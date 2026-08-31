@@ -65,6 +65,14 @@ use tokenizers::Tokenizer;
 /// against a reconstruction.
 mod run_record;
 
+/// The front end's per-token seam, reproduced (lloom issue #412).
+///
+/// `--seam` turns the decode loop into ambrogio's streaming shape — detokenize
+/// the pending run, allocate a `String`, `blocking_send` it into a bounded
+/// channel a real consumer drains — so the thing #412 asks the price of is a
+/// slot in a rotation rather than a thing that has to be argued about.
+mod seam;
+
 /// One `sysctl -n` read, for the machine fields of the run record.
 fn sysctl_str(key: &str) -> String {
     std::process::Command::new("sysctl")
@@ -1115,6 +1123,40 @@ struct Args {
     /// dependency on §11.5's bounded window.
     #[arg(long)]
     sample_in_buffer: bool,
+
+    /// Run the front end's per-token seam on the decode thread (lloom #412).
+    ///
+    /// Reproduces ambrogio's streaming shape — `Tokenizer::decode` over the
+    /// pending run, `frag.to_string()`, `blocking_send` into a
+    /// `tokio::sync::mpsc::channel(32)` a real consumer drains — so what #412
+    /// asks the price of is an **arm in a rotation** rather than an argument.
+    /// `seam.rs` says which lines it is a copy of and what a copy costs.
+    ///
+    /// **Off is the null arm and it is the shipped decode loop**, not a seam
+    /// that does nothing: with this off no channel exists, no runtime exists,
+    /// and no `String` is allocated. The difference between the two arms is the
+    /// whole quantity.
+    #[arg(long)]
+    seam: bool,
+
+    /// The seam's channel capacity. 32 matches `lfm2.rs`'s `channel(32)`.
+    ///
+    /// Exposed because it is the term that decides whether `blocking_send` ever
+    /// **blocks**, which is #412's second question — a slow consumer applying
+    /// backpressure to generation. A capacity of 1 is the arm that makes a stall
+    /// reachable; the default is the shipped value and must stay it.
+    #[arg(long, default_value_t = 32)]
+    seam_capacity: usize,
+
+    /// Detokenize the pending run even on the null arm (lloom #412).
+    ///
+    /// On by default, because ambrogio's decode loop calls `Tokenizer::decode`
+    /// whether or not anyone is streaming — it is how the reply text is built at
+    /// all. Attributing it to the seam would charge the streaming arm for a cost
+    /// both arms pay, which is §15.2 #11a's shape. `--no-detokenize` removes it
+    /// from **both** arms, which is what prices the term itself.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    detokenize: bool,
 
     /// Write row 0's generated token ids, one per line, to this path.
     ///
@@ -2197,6 +2239,41 @@ fn main() -> Result<()> {
     // Per token under `--sample-split`: (argmax-and-sync seconds, readback seconds).
     let mut split_steps: Vec<(f64, f64)> = Vec::with_capacity(args.n);
 
+    // The front end's seam (lloom #412). Three terms per token, kept apart
+    // because they are three mechanisms — see `seam.rs`.
+    let mut seam_steps: Vec<seam::SeamStep> = Vec::with_capacity(args.n);
+    // Built before the loop so a runtime that cannot be created fails now
+    // rather than mid-generation, and so no allocation lands in a timed window.
+    let mut seam_tx = if args.seam {
+        Some(seam::Seam::new(args.seam_capacity)?)
+    } else {
+        None
+    };
+    // The not-yet-emitted run, exactly as `generate_raw` holds it: tokens are
+    // held back until they decode to complete text, because a multi-byte
+    // character can span several of them. Reproducing that is what makes the
+    // detokenize term the right size — decoding the whole sequence every step
+    // instead would be quadratic and would price a bug ambrogio does not have.
+    let mut seam_pending: usize = 0;
+    let mut seam_text_bytes: usize = 0;
+
+    // Context switches across the whole decode window (lloom #412).
+    //
+    // Read in-process because the split is only available here: measured on
+    // this machine `proc_pidinfo(PROC_PIDTASKINFO)`'s `pti_csw` — the one an
+    // out-of-process sampler can read — is exactly `ru_nvcsw + ru_nivcsw`, the
+    // sum with no split, and it is the **involuntary** half that discriminates
+    // preemption from a thread parking at a syscall. `seam.rs` has the probe.
+    //
+    // Two readings around the steady-state window rather than one per token: a
+    // per-token pair would put a syscall inside the quantity it measures, and
+    // the counter is monotone so a difference over the window divides exactly.
+    let mut csw_at_warmup: Option<(u64, u64)> = None;
+    // `warmup`'s two inputs, available here where `warmup` itself is not — see
+    // the branch inside the loop for why the third (`.min(steps.len())`) cannot
+    // bite, and the assertion after the loop that checks it did not.
+    let seam_warmup_floor = args.warmup.max(if axes.arena { axes.record_steps } else { 0 });
+
     #[cfg(feature = "metal")]
     let metal_device = match &device {
         Device::Metal(d) => Some(d.clone()),
@@ -2356,6 +2433,75 @@ fn main() -> Result<()> {
             hit_eos = true;
         }
         tokens.push(next);
+
+        // **The front end's seam** (lloom #412), in `generate_raw`'s own
+        // position: after the token is pushed and before the next forward pass
+        // is encoded. That placement is the measurement — the seam sits on the
+        // decode thread between two tokens, which is why a consumer that blocks
+        // can stall generation at all.
+        //
+        // Outside the `wall` window deliberately, and for the same reason the
+        // sample bucket is (§11.2a's disjointness): `wall` is the forward pass's
+        // window on every recorded figure this project holds, and moving a term
+        // into it would make this arm's `wall` incomparable to all of them. A
+        // step is `wall + sample + eos + seam`.
+        //
+        // The detokenize term is timed on **both** arms, because ambrogio's loop
+        // runs it whether or not anyone is streaming; only the allocate and send
+        // terms are the streaming arm's. Charging the first to the seam would be
+        // §15.2 #11a's shape — a per-axis count read as a per-axis budget.
+        {
+            let mut step = seam::SeamStep::default();
+            if args.detokenize {
+                let (chunk, dt) = seam::time_detokenize(|| {
+                    tokenizer
+                        .decode(&tokens[seam_pending..], false)
+                        .map_err(|e| anyhow::anyhow!("decoding tokens: {e}"))
+                });
+                let chunk = chunk?;
+                step.detokenize_s = dt;
+                // A trailing replacement char means the run ends mid-character,
+                // so the tokens are held for the next step — `generate_raw`'s
+                // rule, reproduced because it is what sets how often the seam
+                // fires. A seam that emitted every token would be a different
+                // and larger quantity.
+                if !chunk.is_empty() && !chunk.ends_with('\u{FFFD}') {
+                    seam_text_bytes += chunk.len();
+                    if let Some(s) = seam_tx.as_ref() {
+                        let e = s.emit(&chunk);
+                        step.alloc_s = e.alloc_s;
+                        step.send_s = e.send_s;
+                    }
+                    seam_pending = tokens.len();
+                }
+            } else if let Some(s) = seam_tx.as_ref() {
+                // `--no-detokenize` prices the channel alone, on a fragment of
+                // fixed size. Not the shipped shape and labelled so: it exists
+                // to separate the two mechanisms, since a null on the total
+                // cannot say which half was null.
+                let e = s.emit("x");
+                step.alloc_s = e.alloc_s;
+                step.send_s = e.send_s;
+                seam_text_bytes += 1;
+            }
+            seam_steps.push(step);
+        }
+
+        // The steady-state context-switch window opens exactly where every
+        // other steady-state mean does, so `invol_csw / token` divides by the
+        // same denominator (lloom #412).
+        //
+        // The threshold is recomputed from the same two inputs `warmup` is
+        // derived from below rather than read from it, because that binding is
+        // clamped by `steps.len()` and does not exist until the loop has ended.
+        // The clamp cannot bite here: this only fires while steps are still
+        // being produced, so `warmup`'s `.min(steps.len())` is the identity at
+        // every point the branch is reachable. Asserted after the loop rather
+        // than argued — a mismatch would mean the csw window and every other
+        // steady-state mean divide by different denominators.
+        if csw_at_warmup.is_none() && tokens.len() > seam_warmup_floor {
+            csw_at_warmup = Some(seam::csw());
+        }
 
         // Arena recording spans the first `record_steps` decode steps.
         //
@@ -2653,6 +2799,15 @@ fn main() -> Result<()> {
     // allocator, where warmup is a cold one.
     let arena_skip = if axes.arena { axes.record_steps } else { 0 };
     let warmup = args.warmup.max(arena_skip).min(steps.len());
+    // The csw window's threshold, checked rather than assumed to be this one
+    // (lloom #412). If the clamp ever bites, `invol_csw_per_token` would divide
+    // a window that opened at one index by a token count taken from another —
+    // a figure that is internally consistent and wrong, which is §2.4's shape.
+    anyhow::ensure!(
+        seam_warmup_floor == warmup || steps.is_empty(),
+        "the csw window opened at {seam_warmup_floor} where the steady-state window \
+         opens at {warmup}; invol_csw_per_token would divide by the wrong denominator"
+    );
     let steady = &steps[warmup..];
     anyhow::ensure!(
         !steady.is_empty(),
@@ -2736,6 +2891,69 @@ fn main() -> Result<()> {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         (mean, v[v.len() / 2], eos)
     };
+
+    // The seam's three terms over the same steady-state window (lloom #412).
+    //
+    // **The median beside the mean, for §6.6b's reason and it is sharper here.**
+    // A `blocking_send` into a channel that is not full is a lock and a memcpy;
+    // one into a channel that IS full is a park until the consumer drains. Those
+    // are different populations, so the mean of the mixture is not a location
+    // estimate of either — and the gap between mean and median is what says
+    // whether the second population was ever entered. A seam whose mean and
+    // median agree never blocked.
+    let seam_steady = &seam_steps[warmup.min(seam_steps.len())..];
+    let (seam_detok_mean, seam_alloc_mean, seam_send_mean, seam_send_med, seam_send_max) =
+        if seam_steady.is_empty() {
+            (0.0, 0.0, 0.0, 0.0, 0.0)
+        } else {
+            let n = seam_steady.len() as f64;
+            let detok = seam_steady.iter().map(|s| s.detokenize_s).sum::<f64>() / n;
+            let alloc = seam_steady.iter().map(|s| s.alloc_s).sum::<f64>() / n;
+            let send = seam_steady.iter().map(|s| s.send_s).sum::<f64>() / n;
+            let mut v: Vec<f64> = seam_steady.iter().map(|s| s.send_s).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let max = v.last().copied().unwrap_or(0.0);
+            (detok, alloc, send, v[v.len() / 2], max)
+        };
+    // The terms only the streaming arm pays, and they are ONE timed window:
+    // `emit` times `to_string` and `blocking_send` together because the timer is
+    // larger than the allocation (see `seam.rs::emit`). `seam_alloc_mean` is
+    // therefore structurally 0.0 and is not added — adding it would double-count
+    // nothing, but reading it as a term would claim a resolution the instrument
+    // does not have. Detokenize is excluded for the reason the loop's own
+    // comment gives: both arms pay it.
+    debug_assert_eq!(
+        seam_alloc_mean, 0.0,
+        "emit times allocate and send as one window; a nonzero alloc mean means \
+         that changed and `seam_mean` is now missing a term"
+    );
+    let seam_mean = seam_send_mean;
+
+    // Context switches over the steady-state window, per token.
+    //
+    // Read here rather than at the last token so the window closes after the
+    // final `synchronize()` — a switch taken while the last forward pass drains
+    // belongs to the window it happened in.
+    let csw_end = seam::csw();
+    let steady_tokens = seam_steady.len().max(1) as f64;
+    let (vol_csw_per_token, invol_csw_per_token) = match csw_at_warmup {
+        Some((v0, i0)) => (
+            (csw_end.0.saturating_sub(v0)) as f64 / steady_tokens,
+            (csw_end.1.saturating_sub(i0)) as f64 / steady_tokens,
+        ),
+        None => (0.0, 0.0),
+    };
+    // What the consumer saw. `seam_received` differing from the number of
+    // fragments sent means the channel closed early and every send after that
+    // point measured an error return rather than a hand-off (§2.4).
+    let seam_consumer = seam_tx.take().map(|s| s.finish()).unwrap_or_default();
+
+    // The instrument, priced against the terms (§2.4, §6.4a). Run here — after
+    // the decode loop, after the channel is closed, before anything is printed
+    // — so it is outside every measured window and its ~20 ms of looping cannot
+    // reach a figure. Both arms run it, so the two RESULT lines carry the same
+    // self-cost and a reader can see it did not move between them.
+    let (seam_instant_pair_s, seam_alloc_priced_s) = seam::self_cost("hello");
 
     // Dispatch counts must be identical token to token if the sequence is
     // stable; report the range so a reader can see whether it was.
@@ -3101,7 +3319,7 @@ fn main() -> Result<()> {
     // the readback on the `--sample-in-buffer` arm, so §11.2's non-GPU figure
     // structurally cannot contain either term (§11.2a, §11.5a).
     {
-        let step_ms = (wall_mean + sample_mean + eos_mean) * 1e3;
+        let step_ms = (wall_mean + sample_mean + eos_mean + seam_mean) * 1e3;
         println!("=== sample and EOS (lloom #172, #319) ===");
         println!(
             "  arm                 {}",
@@ -3118,7 +3336,7 @@ fn main() -> Result<()> {
         );
         println!("  EOS test / token    {:.4} ms", eos_mean * 1e3);
         println!(
-            "  step = wall+sample+eos  {step_ms:.4} ms   -> {:.2} tok/s effective",
+            "  step = wall+sample+eos+seam  {step_ms:.4} ms   -> {:.2} tok/s effective",
             if step_ms > 0.0 { 1e3 / step_ms } else { 0.0 }
         );
         if args.sample_split && split_steps.len() > warmup {
@@ -3137,6 +3355,71 @@ fn main() -> Result<()> {
                 read_mean * 1e3
             );
         }
+        println!();
+    }
+
+    // The seam (lloom #412). Printed on BOTH arms, because a null arm reporting
+    // nothing and a null arm reporting zeros are different claims and only the
+    // second is checkable.
+    {
+        println!("=== the front end's seam (lloom #412) ===");
+        println!(
+            "  arm                 {}",
+            if args.seam {
+                "streaming  (to_string + blocking_send into mpsc(cap))"
+            } else {
+                "null       (the shipped decode loop; no channel, no String)"
+            }
+        );
+        println!(
+            "  detokenize / token  {:.4} ms  <- BOTH arms pay this",
+            seam_detok_mean * 1e3
+        );
+        println!(
+            "  to_string + send    {:.4} ms  (med {:.4}, max {:.4})  <- ONE window",
+            seam_send_mean * 1e3,
+            seam_send_med * 1e3,
+            seam_send_max * 1e3
+        );
+        println!(
+            "  seam / token        {:.4} ms  <- to_string + send, the streaming arm's own",
+            seam_mean * 1e3
+        );
+        // §2.4's *"check whether the measurement tool is the cost"*, run rather
+        // than assumed — and here it fires. The allocation is NOT timed
+        // separately because the timer is larger than it; this prints both
+        // numbers so a reader can check that decision rather than take it.
+        // Outside every measured window: after the loop, after every mean.
+        {
+            let (pair_s, alloc_s) = (seam_instant_pair_s, seam_alloc_priced_s);
+            println!("  --- instrument self-cost (§6.4a, §2.4) ---");
+            println!(
+                "  Instant pair        {:.1} ns   <- the timer",
+                pair_s * 1e9
+            );
+            println!(
+                "  to_string(5B)       {:.1} ns   <- the term, {:.1}x SMALLER than the timer",
+                alloc_s * 1e9,
+                if alloc_s > 0.0 { pair_s / alloc_s } else { 0.0 }
+            );
+            println!(
+                "  => the allocation is not separately resolvable by a timer, and is priced\n     \
+                    at count x price instead: 1 fragment/token x {:.1} ns = {:.6} ms/token",
+                alloc_s * 1e9,
+                alloc_s * 1e3
+            );
+        }
+        // The engagement proof, and it is what makes a null readable (§2.4).
+        // A streaming arm whose consumer received nothing measured a closed
+        // channel; a null arm whose consumer received something is not null.
+        println!(
+            "  consumer received   {} fragments, {} bytes, {} boundaries  (producer emitted {} bytes)",
+            seam_consumer.received, seam_consumer.bytes, seam_consumer.boundaries, seam_text_bytes
+        );
+        println!(
+            "  csw / token         {:.3} involuntary, {:.3} voluntary",
+            invol_csw_per_token, vol_csw_per_token
+        );
         println!();
     }
 
@@ -3190,6 +3473,12 @@ fn main() -> Result<()> {
          spec_proposed={} spec_accepted={} spec_corrupted={} spec_accept_rate={:.4} \
          spec_tokens_per_step={:.4} spec_rows_agree={} prefill_ms={:.2} \
          prompt_tokens={} weight_bytes={} scratch_asks_bytes={} dtype={:?} hit_eos={} \
+         seam={} seam_capacity={} seam_ms_per_token={:.4} \
+         seam_detok_ms_per_token={:.4} seam_alloc_ns_priced={:.1} \
+         seam_send_ms_per_token={:.4} seam_send_med_ms_per_token={:.4} \
+         seam_send_max_ms_per_token={:.4} seam_instant_pair_ns={:.1} \
+         seam_received={} seam_bytes={} \
+         invol_csw_per_token={:.3} vol_csw_per_token={:.3} \
          profiling={} config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
         args.n,
@@ -3215,7 +3504,11 @@ fn main() -> Result<()> {
         to_cpu_fast,
         to_cpu_blit,
         to_cpu_null_after_wait,
-        (wall_per_token + sample_mean + eos_mean) * 1e3,
+        // `+ seam_mean`, which is **0.0 on the null arm and on every run this
+        // field has ever carried** — so a recorded row's `step_ms_per_token` is
+        // unchanged and the two arms remain comparable on one denominator
+        // (lloom #412).
+        (wall_per_token + sample_mean + eos_mean + seam_mean) * 1e3,
         disp_mean,
         // Floored at 0 rather than subtracted blindly: with profiling off
         // `disp_mean` is 0.0, and `0 - (B-1)` printed **-7.0** at B=8 — a count
@@ -3280,6 +3573,37 @@ fn main() -> Result<()> {
         scratch_asks_bytes,
         dtype,
         hit_eos,
+        // The seam (lloom #412). `seam=` is on the line for #171's `UNRECORDED`
+        // reason: a run taken before this field existed is not thereby *on the
+        // null arm*, it is a run the question cannot be asked of.
+        args.seam,
+        args.seam_capacity,
+        // The streaming arm's own cost — `to_string` plus `blocking_send`.
+        // Detokenize is beside it rather than inside it because both arms pay it.
+        seam_mean * 1e3,
+        seam_detok_mean * 1e3,
+        // **Count × price, not a timer** — one fragment per token at the
+        // measured per-allocation cost. Named `_ns_priced` rather than
+        // `_ms_per_token` so no reader takes it for an observed interval: the
+        // timer that would have observed it is 3.3× larger than it (`seam.rs`).
+        seam_alloc_priced_s * 1e9,
+        seam_send_mean * 1e3,
+        // The median and the max, because a bounded channel has two populations
+        // and only the gap between them says whether the second was entered.
+        seam_send_med * 1e3,
+        seam_send_max * 1e3,
+        // The timer's own cost, on the line rather than in a footnote: it is
+        // what says whether the term above it was resolvable at all, and it is
+        // a property of the machine and the toolchain rather than of the run.
+        seam_instant_pair_s * 1e9,
+        // Engagement (§2.4): a streaming arm with `seam_received=0` measured a
+        // closed channel, and a null arm with a nonzero one is not null.
+        seam_consumer.received,
+        seam_consumer.bytes,
+        // #412's preemption instrument. In-process because the vol/invol split
+        // is not externally readable — `pti_csw` is the sum (see `seam.rs`).
+        invol_csw_per_token,
+        vol_csw_per_token,
         profiling,
         axes.config_line(),
         // Passed in by the caller rather than read from git here.

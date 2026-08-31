@@ -64,7 +64,16 @@ tracing = { workspace = true }
 tracing-chrome = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Necessary to disambiguate with tokio in wasm examples which are 1.28.1
-tokio = "1.48.0"
+#
+# `sync` and `rt` are named rather than left to default: `lfm2-decode-profile`'s
+# `--seam` arm reproduces ambrogio's streaming seam, which is a
+# `tokio::sync::mpsc::channel(32)` fed by `blocking_send` from inside
+# `spawn_blocking`. Pricing that seam requires the *same* primitive -- a
+# hand-rolled channel would measure a different one -- and neither feature is on
+# by default. `full` is deliberately not taken: it pulls in the net, time and
+# process stacks this example never touches, and a feature union is global to
+# the build (lloom #412).
+tokio = { version = "1.48.0", features = ["sync", "rt"] }
 
 [build-dependencies]
 anyhow = { workspace = true }

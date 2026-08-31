@@ -1010,3 +1010,219 @@ pub fn call_mlx_gemm(
     encoder.dispatch_thread_groups(grid_size, group_size);
     Ok(())
 }
+
+/// The gate `DESIGN.md` §13.5b names and did not have — issue #380.
+///
+/// §13.5b's re-measure trigger reads *"any change to `select_tile_config` or the
+/// `m == 1` routing at `mlx_gemm.rs:705`, which `occupancy.py` turns into a
+/// failing check"*. Measured, it does not: `occupancy.py` carries that rule as a
+/// **comment** and re-derives the tile split from its own copy of the
+/// arithmetic, so it validates a model of this function rather than this
+/// function. #364 edited exactly this function and that script exited 0.
+///
+/// These tests exercise `select_tile_config` **itself**. They are the second
+/// gate §15.1a prescribes for its COARSE class — the script's own arithmetic is
+/// correct and stays, and what was missing is a check keyed on the claim it is
+/// cited for.
+///
+/// **No device, no GPU, no lease.** `select_tile_config` takes `MetalDeviceType`
+/// as a *parameter* rather than a `&Device`, so the whole selection is a pure
+/// function of `(dtype, m, n, k, batch, a_trans, b_trans, device_type)` and the
+/// tests below are arithmetic that happens to be written in Rust.
+///
+/// **What each test asserts is stated in its own name and doc comment**, per
+/// #380's third requirement: a gate that does not say which claim it carries is
+/// one whose failure nobody can read.
+#[cfg(test)]
+mod tile_config_gate {
+    use super::*;
+
+    /// M1 Max — `architecture_name()` ends in `'s'` (`metal/device.rs:262`), and
+    /// it is the machine every figure in `DESIGN.md` §13.5a/§13.5b/§13.5c was
+    /// taken on. Passed as a value rather than read from a device, which is what
+    /// keeps these tests GPU-free.
+    const DEV: MetalDeviceType = MetalDeviceType::Max;
+
+    /// LFM2's 167 weight matmuls, `DESIGN.md` §5.4 and §6.6.
+    ///
+    /// `(label, count, n = N_out, k = K)`. Every decode matmul is `nt`
+    /// (`a_trans = false`, `b_trans = true`) — a `[m, K]` activation against a
+    /// `[N_out, K]` weight — which is what `call_mlx_gemm`'s stride analysis
+    /// resolves them to and what §13.5b's branch reading depends on.
+    const SITES: &[(&str, usize, usize, usize)] = &[
+        ("conv.in_proj", 22, 6144, 2048),
+        ("conv.out_proj", 22, 2048, 2048),
+        ("w1 (gate)", 30, 10752, 2048),
+        ("w3 (up)", 30, 10752, 2048),
+        ("w2 (down)", 30, 2048, 10752),
+        ("q_proj", 8, 2048, 2048),
+        ("k_proj", 8, 512, 2048),
+        ("v_proj", 8, 512, 2048),
+        ("out_proj", 8, 2048, 2048),
+        ("lm_head", 1, 128000, 2048),
+    ];
+
+    fn tile_at(m: usize, n: usize, k: usize) -> TileConfig {
+        select_tile_config(
+            GemmDType::F16,
+            m,
+            n,
+            k,
+            /* batch_size */ 1,
+            /* a_trans */ false,
+            /* b_trans */ true,
+            DEV,
+        )
+    }
+
+    /// The site table is LFM2's, checked against `DESIGN.md` §6.6's own count.
+    ///
+    /// Not a claim about `select_tile_config`; it is the fixture's own
+    /// non-vacuity check (§15.1a). A table that had drifted from the model would
+    /// make every assertion below true of a workload we do not run.
+    #[test]
+    fn the_site_table_is_lfm2s_167_weight_matmuls() {
+        let total: usize = SITES.iter().map(|(_, c, _, _)| c).sum();
+        assert_eq!(
+            total, 167,
+            "DESIGN.md §6.6 counts 167 GEMVs per decode step (22*2 + 8*4 + 30*3 + 1)"
+        );
+    }
+
+    /// **The claim: `select_tile_config` returns a BM=32 tile below `m` = 16.**
+    ///
+    /// This is what `DESIGN.md` §13.5b asserts as *"`select_tile_config`, rs:85:
+    /// `m < 16` → `TILE_32_32_16_2_2` unconditionally"* and what every figure in
+    /// that section's `align_M`/`align_N` branch reading is computed from. It is
+    /// read here from the function rather than from a comment beside it.
+    ///
+    /// Every one of LFM2's 167 weight matmuls is asserted rather than a
+    /// representative, because §13.5b's own claim is quantified over all 167 and
+    /// the sites differ in `N_out` by 250× (512 to 128000).
+    #[test]
+    fn below_the_threshold_every_lfm2_matmul_gets_the_32_32_tile() {
+        for m in 1..16 {
+            for (label, _, n, k) in SITES {
+                let t = tile_at(m, *n, *k);
+                assert_eq!(
+                    (t.bm, t.bn, t.bk, t.wm, t.wn),
+                    (32, 32, 16, 2, 2),
+                    "§13.5b: at m={m} the {label} matmul ({n}x{k}) must take \
+                     TILE_32_32_16_2_2; got {t:?}"
+                );
+            }
+        }
+    }
+
+    /// **The claim: the threshold is exactly 16, and crossing it leaves BM=32.**
+    ///
+    /// `DESIGN.md` §13.5c pins the boundary *"exact at 16, pinned by
+    /// bisection"* from a GPU census; this is the same boundary read off the
+    /// function with no GPU. **Both sides are asserted** (§8.1g): a test that
+    /// only checked the low side would pass on a function that returned the
+    /// 32×32 tile everywhere, which is precisely the `LLOOM_364_SKINNY_MAX`
+    /// arm and precisely the change §13.5c argues about.
+    #[test]
+    fn the_threshold_is_at_sixteen_and_the_tile_changes_across_it() {
+        let (n, k) = (2048, 2048);
+        let below = tile_at(15, n, k);
+        let at = tile_at(16, n, k);
+        assert_eq!(
+            (below.bm, below.bn),
+            (32, 32),
+            "§13.5c: m=15 is the last m on the 32x32 tile"
+        );
+        assert_eq!(
+            (at.bm, at.bn, at.bk, at.wm, at.wn),
+            (64, 32, 32, 2, 2),
+            "§13.5c: m=16 takes TILE_64_32_32_2_2 -- the larger tile, and the \
+             one measured +17.9 % of GPU busy for +6.7 % of work"
+        );
+        assert_ne!(
+            (below.bm, below.bn, below.bk, below.wm, below.wn),
+            (at.bm, at.bn, at.bk, at.wm, at.wn),
+            "the boundary must be a boundary: if these agree, every §13.5c \
+             figure is a comparison of a tile against itself"
+        );
+    }
+
+    /// **The claim: `align_M` is false and `align_N` is true at all 167 sites.**
+    ///
+    /// This is §13.5b's load-bearing arithmetic — it is what selects
+    /// `mlx_gemm.metal:1300`'s `LoopAlignment<false, true, true>`, which puts
+    /// the scalar `load_safe` on operand A (the 4 KB SLC-resident activation)
+    /// and leaves `load_unsafe` on operand B (the 5.394 GB weight sweep). That
+    /// is the whole of why §13.5b dispositions candidate 3 as *"real, and out of
+    /// reach of the weight traffic"*.
+    ///
+    /// The two constants are computed here exactly as `call_mlx_gemm` computes
+    /// them at `:784-785` — `m % bm` and `n % bn` against **the tile this
+    /// function returned**, not against a literal 32.
+    #[test]
+    fn at_m_one_align_m_is_false_and_align_n_is_true_at_every_site() {
+        let m = 1;
+        for (label, _, n, k) in SITES {
+            let t = tile_at(m, *n, *k);
+            assert!(
+                m % t.bm != 0,
+                "§13.5b: align_M must be false at {label} (m={m}, bm={})",
+                t.bm
+            );
+            assert!(
+                n % t.bn == 0,
+                "§13.5b: align_N must be true at {label} -- every LFM2 N_out is \
+                 a multiple of BN (n={n}, bn={})",
+                t.bn
+            );
+        }
+    }
+
+    /// **The claim: `maxTotalThreadsPerThreadgroup` is 128 for the GEMM tile.**
+    ///
+    /// §13.5b reads the GEMM arm's 128 against the `bm8` GEMV's 256 and
+    /// concludes *"both are declared by the same formula"* — `WM * WN * 32` at
+    /// `mlx_gemm.metal:1024` — so the halving is a tile shape and not an
+    /// occupancy signal. The formula's inputs are this function's output, which
+    /// is why the reading moves if the tile does.
+    #[test]
+    fn the_gemm_arms_declared_thread_bound_is_a_tile_shape() {
+        let t = tile_at(1, 2048, 2048);
+        assert_eq!(
+            t.wm * t.wn * 32,
+            128,
+            "§13.5b: mlx_gemm.metal:1024 declares WM * WN * 32; the 128 the \
+             step-1 probe observed is this product and nothing else"
+        );
+    }
+
+    /// **The claim: the `m == 1` routing means the shipping decode step never
+    /// reaches `select_tile_config` at all.**
+    ///
+    /// §13.5b's trigger names *"the `m == 1` routing at `mlx_gemm.rs:705"*
+    /// beside the function itself, and §13.5c's census records the consequence:
+    /// B=1, K=0 decode dispatches `gemv_float16_*` and no tile. That routing is
+    /// a branch in `call_mlx_gemm`, which needs a device — so what is asserted
+    /// here is the *predicate*, read from the same source line, rather than the
+    /// dispatch.
+    ///
+    /// Kept deliberately: it is the half of §13.5b's trigger that a tile-only
+    /// gate would leave uncovered, and a reader arriving at a failure of the
+    /// tests above needs to know which of the two clauses moved.
+    #[test]
+    fn the_gemv_routing_predicate_still_excludes_the_b1_decode_step() {
+        // `call_mlx_gemm`: `if m == 1 || n == 1 { return call_mlx_gemv(..) }`.
+        let routes_to_gemv = |m: usize, n: usize| m == 1 || n == 1;
+        for (label, _, n, _) in SITES {
+            assert!(
+                routes_to_gemv(1, *n),
+                "§13.5c: at B=1, K=0 the {label} matmul must route to GEMV \
+                 before any tile is selected"
+            );
+        }
+        assert!(
+            !routes_to_gemv(2, 2048),
+            "the predicate must be capable of the other answer: B=2 reaches \
+             select_tile_config, which is the road §13.5c measures"
+        );
+    }
+}

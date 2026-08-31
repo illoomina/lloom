@@ -9,6 +9,7 @@ use crate::{
 };
 use objc2::available;
 use objc2::rc::Retained;
+use objc2_foundation::NSString;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
@@ -197,6 +198,51 @@ impl Kernels {
     }
 }
 
+/// Issue #434's driver-flag arm: pass a flag string through to the Metal
+/// compiler's clang driver, so `-flto` and `-frelaxed-math` can be A/B'd.
+///
+/// **Unset is what ships**, and unset means the property is never touched — so
+/// the default is byte-for-byte what shipped before this existed (`DESIGN.md`
+/// §7.1a: no default is flipped without its own argued decision).
+///
+/// `additionalCompilerArguments` takes an **`NSString`**, not an array: an
+/// array reaches `-[NSConstantArray lengthOfBytesUsingEncoding:]` and throws
+/// `unrecognized selector`. It is also **absent from `MTLLibrary.h`** and from
+/// `objc2-metal`'s generated bindings, which is why this is a raw `msg_send!`
+/// rather than a typed setter — §2.3.3b found the property the same way, by
+/// enumerating `MTLCompileOptions` from the Objective-C runtime. Probed on this
+/// machine the runtime reports `T@"NSString",C,D,N`.
+///
+/// The driver **validates**: `-fbogus-not-a-flag` is rejected while real flags
+/// compile, which is the engagement proof at the mechanism level (§2.4, after
+/// #69's vacuous determinism run). A rejected flag surfaces as a
+/// `LoadLibraryError` from `new_library_with_source`, so a typo fails loudly
+/// rather than silently running the baseline.
+///
+/// **A flag reaching the driver is not a flag changing codegen**, and this
+/// function cannot tell the difference. The arm-level engagement proof is a
+/// `__compute` section-size comparison between the built arms — see
+/// `measurements/probes/issue-434/`.
+fn additional_compiler_arguments() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static ARGS: OnceLock<Option<String>> = OnceLock::new();
+    ARGS.get_or_init(|| match std::env::var("LLOOM_434_METAL_CFLAGS") {
+        // An empty value is a mistake worth failing on rather than silently
+        // treating as unset: it is what an unset shell variable expands to, so
+        // accepting it would let `LLOOM_434_METAL_CFLAGS=$UNSET` run the
+        // baseline while the batch script believes it ran an arm.
+        Ok(v) if v.trim().is_empty() => panic!(
+            "LLOOM_434_METAL_CFLAGS is set but empty. Unset it to run the \
+             default arm; an empty value is almost always an unexpanded \
+             shell variable, which would silently run the baseline (§2.4)."
+        ),
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => panic!("LLOOM_434_METAL_CFLAGS is not valid UTF-8: {e}"),
+    })
+    .as_deref()
+}
+
 fn get_compile_options() -> Retained<MTLCompileOptions> {
     let compile_options = MTLCompileOptions::new();
     //unsafe { compile_options.setEnableLogging(true) };
@@ -217,6 +263,27 @@ fn get_compile_options() -> Retained<MTLCompileOptions> {
         #[allow(deprecated)]
         compile_options.setFastMathEnabled(fast_math_enabled);
     }
+
+    // Deliberately last, and deliberately only when set: an untouched property
+    // is not the same as a property set to the empty string, and only the
+    // former is the shipped default.
+    if let Some(flags) = additional_compiler_arguments() {
+        let ns = NSString::from_str(flags);
+        // SAFETY: `setAdditionalCompilerArguments:` is declared on
+        // `MTLCompileOptions` by the Objective-C runtime (probed: the property
+        // reports `T@"NSString",C,D,N`) and is absent from the generated
+        // bindings, so it is unreachable through a typed setter. The selector
+        // takes exactly one object argument of type `NSString *`, which is what
+        // is passed; the property is `copy`, so the receiver does not borrow
+        // `ns` beyond the call.
+        unsafe {
+            let _: () = objc2::msg_send![
+                &*compile_options,
+                setAdditionalCompilerArguments: &*ns
+            ];
+        }
+    }
+
     compile_options
 }
 
@@ -264,5 +331,64 @@ mod tests {
             .all(|pipeline| std::ptr::eq(pipelines[0].as_ref(), pipeline.as_ref())));
         assert_eq!(kernels.libraries.read().unwrap().len(), 1);
         assert_eq!(kernels.pipelines.read().unwrap().len(), 1);
+    }
+
+    /// Issue #434. The passthrough is exercised **directly** rather than
+    /// through `LLOOM_434_METAL_CFLAGS`, because that variable is read once per
+    /// process through a `OnceLock` and every test in this binary shares it —
+    /// a test that set it would decide the arm for whichever test ran next.
+    ///
+    /// Three claims, and the third is the one that makes the other two mean
+    /// something (`DESIGN.md` §15.1 #1, §11.3j: a comparison whose control
+    /// cannot fail is not evidence):
+    ///
+    /// 1. a real flag compiles,
+    /// 2. the default arm compiles,
+    /// 3. a **bogus** flag is REJECTED — so the string demonstrably reaches a
+    ///    real clang driver rather than being dropped. Without this arm, arms 1
+    ///    and 2 are equally consistent with the property being ignored
+    ///    entirely, which is #69's vacuous-run shape (§2.4).
+    #[test]
+    fn additional_compiler_arguments_reach_a_validating_driver() {
+        let device = Device::system_default().unwrap();
+        // A tiny source of our own: the point is the DRIVER's verdict, and
+        // compiling a whole candle source per arm would price the test at
+        // several seconds for no extra evidence.
+        const SRC: &str = "#include <metal_stdlib>\n\
+             using namespace metal;\n\
+             kernel void k434(device float* o [[buffer(0)]],\n\
+                              uint t [[thread_position_in_grid]]) { o[t] = (float)t; }\n";
+
+        let compile_with = |flags: Option<&str>| {
+            let options = MTLCompileOptions::new();
+            if let Some(f) = flags {
+                let ns = NSString::from_str(f);
+                // SAFETY: as in `get_compile_options` — the selector is
+                // declared by the ObjC runtime and takes one `NSString *`.
+                unsafe {
+                    let _: () = objc2::msg_send![&*options, setAdditionalCompilerArguments: &*ns];
+                }
+            }
+            device.new_library_with_source(SRC, Some(&options))
+        };
+
+        assert!(
+            compile_with(None).is_ok(),
+            "the default arm must compile: it is what ships"
+        );
+        assert!(
+            compile_with(Some("-flto")).is_ok(),
+            "#434 arm A: -flto is accepted by the driver"
+        );
+        assert!(
+            compile_with(Some("-frelaxed-math")).is_ok(),
+            "#434 arm B: -frelaxed-math is accepted by the driver"
+        );
+        assert!(
+            compile_with(Some("-fbogus-not-a-flag")).is_err(),
+            "a bogus flag MUST be rejected. If it compiles, the string is not \
+             reaching the compiler and every arm built through this path is \
+             silently the baseline (§2.4, #69's vacuous determinism run)."
+        );
     }
 }

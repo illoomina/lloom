@@ -8,7 +8,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 // Use Retained when appropriate. Gives us a more elegant way of handling memory (peaks) than autoreleasepool.
@@ -16,6 +16,105 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
 const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
+
+/// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).
+///
+/// # Why there are two
+///
+/// The shipping cut is a **global dispatch counter**: `count >=
+/// compute_per_buffer`, with `count` running from process start. §13.5i
+/// measured what that produces — every seam at a multiple of 50 *counted from
+/// process start*, so the flash arm's land at 51/101/152 rather than
+/// 50/100/150, and of a token's seams 6 fall inside attention layers and 7
+/// inside conv, none at a position the graph would have chosen. The placement
+/// is a **counter's residue**, not a decision.
+///
+/// §13.5j then measured the cost of the cut itself and found it is **~7.2–7.4
+/// µs per encoder session and not a function of the barrier count** — but
+/// barriers and sessions are *collinear* along `COMPUTE_PER_BUFFER` (R² 0.983
+/// and 0.985), because one cut produces both. **No setting of that knob can
+/// separate the two terms.**
+///
+/// A node-index partition is the arm that can, and that is the only reason
+/// this enum exists: it moves *where* the seams land while holding *how many*
+/// there are, so the session term and the barrier term stop moving together.
+///
+/// # What a "node" is here, and why it is the layer
+///
+/// llama.cpp partitions a materialised graph — `n_nodes_per_cb = (n_nodes +
+/// n_cb - 1) / n_cb`, shipping `n_cb` of 1 or 2 (#419). Candle is eager and has
+/// no graph object to index, so the node index has to come from the only party
+/// that knows the graph position: the model. LFM2's decoder is a loop over 30
+/// layers, so **node := layer** and the partition is over the layer sequence.
+///
+/// That is what makes the count held rather than approximately held: cutting a
+/// 30-layer sequence into `n_cb` contiguous runs yields **exactly `n_cb`
+/// sessions per forward pass, by construction**, independent of how many
+/// dispatches a layer happens to contain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutPolicy {
+    /// Cut every `compute_per_buffer` dispatches, counted from process start.
+    /// The default and the shipping path; §13.5j's arm and every recorded
+    /// digest belong to it.
+    DispatchCounter,
+    /// Cut on a layer-index partition: `n_cb` contiguous runs of the layer
+    /// sequence, so every seam lands on a layer boundary and the session count
+    /// is `n_cb` by construction.
+    ///
+    /// `nodes_per_cb` is the run length in layers, derived from `n_cb` the same
+    /// way llama.cpp derives it — `ceil(n_layers / n_cb)` — and computed by the
+    /// caller, since only the model knows `n_layers`.
+    NodeIndex { nodes_per_cb: usize },
+}
+
+impl CutPolicy {
+    /// Whether reaching graph node `index` should arm a cut.
+    ///
+    /// A free function of the policy and the index so the partition arithmetic
+    /// is testable **without a device** — `Commands` needs a live
+    /// `MTLCommandQueue` and this needs none, which is `scratch_tests.rs`'s
+    /// split between the arithmetic and what executes it.
+    ///
+    /// **Node 0 never cuts.** `n_cb` contiguous runs have `n_cb - 1` interior
+    /// boundaries, and a cut at the first node would add a seam the partition
+    /// does not name — the forward pass already opens against whatever encoder
+    /// the previous token's `flush_and_wait_current` left. Cutting there would
+    /// make the session count `n_cb + 1` and break the held-count property the
+    /// arm exists to have.
+    #[inline]
+    pub fn cuts_at_node(&self, index: usize) -> bool {
+        match self {
+            // A dispatch counter has no notion of graph position, which is
+            // §13.5i's whole finding. It cannot answer this question and does
+            // not try.
+            CutPolicy::DispatchCounter => false,
+            CutPolicy::NodeIndex { nodes_per_cb } => {
+                index > 0 && index.is_multiple_of(*nodes_per_cb)
+            }
+        }
+    }
+
+    /// How many sessions a forward pass over `n_nodes` nodes will cut into.
+    ///
+    /// The held-count property, as arithmetic rather than as a claim: a
+    /// partition of `n_nodes` into runs of `nodes_per_cb` has
+    /// `ceil(n_nodes / nodes_per_cb)` runs, and each run is one session. Used
+    /// by the tests and by anything choosing a `nodes_per_cb` to match a
+    /// counter arm's count.
+    pub fn sessions_for(
+        &self,
+        n_nodes: usize,
+        compute_per_buffer: usize,
+        n_dispatches: usize,
+    ) -> usize {
+        match self {
+            // The counter's count is a function of the dispatch total, which is
+            // why it cannot be held while placement moves (§13.5j).
+            CutPolicy::DispatchCounter => n_dispatches.div_ceil(compute_per_buffer.max(1)),
+            CutPolicy::NodeIndex { nodes_per_cb } => n_nodes.div_ceil((*nodes_per_cb).max(1)),
+        }
+    }
+}
 
 /// Callbacks run after each command buffer completes. See
 /// [`Commands::on_command_buffer_complete`].
@@ -123,6 +222,23 @@ pub struct Commands {
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
     compute_per_buffer: usize,
+    /// Where command buffers are cut (`DESIGN.md` §13.5m, issue #420 stage 3).
+    ///
+    /// Read once from the environment at construction, like
+    /// `compute_per_buffer` beside it. `DispatchCounter` unless
+    /// `CANDLE_METAL_NODES_PER_CB` is set, so **the default path is the one
+    /// that ran before this field existed** (§7.1a) rather than one equivalent
+    /// to it.
+    cut_policy: CutPolicy,
+    /// Set by [`Commands::mark_graph_node`] when the model reaches a node the
+    /// partition cuts at; consumed by the next `command_encoder`.
+    ///
+    /// A flag rather than a direct commit because the mark arrives *between*
+    /// dispatches, where no encoder is open and cutting would mean closing an
+    /// encoder only to reopen it for the same work. Deferring to the next
+    /// encoder request puts the seam exactly at the first dispatch of the new
+    /// run, which is the position the partition names.
+    node_cut_pending: AtomicBool,
     device: Device,
     /// Global cross-encoder output map. Maps buffer pointer to the fence of the last encoder
     /// that wrote it, enabling cross-command-buffer ordering for HazardTrackingModeUntracked.
@@ -181,6 +297,28 @@ impl Commands {
             _ => DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
         };
 
+        // `DESIGN.md` §13.5m. Absent -- which is every run that does not opt in
+        // -- leaves `DispatchCounter`, the path that ran before this existed.
+        //
+        // An unparseable or zero value is a *panic* rather than a silent
+        // fallback, per §2.4: "make an invalid setting panic rather than fall
+        // back silently". A run that meant to select the node-index arm and
+        // silently got the counter would report a clean null for the wrong
+        // reason -- #69's vacuous determinism run, in this axis.
+        let cut_policy = match std::env::var("CANDLE_METAL_NODES_PER_CB") {
+            Ok(val) => {
+                let n: usize = val.parse().unwrap_or_else(|_| {
+                    panic!("CANDLE_METAL_NODES_PER_CB must be a positive integer, got {val:?}")
+                });
+                assert!(
+                    n > 0,
+                    "CANDLE_METAL_NODES_PER_CB must be > 0, got {n} (unset it to use the counter)"
+                );
+                CutPolicy::NodeIndex { nodes_per_cb: n }
+            }
+            _ => CutPolicy::DispatchCounter,
+        };
+
         if let Some(raw) = residency_set.raw() {
             command_queue.addResidencySet(raw);
         }
@@ -193,6 +331,8 @@ impl Commands {
             compute_count: AtomicUsize::new(0),
             command_queue,
             compute_per_buffer,
+            cut_policy,
+            node_cut_pending: AtomicBool::new(false),
             device,
             prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
             live_fences: Arc::new(Mutex::new(Vec::new())),
@@ -239,10 +379,79 @@ impl Commands {
         }
     }
 
+    /// The cut policy in force (`DESIGN.md` §13.5m).
+    ///
+    /// Read by the harness to state the arm on its `RESULT` line: §7.1a-i
+    /// records `config_line()` rendering a three-armed axis with a two-armed
+    /// conditional, so an arm is read back from the mechanism that decides it
+    /// rather than from the flag that was passed.
+    pub fn cut_policy(&self) -> CutPolicy {
+        self.cut_policy
+    }
+
+    /// The dispatch period the counter cut uses, whether or not it is in force.
+    ///
+    /// Stated even under `NodeIndex`, where it decides nothing: an arm at its
+    /// default and an arm that is inert are different facts, which is the
+    /// distinction §7.1a-i's `ScratchSizing` note draws.
+    pub fn compute_per_buffer(&self) -> usize {
+        self.compute_per_buffer
+    }
+
+    /// Tell the executor the model has reached graph node `index`
+    /// (`DESIGN.md` §13.5m, issue #420 stage 3).
+    ///
+    /// Under [`CutPolicy::DispatchCounter`] this is **a no-op with no lock and
+    /// no store**, which is what makes the default path unchanged rather than
+    /// merely equivalent: an unmarked build and a marked one that never opted
+    /// in run the same instructions.
+    ///
+    /// Under [`CutPolicy::NodeIndex`] a node whose index begins a partition run
+    /// arms a cut, taken at the next encoder request. Node 0 does **not** cut:
+    /// the forward pass already opens with whatever encoder the previous
+    /// token's tail left, and cutting there would add a seam the partition does
+    /// not name -- `n_cb` runs have `n_cb - 1` interior boundaries, and the
+    /// remaining seam per token is the one the sample's own
+    /// `flush_and_wait_current` already forces.
+    ///
+    /// **The caller owns the node numbering, not this.** `Commands` cannot know
+    /// what a node is -- candle is eager and has no graph (§11.1a) -- so it
+    /// takes an index and a run length and does arithmetic. That keeps the
+    /// model-shaped knowledge in the model, which is §7.1c's finding about
+    /// mechanisms living on `lfm2::Config`.
+    /// The decision itself is [`CutPolicy::cuts_at_node`], which is what the
+    /// tests exercise -- the function under test is the function called, not a
+    /// restatement of it beside the one that runs (§15.2 #12b's shape).
+    #[inline]
+    pub fn mark_graph_node(&self, index: usize) {
+        if self.cut_policy.cuts_at_node(index) {
+            self.node_cut_pending.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether this encoder request should cut a new command buffer.
+    ///
+    /// The two policies are deliberately exclusive rather than combined: under
+    /// `NodeIndex` the dispatch counter is **not consulted at all**, because a
+    /// cut that fires on either condition would be a node partition *plus* a
+    /// counter, and its session count would be the sum -- which is exactly the
+    /// held-count property the arm exists to have (§13.5j: barriers and
+    /// sessions are collinear along the counter, so an arm that moves both
+    /// separates nothing).
+    ///
+    /// `compute_count` is still incremented on both paths, so the counter stays
+    /// a faithful dispatch count for anything else reading it.
+    fn should_cut(&self, count: usize) -> bool {
+        match self.cut_policy {
+            CutPolicy::DispatchCounter => count >= self.compute_per_buffer,
+            CutPolicy::NodeIndex { .. } => self.node_cut_pending.swap(false, Ordering::Relaxed),
+        }
+    }
+
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
-        let flush = count >= self.compute_per_buffer;
+        let flush = self.should_cut(count);
 
         if flush {
             self.commit_swap_locked(&mut state_guard, 1)?;
@@ -279,7 +488,7 @@ impl Commands {
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock().unwrap();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
-        let flush = count >= self.compute_per_buffer;
+        let flush = self.should_cut(count);
 
         if flush {
             self.commit_swap_locked(&mut state_guard, 1)?;

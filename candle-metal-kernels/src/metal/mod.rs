@@ -16,6 +16,12 @@ pub mod commands;
 #[cfg(test)]
 mod component_digest_tests;
 pub mod compute_pipeline;
+/// Where the command buffer is cut: the partition arithmetic (#420 stage 3).
+///
+/// Pure functions, no device -- `scratch_tests.rs`'s split between the
+/// arithmetic and what executes it.
+#[cfg(test)]
+mod cut_policy_tests;
 pub mod device;
 pub mod encoder;
 pub mod executor;

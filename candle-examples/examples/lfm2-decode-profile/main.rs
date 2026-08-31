@@ -570,6 +570,18 @@ struct Axes {
     /// because a run's `B` decides whether its figures may be pooled with
     /// another's, which is exactly what the axis vector is for.
     batch: usize,
+    /// Where the command buffer is cut, and the period the counter arm uses
+    /// (`DESIGN.md` §13.5m, issue #420 stage 3).
+    ///
+    /// **Captured from the device at construction, never re-read from the
+    /// environment at render time.** `CANDLE_METAL_NODES_PER_CB` selects the
+    /// policy and `Commands::new` resolves it once; reading the variable again
+    /// here would be reading the flag rather than the mechanism, which is the
+    /// route §7.1a-i's `AttnImpl` defect took. `None` on a non-Metal device,
+    /// where there are no command buffers to cut — a third fact, and distinct
+    /// from either arm.
+    #[cfg(feature = "metal")]
+    cut_policy: Option<(candle::metal_backend::CutPolicy, usize)>,
 }
 
 /// The `AttnImpl` arm, as `.bench/configurations.md` §1 spells it.
@@ -713,6 +725,18 @@ impl Axes {
             flash_scratch_sizing: config.flash_scratch_sizing,
             memory_budget: config.memory_budget.map(|b| b.fraction),
             batch: args.batch,
+            // Resolved by `Commands::new` from `CANDLE_METAL_NODES_PER_CB` once
+            // per device; read here rather than re-derived from the variable,
+            // per #241. The period travels with the policy because a counter
+            // cut at 50 and one at 55 are different arms -- #420 stage 3's
+            // control is a counter arm at a period chosen to match the node
+            // arm's session count, and a line saying only `Counter` could not
+            // separate it from the shipping default.
+            #[cfg(feature = "metal")]
+            cut_policy: match _device {
+                Device::Metal(m) => Some((m.cut_policy(), m.compute_per_buffer())),
+                _ => None,
+            },
         })
     }
 
@@ -874,7 +898,46 @@ impl Axes {
             // against a per-sequence rate. #171's store keys on this field, so
             // a batched run and an unbatched one cannot silently merge.
             p("Batch", &self.batch.to_string()),
+            // **Where the command buffer is cut**, and the axis this run exists
+            // to move (`DESIGN.md` §13.5m, issue #420 stage 3). Rendered from
+            // the device's own resolved policy through an exhaustive `match`:
+            // a run that meant to take the node arm and silently got the
+            // counter would report a clean null for the wrong reason, which is
+            // #69's vacuous determinism run in this axis (§2.4).
+            p("CutPolicy", &self.cut_policy_arm()),
         ]
+    }
+
+    /// The `CutPolicy` arm, with its period (`DESIGN.md` §13.5m).
+    ///
+    /// Exhaustive for [`attn_impl_arm`]'s reason: a third policy added to
+    /// [`candle::metal_backend::CutPolicy`] fails to compile here rather than
+    /// rendering silently as one of these two.
+    ///
+    /// The period is part of the arm name on **both** sides. `Counter(50)` and
+    /// `Counter(55)` differ in session count — 11 against 10 on the shipping
+    /// decode step — and #420 stage 3's control is a counter arm chosen to
+    /// match the node arm's count, so a line saying only `Counter` would not be
+    /// separable from the shipping default.
+    fn cut_policy_arm(&self) -> String {
+        #[cfg(feature = "metal")]
+        {
+            match self.cut_policy {
+                Some((candle::metal_backend::CutPolicy::DispatchCounter, period)) => {
+                    format!("Counter({period})")
+                }
+                Some((candle::metal_backend::CutPolicy::NodeIndex { nodes_per_cb }, _)) => {
+                    format!("Node({nodes_per_cb})")
+                }
+                // No Metal device, so there are no command buffers to cut.
+                // Distinct from either arm rather than folded into the default.
+                None => "n/a".to_string(),
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a".to_string()
+        }
     }
 
     /// The math mode this build will compile its kernels under.
@@ -2376,7 +2439,9 @@ fn main() -> Result<()> {
     // `warmup`'s two inputs, available here where `warmup` itself is not — see
     // the branch inside the loop for why the third (`.min(steps.len())`) cannot
     // bite, and the assertion after the loop that checks it did not.
-    let seam_warmup_floor = args.warmup.max(if axes.arena { axes.record_steps } else { 0 });
+    let seam_warmup_floor = args
+        .warmup
+        .max(if axes.arena { axes.record_steps } else { 0 });
 
     #[cfg(feature = "metal")]
     let metal_device = match &device {

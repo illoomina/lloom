@@ -523,6 +523,46 @@ impl MetalDevice {
         self.commands.set_executor(executor);
     }
 
+    /// Tell the executor the model has reached graph node `index`
+    /// (`DESIGN.md` §13.5m, issue #420 stage 3).
+    ///
+    /// A model calls this at each node boundary of its forward pass -- for a
+    /// decoder stack, once per layer. Under the default cut policy it is a
+    /// no-op that takes no lock and performs no store, so a model that calls it
+    /// unconditionally costs nothing when the arm is not selected; under
+    /// `CutPolicy::NodeIndex` it is what puts the command-buffer seam on a
+    /// graph position instead of on a dispatch count.
+    ///
+    /// Narrow on purpose, exactly as `set_executor` above is: `commands` is
+    /// `pub(crate)` and stays that way. The model announces *where it is*; it
+    /// does not reach the command-buffer lifecycle around it.
+    #[inline]
+    pub fn mark_graph_node(&self, index: usize) {
+        self.commands.mark_graph_node(index);
+    }
+
+    /// The command-buffer cut policy in force (`DESIGN.md` §13.5m).
+    ///
+    /// Read back from the mechanism that decides it rather than from the flag
+    /// that selected it, per §7.1a-i: a `RESULT` line that renders an axis from
+    /// its own parse of a flag can state an arm the engine is not running, and
+    /// a wrong arm compares *equal* to real runs of another configuration where
+    /// an absent one could not.
+    pub fn cut_policy(&self) -> candle_metal_kernels::metal::CutPolicy {
+        self.commands.cut_policy()
+    }
+
+    /// The dispatch period the counter cut uses (`DESIGN.md` §13.5m).
+    ///
+    /// Reported alongside the policy because a counter cut at 50 and one at 55
+    /// are different arms with different session counts, and #420 stage 3's
+    /// control is a counter arm at a period chosen to match the node arm's
+    /// count. A run that recorded only `Counter` would not be separable from
+    /// the shipping default.
+    pub fn compute_per_buffer(&self) -> usize {
+        self.commands.compute_per_buffer()
+    }
+
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>> {
         let command_encoder = self
             .commands

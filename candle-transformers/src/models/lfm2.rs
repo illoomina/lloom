@@ -2142,6 +2142,43 @@ pub struct Model {
     l_cache: usize,
 }
 
+/// Announce that the forward pass has reached graph node `index`
+/// (`DESIGN.md` §13.5m, issue #420 stage 3).
+///
+/// # Why the model is the party that can say this
+///
+/// Candle is eager: there is no graph object, so nothing below this can know
+/// where in the model a dispatch sits (§11.1a). The command-buffer cut
+/// therefore falls where a *global dispatch counter* happens to tick, and
+/// §13.5i measured the consequence — every seam at a multiple of 50 counted
+/// from process start, landing 0–18 dispatches into whichever block it hits.
+/// The layer loop is the one place that knows the answer, so it is the one
+/// place that can supply it.
+///
+/// # Why it is free when the arm is off
+///
+/// Under the default cut policy `mark_graph_node` returns without a lock or a
+/// store, so this is a call and a branch on a path that runs 30 times per
+/// token against 538 dispatches. It is *not* gated on an environment read here
+/// deliberately: the policy is read once at `Commands::new` and a second read
+/// on the per-token path would be the O(N)-on-the-hot-path shape §15.2 #10
+/// forbids, in an env lookup.
+#[cfg(feature = "metal")]
+fn mark_graph_node(device: &Device, index: usize) {
+    // A non-Metal device with the metal feature built in has no command
+    // buffers to cut. Silent rather than an error, for `admit_memory_budget`'s
+    // reason: a CPU run is a legitimate thing to do.
+    if let Ok(metal) = device.as_metal_device() {
+        metal.mark_graph_node(index);
+    }
+}
+
+/// No Metal, no command buffers, nothing to cut. The CPU and CUDA backends
+/// compile none of the above, which is the constraint upstreaming imposes
+/// (§14.1).
+#[cfg(not(feature = "metal"))]
+fn mark_graph_node(_: &Device, _: usize) {}
+
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vb_m = vb.pp("model");
@@ -2210,6 +2247,11 @@ impl Model {
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
         for (block_idx, layer) in self.layers.iter().enumerate() {
+            // The graph position, announced before the layer's dispatches are
+            // encoded so a seam lands at its first dispatch rather than after
+            // it (`DESIGN.md` §13.5m). A no-op unless the node-index cut is
+            // selected.
+            mark_graph_node(&cache.device, block_idx);
             hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
         }
 
@@ -2261,6 +2303,11 @@ impl Model {
 
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
         for (block_idx, layer) in self.layers.iter().enumerate() {
+            // Marked here as well as in `forward`, for `advance_conv_phase`'s
+            // reason below: two entry points over the same layer loop must not
+            // disagree about the graph position they are at. A verify pass
+            // encodes the same 30 nodes.
+            mark_graph_node(&cache.device, block_idx);
             hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
         }
         let hidden_states = self.embedding_norm.forward(&hidden_states)?.contiguous()?;

@@ -29,6 +29,17 @@ pub use candle_metal_kernels::metal::{
     hazard_key, set_hazard_key, ArenaCounters, ArenaLayout, HazardKey, Slot, StepPlan,
 };
 
+/// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).
+///
+/// Re-exported for the same reason `ArenaLayout` above is: a harness stating
+/// the arm on its `RESULT` line should not need a direct dependency on
+/// `candle-metal-kernels`. Unlike `hazard_key()` beside it this is **not**
+/// process-global — it is resolved once per `Commands` — so it is read from the
+/// device (`MetalDevice::cut_policy`) rather than from a free function, and a
+/// harness that reads the environment variable instead is reading the flag
+/// rather than the mechanism (§7.1a-i).
+pub use candle_metal_kernels::metal::CutPolicy;
+
 /// The memory budget: predict the peak before allocating, and refuse (§9.5).
 ///
 /// Re-exported for the same reason `trace` is: a model deciding whether its

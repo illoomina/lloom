@@ -2097,12 +2097,105 @@ fn main() -> Result<()> {
         "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
         args.prompt
     );
+
+    // **TTFT opens here** — see the block below for the definition. The clock
+    // starts before the tokenize because tokenizing is work the request causes:
+    // a caller hands over text, not ids. It is small (§13.7 measures the
+    // detokenize direction at 3.4-7.6 µs) and it is inside rather than argued
+    // away, because a bracket that excludes a term because it is small is the
+    // shape §2.5 exists to prevent.
+    let ttft_start = std::time::Instant::now();
+
     let prompt_ids = tokenizer
         .encode(prompt.as_str(), true)
         .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?
         .get_ids()
         .to_vec();
     anyhow::ensure!(!prompt_ids.is_empty(), "prompt tokenized to nothing");
+
+    // ---- TTFT: prompt submitted -> first token available -----------------
+    //
+    // **The request layer** (`DESIGN.md` §2.5.1), and the one row of that table
+    // that read *"no. Appears in prose repeatedly, measured never."* §2.5.4
+    // defines it and this is that definition, bracketed:
+    //
+    //     prompt submitted  ->  prefill  ->  one decode step  ->  the first
+    //                                                            sample
+    //
+    // # §2.5.4's decomposition names one term this loop does not have
+    //
+    // **There is no decode step before the first token, and the bracket is
+    // what shows it.** §2.5.4 writes TTFT as `prefill + one decode step + the
+    // first sample`; read against this loop, the decode loop is
+    // **sample-then-forward** — `sample()` at the top of iteration *i* consumes
+    // the logits iteration *i-1* produced, and for *i* = 0 it consumes **the
+    // prefill's**, which the `--sample-in-buffer` bootstrap above says in so
+    // many words. So the first token is the prefill's own argmax and the first
+    // decode forward runs only to produce the *second*.
+    //
+    // Measured, that is the difference between the two readings: `ttft -
+    // prefill_ms` is ~4.2-4.7 ms against a step of ~18 ms. Had the definition
+    // been implemented as written, TTFT would have been reported ~18 ms too
+    // large — which is §2.5's own thesis (*"two figures with different brackets
+    // subtracted"*) landing on the section that states it.
+    //
+    // # Three things the definition pins, each of which this clock obeys
+    //
+    // **It does not drain.** §2.5.4 names the profiler's own prefill bracket as
+    // the trap — `synchronize()` on both sides reads ~90 ms of *execution* where
+    // a user's loop does not drain and sees ~30 ms of *submission* (§14.5b
+    // finding 3) — and says *"the release-harness bracket is the one that
+    // matches what a user waits for."* So this clock opens before the tokenize
+    // and closes after the first token exists, with **no synchronize of its
+    // own**: the drain that does happen inside it is the one the decode loop
+    // was always going to do, at `to_scalar`.
+    //
+    // **It contains the sample.** *"The first token is not available until it
+    // has been sampled, so TTFT contains the sample by construction"* — which
+    // is the layer confusion the taxonomy exists to prevent appearing inside
+    // the definition of the quantity itself. Built from `wall_ms_per_token` it
+    // would understate by ~0.44 ms.
+    //
+    // **It is single-shot, so §14.5b's `n`-drift does not apply** — that is a
+    // property of the engine-cold layer, and this is the request layer.
+    //
+    // # Why it starts here and not at `main`
+    //
+    // A user's request arrives with the model already loaded; what they wait
+    // for is their prompt being answered, not the process starting. Model load
+    // is §2.4a's quantity and is measured there (page-in 7.01 s of a 6.66 s–16.5 s
+    // cold load, attacked by #298's `madvise`). Putting it inside TTFT would
+    // fold two quantities whose optimisations are unrelated — and would make
+    // the figure a property of the page cache, which §2.4's own
+    // *"cold-start quantity needs its cold state PROVED"* is about.
+    //
+    // **The consequence is that this figure is WARM-PROCESS TTFT and must be
+    // labelled one.** §2.5.4's *"what would make it wrong"* names *"quoting it
+    // from a warm process"* as a failure — for a *cold-start* TTFT, which is a
+    // different row. Both are real; the artifact states which this is, and the
+    // cold one is `prefill + this` plus §2.4a's load, not a re-bracket.
+    //
+    // # The one drain inside it, and why it is not the trap §2.5.4 names
+    //
+    // The prefill `synchronize()` below IS inside this window, and it stays
+    // there rather than being made conditional. §2.5.4's trap is about
+    // reporting `prefill_ms` — a *component* — from a draining bracket and then
+    // comparing it against a harness that does not drain, which is §14.5b
+    // finding 3's ~90 ms against ~30 ms. **TTFT is the total to the first
+    // token, and that total is drain-invariant to first order**: the first
+    // token cannot exist until the GPU has executed the prefill, so draining
+    // early moves work *within* the window rather than adding work to it. What
+    // it can cost is overlap — the CPU could have been encoding decode step 0
+    // while the prefill ran — and at a 34-token prompt that is bounded by the
+    // ~0.9 ms non-GPU term of one step against an ~87 ms prefill.
+    //
+    // **It is not made a flag**, deliberately. Removing the call would change
+    // `prefill_ms`, which is a field on every `RESULT` line this project has
+    // recorded (§7.1a's lesson about a quantity moving under a name), and this
+    // change is meant to ADD a layer rather than perturb one. The bound above
+    // is stated in the artifact instead, and the release-harness comparison
+    // §2.5.4 asks for is `lfm2-release`'s to make — which is a separate finding
+    // this PR records as absent from the monorepo.
 
     // ---- prefill, timed into its own bucket ------------------------------
 
@@ -2170,6 +2263,17 @@ fn main() -> Result<()> {
     // divergence is a finding and its `kv_len` is part of it.
     let mut batch_divergence: Option<(usize, usize, u32, u32)> = None;
     let mut hit_eos = false;
+    // Time to first token — the request layer (`DESIGN.md` §2.5.1, §2.5.4).
+    // `None` until the first token is pushed; see the close site for why it is
+    // there and not at the sample.
+    //
+    // **`None` is also the honest value on the speculative arm**, which has its
+    // own loop and does not set this. A window emits between 1 and K tokens, so
+    // "the first token" is the first of a batch the user could not have had
+    // sooner — a different quantity, and #284's is the harness that would own
+    // it. Reporting a number there would be reporting this one under that
+    // arm's name (§2.4's *"ask what a field's name promises"*).
+    let mut ttft: Option<std::time::Duration> = None;
     let mut last_token_kernels: Vec<(String, u64)> = Vec::new();
     // The speculative arm's counters. `spec.windows == 0` after a `--speculate`
     // run is the vacuity check §2.4 requires, asserted rather than printed.
@@ -2433,6 +2537,23 @@ fn main() -> Result<()> {
             hit_eos = true;
         }
         tokens.push(next);
+
+        // **TTFT closes here** (`DESIGN.md` §2.5.4, lloom #388 item 2).
+        //
+        // *After* `tokens.push`, because that is the instant the first token is
+        // available to the caller — the definition is *"prompt submitted ->
+        // first token available"*, and a token that has been sampled but not
+        // yet handed over is not yet available. In this harness "handed over"
+        // is the push onto `tokens`, which is what the seam, the digest and the
+        // EOS test all read.
+        //
+        // `is_none()` so it records the FIRST step only. A single-shot quantity
+        // (§2.5.4: *"the drift with `n` does not apply"*), so there is no mean
+        // and no warmup — one clock, one reading, and a run reports it whatever
+        // `--n` is.
+        if ttft.is_none() {
+            ttft = Some(ttft_start.elapsed());
+        }
 
         // **The front end's seam** (lloom #412), in `generate_raw`'s own
         // position: after the token is pushed and before the next forward pass
@@ -3033,6 +3154,33 @@ fn main() -> Result<()> {
     }
     println!();
 
+    // **Time to first token, decomposed rather than asserted** (§2.5.4, #388
+    // item 2). The residual is printed because it is the whole check on the
+    // claim beside the definition: this loop is sample-then-forward, so the
+    // first token is the prefill's own argmax and TTFT is `tokenize + prefill +
+    // one sample` rather than §2.5.4's `prefill + one decode step + one
+    // sample`. A residual near the sample bucket confirms that; a residual near
+    // a step would mean the bracket is closing a step late, which is the error
+    // this print makes visible instead of leaving to be inferred.
+    if let Some(t) = ttft {
+        let ttft_ms = t.as_secs_f64() * 1e3;
+        let prefill_ms = prefill_wall.as_secs_f64() * 1e3;
+        println!("=== time to first token (request layer, §2.5.1) ===");
+        println!("ttft                  {ttft_ms:.2} ms   <- prompt in -> first token out");
+        println!("  of which prefill    {prefill_ms:.2} ms");
+        println!(
+            "  residual            {:.2} ms   <- tokenize + the first sample",
+            ttft_ms - prefill_ms
+        );
+        println!(
+            "  cf. one step        {:.2} ms   <- NOT inside ttft: the first token is",
+            (wall_per_token + sample_mean + eos_mean) * 1e3
+        );
+        println!("                                     the PREFILL's argmax (see the bracket)");
+        println!("warm process: model already loaded. A cold-start TTFT adds §2.4a's load.");
+        println!();
+    }
+
     println!(
         "=== decode, steady state ({} steps, {} warmup excluded, B={batch}) ===",
         steady.len(),
@@ -3472,6 +3620,7 @@ fn main() -> Result<()> {
          batch_streams_identical={} spec_k={} spec_proposer={} spec_windows={} \
          spec_proposed={} spec_accepted={} spec_corrupted={} spec_accept_rate={:.4} \
          spec_tokens_per_step={:.4} spec_rows_agree={} prefill_ms={:.2} \
+         ttft_ms={} \
          prompt_tokens={} weight_bytes={} scratch_asks_bytes={} dtype={:?} hit_eos={} \
          seam={} seam_capacity={} seam_ms_per_token={:.4} \
          seam_detok_ms_per_token={:.4} seam_alloc_ns_priced={:.1} \
@@ -3568,6 +3717,18 @@ fn main() -> Result<()> {
             (_, _, true, true) => "FALSE",
         },
         prefill_wall.as_secs_f64() * 1e3,
+        // **Time to first token, the request layer** (§2.5.1, §2.5.4, #388
+        // item 2). Rendered `n/a` rather than `0.00` when unset, for #171's
+        // `UNRECORDED` reason applied to a field rather than to an axis: the
+        // speculative arm does not set it (see the declaration), and a `0.00`
+        // there would read as a measured zero — the fastest TTFT ever recorded
+        // — instead of as a question that arm cannot answer. §3.4a-x's rule in
+        // a timing field: an absent value is a scope question before it is a
+        // magnitude one.
+        match ttft {
+            Some(d) => format!("{:.2}", d.as_secs_f64() * 1e3),
+            None => "n/a".to_string(),
+        },
         prompt_ids.len(),
         weight_bytes,
         scratch_asks_bytes,

@@ -15,10 +15,33 @@
 // `get_strided_index` is templated on `PtrT`: the functor type is a kernel
 // template parameter (`l_indexer`, `r_indexer`), so it must not itself be
 // parameterised on the address space, or every instantiation row would double.
-// Templating `operator()` instead keeps `strided_indexer` one type that works
-// with either pointer.
+// Templating `operator()` instead keeps `strided_operand_indexer` one type that
+// works with either pointer.
+//
+// WHY `_operand_` IS IN THESE NAMES (issue #466).
+//
+// These three are per-OPERAND index POLICIES: `binary_kernel_strided` takes one
+// as `l_indexer` and one as `r_indexer`, so a row picks how the left and the
+// right operand are addressed independently. They are selected by name in the
+// `init_kernel` rows below and appear in no kernel name and in no Rust code.
+//
+// `reduce.metal` has an unrelated type that was ALSO called `strided_indexer`
+// -- a `template<ushort D, typename IndexT, typename PtrT>` with a `<1, ..>`
+// partial specialisation, chaining `next` to unroll rank 1..4 (its
+// `get_strided_index_t` switch). It takes `operator()(idx)` with dims/strides
+// as MEMBERS where the one below takes `operator()(idx, num_dims, dims,
+// strides)` and holds no state. That one KEEPS the bare name: three other files
+// (`conv`, `gemv`, `utils`) cite it by that name as the precedent for the
+// `PtrT` templating idea, so renaming it would falsify comments elsewhere.
+//
+// Two different designs, one name: not drift, and not deduplicable. In a merged
+// translation unit the shared name was `redefinition of 'strided_indexer' as a
+// different kind of symbol` -- a struct against a class template -- and it was
+// the ONLY remaining elementwise conflict after #458 hoisted the shared helpers.
+// All three siblings are renamed rather than just the colliding one, so the
+// family keeps one prefix and the next author is not invited to re-collide.
 
-struct cont_indexer {
+struct cont_operand_indexer {
     template <typename PtrT>
     METAL_FUNC uint operator()(
         uint idx,
@@ -30,7 +53,7 @@ struct cont_indexer {
     }
 };
 
-struct strided_indexer {
+struct strided_operand_indexer {
     template <typename PtrT>
     METAL_FUNC uint operator()(
         uint idx,
@@ -42,7 +65,7 @@ struct strided_indexer {
     }
 };
 
-struct scalar_indexer {
+struct scalar_operand_indexer {
     template <typename PtrT>
     METAL_FUNC uint operator()(
         uint idx,
@@ -168,8 +191,8 @@ template <
     typename T,
     typename U,
     typename binary,
-    typename l_indexer = strided_indexer,
-    typename r_indexer = strided_indexer,
+    typename l_indexer = strided_operand_indexer,
+    typename r_indexer = strided_operand_indexer,
     uint W = work_per_thread<T>()>
 [[kernel]] void binary_kernel_strided(
     constant size_t &dim,
@@ -190,8 +213,8 @@ template <
     typename T,
     typename U,
     typename binary,
-    typename l_indexer = strided_indexer,
-    typename r_indexer = strided_indexer,
+    typename l_indexer = strided_operand_indexer,
+    typename r_indexer = strided_operand_indexer,
     uint W = work_per_thread<T>()>
 [[kernel]] void binary_kernel_strided_packed(
     device const BinaryStridedParams *pp,
@@ -264,20 +287,20 @@ static_assert(alignof(BinaryStridedParams) == 8, "BinaryStridedParams alignment"
     init_kernel(#op_name "_" #tname "_packed", binary_kernel_packed, t, u, binary_op)                                                     \
     init_kernel(#op_name "_" #tname "_strided", binary_kernel_strided, t, u, binary_op)                                                   \
     init_kernel(#op_name "_" #tname "_strided_packed", binary_kernel_strided_packed, t, u, binary_op)                                     \
-    init_kernel(#op_name "_" #tname "_lstrided", binary_kernel_strided, t, u, binary_op, strided_indexer, cont_indexer)                   \
-    init_kernel(#op_name "_" #tname "_lstrided_packed", binary_kernel_strided_packed, t, u, binary_op, strided_indexer, cont_indexer)     \
-    init_kernel(#op_name "_" #tname "_rstrided", binary_kernel_strided, t, u, binary_op, cont_indexer, strided_indexer)                   \
-    init_kernel(#op_name "_" #tname "_rstrided_packed", binary_kernel_strided_packed, t, u, binary_op, cont_indexer, strided_indexer)     \
-    init_kernel(#op_name "_" #tname "_scalar", binary_kernel_strided, t, u, binary_op, scalar_indexer, scalar_indexer)                    \
-    init_kernel(#op_name "_" #tname "_scalar_packed", binary_kernel_strided_packed, t, u, binary_op, scalar_indexer, scalar_indexer)      \
-    init_kernel(#op_name "_" #tname "_cs", binary_kernel_strided, t, u, binary_op, cont_indexer, scalar_indexer)                          \
-    init_kernel(#op_name "_" #tname "_cs_packed", binary_kernel_strided_packed, t, u, binary_op, cont_indexer, scalar_indexer)            \
-    init_kernel(#op_name "_" #tname "_sc", binary_kernel_strided, t, u, binary_op, scalar_indexer, cont_indexer)                          \
-    init_kernel(#op_name "_" #tname "_sc_packed", binary_kernel_strided_packed, t, u, binary_op, scalar_indexer, cont_indexer)            \
-    init_kernel(#op_name "_" #tname "_rss", binary_kernel_strided, t, u, binary_op, scalar_indexer, strided_indexer)                      \
-    init_kernel(#op_name "_" #tname "_rss_packed", binary_kernel_strided_packed, t, u, binary_op, scalar_indexer, strided_indexer)        \
-    init_kernel(#op_name "_" #tname "_lss", binary_kernel_strided, t, u, binary_op, strided_indexer, scalar_indexer)                      \
-    init_kernel(#op_name "_" #tname "_lss_packed", binary_kernel_strided_packed, t, u, binary_op, strided_indexer, scalar_indexer)
+    init_kernel(#op_name "_" #tname "_lstrided", binary_kernel_strided, t, u, binary_op, strided_operand_indexer, cont_operand_indexer)                   \
+    init_kernel(#op_name "_" #tname "_lstrided_packed", binary_kernel_strided_packed, t, u, binary_op, strided_operand_indexer, cont_operand_indexer)     \
+    init_kernel(#op_name "_" #tname "_rstrided", binary_kernel_strided, t, u, binary_op, cont_operand_indexer, strided_operand_indexer)                   \
+    init_kernel(#op_name "_" #tname "_rstrided_packed", binary_kernel_strided_packed, t, u, binary_op, cont_operand_indexer, strided_operand_indexer)     \
+    init_kernel(#op_name "_" #tname "_scalar", binary_kernel_strided, t, u, binary_op, scalar_operand_indexer, scalar_operand_indexer)                    \
+    init_kernel(#op_name "_" #tname "_scalar_packed", binary_kernel_strided_packed, t, u, binary_op, scalar_operand_indexer, scalar_operand_indexer)      \
+    init_kernel(#op_name "_" #tname "_cs", binary_kernel_strided, t, u, binary_op, cont_operand_indexer, scalar_operand_indexer)                          \
+    init_kernel(#op_name "_" #tname "_cs_packed", binary_kernel_strided_packed, t, u, binary_op, cont_operand_indexer, scalar_operand_indexer)            \
+    init_kernel(#op_name "_" #tname "_sc", binary_kernel_strided, t, u, binary_op, scalar_operand_indexer, cont_operand_indexer)                          \
+    init_kernel(#op_name "_" #tname "_sc_packed", binary_kernel_strided_packed, t, u, binary_op, scalar_operand_indexer, cont_operand_indexer)            \
+    init_kernel(#op_name "_" #tname "_rss", binary_kernel_strided, t, u, binary_op, scalar_operand_indexer, strided_operand_indexer)                      \
+    init_kernel(#op_name "_" #tname "_rss_packed", binary_kernel_strided_packed, t, u, binary_op, scalar_operand_indexer, strided_operand_indexer)        \
+    init_kernel(#op_name "_" #tname "_lss", binary_kernel_strided, t, u, binary_op, strided_operand_indexer, scalar_operand_indexer)                      \
+    init_kernel(#op_name "_" #tname "_lss_packed", binary_kernel_strided_packed, t, u, binary_op, strided_operand_indexer, scalar_operand_indexer)
 
 #if defined(__HAVE_BFLOAT__)
 #define init_binary(bop)                            \

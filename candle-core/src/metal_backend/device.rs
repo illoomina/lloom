@@ -677,9 +677,18 @@ impl MetalDevice {
             .new_buffer(bytes, PRIVATE_RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         self.residency_set.insert(&base);
-        let arena = Arena::new(&self.private_buffers, base, plan, layout)
+        let arena = Arena::new(base, plan, layout)
             .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
         if let Ok(mut slot) = self.arena.write() {
+            // Unregister the arena being *replaced*, on the same argument as
+            // `clear_arena` and while it still owns its base (issue #489). This
+            // is latent today because nothing in the shipping engine replaces an
+            // arena -- one is installed and lives for the process -- but under
+            // #483's ring or any per-phase arena (§9.2's sizing discussion) the
+            // leak would be per replacement rather than one-off.
+            if let Some(previous) = slot.as_ref() {
+                self.residency_set.remove(previous.base());
+            }
             *slot = Some(arena);
         }
         Ok(())
@@ -749,10 +758,39 @@ impl MetalDevice {
     }
 
     /// Remove the arena. Subsequent allocations all take the pool path.
+    ///
+    /// # The residency removal, and why it is ordered this way (issue #489)
+    ///
+    /// [`Self::install_arena`] registers the base in the residency set, so
+    /// removing the arena has to unregister it -- otherwise the device retains
+    /// an allocation the arena has dropped, which is `DESIGN.md` §6.7 L4 at the
+    /// arena and the mechanism §6.3c records **panicking the machine**.
+    ///
+    /// The base is taken out of the set **while the arena still owns it**, so
+    /// `removeAllocation` names an object that provably still exists -- the same
+    /// ordering `PoolInner::drain_completed` uses when it tells the eviction
+    /// observer before destroying, and the ordering §6.3c's whole finding is
+    /// about. Dropping first and removing after would be the exact shape that
+    /// aborts.
+    ///
+    /// # Why this is here and not in `impl Drop for Arena`
+    ///
+    /// `Arena` is `Clone` and holds no residency handle, so a `Drop` there
+    /// would have to acquire one and would fire on whichever clone happened to
+    /// go last -- §6.3d's finding in a second place: the participant that owns
+    /// the set is the device, so the device is where the removal belongs.
+    ///
+    /// Nothing was calling this until #487's probe, which is why the omission
+    /// survived from #69 (§15.2 #11b, on a lifetime path rather than a
+    /// capability).
     pub fn clear_arena(&self) {
-        if let Ok(mut slot) = self.arena.write() {
-            *slot = None;
+        let Ok(mut slot) = self.arena.write() else {
+            return;
+        };
+        if let Some(arena) = slot.as_ref() {
+            self.residency_set.remove(arena.base());
         }
+        *slot = None;
     }
 
     pub fn arena(&self) -> Option<Arena> {

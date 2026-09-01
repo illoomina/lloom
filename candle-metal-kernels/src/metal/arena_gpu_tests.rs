@@ -572,9 +572,7 @@ fn an_arena_refuses_gpu_offsets_that_disagree_with_the_plan() {
     let base = device
         .new_buffer(plan.bump_capacity().max(1), crate::RESOURCE_OPTIONS)
         .unwrap();
-    let pool = crate::metal::BufferPool::new();
-    let arena =
-        crate::metal::Arena::new(&pool, base, plan.clone(), ArenaLayout::NonAliasing).unwrap();
+    let arena = crate::metal::Arena::new(base, plan.clone(), ArenaLayout::NonAliasing).unwrap();
 
     let correct: Vec<u32> = plan
         .expected_offsets()

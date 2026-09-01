@@ -77,7 +77,11 @@
 //! *execution* comparison rather than a size comparison: both layouts run the
 //! real model and their outputs are compared.
 
-use super::{ArenaOffsets, Buffer, BufferPool, PooledBuffer};
+// No `BufferPool` here: the arena does not touch the pool at all (issue #489).
+// Its slots are unpooled handles over its own base, which is what §9.2a's
+// layer 3 means -- the free list never sees them. The test module below imports
+// one of its own, to assert that installing an arena leaves it untouched.
+use super::{ArenaOffsets, Buffer, PooledBuffer};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -482,12 +486,17 @@ impl Arena {
     ///
     /// One `MTLBuffer` of `plan.arena_bytes()`, allocated once here and never
     /// again. The slot handles are created now and held until the arena drops.
-    pub fn new(
-        pool: &BufferPool,
-        base: Buffer,
-        plan: StepPlan,
-        layout: ArenaLayout,
-    ) -> Result<Self, String> {
+    ///
+    /// # This takes no pool, and that is the point (issue #489)
+    ///
+    /// It used to take a `&BufferPool` and `adopt` each slot into it, which is
+    /// what let a cleared arena's slots re-enter the free list. The parameter is
+    /// removed rather than ignored so the property is enforced by the signature:
+    /// **the arena cannot hand the pool a view of its base, because it is not
+    /// given a pool to hand it to.** §9.2a's layer 3 is defined by the free list
+    /// never seeing these buffers, and a comment is a weaker guarantee than an
+    /// argument that does not exist (§6.7 L2).
+    pub fn new(base: Buffer, plan: StepPlan, layout: ArenaLayout) -> Result<Self, String> {
         plan.check_disjoint()?;
         let needed = plan.arena_bytes();
         if base.length() < needed {
@@ -497,14 +506,41 @@ impl Arena {
             ));
         }
 
-        // One handle per slot, made once. `adopt` gives each a pool handle so it
-        // is the same type every consumer already takes -- but because the
-        // handles are held here for the arena's lifetime, none of them is ever
-        // dropped, so none ever reaches a free list. Layer 3 by construction.
+        // One handle per slot, made once, **unpooled**. Every consumer still
+        // takes the same `Arc<PooledBuffer>` it always did; what an unpooled
+        // handle changes is what happens when the last one drops.
+        //
+        // # Why not `adopt` (lloom issue #489)
+        //
+        // `adopt` installs a back-reference to the pool, so dropping a slot
+        // hands it *back* to the pool -- and a slot is a `Buffer::view` over the
+        // arena's base, not an allocation of its own. This code previously
+        // adopted, on the reasoning that "the handles are held here for the
+        // arena's lifetime, so none is ever dropped and none reaches a free
+        // list". That is true exactly while nothing drops the arena, and
+        // `MetalDevice::clear_arena` does: measured, clearing put all five
+        // slots of §9.2c's 69 632 B arena into `private_buffers`' free list,
+        // from which `acquire` -- which keys on **size alone** and knows
+        // nothing of provenance -- handed every one of them straight back out.
+        // Five "separate" activation buffers, all views of one dropped base at
+        // offsets 0/21504/43008/64512/68608, under
+        // `HazardTrackingModeUntracked` where §9.3 says there is no safety net.
+        //
+        // §6.7 L4 in its silent-corruption form, and the failure would be
+        // invisible: nothing downstream can tell a recycled arena view from an
+        // allocation, which is the whole reason the pool must never be offered
+        // one. Unpooled is `PooledBuffer::unpooled`'s stated purpose --
+        // "allocations that are deliberately outside the pool, so that callers
+        // which must not participate in reuse still get the same handle type"
+        // -- and the arena is §9.2a layer 3, which is defined by the free list
+        // never seeing its buffers.
+        //
+        // The base itself is unaffected: it is owned by `ArenaInner` and freed
+        // by Metal when the last `Arena` clone drops, exactly as before.
         let slot_handles = plan
             .slots()
             .iter()
-            .map(|s| pool.adopt(base.view(s.offset, s.size), s.size))
+            .map(|s| Arc::new(PooledBuffer::unpooled(base.view(s.offset, s.size), s.size)))
             .collect();
 
         Ok(Self {
@@ -1217,6 +1253,10 @@ impl ArenaRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Imported here rather than at module scope: the arena itself must not be
+    // able to reach a pool (issue #489), and the tests are the only thing that
+    // legitimately holds one.
+    use crate::metal::BufferPool;
     use crate::metal::Device;
 
     fn device() -> Device {
@@ -1230,7 +1270,7 @@ mod tests {
             .new_buffer(plan.arena_bytes().max(1), crate::RESOURCE_OPTIONS)
             .expect("arena allocation");
         let pool = BufferPool::new();
-        let arena = Arena::new(&pool, base, plan, layout).expect("plan is valid");
+        let arena = Arena::new(base, plan, layout).expect("plan is valid");
         (arena, pool)
     }
 

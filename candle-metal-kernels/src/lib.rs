@@ -7,6 +7,13 @@ pub mod utils;
 
 pub use err::MetalKernelError;
 pub use kernel::Kernels;
+// The two COMPILE-TIER arms, exported so a harness can state them on its
+// `RESULT` line (`DESIGN.md` §7.1a, §14.5a). Both are read back from the
+// `OnceLock` the compiler itself reads rather than echoed from a flag: an axis
+// rendered from the flag rather than from the mechanism is §7.1a-i's
+// *present-and-wrong* case, which is the unsafe direction because a false arm
+// compares equal to real runs of that arm.
+pub use kernel::{merged_translation_unit, metal_compile_flags};
 // `ParamStyle` used to arrive via `reduce::*`, where it was declared when
 // `reduce.metal` was the only family carrying both binding styles. It moved to
 // `kernels::params` when `conv.metal` followed (issue #42), so it is named

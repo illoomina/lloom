@@ -930,7 +930,65 @@ impl Axes {
                 "GemvResidual",
                 if self.gemv_residual { "on" } else { "off" },
             ),
+            // The two COMPILE-TIER axes (§7.1's first tier), which every axis
+            // above this line is not: these decide what the METALLIB contains,
+            // where the others select among kernels it already carries.
+            //
+            // **`MetalCflags` was the live instance of §2.3.9's failure.** The
+            // passthrough has existed since #434 and became load-bearing with
+            // #509 — `GemvResidual=on` REQUIRES
+            // `-DLLOOM_509_RESIDUAL_EPILOGUE` or the name is absent from the
+            // metallib — and it was in neither the registry nor this line. So
+            // two runs that compiled different programs rendered identical
+            // `config=[…]` fields and the store would have pooled them. Read
+            // from the crate's own `OnceLock` rather than from a flag, because
+            // §7.1a-i's present-and-wrong case is the unsafe direction.
+            //
+            // `MergedUnit` is #477's arm and is new, so every earlier run is
+            // honestly `UNRECORDED` on it rather than silently `off`.
+            p("MetalCflags", &Self::metal_cflags_arm()),
+            p("MergedUnit", Self::merged_unit_arm()),
         ]
+    }
+
+    /// The `MetalCflags` arm: the compile flags as the compiler resolved them.
+    ///
+    /// `none` rather than an empty string, for `MemoryBudget`'s reason: an arm
+    /// that renders as the empty string is indistinguishable from a field the
+    /// harness failed to fill in, and §7.1a-i is about exactly that confusion.
+    /// The flags are rendered **verbatim** — two different `-D`s are two
+    /// different metallibs and must not compare equal.
+    fn metal_cflags_arm() -> String {
+        #[cfg(feature = "metal")]
+        {
+            candle_metal_kernels::metal_compile_flags()
+                .map(|f| f.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            // No Metal compiler in this build, so there is no metallib for a
+            // flag to reach. Distinct from `none`, which means "a Metal build
+            // that set no flags".
+            "n/a".to_string()
+        }
+    }
+
+    /// The `MergedUnit` arm (#477): whether the sixteen non-MLX sources were
+    /// compiled as one translation unit.
+    fn merged_unit_arm() -> &'static str {
+        #[cfg(feature = "metal")]
+        {
+            if candle_metal_kernels::merged_translation_unit() {
+                "on"
+            } else {
+                "off"
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a"
+        }
     }
 
     /// The `CutPolicy` arm, with its period (`DESIGN.md` §13.5m).
@@ -3716,6 +3774,27 @@ fn main() -> Result<()> {
     // fell back to the blit. This is the window that used to segfault; printing
     // it is what makes its frequency a number rather than a crash report.
     let to_cpu_null_after_wait = candle::metal_backend::to_cpu_null_after_wait();
+    // #477's engagement quantity, read from the kernel cache after the run so
+    // it counts what the decode actually compiled rather than what a plan says
+    // it would (§2.4: verify an arm from a quantity the flag should have
+    // changed). Under `MergedUnit=off` the sixteen non-MLX sources each hold
+    // their own library; under `on` they share one.
+    let (metal_library_count, metal_pipeline_count) = {
+        #[cfg(feature = "metal")]
+        {
+            match &device {
+                candle::Device::Metal(d) => d.kernels().cache_sizes(),
+                // Not a Metal device, so there is no library cache. Reported as
+                // zeros with the pipeline total beside them, which is the
+                // reading `(0, 0)` is supposed to have.
+                _ => (0, 0),
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            (0usize, 0usize)
+        }
+    };
     println!(
         "RESULT label={} n={} warmup={} batch={} wall_ms_per_token={:.4} \
          gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} \
@@ -3735,6 +3814,7 @@ fn main() -> Result<()> {
          seam_send_max_ms_per_token={:.4} seam_instant_pair_ns={:.1} \
          seam_received={} seam_bytes={} \
          invol_csw_per_token={:.3} vol_csw_per_token={:.3} \
+         metal_libraries={} metal_pipelines={} \
          profiling={} config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
         args.n,
@@ -3872,6 +3952,21 @@ fn main() -> Result<()> {
         // is not externally readable — `pti_csw` is the sum (see `seam.rs`).
         invol_csw_per_token,
         vol_csw_per_token,
+        // #477's `MergedUnit` engagement proof, and it exists because **the
+        // dispatch census cannot see this axis**. The census counts which
+        // kernels ran; the merged arm changes which *library* each was
+        // compiled from and dispatches an identical set — measured
+        // byte-identical between the two arms, which is the correct outcome
+        // and is exactly why a census-only engagement claim would be vacuous.
+        // Reading §12.2i's instrument onto this axis is §15.1a's INEXPRESSIVE
+        // class, which #522 paid a run for.
+        //
+        // The library count is what the arm moves by construction: 19 → 4.
+        // **The pipeline total is what licenses it** (§14.5d): a probe that
+        // compiled nothing reports `(0, 0)`, and without the second number a
+        // small library count is indistinguishable from a broken read.
+        metal_library_count,
+        metal_pipeline_count,
         profiling,
         axes.config_line(),
         // Passed in by the caller rather than read from git here.

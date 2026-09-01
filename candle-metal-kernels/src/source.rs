@@ -83,6 +83,121 @@ pub const UNARY: &str = with_utils!(
 );
 pub const SDPA: &str = include_str!("metal_src/scaled_dot_product_attention.metal");
 
+/// The sixteen non-MLX sources as **one translation unit** (issue #477,
+/// `DESIGN.md` §13.1e/§13.1j).
+///
+/// # What this is for
+///
+/// #452 asked whether the per-file split hides cross-kernel dataflow and
+/// measured **no kernel's `__compute` moving on 17 of 17** — but it could not
+/// run the experiment as specified, because at that commit the 19 sources did
+/// **not** compile as one unit (3434 errors, 25 redefinitions). #458 hoisted
+/// the shared helpers and dissolved 18 of the elementwise cluster's 19 edges;
+/// #466/#477 resolved the last one (a `strided_indexer` KIND mismatch between
+/// `binary.metal` and `reduce.metal`) and verified by direct n-way compile that
+/// **all 16 non-MLX sources compile together with 0 errors**.
+///
+/// **That landed and nothing consumed it.** A merged unit that no code path
+/// compiles is a fusion the optimizer has never seen whole, and every
+/// `__compute` figure in the corpus was taken with **separate translation units
+/// and `-fno-lto` semantics**. This const is the consumer.
+///
+/// # Why the composition is what it is
+///
+/// **`utils.metal` is spliced exactly ONCE.** It carries no `#pragma once`
+/// deliberately (see the module header: *"there is one textual inclusion per
+/// library by construction"*), so concatenating two `with_utils!` consumers
+/// naively redefines every shared helper — a redefinition manufactured by the
+/// composition rather than present in the tree. `issue-466-raw/pairwise.sh`
+/// records this as the thing that would have measured a strawman.
+///
+/// **The prologue is the UNION of the members' prologues**, not any one
+/// member's: `reduce.metal` needs `<metal_limits>` and `unary.metal` needs
+/// `<metal_math>`, and a merged unit that took only the bare `<metal_stdlib>`
+/// line would fail to compile for a reason that is about the probe rather than
+/// about the merge.
+///
+/// # What is NOT in it, and why
+///
+/// The three MLX sources (`mlx_gemm`, `mlx_sort`, `sdpa`) are excluded: they
+/// carry mutually incompatible bodies for `BlockMMA`/`Limits`/`Transform*` and
+/// **collide on function-constant indices 200/201/300** (§13.1e's fourth
+/// collision class — a namespace the per-file split hides, where in one unit a
+/// caller supplying one kernel's constants would specialise the other's). That
+/// is a port rather than a merge (#409) and is #477's declared non-goal.
+///
+/// `quantized.metal` IS included even though LFM2 dispatches none of it
+/// (§11.2f): excluding it would make the merged arm's kernel set differ from
+/// the union of the split arm's for a reason unrelated to the merge, and a
+/// name present in one arm and absent in the other is a difference the
+/// engagement proof would have to explain.
+pub const MERGED_NON_MLX: &str = concat!(
+    // The union prologue. `unary` contributes <metal_math>, `reduce`
+    // contributes <metal_limits>, everything else the bare stdlib line.
+    "#include <metal_stdlib>\n#include <metal_limits>\n#include <metal_math>\nusing namespace metal;\n",
+    include_str!("metal_src/utils.metal"),
+    "\n",
+    include_str!("metal_src/affine.metal"),
+    "\n",
+    include_str!("metal_src/arena_alloc.metal"),
+    "\n",
+    include_str!("metal_src/binary.metal"),
+    "\n",
+    include_str!("metal_src/cast.metal"),
+    "\n",
+    include_str!("metal_src/conv.metal"),
+    "\n",
+    include_str!("metal_src/fill.metal"),
+    "\n",
+    include_str!("metal_src/flash_decoding.metal"),
+    "\n",
+    include_str!("metal_src/gemv.metal"),
+    "\n",
+    include_str!("metal_src/indexing.metal"),
+    "\n",
+    include_str!("metal_src/quantized.metal"),
+    "\n",
+    include_str!("metal_src/random.metal"),
+    "\n",
+    include_str!("metal_src/reduce.metal"),
+    "\n",
+    include_str!("metal_src/scratch.metal"),
+    "\n",
+    include_str!("metal_src/sort.metal"),
+    "\n",
+    include_str!("metal_src/ternary.metal"),
+    "\n",
+    include_str!("metal_src/unary.metal"),
+    "\n",
+);
+
+/// The [`Source`] variants [`MERGED_NON_MLX`] contains, in composition order.
+///
+/// **This list is what makes the arm checkable rather than asserted.** A
+/// `Source` added to the enum and not here keeps its own library under the
+/// merged arm — which is correct behaviour and silent, so
+/// `merged_unit_covers_every_non_mlx_source` in `kernel.rs` asserts the
+/// partition explicitly: every variant is either in this list or in the MLX
+/// set, and a new one fails the test rather than quietly opting out.
+pub const MERGED_MEMBERS: &[Source] = &[
+    Source::Affine,
+    Source::ArenaAlloc,
+    Source::Binary,
+    Source::Cast,
+    Source::Conv,
+    Source::Fill,
+    Source::FlashDecoding,
+    Source::Gemv,
+    Source::Indexing,
+    Source::Quantized,
+    Source::Random,
+    Source::Reduce,
+    Source::Scratch,
+    Source::Sort,
+    Source::Ternary,
+    Source::Unary,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
     Affine,

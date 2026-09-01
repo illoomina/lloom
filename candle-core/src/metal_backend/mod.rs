@@ -2208,7 +2208,25 @@ impl MetalStorage {
             // finished writing, and asking before means the answer can change
             // before it is used.
             self.device.flush_and_wait_current()?;
-            let src = self.buffer.contents();
+            // `black_box` is load-bearing under `lto = "thin"` and is not a
+            // micro-optimisation guard — measured 2026-09-01 (#445).
+            //
+            // The doc comment on `read_to_vec` below says this branch is kept
+            // because it is "a branch on a value the compiler cannot fold
+            // away". That is true within one codegen unit and FALSE across a
+            // thin-LTO boundary: with `[profile.release] lto = "thin"` the
+            // optimiser inlines `Buffer::contents()`, concludes the returned
+            // pointer is non-null, and deletes this test, the
+            // `TO_CPU_NULL_AFTER_WAIT` counter and the blit fallback with it —
+            // so a null `contents()` reaches `memmove` and segfaults, 8 of 8
+            // decode runs. Structurally: the null-branch-only counter symbol is
+            // present in a non-LTO build and ABSENT under LTO
+            // (`measurements/issue-445-raw/lto_mechanism.sh`).
+            //
+            // `black_box` makes the pointer opaque, so the test survives
+            // whatever the optimiser can prove about the ObjC getter. It costs
+            // one unfoldable move on a path that has just waited for the GPU.
+            let src = std::hint::black_box(self.buffer.contents());
             if !src.is_null() {
                 TO_CPU_FAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // The same pointer that was tested, not a second read of it.
@@ -2687,8 +2705,14 @@ impl BackendDevice for MetalDevice {
 /// on a value the compiler cannot fold away, and the caller above no longer
 /// relies on it: the fast path tests its own pointer and takes the blit when it
 /// is null. This is the second line of defence, not the first.
+///
+/// **"Cannot fold away" holds within a codegen unit and fails across a thin-LTO
+/// boundary — measured 2026-09-01 (#445).** Under `lto = "thin"` the panic's
+/// message string is absent from the binary here too, exactly as this comment
+/// records for the pre-#366 `assert!`. The `black_box` below is what keeps the
+/// test, and it is the same repair the fast path in `to_cpu` now carries.
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
-    let ptr = buffer.contents() as *const T;
+    let ptr = std::hint::black_box(buffer.contents()) as *const T;
     if ptr.is_null() {
         panic!(
             "read_to_vec: buffer has no CPU mapping (len={}, n={n})",
@@ -2939,12 +2963,26 @@ mod issue_336_to_cpu {
         let mapped = m.new_buffer(4064, DType::U32, "probe").unwrap(); // 16256 B
         let unmapped = m.new_buffer(4096, DType::U32, "probe").unwrap(); // 16384 B
 
+        // `black_box` is load-bearing under `lto = "thin"` — measured
+        // 2026-09-01 (#445, `DESIGN.md` §14.5c). Without it the second
+        // assertion FAILS under LTO while the pointer it claims to test is
+        // still `0x0`: the optimiser inlines `Buffer::contents()` across the
+        // crate boundary, proves the result non-null, and folds `is_null()`
+        // to `false`. Probed with the pointers printed, the two arms read
+        // 16256 B -> mapped and 16384 B -> `0x0` IDENTICALLY, so the threshold
+        // this test guards did NOT move — the test was being deleted, and
+        // without the probe it would have been read as the behaviour change it
+        // is written to detect. Same elision as the two production sites in
+        // `to_cpu` and `read_to_vec`, landing on the check for it.
+        let mapped_ptr = std::hint::black_box(mapped.contents());
+        let unmapped_ptr = std::hint::black_box(unmapped.contents());
+
         assert!(
-            !mapped.contents().is_null(),
+            !mapped_ptr.is_null(),
             "a 16256 B private allocation was expected to be CPU-mapped"
         );
         assert!(
-            unmapped.contents().is_null(),
+            unmapped_ptr.is_null(),
             "a 16384 B private allocation was expected NOT to be CPU-mapped; \
              if this fires the threshold moved and the fast path's hit rate \
              changed -- see measurements/issue-336-raw/threshold.txt"
@@ -2953,7 +2991,10 @@ mod issue_336_to_cpu {
         // Shared is mapped at both sizes, which is what makes the above a
         // statement about Private rather than about size alone.
         let big_shared = m.allocate_buffer(1 << 20).unwrap();
-        assert!(!big_shared.contents().is_null(), "shared must be mapped");
+        assert!(
+            !std::hint::black_box(big_shared.contents()).is_null(),
+            "shared must be mapped"
+        );
     }
 
     /// The env switch resolves, and it defaults to the fast path.

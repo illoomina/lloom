@@ -106,6 +106,26 @@ zerocopy = "0.8"
 objc2-metal = { version = "0.3.1" }
 objc2-foundation = { version = "0.3.1" }
 
+# Ambrogio's codegen flags, adopted here so the two trees agree — DESIGN.md
+# §14.5a (#297) recorded their ABSENCE as the finding: candle's workspace
+# declared no `[profile.release]`, so every harness built under cargo's defaults
+# (`codegen-units=16`, no LTO) while the consuming app shipped these three.
+#
+# Safe to enable because #297 MEASURED them: +0.133 % against a null control of
+# +0.133 %, the same figure — a null on every dimension. They reached the host
+# binary (9 173 920 → 8 066 752 B, −12.07 %) and did not reach the GPU, which is
+# the check that would have caught a kernel-side surprise. The bound is strong
+# on GPU busy and wall (±0.40 %) and weak on non-GPU (±6.0 %), so this does not
+# exclude a small real effect there.
+#
+# Declared in the manifest rather than passed as `--config` (#297's route) so
+# the tier is a property of the tree a reader can see, not of an invocation
+# nobody recorded.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
 [profile.release-with-debug]
 inherits = "release"
 debug = true

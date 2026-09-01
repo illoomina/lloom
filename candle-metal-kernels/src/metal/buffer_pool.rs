@@ -61,6 +61,7 @@
 //! predicate beside it -- it is only the signal that the buffer has no *future*
 //! CPU user. One clock decides reuse. See [`GpuClock`] and `PoolInner::release`.
 
+use super::cache_pad::CachePadded;
 use super::Buffer;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,10 +86,40 @@ use std::sync::{Arc, Mutex, Weak};
 /// conservative -- the buffer may have last been touched much earlier, or never
 /// touched at all -- and deliberately so: being wrong in this direction costs a
 /// little reuse latency, while being wrong in the other direction corrupts.
+///
+/// # The two counters are on different cache lines, and that is not tidiness
+///
+/// **They are written by different threads, concurrently** (issue #442).
+/// `submitted` is a `fetch_add` on the **host** thread, from
+/// `Commands::commit_swap_locked`; `completed` is a `fetch_max` from the
+/// **Metal completion handler**, which Metal delivers on a driver thread --
+/// the doc comment on [`Self::mark_completed`] says so in its own terms, since
+/// handlers for different command buffers may arrive on different threads.
+/// Nothing serialises the pair: the host commits the next buffer while the GPU
+/// is still retiring the last, which is the *normal* case rather than a race
+/// (§6.4: "whenever the CPU runs ahead of the GPU").
+///
+/// Unpadded they are adjacent `AtomicU64` in one 128 B line, so every
+/// increment by either invalidates the other's copy. It fires **~11-14 times
+/// per token** at §9.2f's command-buffer count -- not per dispatch, but not
+/// rare either.
+///
+/// Modelled on this hardware, two threads doing `atomic_fetch_add` at
+/// `memory_order_relaxed`: **164.60 Matomics/s on one line against 892.63 on
+/// two, a 5.42x penalty**. The padding emits no instruction and allocates
+/// nothing, so it cannot change what is computed -- which is why the digest
+/// gate for it is an *unmoved* pair rather than a new one.
+///
+/// **This is the write/write case and it is the one that pays.** A read-mostly
+/// flag measures 0.96x -- a wash -- and is deliberately not padded anywhere;
+/// [`super::cache_pad`] carries that measurement and the unit the rule needs.
 #[derive(Debug, Default)]
 pub struct GpuClock {
-    submitted: AtomicU64,
-    completed: AtomicU64,
+    /// Host thread, per committed command buffer.
+    submitted: CachePadded<AtomicU64>,
+    /// Metal completion handler, on a driver thread. Its own line -- see the
+    /// struct docs.
+    completed: CachePadded<AtomicU64>,
 }
 
 impl GpuClock {
@@ -1788,6 +1819,42 @@ mod tests {
 
         clock.mark_completed(0);
         assert!(clock.is_complete(0));
+    }
+
+    /// The two counters are written by **different threads concurrently** --
+    /// `submitted` by the host at commit, `completed` by Metal's completion
+    /// handler -- so they must not share a cache line (issue #442).
+    ///
+    /// Asserted on the **production struct** rather than on `CachePadded`
+    /// alone: `super::cache_pad`'s own tests prove the wrapper aligns, and this
+    /// proves `GpuClock` *uses* it. Reverting both fields to bare `AtomicU64`
+    /// passes every one of those tests and fails this one at **8 bytes apart**,
+    /// which is the whole difference between a mechanism existing and a
+    /// mechanism being applied.
+    ///
+    /// **One mutation SURVIVES and it is recorded rather than engineered
+    /// away**: unpadding `submitted` *alone* leaves this green, because
+    /// `completed`'s own 128 B alignment pushes it onto the next line anyway.
+    /// That is not a hole in the test -- the struct really is correct in that
+    /// arm, since what matters is that the pair does not share a line, and it
+    /// does not. **Padding one field of an adjacent pair is sufficient**; both
+    /// carry it here because which field needs padding is a property of who
+    /// writes it, and a third field inserted between them would re-share a line
+    /// with only one padded. **The test asserts the property, not the
+    /// spelling**, which is why it admits that arm.
+    #[test]
+    fn the_clocks_two_counters_do_not_share_a_cache_line() {
+        use crate::metal::cache_pad::CACHE_LINE;
+
+        let clock = GpuClock::new();
+        let submitted = &clock.submitted as *const _ as usize;
+        let completed = &clock.completed as *const _ as usize;
+        assert!(
+            completed.abs_diff(submitted) >= CACHE_LINE,
+            "GpuClock::submitted ({submitted:#x}) and ::completed ({completed:#x}) are within \
+             one {CACHE_LINE} B line -- the host thread and the completion handler would \
+             invalidate each other ~11-14 times per token"
+        );
     }
 
     /// Completion notifications for different command buffers may arrive on

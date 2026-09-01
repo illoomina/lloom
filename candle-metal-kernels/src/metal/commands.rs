@@ -1,6 +1,6 @@
 use crate::metal::{
-    executor::ExecutorSlot, BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder,
-    ComputePipeline, Device, Fence, GpuClock, PrevCeOutputs, ResidencySet,
+    cache_pad::CachePadded, executor::ExecutorSlot, BlitCommandEncoder, Buffer, CommandBuffer,
+    ComputeCommandEncoder, ComputePipeline, Device, Fence, GpuClock, PrevCeOutputs, ResidencySet,
 };
 use crate::MetalKernelError;
 use block2::RcBlock;
@@ -216,8 +216,30 @@ impl EntryState {
 }
 
 pub struct Commands {
-    state: Mutex<EntryState>,
-    compute_count: AtomicUsize,
+    /// The encoder state, and `compute_count` beside it, are on **different
+    /// cache lines** (issue #442).
+    ///
+    /// A lock word and a counter, both touched on the per-dispatch path:
+    /// `command_encoder` takes `state` and then does `compute_count.fetch_add`
+    /// (`:244`, `:245`), **~555 times per token** at §13.1a's decode census.
+    /// At B=1 that is one thread, so this is *structural rather than live* --
+    /// and the structure is what §11.3o and #317 put multiple threads through
+    /// one `Arc<Commands>` at B>1, where a `Mutex` handoff and a counter
+    /// increment on one line is exactly the shape that costs.
+    ///
+    /// Modelled on this hardware -- a lock word plus a counter, one thread on
+    /// each -- **15.89 Mops/s adjacent against 51.06 padded, so padding buys
+    /// 3.21x**. Zero instructions, zero allocation, zero effect on what is
+    /// computed.
+    ///
+    /// **Stated as latent rather than collected**: at B=1 the registered
+    /// prediction (§17) is a null, and it is padded now because the cost is
+    /// 128 B *once* for the process and retrofitting a layout after a
+    /// concurrency change is how the measurement gets attributed to the wrong
+    /// thing.
+    state: CachePadded<Mutex<EntryState>>,
+    /// Its own line -- see `state` above.
+    compute_count: CachePadded<AtomicUsize>,
     command_queue: CommandQueue,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
@@ -327,8 +349,8 @@ impl Commands {
         let cb = create_command_buffer(&command_queue)?;
 
         Ok(Self {
-            state: Mutex::new(EntryState::new(cb)),
-            compute_count: AtomicUsize::new(0),
+            state: CachePadded::new(Mutex::new(EntryState::new(cb))),
+            compute_count: CachePadded::new(AtomicUsize::new(0)),
             command_queue,
             compute_per_buffer,
             cut_policy,

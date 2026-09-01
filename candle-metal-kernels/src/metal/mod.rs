@@ -10,6 +10,10 @@ pub mod arena_cursor;
 mod arena_gpu_tests;
 pub mod buffer;
 pub mod buffer_pool;
+/// Cache-line padding for control state written by two threads (issue #442).
+/// The unit is load-bearing -- 128 B per *struct instance*, never per element;
+/// the module docs carry the 64x blowup the second half prevents.
+pub mod cache_pad;
 pub mod command_buffer;
 pub mod commands;
 /// Component digests: one fingerprint per mechanism per variant (#105).

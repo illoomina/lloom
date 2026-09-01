@@ -152,6 +152,28 @@ impl LogitsProcessor {
     }
 
     pub fn sample_f(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
+        // The `ArgMax` arm takes its own path over the UNCAST logits.
+        //
+        // `to_dtype(F32)` below is one `cast_f16_f32` dispatch over the whole
+        // vocabulary -- 128 000 elements for LFM2 (`DESIGN.md` §11.2a's dispatch
+        // census) -- and `argmax` reads none of the f32 values it produces: it
+        // returns an *index*, and `reduce_op` already has `fast_argmax_f16`,
+        // `_bf16` and every other dtype wired
+        // (`candle-core/src/metal_backend/mod.rs`, the contiguous reduce table).
+        // So on this arm the cast is work whose result is discarded.
+        //
+        // Widening f16 -> f32 is monotone and injective, so it cannot reorder
+        // two logits and cannot move the argmax index. Ties are the one place
+        // the two paths could differ -- both kernels break them by returning the
+        // lowest index, which is asserted rather than assumed
+        // (`the_f16_argmax_index_matches_the_f32_path`).
+        //
+        // Only `ArgMax` is claimed. Every temperature > 0 arm reads the f32
+        // values through `prs`, needs the f32 softmax, and is untouched
+        // (`DESIGN.md` §11.2c measures that path at 73.7 % host sort).
+        if self.sampling == Sampling::ArgMax {
+            return self.sample_argmax(logits.clone());
+        }
         let logits = logits.to_dtype(DType::F32)?;
         let prs = |temperature: f64| -> Result<Vec<f32>> {
             let logits = (&logits / temperature)?;
@@ -162,6 +184,8 @@ impl LogitsProcessor {
         };
 
         let next_token = match &self.sampling {
+            // Handled above, over the uncast logits, so the `ArgMax` arm does
+            // not pay the whole-vocabulary cast it never reads.
             Sampling::ArgMax => self.sample_argmax(logits)?,
             Sampling::GumbelSoftmax { temperature } => {
                 self.sample_gumbel_softmax(&logits, *temperature)?

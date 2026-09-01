@@ -8,6 +8,17 @@
 //! harness is the mechanism that would *generate* the evidence, which the issue
 //! names as the deliverable rather than the choice.
 //!
+//! **The sizing half of that is now stale and the layout half is not (#526).**
+//! #234 wired `ScratchSizing` to FlashDecoding's own allocation and #274
+//! (§9.1f) swept all three arms across the curve *through the real kernel*, so
+//! the sizing evidence exists and did not come from here. The arms still stay
+//! unchosen -- they separate at `kv_len` 4034 and at neither neighbour.
+//!
+//! **What this harness is still the only instrument for is `--layout`.**
+//! `flash_decoding.metal` is hardcoded to the planes layout and takes no layout
+//! parameter, so §9.1d's **+45.5 % per record** for the interleaved arm was
+//! measured here and can be re-derived only here.
+//!
 //! It reports two things at every `kv_len`, and the separation is the point:
 //!
 //! - **footprint and waste**, which are computed and exact -- pure arithmetic

@@ -709,8 +709,19 @@ impl MetalDevice {
     /// the allocator computes the same table every step. Running it per token
     /// would burn a dispatch and a readback to re-derive a constant.
     ///
-    /// What *is* per step is the reset, and it stays that way for the reason
-    /// `call_arena_reset` gives: it is the ordering point, not a computation.
+    /// **Nothing here is per step, and this comment used to claim otherwise**
+    /// (#526). It read *"what **is** per step is the reset"*; measured on the
+    /// call graph, `call_arena_reset` has no caller outside tests, and it
+    /// cannot acquire one as this path is built: the `ArenaCursor` below is a
+    /// local, dropped when this function returns, and `adopt_gpu_offsets`
+    /// copies the verified table into the plan that binding then reads. **There
+    /// is no cursor left to reset.**
+    ///
+    /// The reset becomes per step under §11.5's GPU-driven loop, where an
+    /// encoding kernel consumes offsets without the readback below and the
+    /// cursor is genuinely live across steps. Until then it is a tested
+    /// capability with no consumer, which `arena_alloc.rs` now says in the one
+    /// place a reader of that kernel will look.
     ///
     /// # The readback, stated plainly
     ///

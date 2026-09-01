@@ -1,10 +1,40 @@
 //! Dispatching the GPU-side arena bump allocator (`DESIGN.md` §9.2d, issue #70).
 //!
 //! Three entry points, and the asymmetry between them is deliberate:
-//! [`call_arena_bump`] is the one the decode path uses,
+//! [`call_arena_bump`] is the one the install path uses,
 //! [`call_arena_bump_concurrent`] exists only so a test can demonstrate why the
-//! first one is single-threaded, and [`call_arena_reset`] is the per-step reset
-//! whose ordering is the subtle part of the whole issue.
+//! first one is single-threaded, and [`call_arena_reset`] is the reset whose
+//! ordering is the subtle part of the whole issue.
+//!
+//! # None of the three runs per step, and this file used to say one did (#526)
+//!
+//! The text here read *"[`call_arena_reset`] is the per-step reset"*, and
+//! `metal_backend/device.rs` said *"what **is** per step is the reset"*. **Both
+//! were comments and neither was ever true of a shipped configuration.**
+//!
+//! `install_gpu_arena_offsets` bump-allocates **once at install** (§9.2g,
+//! deliberately -- *"doing it once at install rather than per token is what
+//! keeps the cost off the per-token path entirely"*), reads the offsets back,
+//! and hands them to `Arena::adopt_gpu_offsets`, which verifies them
+//! element-wise and copies them into the plan. **Binding then reads the plan.**
+//! The [`ArenaCursor`](crate::ArenaCursor) is a local in that function and is
+//! dropped when it returns; no cursor outlives install, on the device or
+//! anywhere else.
+//!
+//! So a per-step reset caller does not merely happen to be absent -- **there is
+//! no cursor for it to reset.** That is what separates this from
+//! `clear_arena` (§9.2m, #489), where a caller genuinely should have existed
+//! and the function was wrong in two ways when one finally ran. Here the
+//! design moved and the comments did not: this is the **`ArenaOffsets::Gpu`
+//! path as built**, not a gap in it.
+//!
+//! **What would make the reset live** is the GPU-driven token loop (§11.5),
+//! where an encoding kernel consumes offsets without a host round-trip. Then
+//! the cursor is per-step state, the reset opens each step, and the ordering
+//! this file documents becomes load-bearing rather than latent. The kernel and
+//! its two ordering tests are kept for that consumer -- §15.2 #11's *keep as
+//! evidence*, with the reason now written down rather than implied by a
+//! comment that misdescribed it.
 
 use crate::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, Device, EncoderProvider, Kernels,
@@ -116,7 +146,13 @@ pub fn call_arena_bump_concurrent(
     Ok(())
 }
 
-/// Reset the cursor, opening a new decode step.
+/// Reset the cursor, opening a new step.
+///
+/// **Nothing on a model path calls this** -- see the module header. The
+/// shipping `ArenaOffsets::Gpu` path bump-allocates once at install and binds
+/// through the adopted table, so no cursor survives to be reset. Its consumer
+/// is §11.5's GPU-driven loop; what is below is the ordering argument that
+/// consumer will need, and it is tested today (#526).
 ///
 /// # The ordering, which is the point of this function
 ///

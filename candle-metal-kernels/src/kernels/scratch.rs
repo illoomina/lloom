@@ -10,6 +10,45 @@
 //! **This does not implement FlashDecoding** -- see `scratch.metal`'s header.
 //! It writes the partials in the right shape and merges them in the order §10.4
 //! requires, so the memory behaviour can be tested before the arithmetic exists.
+//!
+//! # The arithmetic now exists, and what that leaves this file doing (#526)
+//!
+//! **The real kernel superseded most of this and nothing told it.** These
+//! entry points read **zero production callers** on #525's caller census, and
+//! the reason is not that a wiring was forgotten:
+//!
+//! - **The sizing axis is wired, to the real kernel.** §7.1b's prerequisite --
+//!   *"connect `ScratchSizing` to FlashDecoding's allocation"* -- was
+//!   discharged by **#234**. `candle-nn/src/ops.rs` calls
+//!   [`Sizing::sized_chunks`](crate::metal::scratch::Sizing::sized_chunks),
+//!   the same function [`plan_scratch`](crate::plan_scratch) calls, so the two
+//!   cannot disagree about what an arm means. §9.1f's three arms were measured
+//!   through that seam.
+//! - **The addressing distinction is wired too, as a parameter.**
+//!   `SIZING::fixed_offsets` selects between the sized and the live chunk
+//!   count for the write stride; `flash_decoding.metal`'s
+//!   `FlashPartialParams::chunk_capacity` is that same choice made at run time
+//!   -- *"the partial stride must be the reserved count"*.
+//! - **The properties are re-pinned on the real path.**
+//!   `flash_reserving_capacity_is_bit_identical_to_grow`,
+//!   `combine_walks_chunks_in_ascending_index_order` and
+//!   `flash_is_bit_stable_across_runs` assert on the real kernel what
+//!   `every_policy_computes_the_same_bits`, `the_combine_walks_chunks_in_...`
+//!   and `the_merge_is_bit_stable_across_runs` assert here.
+//!
+//! **What is NOT duplicated is the layout axis, and that is why this stays.**
+//! [`ScratchLayout::Interleaved`](crate::ScratchLayout) has no consumer outside
+//! this stub: `flash_decoding.metal` is hardcoded to the **planes** layout and
+//! takes no layout parameter. §9.1d's **+45.5 % per record** for the
+//! interleaved arm was measured *here*, and this stub is the only instrument
+//! that can measure it -- so retiring the file would delete the evidence for a
+//! recorded finding and the means of re-deriving it (§15.2 #11, *keep as
+//! evidence*).
+//!
+//! So: **kept deliberately, and no longer described as a stub awaiting a
+//! wiring that already happened.** What would consume it is a FlashDecoding
+//! kernel that takes the layout as an axis, which §9.1d's figure is the
+//! argument for and which nothing has yet been asked to build.
 
 use crate::metal::scratch::Sizing;
 use crate::{

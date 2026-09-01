@@ -31,10 +31,23 @@ using namespace metal;
 // parameter** -- and §11.3b's `ParamStyle` is the Rust-side mirror of the same
 // idea. `SIZING` here is that move applied to a third axis.
 //
-// Which policy wins is **unmeasured**, because the regime that distinguishes
-// them is long context and the largest `kv_len` this project has ever recorded
-// is 2720 (§13.2, `.bench/` §3). So none is chosen: all three compile, and the
-// A/B that would choose one is the deliverable rather than the choice.
+// Which policy wins was **unmeasured** when this was written, because the
+// regime that distinguishes them is long context and the largest `kv_len` this
+// project had then recorded is 2720 (§13.2, `.bench/` §3). So none was chosen:
+// all three compile, and the A/B that would choose one was the deliverable
+// rather than the choice.
+//
+// **Both halves of that have since moved, and this comment did not (#526).**
+// #234 wired the axis to `candle-nn`'s FlashDecoding allocation and made
+// `Grow` the default; #274 (§9.1f) then ran all three arms across the curve
+// and found they separate at `kv_len` 4034 and at neither of its neighbours --
+// so the policies stay unchosen on evidence rather than for want of it.
+//
+// **That measurement ran through the real kernel, not through this file.** The
+// `SIZING` template parameter is the same choice `FlashPartialParams::
+// chunk_capacity` now makes at run time. What is still only here is the
+// **layout** axis -- `flash_decoding.metal` is hardcoded to planes and takes no
+// layout parameter -- and that is what this file is now kept for.
 
 /// Region alignment. Must equal `ARENA_ALIGNMENT` on the Rust side.
 ///

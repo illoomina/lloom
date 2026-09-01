@@ -114,12 +114,6 @@ struct Model {
     // The clock.
     submitted: u64,
     completed: u64,
-    /// Set by `reset_counters`, cleared by the next write to the real gauge.
-    /// See the KNOWN DEFECT note at `Op::ResetCounters`.
-    pending_gauge_zeroed: bool,
-    /// How many times the known defect was accommodated, so a run can report
-    /// that the accommodation is load-bearing rather than dead code.
-    pending_defect_hits: u64,
 }
 
 impl Model {
@@ -171,9 +165,6 @@ impl Model {
         self.releases += 1;
         self.deferred += 1;
         self.pending.push_back((size, self.submitted));
-        // `release` rewrites the gauge (`state.counters.pending =
-        // state.pending.len()`), so it repairs the zeroing.
-        self.pending_gauge_zeroed = false;
     }
 
     fn is_complete(&self, epoch: u64) -> bool {
@@ -196,11 +187,6 @@ impl Model {
         }
         if moved > 0 {
             self.drained += moved;
-            // `drain_completed` rewrites the gauge, but ONLY when it moved
-            // something -- the write is inside `if drained > 0`. A drain that
-            // moves nothing leaves a zeroed gauge zeroed, which is the same
-            // defect surviving a second operation.
-            self.pending_gauge_zeroed = false;
             self.evict_over_budget();
         }
     }
@@ -419,25 +405,16 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<(), String> {
                 model.deferred = 0;
                 model.drained = 0;
                 model.evicted = 0;
-                // KNOWN DEFECT, found by this fuzzer and recorded in
-                // `buffer_pool::tests::issue_494_reset_counters_zeroes_the_pending_gauge`.
+                // Nothing else to teach the model. `reset_counters` zeroes the
+                // accumulators and touches no live figure, because #507 moved
+                // the one gauge out of `PoolCounters` entirely.
                 //
-                // `counters.pending` is a GAUGE (its only two write sites are
-                // `= state.pending.len()`, where the other eight fields are
-                // `+=`), but `reset_counters` zeroes the whole `PoolCounters`
-                // struct -- so it zeroes a live occupancy figure and the pool
-                // then disagrees with its own `occupancy().pending_buffers`.
-                //
-                // The model reproduces the DEFECTIVE behaviour here, on purpose
-                // and under protest, so that this one known finding does not
-                // mask every later operation in every generated sequence. It is
-                // deliberately NOT silent: `pending_defect_hits` counts it, and
-                // `the_known_pending_defect_is_still_present` fails if the
-                // repair lands and this quirk is left behind -- so the
-                // workaround cannot outlive the bug (§2.6a's shape: name the
-                // mechanism that invalidates the accommodation).
-                model.pending_gauge_zeroed = true;
-                model.pending_defect_hits += 1;
+                // This arm used to reproduce a DEFECT on purpose -- the model
+                // set `pending_gauge_zeroed` so that one known finding did not
+                // mask every later operation in every generated sequence -- and
+                // the accommodation was written with its own expiry, per
+                // §2.6a. The repair landed, so the accommodation is gone rather
+                // than left behind to become a permanent lie.
             }
         }
         compare(&pool, &clock, &model, i, op)?;
@@ -475,13 +452,9 @@ fn compare(
     check("deferred", c.deferred, model.deferred);
     check("drained", c.drained, model.drained);
     check("evicted", c.evicted, model.evicted);
-    // The gauge, accommodating the known defect. See `Op::ResetCounters`.
-    let want_gauge = if model.pending_gauge_zeroed {
-        0
-    } else {
-        model.pending.len() as u64
-    };
-    check("pending(counter)", c.pending, want_gauge);
+    // How many buffers are parked is an OCCUPANCY figure and is checked as one
+    // below (`pending_buffers`). Until #507 it was also mirrored into
+    // `PoolCounters`, and the mirror is what `reset_counters` could zero.
     check(
         "live_buffers",
         occ.live_buffers as u64,
@@ -711,44 +684,63 @@ fn the_generator_actually_reaches_the_interesting_states() {
     );
 }
 
-/// The accommodation in the model must not outlive the defect it accommodates.
+/// **`PoolCounters` holds accumulators only**, checked in source (#507).
 ///
-/// `Op::ResetCounters` teaches the model to reproduce a **known bug** so that
-/// one finding does not mask every later operation in every generated sequence.
-/// That is a debt, and this is what stops it becoming a permanent lie: if the
-/// repair lands and the quirk is left behind, the model would be wrong in the
-/// other direction and nothing else would say so.
+/// This replaces `the_known_pending_defect_is_still_present`, which existed to
+/// stop the model's accommodation for #494 outliving the bug. The repair landed,
+/// the accommodation is gone, and what is worth keeping is the *class* being
+/// closed rather than the instance: `reset_counters` zeroes the whole struct, so
+/// **any** gauge added to it is silently zeroed while the state it describes is
+/// unchanged. That is what made #494's finding possible, and it is a property of
+/// the struct rather than of the field that happened to carry it.
 ///
-/// This is `CONTRIBUTING.md` §2.6a's rule applied to a test fixture -- name the
-/// mechanism that invalidates the accommodation, so it is re-checkable rather
-/// than a comment nobody re-reads.
+/// **It has to read the source, because the defect is a WRITE SHAPE.** A runtime
+/// test can only catch a gauge that some sequence disturbs -- which is the test
+/// in `buffer_pool::tests` and is the right check for the field that existed.
+/// The generalisation is *"nothing here is assigned"*, and an assignment among
+/// the `+=` is visible in the text and invisible to any pool state. Same
+/// reasoning, and the same mechanism, as `Buffer`'s
+/// `load_bearing_contents_sites_keep_their_black_box`.
+///
+/// Mutation-tested: adding `state.counters.<field> = ...` to `buffer_pool.rs`
+/// makes this fail.
 #[test]
-fn the_known_pending_defect_is_still_present() {
-    let dev = device();
-    let clock = Arc::new(GpuClock::new());
-    let pool = BufferPool::with_clock(Arc::clone(&clock));
+fn pool_counters_holds_accumulators_only() {
+    let src = include_str!("buffer_pool.rs");
 
-    let raw = dev
-        .new_buffer(512, crate::RESOURCE_OPTIONS)
-        .expect("allocation");
-    drop(pool.adopt(raw, 512));
+    // Only the production half. This module's own doc comments quote the
+    // defective `counters.pending =` line, and a check that reads its own
+    // description reports on the wrong text -- §15.1a's vacuous class, in the
+    // guard written to prevent a regression.
+    let production = src
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields one element");
 
-    assert_eq!(pool.occupancy().pending_buffers, 1);
-    pool.reset_counters();
+    let writes: Vec<&str> = production
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+        .filter(|l| l.contains("counters."))
+        .filter(|l| l.contains('=') && !l.contains("+=") && !l.contains("=="))
+        .collect();
 
-    assert_eq!(
-        pool.counters().pending,
-        0,
-        "`reset_counters` no longer zeroes the pending gauge -- the #494 defect \
-         appears to be FIXED. Remove the `pending_gauge_zeroed` accommodation in \
-         this module's `Op::ResetCounters` arm and un-ignore \
-         `buffer_pool::tests::issue_494_reset_counters_zeroes_the_pending_gauge`."
+    assert!(
+        production.contains("counters.releases += 1"),
+        "no counter increment found in buffer_pool.rs -- was the struct renamed? \
+         A guard that finds nothing to check passes for the wrong reason."
     );
-    assert_eq!(
-        pool.occupancy().pending_buffers,
-        1,
-        "occupancy stopped seeing the parked buffer -- that is a DIFFERENT and \
-         larger defect than the one this test pins"
+
+    assert!(
+        writes.is_empty(),
+        "a field of `PoolCounters` is ASSIGNED rather than incremented:\n    {}\n\
+         That makes it a GAUGE -- a figure describing the pool's state now -- and \
+         `reset_counters` zeroes the whole struct, so it will be zeroed while the \
+         state it describes is unchanged. That is lloom #494's defect, repaired in \
+         #507 by moving `pending` into `PoolOccupancySnapshot`. Live figures belong \
+         in `occupancy()`, derived from the state they describe; `PoolCounters` is \
+         events since the last reset. DESIGN.md §6.7 L2.",
+        writes.join("\n    ")
     );
 }
 

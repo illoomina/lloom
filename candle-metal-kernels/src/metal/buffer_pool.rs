@@ -272,6 +272,31 @@ impl Drop for PooledBuffer {
 
 /// Statistics, maintained unconditionally because they are counter increments
 /// on a path that already takes a lock. Read via `MetalDevice::pool_stats`.
+///
+/// # Every field here is an ACCUMULATOR, and that is now a property rather than
+/// an observation (issue #507)
+///
+/// Each one counts events since the last [`BufferPool::reset_counters`], so
+/// zeroing the struct is the whole meaning of resetting it. A **gauge** -- a
+/// figure describing the pool's state *now* rather than its history -- cannot
+/// live here, because `reset_counters` has no way to tell the two apart and
+/// would zero a quantity nothing had changed.
+///
+/// This carried one until #507: `pending` was written as an assignment of
+/// `state.pending.len()` where every other field is `+=`, so `reset_counters`
+/// left `counters().pending` reading 0 while `occupancy().pending_buffers` read
+/// 1 -- **two public accessors of one pool disagreeing about how many buffers
+/// await the GPU, at one instant, with nothing having changed about the GPU.**
+/// It now lives only in [`PoolOccupancySnapshot::pending_buffers`], where every
+/// other live figure already lived, derived from `state.pending` at the moment
+/// it is asked for rather than mirrored.
+///
+/// **The repair removes the class, not the instance.** Re-deriving the gauge
+/// inside `reset_counters` would have fixed this field and left the next one
+/// added here free to reintroduce it; a struct whose every member is an
+/// accumulator cannot express the defect. That is `DESIGN.md` §6.7 **L2** --
+/// state duplicated and then not kept -- and a duplicate that can disagree is
+/// worse than one that cannot.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PoolCounters {
     /// Calls into `acquire`.
@@ -303,8 +328,6 @@ pub struct PoolCounters {
     pub deferred: u64,
     /// Buffers moved from the pending list into a free list on GPU completion.
     pub drained: u64,
-    /// Buffers currently parked waiting for the GPU.
-    pub pending: u64,
     /// Free buffers destroyed to keep the free list inside its byte budget.
     ///
     /// Nonzero means the workload is freeing sizes it does not ask for again --
@@ -588,7 +611,9 @@ impl PoolInner {
             size,
             epoch,
         });
-        state.counters.pending = state.pending.len() as u64;
+        // No gauge to update: how many buffers are parked is `state.pending`
+        // itself, which `occupancy()` reports (issue #507). Mirroring it into
+        // `PoolCounters` is what let `reset_counters` zero it.
     }
 
     /// Moves everything whose epoch has completed into the free lists.
@@ -632,7 +657,6 @@ impl PoolInner {
         }
         if drained > 0 {
             state.counters.drained += drained;
-            state.counters.pending = state.pending.len() as u64;
             let evicted = state.evict_over_budget();
             // Drop the lock before telling the observer, and tell it before the
             // buffers are destroyed: `evicted` still owns them here, so the
@@ -1043,7 +1067,63 @@ impl BufferPool {
     ///
     /// `size` must be the buffer's allocated length, since that is the bucket
     /// it returns to.
+    ///
+    /// # The pool takes allocations, never views (issue #507)
+    ///
+    /// `acquire` keys on **size alone**. Two free buffers of one size are
+    /// interchangeable *because each owns its whole `MTLBuffer`*; that premise
+    /// is what makes an O(1) bucket lookup correct, and §6.3a chose it
+    /// deliberately. A [view](Buffer::view) breaks it: N views of one allocation
+    /// are N distinct handles at **one base address**, so handing two of them
+    /// out aliases two unrelated tensors onto one region -- the #23 corruption
+    /// class, under `HazardTrackingModeUntracked` where §9.3 says there is no
+    /// safety net and §2.3.2 says the result is indistinguishable from benign
+    /// float noise.
+    ///
+    /// **This is checked here rather than at `acquire`, and that is the design
+    /// decision rather than an implementation detail.** The two are not
+    /// equivalent placements of one check:
+    ///
+    /// - `acquire` is the **hot** path -- §6.3b measures ~11.6 buffers destroyed
+    ///   per token -- so a check there pays on every lookup, forever, to
+    ///   re-discover a property that is decided once, when the buffer enters.
+    /// - `adopt` is **rare**: it is reached only on a pool *miss*, where the
+    ///   caller has just called `newBufferWithLength`, which costs orders of
+    ///   magnitude more than a bool test on a field already in cache.
+    /// - and a check at `acquire` fires at the **wrong instant**. It reports the
+    ///   aliasing when the second handle is handed out, with nothing to say who
+    ///   put the buffer in the free list; here it fires at the site that
+    ///   violated the invariant, which is the one that has to change.
+    ///
+    /// **The invariant holds by construction today**, audited for #507: both
+    /// production callers (`MetalDevice::new_buffer` and
+    /// `MetalDevice::allocate_buffer`) pass the direct result of
+    /// `device.new_buffer(...)`, and the only `Buffer::view` producer in the
+    /// tree is `Arena::new`, which builds [`PooledBuffer::unpooled`] and is no
+    /// longer handed a pool at all (§9.2m). So this guards a property that is
+    /// currently true rather than repairing one that is not -- #505 fixed the
+    /// single path that violated it, and what it left behind was that **nothing
+    /// prevented the next one**, which is that section's own closing question.
+    ///
+    /// A `debug_assert!` because the property is already enforced by a
+    /// *signature* at the only site that could break it, so this is the
+    /// backstop rather than the mechanism; and because a violation is a
+    /// programming error rather than a resource one, where §9.5e's argument
+    /// against panicking deep inside a forward pass applies.
     pub fn adopt(&self, buffer: Buffer, size: usize) -> Arc<PooledBuffer> {
+        debug_assert!(
+            !buffer.is_view(),
+            "BufferPool::adopt was given a VIEW ({} bytes at offset {} of a \
+             larger allocation). `acquire` keys on size alone, so this handle \
+             and every other view of the same allocation would be handed out as \
+             though they were independent buffers -- lloom #23's corruption \
+             class, and the defect #489 measured on the arena: five \"separate\" \
+             activation buffers at one base address. A handle that must not \
+             participate in reuse wants `PooledBuffer::unpooled`, which exists \
+             for exactly this case (DESIGN.md §9.2a layer 3, §9.2m).",
+            buffer.length(),
+            buffer.base_offset(),
+        );
         if let Ok(mut state) = self.inner.state.lock() {
             state.counters.allocations += 1;
             state.counters.allocated_bytes += size as u64;
@@ -1106,6 +1186,15 @@ impl BufferPool {
             .unwrap_or_default()
     }
 
+    /// Zeroes the event counters, so a caller can measure decode rather than
+    /// decode-plus-load.
+    ///
+    /// **Every field of [`PoolCounters`] is an accumulator**, so zeroing the
+    /// struct is exactly what resetting it means and this cannot disturb any
+    /// figure describing the pool's current state. That was not true until
+    /// #507: `pending` was a gauge living among the accumulators, and this call
+    /// zeroed it while the buffers it counted were still parked. The live
+    /// figures are [`Self::occupancy`]'s, and this does not touch them.
     pub fn reset_counters(&self) {
         if let Ok(mut state) = self.inner.state.lock() {
             state.counters = PoolCounters::default();
@@ -1379,58 +1468,135 @@ mod tests {
         assert!(msg.contains("§6.3b"), "name the measured instance: {msg}");
     }
 
-    /// **#494's finding, found by the fuzzer in a 3-operation sequence.**
+    /// **The invariant `acquire` rests on**: a view must never enter the pool
+    /// (#507).
     ///
-    /// `PoolCounters::pending` is a **gauge**, not an accumulator. Its only two
-    /// write sites are `state.counters.pending = state.pending.len()` --
-    /// assignments, where the other eight fields are `+=`. `reset_counters`
-    /// zeroes the whole struct, so it zeroes a figure that describes **live
-    /// occupancy** rather than history, and the pool then contradicts itself:
-    /// `counters().pending` reads 0 while `occupancy().pending_buffers` reads 1
-    /// for the same pool at the same instant.
+    /// `acquire` keys on size alone, which is correct exactly while two buffers
+    /// of one size are interchangeable -- true for allocations, false for views,
+    /// which are N handles onto one allocation. This drives the guard from the
+    /// aliasing side: a `Buffer::view` is exactly what `Arena::new` used to hand
+    /// to `adopt` before #505, and it is what produced five "separate"
+    /// activation buffers at one base address (§9.2m).
     ///
-    /// Nothing in the 30 hand-written tests calls `reset_counters` while a
-    /// buffer is parked, which is why this survived. The sequence that finds it
-    /// is `Alloc, DropLive, ResetCounters` -- three operations.
-    ///
-    /// **Marked `#[ignore]` rather than fixed**: #494 is an instrument issue and
-    /// forbids restructuring production code. Un-ignore it with the one-line
-    /// repair (re-derive the gauge in `reset_counters`, or move it out of
-    /// `PoolCounters` into `PoolOccupancySnapshot` where the other live figures
-    /// live). The PR argues for the second.
+    /// **The check is at `adopt` rather than `acquire` because `acquire` is
+    /// hot** (§6.3b: ~11.6 destroys/token) and the property is decided once, on
+    /// entry. This test is `debug_assertions`-only for the same reason the
+    /// assertion is.
     #[test]
-    #[ignore = "#494: documents a real defect; un-ignore with the fix"]
-    fn issue_494_reset_counters_zeroes_the_pending_gauge() {
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "was given a VIEW")]
+    fn adopting_a_view_is_refused() {
         let dev = device();
         let (pool, _clock) = pool_with_clock();
+
+        // An arena-shaped base, and a slot carved out of it. §9.2c's shipping
+        // arena is [21504, 21504, 21504, 4096, 1024]; the first slot is the one
+        // an offset-based check would MISS, so it is the one used here.
+        let base = dev
+            .new_buffer(69632, crate::RESOURCE_OPTIONS)
+            .expect("buffer allocation");
+        let slot = base.view(0, 21504);
+        assert_eq!(slot.base_offset(), 0, "the offset-0 slot is the hard case");
+        assert!(
+            slot.is_view(),
+            "a carved slot is a view whatever its offset"
+        );
+
+        let _ = pool.adopt(slot, 21504);
+    }
+
+    /// The guard admits what it must: an ordinary allocation.
+    ///
+    /// **Both bounds** (§1.1, #184's precedent). A refusal that refuses
+    /// everything is not a check, and this is the arm that would catch an
+    /// `is_view` inverted or an assertion written `!` the wrong way -- which
+    /// would otherwise refuse every allocation the engine makes and be caught
+    /// only by the whole suite going red for an unrelated-looking reason.
+    #[test]
+    fn adopting_a_whole_allocation_is_admitted() {
+        let dev = device();
+        let (pool, _clock) = pool_with_clock();
+
+        let raw = dev
+            .new_buffer(4096, crate::RESOURCE_OPTIONS)
+            .expect("buffer allocation");
+        assert!(!raw.is_view(), "a fresh allocation is not a view");
+
+        let b = pool.adopt(raw, 4096);
+        assert_eq!(pool.counters().allocations, 1);
+        assert_eq!(pool.occupancy().live_buffers, 1);
+        drop(b);
+    }
+
+    /// **#494's finding, repaired by #507**: `reset_counters` must not disturb
+    /// how many buffers are awaiting the GPU.
+    ///
+    /// The defect was that `PoolCounters::pending` was a **gauge** among eleven
+    /// accumulators -- its only two write sites assigned `state.pending.len()`,
+    /// where every other field is `+=` -- so `reset_counters`, which zeroes the
+    /// whole struct, zeroed a figure describing **live occupancy** rather than
+    /// history. The pool then contradicted itself: `counters().pending` read 0
+    /// while `occupancy().pending_buffers` read 1, for the same pool at the same
+    /// instant, with nothing having changed about the GPU.
+    ///
+    /// Nothing in the 30 hand-written tests called `reset_counters` while a
+    /// buffer was parked, which is why it survived: the two that call it both
+    /// have `gpu_completes` on the line above, so each resets a *settled* pool.
+    /// **The defect needs a release without a completing drain, then a reset --
+    /// a sequence, not a state**, which is why a stateful fuzzer found it in
+    /// three operations and thirty hand-written tests did not.
+    ///
+    /// **The repair removed the field rather than re-deriving it** (#507), so
+    /// this test pins the *absence of the mirror*: it asserts the live figure
+    /// survives a reset, which is the property that was violated, entirely
+    /// through the public API. The companion guard against a *future* gauge
+    /// being added to `PoolCounters` is
+    /// `buffer_pool_fuzz::pool_counters_holds_accumulators_only`, which has to
+    /// read the source because that defect is a write shape rather than a state.
+    #[test]
+    fn reset_counters_does_not_disturb_the_pending_occupancy() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
 
         let b = alloc(&pool, &dev, 512);
         drop(b);
 
-        // One buffer is genuinely parked awaiting the GPU.
+        // One buffer is genuinely parked awaiting the GPU. This is the state the
+        // defect needed and that no pre-#494 test constructed: released, and
+        // *not* drained by a completion.
         assert_eq!(pool.occupancy().pending_buffers, 1);
         assert_eq!(
-            pool.counters().pending,
+            pool.counters().releases,
             1,
-            "the gauge agrees before the reset"
+            "the release must have happened, or this fixture proves nothing"
         );
 
         pool.reset_counters();
 
-        // The buffer is still parked -- nothing about the GPU changed.
+        // The accumulators ARE zeroed -- that is what the call is for, and
+        // asserting it stops a `reset_counters` that does nothing at all from
+        // passing this test (§15.1a's vacuous class: both bounds, §1.1).
+        assert_eq!(pool.counters().releases, 0, "the accumulator did not reset");
+        assert_eq!(pool.counters().deferred, 0, "the accumulator did not reset");
+
+        // And the live figure is untouched: nothing about the GPU changed, so
+        // nothing about how many buffers await it may change either.
         assert_eq!(
             pool.occupancy().pending_buffers,
             1,
-            "occupancy still sees the parked buffer"
+            "reset_counters disturbed a live occupancy figure -- #494's defect, \
+             repaired in #507 by removing the mirrored gauge from PoolCounters"
         );
-        // But the counter now says zero. TWO PUBLIC ACCESSORS OF ONE POOL
-        // DISAGREE about how many buffers are awaiting the GPU.
+
+        // The parked buffer is still a real buffer: completing the GPU drains it
+        // to the free list exactly as it would have without the reset. Without
+        // this the test would also pass on a pool that had lost the buffer.
+        gpu_completes(&pool, &clock);
+        assert_eq!(pool.occupancy().pending_buffers, 0);
         assert_eq!(
-            pool.counters().pending,
+            pool.occupancy().free_buffers,
             1,
-            "reset_counters zeroed a live occupancy figure: counters().pending \
-             says 0 while occupancy().pending_buffers says {}",
-            pool.occupancy().pending_buffers
+            "the parked buffer did not survive the reset as a real buffer"
         );
     }
 

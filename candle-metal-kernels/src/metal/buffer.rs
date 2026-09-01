@@ -85,6 +85,33 @@ impl Buffer {
         self.base_offset
     }
 
+    /// Whether this handle addresses a **sub-range** of an `MTLBuffer` it does
+    /// not own, rather than a whole allocation.
+    ///
+    /// # Why the pool asks (lloom issue #507)
+    ///
+    /// `BufferPool::acquire` keys on **size alone** and knows nothing of
+    /// provenance -- it hands back whatever is in the bucket. That is correct
+    /// for allocations, which own their whole `MTLBuffer` and are
+    /// interchangeable at a given size, and it is silent corruption for views,
+    /// which are N handles onto **one** allocation: measured on the shipping
+    /// arena, five "separate" activation buffers at one base address and five
+    /// offsets, under `HazardTrackingModeUntracked` where §9.3 says there is no
+    /// safety net (§9.2m, issue #489).
+    ///
+    /// So the pool's invariant is that a view never enters it, and `adopt` is
+    /// where that is checked -- see [`super::BufferPool::adopt`] for why there
+    /// rather than at `acquire`.
+    ///
+    /// **`base_offset != 0` is NOT the test**, which is why this exists as its
+    /// own predicate: an arena's first slot is a view at offset 0 (the measured
+    /// trace has one), so an offset check would pass exactly the aliasing handle
+    /// that shares its address with the base. What makes a handle a view is that
+    /// it carries its own extent.
+    pub fn is_view(&self) -> bool {
+        self.length.is_some()
+    }
+
     pub fn contents(&self) -> *mut u8 {
         self.data()
     }

@@ -6,6 +6,9 @@
 use candle::{DType, Error, Result, Tensor};
 use rand::{distr::Distribution, SeedableRng};
 
+pub mod poll;
+pub mod token_ring;
+
 #[derive(Clone, PartialEq, Debug)]
 pub enum Sampling {
     ArgMax,
@@ -44,7 +47,37 @@ impl LogitsProcessor {
     }
 
     fn sample_argmax(&mut self, logits: Tensor) -> Result<u32> {
-        logits.argmax(candle::D::Minus1)?.to_scalar::<u32>()
+        self.sample_argmax_on_device(&logits)?.to_scalar::<u32>()
+    }
+
+    /// Argmax without forcing the result host-side.
+    ///
+    /// Returns the sampled token as a rank-0 `U32` **device** tensor. This is
+    /// the whole of what [`Self::sample_argmax`] does minus its `to_scalar`,
+    /// and separating them is what `DESIGN.md` §11.5g's non-blocking token path
+    /// is built on: `argmax` already dispatches on the GPU (`fast_argmax_*`,
+    /// one per token) and `reduce_op` gives its output `DType::U32`
+    /// (`candle-core/src/metal_backend/mod.rs`), so the `u32` the next step
+    /// wants is **already in device memory** in the dtype the next step wants
+    /// it in. `to_scalar` is the only thing that forces it back.
+    ///
+    /// So a caller that can consume a device tensor -- writing it into a
+    /// persistent input buffer with `slice_set`, comparing it against a
+    /// device-resident EOS constant -- never pays the round trip, and the
+    /// write leg §11.5f found (the token *goes out again* as the next step's
+    /// input) is **deleted rather than relocated**: there is nothing to upload
+    /// because nothing came down.
+    ///
+    /// This is `--temperature 0` only, and deliberately: §11.5f measures
+    /// `sample_f`'s temperature path taking the same `to_cpu` over the whole
+    /// vocabulary -- 128 000 f32, **512 000 B against argmax's 4** -- and
+    /// §11.2c measures 74 % of that arm in a host `sort_by`. A device-resident
+    /// sampler for temperature > 0 is a different change and is out of scope
+    /// (§11.2c also refuses to ship gumbel-max, on a tier-3 distributional
+    /// failure at χ² 36 440 against a critical 331 -- for correctness, not
+    /// speed).
+    pub fn sample_argmax_on_device(&mut self, logits: &Tensor) -> Result<Tensor> {
+        logits.argmax(candle::D::Minus1)
     }
 
     fn sample_gumbel_softmax(&mut self, logits: &Tensor, temperature: f64) -> Result<u32> {

@@ -605,6 +605,20 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Commit without waiting, prune finished command buffers, and return the
+    /// number still in flight.
+    ///
+    /// The non-blocking counterpart of [`Self::flush_and_wait_current`], for
+    /// the polled token path (`DESIGN.md` §11.5g). The pool drain is kept
+    /// because the completion handlers that free buffers are delivered
+    /// asynchronously, so a caller that never blocks would otherwise leave
+    /// buffers parked against an epoch that has in fact retired.
+    pub fn flush_and_prune(&self) -> Result<usize> {
+        let in_flight = self.commands.flush_and_prune().map_err(MetalError::from)?;
+        self.drain_completed_buffers();
+        Ok(in_flight)
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }

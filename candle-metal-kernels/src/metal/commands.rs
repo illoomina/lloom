@@ -612,6 +612,53 @@ impl Commands {
         Ok(())
     }
 
+    /// Commit the current command buffer **without waiting on it**, and drop
+    /// the `in_flight` entries whose GPU work has already finished.
+    ///
+    /// This exists for the non-blocking token path (`DESIGN.md` §11.5g): when
+    /// the host stops calling [`Self::flush_and_wait_current`] once per token,
+    /// nothing else prunes `in_flight`.
+    ///
+    /// **The pruning is load-bearing and is not bookkeeping.** `in_flight` is a
+    /// `Vec<CommandBuffer>` that shrinks on exactly two paths --
+    /// `wait_until_completed`'s `mem::take` and `flush_and_wait_current`'s
+    /// `retain` -- both of which block. Buffer *reclamation* does not depend on
+    /// either: `commit_swap_locked` attaches an `on_completion` handler that
+    /// marks the epoch and wakes the pools, and Metal delivers it
+    /// asynchronously. So the pools stay correct without a wait, and it is the
+    /// `Vec` itself -- one retained `CommandBuffer` per token, for the length
+    /// of a generation -- that grows without one.
+    ///
+    /// §13.5j measures peak `pending` at "exactly zero on every arm" and
+    /// attributes it to `to_scalar`'s per-token drain. Removing that drain
+    /// removes the reason, which is why this is called from the poll rather
+    /// than left to the next blocking readback.
+    ///
+    /// Returns the number of command buffers still in flight after pruning, so
+    /// a caller can assert the queue is bounded rather than assume it (§2.4:
+    /// an instrument that cannot be shown to have engaged has not measured
+    /// anything).
+    pub fn flush_and_prune(&self) -> Result<usize, MetalKernelError> {
+        let mut state = self.state.lock()?;
+        if self.compute_count.load(Ordering::Acquire) > 0 {
+            self.commit_swap_locked(&mut state, 0)?;
+        }
+        // Errors are surfaced here rather than swallowed: without a blocking
+        // readback on this path, this is the only place a failed command buffer
+        // is observed, and a dropped error would present later as wrong output
+        // rather than as a failure (§3.5 -- a missing dependency is silent
+        // corruption, not an error).
+        for cb in state.in_flight.iter() {
+            if cb.status() == MTLCommandBufferStatus::Error {
+                return Err(Self::cb_error(cb));
+            }
+        }
+        state
+            .in_flight
+            .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
+        Ok(state.in_flight.len())
+    }
+
     fn commit_swap_locked(
         &self,
         state: &mut EntryState,

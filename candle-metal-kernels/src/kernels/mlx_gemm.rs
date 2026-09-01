@@ -527,9 +527,10 @@ pub struct GemvRmsNorm<'a> {
 /// element from exactly one thread, so the transform runs once per output
 /// element — the standalone elementwise kernel's own count.
 ///
-/// It therefore carries **no bindings at all**, where `GemvRmsNorm` carries
-/// two: a pure elementwise transform reads nothing the kernel was not already
-/// reading.
+/// A pure elementwise transform therefore carries **no bindings at all**,
+/// where `GemvRmsNorm` carries two. [`GemvEpilogue::Residual`] is the
+/// exception and its one binding is what §12.2e's G1 gate is about — see
+/// there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GemvEpilogue {
     /// No transform. Resolves the classical `[[host_name]]`, so this is
@@ -545,15 +546,52 @@ pub enum GemvEpilogue {
     /// construction and owes §2.3.5a's discriminator rather than an
     /// unchanged-digest gate.
     Silu,
+    /// The residual add, `x + residual[out_row]` (issue #509).
+    ///
+    /// **The one epilogue that carries a binding, and the arity argument is
+    /// why it is admissible.** §12.2e's G1 requires the functor see one value;
+    /// the second operand here is read at the storing thread's *own output
+    /// position*, so each thread reads exactly the element it is about to
+    /// write — no cross-thread data, no reduction. `kDoAxpby`'s
+    /// `bias[(out_row + tm) * bias_stride]` is already that shape and already
+    /// instantiated. §12.2b's `gate * up` is a full vector of the INPUT extent
+    /// and is therefore multiplied by `n_tgp`: **a residual is indexable from
+    /// the output position and a gate is not.**
+    ///
+    /// Like [`GemvEpilogue::Silu`] this adds at the accumulator's precision
+    /// before the narrowing cast, where the `badd_f16` it replaces adds at `T`
+    /// on the rounded store — so it moves the digests by construction.
+    ///
+    /// **Only instantiated when the metallib was built with
+    /// `-DLLOOM_509_RESIDUAL_EPILOGUE`** (a compile-tier gate, §7.1, reached
+    /// through `LLOOM_434_METAL_CFLAGS`). Unset, no `_residual` name exists
+    /// and asking for this arm fails at pipeline load rather than silently
+    /// running unfused.
+    Residual,
 }
 
 impl GemvEpilogue {
     /// The `[[host_name]]` suffix, matching `gemv.metal`'s
-    /// `instantiate_gemv_silu_helper`.
+    /// `instantiate_gemv_silu_helper` / `instantiate_gemv_residual_helper`.
     fn name_suffix(self) -> &'static str {
         match self {
             GemvEpilogue::None => "",
             GemvEpilogue::Silu => "_silu",
+            GemvEpilogue::Residual => "_residual",
+        }
+    }
+
+    /// Whether this arm reads a second operand at buffer slot 15.
+    ///
+    /// An exhaustive `match` rather than an inequality test, so a future arm
+    /// is a **compile error** here rather than a silently unbound buffer.
+    /// That is §7.1a-i's own repair: a two-armed conditional over a
+    /// three-armed axis mislabelled every `RESULT` line since #116, and the
+    /// fix was to read the resolved enum through a `match`.
+    pub fn needs_operand(self) -> bool {
+        match self {
+            GemvEpilogue::None | GemvEpilogue::Silu => false,
+            GemvEpilogue::Residual => true,
         }
     }
 }
@@ -669,7 +707,86 @@ pub fn call_mlx_gemv_full(
     fused_norm: Option<GemvRmsNorm<'_>>,
     epilogue: GemvEpilogue,
 ) -> Result<(), MetalKernelError> {
+    call_mlx_gemv_epilogue(
+        device,
+        ep,
+        kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        lhs_offset,
+        lhs_buffer,
+        rhs_stride,
+        rhs_offset,
+        rhs_buffer,
+        output,
+        style,
+        fused_norm,
+        epilogue,
+        None,
+    )
+}
+
+/// As [`call_mlx_gemv_full`], supplying the second operand an epilogue that
+/// needs one reads (issue #509).
+///
+/// A **sibling rather than a widened signature**, deliberately: nine callers
+/// pass the existing argument list and none of them has an operand to pass, so
+/// widening it would edit nine sites to write `None` and gain nothing.
+/// [`call_mlx_gemv_full`] delegates here, so there is still **one body** and
+/// the two cannot drift in what they bind — issue #38's discipline, which is
+/// the property that makes the bit-identical test meaningful.
+///
+/// The operand is bound at slot **15**, after every argument the classical
+/// signature declares, exactly as `gemv_rmsnorm`'s two are at 15 and 16 — so
+/// the unfused arm's slot numbering is untouched.
+///
+/// **Refused rather than silently ignored** in three ways, each because a
+/// request that quietly ran the wrong kernel produces a well-formed wrong
+/// number that §3.5 says nothing reports: an epilogue needing an operand with
+/// none supplied, an operand supplied to an epilogue that reads none, and a
+/// `_residual` name absent from the metallib because
+/// `-DLLOOM_509_RESIDUAL_EPILOGUE` was not on the compile line.
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_gemv_epilogue(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Buffer,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Buffer,
+    output: &Buffer,
+    style: ParamStyle,
+    fused_norm: Option<GemvRmsNorm<'_>>,
+    epilogue: GemvEpilogue,
+    epilogue_operand: Option<(&Buffer, usize)>,
+) -> Result<(), MetalKernelError> {
     debug_assert!(m == 1 || n == 1, "call_mlx_gemv requires M=1 or N=1");
+
+    // Both directions checked, not just the missing one. An operand passed to
+    // an arm that does not read it would be silently dropped, and the caller
+    // would believe a fusion ran that did not — §2.4's "an instrument that
+    // cannot be shown to have engaged has measured nothing", at the binding.
+    match (epilogue.needs_operand(), epilogue_operand.is_some()) {
+        (true, false) => {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "gemv epilogue {epilogue:?} reads a second operand and none \
+                 was supplied (issue #509)"
+            )))
+        }
+        (false, true) => {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "gemv epilogue {epilogue:?} reads no second operand but one \
+                 was supplied; it would be silently unused (issue #509)"
+            )))
+        }
+        _ => {}
+    }
 
     assert!(rhs_stride.len() >= 2);
     assert!(lhs_stride.len() >= 2);
@@ -957,6 +1074,16 @@ pub fn call_mlx_gemv_full(
     if let Some(norm) = fused_norm {
         encoder.set_input_buffer(15, Some(norm.weight), norm.weight_offset);
         encoder.set_input_buffer(16, Some(norm.scale), norm.scale_offset);
+    }
+
+    // The fused epilogue's one binding, also at 15 -- the two fused arms are
+    // refused together above, so they never both bind it. `set_input_buffer`
+    // for the reason the prologue's comment gives, and here the RAW edge is
+    // the one the whole issue is about: the residual is written by the layer's
+    // previous op, and dropping that edge is silent corruption under
+    // `HazardTrackingModeUntracked` (§3.5).
+    if let Some((buf, offset)) = epilogue_operand {
+        encoder.set_input_buffer(15, Some(buf), offset);
     }
 
     let n_out_per_tgp = if transpose_mat {

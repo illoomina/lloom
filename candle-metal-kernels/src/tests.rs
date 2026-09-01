@@ -7722,3 +7722,316 @@ fn gemv_unfused_arm_is_bit_identical_with_the_epilogue_threaded() {
         "the unfused arm must be bit-identical run to run"
     );
 }
+
+///////////////////////////////////////////////////////////////////////////////
+// Issue #509 -- the fused residual-add epilogue
+///////////////////////////////////////////////////////////////////////////////
+
+/// Whether this process's metallib carries the `_residual` arm.
+///
+/// The arm is behind `-DLLOOM_509_RESIDUAL_EPILOGUE`, a COMPILE-TIER gate
+/// (§7.1) reached through `LLOOM_434_METAL_CFLAGS`, so on an ordinary
+/// `cargo test` run the kernel does not exist and these tests have nothing to
+/// check. They SKIP rather than fail -- and the skip is **printed**, because a
+/// silently-skipped test reports the same green as a passing one, which is
+/// §15.1a's VACUOUS class in the suite rather than in a measurement.
+fn residual_epilogue_available() -> bool {
+    std::env::var("LLOOM_434_METAL_CFLAGS")
+        .map(|v| v.contains("LLOOM_509_RESIDUAL_EPILOGUE"))
+        .unwrap_or(false)
+}
+
+/// Drive the fused residual arm through the real entry point.
+///
+/// Takes ONE extra buffer, which is the shape of this entry's finding: unlike
+/// a pure elementwise epilogue it reads a second operand -- but at the storing
+/// thread's own output index, which is what keeps it on the admissible side of
+/// §12.2e's G1 gate.
+#[allow(clippy::too_many_arguments)]
+fn run_gemv_fused_residual(
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &[f32],
+    lhs_stride: &[usize],
+    rhs: &[f32],
+    rhs_stride: &[usize],
+    residual: &[f32],
+) -> Vec<f32> {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+
+    let mk = |v: &[f32]| {
+        device
+            .new_buffer_with_data(
+                v.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(v),
+                options,
+            )
+            .unwrap()
+    };
+    let lhs_buf = mk(lhs);
+    let rhs_buf = mk(rhs);
+    let res_buf = mk(residual);
+
+    let length = b * m * n;
+    let output = device
+        .new_buffer(length * core::mem::size_of::<f32>(), options)
+        .unwrap();
+
+    call_mlx_gemv_epilogue(
+        &device,
+        &encoder,
+        &kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        0,
+        &lhs_buf,
+        rhs_stride,
+        0,
+        &rhs_buf,
+        &output,
+        ParamStyle::Split,
+        None,
+        GemvEpilogue::Residual,
+        Some((&res_buf, 0)),
+    )
+    .unwrap();
+
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec(&output, length)
+}
+
+/// A CPU reference for the matmul followed by the residual add, computed in
+/// f64 so it is not itself one of the two f32 orderings being compared
+/// (§10.2g, §2.3.5a).
+fn reference_gemv_residual(
+    (m_out, k): (usize, usize),
+    mat: &[f32],
+    vec: &[f32],
+    res: &[f32],
+) -> Vec<f64> {
+    (0..m_out)
+        .map(|row| {
+            let mut acc = 0.0f64;
+            for c in 0..k {
+                acc += mat[row * k + c] as f64 * vec[c] as f64;
+            }
+            acc + res[row] as f64
+        })
+        .collect()
+}
+
+/// The fused epilogue computes matmul-then-residual-add.
+///
+/// **K = 2050 is in the list for the reason #266's and #484's fixtures carry
+/// it**: the GEMV walks the input vector in `blockN` chunks and handles the
+/// remainder in a separate `leftover` path, so at LFM2's own K = 2048 the tail
+/// never executes. An epilogue is outside that loop and so is not itself
+/// tail-sensitive -- but the ACCUMULATOR it transforms is, so a fixture that
+/// never takes the tail cannot see an epilogue applied to a wrong sum.
+///
+/// **N_out = 2048 is the decode shape here and it is `bm4`**, where #484's
+/// decode shape was `bm8`. All three producers of a residual add -- `w2`,
+/// `out_proj`, `conv.out_proj` -- sit at N_out = 2048, so the tile this entry
+/// cares about is the one #484's fixture carried only as a second arm.
+#[test]
+fn gemv_fused_residual_matches_a_reference() {
+    if !residual_epilogue_available() {
+        eprintln!(
+            "SKIP gemv_fused_residual_matches_a_reference: the metallib was \
+             built without -DLLOOM_509_RESIDUAL_EPILOGUE, so the `_residual` \
+             kernel does not exist. Set LLOOM_434_METAL_CFLAGS to run it."
+        );
+        return;
+    }
+    for &(k, n_out, label) in &[
+        (2048usize, 2048usize, "bm4 (the decode shape), K divides blockN"),
+        (2048usize, 6144usize, "bm8, K divides blockN"),
+        (2050usize, 2048usize, "bm4, K leaves a 2-element tail"),
+        (2050usize, 6144usize, "bm8, K leaves a 2-element tail"),
+    ] {
+        let (b, m, n) = (1usize, n_out, 1usize);
+
+        let mat: Vec<f32> = (0..n_out * k)
+            .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+            .collect();
+        let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+        // The residual VARIES WITH POSITION and is never zero. Both matter:
+        // a constant residual cannot distinguish `res[out_row]` from `res[0]`,
+        // and a zero entry makes that position agree with an epilogue that did
+        // not run at all. The harness's own engagement check read 1959 of 2048
+        // on a fixture with 89 zeros before this was fixed.
+        let res: Vec<f32> = (0..n_out)
+            .map(|i| ((i % 23) as f32 - 11.0) / 8.0 + 0.0625)
+            .collect();
+        assert!(
+            res.iter().all(|v| *v != 0.0),
+            "{label}: the fixture's residual must have no zero entry, or those \
+             positions cannot tell the epilogue from the identity"
+        );
+
+        let got = run_gemv_fused_residual(
+            GemmDType::F32,
+            (b, m, n, k),
+            &mat,
+            &[m * k, k, 1],
+            &vec,
+            &[k, 1, 1],
+            &res,
+        );
+        let want = reference_gemv_residual((n_out, k), &mat, &vec, &res);
+
+        assert_eq!(got.len(), want.len(), "{label}: length");
+
+        // Non-vacuity, per §15.1 #1: two kernels that both write nothing agree
+        // perfectly.
+        let distinct = got
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            distinct >= 2,
+            "{label}: fused output has {distinct} distinct value(s); the \
+             comparison would be vacuous"
+        );
+
+        // A SECOND non-vacuity arm, specific to a residual ADD: the residual
+        // must materially move the answer. If every |res| were tiny against
+        // the accumulator the test would pass against a kernel with no
+        // epilogue at all, which is exactly what mutation arm 1 does.
+        let moved = want
+            .iter()
+            .zip(res.iter())
+            .filter(|(w, r)| (**r as f64).abs() > (**w).abs() * 1e-3)
+            .count();
+        assert!(
+            moved > n_out / 4,
+            "{label}: the residual moves only {moved} of {n_out} outputs \
+             materially; the comparison is close to vacuous"
+        );
+
+        let mut worst = 0.0f64;
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            let denom = w.abs().max(1.0);
+            let rel = ((g as f64) - w).abs() / denom;
+            if rel > worst {
+                worst = rel;
+            }
+            assert!(
+                rel < 2e-5,
+                "{label}: row {i}: fused {g} vs reference {w} (rel {rel:e})"
+            );
+        }
+    }
+}
+
+/// Asking for an epilogue that reads an operand without supplying one is
+/// REFUSED, and so is the converse.
+///
+/// Both directions, because either alone passes on a defect: an operand
+/// supplied to an arm that does not read it would be silently dropped, and the
+/// caller would believe a fusion ran that did not (§2.4). Under
+/// `HazardTrackingModeUntracked` (§3.5) nothing reports a well-formed wrong
+/// number, which is why these are errors rather than debug assertions.
+#[test]
+fn gemv_epilogue_operand_arity_is_enforced() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+
+    let (k, n_out) = (2048usize, 2048usize);
+    let mat = vec![0.01f32; n_out * k];
+    let vec_ = vec![0.02f32; k];
+    let mk = |v: &[f32]| {
+        device
+            .new_buffer_with_data(
+                v.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(v),
+                options,
+            )
+            .unwrap()
+    };
+    let mat_b = mk(&mat);
+    let vec_b = mk(&vec_);
+    let res_b = mk(&vec![0.5f32; n_out]);
+    let out = device
+        .new_buffer(n_out * core::mem::size_of::<f32>(), options)
+        .unwrap();
+
+    let call = |ep: GemvEpilogue, operand: Option<(&Buffer, usize)>| {
+        call_mlx_gemv_epilogue(
+            &device,
+            &encoder,
+            &kernels,
+            GemmDType::F32,
+            (1, n_out, 1, k),
+            &[n_out * k, k, 1],
+            0,
+            &mat_b,
+            &[k, 1, 1],
+            0,
+            &vec_b,
+            &out,
+            ParamStyle::Split,
+            None,
+            ep,
+            operand,
+        )
+    };
+
+    // Residual with no operand: refused.
+    let e = call(GemvEpilogue::Residual, None).unwrap_err();
+    assert!(
+        format!("{e:?}").contains("second operand"),
+        "expected a refusal naming the missing operand, got {e:?}"
+    );
+
+    // Silu WITH an operand: also refused, because it would be dropped.
+    let e = call(GemvEpilogue::Silu, Some((&res_b, 0))).unwrap_err();
+    assert!(
+        format!("{e:?}").contains("no second operand"),
+        "expected a refusal naming the unused operand, got {e:?}"
+    );
+
+    // And `None` with an operand, the same way -- the default arm must not
+    // silently accept one either.
+    let e = call(GemvEpilogue::None, Some((&res_b, 0))).unwrap_err();
+    assert!(
+        format!("{e:?}").contains("no second operand"),
+        "expected a refusal on the default arm, got {e:?}"
+    );
+
+    drop(encoder);
+}
+
+/// `GemvEpilogue::needs_operand` agrees with what the kernel actually binds.
+///
+/// A cheap pin, and the reason it exists is §7.1a-i: a two-armed conditional
+/// over a three-armed axis mislabelled every `RESULT` line since #116, and the
+/// repair was to read the resolved enum through an EXHAUSTIVE match. This
+/// asserts the arity table rather than the rendering, so a fourth arm added
+/// without deciding its arity is a compile error in `needs_operand` and a red
+/// test here if the decision is wrong.
+#[test]
+fn gemv_epilogue_arity_table_is_what_the_kernels_take() {
+    assert!(!GemvEpilogue::None.needs_operand());
+    assert!(
+        !GemvEpilogue::Silu.needs_operand(),
+        "a pure elementwise epilogue reads nothing the kernel was not already \
+         reading -- that is #484's finding and its signature is byte-identical \
+         to `gemv`'s"
+    );
+    assert!(
+        GemvEpilogue::Residual.needs_operand(),
+        "the residual arm reads a second operand at slot 15; that binding is \
+         what §12.2e's G1 gate is about"
+    );
+}

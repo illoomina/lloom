@@ -158,6 +158,41 @@ struct EpilogueSilu {
   }
 };
 
+// The residual add: `x + residual[out_row]` (issue #509, `DESIGN.md` §12.2e's
+// own recommended candidate, which that catalogue has no row for).
+//
+// **This is the first epilogue with a BINDING, and the arity argument is why
+// it is admissible where §12.2 #7 is not.** G1 requires the functor see ONE
+// value; a residual add has two operands, so the row covering this op's
+// CONSUMER end fails it. What makes the PRODUCER end different is the index:
+// the second operand is read at `out_row + tm` -- **the storing thread's own
+// output position** -- so each thread reads exactly the one element it is
+// about to write, with no cross-thread data and no reduction.
+//
+// `kDoAxpby` is already exactly this shape and already instantiated:
+// `bias[(out_row + tm) * bias_stride]` at the store below. That is the
+// structural difference from §12.2b's `gate * up`, whose second operand is a
+// full vector of the INPUT extent and is therefore multiplied by `n_tgp`:
+// **a residual is indexable from the output position and a gate is not.**
+//
+// The residual is read at the ACCUMULATOR's precision and added before the
+// narrowing cast, matching `EpilogueSilu`'s placement. `badd_f16` adds at `T`
+// on the already-rounded store, so this arm rounds once where the pair rounds
+// twice -- strictly the more accurate order, a genuinely different
+// computation, and therefore one that moves the digests by construction and
+// owes §2.3.5a's discriminator rather than an unchanged-digest gate. Recorded
+// rather than worked around, for the reason `EpilogueSilu` gives.
+template <typename T, typename AccT>
+struct EpilogueResidual {
+  const device T* res;
+
+  METAL_FUNC EpilogueResidual(const device T* res_) : res(res_) {}
+
+  METAL_FUNC AccT operator()(AccT x, int i) const {
+    return x + static_cast<AccT>(res[i]);
+  }
+};
+
 // RMSNorm's elementwise tail: `x * inv_rms * weight[i]`.
 //
 // `inv_rms` is a single f32 the reduction dispatch wrote, read once at
@@ -788,6 +823,78 @@ void gemv_silu(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+/// gemv with a fused residual-add epilogue (issue #509)
+///////////////////////////////////////////////////////////////////////////////
+
+// **Behind `-DLLOOM_509_RESIDUAL_EPILOGUE`, which is a COMPILE-TIER gate and
+// not a `const bool`.** §17 item 7 left `kDoAxpby` a `const bool` because no
+// LFM2 dispatch uses axpby; a knob in a header nobody greps leaves no trace in
+// the manifest of what was built, where a `-D` is in the invocation and is
+// recordable per arm (§14.5a, after #455's codegen flags went unrecorded).
+// The route is `kernel.rs`'s `additional_compiler_arguments()`, #434's, which
+// §2.3.9c measures as validated: `-fbogus-not-a-flag` is REJECTED, so a typo
+// fails loudly rather than silently running the baseline.
+//
+// **Unset is what ships.** This whole arm is absent from the metallib unless
+// the flag is passed, so the default path is byte-for-byte what shipped and no
+// default is flipped (§7.1a). That is also what dissolves §17 item 7's gate
+// rather than fighting it: a `-D`-gated arm is inert by default, so the
+// measurement becomes possible without reopening that decision.
+//
+// One binding, at 15 -- after every argument the classical signature declares,
+// so the classical slot numbering is untouched, exactly as `gemv_rmsnorm`'s
+// two are.
+#ifdef LLOOM_509_RESIDUAL_EPILOGUE
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_residual(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    const device T* bias [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& matrix_ld [[buffer(6)]],
+    const constant float& alpha [[buffer(7)]],
+    const constant float& beta [[buffer(8)]],
+    const constant int& batch_ndim [[buffer(9)]],
+    const constant int* batch_shape [[buffer(10)]],
+    const constant int64_t* vector_batch_stride [[buffer(11)]],
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],
+    const constant int64_t* bias_batch_stride [[buffer(13)]],
+    const constant int& bias_stride [[buffer(14)]],
+    const device T* residual [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueResidual<T, typename kernel_t::acc_type>;
+  gemv_tgp_memory(kernel_t);
+  const prologue_t prologue(nullptr, nullptr);
+  // `tid.z` is the batch index and the residual is one vector per batch item,
+  // matching `out_vec += tid.z * out_vec_size` in `gemv_body`.
+  const epilogue_t epilogue(residual + tid.z * out_vec_size);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t>(
+      mat, in_vec, bias, out_vec,
+      in_vec_size, out_vec_size, matrix_ld, alpha, beta,
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      bias_batch_stride, bias_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue, epilogue,
+      tid, lid, simd_gid, simd_lid);
+}
+#endif
+
+///////////////////////////////////////////////////////////////////////////////
 /// gemv with a fused RMSNorm prologue (issue #266, §12.2 #2)
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -1170,6 +1277,34 @@ void gemv_t_packed(
   [[kernel]] decltype(gemv_silu<itype, bm, bn, sm, sn, tm, tn, false, false>) \
              gemv_silu<itype, bm, bn, sm, sn, tm, tn, false, false>;
 
+// The fused residual-epilogue sibling (issue #509), named by appending
+// `_residual`. Scoped exactly as `_silu` and `_rmsnorm` are, for §11.3g's
+// measured +730 ms / +4.01 MiB reason -- and additionally behind the `-D`, so
+// unset it costs nothing at all rather than costing two tiles.
+//
+// **`bm4` is the tile that matters here and it is not the fixture's.** All
+// three producers of a residual add sit at `N_out` = 2048 -- `w2`
+// (K=10752), `conv.out_proj` and `out_proj` (K=2048) -- which
+// `derive_gemv_tile` sends to `bm4`. `bm8` is instantiated beside it so the
+// parity fixture covers a second tile, per §9.2c's rule that a fixture built
+// only from the model's own shapes is blind to a whole defect class. That is
+// the mirror of `_silu`, where `bm8` is the decode tile and `bm4` the
+// fixture's.
+#ifdef LLOOM_509_RESIDUAL_EPILOGUE
+#define instantiate_gemv_residual_helper(nm, itype, bm, bn, sm, sn, tm, tn)      \
+  template [[host_name(                                                         \
+      "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                       \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_residual")]]                             \
+  [[kernel]] decltype(gemv_residual<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_residual<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
+#define instantiate_gemv_residual_blocks(nm, itype)              \
+  instantiate_gemv_residual_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
+  instantiate_gemv_residual_helper(nm, itype, 8, 1, 1, 32, 4, 4)
+#else
+#define instantiate_gemv_residual_blocks(nm, itype)
+#endif
+
 #define instantiate_gemv_nc_axpby(func, nm, itype, bm, bn, sm, sn, tm, tn)    \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 0)      \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 1)      \
@@ -1225,6 +1360,13 @@ instantiate_gemv_rmsnorm_blocks(bfloat16, bfloat)
 instantiate_gemv_silu_blocks(float32, float)
 instantiate_gemv_silu_blocks(float16, half)
 instantiate_gemv_silu_blocks(bfloat16, bfloat)
+
+// Issue #509. Expands to nothing unless `-DLLOOM_509_RESIDUAL_EPILOGUE` is on
+// the compile line, so an unflagged build's metallib is byte-for-byte what
+// shipped.
+instantiate_gemv_residual_blocks(float32, float)
+instantiate_gemv_residual_blocks(float16, half)
+instantiate_gemv_residual_blocks(bfloat16, bfloat)
 
 instantiate_gemv_t_blocks(float32, float)
 instantiate_gemv_t_blocks(float16, half)

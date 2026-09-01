@@ -129,3 +129,57 @@ codegen-units = 1
 [profile.release-with-debug]
 inherits = "release"
 debug = true
+
+# The sanitizer tier (#475). A CORRECTNESS arm, and the profile exists so that
+# is a property of the tree rather than of an invocation nobody recorded —
+# §14.5a's own lesson, where the codegen flags above were `--config`-passed and
+# unrecorded until they were made a property of this manifest.
+#
+# Use:
+#
+#     RUSTFLAGS="-Zsanitizer=address" cargo +nightly build \
+#         --profile sanitize --target aarch64-apple-darwin --features metal
+#
+# `--target` is REQUIRED and is not a portability flourish: without it cargo
+# builds build scripts and proc macros with the same RUSTFLAGS, and they run in
+# a process with no sanitizer runtime. It is free here — the triple is native.
+#
+# `-Zbuild-std` is NOT required. That is measured rather than assumed (#475):
+# the first attempt asked for `rust-src` and the run without `build-std` works.
+# It matters because `build-std` rebuilds core and alloc, which would make this
+# arm far more expensive for nothing.
+#
+# LeakSanitizer is NOT available. `-Zsanitizer=leak` fails at
+# `rustc` with "leak sanitizer is not supported for this target" — so ASan is
+# the arm, and its own `detect_leaks` is a different thing that is worth
+# checking and is not LSan.
+[profile.sanitize]
+inherits = "release"
+# Debug info so a report names a line rather than an address. ASan reports are
+# a stack or they are nothing, and the probe runs for #475 confirm the stacks
+# resolve to file and line under this setting.
+debug = true
+
+# NOT set here: `force-frame-pointers`. It is a `rustc -C` flag and NOT a cargo
+# profile key -- written as one it is accepted silently and does nothing, which
+# cargo says out loud only as `warning: unused manifest key`. Caught that way
+# while running clippy for #475, and recorded rather than quietly deleted
+# because it is §2.4's shape in a manifest: a setting that looks applied, is
+# not, and whose absence nothing else would report. `-Zsanitizer=address`
+# already implies the frame pointers the unwinder needs.
+
+# NOT inherited from `[profile.release]`, deliberately, and this is the
+# load-bearing line rather than a tuning choice.
+#
+# §14.5c/#445 measured `lto = "thin"` DELETING the null-pointer check on the
+# logits readback, its counter and its blit fallback — the tier SIGSEGVs on
+# every decode run until repaired — and §11.5e then measured the same elision
+# at `opt-level = 1` with LTO OFF. So an optimised build removes guards, and a
+# sanitizer run under one would attribute an elision defect to whatever the
+# sanitizer happened to report. Holding LTO off keeps the two separable: a
+# finding here is the sanitizer's.
+lto = false
+# Follows from the same argument. `codegen-units = 1` is what the release tier
+# uses to get one object; it buys nothing for a correctness arm and it is one
+# more difference between this build and the one whose behaviour is under test.
+codegen-units = 16

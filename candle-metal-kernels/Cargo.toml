@@ -34,6 +34,26 @@ run-telemetry = []
 # structurally cannot -- #144 measured a wrong predicate leaving both canonical
 # digest pairs byte-identical over three runs.
 hazard-audit = []
+# ASan shadow-memory poisoning for allocator invariants plain ASan cannot see
+# (#475): a pool buffer in the free list, an arena region not handed out.
+#
+# Follows `run-telemetry`'s shape -- off, every entry point in `metal::poison`
+# is an empty inline function that drops its arguments -- with one difference
+# that matters: this one is NOT free to enable on its own. It calls the
+# sanitizer runtime's `__asan_*` interface, so a build with this feature and
+# without `-Zsanitizer=address` does not link.
+#
+# So it is enabled by the `sanitize` profile and by nothing else. That profile
+# is documented in the workspace manifest; the short form is
+#
+#     RUSTFLAGS="-Zsanitizer=address" cargo +nightly build \
+#         --profile sanitize --target aarch64-apple-darwin \
+#         --features metal,asan-poison
+#
+# A CORRECTNESS arm. ASan changes the allocator and §11.5e measures the
+# readback's arm choice as allocator-state-dependent (blit 1..12 over four runs
+# of one binary), so ANY TIMING TAKEN UNDER IT IS MEANINGLESS.
+asan-poison = []
 
 [dependencies]
 half = { version = "2.5.0", features = [
@@ -71,3 +91,20 @@ required-features = ["hazard-audit"]
 [profile.profiling]
 inherits = "release"
 debug = 2
+
+# The sanitizer tier (#475), duplicated here because this crate is
+# `exclude`d from the workspace and so does not inherit the workspace
+# manifest's profiles. The workspace copy carries the full argument -- why
+# `--target` is required, why `-Zbuild-std` is not, why LSan is out, and above
+# all why LTO is held OFF (#445 measured `lto = "thin"` deleting a null guard,
+# and #454 measured the same elision at `opt-level = 1` with LTO off, so an
+# optimised build would confound an elision defect with a sanitizer finding).
+#
+# Kept byte-identical to the workspace copy on purpose: two tiers under one
+# name would make a figure taken here incomparable with one taken there, which
+# is §2.5's own subject.
+[profile.sanitize]
+inherits = "release"
+debug = true
+lto = false
+codegen-units = 16

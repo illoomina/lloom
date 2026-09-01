@@ -47,6 +47,15 @@ mod icb_executor_tests;
 #[cfg(test)]
 mod icb_tests;
 pub mod library;
+/// ASan shadow-memory poisoning for allocator invariants (issue #475). Every
+/// entry point is inert without the `asan-poison` feature, so the module is
+/// declared unconditionally and compiles to nothing when the feature is off --
+/// `run_telemetry`'s shape, for its reasons.
+///
+/// Deliberately **not** in the glob re-export below: `poison` and `counters`
+/// are general names, and a caller reaching for them should say `poison::`
+/// rather than acquire them from a `metal::*`.
+pub mod poison;
 pub mod profile;
 pub mod residency_set;
 /// Memory-class and event telemetry (issue #171). Every entry point is inert

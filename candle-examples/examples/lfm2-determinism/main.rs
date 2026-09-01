@@ -1386,6 +1386,43 @@ fn main() -> Result<()> {
         elapsed.as_millis(),
     );
 
+    // Issue #475. On its own line rather than folded into `RESULT`, for the
+    // reason the `SPEC` line below gives: every committed artifact's `RESULT`
+    // line has that shape and #171 records what widening it costs an ingest of
+    // the existing corpus.
+    //
+    // **This line is what licenses a clean sanitizer run.** #475's registered
+    // prediction is that ASan finds zero new defects on the decode path, and a
+    // clean run proves that only if the mechanism was live -- otherwise it is
+    // §15.1a's VACUOUS class, which is #69's consumed `OnceLock` and #454's
+    // `to_cpu_fast=0` sweep. So the counters are printed whenever the feature
+    // is compiled in, and `poisoned=0 unmappable=0` is a FAILURE TO ENGAGE
+    // rather than a clean pool.
+    //
+    // `unmappable` is not an error and must be read beside `poisoned`: a
+    // `StorageModePrivate` allocation at or above 16384 B has no CPU mapping,
+    // so there is nothing for a poison to mark (§15.2 #12a, re-probed for
+    // #475). It is the share of the pool the threshold puts outside the shadow
+    // map, and reporting coverage without it invites reading an unmapped pool
+    // as a verified one.
+    {
+        use candle_metal_kernels::metal::poison;
+        if poison::ENABLED {
+            let c = poison::counters();
+            println!(
+                "POISON enabled=true poisoned={} unpoisoned={} unmappable={} empty={}",
+                c.poisoned, c.unpoisoned, c.unmappable, c.empty,
+            );
+            anyhow::ensure!(
+                c.poisoned > 0 || c.unmappable > 0,
+                "the `asan-poison` feature is compiled in and the pool poisoned \
+                 nothing and found nothing unmappable, so this run's clean \
+                 verdict is vacuous -- the mechanism did not engage (§2.4, \
+                 §15.1a)"
+            );
+        }
+    }
+
     // Issue #89. On its own line rather than folded into `RESULT`, because every
     // committed artifact's `RESULT` line has that shape and #171 records what
     // widening it costs an ingest of the existing corpus.

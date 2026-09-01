@@ -172,6 +172,20 @@ metal-hazard-audit = ["metal", "candle/metal-hazard-audit"]
 # code on it, found by grep, not the crate that a sibling feature happens to
 # name.**
 metal-run-telemetry = ["metal", "candle/metal-run-telemetry"]
+# ASan shadow-memory poisoning of allocator invariants (#475), reachable from a
+# harness because this line exists -- #205's defect, avoided rather than
+# repeated for a third time.
+#
+# Only `candle` is named, per the rule stated above and checked the same way:
+# `grep -rn 'feature = "asan-poison"'` over the tree hits
+# `candle-metal-kernels/src/metal/poison.rs` and nothing else, so the reach is
+# `candle/metal-asan-poison` -> `candle-metal-kernels/asan-poison` and there is
+# no third crate gating code on it to name.
+#
+# **This one does not compose with an ordinary build**: it calls the sanitizer
+# runtime, so it needs `-Zsanitizer=address` and the `sanitize` profile. The
+# workspace manifest carries the invocation and the reason.
+metal-asan-poison = ["metal", "candle/metal-asan-poison"]
 microphone = ["cpal", "rubato"]
 encodec = ["cpal", "symphonia", "rubato"]
 mimi = ["cpal", "symphonia", "rubato"]

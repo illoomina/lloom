@@ -246,6 +246,26 @@ impl Drop for PooledBuffer {
         // reason the back-reference is `Weak`.
         if let Some(pool) = self.pool.upgrade() {
             pool.release(buffer, self.size);
+        } else {
+            // Destroyed rather than returned, so any mark must come off before
+            // the allocation does (#475).
+            //
+            // **This branch is why the poison discipline is stated over the
+            // mapping rather than over the buffer.** Metal SUB-ALLOCATES: a
+            // later `newBufferWithLength:` is served from
+            // `allocBufferSubDataWithLength`, which can hand back an address
+            // range a destroyed buffer occupied and then `bzero` it. A mark
+            // outliving its mapping therefore reports Metal's own zeroing of
+            // an unrelated fresh allocation -- a FALSE POSITIVE, and the
+            // direction that discredits the instrument rather than merely
+            // missing a defect. Measured while building this: the pool's own
+            // test suite tripped it, in `__bzero` under
+            // `-[IOGPUMetalDevice allocBufferSubDataWithLength:...]`.
+            //
+            // SAFETY: nothing holds this buffer -- this is its last handle, and
+            // the pool that could have handed out another is gone. Inert
+            // without `asan-poison`.
+            unsafe { super::poison::unpoison_buffer(&buffer) };
         }
     }
 }
@@ -593,6 +613,18 @@ impl PoolInner {
                 .pending
                 .pop_front()
                 .expect("front() just returned Some");
+            // The buffer is now in the free list: no caller holds it and the
+            // GPU epoch it was released in has completed, so *nothing* may
+            // touch it until `acquire` hands it out again. Until #475 that was
+            // a convention no tool could check; poisoning makes a host read of
+            // a free buffer a reported error instead of a legal read of a live
+            // allocation.
+            //
+            // SAFETY: this is the strongest point in the buffer's life for the
+            // claim -- the last handle dropped (`PooledBuffer::drop` is what
+            // put it in `pending`) AND `is_complete` just said the GPU is done
+            // with it. Inert without the `asan-poison` feature.
+            unsafe { super::poison::poison_buffer(&entry.buffer) };
             state.free_bytes += entry.size;
             state.free_order.push_back(entry.size);
             state.free.entry(entry.size).or_default().push(entry.buffer);
@@ -613,6 +645,9 @@ impl PoolInner {
 
     /// Tells the eviction observer about buffers the pool is destroying.
     ///
+    /// (See `impl Drop for PoolInner` for the fourth destruction route, which
+    /// is the pool itself going away with buffers still in its free list.)
+    ///
     /// Takes them by reference and lets the caller drop them afterwards, so the
     /// `MTLBuffer` is still alive while `removeAllocation` runs. Removing an
     /// allocation that has already been freed is the exact operation
@@ -624,6 +659,52 @@ impl PoolInner {
         }
         if let Some(observer) = self.eviction_observer() {
             observer.on_evict(evicted);
+        }
+    }
+}
+
+/// Clears every poison mark the pool still holds before its buffers are freed
+/// (#475).
+///
+/// **The fourth destruction route, and the one that made the discipline
+/// structural rather than a list of call sites.** A pool going away takes its
+/// free list and its pending list with it, and both can hold marked buffers.
+///
+/// Metal SUB-ALLOCATES — `newBufferWithLength:` is served by
+/// `allocBufferSubDataWithLength`, which hands back address ranges a destroyed
+/// buffer occupied and `bzero`s them — so a mark that outlives its mapping
+/// reports Metal zeroing an unrelated *fresh* allocation. That is a **false
+/// positive**, which discredits the instrument rather than merely missing a
+/// defect, and it is what the pool's own test suite hit while this was being
+/// built.
+///
+/// Inert without `asan-poison`: the loops run over lists that are about to be
+/// dropped anyway and the calls compile to nothing, so this costs the shipping
+/// build one empty `Drop`.
+impl Drop for PoolInner {
+    fn drop(&mut self) {
+        if !super::poison::ENABLED {
+            return;
+        }
+        let Ok(state) = self.state.lock() else {
+            // Poisoned lock: another thread panicked holding it. Leaving marks
+            // behind is the safe direction here — a false positive later is
+            // worse than none, but reaching into a `Mutex` whose invariants may
+            // be broken is worse than both.
+            return;
+        };
+        for bucket in state.free.values() {
+            for buffer in bucket {
+                // SAFETY: the pool is being destroyed, so nothing can acquire
+                // these; they are freed as `state` drops.
+                unsafe { super::poison::unpoison_buffer(buffer) };
+            }
+        }
+        for entry in &state.pending {
+            // Pending buffers are not poisoned today (they are marked only on
+            // entering the free list), but clearing is idempotent and this is
+            // the site that must not be re-derived if that changes.
+            unsafe { super::poison::unpoison_buffer(&entry.buffer) };
         }
     }
 }
@@ -708,6 +789,17 @@ impl PoolState {
             }
             self.free_bytes = self.free_bytes.saturating_sub(size);
             self.counters.evicted += 1;
+            // Leaving the free list to be DESTROYED rather than reused, so the
+            // mark must come off before the `MTLBuffer` is freed. A stale
+            // poison would outlive the allocation and sit over address space
+            // Metal is free to hand back for something else -- turning a later
+            // correct access into a reported error, which is a false positive
+            // and the direction that discredits the whole instrument (#475).
+            //
+            // SAFETY: `bucket.pop()` just removed it from the free list under
+            // the pool lock and nothing has handed it out. Inert without
+            // `asan-poison`.
+            unsafe { super::poison::unpoison_buffer(&buffer) };
             evicted.push(buffer);
         }
         evicted
@@ -879,6 +971,14 @@ impl BufferPool {
             state.free.remove(&bucket_size);
         }
 
+        // Handed to a caller, so it is theirs to touch again. This must happen
+        // before the handle can be observed, or the caller's first legitimate
+        // access is what gets reported (#475).
+        //
+        // SAFETY: the buffer has just left the free list under the pool lock,
+        // so no other handle to it exists. Inert without `asan-poison`.
+        unsafe { super::poison::unpoison_buffer(&buffer) };
+
         state.counters.hits += 1;
         state.live_buffers += 1;
         state.live_bytes += bucket_size;
@@ -978,6 +1078,16 @@ impl BufferPool {
         let mut freed = Vec::new();
         if let Ok(mut state) = self.inner.state.lock() {
             for (_, mut bucket) in std::mem::take(&mut state.free) {
+                // Destroyed rather than reused, as in `evict_over_budget`: the
+                // mark comes off before the allocation goes, or it outlives the
+                // buffer and reports a later correct access (#475).
+                //
+                // SAFETY: these have just been taken out of the free list under
+                // the pool lock, so nothing holds them. Inert without
+                // `asan-poison`.
+                for buffer in &bucket {
+                    unsafe { super::poison::unpoison_buffer(buffer) };
+                }
                 freed.append(&mut bucket);
             }
             state.free_bytes = 0;
@@ -1788,6 +1898,72 @@ mod tests {
             pool.counters().evicted > 0,
             "nothing was evicted, so the ordering was never exercised"
         );
+    }
+
+    /// A poison mark must not outlive the mapping it was applied to (#475).
+    ///
+    /// **This pins a FALSE POSITIVE, which is the failure direction that
+    /// discredits an instrument rather than merely blunting it**, and it is
+    /// not hypothetical: the first version of the poisoning marked buffers on
+    /// entry to the free list and cleared them on eviction, trim and acquire —
+    /// and the suite tripped ASan anyway, inside `__bzero` under
+    /// `-[IOGPUMetalDevice allocBufferSubDataWithLength:...]`.
+    ///
+    /// The mechanism is that **Metal sub-allocates**: a later
+    /// `newBufferWithLength:` can be served from an address range a destroyed
+    /// buffer occupied, and Metal zeroes it on the way out. A mark left behind
+    /// therefore reports Metal's own zeroing of an unrelated *fresh*
+    /// allocation.
+    ///
+    /// So the discipline is over the **mapping**, not the buffer, and every
+    /// route out of the pool must clear: acquire, evict, trim, a handle
+    /// outliving its pool, and the pool itself dropping.
+    ///
+    /// Under `asan-poison` this test aborts the process if a route is missed,
+    /// which is a stronger signal than an assertion; without the feature it is
+    /// an ordinary allocate-free-allocate exercise of the same routes.
+    #[test]
+    fn a_poison_mark_does_not_outlive_its_mapping() {
+        let dev = device();
+
+        // Route 1: the pool drops with buffers still in its free list.
+        {
+            let (pool, clock) = pool_with_clock();
+            let b = alloc(&pool, &dev, 1024);
+            release_and_complete(&pool, &clock, b);
+            assert!(
+                pool.counters().drained > 0,
+                "nothing reached the free list, so no mark was applied and \
+                 this test could not have caught a stale one"
+            );
+        }
+
+        // Route 2: a handle outliving its pool, where `Weak::upgrade` fails
+        // and the buffer is destroyed rather than returned.
+        {
+            let (pool, _clock) = pool_with_clock();
+            let b = alloc(&pool, &dev, 1024);
+            drop(pool);
+            drop(b);
+        }
+
+        // Route 3: trim, which destroys the whole free list at once.
+        {
+            let (pool, clock) = pool_with_clock();
+            let b = alloc(&pool, &dev, 1024);
+            release_and_complete(&pool, &clock, b);
+            let freed = pool.trim();
+            assert!(!freed.is_empty(), "trim freed nothing to clear a mark on");
+            drop(freed);
+        }
+
+        // If any route above left a mark behind, Metal's zeroing of these
+        // fresh allocations is what reports it -- the exact shape that was
+        // observed. Several, because sub-allocation reuse is not guaranteed to
+        // land on the first try.
+        for _ in 0..16 {
+            let _ = dev.new_buffer(1024, crate::RESOURCE_OPTIONS);
+        }
     }
 
     /// A buffer outliving its pool must drop cleanly rather than resurrect it.

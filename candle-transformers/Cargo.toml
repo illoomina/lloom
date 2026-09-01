@@ -25,6 +25,14 @@ serde_json = { workspace = true }
 serde_plain = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# The stateful sequence fuzzer over `TokenRing` (lloom #508). A dev-dependency,
+# so nothing shipping and no downstream consumer acquires it -- which is what
+# keeps `CONTRIBUTING.md` §4.1's "must not break CPU or CUDA backends" a
+# non-question here: the target is a test, backend-agnostic, and runs on
+# whichever of CPU and Metal is present.
+proptest = "1.11"
+
 [features]
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate", "candle-nn/accelerate"]

@@ -19,6 +19,10 @@ mod buffer_pool_fuzz;
 pub mod cache_pad;
 pub mod command_buffer;
 pub mod commands;
+/// A stateful model-based fuzzer over `Commands`' submission surface, holding
+/// `in_flight` bounded across arbitrary commit/prune/wait interleavings (#508).
+#[cfg(test)]
+mod commands_fuzz;
 /// Component digests: one fingerprint per mechanism per variant (#105).
 #[cfg(test)]
 mod component_digest_tests;

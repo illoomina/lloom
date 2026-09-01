@@ -659,6 +659,30 @@ impl Commands {
         Ok(state.in_flight.len())
     }
 
+    /// How many command buffers are in flight, **without committing, pruning or
+    /// waiting**.
+    ///
+    /// Test-only, and the reason it exists is a defect it caught in the
+    /// instrument that wanted it (#508). A fuzzer checking the boundedness
+    /// invariant after every operation had no way to read the queue's length
+    /// except by calling [`Self::flush_and_prune`] -- which prunes. So the
+    /// observation *consumed the event it existed to observe*: the queue was
+    /// already empty by the time the next generated `flush_and_prune` ran, and
+    /// the engagement counter read **`pruned_something = 0` across 208 prunes**.
+    /// That is `DESIGN.md` §15.1a's VACUOUS class in the observer, and #504's
+    /// own `evicted = 0` in this alphabet.
+    ///
+    /// Deliberately **not** public: nothing in production may branch on this.
+    /// The length is a racing quantity -- Metal retires buffers on a driver
+    /// thread -- so a caller acting on it would be reading a state that has
+    /// already moved, which is §6.7 L4's two-clocks defect. It is sound for a
+    /// *bound* check, which is the only thing that reads it: the queue cannot
+    /// have grown without a commit the caller made.
+    #[cfg(test)]
+    pub(crate) fn in_flight_len(&self) -> Result<usize, MetalKernelError> {
+        Ok(self.state.lock()?.in_flight.len())
+    }
+
     fn commit_swap_locked(
         &self,
         state: &mut EntryState,

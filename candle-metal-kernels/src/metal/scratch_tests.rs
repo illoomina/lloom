@@ -652,6 +652,12 @@ fn the_combine_order_is_index_and_completion_is_refused() {
         seq.windows(2).all(|w| w[0] < w[1]),
         "the merge sequence is not ascending: {seq:?}"
     );
+    // The absolute half. `len` and `windows(2)` are both SHAPES -- they
+    // constrain the relationship between members and are blind to a defect
+    // shifting the whole sequence (§3.1b). This line is the one that is not:
+    // under `merge_sequence` mutated to `(1..=live_chunks)` it reads
+    // `Some(1)` against `Some(0)` and kills it, where the two above stay
+    // green. Recorded because #524 measured it doing so.
     assert_eq!(seq.first().copied(), Some(0));
 
     // Mutation: the check must reject the other order. Without this the
@@ -676,6 +682,28 @@ fn the_combine_order_is_index_and_completion_is_refused() {
 /// The chunk count must not depend on load, occupancy, or anything else
 /// dynamic. Nothing in [`plan_scratch`] consults such a thing; this states it as
 /// a property so a future change that did would be caught.
+///
+/// **The absolute assertion below is what makes that last sentence true, and it
+/// was added after the sentence was measured false (#524).** Comparing the eight
+/// plans to *each other* takes iteration 0 of this very loop as the reference,
+/// which is `CONTRIBUTING.md` §3.1b's third place for a reference to be wrong --
+/// *the same run*, which looks like a comparison and is not. Demonstrated rather
+/// than argued: mutating `merge_sequence` from `(0..live_chunks)` to
+/// `(1..=live_chunks)` shifts every element while preserving ascendingness,
+/// length and run-to-run identity, and this test **passed on `[1,2,..,11]` while
+/// claiming to pin `[0,1,..,10]`** -- under a real defect, the combine skipping
+/// chunk 0 and reading one past the end, which is §10.4's silent-wrong-answer
+/// class.
+///
+/// The class was caught anyway, by
+/// [`the_combine_order_is_index_and_completion_is_refused`] and
+/// [`one_chunk_and_zero_chunks_are_degenerate_cases_not_special_ones`] -- two
+/// tests with **no connection to this one**, in the same file by accident of
+/// subject. That is coverage by *incident*: delete either sibling in a refactor
+/// and the class goes live with nothing saying so, and a refactor removing a
+/// redundant-looking degenerate-case test is exactly the kind nobody re-runs a
+/// mutation harness for. The line below makes the coverage **intrinsic**, so
+/// this test now kills that mutation on its own.
 #[test]
 fn the_same_kv_len_always_gives_the_same_merge_sequence() {
     let g = lfm2();
@@ -692,6 +720,15 @@ fn the_same_kv_len_always_gives_the_same_merge_sequence() {
             )
             .expect("plan");
             let seq = plan.merge_sequence();
+            // The reference is ABSOLUTE -- a value this loop did not produce --
+            // rather than iteration 0 of the loop. §3.1b rule 1: prefer an
+            // absolute reference to a shape, because it names *why*.
+            assert_eq!(
+                seq,
+                (0..plan.live_chunks()).collect::<Vec<_>>(),
+                "{s:?} merged {seq:?} rather than 0..{}",
+                plan.live_chunks()
+            );
             match &first {
                 None => first = Some(seq),
                 Some(f) => assert_eq!(&seq, f, "{s:?} produced a different merge sequence"),
@@ -745,6 +782,12 @@ fn one_chunk_and_zero_chunks_are_degenerate_cases_not_special_ones() {
     let plan =
         plan_scratch(&g, 1, 1, Sizing::Grow, ScratchLayout::Planes, MAX_CONTEXT).expect("plan");
     assert_eq!(plan.live_chunks(), 1);
+    // `vec![0]` is an ABSOLUTE reference and the degenerate case is where it is
+    // sharpest: a merge sequence off by one has nowhere to hide at length 1.
+    // Measured (#524): under `merge_sequence` mutated to `(1..=live_chunks)`
+    // this reads `[1]` against `[0]` and kills it. Not the point of this test --
+    // §10.6's degenerate-case claim is -- and worth not losing in a refactor
+    // that reads it as redundant with the ascending check above.
     assert_eq!(plan.merge_sequence(), vec![0]);
 }
 

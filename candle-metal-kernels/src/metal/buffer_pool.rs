@@ -1468,6 +1468,80 @@ mod tests {
         assert!(msg.contains("§6.3b"), "name the measured instance: {msg}");
     }
 
+    /// **Why the readback arm is not a call-site property** (#536, §11.5c,
+    /// §15.2 #12a).
+    ///
+    /// §11.5c measures `to_cpu`'s blit-free path firing only below 16384 B, and
+    /// #350 read that as *"allocate the reduce output under 16 KiB"* -- a
+    /// call-site constant. **The reduce output is already 128 B**: the argmax
+    /// asks for `dst_el = 1` `U32` (`metal_backend/mod.rs`'s contiguous reduce),
+    /// and `buf_size` rounds 4 B to one `BUFFER_ALIGNMENT`. So there is no
+    /// call-site constant left to lower, and the sizes §15.2 #12a records --
+    /// 12288 B by default, 731136 B under `--sample-in-buffer` -- cannot have
+    /// come from the request.
+    ///
+    /// They come from **here**. `acquire` serves the smallest free bucket that
+    /// can satisfy the request, so a 128 B ask is answered by whatever oversized
+    /// buffer happens to be free, and the handed-back size is a property of what
+    /// the *rest of the step* freed rather than of what the caller asked for.
+    /// That is why #454 measures the arm drifting **blit 12 / 1 / 2 / 5 over
+    /// four consecutive runs of one binary**: not a configuration, an outcome.
+    ///
+    /// **Both bounds**, because only the pair distinguishes *serves oversized*
+    /// from *never reuses*: an exact-size buffer must be preferred when one is
+    /// free (or the test passes on a pool that always allocates fresh).
+    #[test]
+    fn acquire_serves_an_oversized_bucket_when_no_exact_size_is_free() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        // The size a 4-byte argmax output actually asks for: `buf_size(4)`.
+        const REDUCE_OUTPUT: usize = 128;
+        // Above §15.2 #12a's 16384 B mapping threshold, so a readback served by
+        // this bucket takes the blit arm.
+        const OVERSIZED: usize = 32768;
+
+        // Free an oversized buffer and nothing else.
+        let big = alloc(&pool, &dev, OVERSIZED);
+        release_and_complete(&pool, &clock, big);
+
+        let served = pool.acquire(REDUCE_OUTPUT).expect("the pool must reuse");
+        assert_eq!(
+            served.size(),
+            OVERSIZED,
+            "a {REDUCE_OUTPUT} B request is served by the smallest free bucket \
+             above it, so the readback's arm is decided by what the step freed \
+             -- not by the call site's size (#536, §11.5c)"
+        );
+        assert!(
+            served.size() >= 16384,
+            "and that is what puts this readback on the blit arm"
+        );
+        release_and_complete(&pool, &clock, served);
+
+        // The other bound: an exact bucket is preferred when one exists, so the
+        // assertion above is about which bucket is chosen and not about the
+        // pool refusing to reuse at all.
+        //
+        // The exact-size buffer is adopted directly rather than through
+        // `alloc`, because `alloc` would be served the oversized bucket freed
+        // above -- which is this test's own first finding, and would otherwise
+        // make the second arm construct a 32768 B buffer and assert about it.
+        let raw = dev
+            .new_buffer(REDUCE_OUTPUT, crate::RESOURCE_OPTIONS)
+            .expect("buffer allocation");
+        let exact = pool.adopt(raw, REDUCE_OUTPUT);
+        release_and_complete(&pool, &clock, exact);
+        let served = pool.acquire(REDUCE_OUTPUT).expect("the pool must reuse");
+        assert_eq!(
+            served.size(),
+            REDUCE_OUTPUT,
+            "an exact hit is taken in preference to the oversized bucket, which \
+             is what makes the assertion above a statement about WHICH bucket \
+             is chosen rather than about the pool declining to reuse"
+        );
+    }
+
     /// **The invariant `acquire` rests on**: a view must never enter the pool
     /// (#507).
     ///

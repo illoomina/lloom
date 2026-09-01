@@ -776,9 +776,28 @@ mod tests {
                      when the arm is on -- a per-source key here is the silent \
                      fallback (#500/#536)"
                 );
-                assert!(
-                    std::ptr::eq(text, MERGED_NON_MLX),
+                // Compared by CONTENT, not by address. `MERGED_NON_MLX` is a
+                // `const` (`source.rs`), so every mention is a fresh rvalue and
+                // the compiler is free to materialise more than one copy of the
+                // `concat!` -- `std::ptr::eq` then compares a codegen accident
+                // rather than the routing, and it read FALSE here on a tree
+                // where the routing is correct (#536: the `LibraryKey`
+                // assertion above passes on the same call).
+                //
+                // The identity that matters is *which text this source
+                // compiles*, and the discriminating half is the second
+                // assertion: equality with the merged text alone would also
+                // hold if `MERGED_NON_MLX` were somehow a source's own text, so
+                // the arm is pinned against `library_source` as well.
+                assert_eq!(
+                    text, MERGED_NON_MLX,
                     "{s:?} must compile the MERGED text, not its own"
+                );
+                assert_ne!(
+                    text,
+                    Kernels::library_source(s),
+                    "{s:?} routed to the merged key but compiled its OWN text -- \
+                     the merge is not happening"
                 );
                 n_merged += 1;
             } else {
@@ -809,8 +828,14 @@ mod tests {
                 LibraryKey::PerSource(s),
                 "with the arm off every source keeps its own library"
             );
-            assert!(
-                std::ptr::eq(text, Kernels::library_source(s)),
+            // By content, for the reason the merged arm above gives: these are
+            // `const` strs, so an address comparison tests codegen rather than
+            // routing. This arm happens to pass either way -- both sides call
+            // `library_source` -- which is exactly why it is worth changing
+            // together with the one that did not.
+            assert_eq!(
+                text,
+                Kernels::library_source(s),
                 "{s:?} must compile its own source text with the arm off -- \
                  this is the byte-for-byte shipping path (§7.1a)"
             );

@@ -826,25 +826,35 @@ void gemv_silu(
 /// gemv with a fused residual-add epilogue (issue #509)
 ///////////////////////////////////////////////////////////////////////////////
 
-// **Behind `-DLLOOM_509_RESIDUAL_EPILOGUE`, which is a COMPILE-TIER gate and
-// not a `const bool`.** §17 item 7 left `kDoAxpby` a `const bool` because no
-// LFM2 dispatch uses axpby; a knob in a header nobody greps leaves no trace in
-// the manifest of what was built, where a `-D` is in the invocation and is
-// recordable per arm (§14.5a, after #455's codegen flags went unrecorded).
-// The route is `kernel.rs`'s `additional_compiler_arguments()`, #434's, which
-// §2.3.9c measures as validated: `-fbogus-not-a-flag` is REJECTED, so a typo
-// fails loudly rather than silently running the baseline.
+// **Unconditionally instantiated, exactly as `gemv_silu` and `gemv_rmsnorm`
+// are** -- issue #516. It sat behind `-DLLOOM_509_RESIDUAL_EPILOGUE` until
+// then, and that `-D` is REMOVED rather than made more legible, because both
+// reasons it existed have expired:
 //
-// **Unset is what ships.** This whole arm is absent from the metallib unless
-// the flag is passed, so the default path is byte-for-byte what shipped and no
-// default is flipped (§7.1a). That is also what dissolves §17 item 7's gate
-// rather than fighting it: a `-D`-gated arm is inert by default, so the
-// measurement becomes possible without reopening that decision.
+//  1. **It dissolved §17 item 7's gate** (§12.2h) -- but that item is
+//     discharged in substance by #484 (§17 Phase 1 item 7): `GEMVKernel`
+//     carries an `Epilogue` template parameter defaulting to `EpilogueNone`,
+//     and `gemv_silu` ships through it with no `-D` at all. The gate the flag
+//     routed around is gone, so the route is no longer load-bearing.
+//  2. **It kept the metallib narrow** -- measured at #516 rather than
+//     asserted: the arm adds **6 names of 307, and 55 376 bytes (+2.04 %)** to
+//     `gemv`'s metallib, against §11.3g's **+4.01 MiB and 144 new variants**
+//     for the packed-params doubling this same file already carries. §11.3g's
+//     verdict is that the doubling is affordable *structurally* -- a library
+//     is compiled once per `Source` and pipelines are lazy, so an
+//     un-dispatched variant costs nothing at dispatch. This arm is ~74x
+//     smaller than the widening already accepted here, on the same file.
+//
+// What the `-D` cost was a **second source of truth for one decision**: a
+// run-time `Config::gemv_residual` selecting a kernel whose *existence* was
+// decided at build time, so `GemvResidual=on` without the flag failed at
+// `newFunctionWithName:` -- after model load and prefill, with a Metal error
+// naming a mangled kernel rather than the flag. §7.1's tiers are the frame:
+// the arm is a **dispatch-tier** choice and now resolves at exactly one tier.
 //
 // One binding, at 15 -- after every argument the classical signature declares,
 // so the classical slot numbering is untouched, exactly as `gemv_rmsnorm`'s
 // two are.
-#ifdef LLOOM_509_RESIDUAL_EPILOGUE
 template <
     typename T,
     const int BM, const int BN,
@@ -892,7 +902,6 @@ void gemv_residual(
       prologue, epilogue,
       tid, lid, simd_gid, simd_lid);
 }
-#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 /// gemv with a fused RMSNorm prologue (issue #266, §12.2 #2)
@@ -1279,8 +1288,13 @@ void gemv_t_packed(
 
 // The fused residual-epilogue sibling (issue #509), named by appending
 // `_residual`. Scoped exactly as `_silu` and `_rmsnorm` are, for §11.3g's
-// measured +730 ms / +4.01 MiB reason -- and additionally behind the `-D`, so
-// unset it costs nothing at all rather than costing two tiles.
+// measured +730 ms / +4.01 MiB reason -- two tiles per dtype and no more.
+//
+// **No longer behind a `-D`** (issue #516): see the kernel's own comment above
+// for why the gate is removed rather than made legible. The cost of the arm
+// existing unconditionally is measured at **6 names of 307, +2.04 % of this
+// file's metallib**, which is ~74x below the widening §11.3g already accepts
+// on this same file.
 //
 // **`bm4` is the tile that matters here and it is not the fixture's.** All
 // three producers of a residual add sit at `N_out` = 2048 -- `w2`
@@ -1290,7 +1304,6 @@ void gemv_t_packed(
 // only from the model's own shapes is blind to a whole defect class. That is
 // the mirror of `_silu`, where `bm8` is the decode tile and `bm4` the
 // fixture's.
-#ifdef LLOOM_509_RESIDUAL_EPILOGUE
 #define instantiate_gemv_residual_helper(nm, itype, bm, bn, sm, sn, tm, tn)      \
   template [[host_name(                                                         \
       "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                       \
@@ -1301,9 +1314,6 @@ void gemv_t_packed(
 #define instantiate_gemv_residual_blocks(nm, itype)              \
   instantiate_gemv_residual_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
   instantiate_gemv_residual_helper(nm, itype, 8, 1, 1, 32, 4, 4)
-#else
-#define instantiate_gemv_residual_blocks(nm, itype)
-#endif
 
 #define instantiate_gemv_nc_axpby(func, nm, itype, bm, bn, sm, sn, tm, tn)    \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 0)      \
@@ -1361,9 +1371,10 @@ instantiate_gemv_silu_blocks(float32, float)
 instantiate_gemv_silu_blocks(float16, half)
 instantiate_gemv_silu_blocks(bfloat16, bfloat)
 
-// Issue #509. Expands to nothing unless `-DLLOOM_509_RESIDUAL_EPILOGUE` is on
-// the compile line, so an unflagged build's metallib is byte-for-byte what
-// shipped.
+// Issue #509, unconditional since #516 -- six names, the same two tiles per
+// dtype `_silu` and `_rmsnorm` above instantiate. The `-D` that used to gate
+// this is gone; §7.1's dispatch tier is now the only tier that decides whether
+// the fused arm runs, and `Config::gemv_residual` is the only switch.
 instantiate_gemv_residual_blocks(float32, float)
 instantiate_gemv_residual_blocks(float16, half)
 instantiate_gemv_residual_blocks(bfloat16, bfloat)

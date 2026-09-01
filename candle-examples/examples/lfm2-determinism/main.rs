@@ -345,10 +345,9 @@ struct Args {
     /// Fuse the two residual adds onto their producing GEMV's store (#509).
     ///
     /// The producers are `out_proj`, `conv.out_proj` and `w2` — 60 dispatches
-    /// per token (§12.2e). **Requires the metallib to carry
-    /// `-DLLOOM_509_RESIDUAL_EPILOGUE`** through `LLOOM_434_METAL_CFLAGS`;
-    /// unset, the forward pass fails at pipeline load rather than silently
-    /// running unfused.
+    /// per token (§12.2e). **Needs no compile flag since #516**; it used to
+    /// require `-DLLOOM_509_RESIDUAL_EPILOGUE` through
+    /// `LLOOM_434_METAL_CFLAGS` and failed at pipeline load without it.
     ///
     /// **The digests MOVE**, for `--gemv-silu`'s reason: the add lands at the
     /// f32 accumulator where `badd_f16` adds at `T` on the rounded store

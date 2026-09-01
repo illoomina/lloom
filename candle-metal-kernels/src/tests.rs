@@ -7727,20 +7727,6 @@ fn gemv_unfused_arm_is_bit_identical_with_the_epilogue_threaded() {
 // Issue #509 -- the fused residual-add epilogue
 ///////////////////////////////////////////////////////////////////////////////
 
-/// Whether this process's metallib carries the `_residual` arm.
-///
-/// The arm is behind `-DLLOOM_509_RESIDUAL_EPILOGUE`, a COMPILE-TIER gate
-/// (§7.1) reached through `LLOOM_434_METAL_CFLAGS`, so on an ordinary
-/// `cargo test` run the kernel does not exist and these tests have nothing to
-/// check. They SKIP rather than fail -- and the skip is **printed**, because a
-/// silently-skipped test reports the same green as a passing one, which is
-/// §15.1a's VACUOUS class in the suite rather than in a measurement.
-fn residual_epilogue_available() -> bool {
-    std::env::var("LLOOM_434_METAL_CFLAGS")
-        .map(|v| v.contains("LLOOM_509_RESIDUAL_EPILOGUE"))
-        .unwrap_or(false)
-}
-
 /// Drive the fused residual arm through the real entry point.
 ///
 /// Takes ONE extra buffer, which is the shape of this entry's finding: unlike
@@ -7841,14 +7827,11 @@ fn reference_gemv_residual(
 /// cares about is the one #484's fixture carried only as a second arm.
 #[test]
 fn gemv_fused_residual_matches_a_reference() {
-    if !residual_epilogue_available() {
-        eprintln!(
-            "SKIP gemv_fused_residual_matches_a_reference: the metallib was \
-             built without -DLLOOM_509_RESIDUAL_EPILOGUE, so the `_residual` \
-             kernel does not exist. Set LLOOM_434_METAL_CFLAGS to run it."
-        );
-        return;
-    }
+    // No availability check: since #516 the `_residual` names are instantiated
+    // unconditionally, so this is an ordinary gate rather than a test that
+    // skips unless an environment variable was set. The skip it replaces was
+    // §15.1a's VACUOUS shape sitting in the suite -- a test that reports the
+    // same green whether or not it evaluated anything.
     for &(k, n_out, label) in &[
         (2048usize, 2048usize, "bm4 (the decode shape), K divides blockN"),
         (2048usize, 6144usize, "bm8, K divides blockN"),

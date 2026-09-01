@@ -2000,10 +2000,10 @@ pub fn gemv_silu(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
 /// `conv.out_proj` and `w2`, 60 dispatches per token (`DESIGN.md` §12.2e).
 /// `weight` is `[n, k]`; `residual` is the layer input, `[.., 1, n]`.
 ///
-/// **Requires the metallib to carry `-DLLOOM_509_RESIDUAL_EPILOGUE`** (through
-/// `LLOOM_434_METAL_CFLAGS`). Unset, the `_residual` name is absent and this
-/// **fails at pipeline load rather than silently running unfused** — which is
-/// the arm the mutation test in `candle-metal-kernels` kills.
+/// **No compile flag is required, since #516.** The `_residual` names are
+/// instantiated unconditionally, as `gemv_silu`'s are; this used to need
+/// `-DLLOOM_509_RESIDUAL_EPILOGUE` on the metallib and failed at pipeline load
+/// without it.
 ///
 /// **Moves the digests**: the add happens at the f32 accumulator where the
 /// `badd_f16` it replaces adds at `T` on the rounded store (§12.2h, §2.3.5a).

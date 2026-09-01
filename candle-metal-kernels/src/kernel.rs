@@ -342,13 +342,29 @@ fn additional_compiler_arguments() -> Option<&'static str> {
 ///
 /// # Why this exists, and it is the gap this pass found
 ///
-/// The passthrough has existed since #434 and is **load-bearing**: §12.2i's
-/// `GemvResidual=on` arm does not merely benefit from
-/// `-DLLOOM_509_RESIDUAL_EPILOGUE`, it **requires** it — without the `-D` the
-/// `_residual` name is absent from the metallib and the forward pass fails at
-/// pipeline load. So this string decides *which kernels exist*.
+/// The passthrough has existed since #434, and this string can decide *which
+/// kernels exist* — which is what makes it worth recording rather than merely
+/// worth having.
 ///
-/// **And no artifact recorded it.** `axis_pairs()` emitted nineteen axes plus
+/// **The instance that used to demonstrate that is gone, and the axis is not.**
+/// Until #516 the demonstration was §12.2i's `GemvResidual=on`, which did not
+/// merely benefit from `-DLLOOM_509_RESIDUAL_EPILOGUE` but *required* it —
+/// without the `-D` the `_residual` name was absent from the metallib and the
+/// forward pass failed at pipeline load. #516 removed that `-D`, because it
+/// coupled a run-time `Config` field to a build-time flag (two sources of truth
+/// for one decision), so **no shipping arm passes a `-D` today** and this axis
+/// records `none` on every default run.
+///
+/// That is a weaker claim than the one this comment used to make, and it is
+/// stated rather than quietly dropped (§2.6a: a justification that stops holding
+/// is not thereby wrong to have recorded). The axis stays for three reasons that
+/// do not depend on the `-D`: `-flto` is selectable through it and **is off by
+/// default in the Metal compiler** (§13.1c measures it moving `__compute` on 6
+/// of 18 decode kernels); the driver **validates**, so a typo is a
+/// `LoadLibraryError` rather than a silent baseline; and a future `-D` would
+/// otherwise re-open §2.3.9's `MathMode` hole the moment it landed.
+///
+/// **And the recording gap it was built for was real.** `axis_pairs()` emitted nineteen axes plus
 /// `Batch` and none of them was the compile flags, so two runs that compiled
 /// **different metallibs** produced **identical `config=[…]` lines** and a
 /// reader pooling them would be comparing two different programs. That is
@@ -833,6 +849,16 @@ mod tests {
             // routing. This arm happens to pass either way -- both sides call
             // `library_source` -- which is exactly why it is worth changing
             // together with the one that did not.
+            //
+            // **This arm's content comparison rests on a fact worth stating,
+            // because it could stop holding** (#516). Unlike the merged arm --
+            // where no member can equal the sixteen-source concatenation -- this
+            // asserts a source gets *its own* text, so equality would be weaker
+            // than identity if two sources shared content. Checked rather than
+            // assumed: the 20 `.metal` files hash to **20 distinct contents**,
+            // so content uniquely identifies a source here. A future duplicate
+            // silently weakens this assertion, and would want the `assert_ne!`
+            // treatment the merged arm above uses.
             assert_eq!(
                 text,
                 Kernels::library_source(s),

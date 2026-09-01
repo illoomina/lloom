@@ -562,11 +562,10 @@ pub enum GemvEpilogue {
     /// before the narrowing cast, where the `badd_f16` it replaces adds at `T`
     /// on the rounded store — so it moves the digests by construction.
     ///
-    /// **Only instantiated when the metallib was built with
-    /// `-DLLOOM_509_RESIDUAL_EPILOGUE`** (a compile-tier gate, §7.1, reached
-    /// through `LLOOM_434_METAL_CFLAGS`). Unset, no `_residual` name exists
-    /// and asking for this arm fails at pipeline load rather than silently
-    /// running unfused.
+    /// **Instantiated unconditionally since #516**, at the same two tiles per
+    /// dtype as [`GemvEpilogue::Silu`]. It was behind
+    /// `-DLLOOM_509_RESIDUAL_EPILOGUE` until then, which made a dispatch-tier
+    /// choice depend on a compile-tier flag; the arm now resolves at one tier.
     Residual,
 }
 
@@ -741,12 +740,17 @@ pub fn call_mlx_gemv_full(
 /// signature declares, exactly as `gemv_rmsnorm`'s two are at 15 and 16 — so
 /// the unfused arm's slot numbering is untouched.
 ///
-/// **Refused rather than silently ignored** in three ways, each because a
+/// **Refused rather than silently ignored** in two ways, each because a
 /// request that quietly ran the wrong kernel produces a well-formed wrong
 /// number that §3.5 says nothing reports: an epilogue needing an operand with
-/// none supplied, an operand supplied to an epilogue that reads none, and a
-/// `_residual` name absent from the metallib because
-/// `-DLLOOM_509_RESIDUAL_EPILOGUE` was not on the compile line.
+/// none supplied, and an operand supplied to an epilogue that reads none.
+///
+/// A third case used to sit here — a `_residual` name absent from the metallib
+/// because `-DLLOOM_509_RESIDUAL_EPILOGUE` was not on the compile line — and is
+/// gone as of #516, which instantiates the arm unconditionally. That case was
+/// never refused *here* anyway: it surfaced two frames down as a
+/// `newFunctionWithName:` failure naming a mangled kernel, which is the
+/// illegibility #516 removes rather than relabels.
 #[allow(clippy::too_many_arguments)]
 pub fn call_mlx_gemv_epilogue(
     device: &Device,

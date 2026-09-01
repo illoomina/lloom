@@ -934,15 +934,21 @@ impl Axes {
             // above this line is not: these decide what the METALLIB contains,
             // where the others select among kernels it already carries.
             //
-            // **`MetalCflags` was the live instance of §2.3.9's failure.** The
+            // **`MetalCflags` was the live instance of §2.3.9's failure**, and
+            // as of #516 it is a latent one rather than a live one. The
             // passthrough has existed since #434 and became load-bearing with
-            // #509 — `GemvResidual=on` REQUIRES
-            // `-DLLOOM_509_RESIDUAL_EPILOGUE` or the name is absent from the
-            // metallib — and it was in neither the registry nor this line. So
-            // two runs that compiled different programs rendered identical
-            // `config=[…]` fields and the store would have pooled them. Read
-            // from the crate's own `OnceLock` rather than from a flag, because
-            // §7.1a-i's present-and-wrong case is the unsafe direction.
+            // #509 — `GemvResidual=on` REQUIRED `-DLLOOM_509_RESIDUAL_EPILOGUE`
+            // or the name was absent from the metallib — while sitting in
+            // neither the registry nor this line, so two runs that compiled
+            // different programs rendered identical `config=[…]` fields. #516
+            // removed that `-D` (it coupled a run-time field to a build-time
+            // flag), so **no shipping arm passes one today and this field reads
+            // `none` on every default run**. It stays stated: `-flto` is
+            // selectable through the same variable and is off by default in the
+            // Metal compiler, and a future `-D` would otherwise re-open the hole
+            // silently. Read from the crate's own `OnceLock` rather than from a
+            // flag, because §7.1a-i's present-and-wrong case is the unsafe
+            // direction.
             //
             // `MergedUnit` is #477's arm and is new, so every earlier run is
             // honestly `UNRECORDED` on it rather than silently `off`.
@@ -1439,10 +1445,9 @@ struct Args {
     gemv_silu: bool,
 
     /// Fuse the two residual adds onto their producing GEMV's store (#509,
-    /// §12.2i). **Requires the metallib to carry
-    /// `-DLLOOM_509_RESIDUAL_EPILOGUE`** through `LLOOM_434_METAL_CFLAGS`;
-    /// unset, the forward pass fails at pipeline load rather than silently
-    /// running unfused. Moves the digests by construction.
+    /// §12.2i). **Needs no compile flag since #516**; it used to require
+    /// `-DLLOOM_509_RESIDUAL_EPILOGUE` through `LLOOM_434_METAL_CFLAGS` and
+    /// failed at pipeline load without it. Moves the digests by construction.
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 

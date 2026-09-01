@@ -263,9 +263,10 @@ struct Args {
 
     /// Fuse the two residual adds onto their producing GEMV's store (#509).
     ///
-    /// Requires the metallib to carry `-DLLOOM_509_RESIDUAL_EPILOGUE` through
-    /// `LLOOM_434_METAL_CFLAGS`. Moves the digests by construction (§12.2h) —
-    /// see `--gemv-silu` for why this gate is the one that matters then.
+    /// Needs no compile flag since #516; it used to require
+    /// `-DLLOOM_509_RESIDUAL_EPILOGUE` through `LLOOM_434_METAL_CFLAGS`. Moves
+    /// the digests by construction (§12.2h) — see `--gemv-silu` for why this
+    /// gate is the one that matters then.
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 

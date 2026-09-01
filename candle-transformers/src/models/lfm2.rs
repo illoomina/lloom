@@ -598,11 +598,13 @@ pub struct Config {
     /// The producers are `out_proj`, `conv.out_proj` and `w2` — 60 dispatches
     /// per token (§12.2e). **Defaults to off**, for `gemv_silu`'s reason.
     ///
-    /// **Requires the metallib to carry `-DLLOOM_509_RESIDUAL_EPILOGUE`**
-    /// through `LLOOM_434_METAL_CFLAGS`. Unset, the `_residual` name does not
-    /// exist and the forward pass **fails at pipeline load** rather than
-    /// silently running unfused — which is the third mutation #550's log
-    /// records as killed.
+    /// **A dispatch-tier switch and nothing else, since #516.** It used to
+    /// additionally require the metallib to carry
+    /// `-DLLOOM_509_RESIDUAL_EPILOGUE`, so this run-time field selected a
+    /// kernel whose existence was decided at build time — two sources of truth
+    /// for one decision, failing at pipeline load with a Metal error naming a
+    /// mangled kernel rather than the flag. The `_residual` names are now
+    /// instantiated unconditionally, exactly as `gemv_silu`'s are.
     ///
     /// **This arm moves the digests by construction** (§12.2h): the add is at
     /// the f32 accumulator where `badd_f16` adds at `T` on the rounded store.

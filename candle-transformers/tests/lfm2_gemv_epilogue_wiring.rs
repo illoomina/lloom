@@ -219,12 +219,11 @@ fn gemv_silu_is_reached_from_the_decode_path() -> Result<()> {
 /// **The residual epilogue is reached, and it changes the answer by a
 /// rounding** — the same argument as `gemv_silu` above, on #509's kernel.
 ///
-/// **Requires `-DLLOOM_509_RESIDUAL_EPILOGUE` on the metallib** (through
-/// `LLOOM_434_METAL_CFLAGS`). Without it the `_residual` name is absent and the
-/// forward pass **fails at pipeline load** rather than running unfused, which
-/// is the arm #550's third mutation kills. This test reports that case as a
-/// skip with the reason, rather than as a pass — a silently-skipped test
-/// reports the same green as a passing one (§12.2h).
+/// Since #516 the `_residual` names are instantiated unconditionally, so this
+/// is an ordinary gate on any Metal build. The skip that used to swallow a
+/// `LoadFunction` error is gone: with the kernel always present, that error
+/// means something is genuinely wrong and must fail rather than report the
+/// same green as a passing run (§15.1a's VACUOUS class in the suite).
 #[test]
 fn gemv_residual_is_reached_from_the_decode_path() -> Result<()> {
     let Ok(dev) = Device::new_metal(0) else {
@@ -232,22 +231,7 @@ fn gemv_residual_is_reached_from_the_decode_path() -> Result<()> {
         return Ok(());
     };
     let base = decode_logits(&tiny_config(false, false), &dev)?;
-
-    let fused = match decode_logits(&tiny_config(false, true), &dev) {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("residual") || msg.contains("LoadFunction") {
-                eprintln!(
-                    "SKIPPED: the metallib carries no `_residual` kernel. \
-                     Build with LLOOM_434_METAL_CFLAGS=-DLLOOM_509_RESIDUAL_EPILOGUE \
-                     to run this arm. Underlying error: {msg}"
-                );
-                return Ok(());
-            }
-            return Err(e);
-        }
-    };
+    let fused = decode_logits(&tiny_config(false, true), &dev)?;
 
     let (delta, mag) = max_abs_delta(&base, &fused);
     eprintln!("gemv_residual: max|delta| = {delta:e}, max|logit| = {mag:e}");

@@ -224,9 +224,11 @@ fn the_census_shows_gemv_silu_replacing_the_silu_dispatch() -> Result<()> {
 
 /// **The residual epilogue: the fused name appears and the `add` disappears.**
 ///
-/// Requires `-DLLOOM_509_RESIDUAL_EPILOGUE` on the metallib; without it the
-/// arm reports a skip with the reason rather than a pass, because a
-/// silently-skipped test reports the same green as a passing one (§12.2h).
+/// Since #516 the `_residual` names are instantiated unconditionally, so the
+/// fused arm is reachable on any Metal build and a `LoadFunction` error here is
+/// a REAL failure rather than an unset compile flag. The skip that used to
+/// swallow it is gone; the only skip left is the census instrument itself,
+/// which is recorded only under `CANDLE_METAL_PROFILE=1`.
 #[test]
 fn the_census_shows_gemv_residual_replacing_the_add_dispatch() -> Result<()> {
     if !candle::metal_backend::profile::enabled() {
@@ -244,21 +246,9 @@ fn the_census_shows_gemv_residual_replacing_the_add_dispatch() -> Result<()> {
     let off = decode_census(&tiny_config(false, false), &dev)?;
     dump("gemv_residual OFF", &off);
 
-    let on = match decode_census(&tiny_config(false, true), &dev) {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("residual") || msg.contains("LoadFunction") {
-                eprintln!(
-                    "SKIPPED: the metallib carries no `_residual` kernel. Build \
-                     with LLOOM_434_METAL_CFLAGS=-DLLOOM_509_RESIDUAL_EPILOGUE. \
-                     Underlying error: {msg}"
-                );
-                return Ok(());
-            }
-            return Err(e);
-        }
-    };
+    // Propagates rather than skipping: the kernel is always instantiated now,
+    // so failing to load it means something is genuinely wrong.
+    let on = decode_census(&tiny_config(false, true), &dev)?;
     dump("gemv_residual ON", &on);
 
     assert!(

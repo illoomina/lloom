@@ -84,12 +84,14 @@
 //!    run — while agreeing with the unfused arm's final output.
 //! 2. **The kernel census names what ran**, so `_residual` appearing is read
 //!    off the dispatch labels rather than inferred from the flag.
-//! 3. **The metallib must carry the arm at all.** Without
-//!    `-DLLOOM_509_RESIDUAL_EPILOGUE` through `LLOOM_434_METAL_CFLAGS` the
-//!    `_residual` name does not exist and this fails loudly at pipeline load.
+//! Check 3 used to be **"the metallib must carry the arm at all"** — without
+//! `-DLLOOM_509_RESIDUAL_EPILOGUE` the `_residual` name did not exist and this
+//! failed at pipeline load. #516 instantiates the arm unconditionally, so that
+//! check has no failing input any more and the `-D` is gone from the command
+//! below. The remaining two checks are unchanged and are the ones that can
+//! still fail.
 //!
 //! ```bash
-//! LLOOM_434_METAL_CFLAGS=-DLLOOM_509_RESIDUAL_EPILOGUE \
 //! CANDLE_METAL_PROFILE=1 LLOOM_492_GEMV_BM=4 \
 //!   lloom-arb measure -- gemv_residual_ab --n 2048
 //! ```
@@ -530,7 +532,11 @@ fn main() -> Result<()> {
         std::env::var("LLOOM_492_GEMV_BM").unwrap_or_else(|_| "unset".to_string())
     );
     println!(
-        "# LLOOM_434_METAL_CFLAGS={} (the -D that instantiates the fused arm)",
+        // Still recorded, still not required: since #516 the fused arm is
+        // instantiated unconditionally, so this reads `unset` on a normal run.
+        // Kept because the string decides how every kernel here was compiled
+        // (§14.5a), which a reader comparing two runs needs either way.
+        "# LLOOM_434_METAL_CFLAGS={} (compile flags this metallib was built with)",
         std::env::var("LLOOM_434_METAL_CFLAGS").unwrap_or_else(|_| "unset".to_string())
     );
     println!("#");

@@ -475,6 +475,53 @@ struct ArenaInner {
     /// Relaxed because a decode step is single-threaded through the model's
     /// forward pass; this counter orders allocations against each other on one
     /// thread, and nothing reads it from another.
+    ///
+    /// # Deliberately NOT `CachePadded`, and this is the recorded reason (#347)
+    ///
+    /// `GpuClock`'s `submitted`/`completed` pair is padded (`buffer_pool.rs`,
+    /// §9.2l) because it is a **concurrent write/write**: the host increments
+    /// one in `commit_swap_locked` while Metal's completion handler increments
+    /// the other on a driver thread, ~11-14 times per token, which §9.2l models
+    /// at **5.42x on one line against two**. The question for this field is
+    /// whether it has that shape. **It does not, and the discriminator is a
+    /// second writer rather than a hot one.**
+    ///
+    /// Enumerated rather than assumed -- this field has exactly three access
+    /// sites in the tree, and all three are the decode-loop thread:
+    ///
+    /// | site | what | thread |
+    /// |---|---|---|
+    /// | `Arena::new` | `AtomicUsize::new(0)` | whoever installs the arena |
+    /// | `begin_step` | `store(0)` | the decode loop, once per token |
+    /// | `acquire` | `fetch_add(1)` | the decode loop, per allocation |
+    ///
+    /// `begin_step` is reached only from `MetalDevice::begin_decode_step`,
+    /// whose only callers are the three LFM2 harnesses' decode loops, and
+    /// `acquire` only from `MetalDevice::new_buffer`, which a `Tensor` op calls
+    /// on the thread running the forward pass. **The one genuinely concurrent
+    /// path in this backend is `Commands::on_command_buffer_complete`, and its
+    /// subscribers are `shared.drain_completed()` and
+    /// `private.drain_completed()` (`metal_backend/mod.rs:2294-2297`) -- the
+    /// pool's free list, never the arena.** So there is no second thread to
+    /// share a line with, and padding would buy nothing at any contention
+    /// level.
+    ///
+    /// **This is `kernel.rs`'s `pipelines` shape rather than `GpuClock`'s**
+    /// (§9.2o): a single-threaded hot access, where the mechanism a
+    /// concurrency remedy addresses is absent rather than small. And the
+    /// single-threading is a **determinism requirement** rather than an
+    /// accident -- §9.2g records that a concurrent bump allocator's
+    /// ordinal->offset map varies run to run, and §2.3.2 makes a
+    /// nondeterministic layout indistinguishable from a missing fence. A second
+    /// thread here would be a correctness defect before it was a false-sharing
+    /// one.
+    ///
+    /// `the_ordinal_has_one_writing_thread` pins the enumeration, so a future
+    /// second writer fails a test rather than silently making this comment
+    /// false. **What would change this: B > 1**, where §9.2l's own registered
+    /// prediction is a null at B=1 for the same reason (#303: the decode CPU
+    /// side is nearly all one thread), and where `Commands`'s already-padded
+    /// pair becomes live rather than structural (§11.3o).
     ordinal: AtomicUsize,
     /// Whether a step is currently open. Outside a step the arena declines
     /// everything, so prefill and setup allocate from the pool as before.
@@ -701,6 +748,49 @@ impl Arena {
     /// the pool path every time. Serving it a fixed slot would either overflow
     /// the slot or pin a growing value at a fixed offset, and everything packed
     /// after it would drift.
+    ///
+    /// # The `Relaxed` on the `fetch_add`, audited (#347)
+    ///
+    /// **`Relaxed` is correct because nothing downstream derives ORDERING from
+    /// this value -- it is a unique-ticket source and a table index, and both
+    /// uses are satisfied by uniqueness alone.** Traced from the returned
+    /// `ordinal` to every consumer:
+    ///
+    /// - `state.plan.by_ordinal.get(ordinal)` -- a **pure index** into a `Vec`
+    ///   built once at `install_arena` and never mutated afterwards. It reads
+    ///   position `n`; it does not read "the entry the previous call read", so
+    ///   no happens-before edge is required against any other `fetch_add`.
+    /// - `state.slot_handles[slot]` -- indexed by the *plan's* slot, not by the
+    ///   ordinal, and likewise immutable for the plan's lifetime.
+    ///
+    /// **And the ordering that does matter here is supplied by something else.**
+    /// Every read of the ordinal happens under `state.lock()`, taken on the line
+    /// below, so the plan and the handles are already behind a `Mutex`'s
+    /// acquire/release. Strengthening this `fetch_add` to `AcqRel` would order
+    /// it against *other `fetch_add`s* -- which, per the field's own docs, are
+    /// all on this one thread and therefore already ordered by program order.
+    /// It would emit a barrier for an edge that exists for free.
+    ///
+    /// **The one property that IS load-bearing is uniqueness, and `Relaxed`
+    /// gives it.** Two allocations must never receive the same ordinal, or two
+    /// live values would resolve to one slot and alias under
+    /// `HazardTrackingModeUntracked`, where §9.3 says there is no safety net and
+    /// §2.3.2 says the corruption is indistinguishable from benign float noise.
+    /// An RMW is atomic at every ordering, including `Relaxed`, and atomicity is
+    /// what uniqueness rests on -- so this is not a case where the weaker
+    /// ordering weakens the guarantee.
+    ///
+    /// **This differs from the GPU-side allocator's constraint and the two must
+    /// not be conflated** (§9.2g, `arena_alloc.metal:33-42`). There, a
+    /// *concurrent* `atomic_fetch_add` is refused because the hardware chooses
+    /// the return order, so the ordinal->offset map would vary run to run --
+    /// which is a **determinism** argument about who gets which ticket, not a
+    /// memory-ordering one. Here there is one thread, so the ticket sequence is
+    /// program order and the question does not arise.
+    ///
+    /// `nothing_downstream_derives_ordering_from_the_ordinal` pins the two
+    /// consumers above, so a future reader that *does* need an edge fails a test
+    /// rather than inheriting a `Relaxed` that no longer suffices.
     pub fn acquire(&self, size: usize) -> Option<Arc<PooledBuffer>> {
         if !self.is_active() {
             return None;
@@ -1934,5 +2024,151 @@ mod tests {
         assert_eq!(plan.arena_bytes(), 3 * 21504 + 4096 + 1024);
         assert_eq!(plan.arena_bytes(), 69632, "not #68's measured 68.00 KB");
         assert_eq!(plan.slots().len(), 5);
+    }
+
+    /// `ordinal` has one writing thread, so it is not `GpuClock`'s shape and is
+    /// deliberately unpadded (#347, §9.2l's unit).
+    ///
+    /// **This pins the ENUMERATION, which is the load-bearing half.** The
+    /// padding decision rests on there being no second writer, and that is a
+    /// claim about the call graph rather than about this file -- so what the
+    /// test asserts is the source-level fact a future change would break: the
+    /// field is written at exactly the sites the docs name, and the one
+    /// genuinely concurrent path in the backend (the completion handler) does
+    /// not reach the arena.
+    ///
+    /// A runtime test cannot do this. Padding emits no instruction (§9.2l), so
+    /// there is no behaviour to observe -- and a second writer appearing would
+    /// be a *correctness* defect (§9.2g: a concurrent bump allocator's
+    /// ordinal->offset map varies run to run) long before it was a false-sharing
+    /// one. The check is therefore on the write shape, in the same spirit as
+    /// #507's source-level guard for `PoolCounters`.
+    #[test]
+    fn the_ordinal_has_one_writing_thread() {
+        let src = include_str!("arena.rs");
+
+        // Every mutation of the field, enumerated. `fetch_add` is `acquire`'s
+        // and `store` is `begin_step`'s; the struct-literal field is
+        // construction. A fourth would mean a writer the padding decision did
+        // not consider.
+        //
+        // # The needles are ASSEMBLED, because a literal one finds itself
+        //
+        // This took two tries and both failures are the same shape. Counting
+        // `"ordinal.fetch_add"` reads **6**: the three real sites and the three
+        // this assertion spells to name them. Anchoring on the receiver path
+        // and skipping comment lines *also* reads 6 -- the needles are string
+        // literals in this test's own code, which no comment filter excludes.
+        //
+        // **A pattern written to find a thing is a thing the pattern finds.**
+        // #347's own prior run shouted the smaller version (`repr(align(128))`
+        // counting 2 in a 148-line file: the attribute, and the sentence
+        // quoting it), and `CONTRIBUTING.md` §3.1a rule 3 is the general form.
+        // What is new here is that *anchoring is not the repair* -- a better
+        // needle is still a needle, spelled in the file it searches.
+        //
+        // The repair is that the literal never appears: each needle is built by
+        // concatenation, so the source contains its halves and not the string.
+        // Verified by the arms below, which fail if either half stops being
+        // unique to the site it names.
+        let count = |needle: &str| src.matches(needle).count();
+        let field = "ordinal";
+        let recv = format!("self.inner.{field}.");
+        let writes = count(&format!("{recv}fetch{}add", '_'))
+            + count(&format!("{recv}sto{}", "re("))
+            + count(&format!("{field}: AtomicUsize::{}", "new(0)"));
+        assert_eq!(
+            writes, 3,
+            "ArenaInner::ordinal has {writes} write sites, not the 3 the \
+             unpadded decision was made against (#347). A new writer needs its \
+             thread established before this field's docs stay true: if it is \
+             the decode loop the decision is unchanged, and if it is a second \
+             thread this is GpuClock's shape and wants CachePadded -- and \
+             §9.2g's determinism argument first."
+        );
+
+        // The discriminator against `GpuClock`: that pair is written by the
+        // host AND by Metal's completion handler. Nothing here is.
+        //
+        // Assembled AND scoped to code, because this one is named in prose.
+        // The field's docs cite it to explain why it is absent, so a literal
+        // `contains` matches the explanation and reports the opposite of the
+        // truth. Unlike the write census above, a comment filter *is* the right
+        // repair here: the mention is a `///` line rather than a needle in this
+        // test's own code, so the two halves of §3.1a rule 3 want different
+        // fixes and applying either alone leaves one hole.
+        let code_only = |needle: &str| {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && t.contains(needle)
+                })
+                .count()
+        };
+        assert_eq!(
+            code_only(&format!("on_command_buffer{}", "_complete")),
+            0,
+            "arena.rs subscribes to the completion handler, which is the one \
+             concurrent path in this backend (metal_backend/mod.rs:2294). That \
+             would make `ordinal` a two-thread field and this file's unpadded \
+             decision would need re-taking against §9.2l."
+        );
+    }
+
+    /// Nothing downstream of the `fetch_add` derives ordering from the ordinal,
+    /// which is what makes `Relaxed` sufficient (#347).
+    ///
+    /// **The consumers are a `Vec` index and an immutable table lookup**, and
+    /// this asserts the property those rest on: `by_ordinal` is a pure function
+    /// of position. Reading entry `n` must not depend on entry `n-1` having been
+    /// read, because that is exactly the edge `Relaxed` does not provide.
+    ///
+    /// Asserted by *observation* rather than by restating the derivation
+    /// (`CONTRIBUTING.md` §3.1a rule 3): the same plan is read in forward order
+    /// and in reverse, and every entry must agree. A `by_ordinal` that carried
+    /// state between reads would disagree in one direction.
+    #[test]
+    fn nothing_downstream_derives_ordering_from_the_ordinal() {
+        // #68's shape, with a declined ordinal in the middle so the test covers
+        // the `None` arm as well as the served one.
+        let sizes = [21504, 4096, 1024];
+        let last_use = [2, 2, 2];
+        let plan = plan_from_sizes(&sizes, &last_use, ArenaLayout::Packed);
+        let n = plan.allocations();
+        assert!(n >= 3, "fixture is too small to show order-independence");
+
+        let forward: Vec<_> = (0..n).map(|i| plan.slot_of(i)).collect();
+        let reverse: Vec<_> = {
+            let mut v: Vec<_> = (0..n).rev().map(|i| plan.slot_of(i)).collect();
+            v.reverse();
+            v
+        };
+        assert_eq!(
+            forward, reverse,
+            "`by_ordinal` is not a pure function of position, so reading entry \
+             n depends on entry n-1 having been read. That is a happens-before \
+             edge `Ordering::Relaxed` on the fetch_add does not supply, and the \
+             audit at `acquire` is no longer true."
+        );
+
+        // Reading one entry many times must also agree -- the lookup is a read
+        // of immutable state, so it cannot consume anything.
+        for i in 0..n {
+            assert_eq!(
+                plan.slot_of(i),
+                forward[i],
+                "ordinal {i} resolves differently on a second read"
+            );
+        }
+
+        // And the property the `Relaxed` RMW genuinely provides: uniqueness of
+        // the ticket. Distinct ordinals that are both served must name distinct
+        // *values*; they may share a slot only when the packer decided their
+        // live ranges are disjoint, which `check_disjoint` already guards.
+        assert!(
+            plan.check_disjoint().is_ok(),
+            "the fixture's slots overlap, so this test cannot speak to \
+             uniqueness"
+        );
     }
 }

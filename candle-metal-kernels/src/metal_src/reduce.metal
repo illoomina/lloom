@@ -1,21 +1,14 @@
-#include <metal_stdlib>
-#include <metal_limits>
-using namespace metal;
+// NOTE: this file does NOT open with `#include <metal_stdlib>`.
+// `source.rs` supplies the include prologue and splices `utils.metal`'s
+// shared helpers in after it (issue #458), so this file is a FRAGMENT and
+// does not compile standalone.
+//
+// `div_ceil` and `work_per_thread` come from `utils.metal`. This file keeps
+// its OWN `get_strided_index_t`, which is a different algorithm rather than
+// a stale copy -- a switch over `strided_indexer<D>` specialisations unrolled
+// at rank 1..4 with a fallback past 4 -- so it is not part of the shared
+// helper set and must not be collapsed into one.
 
-template<uint Y>
-constexpr uint div_ceil(uint x) {
-    return x / Y + (x % Y > 0);
-}
-
-template<uint X, uint Y>
-constexpr uint div_ceil() {
-    return X / Y + (X % Y > 0);
-}
-
-template<typename T>
-constexpr uint work_per_thread() {
-    return div_ceil<8, sizeof(T)>();
-}
 
 METAL_FUNC uint nonzero(uint n) {
     return n == 0 ? 1 : n;

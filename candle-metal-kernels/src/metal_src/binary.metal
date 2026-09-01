@@ -1,38 +1,22 @@
-#include <metal_stdlib>
-using namespace metal;
+// NOTE: this file does NOT open with `#include <metal_stdlib>`.
+// `source.rs` supplies the include prologue and splices `utils.metal`'s
+// shared helpers in after it (issue #458), so this file is a FRAGMENT and
+// does not compile standalone. `newLibraryWithSource` sees prologue +
+// utils + this text as one translation unit.
 
 // Utils
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
 
-// Templated on the pointer *type* rather than written once per address space.
-// The classical entry points pass `constant size_t *`; the packed ones pass
-// `device const size_t *`, because an ICB command can bind a buffer but has no
-// `setBytes` at all (`DESIGN.md` §3.7c). Deducing the address space from the
-// pointer type is what lets one body serve both -- the same move issue #38 made
-// for `reduce.metal`'s `strided_indexer`, and it is why no arithmetic is
-// duplicated here.
+// `get_strided_index`, `div_ceil` and `work_per_thread` are shared: they live
+// in `utils.metal`, concatenated ahead of this file by `source.rs` (#458).
 //
-// The indexers are member templates for the same reason: the functor type is a
-// kernel template parameter (`l_indexer`, `r_indexer`), so it must not itself
-// be parameterised on the address space, or every instantiation row would
-// double. Templating `operator()` instead keeps `strided_indexer` one type that
-// works with either pointer.
-template <typename PtrT>
-METAL_FUNC uint get_strided_index(
-    uint idx,
-    size_t num_dims,
-    PtrT dims,
-    PtrT strides
-) {
-    uint strided_i = 0;
-    for (uint d = 0; d < num_dims; d++) {
-        uint dim_idx = num_dims - 1 - d;
-        strided_i += (idx % dims[dim_idx]) * strides[dim_idx];
-        idx /= dims[dim_idx];
-    }
-    return strided_i;
-}
+// The indexers below are member templates for the same reason the shared
+// `get_strided_index` is templated on `PtrT`: the functor type is a kernel
+// template parameter (`l_indexer`, `r_indexer`), so it must not itself be
+// parameterised on the address space, or every instantiation row would double.
+// Templating `operator()` instead keeps `strided_indexer` one type that works
+// with either pointer.
 
 struct cont_indexer {
     template <typename PtrT>
@@ -70,20 +54,6 @@ struct scalar_indexer {
     }
 };
 
-template<uint Y>
-constexpr uint div_ceil(uint x) {
-    return x / Y + (x % Y > 0);
-}
-
-template<uint X, uint Y>
-constexpr uint div_ceil() {
-    return X / Y + (X % Y > 0);
-}
-
-template<typename T>
-constexpr uint work_per_thread() {
-    return div_ceil<8, sizeof(T)>();
-}
 
 // Packed parameter blocks.
 //

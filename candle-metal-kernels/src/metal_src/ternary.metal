@@ -1,41 +1,24 @@
-#include <metal_stdlib>
-using namespace metal;
+// NOTE: this file does NOT open with `#include <metal_stdlib>`.
+// `source.rs` supplies the include prologue and splices `utils.metal`'s
+// shared helpers in after it (issue #458), so this file is a FRAGMENT and
+// does not compile standalone. `newLibraryWithSource` sees prologue +
+// utils + this text as one translation unit.
 
 constant bool IDS_CONTIGUOUS [[function_constant(0)]];
 constant bool T_CONTIGUOUS [[function_constant(1)]];
 constant bool F_CONTIGUOUS [[function_constant(2)]];
 
 
-METAL_FUNC uint get_strided_index(
-    uint idx,
-    constant const size_t &num_dims,
-    constant const size_t *dims,
-    constant const size_t *strides
-) {
-    uint strided_i = 0;
-    #pragma clang loop unroll(full)
-    for (uint d = 0; d < num_dims; d++) {
-        uint dim_idx = num_dims - 1 - d;
-        strided_i += (idx % dims[dim_idx]) * strides[dim_idx];
-        idx /= dims[dim_idx];
-    }
-    return strided_i;
-}
+// `get_strided_index_unrolled`, `div_ceil` and `work_per_thread` are shared:
+// they live in `utils.metal`, concatenated ahead of this file by `source.rs`
+// (#458).
+//
+// This file calls the `_unrolled` form deliberately. Its private copy of the
+// helper carried `#pragma clang loop unroll(full)` where the other five files'
+// copies did not, and measured, that pragma changes `where_u8_f16`'s emitted
+// code -- at an unchanged section size, so only a content hash sees it. Calling
+// the un-pragma'd form here would be a silent codegen change.
 
-template<uint Y>
-constexpr uint div_ceil(uint x) {
-    return x / Y + (x % Y > 0);
-}
-
-template<uint X, uint Y>
-constexpr uint div_ceil() {
-    return X / Y + (X % Y > 0);
-}
-
-template<typename T>
-constexpr uint work_per_thread() {
-    return div_ceil<8, sizeof(T)>();
-}
 
 template<typename T, typename ID, uint W = work_per_thread<T>()>
 METAL_FUNC void where_cond(
@@ -61,17 +44,17 @@ METAL_FUNC void where_cond(
         if (IDS_CONTIGUOUS) {
             idx = i;
         } else {
-            idx = get_strided_index(i, num_dims, dims, strides);
+            idx = get_strided_index_unrolled(i, num_dims, dims, strides);
         }
         if (T_CONTIGUOUS) {
             t_idx = i;
         } else {
-            t_idx = get_strided_index(i, num_dims, dims, strides_t);
+            t_idx = get_strided_index_unrolled(i, num_dims, dims, strides_t);
         }
         if (F_CONTIGUOUS) {
             f_idx = i;
         } else {
-            f_idx = get_strided_index(i, num_dims, dims, strides_f);
+            f_idx = get_strided_index_unrolled(i, num_dims, dims, strides_f);
         }
         out[i] = select(f[f_idx], t[t_idx], ids[idx]);
     }

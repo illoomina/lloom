@@ -1,5 +1,8 @@
-#include <metal_stdlib>
-using namespace metal;
+// NOTE: this file does NOT open with `#include <metal_stdlib>`.
+// `source.rs` supplies the include prologue and splices `utils.metal`'s
+// shared helpers in after it (issue #458), so this file is a FRAGMENT and
+// does not compile standalone. `newLibraryWithSource` sees prologue +
+// utils + this text as one translation unit.
 
 template <typename T>
 inline T max_value();
@@ -81,28 +84,14 @@ struct IndexAddParams {
     size_t ids_dim_size;
 };
 
-// Templated on the pointer type rather than written once per address space.
-//
-// The classical `index` entry point receives `src_dims`/`src_strides` as
-// `constant size_t *`; the packed one receives them as `device const size_t *`,
-// because a `setBytes`-bound array becomes a real buffer under packing. Letting
-// MSL deduce the address space keeps the index arithmetic one body -- the same
+// `get_strided_index` is shared: it lives in `utils.metal`, concatenated ahead
+// of this file by `source.rs` (issue #458). It is templated on the pointer type
+// rather than written once per address space, and this file is why -- the
+// classical `index` entry point receives `src_dims`/`src_strides` as
+// `constant size_t *`, the packed one as `device const size_t *`, because a
+// `setBytes`-bound array becomes a real buffer under packing. Letting MSL
+// deduce the address space keeps the index arithmetic one body -- the same
 // remedy #38 and #41 used for `reduce` and `gemv`.
-template <typename PtrT>
-METAL_FUNC uint get_strided_index(
-    uint idx,
-    size_t num_dims,
-    PtrT dims,
-    PtrT strides
-) {
-    uint strided_i = 0;
-    for (uint d = 0; d < num_dims; d++) {
-        uint dim_idx = num_dims - 1 - d;
-        strided_i += (idx % dims[dim_idx]) * strides[dim_idx];
-        idx /= dims[dim_idx];
-    }
-    return strided_i;
-}
 
 // The five bodies.
 //

@@ -16,6 +16,30 @@ impl Library {
         Library { raw }
     }
 
+    /// Every function the COMPILED library carries, as Metal reports it.
+    ///
+    /// This is the instantiated set read from the artifact rather than from the
+    /// source that produced it — `DESIGN.md` §8.1b's argument for a checked
+    /// registry over a generator, applied to enumeration instead of lookup.
+    ///
+    /// It matters because a source-side count cannot be taken. Eighteen of the
+    /// twenty `.metal` files instantiate through a macro whose `[[host_name]]`
+    /// argument is a *variable* (`reduce.metal:790`, `gemv.metal:1102`), so a
+    /// grep for a literal name is structurally blind to every family a decode
+    /// token dispatches and sees only `quantized.metal`, which spells its names
+    /// inline (lloom #517, correcting #469's 133).
+    ///
+    /// Reading it compiles a library and enqueues no GPU work, so it needs no
+    /// arbiter lease — §13.1i records that compiling a library and creating a
+    /// pipeline use the driver rather than the queue `lloom-arb` arbitrates.
+    pub fn function_names(&self) -> Vec<String> {
+        self.raw
+            .functionNames()
+            .iter()
+            .map(|name| name.to_string())
+            .collect()
+    }
+
     pub fn get_function(
         &self,
         name: &str,

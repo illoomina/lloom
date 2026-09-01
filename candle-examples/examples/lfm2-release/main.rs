@@ -61,6 +61,8 @@ mod sha256;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
+use candle_transformers::generation::poll::PollMechanism;
+use candle_transformers::generation::token_ring::TokenRing;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::lfm2::{
     AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model,
@@ -68,6 +70,7 @@ use candle_transformers::models::lfm2::{
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use tokenizers::Tokenizer;
 
 #[derive(Parser, Debug)]
@@ -151,6 +154,46 @@ struct Args {
     /// its total must not be compared against a run without it.
     #[arg(long)]
     sample_split: bool,
+
+    /// **The second arm.** Run the decode loop on §11.5g's non-blocking token
+    /// path: the sampled token is left on the device, written into a persistent
+    /// input slot in place, and the EOS decision is made GPU-side.
+    ///
+    /// **Off by default and the default arm is byte-identical to the path that
+    /// ships** (§7.1a: no default is flipped without its own argued decision on
+    /// its own evidence, and §11.5h's prize is ~1.0 % of a step with three
+    /// discounts stacked on it before anyone measures). What this flag exists
+    /// for is that #500 found the mechanism had **zero production callers**, so
+    /// the A/B it was sent to take had one arm; the flag is what makes a second
+    /// arm exist *in the same binary*, which is #276's requirement that arms
+    /// interleave rather than being two builds compared across time.
+    ///
+    /// **Run-time rather than compile-tier, deliberately.** §14.5a's property is
+    /// that the arm is reproducible from the manifest alone, after #455's
+    /// codegen flags went unrecorded. A compile-tier arm reproduces only if
+    /// someone writes the build line into the artifact -- which is exactly how
+    /// #455's were lost -- and it cannot put both arms in one binary at all. A
+    /// run-time flag is read back from the resolved value onto the `RESULT`
+    /// line by the binary itself, so the arm travels *with the number*. §7.1a-i
+    /// is the reason it is read back rather than echoed: `AttnImpl` was rendered
+    /// by a two-armed conditional over a three-armed axis and `--attn flash`
+    /// reported `AttnImpl=Generic` on every `RESULT` line since #116, and a
+    /// *wrong* arm compares equal to every run of that arm where an absent one
+    /// compares equal to nothing.
+    #[arg(long)]
+    token_ring: bool,
+
+    /// How the host waits for the GPU to publish, on `--token-ring` runs.
+    ///
+    /// `spin`, `spin-hint`, `sleep`, or `sleep:<micros>`. §11.5g reports
+    /// `surviving_count` = 3 on this and declines to pick; so does this, and so
+    /// does #513. All three arms sit behind one enum whose `wait()` is the only
+    /// place they differ, so the flag exposes the seam without resolving it --
+    /// which is what lets a later measurement discriminate them without a
+    /// rebuild. An unrecognised value is an error rather than a fallback
+    /// (§2.4, after #69's vacuous determinism run).
+    #[arg(long, default_value = "spin")]
+    poll: String,
 }
 
 /// Parse LFM2.5-VL-3B's `config.json`.
@@ -404,6 +447,31 @@ fn main() -> Result<()> {
         }
     }
 
+    // The poll arm, parsed before the window and refused rather than defaulted
+    // (§2.4, after #69's vacuous run: an invalid setting must fail loudly,
+    // because a silent fallback produces a run that reports one arm and
+    // executes another).
+    let poll = PollMechanism::from_str(&args.poll).map_err(anyhow::Error::msg)?;
+
+    // **The ring is `--temperature 0` only, and this refuses rather than
+    // silently running the other arm.** §11.5f measures `sample_f`'s
+    // temperature path taking the same `to_cpu` over the whole vocabulary --
+    // 128 000 f32, 512 000 B against argmax's 4 -- and §11.2c puts 74 % of that
+    // arm in a host `sort_by`. `sample_argmax_on_device` is the only sampler
+    // that leaves the token on the device, so a `--token-ring --temperature 0.7`
+    // run would take the host path while reporting the ring arm: #7.1a-i's
+    // wrong-arm shape, which compares equal to every real run of that arm.
+    anyhow::ensure!(
+        !args.token_ring || args.temperature <= 0.,
+        "--token-ring requires --temperature 0 (DESIGN.md §11.5g): the device-resident \
+         sampler is argmax-only, and a temperature run would take the host readback \
+         while reporting the ring arm"
+    );
+    // B=1 is what this harness runs and what the slot is sized for; §6.6c
+    // records the readback as `B` round trips per step at B>1, which makes the
+    // slot `B` slots and is #263's change. Stated so the scope is in the
+    // binary rather than only in the write-up.
+
     let prompt = format!(
         "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
         args.prompt
@@ -438,6 +506,45 @@ fn main() -> Result<()> {
     let mut hit_eos = false;
     let mut turns_run = 0usize;
     let mut prefill_submit_ns: u64 = 0;
+
+    // ---- ring-arm state, allocated before the window --------------------
+    //
+    // `ring` is the persistent input slot plus the device-resident EOS set;
+    // `history` is what discharges the digest obligation.
+    //
+    // **The digest is why this is not just the ring.** §14.5's load-bearing
+    // clause is that the token digest is taken *after* the window closes, which
+    // is what makes a run verifiable without instrumenting what is measured --
+    // and #511 names it as the constraint: a loop that never learns its tokens
+    // cannot hash them. Reading each token back to push it is the round trip
+    // this arm exists to remove, so the tokens are accumulated **device-side**
+    // into one `[n]` slot with the same `slice_set` the ring uses, and read
+    // back **once**, after the clock stops. So the ring arm learns its tokens
+    // exactly as late as the baseline hashes them.
+    //
+    // The engagement counter is on the `RESULT` line for §11.5c's reason: its
+    // first sweep measured the blit against itself, read `unresolved` on every
+    // dimension, and *was caught by counters and by nothing else*.
+    let mut ring: Option<TokenRing> = None;
+    let mut history: Option<Tensor> = None;
+    let mut ring_publishes: u64 = 0;
+    // `flush_and_prune`'s returned surviving count, maxed over the run.
+    //
+    // #493 repaired the unbounded `Commands::in_flight` and returns this count
+    // **so a caller can assert rather than assume** (§2.4), and nothing had
+    // observed the repair working -- because the path that grows `in_flight` is
+    // the path nothing took. This arm is what makes it observable: a 267-token
+    // generation must not hold 267 command buffers.
+    let mut max_in_flight: usize = 0;
+    let mut poll_iters: u64 = 0;
+    // EOS tokens published but never pushed. **Counted rather than inferred
+    // from `hit_eos`, and that is a repair rather than a style choice:** EOS
+    // ends *each turn*, so a `--turns 3` run can publish three of them, and the
+    // first version of the reconciliation below inferred `+1` from the bool.
+    // It fired on a 3-turn EOS run -- 241 published against 238 + 1 -- which is
+    // exactly the shape of defect this wiring was registered to surface, in the
+    // accounting rather than in the mechanism. A bool cannot count.
+    let mut ring_eos_publishes: u64 = 0;
 
     // ---- the timed window --------------------------------------------------
     //
@@ -511,6 +618,121 @@ fn main() -> Result<()> {
                 device.synchronize()?;
             }
             let sample_start = std::time::Instant::now();
+
+            if args.token_ring {
+                // ---- the ring arm ------------------------------------------
+                //
+                // The token is sampled into a **device** tensor and never comes
+                // back: `publish` writes it into the persistent input slot in
+                // place and computes the EOS flag against the uploaded id set,
+                // both GPU-side. §11.5g's write leg is *deleted rather than
+                // relocated* -- there is nothing to upload because nothing came
+                // down.
+                let sampled = logits_processor
+                    .sample_argmax_on_device(&logits)
+                    .context("device-resident argmax")?;
+                let r = match ring.as_ref() {
+                    Some(r) => r,
+                    None => {
+                        // Allocated on first use: `TokenRing::new` wants a first
+                        // input, and the slot's contents before the first
+                        // `publish` are never read.
+                        ring = Some(TokenRing::new(0, &eos_ids, &device)?);
+                        ring.as_ref().unwrap()
+                    }
+                };
+                r.publish(&sampled).context("publishing the token")?;
+                ring_publishes += 1;
+
+                // Commit without waiting, and prune. **This is the call that
+                // makes the arm non-blocking, and it is also the only thing
+                // pruning `Commands::in_flight` once the per-token readback is
+                // gone** (§11.5h): the `Vec`'s only two shrink sites are inside
+                // the two blocking calls this arm exists to stop calling.
+                // Buffer *reclamation* is safe without a wait -- the completion
+                // handler marks the epoch asynchronously -- and the `Vec` is
+                // not, which is the asymmetry #493 found.
+                //
+                // Metal-only, and `cfg`'d rather than assumed: §14.1 makes not
+                // breaking the CPU and CUDA backends a hard constraint, and the
+                // whole `metal_backend` module is behind the `metal` feature.
+                #[cfg(feature = "metal")]
+                if let Device::Metal(m) = &device {
+                    let in_flight = m.flush_and_prune()?;
+                    max_in_flight = max_in_flight.max(in_flight);
+                }
+
+                // The poll, and **what it is is narrower than "a poll" and is
+                // stated rather than implied.** `wait()` is called once, then
+                // the EOS flag is read -- and that read is itself blocking,
+                // because `to_vec1` reaches `to_cpu`'s
+                // `flush_and_wait_current`. So this is a **hint before a
+                // blocking read**, not a spin-until-published loop: the arm
+                // exercises `PollMechanism`'s seam and the readback it waits
+                // on, and it does NOT yet replace the wait with a poll. Doing
+                // that needs a non-blocking read of the flag, which is a
+                // `candle-core` change rather than a harness one and is
+                // deliberately not bundled here.
+                //
+                // What the seam is worth today is that the three arms are
+                // reachable and selectable from one binary, so the measurement
+                // #500 owes can discriminate them without a rebuild.
+                //
+                // The flag is **1 byte** -- not the token. That is still a
+                // round trip and the module says so (`token_ring.rs:169-172`);
+                // what it is not is the *token's* round trip, which is what
+                // deletes the write leg. §15.2 #10a is discharged in
+                // `poll.rs`: the producer structurally cannot announce, because
+                // a compute kernel cannot signal an `MTLEvent` (§3.7b), while
+                // the host polling a kernel-written buffer is measured reliable
+                // at 1998-2000 of 2000 (§3.7g).
+                poll.wait();
+                poll_iters += 1;
+                let is_eos = r.eos_flag().to_vec1::<u8>()?[0] != 0;
+
+                if is_eos {
+                    hit_eos = true;
+                    ring_eos_publishes += 1;
+                    if turn + 1 < args.turns.max(1) {
+                        break;
+                    }
+                    break 'turns;
+                }
+
+                // The token joins the device-side history at its own index,
+                // with the same `slice_set` the ring uses. Nothing is read
+                // back; the whole `[n]` slot is read once after the window.
+                let h = match history.as_ref() {
+                    Some(h) => h,
+                    None => {
+                        history =
+                            Some(Tensor::zeros(args.n + args.turns + 1, DType::U32, &device)?);
+                        history.as_ref().unwrap()
+                    }
+                };
+                h.slice_set(&sampled.reshape(1)?, 0, tokens.len())?;
+                // A placeholder keeps `tokens.len()` -- the loop's own budget
+                // and the history's write index -- correct without the value.
+                // It is overwritten from the device after the clock stops, and
+                // a mismatch between the count and what the device holds would
+                // be a defect this harness must not paper over: the count is
+                // asserted against the readback below.
+                tokens.push(u32::MAX);
+
+                if args.sample_split {
+                    sample_ns.push(sample_start.elapsed().as_nanos() as u64);
+                }
+
+                logits = model
+                    .forward(r.input(), kv_len, &mut cache)
+                    .context("decode forward pass")?
+                    .squeeze(0)?;
+                kv_len += 1;
+                step_ns.push(step_start.elapsed().as_nanos() as u64);
+                continue;
+            }
+
+            // ---- the baseline arm, unchanged -------------------------------
             let next = logits_processor.sample(&logits).context("sampling")?;
             if args.sample_split {
                 sample_ns.push(sample_start.elapsed().as_nanos() as u64);
@@ -554,6 +776,49 @@ fn main() -> Result<()> {
 
     let elapsed = run_start.elapsed();
     // ---- the window is closed; everything below is after the clock ----------
+
+    // **The ring arm learns its tokens here, in one readback, after the clock.**
+    // Inside the window `tokens` held placeholders and the real ids accumulated
+    // device-side; this is the single `to_cpu` that replaces the per-token one,
+    // and it lands outside the measured window exactly as the digest does.
+    //
+    // The placeholder count is asserted against what the device holds rather
+    // than assumed equal: a `slice_set` that silently wrote nothing would leave
+    // zeros here and hash to a stable, wrong digest -- §2.3.8d's shape, where
+    // three identical digests belonged to a model emitting `picture picture
+    // picture`. So the arm checks that no placeholder survived.
+    if args.token_ring {
+        if let Some(h) = history.as_ref() {
+            let all = h.to_vec1::<u32>()?;
+            anyhow::ensure!(
+                all.len() >= tokens.len(),
+                "token history is shorter than the tokens generated"
+            );
+            for (slot, id) in tokens.iter_mut().zip(all.iter()) {
+                *slot = *id;
+            }
+            anyhow::ensure!(
+                !tokens.contains(&u32::MAX),
+                "a placeholder survived the device readback: the ring's history \
+                 slice_set did not write every token, so the digest below would be \
+                 stable and wrong (DESIGN.md §2.3.8d)"
+            );
+            // Every publish is either a token in the digest or an EOS that
+            // ended a turn. **This reconciles the engagement count against the
+            // digest**, which is what makes `ring_publishes` evidence rather
+            // than decoration: a run whose counter and token stream disagree
+            // has one of the two wrong, and #500's whole finding is that a
+            // green board says nothing when nothing is counted.
+            anyhow::ensure!(
+                ring_publishes == tokens.len() as u64 + ring_eos_publishes,
+                "published {} tokens but accounted for {} + {} EOS: the engagement \
+                 count and the digest disagree",
+                ring_publishes,
+                tokens.len(),
+                ring_eos_publishes
+            );
+        }
+    }
 
     // The digest, taken AFTER the window closes. This is §14.5's load-bearing
     // clause: it is what makes the run verifiable without instrumenting the thing
@@ -669,6 +934,46 @@ fn main() -> Result<()> {
     println!();
     println!("tokens sha256         {token_digest}");
 
+    // **The engagement counters, and they are the reason a null on this axis is
+    // readable at all.** §11.5c's first sweep measured the blit against itself
+    // and read `unresolved` on every dimension -- it was caught by
+    // `to_cpu_fast=0` on both arms and by nothing else. #500 is the same shape
+    // one level out: every gate was green because the mechanism had no callers,
+    // and a run reporting `ring_publishes=0` under `--token-ring` is that state
+    // made visible instead of being discovered by a census.
+    //
+    // `to_cpu_fast`/`to_cpu_blit` are reported **per arm** because #454
+    // measures which arm fires as unstable run to run -- blit 12/1/2/5 across
+    // four consecutive runs of one binary, 3..26 in a committed 12-run arm --
+    // which is the same order as the effect. **If the split differs between
+    // arms the comparison moved the allocator, not the ring**, and the result
+    // is void regardless of sign.
+    // `cfg`'d for §14.1: the counters live in `metal_backend`, which is behind
+    // the `metal` feature. A CPU build reports zeros, which is honest -- there
+    // is no `to_cpu` arm to choose on that backend.
+    #[cfg(feature = "metal")]
+    let (fast, blit) = candle::metal_backend::to_cpu_counts();
+    #[cfg(not(feature = "metal"))]
+    let (fast, blit) = (0u64, 0u64);
+    #[cfg(feature = "metal")]
+    let null_after_wait = candle::metal_backend::to_cpu_null_after_wait();
+    #[cfg(not(feature = "metal"))]
+    let null_after_wait = 0u64;
+    println!();
+    println!(
+        "engagement            token_ring={} ring_publishes={} poll={} poll_iters={} \
+         max_in_flight={}",
+        args.token_ring,
+        ring_publishes,
+        poll.name(),
+        poll_iters,
+        max_in_flight
+    );
+    println!(
+        "  readback arms       to_cpu_fast={fast} to_cpu_blit={blit} \
+         to_cpu_null_after_wait={null_after_wait}"
+    );
+
     // One machine-readable line, in the shape the other harnesses print, so an
     // analysis script reads a line rather than parsing prose.
     println!(
@@ -676,7 +981,9 @@ fn main() -> Result<()> {
          conv_state={:?} dtype={:?} seed={} temp={} top_p={} elapsed_s={:.6} \
          end_to_end_tok_s={:.4} steady_ms_per_step={:.6} steady_tok_s={:.4} \
          step_sd_ms={:.6} step_p5_ms={:.6} step_med_ms={:.6} step_max_ms={:.6} \
-         prefill_submit_ms={:.4} final_kv_len={} hit_eos={} token_digest={}",
+         prefill_submit_ms={:.4} final_kv_len={} hit_eos={} token_ring={} \
+         ring_publishes={} poll={} poll_iters={} max_in_flight={} to_cpu_fast={} \
+         to_cpu_blit={} to_cpu_null_after_wait={} token_digest={}",
         args.n,
         args.warmup,
         turns_run,
@@ -699,6 +1006,14 @@ fn main() -> Result<()> {
         prefill_submit_ns as f64 / 1e6,
         kv_len,
         hit_eos,
+        args.token_ring,
+        ring_publishes,
+        poll.name(),
+        poll_iters,
+        max_in_flight,
+        fast,
+        blit,
+        null_after_wait,
         token_digest
     );
 

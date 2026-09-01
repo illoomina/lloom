@@ -82,7 +82,7 @@
 // layer 3 means -- the free list never sees them. The test module below imports
 // one of its own, to assert that installing an arena leaves it untouched.
 use super::{ArenaOffsets, Buffer, PooledBuffer};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// The recorder currently observing binds, if any.
@@ -435,17 +435,83 @@ pub struct ArenaCounters {
     pub gpu_verified: u64,
 }
 
-struct ArenaState {
+/// The live counters, one relaxed atomic per field (issue #562).
+///
+/// # Why these are atomics and not a `Mutex<ArenaCounters>`
+///
+/// A lock is required when state is **mutated**, by **more than one thread**,
+/// under a **compound invariant** -- and these fail the third test and the
+/// second. Every field is an independent monotone counter: nothing reads two of
+/// them and requires that they were sampled at one instant, because the only
+/// consumers are `Arena::counters()` at a step boundary
+/// (`lfm2-dispatch-trace/main.rs:807`) and this file's own tests. So there is no
+/// invariant *between* fields for a lock to preserve, which is what the
+/// `PoolInner::state` mutex genuinely does have (`pending`/`free`/`free_bytes`/
+/// `free_order` move together or the free list is wrong).
+///
+/// **What the lock was FORCING is the point rather than what it cost.** §9.2o
+/// measures an uncontended `pthread_mutex` at 12.49 ns, so this is not a
+/// throughput change and no speedup is claimed for it. What the mutex forced is
+/// that a *counter increment* and an *immutable plan lookup* were the same
+/// critical section, so the hot path could not read the plan without also
+/// serialising against a bump of `offers` -- and the plan is `&'static`-shaped
+/// data that needs no serialisation at all.
+///
+/// `Relaxed` throughout, for the reason §9.2p gives for `ordinal`: nothing
+/// downstream derives an ordering from a counter's value. They are read once,
+/// after the step, by a harness that wants a total rather than a sequence.
+#[derive(Debug, Default)]
+struct LiveCounters {
+    offers: AtomicU64,
+    hits: AtomicU64,
+    declined_session: AtomicU64,
+    declined_size: AtomicU64,
+    declined_exhausted: AtomicU64,
+    steps: AtomicU64,
+    gpu_verified: AtomicU64,
+}
+
+impl LiveCounters {
+    fn snapshot(&self) -> ArenaCounters {
+        ArenaCounters {
+            offers: self.offers.load(Ordering::Relaxed),
+            hits: self.hits.load(Ordering::Relaxed),
+            declined_session: self.declined_session.load(Ordering::Relaxed),
+            declined_size: self.declined_size.load(Ordering::Relaxed),
+            declined_exhausted: self.declined_exhausted.load(Ordering::Relaxed),
+            steps: self.steps.load(Ordering::Relaxed),
+            gpu_verified: self.gpu_verified.load(Ordering::Relaxed),
+        }
+    }
+
+    fn reset(&self) {
+        self.offers.store(0, Ordering::Relaxed);
+        self.hits.store(0, Ordering::Relaxed);
+        self.declined_session.store(0, Ordering::Relaxed);
+        self.declined_size.store(0, Ordering::Relaxed);
+        self.declined_exhausted.store(0, Ordering::Relaxed);
+        self.steps.store(0, Ordering::Relaxed);
+        self.gpu_verified.store(0, Ordering::Relaxed);
+    }
+}
+
+/// The plan and its slot handles: written once, read for the arena's life.
+///
+/// # Why this is not behind a lock (issue #562)
+///
+/// Every field here is established in [`Arena::new`] and never mutated
+/// afterwards -- verified by `the_plan_is_never_mutated_after_construction`,
+/// which is a source-level census in #507's and §9.2p's shape, because
+/// immutability is a property of the **write set** and a runtime test can only
+/// observe that no sequence it happened to try disturbed it.
+///
+/// So the hot path's lookups (`by_ordinal.get(ordinal)`, `slot_handles[slot]`)
+/// are reads of immutable data reached through the `Arc`, which is exactly the
+/// shape that needs no synchronisation: the `Arc` already publishes them, and
+/// there is no later write for a reader to race.
+struct ArenaPlanState {
     plan: StepPlan,
     layout: ArenaLayout,
-    /// Where the offsets this arena binds through came from (issue #70).
-    ///
-    /// `Cpu` until [`Arena::adopt_gpu_offsets`] verifies a GPU-computed table
-    /// against the plan. It is a *recorded* fact rather than a behavioural
-    /// switch, because adoption only happens when the two agree element-wise --
-    /// so the bytes bound are identical either way, and what this names is
-    /// which allocator computed them.
-    offsets: ArenaOffsets,
     /// One handle per slot, created once and held for the plan's lifetime.
     ///
     /// **This is what makes the arena layer 3.** The handles never drop while
@@ -453,7 +519,6 @@ struct ArenaState {
     /// considers them -- exactly how resident weights already behave (§6.3a).
     /// Nothing here calls `free`.
     slot_handles: Vec<Arc<PooledBuffer>>,
-    counters: ArenaCounters,
 }
 
 /// The activation arena.
@@ -469,7 +534,27 @@ struct ArenaInner {
     /// class needs more, it gets its own arena rather than turning this into an
     /// array of buffers.
     base: Buffer,
-    state: Mutex<ArenaState>,
+    /// The plan and its handles: immutable after construction, so no lock
+    /// (issue #562). See [`ArenaPlanState`] for why that is sound here and is
+    /// not sound for `PoolInner::state`.
+    plan_state: ArenaPlanState,
+    /// Where the offsets this arena binds through came from (issue #70).
+    ///
+    /// `Cpu` until [`Arena::adopt_gpu_offsets`] verifies a GPU-computed table
+    /// against the plan. It is a *recorded* fact rather than a behavioural
+    /// switch, because adoption only happens when the two agree element-wise --
+    /// so the bytes bound are identical either way, and what this names is
+    /// which allocator computed them.
+    ///
+    /// An `AtomicU8` rather than a mutex field: it is a single value with no
+    /// invariant tying it to anything else, written once by whoever adopts and
+    /// read by a reporting path. `Relaxed` because no reader derives an
+    /// ordering from it -- adoption has already *verified* the offsets are
+    /// element-wise equal to the plan's, so both arms bind identical bytes and
+    /// what this records is which allocator computed them (issue #562).
+    offsets: AtomicU8,
+    /// Live counters, one relaxed atomic each (issue #562).
+    counters: LiveCounters,
     /// Allocation ordinal within the current decode step.
     ///
     /// Relaxed because a decode step is single-threaded through the model's
@@ -593,14 +678,14 @@ impl Arena {
         Ok(Self {
             inner: Arc::new(ArenaInner {
                 base,
-                state: Mutex::new(ArenaState {
+                plan_state: ArenaPlanState {
                     plan,
                     layout,
-                    // #69's path until a GPU table is verified against the plan.
-                    offsets: ArenaOffsets::Cpu,
                     slot_handles,
-                    counters: ArenaCounters::default(),
-                }),
+                },
+                // #69's path until a GPU table is verified against the plan.
+                offsets: AtomicU8::new(ArenaOffsets::Cpu.to_bits()),
+                counters: LiveCounters::default(),
                 ordinal: AtomicUsize::new(0),
                 active: AtomicU64::new(0),
             }),
@@ -630,9 +715,7 @@ impl Arena {
     ///
     /// Returns the number of ordinals now served from GPU-computed offsets.
     pub fn adopt_gpu_offsets(&self, gpu_offsets: &[u32]) -> Result<usize, String> {
-        let mut state = self.inner.state.lock().map_err(|_| "arena lock poisoned")?;
-
-        let expected = state.plan.expected_offsets();
+        let expected = self.inner.plan_state.plan.expected_offsets();
         if gpu_offsets.len() != expected.len() {
             return Err(format!(
                 "GPU produced {} offsets, the plan has {} ordinals",
@@ -659,31 +742,31 @@ impl Arena {
         // actually engaged, and §2.4's lesson from #69's vacuous determinism run
         // is that an instrument which cannot be shown to have engaged has not
         // measured anything.
-        state.offsets = ArenaOffsets::Gpu;
-        state.counters.gpu_verified += 1;
+        self.inner
+            .offsets
+            .store(ArenaOffsets::Gpu.to_bits(), Ordering::Relaxed);
+        self.inner
+            .counters
+            .gpu_verified
+            .fetch_add(1, Ordering::Relaxed);
         Ok(expected.iter().filter(|e| e.is_some()).count())
     }
 
     /// A copy of the plan this arena serves.
     ///
-    /// Cloned rather than borrowed because the plan lives behind the arena's
-    /// mutex, and a caller that wants to derive the GPU allocator's request
-    /// sizes from it must not hold that lock across a dispatch.
+    /// Still cloned rather than borrowed, and the reason has changed (issue
+    /// #562): the plan is no longer behind a mutex, so the old *"must not hold
+    /// that lock across a dispatch"* justification is gone. What remains is
+    /// that the return type is owned, and narrowing it to a borrow would tie
+    /// every caller's lifetime to the arena for no benefit -- callers derive
+    /// the GPU allocator's request sizes from it and outlive the borrow.
     pub fn plan_snapshot(&self) -> StepPlan {
-        self.inner
-            .state
-            .lock()
-            .map(|s| s.plan.clone())
-            .unwrap_or_default()
+        self.inner.plan_state.plan.clone()
     }
 
     /// Where this arena's offsets come from.
     pub fn offsets(&self) -> ArenaOffsets {
-        self.inner
-            .state
-            .lock()
-            .map(|s| s.offsets)
-            .unwrap_or_default()
+        ArenaOffsets::from_bits(self.inner.offsets.load(Ordering::Relaxed))
     }
 
     /// The single underlying allocation, for residency registration.
@@ -695,11 +778,7 @@ impl Arena {
     }
 
     pub fn layout(&self) -> ArenaLayout {
-        self.inner
-            .state
-            .lock()
-            .map(|s| s.layout)
-            .unwrap_or_default()
+        self.inner.plan_state.layout
     }
 
     /// Open a decode step, resetting the allocation ordinal.
@@ -711,9 +790,7 @@ impl Arena {
     pub fn begin_step(&self) {
         self.inner.ordinal.store(0, Ordering::Relaxed);
         self.inner.active.store(1, Ordering::Relaxed);
-        if let Ok(mut s) = self.inner.state.lock() {
-            s.counters.steps += 1;
-        }
+        self.inner.counters.steps.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Close the current step. Allocations outside a step go to the pool.
@@ -763,13 +840,21 @@ impl Arena {
     /// - `state.slot_handles[slot]` -- indexed by the *plan's* slot, not by the
     ///   ordinal, and likewise immutable for the plan's lifetime.
     ///
-    /// **And the ordering that does matter here is supplied by something else.**
-    /// Every read of the ordinal happens under `state.lock()`, taken on the line
-    /// below, so the plan and the handles are already behind a `Mutex`'s
-    /// acquire/release. Strengthening this `fetch_add` to `AcqRel` would order
-    /// it against *other `fetch_add`s* -- which, per the field's own docs, are
-    /// all on this one thread and therefore already ordered by program order.
-    /// It would emit a barrier for an edge that exists for free.
+    /// **And there is no ordering to supply, which is a stronger statement than
+    /// the one this paragraph used to make** (issue #562). It previously read
+    /// *"every read of the ordinal happens under `state.lock()` ... so the plan
+    /// and the handles are already behind a `Mutex`'s acquire/release"* -- true
+    /// when written, and it rested the `Relaxed` on an edge the mutex happened
+    /// to supply. **That was the wrong reason to be right**: the plan and the
+    /// handles are *immutable after construction*, published once by the `Arc`
+    /// that owns them, so no reader needs an edge against any writer because
+    /// there is no writer to race. #562 removed the mutex and the `Relaxed`
+    /// stands on its own terms.
+    ///
+    /// Strengthening this `fetch_add` to `AcqRel` would order it against *other
+    /// `fetch_add`s* -- which, per the field's own docs, are all on this one
+    /// thread and therefore already ordered by program order. It would emit a
+    /// barrier for an edge that exists for free.
     ///
     /// **The one property that IS load-bearing is uniqueness, and `Relaxed`
     /// gives it.** Two allocations must never receive the same ordinal, or two
@@ -796,68 +881,64 @@ impl Arena {
             return None;
         }
         let ordinal = self.inner.ordinal.fetch_add(1, Ordering::Relaxed);
-        let mut state = self.inner.state.lock().ok()?;
-        state.counters.offers += 1;
+        let counters = &self.inner.counters;
+        let plan_state = &self.inner.plan_state;
+        counters.offers.fetch_add(1, Ordering::Relaxed);
 
-        let entry = match state.plan.by_ordinal.get(ordinal) {
+        let entry = match plan_state.plan.by_ordinal.get(ordinal) {
             Some(e) => *e,
             None => {
-                state.counters.declined_exhausted += 1;
+                counters.declined_exhausted.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         };
         // Not the arena's: session state, excluded when the plan was built
         // because its size moved between the two recorded steps (§9.1).
         let Some((slot, want)) = entry else {
-            state.counters.declined_session += 1;
+            counters.declined_session.fetch_add(1, Ordering::Relaxed);
             return None;
         };
         // Size must match what was planned for this ordinal. A larger request
         // would run past the slot; a smaller one means the sequence has drifted
         // from the plan and the ordinal no longer names what it did.
         if size != want {
-            state.counters.declined_size += 1;
+            counters.declined_size.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        state.counters.hits += 1;
-        Some(Arc::clone(&state.slot_handles[slot]))
+        counters.hits.fetch_add(1, Ordering::Relaxed);
+        Some(Arc::clone(&plan_state.slot_handles[slot]))
     }
 
+    /// A snapshot of the counters.
+    ///
+    /// **Not an atomic snapshot, and it does not need to be** (issue #562).
+    /// Each field is loaded independently, so a caller reading during a step
+    /// could in principle see `offers` from after a `hits` -- and no consumer
+    /// does: `lfm2-dispatch-trace` reads them at a step boundary, and this
+    /// file's tests read them with the decode loop stopped. The counters carry
+    /// no invariant *between* fields, which is the property that made the mutex
+    /// removable in the first place; a reader that needed one would be asking
+    /// for a guarantee the old mutex gave only by accident of scope.
     pub fn counters(&self) -> ArenaCounters {
-        self.inner
-            .state
-            .lock()
-            .map(|s| s.counters)
-            .unwrap_or_default()
+        self.inner.counters.snapshot()
     }
 
     pub fn reset_counters(&self) {
-        if let Ok(mut s) = self.inner.state.lock() {
-            s.counters = ArenaCounters::default();
-        }
+        self.inner.counters.reset();
     }
 
     /// Slots, for reporting and for the layout checks.
     pub fn slots(&self) -> Vec<Slot> {
-        self.inner
-            .state
-            .lock()
-            .map(|s| s.plan.slots().to_vec())
-            .unwrap_or_default()
+        self.inner.plan_state.plan.slots().to_vec()
     }
 }
 
 impl std::fmt::Debug for Arena {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (slots, bytes) = self
-            .inner
-            .state
-            .lock()
-            .map(|s| (s.plan.slots().len(), s.plan.arena_bytes()))
-            .unwrap_or((0, 0));
+        let plan = &self.inner.plan_state.plan;
         f.debug_struct("Arena")
-            .field("slots", &slots)
-            .field("bytes", &bytes)
+            .field("slots", &plan.slots().len())
+            .field("bytes", &plan.arena_bytes())
             .finish()
     }
 }
@@ -2113,6 +2194,149 @@ mod tests {
              would make `ordinal` a two-thread field and this file's unpadded \
              decision would need re-taking against §9.2l."
         );
+    }
+
+    /// The plan is never mutated after construction, which is what makes it
+    /// safe to read without a lock (issue #562).
+    ///
+    /// # Why this is a source-level check and not a runtime one
+    ///
+    /// Immutability is a property of the **write set**, and a runtime test can
+    /// only observe that no sequence it happened to try disturbed it -- which
+    /// is #507's argument for `PoolCounters`' gauge verbatim: *"a runtime test
+    /// catches only a gauge some sequence disturbs, where 'no field here is
+    /// assigned' is visible in the text and invisible to any pool state."*
+    ///
+    /// The claim it pins is the one the removal rests on: `plan`,
+    /// `slot_handles` and `layout` are established in `Arena::new` and never
+    /// assigned again, so every reader on the decode path reads data the `Arc`
+    /// already published and no reader can race a writer.
+    ///
+    /// # The needles are assembled, for §9.2p's reason
+    ///
+    /// A literal needle finds itself -- #347's own run counted
+    /// `"ordinal.fetch_add"` at **6** against a true 3, three of them being the
+    /// assertion's own spellings, and found that *anchoring is not the repair*
+    /// because a better needle is still a needle spelled in the file it
+    /// searches. Built by concatenation, the source holds the halves and never
+    /// the string.
+    #[test]
+    fn the_plan_is_never_mutated_after_construction() {
+        let src = include_str!("arena.rs");
+
+        // Assignments to the plan's fields through the shared handle. The only
+        // legitimate initialisation is the struct literal in `Arena::new`,
+        // which does not go through `self.inner`.
+        let code_only = |needle: &str| {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with("///") && t.contains(needle)
+                })
+                .count()
+        };
+
+        for field in ["plan", "slot_handles", "layout"] {
+            let assign = format!("plan_state.{field} {}", "=");
+            assert_eq!(
+                code_only(&assign),
+                0,
+                "`plan_state.{field}` is assigned after construction. The \
+                 lock-free read in `acquire` rests on this field being \
+                 immutable once the `Arc` publishes it (#562); a writer makes \
+                 it a data race that `HazardTrackingModeUntracked` reports as \
+                 nothing (§3.5, §9.3). Either revert to a mutex or establish \
+                 that the writer runs before any reader exists."
+            );
+        }
+
+        // `plan_state` itself must not be replaced wholesale either -- that
+        // would be the same defect one level up, and a per-field scan would
+        // miss it.
+        assert_eq!(
+            code_only(&format!("inner.plan_state {}", "=")),
+            0,
+            "`ArenaInner::plan_state` is assigned after construction, which \
+             defeats the per-field check above (#562)."
+        );
+
+        // Non-vacuity: the fields must actually be READ through the handle, or
+        // the zeros above are equally consistent with the struct having been
+        // renamed out from under this test (§15.1a's VACUOUS class, #457's
+        // rule that a zero is not evidence unless something nonzero came from
+        // the same command).
+        let reads = code_only("plan_state.plan") + code_only("plan_state.slot_handles");
+        assert!(
+            reads > 0,
+            "no read of `plan_state.plan` or `plan_state.slot_handles` -- this \
+             test is asserting zeros about a field that no longer exists, \
+             which reads exactly like a passing check."
+        );
+    }
+
+    /// The counters carry no invariant between fields, which is what makes them
+    /// atomics rather than a mutex (issue #562).
+    ///
+    /// **Asserted by observation rather than by restating the derivation**
+    /// (`CONTRIBUTING.md` §3.1a rule 3): the test drives the arena through
+    /// every disposition `acquire` can take and checks that each counter moved
+    /// by the amount that disposition implies. A counter wired to the wrong
+    /// branch is caught by the value rather than by the shape.
+    ///
+    /// It is an ABSOLUTE reference, not a shape (§3.1b rule 1): `[1, 1, 1]` is
+    /// a stronger assertion than *all equal*, and the difference matters here
+    /// because a defect that bumped every counter on every call would leave a
+    /// flat sequence flat.
+    #[test]
+    fn each_counter_moves_only_on_its_own_disposition() {
+        // #68's shape, non-aliasing so each ordinal has its own slot and the
+        // dispositions below are reachable one at a time.
+        let sizes = [21504usize, 4096, 1024];
+        let last_use = [2usize, 2, 2];
+        let (arena, _pool) = arena_of(&sizes, &last_use, ArenaLayout::NonAliasing);
+
+        let before = arena.counters();
+        assert_eq!(before.offers, 0, "a fresh arena has offered nothing");
+
+        arena.begin_step();
+        assert_eq!(arena.counters().steps, before.steps + 1, "begin_step");
+
+        // A hit: the first ordinal at exactly its planned size.
+        let served = arena.acquire(sizes[0]);
+        assert!(served.is_some(), "ordinal 0 at its planned size must serve");
+        let c = arena.counters();
+        assert_eq!(c.hits, 1, "one hit");
+        assert_eq!(c.offers, 1, "one offer");
+        assert_eq!(c.declined_size, 0, "a hit is not a size decline");
+        assert_eq!(c.declined_exhausted, 0, "a hit is not an exhaustion");
+
+        // A size mismatch: the next ordinal at the wrong size.
+        assert!(
+            arena.acquire(sizes[1] + 128).is_none(),
+            "wrong size declines"
+        );
+        let c = arena.counters();
+        assert_eq!(c.declined_size, 1, "one size decline");
+        assert_eq!(c.hits, 1, "a size decline is not a hit");
+        assert_eq!(c.offers, 2, "every acquire is an offer");
+
+        // Past the end of the plan: exhaustion, not a size decline.
+        for _ in 0..sizes.len() {
+            let _ = arena.acquire(4096);
+        }
+        let c = arena.counters();
+        assert!(
+            c.declined_exhausted > 0,
+            "walking past the plan exhausts it"
+        );
+        assert_eq!(c.hits, 1, "exhaustion never serves");
+
+        arena.reset_counters();
+        let c = arena.counters();
+        assert_eq!(c.offers, 0, "reset clears offers");
+        assert_eq!(c.hits, 0, "reset clears hits");
+        assert_eq!(c.declined_size, 0, "reset clears declined_size");
+        assert_eq!(c.steps, 0, "reset clears steps");
     }
 
     /// Nothing downstream of the `fetch_add` derives ordering from the ordinal,

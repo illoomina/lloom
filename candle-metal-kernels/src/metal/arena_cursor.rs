@@ -81,6 +81,41 @@ impl ArenaOffsets {
     pub fn is_gpu(self) -> bool {
         self == ArenaOffsets::Gpu
     }
+
+    /// The wire form for [`Arena`](super::Arena)'s `AtomicU8` (issue #562).
+    ///
+    /// The arena records this field with an atomic rather than under a mutex,
+    /// because it is a single value with no invariant tying it to anything
+    /// else. These two functions are the whole of what that costs, and both are
+    /// a `match` so a third variant is a **compile error** rather than a value
+    /// that silently round-trips to `Cpu` -- §7.1a-i's *presence is not
+    /// correctness*, where a two-armed conditional over a three-armed axis
+    /// rendered `--attn flash` as `AttnImpl=Generic` on every `RESULT` line
+    /// since #116, and a wrong arm compares equal to every run of that arm
+    /// where an absent one compares equal to nothing.
+    pub(crate) fn to_bits(self) -> u8 {
+        match self {
+            ArenaOffsets::Cpu => 0,
+            ArenaOffsets::Gpu => 1,
+        }
+    }
+
+    /// Inverse of [`to_bits`](Self::to_bits).
+    ///
+    /// Panics on an unknown value rather than defaulting to `Cpu`: the only
+    /// writer is `to_bits`, so an unknown bit pattern means memory corruption
+    /// rather than an input to be tolerated. Defaulting would report the CPU
+    /// path for a run that took the GPU one, which is the engagement failure
+    /// §2.4 exists to prevent -- #69's determinism gate was vacuous precisely
+    /// because a flag was believed rather than checked against a quantity it
+    /// should have moved.
+    pub(crate) fn from_bits(bits: u8) -> Self {
+        match bits {
+            0 => ArenaOffsets::Cpu,
+            1 => ArenaOffsets::Gpu,
+            other => unreachable!("ArenaOffsets has no bit pattern {other}"),
+        }
+    }
 }
 
 /// Storage for the bump allocator: the cursor, the request sizes, the results.

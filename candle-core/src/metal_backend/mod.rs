@@ -109,6 +109,24 @@ pub fn to_cpu_null_after_wait() -> u64 {
     TO_CPU_NULL_AFTER_WAIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Engagement counters for [`MetalStorage::peek_cpu`] (#535).
+///
+/// `hit` counts peeks that found the buffer mapped and returned a value;
+/// `unmapped` counts peeks that found `contents()` null and returned `None`.
+/// **A peek that returns `None` is not a failure** -- it is the fail-closed arm,
+/// and a caller is expected to fall back to a blocking read. The pair is on the
+/// `RESULT` line for the same reason #336's is: a non-blocking path whose
+/// engagement nobody counts is one whose null reads as a result (§2.4, after
+/// #69's vacuous determinism run).
+pub static PEEK_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PEEK_UNMAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(hit, unmapped)` counts for the non-blocking peek since process start.
+pub fn peek_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (PEEK_HIT.load(Relaxed), PEEK_UNMAPPED.load(Relaxed))
+}
+
 pub fn buffer_o<'a>(buffer: &'a Buffer, l: &Layout, dtype: DType) -> BufferOffset<'a> {
     BufferOffset {
         buffer,
@@ -2145,6 +2163,99 @@ impl MetalStorage {
         Ok(Self::new(buffer, device.clone(), el_count, dtype))
     }
 
+    /// Read the buffer **without waiting for the GPU**, or `None` if it is not
+    /// CPU-mapped.
+    ///
+    /// This is the non-blocking half of `DESIGN.md` §11.5's token path (#535).
+    /// [`Self::to_cpu`] above documents the wait as the part that is *not*
+    /// skippable -- *"skipping the wait would be a read-before-write race"* --
+    /// and that is true of `to_cpu`, whose contract is *give me the finished
+    /// value*. This function has a different contract: **give me what is visible
+    /// now**, and it is the caller's job to decide whether that is the value it
+    /// wanted.
+    ///
+    /// # Why this is sound, measured rather than argued
+    ///
+    /// §3.7g measured the host polling a kernel-written buffer at **1998-2000 of
+    /// 2000** distinct mid-flight values. That arm is a synthetic `atomic_uint`
+    /// in a spin loop, so #535 re-asked it on this shape -- an ordinary
+    /// (non-atomic) kernel store into a `StorageModeShared` +
+    /// `HazardTrackingModeUntracked` allocation, which is candle's
+    /// `RESOURCE_OPTIONS`:
+    ///
+    /// | arm | result |
+    /// |---|---|
+    /// | plain store, host polls, **no synchronization point** | observed **200 / 200** mid-flight |
+    /// | C1 kernel stores nothing | observed **0 / 200** |
+    /// | C2 kernel writes late | observed early **0 / 200** |
+    /// | C3 read after `waitUntilCompleted` | observed **200 / 200** |
+    ///
+    /// First sighting is at **0.084-0.201 ms** against a completion at
+    /// **0.211 ms** mean, so the value is visible materially before the command
+    /// buffer retires. `measurements/probes/issue-535/p1_nonblocking_read.m`.
+    ///
+    /// # What this does NOT promise, and the caller must handle both
+    ///
+    /// **It does not promise freshness.** There is no synchronization point, so
+    /// a `Some(v)` is *a* value the buffer held, not necessarily *this step's*.
+    /// A caller polling for a published token must therefore compare against a
+    /// sentinel it knows the GPU will overwrite, and must not treat the first
+    /// `Some` as the answer. This is why the ring writes a **generation
+    /// counter** rather than a bare flag.
+    ///
+    /// **It does not promise ordering.** MSL documents no ordering for a plain
+    /// store and `device` atomics accept only `memory_order_relaxed` (§9.3), so
+    /// a payload published *behind* a flag may be stale even when the flag is
+    /// visible. #535 observed **0 / 200** tears at 8 words behind a barrier,
+    /// **and that is a bound rather than a guarantee** -- absence of an observed
+    /// tear is evidence-of-absence only to the extent of the trials
+    /// (`DESIGN.md` §Epistemics). Anything wider than the one word the flag
+    /// occupies needs a version protocol, per §3.7g's tear finding (11 of 20
+    /// reader-arms latched a torn 64-bit pair).
+    ///
+    /// **It fails closed.** An unmapped buffer returns `None` rather than
+    /// reading a null pointer -- the same predicate `to_cpu`'s fast path uses,
+    /// and for the same reason: whether an allocation is mapped is an
+    /// *allocator* property (§15.2 #12a's 16384 B threshold), and #454 measures
+    /// which arm fires as unstable run to run. A caller that cannot tolerate
+    /// `None` must use [`Self::to_cpu`].
+    ///
+    /// # `black_box` is load-bearing
+    ///
+    /// Per §11.5d/#445 and #454's survey: a bare null test on an ObjC getter's
+    /// return is eliminated at `opt-level=1` with LTO off -- the unguarded
+    /// function takes `objc_msgSend`'s result straight to a load with no branch
+    /// on it. Without `black_box` this function would read a null pointer in
+    /// exactly the configuration that ships.
+    pub(crate) fn peek_cpu<T: Clone>(&self) -> Option<Vec<T>> {
+        // NOTE: this body reaches NOTHING that waits on, drains, or otherwise
+        // orders against the GPU -- no completion wait, no queue drain, no
+        // command-buffer status read. That is the entire contract, and it is
+        // pinned by `issue_535_peek_is_not_blocking` at the end of this file,
+        // which scans this function's own source. The forbidden calls are named
+        // there rather than here, so the gate's needles cannot match this
+        // comment -- which the gate's own first run demonstrated by tripping on
+        // the sentence that used to be here.
+        let src = std::hint::black_box(self.buffer.contents());
+        if src.is_null() {
+            PEEK_UNMAPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        PEEK_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: `src` is non-null and CPU-mapped, `self.buffer` keeps the
+        // allocation alive for the length of this borrow, and `self.count`
+        // elements of `T` is the extent this storage was created with.
+        //
+        // The GPU may be writing this range concurrently, which is the point.
+        // That is a data race in the C++ sense and it is what the hardware is
+        // being asked about: §3.7g and #535's own probe both measure the read
+        // as well-defined *in practice* on this part, for a mapped Shared
+        // allocation. The value may be torn or stale, and the contract above
+        // says so; what it may not be is a fault, because the mapping is live.
+        let slice = unsafe { std::slice::from_raw_parts(src as *const T, self.count) };
+        Some(slice.to_vec())
+    }
+
     pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
         let size = self.count * self.dtype.size_in_bytes();
 
@@ -3230,5 +3341,95 @@ mod issue_481_arena_mapping {
                  disagrees with the 16384 B threshold"
             );
         }
+    }
+}
+
+/// The non-blocking peek must stay non-blocking (#535).
+///
+/// **This gate exists because a mutation survived every behavioural test.**
+/// `measurements/issue-535-raw/mutate.sh` arm M4 inserts a
+/// `flush_and_wait_current` at the top of [`MetalStorage::peek_cpu`], making the
+/// "non-blocking" read secretly blocking. No assertion over values can see it --
+/// a blocking read returns exactly the same bytes and only *when* differs -- and
+/// the `to_cpu` engagement counters cannot see it either, because a device wait
+/// is not a `to_cpu` call. That is `DESIGN.md` §15.1a's INEXPRESSIVE class: the
+/// repair is a different instrument, and a timing threshold is not it (this
+/// project measures at load 2-26, §3.2, which is how a test becomes a flake).
+///
+/// So the instrument is the **source of the function itself**, scoped to its own
+/// body. `CONTRIBUTING.md` §3.1a rule 3 says *a grep for a rule is not a test of
+/// the rule* -- and that is exactly right about the *capability*, which is why
+/// the non-blocking claim is carried by
+/// `measurements/probes/issue-535/p1_nonblocking_read.m` (200/200 mid-flight
+/// against three controls) and not by this test. What this pins is narrower and
+/// is the thing a grep *can* decide: that no future edit reintroduces a wait
+/// into a function whose entire contract is not to have one. The same idiom is
+/// already used in this tree by `commands_fuzz.rs`.
+#[cfg(test)]
+mod issue_535_peek_is_not_blocking {
+    /// The blocking primitives a readback can reach on this path.
+    const BLOCKING: &[&str] = &[
+        "flush_and_wait_current",
+        "wait_until_completed",
+        "synchronize",
+        "waitUntilCompleted",
+    ];
+
+    fn peek_cpu_body(src: &str) -> &str {
+        let start = src
+            .find("pub(crate) fn peek_cpu<T: Clone>")
+            .expect("peek_cpu not found -- this gate is pinned to a name that moved");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n    pub(crate) fn to_cpu<T: Clone>")
+            .expect("could not find the end of peek_cpu (the following fn moved)");
+        &rest[..end]
+    }
+
+    #[test]
+    fn peek_cpu_contains_no_blocking_call() {
+        let src = include_str!("mod.rs");
+        let body = peek_cpu_body(src);
+        for needle in BLOCKING {
+            // The doc comment above the function mentions `to_cpu`; the body
+            // check starts at the `pub(crate) fn` line, so only code and the
+            // in-body comments are scanned. An in-body comment naming a
+            // blocking call would trip this, which is the conservative
+            // direction.
+            assert!(
+                !body.contains(needle),
+                "peek_cpu's body contains {needle:?} -- the non-blocking read is \
+                 blocking, and no assertion over VALUES can see that (mutate.sh M4)"
+            );
+        }
+    }
+
+    /// The gate can fail: the same scan over `to_cpu`, which *is* blocking and
+    /// must trip every one of these needles it uses.
+    ///
+    /// Without this arm a typo in `BLOCKING`, a scope that selected an empty
+    /// string, or a `find` that silently matched the wrong function would all
+    /// report a clean pass -- §15.1 #1, and #517's *"a survey whose verdicts are
+    /// zeros needs a positive control or it is unfalsifiable"*.
+    #[test]
+    fn the_gate_can_fail() {
+        let src = include_str!("mod.rs");
+        let body = peek_cpu_body(src);
+        assert!(
+            body.len() > 200,
+            "the scanned body is {} bytes -- the scope selector is wrong and the \
+             gate above is passing over nothing",
+            body.len()
+        );
+        // `to_cpu` is the blocking sibling: the identical scan must trip on it.
+        let start = src
+            .find("pub(crate) fn to_cpu<T: Clone>")
+            .expect("to_cpu not found");
+        let to_cpu = &src[start..];
+        assert!(
+            BLOCKING.iter().any(|n| to_cpu.contains(n)),
+            "the blocking sibling contains none of the needles, so the gate \
+             above cannot detect a blocking call at all"
+        );
     }
 }

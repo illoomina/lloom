@@ -194,6 +194,30 @@ struct Args {
     /// (§2.4, after #69's vacuous determinism run).
     #[arg(long, default_value = "spin")]
     poll: String,
+
+    /// Read the EOS flag **without blocking**, on `--token-ring` runs (#535).
+    ///
+    /// §11.5j records that the ring as wired installs *"a hint before a blocking
+    /// read, not a spin-until-published loop"* -- `wait()` fires once per token
+    /// and the flag read that follows reaches `to_cpu`'s
+    /// `flush_and_wait_current` anyway. §11.5k names replacing that read as
+    /// **the largest single candidate** on this seam, and §11.5l measures the
+    /// three poll arms as indiscriminable *because* nothing ever spins.
+    ///
+    /// This is that replacement, behind its own run-time flag so **both arms
+    /// exist in one binary** (#513's requirement: a mechanism reachable only by
+    /// rebuilding is one nothing measures, and #276's rotations need arms that
+    /// interleave in one process).
+    ///
+    /// Off by default. §7.1a: a default is not flipped without its own argued
+    /// decision on its own evidence, and the evidence here is a capability
+    /// result, not a timing.
+    ///
+    /// Requires `--token-ring`; refused otherwise rather than silently ignored,
+    /// since a run reporting an arm it did not execute is §7.1a-i's wrong-arm
+    /// shape.
+    #[arg(long)]
+    nonblocking_eos: bool,
 }
 
 /// Parse LFM2.5-VL-3B's `config.json`.
@@ -467,6 +491,16 @@ fn main() -> Result<()> {
          sampler is argmax-only, and a temperature run would take the host readback \
          while reporting the ring arm"
     );
+    // The non-blocking EOS read is a property OF the ring arm, so asking for it
+    // without the ring is a contradiction rather than a no-op. Refused for the
+    // same reason as above: a run that reports `nonblocking_eos=true` while
+    // executing the baseline's blocking sampler is a wrong arm, and a wrong arm
+    // compares equal to every real run of that arm (§7.1a-i).
+    anyhow::ensure!(
+        !args.nonblocking_eos || args.token_ring,
+        "--nonblocking-eos requires --token-ring (DESIGN.md §11.5, #535): the flag it \
+         polls is published by the ring, so without it there is nothing to poll"
+    );
     // B=1 is what this harness runs and what the slot is sized for; §6.6c
     // records the readback as `B` round trips per step at B>1, which makes the
     // slot `B` slots and is #263's change. Stated so the scope is in the
@@ -537,6 +571,11 @@ fn main() -> Result<()> {
     // generation must not hold 267 command buffers.
     let mut max_in_flight: usize = 0;
     let mut poll_iters: u64 = 0;
+    // Steps on which the non-blocking poll gave up and took the blocking read
+    // (#535). **A nonzero value is not a failure** -- the fallback computes the
+    // same answer -- but it says the peek was declining, which is what makes
+    // the arm's engagement readable rather than assumed (§2.4).
+    let mut poll_fallbacks: u64 = 0;
     // EOS tokens published but never pushed. **Counted rather than inferred
     // from `hit_eos`, and that is a repair rather than a style choice:** EOS
     // ends *each turn*, so a `--turns 3` run can publish three of them, and the
@@ -641,8 +680,24 @@ fn main() -> Result<()> {
                         ring.as_ref().unwrap()
                     }
                 };
-                r.publish(&sampled).context("publishing the token")?;
-                ring_publishes += 1;
+                // On the non-blocking arm the publish is STAMPED with this
+                // step's ordinal, so the host can poll for *this* step rather
+                // than for a flag it cannot date (#535). Ordinals start at 1
+                // because 0 is the unpublished sentinel.
+                //
+                // Without the stamp `eos == 0` is two states a non-blocking
+                // reader cannot separate -- *published, not EOS* and *not yet
+                // published* -- and the blocking read was silently discharging
+                // that ambiguity by waiting. The blocking arm is unchanged and
+                // still calls the unstamped `publish`.
+                if args.nonblocking_eos {
+                    ring_publishes += 1;
+                    r.publish_step(&sampled, Some(ring_publishes as u32))
+                        .context("publishing the token")?;
+                } else {
+                    r.publish(&sampled).context("publishing the token")?;
+                    ring_publishes += 1;
+                }
 
                 // Commit without waiting, and prune. **This is the call that
                 // makes the arm non-blocking, and it is also the only thing
@@ -686,9 +741,56 @@ fn main() -> Result<()> {
                 // a compute kernel cannot signal an `MTLEvent` (§3.7b), while
                 // the host polling a kernel-written buffer is measured reliable
                 // at 1998-2000 of 2000 (§3.7g).
-                poll.wait();
-                poll_iters += 1;
-                let is_eos = r.eos_flag().to_vec1::<u8>()?[0] != 0;
+                // **#535 replaces the read above on the `--nonblocking-eos`
+                // arm, and the paragraph above describes the OTHER arm**, which
+                // is unchanged and still ships by default.
+                //
+                // Here `wait()` runs between *repeated* non-blocking reads
+                // rather than once before a blocking one, so this is the
+                // spin-until-published loop §11.5j says the tree did not
+                // contain -- which is why §11.5l's null on the three poll arms
+                // is a result about the arm as wired and explicitly **untested**
+                // about this shape.
+                let is_eos = if args.nonblocking_eos {
+                    let generation = ring_publishes as u32;
+                    // **Bounded, and the bound falls back rather than failing.**
+                    // `poll_eos` returns `None` both for *not published yet* and
+                    // for *this buffer is not CPU-mapped*, and the second is an
+                    // allocator property (§15.2 #12a) that #454 measures as
+                    // unstable run to run -- so an unbounded loop would HANG on
+                    // a run where the pool happened to hand back a large
+                    // bucket, and it would hang silently. The blocking read is
+                    // the fallback, which is the same fail-closed shape
+                    // §11.5c's `contents()` test uses: the slow path is always
+                    // correct, so the fast one is free to decline.
+                    //
+                    // The budget is deliberately generous against a ~19 ms step
+                    // (§6.6) -- it exists to convert a hang into a counted
+                    // fallback, not to time anything.
+                    const POLL_BUDGET: u64 = 50_000_000;
+                    let mut spins: u64 = 0;
+                    loop {
+                        poll_iters += 1;
+                        match r.poll_eos(generation) {
+                            Some(eos) => break eos,
+                            None => {
+                                spins += 1;
+                                if spins > POLL_BUDGET {
+                                    // Counted, not silent: a fallback nobody
+                                    // counts is a null that reads as a result
+                                    // (§2.4).
+                                    poll_fallbacks += 1;
+                                    break r.eos_flag().to_vec1::<u8>()?[0] != 0;
+                                }
+                                poll.wait();
+                            }
+                        }
+                    }
+                } else {
+                    poll.wait();
+                    poll_iters += 1;
+                    r.eos_flag().to_vec1::<u8>()?[0] != 0
+                };
 
                 if is_eos {
                     hit_eos = true;
@@ -959,20 +1061,32 @@ fn main() -> Result<()> {
     let null_after_wait = candle::metal_backend::to_cpu_null_after_wait();
     #[cfg(not(feature = "metal"))]
     let null_after_wait = 0u64;
+    // #535's peek counters. `peek_unmapped` is the fail-closed arm: a nonzero
+    // value says the allocator handed back a buffer Metal did not map, which
+    // §15.2 #12a makes a SIZE property and #454 measures as unstable run to
+    // run. Reported beside `poll_fallbacks` so a reader can tell "the peek
+    // declined" from "the peek never ran".
+    #[cfg(feature = "metal")]
+    let (peek_hit, peek_unmapped) = candle::metal_backend::peek_counts();
+    #[cfg(not(feature = "metal"))]
+    let (peek_hit, peek_unmapped) = (0u64, 0u64);
     println!();
     println!(
         "engagement            token_ring={} ring_publishes={} poll={} poll_iters={} \
-         max_in_flight={}",
+         max_in_flight={} nonblocking_eos={} poll_fallbacks={}",
         args.token_ring,
         ring_publishes,
         poll.name(),
         poll_iters,
-        max_in_flight
+        max_in_flight,
+        args.nonblocking_eos,
+        poll_fallbacks
     );
     println!(
         "  readback arms       to_cpu_fast={fast} to_cpu_blit={blit} \
          to_cpu_null_after_wait={null_after_wait}"
     );
+    println!("  peek arms           peek_hit={peek_hit} peek_unmapped={peek_unmapped}");
 
     // One machine-readable line, in the shape the other harnesses print, so an
     // analysis script reads a line rather than parsing prose.
@@ -983,7 +1097,8 @@ fn main() -> Result<()> {
          step_sd_ms={:.6} step_p5_ms={:.6} step_med_ms={:.6} step_max_ms={:.6} \
          prefill_submit_ms={:.4} final_kv_len={} hit_eos={} token_ring={} \
          ring_publishes={} poll={} poll_iters={} max_in_flight={} to_cpu_fast={} \
-         to_cpu_blit={} to_cpu_null_after_wait={} token_digest={}",
+         to_cpu_blit={} to_cpu_null_after_wait={} nonblocking_eos={} \
+         poll_fallbacks={} peek_hit={} peek_unmapped={} token_digest={}",
         args.n,
         args.warmup,
         turns_run,
@@ -1014,6 +1129,10 @@ fn main() -> Result<()> {
         fast,
         blit,
         null_after_wait,
+        args.nonblocking_eos,
+        poll_fallbacks,
+        peek_hit,
+        peek_unmapped,
         token_digest
     );
 

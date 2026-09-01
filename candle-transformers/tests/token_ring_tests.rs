@@ -239,3 +239,175 @@ fn the_published_token_stays_on_the_device() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// #535 -- the non-blocking read
+//
+// §11.5k names "replacing the blocking flag read with a genuinely non-blocking
+// one" as the largest single candidate on this seam, and §11.5l measures the
+// three poll arms as indiscriminable *because* the arm as wired never spins:
+// `wait()` is called once per token before a read that itself blocks. These
+// tests are about the read that removes it.
+//
+// **The mutation discipline here is deliberate and is the pit's own trap.**
+// A test of the counter's VALUE is not a test of the poll's ROUTING: a
+// `poll_eos` that ignored the counter entirely and returned the flag would pass
+// any assertion about what the counter holds. So the arms below assert the
+// *decision* -- that an unpublished step reports `None` and a published one
+// reports the flag -- which is what a routing mutation moves.
+// ---------------------------------------------------------------------------
+
+/// The counter gates the answer: before the step publishes, the poll must
+/// decline; after, it must report the flag.
+///
+/// This is the ambiguity #535 exists to remove. With a bare flag, "not EOS" and
+/// "not yet written" are both zero and the host cannot tell them apart without
+/// the wait it is trying to delete.
+#[test]
+fn poll_declines_before_the_step_publishes_and_answers_after() -> Result<()> {
+    let Ok(device) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let ring = TokenRing::new(1, EOS, &device)?;
+
+    // Nothing published yet: generation 1 has not landed.
+    assert_eq!(
+        ring.poll_eos(1),
+        None,
+        "poll answered for a step that never published -- the counter is not \
+         gating the read, so a host would race"
+    );
+
+    // Publish step 1 with a non-EOS token.
+    let logits = logits_peaked_at(99, 200_000, &device)?;
+    let sampled = logits.argmax(candle::D::Minus1)?;
+    ring.publish_step(&sampled, Some(1))?;
+    device.synchronize()?;
+
+    assert_eq!(
+        ring.poll_eos(1),
+        Some(false),
+        "step 1 published a non-EOS token and the poll did not report it"
+    );
+
+    // And a step that has NOT published is still declined, on the same ring.
+    // This is the arm that separates "the counter is read" from "the counter
+    // was zero once": a poll for a future generation must decline even though
+    // the buffer now holds a nonzero value.
+    assert_eq!(
+        ring.poll_eos(2),
+        None,
+        "poll answered for a FUTURE step -- it is reporting that the counter is \
+         nonzero rather than comparing it against the generation asked for"
+    );
+    Ok(())
+}
+
+/// EOS is reported through the poll, and the non-EOS arm beside it is what
+/// makes the assertion readable.
+///
+/// §3.1b #1: prefer an absolute reference to a shape. Both arms are pinned to a
+/// literal, so a `poll_eos` returning a constant fails one of them whichever
+/// constant it picks.
+#[test]
+fn poll_reports_eos_and_non_eos_distinctly() -> Result<()> {
+    let Ok(device) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let vocab = 200_000;
+
+    let ring = TokenRing::new(1, EOS, &device)?;
+    let non_eos = logits_peaked_at(99, vocab, &device)?.argmax(candle::D::Minus1)?;
+    ring.publish_step(&non_eos, Some(1))?;
+    device.synchronize()?;
+    assert_eq!(ring.poll_eos(1), Some(false), "a non-EOS token read as EOS");
+
+    let eos = logits_peaked_at(EOS[0] as usize, vocab, &device)?.argmax(candle::D::Minus1)?;
+    ring.publish_step(&eos, Some(2))?;
+    device.synchronize()?;
+    assert_eq!(ring.poll_eos(2), Some(true), "an EOS token read as non-EOS");
+
+    Ok(())
+}
+
+/// The poll agrees with the blocking read it replaces, on both answers.
+///
+/// The blocking read is the reference that did not change (§2.3.5a's rule: a
+/// discriminator must compare against something that is not the thing being
+/// changed). If these two ever disagree, the non-blocking path is wrong and
+/// this is the assertion that says so.
+#[test]
+fn poll_agrees_with_the_blocking_read() -> Result<()> {
+    let Ok(device) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let vocab = 200_000;
+    let ring = TokenRing::new(1, EOS, &device)?;
+
+    for (gen, tok) in [(1u32, 99usize), (2, EOS[0] as usize), (3, 1234)] {
+        let sampled = logits_peaked_at(tok, vocab, &device)?.argmax(candle::D::Minus1)?;
+        ring.publish_step(&sampled, Some(gen))?;
+        device.synchronize()?;
+
+        let blocking = ring.eos_flag().to_vec1::<u8>()?[0] != 0;
+        let polled = ring.poll_eos(gen);
+        assert_eq!(
+            polled,
+            Some(blocking),
+            "step {gen}: the non-blocking poll and the blocking read disagree"
+        );
+    }
+    Ok(())
+}
+
+/// Generation 0 is rejected: it is the unpublished sentinel.
+///
+/// A step stamped 0 would be indistinguishable from one that never published,
+/// which is exactly the ambiguity the counter removes -- so accepting it would
+/// reintroduce the defect silently. §2.4: an invalid setting fails loudly.
+#[test]
+fn generation_zero_is_refused() -> Result<()> {
+    let Ok(device) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let ring = TokenRing::new(1, EOS, &device)?;
+    let sampled = logits_peaked_at(99, 4096, &device)?.argmax(candle::D::Minus1)?;
+    assert!(
+        ring.publish_step(&sampled, Some(0)).is_err(),
+        "generation 0 was accepted, so an unpublished step and a published one \
+         are indistinguishable again"
+    );
+    Ok(())
+}
+
+/// `publish` without a generation leaves the counter alone, so the old
+/// (blocking) callers are unaffected.
+///
+/// §12.3 and §15.2 #13: variants coexist. The blocking path is not removed by
+/// this change and must keep behaving exactly as it did -- a caller that never
+/// stamps never publishes a counter, and `poll_eos` correctly declines for it
+/// rather than reporting a stale answer.
+#[test]
+fn unstamped_publish_leaves_the_counter_and_the_poll_declines() -> Result<()> {
+    let Ok(device) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let ring = TokenRing::new(1, EOS, &device)?;
+    let sampled = logits_peaked_at(99, 4096, &device)?.argmax(candle::D::Minus1)?;
+    ring.publish(&sampled)?;
+    device.synchronize()?;
+
+    // The flag IS written -- the blocking read works exactly as before.
+    assert!(
+        !ring.eos_flag().to_vec1::<u8>()?.is_empty(),
+        "the blocking read stopped working"
+    );
+    // And the poll declines, because nothing stamped a generation.
+    assert_eq!(
+        ring.poll_eos(1),
+        None,
+        "the poll answered for an unstamped publish, so it is not reading the \
+         counter"
+    );
+    Ok(())
+}

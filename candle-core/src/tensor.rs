@@ -1977,6 +1977,78 @@ impl Tensor {
         }
     }
 
+    /// Read a contiguous 1D tensor **without waiting for the GPU**, or `None`
+    /// when a non-blocking read is not available.
+    ///
+    /// The non-blocking half of `DESIGN.md` §11.5's token path (#535). Every
+    /// other read on `Tensor` -- [`Self::to_vec1`], [`Self::to_scalar`] -- ends
+    /// in `to_cpu_storage`, which waits on the GPU; that wait is the round trip
+    /// §11.5a prices at **441 µs/token** and classifies EXPOSED. This is the one
+    /// accessor that does not take it.
+    ///
+    /// # It returns `None` rather than blocking, and that is the contract
+    ///
+    /// `None` means *no non-blocking read is available here* and the caller
+    /// should fall back to [`Self::to_vec1`]. Three cases produce it, and none
+    /// is an error:
+    ///
+    /// * a **non-Metal** backend -- CPU storage is already host memory and CUDA
+    ///   has its own mechanism, so neither is served here rather than being
+    ///   given a misleading answer (§14.1: this must not change other backends);
+    /// * a **non-contiguous** layout, since the peek reads the raw allocation;
+    /// * an **unmapped** buffer. Whether a Metal allocation is CPU-mapped is an
+    ///   *allocator* property, not this call's -- §15.2 #12a's 16384 B threshold
+    ///   -- and #454 measures which arm fires as unstable run to run. Failing
+    ///   closed is what makes that acceptable rather than a hazard.
+    ///
+    /// # `Some` does not mean fresh
+    ///
+    /// There is no synchronization point, so the value is *what the buffer holds
+    /// now*, not *this step's result*. #535 measures the visibility this rests
+    /// on -- an ordinary kernel store into Shared storage is observed host-side
+    /// **200 / 200** with no synchronization, first sighting 0.084-0.201 ms
+    /// against a 0.211 ms completion, against three controls that each report
+    /// the other answer. But a caller cannot distinguish *published* from *not
+    /// yet written* by the value alone unless it arranges to: **compare against
+    /// a sentinel the GPU is known to overwrite**, and poll until it changes.
+    ///
+    /// Ordering behind the read word is not promised either; see
+    /// `MetalStorage::peek_cpu` for the tear bound and why anything wider than
+    /// one word needs a version protocol (§3.7g).
+    pub fn peek_vec1<S: crate::WithDType>(&self) -> Option<Vec<S>> {
+        if self.rank() != 1 || !self.is_contiguous() {
+            return None;
+        }
+        match &*self.storage() {
+            // `cfg`'d on the feature rather than stubbed in the dummy backend.
+            // §14.1 makes not breaking the CPU and CUDA builds a hard
+            // constraint, and `dummy_metal_backend::MetalStorage` is a unit
+            // struct with no buffer to peek at -- adding a stub there would put
+            // a Metal-only capability into the no-`metal` surface for no
+            // caller. Without the feature this falls through to `None`, which
+            // is the same answer every non-Metal backend already gets.
+            //
+            // Caught by the §14.1 gate (`cargo build -p candle-core` with no
+            // `metal`), which failed on the first version of this function.
+            #[cfg(feature = "metal")]
+            Storage::Metal(storage) => {
+                if storage.dtype() != S::DTYPE {
+                    return None;
+                }
+                // The layout is contiguous and rank 1, so the allocation's
+                // elements are the tensor's elements in order; the peek reads
+                // the whole storage and the offset selects this view of it.
+                let (o1, o2) = self.layout.contiguous_offsets()?;
+                let raw: Vec<S> = storage.peek_cpu()?;
+                raw.get(o1..o2).map(|s| s.to_vec())
+            }
+            // Deliberately unserved rather than silently blocking: a caller
+            // reaching for a *non-blocking* read and getting a blocking one back
+            // would be measuring the wrong arm (§7.1a-i's wrong-arm shape).
+            _ => None,
+        }
+    }
+
     /// Returns the data contained in a 2D tensor as a vector of vector of scalar values.
     pub fn to_vec2<S: crate::WithDType>(&self) -> Result<Vec<Vec<S>>> {
         let (dim1, dim2) = self.dims2()?;

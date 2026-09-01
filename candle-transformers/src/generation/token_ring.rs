@@ -78,6 +78,40 @@ pub struct TokenRing {
     input: Tensor,
     eos: Tensor,
     eos_ids: Tensor,
+    /// The published-generation counter, and the reason it exists is #535.
+    ///
+    /// A **flag** cannot be polled non-blockingly and a **counter** can, which
+    /// is a property of the reader rather than of the writer. Reading the flag
+    /// through a blocking `to_vec1` is unambiguous because the wait is what
+    /// establishes that the GPU has finished: whatever the flag says afterwards
+    /// is this step's answer. Remove the wait -- which is the whole point of
+    /// §11.5 -- and `eos == 0` becomes two states the host cannot tell apart:
+    ///
+    /// * the GPU has published and the token was **not** EOS, or
+    /// * the GPU **has not published yet**.
+    ///
+    /// Both read zero. A host that treats the first `Some(0)` as "not EOS"
+    /// races, and a host that waits for a `1` that will never come for a
+    /// non-EOS token hangs. This is not a hazard the peek introduces; it is one
+    /// the *blocking* read was silently discharging.
+    ///
+    /// So the ring publishes a **monotone counter** the host compares against a
+    /// value it already knows. `step` is written with the step's own ordinal at
+    /// the end of `publish`, so the host polls until it observes its own
+    /// expected value and only then reads the flag beside it -- which by then
+    /// has been written, because the counter is written after it.
+    ///
+    /// **The ordering that makes this work is the only unproven link and it is
+    /// stated rather than assumed.** MSL documents no ordering for a plain
+    /// store and `device` atomics accept only `memory_order_relaxed` (§9.3), so
+    /// *counter written after flag* is a source-order claim, not a
+    /// visibility-order guarantee. #535 measured payload-behind-flag at
+    /// **0 of 200** tears with a `mem_device` barrier between them, and records
+    /// that as a **bound rather than a guarantee**. The consequence is drawn in
+    /// [`Self::poll_eos`]: the counter is what is polled, the flag is read
+    /// after it, and a caller that cannot accept that bound has
+    /// [`Self::eos_flag`]'s blocking read unchanged beside it.
+    step: Tensor,
 }
 
 impl TokenRing {
@@ -104,10 +138,18 @@ impl TokenRing {
         // than allocates. `from_vec` of a `0u8` is the same shape `publish`
         // writes, which is what makes the two comparable.
         let eos = Tensor::from_vec(vec![0u8], 1, device)?;
+        // The generation counter starts at 0 and `publish` writes 1, 2, 3, ...
+        // so the host's "has step N landed" test is `observed >= N` against a
+        // value it chose, never against a value it read earlier. U32 is the
+        // width §3.7g's tear finding leaves safe: MSL `device` atomics are
+        // 32-bit, so one word is one store and 11-of-20 torn pairs is a
+        // property of publishing *two*.
+        let step = Tensor::from_vec(vec![0u32], 1, device)?;
         Ok(Self {
             input,
             eos,
             eos_ids,
+            step,
         })
     }
 
@@ -130,10 +172,38 @@ impl TokenRing {
     /// sides are freshly shaped `[1, 1]` contiguous `U32` over distinct
     /// allocations, so both hold; the reshape is what establishes the first.
     pub fn publish(&self, token: &Tensor) -> Result<()> {
+        self.publish_step(token, None)
+    }
+
+    /// [`Self::publish`], additionally stamping the generation counter so the
+    /// host can poll for *this* step without a synchronization point (#535).
+    ///
+    /// `generation` is the step's own ordinal, chosen by the caller and starting
+    /// at 1 -- it is a value the host already holds, which is what makes the
+    /// comparison sound: the host waits for a number it decided rather than for
+    /// a change in a number it read.
+    ///
+    /// **The stamp is written last, and that ordering is the protocol.** The
+    /// input slot, then the EOS flag, then the counter. A host that observes the
+    /// counter has, in source order, a written flag behind it. §9.3 records that
+    /// MSL gives no ordering guarantee for plain stores, so this rests on a
+    /// measured bound rather than on a documented one -- #535 observed 0 of 200
+    /// tears with a device barrier -- and [`Self::poll_eos`] states what a
+    /// caller is accepting.
+    pub fn publish_step(&self, token: &Tensor, generation: Option<u32>) -> Result<()> {
         if token.dtype() != DType::U32 {
             candle::bail!(
                 "TokenRing::publish expects the U32 argmax output, got {:?}",
                 token.dtype()
+            );
+        }
+        if generation == Some(0) {
+            // 0 is the counter's initial value, so a step stamped 0 is
+            // indistinguishable from one that never published -- exactly the
+            // ambiguity this counter exists to remove. Rejected rather than
+            // silently accepted (§2.4: make an invalid setting fail loudly).
+            candle::bail!(
+                "TokenRing: generation 0 is the unpublished sentinel, ordinals start at 1"
             );
         }
         // `argmax` over the vocabulary dimension returns rank 0 (it squeezes);
@@ -152,7 +222,65 @@ impl TokenRing {
             .max_all()?
             .reshape(1)?;
         self.eos.slice_set(&hit, 0, 0)?;
+        // The stamp, LAST. Everything a poller will read once it sees this
+        // value has been encoded before it.
+        if let Some(g) = generation {
+            let stamp = Tensor::from_vec(vec![g], 1, self.step.device())?;
+            self.step.slice_set(&stamp, 0, 0)?;
+        }
         Ok(())
+    }
+
+    /// Non-blocking: has step `generation` published, and was it EOS? (#535)
+    ///
+    /// Returns `None` when the answer is not yet available *or* not available
+    /// without blocking -- the caller polls, and falls back to
+    /// [`Self::eos_flag`] if it must have an answer now.
+    ///
+    /// | returns | meaning |
+    /// |---|---|
+    /// | `None` | this step has not published yet, **or** no non-blocking read is available here |
+    /// | `Some(false)` | published, not EOS |
+    /// | `Some(true)` | published, EOS |
+    ///
+    /// # Why the counter is read first and the flag second
+    ///
+    /// The publish order is input, flag, counter; the poll order is the reverse
+    /// of the dependency, counter then flag. Observing the counter at this
+    /// step's ordinal is what licenses reading the flag at all -- without it,
+    /// `eos == 0` conflates *not EOS* with *not yet written* and the poll is a
+    /// race (see the [`Self::step`] field comment).
+    ///
+    /// # What the caller is accepting, stated because it is not free
+    ///
+    /// **A measured bound, not a documented guarantee.** MSL promises no
+    /// ordering between two plain stores, so *counter visible ⇒ flag visible* is
+    /// supported by #535's 0-of-200 tear arm and by nothing in the spec.
+    /// `DESIGN.md` §Epistemics: absence of an observed tear is evidence of
+    /// absence only to the extent of the trials. The failure this would produce
+    /// is a mis-read EOS on the step it occurred -- a generation that stops one
+    /// token late or early -- not corruption, because the token itself travels
+    /// through `input` device-side and is never read here.
+    ///
+    /// A caller unwilling to take that bound has the blocking read unchanged:
+    /// `eos_flag().to_vec1::<u8>()`.
+    pub fn poll_eos(&self, generation: u32) -> Option<bool> {
+        let observed = self.step.peek_vec1::<u32>()?;
+        let seen = *observed.first()?;
+        // `>=` rather than `==`: a poller that missed an intermediate value
+        // must not spin forever. The counter is monotone, so a larger value
+        // means this step published and a later one did too -- which is a
+        // caller error (it should have polled each step) but must not hang.
+        if seen < generation {
+            return None;
+        }
+        let flag = self.eos.peek_vec1::<u8>()?;
+        Some(*flag.first()? != 0)
+    }
+
+    /// The generation counter, for a caller that wants to observe it directly.
+    pub fn step_counter(&self) -> &Tensor {
+        &self.step
     }
 
     /// The tensor the model reads as its next input. Stable across steps, and

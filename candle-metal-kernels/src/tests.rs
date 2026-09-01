@@ -6613,6 +6613,7 @@ fn run_gemv_fused_rmsnorm(
             scale: &scale_buf,
             scale_offset: 0,
         }),
+        GemvEpilogue::None,
     )
     .unwrap();
 
@@ -6735,8 +6736,11 @@ fn gemv_fused_rmsnorm_matches_a_reference() {
                 "{label}: row {i}: fused {g} vs reference {w} (rel {rel:e})"
             );
         }
-        assert!(worst > 0.0, "{label}: exact agreement with an f64 reference \
-                is not expected in f32 and suggests the comparison did not run");
+        assert!(
+            worst > 0.0,
+            "{label}: exact agreement with an f64 reference \
+                is not expected in f32 and suggests the comparison did not run"
+        );
     }
 }
 
@@ -6897,6 +6901,7 @@ fn gemv_fused_rmsnorm_is_refused_where_it_is_not_instantiated() {
         &out,
         ParamStyle::Split,
         Some(norm),
+        GemvEpilogue::None,
     );
     assert!(
         transposed.is_err(),
@@ -6919,6 +6924,7 @@ fn gemv_fused_rmsnorm_is_refused_where_it_is_not_instantiated() {
         &out,
         ParamStyle::Split,
         Some(norm),
+        GemvEpilogue::None,
     );
     assert!(
         ok.is_ok(),
@@ -7008,11 +7014,31 @@ fn rmsnorm_scale_matches_the_shipping_reduction() {
     let scale = device.new_buffer(4, options).unwrap();
 
     call_rms_norm(
-        &device, &encoder, &kernels, "rmsnorm_f32", k, k, eps, &src, 0, &w, 0, &normed,
+        &device,
+        &encoder,
+        &kernels,
+        "rmsnorm_f32",
+        k,
+        k,
+        eps,
+        &src,
+        0,
+        &w,
+        0,
+        &normed,
     )
     .unwrap();
     call_rms_norm_scale(
-        &device, &encoder, &kernels, "rmsnorm_scale_f32", k, k, eps, &src, 0, &scale,
+        &device,
+        &encoder,
+        &kernels,
+        "rmsnorm_scale_f32",
+        k,
+        k,
+        eps,
+        &src,
+        0,
+        &scale,
     )
     .unwrap();
     drop(encoder);
@@ -7026,7 +7052,10 @@ fn rmsnorm_scale_matches_the_shipping_reduction() {
     let idx = (0..k)
         .max_by(|&a, &b| vec[a].abs().partial_cmp(&vec[b].abs()).unwrap())
         .unwrap();
-    assert!(vec[idx].abs() > 0.1, "fixture has no well-conditioned element");
+    assert!(
+        vec[idx].abs() > 0.1,
+        "fixture has no well-conditioned element"
+    );
     let recovered = normed[idx] / vec[idx];
     let rel = ((recovered - scale[0]) / scale[0]).abs();
     assert!(
@@ -7077,7 +7106,10 @@ fn assert_sorts<F: Fn(u32) -> f32>(idx: &[u32], ncols: usize, val: F, what: &str
     for &i in idx {
         let i = i as usize;
         assert!(i < ncols, "{what}: index {i} out of range 0..{ncols}");
-        assert!(!seen[i], "{what}: index {i} appears twice — not a permutation");
+        assert!(
+            !seen[i],
+            "{what}: index {i} appears twice — not a permutation"
+        );
         seen[i] = true;
     }
     assert_eq!(idx.len(), ncols, "{what}: wrong length");
@@ -7126,7 +7158,9 @@ fn mlx_multi_block_sort_merges_at_every_dtype() {
     // bf16 — the checkpoint's on-disk dtype. Its own bit patterns, not the f16
     // ramp converted: bf16 has 8 fewer mantissa bits, so converting would
     // collide and reintroduce the ties this fixture exists to exclude.
-    let mut vals_bf: Vec<bf16> = (0..ncols).map(|i| bf16::from_bits((i + 1024) as u16)).collect();
+    let mut vals_bf: Vec<bf16> = (0..ncols)
+        .map(|i| bf16::from_bits((i + 1024) as u16))
+        .collect();
     vals_bf.shuffle(&mut rng());
     let idx = run_mlx_sort_dtype(&vals_bf, ncols, DType::BF16);
     assert_sorts(&idx, ncols, |i| vals_bf[i as usize].to_f32(), "bf16");
@@ -7215,4 +7249,476 @@ fn mlx_gemm_383_tile_parity() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fused SiLU epilogue on the decode-path GEMV (issue #484, `DESIGN.md`
+// §12.2 #3).
+//
+// The counterpart to the RMSNorm prologue above, at the other end of the same
+// kernel. §12.2a and §12.2b both lost on OUTPUT PARTITIONING: a GEMV splits
+// its output across `n_tgp` threadgroups and each walks the whole input
+// vector, so a prologue's work is multiplied by `n_tgp` whatever it computes.
+//
+// An epilogue is on the other side of that partition. `GEMVKernel::run` writes
+// each output element from exactly one thread (`if (simdN == 0 && thrN == 0)`),
+// so the transform runs once per output element -- the standalone kernel's own
+// count. `measurements/issue-484-raw/prediction.py` states that arithmetic in
+// full, before this was built.
+// ---------------------------------------------------------------------------
+
+/// Drive the fused epilogue arm through the real entry point.
+///
+/// Takes no extra buffers, which is the shape of the finding: a pure
+/// elementwise epilogue reads nothing the kernel was not already reading.
+#[allow(clippy::too_many_arguments)]
+fn run_gemv_fused_silu(
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &[f32],
+    lhs_stride: &[usize],
+    rhs: &[f32],
+    rhs_stride: &[usize],
+) -> Vec<f32> {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+
+    let mk = |v: &[f32]| {
+        device
+            .new_buffer_with_data(
+                v.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(v),
+                options,
+            )
+            .unwrap()
+    };
+    let lhs_buf = mk(lhs);
+    let rhs_buf = mk(rhs);
+
+    let length = b * m * n;
+    let output = device
+        .new_buffer(length * core::mem::size_of::<f32>(), options)
+        .unwrap();
+
+    call_mlx_gemv_full(
+        &device,
+        &encoder,
+        &kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        0,
+        &lhs_buf,
+        rhs_stride,
+        0,
+        &rhs_buf,
+        &output,
+        ParamStyle::Split,
+        None,
+        GemvEpilogue::Silu,
+    )
+    .unwrap();
+
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec(&output, length)
+}
+
+/// A CPU reference for the matmul followed by SiLU, computed in f64 so it is
+/// not itself one of the two f32 orderings being compared (§10.2g, §2.3.5a).
+fn reference_gemv_silu((m_out, k): (usize, usize), mat: &[f32], vec: &[f32]) -> Vec<f64> {
+    (0..m_out)
+        .map(|row| {
+            let mut acc = 0.0f64;
+            for c in 0..k {
+                acc += mat[row * k + c] as f64 * vec[c] as f64;
+            }
+            acc / (1.0 + (-acc).exp())
+        })
+        .collect()
+}
+
+/// The fused epilogue computes matmul-then-SiLU.
+///
+/// **K = 2050 is in the list for the reason #266's fixture carries it**: the
+/// GEMV walks the input vector in `blockN` chunks and handles the remainder in
+/// a separate `leftover` path, so at LFM2's own K = 2048 the tail never
+/// executes. An epilogue is outside that loop and so is not itself tail-
+/// sensitive -- but the ACCUMULATOR it transforms is, so a fixture that never
+/// takes the tail cannot see an epilogue applied to a wrong sum.
+///
+/// The fixture values are chosen so the accumulator spans both signs and is
+/// not near-constant: SiLU is monotone but strongly asymmetric about zero, and
+/// an all-positive fixture cannot distinguish it from the identity times a
+/// number near 1.
+#[test]
+fn gemv_fused_silu_matches_a_reference() {
+    for &(k, n_out, label) in &[
+        (
+            2048usize,
+            512usize,
+            "bm4 (k/v_proj shape), K divides blockN",
+        ),
+        (2048usize, 6144usize, "bm8 (w1 shape), K divides blockN"),
+        (2050usize, 512usize, "bm4, K leaves a 2-element tail"),
+        (2050usize, 6144usize, "bm8, K leaves a 2-element tail"),
+    ] {
+        let (b, m, n) = (1usize, n_out, 1usize);
+
+        let mat: Vec<f32> = (0..n_out * k)
+            .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+            .collect();
+        let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+
+        let got = run_gemv_fused_silu(
+            GemmDType::F32,
+            (b, m, n, k),
+            &mat,
+            &[m * k, k, 1],
+            &vec,
+            &[k, 1, 1],
+        );
+        let want = reference_gemv_silu((n_out, k), &mat, &vec);
+
+        assert_eq!(got.len(), want.len(), "{label}: length");
+
+        // Non-vacuity, per §15.1 #1: two kernels that both write nothing agree
+        // perfectly.
+        let distinct = got
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            distinct >= 2,
+            "{label}: fused output has {distinct} distinct value(s); the \
+             comparison would be vacuous"
+        );
+
+        // A SECOND non-vacuity arm, and this one is specific to SiLU. The
+        // reference must contain values where SiLU is materially not the
+        // identity -- i.e. some accumulator below zero, where SiLU's output
+        // has the OPPOSITE sign behaviour to `x`. Without this a fixture whose
+        // accumulators are all large and positive makes `silu(x) ~ x`, and the
+        // test would pass against a kernel with no epilogue at all.
+        let negatives = want.iter().filter(|v| **v < 0.0).count();
+        assert!(
+            negatives > 0,
+            "{label}: no negative outputs; SiLU is indistinguishable from the \
+             identity on this fixture and the comparison is vacuous"
+        );
+
+        let mut worst = 0.0f64;
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            let denom = w.abs().max(1.0);
+            let rel = ((g as f64) - w).abs() / denom;
+            if rel > worst {
+                worst = rel;
+            }
+            assert!(
+                rel < 2e-5,
+                "{label}: row {i}: fused {g} vs reference {w} (rel {rel:e})"
+            );
+        }
+        assert!(
+            worst > 0.0,
+            "{label}: exact agreement with an f64 reference is not expected in \
+             f32 and suggests the comparison did not run"
+        );
+    }
+}
+
+/// The fused arm agrees with the two-dispatch path it replaces.
+///
+/// **A tolerance comparison and not a bit-equality one, and the reason is
+/// recorded rather than assumed.** `silu_f16`/`silu_f32` evaluate
+/// `x/(1+exp(-x))` at `T` on the value the GEMV already rounded and stored;
+/// the epilogue evaluates it at the f32 accumulator before that rounding. The
+/// fused arm therefore rounds once where the pair rounds twice, which is
+/// strictly the more accurate order and still a different computation.
+#[test]
+fn gemv_fused_silu_agrees_with_the_unfused_path() {
+    let k = 2048usize;
+    let n_out = 512usize;
+    let (b, m, n) = (1usize, n_out, 1usize);
+
+    let mat: Vec<f32> = (0..n_out * k)
+        .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+        .collect();
+    let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+
+    let fused = run_gemv_fused_silu(
+        GemmDType::F32,
+        (b, m, n, k),
+        &mat,
+        &[m * k, k, 1],
+        &vec,
+        &[k, 1, 1],
+    );
+
+    // The unfused path: the ordinary GEMV writes the accumulator, then the
+    // standalone `silu` kernel transforms it.
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+    let mk = |v: &[f32]| {
+        device
+            .new_buffer_with_data(
+                v.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(v),
+                options,
+            )
+            .unwrap()
+    };
+    let mat_buf = mk(&mat);
+    let vec_buf = mk(&vec);
+    let gate = device
+        .new_buffer(n_out * core::mem::size_of::<f32>(), options)
+        .unwrap();
+    call_mlx_gemv_with(
+        &device,
+        &encoder,
+        &kernels,
+        GemmDType::F32,
+        (b, m, n, k),
+        &[m * k, k, 1],
+        0,
+        &mat_buf,
+        &[k, 1, 1],
+        0,
+        &vec_buf,
+        &gate,
+        ParamStyle::Split,
+    )
+    .unwrap();
+    let out = device
+        .new_buffer(n_out * core::mem::size_of::<f32>(), options)
+        .unwrap();
+    call_unary_contiguous(
+        &device,
+        &encoder,
+        &kernels,
+        unary::contiguous::silu::FLOAT,
+        core::mem::size_of::<f32>(),
+        n_out,
+        BufferOffset {
+            buffer: &gate,
+            offset_in_bytes: 0,
+        },
+        &out,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    let unfused: Vec<f32> = read_to_vec(&out, n_out);
+
+    let want = reference_gemv_silu((n_out, k), &mat, &vec);
+
+    // Non-vacuity on BOTH arms, and on the property under test.
+    assert!(
+        want.iter().any(|v| *v < 0.0),
+        "fixture has no negative outputs; SiLU would be indistinguishable \
+         from the identity"
+    );
+
+    let mut worst_fused = 0.0f64;
+    let mut worst_unfused = 0.0f64;
+    for i in 0..n_out {
+        let denom = want[i].abs().max(1.0);
+        worst_fused = worst_fused.max(((fused[i] as f64) - want[i]).abs() / denom);
+        worst_unfused = worst_unfused.max(((unfused[i] as f64) - want[i]).abs() / denom);
+    }
+    // Neither arm is "correct" and the other wrong: both are f32 roundings of
+    // one computation, and the f64 reference is what says how far each sits.
+    assert!(
+        worst_fused < 2e-5 && worst_unfused < 2e-5,
+        "fused {worst_fused:e} / unfused {worst_unfused:e} against an f64 reference"
+    );
+}
+
+/// The fused epilogue is refused where it has no instantiation, rather than
+/// silently running unfused.
+///
+/// Both bounds are asserted -- the refusals AND the admitted case -- because a
+/// check that refuses everything is §8.1g's failure and the admitted arm is
+/// the load-bearing half.
+#[test]
+fn gemv_fused_silu_is_refused_where_it_is_not_instantiated() {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+
+    let k = 2048usize;
+    let buf = device.new_buffer(4 * k * 4, options).unwrap();
+    let scale = device.new_buffer(4, options).unwrap();
+    let out = device.new_buffer(4 * k * 4, options).unwrap();
+
+    // `m == 1` routes to the TRANSPOSED kernel, which carries no `_silu`
+    // instantiation.
+    let transposed = call_mlx_gemv_full(
+        &device,
+        &encoder,
+        &kernels,
+        GemmDType::F32,
+        (1, 1, 512, k),
+        &[k, k, 1],
+        0,
+        &buf,
+        &[512 * k, 512, 1],
+        0,
+        &buf,
+        &out,
+        ParamStyle::Split,
+        None,
+        GemvEpilogue::Silu,
+    );
+    assert!(
+        transposed.is_err(),
+        "the transposed kernel has no fused epilogue and must be refused"
+    );
+
+    // The packed binding style has no fused sibling.
+    let packed = call_mlx_gemv_full(
+        &device,
+        &encoder,
+        &kernels,
+        GemmDType::F32,
+        (1, 512, 1, k),
+        &[512 * k, k, 1],
+        0,
+        &buf,
+        &[k, 1, 1],
+        0,
+        &buf,
+        &out,
+        ParamStyle::Packed,
+        None,
+        GemvEpilogue::Silu,
+    );
+    assert!(
+        packed.is_err(),
+        "the packed style has no fused epilogue and must be refused"
+    );
+
+    // Prologue and epilogue together resolve a name that is not instantiated.
+    let norm = GemvRmsNorm {
+        weight: &buf,
+        weight_offset: 0,
+        scale: &scale,
+        scale_offset: 0,
+    };
+    let both = call_mlx_gemv_full(
+        &device,
+        &encoder,
+        &kernels,
+        GemmDType::F32,
+        (1, 512, 1, k),
+        &[512 * k, k, 1],
+        0,
+        &buf,
+        &[k, 1, 1],
+        0,
+        &buf,
+        &out,
+        ParamStyle::Split,
+        Some(norm),
+        GemvEpilogue::Silu,
+    );
+    assert!(
+        both.is_err(),
+        "no `_rmsnorm_silu` variant is instantiated and the combination must \
+         be refused"
+    );
+
+    // The admitted bound: the non-transposed decode tile IS instantiated.
+    let ok = call_mlx_gemv_full(
+        &device,
+        &encoder,
+        &kernels,
+        GemmDType::F32,
+        (1, 512, 1, k),
+        &[512 * k, k, 1],
+        0,
+        &buf,
+        &[k, 1, 1],
+        0,
+        &buf,
+        &out,
+        ParamStyle::Split,
+        None,
+        GemvEpilogue::Silu,
+    );
+    assert!(
+        ok.is_ok(),
+        "the non-transposed decode tile must be admitted: {ok:?}"
+    );
+
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+}
+
+/// The unfused arm is untouched: threading the epilogue template parameter
+/// through `GEMVKernel` must not change what the shipping kernel computes.
+///
+/// Bit-identical rather than approximate. `EpilogueNone` is the identity and
+/// is meant to inline away entirely; anything but an exact match means the
+/// seam cost the unfused arm something, which is §12.3's requirement that the
+/// two variants coexist without the default paying for it.
+#[test]
+fn gemv_unfused_arm_is_bit_identical_with_the_epilogue_threaded() {
+    let k = 2048usize;
+    let n_out = 512usize;
+    let mat: Vec<f32> = (0..n_out * k)
+        .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+        .collect();
+    let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+
+    let a = run_mlx_gemv_style::<f32>(
+        GemmDType::F32,
+        (1, n_out, 1, k),
+        &mat,
+        &[n_out * k, k, 1],
+        &vec,
+        &[k, 1, 1],
+        ParamStyle::Split,
+    );
+
+    // The fused arm on the same inputs must NOT match, or the epilogue is not
+    // engaged and this test would pass against a no-op. §2.4's rule: an
+    // instrument that cannot be shown to have engaged has measured nothing.
+    let fused = run_gemv_fused_silu(
+        GemmDType::F32,
+        (1, n_out, 1, k),
+        &mat,
+        &[n_out * k, k, 1],
+        &vec,
+        &[k, 1, 1],
+    );
+    assert!(
+        a.iter().zip(fused.iter()).any(|(x, y)| x != y),
+        "the fused and unfused arms produce identical bits; the epilogue is \
+         not engaged and the comparison below would be vacuous"
+    );
+
+    let b = run_mlx_gemv_style::<f32>(
+        GemmDType::F32,
+        (1, n_out, 1, k),
+        &mat,
+        &[n_out * k, k, 1],
+        &vec,
+        &[k, 1, 1],
+        ParamStyle::Split,
+    );
+    assert_eq!(
+        a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "the unfused arm must be bit-identical run to run"
+    );
 }

@@ -78,6 +78,86 @@ struct PrologueNone {
   METAL_FUNC AccT operator()(AccT x, int) const { return x; }
 };
 
+///////////////////////////////////////////////////////////////////////////////
+/// Epilogue functors (issue #484, `DESIGN.md` §12.2 #3)
+///////////////////////////////////////////////////////////////////////////////
+
+// The OTHER end of the same kernel, and the asymmetry is the entry's whole
+// point rather than an implementation detail.
+//
+// A PROLOGUE sits inside the K-walk. Every one of the `n_tgp` threadgroups
+// walks the whole input vector, so a prologue's work is multiplied by `n_tgp`
+// **whatever it computes** -- §12.2b's own words, and the property that priced
+// #266 at 432x the reduction work and #282 at 128x the elementwise work. That
+// is not a fact about reductions; it is a fact about how a GEMV partitions its
+// OUTPUT.
+//
+// An EPILOGUE sits on the other side of that same partition. `GEMVKernel::run`
+// ends with
+//
+//     if (simdN == 0 && thrN == 0) { out_vec[out_row + tm] = ...; }
+//
+// so exactly ONE thread writes each output element, and a transform placed on
+// `result[tm]` there is evaluated exactly once per output element -- the same
+// count as the standalone elementwise kernel it replaces. The multiplier that
+// killed both prologues is 1 here, by the same argument that makes it `n_tgp`
+// there.
+//
+// It also costs no traffic of its own: `result[tm]` is already in registers
+// and `out_vec[out_row + tm]` is a store that already happened. What it removes
+// is the consumer kernel's read and its write of the intermediate.
+//
+// WHAT AN EPILOGUE CANNOT DO, stated so the seam's limit is on the record. It
+// sees one thread's `TM` outputs at `out_row`. It cannot see the whole output
+// vector, so a reduction over N -- a softmax over the logits, say -- is no more
+// expressible here than a reduction over K is in a prologue. The two ends have
+// the same restriction and it binds on different axes: a prologue cannot reduce
+// over K, an epilogue cannot reduce over N. Elementwise is what fits, and silu
+// is elementwise.
+
+// The identity. Byte-for-byte what shipped, on the same argument as
+// `PrologueNone`: no state, returns its argument, inlines away.
+template <typename T, typename AccT>
+struct EpilogueNone {
+  METAL_FUNC AccT operator()(AccT x, int) const { return x; }
+};
+
+// SiLU / swish: `x / (1 + exp(-x))`.
+//
+// The EXPRESSION is spelled to match `unary.metal`'s `usilu` character for
+// character -- `x * (1/(1+exp(-x)))` and `x/(1+exp(-x))` are not the same
+// float operation, and a different spelling would move the digests for a
+// reason that is not the fusion.
+//
+// **The PRECISION deliberately does not match, and this is the one place the
+// fused arm is not a rewrite of the unfused one.** Read from source:
+// `define_unary_op(name, op)` templates `operator()` on `T` and returns
+// `static_cast<T>(op)`, so `silu_f16` evaluates `x/(1+exp(-x))` **at half**
+// and its input is the f16 value `w1` already rounded and stored. Here the
+// input is `result[tm]`, which is the f32 accumulator BEFORE that rounding,
+// and `AccT` is `float` at every dtype this instantiates
+// (`GemvDefaultAccT`) -- so the fused arm computes silu at f32 on an
+// unrounded input and rounds once, where the unfused pair rounds twice and
+// computes the transcendental at f16.
+//
+// That is strictly the more accurate order and it is still a DIFFERENT
+// computation, so this arm **moves the digests by construction** and owes
+// §2.3.5a's discriminator rather than an unchanged-digest gate. Recording it
+// here because the alternative -- casting down to T, computing at half, and
+// casting back, purely to reproduce the unfused rounding -- is available and
+// was not taken: it would spend accuracy to make a gate cheaper, which is
+// §1.2's "never weaken a test to make a digest match" pointed the other way.
+//
+// Per §2.3.3b the bare `exp` at FLOAT is the flag-reachable spelling, so this
+// arm tracks `MathMode` where `silu_f16`'s half `exp` is pinned. That is a
+// second, independent reason the two cannot be bit-compared.
+template <typename T, typename AccT>
+struct EpilogueSilu {
+  METAL_FUNC AccT operator()(AccT x, int) const {
+    return x / (1 + exp(-x));
+  }
+};
+
 // RMSNorm's elementwise tail: `x * inv_rms * weight[i]`.
 //
 // `inv_rms` is a single f32 the reduction dispatch wrote, read once at
@@ -116,10 +196,12 @@ template <
     const int TN,       // Thread cols (in elements)
     const bool kDoAxpby,
     typename AccT = typename GemvDefaultAccT<T>::type,
-    typename Prologue = PrologueNone<T, AccT>>
+    typename Prologue = PrologueNone<T, AccT>,
+    typename Epilogue = EpilogueNone<T, AccT>>
 struct GEMVKernel {
   using acc_type = AccT;
   using prologue_type = Prologue;
+  using epilogue_type = Epilogue;
 
   MLX_MTL_CONST int threadsM = BM * SM;
   MLX_MTL_CONST int threadsN = BN * SN;
@@ -177,6 +259,7 @@ struct GEMVKernel {
       const int bias_stride,
       threadgroup AccT* tgp_memory,
       thread const Prologue& prologue,
+      thread const Epilogue& epilogue,
       uint3 tid,
       uint3 lid,
       uint simd_gid,
@@ -287,15 +370,32 @@ struct GEMVKernel {
       }
     }
 
+    // THE EPILOGUE SEAM (issue #484). This branch is what makes an epilogue
+    // cheap where a prologue is not: it is taken by ONE thread per output
+    // element, so `epilogue()` is evaluated exactly `out_vec_size` times per
+    // dispatch -- the standalone elementwise kernel's own count -- against a
+    // prologue's `n_tgp * in_vec_size` (§12.2a, §12.2b).
+    //
+    // It is applied to `result[tm]`, the AccT accumulator, BEFORE the
+    // narrowing cast to T. Applying it after would round twice and would also
+    // put the transform on the wrong side of `kDoAxpby`'s bias add.
+    //
+    // Under `kDoAxpby` the epilogue transforms the matmul result and the bias
+    // is added to the transformed value. No kernel LFM2 dispatches uses axpby
+    // (see the `bias` note on `gemv_packed`), and no fused arm is instantiated
+    // at `axpby1`, so this composition is unreachable today; it is written the
+    // one way that is arithmetically defensible rather than left to whichever
+    // order fell out.
     if (simdN == 0 && thrN == 0) {
       MLX_MTL_PRAGMA_UNROLL
       for (int tm = 0; tm < TM; tm++) {
+        const AccT y = epilogue(result[tm], out_row + tm);
         if (kDoAxpby) {
           out_vec[out_row + tm] =
-              static_cast<T>(alpha) * static_cast<T>(result[tm]) +
+              static_cast<T>(alpha) * static_cast<T>(y) +
               static_cast<T>(beta) * bias[(out_row + tm) * bias_stride];
         } else {
-          out_vec[out_row + tm] = static_cast<T>(result[tm]);
+          out_vec[out_row + tm] = static_cast<T>(y);
         }
       }
     }
@@ -524,6 +624,7 @@ template <
     const bool kDoNCBatch,
     const bool kDoAxpby,
     typename Prologue,
+    typename Epilogue,
     typename ShapeP, typename StrideP>
 METAL_FUNC void gemv_body(
     const device T* mat,
@@ -543,12 +644,14 @@ METAL_FUNC void gemv_body(
     const int bias_stride,
     threadgroup typename GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>::acc_type* tgp_memory,
     thread const Prologue& prologue,
+    thread const Epilogue& epilogue,
     uint3 tid,
     uint3 lid,
     uint simd_gid,
     uint simd_lid) {
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby,
-                              typename GemvDefaultAccT<T>::type, Prologue>;
+                              typename GemvDefaultAccT<T>::type, Prologue,
+                              Epilogue>;
 
   if (kDoNCBatch) {
     in_vec += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, vector_batch_stride, batch_ndim);
@@ -566,7 +669,7 @@ METAL_FUNC void gemv_body(
   kernel_t::run(mat, in_vec, bias, out_vec,
                 in_vec_size, out_vec_size, matrix_ld,
                 alpha, beta, bias_stride,
-                tgp_memory, prologue,
+                tgp_memory, prologue, epilogue,
                 tid, lid, simd_gid, simd_lid);
 }
 
@@ -608,15 +711,79 @@ void gemv(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueNone<T, typename kernel_t::acc_type>;
   gemv_tgp_memory(kernel_t);
   const prologue_t prologue(nullptr, nullptr);
-  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t>(
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t>(
       mat, in_vec, bias, out_vec,
       in_vec_size, out_vec_size, matrix_ld, alpha, beta,
       batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
       bias_batch_stride, bias_stride,
       kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
-      prologue,
+      prologue, epilogue_t(),
+      tid, lid, simd_gid, simd_lid);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+/// gemv with a fused SiLU epilogue (issue #484, §12.2 #3)
+///////////////////////////////////////////////////////////////////////////////
+
+// The fused arm, and **its signature is byte-identical to `gemv`'s above** --
+// no extra bindings, because a pure elementwise epilogue reads nothing the
+// kernel was not already reading. That is the sharpest single contrast with
+// `gemv_rmsnorm`, which needs two extra buffers to import a reduction it
+// cannot compute.
+//
+// It is nonetheless a DISTINCT function template rather than a second
+// `[[host_name]]` on `gemv`, for the reason `instantiate_gemv_packed_helper`
+// records: MSL rejects two names on one explicit instantiation outright.
+//
+// This arm exists because `lfm2.rs::Mlp::forward` is
+// `silu(gate_proj.forward(x))` -- 30 of the step's 539 dispatches are a
+// `silu_f16` whose sole producer is this kernel, with nothing between them
+// (`measurements/issue-249-raw/kernel-census.txt`; 30 silu against 30 layers).
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_silu(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    const device T* bias [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& matrix_ld [[buffer(6)]],
+    const constant float& alpha [[buffer(7)]],
+    const constant float& beta [[buffer(8)]],
+    const constant int& batch_ndim [[buffer(9)]],
+    const constant int* batch_shape [[buffer(10)]],
+    const constant int64_t* vector_batch_stride [[buffer(11)]],
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],
+    const constant int64_t* bias_batch_stride [[buffer(13)]],
+    const constant int& bias_stride [[buffer(14)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueSilu<T, typename kernel_t::acc_type>;
+  gemv_tgp_memory(kernel_t);
+  const prologue_t prologue(nullptr, nullptr);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t>(
+      mat, in_vec, bias, out_vec,
+      in_vec_size, out_vec_size, matrix_ld, alpha, beta,
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      bias_batch_stride, bias_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue, epilogue_t(),
       tid, lid, simd_gid, simd_lid);
 }
 
@@ -674,19 +841,21 @@ void gemv_rmsnorm(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueRmsNorm<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueNone<T, typename kernel_t::acc_type>;
   gemv_tgp_memory(kernel_t);
   // The scale is read ONCE here, at kernel entry, rather than per element --
   // §11.3e's hoist rule, which is what keeps this one dependent load per
   // dispatch instead of one per element. `tid.z` is the batch index, matching
   // the one scale per row the reduction writes.
   const prologue_t prologue(norm_weight, norm_scale + tid.z);
-  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t>(
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t>(
       mat, in_vec, bias, out_vec,
       in_vec_size, out_vec_size, matrix_ld, alpha, beta,
       batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
       bias_batch_stride, bias_stride,
       kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
-      prologue,
+      prologue, epilogue_t(),
       tid, lid, simd_gid, simd_lid);
 }
 
@@ -742,16 +911,18 @@ void gemv_packed(
     uint simd_lid [[thread_index_in_simdgroup]]) {
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueNone<T, typename kernel_t::acc_type>;
   gemv_tgp_memory(kernel_t);
   GemvParams p = *pp;
   const prologue_t prologue(nullptr, nullptr);
-  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t>(
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t>(
       mat, in_vec, bias, out_vec,
       p.in_vec_size, p.out_vec_size, p.matrix_ld, p.alpha, p.beta,
       p.batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
       bias_batch_stride, p.bias_stride,
       kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
-      prologue,
+      prologue, epilogue_t(),
       tid, lid, simd_gid, simd_lid);
 }
 
@@ -977,6 +1148,28 @@ void gemv_t_packed(
   [[kernel]] decltype(gemv_rmsnorm<itype, bm, bn, sm, sn, tm, tn, false, false>) \
              gemv_rmsnorm<itype, bm, bn, sm, sn, tm, tn, false, false>;
 
+// The fused-epilogue sibling (issue #484, §12.2 #3), named by appending
+// `_silu`.
+//
+// Scoped on exactly #266's arithmetic and for exactly its reason: the full
+// nc/axpby cross over 7 tiles and 3 dtypes would emit 84 more names per dtype
+// of which LFM2 dispatches **one**, against §11.3g's measured +730 ms of cold
+// compile and +4.01 MiB for doubling this family.
+//
+// `bm8` is the tile `call_mlx_gemv` selects for w1 (K=2048, N=10752) and is
+// the only one the decode path reaches. **`bm4` is instantiated anyway, and
+// not as a convenience** -- it is what lets the parity fixture cover a second
+// tile, and §9.2c's rule is that a fixture built only from the model's own
+// shapes is blind to a whole defect class. f32 is instantiated alongside f16
+// for the same reason #266 gives: it is the precision §2.3.5a's discriminator
+// wants.
+#define instantiate_gemv_silu_helper(nm, itype, bm, bn, sm, sn, tm, tn)     \
+  template [[host_name(                                                     \
+      "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                   \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_silu")]]                             \
+  [[kernel]] decltype(gemv_silu<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_silu<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
 #define instantiate_gemv_nc_axpby(func, nm, itype, bm, bn, sm, sn, tm, tn)    \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 0)      \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 1)      \
@@ -1022,6 +1215,16 @@ instantiate_gemv_blocks(bfloat16, bfloat)
 instantiate_gemv_rmsnorm_blocks(float32, float)
 instantiate_gemv_rmsnorm_blocks(float16, half)
 instantiate_gemv_rmsnorm_blocks(bfloat16, bfloat)
+
+// The fused-epilogue tiles. `bm8` is the one w1 selects and therefore the only
+// one decode reaches; `bm4` is the fixture's second tile (see the helper).
+#define instantiate_gemv_silu_blocks(nm, itype)              \
+  instantiate_gemv_silu_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
+  instantiate_gemv_silu_helper(nm, itype, 8, 1, 1, 32, 4, 4)
+
+instantiate_gemv_silu_blocks(float32, float)
+instantiate_gemv_silu_blocks(float16, half)
+instantiate_gemv_silu_blocks(bfloat16, bfloat)
 
 instantiate_gemv_t_blocks(float32, float)
 instantiate_gemv_t_blocks(float16, half)

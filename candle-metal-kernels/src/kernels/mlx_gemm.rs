@@ -442,6 +442,48 @@ pub struct GemvRmsNorm<'a> {
     pub scale_offset: usize,
 }
 
+/// The elementwise transform fused onto a GEMV's OUTPUT (issue #484,
+/// `DESIGN.md` §12.2 #3).
+///
+/// **This is not the mirror of [`GemvRmsNorm`] and the difference is the
+/// entry's whole point.** A prologue sits inside the K-walk, which each of the
+/// `n_tgp` threadgroups performs over the whole input vector, so its work is
+/// multiplied by `n_tgp` *whatever it computes* (§12.2b). An epilogue sits on
+/// the other side of that partition: `GEMVKernel::run` writes each output
+/// element from exactly one thread, so the transform runs once per output
+/// element — the standalone elementwise kernel's own count.
+///
+/// It therefore carries **no bindings at all**, where `GemvRmsNorm` carries
+/// two: a pure elementwise transform reads nothing the kernel was not already
+/// reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GemvEpilogue {
+    /// No transform. Resolves the classical `[[host_name]]`, so this is
+    /// byte-for-byte the path that shipped.
+    #[default]
+    None,
+    /// SiLU / swish, `x / (1 + exp(-x))`.
+    ///
+    /// **Computed at the accumulator's precision on the unrounded
+    /// accumulator**, where the `silu_f16` dispatch it replaces computes at
+    /// `T` on the already-rounded stored value. That is a more accurate order
+    /// and a genuinely different computation, so this arm moves the digests by
+    /// construction and owes §2.3.5a's discriminator rather than an
+    /// unchanged-digest gate.
+    Silu,
+}
+
+impl GemvEpilogue {
+    /// The `[[host_name]]` suffix, matching `gemv.metal`'s
+    /// `instantiate_gemv_silu_helper`.
+    fn name_suffix(self) -> &'static str {
+        match self {
+            GemvEpilogue::None => "",
+            GemvEpilogue::Silu => "_silu",
+        }
+    }
+}
+
 /// M=1 -> gemv_t (vec[K] x mat[K,N] -> vec[N])
 /// N=1 -> gemv   (mat[M,K] x vec[K] -> vec[M])
 #[allow(clippy::too_many_arguments)]
@@ -499,10 +541,21 @@ pub fn call_mlx_gemv_with(
     style: ParamStyle,
 ) -> Result<(), MetalKernelError> {
     call_mlx_gemv_full(
-        device, ep, kernels, dtype, (b, m, n, k),
-        lhs_stride, lhs_offset, lhs_buffer,
-        rhs_stride, rhs_offset, rhs_buffer,
-        output, style, None,
+        device,
+        ep,
+        kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        lhs_offset,
+        lhs_buffer,
+        rhs_stride,
+        rhs_offset,
+        rhs_buffer,
+        output,
+        style,
+        None,
+        GemvEpilogue::None,
     )
 }
 
@@ -540,6 +593,7 @@ pub fn call_mlx_gemv_full(
     output: &Buffer,
     style: ParamStyle,
     fused_norm: Option<GemvRmsNorm<'_>>,
+    epilogue: GemvEpilogue,
 ) -> Result<(), MetalKernelError> {
     debug_assert!(m == 1 || n == 1, "call_mlx_gemv requires M=1 or N=1");
 
@@ -670,8 +724,13 @@ pub fn call_mlx_gemv_full(
     // a fused request that ran unfused would compute an un-normalized result,
     // and under `HazardTrackingModeUntracked` (§3.5) nothing would report it.
     let norm_suffix = if fused_norm.is_some() {
-        let tile_is_instantiated =
-            !transpose_mat && bn == 1 && sm == 1 && sn == 32 && tn == 4 && tm == 4 && (bm == 4 || bm == 8);
+        let tile_is_instantiated = !transpose_mat
+            && bn == 1
+            && sm == 1
+            && sn == 32
+            && tn == 4
+            && tm == 4
+            && (bm == 4 || bm == 8);
         if !tile_is_instantiated {
             return Err(MetalKernelError::LoadFunctionError(format!(
                 "gemv fused rmsnorm prologue is not instantiated for \
@@ -693,8 +752,61 @@ pub fn call_mlx_gemv_full(
         ""
     };
 
+    // The epilogue arm is instantiated only for the non-transposed kernel at
+    // the two tiles `instantiate_gemv_silu_blocks` names, and only at
+    // `nc0_axpby0` — the same scope and the same arithmetic as the prologue
+    // above (§11.3g's +730 ms / +4.01 MiB for doubling this family).
+    //
+    // REFUSED rather than silently falling back, for the reason the prologue
+    // gives: a fused request that ran unfused would write un-transformed
+    // values, and under `HazardTrackingModeUntracked` (§3.5) nothing reports
+    // a wrong number that is well-formed.
+    //
+    // The two fused arms are also refused TOGETHER. They are composable in
+    // principle — a prologue and an epilogue touch different ends of the same
+    // body — but no `_rmsnorm_silu` name is instantiated, so asking for both
+    // would resolve a name that does not exist. Failing here says which
+    // combination is missing; `load_pipeline` would only say the name is
+    // absent.
+    let epilogue_suffix = if epilogue != GemvEpilogue::None {
+        if !norm_suffix.is_empty() {
+            return Err(MetalKernelError::LoadFunctionError(
+                "gemv fused prologue and epilogue cannot be combined: no \
+                 `_rmsnorm_silu` variant is instantiated (issue #484, \
+                 DESIGN.md 12.2 #3). Each is available alone."
+                    .to_string(),
+            ));
+        }
+        let tile_is_instantiated = !transpose_mat
+            && bn == 1
+            && sm == 1
+            && sn == 32
+            && tn == 4
+            && tm == 4
+            && (bm == 4 || bm == 8);
+        if !tile_is_instantiated {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "gemv fused epilogue is not instantiated for \
+                 {kernel_prefix} bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn} \
+                 (mnk={m}x{n}x{k}); only the non-transposed bm4/bm8 decode \
+                 tiles carry it -- see DESIGN.md 12.2 #3, issue #484"
+            )));
+        }
+        if style != ParamStyle::Split {
+            return Err(MetalKernelError::LoadFunctionError(
+                "gemv fused epilogue has no packed sibling; it adds no \
+                 bindings and no scalars, so a packed variant would differ \
+                 from the classical one in nothing but its name (issue #484)"
+                    .to_string(),
+            ));
+        }
+        epilogue.name_suffix()
+    } else {
+        ""
+    };
+
     let name = format!(
-        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}{}",
+        "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}{}{}",
         kernel_prefix,
         dtype_str,
         bm,
@@ -704,7 +816,8 @@ pub fn call_mlx_gemv_full(
         tm,
         tn,
         style.name_suffix(),
-        norm_suffix
+        norm_suffix,
+        epilogue_suffix
     );
 
     let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;

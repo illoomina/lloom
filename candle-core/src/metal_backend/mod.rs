@@ -3062,3 +3062,173 @@ mod issue_336_storage_probe {
         let _ = DType::U32;
     }
 }
+
+#[cfg(test)]
+mod issue_481_arena_mapping {
+    //! **Can the activation arena's buffer be poisoned at all?** (lloom #481,
+    //! `DESIGN.md` §9.2, §15.2 #12a.)
+    //!
+    //! #480 poisoned the pool's free list and deliberately left the arena,
+    //! naming the reason: the arena is **one large `StorageModePrivate`
+    //! allocation**, and §15.2 #12a measures a Private allocation as CPU-mapped
+    //! below 16384 B and never at or above it. A poison needs a CPU mapping
+    //! (`poison.rs` boundary 4), so if the arena's `contents()` is null then not
+    //! one byte of it can be marked and the mechanism does not reach the case it
+    //! would be worth the most on.
+    //!
+    //! # Why this is probed HERE rather than inherited from #480
+    //!
+    //! #480 probed `newBufferWithLength:` **directly**, and #454 measured that
+    //! the threshold **reproduces through candle and NOT through a standalone
+    //! probe**: a hand-rolled `MTLBuffer` with the same options reads MAPPED at
+    //! every size to 256 MiB, so no arm of that probe produces a null and it is
+    //! §15.1a's **VACUOUS** class. The question is about *the arena's own
+    //! allocation path*, so it is asked of `install_arena` — which is a
+    //! different call site with a different size and a different pool.
+    //!
+    //! # Why `black_box` is load-bearing rather than defensive
+    //!
+    //! §11.5e measured a bare null test on an ObjC getter's return **already
+    //! gone at `opt-level=1` with LTO off** — the unguarded function takes
+    //! `objc_msgSend`'s result straight to `ldrb` with no `cbz` on it at all.
+    //! Without it these assertions would be *deleted* and a deleted check reads
+    //! exactly like a passing one (§14.5c hit precisely this, on the test
+    //! written to guard the same threshold).
+    use crate::Device;
+    use candle_metal_kernels::metal::{plan_from_sizes, ArenaLayout};
+
+    fn metal() -> Option<Device> {
+        Device::new_metal(0).ok()
+    }
+
+    /// Installs an arena whose plan totals `bytes` and reports its base
+    /// allocation's mapping.
+    ///
+    /// Returns `(allocated_len, contents_is_null)`. The length is read back
+    /// from the buffer rather than from the plan, because `install_arena` sizes
+    /// on `max(bump_capacity, arena_bytes)` and the *allocated* figure is what
+    /// the threshold applies to.
+    fn arena_mapping(dev: &crate::MetalDevice, sizes: &[usize]) -> (usize, bool) {
+        let last_use = vec![sizes.len().saturating_sub(1); sizes.len()];
+        let plan = plan_from_sizes(sizes, &last_use, ArenaLayout::Packed);
+        dev.install_arena(plan, ArenaLayout::Packed)
+            .expect("arena install");
+        let arena = dev.arena().expect("arena installed");
+        let base = arena.base();
+        let len = base.length();
+        // See the module note: without `black_box` this test measures nothing.
+        let ptr = std::hint::black_box(base.contents());
+        let is_null = ptr.is_null();
+        println!("ISSUE481 arena_bytes={len} contents={ptr:?} null={is_null}");
+        dev.clear_arena();
+        (len, is_null)
+    }
+
+    /// **The registered prediction (§17), measured on the shipping shape.**
+    ///
+    /// §9.2c measures LFM2's decode activation arena at **68.00 KB**, and
+    /// `arena_bytes_is_the_packed_peak` pins that 69632 B figure as a test. That
+    /// is 4.25x the 16384 B threshold, so the prediction is that the arena's
+    /// base allocation has **no CPU mapping** and poisoning cannot reach it.
+    ///
+    /// The two arms below are what make this a measurement rather than an
+    /// assertion: the same code path, the same allocator, one size either side
+    /// of the threshold. If the small arm were also null the probe would be
+    /// blind and the large arm's null would say nothing (§15.1a).
+    #[test]
+    fn the_shipping_arena_buffer_is_not_cpu_mapped() {
+        let Some(dev) = metal() else { return };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+
+        // #68's measured shape: three MLP-width values live together at the
+        // SwiGLU, plus the residual stream and a kv-head value. Same numbers as
+        // `arena_bytes_is_the_packed_peak`, so this arm is the shipping arena's
+        // size by construction rather than by a round number chosen here.
+        let (big_len, big_null) = arena_mapping(m, &[21504, 21504, 21504, 4096, 1024]);
+        assert_eq!(
+            big_len, 69632,
+            "the fixture is not §9.2c's measured 68.00 KB arena"
+        );
+
+        // The non-vacuity arm. One slot, 4096 B: the same `install_arena` call,
+        // the same `PRIVATE_RESOURCE_OPTIONS`, below the threshold.
+        let (small_len, small_null) = arena_mapping(m, &[4096]);
+        assert!(
+            small_len < 16384,
+            "the control arm allocated {small_len} B, which is not below the \
+             16384 B threshold it exists to sit under"
+        );
+        assert!(
+            !small_null,
+            "a {small_len} B arena is ALSO unmapped, so this probe cannot \
+             report `mapped` at any size and its null at 69632 B is vacuous \
+             (DESIGN.md §15.1a) -- exactly the failure #454 measured in the \
+             standalone MTLBuffer probe"
+        );
+
+        assert!(
+            big_null,
+            "the shipping-size arena IS CPU-mapped -- #481's registered \
+             prediction is FALSIFIED, and the arena becomes the highest-value \
+             poisoning target in the tree (its slot boundaries are the ones no \
+             tool can currently see, DESIGN.md §9.2)"
+        );
+    }
+
+    /// The threshold applies to the arena's allocation the same way it applies
+    /// to the pool's, swept rather than sampled at two points.
+    ///
+    /// §3.7h's caution: a pair either side of a boundary cannot tell a **step**
+    /// from a **cliff at one size**. This walks the arena's own path across the
+    /// boundary so the transition is located rather than assumed, and it is the
+    /// arm that says *why* the arena is unmapped -- it is size, not something
+    /// particular to `install_arena`.
+    #[test]
+    fn the_arena_mapping_transition_is_the_16384_b_threshold() {
+        let Some(dev) = metal() else { return };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+
+        // Every size is a multiple of 128 B so the plan's alignment does not
+        // move a request across the boundary under us (the trap
+        // `private_allocations_are_mapped_below_16k_and_not_above` records).
+        let mut rows = Vec::new();
+        for &bytes in &[128usize, 4096, 8192, 16256, 16384, 32768, 69632] {
+            let (len, is_null) = arena_mapping(m, &[bytes]);
+            rows.push((bytes, len, is_null));
+        }
+
+        for (asked, len, is_null) in &rows {
+            println!("ISSUE481 sweep asked={asked} allocated={len} null={is_null}");
+        }
+
+        // Both answers must appear, or the sweep is measuring its own fixture.
+        assert!(
+            rows.iter().any(|r| !r.2),
+            "no size produced a mapping; the sweep is blind (§15.1a)"
+        );
+        assert!(
+            rows.iter().any(|r| r.2),
+            "no size produced a null; the sweep is blind (§15.1a)"
+        );
+
+        // Monotone in size, with exactly one transition.
+        let transitions = rows.windows(2).filter(|w| w[0].2 != w[1].2).count();
+        assert_eq!(
+            transitions, 1,
+            "expected exactly one mapped->unmapped transition, saw \
+             {transitions}: {rows:?}"
+        );
+        for (asked, len, is_null) in &rows {
+            assert_eq!(
+                *is_null,
+                *len >= 16384,
+                "size {asked} allocated {len} B and read null={is_null}, which \
+                 disagrees with the 16384 B threshold"
+            );
+        }
+    }
+}

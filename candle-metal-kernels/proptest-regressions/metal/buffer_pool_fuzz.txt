@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc af3d368ec551cc59271df2956c30fc33983a51953eec0f5cd212e85350da5c72 # shrinks to ops = [CommitEpoch, CommitEpoch, CommitEpoch, CommitEpoch, CommitEpoch, Alloc { size: 512 }, DropLive { index: 0 }, CommitEpoch, MarkCompleted { back: 127 }, Drain]

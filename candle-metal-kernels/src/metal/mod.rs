@@ -10,6 +10,9 @@ pub mod arena_cursor;
 mod arena_gpu_tests;
 pub mod buffer;
 pub mod buffer_pool;
+/// A stateful model-based fuzzer over the pool's public surface (#494).
+#[cfg(test)]
+mod buffer_pool_fuzz;
 /// Cache-line padding for control state written by two threads (issue #442).
 /// The unit is load-bearing -- 128 B per *struct instance*, never per element;
 /// the module docs carry the 64x blowup the second half prevents.

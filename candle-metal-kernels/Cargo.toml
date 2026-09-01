@@ -79,6 +79,7 @@ half = { version = "2.7.1", features = [
 anyhow = "1"
 rand = "0.9.2"
 rand_distr = "0.5.1"
+proptest = "1.11"
 
 [[example]]
 name = "hazard_audit_crosscheck"

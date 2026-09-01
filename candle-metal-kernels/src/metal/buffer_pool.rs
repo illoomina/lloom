@@ -1379,6 +1379,61 @@ mod tests {
         assert!(msg.contains("§6.3b"), "name the measured instance: {msg}");
     }
 
+    /// **#494's finding, found by the fuzzer in a 3-operation sequence.**
+    ///
+    /// `PoolCounters::pending` is a **gauge**, not an accumulator. Its only two
+    /// write sites are `state.counters.pending = state.pending.len()` --
+    /// assignments, where the other eight fields are `+=`. `reset_counters`
+    /// zeroes the whole struct, so it zeroes a figure that describes **live
+    /// occupancy** rather than history, and the pool then contradicts itself:
+    /// `counters().pending` reads 0 while `occupancy().pending_buffers` reads 1
+    /// for the same pool at the same instant.
+    ///
+    /// Nothing in the 30 hand-written tests calls `reset_counters` while a
+    /// buffer is parked, which is why this survived. The sequence that finds it
+    /// is `Alloc, DropLive, ResetCounters` -- three operations.
+    ///
+    /// **Marked `#[ignore]` rather than fixed**: #494 is an instrument issue and
+    /// forbids restructuring production code. Un-ignore it with the one-line
+    /// repair (re-derive the gauge in `reset_counters`, or move it out of
+    /// `PoolCounters` into `PoolOccupancySnapshot` where the other live figures
+    /// live). The PR argues for the second.
+    #[test]
+    #[ignore = "#494: documents a real defect; un-ignore with the fix"]
+    fn issue_494_reset_counters_zeroes_the_pending_gauge() {
+        let dev = device();
+        let (pool, _clock) = pool_with_clock();
+
+        let b = alloc(&pool, &dev, 512);
+        drop(b);
+
+        // One buffer is genuinely parked awaiting the GPU.
+        assert_eq!(pool.occupancy().pending_buffers, 1);
+        assert_eq!(
+            pool.counters().pending,
+            1,
+            "the gauge agrees before the reset"
+        );
+
+        pool.reset_counters();
+
+        // The buffer is still parked -- nothing about the GPU changed.
+        assert_eq!(
+            pool.occupancy().pending_buffers,
+            1,
+            "occupancy still sees the parked buffer"
+        );
+        // But the counter now says zero. TWO PUBLIC ACCESSORS OF ONE POOL
+        // DISAGREE about how many buffers are awaiting the GPU.
+        assert_eq!(
+            pool.counters().pending,
+            1,
+            "reset_counters zeroed a live occupancy figure: counters().pending \
+             says 0 while occupancy().pending_buffers says {}",
+            pool.occupancy().pending_buffers
+        );
+    }
+
     #[test]
     fn empty_pool_misses() {
         let pool = BufferPool::new();

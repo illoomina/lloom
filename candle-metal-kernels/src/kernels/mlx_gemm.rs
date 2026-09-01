@@ -97,6 +97,80 @@ fn forced_tile() -> Option<TileConfig> {
     })
 }
 
+/// Issue #492's GEMV-tile arm: pin the `bm` the GEMV path derives from
+/// `out_vec_size`, so **N and the tile stop moving together**.
+///
+/// **Unset is what ships** and selects byte-for-byte what shipped: the override
+/// is read only where the derived `bm` would otherwise be used, and an unset
+/// variable returns `None` before any branch changes.
+///
+/// It exists because `select_tile_config` is **never consulted on this path**
+/// (`call_mlx_gemm` returns into `call_mlx_gemv` before reaching it), so
+/// `LLOOM_383_TILE` — which forces the GEMM tile — cannot reach a GEMV. The
+/// GEMV's tile is derived inline from `out_vec_size`:
+///
+/// ```text
+/// out_vec_size >= 4096  ->  bm8      (256 threads/tgp, 32 outputs/tgp)
+/// else                  ->  bm4      (128 threads/tgp, 16 outputs/tgp)
+/// ```
+///
+/// **That boundary sits inside #488's sweep**, between its N=2048 and N=6144
+/// points — which is exactly where its effect curve bends. So the two steep
+/// small-N points are the only `bm4` points in that sweep, and *"the effect
+/// falls with N"* and *"the effect is larger at `bm4`"* are the same two
+/// observations. A sweep in N alone cannot separate them; this knob is what
+/// makes N the variable with the tile held (`DESIGN.md` §12.2d, issue #492).
+///
+/// Only `bm` is overridable, and deliberately: `bn`/`sm`/`sn`/`tn` are fixed at
+/// `1/1/32/4` for both instantiated decode tiles, and `tm` follows
+/// `out_vec_size < 4`. `bm` is the whole difference between them, so it is the
+/// whole axis.
+///
+/// An unparseable or unknown value **panics** rather than falling back:
+/// `DESIGN.md` §2.4 — an arm that silently ran the baseline is #69's vacuous
+/// determinism run, and the whole point of this knob is to be A/B'd. Engagement
+/// is nonetheless proved from the **kernel name** rather than from the flag, per
+/// that same rule: the tile is in the `[[host_name]]` the census reports.
+fn forced_gemv_bm() -> Option<usize> {
+    use std::sync::OnceLock;
+    static BM: OnceLock<Option<usize>> = OnceLock::new();
+    *BM.get_or_init(|| match std::env::var("LLOOM_492_GEMV_BM") {
+        Ok(v) => Some(match v.as_str() {
+            "4" => 4usize,
+            "8" => 8usize,
+            other => panic!(
+                "LLOOM_492_GEMV_BM must be 4 or 8 (the two instantiated \
+                 decode tiles), got {other:?}"
+            ),
+        }),
+        Err(_) => None,
+    })
+}
+
+/// The non-transposed GEMV's tile, derived from the two vector lengths.
+///
+/// **Extracted so a test can call it rather than restate it.** Issue #492's
+/// first version of `the_gemv_tile_boundary_is_at_four_thousand_and_ninety_six`
+/// re-implemented this expression inside the test module, and a mutation moving
+/// the production boundary from 4096 to 2048 **survived it** — the test was
+/// checking its own copy. That is §15.1a's VACUOUS class in the check written to
+/// pin the fact, and §15.2 #11b's *"does the fixture vary the axis the code is
+/// parameterised on"* answered the wrong way. One definition, two callers.
+///
+/// Returns `(bm, bn, sm, sn)`. `tm` follows `out_vec_size` at the call site and
+/// `tn` is a constant, so neither is part of the tile decision this names.
+fn derive_gemv_tile(out_vec_size: usize, in_vec_size: usize) -> (usize, usize, usize, usize) {
+    if in_vec_size <= 64 {
+        (1, 1, 8, 4)
+    } else if in_vec_size >= 16 * out_vec_size {
+        (1, 8, 1, 32)
+    } else if out_vec_size >= 4096 {
+        (8, 1, 1, 32)
+    } else {
+        (4, 1, 1, 32)
+    }
+}
+
 /// The `m` below which `select_tile_config` keeps `TILE_32_32_16_2_2`.
 ///
 /// **16 is what ships**, which is `select_tile_config`'s own literal and what
@@ -697,14 +771,17 @@ pub fn call_mlx_gemv_full(
         (1usize, bn, sm, sn, 4usize, tn)
     } else {
         // gemv: mat[M_out,K] x vec[K] -> out[M_out]
-        let (bm, bn, sm, sn): (usize, usize, usize, usize) = if in_vec_size <= 64 {
-            (1, 1, 8, 4)
-        } else if in_vec_size >= 16 * out_vec_size {
-            (1, 8, 1, 32)
-        } else if out_vec_size >= 4096 {
-            (8, 1, 1, 32)
-        } else {
-            (4, 1, 1, 32)
+        let (bm, bn, sm, sn) = derive_gemv_tile(out_vec_size, in_vec_size);
+        // #492's override, applied AFTER the shipping branch has chosen, so an
+        // unset variable leaves this expression byte-for-byte what it was. It
+        // reaches only the `(4|8, 1, 1, 32)` decode tiles: the `in_vec_size`
+        // branches above pick `bm == 1` shapes whose `bn`/`sm`/`sn` differ, and
+        // substituting `bm` alone there would name a tile that is not
+        // instantiated. Guarded rather than trusted, because the failure mode is
+        // a `LoadFunctionError` at a shape the caller cannot see.
+        let bm = match forced_gemv_bm() {
+            Some(forced) if bn == 1 && sm == 1 && sn == 32 => forced,
+            _ => bm,
         };
         let tm: usize = if out_vec_size < 4 { 1 } else { 4 };
         (bm, bn, sm, sn, tm, 4usize)
@@ -1336,6 +1413,89 @@ mod tile_config_gate {
             !routes_to_gemv(2, 2048),
             "the predicate must be capable of the other answer: B=2 reaches \
              select_tile_config, which is the road §13.5c measures"
+        );
+    }
+
+    /// **The claim: the GEMV tile is derived from `out_vec_size`, and the
+    /// boundary is at 4096** (`DESIGN.md` §12.2f, issue #492).
+    ///
+    /// This is the fact that makes an N sweep cross a **kernel** boundary, and
+    /// it had never been pinned: #488 swept N from 512 to 131072 and its two
+    /// steep points turned out to be the only `bm4` points in it. The boundary
+    /// is read here from the same expression `call_mlx_gemv_full` uses rather
+    /// than from a comment, so a change to it goes red beside the sections that
+    /// quote it.
+    ///
+    /// **`select_tile_config` is deliberately not consulted**: the GEMV route
+    /// returns before it, which is why `LLOOM_383_TILE` cannot reach a GEMV and
+    /// why #492 had to add a second knob.
+    ///
+    /// **It calls `derive_gemv_tile`, the function production calls**, rather
+    /// than restating the expression. The first version restated it and a
+    /// mutation moving the boundary to 2048 **survived** — recorded at that
+    /// function, because a test checking its own copy of the thing under test
+    /// is §15.1a's VACUOUS class and the repair is the inputs, not more
+    /// assertions.
+    #[test]
+    fn the_gemv_tile_boundary_is_at_four_thousand_and_ninety_six() {
+        let derived_bm = |out_vec_size: usize, in_vec_size: usize| -> usize {
+            derive_gemv_tile(out_vec_size, in_vec_size).0
+        };
+        let k = 2048; // LFM2's hidden_size (§5.2)
+
+        // Either side of the boundary, and ON it -- the `>=` matters.
+        assert_eq!(derived_bm(4095, k), 4, "just below the boundary is bm4");
+        assert_eq!(derived_bm(4096, k), 8, "the boundary itself is bm8");
+        assert_eq!(derived_bm(4097, k), 8, "just above the boundary is bm8");
+
+        // #488's own sweep points, which is the claim §12.2f makes about that
+        // artifact: its two steep points are the only bm4 ones.
+        let sweep = [512usize, 2048, 6144, 10752, 32768, 65536, 131072];
+        let bm4_points: Vec<usize> = sweep
+            .iter()
+            .copied()
+            .filter(|n| derived_bm(*n, k) == 4)
+            .collect();
+        assert_eq!(
+            bm4_points,
+            vec![512, 2048],
+            "§12.2f: exactly the two steep points of #488's sweep are bm4, \
+             which is why its curve cannot separate N from the tile"
+        );
+
+        // LFM2's own w1/w3 site sits above the boundary, so the decode path
+        // takes bm8 -- stated because §12.2d's headline figure is at that site.
+        assert_eq!(
+            derived_bm(10752, k),
+            8,
+            "LFM2's w1/w3 (N_out = 10752, §5.4) takes the bm8 tile"
+        );
+    }
+
+    /// **The claim: `LLOOM_492_GEMV_BM` unset changes nothing.**
+    ///
+    /// `DESIGN.md` §7.1a's rule for every knob in this file — unset selects
+    /// byte-for-byte what shipped. The override is applied *after* the shipping
+    /// branch has chosen, so this is a property of where the code sits rather
+    /// than of a default value, and the test reads the function rather than
+    /// asserting the intent.
+    ///
+    /// The environment is **not** set here, deliberately: `forced_gemv_bm`
+    /// reads through a `OnceLock`, so a test that set it would poison every
+    /// later test in the process (#69's consumed-`OnceLock` shape, §2.4). What
+    /// is checkable without mutating global state is that the unset path
+    /// returns `None`, which is the whole of the no-op claim.
+    #[test]
+    fn the_gemv_tile_override_is_absent_unless_asked_for() {
+        assert!(
+            std::env::var("LLOOM_492_GEMV_BM").is_err(),
+            "this test asserts the DEFAULT; it cannot run with the override set"
+        );
+        assert_eq!(
+            forced_gemv_bm(),
+            None,
+            "unset must select the derived tile, so every recorded figure \
+             belongs to the shipping path (§7.1a)"
         );
     }
 }

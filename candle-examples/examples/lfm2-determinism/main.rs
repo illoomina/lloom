@@ -329,6 +329,33 @@ struct Args {
     #[arg(long, default_value = "shuffle")]
     conv_state: String,
 
+    /// Fuse SiLU onto `w1`'s GEMV store (#484's kernel, wired by #509).
+    ///
+    /// **The digests MOVE across this axis, and that is the question this flag
+    /// exists to answer.** The fused kernel applies SiLU to the f32
+    /// accumulator where the `silu_f16` dispatch it replaces applies it at `T`
+    /// to the already-rounded store — strictly fewer roundings and a different
+    /// computation (§12.2d). So this has `--attn sdpa`'s shape rather than
+    /// `--kv-append in-place`'s: a moved digest is the *expected* outcome and
+    /// owes §2.3.5a's discriminator, and an **unmoved** one would mean the arm
+    /// never engaged.
+    #[arg(long, default_value_t = false)]
+    gemv_silu: bool,
+
+    /// Fuse the two residual adds onto their producing GEMV's store (#509).
+    ///
+    /// The producers are `out_proj`, `conv.out_proj` and `w2` — 60 dispatches
+    /// per token (§12.2e). **Requires the metallib to carry
+    /// `-DLLOOM_509_RESIDUAL_EPILOGUE`** through `LLOOM_434_METAL_CFLAGS`;
+    /// unset, the forward pass fails at pipeline load rather than silently
+    /// running unfused.
+    ///
+    /// **The digests MOVE**, for `--gemv-silu`'s reason: the add lands at the
+    /// f32 accumulator where `badd_f16` adds at `T` on the rounded store
+    /// (§12.2h).
+    #[arg(long, default_value_t = false)]
+    gemv_residual: bool,
+
     /// How every kernel's scalars reach it: `split` (the default, one `setBytes`
     /// per scalar) or `packed` (one `device const Params*`, issue #115).
     ///
@@ -584,6 +611,17 @@ fn main() -> Result<()> {
 
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     println!("conv state: {:?}", config.conv_state);
+
+    // The two GEMV epilogue fusions (#509's wiring of #484's and #509's
+    // kernels). Printed whether or not they are set, because *inert* and
+    // *unrecorded* are different facts (#241) and a digest is only
+    // interpretable against the arm it was taken in (§2.3.7).
+    config.gemv_silu = args.gemv_silu;
+    config.gemv_residual = args.gemv_residual;
+    println!(
+        "gemv epilogue: silu={} residual={}",
+        config.gemv_silu, config.gemv_residual
+    );
 
     // The binding-style axis (issue #115). Set before any dispatch, and read
     // back from the crate rather than echoed from `args`, so the line printed is

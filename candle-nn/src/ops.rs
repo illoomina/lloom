@@ -1721,3 +1721,298 @@ pub fn flash_decoding(
         },
     )
 }
+
+/// Which transform a fused GEMV epilogue applies at the accumulator (issue
+/// #509 wiring; the kernels are #484's and #509's).
+///
+/// **This is the wiring, not the kernel.** `GemvEpilogue` has existed in
+/// `candle-metal-kernels` since #484 (`Silu`) and #509 (`Residual`), measured
+/// and correct, with **zero production callers** — `Tensor::matmul` reaches
+/// `call_mlx_gemv` through a wrapper that pins the epilogue to `None`
+/// (`mlx_gemm.rs:667`), so no model could select one. `DESIGN.md` §12.2h
+/// records that state and names the wiring as what it waits on.
+///
+/// Both arms **move the digests by construction** and owe §2.3.5a's
+/// discriminator rather than an unchanged-digest gate: the fused kernel
+/// applies the transform to the **f32 accumulator** where the dispatch pair it
+/// replaces applies it at `T` to the **already-rounded store**. Strictly fewer
+/// roundings, and a different computation. See `DESIGN.md` §12.2d and §12.2h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GemvFusion {
+    /// No fusion. The caller takes the eager path it always took.
+    #[default]
+    Off,
+    /// SiLU on the accumulator, replacing a `silu_f16` dispatch (#484).
+    Silu,
+    /// Residual add on the accumulator, replacing a `badd_f16` dispatch
+    /// (#509). Reads the residual at the storing thread's own output row.
+    Residual,
+}
+
+/// A GEMV with an elementwise transform fused onto its store.
+///
+/// `x` is `[.., 1, k]` and `weight` is `[n, k]` — the **untransposed**
+/// `candle_nn::Linear` layout, transposed here exactly as `Linear::forward`
+/// does it, so the unfused arm is the same `[[host_name]]` on the same
+/// operands. `residual` is `[.., 1, n]` and is bound only by
+/// [`GemvFusion::Residual`].
+///
+/// Metal only, `m == 1` only, no bias. Every other case is an **error rather
+/// than a fallback**: the caller decides, because a silent fallback is what
+/// makes an A/B arm measure the wrong thing (`DESIGN.md` §2.4, and the same
+/// rule `flash_decoding` above is written to).
+///
+/// `dead_code` because both members are read only from `metal_fwd`, which is
+/// `#[cfg(feature = "metal")]`. The same shape as `Sdpa` above; `cfg`-gating
+/// the struct instead would take the `cpu_fwd` that reports *no cpu support*
+/// away with it, which is the message a non-Metal caller should get.
+#[allow(dead_code)]
+struct GemvFused {
+    fusion: GemvFusion,
+}
+
+#[allow(dead_code)]
+impl GemvFused {
+    /// The shape checks both arities share, run before either dispatches.
+    ///
+    /// Returns `(b, n, k)` with `m` verified to be 1. A GEMV is the only route
+    /// that carries a fused epilogue — `takes_gemv_route` is `m == 1 || n == 1`
+    /// (`mlx_gemm.rs:246`) and the instantiated tiles are the non-transposed
+    /// `bm4`/`bm8` decode tiles — so an `m != 1` request would silently take
+    /// the GEMM path and run unfused. Refused here instead.
+    fn checked_dims(x_l: &Layout, w_l: &Layout) -> Result<(usize, usize, usize)> {
+        let (b, m, k) = match *x_l.dims() {
+            [b, m, k] => (b, m, k),
+            [m, k] => (1, m, k),
+            ref other => {
+                candle::bail!("gemv-fused expects x rank 2 or 3, got {other:?} (issue #509)")
+            }
+        };
+        if m != 1 {
+            candle::bail!(
+                "gemv-fused is a decode-path fusion: x seq must be 1, got {m} \
+                 (issue #509)"
+            );
+        }
+        let (n, w_k) = match *w_l.dims() {
+            [n, w_k] => (n, w_k),
+            ref other => {
+                candle::bail!("gemv-fused expects weight rank 2 [n, k], got {other:?} (issue #509)")
+            }
+        };
+        if w_k != k {
+            candle::bail!("gemv-fused: x k={k} does not match weight k={w_k} (issue #509)");
+        }
+        Ok((b, n, k))
+    }
+}
+
+#[cfg(feature = "metal")]
+fn gemv_fused_metal(
+    fusion: GemvFusion,
+    x: &candle::MetalStorage,
+    x_l: &Layout,
+    w: &candle::MetalStorage,
+    w_l: &Layout,
+    residual: Option<(&candle::MetalStorage, &Layout)>,
+) -> Result<(candle::MetalStorage, Shape)> {
+    use candle::backend::BackendStorage;
+    use candle_metal_kernels::{GemmDType, GemvEpilogue};
+
+    let (b, n, k) = GemvFused::checked_dims(x_l, w_l)?;
+    let device = x.device();
+
+    if x.dtype() != w.dtype() {
+        candle::bail!(
+            "gemv-fused: x dtype {:?} and weight dtype {:?} must match (issue #509)",
+            x.dtype(),
+            w.dtype()
+        );
+    }
+    let dtype = match x.dtype() {
+        DType::F32 => GemmDType::F32,
+        DType::F16 => GemmDType::F16,
+        DType::BF16 => GemmDType::BF16,
+        other => candle::bail!("gemv-fused does not support {other:?} (issue #509)"),
+    };
+
+    let epilogue = match fusion {
+        GemvFusion::Off => GemvEpilogue::None,
+        GemvFusion::Silu => GemvEpilogue::Silu,
+        GemvFusion::Residual => GemvEpilogue::Residual,
+    };
+
+    // The residual is bound at the storing thread's own output position, so it
+    // must be exactly the output extent and contiguous. Checked rather than
+    // trusted: an offset view would be read at the wrong index and produce a
+    // well-formed wrong number, which under `HazardTrackingModeUntracked`
+    // (§3.5) nothing reports.
+    let operand = match residual {
+        None => None,
+        Some((r, r_l)) => {
+            if r.dtype() != x.dtype() {
+                candle::bail!(
+                    "gemv-fused: residual dtype {:?} must match x dtype {:?} (issue #509)",
+                    r.dtype(),
+                    x.dtype()
+                );
+            }
+            if r_l.shape().elem_count() != b * n {
+                candle::bail!(
+                    "gemv-fused: residual has {} elements, expected b*n = {} (issue #509)",
+                    r_l.shape().elem_count(),
+                    b * n
+                );
+            }
+            if !r_l.is_contiguous() {
+                candle::bail!("gemv-fused: residual must be contiguous (issue #509)");
+            }
+            Some((r.buffer(), r_l.start_offset() * r.dtype().size_in_bytes()))
+        }
+    };
+
+    let out_shape = match *x_l.dims() {
+        [b, m, _] => Shape::from_dims(&[b, m, n]),
+        _ => Shape::from_dims(&[1, n]),
+    };
+    let elem_count = b * n;
+    let output = device
+        .new_buffer_builder()
+        .with_size_for(elem_count, x.dtype())
+        .with_label("gemv_fused")
+        .build()?;
+
+    // `Linear::forward` computes `x @ w.t()`, so the strides handed to the
+    // kernel are the transposed weight's. Built here rather than by calling
+    // `Tensor::t()` because this op has storages, not tensors — and it is the
+    // same `(lhs, rhs)` order `call_mlx_gemm` would have seen.
+    let x_stride = x_l.stride().to_vec();
+    let w_t_stride = vec![1usize, k];
+
+    let encoder = device.command_encoder()?;
+    encoder.set_label("gemv_fused");
+    candle_metal_kernels::call_mlx_gemv_epilogue(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        dtype,
+        (b, 1, n, k),
+        &x_stride,
+        x_l.start_offset() * x.dtype().size_in_bytes(),
+        x.buffer(),
+        &w_t_stride,
+        w_l.start_offset() * w.dtype().size_in_bytes(),
+        w.buffer(),
+        &output,
+        candle_metal_kernels::ParamStyle::Split,
+        None,
+        epilogue,
+        operand,
+    )
+    .map_err(candle::Error::wrap)?;
+
+    let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, x.dtype());
+    Ok((newstorage, out_shape))
+}
+
+impl candle::CustomOp2 for GemvFused {
+    fn name(&self) -> &'static str {
+        "metal-gemv-fused"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("no cpu support for metal-gemv-fused (issue #509)")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        x: &candle::MetalStorage,
+        x_l: &Layout,
+        w: &candle::MetalStorage,
+        w_l: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        gemv_fused_metal(self.fusion, x, x_l, w, w_l, None)
+    }
+}
+
+impl candle::CustomOp3 for GemvFused {
+    fn name(&self) -> &'static str {
+        "metal-gemv-fused-residual"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+        _: &CpuStorage,
+        _: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("no cpu support for metal-gemv-fused-residual (issue #509)")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        x: &candle::MetalStorage,
+        x_l: &Layout,
+        w: &candle::MetalStorage,
+        w_l: &Layout,
+        r: &candle::MetalStorage,
+        r_l: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        gemv_fused_metal(self.fusion, x, x_l, w, w_l, Some((r, r_l)))
+    }
+}
+
+/// `silu(x @ weight.t())` in one dispatch — #484's epilogue, on the decode path.
+///
+/// The consuming site is `lfm2.rs`'s `silu(gate_proj.forward(x))`: a GEMV
+/// immediately followed by a `silu_f16`, which is exactly the pair #484
+/// measured winning at 7 of 7 sizes. `weight` is `[n, k]`, the `Linear`
+/// layout.
+///
+/// **Moves the digests**: SiLU is computed at the f32 accumulator where the
+/// pair computes it at `T` on the rounded store (`DESIGN.md` §12.2d, §2.3.5a).
+///
+/// Metal, `m == 1`, no bias. Anything else is an error — see [`GemvFused`].
+pub fn gemv_silu(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
+    x.apply_op2_no_bwd(
+        weight,
+        &GemvFused {
+            fusion: GemvFusion::Silu,
+        },
+    )
+}
+
+/// `(x @ weight.t()) + residual` in one dispatch — #509's epilogue, on the
+/// decode path.
+///
+/// The producing sites are `lfm2.rs`'s two residual adds: `out_proj`,
+/// `conv.out_proj` and `w2`, 60 dispatches per token (`DESIGN.md` §12.2e).
+/// `weight` is `[n, k]`; `residual` is the layer input, `[.., 1, n]`.
+///
+/// **Requires the metallib to carry `-DLLOOM_509_RESIDUAL_EPILOGUE`** (through
+/// `LLOOM_434_METAL_CFLAGS`). Unset, the `_residual` name is absent and this
+/// **fails at pipeline load rather than silently running unfused** — which is
+/// the arm the mutation test in `candle-metal-kernels` kills.
+///
+/// **Moves the digests**: the add happens at the f32 accumulator where the
+/// `badd_f16` it replaces adds at `T` on the rounded store (§12.2h, §2.3.5a).
+pub fn gemv_residual(x: &Tensor, weight: &Tensor, residual: &Tensor) -> Result<Tensor> {
+    x.apply_op3_no_bwd(
+        weight,
+        residual,
+        &GemvFused {
+            fusion: GemvFusion::Residual,
+        },
+    )
+}

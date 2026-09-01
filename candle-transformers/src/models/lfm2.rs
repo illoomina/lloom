@@ -120,6 +120,11 @@ impl Lfm2Config {
             conv_state: ConvState::default(),
             // §9.5's admission is off unless a caller asks for it, per §7.1a.
             memory_budget: None,
+            // Both GEMV epilogue fusions are off, per §7.1a. #536 and #509 both
+            // say the default needs the decode-path number, which is not taken
+            // here — this change makes the arm reachable, nothing more.
+            gemv_silu: false,
+            gemv_residual: false,
         }
     }
 }
@@ -571,6 +576,37 @@ pub struct Config {
     /// per §7.1a's rule that no default is flipped without its own argued
     /// decision. See `Cache::admit_memory_budget`.
     pub memory_budget: Option<MemoryBudget>,
+    /// Fuse the SiLU in `Mlp::forward` onto `w1`'s GEMV store (#484's kernel,
+    /// wired by #509).
+    ///
+    /// **Defaults to off**, per §7.1a's rule that a default is flipped by its
+    /// own argued decision and that wiring an axis is not that argument. #536
+    /// says so in as many words: *"do not flip the default — that needs the
+    /// decode-path number"*, which this change does not take.
+    ///
+    /// Metal, `seq_len == 1`. Every other case takes the eager path, because
+    /// this is a decode-path GEMV fusion and prefill is a GEMM.
+    ///
+    /// **This arm moves the digests by construction** and owes §2.3.5a's
+    /// discriminator: SiLU is applied to the f32 accumulator where the
+    /// `silu_f16` dispatch it replaces applies it at `T` to the rounded store
+    /// (§12.2d). It is not gated on an unchanged digest.
+    pub gemv_silu: bool,
+    /// Fuse the two residual adds onto their producing GEMV's store (#509's
+    /// kernel, wired by #509).
+    ///
+    /// The producers are `out_proj`, `conv.out_proj` and `w2` — 60 dispatches
+    /// per token (§12.2e). **Defaults to off**, for `gemv_silu`'s reason.
+    ///
+    /// **Requires the metallib to carry `-DLLOOM_509_RESIDUAL_EPILOGUE`**
+    /// through `LLOOM_434_METAL_CFLAGS`. Unset, the `_residual` name does not
+    /// exist and the forward pass **fails at pipeline load** rather than
+    /// silently running unfused — which is the third mutation #550's log
+    /// records as killed.
+    ///
+    /// **This arm moves the digests by construction** (§12.2h): the add is at
+    /// the f32 accumulator where `badd_f16` adds at `T` on the rounded store.
+    pub gemv_residual: bool,
 }
 
 impl Config {
@@ -1333,12 +1369,55 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Ten
     unimplemented!("compile with '--features flash-attn'")
 }
 
+/// Whether a projection's residual add can be fused onto its GEMV store
+/// (§12.2h, #509's kernel; §12.2e names the three producing sites).
+///
+/// `x` is the projection's **input** and `proj` the projection. The GEMV route
+/// is `m == 1` and the fused arms are instantiated only at the non-transposed
+/// `bm4`/`bm8` decode tiles, so a `seq_len > 1` prefill is a GEMM and takes the
+/// eager path.
+///
+/// **Falls back rather than failing**, unlike `flash_decoding`: the eager
+/// `forward` + `add` beside it is correct and is what ships, so a shape this
+/// fusion does not serve is not an error. What *is* an error — raised inside
+/// the op — is a fused request the kernel cannot honour, because that would
+/// otherwise run unfused and silently skip the add.
+fn gemv_residual_applies(enabled: bool, x: &Tensor, proj: &Linear, residual: &Tensor) -> bool {
+    enabled
+        && x.device().is_metal()
+        && matches!(x.dims(), [_, 1, _] | [1, _])
+        && x.dims().last() == Some(&proj.weight().dims()[1])
+        && proj.bias().is_none()
+        // `Linear::forward` reshapes a contiguous input and broadcasts a
+        // non-contiguous one onto a different weight layout. The fused op
+        // builds the transposed stride by hand, so it serves the contiguous
+        // case only and defers the other to the eager path.
+        && x.is_contiguous()
+        && proj.weight().is_contiguous()
+        && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
+        && residual.dtype() == x.dtype()
+        // The residual is read at the storing thread's own output row, so it
+        // must be exactly the output extent and contiguous — a strided or
+        // offset view would be indexed wrongly and produce a well-formed wrong
+        // number that §3.5 says nothing reports. Checked again in the op.
+        && residual.elem_count() == proj.weight().dims()[0]
+        && residual.is_contiguous()
+}
+
 /// MLP layer with SwiGLU activation.
 #[derive(Debug, Clone)]
 struct Mlp {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
+    /// Fuse SiLU onto `w1`'s GEMV store (§12.2d, #484's kernel; #536's site).
+    ///
+    /// Copied from [`Config::gemv_silu`] at construction, the same way
+    /// `attn_impl` is — a construction-tier axis in §7.1's terms.
+    gemv_silu: bool,
+    /// Fuse the post-MLP residual add onto `w2`'s GEMV store (§12.2h). 30 of
+    /// the 60 `badd_f16` dispatches per token.
+    gemv_residual: bool,
     span: tracing::Span,
 }
 
@@ -1354,15 +1433,66 @@ impl Mlp {
             gate_proj,
             up_proj,
             down_proj,
+            gemv_silu: cfg.gemv_silu,
+            gemv_residual: cfg.gemv_residual,
             span: tracing::span!(tracing::Level::TRACE, "mlp"),
         })
     }
 
+    /// Whether the fused `w1` + SiLU arm applies to this call.
+    ///
+    /// Metal, `seq_len == 1`, no bias, and a dtype the GEMV carries. **Every
+    /// other case takes the eager path rather than failing**, because unlike
+    /// `flash_decoding` this arm has a correct eager equivalent right beside
+    /// it and prefill is a GEMM the fusion is not instantiated for. The same
+    /// shape as `sdpa_applies` above.
+    fn gemv_silu_applies(&self, x: &Tensor) -> bool {
+        self.gemv_silu
+            && x.device().is_metal()
+            && x.dims().last() == Some(&self.gate_proj.weight().dims()[1])
+            && matches!(x.dims(), [_, 1, _] | [1, _])
+            && self.gate_proj.bias().is_none()
+            // See `gemv_residual_applies`: the fused op serves the contiguous
+            // layout `Linear::forward` reshapes, not the broadcast one.
+            && x.is_contiguous()
+            && self.gate_proj.weight().is_contiguous()
+            && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let gate = candle_nn::ops::silu(&self.gate_proj.forward(x)?)?;
+        self.down_proj.forward(&self.gated(x)?)
+    }
+
+    /// `mlp(x) + residual`, fusing the add onto `w2`'s store when the arm is
+    /// on (§12.2h). Otherwise **literally `forward(x)? + residual`** — the
+    /// unfused branch calls `forward` rather than reimplementing it, so the
+    /// two cannot drift and the shipping path has exactly one definition.
+    fn forward_add(&self, x: &Tensor, residual: &Tensor) -> Result<Tensor> {
+        if self.gemv_residual {
+            let _enter = self.span.enter();
+            let gated = self.gated(x)?;
+            if gemv_residual_applies(true, &gated, &self.down_proj, residual) {
+                return candle_nn::ops::gemv_residual(&gated, self.down_proj.weight(), residual);
+            }
+            return self.down_proj.forward(&gated)? + residual;
+        }
+        self.forward(x)? + residual
+    }
+
+    /// `silu(w1(x)) * w3(x)` — the SwiGLU gate, shared by both entry points so
+    /// the two cannot drift in what they compute.
+    fn gated(&self, x: &Tensor) -> Result<Tensor> {
+        // The fused arm replaces `gemv` + `silu_f16` with one dispatch, and
+        // computes SiLU on the f32 accumulator rather than on the rounded
+        // store — so it MOVES THE DIGESTS by construction (§12.2d, §2.3.5a).
+        let gate = if self.gemv_silu_applies(x) {
+            candle_nn::ops::gemv_silu(x, self.gate_proj.weight())?
+        } else {
+            candle_nn::ops::silu(&self.gate_proj.forward(x)?)?
+        };
         let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&(gate * up)?)
+        gate * up
     }
 }
 
@@ -1384,6 +1514,9 @@ struct Attention {
     flash_pages_per_chunk: usize,
     /// §9.1a's sizing policy, wired to FlashDecoding's allocation by #234.
     flash_scratch_sizing: FlashScratchSizing,
+    /// Fuse the post-attention residual add onto `out_proj`'s GEMV store
+    /// (§12.2h). 8 of the 60 `badd_f16` dispatches per token.
+    gemv_residual: bool,
     span: tracing::Span,
     span_rot: tracing::Span,
 }
@@ -1422,6 +1555,7 @@ impl Attention {
             flash_page_size: cfg.flash_page_size,
             flash_pages_per_chunk: cfg.flash_pages_per_chunk,
             flash_scratch_sizing: cfg.flash_scratch_sizing,
+            gemv_residual: cfg.gemv_residual,
             span: tracing::span!(tracing::Level::TRACE, "attn"),
             span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
         })
@@ -1495,6 +1629,41 @@ impl Attention {
     }
 
     fn forward(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        let y = self.attend(x, index_pos, block_idx, cache)?;
+        self.o_proj.forward(&y)
+    }
+
+    /// `attn(x) + residual`, fusing the add onto `out_proj`'s store when the
+    /// arm is on (§12.2h). Otherwise **literally `forward(..)? + residual`** —
+    /// the unfused branch calls `forward`, so the shipping path has exactly one
+    /// definition and the two cannot drift.
+    fn forward_add(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        if self.gemv_residual {
+            let y = self.attend(x, index_pos, block_idx, cache)?;
+            if gemv_residual_applies(true, &y, &self.o_proj, residual) {
+                return candle_nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+            }
+            return self.o_proj.forward(&y)? + residual;
+        }
+        self.forward(x, index_pos, block_idx, cache)? + residual
+    }
+
+    /// Everything up to but excluding `out_proj`, so the two entry points
+    /// above share one body and cannot drift in what they compute.
+    fn attend(
         &self,
         x: &Tensor,
         index_pos: usize,
@@ -1644,12 +1813,8 @@ impl Attention {
             att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
         };
 
-        let y = y.transpose(1, 2)?.reshape((
-            b_sz,
-            seq_len,
-            self.num_attention_heads * self.head_dim,
-        ))?;
-        self.o_proj.forward(&y)
+        y.transpose(1, 2)?
+            .reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))
     }
 }
 
@@ -1665,6 +1830,9 @@ struct ShortConv {
     /// `ConvState::RotatingRing` and `None` otherwise. See `ShortConv::new`.
     rotating_weights: Option<Vec<Tensor>>,
     conv_state: ConvState,
+    /// Fuse the post-conv residual add onto `out_proj`'s GEMV store (§12.2h).
+    /// 22 of the 60 `badd_f16` dispatches per token — the largest of the three.
+    gemv_residual: bool,
     span: tracing::Span,
 }
 
@@ -1753,11 +1921,40 @@ impl ShortConv {
             l_cache,
             hidden_size,
             conv_state: cfg.conv_state,
+            gemv_residual: cfg.gemv_residual,
             span: tracing::span!(tracing::Level::TRACE, "shortconv"),
         })
     }
 
     fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
+        let conv_out = self.convolve(x, block_idx, cache)?;
+        self.out_proj.forward(&conv_out)
+    }
+
+    /// `conv(x) + residual`, fusing the add onto `out_proj`'s store when the
+    /// arm is on (§12.2h). Otherwise **literally `forward(..)? + residual`** —
+    /// the unfused branch calls `forward`, so the shipping path has exactly one
+    /// definition and the two cannot drift.
+    fn forward_add(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        cache: &mut Cache,
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        if self.gemv_residual {
+            let conv_out = self.convolve(x, block_idx, cache)?;
+            if gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
+                return candle_nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+            }
+            return self.out_proj.forward(&conv_out)? + residual;
+        }
+        self.forward(x, block_idx, cache)? + residual
+    }
+
+    /// Everything up to but excluding `out_proj`, so the two entry points
+    /// above share one body and cannot drift in what they compute.
+    fn convolve(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
 
@@ -2053,10 +2250,10 @@ impl ShortConv {
             out
         };
 
-        // Multiply by C and project output
+        // Multiply by C; the projection is the caller's, so the two entry
+        // points can fuse it or not.
         let conv_out = (c * &conv_out)?;
-        let conv_out = conv_out.transpose(1, 2)?.contiguous()?;
-        self.out_proj.forward(&conv_out)
+        conv_out.transpose(1, 2)?.contiguous()
     }
 }
 
@@ -2117,16 +2314,20 @@ impl DecoderLayer {
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
 
+        // `forward_add` is `forward(..)? + residual` unless the fused arm is on
+        // AND applies, in which case the add happens at the producing GEMV's
+        // f32 accumulator instead of in a `badd_f16` over the rounded store
+        // (§12.2h). That is a DIFFERENT COMPUTATION and moves the digests.
         let x = match &self.kind {
-            LayerKind::Attention(attn) => attn.forward(&x, index_pos, block_idx, cache)?,
-            LayerKind::ShortConv(conv) => conv.forward(&x, block_idx, cache)?,
+            LayerKind::Attention(attn) => {
+                attn.forward_add(&x, index_pos, block_idx, cache, residual)?
+            }
+            LayerKind::ShortConv(conv) => conv.forward_add(&x, block_idx, cache, residual)?,
         };
 
-        let x = (x + residual)?;
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
-        let x = self.mlp.forward(&x)?;
-        x + residual
+        self.mlp.forward_add(&x, residual)
     }
 }
 

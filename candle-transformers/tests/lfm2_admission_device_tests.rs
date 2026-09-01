@@ -56,6 +56,9 @@ fn config(max_position_embeddings: usize) -> Config {
         kv_append: Default::default(),
         conv_state: Default::default(),
         memory_budget: None,
+        // Both epilogue fusions off, per DESIGN.md 7.1a (issue #509).
+        gemv_silu: false,
+        gemv_residual: false,
     }
 }
 

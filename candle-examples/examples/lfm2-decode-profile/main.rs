@@ -582,6 +582,14 @@ struct Axes {
     /// from either arm.
     #[cfg(feature = "metal")]
     cut_policy: Option<(candle::metal_backend::CutPolicy, usize)>,
+    /// The two GEMV epilogue fusions (§12.2i, #509's wiring of #484's and
+    /// #509's kernels).
+    ///
+    /// Read back from `Config` rather than from the flag, per #241: these are
+    /// construction-tier axes whose arm is decided on the config the model was
+    /// built from, so that is where the arm actually is.
+    gemv_silu: bool,
+    gemv_residual: bool,
 }
 
 /// The `AttnImpl` arm, as `.bench/configurations.md` §1 spells it.
@@ -737,6 +745,10 @@ impl Axes {
                 Device::Metal(m) => Some((m.cut_policy(), m.compute_per_buffer())),
                 _ => None,
             },
+            // From the config, not from `args`, for the reason the three above
+            // give: the arm is decided on `Config` and read back from it.
+            gemv_silu: config.gemv_silu,
+            gemv_residual: config.gemv_residual,
         })
     }
 
@@ -905,6 +917,19 @@ impl Axes {
             // counter would report a clean null for the wrong reason, which is
             // #69's vacuous determinism run in this axis (§2.4).
             p("CutPolicy", &self.cut_policy_arm()),
+            // The two GEMV epilogue fusions (§12.2i, #509's wiring). Stated
+            // whether or not they are set, for `FlashPageSize`'s reason: inert
+            // and unrecorded are different facts, and a run taken before these
+            // existed is `UNRECORDED` rather than `off` — which matters more
+            // here than usual, because these two move `logits_sha256` while
+            // leaving `tokens_sha256` alone, so a run pooled wrongly would
+            // compare two different computations that agree on the field a
+            // reader checks first.
+            p("GemvSilu", if self.gemv_silu { "on" } else { "off" }),
+            p(
+                "GemvResidual",
+                if self.gemv_residual { "on" } else { "off" },
+            ),
         ]
     }
 
@@ -1349,6 +1374,19 @@ struct Args {
     /// `rotating[:K]` (§10.2a's rotating index, §10.2g).
     #[arg(long, default_value = "shuffle")]
     conv_state: String,
+
+    /// Fuse SiLU onto `w1`'s GEMV store (#484's kernel, wired by #509,
+    /// `DESIGN.md` §12.2i). Moves the digests by construction.
+    #[arg(long, default_value_t = false)]
+    gemv_silu: bool,
+
+    /// Fuse the two residual adds onto their producing GEMV's store (#509,
+    /// §12.2i). **Requires the metallib to carry
+    /// `-DLLOOM_509_RESIDUAL_EPILOGUE`** through `LLOOM_434_METAL_CFLAGS`;
+    /// unset, the forward pass fails at pipeline load rather than silently
+    /// running unfused. Moves the digests by construction.
+    #[arg(long, default_value_t = false)]
+    gemv_residual: bool,
 
     /// Decode steps recorded before the arena is installed.
     ///
@@ -2012,6 +2050,10 @@ fn main() -> Result<()> {
     // `AttnImpl` is a construction-tier axis on the config (§7.1, #97), so it
     // is selected before the model is built and both arms stay compiled.
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    // The two GEMV epilogue fusions (#509's wiring of #484's and #509's
+    // kernels), construction-tier like `AttnImpl` beside them.
+    config.gemv_silu = args.gemv_silu;
+    config.gemv_residual = args.gemv_residual;
     config.attn_impl = match args.attn.as_str() {
         "generic" => candle_transformers::models::lfm2::AttnImpl::Generic,
         "sdpa" => candle_transformers::models::lfm2::AttnImpl::Sdpa,

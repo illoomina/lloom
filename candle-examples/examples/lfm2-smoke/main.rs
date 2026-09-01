@@ -251,6 +251,24 @@ struct Args {
     #[arg(long, default_value = "shuffle")]
     conv_state: String,
 
+    /// Fuse SiLU onto `w1`'s GEMV store (#484's kernel, wired by #509).
+    ///
+    /// **This gate is what the digests cannot say for this arm**, exactly as
+    /// for `rotating` above. The fusion moves the digests by construction
+    /// (§12.2d), so §15.1 #7 can only report that they are *stable*; whether
+    /// the model still answers the question is this harness's job and nothing
+    /// else's (§2.3.8d).
+    #[arg(long, default_value_t = false)]
+    gemv_silu: bool,
+
+    /// Fuse the two residual adds onto their producing GEMV's store (#509).
+    ///
+    /// Requires the metallib to carry `-DLLOOM_509_RESIDUAL_EPILOGUE` through
+    /// `LLOOM_434_METAL_CFLAGS`. Moves the digests by construction (§12.2h) —
+    /// see `--gemv-silu` for why this gate is the one that matters then.
+    #[arg(long, default_value_t = false)]
+    gemv_residual: bool,
+
     /// Print each turn's prompt and completion. On by default; `--quiet`
     /// leaves only the verdict lines, for a scripted gate.
     #[arg(long)]
@@ -336,6 +354,16 @@ fn main() -> Result<()> {
 
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     println!("conv state: {:?}", config.conv_state);
+
+    // #509's wiring. Printed whether or not set: *inert* and *unrecorded* are
+    // different facts (#241), and this harness's verdict is only interpretable
+    // against the arm it was taken in.
+    config.gemv_silu = args.gemv_silu;
+    config.gemv_residual = args.gemv_residual;
+    println!(
+        "gemv epilogue: silu={} residual={}",
+        config.gemv_silu, config.gemv_residual
+    );
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;

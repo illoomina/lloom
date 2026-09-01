@@ -51,6 +51,9 @@ fn tiny_config(conv_state: ConvState) -> Config {
         kv_append: KvAppend::InPlace,
         conv_state,
         memory_budget: None,
+        // Both epilogue fusions off, per DESIGN.md 7.1a (issue #509).
+        gemv_silu: false,
+        gemv_residual: false,
     }
 }
 

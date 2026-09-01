@@ -45,6 +45,27 @@ impl Linear {
         let span = tracing::span!(tracing::Level::TRACE, "linear");
         Self { inner, span }
     }
+
+    /// The `[out, in]` weight, for a caller that fuses this projection into a
+    /// single kernel rather than calling [`Module::forward`] (issue #509).
+    ///
+    /// Forwards to [`candle_nn::Linear::weight`], which is already public — the
+    /// wrapper was simply opaque. A fused GEMV epilogue needs the operands, not
+    /// the op, and this is the accessor that hands them over.
+    pub fn weight(&self) -> &Tensor {
+        self.inner.weight()
+    }
+
+    /// The optional bias, so a fusing caller can **verify there is none**
+    /// rather than assume it.
+    ///
+    /// `gemv_silu` and `gemv_residual` compute `x @ w.t()` with no bias term.
+    /// LFM2 builds every projection with `linear_no_bias`, so this is `None` at
+    /// every site that fuses — but a caller that assumed rather than checked
+    /// would silently drop a bias if that ever changed.
+    pub fn bias(&self) -> Option<&Tensor> {
+        self.inner.bias()
+    }
 }
 
 pub fn linear_b(d1: usize, d2: usize, b: bool, vb: VarBuilder) -> Result<Linear> {

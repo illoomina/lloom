@@ -472,9 +472,43 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     }))
 }
 
+/// # The `assert!` here does not survive optimisation (#454)
+///
+/// This is the same shape `metal_backend::read_to_vec` carried before #366,
+/// in a second file: `contents()`, a bare `assert!`, then a `slice::from_raw_parts`.
+/// §11.5d measured that assert absent from the release binary — its panic
+/// string does not appear and the emitted code goes `contents()` → a *length*
+/// test → `memcpy`, with no test on the pointer — and §14.5c measured
+/// `panic!`-inside-an-`if` going the same way. #455 repaired the two sites in
+/// `metal_backend`; this one was not in that survey's population.
+///
+/// Measured for #454 (`measurements/issue-454-raw/guard-probe/`, disassembly
+/// in `measurements/issue-454-raw/shape-disassembly.txt`), reading the emitted
+/// code rather than the source: in a bare-`assert!` function the pointer
+/// returned by `objc_msgSend` goes straight to `ldrb` **with no `cbz` on it at
+/// all**, at `opt-level=3` with LTO *off* as well as on — so this is not an
+/// LTO-only hazard, and the tree compiles with `lto = "thin"` anyway (#445).
+/// With `black_box` the same function stores the pointer, reloads it and
+/// branches on `cbz`, in every profile tested.
+///
+/// The guard is load-bearing here because the buffer can be Private: a
+/// `QMetalStorage`'s buffer comes from `new_buffer` →
+/// `PRIVATE_RESOURCE_OPTIONS`, and §15.2 #12a records a Private allocation as
+/// CPU-mapped below 16384 B and never at or above it. A quantized tensor's
+/// storage is far above that threshold, so `contents()` returning null is the
+/// expected case rather than a hypothetical one.
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
-    let ptr = buffer.contents() as *const T;
-    assert!(!ptr.is_null());
+    // `black_box` makes the pointer opaque, so the test survives whatever the
+    // optimiser can prove about the ObjC getter. Same repair as #445's, and it
+    // costs one unfoldable move on a path that then copies `n` elements.
+    let ptr = std::hint::black_box(buffer.contents()) as *const T;
+    assert!(
+        !ptr.is_null(),
+        "quantized read_to_vec: buffer has no CPU mapping (len={}, n={n})",
+        buffer.length()
+    );
+    // SAFETY: `ptr` is non-null and CPU-mapped, and the caller has waited for
+    // any GPU work that writes it.
     let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
     slice.to_vec()
 }

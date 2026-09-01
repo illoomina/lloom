@@ -97,12 +97,36 @@ impl Buffer {
     /// being a silent-corruption hazard: `read_to_vec` and every other CPU-side
     /// consumer takes this pointer without knowing whether it holds a view.
     ///
-    /// Null for a Private-storage allocation, which has no CPU mapping at all
-    /// -- unchanged by the offset, since `null + n` is still not readable and
-    /// callers already assert on it.
+    /// Null for a Private-storage allocation at or above 16384 B, which has no
+    /// CPU mapping -- unchanged by the offset, since `null + n` is still not
+    /// readable and callers already assert on it. Below that threshold a
+    /// Private allocation *is* mapped, which is `DESIGN.md` §15.2 #12a's
+    /// correction to the older "null for Private" reading.
+    ///
+    /// # This function's own null check folded away (#366, repaired #454)
+    ///
+    /// §11.5d records the early return below being eliminated in the release
+    /// binary: `base_offset` is 0 for every non-arena allocation, so the
+    /// optimiser proves `null + 0 == null`, concludes the branch is redundant
+    /// and drops it -- and with it the only thing standing between a null
+    /// mapping and the `memmove` in a caller. The two production callers in
+    /// `metal_backend` were repaired with `black_box` by #366 and #445; this
+    /// one is the function *they call*, and it was not.
+    ///
+    /// Measured for #454 (`measurements/issue-454-raw/guard-probe/`, with the
+    /// disassembly in `measurements/issue-454-raw/shape-disassembly.txt`): in
+    /// an unguarded function the pointer `objc_msgSend` returns reaches `ldrb`
+    /// with **no `cbz` on it at all**, at `opt-level=3` with LTO off as well as
+    /// on; with `black_box` the same function stores it, reloads it and
+    /// branches on `cbz`. Guarding here means every consumer of `data()`
+    /// inherits a pointer whose nullity was actually tested, rather than each
+    /// having to defend itself.
     pub fn data(&self) -> *mut u8 {
         use objc2_metal::MTLBuffer as _;
-        let base = self.as_ref().contents().as_ptr() as *mut u8;
+        // `black_box` is load-bearing, not a micro-optimisation guard: it makes
+        // the pointer opaque so the `is_null` below cannot be folded against
+        // what the optimiser can prove about `contents()`.
+        let base = std::hint::black_box(self.as_ref().contents().as_ptr()) as *mut u8;
         if base.is_null() {
             return base;
         }
@@ -164,3 +188,69 @@ impl<'a> From<&'a Buffer> for &'a MetalResource {
 }
 
 pub type BufferMap = HashMap<usize, Vec<Arc<Buffer>>>;
+
+#[cfg(test)]
+mod issue_454_guard_shape {
+    //! The null guards on `contents()` are load-bearing and were eliminated
+    //! twice (#366, #445). This pins their SHAPE in source.
+    //!
+    //! It cannot be a runtime test: the defect is that a branch is absent from
+    //! the emitted code, and a test that runs is executing the build it is
+    //! trying to indict. #366 and #445 both verified by reading the
+    //! disassembly, and #454's own probe does the same
+    //! (`measurements/issue-454-raw/shape-disassembly.txt`). What a test CAN
+    //! do cheaply is fail when a site loses its `black_box` in a refactor,
+    //! which is how both regressions arrived -- a correct-looking source diff.
+    //!
+    //! Scoped to the sites where a null is REACHABLE, i.e. buffers that can be
+    //! Private storage. Shared-storage buffers (`RESOURCE_OPTIONS`,
+    //! `CURSOR_OPTIONS`) are CPU-mapped at every size, so their guards are
+    //! unreachable and are deliberately not required to carry one.
+
+    /// Every load-bearing `contents()` site keeps its optimisation barrier.
+    ///
+    /// Mutation-tested: removing the `black_box` from `Buffer::data` makes this
+    /// fail. A first version sliced the function body loosely and passed under
+    /// that mutation, because `black_box` also appears in the doc comment above
+    /// it -- §15.1 #1's vacuous-comparison class, in the guard written to
+    /// prevent a regression. It matches the STATEMENT now, not the region.
+    #[test]
+    fn load_bearing_contents_sites_keep_their_black_box() {
+        let src = include_str!("buffer.rs");
+
+        // Only the production half. This module mentions `.contents()` in its
+        // own filter literal and in its messages, and a check that reads
+        // itself reports on the wrong file -- which is how the first version
+        // failed its own clean arm.
+        let production = src
+            .split("mod issue_454_guard_shape")
+            .next()
+            .expect("split always yields one element");
+
+        // The line that actually reads the pointer, matched exactly.
+        let reads: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//") && l.contains(".contents()"))
+            .collect();
+
+        assert!(
+            !reads.is_empty(),
+            "no `contents()` call found in buffer.rs -- was `data` renamed? \
+             A guard that finds nothing to check passes for the wrong reason."
+        );
+
+        for line in reads {
+            assert!(
+                line.contains("black_box"),
+                "Buffer::data's null test lost its `black_box`:\n    {line}\n\
+                 Without it the optimiser proves the pointer non-null and drops \
+                 the branch -- DESIGN.md §11.5d, §14.5c, and #454's own \
+                 disassembly (`measurements/issue-454-raw/shape-disassembly.txt`). \
+                 `data()` is what every CPU-side consumer reaches, so this is the \
+                 one site whose guard covers the others. If removing it is \
+                 deliberate, re-read the disassembly rather than the source."
+            );
+        }
+    }
+}

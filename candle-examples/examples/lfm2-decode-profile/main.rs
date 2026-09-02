@@ -1221,7 +1221,41 @@ impl Axes {
             // honestly `UNRECORDED` on it rather than silently `off`.
             p("MetalCflags", &Self::metal_cflags_arm()),
             p("MergedUnit", Self::merged_unit_arm()),
+            // The buffer-allocation granularity (§9.2, #586). Read back from
+            // `MetalDevice::buffer_alignment()` — the `OnceLock` `buf_size`
+            // itself reads — rather than from the environment variable, for
+            // `CompletionWait`'s reason: a flag echoed to itself is the
+            // two-parses-of-one-flag shape that made `--attn flash` report
+            // `AttnImpl=Generic` for the life of #116 (§7.1a-i).
+            //
+            // **Stated on every run, including the default one.** This axis had
+            // no selector at all until #586, so unlike every axis above it
+            // there is no interval of runs that took an arm without recording
+            // it — but the *reason* to state it at the default is
+            // `FlashPageSize`'s: a run at 128 and a run that predates the axis
+            // are different facts, and only the first can be pooled with a
+            // future 128 run.
+            //
+            // The arm is the byte count verbatim, `CutPolicy`'s rule: 64 and
+            // 256 are two granularities and a bare `aligned` would pool them.
+            p("BufferAlignment", &Self::buffer_alignment_arm()),
         ]
+    }
+
+    /// The `BufferAlignment` arm: the granularity `buf_size` actually rounds to.
+    ///
+    /// `n/a` on a non-Metal build, following `CompletionWait`: there is no
+    /// Metal allocator for an alignment to apply to, which is a different fact
+    /// from having taken the default arm.
+    fn buffer_alignment_arm() -> String {
+        #[cfg(feature = "metal")]
+        {
+            candle::metal_backend::MetalDevice::buffer_alignment().to_string()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a".to_string()
+        }
     }
 
     /// The `MetalCflags` arm: the compile flags as the compiler resolved them.

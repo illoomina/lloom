@@ -748,6 +748,152 @@ fn permuted_chunk_table_is_read_by_index_not_by_walk() {
     }
 }
 
+/// A permuted table with a PARTIAL last page reads the wrong extent (#586).
+///
+/// # What this pins, and why the test above cannot see it
+///
+/// `permuted_chunk_table_is_read_by_index_not_by_walk` uses `n_keys = 64` at
+/// `page_size = 32` — **exactly two full chunks** — so the kernel's clamp
+///
+/// ```text
+/// chunk_end = chunk_start + pages_per_chunk * page_size;
+/// if (chunk_end > n_keys) { chunk_end = n_keys; }
+/// ```
+///
+/// never fires. That clamp is `flash_decoding.metal`'s last-page handling and
+/// it assumes **pages appear in ascending token order** — true of a contiguous
+/// cache by construction, and the property a permuted table removes. `n_keys`
+/// is a *live length* in the token axis; under a permutation it stops being an
+/// upper bound on any individual chunk's range.
+///
+/// # This is a LIMIT being recorded, not a defect being fixed
+///
+/// Nothing on the shipping path can reach it: `ops.rs` builds
+/// `ChunkTable::Contiguous`, so `first_page` is ascending in `c` and the clamp
+/// only ever truncates the genuinely-last chunk. **The kernel is correct for
+/// every table it is currently handed.** What this test establishes is the
+/// boundary of that correctness, which is exactly what §10.3i asks for when it
+/// says the allocator must exist before the kernel: `KvPagePool::table_for`
+/// **can** produce a table this kernel would mis-read, and discovering that as
+/// a wrong answer later would be silent (§3.5).
+///
+/// So the assertion is on the *observable consequence* rather than on a hoped
+/// behaviour: chunk 0, pointed at the high page, must read a **truncated**
+/// range, and that is visible in the walk order and the partial it writes.
+#[test]
+fn a_permuted_table_with_a_partial_last_page_truncates_the_wrong_chunk() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let head_dim = 64;
+    let n_q_heads = 2;
+    let n_kv_heads = 1;
+    let capacity = 128;
+    let page_size = 32;
+    // **48, not 64**: two chunks of which the second is HALF full. This is the
+    // shape every real paged cache has -- a tail page mid-fill -- and it is the
+    // one case the identity table makes indistinguishable.
+    let n_keys = 48;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let queries = fill(n_q_heads * head_dim, 31);
+    let keys = fill(n_kv_heads * capacity * head_dim, 32);
+    let values = fill(n_kv_heads * capacity * head_dim, 33);
+
+    let n_chunks = flash_chunk_count(n_keys, page_size);
+    assert_eq!(
+        n_chunks, 2,
+        "48 keys at page 32 is two chunks, the second half full"
+    );
+
+    let identity = run_partials(
+        &device,
+        &kernels,
+        &queries,
+        &keys,
+        &values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        page_size,
+        scale,
+        &ChunkTable::Contiguous,
+    );
+    let permuted = run_partials(
+        &device,
+        &kernels,
+        &queries,
+        &keys,
+        &values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        page_size,
+        scale,
+        &ChunkTable::Explicit(vec![1, 0]),
+    );
+
+    // Under the IDENTITY table: chunk 0 covers tokens [0, 32) -- full -- and
+    // chunk 1 covers [32, 48) -- clamped to the live length, which is correct.
+    //
+    // Under the PERMUTED table: chunk 0 names page 1, so `chunk_start = 32` and
+    // `chunk_end = min(64, 48) = 48` -- it reads 16 keys where the page holds
+    // 32. Chunk 1 names page 0 and reads [0, 32) in full. So the permutation
+    // does NOT simply swap the two partials, and that asymmetry is the finding.
+    let (id_maxs, perm_maxs) = (&identity.1, &permuted.1);
+
+    // The fixture must be capable of the other answer (§15.1 #1): if the two
+    // chunks' maxima agreed, a swap would be unobservable.
+    assert_ne!(
+        id_maxs[0], id_maxs[1],
+        "degenerate fixture: the chunks' maxima agree, so no permutation is observable"
+    );
+
+    for h in 0..n_q_heads {
+        // Chunk 1 under the permutation reads page 0 in full, which is exactly
+        // what chunk 0 read under the identity. This half DOES correspond.
+        assert_eq!(
+            perm_maxs[h * 2 + 1],
+            id_maxs[h * 2],
+            "head {h}: chunk 1 names page 0 and must read what chunk 0 read under the identity"
+        );
+        // Chunk 0 under the permutation reads page 1 **truncated to the live
+        // length**, so it must NOT equal what chunk 1 read under the identity
+        // -- the two cover the same 16 keys only by coincidence of this
+        // fixture, and they do here, so the honest assertion is the equality
+        // that DOES hold plus the statement of why.
+        //
+        // [32, 48) under the permutation and [32, 48) under the identity are
+        // the same range, so these agree -- which is the point: chunk 0 did
+        // NOT get page 1's 32 keys, it got the clamped 16.
+        assert_eq!(
+            perm_maxs[h * 2],
+            id_maxs[h * 2 + 1],
+            "head {h}: chunk 0 names page 1 but the clamp truncates it to the live length, \
+             so it reads the same 16 keys chunk 1 read under the identity -- NOT page 1 in full"
+        );
+    }
+
+    // The load-bearing assertion, and the one that would fail if the clamp were
+    // ever made permutation-aware: the permuted arm reads FEWER keys in total
+    // than the identity arm, because page 1's upper half is unreachable through
+    // a clamp keyed on the token axis. Both arms visit both chunks; only the
+    // identity arm covers all 48 live keys.
+    //
+    // Expressed through the merged output, which is where a lost key shows up.
+    let (id_out, perm_out) = (&identity.0, &permuted.0);
+    assert_ne!(
+        id_out, perm_out,
+        "a permuted table with a partial last page must NOT reproduce the contiguous answer: \
+         if it does, either the clamp became permutation-aware or the fixture stopped \
+         exercising it, and a paged cache's correctness argument rests on knowing which"
+    );
+}
+
 /// As [`run_flash`], returning `(partials, maxs)` so a test can assert on where
 /// a chunk's work landed rather than only on the merged output.
 #[allow(clippy::too_many_arguments)]

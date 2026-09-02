@@ -640,6 +640,23 @@ impl MetalDevice {
         self.commands.completion_counts()
     }
 
+    /// The buffer-alignment arm in force (`DESIGN.md` §9.2, issue #586).
+    ///
+    /// **Read back from the resolved value**, like
+    /// [`Self::completion_wait_name`] above and for the same reason: the arm is
+    /// whatever `buf_size` actually rounds to, so a harness that rendered its
+    /// own flag could report an alignment the process did not take. That is
+    /// §7.1a-i's present-and-wrong case, which is the unsafe direction — a
+    /// wrong arm compares **equal** to every real run of that arm.
+    ///
+    /// It is an associated function rather than a method because the arm is a
+    /// property of the process (one `OnceLock`), not of a device: two
+    /// `MetalDevice`s in one process cannot disagree about it, and pretending
+    /// otherwise would invite a caller to ask the wrong one.
+    pub fn buffer_alignment() -> usize {
+        buffer_alignment()
+    }
+
     /// Whether an `MTLSharedEvent` was actually allocated for the selected arm.
     ///
     /// Separates *"an async arm was selected"* from *"an async arm is running"*:
@@ -1209,7 +1226,86 @@ impl MetalDevice {
 /// controller can coalesce accesses cleanly. It also covers the alignment any
 /// dtype could need: the kernels use `float4`/`half4` (16 bytes) widely and
 /// quantized block structures are wider still, all well under 128.
+///
+/// **This is the DEFAULT and no longer the only reachable value** — see
+/// [`buffer_alignment`], which reads `LLOOM_586_BUFFER_ALIGNMENT` once. The
+/// constant is kept as the name every comment and test refers to, and as what
+/// the axis reports when nothing selects an arm.
 const BUFFER_ALIGNMENT: usize = 128;
+
+/// The lowest alignment the axis will accept.
+///
+/// `float4`/`half4` are 16 bytes and quantized block structures are wider, so
+/// **16 is the floor at which every dtype this backend uses is still correctly
+/// aligned**. Below it the arm would not be a granularity choice but a
+/// correctness bug, and §3.5 makes a misaligned vector load silent rather than
+/// an error. The refusal names this number.
+const MIN_BUFFER_ALIGNMENT: usize = 16;
+
+/// The buffer alignment this process allocates at (`DESIGN.md` §9.2, #586).
+///
+/// # Why this is an axis and not a constant
+///
+/// §9.2 records the 128 as load-bearing in one direction — *"lowering the
+/// alignment to 64 would silently introduce false sharing between adjacent
+/// arena slots"* — and closes with *"do not change it without measuring
+/// both"*. **There was no instrument to measure either half**: the value was a
+/// bare `const` with no selector, so #443's paired A/B could not run and its
+/// incumbent figure (+0.49 ms/token to save 2.2 GB) was measured against a
+/// free-list scan removed the same day. This makes the arm exist; it does not
+/// flip the default (§7.1a) and takes no timing.
+///
+/// # What this axis is NOT
+///
+/// **It is not §9.2l's padding**, and conflating the two is the trap that
+/// section names. `CachePadded<T>` is `#[repr(align(128))]` over *control
+/// state* — struct fields two threads write — and lowering **that** to 64 is a
+/// compile error by design. This is *data* alignment: the granularity
+/// `buf_size` rounds an allocation to. §9.2l's own words are that its rule is
+/// *"not licence for any change to `buf_size` / `BUFFER_ALIGNMENT`, which is
+/// #355's and #443's"* — so the two quantities are separated deliberately, and
+/// this axis moves only the second.
+///
+/// # Read once, not per allocation
+///
+/// A `OnceLock`, for §15.2 #10's reason: `buf_size` is on the allocation path
+/// at §6.3b's ~11.6 destroys/token, and an env read per call would put a
+/// syscall-shaped cost on it. Reading once also makes the arm a property of the
+/// process, which is what lets the harness report it (§7.1a-i: read the arm
+/// back from the mechanism that decides it, never from the flag).
+fn buffer_alignment() -> usize {
+    static ALIGNMENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ALIGNMENT.get_or_init(|| {
+        let Ok(raw) = std::env::var("LLOOM_586_BUFFER_ALIGNMENT") else {
+            return BUFFER_ALIGNMENT;
+        };
+        let raw = raw.trim();
+        let Ok(v) = raw.parse::<usize>() else {
+            panic!(
+                "LLOOM_586_BUFFER_ALIGNMENT={raw:?} is not a number. \
+                 Give a power of two >= {MIN_BUFFER_ALIGNMENT} (DESIGN.md §9.2)."
+            )
+        };
+        // Refused rather than clamped, and loudly. A silently-corrected arm is
+        // #241's present-and-wrong case: the run would render an alignment it
+        // did not take, and compare equal to real runs of that arm.
+        if !v.is_power_of_two() {
+            panic!(
+                "LLOOM_586_BUFFER_ALIGNMENT={v} is not a power of two. \
+                 `next_multiple_of` would still round, but a non-power-of-two \
+                 granularity is not an alignment (DESIGN.md §9.2)."
+            )
+        }
+        if v < MIN_BUFFER_ALIGNMENT {
+            panic!(
+                "LLOOM_586_BUFFER_ALIGNMENT={v} is below {MIN_BUFFER_ALIGNMENT}, \
+                 the widest vector this backend loads (`float4`/`half4` are 16 B). \
+                 A lower value is a correctness bug and §3.5 makes it silent."
+            )
+        }
+        v
+    })
+}
 
 /// Size to allocate for a request of `size` bytes.
 ///
@@ -1226,7 +1322,7 @@ const BUFFER_ALIGNMENT: usize = 128;
 fn buf_size(size: usize) -> usize {
     // Never return 0: Metal rejects zero-length buffers, and callers may ask
     // for an empty tensor.
-    size.max(1).next_multiple_of(BUFFER_ALIGNMENT)
+    size.max(1).next_multiple_of(buffer_alignment())
 }
 
 /// Applies the [`BufferBuilder`] label, clearing any stale label on a reused pooled buffer.
@@ -1332,18 +1428,32 @@ impl<'a> ReadyBufferBuilder<'a> {
 mod tests {
     use super::*;
 
+    /// The rounding, as a pure function of the granularity.
+    ///
+    /// `buf_size` reads a process-wide `OnceLock`, so a test cannot vary the arm
+    /// in-process without the first read winning — the same property that keeps
+    /// the alignment off the per-allocation path. This mirrors the arithmetic so
+    /// every arm is exercised, and
+    /// `the_default_arm_agrees_with_buf_size` pins the mirror to the real
+    /// function at the shipped arm so the two cannot drift (§3.1b rule 1: an
+    /// absolute reference, not a shape).
+    fn round_to(size: usize, alignment: usize) -> usize {
+        size.max(1).next_multiple_of(alignment)
+    }
+
     #[test]
     fn test_buf_size_is_aligned() {
+        let alignment = buffer_alignment();
         for size in [1usize, 2, 3, 127, 128, 129, 1000, 4096, 21504, 299008] {
             let got = buf_size(size);
             assert!(got >= size, "buf_size({size}) = {got} is too small");
             assert_eq!(
-                got % BUFFER_ALIGNMENT,
+                got % alignment,
                 0,
-                "buf_size({size}) = {got} is not {BUFFER_ALIGNMENT}-aligned"
+                "buf_size({size}) = {got} is not {alignment}-aligned"
             );
             assert!(
-                got - size < BUFFER_ALIGNMENT,
+                got - size < alignment,
                 "buf_size({size}) = {got} wastes a whole alignment unit"
             );
         }
@@ -1352,13 +1462,17 @@ mod tests {
     #[test]
     fn test_buf_size_never_zero() {
         // Metal rejects zero-length buffers, and an empty tensor asks for one.
-        assert_eq!(buf_size(0), BUFFER_ALIGNMENT);
+        assert_eq!(buf_size(0), buffer_alignment());
     }
 
     #[test]
     fn test_buf_size_avoids_power_of_two_waste() {
         // Shapes that sit just above a power of two are the ones that suffered:
         // a 292-token KV cache and an FFN intermediate both rounded up hard.
+        // Both are multiples of 128, so they are exact at every arm at or below
+        // the default -- which is the arithmetic §9.2l relies on when it says
+        // padding is free at tensor granularity "by arithmetic rather than by
+        // luck".
         assert_eq!(buf_size(299008), 299008); // was 524288, 75% waste
         assert_eq!(buf_size(21504), 21504); // was 32768, 52% waste
     }
@@ -1368,5 +1482,66 @@ mod tests {
         // BF16 and F16 are 2 bytes per element; a scalar tensor requests a
         // 2-byte buffer. It must not be rounded down.
         assert!(buf_size(2) >= 2);
+    }
+
+    #[test]
+    fn the_default_arm_agrees_with_buf_size() {
+        // The mirror above is only worth having if it is the same arithmetic.
+        // Pinned at the arm the test process actually resolved, so this holds
+        // whether or not the environment selects one.
+        let alignment = buffer_alignment();
+        for size in [1usize, 2, 127, 128, 129, 21504, 299008] {
+            assert_eq!(
+                buf_size(size),
+                round_to(size, alignment),
+                "the mirror and buf_size disagree at {size} (alignment {alignment})"
+            );
+        }
+    }
+
+    /// The arm's *effect*, at an absolute reference rather than a shape.
+    ///
+    /// §3.1b rule 1: `[3, 3, 3]` is a stronger assertion than *all equal*. A
+    /// test asserting only *"a larger alignment wastes at least as much"* would
+    /// pass on a `buf_size` that ignored the arm entirely, because a constant
+    /// sequence is monotone. These are the exact byte counts.
+    #[test]
+    fn each_arm_rounds_to_its_own_granularity() {
+        // 4104 is deliberately awkward: a multiple of 8 and of none of the
+        // arms, so every arm rounds it somewhere different.
+        assert_eq!(round_to(4104, 16), 4112);
+        assert_eq!(round_to(4104, 64), 4160);
+        assert_eq!(round_to(4104, 128), 4224);
+        assert_eq!(round_to(4104, 256), 4352);
+        assert_eq!(round_to(4104, 4096), 8192);
+    }
+
+    #[test]
+    fn a_page_sized_request_is_exact_at_every_arm_at_or_below_it() {
+        // The reason the canonical digests cannot move under this axis: every
+        // LFM2 decode activation shape is already a multiple of 128 (§9.2l), so
+        // an arm at or below the default changes no allocation size at all. The
+        // arena's five slots, measured by #489.
+        for &size in &[21504usize, 21504, 21504, 4096, 1024] {
+            for &alignment in &[16usize, 32, 64, 128, 256, 512, 1024] {
+                if size % alignment == 0 {
+                    assert_eq!(
+                        round_to(size, alignment),
+                        size,
+                        "arena slot {size} should be exact at alignment {alignment}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_floor_is_the_widest_vector_this_backend_loads() {
+        // Not a round number chosen for neatness: `float4`/`half4` are 16 bytes
+        // and are what the kernels load. The refusal below this value is a
+        // correctness guard, so the constant must not drift away from the
+        // reason for it.
+        assert_eq!(MIN_BUFFER_ALIGNMENT, 16);
+        assert_eq!(MIN_BUFFER_ALIGNMENT, std::mem::size_of::<f32>() * 4);
     }
 }

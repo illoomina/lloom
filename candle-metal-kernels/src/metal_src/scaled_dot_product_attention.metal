@@ -769,6 +769,539 @@ template <typename T, int D>
   }
 }
 
+// ============ quantized KV (issue #218, `DESIGN.md` §10.7, §17 Phase 5 item 18)
+
+// The KV cache stored as integer codes plus one (scale, bias) pair per group,
+// with **the group equal to one head vector**.
+//
+// # Why the group is the head vector, and why that is not a tuning choice
+//
+// `head_dim` is 64 (§5.3), and §16 #6 records the arithmetic: a group size of
+// 128 **does not divide it**, so AWQ's default and llama.cpp's 128-wide blocks
+// are unavailable along this axis. MLX defaults to 64, which is exactly one
+// group per head vector — §10.7a calls that agreement a *coincidence* that
+// would fail at head_dim 128, so it is asserted on the host side rather than
+// relied on here.
+//
+// The consequence that matters for this kernel: `scale` and `bias` are
+// **uniform across the 32 lanes** that cooperate on one key, so a dequantized
+// dot product needs no cross-lane traffic beyond the `simd_sum` the f16 path
+// already does.
+//
+// # The scales are a parallel plane, not interleaved
+//
+// §17 item 18(c) and §10.7a: interleaving a scale beside each head vector
+// breaks `sdpa_vector`'s contiguous `keys += stride` walk, which §10.3b reads
+// out of the kernel and §9.1d records as a *requirement* rather than a
+// preference (`head_dim × dtype` is exactly one 128 B cache line at f16). The
+// codes therefore keep the `[B, H, T, D]` order the f16 cache has, at a
+// narrower element, and the scales live in their own `[B, H, T]` plane.
+//
+// # Determinism
+//
+// **No variant tier is owed** (§16 #6, §10.7a): a KV scale is computed once at
+// write time and only read thereafter, so it sits *outside* the per-token
+// reduction §2.3.3 #1 governs. What sits inside is the dequantized dot
+// product, and the loop below is `sdpa_vector_body`'s line for line — same
+// `typedef float U`, same `simd_sum` tree, same online-softmax rescale. The
+// only change is where `k[j]` and `values[j]` come from.
+//
+// **The dequant is per element on purpose.** For gs == D the score factorises
+// into `s * sum(qv*c) + b * sum(qv)`, which would hoist the scale out of the
+// key loop for one extra `simd_sum` — algebraically exact and a *different*
+// rounding. This kernel does not take it: the issue's scope is *get it correct
+// first*, and dequantizing into the same accumulator makes parity against a
+// scalar reference exact rather than exact-modulo-reassociation.
+struct SdpaQuantParams {
+  int gqa_factor;
+  int N;
+  // Per-head strides, in ELEMENTS of the plane they address. The code plane's
+  // element is a byte at int8 and half a byte at int4, so `k_code_stride` is a
+  // *byte* stride and `k_scale_stride` is an f16-element stride: two different
+  // units in adjacent fields, which is exactly the shape #38's width trap took.
+  // Both are `size_t` and both are read, so `sdpa_quant_params_layout` can see
+  // a transposition.
+  size_t k_code_stride;
+  size_t v_code_stride;
+  size_t k_scale_stride;
+  size_t v_scale_stride;
+  float scale;
+  float softcapping;
+};
+
+// The write side's parameters. Separate from `SdpaQuantParams` because the two
+// kernels are dispatched independently and share no field whose meaning is the
+// same: a write knows a destination offset and one plane, a read knows N and
+// both planes.
+struct SdpaQuantWriteParams {
+  // Per-head stride of the f16 source, in elements.
+  size_t src_head_stride;
+  // Per-head stride of the code plane, in BYTES.
+  size_t code_head_stride;
+  // Per-head stride of the scale and bias planes, in ELEMENTS.
+  size_t scale_head_stride;
+  // Token index this append starts at — the slot's live length before it.
+  int dst_offset;
+  int _pad;
+};
+
+// Unpack one code from the packed plane.
+//
+// `BITS` is 8 or 4 and is a template parameter rather than a field, so the
+// shift-and-mask disappears at int8 and the two widths are two instantiations
+// rather than one kernel with a branch in its inner loop (§7.2: dtype and
+// memory layout are compile-tier).
+template <int BITS>
+METAL_FUNC uint sdpa_unpack_code(const device uchar* codes, int idx);
+
+template <>
+METAL_FUNC uint sdpa_unpack_code<8>(const device uchar* codes, int idx) {
+  return uint(codes[idx]);
+}
+
+template <>
+METAL_FUNC uint sdpa_unpack_code<4>(const device uchar* codes, int idx) {
+  // Two codes per byte, low nibble first. The low/high choice is mirrored by
+  // the writer in `quantize_kv.metal` and by the CPU reference; a swap is
+  // caught by the parity test, whose fixture uses values that differ between
+  // the nibbles.
+  const uchar packed = codes[idx >> 1];
+  return uint((idx & 1) ? (packed >> 4) : (packed & 0x0F));
+}
+
+// Bytes of code plane occupied by `n` codes at this width.
+template <int BITS>
+METAL_FUNC int sdpa_code_bytes(int n) {
+  return (BITS == 8) ? n : (n >> 1);
+}
+
+template <typename T, int D, int BITS>
+METAL_FUNC void sdpa_vector_quant_body(
+    thread const SdpaQuantParams& p,
+    const device T* queries,
+    const device uchar* k_codes,
+    const device T* k_scales,
+    const device T* k_biases,
+    const device uchar* v_codes,
+    const device T* v_scales,
+    const device T* v_biases,
+    device T* out,
+    threadgroup float* outputs,
+    threadgroup float* max_scores,
+    threadgroup float* sum_exp_scores,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+
+  typedef float U;
+
+  const int gqa_factor = p.gqa_factor;
+  const int N = p.N;
+  const float scale = p.scale;
+  const float softcapping = p.softcapping;
+
+  thread U q[elem_per_thread];
+  thread U k[elem_per_thread];
+  thread U o[elem_per_thread];
+
+  const int head_idx = tid.y;
+  const int kv_head_idx = head_idx / gqa_factor;
+
+  queries += head_idx * D + simd_lid * elem_per_thread;
+  out += head_idx * D + simd_gid * elem_per_thread;
+
+  // The code planes are indexed in codes and converted to bytes once, so an
+  // int4 plane advances half as far per token as an int8 one and the arithmetic
+  // says so in one place.
+  const int lane_first_code = simd_lid * elem_per_thread;
+  const device uchar* k_code_base =
+      k_codes + kv_head_idx * p.k_code_stride + sdpa_code_bytes<BITS>(simd_gid * D);
+  const device uchar* v_code_base =
+      v_codes + kv_head_idx * p.v_code_stride + sdpa_code_bytes<BITS>(simd_gid * D);
+
+  // One (scale, bias) per (head, token): the group IS the head vector.
+  const device T* k_scale_p = k_scales + kv_head_idx * p.k_scale_stride + simd_gid;
+  const device T* k_bias_p = k_biases + kv_head_idx * p.k_scale_stride + simd_gid;
+  const device T* v_scale_p = v_scales + kv_head_idx * p.v_scale_stride + simd_gid;
+  const device T* v_bias_p = v_biases + kv_head_idx * p.v_scale_stride + simd_gid;
+
+  for (int i = 0; i < elem_per_thread; i++) {
+    q[i] = static_cast<U>(scale) * queries[i];
+  }
+  for (int i = 0; i < elem_per_thread; i++) {
+    o[i] = 0;
+  }
+
+  U max_score = -INFINITY;
+  U sum_exp_score = 0;
+
+  // Byte advance per BN keys, per plane. `stride = BN * D` in the f16 kernel.
+  const int code_step = sdpa_code_bytes<BITS>(BN * D);
+
+  for (int i = simd_gid; i < N; i += BN) {
+    const U k_scale = static_cast<U>(*k_scale_p);
+    const U k_bias = static_cast<U>(*k_bias_p);
+    const U v_scale = static_cast<U>(*v_scale_p);
+    const U v_bias = static_cast<U>(*v_bias_p);
+
+    for (int j = 0; j < elem_per_thread; j++) {
+      const uint code = sdpa_unpack_code<BITS>(k_code_base, lane_first_code + j);
+      k[j] = static_cast<U>(code) * k_scale + k_bias;
+    }
+
+    U score = 0;
+    for (int j = 0; j < elem_per_thread; j++) {
+      score += q[j] * k[j];
+    }
+    score = simd_sum(score);
+    if (softcapping != 1.) {
+      score = precise::tanh(score);
+      score = score * softcapping;
+    }
+
+    U new_max = max(max_score, score);
+    U factor = fast::exp(max_score - new_max);
+    U exp_score = fast::exp(score - new_max);
+
+    max_score = new_max;
+    sum_exp_score = sum_exp_score * factor + exp_score;
+
+    for (int j = 0; j < elem_per_thread; j++) {
+      const uint code = sdpa_unpack_code<BITS>(v_code_base, lane_first_code + j);
+      const U value = static_cast<U>(code) * v_scale + v_bias;
+      o[j] = o[j] * factor + exp_score * value;
+    }
+
+    k_code_base += code_step;
+    v_code_base += code_step;
+    k_scale_p += BN;
+    k_bias_p += BN;
+    v_scale_p += BN;
+    v_bias_p += BN;
+  }
+
+  // The combine is `sdpa_vector_body`'s, unchanged. Quantization touches the
+  // loads and nothing about the reduction order (§2.3.3 #1).
+  if (simd_lid == 0) {
+    max_scores[simd_gid] = max_score;
+    sum_exp_scores[simd_gid] = sum_exp_score;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  max_score = max_scores[simd_lid];
+  U new_max = simd_max(max_score);
+  U factor = fast::exp(max_score - new_max);
+  sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+  for (int i = 0; i < elem_per_thread; i++) {
+    outputs[simd_lid * BD + simd_gid] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor) / sum_exp_score;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (simd_lid == 0) {
+    for (int i = 0; i < elem_per_thread; i++) {
+      out[i] = static_cast<T>(o[i]);
+    }
+  }
+}
+
+template <typename T, int D, int BITS>
+[[kernel]] void sdpa_vector_quant(
+    const device T* queries [[buffer(0)]],
+    const device uchar* k_codes [[buffer(1)]],
+    const device T* k_scales [[buffer(2)]],
+    const device T* k_biases [[buffer(3)]],
+    const device uchar* v_codes [[buffer(4)]],
+    const device T* v_scales [[buffer(5)]],
+    const device T* v_biases [[buffer(6)]],
+    device T* out [[buffer(7)]],
+    const device SdpaQuantParams* pp [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+
+  threadgroup float outputs[BN * BD];
+  threadgroup float max_scores[BN];
+  threadgroup float sum_exp_scores[BN];
+
+  // Taken as a pointer rather than as `constant &` scalars, so this family is
+  // ICB-encodable from the first commit rather than needing §11.3's packed
+  // conversion later (`DESIGN.md` §3.7c: `MTLIndirectComputeCommand` has no
+  // `setBytes` in any form). §11.3h's whole programme is that debt paid
+  // retroactively for seven families; there is no reason to incur it again.
+  SdpaQuantParams p = *pp;
+  sdpa_vector_quant_body<T, D, BITS>(
+      p,
+      queries,
+      k_codes,
+      k_scales,
+      k_biases,
+      v_codes,
+      v_scales,
+      v_biases,
+      out,
+      outputs,
+      max_scores,
+      sum_exp_scores,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+#define instantiate_sdpa_vector_quant(name, type, d, bits)              \
+  template [[host_name("sdpa_vector_quant_" #name "_" #d "_" #bits)]]   \
+  [[kernel]] void sdpa_vector_quant<type, d, bits>(                     \
+      const device type* queries [[buffer(0)]],                         \
+      const device uchar* k_codes [[buffer(1)]],                        \
+      const device type* k_scales [[buffer(2)]],                        \
+      const device type* k_biases [[buffer(3)]],                        \
+      const device uchar* v_codes [[buffer(4)]],                        \
+      const device type* v_scales [[buffer(5)]],                        \
+      const device type* v_biases [[buffer(6)]],                        \
+      device type* out [[buffer(7)]],                                   \
+      const device SdpaQuantParams* pp [[buffer(8)]],                   \
+      uint3 tid [[threadgroup_position_in_grid]],                       \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                 \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+// LFM2 decodes at f16 with head_dim 64 (§5.3, §2.3.3b: every `half` site is
+// pinned whatever its spelling). f32 is instantiated beside it because the
+// parity test compares against the CPU backend at f32, and 128 because it is
+// the next head_dim a second checkpoint would bring — §16 #5 records that the
+// question reopens there.
+instantiate_sdpa_vector_quant(float16_t, half, 64, 8)
+instantiate_sdpa_vector_quant(float16_t, half, 64, 4)
+instantiate_sdpa_vector_quant(float16_t, half, 128, 8)
+instantiate_sdpa_vector_quant(float16_t, half, 128, 4)
+instantiate_sdpa_vector_quant(float, float, 64, 8)
+instantiate_sdpa_vector_quant(float, float, 64, 4)
+instantiate_sdpa_vector_quant(float, float, 128, 8)
+instantiate_sdpa_vector_quant(float, float, 128, 4)
+
+// ---- the write side: quantize one token's head vectors into the planes ----
+
+// Quantize `[H, D]` — one token's worth of one of K or V — into a code plane
+// plus a (scale, bias) pair per head vector.
+//
+// # Why this is its own dispatch rather than folded into the append
+//
+// §6.2b's in-place append is a `copy2d` of exactly one token's bytes at a
+// moving offset, and its value is that **the buffer identity stops changing**
+// (§11.1a.1). Quantizing is a *different* computation over the same bytes, so
+// folding it into `slice_set` would mean a strided, dtype-changing copy where
+// there is now a contiguous one — and `slice_set` requires both sides
+// contiguous (`tensor_cat.rs:249`). One dispatch per (layer, K/V) per token is
+// the honest cost and it is what §12's fusion catalogue would later remove.
+//
+// # One threadgroup per head vector
+//
+// The group is the head vector (§16 #6), so a threadgroup owns exactly one
+// group and the min/max reduction is one `simd_min`/`simd_max` over D/32
+// elements per lane. **The reduction is a fixed simdgroup tree** — §2.3.3 #3,
+// which #265 records as the one rule whose cost is structurally zero because
+// `simd_min`/`simd_max` *are* the primitive.
+//
+// Determinism: this runs once per token at write time, and its output is then
+// only read (§16 #6). It is not inside the per-token reduction §2.3.3 #1
+// governs.
+template <typename T, int D, int BITS>
+[[kernel]] void quantize_kv(
+    const device T* src [[buffer(0)]],
+    device uchar* codes [[buffer(1)]],
+    device T* scales [[buffer(2)]],
+    device T* biases [[buffer(3)]],
+    const device SdpaQuantWriteParams* pp [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+  constexpr float levels = (BITS == 8) ? 255.0f : 15.0f;
+
+  const SdpaQuantWriteParams p = *pp;
+
+  // One threadgroup per (head, token-within-this-append).
+  const int head_idx = tid.x;
+  const int tok_idx = tid.y;
+
+  const device T* in = src + head_idx * p.src_head_stride + tok_idx * D;
+  // The destination token index is the slot's live length plus this token's
+  // position in the batch being appended, which is what makes a `seq_len > 1`
+  // prefill append and a 1-token decode append the same call (§6.2b).
+  const int dst_tok = p.dst_offset + tok_idx;
+
+  device uchar* out_codes =
+      codes + head_idx * p.code_head_stride + sdpa_code_bytes<BITS>(dst_tok * D);
+  device T* out_scale = scales + head_idx * p.scale_head_stride + dst_tok;
+  device T* out_bias = biases + head_idx * p.scale_head_stride + dst_tok;
+
+  thread float x[elem_per_thread];
+  for (int j = 0; j < elem_per_thread; j++) {
+    x[j] = static_cast<float>(in[simd_lid * elem_per_thread + j]);
+  }
+
+  float lo = x[0];
+  float hi = x[0];
+  for (int j = 1; j < elem_per_thread; j++) {
+    lo = min(lo, x[j]);
+    hi = max(hi, x[j]);
+  }
+  lo = simd_min(lo);
+  hi = simd_max(hi);
+
+  // An affine (asymmetric) range. K after RoPE and per-head QK-norm is not
+  // zero-centred per group, so a symmetric range would spend a code bit on
+  // an unused sign; the cost of the affine form is the second f16, and that
+  // second array is exactly the term §10.7a counts to get 0.531× rather than
+  // 0.5× (§9.5b, and #228 for admission's copy of the same arithmetic).
+  //
+  // A degenerate group — every element equal, which a zeroed KV slot produces
+  // before anything is written — gives `hi == lo`. Scale 0 with bias `lo`
+  // then reconstructs the constant exactly, which is the correct answer and
+  // avoids a divide by zero. It is not a special case bolted on: it is what
+  // the affine form already means when the range is empty.
+  const float range = hi - lo;
+  const float scale = (range > 0.0f) ? (range / levels) : 0.0f;
+  const float inv_scale = (range > 0.0f) ? (levels / range) : 0.0f;
+
+  if (simd_lid == 0) {
+    // Stored at T, which is what the read side loads them as. Rounding the
+    // scale to f16 BEFORE it is used to encode would be the correct thing if
+    // the reader used the rounded value against unrounded codes; it does not
+    // — both sides read this same stored pair — so the encode below uses the
+    // f32 `inv_scale` and the decode uses the f16 `scale`, and the parity
+    // reference must do the same. That asymmetry is deliberate and is
+    // asserted by the CPU reference rather than left implicit.
+    *out_scale = static_cast<T>(scale);
+    *out_bias = static_cast<T>(lo);
+  }
+
+  // Re-read the scale as the reader will see it, so the codes are chosen
+  // against the value that will actually dequantize them.
+  const float enc_scale = static_cast<float>(static_cast<T>(scale));
+  const float enc_bias = static_cast<float>(static_cast<T>(lo));
+  const float enc_inv = (enc_scale > 0.0f) ? (1.0f / enc_scale) : 0.0f;
+  (void)inv_scale;
+
+  for (int j = 0; j < elem_per_thread; j++) {
+    const int idx = simd_lid * elem_per_thread + j;
+    float t = (x[j] - enc_bias) * enc_inv;
+    t = clamp(rint(t), 0.0f, levels);
+    const uint code = uint(t);
+
+    if (BITS == 8) {
+      out_codes[idx] = uchar(code);
+    } else {
+      // Two codes share a byte and two *different lanes* may own them, so the
+      // write must not be a read-modify-write race. `elem_per_thread` is
+      // D/32 = 2 at D=64 and 4 at D=128 — even in both cases — so a lane owns
+      // a whole number of bytes and packs them itself. Asserted rather than
+      // assumed, because it is the property that makes this branch safe.
+      if ((idx & 1) == 0) {
+        // The odd sibling is this same lane's next element.
+        float t1 = (x[j + 1] - enc_bias) * enc_inv;
+        t1 = clamp(rint(t1), 0.0f, levels);
+        out_codes[idx >> 1] = uchar(code | (uint(t1) << 4));
+      }
+    }
+  }
+}
+
+// Read the code planes back as `T`, for the paths that cannot consume codes.
+//
+// **The prefill path needs this and it is not a convenience.** A turn boundary
+// re-prefills onto the *accumulated* cache (§2.3.8d: turn 2 is the KV-suspect
+// test, and §10.9 records that `Cache::clear()` is never called by either
+// multi-turn harness), so a `seq_len > 1` pass must attend over the whole
+// `kv_len` -- the causal mask is `[seq_len, index_pos + seq_len]` by
+// construction. Attending over only the current pass's K/V is a shape error at
+// best and a silently truncated context at worst.
+//
+// A quantized `seq_len > 1` attention kernel is out of scope (§17 item 18 is
+// the decode path), so the honest arrangement is: the cache stays quantized,
+// and prefill dequantizes it. The decode steps that follow read the codes
+// directly through `sdpa_vector_quant`, which is where the mechanism pays.
+//
+// One threadgroup per (head, token), 32 lanes, mirroring `quantize_kv`.
+template <typename T, int D, int BITS>
+[[kernel]] void dequantize_kv(
+    const device uchar* codes [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    const device SdpaQuantWriteParams* pp [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+
+  const SdpaQuantWriteParams p = *pp;
+  const int head_idx = tid.x;
+  const int tok_idx = tid.y;
+
+  // `dst_offset` is 0 here: a dequant reads from the base of the live region.
+  // `src_head_stride` is reused as the DESTINATION head stride, in elements,
+  // because the direction is reversed -- named in the caller rather than
+  // renamed here, since the struct is shared and its layout is pinned.
+  const device uchar* in_codes =
+      codes + head_idx * p.code_head_stride + sdpa_code_bytes<BITS>(tok_idx * D);
+  const T scale = scales[head_idx * p.scale_head_stride + tok_idx];
+  const T bias = biases[head_idx * p.scale_head_stride + tok_idx];
+  device T* dst = out + head_idx * p.src_head_stride + tok_idx * D;
+
+  for (int j = 0; j < elem_per_thread; j++) {
+    const int idx = simd_lid * elem_per_thread + j;
+    const uint code = sdpa_unpack_code<BITS>(in_codes, idx);
+    dst[idx] = static_cast<T>(static_cast<float>(code) * static_cast<float>(scale) +
+                              static_cast<float>(bias));
+  }
+}
+
+#define instantiate_dequantize_kv(name, type, d, bits)              \
+  template [[host_name("dequantize_kv_" #name "_" #d "_" #bits)]]   \
+  [[kernel]] void dequantize_kv<type, d, bits>(                     \
+      const device uchar* codes [[buffer(0)]],                      \
+      const device type* scales [[buffer(1)]],                      \
+      const device type* biases [[buffer(2)]],                      \
+      device type* out [[buffer(3)]],                               \
+      const device SdpaQuantWriteParams* pp [[buffer(4)]],          \
+      uint3 tid [[threadgroup_position_in_grid]],                   \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+instantiate_dequantize_kv(float16_t, half, 64, 8)
+instantiate_dequantize_kv(float16_t, half, 64, 4)
+instantiate_dequantize_kv(float16_t, half, 128, 8)
+instantiate_dequantize_kv(float16_t, half, 128, 4)
+instantiate_dequantize_kv(float, float, 64, 8)
+instantiate_dequantize_kv(float, float, 64, 4)
+instantiate_dequantize_kv(float, float, 128, 8)
+instantiate_dequantize_kv(float, float, 128, 4)
+
+#define instantiate_quantize_kv(name, type, d, bits)              \
+  template [[host_name("quantize_kv_" #name "_" #d "_" #bits)]]   \
+  [[kernel]] void quantize_kv<type, d, bits>(                     \
+      const device type* src [[buffer(0)]],                       \
+      device uchar* codes [[buffer(1)]],                          \
+      device type* scales [[buffer(2)]],                          \
+      device type* biases [[buffer(3)]],                          \
+      const device SdpaQuantWriteParams* pp [[buffer(4)]],        \
+      uint3 tid [[threadgroup_position_in_grid]],                 \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+instantiate_quantize_kv(float16_t, half, 64, 8)
+instantiate_quantize_kv(float16_t, half, 64, 4)
+instantiate_quantize_kv(float16_t, half, 128, 8)
+instantiate_quantize_kv(float16_t, half, 128, 4)
+instantiate_quantize_kv(float, float, 64, 8)
+instantiate_quantize_kv(float, float, 64, 4)
+instantiate_quantize_kv(float, float, 128, 8)
+instantiate_quantize_kv(float, float, 128, 4)
+
 // ============ "mlx/backend/metal/kernels/utils.h"
 
 template <typename U>
@@ -2521,6 +3054,46 @@ static_assert(alignof(SdpaVectorParams) == 8, "SdpaVectorParams alignment");
   out[4] = sdpa_offsetof_rt(SdpaVectorParams, v_stride);
   out[5] = sdpa_offsetof_rt(SdpaVectorParams, scale);
   out[6] = sdpa_offsetof_rt(SdpaVectorParams, softcapping);
+}
+
+// The same check for issue #218's two structs.
+//
+// A **second** kernel rather than more slots on `sdpa_params_layout`, because
+// that kernel's slot list is what `sdpa_params_layout_check_detects_a_moved_
+// field` indexes its assertion against; appending to it would change what an
+// existing mutation test reads.
+//
+// `SdpaQuantParams` is 48: two `int` (8), then four `size_t` from 8 to 40,
+// then two `float` to 48 — no tail padding, because 48 is already a multiple
+// of the 8-byte alignment. `SdpaQuantWriteParams` is 32: three `size_t` to 24,
+// two `int` to 32.
+static_assert(sizeof(SdpaQuantParams) == 48, "SdpaQuantParams layout");
+static_assert(alignof(SdpaQuantParams) == 8, "SdpaQuantParams alignment");
+static_assert(sizeof(SdpaQuantWriteParams) == 32, "SdpaQuantWriteParams layout");
+static_assert(alignof(SdpaQuantWriteParams) == 8, "SdpaQuantWriteParams alignment");
+
+[[kernel]] void sdpa_quant_params_layout(
+    device uint* out,
+    uint tid [[thread_position_in_grid]]) {
+  if (tid != 0) { return; }
+  SdpaQuantParams probe_SdpaQuantParams;
+  SdpaQuantWriteParams probe_SdpaQuantWriteParams;
+
+  out[0] = sizeof(SdpaQuantParams);
+  out[1] = sdpa_offsetof_rt(SdpaQuantParams, gqa_factor);
+  out[2] = sdpa_offsetof_rt(SdpaQuantParams, N);
+  out[3] = sdpa_offsetof_rt(SdpaQuantParams, k_code_stride);
+  out[4] = sdpa_offsetof_rt(SdpaQuantParams, v_code_stride);
+  out[5] = sdpa_offsetof_rt(SdpaQuantParams, k_scale_stride);
+  out[6] = sdpa_offsetof_rt(SdpaQuantParams, v_scale_stride);
+  out[7] = sdpa_offsetof_rt(SdpaQuantParams, scale);
+  out[8] = sdpa_offsetof_rt(SdpaQuantParams, softcapping);
+
+  out[9] = sizeof(SdpaQuantWriteParams);
+  out[10] = sdpa_offsetof_rt(SdpaQuantWriteParams, src_head_stride);
+  out[11] = sdpa_offsetof_rt(SdpaQuantWriteParams, code_head_stride);
+  out[12] = sdpa_offsetof_rt(SdpaQuantWriteParams, scale_head_stride);
+  out[13] = sdpa_offsetof_rt(SdpaQuantWriteParams, dst_offset);
 }
 
 // SDPA vector instantiations

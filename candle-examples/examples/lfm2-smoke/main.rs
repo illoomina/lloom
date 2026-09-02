@@ -108,14 +108,11 @@ extern crate accelerate_src;
 
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
+use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
+use candle_nn::ops::KvQuant;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{
-    AttnImpl, Cache, ConvState, KvAppend, Model,
-};
-use candle_examples::lfm2_setup::{
-    default_model_dir, parse_config, tensor_names, weight_files,
-};
+use candle_transformers::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
 use clap::Parser;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -240,6 +237,18 @@ struct Args {
     #[arg(long, default_value = "cat")]
     kv_append: String,
 
+    /// KV cache element width: `off` (the f16 default), `int8` or `int4`
+    /// (issue #218, `DESIGN.md` §10.7).
+    ///
+    /// **A moved digest is EXPECTED on this axis and is not itself the
+    /// finding.** Quantization is a real precision loss rather than a
+    /// reordering, so what is owed is the ulp delta's **magnitude** and its
+    /// **growth slope** against §10.7a's ladder, per §2.3.3c's tier-2
+    /// sub-distinction. Magnitude is primary: #128's defect ratio is 0.787, so
+    /// reading growth first would have called a real defect benign.
+    #[arg(long, default_value = "off")]
+    kv_quant: String,
+
     /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
     /// the default), `ring[:K[:slack]]` (the sliding window, §10.2e) or
     /// `rotating[:K]` (§10.2a's rotating index, §10.2g).
@@ -353,6 +362,11 @@ fn main() -> Result<()> {
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
 
+    // Refused rather than defaulted, for `--kv-append`'s reason: an
+    // unrecognized value silently pinning the default would report the f16
+    // arm's digest under a quantized arm's name -- #69's vacuous run (§2.4).
+    config.kv_quant = KvQuant::parse(&args.kv_quant).map_err(anyhow::Error::msg)?;
+
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     println!("conv state: {:?}", config.conv_state);
 
@@ -409,6 +423,7 @@ fn main() -> Result<()> {
     println!("model     {}", model_dir.display());
     println!("attention {:?}", config.attn_impl);
     println!("kv append {:?}", config.kv_append);
+    println!("kv quant  {:?}", config.kv_quant);
     println!(
         "dtype     {dtype:?}   device {}",
         if args.cpu { "cpu" } else { "metal" }

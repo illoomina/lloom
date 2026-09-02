@@ -1,5 +1,5 @@
 use super::*;
-use crate::kernels::params::ParamStyle;
+use crate::kernels::params::{ParamStyle, SdpaQuantParams, SdpaQuantWriteParams};
 use crate::metal::{Commands, ResidencySet};
 use core::ffi::c_void;
 use half::{bf16, f16};
@@ -5300,6 +5300,15 @@ fn every_family_params_layout_matches_metal() {
         // offset of a field the GPU never reads is the shape #103's finding 3
         // and #219 both name — half an assertion over a dead field.
         ("flash_decoding.metal", 17),
+        // Issue #218's two structs, also in
+        // `scaled_dot_product_attention.metal`: `SdpaQuantParams` (a `sizeof`
+        // and eight fields) and `SdpaQuantWriteParams` (a `sizeof` and four).
+        // A **second entry for one file** rather than more slots on the `sdpa`
+        // row above, because that row's list is what
+        // `sdpa_params_layout_check_detects_a_moved_field` indexes its
+        // assertion against. **`pad` is deliberately not a slot**, per the
+        // `_pad` note above: it carries no value and the GPU never reads it.
+        ("scaled_dot_product_attention.metal", 14),
     ];
 
     let mut failures = Vec::new();
@@ -5344,8 +5353,8 @@ fn every_family_params_layout_matches_metal() {
     assert_eq!(
         observed,
         EXPECTED_SLOTS.to_vec(),
-        "family or slot count changed. Nine families and their slot counts are \
-         the state at issue #103; update this only alongside a deliberate addition."
+        "family or slot count changed. Eleven families and their slot counts are \
+         the state at issue #218; update this only alongside a deliberate addition."
     );
 }
 
@@ -5378,6 +5387,7 @@ fn layout_registry_covers_every_family() {
             LayoutFamily::Indexing => "indexing",
             LayoutFamily::Sdpa => "sdpa",
             LayoutFamily::Flash => "flash_decoding",
+            LayoutFamily::SdpaQuant => "sdpa_quant",
         }
     }
 
@@ -5392,6 +5402,7 @@ fn layout_registry_covers_every_family() {
         LayoutFamily::Indexing,
         LayoutFamily::Sdpa,
         LayoutFamily::Flash,
+        LayoutFamily::SdpaQuant,
     ];
 
     for family in expected {
@@ -7833,7 +7844,11 @@ fn gemv_fused_residual_matches_a_reference() {
     // §15.1a's VACUOUS shape sitting in the suite -- a test that reports the
     // same green whether or not it evaluated anything.
     for &(k, n_out, label) in &[
-        (2048usize, 2048usize, "bm4 (the decode shape), K divides blockN"),
+        (
+            2048usize,
+            2048usize,
+            "bm4 (the decode shape), K divides blockN",
+        ),
         (2048usize, 6144usize, "bm8, K divides blockN"),
         (2050usize, 2048usize, "bm4, K leaves a 2-element tail"),
         (2050usize, 6144usize, "bm8, K leaves a 2-element tail"),
@@ -8016,5 +8031,696 @@ fn gemv_epilogue_arity_table_is_what_the_kernels_take() {
         GemvEpilogue::Residual.needs_operand(),
         "the residual arm reads a second operand at slot 15; that binding is \
          what §12.2e's G1 gate is about"
+    );
+}
+
+// ===========================================================================
+// Quantized KV cache -- issue #218, `DESIGN.md` §10.7, §17 Phase 5 item 18.
+// ===========================================================================
+
+/// A scalar CPU reference for attention over a *dequantized* KV cache.
+///
+/// **This is an absolute reference and not a shape invariant** —
+/// `CONTRIBUTING.md` §3.1b rule 1. It recomputes the answer from the codes and
+/// the stored (scale, bias) pairs with no knowledge of what the kernel did, so
+/// a defect that shifts every output equally is visible where an `all equal`
+/// or `both arms agree` assertion would not be.
+///
+/// The accumulation is the online-softmax form the kernel uses, in the same
+/// f32 accumulator, walking keys in index order. It is not the *bit-identical*
+/// reference — the kernel's `simd_sum` is a tree where this is sequential, and
+/// `fast::exp` is not `f32::exp` — so the comparison is against a tolerance,
+/// which is what §2.3.5a's parity row asks for.
+#[allow(clippy::too_many_arguments)]
+fn quant_attention_reference(
+    q: &[f32],
+    k_codes: &[u8],
+    k_scales: &[f32],
+    k_biases: &[f32],
+    v_codes: &[u8],
+    v_scales: &[f32],
+    v_biases: &[f32],
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    capacity: usize,
+    scale: f32,
+    bits: KvQuantBits,
+) -> Vec<f32> {
+    let gqa = n_q_heads / n_kv_heads;
+    let code_at = |plane: &[u8], head: usize, tok: usize, j: usize| -> f32 {
+        let idx = tok * head_dim + j;
+        let base = bits.code_bytes(head * capacity * head_dim);
+        match bits {
+            KvQuantBits::Eight => plane[base + idx] as f32,
+            KvQuantBits::Four => {
+                let byte = plane[base + (idx >> 1)];
+                (if idx & 1 == 1 { byte >> 4 } else { byte & 0x0F }) as f32
+            }
+        }
+    };
+
+    let mut out = vec![0f32; n_q_heads * head_dim];
+    for h in 0..n_q_heads {
+        let kv_h = h / gqa;
+        let qv: Vec<f32> = (0..head_dim).map(|j| scale * q[h * head_dim + j]).collect();
+
+        let mut acc = vec![0f32; head_dim];
+        let mut max_score = f32::NEG_INFINITY;
+        let mut sum_exp = 0f32;
+
+        for t in 0..kv_len {
+            let ks = k_scales[kv_h * capacity + t];
+            let kb = k_biases[kv_h * capacity + t];
+            let mut score = 0f32;
+            for j in 0..head_dim {
+                score += qv[j] * (code_at(k_codes, kv_h, t, j) * ks + kb);
+            }
+
+            let new_max = max_score.max(score);
+            let factor = (max_score - new_max).exp();
+            let exp_score = (score - new_max).exp();
+            max_score = new_max;
+            sum_exp = sum_exp * factor + exp_score;
+
+            let vs = v_scales[kv_h * capacity + t];
+            let vb = v_biases[kv_h * capacity + t];
+            for j in 0..head_dim {
+                acc[j] = acc[j] * factor + exp_score * (code_at(v_codes, kv_h, t, j) * vs + vb);
+            }
+        }
+
+        for j in 0..head_dim {
+            out[h * head_dim + j] = acc[j] / sum_exp;
+        }
+    }
+    out
+}
+
+/// Quantize on the GPU, read the planes back, and check them against the
+/// scalar reference **code for code**.
+///
+/// The write side gets its own arm because a wrong code and a wrong dequant
+/// produce the same wrong attention output, and only one of them is the
+/// quantizer's fault.
+fn run_quantize_kv(
+    device: &Device,
+    kernels: &Kernels,
+    src: &[f16],
+    n_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    capacity: usize,
+    dst_offset: usize,
+    bits: KvQuantBits,
+) -> (Vec<u8>, Vec<f16>, Vec<f16>) {
+    let code_bytes = bits.code_bytes(n_heads * capacity * head_dim);
+    let scale_els = n_heads * capacity;
+
+    let commands = commands(device);
+    let encoder = commands.command_encoder().unwrap();
+
+    let src_buf = new_buffer(device, src);
+    // Zeroed rather than uninitialised: an untouched region must read as a
+    // known value, or a kernel that writes nothing is indistinguishable from
+    // one that writes what was already there (§15.1 #1's vacuity argument, in
+    // the buffer rather than in the comparison).
+    let codes = new_buffer(device, &vec![0u8; code_bytes]);
+    let scales = new_buffer(device, &vec![f16::from_f32(0.0); scale_els]);
+    let biases = new_buffer(device, &vec![f16::from_f32(0.0); scale_els]);
+
+    let p =
+        SdpaQuantWriteParams::for_append(seq_len * head_dim, capacity, head_dim, dst_offset, bits);
+    let params = new_buffer(device, &[p]);
+
+    call_quantize_kv(
+        device,
+        &encoder,
+        kernels,
+        0,
+        &src_buf,
+        &codes,
+        &scales,
+        &biases,
+        &params,
+        n_heads,
+        seq_len,
+        head_dim,
+        bits,
+        SdpaDType::F16,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+
+    (
+        read_to_vec::<u8>(&codes, code_bytes),
+        read_to_vec::<f16>(&scales, scale_els),
+        read_to_vec::<f16>(&biases, scale_els),
+    )
+}
+
+/// The quantizer agrees with the scalar reference on every code, at both widths.
+///
+/// **Absolute, per code.** Not "the codes are in range", not "the two widths
+/// agree with each other" — the exact byte the reference computes, which is the
+/// form §3.1b rule 1 asks for and the only one that fails with a sentence a
+/// reader can act on.
+#[test]
+fn quantize_kv_matches_the_scalar_reference_at_both_widths() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (n_heads, head_dim, seq_len, capacity) = (8usize, 64usize, 3usize, 16usize);
+    let dst_offset = 5usize;
+
+    // A source whose groups have genuinely different ranges: a quantizer that
+    // ignored `hi`/`lo` and used one global range would still pass a fixture
+    // where every group looked alike.
+    let src: Vec<f16> = (0..n_heads * seq_len * head_dim)
+        .map(|i| {
+            let head = i / (seq_len * head_dim);
+            let amp = 1.0 + head as f32;
+            f16::from_f32(amp * (((i * 37 % 101) as f32 - 50.0) / 50.0))
+        })
+        .collect();
+
+    for bits in KvQuantBits::ALL {
+        let (codes, scales, biases) = run_quantize_kv(
+            &device, &kernels, &src, n_heads, seq_len, head_dim, capacity, dst_offset, bits,
+        );
+
+        let mut checked = 0usize;
+        for h in 0..n_heads {
+            for t in 0..seq_len {
+                let group: Vec<f32> = (0..head_dim)
+                    .map(|j| src[(h * seq_len + t) * head_dim + j].to_f32())
+                    .collect();
+                let (want_codes, want_scale, want_bias) =
+                    quantize_group_reference(&group, bits, |x| f16::from_f32(x).to_f32());
+
+                let dst_tok = dst_offset + t;
+                assert_eq!(
+                    scales[h * capacity + dst_tok].to_f32(),
+                    want_scale,
+                    "scale disagrees at head {h} token {dst_tok} at int{}",
+                    bits.bits()
+                );
+                assert_eq!(
+                    biases[h * capacity + dst_tok].to_f32(),
+                    want_bias,
+                    "bias disagrees at head {h} token {dst_tok} at int{}",
+                    bits.bits()
+                );
+
+                for j in 0..head_dim {
+                    let idx = dst_tok * head_dim + j;
+                    let base = bits.code_bytes(h * capacity * head_dim);
+                    let got = match bits {
+                        KvQuantBits::Eight => codes[base + idx],
+                        KvQuantBits::Four => {
+                            let byte = codes[base + (idx >> 1)];
+                            if idx & 1 == 1 {
+                                byte >> 4
+                            } else {
+                                byte & 0x0F
+                            }
+                        }
+                    };
+                    assert_eq!(
+                        got,
+                        want_codes[j],
+                        "code disagrees at head {h} token {dst_tok} element {j} at int{}",
+                        bits.bits()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            n_heads * seq_len * head_dim,
+            "the arm must check every code it wrote, or a kernel writing a \
+             prefix passes"
+        );
+
+        // Non-vacuity, on the codes themselves: a quantizer that wrote one
+        // constant everywhere agrees with a reference that did the same.
+        let distinct = codes.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(
+            distinct >= 2,
+            "the code plane holds {distinct} distinct byte(s) at int{}, so this \
+             comparison is vacuous",
+            bits.bits()
+        );
+    }
+}
+
+/// The append writes **only** the tokens it was given.
+///
+/// A quantizer that ignored `dst_offset` would overwrite the cache from token
+/// zero, and every parity arm above would still pass because it reads at the
+/// offset it wrote. The untouched region is the discriminator, and this is the
+/// arm that reads it.
+#[test]
+fn quantize_kv_leaves_the_rest_of_the_plane_untouched() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (n_heads, head_dim, seq_len, capacity) = (2usize, 64usize, 2usize, 16usize);
+    let dst_offset = 7usize;
+    let src: Vec<f16> = (0..n_heads * seq_len * head_dim)
+        .map(|i| f16::from_f32(((i * 17 % 61) as f32 - 30.0) / 30.0))
+        .collect();
+
+    for bits in KvQuantBits::ALL {
+        let (codes, scales, _biases) = run_quantize_kv(
+            &device, &kernels, &src, n_heads, seq_len, head_dim, capacity, dst_offset, bits,
+        );
+
+        for h in 0..n_heads {
+            for t in 0..capacity {
+                let touched = (dst_offset..dst_offset + seq_len).contains(&t);
+                let scale = scales[h * capacity + t].to_f32();
+                if touched {
+                    assert_ne!(
+                        scale, 0.0,
+                        "head {h} token {t} is inside the append and must have \
+                         been written"
+                    );
+                } else {
+                    assert_eq!(
+                        scale,
+                        0.0,
+                        "head {h} token {t} is outside the append at offset \
+                         {dst_offset}..{} and must not have been written -- a \
+                         kernel ignoring dst_offset passes every arm that reads \
+                         only where it wrote",
+                        dst_offset + seq_len
+                    );
+                }
+
+                let first = bits.code_bytes(h * capacity * head_dim + t * head_dim);
+                let last = bits.code_bytes(h * capacity * head_dim + (t + 1) * head_dim);
+                let any_nonzero = codes[first..last].iter().any(|&b| b != 0);
+                if !touched {
+                    assert!(
+                        !any_nonzero,
+                        "head {h} token {t} has code bytes set outside the append"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `KvQuantBits::code_bytes` and the kernel's `sdpa_code_bytes` are the same
+/// function.
+///
+/// The host sizes every plane with the first and the kernel indexes into it
+/// with the second. A disagreement is a plane that overlaps its neighbour —
+/// §3.5's silent wrong answer, not a crash — so the two are pinned against an
+/// absolute table rather than against each other.
+#[test]
+fn kv_quant_code_bytes_matches_the_kernel() {
+    assert_eq!(KvQuantBits::Eight.code_bytes(64), 64);
+    assert_eq!(KvQuantBits::Four.code_bytes(64), 32);
+    assert_eq!(KvQuantBits::Eight.code_bytes(128), 128);
+    assert_eq!(KvQuantBits::Four.code_bytes(128), 64);
+    // A whole cache: 8 heads x 4096 tokens x 64 dim.
+    assert_eq!(KvQuantBits::Eight.code_bytes(8 * 4096 * 64), 2_097_152);
+    assert_eq!(KvQuantBits::Four.code_bytes(8 * 4096 * 64), 1_048_576);
+
+    assert_eq!(KvQuantBits::Eight.levels(), 255.0);
+    assert_eq!(KvQuantBits::Four.levels(), 15.0);
+    assert_eq!(KvQuantBits::Eight.bits(), 8);
+    assert_eq!(KvQuantBits::Four.bits(), 4);
+}
+
+/// Attention over a quantized cache agrees with the scalar reference.
+///
+/// **The reference is computed from the planes the GPU wrote**, not from the
+/// original f16 values: the question this arm answers is *does the kernel
+/// dequantize and attend correctly*, which is separable from *does the
+/// quantizer choose good codes* (the arms above) and must be, or a compensating
+/// pair of errors passes both.
+///
+/// LFM2's geometry — 32 q heads, 8 kv heads, head_dim 64 — so `gqa_factor` is
+/// 4 and the GQA mapping is exercised. §6.2a records that the pre-existing sdpa
+/// suite had **no** GQA arm, and that mutating the kernel to ignore
+/// `gqa_factor` left all five green; this arm does not repeat that.
+///
+/// `kv_len` 40 crosses the `for (i = simd_gid; i < N; i += BN)` wrap at BN=32,
+/// so both the first pass and the second are exercised.
+#[test]
+fn sdpa_vector_quant_matches_the_scalar_reference_at_both_widths() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (n_q_heads, n_kv_heads, head_dim) = (32usize, 8usize, 64usize);
+    let (kv_len, capacity) = (40usize, 64usize);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q: Vec<f16> = (0..n_q_heads * head_dim)
+        .map(|i| f16::from_f32(((i * 37 % 71) as f32 - 35.0) / 64.0))
+        .collect();
+    // K and V are given different value distributions, so a kernel that read
+    // the K planes for V (or bound the two the same way) produces a different
+    // answer. Both are quantized by the GPU quantizer, which is what makes the
+    // planes the reference reads the ones the reader will see.
+    // **Every key gets its own OFFSET and its own RANGE, and that is what makes
+    // the bias term observable.** A fixture whose groups all span the same
+    // interval gives every group the same `bias`, and dropping the bias from
+    // the dequant then shifts every score by the same constant -- which softmax
+    // is invariant under, so the defect is invisible. Measured: with a single
+    // generator the bias spread over 320 groups is 0.031 and mutant 2 of
+    // `measurements/issue-218-raw/mutation.sh` SURVIVES.
+    //
+    // That is §15.1a's VACUOUS class -- the instrument can express the
+    // difference and no input produces it -- and `CONTRIBUTING.md` §3.1a rule 2
+    // says the repair is the arm's *input*. The per-key offset below is also
+    // the more faithful fixture: real keys at different positions carry
+    // different magnitudes after RoPE.
+    let k_src: Vec<f16> = (0..n_kv_heads * kv_len * head_dim)
+        .map(|i| {
+            let tok = (i / head_dim) % kv_len;
+            let offset = (tok as f32) * 0.25 - 5.0;
+            let amp = 1.0 + (tok % 7) as f32 * 0.5;
+            f16::from_f32(offset + amp * ((i * 53 % 97) as f32 - 48.0) / 96.0)
+        })
+        .collect();
+    let v_src: Vec<f16> = (0..n_kv_heads * kv_len * head_dim)
+        .map(|i| {
+            let tok = (i / head_dim) % kv_len;
+            let offset = 3.0 - (tok as f32) * 0.2;
+            let amp = 1.0 + (tok % 5) as f32 * 0.4;
+            f16::from_f32(offset + amp * 2.0 * ((i * 29 % 83) as f32 - 41.0) / 48.0)
+        })
+        .collect();
+
+    for bits in KvQuantBits::ALL {
+        let (k_codes, k_scales, k_biases) = run_quantize_kv(
+            &device, &kernels, &k_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+        );
+        let (v_codes, v_scales, v_biases) = run_quantize_kv(
+            &device, &kernels, &v_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+        );
+
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+
+        let q_buf = new_buffer(&device, &q);
+        let kc = new_buffer(&device, &k_codes);
+        let ks = new_buffer(&device, &k_scales);
+        let kb = new_buffer(&device, &k_biases);
+        let vc = new_buffer(&device, &v_codes);
+        let vs = new_buffer(&device, &v_scales);
+        let vb = new_buffer(&device, &v_biases);
+        let out_el = n_q_heads * head_dim;
+        let output = device
+            .new_buffer(out_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
+            .unwrap();
+
+        let p = SdpaQuantParams::for_step(
+            n_q_heads / n_kv_heads,
+            kv_len,
+            capacity,
+            head_dim,
+            scale,
+            1.0,
+            bits,
+        );
+        let params = new_buffer(&device, &[p]);
+
+        call_sdpa_vector_quant(
+            &device,
+            &encoder,
+            &kernels,
+            0,
+            &[1, n_q_heads, 1, head_dim],
+            &q_buf,
+            &kc,
+            &ks,
+            &kb,
+            &vc,
+            &vs,
+            &vb,
+            &output,
+            &params,
+            bits,
+            SdpaDType::F16,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+
+        let got = read_to_vec::<f16>(&output, out_el);
+
+        let want = quant_attention_reference(
+            &q.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+            &k_codes,
+            &k_scales.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+            &k_biases.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+            &v_codes,
+            &v_scales.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+            &v_biases.iter().map(|x| x.to_f32()).collect::<Vec<_>>(),
+            n_q_heads,
+            n_kv_heads,
+            head_dim,
+            kv_len,
+            capacity,
+            scale,
+            bits,
+        );
+
+        // Non-vacuity first, so a kernel that wrote nothing cannot pass by
+        // agreeing with a reference that also produced little (§15.1 #1).
+        let distinct = got
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            distinct >= 2,
+            "int{} attention wrote {distinct} distinct value(s) over {out_el} \
+             elements, so this comparison is vacuous",
+            bits.bits()
+        );
+
+        // The tolerance covers f16 storage of the output plus the difference
+        // between a `simd_sum` tree and a sequential sum, and nothing else --
+        // both operands are dequantized from the SAME codes, so quantization
+        // error cancels exactly here rather than being absorbed by a loose
+        // bound. That is what makes this a parity test and not a sanity check.
+        let mut worst = 0f32;
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            let d = (g.to_f32() - w).abs();
+            if d > worst {
+                worst = d;
+            }
+            assert!(
+                d < 2e-3,
+                "int{} attention disagrees with the scalar reference at {i}: \
+                 got {} want {w} (delta {d})",
+                bits.bits(),
+                g.to_f32()
+            );
+        }
+        eprintln!(
+            "int{} sdpa_vector_quant vs scalar reference: worst |delta| = {worst:.3e}",
+            bits.bits()
+        );
+    }
+}
+
+/// The two widths do not compute the same thing.
+///
+/// **The arm that makes the pair above readable.** If int4 and int8 produced
+/// identical output, both could be passing against a reference that shares
+/// their defect — and a `BITS` template parameter that was silently ignored
+/// would look exactly like that. This asserts they differ, and that int8 is the
+/// *closer* of the two to the unquantized answer, which is the direction the
+/// scheme predicts and the one a swapped instantiation would invert.
+#[test]
+fn the_two_widths_differ_and_int8_is_closer_to_f16() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let (n_q_heads, n_kv_heads, head_dim) = (32usize, 8usize, 64usize);
+    let (kv_len, capacity) = (40usize, 64usize);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q: Vec<f16> = (0..n_q_heads * head_dim)
+        .map(|i| f16::from_f32(((i * 37 % 71) as f32 - 35.0) / 64.0))
+        .collect();
+    // **Every key gets its own OFFSET and its own RANGE, and that is what makes
+    // the bias term observable.** A fixture whose groups all span the same
+    // interval gives every group the same `bias`, and dropping the bias from
+    // the dequant then shifts every score by the same constant -- which softmax
+    // is invariant under, so the defect is invisible. Measured: with a single
+    // generator the bias spread over 320 groups is 0.031 and mutant 2 of
+    // `measurements/issue-218-raw/mutation.sh` SURVIVES.
+    //
+    // That is §15.1a's VACUOUS class -- the instrument can express the
+    // difference and no input produces it -- and `CONTRIBUTING.md` §3.1a rule 2
+    // says the repair is the arm's *input*. The per-key offset below is also
+    // the more faithful fixture: real keys at different positions carry
+    // different magnitudes after RoPE.
+    let k_src: Vec<f16> = (0..n_kv_heads * kv_len * head_dim)
+        .map(|i| {
+            let tok = (i / head_dim) % kv_len;
+            let offset = (tok as f32) * 0.25 - 5.0;
+            let amp = 1.0 + (tok % 7) as f32 * 0.5;
+            f16::from_f32(offset + amp * ((i * 53 % 97) as f32 - 48.0) / 96.0)
+        })
+        .collect();
+    let v_src: Vec<f16> = (0..n_kv_heads * kv_len * head_dim)
+        .map(|i| {
+            let tok = (i / head_dim) % kv_len;
+            let offset = 3.0 - (tok as f32) * 0.2;
+            let amp = 1.0 + (tok % 5) as f32 * 0.4;
+            f16::from_f32(offset + amp * 2.0 * ((i * 29 % 83) as f32 - 41.0) / 48.0)
+        })
+        .collect();
+
+    // The unquantized answer, from the same kernel family the shipping path
+    // uses -- `call_sdpa_vector` over the f16 planes.
+    let f16_out = {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let q_buf = new_buffer(&device, &q);
+        let k_buf = new_buffer(&device, &k_src);
+        let v_buf = new_buffer(&device, &v_src);
+        let out_el = n_q_heads * head_dim;
+        let output = device
+            .new_buffer(out_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
+            .unwrap();
+        let strides = [
+            n_kv_heads * kv_len * head_dim,
+            kv_len * head_dim,
+            head_dim,
+            1,
+        ];
+        call_sdpa_vector(
+            &device,
+            &encoder,
+            &kernels,
+            0,
+            &[1, n_q_heads, 1, head_dim],
+            &q_buf,
+            0,
+            &[1, n_kv_heads, kv_len, head_dim],
+            &strides,
+            &k_buf,
+            0,
+            &strides,
+            &v_buf,
+            &output,
+            scale,
+            1.0,
+            SdpaDType::F16,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        read_to_vec::<f16>(&output, out_el)
+    };
+
+    let mut rms = Vec::new();
+    let mut outs = Vec::new();
+    for bits in KvQuantBits::ALL {
+        let (k_codes, k_scales, k_biases) = run_quantize_kv(
+            &device, &kernels, &k_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+        );
+        let (v_codes, v_scales, v_biases) = run_quantize_kv(
+            &device, &kernels, &v_src, n_kv_heads, kv_len, head_dim, capacity, 0, bits,
+        );
+
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let q_buf = new_buffer(&device, &q);
+        let kc = new_buffer(&device, &k_codes);
+        let ks = new_buffer(&device, &k_scales);
+        let kb = new_buffer(&device, &k_biases);
+        let vc = new_buffer(&device, &v_codes);
+        let vs = new_buffer(&device, &v_scales);
+        let vb = new_buffer(&device, &v_biases);
+        let out_el = n_q_heads * head_dim;
+        let output = device
+            .new_buffer(out_el * core::mem::size_of::<f16>(), RESOURCE_OPTIONS)
+            .unwrap();
+        let p = SdpaQuantParams::for_step(
+            n_q_heads / n_kv_heads,
+            kv_len,
+            capacity,
+            head_dim,
+            scale,
+            1.0,
+            bits,
+        );
+        let params = new_buffer(&device, &[p]);
+        call_sdpa_vector_quant(
+            &device,
+            &encoder,
+            &kernels,
+            0,
+            &[1, n_q_heads, 1, head_dim],
+            &q_buf,
+            &kc,
+            &ks,
+            &kb,
+            &vc,
+            &vs,
+            &vb,
+            &output,
+            &params,
+            bits,
+            SdpaDType::F16,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let got = read_to_vec::<f16>(&output, out_el);
+
+        let err: f32 = got
+            .iter()
+            .zip(f16_out.iter())
+            .map(|(a, b)| {
+                let d = a.to_f32() - b.to_f32();
+                d * d
+            })
+            .sum::<f32>()
+            / (out_el as f32);
+        rms.push(err.sqrt());
+        outs.push(got);
+    }
+
+    assert_ne!(
+        outs[0], outs[1],
+        "int8 and int4 produced byte-identical output, which they cannot: a \
+         `BITS` template parameter that is ignored, or one instantiation \
+         reached by both names, looks exactly like this"
+    );
+    assert!(
+        rms[0] < rms[1],
+        "int8 RMS error {} is not below int4's {}; the widths are swapped or \
+         the level count is wrong",
+        rms[0],
+        rms[1]
+    );
+    // An absolute floor as well as an ordering, per §3.1b rule 1: `a < b` alone
+    // is a shape, and a defect scaling both errors keeps the inequality.
+    assert!(
+        rms[0] < 5e-3,
+        "int8 RMS error against f16 is {}, far above what 8-bit affine \
+         quantization of this fixture can explain",
+        rms[0]
+    );
+    eprintln!(
+        "RMS vs f16 attention: int8 = {:.4e}, int4 = {:.4e} (ratio {:.2}x)",
+        rms[0],
+        rms[1],
+        rms[1] / rms[0]
     );
 }

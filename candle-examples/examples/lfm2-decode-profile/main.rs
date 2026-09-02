@@ -47,6 +47,7 @@ use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
 use candle_nn::ops::FlashScratchSizing;
+use candle_nn::ops::KvQuant;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::poll::PollMechanism;
 use candle_transformers::generation::token_ring::TokenRing;
@@ -541,6 +542,7 @@ struct Axes {
     /// today and a hand-written binary test is correct only by coincidence of
     /// that count.
     kv_append: KvAppend,
+    kv_quant: KvQuant,
     /// The conv-state arm (#141), echoed for the run line.
     conv_state: ConvState,
     /// KV tokens per page, and pages per chunk (#116).
@@ -667,6 +669,23 @@ fn kv_append_arm(kv: KvAppend) -> &'static str {
     match kv {
         KvAppend::Cat => "Cat",
         KvAppend::InPlace => "InPlace",
+    }
+}
+
+/// The `KvQuant` arm (#218, `DESIGN.md` §10.7). Exhaustive, for the reason
+/// above: three arms today, and a binary test over a three-armed axis is #241's
+/// exact defect.
+///
+/// **Added to `config_line()` in the same change that adds the axis.** §7.1a
+/// records this surface falling behind the registry five times — an axis added
+/// to the registry and not here renders `UNRECORDED`, which is the *safe*
+/// direction but still means no comparison can hold the axis fixed. There is no
+/// reason to incur that debt on a new axis when the fix is one line.
+fn kv_quant_arm(kv: KvQuant) -> &'static str {
+    match kv {
+        KvQuant::Off => "Off",
+        KvQuant::Int8 => "Int8",
+        KvQuant::Int4 => "Int4",
     }
 }
 
@@ -853,6 +872,7 @@ impl Axes {
             // arm is decided on `Config`, so this is where the arm actually is.
             attn: config.attn_impl,
             kv_append: config.kv_append,
+            kv_quant: config.kv_quant,
             conv_state: config.conv_state,
             flash_page_size: config.flash_page_size,
             flash_k: config.flash_pages_per_chunk,
@@ -1034,6 +1054,7 @@ impl Axes {
             // any check that asks whether the axis is present.
             p("AttnImpl", attn_impl_arm(self.attn)),
             p("KvAppend", kv_append_arm(self.kv_append)),
+            p("KvQuant", kv_quant_arm(self.kv_quant)),
             p("ConvState", &conv_state_arm(self.conv_state)),
             // Only selects anything under `Executor=Icb`, which this harness
             // does not take. Stated at its default rather than omitted: an
@@ -1740,6 +1761,18 @@ struct Args {
     /// `in-place` (pre-allocated, written at a moving offset -- issue #142).
     #[arg(long, default_value = "cat")]
     kv_append: String,
+
+    /// KV cache element width: `off` (the f16 default), `int8` or `int4`
+    /// (issue #218, `DESIGN.md` §10.7).
+    ///
+    /// **A moved digest is EXPECTED on this axis and is not itself the
+    /// finding.** Quantization is a real precision loss rather than a
+    /// reordering, so what is owed is the ulp delta's **magnitude** and its
+    /// **growth slope** against §10.7a's ladder, per §2.3.3c's tier-2
+    /// sub-distinction. Magnitude is primary: #128's defect ratio is 0.787, so
+    /// reading growth first would have called a real defect benign.
+    #[arg(long, default_value = "off")]
+    kv_quant: String,
 
     /// How decode writes conv state: `shuffle` (§6.1's `narrow` + `Tensor::cat`,
     /// the default), `ring[:K[:slack]]` (the sliding window, §10.2e) or
@@ -2497,6 +2530,11 @@ fn main() -> Result<()> {
         "in-place" => candle_transformers::models::lfm2::KvAppend::InPlace,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
+
+    // Refused rather than defaulted, for `--kv-append`'s reason: an
+    // unrecognized value silently pinning the default would report the f16
+    // arm's digest under a quantized arm's name -- #69's vacuous run (§2.4).
+    config.kv_quant = KvQuant::parse(&args.kv_quant).map_err(anyhow::Error::msg)?;
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;

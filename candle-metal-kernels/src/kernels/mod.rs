@@ -59,8 +59,9 @@ pub use params::{
     ConvTranspose1dParams, ConvTranspose2dParams, Copy2dParams, GatherParams, GemvParams,
     Im2col1dParams, Im2colParams, IndexAddParams, IndexParams, LayoutDescriptor, LayoutFamily,
     NormParams, ParamStyle, Pool2dParams, ReduceParams, RopeIParams, RopeParams, RopeThdParams,
-    ScaleParams, ScaleStridedParams, ScatterParams, SoftmaxParams, UnaryParams, UnaryStridedParams,
-    UpsampleBilinear2dParams, UpsampleNearest2dParams,
+    ScaleParams, ScaleStridedParams, ScatterParams, SdpaQuantParams, SdpaQuantWriteParams,
+    SoftmaxParams, UnaryParams, UnaryStridedParams, UpsampleBilinear2dParams,
+    UpsampleNearest2dParams,
 };
 pub use quantized::{
     call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,
@@ -68,7 +69,10 @@ pub use quantized::{
 pub use random::*;
 pub use reduce::*;
 pub use reduce_names::ReduceKernel;
-pub use sdpa::{call_sdpa_full, call_sdpa_vector, call_sdpa_vector_2pass, SdpaDType};
+pub use sdpa::{
+    call_dequantize_kv, call_quantize_kv, call_sdpa_full, call_sdpa_vector, call_sdpa_vector_2pass,
+    call_sdpa_vector_quant, quantize_group_reference, KvQuantBits, SdpaDType,
+};
 pub use sort::{call_arg_sort, call_mlx_arg_sort};
 pub use ternary::call_where_cond;
 pub use unary::*;

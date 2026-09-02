@@ -58,14 +58,11 @@ mod sha256;
 use anyhow::{Context, Result};
 use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, IndexOp, Tensor};
+use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
+use candle_nn::ops::KvQuant;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{
-    AttnImpl, Cache, ConvState, KvAppend, Model,
-};
-use candle_examples::lfm2_setup::{
-    default_model_dir, parse_config, tensor_names, weight_files,
-};
+use candle_transformers::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
 use clap::Parser;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -313,6 +310,21 @@ struct Args {
     /// canonical generic pair.
     #[arg(long, default_value = "cat")]
     kv_append: String,
+
+    /// KV cache element width: `off` (the f16 default), `int8` or `int4`
+    /// (issue #218, `DESIGN.md` §10.7).
+    ///
+    /// **A moved digest is EXPECTED on this axis and is not itself the
+    /// finding** -- quantization is not a reordering, it is a real precision
+    /// loss, so §2.3.5a's dichotomy does not apply unchanged and §2.3.3c's
+    /// tier-2 sub-distinction does: what is owed is the **magnitude** of the
+    /// ulp delta and its **growth slope**, against the ladder in §10.7a
+    /// (FlashDecoding 1.50, `RotatingRing` 2.75, `MathMode` 3.50 f16 ulp,
+    /// against #128's known defect at 1840.06). Magnitude is the primary
+    /// reading: #128's defect ratio is 0.787, so growth alone would have called
+    /// a real defect benign.
+    #[arg(long, default_value = "off")]
+    kv_quant: String,
 
     /// How decode writes conv state: `shuffle` (the default, §6.1's
     /// `narrow` + `Tensor::cat`), `ring[:K[:slack]]` (the sliding window,
@@ -607,6 +619,12 @@ fn main() -> Result<()> {
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
     println!("kv append: {:?}", config.kv_append);
+
+    // Refused rather than defaulted, for `--kv-append`'s reason: an
+    // unrecognized value that silently pinned the default would report the f16
+    // arm's digest under a quantized arm's name, which is #69's vacuous run.
+    config.kv_quant = KvQuant::parse(&args.kv_quant).map_err(anyhow::Error::msg)?;
+    println!("kv quant: {:?}", config.kv_quant);
 
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     println!("conv state: {:?}", config.conv_state);

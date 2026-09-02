@@ -1326,6 +1326,519 @@ pub fn sdpa(
     )
 }
 
+/// Which width a quantized KV cache stores its codes at, or `Off`
+/// (`DESIGN.md` §10.7, §17 Phase 5 item 18, issue #218).
+///
+/// **A backend-neutral declaration converted at the metal boundary**, which is
+/// `FlashScratchSizing`'s shape and for its reason: this enum is compiled on
+/// every backend, so naming `candle_metal_kernels::KvQuantBits` here would put
+/// a metal-only type in a struct CPU and CUDA builds construct, and §14.1's
+/// *"must not break other backends"* is a hard constraint rather than a
+/// preference.
+///
+/// **The default is `Off` and nothing here flips it** (§7.1a): every axis this
+/// project has added defaults to the arm that shipped, and this one has no old
+/// path to be conservative against other than not existing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvQuant {
+    /// The f16 cache. What ships, and what every recorded digest belongs to.
+    #[default]
+    Off,
+    /// 8-bit codes, one byte per element.
+    Int8,
+    /// 4-bit codes, two elements per byte.
+    Int4,
+}
+
+impl KvQuant {
+    /// Every arm, for a harness and for exhaustive tests (`Sizing::ALL`'s
+    /// argument, #58 / §11.3i).
+    pub const ALL: [KvQuant; 3] = [KvQuant::Off, KvQuant::Int8, KvQuant::Int4];
+
+    /// The arm's name, rendered from the resolved enum through an exhaustive
+    /// `match` -- #241's rule, after a two-armed conditional over a three-armed
+    /// axis mislabelled every `RESULT` line since #116.
+    pub fn name(self) -> &'static str {
+        match self {
+            KvQuant::Off => "Off",
+            KvQuant::Int8 => "Int8",
+            KvQuant::Int4 => "Int4",
+        }
+    }
+
+    /// Parse an arm from a flag value.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "off" | "f16" => Ok(KvQuant::Off),
+            "int8" | "8" => Ok(KvQuant::Int8),
+            "int4" | "4" => Ok(KvQuant::Int4),
+            other => candle::bail!("unknown kv-quant {other:?}; expected off, int8 or int4"),
+        }
+    }
+
+    /// Whether this arm stores codes at all.
+    pub fn is_on(self) -> bool {
+        !matches!(self, KvQuant::Off)
+    }
+
+    /// Bits per code, or `None` on the `Off` arm.
+    pub fn bits(self) -> Option<usize> {
+        match self {
+            KvQuant::Off => None,
+            KvQuant::Int8 => Some(8),
+            KvQuant::Int4 => Some(4),
+        }
+    }
+
+    /// Bytes a code plane of `n` elements occupies, or `None` on `Off`.
+    ///
+    /// **The backend-neutral copy of `KvQuantBits::code_bytes`**, because a
+    /// `Cache` sizes its planes on every backend while the kernel constant is
+    /// metal-only. `kv_quant_code_bytes_agree_across_the_boundary` asserts the
+    /// two are the same function, which is §8.1b's checked-registry argument at
+    /// the smallest possible scale -- the same shape
+    /// `MemoryBudget::DEFAULT_FRACTION` uses for its duplicated constant.
+    pub fn code_bytes(self, n: usize) -> Option<usize> {
+        match self {
+            KvQuant::Off => None,
+            KvQuant::Int8 => Some(n),
+            KvQuant::Int4 => {
+                debug_assert_eq!(n % 2, 0, "an int4 plane needs an even code count");
+                Some(n / 2)
+            }
+        }
+    }
+
+    /// The metal-side width this names.
+    ///
+    /// Exhaustive by construction, so an arm added to one enum and not the
+    /// other is a compile error rather than a silently unreachable width
+    /// (#58's mechanism, and #241's finding).
+    #[cfg(feature = "metal")]
+    fn to_metal(self) -> Option<candle_metal_kernels::KvQuantBits> {
+        match self {
+            KvQuant::Off => None,
+            KvQuant::Int8 => Some(candle_metal_kernels::KvQuantBits::Eight),
+            KvQuant::Int4 => Some(candle_metal_kernels::KvQuantBits::Four),
+        }
+    }
+}
+
+/// Quantize `src` into a caller-owned code plane and scale/bias planes
+/// (issue #218).
+///
+/// `src` is `[B, H, seq, D]` contiguous. The planes are written at
+/// `dst_offset` tokens in, which is the destination slot's live length before
+/// this append -- so a `seq > 1` prefill and a one-token decode step are the
+/// same call, exactly as §6.2b's in-place append is.
+///
+/// **Writes through to the caller's tensors rather than returning new ones.**
+/// The planes are allocated once at capacity and written at a moving offset,
+/// which is what preserves §6.2b's stable buffer identity -- returning fresh
+/// tensors per token would put back the reallocation that section removed.
+///
+/// Metal only, `head_dim` 64 or 128, f16 or f32. Every other case is an
+/// **error rather than a fallback**, per `flash_decoding`'s rule: a silent
+/// fallback is what makes an A/B arm measure the wrong thing (§2.4).
+pub fn quantize_kv_into(
+    src: &Tensor,
+    codes: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    capacity: usize,
+    dst_offset: usize,
+    quant: KvQuant,
+) -> Result<()> {
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (src, codes, scales, biases, capacity, dst_offset, quant);
+        candle::bail!("quantize_kv has no cpu impl (issue #218)")
+    }
+    #[cfg(feature = "metal")]
+    {
+        use candle::backend::BackendStorage;
+        use candle_metal_kernels::SdpaDType;
+
+        let bits = match quant.to_metal() {
+            Some(b) => b,
+            None => candle::bail!("quantize_kv_into called on the Off arm (issue #218)"),
+        };
+
+        let (_b, n_heads, seq_len, head_dim) = src.dims4()?;
+        let itype = match src.dtype() {
+            DType::F16 => SdpaDType::F16,
+            DType::F32 => SdpaDType::F32,
+            other => candle::bail!("quantize_kv: unsupported dtype {other:?}"),
+        };
+
+        let (src_s, src_l) = src.storage_and_layout();
+        let src_s = match &*src_s {
+            candle::Storage::Metal(s) => s,
+            _ => candle::bail!("quantize_kv expects a metal device"),
+        };
+        let (codes_s, _) = codes.storage_and_layout();
+        let codes_s = match &*codes_s {
+            candle::Storage::Metal(s) => s,
+            _ => candle::bail!("quantize_kv expects a metal device"),
+        };
+        let (scales_s, _) = scales.storage_and_layout();
+        let scales_s = match &*scales_s {
+            candle::Storage::Metal(s) => s,
+            _ => candle::bail!("quantize_kv expects a metal device"),
+        };
+        let (biases_s, _) = biases.storage_and_layout();
+        let biases_s = match &*biases_s {
+            candle::Storage::Metal(s) => s,
+            _ => candle::bail!("quantize_kv expects a metal device"),
+        };
+        let device = src_s.device();
+
+        // **The struct is built through its own type, never hand-packed.** Field
+        // offsets and the byte/element unit split are what
+        // `every_family_params_layout_matches_metal` pins; a caller assembling the
+        // bytes itself would be outside that check, which is the failure §11.3k
+        // records — a field at the wrong offset reads a well-formed number from the
+        // wrong place and computes a plausible wrong answer.
+        let wp = candle_metal_kernels::SdpaQuantWriteParams::for_append(
+            seq_len * head_dim,
+            capacity,
+            head_dim,
+            dst_offset,
+            bits,
+        );
+        let params_buf = device.new_buffer_with_data(&[wp])?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("quantize_kv");
+
+        candle_metal_kernels::call_quantize_kv(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            src_l.start_offset() * src.dtype().size_in_bytes(),
+            src_s.buffer(),
+            codes_s.buffer(),
+            scales_s.buffer(),
+            biases_s.buffer(),
+            &params_buf,
+            n_heads,
+            seq_len,
+            head_dim,
+            bits,
+            itype,
+        )
+        .map_err(candle::Error::wrap)?;
+        Ok(())
+    }
+}
+
+/// Read a quantized KV cache back as a dense tensor (issue #218).
+///
+/// **What the prefill path needs.** A turn boundary re-prefills onto the
+/// accumulated cache (§2.3.8d, §10.9) and must attend over the whole `kv_len`
+/// -- the causal mask is `[seq_len, index_pos + seq_len]` by construction --
+/// while a quantized `seq_len > 1` kernel is out of scope (§17 item 18 scopes
+/// this to the decode path). So the cache stays quantized and prefill reads it
+/// back; the decode steps that follow read codes directly, which is where the
+/// mechanism pays.
+struct DequantizeKv {
+    scales: Tensor,
+    biases: Tensor,
+    b_sz: usize,
+    n_heads: usize,
+    n_tokens: usize,
+    head_dim: usize,
+    capacity: usize,
+    dtype: DType,
+    quant: KvQuant,
+}
+
+impl candle::CustomOp1 for DequantizeKv {
+    fn name(&self) -> &'static str {
+        "metal-dequantize-kv"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("dequantize_kv has no cpu impl (issue #218)")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        codes: &candle::MetalStorage,
+        _l: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle_metal_kernels::SdpaDType;
+
+        let bits = match self.quant.to_metal() {
+            Some(b) => b,
+            None => candle::bail!("dequantize_kv reached on the Off arm (issue #218)"),
+        };
+        let itype = match self.dtype {
+            DType::F16 => SdpaDType::F16,
+            DType::F32 => SdpaDType::F32,
+            other => candle::bail!("dequantize_kv: unsupported dtype {other:?}"),
+        };
+
+        let (scales_s, _sl) = self.scales.storage_and_layout();
+        let (biases_s, _bl) = self.biases.storage_and_layout();
+        let scales_m = match &*scales_s {
+            candle::Storage::Metal(m) => m,
+            _ => candle::bail!("dequantize_kv expects a metal scales plane"),
+        };
+        let biases_m = match &*biases_s {
+            candle::Storage::Metal(m) => m,
+            _ => candle::bail!("dequantize_kv expects a metal biases plane"),
+        };
+
+        let device = codes.device();
+        let elem_count = self.b_sz * self.n_heads * self.n_tokens * self.head_dim;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, self.dtype)
+            .with_label("dequantize_kv_o")
+            .build()?;
+
+        // `src_head_stride` carries the DESTINATION head stride here, because
+        // the direction is reversed. The struct is shared with the write path
+        // and its layout is pinned by
+        // `every_family_params_layout_matches_metal`, so the field is reused
+        // rather than a near-duplicate struct minted -- and it is named at both
+        // ends rather than left to be inferred from the call.
+        let wp = candle_metal_kernels::SdpaQuantWriteParams::for_append(
+            self.n_tokens * self.head_dim,
+            self.capacity,
+            self.head_dim,
+            0,
+            bits,
+        );
+        let params_buf = device.new_buffer_with_data(&[wp])?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("dequantize_kv");
+        candle_metal_kernels::call_dequantize_kv(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            codes.buffer(),
+            scales_m.buffer(),
+            biases_m.buffer(),
+            &output,
+            &params_buf,
+            self.b_sz * self.n_heads,
+            self.n_tokens,
+            self.head_dim,
+            bits,
+            itype,
+        )
+        .map_err(candle::Error::wrap)?;
+
+        let storage = candle::MetalStorage::new(output, device.clone(), elem_count, self.dtype);
+        Ok((
+            storage,
+            Shape::from_dims(&[self.b_sz, self.n_heads, self.n_tokens, self.head_dim]),
+        ))
+    }
+}
+
+/// Read a quantized KV cache back as `[b, h, n_tokens, d]` at `dtype`.
+#[allow(clippy::too_many_arguments)]
+pub fn dequantize_kv(
+    codes: &Tensor,
+    scales: &Tensor,
+    biases: &Tensor,
+    b_sz: usize,
+    n_heads: usize,
+    n_tokens: usize,
+    head_dim: usize,
+    capacity: usize,
+    dtype: DType,
+    quant: KvQuant,
+) -> Result<Tensor> {
+    codes.apply_op1_no_bwd(&DequantizeKv {
+        scales: scales.clone(),
+        biases: biases.clone(),
+        b_sz,
+        n_heads,
+        n_tokens,
+        head_dim,
+        capacity,
+        dtype,
+        quant,
+    })
+}
+
+/// Attention over a quantized KV cache (issue #218).
+///
+/// The six planes are captured rather than passed as operands, which is
+/// `Sdpa`'s own shape for its `mask`: `CustomOp3` takes three tensors and this
+/// path reads seven, so the alternative would be a new op arity for one caller.
+#[allow(dead_code)]
+struct SdpaQuant {
+    k_codes: Tensor,
+    k_scales: Tensor,
+    k_biases: Tensor,
+    v_codes: Tensor,
+    v_scales: Tensor,
+    v_biases: Tensor,
+    /// The read params, built through `SdpaQuantParams::for_step` at the call
+    /// site rather than hand-packed -- §11.3k's layout check only covers the
+    /// struct, so a caller assembling the bytes is outside it.
+    gqa_factor: usize,
+    n: usize,
+    capacity: usize,
+    scale: f32,
+    softcapping: f32,
+    quant: KvQuant,
+}
+
+impl candle::CustomOp1 for SdpaQuant {
+    fn name(&self) -> &'static str {
+        "metal-sdpa-quant"
+    }
+
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle::bail!("sdpa_quant has no cpu impl (issue #218)")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        q: &candle::MetalStorage,
+        q_l: &Layout,
+    ) -> Result<(candle::MetalStorage, Shape)> {
+        use candle::backend::BackendStorage;
+        use candle_metal_kernels::SdpaDType;
+
+        let bits = match self.quant.to_metal() {
+            Some(b) => b,
+            None => candle::bail!("sdpa_quant reached on the Off arm (issue #218)"),
+        };
+        let itype = match q.dtype() {
+            DType::F16 => SdpaDType::F16,
+            DType::F32 => SdpaDType::F32,
+            other => candle::bail!("sdpa_quant: unsupported dtype {other:?}"),
+        };
+        // `seq_len == 1` only, like `sdpa_vector` itself: the kernel is a
+        // vector kernel and a `seq > 1` request must be an error rather than a
+        // silent fallback (§2.4, and `flash_decoding`'s own rule).
+        if q_l.dim(2)? != 1 {
+            candle::bail!(
+                "sdpa_quant is a decode kernel: q seq must be 1, got {}",
+                q_l.dim(2)?
+            );
+        }
+
+        let device = q.device();
+        let out_dims = q_l.dims().to_vec();
+        let elem_count: usize = out_dims.iter().product();
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, q.dtype())
+            .with_label("sdpa_quant_o")
+            .build()?;
+
+        // The guards are bound to locals and held for the whole encode: a
+        // `storage_and_layout()` temporary dropped at the end of its statement
+        // would release the lock while the buffer it yielded is still being
+        // bound, which is the shape §6.3b's whole argument is about at the GPU
+        // clock and is just as wrong at the host one.
+        let (kc_s, _kc_l) = self.k_codes.storage_and_layout();
+        let (ks_s, _ks_l) = self.k_scales.storage_and_layout();
+        let (kb_s, _kb_l) = self.k_biases.storage_and_layout();
+        let (vc_s, _vc_l) = self.v_codes.storage_and_layout();
+        let (vs_s, _vs_l) = self.v_scales.storage_and_layout();
+        let (vb_s, _vb_l) = self.v_biases.storage_and_layout();
+
+        fn metal_buf<'a>(s: &'a candle::Storage, what: &str) -> Result<&'a candle::MetalStorage> {
+            match s {
+                candle::Storage::Metal(m) => Ok(m),
+                _ => candle::bail!("sdpa_quant expects a metal {what} plane"),
+            }
+        }
+        let kc = metal_buf(&kc_s, "k_codes")?;
+        let ks = metal_buf(&ks_s, "k_scales")?;
+        let kb = metal_buf(&kb_s, "k_biases")?;
+        let vc = metal_buf(&vc_s, "v_codes")?;
+        let vs = metal_buf(&vs_s, "v_scales")?;
+        let vb = metal_buf(&vb_s, "v_biases")?;
+
+        let sp = candle_metal_kernels::SdpaQuantParams::for_step(
+            self.gqa_factor,
+            self.n,
+            self.capacity,
+            q_l.dim(3)?,
+            self.scale,
+            self.softcapping,
+            bits,
+        );
+        let params_buf = device.new_buffer_with_data(&[sp])?;
+
+        let encoder = device.command_encoder()?;
+        encoder.set_label("sdpa_quant");
+
+        candle_metal_kernels::call_sdpa_vector_quant(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            q_l.start_offset() * q.dtype().size_in_bytes(),
+            q_l.dims(),
+            q.buffer(),
+            kc.buffer(),
+            ks.buffer(),
+            kb.buffer(),
+            vc.buffer(),
+            vs.buffer(),
+            vb.buffer(),
+            &output,
+            &params_buf,
+            bits,
+            itype,
+        )
+        .map_err(candle::Error::wrap)?;
+
+        let newstorage = candle::MetalStorage::new(output, device.clone(), elem_count, q.dtype());
+        Ok((newstorage, Shape::from_dims(&out_dims)))
+    }
+}
+
+/// Attention over a quantized KV cache (issue #218, `DESIGN.md` §10.7).
+///
+/// `q` is `[B, H_q, 1, D]`; the planes are the caller's, written by
+/// [`quantize_kv_into`]. Returns `[B, H_q, 1, D]`.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_quant(
+    q: &Tensor,
+    k_codes: &Tensor,
+    k_scales: &Tensor,
+    k_biases: &Tensor,
+    v_codes: &Tensor,
+    v_scales: &Tensor,
+    v_biases: &Tensor,
+    gqa_factor: usize,
+    n: usize,
+    capacity: usize,
+    scale: f32,
+    softcapping: f32,
+    quant: KvQuant,
+) -> Result<Tensor> {
+    q.apply_op1_no_bwd(&SdpaQuant {
+        k_codes: k_codes.clone(),
+        k_scales: k_scales.clone(),
+        k_biases: k_biases.clone(),
+        v_codes: v_codes.clone(),
+        v_scales: v_scales.clone(),
+        v_biases: v_biases.clone(),
+        gqa_factor,
+        n,
+        capacity,
+        scale,
+        softcapping,
+        quant,
+    })
+}
+
 /// How FlashDecoding sizes the scratch class it allocates (`DESIGN.md` §9.1a,
 /// issue #234).
 ///

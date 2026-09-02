@@ -1,5 +1,6 @@
 use crate::kernels::params::{
-    begin_packed_params, finish_packed_params, ParamStyle, SdpaVectorParams,
+    begin_packed_params, finish_packed_params, ParamStyle, SdpaQuantParams, SdpaQuantWriteParams,
+    SdpaVectorParams,
 };
 use crate::utils::EncoderProvider;
 use crate::{
@@ -490,6 +491,423 @@ pub fn call_sdpa_vector_with(
     };
     encoder.dispatch_thread_groups(grid_dims, group_dims);
     Ok(())
+}
+
+/// The bit width a quantized KV plane stores its codes at (issue #218).
+///
+/// Two arms rather than a `bits: usize`, so an unsupported width is a compile
+/// error at the call site rather than a runtime `bail!` — #58's mechanism, and
+/// the one #241 found missing when a two-armed conditional rendered a
+/// three-armed axis.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum KvQuantBits {
+    /// 8 bits per code, one byte per element.
+    Eight,
+    /// 4 bits per code, two elements per byte, low nibble first.
+    Four,
+}
+
+impl KvQuantBits {
+    /// Every arm, for exhaustive tests and a harness flag (`Sizing::ALL`'s
+    /// argument, #58 / §11.3i).
+    pub const ALL: [KvQuantBits; 2] = [KvQuantBits::Eight, KvQuantBits::Four];
+
+    /// Bits per code.
+    pub fn bits(self) -> usize {
+        match self {
+            KvQuantBits::Eight => 8,
+            KvQuantBits::Four => 4,
+        }
+    }
+
+    /// The arm's name, as a kernel name and a `RESULT` line spell it.
+    pub fn name(self) -> &'static str {
+        match self {
+            KvQuantBits::Eight => "8",
+            KvQuantBits::Four => "4",
+        }
+    }
+
+    /// Bytes a code plane of `n` elements occupies at this width.
+    ///
+    /// **The one place this arithmetic lives.** The kernel computes the same
+    /// quantity with `sdpa_code_bytes<BITS>`, and
+    /// `kv_quant_code_bytes_matches_the_kernel` is what keeps the two honest —
+    /// an off-by-one here is a plane that overlaps its neighbour, which is
+    /// §3.5's silent-wrong-answer class rather than a crash.
+    pub fn code_bytes(self, n: usize) -> usize {
+        match self {
+            KvQuantBits::Eight => n,
+            // Callers pass whole head vectors, so `n` is a multiple of
+            // `head_dim` (64 or 128) and this division is exact. Asserted
+            // rather than assumed because a half-byte tail would silently
+            // truncate the last code.
+            KvQuantBits::Four => {
+                debug_assert_eq!(n % 2, 0, "an int4 plane needs an even code count");
+                n / 2
+            }
+        }
+    }
+
+    /// The number of distinct codes, as the affine range divides by.
+    pub fn levels(self) -> f32 {
+        match self {
+            KvQuantBits::Eight => 255.0,
+            KvQuantBits::Four => 15.0,
+        }
+    }
+}
+
+impl SdpaQuantWriteParams {
+    /// The fields for one append, computed in one place.
+    ///
+    /// `FlashPartialParams::for_step`'s shape and for its reason: a caller that
+    /// computed these itself could compute them differently from the tests, and
+    /// the units differ per field (`code_head_stride` is **bytes**, the other
+    /// two are **elements**), which is exactly where that goes wrong.
+    ///
+    /// `capacity` is the slot's token capacity, not its live length: the planes
+    /// are allocated once at capacity, so a head's stride does not move as the
+    /// cache fills — §6.2b's stable buffer identity, preserved at a narrower
+    /// element.
+    pub fn for_append(
+        src_head_stride: usize,
+        capacity: usize,
+        head_dim: usize,
+        dst_offset: usize,
+        bits: KvQuantBits,
+    ) -> Self {
+        Self {
+            src_head_stride: src_head_stride as u64,
+            code_head_stride: bits.code_bytes(capacity * head_dim) as u64,
+            scale_head_stride: capacity as u64,
+            dst_offset: dst_offset as i32,
+            pad: 0,
+        }
+    }
+}
+
+impl SdpaQuantParams {
+    /// The fields for one decode step's attention, computed in one place.
+    ///
+    /// K and V share a geometry here — both are `[B, H, capacity, D]` planes
+    /// of the same slot — so the two stride pairs are equal by construction on
+    /// this path. **They are still separate fields**, because the kernel reads
+    /// four and a struct that folded them would make a transposition
+    /// unobservable, which is #81 finding 3's condition restated: the parity
+    /// arm can only see a swap of fields that differ in value, and the layout
+    /// check can only see a swap of fields that exist.
+    pub fn for_step(
+        gqa_factor: usize,
+        n: usize,
+        capacity: usize,
+        head_dim: usize,
+        scale: f32,
+        softcapping: f32,
+        bits: KvQuantBits,
+    ) -> Self {
+        let code_stride = bits.code_bytes(capacity * head_dim) as u64;
+        Self {
+            gqa_factor: gqa_factor as i32,
+            n: n as i32,
+            k_code_stride: code_stride,
+            v_code_stride: code_stride,
+            k_scale_stride: capacity as u64,
+            v_scale_stride: capacity as u64,
+            scale,
+            softcapping,
+        }
+    }
+}
+
+/// Quantize one append's worth of K or V into a code plane and a scale plane
+/// (issue #218, `DESIGN.md` §10.7).
+///
+/// `src` is `[B, H, seq, D]` contiguous — one token at decode, `P` at a
+/// prefill — and is written at `dst_offset` in the destination planes, which is
+/// the slot's live length before this append (§6.2b's moving offset, at a
+/// narrower element).
+///
+/// **One threadgroup per (head, token), 32 threads.** The group is the head
+/// vector (§16 #6), so the min/max is one `simd_min`/`simd_max` — §2.3.3 #3's
+/// fixed simdgroup tree, which #265 records as the rule whose cost is
+/// structurally zero.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantize_kv(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    src_offset: usize,
+    src_buffer: &Buffer,
+    codes: &Buffer,
+    scales: &Buffer,
+    biases: &Buffer,
+    params: &Buffer,
+    n_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    bits: KvQuantBits,
+    itype: SdpaDType,
+) -> Result<(), MetalKernelError> {
+    let itype_repr = match itype {
+        SdpaDType::F16 => "float16_t",
+        SdpaDType::F32 => "float",
+        SdpaDType::BF16 => {
+            return Err(MetalKernelError::SdpaHeadSizeMismatch {
+                variation: "quantize_kv (bf16 not instantiated)",
+                got: head_dim,
+                expected: vec![64, 128],
+            })
+        }
+    };
+    if head_dim != 64 && head_dim != 128 {
+        return Err(MetalKernelError::SdpaHeadSizeMismatch {
+            variation: "quantize_kv",
+            got: head_dim,
+            expected: vec![64, 128],
+        });
+    }
+    let name = format!("quantize_kv_{itype_repr}_{head_dim}_{}", bits.name());
+
+    let pipeline = kernels.load_pipeline(device, Source::Sdpa, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "quantize_kv hd={head_dim} bits={} heads={n_heads} seq={seq_len}",
+        bits.name()
+    );
+
+    set_params!(
+        encoder,
+        (
+            (src_buffer, src_offset),
+            Output::new(codes),
+            Output::new(scales),
+            Output::new(biases),
+            params
+        )
+    );
+
+    let grid_dims = MTLSize {
+        width: n_heads,
+        height: seq_len,
+        depth: 1,
+    };
+    // 32 threads: one simdgroup owns one head vector, which is what makes the
+    // range reduction a `simd_min`/`simd_max` with no threadgroup memory.
+    let group_dims = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(grid_dims, group_dims);
+    Ok(())
+}
+
+/// Read a quantized KV plane back as `T` (issue #218).
+///
+/// **What the prefill path needs.** A turn boundary re-prefills onto the
+/// accumulated cache (§2.3.8d, §10.9), so a `seq_len > 1` pass must attend over
+/// the whole `kv_len` -- the causal mask is `[seq_len, index_pos + seq_len]`.
+/// A quantized `seq_len > 1` kernel is out of scope (§17 item 18 scopes this to
+/// decode), so the cache stays quantized and prefill dequantizes it; the decode
+/// steps that follow read codes directly, which is where the mechanism pays.
+///
+/// `n_tokens` is the LIVE length, so this reads the region that has been
+/// written and not the whole capacity.
+#[allow(clippy::too_many_arguments)]
+pub fn call_dequantize_kv(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    codes: &Buffer,
+    scales: &Buffer,
+    biases: &Buffer,
+    output: &Buffer,
+    params: &Buffer,
+    n_heads: usize,
+    n_tokens: usize,
+    head_dim: usize,
+    bits: KvQuantBits,
+    itype: SdpaDType,
+) -> Result<(), MetalKernelError> {
+    let itype_repr = match itype {
+        SdpaDType::F16 => "float16_t",
+        SdpaDType::F32 => "float",
+        SdpaDType::BF16 => {
+            return Err(MetalKernelError::SdpaHeadSizeMismatch {
+                variation: "dequantize_kv (bf16 not instantiated)",
+                got: head_dim,
+                expected: vec![64, 128],
+            })
+        }
+    };
+    if head_dim != 64 && head_dim != 128 {
+        return Err(MetalKernelError::SdpaHeadSizeMismatch {
+            variation: "dequantize_kv",
+            got: head_dim,
+            expected: vec![64, 128],
+        });
+    }
+    let name = format!("dequantize_kv_{itype_repr}_{head_dim}_{}", bits.name());
+
+    let pipeline = kernels.load_pipeline(device, Source::Sdpa, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "dequantize_kv hd={head_dim} bits={} heads={n_heads} n={n_tokens}",
+        bits.name()
+    );
+
+    set_params!(
+        encoder,
+        (codes, scales, biases, Output::new(output), params)
+    );
+
+    let grid_dims = MTLSize {
+        width: n_heads,
+        height: n_tokens,
+        depth: 1,
+    };
+    let group_dims = MTLSize {
+        width: 32,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(grid_dims, group_dims);
+    Ok(())
+}
+
+/// Attention over a quantized KV cache (issue #218, `DESIGN.md` §10.7).
+///
+/// The dispatch geometry is `call_sdpa_vector`'s exactly — one threadgroup per
+/// (batch × q head), 1024 threads — because the kernel body is that kernel's
+/// with the loads replaced. See the note in
+/// `scaled_dot_product_attention.metal` for why the dequant is per element.
+#[allow(clippy::too_many_arguments)]
+pub fn call_sdpa_vector_quant(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    q_offset: usize,
+    q_shape: &[usize],
+    q_buffer: &Buffer,
+    k_codes: &Buffer,
+    k_scales: &Buffer,
+    k_biases: &Buffer,
+    v_codes: &Buffer,
+    v_scales: &Buffer,
+    v_biases: &Buffer,
+    output: &Buffer,
+    params: &Buffer,
+    bits: KvQuantBits,
+    itype: SdpaDType,
+) -> Result<(), MetalKernelError> {
+    let head_dim = *q_shape.last().unwrap();
+    let itype_repr = match itype {
+        SdpaDType::F16 => "float16_t",
+        SdpaDType::F32 => "float",
+        SdpaDType::BF16 => {
+            return Err(MetalKernelError::SdpaHeadSizeMismatch {
+                variation: "sdpa_vector_quant (bf16 not instantiated)",
+                got: head_dim,
+                expected: vec![64, 128],
+            })
+        }
+    };
+    if head_dim != 64 && head_dim != 128 {
+        return Err(MetalKernelError::SdpaHeadSizeMismatch {
+            variation: "sdpa_vector_quant",
+            got: head_dim,
+            expected: vec![64, 128],
+        });
+    }
+    let name = format!("sdpa_vector_quant_{itype_repr}_{head_dim}_{}", bits.name());
+
+    let b = q_shape[0] * q_shape[1];
+    let pipeline = kernels.load_pipeline(device, Source::Sdpa, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "sdpa_vector_quant hd={head_dim} bits={} B={b}",
+        bits.name()
+    );
+
+    set_params!(
+        encoder,
+        (
+            (q_buffer, q_offset),
+            k_codes,
+            k_scales,
+            k_biases,
+            v_codes,
+            v_scales,
+            v_biases,
+            Output::new(output),
+            params
+        )
+    );
+
+    let grid_dims = MTLSize {
+        width: 1,
+        height: b,
+        depth: 1,
+    };
+    let group_dims = MTLSize {
+        width: 1024,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(grid_dims, group_dims);
+    Ok(())
+}
+
+/// The CPU reference for one quantize-then-dequantize round trip.
+///
+/// **This is the parity reference and it is deliberately scalar.** It mirrors
+/// `quantize_kv`'s arithmetic exactly, including the part that is easy to get
+/// wrong: the codes are chosen against the scale **as f16 will store it**, not
+/// against the f32 scale that computed the range. The kernel does the same
+/// (`enc_scale`), and a reference that skipped it would disagree with a correct
+/// kernel by one code on roughly half the groups.
+///
+/// Returns `(codes, scale, bias)` for one group of `n` values.
+pub fn quantize_group_reference(
+    values: &[f32],
+    bits: KvQuantBits,
+    // How the scale and bias are rounded for storage. `f16` for the shipping
+    // path; the parameter exists so the f32 instantiation can be tested with
+    // its own rounding rather than inheriting f16's.
+    round: impl Fn(f32) -> f32,
+) -> (Vec<u8>, f32, f32) {
+    let levels = bits.levels();
+    let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
+    let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let range = hi - lo;
+    let scale = if range > 0.0 { range / levels } else { 0.0 };
+
+    let enc_scale = round(scale);
+    let enc_bias = round(lo);
+    let enc_inv = if enc_scale > 0.0 {
+        1.0 / enc_scale
+    } else {
+        0.0
+    };
+
+    let codes: Vec<u8> = values
+        .iter()
+        .map(|&v| {
+            let t = ((v - enc_bias) * enc_inv).round_ties_even();
+            t.clamp(0.0, levels) as u8
+        })
+        .collect();
+    (codes, enc_scale, enc_bias)
 }
 
 pub const SDPA_2PASS_BLOCKS: usize = 32;

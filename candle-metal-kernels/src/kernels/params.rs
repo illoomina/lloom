@@ -866,6 +866,119 @@ pub fn expected_sdpa_layout() -> Vec<(&'static str, u32)> {
     ]
 }
 
+/// Scalars bound by `sdpa_vector_quant` — the quantized-KV read path
+/// (`DESIGN.md` §10.7, §17 Phase 5 item 18, issue #218).
+///
+/// **The two stride pairs are in different units and that is the trap this
+/// struct is shaped to expose.** `k_code_stride`/`v_code_stride` are per-head
+/// strides of the *code* plane in **bytes** — half a byte per element at int4
+/// — while `k_scale_stride`/`v_scale_stride` are per-head strides of the scale
+/// and bias planes in **elements**. All four are `u64` and all four are read,
+/// which is #81 finding 3's condition for a transposition to be *visible* to a
+/// mutation: swapping any adjacent pair changes what the kernel reads without
+/// changing `sizeof` or failing a brace initializer.
+///
+/// 48 bytes: two `i32` (8), four `u64` starting at 8 (32), two `f32` (8).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SdpaQuantParams {
+    pub gqa_factor: i32,
+    pub n: i32,
+    pub k_code_stride: u64,
+    pub v_code_stride: u64,
+    pub k_scale_stride: u64,
+    pub v_scale_stride: u64,
+    pub scale: f32,
+    pub softcapping: f32,
+}
+
+/// Scalars bound by `quantize_kv` — the quantized-KV write path (issue #218).
+///
+/// `dst_offset` is the slot's live length before this append, which is what
+/// makes a `seq_len > 1` prefill append and a one-token decode append the same
+/// dispatch (`DESIGN.md` §6.2b). `pad` is explicit rather than implicit so the
+/// layout check has a name for it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SdpaQuantWriteParams {
+    pub src_head_stride: u64,
+    pub code_head_stride: u64,
+    pub scale_head_stride: u64,
+    pub dst_offset: i32,
+    pub pad: i32,
+}
+
+/// The kernel reporting the device-side layout of the issue #218 structs.
+pub const SDPA_QUANT_LAYOUT_KERNEL: &str = "sdpa_quant_params_layout";
+
+/// What `sdpa_quant_params_layout` reports, and what Rust computes for it.
+///
+/// Covers **both** issue #218 structs from one kernel, because both live in
+/// `scaled_dot_product_attention.metal` and a kernel can only see structs in
+/// its own compilation unit.
+pub fn expected_sdpa_quant_layout() -> Vec<(&'static str, u32)> {
+    use core::mem::{align_of, offset_of, size_of};
+
+    debug_assert_eq!(align_of::<SdpaQuantParams>(), 8);
+    debug_assert_eq!(align_of::<SdpaQuantWriteParams>(), 8);
+
+    vec![
+        (
+            "sizeof(SdpaQuantParams)",
+            size_of::<SdpaQuantParams>() as u32,
+        ),
+        (
+            "SdpaQuantParams.gqa_factor",
+            offset_of!(SdpaQuantParams, gqa_factor) as u32,
+        ),
+        ("SdpaQuantParams.N", offset_of!(SdpaQuantParams, n) as u32),
+        (
+            "SdpaQuantParams.k_code_stride",
+            offset_of!(SdpaQuantParams, k_code_stride) as u32,
+        ),
+        (
+            "SdpaQuantParams.v_code_stride",
+            offset_of!(SdpaQuantParams, v_code_stride) as u32,
+        ),
+        (
+            "SdpaQuantParams.k_scale_stride",
+            offset_of!(SdpaQuantParams, k_scale_stride) as u32,
+        ),
+        (
+            "SdpaQuantParams.v_scale_stride",
+            offset_of!(SdpaQuantParams, v_scale_stride) as u32,
+        ),
+        (
+            "SdpaQuantParams.scale",
+            offset_of!(SdpaQuantParams, scale) as u32,
+        ),
+        (
+            "SdpaQuantParams.softcapping",
+            offset_of!(SdpaQuantParams, softcapping) as u32,
+        ),
+        (
+            "sizeof(SdpaQuantWriteParams)",
+            size_of::<SdpaQuantWriteParams>() as u32,
+        ),
+        (
+            "SdpaQuantWriteParams.src_head_stride",
+            offset_of!(SdpaQuantWriteParams, src_head_stride) as u32,
+        ),
+        (
+            "SdpaQuantWriteParams.code_head_stride",
+            offset_of!(SdpaQuantWriteParams, code_head_stride) as u32,
+        ),
+        (
+            "SdpaQuantWriteParams.scale_head_stride",
+            offset_of!(SdpaQuantWriteParams, scale_head_stride) as u32,
+        ),
+        (
+            "SdpaQuantWriteParams.dst_offset",
+            offset_of!(SdpaQuantWriteParams, dst_offset) as u32,
+        ),
+    ]
+}
+
 /// `flash_decoding_partial`'s scalars (`DESIGN.md` §10.4, issue #116).
 ///
 /// # Three fields carry decisions rather than values
@@ -1899,6 +2012,15 @@ pub enum LayoutFamily {
     /// reported by one layout kernel: a layout kernel can only see the structs
     /// its own file defines.
     Flash,
+    /// The quantized-KV structs, also in
+    /// `scaled_dot_product_attention.metal` — issue #218. A **second** family
+    /// in one file rather than extra slots on [`LayoutFamily::Sdpa`]: that
+    /// descriptor's `expected` list is what
+    /// `sdpa_params_layout_check_detects_a_moved_field` mutates against, and
+    /// growing it would change what that test's assertion indexes. Two
+    /// descriptors over one source is already the shape `Flash` uses for two
+    /// structs, inverted.
+    SdpaQuant,
 }
 
 /// Everything the layout check needs to know about one family.
@@ -1950,6 +2072,7 @@ impl LayoutFamily {
         LayoutFamily::Indexing,
         LayoutFamily::Sdpa,
         LayoutFamily::Flash,
+        LayoutFamily::SdpaQuant,
     ];
 
     /// The name of the `.metal` file this family lives in, for error messages.
@@ -1965,6 +2088,7 @@ impl LayoutFamily {
             LayoutFamily::Indexing => "indexing.metal",
             LayoutFamily::Sdpa => "scaled_dot_product_attention.metal",
             LayoutFamily::Flash => "flash_decoding.metal",
+            LayoutFamily::SdpaQuant => "scaled_dot_product_attention.metal",
         }
     }
 
@@ -2025,6 +2149,11 @@ impl LayoutFamily {
                 crate::Source::FlashDecoding,
                 FLASH_LAYOUT_KERNEL,
                 expected_flash_layout(),
+            ),
+            LayoutFamily::SdpaQuant => (
+                crate::Source::Sdpa,
+                SDPA_QUANT_LAYOUT_KERNEL,
+                expected_sdpa_quant_layout(),
             ),
         };
         LayoutDescriptor {

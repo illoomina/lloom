@@ -8,7 +8,7 @@
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
 use crate::utils::repeat_kv;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
-use candle_nn::ops::FlashScratchSizing;
+use candle_nn::ops::{FlashScratchSizing, KvQuant};
 use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
 use std::collections::HashMap;
 
@@ -117,6 +117,7 @@ impl Lfm2Config {
             // axis reached it (#234). Not a choice — see the field's note.
             flash_scratch_sizing: FlashScratchSizing::default(),
             kv_append: KvAppend::default(),
+            kv_quant: KvQuant::default(),
             conv_state: ConvState::default(),
             // §9.5's admission is off unless a caller asks for it, per §7.1a.
             memory_budget: None,
@@ -570,6 +571,19 @@ pub struct Config {
     pub flash_scratch_sizing: FlashScratchSizing,
     /// Defaults to `Cat`, for the same reason `attn_impl` defaults to `Generic`.
     pub kv_append: KvAppend,
+    /// Whether the KV cache stores integer codes, and at which width
+    /// (`DESIGN.md` §10.7, issue #218).
+    ///
+    /// **Defaults to `Off`, and this issue does not flip it** (§7.1a): every
+    /// recorded digest in this repository belongs to the f16 arm, and a
+    /// value-changing arm made default would move all of them silently.
+    ///
+    /// A *construction*-tier axis in §7.1's terms, following `KvAppend`'s
+    /// shape: the arms are compiled, the old one is the default, and the A/B is
+    /// one field apart. The bit width reaches the kernel as a template
+    /// parameter (§7.2 — memory layout is compile-tier), but selecting between
+    /// two pre-built instantiations is a pipeline choice.
+    pub kv_quant: KvQuant,
     /// Defaults to `Shuffle`, so every existing caller keeps §6.1's path.
     pub conv_state: ConvState,
     /// `DESIGN.md` §9.5's memory budget. `None` — admission off — by default,
@@ -719,6 +733,156 @@ impl KvSlot {
     }
 }
 
+/// One attention layer's K or V, stored as integer codes plus a (scale, bias)
+/// pair per head vector (`DESIGN.md` §10.7, issue #218).
+///
+/// **The quantized sibling of [`KvSlot`], and it preserves that type's three
+/// properties** (§6.2b): there is no `cat`, the write is constant-size, and the
+/// buffer identity does not change — the planes are allocated once at capacity
+/// and written at a moving offset, exactly as `all_data` is.
+///
+/// # The layout, and why the scales are a separate plane
+///
+/// ```text
+/// codes   [B, H, capacity, D]   u8   (int8: 1 code/elem; int4: 2 codes/byte)
+/// scales  [B, H, capacity]      f16  one per (head, token) — the group IS the
+/// biases  [B, H, capacity]      f16  head vector, since gs == head_dim == 64
+/// ```
+///
+/// §17 item 18(c) and §10.7a: interleaving the scale beside each head vector
+/// breaks `sdpa_vector`'s contiguous walk, which §9.1d records as a
+/// *requirement* rather than a preference — `head_dim × dtype` is one 128 B
+/// cache line at f16, and a dim-outer order scatters a token's vector across 64
+/// lines. A parallel plane preserves it.
+///
+/// # Determinism
+///
+/// A scale is computed once at write time and only read thereafter, so it sits
+/// **outside** the per-token reduction §2.3.3 #1 governs — §16 #6 and §10.7a
+/// both record that **int8 KV needs no determinism variant tier**, and that is
+/// why this type adds no arm to `.bench/configurations.md`'s determinism
+/// column. The digests move because the *values* differ (a tier-2 arm in
+/// §2.3.3c's terms), not because the order does.
+#[derive(Debug, Clone)]
+struct QuantKvSlot {
+    /// `[B, H, capacity, D]` codes, packed. `None` until the first append,
+    /// because the batch size is not known at `Cache::new` — `KvSlot`'s reason.
+    codes: Option<Tensor>,
+    scales: Option<Tensor>,
+    biases: Option<Tensor>,
+    /// The `SdpaQuantParams` block, rebuilt per step because `n` moves.
+    ///
+    /// A caller-owned buffer rather than `setBytes` scalars, so this family is
+    /// ICB-encodable from the first commit (`DESIGN.md` §3.7c, §11.3l finding
+    /// 3): a params buffer allocated per call makes ICB coverage zero, because
+    /// a command binds a buffer by identity at encode time.
+    params: Option<Tensor>,
+    len: usize,
+    capacity: usize,
+    quant: KvQuant,
+}
+
+impl QuantKvSlot {
+    fn new(capacity: usize, quant: KvQuant) -> Self {
+        Self {
+            codes: None,
+            scales: None,
+            biases: None,
+            params: None,
+            len: 0,
+            capacity,
+            quant,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.len = 0;
+        self.codes = None;
+        self.scales = None;
+        self.biases = None;
+        self.params = None;
+    }
+
+    /// Discard the last `count` appended positions.
+    ///
+    /// `KvSlot::rewind`'s contract exactly (§10.2a): a length decrement and
+    /// nothing else. The discarded codes sit above `len` and no kernel can
+    /// address them, and the allocation is deliberately not touched.
+    fn rewind(&mut self, count: usize) -> Result<()> {
+        if count > self.len {
+            candle::bail!(
+                "lfm2 quantized KV rewind past the start: {count} > len {}",
+                self.len
+            )
+        }
+        self.len -= count;
+        Ok(())
+    }
+
+    /// Allocate the three planes on first use.
+    fn ensure(
+        &mut self,
+        b_sz: usize,
+        n_heads: usize,
+        head_dim: usize,
+        device: &Device,
+    ) -> Result<()> {
+        if self.codes.is_some() {
+            return Ok(());
+        }
+        let code_bytes = self
+            .quant
+            .code_bytes(b_sz * n_heads * self.capacity * head_dim)
+            .ok_or_else(|| candle::Error::msg("QuantKvSlot::ensure on the Off arm"))?;
+        // A u8 plane rather than a typed one: the packing is the kernel's, and
+        // a `Tensor` of the code width does not exist at int4 anyway.
+        self.codes = Some(Tensor::zeros(code_bytes, DType::U8, device)?);
+        let scale_els = b_sz * n_heads * self.capacity;
+        self.scales = Some(Tensor::zeros(scale_els, DType::F16, device)?);
+        self.biases = Some(Tensor::zeros(scale_els, DType::F16, device)?);
+        Ok(())
+    }
+
+    /// Quantize `src` and append it, advancing `len`.
+    fn append(&mut self, src: &Tensor) -> Result<()> {
+        let (b_sz, n_heads, seq_len, head_dim) = src.dims4()?;
+        if self.len + seq_len > self.capacity {
+            candle::bail!(
+                "lfm2 quantized KV cache exhausted: {} + {} > capacity {}",
+                self.len,
+                seq_len,
+                self.capacity
+            )
+        }
+        self.ensure(b_sz, n_heads, head_dim, src.device())?;
+
+        let bits = match self.quant {
+            KvQuant::Off => candle::bail!("QuantKvSlot::append on the Off arm"),
+            KvQuant::Int8 => 8usize,
+            KvQuant::Int4 => 4usize,
+        };
+        let _ = bits;
+        // **The params block is built by the metal side, not hand-packed
+        // here.** An earlier draft wrote the struct as a `&[u32]` with manual
+        // padding, which is precisely the class §11.3k's layout check exists to
+        // catch: a field at the wrong offset does not crash, it reads a
+        // well-formed number from the wrong place. `write_params` fills a
+        // caller-owned buffer through the same `SdpaQuantWriteParams` the
+        // kernel reads and the layout test pins.
+        candle_nn::ops::quantize_kv_into(
+            src,
+            self.codes.as_ref().unwrap(),
+            self.scales.as_ref().unwrap(),
+            self.biases.as_ref().unwrap(),
+            self.capacity,
+            self.len,
+            self.quant,
+        )?;
+        self.len += seq_len;
+        Ok(())
+    }
+}
+
 /// Cache for LFM2 model supporting both attention KV cache and convolution state cache.
 #[derive(Debug, Clone)]
 pub struct Cache {
@@ -730,7 +894,14 @@ pub struct Cache {
     // Held beside `kvs` rather than replacing it so that both arms stay
     // compiled and the unselected one allocates nothing.
     kv_slots: Vec<(KvSlot, KvSlot)>,
+    /// The `KvQuant` arm's storage, one (K, V) pair per layer.
+    ///
+    /// Held beside `kv_slots` rather than replacing it, so both arms stay
+    /// compiled and the unselected one allocates nothing -- `kv_slots`' own
+    /// argument, one axis further out.
+    quant_slots: Vec<(QuantKvSlot, QuantKvSlot)>,
     kv_append: KvAppend,
+    kv_quant: KvQuant,
     /// The largest `kv_len` this cache admits, in tokens.
     ///
     /// **What `FlashScratchSizing::Reserve` reserves against** (#234), and the
@@ -912,7 +1083,16 @@ impl Cache {
             kv_slots: (0..num_layers)
                 .map(|_| (KvSlot::new(kv_capacity), KvSlot::new(kv_capacity)))
                 .collect(),
+            quant_slots: (0..num_layers)
+                .map(|_| {
+                    (
+                        QuantKvSlot::new(kv_capacity, config.kv_quant),
+                        QuantKvSlot::new(kv_capacity, config.kv_quant),
+                    )
+                })
+                .collect(),
             kv_append: config.kv_append,
+            kv_quant: config.kv_quant,
             kv_capacity,
             conv_states: vec![None; num_layers],
             conv_phase: 0,
@@ -1124,6 +1304,10 @@ impl Cache {
             k.reset();
             v.reset();
         });
+        self.quant_slots.iter_mut().for_each(|(k, v)| {
+            k.reset();
+            v.reset();
+        });
         self.conv_states.iter_mut().for_each(|v| *v = None);
         self.conv_phase = 0;
         self.conv_compact = false;
@@ -1286,6 +1470,17 @@ impl Cache {
         // check meaningful for the slots that *are* live.
         for (k_slot, v_slot) in self.kv_slots.iter_mut() {
             if k_slot.all_data.is_none() {
+                continue;
+            }
+            k_slot.rewind(discard)?;
+            v_slot.rewind(discard)?;
+        }
+        // The quantized arm rewinds by the same rule and for the same reason:
+        // a length decrement, discarded codes left unreachable above `len`
+        // (§10.2a). The `codes.is_none()` skip is `all_data`'s, for the 22 conv
+        // layers whose slots never allocate.
+        for (k_slot, v_slot) in self.quant_slots.iter_mut() {
+            if k_slot.codes.is_none() {
                 continue;
             }
             k_slot.rewind(discard)?;
@@ -1699,8 +1894,95 @@ impl Attention {
         let q = self.apply_rotary_emb(&q, index_pos, cache)?;
         let k = self.apply_rotary_emb(&k, index_pos, cache)?;
 
+        // The quantized arm (issue #218, `DESIGN.md` §10.7).
+        //
+        // **It intercepts before the f16 cache**, because it *is* the cache on
+        // this arm: K and V are quantized at write time and the f16 tensors are
+        // not retained. `seq_len == 1` only -- a prefill takes the f16 path and
+        // then hands its result over, which is why the append below runs on
+        // every step and the read only at decode.
+        if cache.use_kv_cache && cache.kv_quant.is_on() {
+            let k = k.contiguous()?;
+            let v = v.contiguous()?;
+            let (k_slot, v_slot) = &mut cache.quant_slots[block_idx];
+            k_slot.append(&k)?;
+            v_slot.append(&v)?;
+            let n = k_slot.len;
+            let capacity = k_slot.capacity;
+
+            if seq_len == 1 {
+                let y = candle_nn::ops::sdpa_quant(
+                    &q,
+                    k_slot.codes.as_ref().unwrap(),
+                    k_slot.scales.as_ref().unwrap(),
+                    k_slot.biases.as_ref().unwrap(),
+                    v_slot.codes.as_ref().unwrap(),
+                    v_slot.scales.as_ref().unwrap(),
+                    v_slot.biases.as_ref().unwrap(),
+                    self.num_attention_heads / self.num_key_value_heads,
+                    n,
+                    capacity,
+                    1f32 / (self.head_dim as f32).sqrt(),
+                    1.0,
+                    cache.kv_quant,
+                )?;
+                return y.transpose(1, 2)?.reshape((
+                    b_sz,
+                    seq_len,
+                    self.num_attention_heads * self.head_dim,
+                ));
+            }
+        }
+
         // Handle KV cache
         let (k, v) = if !cache.use_kv_cache {
+            (k, v)
+        } else if cache.kv_quant.is_on() {
+            // **Prefill on the quantized arm reads the whole cache back.**
+            //
+            // A turn boundary re-prefills onto the *accumulated* cache without
+            // clearing it (§10.9: `Cache::clear()` is never called by either
+            // multi-turn harness), so this pass must attend over the full
+            // `kv_len` -- the causal mask below is
+            // `[seq_len, index_pos + seq_len]` by construction. Attending over
+            // only this pass's own K/V is a shape error at `--turns 3` and, if
+            // the mask were made to fit, a silently truncated context.
+            //
+            // A quantized `seq_len > 1` attention kernel is out of scope (§17
+            // item 18 scopes this to the decode path), so the honest
+            // arrangement is that the cache stays quantized and prefill
+            // dequantizes it. **The dequantized values are the ones the codes
+            // hold**, not the originals, so prefill sees exactly the cache
+            // decode will see -- which is what makes the two paths consistent
+            // rather than merely both present.
+            let (k_slot, v_slot) = &cache.quant_slots[block_idx];
+            let n = k_slot.len;
+            let capacity = k_slot.capacity;
+            let dtype = q.dtype();
+            let k = candle_nn::ops::dequantize_kv(
+                k_slot.codes.as_ref().unwrap(),
+                k_slot.scales.as_ref().unwrap(),
+                k_slot.biases.as_ref().unwrap(),
+                b_sz,
+                self.num_key_value_heads,
+                n,
+                self.head_dim,
+                capacity,
+                dtype,
+                cache.kv_quant,
+            )?;
+            let v = candle_nn::ops::dequantize_kv(
+                v_slot.codes.as_ref().unwrap(),
+                v_slot.scales.as_ref().unwrap(),
+                v_slot.biases.as_ref().unwrap(),
+                b_sz,
+                self.num_key_value_heads,
+                n,
+                self.head_dim,
+                capacity,
+                dtype,
+                cache.kv_quant,
+            )?;
             (k, v)
         } else {
             match cache.kv_append {

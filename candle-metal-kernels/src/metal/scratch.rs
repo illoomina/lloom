@@ -103,6 +103,48 @@ pub enum CombineOrder {
     /// Nothing constructs this outside the test that shows
     /// [`ScratchPlan::check_index_ordered`] rejects it.
     Completion,
+    /// Merged in the order the **page table** lists the chunks.
+    ///
+    /// # The second wrong order, and the one a B=1 gate cannot see
+    ///
+    /// §10.3h: a page table threatens §10.4's determinism constraint *"not by
+    /// changing the order, but by making the order a property of a data
+    /// structure rather than of a loop bound"*. Both this and [`Index`] visit
+    /// every chunk:
+    ///
+    /// ```text
+    /// for (uint c = 0; c < n_chunks; ++c) { merge(partial[c]); }   // Index -- correct
+    /// for (page in page_list)             { merge(partial_for(page)); }  // TableOrder
+    /// ```
+    ///
+    /// The second is not bit-stable, because a table's *contents* depend on
+    /// allocation history — which under B>1 depends on **what other sequences
+    /// did**. That would make a sequence's logits depend on its batch
+    /// neighbours, violating §2.3.3 #7 directly.
+    ///
+    /// **It is strictly sharper than [`Completion`]**, and that is why it needed
+    /// its own spelling rather than being folded into it: a completion-ordered
+    /// merge varies run to run on one sequence, where this one is perfectly
+    /// *reproducible* for a given allocation history and wrong only across
+    /// histories. §10.3h: *"a B=1 determinism gate structurally cannot detect
+    /// it"* — at B=1 with a fresh pool the table is `page_table[c] == c` and the
+    /// two orders coincide exactly.
+    ///
+    /// # Why it exists now
+    ///
+    /// §10.3h asks for it *"as a second negative control"*, and #181's survey
+    /// recorded it as **the only one of six deliberately-wrong arms this
+    /// document names that was never built** — re-counted at zero by #568, four
+    /// days and ~40 commits later. It was deferred on the ground that *"the arm
+    /// it controls for is indistinguishable from `Index` at B=1"*, which is
+    /// exactly the condition [`KvPagePool`](super::kv_pages::KvPagePool) removes:
+    /// a recycled pool produces a non-identity table from an ordinary
+    /// allocation history, so the arm is now distinguishable and the control has
+    /// something to reject.
+    ///
+    /// Nothing constructs this outside the tests that show
+    /// [`ScratchPlan::check_index_ordered`] rejects it.
+    TableOrder,
 }
 
 /// Where a scratch region's byte extent comes from.
@@ -567,6 +609,15 @@ impl ScratchPlan {
                  (DESIGN.md 2.3.3 #1, 10.4)"
                     .to_string(),
             ),
+            CombineOrder::TableOrder => Err(
+                "combine order is TableOrder; the page table must be INDEXED by chunk number \
+                 and never WALKED, because its contents depend on allocation history and under \
+                 B>1 that depends on what other sequences did -- which would make a sequence's \
+                 logits depend on its batch neighbours (DESIGN.md 2.3.3 #7, 10.3h). Note this \
+                 is reproducible for a given history and therefore invisible to a run-to-run \
+                 digest gate, and identical to Index at B=1"
+                    .to_string(),
+            ),
         }
     }
 
@@ -576,8 +627,47 @@ impl ScratchPlan {
     /// Ascending, always. Returned as a sequence rather than as a promise so a
     /// test can compare against it -- an assertion that a kernel "merges in
     /// index order" with nothing to compare against asserts nothing.
+    ///
+    /// **Independent of the page table by construction**, which is the property
+    /// §10.3h asks for: the combine iterates chunk index `0..n_chunks` and the
+    /// table is *indexed* by that, never *walked*. See
+    /// [`Self::merge_sequence_under`] for what the rejected orders would produce
+    /// — a control that cannot be evaluated is not a control.
     pub fn merge_sequence(&self) -> Vec<usize> {
         (0..self.live_chunks).collect()
+    }
+
+    /// What a combine would read under `order`, given the page table `table`.
+    ///
+    /// # Why a rejected arm needs to be computable
+    ///
+    /// [`Self::check_index_ordered`] refuses everything but
+    /// [`CombineOrder::Index`], and a refusal alone cannot demonstrate that the
+    /// refused thing is *different*. §10.3h's hazard is precisely that
+    /// [`CombineOrder::TableOrder`] and `Index` **coincide** at
+    /// `page_table[c] == c` — so an arm that is only ever rejected leaves the
+    /// reader to take on faith that it would diverge elsewhere.
+    ///
+    /// This computes both, so a test can show they agree on a fresh pool's
+    /// identity table and disagree on a recycled pool's — which is the whole of
+    /// why §10.3i sequences the allocator before the kernel.
+    ///
+    /// [`CombineOrder::Completion`] has no deterministic sequence to return by
+    /// its own definition; it is reported as `None` rather than given an
+    /// arbitrary one, since inventing an order for the arm that is defined by
+    /// not having one would be the vacuity §15.1a names.
+    pub fn merge_sequence_under(&self, order: CombineOrder, table: &[u32]) -> Option<Vec<usize>> {
+        match order {
+            CombineOrder::Index => Some(self.merge_sequence()),
+            CombineOrder::Completion => None,
+            // The table's entries are page indices; walking it means visiting
+            // chunks in the order their pages happen to be listed.
+            CombineOrder::TableOrder => {
+                let mut idx: Vec<usize> = (0..self.live_chunks.min(table.len())).collect();
+                idx.sort_by_key(|&c| table[c]);
+                Some(idx)
+            }
+        }
     }
 
     /// The byte sizes a bump allocator walks to reproduce this plan.

@@ -66,6 +66,13 @@ pub mod icb;
 mod icb_executor_tests;
 #[cfg(test)]
 mod icb_tests;
+/// The paged KV pool: allocation, free list, refcounts and the page table
+/// (`DESIGN.md` §10.3c–§10.3g, issue #148). Pure functions of a configuration
+/// and an allocation history — no device, no buffer, no dispatch — which is the
+/// half §10.3i says to build **before** the page-walking kernel.
+pub mod kv_pages;
+#[cfg(test)]
+mod kv_pages_tests;
 pub mod library;
 /// ASan shadow-memory poisoning for allocator invariants (issue #475). Every
 /// entry point is inert without the `asan-poison` feature, so the module is
@@ -104,6 +111,7 @@ pub use device::*;
 pub use encoder::*;
 pub use executor::*;
 pub use fence::*;
+pub use kv_pages::*;
 pub use library::*;
 pub use residency_set::*;
 pub use scratch::*;

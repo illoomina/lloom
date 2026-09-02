@@ -674,6 +674,128 @@ fn the_combine_order_is_index_and_completion_is_refused() {
         .check_index_ordered()
         .expect_err("a completion-ordered plan was accepted");
     assert!(err.contains("nondeterministic"), "unexpected error: {err}");
+
+    // The SECOND wrong order, and it is not completion order (§10.3h).
+    let table_order = ScratchPlan::from_parts(
+        plan.regions().to_vec(),
+        plan.sizing(),
+        plan.layout(),
+        CombineOrder::TableOrder,
+        plan.kv_len(),
+        plan.live_chunks(),
+    );
+    let err = table_order
+        .check_index_ordered()
+        .expect_err("a table-ordered plan was accepted");
+    assert!(
+        err.contains("INDEXED") && err.contains("WALKED"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `TableOrder` is identical to `Index` at B=1 and diverges on a recycled pool.
+///
+/// # Why this test is the point of building the arm at all
+///
+/// §10.3h specifies `CombineOrder::TableOrder` as a second negative control and
+/// #181 recorded it as **the only one of six deliberately-wrong arms this
+/// document names that was never built**, deferred on the ground that *"the arm
+/// it controls for is indistinguishable from `Index` at B=1"*. That ground is
+/// real, and it is exactly what makes a refusal alone insufficient: a control
+/// that is only ever rejected leaves *"it would diverge elsewhere"* as an
+/// assertion nobody has evaluated.
+///
+/// So this evaluates it, on both sides:
+///
+/// - on the **identity** table a fresh pool produces, the two orders agree
+///   exactly — which is the hazard, stated as a measurement rather than as a
+///   warning;
+/// - on the **non-identity** table an ordinary allocate/release/reallocate
+///   history produces, they disagree — which is what a B=1 gate with a fresh
+///   pool structurally cannot show.
+///
+/// The tables come from [`KvPagePool`] rather than from literals, because a
+/// hand-written permutation would demonstrate that *a* permuted table diverges
+/// and not that the allocator **produces** one (§10.3i's sequencing argument).
+#[test]
+fn table_order_coincides_with_index_at_the_identity_and_diverges_after_recycling() {
+    use super::kv_pages::KvPagePool;
+
+    let g = lfm2();
+    let plan = plan_scratch(
+        &g,
+        2_720,
+        LFM2_ATTENTION_LAYERS,
+        Sizing::Reserve,
+        ScratchLayout::Planes,
+        MAX_CONTEXT,
+    )
+    .expect("plan");
+    // Two chunks, which is the smallest fixture in which an order can differ at
+    // all -- with one chunk every order is the same order.
+    let plan = ScratchPlan::from_parts(
+        plan.regions().to_vec(),
+        plan.sizing(),
+        plan.layout(),
+        CombineOrder::Index,
+        plan.kv_len(),
+        2,
+    );
+
+    // A fresh pool: the table is the identity and the two orders COINCIDE.
+    let mut fresh = KvPagePool::new(4, 8, 4, 64);
+    fresh.append(0, 8).unwrap();
+    let identity = fresh.table_for(0, 1);
+    assert_eq!(identity, vec![0, 1], "a fresh pool must hand out 0, 1");
+    assert_eq!(
+        plan.merge_sequence_under(CombineOrder::TableOrder, &identity),
+        plan.merge_sequence_under(CombineOrder::Index, &identity),
+        "at page_table[c] == c the two orders MUST agree -- if they did not, this test would \
+         be measuring something other than the hazard DESIGN.md 10.3h describes"
+    );
+
+    // A recycled pool: the table is not the identity and they DIVERGE.
+    let mut recycled = KvPagePool::new(4, 8, 4, 64);
+    recycled.append(0, 8).unwrap();
+    recycled.append(1, 8).unwrap();
+    let freed = recycled.release(0);
+    recycled.recycle(&freed).unwrap();
+    recycled.append(2, 8).unwrap();
+    let permuted = recycled.table_for(2, 1);
+    assert_ne!(
+        permuted, identity,
+        "the fixture is degenerate: recycling reproduced the identity table, so the \
+         divergence below could not be observed"
+    );
+
+    let indexed = plan
+        .merge_sequence_under(CombineOrder::Index, &permuted)
+        .expect("Index always has a sequence");
+    let walked = plan
+        .merge_sequence_under(CombineOrder::TableOrder, &permuted)
+        .expect("TableOrder has a sequence for a given history");
+    assert_eq!(
+        indexed,
+        vec![0, 1],
+        "the indexed order is a property of the LOOP BOUND and must not move with the table"
+    );
+    assert_eq!(
+        walked,
+        vec![1, 0],
+        "walking the table must follow its contents -- this is the order that makes a \
+         sequence's logits depend on what its batch neighbours allocated (DESIGN.md 2.3.3 #7)"
+    );
+    assert_ne!(
+        indexed, walked,
+        "the two orders must differ on a recycled pool, or TableOrder controls for nothing"
+    );
+
+    // Completion has no deterministic sequence by construction, and is reported
+    // as absent rather than given an invented one (§15.1a).
+    assert_eq!(
+        plan.merge_sequence_under(CombineOrder::Completion, &permuted),
+        None
+    );
 }
 
 /// **`kv_len` determines the merge tree, so the same `kv_len` always merges the

@@ -619,6 +619,36 @@ impl MetalDevice {
         Ok(in_flight)
     }
 
+    /// The completion-wait arm in force, as its `RESULT`-line name
+    /// (`DESIGN.md` §11.5o, issue #559).
+    ///
+    /// **Read back from the resolved value**, never echoed from the string that
+    /// selected it -- §7.1a-i's `AttnImpl=Generic` defect is what that
+    /// distinction exists to prevent, and a wrong arm compares equal to every
+    /// run of that arm where an absent one compares equal to nothing.
+    pub fn completion_wait_name(&self) -> &'static str {
+        self.commands.completion_wait().name()
+    }
+
+    /// `(signals encoded, polls performed)` by the async completion arms.
+    ///
+    /// The engagement pair. `(0, 0)` under an async arm means the arm did not
+    /// run: #500 measured that a mechanism with no production callers produces
+    /// a clean null indistinguishable from a real one, and a counter is the
+    /// only thing that separates them.
+    pub fn completion_counts(&self) -> (u64, u64) {
+        self.commands.completion_counts()
+    }
+
+    /// Whether an `MTLSharedEvent` was actually allocated for the selected arm.
+    ///
+    /// Separates *"an async arm was selected"* from *"an async arm is running"*:
+    /// a device that declined the event leaves this false and every wait takes
+    /// the blocking fallback, which is correct but is not what was asked for.
+    pub fn completion_event_present(&self) -> bool {
+        self.commands.completion_event_present()
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }

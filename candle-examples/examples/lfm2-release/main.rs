@@ -218,6 +218,35 @@ struct Args {
     /// shape.
     #[arg(long)]
     nonblocking_eos: bool,
+
+    /// How the host waits for a committed command buffer (`DESIGN.md` §11.5o,
+    /// issue #559).
+    ///
+    /// `synchronize` (the default and the incumbent), `shared-event`, or
+    /// `shared-event-sleep[:<micros>]`.
+    ///
+    /// **Three axes on one seam, and they are at different heights.** §11.5j
+    /// records the ring as wired installing *"a hint before a blocking read"*,
+    /// and the three flags now attack the three parts of that sentence:
+    ///
+    /// | flag | what it changes |
+    /// |---|---|
+    /// | `--poll` | how the host idles *between* reads (§11.5l: indiscriminable, because nothing spins) |
+    /// | `--nonblocking-eos` | whether the **flag read** blocks (#535) |
+    /// | `--completion-wait` | whether the **command-buffer wait underneath** blocks (#559) |
+    ///
+    /// They compose and are not substitutes: `--nonblocking-eos` removes the
+    /// block from the *one* read the ring makes per token, while this removes it
+    /// from every `flush_and_wait_current` on the path -- which is what the
+    /// baseline arm reaches through the sampler and what `to_cpu` reaches at
+    /// every other call site.
+    ///
+    /// **`synchronize` stays the default.** Every canonical digest and every
+    /// `.bench/` row belongs to it, and §7.1a's discipline is that a default
+    /// flip is its own argued decision with a number in hand. #559 does not take
+    /// that number.
+    #[arg(long, default_value = "synchronize")]
+    completion_wait: String,
 }
 
 /// Parse LFM2.5-VL-3B's `config.json`.
@@ -395,11 +424,64 @@ fn main() -> Result<()> {
         "no --model-dir given and the LFM2.5-VL-3B snapshot was not found in the HF cache",
     )?;
 
+    // **The completion arm is parsed and installed BEFORE the device exists**
+    // (`DESIGN.md` §11.5o, issue #559). `Commands::new` reads the arm once at
+    // construction through a `OnceLock`, for the reason every other per-token
+    // setting is read once (§2.4: a per-call `var()` on the hot path is what
+    // #69's vacuous determinism run risks) -- so setting it afterwards would
+    // silently leave the incumbent installed while the `RESULT` line reported
+    // otherwise. That is §7.1a-i's wrong-arm shape, and it is the failure this
+    // ordering exists to prevent.
+    //
+    // Parsed first, so an unrecognised value fails here rather than panicking
+    // inside the device constructor: the error names the flag the operator
+    // typed. Parsing is under `cfg(metal)` because the type lives behind the
+    // feature -- §14.1 makes not breaking the non-Metal build a hard constraint
+    // -- and a CPU run has no command buffer to wait for, so the flag is inert
+    // rather than merely unavailable.
+    #[cfg(feature = "metal")]
+    let completion_wait =
+        candle::metal_backend::CompletionWait::from_str_arm(&args.completion_wait)
+            .map_err(anyhow::Error::msg)?;
+    // SAFETY: single-threaded, before any device or thread exists. `set_var` is
+    // unsafe from Rust 2024 because a concurrent `getenv` is UB; there is no
+    // other thread here, and the value is read once immediately below.
+    #[cfg(feature = "metal")]
+    unsafe {
+        std::env::set_var("CANDLE_METAL_COMPLETION_WAIT", &args.completion_wait)
+    };
+
     let device = if args.cpu {
         Device::Cpu
     } else {
         Device::new_metal(0)?
     };
+
+    // **Read back from the RESOLVED value, and refuse if it disagrees.**
+    // §7.1a-i: `AttnImpl` was rendered by a two-armed conditional over a
+    // three-armed axis and `--attn flash` reported `AttnImpl=Generic` on every
+    // `RESULT` line since #116. A wrong arm compares equal to every run of that
+    // arm; an absent one compares equal to nothing. So the check is that what
+    // the device installed is what was asked for, not that the string parsed.
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = &device {
+        anyhow::ensure!(
+            m.completion_wait_name() == completion_wait.name(),
+            "--completion-wait {} resolved to {} inside the device: the arm reported \
+             would not be the arm executed (DESIGN.md §7.1a-i)",
+            completion_wait.name(),
+            m.completion_wait_name()
+        );
+        // An arm that needs an event and did not get one runs the blocking
+        // fallback -- correct, but not what was asked for, and a null measured
+        // on it would be attributed to the wrong mechanism (§2.4).
+        anyhow::ensure!(
+            !completion_wait.needs_event() || m.completion_event_present(),
+            "--completion-wait {} needs an MTLSharedEvent and the device declined to \
+             create one, so every wait would take the blocking fallback",
+            completion_wait.name()
+        );
+    }
 
     // f16 on Metal is what ambrogio loads, so it is the path worth measuring.
     let dtype = match args.dtype.as_deref() {
@@ -1070,6 +1152,27 @@ fn main() -> Result<()> {
     let (peek_hit, peek_unmapped) = candle::metal_backend::peek_counts();
     #[cfg(not(feature = "metal"))]
     let (peek_hit, peek_unmapped) = (0u64, 0u64);
+
+    // #559's completion arm, **read back from the device rather than from the
+    // flag** (§7.1a-i), and its engagement pair beside it. `(0, 0)` under an
+    // async arm means the arm did not run: #500 measured that a mechanism with
+    // no production callers produces a clean null indistinguishable from a real
+    // one, and the counter is what separates them.
+    //
+    // A different height from #535's counters above rather than a duplicate of
+    // them: `peek_hit` counts reads that skipped a wait, this counts waits that
+    // were satisfied without blocking.
+    #[cfg(feature = "metal")]
+    let (cw_name, cw_signals, cw_polls) = match &device {
+        Device::Metal(m) => {
+            let (s, p) = m.completion_counts();
+            (m.completion_wait_name(), s, p)
+        }
+        _ => ("none", 0, 0),
+    };
+    #[cfg(not(feature = "metal"))]
+    let (cw_name, cw_signals, cw_polls) = ("none", 0u64, 0u64);
+
     println!();
     println!(
         "engagement            token_ring={} ring_publishes={} poll={} poll_iters={} \
@@ -1081,6 +1184,10 @@ fn main() -> Result<()> {
         max_in_flight,
         args.nonblocking_eos,
         poll_fallbacks
+    );
+    println!(
+        "  completion arm      completion_wait={cw_name} completion_signals={cw_signals} \
+         completion_polls={cw_polls}"
     );
     println!(
         "  readback arms       to_cpu_fast={fast} to_cpu_blit={blit} \
@@ -1098,7 +1205,8 @@ fn main() -> Result<()> {
          prefill_submit_ms={:.4} final_kv_len={} hit_eos={} token_ring={} \
          ring_publishes={} poll={} poll_iters={} max_in_flight={} to_cpu_fast={} \
          to_cpu_blit={} to_cpu_null_after_wait={} nonblocking_eos={} \
-         poll_fallbacks={} peek_hit={} peek_unmapped={} token_digest={}",
+         poll_fallbacks={} peek_hit={} peek_unmapped={} completion_wait={} \
+         completion_signals={} completion_polls={} token_digest={}",
         args.n,
         args.warmup,
         turns_run,
@@ -1133,6 +1241,9 @@ fn main() -> Result<()> {
         poll_fallbacks,
         peek_hit,
         peek_unmapped,
+        cw_name,
+        cw_signals,
+        cw_polls,
         token_digest
     );
 

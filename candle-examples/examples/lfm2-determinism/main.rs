@@ -1423,6 +1423,35 @@ fn main() -> Result<()> {
         elapsed.as_millis(),
     );
 
+    // Issue #559 (`DESIGN.md` §11.5n). On its own line rather than folded into
+    // `RESULT`, for the reason the `POISON` line below gives: every committed
+    // artifact's `RESULT` line has that shape and #171 records what widening it
+    // costs an ingest of the existing corpus.
+    //
+    // **This line is what licenses reading the digests above as evidence about
+    // the completion arm.** The digest gate is what says the async wait changes
+    // how bytes move rather than what they are -- and it says that only if the
+    // arm was live. An unmoved digest on an arm that never engaged is #500's
+    // finding exactly: a mechanism with no callers regresses nothing, and the
+    // clean board carries no information.
+    //
+    // So `completion_signals = 0` under an async arm is a **FAILURE TO ENGAGE**
+    // rather than a clean run, and it is asserted rather than printed and
+    // hoped over. `synchronize` is exempt because encoding nothing is precisely
+    // what the incumbent must do -- the assertion is on the arm that claims to
+    // do something.
+    #[cfg(feature = "metal")]
+    if let candle::Device::Metal(m) = &device {
+        let arm = m.completion_wait_name();
+        let (signals, polls) = m.completion_counts();
+        println!("COMPLETION arm={arm} signals={signals} polls={polls}");
+        anyhow::ensure!(
+            arm == "synchronize" || signals > 0,
+            "completion arm {arm} encoded no signal, so this run's unmoved digest \
+             is vacuous -- the mechanism did not engage (§2.4, §15.1a, §11.5i)"
+        );
+    }
+
     // Issue #475. On its own line rather than folded into `RESULT`, for the
     // reason the `SPEC` line below gives: every committed artifact's `RESULT`
     // line has that shape and #171 records what widening it costs an ingest of

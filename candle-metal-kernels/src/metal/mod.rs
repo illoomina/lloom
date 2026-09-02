@@ -23,6 +23,19 @@ pub mod commands;
 /// `in_flight` bounded across arbitrary commit/prune/wait interleavings (#508).
 #[cfg(test)]
 mod commands_fuzz;
+/// How the host learns a command buffer finished: the blocking incumbent and
+/// two `MTLSharedEvent` arms behind one seam (#559, `DESIGN.md` §11.5o).
+///
+/// Deliberately **not** in the glob re-export below: `CompletionWait` is the
+/// name a caller should reach for as `completion::CompletionWait`, and
+/// `SharedEvent` is general enough that acquiring it from a `metal::*` would
+/// read as an unrelated type.
+pub mod completion;
+/// The completion seam on the device: engagement, and that every arm computes
+/// the same bytes (#559). `completion.rs`'s own tests cover the routing, which
+/// needs no GPU.
+#[cfg(test)]
+mod completion_gpu_tests;
 /// Component digests: one fingerprint per mechanism per variant (#105).
 #[cfg(test)]
 mod component_digest_tests;

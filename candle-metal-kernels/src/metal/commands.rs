@@ -1,6 +1,9 @@
 use crate::metal::{
-    cache_pad::CachePadded, executor::ExecutorSlot, BlitCommandEncoder, Buffer, CommandBuffer,
-    ComputeCommandEncoder, ComputePipeline, Device, Fence, GpuClock, PrevCeOutputs, ResidencySet,
+    cache_pad::CachePadded,
+    completion::{CompletionWait, SharedEvent},
+    executor::ExecutorSlot,
+    BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipeline, Device,
+    Fence, GpuClock, PrevCeOutputs, ResidencySet,
 };
 use crate::MetalKernelError;
 use block2::RcBlock;
@@ -8,7 +11,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 // Use Retained when appropriate. Gives us a more elegant way of handling memory (peaks) than autoreleasepool.
@@ -294,6 +297,40 @@ pub struct Commands {
     /// touched per dispatch, because the encoder holds its own `Arc` to the
     /// slot from creation.
     executor: Mutex<Arc<ExecutorSlot>>,
+    /// How the host waits for a committed command buffer (`DESIGN.md` §11.5o,
+    /// issue #559).
+    ///
+    /// Read once from the environment at construction, like `compute_per_buffer`
+    /// and `cut_policy` beside it. [`CompletionWait::Synchronize`] unless
+    /// `CANDLE_METAL_COMPLETION_WAIT` is set, so **the default path is the one
+    /// that ran before this field existed** (§7.1a) rather than one equivalent
+    /// to it -- every canonical digest and every `.bench/` row belongs to it.
+    completion_wait: CompletionWait,
+    /// The event the async arms signal, allocated **only** when an async arm is
+    /// selected.
+    ///
+    /// `None` on the default path, where nothing is allocated and nothing is
+    /// encoded, and `None` also when the device declines to create one --
+    /// which is a capability absence rather than an error, so
+    /// [`CompletionWait::wait_for`] falls back to the blocking wait.
+    completion_event: Option<SharedEvent>,
+    /// Polls performed by the async arms since construction (§2.4: an
+    /// instrument that cannot be shown to have engaged has not measured
+    /// anything).
+    ///
+    /// **Zero is a distinguishing value, not a null.** `Synchronize` reports 0
+    /// because it never polls; an async arm reporting 0 has either not run or
+    /// observed every signal on its first read, and `completion_signals`
+    /// beside it separates the two. #500's whole finding is that a green board
+    /// says nothing when nothing is counted.
+    completion_polls: AtomicU64,
+    /// Signals encoded by the async arms since construction.
+    ///
+    /// The engagement counter proper: a run selecting an async arm and
+    /// reporting `completion_signals = 0` has **not taken that arm**, whatever
+    /// its `RESULT` line says it selected. That is #513's `ring_publishes` in
+    /// this axis, and §7.1a-i's wrong-arm shape is what it exists to catch.
+    completion_signals: AtomicU64,
 }
 
 /// A fence still referenced by `prev_ce_outputs`, with its buffer count.
@@ -348,6 +385,74 @@ impl Commands {
         let device = Device::new(command_queue.device());
         let cb = create_command_buffer(&command_queue)?;
 
+        // `DESIGN.md` §11.5o. Absent -- every run that does not opt in --
+        // leaves `Synchronize`, which is the path that ran before this field
+        // existed. An unparseable value panics inside `from_env`, for
+        // `cut_policy`'s reason above.
+        //
+        // The event is allocated **only** for an arm that needs one, so the
+        // default path allocates nothing: `newSharedEvent` on a device that has
+        // never been asked for one is not free, and more importantly a resource
+        // the incumbent does not create cannot change what the incumbent does.
+        let completion_wait = CompletionWait::from_env();
+
+        Self::with_parts(
+            command_queue,
+            device,
+            cb,
+            compute_per_buffer,
+            cut_policy,
+            completion_wait,
+        )
+    }
+
+    /// As [`Self::new`], but with the completion arm supplied rather than read
+    /// from the environment (`DESIGN.md` §11.5o).
+    ///
+    /// **This exists because the environment arm is a `OnceLock` and a test
+    /// cannot select per-test through one.** #434 records the same constraint
+    /// and #536 measured what happens without this split: a flag test that
+    /// exercises the *mechanism* while the *routing* is mutated dead passes,
+    /// because neither test touches the code path the flag runs through. The
+    /// repair there was to split the arm decision into a function the test
+    /// calls and assert **both** directions, which is what this is.
+    ///
+    /// `new` is a caller of this, so the two cannot drift: there is one
+    /// construction path and the only difference is where the arm comes from.
+    pub fn new_with_completion_wait(
+        command_queue: CommandQueue,
+        residency_set: &ResidencySet,
+        completion_wait: CompletionWait,
+    ) -> Result<Self, MetalKernelError> {
+        if let Some(raw) = residency_set.raw() {
+            command_queue.addResidencySet(raw);
+        }
+        let device = Device::new(command_queue.device());
+        let cb = create_command_buffer(&command_queue)?;
+        Self::with_parts(
+            command_queue,
+            device,
+            cb,
+            DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
+            CutPolicy::DispatchCounter,
+            completion_wait,
+        )
+    }
+
+    fn with_parts(
+        command_queue: CommandQueue,
+        device: Device,
+        cb: CommandBuffer,
+        compute_per_buffer: usize,
+        cut_policy: CutPolicy,
+        completion_wait: CompletionWait,
+    ) -> Result<Self, MetalKernelError> {
+        let completion_event = if completion_wait.needs_event() {
+            SharedEvent::new(&device)
+        } else {
+            None
+        };
+
         Ok(Self {
             state: CachePadded::new(Mutex::new(EntryState::new(cb))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
@@ -361,7 +466,47 @@ impl Commands {
             clock: Arc::new(GpuClock::new()),
             on_complete: Arc::new(Mutex::new(Vec::new())),
             executor: Mutex::new(Arc::new(ExecutorSlot::Classical)),
+            completion_wait,
+            completion_event,
+            completion_polls: AtomicU64::new(0),
+            completion_signals: AtomicU64::new(0),
         })
+    }
+
+    /// The completion-wait arm in force (`DESIGN.md` §11.5o).
+    ///
+    /// Read back from the **resolved value**, never echoed from the string that
+    /// selected it. §7.1a-i measured why: `AttnImpl` was rendered by a two-armed
+    /// conditional over a three-armed axis and `--attn flash` reported
+    /// `AttnImpl=Generic` on every `RESULT` line since #116 -- and a *wrong* arm
+    /// compares equal to every run of that arm, where an absent one compares
+    /// equal to nothing.
+    pub fn completion_wait(&self) -> CompletionWait {
+        self.completion_wait
+    }
+
+    /// Whether an event was actually allocated for the selected arm.
+    ///
+    /// Distinguishes *"an async arm was selected"* from *"an async arm is
+    /// running"*: a device that declined to create the event leaves this false
+    /// and every wait takes the blocking fallback, which is correct but is not
+    /// the arm the operator asked for. Reporting it is what stops that becoming
+    /// a silent null (§2.4).
+    pub fn completion_event_present(&self) -> bool {
+        self.completion_event.is_some()
+    }
+
+    /// `(signals encoded, polls performed)` since construction.
+    ///
+    /// The engagement pair for the async arms. `(0, 0)` under an async arm
+    /// means the arm did not run -- #500's finding is that the alternative
+    /// reading, a mechanism that ran and cost nothing, is indistinguishable
+    /// without a counter.
+    pub fn completion_counts(&self) -> (u64, u64) {
+        (
+            self.completion_signals.load(Ordering::Relaxed),
+            self.completion_polls.load(Ordering::Relaxed),
+        )
     }
 
     /// Install the executor that subsequent compute encoders will submit
@@ -587,14 +732,35 @@ impl Commands {
     /// Commit the current command buffer and wait on that specific buffer, for CPU readbacks.
     /// [`Self::wait_until_completed`] waits on the last in-flight buffer, which a concurrent
     /// `flush_and_wait` on another thread may already have taken, returning before our work ran.
+    ///
+    /// **This is the per-token serialization point** (`DESIGN.md` §11.5a: 441
+    /// µs/token, 2.43 % of a step) and therefore the one call routed through
+    /// the completion seam (§11.5o). §11.5f's census is why it is the only one:
+    /// the two production `flush_and_wait_current` sites are the two arms of
+    /// the single `to_cpu` the sampler reaches, and nothing else on the decode
+    /// path blocks.
     pub fn flush_and_wait_current(&self) -> Result<(), MetalKernelError> {
-        let cb = {
+        let (cb, signalled) = {
             let mut state = self.state.lock()?;
-            self.commit_swap_locked(&mut state, 0)?;
-            state.in_flight.last().cloned()
+            let signalled = self.commit_swap_locked(&mut state, 0)?;
+            (state.in_flight.last().cloned(), signalled)
         };
         if let Some(cb) = cb {
-            Self::ensure_completed(&cb)?;
+            // The seam. On the default arm this is `waitUntilCompleted` and the
+            // call is what it always was; on an async arm the host polls the
+            // shared event and never enters the kernel to wait.
+            //
+            // `ensure_completed`'s other duties -- committing a buffer the swap
+            // never saw, and surfacing an `Error` status -- are kept on both
+            // arms, because a dropped error presents as wrong output rather than
+            // as a failure (§3.5).
+            let polls = Self::ensure_completed_via(
+                &cb,
+                self.completion_wait,
+                self.completion_event.as_ref(),
+                signalled,
+            )?;
+            self.completion_polls.fetch_add(polls, Ordering::Relaxed);
             // queue is FIFO: everything committed before cb is done too
             let mut state = self.state.lock()?;
             state
@@ -683,13 +849,42 @@ impl Commands {
         Ok(self.state.lock()?.in_flight.len())
     }
 
+    /// Commit the current buffer, swap in a fresh one, and return the value the
+    /// completion arm should wait for -- `None` on the incumbent path.
+    ///
+    /// The return is what makes the async arms possible without a second commit
+    /// site: the signal has to be encoded on *this* buffer, between closing its
+    /// encoder and committing it, and only this function is at that point.
     fn commit_swap_locked(
         &self,
         state: &mut EntryState,
         reset_to: usize,
-    ) -> Result<(), MetalKernelError> {
+    ) -> Result<Option<u64>, MetalKernelError> {
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
+        }
+
+        // The signal goes here and it can go nowhere else. `encodeSignalEvent:
+        // value:` is documented "may only be called if there is no current
+        // command encoder on the receiver" -- so after `end_encoding` above --
+        // and it must precede the `commit` below, because Metal will not accept
+        // an encode onto a committed buffer.
+        //
+        // Probed before this was written (`measurements/probes/issue-559/
+        // shared_event.m`): the signal is observed from the host with **no**
+        // `waitUntilCompleted`, it does **not** advance when no signal is
+        // encoded, and the kernel's writes are visible at the instant the
+        // signal is. That last arm is the one this seam's soundness rests on --
+        // §3.5 makes a read-before-write silent corruption rather than an error.
+        //
+        // `None` on the incumbent path, where nothing is encoded at all: the
+        // default arm's command buffer is byte-for-byte what it was before this
+        // field existed.
+        let signalled = self
+            .completion_wait
+            .encode_signal(&state.current, self.completion_event.as_ref());
+        if signalled.is_some() {
+            self.completion_signals.fetch_add(1, Ordering::Relaxed);
         }
 
         // Close the epoch this command buffer holds and arrange for the pools to
@@ -738,20 +933,54 @@ impl Commands {
         state.in_flight.push(old_cb);
         self.compute_count.store(reset_to, Ordering::Release);
 
-        Ok(())
+        Ok(signalled)
     }
 
+    /// Wait for `cb` by the blocking incumbent.
+    ///
+    /// A thin wrapper over [`Self::ensure_completed_via`] with the
+    /// [`CompletionWait::Synchronize`] arm, rather than a second copy of the
+    /// status machine. **One implementation, not two that can drift**: the
+    /// status handling below -- committing a buffer the swap never saw,
+    /// surfacing an `Error` -- is identical on every arm and only the wait
+    /// differs, which is the property that makes this a seam rather than a
+    /// fork.
     fn ensure_completed(cb: &CommandBuffer) -> Result<(), MetalKernelError> {
+        Self::ensure_completed_via(cb, CompletionWait::Synchronize, None, None).map(|_| ())
+    }
+
+    /// Wait for `cb` by `arm`, returning the number of polls performed.
+    ///
+    /// Every arm shares the status machine and differs only at the wait, which
+    /// is delegated to [`CompletionWait::wait_for`]. A **third mechanism** is
+    /// therefore a variant of that enum plus its wait -- no change here, no
+    /// change at the call sites, and no change to the error handling. That is
+    /// the "admits a third without restructuring" property, shown rather than
+    /// asserted: `SharedEventSleep` was added exactly that way and touches this
+    /// function not at all.
+    fn ensure_completed_via(
+        cb: &CommandBuffer,
+        arm: CompletionWait,
+        event: Option<&SharedEvent>,
+        signalled: Option<u64>,
+    ) -> Result<u64, MetalKernelError> {
+        let mut polls = 0;
         match cb.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
                 // This path commits a buffer that `commit_swap_locked` never saw,
                 // so it needs its own registration or its GPU time goes unrecorded.
+                //
+                // **And it carries no signal**, because the signal is encoded in
+                // `commit_swap_locked` and this buffer bypassed it. Passing
+                // `None` here is what routes it to the blocking wait, which is
+                // the fail-safe direction: a poll for a value nothing will
+                // publish is a hang.
                 cb.record_gpu_time_on_completion();
                 cb.commit();
                 cb.wait_until_completed();
             }
             MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled => {
-                cb.wait_until_completed();
+                polls = arm.wait_for(cb, event, signalled)?;
             }
             MTLCommandBufferStatus::Completed => {}
             MTLCommandBufferStatus::Error => return Err(Self::cb_error(cb)),
@@ -762,7 +991,7 @@ impl Commands {
             return Err(Self::cb_error(cb));
         }
 
-        Ok(())
+        Ok(polls)
     }
 
     fn cb_error(cb: &CommandBuffer) -> MetalKernelError {

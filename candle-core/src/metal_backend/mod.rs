@@ -40,6 +40,18 @@ pub use candle_metal_kernels::metal::{
 /// rather than the mechanism (§7.1a-i).
 pub use candle_metal_kernels::metal::CutPolicy;
 
+/// How the host waits for a committed command buffer (`DESIGN.md` §11.5o,
+/// issue #559).
+///
+/// Re-exported for `CutPolicy`'s reason, and it is the same shape: resolved once
+/// per `Commands` rather than process-global, so a harness reads it back from
+/// the device (`MetalDevice::completion_wait_name`) rather than from the
+/// environment variable that selected it. Reading the variable is reading the
+/// *flag*; reading the device is reading the *mechanism*, and §7.1a-i measured
+/// the gap between them at `--attn flash` reporting `AttnImpl=Generic` for
+/// eighteen issues.
+pub use candle_metal_kernels::metal::completion::CompletionWait;
+
 /// The memory budget: predict the peak before allocating, and refuse (§9.5).
 ///
 /// Re-exported for the same reason `trace` is: a model deciding whether its

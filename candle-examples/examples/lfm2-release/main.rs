@@ -185,15 +185,23 @@ struct Args {
 
     /// How the host waits for the GPU to publish, on `--token-ring` runs.
     ///
-    /// `spin`, `spin-hint`, `sleep`, or `sleep:<micros>`. §11.5g reports
-    /// `surviving_count` = 3 on this and declines to pick; so does this, and so
-    /// does #513. All three arms sit behind one enum whose `wait()` is the only
-    /// place they differ, so the flag exposes the seam without resolving it --
-    /// which is what lets a later measurement discriminate them without a
+    /// `spin`, `spin-hint`, `wfe` (aarch64), `sleep`, or `sleep:<micros>`.
+    /// §11.5g reports `surviving_count` = 3 on *which arm is best* and that is
+    /// still not resolved; the flag exposes the seam without resolving it,
+    /// which is what lets a later measurement discriminate the arms without a
     /// rebuild. An unrecognised value is an error rather than a fallback
     /// (§2.4, after #69's vacuous determinism run).
-    #[arg(long, default_value = "spin")]
-    poll: String,
+    ///
+    /// **Unset takes `PollMechanism::default()`, and #578 is why that is not
+    /// spelled here.** This carried `default_value = "spin"`, which *shadowed*
+    /// the type's own default: flipping the default in `poll.rs` would have
+    /// changed nothing on either harness, and the `RESULT` line would have gone
+    /// on reporting the arm the CLI pinned. That is §7.1a-i's wrong-arm shape
+    /// pointed at a default rather than at a rendering -- two sources of truth
+    /// for one choice, with the losing one still on the line. The default now
+    /// lives in exactly one place.
+    #[arg(long)]
+    poll: Option<String>,
 
     /// Read the EOS flag **without blocking**, on `--token-ring` runs (#535).
     ///
@@ -656,7 +664,11 @@ fn main() -> Result<()> {
     // (§2.4, after #69's vacuous run: an invalid setting must fail loudly,
     // because a silent fallback produces a run that reports one arm and
     // executes another).
-    let poll = PollMechanism::from_str(&args.poll).map_err(anyhow::Error::msg)?;
+    // Unset takes the type's default rather than a string spelled here (#578).
+    let poll = match &args.poll {
+        Some(s) => PollMechanism::from_str(s).map_err(anyhow::Error::msg)?,
+        None => PollMechanism::default(),
+    };
 
     // **The ring is `--temperature 0` only, and this refuses rather than
     // silently running the other arm.** §11.5f measures `sample_f`'s
@@ -950,6 +962,14 @@ fn main() -> Result<()> {
                     // fallback, not to time anything.
                     const POLL_BUDGET: u64 = 50_000_000;
                     let mut spins: u64 = 0;
+                    // The watched word, resolved once (#578). See the sibling
+                    // loop in `lfm2-decode-profile` for the argument; `Wfe`
+                    // arms the exclusive monitor on it and every other arm
+                    // ignores it.
+                    //
+                    // SAFETY: the pointer is valid while `r` is alive, and `r`
+                    // outlives this loop.
+                    let watched = unsafe { r.step_addr() };
                     loop {
                         poll_iters += 1;
                         match r.poll_eos(generation) {
@@ -963,7 +983,18 @@ fn main() -> Result<()> {
                                     poll_fallbacks += 1;
                                     break r.eos_flag().to_vec1::<u8>()?[0] != 0;
                                 }
-                                poll.wait();
+                                match watched {
+                                    // Wait for the counter to CHANGE from what
+                                    // the poll just saw, not from a value
+                                    // derived from the ordinal -- the compare
+                                    // exists to skip the wait when the word has
+                                    // already moved.
+                                    Some(p) => {
+                                        let seen = unsafe { p.read_volatile() };
+                                        unsafe { poll.wait_on(p, seen) }
+                                    }
+                                    None => poll.wait(),
+                                }
                             }
                         }
                     }
@@ -1288,6 +1319,9 @@ fn main() -> Result<()> {
     let (peek_hit, peek_unmapped) = candle::metal_backend::peek_counts();
     #[cfg(not(feature = "metal"))]
     let (peek_hit, peek_unmapped) = (0u64, 0u64);
+    // See the `peek arms` line below: #578's fast path moves neither counter
+    // above, so this is the one that says the poll ran.
+    let poll_reads = candle_transformers::generation::token_ring::poll_read_count();
 
     // #559's completion arm, **read back from the device rather than from the
     // flag** (§7.1a-i), and its engagement pair beside it. `(0, 0)` under an
@@ -1329,7 +1363,15 @@ fn main() -> Result<()> {
         "  readback arms       to_cpu_fast={fast} to_cpu_blit={blit} \
          to_cpu_null_after_wait={null_after_wait}"
     );
-    println!("  peek arms           peek_hit={peek_hit} peek_unmapped={peek_unmapped}");
+    // `poll_reads` beside the peek pair for #578's reason: the poll's fast path
+    // reads through an address resolved once and so increments neither
+    // `peek_hit` nor `peek_unmapped`. On a mapped run those two read zero for a
+    // path that ran every iteration, which is indistinguishable from a path
+    // that never ran (§3.1c) -- this is the counter that separates them.
+    println!(
+        "  peek arms           peek_hit={peek_hit} peek_unmapped={peek_unmapped} \
+         poll_reads={poll_reads}"
+    );
 
     // ---- the axis vector (#567's reopening) --------------------------------
     //
@@ -1443,7 +1485,7 @@ fn main() -> Result<()> {
          prefill_submit_ms={:.4} final_kv_len={} hit_eos={} token_ring={} \
          ring_publishes={} poll={} poll_iters={} max_in_flight={} to_cpu_fast={} \
          to_cpu_blit={} to_cpu_null_after_wait={} nonblocking_eos={} \
-         poll_fallbacks={} peek_hit={} peek_unmapped={} completion_wait={} \
+         poll_fallbacks={} peek_hit={} peek_unmapped={} poll_reads={} completion_wait={} \
          completion_signals={} completion_polls={} gemv_silu={} gemv_residual={} \
          config=[{}] token_digest={}",
         args.n,
@@ -1483,6 +1525,7 @@ fn main() -> Result<()> {
         poll_fallbacks,
         peek_hit,
         peek_unmapped,
+        poll_reads,
         cw_name,
         cw_signals,
         cw_polls,

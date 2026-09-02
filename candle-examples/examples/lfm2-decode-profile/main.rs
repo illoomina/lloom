@@ -805,7 +805,12 @@ impl Axes {
         // five-minute measurement, and a silently-ignored flag makes a run
         // report an arm it did not execute (§2.4, after #69's vacuous
         // determinism run).
-        let poll = PollMechanism::from_str(&args.poll).map_err(anyhow::Error::msg)?;
+        // Unset takes the type's default rather than a string spelled in the
+        // arg attribute (#578).
+        let poll = match &args.poll {
+            Some(s) => PollMechanism::from_str(s).map_err(anyhow::Error::msg)?,
+            None => PollMechanism::default(),
+        };
 
         // **The ring is `--temperature 0` only.** §11.5f measures `sample_f`'s
         // temperature path taking the same `to_cpu` over the whole vocabulary
@@ -1561,17 +1566,23 @@ struct Args {
 
     /// How the host waits for the ring to publish, on `--token-ring` runs.
     ///
-    /// `spin`, `spin-hint`, `sleep`, or `sleep:<micros>`. §11.5g reports
-    /// `surviving_count` = 3 on this and declines to pick; so does this. §11.5l
-    /// measures the three as indiscriminable **on the arm as wired**, because
-    /// nothing spins — and §11.5o records that they become discriminable once
-    /// `--nonblocking-eos` composes with an async `--completion-wait`, which is
-    /// a combination only this harness can now select.
+    /// `spin`, `spin-hint`, `wfe` (aarch64), `sleep`, or `sleep:<micros>`.
+    /// §11.5g reports `surviving_count` = 3 on *which arm is best* and that is
+    /// still not resolved. §11.5l measures the arms as indiscriminable **on the
+    /// arm as wired**, because nothing spins — and §11.5o records that they
+    /// become discriminable once `--nonblocking-eos` composes with an async
+    /// `--completion-wait`, which is a combination only this harness can now
+    /// select.
     ///
     /// An unrecognised value is an error rather than a fallback (§2.4, after
     /// #69's vacuous determinism run).
-    #[arg(long, default_value = "spin")]
-    poll: String,
+    ///
+    /// **Unset takes `PollMechanism::default()` (#578).** This carried
+    /// `default_value = "spin"`, which shadowed the type's own default — so
+    /// flipping the default would have changed nothing here and the `RESULT`
+    /// line would have gone on reporting the CLI's pin. One choice, one source.
+    #[arg(long)]
+    poll: Option<String>,
 
     /// Read the EOS flag **without blocking**, on `--token-ring` runs (#535).
     ///
@@ -3225,6 +3236,14 @@ fn main() -> Result<()> {
                 // is free to decline.
                 const POLL_BUDGET: u64 = 50_000_000;
                 let mut spins: u64 = 0;
+                // The watched word, resolved once (#578). `Wfe` arms the
+                // exclusive monitor on it; every other arm ignores it. `None`
+                // when the allocation is unmapped, and then the address-free
+                // wait is used and only the monitor is lost.
+                //
+                // SAFETY: the pointer is valid while `r` is alive, and `r`
+                // outlives this loop.
+                let watched = unsafe { r.step_addr() };
                 loop {
                     poll_iters += 1;
                     match r.poll_eos(generation) {
@@ -3237,7 +3256,23 @@ fn main() -> Result<()> {
                                 poll_fallbacks += 1;
                                 break r.eos_flag().to_vec1::<u8>()?[0] != 0;
                             }
-                            axes.poll.wait();
+                            match watched {
+                                // Wait for the counter to CHANGE from what the
+                                // poll just saw. `expect` is the observed value
+                                // rather than `generation - 1`: the two are the
+                                // same only when no step was missed, and the
+                                // point of the compare is to skip the wait when
+                                // the word has already moved -- which needs the
+                                // value actually read, not one derived from the
+                                // ordinal. A `WFE` can also retire on its own
+                                // (§3.7h), so the loop re-reads and re-tests
+                                // after every return either way.
+                                Some(p) => {
+                                    let seen = unsafe { p.read_volatile() };
+                                    unsafe { axes.poll.wait_on(p, seen) }
+                                }
+                                None => axes.poll.wait(),
+                            }
                         }
                     }
                 }
@@ -4689,7 +4724,7 @@ fn main() -> Result<()> {
     // | arm | counter | what a zero means |
     // |---|---|---|
     // | `--token-ring` | `ring_publishes` | the ring never published |
-    // | `--nonblocking-eos` | `peek_hit` | the peek never succeeded |
+    // | `--nonblocking-eos` | `peek_hit` + `poll_reads` | neither read ran |
     // | `--completion-wait` | `completion_signals` | no signal was encoded |
     //
     // `to_cpu_fast`/`to_cpu_blit` are already on the line above and are the
@@ -4702,6 +4737,14 @@ fn main() -> Result<()> {
     let (peek_hit, peek_unmapped) = candle::metal_backend::peek_counts();
     #[cfg(not(feature = "metal"))]
     let (peek_hit, peek_unmapped) = (0u64, 0u64);
+    // #578 split the peek into two arms and `peek_hit` counts only one of them.
+    // The poll now reads through an address resolved once, which calls nothing
+    // that increments `peek_hit` -- so on a mapped run that counter reads
+    // **zero for a path that ran every iteration**, which is exactly the shape
+    // §3.1c warns about: a zero that is indistinguishable from a path that
+    // never ran. `poll_reads` is the counter for the arm that actually carried
+    // the run, and the pair is what makes either readable.
+    let poll_reads = candle_transformers::generation::token_ring::poll_read_count();
     // Read back from the device rather than from the flag (§7.1a-i), and at a
     // different height from `peek_hit` rather than a duplicate of it:
     // `peek_hit` counts reads that skipped a wait, this counts waits that were
@@ -4839,7 +4882,7 @@ fn main() -> Result<()> {
          metal_libraries={} metal_pipelines={} \
          token_ring={} ring_publishes={} ring_eos_publishes={} ring_reads_token={} \
          poll={} poll_iters={} poll_fallbacks={} max_in_flight={} \
-         nonblocking_eos={} peek_hit={} peek_unmapped={} \
+         nonblocking_eos={} peek_hit={} peek_unmapped={} poll_reads={} \
          completion_wait={} completion_signals={} completion_polls={} \
          profiling={} config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
@@ -5069,6 +5112,7 @@ fn main() -> Result<()> {
         args.nonblocking_eos,
         peek_hit,
         peek_unmapped,
+        poll_reads,
         axes.completion_wait_arm(),
         cw_signals,
         cw_polls,

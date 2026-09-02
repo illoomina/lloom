@@ -623,15 +623,21 @@ struct Axes {
     /// `None` on a non-Metal device, where there is no command buffer to wait
     /// for — a third fact, distinct from either arm.
     ///
-    /// **Carries the sleeping arm's PERIOD**, which the device's own
+    /// **Carries a parameterised arm's PERIOD**, which the device's own
     /// `completion_wait_name()` does not — see [`Axes::completion_wait_arm`].
     completion_wait: Option<&'static str>,
-    /// The sleeping arm's period in microseconds, or `None` on the other two.
+    /// A parameterised arm's period, or `None` on the arms that have none.
+    ///
+    /// **Two arms carry one** (#583): `shared-event-sleep`'s is a sleep in
+    /// **microseconds** and `shared-event-wait`'s is a timeout in
+    /// **milliseconds**. The unit is implied by the arm name they are rendered
+    /// beside, so one field serves both rather than one field per unit — a
+    /// second copy of the list is what §11.3h warns decays.
     ///
     /// Held beside the name rather than folded into it because the name is a
     /// `&'static str` from the device and the period is a run-time value; the
     /// two are joined only at render time, in one place.
-    completion_wait_micros: Option<u64>,
+    completion_wait_period: Option<u64>,
 }
 
 /// The `AttnImpl` arm, as `.bench/configurations.md` §1 spells it.
@@ -805,7 +811,12 @@ impl Axes {
         // five-minute measurement, and a silently-ignored flag makes a run
         // report an arm it did not execute (§2.4, after #69's vacuous
         // determinism run).
-        let poll = PollMechanism::from_str(&args.poll).map_err(anyhow::Error::msg)?;
+        // Unset takes the type's default rather than a string spelled in the
+        // arg attribute (#578).
+        let poll = match &args.poll {
+            Some(s) => PollMechanism::from_str(s).map_err(anyhow::Error::msg)?,
+            None => PollMechanism::default(),
+        };
 
         // **The ring is `--temperature 0` only.** §11.5f measures `sample_f`'s
         // temperature path taking the same `to_cpu` over the whole vocabulary
@@ -919,17 +930,26 @@ impl Axes {
             // immediately after constructing the device, so this reads the
             // period *of the arm the device installed*. Without that assertion
             // it would be reading the flag (§7.1a-i).
+            //
+            // **Both parameterised arms are read here** (#583). The wait arm's
+            // period is a TIMEOUT in milliseconds rather than a sleep in
+            // microseconds, and it is carried for the identical reason: an arm
+            // whose period does not reach the axis vector renders equal to the
+            // same arm at a different period.
             #[cfg(feature = "metal")]
-            completion_wait_micros: match candle::metal_backend::CompletionWait::from_str_arm(
+            completion_wait_period: match candle::metal_backend::CompletionWait::from_str_arm(
                 &args.completion_wait,
             ) {
                 Ok(candle::metal_backend::CompletionWait::SharedEventSleep { micros }) => {
                     Some(micros)
                 }
+                Ok(candle::metal_backend::CompletionWait::SharedEventWait { timeout_ms }) => {
+                    Some(timeout_ms)
+                }
                 _ => None,
             },
             #[cfg(not(feature = "metal"))]
-            completion_wait_micros: None,
+            completion_wait_period: None,
         })
     }
 
@@ -950,9 +970,16 @@ impl Axes {
     ///
     /// The two unparameterised arms defer to the device's own name, so they
     /// stay read back from the mechanism rather than from the flag.
+    ///
+    /// **`shared-event-wait` joined the parameterised set** (#583) and its
+    /// period is a **timeout in milliseconds**, not a sleep in microseconds.
+    /// The rendering is `arm:period` either way because the arm name already
+    /// says which unit it is — `shared-event-sleep:50` is 50 µs and
+    /// `shared-event-wait:2000` is 2000 ms — and a second field for the unit
+    /// would be a second copy of a list (§11.3h).
     fn completion_wait_arm(&self) -> String {
-        match (self.completion_wait, self.completion_wait_micros) {
-            (Some(name), Some(micros)) => format!("{name}:{micros}"),
+        match (self.completion_wait, self.completion_wait_period) {
+            (Some(name), Some(period)) => format!("{name}:{period}"),
             (Some(name), None) => name.to_string(),
             (None, _) => "n/a".to_string(),
         }
@@ -1561,17 +1588,23 @@ struct Args {
 
     /// How the host waits for the ring to publish, on `--token-ring` runs.
     ///
-    /// `spin`, `spin-hint`, `sleep`, or `sleep:<micros>`. §11.5g reports
-    /// `surviving_count` = 3 on this and declines to pick; so does this. §11.5l
-    /// measures the three as indiscriminable **on the arm as wired**, because
-    /// nothing spins — and §11.5o records that they become discriminable once
-    /// `--nonblocking-eos` composes with an async `--completion-wait`, which is
-    /// a combination only this harness can now select.
+    /// `spin`, `spin-hint`, `wfe` (aarch64), `sleep`, or `sleep:<micros>`.
+    /// §11.5g reports `surviving_count` = 3 on *which arm is best* and that is
+    /// still not resolved. §11.5l measures the arms as indiscriminable **on the
+    /// arm as wired**, because nothing spins — and §11.5o records that they
+    /// become discriminable once `--nonblocking-eos` composes with an async
+    /// `--completion-wait`, which is a combination only this harness can now
+    /// select.
     ///
     /// An unrecognised value is an error rather than a fallback (§2.4, after
     /// #69's vacuous determinism run).
-    #[arg(long, default_value = "spin")]
-    poll: String,
+    ///
+    /// **Unset takes `PollMechanism::default()` (#578).** This carried
+    /// `default_value = "spin"`, which shadowed the type's own default — so
+    /// flipping the default would have changed nothing here and the `RESULT`
+    /// line would have gone on reporting the CLI's pin. One choice, one source.
+    #[arg(long)]
+    poll: Option<String>,
 
     /// Read the EOS flag **without blocking**, on `--token-ring` runs (#535).
     ///
@@ -1587,10 +1620,18 @@ struct Args {
     #[arg(long)]
     nonblocking_eos: bool,
 
-    /// How the host waits for a committed command buffer (§11.5o, issue #559).
+    /// How the host waits for a committed command buffer (§11.5o, issue #559;
+    /// §11.5t, issue #583).
     ///
-    /// `synchronize` (the default and the incumbent), `shared-event`, or
-    /// `shared-event-sleep[:<micros>]`.
+    /// `synchronize` (the default and the incumbent), `shared-event`,
+    /// `shared-event-sleep[:<micros>]`, or `shared-event-wait[:<timeout_ms>]`.
+    ///
+    /// **The four arms are three designs, not four tunings** (#583). The two
+    /// middle arms are **poll loops** over `signaledValue`; `shared-event-wait`
+    /// is `waitUntilSignaledValue:timeoutMS:` and **parks in the runtime**, so
+    /// it reports `completion_polls=0` structurally. Its period is a **timeout
+    /// in milliseconds** — a fail-safe that falls back to blocking, not a
+    /// latency knob — where the sleeping arm's is a sleep in microseconds.
     ///
     /// **Three axes on one seam, at different heights**, and they compose
     /// rather than substitute:
@@ -3225,6 +3266,14 @@ fn main() -> Result<()> {
                 // is free to decline.
                 const POLL_BUDGET: u64 = 50_000_000;
                 let mut spins: u64 = 0;
+                // The watched word, resolved once (#578). `Wfe` arms the
+                // exclusive monitor on it; every other arm ignores it. `None`
+                // when the allocation is unmapped, and then the address-free
+                // wait is used and only the monitor is lost.
+                //
+                // SAFETY: the pointer is valid while `r` is alive, and `r`
+                // outlives this loop.
+                let watched = unsafe { r.step_addr() };
                 loop {
                     poll_iters += 1;
                     match r.poll_eos(generation) {
@@ -3237,7 +3286,23 @@ fn main() -> Result<()> {
                                 poll_fallbacks += 1;
                                 break r.eos_flag().to_vec1::<u8>()?[0] != 0;
                             }
-                            axes.poll.wait();
+                            match watched {
+                                // Wait for the counter to CHANGE from what the
+                                // poll just saw. `expect` is the observed value
+                                // rather than `generation - 1`: the two are the
+                                // same only when no step was missed, and the
+                                // point of the compare is to skip the wait when
+                                // the word has already moved -- which needs the
+                                // value actually read, not one derived from the
+                                // ordinal. A `WFE` can also retire on its own
+                                // (§3.7h), so the loop re-reads and re-tests
+                                // after every return either way.
+                                Some(p) => {
+                                    let seen = unsafe { p.read_volatile() };
+                                    unsafe { axes.poll.wait_on(p, seen) }
+                                }
+                                None => axes.poll.wait(),
+                            }
                         }
                     }
                 }
@@ -4689,7 +4754,7 @@ fn main() -> Result<()> {
     // | arm | counter | what a zero means |
     // |---|---|---|
     // | `--token-ring` | `ring_publishes` | the ring never published |
-    // | `--nonblocking-eos` | `peek_hit` | the peek never succeeded |
+    // | `--nonblocking-eos` | `peek_hit` + `poll_reads` | neither read ran |
     // | `--completion-wait` | `completion_signals` | no signal was encoded |
     //
     // `to_cpu_fast`/`to_cpu_blit` are already on the line above and are the
@@ -4702,6 +4767,14 @@ fn main() -> Result<()> {
     let (peek_hit, peek_unmapped) = candle::metal_backend::peek_counts();
     #[cfg(not(feature = "metal"))]
     let (peek_hit, peek_unmapped) = (0u64, 0u64);
+    // #578 split the peek into two arms and `peek_hit` counts only one of them.
+    // The poll now reads through an address resolved once, which calls nothing
+    // that increments `peek_hit` -- so on a mapped run that counter reads
+    // **zero for a path that ran every iteration**, which is exactly the shape
+    // §3.1c warns about: a zero that is indistinguishable from a path that
+    // never ran. `poll_reads` is the counter for the arm that actually carried
+    // the run, and the pair is what makes either readable.
+    let poll_reads = candle_transformers::generation::token_ring::poll_read_count();
     // Read back from the device rather than from the flag (§7.1a-i), and at a
     // different height from `peek_hit` rather than a duplicate of it:
     // `peek_hit` counts reads that skipped a wait, this counts waits that were
@@ -4839,7 +4912,7 @@ fn main() -> Result<()> {
          metal_libraries={} metal_pipelines={} \
          token_ring={} ring_publishes={} ring_eos_publishes={} ring_reads_token={} \
          poll={} poll_iters={} poll_fallbacks={} max_in_flight={} \
-         nonblocking_eos={} peek_hit={} peek_unmapped={} \
+         nonblocking_eos={} peek_hit={} peek_unmapped={} poll_reads={} \
          completion_wait={} completion_signals={} completion_polls={} \
          profiling={} config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
@@ -5069,6 +5142,7 @@ fn main() -> Result<()> {
         args.nonblocking_eos,
         peek_hit,
         peek_unmapped,
+        poll_reads,
         axes.completion_wait_arm(),
         cw_signals,
         cw_polls,

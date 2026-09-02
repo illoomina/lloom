@@ -2049,6 +2049,111 @@ impl Tensor {
         }
     }
 
+    /// [`Self::peek_vec1`] for a single element, without allocating (lloom #578).
+    ///
+    /// Identical contract -- Metal only, contiguous rank 1, matching dtype, not
+    /// fresh, not ordered, `None` when the allocation is unmapped -- and the
+    /// same `peek_hit`/`peek_unmapped` counters, so an engagement count means
+    /// the same thing on either call.
+    ///
+    /// # Why this exists beside `peek_vec1`
+    ///
+    /// `peek_vec1` answers a one-word question by materialising a `Vec` of the
+    /// **whole** storage and then a second `Vec` for the slice. On the poll
+    /// path that is two heap allocations per iteration at ~283 000 iterations
+    /// per token (#578), which is an allocator storm in the function whose
+    /// entire purpose was to stop touching the allocator on the decode path
+    /// (§11.5n: `to_cpu_fast` 65 -> 1). Callers reading one element take this;
+    /// `peek_vec1` stays for callers that genuinely want the vector.
+    ///
+    /// **This still takes the storage lock**, so it is not free of
+    /// synchronization -- it is free of *allocation*. A caller polling in a
+    /// tight loop that must not touch the lock either wants
+    /// [`Self::peek_scalar_ptr`], which resolves the mapping once.
+    pub fn peek_scalar<S: crate::WithDType>(&self, index: usize) -> Option<S> {
+        // Read by the `metal` arm below only; without that feature every
+        // backend falls through to `None`, exactly as `peek_vec1` does, and the
+        // parameter is genuinely unused rather than ignorable.
+        #[cfg(not(feature = "metal"))]
+        let _ = index;
+        if self.rank() != 1 || !self.is_contiguous() {
+            return None;
+        }
+        match &*self.storage() {
+            // `cfg`'d rather than stubbed, exactly as `peek_vec1` above: §14.1
+            // makes not breaking the CPU and CUDA builds a hard constraint and
+            // `dummy_metal_backend::MetalStorage` has no buffer to peek at.
+            #[cfg(feature = "metal")]
+            Storage::Metal(storage) => {
+                if storage.dtype() != S::DTYPE {
+                    return None;
+                }
+                // Contiguous and rank 1, so the allocation's elements are the
+                // tensor's elements in order and the view's offset selects
+                // this one. Bounds are checked against the view rather than
+                // the allocation: `o2` is this tensor's end, which may be
+                // shorter than the storage.
+                let (o1, o2) = self.layout.contiguous_offsets()?;
+                let at = o1.checked_add(index)?;
+                if at >= o2 {
+                    return None;
+                }
+                storage.peek_scalar::<S>(at)
+            }
+            // Deliberately unserved rather than silently blocking, per
+            // `peek_vec1`: a caller reaching for a non-blocking read and
+            // getting a blocking one back would be measuring the wrong arm.
+            _ => None,
+        }
+    }
+
+    /// The raw mapped address of element `index`, resolved **once** (lloom #578).
+    ///
+    /// Returns `None` under exactly [`Self::peek_scalar`]'s conditions, so a
+    /// caller that gets `Some` here may read through it with the same contract
+    /// -- not fresh, not ordered, possibly torn above one word (§3.7g).
+    ///
+    /// # Why a pointer rather than a repeated call
+    ///
+    /// A poll loop asking "has the GPU published yet" 283 000 times per token
+    /// (#578) pays a storage `RwLock` acquisition per iteration to re-derive an
+    /// address that cannot have changed: the ring's allocation is stable by
+    /// design and §10.3e names buffer-identity stability as load-bearing.
+    /// Resolving once at construction turns the poll into a load and a compare.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid only while this tensor keeps the
+    /// allocation alive, and **only** if the layout is not changed underneath
+    /// it. It is unsafe for that reason rather than for the read itself: the
+    /// read is the same racy-by-design load `peek_scalar` performs, which
+    /// #535 measures as well-defined in practice on a mapped Shared allocation.
+    /// A caller must hold the `Tensor` for as long as it holds the pointer, and
+    /// must not use it across an operation that could reallocate the storage.
+    /// The peek counters are **not** incremented here -- there is no per-read
+    /// call to count -- so a caller polling through this pointer owes its own
+    /// engagement counter.
+    #[cfg(feature = "metal")]
+    pub unsafe fn peek_scalar_ptr<S: crate::WithDType>(&self, index: usize) -> Option<*const S> {
+        if self.rank() != 1 || !self.is_contiguous() {
+            return None;
+        }
+        match &*self.storage() {
+            Storage::Metal(storage) => {
+                if storage.dtype() != S::DTYPE {
+                    return None;
+                }
+                let (o1, o2) = self.layout.contiguous_offsets()?;
+                let at = o1.checked_add(index)?;
+                if at >= o2 {
+                    return None;
+                }
+                storage.peek_scalar_ptr::<S>(at)
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the data contained in a 2D tensor as a vector of vector of scalar values.
     pub fn to_vec2<S: crate::WithDType>(&self) -> Result<Vec<Vec<S>>> {
         let (dim1, dim2) = self.dims2()?;

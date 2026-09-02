@@ -46,6 +46,26 @@
 
 use candle::{DType, Device, Result, Tensor};
 
+/// Reads the poll made through a resolved address (#578).
+///
+/// **The fast path moves no other counter, and that is why this exists.**
+/// `peek_hit` is incremented inside `MetalStorage::peek_cpu`; a poll that reads
+/// through an address resolved once never calls it, so the engagement figure
+/// for the fast path would otherwise be **zero on a path that ran every time**
+/// -- indistinguishable from a path that never ran (§3.1c: *a zero is not
+/// evidence unless something nonzero came from the same command*). An
+/// optimisation whose engagement nobody counts is one whose null reads as a
+/// result (§2.4).
+static POLL_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reads made through the resolved address since process start (#578).
+///
+/// Pairs with `candle::metal_backend::peek_counts` the way that pair is used on
+/// a `RESULT` line: together they say which arm of the poll carried the run.
+pub fn poll_read_count() -> u64 {
+    POLL_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A persistent device-resident input token, written by the GPU.
 ///
 /// Holds the state that survives a decode step:
@@ -112,6 +132,47 @@ pub struct TokenRing {
     /// after it, and a caller that cannot accept that bound has
     /// [`Self::eos_flag`]'s blocking read unchanged beside it.
     step: Tensor,
+    /// The mapped addresses of `step[0]` and `eos[0]`, resolved once (#578).
+    ///
+    /// **This is the whole of #578's first defect.** `poll_eos` used to reach
+    /// `peek_vec1`, which acquires the storage `RwLock`, materialises a `Vec`
+    /// of the whole storage and then a second `Vec` for the slice -- two heap
+    /// allocations and a lock to read one `u32`, at ~283 000 poll iterations
+    /// per token. The non-blocking path existed to stop touching the allocator
+    /// on the decode path (§11.5n: `to_cpu_fast` 65 -> 1) and was replacing a
+    /// blocking readback with an allocator storm.
+    ///
+    /// Resolving the address once is sound here for the reason §10.3e names:
+    /// these allocations are **stable by design** -- `publish` writes in place
+    /// with `slice_set` and never reallocates, and the tensors are held by this
+    /// struct for the length of the generation, which is the same property that
+    /// keeps them out of the pool's reuse scan (§9.2a layer 3).
+    ///
+    /// `None` when either allocation is unmapped -- an allocator property
+    /// (§15.2 #12a's 16384 B threshold) that #454 measures as unstable run to
+    /// run -- in which case [`Self::poll_eos`] falls back to the locking peek
+    /// rather than failing, so the fast path is an optimisation and not a new
+    /// precondition.
+    mapped: Option<Mapped>,
+}
+
+/// The two addresses [`TokenRing::poll_eos`] reads, and the `Tensor`s they
+/// belong to are owned by the same struct.
+///
+/// Raw pointers are not `Send`/`Sync` and the ring must stay both, so they are
+/// held as `usize` and rebuilt at the read. That is a lint accommodation rather
+/// than a semantic one: the addresses are valid for exactly as long as the
+/// `TokenRing` that owns the tensors, which is what
+/// `Tensor::peek_scalar_ptr`'s safety contract requires.
+#[cfg(feature = "metal")]
+struct Mapped {
+    step: usize,
+    eos: usize,
+}
+
+#[cfg(not(feature = "metal"))]
+struct Mapped {
+    _never: std::convert::Infallible,
 }
 
 impl TokenRing {
@@ -145,12 +206,40 @@ impl TokenRing {
         // 32-bit, so one word is one store and 11-of-20 torn pairs is a
         // property of publishing *two*.
         let step = Tensor::from_vec(vec![0u32], 1, device)?;
+        // Resolve the poll's two addresses once (#578). Both must be mapped for
+        // the fast path to be usable -- a partial resolution would leave
+        // `poll_eos` reading one word through a pointer and the other through
+        // the locking peek, which is two contracts in one function for no gain.
+        let mapped = Self::resolve_mapped(&step, &eos);
         Ok(Self {
             input,
             eos,
             eos_ids,
             step,
+            mapped,
         })
+    }
+
+    /// The mapped addresses, or `None` if either allocation is unmapped.
+    #[cfg(feature = "metal")]
+    fn resolve_mapped(step: &Tensor, eos: &Tensor) -> Option<Mapped> {
+        // SAFETY: the pointers are stored beside the tensors that own them in
+        // the same struct, so they cannot outlive the allocations; `publish`
+        // writes in place and never reallocates (§10.3e), so they stay valid
+        // for the ring's lifetime. Nothing is read here.
+        unsafe {
+            let s = step.peek_scalar_ptr::<u32>(0)?;
+            let e = eos.peek_scalar_ptr::<u8>(0)?;
+            Some(Mapped {
+                step: s as usize,
+                eos: e as usize,
+            })
+        }
+    }
+
+    #[cfg(not(feature = "metal"))]
+    fn resolve_mapped(_step: &Tensor, _eos: &Tensor) -> Option<Mapped> {
+        None
     }
 
     /// Writes the sampled token into the input slot **in place** and computes
@@ -264,9 +353,18 @@ impl TokenRing {
     ///
     /// A caller unwilling to take that bound has the blocking read unchanged:
     /// `eos_flag().to_vec1::<u8>()`.
+    /// # Allocation, and why this is not `peek_vec1` any more (#578)
+    ///
+    /// This is polled ~283 000 times per token, so it does **zero** heap
+    /// allocations and takes **no lock** on the fast path: both words are read
+    /// through addresses resolved once at construction (see [`Self::mapped`]).
+    /// The previous spelling reached `peek_vec1` twice, each acquiring the
+    /// storage lock and materialising two `Vec`s to deliver one scalar.
+    ///
+    /// The locking peek remains the fallback for an unmapped allocation, so the
+    /// behaviour is unchanged and only the cost differs.
     pub fn poll_eos(&self, generation: u32) -> Option<bool> {
-        let observed = self.step.peek_vec1::<u32>()?;
-        let seen = *observed.first()?;
+        let seen = self.peek_step()?;
         // `>=` rather than `==`: a poller that missed an intermediate value
         // must not spin forever. The counter is monotone, so a larger value
         // means this step published and a later one did too -- which is a
@@ -274,8 +372,71 @@ impl TokenRing {
         if seen < generation {
             return None;
         }
-        let flag = self.eos.peek_vec1::<u8>()?;
-        Some(*flag.first()? != 0)
+        Some(self.peek_eos_flag()? != 0)
+    }
+
+    /// The generation counter, through the resolved address when there is one.
+    #[inline]
+    fn peek_step(&self) -> Option<u32> {
+        #[cfg(feature = "metal")]
+        if let Some(m) = &self.mapped {
+            POLL_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // SAFETY: `m.step` was resolved from `self.step`, which this struct
+            // owns and which `publish` writes in place without reallocating
+            // (§10.3e), so the address is live for this borrow. The GPU may be
+            // writing it concurrently -- that is the point, and the contract on
+            // `MetalStorage::peek_scalar` states the value may be stale or
+            // torn. `read_volatile` is what stops the load being hoisted out of
+            // a caller's poll loop.
+            return Some(unsafe { (m.step as *const u32).read_volatile() });
+        }
+        self.step.peek_scalar::<u32>(0)
+    }
+
+    /// The EOS flag, through the resolved address when there is one.
+    #[inline]
+    fn peek_eos_flag(&self) -> Option<u8> {
+        #[cfg(feature = "metal")]
+        if let Some(m) = &self.mapped {
+            // SAFETY: as `peek_step` above; `m.eos` was resolved from
+            // `self.eos`, owned by this struct and written in place.
+            return Some(unsafe { (m.eos as *const u8).read_volatile() });
+        }
+        self.eos.peek_scalar::<u8>(0)
+    }
+
+    /// The address of the generation counter, for a poll loop that wants to
+    /// wait **on** it rather than merely between reads of it (#578).
+    ///
+    /// `PollMechanism::Wfe` arms the exclusive monitor on the watched word, so
+    /// it needs the address; every other arm ignores it. `None` when the
+    /// allocation is unmapped, in which case the caller uses the address-free
+    /// `wait` and loses only the monitor.
+    ///
+    /// # Safety
+    ///
+    /// The pointer is valid while this `TokenRing` is alive. The caller must
+    /// not read through it after dropping the ring, and must treat the value as
+    /// possibly stale or concurrently written -- it is the same racy-by-design
+    /// word [`Self::poll_eos`] reads.
+    pub unsafe fn step_addr(&self) -> Option<*const u32> {
+        #[cfg(feature = "metal")]
+        if let Some(m) = &self.mapped {
+            return Some(m.step as *const u32);
+        }
+        None
+    }
+
+    /// Whether the poll is reading through resolved addresses (#578).
+    ///
+    /// The fast path takes no lock and allocates nothing, so it moves **no**
+    /// counter -- there is no call to count. A test asserting the poll is
+    /// allocation-free needs to know which path ran, and a run's `RESULT` line
+    /// needs it for the same reason the peek counters are on it: an
+    /// optimisation whose engagement nobody counts is one whose null reads as a
+    /// result (§2.4).
+    pub fn poll_is_mapped(&self) -> bool {
+        self.mapped.is_some()
     }
 
     /// The generation counter, for a caller that wants to observe it directly.

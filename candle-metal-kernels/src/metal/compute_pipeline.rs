@@ -39,6 +39,22 @@ impl ComputePipeline {
         self.name.as_deref()
     }
 
+    /// The kernel function name as a shared handle, if it was recorded.
+    ///
+    /// The borrowing [`Self::name`] above is the right shape for a caller that
+    /// only reads; this one is for the caller that has to *keep* the name past
+    /// the pipeline's borrow. Cloning the `Arc` bumps a refcount where
+    /// `Arc::from(self.name())` would allocate and copy the bytes a second
+    /// time -- and the field is already an `Arc<str>` for exactly the reason
+    /// this method exists (see its doc comment above).
+    ///
+    /// `encoder::note_pipeline` is the hot consumer: under
+    /// `CANDLE_METAL_PROFILE=1` it fires once per dispatch, ~677 per decode
+    /// token (`DESIGN.md` §11.2), and it was re-allocating at every one.
+    pub fn name_handle(&self) -> Option<Arc<str>> {
+        self.name.clone()
+    }
+
     pub fn max_total_threads_per_threadgroup(&self) -> usize {
         self.raw.maxTotalThreadsPerThreadgroup()
     }

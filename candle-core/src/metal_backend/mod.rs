@@ -2268,6 +2268,84 @@ impl MetalStorage {
         Some(slice.to_vec())
     }
 
+    /// One element of [`Self::peek_cpu`], read through the mapping without
+    /// allocating (lloom #578).
+    ///
+    /// Same contract, same counters, same fail-closed arm: not fresh, not
+    /// ordered, `None` when the allocation is unmapped. The difference is that
+    /// nothing is copied -- `peek_cpu` materialises a `Vec` of the **whole**
+    /// storage to answer a question about one word, which on the poll path is
+    /// an allocation per iteration at ~283 000 iterations per token (#578).
+    ///
+    /// `index` is bounds-checked against `self.count` rather than trusted: the
+    /// caller's index comes from a tensor layout and this is the last point at
+    /// which the extent is known, so an out-of-range read fails closed here
+    /// instead of reading past the mapping.
+    ///
+    /// # `black_box` is load-bearing, for the same reason as the sibling
+    ///
+    /// Per §11.5d/#445 and #454's survey a bare null test on an ObjC getter's
+    /// return is eliminated at `opt-level=1` with LTO off. This function ships
+    /// in exactly that configuration, so the guard is written the same way.
+    pub(crate) fn peek_scalar<T: Copy>(&self, index: usize) -> Option<T> {
+        // NOTE: this body reaches NOTHING that waits on, drains, or otherwise
+        // orders against the GPU, exactly as `peek_cpu` above. The gate that
+        // pins that for both is `issue_535_peek_is_not_blocking` at the end of
+        // this file, which scans each function's own source; the forbidden
+        // calls are named there rather than here so the gate's needles cannot
+        // match this comment.
+        if index >= self.count {
+            return None;
+        }
+        let src = std::hint::black_box(self.buffer.contents());
+        if src.is_null() {
+            PEEK_UNMAPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
+        PEEK_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: `src` is non-null and CPU-mapped, `self.buffer` keeps the
+        // allocation alive for this borrow, and `index < self.count` is the
+        // extent this storage was created with -- checked above rather than
+        // assumed.
+        //
+        // The GPU may be writing this element concurrently, which is the point,
+        // and `read_volatile` is what stops the compiler hoisting the load out
+        // of a caller's poll loop: the value is expected to change without any
+        // write this thread can see. The read may be torn or stale and the
+        // contract above says so; what it may not be is a fault, because the
+        // mapping is live. `T: Copy` keeps this to plain data with no drop.
+        Some(unsafe { (src as *const T).add(index).read_volatile() })
+    }
+
+    /// The mapped address of element `index`, resolved once (lloom #578).
+    ///
+    /// Same predicate as [`Self::peek_scalar`] -- `None` for an unmapped
+    /// allocation or an out-of-range index -- so a `Some` here licenses exactly
+    /// the reads that call would have served. The counters are deliberately
+    /// **not** touched: this resolves an address rather than performing a peek,
+    /// and counting it as a hit would inflate the engagement figure by one per
+    /// construction rather than one per read.
+    ///
+    /// # Safety
+    ///
+    /// The pointer is valid while `self.buffer` is alive and the allocation
+    /// stays mapped. The caller must keep the owning `Tensor` alive and must
+    /// not read through it after an operation that could reallocate.
+    pub(crate) unsafe fn peek_scalar_ptr<T: Copy>(&self, index: usize) -> Option<*const T> {
+        // NOTE: this body reaches NOTHING that waits on, drains, or otherwise
+        // orders against the GPU. It resolves an address and returns.
+        if index >= self.count {
+            return None;
+        }
+        let src = std::hint::black_box(self.buffer.contents());
+        if src.is_null() {
+            return None;
+        }
+        // SAFETY: `src` is non-null and `index < self.count`, so the offset is
+        // within the extent this storage was created with.
+        Some(unsafe { (src as *const T).add(index) })
+    }
+
     pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
         let size = self.count * self.dtype.size_in_bytes();
 
@@ -3387,32 +3465,88 @@ mod issue_535_peek_is_not_blocking {
         "waitUntilCompleted",
     ];
 
-    fn peek_cpu_body(src: &str) -> &str {
-        let start = src
-            .find("pub(crate) fn peek_cpu<T: Clone>")
-            .expect("peek_cpu not found -- this gate is pinned to a name that moved");
+    /// The body of `fn <name>`, from its signature to the next `pub(crate) fn`.
+    ///
+    /// **Scoped to ONE function deliberately.** Before #578 this helper ended
+    /// `peek_cpu` at `to_cpu`'s signature, and inserting `peek_scalar` between
+    /// them silently widened the scan to cover both -- which would have passed,
+    /// and would have been `CONTRIBUTING.md` §3.1b rule 4's *incidental
+    /// coverage*: the second function protected by an accident of source order,
+    /// with nothing saying so, and a later reordering taking it live again.
+    /// Each non-blocking function now names itself here and has its own arm.
+    /// `fn <name>`'s signature, safe or `unsafe`, whichever this one is.
+    ///
+    /// Both spellings are searched rather than one assumed: `peek_scalar_ptr`
+    /// is `pub(crate) unsafe fn`, and a selector matching only the safe form
+    /// would `panic` -- loudly, which is the acceptable direction -- while one
+    /// matching only a *prefix* would silently scan the wrong extent.
+    fn signature_of(name: &str) -> String {
+        format!("pub(crate) fn {name}")
+    }
+
+    fn unsafe_signature_of(name: &str) -> String {
+        format!("pub(crate) unsafe fn {name}")
+    }
+
+    fn body_of<'a>(src: &'a str, name: &str) -> &'a str {
+        let safe = signature_of(name);
+        let unsafe_ = unsafe_signature_of(name);
+        let (start, sig_len) = match src.find(&safe) {
+            Some(i) => (i, safe.len()),
+            None => match src.find(&unsafe_) {
+                Some(i) => (i, unsafe_.len()),
+                None => panic!("{name} not found -- this gate is pinned to a name that moved"),
+            },
+        };
         let rest = &src[start..];
-        let end = rest
-            .find("\n    pub(crate) fn to_cpu<T: Clone>")
-            .expect("could not find the end of peek_cpu (the following fn moved)");
+        // The next function at this indentation ends the body, whether it is
+        // declared `fn` or `unsafe fn`.
+        let tail = &rest[sig_len..];
+        // The last function in an `impl` has no following signature to anchor
+        // on -- `to_cpu` is one -- so the rest of the input is its body. That
+        // over-scans rather than under-scans, which is the safe direction for a
+        // gate asserting a needle is ABSENT, and `each_scan_is_scoped_to_its_own_function`
+        // is what stops a non-blocking arm relying on it.
+        let end = [
+            tail.find("\n    pub(crate) fn "),
+            tail.find("\n    pub(crate) unsafe fn "),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|e| e + sig_len)
+        .unwrap_or(rest.len());
         &rest[..end]
     }
 
+    /// Every function whose entire contract is not to wait.
+    ///
+    /// `peek_scalar` is #578's non-allocating sibling: same mapping, same
+    /// counters, same contract, so the same mutation (M4) applies to it and it
+    /// needs the same gate rather than inheriting one by source position.
+    const NON_BLOCKING: &[&str] = &[
+        "peek_cpu<T: Clone>",
+        "peek_scalar<T: Copy>",
+        "peek_scalar_ptr<T: Copy>",
+    ];
+
     #[test]
-    fn peek_cpu_contains_no_blocking_call() {
+    fn the_non_blocking_peeks_contain_no_blocking_call() {
         let src = include_str!("mod.rs");
-        let body = peek_cpu_body(src);
-        for needle in BLOCKING {
-            // The doc comment above the function mentions `to_cpu`; the body
-            // check starts at the `pub(crate) fn` line, so only code and the
-            // in-body comments are scanned. An in-body comment naming a
-            // blocking call would trip this, which is the conservative
-            // direction.
-            assert!(
-                !body.contains(needle),
-                "peek_cpu's body contains {needle:?} -- the non-blocking read is \
-                 blocking, and no assertion over VALUES can see that (mutate.sh M4)"
-            );
+        for name in NON_BLOCKING {
+            let body = body_of(src, name);
+            for needle in BLOCKING {
+                // The body check starts at the `pub(crate) fn` line, so the doc
+                // comment above it -- which mentions `to_cpu` -- is not
+                // scanned; only code and in-body comments are. An in-body
+                // comment naming a blocking call would trip this, which is the
+                // conservative direction.
+                assert!(
+                    !body.contains(needle),
+                    "{name}'s body contains {needle:?} -- the non-blocking read is \
+                     blocking, and no assertion over VALUES can see that (mutate.sh M4)"
+                );
+            }
         }
     }
 
@@ -3426,22 +3560,80 @@ mod issue_535_peek_is_not_blocking {
     #[test]
     fn the_gate_can_fail() {
         let src = include_str!("mod.rs");
-        let body = peek_cpu_body(src);
-        assert!(
-            body.len() > 200,
-            "the scanned body is {} bytes -- the scope selector is wrong and the \
-             gate above is passing over nothing",
-            body.len()
-        );
+        for name in NON_BLOCKING {
+            let body = body_of(src, name);
+            assert!(
+                body.len() > 200,
+                "the scanned body of {name} is {} bytes -- the scope selector is \
+                 wrong and the gate above is passing over nothing",
+                body.len()
+            );
+        }
         // `to_cpu` is the blocking sibling: the identical scan must trip on it.
-        let start = src
-            .find("pub(crate) fn to_cpu<T: Clone>")
-            .expect("to_cpu not found");
-        let to_cpu = &src[start..];
+        let to_cpu = body_of(src, "to_cpu<T: Clone>");
         assert!(
             BLOCKING.iter().any(|n| to_cpu.contains(n)),
             "the blocking sibling contains none of the needles, so the gate \
              above cannot detect a blocking call at all"
         );
+    }
+
+    /// Every non-blocking body is BOUNDED by a following signature.
+    ///
+    /// `body_of` falls back to end-of-input when a function is the last in its
+    /// `impl`, which is correct for `to_cpu` and would be a silent over-scan
+    /// for a non-blocking arm: its body would swallow every later function, so
+    /// the absence assertion would be about the rest of the file rather than
+    /// about the function, and moving one of these to the end of the `impl`
+    /// would quietly change what is gated. The fallback is kept -- it is what
+    /// lets the positive control scan `to_cpu` at all -- and the case that must
+    /// not use it is asserted here instead.
+    #[test]
+    fn every_non_blocking_body_is_bounded() {
+        let src = include_str!("mod.rs");
+        for name in NON_BLOCKING {
+            let body = body_of(src, name);
+            let start = src.find(&signature_of(name)).unwrap_or_else(|| {
+                src.find(&unsafe_signature_of(name))
+                    .unwrap_or_else(|| panic!("{name} not found"))
+            });
+            assert!(
+                start + body.len() < src.len(),
+                "{name}'s body runs to the end of the file -- it is the last \
+                 function in its impl, so the gate is scanning everything after \
+                 it rather than the function itself"
+            );
+        }
+    }
+
+    /// Each scan covers ONE function, so no arm is protected by source order.
+    ///
+    /// This is the arm that would have caught #578's near-miss: with the old
+    /// `peek_cpu`-to-`to_cpu` selector, inserting a function between them made
+    /// `peek_cpu`'s body **contain** `peek_scalar`, and both were scanned by
+    /// one arm that named only the first. That reads as coverage and is
+    /// position-dependent (§3.1b rule 4), so the property is asserted directly:
+    /// a scanned body must not contain another function's signature.
+    #[test]
+    fn each_scan_is_scoped_to_its_own_function() {
+        let src = include_str!("mod.rs");
+        for name in NON_BLOCKING {
+            let body = body_of(src, name);
+            for other in NON_BLOCKING
+                .iter()
+                .chain(std::iter::once(&"to_cpu<T: Clone>"))
+            {
+                if other == name {
+                    continue;
+                }
+                assert!(
+                    !body.contains(&signature_of(other))
+                        && !body.contains(&unsafe_signature_of(other)),
+                    "the scan for {name} also covers {other} -- the scope selector \
+                     spans two functions, so one of them is gated only by where it \
+                     happens to sit in the file"
+                );
+            }
+        }
     }
 }

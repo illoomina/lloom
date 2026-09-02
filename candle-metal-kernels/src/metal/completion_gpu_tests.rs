@@ -163,24 +163,131 @@ fn the_third_arm_engages_and_agrees() {
     assert_eq!(out, expected(64, 3.0, 1.5));
 }
 
-/// **All three arms agree with the arithmetic, and the arithmetic is external
+/// **Every arm agrees with the arithmetic, and the arithmetic is external
 /// to all of them.**
 ///
 /// §3.1b rule 2: a shape invariant ("the arms agree") is blind to a defect that
 /// shifts every arm equally, and a per-operation defect moves every member by
 /// construction. So the reference is the closed form, and arm-to-arm agreement
 /// is a consequence rather than the assertion.
+///
+/// **The list is checked against the parser rather than maintained by hand**
+/// (#583). This test read *"all three arms"* while a fourth existed and would
+/// have gone on passing over three -- §3.1b rule 4's incidental coverage, where
+/// the blindness is silent in both directions. `ARMS` below is the shared list
+/// and `every_arm_is_covered_here` is what pins it to reality.
 #[test]
 fn every_arm_agrees_with_the_closed_form() {
     let want = expected(128, -2.0, 7.25);
-    for arm in [
-        CompletionWait::Synchronize,
-        CompletionWait::SharedEvent,
-        CompletionWait::SharedEventSleep { micros: 10 },
-    ] {
+    for arm in ARMS {
         let (out, _, _) = run_affine(arm, 128, -2.0, 7.25);
         assert_eq!(out, want, "arm {} disagrees", arm.name());
     }
+}
+
+/// Every arm this file executes. **One list, so a new arm is added once.**
+const ARMS: [CompletionWait; 4] = [
+    CompletionWait::Synchronize,
+    CompletionWait::SharedEvent,
+    CompletionWait::SharedEventSleep { micros: 10 },
+    CompletionWait::SharedEventWait { timeout_ms: 2_000 },
+];
+
+/// **The coverage list is not allowed to fall behind the enum** (#583).
+///
+/// A `const` array is exactly the shape that goes stale: adding an arm to
+/// `CompletionWait` is a compile error at every `match` and **silent** here, so
+/// this file would keep testing the arms it was written with. That is the defect
+/// this test exists to make loud, and it is #583's own subject one level down --
+/// a mechanism that exists and is reached by nothing.
+///
+/// The check is against the **parser**, which is the enumeration a user can
+/// actually select, so it fails when a selectable arm is untested rather than
+/// when the source text changes.
+#[test]
+fn every_arm_is_covered_here() {
+    let selectable = [
+        "synchronize",
+        "shared-event",
+        "shared-event-sleep",
+        "shared-event-wait",
+    ];
+    for name in selectable {
+        let arm = CompletionWait::from_str_arm(name)
+            .unwrap_or_else(|e| panic!("{name} no longer parses: {e}"));
+        assert!(
+            ARMS.iter().any(|a| a.name() == arm.name()),
+            "arm {name} is selectable and is executed by no test in this file"
+        );
+    }
+    // The control: a name that is *not* an arm must not be found in the list,
+    // or the assertion above would pass for any string (§3.1a rule 3).
+    assert!(CompletionWait::from_str_arm("shared-event-park").is_err());
+    assert_eq!(ARMS.len(), selectable.len(), "ARMS has an untested member");
+}
+
+/// **The parking arm performs ZERO polls, and that is the point of it** (#583).
+///
+/// This is issue #583's own definition of done: *"an `MTLSharedEvent` blocking
+/// wait arm exists and `completion_polls` reads 0 on it"*. The polling arms read
+/// 8.2 M on a release run; this one reads 0 **structurally**, because there is
+/// no loop to count.
+///
+/// **The zero is only readable beside the signal count**, which is why both are
+/// asserted: `(signals >= 1, polls == 0)` is a wait that engaged and did not
+/// iterate, while `(0, 0)` is an arm that never ran and is what §11.5o warns a
+/// bare zero cannot be told apart from (§3.1c: a zero is not evidence unless
+/// something nonzero came from the same command).
+///
+/// The dispatch is deliberately large enough that the GPU is still busy when the
+/// host arrives, so the zero cannot be explained by the work being already
+/// finished -- the same reasoning as
+/// `the_async_arm_waits_for_work_that_is_not_already_done`, and it is the
+/// discriminator that makes this a test of *parking* rather than of *luck*.
+#[test]
+fn the_parking_arm_engages_without_a_single_poll() {
+    let n = 1 << 20;
+    let (out, signals, polls) = run_affine(
+        CompletionWait::SharedEventWait { timeout_ms: 2_000 },
+        n,
+        1.0,
+        0.0,
+    );
+    assert!(
+        signals >= 1,
+        "the parking arm encoded no signal, so it did not run (§11.5i)"
+    );
+    assert_eq!(
+        polls, 0,
+        "the parking arm polled: it is supposed to hand the condition to the \
+         runtime, and a nonzero count means it fell back to a loop"
+    );
+    assert_eq!(
+        out[n - 1],
+        (n - 1) as f32,
+        "the parked wait returned before the GPU finished: a wrong value and no \
+         error is what a read-before-write looks like (§3.5)"
+    );
+    assert_eq!(out[0], 0.0);
+}
+
+/// The polling arm on the **same** dispatch does poll, which is what makes the
+/// zero above a measurement rather than a broken counter (#583).
+///
+/// §3.1c: *"a zero is not evidence unless something nonzero came from the same
+/// command."* If `completion_polls` were wired to nothing, the parking arm's 0
+/// would read identically -- so the discriminator is a second arm, on the same
+/// size of work, through the same counter, reading nonzero.
+#[test]
+fn the_polling_arm_polls_on_the_same_work() {
+    let n = 1 << 20;
+    let (_, signals, polls) = run_affine(CompletionWait::SharedEvent, n, 1.0, 0.0);
+    assert!(signals >= 1, "the polling arm encoded no signal");
+    assert!(
+        polls > 0,
+        "the polling arm reported no polls on {n} elements, so the counter is \
+         not attached and the parking arm's zero means nothing"
+    );
 }
 
 /// A larger dispatch, so the wait is not trivially satisfied on its first read.

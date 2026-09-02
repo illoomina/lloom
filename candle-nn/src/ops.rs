@@ -2038,13 +2038,80 @@ impl candle::CustomOp3 for FlashDecoding {
                 candle::bail!("all q, k, v dtypes must match.");
             }
         }
+        // The batch row must be exactly `n_kv_heads` head-strides wide, on both
+        // K and V.
+        //
+        // **This is the precondition the flattened grid below rests on**, and it
+        // is asserted rather than assumed because §3.5 makes the failure silent:
+        // the kernel reaches a batch row only via `kv_head_idx * k_head_stride`
+        // with `kv_head_idx = head_idx / gqa_factor`, so row `b`'s KV sits at
+        // `b * n_kv_heads * stride[1]`. That is the right address iff
+        // `stride[0] == n_kv_heads * stride[1]`.
+        //
+        // It holds for the shapes this path is given — a contiguous
+        // `[B, H_kv, capacity, D]` cache, including under the `narrow(2, 0, len)`
+        // the KV slot hands out, since a dim-2 narrow changes the length and no
+        // stride (§10.3b: *"`N` is the live length and the stride is the
+        // reserved capacity"*). It would **not** hold for a view offset or
+        // narrowed on dim 0 or 1, which is precisely what a paged or
+        // per-sequence cache could introduce — so this check is what such a
+        // change trips on rather than corrupts.
+        // `q` is reached as `queries += head_idx * D` with a flat `head_idx`, so
+        // the (batch, head) plane must be densely packed. At `q seq == 1` — which
+        // the first check above already enforces — contiguity is exactly that.
+        if !q_l.is_contiguous() {
+            candle::bail!(
+                "flash-decoding needs a contiguous `q`: the grid flattens (batch, head) into one \
+                 axis and indexes queries by `head_idx * head_dim` (DESIGN.md 3.5)"
+            );
+        }
+        for (name, l) in [("k", k_l), ("v", v_l)] {
+            let (st, dims) = (l.stride(), l.dims());
+            if st[0] != dims[1] * st[1] {
+                candle::bail!(
+                    "flash-decoding needs `{name}`'s batch stride to be `n_kv_heads` head-strides \
+                     ({} * {} = {}), got {}: the grid flattens (batch, head) into one axis and \
+                     reaches a row by head stride alone (DESIGN.md 3.5, 10.3b)",
+                    dims[1],
+                    st[1],
+                    dims[1] * st[1],
+                    st[0]
+                );
+            }
+        }
         let itype = match q.dtype() {
             DType::F16 => FlashDType::F16,
             DType::F32 => FlashDType::F32,
             other => candle::bail!("unsupported flash-decoding type {other:?}"),
         };
 
-        let n_q_heads = q_l.dim(1)?;
+        // The grid's `y` axis is **(batch x q head) flattened**, not the q head
+        // count — which is what `call_sdpa_vector` already does
+        // (`sdpa.rs`: `let b = q_shape[0] * q_shape[1]`), and the reason the two
+        // must agree is that every offset in `flash_decoding.metal` is computed
+        // from a flat `head_idx`: `queries += head_idx * D`,
+        // `partials + head_idx * stride_chunks * D`, `out + head_idx * D`.
+        //
+        // **Passing `q_l.dim(1)` here is what left rows 1..B-1 unwritten**: the
+        // output is sized `B*H*1*D` by `out_dims` above while the grid covered
+        // only `H`, so at B=2 row 1 read whatever its buffer happened to hold —
+        // measured as a `--batch-check` divergence at step 1 emitting a token
+        // that varied between runs (127999 at B=2, 20392 at B=4), the signature
+        // of unwritten memory rather than of a mis-index.
+        //
+        // # Why flattening is correct for the KV mapping, and its condition
+        //
+        // The kernel derives `kv_head_idx = head_idx / gqa_factor`. For
+        // `head_idx = b*H + h` that is `b*(H/g) + h/g`, which equals the wanted
+        // `b*H_kv + h/g` **iff `H/g == H_kv`** — exactly what the
+        // `n_heads % n_kv_heads == 0` guard above already establishes, since
+        // `g = H/H_kv`. So the same guard that makes GQA well-formed is what
+        // makes the flattening sound; there is no new precondition.
+        //
+        // `gqa_factor` itself is unaffected: `FlashPartialParams::for_step`
+        // derives it from `q_shape[1] / k_shape[1]`, the true head counts.
+        let b_sz = q_l.dim(0)?;
+        let n_q_heads = b_sz * q_l.dim(1)?;
         let head_dim = q_l.dim(D::Minus1)?;
         let n_keys = k_l.dim(2)?;
         let chunk_size = self.page_size * self.pages_per_chunk;

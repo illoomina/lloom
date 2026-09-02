@@ -247,6 +247,41 @@ struct Args {
     /// that number.
     #[arg(long, default_value = "synchronize")]
     completion_wait: String,
+
+    /// Fuse the SiLU onto its producing GEMV's store (§12.2i, #509).
+    ///
+    /// **The mirror of #567's first half.** That change brought the three async
+    /// arms onto `lfm2-decode-profile` so one binary could select all four; the
+    /// epilogues were selectable there and on `lfm2-determinism` and **not
+    /// here**, so this harness — the one with the undrained queue — could select
+    /// three of the four. The reopening comment asks the question directly
+    /// (*"does release select all four? Grep and say"*), and the answer was no:
+    /// `grep -c gemv_silu` read **0** on this file against 5 on the profiler.
+    ///
+    /// **The digests MOVE and that is the engagement proof, not a regression.**
+    /// §12.2i measures `logits_sha256` moving on every epilogue arm while
+    /// `tokens_sha256` does not — the add lands at the f32 accumulator where
+    /// `badd_f16` adds at `T` on the rounded store (§12.2h). This harness
+    /// computes only the token digest (§14.5's clause, and the module header
+    /// says why), so **its digest is expected to be UNMOVED on this arm**, and
+    /// an unmoved token digest here is therefore not evidence the arm engaged.
+    /// The `RESULT` line's axis field is what separates the runs.
+    ///
+    /// Off by default (§7.1a).
+    #[arg(long, default_value_t = false)]
+    gemv_silu: bool,
+
+    /// Fuse the two residual adds onto their producing GEMV's store (§12.2i, #509).
+    ///
+    /// The producers are `out_proj`, `conv.out_proj` and `w2` — 60 dispatches
+    /// per token (§12.2e). **Needs no compile flag since #516**; it used to
+    /// require `-DLLOOM_509_RESIDUAL_EPILOGUE` through `LLOOM_434_METAL_CFLAGS`
+    /// and failed at pipeline load without it.
+    ///
+    /// Off by default (§7.1a), and see `--gemv-silu` on why an unmoved token
+    /// digest does not prove this arm inert.
+    #[arg(long, default_value_t = false)]
+    gemv_residual: bool,
 }
 
 /// Parse LFM2.5-VL-3B's `config.json`.
@@ -377,6 +412,58 @@ const FOLLOW_UPS: [&str; 8] = [
     "Summarize the key points so far.",
     "What is the next thing someone should learn about this?",
 ];
+
+/// An on/off axis arm. `on`/`off` rather than `true`/`false`, matching the
+/// profiler's rendering so the two harnesses' `config=[…]` fields compare
+/// directly — `.bench/configurations.md` §1 declares the arms in this spelling
+/// and `lloom_runs::arms` checks a rendered line against it.
+fn on_off(v: bool) -> String {
+    if v { "on" } else { "off" }.to_string()
+}
+
+/// The `MetalCflags` arm: the compile flags as the compiler resolved them.
+///
+/// `none` rather than the empty string, for the profiler's reason: an arm that
+/// renders empty is indistinguishable from a field the harness failed to fill
+/// in, which is §7.1a-i's confusion. Rendered **verbatim** — two different `-D`s
+/// are two different metallibs and must not compare equal.
+///
+/// Read from the crate's own `OnceLock` rather than from an environment
+/// variable, so it reports what the compiler received. Note that release mode
+/// refuses every `CANDLE_METAL_*` variable but `LLOOM_434_METAL_CFLAGS` is not
+/// one of them, so this is genuinely selectable here.
+fn metal_cflags_arm() -> String {
+    #[cfg(feature = "metal")]
+    {
+        candle_metal_kernels::metal_compile_flags()
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        // No Metal compiler in this build, so there is no metallib for a flag to
+        // reach. Distinct from `none`, which means "a Metal build that set no
+        // flags".
+        "n/a".to_string()
+    }
+}
+
+/// The `MergedUnit` arm (#477): whether the sixteen non-MLX sources were
+/// compiled as one translation unit.
+fn merged_unit_arm() -> &'static str {
+    #[cfg(feature = "metal")]
+    {
+        if candle_metal_kernels::merged_translation_unit() {
+            "on"
+        } else {
+            "off"
+        }
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        "n/a"
+    }
+}
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -514,6 +601,18 @@ fn main() -> Result<()> {
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    // The two GEMV epilogue fusions (§12.2i, #509's wiring), brought onto this
+    // harness by #567's second half so it selects the same four mechanisms the
+    // profiler does. Construction-tier: read by `Mlp::new` at model construction
+    // (`lfm2.rs:1438-1439`), so they must be set before `Model::new` below.
+    //
+    // Assigned from `args` and rendered on the `RESULT` line from `config`
+    // rather than from the flag (§7.1a-i): the field the model reads is the arm
+    // that ran, and a flag echoed back to itself is the two-parses-of-one-value
+    // shape that made `--attn flash` report `AttnImpl=Generic` for the life of
+    // #116.
+    config.gemv_silu = args.gemv_silu;
+    config.gemv_residual = args.gemv_residual;
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
@@ -1052,6 +1151,43 @@ fn main() -> Result<()> {
     // inside. This is the figure comparable to §11.5a's `wall + sample + eos`.
     let steady_tok_s = 1e3 / steady_mean_ms;
 
+    // ---- §11.2b's denominator, on this harness (#567's reopening) ----------
+    //
+    // **`step_ms_per_token` is `steady_mean_ms` here, and the equality is
+    // structural rather than a coincidence to be checked.** §11.2b defines a
+    // step as `wall + sample + eos`, and the three are summed on
+    // `lfm2-decode-profile` because that harness's windows are **disjoint**: it
+    // samples at `main.rs:3080-3277` and opens its step clock afterwards at
+    // `:3395`, so its `wall` excludes the sample readback §11.5a prices at
+    // 441 µs/token, and `step_ms_per_token` has to add the terms back
+    // (`main.rs:4558`).
+    //
+    // **This harness has one `Instant` and it opens BEFORE the sample call**
+    // (`step_start`, above the `--sample-split` drain), so `step_ns` already
+    // contains the forward pass, `sample()` and the EOS test. The three terms
+    // are not disjoint here; they are nested. **Adding them again would be
+    // #299's double count** — subtracting or adding a term to a denominator
+    // that already contains it — which is the exact error §2.5 exists to
+    // prevent and the one §11.2b was written to end.
+    //
+    // So the field is emitted as the identity rather than as a sum, and the
+    // comparability is the point: the same quantity, `wall + sample + eos`,
+    // reached two ways because the two harnesses bracket it differently. What
+    // makes the pair readable is that neither had to change what `wall` means
+    // (§2.6: adding an axis is not moving one) — the profiler's `wall` still
+    // excludes the sample and this one's still includes it.
+    //
+    // **The mean rather than the median, deliberately, and it is the weaker
+    // statistic.** §6.6b measures this distribution with a floor and a
+    // right tail, mean 22 % above median, and `CONTRIBUTING.md` §3.2a's rule is
+    // to prefer the median where `mean_over_median` is far from 1.0. The mean
+    // is used here because the profiler's field is a mean of `wall` plus a mean
+    // of `sample` (`main.rs:3744`, `:3812`) and a comparison between two
+    // harnesses' denominators must be between the same statistic. `step_med_ms`
+    // is on the line beside it for the reader who wants the location estimate,
+    // and it is unchanged.
+    let step_ms_per_token = steady_mean_ms;
+
     println!("model dir             {}", model_dir.display());
     println!("device                {:?}  dtype {:?}", device, dtype);
     println!(
@@ -1195,18 +1331,121 @@ fn main() -> Result<()> {
     );
     println!("  peek arms           peek_hit={peek_hit} peek_unmapped={peek_unmapped}");
 
+    // ---- the axis vector (#567's reopening) --------------------------------
+    //
+    // **This harness printed no `config=[…]` field at all**, which
+    // `grep -c 'config=\['` read as **0** here against 7 on the profiler. That
+    // is a wider hole than the missing denominator the reopening comment names,
+    // and it is the same defect one level out: `lloom_runs::ingest`'s
+    // `from_result_line` accepts **any** `RESULT` line and reads its axes from
+    // `config=[…]` (`ingest.rs:97`), so every release run ingested to date is
+    // `Unrecorded` on all 22 registry axes — and #171's store pools runs whose
+    // axis vectors agree. Two release runs differing in `--attn`, in the ring
+    // arm, or in an epilogue therefore rendered *equal* axis vectors.
+    //
+    // **That is §2.3.9's `MathMode` failure at the level of a harness rather
+    // than of an axis**: not an axis missing from a line, but the line missing
+    // from a binary. The axes were all registered — #567's first half put the
+    // four async arms in `axes::REGISTRY`, `.bench/configurations.md` §1 and
+    // `axis_pairs()` — and this harness simply did not render them.
+    //
+    // Rendered from the **resolved** values (§7.1a-i) rather than from the flag
+    // strings: `config.attn_impl` is what the model was built with, and
+    // `cw_name` comes from the device. The axes this harness cannot select are
+    // stated at their pinned defaults rather than omitted, for the profiler's
+    // reason — *inert* and *unrecorded* are different facts, and only the
+    // second should stop a merge.
+    let conv_state_arm = match config.conv_state {
+        ConvState::Shuffle => "Shuffle".to_string(),
+        ConvState::SlidingRing { k, slack } => format!("SlidingRing(k={k},slack={slack})"),
+        ConvState::RotatingRing { k } => format!("RotatingRing(k={k})"),
+    };
+    // **The sleeping arm carries its PERIOD**, which `name()` drops: it maps
+    // every `SharedEventSleep { micros }` to bare `shared-event-sleep`, so `:50`
+    // and `:200` would render equal while §11.5o measures them at +0.039 against
+    // +0.121 ms of wake latency. #572 repaired this on the profiler and in
+    // `lloom-runs`; rendering `cw_name` here would have re-opened it on the
+    // third harness. §13.5m's `Counter(50)`/`Counter(55)` rule.
+    //
+    // Built from the parsed arm rather than from `cw_name` for the period, and
+    // asserted equal to the device's own name above, so the widening cannot
+    // drift from what actually ran.
+    #[cfg(feature = "metal")]
+    let completion_wait_arm = match completion_wait {
+        candle::metal_backend::CompletionWait::SharedEventSleep { micros } => {
+            format!("shared-event-sleep:{micros}")
+        }
+        other => other.name().to_string(),
+    };
+    #[cfg(not(feature = "metal"))]
+    let completion_wait_arm = "n/a".to_string();
+    // `PollMechanism::name()` has the identical shape and the identical repair
+    // (#572): `Sleep(d)` renders bare.
+    let poll_arm = match poll {
+        PollMechanism::Sleep(d) => format!("sleep:{}", d.as_micros()),
+        other => other.name().to_string(),
+    };
+    let config_line = [
+        // Not selectable here; nothing on the LFM2 path dispatches the packed
+        // variants (§11.3k). Stated at its pinned default.
+        ("ParamStyle", "Split".to_string()),
+        ("Executor", "Classical".to_string()),
+        // This harness never installs an arena: it has no `--arena` flag, so
+        // every allocation comes from the pool. `none(pool)` is the profiler's
+        // own rendering for that state.
+        ("ArenaLayout", "none(pool)".to_string()),
+        ("ArenaOffsets", "Cpu".to_string()),
+        ("HazardKey", "Resource".to_string()),
+        ("AttnImpl", format!("{:?}", config.attn_impl)),
+        ("KvAppend", format!("{:?}", config.kv_append)),
+        ("ConvState", conv_state_arm),
+        ("BarrierScope", "RunStart".to_string()),
+        ("ScratchSizing", "Grow".to_string()),
+        // Release mode forbids `CANDLE_METAL_*` entirely (asserted at the top of
+        // `main`), and `MathMode` is selected by one of those variables, so this
+        // binary can only ever run the default arm. `Fast` is candle's default
+        // (§2.3.9, `kernel.rs:203`) and is the arm every canonical digest
+        // belongs to.
+        ("MathMode", "Fast".to_string()),
+        ("ReplayBarriers", "Always".to_string()),
+        ("MemoryBudget", "None".to_string()),
+        ("ScratchLayout", "Planes".to_string()),
+        // Only reachable under `AttnImpl=FlashDecoding`; this harness has no
+        // flag for either, so they render the model's defaults.
+        ("FlashPageSize", config.flash_page_size.to_string()),
+        ("FlashK", config.flash_pages_per_chunk.to_string()),
+        // B=1 is what this harness runs (the ring's slot is sized for it, and
+        // the source says so above).
+        ("Batch", "1".to_string()),
+        ("CutPolicy", "Counter(50)".to_string()),
+        ("GemvSilu", on_off(config.gemv_silu)),
+        ("GemvResidual", on_off(config.gemv_residual)),
+        ("TokenRing", on_off(args.token_ring)),
+        ("Poll", poll_arm),
+        ("NonblockingEos", on_off(args.nonblocking_eos)),
+        ("CompletionWait", completion_wait_arm),
+        ("MetalCflags", metal_cflags_arm()),
+        ("MergedUnit", merged_unit_arm().to_string()),
+    ]
+    .iter()
+    .map(|(k, v)| format!("{k}={v}"))
+    .collect::<Vec<_>>()
+    .join(" ");
+
     // One machine-readable line, in the shape the other harnesses print, so an
     // analysis script reads a line rather than parsing prose.
     println!(
         "RESULT mode=release n={} warmup={} turns={} generated={} attn={:?} kv_append={:?} \
          conv_state={:?} dtype={:?} seed={} temp={} top_p={} elapsed_s={:.6} \
          end_to_end_tok_s={:.4} steady_ms_per_step={:.6} steady_tok_s={:.4} \
+         step_ms_per_token={:.4} \
          step_sd_ms={:.6} step_p5_ms={:.6} step_med_ms={:.6} step_max_ms={:.6} \
          prefill_submit_ms={:.4} final_kv_len={} hit_eos={} token_ring={} \
          ring_publishes={} poll={} poll_iters={} max_in_flight={} to_cpu_fast={} \
          to_cpu_blit={} to_cpu_null_after_wait={} nonblocking_eos={} \
          poll_fallbacks={} peek_hit={} peek_unmapped={} completion_wait={} \
-         completion_signals={} completion_polls={} token_digest={}",
+         completion_signals={} completion_polls={} gemv_silu={} gemv_residual={} \
+         config=[{}] token_digest={}",
         args.n,
         args.warmup,
         turns_run,
@@ -1222,6 +1461,9 @@ fn main() -> Result<()> {
         end_to_end_tok_s,
         steady_mean_ms,
         steady_tok_s,
+        // §11.2b's denominator. Equal to `steady_ms_per_step` by construction on
+        // this harness rather than by coincidence -- see the derivation above.
+        step_ms_per_token,
         sd_ms,
         p5_ms,
         med_ms,
@@ -1244,6 +1486,11 @@ fn main() -> Result<()> {
         cw_name,
         cw_signals,
         cw_polls,
+        // Read back from `config`, which is what `Mlp::new` consumed, rather
+        // than from `args` (§7.1a-i).
+        config.gemv_silu,
+        config.gemv_residual,
+        config_line,
         token_digest
     );
 

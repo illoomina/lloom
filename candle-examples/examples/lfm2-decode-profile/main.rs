@@ -1506,17 +1506,27 @@ struct Args {
 
     /// Sample inside the forward pass's command buffer (lloom #319).
     ///
-    /// The default path samples the PREVIOUS iteration's logits after
-    /// `device.synchronize()` has already drained the queue, so `argmax` opens
-    /// a fresh command buffer for one dispatch and `to_scalar` waits on a
+    /// The default path samples the PREVIOUS iteration's logits, so `argmax`
+    /// opens a fresh command buffer for one dispatch and `to_scalar` waits on a
     /// second submit -- §11.2a's fixed ~0.5 ms round trip, measured at
     /// **441 µs/token** in §11.5a.
     ///
     /// With this on the `argmax` is enqueued while the forward pass's command
-    /// buffer is still open, so the existing `synchronize()` drains both and
-    /// the readback reads an already-computed value. **One command-buffer
-    /// boundary moved by one dispatch**: no `MTLSharedEvent`, no token ring, no
-    /// dependency on §11.5's bounded window.
+    /// buffer is still open, so the readback reads an already-computed value.
+    /// **One command-buffer boundary moved by one dispatch**: no
+    /// `MTLSharedEvent`, no token ring, no dependency on §11.5's bounded
+    /// window.
+    ///
+    /// > **#567 deleted the per-token drain this used to lean on** (`DESIGN.md`
+    /// > §11.5r). Two clauses here said the queue was *"already drained"* by a
+    /// > `device.synchronize()` and that *"the existing `synchronize()` drains
+    /// > both"*; both are struck, because there is no longer a per-token one.
+    /// > **The arm still does what it claims** — the argmax rides the forward
+    /// > pass's buffer either way, which is the whole mechanism — but what
+    /// > forces the value to be ready is now `to_scalar`'s own
+    /// > `flush_and_wait_current` rather than a drain that ran first. The
+    /// > **441 µs it is measured against was taken under the drain** and is not
+    /// > re-derived here.
     #[arg(long)]
     sample_in_buffer: bool,
 
@@ -2909,7 +2919,28 @@ fn main() -> Result<()> {
     // **so a caller can assert rather than assume** (§2.4). §11.5o reads it
     // flat at 14-17 across a 7.8x span of `n` against 63 at `n` = 64 with the
     // prune removed, which is the bound this arm must reproduce.
+    //
+    // **Read on every arm since #567**, not only the ring's: with the per-token
+    // drain deleted (§11.5r) the queue bound is a property of this loop rather
+    // than of one flag, and it reads **14** here against the **1** every
+    // pre-#567 run recorded.
     let mut max_in_flight: usize = 0;
+
+    // **Whether every command buffer's GPU interval was actually collected**
+    // (lloom #567, `DESIGN.md` §11.5r).
+    //
+    // The per-token drain used to guarantee this by construction: nothing could
+    // still be in flight when the snapshot ran. Without it that guarantee is an
+    // **assumption**, and §2.4's rule is that an instrument which cannot be
+    // shown to have engaged has not measured anything -- so it is counted
+    // rather than assumed, and asserted after the loop.
+    //
+    // `untimed` is the number of committed buffers whose completion handler had
+    // not yet run when their window was snapshotted. **A nonzero value means
+    // `gpu_ms_per_token` is under-counting**, which is exactly the failure the
+    // drain's removal risks and the one no digest and no other counter can see.
+    let mut timed_cbs: u64 = 0;
+    let mut untimed_cbs: u64 = 0;
 
     // The oracle sequence the proposer draws from — the tokens this
     // configuration emits **without** speculation.
@@ -3247,12 +3278,25 @@ fn main() -> Result<()> {
                 // the exact shape the B=1 path always passed.
                 let row = logits.narrow(0, r, 1)?.squeeze(0)?;
                 *slot = if args.sample_split {
-                    // The forward pass has already been synchronized by the
-                    // previous iteration, so `argmax` here enqueues ONE dispatch
-                    // over the vocab and `to_scalar` then blits 4 bytes back and
-                    // blocks on `flush_and_wait_current()`. Synchronizing between
-                    // them attributes the two separately -- which is what decides
+                    // `argmax` here enqueues ONE dispatch over the vocab and
+                    // `to_scalar` then blits 4 bytes back and blocks on
+                    // `flush_and_wait_current()`. Synchronizing between them
+                    // attributes the two separately -- which is what decides
                     // whether the cost is the submit or the transfer (§11.2a).
+                    //
+                    // **This `synchronize` stays, and #567 changed what precedes
+                    // it** (`DESIGN.md` §11.5r). This comment used to open *"the
+                    // forward pass has already been synchronized by the previous
+                    // iteration"* — true until the per-token drain was deleted,
+                    // and **false now**: the previous iteration commits without
+                    // waiting. The split this arm exists to take still comes
+                    // from the `synchronize` *below* rather than from any
+                    // earlier one, so the attribution mechanism is intact — but
+                    // the argmax term now also absorbs whatever of the previous
+                    // forward pass had not finished, so **this arm's split is no
+                    // longer comparable with the figures §11.2a took under the
+                    // drain.** Stated rather than repaired: the repair is a
+                    // separate measurement and this arm is off the default path.
                     let split_start = std::time::Instant::now();
                     let idx = row.argmax(candle::D::Minus1).context("argmax")?;
                     device.synchronize()?;
@@ -3499,21 +3543,29 @@ fn main() -> Result<()> {
 
         // **Issue #319: the argmax rides the forward pass's command buffer.**
         //
-        // Enqueued HERE -- after `forward` and before `synchronize()` -- the
+        // Enqueued HERE -- after `forward`, before the commit below -- the
         // `argmax` dispatch lands in the command buffer the forward pass is
-        // still filling. The `synchronize()` below then drains both, and the
-        // `to_scalar` after it reads a value the GPU has already computed.
+        // still filling, and the `to_scalar` further down reads a value the GPU
+        // has already computed.
         //
         // On the default path this same `argmax` runs at the TOP of the next
-        // iteration, after `synchronize()` has drained the queue -- so it opens
-        // a fresh command buffer for one dispatch and `to_scalar` waits on a
-        // second submit. That is §11.2a's fixed ~0.5 ms round trip, measured at
-        // 441 µs/token in §11.5a. **The dispatch is the same and the arithmetic
-        // is the same; only which buffer carries it moves.**
+        // iteration -- so it opens a fresh command buffer for one dispatch and
+        // `to_scalar` waits on a second submit. That is §11.2a's fixed ~0.5 ms
+        // round trip, measured at 441 µs/token in §11.5a. **The dispatch is the
+        // same and the arithmetic is the same; only which buffer carries it
+        // moves.**
         //
-        // The `to_scalar` is deliberately NOT here: it must follow the
-        // `synchronize()`, because it is the readback and putting it before the
-        // drain would reintroduce the very wait this arm removes.
+        // The `to_scalar` is deliberately NOT here: it is the readback, and it
+        // belongs after the commit rather than before it.
+        //
+        // > **#567 deleted the per-token drain these clauses named** (§11.5r).
+        // > They said the `synchronize()` below *"drains both"* and that the
+        // > default arm's argmax runs *"after `synchronize()` has drained the
+        // > queue"*. **The arm's mechanism is unchanged** — which command buffer
+        // > carries the argmax is decided by where it is enqueued, not by what
+        // > drains afterwards — but what makes the value ready is now
+        // > `to_scalar`'s own `flush_and_wait_current` rather than a drain that
+        // > ran first, and the **441 µs was measured under the drain**.
         let pending_argmax = if args.sample_in_buffer {
             let mut idx = Vec::with_capacity(batch);
             for r in 0..batch {
@@ -3525,12 +3577,64 @@ fn main() -> Result<()> {
             None
         };
 
-        // One synchronization per token. This is what makes the window a single
-        // token rather than a submission queue, and it is also what the decode
-        // loop does anyway: sampling reads the logits back to the CPU, so the
-        // serialization is inherent to the workload, not an artifact of
-        // measuring it.
-        device.synchronize()?;
+        // **The per-token drain is DELETED** (lloom #567, `DESIGN.md` §11.5r).
+        //
+        // What stood here was `device.synchronize()?`, justified as *"what the
+        // decode loop does anyway: sampling reads the logits back to the CPU,
+        // so the serialization is inherent to the workload, not an artifact of
+        // measuring it."* **That second clause was true when it was written and
+        // is false now.** §11.5n built the non-blocking read (`to_cpu_fast` 65
+        // -> 1) and §11.5o made the completion wait a seam, so the engine no
+        // longer requires the stall -- and the harness was asserting one, then
+        // measuring arms whose entire purpose is removing it.
+        //
+        // **And the `max_in_flight = 1` that §11.5p attributed to this drain is
+        // NOT the drain's.** A mutation arm restoring the `synchronize` while
+        // keeping the prune below still reads **13**
+        // (`measurements/issue-567-raw/mutate-nodrain.txt`, ARM A). The 1 was
+        // the OBSERVATION POINT: the pre-existing `flush_and_prune` sits in the
+        // sample block at the *top* of the iteration (`:3162`), which under the
+        // old code ran immediately after the previous step's drain and so read
+        // an empty queue by construction. Three arms, one machine:
+        //
+        // | drain | prune at bottom | `max_in_flight` |
+        // |---|---|---|
+        // | yes | no | **1** |
+        // | yes | **yes** | **13** |
+        // | no | yes | **15** |
+        //
+        // §11.5r corrects the attribution. The deletion is still right, for the
+        // reason above rather than for the queue reading.
+        //
+        // **There is deliberately no `synchronize` arm.** A flag reproducing
+        // today's `wall` byte-for-byte would preserve the defect under a name --
+        // every figure taken through that call measures a decode loop carrying
+        // a forced stall the engine does not need. §11.5r records that fact for
+        // the corpus instead, which is what makes the pre-change rows readable
+        // rather than comparable.
+        //
+        // **What replaces it is a commit without a wait**, which is exactly the
+        // call §11.5h built for this and which `lfm2-release` already makes
+        // (`main.rs:897`): `flush_and_prune` submits the encoder and drops the
+        // `in_flight` entries whose GPU work has finished, returning the
+        // surviving count. **The pruning is the load-bearing half** -- once
+        // nothing blocks per token, `in_flight`'s only two shrink sites are
+        // inside the two blocking calls this change stops making, so without it
+        // the `Vec` grows one retained command buffer per token for the length
+        // of a generation (§11.5h). Errors surface here for the same reason:
+        // with no blocking readback on this path this is the only place a
+        // failed command buffer is observed, and a dropped error presents as
+        // wrong output rather than as a failure (§3.5).
+        //
+        // Called on **every** arm rather than only the ring's, so the queue
+        // bound is a reading this harness takes rather than a property of one
+        // flag -- and so `max_in_flight` means the same thing here as it does
+        // on release.
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &device {
+            let in_flight = m.flush_and_prune()?;
+            max_in_flight = max_in_flight.max(in_flight);
+        }
         let wall = step_start.elapsed().as_secs_f64();
 
         // The readback, on the `--sample-in-buffer` arm only. Timed into the
@@ -3554,6 +3658,39 @@ fn main() -> Result<()> {
             }
         }
 
+        // **The GPU-side window, and it is the one the drain's removal does NOT
+        // move** (lloom #567, `DESIGN.md` §11.5r).
+        //
+        // `profile::reset`'s own doc states a precondition this loop has just
+        // stopped satisfying: call it *"after a device synchronization: an
+        // in-flight command buffer's completion handler fires later and would
+        // otherwise land in the next window."* **So whether the intervals are
+        // still all collected is something this change owes an answer to**, and
+        // the counters accumulated here are that answer. The assertion site
+        // after the loop carries the table and the control arm.
+        //
+        // **Two readings, and the first one was wrong.** The run-final
+        // `command buffers N (N timed)` line reads `14 (14 timed)` -- but it
+        // describes the **last window only**, and accumulating over every
+        // window finds a residue. §3.1c on my own instrument: a summary line
+        // answering a different question from the one being asked.
+        //
+        // **Then a control arm found the residue is not this change's.** Rebuilt
+        // with the drain restored and these counters kept, it is the same size
+        // or larger (21/4357 draining against 14/4409 not, at `n` = 256).
+        // `record_command_buffer` increments *both* compared counts, from
+        // inside the completion handler itself, so what separates them is the
+        // zero-GPU-work filter on the next line and never a buffer still in
+        // flight.
+        //
+        // **What matters for this change is that the quantity does not move**:
+        // `gpu busy / step` reads 17.211 / 17.250 / 17.570 ms at `n` = 64 / 128
+        // / 256 against the draining baseline's 17.246 / 17.450 / 17.615, taken
+        // on the same machine minutes apart -- within **0.24 %**, where the
+        // CPU-side `wall` moves by a factor of ten. **The GPU quantity is
+        // drain-invariant and the CPU one is not**, which is the whole finding
+        // and why the fields below are renamed rather than left to mean
+        // something new under an old name.
         let (gpu, disp) = if profiling {
             let s = profile::snapshot();
             profile::reset();
@@ -3561,6 +3698,8 @@ fn main() -> Result<()> {
             // after the loop there is nothing left to read. This is one token's
             // kernel mix, which is what the inventory should be.
             last_token_kernels = s.by_label.clone();
+            timed_cbs += s.timed_command_buffers;
+            untimed_cbs += s.command_buffers.saturating_sub(s.timed_command_buffers);
             (s.gpu_busy_union_s, s.dispatches)
         } else {
             (0.0, 0)
@@ -3819,6 +3958,39 @@ fn main() -> Result<()> {
     let wall_per_token = wall_mean / spec_tokens_per_step;
     let gpu_per_token = gpu_mean / spec_tokens_per_step;
 
+    // ---- the step, bracketed by OBSERVATION (lloom #567, §11.5r) ---------
+    //
+    // **`wall` no longer bounds a token, and this is the field that does.**
+    //
+    // With the per-token drain deleted, `wall` is the interval from opening the
+    // step clock to the *submit* returning -- CPU encode plus whatever
+    // back-pressure the queue applies -- and it is **not** a bracket around a
+    // token's execution. Measured on this tree at `--token-ring`, same machine,
+    // minutes apart:
+    //
+    // | `n` | draining `wall`/step | non-draining `wall`/step | `gpu busy`/step, both |
+    // |---|---|---|---|
+    // | 64 | 18.047 | **1.793** | 17.246 / 17.211 |
+    // | 128 | 18.565 | **2.638** | 17.450 / 17.250 |
+    // | 256 | 18.752 | **3.619** | 17.570 / 17.570 |
+    //
+    // The draining figure is flat across `n` and the non-draining one **climbs**
+    // -- it is measuring how full the queue is, which is an `n`-dependent
+    // property of the harness rather than a per-token cost. **A `tok/s` computed
+    // from it would read ~558 at `n` = 64**, a fabricated 10x, which is §1.3's
+    // *"a speedup that is too large is a bug signal"* arriving as a bracket
+    // error rather than as a corrupted cache.
+    //
+    // **So the denominator becomes the GPU's own clock**, which is the
+    // observation route: `GPUStartTime`/`GPUEndTime` per command buffer, unioned
+    // over the window (`profile.rs`), already recorded on every arm and shown
+    // above to be **drain-invariant** -- it reads within 0.24 % of the draining
+    // baseline at all three `n`. That is what §2.5.1's *engine* layer is, and it
+    // is the layer the mechanisms this harness selects actually move.
+    //
+    // The step's own binding is below, once the sample, EOS and seam means it
+    // sums exist — see `step_per_token`.
+
     // Standard deviation, so a mean is never reported without its spread.
     let wall_sd = (steady
         .iter()
@@ -3890,6 +4062,26 @@ fn main() -> Result<()> {
          that changed and `seam_mean` is now missing a term"
     );
     let seam_mean = seam_send_mean;
+
+    // **The step, and it is what survived #567's deletion intact**
+    // (`DESIGN.md` §11.5r).
+    //
+    // §11.2b defines a step as `wall + sample + eos` (plus #412's seam) and this
+    // harness sums them because the windows are disjoint. **Deleting the
+    // per-token drain did not change that** — it moved the wait from the first
+    // term into the second, `sample / token` going **0.4204 -> 16.8235 ms**,
+    // and left the sum where it was: **18.6779 ms against the draining
+    // baseline's 18.4674**, same machine, minutes apart.
+    //
+    // So this, and **not** `wall`, is the denominator every rate and share is
+    // taken against from here on. It is the one quantity on this harness that
+    // stays comparable with every pre-#567 row, which is what makes the
+    // deletion checkable against the corpus rather than merely asserted.
+    //
+    // Bound once, so the `RESULT` line, the store and the human-readable block
+    // cannot drift into three different denominators — §2.4's defect, and one
+    // that would be invisible because each number is individually plausible.
+    let step_per_token = wall_per_token + sample_mean + eos_mean + seam_mean;
 
     // Context switches over the steady-state window, per token.
     //
@@ -4015,7 +4207,7 @@ fn main() -> Result<()> {
         );
         println!(
             "  cf. one step        {:.2} ms   <- NOT inside ttft: the first token is",
-            (wall_per_token + sample_mean + eos_mean) * 1e3
+            step_per_token * 1e3
         );
         println!("                                     the PREFILL's argmax (see the bracket)");
         println!("warm process: model already loaded. A cold-start TTFT adds §2.4a's load.");
@@ -4035,39 +4227,78 @@ fn main() -> Result<()> {
     // is §2.4's *"check whether the measurement tool measures the thing its
     // output names"* — the defect that removed `tok_per_s` from the sibling
     // harness (#102).
+    // **Labelled `submit` since #567** (`DESIGN.md` §11.5r): with the per-token
+    // drain deleted this closes when the encoder is submitted, not when the
+    // token is done. It is printed because it is a real quantity and a useful
+    // one -- it is how the queue's back-pressure becomes visible, climbing
+    // 1.79 -> 3.62 ms as `n` goes 64 -> 256 where the draining figure was flat
+    // -- but it is **not** the denominator anything is quoted against.
     println!(
-        "wall / step           {:.3} ms  (sd {:.3}, min {:.3}, med {:.3}, max {:.3})",
+        "submit / step         {:.3} ms  (sd {:.3}, min {:.3}, med {:.3}, max {:.3})",
         wall_mean * 1e3,
         wall_sd * 1e3,
         wall_min * 1e3,
         wall_med * 1e3,
         wall_max * 1e3
     );
+    println!("                      ^ CPU encode+submit only; NOT a token's duration (§11.5r)");
     // The figure §13.4a's table is in: `B / step_time`. At `B = 1` it is the
     // per-sequence rate this harness has always printed, so the row does not
     // change meaning for an unflagged run.
+    //
+    // **Over the STEP rather than the submit window** (#567, §11.5r). Dividing
+    // by the latter printed **540 tok/s** against a true ~54, which is §1.3's
+    // too-large-to-be-real signal arriving as a bracket error. The step is the
+    // denominator that survived the deletion intact -- the wait moved from
+    // `wall` into `sample` and the sum is unchanged -- so this row still means
+    // what it has always meant and still compares with every recorded one.
+    //
+    // Needs no `profiling` guard: all three terms are CPU clocks the harness
+    // takes whether or not the GPU counters ran.
+    let step_mean = wall_mean + sample_mean + eos_mean + seam_mean;
     println!(
         "aggregate throughput  {:.2} tok/s  ({batch} seq x {:.2} tok/s)",
-        batch as f64 / wall_mean,
-        1.0 / wall_mean
+        batch as f64 / step_mean,
+        1.0 / step_mean
     );
     if batch > 1 {
         println!(
             "per-sequence          {:.3} ms/token  ({:.2} tok/s)",
-            wall_mean * 1e3,
-            1.0 / wall_mean
+            step_mean * 1e3,
+            1.0 / step_mean
         );
     }
+    // `step_mean` is the per-STEP sum and `step_per_token` the per-accepted-token
+    // one; at `K = 0` they are equal, and under `--speculate` only the second
+    // is a token cost (§10.2i). Asserted rather than assumed so the two cannot
+    // drift into meaning different things on one line.
+    debug_assert!(
+        spec.windows > 0 || (step_mean - step_per_token).abs() < 1e-12,
+        "the step's per-step and per-token sums disagree at K = 0"
+    );
     if profiling {
         println!(
             "gpu busy / step       {:.3} ms  (sd {:.3})",
             gpu_mean * 1e3,
             gpu_sd * 1e3
         );
+        // **The non-GPU term is taken against the STEP since #567**, not
+        // against `wall` (§11.5r). It was `wall - gpu`, and `wall` is now the
+        // submit window while `gpu` is the token's execution -- neither
+        // contains the other, so that subtraction is the one §2.5.2 obligation
+        // 2 forbids and it read **-15.42 ms** on this change's first run.
+        //
+        // The step does contain both, because the wait the drain used to hold
+        // is now inside `sample` and the step is still their sum. So the term
+        // is recovered rather than lost, and **against a denominator that is
+        // one token rather than one submission** -- which is arguably what it
+        // should always have been: §11.2b records that `wall` and `sample` are
+        // disjoint windows and that quoting a share of `wall` is #299's double
+        // count in miniature.
         println!(
-            "non-gpu / step        {:.3} ms  ({:.1}% of wall)",
-            (wall_mean - gpu_mean) * 1e3,
-            100.0 * (wall_mean - gpu_mean) / wall_mean
+            "non-gpu / step        {:.3} ms  ({:.1}% of step)",
+            (step_mean - gpu_mean) * 1e3,
+            100.0 * (step_mean - gpu_mean) / step_mean
         );
         println!(
             "dispatches / step     {:.1}  (min {}, max {})",
@@ -4515,6 +4746,52 @@ fn main() -> Result<()> {
          -- the mechanism did not engage (DESIGN.md §11.5o, §11.5i, §2.4)",
         axes.completion_wait
     );
+    // **The zero-GPU-work residue, and it is the DRAIN'S INNOCENCE** (lloom
+    // #567, `DESIGN.md` §11.5r).
+    //
+    // This counter was written to catch a defect the drain's removal was
+    // predicted to cause -- an in-flight command buffer whose completion
+    // handler had not run when its window was snapshotted, whose interval is
+    // therefore missing from the union, and which would make
+    // `gpu_ms_per_token` under-count while every digest, every other counter
+    // and the token stream stayed identical (§15.1a's INEXPRESSIVE class).
+    //
+    // **It fired, and then a control arm falsified the diagnosis.** Rebuilt
+    // with the drain RESTORED and this counter kept, the residue is still
+    // there and is not smaller:
+    //
+    // | `n` | drain present | drain deleted |
+    // |---|---|---|
+    // | 64 | 5 / 1089 | 9 / 1076 |
+    // | 128 | 7 / 2177 | 16 / 2236 |
+    // | 256 | **21 / 4357** | **14 / 4409** |
+    //
+    // At `n` = 256 the *draining* arm is worse. **So the residue is a property
+    // of the instrument and not of the drain**, and every `gpu_ms_per_token`
+    // this project has recorded carries it. The mechanism is visible once
+    // looked for: `COMMAND_BUFFERS` is incremented **inside**
+    // `record_command_buffer`, which *is* the completion handler
+    // (`profile.rs:98`), so both counts describe buffers that have already
+    // completed -- and what separates them is the filter on the next line,
+    // `start <= 0.0 || end <= start`, which drops a buffer that **encoded no
+    // GPU work**. A count of not-yet-completed buffers is not a quantity this
+    // instrument can express at all.
+    //
+    // **This is therefore a warning rather than a failure, and the reason it is
+    // not silent is that it is real**: 0.1-0.5 % of buffers, non-monotone in
+    // `n`, present on both arms. Made an error would fail every pre-existing
+    // arm equally, which is CONTRIBUTING.md §1.2's *"weaken a test so it
+    // passes"* inverted -- a gate that fails on the state the corpus chose is
+    // one that gets disabled (§3.1a's own note).
+    if profiling && untimed_cbs > 0 {
+        eprintln!(
+            "note: {untimed_cbs} of {} command buffers encoded no GPU work and are \
+             excluded from the union (profile.rs:101). Present on the draining arm too \
+             -- 21/4357 at n=256 against this arm's 14/4409 -- so it is the instrument's \
+             residue rather than this change's (DESIGN.md §11.5r).",
+            timed_cbs + untimed_cbs
+        );
+    }
     // #366: readbacks that found the buffer unmapped *after* the GPU wait and
     // fell back to the blit. This is the window that used to segfault; printing
     // it is what makes its frequency a number rather than a crash report.
@@ -4541,8 +4818,8 @@ fn main() -> Result<()> {
         }
     };
     println!(
-        "RESULT label={} n={} warmup={} batch={} wall_ms_per_token={:.4} \
-         gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} \
+        "RESULT label={} n={} warmup={} batch={} submit_ms_per_token={:.4} \
+         gpu_ms_per_token={:.4} nongpu_ms_per_token={:.4} timed_cbs={} untimed_cbs={} \
          sample_ms_per_token={:.4} sample_med_ms_per_token={:.4} eos_ms_per_token={:.4} \
          sample_in_buffer={} to_cpu_fast={} to_cpu_blit={} \
          to_cpu_null_after_wait={} step_ms_per_token={:.4} \
@@ -4569,12 +4846,37 @@ fn main() -> Result<()> {
         args.n,
         warmup,
         batch,
-        // Per **accepted token** under `--speculate`, per step otherwise — and
-        // at `K = 0` the two are the same number, so this field means what every
-        // recorded row means (§10.2i, and the divisor's own note above).
+        // **`submit_ms_per_token`, renamed from `wall_ms_per_token` by #567**
+        // (`DESIGN.md` §11.5r), because the quantity changed and §2.4's defect
+        // is a field whose name promises one thing while the arithmetic
+        // delivers another. With the per-token drain deleted this is the CPU's
+        // encode-and-submit window, **not** a bracket around a token: it reads
+        // 1.79 ms at `n` = 64 and 3.62 at 256, climbing with how full the queue
+        // is, where the draining figure was flat at ~18.0-18.8.
+        //
+        // **A parser keying on `wall_ms_per_token` will now MISS rather than
+        // silently mis-read**, which is the intended failure direction: an
+        // absent field compares equal to nothing, where a wrong one compares
+        // equal to every run of that arm (§7.1a-i).
         wall_per_token * 1e3,
         gpu_per_token * 1e3,
-        (wall_per_token - gpu_per_token) * 1e3,
+        // **`nongpu_ms_per_token` is now `step - gpu`, not `wall - gpu`**
+        // (#567, §11.5r). The old subtraction went **negative** -- `-15.4189`
+        // on this change's first run -- because `wall` stopped containing the
+        // GPU while `gpu` still held a whole token. The step contains both, so
+        // the term is recovered against a denominator that is one *token*
+        // rather than one *submission*; §11.2b already records that a share of
+        // `wall` was #299's double count in miniature.
+        (step_per_token - gpu_per_token) * 1e3,
+        // **The instrument's own residue, on the line rather than in a
+        // comment.** `untimed` counts command buffers that completed having
+        // encoded no GPU work and are therefore excluded from the union
+        // (`profile.rs:101`). Measured present on the *draining* arm too, so it
+        // is not this change's -- and it is reported because a reader comparing
+        // a `gpu_ms_per_token` across two runs should be able to see whether
+        // they excluded the same fraction.
+        timed_cbs,
+        untimed_cbs,
         // The sample bucket (#172, #319). DISJOINT from `wall`, so a step is
         // the sum of the three rather than `wall` alone -- which is why
         // `step_ms_per_token` is printed beside them rather than left to be
@@ -4589,11 +4891,28 @@ fn main() -> Result<()> {
         to_cpu_fast,
         to_cpu_blit,
         to_cpu_null_after_wait,
-        // `+ seam_mean`, which is **0.0 on the null arm and on every run this
-        // field has ever carried** — so a recorded row's `step_ms_per_token` is
-        // unchanged and the two arms remain comparable on one denominator
-        // (lloom #412).
-        (wall_per_token + sample_mean + eos_mean + seam_mean) * 1e3,
+        // **The step is STILL `wall + sample + eos + seam`, and the reason is
+        // the finding** (lloom #567, `DESIGN.md` §11.5r).
+        //
+        // The obvious move once `wall` stops holding the forward pass is to
+        // swap in the GPU-bounded term. **That double-counts**, and measuring
+        // it is what showed why: with the per-token drain deleted,
+        // `sample / token` moves **0.4204 -> 16.8235 ms**. The sample is a
+        // blocking readback, so once nothing drains ahead of it *it* is what
+        // waits for the GPU. **The wait did not disappear; it moved from `wall`
+        // into `sample`** -- and `engine + sample` would count that same GPU
+        // time twice, reading 34.19 ms against a true ~18.7.
+        //
+        // So the three terms remain disjoint and still sum, exactly as §11.2b
+        // defines -- what changed is only *which* of them carries the wait.
+        // **`step_ms_per_token` is therefore comparable with every pre-#567
+        // row**, which is the one field that is, and it is why the deletion can
+        // be checked against the corpus at all: 18.6779 here against the
+        // draining baseline's 18.4674, same machine, minutes apart.
+        //
+        // `+ seam_mean` is 0.0 on the null arm and on every run this field has
+        // ever carried (lloom #412).
+        step_per_token * 1e3,
         disp_mean,
         // Floored at 0 rather than subtracted blindly: with profiling off
         // `disp_mean` is 0.0, and `0 - (B-1)` printed **-7.0** at B=8 — a count
@@ -4610,8 +4929,18 @@ fn main() -> Result<()> {
         // yields `spec_tokens_per_step` tokens per row rather than one, so the
         // rate is over the tokens the windows kept — the same divisor the
         // per-token fields take, applied to the same numerator.
-        batch as f64 / wall_per_token,
-        1.0 / wall_per_token,
+        //
+        // **Divided by the STEP since #567, not by `wall`** (§11.5r). `wall` is
+        // now the submit window, and `B / 1.85 ms` would have printed **540
+        // tok/s** against a true ~54 — §1.3's *"a speedup that is too large is
+        // a bug signal"*, and it would have been a fabricated 10x on the field
+        // this project's headline numbers are quoted in.
+        //
+        // The step rather than the engine term, because the step is what a
+        // token costs the caller and it is the one denominator still
+        // comparable with every recorded row (see `step_ms_per_token` above).
+        batch as f64 / step_per_token,
+        1.0 / step_per_token,
         // Tri-state rather than a bool: at `B = 1` there is nothing to compare,
         // and reporting `true` there would claim a check that did not run —
         // §15.1a's vacuous-instrument class, in a field.
@@ -4760,9 +5089,11 @@ fn main() -> Result<()> {
 
     // ---- the run record, at exit (lloom issue #171) ----------------------
     //
-    // Deliberately here: after the last token, after `device.synchronize()`,
-    // after every mean is computed, and after `RESULT` is printed. Nothing
-    // below runs inside a measured window.
+    // Deliberately here: after the last token, after every mean is computed,
+    // and after `RESULT` is printed. Nothing below runs inside a measured
+    // window. (This used to say *"after `device.synchronize()`"*; #567 deleted
+    // that call from the loop, and the property that mattered — being outside
+    // every window — is unchanged.)
     //
     // Absent `--run-store`, nothing is written and nothing fails. `lloom-sample`
     // decided the same way and gives the reason: telemetry failure must degrade
@@ -4780,10 +5111,24 @@ fn main() -> Result<()> {
         // shape §2.4 names — a field whose name promises one quantity while the
         // arithmetic delivers another — and it would be invisible, because both
         // numbers are individually plausible.
+        // **`nongpu` is `step - gpu` since #567**, not `wall - gpu`
+        // (`DESIGN.md` §11.5r). With the per-token drain deleted `wall` is the
+        // submit window while `gpu` is a whole token's execution, so the old
+        // subtraction is between two windows where neither contains the other
+        // (§2.5.2 obligation 2) and it went **negative** — `-15.4189` on this
+        // change's first run. The step contains both, because the wait moved
+        // from `wall` into `sample` and the step is still their sum, so the
+        // term is recovered rather than dropped.
+        //
+        // **The same denominator the `RESULT` line takes**, which is the
+        // correctness requirement the comment above states: the store and the
+        // line describing one run with two different denominators is §2.4's
+        // shape and would be invisible, because both numbers are individually
+        // plausible.
         let (gpu_metric, nongpu_metric, disp_metric) = if profiling {
             (
                 m(gpu_per_token * 1e3),
-                m((wall_per_token - gpu_per_token) * 1e3),
+                m((step_per_token - gpu_per_token) * 1e3),
                 m(disp_mean),
             )
         } else {
@@ -4835,7 +5180,20 @@ fn main() -> Result<()> {
             dtype: format!("{dtype:?}"),
             profiling_compiled: cfg!(feature = "metal"),
             profiling_enabled: profiling,
-            wall_ms_per_token: m(wall_per_token * 1e3),
+            // **The STEP, not the submit window** (lloom #567, `DESIGN.md`
+            // §11.5r). This field is shared with `lfm2-release`, and
+            // `lloom_runs`' store pools runs whose axis vectors agree — so
+            // writing the 1.85 ms submit window into a field release fills with
+            // an ~18 ms step would put two quantities differing by 10x under
+            // one name. That is exactly the shape §11.5q found when release
+            // rendered no `config=[…]` and its runs pooled with this
+            // harness's, and it is worth avoiding twice.
+            //
+            // The step is the leg that still means what this field has always
+            // meant, and §11.5q already records release's own figure as an
+            // identity over the same three terms — so the two harnesses agree
+            // here by construction rather than by coincidence.
+            wall_ms_per_token: m(step_per_token * 1e3),
             gpu_ms_per_token: gpu_metric,
             nongpu_ms_per_token: nongpu_metric,
             dispatches_per_token: disp_metric,

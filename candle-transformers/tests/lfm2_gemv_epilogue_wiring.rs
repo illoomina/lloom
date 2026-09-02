@@ -63,6 +63,10 @@ fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
         flash_pages_per_chunk: 1,
         flash_scratch_sizing: Default::default(),
         kv_append: KvAppend::InPlace,
+        // `Off`, the f16 arm every recorded digest belongs to. Added by #218
+        // after this file was written, which is why it stopped compiling --
+        // `flash_scratch_sizing` above carries the same note from #116.
+        kv_quant: Default::default(),
         conv_state: Default::default(),
         memory_budget: None,
         gemv_silu,

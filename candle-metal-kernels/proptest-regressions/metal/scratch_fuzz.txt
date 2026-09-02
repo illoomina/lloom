@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cf3f0105631d4e5acc8f4a784374e1a995a7e3a1a7e2fad994d2807f264b5b17 # shrinks to geometry = PartialsGeometry { n_heads: 1, head_dim: 32, page_size: 256, batch: 1 }, layers = 1, sizing = Reserve, layout = Planes, kv_len = 131073
+cc c034011811192786fd0d4a2a734b037732871b89972541b849a6b37231f4470d # shrinks to geometry = PartialsGeometry { n_heads: 1, head_dim: 32, page_size: 256, batch: 1 }, layers = 1, sizing = Reserve, layout = Planes, ops = [SeekNear { boundary: 131072, delta: 0 }, Append { n: 1 }]
+cc 49e6f94c1c4669a5101ee83f780c665134c41ba4b31d0d6451b1f209f794b0fa # shrinks to geometry = PartialsGeometry { n_heads: 1, head_dim: 32, page_size: 256, batch: 1 }, layers = 1, sizing = Bucket, layout = Planes, kv_len = 8193

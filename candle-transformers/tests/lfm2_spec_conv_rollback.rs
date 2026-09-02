@@ -46,6 +46,10 @@ fn tiny_config(conv_state: ConvState) -> Config {
         // the axis reached it (#234). Not a choice — see the field.
         flash_scratch_sizing: Default::default(),
         kv_append: KvAppend::InPlace,
+        // `Off`, the f16 arm every recorded digest belongs to. Added by #218
+        // after this file was written, which is why it stopped compiling --
+        // `flash_scratch_sizing` above carries the same note from #116.
+        kv_quant: Default::default(),
         conv_state,
         memory_budget: None,
         // Both epilogue fusions off, per DESIGN.md 7.1a (issue #509).

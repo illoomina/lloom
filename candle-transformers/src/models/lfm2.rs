@@ -3098,4 +3098,487 @@ mod tests {
         );
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // A stateful fuzzer over the slot's append/rewind SEQUENCE (lloom #575).
+    // -----------------------------------------------------------------------
+
+    /// One symbol of the slot's alphabet, as the decode loop drives it.
+    ///
+    /// Deliberately the *loop's* operations: `KvSlot`'s own methods are covered
+    /// by the five tests above, and what is not covered is what happens across
+    /// a long run of them. §10.2a's `advance`/`resolve` pair is a length
+    /// increment followed by a conditional decrement, and the five tests reach
+    /// at most two windows with `k <= 3`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SlotOp {
+        /// Decode `n` positions and keep them: the ordinary step.
+        Append { n: usize },
+        /// A speculative window of `k` positions of which `n` are accepted --
+        /// `advance(k)` then `resolve(_, n)`, which at slot level is an append
+        /// of `k` followed by `rewind(k - n)`.
+        Speculate { k: usize, accept: usize },
+        /// A rewind of more positions than are live. Must be refused, and the
+        /// slot must be unchanged afterwards.
+        RewindPastStart,
+        /// Append exactly enough positions to reach capacity, then one more.
+        ///
+        /// **The boundary itself, drawn as a symbol rather than left to
+        /// chance.** A generator that only draws window sizes lands *near* the
+        /// capacity, essentially never *on* it, so the admitted side of the
+        /// bound is never exercised at the one value that distinguishes `>`
+        /// from `>=`. This symbol pins both sides: filling to exactly capacity
+        /// must be ADMITTED, and one past it must be REFUSED.
+        ///
+        /// **It still does not kill a bound mutated to `> capacity + 1`, and
+        /// that is a finding rather than a gap.** Under that mutant `KvSlot`
+        /// admits one position too many and `Tensor::slice_set` refuses it on
+        /// its own — `candle-core/src/tensor_cat.rs:280` bails on
+        /// `*v2 + offset > *v1`. The write never lands, so **no sequence of
+        /// appends can observe the difference**: this fuzzer asserts
+        /// *behaviour*, and the behaviour is unchanged.
+        ///
+        /// `exceeding_capacity_fails_loudly` does kill it, because it asserts
+        /// the error *text* — which becomes
+        /// `"shape mismatch on target dim, dst: 2, src: 1 + 2"` instead of
+        /// `"KV cache exhausted"`. That is a real and different property: the
+        /// slot's own message names the knob (`Config::kv_capacity`) a caller
+        /// must raise, where `slice_set`'s names two integers. So the two tests
+        /// are **not** redundant and neither subsumes the other — this one
+        /// catches a bound that lets the write through, that one catches a
+        /// bound that stops naming itself. Recorded here because a doc comment
+        /// promising more than its assertions deliver is the sentence a reader
+        /// trusts (§3.1b rule 3).
+        FillToCapacityThenOne,
+        /// A turn boundary, and the next turn runs at `heads` KV heads.
+        ///
+        /// **The head count is carried on the symbol deliberately.** `reset`'s
+        /// contract is that the *buffer* is dropped and not merely the length,
+        /// and `Cache::clear`'s doc gives the reason in as many words: *"a new
+        /// sequence may have a different batch size, so keeping the allocation
+        /// would pin `b_sz` from the previous one."* A fixture whose every turn
+        /// has the same shape cannot see that -- the stale buffer is the right
+        /// size, the writes land, and the mutant is behaviourally identical.
+        ///
+        /// Measured: with a constant shape, `reset` mutated to keep `all_data`
+        /// **survives this fuzzer and all 16 pre-existing tests**. It is
+        /// #574's mutant 2 exactly -- a quantity that is constant across the
+        /// fixture cannot be observed -- reproduced in the harness written to
+        /// catch that class, and repaired the way §3.1a rule 2 says: by fixing
+        /// the INPUT, not by adding a check.
+        Reset { heads: usize },
+    }
+
+    /// What the slot's length and contents should be, from the documented
+    /// contract rather than from `KvSlot`'s fields.
+    ///
+    /// Keeps the accepted tokens' *step ids* rather than tensors: the model has
+    /// no business holding a `Tensor`, and a model that shares the
+    /// implementation's data structures shares its bugs (§15.1h).
+    #[derive(Debug)]
+    struct SlotModel {
+        /// Step id of every live position, in order.
+        live: Vec<usize>,
+        /// KV heads the current turn writes. Changes at a `Reset`, which is
+        /// what makes a buffer kept across turns observable.
+        heads: usize,
+    }
+
+    /// Transitions this state machine has, for #575's *report transitions, not
+    /// lines* rule.
+    #[derive(Debug, Default, Clone, Copy)]
+    struct SlotTransitions {
+        appends: u64,
+        speculations: u64,
+        full_accepts: u64,
+        full_rejects: u64,
+        partial_accepts: u64,
+        rewinds_refused: u64,
+        capacity_refusals: u64,
+        resets_from_nonempty: u64,
+        /// A rewind that returned the slot to a length it had previously held,
+        /// then appended different content there -- the reuse-after-discard
+        /// shape, and the one a length-only assertion cannot see.
+        rewrote_discarded_positions: u64,
+        /// A turn boundary where the next turn's shape differs from the last's.
+        /// The transition that makes `reset` dropping the buffer observable.
+        turns_changed_shape: u64,
+        /// A sequence that landed EXACTLY on capacity. The transition that
+        /// makes the `>` in the bound check observable.
+        filled_to_capacity: u64,
+    }
+
+    /// Drive one sequence against the real slot and the model, comparing the
+    /// full live contents after **every** operation.
+    ///
+    /// Contents and not just the length: a rewind is a length decrement, so a
+    /// defect that decrements correctly and leaves the wrong bytes reachable is
+    /// invisible to a length check. That is §3.1b's *shape invariant* trap --
+    /// `[4,4,4]` is as flat as `[3,3,3]` -- and the reason this compares an
+    /// absolute reference.
+    fn run_slot_sequence(
+        capacity: usize,
+        ops: &[SlotOp],
+        dev: &Device,
+    ) -> std::result::Result<SlotTransitions, String> {
+        let mut slot = KvSlot::new(capacity);
+        let mut model = SlotModel {
+            live: Vec::new(),
+            heads: 2,
+        };
+        let mut t = SlotTransitions::default();
+        // A monotonically increasing step id, so a position written after a
+        // discard carries a *different* value from the one it replaced. Without
+        // this the reuse case is invisible: rewriting a discarded slot with the
+        // same bytes proves nothing (#11.3l finding 3, and #574's mutant 2).
+        let mut next_step = 0usize;
+
+        for (i, op) in ops.iter().enumerate() {
+            match *op {
+                SlotOp::Append { n } => {
+                    let ids: Vec<usize> = (0..n)
+                        .map(|_| {
+                            let s = next_step;
+                            next_step += 1;
+                            s
+                        })
+                        .collect();
+                    let src =
+                        multi_token(&ids, model.heads, dev).map_err(|e| format!("op {i}: {e}"))?;
+                    match slot.append(&src) {
+                        Ok(_) => {
+                            model.live.extend_from_slice(&ids);
+                            t.appends += 1;
+                        }
+                        Err(_) => {
+                            // Refusal is the documented behaviour past capacity.
+                            if model.live.len() + n <= capacity {
+                                return Err(format!(
+                                    "op {i}: append({n}) refused at len {} with capacity \
+                                     {capacity}, where it fits",
+                                    model.live.len()
+                                ));
+                            }
+                            t.capacity_refusals += 1;
+                        }
+                    }
+                }
+                SlotOp::Speculate { k, accept } => {
+                    let ids: Vec<usize> = (0..k)
+                        .map(|_| {
+                            let s = next_step;
+                            next_step += 1;
+                            s
+                        })
+                        .collect();
+                    let src =
+                        multi_token(&ids, model.heads, dev).map_err(|e| format!("op {i}: {e}"))?;
+                    let had = model.live.len();
+                    match slot.append(&src) {
+                        Ok(_) => {
+                            model.live.extend_from_slice(&ids);
+                            let discard = k - accept;
+                            if discard > 0 {
+                                slot.rewind(discard).map_err(|e| {
+                                    format!("op {i}: rewind({discard}) of a {k}-window failed: {e}")
+                                })?;
+                                model.live.truncate(had + accept);
+                                if had + accept < had + k {
+                                    t.rewrote_discarded_positions += 1;
+                                }
+                            }
+                            t.speculations += 1;
+                            if accept == k {
+                                t.full_accepts += 1;
+                            } else if accept == 0 {
+                                t.full_rejects += 1;
+                            } else {
+                                t.partial_accepts += 1;
+                            }
+                        }
+                        Err(_) => {
+                            if had + k <= capacity {
+                                return Err(format!(
+                                    "op {i}: a {k}-position window was refused at len {had} \
+                                     with capacity {capacity}, where it fits"
+                                ));
+                            }
+                            t.capacity_refusals += 1;
+                        }
+                    }
+                }
+                SlotOp::FillToCapacityThenOne => {
+                    // Exactly to the boundary: this must be ADMITTED.
+                    let room = capacity - model.live.len();
+                    if room > 0 {
+                        let ids: Vec<usize> = (0..room)
+                            .map(|_| {
+                                let s = next_step;
+                                next_step += 1;
+                                s
+                            })
+                            .collect();
+                        let src = multi_token(&ids, model.heads, dev)
+                            .map_err(|e| format!("op {i}: {e}"))?;
+                        slot.append(&src).map_err(|e| {
+                            format!(
+                                "op {i}: filling to exactly capacity {capacity} from len {} \
+                                 was refused: {e}. The bound is `len + seq_len > capacity`, \
+                                 so landing ON the capacity must be admitted.",
+                                model.live.len()
+                            )
+                        })?;
+                        model.live.extend_from_slice(&ids);
+                        t.filled_to_capacity += 1;
+                    }
+                    // One past it: this must be REFUSED.
+                    let one = [next_step];
+                    next_step += 1;
+                    let src =
+                        multi_token(&one, model.heads, dev).map_err(|e| format!("op {i}: {e}"))?;
+                    if slot.append(&src).is_ok() {
+                        return Err(format!(
+                            "op {i}: a position past capacity {capacity} was ADMITTED at len \
+                             {}. The slot returns Err rather than reallocating, and a write \
+                             past the allocation is what DESIGN.md §3.5 says nothing catches.",
+                            model.live.len()
+                        ));
+                    }
+                    t.capacity_refusals += 1;
+                }
+                SlotOp::RewindPastStart => {
+                    let too_many = model.live.len() + 1;
+                    let before = model.live.len();
+                    if slot.rewind(too_many).is_ok() {
+                        return Err(format!(
+                            "op {i}: rewind({too_many}) succeeded at len {before}; \
+                             `resolve(n)` may only discard positions this speculation \
+                             appended, and a rewind past the start silently exposes \
+                             positions an earlier turn wrote"
+                        ));
+                    }
+                    t.rewinds_refused += 1;
+                }
+                SlotOp::Reset { heads } => {
+                    if !model.live.is_empty() {
+                        t.resets_from_nonempty += 1;
+                    }
+                    if heads != model.heads {
+                        t.turns_changed_shape += 1;
+                    }
+                    slot.reset();
+                    model.live.clear();
+                    model.heads = heads;
+                }
+            }
+
+            // --- the comparison, after every operation ----------------------
+            let want = &model.live;
+            match slot.all_data.as_ref() {
+                None => {
+                    if !want.is_empty() {
+                        return Err(format!(
+                            "op {i} ({op:?}): slot has no buffer but the model holds {} \
+                             positions",
+                            want.len()
+                        ));
+                    }
+                }
+                Some(all) => {
+                    if slot.len != want.len() {
+                        return Err(format!(
+                            "op {i} ({op:?}): slot.len={} model={}",
+                            slot.len,
+                            want.len()
+                        ));
+                    }
+                    if slot.len > 0 {
+                        let view = all
+                            .narrow(2, 0, slot.len)
+                            .map_err(|e| format!("op {i}: narrow failed: {e}"))?;
+                        let got = view
+                            .flatten_all()
+                            .and_then(|v| v.to_vec1::<f32>())
+                            .map_err(|e| format!("op {i}: readback failed: {e}"))?;
+                        // The SHAPE is part of the comparison, not only the
+                        // values: a buffer kept across a turn that changed
+                        // shape has the wrong dims with the right length.
+                        let dims = view.dims().to_vec();
+                        if dims != [1, model.heads, want.len(), 3] {
+                            return Err(format!(
+                                "op {i} ({op:?}): live view has dims {dims:?}, expected \
+                                 [1, {}, {}, 3]. A buffer kept across a turn boundary pins \
+                                 the previous turn's shape -- `Cache::clear`'s doc gives \
+                                 exactly this reason for dropping the allocation rather \
+                                 than rewinding the length.",
+                                model.heads,
+                                want.len()
+                            ));
+                        }
+                        let expect = expected_values(want, model.heads);
+                        if got != expect {
+                            return Err(format!(
+                                "op {i} ({op:?}): live contents diverge at len {}.\n  \
+                                 slot  = {:?}\n  model = {:?}\n\
+                                 A length that matches with contents that do not is the \
+                                 shape a length-only assertion cannot see (CONTRIBUTING \
+                                 §3.1b).",
+                                slot.len,
+                                &got[..got.len().min(12)],
+                                &expect[..expect.len().min(12)]
+                            ));
+                        }
+                    }
+                }
+            }
+            if slot.len > capacity {
+                return Err(format!(
+                    "op {i} ({op:?}): len {} exceeds capacity {capacity}",
+                    slot.len
+                ));
+            }
+        }
+        Ok(t)
+    }
+
+    /// `[1, heads, seq, 3]` whose every element is a function of its step id
+    /// and head, so a position written by a different step is a *different*
+    /// value and a buffer kept across a shape change is a *shape* error.
+    fn multi_token(ids: &[usize], heads: usize, dev: &Device) -> Result<Tensor> {
+        Tensor::from_vec(expected_values(ids, heads), (1, heads, ids.len(), 3), dev)
+    }
+
+    /// The flattened values a `narrow(2, 0, len)` view must hold.
+    ///
+    /// Dim order is `[b, h, seq, d]`, so the seq axis is second-innermost and
+    /// the values are laid out h-major over seq.
+    fn expected_values(ids: &[usize], heads: usize) -> Vec<f32> {
+        let mut v = Vec::with_capacity(ids.len() * heads * 3);
+        for h in 0..heads {
+            for &id in ids {
+                for d in 0..3 {
+                    v.push((id * 100 + h * 3 + d) as f32);
+                }
+            }
+        }
+        v
+    }
+
+    use proptest::prelude::*;
+
+    fn slot_op_strategy(capacity: usize) -> impl Strategy<Value = SlotOp> {
+        prop_oneof![
+            8 => (1usize..=4).prop_map(|n| SlotOp::Append { n }),
+            6 => (1usize..=4).prop_flat_map(|k| (Just(k), 0..=k))
+                .prop_map(|(k, accept)| SlotOp::Speculate { k, accept }),
+            1 => Just(SlotOp::RewindPastStart),
+            2 => Just(SlotOp::FillToCapacityThenOne),
+            // The head count VARIES across turns. A constant one makes the
+            // fixture blind to `reset` keeping its buffer -- measured, and the
+            // reason the symbol carries the shape at all.
+            1 => prop::sample::select(vec![1usize, 2, 4]).prop_map(|heads| SlotOp::Reset { heads }),
+        ]
+        .prop_filter("window must fit the capacity", move |op| match op {
+            SlotOp::Speculate { k, .. } => *k <= capacity,
+            SlotOp::Append { n } => *n <= capacity,
+            _ => true,
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, max_shrink_iters: 4096, ..ProptestConfig::default() })]
+
+        /// The slot's live contents match a model of its contract across an
+        /// arbitrary sequence of appends, speculative windows and turns.
+        ///
+        /// **The axis no existing test carries.** The five tests above drive at
+        /// most six appends and no rewind at all; the two `lfm2_spec_conv_*`
+        /// integration files reach two windows with `k <= 3`. A partial accept
+        /// followed by a re-append writes *different* content to a position a
+        /// discarded speculation already wrote, and that is the in-flight-reuse
+        /// shape #23 is the precedent for -- at the level of a length rather
+        /// than of a buffer.
+        #[test]
+        fn the_slot_matches_its_model_across_speculation_and_turns(
+            capacity in 4usize..=64,
+            ops in prop::collection::vec(slot_op_strategy(64), 1..80),
+        ) {
+            let ops: Vec<SlotOp> = ops
+                .into_iter()
+                .filter(|op| match op {
+                    SlotOp::Speculate { k, .. } => *k <= capacity,
+                    SlotOp::Append { n } => *n <= capacity,
+                    _ => true,
+                })
+                .collect();
+            if let Err(e) = run_slot_sequence(capacity, &ops, &Device::Cpu) {
+                return Err(TestCaseError::fail(e));
+            }
+        }
+    }
+
+    /// The generator reaches every transition, and names the ones it does not.
+    ///
+    /// #575's *report transitions taken, not lines executed*. Without this the
+    /// property above is #504's `evicted = 0`: a green result over a generator
+    /// that never produced a rejection.
+    #[test]
+    fn the_slot_generator_reaches_every_transition() {
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::{Config, TestRunner};
+
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            ..Config::default()
+        });
+        let strategy = prop::collection::vec(slot_op_strategy(16), 40..80);
+        let mut total = SlotTransitions::default();
+        for _ in 0..256 {
+            let ops = strategy
+                .new_tree(&mut runner)
+                .expect("strategy produces a value")
+                .current();
+            let t = run_slot_sequence(16, &ops, &Device::Cpu)
+                .expect("engagement run diverged; the property should have caught it");
+            total.appends += t.appends;
+            total.speculations += t.speculations;
+            total.full_accepts += t.full_accepts;
+            total.full_rejects += t.full_rejects;
+            total.partial_accepts += t.partial_accepts;
+            total.rewinds_refused += t.rewinds_refused;
+            total.capacity_refusals += t.capacity_refusals;
+            total.resets_from_nonempty += t.resets_from_nonempty;
+            total.rewrote_discarded_positions += t.rewrote_discarded_positions;
+            total.turns_changed_shape += t.turns_changed_shape;
+            total.filled_to_capacity += t.filled_to_capacity;
+        }
+
+        println!("FUZZ575 kvslot transitions: {total:?}");
+        let named: [(&str, u64); 11] = [
+            ("turns_changed_shape", total.turns_changed_shape),
+            ("filled_to_capacity", total.filled_to_capacity),
+            ("appends", total.appends),
+            ("speculations", total.speculations),
+            ("full_accepts", total.full_accepts),
+            ("full_rejects", total.full_rejects),
+            ("partial_accepts", total.partial_accepts),
+            ("rewinds_refused", total.rewinds_refused),
+            ("capacity_refusals", total.capacity_refusals),
+            ("resets_from_nonempty", total.resets_from_nonempty),
+            (
+                "rewrote_discarded_positions",
+                total.rewrote_discarded_positions,
+            ),
+        ];
+        let unreached: Vec<&str> = named
+            .iter()
+            .filter(|(_, n)| *n == 0)
+            .map(|(s, _)| *s)
+            .collect();
+        assert!(
+            unreached.is_empty(),
+            "the generator never reached: {unreached:?}. An unreached transition is the \
+             finding (#575)."
+        );
+    }
 }

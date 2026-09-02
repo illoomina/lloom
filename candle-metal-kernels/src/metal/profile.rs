@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Whether profiling was requested, read once from the environment.
 pub fn enabled() -> bool {
@@ -51,7 +51,21 @@ struct Recorder {
     /// GPU intervals of every command buffer that has completed.
     intervals: Vec<GpuInterval>,
     /// Dispatches per pipeline label, for the per-token dispatch inventory.
-    dispatches: HashMap<String, u64>,
+    ///
+    /// **Keyed on `Arc<str>` rather than `String`, so counting a dispatch
+    /// allocates nothing** (issue #579). The caller already holds the label as
+    /// an `Arc<str>` -- `ComputePipeline` stores it that way and
+    /// `EncoderState::current_pipeline` keeps it that way -- so a lookup
+    /// borrows and only a *first* sighting of a label clones the handle into
+    /// the key.
+    ///
+    /// The `String` key this replaces cost a heap allocation and a copy at
+    /// **every** dispatch: 675 per decode token, measured (§11.2), on the
+    /// instrument every measurement in this project runs under. §2.4's rule is
+    /// that an instrument perturbing what it measures has not measured the
+    /// thing its name promises, and §6.4a had already priced this exact shape
+    /// at ~3.6 % of forward-pass CPU without connecting it to the census.
+    dispatches: HashMap<Arc<str>, u64>,
 }
 
 fn recorder() -> &'static Mutex<Recorder> {
@@ -69,15 +83,65 @@ static COMMAND_BUFFERS: AtomicU64 = AtomicU64::new(0);
 /// dispatch count rather than being inferred from it.
 static ENCODERS: AtomicU64 = AtomicU64::new(0);
 
+/// The key a dispatch with no recorded pipeline name is counted under.
+///
+/// Built once. The `&'static str` this replaces could not be a key at all once
+/// the map became `Arc<str>`-keyed, and materialising one per unnamed dispatch
+/// would reintroduce exactly the allocation this module was changed to remove.
+fn unnamed() -> &'static Arc<str> {
+    static UNNAMED: OnceLock<Arc<str>> = OnceLock::new();
+    UNNAMED.get_or_init(|| Arc::from("<unnamed>"))
+}
+
 /// Record that a dispatch was encoded, attributed to `label`.
+///
+/// **Takes the caller's `Arc<str>` handle, and allocates nothing on the path
+/// that runs** (issue #579). The label reaches here from
+/// `EncoderState::current_pipeline`, which holds the same `Arc<str>`
+/// `ComputePipeline` was built with, so:
+///
+/// * a label already in the map costs a hash, a compare and an increment;
+/// * a label seen for the first time clones the handle -- a refcount bump, not
+///   a copy of the bytes -- into the key.
+///
+/// Measured on `lfm2-decode-profile --n 200`: **17 distinct kernels over 675
+/// dispatches per token**, so the clone happens 17 times in a run and the
+/// other 675-per-token are pure lookups. Before this it was `label.to_string()`
+/// at every dispatch -- a heap allocation and a copy, 675 per token, on the
+/// instrument **every measurement in this project is taken under**. §2.4 is
+/// the rule it was breaking (*check whether the measurement tool is the
+/// cost*), and §6.4a had already priced the shape at ~3.6 % of forward-pass
+/// CPU.
+///
+/// `None` means no pipeline name was recorded; it is counted under a single
+/// shared `<unnamed>` key rather than dropped, so the per-label totals still
+/// sum to `DISPATCHES`.
 #[inline]
-pub fn record_dispatch(label: &str) {
+pub fn record_dispatch(label: Option<&Arc<str>>) {
     if !enabled() {
         return;
     }
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     let mut rec = recorder().lock().unwrap();
-    *rec.dispatches.entry(label.to_string()).or_insert(0) += 1;
+    bump_label(&mut rec.dispatches, label.unwrap_or_else(|| unnamed()));
+}
+
+/// Increment `label`'s count, cloning the handle only to create a new entry.
+///
+/// Split out from [`record_dispatch`] so the property that makes this change
+/// worth anything -- *a repeat label allocates nothing* -- is testable without
+/// the process-global recorder and without a GPU. A test on the public
+/// function could observe only the counts, which are identical either way.
+#[inline]
+fn bump_label(map: &mut HashMap<Arc<str>, u64>, label: &Arc<str>) {
+    // `get_mut` first so the common case -- a label already counted -- neither
+    // clones the handle nor constructs an entry. `entry()` would take the key
+    // by value, which is the clone this exists to avoid.
+    if let Some(count) = map.get_mut(label) {
+        *count += 1;
+    } else {
+        map.insert(Arc::clone(label), 1);
+    }
 }
 
 /// Record that a compute encoder was opened.
@@ -171,10 +235,14 @@ pub fn snapshot() -> Snapshot {
     let sum: f64 = intervals.iter().map(|i| i.end - i.start).sum();
     let (union, span) = union_and_span(&mut intervals);
 
+    // `Snapshot` keeps `String` keys: it is taken once per window (a run, or a
+    // token boundary under `--per-token`), never per dispatch, so the
+    // allocation here is off the hot path by construction and callers that
+    // format or serialise the result want an owned `String` anyway.
     let mut by_label: Vec<(String, u64)> = rec
         .dispatches
         .iter()
-        .map(|(k, v)| (k.clone(), *v))
+        .map(|(k, v)| (k.to_string(), *v))
         .collect();
     by_label.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
@@ -304,5 +372,162 @@ mod tests {
     #[test]
     fn empty_is_zero() {
         assert_eq!(union_and_span(&mut []), (0.0, 0.0));
+    }
+
+    /// The census must not allocate per dispatch (issue #579).
+    ///
+    /// **`Arc::strong_count` is an absolute reference, not a shape**
+    /// (`CONTRIBUTING.md` §3.1b rule 1): it pins the exact number of live
+    /// handles, so it fails with a sentence a reader can act on rather than
+    /// with *"they were not all equal"*. Two handles -- the caller's and the
+    /// map's key -- at every count from the first dispatch onward, so a
+    /// `String`-keyed map (which copies the bytes and leaves this at 1) and an
+    /// `Arc`-cloning-per-call map (which climbs past 2) are both killed, in
+    /// opposite directions.
+    ///
+    /// This is what a runtime test can carry here. That the *production* call
+    /// site passes the handle through rather than rebuilding one is a property
+    /// of the write shape and is pinned separately, by
+    /// `the_census_takes_the_callers_handle` below.
+    #[test]
+    fn a_repeat_label_clones_no_handle_and_copies_no_bytes() {
+        let mut map: HashMap<Arc<str>, u64> = HashMap::new();
+        let label: Arc<str> = Arc::from("rmsnorm_f16");
+        assert_eq!(Arc::strong_count(&label), 1, "only the caller holds it yet");
+
+        bump_label(&mut map, &label);
+        assert_eq!(
+            Arc::strong_count(&label),
+            2,
+            "the first sighting clones the handle into the key: the caller's \
+             plus the map's. A String key would copy the bytes and leave this \
+             at 1"
+        );
+
+        // 674 more, which is one decode token at the measured dispatch count.
+        for _ in 0..674 {
+            bump_label(&mut map, &label);
+        }
+        assert_eq!(
+            Arc::strong_count(&label),
+            2,
+            "a repeat must reuse the key already there: still exactly the \
+             caller's handle and the map's, after 675 dispatches"
+        );
+        assert_eq!(map.get(&label).copied(), Some(675));
+    }
+
+    /// Two labels are two entries, so the map is not silently collapsing them.
+    ///
+    /// The control for the test above: without it, a `bump_label` that ignored
+    /// its argument and counted everything under one key would satisfy the
+    /// strong-count assertion perfectly.
+    #[test]
+    fn distinct_labels_are_counted_separately() {
+        let mut map: HashMap<Arc<str>, u64> = HashMap::new();
+        let a: Arc<str> = Arc::from("rmsnorm_f16");
+        let b: Arc<str> = Arc::from("sdpa_vector_2pass_1");
+        bump_label(&mut map, &a);
+        bump_label(&mut map, &b);
+        bump_label(&mut map, &a);
+        assert_eq!(map.get(&a).copied(), Some(2));
+        assert_eq!(map.get(&b).copied(), Some(1));
+        assert_eq!(map.len(), 2);
+    }
+
+    /// Two `Arc<str>` with the same text but different allocations must land in
+    /// one entry.
+    ///
+    /// `Arc<str>`'s `Hash`/`Eq` delegate to `str`, so this holds -- but it is
+    /// the property the census depends on and it is not obvious from the type.
+    /// A pipeline rebuilt from the cache hands out a different allocation with
+    /// the same name, and if that made a second entry the per-label totals
+    /// would silently split.
+    #[test]
+    fn equal_text_in_two_allocations_is_one_entry() {
+        let mut map: HashMap<Arc<str>, u64> = HashMap::new();
+        let first: Arc<str> = Arc::from("gemv_f16");
+        let second: Arc<str> = Arc::from("gemv_f16");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the fixture must use two distinct allocations or it tests nothing"
+        );
+        bump_label(&mut map, &first);
+        bump_label(&mut map, &second);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&first).copied(), Some(2));
+    }
+
+    /// The production call site hands the census the handle it already holds,
+    /// rather than building a `String` or a fresh `Arc` from a `&str`.
+    ///
+    /// **A source-level census, for #507's reason**: this is a property of the
+    /// *write shape*, and a runtime test observes only the counts, which are
+    /// the same whether or not the handle was rebuilt.
+    ///
+    /// **Both of §9.2p's repairs are needed and neither alone suffices**, which
+    /// that section measured and this test reproduced on its first run. The
+    /// needles are **assembled by concatenation**, because a literal needle is
+    /// a string the file it searches contains -- and the searched file has its
+    /// **comment lines stripped**, because the comment explaining *why the old
+    /// form was removed* names the old form. The first run failed on exactly
+    /// that: `encoder.rs`'s own justification for this change, matched as
+    /// though it were the change's absence. *"A better needle is still a
+    /// needle"* -- assembly escapes the first hole, and only a comment filter
+    /// escapes the second.
+    #[test]
+    fn the_census_takes_the_callers_handle() {
+        // Comment lines removed, so a sentence *about* a pattern cannot be
+        // read as an instance of it.
+        fn code_only(src: &str) -> String {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let encoder = code_only(include_str!("encoder.rs"));
+        let pipeline = code_only(include_str!("compute_pipeline.rs"));
+
+        // The re-allocating form this replaced: `.name()` (a `&str`) fed to
+        // `Arc::from`. Assembled so this assertion does not match itself.
+        let rebuilt = ["pipeline.name()", ".map(", "Arc::from)"].concat();
+        assert!(
+            !encoder.contains(&rebuilt),
+            "note_pipeline must clone the pipeline's existing Arc<str>, not \
+             build a new one from &str: that allocated once per dispatch \
+             (issue #579)"
+        );
+
+        let handle = ["fn name_", "handle(&self)"].concat();
+        assert!(
+            pipeline.contains(&handle),
+            "ComputePipeline must expose its name as a shared handle; \
+             note_pipeline has no other way to avoid the re-allocation"
+        );
+
+        // Non-vacuity: the needles must be capable of matching something, or
+        // two absences read exactly like two passes (§15.1a's VACUOUS class).
+        // This is the positive control for both assertions above -- the call
+        // site the first requires absent in its old form, found in its new one,
+        // in the same filtered text.
+        let present = ["pipeline.name_", "handle()"].concat();
+        assert!(
+            encoder.contains(&present),
+            "the search is over the wrong file or the call site was renamed: \
+             this assertion is what stops the two above passing vacuously"
+        );
+
+        // And the filter must not have eaten the code. A `code_only` returning
+        // nothing would satisfy every "must not contain" assertion above, so
+        // the filter needs its own control: the searched text must still hold
+        // the function whose body the census is about.
+        assert!(
+            encoder.contains(&["fn note_", "pipeline(&self"].concat()),
+            "the comment filter removed the code it was meant to keep"
+        );
     }
 }

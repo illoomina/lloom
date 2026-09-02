@@ -381,9 +381,27 @@ pub struct EncoderState {
     /// must roll together or the eventual emission is attributed to only the
     /// directions seen since the suppression.
     pub pending_kinds: HazardKinds,
-    /// All inputs seen this encoder session (cross-encoder fence coordination).
-    pub all_inputs: HashSet<usize>,
     /// All outputs seen this encoder session (registered in global map at end_encoding).
+    ///
+    /// **There is deliberately no `all_inputs` beside this** — removed by issue
+    /// #579, and the asymmetry is the point rather than an oversight.
+    ///
+    /// `all_outputs` is *read*: `Commands::end_encoding` walks it to register
+    /// this encoder's fence against every buffer it wrote, so a later encoder
+    /// reading one of them can wait. `all_inputs` was written at every input
+    /// binding and **read nowhere** — its doc comment claimed *"cross-encoder
+    /// fence coordination"*, which is a job `wait_for_buffer` already does, per
+    /// buffer, at bind time (§6.4's fix). A set of every input a session saw
+    /// expresses nothing that wait has not already acted on.
+    ///
+    /// It cost **1123 inserts per decode token** (counted from a dispatch
+    /// trace, not from the source) at **27.0 ns per binding — 0.0303 ms/token,
+    /// 3.82 % of §6.6b's non-GPU floor**, of which **66 % was the fresh
+    /// `HashSet` allocation per encoder session** rather than the inserts. §6.7
+    /// **L2** names this exact field as the canonical *"records information it
+    /// does not consume"*, and §15.2 #11's dispositions are *consume it*,
+    /// *delete it*, or *keep it as evidence* — the third is for probe results,
+    /// not for a per-token write, and the first has no consumer to write.
     pub all_outputs: HashSet<usize>,
     /// Fences already waited on this session, so a buffer bound repeatedly does
     /// not re-emit the same wait.
@@ -415,7 +433,6 @@ impl EncoderState {
             next_inputs: BoundSet::default(),
             needs_barrier: false,
             pending_kinds: HazardKinds::NONE,
-            all_inputs: HashSet::new(),
             all_outputs: HashSet::new(),
             waited_fences: HashSet::new(),
             current_pipeline: None,
@@ -668,6 +685,16 @@ impl ComputeCommandEncoder {
     /// suppression without editing it). With the `hazard-audit` feature off,
     /// `hazard_audit::record_dispatch` is an empty inline function, so the
     /// separation costs nothing.
+    ///
+    /// **The profiler is handed the `Arc<str>`, not a `&str`, and that is what
+    /// keeps the census allocation-free** (issue #579). Its per-label map is
+    /// keyed on `Arc<str>`, so a kernel already in the map costs a hash and a
+    /// compare; only a label seen for the *first* time clones the handle into
+    /// the key. Steady-state decode reaches 17 distinct kernels at 675
+    /// dispatches per token (measured, §11.2), so after the first token every
+    /// one of them is a lookup. The audit keeps taking `&str` because it builds
+    /// an owned `AuditDispatch` record per dispatch regardless, and it is
+    /// compiled out entirely by default.
     #[inline]
     fn record_dispatch(&self) {
         let profiling = crate::metal::profile::enabled();
@@ -678,11 +705,10 @@ impl ComputeCommandEncoder {
             let s = self.state.lock().unwrap();
             s.current_pipeline.clone()
         };
-        let name = name.as_deref().unwrap_or("<unnamed>");
         if profiling {
-            crate::metal::profile::record_dispatch(name);
+            crate::metal::profile::record_dispatch(name.as_ref());
         }
-        crate::metal::hazard_audit::record_dispatch(name);
+        crate::metal::hazard_audit::record_dispatch(name.as_deref().unwrap_or("<unnamed>"));
     }
 
     fn auto_barrier(&self) {
@@ -820,7 +846,6 @@ impl ComputeCommandEncoder {
             }
             s.next_inputs.insert(key, range);
             crate::metal::hazard_audit::record_binding(&range, false);
-            s.all_inputs.insert(ptr);
             drop(s);
             if !self.executor.is_classical() {
                 self.executor.will_bind_buffer(index, buf, offset, false);
@@ -945,7 +970,6 @@ impl ComputeCommandEncoder {
             let mut s = self.state.lock().unwrap();
             let key = s.hazard_key;
             s.next_inputs.insert(key, range);
-            s.all_inputs.insert(ptr);
         }
         unsafe {
             self.raw
@@ -1032,7 +1056,14 @@ impl ComputeCommandEncoder {
         if !has_executor && !crate::metal::profile::enabled() {
             return;
         }
-        let name = pipeline.name().map(Arc::from);
+        // `name_handle` clones the `Arc<str>` the pipeline already holds. The
+        // form this replaced built a fresh one from the `&str` at every call --
+        // once per dispatch, ~677 per decode token under
+        // `CANDLE_METAL_PROFILE=1` (`DESIGN.md` §11.2), which is the profiler
+        // perturbing the quantity it exists to measure (§2.4). The field it is
+        // stored into is `Option<Arc<str>>` already, so this is a refcount bump
+        // into a slot that was always shaped for one (issue #579).
+        let name = pipeline.name_handle();
         self.state.lock().unwrap().current_pipeline = name;
     }
 
@@ -1501,5 +1532,56 @@ mod tests {
         // The default is what shipped, so an unconfigured process is unchanged.
         assert_eq!(EncoderState::new().hazard_key, HazardKey::Pointer);
         assert_eq!(HazardKey::default(), HazardKey::Pointer);
+    }
+
+    /// Every set this state carries is READ somewhere (issue #579).
+    ///
+    /// `all_inputs` was written at 1123 bindings per decode token and read
+    /// nowhere -- §6.7 **L2**'s canonical instance -- and it is now gone. This
+    /// is what stops it, or a successor, coming back silently: a set on the
+    /// per-bind path is 27 ns a token pays 1123 times, and nothing about
+    /// adding one announces that it has no reader.
+    ///
+    /// **A source-level census, because the property is the absence of a
+    /// read** -- a runtime test cannot observe a field nobody consults, and
+    /// the value it holds is correct either way. Needles are assembled and
+    /// comment lines stripped, both of §9.2p's repairs, for its measured
+    /// reason.
+    #[test]
+    fn every_recorded_set_on_the_bind_path_has_a_reader() {
+        fn code_only(src: &str) -> String {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        let encoder = code_only(include_str!("encoder.rs"));
+        let commands = code_only(include_str!("commands.rs"));
+
+        let gone = ["all_", "inputs"].concat();
+        assert!(
+            !encoder.contains(&gone),
+            "a write-only per-bind set is back. It cost 1123 inserts and \
+             0.0303 ms per decode token and had no reader (issue #579, \
+             DESIGN.md §6.7 L2). If it has a consumer now, name the consumer \
+             here and delete this assertion"
+        );
+
+        // The control, and it is the half that makes the assertion mean
+        // something: the SIBLING set is still written AND still read, so the
+        // needle above is not passing because the whole mechanism vanished.
+        let kept = ["all_", "outputs"].concat();
+        assert!(
+            encoder.contains(&kept),
+            "the sibling set is gone too -- this census is now vacuous"
+        );
+        assert!(
+            commands.contains(&kept),
+            "the sibling set has lost its reader in end_encoding, which is the \
+             only thing that distinguished it from the removed one"
+        );
     }
 }

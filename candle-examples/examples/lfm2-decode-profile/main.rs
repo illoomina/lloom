@@ -623,15 +623,21 @@ struct Axes {
     /// `None` on a non-Metal device, where there is no command buffer to wait
     /// for — a third fact, distinct from either arm.
     ///
-    /// **Carries the sleeping arm's PERIOD**, which the device's own
+    /// **Carries a parameterised arm's PERIOD**, which the device's own
     /// `completion_wait_name()` does not — see [`Axes::completion_wait_arm`].
     completion_wait: Option<&'static str>,
-    /// The sleeping arm's period in microseconds, or `None` on the other two.
+    /// A parameterised arm's period, or `None` on the arms that have none.
+    ///
+    /// **Two arms carry one** (#583): `shared-event-sleep`'s is a sleep in
+    /// **microseconds** and `shared-event-wait`'s is a timeout in
+    /// **milliseconds**. The unit is implied by the arm name they are rendered
+    /// beside, so one field serves both rather than one field per unit — a
+    /// second copy of the list is what §11.3h warns decays.
     ///
     /// Held beside the name rather than folded into it because the name is a
     /// `&'static str` from the device and the period is a run-time value; the
     /// two are joined only at render time, in one place.
-    completion_wait_micros: Option<u64>,
+    completion_wait_period: Option<u64>,
 }
 
 /// The `AttnImpl` arm, as `.bench/configurations.md` §1 spells it.
@@ -924,17 +930,26 @@ impl Axes {
             // immediately after constructing the device, so this reads the
             // period *of the arm the device installed*. Without that assertion
             // it would be reading the flag (§7.1a-i).
+            //
+            // **Both parameterised arms are read here** (#583). The wait arm's
+            // period is a TIMEOUT in milliseconds rather than a sleep in
+            // microseconds, and it is carried for the identical reason: an arm
+            // whose period does not reach the axis vector renders equal to the
+            // same arm at a different period.
             #[cfg(feature = "metal")]
-            completion_wait_micros: match candle::metal_backend::CompletionWait::from_str_arm(
+            completion_wait_period: match candle::metal_backend::CompletionWait::from_str_arm(
                 &args.completion_wait,
             ) {
                 Ok(candle::metal_backend::CompletionWait::SharedEventSleep { micros }) => {
                     Some(micros)
                 }
+                Ok(candle::metal_backend::CompletionWait::SharedEventWait { timeout_ms }) => {
+                    Some(timeout_ms)
+                }
                 _ => None,
             },
             #[cfg(not(feature = "metal"))]
-            completion_wait_micros: None,
+            completion_wait_period: None,
         })
     }
 
@@ -955,9 +970,16 @@ impl Axes {
     ///
     /// The two unparameterised arms defer to the device's own name, so they
     /// stay read back from the mechanism rather than from the flag.
+    ///
+    /// **`shared-event-wait` joined the parameterised set** (#583) and its
+    /// period is a **timeout in milliseconds**, not a sleep in microseconds.
+    /// The rendering is `arm:period` either way because the arm name already
+    /// says which unit it is — `shared-event-sleep:50` is 50 µs and
+    /// `shared-event-wait:2000` is 2000 ms — and a second field for the unit
+    /// would be a second copy of a list (§11.3h).
     fn completion_wait_arm(&self) -> String {
-        match (self.completion_wait, self.completion_wait_micros) {
-            (Some(name), Some(micros)) => format!("{name}:{micros}"),
+        match (self.completion_wait, self.completion_wait_period) {
+            (Some(name), Some(period)) => format!("{name}:{period}"),
             (Some(name), None) => name.to_string(),
             (None, _) => "n/a".to_string(),
         }
@@ -1598,10 +1620,18 @@ struct Args {
     #[arg(long)]
     nonblocking_eos: bool,
 
-    /// How the host waits for a committed command buffer (§11.5o, issue #559).
+    /// How the host waits for a committed command buffer (§11.5o, issue #559;
+    /// §11.5t, issue #583).
     ///
-    /// `synchronize` (the default and the incumbent), `shared-event`, or
-    /// `shared-event-sleep[:<micros>]`.
+    /// `synchronize` (the default and the incumbent), `shared-event`,
+    /// `shared-event-sleep[:<micros>]`, or `shared-event-wait[:<timeout_ms>]`.
+    ///
+    /// **The four arms are three designs, not four tunings** (#583). The two
+    /// middle arms are **poll loops** over `signaledValue`; `shared-event-wait`
+    /// is `waitUntilSignaledValue:timeoutMS:` and **parks in the runtime**, so
+    /// it reports `completion_polls=0` structurally. Its period is a **timeout
+    /// in milliseconds** — a fail-safe that falls back to blocking, not a
+    /// latency knob — where the sleeping arm's is a sleep in microseconds.
     ///
     /// **Three axes on one seam, at different heights**, and they compose
     /// rather than substitute:

@@ -87,6 +87,33 @@
 //! is the `wait` column's excess over `spin`: **+0.039 ms at 50 us** and **+0.121
 //! ms at 200 us**, against a 3400x and 13000x reduction in polls. That is a real
 //! trade rather than a free win, and it is now a number.
+//!
+//! # Three designs were collapsed into one word, and the third was never built
+//!
+//! **Separated 2026-09-02 (#583, `DESIGN.md` §11.5t.)** Every async arm above
+//! **polls**, including the two named for mechanisms that do not have to, and
+//! the reason is that three distinct designs shared the vocabulary of "waiting":
+//!
+//! | design | mechanism | who owns the exit condition |
+//! |---|---|---|
+//! | **poll a GPU-written counter** | host reads a mapped line in a loop | the host, by re-reading |
+//! | **`WFE` on a watched line** | `LDXR` + `WFE`, wake on a store to that line | the host -- `WFE` retires on a **clock** (711-1325 ns, §3.7h), so the loop still re-tests |
+//! | **wait on an `MTLSharedEvent`** | `waitUntilSignaledValue:timeoutMS:` | **the runtime** -- the thread does not run until the value arrives |
+//!
+//! The first two are **loops around a wait**; the third is **a wait**. `WFE` is
+//! a watched-line spin whose quantum happens to be ~1 us, so naming it beside an
+//! event wait obscures that it iterates at all -- §11.5s measured **1.39 M poll
+//! iterations per token** under it, and a wait does not iterate 1.39 M times.
+//!
+//! **[`Self::SharedEventWait`] is the third**, and it is the arm §15.2 #10a asks
+//! for. That rule says *"anything that polls for a condition owes an explanation
+//! of why the producer cannot announce it"*. `poll.rs` discharges it for the
+//! **kernel** case and the discharge is sound -- §3.7b establishes a compute
+//! kernel carries no signal primitive. **It was never a discharge for this
+//! seam**: the producer here is a **command buffer**, §11.5o's own probe shows it
+//! announcing, and the arms above poll for a value the runtime would have parked
+//! them for. So the poll here was a missing event rather than a missing
+//! primitive, which is exactly the distinction §15.2 #10a is drawn to catch.
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -130,7 +157,52 @@ pub enum CompletionWait {
         /// Microseconds to sleep between polls.
         micros: u64,
     },
+    /// `waitUntilSignaledValue:timeoutMS:` -- park in the runtime until the GPU
+    /// signals, with **no poll loop at all** (#583).
+    ///
+    /// # Why this is a different design and not a third tuning of the same one
+    ///
+    /// The two arms above are loops: they read `signaledValue` and decide. This
+    /// one hands the condition to the runtime and does not run until it holds,
+    /// so [`Self::wait_for`] returns **0 polls** by construction rather than by
+    /// luck -- and 0 here is a *structural* zero, which is why the counter is
+    /// worth reading on this arm where §11.5o warns it is ambiguous on the
+    /// others.
+    ///
+    /// This is the arm `DESIGN.md` §15.2 #10a asks for. `poll.rs` discharges
+    /// that rule for a **kernel**, which genuinely cannot announce (§3.7b); a
+    /// **command buffer** can, and §11.5o's own probe measured it doing so. The
+    /// polling arms were therefore optimising a poll whose producer was able to
+    /// announce the whole time.
+    ///
+    /// # The timeout is a fail-safe and not a tuning knob
+    ///
+    /// `waitUntilSignaledValue:timeoutMS:` returns `false` on timeout, and a
+    /// timeout **must not** be read as completion: §3.5 makes a read before the
+    /// GPU's write silent corruption rather than an error. So a `false` falls
+    /// back to [`Self::Synchronize`]'s blocking wait rather than proceeding,
+    /// which is the same asymmetry [`Self::wait_for`] applies to a missing
+    /// event -- falling back to a block can only ever be *early*.
+    ///
+    /// The default is deliberately long ([`DEFAULT_WAIT_TIMEOUT_MS`]): it exists
+    /// so a lost signal becomes a slow run rather than a hang, not so that it
+    /// can be tuned against the ~18 ms token cadence.
+    SharedEventWait {
+        /// Milliseconds before the wait gives up and blocks instead.
+        timeout_ms: u64,
+    },
 }
+
+/// The fail-safe timeout for [`CompletionWait::SharedEventWait`], in
+/// milliseconds.
+///
+/// **Two orders of magnitude above the 18.76 ms token cadence** (§6.6), because
+/// this is the bound on a *pathology* -- a signal that never arrives -- and not
+/// a latency budget. A timeout close to the cadence would convert ordinary
+/// jitter into a fallback and the arm would silently become the incumbent,
+/// which is §7.1a-i's wrong-arm shape: a run reporting one arm and executing
+/// another.
+pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 2_000;
 
 impl CompletionWait {
     /// The arm's name, for a `RESULT` line.
@@ -146,6 +218,22 @@ impl CompletionWait {
             Self::Synchronize => "synchronize",
             Self::SharedEvent => "shared-event",
             Self::SharedEventSleep { .. } => "shared-event-sleep",
+            Self::SharedEventWait { .. } => "shared-event-wait",
+        }
+    }
+
+    /// Whether this arm reaches the GPU through a poll loop.
+    ///
+    /// **The axis #583 separates**, readable rather than inferred from a name.
+    /// `Synchronize` and `SharedEventWait` both park -- in the Mach kernel and
+    /// in the Metal runtime respectively -- while the two `SharedEvent*` arms
+    /// iterate. A run can therefore assert *"this arm must report 0 polls"*
+    /// from the arm itself instead of from a table a reader has to trust, which
+    /// is what makes the engagement counter checkable (§2.4).
+    pub fn polls(&self) -> bool {
+        match self {
+            Self::Synchronize | Self::SharedEventWait { .. } => false,
+            Self::SharedEvent | Self::SharedEventSleep { .. } => true,
         }
     }
 
@@ -157,12 +245,15 @@ impl CompletionWait {
     pub fn needs_event(&self) -> bool {
         match self {
             Self::Synchronize => false,
-            Self::SharedEvent | Self::SharedEventSleep { .. } => true,
+            Self::SharedEvent | Self::SharedEventSleep { .. } | Self::SharedEventWait { .. } => {
+                true
+            }
         }
     }
 
-    /// Parses `synchronize`, `shared-event`, `shared-event-sleep` and
-    /// `shared-event-sleep:<micros>`.
+    /// Parses `synchronize`, `shared-event`, `shared-event-sleep`,
+    /// `shared-event-sleep:<micros>`, `shared-event-wait` and
+    /// `shared-event-wait:<timeout_ms>`.
     ///
     /// An unrecognised value is an **error**, never a fallback to the default:
     /// §2.4's rule after #69's vacuous determinism run is that an invalid
@@ -174,16 +265,33 @@ impl CompletionWait {
             "synchronize" => Ok(Self::Synchronize),
             "shared-event" => Ok(Self::SharedEvent),
             "shared-event-sleep" => Ok(Self::SharedEventSleep { micros: 50 }),
-            other => match other.strip_prefix("shared-event-sleep:") {
-                Some(us) => us
-                    .parse::<u64>()
-                    .map(|micros| Self::SharedEventSleep { micros })
-                    .map_err(|e| format!("completion wait {other:?}: bad microseconds: {e}")),
-                None => Err(format!(
+            "shared-event-wait" => Ok(Self::SharedEventWait {
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+            }),
+            // The two parameterised arms are matched **before** any shorter
+            // prefix, and both are matched exhaustively here rather than by
+            // `starts_with("shared-event")` -- `shared-event-wait:5` must not
+            // be readable as `shared-event` with a suffix nobody looked at.
+            // §7.1a-i: a run that reports one arm and executes another.
+            other => {
+                if let Some(us) = other.strip_prefix("shared-event-sleep:") {
+                    return us
+                        .parse::<u64>()
+                        .map(|micros| Self::SharedEventSleep { micros })
+                        .map_err(|e| format!("completion wait {other:?}: bad microseconds: {e}"));
+                }
+                if let Some(ms) = other.strip_prefix("shared-event-wait:") {
+                    return ms
+                        .parse::<u64>()
+                        .map(|timeout_ms| Self::SharedEventWait { timeout_ms })
+                        .map_err(|e| format!("completion wait {other:?}: bad milliseconds: {e}"));
+                }
+                Err(format!(
                     "unknown completion wait {other:?} (expected synchronize, \
-                     shared-event, shared-event-sleep, or shared-event-sleep:<micros>)"
-                )),
-            },
+                     shared-event, shared-event-sleep, shared-event-sleep:<micros>, \
+                     shared-event-wait, or shared-event-wait:<timeout_ms>)"
+                ))
+            }
         }
     }
 
@@ -281,6 +389,27 @@ impl CompletionWait {
                 }
                 Ok(polls)
             }
+            WaitRoute::Park { timeout_ms } => {
+                // As `Poll` above: both are `Some` on this route by
+                // construction, and re-deriving the decision here would make
+                // the routing function untestable. The fallback blocks.
+                let (Some(ev), Some(target)) = (event, signalled) else {
+                    cb.wait_until_completed();
+                    return Ok(0);
+                };
+                // The whole arm, in one call: the thread does not run until the
+                // runtime observes the value. No loop, so no poll to count --
+                // the 0 below is structural rather than a lucky first read.
+                if !ev.wait_until_signaled(target, timeout_ms) {
+                    // A timeout is **not** completion. §3.5 makes reading before
+                    // the GPU's write silent corruption rather than an error, so
+                    // this falls back to the blocking wait -- the same
+                    // fail-safe direction as a missing event, and for the same
+                    // reason: blocking can only ever be early.
+                    cb.wait_until_completed();
+                }
+                Ok(0)
+            }
         }
     }
 
@@ -303,18 +432,44 @@ impl CompletionWait {
                     WaitRoute::Block
                 }
             }
+            // The same fail-safe guard as the polling arms, and it is needed
+            // for a *different* reason worth stating: a park without a signal
+            // does not spin, it sleeps until the timeout and then blocks -- so
+            // the failure would be a slow run rather than a hang, and a slow
+            // run is the harder one to notice.
+            Self::SharedEventWait { timeout_ms } => {
+                if has_event && has_signal {
+                    WaitRoute::Park {
+                        timeout_ms: *timeout_ms,
+                    }
+                } else {
+                    WaitRoute::Block
+                }
+            }
         }
     }
 }
 
-/// The two ways [`CompletionWait::wait_for`] can wait. See
+/// The three ways [`CompletionWait::wait_for`] can wait. See
 /// [`CompletionWait::wait_route`].
+///
+/// **`Block` and `Park` both park and are not the same route** (#583): `Block`
+/// enters the Mach kernel via `waitUntilCompleted` and knows nothing about the
+/// event, while `Park` waits on the event's value in the Metal runtime and
+/// falls back to `Block` on timeout. Collapsing them would make the fallback
+/// unobservable, and the fallback is the arm's only unsound direction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum WaitRoute {
     /// `waitUntilCompleted` -- the incumbent, and the fail-safe fallback.
     Block,
     /// Poll the shared event's signalled value.
     Poll,
+    /// Park in the runtime until the event reaches the value, or `timeout_ms`
+    /// elapses and the wait falls back to [`Self::Block`].
+    Park {
+        /// Milliseconds before falling back to the blocking wait.
+        timeout_ms: u64,
+    },
 }
 
 /// An `MTLSharedEvent` and the monotonically increasing value the host waits on.
@@ -372,6 +527,21 @@ impl SharedEvent {
     pub fn signaled_value(&self) -> u64 {
         self.raw.signaledValue()
     }
+
+    /// Park until the event reaches `value`, or `timeout_ms` elapses (#583).
+    ///
+    /// Returns **`true` if the value was reached** and `false` on timeout. The
+    /// caller must treat `false` as *"still unknown"* and not as completion --
+    /// [`CompletionWait::wait_for`] blocks on it, for §3.5's reason.
+    ///
+    /// This is `waitUntilSignaledValue:timeoutMS:`, which was bound in
+    /// `objc2-metal` and called from nowhere in this tree until #583. It is the
+    /// only wait here that does not iterate: the thread is descheduled by the
+    /// runtime and the exit condition belongs to it rather than to a loop the
+    /// host writes.
+    pub fn wait_until_signaled(&self, value: u64, timeout_ms: u64) -> bool {
+        self.raw.waitUntilSignaledValue_timeoutMS(value, timeout_ms)
+    }
 }
 
 impl std::fmt::Debug for SharedEvent {
@@ -400,6 +570,66 @@ mod tests {
             CompletionWait::from_str_arm("shared-event-sleep:7").unwrap(),
             CompletionWait::SharedEventSleep { micros: 7 }
         );
+        assert_eq!(
+            CompletionWait::from_str_arm("shared-event-wait").unwrap(),
+            CompletionWait::SharedEventWait {
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS
+            }
+        );
+        assert_eq!(
+            CompletionWait::from_str_arm("shared-event-wait:7").unwrap(),
+            CompletionWait::SharedEventWait { timeout_ms: 7 }
+        );
+    }
+
+    /// The two parameterised arms share a prefix, and neither may absorb the
+    /// other (#583).
+    ///
+    /// `shared-event-wait` starts with `shared-event`, so a parser reaching for
+    /// the shorter name first -- or using `starts_with` -- would resolve the
+    /// wait arm to the **polling** arm and silently drop the suffix. That is
+    /// §7.1a-i's wrong-arm shape, and a wrong arm compares equal to every run
+    /// of that arm where an absent one compares equal to nothing.
+    ///
+    /// Asserted with an **absolute** reference on each side (§3.1b rule 1)
+    /// rather than as *"the two differ"*, which a parser mapping both to a
+    /// third arm would also satisfy.
+    #[test]
+    fn the_prefixed_arms_do_not_absorb_each_other() {
+        assert_eq!(
+            CompletionWait::from_str_arm("shared-event").unwrap(),
+            CompletionWait::SharedEvent
+        );
+        assert_eq!(
+            CompletionWait::from_str_arm("shared-event-wait").unwrap(),
+            CompletionWait::SharedEventWait {
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS
+            }
+        );
+        // The suffix must reach the field rather than being parsed and dropped:
+        // a `shared-event-wait:5` read as the default timeout would pass an
+        // equality test against the arm and be wrong by 1995 ms.
+        assert_eq!(
+            CompletionWait::from_str_arm("shared-event-wait:5").unwrap(),
+            CompletionWait::SharedEventWait { timeout_ms: 5 }
+        );
+        assert_ne!(DEFAULT_WAIT_TIMEOUT_MS, 5, "the control above is vacuous");
+    }
+
+    /// Which arms poll, pinned as an **absolute** list rather than a shape
+    /// (#583).
+    ///
+    /// This is the axis #583 separates: `Synchronize` and `SharedEventWait`
+    /// park, the two `SharedEvent*` arms iterate. The property is asserted per
+    /// arm because a shape invariant -- *"the arms differ"* -- is blind to a
+    /// defect that moves every member (§3.1b), and inverting `polls()` wholesale
+    /// is exactly such a defect.
+    #[test]
+    fn exactly_the_looping_arms_report_polling() {
+        assert!(!CompletionWait::Synchronize.polls());
+        assert!(CompletionWait::SharedEvent.polls());
+        assert!(CompletionWait::SharedEventSleep { micros: 1 }.polls());
+        assert!(!CompletionWait::SharedEventWait { timeout_ms: 1 }.polls());
     }
 
     /// An invalid setting must fail rather than fall back (§2.4, after #69).
@@ -422,6 +652,7 @@ mod tests {
             CompletionWait::Synchronize,
             CompletionWait::SharedEvent,
             CompletionWait::SharedEventSleep { micros: 50 },
+            CompletionWait::SharedEventWait { timeout_ms: 2_000 },
         ];
         let names: std::collections::HashSet<_> = arms.iter().map(|a| a.name()).collect();
         assert_eq!(names.len(), arms.len(), "two arms render the same name");
@@ -448,6 +679,7 @@ mod tests {
         assert!(!CompletionWait::Synchronize.needs_event());
         assert!(CompletionWait::SharedEvent.needs_event());
         assert!(CompletionWait::SharedEventSleep { micros: 1 }.needs_event());
+        assert!(CompletionWait::SharedEventWait { timeout_ms: 1 }.needs_event());
     }
 
     /// **The fail-safe direction, asserted rather than assumed.**
@@ -481,6 +713,21 @@ mod tests {
             // Both present is the only case that may poll.
             assert_eq!(arm.wait_route(true, true), Poll, "{}", arm.name());
         }
+
+        // The parking arm takes the same three fail-safe cases (#583). Its
+        // failure mode is a *slow* run rather than a hang -- it would sleep to
+        // the timeout and then block -- which is the harder one to notice, so
+        // it is asserted rather than left to the timeout.
+        let park = CompletionWait::SharedEventWait { timeout_ms: 1 };
+        assert_eq!(park.wait_route(false, false), Block, "{}", park.name());
+        assert_eq!(park.wait_route(false, true), Block, "{}", park.name());
+        assert_eq!(park.wait_route(true, false), Block, "{}", park.name());
+        assert_eq!(
+            park.wait_route(true, true),
+            Park { timeout_ms: 1 },
+            "{}",
+            park.name()
+        );
     }
 
     /// The routing table above is only meaningful if a poll is reachable at all
@@ -489,6 +736,56 @@ mod tests {
     /// non-vacuity control stated separately (§3.1a rule 1).
     #[test]
     fn the_poll_route_is_reachable() {
+        assert_eq!(
+            CompletionWait::SharedEvent.wait_route(true, true),
+            WaitRoute::Poll
+        );
+    }
+
+    /// The park route's non-vacuity control, and it carries the timeout (#583).
+    ///
+    /// The same argument as `the_poll_route_is_reachable` one arm along: an
+    /// implementation collapsing `Park` into `Block` would satisfy every
+    /// fail-safe assertion above, because those all *expect* `Block`. Only a
+    /// positive assertion that the route is reached can see it.
+    ///
+    /// **The timeout is asserted through the route rather than the field**,
+    /// because that is the value `wait_for` actually hands to the runtime: a
+    /// routing function that returned a hard-coded default would leave the enum
+    /// correct and the wait wrong.
+    #[test]
+    fn the_park_route_is_reachable_and_carries_its_timeout() {
+        assert_eq!(
+            CompletionWait::SharedEventWait { timeout_ms: 1234 }.wait_route(true, true),
+            WaitRoute::Park { timeout_ms: 1234 }
+        );
+        assert_ne!(
+            1234, DEFAULT_WAIT_TIMEOUT_MS,
+            "the timeout above equals the default, so this cannot see a hard-coded one"
+        );
+    }
+
+    /// A parking arm must never route to a poll, whatever it is handed (#583).
+    ///
+    /// This is the property that makes `completion_polls == 0` readable as
+    /// evidence rather than as a coincidence: if the wait arm could reach
+    /// `Poll` under any input, a zero would mean *"the signal was up on the
+    /// first read"* instead of *"this arm does not iterate"*. Stated over all
+    /// four input combinations because that is the whole domain.
+    #[test]
+    fn a_parking_arm_never_routes_to_a_poll() {
+        let park = CompletionWait::SharedEventWait {
+            timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+        };
+        for (has_event, has_signal) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_ne!(
+                park.wait_route(has_event, has_signal),
+                WaitRoute::Poll,
+                "the wait arm polled with event={has_event} signal={has_signal}"
+            );
+        }
+        // The control: `Poll` is reachable for an arm that should reach it, so
+        // the assertion above is not passing over an unreachable variant.
         assert_eq!(
             CompletionWait::SharedEvent.wait_route(true, true),
             WaitRoute::Poll

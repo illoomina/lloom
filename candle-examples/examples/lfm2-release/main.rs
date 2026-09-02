@@ -228,10 +228,17 @@ struct Args {
     nonblocking_eos: bool,
 
     /// How the host waits for a committed command buffer (`DESIGN.md` §11.5o,
-    /// issue #559).
+    /// issue #559; §11.5t, issue #583).
     ///
-    /// `synchronize` (the default and the incumbent), `shared-event`, or
-    /// `shared-event-sleep[:<micros>]`.
+    /// `synchronize` (the default and the incumbent), `shared-event`,
+    /// `shared-event-sleep[:<micros>]`, or `shared-event-wait[:<timeout_ms>]`.
+    ///
+    /// **The four arms are three designs, not four tunings** (#583). The two
+    /// middle arms are **poll loops** over `signaledValue`; `shared-event-wait`
+    /// is `waitUntilSignaledValue:timeoutMS:` and **parks in the runtime**, so
+    /// it reports `completion_polls=0` structurally. Its period is a **timeout
+    /// in milliseconds** — a fail-safe that falls back to blocking, not a
+    /// latency knob — where the sleeping arm's is a sleep in microseconds.
     ///
     /// **Three axes on one seam, and they are at different heights.** §11.5j
     /// records the ring as wired installing *"a hint before a blocking read"*,
@@ -1416,6 +1423,13 @@ fn main() -> Result<()> {
     let completion_wait_arm = match completion_wait {
         candle::metal_backend::CompletionWait::SharedEventSleep { micros } => {
             format!("shared-event-sleep:{micros}")
+        }
+        // #583's parking arm carries a TIMEOUT and renders it for exactly the
+        // reason above: `name()` maps every `SharedEventWait { timeout_ms }` to
+        // bare `shared-event-wait`, so two runs at different timeouts would
+        // render equal axis vectors and #171's store would pool them.
+        candle::metal_backend::CompletionWait::SharedEventWait { timeout_ms } => {
+            format!("shared-event-wait:{timeout_ms}")
         }
         other => other.name().to_string(),
     };

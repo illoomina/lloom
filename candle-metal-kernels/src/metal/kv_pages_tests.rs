@@ -7,7 +7,7 @@
 //! a table that is **not** the identity before the kernel that reads one is
 //! worth writing.
 
-use super::kv_pages::{reserve_pages_for, KvPagePool, PageError};
+use super::kv_pages::{reserve_pages_for, KvPagePool, PageError, PageQuarantine};
 
 /// A pool sized so the tests below can exhaust it deliberately.
 fn pool(pool_pages: usize) -> KvPagePool {
@@ -240,4 +240,142 @@ fn a_straddling_chunk_is_detectable_at_k_greater_than_one() {
     // -- asserted so the check above is known to be about `k` and not about the
     // pool being disordered.
     assert!(p.chunk_pages_are_contiguous(2, 1));
+}
+
+// ---------------------------------------------------------------------------
+// The GPU-liveness epoch (§10.3h's one non-fence obligation), #148.
+// ---------------------------------------------------------------------------
+
+/// A page held for an epoch that has not finished is NOT handed back.
+///
+/// This is the defect §10.3h names, in the smallest form that exhibits it:
+/// sequence 0 is released while the command buffer that read its pages is still
+/// in flight, and sequence 1 then asks for a page. Without the quarantine the
+/// pool hands back the page the GPU is reading — **§6.7 L4 exactly, and the bug
+/// #23 fixed in the buffer pool one layer up.**
+///
+/// The reference is absolute rather than a shape (`CONTRIBUTING.md` §3.1b rule
+/// 1): the test names the page indices, so a defect that shifts *every* index
+/// cannot pass the way an *all-different* invariant would.
+#[test]
+fn a_page_is_not_reallocated_while_its_last_reader_is_in_flight() {
+    let mut p = pool(4);
+    let mut q = PageQuarantine::new();
+
+    // Sequence 0 takes pages 0 and 1; a command buffer in epoch 7 reads them.
+    let taken = p.append(0, 8).unwrap();
+    assert_eq!(taken, vec![0, 1], "a fresh pool hands out the identity");
+    let reading_epoch = 7u64;
+
+    // The CPU gives the sequence up. The refcount half says the pages are free.
+    let freed = p.release(0);
+    assert_eq!(freed, vec![0, 1], "both pages lost their last CPU referent");
+
+    // The epoch half says they are not yet SAFE, which is the distinction the
+    // whole mechanism exists to make.
+    q.quarantine(reading_epoch, freed);
+    assert_eq!(q.held(), 2);
+
+    // Epoch 7 has not completed: `completed_count` counts FINISHED epochs, so
+    // 7 means epochs 0..=6 are done and 7 is still running (GpuClock's own
+    // off-by-one, inherited rather than re-derived).
+    assert_eq!(
+        q.drain_completed(7),
+        Vec::<u32>::new(),
+        "the reader is still in flight; nothing may be recycled"
+    );
+    assert_eq!(q.held(), 2, "and the pages are still held");
+
+    // So the next allocation must NOT be page 0 or 1 -- it comes from the pages
+    // the pool never handed out.
+    let next = p.append(1, 8).unwrap();
+    assert_eq!(
+        next,
+        vec![2, 3],
+        "sequence 1 must be served from untouched pages while 0 and 1 are in \
+         flight; serving [0, 1] here is the write-after-read across sequences \
+         DESIGN.md 10.3h forbids"
+    );
+
+    // Once epoch 7 finishes, the pages become eligible and the pool takes them.
+    let ready = q.drain_completed(8);
+    assert_eq!(ready, vec![0, 1]);
+    assert_eq!(q.held(), 0);
+    p.recycle(&ready).unwrap();
+    assert_eq!(p.pages_free(), 2, "both are back on the free list");
+}
+
+/// The unguarded path is still expressible, and it produces the defect.
+///
+/// The counterpart to the test above, and the reason it is not redundant with
+/// it: a test showing the safe path is safe cannot show that the unsafe one is
+/// unsafe, and §3.1b rule 2 asks for the second arm that pins the level. Here
+/// the two arms differ in **one call** and disagree about which page sequence 1
+/// gets, which is what makes the quarantine's contribution visible rather than
+/// assumed.
+#[test]
+fn recycling_without_the_epoch_hands_back_a_page_the_gpu_is_reading() {
+    let mut p = pool(4);
+    p.append(0, 8).unwrap();
+    let freed = p.release(0);
+
+    // The shortcut DESIGN.md 10.3h names: refcount hit zero, so back it goes.
+    p.recycle(&freed).unwrap();
+
+    let next = p.append(1, 8).unwrap();
+    assert_eq!(
+        next,
+        vec![1, 0],
+        "this is the DEFECT, pinned so the quarantine's contribution is a \
+         measured difference rather than a claim: sequence 1 is handed the very \
+         pages an in-flight command buffer is reading"
+    );
+}
+
+/// Epochs drain in order, and a later-quarantined batch does not overtake an
+/// earlier one.
+///
+/// The prefix walk in `drain_completed` is what keeps this off §15.2 #10's
+/// O(N)-per-token list; this pins that it is also *correct*, since a walk that
+/// stopped at the first unfinished entry would be wrong if the epochs were not
+/// non-decreasing.
+#[test]
+fn the_quarantine_drains_in_epoch_order_and_stops_at_the_first_unfinished() {
+    let mut q = PageQuarantine::new();
+    q.quarantine(1, vec![10, 11]);
+    q.quarantine(2, vec![20]);
+    q.quarantine(5, vec![50, 51]);
+    assert_eq!(q.held(), 5);
+
+    // Epoch 1 finished (count 2 == epochs 0 and 1 done), 2 has not.
+    assert_eq!(q.drain_completed(2), vec![10, 11]);
+    assert_eq!(q.held(), 3, "epoch 2's and epoch 5's pages stay");
+
+    // Epoch 2 finished; epoch 5 has not, so the walk must stop rather than
+    // sweeping the whole list.
+    assert_eq!(q.drain_completed(3), vec![20]);
+    assert_eq!(q.held(), 2);
+
+    assert_eq!(q.drain_completed(6), vec![50, 51]);
+    assert!(q.is_empty());
+}
+
+/// An empty release costs nothing, so a step that frees no page records no
+/// entry.
+///
+/// Pinned because the alternative -- pushing an empty `Vec` per step -- grows
+/// `pending` once per token forever, which is exactly the
+/// climbs-without-plateauing shape §3.4a-iv records this project having missed
+/// three times.
+#[test]
+fn quarantining_nothing_records_nothing() {
+    let mut q = PageQuarantine::new();
+    for epoch in 0..1000 {
+        q.quarantine(epoch, Vec::new());
+    }
+    assert!(
+        q.is_empty(),
+        "1000 empty steps must leave the quarantine empty"
+    );
+    assert_eq!(q.held(), 0);
 }

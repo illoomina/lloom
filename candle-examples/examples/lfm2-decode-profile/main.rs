@@ -931,23 +931,19 @@ impl Axes {
             // period *of the arm the device installed*. Without that assertion
             // it would be reading the flag (§7.1a-i).
             //
-            // **Both parameterised arms are read here** (#583). The wait arm's
-            // period is a TIMEOUT in milliseconds rather than a sleep in
-            // microseconds, and it is carried for the identical reason: an arm
-            // whose period does not reach the axis vector renders equal to the
-            // same arm at a different period.
+            // **The period comes from the ARM rather than from a match here**
+            // (#583). This was a local `match` naming each parameterised arm,
+            // which is a list that goes stale silently: an arm added without a
+            // branch falls into `_ => None` and renders **equal** to the same
+            // arm at every other period. `CompletionWait::period()` is the one
+            // place that knows, and it is an exhaustive match, so a new arm is
+            // a compile error there rather than a wrong axis vector here.
             #[cfg(feature = "metal")]
-            completion_wait_period: match candle::metal_backend::CompletionWait::from_str_arm(
+            completion_wait_period: candle::metal_backend::CompletionWait::from_str_arm(
                 &args.completion_wait,
-            ) {
-                Ok(candle::metal_backend::CompletionWait::SharedEventSleep { micros }) => {
-                    Some(micros)
-                }
-                Ok(candle::metal_backend::CompletionWait::SharedEventWait { timeout_ms }) => {
-                    Some(timeout_ms)
-                }
-                _ => None,
-            },
+            )
+            .ok()
+            .and_then(|a| a.period()),
             #[cfg(not(feature = "metal"))]
             completion_wait_period: None,
         })
@@ -1624,14 +1620,31 @@ struct Args {
     /// §11.5t, issue #583).
     ///
     /// `synchronize` (the default and the incumbent), `shared-event`,
-    /// `shared-event-sleep[:<micros>]`, or `shared-event-wait[:<timeout_ms>]`.
+    /// `shared-event-sleep[:<micros>]`, `shared-event-wait[:<timeout_ms>]`, or
+    /// `shared-event-listener[:<timeout_ms>]`.
     ///
-    /// **The four arms are three designs, not four tunings** (#583). The two
+    /// **The five arms are four designs, not five tunings** (#583). The two
     /// middle arms are **poll loops** over `signaledValue`; `shared-event-wait`
     /// is `waitUntilSignaledValue:timeoutMS:` and **parks in the runtime**, so
     /// it reports `completion_polls=0` structurally. Its period is a **timeout
     /// in milliseconds** — a fail-safe that falls back to blocking, not a
     /// latency knob — where the sleeping arm's is a sleep in microseconds.
+    ///
+    /// **`shared-event-listener` is the fourth design and the only one where
+    /// the completion is DELIVERED rather than waited for** —
+    /// `notifyListener:atValue:block:` runs a block on a GCD worker, which
+    /// wakes this thread through a condvar. It also reports
+    /// `completion_polls=0`, and **that zero is not its engagement proof**: a
+    /// listener that has stopped firing falls back to blocking, is correct,
+    /// moves no digest, and reads the same 0. `completion_fires` is what
+    /// separates them, and a run selecting this arm with `completion_fires=0`
+    /// has **not taken it**.
+    ///
+    /// **A result from this arm carries a blind spot that must be stated where
+    /// it is used**: the block runs on a GCD queue, and §15.1i measures that
+    /// TSan cannot model the happens-before edge through Metal's dispatch — a
+    /// report there survives `-Zbuild-std` and is still false, so a genuine
+    /// ordering defect at that boundary would be indistinguishable.
     ///
     /// **Three axes on one seam, at different heights**, and they compose
     /// rather than substitute:
@@ -4786,6 +4799,19 @@ fn main() -> Result<()> {
     };
     #[cfg(not(feature = "metal"))]
     let (cw_signals, cw_polls) = (0u64, 0u64);
+    // The listener arm's own counter (#583), and it is a THIRD one because the
+    // two above cannot see this arm's failure. `shared-event-listener` reports
+    // `(signals > 0, polls == 0)` whether its notification block delivered or
+    // never fired and the wait fell back to blocking -- and the fallback is
+    // correct, so the values agree and both digests are unmoved either way.
+    // `completion_fires` is the only quantity that separates them.
+    #[cfg(feature = "metal")]
+    let (cw_fires, cw_already) = match &device {
+        Device::Metal(m) => (m.completion_fires(), m.completion_already_complete()),
+        _ => (0u64, 0u64),
+    };
+    #[cfg(not(feature = "metal"))]
+    let (cw_fires, cw_already) = (0u64, 0u64);
 
     // **The engagement assertions, not merely the prints.** §11.5i's finding is
     // that an unmoved digest on an arm that never engaged carries no
@@ -4818,6 +4844,37 @@ fn main() -> Result<()> {
         "completion arm {:?} encoded no signal, so this run's figures are the incumbent's \
          -- the mechanism did not engage (DESIGN.md §11.5o, §11.5i, §2.4)",
         axes.completion_wait
+    );
+    // **The listener arm needs its own assertion, and the one above cannot be
+    // it** (#583). A listener that never fires falls back to the blocking wait,
+    // which computes the right answer -- so `cw_signals` is nonzero, both
+    // digests are unmoved, every value assertion passes, and the run reports an
+    // arm it did not take. That is §7.1a-i's wrong-arm shape in the one place
+    // no pre-existing counter could see it, and Apple's own guidance is that a
+    // deallocated listener stops delivering silently.
+    // **`completion_signals` counts COMMITS and `completion_fires` counts
+    // WAITS, and the two are ~13.5:1 by construction** (#583). A signal is
+    // encoded in every `commit_swap_locked` — five call sites, and
+    // `CutPolicy::Counter(50)` cuts a buffer every 50 of 675 dispatches per
+    // token — while only `flush_and_wait_current` waits, once per token. So
+    // `fires ≈ n` is the listener firing on every wait there is, and comparing
+    // it against `signals` measures the cut policy rather than the mechanism.
+    //
+    // Measured, `completion_already_complete` is **0**, which excludes the
+    // other candidate explanation (that the readbacks arrive after the GPU has
+    // retired the buffer) rather than leaving it to be assumed.
+    #[cfg(feature = "metal")]
+    let cw_engaged_waits = cw_signals.saturating_sub(cw_already);
+    #[cfg(feature = "metal")]
+    anyhow::ensure!(
+        axes.completion_wait != Some("shared-event-listener")
+            || cw_engaged_waits == 0
+            || cw_fires > 0,
+        "completion arm shared-event-listener fired no notification block over {} tokens \
+         while {cw_engaged_waits} waits actually waited: the wait fell back to blocking \
+         and computed the right answer, so this run's figures belong to the incumbent \
+         (DESIGN.md §11.5u, §2.4)",
+        tokens.len()
     );
     // **The zero-GPU-work residue, and it is the DRAIN'S INNOCENCE** (lloom
     // #567, `DESIGN.md` §11.5r).
@@ -4914,6 +4971,7 @@ fn main() -> Result<()> {
          poll={} poll_iters={} poll_fallbacks={} max_in_flight={} \
          nonblocking_eos={} peek_hit={} peek_unmapped={} poll_reads={} \
          completion_wait={} completion_signals={} completion_polls={} \
+         completion_fires={} completion_already_complete={} \
          profiling={} config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
         args.n,
@@ -5146,6 +5204,8 @@ fn main() -> Result<()> {
         axes.completion_wait_arm(),
         cw_signals,
         cw_polls,
+        cw_fires,
+        cw_already,
         profiling,
         axes.config_line(),
         // Passed in by the caller rather than read from git here.

@@ -51,7 +51,21 @@ fn commands(device: &Device, arm: CompletionWait) -> Commands {
 /// form -- `mul * x + add` -- so the result can be checked against arithmetic
 /// rather than against the other arm. A fixture whose expected value comes from
 /// the run is #519's "looks like a comparison and is not".
+///
+/// For the listener arm see [`run_affine_full`], which additionally returns the
+/// **fired** count -- the only engagement proof that arm has, since it polls
+/// zero times whether it worked or fell back to blocking (#583).
 fn run_affine(arm: CompletionWait, n: usize, mul: f32, add: f32) -> (Vec<f32>, u64, u64) {
+    let (out, signals, polls, _fired) = run_affine_full(arm, n, mul, add);
+    (out, signals, polls)
+}
+
+/// As [`run_affine`], also returning the notification blocks that fired (#583).
+///
+/// Separate rather than folded into every call site because `fired` is
+/// meaningful on exactly one arm, and a fourth element every other test ignores
+/// invites reading a structural zero as a result.
+fn run_affine_full(arm: CompletionWait, n: usize, mul: f32, add: f32) -> (Vec<f32>, u64, u64, u64) {
     let device = device();
     let cmds = commands(&device, arm);
     let kernels = Kernels::new();
@@ -89,7 +103,7 @@ fn run_affine(arm: CompletionWait, n: usize, mul: f32, add: f32) -> (Vec<f32>, u
     // SAFETY: shared storage sized for `n` f32, and the wait above has returned.
     let out = unsafe { std::slice::from_raw_parts(p, n) }.to_vec();
     let (signals, polls) = cmds.completion_counts();
-    (out, signals, polls)
+    (out, signals, polls, cmds.completion_fires())
 }
 
 fn expected(n: usize, mul: f32, add: f32) -> Vec<f32> {
@@ -185,45 +199,149 @@ fn every_arm_agrees_with_the_closed_form() {
     }
 }
 
-/// Every arm this file executes. **One list, so a new arm is added once.**
-const ARMS: [CompletionWait; 4] = [
-    CompletionWait::Synchronize,
-    CompletionWait::SharedEvent,
-    CompletionWait::SharedEventSleep { micros: 10 },
-    CompletionWait::SharedEventWait { timeout_ms: 2_000 },
-];
+/// Every arm this file executes: **the enum's own list**, not a copy (#583).
+///
+/// This was a hand-written `const` array of four, checked against a
+/// hand-written list of four parser names. **Both went stale on the next arm
+/// added** -- the fifth arm was selectable, shipped and executed by no test
+/// here, while `every_arm_is_covered_here` stayed green, because the test
+/// compared two hand-written lists **to each other**. That is #519's *"a
+/// comparison that looks like one and is not"* (§3.1b) inside the check written
+/// to prevent exactly this, and it is why the reference now lives on the enum
+/// (`CompletionWait::ALL_ARMS`) with `no_arm_is_missing_from_all_arms` pinning
+/// it to the compiler.
+const ARMS: [CompletionWait; CompletionWait::ALL_ARMS.len()] = CompletionWait::ALL_ARMS;
 
 /// **The coverage list is not allowed to fall behind the enum** (#583).
 ///
-/// A `const` array is exactly the shape that goes stale: adding an arm to
-/// `CompletionWait` is a compile error at every `match` and **silent** here, so
-/// this file would keep testing the arms it was written with. That is the defect
-/// this test exists to make loud, and it is #583's own subject one level down --
-/// a mechanism that exists and is reached by nothing.
+/// `ARMS` is now `CompletionWait::ALL_ARMS` itself, so this can no longer fail
+/// by the route it was written for -- and it is kept, because what it asserts
+/// is the property rather than the mechanism: **every arm a user can select is
+/// executed by this file**. If someone re-introduces a local list, this goes red.
 ///
 /// The check is against the **parser**, which is the enumeration a user can
-/// actually select, so it fails when a selectable arm is untested rather than
-/// when the source text changes.
+/// actually select, and the parser names come from `ALL_ARMS` rather than from a
+/// literal -- which is the half that went stale last time.
 #[test]
 fn every_arm_is_covered_here() {
-    let selectable = [
-        "synchronize",
-        "shared-event",
-        "shared-event-sleep",
-        "shared-event-wait",
-    ];
-    for name in selectable {
-        let arm = CompletionWait::from_str_arm(name)
-            .unwrap_or_else(|e| panic!("{name} no longer parses: {e}"));
+    for arm in CompletionWait::ALL_ARMS {
+        let parsed = CompletionWait::from_str_arm(arm.name())
+            .unwrap_or_else(|e| panic!("{} no longer parses: {e}", arm.name()));
         assert!(
-            ARMS.iter().any(|a| a.name() == arm.name()),
-            "arm {name} is selectable and is executed by no test in this file"
+            ARMS.iter().any(|a| a.name() == parsed.name()),
+            "arm {} is selectable and is executed by no test in this file",
+            arm.name()
         );
     }
     // The control: a name that is *not* an arm must not be found in the list,
     // or the assertion above would pass for any string (§3.1a rule 3).
     assert!(CompletionWait::from_str_arm("shared-event-park").is_err());
-    assert_eq!(ARMS.len(), selectable.len(), "ARMS has an untested member");
+    assert_eq!(
+        ARMS.len(),
+        CompletionWait::ALL_ARMS.len(),
+        "ARMS has an untested member"
+    );
+}
+
+/// **The listener arm is woken by a block, and the block is proved to fire**
+/// (#583).
+///
+/// This is the issue's own definition of done: *"the block firing is asserted,
+/// not assumed -- a listener that stopped firing reads as a clean run."* That is
+/// not a stylistic preference. Apple's guidance is that a deallocated listener
+/// silently stops delivering blocks, and this arm falls back to a blocking wait
+/// when nothing arrives -- so **a broken listener computes the right answer**.
+/// Every value assertion in this file would pass, both digests would be
+/// unmoved, and `completion_polls` would read the same structural 0 it reads
+/// when the arm works.
+///
+/// `fired >= 1` is the only observation that separates the two, which is why
+/// the counter exists (§3.1c: a zero is not evidence unless something nonzero
+/// came from the same command; here the *nonzero* is the thing being asserted
+/// and its control is the arm below, which fires nothing on the same work).
+///
+/// The dispatch is large enough that the GPU is still busy when the host
+/// arrives, so a fired block cannot be explained by the work already being done
+/// -- the same discriminator `the_parking_arm_engages_without_a_single_poll`
+/// uses.
+#[test]
+fn the_listener_arm_fires_its_block_and_agrees() {
+    let n = 1 << 20;
+    let (out, signals, polls, fired) = run_affine_full(
+        CompletionWait::SharedEventListener { timeout_ms: 2_000 },
+        n,
+        1.0,
+        0.0,
+    );
+    assert!(
+        signals >= 1,
+        "the listener arm encoded no signal, so it did not run (§11.5i)"
+    );
+    assert!(
+        fired >= 1,
+        "the listener arm's notification block never fired: the wait fell back \
+         to blocking and computed the right answer anyway, which is exactly \
+         what a deallocated listener looks like and what no value assertion \
+         can see"
+    );
+    assert_eq!(
+        polls, 0,
+        "the listener arm polled: it is woken by a block, and a nonzero count \
+         means it took a loop instead"
+    );
+    assert_eq!(
+        out[n - 1],
+        (n - 1) as f32,
+        "the notified wait returned before the GPU finished: a wrong value and \
+         no error is what a read-before-write looks like (§3.5)"
+    );
+    assert_eq!(out[0], 0.0);
+}
+
+/// **No other arm fires a block**, which is what makes the count above evidence
+/// (#583).
+///
+/// §3.1c's rule in both directions: the test above asserts a nonzero from a
+/// counter, and this is the control showing the counter is not simply always
+/// nonzero. An arm that does not register a listener must report `fired = 0` on
+/// the same work through the same counter.
+#[test]
+fn only_the_listener_arm_fires_a_block() {
+    let n = 1 << 20;
+    for arm in [
+        CompletionWait::Synchronize,
+        CompletionWait::SharedEvent,
+        CompletionWait::SharedEventWait { timeout_ms: 2_000 },
+    ] {
+        let (_, _, _, fired) = run_affine_full(arm, n, 1.0, 0.0);
+        assert_eq!(
+            fired,
+            0,
+            "arm {} fired a notification block and registers no listener",
+            arm.name()
+        );
+    }
+}
+
+/// The listener is allocated for exactly the arm that needs one (#583).
+///
+/// *"Hold a strong reference for the engine's life"* is the research's first
+/// production constraint, and this is the mechanical half of it: the listener's
+/// lifetime is the event's, and the event's is `Commands`'. A listener created
+/// per wait would be dropped between tokens and the arm would silently become
+/// the blocking fallback -- correct output, wrong arm.
+#[test]
+fn only_the_listener_arm_allocates_a_listener() {
+    let device = device();
+    for arm in CompletionWait::ALL_ARMS {
+        let cmds = commands(&device, arm);
+        assert_eq!(
+            cmds.completion_listener_present(),
+            arm.needs_listener(),
+            "arm {} disagrees with its own needs_listener()",
+            arm.name()
+        );
+    }
 }
 
 /// **The parking arm performs ZERO polls, and that is the point of it** (#583).

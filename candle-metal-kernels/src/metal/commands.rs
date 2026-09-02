@@ -1,6 +1,6 @@
 use crate::metal::{
     cache_pad::CachePadded,
-    completion::{CompletionWait, SharedEvent},
+    completion::{CompletionWait, SharedEvent, WaitOutcome},
     executor::ExecutorSlot,
     BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipeline, Device,
     Fence, GpuClock, PrevCeOutputs, ResidencySet,
@@ -331,6 +331,25 @@ pub struct Commands {
     /// its `RESULT` line says it selected. That is #513's `ring_publishes` in
     /// this axis, and §7.1a-i's wrong-arm shape is what it exists to catch.
     completion_signals: AtomicU64,
+    /// Notification blocks that fired, for the listener arm (#583).
+    ///
+    /// **The listener arm's engagement proof, and `completion_polls` cannot be
+    /// it.** That counter reads 0 on this arm whether the block arrived or
+    /// never did, so on this arm the poll count is not evidence — a listener
+    /// that silently stopped delivering and fell back to blocking is
+    /// indistinguishable from a working park by every counter that existed
+    /// before this one. §3.1c's rule in a counter: a zero is not evidence
+    /// unless something nonzero came from the same command.
+    completion_fires: AtomicU64,
+    /// Waits that found the command buffer already complete, so no arm ran
+    /// (#583).
+    ///
+    /// **Measured 0 on the decode path**, and kept because it is the arm that
+    /// falsified the first explanation for `completion_fires` sitting an order
+    /// of magnitude below `completion_signals`. The buffers are not already
+    /// complete; the two counters simply count different things — commits
+    /// against waits, ~13.5:1 under `CutPolicy::Counter(50)`.
+    completion_already_complete: AtomicU64,
 }
 
 /// A fence still referenced by `prev_ce_outputs`, with its buffer count.
@@ -447,8 +466,13 @@ impl Commands {
         cut_policy: CutPolicy,
         completion_wait: CompletionWait,
     ) -> Result<Self, MetalKernelError> {
+        // The listener is allocated with the event and only for the arm that
+        // needs one (#583). Its lifetime is then the engine's, which is the
+        // whole discipline: a deallocated listener silently stops delivering
+        // blocks, and a mechanism that stops firing reads exactly like one that
+        // never engaged (§2.4).
         let completion_event = if completion_wait.needs_event() {
-            SharedEvent::new(&device)
+            SharedEvent::with_listener(&device, completion_wait.needs_listener())
         } else {
             None
         };
@@ -470,6 +494,8 @@ impl Commands {
             completion_event,
             completion_polls: AtomicU64::new(0),
             completion_signals: AtomicU64::new(0),
+            completion_fires: AtomicU64::new(0),
+            completion_already_complete: AtomicU64::new(0),
         })
     }
 
@@ -507,6 +533,28 @@ impl Commands {
             self.completion_signals.load(Ordering::Relaxed),
             self.completion_polls.load(Ordering::Relaxed),
         )
+    }
+
+    /// Notification blocks that fired since construction (#583).
+    ///
+    /// Separate from [`Self::completion_counts`] rather than a third element of
+    /// it, because it answers a question the other two cannot: on the listener
+    /// arm both of those read `(nonzero, 0)` whether the block delivered or the
+    /// wait timed out and blocked instead. **A listener arm reporting
+    /// `completion_fires = 0` has not taken the arm its `RESULT` line names**,
+    /// which is §7.1a-i's wrong-arm shape in the one place no existing counter
+    /// could see it.
+    pub fn completion_fires(&self) -> u64 {
+        self.completion_fires.load(Ordering::Relaxed)
+    }
+
+    /// Waits that found the buffer already complete, so no arm ran (#583).
+    ///
+    /// Read beside [`Self::completion_fires`] and [`Self::completion_counts`],
+    /// which it is the denominator for: an async arm engages only on the waits
+    /// that actually had to wait.
+    pub fn completion_already_complete(&self) -> u64 {
+        self.completion_already_complete.load(Ordering::Relaxed)
     }
 
     /// Install the executor that subsequent compute encoders will submit
@@ -754,13 +802,18 @@ impl Commands {
             // never saw, and surfacing an `Error` status -- are kept on both
             // arms, because a dropped error presents as wrong output rather than
             // as a failure (§3.5).
-            let polls = Self::ensure_completed_via(
+            let outcome = Self::ensure_completed_via(
                 &cb,
                 self.completion_wait,
                 self.completion_event.as_ref(),
                 signalled,
             )?;
-            self.completion_polls.fetch_add(polls, Ordering::Relaxed);
+            self.completion_polls
+                .fetch_add(outcome.polls, Ordering::Relaxed);
+            self.completion_fires
+                .fetch_add(outcome.fired, Ordering::Relaxed);
+            self.completion_already_complete
+                .fetch_add(outcome.already_complete, Ordering::Relaxed);
             // queue is FIFO: everything committed before cb is done too
             let mut state = self.state.lock()?;
             state
@@ -949,6 +1002,19 @@ impl Commands {
         Self::ensure_completed_via(cb, CompletionWait::Synchronize, None, None).map(|_| ())
     }
 
+    /// Whether a listener was allocated for the selected arm (#583).
+    ///
+    /// The listener arm's counterpart of [`Self::completion_event_present`],
+    /// and it exists for the same reason: *"the arm was selected"* and *"the
+    /// arm can run"* are different facts, and a listener that was never created
+    /// makes every wait take the blocking fallback -- correct, and not the arm
+    /// the operator asked for.
+    pub fn completion_listener_present(&self) -> bool {
+        self.completion_event
+            .as_ref()
+            .is_some_and(|e| e.has_listener())
+    }
+
     /// Wait for `cb` by `arm`, returning the number of polls performed.
     ///
     /// Every arm shares the status machine and differs only at the wait, which
@@ -963,8 +1029,8 @@ impl Commands {
         arm: CompletionWait,
         event: Option<&SharedEvent>,
         signalled: Option<u64>,
-    ) -> Result<u64, MetalKernelError> {
-        let mut polls = 0;
+    ) -> Result<WaitOutcome, MetalKernelError> {
+        let mut outcome = WaitOutcome::default();
         match cb.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
                 // This path commits a buffer that `commit_swap_locked` never saw,
@@ -980,9 +1046,26 @@ impl Commands {
                 cb.wait_until_completed();
             }
             MTLCommandBufferStatus::Committed | MTLCommandBufferStatus::Scheduled => {
-                polls = arm.wait_for(cb, event, signalled)?;
+                outcome = arm.wait_for(cb, event, signalled)?;
             }
-            MTLCommandBufferStatus::Completed => {}
+            // Already finished, so no arm runs. **Counted, and it measures 0 on
+            // the decode path** (#583) -- which is what makes the counter worth
+            // keeping rather than a reason to drop it: it is the arm that
+            // *falsified* the first explanation offered for the gap between
+            // `completion_signals` and `completion_fires`, and a hypothesis
+            // excluded by measurement is why the real one is trustworthy.
+            //
+            // The real explanation is that the two counters have **different
+            // denominators**: a signal is encoded in every
+            // `commit_swap_locked`, of which there are five call sites, and
+            // only `flush_and_wait_current`'s return reaches a wait. At 675
+            // dispatches/token with `CutPolicy::Counter(50)` that is ~13.5
+            // commits per token against **one** wait -- so `signals` counts
+            // commits and `fires` counts waits, and they are ~16:1 by
+            // construction rather than by anything failing.
+            MTLCommandBufferStatus::Completed => {
+                outcome.already_complete = 1;
+            }
             MTLCommandBufferStatus::Error => return Err(Self::cb_error(cb)),
             _ => unreachable!(),
         }
@@ -991,7 +1074,7 @@ impl Commands {
             return Err(Self::cb_error(cb));
         }
 
-        Ok(polls)
+        Ok(outcome)
     }
 
     fn cb_error(cb: &CommandBuffer) -> MetalKernelError {

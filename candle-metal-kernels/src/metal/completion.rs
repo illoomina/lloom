@@ -117,8 +117,9 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLDevice, MTLSharedEvent};
+use objc2_metal::{MTLCommandBuffer, MTLDevice, MTLSharedEvent, MTLSharedEventListener};
 
+use super::cache_pad::CachePadded;
 use super::{CommandBuffer, Device};
 use crate::MetalKernelError;
 
@@ -191,6 +192,55 @@ pub enum CompletionWait {
         /// Milliseconds before the wait gives up and blocks instead.
         timeout_ms: u64,
     },
+    /// `notifyListener:atValue:block:` -- the GPU's signal invokes a **block on
+    /// a GCD queue**, which wakes this thread through a condvar (#583).
+    ///
+    /// # What is different, and it is the host thread rather than the wait
+    ///
+    /// The three arms above are all things the *waiting thread* does: it loops
+    /// ([`Self::SharedEvent`], [`Self::SharedEventSleep`]) or it parks inside
+    /// the runtime ([`Self::SharedEventWait`]). This arm is the only one where
+    /// the completion is delivered **to** the host rather than waited **for**
+    /// by it -- Metal invokes a callback on a background dispatch queue, and
+    /// what that callback does is a decision this code makes rather than one
+    /// the runtime makes for it.
+    ///
+    /// Here it signals a condvar, because [`super::Commands::flush_and_wait_current`]'s
+    /// contract is *the value is ready when I return* -- `to_cpu` reads the
+    /// buffer on the next line, and §3.5 makes a read before the GPU's write
+    /// silent corruption rather than an error. **So this arm still blocks the
+    /// calling thread, and it must**; what it does not do is burn a core or sit
+    /// in the Metal runtime's own wait.
+    ///
+    /// # What it is FOR is the callback, and this arm is the seam for it
+    ///
+    /// The issue this was built for describes the shape where *"the host does
+    /// other work instead of waiting at all"*. That shape needs a caller with
+    /// other work to do, and `to_cpu` -- the one call site on the decode path
+    /// (§11.5f's census) -- has none: it needs the bytes. **So this arm is the
+    /// mechanism in place with its consumer honestly absent**, which is #500's
+    /// finding recorded in advance rather than discovered by a measurement:
+    /// what is built here is the *notification path*, and a decode loop that
+    /// overlaps host work with GPU work is a change to the loop, not to this.
+    ///
+    /// # Lifetime is the hazard, and it fails silently
+    ///
+    /// *"If the listener is deallocated, registered completion blocks will
+    /// never fire"* -- and **a mechanism that stops firing is indistinguishable
+    /// from one that never engaged** (§2.4, and #500's whole finding). This arm
+    /// therefore holds its listener for the life of the [`SharedEvent`] rather
+    /// than per wait, and [`Self::wait_for`] returns a **fired count** so the
+    /// block's arrival is asserted rather than assumed.
+    ///
+    /// # The timeout is a fail-safe, exactly as [`Self::SharedEventWait`]'s is
+    ///
+    /// A block that never fires would hang, and a hang is the one failure a
+    /// test cannot report. The condvar wait is bounded and a timeout falls back
+    /// to the blocking wait -- which can only ever be *early*.
+    SharedEventListener {
+        /// Milliseconds before the condvar wait gives up and blocks instead.
+        timeout_ms: u64,
+    },
 }
 
 /// The fail-safe timeout for [`CompletionWait::SharedEventWait`], in
@@ -205,6 +255,41 @@ pub enum CompletionWait {
 pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 2_000;
 
 impl CompletionWait {
+    /// Every arm a user can select, as the **enum's own** enumeration (#583).
+    ///
+    /// # Why this exists, and it is a defect found by making it
+    ///
+    /// #583 added a fourth arm and repaired the GPU suite's hand-written
+    /// coverage array by *"checking the list against the parser"*. That repair
+    /// carried a second hand-written list -- the parser names it checked
+    /// against -- and **it went stale on the very next arm**: adding a fifth
+    /// left `every_arm_is_covered_here` green while the new arm was executed by
+    /// no test, because the test compared two hand-written lists **to each
+    /// other**. That is #519's *"a comparison that looks like one and is not"*
+    /// (§3.1b), inside the check written to prevent exactly this.
+    ///
+    /// **The durable form is an enumeration the enum owns**, so a new variant
+    /// is one edit here and every consumer -- the GPU sweep, the registry
+    /// check, a harness's `--help` -- is derived rather than maintained. It is
+    /// §8.1b's checked-registry argument applied to an axis's arms, and the
+    /// `no_arm_is_missing_from_all_arms` test below is what keeps it honest,
+    /// since a `const` array cannot be exhaustively checked by the compiler.
+    ///
+    /// Parameterised arms appear once, at their default period: the period is a
+    /// value on the arm, not a separate arm, and `from_str_arm` round-trips
+    /// both spellings.
+    pub const ALL_ARMS: [Self; 5] = [
+        Self::Synchronize,
+        Self::SharedEvent,
+        Self::SharedEventSleep { micros: 50 },
+        Self::SharedEventWait {
+            timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+        },
+        Self::SharedEventListener {
+            timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+        },
+    ];
+
     /// The arm's name, for a `RESULT` line.
     ///
     /// Rendered through an **exhaustive** `match` so a new arm is a compile
@@ -219,6 +304,7 @@ impl CompletionWait {
             Self::SharedEvent => "shared-event",
             Self::SharedEventSleep { .. } => "shared-event-sleep",
             Self::SharedEventWait { .. } => "shared-event-wait",
+            Self::SharedEventListener { .. } => "shared-event-listener",
         }
     }
 
@@ -232,8 +318,33 @@ impl CompletionWait {
     /// is what makes the engagement counter checkable (§2.4).
     pub fn polls(&self) -> bool {
         match self {
-            Self::Synchronize | Self::SharedEventWait { .. } => false,
+            Self::Synchronize | Self::SharedEventWait { .. } | Self::SharedEventListener { .. } => {
+                false
+            }
             Self::SharedEvent | Self::SharedEventSleep { .. } => true,
+        }
+    }
+
+    /// Whether this arm is woken by a **callback** rather than by waiting.
+    ///
+    /// The axis the listener arm adds (#583), and it is orthogonal to
+    /// [`Self::polls`]: `Synchronize` and `SharedEventWait` both answer `false`
+    /// to both, and they are not the same mechanism -- one parks in the Mach
+    /// kernel on the command buffer, the other in the Metal runtime on the
+    /// event's value. This arm is the only one where the completion is
+    /// **delivered** to the host, on a GCD worker, rather than waited for on
+    /// the calling thread.
+    ///
+    /// Readable rather than inferred from a name, for [`Self::polls`]'s reason:
+    /// a run can assert *"this arm must report a nonzero fired count"* from the
+    /// arm itself instead of from a table a reader has to trust (§2.4).
+    pub fn notifies(&self) -> bool {
+        match self {
+            Self::SharedEventListener { .. } => true,
+            Self::Synchronize
+            | Self::SharedEvent
+            | Self::SharedEventSleep { .. }
+            | Self::SharedEventWait { .. } => false,
         }
     }
 
@@ -245,10 +356,58 @@ impl CompletionWait {
     pub fn needs_event(&self) -> bool {
         match self {
             Self::Synchronize => false,
-            Self::SharedEvent | Self::SharedEventSleep { .. } | Self::SharedEventWait { .. } => {
-                true
-            }
+            Self::SharedEvent
+            | Self::SharedEventSleep { .. }
+            | Self::SharedEventWait { .. }
+            | Self::SharedEventListener { .. } => true,
         }
+    }
+
+    /// The arm's period, if it carries one — and it is the enum that knows
+    /// (#583).
+    ///
+    /// **Three consumers were each rendering this with their own `match`**, and
+    /// each is a list that goes stale silently when an arm is added: adding a
+    /// parameterised arm is a compile error at an exhaustive `match` and a
+    /// *wrong answer* at one with a `_ =>` fallback, which is what these had.
+    /// An arm whose period does not reach the axis vector renders **equal** to
+    /// the same arm at a different period — §7.1a-i's present-and-wrong
+    /// direction, and §13.5m's measured defect at `CutPolicy`.
+    ///
+    /// The unit is the arm's, not this function's: `shared-event-sleep`'s is
+    /// microseconds and both `shared-event-wait`'s and
+    /// `shared-event-listener`'s are milliseconds. That is why the rendering is
+    /// `arm:period` — the name already says which unit it is, and a second
+    /// field for the unit would be a second copy of a list (§11.3h).
+    pub fn period(&self) -> Option<u64> {
+        match self {
+            Self::Synchronize | Self::SharedEvent => None,
+            Self::SharedEventSleep { micros } => Some(*micros),
+            Self::SharedEventWait { timeout_ms } => Some(*timeout_ms),
+            Self::SharedEventListener { timeout_ms } => Some(*timeout_ms),
+        }
+    }
+
+    /// The arm as an axis vector element: `name` or `name:period` (#583).
+    ///
+    /// Derived from [`Self::name`] and [`Self::period`] so a new arm reaches
+    /// every consumer at once. `lloom-runs` keys comparisons on this string, so
+    /// two runs differing only in a period must not render equal.
+    pub fn arm_with_period(&self) -> String {
+        match self.period() {
+            Some(p) => format!("{}:{p}", self.name()),
+            None => self.name().to_string(),
+        }
+    }
+
+    /// Whether this arm needs an `MTLSharedEventListener` beside its event.
+    ///
+    /// Only the listener arm does, and it is allocated with the event so its
+    /// lifetime is the engine's: *"if the listener is deallocated, registered
+    /// completion blocks will never fire"*, and a block that stops firing reads
+    /// exactly like one that never engaged (§2.4).
+    pub fn needs_listener(&self) -> bool {
+        self.notifies()
     }
 
     /// Parses `synchronize`, `shared-event`, `shared-event-sleep`,
@@ -266,6 +425,9 @@ impl CompletionWait {
             "shared-event" => Ok(Self::SharedEvent),
             "shared-event-sleep" => Ok(Self::SharedEventSleep { micros: 50 }),
             "shared-event-wait" => Ok(Self::SharedEventWait {
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+            }),
+            "shared-event-listener" => Ok(Self::SharedEventListener {
                 timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
             }),
             // The two parameterised arms are matched **before** any shorter
@@ -286,10 +448,17 @@ impl CompletionWait {
                         .map(|timeout_ms| Self::SharedEventWait { timeout_ms })
                         .map_err(|e| format!("completion wait {other:?}: bad milliseconds: {e}"));
                 }
+                if let Some(ms) = other.strip_prefix("shared-event-listener:") {
+                    return ms
+                        .parse::<u64>()
+                        .map(|timeout_ms| Self::SharedEventListener { timeout_ms })
+                        .map_err(|e| format!("completion wait {other:?}: bad milliseconds: {e}"));
+                }
                 Err(format!(
                     "unknown completion wait {other:?} (expected synchronize, \
                      shared-event, shared-event-sleep, shared-event-sleep:<micros>, \
-                     shared-event-wait, or shared-event-wait:<timeout_ms>)"
+                     shared-event-wait, shared-event-wait:<timeout_ms>, \
+                     shared-event-listener, or shared-event-listener:<timeout_ms>)"
                 ))
             }
         }
@@ -342,18 +511,27 @@ impl CompletionWait {
     /// was encoded and the blocking path is the only one available, which is
     /// what makes a missing event **fail safe** rather than spin forever.
     ///
-    /// Returns the number of polls performed, so a caller can put engagement on
-    /// a `RESULT` line -- §2.4: an instrument that cannot be shown to have
-    /// engaged has not measured anything, and #500's finding is that a green
-    /// board says nothing when nothing is counted. `Synchronize` reports 0,
-    /// which is the value that distinguishes it from an async arm that happened
-    /// to observe the signal on its first read.
+    /// Returns [`WaitOutcome`] -- polls performed and blocks fired -- so a
+    /// caller can put engagement on a `RESULT` line. §2.4: an instrument that
+    /// cannot be shown to have engaged has not measured anything, and #500's
+    /// finding is that a green board says nothing when nothing is counted.
+    /// `Synchronize` reports zeros on both, which is the value that
+    /// distinguishes it from an async arm that happened to observe the signal
+    /// on its first read.
+    ///
+    /// **Two counters rather than one, because the arms fail differently**
+    /// (#583): a polling arm that stopped engaging reads `polls = 0`, and a
+    /// listener arm that stopped engaging *also* reads `polls = 0` -- so on the
+    /// listener arm the poll count is not an engagement proof at all and
+    /// `fired` is. That is §3.1c's rule (*a zero is not evidence unless
+    /// something nonzero came from the same command*) applied to a counter
+    /// rather than to a run.
     pub fn wait_for(
         &self,
         cb: &CommandBuffer,
         event: Option<&SharedEvent>,
         signalled: Option<u64>,
-    ) -> Result<u64, MetalKernelError> {
+    ) -> Result<WaitOutcome, MetalKernelError> {
         match self.wait_route(event.is_some(), signalled.is_some()) {
             // The incumbent, and the fallback whenever a signal was not
             // encoded. Falling back to a blocking wait can only ever be
@@ -362,7 +540,7 @@ impl CompletionWait {
             // direction (§3.5).
             WaitRoute::Block => {
                 cb.wait_until_completed();
-                Ok(0)
+                Ok(WaitOutcome::default())
             }
             WaitRoute::Poll => {
                 // Both are `Some` on this route by construction, but the
@@ -372,7 +550,7 @@ impl CompletionWait {
                 // the two ever disagreed.
                 let (Some(ev), Some(target)) = (event, signalled) else {
                     cb.wait_until_completed();
-                    return Ok(0);
+                    return Ok(WaitOutcome::default());
                 };
                 let sleep = match self {
                     Self::SharedEventSleep { micros } => {
@@ -387,7 +565,11 @@ impl CompletionWait {
                         std::thread::sleep(d);
                     }
                 }
-                Ok(polls)
+                Ok(WaitOutcome {
+                    polls,
+                    fired: 0,
+                    already_complete: 0,
+                })
             }
             WaitRoute::Park { timeout_ms } => {
                 // As `Poll` above: both are `Some` on this route by
@@ -395,7 +577,7 @@ impl CompletionWait {
                 // the routing function untestable. The fallback blocks.
                 let (Some(ev), Some(target)) = (event, signalled) else {
                     cb.wait_until_completed();
-                    return Ok(0);
+                    return Ok(WaitOutcome::default());
                 };
                 // The whole arm, in one call: the thread does not run until the
                 // runtime observes the value. No loop, so no poll to count --
@@ -408,7 +590,36 @@ impl CompletionWait {
                     // reason: blocking can only ever be early.
                     cb.wait_until_completed();
                 }
-                Ok(0)
+                Ok(WaitOutcome::default())
+            }
+            WaitRoute::Notify { timeout_ms } => {
+                // As the two routes above: both are `Some` here by
+                // construction, and re-deriving the decision would make
+                // `wait_route` untestable. The fallback blocks.
+                let (Some(ev), Some(target)) = (event, signalled) else {
+                    cb.wait_until_completed();
+                    return Ok(WaitOutcome::default());
+                };
+                // The block is registered on the event and fires on a GCD
+                // worker; this thread parks on the condvar it signals. Nothing
+                // here loops, so `polls` stays 0 -- and unlike the parking arm
+                // above, that zero is NOT this arm's engagement proof, because
+                // a listener that never fired reads zero too. `fired` is.
+                let fired = ev.notify_then_wait(target, timeout_ms);
+                if fired == 0 {
+                    // The block did not arrive inside the budget. Same
+                    // fail-safe direction and the same reason as every arm
+                    // above -- blocking can only ever be early -- and it is
+                    // reported rather than hidden, because a listener silently
+                    // falling back to the incumbent is §7.1a-i's wrong-arm
+                    // shape: a run that says one thing and does another.
+                    cb.wait_until_completed();
+                }
+                Ok(WaitOutcome {
+                    polls: 0,
+                    fired,
+                    already_complete: 0,
+                })
             }
         }
     }
@@ -446,11 +657,67 @@ impl CompletionWait {
                     WaitRoute::Block
                 }
             }
+            // The same fail-safe guard again, and a third distinct reason it is
+            // needed: with no signal encoded, no block is ever registered, so a
+            // condvar wait would time out rather than return -- a slow run, and
+            // the timeout is what stops it being a hang.
+            Self::SharedEventListener { timeout_ms } => {
+                if has_event && has_signal {
+                    WaitRoute::Notify {
+                        timeout_ms: *timeout_ms,
+                    }
+                } else {
+                    WaitRoute::Block
+                }
+            }
         }
     }
 }
 
-/// The three ways [`CompletionWait::wait_for`] can wait. See
+/// What one wait engaged, returned by [`CompletionWait::wait_for`] (#583).
+///
+/// **Two counters because the arms fail differently**, and one would hide the
+/// listener arm's failure. A polling arm proves it ran by `polls > 0`; the
+/// listener arm polls zero times whether it worked or not, so its proof is
+/// `fired > 0`. Reporting a single number would make *"the block never
+/// arrived and we quietly blocked instead"* read exactly like a working parked
+/// wait -- §2.4's rule, and #500's finding that a green board says nothing when
+/// nothing is counted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WaitOutcome {
+    /// Reads of `signaledValue` performed by a polling arm.
+    pub polls: u64,
+    /// Notification blocks that fired and woke this wait (#583).
+    ///
+    /// `0` on every arm that does not register one, and `0` on the listener arm
+    /// **when the block did not arrive inside the timeout** -- which is the
+    /// failure this counter exists to make visible rather than a second normal
+    /// value.
+    pub fired: u64,
+    /// `1` when the command buffer had **already completed** and no arm ran at
+    /// all (#583).
+    ///
+    /// **Measured 0 on the decode path, and it is kept because of what it
+    /// excluded.** It was added to test an explanation for `completion_fires`
+    /// reading ~28 against `completion_signals` ~384 -- that most readbacks
+    /// arrive after the GPU has retired the buffer -- and it **falsified**
+    /// that: the buffers are not already complete.
+    ///
+    /// The real reason is that the two counters have **different
+    /// denominators**. A signal is encoded in every `commit_swap_locked` (five
+    /// call sites), and only `flush_and_wait_current`'s reaches a wait; at 675
+    /// dispatches/token under `CutPolicy::Counter(50)` that is ~13.5 commits
+    /// per token against **one** wait. So `fired` ~= one per token is the
+    /// listener firing on essentially every wait there is, and the ratio to
+    /// `signals` is arithmetic rather than a failure rate.
+    ///
+    /// Kept rather than deleted because a counter that reads zero for a
+    /// *measured* reason is evidence, where the absence of one leaves the same
+    /// question open for the next reader (§2.4).
+    pub already_complete: u64,
+}
+
+/// The four ways [`CompletionWait::wait_for`] can wait. See
 /// [`CompletionWait::wait_route`].
 ///
 /// **`Block` and `Park` both park and are not the same route** (#583): `Block`
@@ -467,6 +734,19 @@ enum WaitRoute {
     /// Park in the runtime until the event reaches the value, or `timeout_ms`
     /// elapses and the wait falls back to [`Self::Block`].
     Park {
+        /// Milliseconds before falling back to the blocking wait.
+        timeout_ms: u64,
+    },
+    /// Register a notification block and park on a condvar until it fires, or
+    /// `timeout_ms` elapses and the wait falls back to [`Self::Block`] (#583).
+    ///
+    /// **Distinct from [`Self::Park`] for the same reason `Park` is distinct
+    /// from [`Self::Block`]**: all three end with the thread descheduled, and
+    /// they differ in *what wakes it* -- the Mach kernel on the command buffer,
+    /// the Metal runtime on the event's value, and a GCD worker running our own
+    /// block. Only the third has a fired count, and collapsing the routes would
+    /// make that count unobservable.
+    Notify {
         /// Milliseconds before falling back to the blocking wait.
         timeout_ms: u64,
     },
@@ -489,6 +769,59 @@ enum WaitRoute {
 pub struct SharedEvent {
     raw: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     next: std::sync::atomic::AtomicU64,
+    /// The listener notification blocks are delivered on, held for this
+    /// event's whole life (#583).
+    ///
+    /// **The strong reference is the mechanism, not tidiness.** Apple's
+    /// guidance is explicit -- *"if the listener is deallocated, registered
+    /// completion blocks will never fire"* -- and a block that stops firing is
+    /// indistinguishable from one that never engaged (§2.4, #500). Holding it
+    /// per *wait* rather than per *event* would drop it between tokens and the
+    /// arm would silently become the blocking fallback: §7.1a-i's wrong-arm
+    /// shape, where a run reports one arm and executes another.
+    ///
+    /// `None` on every arm that does not need one, so the incumbent allocates
+    /// nothing (the same discipline as the event itself).
+    listener: Option<Retained<MTLSharedEventListener>>,
+    /// Where a fired block leaves the value it saw, and the condvar it wakes
+    /// the waiting thread through.
+    ///
+    /// **`Arc` because a registered block may fire after this event is
+    /// dropped.** Metal owns the block once it is registered and there is no
+    /// API to withdraw one, so a block capturing a borrow of this struct would
+    /// be a write into freed memory on exactly the path -- a late or lost
+    /// signal -- that the arm's timeout exists to survive. The `Arc` makes the
+    /// state outlive both, which is structural rather than an argument about
+    /// timing.
+    ///
+    /// `CachePadded` because the block runs on a **GCD worker** and the waiter
+    /// is the decode thread, so this line is genuinely cross-thread -- §9.2l
+    /// prices a shared line at 4.93x at two threads, and #582 is the standing
+    /// rule that a counter a completion handler shares with the host gets
+    /// padded.
+    shared: CachePadded<std::sync::Arc<NotifySlot>>,
+}
+
+/// The condvar-guarded state a notification block writes and a waiter reads.
+type NotifySlot = (std::sync::Mutex<NotifyState>, std::sync::Condvar);
+
+/// What a fired notification block leaves for the waiting thread.
+///
+/// The value is carried rather than a bare flag for §11.5n's reason one level
+/// out: a flag cannot distinguish *"the block fired for the value I want"* from
+/// *"the block fired for an earlier one"*, and blocks for different values are
+/// delivered independently. Comparing against a target the waiter already holds
+/// is the same repair the ring's generation counter is.
+#[derive(Default)]
+pub struct NotifyState {
+    /// Highest value any fired block has reported.
+    seen: u64,
+    /// How many blocks have fired on this event since it was created.
+    ///
+    /// The engagement proof for the listener arm, and it is a **count** rather
+    /// than a flag so that a wait can tell *its own* block fired rather than
+    /// inheriting a previous one's.
+    fired: u64,
 }
 
 // SAFETY: `MTLSharedEvent` is documented as usable across threads and processes
@@ -506,10 +839,43 @@ impl SharedEvent {
     /// correct everywhere. Returning an error instead would make a device
     /// without shared events fail rather than run slower.
     pub fn new(device: &Device) -> Option<Self> {
+        Self::with_listener(device, false)
+    }
+
+    /// As [`Self::new`], allocating an `MTLSharedEventListener` when `listener`
+    /// (#583).
+    ///
+    /// The listener is created **with the event** and dropped **with it**, which
+    /// is the whole lifetime discipline: Apple's guidance is that a deallocated
+    /// listener silently stops delivering blocks, and this is the allocation
+    /// whose lifetime is easiest to reason about because it is the same as the
+    /// thing it notifies for.
+    ///
+    /// `MTLSharedEventListener::new()` takes the process's default dispatch
+    /// queue rather than one we make. That is deliberate: a queue of our own
+    /// would be a second lifetime to get right for no benefit, and #547 already
+    /// establishes the block runs on a GCD worker either way
+    /// (`MTLDispatchListApply` -> `libsystem_blocks`), so the queue's identity
+    /// is not what the soundness rests on.
+    pub fn with_listener(device: &Device, listener: bool) -> Option<Self> {
         device.as_ref().newSharedEvent().map(|raw| Self {
             raw,
             next: std::sync::atomic::AtomicU64::new(0),
+            listener: listener.then(MTLSharedEventListener::new),
+            shared: CachePadded::new(std::sync::Arc::new((
+                std::sync::Mutex::new(NotifyState::default()),
+                std::sync::Condvar::new(),
+            ))),
         })
+    }
+
+    /// Whether a listener was allocated for this event.
+    ///
+    /// Reported so *"the listener arm was selected"* and *"the listener arm is
+    /// running"* stay separable, the same distinction
+    /// [`super::Commands::completion_event_present`] draws for the event.
+    pub fn has_listener(&self) -> bool {
+        self.listener.is_some()
     }
 
     fn raw(&self) -> &ProtocolObject<dyn MTLSharedEvent> {
@@ -517,6 +883,27 @@ impl SharedEvent {
     }
 
     /// The next value to signal. Monotone, host-written only.
+    ///
+    /// # This is NOT the token ring's generation counter, and they cannot merge
+    ///
+    /// #583 asks whether the ring's counter and this value *"are the same
+    /// number"* before adding a second. **They are not**, and the reason is the
+    /// same *different heights* argument that decided the ring still needs its
+    /// counter under a real event wait (§11.5t):
+    ///
+    /// | | ring's generation counter | this value |
+    /// |---|---|---|
+    /// | written by | a **kernel**, mid-buffer, via `slice_set` | the **host**, before commit |
+    /// | advances | once per **token** | once per **`commit_swap_locked`** — ~13.5/token under `CutPolicy::Counter(50)` |
+    /// | observed by | the host polling a mapped line (§3.7g) | the Metal runtime, or the host reading `signaledValue` |
+    /// | means | *this step's output is published* | *this command buffer is retired* |
+    ///
+    /// **Measured, they differ by more than an offset**: at `n` = 24 this
+    /// counter reaches ~384 while the ring publishes 24 times, and the ratio is
+    /// the cut policy's rather than a constant. A single number cannot carry
+    /// both, and §3.7b is why the ring's cannot simply become an event: a
+    /// compute kernel has no signal primitive, so there is no event at the
+    /// height the ring needs one.
     fn next_value(&self) -> u64 {
         self.next
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -541,6 +928,98 @@ impl SharedEvent {
     /// host writes.
     pub fn wait_until_signaled(&self, value: u64, timeout_ms: u64) -> bool {
         self.raw.waitUntilSignaledValue_timeoutMS(value, timeout_ms)
+    }
+
+    /// Register a notification block for `value` and park until it fires, or
+    /// until `timeout_ms` elapses (#583).
+    ///
+    /// Returns **the number of blocks that had fired** by the time this
+    /// returned, which is `0` exactly when the block did not arrive inside the
+    /// budget -- so a caller can tell *"the listener delivered"* from *"the
+    /// listener is not delivering and I quietly blocked instead"*. That
+    /// distinction is the reason this returns a count rather than a `bool`
+    /// (§2.4, #500).
+    ///
+    /// # The shape, and why the block does not do the work
+    ///
+    /// Metal invokes the block on a GCD worker. What the block does here is the
+    /// smallest thing that can be done correctly: record the value it was given
+    /// and wake the condvar. **It must not run the caller's work** -- the caller
+    /// is `to_cpu`, whose contract is *give me the finished value*, and moving
+    /// that onto a background queue would change what
+    /// [`super::Commands::flush_and_wait_current`] returning means.
+    ///
+    /// # Why the state is compared and not merely flagged
+    ///
+    /// Blocks for different values are delivered independently, so a bare flag
+    /// cannot distinguish *this* step's completion from a previous one's. The
+    /// waiter therefore compares `seen` against a `value` it already holds --
+    /// the same repair §11.5n made when a one-byte EOS flag turned out not to
+    /// be pollable, one level out.
+    ///
+    /// # The GCD boundary is a known blind spot for TSan
+    ///
+    /// #547 read the stack (`MTLDispatchListApply` -> `libsystem_blocks`) and
+    /// §15.1i measured the consequence: **TSan cannot model the happens-before
+    /// edge through Metal's dispatch, so a report at this boundary survives
+    /// `-Zbuild-std` and is still false.** Any result taken on this arm must
+    /// state that, because a genuine ordering defect here would be
+    /// indistinguishable from the false ones.
+    pub fn notify_then_wait(&self, value: u64, timeout_ms: u64) -> u64 {
+        let Some(listener) = self.listener.as_ref() else {
+            // No listener: nothing will ever fire, so report the failure rather
+            // than parking for the whole timeout. The caller blocks.
+            return 0;
+        };
+
+        // The state the block writes and this thread reads. Cloned into the
+        // block because Metal owns the block once it is registered and may
+        // invoke it after this call -- or after this event is dropped.
+        let shared = std::sync::Arc::clone(&self.shared);
+        let block = block2::RcBlock::new(
+            move |_event: std::ptr::NonNull<ProtocolObject<dyn MTLSharedEvent>>, seen: u64| {
+                let (lock, cv) = &*shared;
+                if let Ok(mut st) = lock.lock() {
+                    st.seen = st.seen.max(seen);
+                    st.fired += 1;
+                }
+                // Woken under no lock: the waiter re-checks the predicate, so a
+                // wake that races the unlock is harmless.
+                cv.notify_all();
+            },
+        );
+
+        let before = {
+            let (lock, _) = &**self.shared;
+            lock.lock().map(|st| st.fired).unwrap_or(0)
+        };
+
+        // SAFETY: `block` is a valid `RcBlock` for the duration of the call, and
+        // `notifyListener:atValue:block:` copies it -- Metal retains what it
+        // needs, which is why the block may safely outlive this stack frame and
+        // why it is sound for it to fire after a timeout below.
+        unsafe {
+            self.raw
+                .notifyListener_atValue_block(listener, value, &*block as *const _ as *mut _);
+        }
+
+        let (lock, cv) = &**self.shared;
+        let deadline = std::time::Duration::from_millis(timeout_ms);
+        let Ok(guard) = lock.lock() else {
+            return 0;
+        };
+        // `wait_timeout_while` re-checks the predicate on every wake, so a
+        // spurious wake does not return early and a block that fired *before*
+        // this thread parked is not missed -- the predicate reads state the
+        // block already wrote.
+        let Ok((guard, _timed_out)) =
+            cv.wait_timeout_while(guard, deadline, |st| st.seen < value && st.fired == before)
+        else {
+            return 0;
+        };
+        // The count this wait observed, and 0 when nothing arrived. Reported
+        // rather than a bool for the reason in the doc comment above.
+        guard.fired.saturating_sub(before)
     }
 }
 
@@ -580,6 +1059,16 @@ mod tests {
             CompletionWait::from_str_arm("shared-event-wait:7").unwrap(),
             CompletionWait::SharedEventWait { timeout_ms: 7 }
         );
+        assert_eq!(
+            CompletionWait::from_str_arm("shared-event-listener").unwrap(),
+            CompletionWait::SharedEventListener {
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS
+            }
+        );
+        assert_eq!(
+            CompletionWait::from_str_arm("shared-event-listener:7").unwrap(),
+            CompletionWait::SharedEventListener { timeout_ms: 7 }
+        );
     }
 
     /// The two parameterised arms share a prefix, and neither may absorb the
@@ -614,6 +1103,34 @@ mod tests {
             CompletionWait::SharedEventWait { timeout_ms: 5 }
         );
         assert_ne!(DEFAULT_WAIT_TIMEOUT_MS, 5, "the control above is vacuous");
+
+        // The listener arm shares the same prefix and widens the hazard from a
+        // pair to a set of three (#583): `shared-event-listener` starts with
+        // `shared-event`, and `shared-event-l...` is not distinguished from
+        // `shared-event-w...` until the fourth character of the suffix.
+        assert_eq!(
+            CompletionWait::from_str_arm("shared-event-listener").unwrap(),
+            CompletionWait::SharedEventListener {
+                timeout_ms: DEFAULT_WAIT_TIMEOUT_MS
+            }
+        );
+        assert_eq!(
+            CompletionWait::from_str_arm("shared-event-listener:5").unwrap(),
+            CompletionWait::SharedEventListener { timeout_ms: 5 }
+        );
+
+        // **Every arm resolves to itself, over the whole set.** The pairwise
+        // assertions above are absolute and still cannot see a parser that
+        // mapped two *unrelated* prefixed names together; sweeping the set is
+        // what closes that, and it grows with the enum rather than by hand.
+        for arm in CompletionWait::ALL_ARMS {
+            assert_eq!(
+                CompletionWait::from_str_arm(arm.name()).unwrap().name(),
+                arm.name(),
+                "arm {} does not resolve to itself",
+                arm.name()
+            );
+        }
     }
 
     /// Which arms poll, pinned as an **absolute** list rather than a shape
@@ -630,6 +1147,56 @@ mod tests {
         assert!(CompletionWait::SharedEvent.polls());
         assert!(CompletionWait::SharedEventSleep { micros: 1 }.polls());
         assert!(!CompletionWait::SharedEventWait { timeout_ms: 1 }.polls());
+        assert!(!CompletionWait::SharedEventListener { timeout_ms: 1 }.polls());
+    }
+
+    /// **`notifies()` and `polls()` are different axes**, and exactly one arm
+    /// is woken by a callback (#583).
+    ///
+    /// Asserted per arm rather than as a shape: `Synchronize`,
+    /// `SharedEventWait` and `SharedEventListener` all answer `false` to
+    /// `polls()`, and reading that as *"they are the same"* is the collapse
+    /// this axis exists to prevent -- they park in the Mach kernel, in the
+    /// Metal runtime, and on a condvar a GCD worker signals, which are three
+    /// mechanisms with three failure modes.
+    #[test]
+    fn exactly_the_listener_arm_is_notified() {
+        assert!(!CompletionWait::Synchronize.notifies());
+        assert!(!CompletionWait::SharedEvent.notifies());
+        assert!(!CompletionWait::SharedEventSleep { micros: 1 }.notifies());
+        assert!(!CompletionWait::SharedEventWait { timeout_ms: 1 }.notifies());
+        assert!(CompletionWait::SharedEventListener { timeout_ms: 1 }.notifies());
+        // Only the notified arm allocates a listener, so the incumbent and the
+        // three other async arms create nothing extra.
+        for arm in CompletionWait::ALL_ARMS {
+            assert_eq!(
+                arm.needs_listener(),
+                arm.notifies(),
+                "arm {} disagrees about needing a listener",
+                arm.name()
+            );
+        }
+    }
+
+    /// No two arms both poll and notify, and every async arm does exactly one
+    /// of {poll, park, notify} (#583).
+    ///
+    /// The partition is what makes each arm's engagement counter readable: a
+    /// polling arm proves itself by `polls > 0`, a notified arm by `fired > 0`,
+    /// and an arm that did both would have no unambiguous proof.
+    #[test]
+    fn polling_and_notifying_are_exclusive() {
+        for arm in CompletionWait::ALL_ARMS {
+            assert!(
+                !(arm.polls() && arm.notifies()),
+                "arm {} both polls and notifies, so neither counter is its proof",
+                arm.name()
+            );
+        }
+        // The control: each property is true of something, or the assertion
+        // above holds vacuously for an implementation returning false always.
+        assert!(CompletionWait::ALL_ARMS.iter().any(|a| a.polls()));
+        assert!(CompletionWait::ALL_ARMS.iter().any(|a| a.notifies()));
     }
 
     /// An invalid setting must fail rather than fall back (§2.4, after #69).
@@ -648,12 +1215,7 @@ mod tests {
     /// Every arm renders a distinct name (§7.1a-i's defect was a *collision*).
     #[test]
     fn every_arm_renders_distinctly() {
-        let arms = [
-            CompletionWait::Synchronize,
-            CompletionWait::SharedEvent,
-            CompletionWait::SharedEventSleep { micros: 50 },
-            CompletionWait::SharedEventWait { timeout_ms: 2_000 },
-        ];
+        let arms = CompletionWait::ALL_ARMS;
         let names: std::collections::HashSet<_> = arms.iter().map(|a| a.name()).collect();
         assert_eq!(names.len(), arms.len(), "two arms render the same name");
     }
@@ -728,6 +1290,90 @@ mod tests {
             "{}",
             park.name()
         );
+
+        // The listener arm takes the same three fail-safe cases (#583), and its
+        // failure mode is a third one worth naming: with no signal encoded no
+        // block is ever registered, so a condvar wait would sleep to the
+        // timeout and *then* block -- a slow run rather than a hang, which is
+        // the harder one to notice and the reason this is asserted rather than
+        // left to the timeout.
+        let notify = CompletionWait::SharedEventListener { timeout_ms: 1 };
+        assert_eq!(notify.wait_route(false, false), Block, "{}", notify.name());
+        assert_eq!(notify.wait_route(false, true), Block, "{}", notify.name());
+        assert_eq!(notify.wait_route(true, false), Block, "{}", notify.name());
+        assert_eq!(
+            notify.wait_route(true, true),
+            Notify { timeout_ms: 1 },
+            "{}",
+            notify.name()
+        );
+    }
+
+    /// The notify route's non-vacuity control, carrying its timeout (#583).
+    ///
+    /// The same argument as `the_park_route_is_reachable_and_carries_its_timeout`
+    /// one arm along: an implementation collapsing `Notify` into `Block` or into
+    /// `Park` would satisfy every fail-safe assertion above, because those all
+    /// expect `Block`. Only a positive assertion that the route is reached, with
+    /// the timeout that reaches the condvar rather than the one on the enum, can
+    /// see it.
+    #[test]
+    fn the_notify_route_is_reachable_and_carries_its_timeout() {
+        assert_eq!(
+            CompletionWait::SharedEventListener { timeout_ms: 4321 }.wait_route(true, true),
+            WaitRoute::Notify { timeout_ms: 4321 }
+        );
+        assert_ne!(
+            4321, DEFAULT_WAIT_TIMEOUT_MS,
+            "the timeout above equals the default, so this cannot see a hard-coded one"
+        );
+    }
+
+    /// **The three parking routes are distinct**, asserted directly (#583).
+    ///
+    /// `Block`, `Park` and `Notify` all end with the thread descheduled, which
+    /// is exactly why collapsing them is tempting and why it must not happen:
+    /// they differ in *what wakes the thread*, and only `Notify` has a fired
+    /// count. A routing function mapping two of them together would leave every
+    /// fail-safe test above passing while making one arm's engagement proof
+    /// unobservable.
+    #[test]
+    fn the_three_parking_routes_are_distinct() {
+        let block = CompletionWait::Synchronize.wait_route(true, true);
+        let park = CompletionWait::SharedEventWait { timeout_ms: 7 }.wait_route(true, true);
+        let notify = CompletionWait::SharedEventListener { timeout_ms: 7 }.wait_route(true, true);
+        // Absolute references on all three, not "they differ": a function
+        // mapping all three to a fourth route would satisfy pairwise inequality
+        // (§3.1b rule 1, and the shape #583's own prefix test guards against).
+        assert_eq!(block, WaitRoute::Block);
+        assert_eq!(park, WaitRoute::Park { timeout_ms: 7 });
+        assert_eq!(notify, WaitRoute::Notify { timeout_ms: 7 });
+    }
+
+    /// A notified arm must never route to a poll, whatever it is handed (#583).
+    ///
+    /// The counterpart of `a_parking_arm_never_routes_to_a_poll`, and it is what
+    /// makes `completion_polls == 0` readable on this arm too. Stated over the
+    /// whole four-case input domain.
+    #[test]
+    fn a_notified_arm_never_routes_to_a_poll() {
+        let notify = CompletionWait::SharedEventListener {
+            timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+        };
+        for (has_event, has_signal) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            assert_ne!(
+                notify.wait_route(has_event, has_signal),
+                WaitRoute::Poll,
+                "the listener arm polled with event={has_event} signal={has_signal}"
+            );
+        }
+        // The control, as above: `Poll` is reachable for an arm that should
+        // reach it.
+        assert_eq!(
+            CompletionWait::SharedEvent.wait_route(true, true),
+            WaitRoute::Poll
+        );
     }
 
     /// The routing table above is only meaningful if a poll is reachable at all
@@ -765,6 +1411,178 @@ mod tests {
         );
     }
 
+    /// **`ALL_ARMS` must contain every variant**, checked against the compiler
+    /// rather than against a second hand-written list (#583).
+    ///
+    /// A `const` array is the one enumeration a new variant does not break: it
+    /// is a compile error at every `match` and **silent** here. The previous
+    /// repair -- checking the array against a list of parser names -- compared
+    /// two hand-written lists to each other and went stale on the next arm
+    /// added, which is #519's *"looks like a comparison and is not"* (§3.1b).
+    ///
+    /// **The reference here is the compiler's**: the `match` below is
+    /// exhaustive, so adding a variant fails to build until it is handled, and
+    /// handling it means naming its discriminant. The test then asserts every
+    /// named discriminant appears in `ALL_ARMS`. So the array cannot fall
+    /// behind the enum without something failing -- a build error if the match
+    /// is not updated, this test if the array is not.
+    #[test]
+    fn no_arm_is_missing_from_all_arms() {
+        // The exhaustive match is the mechanism: a new variant does not compile
+        // until it is added here, and adding it here is what puts it in `want`.
+        fn discriminant(arm: &CompletionWait) -> &'static str {
+            match arm {
+                CompletionWait::Synchronize => "Synchronize",
+                CompletionWait::SharedEvent => "SharedEvent",
+                CompletionWait::SharedEventSleep { .. } => "SharedEventSleep",
+                CompletionWait::SharedEventWait { .. } => "SharedEventWait",
+                CompletionWait::SharedEventListener { .. } => "SharedEventListener",
+            }
+        }
+        let want = [
+            "Synchronize",
+            "SharedEvent",
+            "SharedEventSleep",
+            "SharedEventWait",
+            "SharedEventListener",
+        ];
+        let have: Vec<&str> = CompletionWait::ALL_ARMS.iter().map(discriminant).collect();
+        for w in want {
+            assert!(
+                have.contains(&w),
+                "{w} is a variant of CompletionWait and is absent from ALL_ARMS, \
+                 so every sweep over ALL_ARMS silently skips it"
+            );
+        }
+        assert_eq!(
+            have.len(),
+            want.len(),
+            "ALL_ARMS has a duplicate or an extra member: {have:?}"
+        );
+    }
+
+    /// Every arm in `ALL_ARMS` round-trips through the parser (#583).
+    ///
+    /// The other half of the registry property: `ALL_ARMS` is what sweeps
+    /// iterate and `from_str_arm` is what a **user** can select, so an arm in
+    /// one and not the other is either untestable from a flag or untested by
+    /// every sweep. Checking the two against each other is sound *here* --
+    /// unlike the stale test this replaces -- because neither is hand-written
+    /// relative to the other: `ALL_ARMS` is pinned to the enum above and the
+    /// parser is pinned to the names a `RESULT` line carries.
+    #[test]
+    fn every_arm_round_trips_through_its_name() {
+        for arm in CompletionWait::ALL_ARMS {
+            let parsed = CompletionWait::from_str_arm(arm.name()).unwrap_or_else(|e| {
+                panic!(
+                    "arm {} is in ALL_ARMS and does not parse from its own name: {e}",
+                    arm.name()
+                )
+            });
+            assert_eq!(
+                parsed.name(),
+                arm.name(),
+                "arm {} parses to a different arm: {}",
+                arm.name(),
+                parsed.name()
+            );
+        }
+        // The control: an unknown name is still an error, or the loop above
+        // would pass for a parser that accepted everything (§3.1a rule 3).
+        assert!(CompletionWait::from_str_arm("shared-event-park").is_err());
+    }
+
+    /// **Every parameterised arm's period reaches its rendered name** (#583).
+    ///
+    /// The defect this pins is §13.5m's, measured at `CutPolicy` and repeated
+    /// at `CompletionWait` in #567: an arm rendered without its period compares
+    /// **equal** to the same arm at a different period, so two runs the design
+    /// separates are pooled by the store. §11.5o measures `sleep:50` against
+    /// `sleep:200` at 15.0 against 3.9 polls/ms — two arms, not one.
+    ///
+    /// Asserted by **varying the period and requiring the rendering to move**,
+    /// which is the only form that can see a `match` arm returning a constant.
+    /// A test comparing `arm_with_period()` against a literal would pass on an
+    /// implementation that ignored the field and happened to print the default.
+    #[test]
+    fn a_periods_arm_renders_its_period_and_a_bare_arm_does_not() {
+        // Bare arms render bare, so the axis vector does not gain a spurious
+        // field for an arm that has no period.
+        assert_eq!(CompletionWait::Synchronize.arm_with_period(), "synchronize");
+        assert_eq!(
+            CompletionWait::SharedEvent.arm_with_period(),
+            "shared-event"
+        );
+        assert_eq!(CompletionWait::Synchronize.period(), None);
+        assert_eq!(CompletionWait::SharedEvent.period(), None);
+
+        // Every parameterised arm: two distinct periods must render
+        // differently, which is the property that stops the pooling.
+        let cases: [(CompletionWait, CompletionWait, &str); 3] = [
+            (
+                CompletionWait::SharedEventSleep { micros: 50 },
+                CompletionWait::SharedEventSleep { micros: 200 },
+                "shared-event-sleep",
+            ),
+            (
+                CompletionWait::SharedEventWait { timeout_ms: 50 },
+                CompletionWait::SharedEventWait { timeout_ms: 200 },
+                "shared-event-wait",
+            ),
+            (
+                CompletionWait::SharedEventListener { timeout_ms: 50 },
+                CompletionWait::SharedEventListener { timeout_ms: 200 },
+                "shared-event-listener",
+            ),
+        ];
+        for (lo, hi, name) in cases {
+            // Absolute references on both sides, per §3.1b rule 1: an
+            // implementation mapping both to a third string would satisfy a
+            // bare `assert_ne!`.
+            assert_eq!(lo.arm_with_period(), format!("{name}:50"));
+            assert_eq!(hi.arm_with_period(), format!("{name}:200"));
+            assert_eq!(lo.period(), Some(50));
+            assert_eq!(hi.period(), Some(200));
+            // And the bare name is still the arm's, so the period is an
+            // addition rather than a replacement.
+            assert_eq!(lo.name(), name);
+        }
+    }
+
+    /// Every arm in `ALL_ARMS` renders a period iff it carries one (#583).
+    ///
+    /// The sweep that keeps [`CompletionWait::period`] honest as arms are
+    /// added: a new parameterised arm falling into a `None` branch would be
+    /// silently pooled with itself at every period, and this is what fails.
+    #[test]
+    fn the_period_sweep_agrees_with_the_rendering() {
+        for arm in CompletionWait::ALL_ARMS {
+            let rendered = arm.arm_with_period();
+            match arm.period() {
+                Some(p) => assert_eq!(
+                    rendered,
+                    format!("{}:{p}", arm.name()),
+                    "arm {} has a period and does not render it",
+                    arm.name()
+                ),
+                None => assert_eq!(
+                    rendered,
+                    arm.name(),
+                    "arm {} has no period and renders one",
+                    arm.name()
+                ),
+            }
+        }
+        // The control: at least one arm of each kind exists, or the loop above
+        // holds vacuously (§3.1a rule 1).
+        assert!(CompletionWait::ALL_ARMS
+            .iter()
+            .any(|a| a.period().is_some()));
+        assert!(CompletionWait::ALL_ARMS
+            .iter()
+            .any(|a| a.period().is_none()));
+    }
+
     /// A parking arm must never route to a poll, whatever it is handed (#583).
     ///
     /// This is the property that makes `completion_polls == 0` readable as
@@ -777,7 +1595,8 @@ mod tests {
         let park = CompletionWait::SharedEventWait {
             timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
         };
-        for (has_event, has_signal) in [(false, false), (false, true), (true, false), (true, true)] {
+        for (has_event, has_signal) in [(false, false), (false, true), (true, false), (true, true)]
+        {
             assert_ne!(
                 park.wait_route(has_event, has_signal),
                 WaitRoute::Poll,

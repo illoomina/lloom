@@ -231,14 +231,28 @@ struct Args {
     /// issue #559; §11.5t, issue #583).
     ///
     /// `synchronize` (the default and the incumbent), `shared-event`,
-    /// `shared-event-sleep[:<micros>]`, or `shared-event-wait[:<timeout_ms>]`.
+    /// `shared-event-sleep[:<micros>]`, `shared-event-wait[:<timeout_ms>]`, or
+    /// `shared-event-listener[:<timeout_ms>]`.
     ///
-    /// **The four arms are three designs, not four tunings** (#583). The two
+    /// **The five arms are four designs, not five tunings** (#583). The two
     /// middle arms are **poll loops** over `signaledValue`; `shared-event-wait`
     /// is `waitUntilSignaledValue:timeoutMS:` and **parks in the runtime**, so
     /// it reports `completion_polls=0` structurally. Its period is a **timeout
     /// in milliseconds** — a fail-safe that falls back to blocking, not a
     /// latency knob — where the sleeping arm's is a sleep in microseconds.
+    ///
+    /// **`shared-event-listener` is the fourth design and the only one where
+    /// the completion is DELIVERED** — `notifyListener:atValue:block:` runs a
+    /// block on a GCD worker, which wakes this thread through a condvar. It
+    /// reports `completion_polls=0` like the parking arm, and **that zero is
+    /// not its engagement proof**: a listener that has stopped delivering falls
+    /// back to blocking, computes the right answer, moves no digest and reads
+    /// the same 0. `completion_fires` is what separates them.
+    ///
+    /// **A result from this arm owes a stated blind spot**: the block runs on a
+    /// GCD queue, and §15.1i measures TSan unable to model the happens-before
+    /// edge through Metal's dispatch — a report there survives `-Zbuild-std`
+    /// and is still false.
     ///
     /// **Three axes on one seam, and they are at different heights.** §11.5j
     /// records the ring as wired installing *"a hint before a blocking read"*,
@@ -1339,16 +1353,21 @@ fn main() -> Result<()> {
     // A different height from #535's counters above rather than a duplicate of
     // them: `peek_hit` counts reads that skipped a wait, this counts waits that
     // were satisfied without blocking.
+    // `cw_fires` is the listener arm's own engagement proof (#583), and the
+    // pair above cannot be it: `shared-event-listener` reports
+    // `(signals > 0, polls == 0)` whether its notification block delivered or
+    // never fired and the wait fell back to blocking. The fallback is correct,
+    // so the values agree and both digests are unmoved either way.
     #[cfg(feature = "metal")]
-    let (cw_name, cw_signals, cw_polls) = match &device {
+    let (cw_name, cw_signals, cw_polls, cw_fires) = match &device {
         Device::Metal(m) => {
             let (s, p) = m.completion_counts();
-            (m.completion_wait_name(), s, p)
+            (m.completion_wait_name(), s, p, m.completion_fires())
         }
-        _ => ("none", 0, 0),
+        _ => ("none", 0, 0, 0),
     };
     #[cfg(not(feature = "metal"))]
-    let (cw_name, cw_signals, cw_polls) = ("none", 0u64, 0u64);
+    let (cw_name, cw_signals, cw_polls, cw_fires) = ("none", 0u64, 0u64, 0u64);
 
     println!();
     println!(
@@ -1364,7 +1383,7 @@ fn main() -> Result<()> {
     );
     println!(
         "  completion arm      completion_wait={cw_name} completion_signals={cw_signals} \
-         completion_polls={cw_polls}"
+         completion_polls={cw_polls} completion_fires={cw_fires}"
     );
     println!(
         "  readback arms       to_cpu_fast={fast} to_cpu_blit={blit} \
@@ -1419,20 +1438,17 @@ fn main() -> Result<()> {
     // Built from the parsed arm rather than from `cw_name` for the period, and
     // asserted equal to the device's own name above, so the widening cannot
     // drift from what actually ran.
+    // **The period comes from the ARM, and this was the THIRD copy of that
+    // list** (#583). It was a local `match` naming each parameterised arm with
+    // an `other => name()` fallback — so a newly added parameterised arm does
+    // not fail to compile here, it silently renders **without its period** and
+    // pools with every other period of itself in #171's store. That is §13.5m's
+    // defect, and the reason it kept recurring is that three harnesses each
+    // kept their own copy of one list. `CompletionWait::arm_with_period()` is
+    // now the single place that knows, and its `match` is exhaustive, so a new
+    // arm is a compile error *there* rather than a wrong axis vector *here*.
     #[cfg(feature = "metal")]
-    let completion_wait_arm = match completion_wait {
-        candle::metal_backend::CompletionWait::SharedEventSleep { micros } => {
-            format!("shared-event-sleep:{micros}")
-        }
-        // #583's parking arm carries a TIMEOUT and renders it for exactly the
-        // reason above: `name()` maps every `SharedEventWait { timeout_ms }` to
-        // bare `shared-event-wait`, so two runs at different timeouts would
-        // render equal axis vectors and #171's store would pool them.
-        candle::metal_backend::CompletionWait::SharedEventWait { timeout_ms } => {
-            format!("shared-event-wait:{timeout_ms}")
-        }
-        other => other.name().to_string(),
-    };
+    let completion_wait_arm = completion_wait.arm_with_period();
     #[cfg(not(feature = "metal"))]
     let completion_wait_arm = "n/a".to_string();
     // `PollMechanism::name()` has the identical shape and the identical repair
@@ -1500,7 +1516,8 @@ fn main() -> Result<()> {
          ring_publishes={} poll={} poll_iters={} max_in_flight={} to_cpu_fast={} \
          to_cpu_blit={} to_cpu_null_after_wait={} nonblocking_eos={} \
          poll_fallbacks={} peek_hit={} peek_unmapped={} poll_reads={} completion_wait={} \
-         completion_signals={} completion_polls={} gemv_silu={} gemv_residual={} \
+         completion_signals={} completion_polls={} completion_fires={} \
+         gemv_silu={} gemv_residual={} \
          config=[{}] token_digest={}",
         args.n,
         args.warmup,
@@ -1543,6 +1560,7 @@ fn main() -> Result<()> {
         cw_name,
         cw_signals,
         cw_polls,
+        cw_fires,
         // Read back from `config`, which is what `Mlp::new` consumed, rather
         // than from `args` (§7.1a-i).
         config.gemv_silu,

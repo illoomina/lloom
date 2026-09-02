@@ -649,6 +649,41 @@ impl MetalDevice {
         self.commands.completion_event_present()
     }
 
+    /// Notification blocks that fired, for the listener arm (`DESIGN.md`
+    /// §11.5u, issue #583).
+    ///
+    /// **The listener arm's only engagement proof**, and the reason it is a
+    /// third counter rather than a third element of
+    /// [`Self::completion_counts`]: that pair reads `(nonzero, 0)` on this arm
+    /// whether the block delivered or the wait timed out and blocked instead,
+    /// because the arm polls zero times either way. A listener that has stopped
+    /// firing computes the right answer and moves no digest, so nothing else in
+    /// the tree can see it (§2.4, #500).
+    pub fn completion_fires(&self) -> u64 {
+        self.commands.completion_fires()
+    }
+
+    /// Whether an `MTLSharedEventListener` was allocated for the selected arm.
+    ///
+    /// [`Self::completion_event_present`]'s counterpart one level in, and for
+    /// the same reason: *"the listener arm was selected"* and *"the listener
+    /// arm can run"* are different facts.
+    pub fn completion_listener_present(&self) -> bool {
+        self.commands.completion_listener_present()
+    }
+
+    /// Waits that found the command buffer already complete (`DESIGN.md`
+    /// §11.5u, issue #583).
+    ///
+    /// **Measured 0 on the decode path**, and kept for what it excluded: it
+    /// falsified the first explanation for `completion_fires` sitting an order
+    /// of magnitude below `completion_signals`. The two count different things
+    /// -- commits against waits, ~13.5:1 under `CutPolicy::Counter(50)` -- so
+    /// the ratio is arithmetic rather than a failure rate.
+    pub fn completion_already_complete(&self) -> u64 {
+        self.commands.completion_already_complete()
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }

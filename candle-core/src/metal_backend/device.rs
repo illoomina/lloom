@@ -4,9 +4,10 @@ use crate::{DType, Result};
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_metal_kernels::{
     metal::{
-        Arena, ArenaCounters, ArenaCursor, ArenaLayout, ArenaOffsets, ArenaRecorder,
+        session_region::{RegionCounters, RegionPlan},
+        Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout, ArenaOffsets, ArenaRecorder,
         BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, MTLResourceOptions,
-        PoolCounters, PoolOccupancySnapshot, PooledBuffer, ResidencySet, StepPlan,
+        PoolCounters, PoolOccupancySnapshot, PooledBuffer, ResidencySet, SessionRegion, StepPlan,
     },
     Kernels,
 };
@@ -301,6 +302,16 @@ pub struct MetalDevice {
     /// (§11.1a.1), so one observed step describes the rest. This is §11.1a's
     /// record-then-replay, applied to allocation.
     pub(crate) arena_recorder: Arc<Mutex<Option<Arc<Mutex<ArenaRecorder>>>>>,
+
+    /// The session region: one owned allocation serving the class the arena
+    /// declines (#47, `DESIGN.md` §9.2x).
+    ///
+    /// Beside the arena rather than inside it because the two have different
+    /// placement rules and only one of them may reuse a span across a step
+    /// boundary — an arena slot's occupant is dead by the end of the step, a
+    /// session tenant is read by the *next* one. `None` until installed, which
+    /// is every process that has not asked for it.
+    pub(crate) session_region: Arc<RwLock<Option<SessionRegion>>>,
 }
 
 // Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
@@ -735,6 +746,88 @@ impl MetalDevice {
         self.arena.read().ok().and_then(|a| a.clone())
     }
 
+    /// The installed session region, if any. Cheap, on `arena_slot`'s argument.
+    fn session_region_slot(&self) -> Option<SessionRegion> {
+        self.session_region.read().ok().and_then(|r| r.clone())
+    }
+
+    /// Install a session region serving the ordinals the arena declines as
+    /// session state (#47, `DESIGN.md` §9.2x).
+    ///
+    /// `reservations` is `(ordinal, bytes)`: the allocation ordinal within a
+    /// decode step, and the bytes that ordinal's tenant needs **at full
+    /// capacity**. That second figure is ggml's `reserve` (§9.2t): a tenant
+    /// growing by a fixed stride per token to a known capacity needs
+    /// `stride × capacity` bytes and never more, so reserving it once means no
+    /// allocation on any later token.
+    ///
+    /// # This is additive, exactly as the arena is (§9.2a)
+    ///
+    /// Nothing about the pool changes and no caller releases anything. An
+    /// ordinal with no reservation, or a request past its reservation, falls
+    /// through to the pool as before — which costs coverage, never correctness,
+    /// and is the direction a wrong reservation must fail in.
+    ///
+    /// One `MTLBuffer`, registered in the residency set once, on §9.2's
+    /// *"residency is a CPU-side fact established once"*: the whole point is
+    /// that the per-token path stops inserting.
+    pub fn install_session_region(&self, reservations: &[(usize, usize)]) -> Result<usize> {
+        let plan = RegionPlan::reserve(reservations);
+        let bytes = plan.bytes().max(1);
+        let base = self
+            .device
+            .new_buffer(bytes, PRIVATE_RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&base);
+        let region = SessionRegion::new(base, plan)
+            .map_err(|e| MetalError::Message(format!("session region rejected: {e}")))?;
+        if let Ok(mut slot) = self.session_region.write() {
+            // Unregister the region being replaced while it still owns its base
+            // — #489's ordering argument, which applies here for the same reason
+            // it applies to the arena.
+            if let Some(previous) = slot.as_ref() {
+                self.residency_set.remove(previous.base());
+            }
+            *slot = Some(region);
+        }
+        Ok(bytes)
+    }
+
+    /// Remove the session region. Subsequent allocations take the pool path.
+    ///
+    /// Ordered as [`Self::clear_arena`] is: the base leaves the residency set
+    /// **while the region still owns it**, so `removeAllocation` names an object
+    /// that provably still exists (§6.3c, #489).
+    pub fn clear_session_region(&self) {
+        let Ok(mut slot) = self.session_region.write() else {
+            return;
+        };
+        if let Some(region) = slot.as_ref() {
+            self.residency_set.remove(region.base());
+        }
+        *slot = None;
+    }
+
+    /// The session region's counters, if one is installed.
+    pub fn session_region_counters(&self) -> Option<RegionCounters> {
+        self.session_region_slot().map(|r| r.counters())
+    }
+
+    /// Bytes the installed session region holds.
+    pub fn session_region_bytes(&self) -> Option<usize> {
+        self.session_region_slot().map(|r| r.bytes())
+    }
+
+    /// How many tenants the installed session region reserves for.
+    ///
+    /// `None` when none is installed, and `Some(0)` when one is installed with
+    /// nothing to serve — two states a harness must be able to tell apart, since
+    /// an empty region and an absent one produce identical counters otherwise
+    /// (#500's lesson: a clean null and an unwired mechanism look the same).
+    pub fn session_region_tenants(&self) -> Option<usize> {
+        self.session_region_slot().map(|r| r.tenants())
+    }
+
     /// Install an activation arena built from `plan`, replacing any previous
     /// one.
     ///
@@ -982,6 +1075,25 @@ impl MetalDevice {
         Some(r.excluded_by_test())
     }
 
+    /// Reservations for a session region, derived from the recording (#47).
+    ///
+    /// `(ordinal, bytes at capacity)` for each ordinal whose size grew between
+    /// the two recorded steps, extrapolated from the **measured** stride to
+    /// `capacity_tokens`. See
+    /// [`ArenaRecorder::session_reservations`](candle_metal_kernels::metal::ArenaRecorder::session_reservations)
+    /// for why the stride is measured rather than computed from the geometry,
+    /// and why the fixed-size session state is deliberately not included.
+    pub fn arena_recording_session_reservations(
+        &self,
+        tokens_recorded: usize,
+        capacity_tokens: usize,
+    ) -> Option<Vec<(usize, usize)>> {
+        let g = self.arena_recorder.lock().ok()?;
+        let rec = g.as_ref()?;
+        let r = rec.lock().ok()?;
+        Some(r.session_reservations(tokens_recorded, capacity_tokens))
+    }
+
     /// Stop observing and build a plan from what was seen.
     ///
     /// Returns `None` if nothing was recorded, which is a real outcome worth
@@ -1040,8 +1152,36 @@ impl MetalDevice {
         // session-state allocation whose size grows with `kv_len` -- falls
         // through to the pool below, unchanged.
         if let Some(arena) = self.arena_slot() {
-            if let Some(b) = arena.acquire(size) {
+            let offer = arena.acquire_attributed(size);
+            if let Some(b) = offer.served {
                 return Ok(b);
+            }
+            // Layer 3b (#47, `DESIGN.md` §9.2x). The arena declined; if it
+            // declined because this ordinal is **session state**, the session
+            // region may own a reservation for it.
+            //
+            // # Why only the `Session` decline, and not every decline
+            //
+            // The region's tenants are keyed by allocation ordinal, and a
+            // reservation means "these bytes belong to this ordinal for the
+            // whole session". That is meaningful only for the population the
+            // plan classified as session state. `PastPlan` and `SizeMismatch`
+            // say the step has drifted from what was recorded, and serving a
+            // drifted allocation from a fixed reservation is exactly the
+            // aliasing §9.3 gives no safety net against — so those keep falling
+            // to the pool, unchanged.
+            //
+            // `Inactive` is outside a decode step (prefill, setup, sampling) and
+            // carries no ordinal at all, which is why the `ordinal` is taken
+            // from the offer rather than recomputed: the `fetch_add` already
+            // happened inside `acquire_attributed`, and a second one here would
+            // walk the plan out of alignment.
+            if offer.decline == Some(ArenaDecline::Session) {
+                if let (Some(ordinal), Some(region)) = (offer.ordinal, self.session_region_slot()) {
+                    if let Some(b) = region.acquire(ordinal, size) {
+                        return Ok(self.note_for_recording(b, size));
+                    }
+                }
             }
         }
         let buffer = match self.private_buffers.acquire(size) {

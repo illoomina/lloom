@@ -98,6 +98,16 @@ mod scratch_fuzz;
 mod scratch_gpu_tests;
 #[cfg(test)]
 mod scratch_tests;
+/// The session region: one owned allocation for the class the arena declines
+/// (#47, `DESIGN.md` §9.2x).
+///
+/// Deliberately **not** in the glob re-export below: `Span` and `TenantId` are
+/// general names, and a caller reaching for them should say `session_region::`
+/// rather than acquire them from a `metal::*`. `SessionRegion` itself is
+/// re-exported by name for the same reason `admission::Budget` is not.
+pub mod session_region;
+#[cfg(test)]
+mod session_region_tests;
 pub mod trace;
 
 pub use arena::*;
@@ -115,3 +125,4 @@ pub use kv_pages::*;
 pub use library::*;
 pub use residency_set::*;
 pub use scratch::*;
+pub use session_region::SessionRegion;

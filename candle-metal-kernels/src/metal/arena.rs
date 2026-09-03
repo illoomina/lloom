@@ -521,6 +521,46 @@ struct ArenaPlanState {
     slot_handles: Vec<Arc<PooledBuffer>>,
 }
 
+/// Why the arena declined an allocation.
+///
+/// Every variant is a **normal outcome**, not an error: the allocation falls
+/// through to the pool exactly as it did before the arena existed. They are
+/// distinguished because they want different responses, and reporting one number
+/// that could mean any of them is the shape §3.1c warns about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArenaDecline {
+    /// Outside a decode step: prefill, model setup, sampling.
+    Inactive,
+    /// The step allocated more values than the plan recorded.
+    PastPlan,
+    /// **Session state**, excluded when the plan was built (§9.1).
+    ///
+    /// This is the population the session region serves (#47): per-sequence
+    /// state whose size grows with `kv_len`, which a fixed-offset slot cannot
+    /// hold. Measured on LFM2 decode this is every decline the arena makes —
+    /// `lfm2-dispatch-trace --arena` reports `declined(size) 0` and
+    /// `declined(past plan) 0`.
+    Session,
+    /// The request's size is not what this ordinal was planned for.
+    SizeMismatch,
+}
+
+/// What the arena did with one offered allocation.
+#[derive(Clone)]
+pub struct ArenaOffer {
+    /// The buffer, when the arena served it.
+    pub served: Option<Arc<PooledBuffer>>,
+    /// The allocation ordinal this offer consumed, when a step was open.
+    ///
+    /// **The key a downstream region must use**, and the reason this struct
+    /// exists: the ordinal is consumed by the `fetch_add` inside `acquire`, so a
+    /// caller cannot recompute it without double-counting and walking the plan
+    /// out of alignment.
+    pub ordinal: Option<usize>,
+    /// Why it declined, or `None` when it served.
+    pub decline: Option<ArenaDecline>,
+}
+
 /// The activation arena.
 ///
 /// Cheap to clone; every clone refers to the same arena.
@@ -877,8 +917,39 @@ impl Arena {
     /// consumers above, so a future reader that *does* need an edge fails a test
     /// rather than inheriting a `Relaxed` that no longer suffices.
     pub fn acquire(&self, size: usize) -> Option<Arc<PooledBuffer>> {
+        self.acquire_attributed(size).served
+    }
+
+    /// As [`Self::acquire`], and it also reports **which ordinal** was consumed
+    /// and **why** a decline happened.
+    ///
+    /// # Why this exists rather than a second counter read (#47)
+    ///
+    /// The session region (`session_region.rs`) serves the population this arena
+    /// declines as session state, and it keys on the same allocation ordinal for
+    /// the same reason this does: the kernel sequence is byte-identical across
+    /// tokens (§11.1a.1), so the Nth allocation of one step is the Nth of the
+    /// next. That key is consumed *inside* this function — the `fetch_add` is
+    /// here — so a caller that wanted to offer the declined allocation onwards
+    /// had no way to name it.
+    ///
+    /// Returning it is strictly cheaper than the alternatives and does not touch
+    /// the ordinal's single-writer property: the `fetch_add` still happens
+    /// exactly once, on the same thread, and this only reports what it returned.
+    /// A second `fetch_add` in the caller would **double-count the ordinal** and
+    /// walk the plan out of alignment, which is the defect this shape prevents
+    /// rather than risks.
+    ///
+    /// `acquire` above is kept as the one-line wrapper so every existing caller
+    /// is untouched — §3.6's *add a variant behind a seam, never rip out the
+    /// block*.
+    pub fn acquire_attributed(&self, size: usize) -> ArenaOffer {
         if !self.is_active() {
-            return None;
+            return ArenaOffer {
+                served: None,
+                ordinal: None,
+                decline: Some(ArenaDecline::Inactive),
+            };
         }
         let ordinal = self.inner.ordinal.fetch_add(1, Ordering::Relaxed);
         let counters = &self.inner.counters;
@@ -889,24 +960,40 @@ impl Arena {
             Some(e) => *e,
             None => {
                 counters.declined_exhausted.fetch_add(1, Ordering::Relaxed);
-                return None;
+                return ArenaOffer {
+                    served: None,
+                    ordinal: Some(ordinal),
+                    decline: Some(ArenaDecline::PastPlan),
+                };
             }
         };
         // Not the arena's: session state, excluded when the plan was built
         // because its size moved between the two recorded steps (§9.1).
         let Some((slot, want)) = entry else {
             counters.declined_session.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return ArenaOffer {
+                served: None,
+                ordinal: Some(ordinal),
+                decline: Some(ArenaDecline::Session),
+            };
         };
         // Size must match what was planned for this ordinal. A larger request
         // would run past the slot; a smaller one means the sequence has drifted
         // from the plan and the ordinal no longer names what it did.
         if size != want {
             counters.declined_size.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return ArenaOffer {
+                served: None,
+                ordinal: Some(ordinal),
+                decline: Some(ArenaDecline::SizeMismatch),
+            };
         }
         counters.hits.fetch_add(1, Ordering::Relaxed);
-        Some(Arc::clone(&plan_state.slot_handles[slot]))
+        ArenaOffer {
+            served: Some(Arc::clone(&plan_state.slot_handles[slot])),
+            ordinal: Some(ordinal),
+            decline: None,
+        }
     }
 
     /// A snapshot of the counters.
@@ -1407,6 +1494,71 @@ impl ArenaRecorder {
         )
     }
 
+    /// Reservations for the session region: `(ordinal, bytes at capacity)`
+    /// (#47, `DESIGN.md` §9.2x).
+    ///
+    /// The population is exactly the ordinals [`Self::kv_dependent`] excluded —
+    /// the ones whose allocation size **moved between the two recorded steps** —
+    /// and the reservation is that growth extrapolated to `capacity_tokens`.
+    ///
+    /// # The stride is measured, never assumed
+    ///
+    /// Two recorded steps one token apart give `stride = this - previous` at
+    /// each ordinal directly. Under `KvAppend::Cat` that is
+    /// `b × kv_heads × head_dim × dtype` per token, but this does not compute it
+    /// from the geometry: the recorder already holds both figures, and a derived
+    /// constant would be a second source of truth to drift (§8.1b's argument for
+    /// a checked registry, applied to a size).
+    ///
+    /// `tokens_recorded` is how many tokens of growth the observed step already
+    /// contains — the `kv_len` at recording time — so the reservation covers the
+    /// tenant from where it is now to `capacity_tokens`:
+    ///
+    /// ```text
+    /// reserved = this_step_size + stride × (capacity_tokens − tokens_recorded)
+    /// ```
+    ///
+    /// # Which ordinals are excluded, and why only one of the two tests
+    ///
+    /// [`Self::excluded_flags`] unions two detectors, and only `kv_dependent`'s
+    /// population belongs here. The other — [`Self::outlives_step`] — catches
+    /// state that lives across steps at a **fixed** size, LFM2's conv state
+    /// being the worked case at 12288 B. A fixed-size tenant does not grow, so
+    /// it has no stride to extrapolate and reserving for it would hand the
+    /// region a tenant it cannot size; those keep falling to the pool, which is
+    /// what they do today.
+    ///
+    /// An ordinal that **shrank** between the two steps is skipped rather than
+    /// reserved: a negative stride means the sequence drifted rather than grew,
+    /// and extrapolating it would produce a reservation smaller than the tenant
+    /// already needs — a decline every token, which costs the lookup and buys
+    /// nothing.
+    pub fn session_reservations(
+        &self,
+        tokens_recorded: usize,
+        capacity_tokens: usize,
+    ) -> Vec<(usize, usize)> {
+        let growing = self.kv_dependent();
+        let fixed = self.outlives_step();
+        let remaining = capacity_tokens.saturating_sub(tokens_recorded);
+        (0..self.sizes.len())
+            .filter(|&i| growing[i] && !fixed[i])
+            .filter_map(|i| {
+                let now = self.sizes[i];
+                // `kv_dependent` marks an ordinal absent from the previous step
+                // as varying, so `previous` may be short here. No previous size
+                // means no measurable stride, and a guessed one is exactly what
+                // this doc comment refuses.
+                let prev = *self.previous.get(i)?;
+                let stride = now.checked_sub(prev)?;
+                if stride == 0 {
+                    return None;
+                }
+                Some((i, now + stride * remaining))
+            })
+            .collect()
+    }
+
     /// Forget everything, including the previous step.
     pub fn reset(&mut self) {
         self.sizes.clear();
@@ -1884,6 +2036,104 @@ mod tests {
             rec.excluded_by_test(),
             (0, 1),
             "exclusion was not attributed to the cross-step test"
+        );
+    }
+
+    /// A growing tenant's reservation is its measured stride extrapolated to
+    /// capacity, by absolute byte count (#47, §9.2x).
+    ///
+    /// **Kills**: any change to `session_reservations`' arithmetic — dropping
+    /// the `tokens_recorded` subtraction, using `prev` instead of `now` as the
+    /// base, or multiplying by `capacity` rather than by the remaining tokens.
+    /// A test asserting only *"the reservation is at least the current size"*
+    /// survives all three (§3.1b rule 1: an absolute reference, not a shape).
+    #[test]
+    fn a_growing_tenant_reserves_its_measured_stride_to_capacity() {
+        const KV: usize = 0x11;
+        const ACT: usize = 0x22;
+        // 128 B of growth per token: the `Tensor::cat` stride under `Cat`.
+        const STRIDE: usize = 128;
+
+        let mut rec = ArenaRecorder::new();
+        let mut step = |rec: &mut ArenaRecorder, kv_bytes: usize| {
+            rec.record_alloc(KV, kv_bytes);
+            rec.record_bind(KV);
+            rec.record_dispatch();
+            rec.record_alloc(ACT, 4096);
+            rec.record_bind(ACT);
+            rec.record_dispatch();
+        };
+        // Two steps one token apart: 40 tokens of KV, then 41.
+        step(&mut rec, STRIDE * 40);
+        rec.next_step();
+        step(&mut rec, STRIDE * 41);
+
+        // Recorded at 41 tokens, reserving to a capacity of 100.
+        let res = rec.session_reservations(41, 100);
+        assert_eq!(
+            res,
+            vec![(0, STRIDE * 41 + STRIDE * 59)],
+            "the reservation must be this step's size plus the stride over the \
+             remaining 59 tokens, and must not include the activation"
+        );
+        // Which is the closed form, stated as the number a reader can check:
+        assert_eq!(res[0].1, 12800, "100 tokens x 128 B");
+    }
+
+    /// A fixed-size tenant that outlives its step gets no reservation.
+    ///
+    /// It is session state and the arena declines it, but it has no stride to
+    /// extrapolate — reserving for it would hand the region a tenant it cannot
+    /// size. LFM2's conv state is the worked case at a flat 12288 B.
+    ///
+    /// **Kills**: dropping the `!fixed[i]` filter, which would reserve for the
+    /// conv state using a stride of zero and produce a tenant whose reservation
+    /// never grows.
+    #[test]
+    fn a_fixed_size_session_tenant_gets_no_reservation() {
+        const CONV: usize = 0xc0;
+        let mut rec = ArenaRecorder::new();
+        let mut step = |rec: &mut ArenaRecorder| {
+            rec.record_bind(CONV);
+            rec.record_dispatch();
+            rec.record_alloc(CONV, 12288);
+            rec.record_bind(CONV);
+            rec.record_dispatch();
+        };
+        step(&mut rec);
+        rec.next_step();
+        step(&mut rec);
+
+        assert_eq!(
+            rec.outlives_step(),
+            vec![true],
+            "the fixture must produce a cross-step tenant, or this asserts nothing"
+        );
+        assert!(
+            rec.session_reservations(41, 100).is_empty(),
+            "a fixed-size session tenant must not be reserved: it has no stride"
+        );
+    }
+
+    /// An ordinary activation — same size both steps — is never reserved.
+    ///
+    /// It belongs to the arena, and reserving for it in the region as well would
+    /// mean two owned allocations for one value.
+    #[test]
+    fn a_stable_activation_is_never_reserved() {
+        const ACT: usize = 0xa0;
+        let mut rec = ArenaRecorder::new();
+        let mut step = |rec: &mut ArenaRecorder| {
+            rec.record_alloc(ACT, 21504);
+            rec.record_bind(ACT);
+            rec.record_dispatch();
+        };
+        step(&mut rec);
+        rec.next_step();
+        step(&mut rec);
+        assert!(
+            rec.session_reservations(41, 100).is_empty(),
+            "a stable activation must stay the arena's, not the region's"
         );
     }
 

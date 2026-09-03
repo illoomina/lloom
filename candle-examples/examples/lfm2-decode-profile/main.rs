@@ -612,6 +612,12 @@ struct Axes {
     layout: candle::metal_backend::ArenaLayout,
     /// #70's GPU bump allocator, rather than #69's CPU plan.
     gpu_offsets: bool,
+    /// #47's session region, for the population the arena declines.
+    session_region: bool,
+    /// The Metal device, so an axis arm can be read back from the mechanism
+    /// rather than echoed from the flag that asked for it (§7.1a-i).
+    #[cfg(feature = "metal")]
+    device: Option<candle::MetalDevice>,
     /// The attention arm, echoed for the run line.
     ///
     /// **The resolved enum, not the flag string** (issue #241). It was a
@@ -890,6 +896,20 @@ impl Axes {
             anyhow::bail!("--arena needs a Metal device");
         }
 
+        // #47's session region. Refused rather than silently ignored, on the
+        // reason every other axis here is refused: a flag that does nothing
+        // makes a run compare EQUAL to one that took the arm, which is the
+        // failure §7.1a-i names and the one a measurement cannot recover from.
+        if args.session_region && !args.arena {
+            anyhow::bail!(
+                "--session-region needs --arena: the reservations are derived from the \
+                 arena recording's two steps, which is what measures the per-token stride"
+            );
+        }
+        if args.session_region && !matches!(_device, Device::Metal(_)) {
+            anyhow::bail!("--session-region needs a Metal device");
+        }
+
         // ---- #567's three async arms, refused rather than defaulted --------
         //
         // Parsed before the clock for the reason every other axis here is: an
@@ -964,6 +984,12 @@ impl Axes {
             #[cfg(feature = "metal")]
             layout,
             gpu_offsets,
+            session_region: args.session_region,
+            #[cfg(feature = "metal")]
+            device: match _device {
+                Device::Metal(d) => Some(d.clone()),
+                _ => None,
+            },
             // Read back from the configuration the model was built from, not
             // re-parsed from the flag (#241). These three are the axes whose
             // arm is decided on `Config`, so this is where the arm actually is.
@@ -1360,7 +1386,57 @@ impl Axes {
             // facts, and only the first can be pooled with a future `exact`
             // run.
             p("SiluImpl", Self::silu_impl_arm()),
+            // #47's session region (`DESIGN.md` §9.2x).
+            //
+            // **Read back from the device**, never echoed from the flag, on
+            // `ReuseOversizeBound`'s reasoning exactly: a run that rendered
+            // `on` while the install had silently produced no tenants would
+            // compare EQUAL to a real `on` run, which is §7.1a-i's
+            // present-and-wrong case and the failure #500 measured.
+            //
+            // The arm carries the **tenant count**, not a bare `on`, because
+            // "installed" and "installed and covering something" are different
+            // states and only the second is the arm anyone wants to pool on.
+            p("SessionRegion", &self.session_region_arm()),
         ]
+    }
+
+    /// The `SessionRegion` arm: what the device actually has installed.
+    ///
+    /// `off` when none is installed — the default and what ships — and
+    /// `tenants:<N>` naming the tenant count when one is, so an
+    /// installed-but-empty region renders `tenants:0` rather than passing for
+    /// a covering one.
+    ///
+    /// The count sits behind a `:` on `Poll`'s `sleep:<micros>` pattern rather
+    /// than glued on as `t56`, because `.bench/configurations.md` declares the
+    /// arm once as `tenants:<N>` and `lloom-runs`'s coverage check matches a
+    /// rendered arm to a declared one on the stem before the separator. A
+    /// glued spelling has no stem, so every run of it would read as an
+    /// undeclared arm and the declared one as never rendered — the first form
+    /// of this renderer did exactly that, and the check refused it.
+    ///
+    /// Reads the device rather than a field the install wrote, because a field
+    /// IS the flag echoed to itself one indirection later: it would render `t8`
+    /// for a run whose install silently produced nothing. This reaches the
+    /// `Option<SessionRegion>` the allocation path itself consults, which is the
+    /// only state that can answer honestly (§7.1a-i).
+    fn session_region_arm(&self) -> String {
+        #[cfg(feature = "metal")]
+        {
+            match self
+                .device
+                .as_ref()
+                .and_then(|d| d.session_region_tenants())
+            {
+                Some(n) => format!("tenants:{n}"),
+                None => "off".to_string(),
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a".to_string()
+        }
     }
 
     /// The `EvictionOrder` arm: the order `evict_over_budget` actually applies.
@@ -2107,6 +2183,29 @@ struct Args {
     /// sized by `kv_len` (§9.1, #68 finding 4).
     #[arg(long, default_value_t = 2)]
     arena_record_steps: usize,
+
+    /// Serve the arena's session-state declines from an owned region (#47,
+    /// `DESIGN.md` §9.2x).
+    ///
+    /// # What this is, against `--arena` which it requires
+    ///
+    /// The arena is already an owned slab — one `MTLBuffer`, slots at fixed
+    /// offsets — but it serves only the ordinals whose size is **the same every
+    /// token**. Measured on this tree, every decline it makes is
+    /// `declined(session)`: the `Tensor::cat` KV copies under `--kv-append cat`,
+    /// which grow one token wider each step and carry **84.1 % of the residual
+    /// overhang** (§9.2u). This flag gives that population a second owned
+    /// allocation, sized once from the **measured** per-token stride to
+    /// `--kv-capacity` tokens, so no later token allocates for it.
+    ///
+    /// **`off` is the default and is what ships.** An unflagged run is the path
+    /// every recorded figure belongs to.
+    ///
+    /// Requires `--arena`: the reservations are derived from the arena
+    /// recording's two steps, which is the only thing in the tree that measures
+    /// a per-token stride rather than assuming one.
+    #[arg(long, default_value_t = false)]
+    session_region: bool,
 
     /// Tokens of KV reserved per sequence under `--kv-append in-place`.
     ///
@@ -4057,6 +4156,15 @@ fn main() -> Result<()> {
                 if tokens.len() - 1 == axes.record_steps - 1 {
                     let excluded = dev.arena_recording_excluded();
                     let by_test = dev.arena_recording_excluded_by_test();
+                    // Read BEFORE `finish_arena_recording`, which `take`s the
+                    // recorder — the reservations are derived from the same two
+                    // steps the plan is, and after the take there is nothing
+                    // left to derive them from.
+                    let reservations = if axes.session_region {
+                        dev.arena_recording_session_reservations(kv_len, args.kv_capacity)
+                    } else {
+                        None
+                    };
                     let plan = dev
                         .finish_arena_recording(axes.layout)
                         .context("arena recording produced no allocations")?;
@@ -4087,6 +4195,33 @@ fn main() -> Result<()> {
                     );
                     dev.install_arena(plan, axes.layout)
                         .context("installing the arena")?;
+                    // #47's session region, after the arena because it serves
+                    // what the arena declines: the offer order in `new_buffer`
+                    // is arena first, region second, pool last.
+                    if let Some(res) = reservations {
+                        if res.is_empty() {
+                            // A result, not a nuisance: it means no ordinal grew
+                            // between the two recorded steps, which is what
+                            // `--kv-append in-place` produces. Said out loud
+                            // because an installed-but-empty region and an
+                            // uninstalled one are different states and only the
+                            // counters below distinguish them (#500).
+                            eprintln!(
+                                "session region: no growing ordinals were recorded, so nothing \
+                                 is reserved -- under `--kv-append in-place` the KV cache does \
+                                 not reallocate and this axis has no population to serve"
+                            );
+                        }
+                        let bytes = dev
+                            .install_session_region(&res)
+                            .context("installing the session region")?;
+                        eprintln!(
+                            "session region: {} tenants reserved to kv_capacity {}, {} B",
+                            res.len(),
+                            args.kv_capacity,
+                            bytes
+                        );
+                    }
                     if axes.gpu_offsets {
                         // Checked against the plan that was recorded, not
                         // against the layout's name: a plan that somehow is not
@@ -4550,6 +4685,42 @@ fn main() -> Result<()> {
         println!("                                     the PREFILL's argmax (see the bracket)");
         println!("warm process: model already loaded. A cold-start TTFT adds §2.4a's load.");
         println!();
+    }
+
+    // #47's session region, reported whenever one is installed.
+    //
+    // **This is the engagement proof, and without it a null is unreadable**
+    // (#500): an installed region that served nothing and an uninstalled one
+    // produce identical pool counters, and only `offers`/`hits` separate them.
+    // The two declines are printed separately because they want opposite
+    // responses -- `unplanned` says widen the plan, `capacity` says the
+    // reservation was too small -- and a single number could mean either.
+    #[cfg(feature = "metal")]
+    if let Some(dev) = metal_device.as_ref() {
+        if let Some(c) = dev.session_region_counters() {
+            println!();
+            println!("=== session region (#47, DESIGN.md §9.2x) ===");
+            println!(
+                "  tenants             {}  reserving {} B",
+                dev.session_region_tenants().unwrap_or(0),
+                dev.session_region_bytes().unwrap_or(0)
+            );
+            println!(
+                "  offers / hits       {} / {}  ({:.1} % served)",
+                c.offers,
+                c.hits,
+                if c.offers > 0 {
+                    100.0 * c.hits as f64 / c.offers as f64
+                } else {
+                    0.0
+                }
+            );
+            println!(
+                "  declined            {} unplanned, {} past the reservation",
+                c.declined_unplanned, c.declined_capacity
+            );
+            println!();
+        }
     }
 
     println!(

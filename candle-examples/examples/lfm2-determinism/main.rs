@@ -232,6 +232,23 @@ struct Args {
     #[arg(long)]
     arena: bool,
 
+    /// Serve the arena's session-state declines from an owned region (#47,
+    /// `DESIGN.md` §9.2x).
+    ///
+    /// **This flag is why the digest gate matters for #47.** The region hands
+    /// out views of one owned allocation at planned offsets, so a wrong offset
+    /// aliases two session tenants — and §9.3 says nothing would report it. A
+    /// session tenant is read by the *next* step, so the corruption would appear
+    /// one token after the write that caused it, which is precisely the shape
+    /// §2.3.2 says looks like benign float noise. The digest is the only
+    /// available detector, and an **unmoved** pair is the required result rather
+    /// than a pleasant one: the region changes which buffer answers, never what
+    /// is computed.
+    ///
+    /// Requires `--arena`, and has a population only under `--kv-append cat`.
+    #[arg(long)]
+    session_region: bool,
+
     /// Arena layout: `packed` or `non-aliasing` (§9.3's reference).
     #[arg(long, default_value = "non-aliasing")]
     arena_layout: String,
@@ -1261,6 +1278,16 @@ fn main() -> Result<()> {
             if let (true, Some(dev)) = (args.arena, metal_device.as_ref()) {
                 dev.end_decode_step();
                 if decode_steps == ARENA_RECORD_STEPS - 1 {
+                    // Read BEFORE `finish_arena_recording`, which `take`s the
+                    // recorder the reservations are derived from (#47).
+                    let reservations = if args.session_region {
+                        dev.arena_recording_session_reservations(
+                            kv_len,
+                            candle_transformers::models::lfm2::DEFAULT_KV_CAPACITY,
+                        )
+                    } else {
+                        None
+                    };
                     let plan = dev
                         .finish_arena_recording(arena_layout)
                         .context("arena recording produced no allocations")?;
@@ -1269,6 +1296,14 @@ fn main() -> Result<()> {
                     dev.install_arena(plan, arena_layout)
                         .context("installing the arena")?;
                     eprintln!("arena: {covered} of {total} ordinals served ({arena_layout:?})");
+                    // #47, after the arena because it serves what the arena
+                    // declines: the offer order is arena, region, pool.
+                    if let Some(res) = reservations {
+                        let bytes = dev
+                            .install_session_region(&res)
+                            .context("installing the session region")?;
+                        eprintln!("session region: {} tenants, {} B", res.len(), bytes);
+                    }
 
                     if gpu_offsets {
                         if !monotone {

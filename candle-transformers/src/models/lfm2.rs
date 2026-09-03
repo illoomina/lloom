@@ -126,6 +126,12 @@ impl Lfm2Config {
             // here — this change makes the arm reachable, nothing more.
             gemv_silu: false,
             gemv_residual: false,
+            // No tap, per §7.1a: an empty `tap_layers` is what every existing
+            // caller had before #363 and costs an `is_empty()` per layer. The
+            // indices belong to a *drafter* checkpoint, so there is no
+            // meaningful default for a target config to carry.
+            tap_layers: Vec::new(),
+            tap_dtype: DType::F32,
         }
     }
 }
@@ -623,6 +629,50 @@ pub struct Config {
     /// **This arm moves the digests by construction** (§12.2h): the add is at
     /// the f32 accumulator where `badd_f16` adds at `T` on the rounded store.
     pub gemv_residual: bool,
+    /// Which layers' **input residual** to capture into [`Cache::taps`], for a
+    /// hidden-state-typed drafter (`DESIGN.md` §10.2m, issue #363).
+    ///
+    /// # Why a tap is needed at all, which is not obvious from the seam
+    ///
+    /// §10.2l measured `LFM2.5-2.6B-DSpark` and found it has **no
+    /// `embed_tokens` and no `lm_head`**: `fc.weight` is `[2048, 10240]` where
+    /// `10240 = 5 × 2048`, so it consumes **five concatenated 2048-d hidden
+    /// states** from this target's layers. It cannot be run from tokens at all,
+    /// and [`Model::verify_step`]'s seam is `(last, proposed) -> Vec<u32>` —
+    /// tokens in, tokens out. **The tap is the prerequisite**, and neither
+    /// `forward` nor `forward_all` returned one.
+    ///
+    /// # Which representation, and why this one rather than another
+    ///
+    /// The **layer-input residual**, captured at layer entry *before* the block
+    /// runs — not post-attention, not post-MLP. The witness is mainline
+    /// llama.cpp PR #27383 (`src/models/lfm2.cpp`), which writes
+    /// `t_layer_inp[il] = cur` at exactly that point. §10.2l item 1 recorded the
+    /// representation as unspecifiable from public prose; §10.2m corrects that
+    /// from the reference implementation, which is a source that section did not
+    /// have.
+    ///
+    /// **Empty by default**, which is what makes this free when unused: the
+    /// layer loop tests `is_empty()` on a slice and captures nothing. §7.1a's
+    /// rule is that a default is flipped by its own argued decision, and there
+    /// is no decode-path consumer yet to make that argument.
+    ///
+    /// For the 2.6B target the drafter's `dflash_config.target_layer_ids` is
+    /// `[2, 9, 17, 21, 27]` against `num_target_layers: 30`, which is this
+    /// model's layer count (§5.11). **The indices are the caller's**, not a
+    /// constant here: they are a property of the *drafter* checkpoint, and
+    /// welding them into the target would be the conflation §10.1 renames the
+    /// abstraction to avoid.
+    pub tap_layers: Vec<usize>,
+    /// The dtype [`Cache::taps`] holds, when `tap_layers` is non-empty.
+    ///
+    /// **F32, and it is deliberate rather than incidental.** The target's
+    /// residual is f16 and `dflash.cpp` upcasts the concat to `GGML_TYPE_F32`.
+    /// The target verifies bit-exactly whatever the draft proposes (§10.2j), so
+    /// this is **not** a correctness decision — it buys **acceptance rate**,
+    /// which is the entire ROI of a speculative scheme (§10.2m). A
+    /// lower-precision tap shifts the draft distribution and lowers accept.
+    pub tap_dtype: DType,
 }
 
 impl Config {
@@ -974,6 +1024,38 @@ pub struct Cache {
     /// rebuild. So the caller says which it is, and `advance`/`resolve` are the
     /// only things that set it.
     speculative: bool,
+    /// The layer-input residuals captured by this pass, one per entry of
+    /// `Config::tap_layers` and **in that slice's order** (`DESIGN.md` §10.2m,
+    /// issue #363).
+    ///
+    /// Each is `[b_sz, seq_len, hidden_size]` at `Config::tap_dtype`. The
+    /// consumer concatenates along the last dim to reach the drafter's
+    /// `fc.weight [2048, 10240]` — so **order is load-bearing**, not incidental:
+    /// `fc` expects `[H(l₁); …; H(l₅)]` in the drafter's own
+    /// `target_layer_ids` order, and a permuted concat pairs every slice with
+    /// the wrong 2048-column block of `W_c`. That is the shape §10.2h found in
+    /// the rotating ring's weight permutation — algebraically valid, silently
+    /// wrong — so the order is asserted by a test rather than left to a
+    /// convention.
+    ///
+    /// **Overwritten per pass, not accumulated.** A tap is a property of *this*
+    /// forward pass; a speculative window that is rolled back must not leave a
+    /// stale tap behind for the next one to read, and the cheapest way to
+    /// guarantee that is for every pass that taps to replace the vector whole.
+    /// [`Cache::take_taps`] is the consumer's accessor and drains it, so a
+    /// second read of one pass's taps is impossible by construction rather than
+    /// by discipline.
+    ///
+    /// Empty whenever `tap_layers` is empty, which is the default — so a run
+    /// that does not tap allocates nothing here (§9.1's memory classes are
+    /// unmoved).
+    taps: Vec<Option<Tensor>>,
+    /// `Config::tap_layers`, copied so the layer loop can test it without a
+    /// `Model` in hand — `conv_state`/`l_cache`'s argument, one field further
+    /// out.
+    tap_layers: Vec<usize>,
+    /// `Config::tap_dtype`, copied for `tap_layers`' reason.
+    tap_dtype: DType,
     cos: Tensor,
     sin: Tensor,
     device: Device,
@@ -1065,6 +1147,28 @@ impl Cache {
         // first means the refusal happens before any of it is allocated.
         Self::admit_memory_budget(config, device, kv_capacity)?;
 
+        // #363's tap indices, checked here rather than left to `contains`.
+        //
+        // `target_layer_ids` is a property of the **drafter** checkpoint and the
+        // layer count a property of the **target**, so a mismatched pair is the
+        // first thing a consumer hits — DSpark's `[2, 9, 17, 21, 27]` against a
+        // target that is not the 30-layer 2.6B. Left silent, an out-of-range
+        // index captures nothing and the consumer receives four slices where
+        // `fc.weight [2048, 10240]` expects five, failing as a shape error far
+        // from its cause. `DEFAULT_KV_CAPACITY`'s own note is the precedent:
+        // fail loudly at configuration rather than plausibly at use.
+        for &l in &config.tap_layers {
+            if l >= config.num_hidden_layers {
+                candle::bail!(
+                    "lfm2 tap_layers: layer {l} is past the last layer ({}). \
+                     The tap indices belong to the drafter checkpoint \
+                     (`dflash_config.target_layer_ids`) and must be indices \
+                     into THIS target's stack (DESIGN.md 10.2m).",
+                    config.num_hidden_layers - 1
+                )
+            }
+        }
+
         let theta = calculate_default_inv_freq(config);
         let theta = Tensor::new(theta, device)?;
 
@@ -1100,10 +1204,43 @@ impl Cache {
             conv_state: config.conv_state,
             l_cache: config.conv_l_cache,
             speculative: false,
+            // Reserved to the tap count rather than left to grow: the layer
+            // loop pushes exactly `tap_layers.len()` entries per tapping pass,
+            // so the capacity is known and the push cannot reallocate on the
+            // per-token path (§15.2 #10 is about lookup, but a realloc in the
+            // layer loop is the same shape).
+            taps: Vec::with_capacity(config.tap_layers.len()),
+            tap_layers: config.tap_layers.clone(),
+            tap_dtype: config.tap_dtype,
             device: device.clone(),
             cos,
             sin,
         })
+    }
+
+    /// Take this pass's layer-input residuals, leaving the cache empty
+    /// (`DESIGN.md` §10.2m, issue #363).
+    ///
+    /// One entry per [`Config::tap_layers`] index, **in that slice's order**,
+    /// each `[b_sz, seq_len, hidden_size]` at [`Config::tap_dtype`]. Empty
+    /// unless the preceding forward pass ran with a non-empty `tap_layers`.
+    ///
+    /// **It drains rather than borrows**, which is the property that matters:
+    /// a tap belongs to the pass that produced it, so reading one pass's taps
+    /// twice — or reading a rolled-back speculative window's taps as though
+    /// they described the committed state — is impossible by construction
+    /// rather than by the caller remembering. The alternative (a `&[Tensor]`
+    /// accessor) makes both of those a caller discipline, and §6.7 L4's whole
+    /// lesson is that a discipline nothing enforces is a defect waiting for a
+    /// second consumer.
+    /// Returns empty if the preceding pass did not tap. **Every slot is filled
+    /// or none is**: the indices are range-checked at construction, so a slot
+    /// can only be empty if no pass has run, and a partially-filled vector
+    /// would mean a layer index the loop never reached — which the constructor
+    /// has already refused.
+    pub fn take_taps(&mut self) -> Vec<Tensor> {
+        let slots = std::mem::take(&mut self.taps);
+        slots.into_iter().flatten().collect()
     }
 
     /// `DESIGN.md` §9.5's admission check: predict the peak, refuse before
@@ -2731,12 +2868,14 @@ impl Model {
 
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
 
+        Self::begin_taps(cache);
         for (block_idx, layer) in self.layers.iter().enumerate() {
             // The graph position, announced before the layer's dispatches are
             // encoded so a seam lands at its first dispatch rather than after
             // it (`DESIGN.md` §13.5m). A no-op unless the node-index cut is
             // selected.
             mark_graph_node(&cache.device, block_idx);
+            Self::tap_layer_input(&hidden_states, block_idx, cache)?;
             hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
         }
 
@@ -2787,17 +2926,139 @@ impl Model {
         self.advance_conv_phase(seq_len, cache);
 
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        Self::begin_taps(cache);
         for (block_idx, layer) in self.layers.iter().enumerate() {
             // Marked here as well as in `forward`, for `advance_conv_phase`'s
             // reason below: two entry points over the same layer loop must not
             // disagree about the graph position they are at. A verify pass
             // encodes the same 30 nodes.
             mark_graph_node(&cache.device, block_idx);
+            // Tapped here as well as in `forward`, for the same reason and with
+            // the same helper — a drafter conditioned on a *verify* pass's
+            // hidden states is the case #363 exists for, so the entry point
+            // that runs `seq_len > 1` must not be the one that does not tap.
+            Self::tap_layer_input(&hidden_states, block_idx, cache)?;
             hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
         }
         let hidden_states = self.embedding_norm.forward(&hidden_states)?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
         logits.to_dtype(DType::F32)
+    }
+
+    /// The residual stream at the entry of **every** layer — the reference the
+    /// tap is tested against (`DESIGN.md` §10.2m, issue #363).
+    ///
+    /// # Why this exists rather than the test reaching into the tap
+    ///
+    /// `CONTRIBUTING.md` §3.1b: a test whose reference comes from the same
+    /// mechanism as its subject *"looks like a comparison and is not."* The tap
+    /// pushes from inside the layer loop; this returns what the layer loop was
+    /// about to consume, for every layer rather than the configured few. So
+    /// *"tap `i` is layer `tap_layers[i]`'s input"* becomes an equality against
+    /// a value produced by a different code path, and a defect that shifted
+    /// every tap by one layer — the class a shape invariant is blind to — fails
+    /// it.
+    ///
+    /// Not on any per-token path: it materialises `num_hidden_layers` tensors
+    /// and exists for the test and for whoever needs to pin the representation
+    /// against llama.cpp's (§10.2m's `H_ctx` ulp-match is the eventual
+    /// consumer).
+    pub fn layer_input_residuals(
+        &self,
+        input_ids: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<Vec<Tensor>> {
+        let (_, seq_len) = input_ids.dims2()?;
+        self.advance_conv_phase(seq_len, cache);
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        let mut out = Vec::with_capacity(self.layers.len());
+        for (block_idx, layer) in self.layers.iter().enumerate() {
+            out.push(hidden_states.contiguous()?.to_dtype(cache.tap_dtype)?);
+            hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
+        }
+        Ok(out)
+    }
+
+    /// Clear the previous pass's taps, once per forward pass
+    /// (`DESIGN.md` §10.2m, issue #363).
+    ///
+    /// Factored out for `advance_conv_phase`'s reason: two entry points over
+    /// one layer loop must not disagree, and *when the vector is cleared* is
+    /// exactly the kind of decision that has already been got wrong once here
+    /// by being written twice (the conv wrap, §10.2e).
+    ///
+    /// **Clearing at pass entry rather than at `take_taps`** is what makes a
+    /// pass that is never drained safe: a rolled-back speculative window leaves
+    /// its taps behind, and the next pass replaces them before any consumer can
+    /// read them as though they described committed state.
+    ///
+    /// Free when not tapping — clearing an empty vector is a store of a length
+    /// that is already zero.
+    ///
+    /// **It resizes to `tap_layers.len()` rather than emptying**, because the
+    /// layer loop writes taps **by slot index** rather than by pushing: the
+    /// consumer's order is `tap_layers`' order and the loop's order is ascending
+    /// layer index, and those differ whenever the drafter's `target_layer_ids`
+    /// is not sorted. Pushing produced ascending order, which
+    /// `tap_order_follows_tap_layers_and_the_layers_are_distinguishable` caught
+    /// — the §10.2h shape, where a permutation is algebraically valid and
+    /// silently pairs every slice with the wrong block of `W_c`.
+    fn begin_taps(cache: &mut Cache) {
+        cache.taps.clear();
+        cache.taps.resize(cache.tap_layers.len(), None);
+    }
+
+    /// Capture layer `block_idx`'s **input residual** if it is tapped
+    /// (`DESIGN.md` §10.2m, issue #363).
+    ///
+    /// Called at layer entry, *before* the block runs — which is the whole
+    /// specification of the representation, and the reason it is a call at this
+    /// point rather than a field the layer fills in. The witness is llama.cpp
+    /// PR #27383's `t_layer_inp[il] = cur`; post-attention or post-MLP would be
+    /// a different tensor that `fc.weight` was not trained against, and nothing
+    /// downstream could tell (§2.3.5a: a wrong-but-stable input produces a
+    /// deterministic wrong drafter, and the identity gate cannot see a drafter
+    /// at all, §10.2m).
+    ///
+    /// # Cost when off, which is the case that must stay free
+    ///
+    /// `tap_layers` is empty by default, so this is an `is_empty()` on a slice
+    /// and a return — 30 times per token against §6.6's 675 dispatches. It is
+    /// deliberately *not* gated on an environment read, for `mark_graph_node`'s
+    /// reason: a per-token env lookup is the O(N)-on-the-hot-path shape §15.2
+    /// #10 forbids.
+    ///
+    /// `contains` over a ≤5-element slice rather than a set: at this length a
+    /// linear scan is faster than hashing, and §15.2 #10's target is a *lookup
+    /// whose N grows*, which this one's cannot — it is the drafter's fixed
+    /// `target_layer_ids`.
+    /// **Written by slot, not pushed.** A layer may appear at any position of
+    /// `tap_layers` — the drafter's `target_layer_ids` is its order, not
+    /// ascending — so the slot is where the *consumer* expects this layer, and
+    /// the loop's own order is irrelevant. A layer listed twice fills both its
+    /// slots, which is what a consumer asking for it twice means.
+    fn tap_layer_input(hidden: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<()> {
+        if cache.tap_layers.is_empty() {
+            return Ok(());
+        }
+        let mut tapped: Option<Tensor> = None;
+        for slot in 0..cache.tap_layers.len() {
+            if cache.tap_layers[slot] != block_idx {
+                continue;
+            }
+            // `contiguous` before the cast: the residual arrives as whatever the
+            // previous layer's store left, and a consumer concatenating five of
+            // these needs each addressable as a plain `[b, seq, hidden]` block.
+            // Doing it here rather than at the consumer keeps the layout
+            // obligation with the party that knows the producer. Computed once
+            // even when a layer fills two slots.
+            if tapped.is_none() {
+                tapped = Some(hidden.contiguous()?.to_dtype(cache.tap_dtype)?);
+            }
+            cache.taps[slot] = tapped.clone();
+        }
+        Ok(())
     }
 
     /// The ring's write slot, advanced once per forward pass and read by all 22

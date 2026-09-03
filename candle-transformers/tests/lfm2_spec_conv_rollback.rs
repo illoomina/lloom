@@ -55,6 +55,9 @@ fn tiny_config(conv_state: ConvState) -> Config {
         // Both epilogue fusions off, per DESIGN.md 7.1a (issue #509).
         gemv_silu: false,
         gemv_residual: false,
+        // #363's tap: off, as every pre-#363 caller had it.
+        tap_layers: Vec::new(),
+        tap_dtype: DType::F32,
     }
 }
 

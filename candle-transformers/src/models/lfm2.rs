@@ -3900,4 +3900,58 @@ mod tests {
              finding (#575)."
         );
     }
+
+    /// **`transpose(1, 2)` is CONTIGUOUS at `seq_len == 1`, so the Q/K/V layout
+    /// change costs nothing on the decode path** (#601).
+    ///
+    /// `Attention::attend` reshapes each projection to
+    /// `[b, seq, heads, head_dim]` and transposes to `[b, heads, seq, head_dim]`
+    /// (`lfm2.rs:2015-2024`). At decode `seq` is 1, so the swapped axis has
+    /// **extent 1**: its stride is unreachable and the layout is still row-major.
+    /// `Tensor::contiguous()` therefore takes its `is_contiguous()` short-circuit
+    /// (`tensor.rs:2670`) and returns an `Arc` clone — no `alloc_uninit`, no
+    /// `copy_strided_src`, no dispatch.
+    ///
+    /// Pinned as an **absolute reference** rather than a shape
+    /// (`CONTRIBUTING.md` §3.1b rule 1): the exact `seq_len` at which the
+    /// property flips is asserted, so a change that made the decode transpose
+    /// strided fails here with a sentence rather than passing an "all equal".
+    /// The `seq_len > 1` arm is the **control that pins the level** (rule 2) —
+    /// without it, `is_contiguous == true` everywhere would satisfy the test
+    /// while meaning the probe had stopped reading the layout.
+    ///
+    /// Corroborated on the GPU by the dispatch census: of the 38 `copy2d_f16`
+    /// in a steady-state decode token, **22 are the conv ring and 16 are the KV
+    /// append** (`grid=(8, 64, 1)`, writing at `kv_len * head_dim * 2` and
+    /// advancing 128 B per step) — **none is a transpose copy**.
+    #[test]
+    fn decode_transpose_is_contiguous_and_prefill_is_not() -> Result<()> {
+        let dev = Device::Cpu;
+        // LFM2.5-VL-3B geometry (§5): 32 query heads, 8 KV heads, head_dim 64.
+        for (label, heads) in [("q", 32usize), ("k/v", 8usize)] {
+            let decode = Tensor::zeros((1usize, 1usize, heads, 64usize), DType::F16, &dev)?
+                .transpose(1, 2)?;
+            assert!(
+                decode.is_contiguous(),
+                "{label}: [1, 1, {heads}, 64].transpose(1, 2) must be contiguous — this is \
+                 why the decode path pays no layout copy (#601). If this fails, the copy \
+                 #601 describes has become real and its two directions are worth building."
+            );
+
+            // The control that pins the level: the same expression at seq_len > 1
+            // IS strided, so the assertion above is reading the layout rather
+            // than reporting a constant.
+            for seq in [2usize, 34, 736] {
+                let prefill = Tensor::zeros((1usize, seq, heads, 64usize), DType::F16, &dev)?
+                    .transpose(1, 2)?;
+                assert!(
+                    !prefill.is_contiguous(),
+                    "{label}: [1, {seq}, {heads}, 64].transpose(1, 2) must be STRIDED. If \
+                     this fails the probe has stopped reading the layout and the decode \
+                     assertion above proves nothing."
+                );
+            }
+        }
+        Ok(())
+    }
 }

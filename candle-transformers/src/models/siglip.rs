@@ -589,8 +589,20 @@ impl Module for VisionEmbeddings {
         {
             self.position_embedding.clone()
         } else {
-            self.position_embedding
-                .interpolate2d(num_patches_h, num_patches_w)?
+            // Antialiased bilinear, matching the reference's
+            // `F.interpolate(mode="bilinear", align_corners=False, antialias=True)`.
+            //
+            // This called `interpolate2d` until lloom #609, which is
+            // `upsample_nearest2d` despite the name — a silent-wrong that changes
+            // no shape, no dtype and no token count, so the model ran and emitted
+            // fluent output about subtly-wrong features at any non-base image
+            // size. Measured on LFM2-VL's 16x16 grid resampled to 8x8, nearest
+            // reads 9.15e0 against the reference where this reads ~4.77e-7.
+            crate::utils::interpolate2d_bilinear_antialias(
+                &self.position_embedding,
+                num_patches_h,
+                num_patches_w,
+            )?
         };
         // Add position embeddings to tokens and flatten from 2D patches to 1D sequence
         let embeddings = embeddings

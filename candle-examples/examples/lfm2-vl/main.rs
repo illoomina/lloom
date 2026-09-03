@@ -271,8 +271,34 @@ fn run_gate(args: &Args, device: &Device) -> Result<()> {
         }
         pixels_run += 1;
         let want = read_golden_bin(&want_path, &[entry.rows * entry.cols, 768], device)?;
-        let img = image::ImageReader::open(&entry.image)
-            .with_context(|| format!("opening {}", entry.image))?
+        // `make_golden.py` records an ABSOLUTE image path, which is the path of
+        // whichever worktree generated the golden — so the gate ran only there
+        // and failed everywhere else with a missing-file error (found running it
+        // from a second worktree, lloom #609). The images are committed beside
+        // the golden, so fall back to resolving against `golden_dir`. The
+        // recorded path is still tried first: it is what the golden was actually
+        // built from, and preferring it keeps a deliberately out-of-tree image
+        // working.
+        let image_path = {
+            let recorded = std::path::Path::new(&entry.image);
+            if recorded.exists() {
+                recorded.to_path_buf()
+            } else {
+                let rel = recorded
+                    .file_name()
+                    .map(|f| golden_dir.join("images").join(f))
+                    .filter(|p| p.exists());
+                rel.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "image {} not found, and no fallback under {}/images",
+                        entry.image,
+                        golden_dir.display()
+                    )
+                })?
+            }
+        };
+        let img = image::ImageReader::open(&image_path)
+            .with_context(|| format!("opening {}", image_path.display()))?
             .decode()?;
         let proc = ImageProcessor::default();
         let (rgb, r, c) = {

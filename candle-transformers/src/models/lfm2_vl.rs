@@ -213,104 +213,14 @@ impl super::siglip::TransformerConfig for VisionConfig {
 // grid interpolated to the image's own patch layout.
 // ---------------------------------------------------------------------------
 
-/// Antialiased bilinear resample of `[side, side, dim]` to `[rows, cols, dim]`,
-/// matching `torch.nn.functional.interpolate(mode="bilinear",
-/// align_corners=False, antialias=True)`.
+/// Antialiased bilinear resample of the learned position grid.
 ///
-/// # Why this is hand-rolled rather than a `Tensor` op
-///
-/// **`Tensor::interpolate2d` is `upsample_nearest2d`** — the name says bilinear
-/// and the implementation is nearest-neighbour (`candle-core/src/tensor.rs:1205`
-/// constructs `Op::UpsampleNearest2D` and calls `storage.upsample_nearest2d`).
-/// Measured against the reference on this checkpoint's own position table
-/// resized 16x16 -> 8x8, the four candidate readings are:
-///
-/// | interpolation | max abs difference from the reference |
-/// |---|---|
-/// | bilinear, `align_corners=false`, **antialias on** | **4.77e-7** |
-/// | bilinear, `align_corners=false`, antialias off | 5.10e0 |
-/// | bicubic | 7.77e0 |
-/// | **nearest (what `interpolate2d` does)** | **9.15e0** |
-///
-/// So the wrong one is not close, and it is the one a reader reaches for by
-/// name. Antialiasing is not cosmetic here: it is a *downsample* (a 16x16 grid
-/// to an 8x8 one for a small image), and a downsample without a low-pass filter
-/// aliases by construction.
-///
-/// This runs **once per image**, not per token, so a host-side implementation
-/// costs nothing on the decode path (`DESIGN.md` §15.2 #10).
-fn resize_pos_embed_antialias(
-    table: &[f32],
-    side: usize,
-    dim: usize,
-    rows: usize,
-    cols: usize,
-) -> Vec<f32> {
-    // Separable: resample rows then columns. `scale` < 1 is a downsample, and
-    // torch widens the kernel support by 1/scale in exactly that case — that
-    // widening IS the antialiasing.
-    let axis = |src_n: usize, dst_n: usize| -> Vec<(usize, Vec<f32>)> {
-        let scale = dst_n as f64 / src_n as f64;
-        let filter_scale = if scale < 1.0 { 1.0 / scale } else { 1.0 };
-        let support = filter_scale; // bilinear support is 1.0, widened
-        (0..dst_n)
-            .map(|i| {
-                // align_corners=false: sample at pixel centres.
-                let centre = (i as f64 + 0.5) / scale;
-                let left = ((centre - support) + 0.5).floor().max(0.0) as usize;
-                let right = (((centre + support) + 0.5).floor() as usize).min(src_n);
-                let mut weights = Vec::with_capacity(right.saturating_sub(left));
-                let mut total = 0.0f64;
-                for j in left..right {
-                    // Triangle filter evaluated in source space, scaled.
-                    let t = ((j as f64 + 0.5) - centre).abs() / filter_scale;
-                    let w = if t < 1.0 { 1.0 - t } else { 0.0 };
-                    weights.push(w);
-                    total += w;
-                }
-                if total > 0.0 {
-                    for w in weights.iter_mut() {
-                        *w /= total;
-                    }
-                }
-                (left, weights.into_iter().map(|w| w as f32).collect())
-            })
-            .collect()
-    };
-
-    let row_taps = axis(side, rows);
-    let col_taps = axis(side, cols);
-
-    // Pass 1: [side, side, dim] -> [rows, side, dim]
-    let mut mid = vec![0f32; rows * side * dim];
-    for (r, (r0, rw)) in row_taps.iter().enumerate() {
-        for (k, w) in rw.iter().enumerate() {
-            let sr = r0 + k;
-            for c in 0..side {
-                let src = (sr * side + c) * dim;
-                let dst = (r * side + c) * dim;
-                for d in 0..dim {
-                    mid[dst + d] += w * table[src + d];
-                }
-            }
-        }
-    }
-    // Pass 2: [rows, side, dim] -> [rows, cols, dim]
-    let mut out = vec![0f32; rows * cols * dim];
-    for r in 0..rows {
-        for (c, (c0, cw)) in col_taps.iter().enumerate() {
-            for (k, w) in cw.iter().enumerate() {
-                let sc = c0 + k;
-                let src = (r * side + sc) * dim;
-                let dst = (r * cols + c) * dim;
-                for d in 0..dim {
-                    out[dst + d] += w * mid[src + d];
-                }
-            }
-        }
-    }
-    out
-}
+/// The implementation moved to `crate::utils` for lloom #609, when `siglip.rs`
+/// needed the same mathematics for the same purpose. Copying it would have been
+/// the SiLU-in-three-files defect (#599) in a second place: one resampler, two
+/// container layouts, and the tap weights computed once
+/// (`utils::antialias_bilinear_taps`) so the two cannot drift.
+use crate::utils::resize_pos_embed_antialias;
 
 #[derive(Debug, Clone)]
 struct VisionEmbeddings {

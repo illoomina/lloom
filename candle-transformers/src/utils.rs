@@ -1,6 +1,176 @@
-//! Shared utilities: repeat_kv, repeat_penalty, causal mask.
+//! Shared utilities: repeat_kv, repeat_penalty, causal mask, position-grid resample.
 
 use candle::{DType, Device, Result, Tensor};
+
+/// One output position's resample taps: the first source index, and the weights
+/// applied to the run of source samples starting there.
+type Taps = Vec<(usize, Vec<f32>)>;
+
+/// Separable antialiased-bilinear taps for one axis, `src_n -> dst_n`.
+///
+/// Matches `torch.nn.functional.interpolate(mode="bilinear", align_corners=False,
+/// antialias=True)` along a single axis. Separability is what makes that legal:
+/// a 2-D triangle filter is the outer product of two 1-D ones, so resampling
+/// rows then columns is the same operation as one 2-D pass, at `O(n)` taps
+/// instead of `O(n^2)`.
+///
+/// # What the antialias term is, mechanically
+///
+/// `scale < 1` is a **downsample**, and torch widens the filter support by
+/// `1/scale` in exactly that case. That widening *is* the antialiasing: it makes
+/// each output sample average over every source sample that maps onto it, rather
+/// than over the two nearest. Without it a downsample aliases by construction —
+/// source samples between the two taps are simply never read.
+///
+/// On an **upsample** (`scale >= 1`) `filter_scale` is 1.0 and this reduces to
+/// ordinary bilinear, which is why `antialias` is a no-op there and why a test
+/// suite built on upsamples cannot see the difference (lloom #609).
+fn antialias_bilinear_taps(src_n: usize, dst_n: usize) -> Taps {
+    let scale = dst_n as f64 / src_n as f64;
+    let filter_scale = if scale < 1.0 { 1.0 / scale } else { 1.0 };
+    // A bilinear (triangle) filter has support 1.0, widened on a downsample.
+    let support = filter_scale;
+    (0..dst_n)
+        .map(|i| {
+            // `align_corners=false`: sample at pixel centres.
+            let centre = (i as f64 + 0.5) / scale;
+            let left = ((centre - support) + 0.5).floor().max(0.0) as usize;
+            let right = (((centre + support) + 0.5).floor() as usize).min(src_n);
+            let mut weights = Vec::with_capacity(right.saturating_sub(left));
+            let mut total = 0.0f64;
+            for j in left..right {
+                // Triangle filter evaluated in source space, scaled.
+                let t = ((j as f64 + 0.5) - centre).abs() / filter_scale;
+                let w = if t < 1.0 { 1.0 - t } else { 0.0 };
+                weights.push(w);
+                total += w;
+            }
+            // Normalising here rather than folding a constant in is what keeps
+            // the edges right: near a boundary the support is clipped, so the
+            // surviving taps must still sum to one or the output darkens there.
+            if total > 0.0 {
+                for w in weights.iter_mut() {
+                    *w /= total;
+                }
+            }
+            (left, weights.into_iter().map(|w| w as f32).collect())
+        })
+        .collect()
+}
+
+/// Antialiased bilinear resample of a **host-side** `[side, side, dim]` position
+/// table to `[rows, cols, dim]`, returned flat.
+///
+/// Equivalent to `F.interpolate(mode="bilinear", align_corners=False,
+/// antialias=True)` on the `[1, dim, side, side]` view of the same data.
+///
+/// # Why this is not `Tensor::interpolate2d`
+///
+/// **`Tensor::interpolate2d` is `upsample_nearest2d`** — the name says bilinear
+/// and the implementation is nearest-neighbour (`candle-core/src/tensor.rs`
+/// constructs `Op::UpsampleNearest2D`). `Tensor::upsample_bilinear2d` *does*
+/// exist and is correct, but it has **no antialias term**, so on a downsample it
+/// is the wrong one of the two. Measured on LFM2-VL's own 16x16 position table
+/// resampled to 8x8, against `bilinear+antialias` as the reference:
+///
+/// | interpolation | max abs difference |
+/// |---|---|
+/// | bilinear, `align_corners=false`, **antialias on** | reference |
+/// | bilinear, `align_corners=false`, antialias off | 5.10e0 |
+/// | bicubic | 7.77e0 |
+/// | nearest (what `interpolate2d` does) | 9.15e0 |
+/// | bilinear, `align_corners=true` | 1.87e1 |
+///
+/// This runs **once per image**, never per token, so a host-side implementation
+/// costs nothing on the decode path.
+pub fn resize_pos_embed_antialias(
+    table: &[f32],
+    side: usize,
+    dim: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
+    let row_taps = antialias_bilinear_taps(side, rows);
+    let col_taps = antialias_bilinear_taps(side, cols);
+
+    // Pass 1: [side, side, dim] -> [rows, side, dim]
+    let mut mid = vec![0f32; rows * side * dim];
+    for (r, (r0, rw)) in row_taps.iter().enumerate() {
+        for (k, w) in rw.iter().enumerate() {
+            let sr = r0 + k;
+            for c in 0..side {
+                let src = (sr * side + c) * dim;
+                let dst = (r * side + c) * dim;
+                for d in 0..dim {
+                    mid[dst + d] += w * table[src + d];
+                }
+            }
+        }
+    }
+    // Pass 2: [rows, side, dim] -> [rows, cols, dim]
+    let mut out = vec![0f32; rows * cols * dim];
+    for r in 0..rows {
+        for (c, (c0, cw)) in col_taps.iter().enumerate() {
+            for (k, w) in cw.iter().enumerate() {
+                let sc = c0 + k;
+                let src = (r * side + sc) * dim;
+                let dst = (r * cols + c) * dim;
+                for d in 0..dim {
+                    out[dst + d] += w * mid[src + d];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Antialiased bilinear resample of a `[b, c, h, w]` tensor to `[b, c, rows, cols]`.
+///
+/// The tensor-native counterpart to [`resize_pos_embed_antialias`], for callers
+/// whose position grid is already channels-first on a device. Both go through
+/// [`antialias_bilinear_taps`], so the two cannot drift apart — the weights are
+/// computed once, in one place.
+///
+/// The taps are applied as two `matmul`s (one per axis), which keeps the work on
+/// whatever device the input is on and avoids a host round trip. Row taps
+/// contract `h`, column taps contract `w`:
+///
+/// ```text
+///   [b, c, rows, h] @ [b, c, h, w]  ->  [b, c, rows, w]
+///   [b, c, rows, w] @ [b, c, w, cols] -> [b, c, rows, cols]
+/// ```
+///
+/// See [`resize_pos_embed_antialias`] for why this exists rather than
+/// `Tensor::interpolate2d` or `Tensor::upsample_bilinear2d`.
+pub fn interpolate2d_bilinear_antialias(xs: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
+    let (_b, _c, h, w) = xs.dims4()?;
+    if h == rows && w == cols {
+        return Ok(xs.clone());
+    }
+    let device = xs.device();
+    // The taps are computed in f32 and the matmul runs in the input's dtype, so
+    // a f16 grid stays f16 rather than being silently widened.
+    let dtype = xs.dtype();
+
+    // `[rows, h]`: dense weight matrix, zero outside each output's support.
+    let dense = |taps: &Taps, src_n: usize, dst_n: usize| -> Result<Tensor> {
+        let mut m = vec![0f32; dst_n * src_n];
+        for (i, (start, weights)) in taps.iter().enumerate() {
+            for (k, weight) in weights.iter().enumerate() {
+                m[i * src_n + start + k] = *weight;
+            }
+        }
+        Tensor::from_vec(m, (dst_n, src_n), device)?.to_dtype(dtype)
+    };
+
+    let row_m = dense(&antialias_bilinear_taps(h, rows), h, rows)?;
+    let col_m = dense(&antialias_bilinear_taps(w, cols), w, cols)?;
+
+    // Contract h: broadcast_matmul lifts [rows, h] over the leading [b, c].
+    let out = row_m.broadcast_matmul(xs)?;
+    // Contract w: transpose the column taps so `w` is the contracted axis.
+    out.broadcast_matmul(&col_m.t()?.contiguous()?)
+}
 
 /// Build a causal attention mask of shape `(seq_len, kv_len)` where
 /// `kv_len = index_pos + seq_len`.

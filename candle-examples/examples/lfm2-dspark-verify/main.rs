@@ -261,10 +261,13 @@ struct Args {
     #[arg(long)]
     no_identity: bool,
 
-    /// Shift every tap index — `0` is llama.cpp's layer-input convention and
-    /// ours, `1` reproduces mlx-dspark's after-the-block capture (§10.2o).
+    /// Shift every tap index relative to `DSparkConfig::tap_layers()` — the
+    /// layer-input capture at `target_layer_ids + 1`, which is the output
+    /// residual of `target_layer_ids` and what llama.cpp and mlx-dspark both
+    /// feed (§10.2s). `0` is the reference; `-1` reproduces the convention this
+    /// tree shipped before §10.2s, one layer early.
     #[arg(long, default_value_t = 0)]
-    tap_shift: usize,
+    tap_shift: i64,
 
     /// How much of the prefill to key into the drafter's context cache.
     ///
@@ -307,6 +310,57 @@ struct Args {
     /// pool; `lfm2-decode-profile` carries `--warmup` for the same reason.
     #[arg(long, default_value_t = 8)]
     timing_warmup: usize,
+
+    /// Hold the last prompt token back as the first anchor — llama.cpp's
+    /// `speculative-simple` convention (`inp.back()` is `id_last`, the prefill
+    /// is `inp[0..n-1]`).
+    ///
+    /// Off, the prefill runs the whole prompt and the first anchor is the
+    /// target's own first prediction. On, the round structure matches the
+    /// reference exactly, so a per-round comparison of drafted blocks is
+    /// position-aligned from round 0. The token stream is the same either way.
+    #[arg(long)]
+    hold_last: bool,
+
+    /// Write the drafter's intermediates as raw F32 for the `H_ctx` ulp-match
+    /// against llama.cpp (§10.2m's parity surface): the prefill taps, the
+    /// projected `H_ctx`, and per round the block hidden state, the base
+    /// logits, the Markov-biased proposal and the verdict.
+    #[arg(long)]
+    dump_dir: Option<PathBuf>,
+
+    /// How many rounds to dump under `--dump-dir`.
+    #[arg(long, default_value_t = 3)]
+    dump_rounds: usize,
+
+    /// Prepend the tokenizer's BOS (`<|startoftext|>`, 124894) to the templated
+    /// prompt. The checkpoint's own chat template begins `{{- bos_token -}}` and
+    /// llama.cpp's `common_tokenize(…, add_special=true)` adds it; the
+    /// `tokenizers` crate's `encode(…, true)` does not, so the two sides
+    /// disagree by one token unless this is set.
+    #[arg(long)]
+    bos: bool,
+}
+
+/// Raw little-endian F32 plus a one-line `.meta` with the shape — the format
+/// `measurements/issue-363-raw/ulp_match.py` reads on both sides.
+fn dump_f32(dir: &Path, name: &str, t: &Tensor) -> Result<()> {
+    let shape: Vec<usize> = t.dims().to_vec();
+    let flat = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    let bytes: Vec<u8> = flat.iter().flat_map(|x| x.to_le_bytes()).collect();
+    std::fs::write(dir.join(format!("{name}.bin")), bytes)?;
+    std::fs::write(
+        dir.join(format!("{name}.meta")),
+        format!(
+            "name={name}\nshape={}\n",
+            shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    )?;
+    Ok(())
 }
 
 fn newest_snapshot(repo: &str) -> Option<PathBuf> {
@@ -539,8 +593,14 @@ fn report_timing(
         .map(|r| r.draft.dispatches + r.verify.dispatches + r.overhead.dispatches)
         .sum();
 
-    println!("rounds timed        : {} (dropped {warmup} warm-up)", spec.len());
-    println!("baseline steps timed: {} (dropped {warmup} warm-up)", base.len());
+    println!(
+        "rounds timed        : {} (dropped {warmup} warm-up)",
+        spec.len()
+    );
+    println!(
+        "baseline steps timed: {} (dropped {warmup} warm-up)",
+        base.len()
+    );
     println!("tokens emitted      : {emitted}  (mean advance {mean_adv:.3})");
 
     println!("\n-- per EMITTED token, wall (ms) --");
@@ -608,14 +668,18 @@ fn report_timing(
     // comparable quantity is its cost per VERIFIED POSITION against a baseline
     // step (one position, one sweep). #148's bandwidth-amortization claim
     // (§10.2m) is exactly this ratio.
+    // The window is the `k` proposals plus the bonus position (`verify_step`).
+    let positions = k + 1;
     let verify_per_round = sum_verify_wall / nr;
-    let verify_per_position = verify_per_round / k as f64;
+    let verify_per_position = verify_per_round / positions as f64;
     println!("\n-- does batched verify amortize? (the mechanism, not the drafter) --");
-    println!("  verify per round        : {verify_per_round:8.3} ms  (K = {k} positions, one weight sweep)");
+    println!("  verify per round        : {verify_per_round:8.3} ms  (K + 1 = {positions} positions, one weight sweep)");
     println!("  verify per POSITION     : {verify_per_position:8.3} ms");
-    println!("  baseline per token      : {base_wall_med:8.3} ms  (one position, one weight sweep)");
     println!(
-        "  amortization            : {:8.3}x  -- one weight-load serving {k} positions is \
+        "  baseline per token      : {base_wall_med:8.3} ms  (one position, one weight sweep)"
+    );
+    println!(
+        "  amortization            : {:8.3}x  -- one weight-load serving {positions} positions is \
          {} cheaper per position",
         base_wall_med / verify_per_position,
         if base_wall_med > verify_per_position {
@@ -626,7 +690,7 @@ fn report_timing(
     );
     println!(
         "  so the verify side WORKS as designed; what decides the verdict is how many of the \n\
-           {k} verified positions are KEPT, which is the accept rate: {mean_adv:.3} of {k}."
+           {positions} verified positions are KEPT, which is the accept rate: {mean_adv:.3} of {positions}."
     );
 
     // ---- the null control, which bounds what any of this resolves ---------
@@ -636,7 +700,10 @@ fn report_timing(
     // effect is ~1.5x and the null is a fraction of a percent, which is the
     // only reason the ratio above is worth stating at all.
     let null_ratio = if null_steps.len() > warmup {
-        let null_wall: Vec<f64> = null_steps[warmup..].iter().map(|b| b.wall_s * 1e3).collect();
+        let null_wall: Vec<f64> = null_steps[warmup..]
+            .iter()
+            .map(|b| b.wall_s * 1e3)
+            .collect();
         let null_med = median(&null_wall);
         let r = null_med / base_wall_med;
         println!("\n-- null control (the same baseline arm, second slot) --");
@@ -665,9 +732,10 @@ fn report_timing(
     println!("  cost of one round     : {per_round_wall:8.3} ms wall");
     println!("  baseline per token    : {base_wall_med:8.3} ms wall");
     println!(
-        "  advance needed to pay : {breakeven_adv:8.3} tokens/round  (K = {k}, so it is \
+        "  advance needed to pay : {breakeven_adv:8.3} tokens/round  (ceiling K + 1 = {}, so it is \
          {})",
-        if breakeven_adv > k as f64 {
+        k + 1,
+        if breakeven_adv > (k + 1) as f64 {
             "UNREACHABLE at this K"
         } else {
             "reachable in principle"
@@ -815,7 +883,7 @@ fn main() -> Result<()> {
     println!("prompt      : {prompt_text:?}");
 
     // ---- the drafter's constants ------------------------------------------
-    let mut dcfg = read_drafter_config(&draft_dir)?;
+    let dcfg = read_drafter_config(&draft_dir)?;
     let derived = drafter_params(&dcfg);
     if derived != CHECKPOINT_PARAMS {
         bail!(
@@ -826,15 +894,37 @@ fn main() -> Result<()> {
     }
     println!("\ndrafter params    : {derived} (matches checkpoint, delta 0)");
 
-    let mut tap_layers = dcfg.target_layer_ids.clone();
+    // The layer-input tap is requested at `target_layer_ids + 1`: the drafter
+    // is trained on those layers' OUTPUT residual, which is the next layer's
+    // input. `DSparkConfig::tap_layers` is that mapping; `--tap-shift` moves
+    // off it for an experiment and `-1` is the convention shipped before
+    // §10.2s.
+    let tap_layers: Vec<usize> = dcfg
+        .tap_layers()
+        .iter()
+        .map(|&l| {
+            let shifted = l as i64 + args.tap_shift;
+            if shifted < 0 {
+                bail!(
+                    "--tap-shift {} puts tap layer {l} below zero",
+                    args.tap_shift
+                );
+            }
+            Ok(shifted as usize)
+        })
+        .collect::<Result<Vec<_>>>()?;
     if args.tap_shift != 0 {
         println!(
-            "NOTE: --tap-shift {} reproduces mlx-dspark's after-the-block capture \
-             (§10.2o; the two witnesses disagree by one layer)",
+            "NOTE: --tap-shift {} moves the tap off the reference convention \
+             (target_layer_ids + 1, §10.2s); -1 is the one-layer-early arm this \
+             tree shipped before it",
             args.tap_shift
         );
-        tap_layers = tap_layers.iter().map(|l| l + args.tap_shift).collect();
     }
+    println!(
+        "tap layers        : {tap_layers:?}  (target_layer_ids {:?} + 1 + shift {})",
+        dcfg.target_layer_ids, args.tap_shift
+    );
 
     // ---- the target -------------------------------------------------------
     let raw = std::fs::read_to_string(target_dir.join("config.json"))?;
@@ -860,11 +950,13 @@ fn main() -> Result<()> {
         bail!("--draft must be at least 1");
     }
 
-    // **The ring's K and the verifier's K are the same number** (`DESIGN.md`
-    // §16 6b), enforced by `Cache::advance`, which refuses a window wider than
-    // the reserved history rather than letting a speculative write overwrite the
-    // live window. Set from `k` rather than hardcoded so the two cannot drift.
-    cfg.conv_state = ConvState::RotatingRing { k };
+    // The verify window is `k + 1` positions -- the `k` proposals plus the
+    // bonus position after them (`Model::verify_step`) -- and the ring must
+    // reserve that many history slots (`DESIGN.md` §16 6b), enforced by
+    // `Cache::advance`, which refuses a window wider than the reserved history
+    // rather than letting a speculative write overwrite the live window. Set
+    // from `k` rather than hardcoded so the two cannot drift.
+    cfg.conv_state = ConvState::RotatingRing { k: k + 1 };
     // Speculation requires the in-place arm: the `Cat` arm has no length to
     // rewind, and `Cache::resolve` refuses it (`lfm2.rs:1546`) rather than
     // silently keeping discarded positions inside the concatenated allocation.
@@ -879,7 +971,7 @@ fn main() -> Result<()> {
     // (`lfm2-smoke --raw-prompt` records it), so an untemplated prompt would
     // make the accept rate a property of a one-token stream.
     let templated = format!("<|im_start|>user\n{prompt_text}<|im_end|>\n<|im_start|>assistant\n");
-    let prompt_ids: Vec<u32> = tokenizer
+    let mut prompt_ids: Vec<u32> = tokenizer
         .encode(templated.as_str(), true)
         .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?
         .get_ids()
@@ -887,10 +979,48 @@ fn main() -> Result<()> {
     if prompt_ids.is_empty() {
         bail!("prompt tokenized to nothing");
     }
+    if args.bos {
+        let bos = tokenizer
+            .token_to_id("<|startoftext|>")
+            .context("tokenizer has no <|startoftext|>")?;
+        prompt_ids.insert(0, bos);
+    }
     println!(
-        "prompt tokens     : {} (wrapped in the chat template)",
-        prompt_ids.len()
+        "prompt tokens     : {} (wrapped in the chat template{})",
+        prompt_ids.len(),
+        if args.bos { ", BOS prepended" } else { "" }
     );
+    println!("prompt ids        : {prompt_ids:?}");
+
+    // llama.cpp's `speculative-simple` holds `inp.back()` out of the prefill as
+    // the first anchor; the default here lets the prefill's own argmax be the
+    // anchor. Either way `prefill_ids` is what the target sees before round 0
+    // and `index_pos` is where round 0's window starts.
+    let (prefill_ids, held_anchor): (Vec<u32>, Option<u32>) = if args.hold_last {
+        if prompt_ids.len() < 2 {
+            bail!("--hold-last needs a prompt of at least two tokens");
+        }
+        (
+            prompt_ids[..prompt_ids.len() - 1].to_vec(),
+            Some(prompt_ids[prompt_ids.len() - 1]),
+        )
+    } else {
+        (prompt_ids.clone(), None)
+    };
+    if let Some(d) = &args.dump_dir {
+        std::fs::create_dir_all(d)?;
+        std::fs::write(
+            d.join("prompt_ids.txt"),
+            format!(
+                "{}\n",
+                prompt_ids
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        )?;
+    }
 
     println!("target config     : {} layers", cfg.num_hidden_layers);
 
@@ -904,10 +1034,13 @@ fn main() -> Result<()> {
     println!("drafter dtype     : stored {CHECKPOINT_DTYPE:?}, computing at {compute_dtype:?}");
     let dvb =
         unsafe { VarBuilder::from_mmaped_safetensors(&[draft_file], compute_dtype, &device)? };
-    dcfg.target_layer_ids = tap_layers.clone();
     let drafter = DSparkDrafter::new(dcfg.clone(), max_pos, dvb)?;
     println!("drafter loaded    : {} layers", dcfg.num_hidden_layers);
-    println!("draft block K     : {k}  (conv ring reserves {k} history slots)");
+    println!(
+        "draft block K     : {k}  (verify window {} positions, conv ring reserves {} history slots)",
+        k + 1,
+        k + 1
+    );
 
     // =====================================================================
     // ARM 1 — the speculative loop
@@ -928,10 +1061,18 @@ fn main() -> Result<()> {
 
     // Prefill. The taps this pass leaves describe the whole prompt; the drafter
     // keys the LAST position, which is the one the anchor follows from.
-    let input = Tensor::new(prompt_ids.as_slice(), &device)?.unsqueeze(0)?;
+    let input = Tensor::new(prefill_ids.as_slice(), &device)?.unsqueeze(0)?;
     let logits = spec_model.forward(&input, 0, &mut cache)?;
-    let anchor = logits.squeeze(0)?.argmax(D::Minus1)?.to_scalar::<u32>()?;
+    let anchor = match held_anchor {
+        Some(a) => a,
+        None => logits.squeeze(0)?.argmax(D::Minus1)?.to_scalar::<u32>()?,
+    };
     let prefill_taps = cache.take_taps();
+    if let Some(d) = &args.dump_dir {
+        for (i, t) in prefill_taps.iter().enumerate() {
+            dump_f32(d, &format!("prefill_tap{i}_L{}", tap_layers[i]), t)?;
+        }
+    }
     if prefill_taps.len() != tap_layers.len() {
         bail!(
             "FAIL: the target produced {} taps and the projection consumes {}",
@@ -955,6 +1096,12 @@ fn main() -> Result<()> {
             .collect::<candle::Result<Vec<_>>>()?,
         other => bail!("--prefill-ctx must be `all` or `last`, got {other:?}"),
     };
+    if let Some(d) = &args.dump_dir {
+        // The projection alone, on the same taps the context is keyed from --
+        // §10.2m's first falsifiable surface, written as `[seq, 2048]` F32.
+        let h_ctx = drafter.projection().forward(&seed_taps)?;
+        dump_f32(d, "prefill_h_ctx", &h_ctx.squeeze(0)?)?;
+    }
     drafter.update_context(&seed_taps, 0, &mut caches)?;
     let mut ctx_positions = caches[0].len();
 
@@ -967,8 +1114,12 @@ fn main() -> Result<()> {
     let mut stream: Vec<u32> = Vec::new();
     let mut rounds: Vec<Round> = Vec::new();
     let mut last = anchor;
-    stream.push(anchor);
-    let mut index_pos = prompt_ids.len();
+    // With `--hold-last` the anchor is a prompt token, so it is not part of the
+    // generated stream; without it the anchor is the first generated token.
+    if held_anchor.is_none() {
+        stream.push(anchor);
+    }
+    let mut index_pos = prefill_ids.len();
 
     // With `--timing` the loop runs until it has EMITTED `--timing-tokens`
     // tokens rather than for a fixed round count: the two arms must be compared
@@ -999,6 +1150,28 @@ fn main() -> Result<()> {
             .draft_lm_head(&pred.to_dtype(DType::F16)?)?
             .to_dtype(DType::F32)?;
         let proposed = drafter.sample_block(&base_logits, last)?;
+        if let Some(d) = &args.dump_dir {
+            if r < args.dump_rounds {
+                dump_f32(d, &format!("round{r}_block_hidden"), &hidden.squeeze(0)?)?;
+                dump_f32(d, &format!("round{r}_base_logits"), &base_logits)?;
+                std::fs::write(
+                    d.join(format!("round{r}_block.txt")),
+                    format!(
+                        "anchor={last}\nblock_offset={ctx_positions}\nblock_ids={}\nproposed={}\n",
+                        block_ids
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        proposed
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                )?;
+            }
+        }
         let b_draft = if args.timing {
             close_bracket(&device, t_draft)?
         } else {
@@ -1027,6 +1200,21 @@ fn main() -> Result<()> {
             .take_while(|(a, p)| a == p)
             .count();
 
+        if let Some(d) = &args.dump_dir {
+            if r < args.dump_rounds {
+                std::fs::write(
+                    d.join(format!("round{r}_verdict.txt")),
+                    format!(
+                        "matched={matched}\naccepted={}\n",
+                        accepted
+                            .iter()
+                            .map(|t| t.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                )?;
+            }
+        }
         index_pos += accepted.len();
         stream.extend_from_slice(&accepted);
         last = *accepted.last().expect("verify_step never returns empty");
@@ -1112,11 +1300,19 @@ fn main() -> Result<()> {
             Model::new(&cfg, vb)?
         };
         let mut plain_cache = Cache::new(true, DType::F16, &cfg, &device)?;
-        let input = Tensor::new(prompt_ids.as_slice(), &device)?.unsqueeze(0)?;
+        let input = Tensor::new(prefill_ids.as_slice(), &device)?.unsqueeze(0)?;
         let logits = plain_model.forward(&input, 0, &mut plain_cache)?;
-        let mut tok = logits.squeeze(0)?.argmax(D::Minus1)?.to_scalar::<u32>()?;
-        let mut plain: Vec<u32> = vec![tok];
-        let mut pos = prompt_ids.len();
+        // Same convention as ARM 1: a held anchor is decoded from, not emitted.
+        let mut tok = match held_anchor {
+            Some(a) => a,
+            None => logits.squeeze(0)?.argmax(D::Minus1)?.to_scalar::<u32>()?,
+        };
+        let mut plain: Vec<u32> = if held_anchor.is_none() {
+            vec![tok]
+        } else {
+            Vec::new()
+        };
+        let mut pos = prefill_ids.len();
         while plain.len() < stream.len() {
             // One bracket per decode step, so the baseline's per-token figure
             // is a median over steps rather than a total divided by a count —
@@ -1153,11 +1349,14 @@ fn main() -> Result<()> {
             Model::new(&cfg, vb)?
         };
         let mut null_cache = Cache::new(true, DType::F16, &cfg, &device)?;
-        let input = Tensor::new(prompt_ids.as_slice(), &device)?.unsqueeze(0)?;
+        let input = Tensor::new(prefill_ids.as_slice(), &device)?.unsqueeze(0)?;
         let logits = null_model.forward(&input, 0, &mut null_cache)?;
-        let mut tok = logits.squeeze(0)?.argmax(D::Minus1)?.to_scalar::<u32>()?;
-        let mut n_done = 1usize;
-        let mut pos = prompt_ids.len();
+        let mut tok = match held_anchor {
+            Some(a) => a,
+            None => logits.squeeze(0)?.argmax(D::Minus1)?.to_scalar::<u32>()?,
+        };
+        let mut n_done = if held_anchor.is_none() { 1usize } else { 0 };
+        let mut pos = prefill_ids.len();
         while n_done < stream.len() {
             let t_step = std::time::Instant::now();
             let inp = Tensor::new(&[tok], &device)?.unsqueeze(0)?;
@@ -1182,7 +1381,8 @@ fn main() -> Result<()> {
     let mut adv: Vec<usize> = rounds.iter().map(|r| r.advance()).collect();
     adv.sort_unstable();
     let median = adv[adv.len() / 2];
-    let full_blocks = rounds.iter().filter(|r| r.advance() == k).count();
+    // A full block is every proposal accepted PLUS the bonus token: `k + 1`.
+    let full_blocks = rounds.iter().filter(|r| r.advance() == k + 1).count();
     let single = rounds.iter().filter(|r| r.advance() == 1).count();
 
     println!("\n=== 1. ACCEPTANCE RATE ===");
@@ -1218,7 +1418,7 @@ fn main() -> Result<()> {
 
     // Per-round advance, because a mean hides the shape (§3.2a rule 3).
     println!("\nadvance per round (the distribution the mean summarises):");
-    let hist: Vec<String> = (1..=k)
+    let hist: Vec<String> = (1..=k + 1)
         .map(|n| {
             let c = rounds.iter().filter(|r| r.advance() == n).count();
             format!("{n}:{c}")
@@ -1372,12 +1572,20 @@ fn main() -> Result<()> {
         "\nRESULT prompt_id={prompt_id} prompt_sha={} k={k} rounds={} \
          mean_advance={mean_advance:.4} median_advance={median} \
          mean_matched={mean_matched:.4} accept_fraction={:.4} \
-         tokens={} tap_shift={} stream_sha256={spec_digest} identity={}",
+         tokens={} tap_shift={} tap_layers={} bos={} hold_last={} \
+         stream_sha256={spec_digest} identity={}",
         &sha256(prompt_text.as_bytes())[..16],
         rounds.len(),
         total_matched as f64 / (rounds.len() * k) as f64,
         stream.len(),
         args.tap_shift,
+        tap_layers
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("+"),
+        args.bos,
+        args.hold_last,
         match &identity {
             None => "skipped",
             Some(_) => "IDENTICAL",

@@ -3234,22 +3234,24 @@ impl Model {
     /// divergence bound. Distribution-preserving sampling is a later,
     /// separately-argued step and is deliberately absent.
     ///
-    /// # The one-token overhang, which is the mechanism and not an off-by-one
+    /// # The window is `k + 1` positions, and the last one is the bonus token
     ///
     /// `last` is the token already committed — the one whose logits produced
-    /// `proposed[0]`. The pass runs `[last, proposed[0..k-1]]`, so position `i`
-    /// predicts what follows `proposed[i-1]`, and **a fully-accepted window
-    /// yields `k` tokens from `k` positions**: the `k − 1` verified proposals
-    /// plus the bonus token the last position predicts for free. That free token
-    /// is why a `k`-position verify can advance `k` tokens rather than `k − 1`,
-    /// and it is the reason the cost model in
-    /// `measurements/issue-89-verify-shape.md` §4 compares a `k`-position verify
-    /// against `k` decodes rather than `k − 1`.
+    /// `proposed[0]`. The pass runs `[last, proposed[0..k]]`: position `i < k`
+    /// predicts what follows `window[i]` and is compared against `proposed[i]`,
+    /// and position `k` predicts the token after the last proposal. So **a
+    /// fully-accepted window advances `k + 1` tokens**: the `k` verified
+    /// proposals plus that bonus. Feeding only `k` positions verifies the last
+    /// proposal implicitly and forfeits the bonus whenever the whole block is
+    /// right — a ceiling of `k` against the `k + 1` of llama.cpp's
+    /// `speculative-simple`, which feeds `[id_last, draft…]` (§10.2s).
+    ///
+    /// The conv ring must reserve `k + 1` history slots (`Cache::advance`).
     ///
     /// # Returns
     ///
-    /// The accepted tokens — between 1 and `k`, never 0, because the target's
-    /// own prediction at position 0 is always correct by definition.
+    /// The accepted tokens — between 1 and `k + 1`, never 0, because the
+    /// target's own prediction at position 0 is always correct by definition.
     pub fn verify_step(
         &self,
         last: u32,
@@ -3263,31 +3265,32 @@ impl Model {
         }
         // Opened before the pass, so the token records the state to return to
         // rather than a state the pass has already moved.
-        let tok = cache.advance(k)?;
+        let tok = cache.advance(k + 1)?;
 
-        // `[last, proposed[0..k-1]]`. The final proposal is not fed: nothing
-        // would verify it, since its verifier is the token after it.
-        let mut window = Vec::with_capacity(k);
+        // `[last, proposed[0..k]]`: every proposal is fed, and the position
+        // after the last one is where the bonus token comes from.
+        let mut window = Vec::with_capacity(k + 1);
         window.push(last);
-        window.extend_from_slice(&proposed[..k - 1]);
+        window.extend_from_slice(proposed);
 
         let device = &cache.device;
-        let input = Tensor::new(window.as_slice(), device)?.reshape((1, k))?;
+        let input = Tensor::new(window.as_slice(), device)?.reshape((1, k + 1))?;
 
-        // **One pass over the weights for k positions.** §9.1c: the weight sweep
-        // is per step and not per token, so this is where the multiple comes
-        // from -- 5.394 GB read once against k times.
+        // **One pass over the weights for k + 1 positions.** §9.1c: the weight
+        // sweep is per step and not per token, so this is where the multiple
+        // comes from -- 5.394 GB read once against k + 1 times.
         let logits = self.forward_all(&input, index_pos, cache)?;
         let argmax = logits.i(0)?.argmax(candle::D::Minus1)?.to_vec1::<u32>()?;
 
         // Accept the longest prefix where the target agrees with the proposal.
         // Position `i`'s argmax is what the target would emit after
-        // `window[i]`, so it is compared against `proposed[i]`.
-        let mut accepted = Vec::with_capacity(k);
-        for i in 0..k {
+        // `window[i]`; for `i < k` it is compared against `proposed[i]`, and
+        // position `k`'s is the bonus, kept unconditionally.
+        let mut accepted = Vec::with_capacity(k + 1);
+        for i in 0..=k {
             let target = argmax[i];
             accepted.push(target);
-            if i + 1 < k && target != proposed[i] {
+            if i < k && target != proposed[i] {
                 // The first disagreement ends the prefix. The target's own token
                 // is kept -- it is what non-speculative decoding would have
                 // emitted here -- which is what makes a rejection cost nothing
@@ -3296,8 +3299,9 @@ impl Model {
             }
         }
 
-        // `n` positions of state survive. The remaining `k - n` were written by
-        // the pass and are discarded: KV by a length decrement, conv by a phase
+        // `n` positions of state survive: `last` and the `n - 1` proposals the
+        // target agreed with. The remaining `k + 1 - n` were written by the
+        // pass and are discarded: KV by a length decrement, conv by a phase
         // move, neither by clearing bytes (§10.2a).
         cache.resolve(tok, accepted.len())?;
         Ok(accepted)

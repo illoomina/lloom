@@ -557,3 +557,40 @@ fn the_checkpoint_dtype_is_bf16() {
         DType::BF16
     );
 }
+
+// ---------------------------------------------------------------------------
+// Which target layers are tapped — §10.2s
+// ---------------------------------------------------------------------------
+
+/// The layer-input tap is requested at `target_layer_ids + 1`, because the
+/// drafter is trained on those layers' **output** residual and the tap reads
+/// the residual **entering** a layer.
+///
+/// The absolute reference (§3.1b rule 1) is the released GGUF, whose metadata
+/// carries `dflash.target_layers = [3, 10, 18, 22, 28]` for this checkpoint's
+/// `target_layer_ids = [2, 9, 17, 21, 27]` — llama.cpp's converter applies the
+/// same `+ 1` (`conversion/qwen.py`, `extract_layer_ids = [i + 1 for i in
+/// target_layer_ids]`), and its `t_layer_inp[il]` is the input of layer `il`.
+/// Requesting `[2, 9, 17, 21, 27]` directly is one layer early: §10.2s measured
+/// a different drafted block from slot 1 onward and a lower accept rate, with
+/// every other gate green.
+#[test]
+fn tap_layers_are_target_layer_ids_plus_one_matching_the_released_gguf() {
+    let cfg = DSparkConfig::lfm2_2_6b();
+    assert_eq!(cfg.target_layer_ids, vec![2, 9, 17, 21, 27]);
+    // `dflash.target_layers` in LFM2.5-2.6B-DSpark-F16.gguf, read with gguf_dump.
+    const GGUF_TARGET_LAYERS: [usize; 5] = [3, 10, 18, 22, 28];
+    assert_eq!(
+        cfg.tap_layers(),
+        GGUF_TARGET_LAYERS.to_vec(),
+        "tap_layers must be the layer-INPUT indices whose residual is target_layer_ids' OUTPUT"
+    );
+    // Every tap index is a real layer of the 30-layer target: the largest,
+    // 28, is the input of the last-but-one layer, so no `+ 1` runs off the end.
+    for &l in &cfg.tap_layers() {
+        assert!(
+            l < cfg.num_target_layers,
+            "tap layer {l} is past the target's layers"
+        );
+    }
+}

@@ -50,16 +50,15 @@
 //! flipped. The tap is off unless a caller names layers, and this is that
 //! caller.
 //!
-//! # The witness conflict this harness makes visible
+//! # Which layers are tapped
 //!
-//! Our tap is the layer-**input** residual (§10.2n), following llama.cpp
-//! PR #27383's `t_layer_inp[il]`, whose consumer passes the drafter's indices
-//! unshifted under the comment *"turn on extraction of the target layers'
-//! **input** embeddings"*. The native MLX port captures the layer **output**
-//! instead, with no compensating shift. Both are §10.2m witnesses and they
-//! differ by one layer. `--tap-shift` runs the other convention so the two are
-//! comparable on one machine the moment a reference exists; it changes which
-//! layers are tapped and nothing else.
+//! The tap is the layer-**input** residual (§10.2n), requested at
+//! `target_layer_ids + 1` — the **output** residual of `target_layer_ids`, which
+//! is what llama.cpp's converter writes into `dflash.target_layers` and what
+//! mlx-dspark captures after the block (§10.2s; the two witnesses agree once
+//! the converter's `+ 1` is read). `--tap-shift` moves off that for an
+//! experiment; `-1` is the one-layer-early convention this harness shipped
+//! with, whose `H_ctx` was `7fefbc46…` against the reference's `eea6a6d6…`.
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
@@ -98,16 +97,12 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     tokens: usize,
 
-    /// Shift every tap index by this much before running.
-    ///
-    /// `0` is our convention and llama.cpp's: the layer-**input** residual at
-    /// `target_layer_ids`. `1` reproduces mlx-dspark's, whose capture is after
-    /// the block — the input of layer `l+1` is the output of layer `l`, so a
-    /// shift of one is exactly that convention on an input-tapping engine.
-    /// Recorded as an arm rather than a constant because the two witnesses
-    /// disagree and this tree cannot yet adjudicate (§10.2o).
+    /// Shift every tap index relative to the reference convention — the
+    /// layer-input capture at `target_layer_ids + 1`, i.e. the output residual
+    /// of `target_layer_ids` (§10.2s). `-1` is the one-layer-early arm this
+    /// harness shipped with.
     #[arg(long, default_value_t = 0)]
-    tap_shift: usize,
+    tap_shift: i64,
 }
 
 fn newest_snapshot(repo: &str) -> Option<PathBuf> {
@@ -201,17 +196,32 @@ fn main() -> Result<()> {
     println!("draft  : {}", draft_dir.display());
     println!("device : {device:?}");
 
-    let (mut tap_layers, draft_hidden, eps) = drafter_tap_layers(&draft_dir)?;
+    let (target_layer_ids, draft_hidden, eps) = drafter_tap_layers(&draft_dir)?;
+    // The layer-input tap at `l + 1` is layer `l`'s output residual, which is
+    // the representation `fc.weight` was trained on (§10.2s) -- the same `+ 1`
+    // llama.cpp's converter writes into `dflash.target_layers`.
+    let tap_layers: Vec<usize> = target_layer_ids
+        .iter()
+        .map(|&l| {
+            let shifted = l as i64 + 1 + args.tap_shift;
+            if shifted < 0 {
+                bail!(
+                    "--tap-shift {} puts tap layer {l} below zero",
+                    args.tap_shift
+                );
+            }
+            Ok(shifted as usize)
+        })
+        .collect::<Result<Vec<_>>>()?;
     if args.tap_shift != 0 {
         println!(
-            "\nNOTE: --tap-shift {} -- reproducing mlx-dspark's after-the-block \
-             capture convention. Our default (0) is llama.cpp's layer-INPUT \
-             residual. See DESIGN.md 10.2o; the two witnesses disagree.",
+            "\nNOTE: --tap-shift {} moves the tap off the reference convention \
+             (target_layer_ids + 1, DESIGN.md 10.2s); -1 is the one-layer-early arm.",
             args.tap_shift
         );
-        tap_layers = tap_layers.iter().map(|l| l + args.tap_shift).collect();
     }
-    println!("\ntap_layers        : {tap_layers:?}");
+    println!("\ntarget_layer_ids  : {target_layer_ids:?}");
+    println!("tap_layers        : {tap_layers:?}  (target_layer_ids + 1 + shift)");
     println!("drafter hidden    : {draft_hidden}");
     println!("drafter rms eps   : {eps:e}");
 

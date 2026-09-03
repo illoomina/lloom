@@ -62,28 +62,21 @@
 //! that produces it. What is gained is a projection that **runs**, on every
 //! backend, with an absolute-reference parity test.
 //!
-//! # The representation, and a witness conflict this module does not resolve
+//! # The representation: the OUTPUT residual of `target_layer_ids`
 //!
-//! The tap feeding this is the **layer-input residual** (§10.2n), captured
-//! before the block runs. That follows llama.cpp PR #27383 — `t_layer_inp[il]`,
-//! whose consumer passes the drafter's indices unshifted and whose own comment
-//! reads *"turn on extraction of the target layers' **input** embeddings"*
-//! (`common/speculative.cpp:1046`).
+//! The tap mechanism captures the **layer-input residual** (§10.2n) — llama.cpp
+//! PR #27383's `t_layer_inp[il]`, read before layer `il` runs. The drafter's
+//! `target_layer_ids` `[2, 9, 17, 21, 27]` name the layers whose **output** it
+//! was trained on, so the layer-input capture has to be requested at `l + 1`:
+//! llama.cpp's converter writes `dflash.target_layers = [i + 1 for i in
+//! target_layer_ids]` (`conversion/qwen.py`), the released GGUF carries
+//! `[3, 10, 18, 22, 28]`, and mlx-dspark captures after the block with the
+//! indices unshifted. The two witnesses agree; [`DSparkConfig::tap_layers`] is
+//! that `+ 1`, and requesting `target_layer_ids` directly is one layer early
+//! (§10.2s measured the cost: a different drafted block from slot 1 onward).
 //!
-//! **mlx-dspark disagrees by one layer.** Its LFM2 body captures *after* the
-//! block (`target.py:_body_lfm2` — `h = layer(h, …)` then `captured.append(h)`),
-//! with no compensating index shift, so for `[2, 9, 17, 21, 27]` it feeds the
-//! *outputs* of those layers where llama.cpp feeds their *inputs*. Both are
-//! §10.2m-designated witnesses and they cannot both be right.
-//!
-//! **This module takes neither side**, because it does not have to: the tap is
-//! its input, [`DSparkProjection::forward`] projects whatever it is given, and
-//! the discriminator is the `H_ctx` ulp-match against a reference — which is
-//! what this module makes reachable and what §10.2o registers as the open
-//! question. Recorded rather than guessed (`CONTRIBUTING.md` §6): picking one
-//! silently is precisely the class §10.2n calls *"the defect no gate here can
-//! see"*, since a wrong-but-stable `H_ctx` degrades acceptance with every gate
-//! green.
+//! This module projects whatever taps it is given. The producer's order and
+//! layer choice are the caller's contract, checked where they are made.
 
 use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{Linear, RmsNorm, VarBuilder};
@@ -279,8 +272,9 @@ pub struct DSparkConfig {
     pub block_size: usize,
     /// The id whose embedding fills every block slot after the anchor.
     pub mask_token_id: u32,
-    /// The target layers whose input residuals the projection consumes, **in
-    /// this order** (§10.2n: the order is the consumer's contract).
+    /// The target layers whose **output** residuals the projection consumes,
+    /// **in this order** (§10.2n: the order is the consumer's contract). The
+    /// layer-input tap that delivers them is requested at [`Self::tap_layers`].
     pub target_layer_ids: Vec<usize>,
     pub num_target_layers: usize,
     pub markov_rank: usize,
@@ -329,6 +323,19 @@ impl DSparkConfig {
             enable_confidence_head: true,
             logits_start: 0,
         }
+    }
+
+    /// The `Config::tap_layers` that deliver `target_layer_ids`' output residuals.
+    ///
+    /// The tap captures the residual **entering** a layer, and the drafter is
+    /// trained on the residual **leaving** `target_layer_ids`, so each index is
+    /// shifted by one: the input of layer `l + 1` is the output of layer `l`.
+    /// This is the same `+ 1` llama.cpp's converter applies when it writes
+    /// `dflash.target_layers` (`[3, 10, 18, 22, 28]` in the released GGUF for
+    /// `[2, 9, 17, 21, 27]`). Requesting `target_layer_ids` unshifted taps one
+    /// layer early and is invisible to every gate but the accept rate (§10.2s).
+    pub fn tap_layers(&self) -> Vec<usize> {
+        self.target_layer_ids.iter().map(|l| l + 1).collect()
     }
 
     /// How many tokens one block can propose: `block_size - logits_start`.

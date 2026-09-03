@@ -94,12 +94,12 @@ struct Args {
     #[arg(long, default_value_t = 9)]
     draft: usize,
 
-    /// Shift every tap index by this much — `0` is llama.cpp's layer-input
-    /// convention and ours, `1` reproduces mlx-dspark's after-the-block
-    /// capture. The two witnesses disagree (§10.2o) and this makes them
-    /// comparable on one machine.
+    /// Shift every tap index relative to `DSparkConfig::tap_layers()` — the
+    /// layer-input capture at `target_layer_ids + 1`, i.e. those layers' output
+    /// residual, which llama.cpp and mlx-dspark both feed (§10.2s). `-1` is the
+    /// one-layer-early convention this tree shipped before §10.2s.
     #[arg(long, default_value_t = 0)]
-    tap_shift: usize,
+    tap_shift: i64,
 }
 
 fn newest_snapshot(repo: &str) -> Option<PathBuf> {
@@ -237,7 +237,7 @@ fn main() -> Result<()> {
     println!("device : {device:?}");
 
     // ---- the drafter's own constants, read rather than assumed --------------
-    let mut dcfg = read_drafter_config(&draft_dir)?;
+    let dcfg = read_drafter_config(&draft_dir)?;
     println!("\ndrafter config (read from its own config.json)");
     println!(
         "  hidden / layers : {} / {}",
@@ -291,16 +291,30 @@ fn main() -> Result<()> {
     }
     println!("  MATCH (delta 0)");
 
-    let mut tap_layers = dcfg.target_layer_ids.clone();
+    // The layer-input tap at `target_layer_ids + 1` is those layers' output
+    // residual -- the representation the drafter is trained on (§10.2s).
+    let tap_layers: Vec<usize> = dcfg
+        .tap_layers()
+        .iter()
+        .map(|&l| {
+            let shifted = l as i64 + args.tap_shift;
+            if shifted < 0 {
+                bail!(
+                    "--tap-shift {} puts tap layer {l} below zero",
+                    args.tap_shift
+                );
+            }
+            Ok(shifted as usize)
+        })
+        .collect::<Result<Vec<_>>>()?;
     if args.tap_shift != 0 {
         println!(
-            "\nNOTE: --tap-shift {} -- reproducing mlx-dspark's after-the-block \
-             capture. Our default (0) is llama.cpp's layer-INPUT residual. \
-             DESIGN.md 10.2o; the two witnesses disagree.",
+            "\nNOTE: --tap-shift {} moves the tap off the reference convention \
+             (target_layer_ids + 1, DESIGN.md 10.2s); -1 is the one-layer-early arm.",
             args.tap_shift
         );
-        tap_layers = tap_layers.iter().map(|l| l + args.tap_shift).collect();
     }
+    println!("  tap_layers      : {tap_layers:?}  (target_layer_ids + 1 + shift)");
 
     // ---- the target -------------------------------------------------------
     let raw = std::fs::read_to_string(target_dir.join("config.json"))?;
@@ -355,7 +369,6 @@ fn main() -> Result<()> {
     );
     let dvb =
         unsafe { VarBuilder::from_mmaped_safetensors(&[draft_file], compute_dtype, &device)? };
-    dcfg.target_layer_ids = tap_layers.clone();
     let drafter = DSparkDrafter::new(dcfg.clone(), max_pos, dvb)?;
     println!(
         "drafter loaded    : {} layers, {} params",

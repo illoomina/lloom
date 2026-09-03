@@ -82,8 +82,7 @@ fn main() -> Result<()> {
 
     let mut ok = true;
     for (idx, prompt) in turns.iter().enumerate() {
-        let templated =
-            format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
+        let templated = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
         let ids = tokenizer
             .encode(templated.as_str(), idx == 0)
             .map_err(|e| anyhow::anyhow!("tokenizing turn {}: {e}", idx + 1))?
@@ -109,7 +108,11 @@ fn main() -> Result<()> {
         println!("--- turn {} ---", idx + 1);
         println!("prompt: {prompt}");
         println!("output: {}", decoded.text.trim());
-        println!("        ({} tokens, {:?})", decoded.tokens.len(), decoded.stop);
+        println!(
+            "        ({} tokens, {:?})",
+            decoded.tokens.len(),
+            decoded.stop
+        );
 
         // Turn 2's low-bar substring check, the §3.1a gate: a working cache
         // answers "Paris" against the accumulated state.
@@ -133,9 +136,13 @@ fn default_model_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(dir));
     }
     let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--LiquidAI--LFM2.5-VL-3B/snapshots");
-    std::fs::read_dir(&snaps).ok()?.flatten().next().map(|e| e.path())
+    let snaps =
+        PathBuf::from(home).join(".cache/huggingface/hub/models--LiquidAI--LFM2.5-VL-3B/snapshots");
+    std::fs::read_dir(&snaps)
+        .ok()?
+        .flatten()
+        .next()
+        .map(|e| e.path())
 }
 
 /// Parse `config.json` into a runtime `lfm2::Config`, reusing the normalization

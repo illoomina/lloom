@@ -107,7 +107,10 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// token during decode.
     fn forward(&mut self, tokens: &[u32]) -> Result<Tensor> {
         let input = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input, self.pos, &mut self.cache)?.squeeze(0)?;
+        let logits = self
+            .model
+            .forward(&input, self.pos, &mut self.cache)?
+            .squeeze(0)?;
         self.pos += tokens.len();
         Ok(logits)
     }
@@ -169,7 +172,10 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             }
 
             if !params.stop_strings.is_empty()
-                && params.stop_strings.iter().any(|s| text.contains(s.as_str()))
+                && params
+                    .stop_strings
+                    .iter()
+                    .any(|s| text.contains(s.as_str()))
             {
                 stop = Stop::StopString;
                 break;

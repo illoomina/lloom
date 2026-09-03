@@ -2929,7 +2929,10 @@ fn main() -> Result<()> {
                 args.silu_impl
             )
         })?;
-        candle::kernels::set_silu_impl(silu);
+        // The SiLU arm rides `Config::silu_impl` now (RESTRUCTURING §1.6):
+        // `Model::new` pushes the field into the kernel cache, so setting the
+        // atomic directly here would be clobbered by that push.
+        config.silu_impl = silu;
     }
     config.attn_impl = match args.attn.as_str() {
         "generic" => lloom::models::lfm2::AttnImpl::Generic,

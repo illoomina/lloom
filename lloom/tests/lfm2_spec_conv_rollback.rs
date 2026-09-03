@@ -58,6 +58,7 @@ fn tiny_config(conv_state: ConvState) -> Config {
         // #363's tap: off, as every pre-#363 caller had it.
         tap_layers: Vec::new(),
         tap_dtype: DType::F32,
+        ..Default::default()
     }
 }
 

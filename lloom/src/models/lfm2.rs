@@ -9,6 +9,11 @@ use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, R
 use crate::nn::ops::{FlashScratchSizing, KvQuant};
 use crate::nn::{CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, Speculative, VarBuilder};
 use crate::utils::repeat_kv;
+use lloom_macros::Config as ConfigDerive;
+// The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its
+// axis field are metal-gated exactly as its former crate dependency was.
+#[cfg(feature = "metal")]
+use lloom_tensor::kernels::SiluImpl;
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor};
 use std::collections::{BTreeMap, HashMap};
 
@@ -138,6 +143,11 @@ impl Lfm2Config {
             // meaningful default for a target config to carry.
             tap_layers: Vec::new(),
             tap_dtype: DType::F32,
+            // The default SiLU arm, `Exact` — an unconfigured process is
+            // byte-for-byte what it was (§7.1a). The kernel atomic is set from
+            // this at construction (§1.6). Metal-only, like the kernel it steers.
+            #[cfg(feature = "metal")]
+            silu_impl: SiluImpl::default(),
         }
     }
 }
@@ -357,6 +367,21 @@ pub enum AttnImpl {
     FlashDecoding,
 }
 
+impl AttnImpl {
+    /// Parse the `--attn` flag arm. The spellings are the ones every harness
+    /// used inline before `#[derive(Config)]` consolidated them (§3.6).
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "generic" => Ok(AttnImpl::Generic),
+            "sdpa" => Ok(AttnImpl::Sdpa),
+            "flash" => Ok(AttnImpl::FlashDecoding),
+            other => Err(format!(
+                "--attn must be `generic`, `sdpa` or `flash`, got `{other}`"
+            )),
+        }
+    }
+}
+
 /// How the KV cache grows as decode appends a token.
 ///
 /// A construction-tier axis in `DESIGN.md` §7.1's terms, following `AttnImpl`'s
@@ -382,6 +407,20 @@ pub enum KvAppend {
     /// §11.1a.1 actually wants — the buffer identity stops changing, because
     /// `narrow` shares storage and only rewrites the layout.
     InPlace,
+}
+
+impl KvAppend {
+    /// Parse the `--kv-append` flag arm. The spellings match the harnesses'
+    /// prior inline parse (§3.6).
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "cat" => Ok(KvAppend::Cat),
+            "in-place" => Ok(KvAppend::InPlace),
+            other => Err(format!(
+                "--kv-append must be `cat` or `in-place`, got `{other}`"
+            )),
+        }
+    }
 }
 
 /// How much KV a sequence may accumulate before [`KvAppend::InPlace`] declines.
@@ -518,7 +557,11 @@ pub fn report_weight_divergence(r: &lloom_tensor::metal_backend::admission::Weig
     eprintln!("lfm2: {}", r.describe());
 }
 
-#[derive(Debug, Clone)]
+/// The runtime config. The `#[axis]`-tagged fields are the engine's
+/// configuration axes (RESTRUCTURING §1.6): each contributes to `lloom::axes::AXES`
+/// at link time and becomes a `ConfigArgs` clap flag. The shape fields
+/// (`hidden_size`, `layer_types`, …) come from the checkpoint and are not axes.
+#[derive(Debug, Clone, ConfigDerive)]
 pub struct Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
@@ -538,6 +581,13 @@ pub struct Config {
     pub use_flash_attn: bool,
     /// Defaults to `Generic`, so `into_config` and every existing caller keep
     /// the path they had without naming it.
+    #[axis(
+        name = "AttnImpl",
+        flag = "attn",
+        variants = ["Generic", "Sdpa", "FlashDecoding"],
+        default = "Generic",
+        parser = "AttnImpl::parse"
+    )]
     pub attn_impl: AttnImpl,
     /// KV tokens per **page** — the allocation granularity — for
     /// `AttnImpl::FlashDecoding`.
@@ -580,8 +630,22 @@ pub struct Config {
     /// **Inert unless `attn_impl` is `FlashDecoding`**, which is the only path
     /// that allocates from this class — *inert* and *unrecorded* being different
     /// facts, so it is still stated on a `RESULT` line (#241).
+    #[axis(
+        name = "ScratchSizing",
+        flag = "flash-scratch-sizing",
+        variants = ["Grow", "Reserve", "Bucket"],
+        default = "Grow",
+        parser = "FlashScratchSizing::parse"
+    )]
     pub flash_scratch_sizing: FlashScratchSizing,
     /// Defaults to `Cat`, for the same reason `attn_impl` defaults to `Generic`.
+    #[axis(
+        name = "KvAppend",
+        flag = "kv-append",
+        variants = ["Cat", "InPlace"],
+        default = "Cat",
+        parser = "KvAppend::parse"
+    )]
     pub kv_append: KvAppend,
     /// Whether the KV cache stores integer codes, and at which width
     /// (`DESIGN.md` §10.7, issue #218).
@@ -595,8 +659,22 @@ pub struct Config {
     /// one field apart. The bit width reaches the kernel as a template
     /// parameter (§7.2 — memory layout is compile-tier), but selecting between
     /// two pre-built instantiations is a pipeline choice.
+    #[axis(
+        name = "KvQuant",
+        flag = "kv-quant",
+        variants = ["Off", "Int8", "Int4"],
+        default = "Off",
+        parser = "KvQuant::parse"
+    )]
     pub kv_quant: KvQuant,
     /// Defaults to `Shuffle`, so every existing caller keeps §6.1's path.
+    #[axis(
+        name = "ConvState",
+        flag = "conv-state",
+        variants = ["Shuffle", "SlidingRing", "RotatingRing"],
+        default = "Shuffle",
+        parser = "ConvState::parse"
+    )]
     pub conv_state: ConvState,
     /// `DESIGN.md` §9.5's memory budget. `None` — admission off — by default,
     /// per §7.1a's rule that no default is flipped without its own argued
@@ -617,6 +695,7 @@ pub struct Config {
     /// discriminator: SiLU is applied to the f32 accumulator where the
     /// `silu_f16` dispatch it replaces applies it at `T` to the rounded store
     /// (§12.2d). It is not gated on an unchanged digest.
+    #[axis(name = "GemvSilu", flag = "gemv-silu", variants = ["off", "on"], default = "off", bool)]
     pub gemv_silu: bool,
     /// Fuse the two residual adds onto their producing GEMV's store (#509's
     /// kernel, wired by #509).
@@ -634,6 +713,7 @@ pub struct Config {
     ///
     /// **This arm moves the digests by construction** (§12.2h): the add is at
     /// the f32 accumulator where `badd_f16` adds at `T` on the rounded store.
+    #[axis(name = "GemvResidual", flag = "gemv-residual", variants = ["off", "on"], default = "off", bool)]
     pub gemv_residual: bool,
     /// Which layers' **input residual** to capture into [`Cache::taps`], for a
     /// hidden-state-typed drafter (`DESIGN.md` §10.2m, issue #363).
@@ -679,6 +759,44 @@ pub struct Config {
     /// which is the entire ROI of a speculative scheme (§10.2m). A
     /// lower-precision tap shifts the draft distribution and lowers accept.
     pub tap_dtype: DType,
+    /// Which SiLU arm the 30 `usilu` dispatches per token resolve to
+    /// (`DESIGN.md` §12.2l, issue #599).
+    ///
+    /// **The steer value is registered engine-side, cached kernel-side**
+    /// (RESTRUCTURING §1.6). Before Wave A the arm lived only as the
+    /// `SILU_IMPL` process-wide atomic in `lloom-tensor::kernels`
+    /// (`unary.rs:464`), switched by `--silu-impl` and captured on no run
+    /// record — the "unlisted ambient switch" §7.1a records as a run-record
+    /// corruption (B7). It now rides a `#[axis]` field here, so a run's SiLU
+    /// arm is part of its `Config` and its `AXES` registration; the atomic is
+    /// the *cache* of this field's value, pushed into the kernel once at model
+    /// construction via `lloom_tensor::kernels::set_silu_impl`. The STEER stays
+    /// a kernel switch; only its registration moved engine-side.
+    ///
+    /// **Defaults to `Exact`** (`SiluImpl::default`), so an unconfigured process
+    /// is byte-for-byte what it was (§7.1a: no default flipped).
+    #[cfg(feature = "metal")]
+    #[axis(
+        name = "SiluImpl",
+        flag = "silu-impl",
+        variants = ["Exact", "Recip", "Literal", "Coarse4", "Coarse1", "HardSwish", "Relu"],
+        default = "Exact",
+        parser = "parse_silu_impl"
+    )]
+    pub silu_impl: SiluImpl,
+}
+
+/// Parse the `--silu-impl` arm into the enum, adapting the kernel layer's
+/// `Option`-returning `parse` to the `Result<_, String>` shape the derive's
+/// flag apply expects. Metal-only, like the axis it serves.
+#[cfg(feature = "metal")]
+pub fn parse_silu_impl(s: &str) -> std::result::Result<SiluImpl, String> {
+    SiluImpl::parse(s).ok_or_else(|| {
+        format!(
+            "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
+             `coarse1`, `hardswish` or `relu`, got `{s}`"
+        )
+    })
 }
 
 impl Config {
@@ -728,6 +846,8 @@ impl Default for Config {
             gemv_residual: false,
             tap_layers: Vec::new(),
             tap_dtype: DType::F32,
+            #[cfg(feature = "metal")]
+            silu_impl: SiluImpl::default(),
         }
     }
 }
@@ -2856,6 +2976,14 @@ fn mark_graph_node(_: &Device, _: usize) {}
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        // Push the SiLU steer arm into the kernel-layer cache (RESTRUCTURING
+        // §1.6). The value is a `#[axis]` field on `Config` so a run records it;
+        // the atomic in `lloom-tensor::kernels` is its cache, set once here at
+        // construction. `Exact` leaves the pre-existing `silu_f16` path
+        // byte-for-byte unchanged (§7.1a). Metal-only, like the kernel.
+        #[cfg(feature = "metal")]
+        lloom_tensor::kernels::set_silu_impl(cfg.silu_impl);
+
         let vb_m = vb.pp("model");
 
         let embed_tokens =

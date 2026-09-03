@@ -399,7 +399,10 @@ fn main() -> Result<()> {
             args.silu_impl
         )
     })?;
-    candle::kernels::set_silu_impl(silu);
+    // The SiLU arm rides `Config::silu_impl` now (RESTRUCTURING §1.6):
+    // `Model::new` pushes the field into the kernel cache, so setting the atomic
+    // directly here would be clobbered by that push. Set the field instead.
+    config.silu_impl = silu;
     println!("silu impl: {}", silu.name());
 
     // #509's wiring. Printed whether or not set: *inert* and *unrecorded* are

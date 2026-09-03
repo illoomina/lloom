@@ -675,7 +675,12 @@ fn main() -> Result<()> {
             args.silu_impl
         )
     })?;
-    candle::kernels::set_silu_impl(silu);
+    // The SiLU arm now rides `Config::silu_impl` (RESTRUCTURING §1.6): the field
+    // is the source of truth and `Model::new` pushes it into the kernel cache,
+    // so setting it here (rather than calling `set_silu_impl` directly) is what
+    // makes the run record it. Setting the atomic directly would be clobbered by
+    // `Model::new`'s push of `config.silu_impl`.
+    config.silu_impl = silu;
     println!("silu impl: {}", silu.name());
 
     // The two GEMV epilogue fusions (#509's wiring of #484's and #509's

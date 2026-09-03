@@ -4,6 +4,10 @@
 // as `crate::nn::` internally and `lloom::nn::` by consumers.
 pub mod nn;
 
+// The within-crate axis registry (RESTRUCTURING §1.6): the authoritative,
+// link-time-collected `AXES` slice every `#[derive(Config)]` contributes to.
+pub mod axes;
+
 pub mod fused_moe;
 pub mod generation;
 pub mod hub;

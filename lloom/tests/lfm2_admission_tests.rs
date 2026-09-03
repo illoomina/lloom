@@ -220,6 +220,7 @@ fn admission_is_off_by_default() {
         // #363's tap: off, as every pre-#363 caller had it.
         tap_layers: Vec::new(),
         tap_dtype: lloom_tensor::DType::F32,
+        ..Default::default()
     };
     assert!(
         cfg.memory_budget.is_none(),

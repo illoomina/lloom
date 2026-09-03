@@ -67,6 +67,7 @@ fn tiny_config() -> Config {
         gemv_residual: false,
         tap_layers: Vec::new(),
         tap_dtype: DType::F32,
+        ..Default::default()
     }
 }
 

@@ -125,9 +125,27 @@ struct EpilogueNone {
 // SiLU / swish: `x / (1 + exp(-x))`.
 //
 // The EXPRESSION is spelled to match `unary.metal`'s `usilu` character for
-// character -- `x * (1/(1+exp(-x)))` and `x/(1+exp(-x))` are not the same
+// character. ~~`x * (1/(1+exp(-x)))` and `x/(1+exp(-x))` are not the same
 // float operation, and a different spelling would move the digests for a
-// reason that is not the fusion.
+// reason that is not the fusion.~~
+//
+// **The struck clause was a prediction and it is FALSE -- measured 2026-09-03
+// (#599, `DESIGN.md` §12.2k).** Compiled side by side at held-constant
+// precision over 4096 inputs, `x * (1/(1+exp(-x)))` is **bit-identical** to
+// `x/(1+exp(-x))` at f32 AND at f16, as is `x * recip(1+exp(-x))`
+// (`unary.metal:308`'s sigmoid spelling). The algebraic rearrangement this
+// comment warned about costs nothing.
+//
+// What DOES move bits is the LITERAL: `quantized.metal:1563`'s
+// `x / (1.0f + exp(-x))` differs by 1 ulp at f16 over 440 of 4096 points,
+// because the `f` suffix promotes the addition to float where a bare `1`
+// converts to `T`. At `T = float` the two are the same expression, which is
+// why f32 shows nothing. Mutation-verified.
+//
+// **Matching `usilu` character for character remains the right choice** -- it
+// costs nothing and removes a variable -- so the decision below is unchanged
+// and only its justification is corrected. The PRECISION note that follows is
+// unaffected and is the real reason this arm moves the digests.
 //
 // **The PRECISION deliberately does not match, and this is the one place the
 // fused arm is not a rewrite of the unfused one.** Read from source:

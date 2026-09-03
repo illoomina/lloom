@@ -57,7 +57,7 @@ pub const CAST: &str = with_utils!(
 );
 pub const CONV: &str = include_str!("metal_src/conv.metal");
 pub const FILL: &str = include_str!("metal_src/fill.metal");
-pub const FLASH_DECODING: &str = include_str!("metal_src/flash_decoding.metal");
+pub const FLASH_DECODING: &str = include_str!("metal_src/attention/flash_decoding.metal");
 pub const INDEXING: &str = with_utils!(
     "#include <metal_stdlib>\nusing namespace metal;",
     include_str!("metal_src/indexing.metal")
@@ -100,7 +100,14 @@ pub const UNARY: &str = with_utils!(
     "#include <metal_stdlib>\n#include <metal_math>\nusing namespace metal;",
     include_str!("metal_src/unary.metal")
 );
-pub const SDPA: &str = include_str!("metal_src/scaled_dot_product_attention.metal");
+/// `scaled_dot_product_attention.metal` and `flash_decoding.metal` above live
+/// in the `metal_src/attention/` role directory (§7.2): the two attention
+/// translation units, grouped by role. The embedded text is byte-identical to
+/// before the move, so the compiled libraries and every canonical digest are
+/// unmoved — the relocation changes only the `include_str!` path (§7.3 move
+/// gate). Both keep their own `Source` variant, so every dispatch site, the
+/// `Pipelines` key and the `Libraries` key are untouched.
+pub const SDPA: &str = include_str!("metal_src/attention/scaled_dot_product_attention.metal");
 
 /// The sixteen non-MLX sources as **one translation unit** (issue #477,
 /// `DESIGN.md` §13.1e/§13.1j).
@@ -176,7 +183,7 @@ pub const MERGED_NON_MLX: &str = concat!(
     "\n",
     include_str!("metal_src/fill.metal"),
     "\n",
-    include_str!("metal_src/flash_decoding.metal"),
+    include_str!("metal_src/attention/flash_decoding.metal"),
     "\n",
     include_str!("metal_src/gemm/gemv.metal"),
     "\n",

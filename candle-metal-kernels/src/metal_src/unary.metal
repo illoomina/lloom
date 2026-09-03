@@ -324,6 +324,128 @@ define_unary_op(uid, x);
 define_unary_op(ugelu, gelu(x));
 define_unary_op(urelu, x < 0 ? 0 : x);
 define_unary_op(usilu, x / (1 + exp(-x)));
+
+///////////////////////////////////////////////////////////////////////////////
+/// The SiLU variant axis (issue #599, `DESIGN.md` §12.2l)
+///////////////////////////////////////////////////////////////////////////////
+//
+// `usilu` above is the SHIPPING arm and is untouched: it is `SiluImpl::Exact`,
+// it keeps its `[[host_name]]`, and an unconfigured process resolves exactly
+// the name it always did (§7.1a -- no default is flipped here).
+//
+// The arms below exist to answer #599's titled question -- *how much error does
+// the model absorb before it degenerates* -- which needs variants that differ
+// by a KNOWN amount, spanning several orders of magnitude. #604 (§12.2k)
+// measured the five spellings already in the tree and found them bit-identical
+// at f32 and 0-3 ulp apart at f16: the existing spread is far too narrow to
+// locate an absorption threshold, so the curve needs arms built for it.
+//
+// **These are variants, not replacements** -- §3.6's law. The functor is the
+// template parameter `unary_kernel` already takes, so each arm is one
+// `define_unary_op` row plus one `init_unary_float` row, composed at
+// instantiation and inlined by the compiler. Nothing about the kernel body,
+// the binding style or the dispatch changes.
+//
+// **Why the ERROR is the axis and not the SPEED.** These arms are deliberately
+// not proposed as faster: `exp` on this hardware is a hardware instruction and
+// a polynomial that replaces it is not obviously cheaper. The axis is
+// numerical, and the question is what the model tolerates -- which bounds every
+// future approximation (quantized activations, a cheaper `exp`, a fused
+// epilogue at lower precision) with one measured curve instead of one
+// experiment each.
+
+// **Arm 2 -- `Recip`.** `x * recip(1+exp(-x))`, `unary.metal:308`'s sigmoid
+// spelling composed. #604 measured this bit-identical to `usilu` at both
+// dtypes; it is carried here as an INTERNAL CONTROL rather than as a variant.
+// A sweep whose arms all differ cannot show that the instrument reports "no
+// difference" when there is none, and §3.1a rule 4 is that all-different is as
+// suspicious as all-identical. This arm must read zero.
+define_unary_op(usilu_recip, x * recip(1 + exp(-x)));
+
+// **Arm 3 -- `Literal`.** `x / (1.0f + exp(-x))`, `quantized.metal:1563`'s
+// spelling. #604 measured this at 1 ulp over 440 of 4096 points at f16 and
+// bit-identical at f32, and identified the `1.0f` suffix as the mechanism: it
+// promotes the addition to float where a bare `1` converts to `T`. It is the
+// smallest NON-ZERO perturbation available from a real site in this tree, so it
+// is the bottom rung of the ladder -- and the one arm whose magnitude was
+// measured before this issue rather than by it.
+define_unary_op(usilu_literal, x / (1.0f + exp(-x)));
+
+// **Arms 4 and 5 -- `Coarse4` and `Coarse1`.** The two middle rungs, and the
+// only ones whose error is a free parameter.
+//
+// `exp(-x)` is rewritten as `exp2(-x * log2(e))` -- an identity, and `exp2` is
+// what the hardware instruction computes anyway -- and then the ARGUMENT is
+// rounded to a fixed number of fractional bits before `exp2` sees it. The
+// number of bits is the knob: 4 fractional bits gives ~4.6e-3 peak absolute
+// error, 1 bit gives ~3.9e-2, and the limit of infinitely many bits is the
+// exact arm. Nothing else about the expression changes.
+//
+// **Why this shape rather than a polynomial or a fast-sigmoid.** The first
+// version of this arm WAS the classic fast-sigmoid `0.5*(1 + x/(1+|x|))`, and
+// it was wrong for this job in a way worth recording: it converges to -0.476
+// as x -> -inf where SiLU converges to 0, so its "error" is a systematic bias
+// in the whole negative tail rather than an approximation that shrinks where
+// the function does. An arm like that degenerates the model for a reason that
+// is not *approximation error*, which makes it useless as a rung -- it would
+// put a point on the curve whose x-coordinate does not mean what the other
+// points' means. Measured before it was replaced: peak absolute error 4.76e-1,
+// and 4096 of 4096 points differing at f32 where the exact arm's own error is
+// 1.7e-6.
+//
+// The quantized-`exp2` form has the property the ladder needs: it decays to
+// zero in the tail exactly as SiLU does, so its error is *approximation* error
+// at every x, and the knob moves it smoothly.
+//
+// A note on spelling, because it cost a build: at `T = bfloat` a bare `abs`,
+// `clamp` or `floor` is ambiguous between the float overload and the integer
+// ones, and the whole `unary` library then fails to compile -- taking every
+// unary op with it, not just this arm. Caught by the name-resolution table in
+// `silu_variant_error.rs` on its first run, where `silu_f16` -- a name that has
+// always existed -- read NO alongside the new ones. **A resolution check
+// covering only the NEW names would have reported them absent and sent the
+// reader hunting a missing instantiation** (§8.1b, and #517's positive-control
+// rule: include a name that must already be there).
+#define SILU_COARSE(x, scale)                                                  \
+    ((x) / (static_cast<T>(1) +                                                \
+        exp2(static_cast<T>(rint(static_cast<float>(-(x)) * 1.4426950408889634f \
+             * (scale)) / (scale)))))
+
+define_unary_op(usilu_coarse4, SILU_COARSE(x, 16.0f));
+define_unary_op(usilu_coarse1, SILU_COARSE(x, 2.0f));
+
+// **Arm 6 -- `HardSwish`.** `x * clamp(x/6 + 0.5, 0, 1)`, the piecewise-linear
+// hard-swish from MobileNetV3. Exp-free, cheap, and visibly wrong: peak
+// absolute error against SiLU is ~0.14 and it is exactly zero for x <= -3 where
+// SiLU is small but non-zero.
+//
+// Spelled with `fmin`/`fmax` rather than `clamp` for `fabs`'s reason one arm
+// up: at `T = bfloat` a bare `clamp` is ambiguous against the integer
+// overloads. `fmin(fmax(v, 0), 1)` is the same function and names the float
+// overload unambiguously at all three dtypes.
+define_unary_op(usilu_hardswish, x * fmin(fmax(x / static_cast<T>(6) +
+    static_cast<T>(0.5), static_cast<T>(0)), static_cast<T>(1)));
+
+// **Arm 7 -- `Relu`.** Not an approximation to SiLU at all: a DIFFERENT
+// activation function, peak absolute error ~0.28 against SiLU and about twice
+// hard-swish's.
+//
+// **Added because the ladder ran out before the model did.** The first sweep
+// went to `hardswish` and every arm passed the text gate, which bounds the
+// absorption capacity from below and does not locate it. This arm is the top
+// because it abandons the *shape*: it is exactly zero for all x < 0, where SiLU
+// has its characteristic non-monotone dip, so if the model tolerates this the
+// finding is not "SiLU error is absorbed" but "this position in the network
+// barely cares which nonlinearity it gets".
+//
+// `x < 0 ? 0 : x` is `urelu`'s own spelling one screen up, copied
+// character-for-character rather than paraphrased (§3.1c). Note that
+// `unary.metal:294`'s `relu<T>()` is NOT relu -- its body is a copy of `gelu`'s
+// tanh approximation and nothing calls it (#599's earlier finding, recorded in
+// the pit) -- so taking the functor's spelling rather than that function's is
+// deliberate.
+define_unary_op(usilu_relu, x < 0 ? 0 : x);
+
 define_unary_op(ugelu_erf, gelu_erf(x));
 define_unary_op(usqrt, sqrt(x));
 define_unary_op(ucos, cos(x));
@@ -435,6 +557,18 @@ init_unary_float(neg, uneg);
 init_unary_float(recip, urecip);
 init_unary_float(copy, uid);
 init_unary_float(silu, usilu);
+// The #599 variant arms. Each is a DISTINCT `[[host_name]]` set, so `silu_f16`
+// -- the name an unconfigured process resolves -- is byte-identical to what it
+// was and the arms are selected by name rather than by rebuilding (§7.1a).
+// Instantiated unconditionally, as `gemv_silu`'s names are since #516: a
+// run-time selector whose kernel exists only under a `-D` is two sources of
+// truth for one decision, and #516 removed exactly that shape.
+init_unary_float(silu_recip, usilu_recip);
+init_unary_float(silu_literal, usilu_literal);
+init_unary_float(silu_coarse4, usilu_coarse4);
+init_unary_float(silu_coarse1, usilu_coarse1);
+init_unary_float(silu_hardswish, usilu_hardswish);
+init_unary_float(silu_relu, usilu_relu);
 init_unary_float(gelu, ugelu);
 init_unary_float(relu, urelu);
 init_unary_float(cos, ucos);

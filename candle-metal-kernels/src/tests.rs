@@ -8724,3 +8724,95 @@ fn the_two_widths_differ_and_int8_is_closer_to_f16() {
         rms[1] / rms[0]
     );
 }
+
+///////////////////////////////////////////////////////////////////////////////
+/// The SiLU variant axis (issue #599, `DESIGN.md` §12.2l)
+///////////////////////////////////////////////////////////////////////////////
+
+/// Every `SiluImpl` arm resolves, at every dtype, in both binding forms.
+///
+/// This is `packed_names_resolve`'s argument for a second axis (§8.1b): the
+/// name is checked against the **compiled library**, not against the macro that
+/// should have produced it, because #26 shipped 48 names absent from a metallib
+/// that compiled cleanly.
+///
+/// **It carries `Exact` deliberately, and that is not redundant.** On this
+/// axis's first run every arm read absent -- including `silu_f16`, which has
+/// always existed -- because `usilu_poly`'s `abs` was ambiguous at `bfloat` and
+/// the whole `unary` library failed to compile. A check covering only the NEW
+/// names would have reported them missing and sent the reader hunting an
+/// instantiation bug instead of a compile error two lines away.
+#[test]
+fn silu_variant_names_resolve() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let mut checked = 0usize;
+    for arm in crate::SiluImpl::ALL {
+        for dtype in [
+            crate::SiluDType::F16,
+            crate::SiluDType::F32,
+            crate::SiluDType::BF16,
+        ] {
+            for name in [arm.contiguous_name(dtype), arm.strided_name(dtype)] {
+                kernels
+                    .load_pipeline(&device, Source::Unary, name)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "unary.metal has no kernel named {name:?} \
+                             (SiluImpl::{:?} at {dtype:?}): {e:?}",
+                            arm
+                        )
+                    });
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(
+        checked, 42,
+        "expected 7 arms x 3 dtypes x 2 forms = 42 names, found {checked}"
+    );
+}
+
+/// The default arm resolves the name the tree shipped before this axis existed.
+///
+/// `DESIGN.md` §7.1a: a default is flipped by its own argued decision, and
+/// wiring an axis is not that argument. This pins the property in a test rather
+/// than leaving it to the end-to-end digest gate, because the digest cannot say
+/// WHICH name was resolved -- only that the answer came out the same.
+#[test]
+fn the_default_silu_arm_is_the_shipping_name() {
+    assert_eq!(crate::SiluImpl::default(), crate::SiluImpl::Exact);
+    assert_eq!(crate::silu_impl(), crate::SiluImpl::Exact);
+    assert_eq!(
+        crate::SiluImpl::Exact.contiguous_name(crate::SiluDType::F16),
+        "silu_f16"
+    );
+    assert_eq!(
+        crate::SiluImpl::Exact.strided_name(crate::SiluDType::F16),
+        "silu_f16_strided"
+    );
+    // The suffix is empty for `Exact` and non-empty for every other arm. That
+    // asymmetry is what makes the default resolve the pre-existing name rather
+    // than a renamed sibling, so it is asserted rather than assumed.
+    assert_eq!(crate::SiluImpl::Exact.suffix(), "");
+    for arm in crate::SiluImpl::ALL {
+        if arm != crate::SiluImpl::Exact {
+            assert!(!arm.suffix().is_empty(), "{arm:?} must carry a suffix");
+        }
+    }
+}
+
+/// Every arm round-trips through its CLI spelling.
+///
+/// The harnesses REFUSE an unrecognized `--silu-impl` rather than defaulting
+/// (§2.4: a silently-ignored flag makes a gate report on an arm it did not
+/// run), so `parse` returning `None` is load-bearing and is asserted here.
+#[test]
+fn silu_arm_names_round_trip() {
+    for arm in crate::SiluImpl::ALL {
+        assert_eq!(crate::SiluImpl::parse(arm.name()), Some(arm));
+    }
+    assert_eq!(crate::SiluImpl::parse("nosuchvariant"), None);
+    assert_eq!(crate::SiluImpl::parse(""), None);
+}

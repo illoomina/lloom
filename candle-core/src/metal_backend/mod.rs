@@ -889,9 +889,23 @@ impl BackendStorage for MetalStorage {
                 ("uround", DType::F16) => contiguous::round::HALF,
                 ("uround", DType::F32) => contiguous::round::FLOAT,
                 ("uround", DType::BF16) => contiguous::round::BFLOAT,
-                ("usilu", DType::F16) => contiguous::silu::HALF,
-                ("usilu", DType::F32) => contiguous::silu::FLOAT,
-                ("usilu", DType::BF16) => contiguous::silu::BFLOAT,
+                // The #599 variant axis. `SiluImpl::Exact` -- the default and
+                // what an unconfigured process gets -- returns exactly
+                // `silu_{dtype}`, the name these three arms always resolved, so
+                // the shipping path is byte-identical (`DESIGN.md` §7.1a).
+                // Selecting any other arm is what `set_silu_impl` is for.
+                ("usilu", DType::F16) => contiguous::Kernel(
+                    candle_metal_kernels::silu_impl()
+                        .contiguous_name(candle_metal_kernels::SiluDType::F16),
+                ),
+                ("usilu", DType::F32) => contiguous::Kernel(
+                    candle_metal_kernels::silu_impl()
+                        .contiguous_name(candle_metal_kernels::SiluDType::F32),
+                ),
+                ("usilu", DType::BF16) => contiguous::Kernel(
+                    candle_metal_kernels::silu_impl()
+                        .contiguous_name(candle_metal_kernels::SiluDType::BF16),
+                ),
                 ("usin", DType::F16) => contiguous::sin::HALF,
                 ("usin", DType::F32) => contiguous::sin::FLOAT,
                 ("usin", DType::BF16) => contiguous::sin::BFLOAT,
@@ -937,7 +951,11 @@ impl BackendStorage for MetalStorage {
                 ("ugelu", DType::F32) => strided::gelu::FLOAT,
                 ("ugelu_erf", DType::F32) => strided::gelu_erf::FLOAT,
                 ("uerf", DType::F32) => strided::erf::FLOAT,
-                ("usilu", DType::F32) => strided::silu::FLOAT,
+                // The #599 variant axis, as in the contiguous match above.
+                ("usilu", DType::F32) => strided::Kernel(
+                    candle_metal_kernels::silu_impl()
+                        .strided_name(candle_metal_kernels::SiluDType::F32),
+                ),
                 ("uabs", DType::F32) => strided::abs::FLOAT,
                 ("uceil", DType::F32) => strided::ceil::FLOAT,
                 ("ufloor", DType::F32) => strided::floor::FLOAT,
@@ -955,7 +973,10 @@ impl BackendStorage for MetalStorage {
                 ("ugelu", DType::F16) => strided::gelu::HALF,
                 ("ugelu_erf", DType::F16) => strided::gelu_erf::HALF,
                 ("uerf", DType::F16) => strided::erf::HALF,
-                ("usilu", DType::F16) => strided::silu::HALF,
+                ("usilu", DType::F16) => strided::Kernel(
+                    candle_metal_kernels::silu_impl()
+                        .strided_name(candle_metal_kernels::SiluDType::F16),
+                ),
                 ("uabs", DType::F16) => strided::abs::HALF,
                 ("uceil", DType::F16) => strided::ceil::HALF,
                 ("ufloor", DType::F16) => strided::floor::HALF,
@@ -973,7 +994,10 @@ impl BackendStorage for MetalStorage {
                 ("ugelu", DType::BF16) => strided::gelu::BFLOAT,
                 ("ugelu_erf", DType::BF16) => strided::gelu_erf::BFLOAT,
                 ("uerf", DType::BF16) => strided::erf::BFLOAT,
-                ("usilu", DType::BF16) => strided::silu::BFLOAT,
+                ("usilu", DType::BF16) => strided::Kernel(
+                    candle_metal_kernels::silu_impl()
+                        .strided_name(candle_metal_kernels::SiluDType::BF16),
+                ),
                 ("uabs", DType::BF16) => strided::abs::BFLOAT,
                 ("uceil", DType::BF16) => strided::ceil::BFLOAT,
                 ("ufloor", DType::BF16) => strided::floor::BFLOAT,

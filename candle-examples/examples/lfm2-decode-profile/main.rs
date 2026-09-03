@@ -1343,6 +1343,23 @@ impl Axes {
             // every run including the default `age`, since a run predating the
             // axis and a run at `age` are different facts (§9.2w).
             p("EvictionOrder", &Self::eviction_order_arm()),
+            // #599's SiLU variant axis (`DESIGN.md` §12.2l) — which of the
+            // seven implementations the 30 `usilu` dispatches per token
+            // resolve to.
+            //
+            // **Read back from `candle_metal_kernels::silu_impl()`**, the same
+            // process state `MetalStorage::unary_impl` consults when it picks a
+            // `[[host_name]]`, on `ReuseOversizeBound`'s reasoning exactly: a
+            // flag echoed to itself is §7.1a-i's present-and-wrong case, and a
+            // run that rendered an arm it did not take would compare EQUAL to
+            // every real run of that arm.
+            //
+            // Stated on every run including the default `exact`, for
+            // `BufferAlignment`'s reason: this axis did not exist before #599,
+            // so a run at `exact` and a run predating the axis are different
+            // facts, and only the first can be pooled with a future `exact`
+            // run.
+            p("SiluImpl", Self::silu_impl_arm()),
         ]
     }
 
@@ -1366,6 +1383,25 @@ impl Axes {
         {
             "n/a".to_string()
         }
+    }
+
+    /// The `SiluImpl` arm: which SiLU the `usilu` dispatches resolve to.
+    ///
+    /// The CLI spelling, which is also what `.bench/configurations.md` §1
+    /// declares — `exact`, `recip`, `literal`, `coarse4`, `coarse1`,
+    /// `hardswish`, `relu`. Taken from `SiluImpl::name()` rather than written
+    /// as a literal here, so the harness and the registry cannot disagree about
+    /// an arm's name the way `ReuseOversizeBound`'s float rendering did (#47).
+    #[cfg(feature = "metal")]
+    fn silu_impl_arm() -> &'static str {
+        candle_metal_kernels::silu_impl().name()
+    }
+
+    /// Without the Metal backend there is no SiLU kernel to select, so the axis
+    /// is honestly absent rather than defaulted to an arm nothing took.
+    #[cfg(not(feature = "metal"))]
+    fn silu_impl_arm() -> &'static str {
+        "UNRECORDED"
     }
 
     /// The `ReuseOversizeBound` arm: the ceiling `acquire` actually applies.
@@ -2052,6 +2088,17 @@ struct Args {
     /// failed at pipeline load without it. Moves the digests by construction.
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
+
+    /// Which SiLU implementation the 30 `usilu` dispatches resolve to
+    /// (#599, `DESIGN.md` §12.2l): `exact` | `recip` | `literal` | `coarse4` |
+    /// `coarse1` | `hardswish` | `relu`, in ascending error.
+    ///
+    /// **`exact` is the default and resolves the name that always shipped.**
+    /// Every arm but `exact` and `recip` moves `logits_sha256` by
+    /// construction — an approximation to SiLU computes different numbers, and
+    /// that is the axis rather than a defect.
+    #[arg(long, default_value = "exact")]
+    silu_impl: String,
 
     /// Decode steps recorded before the arena is installed.
     ///
@@ -2769,6 +2816,22 @@ fn main() -> Result<()> {
     // kernels), construction-tier like `AttnImpl` beside them.
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
+    // #599's SiLU arm. Refused rather than defaulted, for `--conv-state`'s
+    // reason: an unrecognized value silently pinning `exact` would render
+    // `SiluImpl=exact` on a RESULT line for a run the caller asked to be a
+    // variant, and that line would then pool with every real `exact` run
+    // (§2.4, §7.1a-i).
+    #[cfg(feature = "metal")]
+    {
+        let silu = candle_metal_kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
+                 `coarse1`, `hardswish`, `relu`, got `{}`",
+                args.silu_impl
+            )
+        })?;
+        candle_metal_kernels::set_silu_impl(silu);
+    }
     config.attn_impl = match args.attn.as_str() {
         "generic" => candle_transformers::models::lfm2::AttnImpl::Generic,
         "sdpa" => candle_transformers::models::lfm2::AttnImpl::Sdpa,

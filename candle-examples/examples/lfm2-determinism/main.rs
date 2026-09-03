@@ -367,6 +367,23 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
+    /// Which SiLU implementation the 30 `usilu` dispatches resolve to
+    /// (issue #599, `DESIGN.md` §12.2l).
+    ///
+    /// `exact` | `recip` | `literal` | `coarse4` | `coarse1` | `hardswish`,
+    /// in ascending error order. **`exact` is the default and resolves the
+    /// same `silu_f16` name it always did**, so an unconfigured run is
+    /// byte-identical (§7.1a).
+    ///
+    /// **Every arm but `exact` and `recip` MOVES THE DIGESTS by construction**
+    /// — that is what an approximation to SiLU does, and it is the point.
+    /// `recip` is the control: #604 measured it bit-identical, so an
+    /// unmoved digest there is the arm engaging correctly and a MOVED one is
+    /// a defect. Pair with `--force-tokens` and `--dump-logits` for §2.3.5a's
+    /// magnitude ladder, which is the quantity #599's absorption curve wants.
+    #[arg(long, default_value = "exact")]
+    silu_impl: String,
+
     /// How every kernel's scalars reach it: `split` (the default, one `setBytes`
     /// per scalar) or `packed` (one `device const Params*`, issue #115).
     ///
@@ -628,6 +645,21 @@ fn main() -> Result<()> {
 
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     println!("conv state: {:?}", config.conv_state);
+
+    // #599's SiLU arm. Refused rather than defaulted, for `--conv-state`'s
+    // reason: an unrecognized value silently pinning `exact` would report the
+    // shipping arm's digest under a variant's name, which is #69's vacuous run
+    // (§2.4). Printed whether or not it is `exact` — a digest is only
+    // interpretable against the arm it was taken in.
+    let silu = candle_metal_kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
+             `coarse1`, `hardswish`, got `{}`",
+            args.silu_impl
+        )
+    })?;
+    candle_metal_kernels::set_silu_impl(silu);
+    println!("silu impl: {}", silu.name());
 
     // The two GEMV epilogue fusions (#509's wiring of #484's and #509's
     // kernels). Printed whether or not they are set, because *inert* and

@@ -279,6 +279,22 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
+    /// Which SiLU implementation the 30 `usilu` dispatches resolve to
+    /// (issue #599, `DESIGN.md` §12.2l).
+    ///
+    /// `exact` | `recip` | `literal` | `coarse4` | `coarse1` | `hardswish`,
+    /// in ascending error order. **`exact` is the default and is what ships**
+    /// — it resolves the same `silu_f16` name it always did, so an
+    /// unconfigured run is byte-identical (§7.1a).
+    ///
+    /// This is the text half of #599's absorption question. A coarser arm
+    /// moves the digests by construction, so `lfm2-determinism` cannot say
+    /// whether the model still WORKS under it — only this harness can
+    /// (§2.3.8d: three identical digests of a model emitting
+    /// `picture picture picture`).
+    #[arg(long, default_value = "exact")]
+    silu_impl: String,
+
     /// Print each turn's prompt and completion. On by default; `--quiet`
     /// leaves only the verdict lines, for a scripted gate.
     #[arg(long)]
@@ -369,6 +385,22 @@ fn main() -> Result<()> {
 
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     println!("conv state: {:?}", config.conv_state);
+
+    // #599's SiLU arm. Refused rather than defaulted, for `--attn`'s reason: a
+    // silently-ignored flag makes this harness report the exact arm's text
+    // under a coarse arm's name, which is precisely the absorption question
+    // answered wrong. Printed whether or not it is `exact`, because *inert* and
+    // *unrecorded* are different facts (#241) and a PASS is only interpretable
+    // against the arm it was taken in.
+    let silu = candle_metal_kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
+             `coarse1`, `hardswish`, got `{}`",
+            args.silu_impl
+        )
+    })?;
+    candle_metal_kernels::set_silu_impl(silu);
+    println!("silu impl: {}", silu.name());
 
     // #509's wiring. Printed whether or not set: *inert* and *unrecorded* are
     // different facts (#241), and this harness's verdict is only interpretable

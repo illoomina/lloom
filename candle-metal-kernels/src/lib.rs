@@ -36,6 +36,11 @@ pub use kernels::params::{
     constants_pool, default_param_style, set_constants_pool_enabled, set_default_param_style,
     ConstantsPool, FlashCombineParams, FlashPartialParams,
 };
+// The SiLU variant axis (issue #599, `DESIGN.md` §12.2l). Named rather than
+// arriving through a glob for `set_default_param_style`'s reason: this is the
+// switch that decides which arithmetic 30 of the step's dispatches perform, and
+// `SiluImpl`'s own docs say why the choice lives here and not at the call sites.
+pub use kernels::unary::{set_silu_impl, silu_impl, SiluDType, SiluImpl};
 // The arena's GPU-side allocator vocabulary (`DESIGN.md` §9.2d, issue #70).
 // Named rather than arriving through a glob, because `ARENA_DECLINED` is a
 // cross-language constant -- `arena_alloc.metal` writes the same sentinel, and

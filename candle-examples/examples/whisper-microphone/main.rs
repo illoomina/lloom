@@ -6,7 +6,7 @@ extern crate intel_mkl_src;
 
 use anyhow::{Error as E, Result};
 use candle::{Device, IndexOp, Tensor};
-use lloom_engine::nn::{ops::softmax, VarBuilder};
+use lloom::nn::{ops::softmax, VarBuilder};
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use rand::{distr::Distribution, SeedableRng};
@@ -14,7 +14,7 @@ use tokenizers::Tokenizer;
 
 mod multilingual;
 
-use lloom_engine::models::whisper::{self as m, audio, Config};
+use lloom::models::whisper::{self as m, audio, Config};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -538,7 +538,7 @@ pub fn main() -> Result<()> {
     let config: Config = serde_json::from_str(&std::fs::read_to_string(config_filename)?)?;
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;
     let model = if args.quantized {
-        let vb = lloom_engine::quantized_var_builder::VarBuilder::from_gguf(
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
             &weights_filename,
             &device,
         )?;

@@ -46,13 +46,13 @@ extern crate accelerate_src;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use lloom_engine::nn::ops::FlashScratchSizing;
-use lloom_engine::nn::ops::KvQuant;
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::poll::PollMechanism;
-use lloom_engine::generation::token_ring::TokenRing;
-use lloom_engine::generation::{LogitsProcessor, Sampling};
-use lloom_engine::models::lfm2::{
+use lloom::nn::ops::FlashScratchSizing;
+use lloom::nn::ops::KvQuant;
+use lloom::nn::VarBuilder;
+use lloom::generation::poll::PollMechanism;
+use lloom::generation::token_ring::TokenRing;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{
     AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model,
 };
 use clap::Parser;
@@ -2236,7 +2236,7 @@ struct Args {
     ///
     /// Ignored under `--kv-append cat`, which has no capacity: it reallocates
     /// the whole cache every token (§6.2), which is the thing being measured.
-    #[arg(long, default_value_t = lloom_engine::models::lfm2::DEFAULT_KV_CAPACITY)]
+    #[arg(long, default_value_t = lloom::models::lfm2::DEFAULT_KV_CAPACITY)]
     kv_capacity: usize,
 
     /// Print a progress line to stderr every N decode tokens. 0 disables it.
@@ -2932,12 +2932,12 @@ fn main() -> Result<()> {
         candle::kernels::set_silu_impl(silu);
     }
     config.attn_impl = match args.attn.as_str() {
-        "generic" => lloom_engine::models::lfm2::AttnImpl::Generic,
-        "sdpa" => lloom_engine::models::lfm2::AttnImpl::Sdpa,
+        "generic" => lloom::models::lfm2::AttnImpl::Generic,
+        "sdpa" => lloom::models::lfm2::AttnImpl::Sdpa,
         // Issue #116. Selectable and never a default: 10.4's argument for it
         // is structural rather than measured, and the kv_len at which it pays
         // is #61's to find.
-        "flash" => lloom_engine::models::lfm2::AttnImpl::FlashDecoding,
+        "flash" => lloom::models::lfm2::AttnImpl::FlashDecoding,
         other => anyhow::bail!("--attn must be `generic`, `sdpa` or `flash`, got `{other}`"),
     };
     config.flash_page_size = args.flash_page_size;
@@ -2949,8 +2949,8 @@ fn main() -> Result<()> {
         FlashScratchSizing::parse(&args.flash_scratch_sizing).map_err(anyhow::Error::msg)?;
     // Refused rather than defaulted, for the same reason as `--attn`.
     config.kv_append = match args.kv_append.as_str() {
-        "cat" => lloom_engine::models::lfm2::KvAppend::Cat,
-        "in-place" => lloom_engine::models::lfm2::KvAppend::InPlace,
+        "cat" => lloom::models::lfm2::KvAppend::Cat,
+        "in-place" => lloom::models::lfm2::KvAppend::InPlace,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
 
@@ -3005,11 +3005,11 @@ fn main() -> Result<()> {
             .map(|t| {
                 matches!(
                     t,
-                    lloom_engine::models::lfm2::LayerType::FullAttention
+                    lloom::models::lfm2::LayerType::FullAttention
                 )
             })
             .collect();
-        let mut budget = lloom_engine::models::lfm2::MemoryBudget::new(
+        let mut budget = lloom::models::lfm2::MemoryBudget::new(
             language_weight_bytes(&config, &la, dtype.size_in_bytes()),
         );
         budget.batch = args.batch;
@@ -5218,7 +5218,7 @@ fn main() -> Result<()> {
     // §3.1c warns about: a zero that is indistinguishable from a path that
     // never ran. `poll_reads` is the counter for the arm that actually carried
     // the run, and the pair is what makes either readable.
-    let poll_reads = lloom_engine::generation::token_ring::poll_read_count();
+    let poll_reads = lloom::generation::token_ring::poll_read_count();
     // Read back from the device rather than from the flag (§7.1a-i), and at a
     // different height from `peek_hit` rather than a duplicate of it:
     // `peek_hit` counts reads that skipped a wait, this counts waits that were

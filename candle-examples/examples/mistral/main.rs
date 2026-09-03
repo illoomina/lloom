@@ -7,13 +7,13 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use lloom_engine::models::mistral::{Config, Model as Mistral};
-use lloom_engine::models::quantized_mistral::Model as QMistral;
+use lloom::models::mistral::{Config, Model as Mistral};
+use lloom::models::quantized_mistral::Model as QMistral;
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -106,7 +106,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                lloom_engine::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],
@@ -321,7 +321,7 @@ fn main() -> Result<()> {
     let (model, device) = if args.quantized {
         let filename = &filenames[0];
         let vb =
-            lloom_engine::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
+            lloom::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
         let model = QMistral::new(&config, vb)?;
         (Model::Quantized(model), device)
     } else {

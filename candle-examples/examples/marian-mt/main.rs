@@ -9,8 +9,8 @@ use clap::{Parser, ValueEnum};
 
 use candle::{DType, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::models::marian;
+use lloom::nn::VarBuilder;
+use lloom::models::marian;
 
 use tokenizers::Tokenizer;
 
@@ -192,7 +192,7 @@ pub fn main() -> anyhow::Result<()> {
     let mut model = marian::MTModel::new(&config, vb)?;
 
     let mut logits_processor =
-        lloom_engine::generation::LogitsProcessor::new(1337, None, None);
+        lloom::generation::LogitsProcessor::new(1337, None, None);
 
     let encoder_xs = {
         let mut tokens = tokenizer

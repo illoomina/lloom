@@ -4,11 +4,11 @@ extern crate accelerate_src;
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
-use lloom_engine::models::{clip, flux, t5};
+use lloom::models::{clip, flux, t5};
 
 use anyhow::{Error as E, Result};
 use candle::{IndexOp, Module, Tensor};
-use lloom_engine::nn::VarBuilder;
+use lloom::nn::VarBuilder;
 use clap::Parser;
 use tokenizers::Tokenizer;
 
@@ -192,7 +192,7 @@ fn run(args: Args) -> Result<()> {
                             .get("flux1-schnell.gguf")?,
                         Model::Dev => todo!(),
                     };
-                    let vb = lloom_engine::quantized_var_builder::VarBuilder::from_gguf(
+                    let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
                         model_file, &device,
                     )?;
 

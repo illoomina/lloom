@@ -15,13 +15,13 @@ candle = { workspace = true }
 # PARKED (RESTRUCTURING §7.1 downstream-consumer decision, surfaced in the PR):
 # candle-datasets and candle-onnx consume candle-nn/candle-transformers, which no
 # longer exist under those names after the merge. They are excluded peripheral
-# consumers until the owner decides whether to repoint them at lloom-engine; the
+# consumers until the owner decides whether to repoint them at lloom; the
 # examples that need them (mnist-training, llama2-c, onnx*) are parked below with
 # them. Off by default, never part of the lfm2 gate.
 # candle-datasets = { workspace = true, optional = true }
-# candle-nn + candle-transformers merged into lloom-engine (RESTRUCTURING §7.1);
-# nn is reached as `lloom_engine::nn::`, the zoo as `lloom_engine::models::`.
-lloom-engine = { workspace = true }
+# candle-nn + candle-transformers merged into lloom (RESTRUCTURING §7.1);
+# nn is reached as `lloom::nn::`, the zoo as `lloom::models::`.
+lloom = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
 # candle-onnx = { workspace = true, optional = true }  # PARKED — see above
 # candle-metal-kernels merged into lloom-tensor's `kernels` module (RESTRUCTURING
@@ -91,23 +91,23 @@ default = []
 accelerate = [
     "dep:accelerate-src",
     "candle/accelerate",
-    "lloom-engine/accelerate",
+    "lloom/accelerate",
 ]
 cuda = [
     "candle/cuda",
-    "lloom-engine/cuda",
+    "lloom/cuda",
     "dep:cudaforge",
 ]
-cudnn = ["candle/cudnn", "lloom-engine/cudnn"]
-flash-attn = ["cuda", "lloom-engine/flash-attn", "dep:candle-flash-attn"]
+cudnn = ["candle/cudnn", "lloom/cudnn"]
+flash-attn = ["cuda", "lloom/flash-attn", "dep:candle-flash-attn"]
 mkl = [
     "dep:intel-mkl-src",
     "candle/mkl",
-    "lloom-engine/mkl",
+    "lloom/mkl",
 ]
 nccl = ["cuda", "cudarc/nccl", "dep:half"]
 # onnx = ["candle-onnx"]  # PARKED — candle-onnx consumes candle-nn (RESTRUCTURING §7.1)
-# `lloom-engine/metal` is here because a model may carry Metal-only
+# `lloom/metal` is here because a model may carry Metal-only
 # behaviour, and without it that behaviour silently compiles to its non-Metal
 # stub in every example. `lfm2::Cache::admit_memory_budget` (§9.5l) is the case
 # that found it: the check is `#[cfg(feature = "metal")]`, so every harness was
@@ -116,13 +116,13 @@ nccl = ["cuda", "cudarc/nccl", "dep:half"]
 # **Pre-existing, and invisible because nothing in `candle-transformers` was
 # gated on `metal` before** -- an unused feature flag reads exactly like a
 # correct one. Note the line below already propagates
-# `lloom-engine/metal-debug-labels`, which is what makes the omission
+# `lloom/metal-debug-labels`, which is what makes the omission
 # here an oversight rather than a decision.
 metal = [
     "candle/metal",
-    "lloom-engine/metal",
+    "lloom/metal",
 ]
-metal-debug-labels = ["metal", "candle/metal-debug-labels", "lloom-engine/metal-debug-labels"]
+metal-debug-labels = ["metal", "candle/metal-debug-labels", "lloom/metal-debug-labels"]
 # Strict ordering verification (#185, `DESIGN.md` §11.3t), reachable from a
 # harness because this line exists -- #205's defect below, avoided rather than
 # repeated.

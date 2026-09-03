@@ -6,8 +6,8 @@ extern crate accelerate_src;
 
 use anyhow::Result;
 use candle::{DType, IndexOp, Tensor};
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::models::mimi::{Config, Model};
+use lloom::nn::VarBuilder;
+use lloom::models::mimi::{Config, Model};
 use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::Api;
 

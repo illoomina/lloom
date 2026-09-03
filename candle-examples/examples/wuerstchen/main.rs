@@ -4,8 +4,8 @@ extern crate accelerate_src;
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
-use lloom_engine::models::stable_diffusion;
-use lloom_engine::models::wuerstchen;
+use lloom::models::stable_diffusion;
+use lloom::models::wuerstchen;
 
 use anyhow::{Error as E, Result};
 use candle::{DType, Device, IndexOp, Tensor};
@@ -277,7 +277,7 @@ fn run(args: Args) -> Result<()> {
         let prior = {
             let file = ModelFile::Prior.get(prior_weights)?;
             let vb = unsafe {
-                lloom_engine::nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)?
+                lloom::nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)?
             };
             wuerstchen::prior::WPrior::new(
                 /* c_in */ PRIOR_CIN,
@@ -314,7 +314,7 @@ fn run(args: Args) -> Result<()> {
     let vqgan = {
         let file = ModelFile::VqGan.get(vqgan_weights)?;
         let vb = unsafe {
-            lloom_engine::nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)?
+            lloom::nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)?
         };
         wuerstchen::paella_vq::PaellaVQ::new(vb)?
     };
@@ -325,7 +325,7 @@ fn run(args: Args) -> Result<()> {
     let decoder = {
         let file = ModelFile::Decoder.get(decoder_weights)?;
         let vb = unsafe {
-            lloom_engine::nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)?
+            lloom::nn::VarBuilder::from_mmaped_safetensors(&[file], DType::F32, &device)?
         };
         wuerstchen::diffnext::WDiffNeXt::new(
             /* c_in */ DECODER_CIN,

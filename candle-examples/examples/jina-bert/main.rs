@@ -4,11 +4,11 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use lloom_engine::models::jina_bert::{BertModel, Config, PositionEmbeddingType};
+use lloom::models::jina_bert::{BertModel, Config, PositionEmbeddingType};
 
 use anyhow::Error as E;
 use candle::{DType, Module, Tensor};
-use lloom_engine::nn::VarBuilder;
+use lloom::nn::VarBuilder;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -72,7 +72,7 @@ impl Args {
             12,
             12,
             3072,
-            lloom_engine::nn::Activation::Gelu,
+            lloom::nn::Activation::Gelu,
             8192,
             2,
             0.02,

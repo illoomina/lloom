@@ -7,12 +7,12 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use lloom_engine::models::pixtral::{vision_model, Config, Model};
+use lloom::models::pixtral::{vision_model, Config, Model};
 
 use candle::{DType, Device, Module, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
+use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -127,7 +127,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                lloom_engine::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],

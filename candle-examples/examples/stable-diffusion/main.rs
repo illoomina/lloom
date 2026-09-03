@@ -4,7 +4,7 @@ extern crate accelerate_src;
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
-use lloom_engine::models::stable_diffusion;
+use lloom::models::stable_diffusion;
 use std::ops::Div;
 
 use anyhow::{Error as E, Result};

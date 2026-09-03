@@ -7,14 +7,14 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use lloom_engine::models::gemma::{Config as Config1, Model as Model1};
-use lloom_engine::models::gemma2::{Config as Config2, Model as Model2};
-use lloom_engine::models::gemma3::{Config as Config3, Model as Model3};
+use lloom::models::gemma::{Config as Config1, Model as Model1};
+use lloom::models::gemma2::{Config as Config2, Model as Model2};
+use lloom::models::gemma3::{Config as Config3, Model as Model3};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
+use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -147,7 +147,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                lloom_engine::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],

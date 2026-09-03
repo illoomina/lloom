@@ -37,9 +37,9 @@ extern crate accelerate_src;
 
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::{LogitsProcessor, Sampling};
-use lloom_engine::models::lfm2::{
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{
     AttnImpl, Cache, ConvState, KvAppend, Model,
 };
 use candle_examples::lfm2_setup::{

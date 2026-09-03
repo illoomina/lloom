@@ -8,8 +8,8 @@ mod model;
 use model::{Multiples, YoloV8, YoloV8Pose};
 
 use candle::{DType, Device, IndexOp, Result, Tensor};
-use lloom_engine::nn::{Module, VarBuilder};
-use lloom_engine::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
+use lloom::nn::{Module, VarBuilder};
+use lloom::object_detection::{non_maximum_suppression, Bbox, KeyPoint};
 use clap::{Parser, ValueEnum};
 use image::DynamicImage;
 

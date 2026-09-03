@@ -1,8 +1,8 @@
 use anyhow::{Ok, Result};
 use candle::{DType, IndexOp, Tensor};
 
-use lloom_engine::models::flux;
-use lloom_engine::models::mmdit::model::MMDiT;
+use lloom::models::flux;
+use lloom::models::mmdit::model::MMDiT;
 
 pub struct SkipLayerGuidanceConfig {
     pub scale: f64,

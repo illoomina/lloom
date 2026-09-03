@@ -8,14 +8,14 @@ use anyhow::{Error as E, Result};
 use clap::{Parser, ValueEnum};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use lloom_engine::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
-use lloom_engine::models::phi::{Config as PhiConfig, Model as Phi};
-use lloom_engine::models::phi3::{Config as Phi3Config, Model as Phi3};
-use lloom_engine::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
+use lloom::models::mixformer::{Config, MixFormerSequentialForCausalLM as MixFormer};
+use lloom::models::phi::{Config as PhiConfig, Model as Phi};
+use lloom::models::phi3::{Config as Phi3Config, Model as Phi3};
+use lloom::models::quantized_mixformer::MixFormerSequentialForCausalLM as QMixFormer;
 
 use candle::{DType, Device, IndexOp, Tensor};
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
+use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -103,7 +103,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                lloom_engine::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],
@@ -355,7 +355,7 @@ fn main() -> Result<()> {
     let device = candle_examples::device(args.cpu)?;
     let model = if args.quantized {
         let config = config();
-        let vb = lloom_engine::quantized_var_builder::VarBuilder::from_gguf(
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
             &filenames[0],
             &device,
         )?;

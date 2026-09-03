@@ -1,5 +1,5 @@
 [package]
-name = "lloom-engine"
+name = "lloom"
 version.workspace = true
 edition.workspace = true
 description.workspace = true

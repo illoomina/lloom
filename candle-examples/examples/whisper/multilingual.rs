@@ -127,7 +127,7 @@ pub fn detect_language(
     let ys = model.decoder_forward(&tokens, &audio_features, true)?;
     let logits = model.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
     let logits = logits.index_select(&language_token_ids, 0)?;
-    let probs = lloom_engine::nn::ops::softmax(&logits, D::Minus1)?;
+    let probs = lloom::nn::ops::softmax(&logits, D::Minus1)?;
     let probs = probs.to_vec1::<f32>()?;
     let mut probs = LANGUAGES.iter().zip(probs.iter()).collect::<Vec<_>>();
     probs.sort_by(|(_, p1), (_, p2)| p2.total_cmp(p1));

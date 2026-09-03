@@ -59,10 +59,10 @@ use anyhow::{Context, Result};
 use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use lloom_engine::nn::ops::KvQuant;
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::{LogitsProcessor, Sampling};
-use lloom_engine::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
+use lloom::nn::ops::KvQuant;
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
 use clap::Parser;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -640,7 +640,7 @@ fn main() -> Result<()> {
     // reason as `--attn`: a silently-ignored flag makes a gate report on an arm
     // it did not run (§2.4).
     config.flash_scratch_sizing =
-        lloom_engine::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
+        lloom::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
             .map_err(anyhow::Error::msg)?;
     println!("attention implementation: {:?}", config.attn_impl);
     // Refused rather than defaulted, for the same reason as `--attn`: an
@@ -1283,7 +1283,7 @@ fn main() -> Result<()> {
                     let reservations = if args.session_region {
                         dev.arena_recording_session_reservations(
                             kv_len,
-                            lloom_engine::models::lfm2::DEFAULT_KV_CAPACITY,
+                            lloom::models::lfm2::DEFAULT_KV_CAPACITY,
                         )
                     } else {
                         None

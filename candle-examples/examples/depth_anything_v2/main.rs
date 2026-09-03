@@ -12,9 +12,9 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 use candle::DType::{F32, U8};
 use candle::{DType, Device, Module, Result, Tensor};
 use candle_examples::{load_image, load_image_and_resize, save_image};
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::models::depth_anything_v2::{DepthAnythingV2, DepthAnythingV2Config};
-use lloom_engine::models::dinov2;
+use lloom::nn::VarBuilder;
+use lloom::models::depth_anything_v2::{DepthAnythingV2, DepthAnythingV2Config};
+use lloom::models::dinov2;
 
 use crate::color_map::SpectralRColormap;
 

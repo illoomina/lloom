@@ -5,8 +5,8 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use candle::{DType, Device, Tensor};
-use lloom_engine::nn as nn;
-use lloom_engine::models::chinese_clip::{ChineseClipConfig, ChineseClipModel};
+use lloom::nn as nn;
+use lloom::models::chinese_clip::{ChineseClipConfig, ChineseClipModel};
 use clap::Parser;
 use tokenizers::Tokenizer;
 

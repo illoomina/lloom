@@ -3,7 +3,7 @@ mod sampling;
 mod vae;
 
 use candle::{DType, IndexOp, Tensor};
-use lloom_engine::models::mmdit::model::{Config as MMDiTConfig, MMDiT};
+use lloom::models::mmdit::model::{Config as MMDiTConfig, MMDiT};
 
 use crate::clip::StableDiffusion3TripleClipWithTokenizer;
 use crate::vae::{build_sd3_vae_autoencoder, sd3_vae_vb_rename};
@@ -186,7 +186,7 @@ fn main() -> Result<()> {
             &device,
         )?;
         let vb = unsafe {
-            lloom_engine::nn::VarBuilder::from_mmaped_safetensors(&[model_file], DType::F16, &device)?
+            lloom::nn::VarBuilder::from_mmaped_safetensors(&[model_file], DType::F16, &device)?
         };
         match which {
             Which::V3_5Large => (MMDiTConfig::sd3_5_large(), triple, vb),
@@ -201,7 +201,7 @@ fn main() -> Result<()> {
         };
         let model_file = sai_repo.get("sd3_medium_incl_clips_t5xxlfp16.safetensors")?;
         let vb = unsafe {
-            lloom_engine::nn::VarBuilder::from_mmaped_safetensors(&[&model_file], DType::F16, &device)?
+            lloom::nn::VarBuilder::from_mmaped_safetensors(&[&model_file], DType::F16, &device)?
         };
         let triple = StableDiffusion3TripleClipWithTokenizer::new(vb.pp("text_encoders"))?;
         (MMDiTConfig::sd3_medium(), triple, vb)

@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};
 use candle::{Device, Tensor};
-use lloom_engine::nn::ops::softmax;
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::models::xlm_roberta::{
+use lloom::nn::ops::softmax;
+use lloom::nn::VarBuilder;
+use lloom::models::xlm_roberta::{
     Config, XLMRobertaForMaskedLM, XLMRobertaForSequenceClassification,
 };
 use clap::{Parser, ValueEnum};
@@ -204,7 +204,7 @@ fn main() -> Result<()> {
             let model = XLMRobertaForSequenceClassification::new(1, &config, vb)?;
 
             let output = model.forward(&input_ids, &attention_mask, &token_type_ids)?;
-            let output = lloom_engine::nn::ops::sigmoid(&output)?.t().unwrap();
+            let output = lloom::nn::ops::sigmoid(&output)?.t().unwrap();
             let ranks = output
                 .arg_sort_last_dim(false)?
                 .to_vec2::<u32>()?

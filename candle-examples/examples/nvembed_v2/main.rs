@@ -6,8 +6,8 @@ extern crate accelerate_src;
 
 use anyhow::{Error as E, Result};
 use candle::{DType, IndexOp, Shape, Tensor, D};
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::models::nvembed_v2::model::Model;
+use lloom::nn::VarBuilder;
+use lloom::models::nvembed_v2::model::Model;
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingDirection, PaddingParams, Tokenizer, TruncationParams};

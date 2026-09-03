@@ -37,10 +37,10 @@
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::{LogitsProcessor, Sampling};
-use lloom_engine::models::lfm2::{Cache, Model};
-use lloom_engine::models::lfm2_vl::{
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{Cache, Model};
+use lloom::models::lfm2_vl::{
     merge_image_features, ImageProcessor, Lfm2VlConfig, VisionEncoder,
 };
 use clap::Parser;
@@ -492,7 +492,7 @@ fn generate_with_image(
     model: &Model,
     encoder: &VisionEncoder,
     cfg: &Lfm2VlConfig,
-    config: &lloom_engine::models::lfm2::Config,
+    config: &lloom::models::lfm2::Config,
     tokenizer: &tokenizers::Tokenizer,
     eos_ids: &[u32],
     vision_runs: &mut usize,

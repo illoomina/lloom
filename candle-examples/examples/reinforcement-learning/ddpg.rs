@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use candle::{DType, Device, Error, Module, Result, Tensor, Var};
-use lloom_engine::nn::{
+use lloom::nn::{
     func, linear, sequential::seq, Activation, AdamW, Optimizer, ParamsAdamW, Sequential,
     VarBuilder, VarMap,
 };

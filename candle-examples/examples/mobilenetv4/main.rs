@@ -7,8 +7,8 @@ extern crate accelerate_src;
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, IndexOp, D};
-use lloom_engine::nn::{Module, VarBuilder};
-use lloom_engine::models::mobilenetv4;
+use lloom::nn::{Module, VarBuilder};
+use lloom::models::mobilenetv4;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Which {
@@ -91,7 +91,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = mobilenetv4::mobilenetv4(&args.which.config(), 1000, vb)?;
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = lloom_engine::nn::ops::softmax(&logits, D::Minus1)?
+    let prs = lloom::nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

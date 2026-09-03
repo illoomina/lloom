@@ -109,10 +109,10 @@ extern crate accelerate_src;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use lloom_engine::nn::ops::KvQuant;
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::{LogitsProcessor, Sampling};
-use lloom_engine::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
+use lloom::nn::ops::KvQuant;
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
 use clap::Parser;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -369,7 +369,7 @@ fn main() -> Result<()> {
     // reason as `--attn`: a silently-ignored flag makes a gate report on an arm
     // it did not run (§2.4).
     config.flash_scratch_sizing =
-        lloom_engine::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
+        lloom::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
             .map_err(anyhow::Error::msg)?;
     // Refused rather than defaulted, for the same reason as `--attn` above.
     config.kv_append = match args.kv_append.as_str() {

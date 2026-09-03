@@ -1,9 +1,9 @@
 use candle::{DType, Device, Result, Tensor, D};
-use lloom_engine::nn::{
+use lloom::nn::{
     embedding, layer_norm, linear_no_bias, Activation, Embedding, LayerNorm, Linear, Module,
     VarBuilder,
 };
-use lloom_engine::models::{encodec, t5};
+use lloom::models::{encodec, t5};
 
 // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/models/musicgen/configuration_musicgen.py#L83
 #[derive(Debug, Clone, PartialEq)]
@@ -187,7 +187,7 @@ impl MusicgenAttention {
         let attn_weights = attn_weights
             .reshape((b_sz, self.num_heads, tgt_len, src_len))?
             .broadcast_add(attention_mask)?;
-        let attn_weights = lloom_engine::nn::ops::softmax(&attn_weights, D::Minus1)?;
+        let attn_weights = lloom::nn::ops::softmax(&attn_weights, D::Minus1)?;
         // TODO: layer_head_mask?
         let attn_output = attn_weights
             .matmul(&value_states)?

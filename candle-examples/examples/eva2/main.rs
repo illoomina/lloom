@@ -10,8 +10,8 @@ extern crate accelerate_src;
 use clap::Parser;
 
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
-use lloom_engine::nn::{Module, VarBuilder};
-use lloom_engine::models::eva2;
+use lloom::nn::{Module, VarBuilder};
+use lloom::models::eva2;
 
 /// Loads an image from disk using the image crate, this returns a tensor with shape
 /// (3, 448, 448). OpenAI normalization is applied.
@@ -66,7 +66,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = eva2::vit_base(vb)?;
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = lloom_engine::nn::ops::softmax(&logits, D::Minus1)?
+    let prs = lloom::nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

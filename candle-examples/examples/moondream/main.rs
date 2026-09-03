@@ -8,8 +8,8 @@ use anyhow::{Error as E, Result};
 use clap::Parser;
 
 use candle::{DType, Device, Tensor};
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::{
+use lloom::nn::VarBuilder;
+use lloom::{
     generation::LogitsProcessor,
     models::{moondream, quantized_moondream},
 };
@@ -114,7 +114,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                lloom_engine::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],
@@ -306,7 +306,7 @@ async fn main() -> anyhow::Result<()> {
         DType::F32
     };
     let model = if args.quantized {
-        let vb = lloom_engine::quantized_var_builder::VarBuilder::from_gguf(
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
             &model_file,
             &device,
         )?;

@@ -57,9 +57,9 @@ extern crate accelerate_src;
 use anyhow::{bail, Context, Result};
 use candle::{DType, Device, IndexOp, Tensor, D};
 use candle_examples::lfm2_setup::{parse_config, weight_files};
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::models::lfm2::{Cache, Model};
-use lloom_engine::models::lfm2_dspark::{
+use lloom::nn::VarBuilder;
+use lloom::models::lfm2::{Cache, Model};
+use lloom::models::lfm2_dspark::{
     drafter_params, DSparkConfig, DSparkDrafter, CHECKPOINT_DTYPE,
 };
 use clap::Parser;

@@ -7,12 +7,12 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use lloom_engine::models::mpt::{Config, Model as M};
-use lloom_engine::models::quantized_mpt::Model as Q;
+use lloom::models::mpt::{Config, Model as M};
+use lloom::models::quantized_mpt::Model as Q;
 
 use candle::{DType, Device, Tensor};
-use lloom_engine::nn::VarBuilder;
-use lloom_engine::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
+use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -97,7 +97,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                lloom_engine::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],
@@ -240,7 +240,7 @@ fn main() -> Result<()> {
     let config = Config::replit_code_v1_5_3b();
     let model = if args.quantized {
         let vb =
-            lloom_engine::quantized_var_builder::VarBuilder::from_gguf(&filename, &device)?;
+            lloom::quantized_var_builder::VarBuilder::from_gguf(&filename, &device)?;
         Model::Q(Q::new(&config, vb.pp("transformer"))?)
     } else {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[filename], DType::F32, &device)? };

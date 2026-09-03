@@ -1,19 +1,19 @@
 [workspace]
 members = [
     "lloom-tensor",
-    "lloom-engine",
+    "lloom",
     "candle-examples",
     "candle-ug",
     "candle-wasm-tests",
     "tensor-tools",
 ]
 # RESTRUCTURING §7.1: the engine is the two-crate floor (lloom-tensor +
-# lloom-engine). The crates below consume candle-nn/candle-transformers, which no
+# lloom). The crates below consume candle-nn/candle-transformers, which no
 # longer exist under those names after the merge; they are peripheral consumers,
 # not the engine, and none builds in the default gate on this metal-only machine
 # (pyo3 needs a Python extension toolchain, the wasm examples need the wasm
 # target). They are kept in-tree for the breadth CI (§7.4) but moved out of the
-# default workspace until they are repointed at lloom-engine (see the PR's
+# default workspace until they are repointed at lloom (see the PR's
 # "what was NOT done" — the downstream-consumer decision is surfaced for the
 # owner, §6). candle-book/flash-attn/flash-attn-v3/kernels/onnx were already
 # excluded upstream.
@@ -44,7 +44,7 @@ accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 lloom-tensor = { path = "./lloom-tensor", version = "0.11.0" }
-lloom-engine = { path = "./lloom-engine", version = "0.11.0" }
+lloom = { path = "./lloom", version = "0.11.0" }
 # Transitional alias: candle-examples/candle-ug/candle-wasm-tests/tensor-tools
 # still name `candle::` (the tensor layer). Kept resolving to lloom-tensor so
 # those crates build unchanged; the engine crates now name `lloom_tensor::`

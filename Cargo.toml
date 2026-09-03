@@ -2,6 +2,7 @@
 members = [
     "lloom-tensor",
     "lloom",
+    "lloom-engine",
     "lloom-macros",
     "candle-examples",
     "candle-ug",
@@ -46,6 +47,9 @@ anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
 lloom-tensor = { path = "./lloom-tensor", version = "0.11.0" }
 lloom = { path = "./lloom", version = "0.11.0" }
+# The serving engine (RESTRUCTURING §4, §7.1): decode loop + request seam over
+# lloom's tier-1 API. Consumed by amber; consumes lloom, never the reverse.
+lloom-engine = { path = "./lloom-engine", version = "0.11.0" }
 # The engine's derive macros (RESTRUCTURING §1.6): #[derive(Config)] emits the
 # clap flags and the within-crate `AXES` distributed-slice contributions.
 lloom-macros = { path = "./lloom-macros", version = "0.11.0" }

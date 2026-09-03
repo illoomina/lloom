@@ -500,6 +500,38 @@ impl VisionEncoder {
     }
 }
 
+/// The config `VisionEncoder` is constructed from through the `Model` trait.
+///
+/// It pairs the VL config with the text model's hidden size, because the tower
+/// projects into the language model's embedding space and that width is a
+/// property of the *text* config (`text_config.hidden_size`), not the vision
+/// one. `VisionEncoder::new` has always taken it as a separate argument; the
+/// trait wants a single `Config`, so this carries both.
+#[derive(Debug, Clone)]
+pub struct VisionEncoderConfig {
+    pub vl: Lfm2VlConfig,
+    pub text_hidden_size: usize,
+}
+
+impl crate::nn::Model for VisionEncoder {
+    type Config = VisionEncoderConfig;
+
+    fn from_weights(vb: VarBuilder, cfg: &Self::Config) -> Result<Self> {
+        VisionEncoder::new(&cfg.vl, cfg.text_hidden_size, vb)
+    }
+}
+
+impl crate::nn::VisionEncoder for VisionEncoder {
+    type Input = ProcessedImage;
+
+    /// Wires to the inherent `forward`; the host stage `ProcessedImage` carries
+    /// the `(patches, rows, cols)` the tower reads. No computation is added — the
+    /// §5.12 staged-reference gate belongs to `forward` and is unmoved by this.
+    fn encode(&self, input: &Self::Input) -> Result<Tensor> {
+        self.forward(&input.patches, input.rows, input.cols)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host-side preprocessing.
 // ---------------------------------------------------------------------------
@@ -797,5 +829,23 @@ mod tests {
             );
             assert!(rows >= 1 && cols >= 1);
         }
+    }
+
+    /// The trait impls are reachable through their bounds. Like `lfm2.rs`'s
+    /// keystone test (§3.1c), this proves the callable-through-the-trait property
+    /// without a forward pass: the function only compiles if `VisionEncoder`
+    /// satisfies `crate::nn::Model` and `crate::nn::VisionEncoder` with the
+    /// associated types lined up. The numeric behaviour is the §5.12 gate's, run
+    /// against the real checkpoint by `lfm2-vl --gate`.
+    #[allow(dead_code)]
+    fn trait_bounds_hold<E>()
+    where
+        E: crate::nn::VisionEncoder<Config = VisionEncoderConfig, Input = ProcessedImage>,
+    {
+    }
+
+    #[test]
+    fn vision_encoder_satisfies_the_domain_trait() {
+        trait_bounds_hold::<VisionEncoder>();
     }
 }

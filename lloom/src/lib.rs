@@ -6,6 +6,7 @@ pub mod nn;
 
 pub mod fused_moe;
 pub mod generation;
+pub mod hub;
 pub mod models;
 pub mod object_detection;
 pub mod pipelines;

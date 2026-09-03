@@ -103,3 +103,28 @@ pub trait Speculative: CausalLM {
     /// discarding the rest.
     fn resolve(cache: &mut Self::Cache, window: Self::Window, n: usize) -> Result<()>;
 }
+
+/// A vision tower that encodes one host-preprocessed image to rows in the
+/// language model's embedding space.
+///
+/// A domain trait added because its one impl exists (`RESTRUCTURING_DESIGN.md`
+/// §3.2, §5): `lfm2_vl::VisionEncoder`. It composes with `CausalLM` through
+/// `embed`/`forward_embeds` rather than through a second entry point — the host
+/// merges the encoded rows into the residual stream at the image-token positions
+/// before the prefill, so nothing here runs on the per-token path.
+///
+/// `Input` is the host stage, not raw pixels: patchification, resizing and
+/// normalisation happen on the CPU (`ProcessedImage`), so `encode` takes an
+/// already-patchified `[1, n_patches, C*P*P]` sequence with its `(rows, cols)`.
+/// The result is `[n_image_tokens, text_hidden]` — one row per image token, in
+/// the text model's hidden size, ready for the host-side merge.
+///
+/// The trait shares its name with `lfm2_vl::VisionEncoder`, the concrete tower
+/// it is first implemented for; §5 names both, and they sit in different modules.
+pub trait VisionEncoder: Model {
+    /// The host-preprocessed image this tower consumes.
+    type Input;
+
+    /// Encode one image to `[n_image_tokens, text_hidden]`.
+    fn encode(&self, input: &Self::Input) -> Result<Tensor>;
+}

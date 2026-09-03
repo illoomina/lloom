@@ -10,6 +10,10 @@ pub mod axes;
 
 pub mod fused_moe;
 pub mod generation;
+// The hub module downloads checkpoints (hf-hub) and owns the tokenizer
+// (tokenizers), neither of which compiles to wasm32; a browser loads bytes and
+// tokenizes in JS (#656). Host-only.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod hub;
 pub mod models;
 pub mod object_detection;

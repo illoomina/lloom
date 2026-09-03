@@ -1,0 +1,5 @@
+# wasm-bindgen generated bindings — regenerated from the .wasm by `make`.
+www/pkg/
+# build output
+target/
+Cargo.lock

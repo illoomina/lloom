@@ -15,6 +15,11 @@
 //! reads the [manifest](write_manifest) this module emits rather than depending
 //! on this crate (`lloom-runs` is candle-free by construction).
 
+// linkme's distributed_slice is not implemented for wasm32-unknown-unknown. The
+// axis registry is a host-side facility (harness flags, the lloom-runs mirror
+// test) and is never read in a browser forward pass, so on wasm AXES degrades to
+// an empty slice and the #[derive(Config)] macro emits no contributions (#656).
+#[cfg(not(target_arch = "wasm32"))]
 use linkme::distributed_slice;
 
 /// One configuration axis, contributed by a `#[axis]`-tagged field.
@@ -40,8 +45,15 @@ pub struct AxisMeta {
 /// is a total view of the engine's configuration surface — the thing the mirror
 /// test reconciles against `lloom-runs`' `REGISTRY` and `.bench/configurations.md`
 /// §1.
+#[cfg(not(target_arch = "wasm32"))]
 #[distributed_slice]
 pub static AXES: [AxisMeta];
+
+/// On wasm32 linkme is unavailable, so the registry is empty. Nothing on the
+/// browser forward path reads it; the harness/mirror-test consumers are
+/// host-only (#656).
+#[cfg(target_arch = "wasm32")]
+pub static AXES: [AxisMeta; 0] = [];
 
 /// Every axis name in [`AXES`], sorted and deduplicated.
 ///

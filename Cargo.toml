@@ -23,6 +23,11 @@ exclude = [
     "candle-datasets",
     "candle-pyo3",
     "candle-wasm-examples",
+    # The #656 browser-runner spike: wasm32-only, its own workspace root. Its
+    # wasm deps (getrandom js backends, wasm-bindgen) must not enter the
+    # metal-only default resolve. Build it with `--target wasm32-unknown-unknown`
+    # from lloom-wasm/ (see its README).
+    "lloom-wasm",
     "candle-book",
     "candle-flash-attn",
     "candle-flash-attn-v3",

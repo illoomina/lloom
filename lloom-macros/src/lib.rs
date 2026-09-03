@@ -179,7 +179,10 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
         let default = &attr.default;
         let variants = &attr.variants;
         let _ = ident;
+        // linkme has no wasm32 backend; on wasm the AXES slice is empty and gets
+        // no contributions (the registry is host-only, #656).
         quote! {
+            #[cfg(not(target_arch = "wasm32"))]
             #[::linkme::distributed_slice(crate::axes::AXES)]
             static #static_ident: crate::axes::AxisMeta = crate::axes::AxisMeta {
                 name: #name,

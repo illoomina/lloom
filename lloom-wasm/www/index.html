@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>lloom browser-runner spike (#656)</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, monospace; margin: 2rem; max-width: 60rem; }
+  pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; }
+  button { font: inherit; padding: .4rem .8rem; margin-right: .5rem; }
+  .ok { color: #0a0; } .err { color: #a00; }
+</style>
+</head>
+<body>
+<h1>lloom &rarr; wasm32 &middot; CPU backend &middot; Web Worker</h1>
+<p>The engine runs in a Web Worker. Click <b>Run smoke</b>: it computes a fixed
+matmul+softmax on the CPU backend and prints the byte-exact fingerprint. Compare
+it against the native CPU reference (see <code>make reference</code>).</p>
+
+<button id="info">Build info</button>
+<button id="smoke">Run smoke</button>
+<button id="kill">worker.terminate()</button>
+<pre id="out">idle.</pre>
+
+<script type="module">
+const out = document.getElementById("out");
+let worker = new Worker("./worker.js", { type: "module" });
+function log(s, cls) { out.innerHTML = (cls ? `<span class="${cls}">${s}</span>` : s); }
+
+worker.onmessage = (ev) => {
+  const d = ev.data;
+  if (!d.ok) { log("ERROR: " + d.error, "err"); window.__SMOKE__ = { error: d.error }; return; }
+  if (d.cmd === "smoke") {
+    log(`smoke OK (${d.ms.toFixed(2)} ms in worker)\n\n${JSON.stringify(JSON.parse(d.result), null, 2)}`, "ok");
+    // Expose for headless automation (the #656 oracle check reads this).
+    const parsed = JSON.parse(d.result);
+    window.__SMOKE__ = { ms: d.ms, warm_median_ms: d.warm_median_ms, ...parsed };
+    document.title = "SMOKE:" + parsed.fingerprint;
+    console.log("SMOKE_RESULT " + d.result + " cold_ms=" + d.ms.toFixed(3) + " warm_median_ms=" + (d.warm_median_ms ?? -1).toFixed(4));
+  } else {
+    log(`${d.cmd} OK\n\n${JSON.stringify(JSON.parse(d.result), null, 2)}`, "ok");
+    console.log("INFO_RESULT " + d.result);
+  }
+};
+
+// Auto-run on load so a headless driver needs no interaction (#656 step 3/4).
+window.addEventListener("load", () => {
+  worker.postMessage({ cmd: "build_info" });
+  setTimeout(() => worker.postMessage({ cmd: "smoke" }), 200);
+});
+worker.onerror = (e) => log("worker error: " + e.message, "err");
+
+document.getElementById("info").onclick  = () => worker.postMessage({ cmd: "build_info" });
+document.getElementById("smoke").onclick = () => worker.postMessage({ cmd: "smoke" });
+document.getElementById("kill").onclick  = () => {
+  worker.terminate();
+  worker = new Worker("./worker.js", { type: "module" });
+  worker.onmessage = arguments.callee; // rebind not needed; page reload is simplest
+  log("worker terminated (interrupt story). Reload to respawn.", "err");
+};
+</script>
+</body>
+</html>

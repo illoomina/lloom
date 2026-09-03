@@ -109,10 +109,10 @@ extern crate accelerate_src;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use candle_nn::ops::KvQuant;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
+use lloom_engine::nn::ops::KvQuant;
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::generation::{LogitsProcessor, Sampling};
+use lloom_engine::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
 use clap::Parser;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -369,7 +369,7 @@ fn main() -> Result<()> {
     // reason as `--attn`: a silently-ignored flag makes a gate report on an arm
     // it did not run (§2.4).
     config.flash_scratch_sizing =
-        candle_nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
+        lloom_engine::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
             .map_err(anyhow::Error::msg)?;
     // Refused rather than defaulted, for the same reason as `--attn` above.
     config.kv_append = match args.kv_append.as_str() {
@@ -392,14 +392,14 @@ fn main() -> Result<()> {
     // answered wrong. Printed whether or not it is `exact`, because *inert* and
     // *unrecorded* are different facts (#241) and a PASS is only interpretable
     // against the arm it was taken in.
-    let silu = candle_metal_kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
+    let silu = candle::kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
         anyhow::anyhow!(
             "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
              `coarse1`, `hardswish`, got `{}`",
             args.silu_impl
         )
     })?;
-    candle_metal_kernels::set_silu_impl(silu);
+    candle::kernels::set_silu_impl(silu);
     println!("silu impl: {}", silu.name());
 
     // #509's wiring. Printed whether or not set: *inert* and *unrecorded* are

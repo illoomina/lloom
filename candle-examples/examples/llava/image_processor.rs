@@ -1,7 +1,7 @@
 use std::cmp::min;
 
 use candle::{bail, DType, Device, Result, Tensor};
-use candle_transformers::models::llava::{
+use lloom_engine::models::llava::{
     config::{HFPreProcessorConfig, LLaVAConfig},
     utils::select_best_resolution,
 };

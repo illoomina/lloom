@@ -4,11 +4,11 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle_transformers::models::nomic_bert::{self, Config, NomicBertModel};
+use lloom_engine::models::nomic_bert::{self, Config, NomicBertModel};
 
 use anyhow::{bail, Error as E, Result};
 use candle::{DType, Tensor};
-use candle_nn::VarBuilder;
+use lloom_engine::nn::VarBuilder;
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer};

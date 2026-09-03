@@ -46,13 +46,13 @@ extern crate accelerate_src;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use candle_nn::ops::FlashScratchSizing;
-use candle_nn::ops::KvQuant;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::poll::PollMechanism;
-use candle_transformers::generation::token_ring::TokenRing;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{
+use lloom_engine::nn::ops::FlashScratchSizing;
+use lloom_engine::nn::ops::KvQuant;
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::generation::poll::PollMechanism;
+use lloom_engine::generation::token_ring::TokenRing;
+use lloom_engine::generation::{LogitsProcessor, Sampling};
+use lloom_engine::models::lfm2::{
     AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model,
 };
 use clap::Parser;
@@ -202,7 +202,7 @@ fn flush_run_telemetry(args: &Args, rt_written: &mut usize) -> Result<()> {
     let Some(path) = args.run_telemetry_jsonl.as_ref() else {
         return Ok(());
     };
-    use candle_metal_kernels::metal::run_telemetry as rt;
+    use candle::kernels::metal::run_telemetry as rt;
     let run_id = args.run_id.clone().unwrap_or_else(|| "lfm2".to_string());
     let body = rt::to_jsonl(&run_id);
     *rt_written = body.len();
@@ -455,7 +455,7 @@ impl MemProbe {
     /// figure the PR states rather than hides.
     #[cfg(feature = "metal")]
     fn emit_telemetry(&self, kv_bytes_per_token: u64) {
-        use candle_metal_kernels::metal::run_telemetry as rt;
+        use candle::kernels::metal::run_telemetry as rt;
 
         rt::set_token(self.token);
         rt::sample(
@@ -1373,7 +1373,7 @@ impl Axes {
             // seven implementations the 30 `usilu` dispatches per token
             // resolve to.
             //
-            // **Read back from `candle_metal_kernels::silu_impl()`**, the same
+            // **Read back from `candle::kernels::silu_impl()`**, the same
             // process state `MetalStorage::unary_impl` consults when it picks a
             // `[[host_name]]`, on `ReuseOversizeBound`'s reasoning exactly: a
             // flag echoed to itself is §7.1a-i's present-and-wrong case, and a
@@ -1451,7 +1451,7 @@ impl Axes {
     fn eviction_order_arm() -> String {
         #[cfg(feature = "metal")]
         {
-            candle_metal_kernels::metal::buffer_pool::eviction_order()
+            candle::kernels::metal::buffer_pool::eviction_order()
                 .as_str()
                 .to_string()
         }
@@ -1470,7 +1470,7 @@ impl Axes {
     /// an arm's name the way `ReuseOversizeBound`'s float rendering did (#47).
     #[cfg(feature = "metal")]
     fn silu_impl_arm() -> &'static str {
-        candle_metal_kernels::silu_impl().name()
+        candle::kernels::silu_impl().name()
     }
 
     /// Without the Metal backend there is no SiLU kernel to select, so the axis
@@ -1506,7 +1506,7 @@ impl Axes {
     fn reuse_oversize_bound_arm() -> String {
         #[cfg(feature = "metal")]
         {
-            match candle_metal_kernels::metal::buffer_pool::reuse_oversize_bound() {
+            match candle::kernels::metal::buffer_pool::reuse_oversize_bound() {
                 Some(v) => format!("{v:.1}"),
                 None => "off".to_string(),
             }
@@ -1543,7 +1543,7 @@ impl Axes {
     fn metal_cflags_arm() -> String {
         #[cfg(feature = "metal")]
         {
-            candle_metal_kernels::metal_compile_flags()
+            candle::kernels::metal_compile_flags()
                 .map(|f| f.to_string())
                 .unwrap_or_else(|| "none".to_string())
         }
@@ -1561,7 +1561,7 @@ impl Axes {
     fn merged_unit_arm() -> &'static str {
         #[cfg(feature = "metal")]
         {
-            if candle_metal_kernels::merged_translation_unit() {
+            if candle::kernels::merged_translation_unit() {
                 "on"
             } else {
                 "off"
@@ -2236,7 +2236,7 @@ struct Args {
     ///
     /// Ignored under `--kv-append cat`, which has no capacity: it reallocates
     /// the whole cache every token (§6.2), which is the thing being measured.
-    #[arg(long, default_value_t = candle_transformers::models::lfm2::DEFAULT_KV_CAPACITY)]
+    #[arg(long, default_value_t = lloom_engine::models::lfm2::DEFAULT_KV_CAPACITY)]
     kv_capacity: usize,
 
     /// Print a progress line to stderr every N decode tokens. 0 disables it.
@@ -2922,22 +2922,22 @@ fn main() -> Result<()> {
     // (§2.4, §7.1a-i).
     #[cfg(feature = "metal")]
     {
-        let silu = candle_metal_kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
+        let silu = candle::kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
             anyhow::anyhow!(
                 "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
                  `coarse1`, `hardswish`, `relu`, got `{}`",
                 args.silu_impl
             )
         })?;
-        candle_metal_kernels::set_silu_impl(silu);
+        candle::kernels::set_silu_impl(silu);
     }
     config.attn_impl = match args.attn.as_str() {
-        "generic" => candle_transformers::models::lfm2::AttnImpl::Generic,
-        "sdpa" => candle_transformers::models::lfm2::AttnImpl::Sdpa,
+        "generic" => lloom_engine::models::lfm2::AttnImpl::Generic,
+        "sdpa" => lloom_engine::models::lfm2::AttnImpl::Sdpa,
         // Issue #116. Selectable and never a default: 10.4's argument for it
         // is structural rather than measured, and the kv_len at which it pays
         // is #61's to find.
-        "flash" => candle_transformers::models::lfm2::AttnImpl::FlashDecoding,
+        "flash" => lloom_engine::models::lfm2::AttnImpl::FlashDecoding,
         other => anyhow::bail!("--attn must be `generic`, `sdpa` or `flash`, got `{other}`"),
     };
     config.flash_page_size = args.flash_page_size;
@@ -2949,8 +2949,8 @@ fn main() -> Result<()> {
         FlashScratchSizing::parse(&args.flash_scratch_sizing).map_err(anyhow::Error::msg)?;
     // Refused rather than defaulted, for the same reason as `--attn`.
     config.kv_append = match args.kv_append.as_str() {
-        "cat" => candle_transformers::models::lfm2::KvAppend::Cat,
-        "in-place" => candle_transformers::models::lfm2::KvAppend::InPlace,
+        "cat" => lloom_engine::models::lfm2::KvAppend::Cat,
+        "in-place" => lloom_engine::models::lfm2::KvAppend::InPlace,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
 
@@ -3005,11 +3005,11 @@ fn main() -> Result<()> {
             .map(|t| {
                 matches!(
                     t,
-                    candle_transformers::models::lfm2::LayerType::FullAttention
+                    lloom_engine::models::lfm2::LayerType::FullAttention
                 )
             })
             .collect();
-        let mut budget = candle_transformers::models::lfm2::MemoryBudget::new(
+        let mut budget = lloom_engine::models::lfm2::MemoryBudget::new(
             language_weight_bytes(&config, &la, dtype.size_in_bytes()),
         );
         budget.batch = args.batch;
@@ -3049,7 +3049,7 @@ fn main() -> Result<()> {
     // of the run is the other half, and it is checked before the file is
     // written.
     if args.run_telemetry_jsonl.is_some() {
-        if !candle_metal_kernels::metal::run_telemetry::compiled() {
+        if !candle::kernels::metal::run_telemetry::compiled() {
             anyhow::bail!(
                 "--run-telemetry-jsonl needs the `metal-run-telemetry` feature, and this \
                  binary was built without it.\n  \
@@ -3060,7 +3060,7 @@ fn main() -> Result<()> {
                  so no harness could enable it at all.)"
             );
         }
-        candle_metal_kernels::metal::run_telemetry::set_enabled(true);
+        candle::kernels::metal::run_telemetry::set_enabled(true);
     }
 
     let sampling = if args.temperature <= 0. {
@@ -4348,7 +4348,7 @@ fn main() -> Result<()> {
     // -- the discrimination §2.4 requires after #69's determinism arm consumed
     // its own `OnceLock` and reported a passing digest for the unchanged path.
     if args.run_telemetry_jsonl.is_some() {
-        use candle_metal_kernels::metal::run_telemetry as rt;
+        use candle::kernels::metal::run_telemetry as rt;
         let accepted = rt::accepted();
         anyhow::ensure!(
             rt::engaged(),
@@ -5218,7 +5218,7 @@ fn main() -> Result<()> {
     // §3.1c warns about: a zero that is indistinguishable from a path that
     // never ran. `poll_reads` is the counter for the arm that actually carried
     // the run, and the pair is what makes either readable.
-    let poll_reads = candle_transformers::generation::token_ring::poll_read_count();
+    let poll_reads = lloom_engine::generation::token_ring::poll_read_count();
     // Read back from the device rather than from the flag (§7.1a-i), and at a
     // different height from `peek_hit` rather than a duplicate of it:
     // `peek_hit` counts reads that skipped a wait, this counts waits that were

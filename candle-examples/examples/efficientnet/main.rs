@@ -9,8 +9,8 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use candle::{DType, IndexOp, D};
-use candle_nn::{Module, VarBuilder};
-use candle_transformers::models::efficientnet::{EfficientNet, MBConvConfig};
+use lloom_engine::nn::{Module, VarBuilder};
+use lloom_engine::models::efficientnet::{EfficientNet, MBConvConfig};
 use clap::{Parser, ValueEnum};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -82,7 +82,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = EfficientNet::new(vb, cfg, candle_examples::imagenet::CLASS_COUNT as usize)?;
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = candle_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = lloom_engine::nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

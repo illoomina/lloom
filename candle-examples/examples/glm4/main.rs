@@ -1,8 +1,8 @@
 use candle::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::glm4::{Config as ConfigOld, EosTokenId, Model as ModelOld};
-use candle_transformers::models::glm4_new::{Config as ConfigNew, ModelForCausalLM as ModelNew};
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::generation::LogitsProcessor;
+use lloom_engine::models::glm4::{Config as ConfigOld, EosTokenId, Model as ModelOld};
+use lloom_engine::models::glm4_new::{Config as ConfigNew, ModelForCausalLM as ModelNew};
 
 use clap::Parser;
 use hf_hub::{Repo, RepoType};
@@ -102,7 +102,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(args.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom_engine::utils::apply_repeat_penalty(
                     &logits,
                     args.repeat_penalty,
                     &tokens[start_at..],

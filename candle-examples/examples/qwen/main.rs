@@ -7,15 +7,15 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use candle_transformers::models::qwen2::{Config as ConfigBase, ModelForCausalLM as ModelBase};
-use candle_transformers::models::qwen2_moe::{Config as ConfigMoe, Model as ModelMoe};
-use candle_transformers::models::qwen3::{Config as Config3, ModelForCausalLM as Model3};
-use candle_transformers::models::qwen3_moe::{Config as ConfigMoe3, ModelForCausalLM as ModelMoe3};
+use lloom_engine::models::qwen2::{Config as ConfigBase, ModelForCausalLM as ModelBase};
+use lloom_engine::models::qwen2_moe::{Config as ConfigMoe, Model as ModelMoe};
+use lloom_engine::models::qwen3::{Config as Config3, ModelForCausalLM as Model3};
+use lloom_engine::models::qwen3_moe::{Config as ConfigMoe3, ModelForCausalLM as ModelMoe3};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -107,7 +107,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom_engine::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],

@@ -8,8 +8,8 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use candle::DType;
-use candle_nn::VarBuilder;
-use candle_transformers::models::segment_anything::sam;
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::models::segment_anything::sam;
 use clap::Parser;
 
 #[derive(Parser)]

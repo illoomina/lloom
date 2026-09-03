@@ -69,9 +69,9 @@ extern crate accelerate_src;
 use anyhow::{bail, Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{parse_config, weight_files};
-use candle_nn::VarBuilder;
-use candle_transformers::models::lfm2::{Cache, Model};
-use candle_transformers::models::lfm2_dspark::{DSparkProjection, CHECKPOINT_DTYPE};
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::models::lfm2::{Cache, Model};
+use lloom_engine::models::lfm2_dspark::{DSparkProjection, CHECKPOINT_DTYPE};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 

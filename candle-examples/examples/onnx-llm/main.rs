@@ -6,7 +6,7 @@ extern crate accelerate_src;
 
 use anyhow::Result;
 use candle::{DType, Tensor};
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use lloom_engine::generation::{LogitsProcessor, Sampling};
 use clap::{Parser, ValueEnum};
 use hf_hub::api::sync::Api;
 use serde::Deserialize;

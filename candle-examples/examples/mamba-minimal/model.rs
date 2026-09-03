@@ -2,9 +2,9 @@
 /// https://github.com/johnma2006/mamba-minimal/blob/master/model.py
 /// Simple, minimal implementation of Mamba in one file of PyTorch.
 use candle::{IndexOp, Module, Result, Tensor, D};
-use candle_nn::{RmsNorm, VarBuilder};
+use lloom_engine::nn::{RmsNorm, VarBuilder};
 
-use candle_transformers::models::with_tracing::{linear, linear_no_bias, Linear};
+use lloom_engine::models::with_tracing::{linear, linear_no_bias, Linear};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Config {
@@ -41,7 +41,7 @@ impl Config {
 #[derive(Clone, Debug)]
 pub struct MambaBlock {
     in_proj: Linear,
-    conv1d: candle_nn::Conv1d,
+    conv1d: lloom_engine::nn::Conv1d,
     x_proj: Linear,
     dt_proj: Linear,
     a_log: Tensor,
@@ -57,12 +57,12 @@ impl MambaBlock {
         let d_state = cfg.d_state();
         let dt_rank = cfg.dt_rank();
         let in_proj = linear_no_bias(cfg.d_model, d_inner * 2, vb.pp("in_proj"))?;
-        let conv_cfg = candle_nn::Conv1dConfig {
+        let conv_cfg = lloom_engine::nn::Conv1dConfig {
             groups: d_inner,
             padding: d_conv - 1,
             ..Default::default()
         };
-        let conv1d = candle_nn::conv1d(d_inner, d_inner, d_conv, conv_cfg, vb.pp("conv1d"))?;
+        let conv1d = lloom_engine::nn::conv1d(d_inner, d_inner, d_conv, conv_cfg, vb.pp("conv1d"))?;
         let x_proj = linear_no_bias(d_inner, dt_rank + d_state * 2, vb.pp("x_proj"))?;
         let dt_proj = linear(dt_rank, d_inner, vb.pp("dt_proj"))?;
         let a_log = vb.get((d_inner, d_state), "A_log")?;
@@ -134,8 +134,8 @@ impl Module for MambaBlock {
             .apply(&self.conv1d)?
             .narrow(D::Minus1, 0, seq_len)?
             .t()?;
-        let xs = candle_nn::ops::silu(&xs)?;
-        let ys = (self.ssm(&xs)? * candle_nn::ops::silu(res))?;
+        let xs = lloom_engine::nn::ops::silu(&xs)?;
+        let ys = (self.ssm(&xs)? * lloom_engine::nn::ops::silu(res))?;
         ys.apply(&self.out_proj)
     }
 }
@@ -149,7 +149,7 @@ pub struct ResidualBlock {
 
 impl ResidualBlock {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let norm = candle_nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm"))?;
+        let norm = lloom_engine::nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm"))?;
         let mixer = MambaBlock::new(cfg, vb.pp("mixer"))?;
         Ok(Self { mixer, norm })
     }
@@ -164,7 +164,7 @@ impl Module for ResidualBlock {
 // https://github.com/johnma2006/mamba-minimal/blob/61f01953ca153f8c4a850d7111beecbf4be9cee1/model.py#L56
 #[derive(Clone, Debug)]
 pub struct Model {
-    embedding: candle_nn::Embedding,
+    embedding: lloom_engine::nn::Embedding,
     layers: Vec<ResidualBlock>,
     norm_f: RmsNorm,
     lm_head: Linear,
@@ -172,14 +172,14 @@ pub struct Model {
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let embedding = candle_nn::embedding(cfg.vocab_size(), cfg.d_model, vb.pp("embedding"))?;
+        let embedding = lloom_engine::nn::embedding(cfg.vocab_size(), cfg.d_model, vb.pp("embedding"))?;
         let mut layers = Vec::with_capacity(cfg.n_layer);
         let vb_l = vb.pp("layers");
         for layer_idx in 0..cfg.n_layer {
             let layer = ResidualBlock::new(cfg, vb_l.pp(layer_idx))?;
             layers.push(layer)
         }
-        let norm_f = candle_nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm_f"))?;
+        let norm_f = lloom_engine::nn::rms_norm(cfg.d_model, 1e-5, vb.pp("norm_f"))?;
         let lm_head = Linear::from_weights(embedding.embeddings().clone(), None);
         Ok(Self {
             embedding,

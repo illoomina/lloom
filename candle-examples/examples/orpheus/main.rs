@@ -8,9 +8,9 @@ use anyhow::{Error as E, Result};
 use clap::Parser;
 
 use candle::{DType, Device, IndexOp, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::llama::{Cache, Llama, LlamaConfig};
-use candle_transformers::models::snac::{Config as SnacConfig, Model as SnacModel};
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::models::llama::{Cache, Llama, LlamaConfig};
+use lloom_engine::models::snac::{Config as SnacConfig, Model as SnacModel};
 use tokenizers::Tokenizer;
 
 // https://github.com/canopyai/Orpheus-TTS/blob/df0b0d96685dd21885aef7f900ee7f705c669e94/realtime_streaming_example/main.py#L43
@@ -148,7 +148,7 @@ fn main() -> Result<()> {
 struct Model {
     model: Llama,
     tokenizer: Tokenizer,
-    logits_processor: candle_transformers::generation::LogitsProcessor,
+    logits_processor: lloom_engine::generation::LogitsProcessor,
     cache: Cache,
     device: Device,
     verbose_prompt: bool,
@@ -215,7 +215,7 @@ impl Model {
         let config = config.into_config(args.use_flash_attn);
         let model = Llama::load(vb, &config)?;
         let logits_processor = {
-            use candle_transformers::generation::{LogitsProcessor, Sampling};
+            use lloom_engine::generation::{LogitsProcessor, Sampling};
             let temperature = args.temperature;
             let sampling = if temperature <= 0. {
                 Sampling::ArgMax

@@ -33,7 +33,7 @@
 //! collapsing it is step 3's work and not a byte-identical move.
 
 use candle::{Error, Result};
-use candle_transformers::models::lfm2::{Config, Lfm2Config};
+use lloom_engine::models::lfm2::{Config, Lfm2Config};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 

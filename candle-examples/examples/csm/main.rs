@@ -7,10 +7,10 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use candle_transformers::models::csm::{Config, Model};
+use lloom_engine::models::csm::{Config, Model};
 
 use candle::{DType, IndexOp, Tensor};
-use candle_nn::VarBuilder;
+use lloom_engine::nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -177,7 +177,7 @@ fn main() -> Result<()> {
         (model, device)
     };
     let mut mimi_model = {
-        use candle_transformers::models::mimi;
+        use lloom_engine::models::mimi;
         let vb =
             unsafe { VarBuilder::from_mmaped_safetensors(&[mimi_filename], DType::F32, &device)? };
         let config = mimi::Config::v0_1(Some(32));
@@ -188,7 +188,7 @@ fn main() -> Result<()> {
     println!("loaded the model in {:?}", start.elapsed());
 
     let voices = candle::safetensors::load(args.voices, &device)?;
-    let mut lp = candle_transformers::generation::LogitsProcessor::new(
+    let mut lp = lloom_engine::generation::LogitsProcessor::new(
         args.seed,
         Some(args.temperature),
         None,

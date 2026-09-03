@@ -60,11 +60,11 @@ mod sha256;
 
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::poll::PollMechanism;
-use candle_transformers::generation::token_ring::TokenRing;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::generation::poll::PollMechanism;
+use lloom_engine::generation::token_ring::TokenRing;
+use lloom_engine::generation::{LogitsProcessor, Sampling};
+use lloom_engine::models::lfm2::{
     AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model,
 };
 use clap::Parser;
@@ -464,7 +464,7 @@ fn on_off(v: bool) -> String {
 fn metal_cflags_arm() -> String {
     #[cfg(feature = "metal")]
     {
-        candle_metal_kernels::metal_compile_flags()
+        candle::kernels::metal_compile_flags()
             .map(|f| f.to_string())
             .unwrap_or_else(|| "none".to_string())
     }
@@ -482,7 +482,7 @@ fn metal_cflags_arm() -> String {
 fn merged_unit_arm() -> &'static str {
     #[cfg(feature = "metal")]
     {
-        if candle_metal_kernels::merged_translation_unit() {
+        if candle::kernels::merged_translation_unit() {
             "on"
         } else {
             "off"
@@ -1342,7 +1342,7 @@ fn main() -> Result<()> {
     let (peek_hit, peek_unmapped) = (0u64, 0u64);
     // See the `peek arms` line below: #578's fast path moves neither counter
     // above, so this is the one that says the poll ran.
-    let poll_reads = candle_transformers::generation::token_ring::poll_read_count();
+    let poll_reads = lloom_engine::generation::token_ring::poll_read_count();
 
     // #559's completion arm, **read back from the device rather than from the
     // flag** (§7.1a-i), and its engagement pair beside it. `(0, 0)` under an

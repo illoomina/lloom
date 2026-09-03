@@ -1,0 +1,1696 @@
+use crate::{DType, Result};
+
+#[cfg(feature = "ug")]
+use crate::kernels::metal::ComputePipeline;
+use crate::kernels::{
+    metal::{
+        session_region::{RegionCounters, RegionPlan},
+        Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout, ArenaOffsets, ArenaRecorder,
+        BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, MTLResourceOptions,
+        PoolCounters, PoolOccupancySnapshot, PooledBuffer, ResidencySet, SessionRegion, StepPlan,
+    },
+    Kernels,
+};
+use objc2_foundation::NSURL;
+use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
+
+use super::MetalError;
+
+/// Unique identifier for metal devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DeviceId(usize);
+
+impl DeviceId {
+    pub(crate) fn new() -> Self {
+        // https://users.rust-lang.org/t/idiomatic-rust-way-to-generate-unique-id/33805
+        use std::sync::atomic;
+        static COUNTER: atomic::AtomicUsize = atomic::AtomicUsize::new(1);
+        Self(COUNTER.fetch_add(1, atomic::Ordering::Relaxed))
+    }
+}
+
+/// Runs the residency-set teardown when the **last** [`MetalDevice`] handle
+/// drops (`DESIGN.md` §6.3c, issue #163).
+///
+/// # Why this is a separate type rather than `impl Drop for MetalDevice`
+///
+/// `MetalDevice` is `Clone` and every field is shared, so every `Tensor` holds a
+/// clone through its `MetalStorage`. A `Drop` written on `MetalDevice` itself
+/// would therefore fire on **every tensor drop** -- hundreds of times per decode
+/// token -- and each firing would wait for the GPU. That is not a teardown
+/// guard, it is a synchronize on the hot path, and §11.2's 6.1 % non-GPU budget
+/// makes it a regression rather than a subtlety.
+///
+/// Holding the guard behind an `Arc` moves the trigger to the instant the last
+/// handle goes, which is what the panic log shows actually happening:
+/// `main+5200` -> `drop_in_place<MetalDevice>` -> `Arc::drop_slow`, on the main
+/// thread past the `RESULT` line.
+///
+/// # Why it is declared first
+///
+/// Fields drop in declaration order, and this must run **before** `commands`,
+/// `buffers` and `private_buffers` -- the pools are what free the `MTLBuffer`s
+/// the set still lists, and removing an object that is already gone is what
+/// `IOGPUGroupMemory::remove_memory_object()` aborts the machine over. The
+/// original defect *is* a declaration-order property, so the fix has to be one
+/// too.
+pub(crate) struct DeviceTeardown {
+    commands: Arc<Commands>,
+    residency_set: Arc<ResidencySet>,
+}
+
+/// Unregisters an evicted buffer from the residency set, so Metal releases the
+/// allocation the pool has just destroyed (`DESIGN.md` §6.3c, §6.3e).
+///
+/// The pool bounds its free list by **destroying** buffers whose size will not
+/// be asked for again (§6.3b), which is a second place a buffer's existence
+/// ends -- and unlike a trim, nothing was telling the residency set about it.
+///
+/// # Why this calls `removeAllocation` as of #210, having retired the key before
+///
+/// #166 retired the membership key **without** the Metal call, on a measurement:
+/// eager unregistration cost **+0.062 ms/token even batched** against §11.2's
+/// whole 6.1 % non-GPU budget, and the residual was named *"a retention, not a
+/// dangling reference"*. Both halves were right. **What was never asked is what
+/// the retention weighs**, and the answer is **48 GB** (§6.3e, #206): the
+/// pricing was taken at §6.3b's **11.6 evictions per token**, and under
+/// `KvAppend=Cat` at long context the rate is **~220 per token**, at which the
+/// shipping default exhausts a 64 GB device at 97 % of
+/// `recommendedMaxWorkingSetSize`.
+///
+/// **The structural fact that decides the shape, and it is read from this file
+/// rather than argued.** §6.3e offers three: eager always, eager above a
+/// retention threshold, or a sweep folded into the per-command-buffer
+/// completion handler. **The first and the third are the same code.**
+/// `on_evict` is reached only from `PoolInner::drain_completed`, which is
+/// subscribed to `Commands::on_command_buffer_complete` -- so every
+/// steady-state eviction **already runs inside** that handler, once per command
+/// buffer, batched over everything it freed. There is no third site to fold
+/// anything into and no sweep to add; `evict_over_budget`'s only other caller is
+/// `set_free_budget`, which is setup-time.
+///
+/// **And the commit is not additional in the sense the cost argument assumed.**
+/// `ResidencySet::insert` is one buffer and one `commit()`, called from every
+/// pool miss -- so a residency commit is *already* on the per-token path at the
+/// allocation rate, and what a batched eager release adds is **one more per
+/// eviction round**, not one per evicted buffer. §6.3e's *"the `commit()` may
+/// not be additional"* is right about the mechanism and located it in the wrong
+/// place: it is the *allocation* commit that was already there.
+///
+/// **The threshold shape is rejected on evidence rather than on taste.** It
+/// needs a retention figure nobody has measured a threshold against, and §9.1a
+/// is the worked case of what that costs -- three policies, all built, none
+/// chosen, because the separating axis was never exercised. A threshold here
+/// would also be a knob whose wrong setting reproduces exactly this defect
+/// silently, where the unconditional form has no setting to get wrong.
+///
+/// # The measurement that put it here
+///
+/// #166's figures, which stand and are the bar this had to beat:
+///
+/// ```text
+///   baseline                                        0.928  0.936  0.932
+///   unregister eagerly, one call per buffer         1.009  1.016  1.050   +0.087
+///   unregister eagerly, one call per batch          0.993  0.998  0.993   +0.062
+///   retire the key, remove at teardown              0.941  0.928  0.945    +0.00
+/// ```
+///
+/// **A per-allocation Metal call is forbidden and this is not one** (§9.5e's
+/// premise, from #167's own ablation: *accounting is cheap, calling into Metal
+/// is not*). The call is per eviction **round**, batched by
+/// `BufferEvictionObserver::on_evict`'s contract, which exists for exactly this
+/// reason -- #166 measured the per-buffer form at +0.087 and the batched form at
+/// +0.062, and the difference between them is the commit count.
+pub(crate) struct ResidencyEvictionObserver {
+    residency_set: Arc<ResidencySet>,
+}
+
+impl ResidencyEvictionObserver {
+    pub(crate) fn new(residency_set: Arc<ResidencySet>) -> Self {
+        Self { residency_set }
+    }
+}
+
+impl crate::kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver {
+    fn on_evict(&self, buffers: &[Buffer]) {
+        // One Metal call per eviction ROUND, never per buffer: `on_evict` is
+        // handed everything one round destroys, and `remove_batch` issues one
+        // `commit()` for the lot.
+        //
+        // Both arms stay selectable (§12.3, §7.1a): `retire_batch` is the arm
+        // #166's +0.062 ms was measured on, so a re-measurement has something to
+        // measure against, and an operator hitting an unforeseen cost can get
+        // the old behaviour back without a rebuild. The old arm's failure mode
+        // is now documented rather than latent -- it is an unbounded retention,
+        // not a safe deferral.
+        if retain_evicted_allocations() {
+            self.residency_set.retire_batch(buffers.iter());
+        } else {
+            self.residency_set.remove_batch(buffers.iter());
+        }
+    }
+}
+
+/// Whether an evicted buffer's allocation is **retained** by Metal rather than
+/// released (`DESIGN.md` §6.3d's behaviour, superseded by §6.3e/#210).
+///
+/// `false` is what ships: eviction unregisters. Setting
+/// `CANDLE_METAL_RETAIN_EVICTED=1` restores the pre-#210 arm, which is the one
+/// §6.3d priced and the one that reaches **48 GB of retention** at long context
+/// under `KvAppend=Cat` -- so it is a measurement arm and an escape hatch, not a
+/// tuning knob.
+///
+/// Read once: a per-eviction `var()` would put an environment lookup on the
+/// decode path, which is the shape §6.4a prices.
+fn retain_evicted_allocations() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        // `CANDLE_METAL_EAGER_RESIDENCY_RELEASE=0` is #206's probe spelled the
+        // other way round, and it selected the arm that is now the default.
+        // Honoured so an existing script that pins the arm explicitly still
+        // selects the arm it names rather than silently getting the new default
+        // -- an A/B whose arms both moved is worse than one that fails.
+        if let Ok(v) = std::env::var("CANDLE_METAL_EAGER_RESIDENCY_RELEASE") {
+            return !(v == "1" || v.eq_ignore_ascii_case("true"));
+        }
+        std::env::var("CANDLE_METAL_RETAIN_EVICTED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+impl DeviceTeardown {
+    pub(crate) fn new(commands: Arc<Commands>, residency_set: Arc<ResidencySet>) -> Self {
+        Self {
+            commands,
+            residency_set,
+        }
+    }
+
+    /// How many `MetalDevice` handles share this guard.
+    ///
+    /// The guard fires when this reaches zero, so a test can assert *when* it
+    /// will run rather than that it did -- the defect's natural expression is a
+    /// machine panic, which is not a testable assertion, so the mechanism is
+    /// what gets tested (issue #166).
+    pub(crate) fn handles(self: &Arc<Self>) -> usize {
+        Arc::strong_count(self)
+    }
+}
+
+impl Drop for DeviceTeardown {
+    fn drop(&mut self) {
+        // 1. Wait. This is the load-bearing step and the one `Drop for Commands`
+        //    does not do: it calls `flush()`, which commits *without* waiting
+        //    (`flush_and_wait` is the one that waits), so without this the pools
+        //    are destroyed while GPU work is still in flight -- §6.3c's
+        //    aggravating condition, and §6.7 L4's rule that a decision about a
+        //    buffer's existence taken on a different clock from the one that
+        //    orders execution is a correctness bug.
+        //
+        //    A failure here is reported and not propagated: this is a
+        //    destructor, and unwinding out of one during teardown would abort.
+        //    Proceeding to unregister after a failed wait is still strictly
+        //    better than not unregistering at all -- the set is emptied either
+        //    way, and it is the *absent object* that panics the kernel, not an
+        //    outstanding command buffer.
+        if let Err(e) = self.commands.wait_until_completed() {
+            // `eprintln!` rather than a panic or a log dependency: candle-core
+            // takes no logger, and a destructor must not unwind.
+            eprintln!("candle: MetalDevice teardown: waiting for GPU work failed: {e}");
+        }
+
+        // 2. Unregister, while the pools still hold the buffers. Emptying the
+        //    set here is what makes the later teardown of the Metal object a
+        //    no-op instead of a removal of objects that no longer exist.
+        self.residency_set.remove_all();
+
+        // 3. The pools drop after this, freeing buffers the set no longer
+        //    lists. That ordering is the whole fix and it is a property of
+        //    where this field is declared, not of anything written here.
+    }
+}
+
+#[derive(Clone)]
+pub struct MetalDevice {
+    /// Empties the residency set, after waiting for the GPU, when the last
+    /// handle to this device drops. Declared **first** so it runs before the
+    /// pools free the buffers the set lists (`DESIGN.md` §6.3c).
+    pub(crate) teardown: Arc<DeviceTeardown>,
+
+    /// Unique identifier, the registryID is not sufficient as it identifies the GPU rather than
+    /// the device itself.
+    pub(crate) id: DeviceId,
+
+    /// Raw metal device: <https://developer.apple.com/documentation/metal/mtldevice?language=objc>
+    pub(crate) device: Device,
+
+    pub(crate) commands: Arc<Commands>,
+
+    /// Shared-storage buffer pool (`RESOURCE_OPTIONS`), for buffers the CPU
+    /// also reads.
+    ///
+    /// Buffers return themselves here when their last handle drops; see
+    /// [`crate::kernels::metal::buffer_pool`]. Reclamation is automatic
+    /// and requires nothing of callers.
+    pub(crate) buffers: BufferPool,
+
+    /// Private-storage pool (`PRIVATE_RESOURCE_OPTIONS`, StorageModePrivate on
+    /// macOS). Intermediate compute buffers do not need CPU access, so Private
+    /// avoids coherency overhead.
+    ///
+    /// Despite the name this is the *activation* path, and it is where reuse
+    /// matters most: it takes every intermediate a forward pass produces. It
+    /// also holds the resident weights, because `to_dtype` on load allocates
+    /// through it -- but those are held by live tensors for the process
+    /// lifetime, so they are never in the free list and never looked at by a
+    /// lookup. Reclaimability separates them, not pool identity.
+    pub(crate) private_buffers: BufferPool,
+
+    /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
+    /// Heavily used by [`crate::kernels`]
+    pub(crate) kernels: Arc<Kernels>,
+    /// Seed for random number generation.
+    pub(crate) seed: Arc<Mutex<Buffer>>,
+    /// Last seed value set on this device.
+    pub(crate) seed_value: Arc<RwLock<u64>>,
+    /// Residency set registered on the command queue.
+    pub(crate) residency_set: Arc<ResidencySet>,
+
+    /// The activation arena, when one is installed.
+    ///
+    /// `None` is the default and is the classical path: every allocation goes
+    /// to the pool exactly as before, and the added cost is one `Option` test
+    /// per allocation. Installing an arena changes **where an activation buffer
+    /// comes from**, not how the pool decides a buffer is free (`DESIGN.md`
+    /// §9.2a) -- the pool's `acquire`, `release`, free list and epoch gate are
+    /// untouched.
+    ///
+    /// `RwLock` rather than `OnceLock` because the layout is selectable at run
+    /// time: §9.3's parity check needs to run the same model under the packed
+    /// layout and under the non-aliasing reference, and keeping both installable
+    /// is the same discipline `ParamStyle` follows for binding styles (§11.3b).
+    pub(crate) arena: Arc<RwLock<Option<Arena>>>,
+
+    /// Observes one decode step's allocations so a plan can be derived from it.
+    ///
+    /// `None` except while recording. Candle is eager, so nothing declares the
+    /// activation set up front -- but the dispatch sequence is stable
+    /// (§11.1a.1), so one observed step describes the rest. This is §11.1a's
+    /// record-then-replay, applied to allocation.
+    pub(crate) arena_recorder: Arc<Mutex<Option<Arc<Mutex<ArenaRecorder>>>>>,
+
+    /// The session region: one owned allocation serving the class the arena
+    /// declines (#47, `DESIGN.md` §9.2x).
+    ///
+    /// Beside the arena rather than inside it because the two have different
+    /// placement rules and only one of them may reuse a span across a step
+    /// boundary — an arena slot's occupant is dead by the end of the step, a
+    /// session tenant is read by the *next* one. `None` until installed, which
+    /// is every process that has not asked for it.
+    pub(crate) session_region: Arc<RwLock<Option<SessionRegion>>>,
+}
+
+// Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
+pub const RESOURCE_OPTIONS: MTLResourceOptions = objc2_metal::MTLResourceOptions(
+    MTLResourceOptions::StorageModeShared.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,
+);
+// Resource options used for `new_private_buffer`. This uses `private` where supported.
+#[cfg(target_os = "ios")]
+pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = RESOURCE_OPTIONS;
+#[cfg(not(target_os = "ios"))]
+pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = objc2_metal::MTLResourceOptions(
+    MTLResourceOptions::StorageModePrivate.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,
+);
+
+impl std::fmt::Debug for MetalDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MetalDevice({:?})", self.id)
+    }
+}
+
+impl std::ops::Deref for MetalDevice {
+    type Target = Device;
+
+    fn deref(&self) -> &Self::Target {
+        &self.device
+    }
+}
+
+impl MetalDevice {
+    #[cfg(all(feature = "ug", not(target_arch = "wasm32"), not(target_os = "ios")))]
+    pub fn compile(
+        &self,
+        func_name: &'static str,
+        kernel: candle_ug::lang::ssa::Kernel,
+    ) -> Result<ComputePipeline> {
+        let mut buf = vec![];
+        candle_ug::metal::code_gen::gen(&mut buf, func_name, &kernel)?;
+        let metal_code = String::from_utf8(buf)?;
+        let lib = self
+            .device
+            .new_library_with_source(&metal_code, None)
+            .map_err(MetalError::from)?;
+        let func = lib
+            .get_function(func_name, None)
+            .map_err(MetalError::from)?;
+        let pl = self
+            .device
+            .new_compute_pipeline_state_with_function(&func)
+            .map_err(MetalError::from)?;
+        Ok(pl)
+    }
+
+    pub fn id(&self) -> DeviceId {
+        self.id
+    }
+
+    pub fn metal_device(&self) -> &Device {
+        &self.device
+    }
+
+    /// How many allocations the residency set currently holds
+    /// (`DESIGN.md` §6.3c).
+    ///
+    /// Exists so the guard can be observed rather than assumed. The defect it
+    /// prevents is a machine panic, which is not something a test may provoke,
+    /// so the tests assert on membership -- which is exactly this number.
+    pub fn residency_set_len(&self) -> usize {
+        self.residency_set.len()
+    }
+
+    /// A handle to the residency set that outlives this device.
+    ///
+    /// Exists so the teardown guard can be observed from outside: after the
+    /// last `MetalDevice` drops there is no device left to ask, so a test that
+    /// wants to check the set was emptied has to be holding the set itself.
+    pub fn residency_set_handle(&self) -> Arc<ResidencySet> {
+        Arc::clone(&self.residency_set)
+    }
+
+    /// What the residency set has done — commits, adds, removes, retirements
+    /// (`DESIGN.md` §6.3e).
+    ///
+    /// **`commits` is the quantity §6.3d's cost argument is about.** That
+    /// section attributes eager unregistration's +0.062 ms/token to putting a
+    /// `commit()` on the per-token path; this reports how many there are on
+    /// each arm, so the argument can be checked against a rate rather than
+    /// restated. `retired` nonzero with `removed` zero is the pre-#210
+    /// behaviour, and it is the retention that reached 48 GB.
+    pub fn residency_counters(&self) -> crate::kernels::metal::ResidencyCounters {
+        self.residency_set.counters()
+    }
+
+    /// Zeroes the residency counters, so a caller can measure decode rather
+    /// than decode-plus-load.
+    pub fn reset_residency_counters(&self) {
+        self.residency_set.reset_counters();
+    }
+
+    /// Sets the cap on bytes each pool retains in its free list, evicting
+    /// immediately if the new cap is already exceeded.
+    ///
+    /// Eviction *destroys* buffers, so it unregisters them from the residency
+    /// set on the way (`DESIGN.md` §6.3c).
+    pub fn set_free_budget(&self, bytes: usize) {
+        self.buffers.set_free_budget(bytes);
+        self.private_buffers.set_free_budget(bytes);
+    }
+
+    /// Installs `DESIGN.md` §9.5k's derived residual as a cap on unplanned
+    /// bytes, across both pools.
+    ///
+    /// `limit` is admission's `budget − predicted`; `planned_shared` and
+    /// `planned_private` are the parts of the predicted set each pool serves.
+    /// Both are needed because the two pools hold different classes and
+    /// `live_bytes` already contains them (§9.5k):
+    ///
+    /// * **shared (`buffers`)** — the KV reserve, via `KvSlot::append` →
+    ///   `Tensor::zeros` → `allocate_buffer`.
+    /// * **private (`private_buffers`)** — the weights, via `to_dtype` →
+    ///   `new_buffer_builder` → `new_buffer`, *and* every activation
+    ///   intermediate (§6.3a's correction: `private_buffers` is not the weight
+    ///   pool, it is where both live).
+    ///
+    /// The **arena is in neither**, because `install_arena` calls the raw
+    /// device — it is the one class of the five genuinely outside the pools,
+    /// which is why admission subtracts it from the budget and not from a
+    /// pool's holdings.
+    ///
+    /// # The limit is per pool, and that is deliberate
+    ///
+    /// Each pool is given the whole residual rather than a share of it, so the
+    /// bound is *"neither pool alone exceeds the residual"* rather than *"their
+    /// sum does not"*. Splitting it would need a policy for the split that no
+    /// measurement supports — §9.5b puts no figure on how unplanned bytes
+    /// divide between the two — and the looser bound is the one that cannot
+    /// refuse a run that would have been fine. **It is a backstop against
+    /// unbounded growth, not an accountant**: §6.3b's stranding, the one
+    /// instance of that shape ever measured, lands in a single pool.
+    pub fn set_residual_cap(&self, limit: usize, planned_shared: usize, planned_private: usize) {
+        self.buffers.set_residual_cap(limit, planned_shared);
+        self.private_buffers
+            .set_residual_cap(limit, planned_private);
+    }
+
+    /// Removes the residual cap from both pools, restoring the unbounded
+    /// behaviour that shipped.
+    pub fn clear_residual_cap(&self) {
+        self.buffers.clear_residual_cap();
+        self.private_buffers.clear_residual_cap();
+    }
+
+    /// Unplanned bytes in each pool, shared first, or `None` where no cap is
+    /// installed.
+    pub fn unplanned_bytes(&self) -> (Option<usize>, Option<usize>) {
+        (
+            self.buffers.unplanned_bytes(),
+            self.private_buffers.unplanned_bytes(),
+        )
+    }
+
+    /// How many `MetalDevice` handles are alive, counted through the teardown
+    /// guard.
+    ///
+    /// The guard runs when this reaches zero. `MetalDevice` is `Clone` and every
+    /// `Tensor` holds a clone, so this is what distinguishes "the last handle
+    /// went" from "a handle went" -- the distinction that keeps the GPU wait off
+    /// the per-tensor path.
+    pub fn device_handles(&self) -> usize {
+        self.teardown.handles()
+    }
+
+    /// Destroys every buffer currently sitting in a free list.
+    ///
+    /// This is the old `drop_unused_buffers` sweep, and the change is that it
+    /// is no longer on the allocation path. It used to run on every
+    /// `wait_until_completed`, walking every buffer in both pools to discover
+    /// by `strong_count` which had become free -- so the pool oscillated
+    /// between growing and being swept, and the sweep *destroyed* buffers that
+    /// would immediately be re-created by the next allocation.
+    ///
+    /// Now a free buffer is already known to be free, so this exists only to
+    /// hand memory back under pressure. Nothing calls it on the hot path.
+    pub fn trim_unused_buffers(&self) {
+        for buffer in self.buffers.trim() {
+            self.residency_set.remove(&buffer);
+        }
+        for buffer in self.private_buffers.trim() {
+            self.residency_set.remove(&buffer);
+        }
+    }
+
+    /// Scan and reuse counters for both pools. See `buffer_pool`.
+    pub fn pool_counters(&self) -> (PoolCounters, PoolCounters) {
+        (self.buffers.counters(), self.private_buffers.counters())
+    }
+
+    pub fn reset_pool_counters(&self) {
+        self.buffers.reset_counters();
+        self.private_buffers.reset_counters();
+    }
+
+    /// Live and free occupancy for both pools, shared first.
+    pub fn pool_occupancy(&self) -> (PoolOccupancySnapshot, PoolOccupancySnapshot) {
+        (self.buffers.occupancy(), self.private_buffers.occupancy())
+    }
+
+    pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
+        let command_encoder = self.commands.command_encoder().map_err(MetalError::from)?;
+        Ok(command_encoder)
+    }
+
+    /// Submit dispatches through `executor` (`DESIGN.md` §11.1, issue #115).
+    ///
+    /// Narrow on purpose: `commands` is `pub(crate)` and stays that way, so a
+    /// harness can install an executor without reaching the command-buffer
+    /// lifecycle around it. `ExecutorSlot::Classical` is the default and is the
+    /// same code that ran before the seam existed (§11.1b), so *not* calling
+    /// this leaves the path unchanged rather than equivalent.
+    pub fn set_executor(&self, executor: Arc<crate::kernels::metal::ExecutorSlot>) {
+        self.commands.set_executor(executor);
+    }
+
+    /// Tell the executor the model has reached graph node `index`
+    /// (`DESIGN.md` §13.5m, issue #420 stage 3).
+    ///
+    /// A model calls this at each node boundary of its forward pass -- for a
+    /// decoder stack, once per layer. Under the default cut policy it is a
+    /// no-op that takes no lock and performs no store, so a model that calls it
+    /// unconditionally costs nothing when the arm is not selected; under
+    /// `CutPolicy::NodeIndex` it is what puts the command-buffer seam on a
+    /// graph position instead of on a dispatch count.
+    ///
+    /// Narrow on purpose, exactly as `set_executor` above is: `commands` is
+    /// `pub(crate)` and stays that way. The model announces *where it is*; it
+    /// does not reach the command-buffer lifecycle around it.
+    #[inline]
+    pub fn mark_graph_node(&self, index: usize) {
+        self.commands.mark_graph_node(index);
+    }
+
+    /// The command-buffer cut policy in force (`DESIGN.md` §13.5m).
+    ///
+    /// Read back from the mechanism that decides it rather than from the flag
+    /// that selected it, per §7.1a-i: a `RESULT` line that renders an axis from
+    /// its own parse of a flag can state an arm the engine is not running, and
+    /// a wrong arm compares *equal* to real runs of another configuration where
+    /// an absent one could not.
+    pub fn cut_policy(&self) -> crate::kernels::metal::CutPolicy {
+        self.commands.cut_policy()
+    }
+
+    /// The dispatch period the counter cut uses (`DESIGN.md` §13.5m).
+    ///
+    /// Reported alongside the policy because a counter cut at 50 and one at 55
+    /// are different arms with different session counts, and #420 stage 3's
+    /// control is a counter arm at a period chosen to match the node arm's
+    /// count. A run that recorded only `Counter` would not be separable from
+    /// the shipping default.
+    pub fn compute_per_buffer(&self) -> usize {
+        self.commands.compute_per_buffer()
+    }
+
+    pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>> {
+        let command_encoder = self
+            .commands
+            .blit_command_encoder()
+            .map_err(MetalError::from)?;
+        Ok(command_encoder)
+    }
+
+    pub fn wait_until_completed(&self) -> Result<()> {
+        self.commands
+            .wait_until_completed()
+            .map_err(MetalError::from)?;
+        // No sweep here any more. Buffers freed while this was waiting have
+        // already returned themselves to their pool, so there is nothing to
+        // discover -- and destroying them, which is what the sweep did, only
+        // forced the next allocation to re-create them.
+        //
+        // Still a drain, though, and it is not a scan: everything is complete
+        // now by definition, so this hands back whatever was waiting on the GPU
+        // without depending on a completion handler having been delivered yet.
+        // Metal dispatches those asynchronously, so a caller that synchronizes
+        // and immediately allocates would otherwise miss buffers that are
+        // provably free.
+        self.drain_completed_buffers();
+        Ok(())
+    }
+
+    /// Returns buffers whose GPU work has finished to their free lists.
+    fn drain_completed_buffers(&self) {
+        self.buffers.drain_completed();
+        self.private_buffers.drain_completed();
+    }
+
+    /// Commit and wait on the buffer holding the caller's work; safe for concurrent CPU readbacks.
+    pub fn flush_and_wait_current(&self) -> Result<()> {
+        self.commands
+            .flush_and_wait_current()
+            .map_err(MetalError::from)?;
+        self.drain_completed_buffers();
+        Ok(())
+    }
+
+    /// Commit without waiting, prune finished command buffers, and return the
+    /// number still in flight.
+    ///
+    /// The non-blocking counterpart of [`Self::flush_and_wait_current`], for
+    /// the polled token path (`DESIGN.md` §11.5g). The pool drain is kept
+    /// because the completion handlers that free buffers are delivered
+    /// asynchronously, so a caller that never blocks would otherwise leave
+    /// buffers parked against an epoch that has in fact retired.
+    pub fn flush_and_prune(&self) -> Result<usize> {
+        let in_flight = self.commands.flush_and_prune().map_err(MetalError::from)?;
+        self.drain_completed_buffers();
+        Ok(in_flight)
+    }
+
+    /// The completion-wait arm in force, as its `RESULT`-line name
+    /// (`DESIGN.md` §11.5o, issue #559).
+    ///
+    /// **Read back from the resolved value**, never echoed from the string that
+    /// selected it -- §7.1a-i's `AttnImpl=Generic` defect is what that
+    /// distinction exists to prevent, and a wrong arm compares equal to every
+    /// run of that arm where an absent one compares equal to nothing.
+    pub fn completion_wait_name(&self) -> &'static str {
+        self.commands.completion_wait().name()
+    }
+
+    /// `(signals encoded, polls performed)` by the async completion arms.
+    ///
+    /// The engagement pair. `(0, 0)` under an async arm means the arm did not
+    /// run: #500 measured that a mechanism with no production callers produces
+    /// a clean null indistinguishable from a real one, and a counter is the
+    /// only thing that separates them.
+    pub fn completion_counts(&self) -> (u64, u64) {
+        self.commands.completion_counts()
+    }
+
+    /// The buffer-alignment arm in force (`DESIGN.md` §9.2, issue #586).
+    ///
+    /// **Read back from the resolved value**, like
+    /// [`Self::completion_wait_name`] above and for the same reason: the arm is
+    /// whatever `buf_size` actually rounds to, so a harness that rendered its
+    /// own flag could report an alignment the process did not take. That is
+    /// §7.1a-i's present-and-wrong case, which is the unsafe direction — a
+    /// wrong arm compares **equal** to every real run of that arm.
+    ///
+    /// It is an associated function rather than a method because the arm is a
+    /// property of the process (one `OnceLock`), not of a device: two
+    /// `MetalDevice`s in one process cannot disagree about it, and pretending
+    /// otherwise would invite a caller to ask the wrong one.
+    pub fn buffer_alignment() -> usize {
+        buffer_alignment()
+    }
+
+    /// Whether an `MTLSharedEvent` was actually allocated for the selected arm.
+    ///
+    /// Separates *"an async arm was selected"* from *"an async arm is running"*:
+    /// a device that declined the event leaves this false and every wait takes
+    /// the blocking fallback, which is correct but is not what was asked for.
+    pub fn completion_event_present(&self) -> bool {
+        self.commands.completion_event_present()
+    }
+
+    /// Notification blocks that fired, for the listener arm (`DESIGN.md`
+    /// §11.5u, issue #583).
+    ///
+    /// **The listener arm's only engagement proof**, and the reason it is a
+    /// third counter rather than a third element of
+    /// [`Self::completion_counts`]: that pair reads `(nonzero, 0)` on this arm
+    /// whether the block delivered or the wait timed out and blocked instead,
+    /// because the arm polls zero times either way. A listener that has stopped
+    /// firing computes the right answer and moves no digest, so nothing else in
+    /// the tree can see it (§2.4, #500).
+    pub fn completion_fires(&self) -> u64 {
+        self.commands.completion_fires()
+    }
+
+    /// Whether an `MTLSharedEventListener` was allocated for the selected arm.
+    ///
+    /// [`Self::completion_event_present`]'s counterpart one level in, and for
+    /// the same reason: *"the listener arm was selected"* and *"the listener
+    /// arm can run"* are different facts.
+    pub fn completion_listener_present(&self) -> bool {
+        self.commands.completion_listener_present()
+    }
+
+    /// Waits that found the command buffer already complete (`DESIGN.md`
+    /// §11.5u, issue #583).
+    ///
+    /// **Measured 0 on the decode path**, and kept for what it excluded: it
+    /// falsified the first explanation for `completion_fires` sitting an order
+    /// of magnitude below `completion_signals`. The two count different things
+    /// -- commits against waits, ~13.5:1 under `CutPolicy::Counter(50)` -- so
+    /// the ratio is arithmetic rather than a failure rate.
+    pub fn completion_already_complete(&self) -> u64 {
+        self.commands.completion_already_complete()
+    }
+
+    pub fn kernels(&self) -> &Kernels {
+        &self.kernels
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Registers buffers in the device's residency set, keeping them
+    /// permanently GPU-resident instead of paying per-command-buffer residency
+    /// bookkeeping. Useful for buffers candle did not allocate, e.g.
+    /// `newBufferWithBytesNoCopy` views over an mmap'd weights file. No-op on
+    /// systems without residency-set support.
+    pub fn register_buffers<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) {
+        self.residency_set.insert_batch(bufs);
+    }
+
+    /// Unregisters buffers previously passed to `register_buffers`, releasing
+    /// the set's retain so they can be deallocated. Only unregister buffers
+    /// you registered yourself, after GPU work referencing them has completed.
+    pub fn unregister_buffers<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) {
+        self.residency_set.remove_batch(bufs);
+    }
+
+    /// Returns a builder for buffer allocation. See `BufferBuilder`.
+    pub fn new_buffer_builder(&self) -> BufferBuilder<'_> {
+        BufferBuilder::new(self)
+    }
+
+    /// The installed arena, if any. Cheap: one lock and an `Option` clone.
+    fn arena_slot(&self) -> Option<Arena> {
+        self.arena.read().ok().and_then(|a| a.clone())
+    }
+
+    /// The installed session region, if any. Cheap, on `arena_slot`'s argument.
+    fn session_region_slot(&self) -> Option<SessionRegion> {
+        self.session_region.read().ok().and_then(|r| r.clone())
+    }
+
+    /// Install a session region serving the ordinals the arena declines as
+    /// session state (#47, `DESIGN.md` §9.2x).
+    ///
+    /// `reservations` is `(ordinal, bytes)`: the allocation ordinal within a
+    /// decode step, and the bytes that ordinal's tenant needs **at full
+    /// capacity**. That second figure is ggml's `reserve` (§9.2t): a tenant
+    /// growing by a fixed stride per token to a known capacity needs
+    /// `stride × capacity` bytes and never more, so reserving it once means no
+    /// allocation on any later token.
+    ///
+    /// # This is additive, exactly as the arena is (§9.2a)
+    ///
+    /// Nothing about the pool changes and no caller releases anything. An
+    /// ordinal with no reservation, or a request past its reservation, falls
+    /// through to the pool as before — which costs coverage, never correctness,
+    /// and is the direction a wrong reservation must fail in.
+    ///
+    /// One `MTLBuffer`, registered in the residency set once, on §9.2's
+    /// *"residency is a CPU-side fact established once"*: the whole point is
+    /// that the per-token path stops inserting.
+    pub fn install_session_region(&self, reservations: &[(usize, usize)]) -> Result<usize> {
+        let plan = RegionPlan::reserve(reservations);
+        let bytes = plan.bytes().max(1);
+        let base = self
+            .device
+            .new_buffer(bytes, PRIVATE_RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&base);
+        let region = SessionRegion::new(base, plan)
+            .map_err(|e| MetalError::Message(format!("session region rejected: {e}")))?;
+        if let Ok(mut slot) = self.session_region.write() {
+            // Unregister the region being replaced while it still owns its base
+            // — #489's ordering argument, which applies here for the same reason
+            // it applies to the arena.
+            if let Some(previous) = slot.as_ref() {
+                self.residency_set.remove(previous.base());
+            }
+            *slot = Some(region);
+        }
+        Ok(bytes)
+    }
+
+    /// Remove the session region. Subsequent allocations take the pool path.
+    ///
+    /// Ordered as [`Self::clear_arena`] is: the base leaves the residency set
+    /// **while the region still owns it**, so `removeAllocation` names an object
+    /// that provably still exists (§6.3c, #489).
+    pub fn clear_session_region(&self) {
+        let Ok(mut slot) = self.session_region.write() else {
+            return;
+        };
+        if let Some(region) = slot.as_ref() {
+            self.residency_set.remove(region.base());
+        }
+        *slot = None;
+    }
+
+    /// The session region's counters, if one is installed.
+    pub fn session_region_counters(&self) -> Option<RegionCounters> {
+        self.session_region_slot().map(|r| r.counters())
+    }
+
+    /// Bytes the installed session region holds.
+    pub fn session_region_bytes(&self) -> Option<usize> {
+        self.session_region_slot().map(|r| r.bytes())
+    }
+
+    /// How many tenants the installed session region reserves for.
+    ///
+    /// `None` when none is installed, and `Some(0)` when one is installed with
+    /// nothing to serve — two states a harness must be able to tell apart, since
+    /// an empty region and an absent one produce identical counters otherwise
+    /// (#500's lesson: a clean null and an unwired mechanism look the same).
+    pub fn session_region_tenants(&self) -> Option<usize> {
+        self.session_region_slot().map(|r| r.tenants())
+    }
+
+    /// Install an activation arena built from `plan`, replacing any previous
+    /// one.
+    ///
+    /// Allocates one `MTLBuffer` of the plan's size and registers it in the
+    /// residency set -- §9.2's "residency is a CPU-side fact established once":
+    /// one buffer in the set rather than 674.
+    ///
+    /// The arena is *additive* (§9.2a). Nothing about the pool changes, no
+    /// caller is asked to release anything, and removing the arena with
+    /// [`Self::clear_arena`] returns the device to the classical path exactly.
+    pub fn install_arena(&self, plan: StepPlan, layout: ArenaLayout) -> Result<()> {
+        // `bump_capacity`, not `arena_bytes`: the two differ when the last
+        // slot's size is not a multiple of the 128 B alignment, and a GPU bump
+        // allocator rounds every request including the last (issue #70). Sizing
+        // to the larger figure costs at most 127 bytes of tail and lets either
+        // offset source serve every ordinal; sizing to the smaller one makes the
+        // GPU path decline an ordinal that fits the plan perfectly, which is a
+        // silent loss of coverage rather than an error.
+        let bytes = plan.bump_capacity().max(plan.arena_bytes()).max(1);
+        let base = self
+            .device
+            .new_buffer(bytes, PRIVATE_RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&base);
+        let arena = Arena::new(base, plan, layout)
+            .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
+        if let Ok(mut slot) = self.arena.write() {
+            // Unregister the arena being *replaced*, on the same argument as
+            // `clear_arena` and while it still owns its base (issue #489). This
+            // is latent today because nothing in the shipping engine replaces an
+            // arena -- one is installed and lives for the process -- but under
+            // #483's ring or any per-phase arena (§9.2's sizing discussion) the
+            // leak would be per replacement rather than one-off.
+            if let Some(previous) = slot.as_ref() {
+                self.residency_set.remove(previous.base());
+            }
+            *slot = Some(arena);
+        }
+        Ok(())
+    }
+
+    /// Compute this arena's offsets on the GPU and adopt them if they agree
+    /// with the plan (`DESIGN.md` §9.2d, issue #70).
+    ///
+    /// Dispatches the bump allocator over the installed arena's plan, reads the
+    /// offsets back, and hands them to
+    /// [`Arena::adopt_gpu_offsets`](crate::kernels::metal::Arena::adopt_gpu_offsets),
+    /// which verifies them element-wise before switching. A disagreement is an
+    /// error and the arena keeps binding through the CPU plan.
+    ///
+    /// # Why this is a one-off rather than per step
+    ///
+    /// The plan is fixed once recorded and the request sizes never change, so
+    /// the allocator computes the same table every step. Running it per token
+    /// would burn a dispatch and a readback to re-derive a constant.
+    ///
+    /// **Nothing here is per step, and this comment used to claim otherwise**
+    /// (#526). It read *"what **is** per step is the reset"*; measured on the
+    /// call graph, `call_arena_reset` has no caller outside tests, and it
+    /// cannot acquire one as this path is built: the `ArenaCursor` below is a
+    /// local, dropped when this function returns, and `adopt_gpu_offsets`
+    /// copies the verified table into the plan that binding then reads. **There
+    /// is no cursor left to reset.**
+    ///
+    /// The reset becomes per step under §11.5's GPU-driven loop, where an
+    /// encoding kernel consumes offsets without the readback below and the
+    /// cursor is genuinely live across steps. Until then it is a tested
+    /// capability with no consumer, which `arena_alloc.rs` now says in the one
+    /// place a reader of that kernel will look.
+    ///
+    /// # The readback, stated plainly
+    ///
+    /// The offsets cross back to the host because `setBuffer_offset_atIndex` is
+    /// a CPU call -- a classical dispatch cannot consume a GPU-computed offset
+    /// any other way. That is the boundary §11.3c describes, not a shortcut:
+    /// consuming an offset without a round-trip requires an ICB command written
+    /// by an encoding kernel, and the ICB executor is out of scope here. Doing
+    /// it once at install rather than per token is what keeps the cost off the
+    /// per-token path entirely.
+    pub fn install_gpu_arena_offsets(&self) -> Result<usize> {
+        use crate::kernels::call_arena_bump;
+
+        let arena = self
+            .arena_slot()
+            .ok_or_else(|| MetalError::Message("no arena installed".to_string()))?;
+        let plan = arena.plan_snapshot();
+        let sizes = plan.request_sizes();
+        let capacity = plan.bump_capacity().max(plan.arena_bytes()).max(1);
+
+        let cursor = ArenaCursor::new(&self.device, &sizes, capacity)
+            .map_err(|e| MetalError::Message(format!("arena cursor: {e}")))?;
+        {
+            let guard = self.commands.command_encoder().map_err(MetalError::from)?;
+            call_arena_bump(
+                &self.device,
+                &guard,
+                &self.kernels,
+                cursor.cursor_buffer(),
+                cursor.sizes_buffer(),
+                cursor.offsets_buffer(),
+                cursor.len(),
+                cursor.capacity(),
+            )
+            .map_err(MetalError::from)?;
+        }
+        // The offsets live in shared storage, so they are only meaningful once
+        // the command buffer carrying the allocator has completed. Reading them
+        // sooner is a race the host cannot detect.
+        self.wait_until_completed()?;
+
+        Ok(arena
+            .adopt_gpu_offsets(&cursor.offsets())
+            .map_err(|e| MetalError::Message(format!("GPU offsets rejected: {e}")))?)
+    }
+
+    /// Remove the arena. Subsequent allocations all take the pool path.
+    ///
+    /// # The residency removal, and why it is ordered this way (issue #489)
+    ///
+    /// [`Self::install_arena`] registers the base in the residency set, so
+    /// removing the arena has to unregister it -- otherwise the device retains
+    /// an allocation the arena has dropped, which is `DESIGN.md` §6.7 L4 at the
+    /// arena and the mechanism §6.3c records **panicking the machine**.
+    ///
+    /// The base is taken out of the set **while the arena still owns it**, so
+    /// `removeAllocation` names an object that provably still exists -- the same
+    /// ordering `PoolInner::drain_completed` uses when it tells the eviction
+    /// observer before destroying, and the ordering §6.3c's whole finding is
+    /// about. Dropping first and removing after would be the exact shape that
+    /// aborts.
+    ///
+    /// # Why this is here and not in `impl Drop for Arena`
+    ///
+    /// `Arena` is `Clone` and holds no residency handle, so a `Drop` there
+    /// would have to acquire one and would fire on whichever clone happened to
+    /// go last -- §6.3d's finding in a second place: the participant that owns
+    /// the set is the device, so the device is where the removal belongs.
+    ///
+    /// Nothing was calling this until #487's probe, which is why the omission
+    /// survived from #69 (§15.2 #11b, on a lifetime path rather than a
+    /// capability).
+    pub fn clear_arena(&self) {
+        let Ok(mut slot) = self.arena.write() else {
+            return;
+        };
+        if let Some(arena) = slot.as_ref() {
+            self.residency_set.remove(arena.base());
+        }
+        *slot = None;
+    }
+
+    pub fn arena(&self) -> Option<Arena> {
+        self.arena_slot()
+    }
+
+    /// Mark the start of a decode step, resetting the arena's allocation
+    /// ordinal.
+    ///
+    /// The ordinal is what ties an allocation to a slot, so it has to restart at
+    /// the same point every token. No-op when no arena is installed.
+    pub fn begin_decode_step(&self) {
+        if let Some(a) = self.arena_slot() {
+            a.begin_step();
+        }
+    }
+
+    /// Mark the end of a decode step. Allocations outside a step take the pool
+    /// path, which is what keeps prefill and setup on the classical route.
+    pub fn end_decode_step(&self) {
+        if let Some(a) = self.arena_slot() {
+            a.end_step();
+        }
+    }
+
+    pub fn arena_counters(&self) -> Option<ArenaCounters> {
+        self.arena_slot().map(|a| a.counters())
+    }
+
+    /// Where the installed arena's offsets came from (issue #70).
+    ///
+    /// Reported so a harness can show the GPU path *engaged* rather than
+    /// asserting that a flag was passed. §2.4: an instrument that cannot be
+    /// shown to have engaged has not measured anything, and #69's first
+    /// determinism gate was vacuous for exactly that reason.
+    pub fn arena_offsets(&self) -> Option<ArenaOffsets> {
+        self.arena_slot().map(|a| a.offsets())
+    }
+
+    /// Begin observing allocations so a plan can be derived from one step.
+    ///
+    /// Record over a *steady-state* decode step, not the first one: the first
+    /// token after prefill allocates a different set, and #68 plans from
+    /// `decode[1]` for the same reason.
+    pub fn begin_arena_recording(&self) {
+        let rec = Arc::new(Mutex::new(ArenaRecorder::new()));
+        // The encoder observes binds, which is where an interval ends, so it
+        // needs the same recorder this device is filling.
+        crate::kernels::metal::arena::set_bind_observer(Some(Arc::clone(&rec)));
+        if let Ok(mut g) = self.arena_recorder.lock() {
+            *g = Some(rec);
+        }
+    }
+
+    /// Close the decode step being recorded and begin recording another.
+    ///
+    /// **Two steps are the minimum a plan can be built from**, because comparing
+    /// them is what separates an activation from session state: an allocation
+    /// whose size moved between them is sized by `kv_len` and must not enter the
+    /// arena (`DESIGN.md` §9.1, #68 finding 4). #68's planner likewise requires
+    /// two decode steps and refuses rather than silently returning nothing.
+    pub fn next_arena_recording_step(&self) {
+        if let Ok(g) = self.arena_recorder.lock() {
+            if let Some(rec) = g.as_ref() {
+                if let Ok(mut r) = rec.lock() {
+                    r.next_step();
+                }
+            }
+        }
+    }
+
+    /// How many recorded ordinals were excluded as session state, of the total.
+    pub fn arena_recording_excluded(&self) -> Option<(usize, usize)> {
+        let g = self.arena_recorder.lock().ok()?;
+        let rec = g.as_ref()?;
+        let r = rec.lock().ok()?;
+        Some(r.excluded())
+    }
+
+    /// Exclusions split by which test caught them: `(size_grew, outlived_step)`.
+    ///
+    /// Reported separately because the two detectors see different populations
+    /// and neither subsumes the other -- size growth finds the KV cache, and
+    /// cross-step liveness finds the conv state, which is fixed at
+    /// `[B, 2048, 3]` and invisible to a size comparison (`DESIGN.md` §5.7,
+    /// §9.2c). A run where the second number is zero would mean it is not
+    /// earning its place; a run where it is nonzero names values the size test
+    /// admitted.
+    ///
+    /// The two counts overlap where both tests fire, so they do not sum to the
+    /// total exclusion count.
+    pub fn arena_recording_excluded_by_test(&self) -> Option<(usize, usize)> {
+        let g = self.arena_recorder.lock().ok()?;
+        let rec = g.as_ref()?;
+        let r = rec.lock().ok()?;
+        Some(r.excluded_by_test())
+    }
+
+    /// Reservations for a session region, derived from the recording (#47).
+    ///
+    /// `(ordinal, bytes at capacity)` for each ordinal whose size grew between
+    /// the two recorded steps, extrapolated from the **measured** stride to
+    /// `capacity_tokens`. See
+    /// [`ArenaRecorder::session_reservations`](crate::kernels::metal::ArenaRecorder::session_reservations)
+    /// for why the stride is measured rather than computed from the geometry,
+    /// and why the fixed-size session state is deliberately not included.
+    pub fn arena_recording_session_reservations(
+        &self,
+        tokens_recorded: usize,
+        capacity_tokens: usize,
+    ) -> Option<Vec<(usize, usize)>> {
+        let g = self.arena_recorder.lock().ok()?;
+        let rec = g.as_ref()?;
+        let r = rec.lock().ok()?;
+        Some(r.session_reservations(tokens_recorded, capacity_tokens))
+    }
+
+    /// Stop observing and build a plan from what was seen.
+    ///
+    /// Returns `None` if nothing was recorded, which is a real outcome worth
+    /// distinguishing from an empty plan -- it means recording was never begun
+    /// or the step allocated nothing.
+    pub fn finish_arena_recording(&self, layout: ArenaLayout) -> Option<StepPlan> {
+        crate::kernels::metal::arena::set_bind_observer(None);
+        let mut g = self.arena_recorder.lock().ok()?;
+        let rec = g.take()?;
+        let r = rec.lock().ok()?;
+        if r.is_empty() {
+            return None;
+        }
+        Some(r.plan(layout))
+    }
+
+    /// Record one decode step and install the resulting arena.
+    ///
+    /// The whole sequence a caller needs: observe a steady-state step, derive
+    /// the plan, allocate the arena, and switch to it. `step` runs the model for
+    /// exactly one token.
+    pub fn record_and_install_arena<F>(&self, layout: ArenaLayout, step: F) -> Result<bool>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        self.begin_arena_recording();
+        let outcome = step();
+        // Stop recording whether or not the step succeeded, so a failure cannot
+        // leave the recorder attached and quietly accumulating.
+        let plan = self.finish_arena_recording(layout);
+        outcome?;
+        match plan {
+            Some(plan) => {
+                self.install_arena(plan, layout)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Creates a new buffer (not necessarily zeroed).
+    ///
+    /// Uses StorageModePrivate on macOS for faster GPU access (no CPU coherency overhead).
+    /// Falls back to StorageModeShared on iOS where Private is not always available.
+    pub fn new_buffer(
+        &self,
+        element_count: usize,
+        dtype: DType,
+        _name: &str,
+    ) -> Result<Arc<PooledBuffer>> {
+        let size = element_count * dtype.size_in_bytes();
+        // Layer 3 (`DESIGN.md` §9.2a). The arena is offered the allocation
+        // first; it serves it only inside a decode step, only while the plan
+        // still has an ordinal, and only when the size matches what that ordinal
+        // was planned for. Everything else -- prefill, model setup, and every
+        // session-state allocation whose size grows with `kv_len` -- falls
+        // through to the pool below, unchanged.
+        if let Some(arena) = self.arena_slot() {
+            let offer = arena.acquire_attributed(size);
+            if let Some(b) = offer.served {
+                return Ok(b);
+            }
+            // Layer 3b (#47, `DESIGN.md` §9.2x). The arena declined; if it
+            // declined because this ordinal is **session state**, the session
+            // region may own a reservation for it.
+            //
+            // # Why only the `Session` decline, and not every decline
+            //
+            // The region's tenants are keyed by allocation ordinal, and a
+            // reservation means "these bytes belong to this ordinal for the
+            // whole session". That is meaningful only for the population the
+            // plan classified as session state. `PastPlan` and `SizeMismatch`
+            // say the step has drifted from what was recorded, and serving a
+            // drifted allocation from a fixed reservation is exactly the
+            // aliasing §9.3 gives no safety net against — so those keep falling
+            // to the pool, unchanged.
+            //
+            // `Inactive` is outside a decode step (prefill, setup, sampling) and
+            // carries no ordinal at all, which is why the `ordinal` is taken
+            // from the offer rather than recomputed: the `fetch_add` already
+            // happened inside `acquire_attributed`, and a second one here would
+            // walk the plan out of alignment.
+            if offer.decline == Some(ArenaDecline::Session) {
+                if let (Some(ordinal), Some(region)) = (offer.ordinal, self.session_region_slot()) {
+                    if let Some(b) = region.acquire(ordinal, size) {
+                        return Ok(self.note_for_recording(b, size));
+                    }
+                }
+            }
+        }
+        let buffer = match self.private_buffers.acquire(size) {
+            Some(b) => b,
+            None => {
+                let alloc = buf_size(size);
+                // `DESIGN.md` §9.5k's one branch, on the derived residual. It
+                // sits on the pool MISS, after `acquire` has declined, because
+                // a hit allocates nothing and there is nothing to bound; and
+                // BEFORE `new_buffer`, because reporting an overrun after the
+                // allocation is committed is useless. Inert with no cap
+                // installed, which is every process that has not run admission.
+                self.private_buffers
+                    .check_residual(alloc)
+                    .map_err(|e| MetalError::Message(e.to_string()))?;
+                let new_buffer = self
+                    .device
+                    .new_buffer(alloc, PRIVATE_RESOURCE_OPTIONS)
+                    .map_err(MetalError::from)?;
+                self.residency_set.insert(&new_buffer);
+                // `size` is the pre-rounding request and `alloc` is what Metal
+                // was given; `adopt_requesting` counts both so §9.2's residual
+                // overhang is derivable. The rounding happened at `alloc`
+                // above, which is the last point where the two are both in
+                // scope (#47).
+                self.private_buffers
+                    .adopt_requesting(new_buffer, size, alloc)
+            }
+        };
+        Ok(self.note_for_recording(buffer, size))
+    }
+
+    /// While a plan is being recorded, note this allocation.
+    ///
+    /// Records the allocation's *size* and the *address* of the buffer serving
+    /// it. The address is only how later binds are attributed back to this
+    /// value; the value itself is the **allocation event**, never the buffer
+    /// (`DESIGN.md` §9.2c). When a later allocation is handed the same address
+    /// it takes the address over, and the earlier value keeps the interval it
+    /// accumulated while it held it -- so one pooled buffer serving 60 values
+    /// yields 60 intervals rather than one merged one. That merge is the mistake
+    /// that made #68's first planner report 3.55 MB against the true 68 KB.
+    ///
+    /// The interval **ends at the last bind**, not here and not when the handle
+    /// drops -- see `ArenaRecorder::record_bind` for why the CPU's clock is the
+    /// wrong one.
+    fn note_for_recording(&self, buffer: Arc<PooledBuffer>, size: usize) -> Arc<PooledBuffer> {
+        let Ok(guard) = self.arena_recorder.lock() else {
+            return buffer;
+        };
+        let Some(rec) = guard.as_ref() else {
+            return buffer;
+        };
+        if let Ok(mut r) = rec.lock() {
+            r.record_alloc(buffer.raw_addr(), size);
+        }
+        buffer
+    }
+
+    /// Creates a new private buffer (not necessarily zeroed).
+    ///
+    /// This is intentionally not in the Metal buffer pool to allow the efficient implementation of persistent buffers.
+    pub fn new_private_buffer(
+        &self,
+        element_count: usize,
+        dtype: DType,
+        _name: &str,
+    ) -> Result<Arc<PooledBuffer>> {
+        let size = element_count * dtype.size_in_bytes();
+        let buffer = self
+            .device
+            .new_buffer(size, PRIVATE_RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&buffer);
+        // Deliberately not pooled: this exists for persistent buffers, so it
+        // returns a handle with no pool behind it. Dropping it frees the buffer
+        // outright rather than offering it for reuse.
+        Ok(Arc::new(PooledBuffer::unpooled(buffer, size)))
+    }
+
+    /// Creates a new buffer from data.
+    ///
+    /// Does not require synchronization, as [newBufferWithBytes](https://developer.apple.com/documentation/metal/mtldevice/1433429-newbufferwithbytes)
+    /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
+    pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<PooledBuffer>> {
+        let size = core::mem::size_of_val(data);
+        let new_buffer = self
+            .device
+            .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&new_buffer);
+
+        // Deliberately not pooled.
+        //
+        // This path always calls `newBufferWithBytes` and never consults the
+        // free list, so a buffer parked here is only reachable by an
+        // `allocate_buffer` request for the same size -- and `allocate_buffer`
+        // has three callers, all on quantized dequantize paths. Nothing in an
+        // f16 forward pass ever asks for one.
+        //
+        // In practice these are weight tensors staged from safetensors, which
+        // `to_dtype` immediately converts into `private_buffers`; the staging
+        // buffer is then dropped and never wanted again. Measured on an LFM2
+        // load that is 276 buffers holding 5145 MB. The old allocator reclaimed
+        // them only as a side effect of its sweep, so with the sweep off the
+        // allocation path, pooling them would double the footprint and undo
+        // issue #8's 7731 -> 5509 MB.
+        //
+        // Freeing on drop keeps that reclamation without reintroducing a scan.
+        // Note this is a property of the *path*, not of buffer size: these
+        // average 18.6 MB, so a size threshold does not separate them from
+        // activations.
+        Ok(Arc::new(PooledBuffer::unpooled(new_buffer, size)))
+    }
+
+    pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<PooledBuffer>> {
+        let buffer = self.allocate_buffer(size_in_bytes)?;
+        let mut blit = self.blit_command_encoder()?;
+        blit.set_label("zeros");
+        blit.fill_buffer(&buffer, (0, buffer.length()), 0);
+        /*
+        // Alternative impl
+        if size_in_bytes > 0 {
+            let encoder = self.command_encoder()?;
+            call_const_fill(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                "fill_u8",
+                size_in_bytes,
+                &buffer,
+                0u8,
+            )
+            .map_err(crate::Error::wrap)?;
+        }
+        */
+        Ok(buffer)
+    }
+
+    /// The critical allocator algorithm
+    pub fn allocate_buffer(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+        if let Some(b) = self.buffers.acquire(size) {
+            return Ok(b);
+        }
+        // Kept before `buf_size` shadows `size`, so the overhang has both terms
+        // (§9.2, #47).
+        let requested = size;
+        let size = buf_size(size);
+        // §9.5k's branch, on the pool miss and before the allocation -- see
+        // `new_buffer` above. This is the pool the KV reserve is served from
+        // (`KvSlot::append` -> `Tensor::zeros` -> here), which is why the
+        // subtracted `planned` figure includes KV.
+        self.buffers
+            .check_residual(size)
+            .map_err(|e| MetalError::Message(e.to_string()))?;
+        let new_buffer = self
+            .device
+            .new_buffer(size, RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&new_buffer);
+        Ok(self.buffers.adopt_requesting(new_buffer, requested, size))
+    }
+
+    /// Create a metal GPU capture trace on [`path`].
+    pub fn capture<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        let capture = unsafe { MTLCaptureManager::sharedCaptureManager() };
+        let descriptor = MTLCaptureDescriptor::new();
+        descriptor.setDestination(MTLCaptureDestination::GPUTraceDocument);
+        descriptor.set_capture_device(self.device().as_ref());
+        // The [set_output_url] call requires an absolute path so we convert it if needed.
+        if path.as_ref().is_absolute() {
+            let url = NSURL::from_file_path(path);
+            descriptor.setOutputURL(url.as_deref());
+        } else {
+            let path = std::env::current_dir()?.join(path);
+            let url = NSURL::from_file_path(path);
+            descriptor.setOutputURL(url.as_deref());
+        }
+
+        capture
+            .startCaptureWithDescriptor_error(&descriptor)
+            .map_err(|e| MetalError::from(e.to_string()))?;
+        Ok(())
+    }
+}
+
+/// Alignment applied to every buffer allocation.
+///
+/// This is the Apple Silicon cache line. Aligning to it means every buffer
+/// starts on a line boundary, so no two buffers share a line and the memory
+/// controller can coalesce accesses cleanly. It also covers the alignment any
+/// dtype could need: the kernels use `float4`/`half4` (16 bytes) widely and
+/// quantized block structures are wider still, all well under 128.
+///
+/// **This is the DEFAULT and no longer the only reachable value** — see
+/// [`buffer_alignment`], which reads `LLOOM_586_BUFFER_ALIGNMENT` once. The
+/// constant is kept as the name every comment and test refers to, and as what
+/// the axis reports when nothing selects an arm.
+const BUFFER_ALIGNMENT: usize = 128;
+
+/// The lowest alignment the axis will accept.
+///
+/// `float4`/`half4` are 16 bytes and quantized block structures are wider, so
+/// **16 is the floor at which every dtype this backend uses is still correctly
+/// aligned**. Below it the arm would not be a granularity choice but a
+/// correctness bug, and §3.5 makes a misaligned vector load silent rather than
+/// an error. The refusal names this number.
+const MIN_BUFFER_ALIGNMENT: usize = 16;
+
+/// The buffer alignment this process allocates at (`DESIGN.md` §9.2, #586).
+///
+/// # Why this is an axis and not a constant
+///
+/// §9.2 records the 128 as load-bearing in one direction — *"lowering the
+/// alignment to 64 would silently introduce false sharing between adjacent
+/// arena slots"* — and closes with *"do not change it without measuring
+/// both"*. **There was no instrument to measure either half**: the value was a
+/// bare `const` with no selector, so #443's paired A/B could not run and its
+/// incumbent figure (+0.49 ms/token to save 2.2 GB) was measured against a
+/// free-list scan removed the same day. This makes the arm exist; it does not
+/// flip the default (§7.1a) and takes no timing.
+///
+/// # What this axis is NOT
+///
+/// **It is not §9.2l's padding**, and conflating the two is the trap that
+/// section names. `CachePadded<T>` is `#[repr(align(128))]` over *control
+/// state* — struct fields two threads write — and lowering **that** to 64 is a
+/// compile error by design. This is *data* alignment: the granularity
+/// `buf_size` rounds an allocation to. §9.2l's own words are that its rule is
+/// *"not licence for any change to `buf_size` / `BUFFER_ALIGNMENT`, which is
+/// #355's and #443's"* — so the two quantities are separated deliberately, and
+/// this axis moves only the second.
+///
+/// # Read once, not per allocation
+///
+/// A `OnceLock`, for §15.2 #10's reason: `buf_size` is on the allocation path
+/// at §6.3b's ~11.6 destroys/token, and an env read per call would put a
+/// syscall-shaped cost on it. Reading once also makes the arm a property of the
+/// process, which is what lets the harness report it (§7.1a-i: read the arm
+/// back from the mechanism that decides it, never from the flag).
+fn buffer_alignment() -> usize {
+    static ALIGNMENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ALIGNMENT.get_or_init(|| {
+        let Ok(raw) = std::env::var("LLOOM_586_BUFFER_ALIGNMENT") else {
+            return BUFFER_ALIGNMENT;
+        };
+        let raw = raw.trim();
+        let Ok(v) = raw.parse::<usize>() else {
+            panic!(
+                "LLOOM_586_BUFFER_ALIGNMENT={raw:?} is not a number. \
+                 Give a power of two >= {MIN_BUFFER_ALIGNMENT} (DESIGN.md §9.2)."
+            )
+        };
+        // Refused rather than clamped, and loudly. A silently-corrected arm is
+        // #241's present-and-wrong case: the run would render an alignment it
+        // did not take, and compare equal to real runs of that arm.
+        if !v.is_power_of_two() {
+            panic!(
+                "LLOOM_586_BUFFER_ALIGNMENT={v} is not a power of two. \
+                 `next_multiple_of` would still round, but a non-power-of-two \
+                 granularity is not an alignment (DESIGN.md §9.2)."
+            )
+        }
+        if v < MIN_BUFFER_ALIGNMENT {
+            panic!(
+                "LLOOM_586_BUFFER_ALIGNMENT={v} is below {MIN_BUFFER_ALIGNMENT}, \
+                 the widest vector this backend loads (`float4`/`half4` are 16 B). \
+                 A lower value is a correctness bug and §3.5 makes it silent."
+            )
+        }
+        v
+    })
+}
+
+/// Size to allocate for a request of `size` bytes.
+///
+/// Previously this rounded up to the next power of two, which wastes up to 2x
+/// per buffer. That is not hypothetical: for shapes that sit just above a
+/// power of two -- a 292-token KV cache, or an FFN intermediate of 10752 --
+/// the rounding costs 75% and 52% respectively, and the pool holds the excess
+/// for the process lifetime.
+///
+/// Aligning instead keeps the guarantees that matter (vector alignment, and a
+/// size the memory controller likes) without the waste. Reuse is unaffected:
+/// `find_available_buffer` accepts any pooled buffer at least as large as the
+/// request, so a slightly larger buffer still satisfies a smaller one.
+fn buf_size(size: usize) -> usize {
+    // Never return 0: Metal rejects zero-length buffers, and callers may ask
+    // for an empty tensor.
+    size.max(1).next_multiple_of(buffer_alignment())
+}
+
+/// Applies the [`BufferBuilder`] label, clearing any stale label on a reused pooled buffer.
+#[cfg(feature = "metal-debug-labels")]
+#[inline]
+fn buffer_label(buffer: &Buffer, label: Option<&str>) {
+    buffer.set_label(label.unwrap_or("unlabeled"));
+}
+#[cfg(not(feature = "metal-debug-labels"))]
+#[inline]
+fn buffer_label(_buffer: &Buffer, _label: Option<&str>) {}
+
+type DataUpload<'a> = Box<dyn FnOnce(&MetalDevice) -> Result<Arc<PooledBuffer>> + 'a>;
+
+enum BufferInit<'a> {
+    Typed { elem_count: usize, dtype: DType },
+    Size(usize),
+    Zeros(usize),
+    Data(DataUpload<'a>),
+}
+
+/// Builder for `MTLBuffer` allocations; pool reuse handled by [`MetalDevice`].
+pub struct BufferBuilder<'a> {
+    device: &'a MetalDevice,
+    label: Option<&'a str>,
+}
+
+/// [`BufferBuilder`] with an init kind set; `build()` lives here.
+pub struct ReadyBufferBuilder<'a> {
+    device: &'a MetalDevice,
+    init: BufferInit<'a>,
+    label: Option<&'a str>,
+}
+
+impl<'a> BufferBuilder<'a> {
+    fn new(device: &'a MetalDevice) -> Self {
+        Self {
+            device,
+            label: None,
+        }
+    }
+
+    /// Allocate elem_count * dtype size bytes, uninitialized, private storage.
+    pub fn with_size_for(self, elem_count: usize, dtype: DType) -> ReadyBufferBuilder<'a> {
+        self.ready(BufferInit::Typed { elem_count, dtype })
+    }
+
+    /// Allocate size bytes, uninitialized, shared storage.
+    pub fn with_size(self, size: usize) -> ReadyBufferBuilder<'a> {
+        self.ready(BufferInit::Size(size))
+    }
+
+    /// Allocate size bytes, zero-filled, shared storage. Pool rounding may make
+    /// the allocation larger than size; the extra bytes are also zeroed.
+    pub fn with_zeros(self, size: usize) -> ReadyBufferBuilder<'a> {
+        self.ready(BufferInit::Zeros(size))
+    }
+
+    /// Allocate a shared buffer initialized from data. Always allocates; does not
+    /// reuse the pool.
+    pub fn with_data<T>(self, data: &'a [T]) -> ReadyBufferBuilder<'a> {
+        self.ready(BufferInit::Data(Box::new(move |device| {
+            device.new_buffer_with_data(data)
+        })))
+    }
+
+    pub fn with_label(mut self, label: &'a str) -> Self {
+        self.label = Some(label);
+        self
+    }
+
+    #[inline]
+    fn ready(self, init: BufferInit<'a>) -> ReadyBufferBuilder<'a> {
+        ReadyBufferBuilder {
+            device: self.device,
+            init,
+            label: self.label,
+        }
+    }
+}
+
+impl<'a> ReadyBufferBuilder<'a> {
+    pub fn with_label(mut self, label: &'a str) -> Self {
+        self.label = Some(label);
+        self
+    }
+
+    pub fn build(self) -> Result<Arc<PooledBuffer>> {
+        let buffer = match self.init {
+            BufferInit::Typed { elem_count, dtype } => {
+                self.device.new_buffer(elem_count, dtype, "")?
+            }
+            BufferInit::Size(size) => self.device.allocate_buffer(size)?,
+            BufferInit::Zeros(size) => self.device.allocate_zeros(size)?,
+            BufferInit::Data(upload) => upload(self.device)?,
+        };
+        buffer_label(&buffer, self.label);
+        Ok(buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rounding, as a pure function of the granularity.
+    ///
+    /// `buf_size` reads a process-wide `OnceLock`, so a test cannot vary the arm
+    /// in-process without the first read winning — the same property that keeps
+    /// the alignment off the per-allocation path. This mirrors the arithmetic so
+    /// every arm is exercised, and
+    /// `the_default_arm_agrees_with_buf_size` pins the mirror to the real
+    /// function at the shipped arm so the two cannot drift (§3.1b rule 1: an
+    /// absolute reference, not a shape).
+    fn round_to(size: usize, alignment: usize) -> usize {
+        size.max(1).next_multiple_of(alignment)
+    }
+
+    #[test]
+    fn test_buf_size_is_aligned() {
+        let alignment = buffer_alignment();
+        for size in [1usize, 2, 3, 127, 128, 129, 1000, 4096, 21504, 299008] {
+            let got = buf_size(size);
+            assert!(got >= size, "buf_size({size}) = {got} is too small");
+            assert_eq!(
+                got % alignment,
+                0,
+                "buf_size({size}) = {got} is not {alignment}-aligned"
+            );
+            assert!(
+                got - size < alignment,
+                "buf_size({size}) = {got} wastes a whole alignment unit"
+            );
+        }
+    }
+
+    #[test]
+    fn test_buf_size_never_zero() {
+        // Metal rejects zero-length buffers, and an empty tensor asks for one.
+        assert_eq!(buf_size(0), buffer_alignment());
+    }
+
+    #[test]
+    fn test_buf_size_avoids_power_of_two_waste() {
+        // Shapes that sit just above a power of two are the ones that suffered:
+        // a 292-token KV cache and an FFN intermediate both rounded up hard.
+        // Both are multiples of 128, so they are exact at every arm at or below
+        // the default -- which is the arithmetic §9.2l relies on when it says
+        // padding is free at tensor granularity "by arithmetic rather than by
+        // luck".
+        assert_eq!(buf_size(299008), 299008); // was 524288, 75% waste
+        assert_eq!(buf_size(21504), 21504); // was 32768, 52% waste
+    }
+
+    #[test]
+    fn test_buf_size_bf16_f16_scalar() {
+        // BF16 and F16 are 2 bytes per element; a scalar tensor requests a
+        // 2-byte buffer. It must not be rounded down.
+        assert!(buf_size(2) >= 2);
+    }
+
+    #[test]
+    fn the_default_arm_agrees_with_buf_size() {
+        // The mirror above is only worth having if it is the same arithmetic.
+        // Pinned at the arm the test process actually resolved, so this holds
+        // whether or not the environment selects one.
+        let alignment = buffer_alignment();
+        for size in [1usize, 2, 127, 128, 129, 21504, 299008] {
+            assert_eq!(
+                buf_size(size),
+                round_to(size, alignment),
+                "the mirror and buf_size disagree at {size} (alignment {alignment})"
+            );
+        }
+    }
+
+    /// The arm's *effect*, at an absolute reference rather than a shape.
+    ///
+    /// §3.1b rule 1: `[3, 3, 3]` is a stronger assertion than *all equal*. A
+    /// test asserting only *"a larger alignment wastes at least as much"* would
+    /// pass on a `buf_size` that ignored the arm entirely, because a constant
+    /// sequence is monotone. These are the exact byte counts.
+    #[test]
+    fn each_arm_rounds_to_its_own_granularity() {
+        // 4104 is deliberately awkward: a multiple of 8 and of none of the
+        // arms, so every arm rounds it somewhere different.
+        assert_eq!(round_to(4104, 16), 4112);
+        assert_eq!(round_to(4104, 64), 4160);
+        assert_eq!(round_to(4104, 128), 4224);
+        assert_eq!(round_to(4104, 256), 4352);
+        assert_eq!(round_to(4104, 4096), 8192);
+    }
+
+    #[test]
+    fn a_page_sized_request_is_exact_at_every_arm_at_or_below_it() {
+        // The reason the canonical digests cannot move under this axis: every
+        // LFM2 decode activation shape is already a multiple of 128 (§9.2l), so
+        // an arm at or below the default changes no allocation size at all. The
+        // arena's five slots, measured by #489.
+        for &size in &[21504usize, 21504, 21504, 4096, 1024] {
+            for &alignment in &[16usize, 32, 64, 128, 256, 512, 1024] {
+                if size % alignment == 0 {
+                    assert_eq!(
+                        round_to(size, alignment),
+                        size,
+                        "arena slot {size} should be exact at alignment {alignment}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_floor_is_the_widest_vector_this_backend_loads() {
+        // Not a round number chosen for neatness: `float4`/`half4` are 16 bytes
+        // and are what the kernels load. The refusal below this value is a
+        // correctness guard, so the constant must not drift away from the
+        // reason for it.
+        assert_eq!(MIN_BUFFER_ALIGNMENT, 16);
+        assert_eq!(MIN_BUFFER_ALIGNMENT, std::mem::size_of::<f32>() * 4);
+    }
+}

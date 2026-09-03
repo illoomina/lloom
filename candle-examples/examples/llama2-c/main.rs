@@ -6,16 +6,16 @@ extern crate accelerate_src;
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
 
-use candle_transformers::models::llama2_c as model;
-use candle_transformers::models::llama2_c_weights as weights;
-use candle_transformers::models::quantized_llama2_c as qmodel;
+use lloom_engine::models::llama2_c as model;
+use lloom_engine::models::llama2_c_weights as weights;
+use lloom_engine::models::quantized_llama2_c as qmodel;
 mod training;
 use clap::{Parser, Subcommand};
 
 use anyhow::{Error as E, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use candle::{IndexOp, Tensor};
-use candle_transformers::generation::LogitsProcessor;
+use lloom_engine::generation::LogitsProcessor;
 use std::io::Write;
 use tokenizers::Tokenizer;
 
@@ -236,7 +236,7 @@ fn run_eval(args: &EvaluationCmd, common_args: &Args) -> Result<()> {
     for inp_tgt in batch_iter {
         let (inp, tgt) = inp_tgt?;
         let logits = model.forward(&inp, 0, &mut cache)?;
-        let loss = candle_nn::loss::cross_entropy(&logits.flatten_to(1)?, &tgt.flatten_to(1)?)?;
+        let loss = lloom_engine::nn::loss::cross_entropy(&logits.flatten_to(1)?, &tgt.flatten_to(1)?)?;
         println!("{}", loss.to_vec0::<f32>()?);
     }
     Ok(())
@@ -293,7 +293,7 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
             )?
             .dequantize(&device)?;
 
-        let fake_vb = candle_nn::VarBuilder::from_tensors(
+        let fake_vb = lloom_engine::nn::VarBuilder::from_tensors(
             [
                 ("freq_cis_real".to_string(), freq_cis_real),
                 ("freq_cis_imag".to_string(), freq_cis_imag),
@@ -309,7 +309,7 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
     } else if is_safetensors {
         let config = Config::tiny_15m();
         let tensors = candle::safetensors::load(config_path, &device)?;
-        let vb = candle_nn::VarBuilder::from_tensors(tensors, candle::DType::F32, &device);
+        let vb = lloom_engine::nn::VarBuilder::from_tensors(tensors, candle::DType::F32, &device);
         let cache = model::Cache::new(true, &config, vb.pp("rot"))?;
         let model = Model::Llama(Llama::load(vb, config.clone())?);
         (model, config, cache)
@@ -350,7 +350,7 @@ fn run_inference(args: &InferenceCmd, common_args: &Args) -> Result<()> {
             logits
         } else {
             let start_at = tokens.len().saturating_sub(common_args.repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
+            lloom_engine::utils::apply_repeat_penalty(
                 &logits,
                 common_args.repeat_penalty,
                 &tokens[start_at..],

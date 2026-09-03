@@ -1,8 +1,8 @@
 use anyhow::{Error as E, Result};
 use candle::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::colpali::Model;
-use candle_transformers::models::{colpali, paligemma};
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::models::colpali::Model;
+use lloom_engine::models::{colpali, paligemma};
 use clap::Parser;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use image::DynamicImage;

@@ -10,12 +10,12 @@ use tokenizers::Tokenizer;
 
 use candle::quantized::gguf_file;
 use candle::Tensor;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use lloom_engine::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::quantized_llama::ModelWeights as Phi3b;
-use candle_transformers::models::quantized_phi::ModelWeights as Phi2;
-use candle_transformers::models::quantized_phi3::ModelWeights as Phi3;
+use lloom_engine::models::quantized_llama::ModelWeights as Phi3b;
+use lloom_engine::models::quantized_phi::ModelWeights as Phi2;
+use lloom_engine::models::quantized_phi3::ModelWeights as Phi3;
 
 const DEFAULT_PROMPT: &str = "Write a function to count prime numbers up to N. ";
 
@@ -294,7 +294,7 @@ fn main() -> anyhow::Result<()> {
             logits
         } else {
             let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
+            lloom_engine::utils::apply_repeat_penalty(
                 &logits,
                 args.repeat_penalty,
                 &all_tokens[start_at..],

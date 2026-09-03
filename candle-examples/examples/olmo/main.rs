@@ -7,13 +7,13 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::{Parser, ValueEnum};
 
-use candle_transformers::models::olmo::{Config, Model as OLMo};
-use candle_transformers::models::olmo2::{Config as Config2, Model as OLMo2};
+use lloom_engine::models::olmo::{Config, Model as OLMo};
+use lloom_engine::models::olmo2::{Config as Config2, Model as OLMo2};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -91,7 +91,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom_engine::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],

@@ -1,0 +1,121 @@
+[package]
+name = "lloom-tensor"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[dependencies]
+accelerate-src = { workspace = true, optional = true }
+byteorder = { workspace = true }
+candle-kernels = { workspace = true, optional = true }
+# Metal kernel-layer deps, merged in from candle-metal-kernels (RESTRUCTURING
+# §7.1). objc2-metal/objc2-foundation/objc2/block2 are the Metal FFI the merged
+# `kernels` module needs; gated on the `metal` feature exactly as the former
+# `candle-metal-kernels` crate dependency was.
+objc2-metal = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
+block2 = { workspace = true, optional = true }
+once_cell = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+cudarc = { workspace = true, optional = true }
+gemm = { workspace = true }
+half = { workspace = true, features = ["zerocopy"] }
+float8 = { workspace = true }
+intel-mkl-src = { workspace = true, optional = true }
+libc = { workspace = true }
+libm = { workspace = true }
+memmap2 = { workspace = true }
+num-traits = { workspace = true }
+num_cpus = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+rayon = { workspace = true }
+safetensors = { workspace = true }
+thiserror = { workspace = true }
+yoke = { workspace = true }
+zerocopy = { workspace = true }
+zip = { workspace = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { workspace = true, features = ["onig"] }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
+candle-ug = { workspace = true, optional = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+criterion = { workspace = true }
+# Merged from candle-metal-kernels dev-deps: the kernel fuzzers use proptest.
+proptest = "1.11"
+rand_distr = { workspace = true }
+
+[features]
+default = []
+cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
+cudnn = ["cuda", "cudarc/cudnn"]
+nccl = ["cuda", "cudarc/nccl"]
+mkl = ["dep:intel-mkl-src"]
+accelerate = ["dep:accelerate-src"]
+# The `metal` feature now compiles the merged `kernels` module too, so it pulls
+# the Metal FFI deps the module needs (previously candle-metal-kernels's own).
+metal = [
+    "dep:objc2-metal",
+    "dep:objc2-foundation",
+    "dep:objc2",
+    "dep:block2",
+    "dep:once_cell",
+    "dep:tracing",
+    "candle-ug?/metal",
+]
+# The former candle-metal-kernels feature flags, now internal to the merged
+# `kernels` module. The public `metal-*` names are kept for the callers that
+# already reference them (candle-nn/examples, the workspace `sanitize` profile);
+# each enables the short internal name the moved `kernels` source still gates on
+# (`#[cfg(feature = "debug-labels")]` etc.), which keeps that source untouched.
+# Each was empty-default and compiles to nothing when off.
+debug-labels = []
+run-telemetry = []
+hazard-audit = []
+asan-poison = []
+metal-debug-labels = ["metal", "debug-labels"]
+# Per-memory-class and event telemetry (#171). Composes with a release build;
+# off by default, and off it compiles to nothing.
+metal-run-telemetry = ["metal", "run-telemetry"]
+# Strict ordering verification (#185). Composes with a release build; off by
+# default, and off it compiles to nothing.
+metal-hazard-audit = ["metal", "hazard-audit"]
+# ASan shadow-memory poisoning of allocator invariants (#475). Off by default,
+# and off it compiles to nothing.
+#
+# **Unlike the two above it is NOT free to enable on its own**: it calls the
+# sanitizer runtime's `__asan_*` interface, so a build carrying it and not
+# `-Zsanitizer=address` does not link. It is enabled by the `sanitize` profile,
+# which the workspace manifest documents.
+metal-asan-poison = ["metal", "asan-poison"]
+ug = ["dep:candle-ug"]
+
+[build-dependencies]
+
+[[bench]]
+name = "bench_main"
+harness = false
+
+[[example]]
+name = "metal_basics"
+required-features = ["metal"]
+
+[[example]]
+name = "cuda_basics"
+required-features = ["cuda"]
+
+# Merged from candle-metal-kernels: the hazard-audit crosscheck consumes the
+# `#[cfg]`-gated `kernels::metal::hazard_audit`, so it requires the feature.
+[[example]]
+name = "hazard_audit_crosscheck"
+required-features = ["metal-hazard-audit"]

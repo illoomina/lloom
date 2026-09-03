@@ -10,9 +10,9 @@ use anyhow::{bail, Error as E, Result};
 use clap::Parser;
 
 use candle::{DType, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::granitemoehybrid as model;
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::generation::{LogitsProcessor, Sampling};
+use lloom_engine::models::granitemoehybrid as model;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use model::{GraniteMoeHybrid, GraniteMoeHybridCache, GraniteMoeHybridConfig};
 
@@ -217,7 +217,7 @@ fn main() -> Result<()> {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(args.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom_engine::utils::apply_repeat_penalty(
                     &logits,
                     args.repeat_penalty,
                     &tokens[start_at..],

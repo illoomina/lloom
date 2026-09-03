@@ -8,13 +8,13 @@ use anyhow::Result;
 use clap::Parser;
 use std::io::Write;
 
-use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::encodec;
-use candle_transformers::models::metavoice::{adapters, gpt, tokenizers, transformer};
-use candle_transformers::models::quantized_metavoice::transformer as qtransformer;
+use lloom_engine::generation::LogitsProcessor;
+use lloom_engine::models::encodec;
+use lloom_engine::models::metavoice::{adapters, gpt, tokenizers, transformer};
+use lloom_engine::models::quantized_metavoice::transformer as qtransformer;
 
 use candle::{DType, IndexOp, Tensor};
-use candle_nn::VarBuilder;
+use lloom_engine::nn::VarBuilder;
 use hf_hub::api::sync::Api;
 use rand::{distr::Distribution, SeedableRng};
 
@@ -149,7 +149,7 @@ fn main() -> Result<()> {
             None => repo.get("first_stage_q4k.gguf")?,
         };
         let vb =
-            candle_transformers::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
+            lloom_engine::quantized_var_builder::VarBuilder::from_gguf(filename, &device)?;
         let first_stage_model = qtransformer::Model::new(&first_stage_config, vb)?;
         Transformer::Quantized(first_stage_model)
     } else {
@@ -249,7 +249,7 @@ fn main() -> Result<()> {
         for step in 0..seq_len {
             let logits = logits.i(step)?.to_dtype(DType::F32)?;
             let logits = &(&logits / 1.0)?;
-            let prs = candle_nn::ops::softmax_last_dim(logits)?.to_vec1::<f32>()?;
+            let prs = lloom_engine::nn::ops::softmax_last_dim(logits)?.to_vec1::<f32>()?;
             let distr = rand::distr::weighted::WeightedIndex::new(prs.as_slice())?;
             let sample = distr.sample(&mut rng) as u32;
             codes_.push(sample)

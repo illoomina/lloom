@@ -12,10 +12,10 @@ use tokenizers::Tokenizer;
 
 use candle::quantized::gguf_file;
 use candle::Tensor;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use lloom_engine::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::quantized_lfm2::ModelWeights;
+use lloom_engine::models::quantized_lfm2::ModelWeights;
 
 const DEFAULT_PROMPT: &str = "Explain how Rotary Position Embeddings work in transformers.";
 
@@ -312,7 +312,7 @@ fn main() -> Result<()> {
             logits
         } else {
             let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
+            lloom_engine::utils::apply_repeat_penalty(
                 &logits,
                 args.repeat_penalty,
                 &all_tokens[start_at..],

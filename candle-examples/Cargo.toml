@@ -12,16 +12,22 @@ readme = "README.md"
 [dependencies]
 accelerate-src = { workspace = true, optional = true }
 candle = { workspace = true }
-candle-datasets = { workspace = true, optional = true }
-candle-nn = { workspace = true }
-candle-transformers = { workspace = true }
+# PARKED (RESTRUCTURING §7.1 downstream-consumer decision, surfaced in the PR):
+# candle-datasets and candle-onnx consume candle-nn/candle-transformers, which no
+# longer exist under those names after the merge. They are excluded peripheral
+# consumers until the owner decides whether to repoint them at lloom-engine; the
+# examples that need them (mnist-training, llama2-c, onnx*) are parked below with
+# them. Off by default, never part of the lfm2 gate.
+# candle-datasets = { workspace = true, optional = true }
+# candle-nn + candle-transformers merged into lloom-engine (RESTRUCTURING §7.1);
+# nn is reached as `lloom_engine::nn::`, the zoo as `lloom_engine::models::`.
+lloom-engine = { workspace = true }
 candle-flash-attn = { workspace = true, optional = true }
-candle-onnx = { workspace = true, optional = true }
-# Metal-only, and optional so the CPU and CUDA builds compile none of it
-# (`DESIGN.md` §14.1). The determinism harness needs it to select the
-# binding-style axis (issue #115), which is a `candle-metal-kernels` switch with
-# no `candle-core` surface.
-candle-metal-kernels = { workspace = true, optional = true }
+# candle-onnx = { workspace = true, optional = true }  # PARKED — see above
+# candle-metal-kernels merged into lloom-tensor's `kernels` module (RESTRUCTURING
+# §7.1). The determinism harness reaches the binding-style axis (issue #115) as
+# `candle::kernels::` via the tensor crate; the former `metal-*` feature reaches
+# below now resolve through `candle/metal-*` into the merged crate.
 
 chrono = "0.4"
 csv = "1.3.0"
@@ -85,26 +91,23 @@ default = []
 accelerate = [
     "dep:accelerate-src",
     "candle/accelerate",
-    "candle-nn/accelerate",
-    "candle-transformers/accelerate",
+    "lloom-engine/accelerate",
 ]
 cuda = [
     "candle/cuda",
-    "candle-nn/cuda",
-    "candle-transformers/cuda",
+    "lloom-engine/cuda",
     "dep:cudaforge",
 ]
-cudnn = ["candle/cudnn", "candle-nn/cudnn", "candle-transformers/cudnn"]
-flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
+cudnn = ["candle/cudnn", "lloom-engine/cudnn"]
+flash-attn = ["cuda", "lloom-engine/flash-attn", "dep:candle-flash-attn"]
 mkl = [
     "dep:intel-mkl-src",
     "candle/mkl",
-    "candle-nn/mkl",
-    "candle-transformers/mkl",
+    "lloom-engine/mkl",
 ]
 nccl = ["cuda", "cudarc/nccl", "dep:half"]
-onnx = ["candle-onnx"]
-# `candle-transformers/metal` is here because a model may carry Metal-only
+# onnx = ["candle-onnx"]  # PARKED — candle-onnx consumes candle-nn (RESTRUCTURING §7.1)
+# `lloom-engine/metal` is here because a model may carry Metal-only
 # behaviour, and without it that behaviour silently compiles to its non-Metal
 # stub in every example. `lfm2::Cache::admit_memory_budget` (§9.5l) is the case
 # that found it: the check is `#[cfg(feature = "metal")]`, so every harness was
@@ -113,15 +116,13 @@ onnx = ["candle-onnx"]
 # **Pre-existing, and invisible because nothing in `candle-transformers` was
 # gated on `metal` before** -- an unused feature flag reads exactly like a
 # correct one. Note the line below already propagates
-# `candle-transformers/metal-debug-labels`, which is what makes the omission
+# `lloom-engine/metal-debug-labels`, which is what makes the omission
 # here an oversight rather than a decision.
 metal = [
     "candle/metal",
-    "candle-nn/metal",
-    "candle-transformers/metal",
-    "dep:candle-metal-kernels",
+    "lloom-engine/metal",
 ]
-metal-debug-labels = ["metal", "candle/metal-debug-labels", "candle-nn/metal-debug-labels", "candle-transformers/metal-debug-labels"]
+metal-debug-labels = ["metal", "candle/metal-debug-labels", "lloom-engine/metal-debug-labels"]
 # Strict ordering verification (#185, `DESIGN.md` §11.3t), reachable from a
 # harness because this line exists -- #205's defect below, avoided rather than
 # repeated.
@@ -202,17 +203,19 @@ required-features = ["cuda", "nccl", "flash-attn"]
 name = "reinforcement-learning"
 required-features = ["pyo3"]
 
-[[example]]
-name = "onnx"
-required-features = ["onnx"]
-
-[[example]]
-name = "onnx-llm"
-required-features = ["onnx"]
-
-[[example]]
-name = "onnx_basics"
-required-features = ["onnx"]
+# PARKED (RESTRUCTURING §7.1): the onnx/datasets examples need the parked
+# candle-onnx/candle-datasets deps. Re-enabled when those consumers are repointed.
+# [[example]]
+# name = "onnx"
+# required-features = ["onnx"]
+#
+# [[example]]
+# name = "onnx-llm"
+# required-features = ["onnx"]
+#
+# [[example]]
+# name = "onnx_basics"
+# required-features = ["onnx"]
 
 [[example]]
 name = "whisper"
@@ -222,13 +225,14 @@ required-features = ["symphonia"]
 name = "whisper-microphone"
 required-features = ["microphone"]
 
-[[example]]
-name = "mnist-training"
-required-features = ["candle-datasets"]
-
-[[example]]
-name = "llama2-c"
-required-features = ["candle-datasets"]
+# PARKED (RESTRUCTURING §7.1): need the parked candle-datasets dep.
+# [[example]]
+# name = "mnist-training"
+# required-features = ["candle-datasets"]
+#
+# [[example]]
+# name = "llama2-c"
+# required-features = ["candle-datasets"]
 
 [[example]]
 name = "mimi"
@@ -246,9 +250,10 @@ required-features = ["encodec"]
 name = "depth_anything_v2"
 required-features = ["depth_anything_v2"]
 
-[[example]]
-name = "silero-vad"
-required-features = ["onnx"]
+# PARKED (RESTRUCTURING §7.1): needs the parked onnx feature.
+# [[example]]
+# name = "silero-vad"
+# required-features = ["onnx"]
 
 [[example]]
 name = "colpali"

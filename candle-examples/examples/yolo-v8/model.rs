@@ -1,5 +1,5 @@
 use candle::{DType, IndexOp, Result, Tensor, D};
-use candle_nn::{batch_norm, conv2d, conv2d_no_bias, Conv2d, Conv2dConfig, Module, VarBuilder};
+use lloom_engine::nn::{batch_norm, conv2d, conv2d_no_bias, Conv2d, Conv2dConfig, Module, VarBuilder};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Multiples {
@@ -107,7 +107,7 @@ impl Module for ConvBlock {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let _enter = self.span.enter();
         let xs = self.conv.forward(xs)?;
-        candle_nn::ops::silu(&xs)
+        lloom_engine::nn::ops::silu(&xs)
     }
 }
 
@@ -255,7 +255,7 @@ impl Module for Dfl {
         let xs = xs
             .reshape((b_sz, 4, self.num_classes, anchors))?
             .transpose(2, 1)?;
-        let xs = candle_nn::ops::softmax(&xs, 1)?;
+        let xs = lloom_engine::nn::ops::softmax(&xs, 1)?;
         self.conv.forward(&xs)?.reshape((b_sz, 4, anchors))
     }
 }
@@ -615,7 +615,7 @@ impl DetectionHead {
 
         let dbox = dist2bbox(&self.dfl.forward(&box_)?, &anchors)?;
         let dbox = dbox.broadcast_mul(&strides)?;
-        let pred = Tensor::cat(&[dbox, candle_nn::ops::sigmoid(&cls)?], 1)?;
+        let pred = Tensor::cat(&[dbox, lloom_engine::nn::ops::sigmoid(&cls)?], 1)?;
         Ok(DetectionHeadOut {
             pred,
             anchors,
@@ -680,7 +680,7 @@ impl PoseHead {
 
         let ys01 = ((xs.i((.., .., 0..2))? * 2.)?.broadcast_add(&d.anchors)? - 0.5)?
             .broadcast_mul(&d.strides)?;
-        let ys2 = candle_nn::ops::sigmoid(&xs.i((.., .., 2..3))?)?;
+        let ys2 = lloom_engine::nn::ops::sigmoid(&xs.i((.., .., 2..3))?)?;
         let ys = Tensor::cat(&[ys01, ys2], 2)?.flatten(1, 2)?;
         Tensor::cat(&[d.pred, ys], 1)
     }

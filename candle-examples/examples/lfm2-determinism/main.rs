@@ -59,10 +59,10 @@ use anyhow::{Context, Result};
 use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use candle_nn::ops::KvQuant;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
+use lloom_engine::nn::ops::KvQuant;
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::generation::{LogitsProcessor, Sampling};
+use lloom_engine::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
 use clap::Parser;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -640,7 +640,7 @@ fn main() -> Result<()> {
     // reason as `--attn`: a silently-ignored flag makes a gate report on an arm
     // it did not run (§2.4).
     config.flash_scratch_sizing =
-        candle_nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
+        lloom_engine::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
             .map_err(anyhow::Error::msg)?;
     println!("attention implementation: {:?}", config.attn_impl);
     // Refused rather than defaulted, for the same reason as `--attn`: an
@@ -668,14 +668,14 @@ fn main() -> Result<()> {
     // shipping arm's digest under a variant's name, which is #69's vacuous run
     // (§2.4). Printed whether or not it is `exact` — a digest is only
     // interpretable against the arm it was taken in.
-    let silu = candle_metal_kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
+    let silu = candle::kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
         anyhow::anyhow!(
             "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
              `coarse1`, `hardswish`, got `{}`",
             args.silu_impl
         )
     })?;
-    candle_metal_kernels::set_silu_impl(silu);
+    candle::kernels::set_silu_impl(silu);
     println!("silu impl: {}", silu.name());
 
     // The two GEMV epilogue fusions (#509's wiring of #484's and #509's
@@ -695,7 +695,7 @@ fn main() -> Result<()> {
     // that the two arms differ in something observable (§2.4, §9.2f).
     #[cfg(feature = "metal")]
     {
-        use candle_metal_kernels::{default_param_style, set_default_param_style, ParamStyle};
+        use candle::kernels::{default_param_style, set_default_param_style, ParamStyle};
         let want = match args.param_style.as_str() {
             "split" => ParamStyle::Split,
             "packed" => ParamStyle::Packed,
@@ -729,9 +729,9 @@ fn main() -> Result<()> {
              (DESIGN.md §3.7c), so under `split` every position is excluded and this would \
              gate an executor that replayed nothing"
         );
-        candle_metal_kernels::set_pipelines_support_icb(true)
+        candle::kernels::set_pipelines_support_icb(true)
             .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
-        candle_metal_kernels::set_constants_pool_enabled(true);
+        candle::kernels::set_constants_pool_enabled(true);
         println!("icb: enabled");
     }
     #[cfg(not(feature = "metal"))]
@@ -923,23 +923,23 @@ fn main() -> Result<()> {
     const ICB_RECORD_STEPS: usize = 3;
     #[cfg(feature = "metal")]
     let icb_barrier_scope = match args.icb_barrier_scope.as_str() {
-        "run-start" => candle_metal_kernels::BarrierScope::RunStart,
-        "since-barrier" => candle_metal_kernels::BarrierScope::SinceBarrier,
+        "run-start" => candle::kernels::BarrierScope::RunStart,
+        "since-barrier" => candle::kernels::BarrierScope::SinceBarrier,
         other => anyhow::bail!(
             "--icb-barrier-scope must be `run-start` or `since-barrier`, got `{other}`"
         ),
     };
     #[cfg(feature = "metal")]
     let icb_replay_barriers = match args.icb_replay_barriers.as_str() {
-        "always" => candle_metal_kernels::ReplayBarriers::Always,
-        "skip-replayed" => candle_metal_kernels::ReplayBarriers::SkipReplayed,
+        "always" => candle::kernels::ReplayBarriers::Always,
+        "skip-replayed" => candle::kernels::ReplayBarriers::SkipReplayed,
         other => anyhow::bail!(
             "--icb-replay-barriers must be `always` or `skip-replayed`, got `{other}`"
         ),
     };
     #[cfg(feature = "metal")]
     let icb_executor = args.icb.then(|| {
-        candle_metal_kernels::IcbExecutor::configured(
+        candle::kernels::IcbExecutor::configured(
             ICB_RECORD_STEPS,
             icb_barrier_scope,
             icb_replay_barriers,
@@ -1251,7 +1251,7 @@ fn main() -> Result<()> {
             if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
                 if decode_steps == icb_installed_at {
                     dev.set_executor(std::sync::Arc::new(
-                        candle_metal_kernels::metal::ExecutorSlot::Custom(exec.clone()),
+                        candle::kernels::metal::ExecutorSlot::Custom(exec.clone()),
                     ));
                 }
             }
@@ -1283,7 +1283,7 @@ fn main() -> Result<()> {
                     let reservations = if args.session_region {
                         dev.arena_recording_session_reservations(
                             kv_len,
-                            candle_transformers::models::lfm2::DEFAULT_KV_CAPACITY,
+                            lloom_engine::models::lfm2::DEFAULT_KV_CAPACITY,
                         )
                     } else {
                         None
@@ -1418,7 +1418,7 @@ fn main() -> Result<()> {
         // The correctness evidence is this harness's own digest.
         println!(
             "ICB replay barriers: {icb_replay_barriers:?}  suppressed={}",
-            candle_metal_kernels::metal::trace::barriers_suppressed(),
+            candle::kernels::metal::trace::barriers_suppressed(),
         );
         // Per kernel, with the reason attached, because the totals above cannot
         // distinguish a position that became *covered* from one that merely
@@ -1557,7 +1557,7 @@ fn main() -> Result<()> {
     // map, and reporting coverage without it invites reading an unmapped pool
     // as a verified one.
     {
-        use candle_metal_kernels::metal::poison;
+        use candle::kernels::metal::poison;
         if poison::ENABLED {
             let c = poison::counters();
             println!(

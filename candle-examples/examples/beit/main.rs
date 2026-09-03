@@ -10,8 +10,8 @@ extern crate accelerate_src;
 use clap::Parser;
 
 use candle::{DType, Device, IndexOp, Result, Tensor, D};
-use candle_nn::{Module, VarBuilder};
-use candle_transformers::models::beit;
+use lloom_engine::nn::{Module, VarBuilder};
+use lloom_engine::models::beit;
 
 /// Loads an image from disk using the image crate, this returns a tensor with shape
 /// (3, 384, 384). Beit special normalization is applied.
@@ -63,7 +63,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = beit::vit_base(vb)?;
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = candle_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = lloom_engine::nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

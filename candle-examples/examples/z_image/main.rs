@@ -34,8 +34,8 @@
 
 use anyhow::{Error as E, Result};
 use candle::{DType, IndexOp, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::z_image::{
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::models::z_image::{
     calculate_shift, get_noise, postprocess_image, AutoEncoderKL, Config,
     FlowMatchEulerDiscreteScheduler, SchedulerConfig, TextEncoderConfig, VaeConfig,
     ZImageTextEncoder, ZImageTransformer2DModel,

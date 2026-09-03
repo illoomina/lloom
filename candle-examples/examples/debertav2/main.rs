@@ -10,11 +10,11 @@ use std::path::PathBuf;
 use anyhow::bail;
 use anyhow::{Error as E, Result};
 use candle::{Device, Tensor};
-use candle_nn::ops::softmax;
-use candle_nn::VarBuilder;
-use candle_transformers::models::debertav2::{Config as DebertaV2Config, DebertaV2NERModel};
-use candle_transformers::models::debertav2::{DebertaV2SeqClassificationModel, Id2Label};
-use candle_transformers::models::debertav2::{NERItem, TextClassificationItem};
+use lloom_engine::nn::ops::softmax;
+use lloom_engine::nn::VarBuilder;
+use lloom_engine::models::debertav2::{Config as DebertaV2Config, DebertaV2NERModel};
+use lloom_engine::models::debertav2::{DebertaV2SeqClassificationModel, Id2Label};
+use lloom_engine::models::debertav2::{NERItem, TextClassificationItem};
 use clap::{ArgGroup, Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{Encoding, PaddingParams, Tokenizer};
@@ -152,14 +152,14 @@ impl Args {
         let vb = if self.use_pth {
             VarBuilder::from_pth(
                 &weights_filename,
-                candle_transformers::models::debertav2::DTYPE,
+                lloom_engine::models::debertav2::DTYPE,
                 &device,
             )?
         } else {
             unsafe {
                 VarBuilder::from_mmaped_safetensors(
                     &[weights_filename],
-                    candle_transformers::models::debertav2::DTYPE,
+                    lloom_engine::models::debertav2::DTYPE,
                     &device,
                 )?
             }

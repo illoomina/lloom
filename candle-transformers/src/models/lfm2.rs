@@ -10,7 +10,7 @@ use crate::utils::repeat_kv;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::ops::{FlashScratchSizing, KvQuant};
 use candle_nn::{CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, Speculative, VarBuilder};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -19,7 +19,7 @@ pub enum LayerType {
     Conv,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct Lfm2Config {
     pub vocab_size: usize,
     pub hidden_size: usize,
@@ -47,6 +47,12 @@ pub struct Lfm2Config {
     pub block_ffn_dim_multiplier: f32,
     #[serde(default = "default_block_multiple_of")]
     pub block_multiple_of: usize,
+    /// Every checkpoint key not named by a typed field above, kept losslessly
+    /// (pydantic `extra="allow"`). Zero runtime cost when a checkpoint carries
+    /// no unknown keys: the flatten is resolved by serde, and an empty map
+    /// allocates nothing. (`RESTRUCTURING_DESIGN.md` §1.6)
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_num_key_value_heads() -> usize {
@@ -678,6 +684,51 @@ pub struct Config {
 impl Config {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
+    }
+}
+
+/// A `Config` a test or a `..` update can build from, so a new field is not a
+/// breaking change to every struct literal that names the others.
+///
+/// The six integration-test binaries #575 found dark had each stopped compiling
+/// on a `missing field` error one field-add earlier (`DESIGN.md` §15.1k); this
+/// is the repair that section names and does not take, deferred there because it
+/// is a public-API decision. `#[derive(Default)]` cannot express it — `DType`
+/// has no `Default` — so it is hand-written, and its axis fields carry the same
+/// arms `into_config` selects (§7.1a: no default is flipped). The shape fields
+/// are a minimal valid geometry, not any checkpoint's.
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            vocab_size: 0,
+            hidden_size: 0,
+            intermediate_size: 0,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            norm_eps: default_norm_eps(),
+            rope_theta: default_rope_theta(),
+            max_position_embeddings: default_max_position_embeddings(),
+            conv_l_cache: default_conv_l_cache(),
+            conv_bias: false,
+            layer_types: Vec::new(),
+            tie_embedding: false,
+            bos_token_id: None,
+            eos_token_id: None,
+            use_flash_attn: false,
+            attn_impl: AttnImpl::default(),
+            flash_page_size: 256,
+            flash_pages_per_chunk: 1,
+            flash_scratch_sizing: FlashScratchSizing::default(),
+            kv_append: KvAppend::default(),
+            kv_quant: KvQuant::default(),
+            conv_state: ConvState::default(),
+            memory_budget: None,
+            gemv_silu: false,
+            gemv_residual: false,
+            tap_layers: Vec::new(),
+            tap_dtype: DType::F32,
+        }
     }
 }
 
@@ -4101,5 +4152,70 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// `Config::default()` selects the same axis arm every construction path
+    /// selects, so a `..Config::default()` update is byte-identical to naming
+    /// the axis explicitly.
+    ///
+    /// The absolute reference (§3.1b): each axis is pinned to `into_config`'s
+    /// literal, not to "some default". A mutation flipping one arm here — the
+    /// change that silently reroutes every `..`-built test — flips exactly one
+    /// assertion, which is the coverage §15.1k's repair owes.
+    #[test]
+    fn config_default_matches_the_shipped_axis_arms() {
+        let c = Config::default();
+        assert_eq!(c.attn_impl, AttnImpl::Generic, "AttnImpl default arm");
+        assert_eq!(c.kv_append, KvAppend::Cat, "KvAppend default arm");
+        assert_eq!(c.conv_state, ConvState::Shuffle, "ConvState default arm");
+        assert_eq!(c.kv_quant, KvQuant::Off, "KvQuant default arm");
+        assert!(c.memory_budget.is_none(), "MemoryBudget off");
+        assert!(!c.gemv_silu, "GemvSilu off");
+        assert!(!c.gemv_residual, "GemvResidual off");
+        assert!(c.tap_layers.is_empty(), "no tap by default");
+        assert_eq!(c.tap_dtype, DType::F32, "tap dtype");
+        assert_eq!(c.flash_page_size, 256);
+        assert_eq!(c.flash_pages_per_chunk, 1);
+        // Div-by-zero guard: `head_dim` divides by `num_attention_heads`, so the
+        // default must not be zero even though the geometry is otherwise empty.
+        assert_eq!(c.num_attention_heads, 1);
+        assert_eq!(c.head_dim(), 0);
+    }
+
+    /// `#[serde(flatten)] extra` keeps every checkpoint key a typed field does
+    /// not name (pydantic `extra="allow"`), and takes none that a typed field
+    /// does — the two properties that make it lossless without shadowing.
+    #[test]
+    fn lfm2_config_flatten_keeps_unknown_keys_and_takes_no_known_ones() {
+        let json = serde_json::json!({
+            "vocab_size": 65536,
+            "hidden_size": 2048,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 32,
+            "layer_types": ["full_attention", "conv"],
+            // Keys candle's typed struct does not name — must land in `extra`.
+            "architectures": ["Lfm2ForCausalLM"],
+            "torch_dtype": "bfloat16",
+            "unforeseen_future_field": 42
+        });
+        let cfg: Lfm2Config = serde_json::from_value(json).expect("deserialize");
+
+        // Known keys parsed into typed fields, not into `extra`.
+        assert_eq!(cfg.vocab_size, 65536);
+        assert_eq!(cfg.num_attention_heads, 32);
+        assert!(
+            !cfg.extra.contains_key("vocab_size")
+                && !cfg.extra.contains_key("num_attention_heads")
+                && !cfg.extra.contains_key("layer_types"),
+            "a typed field must not also appear in `extra`"
+        );
+
+        // Unknown keys preserved losslessly.
+        assert_eq!(
+            cfg.extra["architectures"],
+            serde_json::json!(["Lfm2ForCausalLM"])
+        );
+        assert_eq!(cfg.extra["torch_dtype"], serde_json::json!("bfloat16"));
+        assert_eq!(cfg.extra["unforeseen_future_field"], serde_json::json!(42));
     }
 }

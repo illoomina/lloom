@@ -78,6 +78,8 @@
 //! This module projects whatever taps it is given. The producer's order and
 //! layer choice are the caller's contract, checked where they are made.
 
+use crate::models::with_tracing::{Embedding as TracedEmbedding, Linear as TracedLinear};
+use crate::nn::speculator::{Draft, KvSource, LayerTaps, SeqId, Speculator};
 use crate::nn::{Linear, RmsNorm, VarBuilder};
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor, D};
 
@@ -485,6 +487,39 @@ impl CtxCache {
         self.k = Some(self.k.as_ref().unwrap().narrow(2, 0, keep)?.contiguous()?);
         self.v = Some(self.v.as_ref().unwrap().narrow(2, 0, keep)?.contiguous()?);
         Ok(())
+    }
+}
+
+// The drafter's own KV cache under the engine seam (`RESTRUCTURING_DESIGN.md`
+// §3.3: "the DSpark draft-KV — all one `KvCache`"). It is the `KvSource::Own`
+// case a `Speculator` names: `append` keys/values the projected `H_ctx` and
+// returns the live `(K, V)`; `rollback` is `truncate`'s draft-side half. This is
+// the concrete `CtxCache: KvCache` that lets `KvSource::Own` name a real type.
+impl crate::nn::kv_cache::seam::KvCache for CtxCache {
+    type View<'a> = (Tensor, Tensor);
+
+    fn append<'a>(&'a mut self, k: &Tensor, v: &Tensor) -> Result<Self::View<'a>> {
+        CtxCache::append(self, k, v)?;
+        Ok((
+            self.k.as_ref().unwrap().clone(),
+            self.v.as_ref().unwrap().clone(),
+        ))
+    }
+
+    fn len(&self) -> usize {
+        CtxCache::len(self)
+    }
+
+    fn rollback(&mut self, to: usize) -> Result<()> {
+        let len = CtxCache::len(self);
+        if to > len {
+            lloom_tensor::bail!("CtxCache rollback to {to} past len {len}")
+        }
+        self.truncate(len - to)
+    }
+
+    fn reset(&mut self) {
+        self.clear()
     }
 }
 
@@ -1163,4 +1198,224 @@ pub fn drafter_params(cfg: &DSparkConfig) -> usize {
         + h // final norm
         + markov
         + confidence
+}
+
+// ---------------------------------------------------------------------------
+// The `Speculator` seam (`RESTRUCTURING_DESIGN.md` §3.4.1), over the DSpark
+// family.
+// ---------------------------------------------------------------------------
+
+/// One sequence's cross-round drafter state — the `Vec<PerSeq>` the trait keeps
+/// PRIVATE (`RESTRUCTURING_DESIGN.md` §3.4.1). Never leaves this module.
+#[derive(Debug)]
+struct PerSeq {
+    /// Per-layer context KV for this sequence's drafter.
+    ctx: Vec<CtxCache>,
+    /// The absolute context position the next `update_context` keys at — grows
+    /// by the accepted length each round (the verify example's `ctx_positions`).
+    ctx_offset: usize,
+    /// The last committed token — the block anchor for the next `draft`.
+    last: u32,
+    /// Whether this slot has been `begin`-seeded.
+    active: bool,
+}
+
+/// A DSpark proposer driving a fixed set of sequences — the [`Speculator`]
+/// implementation of the DSpark family (`RESTRUCTURING_DESIGN.md` §3.4).
+///
+/// # It borrows the target's two projections rather than owning a target
+///
+/// DSpark ships no `embed_tokens` and no `lm_head` (`DSparkDrafter`'s docs); the
+/// block is embedded with the target's raw table and the base logits are the
+/// target's raw head. §3.4's `Speculator::draft(active)` gives the call no target
+/// handle — it is modelled on llama.cpp's self-contained drafter, which carries
+/// its own embed and head. **This is a §3.4/tree seam** (see this PR's finding):
+/// the DSpark family shares the target's embed/`lm_head`, which §3.4 covers for
+/// the *KV* cache ([`KvSource::SharedWithTarget`]) but not for the embed/head. The
+/// faithful resolution that keeps "the drafter does not own a target" is to hold
+/// **clones of the two shared projection tensors** (cheap — both are `Arc`-backed),
+/// supplied at construction by the caller that has the target. A target is never
+/// pinned alive.
+///
+/// # The round, and where the context is seeded
+///
+/// The driver loop is `draft → verify → observe` ([`crate::nn::Session::speculative_step`]).
+/// The first `draft` needs the context already keyed, so a caller seeds it once
+/// after the target's prefill: `begin(seq, prompt)` sets the block anchor to the
+/// prompt's last token, then a single `observe(seq, prefill_taps, &[])` keys the
+/// context from the prefill's taps (empty `accepted` leaves the anchor in place).
+/// Thereafter each `observe` re-keys from the verified round's taps and advances
+/// the anchor. This mirrors the `lfm2-dspark-verify` example's
+/// seed-then-loop shape, factored behind the seam.
+pub struct DSparkSpeculator {
+    drafter: DSparkDrafter,
+    /// The target's token embedding, shared (the drafter ships none).
+    embed: TracedEmbedding,
+    /// The target's raw `lm_head`, shared. The proposal head must stay the raw
+    /// projection (`Model::draft_lm_head`'s contract).
+    lm_head: TracedLinear,
+    seqs: Vec<PerSeq>,
+    /// The draft-block width `γ` and the prediction cap, read once from the
+    /// drafter config.
+    block_size: usize,
+    max_draft: usize,
+}
+
+impl DSparkSpeculator {
+    /// Build a proposer for `n_seq` server slots.
+    ///
+    /// `embed` and `lm_head` are the **target's** — cloned here so the drafter
+    /// borrows the two shared projections without owning the target
+    /// ([`crate::models::lfm2::Model::draft_embedding`],
+    /// [`crate::models::lfm2::Model::lm_head_linear`]).
+    pub fn new(
+        drafter: DSparkDrafter,
+        embed: TracedEmbedding,
+        lm_head: TracedLinear,
+        n_seq: usize,
+    ) -> Self {
+        let block_size = drafter.config().block_size;
+        let max_draft = drafter.config().max_draft();
+        let seqs = (0..n_seq)
+            .map(|_| PerSeq {
+                ctx: drafter.make_ctx_caches(),
+                ctx_offset: 0,
+                last: 0,
+                active: false,
+            })
+            .collect();
+        Self {
+            drafter,
+            embed,
+            lm_head,
+            seqs,
+            block_size,
+            max_draft,
+        }
+    }
+
+    fn seq_mut(&mut self, seq: SeqId) -> Result<&mut PerSeq> {
+        self.seqs
+            .get_mut(seq.0)
+            .ok_or_else(|| lloom_tensor::Error::msg(format!("DSpark: no sequence slot {}", seq.0)))
+    }
+
+    /// Draft one block for one already-seeded sequence — the verify example's
+    /// per-round draft body, factored behind the seam.
+    fn draft_one(&self, seq: &PerSeq) -> Result<Draft> {
+        let device = self.lm_head.weight().device();
+        let block_ids = self.drafter.block_input_ids(seq.last, self.block_size);
+        let block_tensor = Tensor::new(block_ids.as_slice(), device)?.unsqueeze(0)?;
+        let block_embeds = self
+            .drafter
+            .embed_block(&self.embed.forward(&block_tensor)?)?;
+        let hidden = self
+            .drafter
+            .block_hidden(&block_embeds, seq.ctx_offset, &seq.ctx)?;
+        let pred = self
+            .drafter
+            .head_slice(&hidden, self.max_draft)?
+            .squeeze(0)?;
+        let base_logits = self
+            .lm_head
+            .forward(&pred.to_dtype(self.embed.embeddings().dtype())?)?
+            .to_dtype(DType::F32)?;
+        let tokens = self.drafter.sample_block(&base_logits, seq.last)?;
+
+        // The confidence head, when present, is the family's `Draft.confidence`
+        // hint (§3.4.1). `prev_tokens[k]` precedes draft position `k`: the anchor
+        // for `k = 0`, then the drafted tokens. EMPTY when the family exposes no
+        // confidence signal.
+        let confidence = match self.drafter.confidence_head() {
+            None => Vec::new(),
+            Some(_) => {
+                let cap = tokens.len();
+                let head = self.drafter.head_slice(&hidden, cap)?.squeeze(0)?;
+                let mut prev = Vec::with_capacity(cap);
+                prev.push(seq.last);
+                prev.extend_from_slice(&tokens[..cap.saturating_sub(1)]);
+                match self.drafter.confidence_scores(&head, &prev)? {
+                    Some(scores) => scores.to_dtype(DType::F32)?.to_vec1::<f32>()?,
+                    None => Vec::new(),
+                }
+            }
+        };
+
+        Ok(Draft { tokens, confidence })
+    }
+}
+
+impl Speculator for DSparkSpeculator {
+    type Probe = LayerTaps<5>;
+
+    fn n_seq(&self) -> usize {
+        self.seqs.len()
+    }
+
+    fn kv_source(&self) -> KvSource {
+        // DSpark keeps its own draft-KV — the per-layer `CtxCache`
+        // (`RESTRUCTURING_DESIGN.md` §3.4: `KvSource::Own` names a real
+        // `CtxCache: KvCache`).
+        KvSource::Own
+    }
+
+    fn max_draft(&self) -> usize {
+        self.max_draft
+    }
+
+    fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
+        let s = self.seq_mut(seq)?;
+        for c in s.ctx.iter_mut() {
+            c.clear();
+        }
+        s.ctx_offset = 0;
+        s.last = *prompt.last().unwrap_or(&0);
+        s.active = true;
+        Ok(())
+    }
+
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        // Per-seq state is private and `draft_one` reads it immutably, so the
+        // batch is built without a mutable borrow of `self.seqs` outliving the
+        // loop. B>1 amortizes the target's verify pass (§10.2r); the proposals
+        // themselves are per-seq drafter forwards.
+        let mut out = Vec::with_capacity(active.len());
+        for &seq in active {
+            let s = self
+                .seqs
+                .get(seq.0)
+                .ok_or_else(|| lloom_tensor::Error::msg(format!("DSpark: no slot {}", seq.0)))?;
+            if !s.active {
+                lloom_tensor::bail!("DSpark: draft on sequence {} before begin()", seq.0);
+            }
+            out.push(self.draft_one(s)?);
+        }
+        Ok(out)
+    }
+
+    fn observe(
+        &mut self,
+        seq: SeqId,
+        probe: &<Self::Probe as crate::nn::speculator::TargetProbe>::Output,
+        accepted: &[u32],
+    ) -> Result<()> {
+        // `probe` is the target's per-round taps (`Cache::take_taps`), already
+        // trimmed to the accepted rows by the driver. Re-key the drafter's
+        // context from them and advance the context offset and anchor.
+        //
+        // The drafter and the per-seq caches are disjoint fields, so borrow them
+        // separately rather than through one `&mut self` reach — `update_context`
+        // reads `&self.drafter` while writing `&mut s.ctx`.
+        let drafter = &self.drafter;
+        let s = self
+            .seqs
+            .get_mut(seq.0)
+            .ok_or_else(|| lloom_tensor::Error::msg(format!("DSpark: no slot {}", seq.0)))?;
+        drafter.update_context(probe, s.ctx_offset, &mut s.ctx)?;
+        s.ctx_offset = s.ctx.first().map(|c| c.len()).unwrap_or(s.ctx_offset);
+        if let Some(&t) = accepted.last() {
+            s.last = t;
+        }
+        Ok(())
+    }
 }

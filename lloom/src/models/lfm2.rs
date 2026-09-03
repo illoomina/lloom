@@ -1104,6 +1104,44 @@ impl QuantKvSlot {
     }
 }
 
+// The `seam::KvCache` impl for LFM2's in-place slot pair
+// (`RESTRUCTURING_DESIGN.md` §3.3, N2's "append in place" shape). A `KvSlot`
+// stores one of K or V, so the trait — whose `append(k, v)` writes both — is
+// implemented on the `(K, V)` pair the model already holds per layer
+// (`Cache::kv_slots`). `append` returns the two live prefixes as a `(Tensor,
+// Tensor)` view (the paired shape), and `rollback` is the length decrement
+// `KvSlot::rewind` already implements: the in-place slot IS the cache
+// speculation needs, which the `Cat`/rotating caches above cannot be.
+impl crate::nn::kv_cache::seam::KvCache for (KvSlot, KvSlot) {
+    type View<'a> = (Tensor, Tensor);
+
+    fn append<'a>(&'a mut self, k: &Tensor, v: &Tensor) -> Result<Self::View<'a>> {
+        let out_k = self.0.append(k)?;
+        let out_v = self.1.append(v)?;
+        Ok((out_k, out_v))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len
+    }
+
+    fn rollback(&mut self, to: usize) -> Result<()> {
+        let len = self.0.len;
+        if to > len {
+            lloom_tensor::bail!("lfm2 KvSlot rollback to {to} past len {len}")
+        }
+        let discard = len - to;
+        self.0.rewind(discard)?;
+        self.1.rewind(discard)?;
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.0.reset();
+        self.1.reset();
+    }
+}
+
 /// Cache for LFM2 model supporting both attention KV cache and convolution state cache.
 #[derive(Debug, Clone)]
 pub struct Cache {
@@ -3214,6 +3252,19 @@ impl Model {
         self.embed_tokens.forward(input_ids)
     }
 
+    /// The token embedding, for a DSpark drafter that ships none and shares the
+    /// target's (`RESTRUCTURING_DESIGN.md` §3.4; `DSparkSpeculator::new`). A
+    /// clone is cheap — the weight is `Arc`-backed.
+    pub fn draft_embedding(&self) -> &Embedding {
+        &self.embed_tokens
+    }
+
+    /// The raw `lm_head`, shared with a DSpark drafter as its proposal head. See
+    /// [`Self::draft_lm_head`] for why it must stay the raw projection.
+    pub fn lm_head_linear(&self) -> &Linear {
+        &self.lm_head
+    }
+
     /// The **raw** `lm_head` projection, for a drafter that ships none of its
     /// own (`DESIGN.md` §10.2p, issue #363).
     ///
@@ -3553,6 +3604,54 @@ impl Speculative for Model {
 
     fn resolve(cache: &mut Self::Cache, window: Self::Window, n: usize) -> Result<()> {
         cache.resolve(window, n)
+    }
+}
+
+/// LFM2 satisfies `LayerTaps<5>` — it has the layer-input tap hooks a DSpark
+/// drafter reads (`RESTRUCTURING_DESIGN.md` §3.4.3). This impl is the pairing
+/// contract: a drafter whose `Probe` is `NextnHidden` (MTP, needing an
+/// `h_nextn` head LFM2 does not have) does NOT compile against this target,
+/// because LFM2 implements `Probes<LayerTaps<5>>` and NOT `Probes<NextnHidden>`.
+///
+/// `verify_and_probe` wires to the existing `verify_step` + `Cache::take_taps`,
+/// adding no computation. LFM2's cache is one sequence (B=1), so `anchors`/
+/// `drafts` carry exactly one entry; a second is a shape the cache cannot hold
+/// today and is refused rather than silently ignored.
+impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
+    fn verify_and_probe(
+        &self,
+        drafts: &[crate::nn::Draft],
+        anchors: &[crate::nn::Anchor],
+        cache: &mut Self::Cache,
+    ) -> Result<(Vec<Vec<u32>>, Vec<Tensor>)> {
+        if drafts.len() != 1 || anchors.len() != 1 {
+            lloom_tensor::bail!(
+                "lfm2 verify_and_probe: the LFM2 cache is single-sequence (B=1); \
+                 got {} drafts and {} anchors. Batched speculation needs the \
+                 batched cache (§10.2r, not built here).",
+                drafts.len(),
+                anchors.len()
+            )
+        }
+        let anchor = anchors[0];
+        let accepted = self.verify_step(anchor.last, &drafts[0].tokens, anchor.pos, cache)?;
+
+        // The probe: this pass's layer-input taps, drained. Trim to the accepted
+        // rows — the rejected positions describe state the target just rolled
+        // back (§10.2m). `take_taps` is empty unless `tap_layers` was set, so a
+        // caller that did not build the cache with taps gets an empty probe and
+        // the mismatch surfaces at the drafter, not here.
+        let taps = cache.take_taps();
+        let n_acc = accepted.len();
+        let probe = taps
+            .iter()
+            .map(|t| {
+                let seq = t.dim(1)?;
+                t.narrow(1, 0, n_acc.min(seq))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((vec![accepted], probe))
     }
 }
 

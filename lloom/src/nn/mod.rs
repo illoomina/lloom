@@ -37,6 +37,7 @@ pub mod rnn;
 pub mod rotary_emb;
 pub mod sampling;
 pub mod sequential;
+pub mod speculator;
 pub mod var_builder;
 pub mod var_map;
 /// Re-export of [`attention::varlen`] for backward compatibility.
@@ -64,6 +65,10 @@ pub use ops::Dropout;
 pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
+pub use speculator::{
+    Anchor, Draft, KvSource, LayerTaps, NextnHidden, NoProbe, ProbeHooks, Probes, SeqId, Session,
+    Speculator, TapSide, TapSpec, TargetProbe,
+};
 pub use var_builder::VarBuilder;
 pub use var_map::VarMap;
 

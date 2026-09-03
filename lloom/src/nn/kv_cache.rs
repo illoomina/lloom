@@ -2,6 +2,89 @@
 //!
 use lloom_tensor::{DType, Device, Result, Tensor};
 
+/// The append-and-read seam every attention KV cache shares
+/// (`RESTRUCTURING_DESIGN.md` §3.3, `DESIGN.md` §15.2 #15).
+///
+/// A model's attention body writes this token's K and V, then reads the live
+/// prefix back to attend over. The caches differ in *how* they store — a fixed
+/// buffer written at a moving offset (`KvCache`), a `Tensor::cat` (`ConcatKvCache`),
+/// a rotating ring (`RotatingKvCache`), a sequence-first interleave
+/// (`InterleavedKvCache`), LFM2's in-place slots — but a generic forward pass
+/// only needs the two verbs `append` and `len`, plus the rollback the
+/// speculative verify loop calls. Making that a trait lets `Attention::forward`
+/// be written once over `C: KvCache` rather than branching on which cache it holds.
+///
+/// # `View` is an associated type because the read shape is not shared
+///
+/// The zoo's paired caches hand back `(Tensor, Tensor)`; the interleaved cache
+/// hands back one sequence-first `Tensor`; an in-place slot pair hands back its
+/// two live prefixes. The return is therefore `type View<'a>`, not a fixed
+/// tuple — the N2 finding (`RESTRUCTURING_DESIGN.md` §3.3): force one return
+/// shape and the trait is an eleventh cache rather than the seam over the ten.
+///
+/// # What does NOT implement it, and why that is honest
+///
+/// Four cache-like types are not attention KV caches under this seam and are
+/// deliberately left out rather than bent to fit:
+/// - [`Cache`] is LFM2's **conv** state (single tensor, `append(src)`), not a
+///   K/V pair; the conv seam is a different verb.
+/// - [`ScatteredKvCache`] appends with an extra `IndicesAndMask` argument the
+///   trait's `append(k, v)` has no slot for — a batched-scatter cache whose
+///   write needs the per-batch index plan.
+/// - [`RawInterleavedKvCache`] is a CPU-side `Vec<f32>` written from flat slices
+///   (`write_kv`), not `Tensor`s — a different storage layer entirely.
+/// - LFM2's `QuantKvSlot` pair (`lfm2.rs`): its `append` quantizes and returns
+///   **nothing to attend over** — the kernel (`sdpa_quant`) reads its code /
+///   scale / bias planes directly, so there is no live `(K, V)` view to hand
+///   back. Its `KvSlot` sibling (f16, returns the live prefix) DOES implement
+///   the trait; the quantized arm is the non-fitting shape.
+///
+/// Forcing these under `append(k, v) -> Tensor` was the trap the N2 finding
+/// names; they keep their own inherent methods.
+///
+/// # The trait is `seam::KvCache`, path-qualified, because the name is taken
+///
+/// `RESTRUCTURING_DESIGN.md` §3.3 locks the trait *name* `KvCache`, but the
+/// concrete fixed-buffer struct [`KvCache`] already holds that name in this
+/// module, and a trait and a struct with one name in one module is `E0428`. The
+/// trait keeps its locked name and lives one module down (`seam`); every
+/// consumer names it `kv_cache::seam::KvCache`. Renaming the struct instead
+/// would churn ~8 zoo files and risk their digests for a name — see this PR's
+/// finding.
+pub mod seam {
+    use super::{Result, Tensor};
+
+    /// The append-and-read seam every attention KV cache shares
+    /// (`RESTRUCTURING_DESIGN.md` §3.3).
+    pub trait KvCache {
+        /// The live cache after the append, borrowed for `'a`. `(Tensor, Tensor)`
+        /// for the paired caches, one `Tensor` for the interleaved cache.
+        type View<'a>
+        where
+            Self: 'a;
+
+        /// Write this step's `k` and `v` and return the live cache to attend over.
+        fn append<'a>(&'a mut self, k: &Tensor, v: &Tensor) -> Result<Self::View<'a>>;
+
+        /// Positions currently live in the cache.
+        fn len(&self) -> usize;
+
+        fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
+
+        /// Discard back to `to` positions — the speculative verify loop's
+        /// rollback half. `Err` for a cache that cannot rewind (a `Tensor::cat`
+        /// cache has no length to decrement; the discarded positions are inside
+        /// the allocation), so a driver that pairs speculation with such a cache
+        /// fails loudly at the first rollback rather than reading stale positions.
+        fn rollback(&mut self, to: usize) -> Result<()>;
+
+        /// Drop all state, returning the cache to empty.
+        fn reset(&mut self);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Cache {
     // all_data is an option on a Tensor, this makes it possible to only create the actual tensor
@@ -788,6 +871,120 @@ impl ConcatKvCache {
             (Some(k), Some(v)) => Some((k, v)),
             _ => None,
         }
+    }
+}
+
+// `seam::KvCache` impls for the paired caches that fit `append(k, v)` cleanly
+// (`RESTRUCTURING_DESIGN.md` §3.3). Each wires to the inherent `append`/`reset`
+// above and adds only `len` and `rollback`; no computation changes. The inherent
+// methods are called as `Self::` so they resolve to the struct's methods, not
+// the trait's identically-named ones.
+
+impl seam::KvCache for KvCache {
+    // The fixed-buffer cache: `slice_set` at a moving offset. It cannot rewind —
+    // its `append` reallocates with `Tensor::cat` on exhaustion (the `Grow` arm),
+    // and a decrement would not undo that — so `rollback` refuses.
+    type View<'a> = (Tensor, Tensor);
+
+    fn append<'a>(&'a mut self, k: &Tensor, v: &Tensor) -> Result<Self::View<'a>> {
+        Self::append(self, k, v)
+    }
+
+    fn len(&self) -> usize {
+        self.current_seq_len()
+    }
+
+    fn rollback(&mut self, _to: usize) -> Result<()> {
+        lloom_tensor::bail!(
+            "KvCache cannot roll back: its append grows with `Tensor::cat`, so a \
+             rewound position is inside the allocation. Speculation needs an \
+             in-place cache."
+        )
+    }
+
+    fn reset(&mut self) {
+        Self::reset(self)
+    }
+}
+
+impl seam::KvCache for RotatingKvCache {
+    type View<'a> = (Tensor, Tensor);
+
+    fn append<'a>(&'a mut self, k: &Tensor, v: &Tensor) -> Result<Self::View<'a>> {
+        Self::append(self, k, v)
+    }
+
+    fn len(&self) -> usize {
+        self.current_seq_len()
+    }
+
+    fn rollback(&mut self, _to: usize) -> Result<()> {
+        lloom_tensor::bail!(
+            "RotatingKvCache cannot roll back: the ring overwrites, so a position \
+             leaving the window is gone and cannot be restored."
+        )
+    }
+
+    fn reset(&mut self) {
+        Self::reset(self)
+    }
+}
+
+impl seam::KvCache for ConcatKvCache {
+    // The one paired cache that CAN roll back: `narrow` on the concatenated
+    // allocation keeps the first `to` positions.
+    type View<'a> = (Tensor, Tensor);
+
+    fn append<'a>(&'a mut self, k: &Tensor, v: &Tensor) -> Result<Self::View<'a>> {
+        Self::append(self, k, v)
+    }
+
+    fn len(&self) -> usize {
+        self.current_seq_len()
+    }
+
+    fn rollback(&mut self, to: usize) -> Result<()> {
+        let len = self.current_seq_len();
+        if to > len {
+            lloom_tensor::bail!("ConcatKvCache rollback to {to} past len {len}")
+        }
+        if to == len {
+            return Ok(());
+        }
+        if to == 0 {
+            Self::reset(self);
+            return Ok(());
+        }
+        let dim = self.dim();
+        self.k = Some(self.k.as_ref().unwrap().narrow(dim, 0, to)?.contiguous()?);
+        self.v = Some(self.v.as_ref().unwrap().narrow(dim, 0, to)?.contiguous()?);
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        Self::reset(self)
+    }
+}
+
+impl seam::KvCache for InterleavedKvCache {
+    // The interleaved cache returns ONE sequence-first tensor `(S, H_kv, 2D)`,
+    // not a pair — the `View` GAT is exactly why the trait admits it.
+    type View<'a> = Tensor;
+
+    fn append<'a>(&'a mut self, k: &Tensor, v: &Tensor) -> Result<Self::View<'a>> {
+        Self::append(self, k, v)
+    }
+
+    fn len(&self) -> usize {
+        self.current_seq_len()
+    }
+
+    fn rollback(&mut self, _to: usize) -> Result<()> {
+        lloom_tensor::bail!("InterleavedKvCache cannot roll back: append grows with `Tensor::cat`.")
+    }
+
+    fn reset(&mut self) {
+        Self::reset(self)
     }
 }
 

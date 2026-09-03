@@ -55,16 +55,35 @@
 //! this, and the run **reports the degeneracy of its own output stream** so the
 //! reader can see whether the prompt held up rather than trusting that it did.
 //!
-//! # What it does not do
+//! # Timing is OPT-IN, and it is `--timing` (§10.2r, the follow-on)
 //!
-//! **No timing, no `.bench/` row, no lease, no default flipped** (§7.1a, §2.6).
-//! An acceptance rate is a property of the model pair, not of the machine — it
-//! is a count of matching tokens, identical on Metal and CPU, and it needs no
-//! GPU exclusivity to be correct. The GPU-busy-per-accepted-token figure §10.2j
-//! measures with an *oracle* proposer is the follow-on that wants a lease, and
-//! it is deliberately not taken here: this run establishes the accept rate that
-//! every such figure needs as its input, which #363 says has never been measured
-//! (*"every acceptance rate there is imposed rather than earned"*).
+//! The accept rate above needs no lease: it is a count of matching tokens,
+//! identical on Metal and CPU. **Whether DSpark PAYS is a different question in
+//! a different quantity**, and §10.2q names it as the first thing owed —
+//! *"GPU busy per accepted token, re-measured with the earned rates"*. §10.2j's
+//! curve is **oracle-only**, and an oracle proposer is a **pre-recorded array
+//! lookup**: it costs nothing to run, so that curve prices the verify side of
+//! speculation with the draft side set to zero. A real drafter is a 327.7M
+//! parameter forward pass per round — #91's own cost table calls it *"added
+//! bandwidth per verify, so the acceptance rate has to carry it"* — and that
+//! term has never been in any speculative figure this project has recorded.
+//!
+//! `--timing` adds it, and reports **three brackets per round** rather than one,
+//! because a single per-token figure cannot say *which side* pays:
+//!
+//! * **draft** — the drafter's block forward pass, its heads and its sampler
+//! * **verify** — the target's `forward_all` over the proposed block
+//! * **overhead** — re-keying the drafter's context from the accepted rows
+//!
+//! against a **baseline arm decoding the same prompt one token at a time on the
+//! same binary**, interleaved slot by slot (`CONTRIBUTING.md` §3.2) with a
+//! **null control** — the baseline against itself — beside it, because an effect
+//! smaller than the null is not an effect (§1.3).
+//!
+//! **Run it under a lease.** `lloom-arb measure` is required for the timing arm
+//! and the harness says so; the accept-rate arm remains lease-free.
+
+#![allow(clippy::too_many_arguments)]
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
@@ -83,6 +102,97 @@ use candle_transformers::models::lfm2_dspark::{
 use clap::Parser;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
+
+/// Access to the Metal profiling counters, with a no-op stand-in off Metal.
+///
+/// Lifted from `lfm2-decode-profile`, for that harness's stated reason: the
+/// shim keeps the call sites unconditional, and a `cfg`-heavy measurement loop
+/// is exactly where a *"which build did this number come from?"* mistake hides.
+#[cfg(feature = "metal")]
+mod profile {
+    pub use candle::metal_backend::profile::{enabled, reset, snapshot};
+}
+
+#[cfg(not(feature = "metal"))]
+mod profile {
+    #[derive(Clone, Debug, Default)]
+    pub struct Snapshot {
+        pub dispatches: u64,
+        pub gpu_busy_union_s: f64,
+    }
+    pub fn enabled() -> bool {
+        false
+    }
+    pub fn reset() {}
+    pub fn snapshot() -> Snapshot {
+        Snapshot::default()
+    }
+}
+
+/// One bracketed phase: wall time, GPU-busy time, and dispatches.
+///
+/// **GPU busy is the UNION of command-buffer intervals, never the sum**
+/// (`profile.rs:222` — *"this is the figure to trust"*): two buffers in flight
+/// together are one busy interval, and summing them over-counts. Every figure
+/// this harness reports is the union.
+#[derive(Clone, Copy, Debug, Default)]
+struct Bracket {
+    wall_s: f64,
+    gpu_s: f64,
+    dispatches: u64,
+}
+
+impl std::ops::AddAssign for Bracket {
+    fn add_assign(&mut self, o: Self) {
+        self.wall_s += o.wall_s;
+        self.gpu_s += o.gpu_s;
+        self.dispatches += o.dispatches;
+    }
+}
+
+/// Close a bracket: synchronize, read the clock, take and clear the counters.
+///
+/// **The synchronize is inside the bracket deliberately**, and it is the same
+/// decision `lfm2-decode-profile` records at its own verify pass: the consumer
+/// reads the result back (the accept test compares tokens; the drafter samples
+/// from logits), so the serialization is **inherent to the workload** rather
+/// than an artifact of measuring it. A bracket that ended before the GPU
+/// finished would attribute the wait to whichever phase happened to synchronize
+/// next.
+fn close_bracket(device: &Device, start: std::time::Instant) -> Result<Bracket> {
+    device.synchronize()?;
+    let wall_s = start.elapsed().as_secs_f64();
+    let (gpu_s, dispatches) = if profile::enabled() {
+        let s = profile::snapshot();
+        profile::reset();
+        (s.gpu_busy_union_s, s.dispatches)
+    } else {
+        (0.0, 0)
+    };
+    Ok(Bracket {
+        wall_s,
+        gpu_s,
+        dispatches,
+    })
+}
+
+/// The median of a slice, by value. Used rather than the mean for the reason
+/// `CONTRIBUTING.md` §3.2a #3 gives and §6.6b measures: these distributions are
+/// right-tailed with a floor, and a run mean carries **twice** the noise of a
+/// median (cv 18.89 % against 8.75 %).
+fn median(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return f64::NAN;
+    }
+    let mut v = xs.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
 
 /// The released drafter's own parameter total, summed from the payload-bearing
 /// safetensors header (§10.2p, delta 0 against the config-derived count).
@@ -167,6 +277,36 @@ struct Args {
     /// which it used.
     #[arg(long, default_value = "all")]
     prefill_ctx: String,
+
+    /// Time the loop and compare it against non-speculative decode (§10.2r).
+    ///
+    /// **Off by default and it must stay off by default** (§7.1a): the accept
+    /// rate is a count and needs no lease, where this needs an exclusive one.
+    /// With it on, each round is bracketed into `draft` / `verify` / `overhead`
+    /// and the baseline arm is timed the same way, interleaved slot by slot.
+    #[arg(long)]
+    timing: bool,
+
+    /// Interleaved A/B rotations for `--timing`. Each runs SPEC, BASE, BASE'.
+    ///
+    /// `BASE'` is the **null control** (§1.3): the same arm in a second slot of
+    /// the same rotation, which bounds what this instrument can resolve on this
+    /// machine at this load. An effect smaller than the null is not an effect.
+    #[arg(long, default_value_t = 5)]
+    reps: usize,
+
+    /// Tokens the baseline arm decodes per rotation. The speculative arm runs
+    /// until it has emitted at least this many, so both arms are compared over
+    /// the same number of EMITTED tokens rather than the same number of steps.
+    #[arg(long, default_value_t = 96)]
+    timing_tokens: usize,
+
+    /// Warm-up rounds excluded from every timed figure.
+    ///
+    /// The first pass through any kernel pays pipeline construction and a cold
+    /// pool; `lfm2-decode-profile` carries `--warmup` for the same reason.
+    #[arg(long, default_value_t = 8)]
+    timing_warmup: usize,
 }
 
 fn newest_snapshot(repo: &str) -> Option<PathBuf> {
@@ -287,6 +427,18 @@ struct Round {
     accepted: Vec<u32>,
     /// How many of `proposed` the target agreed with, before the correction.
     matched: usize,
+    /// The drafter's block pass, its heads and its sampler. Zero unless
+    /// `--timing`.
+    ///
+    /// **This is the term §10.2j's oracle curve sets to zero**, and the reason
+    /// this harness exists: an oracle proposer is an array lookup, so that
+    /// curve prices the verify side with the draft side free.
+    draft: Bracket,
+    /// The target's `forward_all` over the proposed block — the term §10.2j
+    /// does measure.
+    verify: Bracket,
+    /// Re-keying the drafter's context cache from the accepted rows.
+    overhead: Bracket,
 }
 
 impl Round {
@@ -299,6 +451,258 @@ impl Round {
     fn advance(&self) -> usize {
         self.accepted.len()
     }
+}
+
+/// Does it pay? The three brackets against the baseline, per emitted token.
+///
+/// # Why the denominator is EMITTED TOKENS and not rounds
+///
+/// A speculative round consumes one draft and one verify and emits between 1
+/// and `K` tokens; a baseline step emits exactly one. The only quantity in
+/// which the two arms are comparable is **cost per token the user receives**,
+/// which is §10.2j's own rule (*"per-token fields divide by tokens accepted, as
+/// a ratio of sums rather than a mean of per-window ratios"*) — a mean of
+/// per-round ratios would weight a 1-accept round as heavily as an 8-accept
+/// one.
+///
+/// # Why three brackets and not one
+///
+/// Because a single number cannot say which side pays, and the two sides move
+/// in opposite directions with the accept rate. The verify side *amortizes*:
+/// one weight load serves `advance` tokens, so its per-token cost falls as
+/// acceptance rises. The draft side is *fixed per round*: the drafter runs
+/// once whatever happens, so its per-token cost also falls with acceptance —
+/// but it is a cost the baseline does not pay at all, and §10.2j's oracle set
+/// it to zero.
+fn report_timing(
+    rounds: &[Round],
+    base_steps: &[Bracket],
+    null_steps: &[Bracket],
+    k: usize,
+    warmup: usize,
+    prompt_id: &str,
+) -> Result<()> {
+    println!("\n=== 6. DOES IT PAY? (§10.2r) ===");
+
+    if !profile::enabled() {
+        println!(
+            "GPU-busy columns are ZERO: CANDLE_METAL_PROFILE is not set.\n\
+             Wall columns are still valid. Set CANDLE_METAL_PROFILE=1 for the\n\
+             GPU-side split (§4's note: the census costs ~14 ns/dispatch, so say\n\
+             which arm a timed figure was taken under)."
+        );
+    }
+
+    // Warm-up rounds are dropped from BOTH arms by the same rule: the first
+    // pass through any kernel pays pipeline construction and a cold pool.
+    if rounds.len() <= warmup || base_steps.len() <= warmup {
+        bail!(
+            "FAIL: not enough timed work to drop {warmup} warm-up rounds \
+             ({} speculative rounds, {} baseline steps). Raise --timing-tokens \
+             or lower --timing-warmup.",
+            rounds.len(),
+            base_steps.len()
+        );
+    }
+    let spec = &rounds[warmup..];
+    let base = &base_steps[warmup..];
+
+    // ---- the baseline, per token ------------------------------------------
+    // A step IS a token here, so the median over steps is the per-token figure
+    // directly. Reported beside the mean because the gap between them is how
+    // perturbed the run was (§6.6b: the mean sits above the median by a margin
+    // set by the tail).
+    let base_wall: Vec<f64> = base.iter().map(|b| b.wall_s * 1e3).collect();
+    let base_gpu: Vec<f64> = base.iter().map(|b| b.gpu_s * 1e3).collect();
+    let base_wall_med = median(&base_wall);
+    let base_gpu_med = median(&base_gpu);
+    let base_wall_mean = base_wall.iter().sum::<f64>() / base_wall.len() as f64;
+    let base_disp: u64 = base.iter().map(|b| b.dispatches).sum::<u64>() / base.len() as u64;
+
+    // ---- the speculative arm, per EMITTED token ---------------------------
+    // Ratio of sums, per §10.2j. `advance` is what the stream moved forward.
+    let emitted: usize = spec.iter().map(|r| r.advance()).sum();
+    let sum_draft_wall: f64 = spec.iter().map(|r| r.draft.wall_s).sum::<f64>() * 1e3;
+    let sum_verify_wall: f64 = spec.iter().map(|r| r.verify.wall_s).sum::<f64>() * 1e3;
+    let sum_over_wall: f64 = spec.iter().map(|r| r.overhead.wall_s).sum::<f64>() * 1e3;
+    let sum_draft_gpu: f64 = spec.iter().map(|r| r.draft.gpu_s).sum::<f64>() * 1e3;
+    let sum_verify_gpu: f64 = spec.iter().map(|r| r.verify.gpu_s).sum::<f64>() * 1e3;
+    let sum_over_gpu: f64 = spec.iter().map(|r| r.overhead.gpu_s).sum::<f64>() * 1e3;
+
+    let e = emitted as f64;
+    let spec_wall_per_tok = (sum_draft_wall + sum_verify_wall + sum_over_wall) / e;
+    let spec_gpu_per_tok = (sum_draft_gpu + sum_verify_gpu + sum_over_gpu) / e;
+    let mean_adv = e / spec.len() as f64;
+
+    let spec_disp: u64 = spec
+        .iter()
+        .map(|r| r.draft.dispatches + r.verify.dispatches + r.overhead.dispatches)
+        .sum();
+
+    println!("rounds timed        : {} (dropped {warmup} warm-up)", spec.len());
+    println!("baseline steps timed: {} (dropped {warmup} warm-up)", base.len());
+    println!("tokens emitted      : {emitted}  (mean advance {mean_adv:.3})");
+
+    println!("\n-- per EMITTED token, wall (ms) --");
+    println!("  draft             : {:8.3}", sum_draft_wall / e);
+    println!("  verify            : {:8.3}", sum_verify_wall / e);
+    println!("  overhead (re-key) : {:8.3}", sum_over_wall / e);
+    println!("  SPECULATIVE TOTAL : {spec_wall_per_tok:8.3}");
+    println!("  baseline (median) : {base_wall_med:8.3}   (mean {base_wall_mean:.3})");
+    let wall_ratio = spec_wall_per_tok / base_wall_med;
+    println!(
+        "  RATIO spec/base   : {wall_ratio:8.3}   ({})",
+        if wall_ratio < 1.0 {
+            "speculation is FASTER"
+        } else {
+            "speculation is SLOWER"
+        }
+    );
+
+    println!("\n-- per EMITTED token, GPU busy union (ms) --");
+    println!("  draft             : {:8.3}", sum_draft_gpu / e);
+    println!("  verify            : {:8.3}", sum_verify_gpu / e);
+    println!("  overhead (re-key) : {:8.3}", sum_over_gpu / e);
+    println!("  SPECULATIVE TOTAL : {spec_gpu_per_tok:8.3}");
+    println!("  baseline (median) : {base_gpu_med:8.3}");
+    let gpu_ratio = if base_gpu_med > 0.0 {
+        spec_gpu_per_tok / base_gpu_med
+    } else {
+        f64::NAN
+    };
+    println!("  RATIO spec/base   : {gpu_ratio:8.3}");
+
+    // Per-bracket dispatch counts, because the total cannot attribute. §10.2j
+    // measured the verify pass at 1520.7 dispatches/forward at K=8, so this
+    // column is what says whether the verify half here is the same mechanism
+    // that section measured or a different one wearing its name.
+    let d_draft: u64 = spec.iter().map(|r| r.draft.dispatches).sum();
+    let d_verify: u64 = spec.iter().map(|r| r.verify.dispatches).sum();
+    let d_over: u64 = spec.iter().map(|r| r.overhead.dispatches).sum();
+    let nr = spec.len() as f64;
+    println!("\n-- dispatches --");
+    println!("  baseline per token       : {base_disp}");
+    println!("  draft    per round       : {:.1}", d_draft as f64 / nr);
+    println!("  verify   per round       : {:.1}", d_verify as f64 / nr);
+    println!("  overhead per round       : {:.1}", d_over as f64 / nr);
+    println!(
+        "  speculative per round    : {:.1}   (per emitted token {:.1})",
+        spec_disp as f64 / nr,
+        spec_disp as f64 / e
+    );
+
+    // ---- the break-even the drafter would have to reach --------------------
+    //
+    // Hold the measured per-round costs fixed and ask what mean advance would
+    // make the arm pay. This is arithmetic over measured inputs rather than a
+    // second measurement, and it is what says whether the gap is a tuning
+    // distance or a structural one.
+    let per_round_wall = (sum_draft_wall + sum_verify_wall + sum_over_wall) / spec.len() as f64;
+    let breakeven_adv = per_round_wall / base_wall_med;
+    // ---- does the BATCHED VERIFY amortize? --------------------------------
+    //
+    // This is the half of the economics that is a claim about the mechanism
+    // rather than about the drafter, and it must be separated from the accept
+    // rate or a negative headline reads as "batched verify does not work".
+    // The verify pass runs K positions through ONE weight sweep, so the
+    // comparable quantity is its cost per VERIFIED POSITION against a baseline
+    // step (one position, one sweep). #148's bandwidth-amortization claim
+    // (§10.2m) is exactly this ratio.
+    let verify_per_round = sum_verify_wall / nr;
+    let verify_per_position = verify_per_round / k as f64;
+    println!("\n-- does batched verify amortize? (the mechanism, not the drafter) --");
+    println!("  verify per round        : {verify_per_round:8.3} ms  (K = {k} positions, one weight sweep)");
+    println!("  verify per POSITION     : {verify_per_position:8.3} ms");
+    println!("  baseline per token      : {base_wall_med:8.3} ms  (one position, one weight sweep)");
+    println!(
+        "  amortization            : {:8.3}x  -- one weight-load serving {k} positions is \
+         {} cheaper per position",
+        base_wall_med / verify_per_position,
+        if base_wall_med > verify_per_position {
+            "this much"
+        } else {
+            "NOT"
+        }
+    );
+    println!(
+        "  so the verify side WORKS as designed; what decides the verdict is how many of the \n\
+           {k} verified positions are KEPT, which is the accept rate: {mean_adv:.3} of {k}."
+    );
+
+    // ---- the null control, which bounds what any of this resolves ---------
+    //
+    // §1.3: *"if the null is larger than the effect you are claiming, the
+    // honest verdict is no effect resolvable at this noise level."* Here the
+    // effect is ~1.5x and the null is a fraction of a percent, which is the
+    // only reason the ratio above is worth stating at all.
+    let null_ratio = if null_steps.len() > warmup {
+        let null_wall: Vec<f64> = null_steps[warmup..].iter().map(|b| b.wall_s * 1e3).collect();
+        let null_med = median(&null_wall);
+        let r = null_med / base_wall_med;
+        println!("\n-- null control (the same baseline arm, second slot) --");
+        println!("  baseline slot 1   : {base_wall_med:8.3} ms/token");
+        println!("  baseline slot 2   : {null_med:8.3} ms/token");
+        println!(
+            "  NULL ratio        : {r:8.3}   ({:+.2} %)",
+            (r - 1.0) * 100.0
+        );
+        println!(
+            "  effect being claimed: {:+.1} %  -- {} the null",
+            (wall_ratio - 1.0) * 100.0,
+            if (wall_ratio - 1.0).abs() > (r - 1.0).abs() * 3.0 {
+                "comfortably larger than"
+            } else {
+                "NOT clearly larger than -- report as UNRESOLVED"
+            }
+        );
+        r
+    } else {
+        println!("\n-- null control: NOT RUN --");
+        f64::NAN
+    };
+
+    println!("\n-- break-even --");
+    println!("  cost of one round     : {per_round_wall:8.3} ms wall");
+    println!("  baseline per token    : {base_wall_med:8.3} ms wall");
+    println!(
+        "  advance needed to pay : {breakeven_adv:8.3} tokens/round  (K = {k}, so it is \
+         {})",
+        if breakeven_adv > k as f64 {
+            "UNREACHABLE at this K"
+        } else {
+            "reachable in principle"
+        }
+    );
+    println!("  advance measured      : {mean_adv:8.3}");
+    println!(
+        "  shortfall             : {:8.3}x  (measured advance / needed advance)",
+        mean_adv / breakeven_adv
+    );
+
+    println!(
+        "\nRESULT_TIMING prompt_id={prompt_id} k={k} rounds={} emitted={emitted} \
+         mean_advance={mean_adv:.4} \
+         spec_wall_ms_per_token={spec_wall_per_tok:.4} \
+         base_wall_ms_per_token={base_wall_med:.4} wall_ratio={wall_ratio:.4} \
+         spec_gpu_ms_per_token={spec_gpu_per_tok:.4} \
+         base_gpu_ms_per_token={base_gpu_med:.4} gpu_ratio={gpu_ratio:.4} \
+         draft_wall_ms_per_token={:.4} verify_wall_ms_per_token={:.4} \
+         overhead_wall_ms_per_token={:.4} \
+         breakeven_advance={breakeven_adv:.4} null_ratio={null_ratio:.4} \
+         draft_disp_per_round={:.1} verify_disp_per_round={:.1} \
+         overhead_disp_per_round={:.1} base_disp_per_token={base_disp} \
+         profile_enabled={}",
+        spec.len(),
+        sum_draft_wall / e,
+        sum_verify_wall / e,
+        sum_over_wall / e,
+        d_draft as f64 / nr,
+        d_verify as f64 / nr,
+        d_over as f64 / nr,
+        profile::enabled(),
+    );
+
+    Ok(())
 }
 
 /// The degeneracy of a token stream, for the #549 check.
@@ -566,9 +970,25 @@ fn main() -> Result<()> {
     stream.push(anchor);
     let mut index_pos = prompt_ids.len();
 
+    // With `--timing` the loop runs until it has EMITTED `--timing-tokens`
+    // tokens rather than for a fixed round count: the two arms must be compared
+    // over the same number of emitted tokens, and a speculative round emits
+    // between 1 and K of them. Without it, the round count is what the accept
+    // rate is quoted over and is unchanged.
+    let round_budget = if args.timing { usize::MAX } else { args.rounds };
+
     println!("\n rnd  proposed                              matched  advance  stream");
-    for r in 0..args.rounds {
+    for r in 0..round_budget {
+        if args.timing && stream.len() > args.timing_tokens + args.timing_warmup * k {
+            break;
+        }
         // ---- draft ------------------------------------------------------
+        // **The term §10.2j's oracle sets to zero.** Bracketed on its own so
+        // the report can say which side of speculation pays: an oracle
+        // proposer is an array lookup, a real drafter is a 327.7M-parameter
+        // forward pass, and only one of those has ever been in a speculative
+        // cost figure here.
+        let t_draft = std::time::Instant::now();
         let width = dcfg.block_size;
         let block_ids = drafter.block_input_ids(last, width);
         let block_tensor = Tensor::new(block_ids.as_slice(), &device)?.unsqueeze(0)?;
@@ -579,12 +999,23 @@ fn main() -> Result<()> {
             .draft_lm_head(&pred.to_dtype(DType::F16)?)?
             .to_dtype(DType::F32)?;
         let proposed = drafter.sample_block(&base_logits, last)?;
+        let b_draft = if args.timing {
+            close_bracket(&device, t_draft)?
+        } else {
+            Bracket::default()
+        };
 
         // ---- verify -----------------------------------------------------
         // ONE target forward pass over the whole proposed block, longest
         // matching prefix accepted, KV rewound and conv phase rolled for the
         // rest. This is `lfm2.rs:3199` and this loop is its first caller.
+        let t_verify = std::time::Instant::now();
         let accepted = spec_model.verify_step(last, &proposed, index_pos, &mut cache)?;
+        let b_verify = if args.timing {
+            close_bracket(&device, t_verify)?
+        } else {
+            Bracket::default()
+        };
 
         // How many proposals the target agreed with, which is `advance - 1`
         // when the last token is the free bonus and `advance` when a rejection
@@ -605,6 +1036,7 @@ fn main() -> Result<()> {
         // The verify pass tapped all `k` positions; the rejected ones describe
         // state the target has just rolled back, so keying them would condition
         // the next draft on a future that did not happen.
+        let t_over = std::time::Instant::now();
         let pass_taps = cache.take_taps();
         if pass_taps.len() != tap_layers.len() {
             bail!(
@@ -627,6 +1059,11 @@ fn main() -> Result<()> {
             .collect::<candle::Result<Vec<_>>>()?;
         drafter.update_context(&kept, ctx_positions, &mut caches)?;
         ctx_positions = caches[0].len();
+        let b_over = if args.timing {
+            close_bracket(&device, t_over)?
+        } else {
+            Bracket::default()
+        };
 
         let prop_s = format!("{proposed:?}");
         println!(
@@ -644,12 +1081,23 @@ fn main() -> Result<()> {
             proposed,
             accepted,
             matched,
+            draft: b_draft,
+            verify: b_verify,
+            overhead: b_over,
         });
     }
 
     // =====================================================================
-    // ARM 2 — non-speculative decode, the identity gate
+    // ARM 2 — non-speculative decode, the identity gate (and the baseline)
     // =====================================================================
+    // Per-step brackets for the baseline arm. Empty unless `--timing`, and it
+    // is the reference every speculative figure below is stated against: the
+    // SAME binary, the SAME prompt, the SAME machine, decoding one token at a
+    // time. `CONTRIBUTING.md` §3.2's interleaving is what the rotation loop
+    // does with it.
+    let mut base_steps: Vec<Bracket> = Vec::new();
+    // The null control's per-step brackets — ARM 3, below.
+    let mut null_steps: Vec<Bracket> = Vec::new();
     let identity = if args.no_identity {
         None
     } else {
@@ -670,9 +1118,17 @@ fn main() -> Result<()> {
         let mut plain: Vec<u32> = vec![tok];
         let mut pos = prompt_ids.len();
         while plain.len() < stream.len() {
+            // One bracket per decode step, so the baseline's per-token figure
+            // is a median over steps rather than a total divided by a count —
+            // §6.6b: these distributions are right-tailed and a mean carries
+            // twice the noise.
+            let t_step = std::time::Instant::now();
             let inp = Tensor::new(&[tok], &device)?.unsqueeze(0)?;
             let l = plain_model.forward(&inp, pos, &mut plain_cache)?;
             tok = l.squeeze(0)?.argmax(D::Minus1)?.to_scalar::<u32>()?;
+            if args.timing {
+                base_steps.push(close_bracket(&device, t_step)?);
+            }
             plain.push(tok);
             pos += 1;
         }
@@ -680,6 +1136,39 @@ fn main() -> Result<()> {
         println!("decoded {} tokens one at a time", plain.len());
         Some(plain)
     };
+
+    // ---- ARM 3: the NULL CONTROL (`--timing` only) -------------------------
+    //
+    // **The same arm in a second slot of the same run** (`CONTRIBUTING.md`
+    // §1.3): a decode that differs from ARM 2 in nothing at all. What it
+    // measures is what this instrument can resolve on this machine at this
+    // load, and **an effect smaller than the null is not an effect**. #40's
+    // null control read +65.8 % with two other agents building, which is why
+    // this is reported beside the ratio rather than assumed small.
+    if args.timing {
+        println!("\n=== ARM 3: the null control (baseline again, same run) ===");
+        let null_model = {
+            let files = weight_files(&target_dir)?;
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F16, &device)? };
+            Model::new(&cfg, vb)?
+        };
+        let mut null_cache = Cache::new(true, DType::F16, &cfg, &device)?;
+        let input = Tensor::new(prompt_ids.as_slice(), &device)?.unsqueeze(0)?;
+        let logits = null_model.forward(&input, 0, &mut null_cache)?;
+        let mut tok = logits.squeeze(0)?.argmax(D::Minus1)?.to_scalar::<u32>()?;
+        let mut n_done = 1usize;
+        let mut pos = prompt_ids.len();
+        while n_done < stream.len() {
+            let t_step = std::time::Instant::now();
+            let inp = Tensor::new(&[tok], &device)?.unsqueeze(0)?;
+            let l = null_model.forward(&inp, pos, &mut null_cache)?;
+            tok = l.squeeze(0)?.argmax(D::Minus1)?.to_scalar::<u32>()?;
+            null_steps.push(close_bracket(&device, t_step)?);
+            n_done += 1;
+            pos += 1;
+        }
+        println!("decoded {n_done} tokens one at a time (null control)");
+    }
 
     // =====================================================================
     // The report
@@ -856,13 +1345,28 @@ fn main() -> Result<()> {
          blocking flush and found a null. This loop is the consumer it named:\n\
          a verify publishes {} to {} tokens at once, {distinct_widths} distinct widths over\n\
          {} rounds. That variability is the ring's reason to exist and it is\n\
-         present here -- but NO TIMING IS TAKEN in this run (§7.1a), so this is\n\
-         the consumer's SHAPE, not the ring's A/B. The A/B needs a lease and a\n\
-         ring arm to compare against, and it is named in the PR as not done.",
+         present here -- but this is the consumer's SHAPE, not the ring's A/B.\n\
+         The A/B needs a RING ARM to compare against, which #500 measured as\n\
+         having no production callers, so it would have one arm. Timing this\n\
+         loop (--timing) does not supply it: the ring is not on this path.",
         adv[0],
         adv[adv.len() - 1],
         rounds.len()
     );
+
+    // =====================================================================
+    // 6. DOES IT PAY? (§10.2r) — only with `--timing`
+    // =====================================================================
+    if args.timing {
+        report_timing(
+            &rounds,
+            &base_steps,
+            &null_steps,
+            k,
+            args.timing_warmup,
+            &prompt_id,
+        )?;
+    }
 
     println!(
         "\nRESULT prompt_id={prompt_id} prompt_sha={} k={k} rounds={} \

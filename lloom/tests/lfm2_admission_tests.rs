@@ -25,7 +25,7 @@
 //! `hw.memsize` stand-in, which changes the arithmetic's inputs and not its
 //! shape.
 
-use candle_transformers::models::lfm2::MemoryBudget;
+use lloom::models::lfm2::MemoryBudget;
 
 /// `hw.memsize` on the development machine (§3.4), the stand-in for
 /// `recommendedMaxWorkingSetSize` that §9.5k's own table uses.
@@ -45,7 +45,7 @@ const GB: f64 = 1e9;
 fn default_fraction_matches_admissions() {
     assert_eq!(
         MemoryBudget::DEFAULT_FRACTION,
-        candle::metal_backend::admission::DEFAULT_BUDGET_FRACTION,
+        lloom_tensor::metal_backend::admission::DEFAULT_BUDGET_FRACTION,
         "the two spellings of §9.5k's fraction have drifted"
     );
 }
@@ -57,7 +57,7 @@ fn default_fraction_matches_admissions() {
 fn default_weight_tolerance_matches_admissions() {
     assert_eq!(
         MemoryBudget::DEFAULT_WEIGHT_TOLERANCE,
-        candle::metal_backend::admission::WEIGHT_RECONCILE_TOLERANCE,
+        lloom_tensor::metal_backend::admission::WEIGHT_RECONCILE_TOLERANCE,
         "the two spellings of §9.5m's tolerance have drifted"
     );
 }
@@ -67,7 +67,7 @@ fn default_weight_tolerance_matches_admissions() {
 #[cfg(feature = "metal")]
 #[test]
 fn admits_what_fits_and_refuses_what_does_not() {
-    use candle::metal_backend::admission::Budget;
+    use lloom_tensor::metal_backend::admission::Budget;
 
     // ADMITTED: what ships today. §9.5b puts it at 9.6 % of the machine.
     let ships = Budget::new(WEIGHTS_FULL, 4096, 4096).admit(MACHINE);
@@ -101,7 +101,7 @@ fn admits_what_fits_and_refuses_what_does_not() {
 #[cfg(feature = "metal")]
 #[test]
 fn b16_ctx128k_is_tight_against_measured_stranding_not_against_the_sum() {
-    use candle::metal_backend::admission::{Budget, OBSERVED_STRANDING_BYTES};
+    use lloom_tensor::metal_backend::admission::{Budget, OBSERVED_STRANDING_BYTES};
 
     let mut b = Budget::new(WEIGHTS_FULL, 131_072, 131_072);
     b.batch = 16;
@@ -181,7 +181,7 @@ fn rope_table_bytes_match_what_9_5k_records() {
 /// way every caller builds it carries no budget and admits unconditionally.
 #[test]
 fn admission_is_off_by_default() {
-    let cfg = candle_transformers::models::lfm2::Config {
+    let cfg = lloom::models::lfm2::Config {
         vocab_size: 128_000,
         hidden_size: 2048,
         intermediate_size: 10_752,
@@ -219,7 +219,7 @@ fn admission_is_off_by_default() {
         gemv_residual: false,
         // #363's tap: off, as every pre-#363 caller had it.
         tap_layers: Vec::new(),
-        tap_dtype: candle::DType::F32,
+        tap_dtype: lloom_tensor::DType::F32,
     };
     assert!(
         cfg.memory_budget.is_none(),
@@ -228,7 +228,7 @@ fn admission_is_off_by_default() {
 
     // And a budget is one field, which is the axis shape every other variant
     // in this file uses.
-    let with = candle_transformers::models::lfm2::Config {
+    let with = lloom::models::lfm2::Config {
         memory_budget: Some(MemoryBudget::new(WEIGHTS_FULL)),
         ..cfg
     };
@@ -270,7 +270,7 @@ fn the_prefill_length_is_opt_in_and_defaults_to_decode() {
 #[cfg(feature = "metal")]
 #[test]
 fn the_prefill_length_moves_the_predicted_footprint() {
-    use candle::metal_backend::admission::Budget;
+    use lloom_tensor::metal_backend::admission::Budget;
 
     let decode = Budget::new(WEIGHTS_FULL, 4096, 4096);
     let prefill = decode.with_prefill(2048);

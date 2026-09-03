@@ -33,8 +33,8 @@
 //! Goldens from torch 2.14.0 via
 //! `design/measurements/issue-609-raw/make_test_golden.py`.
 
-use candle::{Device, Result, Tensor};
-use candle_transformers::utils::{interpolate2d_bilinear_antialias, resize_pos_embed_antialias};
+use lloom_tensor::{Device, Result, Tensor};
+use lloom::utils::{interpolate2d_bilinear_antialias, resize_pos_embed_antialias};
 
 #[rustfmt::skip]
 const SRC: [f32; 128] = [
@@ -224,28 +224,28 @@ fn identity_resample_is_exact(dev: &Device) -> Result<()> {
     Ok(())
 }
 
-candle::test_device!(
+lloom_tensor::test_device!(
     downsample_matches_torch_antialias,
     downsample_matches_torch_antialias_cpu,
     downsample_matches_torch_antialias_gpu,
     downsample_matches_torch_antialias_metal
 );
 
-candle::test_device!(
+lloom_tensor::test_device!(
     non_square_downsample_matches_torch,
     non_square_downsample_matches_torch_cpu,
     non_square_downsample_matches_torch_gpu,
     non_square_downsample_matches_torch_metal
 );
 
-candle::test_device!(
+lloom_tensor::test_device!(
     upsample_agreement_is_why_the_existing_suite_is_blind,
     upsample_agreement_is_why_the_existing_suite_is_blind_cpu,
     upsample_agreement_is_why_the_existing_suite_is_blind_gpu,
     upsample_agreement_is_why_the_existing_suite_is_blind_metal
 );
 
-candle::test_device!(
+lloom_tensor::test_device!(
     identity_resample_is_exact,
     identity_resample_is_exact_cpu,
     identity_resample_is_exact_gpu,
@@ -314,9 +314,9 @@ fn host_and_tensor_entry_points_agree() -> Result<()> {
 /// the model reproduces the bilinear one.
 #[test]
 fn siglip_vision_model_resamples_position_grid_with_antialiased_bilinear() -> Result<()> {
-    use candle::DType;
-    use candle_nn::{Module, VarBuilder};
-    use candle_transformers::models::siglip::{VisionConfig, VisionModel};
+    use lloom_tensor::DType;
+    use lloom::nn::{Module, VarBuilder};
+    use lloom::models::siglip::{VisionConfig, VisionModel};
     use std::collections::HashMap;
 
     let dev = Device::Cpu;
@@ -331,7 +331,7 @@ fn siglip_vision_model_resamples_position_grid_with_antialiased_bilinear() -> Re
         num_channels: 3,
         image_size: patch * base_side,
         patch_size: patch,
-        hidden_act: candle_nn::Activation::Gelu,
+        hidden_act: lloom::nn::Activation::Gelu,
         layer_norm_eps: 1e-6,
     };
 

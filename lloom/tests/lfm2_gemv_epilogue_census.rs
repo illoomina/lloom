@@ -23,9 +23,9 @@
 
 #![cfg(feature = "metal")]
 
-use candle::{DType, Device, Result, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::lfm2::{Cache, Config, KvAppend, LayerType, Model};
+use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom::nn::VarBuilder;
+use lloom::models::lfm2::{Cache, Config, KvAppend, LayerType, Model};
 
 fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
     Config {
@@ -131,7 +131,7 @@ fn decode_census(cfg: &Config, dev: &Device) -> Result<Vec<(String, u64)>> {
     // Reset AFTER the synchronize, per `profile::reset`'s own doc: an in-flight
     // command buffer's completion handler fires later and would otherwise land
     // in this window.
-    candle::metal_backend::profile::reset();
+    lloom_tensor::metal_backend::profile::reset();
 
     let step = Tensor::new(&[7u32], dev)?.reshape((1, 1))?;
     let logits = model.forward(&step, prompt.len(), &mut cache)?;
@@ -142,7 +142,7 @@ fn decode_census(cfg: &Config, dev: &Device) -> Result<Vec<(String, u64)>> {
         .to_vec1::<f32>()?;
     dev.synchronize()?;
 
-    Ok(candle::metal_backend::profile::snapshot().by_label)
+    Ok(lloom_tensor::metal_backend::profile::snapshot().by_label)
 }
 
 fn count_matching(census: &[(String, u64)], pred: impl Fn(&str) -> bool) -> u64 {
@@ -172,7 +172,7 @@ fn dump(tag: &str, census: &[(String, u64)]) {
 /// and a delta-only test cannot see it.
 #[test]
 fn the_census_shows_gemv_silu_replacing_the_silu_dispatch() -> Result<()> {
-    if !candle::metal_backend::profile::enabled() {
+    if !lloom_tensor::metal_backend::profile::enabled() {
         eprintln!(
             "SKIPPED: this test reads the dispatch census, which is only \
              recorded under CANDLE_METAL_PROFILE=1. Re-run with it set."
@@ -238,7 +238,7 @@ fn the_census_shows_gemv_silu_replacing_the_silu_dispatch() -> Result<()> {
 /// which is recorded only under `CANDLE_METAL_PROFILE=1`.
 #[test]
 fn the_census_shows_gemv_residual_replacing_the_add_dispatch() -> Result<()> {
-    if !candle::metal_backend::profile::enabled() {
+    if !lloom_tensor::metal_backend::profile::enabled() {
         eprintln!(
             "SKIPPED: this test reads the dispatch census, which is only \
              recorded under CANDLE_METAL_PROFILE=1. Re-run with it set."

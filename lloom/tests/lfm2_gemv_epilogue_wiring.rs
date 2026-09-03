@@ -29,9 +29,9 @@
 
 #![cfg(feature = "metal")]
 
-use candle::{DType, Device, Result, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::lfm2::{Cache, Config, KvAppend, LayerType, Model};
+use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom::nn::VarBuilder;
+use lloom::models::lfm2::{Cache, Config, KvAppend, LayerType, Model};
 
 /// A two-layer LFM2 — one conv layer, one attention layer — so **all three**
 /// residual producers are exercised: `conv.out_proj`, `self_attn.out_proj` and

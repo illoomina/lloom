@@ -39,8 +39,8 @@
 //! machine this project measures at load 2--26 (§3.2), which is how a test
 //! becomes a flake.
 
-use candle::{Device, Result, Tensor};
-use candle_transformers::generation::token_ring::TokenRing;
+use lloom_tensor::{Device, Result, Tensor};
+use lloom::generation::token_ring::TokenRing;
 
 const EOS: &[u32] = &[124900];
 
@@ -105,18 +105,18 @@ fn the_poll_does_not_reach_the_blocking_readback() -> Result<()> {
         return Ok(());
     };
     let ring = TokenRing::new(1, EOS, &device)?;
-    let sampled = logits_peaked_at(99, 200_000, &device)?.argmax(candle::D::Minus1)?;
+    let sampled = logits_peaked_at(99, 200_000, &device)?.argmax(lloom_tensor::D::Minus1)?;
     ring.publish_step(&sampled, Some(1))?;
     device.synchronize()?;
 
     // --- the arm under test -------------------------------------------------
-    let (fast0, blit0) = candle::metal_backend::to_cpu_counts();
-    let (peek0, _) = candle::metal_backend::peek_counts();
-    let reads0 = candle_transformers::generation::token_ring::poll_read_count();
+    let (fast0, blit0) = lloom_tensor::metal_backend::to_cpu_counts();
+    let (peek0, _) = lloom_tensor::metal_backend::peek_counts();
+    let reads0 = lloom::generation::token_ring::poll_read_count();
     let polled = ring.poll_eos(1);
-    let (fast1, blit1) = candle::metal_backend::to_cpu_counts();
-    let (peek1, _) = candle::metal_backend::peek_counts();
-    let reads1 = candle_transformers::generation::token_ring::poll_read_count();
+    let (fast1, blit1) = lloom_tensor::metal_backend::to_cpu_counts();
+    let (peek1, _) = lloom_tensor::metal_backend::peek_counts();
+    let reads1 = lloom::generation::token_ring::poll_read_count();
 
     assert_eq!(polled, Some(false), "the poll did not answer");
     assert_eq!(
@@ -154,9 +154,9 @@ fn the_poll_does_not_reach_the_blocking_readback() -> Result<()> {
     );
 
     // --- the positive control ----------------------------------------------
-    let (fast2, blit2) = candle::metal_backend::to_cpu_counts();
+    let (fast2, blit2) = lloom_tensor::metal_backend::to_cpu_counts();
     let _ = ring.eos_flag().to_vec1::<u8>()?;
-    let (fast3, blit3) = candle::metal_backend::to_cpu_counts();
+    let (fast3, blit3) = lloom_tensor::metal_backend::to_cpu_counts();
     assert!(
         (fast3 - fast2) + (blit3 - blit2) > 0,
         "the blocking read did not move the readback counters, so the assertion \
@@ -186,7 +186,7 @@ fn the_poll_allocates_nothing_and_the_old_spelling_did() -> Result<()> {
         return Ok(());
     };
     let ring = TokenRing::new(1, EOS, &device)?;
-    let sampled = logits_peaked_at(99, 200_000, &device)?.argmax(candle::D::Minus1)?;
+    let sampled = logits_peaked_at(99, 200_000, &device)?.argmax(lloom_tensor::D::Minus1)?;
     ring.publish_step(&sampled, Some(1))?;
     device.synchronize()?;
 

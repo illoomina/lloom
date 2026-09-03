@@ -35,7 +35,7 @@
 //! where it can run without a checkpoint.
 #![cfg(feature = "metal")]
 
-use candle::{DType, Device, Result, Tensor};
+use lloom_tensor::{DType, Device, Result, Tensor};
 use half::f16;
 
 /// A deterministic filler. A fixed pattern rather than an RNG: the assertion is
@@ -78,7 +78,7 @@ fn flash_decoding_writes_every_batch_row() -> Result<()> {
     let v1 = Tensor::from_vec(fill(H_KV * KV_LEN * D, 13), (1, H_KV, KV_LEN, D), &device)?
         .to_dtype(DType::F16)?;
 
-    let reference = candle_nn::ops::flash_decoding(
+    let reference = lloom::nn::ops::flash_decoding(
         &q1,
         &k1,
         &v1,
@@ -86,7 +86,7 @@ fn flash_decoding_writes_every_batch_row() -> Result<()> {
         1.0,
         PAGE,
         K,
-        candle_nn::ops::FlashScratchSizing::Grow,
+        lloom::nn::ops::FlashScratchSizing::Grow,
         KV_LEN.div_ceil(PAGE * K),
     )?
     .flatten_all()?
@@ -106,7 +106,7 @@ fn flash_decoding_writes_every_batch_row() -> Result<()> {
         let k = Tensor::cat(&vec![&k1; b], 0)?;
         let v = Tensor::cat(&vec![&v1; b], 0)?;
 
-        let out = candle_nn::ops::flash_decoding(
+        let out = lloom::nn::ops::flash_decoding(
             &q,
             &k,
             &v,
@@ -114,7 +114,7 @@ fn flash_decoding_writes_every_batch_row() -> Result<()> {
             1.0,
             PAGE,
             K,
-            candle_nn::ops::FlashScratchSizing::Grow,
+            lloom::nn::ops::FlashScratchSizing::Grow,
             KV_LEN.div_ceil(PAGE * K),
         )?;
         assert_eq!(out.dims(), [b, H, 1, D]);
@@ -167,7 +167,7 @@ fn flash_decoding_refuses_a_kv_whose_batch_stride_is_not_head_major() -> Result<
     let k = wide.narrow(1, 0, H_KV)?;
     let v = wide.narrow(1, 0, H_KV)?;
 
-    let err = candle_nn::ops::flash_decoding(
+    let err = lloom::nn::ops::flash_decoding(
         &q,
         &k,
         &v,
@@ -175,7 +175,7 @@ fn flash_decoding_refuses_a_kv_whose_batch_stride_is_not_head_major() -> Result<
         1.0,
         PAGE,
         1,
-        candle_nn::ops::FlashScratchSizing::Grow,
+        lloom::nn::ops::FlashScratchSizing::Grow,
         KV_LEN.div_ceil(PAGE),
     );
     let msg = match err {

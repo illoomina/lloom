@@ -48,8 +48,8 @@
 //! stops a green run being read as evidence when the generator never reached
 //! the states the claim is about (#504's `evicted = 0`, §2.4's rule).
 
-use candle::{DType, Device, Result, Tensor};
-use candle_transformers::generation::token_ring::TokenRing;
+use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom::generation::token_ring::TokenRing;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -163,7 +163,7 @@ pub fn run_sequence(device: &Device, ops: &[Op]) -> std::result::Result<Engageme
                 let token = (*id as usize % (VOCAB - 8)) + 4;
                 let logits = logits_peaked_at(token, device).map_err(|e| at(format!("{e}")))?;
                 let sampled = logits
-                    .argmax(candle::D::Minus1)
+                    .argmax(lloom_tensor::D::Minus1)
                     .map_err(|e| at(format!("argmax: {e}")))?;
                 ring.publish(&sampled)
                     .map_err(|e| at(format!("publish: {e}")))?;
@@ -453,7 +453,7 @@ fn the_model_can_fail() -> Result<()> {
     let device = Device::Cpu;
     let ring = TokenRing::new(0, EOS, &device)?;
     let logits = logits_peaked_at(7, &device)?;
-    let sampled = logits.argmax(candle::D::Minus1)?;
+    let sampled = logits.argmax(lloom_tensor::D::Minus1)?;
     ring.publish(&sampled)?;
 
     let got = ring.input().to_vec2::<u32>()?[0][0];
@@ -490,7 +490,7 @@ fn a_refused_publish_leaves_the_ring_unchanged() -> Result<()> {
     for device in devices() {
         let ring = TokenRing::new(0, EOS, &device)?;
         let logits = logits_peaked_at(21, &device)?;
-        ring.publish(&logits.argmax(candle::D::Minus1)?)?;
+        ring.publish(&logits.argmax(lloom_tensor::D::Minus1)?)?;
         let before_input = ring.input().to_vec2::<u32>()?[0][0];
         let before_flag = ring.eos_flag().to_vec1::<u8>()?[0];
 

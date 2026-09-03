@@ -32,9 +32,9 @@
 //! thing, not what a kernel computes, and the CPU backend is bit-stable
 //! (`CONTRIBUTING.md` §3.1).
 
-use candle::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
+use lloom::nn::VarBuilder;
+use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
 
 fn tiny_config() -> Config {
     Config {

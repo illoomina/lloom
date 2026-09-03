@@ -4,11 +4,11 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle::{Device, Result, Tensor};
+use lloom_tensor::{Device, Result, Tensor};
 
 #[test]
 fn kv_cache() -> Result<()> {
-    let mut cache = candle_nn::kv_cache::Cache::new(0, 16);
+    let mut cache = lloom::nn::kv_cache::Cache::new(0, 16);
     for _ in [0, 1] {
         assert_eq!(cache.current_seq_len(), 0);
         let data = cache.current_data()?;
@@ -33,7 +33,7 @@ fn kv_cache() -> Result<()> {
 
 #[test]
 fn rotating_kv_cache() -> Result<()> {
-    let mut cache = candle_nn::kv_cache::RotatingCache::new(0, 6);
+    let mut cache = lloom::nn::kv_cache::RotatingCache::new(0, 6);
     for _ in [0, 1] {
         assert_eq!(cache.offset(), 0);
         assert_eq!(cache.current_seq_len(), 0);

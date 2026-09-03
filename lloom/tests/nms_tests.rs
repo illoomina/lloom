@@ -1,5 +1,5 @@
-use candle::Result;
-use candle_transformers::object_detection::{
+use lloom_tensor::Result;
+use lloom::object_detection::{
     non_maximum_suppression, soft_non_maximum_suppression, Bbox,
 };
 

@@ -1,6 +1,6 @@
 #[cfg(feature = "metal")]
 mod metal_sdpa_tests {
-    use candle::{DType, Device, Result, Shape, Tensor};
+    use lloom_tensor::{DType, Device, Result, Shape, Tensor};
     use rand::SeedableRng;
     use rand_distr::Distribution;
     use std::ops::{Div, Mul};
@@ -34,11 +34,11 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
+            let att = lloom::nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
                 .to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
-        let sdpa_output = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
+        let sdpa_output = lloom::nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?
@@ -65,11 +65,11 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
+            let att = lloom::nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
                 .to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
-        let sdpa_output = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
+        let sdpa_output = lloom::nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?
@@ -98,7 +98,7 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = candle_nn::ops::softmax_last_dim(
+            let att = lloom::nn::ops::softmax_last_dim(
                 &att.to_dtype(DType::F32)?
                     .div(SOFTCAP)?
                     .tanh()?
@@ -108,7 +108,7 @@ mod metal_sdpa_tests {
             att.matmul(&v.clone())?
         };
         let sdpa_output =
-            candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, SOFTCAP as f32)?;
+            lloom::nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, SOFTCAP as f32)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?
@@ -136,7 +136,7 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = candle_nn::ops::softmax_last_dim(
+            let att = lloom::nn::ops::softmax_last_dim(
                 &att.to_dtype(DType::F32)?
                     .div(SOFTCAP)?
                     .tanh()?
@@ -146,7 +146,7 @@ mod metal_sdpa_tests {
             att.matmul(&v.clone())?
         };
         let sdpa_output =
-            candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, SOFTCAP as f32)?;
+            lloom::nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, SOFTCAP as f32)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?
@@ -172,11 +172,11 @@ mod metal_sdpa_tests {
         let v = randn(&mut rng, (BS, H, L, DK), &device)?;
         let ground_truth = {
             let att = (q.clone() * scale)?.matmul(&k.clone().t()?)?;
-            let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
+            let att = lloom::nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?
                 .to_dtype(q.dtype())?;
             att.matmul(&v.clone())?
         };
-        let sdpa_output = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
+        let sdpa_output = lloom::nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.)?;
         assert_eq!(ground_truth.shape(), sdpa_output.shape());
         let error: f32 = ((&ground_truth - &sdpa_output)?.abs()? / &ground_truth.abs()?)?
             .sum_all()?
@@ -208,7 +208,7 @@ mod metal_sdpa_tests {
 
     /// Broadcast each kv head to `repeat` query heads.
     ///
-    /// Spelled out rather than taken from `candle_transformers::utils`, which
+    /// Spelled out rather than taken from `lloom::utils`, which
     /// would make `candle-nn`'s tests depend on a crate above it.
     fn repeat_kv(x: &Tensor, repeat: usize) -> Result<Tensor> {
         if repeat == 1 {
@@ -233,7 +233,7 @@ mod metal_sdpa_tests {
         let v = v.to_dtype(DType::F32)?;
 
         let att = (q.matmul(&k.t()?.contiguous()?)? * scale)?;
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
+        let att = lloom::nn::ops::softmax_last_dim(&att)?;
         att.matmul(&v.contiguous()?)
     }
 
@@ -289,7 +289,7 @@ mod metal_sdpa_tests {
 
         let want = reference_attention(&q, &k, &v, scale)?;
 
-        let got = candle_nn::ops::sdpa(
+        let got = lloom::nn::ops::sdpa(
             &q.to_device(&metal)?,
             &k.to_device(&metal)?,
             &v.to_device(&metal)?,
@@ -331,7 +331,7 @@ mod metal_sdpa_tests {
 
         let want = reference_attention(&q16, &k16, &v16, scale)?;
 
-        let got = candle_nn::ops::sdpa(
+        let got = lloom::nn::ops::sdpa(
             &q16.to_device(&metal)?,
             &k16.to_device(&metal)?,
             &v16.to_device(&metal)?,
@@ -374,7 +374,7 @@ mod metal_sdpa_tests {
         }
         let v = Tensor::from_vec(v_data, (1, LFM2_KV_HEADS, L, LFM2_HEAD_DIM), &cpu)?;
 
-        let got = candle_nn::ops::sdpa(
+        let got = lloom::nn::ops::sdpa(
             &q.to_device(&metal)?,
             &k.to_device(&metal)?,
             &v.to_device(&metal)?,
@@ -456,7 +456,7 @@ mod metal_sdpa_tests {
             );
 
             let got =
-                candle_nn::ops::sdpa(&q.to_device(&metal)?, &k, &v, None, false, scale as f32, 1.)?
+                lloom::nn::ops::sdpa(&q.to_device(&metal)?, &k, &v, None, false, scale as f32, 1.)?
                     .to_device(&cpu)?;
 
             let err = assert_matches_reference(

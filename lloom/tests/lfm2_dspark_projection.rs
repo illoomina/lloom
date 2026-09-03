@@ -36,8 +36,8 @@
 //! path is not (`CONTRIBUTING.md` §3.1, §2.3.8a). This also keeps the file
 //! runnable with no `metal` feature, which is the build §14.1 gates on.
 
-use candle::{DType, Device, Result, Tensor};
-use candle_transformers::models::lfm2_dspark::{
+use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom::models::lfm2_dspark::{
     projection_params, DSparkProjection, CHECKPOINT_DTYPE,
 };
 
@@ -185,9 +185,9 @@ fn norm_after_matmul_differs_from_norm_before_on_this_fixture() -> Result<()> {
     // -- `hidden_norm.weight` is [2048], i.e. the OUTPUT width. That absence is
     // itself evidence for the order, and this arm makes the numeric half of the
     // argument with a synthetic weight.
-    let cat = Tensor::cat(&taps, candle::D::Minus1)?;
+    let cat = Tensor::cat(&taps, lloom_tensor::D::Minus1)?;
     let w12 = Tensor::from_vec(vec![1f32; N_TAP * HIDDEN], N_TAP * HIDDEN, &dev)?;
-    let normed = candle_nn::ops::rms_norm(&cat, &w12, EPS as f32)?;
+    let normed = lloom::nn::ops::rms_norm(&cat, &w12, EPS as f32)?;
     let fc = fc_weight(&dev)?.t()?.contiguous()?;
     let before = normed
         .broadcast_matmul(&fc)?

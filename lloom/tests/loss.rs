@@ -4,8 +4,8 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle::test_utils::to_vec0_round;
-use candle::{Device, Result, Tensor};
+use lloom_tensor::test_utils::to_vec0_round;
+use lloom_tensor::{Device, Result, Tensor};
 /* Equivalent python code:
 import torch
 import torch.nn.functional as F
@@ -31,10 +31,10 @@ fn nll_and_cross_entropy() -> Result<()> {
     )?;
     let target = Tensor::new(&[1u32, 0, 4], &cpu)?;
 
-    let log_softmax = candle_nn::ops::log_softmax(&input, 1)?;
-    let loss = candle_nn::loss::nll(&log_softmax, &target)?;
+    let log_softmax = lloom::nn::ops::log_softmax(&input, 1)?;
+    let loss = lloom::nn::loss::nll(&log_softmax, &target)?;
     assert_eq!(to_vec0_round(&loss, 4)?, 1.1312);
-    let loss = candle_nn::loss::cross_entropy(&input, &target)?;
+    let loss = lloom::nn::loss::cross_entropy(&input, &target)?;
     assert_eq!(to_vec0_round(&loss, 4)?, 1.1312);
     Ok(())
 }
@@ -80,7 +80,7 @@ fn binary_cross_entropy_with_logit() -> Result<()> {
     let inp = Tensor::new(&inp, &cpu)?;
     let target = Tensor::new(&target, &cpu)?;
 
-    let loss = candle_nn::loss::binary_cross_entropy_with_logit(&inp, &target)?;
+    let loss = lloom::nn::loss::binary_cross_entropy_with_logit(&inp, &target)?;
 
     assert_eq!(to_vec0_round(&loss, 4)?, 0.8224);
     Ok(())
@@ -126,9 +126,9 @@ fn huber_loss() -> Result<()> {
 
     let inp = Tensor::new(&inp, &cpu)?;
     let target = Tensor::new(&target, &cpu)?;
-    let loss = candle_nn::loss::huber(&inp, &target, 1.0)?;
+    let loss = lloom::nn::loss::huber(&inp, &target, 1.0)?;
     assert_eq!(to_vec0_round(&loss, 4)?, 0.4734);
-    let loss = candle_nn::loss::huber(&inp, &target, 0.88)?;
+    let loss = lloom::nn::loss::huber(&inp, &target, 0.88)?;
     assert_eq!(to_vec0_round(&loss, 4)?, 0.4483);
     Ok(())
 }

@@ -1,10 +1,10 @@
-use candle::{DType, Device, Result, Tensor};
-use candle_nn::attention::{flash_attn, AttnMask};
+use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom::nn::attention::{flash_attn, AttnMask};
 
 /// Reference SDPA: softmax(Q @ K^T * scale) @ V
 fn reference_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Result<Tensor> {
     let att = (q.clone() * scale as f64)?.matmul(&k.clone().t()?)?;
-    let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
+    let att = lloom::nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
     att.matmul(&v.clone())
 }
 
@@ -29,7 +29,7 @@ fn reference_causal_sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Resu
 
     let att = (q.clone() * scale as f64)?.matmul(&k.clone().t()?)?;
     let att = att.broadcast_add(&mask)?;
-    let att = candle_nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
+    let att = lloom::nn::ops::softmax_last_dim(&att.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
     att.matmul(&v.clone())
 }
 
@@ -217,7 +217,7 @@ fn standard_with_mask_b1() -> Result<()> {
     // Reference with mask applied
     let att = (q.clone() * scale as f64)?.matmul(&k.clone().t()?)?;
     let att = att.broadcast_add(&mask_tensor.unsqueeze(0)?)?;
-    let att = candle_nn::ops::softmax_last_dim(&att)?;
+    let att = lloom::nn::ops::softmax_last_dim(&att)?;
     let expected = att.matmul(&v.clone())?;
 
     let out = flash_attn::<f32>(
@@ -237,7 +237,7 @@ fn standard_with_mask_b1() -> Result<()> {
 
 #[test]
 fn interleaved_kv_decode() -> Result<()> {
-    use candle_nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
+    use lloom::nn::attention::cpu_flash::causal::causal_decode_f32_interleaved;
 
     let (h_q, h_kv, d, kv_len) = (8, 2, 16, 20);
     let scale = 1.0 / (d as f32).sqrt();

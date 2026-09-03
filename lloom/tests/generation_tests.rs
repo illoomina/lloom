@@ -1,5 +1,5 @@
-use candle::{DType, Device, Result, Tensor};
-use candle_transformers::generation::LogitsProcessor;
+use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom::generation::LogitsProcessor;
 
 /// The `ArgMax` arm returns the same index over f16 as over f32 (lloom #351).
 ///
@@ -113,7 +113,7 @@ fn sample_with_top_p() -> Result<()> {
 fn sample_with_top_k() -> Result<()> {
     let mut logits_process = LogitsProcessor::from_sampling(
         42,
-        candle_transformers::generation::Sampling::TopK {
+        lloom::generation::Sampling::TopK {
             k: 1,
             temperature: 1.0,
         },
@@ -123,7 +123,7 @@ fn sample_with_top_k() -> Result<()> {
     assert_eq!(token, 3);
     let mut logits_process = LogitsProcessor::from_sampling(
         42,
-        candle_transformers::generation::Sampling::TopK {
+        lloom::generation::Sampling::TopK {
             k: 2,
             temperature: 1.0,
         },
@@ -140,10 +140,10 @@ fn sample_with_top_k() -> Result<()> {
 fn sample_gumbel() -> Result<()> {
     let mut logits_process = LogitsProcessor::from_sampling(
         42,
-        candle_transformers::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
+        lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
     );
     let logits = Tensor::new(&[-1.0, 0.0, 0.2, 1.0], &Device::Cpu)?;
-    let sm = candle_nn::ops::softmax(&logits, 0)?.to_vec1::<f64>()?;
+    let sm = lloom::nn::ops::softmax(&logits, 0)?.to_vec1::<f64>()?;
     let mut counts = vec![0f64; 4];
     let samples = 100000;
     for _ in 0..samples {

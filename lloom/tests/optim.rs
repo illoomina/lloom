@@ -4,11 +4,11 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle::test_utils::{to_vec0_round, to_vec2_round};
+use lloom_tensor::test_utils::{to_vec0_round, to_vec2_round};
 
 use anyhow::Result;
-use candle::{DType, Device, Tensor, Var};
-use candle_nn::{AdamW, Linear, Module, Optimizer, ParamsAdamW, SGD};
+use lloom_tensor::{DType, Device, Tensor, Var};
+use lloom::nn::{AdamW, Linear, Module, Optimizer, ParamsAdamW, SGD};
 
 #[test]
 fn sgd_optim() -> Result<()> {
@@ -124,7 +124,7 @@ fn adamw_linear_regression() -> Result<()> {
 
 #[test]
 fn adamw_linear_regression_varmap() -> Result<()> {
-    use candle_nn::Init::Const;
+    use lloom::nn::Init::Const;
 
     // Similar as the previous test but using a VarMap.
     let w_gen = Tensor::new(&[[3f32, 1.]], &Device::Cpu)?;
@@ -133,7 +133,7 @@ fn adamw_linear_regression_varmap() -> Result<()> {
     let sample_xs = Tensor::new(&[[2f32, 1.], [7., 4.], [-4., 12.], [5., 8.]], &Device::Cpu)?;
     let sample_ys = gen.forward(&sample_xs)?;
 
-    let mut var_map = candle_nn::VarMap::new();
+    let mut var_map = lloom::nn::VarMap::new();
 
     let w = var_map.get((1, 2), "w", Const(0.), DType::F32, &Device::Cpu)?;
     let b = var_map.get((), "b", Const(0.), DType::F32, &Device::Cpu)?;

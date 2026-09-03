@@ -30,9 +30,9 @@
 //! wrong on every backend; a tap that captures the right one is bit-exact here
 //! and lets the assertions be equalities rather than tolerances.
 
-use candle::{DType, Device, Result, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom::nn::VarBuilder;
+use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
 
 /// Six layers, alternating conv and attention, so a tap index can fall on
 /// either kind. The real target's `target_layer_ids` `[2, 9, 17, 21, 27]` hits

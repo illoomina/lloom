@@ -13,9 +13,9 @@
 //! about a kernel, and the CPU backend is bit-stable and needs no GPU
 //! (`CONTRIBUTING.md` §3.1).
 
-use candle::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
+use lloom::nn::VarBuilder;
+use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
 
 /// A two-layer LFM2 — one conv layer, one attention layer — small enough to
 /// build from random weights and large enough to exercise both paths.

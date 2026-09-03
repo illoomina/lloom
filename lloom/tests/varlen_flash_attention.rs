@@ -5,14 +5,14 @@
 //!
 //! Ported from <https://github.com/huggingface/candle/pull/3250>.
 
-use candle::Result;
-use candle_nn::attention::flash_attn_varlen_cpu;
-use candle_nn::varlen_attention::flash_attn_varlen_unfused;
+use lloom_tensor::Result;
+use lloom::nn::attention::flash_attn_varlen_cpu;
+use lloom::nn::varlen_attention::flash_attn_varlen_unfused;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle::{DType, Device, IndexOp, Tensor};
+    use lloom_tensor::{DType, Device, IndexOp, Tensor};
     use rand::prelude::*;
 
     // Implementation dispatch
@@ -88,7 +88,7 @@ mod tests {
                 k.to_dtype(DType::F16)?,
                 v.to_dtype(DType::F16)?,
             )),
-            _ => candle::bail!("Unsupported precision: {:?}", precision),
+            _ => lloom_tensor::bail!("Unsupported precision: {:?}", precision),
         }
     }
 
@@ -131,7 +131,7 @@ mod tests {
             return Ok((k.clone(), v.clone()));
         }
         if !num_heads.is_multiple_of(num_kv_heads) {
-            candle::bail!(
+            lloom_tensor::bail!(
                 "Invalid GQA config: num_heads={} not divisible by num_kv_heads={}",
                 num_heads,
                 num_kv_heads
@@ -212,7 +212,7 @@ mod tests {
         let slopes = if let Some(s) = alibi_slopes {
             let v = s.to_vec1::<f32>()?;
             if v.len() != num_heads {
-                candle::bail!("alibi_slopes has len {}, expected {}", v.len(), num_heads);
+                lloom_tensor::bail!("alibi_slopes has len {}, expected {}", v.len(), num_heads);
             }
             Some(v)
         } else {
@@ -273,7 +273,7 @@ mod tests {
                                 }
                                 (None, None) => {}
                                 (None, Some(_)) => {
-                                    candle::bail!("window_right without window_left")
+                                    lloom_tensor::bail!("window_right without window_left")
                                 }
                             }
                         }
@@ -385,7 +385,7 @@ mod tests {
         .to_dtype(scores.dtype())?;
         scores = scores.add(&bias)?;
 
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let probs = lloom::nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?.transpose(1, 2)?; // [B,max_q,H,D]
 
         let mut outs = Vec::with_capacity(bsz);

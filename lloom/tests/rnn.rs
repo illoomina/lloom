@@ -4,8 +4,8 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle::{test_utils::to_vec2_round, DType, Device, Result, Tensor};
-use candle_nn::RNN;
+use lloom_tensor::{test_utils::to_vec2_round, DType, Device, Result, Tensor};
+use lloom::nn::RNN;
 
 /* The following test can be verified against PyTorch using the following snippet.
 import torch
@@ -42,8 +42,8 @@ fn lstm() -> Result<()> {
     ]
     .into_iter()
     .collect();
-    let vb = candle_nn::VarBuilder::from_tensors(tensors, DType::F32, cpu);
-    let lstm = candle_nn::lstm(2, 3, Default::default(), vb)?;
+    let vb = lloom::nn::VarBuilder::from_tensors(tensors, DType::F32, cpu);
+    let lstm = lloom::nn::lstm(2, 3, Default::default(), vb)?;
     let mut state = lstm.zero_state(1)?;
     for inp in [3f32, 1., 4., 1., 5., 9., 2.] {
         let inp = Tensor::new(&[[inp, inp * 0.5]], cpu)?;
@@ -88,8 +88,8 @@ fn gru() -> Result<()> {
     ]
     .into_iter()
     .collect();
-    let vb = candle_nn::VarBuilder::from_tensors(tensors, DType::F32, cpu);
-    let gru = candle_nn::gru(2, 3, Default::default(), vb)?;
+    let vb = lloom::nn::VarBuilder::from_tensors(tensors, DType::F32, cpu);
+    let gru = lloom::nn::gru(2, 3, Default::default(), vb)?;
     let mut state = gru.zero_state(1)?;
     for inp in [3f32, 1., 4., 1., 5., 9., 2.] {
         let inp = Tensor::new(&[[inp, inp * 0.5]], cpu)?;

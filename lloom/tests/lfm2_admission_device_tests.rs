@@ -20,8 +20,8 @@
 
 #![cfg(feature = "metal")]
 
-use candle::{DType, Device};
-use candle_transformers::models::lfm2::{Cache, Config, LayerType, MemoryBudget};
+use lloom_tensor::{DType, Device};
+use lloom::models::lfm2::{Cache, Config, LayerType, MemoryBudget};
 
 /// §5.5's language-model weights, which is what a text-only LFM2 load carries.
 const WEIGHTS: usize = 5_394_397_184;
@@ -146,8 +146,8 @@ fn no_budget_means_no_refusal_on_the_device() {
 /// allocation has to actually happen for this to mean anything.
 #[test]
 fn a_caller_passing_the_wrong_weight_constant_is_detected_on_the_device() {
-    use candle::metal_backend::admission::{reconcile_weights, WEIGHT_RECONCILE_TOLERANCE};
-    use candle::Tensor;
+    use lloom_tensor::metal_backend::admission::{reconcile_weights, WEIGHT_RECONCILE_TOLERANCE};
+    use lloom_tensor::Tensor;
 
     let Ok(device) = Device::new_metal(0) else {
         eprintln!("no Metal device; skipping");

@@ -25,9 +25,9 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use anyhow::Result;
-use candle::test_utils::to_vec3_round;
-use candle::{Device, Tensor};
-use candle_nn::{GroupNorm, Module};
+use lloom_tensor::test_utils::to_vec3_round;
+use lloom_tensor::{Device, Tensor};
+use lloom::nn::{GroupNorm, Module};
 
 #[test]
 fn group_norm() -> Result<()> {

@@ -38,7 +38,7 @@
 
 #![cfg(feature = "metal")]
 
-use candle::{DType, Device, Tensor};
+use lloom_tensor::{DType, Device, Tensor};
 
 /// LFM2's KV geometry at B=1 (§5.2, §5.6): 8 KV heads, head_dim 64.
 const N_KV_HEADS: usize = 8;

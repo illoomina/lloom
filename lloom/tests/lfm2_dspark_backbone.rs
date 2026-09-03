@@ -41,8 +41,8 @@
 //! generic path is not (`CONTRIBUTING.md` §3.1, §2.3.8a). It also keeps this
 //! runnable with no `metal` feature, which is the build §14.1 gates on.
 
-use candle::{DType, Device, IndexOp, Result, Tensor, D};
-use candle_transformers::models::lfm2_dspark::{
+use lloom_tensor::{DType, Device, IndexOp, Result, Tensor, D};
+use lloom::models::lfm2_dspark::{
     confidence_feature_width, drafter_params, DSparkConfig, MarkovHead,
 };
 
@@ -553,7 +553,7 @@ fn the_drafter_has_no_embedding_and_no_lm_head() {
 #[test]
 fn the_checkpoint_dtype_is_bf16() {
     assert_eq!(
-        candle_transformers::models::lfm2_dspark::CHECKPOINT_DTYPE,
+        lloom::models::lfm2_dspark::CHECKPOINT_DTYPE,
         DType::BF16
     );
 }

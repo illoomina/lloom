@@ -19,8 +19,8 @@
 //! nothing when the token is unchanged. So every parity arm below **moves the
 //! value it checks**, and the mutation arms assert the tests can fail.
 
-use candle::{DType, Device, Result, Tensor};
-use candle_transformers::generation::token_ring::TokenRing;
+use lloom_tensor::{DType, Device, Result, Tensor};
+use lloom::generation::token_ring::TokenRing;
 
 /// EOS ids from `DESIGN.md` §5.1: bos / eos / pad = 124894 / 124900 / 124893.
 const EOS: &[u32] = &[124900];
@@ -65,7 +65,7 @@ fn ring_matches_the_round_trip_and_keeps_one_allocation() -> Result<()> {
         // agree at step 1 and disagree at step 2.
         for &tok in &[11u32, 2044, 3] {
             let logits = logits_peaked_at(tok as usize, vocab, &device)?;
-            let sampled = logits.argmax(candle::D::Minus1)?;
+            let sampled = logits.argmax(lloom_tensor::D::Minus1)?;
             assert_eq!(sampled.dtype(), DType::U32, "argmax must give U32");
 
             let (want, want_input) = round_trip_reference(&sampled, &device)?;
@@ -110,14 +110,14 @@ fn eos_flag_is_set_device_side_and_clears() -> Result<()> {
         let ring = TokenRing::new(1, EOS, &device)?;
 
         let eos_logits = logits_peaked_at(EOS[0] as usize, vocab, &device)?;
-        ring.publish(&eos_logits.argmax(candle::D::Minus1)?)?;
+        ring.publish(&eos_logits.argmax(lloom_tensor::D::Minus1)?)?;
         let hit = ring.eos_flag().flatten_all()?.to_vec1::<u8>()?[0];
         assert_eq!(hit, 1, "EOS token did not set the flag on {device:?}");
 
         // And it must come back down: a latched flag would end every
         // generation at its first non-EOS token after an EOS.
         let plain = logits_peaked_at(42, vocab, &device)?;
-        ring.publish(&plain.argmax(candle::D::Minus1)?)?;
+        ring.publish(&plain.argmax(lloom_tensor::D::Minus1)?)?;
         let miss = ring.eos_flag().flatten_all()?.to_vec1::<u8>()?[0];
         assert_eq!(miss, 0, "flag stayed set after a non-EOS token");
     }
@@ -137,7 +137,7 @@ fn every_eos_id_matches() -> Result<()> {
         let ring = TokenRing::new(1, ids, &device)?;
         for &id in ids {
             let l = logits_peaked_at(id as usize, vocab, &device)?;
-            ring.publish(&l.argmax(candle::D::Minus1)?)?;
+            ring.publish(&l.argmax(lloom_tensor::D::Minus1)?)?;
             assert_eq!(
                 ring.eos_flag().flatten_all()?.to_vec1::<u8>()?[0],
                 1,
@@ -147,7 +147,7 @@ fn every_eos_id_matches() -> Result<()> {
         // A token adjacent to a real id must not match -- otherwise the
         // comparison is a range test rather than an equality.
         let near = logits_peaked_at(124_899, vocab, &device)?;
-        ring.publish(&near.argmax(candle::D::Minus1)?)?;
+        ring.publish(&near.argmax(lloom_tensor::D::Minus1)?)?;
         assert_eq!(
             ring.eos_flag().flatten_all()?.to_vec1::<u8>()?[0],
             0,
@@ -198,7 +198,7 @@ fn the_parity_comparison_can_fail() -> Result<()> {
         let vocab = 4096;
         let ring = TokenRing::new(7, EOS, &device)?;
         let logits = logits_peaked_at(11, vocab, &device)?;
-        ring.publish(&logits.argmax(candle::D::Minus1)?)?;
+        ring.publish(&logits.argmax(lloom_tensor::D::Minus1)?)?;
 
         // A stale slot: what the ring would hold if `publish` were a no-op.
         let stale = Tensor::from_vec(vec![7u32], (1, 1), &device)?;
@@ -226,7 +226,7 @@ fn the_published_token_stays_on_the_device() -> Result<()> {
     };
     let ring = TokenRing::new(1, EOS, &device)?;
     let logits = logits_peaked_at(99, 4096, &device)?;
-    let sampled = logits.argmax(candle::D::Minus1)?;
+    let sampled = logits.argmax(lloom_tensor::D::Minus1)?;
     assert!(sampled.device().is_metal(), "argmax left the device");
     ring.publish(&sampled)?;
     assert!(
@@ -280,7 +280,7 @@ fn poll_declines_before_the_step_publishes_and_answers_after() -> Result<()> {
 
     // Publish step 1 with a non-EOS token.
     let logits = logits_peaked_at(99, 200_000, &device)?;
-    let sampled = logits.argmax(candle::D::Minus1)?;
+    let sampled = logits.argmax(lloom_tensor::D::Minus1)?;
     ring.publish_step(&sampled, Some(1))?;
     device.synchronize()?;
 
@@ -317,12 +317,12 @@ fn poll_reports_eos_and_non_eos_distinctly() -> Result<()> {
     let vocab = 200_000;
 
     let ring = TokenRing::new(1, EOS, &device)?;
-    let non_eos = logits_peaked_at(99, vocab, &device)?.argmax(candle::D::Minus1)?;
+    let non_eos = logits_peaked_at(99, vocab, &device)?.argmax(lloom_tensor::D::Minus1)?;
     ring.publish_step(&non_eos, Some(1))?;
     device.synchronize()?;
     assert_eq!(ring.poll_eos(1), Some(false), "a non-EOS token read as EOS");
 
-    let eos = logits_peaked_at(EOS[0] as usize, vocab, &device)?.argmax(candle::D::Minus1)?;
+    let eos = logits_peaked_at(EOS[0] as usize, vocab, &device)?.argmax(lloom_tensor::D::Minus1)?;
     ring.publish_step(&eos, Some(2))?;
     device.synchronize()?;
     assert_eq!(ring.poll_eos(2), Some(true), "an EOS token read as non-EOS");
@@ -345,7 +345,7 @@ fn poll_agrees_with_the_blocking_read() -> Result<()> {
     let ring = TokenRing::new(1, EOS, &device)?;
 
     for (gen, tok) in [(1u32, 99usize), (2, EOS[0] as usize), (3, 1234)] {
-        let sampled = logits_peaked_at(tok, vocab, &device)?.argmax(candle::D::Minus1)?;
+        let sampled = logits_peaked_at(tok, vocab, &device)?.argmax(lloom_tensor::D::Minus1)?;
         ring.publish_step(&sampled, Some(gen))?;
         device.synchronize()?;
 
@@ -371,7 +371,7 @@ fn generation_zero_is_refused() -> Result<()> {
         return Ok(());
     };
     let ring = TokenRing::new(1, EOS, &device)?;
-    let sampled = logits_peaked_at(99, 4096, &device)?.argmax(candle::D::Minus1)?;
+    let sampled = logits_peaked_at(99, 4096, &device)?.argmax(lloom_tensor::D::Minus1)?;
     assert!(
         ring.publish_step(&sampled, Some(0)).is_err(),
         "generation 0 was accepted, so an unpublished step and a published one \
@@ -393,7 +393,7 @@ fn unstamped_publish_leaves_the_counter_and_the_poll_declines() -> Result<()> {
         return Ok(());
     };
     let ring = TokenRing::new(1, EOS, &device)?;
-    let sampled = logits_peaked_at(99, 4096, &device)?.argmax(candle::D::Minus1)?;
+    let sampled = logits_peaked_at(99, 4096, &device)?.argmax(lloom_tensor::D::Minus1)?;
     ring.publish(&sampled)?;
     device.synchronize()?;
 

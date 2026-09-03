@@ -25,7 +25,7 @@
 //! bit-stable and upstreamable, where the Metal generic grouped path is the
 //! unstable side at high channel counts (§2.3.8a).
 
-use candle::{DType, Device, IndexOp, Result, Tensor};
+use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 /// The shuffle, exactly as `ShortConv::forward` runs it at `seq_len == 1`.
 fn shuffle_step(

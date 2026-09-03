@@ -377,6 +377,24 @@ pub struct PoolCounters {
     /// see which rows are clean rather than trusting a label the pool cannot
     /// verify.
     pub bands: [SizeBand; SIZE_BAND_COUNT],
+
+    /// Range-query candidates rejected by the reuse-oversize bound
+    /// (`DESIGN.md` §9.2v, #47).
+    ///
+    /// **The arm's engagement proof, and it is a third counter rather than a
+    /// derivation from the two above for #500's reason**: a bound that is
+    /// installed but never binds and a bound that is not installed at all
+    /// produce the *same* `requested`/`served` sums, so nothing else in this
+    /// struct separates them. A run reporting `bound=4.0` with
+    /// `oversize_declined = 0` has either found a free list that never offers a
+    /// candidate past the bound -- a real and interesting outcome -- or has not
+    /// engaged the mechanism at all, and only this counter can say which.
+    ///
+    /// Counted at the rejection, so it is a count of *candidates declined*,
+    /// never of allocations caused: a decline is followed by the caller
+    /// allocating fresh, but a miss with an empty free list allocates fresh
+    /// too and does not increment this.
+    pub oversize_declined: u64,
 }
 
 /// One row of [`PoolCounters::bands`]: the same two sums over one size range.
@@ -421,6 +439,116 @@ pub const SIZE_BAND_COUNT: usize = 4;
 
 /// Human-readable band names, index-aligned with [`PoolCounters::bands`].
 pub const SIZE_BAND_NAMES: [&str; SIZE_BAND_COUNT] = ["<4KB", "4KB-256KB", "256KB-4MB", ">=4MB"];
+
+/// The reuse-oversize bound in force, as a multiple of the request
+/// (`DESIGN.md` §9.2v, #47). `None` is the shipped behaviour: unbounded.
+///
+/// # What this axis is, and why it is the one the measurement pointed at
+///
+/// §9.2u measured the pool's overhang and found **84.1 % of it in the
+/// 4KB-256KB activation band at a 16.01x served/requested ratio**, against KV's
+/// 15.9 % at 1.35x. The mechanism is not that the activation band asks for too
+/// much: it is that [`BufferPool::acquire`]'s second probe returns the smallest
+/// bucket *strictly larger* than the request **with no ceiling on how much
+/// larger**, and by token 90 the only thing left free is the `Cat` KV arm's
+/// discarded multi-MB tensors -- `evict_over_budget` having destroyed the small
+/// buckets to stay inside `free_budget`, oldest-first and **size-blind**. So a
+/// 76 KB activation request meets a 3.83 MB bucket and takes it.
+///
+/// §9.2t went looking for a borrow for this and found none: *"neither engine
+/// bounds how much larger a reused buffer may be than the request"* -- ggml
+/// searches best-fit over an offset-sorted free-block list, we take the
+/// smallest bucket strictly larger, and **no prior art bounds the ratio**. That
+/// section's disposition was that it is *"ours to settle"*. This is the
+/// instrument that settles it.
+///
+/// # Declining is not refusing to reuse
+///
+/// When the bound rejects a candidate, `acquire` returns `None` and the caller
+/// allocates fresh **at its own size**, which then returns to the free list as a
+/// bucket of that size -- so the mechanism *creates* the small buckets whose
+/// absence is the pathology, rather than merely refusing the large ones. That
+/// is why the arm is expected to move the band-1 ratio and not merely trade one
+/// waste for another.
+///
+/// **`Drop` reclamation is untouched** (§9.2a layer 1, non-negotiable). This
+/// changes only *which bucket answers a request*, never who releases a buffer
+/// or when. No caller is asked to free anything.
+///
+/// # Read once, not per acquisition
+///
+/// A `OnceLock`, exactly as §9.2r's `LLOOM_586_BUFFER_ALIGNMENT`: `acquire` is
+/// the hot path at §6.3b's ~11.6 destroys/token, and an env read per call would
+/// put a syscall-shaped cost on it. Reading once also makes the arm a property
+/// of the process, which is what lets a harness report it back from the
+/// mechanism rather than from the flag (§7.1a-i).
+pub fn reuse_oversize_bound() -> Option<f64> {
+    static BOUND: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *BOUND.get_or_init(|| {
+        let Ok(raw) = std::env::var("LLOOM_47_REUSE_OVERSIZE_BOUND") else {
+            return None;
+        };
+        let raw = raw.trim();
+        // The explicit spelling of the shipped arm, so a sweep can name it
+        // rather than expressing it by unsetting the variable -- an arm you
+        // cannot write down is one a harness renders as absent, which is
+        // §7.1a-i's present-and-wrong case from the other side.
+        if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        let Ok(v) = raw.parse::<f64>() else {
+            panic!(
+                "LLOOM_47_REUSE_OVERSIZE_BOUND={raw:?} is not a number. \
+                 Give a multiple of the request >= 1.0, or `off` for the \
+                 unbounded behaviour that ships (DESIGN.md §9.2v)."
+            )
+        };
+        // Refused rather than clamped, and loudly -- a silently-corrected arm
+        // renders a bound the process did not take and compares equal to real
+        // runs of that arm (§9.2r's reasoning, same failure).
+        if !v.is_finite() || v < 1.0 {
+            panic!(
+                "LLOOM_47_REUSE_OVERSIZE_BOUND={v} is below 1.0. A bound under \
+                 1.0 would reject every candidate including an exact match, \
+                 which is not a reuse policy but a way to disable the pool \
+                 (DESIGN.md §9.2v)."
+            )
+        }
+        Some(v)
+    })
+}
+
+/// Whether a free bucket of `bucket` bytes may answer a request for `size`,
+/// under `bound` (`DESIGN.md` §9.2v, #47).
+///
+/// # Why this is a pure function and not a comparison inlined at the call site
+///
+/// [`reuse_oversize_bound`] is a process-wide `OnceLock`, so a test cannot
+/// select an arm without deciding it for every other test in the binary. §9.2r's
+/// `LLOOM_586_BUFFER_ALIGNMENT` has exactly that shape and is consequently
+/// **exercised only end-to-end** -- 18 runs of a whole model to check an
+/// arithmetic property. Splitting the *policy* out from the *arm selection*
+/// makes the policy unit-testable at every bound including the ones no run
+/// takes, and leaves the `OnceLock` doing only what it must: supplying the
+/// default.
+///
+/// This is §3.1b rule 1 -- prefer an absolute reference to a shape. The
+/// predicate can be asserted against exact byte pairs; an end-to-end run can
+/// only be asserted against itself.
+#[inline]
+pub fn bucket_admissible(size: usize, bucket: usize, bound: Option<f64>) -> bool {
+    match bound {
+        // `size` is never 0 on the allocation path -- `buf_size` returns
+        // `max(1)` -- but this is a public predicate, and at `size == 0` the
+        // product is 0 while every bucket is larger, so an unguarded
+        // comparison would reject every candidate and read as "the bound is
+        // very tight" rather than as "the question is malformed". Admitting is
+        // the direction that matches the unbounded arm.
+        Some(_) if size == 0 => true,
+        Some(limit) => (bucket as f64) <= (size as f64) * limit,
+        None => true,
+    }
+}
 
 /// Which band a request of `size` bytes falls in.
 ///
@@ -546,6 +674,22 @@ struct PoolState {
 
     /// Cap on `free_bytes`. See `evict_over_budget` for why there has to be one.
     free_budget: usize,
+
+    /// How much larger than a request a reused bucket may be (`DESIGN.md`
+    /// §9.2v, #47). `None` is the shipped behaviour: unbounded.
+    ///
+    /// # Why this is state rather than a read of the axis at each `acquire`
+    ///
+    /// It is initialised from [`reuse_oversize_bound`] once, at pool
+    /// construction, so a process still takes exactly one arm and `acquire`
+    /// still reads no environment. What it buys is that a **test** can select
+    /// an arm for one pool, which a process-wide `OnceLock` cannot offer -- and
+    /// #586's axis, which does not have this, is exercised only by running a
+    /// whole model 18 times.
+    ///
+    /// The field is written once at construction and by
+    /// [`BufferPool::set_reuse_oversize_bound`]; `acquire` only reads it.
+    oversize_bound: Option<f64>,
 
     /// Cap on bytes the pools hold that **no planner owns** — `DESIGN.md`
     /// §9.5k's derived residual, installed by admission.
@@ -725,6 +869,9 @@ impl PoolInner {
                 free_bytes: 0,
                 free_order: std::collections::VecDeque::new(),
                 free_budget: DEFAULT_FREE_BUDGET_BYTES,
+                // Read once here rather than per `acquire`, so the process
+                // takes one arm and the hot path reads no environment (§9.2v).
+                oversize_bound: reuse_oversize_bound(),
                 // Absent = unbounded, which is what shipped. Admission installs
                 // one; a process that never runs admission is unchanged.
                 residual: None,
@@ -1047,6 +1194,25 @@ impl BufferPool {
         self.inner.drain_completed();
     }
 
+    /// Selects the reuse-oversize bound for this pool (`DESIGN.md` §9.2v, #47).
+    ///
+    /// `None` restores the unbounded behaviour that ships. Every pool is
+    /// constructed at [`reuse_oversize_bound`]'s arm already, so **production
+    /// does not call this** -- it exists so a test can exercise a bound the
+    /// process-wide `OnceLock` cannot be made to yield, which is the gap that
+    /// leaves §9.2r's alignment axis testable only by running a whole model.
+    ///
+    /// Retroactive by construction and deliberately so: the bound is consulted
+    /// at `acquire`, never recorded on a buffer, so tightening it cannot
+    /// invalidate a handle already handed out. Nothing is evicted -- a bucket
+    /// past the bound is still the right answer for a larger request, and
+    /// `evict_over_budget` remains the only thing that destroys a free buffer.
+    pub fn set_reuse_oversize_bound(&self, bound: Option<f64>) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.oversize_bound = bound;
+        }
+    }
+
     /// Sets the cap on bytes retained in the free list, evicting immediately if
     /// the new cap is already exceeded. See `DEFAULT_FREE_BUDGET_BYTES`.
     pub fn set_free_budget(&self, bytes: usize) {
@@ -1134,11 +1300,39 @@ impl BufferPool {
             Some(hit) => Some(hit),
             None => {
                 state.counters.buckets_probed += 1;
+                // The reuse-oversize bound (§9.2v, #47), applied to the
+                // candidate *before* it is popped. `range` yields the smallest
+                // key above the request, so if that one is past the bound then
+                // every other candidate is further past it -- the ordering is
+                // what makes one comparison sufficient and keeps this off
+                // §3.3's no-O(N) list.
+                //
+                // Declining leaves the buffer in the free list rather than
+                // destroying it: it is still the right answer for a larger
+                // request, and evicting on this path would make a lookup
+                // policy into a retention policy. `evict_over_budget` remains
+                // the only thing that removes a free buffer.
+                let bound = state.oversize_bound;
                 let next = state
                     .free
                     .range_mut((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
                     .next()
+                    .filter(|(k, _)| bucket_admissible(size, **k, bound))
                     .and_then(|(k, v)| v.pop().map(|b| (b, *k)));
+                if next.is_none() && bound.is_some() {
+                    // Only when a candidate existed and the bound is what
+                    // rejected it. An empty range yields `None` too, and
+                    // counting that would make this a miss counter rather than
+                    // the arm's engagement proof (#500).
+                    let had_candidate = state
+                        .free
+                        .range((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
+                        .next()
+                        .is_some();
+                    if had_candidate {
+                        state.counters.oversize_declined += 1;
+                    }
+                }
                 next
             }
         };
@@ -1764,6 +1958,228 @@ mod tests {
             "an exact hit is taken in preference to the oversized bucket, which \
              is what makes the assertion above a statement about WHICH bucket \
              is chosen rather than about the pool declining to reuse"
+        );
+    }
+
+    /// The reuse-oversize bound rejects the candidate the test above accepts
+    /// (`DESIGN.md` §9.2v, #47).
+    ///
+    /// **This is the same 128 B request and the same 32768 B bucket as
+    /// `acquire_serves_an_oversized_bucket_when_no_exact_size_is_free`
+    /// directly above**, so the pair is one A/B on one population: that test
+    /// pins the shipped arm's behaviour, this one pins the bounded arm's, and
+    /// the only thing that differs is the bound. Read them together -- a
+    /// change that broke the range query entirely would take this test green
+    /// and its sibling red, which is why the sibling's assertion is what makes
+    /// this one meaningful (§3.1b rule 4, recording the dependency in a
+    /// comment where it cannot be made intrinsic).
+    ///
+    /// The measured motivation is §9.2u's: a 76 KB activation request meeting
+    /// a 3.83 MB KV leftover is a **256x** over-service, and 32768/128 is
+    /// **256x** exactly -- so this fixture is that pathology at the same ratio
+    /// rather than at an arbitrary one.
+    #[test]
+    fn the_oversize_bound_declines_a_bucket_past_the_ceiling() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        const REQUEST: usize = 128;
+        const OVERSIZED: usize = 32768;
+        // 256x, the ratio §9.2u measured between a 76 KB activation request
+        // and the 3.83 MB KV bucket that answers it.
+        assert_eq!(
+            OVERSIZED / REQUEST,
+            256,
+            "the fixture is the measured ratio"
+        );
+
+        pool.set_reuse_oversize_bound(Some(4.0));
+
+        let big = alloc(&pool, &dev, OVERSIZED);
+        release_and_complete(&pool, &clock, big);
+
+        assert!(
+            pool.acquire(REQUEST).is_none(),
+            "a {OVERSIZED} B bucket is 256x a {REQUEST} B request, so a 4.0x \
+             bound must decline it -- the caller then allocates at its own \
+             size, which is what puts a small bucket back in a free list whose \
+             small buckets eviction destroyed (§9.2u)"
+        );
+        assert_eq!(
+            pool.counters().oversize_declined,
+            1,
+            "and the decline is counted, because a bound that never binds and \
+             a bound that is not installed produce identical requested/served \
+             sums -- this counter is the only thing that separates them (#500)"
+        );
+
+        // The bucket is still free: declining is a lookup policy, not a
+        // retention policy. A larger request must still be served from it.
+        let served = pool
+            .acquire(OVERSIZED)
+            .expect("the declined bucket is still free for a request it fits");
+        assert_eq!(
+            served.size(),
+            OVERSIZED,
+            "declining for a small request must not have destroyed or resized \
+             the bucket -- `evict_over_budget` is the only thing that removes a \
+             free buffer"
+        );
+    }
+
+    /// The bound admits what it should: an exact hit and a candidate inside the
+    /// ceiling are both unaffected (§9.2v).
+    ///
+    /// **The non-vacuity arm for the test above.** A bound that rejected
+    /// everything would take that test green while destroying reuse entirely,
+    /// and the two assertions there cannot see it -- so the ceiling has to be
+    /// shown to admit as well as to decline. This is §3.1b rule 2: a shape
+    /// needs a second arm producing a value the shape can be checked against.
+    #[test]
+    fn the_oversize_bound_admits_an_exact_hit_and_a_candidate_inside_it() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        pool.set_reuse_oversize_bound(Some(4.0));
+
+        // An exact match is never affected: `acquire`'s first probe returns
+        // before the bound is consulted, and 1.0x is inside any bound >= 1.0.
+        const EXACT: usize = 4096;
+        let b = alloc(&pool, &dev, EXACT);
+        release_and_complete(&pool, &clock, b);
+        let served = pool.acquire(EXACT).expect("an exact hit must be served");
+        assert_eq!(served.size(), EXACT, "an exact match is not over-service");
+
+        // And a candidate strictly inside the ceiling is served: 8192 is 2.0x
+        // a 4096 B request, under the 4.0x bound.
+        //
+        // The exact-size handle above is deliberately **still held** here
+        // rather than released, so the only thing free is the 8192 bucket and
+        // the range query is what has to answer. Releasing it first would put
+        // a 4096 B buffer back in the free list, the exact probe would return
+        // it, and this arm would assert about a path that never consults the
+        // bound at all -- which is how a test comes to pass without exercising
+        // its subject. (Caught by this test failing on its first version.)
+        const INSIDE: usize = 8192;
+        let b = alloc(&pool, &dev, INSIDE);
+        release_and_complete(&pool, &clock, b);
+        let from_range = pool
+            .acquire(EXACT)
+            .expect("2.0x is inside a 4.0x bound and must be served");
+        assert_eq!(
+            from_range.size(),
+            INSIDE,
+            "the bound is a ceiling on the ratio, not a requirement of an \
+             exact match -- a change that made it the latter would pass the \
+             decline test and destroy every hit on the decode path"
+        );
+        assert_eq!(
+            pool.counters().oversize_declined,
+            0,
+            "and nothing was declined, which is what makes this the \
+             non-vacuity arm rather than a second decline test"
+        );
+    }
+
+    /// The bound's boundary is inclusive, at the exact byte pair (§9.2v).
+    ///
+    /// **An absolute reference rather than a shape** (§3.1b rule 1): the
+    /// assertion is about two specific sizes whose ratio is exactly the bound,
+    /// so an off-by-one in the comparison direction fails here and nowhere
+    /// else. `<=` admits; `<` would reject 4x at a 4x bound, which is a
+    /// different policy silently.
+    #[test]
+    fn the_bound_is_inclusive_at_exactly_the_ratio() {
+        // The predicate directly, not through a pool: this is arithmetic, and
+        // routing it through an allocation would make a comparison test depend
+        // on a Metal device.
+        assert!(
+            bucket_admissible(1024, 4096, Some(4.0)),
+            "4096 is exactly 4.0x 1024, and the bound is a ceiling the \
+             candidate may reach"
+        );
+        assert!(
+            !bucket_admissible(1024, 4097, Some(4.0)),
+            "one byte past it is declined"
+        );
+        assert!(
+            bucket_admissible(1024, 4096, None),
+            "and with no bound installed the same pair is admitted, which is \
+             the arm that ships"
+        );
+        // The degenerate input the public predicate has to answer for.
+        assert!(
+            bucket_admissible(0, 4096, Some(4.0)),
+            "a zero-byte request admits rather than rejecting every bucket: \
+             `buf_size` never produces one, so this is a malformed question \
+             and the safe answer is the unbounded arm's"
+        );
+    }
+
+    /// An empty free list is a MISS, never a decline (§9.2v).
+    ///
+    /// **This is what keeps `oversize_declined` an engagement proof rather
+    /// than a miss counter.** `range(..).next()` yields `None` both when a
+    /// candidate was rejected by the bound and when there was no candidate at
+    /// all, and those mean opposite things: the first says the mechanism fired,
+    /// the second says the pool was empty. Counting both would make the
+    /// counter read nonzero on a run where the bound never bound, which is
+    /// exactly the #500 confusion the counter exists to resolve -- so the
+    /// re-probe that distinguishes them is load-bearing and this test is the
+    /// only thing that can see it removed.
+    #[test]
+    fn an_empty_free_list_is_a_miss_and_not_a_decline() {
+        let (pool, _clock) = pool_with_clock();
+        pool.set_reuse_oversize_bound(Some(4.0));
+
+        // Nothing has ever been freed, so the range query finds no candidate.
+        assert!(
+            pool.acquire(4096).is_none(),
+            "an empty pool has nothing to serve"
+        );
+        assert_eq!(
+            pool.counters().oversize_declined,
+            0,
+            "an empty free list must not increment the decline counter -- \
+             otherwise a run whose pool was simply cold would report the bound \
+             as having engaged, and the counter would say nothing about the \
+             mechanism it exists to prove (#500)"
+        );
+        // And the miss itself is still counted where misses belong, so this is
+        // a statement about WHICH counter moves rather than about nothing
+        // happening (§3.1c: a zero is not evidence unless something nonzero
+        // came from the same command).
+        assert_eq!(
+            pool.counters().lookups,
+            1,
+            "the lookup happened; it was a miss, not a decline"
+        );
+        assert_eq!(pool.counters().hits, 0, "and it was not a hit");
+    }
+
+    /// The axis parses its arms, including the spelled-out default (§9.2v).
+    ///
+    /// Reads the parse rules through the same predicate the pool uses rather
+    /// than through the `OnceLock`, which cannot be re-selected in a test. What
+    /// this pins is that `off` and an absent variable mean the same thing --
+    /// the property that lets a sweep name the shipped arm instead of
+    /// expressing it by unsetting a variable, which a harness renders as
+    /// absent (§7.1a-i).
+    #[test]
+    fn the_unbounded_arm_and_a_generous_bound_are_different_facts() {
+        // 512x admits the 256x pathology; the arm exists so a sweep can show a
+        // bound that is installed and does not bind, which is a different
+        // finding from no bound at all -- and `oversize_declined` is what
+        // reports the difference.
+        assert!(
+            bucket_admissible(128, 32768, Some(512.0)),
+            "a bound above the observed ratio admits, so a null result at a \
+             generous bound is evidence about the free list rather than about \
+             the mechanism"
+        );
+        assert!(
+            !bucket_admissible(128, 32768, Some(255.0)),
+            "and just below it declines, which brackets the measured 256x"
         );
     }
 

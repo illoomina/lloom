@@ -321,6 +321,16 @@ struct MemProbe {
     band_acquisitions: [u64; SIZE_BAND_COUNT],
     band_requested_bytes: [u64; SIZE_BAND_COUNT],
     band_served_bytes: [u64; SIZE_BAND_COUNT],
+    /// Range-query candidates rejected by the reuse-oversize bound
+    /// (`DESIGN.md` §9.2v, #47).
+    ///
+    /// **The arm's engagement proof.** A bound that is installed but never
+    /// binds and a bound that is not installed at all produce identical
+    /// `requested`/`served` sums, so this is the only field that separates
+    /// them -- #500's lesson that a mechanism with no production callers yields
+    /// a clean null indistinguishable from a real one, and that a counter is
+    /// the only thing that tells them apart.
+    oversize_declined: u64,
     residency: u64,
     /// Residency-set activity, cumulative (`DESIGN.md` §6.3e, issue #210).
     ///
@@ -380,6 +390,7 @@ impl MemProbe {
             band_served_bytes: std::array::from_fn(|i| {
                 cs.bands[i].served_bytes + cp.bands[i].served_bytes
             }),
+            oversize_declined: cs.oversize_declined + cp.oversize_declined,
             residency: dev.residency_set_len() as u64,
             residency_commits: rc.commits,
             residency_added: rc.added,
@@ -514,7 +525,7 @@ impl MemProbe {
              \"hits\":{},\"lookups\":{},\"buckets_probed\":{},\
              \"requested_bytes\":{},\"served_bytes\":{},\
              \"band_acquisitions\":{},\"band_requested_bytes\":{},\
-             \"band_served_bytes\":{},\
+             \"band_served_bytes\":{},\"oversize_declined\":{},\
              \"residency\":{},\"residency_commits\":{},\
              \"residency_added\":{},\"residency_removed\":{},\
              \"residency_retired\":{},\"device_allocated\":{},\
@@ -540,6 +551,7 @@ impl MemProbe {
             json_u64_array(&self.band_acquisitions),
             json_u64_array(&self.band_requested_bytes),
             json_u64_array(&self.band_served_bytes),
+            self.oversize_declined,
             self.residency,
             self.residency_commits,
             self.residency_added,
@@ -1313,7 +1325,56 @@ impl Axes {
             // The arm is the byte count verbatim, `CutPolicy`'s rule: 64 and
             // 256 are two granularities and a bare `aligned` would pool them.
             p("BufferAlignment", &Self::buffer_alignment_arm()),
+            // The reuse-oversize bound (§9.2v, #47). Read back from the
+            // `OnceLock` `acquire` itself consults, on `BufferAlignment`'s
+            // reasoning exactly: a flag echoed to itself is §7.1a-i's
+            // present-and-wrong case, and this axis has the same failure
+            // available to it -- a run that rendered a bound it did not take
+            // would compare EQUAL to every real run of that arm.
+            //
+            // Stated on every run including the default `off`, for the same
+            // reason `BufferAlignment` is: this axis did not exist before #47,
+            // so a run at `off` and a run predating the axis are different
+            // facts, and only the first can be pooled with a future `off` run.
+            p("ReuseOversizeBound", &Self::reuse_oversize_bound_arm()),
         ]
+    }
+
+    /// The `ReuseOversizeBound` arm: the ceiling `acquire` actually applies.
+    ///
+    /// `off` for the unbounded behaviour that ships, spelled rather than left
+    /// empty -- `MemoryBudget`'s rule, that an arm rendering as the empty
+    /// string is indistinguishable from a field the harness failed to fill.
+    /// `n/a` off Metal, following `BufferAlignment`: there is no pool for a
+    /// bound to apply to, which is a different fact from having taken the
+    /// default arm.
+    ///
+    /// # `{:.1}` rather than `{}`, and it is not cosmetic
+    ///
+    /// Rust's `Display` for `f64` drops a trailing zero, so `LLOOM_47_…=4.0`
+    /// renders `4` while `.bench/configurations.md` declares the arm `4.0` --
+    /// and the two then **fail to compare equal across a sweep**, which is
+    /// exactly the pooling failure the byte-count-verbatim rule exists to
+    /// prevent for `BufferAlignment`. One decimal place is canonical for every
+    /// bound a sweep would take; a bound needing more precision than that is
+    /// not a ratio anyone is choosing deliberately.
+    ///
+    /// **Caught by `every_registry_arm_is_renderable_by_the_harness`**, which
+    /// reads real `RESULT` lines rather than a rendering the test invented --
+    /// the check §7.1a exists for, firing in the direction that a declared arm
+    /// and a rendered arm had drifted apart.
+    fn reuse_oversize_bound_arm() -> String {
+        #[cfg(feature = "metal")]
+        {
+            match candle_metal_kernels::metal::buffer_pool::reuse_oversize_bound() {
+                Some(v) => format!("{v:.1}"),
+                None => "off".to_string(),
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a".to_string()
+        }
     }
 
     /// The `BufferAlignment` arm: the granularity `buf_size` actually rounds to.

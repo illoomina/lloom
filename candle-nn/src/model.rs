@@ -1,0 +1,105 @@
+//! The engine's model traits: `Model`, `CausalLM`, `Speculative`.
+//!
+//! These name the entry points a decoder-only language model already exposes,
+//! so the serving engine, the VL composition and the speculative verify loop
+//! can be written against a seam rather than against `lfm2::Model` by name
+//! (`RESTRUCTURING_DESIGN.md` §3.1). They add no computation: an impl wires each
+//! method to the model's existing inherent method.
+//!
+//! `Cache` is an associated type because a real cache is not a shared concrete
+//! type — LFM2's bundles KV slots, quant slots, conv state, phase, taps and
+//! masks (`RESTRUCTURING_DESIGN.md` §3.1, B8). The trait fixes the *shape* of
+//! the entry points, not the state they thread.
+
+use crate::var_builder::VarBuilder;
+use candle::{Result, Tensor};
+
+/// A model constructible from weights and a typed config.
+///
+/// `VarBuilder` is `candle-nn`'s, which is why the trait lives here rather than
+/// in `candle-core` (`RESTRUCTURING_DESIGN.md` §3.1, B12: the zoo's direction is
+/// `candle-transformers → candle-nn → candle-core`).
+///
+/// `Config` carries no `serde` bound. `RESTRUCTURING_DESIGN.md` §3.1 sketches
+/// `type Config: serde::de::DeserializeOwned`, but LFM2's constructor takes a
+/// *runtime* `Config` derived from the wire `Lfm2Config` by `into_config`, which
+/// computes `intermediate_size` and folds in a caller-supplied `use_flash_attn`
+/// — so the runtime config is not the deserialized one and deriving
+/// `Deserialize` on it would read the wrong intermediate size. Deserialization
+/// is the checkpoint layer's concern (`Checkpoint`/`Pretrained`, §3.6, PR 7),
+/// not this trait's; see this PR's body for the reconciliation.
+pub trait Model: Sized {
+    type Config;
+
+    fn from_weights(vb: VarBuilder, cfg: &Self::Config) -> Result<Self>;
+}
+
+/// The LLM domain: an autoregressive model that projects the residual stream to
+/// vocabulary logits and threads a cache across positions.
+///
+/// `forward` is a provided method over `embed` + `forward_embeds` so a caller
+/// that builds the residual stream itself — the VL path substituting image rows
+/// at the image-token positions (`RESTRUCTURING_DESIGN.md` §5) — needs no second
+/// trait. A model whose per-token path must stay byte-identical to its recorded
+/// digests overrides `forward` with its hand-written one; the default exists for
+/// the models that do not.
+pub trait CausalLM: Model {
+    /// The state threaded across positions. Bundled per model, not shared: see
+    /// the module docs and B8.
+    type Cache;
+
+    fn new_cache(&self, cfg: &Self::Config, dev: &candle::Device) -> Result<Self::Cache>;
+
+    /// Embed `tokens` to `[b, seq, hidden]` without running a layer.
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor>;
+
+    /// Run the model from a residual stream the caller has already built,
+    /// projecting the last position to logits.
+    fn forward_embeds(
+        &self,
+        embeds: &Tensor,
+        pos: usize,
+        cache: &mut Self::Cache,
+    ) -> Result<Tensor>;
+
+    /// Embed and run in one call. Provided over `embed` + `forward_embeds`;
+    /// override only where the per-token path must stay byte-identical to the
+    /// recorded digests.
+    fn forward(&self, tokens: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
+        let embeds = self.embed(tokens)?;
+        self.forward_embeds(&embeds, pos, cache)
+    }
+
+    fn vocab_size(&self) -> usize;
+}
+
+/// The verifier's entry and the speculative rollback seam.
+///
+/// Only a model that can rewind implements it. `forward_all` projects **every**
+/// position rather than the last, which is what a verify pass needs: comparing
+/// the target's argmax at each of K proposed positions, where one position's
+/// logits cannot answer K questions (`lfm2.rs` `forward_all`'s doc).
+///
+/// Rollback is transactional rather than an absolute `rewind(to)`: `advance`
+/// opens a window and returns a token recording the state to return to;
+/// `resolve` keeps the accepted prefix and discards the rest (KV by a length
+/// decrement, conv by a phase move, `RESTRUCTURING_DESIGN.md` §3.1 /
+/// `DESIGN.md` §10.2a). The token is the seam, not a position index — see the
+/// finding in this PR's body.
+pub trait Speculative: CausalLM {
+    /// A handle to an open speculative window, recording the state `resolve`
+    /// returns to. Not `Copy`, so a caller cannot hold two windows at once.
+    type Window;
+
+    /// Run the model and project every position: `[b, seq, vocab]` where
+    /// `forward` returns `[b, vocab]`.
+    fn forward_all(&self, tokens: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor>;
+
+    /// Open a speculative window of `k` positions. Records the pre-window state;
+    /// writes nothing until the K-position pass runs.
+    fn advance(cache: &mut Self::Cache, k: usize) -> Result<Self::Window>;
+
+    /// Close the window opened by `advance`, keeping the first `n` positions and
+    /// discarding the rest.
+    fn resolve(cache: &mut Self::Cache, window: Self::Window, n: usize) -> Result<()>;
+}

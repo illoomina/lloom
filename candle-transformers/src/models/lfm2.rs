@@ -9,7 +9,7 @@ use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, R
 use crate::utils::repeat_kv;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::ops::{FlashScratchSizing, KvQuant};
-use candle_nn::{Conv1d, Conv1dConfig, VarBuilder};
+use candle_nn::{CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, Speculative, VarBuilder};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
@@ -3308,9 +3308,99 @@ impl Model {
     }
 }
 
+// The engine's model traits over LFM2's existing entry points
+// (`RESTRUCTURING_DESIGN.md` §3.1). No computation is threaded through them that
+// the inherent methods above do not already do; each wires to one of them.
+//
+// `forward` is overridden rather than taking `CausalLM`'s provided
+// `embed`+`forward_embeds` default: the inherent `forward` is on the per-token
+// path and its shape is what every recorded digest belongs to (`DESIGN.md`
+// §2.3.8c), so it stays byte-identical rather than routing through two calls.
+impl ModelTrait for Model {
+    type Config = Config;
+
+    fn from_weights(vb: VarBuilder, cfg: &Self::Config) -> Result<Self> {
+        Model::new(cfg, vb)
+    }
+}
+
+impl CausalLM for Model {
+    type Cache = Cache;
+
+    fn new_cache(&self, cfg: &Self::Config, dev: &Device) -> Result<Self::Cache> {
+        Cache::new(true, self.dtype, cfg, dev)
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        Model::embed(self, tokens)
+    }
+
+    fn forward_embeds(
+        &self,
+        embeds: &Tensor,
+        pos: usize,
+        cache: &mut Self::Cache,
+    ) -> Result<Tensor> {
+        Model::forward_embeds(self, embeds, pos, cache)
+    }
+
+    fn forward(&self, tokens: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
+        Model::forward(self, tokens, pos, cache)
+    }
+
+    fn vocab_size(&self) -> usize {
+        // `lm_head` is `[vocab, hidden]` (`Model::new`: `linear(hidden, vocab)`
+        // or the tied `[vocab, hidden]` embedding), so its leading dim is the
+        // vocabulary. 2D by construction, so `dims()[0]` cannot be absent.
+        self.lm_head.weight().dims()[0]
+    }
+}
+
+impl Speculative for Model {
+    type Window = SpecToken;
+
+    fn forward_all(&self, tokens: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
+        Model::forward_all(self, tokens, pos, cache)
+    }
+
+    fn advance(cache: &mut Self::Cache, k: usize) -> Result<Self::Window> {
+        cache.advance(k)
+    }
+
+    fn resolve(cache: &mut Self::Cache, window: Self::Window, n: usize) -> Result<()> {
+        cache.resolve(window, n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The trait impls dispatch to the inherent entry points, checked at the
+    /// bound rather than at a forward pass.
+    ///
+    /// A keystone-trait PR earns its reachability the way §3.1c asks — the
+    /// production consumers (`KvCache`, `VisionEncoder`, `candle-hub`, llumos)
+    /// arrive in PRs 4–10, so here the callable-through-the-trait property is
+    /// what a generic bound proves: this function only compiles if `Model`
+    /// satisfies `Model`/`CausalLM`/`Speculative` and the associated types line
+    /// up. The end-to-end computation is the digest gate's, not a unit test's.
+    #[allow(dead_code)]
+    fn assert_bounds<M>()
+    where
+        M: ModelTrait + CausalLM + Speculative,
+        M::Config: Sized,
+    {
+    }
+
+    #[test]
+    fn lfm2_implements_the_model_traits() {
+        assert_bounds::<Model>();
+        // The associated types resolve to LFM2's own state, not a placeholder:
+        // each closure only typechecks if the two sides are the same type.
+        let _cache: fn(<Model as CausalLM>::Cache) -> Cache = |c| c;
+        let _window: fn(<Model as Speculative>::Window) -> SpecToken = |w| w;
+    }
 
     /// The two arms' shapes and contents, built the way `Attention::forward`
     /// builds them: `[b_sz, n_kv_heads, seq, head_dim]`, appended along dim 2.

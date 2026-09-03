@@ -8816,3 +8816,196 @@ fn silu_arm_names_round_trip() {
     assert_eq!(crate::SiluImpl::parse("nosuchvariant"), None);
     assert_eq!(crate::SiluImpl::parse(""), None);
 }
+
+///////////////////////////////////////////////////////////////////////////////
+/// The SiLU consolidation (issue #599, `DESIGN.md` §15.2 #15 / §3.6)
+///////////////////////////////////////////////////////////////////////////////
+
+/// The shipping SiLU expression has exactly ONE definition, and the live
+/// placements are call sites of it.
+///
+/// **This is a SOURCE-level census and it has to be**, in #507's and #562's
+/// shape: one-definition-ness is a property of the **text**, not of any value a
+/// run produces. Every dispatch test in this file passes just as happily with
+/// the expression written out twice — which is the state this change removed —
+/// so no runtime assertion can distinguish "consolidated" from "duplicated and
+/// currently in agreement". That is the whole defect class §3.6 names.
+///
+/// **The needles are ASSEMBLED by concatenation** (§9.2p, measured): a literal
+/// needle finds itself in the file it searches, and *anchoring is not the
+/// repair* — only a needle the source does not contain escapes it. #347's
+/// earlier run read 6 where the answer was 3 for exactly this reason.
+///
+/// **A non-vacuity arm runs first** (§3.1a rule 1, #506): if the shared
+/// definition cannot be found at all, every "zero copies" count below is
+/// trivially satisfied by a file that has been renamed away, which is §15.1a's
+/// VACUOUS class. The count of *call sites* is asserted to be non-zero for the
+/// same reason.
+///
+/// **And this test turns out to be the ONLY thing in the suite that kills a
+/// real numerics change to the shared body**, which was not the intent and is
+/// worth recording. Mutating the primitive's bare `1` to `1.0f` — #604's
+/// measured lever, 1 f16 ulp over 440 of 4096 points — leaves `silu_f16`,
+/// `silu_f32`, `gemv_fused_silu_matches_a_reference` and
+/// `gemv_fused_silu_agrees_with_the_unfused_path` **all green**, and only this
+/// census goes red. The reason is `approx_f16(results, 2)`: the numeric tests
+/// round to two decimal places, so they are structurally blind to a
+/// one-ulp-at-f16 difference (§3.1b — a tolerance is a shape, and a defect
+/// smaller than the tolerance changes no relationship it constrains).
+///
+/// So the coverage here is **incidental**, which #524 names as a distinct risk
+/// from absence: a future edit that loosens this census, or a refactor that
+/// deletes it as "just a grep", takes that class live with nothing saying so.
+/// Recorded at the test rather than left to be re-derived. The honest reading
+/// is that a 1-ulp guard on the shared SiLU body **does not exist** in this
+/// suite; what exists is a text check that happens to catch the one spelling
+/// known to produce one.
+#[test]
+fn the_silu_expression_has_one_definition_and_the_rest_are_call_sites() {
+    let utils = include_str!("metal_src/utils.metal");
+    let unary = include_str!("metal_src/unary.metal");
+    let gemv = include_str!("metal_src/gemv.metal");
+
+    // Assembled, never written as one literal — see the doc comment.
+    let expr = format!("x /{} (1 +{} exp(-x))", "", "");
+    let defn = format!("METAL_FUNC T silu(T{} x)", "");
+    let call = format!("silu({}x)", "");
+
+    // Non-vacuity FIRST: the shared definition must exist, or every count below
+    // is a statement about a file that is not there.
+    assert!(
+        utils.contains(&defn),
+        "utils.metal carries no `{defn}` — the shared primitive is gone, and \
+         every count below would pass vacuously"
+    );
+
+    // Comment lines are stripped before counting: `utils.metal` and both call
+    // sites EXPLAIN the expression in prose, and an explanation matching itself
+    // is #579's measured trap (`a better needle is still a needle`).
+    let code_only = |src: &str| -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let utils_code = code_only(utils);
+    let unary_code = code_only(unary);
+    let gemv_code = code_only(gemv);
+
+    // ONE definition of the expression, and it is in `utils.metal`.
+    assert_eq!(
+        utils_code.matches(expr.as_str()).count(),
+        1,
+        "utils.metal must hold exactly one copy of the SiLU expression"
+    );
+
+    // `unary.metal` still spells it in the LADDER arms — `usilu_literal` and
+    // the `Recip` control are deliberately independent expressions (#613), so
+    // this is not asserted to be zero. What must be zero is the SHIPPING copy,
+    // and the discriminator is the bare `1` with no `f` suffix: `usilu_literal`
+    // is `1.0f` and every other arm is a different function entirely.
+    assert_eq!(
+        unary_code.matches(expr.as_str()).count(),
+        0,
+        "unary.metal must not re-spell the shipping SiLU expression — \
+         `usilu` is a call site of utils.metal's `silu<T>()`. The variant arms \
+         carry their own DIFFERENT expressions and are unaffected."
+    );
+    assert_eq!(
+        gemv_code.matches(expr.as_str()).count(),
+        0,
+        "gemv.metal must not re-spell the SiLU expression — `EpilogueSilu` is \
+         a call site of utils.metal's `silu<T>()`"
+    );
+
+    // And both placements must actually CALL it. A file that spells the
+    // expression zero times because it dropped SiLU altogether would satisfy
+    // the two assertions above; this is what separates consolidated from
+    // deleted, and it is #517's positive-control rule.
+    assert!(
+        unary_code.contains(&call),
+        "unary.metal must call the shared `silu()` — a zero above with no call \
+         here means the op was removed, not consolidated"
+    );
+    assert!(
+        gemv_code.contains(&call),
+        "gemv.metal must call the shared `silu()`"
+    );
+}
+
+/// `gemv` sees `utils.metal`, and the default arm still routes through it.
+///
+/// `EpilogueSilu` can only call the shared primitive because `source.rs` makes
+/// `GEMV` a `with_utils!` consumer (#599). That composition is what a
+/// `#include` would do in a tree that had a filesystem at compile time, and
+/// #458 measured that it does not — so this asserts the ROUTING rather than the
+/// text, which is #516's mutation-3 lesson: *a test of the merged TEXT is not a
+/// test of the merged ARM*.
+///
+/// The bogus-name arm is the non-vacuity control: without it, a `load_pipeline`
+/// that succeeded for every string would read as a passing test.
+#[test]
+fn gemv_is_composed_with_utils_and_its_silu_epilogue_resolves() {
+    // The composed text must contain a helper that lives ONLY in utils.metal.
+    // `get_strided_index` is the marker: `gemv.metal` never uses it, so its
+    // presence in `GEMV` is evidence of the splice and of nothing else.
+    let marker = format!("METAL_FUNC uint get_strided_index{}(", "");
+    assert!(
+        crate::source::GEMV.contains(&marker),
+        "source::GEMV is not composed with utils.metal — `EpilogueSilu` cannot \
+         see the shared `silu<T>()`"
+    );
+
+    // Spliced exactly once. Twice would redefine every shared helper, which is
+    // the redefinition `MERGED_NON_MLX`'s own docs record as manufacturable by
+    // a careless composition.
+    assert_eq!(
+        crate::source::GEMV.matches(marker.as_str()).count(),
+        1,
+        "utils.metal must be spliced into GEMV exactly once"
+    );
+
+    // And the fused kernel still compiles and resolves out of that library, at
+    // EVERY instantiated dtype.
+    //
+    // **`bfloat16` is the row that earns its place.** The hoist's first version
+    // dropped `define_unary_op`'s `static_cast<T>` and failed to compile at
+    // `bfloat` alone — `1 + exp(-x)` promotes to `float` and MSL has no
+    // implicit narrowing — while f16 and f32 were clean. LFM2 decodes at f16,
+    // both canonical pairs are f16 and `lfm2-smoke` is f16, so **every gate
+    // this project leads with is blind to that failure**. It was caught by the
+    // fuzzers dispatching a unary op at every dtype; this asserts it directly
+    // so the next reader does not need a proptest to find it.
+    // Names written out verbatim rather than assembled, deliberately: a name is
+    // an artifact of a `[[host_name]]` string in `gemv.metal` and #26 shipped 48
+    // names that a `format!` reproduced and the metallib did not have. Spelling
+    // them is what makes this a check against the compiled library (§8.1b).
+    let device = device();
+    let kernels = Kernels::new();
+    let mut resolved = 0usize;
+    for name in [
+        "gemv_float32_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_silu",
+        "gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_silu",
+        "gemv_bfloat16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_silu",
+    ] {
+        kernels
+            .load_pipeline(&device, Source::Gemv, name)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the fused silu GEMV {name:?} must resolve out of the \
+                     composed library: {e:?}"
+                )
+            });
+        resolved += 1;
+    }
+    assert_eq!(resolved, 3, "three dtypes are instantiated for `_silu`");
+
+    assert!(
+        kernels
+            .load_pipeline(&device, Source::Gemv, "gemv_no_such_kernel_f16")
+            .is_err(),
+        "non-vacuity: an arbitrary name must NOT resolve, or the assertions \
+         above say nothing"
+    );
+}

@@ -304,9 +304,16 @@ template <typename T> METAL_FUNC T relu(T x) {
 template <typename T> METAL_FUNC T recip(T x) {
     return static_cast<T>(1.0 / x);
 }
-template <typename T> METAL_FUNC T sigmoid(T x) {
-    return static_cast<T>(recip(1 + exp(-x)));
-}
+
+// `sigmoid` and `silu` are NOT defined here any more: they are shared
+// primitives in `utils.metal`, spliced ahead of this file by `source.rs`
+// (issue #599, `DESIGN.md` §15.2 #15). This file is a CALL SITE.
+//
+// The bodies moved unchanged -- `sigmoid`'s is `recip(1 + exp(-x))` with
+// `recip` expanded inline, since a primitive must not depend on a consumer --
+// so `usigmoid` and `usilu` resolve the same names to the same arithmetic and
+// the digests cannot move. See `utils.metal` for why the primitive is
+// templated on its value type and why that is load-bearing.
 
 // Define unary ops
 #define define_unary_op(name, op)   \
@@ -323,7 +330,21 @@ define_unary_op(uneg, -x);
 define_unary_op(uid, x);
 define_unary_op(ugelu, gelu(x));
 define_unary_op(urelu, x < 0 ? 0 : x);
-define_unary_op(usilu, x / (1 + exp(-x)));
+// A CALL SITE of `utils.metal`'s shared `silu<T>()`, not a copy of it (#599).
+// `x` is `T` here, so this instantiates `silu<T>` and keeps computing at the
+// storage precision exactly as it did -- which is the half of the precision
+// split `DESIGN.md` §12.2d records and that the consolidation must preserve.
+//
+// `define_unary_op` wraps this in a second `static_cast<T>`, so the emitted
+// expression is `static_cast<T>(static_cast<T>(x / (1 + exp(-x))))` where it
+// was `static_cast<T>(x / (1 + exp(-x)))`. **A `static_cast<T>` applied to an
+// expression already of type `T` is the identity at every dtype**, so this is a
+// no-op rather than a second rounding: the inner cast is where the one
+// narrowing happens and the outer one has nothing left to narrow. Stated
+// because *two casts where there was one* is the shape that WOULD be a numerics
+// change if the inner one produced a wider type -- which is exactly what it
+// does not do, and which the digest gates confirm.
+define_unary_op(usilu, silu(x));
 
 ///////////////////////////////////////////////////////////////////////////////
 /// The SiLU variant axis (issue #599, `DESIGN.md` §12.2l)
@@ -354,12 +375,20 @@ define_unary_op(usilu, x / (1 + exp(-x)));
 // epilogue at lower precision) with one measured curve instead of one
 // experiment each.
 
-// **Arm 2 -- `Recip`.** `x * recip(1+exp(-x))`, `unary.metal:308`'s sigmoid
-// spelling composed. #604 measured this bit-identical to `usilu` at both
-// dtypes; it is carried here as an INTERNAL CONTROL rather than as a variant.
-// A sweep whose arms all differ cannot show that the instrument reports "no
-// difference" when there is none, and §3.1a rule 4 is that all-different is as
-// suspicious as all-identical. This arm must read zero.
+// **Arm 2 -- `Recip`.** `x * recip(1+exp(-x))`, the sigmoid spelling composed.
+// #604 measured this bit-identical to `usilu` at both dtypes; it is carried
+// here as an INTERNAL CONTROL rather than as a variant. A sweep whose arms all
+// differ cannot show that the instrument reports "no difference" when there is
+// none, and §3.1a rule 4 is that all-different is as suspicious as
+// all-identical. This arm must read zero.
+//
+// **Spelled out rather than calling `sigmoid()`, deliberately** (#599's
+// consolidation). The variant arms exist to DIFFER from the shared primitive in
+// a controlled way; routing one through it would make the arm and its reference
+// the same expression, and this arm's whole job is to be a second expression
+// that agrees. That is `DESIGN.md` §3.1b rule 2 -- a control has to be an
+// independent arm, not the subject under another name. The consolidation is
+// over the SHIPPING copies; the ladder's arms are not copies of anything.
 define_unary_op(usilu_recip, x * recip(1 + exp(-x)));
 
 // **Arm 3 -- `Literal`.** `x / (1.0f + exp(-x))`, `quantized.metal:1563`'s

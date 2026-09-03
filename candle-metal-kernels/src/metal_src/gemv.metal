@@ -2,10 +2,18 @@
 // https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/gemv.metal
 // Copyright © 2023-2024 Apple Inc.
 
-#include <metal_simdgroup>
-#include <metal_stdlib>
-
-using namespace metal;
+// NOTE: this file does NOT open with its own `#include`s. As of issue #599 it
+// is a `with_utils!` consumer: `source.rs` supplies
+// `<metal_simdgroup>`/`<metal_stdlib>` and splices `utils.metal` in after them,
+// so this file is a FRAGMENT and does not compile standalone -- the same shape
+// `unary.metal`, `binary.metal` and `reduce.metal` have had since #458.
+//
+// It was made one so that `EpilogueSilu` could CALL `utils.metal`'s shared
+// `silu<T>()` instead of carrying a second copy of the expression
+// (`DESIGN.md` §15.2 #15 / `CONTRIBUTING.md` §3.6). `#include` is not available
+// here for #458's reason: the sources are `include_str!`-embedded and compiled
+// at runtime by `newLibraryWithSource`, so there is no directory for a quoted
+// include to resolve against. Composition is `concat!` on the Rust side.
 
 #define MLX_MTL_CONST static constant constexpr const
 #define MLX_MTL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
@@ -169,10 +177,24 @@ struct EpilogueNone {
 // Per §2.3.3b the bare `exp` at FLOAT is the flag-reachable spelling, so this
 // arm tracks `MathMode` where `silu_f16`'s half `exp` is pinned. That is a
 // second, independent reason the two cannot be bit-compared.
+// **This is a CALL SITE of `utils.metal`'s shared `silu<T>()`, not a copy of
+// it -- consolidated 2026-09-03 (#599, `DESIGN.md` §15.2 #15).** The expression
+// above used to be written out here and in `unary.metal`, which is the
+// duplication §3.6 names; there is now one definition and this is one of its
+// two live callers.
+//
+// **The precision note below is UNCHANGED by that, and it is why the primitive
+// is templated.** `silu` is instantiated here at `AccT` -- `float` at every
+// dtype -- and at `T` in `unary.metal`, so each site keeps the type it always
+// passed and the f32-accumulator-versus-f16-store difference this comment
+// describes survives verbatim. A shared helper fixed at `float` would have
+// silently promoted `usilu` and moved the shipping digests; templating it is
+// what makes the consolidation bit-preserving rather than a numerics change
+// wearing a refactor's clothes.
 template <typename T, typename AccT>
 struct EpilogueSilu {
   METAL_FUNC AccT operator()(AccT x, int) const {
-    return x / (1 + exp(-x));
+    return silu(x);
   }
 };
 

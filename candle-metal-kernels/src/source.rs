@@ -62,7 +62,20 @@ pub const INDEXING: &str = with_utils!(
     "#include <metal_stdlib>\nusing namespace metal;",
     include_str!("metal_src/indexing.metal")
 );
-pub const GEMV: &str = include_str!("metal_src/gemv.metal");
+/// `gemv` became a `with_utils!` consumer for issue #599: `EpilogueSilu` is now
+/// a call site of `utils.metal`'s shared `silu<T>()` rather than a second copy
+/// of the expression (`DESIGN.md` §15.2 #15).
+///
+/// It contributes `<metal_simdgroup>` to the prologue, which the other
+/// consumers do not need and which this file's own header line carried. Note
+/// `gemv.metal` keeps its MLX attribution comment and its `MLX_MTL_*` macros
+/// above the splice point exactly as before; only the include line moves out,
+/// on `with_utils!`'s stated requirement that the consumer's header be the one
+/// the compiler sees first.
+pub const GEMV: &str = with_utils!(
+    "#include <metal_simdgroup>\n#include <metal_stdlib>\nusing namespace metal;",
+    include_str!("metal_src/gemv.metal")
+);
 pub const MLX_GEMM: &str = include_str!("metal_src/mlx_gemm.metal");
 pub const MLX_SORT: &str = include_str!("metal_src/mlx_sort.metal");
 pub const QUANTIZED: &str = include_str!("metal_src/quantized.metal");
@@ -112,10 +125,17 @@ pub const SDPA: &str = include_str!("metal_src/scaled_dot_product_attention.meta
 /// records this as the thing that would have measured a strawman.
 ///
 /// **The prologue is the UNION of the members' prologues**, not any one
-/// member's: `reduce.metal` needs `<metal_limits>` and `unary.metal` needs
-/// `<metal_math>`, and a merged unit that took only the bare `<metal_stdlib>`
-/// line would fail to compile for a reason that is about the probe rather than
-/// about the merge.
+/// member's: `reduce.metal` needs `<metal_limits>`, `unary.metal` needs
+/// `<metal_math>` and `gemv.metal` needs `<metal_simdgroup>`, and a merged unit
+/// that took only the bare `<metal_stdlib>` line would fail to compile for a
+/// reason that is about the probe rather than about the merge.
+///
+/// `<metal_simdgroup>` joined that union in #599, when `gemv` became a
+/// `with_utils!` consumer and stopped carrying its own include line. Before
+/// then `gemv.metal`'s own header supplied it and the union did not have to
+/// name it -- so this is a case where making a source a fragment moves a
+/// requirement from the file into this list, and the partition test below is
+/// what stops that being silent.
 ///
 /// # What is NOT in it, and why
 ///
@@ -133,8 +153,9 @@ pub const SDPA: &str = include_str!("metal_src/scaled_dot_product_attention.meta
 /// engagement proof would have to explain.
 pub const MERGED_NON_MLX: &str = concat!(
     // The union prologue. `unary` contributes <metal_math>, `reduce`
-    // contributes <metal_limits>, everything else the bare stdlib line.
-    "#include <metal_stdlib>\n#include <metal_limits>\n#include <metal_math>\nusing namespace metal;\n",
+    // contributes <metal_limits>, `gemv` contributes <metal_simdgroup> (#599),
+    // everything else the bare stdlib line.
+    "#include <metal_stdlib>\n#include <metal_limits>\n#include <metal_math>\n#include <metal_simdgroup>\nusing namespace metal;\n",
     include_str!("metal_src/utils.metal"),
     "\n",
     include_str!("metal_src/affine.metal"),

@@ -104,6 +104,111 @@ METAL_FUNC uint get_strided_index_unrolled(
     return strided_i;
 }
 
+// ---------------------------------------------------------------------------
+// Activation primitives (issue #599, `DESIGN.md` §15.2 #15 / `CONTRIBUTING.md`
+// §3.6): ONE definition, called from every placement.
+// ---------------------------------------------------------------------------
+//
+// WHY THESE ARE HERE AND NOT IN A PLACEMENT. SiLU is a reusable numeric
+// primitive that three different kernel shapes evaluate -- a standalone unary
+// op, a fused GEMV epilogue, and (dead, see below) a ggml-imported kernel. A
+// name like `SiluKernel` names one of those homes and forces the other two to
+// duplicate it, which is exactly what had happened: `unary.metal:326`,
+// `gemv.metal:175` and `quantized.metal:1563`/`:1571` each carried their own
+// copy of `x / (1 + exp(-x))`.
+//
+// **This is a HYGIENE change and not a correctness fix, and the distinction is
+// measured rather than asserted (#604, `DESIGN.md` §12.2k).** The two LIVE
+// copies -- `usilu` and `EpilogueSilu` -- are the same expression and compile
+// bit-identically at f32 and at f16; the two that diverge (1 and 3 f16 ulp,
+// from the `1.0f` literal) are `quantized.metal`'s and have **zero callers**.
+// So nothing here computes a different number and no digest can move because
+// of it. #599's original premise -- *"a digest could move today purely because
+// two kernels spell SiLU differently"* -- was falsified before this landed, and
+// consolidating on a correctness argument would have been consolidating on a
+// false one (`CONTRIBUTING.md` §1.2).
+//
+// WHAT THE TEMPLATE PARAMETER IS FOR, because it is the whole design. The two
+// live call sites evaluate at DIFFERENT precisions, deliberately:
+//
+//   `usilu`         -- `T`, the storage type. `define_unary_op` templates
+//                      `operator()` on `T`, so `silu_f16` computes at half on
+//                      an already-rounded input and rounds twice.
+//   `EpilogueSilu`  -- `AccT`, which is `float` at every dtype
+//                      (`GemvDefaultAccT`). It sees the f32 accumulator BEFORE
+//                      the narrowing store, so it computes at float and rounds
+//                      once.
+//
+// That difference is `DESIGN.md` §12.2d's finding and is why `--gemv-silu`
+// moves `logits_sha256` (§12.2i). **It must survive this consolidation
+// untouched**: it is a real precision difference that was argued and chosen,
+// not an accident of duplication. A shared function templated on its value type
+// preserves it by construction -- `silu<half>` and `silu<float>` are two
+// instantiations of one body, and each call site keeps the type it always
+// passed. Writing this as a non-templated `float` helper would have silently
+// promoted `usilu` to the epilogue's precision and moved the shipping digests,
+// which is the destructive form of this change.
+//
+// SPELLING. The body is `usilu`'s, character for character: a bare `1`, not
+// `1.0f`. #604 measured that literal as the one lever that moves bits -- the
+// `f` suffix promotes the addition to float where a bare `1` converts to `T` --
+// so preserving the character-level spelling is what makes the consolidation
+// bit-preserving at f16. `gemv.metal:127-130` had already chosen to match
+// `usilu` character for character for the same reason; this makes that
+// agreement structural instead of a comment asking two files to stay in step.
+//
+// THE `static_cast<T>` IS LOAD-BEARING AND IT IS NOT NEW. `define_unary_op`
+// wraps every operation in `static_cast<T>(op)`, so `usilu`'s emitted body was
+// always `static_cast<T>(x / (1 + exp(-x)))`; `EpilogueSilu` returned `AccT`
+// from an expression already of type `AccT`, where the cast is the identity.
+// Hoisting the expression without the cast does not merely lose a formality --
+// **it does not compile at `bfloat`**: `1 + exp(-x)` promotes to `float`, and
+// MSL has no implicit `float` -> `bfloat` conversion, so the return fails with
+// *"cannot initialize return object of type 'bfloat' with an rvalue of type
+// 'float'"* and takes the whole `unary` library with it. Found by the fuzzers
+// rather than by reading, on the first run after the hoist.
+//
+// That is the same `bfloat`-narrowing class the #613 arms hit with `abs`,
+// `clamp` and `floor`, arriving through conversion rather than through overload
+// resolution -- and it is why the primitive carries the cast rather than
+// leaving it to each call site: a call site that forgets it fails at
+// **`bfloat` only**, which is a dtype neither canonical digest exercises.
+//
+// At `T = half` and `T = float` the cast is exactly the one `define_unary_op`
+// already emitted at the same point in the expression, so the arithmetic is
+// unchanged and the digests cannot move. `EpilogueSilu` instantiates it at
+// `AccT = float`, where `static_cast<float>` of a `float` is a no-op.
+//
+// This is #458's shape applied to an activation rather than to an indexing
+// helper, and #458's method applies with it: the body below is the one the live
+// copies actually carried, so composing them changes no emitted code.
+template <typename T>
+METAL_FUNC T silu(T x) {
+    return static_cast<T>(x / (1 + exp(-x)));
+}
+
+// The sigmoid the same two files spell two ways: `unary.metal:308`'s
+// `recip(1 + exp(-x))` and `quantized.metal:1503`'s `1.0f / (1.0f + exp(-x))`.
+//
+// `unary.metal`'s spelling is the one kept, for the reason above -- it is the
+// live one, `usigmoid` dispatches through it, and the `quantized.metal` copy is
+// dead. #604 measured `recip(1+exp(-x))` bit-identical to `x/(1+exp(-x))`'s
+// division form at both dtypes, so the two rearrangements were never the
+// divergence; the literal was.
+//
+// `recip` is inlined here rather than called, because it lives in
+// `unary.metal` and a primitive in this file must not depend on a consumer of
+// this file. The expansion is written out to be exactly what the original
+// composition produced: `recip<T>(v)` is `static_cast<T>(1.0 / v)`, and
+// `sigmoid` then wrapped that in a second `static_cast<T>` which is a no-op on
+// an expression already of type `T`. `1.0` is a `double` literal, so the
+// division is spelled as it was -- narrowing it to `1.0f` or `1` is precisely
+// the class of edit #604 measured moving bits, and is not made here.
+template <typename T>
+METAL_FUNC T sigmoid(T x) {
+    return static_cast<T>(static_cast<T>(1.0 / (1 + exp(-x))));
+}
+
 template<uint Y>
 constexpr uint div_ceil(uint x) {
     return x / Y + (x % Y > 0);

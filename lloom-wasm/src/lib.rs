@@ -8,6 +8,8 @@
 //! target-agnostic, so the same code runs in the wasm export `smoke()` and in
 //! the native `reference` binary -- the two fingerprints are the oracle check.
 
+pub mod lfm2;
+
 use lloom_tensor::{Device, Tensor};
 
 /// The deterministic CPU computation. Fixed inputs, no RNG, no I/O, no
@@ -61,6 +63,38 @@ mod wasm {
         let (_v, fp, json) = compute().map_err(|e| JsValue::from_str(&format!("{e}")))?;
         web_sys::console::log_1(&JsValue::from_str(&format!("smoke ok, fp={fp:016x}")));
         Ok(json)
+    }
+
+    /// The fuller notebook cell (#623): decode one real LFM2 token in the
+    /// browser. `weights` is the whole `.gguf` file fetched in JS; `prompt` is
+    /// the cell's text. Returns a JSON string the page renders — token, top-k
+    /// logits, and the byte-exact fingerprint the native reference reproduces.
+    #[wasm_bindgen]
+    pub fn decode_lfm2(weights: Vec<u8>, prompt: String) -> Result<String, JsValue> {
+        let d = lfm2::decode_one(weights, &prompt, 8)
+            .map_err(|e| JsValue::from_str(&format!("{e}")))?;
+        web_sys::console::log_1(&JsValue::from_str(&format!(
+            "lfm2 ok, token={:?} fp={:016x}",
+            d.token_text, d.logits_fp
+        )));
+        let topk_json: Vec<String> = d
+            .topk
+            .iter()
+            .map(|(id, text, logit)| {
+                format!(
+                    "{{\"id\":{id},\"text\":{},\"logit\":{logit}}}",
+                    serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
+                )
+            })
+            .collect();
+        Ok(format!(
+            "{{\"token_id\":{},\"token_text\":{},\"logits_fp\":\"{:016x}\",\"prompt_ids\":{:?},\"topk\":[{}]}}",
+            d.token_id,
+            serde_json::to_string(&d.token_text).unwrap_or_else(|_| "\"\"".into()),
+            d.logits_fp,
+            d.prompt_ids,
+            topk_json.join(",")
+        ))
     }
 
     /// Report the build config from the artifact, so the finding asserts "no

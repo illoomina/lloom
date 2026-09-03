@@ -44,6 +44,12 @@ zip = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokenizers = { workspace = true, features = ["onig"] }
 
+# On wasm the `onig` C library will not compile; `unstable_wasm` gives the same
+# BPE tokenizer (a pure-Rust regex split) so `quantized::tokenizer` builds in a
+# browser and a GGUF stays self-contained (weights + tokenizer, #623).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokenizers = { workspace = true, features = ["unstable_wasm"] }
+
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
 candle-ug = { workspace = true, optional = true }
 

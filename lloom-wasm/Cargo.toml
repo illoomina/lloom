@@ -32,6 +32,12 @@ console_error_panic_hook = "0.1.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# The GGUF's embedded tokenizer is read via `lloom_tensor`'s `TokenizerFromGguf`,
+# which names `tokenizers` types. On wasm the `onig` C library will not compile,
+# so the feature set is target-split the same way `lloom-tensor` splits it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
 [dependencies.web-sys]
 version = "0.3"
 features = ["console"]
@@ -44,3 +50,8 @@ features = ["console"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
+# The GGUF's embedded tokenizer is read via `lloom_tensor`'s `TokenizerFromGguf`.
+# On wasm the `onig` C library will not compile, so `unstable_wasm` (pure-Rust
+# regex split) gives the same BPE. Native takes `onig` (above).
+tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }

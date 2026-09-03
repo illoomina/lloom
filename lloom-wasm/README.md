@@ -43,9 +43,40 @@ node ../drive.mjs            # needs headless Chrome on :9876 (see drive.mjs)
 The `.cargo/config.toml` enables `simd128` and selects getrandom's `wasm_js`
 backend; both are required for the build.
 
+## The fuller notebook: a real LFM2 token (#623)
+
+`notebook.html` is a doc-style page with one runnable cell that decodes a real
+LFM2 token in a Web Worker. It loads a **quantized LFM2.5-350M GGUF** (Q4_K_M,
+~219 MB, fetched once from the Hub), reads the tokenizer embedded in the GGUF,
+runs one forward pass through `quantized_lfm2::from_gguf` on the CPU backend, and
+renders the token + top-k logit distribution in-cell.
+
+Why quantized, not the raw checkpoint: a bf16 LFM2 is ~5 GB, over the wasm32
+4 GiB linear-memory ceiling. The quantized GGUF is the real browser story — the
+same path candle's own browser examples take.
+
+```sh
+# native oracle (the §2.3.5a reference): decode one token on the host CPU
+curl -L -o /tmp/lfm2-350m-q4.gguf \
+  https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/resolve/main/LFM2.5-350M-Q4_K_M.gguf
+cargo run --release --bin reference_lfm2 -- /tmp/lfm2-350m-q4.gguf "The capital of France is"
+#   -> token " Paris" (id 5242), logit fingerprint, top-8
+
+# browser: build + bind (see above), then
+ln -sf /tmp/lfm2-350m-q4.gguf www/LFM2.5-350M-Q4_K_M.gguf   # serve same-origin
+cd www && python3 -m http.server 8656
+#   open http://localhost:8656/notebook.html and click Run, OR headless:
+GGUF=http://localhost:8656/LFM2.5-350M-Q4_K_M.gguf node ../drive_lfm2.mjs
+```
+
+Native and browser agree on the sampled token; the logit fingerprints differ
+because the quantized dot product reduces in a different order on aarch64 NEON
+than on wasm (same result, different arithmetic — §2.3.5a). Build with
+`+simd128` (in `.cargo/config.toml`) for the wasm SIMD quantized kernels.
+
 ## What this is NOT
 
-Not the full notebook (#623), not WebGPU/WGSL, not a REPL. The smoke computation
-is a fixed 6-element op — enough to prove the CPU kernels run and match the
-oracle. A representative *token* latency needs the full LFM2 weights loaded from
-JS, which is the next strand, not this spike (see the PR's "what was NOT done").
+Not the multi-cell notebook FORMAT + server-side recompile runner (§7.6) — this
+is the ONE end-to-end cell, the load-bearing proof. Not WebGPU/WGSL (the shader
+cells are §623's separate option-C strand). Not a REPL. Not a throughput
+benchmark — one 6-token prefill is a correctness proof, not a tok/s number.

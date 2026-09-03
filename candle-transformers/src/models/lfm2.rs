@@ -2945,6 +2945,64 @@ impl Model {
         logits.to_dtype(DType::F32)
     }
 
+    /// The **raw** token embedding, for a drafter that ships none of its own
+    /// (`DESIGN.md` §10.2p, issue #363).
+    ///
+    /// # Why a drafter needs this at all
+    ///
+    /// `LFM2.5-2.6B-DSpark` has **no `embed_tokens`** — verified from the
+    /// payload-bearing safetensors header, which carries 62 tensors and none of
+    /// that name (§10.2l/§10.2o). That is the design rather than a defect: a
+    /// hidden-state drafter shares the target's token boundary, so the draft
+    /// block's input embedding has to come from here.
+    ///
+    /// # Why RAW, and why that is not an oversight
+    ///
+    /// This deliberately does **not** apply `embedding_norm`, and the
+    /// distinction is worth a sentence because the normed tensor is the one a
+    /// reader would reach for — it is what `forward` feeds `lm_head`. It is the
+    /// wrong one here twice over: the drafter's own `input_layernorm`
+    /// normalizes its input already, and the residual the draft block carries
+    /// is the raw table output, so the normed tensor double-normalizes the
+    /// first and falsifies the second.
+    ///
+    /// **Measured elsewhere rather than argued here**: mlx-dspark's
+    /// `Target.draft_embed` records *"Do NOT apply `embed_norm` here: feeding
+    /// the normalized input embedding measured a clear acceptance loss (accept
+    /// 3.73 raw vs 2.86 normed on code), because the drafter's own
+    /// `input_layernorm` already normalizes and the residual it carries is the
+    /// raw table output, not the normed one."* That is a **−23 % acceptance**
+    /// defect with **no error anywhere** — the class §10.2n names as the one no
+    /// gate in this tree can see, since the target verifies every token and the
+    /// emitted stream is byte-identical either way.
+    pub fn draft_embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids)
+    }
+
+    /// The **raw** `lm_head` projection, for a drafter that ships none of its
+    /// own (`DESIGN.md` §10.2p, issue #363).
+    ///
+    /// `hidden [.., hidden_size]` → `[.., vocab_size]`, in the model's dtype
+    /// rather than f32: this is a *proposal* head whose output is consumed by
+    /// the Markov bias and an argmax, where `forward` and [`Self::forward_all`]
+    /// cast because their output is compared against a digest.
+    ///
+    /// # Why the proposal head must stay the raw projection
+    ///
+    /// The drafter adds its Markov transition bias to *these* logits, at the
+    /// scale `lm_head` produces them. Any output transform a verifier applies —
+    /// a scale, a softcap — shrinks the base logits while the bias stays at raw
+    /// scale, so the bias overwhelms the head; mlx-dspark measured exactly that
+    /// on a target whose head scales by ~0.196, where first-position acceptance
+    /// fell **~85 % → ~29 % with no error anywhere**. LFM2 applies no such
+    /// transform, so on this target the two coincide **today**. The accessor is
+    /// named for the property it must keep rather than for the code it
+    /// currently equals, so that adding one later does not silently reach the
+    /// drafter.
+    pub fn draft_lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        self.lm_head.forward(hidden)
+    }
+
     /// The residual stream at the entry of **every** layer — the reference the
     /// tap is tested against (`DESIGN.md` §10.2m, issue #363).
     ///

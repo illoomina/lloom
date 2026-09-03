@@ -518,6 +518,102 @@ pub fn reuse_oversize_bound() -> Option<f64> {
     })
 }
 
+/// The eviction order in force (`DESIGN.md` §9.2w, #47). `Age` is the shipped
+/// behaviour.
+///
+/// # Why this axis exists, and why it is the lever §9.2v pointed at rather than
+/// the one §9.2v built
+///
+/// §9.2v bounded [`BufferPool::acquire`]'s second probe and took the activation
+/// band's served/requested ratio **16.12x -> 1.17x with the acquisition count
+/// identical** -- and paid **3.03x the `newBufferWithLength` calls**, hit rate
+/// 87.5 % -> 61.8 %. Its own reading of that result is what this axis tests:
+///
+/// > **the bound does not shrink the free list -- it keeps small buckets
+/// > alive** (431 free buffers against 71, 28 buckets against 6) [...] **the
+/// > lever this points at is not this bound**: `evict_over_budget` is
+/// > oldest-first and **size-blind**, so **evicting by SIZE rather than by AGE
+/// > would reach the same place without declining a single reuse and without
+/// > paying the 3.03x.**
+///
+/// That is a **prediction with a mechanism**, and it is falsifiable in the
+/// direction that matters: if band 1's ratio falls only because reuse was
+/// declined, then an arm that declines nothing cannot move it.
+///
+/// # Why the largest, and not the smallest
+///
+/// `free_budget` caps the *bytes* held free, so evicting one 3.83 MB KV discard
+/// releases as much budget as **fifty-two** 76 KB activation buckets. Under
+/// `Age` the small buckets are destroyed first purely because they were freed
+/// first, and what survives is the multi-MB tail that then over-serves band 1.
+/// Taking the largest first reaches the same `free_bytes` in **fewer**
+/// evictions and leaves the small buckets in place -- which is the state
+/// §9.2v's `4.0` arm reached by refusing reuse, arrived at by retention
+/// instead.
+///
+/// **The two arms are not the same policy under different names**, and the
+/// discriminator is `oversize_declined`: this axis must leave it at **0**,
+/// because it never rejects a candidate. An arm that moves the ratio *and*
+/// declines nothing separates retention from refusal.
+///
+/// # What this does not change
+///
+/// **`Drop` reclamation is untouched** (§9.2a layer 1, non-negotiable). This
+/// decides only *which free buffer is destroyed when the budget is exceeded*,
+/// never who releases a buffer or when. No caller is asked to free anything,
+/// and every buffer evicted under either arm was already free.
+///
+/// **`acquire` is untouched**, which is what keeps this off §3.3's no-O(N)
+/// list from the other side: the cost moves to the eviction path, which already
+/// runs inside the per-command-buffer completion handler (§6.3f) rather than on
+/// the encode path.
+pub fn eviction_order() -> EvictionOrder {
+    static ORDER: std::sync::OnceLock<EvictionOrder> = std::sync::OnceLock::new();
+    *ORDER.get_or_init(|| {
+        let Ok(raw) = std::env::var("LLOOM_47_EVICTION_ORDER") else {
+            return EvictionOrder::Age;
+        };
+        let raw = raw.trim();
+        match raw.to_ascii_lowercase().as_str() {
+            // The shipped arm spelled explicitly, so a sweep can name it rather
+            // than express it by unsetting the variable (§7.1a-i).
+            "age" | "oldest" | "off" => EvictionOrder::Age,
+            "size" | "largest" => EvictionOrder::Size,
+            _ => panic!(
+                "LLOOM_47_EVICTION_ORDER={raw:?} is not an eviction order. \
+                 Give `age` for the oldest-first behaviour that ships, or \
+                 `size` for largest-first (DESIGN.md §9.2w)."
+            ),
+        }
+    })
+}
+
+/// Which free buffer `evict_over_budget` destroys first (`DESIGN.md` §9.2w).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionOrder {
+    /// Oldest-first, size-blind. What ships.
+    Age,
+    /// Largest-first. Releases the same budget in fewer evictions and leaves
+    /// the small buckets alive.
+    Size,
+}
+
+impl EvictionOrder {
+    /// The arm name, for a `RESULT` line.
+    ///
+    /// Read back from the value rather than from the flag, so a harness reports
+    /// the arm the process **took** (§7.1a-i). Spelled out rather than derived
+    /// from `Debug` so the rendering cannot drift with a type rename -- and
+    /// because §9.2v's own float arm rendered `4` for `4.0` and two runs of one
+    /// arm would not have pooled.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Age => "age",
+            Self::Size => "size",
+        }
+    }
+}
+
 /// Whether a free bucket of `bucket` bytes may answer a request for `size`,
 /// under `bound` (`DESIGN.md` §9.2v, #47).
 ///
@@ -690,6 +786,15 @@ struct PoolState {
     /// The field is written once at construction and by
     /// [`BufferPool::set_reuse_oversize_bound`]; `acquire` only reads it.
     oversize_bound: Option<f64>,
+
+    /// Which free buffer eviction destroys first (`DESIGN.md` §9.2w, #47).
+    /// `Age` is the shipped behaviour.
+    ///
+    /// State rather than a read of the axis inside `evict_over_budget`, for the
+    /// same reason as `oversize_bound` above: a test can then select an arm for
+    /// **one** pool, where a process-wide `OnceLock` decides it for every test
+    /// in the binary.
+    eviction_order: EvictionOrder,
 
     /// Cap on bytes the pools hold that **no planner owns** — `DESIGN.md`
     /// §9.5k's derived residual, installed by admission.
@@ -872,6 +977,8 @@ impl PoolInner {
                 // Read once here rather than per `acquire`, so the process
                 // takes one arm and the hot path reads no environment (§9.2v).
                 oversize_bound: reuse_oversize_bound(),
+                // Same, for the eviction order (§9.2w).
+                eviction_order: eviction_order(),
                 // Absent = unbounded, which is what shipped. Admission installs
                 // one; a process that never runs admission is unchanged.
                 residual: None,
@@ -1099,9 +1206,18 @@ impl PoolState {
     /// event here. This only enforces the bound; it never searches for anything,
     /// and it never touches a buffer that is live or still pending.
     ///
-    /// Oldest-first, because a size that has not been asked for since it was
-    /// freed is the least likely to be asked for again -- in the growing case,
-    /// provably never.
+    /// Under [`EvictionOrder::Age`] -- what ships -- oldest-first, because a
+    /// size that has not been asked for since it was freed is the least likely
+    /// to be asked for again; in the growing case, provably never.
+    ///
+    /// Under [`EvictionOrder::Size`] (§9.2w, #47) largest-first, because
+    /// `free_budget` caps *bytes*: one 3.83 MB KV discard releases as much
+    /// budget as fifty-two 76 KB activation buckets, so taking the largest
+    /// reaches the same `free_bytes` in fewer evictions and leaves the small
+    /// buckets alive. That is the state §9.2v's bound reached by refusing
+    /// reuse, arrived at by retention instead -- and `oversize_declined` stays
+    /// at 0, which is what tells the two apart.
+    ///
     /// Returns the buffers it removed rather than dropping them here, so the
     /// caller can hand them to the eviction observer **before** they are
     /// destroyed (`DESIGN.md` §6.3c). Dropping them inside this function would
@@ -1111,20 +1227,9 @@ impl PoolState {
     fn evict_over_budget(&mut self) -> Vec<Buffer> {
         let mut evicted = Vec::new();
         while self.free_bytes > self.free_budget {
-            let Some(size) = self.free_order.pop_front() else {
+            let Some((size, buffer)) = self.take_eviction_victim() else {
                 break;
             };
-            let Some(bucket) = self.free.get_mut(&size) else {
-                continue;
-            };
-            // Stale entry: a lookup already took this buffer, so there is
-            // nothing here to evict and the queue entry is just noise.
-            let Some(buffer) = bucket.pop() else {
-                continue;
-            };
-            if bucket.is_empty() {
-                self.free.remove(&size);
-            }
             self.free_bytes = self.free_bytes.saturating_sub(size);
             self.counters.evicted += 1;
             // Leaving the free list to be DESTROYED rather than reused, so the
@@ -1134,13 +1239,69 @@ impl PoolState {
             // correct access into a reported error, which is a false positive
             // and the direction that discredits the whole instrument (#475).
             //
-            // SAFETY: `bucket.pop()` just removed it from the free list under
-            // the pool lock and nothing has handed it out. Inert without
+            // SAFETY: `take_eviction_victim` just removed it from the free list
+            // under the pool lock and nothing has handed it out. Inert without
             // `asan-poison`.
             unsafe { super::poison::unpoison_buffer(&buffer) };
             evicted.push(buffer);
         }
         evicted
+    }
+
+    /// Removes one buffer from the free list under the arm in force, returning
+    /// its bucket size (`DESIGN.md` §9.2w, #47).
+    ///
+    /// Returns `None` only when the free list holds nothing evictable, which
+    /// stops `evict_over_budget`'s loop. **`free_bytes` is not adjusted here** —
+    /// the caller does that, so the two arms cannot disagree about the
+    /// accounting.
+    ///
+    /// # Neither arm scans
+    ///
+    /// `Age` pops `free_order`'s front and skips stale entries, as it always
+    /// has. `Size` reads `free`'s **last key** — a `BTreeMap`, so the largest
+    /// bucket is `O(log n)` and there is no walk. Both stay off §3.3's
+    /// no-O(N)-on-the-per-token-path list, and this runs in the completion
+    /// handler rather than on the encode path either way (§6.3f).
+    fn take_eviction_victim(&mut self) -> Option<(usize, Buffer)> {
+        match self.eviction_order {
+            EvictionOrder::Age => loop {
+                let size = self.free_order.pop_front()?;
+                let bucket = match self.free.get_mut(&size) {
+                    Some(b) => b,
+                    // The key is gone: its bucket emptied and was removed.
+                    None => continue,
+                };
+                // Stale entry: a lookup already took this buffer, so there is
+                // nothing here to evict and the queue entry is just noise.
+                let Some(buffer) = bucket.pop() else {
+                    continue;
+                };
+                if bucket.is_empty() {
+                    self.free.remove(&size);
+                }
+                return Some((size, buffer));
+            },
+            EvictionOrder::Size => {
+                // `last_key_value` is the largest bucket. A bucket present in
+                // `free` always holds at least one buffer -- the key is removed
+                // when it empties, here and in `acquire` -- so the `pop` below
+                // cannot observe an empty `Vec`, and there is no stale-entry
+                // case to skip because this arm reads the map rather than the
+                // queue.
+                let size = *self.free.last_key_value()?.0;
+                let bucket = self.free.get_mut(&size)?;
+                let buffer = bucket.pop()?;
+                if bucket.is_empty() {
+                    self.free.remove(&size);
+                }
+                // `free_order`'s entry for this buffer is left behind and
+                // skipped if the arm ever changes -- the same treatment
+                // `acquire` already gives an entry whose buffer it took, and
+                // the reason removing it would be a linear search.
+                Some((size, buffer))
+            }
+        }
     }
 }
 
@@ -1211,6 +1372,35 @@ impl BufferPool {
         if let Ok(mut state) = self.inner.state.lock() {
             state.oversize_bound = bound;
         }
+    }
+
+    /// Selects the eviction order for this pool (`DESIGN.md` §9.2w, #47).
+    ///
+    /// [`EvictionOrder::Age`] restores the behaviour that ships. As with
+    /// [`Self::set_reuse_oversize_bound`], **production does not call this** —
+    /// every pool is constructed at [`eviction_order`]'s arm already, and this
+    /// exists so a test can exercise an arm the process-wide `OnceLock` cannot
+    /// be made to yield.
+    ///
+    /// Does **not** evict: the order decides which buffer goes when the budget
+    /// is next exceeded, and changing it is not itself a budget event. A caller
+    /// wanting both calls [`Self::set_free_budget`] after this.
+    pub fn set_eviction_order(&self, order: EvictionOrder) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.eviction_order = order;
+        }
+    }
+
+    /// The eviction order in force for this pool, for a `RESULT` line.
+    ///
+    /// Read from the state the eviction path consults, never from the flag, so
+    /// a harness reports the arm the process **took** (§7.1a-i).
+    pub fn eviction_order(&self) -> EvictionOrder {
+        self.inner
+            .state
+            .lock()
+            .map(|s| s.eviction_order)
+            .unwrap_or(EvictionOrder::Age)
     }
 
     /// Sets the cap on bytes retained in the free list, evicting immediately if
@@ -2181,6 +2371,267 @@ mod tests {
             !bucket_admissible(128, 32768, Some(255.0)),
             "and just below it declines, which brackets the measured 256x"
         );
+    }
+
+    /// **The mechanism §9.2w exists for**: under `Age`, the small bucket is
+    /// destroyed and the large one survives to over-serve (`DESIGN.md` §9.2v).
+    ///
+    /// This is the pathology at its smallest reproducible size, with an
+    /// **absolute reference** rather than a shape (§3.1b rule 1): the assertion
+    /// names the exact bucket that must survive and the exact one that must
+    /// not, so a failure says which way the order went rather than "they were
+    /// not equal".
+    #[test]
+    fn age_eviction_destroys_the_small_bucket_and_keeps_the_kv_sized_one() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        pool.set_eviction_order(EvictionOrder::Age);
+
+        // §9.2u's two tenants at their measured sizes: a 76 KB activation
+        // request and one K tensor at `kv_len` 234. Freed activation-first,
+        // which is the order decode produces them in.
+        const ACT: usize = 76 * 1024;
+        const KV: usize = 3_833_856;
+
+        // Held live together, then released together, so both are in the free
+        // list at once: allocating one after freeing the other would simply
+        // reuse it and there would be no pair to choose between. `free_order`
+        // records activation-first, which is the order decode frees them in.
+        let held = vec![alloc(&pool, &dev, ACT), alloc(&pool, &dev, KV)];
+        drop(held);
+        gpu_completes(&pool, &clock);
+
+        // Room for the KV tensor alone, so exactly one of the two must go.
+        pool.set_free_budget(KV);
+
+        // The activation bucket was freed first, so Age destroyed it -- and the
+        // request does NOT miss: it is answered by the KV discard that
+        // survived. That is the pathology in one assertion, and it is why the
+        // reference here is the served SIZE rather than hit-or-miss. A
+        // hit/miss assertion would pass on a pool that reused correctly.
+        let served = pool
+            .acquire(ACT)
+            .expect("the request is served -- from the wrong bucket");
+        assert_eq!(
+            served.size(),
+            KV,
+            "under Age the {ACT} B bucket is destroyed as the oldest and the \
+             {KV} B KV discard survives, so an activation request is served at \
+             {}x its size. This is §9.2u's 'one class served out of another \
+             class's garbage', at its smallest reproducible size",
+            KV / ACT
+        );
+    }
+
+    /// The same fixture under `Size`, which is the falsifiable half (§9.2w).
+    ///
+    /// Largest-first destroys the KV discard and **leaves the activation bucket
+    /// alive**, so the next activation request is served at its own size. The
+    /// two tests share a fixture and differ only in the arm, which is what
+    /// makes the arm the attributable cause.
+    ///
+    /// **`oversize_declined` must stay 0**: that is the discriminator against
+    /// §9.2v's bound, which reaches the same ratio by refusing reuse. An arm
+    /// that moves the ratio while declining nothing is retention, not refusal.
+    #[test]
+    fn size_eviction_keeps_the_small_bucket_and_destroys_the_kv_sized_one() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        pool.set_eviction_order(EvictionOrder::Size);
+
+        const ACT: usize = 76 * 1024;
+        const KV: usize = 3_833_856;
+
+        // Identical fixture to the `Age` test above; only the arm differs,
+        // which is what makes the arm the attributable cause.
+        let held = vec![alloc(&pool, &dev, ACT), alloc(&pool, &dev, KV)];
+        drop(held);
+        gpu_completes(&pool, &clock);
+
+        pool.set_free_budget(KV);
+
+        let served = pool
+            .acquire(ACT)
+            .expect("under Size the activation bucket survives");
+        assert_eq!(
+            served.size(),
+            ACT,
+            "and it is served at its own size -- ratio 1.00x, against Age's \
+             {}x on the identical fixture",
+            KV / ACT
+        );
+        assert_eq!(
+            pool.counters().oversize_declined,
+            0,
+            "and nothing was declined. This is what separates this axis from \
+             §9.2v's bound, which reaches the same ratio by refusing reuse and \
+             pays 3.03x the allocations for it"
+        );
+    }
+
+    /// Evicting the largest first reaches the budget in **fewer** evictions,
+    /// which is the arithmetic the axis rests on (`DESIGN.md` §9.2w).
+    ///
+    /// An absolute reference on both arms: 52 small buckets against 1 large one
+    /// for the same released bytes. A shape invariant ("Size evicts fewer")
+    /// would pass on any pair of numbers with that ordering; these are the
+    /// numbers the geometry predicts.
+    #[test]
+    fn size_eviction_reaches_the_budget_in_fewer_evictions_than_age() {
+        let dev = device();
+        const ACT: usize = 73_728;
+        // Exactly 52 activation buckets, so the arithmetic is exact rather than
+        // approximate and the assertion can name a count.
+        const KV: usize = ACT * 52;
+
+        for (order, expected) in [(EvictionOrder::Age, 52), (EvictionOrder::Size, 1)] {
+            let (pool, clock) = pool_with_clock();
+            pool.set_eviction_order(order);
+
+            // All 53 held live at once, so every one reaches the free list --
+            // allocating and freeing in turn would reuse the same buffer 52
+            // times and there would be nothing to choose between. The 52 small
+            // ones are allocated first, so `free_order` records them first.
+            let mut held: Vec<_> = (0..52).map(|_| alloc(&pool, &dev, ACT)).collect();
+            held.push(alloc(&pool, &dev, KV));
+            drop(held);
+            gpu_completes(&pool, &clock);
+
+            // free_bytes is 2 x KV (52 x ACT of small, plus KV of large). A
+            // budget of KV therefore requires exactly KV bytes released, which
+            // is 52 small buckets or 1 large one.
+            assert_eq!(
+                pool.occupancy().free_bytes,
+                2 * KV,
+                "{order:?}: the fixture must hold both halves before the budget \
+                 is applied, or the count below measures the fixture"
+            );
+            pool.set_free_budget(KV);
+
+            assert_eq!(
+                pool.counters().evicted,
+                expected,
+                "{order:?} must release {KV} bytes in {expected} eviction(s): \
+                 Age takes them {ACT} B at a time because that is the order \
+                 they were freed in, Size takes the one bucket that is the \
+                 whole amount"
+            );
+        }
+    }
+
+    /// The arm renders as it is declared, read from the pool rather than the
+    /// flag (§7.1a-i, and §9.2v's `Display`-drops-a-trailing-zero defect).
+    ///
+    /// §9.2v's float arm rendered `4` for a `.bench/configurations.md` arm
+    /// declared `4.0`, so two runs of one arm would not have pooled. These arms
+    /// are strings, which removes that failure by construction -- and this
+    /// pins the spelling so a type rename cannot silently move it.
+    #[test]
+    fn the_eviction_arm_renders_as_the_registry_declares_it() {
+        assert_eq!(EvictionOrder::Age.as_str(), "age");
+        assert_eq!(EvictionOrder::Size.as_str(), "size");
+
+        let (pool, _clock) = pool_with_clock();
+        pool.set_eviction_order(EvictionOrder::Size);
+        assert_eq!(
+            pool.eviction_order().as_str(),
+            "size",
+            "the harness must read the arm back from the state the eviction \
+             path consults, never from the flag it was set with"
+        );
+    }
+
+    /// Emptying a bucket must remove its key, or eviction stops making
+    /// progress while the budget is still exceeded (§9.2w, and issue #21's
+    /// graveyard defect).
+    ///
+    /// **Written because a mutation survived without it.** The `Size` arm
+    /// reads `free`'s last key and pops from that bucket; if the emptied key
+    /// is left behind, the next call finds the same key, pops an **empty**
+    /// `Vec`, and `take_eviction_victim` returns `None` -- so
+    /// `evict_over_budget` breaks out with `free_bytes` still over budget and
+    /// **retains the memory silently**. Every other test here evicts at most
+    /// one buffer per size, so none of them reaches the second pop.
+    ///
+    /// The reference is absolute (§3.1b rule 1): two buffers of ONE size, a
+    /// budget requiring BOTH to go, and an assertion on the resulting
+    /// `free_bytes` -- which a "some eviction happened" shape would pass.
+    #[test]
+    fn emptying_a_bucket_removes_its_key_so_eviction_can_continue() {
+        let dev = device();
+        const SIZE: usize = 1024 * 1024;
+
+        for order in [EvictionOrder::Age, EvictionOrder::Size] {
+            let (pool, clock) = pool_with_clock();
+            pool.set_eviction_order(order);
+
+            // Two buffers of the SAME size, so one bucket holds both and
+            // draining it needs two pops from one key.
+            let held = vec![alloc(&pool, &dev, SIZE), alloc(&pool, &dev, SIZE)];
+            drop(held);
+            gpu_completes(&pool, &clock);
+            assert_eq!(
+                pool.occupancy().free_bytes,
+                2 * SIZE,
+                "{order:?}: both must be free before the budget is applied"
+            );
+
+            // A budget of zero requires the whole bucket to go: two pops, one
+            // key.
+            pool.set_free_budget(0);
+
+            assert_eq!(
+                pool.occupancy().free_bytes,
+                0,
+                "{order:?}: eviction must reach the budget. A non-zero residue \
+                 means the loop stopped early -- which is what happens when an \
+                 emptied bucket's key is left in `free` and the next pop finds \
+                 an empty Vec"
+            );
+            assert_eq!(
+                pool.counters().evicted,
+                2,
+                "{order:?}: and it took exactly two evictions to get there"
+            );
+            // **The assertion the byte count cannot make.** Draining the last
+            // buffer must take the KEY with it. `free_bytes` reaches 0 either
+            // way -- the budget is met by the second pop, so a left-behind key
+            // is never popped a third time and never stops progress *here* --
+            // so the residue is visible only as a bucket that still exists
+            // holding an empty `Vec`. That is issue #21's graveyard: keys
+            // accumulating at ~3.2 per token, 412 291 walked per token to
+            // manage 329 live buffers, an O(N) whose N is work-done-so-far.
+            assert_eq!(
+                pool.occupancy().free_buckets,
+                0,
+                "{order:?}: the emptied bucket's KEY must go too. `free_bytes` \
+                 is 0 either way, so a key left behind is invisible to every \
+                 byte-valued assertion and shows up only here -- and it is \
+                 what `acquire`'s range query then walks forever (#21)"
+            );
+        }
+    }
+
+    /// An empty free list stops the loop rather than spinning (§9.2w).
+    ///
+    /// Both arms return `None` when there is nothing evictable, which is what
+    /// terminates `evict_over_budget`. Worth pinning because the `Size` arm
+    /// reads the map rather than the queue, so it has a different exhaustion
+    /// condition from the one `Age` has always had.
+    #[test]
+    fn eviction_terminates_on_an_empty_free_list_under_both_arms() {
+        for order in [EvictionOrder::Age, EvictionOrder::Size] {
+            let (pool, _clock) = pool_with_clock();
+            pool.set_eviction_order(order);
+            // A budget of 0 with nothing free: the loop must not spin.
+            pool.set_free_budget(0);
+            assert_eq!(
+                pool.counters().evicted,
+                0,
+                "{order:?}: nothing was free, so nothing can be evicted -- and \
+                 the call returned, which is the half a hang would fail"
+            );
+        }
     }
 
     /// **The invariant `acquire` rests on**: a view must never enter the pool

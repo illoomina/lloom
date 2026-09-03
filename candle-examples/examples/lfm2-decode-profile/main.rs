@@ -1337,7 +1337,35 @@ impl Axes {
             // so a run at `off` and a run predating the axis are different
             // facts, and only the first can be pooled with a future `off` run.
             p("ReuseOversizeBound", &Self::reuse_oversize_bound_arm()),
+            // Same reasoning, and the same failure available to it: an arm
+            // echoed from the flag rather than read from the pool would render
+            // a policy the eviction path did not take (§7.1a-i). Stated on
+            // every run including the default `age`, since a run predating the
+            // axis and a run at `age` are different facts (§9.2w).
+            p("EvictionOrder", &Self::eviction_order_arm()),
         ]
+    }
+
+    /// The `EvictionOrder` arm: the order `evict_over_budget` actually applies.
+    ///
+    /// `age` for the oldest-first behaviour that ships, spelled rather than
+    /// left empty, and `n/a` off Metal where there is no pool to evict from --
+    /// both following `ReuseOversizeBound` below.
+    ///
+    /// **These arms are strings, which removes §9.2v's rendering defect by
+    /// construction**: there is no `Display` rounding to disagree with the
+    /// registry about.
+    fn eviction_order_arm() -> String {
+        #[cfg(feature = "metal")]
+        {
+            candle_metal_kernels::metal::buffer_pool::eviction_order()
+                .as_str()
+                .to_string()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a".to_string()
+        }
     }
 
     /// The `ReuseOversizeBound` arm: the ceiling `acquire` actually applies.

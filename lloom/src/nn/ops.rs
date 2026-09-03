@@ -2566,6 +2566,27 @@ impl lloom_tensor::CustomOp3 for GemvFused {
     }
 }
 
+/// Dispatch the runtime fused GEMV: `x @ weight.t()` with the epilogue named by
+/// `fusion` riding the f32 accumulator, binding `residual` when the arm reads a
+/// second operand.
+///
+/// This is the low-level door; the sole caller is the typed
+/// [`crate::nn::fusion::Gemv`] constructor (§1.2–1.3), so a fused op is only
+/// ever built from a type that the `Epilogue`/`Prologue` bounds admitted. The
+/// public `gemv_silu`/`gemv_residual` below are the tier-1 shorthands and route
+/// through the same type.
+pub(crate) fn dispatch_gemv_fused(
+    fusion: GemvFusion,
+    x: &Tensor,
+    weight: &Tensor,
+    residual: Option<&Tensor>,
+) -> Result<Tensor> {
+    match residual {
+        None => x.apply_op2_no_bwd(weight, &GemvFused { fusion }),
+        Some(r) => x.apply_op3_no_bwd(weight, r, &GemvFused { fusion }),
+    }
+}
+
 /// `silu(x @ weight.t())` in one dispatch — #484's epilogue, on the decode path.
 ///
 /// The consuming site is `lfm2.rs`'s `silu(gate_proj.forward(x))`: a GEMV
@@ -2577,13 +2598,10 @@ impl lloom_tensor::CustomOp3 for GemvFused {
 /// pair computes it at `T` on the rounded store (`DESIGN.md` §12.2d, §2.3.5a).
 ///
 /// Metal, `m == 1`, no bias. Anything else is an error — see [`GemvFused`].
+/// The typed spelling is `fusion::gemv(weight).then(fusion::Silu).eval(x)`.
 pub fn gemv_silu(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
-    x.apply_op2_no_bwd(
-        weight,
-        &GemvFused {
-            fusion: GemvFusion::Silu,
-        },
-    )
+    use crate::nn::fusion::{gemv, Silu};
+    gemv(weight).then(Silu).eval(x)
 }
 
 /// `(x @ weight.t()) + residual` in one dispatch — #509's epilogue, on the
@@ -2600,12 +2618,9 @@ pub fn gemv_silu(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
 ///
 /// **Moves the digests**: the add happens at the f32 accumulator where the
 /// `badd_f16` it replaces adds at `T` on the rounded store (§12.2h, §2.3.5a).
+/// The typed spelling is
+/// `fusion::gemv(weight).then(fusion::Residual::of(residual)).eval(x)`.
 pub fn gemv_residual(x: &Tensor, weight: &Tensor, residual: &Tensor) -> Result<Tensor> {
-    x.apply_op3_no_bwd(
-        weight,
-        residual,
-        &GemvFused {
-            fusion: GemvFusion::Residual,
-        },
-    )
+    use crate::nn::fusion::{gemv, Residual};
+    gemv(weight).then(Residual::of(residual)).eval(x)
 }

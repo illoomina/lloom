@@ -574,7 +574,12 @@ pub enum GemvEpilogue {
 impl GemvEpilogue {
     /// The `[[host_name]]` suffix, matching `gemv.metal`'s
     /// `instantiate_gemv_silu_helper` / `instantiate_gemv_residual_helper`.
-    fn name_suffix(self) -> &'static str {
+    ///
+    /// `pub` so the engine-side `Epilogue::SUFFIX` (`lloom::nn::fusion`) can be
+    /// reconciled against it: the typed seam and the runtime enum must resolve
+    /// the same `[[host_name]]` or a fused type would dispatch a kernel that
+    /// does not exist.
+    pub fn name_suffix(self) -> &'static str {
         match self {
             GemvEpilogue::None => "",
             GemvEpilogue::Silu => "_silu",

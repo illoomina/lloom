@@ -62,6 +62,12 @@ pub const INDEXING: &str = with_utils!(
     "#include <metal_stdlib>\nusing namespace metal;",
     include_str!("metal_src/indexing.metal")
 );
+/// The GEMV source and `mlx_gemm.metal` below live in the `metal_src/gemm/`
+/// role directory (§7.2): the two translation units the projection fusion
+/// touches, grouped by role. The embedded text is byte-identical to before the
+/// move, so the compiled library and every canonical digest are unmoved — the
+/// relocation changes only the `include_str!` path (§7.3 move gate).
+///
 /// `gemv` became a `with_utils!` consumer for issue #599: `EpilogueSilu` is now
 /// a call site of `utils.metal`'s shared `silu<T>()` rather than a second copy
 /// of the expression (`DESIGN.md` §15.2 #15).
@@ -74,9 +80,9 @@ pub const INDEXING: &str = with_utils!(
 /// the compiler sees first.
 pub const GEMV: &str = with_utils!(
     "#include <metal_simdgroup>\n#include <metal_stdlib>\nusing namespace metal;",
-    include_str!("metal_src/gemv.metal")
+    include_str!("metal_src/gemm/gemv.metal")
 );
-pub const MLX_GEMM: &str = include_str!("metal_src/mlx_gemm.metal");
+pub const MLX_GEMM: &str = include_str!("metal_src/gemm/mlx_gemm.metal");
 pub const MLX_SORT: &str = include_str!("metal_src/mlx_sort.metal");
 pub const QUANTIZED: &str = include_str!("metal_src/quantized.metal");
 pub const RANDOM: &str = include_str!("metal_src/random.metal");
@@ -172,7 +178,7 @@ pub const MERGED_NON_MLX: &str = concat!(
     "\n",
     include_str!("metal_src/flash_decoding.metal"),
     "\n",
-    include_str!("metal_src/gemv.metal"),
+    include_str!("metal_src/gemm/gemv.metal"),
     "\n",
     include_str!("metal_src/indexing.metal"),
     "\n",

@@ -8873,7 +8873,7 @@ fn silu_arm_names_round_trip() {
 fn the_silu_expression_has_one_definition_and_the_rest_are_call_sites() {
     let utils = include_str!("metal_src/utils.metal");
     let unary = include_str!("metal_src/unary.metal");
-    let gemv = include_str!("metal_src/gemv.metal");
+    let gemv = include_str!("metal_src/gemm/gemv.metal");
 
     // Assembled, never written as one literal — see the doc comment.
     let expr = format!("x /{} (1 +{} exp(-x))", "", "");

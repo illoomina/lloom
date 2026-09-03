@@ -744,6 +744,65 @@ fn pool_counters_holds_accumulators_only() {
     );
 }
 
+/// The hole the check above cannot see: a field borrowed mutably OUT of the
+/// struct, and written through the borrow.
+///
+/// `pool_counters_holds_accumulators_only` reads for `counters.<field> =` with
+/// no `+=`. **A `let x = &mut state.counters.<field>;` followed by a write
+/// through `x` defeats it**, because the write names `x` and never names
+/// `counters` -- so the gauge class it exists to close stays reachable through
+/// one extra line.
+///
+/// Found while adding §9.2u's bands (#47): the natural spelling for a per-band
+/// update *is* that borrow, and it made the first guard fail on code that was a
+/// pure accumulator. **The guard was right that the shape is dangerous and
+/// wrong about that instance** -- the two-sided form of `CONTRIBUTING.md`
+/// §3.1c's *"a pattern written to find a thing is a thing the pattern finds"*.
+/// The repair is not to loosen the needle but to name the escape route it
+/// cannot follow.
+///
+/// The rule is narrow on purpose: a mutable borrow of a `counters` field must
+/// not leave `impl PoolCounters`. Inside it the borrow is local to a method
+/// whose whole body a reader is already checking; outside it the write happens
+/// where the first guard has no line to read.
+#[test]
+fn no_counter_field_is_mutably_borrowed_out_of_the_struct() {
+    let src = include_str!("buffer_pool.rs");
+
+    let production = src
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields one element");
+
+    let borrows: Vec<&str> = production
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+        .filter(|l| l.contains("&mut") && l.contains("counters."))
+        .collect();
+
+    // Non-vacuity: the in-struct borrow must still be findable, or an empty
+    // result means the spelling moved rather than that the property holds
+    // (§3.1c -- a zero is not evidence without a nonzero from the same run).
+    assert!(
+        production.contains("&mut self.bands["),
+        "no in-struct mutable borrow found -- `record_band` was renamed or \
+         removed, so this guard is matching against code that no longer exists \
+         and its empty result means nothing."
+    );
+
+    assert!(
+        borrows.is_empty(),
+        "a `PoolCounters` field is mutably borrowed outside `impl PoolCounters`:\n    {}\n\
+         A write through that borrow never spells `counters.<field> =`, so \
+         `pool_counters_holds_accumulators_only` cannot see it and the gauge class \
+         it closes is reachable again. Put the update in a method on \
+         `PoolCounters` -- `record_band` is the pattern -- so the borrow stays \
+         where a reader checking the accumulator property is already looking.",
+        borrows.join("\n    ")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Target 4: `GpuClock` epoch ordering, in isolation.
 // ---------------------------------------------------------------------------

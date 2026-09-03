@@ -353,6 +353,90 @@ pub struct PoolCounters {
     /// counts what every caller was *given*, hit or miss, which is the only
     /// population against which "what did we ask for" is a fair denominator.
     pub served_bytes: u64,
+
+    /// [`Self::requested_bytes`] and [`Self::served_bytes`], split by the size
+    /// band the *request* fell in (`DESIGN.md` §9.2u, #47).
+    ///
+    /// # Why the request and not the bucket
+    ///
+    /// The band is chosen by what the caller **asked for**, so a request that
+    /// is over-served stays in its own band rather than being filed under
+    /// whatever oversized bucket happened to answer it. Keying on the served
+    /// size would put the overhang in the *large* band by construction, and the
+    /// split would be an artifact of the keying -- the shape §3.1b names, a
+    /// comparison that is not one.
+    ///
+    /// # Why bands rather than a tenant tag
+    ///
+    /// A tenant tag would have to be threaded from `Tensor::cat` and
+    /// `KvSlot::append` through `new_buffer`'s call layers, and the pool has no
+    /// argument for it (§9.2s: *"the request is discarded at the pool
+    /// boundary"*). A band is derivable from what `acquire` already holds. It
+    /// is a **proxy** and is reported as one: §9.2u states which LFM2 class
+    /// occupies which size range and where they could overlap, so a reader can
+    /// see which rows are clean rather than trusting a label the pool cannot
+    /// verify.
+    pub bands: [SizeBand; SIZE_BAND_COUNT],
+}
+
+/// One row of [`PoolCounters::bands`]: the same two sums over one size range.
+///
+/// Both fields are accumulators over the same population and the same instant
+/// as their whole-pool counterparts, so the bands sum to
+/// [`PoolCounters::requested_bytes`] and [`PoolCounters::served_bytes`]
+/// exactly -- asserted by `bands_sum_to_the_whole_pool_counters`, which is what
+/// makes a per-band figure comparable *with* the headline rather than merely
+/// adjacent to it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SizeBand {
+    /// Acquisitions whose request fell in this band.
+    pub acquisitions: u64,
+    /// Bytes asked for, summed over those acquisitions.
+    pub requested_bytes: u64,
+    /// Bytes handed over, summed over the same acquisitions.
+    pub served_bytes: u64,
+}
+
+impl SizeBand {
+    /// Bytes served beyond what was asked for, in this band.
+    pub fn overhang_bytes(&self) -> u64 {
+        self.served_bytes.saturating_sub(self.requested_bytes)
+    }
+}
+
+/// Upper bounds (exclusive) of the size bands, in bytes.
+///
+/// Chosen against LFM2's measured decode geometry (`DESIGN.md` §9.2u) rather
+/// than as round numbers. The B=1 activation shapes are 1 KB -- 21.5 KB
+/// (§9.2c's 68 KB arena over five slots) with the `Cat` arm's per-layer
+/// temporaries just above; one K or V tensor is 3.83 MB at `kv_len` 234 and
+/// grows linearly (§9.2s). **256 KB is what separates the two at every `kv_len`
+/// this project has run** -- and because that separation is `kv_len`-dependent
+/// rather than structural, §9.2u states the bound explicitly instead of
+/// presenting the split as exact.
+pub const SIZE_BAND_LIMITS: [usize; SIZE_BAND_COUNT - 1] = [4 * 1024, 256 * 1024, 4 * 1024 * 1024];
+
+/// Number of bands: the limits above, plus the unbounded tail.
+pub const SIZE_BAND_COUNT: usize = 4;
+
+/// Human-readable band names, index-aligned with [`PoolCounters::bands`].
+pub const SIZE_BAND_NAMES: [&str; SIZE_BAND_COUNT] = ["<4KB", "4KB-256KB", "256KB-4MB", ">=4MB"];
+
+/// Which band a request of `size` bytes falls in.
+///
+/// A free function rather than a method so the counting site and the tests
+/// share one definition -- a second copy is how a band boundary drifts between
+/// the instrument and the analysis that reads it.
+#[inline]
+pub fn size_band(size: usize) -> usize {
+    // Linear over three constants and monotone by construction. A binary
+    // search would be slower at this length, and a match on ranges would spell
+    // the boundaries twice.
+    let mut band = 0;
+    while band < SIZE_BAND_LIMITS.len() && size >= SIZE_BAND_LIMITS[band] {
+        band += 1;
+    }
+    band
 }
 
 impl PoolCounters {
@@ -393,6 +477,30 @@ impl PoolCounters {
             return None;
         }
         Some(self.overhang_bytes() as f64 / self.served_bytes as f64)
+    }
+
+    /// Record one acquisition into its size band (§9.2u).
+    ///
+    /// Both call sites -- `acquire`'s hit and `adopt_requesting`'s miss -- go
+    /// through here, so the band key is chosen in exactly one place. A second
+    /// copy is how the two halves of one population come to disagree about
+    /// where a boundary is.
+    ///
+    /// A method rather than an inline `&mut` borrow at each site for a second
+    /// reason, and it is a real one: `pool_counters_holds_accumulators_only`
+    /// reads this file's *text* for `counters.<field> =` because a gauge is a
+    /// write shape, and `let band = &mut state.counters.bands[..]` is
+    /// lexically that pattern while being a borrow. Keeping the borrow inside
+    /// `impl PoolCounters` means that guard sees `+=` at every `counters.`
+    /// site, and the borrow is covered by
+    /// `no_counter_field_is_mutably_borrowed_out_of_the_struct` instead --
+    /// which closes a hole the older guard could not see.
+    #[inline]
+    fn record_band(&mut self, requested: usize, served: usize) {
+        let band = &mut self.bands[size_band(requested)];
+        band.acquisitions += 1;
+        band.requested_bytes += requested as u64;
+        band.served_bytes += served as u64;
     }
 }
 
@@ -1071,6 +1179,11 @@ impl BufferPool {
         // allocation happens and `adopt` is never reached.
         state.counters.requested_bytes += size as u64;
         state.counters.served_bytes += bucket_size as u64;
+        // Banded by the REQUEST (§9.2u). Keying on `bucket_size` would file
+        // every over-served acquisition under the band of the bucket that
+        // answered it -- which is the band the overhang would then appear to
+        // belong to, true by construction and therefore evidence of nothing.
+        state.counters.record_band(size, bucket_size);
         state.live_buffers += 1;
         state.live_bytes += bucket_size;
         Some(Arc::new(PooledBuffer {
@@ -1242,6 +1355,9 @@ impl BufferPool {
         if let Ok(mut state) = self.inner.state.lock() {
             state.counters.requested_bytes += requested as u64;
             state.counters.served_bytes += allocated as u64;
+            // The MISS half of the same split, banded on the same key as the
+            // hit half so the two are one population (§9.2u).
+            state.counters.record_band(requested, allocated);
         }
         handle
     }
@@ -2601,5 +2717,184 @@ mod tests {
         );
         // 127 + 0 + 127 + 120, by hand.
         assert_eq!(c.overhang_bytes(), 374);
+    }
+
+    /// The three band constants describe one partition, and cannot drift apart.
+    ///
+    /// `SIZE_BAND_COUNT` is spelled a second time in `lfm2-decode-profile`'s
+    /// `MemProbe`, which is compiled without the `metal` feature and so cannot
+    /// import this one. That copy is why this exists: a band added here without
+    /// widening the probe's arrays would silently drop the new row from every
+    /// committed series, and a series missing a row still parses.
+    #[test]
+    fn the_band_constants_describe_one_partition() {
+        assert_eq!(
+            SIZE_BAND_COUNT, 4,
+            "lfm2-decode-profile's MemProbe spells this 4"
+        );
+        assert_eq!(
+            SIZE_BAND_LIMITS.len(),
+            SIZE_BAND_COUNT - 1,
+            "N bands need N-1 interior boundaries"
+        );
+        assert_eq!(SIZE_BAND_NAMES.len(), SIZE_BAND_COUNT);
+        assert!(
+            SIZE_BAND_LIMITS.windows(2).all(|w| w[0] < w[1]),
+            "the limits must be strictly increasing or `size_band`'s walk is \
+             not a partition: {SIZE_BAND_LIMITS:?}"
+        );
+        // Each limit is the first size in the band above it, which is what
+        // `size_band`'s `>=` implements.
+        for (i, limit) in SIZE_BAND_LIMITS.iter().enumerate() {
+            assert_eq!(size_band(limit - 1), i, "{limit} - 1 belongs below");
+            assert_eq!(size_band(*limit), i + 1, "{limit} itself belongs above");
+        }
+    }
+
+    /// The band boundaries, at every edge and one byte either side.
+    ///
+    /// An absolute reference per §3.1b rule 1: each case names the band it must
+    /// land in, so a moved boundary fails with the size that moved rather than
+    /// with "the bands were not monotone".
+    #[test]
+    fn size_band_puts_each_size_in_its_named_band() {
+        for (size, want) in [
+            (0usize, 0usize),
+            (1, 0),
+            (4095, 0),
+            (4096, 1),
+            (4097, 1),
+            (21504, 1), // §9.2c's largest activation slot
+            (262_143, 1),
+            (262_144, 2),
+            (3_833_856, 2), // one K or V at kv_len 234 (§9.2s)
+            (4_194_303, 2),
+            (4_194_304, 3),
+            (1 << 30, 3),
+        ] {
+            assert_eq!(
+                size_band(size),
+                want,
+                "size {size} landed in band {} ({}), expected {want} ({})",
+                size_band(size),
+                SIZE_BAND_NAMES[size_band(size)],
+                SIZE_BAND_NAMES[want]
+            );
+        }
+    }
+
+    /// The bands are a partition of the whole-pool counters, not a sample.
+    ///
+    /// This is what licenses reading a band figure against the headline
+    /// (§9.2u). Without it a band could silently miss a path -- `acquire`'s hit
+    /// or `adopt_requesting`'s miss -- and every per-band share would be over a
+    /// population smaller than the one it is compared to, which is
+    /// `CONTRIBUTING.md` §3.1b's *"looks like a comparison and is not"*.
+    ///
+    /// Both paths are exercised deliberately, and the hit is an **over-served**
+    /// one (3000 B answered by the 4096 B bucket) so the hit half contributes
+    /// overhang rather than only bytes.
+    #[test]
+    fn bands_sum_to_the_whole_pool_counters() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        // Misses, in two different bands.
+        for (requested, allocated) in [(1000usize, 1024usize), (300_000, 300_032)] {
+            let raw = dev
+                .new_buffer(allocated, crate::RESOURCE_OPTIONS)
+                .expect("buffer allocation");
+            let _ = pool.adopt_requesting(raw, requested, allocated);
+        }
+
+        // A third miss, whose buffer is then freed to set up an over-served hit.
+        let raw = dev
+            .new_buffer(4096, crate::RESOURCE_OPTIONS)
+            .expect("buffer allocation");
+        let b = pool.adopt_requesting(raw, 4096, 4096);
+        release_and_complete(&pool, &clock, b);
+        let hit = pool.acquire(3000).expect("the 4096 bucket answers 3000");
+        assert_eq!(
+            hit.size(),
+            4096,
+            "the hit must be over-served, or the overhang contributed by the \
+             hit path is zero and this test is vacuous on half its population"
+        );
+
+        let c = pool.counters();
+        let band_req: u64 = c.bands.iter().map(|b| b.requested_bytes).sum();
+        let band_srv: u64 = c.bands.iter().map(|b| b.served_bytes).sum();
+        let band_acq: u64 = c.bands.iter().map(|b| b.acquisitions).sum();
+
+        assert_eq!(
+            band_req, c.requested_bytes,
+            "bands requested {band_req} != pool requested {}",
+            c.requested_bytes
+        );
+        assert_eq!(
+            band_srv, c.served_bytes,
+            "bands served {band_srv} != pool served {}",
+            c.served_bytes
+        );
+        assert_eq!(band_acq, 4, "three misses and one hit were recorded");
+
+        // Absolute references rather than a shape (§3.1b rule 1), so a
+        // mis-banded acquisition fails naming the band that received it.
+        // Band 0 (<4KB): the 1000 B miss and the 3000 B hit.
+        assert_eq!(
+            c.bands[0].acquisitions, 2,
+            "1000 B and 3000 B are both <4KB"
+        );
+        assert_eq!(c.bands[0].requested_bytes, 1000 + 3000);
+        assert_eq!(c.bands[0].served_bytes, 1024 + 4096);
+        assert_eq!(c.bands[0].overhang_bytes(), 24 + 1096);
+        // Band 1 (4KB-256KB): the 4096 B miss that set up the hit.
+        assert_eq!(c.bands[1].acquisitions, 1, "4096 B is 4KB-256KB");
+        assert_eq!(c.bands[1].overhang_bytes(), 0, "it was served exactly");
+        // Band 2 (256KB-4MB): the 300 000 B miss.
+        assert_eq!(c.bands[2].acquisitions, 1, "300000 B is 256KB-4MB");
+        assert_eq!(c.bands[2].overhang_bytes(), 32);
+        assert_eq!(c.bands[3].acquisitions, 0, "nothing here reached 4MB");
+    }
+
+    /// A request over-served from a larger bucket stays in the REQUEST's band.
+    ///
+    /// The keying decision §9.2u rests on, and the assertion that dies if the
+    /// two keys are swapped. Banding on the served size would move this
+    /// acquisition into the bucket's band, where the overhang would then appear
+    /// in the large band **by construction** -- which is exactly the reading
+    /// the split exists to refute.
+    #[test]
+    fn an_over_served_request_is_banded_by_what_was_asked_for() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        // Free a 1 MB buffer (band 2), then ask for 2 KB (band 0).
+        let raw = dev
+            .new_buffer(1 << 20, crate::RESOURCE_OPTIONS)
+            .expect("buffer allocation");
+        let big = pool.adopt_requesting(raw, 1 << 20, 1 << 20);
+        release_and_complete(&pool, &clock, big);
+
+        let before = pool.counters();
+        let served = pool.acquire(2048).expect("the 1 MB bucket answers 2 KB");
+        assert_eq!(
+            served.size(),
+            1 << 20,
+            "the range query must over-serve here"
+        );
+
+        let c = pool.counters();
+        let d0 = c.bands[0].acquisitions - before.bands[0].acquisitions;
+        let d2 = c.bands[2].acquisitions - before.bands[2].acquisitions;
+        assert_eq!(d0, 1, "the 2 KB REQUEST belongs to band 0 (<4KB)");
+        assert_eq!(d2, 0, "banding on the 1 MB BUCKET would have put it here");
+
+        let oh = c.bands[0].overhang_bytes() - before.bands[0].overhang_bytes();
+        assert_eq!(
+            oh,
+            (1 << 20) - 2048,
+            "the whole over-service is attributed to the asking band"
+        );
     }
 }

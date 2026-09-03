@@ -249,6 +249,34 @@ const KV_BYTES_PER_TOKEN: u64 = 2 * 8 * 64 * 2 * 8;
 /// driver's own allocated size tracks the pool while the footprint climbs, the
 /// growth is outside Metal's allocations; if both climb together, it is bytes
 /// and the question is whose. Neither reading is available from a pool counter.
+/// A `[u64; N]` as a JSON array, for the band rows.
+///
+/// Hand-rolled because this file writes its JSON by `format!` rather than
+/// through a serializer, and adding one for three fields would change how every
+/// other field is emitted -- which would invalidate the committed series' shape
+/// for a cosmetic gain.
+fn json_u64_array(xs: &[u64]) -> String {
+    let mut s = String::with_capacity(xs.len() * 8 + 2);
+    s.push('[');
+    for (i, x) in xs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&x.to_string());
+    }
+    s.push(']');
+    s
+}
+
+/// Size bands for the overhang split (`DESIGN.md` §9.2u, #47).
+///
+/// Declared here rather than imported because `MemProbe` is compiled without
+/// the `metal` feature while `candle_metal_kernels` is not, and a `cfg` on a
+/// struct field would make the two builds different shapes.
+/// `band_names_match_the_pools` pins it to the pool's own constant on the
+/// `metal` build, so the two cannot drift.
+const SIZE_BAND_COUNT: usize = 4;
+
 #[derive(Clone, Copy, Debug, Default)]
 struct MemProbe {
     token: u64,
@@ -280,6 +308,19 @@ struct MemProbe {
     /// acquisition is a hit. `served_bytes` counts every acquisition.
     requested_bytes: u64,
     served_bytes: u64,
+    /// The two fields above, split by the size band of the REQUEST
+    /// (`DESIGN.md` §9.2u, #47). Index-aligned with `SIZE_BAND_NAMES`,
+    /// cumulative like everything else here, and summing to `requested_bytes` /
+    /// `served_bytes` exactly -- which is what lets a band be read *against* the
+    /// headline rather than merely beside it.
+    ///
+    /// **This is what separates a growing request from a widening gap.** The
+    /// whole-pool ratio moves when either term moves, so on its own it cannot
+    /// say whether the allocator got worse or the workload asked for more.
+    /// Per band, the KV population's own growth is visible in its own row.
+    band_acquisitions: [u64; SIZE_BAND_COUNT],
+    band_requested_bytes: [u64; SIZE_BAND_COUNT],
+    band_served_bytes: [u64; SIZE_BAND_COUNT],
     residency: u64,
     /// Residency-set activity, cumulative (`DESIGN.md` §6.3e, issue #210).
     ///
@@ -328,6 +369,17 @@ impl MemProbe {
             buckets_probed: cs.buckets_probed + cp.buckets_probed,
             requested_bytes: cs.requested_bytes + cp.requested_bytes,
             served_bytes: cs.served_bytes + cp.served_bytes,
+            // Summed over both pools, exactly as every counter above is, so a
+            // band row and the headline are over one population (§9.2u).
+            band_acquisitions: std::array::from_fn(|i| {
+                cs.bands[i].acquisitions + cp.bands[i].acquisitions
+            }),
+            band_requested_bytes: std::array::from_fn(|i| {
+                cs.bands[i].requested_bytes + cp.bands[i].requested_bytes
+            }),
+            band_served_bytes: std::array::from_fn(|i| {
+                cs.bands[i].served_bytes + cp.bands[i].served_bytes
+            }),
             residency: dev.residency_set_len() as u64,
             residency_commits: rc.commits,
             residency_added: rc.added,
@@ -461,6 +513,8 @@ impl MemProbe {
              \"allocations\":{},\"allocated_bytes\":{},\"evicted\":{},\
              \"hits\":{},\"lookups\":{},\"buckets_probed\":{},\
              \"requested_bytes\":{},\"served_bytes\":{},\
+             \"band_acquisitions\":{},\"band_requested_bytes\":{},\
+             \"band_served_bytes\":{},\
              \"residency\":{},\"residency_commits\":{},\
              \"residency_added\":{},\"residency_removed\":{},\
              \"residency_retired\":{},\"device_allocated\":{},\
@@ -483,6 +537,9 @@ impl MemProbe {
             self.buckets_probed,
             self.requested_bytes,
             self.served_bytes,
+            json_u64_array(&self.band_acquisitions),
+            json_u64_array(&self.band_requested_bytes),
+            json_u64_array(&self.band_served_bytes),
             self.residency,
             self.residency_commits,
             self.residency_added,

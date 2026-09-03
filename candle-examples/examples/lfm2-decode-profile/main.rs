@@ -268,6 +268,18 @@ struct MemProbe {
     hits: u64,
     lookups: u64,
     buckets_probed: u64,
+    /// Bytes callers asked for, and bytes they were given (`DESIGN.md` §9.2s,
+    /// #47). Cumulative, so the overhang over a window is the difference of
+    /// two samples, exactly as `allocations` is used.
+    ///
+    /// **Not derivable from `allocated_bytes`**, which is why these are
+    /// separate fields rather than a computation over the ones above.
+    /// `allocated_bytes` counts what went to `newBufferWithLength` -- fresh
+    /// allocations only -- so it is blind to the pool HIT that is served from
+    /// a strictly larger bucket, and in steady-state decode almost every
+    /// acquisition is a hit. `served_bytes` counts every acquisition.
+    requested_bytes: u64,
+    served_bytes: u64,
     residency: u64,
     /// Residency-set activity, cumulative (`DESIGN.md` §6.3e, issue #210).
     ///
@@ -314,6 +326,8 @@ impl MemProbe {
             hits: cs.hits + cp.hits,
             lookups: cs.lookups + cp.lookups,
             buckets_probed: cs.buckets_probed + cp.buckets_probed,
+            requested_bytes: cs.requested_bytes + cp.requested_bytes,
+            served_bytes: cs.served_bytes + cp.served_bytes,
             residency: dev.residency_set_len() as u64,
             residency_commits: rc.commits,
             residency_added: rc.added,
@@ -446,6 +460,7 @@ impl MemProbe {
              \"pool_free_buckets\":{},\"pool_pending_buffers\":{},\
              \"allocations\":{},\"allocated_bytes\":{},\"evicted\":{},\
              \"hits\":{},\"lookups\":{},\"buckets_probed\":{},\
+             \"requested_bytes\":{},\"served_bytes\":{},\
              \"residency\":{},\"residency_commits\":{},\
              \"residency_added\":{},\"residency_removed\":{},\
              \"residency_retired\":{},\"device_allocated\":{},\
@@ -466,6 +481,8 @@ impl MemProbe {
             self.hits,
             self.lookups,
             self.buckets_probed,
+            self.requested_bytes,
+            self.served_bytes,
             self.residency,
             self.residency_commits,
             self.residency_added,

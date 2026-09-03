@@ -1062,7 +1062,13 @@ impl MetalDevice {
                     .new_buffer(alloc, PRIVATE_RESOURCE_OPTIONS)
                     .map_err(MetalError::from)?;
                 self.residency_set.insert(&new_buffer);
-                self.private_buffers.adopt(new_buffer, alloc)
+                // `size` is the pre-rounding request and `alloc` is what Metal
+                // was given; `adopt_requesting` counts both so §9.2's residual
+                // overhang is derivable. The rounding happened at `alloc`
+                // above, which is the last point where the two are both in
+                // scope (#47).
+                self.private_buffers
+                    .adopt_requesting(new_buffer, size, alloc)
             }
         };
         Ok(self.note_for_recording(buffer, size))
@@ -1180,6 +1186,9 @@ impl MetalDevice {
         if let Some(b) = self.buffers.acquire(size) {
             return Ok(b);
         }
+        // Kept before `buf_size` shadows `size`, so the overhang has both terms
+        // (§9.2, #47).
+        let requested = size;
         let size = buf_size(size);
         // §9.5k's branch, on the pool miss and before the allocation -- see
         // `new_buffer` above. This is the pool the KV reserve is served from
@@ -1193,7 +1202,7 @@ impl MetalDevice {
             .new_buffer(size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         self.residency_set.insert(&new_buffer);
-        Ok(self.buffers.adopt(new_buffer, size))
+        Ok(self.buffers.adopt_requesting(new_buffer, requested, size))
     }
 
     /// Create a metal GPU capture trace on [`path`].

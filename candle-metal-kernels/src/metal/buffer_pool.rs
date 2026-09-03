@@ -335,6 +335,65 @@ pub struct PoolCounters {
     /// found a later use, which is the steady state a fixed-shape workload
     /// reaches.
     pub evicted: u64,
+
+    /// Bytes callers actually asked for, summed over every served `acquire`.
+    ///
+    /// The denominator of the overhang below. Counted at the same instant as
+    /// [`Self::served_bytes`] and over exactly the same population, because a
+    /// ratio between two counters incremented on different conditions is the
+    /// shape `CONTRIBUTING.md` §3.1b names -- two numbers that look like a
+    /// comparison and are not.
+    pub requested_bytes: u64,
+
+    /// Bytes the pool actually handed over, summed over the same acquisitions.
+    ///
+    /// Not the same as [`Self::allocated_bytes`], and the difference is the
+    /// point. `allocated_bytes` counts what went to `newBufferWithLength` --
+    /// fresh allocations only, so a pool HIT contributes nothing to it. This
+    /// counts what every caller was *given*, hit or miss, which is the only
+    /// population against which "what did we ask for" is a fair denominator.
+    pub served_bytes: u64,
+}
+
+impl PoolCounters {
+    /// `DESIGN.md` §9.2's residual overhang: bytes held minus bytes wanted.
+    ///
+    /// The quantity #47's expanded acceptance list asks for a number on before
+    /// any rewrite, and which nothing counted -- `buf_size` rounds at
+    /// `device.rs`, discards the request, and [`PooledBuffer::size`] records
+    /// only *"the allocated size, not the requested one"*.
+    ///
+    /// # Two sources, deliberately summed
+    ///
+    /// A caller is over-served on a **miss** when `buf_size` rounds the request
+    /// up to [`crate::metal::arena::ARENA_ALIGNMENT`]-granularity, and on a
+    /// **hit** when the ordered range query returns a bucket strictly larger
+    /// than the request (`acquire`'s second probe). Both are the same
+    /// phenomenon -- bytes resident and unwanted -- and separating them would
+    /// invite reporting whichever is smaller.
+    ///
+    /// # Why saturating
+    ///
+    /// It cannot go negative: every served buffer is at least as large as its
+    /// request, asserted by `served_is_never_below_requested`. The saturation
+    /// is so a counter overflow degrades to zero rather than to a
+    /// near-`u64::MAX` figure that would read as catastrophic waste.
+    pub fn overhang_bytes(&self) -> u64 {
+        self.served_bytes.saturating_sub(self.requested_bytes)
+    }
+
+    /// The overhang as a fraction of what was served, or `None` if nothing was.
+    ///
+    /// `None` rather than `0.0` for an empty pool: a zero ratio and "no
+    /// acquisitions happened" are different facts, and §3.1c's rule is that a
+    /// zero is not evidence unless something nonzero came from the same
+    /// command.
+    pub fn overhang_fraction(&self) -> Option<f64> {
+        if self.served_bytes == 0 {
+            return None;
+        }
+        Some(self.overhang_bytes() as f64 / self.served_bytes as f64)
+    }
 }
 
 struct PoolState {
@@ -1004,6 +1063,14 @@ impl BufferPool {
         unsafe { super::poison::unpoison_buffer(&buffer) };
 
         state.counters.hits += 1;
+        // The overhang's HIT source (§9.2). `bucket_size` is what the range
+        // query found and `size` is what was asked for; when the exact probe
+        // above missed, the second probe deliberately returns a *larger*
+        // bucket, and the difference is bytes this caller holds and does not
+        // want. Recorded here rather than at `adopt` because on a hit no
+        // allocation happens and `adopt` is never reached.
+        state.counters.requested_bytes += size as u64;
+        state.counters.served_bytes += bucket_size as u64;
         state.live_buffers += 1;
         state.live_bytes += bucket_size;
         Some(Arc::new(PooledBuffer {
@@ -1135,6 +1202,48 @@ impl BufferPool {
             size,
             pool: Arc::downgrade(&self.inner),
         })
+    }
+
+    /// [`Self::adopt`], also recording what the caller originally asked for.
+    ///
+    /// The overhang's MISS source (`DESIGN.md` §9.2, #47). `buf_size` rounds a
+    /// request up to the buffer alignment and then **shadows the variable**, so
+    /// by the time `adopt` is called the original figure is gone at both
+    /// production sites (`device.rs:1050`, `device.rs:1183`). This takes both
+    /// numbers so the difference can be counted at the one instant it is still
+    /// known.
+    ///
+    /// # Why a sibling rather than a wider `adopt`
+    ///
+    /// `adopt` has two production callers and eleven in tests, probes and
+    /// fuzzers. Widening its signature would edit thirteen sites to instrument
+    /// two, and every test call would have to invent a "requested" figure it
+    /// does not model -- which is how a counter acquires a population that is
+    /// not the one it claims to measure. `adopt` keeps its meaning (*take
+    /// ownership of this allocation*) and this adds the accounting the decode
+    /// path needs.
+    ///
+    /// `requested` is the pre-rounding byte count; `allocated` is what was
+    /// handed to `newBufferWithLength` and what the bucket is keyed on.
+    pub fn adopt_requesting(
+        &self,
+        buffer: Buffer,
+        requested: usize,
+        allocated: usize,
+    ) -> Arc<PooledBuffer> {
+        debug_assert!(
+            allocated >= requested,
+            "adopt_requesting({requested} -> {allocated}) shrank the request; \
+             `buf_size` only ever rounds up, so a smaller allocation than the \
+             request means the two arguments were passed in the wrong order \
+             and the overhang would underflow (DESIGN.md §9.2)."
+        );
+        let handle = self.adopt(buffer, allocated);
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.counters.requested_bytes += requested as u64;
+            state.counters.served_bytes += allocated as u64;
+        }
+        handle
     }
 
     /// Drops every currently-free buffer, returning them so the caller can
@@ -2342,5 +2451,155 @@ mod tests {
             "a late report moved the clock back"
         );
         assert!(clock.is_complete(5));
+    }
+
+    /// The overhang counts BOTH sources, with an absolute reference for each.
+    ///
+    /// `CONTRIBUTING.md` §3.1b rule 1: an absolute figure over a shape. *"The
+    /// overhang is nonzero"* would pass on a counter that double-counts, on one
+    /// that counts only misses, and on one that adds a constant -- so every
+    /// number here is derived by hand from the two inputs and asserted exactly.
+    ///
+    /// The two sources are deliberately in one test: they are summed into one
+    /// figure, so a test covering only one leaves the other free to drift while
+    /// the suite stays green (§3.1b rule 4 -- incidental coverage is a distinct
+    /// risk from absence).
+    #[test]
+    fn the_overhang_counts_the_miss_rounding_and_the_hit_oversize() {
+        let dev = device();
+        // A pool with a clock, because `release` always parks into `pending`
+        // (§6.3b's deliberate absence of an idle fast path) -- a drop alone
+        // leaves the free list empty and every reuse assertion below vacuous.
+        // That is §9.2m's measured VACUOUS case, in the test written to catch
+        // this defect.
+        let (pool, clock) = pool_with_clock();
+
+        // --- Source 1: the MISS. A caller wants 1000 B; `buf_size`-style
+        // rounding to 1024 hands it 24 B it did not ask for.
+        let raw = dev
+            .new_buffer(1024, crate::RESOURCE_OPTIONS)
+            .expect("buffer allocation");
+        let b = pool.adopt_requesting(raw, 1000, 1024);
+        let c = pool.counters();
+        assert_eq!(c.requested_bytes, 1000);
+        assert_eq!(c.served_bytes, 1024);
+        assert_eq!(c.overhang_bytes(), 24, "the miss rounding is 1024 - 1000");
+
+        // The handle must report the BUCKET, not the request: reuse keys on it,
+        // and a handle claiming 1000 would return to the wrong free list.
+        assert_eq!(b.size(), 1024);
+
+        // --- Source 2: the HIT. Return the 1024 B buffer, then ask for 900.
+        // The exact probe misses and the range query serves the 1024 bucket,
+        // so this caller is over-served by 124 B without any allocation.
+        release_and_complete(&pool, &clock, b);
+        assert_eq!(
+            pool.occupancy().free_buffers,
+            1,
+            "the buffer must actually be free, or the acquire below is vacuous"
+        );
+        let d = pool.acquire(900).expect("the 1024 bucket must satisfy 900");
+        assert_eq!(d.size(), 1024, "served from the larger bucket");
+
+        let c = pool.counters();
+        assert_eq!(c.requested_bytes, 1000 + 900);
+        assert_eq!(c.served_bytes, 1024 + 1024);
+        assert_eq!(
+            c.overhang_bytes(),
+            24 + 124,
+            "both sources must be summed: 24 B of miss rounding + 124 B of \
+             hit oversize"
+        );
+
+        // The fraction is against what was SERVED, not what was requested.
+        let f = c.overhang_fraction().expect("something was served");
+        assert!(
+            (f - (148.0 / 2048.0)).abs() < 1e-12,
+            "overhang_fraction must be overhang/served, got {f}"
+        );
+    }
+
+    /// An exact hit contributes nothing, which is what makes a nonzero
+    /// overhang attributable.
+    ///
+    /// The non-vacuity arm for the test above: if every acquisition inflated
+    /// the counter, a nonzero total would say nothing about rounding. Decode
+    /// asks for the same shapes every token (`acquire`'s exact-probe comment),
+    /// so this is the *common* case and it must read zero.
+    #[test]
+    fn an_exact_hit_adds_no_overhang_and_the_counter_still_moves() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+
+        let raw = dev
+            .new_buffer(2048, crate::RESOURCE_OPTIONS)
+            .expect("buffer allocation");
+        let b = pool.adopt_requesting(raw, 2048, 2048);
+        release_and_complete(&pool, &clock, b);
+        assert_eq!(
+            pool.occupancy().free_buffers,
+            1,
+            "the buffer must actually be free, or the acquire below is vacuous"
+        );
+
+        let before = pool.counters();
+        assert_eq!(
+            before.overhang_bytes(),
+            0,
+            "an exact request wastes nothing"
+        );
+
+        let b = pool.acquire(2048).expect("exact bucket");
+        assert_eq!(b.size(), 2048);
+
+        let after = pool.counters();
+        // The zero above is evidence only because these moved (§3.1c: a zero
+        // is not evidence unless something nonzero came from the same command).
+        assert_eq!(
+            after.served_bytes,
+            before.served_bytes + 2048,
+            "the counter must have moved, or the zero overhang is vacuous"
+        );
+        assert_eq!(after.requested_bytes, before.requested_bytes + 2048);
+        assert_eq!(after.overhang_bytes(), 0, "an exact hit is not overhang");
+    }
+
+    /// Nothing served means no ratio, rather than a ratio of zero.
+    ///
+    /// `0.0` would be indistinguishable from a pool that served petabytes with
+    /// perfect fit, and the two want opposite readings.
+    #[test]
+    fn overhang_fraction_is_none_on_an_untouched_pool() {
+        let pool = BufferPool::new();
+        assert_eq!(pool.counters().served_bytes, 0);
+        assert!(pool.counters().overhang_fraction().is_none());
+    }
+
+    /// The invariant the subtraction rests on, over every path that records.
+    ///
+    /// `overhang_bytes` saturates, so a served-below-requested bug would read
+    /// as a comfortable zero rather than as a failure. This asserts the
+    /// property directly instead of trusting the subtraction to reveal it.
+    #[test]
+    fn served_is_never_below_requested() {
+        let dev = device();
+        let pool = BufferPool::new();
+
+        for (requested, allocated) in [(1usize, 128usize), (128, 128), (129, 256), (5000, 5120)] {
+            let raw = dev
+                .new_buffer(allocated, crate::RESOURCE_OPTIONS)
+                .expect("buffer allocation");
+            let _ = pool.adopt_requesting(raw, requested, allocated);
+        }
+
+        let c = pool.counters();
+        assert!(
+            c.served_bytes >= c.requested_bytes,
+            "served {} < requested {}, so the overhang would underflow",
+            c.served_bytes,
+            c.requested_bytes
+        );
+        // 127 + 0 + 127 + 120, by hand.
+        assert_eq!(c.overhang_bytes(), 374);
     }
 }

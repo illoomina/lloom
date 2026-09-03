@@ -55,6 +55,7 @@ pub mod hiera;
 pub mod jina_bert;
 pub mod lfm2;
 pub mod lfm2_dspark;
+pub mod lfm2_vl;
 pub mod llama;
 pub mod llama2_c;
 pub mod llama2_c_weights;

@@ -2885,6 +2885,60 @@ impl Model {
         logits.to_dtype(DType::F32)
     }
 
+    /// Embed `input_ids` without running a single layer.
+    ///
+    /// This exists so a caller holding image features can build the residual
+    /// stream itself — embed the text, substitute the projected image rows at
+    /// the `image_token_id` positions, and hand the result to
+    /// [`Self::forward_embeds`]. Exposing the embedding rather than taking
+    /// `pixel_values` here is what keeps every vision type out of this file
+    /// (`CONTRIBUTING.md` §4's constraint that the CPU and CUDA backends must
+    /// still build, and `DESIGN.md` §5.5a's that a text-only model names 266
+    /// tensors and no more).
+    pub fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids)
+    }
+
+    /// `forward`, but starting from a residual stream the caller has already
+    /// built.
+    ///
+    /// # Why this is a second entry point rather than a flag on `forward`
+    ///
+    /// The same reason `forward_all` is: `forward` is on the per-token path and
+    /// its shape is what every recorded digest belongs to (`DESIGN.md` §2.3.8c).
+    /// A branch inside it would put a caller decode does not have onto the
+    /// decode path — §11.3l finding 4's shape, where a window drawn for one
+    /// purpose silently changed another. **Text-only decode does not reach this
+    /// function at all**, which is what makes "the text path is unregressed" a
+    /// structural claim rather than a measured hope.
+    ///
+    /// `embeds` is `[b, seq, hidden]` and must already carry whatever the caller
+    /// wanted substituted into it. Everything after the embedding is `forward`'s
+    /// code exactly, including the conv-phase advance, so a prompt whose embeds
+    /// happen to be the plain token embeddings produces `forward`'s own answer.
+    pub fn forward_embeds(
+        &self,
+        embeds: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        let (_, seq_len, _) = embeds.dims3()?;
+        self.advance_conv_phase(seq_len, cache);
+
+        let mut hidden_states = embeds.clone();
+        Self::begin_taps(cache);
+        for (block_idx, layer) in self.layers.iter().enumerate() {
+            mark_graph_node(&cache.device, block_idx);
+            Self::tap_layer_input(&hidden_states, block_idx, cache)?;
+            hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
+        }
+
+        let hidden_states = self.embedding_norm.forward(&hidden_states)?;
+        let hidden_states = hidden_states.i((.., seq_len - 1, ..))?.contiguous()?;
+        let logits = self.lm_head.forward(&hidden_states)?;
+        logits.to_dtype(DType::F32)
+    }
+
     /// Run the model and project **every** position, not only the last.
     ///
     /// # Why this exists, and why it is a separate entry point

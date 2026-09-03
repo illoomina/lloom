@@ -140,7 +140,7 @@ pub struct VisionConfig {
     pub layer_norm_eps: f64,
 }
 
-trait TransformerConfig {
+pub(crate) trait TransformerConfig {
     fn hidden_size(&self) -> usize;
     fn intermediate_size(&self) -> usize;
     fn num_attention_heads(&self) -> usize;
@@ -382,7 +382,7 @@ impl Module for MultiheadAttentionPoolingHead {
 }
 
 #[derive(Debug, Clone)]
-struct Attention {
+pub(crate) struct Attention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -393,7 +393,7 @@ struct Attention {
 }
 
 impl Attention {
-    fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let embed_dim = cfg.hidden_size();
         let q_proj = linear(embed_dim, embed_dim, vb.pp("q_proj"))?;
         let k_proj = linear(embed_dim, embed_dim, vb.pp("k_proj"))?;
@@ -412,7 +412,7 @@ impl Attention {
         })
     }
 
-    fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+    pub(crate) fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let (batch_size, q_len, _) = xs.dims3()?;
         let query_states = xs.apply(&self.q_proj)?;
         let key_states = xs.apply(&self.k_proj)?;
@@ -441,14 +441,14 @@ impl Attention {
 
 // https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/models/siglip/modeling_siglip.py#L599
 #[derive(Debug, Clone)]
-struct Mlp {
+pub(crate) struct Mlp {
     fc1: Linear,
     fc2: Linear,
     activation_fn: candle_nn::Activation,
 }
 
 impl Mlp {
-    fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size();
         let intermediate_size = cfg.intermediate_size();
         let fc1 = candle_nn::linear(hidden_size, intermediate_size, vb.pp("fc1"))?;
@@ -471,7 +471,7 @@ impl Module for Mlp {
 
 // https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/models/siglip/modeling_siglip.py#L614
 #[derive(Debug, Clone)]
-struct EncoderLayer {
+pub(crate) struct EncoderLayer {
     self_attn: Attention,
     layer_norm1: LayerNorm,
     mlp: Mlp,
@@ -479,7 +479,7 @@ struct EncoderLayer {
 }
 
 impl EncoderLayer {
-    fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size();
         let layer_norm_eps = cfg.layer_norm_eps();
         let self_attn = Attention::new(cfg, vb.pp("self_attn"))?;
@@ -494,7 +494,7 @@ impl EncoderLayer {
         })
     }
 
-    fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+    pub(crate) fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let residual = xs;
         let xs = xs.apply(&self.layer_norm1)?;
         let xs = self.self_attn.forward(&xs, attention_mask)?;
@@ -507,12 +507,12 @@ impl EncoderLayer {
 }
 
 #[derive(Debug, Clone)]
-struct Encoder {
+pub(crate) struct Encoder {
     layers: Vec<EncoderLayer>,
 }
 
 impl Encoder {
-    fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+    pub(crate) fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
         let mut layers = vec![];
         let vb = vb.pp("layers");
         for layer_idx in 0..cfg.num_hidden_layers() {
@@ -522,7 +522,7 @@ impl Encoder {
         Ok(Self { layers })
     }
 
-    fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
+    pub(crate) fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let mut xs = xs.clone();
         for layer in self.layers.iter() {
             xs = layer.forward(&xs, attention_mask)?

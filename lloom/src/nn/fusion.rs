@@ -254,6 +254,12 @@ impl FusedArm for Residual {
     const ARM: GemvFusion = GemvFusion::Residual;
 }
 
+// `FusedArm` is deliberately `pub(crate)` — it is the sealed drift-guard above,
+// not public API — while `Gemv` is `pub` only as a type-level marker. The one
+// method here (`apply`) is private and reached solely through `GemvBuilder`, so
+// the crate-private bound leaks nothing; the lint fires on the visibility gap
+// alone, which the seal is the whole point of.
+#[allow(private_bounds)]
 impl<E: FusedArm> Gemv<PrologueNone, E> {
     /// The sole constructor of the runtime fused GEMV op: dispatch `x @ w.t()`
     /// with epilogue `E` riding the f32 accumulator, plus the epilogue's

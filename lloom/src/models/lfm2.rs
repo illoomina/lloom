@@ -24,6 +24,13 @@ pub enum LayerType {
     Conv,
 }
 
+/// The nested RoPE block newer LFM2 configs carry in place of a flat
+/// `rope_theta` (`{"rope_theta": 1e7, "rope_type": "default"}`).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Lfm2RopeParameters {
+    pub rope_theta: Option<f32>,
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct Lfm2Config {
     pub vocab_size: usize,
@@ -34,8 +41,16 @@ pub struct Lfm2Config {
     pub num_key_value_heads: usize,
     #[serde(default = "default_norm_eps")]
     pub norm_eps: f64,
+    // Newer LFM2 checkpoints nest the base frequency under `rope_parameters`
+    // and omit the flat `rope_theta` (LFM2.5-2.6B: `rope_parameters.rope_theta`
+    // = 1e7). When present it wins in `into_config`; the flat field's default is
+    // the fallback for older configs. Getting this wrong is silent — a default
+    // 1e6 against a checkpoint's 1e7 corrupts every RoPE rotation without an
+    // error, which is why the nested form is read here rather than in a harness.
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_parameters: Option<Lfm2RopeParameters>,
     #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: usize,
     #[serde(default = "default_conv_l_cache", alias = "conv_L_cache")]
@@ -43,11 +58,28 @@ pub struct Lfm2Config {
     #[serde(default)]
     pub conv_bias: bool,
     pub layer_types: Vec<LayerType>,
-    #[serde(default)]
+    // HF checkpoints spell this `tie_word_embeddings`; the alias reads it so a
+    // tied checkpoint (LFM2.5-2.6B: no `lm_head.weight`, reuses
+    // `embed_tokens.weight`) loads without a harness normalizing the key first.
+    #[serde(default, alias = "tie_word_embeddings")]
     pub tie_embedding: bool,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
-    // FFN dimension configuration
+    // FFN dimension configuration.
+    //
+    // LFM2 has two ways to size the FFN, and a checkpoint picks one. When
+    // `block_auto_adjust_ff_dim` is true (or absent), the dimension is DERIVED
+    // as `hidden_size * 4 * block_ffn_dim_multiplier` rounded to
+    // `block_multiple_of` (`compute_intermediate_size`). When it is false, the
+    // checkpoint states `intermediate_size` EXPLICITLY and that value is used
+    // verbatim — the derived formula does not match. LFM2.5-VL-3B is the
+    // auto-adjust case; LFM2.5-2.6B sets `intermediate_size: 10752` with
+    // `block_auto_adjust_ff_dim: false`, which the formula would misread as
+    // 8192 and fail to load `feed_forward.w1` against.
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
+    #[serde(default = "default_block_auto_adjust_ff_dim")]
+    pub block_auto_adjust_ff_dim: bool,
     #[serde(default = "default_ffn_dim_multiplier")]
     pub block_ffn_dim_multiplier: f32,
     #[serde(default = "default_block_multiple_of")]
@@ -84,6 +116,13 @@ fn default_ffn_dim_multiplier() -> f32 {
     1.0
 }
 
+// Absent means "derive the FFN dim from the formula", which is how the
+// checkpoints predating this field are read. A checkpoint that states
+// `intermediate_size` explicitly also carries `block_auto_adjust_ff_dim: false`.
+fn default_block_auto_adjust_ff_dim() -> bool {
+    true
+}
+
 fn default_block_multiple_of() -> usize {
     256
 }
@@ -102,8 +141,22 @@ impl Lfm2Config {
     }
 
     pub fn into_config(self, use_flash_attn: bool) -> Config {
-        // Use computed intermediate size (matches actual weights) instead of config field
-        let intermediate_size = self.compute_intermediate_size();
+        // The FFN dimension: the explicit `intermediate_size` when the
+        // checkpoint disables auto-adjust (LFM2.5-2.6B: 10752), else the derived
+        // formula (LFM2.5-VL-3B: hidden*4 rounded to block_multiple_of = 8192).
+        // Reading the explicit value is what lets a non-auto-adjust checkpoint
+        // load its `feed_forward.w1` at all.
+        let intermediate_size = match self.intermediate_size {
+            Some(n) if !self.block_auto_adjust_ff_dim => n,
+            _ => self.compute_intermediate_size(),
+        };
+        // Nested `rope_parameters.rope_theta` wins over the flat field's default
+        // when a checkpoint carries it (LFM2.5-2.6B omits the flat one).
+        let rope_theta = self
+            .rope_parameters
+            .as_ref()
+            .and_then(|rp| rp.rope_theta)
+            .unwrap_or(self.rope_theta);
         Config {
             vocab_size: self.vocab_size,
             hidden_size: self.hidden_size,
@@ -112,7 +165,7 @@ impl Lfm2Config {
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
             norm_eps: self.norm_eps,
-            rope_theta: self.rope_theta,
+            rope_theta,
             max_position_embeddings: self.max_position_embeddings,
             conv_l_cache: self.conv_l_cache,
             conv_bias: self.conv_bias,

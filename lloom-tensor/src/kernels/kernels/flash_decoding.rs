@@ -108,6 +108,12 @@ impl FlashKernel {
         Self::name("flash_decoding_combine", dtype, head_dim)
     }
 
+    /// The single-pass kernel for one `(dtype, head_dim)` — the `n_chunks == 1`
+    /// path that writes `out` directly, skipping the partial+combine round-trip.
+    pub fn single(dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
+        Self::name("flash_decoding_single", dtype, head_dim)
+    }
+
     fn name(stem: &str, dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
         if !FLASH_HEAD_DIMS.contains(&head_dim) {
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
@@ -126,6 +132,7 @@ impl FlashKernel {
             for head_dim in FLASH_HEAD_DIMS {
                 names.push(Self::name("flash_decoding_partial", dtype, head_dim).unwrap());
                 names.push(Self::name("flash_decoding_combine", dtype, head_dim).unwrap());
+                names.push(Self::name("flash_decoding_single", dtype, head_dim).unwrap());
             }
         }
         names
@@ -344,6 +351,56 @@ pub fn call_flash_decoding(
     n_chunks: usize,
     itype: FlashDType,
 ) -> Result<(), MetalKernelError> {
+    // The single-chunk fast path: at `n_chunks == 1` the split-K machinery
+    // manufactures no parallelism (one chunk is one threadgroup per head), and
+    // the two-pass path would still write the answer to `partials` scratch, then
+    // pay a SECOND dispatch (`flash_decoding_combine`) plus a device-memory
+    // round-trip to read it back and write `out`. `flash_decoding_single` does
+    // the whole thing in one dispatch, writing `out` directly — bit-identical to
+    // the two-pass path at one chunk (§2.3.5a; the combine's rescale is
+    // `exp(0) = 1` and its denom is `sums[0]`, so both reduce to `acc / sums[0]`).
+    //
+    // `scratch`/`combine_params`/`walk_order` are still allocated by the caller
+    // but go unread here — sizing them is cheap and the caller does not know the
+    // chunk count until it has the params. `chunk_table` is likewise unused: at
+    // one chunk the table is the identity and the range is `[0, n_keys)`.
+    if n_chunks == 1 {
+        let name = FlashKernel::single(itype, head_dim)?;
+        let pipeline =
+            kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+        let encoder = ep.encoder();
+        let encoder: &ComputeCommandEncoder = encoder.as_ref();
+        encoder.set_compute_pipeline_state(&pipeline);
+        debug_group!(encoder, "flash_decoding single hd={head_dim}");
+
+        set_params!(
+            encoder,
+            (
+                (q_buffer, q_offset),
+                (k_buffer, k_offset),
+                (v_buffer, v_offset),
+                Output::new(output),
+                partial_params
+            )
+        );
+
+        // One threadgroup per head — the single chunk IS the cache, so there is
+        // no `depth` axis to split over (contrast the partial pass's
+        // `depth = n_chunks`).
+        let grid_dims = MTLSize {
+            width: 1,
+            height: n_q_heads,
+            depth: 1,
+        };
+        let group_dims = MTLSize {
+            width: 32 * 32,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatch_thread_groups(grid_dims, group_dims);
+        return Ok(());
+    }
+
     // Pass 1 -- partials.
     {
         let name = FlashKernel::partial(itype, head_dim)?;

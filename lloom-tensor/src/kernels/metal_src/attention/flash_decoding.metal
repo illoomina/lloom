@@ -182,46 +182,51 @@ struct FlashCombineParams {
 /// before the combine, which is two per attention layer per step and is the
 /// caller's obligation.
 ///
-/// `T` is the storage type and accumulation is in `float` regardless: §8.1
-/// principle 4, and §9.1a records that this class cannot be shrunk to f16
-/// because the combine merges what the accumulation bought.
-template <typename T, int D>
-[[kernel]] void flash_decoding_partial(
-    const device T* queries [[buffer(0)]],
-    const device T* keys [[buffer(1)]],
-    const device T* values [[buffer(2)]],
-    // Partials, laid out as §9.1a's PLANES layout: the accumulator plane is
-    // [head][chunk][dim] and the statistics plane is [head][chunk][2].
-    device float* partials [[buffer(3)]],
-    device float* sums [[buffer(4)]],
-    device float* maxs [[buffer(5)]],
-    // The chunk table: `chunk_table[c]` is the FIRST PAGE of chunk `c`.
-    // At B=1 contiguous it is the identity, and it is bound anyway -- see the
-    // header note on why a B=1 gate cannot otherwise discriminate.
-    const device uint* chunk_table [[buffer(6)]],
-    const device FlashPartialParams* params [[buffer(7)]],
-    uint3 tid [[threadgroup_position_in_grid]],
-    uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int BN = 32;
-  constexpr int BD = 32;
-  constexpr int elem_per_thread = D / BD;
-
+/// The shared attention core: one threadgroup computes online-softmax
+/// attention over a **contiguous KV range** `[range_start, range_end)`, in
+/// `float` regardless of the storage type `T` (§8.1 principle 4). Both output
+/// tails below call this — `flash_decoding_partial` writes the *unnormalised*
+/// state to scratch for a later combine, and `flash_decoding_single` divides by
+/// the denominator and writes `out` directly. Factoring it here is what keeps
+/// the two arms one arithmetic body: a divergence between the split path and the
+/// single-chunk path would be a silent wrong answer on exactly the band the
+/// single path is FOR (§3.5).
+///
+/// Returns, per lane, the accumulated `o[]` (NOT yet divided by the
+/// denominator, NOT yet reduced across the simdgroup transpose), and by
+/// reference the threadgroup-merged `sum_exp_score`, `new_max`, the cross-simd
+/// `factor` the caller's transpose must apply, and `empty`. The caller owns the
+/// transpose+write because the two tails write to different places (scratch vs
+/// `out`) and in different dtypes.
+///
+/// The token step is `k_token_stride` — a PARAMETER, not a `constexpr`. This is
+/// the line #200 could not vary and §9.1d asks for, and it is the reason this
+/// family exists separately from `sdpa_vector` (whose stride is compile-time):
+/// a strided or `narrow`ed KV cache, and §10.7's int8 KV, are a different value
+/// here rather than a different kernel. The single-chunk tail below inherits
+/// that capability, which is why it is NOT a rewiring to `sdpa_vector`.
+template <typename T, int D, int BN, int BD, int elem_per_thread>
+inline void flash_decoding_core(
+    const device T* queries,
+    const device T* keys,
+    const device T* values,
+    const FlashPartialParams p,
+    int range_start,
+    int range_end,
+    threadgroup float* outputs,
+    threadgroup float* max_scores,
+    threadgroup float* sum_exp_scores,
+    thread float (&o)[elem_per_thread],
+    thread float& out_sum_exp_score,
+    thread float& out_new_max,
+    thread float& out_factor,
+    thread bool& out_empty,
+    uint head_idx,
+    uint simd_gid,
+    uint simd_lid) {
   typedef float U;
 
-  threadgroup U outputs[BN * BD];
-  threadgroup U max_scores[BN];
-  threadgroup U sum_exp_scores[BN];
-
-  // One structure load into registers (§11.3e). Not `params->field` per use:
-  // `device` is general memory where `constant` is a cached read-only space,
-  // and these are read inside the key loop.
-  const FlashPartialParams p = *params;
   const int gqa_factor = p.gqa_factor;
-  const int n_keys = p.n_keys;
-  const int chunk_size = p.chunk_size;
-  const int pages_per_chunk = p.pages_per_chunk;
-  const int page_size = p.page_size;
   const size_t k_head_stride = p.k_head_stride;
   const size_t v_head_stride = p.v_head_stride;
   const size_t k_token_stride = p.k_token_stride;
@@ -229,46 +234,13 @@ template <typename T, int D>
   const float scale = p.scale;
   const float softcapping = p.softcapping;
 
-  const int head_idx = tid.y;
-  const int chunk_idx = tid.z;
-  const int kv_head_idx = head_idx / gqa_factor;
-
-  // The chunk's KV range, resolved ONCE at chunk entry rather than per key
-  // (§10.3d). At `k = 1` this is one table read; at `k > 1` it is `k` of them,
-  // and either way it is hoisted out of the loop below, so the indirection is
-  // 1 : 8192 bytes of key data at page size 256 rather than a dependent load in
-  // the innermost loop of a bandwidth-bound kernel.
-  //
-  // `chunk_table[c]` names a PAGE, and a chunk spans `pages_per_chunk` of them.
-  // Under a contiguous cache the pages of one chunk are consecutive, so the
-  // first page determines the range; a paged cache would resolve each page
-  // separately here, which is the loop this shape leaves room for.
-  const uint first_page = chunk_table[chunk_idx];
-  const int chunk_start = (int)first_page * page_size;
-  int chunk_end = chunk_start + pages_per_chunk * page_size;
-  if (chunk_end > n_keys) {
-    chunk_end = n_keys;
-  }
-  // The last chunk is partial, and the clamp above is what walks the LIVE
-  // count rather than the reserved one -- merging over a full last chunk folds
-  // in uninitialised memory, which §9.1a records as a silent wrong answer that
-  // no size check catches.
-  //
-  // The extent is `pages_per_chunk * page_size` and NOT `chunk_size`, though
-  // the two are equal by construction. Deriving it from the two fields the
-  // table is indexed with keeps one source for the range: `chunk_size` is
-  // carried for the descriptor's completeness and a kernel that read it here
-  // could disagree with the table if a caller ever set them inconsistently.
-  (void)chunk_size;
+  const int kv_head_idx = (int)head_idx / gqa_factor;
 
   thread U q[elem_per_thread];
   thread U k[elem_per_thread];
-  thread U o[elem_per_thread];
 
   queries += head_idx * D + simd_lid * elem_per_thread;
 
-  // The token step is `k_token_stride` -- a PARAMETER. This is the line #200
-  // could not vary and §9.1d asks for; see the header note.
   const device T* k_base =
       keys + kv_head_idx * k_head_stride + simd_lid * elem_per_thread;
   const device T* v_base =
@@ -284,11 +256,11 @@ template <typename T, int D>
   U max_score = -INFINITY;
   U sum_exp_score = 0;
 
-  // Walk this chunk's keys only. The trip count is uniform across the
+  // Walk this range's keys only. The trip count is uniform across the
   // simdgroup, so §3.3 makes the bound a compare and a branch rather than a
   // divergence -- which is the CUDA-derived intuition that section corrects,
   // and it is why a dynamic `kv_len` needs no bucketing (§10.4).
-  for (int t = chunk_start + (int)simd_gid; t < chunk_end; t += BN) {
+  for (int t = range_start + (int)simd_gid; t < range_end; t += BN) {
     const device T* kp = k_base + (size_t)t * k_token_stride;
     const device T* vp = v_base + (size_t)t * v_token_stride;
 
@@ -332,13 +304,88 @@ template <typename T, int D>
   U factor = fast::exp(max_score - new_max);
   sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
 
-  // An EMPTY chunk contributes nothing and must not poison the merge. It arises
-  // when `n_keys` does not fill the last chunk's first key -- reachable
-  // whenever `chunk_start >= n_keys`, which a caller can produce by sizing for
-  // more chunks than the step needs. `m = -INFINITY` with `l = 0` is the
-  // identity of the online-softmax merge, and writing it is what makes a
-  // reserved-but-unused chunk safe rather than a source of NaN.
-  const bool empty = (chunk_start >= chunk_end);
+  // An EMPTY range contributes nothing and must not poison the merge. It arises
+  // when `n_keys` does not fill the range's first key -- reachable whenever
+  // `range_start >= range_end`, which a caller can produce by sizing for more
+  // chunks than the step needs. `m = -INFINITY` with `l = 0` is the identity of
+  // the online-softmax merge, and returning it is what makes a reserved-but-
+  // unused chunk safe rather than a source of NaN.
+  out_empty = (range_start >= range_end);
+  out_sum_exp_score = sum_exp_score;
+  out_new_max = new_max;
+  out_factor = factor;
+}
+
+/// `T` is the storage type and accumulation is in `float` regardless: §8.1
+/// principle 4, and §9.1a records that this class cannot be shrunk to f16
+/// because the combine merges what the accumulation bought.
+template <typename T, int D>
+[[kernel]] void flash_decoding_partial(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    // Partials, laid out as §9.1a's PLANES layout: the accumulator plane is
+    // [head][chunk][dim] and the statistics plane is [head][chunk][2].
+    device float* partials [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    // The chunk table: `chunk_table[c]` is the FIRST PAGE of chunk `c`.
+    // At B=1 contiguous it is the identity, and it is bound anyway -- see the
+    // header note on why a B=1 gate cannot otherwise discriminate.
+    const device uint* chunk_table [[buffer(6)]],
+    const device FlashPartialParams* params [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+
+  typedef float U;
+
+  threadgroup U outputs[BN * BD];
+  threadgroup U max_scores[BN];
+  threadgroup U sum_exp_scores[BN];
+
+  // One structure load into registers (§11.3e). Not `params->field` per use:
+  // `device` is general memory where `constant` is a cached read-only space,
+  // and these are read inside the key loop.
+  const FlashPartialParams p = *params;
+  const int n_keys = p.n_keys;
+  const int pages_per_chunk = p.pages_per_chunk;
+  const int page_size = p.page_size;
+
+  const int head_idx = tid.y;
+  const int chunk_idx = tid.z;
+
+  // The chunk's KV range, resolved ONCE at chunk entry rather than per key
+  // (§10.3d). At `k = 1` this is one table read; at `k > 1` it is `k` of them,
+  // and either way it is hoisted out of the loop, so the indirection is
+  // 1 : 8192 bytes of key data at page size 256 rather than a dependent load in
+  // the innermost loop of a bandwidth-bound kernel.
+  //
+  // `chunk_table[c]` names a PAGE, and a chunk spans `pages_per_chunk` of them.
+  // Under a contiguous cache the pages of one chunk are consecutive, so the
+  // first page determines the range; a paged cache would resolve each page
+  // separately here, which is the loop this shape leaves room for.
+  const uint first_page = chunk_table[chunk_idx];
+  const int chunk_start = (int)first_page * page_size;
+  int chunk_end = chunk_start + pages_per_chunk * page_size;
+  if (chunk_end > n_keys) {
+    chunk_end = n_keys;
+  }
+  // The last chunk is partial, and the clamp above is what walks the LIVE
+  // count rather than the reserved one -- merging over a full last chunk folds
+  // in uninitialised memory, which §9.1a records as a silent wrong answer that
+  // no size check catches.
+
+  thread U o[elem_per_thread];
+  U sum_exp_score, new_max, factor;
+  bool empty;
+  flash_decoding_core<T, D, BN, BD, elem_per_thread>(
+      queries, keys, values, p, chunk_start, chunk_end, outputs, max_scores,
+      sum_exp_scores, o, sum_exp_score, new_max, factor, empty, head_idx,
+      simd_gid, simd_lid);
 
   // The stride between two heads' partials is what the region was SIZED for,
   // which under `Sizing::Reserve` and `Sizing::Bucket` exceeds what this step
@@ -372,6 +419,88 @@ template <typename T, int D>
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_lid == 0) {
       acc_out[simd_gid * elem_per_thread + i] = empty ? 0.0f : v;
+    }
+  }
+}
+
+/// The single-chunk path: `n_chunks == 1` attention in ONE dispatch, writing
+/// `out` directly with no scratch and no combine.
+///
+/// # Why this exists, and why it is not the combine made cheap
+///
+/// `flash_chunk_count` returns 1 whenever `kv_len <= chunk_size`, which is the
+/// COMMON decode band — at the shipped `chunk_size = 256` a crown decode at
+/// `kv_len ≈ 234` is one chunk. The split-K machinery buys nothing there: one
+/// chunk is no parallelism to manufacture (§10.4's whole argument is that
+/// *multiple* chunks fill a GPU wanting hundreds of threadgroups). But the
+/// two-pass path still PAID for it — `flash_decoding_partial` writes the answer
+/// to *scratch* device memory, then a second dispatch (`flash_decoding_combine`)
+/// reads it back and writes `out`. That second dispatch plus the partials
+/// round-trip through global memory is the **+0.989 % `n_chunks = 1` residual**
+/// §10.4d/§10.4e measured and left in the INEXPRESSIVE class: it is not a
+/// microarchitectural mystery, it is a mandatory extra dispatch and a
+/// device-memory round-trip that `sdpa` does not pay. This kernel is the
+/// design's own *"single-pass attention is FlashDecoding with n_chunks == 1"*
+/// (`flash_decoding.rs`), finally taken.
+///
+/// # Bit-identity with the two-pass path at n_chunks == 1 (§2.3.5a)
+///
+/// The combine at one chunk computes `denom = sums[0] * exp(maxs[0] - maxs[0])`
+/// = `sums[0]`, and `out[i] = partials[0][i] * exp(0) / denom` = `acc[i] /
+/// sums[0]`. The `exp(0) = 1` and the `* 1` are exact in IEEE-754, so this
+/// kernel's `o[i] * factor / sum_exp_score` — the SAME transpose+`factor` the
+/// partial's scratch tail applies, then one division — reproduces the two-pass
+/// output BIT for BIT. It shares `flash_decoding_core`, so the scores,
+/// accumulation and reduction are literally the same instructions; only the
+/// write differs (`out` in dtype `T` vs unnormalised scratch in `float`).
+template <typename T, int D>
+[[kernel]] void flash_decoding_single(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    const device FlashPartialParams* params [[buffer(4)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+
+  typedef float U;
+
+  threadgroup U outputs[BN * BD];
+  threadgroup U max_scores[BN];
+  threadgroup U sum_exp_scores[BN];
+
+  const FlashPartialParams p = *params;
+  const int head_idx = tid.y;
+
+  // The whole live range, `[0, n_keys)`. This kernel is dispatched only when
+  // the caller computed `n_chunks == 1`, so the single chunk IS the cache: no
+  // table read, and `range_start = 0` cannot make the range empty for a real
+  // step (`n_keys >= 1` at decode).
+  thread U o[elem_per_thread];
+  U sum_exp_score, new_max, factor;
+  bool empty;
+  flash_decoding_core<T, D, BN, BD, elem_per_thread>(
+      queries, keys, values, p, 0, p.n_keys, outputs, max_scores,
+      sum_exp_scores, o, sum_exp_score, new_max, factor, empty, head_idx,
+      simd_gid, simd_lid);
+
+  // Normalise and write `out` in dtype `T`. `inv_denom` guards an all-empty
+  // range the same way the combine's does (`denom > 0`), so a step with no keys
+  // writes zeros rather than NaN -- unreachable at decode, kept for parity with
+  // the combine it replaces.
+  const U inv_denom = (!empty && sum_exp_score > 0) ? 1.0f / sum_exp_score : 0.0f;
+  device T* head_out = out + (size_t)head_idx * D;
+  for (int i = 0; i < elem_per_thread; i++) {
+    outputs[simd_lid * BD + simd_gid] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    U v = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lid == 0) {
+      head_out[simd_gid * elem_per_thread + i] = static_cast<T>(v * inv_denom);
     }
   }
 }
@@ -596,6 +725,16 @@ static_assert(sizeof(FlashCombineParams) == 8, "FlashCombineParams layout");
       device type* out [[buffer(3)]],                                         \
       const device FlashCombineParams* params [[buffer(4)]],                  \
       device uint* walk_order [[buffer(5)]],                                  \
+      uint3 tid [[threadgroup_position_in_grid]],                             \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
+      uint simd_lid [[thread_index_in_simdgroup]]);                           \
+  template [[host_name("flash_decoding_single_" #type "_" #head_dim)]]        \
+  [[kernel]] void flash_decoding_single<type, head_dim>(                      \
+      const device type* queries [[buffer(0)]],                               \
+      const device type* keys [[buffer(1)]],                                  \
+      const device type* values [[buffer(2)]],                                \
+      device type* out [[buffer(3)]],                                         \
+      const device FlashPartialParams* params [[buffer(4)]],                  \
       uint3 tid [[threadgroup_position_in_grid]],                             \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
       uint simd_lid [[thread_index_in_simdgroup]]);

@@ -59,15 +59,15 @@ extern crate accelerate_src;
 mod sha256;
 
 use anyhow::{Context, Result};
-use candle::{DType, Device, Tensor};
-use lloom::nn::VarBuilder;
-use lloom::generation::poll::PollMechanism;
-use lloom::generation::token_ring::TokenRing;
-use lloom::generation::{LogitsProcessor, Sampling};
-use lloom::models::lfm2::{
-    AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model,
-};
+use candle::{DType, Device};
 use clap::Parser;
+use lloom::generation::poll::PollMechanism;
+use lloom::generation::{
+    Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackArms, ReadbackCounters,
+    ReadbackStrategy, Ring, Sampling,
+};
+use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model};
+use lloom::nn::{DecodeOptions, IdentityProposer, Session, VarBuilder};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -233,6 +233,35 @@ struct Args {
     /// shape.
     #[arg(long)]
     nonblocking_eos: bool,
+
+    /// Forward passes the host may enqueue before it has learned the previous
+    /// step's EOS, on `--token-ring` runs: `0` (the incumbent order — publish,
+    /// wait, then encode the next forward) or `1` (encode the next forward,
+    /// then wait, while it runs). `1` is the arm that closes the non-GPU gap
+    /// (`design/docs/decode-driver-design.md`): the GPU always has the next
+    /// step queued, so nothing idles between tokens.
+    ///
+    /// **`1` leaves the cache one position past an EOS** — the forward that
+    /// consumed the EOS token was already enqueued when the host learned it —
+    /// and the crown configuration's cache (`KvAppend=Cat`, `ConvState=Shuffle`)
+    /// cannot rewind. So it is refused with `--turns` above 1 rather than
+    /// letting turn two prefill onto a polluted cache and move the digest.
+    /// Reported as `overrun` on the `RESULT` line.
+    ///
+    /// Off (`0`) by default per §7.1a: the evidence is what this flag lets a
+    /// run take.
+    #[arg(long, default_value_t = 0)]
+    lookahead: usize,
+
+    /// How often the decode loop commits and prunes the in-flight queue:
+    /// `per-token` (the incumbent ring arm's cadence) or `steps:<N>`.
+    ///
+    /// Only real under `--lookahead 1`: with the wait before the next encode
+    /// the publish must be committed before the host can wait on it, so the
+    /// loop commits per token whatever this says, and `commits` on the
+    /// `RESULT` line reports which happened.
+    #[arg(long, default_value = "per-token")]
+    commit_budget: String,
 
     /// How the host waits for a committed command buffer (`DESIGN.md` §11.5o,
     /// issue #559; §11.5t, issue #583).
@@ -484,6 +513,21 @@ fn metal_cflags_arm() -> String {
     }
 }
 
+/// The `HazardKey` arm the process installed, from the resolved value.
+fn hazard_key_arm() -> &'static str {
+    #[cfg(feature = "metal")]
+    {
+        match candle::metal_backend::hazard_key() {
+            candle::metal_backend::HazardKey::Pointer => "Pointer",
+            candle::metal_backend::HazardKey::Range => "Range",
+        }
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        "n/a"
+    }
+}
+
 /// The `MergedUnit` arm (#477): whether the sixteen non-MLX sources were
 /// compiled as one translation unit.
 fn merged_unit_arm() -> &'static str {
@@ -543,7 +587,7 @@ fn main() -> Result<()> {
         "release mode requires debug-labels OFF (DESIGN.md §14.5)"
     );
 
-    let model_dir = args.model_dir.or_else(default_model_dir).context(
+    let model_dir = args.model_dir.clone().or_else(default_model_dir).context(
         "no --model-dir given and the LFM2.5-VL-3B snapshot was not found in the HF cache",
     )?;
 
@@ -669,7 +713,7 @@ fn main() -> Result<()> {
     };
 
     let model = Model::new(&config, vb).context("constructing LFM2 model")?;
-    let mut cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
+    let cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
 
     let sampling = if args.temperature <= 0. {
         Sampling::ArgMax
@@ -755,428 +799,142 @@ fn main() -> Result<()> {
         .to_vec();
     anyhow::ensure!(!prompt_ids.is_empty(), "prompt tokenized to nothing");
 
-    // Reserved BEFORE the window opens. A `Vec` growth inside the timed region
-    // would be an allocation the user does not pay for on a steady-state path
-    // and this harness would be measuring its own bookkeeping (§6.4a).
-    let mut tokens: Vec<u32> = Vec::with_capacity(args.n + args.turns + 1);
-    // Per-step wall, for the steady-state figure and the distribution. This is a
-    // push into a reserved `Vec` of `u64` nanoseconds -- one `Instant::elapsed`
-    // per token, which is the same `clock_gettime_nsec_np` against a 24 MHz
-    // timebase the profiler stamps (§3.4b) and is not a per-token *series* in
-    // §14.5's sense: nothing is written, sampled or read back.
-    let mut step_ns: Vec<u64> = Vec::with_capacity(args.n + args.turns + 1);
-    // Only written under `--sample-split`, and reserved either way so the flag
-    // does not change the allocation behaviour of the path it measures.
-    let mut sample_ns: Vec<u64> = Vec::with_capacity(args.n + args.turns + 1);
-
-    // Starts at 0, not at `prompt_ids.len()`: turn 0's prefill is what appends
-    // the prompt, so the forward pass must be told the cache is empty and
-    // `kv_len` advances by the turn's length after it (`lfm2-determinism`
-    // `main.rs:891`, `:982-985`). Seeding it with the prompt length instead
-    // double-counts and the attention mask fails to broadcast.
-    let mut kv_len = 0usize;
-    let mut hit_eos = false;
-    let mut turns_run = 0usize;
-    let mut prefill_submit_ns: u64 = 0;
-
-    // ---- ring-arm state, allocated before the window --------------------
+    // ---- the readback strategy and the loop's knobs, before the window ---
     //
-    // `ring` is the persistent input slot plus the device-resident EOS set;
-    // `history` is what discharges the digest obligation.
-    //
-    // **The digest is why this is not just the ring.** §14.5's load-bearing
-    // clause is that the token digest is taken *after* the window closes, which
-    // is what makes a run verifiable without instrumenting what is measured --
-    // and #511 names it as the constraint: a loop that never learns its tokens
-    // cannot hash them. Reading each token back to push it is the round trip
-    // this arm exists to remove, so the tokens are accumulated **device-side**
-    // into one `[n]` slot with the same `slice_set` the ring uses, and read
-    // back **once**, after the clock stops. So the ring arm learns its tokens
-    // exactly as late as the baseline hashes them.
-    //
-    // The engagement counter is on the `RESULT` line for §11.5c's reason: its
-    // first sweep measured the blit against itself, read `unresolved` on every
-    // dimension, and *was caught by counters and by nothing else*.
-    let mut ring: Option<TokenRing> = None;
-    let mut history: Option<Tensor> = None;
-    let mut ring_publishes: u64 = 0;
-    // `flush_and_prune`'s returned surviving count, maxed over the run.
-    //
-    // #493 repaired the unbounded `Commands::in_flight` and returns this count
-    // **so a caller can assert rather than assume** (§2.4), and nothing had
-    // observed the repair working -- because the path that grows `in_flight` is
-    // the path nothing took. This arm is what makes it observable: a 267-token
-    // generation must not hold 267 command buffers.
-    let mut max_in_flight: usize = 0;
-    let mut poll_iters: u64 = 0;
-    // Steps on which the non-blocking poll gave up and took the blocking read
-    // (#535). **A nonzero value is not a failure** -- the fallback computes the
-    // same answer -- but it says the peek was declining, which is what makes
-    // the arm's engagement readable rather than assumed (§2.4).
-    let mut poll_fallbacks: u64 = 0;
-    // EOS tokens published but never pushed. **Counted rather than inferred
-    // from `hit_eos`, and that is a repair rather than a style choice:** EOS
-    // ends *each turn*, so a `--turns 3` run can publish three of them, and the
-    // first version of the reconciliation below inferred `+1` from the bool.
-    // It fired on a 3-turn EOS run -- 241 published against 238 + 1 -- which is
-    // exactly the shape of defect this wiring was registered to surface, in the
-    // accounting rather than in the mechanism. A bool cannot count.
-    let mut ring_eos_publishes: u64 = 0;
+    // The loop is `Session::decode` (`design/docs/decode-driver-design.md`,
+    // stage 1) and this harness only SELECTS: which readback arm, whether the
+    // host encodes ahead of the EOS it has not yet learned, and how often the
+    // in-flight queue is pruned. The `RESULT` line renders the arms from the
+    // strategy that ran and the counters from the loop that ran them.
+    let budget = CommitBudget::from_str(&args.commit_budget).map_err(anyhow::Error::msg)?;
+    anyhow::ensure!(
+        args.lookahead <= 1,
+        "--lookahead must be 0 or 1: the ring holds one input slot and the overrun past an \
+         EOS is bounded at one forward only for a lookahead of at most one"
+    );
+    anyhow::ensure!(
+        args.lookahead == 0 || args.token_ring,
+        "--lookahead 1 needs --token-ring: the blocking arm learns EOS inside its readback, \
+         so there is nothing to encode ahead of"
+    );
+    anyhow::ensure!(
+        args.lookahead == 0 || args.turns.max(1) == 1,
+        "--lookahead 1 with --turns {}: the forward enqueued past an EOS leaves the cache one \
+         position long, and the next turn would prefill onto it and move the digest; this \
+         cache cannot rewind (DESIGN.md §10.2a). Use --turns 1 or --lookahead 0.",
+        args.turns
+    );
+    let opts = DecodeOptions {
+        max_tokens: args.n,
+        budget,
+        lookahead: args.lookahead,
+        sample_split: args.sample_split,
+    };
+    // The ring's device-side history is sized for the whole run — every turn
+    // — and refuses to overflow rather than silently dropping an id.
+    let capacity = args.n + args.turns + 1;
 
     // ---- the timed window --------------------------------------------------
     //
-    // One clock over the whole loop. It opens before the first prefill and closes
-    // after the last token is pushed, so it contains every prefill, every forward
-    // pass, every `sample()` and every EOS test -- which is what a user waits
-    // for. Nothing inside it writes, allocates or reads anything back except what
-    // the decode itself requires.
-    let run_start = std::time::Instant::now();
-
-    'turns: for turn in 0..args.turns.max(1) {
-        let turn_ids: Vec<u32> = if turn == 0 {
-            prompt_ids.clone()
-        } else {
-            let follow_up = FOLLOW_UPS[(turn - 1) % FOLLOW_UPS.len()];
-            let text = format!("<|im_start|>user\n{follow_up}<|im_end|>\n<|im_start|>assistant\n");
-            tokenizer
-                .encode(text.as_str(), false)
-                .map_err(|e| anyhow::anyhow!("tokenizing follow-up: {e}"))?
-                .get_ids()
-                .to_vec()
-        };
-
-        let prefill_start = std::time::Instant::now();
-        let input = Tensor::new(turn_ids.as_slice(), &device)?.unsqueeze(0)?;
-        let mut logits = model
-            .forward(&input, kv_len, &mut cache)
-            .context("prefill forward pass")?
-            .squeeze(0)?;
-        kv_len += turn_ids.len();
-        turns_run = turn + 1;
-        // Accumulated across turns; reported apart from the decode rate because
-        // prefill is a different shape of work (§6.6) and folding it in is the
-        // whole-generation average this project has twice been misled by.
-        //
-        // **This is SUBMISSION time, not execution time, and the field name says
-        // so.** Candle is asynchronous: `forward` returns once the work is
-        // encoded. `lfm2-decode-profile` brackets its prefill with
-        // `device.synchronize()` on both sides (`main.rs:1666`, `:1694`) and so
-        // reports ~90 ms where this reports ~30 ms; the difference is the
-        // prefill's GPU tail, which here lands in the first decode steps and is
-        // what `--warmup` excludes. Draining here would make the two comparable
-        // -- and would also put a synchronization in the release path that a
-        // user's decode loop does not have, which is the thing this binary
-        // exists not to do. So it is named honestly instead.
-        prefill_submit_ns += prefill_start.elapsed().as_nanos() as u64;
-
-        loop {
-            if tokens.len() >= args.n {
-                break 'turns;
-            }
-
-            let step_start = std::time::Instant::now();
-
-            // **Inside the window, and this is the difference from the profiler.**
-            // §11.5a prices this readback at 441 µs/token and classifies it
-            // EXPOSED: the host waits on a specific completion, so overlap cannot
-            // hide it. The profiler's `wall` opens after this call; a user does
-            // not get to.
-            // Under `--sample-split` the forward pass is drained BEFORE the
-            // sample call is timed. Without this the two are not separable at
-            // all: `forward()` returns having only *encoded* the work, and
-            // `sample()` is then the call that blocks on its completion, so a
-            // naive split attributes the whole forward pass to sampling. The
-            // first version of this diagnostic did exactly that and read
-            // **16.53 ms, 93 % of the step** -- a figure that is real as an
-            // interval and wrong as an attribution, and it is recorded in the
-            // write-up because it is the trap the profiler's own window shape
-            // avoids by synchronizing explicitly (`lfm2-decode-profile:1839`).
-            if args.sample_split {
-                device.synchronize()?;
-            }
-            let sample_start = std::time::Instant::now();
-
-            if args.token_ring {
-                // ---- the ring arm ------------------------------------------
-                //
-                // The token is sampled into a **device** tensor and never comes
-                // back: `publish` writes it into the persistent input slot in
-                // place and computes the EOS flag against the uploaded id set,
-                // both GPU-side. §11.5g's write leg is *deleted rather than
-                // relocated* -- there is nothing to upload because nothing came
-                // down.
-                let sampled = logits_processor
-                    .sample_argmax_on_device(&logits)
-                    .context("device-resident argmax")?;
-                let r = match ring.as_ref() {
-                    Some(r) => r,
-                    None => {
-                        // Allocated on first use: `TokenRing::new` wants a first
-                        // input, and the slot's contents before the first
-                        // `publish` are never read.
-                        ring = Some(TokenRing::new(0, &eos_ids, &device)?);
-                        ring.as_ref().unwrap()
-                    }
-                };
-                // On the non-blocking arm the publish is STAMPED with this
-                // step's ordinal, so the host can poll for *this* step rather
-                // than for a flag it cannot date (#535). Ordinals start at 1
-                // because 0 is the unpublished sentinel.
-                //
-                // Without the stamp `eos == 0` is two states a non-blocking
-                // reader cannot separate -- *published, not EOS* and *not yet
-                // published* -- and the blocking read was silently discharging
-                // that ambiguity by waiting. The blocking arm is unchanged and
-                // still calls the unstamped `publish`.
-                if args.nonblocking_eos {
-                    ring_publishes += 1;
-                    r.publish_step(&sampled, Some(ring_publishes as u32))
-                        .context("publishing the token")?;
-                } else {
-                    r.publish(&sampled).context("publishing the token")?;
-                    ring_publishes += 1;
-                }
-
-                // Commit without waiting, and prune. **This is the call that
-                // makes the arm non-blocking, and it is also the only thing
-                // pruning `Commands::in_flight` once the per-token readback is
-                // gone** (§11.5h): the `Vec`'s only two shrink sites are inside
-                // the two blocking calls this arm exists to stop calling.
-                // Buffer *reclamation* is safe without a wait -- the completion
-                // handler marks the epoch asynchronously -- and the `Vec` is
-                // not, which is the asymmetry #493 found.
-                //
-                // Metal-only, and `cfg`'d rather than assumed: §14.1 makes not
-                // breaking the CPU and CUDA backends a hard constraint, and the
-                // whole `metal_backend` module is behind the `metal` feature.
-                #[cfg(feature = "metal")]
-                if let Device::Metal(m) = &device {
-                    let in_flight = m.flush_and_prune()?;
-                    max_in_flight = max_in_flight.max(in_flight);
-                }
-
-                // The poll, and **what it is is narrower than "a poll" and is
-                // stated rather than implied.** `wait()` is called once, then
-                // the EOS flag is read -- and that read is itself blocking,
-                // because `to_vec1` reaches `to_cpu`'s
-                // `flush_and_wait_current`. So this is a **hint before a
-                // blocking read**, not a spin-until-published loop: the arm
-                // exercises `PollMechanism`'s seam and the readback it waits
-                // on, and it does NOT yet replace the wait with a poll. Doing
-                // that needs a non-blocking read of the flag, which is a
-                // `candle-core` change rather than a harness one and is
-                // deliberately not bundled here.
-                //
-                // What the seam is worth today is that the three arms are
-                // reachable and selectable from one binary, so the measurement
-                // #500 owes can discriminate them without a rebuild.
-                //
-                // The flag is **1 byte** -- not the token. That is still a
-                // round trip and the module says so (`token_ring.rs:169-172`);
-                // what it is not is the *token's* round trip, which is what
-                // deletes the write leg. §15.2 #10a is discharged in
-                // `poll.rs`: the producer structurally cannot announce, because
-                // a compute kernel cannot signal an `MTLEvent` (§3.7b), while
-                // the host polling a kernel-written buffer is measured reliable
-                // at 1998-2000 of 2000 (§3.7g).
-                // **#535 replaces the read above on the `--nonblocking-eos`
-                // arm, and the paragraph above describes the OTHER arm**, which
-                // is unchanged and still ships by default.
-                //
-                // Here `wait()` runs between *repeated* non-blocking reads
-                // rather than once before a blocking one, so this is the
-                // spin-until-published loop §11.5j says the tree did not
-                // contain -- which is why §11.5l's null on the three poll arms
-                // is a result about the arm as wired and explicitly **untested**
-                // about this shape.
-                let is_eos = if args.nonblocking_eos {
-                    let generation = ring_publishes as u32;
-                    // **Bounded, and the bound falls back rather than failing.**
-                    // `poll_eos` returns `None` both for *not published yet* and
-                    // for *this buffer is not CPU-mapped*, and the second is an
-                    // allocator property (§15.2 #12a) that #454 measures as
-                    // unstable run to run -- so an unbounded loop would HANG on
-                    // a run where the pool happened to hand back a large
-                    // bucket, and it would hang silently. The blocking read is
-                    // the fallback, which is the same fail-closed shape
-                    // §11.5c's `contents()` test uses: the slow path is always
-                    // correct, so the fast one is free to decline.
-                    //
-                    // The budget is deliberately generous against a ~19 ms step
-                    // (§6.6) -- it exists to convert a hang into a counted
-                    // fallback, not to time anything.
-                    const POLL_BUDGET: u64 = 50_000_000;
-                    let mut spins: u64 = 0;
-                    // The watched word, resolved once (#578). See the sibling
-                    // loop in `lfm2-decode-profile` for the argument; `Wfe`
-                    // arms the exclusive monitor on it and every other arm
-                    // ignores it.
-                    //
-                    // SAFETY: the pointer is valid while `r` is alive, and `r`
-                    // outlives this loop.
-                    let watched = unsafe { r.step_addr() };
-                    loop {
-                        poll_iters += 1;
-                        match r.poll_eos(generation) {
-                            Some(eos) => break eos,
-                            None => {
-                                spins += 1;
-                                if spins > POLL_BUDGET {
-                                    // Counted, not silent: a fallback nobody
-                                    // counts is a null that reads as a result
-                                    // (§2.4).
-                                    poll_fallbacks += 1;
-                                    break r.eos_flag().to_vec1::<u8>()?[0] != 0;
-                                }
-                                match watched {
-                                    // Wait for the counter to CHANGE from what
-                                    // the poll just saw, not from a value
-                                    // derived from the ordinal -- the compare
-                                    // exists to skip the wait when the word has
-                                    // already moved.
-                                    Some(p) => {
-                                        let seen = unsafe { p.read_volatile() };
-                                        unsafe { poll.wait_on(p, seen) }
-                                    }
-                                    None => poll.wait(),
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    poll.wait();
-                    poll_iters += 1;
-                    r.eos_flag().to_vec1::<u8>()?[0] != 0
-                };
-
-                if is_eos {
-                    hit_eos = true;
-                    ring_eos_publishes += 1;
-                    if turn + 1 < args.turns.max(1) {
-                        break;
-                    }
-                    break 'turns;
-                }
-
-                // The token joins the device-side history at its own index,
-                // with the same `slice_set` the ring uses. Nothing is read
-                // back; the whole `[n]` slot is read once after the window.
-                let h = match history.as_ref() {
-                    Some(h) => h,
-                    None => {
-                        history =
-                            Some(Tensor::zeros(args.n + args.turns + 1, DType::U32, &device)?);
-                        history.as_ref().unwrap()
-                    }
-                };
-                h.slice_set(&sampled.reshape(1)?, 0, tokens.len())?;
-                // A placeholder keeps `tokens.len()` -- the loop's own budget
-                // and the history's write index -- correct without the value.
-                // It is overwritten from the device after the clock stops, and
-                // a mismatch between the count and what the device holds would
-                // be a defect this harness must not paper over: the count is
-                // asserted against the readback below.
-                tokens.push(u32::MAX);
-
-                if args.sample_split {
-                    sample_ns.push(sample_start.elapsed().as_nanos() as u64);
-                }
-
-                logits = model
-                    .forward(r.input(), kv_len, &mut cache)
-                    .context("decode forward pass")?
-                    .squeeze(0)?;
-                kv_len += 1;
-                step_ns.push(step_start.elapsed().as_nanos() as u64);
-                continue;
-            }
-
-            // ---- the baseline arm, unchanged -------------------------------
-            let next = logits_processor.sample(&logits).context("sampling")?;
-            if args.sample_split {
-                sample_ns.push(sample_start.elapsed().as_nanos() as u64);
-            }
-
-            // **EOS ends the turn WITHOUT being pushed or hashed**, which is
-            // `lfm2-determinism`'s order (`main.rs:1227-1237`: the `break`
-            // precedes `token_hasher.update`) and therefore the order the
-            // canonical pairs in §2.3.8c were taken in. Pushing it here would
-            // move the digest by one token and the gate would read a defect in
-            // the release build that was this harness's own bug.
-            if eos_ids.contains(&next) {
-                hit_eos = true;
-                if turn + 1 < args.turns.max(1) {
-                    break;
-                }
-                break 'turns;
-            }
-
-            tokens.push(next);
-
-            let input = Tensor::new(&[next], &device)?.unsqueeze(0)?;
-            logits = model
-                .forward(&input, kv_len, &mut cache)
-                .context("decode forward pass")?
-                .squeeze(0)?;
-            kv_len += 1;
-
-            // No explicit `device.synchronize()`, and its absence is the point.
-            // The next iteration's `sample()` reads the logits back to the host,
-            // which is itself the synchronization -- so the serialization stays
-            // inherent to the workload rather than being one this harness added.
-            // `lfm2-determinism` has no synchronize either, and a step timed here
-            // is therefore bounded by the readback that opens the NEXT step. The
-            // end-to-end figure is unaffected by where that boundary falls; only
-            // the per-step distribution is, which is why the publishable number
-            // is the end-to-end one.
-            step_ns.push(step_start.elapsed().as_nanos() as u64);
-        }
-    }
-
-    let elapsed = run_start.elapsed();
+    // One clock over the whole loop, inside `run_turns`. It opens before the
+    // first prefill and closes after the last token is produced, so it contains
+    // every prefill, every forward pass, every sample and every EOS test --
+    // which is what a user waits for. The ring arms learn their tokens once,
+    // after each turn's loop, in a single readback of the device-side history;
+    // nothing else inside the window reads anything back except what the
+    // decode itself requires.
+    let run = if !args.token_ring {
+        let rb = Blocking::new(&eos_ids, &device)?;
+        run_turns(
+            &args,
+            &model,
+            cache,
+            rb,
+            &mut logits_processor,
+            &tokenizer,
+            &prompt_ids,
+            &opts,
+        )?
+    } else if args.nonblocking_eos {
+        let rb = Ring::new(&eos_ids, &device, capacity, EosRead::Poll(poll))?;
+        run_turns(
+            &args,
+            &model,
+            cache,
+            rb,
+            &mut logits_processor,
+            &tokenizer,
+            &prompt_ids,
+            &opts,
+        )?
+    } else {
+        let rb = Ring::new(&eos_ids, &device, capacity, EosRead::Blocking)?;
+        run_turns(
+            &args,
+            &model,
+            cache,
+            rb,
+            &mut logits_processor,
+            &tokenizer,
+            &prompt_ids,
+            &opts,
+        )?
+    };
+    let Run {
+        tokens,
+        step_ns,
+        sample_ns,
+        kv_len,
+        hit_eos,
+        turns_run,
+        prefill_submit_ns,
+        elapsed,
+        commits,
+        max_in_flight,
+        overrun,
+        arms,
+        counters,
+    } = run;
+    // **Read back from the strategy that ran, not from the flags.** A wrong
+    // arm compares equal to every run of that arm (§7.1a-i); the strategy is
+    // where the arm actually is.
+    anyhow::ensure!(
+        arms.token_ring == args.token_ring && arms.nonblocking_eos == args.nonblocking_eos,
+        "the strategy that ran renders token_ring={} nonblocking_eos={} against the flags \
+         {}/{}: the arm reported would not be the arm executed (DESIGN.md §7.1a-i)",
+        arms.token_ring,
+        arms.nonblocking_eos,
+        args.token_ring,
+        args.nonblocking_eos
+    );
+    let ReadbackCounters {
+        ring_publishes,
+        ring_eos_publishes,
+        poll_iters,
+        poll_fallbacks,
+    } = counters;
     // ---- the window is closed; everything below is after the clock ----------
 
-    // **The ring arm learns its tokens here, in one readback, after the clock.**
-    // Inside the window `tokens` held placeholders and the real ids accumulated
-    // device-side; this is the single `to_cpu` that replaces the per-token one,
-    // and it lands outside the measured window exactly as the digest does.
-    //
-    // The placeholder count is asserted against what the device holds rather
-    // than assumed equal: a `slice_set` that silently wrote nothing would leave
-    // zeros here and hash to a stable, wrong digest -- §2.3.8d's shape, where
-    // three identical digests belonged to a model emitting `picture picture
-    // picture`. So the arm checks that no placeholder survived.
+    // Every publish is either a token in the digest or an EOS that ended a
+    // turn. **This reconciles the engagement count against the digest**, which
+    // is what makes `ring_publishes` evidence rather than decoration: a run
+    // whose counter and token stream disagree has one of the two wrong, and
+    // #500's whole finding is that a green board says nothing when nothing is
+    // counted. (An EOS counted per turn rather than inferred from a bool: a
+    // `--turns 3` run can publish three.)
     if args.token_ring {
-        if let Some(h) = history.as_ref() {
-            let all = h.to_vec1::<u32>()?;
-            anyhow::ensure!(
-                all.len() >= tokens.len(),
-                "token history is shorter than the tokens generated"
-            );
-            for (slot, id) in tokens.iter_mut().zip(all.iter()) {
-                *slot = *id;
-            }
-            anyhow::ensure!(
-                !tokens.contains(&u32::MAX),
-                "a placeholder survived the device readback: the ring's history \
-                 slice_set did not write every token, so the digest below would be \
-                 stable and wrong (DESIGN.md §2.3.8d)"
-            );
-            // Every publish is either a token in the digest or an EOS that
-            // ended a turn. **This reconciles the engagement count against the
-            // digest**, which is what makes `ring_publishes` evidence rather
-            // than decoration: a run whose counter and token stream disagree
-            // has one of the two wrong, and #500's whole finding is that a
-            // green board says nothing when nothing is counted.
-            anyhow::ensure!(
-                ring_publishes == tokens.len() as u64 + ring_eos_publishes,
-                "published {} tokens but accounted for {} + {} EOS: the engagement \
-                 count and the digest disagree",
-                ring_publishes,
-                tokens.len(),
-                ring_eos_publishes
-            );
-        }
+        anyhow::ensure!(
+            ring_publishes == tokens.len() as u64 + ring_eos_publishes,
+            "published {} tokens but accounted for {} + {} EOS: the engagement \
+             count and the digest disagree",
+            ring_publishes,
+            tokens.len(),
+            ring_eos_publishes
+        );
+        anyhow::ensure!(
+            ring_publishes > 0,
+            "--token-ring ran and published nothing: the ring arm is not on the path"
+        );
     }
 
     // The digest, taken AFTER the window closes. This is §14.5's load-bearing
@@ -1397,13 +1155,21 @@ fn main() -> Result<()> {
     println!(
         "engagement            token_ring={} ring_publishes={} poll={} poll_iters={} \
          max_in_flight={} nonblocking_eos={} poll_fallbacks={}",
-        args.token_ring,
+        arms.token_ring,
         ring_publishes,
         poll.name(),
         poll_iters,
         max_in_flight,
-        args.nonblocking_eos,
+        arms.nonblocking_eos,
         poll_fallbacks
+    );
+    println!(
+        "  decode loop         lookahead={} commit_budget={} commits={} overrun={} \
+         (Session::decode, DESIGN.md decode-driver stage 1)",
+        args.lookahead,
+        budget.arm(),
+        commits,
+        overrun
     );
     println!(
         "  completion arm      completion_wait={cw_name} completion_signals={cw_signals} \
@@ -1491,7 +1257,13 @@ fn main() -> Result<()> {
         // own rendering for that state.
         ("ArenaLayout", "none(pool)".to_string()),
         ("ArenaOffsets", "Cpu".to_string()),
-        ("HazardKey", "Resource".to_string()),
+        // **Read back from the resolved value** (§7.1a-i), as the profiler
+        // does. This rendered the literal `Resource` — an arm `HazardKey` does
+        // not have (`Pointer` | `Range`) — on every release line since #567,
+        // and nothing noticed until a release line became a registry fixture
+        // (#673): a wrong arm compares equal to every run of that arm, and an
+        // unknown one to nothing.
+        ("HazardKey", hazard_key_arm().to_string()),
         ("AttnImpl", format!("{:?}", config.attn_impl)),
         ("KvAppend", format!("{:?}", config.kv_append)),
         ("ConvState", conv_state_arm),
@@ -1516,9 +1288,14 @@ fn main() -> Result<()> {
         ("CutPolicy", "Counter(50)".to_string()),
         ("GemvSilu", on_off(config.gemv_silu)),
         ("GemvResidual", on_off(config.gemv_residual)),
-        ("TokenRing", on_off(args.token_ring)),
+        ("TokenRing", on_off(arms.token_ring)),
         ("Poll", poll_arm),
-        ("NonblockingEos", on_off(args.nonblocking_eos)),
+        ("NonblockingEos", on_off(arms.nonblocking_eos)),
+        // The decode loop's two knobs (#673). Rendered from the resolved
+        // values the loop ran under; `Lookahead` carries the count and
+        // `CommitBudget` its period verbatim (§13.5m).
+        ("Lookahead", args.lookahead.to_string()),
+        ("CommitBudget", budget.arm()),
         ("CompletionWait", completion_wait_arm),
         ("MetalCflags", metal_cflags_arm()),
         ("MergedUnit", merged_unit_arm().to_string()),
@@ -1542,6 +1319,7 @@ fn main() -> Result<()> {
          poll_fallbacks={} peek_hit={} peek_unmapped={} poll_reads={} completion_wait={} \
          completion_signals={} completion_polls={} completion_fires={} \
          gemv_silu={} gemv_residual={} \
+         lookahead={} commit_budget={} commits={} overrun={} \
          config=[{}] token_digest={}",
         args.n,
         args.warmup,
@@ -1568,7 +1346,7 @@ fn main() -> Result<()> {
         prefill_submit_ns as f64 / 1e6,
         kv_len,
         hit_eos,
-        args.token_ring,
+        arms.token_ring,
         ring_publishes,
         poll.name(),
         poll_iters,
@@ -1576,7 +1354,7 @@ fn main() -> Result<()> {
         fast,
         blit,
         null_after_wait,
-        args.nonblocking_eos,
+        arms.nonblocking_eos,
         poll_fallbacks,
         peek_hit,
         peek_unmapped,
@@ -1589,9 +1367,134 @@ fn main() -> Result<()> {
         // than from `args` (§7.1a-i).
         config.gemv_silu,
         config.gemv_residual,
+        args.lookahead,
+        budget.arm(),
+        commits,
+        overrun,
         config_line,
         token_digest
     );
 
     Ok(())
+}
+
+/// What one run produced, across every turn.
+struct Run {
+    tokens: Vec<u32>,
+    /// Per-step wall, one entry per token, concatenated across turns.
+    step_ns: Vec<u64>,
+    /// Only under `--sample-split`.
+    sample_ns: Vec<u64>,
+    kv_len: usize,
+    hit_eos: bool,
+    turns_run: usize,
+    prefill_submit_ns: u64,
+    elapsed: std::time::Duration,
+    commits: u64,
+    max_in_flight: usize,
+    overrun: usize,
+    arms: ReadbackArms,
+    counters: ReadbackCounters,
+}
+
+/// The conversational turns against one cache, driven through
+/// `Session::decode` over the selected strategy.
+///
+/// Generic over the strategy so the loop monomorphizes per arm (§15.2 #9): the
+/// three call sites above are the three instantiations, and nothing here names
+/// an arm. Turn 0 is the prompt; every later turn prefills a follow-up onto the
+/// same cache, exactly as `lfm2-determinism` does, so a `--turns 3` run decodes
+/// the sequence the canonical §2.3.8c pairs were taken over.
+///
+/// **EOS ends a turn without being pushed or hashed**, which is the order the
+/// canonical pairs were taken in; `Session::decode` returns the ids without
+/// it. A turn that reaches the token budget ends the run.
+#[allow(clippy::too_many_arguments)]
+fn run_turns<R: ReadbackStrategy>(
+    args: &Args,
+    model: &Model,
+    cache: Cache,
+    mut rb: R,
+    sampler: &mut LogitsProcessor,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    opts: &DecodeOptions,
+) -> Result<Run> {
+    // Reserved BEFORE the window opens. A `Vec` growth inside the timed region
+    // would be an allocation the user does not pay for on a steady-state path
+    // and this harness would be measuring its own bookkeeping (§6.4a).
+    let mut tokens: Vec<u32> = Vec::with_capacity(args.n + args.turns + 1);
+    let mut step_ns: Vec<u64> = Vec::with_capacity(args.n + args.turns + 1);
+    let mut sample_ns: Vec<u64> = Vec::with_capacity(args.n + args.turns + 1);
+    let mut hit_eos = false;
+    let mut turns_run = 0usize;
+    let mut prefill_submit_ns: u64 = 0;
+    let mut commits: u64 = 0;
+    let mut max_in_flight = 0usize;
+    let mut overrun = 0usize;
+    // The cache starts empty: turn 0's prefill is what appends the prompt, and
+    // the session's position advances by each turn's length after it.
+    let mut session = Session::new(model, cache);
+    let mut spec = IdentityProposer;
+
+    let run_start = std::time::Instant::now();
+    for turn in 0..args.turns.max(1) {
+        let turn_ids: Vec<u32> = if turn == 0 {
+            prompt_ids.to_vec()
+        } else {
+            let follow_up = FOLLOW_UPS[(turn - 1) % FOLLOW_UPS.len()];
+            let text = format!("<|im_start|>user\n{follow_up}<|im_end|>\n<|im_start|>assistant\n");
+            tokenizer
+                .encode(text.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("tokenizing follow-up: {e}"))?
+                .get_ids()
+                .to_vec()
+        };
+        // The budget left for this turn. A turn opened with none left still
+        // prefills — the previous loop shape did, and `final_kv_len` and
+        // `turns_run` are what would otherwise move.
+        let turn_opts = DecodeOptions {
+            max_tokens: args.n - tokens.len(),
+            ..*opts
+        };
+        let out = session
+            .decode(&mut spec, &mut rb, sampler, &turn_ids, &turn_opts)
+            .with_context(|| format!("decoding turn {turn}"))?;
+        turns_run = turn + 1;
+        // Accumulated across turns; prefill is a different shape of work (§6.6)
+        // and is reported apart from the decode rate. **Submission time, not
+        // execution time**: candle is asynchronous and `forward` returns once
+        // the work is encoded (see the profiler's bracket for the other side).
+        prefill_submit_ns += out.stats.prefill_ns;
+        tokens.extend_from_slice(&out.ids);
+        step_ns.extend_from_slice(&out.stats.step_ns);
+        sample_ns.extend_from_slice(&out.stats.sample_ns);
+        commits += out.stats.commits;
+        max_in_flight = max_in_flight.max(out.stats.max_in_flight);
+        overrun += out.stats.overrun;
+        if out.eos {
+            hit_eos = true;
+            if turn + 1 < args.turns.max(1) {
+                continue;
+            }
+        }
+        break;
+    }
+    let elapsed = run_start.elapsed();
+
+    Ok(Run {
+        tokens,
+        step_ns,
+        sample_ns,
+        kv_len: session.pos(),
+        hit_eos,
+        turns_run,
+        prefill_submit_ns,
+        elapsed,
+        commits,
+        max_in_flight,
+        overrun,
+        arms: rb.arms(),
+        counters: rb.counters(),
+    })
 }

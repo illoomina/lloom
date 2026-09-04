@@ -7,7 +7,12 @@ use lloom_tensor::{DType, Error, Result, Tensor};
 use rand::{distr::Distribution, SeedableRng};
 
 pub mod poll;
+pub mod readback;
 pub mod token_ring;
+
+pub use readback::{
+    Blocking, CommitBudget, EosRead, ReadbackArms, ReadbackCounters, ReadbackStrategy, Ring,
+};
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Sampling {
@@ -29,6 +34,13 @@ impl LogitsProcessor {
     pub fn from_sampling(seed: u64, sampling: Sampling) -> Self {
         let rng = rand::rngs::StdRng::seed_from_u64(seed);
         Self { rng, sampling }
+    }
+
+    /// The sampling arm this processor runs, so a caller that must refuse a
+    /// host-only arm (the token ring, `DESIGN.md` §11.2c) can read it back
+    /// from the resolved value rather than from the flag that selected it.
+    pub fn sampling(&self) -> &Sampling {
+        &self.sampling
     }
 
     pub fn new(seed: u64, temperature: Option<f64>, top_p: Option<f64>) -> Self {

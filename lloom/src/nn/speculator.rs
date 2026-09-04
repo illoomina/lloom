@@ -312,14 +312,37 @@ pub trait Probes<P: TargetProbe>: CausalLM {
 /// ([`CausalLM::new_cache`]); the model is borrowed rather than owned so a
 /// session pins no weights alive beyond the round it drives.
 pub struct Session<'m, M: CausalLM> {
-    model: &'m M,
-    cache: M::Cache,
+    pub(crate) model: &'m M,
+    pub(crate) cache: M::Cache,
+    /// Positions already in the cache; the next forward pass starts here.
+    pub(crate) pos: usize,
 }
 
 impl<'m, M: CausalLM> Session<'m, M> {
-    /// Pair a target with a cache it has already built.
+    /// Pair a target with a cache it has already built. The cache is taken as
+    /// empty; a caller that prefilled it supplies the length with
+    /// [`Self::with_pos`].
     pub fn new(model: &'m M, cache: M::Cache) -> Self {
-        Self { model, cache }
+        Self {
+            model,
+            cache,
+            pos: 0,
+        }
+    }
+
+    /// As [`Self::new`], with `pos` positions already prefilled into `cache`.
+    pub fn with_pos(model: &'m M, cache: M::Cache, pos: usize) -> Self {
+        Self { model, cache, pos }
+    }
+
+    /// Positions currently in the cache.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// The target, for a caller composing a second seam over the same model.
+    pub fn model(&self) -> &'m M {
+        self.model
     }
 
     /// Drive one speculative round across the active sequences.

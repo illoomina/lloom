@@ -58,11 +58,17 @@ pub struct Lfm2Config {
     #[serde(default)]
     pub conv_bias: bool,
     pub layer_types: Vec<LayerType>,
-    // HF checkpoints spell this `tie_word_embeddings`; the alias reads it so a
-    // tied checkpoint (LFM2.5-2.6B: no `lm_head.weight`, reuses
-    // `embed_tokens.weight`) loads without a harness normalizing the key first.
-    #[serde(default, alias = "tie_word_embeddings")]
+    // HF checkpoints spell this `tie_word_embeddings`, and one checkpoint
+    // carries BOTH spellings (LFM2.5-VL-3B's `text_config` has `tie_embedding`
+    // beside `tie_word_embeddings`), so the HF key is a second field rather
+    // than a serde alias: an alias makes two keys one field, and serde refuses
+    // a field it sees twice. A tied checkpoint (LFM2.5-2.6B: no
+    // `lm_head.weight`, reuses `embed_tokens.weight`) loads through either key
+    // without a harness normalizing it first; `into_config` folds them.
+    #[serde(default)]
     pub tie_embedding: bool,
+    #[serde(default)]
+    tie_word_embeddings: Option<bool>,
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<u32>,
     // FFN dimension configuration.
@@ -170,7 +176,10 @@ impl Lfm2Config {
             conv_l_cache: self.conv_l_cache,
             conv_bias: self.conv_bias,
             layer_types: self.layer_types,
-            tie_embedding: self.tie_embedding,
+            // Tied iff either spelling says so: `tie_embedding` is the
+            // candle spelling a harness may have normalized to, and
+            // `tie_word_embeddings` the HF one.
+            tie_embedding: self.tie_embedding || self.tie_word_embeddings.unwrap_or(false),
             bos_token_id: self.bos_token_id,
             eos_token_id: self.eos_token_id,
             use_flash_attn,

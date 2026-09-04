@@ -641,7 +641,7 @@ pub fn call_rope_i_with(
     style: ParamStyle,
 ) -> Result<(), MetalKernelError> {
     let name = style.kernel_name(kernel_name);
-    let pipeline = kernels.load_pipeline(device, Source::Reduce, name)?;
+    let pipeline = kernels.load_pipeline(device, Source::Rope, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -727,7 +727,7 @@ pub fn call_rope_thd_with(
     style: ParamStyle,
 ) -> Result<(), MetalKernelError> {
     let name = style.kernel_name(kernel_name);
-    let pipeline = kernels.load_pipeline(device, Source::Reduce, name)?;
+    let pipeline = kernels.load_pipeline(device, Source::Rope, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -812,7 +812,7 @@ pub fn call_rope_with(
     style: ParamStyle,
 ) -> Result<(), MetalKernelError> {
     let name = style.kernel_name(kernel_name);
-    let pipeline = kernels.load_pipeline(device, Source::Reduce, name)?;
+    let pipeline = kernels.load_pipeline(device, Source::Rope, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

@@ -1,7 +1,7 @@
 use crate::kernels::source::{
     AFFINE, ARENA_ALLOC, BINARY, CAST, CONV, FILL, FLASH_DECODING, GEMV, INDEXING, MERGED_MEMBERS,
-    MERGED_NON_MLX, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE, SCRATCH, SDPA, SORT, TERNARY,
-    UNARY,
+    MERGED_NON_MLX, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE, ROPE, SCRATCH, SDPA, SORT,
+    TERNARY, UNARY,
 };
 use crate::kernels::utils::get_env_bool;
 use crate::kernels::{
@@ -80,7 +80,7 @@ enum LibraryKey {
     /// One library per source: the shipping default, and what every
     /// `__compute` figure in the corpus was measured under.
     PerSource(Source),
-    /// The sixteen non-MLX sources as one translation unit (#477).
+    /// The non-MLX sources as one translation unit (#477).
     MergedNonMlx,
 }
 
@@ -113,7 +113,7 @@ impl Kernels {
     ///
     /// Under the default arm this is the identity: one library per source, the
     /// same nineteen `newLibraryWithSource` calls that have always shipped.
-    /// Under [`merged_translation_unit`] the sixteen non-MLX sources collapse
+    /// Under [`merged_translation_unit`] the non-MLX sources collapse
     /// onto one key and one text (#477).
     fn library_for(&self, source: Source) -> (LibraryKey, &'static str) {
         Self::library_for_arm(merged_translation_unit(), source)
@@ -159,6 +159,7 @@ impl Kernels {
             Source::Quantized => QUANTIZED,
             Source::Random => RANDOM,
             Source::Reduce => REDUCE,
+            Source::Rope => ROPE,
             Source::Scratch => SCRATCH,
             Source::Sort => SORT,
             Source::Ternary => TERNARY,
@@ -634,6 +635,7 @@ mod tests {
                 | Source::Quantized
                 | Source::Random
                 | Source::Reduce
+                | Source::Rope
                 | Source::Scratch
                 | Source::Sort
                 | Source::Ternary
@@ -670,6 +672,7 @@ mod tests {
             Source::Quantized,
             Source::Random,
             Source::Reduce,
+            Source::Rope,
             Source::Scratch,
             Source::Sort,
             Source::Ternary,
@@ -686,8 +689,12 @@ mod tests {
 
         // Non-vacuity: the counts are stated so a list silently emptied by a
         // bad edit fails here rather than passing over an empty iteration.
-        assert_eq!(MERGED_MEMBERS.len(), 16, "16 non-MLX sources (#466 §4)");
-        assert_eq!(all.len(), 19, "19 Source variants");
+        assert_eq!(
+            MERGED_MEMBERS.len(),
+            17,
+            "17 non-MLX sources (#466 §4, +rope #659)"
+        );
+        assert_eq!(all.len(), 20, "20 Source variants");
     }
 
     /// Issue #477. The merged text **compiles**, and it contains kernels from
@@ -705,7 +712,7 @@ mod tests {
         let lib = device
             .new_library_with_source(MERGED_NON_MLX, Some(&options))
             .expect(
-                "the merged unit must compile: #466 §4 verified all 16 non-MLX \
+                "the merged unit must compile: #466 §4 verified the non-MLX \
                  sources compile as one translation unit with 0 errors",
             );
 
@@ -772,6 +779,7 @@ mod tests {
             Source::Quantized,
             Source::Random,
             Source::Reduce,
+            Source::Rope,
             Source::Scratch,
             Source::Sort,
             Source::Ternary,
@@ -826,12 +834,12 @@ mod tests {
             }
             merged_keys.insert(key);
         }
-        assert_eq!(n_merged, 16, "16 sources must route to the merged library");
-        // 1 merged key + 3 MLX keys. A count of 19 would mean nothing merged.
+        assert_eq!(n_merged, 17, "17 sources must route to the merged library");
+        // 1 merged key + 3 MLX keys. A count of 20 would mean nothing merged.
         assert_eq!(
             merged_keys.len(),
             4,
-            "the merged arm must collapse 19 libraries to 4, or it is not \
+            "the merged arm must collapse 20 libraries to 4, or it is not \
              merging anything"
         );
 
@@ -852,10 +860,10 @@ mod tests {
             //
             // **This arm's content comparison rests on a fact worth stating,
             // because it could stop holding** (#516). Unlike the merged arm --
-            // where no member can equal the sixteen-source concatenation -- this
+            // where no member can equal the merged concatenation -- this
             // asserts a source gets *its own* text, so equality would be weaker
             // than identity if two sources shared content. Checked rather than
-            // assumed: the 20 `.metal` files hash to **20 distinct contents**,
+            // assumed: the `.metal` files hash to distinct contents,
             // so content uniquely identifies a source here. A future duplicate
             // silently weakens this assertion, and would want the `assert_ne!`
             // treatment the merged arm above uses.
@@ -869,8 +877,8 @@ mod tests {
         }
         assert_eq!(
             default_keys.len(),
-            19,
-            "the default arm must be 19 distinct libraries, unchanged"
+            20,
+            "the default arm must be 20 distinct libraries, unchanged"
         );
     }
 }

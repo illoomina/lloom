@@ -19,6 +19,9 @@
 //!   still checks the full name, rather than treating the suffix as free-form.
 //! * **A prefix family.** `rope`, `rope_i` and `rope_thd` come from one
 //!   `init_rope` row but are three different stems, so each is its own family.
+//!   Since #659 those three families compile into `rope/rope.metal`
+//!   (`Source::Rope`), not `reduce.metal`; each family carries its own `source`
+//!   so the resolution tests load it from the library that defines it.
 //!
 //! What is deliberately *not* here is the threadgroup-size axis. `reduce.metal`
 //! instantiates each kernel for eleven block sizes, but all eleven live behind
@@ -34,6 +37,12 @@
 /// mechanical one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReduceKernel {
+    /// The [`Source`] library this family's kernels compile into. Reductions,
+    /// softmax and the norms are `Source::Reduce`; the three RoPE families are
+    /// `Source::Rope` since #659 split them into `rope/rope.metal`. Carried as
+    /// data so the resolution tests load each family from the library that
+    /// actually defines it, rather than assuming one source for the registry.
+    source: crate::kernels::Source,
     stem: &'static str,
     /// Trailing segment after the dtype suffix. Empty for the contiguous
     /// families, `"_strided"` for their strided counterparts.
@@ -72,12 +81,14 @@ macro_rules! reduce_variants {
 macro_rules! reduce_family {
     ($contig:ident, $strided:ident, $stem:literal) => {
         pub const $contig: Self = Self {
+            source: crate::kernels::Source::Reduce,
             stem: $stem,
             tail: "",
             variants: reduce_variants!($stem, ""),
         };
 
         pub const $strided: Self = Self {
+            source: crate::kernels::Source::Reduce,
             stem: $stem,
             tail: "_strided",
             variants: reduce_variants!($stem, "_strided"),
@@ -97,6 +108,7 @@ impl ReduceKernel {
     /// alone, so an integer suffix must return `None` rather than a name that
     /// would fail to resolve.
     pub const SOFTMAX: Self = Self {
+        source: crate::kernels::Source::Reduce,
         stem: "softmax",
         tail: "",
         variants: &[
@@ -107,6 +119,7 @@ impl ReduceKernel {
     };
 
     pub const RMSNORM: Self = Self {
+        source: crate::kernels::Source::Reduce,
         stem: "rmsnorm",
         tail: "",
         variants: &[
@@ -117,6 +130,7 @@ impl ReduceKernel {
     };
 
     pub const LAYERNORM: Self = Self {
+        source: crate::kernels::Source::Reduce,
         stem: "layernorm",
         tail: "",
         variants: &[
@@ -130,6 +144,7 @@ impl ReduceKernel {
     /// they are separate stems rather than one stem with a suffix, so each is
     /// its own family and `name()` stays a total lookup by dtype.
     pub const ROPE: Self = Self {
+        source: crate::kernels::Source::Rope,
         stem: "rope",
         tail: "",
         variants: &[
@@ -140,6 +155,7 @@ impl ReduceKernel {
     };
 
     pub const ROPE_I: Self = Self {
+        source: crate::kernels::Source::Rope,
         stem: "rope_i",
         tail: "",
         variants: &[
@@ -150,6 +166,7 @@ impl ReduceKernel {
     };
 
     pub const ROPE_THD: Self = Self {
+        source: crate::kernels::Source::Rope,
         stem: "rope_thd",
         tail: "",
         variants: &[
@@ -185,6 +202,13 @@ impl ReduceKernel {
     /// The family's name without a dtype suffix, for diagnostics.
     pub const fn stem(&self) -> &'static str {
         self.stem
+    }
+
+    /// The [`Source`](crate::kernels::Source) library this family loads from.
+    /// `Source::Rope` for the three RoPE families (split into `rope/rope.metal`
+    /// by #659), `Source::Reduce` for everything else in this registry.
+    pub const fn source(&self) -> crate::kernels::Source {
+        self.source
     }
 
     /// The segment following the dtype suffix — `"_strided"` for the strided

@@ -90,6 +90,14 @@ pub const REDUCE: &str = with_utils!(
     "#include <metal_stdlib>\n#include <metal_limits>\nusing namespace metal;",
     include_str!("metal_src/reduce.metal")
 );
+/// The three RoPE entry points, split out of `reduce.metal` into the
+/// `metal_src/rope/` role directory (§7.2). Unlike the `attention/` and `gemm/`
+/// moves, this is a translation-unit split: the rope family is a self-contained
+/// fragment that references no reduction preamble and no `utils.metal` helper,
+/// so it carries its own `#include <metal_stdlib>` and is NOT a `with_utils!`
+/// consumer. The residual `reduce.metal` keeps reduce/arg_reduce/softmax/norm,
+/// whose shared preamble cannot split (§7.2 finding, #653).
+pub const ROPE: &str = include_str!("metal_src/rope/rope.metal");
 pub const SCRATCH: &str = include_str!("metal_src/scratch.metal");
 pub const SORT: &str = include_str!("metal_src/sort.metal");
 pub const TERNARY: &str = with_utils!(
@@ -109,7 +117,7 @@ pub const UNARY: &str = with_utils!(
 /// `Pipelines` key and the `Libraries` key are untouched.
 pub const SDPA: &str = include_str!("metal_src/attention/scaled_dot_product_attention.metal");
 
-/// The sixteen non-MLX sources as **one translation unit** (issue #477,
+/// The non-MLX sources as **one translation unit** (issue #477,
 /// `DESIGN.md` §13.1e/§13.1j).
 ///
 /// # What this is for
@@ -195,6 +203,8 @@ pub const MERGED_NON_MLX: &str = concat!(
     "\n",
     include_str!("metal_src/reduce.metal"),
     "\n",
+    include_str!("metal_src/rope/rope.metal"),
+    "\n",
     include_str!("metal_src/scratch.metal"),
     "\n",
     include_str!("metal_src/sort.metal"),
@@ -226,6 +236,7 @@ pub const MERGED_MEMBERS: &[Source] = &[
     Source::Quantized,
     Source::Random,
     Source::Reduce,
+    Source::Rope,
     Source::Scratch,
     Source::Sort,
     Source::Ternary,
@@ -255,6 +266,11 @@ pub enum Source {
     Quantized,
     Random,
     Reduce,
+    /// RoPE: the three rotary-position-embedding entry points (rope, rope_i,
+    /// rope_thd), split out of `reduce.metal` into `metal_src/rope/` (§7.2). A
+    /// separate `Source` so the family is one translation unit compiled on its
+    /// own; the residual reduction preamble stays in `Source::Reduce`.
+    Rope,
     /// FlashDecoding partials: the scratch class and its sizing policy
     /// (`DESIGN.md` §9.1, issue #71). Not dispatched by any tensor op -- the
     /// scratch arena drives it, and the kernel is a stub until Phase 4/5

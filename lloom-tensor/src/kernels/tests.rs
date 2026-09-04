@@ -2820,11 +2820,12 @@ fn reduce_names_resolve() {
     for family in ReduceKernel::ALL {
         for (suffix, name) in family.variants() {
             kernels
-                .load_pipeline(&device, Source::Reduce, name)
+                .load_pipeline(&device, family.source(), name)
                 .unwrap_or_else(|e| {
                     panic!(
-                        "reduce.metal has no kernel named {name:?} \
+                        "{:?} has no kernel named {name:?} \
                          (declared by ReduceKernel::{}{} for {suffix:?}): {e:?}",
+                        family.source(),
                         family.stem(),
                         family.tail(),
                     )
@@ -3209,11 +3210,12 @@ fn packed_names_resolve() {
         for (suffix, name) in family.variants() {
             let packed = crate::kernels::kernels::params::packed_name(name);
             kernels
-                .load_pipeline(&device, Source::Reduce, packed.clone())
+                .load_pipeline(&device, family.source(), packed.clone())
                 .unwrap_or_else(|e| {
                     panic!(
-                        "reduce.metal has no kernel named {packed:?} \
+                        "{:?} has no kernel named {packed:?} \
                          (the packed form of {name:?}, ReduceKernel::{}{} for {suffix:?}): {e:?}",
+                        family.source(),
                         family.stem(),
                         family.tail(),
                     )
@@ -5277,7 +5279,15 @@ fn every_family_params_layout_matches_metal() {
     // stopped being checked, and two families moving in opposite directions
     // would cancel.
     const EXPECTED_SLOTS: &[(&str, usize)] = &[
-        ("reduce.metal", 26),
+        // 26 until #659, which split the three RoPE structs out of
+        // `reduce.metal` into `rope/rope.metal` — 15 slots left with them. A
+        // split is as deliberate as an addition and moves this number the same
+        // way; the residual reports 11 (ReduceParams, SoftmaxParams, NormParams).
+        ("reduce.metal", 11),
+        // The three RoPE structs, split out of `reduce.metal` by #659. 15 slots:
+        // RopeIParams (4), RopeParams (5), RopeThdParams (6), each a `sizeof`
+        // plus its fields. One layout kernel reports all three, the `Flash` shape.
+        ("rope/rope.metal", 15),
         ("unary.metal", 10),
         ("binary.metal", 5),
         ("cast.metal", 5),
@@ -5359,8 +5369,8 @@ fn every_family_params_layout_matches_metal() {
     assert_eq!(
         observed,
         EXPECTED_SLOTS.to_vec(),
-        "family or slot count changed. Eleven families and their slot counts are \
-         the state at issue #218; update this only alongside a deliberate addition."
+        "family or slot count changed. Twelve families and their slot counts are \
+         the state at issue #659; update this only alongside a deliberate addition."
     );
 }
 
@@ -5384,6 +5394,7 @@ fn layout_registry_covers_every_family() {
     fn seen(family: LayoutFamily) -> &'static str {
         match family {
             LayoutFamily::Reduce => "reduce",
+            LayoutFamily::Rope => "rope",
             LayoutFamily::Unary => "unary",
             LayoutFamily::Binary => "binary",
             LayoutFamily::Cast => "cast",
@@ -5399,6 +5410,7 @@ fn layout_registry_covers_every_family() {
 
     let expected = [
         LayoutFamily::Reduce,
+        LayoutFamily::Rope,
         LayoutFamily::Unary,
         LayoutFamily::Binary,
         LayoutFamily::Cast,

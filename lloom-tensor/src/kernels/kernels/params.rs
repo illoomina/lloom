@@ -1212,9 +1212,6 @@ pub fn expected_reduce_layout() -> Vec<(&'static str, u32)> {
     debug_assert_eq!(align_of::<ReduceParams>(), 4);
     debug_assert_eq!(align_of::<SoftmaxParams>(), 4);
     debug_assert_eq!(align_of::<NormParams>(), 4);
-    debug_assert_eq!(align_of::<RopeIParams>(), 8);
-    debug_assert_eq!(align_of::<RopeParams>(), 8);
-    debug_assert_eq!(align_of::<RopeThdParams>(), 8);
 
     vec![
         ("sizeof(ReduceParams)", size_of::<ReduceParams>() as u32),
@@ -1249,6 +1246,32 @@ pub fn expected_reduce_layout() -> Vec<(&'static str, u32)> {
             offset_of!(NormParams, el_per_block) as u32,
         ),
         ("NormParams.eps", offset_of!(NormParams, eps) as u32),
+    ]
+}
+
+/// The kernel in `rope/rope.metal` that reports the device-side layout of the
+/// three RoPE structs. A second kernel rather than more slots on
+/// [`REDUCE_LAYOUT_KERNEL`]: the layout check loads from the library that
+/// actually defines the struct, and `rope/rope.metal` is a separate `Source`
+/// compiled independently of `reduce.metal` (§7.2, issue #659) — the `Flash`
+/// shape, where a layout kernel can only see its own translation unit's structs.
+pub const ROPE_LAYOUT_KERNEL: &str = "rope_params_layout";
+
+/// What each slot of [`ROPE_LAYOUT_KERNEL`]'s output means, and what Rust
+/// computes for it.
+///
+/// As [`expected_reduce_layout`], for `rope/rope.metal`. `size_t` is 8 bytes in
+/// MSL, so these structs are 8-aligned where the reductions' `uint` params are
+/// 4-aligned; the Rust mirrors are `u64` for the same reason and are asserted
+/// here.
+pub fn expected_rope_layout() -> Vec<(&'static str, u32)> {
+    use core::mem::{align_of, offset_of, size_of};
+
+    debug_assert_eq!(align_of::<RopeIParams>(), 8);
+    debug_assert_eq!(align_of::<RopeParams>(), 8);
+    debug_assert_eq!(align_of::<RopeThdParams>(), 8);
+
+    vec![
         ("sizeof(RopeIParams)", size_of::<RopeIParams>() as u32),
         ("RopeIParams.bh", offset_of!(RopeIParams, bh) as u32),
         ("RopeIParams.td", offset_of!(RopeIParams, td) as u32),
@@ -1987,8 +2010,13 @@ pub fn packed_name(classical: &str) -> String {
 /// compile error rather than a silently unchecked family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LayoutFamily {
-    /// `reduce.metal` — issue #38. Reductions, softmax, the two norms, RoPE.
+    /// `reduce.metal` — issue #38. Reductions, softmax, the two norms.
     Reduce,
+    /// `rope/rope.metal` — issue #659. The three RoPE structs, split out of
+    /// `reduce.metal` into their own translation unit: a layout kernel can only
+    /// see the structs its own file defines, so the split forces its own family
+    /// rather than extra slots on [`LayoutFamily::Reduce`] (the `Flash` shape).
+    Rope,
     /// `unary.metal` — issue #40. Includes `copy2d`, the largest single kernel
     /// in the decode trace (`DESIGN.md` §11.2).
     Unary,
@@ -2063,6 +2091,7 @@ impl LayoutFamily {
     /// cannot be missing from `descriptor` at all.
     pub const ALL: &'static [LayoutFamily] = &[
         LayoutFamily::Reduce,
+        LayoutFamily::Rope,
         LayoutFamily::Unary,
         LayoutFamily::Binary,
         LayoutFamily::Cast,
@@ -2079,6 +2108,7 @@ impl LayoutFamily {
     pub fn metal_file(self) -> &'static str {
         match self {
             LayoutFamily::Reduce => "reduce.metal",
+            LayoutFamily::Rope => "rope/rope.metal",
             LayoutFamily::Unary => "unary.metal",
             LayoutFamily::Binary => "binary.metal",
             LayoutFamily::Cast => "cast.metal",
@@ -2104,6 +2134,11 @@ impl LayoutFamily {
                 crate::kernels::Source::Reduce,
                 REDUCE_LAYOUT_KERNEL,
                 expected_reduce_layout(),
+            ),
+            LayoutFamily::Rope => (
+                crate::kernels::Source::Rope,
+                ROPE_LAYOUT_KERNEL,
+                expected_rope_layout(),
             ),
             LayoutFamily::Unary => (
                 crate::kernels::Source::Unary,

@@ -41,8 +41,11 @@ struct Args {
     #[arg(long)]
     model_dir: Option<PathBuf>,
 
-    /// Max new tokens to generate.
-    #[arg(long, short = 'n', default_value_t = 256)]
+    /// Safety cap on new tokens; generation runs until the model emits EOS
+    /// (`<|im_end|>` / `<|endoftext|>`) and this is only the ceiling. Default is
+    /// generous so a normal reply — including LFM2.5's `<think>` block — finishes
+    /// on EOS rather than being truncated.
+    #[arg(long, short = 'n', default_value_t = 2048)]
     max_tokens: usize,
 
     /// Sampling temperature. 0 (the default) is greedy / argmax.
@@ -61,19 +64,28 @@ struct Args {
     /// `blocking` (the token is read back every step), `ring` (device-resident
     /// token, one blocking flag read per step) or `ring-nonblocking`
     /// (device-resident token, the flag is polled). The ring arms need argmax
-    /// or plain temperature; top-p is refused on them.
-    #[arg(long, default_value = "blocking")]
+    /// or plain temperature; top-p is refused on them. **Defaults to
+    /// `ring-nonblocking`**: this example is a speed demo and it is the fastest
+    /// arm — the token stays on the device AND the EOS flag is polled rather than
+    /// read back, so nothing crosses the host boundary per step (§11.5g). It is
+    /// the arm that reaches ~60 tok/s steady on M1 Max at B=1.
+    #[arg(long, default_value = "ring-nonblocking")]
     readback: String,
 
     /// Forward passes the host may enqueue before it has learned the previous
     /// step's EOS (ring arms only): 0 or 1. With 1 the GPU always has the next
-    /// step queued, and the cache ends one position past an EOS.
-    #[arg(long, default_value_t = 0)]
+    /// step queued, and the cache ends one position past an EOS. **Defaults to
+    /// 1**: it is the +3.5 % that collects the non-GPU gap (§11.2b), and this
+    /// example is single-turn so the one-past-EOS cache ends with the run — the
+    /// exact condition `lfm2-release` refuses `--turns > 1` under (§10.2a).
+    #[arg(long, default_value_t = 1)]
     lookahead: usize,
 
     /// How often the decode loop commits and prunes the in-flight queue:
-    /// `per-token` or `steps:<N>`.
-    #[arg(long, default_value = "per-token")]
+    /// `per-token` or `steps:<N>`. **Defaults to `steps:8`**: the queue bound is
+    /// flat at 13–15 across a 7.8× span of n (#520), so committing every 8 steps
+    /// never overflows and takes the commit off the per-token path.
+    #[arg(long, default_value = "steps:8")]
     commit_budget: String,
 }
 
@@ -135,12 +147,27 @@ fn main() -> Result<()> {
     };
 
     // ---- load: tokenizer, config, weights --------------------------------
+    let load_start = std::time::Instant::now();
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
 
     let config: Lfm2Config = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)
         .context("parsing config.json")?;
-    let config = config.into_config(false);
+    let mut config = config.into_config(false);
+    // The fastest B=1 decode config lloom has, baked in — this example exists to
+    // show what the engine does at its best, not the conservative defaults every
+    // axis ships at (§7.1a keeps those off in the library; a demo turns them on).
+    // The crown attention/KV/conv arms (Sdpa × Cat × Shuffle, §13.5) plus the two
+    // GEMV epilogue fusions (§12.2d/§12.2h) plus the conv fold (§12.2 row 1). Every
+    // one is token-identical to the generic path — only the logits reorder — so
+    // this is the same answer, faster. The readback strategy (ring + lookahead)
+    // is selected below, on the loop side.
+    config.attn_impl = lloom::models::lfm2::AttnImpl::Sdpa;
+    config.kv_append = lloom::models::lfm2::KvAppend::Cat;
+    config.conv_state = lloom::models::lfm2::ConvState::Shuffle;
+    config.gemv_silu = true;
+    config.gemv_residual = true;
+    config.conv_fused = true;
 
     let files = weight_files(&model_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
@@ -154,6 +181,12 @@ fn main() -> Result<()> {
             eos_ids.push(id);
         }
     }
+
+    // Load time, printed before we block on stdin so it is attributable. This is
+    // mmap + model construction + cache allocation — the safetensors are memory
+    // mapped, so the weight *bytes* fault in lazily on the first forward (they
+    // land in the prefill / TTFT below), not here.
+    eprintln!("[loaded in {:.2}s (mmap + construct)]", load_start.elapsed().as_secs_f64());
 
     let sampling = if args.temperature <= 0.0 {
         Sampling::ArgMax
@@ -212,13 +245,37 @@ fn main() -> Result<()> {
     println!("{reply}");
 
     let n = out_ids.len();
-    let tok_s = n as f64 / decode_elapsed.as_secs_f64();
     let st = &out.stats;
+
+    // Two figures, because they answer different questions (§2.5.3):
+    //  * end-to-end includes the prompt's prefill, which is a different shape of
+    //    work and drifts with prompt length — what a user of a one-shot waits.
+    //  * steady is the median decode step, prefill excluded — what the engine
+    //    sustains token-to-token, and the number to compare against the §320
+    //    floor. The median, not the mean, because one scheduling hiccup (or a
+    //    loaded machine) drags the mean and says nothing about the steady path.
+    let end_to_end = n as f64 / decode_elapsed.as_secs_f64();
+    let mut steps: Vec<u64> = st.step_ns.clone();
+    let steady = if steps.is_empty() {
+        f64::NAN
+    } else {
+        // Median is taken on a sorted copy; the unsorted `step_ns[0]` above is the
+        // first step, so sort AFTER reading the TTFT term.
+        steps.sort_unstable();
+        let med_ns = steps[steps.len() / 2] as f64;
+        1e9 / med_ns
+    };
+    // TTFT = prompt submitted → first token available = the prefill forward plus
+    // the first decode step (the first token is the prefill's own argmax, fed and
+    // sampled in step 0). This is where the mmap'd weights fault in, so a cold
+    // run's TTFT carries the load the `[loaded …]` line above deferred.
+    let ttft_ms = (st.prefill_ns + st.step_ns.first().copied().unwrap_or(0)) as f64 / 1e6;
     eprintln!(
-        "[{n} tokens in {:.2}s = {tok_s:.1} tok/s decode (prefill included), {} on {:?}; \
+        "[{n} tokens: {end_to_end:.1} tok/s end-to-end (prefill included), \
+         {steady:.1} tok/s steady (median decode step), TTFT {ttft_ms:.1} ms, \
+         {} on {:?}; \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={}]",
-        decode_elapsed.as_secs_f64(),
         if dtype == DType::F16 { "f16" } else { "f32" },
         device,
         args.readback,

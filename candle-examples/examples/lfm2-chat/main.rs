@@ -98,12 +98,12 @@ struct Args {
     /// default (the current behavior is unchanged). See `--draft-dir` for where
     /// the drafter weights are found.
     ///
-    /// **Honest caveat**: `lfm2-chat` runs at batch 1, and DSpark's amortization
-    /// is `B×K` — at B=1 the draft+verify overhead is not amortized, so this may
-    /// be SLOWER than the non-speculative path (`design/docs/speculation.md`
-    /// §10.2r: "B>1 is the whole reason DSpark can pay; at B=1 it does not").
-    /// This flag exists to make the integration correct and measurable, not to
-    /// claim a B=1 speedup.
+    /// At B=1 on an M1 Max this is measured FASTER than the crown non-spec path
+    /// (`design/docs/speculation.md` §10.2u: ~80 against ~62 tok/s steady at
+    /// 3.5 accepted tokens per round) — once the verify pass took the 16-row
+    /// GEMM tile and the ring conv fused; before those it was 0.72×. The round
+    /// is still verify-dominated, so the figure moves with the prompt's
+    /// acceptance rate; `--phase-sync` shows where a round's time goes.
     #[arg(long)]
     dspark: bool,
 
@@ -123,6 +123,25 @@ struct Args {
     /// snapshot in the HF cache.
     #[arg(long)]
     draft_dir: Option<PathBuf>,
+
+    /// Which cache configuration the NON-speculative path runs on: `crown`
+    /// (`Sdpa × Cat × Shuffle`, the fastest B=1 config) or `rewindable` — the
+    /// one `--dspark` is forced onto (`Sdpa × InPlace × RotatingRing{K+1}` with
+    /// the F32 taps on), run here WITHOUT a drafter, K=1. The pair isolates the
+    /// cost of leaving the crown from the cost of the verify loop (#675).
+    /// `rewindable-notap` is the same cache with the taps off, so the taps'
+    /// own cost separates from the ring's. `--dspark` ignores this and always
+    /// runs `rewindable`.
+    #[arg(long, default_value = "crown")]
+    cache: String,
+
+    /// **Diagnostic, perturbs what it measures**: with `--dspark`, synchronize
+    /// the GPU at the end of each phase of a round (draft / verify / observe) so
+    /// each phase's wall carries its own GPU tail, and — with
+    /// `CANDLE_METAL_PROFILE=1` — take each phase's GPU-busy, dispatch count and
+    /// one round's per-kernel census. Off for any throughput figure.
+    #[arg(long)]
+    phase_sync: bool,
 }
 
 /// The LFM2.5-2.6B snapshot dir in the HF cache, if it is there.
@@ -340,26 +359,47 @@ fn main() -> Result<()> {
         None
     };
 
-    if let Some(setup) = &dspark_setup {
-        // Speculation needs the REWINDABLE cache, which the crown arms below cannot
-        // provide: `Cache::advance` requires `ConvState::RotatingRing{ >= K+1 }`
-        // (the shuffle is destructive) and `Cache::resolve` requires
-        // `KvAppend::InPlace` (the `Cat` arm has no length to rewind) — both refused
-        // otherwise (`lfm2.rs`). The verify window is `K + 1` positions (the K
-        // proposals plus the target's bonus), so the ring reserves that many history
-        // slots. Taps are ON — the drafter's projection consumes the target's
-        // layer-output residuals — at F32 (`§10.2m`: deliberate, buys acceptance
-        // rate). `Sdpa` attention still applies (token-identical); the GEMV/conv
-        // fusions stay on where they compose.
+    // The cache arm that runs. `--dspark` needs the REWINDABLE cache, which the
+    // crown arms cannot provide: `Cache::advance` requires
+    // `ConvState::RotatingRing{ >= K+1 }` (the shuffle is destructive) and
+    // `Cache::resolve` requires `KvAppend::InPlace` (the `Cat` arm has no length
+    // to rewind) — both refused otherwise (`lfm2.rs`). The verify window is
+    // `K + 1` positions (the K proposals plus the target's bonus), so the ring
+    // reserves that many history slots. Taps are ON — the drafter's projection
+    // consumes the target's layer-output residuals — at F32 (`§10.2m`:
+    // deliberate, buys acceptance rate). `Sdpa` attention still applies
+    // (token-identical); the GEMV fusions stay on where they compose, and the
+    // whole-block conv fusion does not (it is the `Shuffle` arm's, §12.2 row 1).
+    // `--cache rewindable` runs the SAME cache without a drafter, so the cost of
+    // the cache is measured apart from the cost of the verify loop.
+    let cache_arm: &str = if dspark_setup.is_some() {
+        "rewindable"
+    } else {
+        args.cache.as_str()
+    };
+    if cache_arm == "rewindable" || cache_arm == "rewindable-notap" {
+        let k = match &dspark_setup {
+            Some(setup) => setup.k,
+            None => args.draft.unwrap_or(9),
+        };
         config.attn_impl = lloom::models::lfm2::AttnImpl::Sdpa;
         config.kv_append = KvAppend::InPlace;
-        config.conv_state = ConvState::RotatingRing { k: setup.k + 1 };
+        config.conv_state = ConvState::RotatingRing { k: k + 1 };
         config.gemv_silu = true;
         config.gemv_residual = true;
         config.conv_fused = true;
-        config.tap_layers = setup.dcfg.tap_layers();
         config.tap_dtype = DType::F32;
-    } else {
+        config.tap_layers = match (&dspark_setup, cache_arm) {
+            (Some(setup), _) => setup.dcfg.tap_layers(),
+            (None, "rewindable") => {
+                // The 2.6B drafter's taps, `target_layer_ids + 1`, without
+                // loading the drafter: the same five layers the `--dspark` run
+                // taps, so the arm carries the same per-token capture cost.
+                DSparkConfig::lfm2_2_6b().tap_layers()
+            }
+            _ => Vec::new(),
+        };
+    } else if cache_arm == "crown" {
         // The fastest B=1 decode config lloom has, baked in — this example exists to
         // show what the engine does at its best, not the conservative defaults every
         // axis ships at (§7.1a keeps those off in the library; a demo turns them on).
@@ -374,6 +414,10 @@ fn main() -> Result<()> {
         config.gemv_silu = true;
         config.gemv_residual = true;
         config.conv_fused = true;
+    } else {
+        anyhow::bail!(
+            "--cache must be `crown`, `rewindable` or `rewindable-notap`, got `{cache_arm}`"
+        );
     }
 
     let files = weight_files(&model_dir)?;
@@ -450,11 +494,15 @@ fn main() -> Result<()> {
     // one value of the `ReadbackStrategy` seam; the loop is generic over it and
     // monomorphizes, so selecting an arm costs nothing per token.
     let budget = CommitBudget::from_str(&args.commit_budget).map_err(anyhow::Error::msg)?;
+    if args.phase_sync && !args.dspark {
+        anyhow::bail!("--phase-sync brackets the speculative round's phases; it needs --dspark");
+    }
     let opts = DecodeOptions {
         max_tokens: args.max_tokens,
         budget,
         lookahead: args.lookahead,
-        sample_split: false,
+        // Under the speculative body this is the per-phase drain (decode.rs).
+        sample_split: args.phase_sync,
     };
 
     // The DSpark proposer, built only when `--dspark` is set. It borrows the
@@ -616,20 +664,19 @@ fn main() -> Result<()> {
         let setup = dspark_setup.as_ref().expect("--dspark implies a setup");
         eprintln!(
             "[dspark: {} accepted-tokens/round (mean over {} rounds), \
-             {} tok/s steady (rounds/s × tokens/round), K={} \
-             — note: B=1, DSpark is not expected to beat the non-spec path here \
-             (speculation.md §10.2r)]",
+             {} tok/s steady (rounds/s × tokens/round), K={}]",
             b(format!("{tokens_per_round:.2}")),
             rounds,
             b(format!("{steady_tok_s:.1}")),
             setup.k,
         );
+        report_rounds(st, args.phase_sync);
     }
 
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \
-         {} on {:?}; \
+         {} on {:?}; cache={cache_arm} \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={}]",
         b(format!("{end_to_end:.1}")),
@@ -653,6 +700,139 @@ fn main() -> Result<()> {
         out.eos,
     );
     Ok(())
+}
+
+/// The per-round breakdown of a `--dspark` run: where a round's wall goes, per
+/// round and per emitted token, from `DecodeStats::rounds`.
+///
+/// The first `WARMUP_ROUNDS` are dropped from every figure — the first pass
+/// through the drafter's kernels pays pipeline construction and a cold pool —
+/// and the dropped count is printed. Wall figures are medians per round and
+/// ratios of sums per token (§10.2j's denominator rule); GPU-busy and dispatch
+/// figures appear only under `--phase-sync` with `CANDLE_METAL_PROFILE=1`, and
+/// the census is one round's, the one the loop kept.
+fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
+    const WARMUP_ROUNDS: usize = 4;
+    let rounds = &st.rounds;
+    if rounds.len() <= WARMUP_ROUNDS {
+        eprintln!(
+            "[dspark rounds: only {} rounds, fewer than the {WARMUP_ROUNDS} dropped as warm-up; \
+             no breakdown]",
+            rounds.len()
+        );
+        return;
+    }
+    let timed = &rounds[WARMUP_ROUNDS..];
+    let n = timed.len() as f64;
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let median = |mut v: Vec<f64>| -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = v.len();
+        if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            0.5 * (v[n / 2 - 1] + v[n / 2])
+        }
+    };
+    let accepted: usize = timed.iter().map(|r| r.accepted).sum();
+    let tokens_per_round = accepted as f64 / n;
+    let sum_draft: f64 = timed.iter().map(|r| ms(r.timing.draft_ns)).sum();
+    let sum_verify: f64 = timed.iter().map(|r| ms(r.timing.verify_ns)).sum();
+    let sum_observe: f64 = timed.iter().map(|r| ms(r.timing.observe_ns)).sum();
+    let sum_round = sum_draft + sum_verify + sum_observe;
+    let med_round = median(timed.iter().map(|r| ms(r.timing.wall_ns())).collect());
+    let med_draft = median(timed.iter().map(|r| ms(r.timing.draft_ns)).collect());
+    let med_verify = median(timed.iter().map(|r| ms(r.timing.verify_ns)).collect());
+    let med_observe = median(timed.iter().map(|r| ms(r.timing.observe_ns)).collect());
+    let e = accepted as f64;
+    eprintln!(
+        "[dspark rounds: {} timed ({WARMUP_ROUNDS} warm-up dropped), {accepted} tokens accepted, \
+         {tokens_per_round:.3} tokens/round; phase_sync={phase_sync}]",
+        timed.len()
+    );
+    eprintln!("[dspark per round, ms (median | mean):  draft {med_draft:.3} | {:.3}   verify {med_verify:.3} | {:.3}   observe {med_observe:.3} | {:.3}   round {med_round:.3} | {:.3}]",
+        sum_draft / n, sum_verify / n, sum_observe / n, sum_round / n);
+    eprintln!("[dspark per accepted token, ms (ratio of sums):  draft {:.3}   verify {:.3}   observe {:.3}   total {:.3}]",
+        sum_draft / e, sum_verify / e, sum_observe / e, sum_round / e);
+    // The accepted-length distribution: the round cost is paid whatever the
+    // acceptance, so this is the other factor in the per-token figure.
+    let mut hist = vec![0usize; timed.iter().map(|r| r.accepted).max().unwrap_or(0) + 1];
+    for r in timed {
+        hist[r.accepted] += 1;
+    }
+    eprintln!(
+        "[dspark accepted-per-round histogram (1..): {}]",
+        hist.iter()
+            .enumerate()
+            .skip(1)
+            .map(|(k, c)| format!("{k}:{c}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let gpu_draft: f64 = timed.iter().map(|r| r.timing.draft_gpu_s * 1e3).sum();
+    let gpu_verify: f64 = timed.iter().map(|r| r.timing.verify_gpu_s * 1e3).sum();
+    let gpu_observe: f64 = timed.iter().map(|r| r.timing.observe_gpu_s * 1e3).sum();
+    let disp_draft: u64 = timed.iter().map(|r| r.timing.draft_disp).sum();
+    let disp_verify: u64 = timed.iter().map(|r| r.timing.verify_disp).sum();
+    let disp_observe: u64 = timed.iter().map(|r| r.timing.observe_disp).sum();
+    let profiled = disp_draft + disp_verify + disp_observe > 0;
+    if profiled {
+        eprintln!("[dspark GPU-busy per round, ms (mean of union):  draft {:.3}   verify {:.3}   observe {:.3}   round {:.3}  — idle (wall−busy) {:.3}]",
+            gpu_draft / n, gpu_verify / n, gpu_observe / n, (gpu_draft + gpu_verify + gpu_observe) / n,
+            (sum_round - gpu_draft - gpu_verify - gpu_observe) / n);
+        eprintln!(
+            "[dspark dispatches per round (mean):  draft {:.1}   verify {:.1}   observe {:.1}]",
+            disp_draft as f64 / n,
+            disp_verify as f64 / n,
+            disp_observe as f64 / n
+        );
+        for (name, census) in [
+            (
+                "draft",
+                timed.iter().find_map(|r| r.timing.draft_census.as_ref()),
+            ),
+            (
+                "verify",
+                timed.iter().find_map(|r| r.timing.verify_census.as_ref()),
+            ),
+            (
+                "observe",
+                timed.iter().find_map(|r| r.timing.observe_census.as_ref()),
+            ),
+        ] {
+            if let Some(c) = census {
+                let total: u64 = c.iter().map(|(_, n)| n).sum();
+                eprintln!(
+                    "[dspark census {name} (one round, {total} dispatches, {} labels):",
+                    c.len()
+                );
+                for (label, count) in c {
+                    eprintln!("    {count:>6}  {label}");
+                }
+                eprintln!("]");
+            }
+        }
+    }
+    eprintln!(
+        "DSPARK_ROUNDS rounds={} tokens={accepted} tokens_per_round={tokens_per_round:.4} \
+         round_ms_median={med_round:.4} round_ms_mean={:.4} \
+         draft_ms_median={med_draft:.4} verify_ms_median={med_verify:.4} observe_ms_median={med_observe:.4} \
+         draft_ms_per_token={:.4} verify_ms_per_token={:.4} observe_ms_per_token={:.4} total_ms_per_token={:.4} \
+         draft_gpu_ms={:.4} verify_gpu_ms={:.4} observe_gpu_ms={:.4} \
+         draft_disp={:.1} verify_disp={:.1} observe_disp={:.1} phase_sync={phase_sync} profiled={profiled}",
+        timed.len(),
+        sum_round / n,
+        sum_draft / e,
+        sum_verify / e,
+        sum_observe / e,
+        sum_round / e,
+        gpu_draft / n,
+        gpu_verify / n,
+        gpu_observe / n,
+        disp_draft as f64 / n,
+        disp_verify as f64 / n,
+        disp_observe as f64 / n,
+    );
 }
 
 /// Build the selected strategy and run the loop over it.

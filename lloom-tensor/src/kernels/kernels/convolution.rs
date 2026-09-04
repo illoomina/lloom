@@ -1,8 +1,8 @@
 use crate::kernels::kernels::params::{
     begin_packed_params, finish_packed_params, Col2im1dParams, Conv1dDepthwiseKParams,
     Conv1dDepthwiseParams, ConvTranspose1dParams, ConvTranspose2dParams, Im2col1dParams,
-    Im2colParams, ParamStyle, Pool2dParams, ShortconvStepParams, UpsampleBilinear2dParams,
-    UpsampleNearest2dParams,
+    Im2colParams, ParamStyle, Pool2dParams, ShortconvRingParams, ShortconvStepParams,
+    UpsampleBilinear2dParams, UpsampleNearest2dParams,
 };
 use crate::kernels::linear_split;
 use crate::kernels::utils::{BufferOffset, EncoderProvider};
@@ -26,6 +26,7 @@ const CONV_TRANSPOSE2D_PARAMS_ALIGN: usize = core::mem::align_of::<ConvTranspose
 const CONV1D_DEPTHWISE_PARAMS_ALIGN: usize = core::mem::align_of::<Conv1dDepthwiseParams>();
 const CONV1D_DEPTHWISE_K_PARAMS_ALIGN: usize = core::mem::align_of::<Conv1dDepthwiseKParams>();
 const SHORTCONV_STEP_PARAMS_ALIGN: usize = core::mem::align_of::<ShortconvStepParams>();
+const SHORTCONV_RING_PARAMS_ALIGN: usize = core::mem::align_of::<ShortconvRingParams>();
 
 // A note on widths, since #38 found a latent mismatch of exactly this kind in
 // `reduce.metal`'s callers and predicted it in the remaining six files.
@@ -436,6 +437,102 @@ pub fn call_shortconv_step_with(
         )
     );
     let _staged = finish_packed_params(device, encoder, style, SHORTCONV_STEP_PARAMS_ALIGN)?;
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+/// The RotatingRing conv block over `seq_len` positions in one dispatch (the
+/// speculative verify pass's per-position ring writer, or the K=1 decode
+/// step on the same ring). `b_in`/`x_in`/`c_in` share one
+/// `(stride_b, stride_c, stride_l)` triple — sibling narrows of one `in_proj`
+/// output — with base offsets on the `BufferOffset`s. Preconditions:
+/// contiguous `state_in`/`state_out` in `[b, hidden, width]`, contiguous
+/// `weights` in `[width, hidden, width]` (the per-phase permuted table),
+/// `1 <= seq_len <= width`; `dst` is written contiguous `[b, seq_len, hidden]`.
+/// The single caller enforces them.
+#[allow(clippy::too_many_arguments)]
+pub fn call_shortconv_ring(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    params: ShortconvRingParams,
+    b_in: BufferOffset,
+    x_in: BufferOffset,
+    c_in: BufferOffset,
+    state_in: BufferOffset,
+    weights: BufferOffset,
+    state_out: &Buffer,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    call_shortconv_ring_with(
+        device,
+        ep,
+        kernels,
+        name,
+        params,
+        b_in,
+        x_in,
+        c_in,
+        state_in,
+        weights,
+        state_out,
+        dst,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_shortconv_ring`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_shortconv_ring_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    params: ShortconvRingParams,
+    b_in: BufferOffset,
+    x_in: BufferOffset,
+    c_in: BufferOffset,
+    state_in: BufferOffset,
+    weights: BufferOffset,
+    state_out: &Buffer,
+    dst: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let dst_numel = params.dst_numel as usize;
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_numel);
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "shortconv_ring {name} dst_numel={dst_numel} seq_len={}",
+        params.seq_len
+    );
+    let _capture = begin_packed_params(encoder, style);
+    set_params!(
+        encoder,
+        (
+            params.dst_numel as usize,
+            params.hidden as usize,
+            params.seq_len as usize,
+            params.width as usize,
+            params.phase_last as usize,
+            params.proj_stride_b as usize,
+            params.proj_stride_c as usize,
+            params.proj_stride_l as usize,
+            &b_in,
+            &x_in,
+            &c_in,
+            &state_in,
+            &weights,
+            Output::new(state_out),
+            Output::new(dst)
+        )
+    );
+    let _staged = finish_packed_params(device, encoder, style, SHORTCONV_RING_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }

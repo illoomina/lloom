@@ -238,6 +238,19 @@ impl ConvKernel {
         }
     }
 
+    /// The RotatingRing conv block over `seq_len` positions as one kernel:
+    /// the ring writes, the per-slot permuted folds and the `*C` gate. Width
+    /// and position count are runtime, so one family serves every ring.
+    pub const SHORTCONV_RING: Self = Self {
+        stem: "shortconv_ring",
+        tail: "",
+        variants: &[
+            ("f32", "shortconv_ring_f32"),
+            ("f16", "shortconv_ring_f16"),
+            ("bf16", "shortconv_ring_bf16"),
+        ],
+    };
+
     pub const CONV_TRANSPOSE1D: Self = Self {
         stem: "conv_transpose1d",
         tail: "",
@@ -319,6 +332,10 @@ impl ConvKernel {
         Self::CONV1D_DEPTHWISE_K2,
         Self::CONV1D_DEPTHWISE_K3,
         Self::CONV1D_DEPTHWISE_K4,
+        Self::SHORTCONV_STEP_K2,
+        Self::SHORTCONV_STEP_K3,
+        Self::SHORTCONV_STEP_K4,
+        Self::SHORTCONV_RING,
         Self::CONV_TRANSPOSE1D,
         Self::CONV_TRANSPOSE2D,
         Self::UPSAMPLE_NEAREST2D,

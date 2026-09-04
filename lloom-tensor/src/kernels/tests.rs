@@ -2718,11 +2718,13 @@ fn conv_names_resolve() {
     // its variants — an all-green run over zero names would otherwise pass.
     // 5 dtypes each for im2col1d, im2col, col2im1d, conv_transpose1d,
     // upsample_nearest2d, upsample_bilinear2d, max_pool2d and avg_pool2d, plus
-    // 3 each for the float-only conv1d_depthwise and conv_transpose2d, and 3
-    // each for the three k_size-specialized depthwise families (k = 2, 3, 4).
+    // 3 each for the float-only conv1d_depthwise and conv_transpose2d, 3 each
+    // for the three k_size-specialized depthwise families (k = 2, 3, 4), 3
+    // each for the three fused shortconv_step families (k = 2, 3, 4), and 3
+    // for shortconv_ring.
     assert_eq!(
-        checked, 55,
-        "expected 55 declared conv variants, found {checked}"
+        checked, 67,
+        "expected 67 declared conv variants, found {checked}"
     );
 }
 
@@ -4614,8 +4616,8 @@ fn conv_packed_names_resolve() {
         }
     }
     assert_eq!(
-        checked, 55,
-        "expected a packed counterpart for all 55 declared conv variants, found {checked}"
+        checked, 67,
+        "expected a packed counterpart for all 67 declared conv variants, found {checked}"
     );
 }
 
@@ -5293,7 +5295,7 @@ fn every_family_params_layout_matches_metal() {
         ("cast.metal", 5),
         ("affine.metal", 16),
         ("gemv.metal", 8),
-        ("conv.metal", 65),
+        ("conv.metal", 79),
         // 27 until #219, which removed `left_size` from all four of this
         // file's structs — four `offsetof` rows, one per struct. A **removal**
         // is as deliberate as an addition and moves this number the same way;

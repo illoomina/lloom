@@ -40,7 +40,10 @@
 
 use crate::generation::{CommitBudget, LogitsProcessor, ReadbackCounters, ReadbackStrategy};
 use crate::nn::model::{CacheReset, CausalLM};
-use crate::nn::speculator::{Anchor, Draft, NoProbe, Probes, SeqId, Session, Speculator, TargetProbe};
+use crate::nn::speculator::{
+    Anchor, Draft, NoProbe, Probes, RoundProbe, RoundTiming, SeqId, Session, Speculator,
+    TargetProbe,
+};
 use lloom_tensor::{Device, Result, Tensor};
 
 /// The K=1 identity proposer: drafts nothing, so the loop takes the baseline
@@ -95,8 +98,23 @@ pub struct DecodeOptions {
     pub lookahead: usize,
     /// **Diagnostic, and it perturbs the thing it measures**: drain the GPU
     /// before each sample so the sample term can be timed apart from the
-    /// forward pass (§11.2a). Off for every published number.
+    /// forward pass (§11.2a). Off for every published number. Under
+    /// [`Session::decode_speculative`] it drains the GPU at the end of each
+    /// phase of a round instead — draft, verify, observe — so
+    /// [`DecodeStats::rounds`] charges each phase its own GPU tail, and takes
+    /// the profiler's per-phase counters when it is on.
     pub sample_split: bool,
+}
+
+/// One speculative round of [`Session::decode_speculative`], for the per-round
+/// breakdown a B=1 verdict rests on.
+#[derive(Debug, Clone, Default)]
+pub struct RoundStats {
+    /// Tokens the verify returned, the bonus included — before the EOS and
+    /// `max_tokens` cuts, so the round's work is counted whole.
+    pub accepted: usize,
+    /// The three phases' brackets; see [`RoundTiming`].
+    pub timing: RoundTiming,
 }
 
 impl DecodeOptions {
@@ -134,6 +152,8 @@ pub struct DecodeStats {
     pub overrun: usize,
     /// The strategy's own counters.
     pub readback: ReadbackCounters,
+    /// One entry per speculative round, empty on the baseline body.
+    pub rounds: Vec<RoundStats>,
 }
 
 /// The outcome of one decode run.
@@ -516,7 +536,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         self.pos += prompt.len();
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
 
-        let mut anchor_tok = logits.squeeze(0)?.argmax(lloom_tensor::D::Minus1)?.to_scalar::<u32>()?;
+        let mut anchor_tok = logits
+            .squeeze(0)?
+            .argmax(lloom_tensor::D::Minus1)?
+            .to_scalar::<u32>()?;
 
         // Seed the drafter's per-seq state: `begin` sets the block anchor to the
         // prompt's last token and clears the context. The context is keyed by the
@@ -558,11 +581,25 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 last: anchor_tok,
                 pos: self.pos,
             };
-            let accepted = self.speculative_step(spec, &[seq], &[anchor], 0.0)?;
-            let accepted = accepted
-                .into_iter()
-                .next()
-                .ok_or_else(|| lloom_tensor::Error::msg("decode_speculative: verify returned no sequence"))?;
+            // The census is one round's worth of allocation; take it once,
+            // past the warm-up rounds, so the breakdown carries which kernels
+            // each phase dispatches and not only how many.
+            let probe = RoundProbe {
+                sync: if opts.sample_split {
+                    Some(&device)
+                } else {
+                    None
+                },
+                census: opts.sample_split && stats.steps == CENSUS_ROUND,
+            };
+            let (accepted, timing) = self.speculative_round(spec, &[seq], &[anchor], 0.0, probe)?;
+            let accepted = accepted.into_iter().next().ok_or_else(|| {
+                lloom_tensor::Error::msg("decode_speculative: verify returned no sequence")
+            })?;
+            stats.rounds.push(RoundStats {
+                accepted: accepted.len(),
+                timing,
+            });
             if accepted.is_empty() {
                 lloom_tensor::bail!(
                     "decode_speculative: a verify round accepted zero tokens; the target's own \
@@ -697,6 +734,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         Ok(cache_sizes(device))
     }
 }
+
+/// The speculative round whose per-phase dispatch census is kept under
+/// `DecodeOptions::sample_split`: past the first rounds' pipeline warm-up,
+/// early enough that a short run still reaches it.
+const CENSUS_ROUND: u64 = 6;
 
 /// Prefill length for [`Session::warmup`], chosen to cross the
 /// `select_tile_config` `m >= 16` boundary (`DESIGN.md` §13.5c) so the warmup

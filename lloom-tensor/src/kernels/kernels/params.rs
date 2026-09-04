@@ -316,6 +316,23 @@ pub struct ShortconvStepParams {
     pub proj_stride_c: u64,
 }
 
+/// Scalars bound by `shortconv_ring` — the RotatingRing conv block over
+/// `seq_len` positions in one kernel (a speculative verify pass's ring writer,
+/// or the K=1 decode step on the same ring). The ring width and the position
+/// count are runtime, so the whole geometry is bound.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortconvRingParams {
+    pub dst_numel: u64,
+    pub hidden: u64,
+    pub seq_len: u64,
+    pub width: u64,
+    pub phase_last: u64,
+    pub proj_stride_b: u64,
+    pub proj_stride_c: u64,
+    pub proj_stride_l: u64,
+}
+
 /// The kernel in `conv.metal` that reports the device-side layout.
 pub const CONV_LAYOUT_KERNEL: &str = "conv_params_layout";
 
@@ -339,6 +356,8 @@ pub fn expected_conv_layout() -> Vec<(&'static str, u32)> {
     debug_assert_eq!(align_of::<ConvTranspose2dParams>(), 8);
     debug_assert_eq!(align_of::<Conv1dDepthwiseParams>(), 8);
     debug_assert_eq!(align_of::<Conv1dDepthwiseKParams>(), 8);
+    debug_assert_eq!(align_of::<ShortconvStepParams>(), 8);
+    debug_assert_eq!(align_of::<ShortconvRingParams>(), 8);
 
     vec![
         ("sizeof(Im2colParams)", size_of::<Im2colParams>() as u32),
@@ -567,6 +586,62 @@ pub fn expected_conv_layout() -> Vec<(&'static str, u32)> {
         (
             "Conv1dDepthwiseKParams.padding",
             offset_of!(Conv1dDepthwiseKParams, padding) as u32,
+        ),
+        (
+            "sizeof(ShortconvStepParams)",
+            size_of::<ShortconvStepParams>() as u32,
+        ),
+        (
+            "ShortconvStepParams.dst_numel",
+            offset_of!(ShortconvStepParams, dst_numel) as u32,
+        ),
+        (
+            "ShortconvStepParams.hidden",
+            offset_of!(ShortconvStepParams, hidden) as u32,
+        ),
+        (
+            "ShortconvStepParams.proj_stride_b",
+            offset_of!(ShortconvStepParams, proj_stride_b) as u32,
+        ),
+        (
+            "ShortconvStepParams.proj_stride_c",
+            offset_of!(ShortconvStepParams, proj_stride_c) as u32,
+        ),
+        (
+            "sizeof(ShortconvRingParams)",
+            size_of::<ShortconvRingParams>() as u32,
+        ),
+        (
+            "ShortconvRingParams.dst_numel",
+            offset_of!(ShortconvRingParams, dst_numel) as u32,
+        ),
+        (
+            "ShortconvRingParams.hidden",
+            offset_of!(ShortconvRingParams, hidden) as u32,
+        ),
+        (
+            "ShortconvRingParams.seq_len",
+            offset_of!(ShortconvRingParams, seq_len) as u32,
+        ),
+        (
+            "ShortconvRingParams.width",
+            offset_of!(ShortconvRingParams, width) as u32,
+        ),
+        (
+            "ShortconvRingParams.phase_last",
+            offset_of!(ShortconvRingParams, phase_last) as u32,
+        ),
+        (
+            "ShortconvRingParams.proj_stride_b",
+            offset_of!(ShortconvRingParams, proj_stride_b) as u32,
+        ),
+        (
+            "ShortconvRingParams.proj_stride_c",
+            offset_of!(ShortconvRingParams, proj_stride_c) as u32,
+        ),
+        (
+            "ShortconvRingParams.proj_stride_l",
+            offset_of!(ShortconvRingParams, proj_stride_l) as u32,
         ),
     ]
 }

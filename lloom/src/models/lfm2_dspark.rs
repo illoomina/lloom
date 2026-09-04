@@ -95,6 +95,11 @@ pub struct DSparkProjection {
     /// the safetensors header carries `fc.weight` and no `fc.bias`, and
     /// mlx-dspark constructs `nn.Linear(…, bias=False)`).
     fc: Tensor,
+    /// `fc` at the taps' dtype, transposed and contiguous — the operand
+    /// `forward`'s matmul actually reads. Built on the first call and kept:
+    /// the taps are F32 and the checkpoint is not, so rebuilding it per round
+    /// re-casts and re-copies the whole 42 MB weight every speculative round.
+    fc_t: std::sync::OnceLock<Tensor>,
     /// `hidden_norm.weight`, `[hidden]` — the encoder RMSNorm applied *after*
     /// the matmul.
     norm_weight: Tensor,
@@ -125,6 +130,7 @@ impl DSparkProjection {
         let norm_weight = vb.get(hidden, "hidden_norm.weight")?;
         Ok(Self {
             fc,
+            fc_t: std::sync::OnceLock::new(),
             norm_weight,
             eps,
             n_tap,
@@ -144,11 +150,27 @@ impl DSparkProjection {
         }
         Ok(Self {
             fc,
+            fc_t: std::sync::OnceLock::new(),
             norm_weight,
             eps,
             n_tap: cols / hidden,
             hidden,
         })
+    }
+
+    /// `W_c` at `dtype`, transposed to `[n_tap × hidden, hidden]` and
+    /// contiguous. Cached after the first call; a later call at a different
+    /// dtype rebuilds without caching, so one instance serves one dtype fast
+    /// and any other correctly.
+    fn fc_t(&self, dtype: DType) -> Result<Tensor> {
+        if let Some(t) = self.fc_t.get() {
+            if t.dtype() == dtype {
+                return Ok(t.clone());
+            }
+        }
+        let t = self.fc.to_dtype(dtype)?.t()?.contiguous()?;
+        let _ = self.fc_t.set(t.clone());
+        Ok(t)
     }
 
     /// How many target hidden states this projection consumes.
@@ -210,7 +232,7 @@ impl DSparkProjection {
         // Cast to the activations' dtype rather than the reverse: the taps are
         // F32 by `Config::tap_dtype` and downcasting them here would discard
         // the precision §10.2m says is bought deliberately.
-        let w = self.fc.to_dtype(cat.dtype())?.t()?.contiguous()?;
+        let w = self.fc_t(cat.dtype())?;
         let fc_out = cat.broadcast_matmul(&w)?;
 
         // The norm is AFTER the matmul. See the module docs: this is 10.2m's
@@ -792,6 +814,22 @@ impl MarkovHead {
         let w2 = self.w2.to_dtype(r.dtype())?;
         w2.matmul(&r.reshape((r.elem_count(), 1))?)?.squeeze(1)
     }
+
+    /// `W₁[tokens]` for a `[n]` `U32` tensor of tokens — `[n, rank]`, the
+    /// rows gathered on the device.
+    pub fn prev_embeddings(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.w1.index_select(tokens, 0)
+    }
+
+    /// [`Self::step_bias`] for a token that is still on the device — a `[1]`
+    /// `U32` tensor, such as the argmax of the previous position. The same
+    /// products in the same order; only the row lookup moves off the host.
+    pub fn step_bias_at(&self, token: &Tensor) -> Result<Tensor> {
+        let r = self.prev_embeddings(token)?;
+        let rank = r.dim(1)?;
+        let w2 = self.w2.to_dtype(r.dtype())?;
+        w2.matmul(&r.reshape((rank, 1))?)?.squeeze(1)
+    }
 }
 
 /// The confidence head's input width: `hidden_size + markov_rank`.
@@ -1099,24 +1137,31 @@ impl DSparkDrafter {
     /// inter-token dependency the parallel backbone drops and the Markov head
     /// restores (§10.2m step 3). With no Markov head this degenerates to a
     /// per-position argmax and the loop still gives the same answer.
+    ///
+    /// **The chain stays on the device.** Position `k`'s bias is looked up
+    /// from position `k−1`'s argmax *as a tensor*, so the `cap` positions are
+    /// one enqueued chain and the block comes back in a single readback at the
+    /// end — not one blocking readback per position, which serialized the host
+    /// against the GPU `cap` times per draft (#675). The arithmetic is
+    /// unchanged: the same rows, the same products, the same argmax.
     pub fn sample_block(&self, base_logits: &Tensor, first_prev: u32) -> Result<Vec<u32>> {
         let (cap, _) = base_logits.dims2()?;
-        let mut out = Vec::with_capacity(cap);
-        let mut prev = first_prev;
+        let mut picks = Vec::with_capacity(cap);
+        let mut prev = Tensor::new(&[first_prev], base_logits.device())?;
         for k in 0..cap {
             let row = base_logits.i(k)?;
             let row = match &self.markov {
                 None => row,
                 Some(m) => {
-                    let bias = m.step_bias(prev)?.to_dtype(row.dtype())?;
+                    let bias = m.step_bias_at(&prev)?.to_dtype(row.dtype())?;
                     (row + bias)?
                 }
             };
-            let next = row.argmax(D::Minus1)?.to_scalar::<u32>()?;
-            out.push(next);
+            let next = row.argmax_keepdim(D::Minus1)?;
+            picks.push(next.clone());
             prev = next;
         }
-        Ok(out)
+        Tensor::cat(&picks, 0)?.to_vec1::<u32>()
     }
 
     /// Per-position accept probabilities for a drafted block.
@@ -1145,14 +1190,11 @@ impl DSparkDrafter {
                 prev_tokens.len()
             );
         }
-        let mut rows = Vec::with_capacity(cap);
-        for &t in prev_tokens {
-            rows.push(markov.prev_embedding(t)?);
-        }
+        let prev_ids = Tensor::new(prev_tokens, block_hidden.device())?;
         // Both halves of the concat are brought to the backbone's dtype rather
         // than to `block_hidden`'s, because the head's own weights are at that
         // dtype and a caller may hand us an F32 slice.
-        let prev = Tensor::stack(&rows, 0)?.to_dtype(self.dtype)?;
+        let prev = markov.prev_embeddings(&prev_ids)?.to_dtype(self.dtype)?;
         let hidden = block_hidden.to_dtype(self.dtype)?;
         let feats = Tensor::cat(&[&hidden, &prev], D::Minus1)?.contiguous()?;
         Ok(Some(head.forward(&feats)?))

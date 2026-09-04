@@ -665,9 +665,9 @@ pub fn shortconv_step(
             .and_then(|f| f.name(dtype.as_str()))
         {
             Some(n) => n,
-            None => lloom_tensor::bail!(
-                "shortconv_step: no fused variant for (k={k_size}, {dtype:?})"
-            ),
+            None => {
+                lloom_tensor::bail!("shortconv_step: no fused variant for (k={k_size}, {dtype:?})")
+            }
         };
 
         // b/x/c share a layout (sibling narrows); take the stride pair from `b`
@@ -682,7 +682,9 @@ pub fn shortconv_step(
             ($s:expr, $what:literal) => {
                 match &*$s {
                     lloom_tensor::Storage::Metal(m) => m,
-                    _ => lloom_tensor::bail!(concat!("shortconv_step: ", $what, " must be on metal")),
+                    _ => {
+                        lloom_tensor::bail!(concat!("shortconv_step: ", $what, " must be on metal"))
+                    }
                 }
             };
         }
@@ -711,7 +713,9 @@ pub fn shortconv_step(
             .build()
             .map_err(lloom_tensor::Error::wrap)?;
 
-        let encoder = device.command_encoder().map_err(lloom_tensor::Error::wrap)?;
+        let encoder = device
+            .command_encoder()
+            .map_err(lloom_tensor::Error::wrap)?;
         lloom_tensor::kernels::call_shortconv_step(
             device.metal_device(),
             &encoder,
@@ -746,6 +750,158 @@ pub fn shortconv_step(
         let new_state = Tensor::from_storage(
             lloom_tensor::Storage::Metal(state_storage),
             (b_sz, hidden, k_size),
+            BackpropOp::none(),
+            false,
+        );
+        Ok((out, new_state))
+    }
+}
+
+/// The RotatingRing conv block over `seq_len` positions in one dispatch —
+/// the speculative verify pass's per-position ring writer (`slice_set` + the
+/// phase-permuted fold per position per layer) and the K=1 decode step on the
+/// same ring, as one kernel per layer (`shortconv_ring`, issue #675).
+///
+/// `b`, `x`, `c` are `[b, hidden, seq_len]` views sharing one stride triple;
+/// `state` is the contiguous `[b, hidden, width]` ring; `weights` is the
+/// per-phase permuted table `[width, hidden, width]`; `phase_last` is the ring
+/// slot of the last position (the pass's `conv_phase`). Returns the gated conv
+/// output already in `[b, seq_len, hidden]` — the layout `out_proj` reads — and
+/// the ring after the writes. Bit-identical to the per-position loop: the same
+/// products in the same order, rounded at the same points.
+pub fn shortconv_ring(
+    b: &Tensor,
+    x: &Tensor,
+    c: &Tensor,
+    state: &Tensor,
+    weights: &Tensor,
+    phase_last: usize,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (b, x, c, state, weights, phase_last);
+        lloom_tensor::bail!("shortconv_ring is metal-only; use the unfused conv arm off Metal")
+    }
+    #[cfg(feature = "metal")]
+    {
+        use lloom_tensor::backend::BackendStorage;
+        use lloom_tensor::metal_backend::buffer_o;
+
+        let (b_sz, hidden, width) = state.dims3().map_err(|e| {
+            lloom_tensor::Error::msg(format!(
+                "shortconv_ring: state must be [b, hidden, width]: {e}"
+            ))
+        })?;
+        let (_, _, seq_len) = b.dims3()?;
+        if seq_len == 0 || seq_len > width {
+            lloom_tensor::bail!(
+                "shortconv_ring: {seq_len} positions into a {width}-wide ring; a pass writes \
+                 between 1 and width slots"
+            );
+        }
+        if weights.dims3()? != (width, hidden, width) || !weights.is_contiguous() {
+            lloom_tensor::bail!(
+                "shortconv_ring: weights must be the contiguous per-phase table \
+                 [width={width}, hidden={hidden}, width={width}], got {:?}",
+                weights.shape()
+            );
+        }
+        if !state.is_contiguous() {
+            lloom_tensor::bail!("shortconv_ring: state must be contiguous");
+        }
+        if b.stride() != x.stride() || b.stride() != c.stride() {
+            lloom_tensor::bail!("shortconv_ring: b/x/c must share one layout");
+        }
+        let dtype = state.dtype();
+        let name = match lloom_tensor::kernels::ConvKernel::SHORTCONV_RING.name(dtype.as_str()) {
+            Some(n) => n,
+            None => lloom_tensor::bail!("shortconv_ring: no variant for {dtype:?}"),
+        };
+
+        let (b_s, b_l) = b.storage_and_layout();
+        let (x_s, x_l) = x.storage_and_layout();
+        let (c_s, c_l) = c.storage_and_layout();
+        let (st_s, st_l) = state.storage_and_layout();
+        let (w_s, w_l) = weights.storage_and_layout();
+        macro_rules! metal {
+            ($s:expr, $what:literal) => {
+                match &*$s {
+                    lloom_tensor::Storage::Metal(m) => m,
+                    _ => {
+                        lloom_tensor::bail!(concat!("shortconv_ring: ", $what, " must be on metal"))
+                    }
+                }
+            };
+        }
+        let b_s = metal!(b_s, "b");
+        let x_s = metal!(x_s, "x");
+        let c_s = metal!(c_s, "c");
+        let st_s = metal!(st_s, "state");
+        let w_s = metal!(w_s, "weights");
+
+        let stride = b_l.stride();
+        let params = lloom_tensor::kernels::ShortconvRingParams {
+            dst_numel: (b_sz * hidden) as u64,
+            hidden: hidden as u64,
+            seq_len: seq_len as u64,
+            width: width as u64,
+            phase_last: phase_last as u64,
+            proj_stride_b: stride[0] as u64,
+            proj_stride_c: stride[1] as u64,
+            proj_stride_l: stride[2] as u64,
+        };
+
+        let device = st_s.device();
+        let state_out = device
+            .new_buffer_builder()
+            .with_size_for(b_sz * hidden * width, dtype)
+            .with_label("shortconv_ring_state")
+            .build()
+            .map_err(lloom_tensor::Error::wrap)?;
+        let out_numel = b_sz * seq_len * hidden;
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(out_numel, dtype)
+            .with_label("shortconv_ring_out")
+            .build()
+            .map_err(lloom_tensor::Error::wrap)?;
+
+        let encoder = device
+            .command_encoder()
+            .map_err(lloom_tensor::Error::wrap)?;
+        lloom_tensor::kernels::call_shortconv_ring(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            name,
+            params,
+            buffer_o(b_s.buffer(), b_l, dtype),
+            buffer_o(x_s.buffer(), x_l, dtype),
+            buffer_o(c_s.buffer(), c_l, dtype),
+            buffer_o(st_s.buffer(), st_l, dtype),
+            buffer_o(w_s.buffer(), w_l, dtype),
+            &state_out,
+            &dst,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+
+        use lloom_tensor::op::BackpropOp;
+        let out_storage = lloom_tensor::MetalStorage::new(dst, device.clone(), out_numel, dtype);
+        let out = Tensor::from_storage(
+            lloom_tensor::Storage::Metal(out_storage),
+            (b_sz, seq_len, hidden),
+            BackpropOp::none(),
+            false,
+        );
+        let state_storage = lloom_tensor::MetalStorage::new(
+            state_out,
+            device.clone(),
+            b_sz * hidden * width,
+            dtype,
+        );
+        let new_state = Tensor::from_storage(
+            lloom_tensor::Storage::Metal(state_storage),
+            (b_sz, hidden, width),
             BackpropOp::none(),
             false,
         );

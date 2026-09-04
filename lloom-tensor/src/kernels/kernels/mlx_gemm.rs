@@ -173,7 +173,8 @@ fn derive_gemv_tile(out_vec_size: usize, in_vec_size: usize) -> (usize, usize, u
     }
 }
 
-/// The `m` below which `select_tile_config` keeps `TILE_32_32_16_2_2`.
+/// The `m` below which `select_tile_config` takes the skinny tile
+/// (`TILE_16_32_16_2_2` as of issue #675; `TILE_32_32_16_2_2` before it).
 ///
 /// **16 is what ships**, which is `select_tile_config`'s own literal and what
 /// every recorded figure in this repository belongs to. `LLOOM_364_SKINNY_MAX`
@@ -312,8 +313,22 @@ fn select_tile_config(
     //
     // Read once (`OnceLock`), so this is not a per-dispatch `getenv` on a path
     // §15.2 #10 forbids O(N) work on.
+    //
+    // # The tile below the threshold is 16×32, not 32×32 (issue #675)
+    //
+    // The comment above calls 32×32 "the smallest available"; 16-row tiles
+    // are instantiated and were only reachable through `LLOOM_383_TILE`.
+    // Measured on batched decode, where `m` is `B` (§13.4b), GPU busy per
+    // step against the 32×32 tile, 3 interleaved reps each, null 1.000:
+    // `m` = 2 **0.671**, 4 **0.682**, 8 **0.693**, 12 **0.700**, 15 **0.685**
+    // for 16×32, and 0.70–0.75 for 16×16 — a third of the step across the
+    // whole band, and the DSpark verify pass at `m` = 10 from 54.6 to 39.6 ms
+    // (`DESIGN.md` §10.2u). The 32×32 tile pads 10 rows to 32; the 16-row
+    // tile pads to 16 and issues twice the threadgroups over N, which is what
+    // a padded-thread-bound kernel wants. `LLOOM_383_TILE=32x32` restores the
+    // previous selection for an A/B.
     if m < skinny_max() {
-        return TILE_32_32_16_2_2;
+        return TILE_16_32_16_2_2;
     }
 
     // MLX uses batch_size * M * N >= 1M as the threshold for "large matmul"

@@ -23,7 +23,7 @@
 //! `h_nextn` head does not compile rather than failing at runtime (§3.4.3).
 
 use crate::nn::model::CausalLM;
-use lloom_tensor::{DType, Result};
+use lloom_tensor::{DType, Device, Result};
 
 /// A sequence slot on the serving side. The `Speculator` is constructed for a
 /// fixed number of these (server slots), and per-seq state lives *inside* the
@@ -303,6 +303,70 @@ pub trait Probes<P: TargetProbe>: CausalLM {
     ) -> Result<(Vec<Vec<u32>>, P::Output)>;
 }
 
+/// How [`Session::speculative_round`] brackets its phases.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RoundProbe<'d> {
+    /// Synchronize this device at the end of every phase, so a phase's GPU
+    /// work is charged to it. `None` brackets the host only.
+    pub sync: Option<&'d Device>,
+    /// Also take the per-phase dispatch census by pipeline label (needs
+    /// `sync` and the Metal profiler). Allocates; ask for one round, not all.
+    pub census: bool,
+}
+
+/// One phase's dispatch census: `(pipeline label, dispatches)`, descending.
+pub type PhaseCensus = Vec<(String, u64)>;
+
+impl RoundProbe<'_> {
+    /// Close a phase: synchronize if asked, and take `(gpu_busy_union_s,
+    /// dispatches, census)` from the profiler if it is on, resetting it.
+    fn close(&self) -> Result<(f64, u64, Option<PhaseCensus>)> {
+        let Some(device) = self.sync else {
+            return Ok((0.0, 0, None));
+        };
+        device.synchronize()?;
+        #[cfg(feature = "metal")]
+        {
+            use lloom_tensor::metal_backend::profile;
+            if profile::enabled() {
+                let s = profile::snapshot();
+                profile::reset();
+                let census = if self.census { Some(s.by_label) } else { None };
+                return Ok((s.gpu_busy_union_s, s.dispatches, census));
+            }
+        }
+        Ok((0.0, 0, None))
+    }
+}
+
+/// One speculative round's phase brackets, from [`Session::speculative_round`].
+///
+/// Wall is the host's clock around each phase. GPU-busy and dispatches are
+/// per phase and only nonzero when the round was probed with `sync` and the
+/// Metal profiler on; the census only when it was asked for.
+#[derive(Debug, Clone, Default)]
+pub struct RoundTiming {
+    pub draft_ns: u64,
+    pub verify_ns: u64,
+    pub observe_ns: u64,
+    pub draft_gpu_s: f64,
+    pub verify_gpu_s: f64,
+    pub observe_gpu_s: f64,
+    pub draft_disp: u64,
+    pub verify_disp: u64,
+    pub observe_disp: u64,
+    pub draft_census: Option<PhaseCensus>,
+    pub verify_census: Option<PhaseCensus>,
+    pub observe_census: Option<PhaseCensus>,
+}
+
+impl RoundTiming {
+    /// The round's wall, the three phases summed.
+    pub fn wall_ns(&self) -> u64 {
+        self.draft_ns + self.verify_ns + self.observe_ns
+    }
+}
+
 /// A target holding its own cache, driving speculative rounds. The typed pair
 /// (target, drafter) is checked where [`Session::speculative_step`] is
 /// instantiated — `M: Probes<S::Probe>` there — and the driver names neither
@@ -365,7 +429,45 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         M: Probes<S::Probe>,
     {
+        self.speculative_round(spec, active, anchors, p_min, RoundProbe::default())
+            .map(|(accepted, _)| accepted)
+    }
+
+    /// [`Self::speculative_step`] with the round's three phases bracketed —
+    /// draft, verify (the target's `forward_all` up to and including the
+    /// accept compare's readback) and observe (the drafter's re-key). The
+    /// decode loop's per-round breakdown (`DecodeStats::rounds`) is this.
+    ///
+    /// Without a `probe.sync` device the brackets are the host's view: the
+    /// draft ends when the drafter has its tokens (it reads them back), the
+    /// verify ends when the argmax has been read back, and the observe is its
+    /// encode only. With `probe.sync` each phase ends on a `synchronize`, so a
+    /// phase's GPU tail is charged to that phase and not to the next one's
+    /// readback; and when the Metal profiler is on the per-phase GPU-busy
+    /// union and dispatch count are taken too (the counters are reset per
+    /// phase — a caller reading them itself must accumulate from here).
+    /// The synchronize perturbs the round it measures, exactly as
+    /// `DecodeOptions::sample_split` does for the baseline loop.
+    pub fn speculative_round<S>(
+        &mut self,
+        spec: &mut S,
+        active: &[SeqId],
+        anchors: &[Anchor],
+        p_min: f32,
+        probe: RoundProbe<'_>,
+    ) -> Result<(Vec<Vec<u32>>, RoundTiming)>
+    where
+        S: Speculator,
+        M: Probes<S::Probe>,
+    {
+        let mut timing = RoundTiming::default();
+        let t = std::time::Instant::now();
         let mut drafts = spec.draft(active)?;
+        let (gpu, disp, census) = probe.close()?;
+        timing.draft_ns = t.elapsed().as_nanos() as u64;
+        timing.draft_gpu_s = gpu;
+        timing.draft_disp = disp;
+        timing.draft_census = census;
 
         // Driver-owned `p_min` truncation. `--spec-draft-p-min` is off at 0.0
         // (`speculative.cpp:796`), and a family with no confidence signal leaves
@@ -382,13 +484,26 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         // ONE target forward over `[last, draft…]`, extracting the probe in the
         // SAME pass (§10.2r amortization).
+        let t = std::time::Instant::now();
         let (accepted, probe_out) =
             self.model
                 .verify_and_probe(&drafts, anchors, &mut self.cache)?;
+        let (gpu, disp, census) = probe.close()?;
+        timing.verify_ns = t.elapsed().as_nanos() as u64;
+        timing.verify_gpu_s = gpu;
+        timing.verify_disp = disp;
+        timing.verify_census = census;
+
+        let t = std::time::Instant::now();
         for (seq, acc) in active.iter().zip(&accepted) {
             spec.observe(*seq, &probe_out, acc)?;
         }
-        Ok(accepted)
+        let (gpu, disp, census) = probe.close()?;
+        timing.observe_ns = t.elapsed().as_nanos() as u64;
+        timing.observe_gpu_s = gpu;
+        timing.observe_disp = disp;
+        timing.observe_census = census;
+        Ok((accepted, timing))
     }
 
     /// The target's cache, for a caller that prefills before the first round.

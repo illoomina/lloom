@@ -199,12 +199,24 @@ impl ReadbackStrategy for AnyArm {
             AnyArm::Ring(r) => r.take_ids(),
         }
     }
+    fn drain_all(&mut self) -> Result<Vec<u32>> {
+        match self {
+            AnyArm::Blocking(b) => b.drain_all(),
+            AnyArm::Ring(r) => r.drain_all(),
+        }
+    }
     fn counters(&self) -> lloom::generation::ReadbackCounters {
         match self {
             AnyArm::Blocking(b) => b.counters(),
             AnyArm::Ring(r) => r.counters(),
         }
     }
+}
+
+/// The streaming hook these tests do not exercise: the loop calls it with
+/// each confirmed batch, and the returned `ids` carry the whole run either way.
+fn sink(_batch: &[u32]) -> Result<()> {
+    Ok(())
 }
 
 fn run(
@@ -218,7 +230,7 @@ fn run(
     let mut spec = IdentityProposer;
     let mut rb = strategy(arm, device, opts.max_tokens + 4)?;
     let mut sampler = greedy();
-    let out = session.decode(&mut spec, &mut rb, &mut sampler, prompt, opts)?;
+    let out = session.decode(&mut spec, &mut rb, &mut sampler, prompt, opts, &mut sink)?;
     Ok((out, session.pos()))
 }
 
@@ -388,12 +400,13 @@ fn a_second_decode_continues_from_the_cache_position() -> Result<()> {
             let mut rb = strategy(&arm, &device, 64)?;
             let mut sampler = greedy();
             let opts = DecodeOptions::new(6);
-            let first = session.decode(&mut spec, &mut rb, &mut sampler, &[0], &opts)?;
+            let first = session.decode(&mut spec, &mut rb, &mut sampler, &[0], &opts, &mut sink)?;
             assert_eq!(first.ids, chain(0, 6).0);
             assert_eq!(session.pos(), 7);
             // The follow-up prompt is prefilled at the cache position; the
             // chain restarts from its last token.
-            let second = session.decode(&mut spec, &mut rb, &mut sampler, &[5, 1], &opts)?;
+            let second =
+                session.decode(&mut spec, &mut rb, &mut sampler, &[5, 1], &opts, &mut sink)?;
             let (want, hit) = chain(1, 6);
             assert_eq!(second.ids, want);
             assert_eq!(second.eos, hit);
@@ -423,6 +436,10 @@ fn max_tokens_bounds_the_run_and_a_ring_too_small_is_refused() -> Result<()> {
     assert_eq!(out.ids.len(), 5);
     let model = Chain::new(&device)?;
     let mut session = Session::new(&model, 0usize);
+    // `Ring::new` floors the history at `RING_HISTORY_SLOTS` (a few pages, so
+    // a short run gets a generous ring), so a refusal needs a run longer than
+    // the floor, not longer than the 3 asked for.
+    let floor = lloom::generation::readback::RING_HISTORY_SLOTS;
     let mut rb = Ring::new(&[EOS], &device, 3, EosRead::Blocking)?;
     let err = session
         .decode(
@@ -430,7 +447,8 @@ fn max_tokens_bounds_the_run_and_a_ring_too_small_is_refused() -> Result<()> {
             &mut rb,
             &mut greedy(),
             &[0],
-            &DecodeOptions::new(5),
+            &DecodeOptions::new(floor + 2),
+            &mut sink,
         )
         .unwrap_err();
     assert!(err.to_string().contains("capacity"), "{err}");
@@ -459,6 +477,7 @@ fn the_refusals_refuse() -> Result<()> {
             &mut top_p,
             &[0],
             &DecodeOptions::new(4),
+            &mut sink,
         )
         .unwrap_err();
     assert!(err.to_string().contains("device-resident"), "{err}");
@@ -471,6 +490,7 @@ fn the_refusals_refuse() -> Result<()> {
         &mut top_p,
         &[0],
         &DecodeOptions::new(4),
+        &mut sink,
     )?;
 
     // Lookahead on the blocking arm has nothing to overlap.
@@ -481,7 +501,14 @@ fn the_refusals_refuse() -> Result<()> {
         ..DecodeOptions::new(4)
     };
     let err = session
-        .decode(&mut IdentityProposer, &mut rb, &mut greedy(), &[0], &opts)
+        .decode(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut greedy(),
+            &[0],
+            &opts,
+            &mut sink,
+        )
         .unwrap_err();
     assert!(err.to_string().contains("lookahead"), "{err}");
 
@@ -493,7 +520,14 @@ fn the_refusals_refuse() -> Result<()> {
         ..DecodeOptions::new(4)
     };
     let err = session
-        .decode(&mut IdentityProposer, &mut rb, &mut greedy(), &[0], &opts)
+        .decode(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut greedy(),
+            &[0],
+            &opts,
+            &mut sink,
+        )
         .unwrap_err();
     assert!(err.to_string().contains("lookahead 2"), "{err}");
 
@@ -506,7 +540,8 @@ fn the_refusals_refuse() -> Result<()> {
             &mut rb,
             &mut greedy(),
             &[],
-            &DecodeOptions::new(4)
+            &DecodeOptions::new(4),
+            &mut sink,
         )
         .is_err());
     assert!(Blocking::new(&[], &device).is_err());
@@ -545,9 +580,10 @@ fn the_refusals_refuse() -> Result<()> {
             &mut greedy(),
             &[0],
             &DecodeOptions::new(4),
+            &mut sink,
         )
         .unwrap_err();
-    assert!(err.to_string().contains("stage 2"), "{err}");
+    assert!(err.to_string().contains("decode_speculative"), "{err}");
     Ok(())
 }
 

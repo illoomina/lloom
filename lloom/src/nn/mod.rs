@@ -54,7 +54,7 @@ pub use conv::{
     conv_transpose2d, conv_transpose2d_no_bias, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
-pub use decode::{DecodeOptions, DecodeOut, DecodeStats, IdentityProposer};
+pub use decode::{DecodeOptions, DecodeOut, DecodeStats, IdentityProposer, RoundStats};
 pub use embedding::{embedding, Embedding};
 pub use func::{func, func_t, Func, FuncT};
 pub use group_norm::{group_norm, GroupNorm};
@@ -69,8 +69,8 @@ pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
 pub use speculator::{
-    Anchor, Draft, KvSource, LayerTaps, NextnHidden, NoProbe, ProbeHooks, Probes, SeqId, Session,
-    Speculator, TapSide, TapSpec, TargetProbe,
+    Anchor, Draft, KvSource, LayerTaps, NextnHidden, NoProbe, PhaseCensus, ProbeHooks, Probes,
+    RoundProbe, RoundTiming, SeqId, Session, Speculator, TapSide, TapSpec, TargetProbe,
 };
 pub use var_builder::VarBuilder;
 pub use var_map::VarMap;

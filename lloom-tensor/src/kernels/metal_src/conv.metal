@@ -135,6 +135,29 @@ struct ShortconvStepParams {
     size_t proj_stride_c; // stride to step one channel in b/x/c
 };
 
+// The RotatingRing conv block for `seq_len` positions in one kernel: the
+// ring-writer a speculative verify pass runs per position (`slice_set` + fold
+// against the phase-permuted weight, 22 layers x seq_len x 5 dispatches), and
+// the K=1 decode step on the same ring. Position `i` lands in slot
+// `(phase_last + width - (seq_len - 1 - i)) % width`, is folded over the whole
+// `width`-wide row against that slot's permuted weight in slot order 0..width-1
+// with a wider accumulator, then scaled by `C` -- the per-position depthwise
+// fold's products in its order, so the output is bit-identical to the loop.
+// Threads are per (batch, channel); the output is written directly in
+// `[b, seq_len, hidden]`, the layout `out_proj` reads, so the transpose copy
+// goes too. State `[b, hidden, width]` contiguous in and out; `weights` is the
+// per-phase permuted table `[width, hidden, width]` contiguous.
+struct ShortconvRingParams {
+    size_t dst_numel;      // b * hidden (one thread per channel per batch)
+    size_t hidden;         // channel count
+    size_t seq_len;        // positions this pass writes, 1..=width
+    size_t width;          // ring width, l_cache + K
+    size_t phase_last;     // ring slot of the LAST position (the pass's conv_phase)
+    size_t proj_stride_b;  // stride to step one batch in b/x/c
+    size_t proj_stride_c;  // stride to step one channel in b/x/c
+    size_t proj_stride_l;  // stride to step one position in b/x/c
+};
+
 // Kernels
 //
 // One body per kernel, two entry points around it. The classical wrapper binds
@@ -1336,6 +1359,107 @@ template <typename T, typename A, ushort K_SIZE>
       p, b_in, x_in, c_in, state_in, weight, state_out, dst, tid);
 }
 
+template <typename T, typename A>
+METAL_FUNC void shortconv_ring_body(
+    thread const ShortconvRingParams &p,
+    device const T *b_in,
+    device const T *x_in,
+    device const T *c_in,
+    device const T *state_in,
+    device const T *weights,
+    device T *state_out,
+    device T *dst,
+    uint tid
+) {
+  if (tid >= p.dst_numel) {
+    return;
+  }
+  const size_t hidden = p.hidden;
+  const size_t width = p.width;
+  const size_t seq_len = p.seq_len;
+  const size_t c_idx = tid % hidden;
+  const size_t b_idx = tid / hidden;
+
+  // This channel's ring row: carried over whole, then written per position.
+  const size_t st = (b_idx * hidden + c_idx) * width;
+  for (size_t s = 0; s < width; ++s) {
+    state_out[st + s] = state_in[st + s];
+  }
+
+  const size_t proj = b_idx * p.proj_stride_b + c_idx * p.proj_stride_c;
+  for (size_t i = 0; i < seq_len; ++i) {
+    const size_t phase = (p.phase_last + width - (seq_len - 1 - i)) % width;
+    const size_t pi = proj + i * p.proj_stride_l;
+    // `b * x` in T, as the elementwise kernel computes it.
+    const T bx = b_in[pi] * x_in[pi];
+    state_out[st + phase] = bx;
+
+    // The whole row against this slot's permuted weight, slot order, wide
+    // accumulator, rounded once -- the depthwise fold's arithmetic exactly.
+    // The pragma pins the reduction to that serial order: under fast math the
+    // compiler may otherwise split a branch-free loop into interleaved partial
+    // sums, which the depthwise kernel's branchy loop never gets, and the two
+    // then disagree by an ulp.
+    device const T *w = weights + (phase * hidden + c_idx) * width;
+    A acc = static_cast<A>(0);
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+    for (size_t s = 0; s < width; ++s) {
+      acc += static_cast<A>(state_out[st + s]) * static_cast<A>(w[s]);
+    }
+    // Rounded to T, then gated in T -- the depthwise store followed by the
+    // elementwise `* C`, in that order and at that width. The store to a
+    // volatile is the rounding: under fast math the compiler otherwise feeds
+    // the unrounded accumulator into the multiply, and the result then differs
+    // from the two-kernel form by an ulp of T on a third of the elements.
+    thread volatile T folded_v = static_cast<T>(acc);
+    const T folded = folded_v;
+    dst[(b_idx * seq_len + i) * hidden + c_idx] = folded * c_in[pi];
+  }
+}
+
+template <typename T, typename A>
+[[kernel]] void shortconv_ring(
+    constant size_t &dst_numel,
+    constant size_t &hidden,
+    constant size_t &seq_len,
+    constant size_t &width,
+    constant size_t &phase_last,
+    constant size_t &proj_stride_b,
+    constant size_t &proj_stride_c,
+    constant size_t &proj_stride_l,
+    device const T *b_in,
+    device const T *x_in,
+    device const T *c_in,
+    device const T *state_in,
+    device const T *weights,
+    device T *state_out,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  ShortconvRingParams p {
+      dst_numel, hidden, seq_len, width, phase_last,
+      proj_stride_b, proj_stride_c, proj_stride_l };
+  shortconv_ring_body<T, A>(
+      p, b_in, x_in, c_in, state_in, weights, state_out, dst, tid);
+}
+
+template <typename T, typename A>
+[[kernel]] void shortconv_ring_packed(
+    device const ShortconvRingParams *pp,
+    device const T *b_in,
+    device const T *x_in,
+    device const T *c_in,
+    device const T *state_in,
+    device const T *weights,
+    device T *state_out,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  ShortconvRingParams p = *pp;
+  shortconv_ring_body<T, A>(
+      p, b_in, x_in, c_in, state_in, weights, state_out, dst, tid);
+}
+
 // Layout, asserted rather than hoped.
 //
 // A field at the wrong offset does not crash: the kernel reads a well-formed
@@ -1384,6 +1508,12 @@ static_assert(alignof(Conv1dDepthwiseParams) == 8, "Conv1dDepthwiseParams alignm
 static_assert(sizeof(Conv1dDepthwiseKParams) == 24, "Conv1dDepthwiseKParams layout");
 static_assert(alignof(Conv1dDepthwiseKParams) == 8, "Conv1dDepthwiseKParams alignment");
 
+static_assert(sizeof(ShortconvStepParams) == 32, "ShortconvStepParams layout");
+static_assert(alignof(ShortconvStepParams) == 8, "ShortconvStepParams alignment");
+
+static_assert(sizeof(ShortconvRingParams) == 64, "ShortconvRingParams layout");
+static_assert(alignof(ShortconvRingParams) == 8, "ShortconvRingParams alignment");
+
 // The offset is taken from a real `thread` instance rather than the usual
 // null-pointer form, which MSL rejects in constant evaluation. Measuring it at
 // runtime is what this kernel is for.
@@ -1405,6 +1535,8 @@ static_assert(alignof(Conv1dDepthwiseKParams) == 8, "Conv1dDepthwiseKParams alig
     ConvTranspose2dParams     probe_ConvTranspose2dParams;
     Conv1dDepthwiseParams     probe_Conv1dDepthwiseParams;
     Conv1dDepthwiseKParams    probe_Conv1dDepthwiseKParams;
+    ShortconvStepParams       probe_ShortconvStepParams;
+    ShortconvRingParams       probe_ShortconvRingParams;
 
     out[0]  = sizeof(Im2colParams);
     out[1]  = offsetof_rt(Im2colParams, dst_numel);
@@ -1480,6 +1612,22 @@ static_assert(alignof(Conv1dDepthwiseKParams) == 8, "Conv1dDepthwiseKParams alig
     out[62] = offsetof_rt(Conv1dDepthwiseKParams, dst_numel);
     out[63] = offsetof_rt(Conv1dDepthwiseKParams, l_out);
     out[64] = offsetof_rt(Conv1dDepthwiseKParams, padding);
+
+    out[65] = sizeof(ShortconvStepParams);
+    out[66] = offsetof_rt(ShortconvStepParams, dst_numel);
+    out[67] = offsetof_rt(ShortconvStepParams, hidden);
+    out[68] = offsetof_rt(ShortconvStepParams, proj_stride_b);
+    out[69] = offsetof_rt(ShortconvStepParams, proj_stride_c);
+
+    out[70] = sizeof(ShortconvRingParams);
+    out[71] = offsetof_rt(ShortconvRingParams, dst_numel);
+    out[72] = offsetof_rt(ShortconvRingParams, hidden);
+    out[73] = offsetof_rt(ShortconvRingParams, seq_len);
+    out[74] = offsetof_rt(ShortconvRingParams, width);
+    out[75] = offsetof_rt(ShortconvRingParams, phase_last);
+    out[76] = offsetof_rt(ShortconvRingParams, proj_stride_b);
+    out[77] = offsetof_rt(ShortconvRingParams, proj_stride_c);
+    out[78] = offsetof_rt(ShortconvRingParams, proj_stride_l);
 }
 
 // Explicit instantiation. `decltype(func<...>)` restates the template's own
@@ -1533,6 +1681,10 @@ static_assert(alignof(Conv1dDepthwiseKParams) == 8, "Conv1dDepthwiseKParams alig
 #define init_shortconv_step(tname, t, acc, k) \
     init_kernel("shortconv_step_" #tname "_k" #k, shortconv_step, t, acc, k) \
     init_kernel("shortconv_step_" #tname "_k" #k "_packed", shortconv_step_packed, t, acc, k)
+
+#define init_shortconv_ring(tname, t, acc) \
+    init_kernel("shortconv_ring_" #tname, shortconv_ring, t, acc) \
+    init_kernel("shortconv_ring_" #tname "_packed", shortconv_ring_packed, t, acc)
 
 #define init_im2col1d(tname, t) \
     init_kernel("im2col1d_" #tname, im2col1d, t) \
@@ -1629,6 +1781,12 @@ init_shortconv_step(f16, half, float, 4);
 init_shortconv_step(bf16, bfloat, float, 2);
 init_shortconv_step(bf16, bfloat, float, 3);
 init_shortconv_step(bf16, bfloat, float, 4);
+#endif
+
+init_shortconv_ring(f32, float, float);
+init_shortconv_ring(f16, half, float);
+#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 310
+init_shortconv_ring(bf16, bfloat, float);
 #endif
 
 init_im2col1d(f32, float);

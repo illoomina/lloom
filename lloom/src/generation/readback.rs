@@ -499,6 +499,7 @@ impl ReadbackStrategy for Ring {
         // place and never reallocated for this ring's lifetime, so the mapping
         // stays valid; `end <= fed <= capacity = count`, so every read is in
         // bounds.
+        #[cfg(feature = "metal")]
         if end > start {
             if let Some(base) = unsafe { self.history.peek_scalar_ptr::<u32>(start) } {
                 let n = end - start;
@@ -510,6 +511,10 @@ impl ReadbackStrategy for Ring {
                 return Ok(ids);
             }
         }
+        // Off Metal there is no mapped pointer to peek; the snapshot below is
+        // the only path (`peek_scalar_ptr` is `cfg(feature = "metal")`).
+        #[cfg(not(feature = "metal"))]
+        let _ = end;
 
         // Snapshot / fallback path. Taken when: the counter is unmapped (`end`
         // forced to 0 above), or the history buffer itself is not CPU-mapped (a

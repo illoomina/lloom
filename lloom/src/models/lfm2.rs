@@ -2547,6 +2547,9 @@ struct ShortConv {
     /// One weight permutation per rotation phase, built at load time for
     /// `ConvState::RotatingRing` and `None` otherwise. See `ShortConv::new`.
     rotating_weights: Option<Vec<Tensor>>,
+    /// The same permutations stacked `[width, hidden, width]`, the operand the
+    /// fused ring kernel indexes by phase (`shortconv_ring_fused`).
+    rotating_table: Option<Tensor>,
     conv_state: ConvState,
     /// Fuse the post-conv residual add onto `out_proj`'s GEMV store (§12.2h).
     /// 22 of the 60 `badd_f16` dispatches per token — the largest of the three.
@@ -2650,12 +2653,17 @@ impl ShortConv {
             }
             _ => None,
         };
+        let rotating_table = match &rotating_weights {
+            Some(per_phase) => Some(Tensor::stack(per_phase, 0)?.contiguous()?),
+            None => None,
+        };
 
         Ok(Self {
             in_proj,
             out_proj,
             conv_weight,
             rotating_weights,
+            rotating_table,
             l_cache,
             hidden_size,
             conv_state: cfg.conv_state,
@@ -2811,6 +2819,50 @@ impl ShortConv {
         }
     }
 
+    /// The RotatingRing conv block over this pass's `seq_len` positions as
+    /// ONE kernel (issue #675, `DESIGN.md` §10.2u): the speculative verify
+    /// writer's per-position `narrow + slice_set + fold` (5 dispatches per
+    /// position per layer, the `110·k` term of §10.2i) and the K=1 ring decode
+    /// step both collapse to it. Bit-identical to the loop it replaces — the
+    /// same products in the same order, rounded at the same points — and the
+    /// output arrives in `[b, seq, hidden]` with `*C` applied, so the gate
+    /// multiply and the transpose copy go too.
+    ///
+    /// Returns `None` (the caller runs the loop) when the fusion is off, off
+    /// Metal, or when the operands are not in the layout the kernel reads.
+    fn shortconv_ring_fused(
+        &self,
+        b: &Tensor,
+        x: &Tensor,
+        c: &Tensor,
+        state: &Tensor,
+        phase_last: usize,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        if !self.conv_fused || conv_c_fusion_disabled() {
+            return Ok(None);
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (b, x, c, state, phase_last);
+            Ok(None)
+        }
+        #[cfg(feature = "metal")]
+        {
+            let Some(table) = &self.rotating_table else {
+                return Ok(None);
+            };
+            if !state.device().is_metal() || !state.is_contiguous() {
+                return Ok(None);
+            }
+            if b.stride() != x.stride() || b.stride() != c.stride() {
+                return Ok(None);
+            }
+            let (out, new_state) =
+                crate::nn::ops::shortconv_ring(b, x, c, state, table, phase_last)?;
+            Ok(Some((out, new_state)))
+        }
+    }
+
     fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
         let conv_out = self.convolve(x, block_idx, cache)?;
         self.out_proj.forward(&conv_out)
@@ -2878,6 +2930,30 @@ impl ShortConv {
                 // `c` is already applied in the kernel store; only the transpose
                 // to `[b, seq, hidden]` for `out_proj` remains.
                 return conv_out.transpose(1, 2)?.contiguous();
+            }
+        }
+
+        // The whole RotatingRing block — a speculative verify's `seq_len`
+        // ring writes or the K=1 decode step — as one kernel, attempted before
+        // `bx` is materialized for `shortconv_fused`'s reason. Falls through
+        // to the per-position loop below when it does not apply.
+        if matches!(self.conv_state, ConvState::RotatingRing { .. })
+            && ((cache.speculative && seq_len > 1) || seq_len == 1)
+        {
+            let width = self.conv_state.width(self.l_cache);
+            let state = match &cache.conv_states[block_idx] {
+                Some(s) => s.clone(),
+                None => Tensor::zeros((b_sz, self.hidden_size, width), c.dtype(), c.device())?,
+            };
+            // `Model::forward`/`forward_all` have advanced `conv_phase` to the
+            // slot of this pass's LAST position (§10.2e's one owner).
+            if let Some((conv_out, new_state)) =
+                self.shortconv_ring_fused(&b, &x_proj, &c, &state, cache.conv_phase)?
+            {
+                if cache.use_kv_cache {
+                    cache.conv_states[block_idx] = Some(new_state);
+                }
+                return Ok(conv_out);
             }
         }
 

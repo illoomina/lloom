@@ -303,6 +303,19 @@ pub struct Conv1dDepthwiseKParams {
     pub padding: u64,
 }
 
+/// Scalars bound by `shortconv_step` — the fused decode conv (§12.2 row 1). The
+/// tap count `K` is compile-time (in the pipeline name), and `l_out == 1` is a
+/// decode precondition, so only the channel geometry and the shared b/x/c
+/// strides are bound.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortconvStepParams {
+    pub dst_numel: u64,
+    pub hidden: u64,
+    pub proj_stride_b: u64,
+    pub proj_stride_c: u64,
+}
+
 /// The kernel in `conv.metal` that reports the device-side layout.
 pub const CONV_LAYOUT_KERNEL: &str = "conv_params_layout";
 

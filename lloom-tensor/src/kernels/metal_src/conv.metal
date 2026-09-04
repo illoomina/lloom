@@ -116,6 +116,25 @@ struct Conv1dDepthwiseKParams {
     size_t padding;
 };
 
+// The whole LFM2 decode conv block as one kernel (§12.2 row 1): compute
+// `bx_new = b * x` for the newest position, shift it into the `k`-wide state,
+// fold against the weight, scale by `C`, and write the shifted state back.
+// Replaces `bmul + contiguous + cat + fold + bmul` (7 tensor ops, `DESIGN.md`
+// §12.2c's "88 dispatches on Shuffle") with one dispatch and no intermediate
+// copies. Decode-only: one output per channel per batch (`l_out == 1`), state
+// `[b, hidden, k]` contiguous.
+//
+// `b`, `x`, `c` are sibling narrows of the same `in_proj` output, so they share
+// one `(stride_b, stride_c)` pair; their differing base offsets ride on the
+// `BufferOffset`. The accumulation order is `state[1]*w0 + ... + bx_new*w_{k-1}`
+// — exactly the shifted `conv_fold`'s — so the LFM2 digests do not move.
+struct ShortconvStepParams {
+    size_t dst_numel;    // b * hidden (one thread per output channel)
+    size_t hidden;       // channel count
+    size_t proj_stride_b; // stride to step one batch in b/x/c
+    size_t proj_stride_c; // stride to step one channel in b/x/c
+};
+
 // Kernels
 //
 // One body per kernel, two entry points around it. The classical wrapper binds
@@ -1145,6 +1164,178 @@ template <typename T, typename A, ushort K_SIZE>
       p, src_dims, src, weight, dst, tid);
 }
 
+// The depthwise fold with a per-output scale folded into the store — LFM2's `*C`
+// conv gate as a kernel epilogue rather than a second `bmul` dispatch behind a
+// barrier (`DESIGN.md` §12.2 row 1, §12.2d's economics: this is one multiply per
+// OUTPUT element, so a GEMV's `n_tgp` re-read multiplier is 1 and the epilogue is
+// the winning side of the partition). `scale` has the same `(b, c, l_out)` layout
+// as `dst`, so `dst[tid] = scale[tid] * acc` is exactly `(c * conv_out)` computed
+// where `conv_out` is still in a register — the accumulation order of `acc` is
+// untouched, so the result is bit-identical to the fold-then-`bmul` pair and the
+// LFM2 digests do not move.
+template <typename T, typename A, ushort K_SIZE, typename PtrT>
+METAL_FUNC void conv1d_depthwise_k_scaled_body(
+    thread const Conv1dDepthwiseKParams &p,
+    PtrT src_dims,
+    device const T *src,
+    device const T *weight,
+    device const T *scale,
+    device T *dst,
+    uint tid
+) {
+  const size_t dst_numel = p.dst_numel;
+  const size_t l_out = p.l_out;
+  const size_t padding = p.padding;
+  if (tid >= dst_numel) {
+    return;
+  }
+
+  const size_t c = src_dims[1];
+  const size_t l_in = src_dims[2];
+
+  const size_t l_idx = tid % l_out;
+  const size_t tmp = tid / l_out;
+  const size_t c_idx = tmp % c;
+  const size_t b_idx = tmp / c;
+
+  A acc = static_cast<A>(0);
+  const size_t src_base = (b_idx * c + c_idx) * l_in;
+  const size_t w_base = c_idx * K_SIZE;
+
+#pragma clang loop unroll(full)
+  for (ushort k = 0; k < K_SIZE; ++k) {
+    const size_t pos = l_idx + k;
+    if (pos < padding) {
+      continue;
+    }
+    const size_t src_l = pos - padding;
+    if (src_l >= l_in) {
+      continue;
+    }
+    acc += static_cast<A>(src[src_base + src_l])
+         * static_cast<A>(weight[w_base + k]);
+  }
+
+  // The epilogue: `scale` is laid out like `dst`, so its index is `tid`.
+  dst[tid] = static_cast<T>(acc * static_cast<A>(scale[tid]));
+}
+
+template <typename T, typename A, ushort K_SIZE>
+[[kernel]] void conv1d_depthwise_k_scaled(
+    constant size_t &dst_numel,
+    constant size_t &l_out,
+    constant size_t &padding,
+    constant size_t *src_dims,
+    device const T *src,
+    device const T *weight,
+    device const T *scale,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Conv1dDepthwiseKParams p { dst_numel, l_out, padding };
+  conv1d_depthwise_k_scaled_body<T, A, K_SIZE, constant size_t *>(
+      p, src_dims, src, weight, scale, dst, tid);
+}
+
+template <typename T, typename A, ushort K_SIZE>
+[[kernel]] void conv1d_depthwise_k_scaled_packed(
+    device const Conv1dDepthwiseKParams *pp,
+    device const size_t *src_dims,
+    device const T *src,
+    device const T *weight,
+    device const T *scale,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  Conv1dDepthwiseKParams p = *pp;
+  conv1d_depthwise_k_scaled_body<T, A, K_SIZE, device const size_t *>(
+      p, src_dims, src, weight, scale, dst, tid);
+}
+
+// The fused decode shortconv step (§12.2 row 1). One thread per output channel.
+template <typename T, typename A, ushort K_SIZE>
+METAL_FUNC void shortconv_step_body(
+    thread const ShortconvStepParams &p,
+    device const T *b_in,
+    device const T *x_in,
+    device const T *c_in,
+    device const T *state_in,
+    device const T *weight,
+    device T *state_out,
+    device T *dst,
+    uint tid
+) {
+  if (tid >= p.dst_numel) {
+    return;
+  }
+  const size_t hidden = p.hidden;
+  const size_t c_idx = tid % hidden;
+  const size_t b_idx = tid / hidden;
+
+  // b/x/c share one layout; the element for (b_idx, c_idx).
+  const size_t proj = b_idx * p.proj_stride_b + c_idx * p.proj_stride_c;
+  const A bx_new = static_cast<A>(b_in[proj]) * static_cast<A>(x_in[proj]);
+
+  // State is contiguous [b, hidden, K]; the row for this channel.
+  const size_t st_base = (b_idx * hidden + c_idx) * K_SIZE;
+  const size_t w_base = c_idx * K_SIZE;
+
+  // The shifted window: slots 1..K-1 of the old state, then the new bx at the
+  // end -- exactly `cat(state[1..], bx)`. Fold in that order so the sum matches
+  // `conv_fold` to the ulp, and write the window back as the next state.
+  A acc = static_cast<A>(0);
+#pragma clang loop unroll(full)
+  for (ushort j = 0; j < K_SIZE; ++j) {
+    T win_j;
+    if (j + 1 < K_SIZE) {
+      win_j = state_in[st_base + j + 1];
+    } else {
+      win_j = static_cast<T>(bx_new);
+    }
+    state_out[st_base + j] = win_j;
+    acc += static_cast<A>(win_j) * static_cast<A>(weight[w_base + j]);
+  }
+
+  dst[tid] = static_cast<T>(acc * static_cast<A>(c_in[proj]));
+}
+
+template <typename T, typename A, ushort K_SIZE>
+[[kernel]] void shortconv_step(
+    constant size_t &dst_numel,
+    constant size_t &hidden,
+    constant size_t &proj_stride_b,
+    constant size_t &proj_stride_c,
+    device const T *b_in,
+    device const T *x_in,
+    device const T *c_in,
+    device const T *state_in,
+    device const T *weight,
+    device T *state_out,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  ShortconvStepParams p { dst_numel, hidden, proj_stride_b, proj_stride_c };
+  shortconv_step_body<T, A, K_SIZE>(
+      p, b_in, x_in, c_in, state_in, weight, state_out, dst, tid);
+}
+
+template <typename T, typename A, ushort K_SIZE>
+[[kernel]] void shortconv_step_packed(
+    device const ShortconvStepParams *pp,
+    device const T *b_in,
+    device const T *x_in,
+    device const T *c_in,
+    device const T *state_in,
+    device const T *weight,
+    device T *state_out,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  ShortconvStepParams p = *pp;
+  shortconv_step_body<T, A, K_SIZE>(
+      p, b_in, x_in, c_in, state_in, weight, state_out, dst, tid);
+}
+
 // Layout, asserted rather than hoped.
 //
 // A field at the wrong offset does not crash: the kernel reads a well-formed
@@ -1327,6 +1518,22 @@ static_assert(alignof(Conv1dDepthwiseKParams) == 8, "Conv1dDepthwiseKParams alig
     init_kernel("conv1d_depthwise_" #tname "_k" #k, conv1d_depthwise_k, t, acc, k) \
     init_kernel("conv1d_depthwise_" #tname "_k" #k "_packed", conv1d_depthwise_k_packed, t, acc, k)
 
+// The scaled variant carries the same `_k<K>` compile-tier axis and the same two
+// binding styles; it adds one `device const T *scale` argument and multiplies it
+// into the store (LFM2's `*C` gate, §12.2 row 1). Kept a separate family rather
+// than a function-constant flag on the base kernel so the unscaled path's
+// register allocation and its byte-identical digests are untouched.
+#define init_conv1d_depthwise_k_scaled(tname, t, acc, k) \
+    init_kernel("conv1d_depthwise_" #tname "_k" #k "_scaled", conv1d_depthwise_k_scaled, t, acc, k) \
+    init_kernel("conv1d_depthwise_" #tname "_k" #k "_scaled_packed", conv1d_depthwise_k_scaled_packed, t, acc, k)
+
+// The fused decode shortconv step: `bx = b*x`, shift into state, fold, `*C`,
+// write state back (§12.2 row 1). Same `_k<K>` compile-tier axis and two binding
+// styles as the depthwise families.
+#define init_shortconv_step(tname, t, acc, k) \
+    init_kernel("shortconv_step_" #tname "_k" #k, shortconv_step, t, acc, k) \
+    init_kernel("shortconv_step_" #tname "_k" #k "_packed", shortconv_step_packed, t, acc, k)
+
 #define init_im2col1d(tname, t) \
     init_kernel("im2col1d_" #tname, im2col1d, t) \
     init_kernel("im2col1d_" #tname "_packed", im2col1d_packed, t)
@@ -1398,6 +1605,30 @@ init_conv1d_depthwise_k(f16, half, float, 4);
 init_conv1d_depthwise_k(bf16, bfloat, float, 2);
 init_conv1d_depthwise_k(bf16, bfloat, float, 3);
 init_conv1d_depthwise_k(bf16, bfloat, float, 4);
+#endif
+
+init_conv1d_depthwise_k_scaled(f32, float, float, 2);
+init_conv1d_depthwise_k_scaled(f32, float, float, 3);
+init_conv1d_depthwise_k_scaled(f32, float, float, 4);
+init_conv1d_depthwise_k_scaled(f16, half, float, 2);
+init_conv1d_depthwise_k_scaled(f16, half, float, 3);
+init_conv1d_depthwise_k_scaled(f16, half, float, 4);
+#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 310
+init_conv1d_depthwise_k_scaled(bf16, bfloat, float, 2);
+init_conv1d_depthwise_k_scaled(bf16, bfloat, float, 3);
+init_conv1d_depthwise_k_scaled(bf16, bfloat, float, 4);
+#endif
+
+init_shortconv_step(f32, float, float, 2);
+init_shortconv_step(f32, float, float, 3);
+init_shortconv_step(f32, float, float, 4);
+init_shortconv_step(f16, half, float, 2);
+init_shortconv_step(f16, half, float, 3);
+init_shortconv_step(f16, half, float, 4);
+#if defined(__METAL_VERSION__) && __METAL_VERSION__ >= 310
+init_shortconv_step(bf16, bfloat, float, 2);
+init_shortconv_step(bf16, bfloat, float, 3);
+init_shortconv_step(bf16, bfloat, float, 4);
 #endif
 
 init_im2col1d(f32, float);

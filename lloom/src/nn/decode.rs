@@ -39,8 +39,8 @@
 //! is committed before step `s` retires.
 
 use crate::generation::{CommitBudget, LogitsProcessor, ReadbackCounters, ReadbackStrategy};
-use crate::nn::model::CausalLM;
-use crate::nn::speculator::{Draft, NoProbe, SeqId, Session, Speculator, TargetProbe};
+use crate::nn::model::{CacheReset, CausalLM};
+use crate::nn::speculator::{Anchor, Draft, NoProbe, Probes, SeqId, Session, Speculator, TargetProbe};
 use lloom_tensor::{Device, Result, Tensor};
 
 /// The K=1 identity proposer: drafts nothing, so the loop takes the baseline
@@ -196,8 +196,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
     {
         if spec.max_draft() > 0 {
             lloom_tensor::bail!(
-                "Session::decode: a proposer with max_draft {} needs the speculative body, \
-                 which is stage 2 of the decode-driver design and is not built",
+                "Session::decode: a proposer with max_draft {} needs the speculative body \
+                 (`Session::decode_speculative`), whose bounds are `M: Speculative + \
+                 Probes<S::Probe>` — stronger than this method's `M: CausalLM`. Call \
+                 `decode_speculative` directly; the K=1 identity path stays here.",
                 spec.max_draft()
             );
         }
@@ -391,4 +393,322 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         Ok(())
     }
+
+    /// Decode from `prompt` with a real speculative proposer — stage 2 of
+    /// `design/docs/decode-driver-design.md` ("the speculative body").
+    ///
+    /// This is the arm [`Self::decode`] refuses: a proposer with
+    /// `max_draft() > 0` (DSpark). The bound is stronger than `decode`'s
+    /// `M: CausalLM` — `M: Speculative` for the `forward_all`/`advance`/`resolve`
+    /// rollback window and `M: Probes<S::Probe>` for the pairing contract
+    /// (`speculator.rs`: an unsatisfiable target+drafter pair is a **compile
+    /// error**, not a runtime bail). It is a separate method rather than a branch
+    /// inside `decode` for exactly that reason: the K=1 identity path stays
+    /// callable with only `CausalLM`, so widening the bound there would refuse a
+    /// caller that has no drafter at all (`design/docs/decode-driver-design.md`,
+    /// "two loop bodies, not one").
+    ///
+    /// # The round, and why it is output-identical to greedy
+    ///
+    /// Per round: draft up to `K` tokens, run the target's `forward_all` over
+    /// `[anchor, draft…]`, accept the longest prefix whose argmax matches the
+    /// draft **plus the target's own next token** (the bonus), roll the cache
+    /// back to the accepted length, re-key the drafter from the accepted rows.
+    /// The whole round is [`Self::speculative_step`], which is `draft →
+    /// verify_and_probe → observe` — the verify accepts a draft token iff it
+    /// equals `argmax(target logits)`, so the emitted stream is **byte-identical
+    /// to non-speculative greedy decoding by construction** (`lfm2.rs`
+    /// `verify_step`'s "greedy needs no epsilon"; DESIGN §10.2n). A drafter that
+    /// proposes garbage costs acceptance rate and nothing else; it cannot change
+    /// the output. That is the property the correctness gate asserts.
+    ///
+    /// # What this owns that `speculative_step` does not
+    ///
+    /// `speculative_step` runs one round across a batch and returns the accepted
+    /// ids; it threads no decode state. The loop owns the decode cursor —
+    /// [`Anchor`] (`last` = the last committed token, `pos` = the target position
+    /// the window starts at), advancing `pos` by the accepted length and `last`
+    /// to the accepted tail each round — plus EOS detection, the `max_tokens`
+    /// cap (which may fall MID-block, so a round publishes 1..K+1 tokens), and
+    /// the streaming hand-off.
+    ///
+    /// # Streaming, EOS and the cache
+    ///
+    /// The accepted tokens are already host-side — `verify_step` reads the argmax
+    /// back to compare it (`design/docs/decode-driver-design.md`: the
+    /// speculative body's one readback per round is inherent, not the ring's
+    /// device-resident path). So this arm does NOT feed through the
+    /// [`ReadbackStrategy`]'s device seam; it streams the accepted ids straight
+    /// to `on_tokens` and tests EOS host-side against `eos_ids`. The strategy is
+    /// still taken so the signature matches [`Self::decode`] and a future arm can
+    /// publish the accepted block through the ring for a B>1 driver (#535's "the
+    /// ring's real consumer is the speculation loop"); today it is used only for
+    /// its device handle and its commit cadence.
+    ///
+    /// An EOS inside a block ends the run at that token: the tokens before it are
+    /// streamed, the EOS and anything after it are not. The cache has advanced
+    /// past the accepted prefix (`resolve` kept `accepted.len()` positions), so
+    /// like `decode`'s `lookahead = 1` arm it can end one region past the EOS —
+    /// which is safe for a single-turn run whose cache ends with it
+    /// (`lfm2-chat`'s shape) and is why speculation needs the rewindable cache
+    /// (`RotatingRing` + `InPlace`) `advance`/`resolve` require.
+    ///
+    /// # The drafter context is seeded lazily
+    ///
+    /// `DSparkSpeculator` documents a caller seeding its context from the
+    /// prefill's taps (`begin` then `observe(seq, prefill_taps, &[])`). Extracting
+    /// the prefill probe is model-specific (LFM2's `Cache::take_taps`), so to keep
+    /// this method generic over `M` the first round instead drafts with an EMPTY
+    /// context and the round-0 `observe` keys it from the verify pass's own taps.
+    /// This is output-identical either way (the target verifies every token) and
+    /// costs only round-0 acceptance rate — the drafter is unconditioned for one
+    /// block, then fully seeded. `begin`/`observe` is the trait's own documented
+    /// lifecycle (`speculator.rs`), so this uses the seam as specified.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_speculative<S, R>(
+        &mut self,
+        spec: &mut S,
+        readback: &mut R,
+        _sampler: &mut LogitsProcessor,
+        prompt: &[u32],
+        opts: &DecodeOptions,
+        eos_ids: &[u32],
+        on_tokens: &mut dyn FnMut(&[u32]) -> Result<()>,
+    ) -> Result<DecodeOut>
+    where
+        S: Speculator,
+        M: Probes<S::Probe>,
+        R: ReadbackStrategy,
+    {
+        if spec.max_draft() == 0 {
+            lloom_tensor::bail!(
+                "Session::decode_speculative: the proposer has max_draft 0 (the K=1 identity); \
+                 it belongs on `Session::decode`, which has the device-resident ring path this \
+                 method deliberately does not."
+            );
+        }
+        if eos_ids.is_empty() {
+            lloom_tensor::bail!(
+                "Session::decode_speculative: eos_ids is empty, so the loop would never terminate"
+            );
+        }
+        if prompt.is_empty() {
+            lloom_tensor::bail!("Session::decode_speculative: empty prompt");
+        }
+
+        let device = readback.device().clone();
+        let seq = SeqId(0);
+        let mut stats = DecodeStats {
+            step_ns: Vec::with_capacity(opts.max_tokens),
+            ..DecodeStats::default()
+        };
+
+        // Prefill: the whole prompt in one pass. Its argmax is the first anchor —
+        // the token whose logits produced the first draft — exactly as the
+        // `lfm2-dspark-verify` example takes `logits.argmax` when it does not hold
+        // the last prompt token back. `forward` taps (the tap hooks are woven into
+        // both entry points, `lfm2.rs`), so the cache carries the prefill's taps,
+        // but this method seeds lazily (see the method docs) and does not read
+        // them — they are cleared by the first verify pass's `begin_taps`.
+        let prefill_start = std::time::Instant::now();
+        let input = Tensor::new(prompt, &device)?.unsqueeze(0)?;
+        let logits = self.model.forward(&input, self.pos, &mut self.cache)?;
+        self.pos += prompt.len();
+        stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
+
+        let mut anchor_tok = logits.squeeze(0)?.argmax(lloom_tensor::D::Minus1)?.to_scalar::<u32>()?;
+
+        // Seed the drafter's per-seq state: `begin` sets the block anchor to the
+        // prompt's last token and clears the context. The context is keyed by the
+        // first round's `observe`, not here (the lazy seed).
+        spec.begin(seq, prompt)?;
+
+        // The prefill's own argmax is the first generated token — it is what
+        // non-speculative greedy would emit as token 0 (the prefill logits' argmax),
+        // and the verify loop's anchor. Stream it and count it, unless it is EOS.
+        let mut produced = 0usize;
+        let mut eos = false;
+        let mut all_ids: Vec<u32> = Vec::with_capacity(opts.max_tokens);
+
+        if eos_ids.contains(&anchor_tok) {
+            // The model wanted to stop immediately (an empty reply). Nothing is
+            // produced and the run ends before any round.
+            eos = true;
+        } else if produced < opts.max_tokens {
+            on_tokens(std::slice::from_ref(&anchor_tok))?;
+            all_ids.push(anchor_tok);
+            produced += 1;
+        }
+
+        // The verify window is `[anchor, draft…]` at this position; `pos` advances
+        // by the accepted length each round (`lfm2-dspark-verify`'s `index_pos`).
+        let mut since_commit = 0usize;
+
+        while !eos && produced < opts.max_tokens {
+            stats.steps += 1;
+            let step_start = std::time::Instant::now();
+
+            // One speculative round: draft → verify (accept longest argmax-match
+            // prefix + bonus, roll back) → observe (re-key drafter from the
+            // accepted rows). `p_min = 0.0` disables the confidence early-exit
+            // (`speculative.cpp:796`; the driver owns the knob). `speculative_step`
+            // returns the accepted tokens, INCLUDING the bonus, and has already
+            // advanced the drafter's own anchor via `observe`.
+            let anchor = Anchor {
+                last: anchor_tok,
+                pos: self.pos,
+            };
+            let accepted = self.speculative_step(spec, &[seq], &[anchor], 0.0)?;
+            let accepted = accepted
+                .into_iter()
+                .next()
+                .ok_or_else(|| lloom_tensor::Error::msg("decode_speculative: verify returned no sequence"))?;
+            if accepted.is_empty() {
+                lloom_tensor::bail!(
+                    "decode_speculative: a verify round accepted zero tokens; the target's own \
+                     prediction at position 0 is always correct, so this is a broken verify"
+                );
+            }
+
+            // The cache advanced by the accepted length; the next window starts
+            // there. The loop's anchor follows the accepted tail — which is what
+            // `observe` set the drafter's own anchor to, kept in step here so the
+            // next `Anchor` matches.
+            self.pos += accepted.len();
+            anchor_tok = *accepted.last().unwrap();
+
+            // Publish the accepted tokens, stopping at the first EOS or at
+            // `max_tokens`, whichever comes first — a round may straddle either.
+            // An EOS is not streamed and retracts from the count, exactly as the
+            // baseline loop drops an EOS token.
+            let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
+            for &id in &accepted {
+                if eos_ids.contains(&id) {
+                    eos = true;
+                    break;
+                }
+                if produced + batch.len() >= opts.max_tokens {
+                    break;
+                }
+                batch.push(id);
+            }
+            if !batch.is_empty() {
+                on_tokens(&batch)?;
+                all_ids.extend_from_slice(&batch);
+                produced += batch.len();
+            }
+
+            // Periodic commit/prune. The verify pass already read the argmax back
+            // (a host sync), so the round is naturally drained; the commit bounds
+            // the in-flight queue on the ring-owning strategies and is a no-op
+            // elsewhere. Gated on the budget like the baseline loop.
+            if readback.loop_commits() {
+                since_commit += 1;
+                if opts.budget.due(since_commit) {
+                    self.commit(&device, &mut stats)?;
+                    since_commit = 0;
+                }
+            }
+
+            stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
+        }
+
+        // A run that ends past an EOS the way `decode`'s lookahead=1 arm does:
+        // the accepted prefix was written to the cache before the EOS was seen.
+        // Reported so a caller can refuse to continue a conversation from it.
+        if eos {
+            stats.overrun = 1;
+        }
+
+        stats.produced = produced;
+        stats.readback = readback.counters();
+        Ok(DecodeOut {
+            ids: all_ids,
+            eos,
+            stats,
+        })
+    }
+
+    /// Compile the Metal pipelines the first real forward would otherwise
+    /// compile *inside its own timed window*, then reset so the session is
+    /// untouched.
+    ///
+    /// # What this moves, and why it is not a compute change
+    ///
+    /// `DESIGN.md` §13.1i measures pipeline creation at **~2 ms cold, ~0.01 ms
+    /// warm** and library compilation at seconds, both lazily cached in the
+    /// device's `Kernels`. The decode step (`m == 1`) routes to GEMV **before**
+    /// `select_tile_config` (`mlx_gemm.rs`), so the prefill GEMM-tile pipelines
+    /// — and the F32 generic-attention and batched-`Conv1d` pipelines the
+    /// `seq_len > 1` path takes — are **prefill-exclusive**: none is touched by
+    /// any decode step, so all are cold on the first real prefill. That is the
+    /// fixed cost a single-shot TTFT carries and `llama.cpp` does not (it
+    /// compiles every kernel up front). A warmup pays it here, folded into model
+    /// load, where no clock the user reads is running.
+    ///
+    /// # Why a real forward rather than an enumerated pipeline list
+    ///
+    /// The GEMM pipeline key varies with `M` through both the tile name and
+    /// `align_m = m % bm`, so a hand-written list would be incomplete by
+    /// construction and a near-miss on the constants keys a *different* cache
+    /// entry — the real forward would still compile cold. Running the production
+    /// `forward` cannot miss a pipeline that same `forward` will later use for
+    /// the same shape bucket. The buckets are coarse (§13.5c: `m < 16` → 32×32,
+    /// `m >= 16` → the 64-tile), so one prefill across the `m >= 16` boundary
+    /// plus one decode step covers the set; [`WARMUP_PREFILL_LEN`] is chosen to
+    /// cross it.
+    ///
+    /// Token id `0` is always a valid vocabulary index. The forward's output is
+    /// discarded — only its compilation side effect is wanted — and
+    /// `M::Cache: CacheReset` returns the cache to its pre-prefill state
+    /// afterwards, so the next real prompt starts exactly as it would have.
+    /// `synchronize` forces compilation to *complete* here rather than leak into
+    /// the first real forward.
+    ///
+    /// Returns the device's `(libraries, pipelines)` cache sizes after warming,
+    /// so a caller can report engagement — a nonzero pipeline count is what
+    /// distinguishes a warmed cache from a probe that compiled nothing
+    /// (§14.5d).
+    pub fn warmup(&mut self, device: &Device) -> Result<(usize, usize)>
+    where
+        M::Cache: CacheReset,
+    {
+        // Prefill across the m >= 16 tile boundary (§13.5c), then one decode
+        // step — the same two shape buckets every real run takes.
+        let prefill_tokens = vec![0u32; WARMUP_PREFILL_LEN];
+        let prefill = Tensor::new(prefill_tokens.as_slice(), device)?.unsqueeze(0)?;
+        let _ = self.model.forward(&prefill, 0, &mut self.cache)?;
+
+        let decode = Tensor::new(&[0u32], device)?.unsqueeze(0)?;
+        let _ = self
+            .model
+            .forward(&decode, WARMUP_PREFILL_LEN, &mut self.cache)?;
+
+        // Force the driver to finish compiling before the clock the caller is
+        // about to stop; a cold pipeline creation left in flight would surface
+        // on the first real forward instead.
+        device.synchronize()?;
+
+        // Leave nothing behind: the warmup wrote KV, conv state and the position
+        // counter, and the next call is the user's real prefill from position 0.
+        self.cache.reset();
+        self.pos = 0;
+
+        Ok(cache_sizes(device))
+    }
+}
+
+/// Prefill length for [`Session::warmup`], chosen to cross the
+/// `select_tile_config` `m >= 16` boundary (`DESIGN.md` §13.5c) so the warmup
+/// compiles the prefill GEMM tile the real path will use, not a smaller one.
+pub const WARMUP_PREFILL_LEN: usize = 32;
+
+/// The device's `(libraries, pipelines)` cache sizes, or `(0, 0)` off Metal.
+fn cache_sizes(device: &Device) -> (usize, usize) {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        return m.kernels().cache_sizes();
+    }
+    let _ = device;
+    (0, 0)
 }

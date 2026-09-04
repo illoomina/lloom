@@ -73,6 +73,27 @@ pub trait CausalLM: Model {
     fn vocab_size(&self) -> usize;
 }
 
+/// A cache that can be returned to its pre-prefill state.
+///
+/// The one method [`Session::warmup`](crate::nn::speculator::Session) needs and
+/// the locked [`CausalLM`] surface does not carry: a warmup runs a real forward
+/// to compile the Metal pipelines the first token would otherwise compile inside
+/// the timed window (`DESIGN.md` §13.1i — pipeline creation is ~2 ms cold and
+/// ~0.01 ms warm, and the prefill-tile / F32-attention / batched-conv pipelines
+/// are prefill-exclusive, so they are all cold on the first real prefill), then
+/// resets so the warmup leaves nothing behind. Kept off `CausalLM` because that
+/// trait is API-locked (`RESTRUCTURING_DESIGN.md`) and a model that never warms
+/// need not implement it; `warmup` is bounded `where M::Cache: CacheReset`
+/// rather than widening the locked trait.
+pub trait CacheReset {
+    /// Return every position-threaded field to its empty, pre-prefill state.
+    /// The post-condition the LFM2 impl already tests
+    /// (`reset_returns_the_slot_to_its_pre_prefill_state`) is what makes a
+    /// warmup non-observable: after it, the next real prefill starts from the
+    /// same state it would have without the warmup.
+    fn reset(&mut self);
+}
+
 /// The verifier's entry and the speculative rollback seam.
 ///
 /// Only a model that can rewind implements it. `forward_all` projects **every**

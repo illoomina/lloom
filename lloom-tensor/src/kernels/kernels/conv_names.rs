@@ -148,6 +148,96 @@ impl ConvKernel {
         }
     }
 
+    /// The scaled depthwise family — the `_k<K>` fold with LFM2's `*C` gate folded
+    /// into the store (§12.2 row 1). Same `(dtype, K)` keying as the plain family,
+    /// so the same one-family-per-K shape keeps `name()` total.
+    pub const CONV1D_DEPTHWISE_K2_SCALED: Self = Self {
+        stem: "conv1d_depthwise",
+        tail: "_k2_scaled",
+        variants: &[
+            ("f32", "conv1d_depthwise_f32_k2_scaled"),
+            ("f16", "conv1d_depthwise_f16_k2_scaled"),
+            ("bf16", "conv1d_depthwise_bf16_k2_scaled"),
+        ],
+    };
+
+    pub const CONV1D_DEPTHWISE_K3_SCALED: Self = Self {
+        stem: "conv1d_depthwise",
+        tail: "_k3_scaled",
+        variants: &[
+            ("f32", "conv1d_depthwise_f32_k3_scaled"),
+            ("f16", "conv1d_depthwise_f16_k3_scaled"),
+            ("bf16", "conv1d_depthwise_bf16_k3_scaled"),
+        ],
+    };
+
+    pub const CONV1D_DEPTHWISE_K4_SCALED: Self = Self {
+        stem: "conv1d_depthwise",
+        tail: "_k4_scaled",
+        variants: &[
+            ("f32", "conv1d_depthwise_f32_k4_scaled"),
+            ("f16", "conv1d_depthwise_f16_k4_scaled"),
+            ("bf16", "conv1d_depthwise_bf16_k4_scaled"),
+        ],
+    };
+
+    /// The scaled specialized family for a compile-time `k_size`, or `None` if no
+    /// variant is instantiated. `None` means "fall back to the fold-then-`bmul`
+    /// pair", never "unsupported".
+    pub fn conv1d_depthwise_k_scaled(k_size: usize) -> Option<Self> {
+        match k_size {
+            2 => Some(Self::CONV1D_DEPTHWISE_K2_SCALED),
+            3 => Some(Self::CONV1D_DEPTHWISE_K3_SCALED),
+            4 => Some(Self::CONV1D_DEPTHWISE_K4_SCALED),
+            _ => None,
+        }
+    }
+
+    /// The fused decode shortconv step — `bx = b*x`, shift into state, fold,
+    /// `*C`, write state back — as one kernel (§12.2 row 1). One family per
+    /// compile-time `k`, same keying as the depthwise families.
+    pub const SHORTCONV_STEP_K2: Self = Self {
+        stem: "shortconv_step",
+        tail: "_k2",
+        variants: &[
+            ("f32", "shortconv_step_f32_k2"),
+            ("f16", "shortconv_step_f16_k2"),
+            ("bf16", "shortconv_step_bf16_k2"),
+        ],
+    };
+
+    pub const SHORTCONV_STEP_K3: Self = Self {
+        stem: "shortconv_step",
+        tail: "_k3",
+        variants: &[
+            ("f32", "shortconv_step_f32_k3"),
+            ("f16", "shortconv_step_f16_k3"),
+            ("bf16", "shortconv_step_bf16_k3"),
+        ],
+    };
+
+    pub const SHORTCONV_STEP_K4: Self = Self {
+        stem: "shortconv_step",
+        tail: "_k4",
+        variants: &[
+            ("f32", "shortconv_step_f32_k4"),
+            ("f16", "shortconv_step_f16_k4"),
+            ("bf16", "shortconv_step_bf16_k4"),
+        ],
+    };
+
+    /// The fused shortconv-step family for a compile-time `k_size`, or `None`
+    /// when no variant is instantiated (the caller falls back to the unfused
+    /// shift + fold + gates).
+    pub fn shortconv_step_k(k_size: usize) -> Option<Self> {
+        match k_size {
+            2 => Some(Self::SHORTCONV_STEP_K2),
+            3 => Some(Self::SHORTCONV_STEP_K3),
+            4 => Some(Self::SHORTCONV_STEP_K4),
+            _ => None,
+        }
+    }
+
     pub const CONV_TRANSPOSE1D: Self = Self {
         stem: "conv_transpose1d",
         tail: "",

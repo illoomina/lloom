@@ -438,6 +438,321 @@ pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
     xs.apply_op1_no_bwd(&SoftmaxLastDim)
 }
 
+/// Depthwise 1D conv with LFM2's `*C` gate folded into the store (§12.2 row 1).
+///
+/// Computes `scale * depthwise_conv(window, weight)` in ONE kernel, where the
+/// unfused decode path was a `conv1d_depthwise` dispatch followed by a separate
+/// `bmul` for the `C` gate behind a barrier. `window` is `[b, c, l_in]` (the
+/// conv state), `weight` is `[c, k_size]` contiguous, `scale` is `[b, c, l_out]`
+/// (the `C` projection) laid out like the output. Stride and dilation are 1;
+/// `padding = 0` on the decode ring path.
+///
+/// **Bit-identical to the fold-then-`bmul` pair.** The accumulator's order is the
+/// `_k` kernel's, unchanged; only the final `* scale[tid]` moves from a second
+/// kernel into the store — so the LFM2 digests do not move, and the `cpu_fwd`
+/// oracle computes the same value the Metal kernel does for the parity gate.
+#[derive(Debug, Clone)]
+struct Conv1dDepthwiseScaled {
+    k_size: usize,
+    padding: usize,
+}
+
+impl lloom_tensor::CustomOp3 for Conv1dDepthwiseScaled {
+    fn name(&self) -> &'static str {
+        "conv1d-depthwise-scaled"
+    }
+
+    fn cpu_fwd(
+        &self,
+        window: &CpuStorage,
+        wl: &Layout,
+        weight: &CpuStorage,
+        weight_l: &Layout,
+        scale: &CpuStorage,
+        scale_l: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        // The parity oracle: the same windowed weighted sum the Metal kernel
+        // runs, scaled per output. Written over the raw slices with the layouts'
+        // offsets so a non-zero start offset is honoured (the state tensors are
+        // often narrows). Contiguity in (b, c, l) is a precondition the caller
+        // enforces, so addressing is direct.
+        let dims = wl.shape().dims();
+        let (b, c, l_in) = (dims[0], dims[1], dims[2]);
+        let l_out = l_in + 2 * self.padding - (self.k_size - 1);
+        let out_el = b * c * l_out;
+
+        fn fold<T: lloom_tensor::WithDType + num_traits::Float>(
+            win: &[T],
+            w_off: usize,
+            weight: &[T],
+            wt_off: usize,
+            sc: &[T],
+            sc_off: usize,
+            c: usize,
+            l_in: usize,
+            l_out: usize,
+            k_size: usize,
+            padding: usize,
+            out_el: usize,
+        ) -> Vec<T> {
+            let mut out = vec![T::zero(); out_el];
+            for tid in 0..out_el {
+                let l_idx = tid % l_out;
+                let tmp = tid / l_out;
+                let c_idx = tmp % c;
+                let b_idx = tmp / c;
+                let src_base = w_off + (b_idx * c + c_idx) * l_in;
+                let w_base = wt_off + c_idx * k_size;
+                let mut acc = 0f64;
+                for k in 0..k_size {
+                    let pos = l_idx + k;
+                    if pos < padding {
+                        continue;
+                    }
+                    let src_l = pos - padding;
+                    if src_l >= l_in {
+                        continue;
+                    }
+                    acc += win[src_base + src_l].to_f64() * weight[w_base + k].to_f64();
+                }
+                let scaled = acc * sc[sc_off + tid].to_f64();
+                out[tid] = T::from_f64(scaled);
+            }
+            out
+        }
+
+        let w_off = wl.start_offset();
+        let wt_off = weight_l.start_offset();
+        let sc_off = scale_l.start_offset();
+        let shape = Shape::from((b, c, l_out));
+        macro_rules! run {
+            ($variant:ident, $t:ty) => {{
+                let (CpuStorage::$variant(win), CpuStorage::$variant(wt), CpuStorage::$variant(sc)) =
+                    (window, weight, scale)
+                else {
+                    lloom_tensor::bail!("conv1d-depthwise-scaled: mixed dtypes on cpu")
+                };
+                let out = fold::<$t>(
+                    win, w_off, wt, wt_off, sc, sc_off, c, l_in, l_out, self.k_size,
+                    self.padding, out_el,
+                );
+                Ok((CpuStorage::$variant(out), shape))
+            }};
+        }
+        match window {
+            CpuStorage::F32(_) => run!(F32, f32),
+            CpuStorage::F16(_) => run!(F16, half::f16),
+            CpuStorage::BF16(_) => run!(BF16, half::bf16),
+            other => lloom_tensor::bail!(
+                "conv1d-depthwise-scaled: cpu path is float-only, got {:?}",
+                other.dtype()
+            ),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        window: &lloom_tensor::MetalStorage,
+        wl: &Layout,
+        weight: &lloom_tensor::MetalStorage,
+        weight_l: &Layout,
+        scale: &lloom_tensor::MetalStorage,
+        scale_l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        use lloom_tensor::metal_backend::buffer_o;
+
+        let device = window.device();
+        let dtype = window.dtype();
+        let name = match lloom_tensor::kernels::ConvKernel::conv1d_depthwise_k_scaled(self.k_size)
+            .and_then(|f| f.name(dtype.as_str()))
+        {
+            Some(n) => n,
+            None => lloom_tensor::bail!(
+                "conv1d-depthwise-scaled: no scaled variant for (k={}, {:?}); \
+                 the caller must fall back to fold-then-bmul",
+                self.k_size,
+                dtype
+            ),
+        };
+
+        let dims = wl.shape().dims();
+        let (b, c, l_in) = (dims[0], dims[1], dims[2]);
+        let l_out = l_in + 2 * self.padding - (self.k_size - 1);
+        let out_el = b * c * l_out;
+        let out_shape = Shape::from((b, c, l_out));
+
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(out_el, dtype)
+            .with_label("conv1d_depthwise_scaled")
+            .build()?;
+
+        let encoder = device.command_encoder()?;
+        lloom_tensor::kernels::call_conv1d_depthwise_k_scaled(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            name,
+            wl.shape().dims(),
+            (self.k_size, self.padding),
+            buffer_o(window.buffer(), wl, dtype),
+            buffer_o(weight.buffer(), weight_l, dtype),
+            buffer_o(scale.buffer(), scale_l, dtype),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+
+        let storage = lloom_tensor::MetalStorage::new(output, device.clone(), out_el, dtype);
+        Ok((storage, out_shape))
+    }
+}
+
+/// `scale * depthwise_conv(window, weight)` fused (§12.2 row 1). Preconditions,
+/// enforced here so the kernels stay total: `window` and `scale` contiguous in
+/// `(b, c, l)`, `weight` contiguous in `(c, k_size)`, stride and dilation 1, and
+/// a `k_size` for which a scaled variant is instantiated. On a non-Metal device
+/// the `cpu_fwd` oracle runs the identical arithmetic.
+pub fn conv1d_depthwise_scaled(
+    window: &Tensor,
+    weight: &Tensor,
+    scale: &Tensor,
+    k_size: usize,
+    padding: usize,
+) -> Result<Tensor> {
+    window.apply_op3_no_bwd(weight, scale, &Conv1dDepthwiseScaled { k_size, padding })
+}
+
+/// The whole LFM2 decode conv block as one kernel (§12.2 row 1): `bx = b*x`,
+/// shift into the `k`-wide `state`, fold against `weight`, `*c`, and return
+/// `(fold_output, new_state)`. Replaces `bmul + contiguous + cat + fold + bmul`
+/// (7 ops) with one dispatch and no intermediate copies.
+///
+/// `b`, `x`, `c` are the three `[b, hidden, 1]` decode projections (sibling
+/// narrows of one `in_proj` output, so they share a layout); `state` is
+/// `[b, hidden, k]` contiguous; `weight` is `[hidden, k]` contiguous. The fold's
+/// accumulation order is the shifted `conv_fold`'s, so the result is
+/// bit-identical and the LFM2 digests do not move.
+///
+/// **Metal only.** The unfused Shuffle arm (`cat` + `conv_fold` + `* c`) is the
+/// portable path and the parity oracle; this returns an error off Metal so the
+/// caller falls back to it rather than silently diverging.
+#[allow(unused_variables)]
+pub fn shortconv_step(
+    b: &Tensor,
+    x: &Tensor,
+    c: &Tensor,
+    state: &Tensor,
+    weight: &Tensor,
+    k_size: usize,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(not(feature = "metal"))]
+    {
+        lloom_tensor::bail!("shortconv_step is metal-only; use the unfused conv arm off Metal")
+    }
+    #[cfg(feature = "metal")]
+    {
+        use lloom_tensor::backend::BackendStorage;
+        use lloom_tensor::metal_backend::buffer_o;
+
+        let (b_sz, hidden, _one) = state.dims3().map_err(|e| {
+            lloom_tensor::Error::msg(format!("shortconv_step: state must be [b, hidden, k]: {e}"))
+        })?;
+        let dtype = state.dtype();
+        let name = match lloom_tensor::kernels::ConvKernel::shortconv_step_k(k_size)
+            .and_then(|f| f.name(dtype.as_str()))
+        {
+            Some(n) => n,
+            None => lloom_tensor::bail!(
+                "shortconv_step: no fused variant for (k={k_size}, {dtype:?})"
+            ),
+        };
+
+        // b/x/c share a layout (sibling narrows); take the stride pair from `b`
+        // and the per-tensor base offset from each layout. The stride to step a
+        // batch is dim-0's, to step a channel is dim-1's.
+        let (b_s, b_l) = b.storage_and_layout();
+        let (x_s, x_l) = x.storage_and_layout();
+        let (c_s, c_l) = c.storage_and_layout();
+        let (st_s, st_l) = state.storage_and_layout();
+        let (w_s, w_l) = weight.storage_and_layout();
+        macro_rules! metal {
+            ($s:expr, $what:literal) => {
+                match &*$s {
+                    lloom_tensor::Storage::Metal(m) => m,
+                    _ => lloom_tensor::bail!(concat!("shortconv_step: ", $what, " must be on metal")),
+                }
+            };
+        }
+        let b_s = metal!(b_s, "b");
+        let x_s = metal!(x_s, "x");
+        let c_s = metal!(c_s, "c");
+        let st_s = metal!(st_s, "state");
+        let w_s = metal!(w_s, "weight");
+
+        let stride = b_l.stride();
+        let (proj_stride_b, proj_stride_c) = (stride[0], stride[1]);
+        let dst_numel = b_sz * hidden;
+        let elem_sz = dtype.size_in_bytes();
+
+        let device = st_s.device();
+        let state_out = device
+            .new_buffer_builder()
+            .with_size_for(b_sz * hidden * k_size, dtype)
+            .with_label("shortconv_step_state")
+            .build()
+            .map_err(lloom_tensor::Error::wrap)?;
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(dst_numel, dtype)
+            .with_label("shortconv_step_out")
+            .build()
+            .map_err(lloom_tensor::Error::wrap)?;
+
+        let encoder = device.command_encoder().map_err(lloom_tensor::Error::wrap)?;
+        lloom_tensor::kernels::call_shortconv_step(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            name,
+            (dst_numel, hidden, proj_stride_b, proj_stride_c),
+            buffer_o(b_s.buffer(), &b_l, dtype),
+            buffer_o(x_s.buffer(), &x_l, dtype),
+            buffer_o(c_s.buffer(), &c_l, dtype),
+            buffer_o(st_s.buffer(), &st_l, dtype),
+            buffer_o(w_s.buffer(), &w_l, dtype),
+            &state_out,
+            &dst,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+
+        let _ = elem_sz;
+        use lloom_tensor::op::BackpropOp;
+        let out_storage = lloom_tensor::MetalStorage::new(dst, device.clone(), dst_numel, dtype);
+        let out = Tensor::from_storage(
+            lloom_tensor::Storage::Metal(out_storage),
+            (b_sz, hidden, 1usize),
+            BackpropOp::none(),
+            false,
+        );
+        let state_storage = lloom_tensor::MetalStorage::new(
+            state_out,
+            device.clone(),
+            b_sz * hidden * k_size,
+            dtype,
+        );
+        let new_state = Tensor::from_storage(
+            lloom_tensor::Storage::Metal(state_storage),
+            (b_sz, hidden, k_size),
+            BackpropOp::none(),
+            false,
+        );
+        Ok((out, new_state))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RmsNorm {
     eps: f32,

@@ -27,10 +27,11 @@ use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
 };
-use lloom::models::lfm2::{Cache, Lfm2Config, Model};
+use lloom::models::lfm2::{Cache, ConvState, KvAppend, Lfm2Config, Model};
+use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, Session, VarBuilder};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tokenizers::Tokenizer;
 
@@ -87,6 +88,41 @@ struct Args {
     /// never overflows and takes the commit off the per-token path.
     #[arg(long, default_value = "steps:8")]
     commit_budget: String,
+
+    /// Drive decode with the **DSpark** speculative drafter instead of the K=1
+    /// identity proposer. The drafter proposes a block of up to `--draft` tokens
+    /// per round and the target verifies them in one `forward_all`, accepting the
+    /// longest argmax-matching prefix plus the target's own bonus token — so the
+    /// output is **byte-identical** to the non-speculative path (the target
+    /// corrects every mismatch; `design/docs/speculation.md` §10.2n). Off by
+    /// default (the current behavior is unchanged). See `--draft-dir` for where
+    /// the drafter weights are found.
+    ///
+    /// **Honest caveat**: `lfm2-chat` runs at batch 1, and DSpark's amortization
+    /// is `B×K` — at B=1 the draft+verify overhead is not amortized, so this may
+    /// be SLOWER than the non-speculative path (`design/docs/speculation.md`
+    /// §10.2r: "B>1 is the whole reason DSpark can pay; at B=1 it does not").
+    /// This flag exists to make the integration correct and measurable, not to
+    /// claim a B=1 speedup.
+    #[arg(long)]
+    dspark: bool,
+
+    /// The draft block size K when `--dspark` is set — how many tokens the drafter
+    /// proposes per round. The DSpark drafter's block is FIXED at
+    /// `block_size − logits_start` (9 for the 2.6B DSpark checkpoint) and has no
+    /// runtime cap, so the only accepted value is that ceiling; omit this to use
+    /// it. Passing a different K is refused with the reason rather than silently
+    /// clamped (a smaller ring would overflow the drafter's fixed block). The flag
+    /// is kept so the block size is visible and so a future drafter with a runtime
+    /// cap can honor it.
+    #[arg(long)]
+    draft: Option<usize>,
+
+    /// The DSpark drafter checkpoint directory (config.json + model.safetensors).
+    /// Only used with `--dspark`. Defaults to the newest LFM2.5-2.6B-DSpark
+    /// snapshot in the HF cache.
+    #[arg(long)]
+    draft_dir: Option<PathBuf>,
 }
 
 /// The LFM2.5-2.6B snapshot dir in the HF cache, if it is there.
@@ -127,6 +163,106 @@ fn weight_files(dir: &std::path::Path) -> Result<Vec<PathBuf>> {
     Ok(names.into_iter().map(|n| dir.join(n)).collect())
 }
 
+/// The DSpark drafter setup resolved before the target config: where its weights
+/// live, its constants, and the resolved draft block size `K`.
+struct DsparkSetup {
+    draft_dir: PathBuf,
+    dcfg: DSparkConfig,
+    /// The draft block size, capped at the drafter's `max_draft()`.
+    k: usize,
+}
+
+/// The newest snapshot of a HF repo in the cache with a `config.json`, if any.
+/// The same discovery the `lfm2-dspark-verify` example uses for the drafter.
+fn newest_snapshot(repo: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let base = PathBuf::from(home)
+        .join(".cache/huggingface/hub")
+        .join(repo)
+        .join("snapshots");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&base)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.join("config.json").exists())
+        .collect();
+    entries.sort();
+    entries.pop()
+}
+
+/// Read the DSpark drafter's constants from its own `config.json`.
+///
+/// Never defaulted for the two fields a wrong default silently corrupts —
+/// `rope_theta` and `rope_is_neox_style` alter no shape and no dispatch count,
+/// and on a drafter there is not even a text gate to catch them because the
+/// target verifies every token (`design/docs/speculation.md` §10.2n). Adapted
+/// from the `lfm2-dspark-verify` example's `read_drafter_config`.
+fn read_drafter_config(dir: &Path) -> Result<DSparkConfig> {
+    let raw = std::fs::read_to_string(dir.join("config.json"))
+        .with_context(|| format!("reading {}/config.json", dir.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)?;
+    let dfc = v.get("dflash_config").cloned().unwrap_or_else(|| v.clone());
+
+    let usize_at = |k: &str| -> Result<usize> {
+        v.get(k)
+            .and_then(|x| x.as_u64())
+            .map(|n| n as usize)
+            .with_context(|| format!("drafter config has no {k}"))
+    };
+
+    let target_layer_ids: Vec<usize> = dfc
+        .get("target_layer_ids")
+        .and_then(|x| x.as_array())
+        .context("drafter config has no dflash_config.target_layer_ids")?
+        .iter()
+        .filter_map(|x| x.as_u64().map(|n| n as usize))
+        .collect();
+
+    Ok(DSparkConfig {
+        hidden_size: usize_at("hidden_size")?,
+        num_hidden_layers: usize_at("num_hidden_layers")?,
+        num_attention_heads: usize_at("num_attention_heads")?,
+        num_key_value_heads: usize_at("num_key_value_heads")?,
+        head_dim: usize_at("head_dim")?,
+        intermediate_size: usize_at("intermediate_size")?,
+        vocab_size: usize_at("vocab_size")?,
+        rms_norm_eps: v
+            .get("rms_norm_eps")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(1e-5),
+        rope_theta: v
+            .get("rope_theta")
+            .and_then(|x| x.as_f64())
+            .context("drafter config has no rope_theta")?,
+        rope_is_neox_style: v
+            .get("rope_is_neox_style")
+            .and_then(|x| x.as_bool())
+            .context("drafter config has no rope_is_neox_style")?,
+        block_size: usize_at("block_size")?,
+        mask_token_id: dfc
+            .get("mask_token_id")
+            .and_then(|x| x.as_u64())
+            .context("drafter config has no dflash_config.mask_token_id")? as u32,
+        num_target_layers: dfc
+            .get("num_target_layers")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(30),
+        target_layer_ids,
+        markov_rank: v
+            .get("markov_rank")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0),
+        enable_confidence_head: v
+            .get("enable_confidence_head")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        // NOT a key in config.json — a property of the packaging (§10.2p).
+        logits_start: 0,
+    })
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -154,20 +290,91 @@ fn main() -> Result<()> {
     let config: Lfm2Config = serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)
         .context("parsing config.json")?;
     let mut config = config.into_config(false);
-    // The fastest B=1 decode config lloom has, baked in — this example exists to
-    // show what the engine does at its best, not the conservative defaults every
-    // axis ships at (§7.1a keeps those off in the library; a demo turns them on).
-    // The crown attention/KV/conv arms (Sdpa × Cat × Shuffle, §13.5) plus the two
-    // GEMV epilogue fusions (§12.2d/§12.2h) plus the conv fold (§12.2 row 1). Every
-    // one is token-identical to the generic path — only the logits reorder — so
-    // this is the same answer, faster. The readback strategy (ring + lookahead)
-    // is selected below, on the loop side.
-    config.attn_impl = lloom::models::lfm2::AttnImpl::Sdpa;
-    config.kv_append = lloom::models::lfm2::KvAppend::Cat;
-    config.conv_state = lloom::models::lfm2::ConvState::Shuffle;
-    config.gemv_silu = true;
-    config.gemv_residual = true;
-    config.conv_fused = true;
+
+    // The DSpark drafter's constants, resolved BEFORE the target config because
+    // the verify window's width (`K + 1`) sizes the conv ring, and taps must be
+    // requested on the target's own layers. Only when `--dspark` is set; the
+    // default path never reads a drafter.
+    let dspark_setup: Option<DsparkSetup> = if args.dspark {
+        let draft_dir = args
+            .draft_dir
+            .clone()
+            .or_else(|| newest_snapshot("models--LiquidAI--LFM2.5-2.6B-DSpark"))
+            .context(
+                "no LFM2.5-2.6B-DSpark snapshot in the HF cache and no --draft-dir. The drafter is \
+                 trained against THIS target (design/docs/speculation.md §10.2l).",
+            )?;
+        let dcfg = read_drafter_config(&draft_dir)?;
+        if dcfg.hidden_size != config.hidden_size {
+            anyhow::bail!(
+                "drafter hidden {} != target hidden {} — the drafter is not this target's \
+                 (design/docs/speculation.md §10.2l)",
+                dcfg.hidden_size,
+                config.hidden_size
+            );
+        }
+        // The DSpark drafter proposes a FIXED block every round —
+        // `block_size − logits_start` tokens (`DSparkSpeculator::draft`, which reads
+        // `max_draft()` and does not take a runtime cap). So the verify window is
+        // always `max_draft() + 1` positions and the conv ring must reserve that
+        // many; a smaller `--draft` cannot make the drafter propose fewer, and
+        // sizing the ring below what the drafter emits is the `advance()` overflow
+        // this refuses rather than misreports (§7.1a). `--draft` therefore selects
+        // the block only when it EQUALS the drafter's own ceiling; anything else is
+        // an error with the reason, not a silent clamp.
+        let ceiling = dcfg.max_draft();
+        let k = match args.draft {
+            None => ceiling,
+            Some(requested) if requested == ceiling => ceiling,
+            Some(requested) => anyhow::bail!(
+                "--draft {requested}: the DSpark drafter proposes a fixed block of {ceiling} \
+                 tokens (block_size {} − logits_start {}) and has no runtime cap, so only \
+                 --draft {ceiling} is supported on this checkpoint. Omit --draft to use the \
+                 ceiling.",
+                dcfg.block_size,
+                dcfg.logits_start,
+            ),
+        };
+        Some(DsparkSetup { draft_dir, dcfg, k })
+    } else {
+        None
+    };
+
+    if let Some(setup) = &dspark_setup {
+        // Speculation needs the REWINDABLE cache, which the crown arms below cannot
+        // provide: `Cache::advance` requires `ConvState::RotatingRing{ >= K+1 }`
+        // (the shuffle is destructive) and `Cache::resolve` requires
+        // `KvAppend::InPlace` (the `Cat` arm has no length to rewind) — both refused
+        // otherwise (`lfm2.rs`). The verify window is `K + 1` positions (the K
+        // proposals plus the target's bonus), so the ring reserves that many history
+        // slots. Taps are ON — the drafter's projection consumes the target's
+        // layer-output residuals — at F32 (`§10.2m`: deliberate, buys acceptance
+        // rate). `Sdpa` attention still applies (token-identical); the GEMV/conv
+        // fusions stay on where they compose.
+        config.attn_impl = lloom::models::lfm2::AttnImpl::Sdpa;
+        config.kv_append = KvAppend::InPlace;
+        config.conv_state = ConvState::RotatingRing { k: setup.k + 1 };
+        config.gemv_silu = true;
+        config.gemv_residual = true;
+        config.conv_fused = true;
+        config.tap_layers = setup.dcfg.tap_layers();
+        config.tap_dtype = DType::F32;
+    } else {
+        // The fastest B=1 decode config lloom has, baked in — this example exists to
+        // show what the engine does at its best, not the conservative defaults every
+        // axis ships at (§7.1a keeps those off in the library; a demo turns them on).
+        // The crown attention/KV/conv arms (Sdpa × Cat × Shuffle, §13.5) plus the two
+        // GEMV epilogue fusions (§12.2d/§12.2h) plus the conv fold (§12.2 row 1). Every
+        // one is token-identical to the generic path — only the logits reorder — so
+        // this is the same answer, faster. The readback strategy (ring + lookahead)
+        // is selected below, on the loop side.
+        config.attn_impl = lloom::models::lfm2::AttnImpl::Sdpa;
+        config.kv_append = lloom::models::lfm2::KvAppend::Cat;
+        config.conv_state = lloom::models::lfm2::ConvState::Shuffle;
+        config.gemv_silu = true;
+        config.gemv_residual = true;
+        config.conv_fused = true;
+    }
 
     let files = weight_files(&model_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
@@ -188,12 +395,30 @@ fn main() -> Result<()> {
         }
     }
 
+    // Warm the Metal pipelines before the clock the user reads starts. A real
+    // forward compiles the prefill GEMM-tile / F32-attention / batched-conv
+    // pipelines that the decode step never touches (it routes to GEMV first), so
+    // without this they compile *inside* the first prompt's TTFT — ~90 ms of
+    // one-time cost `llama.cpp` pays up front and we otherwise pay on the first
+    // token. `warmup` runs one prefill + one decode step and resets, so the
+    // session is untouched; the cost folds into the load figure below.
+    let mut session = Session::new(&model, cache);
+    // `LLOOM_SKIP_WARMUP=1` measures the counterfactual: TTFT with the pipelines
+    // left cold, so the warmup's effect on the first prompt is attributable
+    // rather than asserted. Default is to warm.
+    let (libs, pipes) = if std::env::var("LLOOM_SKIP_WARMUP").is_ok() {
+        (0, 0)
+    } else {
+        session.warmup(&device).context("warming Metal pipelines")?
+    };
+
     // Load time, printed before we block on stdin so it is attributable. This is
-    // mmap + model construction + cache allocation — the safetensors are memory
-    // mapped, so the weight *bytes* fault in lazily on the first forward (they
-    // land in the prefill / TTFT below), not here.
+    // mmap + model construction + cache allocation + pipeline warmup — the
+    // safetensors are memory mapped, so the weight *bytes* fault in lazily on the
+    // first forward, but the pipelines are now compiled, so the first prompt's
+    // TTFT is real prefill work rather than compilation.
     eprintln!(
-        "[loaded in \x1b[1;96m{:.2}s\x1b[0m (mmap + construct)]",
+        "[loaded in \x1b[1;96m{:.2}s\x1b[0m (mmap + construct + warmup: {libs} libs, {pipes} pipelines)]",
         load_start.elapsed().as_secs_f64()
     );
 
@@ -231,7 +456,46 @@ fn main() -> Result<()> {
         lookahead: args.lookahead,
         sample_split: false,
     };
-    let mut session = Session::new(&model, cache);
+
+    // The DSpark proposer, built only when `--dspark` is set. It borrows the
+    // target's token embedding and `lm_head` (the drafter ships neither — 62
+    // tensors, `lfm2_dspark.rs`) as cheap `Arc`-backed clones. The RoPE table is
+    // sized for the whole generation, context positions included.
+    let mut dspark_spec: Option<DSparkSpeculator> = match &dspark_setup {
+        None => None,
+        Some(setup) => {
+            let draft_file = setup.draft_dir.join("model.safetensors");
+            if !draft_file.exists() {
+                anyhow::bail!("{} does not exist", draft_file.display());
+            }
+            // Cover the largest absolute position the draft will attend: the prompt,
+            // every accepted token (≤ max_tokens), plus the block width and slack.
+            let max_pos = prompt_ids.len() + args.max_tokens + setup.dcfg.block_size + 64;
+            // F16 to match the target the block is embedded with — the drafter's
+            // stored BF16 has no CPU matmul and would need a cast at every meeting
+            // of the two dtypes (`lfm2_dspark.rs` `DSparkDrafter::new` docs).
+            let dvb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&[draft_file], DType::F16, &device)?
+            };
+            let drafter = DSparkDrafter::new(setup.dcfg.clone(), max_pos, dvb)
+                .context("constructing DSpark drafter")?;
+            eprintln!(
+                "[dspark: drafter loaded, {} layers, draft block K={} (verify window {} positions, \
+                 conv ring reserves {} history slots)]",
+                setup.dcfg.num_hidden_layers,
+                setup.k,
+                setup.k + 1,
+                setup.k + 1
+            );
+            Some(DSparkSpeculator::new(
+                drafter,
+                model.draft_embedding().clone(),
+                model.lm_head_linear().clone(),
+                1,
+            ))
+        }
+    };
+
     let mut spec = IdentityProposer;
 
     // ---- decode: stream tokens to stdout as they are produced -------------
@@ -260,17 +524,38 @@ fn main() -> Result<()> {
             }
             Ok(())
         };
-        decode_with(
-            &args.readback,
-            &mut session,
-            &mut spec,
-            &mut logits_processor,
-            &prompt_ids,
-            &opts,
-            &eos_ids,
-            &device,
-            &mut on_tokens,
-        )?
+        match dspark_spec.as_mut() {
+            Some(dspark) => {
+                // The speculative body. It does NOT ride the device-resident ring —
+                // the accepted tokens are host-side after each verify pass's argmax
+                // compare (`design/docs/decode-driver-design.md`: the speculative
+                // path's one readback per round is inherent) — so it streams the
+                // accepted block straight to `on_tokens` and learns EOS host-side.
+                // A `Blocking` strategy supplies the device handle and commit
+                // cadence; its own feed/EOS paths are unused here.
+                let mut rb = Blocking::new(&eos_ids, &device)?;
+                session.decode_speculative(
+                    dspark,
+                    &mut rb,
+                    &mut logits_processor,
+                    &prompt_ids,
+                    &opts,
+                    &eos_ids,
+                    &mut on_tokens,
+                )?
+            }
+            None => decode_with(
+                &args.readback,
+                &mut session,
+                &mut spec,
+                &mut logits_processor,
+                &prompt_ids,
+                &opts,
+                &eos_ids,
+                &device,
+                &mut on_tokens,
+            )?,
+        }
     };
     let decode_elapsed = decode_start.elapsed();
     // The tail the streaming decoder is still holding (a partial multibyte run),
@@ -314,18 +599,50 @@ fn main() -> Result<()> {
     // they stand out when scanning a terminal. `\x1b[1;96m` = bold + bright cyan,
     // `\x1b[0m` = reset. Only the numbers are wrapped; the labels stay plain.
     let b = |s: String| format!("\x1b[1;96m{s}\x1b[0m");
+
+    // Under `--dspark` a "step" is a speculative ROUND, not a token: a round
+    // publishes 1..K+1 tokens (the accepted prefix plus the target's bonus). So
+    // `steady` above is rounds/s, and the token throughput is that times the mean
+    // tokens per round. Both are reported honestly rather than relabeling one as
+    // the other. `n` counts the streamed anchor plus every round's accepted
+    // tokens; `st.steps` counts the rounds after the anchor.
+    if args.dspark {
+        let rounds = st.steps.max(1);
+        // Tokens the ROUNDS produced (the whole stream minus the prefill anchor
+        // that is emitted before round 0).
+        let round_tokens = n.saturating_sub(if n > 0 { 1 } else { 0 });
+        let tokens_per_round = round_tokens as f64 / rounds as f64;
+        let steady_tok_s = steady * tokens_per_round; // rounds/s × tokens/round
+        let setup = dspark_setup.as_ref().expect("--dspark implies a setup");
+        eprintln!(
+            "[dspark: {} accepted-tokens/round (mean over {} rounds), \
+             {} tok/s steady (rounds/s × tokens/round), K={} \
+             — note: B=1, DSpark is not expected to beat the non-spec path here \
+             (speculation.md §10.2r)]",
+            b(format!("{tokens_per_round:.2}")),
+            rounds,
+            b(format!("{steady_tok_s:.1}")),
+            setup.k,
+        );
+    }
+
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
-         {} tok/s steady (median decode step), TTFT {} ms, \
+         {} {} , TTFT {} ms, \
          {} on {:?}; \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={}]",
         b(format!("{end_to_end:.1}")),
         b(format!("{steady:.1}")),
+        if args.dspark {
+            "rounds/s steady (median round); see the dspark line above for tok/s"
+        } else {
+            "tok/s steady (median decode step)"
+        },
         b(format!("{ttft_ms:.1}")),
         if dtype == DType::F16 { "f16" } else { "f32" },
         device,
-        args.readback,
+        if args.dspark { "dspark" } else { &args.readback },
         args.lookahead,
         budget.arm(),
         st.commits,

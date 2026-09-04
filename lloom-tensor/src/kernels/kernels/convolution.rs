@@ -1,7 +1,8 @@
 use crate::kernels::kernels::params::{
     begin_packed_params, finish_packed_params, Col2im1dParams, Conv1dDepthwiseKParams,
     Conv1dDepthwiseParams, ConvTranspose1dParams, ConvTranspose2dParams, Im2col1dParams,
-    Im2colParams, ParamStyle, Pool2dParams, UpsampleBilinear2dParams, UpsampleNearest2dParams,
+    Im2colParams, ParamStyle, Pool2dParams, ShortconvStepParams, UpsampleBilinear2dParams,
+    UpsampleNearest2dParams,
 };
 use crate::kernels::linear_split;
 use crate::kernels::utils::{BufferOffset, EncoderProvider};
@@ -24,6 +25,7 @@ const CONV_TRANSPOSE1D_PARAMS_ALIGN: usize = core::mem::align_of::<ConvTranspose
 const CONV_TRANSPOSE2D_PARAMS_ALIGN: usize = core::mem::align_of::<ConvTranspose2dParams>();
 const CONV1D_DEPTHWISE_PARAMS_ALIGN: usize = core::mem::align_of::<Conv1dDepthwiseParams>();
 const CONV1D_DEPTHWISE_K_PARAMS_ALIGN: usize = core::mem::align_of::<Conv1dDepthwiseKParams>();
+const SHORTCONV_STEP_PARAMS_ALIGN: usize = core::mem::align_of::<ShortconvStepParams>();
 
 // A note on widths, since #38 found a latent mismatch of exactly this kind in
 // `reduce.metal`'s callers and predicted it in the remaining six files.
@@ -271,6 +273,169 @@ pub fn call_conv1d_depthwise_k_with(
         )
     );
     let _staged = finish_packed_params(device, encoder, style, CONV1D_DEPTHWISE_K_PARAMS_ALIGN)?;
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+/// The `_k` fold with a per-output `scale` multiplied into the store — LFM2's
+/// `*C` conv gate as an epilogue (`DESIGN.md` §12.2 row 1). `scale` has the same
+/// `(b, c, l_out)` layout as `output`, so the kernel indexes it by the same flat
+/// `tid`; the caller passes the `C` tensor. Same preconditions as
+/// [`call_conv1d_depthwise_k`] (stride 1, dilation 1, contiguous source), plus
+/// `scale` contiguous in destination layout — the single caller enforces both.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv1d_depthwise_k_scaled(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    (k_size, padding): (usize, usize),
+    input: BufferOffset,
+    weight: BufferOffset,
+    scale: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    call_conv1d_depthwise_k_scaled_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        (k_size, padding),
+        input,
+        weight,
+        scale,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_conv1d_depthwise_k_scaled`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv1d_depthwise_k_scaled_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    shape: &[usize],
+    (k_size, padding): (usize, usize),
+    input: BufferOffset,
+    weight: BufferOffset,
+    scale: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
+    let l_out = shape[2] + 2 * padding - (k_size - 1);
+    let dst_el = shape[0] * shape[1] * l_out;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "conv1d_depthwise_k_scaled {name} dst_el={dst_el}");
+    let _capture = begin_packed_params(encoder, style);
+    set_params!(
+        encoder,
+        (
+            dst_el,
+            l_out,
+            padding,
+            shape,
+            &input,
+            &weight,
+            &scale,
+            Output::new(output)
+        )
+    );
+    let _staged = finish_packed_params(device, encoder, style, CONV1D_DEPTHWISE_K_PARAMS_ALIGN)?;
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+/// The fused decode shortconv step (§12.2 row 1): `bx = b*x`, shift into the
+/// `k`-wide `state_in`, fold, `*C`, write the shifted state to `state_out`. One
+/// thread per output channel (`dst_numel == b * hidden`). `b`, `x`, `c` share
+/// one `(stride_b, stride_c)` pair — they are sibling narrows of one `in_proj`
+/// output — and their base offsets ride on the `BufferOffset`s. Preconditions:
+/// contiguous `state_in`/`state_out` in `[b, hidden, k]`, contiguous `weight` in
+/// `[hidden, k]`, decode shape (`l_out == 1`), and a `k` with an instantiated
+/// variant. The single caller enforces them.
+#[allow(clippy::too_many_arguments)]
+pub fn call_shortconv_step(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    (dst_numel, hidden, proj_stride_b, proj_stride_c): (usize, usize, usize, usize),
+    b_in: BufferOffset,
+    x_in: BufferOffset,
+    c_in: BufferOffset,
+    state_in: BufferOffset,
+    weight: BufferOffset,
+    state_out: &Buffer,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    call_shortconv_step_with(
+        device,
+        ep,
+        kernels,
+        name,
+        (dst_numel, hidden, proj_stride_b, proj_stride_c),
+        b_in,
+        x_in,
+        c_in,
+        state_in,
+        weight,
+        state_out,
+        dst,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_shortconv_step`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_shortconv_step_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    (dst_numel, hidden, proj_stride_b, proj_stride_c): (usize, usize, usize, usize),
+    b_in: BufferOffset,
+    x_in: BufferOffset,
+    c_in: BufferOffset,
+    state_in: BufferOffset,
+    weight: BufferOffset,
+    state_out: &Buffer,
+    dst: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_numel);
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "shortconv_step {name} dst_numel={dst_numel}");
+    let _capture = begin_packed_params(encoder, style);
+    set_params!(
+        encoder,
+        (
+            dst_numel,
+            hidden,
+            proj_stride_b,
+            proj_stride_c,
+            &b_in,
+            &x_in,
+            &c_in,
+            &state_in,
+            &weight,
+            Output::new(state_out),
+            Output::new(dst)
+        )
+    );
+    let _staged = finish_packed_params(device, encoder, style, SHORTCONV_STEP_PARAMS_ALIGN)?;
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }

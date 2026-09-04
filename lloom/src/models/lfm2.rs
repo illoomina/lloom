@@ -7,7 +7,9 @@
 
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
 use crate::nn::ops::{FlashScratchSizing, KvQuant};
-use crate::nn::{CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, Speculative, VarBuilder};
+use crate::nn::{
+    CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, Speculative, VarBuilder,
+};
 use crate::utils::repeat_kv;
 use lloom_macros::Config as ConfigDerive;
 // The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its
@@ -1352,6 +1354,16 @@ fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
         .collect()
 }
 
+impl CacheReset for Cache {
+    /// Delegates to [`Cache::clear`] — the tested total reset (kvs, kv/quant
+    /// slots, conv states, conv phase and compaction flag). This is what lets
+    /// `Session::warmup` run a real forward for its compilation side effect and
+    /// leave the session pre-prefill, so the first real prompt is unaffected.
+    fn reset(&mut self) {
+        self.clear();
+    }
+}
+
 impl Cache {
     pub fn new(use_kv_cache: bool, dtype: DType, config: &Config, device: &Device) -> Result<Self> {
         Self::new_with(use_kv_cache, dtype, config, device, DEFAULT_KV_CAPACITY)
@@ -2552,6 +2564,16 @@ struct ShortConv {
     span: tracing::Span,
 }
 
+/// `true` when `LLOOM_SKIP_CONV_C_FUSION` is set, forcing the unfused `*C`
+/// path (§12.2 row 1) so the fused kernel and its reference can be A/B'd for the
+/// digest gate. Read once — the value is fixed for the process, like the other
+/// `LLOOM_*` compile/behaviour toggles.
+fn conv_c_fusion_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var("LLOOM_SKIP_CONV_C_FUSION").is_ok())
+}
+
 impl ShortConv {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
@@ -2674,6 +2696,121 @@ impl ShortConv {
         }
     }
 
+    /// The fold with LFM2's `*C` gate folded into the kernel store (§12.2 row 1).
+    ///
+    /// Returns `Some(scale * fold(window, weight))` in `[b, hidden, l_out]` when
+    /// the fused kernel applies — `conv_fused` on, a scaled `_k<K>` variant
+    /// instantiated for this window's tap count, and a per-channel `c`. Returns
+    /// `None` otherwise, which is the caller's signal to run `conv_fold` and the
+    /// separate `(c * conv_out)` multiply (the arm below RotatingRing folds at
+    /// `k = width`, outside the instantiated set, so it takes this path).
+    ///
+    /// Bit-identical to the two-step form: the accumulation order is `conv_fold`'s
+    /// and only the trailing `* c` moves into the store. `c` is passed already
+    /// shaped `[b, hidden, l_out]` and made contiguous here so the kernel's flat
+    /// `scale[tid]` indexing is valid.
+    fn conv_fold_c(&self, window: &Tensor, weight: &Tensor, c: &Tensor) -> Result<Option<Tensor>> {
+        if !self.conv_fused {
+            return Ok(None);
+        }
+        // Diagnostic escape hatch: `LLOOM_SKIP_CONV_C_FUSION=1` forces the
+        // unfused `conv_fold` + separate `(c * conv_out)`, so the fused and
+        // reference paths can be A/B'd for the digest gate in one build.
+        if conv_c_fusion_disabled() {
+            return Ok(None);
+        }
+        // The fused kernels are Metal-only; off Metal the scaled `ConvKernel`
+        // family does not compile, so gate the whole path and fall back to the
+        // unfused `conv_fold` + `(c * conv_out)` that every backend shares.
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (window, weight, c);
+            return Ok(None);
+        }
+        #[cfg(feature = "metal")]
+        {
+        let k = window.dims3()?.2;
+        if lloom_tensor::kernels::ConvKernel::conv1d_depthwise_k_scaled(k).is_none() {
+            return Ok(None);
+        }
+        if !window.device().is_metal() {
+            return Ok(None);
+        }
+        // The scaled kernel addresses the source as a DENSE `(b, c, l_in)` — its
+        // row base is `(b*c + c_idx) * l_in`, which is only the real element when
+        // dim-1's stride is `l_in`. A ring `window` is a `narrow` of a wider
+        // buffer (dim-1 stride is `width`, not `l_cache`), so it fails this and
+        // takes the unfused path; `Shuffle`'s state is exactly `[b, hidden,
+        // l_cache]` and passes. Making it contiguous here would add the copy the
+        // fusion exists to remove, so the guard refuses rather than repairs.
+        if !window.is_contiguous() {
+            return Ok(None);
+        }
+        // `weight` is `[hidden, k]` (squeezed); the scaled op reads it as the
+        // same `[c, k]` the plain `_k` kernel does. `c` must be contiguous in
+        // `[b, hidden, l_out]` for the flat `scale[tid]` read.
+        let c = c.contiguous()?;
+        let out = crate::nn::ops::conv1d_depthwise_scaled(window, weight, &c, k, 0)?;
+        Ok(Some(out))
+        }
+    }
+
+    /// The whole Shuffle decode conv step fused into one kernel (§12.2 row 1):
+    /// `bx = b*x`, shift into `state`, fold against `weight`, `*c`. Returns
+    /// `Some((conv_out, new_state))` when the fused path applies — `conv_fused`
+    /// on, `Shuffle`, metal, a `shortconv_step` variant for `l_cache`, a
+    /// contiguous state, and `b`/`x`/`c` sharing one layout so the kernel's
+    /// single stride pair addresses all three. `None` otherwise, so the caller
+    /// runs the unfused `cat` + `conv_fold` + `* c`, which is the parity oracle.
+    ///
+    /// Bit-identical: the fold order is `state[1]*w0 + … + bx*w_{k-1}`, exactly
+    /// the shifted `conv_fold`'s, and `new_state = [state[1.. ], bx]` is exactly
+    /// `cat(state[1..], bx)`.
+    #[allow(clippy::type_complexity)]
+    fn shortconv_fused(
+        &self,
+        b: &Tensor,
+        x: &Tensor,
+        c: &Tensor,
+        state: &Tensor,
+        weight: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor)>> {
+        if !self.conv_fused || conv_c_fusion_disabled() {
+            return Ok(None);
+        }
+        // Metal-only, same reason as `conv_fold_c`: the `shortconv_step` family
+        // does not compile off Metal. Fall back to the unfused Shuffle arm.
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (b, x, c, state, weight);
+            return Ok(None);
+        }
+        #[cfg(feature = "metal")]
+        {
+        if !state.device().is_metal() {
+            return Ok(None);
+        }
+        let k = state.dims3()?.2;
+        if lloom_tensor::kernels::ConvKernel::shortconv_step_k(k).is_none() {
+            return Ok(None);
+        }
+        // The kernel reads `state` as dense `[b, hidden, k]` and writes a dense
+        // state back, so the incoming state must be contiguous (it is: prefill
+        // seeds it contiguous and this path writes it back contiguous).
+        if !state.is_contiguous() {
+            return Ok(None);
+        }
+        // b/x/c must share one layout — they are sibling narrows of the same
+        // `in_proj` output, so this holds — because the kernel takes a single
+        // `(stride_b, stride_c)` pair for all three.
+        if b.stride() != x.stride() || b.stride() != c.stride() {
+            return Ok(None);
+        }
+        let (out, new_state) = crate::nn::ops::shortconv_step(b, x, c, state, weight, k)?;
+        Ok(Some((out, new_state)))
+        }
+    }
+
     fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
         let conv_out = self.convolve(x, block_idx, cache)?;
         self.out_proj.forward(&conv_out)
@@ -2712,12 +2849,47 @@ impl ShortConv {
         let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
         let x_proj = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
 
-        // Element-wise multiply B and X
-        let bx = (b * &x_proj)?.contiguous()?;
-
         // Prepare conv weight: squeeze to (hidden_size, l_cache) for element-wise, or keep for Conv1d
         let conv_weight = self.conv_weight.squeeze(1)?;
 
+        // The whole-block fused Shuffle decode path (§12.2 row 1), attempted
+        // BEFORE `bx` is materialized so its `bmul` and `.contiguous()` are
+        // skipped entirely — that is the win over `conv_fold_c`, which still
+        // pays them. One kernel computes `bx = b*x`, shifts it into the state,
+        // folds, applies `c`, and writes the next state; only the transpose for
+        // `out_proj` remains. Fires only for `Shuffle` at `seq_len == 1` off the
+        // speculative path; everything else falls through to the code below.
+        if matches!(self.conv_state, ConvState::Shuffle)
+            && seq_len == 1
+            && !(cache.speculative && seq_len > 1)
+        {
+            let state = match &cache.conv_states[block_idx] {
+                Some(s) => s.clone(),
+                None => {
+                    Tensor::zeros((b_sz, self.hidden_size, self.l_cache), c.dtype(), c.device())?
+                }
+            };
+            if let Some((conv_out, new_state)) =
+                self.shortconv_fused(&b, &x_proj, &c, &state, &conv_weight)?
+            {
+                if cache.use_kv_cache {
+                    cache.conv_states[block_idx] = Some(new_state);
+                }
+                // `c` is already applied in the kernel store; only the transpose
+                // to `[b, seq, hidden]` for `out_proj` remains.
+                return conv_out.transpose(1, 2)?.contiguous();
+            }
+        }
+
+        // Element-wise multiply B and X
+        let bx = (b * &x_proj)?.contiguous()?;
+
+        // Set true by a decode arm that folds the `*C` gate into its conv kernel
+        // (`conv_fold_c` / `shortconv_fused`, §12.2 row 1); the trailing
+        // `(c * conv_out)` is then skipped. The prefill and speculative arms
+        // leave it false and take the separate multiply, which is the unchanged
+        // path and the parity oracle.
+        let mut c_fused = false;
         let conv_out = if cache.speculative && seq_len > 1 {
             // **The speculative verify path** — `DESIGN.md` §10.2a's `advance`,
             // for the conv half, at `seq_len = k`.
@@ -2944,7 +3116,13 @@ impl ShortConv {
                     // step, not per sequence. (Under `--conv-fused` the same
                     // per-step weight sharing holds: the depthwise kernel reads
                     // one `[hidden, w]` weight for the whole batch.)
-                    self.conv_fold(&state, &conv_weight)?
+                    match self.conv_fold_c(&state, &conv_weight, &c)? {
+                        Some(scaled) => {
+                            c_fused = true;
+                            scaled
+                        }
+                        None => self.conv_fold(&state, &conv_weight)?,
+                    }
                 }
             }
         } else {
@@ -2996,9 +3174,15 @@ impl ShortConv {
             out
         };
 
-        // Multiply by C; the projection is the caller's, so the two entry
-        // points can fuse it or not.
-        let conv_out = (c * &conv_out)?;
+        // Multiply by C, unless a decode arm already folded it into the conv
+        // kernel's store (`c_fused`, §12.2 row 1). The transpose to `[b, seq,
+        // hidden]` for `out_proj` is unchanged either way; only the elementwise
+        // `*C` dispatch and its barrier are removed on the fused arm.
+        let conv_out = if c_fused {
+            conv_out
+        } else {
+            (c * &conv_out)?
+        };
         conv_out.transpose(1, 2)?.contiguous()
     }
 }

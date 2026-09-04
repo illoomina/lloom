@@ -233,17 +233,28 @@ pub struct Ring {
 /// into a counted fallback and times nothing.
 pub const POLL_BUDGET: u64 = 50_000_000;
 
+/// The floor the id history is sized to: **four 16 KiB pages** of `U32`. A
+/// caller's `capacity` only ever raises this, never lowers it — the history is
+/// pure host-visible scratch (a few tens of KB) and there is no reason to run it
+/// tight, so a short generation still gets a generous ring. It bounds nothing a
+/// caller relies on being small; `sample_and_feed` refuses to write past the
+/// live `fed` count regardless.
+pub const RING_HISTORY_FLOOR: usize = 4 * 16 * 1024 / 4;
+
 impl Ring {
     /// `capacity` bounds the ids one ring will accumulate across every decode
-    /// call it serves; exceeding it is an error rather than a silent drop.
+    /// call it serves; exceeding it is an error rather than a silent drop. The
+    /// allocation is floored at [`RING_HISTORY_FLOOR`], so a caller that asks for
+    /// less still gets a generous buffer.
     pub fn new(eos_ids: &[u32], device: &Device, capacity: usize, eos: EosRead) -> Result<Self> {
         let ring = TokenRing::new(0, eos_ids, device)?;
-        let history = Tensor::zeros(capacity.max(1), DType::U32, device)?;
+        let capacity = capacity.max(RING_HISTORY_FLOOR);
+        let history = Tensor::zeros(capacity, DType::U32, device)?;
         Ok(Self {
             ring,
             eos,
             history,
-            capacity: capacity.max(1),
+            capacity,
             fed: 0,
             cursor: 0,
             generation: 0,

@@ -1457,8 +1457,11 @@ fn run_turns<R: ReadbackStrategy>(
             max_tokens: args.n - tokens.len(),
             ..*opts
         };
+        // No streaming: this is the perf harness, whose number is the whole
+        // generation and whose digest is taken from the ids after the clock. A
+        // per-batch drain would add readbacks the published figure must not carry.
         let out = session
-            .decode(&mut spec, &mut rb, sampler, &turn_ids, &turn_opts)
+            .decode(&mut spec, &mut rb, sampler, &turn_ids, &turn_opts, &mut |_| Ok(()))
             .with_context(|| format!("decoding turn {turn}"))?;
         turns_run = turn + 1;
         // Accumulated across turns; prefill is a different shape of work (§6.6)

@@ -170,6 +170,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// (the verify body is stage 2), a lookahead the strategy cannot use, a
     /// lookahead above 1, and a sampler the strategy cannot serve without a
     /// host round trip it would not report.
+    /// `on_tokens` is called with the ids produced since the last call, at each
+    /// commit and once at the end — the STREAMING hook, and it is streaming
+    /// *without re-serializing*. On the ring arms the ids live device-side and a
+    /// commit is where the GPU has already retired up to `fed` (the host is
+    /// `lookahead` steps ahead, `max_in_flight` deep), so draining
+    /// `ReadbackStrategy::take_ids` there reads work that is already done — one
+    /// batched readback per commit, not the per-token round trip §11.5a deleted.
+    /// A caller that does not stream passes a no-op; the tail drain at the end is
+    /// unchanged either way. Streaming appears in commit-sized chunks, which is
+    /// the price of not blocking: a token cannot be shown before the GPU makes
+    /// it, and the batch is what keeps that observation off the per-token path.
     pub fn decode<S, R>(
         &mut self,
         spec: &mut S,
@@ -177,6 +188,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         sampler: &mut LogitsProcessor,
         prompt: &[u32],
         opts: &DecodeOptions,
+        on_tokens: &mut dyn FnMut(&[u32]) -> Result<()>,
     ) -> Result<DecodeOut>
     where
         S: Speculator,
@@ -234,6 +246,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut produced = 0usize;
         let mut since_commit = 0usize;
         let mut eos = false;
+        // Every id the loop drains, streamed or not, accumulates here so the
+        // returned `ids` is complete and the reconciliation below counts the
+        // whole run. Draining for the stream advances the strategy's cursor, so
+        // the final `take_ids` only sees the tail; the total is what matches
+        // `produced`, not either part alone.
+        let mut all_ids: Vec<u32> = Vec::with_capacity(opts.max_tokens);
 
         loop {
             if produced >= opts.max_tokens {
@@ -304,29 +322,63 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // The periodic machinery: the only place the lookahead arm
             // commits. A step that already committed before its wait is not
             // committed twice.
+            let mut committed_now = committed_this_step;
             if loop_commits && !committed_this_step {
                 since_commit += 1;
                 if opts.budget.due(since_commit) {
                     self.commit(&device, &mut stats)?;
                     since_commit = 0;
+                    committed_now = true;
+                }
+            }
+
+            // Stream what is confirmed. This step's token has passed its EOS
+            // check (an EOS `break`s above and is never streamed), so a drain
+            // here carries only good ids.
+            //
+            // WHEN to drain is the whole of keeping this non-blocking. On the
+            // ring arm (`loop_commits`) the ids live device-side and a readback
+            // is a sync, so the drain is gated to commit steps: that is where the
+            // GPU has retired up to `fed`, so the read is of finished work rather
+            // than a wait, and it is one batched readback per commit instead of
+            // the per-token round trip §11.5a deleted. On the blocking arm
+            // (`!loop_commits`) the id is already host-side after this step's own
+            // readback, so there is nothing to gate — it streams per token, which
+            // is what that arm is.
+            let stream_now = if loop_commits { committed_now } else { true };
+            if stream_now {
+                let batch = readback.take_ids()?;
+                if !batch.is_empty() {
+                    on_tokens(&batch)?;
+                    all_ids.extend_from_slice(&batch);
                 }
             }
             stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
         }
 
-        // After the clock: the ring's one readback recovers the ids.
-        let ids = readback.take_ids()?;
-        if ids.len() != produced {
+        // After the clock: the tail the loop has not drained yet (between the
+        // last streamed batch and the end), streamed too so a caller sees every
+        // token before the run returns, then folded into the full `ids`.
+        let tail = readback.take_ids()?;
+        if !tail.is_empty() {
+            on_tokens(&tail)?;
+            all_ids.extend_from_slice(&tail);
+        }
+        if all_ids.len() != produced {
             lloom_tensor::bail!(
                 "Session::decode: the strategy returned {} ids for {} produced tokens — the \
                  count and the history disagree",
-                ids.len(),
+                all_ids.len(),
                 produced
             );
         }
         stats.produced = produced;
         stats.readback = readback.counters();
-        Ok(DecodeOut { ids, eos, stats })
+        Ok(DecodeOut {
+            ids: all_ids,
+            eos,
+            stats,
+        })
     }
 
     fn commit(&self, device: &Device, stats: &mut DecodeStats) -> Result<()> {

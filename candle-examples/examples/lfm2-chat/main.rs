@@ -186,7 +186,10 @@ fn main() -> Result<()> {
     // mmap + model construction + cache allocation — the safetensors are memory
     // mapped, so the weight *bytes* fault in lazily on the first forward (they
     // land in the prefill / TTFT below), not here.
-    eprintln!("[loaded in {:.2}s (mmap + construct)]", load_start.elapsed().as_secs_f64());
+    eprintln!(
+        "[loaded in \x1b[1;96m{:.2}s\x1b[0m (mmap + construct)]",
+        load_start.elapsed().as_secs_f64()
+    );
 
     let sampling = if args.temperature <= 0.0 {
         Sampling::ArgMax
@@ -224,25 +227,54 @@ fn main() -> Result<()> {
     };
     let mut session = Session::new(&model, cache);
     let mut spec = IdentityProposer;
-    let decode_start = std::time::Instant::now();
-    let out = decode_with(
-        &args.readback,
-        &mut session,
-        &mut spec,
-        &mut logits_processor,
-        &prompt_ids,
-        &opts,
-        &eos_ids,
-        &device,
-    )?;
-    let decode_elapsed = decode_start.elapsed();
-    let out_ids = out.ids;
 
-    // ---- output: reply to stdout, throughput to stderr --------------------
-    let reply = tokenizer
-        .decode(&out_ids, true)
-        .map_err(|e| anyhow::anyhow!("decoding reply: {e}"))?;
-    println!("{reply}");
+    // ---- decode: stream tokens to stdout as they are produced -------------
+    //
+    // The callback fires with each committed batch (ring) or each token
+    // (blocking) and prints incrementally, so a reply appears as it is written
+    // rather than after EOS. `TokenOutputStream` handles the BPE boundary — a
+    // token that lands mid-multibyte yields nothing until the next completes it,
+    // so the printed text is never broken UTF-8. That the tok/s below holds under
+    // this is the point: the drain reads finished work off the ring, it does not
+    // wait, so streaming does not re-serialize the non-blocking path.
+    use std::io::Write;
+    let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+    let decode_start = std::time::Instant::now();
+    let out = {
+        // Returns `candle::Result`, which is the type `Session::decode`'s callback
+        // wants: `candle` is the workspace alias for `lloom-tensor` in this tree,
+        // so `candle::Result` and `lloom_tensor::Result` are one type. `next_token`
+        // already returns it, so no map is needed.
+        let mut on_tokens = |batch: &[u32]| -> candle::Result<()> {
+            for &id in batch {
+                if let Some(text) = tos.next_token(id)? {
+                    print!("{text}");
+                    std::io::stdout().flush().ok();
+                }
+            }
+            Ok(())
+        };
+        decode_with(
+            &args.readback,
+            &mut session,
+            &mut spec,
+            &mut logits_processor,
+            &prompt_ids,
+            &opts,
+            &eos_ids,
+            &device,
+            &mut on_tokens,
+        )?
+    };
+    let decode_elapsed = decode_start.elapsed();
+    // The tail the streaming decoder is still holding (a partial multibyte run),
+    // then a newline so the reply is its own line before the perf report.
+    if let Some(rest) = tos.decode_rest()? {
+        print!("{rest}");
+    }
+    println!();
+    std::io::stdout().flush().ok();
+    let out_ids = out.ids;
 
     let n = out_ids.len();
     let st = &out.stats;
@@ -270,12 +302,19 @@ fn main() -> Result<()> {
     // sampled in step 0). This is where the mmap'd weights fault in, so a cold
     // run's TTFT carries the load the `[loaded …]` line above deferred.
     let ttft_ms = (st.prefill_ns + st.step_ns.first().copied().unwrap_or(0)) as f64 / 1e6;
+    // Bold bright-cyan on the figures worth eyeballing (the reset closes it), so
+    // they stand out when scanning a terminal. `\x1b[1;96m` = bold + bright cyan,
+    // `\x1b[0m` = reset. Only the numbers are wrapped; the labels stay plain.
+    let b = |s: String| format!("\x1b[1;96m{s}\x1b[0m");
     eprintln!(
-        "[{n} tokens: {end_to_end:.1} tok/s end-to-end (prefill included), \
-         {steady:.1} tok/s steady (median decode step), TTFT {ttft_ms:.1} ms, \
+        "[{n} tokens: {} tok/s end-to-end (prefill included), \
+         {} tok/s steady (median decode step), TTFT {} ms, \
          {} on {:?}; \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={}]",
+        b(format!("{end_to_end:.1}")),
+        b(format!("{steady:.1}")),
+        b(format!("{ttft_ms:.1}")),
         if dtype == DType::F16 { "f16" } else { "f32" },
         device,
         args.readback,
@@ -297,6 +336,7 @@ fn main() -> Result<()> {
 /// type is chosen. An unknown name is an error rather than a fallback (a run
 /// that reports one arm and executes another is the failure this refuses).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn decode_with(
     readback: &str,
     session: &mut Session<'_, Model>,
@@ -306,17 +346,20 @@ fn decode_with(
     opts: &DecodeOptions,
     eos_ids: &[u32],
     device: &Device,
+    on_tokens: &mut dyn FnMut(&[u32]) -> candle::Result<()>,
 ) -> Result<DecodeOut> {
-    // Sized for this one generation; the ring refuses to overflow it.
+    // The device-side id history, sized for this generation; `Ring::new` floors
+    // it at a few pages (`RING_HISTORY_FLOOR`), so a short run still gets a
+    // generous ring. It refuses to overflow.
     let capacity = opts.max_tokens + 1;
     let out = match readback {
         "blocking" => {
             let mut rb = Blocking::new(eos_ids, device)?;
-            session.decode(spec, &mut rb, sampler, prompt_ids, opts)?
+            session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?
         }
         "ring" => {
             let mut rb = Ring::new(eos_ids, device, capacity, EosRead::Blocking)?;
-            session.decode(spec, &mut rb, sampler, prompt_ids, opts)?
+            session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?
         }
         "ring-nonblocking" => {
             let mut rb = Ring::new(
@@ -325,7 +368,7 @@ fn decode_with(
                 capacity,
                 EosRead::Poll(PollMechanism::default()),
             )?;
-            let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts)?;
+            let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
             // The arm that ran is the arm reported: a ring whose poll could not
             // read the mapped words fell back to the blocking read on every
             // step, and says so rather than passing as non-blocking.

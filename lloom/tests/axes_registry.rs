@@ -18,6 +18,7 @@ use std::path::PathBuf;
 /// fails with the missing name rather than a silent shrink.
 const EXPECTED_AXES: &[&str] = &[
     "AttnImpl",
+    "ConvFused",
     "ConvState",
     "GemvResidual",
     "GemvSilu",

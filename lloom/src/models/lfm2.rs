@@ -199,6 +199,7 @@ impl Lfm2Config {
             // here — this change makes the arm reachable, nothing more.
             gemv_silu: false,
             gemv_residual: false,
+            conv_fused: false,
             // No tap, per §7.1a: an empty `tap_layers` is what every existing
             // caller had before #363 and costs an `is_empty()` per layer. The
             // indices belong to a *drafter* checkpoint, so there is no
@@ -777,6 +778,16 @@ pub struct Config {
     /// the f32 accumulator where `badd_f16` adds at `T` on the rounded store.
     #[axis(name = "GemvResidual", flag = "gemv-residual", variants = ["off", "on"], default = "off", bool)]
     pub gemv_residual: bool,
+    /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
+    /// `conv1d` dispatch (§12.2 row 1). Off by default (§7.1a): it MOVES the
+    /// digest — the depthwise kernel accumulates serially ascending in f32 where
+    /// `sum_keepdim` uses a `simd_sum` tree — so an unmoved-digest gate cannot
+    /// clear it and the discriminator is CPU-backend parity (§2.3.5a). The win
+    /// is on the dispatch axis: ~2–3 dispatches per conv layer become 1, and
+    /// LFM2 has 22 conv layers, so it is the largest single dispatch reduction
+    /// the catalogue leaves open (llama.cpp's decode conv is one kernel).
+    #[axis(name = "ConvFused", flag = "conv-fused", variants = ["off", "on"], default = "off", bool)]
+    pub conv_fused: bool,
     /// Which layers' **input residual** to capture into [`Cache::taps`], for a
     /// hidden-state-typed drafter (`DESIGN.md` §10.2m, issue #363).
     ///
@@ -906,6 +917,7 @@ impl Default for Config {
             memory_budget: None,
             gemv_silu: false,
             gemv_residual: false,
+            conv_fused: false,
             tap_layers: Vec::new(),
             tap_dtype: DType::F32,
             #[cfg(feature = "metal")]
@@ -2527,6 +2539,16 @@ struct ShortConv {
     /// Fuse the post-conv residual add onto `out_proj`'s GEMV store (§12.2h).
     /// 22 of the 60 `badd_f16` dispatches per token — the largest of the three.
     gemv_residual: bool,
+    /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
+    /// conv1d dispatch (§12.2 row 1, the largest open dispatch-axis win). The
+    /// window is `[b, hidden, l_cache]` and the kernel is the same `[hidden, 1,
+    /// l_cache]` weight prefill already convolves with, so this reuses the
+    /// validated fused depthwise path rather than a new kernel. It MOVES the
+    /// digest — the depthwise kernel accumulates serially ascending in f32 where
+    /// `sum_keepdim` reduces with a `simd_sum` tree — so it is off by default and
+    /// its correctness is a CPU-backend parity check, not an unmoved digest
+    /// (§2.3.5a).
+    conv_fused: bool,
     span: tracing::Span,
 }
 
@@ -2616,8 +2638,40 @@ impl ShortConv {
             hidden_size,
             conv_state: cfg.conv_state,
             gemv_residual: cfg.gemv_residual,
+            conv_fused: cfg.conv_fused,
             span: tracing::span!(tracing::Level::TRACE, "shortconv"),
         })
+    }
+
+    /// Fold a conv window `[b, hidden, w]` against a `[hidden, w]` weight into
+    /// the per-channel output `[b, hidden, 1]` — the operation every decode arm
+    /// ends on.
+    ///
+    /// Unfused (default): `broadcast_mul + sum_keepdim`, whose `simd_sum` tree
+    /// is the accumulation order every recorded digest belongs to. Fused
+    /// (`--conv-fused`): one depthwise `conv1d` dispatch over the same window,
+    /// reusing prefill's validated kernel. `weight` is the `[hidden, w]` slice
+    /// (squeezed or phase-permuted); the fused arm `unsqueeze(1)`s it back to the
+    /// `[hidden, 1, w]` conv-kernel layout, so a caller passes the SAME weight to
+    /// both arms and the choice is this method's alone.
+    fn conv_fold(&self, window: &Tensor, weight: &Tensor) -> Result<Tensor> {
+        if self.conv_fused {
+            let w = window.dims3()?.2;
+            // Depthwise: groups == in-channels, one tap window, no padding. The
+            // fused Metal kernel (`conv1d_depthwise_k*`) is dispatched by
+            // `Tensor::conv1d` when `groups == c_in && c_in_k == 1`, which this
+            // is; on a backend without it the generic grouped path gives the
+            // identical answer (§conv1d_depthwise fallback).
+            let _ = w;
+            window
+                .conv1d(&weight.unsqueeze(1)?, 0, 1, 1, self.hidden_size)?
+                .contiguous()
+        } else {
+            window
+                .broadcast_mul(&weight.unsqueeze(0)?)?
+                .sum_keepdim(2)?
+                .contiguous()
+        }
     }
 
     fn forward(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
@@ -2728,10 +2782,10 @@ impl ShortConv {
                     .expect("rotating weights exist whenever the arm is RotatingRing")
                     .get(phase)
                     .expect("phase is taken modulo width, so it indexes the table");
-                // `broadcast_mul` rather than `*`: see the decode arm below for
-                // why, and note it is the same one-line change at all four
-                // conv-weight sites.
-                outs.push(state.broadcast_mul(&w.unsqueeze(0)?)?.sum_keepdim(2)?);
+                // The same fold as the decode arm, per position: `conv_fold`
+                // honours `--conv-fused` here too, so a speculative verify runs
+                // the same conv kernel a decode of that token would.
+                outs.push(self.conv_fold(&state, w)?);
             }
 
             if cache.use_kv_cache {
@@ -2782,10 +2836,12 @@ impl ShortConv {
                         .expect("rotating weights are built whenever the arm is RotatingRing")
                         .get(phase)
                         .expect("phase is taken modulo width, so it indexes the table");
-                    state
-                        .broadcast_mul(&w.unsqueeze(0)?)?
-                        .sum_keepdim(2)?
-                        .contiguous()?
+                    // The rotating arm folds the WHOLE `width`-wide buffer against
+                    // a phase-permuted weight (not an `l_cache` window), so
+                    // `conv_fold`'s depthwise kernel runs at `k_size = width`. The
+                    // permutation already lives in `w`, so the fused and unfused
+                    // arms fold the same products and differ only in order.
+                    self.conv_fold(&state, w)?
                 }
                 ConvState::SlidingRing { .. } => {
                     let width = self.conv_state.width(self.l_cache);
@@ -2838,10 +2894,7 @@ impl ShortConv {
                     // unchanged and the output bit-identical. A rotating index
                     // would not: see `ConvState`'s note on §10.2a.
                     let window = state.narrow(2, phase + 1 - self.l_cache, self.l_cache)?;
-                    window
-                        .broadcast_mul(&conv_weight.unsqueeze(0)?)?
-                        .sum_keepdim(2)?
-                        .contiguous()?
+                    self.conv_fold(&window, &conv_weight)?
                 }
                 ConvState::Shuffle => {
                     // Token-by-token generation: use cached state
@@ -2888,11 +2941,10 @@ impl ShortConv {
                     // At `b_sz > 1` the weight becomes a stride-0 view rather
                     // than a copy, so the batch shares one weight read, which
                     // is §13.4a's claim in miniature: the conv weight is per
-                    // step, not per sequence.
-                    state
-                        .broadcast_mul(&conv_weight.unsqueeze(0)?)?
-                        .sum_keepdim(2)?
-                        .contiguous()?
+                    // step, not per sequence. (Under `--conv-fused` the same
+                    // per-step weight sharing holds: the depthwise kernel reads
+                    // one `[hidden, w]` weight for the whole batch.)
+                    self.conv_fold(&state, &conv_weight)?
                 }
             }
         } else {

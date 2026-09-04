@@ -384,6 +384,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
+    /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
+    /// `conv1d` dispatch (§12.2 row 1). **The digests MOVE** — the depthwise
+    /// kernel accumulates serially ascending in f32 where `sum_keepdim` uses a
+    /// `simd_sum` tree — so `--cpu --conv-fused` against `--cpu` is the §2.3.5a
+    /// discriminator that says it is a reordering rather than a defect.
+    #[arg(long, default_value_t = false)]
+    conv_fused: bool,
+
     /// Which SiLU implementation the 30 `usilu` dispatches resolve to
     /// (issue #599, `DESIGN.md` §12.2l).
     ///
@@ -689,6 +697,7 @@ fn main() -> Result<()> {
     // interpretable against the arm it was taken in (§2.3.7).
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
+    config.conv_fused = args.conv_fused;
     println!(
         "gemv epilogue: silu={} residual={}",
         config.gemv_silu, config.gemv_residual

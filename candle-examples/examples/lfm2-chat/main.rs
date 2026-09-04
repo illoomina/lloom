@@ -89,6 +89,15 @@ struct Args {
     #[arg(long, default_value = "steps:8")]
     commit_budget: String,
 
+    /// The most command buffers the host may leave in flight before it waits for
+    /// the GPU — explicit backpressure. `0` (the default) is off. Only meaningful
+    /// on the `ring-hostdrain` arm, which has no per-token EOS wait to pace it and
+    /// otherwise runs the host arbitrarily far ahead of the GPU (measured: 63 vs
+    /// the poll arm's ~9). A value near the commit budget keeps in-flight bounded
+    /// like the poll arm while letting the GPU run ahead up to the cap.
+    #[arg(long, default_value_t = 0)]
+    max_in_flight: usize,
+
     /// Drive decode with the **DSpark** speculative drafter instead of the K=1
     /// identity proposer. The drafter proposes a block of up to `--draft` tokens
     /// per round and the target verifies them in one `forward_all`, accepting the
@@ -403,13 +412,30 @@ fn main() -> Result<()> {
         // The fastest B=1 decode config lloom has, baked in — this example exists to
         // show what the engine does at its best, not the conservative defaults every
         // axis ships at (§7.1a keeps those off in the library; a demo turns them on).
-        // The crown attention/KV/conv arms (Sdpa × Cat × Shuffle, §13.5) plus the two
-        // GEMV epilogue fusions (§12.2d/§12.2h) plus the conv fold (§12.2 row 1). Every
-        // one is token-identical to the generic path — only the logits reorder — so
-        // this is the same answer, faster. The readback strategy (ring + lookahead)
-        // is selected below, on the loop side.
+        // The crown attention/conv arms (Sdpa × Shuffle, §13.5) plus the two GEMV
+        // epilogue fusions (§12.2d/§12.2h) plus the conv fold (§12.2 row 1). Every one
+        // is token-identical to the generic path — only the logits reorder — so this
+        // is the same answer, faster. The readback strategy (ring + lookahead) is
+        // selected below, on the loop side.
         config.attn_impl = lloom::models::lfm2::AttnImpl::Sdpa;
-        config.kv_append = lloom::models::lfm2::KvAppend::Cat;
+        // KV append: `Cat` is the demo default because it is the fastest arm
+        // *today* (measured 2026-09-05: Cat ~60.5 vs InPlace ~58.3 tok/s steady,
+        // both byte-identical). InPlace writes in place at a moving offset (stable
+        // buffer identity, one `copy2d`/token) and stabilises the attention
+        // positions for replay (memory.md §9.2i: 77.9% → 81.7% coverage) — BUT that
+        // coverage is latent: no ICB executor is installed on this decode path
+        // (`ExecutorSlot::Classical`), so InPlace pays its per-token cost with the
+        // replay benefit switched off and loses. InPlace's win is a TWO-part change
+        // (InPlace + engage the ICB replay executor); until the second half lands,
+        // Cat is faster for this single-turn speed demo. A real serving engine wants
+        // InPlace regardless — `Cat` reallocates a wider KV every token and grows
+        // unbounded, which does not fly for many concurrent long generations — but
+        // that is the serving path's decision, not this demo's. `LLOOM_CROWN_KV=in-place`
+        // selects it for the A/B and for the replay work.
+        config.kv_append = match std::env::var("LLOOM_CROWN_KV").as_deref() {
+            Ok("in-place") => lloom::models::lfm2::KvAppend::InPlace,
+            _ => lloom::models::lfm2::KvAppend::Cat,
+        };
         config.conv_state = lloom::models::lfm2::ConvState::Shuffle;
         config.gemv_silu = true;
         config.gemv_residual = true;
@@ -501,6 +527,7 @@ fn main() -> Result<()> {
         max_tokens: args.max_tokens,
         budget,
         lookahead: args.lookahead,
+        max_in_flight: args.max_in_flight,
         // Under the speculative body this is the per-phase drain (decode.rs).
         sample_split: args.phase_sync,
     };
@@ -887,8 +914,27 @@ fn decode_with(
             debug_assert!(rb.arms().nonblocking_eos);
             out
         }
+        "ring-hostdrain" => {
+            // The device never computes the EOS flag (~5 dispatches/token gone);
+            // the host learns EOS from the drained ids on the commit cadence, so
+            // up to a commit-worth of forwards may run past the EOS and their
+            // tokens are truncated from the output. Byte-identical to the poll
+            // arm — the truncation lands at the same position the poll would
+            // break at.
+            let mut rb = Ring::new(eos_ids, device, capacity, EosRead::HostOnDrain)?;
+            let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
+            if !rb.poll_is_mapped() {
+                eprintln!(
+                    "[ring-hostdrain: the ring's words were not CPU-mapped; the drain took the \
+                     synchronising snapshot each commit]"
+                );
+            }
+            debug_assert!(rb.arms().nonblocking_eos);
+            out
+        }
         other => anyhow::bail!(
-            "--readback must be `blocking`, `ring` or `ring-nonblocking`, got `{other}`"
+            "--readback must be `blocking`, `ring`, `ring-nonblocking` or `ring-hostdrain`, \
+             got `{other}`"
         ),
     };
     Ok(out)

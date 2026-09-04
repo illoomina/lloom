@@ -320,6 +320,52 @@ impl TokenRing {
         Ok(())
     }
 
+    /// [`Self::publish_step`] **without the device EOS decision** — writes the
+    /// input slot and the generation stamp only, skipping the
+    /// `broadcast_eq → max_all → slice_set(eos)` that costs ~5 dispatches every
+    /// token in the command stream (`DESIGN.md` §11.5g's comparison).
+    ///
+    /// For the [`crate::generation::EosRead::HostOnDrain`] arm, where EOS is not
+    /// learned per token from the device flag but host-side from the drained ids
+    /// (a plain Rust compare on the batch the drain already reads), so the flag
+    /// is never read and the dispatches that compute it are pure cost. The stamp
+    /// is still written last and is still the visibility signal the zero-copy
+    /// drain rides ([`Self::published_generation`]) — that protocol is unchanged,
+    /// only the EOS flag is gone.
+    ///
+    /// The `eos` flag tensor is left at whatever it last held; nothing reads it
+    /// on this arm. A `generation` of 0 is rejected for [`Self::publish_step`]'s
+    /// reason.
+    pub fn publish_input_and_stamp(&self, token: &Tensor, generation: u32) -> Result<()> {
+        if token.dtype() != DType::U32 {
+            lloom_tensor::bail!(
+                "TokenRing::publish_input_and_stamp expects the U32 argmax output, got {:?}",
+                token.dtype()
+            );
+        }
+        if generation == 0 {
+            lloom_tensor::bail!(
+                "TokenRing: generation 0 is the unpublished sentinel, ordinals start at 1"
+            );
+        }
+        let token = token.reshape((1, 1))?;
+        self.input.slice_set(&token, 0, 0)?;
+        // The stamp, LAST — the drain's visibility signal, same ordering as
+        // `publish_step`. No EOS flag is written: this arm never reads it.
+        let stamp = Tensor::from_vec(vec![generation], 1, self.step.device())?;
+        self.step.slice_set(&stamp, 0, 0)?;
+        Ok(())
+    }
+
+    /// The EOS id set this ring compares against, for the host-side EOS check on
+    /// the [`crate::generation::EosRead::HostOnDrain`] arm. Read back once at
+    /// ring construction and cached by the caller, so this is `to_vec1`'d off
+    /// the hot path (it is a loop invariant — the same handful of ids every
+    /// step).
+    pub fn eos_ids(&self) -> Result<Vec<u32>> {
+        self.eos_ids.to_vec1::<u32>()
+    }
+
     /// Non-blocking: has step `generation` published, and was it EOS? (#535)
     ///
     /// Returns `None` when the answer is not yet available *or* not available

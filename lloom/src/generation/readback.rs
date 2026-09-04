@@ -123,6 +123,44 @@ pub trait ReadbackStrategy {
     /// between the last incremental drain and the end.
     fn drain_all(&mut self) -> Result<Vec<u32>>;
 
+    /// The index of the first EOS id in a drained `batch`, for the arm that
+    /// learns EOS host-side ([`EosRead::HostOnDrain`]) rather than from a
+    /// per-token device flag. The loop calls this on each streamed batch and, on
+    /// `Some(i)`, streams `batch[..i]` and stops.
+    ///
+    /// **The default is `None`** — every arm that learns EOS per token
+    /// ([`Self::eos_of_last`]) has already excluded the EOS token before it
+    /// reaches a batch, so their batches carry no EOS to find. Only the
+    /// host-on-drain ring overrides this.
+    fn eos_in_drained(&self, batch: &[u32]) -> Option<usize> {
+        let _ = batch;
+        None
+    }
+
+    /// Whether this arm learns EOS by truncating a drained batch host-side
+    /// (rather than retracting a token per step). `true` only for
+    /// [`EosRead::HostOnDrain`]. The loop uses it to decide whether, after an EOS
+    /// it found in the loop body, the remaining ring content is overrun to
+    /// discard (this arm) or good tokens still to stream (every other arm, whose
+    /// EOS token was already retracted per step). Default `false`.
+    fn truncates_on_drain(&self) -> bool {
+        false
+    }
+
+    /// Wait until the host is at most `cap` command buffers ahead of the GPU —
+    /// explicit backpressure the loop calls after each enqueue when `cap > 0`.
+    ///
+    /// The default is a no-op: an arm that already paces itself (the blocking
+    /// arm reads every token back; the poll arm waits for each step's EOS) needs
+    /// no separate cap. The ring's stamped arms override this to wait, by the
+    /// same WFE mechanism the poll uses, on the published-generation counter —
+    /// and **only when actually more than `cap` ahead**, so when the GPU keeps up
+    /// it is a mapped read and a compare, not a wait.
+    fn apply_backpressure(&mut self, cap: usize) -> Result<()> {
+        let _ = cap;
+        Ok(())
+    }
+
     /// The engagement counters so far.
     fn counters(&self) -> ReadbackCounters;
 }
@@ -222,6 +260,24 @@ pub enum EosRead {
     /// falling back to the blocking read after a bounded number of iterations
     /// (§11.5n's arm).
     Poll(PollMechanism),
+    /// Learn EOS **host-side, off the hot path**: the device never computes the
+    /// EOS flag (the `broadcast_eq → max_all → slice_set(eos)` dispatches are
+    /// skipped, ~5/token), and the host compares the drained ids against the EOS
+    /// set in plain Rust at the drain point instead. `eos_of_last` therefore
+    /// always answers `false` — the loop learns EOS from
+    /// [`Ring::eos_in_drained`] on the batch it streams, not per token.
+    ///
+    /// The trade is the overrun: EOS is discovered only when the ids are drained
+    /// (on the commit cadence), so up to a cadence-worth of forwards may run past
+    /// it and their tokens are truncated from the output. At B=1 with a ring
+    /// wide enough to hold the tail that is a rare, once-per-generation cost, not
+    /// a per-token one — and the bound is a knob, not a committed shape.
+    ///
+    /// Like [`Self::Poll`], this rides the device-resident token and the stamped
+    /// generation counter (the drain's visibility signal), so it needs the ring
+    /// mapped for the zero-copy drain; the drain's own fallback covers the
+    /// unmapped case.
+    HostOnDrain,
 }
 
 /// The device-resident arms: the token never comes to the host, the next
@@ -240,6 +296,11 @@ pub struct Ring {
     cursor: usize,
     /// The ordinal stamped on the last publish; 0 before any.
     generation: u32,
+    /// The EOS id set, host-side, for the [`EosRead::HostOnDrain`] compare.
+    /// Read back from the device ring once at construction (a loop invariant),
+    /// so the per-token path never touches it. Empty on the other arms, which
+    /// learn EOS from the device flag instead.
+    eos_ids_host: Vec<u32>,
     counters: ReadbackCounters,
 }
 
@@ -289,6 +350,13 @@ impl Ring {
         // buffer, whose Shared-vs-Private write cost is unmeasured.
         let capacity = capacity.max(RING_HISTORY_SLOTS);
         let history = Tensor::zeros(capacity, DType::U32, device)?;
+        // Cache the EOS ids host-side only for the arm that compares them there;
+        // the other arms read the device flag and never touch this.
+        let eos_ids_host = if matches!(eos, EosRead::HostOnDrain) {
+            ring.eos_ids()?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             ring,
             eos,
@@ -297,6 +365,7 @@ impl Ring {
             fed: 0,
             cursor: 0,
             generation: 0,
+            eos_ids_host,
             poll_budget: POLL_BUDGET,
             counters: ReadbackCounters::default(),
         })
@@ -334,7 +403,9 @@ impl ReadbackStrategy for Ring {
     fn arms(&self) -> ReadbackArms {
         ReadbackArms {
             token_ring: true,
-            nonblocking_eos: matches!(self.eos, EosRead::Poll(_)),
+            // Both the poll and the host-on-drain arms learn EOS without a
+            // per-step blocking readback of the device flag.
+            nonblocking_eos: matches!(self.eos, EosRead::Poll(_) | EosRead::HostOnDrain),
         }
     }
 
@@ -392,6 +463,11 @@ impl ReadbackStrategy for Ring {
         match self.eos {
             EosRead::Poll(_) => self.ring.publish_step(&sampled, Some(self.generation))?,
             EosRead::Blocking => self.ring.publish(&sampled)?,
+            // No device EOS: input + stamp only, the ~5 EOS dispatches skipped.
+            // EOS is learned host-side from the drained batch (`eos_in_drained`).
+            EosRead::HostOnDrain => self
+                .ring
+                .publish_input_and_stamp(&sampled, self.generation)?,
         }
         self.fed += 1;
         Ok(self.ring.input().clone())
@@ -399,6 +475,12 @@ impl ReadbackStrategy for Ring {
 
     fn eos_of_last(&mut self) -> Result<bool> {
         let is_eos = match self.eos {
+            // EOS is not learned per token on this arm — the device never
+            // computed the flag. The loop learns it from `eos_in_drained` on the
+            // batch it streams, so this always answers `false` and never
+            // retracts a token here (the retraction happens host-side, at the
+            // drain, when the batch is truncated to the EOS position).
+            EosRead::HostOnDrain => false,
             EosRead::Blocking => {
                 self.counters.poll_iters += 1;
                 self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
@@ -474,7 +556,12 @@ impl ReadbackStrategy for Ring {
         // but its own per-step EOS `to_vec1` already synchronised up to `fed`, so
         // every enqueued slot is visible and the full range is safe.
         let end = match self.eos {
-            EosRead::Poll(_) => match self.ring.published_generation() {
+            // Both stamped arms ride the same visibility signal: drain only up to
+            // the GPU-published generation, never past it. On `HostOnDrain` `fed`
+            // is never decremented (EOS is not retracted per token — the loop
+            // truncates the batch to the EOS position instead), so this returns
+            // every published id and the loop's own scan decides where to stop.
+            EosRead::Poll(_) | EosRead::HostOnDrain => match self.ring.published_generation() {
                 // `g` counts published steps; each retracted EOS decremented
                 // `fed` but not the counter, so clamp both ways.
                 Some(g) => self.fed.min(g as usize),
@@ -545,6 +632,60 @@ impl ReadbackStrategy for Ring {
         let ids = self.history.narrow(0, start, n)?.to_vec1::<u32>()?;
         self.cursor = self.fed;
         Ok(ids)
+    }
+
+    /// The host EOS check for [`EosRead::HostOnDrain`]: the index of the first
+    /// EOS id in `batch`, a plain Rust compare against the id set read back once
+    /// at construction (`eos_ids_host`). Costs no device work and no readback —
+    /// it runs on the batch the drain already produced. `None` (and empty
+    /// `eos_ids_host`) on every other arm, which learn EOS per token instead.
+    fn eos_in_drained(&self, batch: &[u32]) -> Option<usize> {
+        if self.eos_ids_host.is_empty() {
+            return None;
+        }
+        batch.iter().position(|id| self.eos_ids_host.contains(id))
+    }
+
+    fn truncates_on_drain(&self) -> bool {
+        matches!(self.eos, EosRead::HostOnDrain)
+    }
+
+    fn apply_backpressure(&mut self, cap: usize) -> Result<()> {
+        if cap == 0 {
+            return Ok(());
+        }
+        // In-flight is how far the host's enqueue count (`generation`) runs
+        // ahead of the GPU's published count (`published_generation`, the mapped
+        // stamp the drain already rides). Wait until that gap is within `cap`.
+        //
+        // The wait is the poll arm's own WFE on the step counter, but conditional
+        // rather than per-token: when the GPU is within `cap` this loop does not
+        // execute a single WFE — it is a mapped read (`published_generation`) and
+        // a subtraction. Only when the host has genuinely outrun the GPU does it
+        // arm the monitor and wait for the counter to advance, then re-check.
+        //
+        // If the counter is not mapped there is no non-blocking way to read the
+        // GPU's progress, so backpressure cannot be applied here; the arm falls
+        // back to the unbounded behaviour it had before this cap, which is the
+        // same degradation `poll_eos` takes when unmapped. `flush_and_prune` at
+        // the loop's commit cadence still bounds it loosely.
+        let Some(watched) = (unsafe { self.ring.step_addr() }) else {
+            return Ok(());
+        };
+        loop {
+            let published = self.ring.published_generation().unwrap_or(0) as usize;
+            let in_flight = self.generation as usize - published.min(self.generation as usize);
+            if in_flight <= cap {
+                return Ok(());
+            }
+            self.counters.poll_iters += 1;
+            // Wait for the counter to change from what we just saw; the compare
+            // inside `wait_on` skips the WFE if it has already advanced.
+            // SAFETY: `watched` is `step_addr`, valid while `self.ring` lives.
+            let seen = unsafe { watched.read_volatile() };
+            let poll = PollMechanism::default();
+            unsafe { poll.wait_on(watched, seen) };
+        }
     }
 
     fn counters(&self) -> ReadbackCounters {

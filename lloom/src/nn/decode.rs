@@ -96,6 +96,27 @@ pub struct DecodeOptions {
     /// Forward passes the host may enqueue before it has learned the previous
     /// step's EOS: `0` or `1`. See the module docs for what `1` costs.
     pub lookahead: usize,
+    /// The most command buffers the host may leave in flight before it waits for
+    /// the GPU to catch up — explicit backpressure, decoupled from the EOS
+    /// mechanism. `0` is **off** (no cap).
+    ///
+    /// # Why this exists, and what it replaces
+    ///
+    /// On the poll arm the per-token EOS wait ([`ReadbackStrategy::eos_of_last`])
+    /// doubles as pacing: the host blocks ~every token, so it never runs more
+    /// than a handful of forwards ahead of the GPU. An arm that learns EOS off
+    /// the hot path ([`crate::generation::EosRead::HostOnDrain`]) has no such
+    /// wait, so nothing bounds how far the host runs ahead — measured, in-flight
+    /// ratcheted to 63 against the poll arm's ~9, and the deep queue cost the
+    /// tail. `flush_and_prune` only drops *completed* buffers; it never caps.
+    ///
+    /// This is the cap made explicit and per-arm: after each enqueue the loop
+    /// asks the strategy to apply backpressure, which waits (by the same WFE
+    /// mechanism the poll arm uses, on the published-generation counter) **only
+    /// when** the host is more than `max_in_flight` generations ahead — a mapped
+    /// read and a compare when it is not, so the GPU is free to run ahead up to
+    /// the cap rather than being throttled to one forward per token.
+    pub max_in_flight: usize,
     /// **Diagnostic, and it perturbs the thing it measures**: drain the GPU
     /// before each sample so the sample term can be timed apart from the
     /// forward pass (§11.2a). Off for every published number. Under
@@ -118,12 +139,14 @@ pub struct RoundStats {
 }
 
 impl DecodeOptions {
-    /// Greedy defaults: `max_tokens`, per-token commit, no lookahead, no split.
+    /// Greedy defaults: `max_tokens`, per-token commit, no lookahead, no
+    /// in-flight cap, no split.
     pub fn new(max_tokens: usize) -> Self {
         Self {
             max_tokens,
             budget: CommitBudget::per_token(),
             lookahead: 0,
+            max_in_flight: 0,
             sample_split: false,
         }
     }
@@ -333,6 +356,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     .forward(&feed, self.pos, &mut self.cache)?
                     .squeeze(0)?;
                 self.pos += 1;
+                // Backpressure AFTER the enqueue: the host has just added a
+                // command buffer, so cap how far it may run ahead of the GPU.
+                // A no-op on arms that pace themselves; on the host-on-drain arm
+                // it is what replaces the pacing the per-token EOS wait used to
+                // provide, and it only waits when actually more than `cap` ahead.
+                if opts.max_in_flight > 0 {
+                    readback.apply_backpressure(opts.max_in_flight)?;
+                }
                 if readback.eos_of_last()? {
                     produced -= 1;
                     eos = true;
@@ -371,6 +402,28 @@ impl<'m, M: CausalLM> Session<'m, M> {
             if stream_now {
                 let batch = readback.take_ids()?;
                 if !batch.is_empty() {
+                    // The host-side EOS check (`EosRead::HostOnDrain`): this arm
+                    // does not learn EOS per token, so a drained batch may
+                    // contain the EOS token and the overrun the loop enqueued
+                    // after it. Scan here, BEFORE streaming, so `on_tokens` still
+                    // only ever sees good ids (the invariant the per-token arms
+                    // hold by `break`ing before they stream). On other arms
+                    // `eos_in_drained` is `None` and the batch streams whole.
+                    if let Some(k) = readback.eos_in_drained(&batch) {
+                        // `batch[..k]` are good; `batch[k]` is EOS (excluded, as
+                        // the per-token retraction excludes it); `batch[k+1..]`
+                        // are overrun (discarded). Reconcile `produced` down to
+                        // the good count so it matches `all_ids`.
+                        let good = &batch[..k];
+                        if !good.is_empty() {
+                            on_tokens(good)?;
+                            all_ids.extend_from_slice(good);
+                        }
+                        produced = all_ids.len();
+                        eos = true;
+                        stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
+                        break;
+                    }
                     on_tokens(&batch)?;
                     all_ids.extend_from_slice(&batch);
                 }
@@ -384,10 +437,36 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // the GPU has published. `drain_all` synchronises up to the final slot,
         // so the tail is complete; streamed too, so a caller sees the last
         // tokens, then folded into the full `ids`.
-        let tail = readback.drain_all()?;
-        if !tail.is_empty() {
-            on_tokens(&tail)?;
-            all_ids.extend_from_slice(&tail);
+        //
+        // The tail is scanned for EOS too, for `EosRead::HostOnDrain`: if the run
+        // ended on `max_tokens` (not an EOS `break` above) the EOS may sit in the
+        // never-committed tail, and streaming it whole would emit tokens past it.
+        // On the per-token arms `eos_in_drained` is `None`, so the tail streams
+        // whole as before.
+        //
+        // The one case that skips the tail entirely is a host-on-drain arm that
+        // ALREADY truncated at EOS in the loop above (`eos && truncates_on_drain`):
+        // everything still in the ring past that point is the overrun it enqueued
+        // before it could stop, and draining it would emit tokens past the EOS.
+        // Every other arm drains unconditionally — the poll arm retracted its EOS
+        // token in `eos_of_last` and the remainder in the ring is all good, so it
+        // must still be streamed even after an EOS `break`.
+        if !(eos && readback.truncates_on_drain()) {
+            let tail = readback.drain_all()?;
+            if !tail.is_empty() {
+                if let Some(k) = readback.eos_in_drained(&tail) {
+                    let good = &tail[..k];
+                    if !good.is_empty() {
+                        on_tokens(good)?;
+                        all_ids.extend_from_slice(good);
+                    }
+                    produced = all_ids.len();
+                    eos = true;
+                } else {
+                    on_tokens(&tail)?;
+                    all_ids.extend_from_slice(&tail);
+                }
+            }
         }
         if all_ids.len() != produced {
             lloom_tensor::bail!(

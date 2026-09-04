@@ -91,6 +91,7 @@ mod strided_index;
 mod tensor;
 mod tensor_cat;
 pub mod test_utils;
+pub mod typed;
 pub mod utils;
 mod variable;
 
@@ -113,6 +114,7 @@ pub use storage::Storage;
 pub use streaming::{StreamTensor, StreamingBinOp, StreamingModule};
 pub use strided_index::{StridedBlocks, StridedIndex};
 pub use tensor::{Tensor, TensorId};
+pub use typed::{Backend, Cpu, Cuda, Metal, Typed};
 pub use variable::Var;
 
 #[cfg(feature = "cuda")]

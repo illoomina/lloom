@@ -68,16 +68,71 @@ impl LogitsProcessor {
     /// input) is **deleted rather than relocated**: there is nothing to upload
     /// because nothing came down.
     ///
-    /// This is `--temperature 0` only, and deliberately: §11.5f measures
-    /// `sample_f`'s temperature path taking the same `to_cpu` over the whole
-    /// vocabulary -- 128 000 f32, **512 000 B against argmax's 4** -- and
-    /// §11.2c measures 74 % of that arm in a host `sort_by`. A device-resident
-    /// sampler for temperature > 0 is a different change and is out of scope
-    /// (§11.2c also refuses to ship gumbel-max, on a tier-3 distributional
-    /// failure at χ² 36 440 against a critical 331 -- for correctness, not
-    /// speed).
+    /// Temperature > 0 stays on the device too, via gumbel-max. Sampling from
+    /// `softmax(logits/T)` is `argmax(logits/T + G)` with `G` an i.i.d. Gumbel
+    /// per logit (`-log(-log u)`) -- an argmax over a perturbed logit vector, so
+    /// the token is produced by the same device `argmax` the t=0 arm uses and
+    /// **nothing comes down**. §11.2c's original blocker (a tier-3 distributional
+    /// failure at χ² 36 440) is DISCHARGED: the two root causes -- `rand_uniform`'s
+    /// seed advance collapsing onto a period-257 orbit, and `gumbel_softmax`'s
+    /// `(1e-7, 0.999)` clamp truncating one Gumbel variate in a thousand -- were
+    /// fixed, and the check now passes at χ² 216/280 against a critical 331
+    /// (`nn::sampling::gumbel_softmax`, which this delegates to and which returns
+    /// a device tensor). So temperature is no longer `--temperature 0` only: the
+    /// ring's `to_cpu_blit` stays at 0 at t > 0, where the host path took a
+    /// 512 KB whole-vocab readback per token (§11.5f) plus a 74 %-of-arm host
+    /// `sort_by` (§11.2c). ArgMax and the two top-{k,p} arms that need a host
+    /// sort still round-trip; plain temperature and gumbel-softmax do not.
     pub fn sample_argmax_on_device(&mut self, logits: &Tensor) -> Result<Tensor> {
-        logits.argmax(lloom_tensor::D::Minus1)
+        match self.sampling {
+            // t = 0 -- a bare device argmax, the original mechanism.
+            Sampling::ArgMax => logits.argmax(lloom_tensor::D::Minus1),
+            // t > 0 without a nucleus/top-k -- gumbel-max with the Gumbel noise
+            // generated on the HOST and fed as an input, not `rand_like` on the
+            // GPU. The noise is data-independent (it never reads the logits), so
+            // producing it on the device, inline, per token, is work on the
+            // critical path that need not be there -- llama.cpp's backend dist
+            // sampler feeds `inp_uniforms` the same way (host `std::uniform_real`
+            // -> a GPU input tensor). The device then does only `logits/T + G ->
+            // argmax`, one add over the reduction it was already going to run.
+            Sampling::All { temperature } | Sampling::GumbelSoftmax { temperature } => {
+                self.gumbel_max_host_noise(logits, temperature)
+            }
+            // top-k / top-p need a host sort (§11.2c) -- fall back to the plain
+            // argmax on the device, and let the caller's blocking `sample` path
+            // handle the nucleus. (These arms disable the ring in the harness.)
+            Sampling::TopK { .. } | Sampling::TopP { .. } | Sampling::TopKThenTopP { .. } => {
+                logits.argmax(lloom_tensor::D::Minus1)
+            }
+        }
+    }
+
+    /// Gumbel-max with the Gumbel variates generated host-side.
+    ///
+    /// `G = -log(-log u)`, `u ~ U(1e-9, 0.9999999)` (the tight clamp §11.2c/#345
+    /// fixed -- `(1e-7, 0.999)` failed χ² at 2281, this passes at 280), drawn
+    /// from the processor's own seeded host `StdRng` -- so `--seed` reaches the
+    /// sampler directly, without going through `Device::set_seed` and the Metal
+    /// RNG at all. The vector is uploaded with `Tensor::from_vec` and added to
+    /// the logits; the argmax stays on the device, so the token never comes down
+    /// (the ring's `to_cpu_blit` stays 0 at t > 0). Sampling from `softmax(z/T)`
+    /// is `argmax(z/T + G)`, i.e. `argmax(z + T·G)` up to the shared `1/T`.
+    fn gumbel_max_host_noise(&mut self, logits: &Tensor, temperature: f64) -> Result<Tensor> {
+        use rand::Rng;
+        let logits = logits.to_dtype(DType::F32)?;
+        let n = logits.elem_count();
+        let dev = logits.device();
+        // Host RNG -> Gumbel variates. Uniform in the tight open interval, then
+        // G = -log(-log u).
+        let mut g = Vec::<f32>::with_capacity(n);
+        for _ in 0..n {
+            let u: f64 = self.rng.random_range(1e-9..0.9999999);
+            g.push((-((-u.ln()).ln())) as f32);
+        }
+        let noise = Tensor::from_vec(g, logits.shape(), dev)?;
+        // argmax(z + T·G): scaling G by T is the temperature, and the shared
+        // 1/T on z is monotone so it drops out of the argmax.
+        (logits + noise.affine(temperature, 0.0)?)?.argmax(lloom_tensor::D::Minus1)
     }
 
     fn sample_gumbel_softmax(&mut self, logits: &Tensor, temperature: f64) -> Result<u32> {

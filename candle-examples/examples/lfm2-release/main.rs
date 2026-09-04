@@ -104,6 +104,13 @@ struct Args {
     #[arg(long, default_value_t = 0.9)]
     top_p: f64,
 
+    /// Sample by device-resident gumbel-max (plain temperature, no top-p)
+    /// instead of the host nucleus path. This is the arm the token-ring can ride
+    /// at t > 0 (§11.2c discharged): the token stays on the device, `to_cpu_blit`
+    /// stays 0.
+    #[arg(long)]
+    gumbel: bool,
+
     /// Conversational turns against one KV cache. The canonical digest pairs in
     /// §2.3.8c are `--turns 3`, which is what the gate compares against.
     #[arg(long, default_value_t = 1)]
@@ -666,13 +673,29 @@ fn main() -> Result<()> {
 
     let sampling = if args.temperature <= 0. {
         Sampling::ArgMax
+    } else if args.gumbel {
+        // Plain temperature via gumbel-max, no nucleus. This is the arm that
+        // stays on the device (§11.2c discharged), so the token-ring works at
+        // t > 0 with `to_cpu_blit=0`.
+        Sampling::All {
+            temperature: args.temperature,
+        }
     } else {
         Sampling::TopP {
             p: args.top_p,
             temperature: args.temperature,
         }
     };
+    // Whether the ring's device-resident sampler covers this arm (checked
+    // before `sampling` is moved into the processor).
+    let ring_sampler_is_device = matches!(sampling, Sampling::ArgMax | Sampling::All { .. });
     let mut logits_processor = LogitsProcessor::from_sampling(args.seed, sampling);
+    // Gumbel-max samples from the DEVICE rng (`rand_like`), not the processor's
+    // host `StdRng`, so `--seed` reaches it only through `Device::set_seed`.
+    // Without this, `--gumbel` runs are reproducible-by-accident from the RNG's
+    // default state and ignore `--seed` (the §11.2c seed-reach gap, on the
+    // harness side).
+    device.set_seed(args.seed)?;
 
     let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
     for tok in ["<|im_end|>", "<|endoftext|>"] {
@@ -691,19 +714,20 @@ fn main() -> Result<()> {
         None => PollMechanism::default(),
     };
 
-    // **The ring is `--temperature 0` only, and this refuses rather than
-    // silently running the other arm.** §11.5f measures `sample_f`'s
-    // temperature path taking the same `to_cpu` over the whole vocabulary --
-    // 128 000 f32, 512 000 B against argmax's 4 -- and §11.2c puts 74 % of that
-    // arm in a host `sort_by`. `sample_argmax_on_device` is the only sampler
-    // that leaves the token on the device, so a `--token-ring --temperature 0.7`
-    // run would take the host path while reporting the ring arm: #7.1a-i's
+    // **The ring needs a DEVICE-RESIDENT sampler, and this refuses the arms
+    // that round-trip rather than silently running the host path.** The ring is
+    // built on `sample_argmax_on_device` leaving the token on the device; that
+    // now holds for t=0 (`ArgMax`) and plain temperature via gumbel-max (`All`,
+    // §11.2c discharged) but NOT top-{k,p}, which need a host `sort_by` (§11.2c:
+    // 74 % of that arm). So `--token-ring` at t > 0 requires `--gumbel` (the
+    // `All` arm); a `--token-ring --temperature 0.7` without `--gumbel` would
+    // build `TopP`, take the host path, and report the ring arm -- #7.1a-i's
     // wrong-arm shape, which compares equal to every real run of that arm.
     anyhow::ensure!(
-        !args.token_ring || args.temperature <= 0.,
-        "--token-ring requires --temperature 0 (DESIGN.md §11.5g): the device-resident \
-         sampler is argmax-only, and a temperature run would take the host readback \
-         while reporting the ring arm"
+        !args.token_ring || ring_sampler_is_device,
+        "--token-ring needs a device-resident sampler: t=0 (argmax) or t>0 with --gumbel \
+         (plain-temperature gumbel-max). top-p/top-k take a host sort (§11.2c) and cannot \
+         ride the ring; drop --top-p by passing --gumbel, or drop --token-ring."
     );
     // The non-blocking EOS read is a property OF the ring arm, so asking for it
     // without the ring is a contradiction rather than a no-op. Refused for the

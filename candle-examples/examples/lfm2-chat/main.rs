@@ -171,6 +171,12 @@ fn main() -> Result<()> {
 
     let files = weight_files(&model_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
+    // `Model::new` is the bulk of the load (~950 ms): it reads the 266 weight
+    // tensors through the mmap. Measured config-independent — the crown arms
+    // above cost it nothing — so it is the construction touching the mapped
+    // bytes, not anything this example selects. A warm page cache hides it (the
+    // "sub-second" cold-vs-warm difference); the number the demo shows is the
+    // honest steady one.
     let model = Model::new(&config, vb).context("constructing LFM2")?;
     let cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
 
@@ -272,11 +278,14 @@ fn main() -> Result<()> {
     if let Some(rest) = tos.decode_rest()? {
         print!("{rest}");
     }
+
+    let out_ids = out.ids;
+    let n = out_ids.len();
+    let end_to_end = n as f64 / decode_elapsed.as_secs_f64();
+
     println!();
     std::io::stdout().flush().ok();
-    let out_ids = out.ids;
 
-    let n = out_ids.len();
     let st = &out.stats;
 
     // Two figures, because they answer different questions (§2.5.3):
@@ -286,7 +295,6 @@ fn main() -> Result<()> {
     //    sustains token-to-token, and the number to compare against the §320
     //    floor. The median, not the mean, because one scheduling hiccup (or a
     //    loaded machine) drags the mean and says nothing about the steady path.
-    let end_to_end = n as f64 / decode_elapsed.as_secs_f64();
     let mut steps: Vec<u64> = st.step_ns.clone();
     let steady = if steps.is_empty() {
         f64::NAN

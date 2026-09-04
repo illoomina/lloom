@@ -393,6 +393,21 @@ impl TokenRing {
         self.step.peek_scalar::<u32>(0)
     }
 
+    /// The step ordinal the GPU has published so far, read non-blocking through
+    /// the mapped counter — or `None` if the counter is not CPU-mapped.
+    ///
+    /// This is the visibility signal a streaming consumer of a *second* buffer
+    /// needs: `publish_step` writes the history/input slot, then the EOS flag,
+    /// then this counter **last**, in queue order, so an observed value `>= N`
+    /// means every write of steps `1..=N` — including the history slot — is
+    /// visible (§9.3). A consumer draining a device-side history therefore reads
+    /// only up to this ordinal, never a slot the GPU has not yet written. Only
+    /// meaningful on the stamped (`publish_step`) arm; the blocking arm's own
+    /// per-step readback already synced, so it does not need this.
+    pub fn published_generation(&self) -> Option<u32> {
+        self.peek_step()
+    }
+
     /// The EOS flag, through the resolved address when there is one.
     #[inline]
     fn peek_eos_flag(&self) -> Option<u8> {

@@ -356,10 +356,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
         }
 
-        // After the clock: the tail the loop has not drained yet (between the
-        // last streamed batch and the end), streamed too so a caller sees every
-        // token before the run returns, then folded into the full `ids`.
-        let tail = readback.take_ids()?;
+        // After the clock: EVERY id not yet drained — `drain_all`, not the
+        // incremental `take_ids`, because the poll arm may still have the last
+        // forwards in flight and its incremental drain refuses to read past what
+        // the GPU has published. `drain_all` synchronises up to the final slot,
+        // so the tail is complete; streamed too, so a caller sees the last
+        // tokens, then folded into the full `ids`.
+        let tail = readback.drain_all()?;
         if !tail.is_empty() {
             on_tokens(&tail)?;
             all_ids.extend_from_slice(&tail);

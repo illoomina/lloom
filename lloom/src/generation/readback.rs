@@ -106,9 +106,22 @@ pub trait ReadbackStrategy {
     /// token from the ids [`Self::take_ids`] will return.
     fn eos_of_last(&mut self) -> Result<bool>;
 
-    /// The ids fed since the last call, EOS excluded. One readback on the ring
-    /// arms; already host-side on the blocking arm.
+    /// The ids published SO FAR and not yet drained, EOS excluded — the
+    /// incremental, non-blocking drain for streaming. On the ring's poll arm it
+    /// returns only what the GPU has published (it never waits and never drains
+    /// past the visibility signal), so a caller mid-loop may get fewer than were
+    /// fed; the rest arrive on a later call or from [`Self::drain_all`]. On the
+    /// blocking arm every fed id is already visible, so it returns them all.
     fn take_ids(&mut self) -> Result<Vec<u32>>;
+
+    /// EVERY id not yet drained, waiting for the GPU if it must — the final drain
+    /// after the loop, where the contract is completeness rather than
+    /// non-blocking. On the ring arms this synchronises up to the last fed slot
+    /// (the poll arm cannot otherwise know the tail landed) and returns the whole
+    /// remainder; on the blocking arm it is the same as [`Self::take_ids`], which
+    /// already had everything. A caller streams this too, so nothing is lost
+    /// between the last incremental drain and the end.
+    fn drain_all(&mut self) -> Result<Vec<u32>>;
 
     /// The engagement counters so far.
     fn counters(&self) -> ReadbackCounters;
@@ -188,6 +201,12 @@ impl ReadbackStrategy for Blocking {
         Ok(std::mem::take(&mut self.ids))
     }
 
+    fn drain_all(&mut self) -> Result<Vec<u32>> {
+        // The blocking arm's ids are already host-side and always complete, so
+        // the final drain is the incremental one.
+        Ok(std::mem::take(&mut self.ids))
+    }
+
     fn counters(&self) -> ReadbackCounters {
         ReadbackCounters::default()
     }
@@ -233,13 +252,22 @@ pub struct Ring {
 /// into a counted fallback and times nothing.
 pub const POLL_BUDGET: u64 = 50_000_000;
 
-/// The floor the id history is sized to: **four 16 KiB pages** of `U32`. A
-/// caller's `capacity` only ever raises this, never lowers it — the history is
-/// pure host-visible scratch (a few tens of KB) and there is no reason to run it
-/// tight, so a short generation still gets a generous ring. It bounds nothing a
-/// caller relies on being small; `sample_and_feed` refuses to write past the
-/// live `fed` count regardless.
-pub const RING_HISTORY_FLOOR: usize = 4 * 16 * 1024 / 4;
+/// The id history slot count, chosen to stay CPU-mapped under **Private**
+/// storage so the streaming drain reads it through a mapped pointer with no copy
+/// and no blit (§15.2 #12: no blits on the decode path). Metal maps a
+/// `StorageModePrivate` buffer iff it is **< 16384 bytes** (§15.2 #12a); at 4
+/// bytes per `U32` that is **< 4096 slots**, so 4092 slots (16368 B) stays just
+/// under the line while giving the host a wide window — it drains every commit,
+/// far fewer than this behind. This is deliberately NOT Shared: Shared maps at
+/// any size but its GPU-write coherency cost on the per-token `slice_set` is
+/// unmeasured, and staying inside the Private mapping window keeps the write on
+/// the same footing as every other decode buffer.
+///
+/// A generation longer than this many tokens is a real limit today —
+/// `sample_and_feed` bails rather than wrapping — and the fix when it matters is
+/// a genuine ring (wrap the write index, track a consumer lag) or a re-alloc,
+/// not a bigger flat buffer. Left as a bounded slot count for now, loudly.
+pub const RING_HISTORY_SLOTS: usize = 4092;
 
 impl Ring {
     /// `capacity` bounds the ids one ring will accumulate across every decode
@@ -248,7 +276,18 @@ impl Ring {
     /// less still gets a generous buffer.
     pub fn new(eos_ids: &[u32], device: &Device, capacity: usize, eos: EosRead) -> Result<Self> {
         let ring = TokenRing::new(0, eos_ids, device)?;
-        let capacity = capacity.max(RING_HISTORY_FLOOR);
+        // Sized to hold the whole generation, but at least a wide mapped window
+        // and — for the zero-copy drain — ideally within [`RING_HISTORY_SLOTS`]
+        // so a Private allocation stays CPU-mapped. `Tensor::zeros` uses the
+        // default (Private on macOS) pool; below the mapping limit its
+        // `contents()` is non-null and `take_ids` reads it through a pointer with
+        // no copy. Above the limit (a > `RING_HISTORY_SLOTS`-token run) the pool
+        // hands back an unmapped buffer and `take_ids` falls back to a `to_vec1`
+        // snapshot, which is correct if slower — the honest degradation, not a
+        // silent one. Kept Private rather than forced Shared: the per-token
+        // `slice_set` write stays on the same footing as every other decode
+        // buffer, whose Shared-vs-Private write cost is unmeasured.
+        let capacity = capacity.max(RING_HISTORY_SLOTS);
         let history = Tensor::zeros(capacity, DType::U32, device)?;
         Ok(Self {
             ring,
@@ -333,18 +372,27 @@ impl ReadbackStrategy for Ring {
             );
         }
         let sampled = sampler.sample_argmax_on_device(logits)?;
-        // Stamped on the polling arm so the host can wait for *this* step's
-        // ordinal (#535); the blocking flag read needs no stamp and gets none,
-        // so that arm's command stream is what §11.5j gated.
+        self.counters.ring_publishes += 1;
+
+        // Order matters, and it is the streaming protocol. The history slot is
+        // written FIRST, then the stamp — so a host that observes the generation
+        // counter at `>= N` has, in queue order, `history[N-1]` written behind
+        // it. `publish_step` already documents its own three writes as
+        // "input, eos, stamp, stamp last"; the history write joins that ordering
+        // *ahead* of the stamp, which is what lets the zero-copy `take_ids` read
+        // `history[cursor..fed]` through the mapped pointer once the counter says
+        // those steps landed — without a `to_vec1` sync. Writing the history
+        // AFTER the stamp (the previous order) would let the counter run ahead of
+        // the slot and the drain read an unwritten slot (§9.3's ordering, applied
+        // to a second buffer).
         self.generation += 1;
+        // Into the history at its own index, before the host knows whether it is
+        // EOS; `eos_of_last` retracts by moving the cursor back.
+        self.history.slice_set(&sampled.reshape(1)?, 0, self.fed)?;
         match self.eos {
             EosRead::Poll(_) => self.ring.publish_step(&sampled, Some(self.generation))?,
             EosRead::Blocking => self.ring.publish(&sampled)?,
         }
-        self.counters.ring_publishes += 1;
-        // Into the history at its own index, before the host knows whether it
-        // is EOS; `eos_of_last` retracts by moving the cursor back.
-        self.history.slice_set(&sampled.reshape(1)?, 0, self.fed)?;
         self.fed += 1;
         Ok(self.ring.input().clone())
     }
@@ -413,9 +461,83 @@ impl ReadbackStrategy for Ring {
         if self.cursor == self.fed {
             return Ok(Vec::new());
         }
-        // ONE readback of the whole slot, after the loop.
-        let all = self.history.to_vec1::<u32>()?;
-        let ids = all[self.cursor..self.fed].to_vec();
+        let start = self.cursor;
+
+        // How far it is SAFE to drain. On the stamped (poll) arm the loop may be
+        // ahead of the GPU (that is the lookahead), so `fed` counts slots the
+        // host has *enqueued* — not all of them are written yet. The published
+        // generation is the visibility signal (`published_generation` reads the
+        // GPU-written counter, which `sample_and_feed` writes AFTER the history
+        // slot): a value `g` means `history[0..g]` are written, so draining past
+        // it would read an unwritten slot as the buffer's init value — silent
+        // corruption (§3.5). Clamp to it. On the blocking arm there is no stamp,
+        // but its own per-step EOS `to_vec1` already synchronised up to `fed`, so
+        // every enqueued slot is visible and the full range is safe.
+        let end = match self.eos {
+            EosRead::Poll(_) => match self.ring.published_generation() {
+                // `g` counts published steps; each retracted EOS decremented
+                // `fed` but not the counter, so clamp both ways.
+                Some(g) => self.fed.min(g as usize),
+                // Unmapped counter (no visibility signal): fall back to the
+                // synchronising snapshot below, which is correct by force.
+                None => 0,
+            },
+            EosRead::Blocking => self.fed,
+        };
+
+        // Fast path: read `[start..end]` straight from the mapped buffer — no copy
+        // of the whole history and, crucially, **no blit and no GPU drain**
+        // (`peek_scalar_ptr` "reaches nothing that waits on or orders against the
+        // GPU"). This is what keeps streaming non-blocking: called once per
+        // commit, it must not become a `waitUntilCompleted` per commit, which a
+        // `to_vec1` is (§15.2 #12 forbids that blit on the decode path). `end`
+        // bounds it to published slots; `read_volatile` because the GPU may still
+        // be writing *later* slots into the same buffer.
+        //
+        // SAFETY: `peek_scalar_ptr(start)` returns a pointer valid for
+        // `[start, count)` (it checks `start < count`); `history` is written in
+        // place and never reallocated for this ring's lifetime, so the mapping
+        // stays valid; `end <= fed <= capacity = count`, so every read is in
+        // bounds.
+        if end > start {
+            if let Some(base) = unsafe { self.history.peek_scalar_ptr::<u32>(start) } {
+                let n = end - start;
+                let mut ids = Vec::with_capacity(n);
+                for i in 0..n {
+                    ids.push(unsafe { base.add(i).read_volatile() });
+                }
+                self.cursor = end;
+                return Ok(ids);
+            }
+        }
+
+        // Snapshot / fallback path. Taken when: the counter is unmapped (`end`
+        // forced to 0 above), or the history buffer itself is not CPU-mapped (a
+        // > `RING_HISTORY_SLOTS`-token run whose Private allocation exceeds the
+        // 16 KiB window). A `to_vec1` of the live prefix synchronises up to `fed`
+        // and is correct if a copy — the honest degradation. It is also the path
+        // the one-shot final drain and the digest gate take, where a contiguous
+        // `Vec` is the actual need. Drains the FULL `[start..fed]` because the
+        // `to_vec1` made all of it visible.
+        let n = self.fed - start;
+        let all = self.history.narrow(0, start, n)?.to_vec1::<u32>()?;
+        self.cursor = self.fed;
+        Ok(all)
+    }
+
+    fn drain_all(&mut self) -> Result<Vec<u32>> {
+        if self.cursor == self.fed {
+            return Ok(Vec::new());
+        }
+        // The final drain: completeness over non-blocking. `to_vec1` over the
+        // live `[cursor..fed]` **synchronises** up to the last enqueued slot,
+        // which is exactly what the poll arm needs here — it cannot otherwise
+        // know the tail landed, and its incremental `take_ids` deliberately
+        // refuses to read past the published counter. One `narrow` + `to_vec1`
+        // is the honest cost of learning the whole tail once, after the clock.
+        let start = self.cursor;
+        let n = self.fed - start;
+        let ids = self.history.narrow(0, start, n)?.to_vec1::<u32>()?;
         self.cursor = self.fed;
         Ok(ids)
     }

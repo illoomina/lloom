@@ -1239,8 +1239,14 @@ METAL_FUNC void conv1d_depthwise_k_scaled_body(
          * static_cast<A>(weight[w_base + k]);
   }
 
-  // The epilogue: `scale` is laid out like `dst`, so its index is `tid`.
-  dst[tid] = static_cast<T>(acc * static_cast<A>(scale[tid]));
+  // The epilogue: `scale` is laid out like `dst`, so its index is `tid`. Round
+  // the fold to T BEFORE the `* scale` gate — the two-kernel path stores the
+  // fold as T then multiplies, two roundings; `T(acc * scale)` rounds once and
+  // moves the digest ~1 ulp at f16/bf16 (§2.3.5a). `volatile` forces the
+  // intermediate round under fast math (same as `shortconv_ring`, #675).
+  thread volatile T folded_v = static_cast<T>(acc);
+  T folded = folded_v;
+  dst[tid] = folded * scale[tid];
 }
 
 template <typename T, typename A, ushort K_SIZE>
@@ -1319,7 +1325,16 @@ METAL_FUNC void shortconv_step_body(
     acc += static_cast<A>(win_j) * static_cast<A>(weight[w_base + j]);
   }
 
-  dst[tid] = static_cast<T>(acc * static_cast<A>(c_in[proj]));
+  // Round the fold to T BEFORE the `* c` gate, so this matches the two-kernel
+  // path bit-for-bit: the unfused arm stores `conv_fold` as T (one rounding),
+  // then a separate `bmul` multiplies that T by c (a second rounding). Fusing
+  // `T(acc * c)` rounds only once and differs by ~1 ulp at f16/bf16 -- a moved
+  // digest (§2.3.5a). `volatile` forces the intermediate round under fast math,
+  // which otherwise feeds the unrounded accumulator straight into the multiply.
+  // Same mechanism `shortconv_ring` uses (issue #675).
+  thread volatile T folded_v = static_cast<T>(acc);
+  T folded = folded_v;
+  dst[tid] = folded * c_in[proj];
 }
 
 template <typename T, typename A, ushort K_SIZE>

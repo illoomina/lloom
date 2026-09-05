@@ -1977,7 +1977,7 @@ pub(crate) fn finish_packed_params(
         // what §11.3d says a real ICB path wants instead of the per-call
         // allocation below. Off by default, so nothing changes for any caller
         // that has not asked for it.
-        Some(pool) => pool.next(device, &bytes)?,
+        Some(pool) => pool.next(device, &bytes, encoder.clock())?,
         None => device.new_buffer_with_data(
             bytes.as_ptr() as *const std::ffi::c_void,
             bytes.len(),
@@ -2014,20 +2014,69 @@ pub(crate) fn finish_packed_params(
 /// resets per step assigns the same buffer to the same position by construction.
 /// That is the same reasoning `#70`'s bump allocator rests on, one level up.
 ///
-/// A position whose block *contents* change between steps is still correct: the
-/// bytes are rewritten in place before the dispatch that reads them, ordered by
-/// the same barrier that orders any other write-then-read on the buffer.
+/// # A slot is rewritten only when nothing in flight can still read it
+///
+/// The write is a CPU `memcpy` into shared storage, and no barrier orders a CPU
+/// write against a GPU read: a barrier separates two *dispatches*. On a loop
+/// that waits for each step the distinction is invisible, because the GPU is
+/// idle when the next step encodes. On a loop that runs a step ahead
+/// (`lookahead`, `DESIGN.md` §11.2b) it is not: the previous step's `sdpa_vector`
+/// may still be executing when this step writes a new `kv_len` into the same
+/// slot, and under `HazardTrackingModeUntracked` that is a silent wrong answer
+/// rather than an error (§3.5). Measured on `lfm2-chat --replay` before this
+/// check existed: the output diverges from the classical stream at `lookahead 1`
+/// and matches it at `lookahead 0`.
+///
+/// So a slot whose bytes already match is handed out untouched (the common
+/// case: every block whose contents are step-invariant, which is exactly the
+/// population a replay can cover), a slot whose last reader has completed on
+/// the [`GpuClock`] is rewritten in place, and a slot whose last reader may
+/// still be in flight is left alone -- the dispatch gets a private buffer
+/// instead. That last case changes the position's binding, which a replaying
+/// executor reads as `varies` and encodes classically, so a step-varying block
+/// is never replayed from a slot it might race on.
+///
+/// [`GpuClock`]: crate::kernels::metal::GpuClock
 pub struct ConstantsPool {
     inner: std::sync::Mutex<ConstantsPoolInner>,
 }
 
 #[derive(Default)]
 struct ConstantsPoolInner {
-    buffers: Vec<Buffer>,
+    slots: Vec<Slot>,
     cursor: usize,
     /// Largest block seen, so every buffer is sized for the worst case and a
     /// later, larger block cannot outgrow the one already handed to a command.
     stride: usize,
+    counters: ConstantsPoolCounters,
+}
+
+struct Slot {
+    buf: Buffer,
+    /// The epoch that was open the last time this slot was handed to a dispatch:
+    /// the newest GPU work that may read it.
+    epoch: u64,
+    /// The clock `epoch` is on. The pool serves one queue; a slot last read
+    /// under another clock (a queue since torn down -- one test's `Commands`
+    /// after another's) is treated as idle and re-tagged, because epochs of two
+    /// clocks are not comparable and the old queue's work is not this one's.
+    clock: u64,
+}
+
+/// What the pool did, per hand-out. The four arms partition every call to
+/// [`ConstantsPool::next`] after the first per slot, so a harness can show which
+/// path its dispatches took rather than assume it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConstantsPoolCounters {
+    /// A slot allocated for a position seen for the first time.
+    pub allocated: u64,
+    /// The bytes already matched the slot; nothing was written.
+    pub unchanged: u64,
+    /// The slot was rewritten in place, its last reader having completed.
+    pub rewritten: u64,
+    /// The slot's last reader may still be in flight, so the dispatch was given
+    /// a private buffer and the slot was left as it was.
+    pub detached: u64,
 }
 
 /// The width every pooled constants buffer is allocated at.
@@ -2039,15 +2088,34 @@ struct ConstantsPoolInner {
 /// §9.2 requires of anything the arena touches.
 const CONSTANTS_SLOT_BYTES: usize = 256;
 
+/// Copy `bytes` into a pooled slot.
+fn write_block(buf: &Buffer, bytes: &[u8]) {
+    // SAFETY: shared storage, `CONSTANTS_SLOT_BYTES` long, and `bytes` is no
+    // longer than that -- checked by the caller. The caller has established that
+    // no GPU work in flight reads this buffer (`ConstantsPool`).
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents(), bytes.len());
+    }
+}
+
 impl ConstantsPool {
-    fn new() -> ConstantsPool {
+    pub(crate) fn new() -> ConstantsPool {
         ConstantsPool {
             inner: std::sync::Mutex::new(ConstantsPoolInner::default()),
         }
     }
 
-    /// The buffer for the next dispatch position, with `bytes` written into it.
-    fn next(&self, device: &Device, bytes: &[u8]) -> Result<Buffer, MetalKernelError> {
+    /// The buffer for the next dispatch position, holding `bytes`.
+    ///
+    /// `clock` is the queue the dispatch will be committed on. Without one the
+    /// slot is rewritten unconditionally, which is only sound when nothing is in
+    /// flight -- the encoders `Commands` hands out always carry it.
+    pub(crate) fn next(
+        &self,
+        device: &Device,
+        bytes: &[u8],
+        clock: Option<&crate::kernels::metal::GpuClock>,
+    ) -> Result<Buffer, MetalKernelError> {
         let mut inner = self.inner.lock().unwrap();
         if bytes.len() > CONSTANTS_SLOT_BYTES {
             return Err(MetalKernelError::InvalidInput(format!(
@@ -2060,19 +2128,52 @@ impl ConstantsPool {
         inner.stride = inner.stride.max(bytes.len());
         let index = inner.cursor;
         inner.cursor += 1;
-        if index == inner.buffers.len() {
+        // The epoch this dispatch will execute in: the one open on its queue.
+        let epoch = clock.map_or(0, |c| c.current_epoch());
+        let clock_id = clock.map_or(0, |c| c.id());
+        if index == inner.slots.len() {
             let buf = device.new_buffer(CONSTANTS_SLOT_BYTES, RESOURCE_OPTIONS)?;
-            inner.buffers.push(buf);
+            write_block(&buf, bytes);
+            inner.slots.push(Slot {
+                buf: buf.clone(),
+                epoch,
+                clock: clock_id,
+            });
+            inner.counters.allocated += 1;
+            return Ok(buf);
         }
-        let buf = inner.buffers[index].clone();
+        let ConstantsPoolInner {
+            slots, counters, ..
+        } = &mut *inner;
+        let slot = &mut slots[index];
         // SAFETY: shared storage, `CONSTANTS_SLOT_BYTES` long, and `bytes` is no
-        // longer than that -- checked above. The write is ordered against the
-        // dispatch that reads it by the barrier `set_input_buffer` will request,
-        // exactly as any other write-then-read on this buffer would be.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.contents(), bytes.len());
+        // longer than that -- checked above. A read, so a GPU reading the same
+        // bytes concurrently is benign.
+        let current =
+            unsafe { std::slice::from_raw_parts(slot.buf.contents() as *const u8, bytes.len()) };
+        if current == bytes {
+            slot.epoch = epoch;
+            slot.clock = clock_id;
+            counters.unchanged += 1;
+            return Ok(slot.buf.clone());
         }
-        Ok(buf)
+        let idle = slot.clock != clock_id || clock.map_or(true, |c| c.is_complete(slot.epoch));
+        if idle {
+            write_block(&slot.buf, bytes);
+            slot.epoch = epoch;
+            slot.clock = clock_id;
+            counters.rewritten += 1;
+            return Ok(slot.buf.clone());
+        }
+        counters.detached += 1;
+        let private = device.new_buffer(CONSTANTS_SLOT_BYTES, RESOURCE_OPTIONS)?;
+        write_block(&private, bytes);
+        Ok(private)
+    }
+
+    /// See [`ConstantsPoolCounters`].
+    pub fn counters(&self) -> ConstantsPoolCounters {
+        self.inner.lock().unwrap().counters
     }
 
     /// Start a new step: hand out the same buffers again, from the top.
@@ -2087,7 +2188,7 @@ impl ConstantsPool {
     /// How many distinct buffers the pool has handed out, i.e. the high-water
     /// mark of packed dispatches in one step.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().buffers.len()
+        self.inner.lock().unwrap().slots.len()
     }
 
     pub fn is_empty(&self) -> bool {

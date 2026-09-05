@@ -473,6 +473,10 @@ pub struct ComputeCommandEncoder {
     /// not paying by default.
     pub(crate) capturing: Arc<AtomicBool>,
     pub(crate) param_capture: Arc<Mutex<ParamCapture>>,
+    /// The clock the pooled constants buffers decide rewriting against
+    /// (`ConstantsPool`). `None` on encoders built outside `Commands`, which
+    /// have no in-flight work to order a CPU write behind.
+    pub(crate) clock: Option<Arc<crate::kernels::metal::GpuClock>>,
 }
 
 /// Scalars accumulated for a packed params block, and the buffer renumbering
@@ -538,7 +542,20 @@ impl ComputeCommandEncoder {
             executor,
             capturing: Arc::new(AtomicBool::new(false)),
             param_capture: Arc::new(Mutex::new(ParamCapture::default())),
+            clock: None,
         }
+    }
+
+    /// The GPU clock of the queue this encoder's command buffer is committed on.
+    pub fn with_clock(mut self, clock: Arc<crate::kernels::metal::GpuClock>) -> Self {
+        self.clock = Some(clock);
+        self
+    }
+
+    /// The clock a CPU write into a buffer this encoder's predecessors may still
+    /// be reading must consult, when the encoder has one.
+    pub fn clock(&self) -> Option<&crate::kernels::metal::GpuClock> {
+        self.clock.as_deref()
     }
 
     /// Wait on the fence of `ptr`'s last writer, if any, and only once.

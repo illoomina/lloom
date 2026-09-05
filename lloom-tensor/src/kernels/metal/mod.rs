@@ -63,6 +63,8 @@ pub mod hazard_audit;
 mod hazard_audit_tests;
 pub mod icb;
 #[cfg(test)]
+mod constants_pool_tests;
+#[cfg(test)]
 mod icb_executor_tests;
 #[cfg(test)]
 mod icb_tests;

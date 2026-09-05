@@ -113,18 +113,38 @@ use std::sync::{Arc, Mutex, Weak};
 /// **This is the write/write case and it is the one that pays.** A read-mostly
 /// flag measures 0.96x -- a wash -- and is deliberately not padded anywhere;
 /// [`super::cache_pad`] carries that measurement and the unit the rule needs.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct GpuClock {
     /// Host thread, per committed command buffer.
     submitted: CachePadded<AtomicU64>,
     /// Metal completion handler, on a driver thread. Its own line -- see the
     /// struct docs.
     completed: CachePadded<AtomicU64>,
+    /// Distinct per clock for the life of the process, so a reader that stored
+    /// an epoch can tell whether it is still comparing against the same clock.
+    /// An address cannot do that: a dropped clock's allocation is reused.
+    id: u64,
+}
+
+impl Default for GpuClock {
+    fn default() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        GpuClock {
+            submitted: CachePadded::default(),
+            completed: CachePadded::default(),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+        }
+    }
 }
 
 impl GpuClock {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This clock's process-unique identity. Never zero.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// The epoch a buffer dropped right now must outlive.
@@ -159,7 +179,7 @@ impl GpuClock {
     }
 
     /// Whether work encoded in `epoch` is known to have finished.
-    fn is_complete(&self, epoch: u64) -> bool {
+    pub fn is_complete(&self, epoch: u64) -> bool {
         self.completed_count() > epoch
     }
 }

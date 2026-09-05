@@ -694,11 +694,10 @@ impl Commands {
             // so it waits per buffer in set_input_buffer / set_output_buffer
             // instead. Waiting on every live fence would order this encoder
             // after work it never touches.
-            let enc = state_guard.current.compute_command_encoder_with_executor(
-                &fence,
-                &self.prev_ce_outputs,
-                &self.executor(),
-            );
+            let enc = state_guard
+                .current
+                .compute_command_encoder_with_executor(&fence, &self.prev_ce_outputs, &self.executor())
+                .with_clock(Arc::clone(&self.clock));
             // Hazard state is per encoder, so a barrier count is only
             // interpretable against the session boundaries (`DESIGN.md` §9.2e).
             crate::kernels::metal::trace::record_encoder_begin();

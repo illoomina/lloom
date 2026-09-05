@@ -125,3 +125,60 @@ required-features = ["cuda"]
 [[example]]
 name = "hazard_audit_crosscheck"
 required-features = ["metal-hazard-audit"]
+
+# Metal-only probes: each reaches `lloom_tensor::kernels` or the objc2 Metal
+# FFI directly, both of which exist only under the `metal` feature. Without
+# the gate `cargo test -p lloom-tensor` (which builds every example) does not
+# compile on a CPU-only host, so the no-metal test gate could never run.
+[[example]]
+name = "bandwidth"
+required-features = ["metal"]
+
+[[example]]
+name = "dispatch_cost"
+required-features = ["metal"]
+
+[[example]]
+name = "gemv_epilogue_ab"
+required-features = ["metal"]
+
+[[example]]
+name = "gemv_residual_ab"
+required-features = ["metal"]
+
+[[example]]
+name = "i466_dump"
+required-features = ["metal"]
+
+[[example]]
+name = "kernel_census"
+required-features = ["metal"]
+
+[[example]]
+name = "metal_benchmarks"
+required-features = ["metal"]
+
+[[example]]
+name = "pool_lease_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "rand_cost"
+required-features = ["metal"]
+
+[[example]]
+name = "scratch_ab"
+required-features = ["metal"]
+
+[[example]]
+name = "silu_spelling_divergence"
+required-features = ["metal"]
+
+[[example]]
+name = "silu_variant_error"
+required-features = ["metal"]
+
+[[example]]
+name = "variant_selection_cost"
+required-features = ["metal"]
+

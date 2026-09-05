@@ -10,7 +10,7 @@ use rayon::prelude::*;
 /// ```rust
 /// use lloom_tensor::{Tensor, Device, test_utils::to_vec2_round};
 /// let a = Tensor::new(&[[0f32, 1., 0., 1.], [-2., 2., 3., -3.]], &Device::Cpu)?;
-/// let a = crate::nn::ops::softmax(&a, 1)?;
+/// let a = lloom::nn::ops::softmax(&a, 1)?;
 /// assert_eq!(
 ///     to_vec2_round(&a, 4)?,
 ///     &[

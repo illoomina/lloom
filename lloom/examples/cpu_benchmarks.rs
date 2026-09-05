@@ -5,9 +5,9 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle::quantized::GgmlType;
-use candle::{CpuStorage, Device, Layout, Module, Result, Shape, Tensor, D};
 use clap::{Parser, Subcommand};
+use lloom_tensor::quantized::GgmlType;
+use lloom_tensor::{CpuStorage, Device, Layout, Module, Result, Shape, Tensor, D};
 
 const CHECK_CONV2D: bool = false;
 
@@ -37,7 +37,7 @@ impl Im2Col {
     }
 }
 
-impl candle::CustomOp1 for Im2Col {
+impl lloom_tensor::CustomOp1 for Im2Col {
     fn name(&self) -> &'static str {
         "im2col"
     }
@@ -97,7 +97,7 @@ impl candle::CustomOp1 for Im2Col {
                 }
             }
         }
-        let storage = candle::WithDType::to_cpu_storage_owned(dst);
+        let storage = lloom_tensor::WithDType::to_cpu_storage_owned(dst);
         Ok((storage, (b * h_out * w_out, c * h_k * w_k).into()))
     }
 }
@@ -218,15 +218,15 @@ impl Benchmark for MatVec {
 // https://github.com/ggerganov/llama.cpp/blob/master/examples/benchmark/benchmark-matmult.cpp
 struct QMatMul;
 impl Benchmark for QMatMul {
-    type PreProcessData = (candle::quantized::QMatMul, Tensor);
+    type PreProcessData = (lloom_tensor::quantized::QMatMul, Tensor);
     type RunResult = Tensor;
     fn preprocess() -> Result<Self::PreProcessData> {
-        let zeros = vec![candle::quantized::k_quants::BlockQ4_0::zeros(); 4096 * 11008 / 32];
-        let mm = candle::quantized::QTensor::new(
-            candle::quantized::QStorage::Cpu(Box::new(zeros)),
+        let zeros = vec![lloom_tensor::quantized::k_quants::BlockQ4_0::zeros(); 4096 * 11008 / 32];
+        let mm = lloom_tensor::quantized::QTensor::new(
+            lloom_tensor::quantized::QStorage::Cpu(Box::new(zeros)),
             (4096, 11008),
         )?;
-        let mm = candle::quantized::QMatMul::from_qtensor(mm)?;
+        let mm = lloom_tensor::quantized::QMatMul::from_qtensor(mm)?;
         let arg = Tensor::randn(0f32, 1., (128, 11008), &Device::Cpu)?;
         Ok((mm, arg))
     }
@@ -266,7 +266,7 @@ impl Benchmark for Softmax {
     }
 
     fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
-        candle_nn::ops::softmax(d, D::Minus1)
+        lloom::nn::ops::softmax(d, D::Minus1)
     }
 
     const ITERS: usize = 100;
@@ -283,7 +283,7 @@ impl Benchmark for SoftmaxLastDim {
     }
 
     fn run_one(d: &Self::PreProcessData) -> Result<Self::RunResult> {
-        candle_nn::ops::softmax_last_dim(d)
+        lloom::nn::ops::softmax_last_dim(d)
     }
 
     const ITERS: usize = 100;

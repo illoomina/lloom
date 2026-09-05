@@ -33,7 +33,7 @@ use lloom_tensor::{bail, DType, Result, Tensor, WithDType};
 ///
 /// ```rust
 /// use lloom_tensor::{Shape, Tensor, Device};
-/// use crate::nn::encoding::one_hot;
+/// use lloom::nn::encoding::one_hot;
 ///
 /// let device = lloom_tensor::Device::Cpu;
 ///
@@ -56,7 +56,7 @@ use lloom_tensor::{bail, DType, Result, Tensor, WithDType};
 ///
 /// ```rust
 /// use lloom_tensor::{Shape, Tensor, Device};
-/// use crate::nn::encoding::one_hot;
+/// use lloom::nn::encoding::one_hot;
 ///
 ///
 /// let device = lloom_tensor::Device::Cpu;

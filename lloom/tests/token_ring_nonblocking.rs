@@ -39,9 +39,17 @@
 //! machine this project measures at load 2--26 (§3.2), which is how a test
 //! becomes a flake.
 
-use lloom_tensor::{Device, Result, Tensor};
+//!
+//! The three counter-instrumented tests are gated on `metal`: the counters are
+//! `lloom_tensor::metal_backend` statics that do not exist on a CPU-only build,
+//! and the tests skip themselves when no Metal device is present anyway. The
+//! CPU-decline arm is unconditional -- it is the one that runs on the no-metal
+//! gate.
+#[cfg(feature = "metal")]
 use lloom::generation::token_ring::TokenRing;
+use lloom_tensor::{Device, Result, Tensor};
 
+#[cfg(feature = "metal")]
 const EOS: &[u32] = &[124900];
 
 /// Counts every allocation the process makes, for #578's first defect.
@@ -83,10 +91,12 @@ unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator;
 
+#[cfg(feature = "metal")]
 fn allocs() -> u64 {
     ALLOCS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(feature = "metal")]
 fn logits_peaked_at(at: usize, vocab: usize, device: &Device) -> Result<Tensor> {
     let mut v = vec![0f32; vocab];
     v[at] = 1.0;
@@ -99,6 +109,7 @@ fn logits_peaked_at(at: usize, vocab: usize, device: &Device) -> Result<Tensor> 
 /// also failed to move the counters, the first assertion would pass on an
 /// instrument that reads nothing (§15.1 #1, and #336's own first sweep, which
 /// measured the blit against itself and read `unresolved` on every dimension).
+#[cfg(feature = "metal")]
 #[test]
 fn the_poll_does_not_reach_the_blocking_readback() -> Result<()> {
     let Ok(device) = Device::new_metal(0) else {
@@ -180,6 +191,7 @@ fn the_poll_does_not_reach_the_blocking_readback() -> Result<()> {
 /// -- is exercised on the same tensors in the same test and must move the
 /// counter. That is also what pins the finding: the two calls answer the same
 /// question and only one of them allocates.
+#[cfg(feature = "metal")]
 #[test]
 fn the_poll_allocates_nothing_and_the_old_spelling_did() -> Result<()> {
     let Ok(device) = Device::new_metal(0) else {
@@ -255,6 +267,7 @@ fn the_poll_allocates_nothing_and_the_old_spelling_did() -> Result<()> {
 /// reachable, or callers will be written as though it never fires -- which is
 /// how §11.5c's `contents()` test came to be described as "failing closed"
 /// while the path around it did not (§15.2 #12b).
+#[cfg(feature = "metal")]
 #[test]
 fn the_peek_declines_shapes_it_cannot_serve() -> Result<()> {
     let Ok(device) = Device::new_metal(0) else {

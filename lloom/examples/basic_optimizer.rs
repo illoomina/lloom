@@ -4,8 +4,8 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle::{DType, Device, Result, Tensor};
-use candle_nn::{linear, AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use lloom::nn::{linear, AdamW, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap};
+use lloom_tensor::{DType, Device, Result, Tensor};
 
 fn gen_data() -> Result<(Tensor, Tensor)> {
     // Generate some sample linear data.

@@ -48,8 +48,8 @@
 //! stops a green run being read as evidence when the generator never reached
 //! the states the claim is about (#504's `evicted = 0`, §2.4's rule).
 
-use lloom_tensor::{DType, Device, Result, Tensor};
 use lloom::generation::token_ring::TokenRing;
+use lloom_tensor::{DType, Device, Result, Tensor};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -296,9 +296,19 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// The case count: `PROPTEST_CASES` when set (the CI gate runs this in the
+/// thousands), else the literal. `ProptestConfig::default()` reads the variable
+/// too, but an explicit `cases:` field would override it, so it is read here.
+fn proptest_cases(default: u32) -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 128,
+        cases: proptest_cases(128),
         max_shrink_iters: 4096,
         ..ProptestConfig::default()
     })]

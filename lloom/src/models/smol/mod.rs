@@ -23,7 +23,7 @@
 //! use crate::models::smol::smollm3::{Config, ModelForCausalLM};
 //! use crate::models::smol::quantized_smollm3::QuantizedModelForCausalLM;
 //! use lloom_tensor::{Device, Tensor};
-//! use crate::nn::VarBuilder;
+//! use lloom::nn::VarBuilder;
 //!
 //! # fn main() -> anyhow::Result<()> {
 //! let device = Device::Cpu;

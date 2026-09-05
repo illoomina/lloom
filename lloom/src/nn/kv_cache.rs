@@ -732,7 +732,7 @@ impl ScatteredCacheBuilder {
 /// # Example
 ///
 /// ```ignore
-/// use crate::nn::kv_cache::ConcatKvCache;
+/// use lloom::nn::kv_cache::ConcatKvCache;
 ///
 /// let mut cache = ConcatKvCache::new(2); // dim=2 for sequence dimension
 ///

@@ -668,6 +668,7 @@ impl ComputeCommandEncoder {
                 objc2_foundation::NSRange { location, length },
             );
         }
+        trace::record_execute_range(range.resident.len());
     }
 
     /// Attribute this dispatch to the currently bound pipeline, for the

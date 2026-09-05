@@ -392,6 +392,32 @@ pub fn barriers_suppressed() -> usize {
 /// Suppression events, independent of whether a trace is being recorded.
 static BARRIERS_SUPPRESSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// Record one `executeCommandsInBuffer` and the `useResource` declarations made
+/// for it, independent of whether a trace is being recorded.
+///
+/// The residency term of a replayed step is `runs x |resident(run)|`
+/// (`DESIGN.md` §11.3w). Counted at the call site rather than derived from the
+/// plan, so a harness reports what the encoder declared, not what the plan
+/// intended to.
+#[inline]
+pub fn record_execute_range(resources: usize) {
+    EXECUTE_RANGES.fetch_add(1, Ordering::Relaxed);
+    USE_RESOURCE.fetch_add(resources as u64, Ordering::Relaxed);
+}
+
+/// `executeCommandsInBuffer` calls made, process-wide.
+pub fn execute_range_count() -> u64 {
+    EXECUTE_RANGES.load(Ordering::Relaxed)
+}
+
+/// `useResource` calls made for ICB ranges, process-wide.
+pub fn use_resource_count() -> u64 {
+    USE_RESOURCE.load(Ordering::Relaxed)
+}
+
+static EXECUTE_RANGES: AtomicU64 = AtomicU64::new(0);
+static USE_RESOURCE: AtomicU64 = AtomicU64::new(0);
+
 /// Record that a new encoder session began, resetting hazard state.
 ///
 /// Barriers order dispatches only *within* an encoder, so a barrier count is

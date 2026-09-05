@@ -566,6 +566,11 @@ fn main() -> Result<()> {
     // packed subset each step. `--replay-barriers skip-replayed` is the separable
     // barrier-suppression win (§11.3r); `--replay-barrier-scope` is §11.3l's
     // open question 3. Metal-only; a no-op wherever `--replay` is off.
+    // Held so the run can report what the executor actually did: a flag being
+    // passed does not establish that anything was replayed (§2.4), and the
+    // A/B below is only about the executor if `covered > 0` and `replaying`.
+    #[cfg(feature = "metal")]
+    let mut icb_exec: Option<std::sync::Arc<candle::kernels::IcbExecutor>> = None;
     #[cfg(feature = "metal")]
     if args.replay {
         use candle::kernels::metal::ExecutorSlot;
@@ -589,8 +594,9 @@ fn main() -> Result<()> {
         // (the `Arc<Arc<_>>` is what does not coerce to `Arc<dyn Executor>`).
         let exec = IcbExecutor::configured(ICB_RECORD_STEPS, scope, barriers);
         if let Device::Metal(dev) = &device {
-            dev.set_executor(std::sync::Arc::new(ExecutorSlot::Custom(exec)));
+            dev.set_executor(std::sync::Arc::new(ExecutorSlot::Custom(exec.clone())));
         }
+        icb_exec = Some(exec);
         eprintln!("[replay: ICB executor installed — barriers={barriers:?} scope={scope:?} param-style=packed]");
     }
 
@@ -850,7 +856,50 @@ fn main() -> Result<()> {
         st.overrun,
         out.eos,
     );
+    #[cfg(feature = "metal")]
+    if let Some(exec) = icb_exec.as_ref() {
+        report_replay(exec, st.steps);
+    }
     Ok(())
+}
+
+/// What the ICB executor did on this run: engagement first, then the residency
+/// term (`DESIGN.md` §11.3w). `replaying=false` or `covered=0` means the A/B
+/// above compared the classical path against itself wearing this arm's name.
+#[cfg(feature = "metal")]
+fn report_replay(exec: &candle::kernels::IcbExecutor, steps: u64) {
+    use candle::kernels::metal::trace;
+    let cov = exec.coverage();
+    eprintln!(
+        "[replay: replaying={} covered={}/{} runs={} barriers_encoded={} stale={} \
+         poisoned_runs={} discarded_windows={} excluded_varies={} excluded_inline_consts={} \
+         excluded_no_pipeline={}]",
+        exec.is_replaying(),
+        cov.covered,
+        cov.positions,
+        exec.runs(),
+        exec.encoded_barriers(),
+        exec.stale_positions(),
+        exec.poisoned_runs(),
+        exec.discarded_windows(),
+        cov.varies,
+        cov.inline_constants,
+        cov.no_pipeline,
+    );
+    let ranges = trace::execute_range_count();
+    let use_resource = trace::use_resource_count();
+    let steps = steps.max(1) as f64;
+    eprintln!(
+        "[replay: execute_ranges={ranges} ({:.1}/step) useResource={use_resource} ({:.1}/step) \
+         barriers_suppressed={} constants_pool_slots={}]",
+        ranges as f64 / steps,
+        use_resource as f64 / steps,
+        trace::barriers_suppressed(),
+        candle::kernels::constants_pool().map_or(0, |p| p.len()),
+    );
+    for ((kernel, reason), n) in &cov.excluded_by_kernel {
+        eprintln!("[replay excluded {n:4} {kernel:<44} {reason}]");
+    }
 }
 
 /// The per-round breakdown of a `--dspark` run: where a round's wall goes, per

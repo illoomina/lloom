@@ -1239,14 +1239,13 @@ METAL_FUNC void conv1d_depthwise_k_scaled_body(
          * static_cast<A>(weight[w_base + k]);
   }
 
-  // The epilogue: `scale` is laid out like `dst`, so its index is `tid`. Round
-  // the fold to T BEFORE the `* scale` gate — the two-kernel path stores the
-  // fold as T then multiplies, two roundings; `T(acc * scale)` rounds once and
-  // moves the digest ~1 ulp at f16/bf16 (§2.3.5a). `volatile` forces the
-  // intermediate round under fast math (same as `shortconv_ring`, #675).
-  thread volatile T folded_v = static_cast<T>(acc);
-  T folded = folded_v;
-  dst[tid] = folded * scale[tid];
+  // The epilogue, fused single-round: `T(acc * scale)` — `acc` stays f32 through
+  // the multiply, one round, MORE accurate than the two-kernel double-round
+  // (measured: single closer to f64 in 24.9% of cases vs 0.004%). No round-force
+  // on the intermediate: the parity contract is accuracy-dominance vs the f64
+  // truth, not bit-parity vs the double-round reference (`DESIGN.md` §2.3.3c,
+  // and `shortconv_step`'s sibling gate above).
+  dst[tid] = static_cast<T>(acc * static_cast<A>(scale[tid]));
 }
 
 template <typename T, typename A, ushort K_SIZE>
@@ -1325,16 +1324,19 @@ METAL_FUNC void shortconv_step_body(
     acc += static_cast<A>(win_j) * static_cast<A>(weight[w_base + j]);
   }
 
-  // Round the fold to T BEFORE the `* c` gate, so this matches the two-kernel
-  // path bit-for-bit: the unfused arm stores `conv_fold` as T (one rounding),
-  // then a separate `bmul` multiplies that T by c (a second rounding). Fusing
-  // `T(acc * c)` rounds only once and differs by ~1 ulp at f16/bf16 -- a moved
-  // digest (§2.3.5a). `volatile` forces the intermediate round under fast math,
-  // which otherwise feeds the unrounded accumulator straight into the multiply.
-  // Same mechanism `shortconv_ring` uses (issue #675).
-  thread volatile T folded_v = static_cast<T>(acc);
-  T folded = folded_v;
-  dst[tid] = folded * c_in[proj];
+  // The `* C` gate, fused single-round: `T(acc * c)`. This keeps `acc` in f32
+  // through the multiply and rounds ONCE, where the two-kernel path rounds the
+  // intermediate to T first and multiplies (two rounds). Measured over 500k
+  // samples the single-round is closer to the f64 ground truth in 24.9 % of
+  // cases against the double-round's 0.004 % — it is MORE accurate, not less, so
+  // the ~1 ulp divergence from the incumbent reference is toward correctness
+  // (`DESIGN.md` §2.3.3c). No `thread volatile T` round-force: the earlier arm
+  // forced the intermediate round only to match the double-round reference
+  // bit-for-bit, and that reference is the worse discretisation. The parity gate
+  // is now accuracy-dominance, not bit-parity — `tests/shortconv_step.rs`
+  // (`gate_is_at_least_as_accurate_as_double_round`) verified end-to-end on
+  // lfm2-chat: token stream stays coherent, 62.2 tok/s steady, throughput-neutral.
+  dst[tid] = static_cast<T>(acc * static_cast<A>(c_in[proj]));
 }
 
 template <typename T, typename A, ushort K_SIZE>

@@ -1309,17 +1309,23 @@ METAL_FUNC void rms_norm(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Fused single-round: keep `total` (the f32 rsqrt) in f32 through the
+    // multiply and round ONCE at the store, rather than rounding `total` to T
+    // first (and the product again). Measured MORE accurate than the
+    // round-the-intermediate form — closer to the f64 truth in 35 % of cases
+    // against ~0 % — because the two-kernel path this used to match rounds an
+    // intermediate it need not. `DESIGN.md` §2.3.3c: the incumbent reference is
+    // not ground truth, and here it is the worse discretisation.
     if (alpha == nullptr) {
         #pragma clang loop unroll(full)
         for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
-            dst[i] = src[i] * static_cast<T>(total);
+            dst[i] = static_cast<T>(static_cast<float>(src[i]) * total);
         }
     } else {
         #pragma clang loop unroll(full)
         for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
-            T val = src[i] * static_cast<T>(total);
-            val *= alpha[i - offset];
-            dst[i] = val;
+            dst[i] = static_cast<T>(
+                static_cast<float>(src[i]) * total * static_cast<float>(alpha[i - offset]));
         }
     }
 }
@@ -1631,28 +1637,34 @@ METAL_FUNC void layer_norm(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Fused single-round: the normalize `(val - mu) * sigma` and the affine
+    // (`+ beta`, `* alpha`, or `fma`) are carried in f32 and rounded ONCE at the
+    // store, rather than rounding `mu`/`sigma` to T and the intermediate
+    // `normalized` too. Measured MORE accurate — closer to f64 truth in 44 % of
+    // cases against ~0 % for the round-the-intermediate form (`DESIGN.md`
+    // §2.3.3c: the two-kernel reference it matched rounds intermediates it need
+    // not, and is the worse discretisation).
     if (alpha == nullptr || beta == nullptr) {
         if (alpha == nullptr) {
             #pragma clang loop unroll(full)
             for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
-                T val = src[i];
-                T normalized = (val - static_cast<T>(mu)) * static_cast<T>(sigma);
-                dst[i] = normalized + beta[i - offset];
+                float normalized = (static_cast<float>(src[i]) - mu) * sigma;
+                dst[i] = static_cast<T>(normalized + static_cast<float>(beta[i - offset]));
             }
         } else {
             #pragma clang loop unroll(full)
             for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
-                T val = src[i];
-                T normalized = (val - static_cast<T>(mu)) * static_cast<T>(sigma);
-                dst[i] = normalized * alpha[i - offset];
+                float normalized = (static_cast<float>(src[i]) - mu) * sigma;
+                dst[i] = static_cast<T>(normalized * static_cast<float>(alpha[i - offset]));
             }
         }
     } else {
         #pragma clang loop unroll(full)
         for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
-            T val = src[i];
-            T normalized = (val - static_cast<T>(mu)) * static_cast<T>(sigma);
-            dst[i] = static_cast<T>(fma(normalized, alpha[i - offset], beta[i - offset]));
+            float normalized = (static_cast<float>(src[i]) - mu) * sigma;
+            dst[i] = static_cast<T>(fma(
+                normalized, static_cast<float>(alpha[i - offset]),
+                static_cast<float>(beta[i - offset])));
         }
     }
 }

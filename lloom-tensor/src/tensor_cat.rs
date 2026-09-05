@@ -7,7 +7,7 @@ impl Tensor {
     /// the same rank
     ///
     /// ```rust
-    /// # use candle_core::{Tensor, DType, Device};
+    /// # use lloom_tensor::{Tensor, DType, Device};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     /// let b = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     ///
@@ -16,7 +16,7 @@ impl Tensor {
     ///
     /// let c = Tensor::cat(&[&a, &b], 1)?;
     /// assert_eq!(c.shape().dims(), &[2, 6]);
-    /// # Ok::<(), candle_core::Error>(())
+    /// # Ok::<(), lloom_tensor::Error>(())
     /// ```
     pub fn cat<A: AsRef<Tensor>, D: Dim>(args: &[A], dim: D) -> Result<Self> {
         if args.is_empty() {

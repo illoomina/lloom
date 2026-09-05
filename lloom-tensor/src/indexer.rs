@@ -7,7 +7,7 @@ impl Tensor {
     /// Intended to be use by the trait `.i()`
     ///
     /// ```
-    /// # use candle_core::{Tensor, DType, Device, IndexOp};
+    /// # use lloom_tensor::{Tensor, DType, Device, IndexOp};
     /// let a = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
     ///
     /// let c = a.i(0..1)?;
@@ -22,7 +22,7 @@ impl Tensor {
     /// let c = a.i((.., ..=2))?;
     /// assert_eq!(c.shape().dims(), &[2, 3]);
     ///
-    /// # Ok::<(), candle_core::Error>(())
+    /// # Ok::<(), lloom_tensor::Error>(())
     /// ```
     fn index(&self, indexers: &[TensorIndexer]) -> Result<Self, Error> {
         let mut x = self.clone();
@@ -142,7 +142,7 @@ where
     T: Into<TensorIndexer>,
 {
     ///```rust
-    /// use candle_core::{Tensor, DType, Device, IndexOp};
+    /// use lloom_tensor::{Tensor, DType, Device, IndexOp};
     /// let a = Tensor::new(&[
     ///     [0., 1.],
     ///     [2., 3.],
@@ -166,7 +166,7 @@ where
     ///     [2., 3.],
     ///     [4., 5.]
     /// ]);
-    /// # Ok::<(), candle_core::Error>(())
+    /// # Ok::<(), lloom_tensor::Error>(())
     /// ```
     fn i(&self, index: T) -> Result<Tensor, Error> {
         self.index(&[index.into()])
@@ -178,7 +178,7 @@ where
     A: Into<TensorIndexer>,
 {
     ///```rust
-    /// use candle_core::{Tensor, DType, Device, IndexOp};
+    /// use lloom_tensor::{Tensor, DType, Device, IndexOp};
     /// let a = Tensor::new(&[
     ///     [0f32, 1.],
     ///     [2.  , 3.],
@@ -202,7 +202,7 @@ where
     ///     [2., 3.],
     ///     [4., 5.]
     /// ]);
-    /// # Ok::<(), candle_core::Error>(())
+    /// # Ok::<(), lloom_tensor::Error>(())
     /// ```
     fn i(&self, (a,): (A,)) -> Result<Tensor, Error> {
         self.index(&[a.into()])
@@ -215,7 +215,7 @@ where
     B: Into<TensorIndexer>,
 {
     ///```rust
-    /// use candle_core::{Tensor, DType, Device, IndexOp};
+    /// use lloom_tensor::{Tensor, DType, Device, IndexOp};
     /// let a = Tensor::new(&[[0f32, 1., 2.], [3., 4., 5.], [6., 7., 8.]], &Device::Cpu)?;
     ///
     /// let b = a.i((1, 0))?;
@@ -228,7 +228,7 @@ where
     /// let d = a.i((2.., ..))?;
     /// assert_eq!(d.shape().dims(), &[1, 3]);
     /// assert_eq!(d.to_vec2::<f32>()?, &[[6., 7., 8.]]);
-    /// # Ok::<(), candle_core::Error>(())
+    /// # Ok::<(), lloom_tensor::Error>(())
     /// ```
     fn i(&self, (a, b): (A, B)) -> Result<Tensor, Error> {
         self.index(&[a.into(), b.into()])

@@ -4772,7 +4772,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 256, max_shrink_iters: 4096, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig { max_shrink_iters: 4096, ..ProptestConfig::default() })]
 
         /// The slot's live contents match a model of its contract across an
         /// arbitrary sequence of appends, speculative windows and turns.

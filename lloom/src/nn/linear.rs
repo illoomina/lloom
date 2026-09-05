@@ -7,7 +7,7 @@
 //!
 //! ```rust
 //! use lloom_tensor::{Tensor, Device::Cpu};
-//! use crate::nn::{Linear, Module};
+//! use lloom::nn::{Linear, Module};
 //! # fn main() -> lloom_tensor::Result<()> {
 //!
 //! let w = Tensor::new(&[[1f32, 2.], [3., 4.], [5., 6.]], &Cpu)?;

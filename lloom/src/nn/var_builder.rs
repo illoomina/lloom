@@ -701,7 +701,7 @@ impl<'a> VarBuilder<'a> {
     /// ]
     /// .into_iter()
     /// .collect();
-    /// let vb = crate::nn::VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+    /// let vb = lloom::nn::VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
     /// assert!(vb.contains_tensor("foo"));
     /// assert!(vb.get((2, 3), "foo").is_ok());
     /// assert!(!vb.contains_tensor("bar"));

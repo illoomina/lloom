@@ -603,7 +603,7 @@ impl SiluImpl {
 
 /// The three float dtypes `init_unary_float` instantiates.
 ///
-/// A local enum rather than `candle_core::DType` because this crate does not
+/// A local enum rather than `lloom_tensor::DType` because this crate does not
 /// depend on `candle-core` -- the same reason `GemmDType` exists here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SiluDType {

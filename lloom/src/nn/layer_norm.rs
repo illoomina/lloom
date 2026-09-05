@@ -8,7 +8,7 @@
 //!
 //! ```rust
 //! use lloom_tensor::{Tensor, Device::Cpu, test_utils::to_vec3_round};
-//! use crate::nn::{LayerNorm, Module};
+//! use lloom::nn::{LayerNorm, Module};
 //! # fn main() -> lloom_tensor::Result<()> {
 //!
 //! let w = Tensor::new(&[1f32, 1f32, 1f32], &Cpu)?;

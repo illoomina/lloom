@@ -4058,9 +4058,40 @@ impl Model {
         index_pos: usize,
         cache: &mut Cache,
     ) -> Result<Vec<u32>> {
-        let k = proposed.len();
-        if k == 0 {
+        if proposed.is_empty() {
             lloom_tensor::bail!("lfm2 verify_step: no proposed tokens")
+        }
+        let proposed = Tensor::new(proposed, &cache.device)?;
+        self.verify_tokens(last, &proposed, index_pos, cache)
+    }
+
+    /// [`Self::verify_step`] over proposals that are already on the device — a
+    /// rank-1 `U32` tensor of the `k` ids, as a drafter sampling on the GPU
+    /// produces them.
+    ///
+    /// The window `[last, proposed…]` is assembled on the device and the pass
+    /// runs without the host ever holding the proposals: the round's single
+    /// readback is the target's argmax with the proposals beside it, one
+    /// `to_vec1` at the end. A drafter that read its ids back first would pay
+    /// a second wait for the GPU per round, and the draft→verify seam would be
+    /// a device→host→device round-trip of ids the host does not use until
+    /// this compare.
+    pub fn verify_tokens(
+        &self,
+        last: u32,
+        proposed: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<Vec<u32>> {
+        let k = proposed.dims1()?;
+        if k == 0 {
+            lloom_tensor::bail!("lfm2 verify_tokens: no proposed tokens")
+        }
+        if proposed.dtype() != DType::U32 {
+            lloom_tensor::bail!(
+                "lfm2 verify_tokens: proposals must be U32 ids, got {:?}",
+                proposed.dtype()
+            )
         }
         // Opened before the pass, so the token records the state to return to
         // rather than a state the pass has already moved.
@@ -4068,38 +4099,21 @@ impl Model {
 
         // `[last, proposed[0..k]]`: every proposal is fed, and the position
         // after the last one is where the bonus token comes from.
-        let mut window = Vec::with_capacity(k + 1);
-        window.push(last);
-        window.extend_from_slice(proposed);
-
         let device = &cache.device;
-        let input = Tensor::new(window.as_slice(), device)?.reshape((1, k + 1))?;
+        let anchor = Tensor::new(&[last], device)?;
+        let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
 
         // **One pass over the weights for k + 1 positions.** §9.1c: the weight
         // sweep is per step and not per token, so this is where the multiple
         // comes from -- 5.394 GB read once against k + 1 times.
         let logits = self.forward_all(&input, index_pos, cache)?;
-        let argmax = logits
-            .i(0)?
-            .argmax(lloom_tensor::D::Minus1)?
-            .to_vec1::<u32>()?;
+        let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
 
-        // Accept the longest prefix where the target agrees with the proposal.
-        // Position `i`'s argmax is what the target would emit after
-        // `window[i]`; for `i < k` it is compared against `proposed[i]`, and
-        // position `k`'s is the bonus, kept unconditionally.
-        let mut accepted = Vec::with_capacity(k + 1);
-        for i in 0..=k {
-            let target = argmax[i];
-            accepted.push(target);
-            if i < k && target != proposed[i] {
-                // The first disagreement ends the prefix. The target's own token
-                // is kept -- it is what non-speculative decoding would have
-                // emitted here -- which is what makes a rejection cost nothing
-                // rather than costing a token.
-                break;
-            }
-        }
+        // The one readback: `[argmax[0..=k], proposed[0..k]]` in a single
+        // buffer, so the host waits for the GPU once and compares locally.
+        let both = Tensor::cat(&[&argmax, proposed], 0)?.to_vec1::<u32>()?;
+        let (argmax, proposed) = both.split_at(k + 1);
+        let accepted = accept_prefix(argmax, proposed);
 
         // `n` positions of state survive: `last` and the `n - 1` proposals the
         // target agreed with. The remaining `k + 1 - n` were written by the
@@ -4108,6 +4122,32 @@ impl Model {
         cache.resolve(tok, accepted.len())?;
         Ok(accepted)
     }
+}
+
+/// The greedy accept rule over a verified window: the longest prefix where the
+/// target's argmax agrees with the proposal, plus the target's own token at the
+/// first disagreement — or, when every proposal agreed, the bonus at position
+/// `k`.
+///
+/// `argmax` has `k + 1` entries (position `i` is what the target emits after
+/// `window[i]`) and `proposed` has `k`. Returns between 1 and `k + 1` tokens,
+/// never 0: position 0 is the target's own prediction and is always kept. This
+/// is the whole of what makes speculation output-identical to greedy — every
+/// returned token is a target argmax — and a rejection costs nothing, since
+/// the target's token at the mismatch is what plain decoding would have
+/// emitted there.
+pub fn accept_prefix(argmax: &[u32], proposed: &[u32]) -> Vec<u32> {
+    let k = proposed.len();
+    debug_assert_eq!(argmax.len(), k + 1, "argmax covers the k + 1 window");
+    let mut accepted = Vec::with_capacity(k + 1);
+    for i in 0..=k {
+        let target = argmax[i];
+        accepted.push(target);
+        if i < k && target != proposed[i] {
+            break;
+        }
+    }
+    accepted
 }
 
 // The engine's model traits over LFM2's existing entry points
@@ -4211,7 +4251,14 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
             )
         }
         let anchor = anchors[0];
-        let accepted = self.verify_step(anchor.last, &drafts[0].tokens, anchor.pos, cache)?;
+        let accepted = match &drafts[0].tokens {
+            crate::nn::DraftTokens::Host(ids) => {
+                self.verify_step(anchor.last, ids, anchor.pos, cache)?
+            }
+            crate::nn::DraftTokens::Device(ids) => {
+                self.verify_tokens(anchor.last, ids, anchor.pos, cache)?
+            }
+        };
 
         // The probe: this pass's layer-input taps, drained. Trim to the accepted
         // rows — the rejected positions describe state the target just rolled
@@ -4264,6 +4311,21 @@ mod tests {
         // each closure only typechecks if the two sides are the same type.
         let _cache: fn(<Model as CausalLM>::Cache) -> Cache = |c| c;
         let _window: fn(<Model as Speculative>::Window) -> SpecToken = |w| w;
+    }
+
+    /// The accept rule, pinned on values: the longest agreeing prefix plus the
+    /// target's token at the first disagreement, or the bonus when nothing
+    /// disagrees. Position 0 is always kept.
+    #[test]
+    fn accept_prefix_keeps_the_agreeing_prefix_plus_the_targets_token() {
+        let argmax = [10u32, 11, 12, 13];
+        assert_eq!(accept_prefix(&argmax, &[10, 11, 12]), vec![10, 11, 12, 13]);
+        assert_eq!(accept_prefix(&argmax, &[99, 11, 12]), vec![10]);
+        assert_eq!(accept_prefix(&argmax, &[10, 99, 12]), vec![10, 11]);
+        assert_eq!(accept_prefix(&argmax, &[10, 11, 99]), vec![10, 11, 12]);
+        // A proposal equal to the wrong position's argmax is still wrong.
+        assert_eq!(accept_prefix(&argmax, &[11, 12, 13]), vec![10]);
+        assert_eq!(accept_prefix(&[7], &[]), vec![7]);
     }
 
     /// The two arms' shapes and contents, built the way `Attention::forward`

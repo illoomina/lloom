@@ -57,12 +57,10 @@ extern crate accelerate_src;
 use anyhow::{bail, Context, Result};
 use candle::{DType, Device, IndexOp, Tensor, D};
 use candle_examples::lfm2_setup::{parse_config, weight_files};
-use lloom::nn::VarBuilder;
-use lloom::models::lfm2::{Cache, Model};
-use lloom::models::lfm2_dspark::{
-    drafter_params, DSparkConfig, DSparkDrafter, CHECKPOINT_DTYPE,
-};
 use clap::Parser;
+use lloom::models::lfm2::{Cache, Model};
+use lloom::models::lfm2_dspark::{drafter_params, DSparkConfig, DSparkDrafter, CHECKPOINT_DTYPE};
+use lloom::nn::VarBuilder;
 use std::path::{Path, PathBuf};
 
 /// The released drafter's own parameter total, summed from the payload-bearing
@@ -462,7 +460,9 @@ fn main() -> Result<()> {
         .to_dtype(DType::F32)?;
     println!("\nbase logits       : {:?}", base_logits.dims());
 
-    let drafted = drafter.sample_block(&base_logits, anchor)?;
+    let drafted = drafter
+        .sample_block(&base_logits, anchor)?
+        .to_vec1::<u32>()?;
     println!("drafted block     : {drafted:?}");
 
     // Check 2: every drafted id is a real token.
@@ -492,6 +492,7 @@ fn main() -> Result<()> {
     for &t in drafted.iter().take(cap.saturating_sub(1)) {
         prev_tokens.push(t);
     }
+    let prev_tokens = Tensor::new(prev_tokens.as_slice(), pred2.device())?;
     if let Some(conf) = drafter.confidence_scores(&pred2, &prev_tokens)? {
         let cv = conf.to_dtype(DType::F32)?.to_vec1::<f32>()?;
         println!(

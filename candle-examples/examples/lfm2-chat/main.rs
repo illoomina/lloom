@@ -286,7 +286,8 @@ fn read_drafter_config(dir: &Path) -> Result<DSparkConfig> {
         mask_token_id: dfc
             .get("mask_token_id")
             .and_then(|x| x.as_u64())
-            .context("drafter config has no dflash_config.mask_token_id")? as u32,
+            .context("drafter config has no dflash_config.mask_token_id")?
+            as u32,
         num_target_layers: dfc
             .get("num_target_layers")
             .and_then(|x| x.as_u64())
@@ -591,9 +592,8 @@ fn main() -> Result<()> {
             // F16 to match the target the block is embedded with — the drafter's
             // stored BF16 has no CPU matmul and would need a cast at every meeting
             // of the two dtypes (`lfm2_dspark.rs` `DSparkDrafter::new` docs).
-            let dvb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&[draft_file], DType::F16, &device)?
-            };
+            let dvb =
+                unsafe { VarBuilder::from_mmaped_safetensors(&[draft_file], DType::F16, &device)? };
             let drafter = DSparkDrafter::new(setup.dcfg.clone(), max_pos, dvb)
                 .context("constructing DSpark drafter")?;
             eprintln!(
@@ -847,6 +847,19 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
             .collect::<Vec<_>>()
             .join(" ")
     );
+    // Host readbacks per phase: each is a wait for the GPU, and the round owes
+    // exactly one (the verify's argmax). Counted, not inferred — a draft that
+    // drained its ids to the host shows here and nowhere in the digests.
+    let rb_draft: u64 = timed.iter().map(|r| r.timing.draft_readbacks).sum();
+    let rb_verify: u64 = timed.iter().map(|r| r.timing.verify_readbacks).sum();
+    let rb_observe: u64 = timed.iter().map(|r| r.timing.observe_readbacks).sum();
+    eprintln!(
+        "[dspark host readbacks per round (mean):  draft {:.2}   verify {:.2}   observe {:.2}   round {:.2}]",
+        rb_draft as f64 / n,
+        rb_verify as f64 / n,
+        rb_observe as f64 / n,
+        (rb_draft + rb_verify + rb_observe) as f64 / n
+    );
     let gpu_draft: f64 = timed.iter().map(|r| r.timing.draft_gpu_s * 1e3).sum();
     let gpu_verify: f64 = timed.iter().map(|r| r.timing.verify_gpu_s * 1e3).sum();
     let gpu_observe: f64 = timed.iter().map(|r| r.timing.observe_gpu_s * 1e3).sum();
@@ -897,7 +910,9 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
          draft_ms_median={med_draft:.4} verify_ms_median={med_verify:.4} observe_ms_median={med_observe:.4} \
          draft_ms_per_token={:.4} verify_ms_per_token={:.4} observe_ms_per_token={:.4} total_ms_per_token={:.4} \
          draft_gpu_ms={:.4} verify_gpu_ms={:.4} observe_gpu_ms={:.4} \
-         draft_disp={:.1} verify_disp={:.1} observe_disp={:.1} phase_sync={phase_sync} profiled={profiled}",
+         draft_disp={:.1} verify_disp={:.1} observe_disp={:.1} \
+         draft_readbacks={:.3} verify_readbacks={:.3} observe_readbacks={:.3} \
+         phase_sync={phase_sync} profiled={profiled}",
         timed.len(),
         sum_round / n,
         sum_draft / e,
@@ -910,6 +925,9 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
         disp_draft as f64 / n,
         disp_verify as f64 / n,
         disp_observe as f64 / n,
+        rb_draft as f64 / n,
+        rb_verify as f64 / n,
+        rb_observe as f64 / n,
     );
 }
 

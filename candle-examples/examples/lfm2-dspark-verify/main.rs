@@ -94,12 +94,10 @@ extern crate accelerate_src;
 use anyhow::{bail, Context, Result};
 use candle::{DType, Device, Tensor, D};
 use candle_examples::lfm2_setup::{parse_config, weight_files};
-use lloom::nn::VarBuilder;
-use lloom::models::lfm2::{Cache, ConvState, KvAppend, Model};
-use lloom::models::lfm2_dspark::{
-    drafter_params, DSparkConfig, DSparkDrafter, CHECKPOINT_DTYPE,
-};
 use clap::Parser;
+use lloom::models::lfm2::{Cache, ConvState, KvAppend, Model};
+use lloom::models::lfm2_dspark::{drafter_params, DSparkConfig, DSparkDrafter, CHECKPOINT_DTYPE};
+use lloom::nn::VarBuilder;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
@@ -1149,7 +1147,7 @@ fn main() -> Result<()> {
         let base_logits = spec_model
             .draft_lm_head(&pred.to_dtype(DType::F16)?)?
             .to_dtype(DType::F32)?;
-        let proposed = drafter.sample_block(&base_logits, last)?;
+        let proposed = drafter.sample_block(&base_logits, last)?.to_vec1::<u32>()?;
         if let Some(d) = &args.dump_dir {
             if r < args.dump_rounds {
                 dump_f32(d, &format!("round{r}_block_hidden"), &hidden.squeeze(0)?)?;

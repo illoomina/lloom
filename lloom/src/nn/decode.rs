@@ -67,13 +67,7 @@ impl Speculator for IdentityProposer {
     }
 
     fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
-        Ok(active
-            .iter()
-            .map(|_| Draft {
-                tokens: Vec::new(),
-                confidence: Vec::new(),
-            })
-            .collect())
+        Ok(active.iter().map(|_| Draft::host(Vec::new())).collect())
     }
 
     fn observe(

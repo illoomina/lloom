@@ -190,15 +190,72 @@ pub struct Anchor {
     pub pos: usize,
 }
 
+/// The ids of one drafted block, where the family produced them.
+///
+/// A drafter that samples on the device (DSpark's `sample_block` argmax
+/// chain) hands its ids over as the `[k]` `U32` tensor they already are, and
+/// the verify feeds that tensor straight into the target's window. Draining
+/// them to the host first is a blocking readback the round does not need —
+/// the host learns what was accepted from the verify's own readback, and the
+/// draft ids ride along in it. A family that drafts on the host (n-gram, a
+/// test double) hands over a `Vec` and the verify uploads it.
+///
+/// Either way `len()` is the block width and the verify's window is `k + 1`.
+#[derive(Debug, Clone)]
+pub enum DraftTokens {
+    /// Host-side ids; the verify uploads them.
+    Host(Vec<u32>),
+    /// Device-resident ids: a rank-1 `U32` tensor of length `k`.
+    Device(Tensor),
+}
+
+impl DraftTokens {
+    /// The block width `k`.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Host(v) => v.len(),
+            Self::Device(t) => t.elem_count(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Keep the first `n` ids. A `Device` block is narrowed, not read back.
+    pub fn truncate(&mut self, n: usize) -> Result<()> {
+        match self {
+            Self::Host(v) => v.truncate(n),
+            Self::Device(t) => {
+                if n < t.elem_count() {
+                    *t = t.narrow(0, 0, n)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One drafted block for one sequence.
 pub struct Draft {
-    pub tokens: Vec<u32>,
+    pub tokens: DraftTokens,
     /// Per-position `P(this token)` in `[0, 1]` if the family exposes a
-    /// confidence signal (DSpark's confidence head), EMPTY otherwise. NOT a
+    /// confidence signal (DSpark's confidence head) AND the driver asked for
+    /// it ([`Speculator::want_confidence`]), EMPTY otherwise. NOT a
     /// probability the target must honour — a hint. The DRIVER owns the
     /// `p_min` threshold ([`Session::speculative_step`]); the family never
     /// sees it. One knob, many families.
     pub confidence: Vec<f32>,
+}
+
+impl Draft {
+    /// A block drafted on the host, with no confidence hint.
+    pub fn host(tokens: Vec<u32>) -> Self {
+        Self {
+            tokens: DraftTokens::Host(tokens),
+            confidence: Vec::new(),
+        }
+    }
 }
 
 /// A speculative proposer: one target, one drafter family.
@@ -234,6 +291,16 @@ pub trait Speculator {
     /// Propose for the flagged-active sequences — ONE call, ALL sequences, so
     /// the driver verifies them in one batched target forward (§10.2m's B>1 win).
     fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>>;
+
+    /// Whether the driver will read [`Draft::confidence`] this round.
+    ///
+    /// The driver owns the `p_min` threshold and calls this with `p_min > 0`
+    /// before each `draft`; the family never learns the threshold, only
+    /// whether the hint is consumed. A hint nobody reads is a head forward
+    /// and a blocking host readback per round for nothing, so a family with a
+    /// confidence head produces it only when asked. Default: ignored — a
+    /// family with no confidence signal leaves `confidence` empty either way.
+    fn want_confidence(&mut self, _wanted: bool) {}
 
     /// Fold sequence `seq`'s verified rows back in. This is llama.cpp's
     /// `process` and `accept` merged: every family's "accept" is "update my
@@ -356,6 +423,13 @@ pub struct RoundTiming {
     pub draft_ns: u64,
     pub verify_ns: u64,
     pub observe_ns: u64,
+    /// Host readbacks (each one a wait for the GPU) per phase, from the Metal
+    /// backend's `to_cpu` counters; 0 off Metal. The speculative round owes
+    /// exactly one, in the verify — the count is what shows a draft that
+    /// drained its ids to the host, since the digests cannot.
+    pub draft_readbacks: u64,
+    pub verify_readbacks: u64,
+    pub observe_readbacks: u64,
     pub draft_gpu_s: f64,
     pub verify_gpu_s: f64,
     pub observe_gpu_s: f64,
@@ -371,6 +445,25 @@ impl RoundTiming {
     /// The round's wall, the three phases summed.
     pub fn wall_ns(&self) -> u64 {
         self.draft_ns + self.verify_ns + self.observe_ns
+    }
+
+    /// Host readbacks the round performed, the three phases summed.
+    pub fn readbacks(&self) -> u64 {
+        self.draft_readbacks + self.verify_readbacks + self.observe_readbacks
+    }
+}
+
+/// Host readbacks performed so far by this process (Metal's two `to_cpu`
+/// paths summed); 0 on other backends.
+fn readbacks() -> u64 {
+    #[cfg(feature = "metal")]
+    {
+        let (fast, blit) = lloom_tensor::metal_backend::to_cpu_counts();
+        fast + blit
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        0
     }
 }
 
@@ -732,9 +825,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
     {
         let mut timing = RoundTiming::default();
         let t = std::time::Instant::now();
+        let rb = readbacks();
+        // The hint is produced only when this round will read it (§3.4.4: the
+        // driver owns `p_min`; the family only learns whether it is consumed).
+        spec.want_confidence(p_min > 0.0);
         let mut drafts = spec.draft(active)?;
         let (gpu, disp, census) = probe.close()?;
         timing.draft_ns = t.elapsed().as_nanos() as u64;
+        timing.draft_readbacks = readbacks() - rb;
         timing.draft_gpu_s = gpu;
         timing.draft_disp = disp;
         timing.draft_census = census;
@@ -746,30 +844,35 @@ impl<'m, M: CausalLM> Session<'m, M> {
         if p_min > 0.0 {
             for d in drafts.iter_mut() {
                 if let Some(cut) = d.confidence.iter().position(|&p| p < p_min) {
-                    d.tokens.truncate(cut);
+                    d.tokens.truncate(cut)?;
                     d.confidence.truncate(cut);
                 }
             }
         }
 
         // ONE target forward over `[last, draft…]`, extracting the probe in the
-        // SAME pass (§10.2r amortization).
+        // SAME pass (§10.2r amortization). The round's one host readback is in
+        // here: the verify's argmax, with the draft ids beside it.
         let t = std::time::Instant::now();
+        let rb = readbacks();
         let (accepted, probe_out) =
             self.model
                 .verify_and_probe(&drafts, anchors, &mut self.seq.cache)?;
         let (gpu, disp, census) = probe.close()?;
         timing.verify_ns = t.elapsed().as_nanos() as u64;
+        timing.verify_readbacks = readbacks() - rb;
         timing.verify_gpu_s = gpu;
         timing.verify_disp = disp;
         timing.verify_census = census;
 
         let t = std::time::Instant::now();
+        let rb = readbacks();
         for (seq, acc) in active.iter().zip(&accepted) {
             spec.observe(*seq, &probe_out, acc)?;
         }
         let (gpu, disp, census) = probe.close()?;
         timing.observe_ns = t.elapsed().as_nanos() as u64;
+        timing.observe_readbacks = readbacks() - rb;
         timing.observe_gpu_s = gpu;
         timing.observe_disp = disp;
         timing.observe_census = census;

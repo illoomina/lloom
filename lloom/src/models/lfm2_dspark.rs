@@ -79,7 +79,7 @@
 //! layer choice are the caller's contract, checked where they are made.
 
 use crate::models::with_tracing::{Embedding as TracedEmbedding, Linear as TracedLinear};
-use crate::nn::speculator::{Draft, KvSource, LayerTaps, SeqId, Speculator};
+use crate::nn::speculator::{Draft, DraftTokens, KvSource, LayerTaps, SeqId, Speculator};
 use crate::nn::{Linear, RmsNorm, VarBuilder};
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor, D};
 
@@ -1138,13 +1138,16 @@ impl DSparkDrafter {
     /// restores (§10.2m step 3). With no Markov head this degenerates to a
     /// per-position argmax and the loop still gives the same answer.
     ///
-    /// **The chain stays on the device.** Position `k`'s bias is looked up
-    /// from position `k−1`'s argmax *as a tensor*, so the `cap` positions are
-    /// one enqueued chain and the block comes back in a single readback at the
-    /// end — not one blocking readback per position, which serialized the host
-    /// against the GPU `cap` times per draft (#675). The arithmetic is
-    /// unchanged: the same rows, the same products, the same argmax.
-    pub fn sample_block(&self, base_logits: &Tensor, first_prev: u32) -> Result<Vec<u32>> {
+    /// **The chain stays on the device, and so does the block.** Position
+    /// `k`'s bias is looked up from position `k−1`'s argmax *as a tensor*, so
+    /// the `cap` positions are one enqueued chain — not one blocking readback
+    /// per position, which serialized the host against the GPU `cap` times
+    /// per draft. The block is returned as the `[cap]` `U32` tensor it is; the
+    /// verify feeds it into the target's window without a host round-trip,
+    /// and the host reads the ids back beside the verify's argmax, once. The
+    /// arithmetic is unchanged: the same rows, the same products, the same
+    /// argmax.
+    pub fn sample_block(&self, base_logits: &Tensor, first_prev: u32) -> Result<Tensor> {
         let (cap, _) = base_logits.dims2()?;
         let mut picks = Vec::with_capacity(cap);
         let mut prev = Tensor::new(&[first_prev], base_logits.device())?;
@@ -1161,18 +1164,19 @@ impl DSparkDrafter {
             picks.push(next.clone());
             prev = next;
         }
-        Tensor::cat(&picks, 0)?.to_vec1::<u32>()
+        Tensor::cat(&picks, 0)
     }
 
     /// Per-position accept probabilities for a drafted block.
     ///
     /// `block_hidden` is [`Self::head_slice`]'s output squeezed to
     /// `[cap, hidden]`; `prev_tokens[k]` is the token preceding draft position
-    /// `k` (the anchor for `k = 0`, then the drafted tokens).
+    /// `k` (the anchor for `k = 0`, then the drafted tokens), a `[cap]` `U32`
+    /// tensor so a device-resident block feeds it without a readback.
     pub fn confidence_scores(
         &self,
         block_hidden: &Tensor,
-        prev_tokens: &[u32],
+        prev_tokens: &Tensor,
     ) -> Result<Option<Tensor>> {
         let Some(head) = &self.confidence else {
             return Ok(None);
@@ -1184,17 +1188,16 @@ impl DSparkDrafter {
             );
         };
         let (cap, _) = block_hidden.dims2()?;
-        if prev_tokens.len() != cap {
+        if prev_tokens.dims1()? != cap {
             lloom_tensor::bail!(
                 "DSpark confidence: {cap} positions and {} previous tokens (issue #363)",
-                prev_tokens.len()
+                prev_tokens.dims1()?
             );
         }
-        let prev_ids = Tensor::new(prev_tokens, block_hidden.device())?;
         // Both halves of the concat are brought to the backbone's dtype rather
         // than to `block_hidden`'s, because the head's own weights are at that
         // dtype and a caller may hand us an F32 slice.
-        let prev = markov.prev_embeddings(&prev_ids)?.to_dtype(self.dtype)?;
+        let prev = markov.prev_embeddings(prev_tokens)?.to_dtype(self.dtype)?;
         let hidden = block_hidden.to_dtype(self.dtype)?;
         let feats = Tensor::cat(&[&hidden, &prev], D::Minus1)?.contiguous()?;
         Ok(Some(head.forward(&feats)?))
@@ -1301,6 +1304,10 @@ pub struct DSparkSpeculator {
     /// drafter config.
     block_size: usize,
     max_draft: usize,
+    /// Whether the driver reads `Draft::confidence` this round
+    /// ([`Speculator::want_confidence`]). The head is a forward and a host
+    /// readback per round; off, the round's only readback is the verify's.
+    confidence_wanted: bool,
 }
 
 impl DSparkSpeculator {
@@ -1333,6 +1340,7 @@ impl DSparkSpeculator {
             seqs,
             block_size,
             max_draft,
+            confidence_wanted: false,
         }
     }
 
@@ -1362,28 +1370,34 @@ impl DSparkSpeculator {
             .lm_head
             .forward(&pred.to_dtype(self.embed.embeddings().dtype())?)?
             .to_dtype(DType::F32)?;
+        // The block stays on the device: the verify takes it as a tensor, and
+        // the host sees the ids in the verify's own readback.
         let tokens = self.drafter.sample_block(&base_logits, seq.last)?;
 
-        // The confidence head, when present, is the family's `Draft.confidence`
-        // hint (§3.4.1). `prev_tokens[k]` precedes draft position `k`: the anchor
-        // for `k = 0`, then the drafted tokens. EMPTY when the family exposes no
-        // confidence signal.
+        // The confidence head, when present AND asked for, is the family's
+        // `Draft.confidence` hint (§3.4.1). `prev_tokens[k]` precedes draft
+        // position `k`: the anchor for `k = 0`, then the drafted tokens —
+        // assembled on the device from the block. The hint is host-side by
+        // contract, so producing it is the draft's one readback; the driver
+        // asks only when its `p_min` will read it. EMPTY otherwise.
         let confidence = match self.drafter.confidence_head() {
-            None => Vec::new(),
-            Some(_) => {
-                let cap = tokens.len();
+            Some(_) if self.confidence_wanted => {
+                let cap = tokens.dims1()?;
                 let head = self.drafter.head_slice(&hidden, cap)?.squeeze(0)?;
-                let mut prev = Vec::with_capacity(cap);
-                prev.push(seq.last);
-                prev.extend_from_slice(&tokens[..cap.saturating_sub(1)]);
+                let anchor = Tensor::new(&[seq.last], device)?;
+                let prev = Tensor::cat(&[&anchor, &tokens.narrow(0, 0, cap - 1)?], 0)?;
                 match self.drafter.confidence_scores(&head, &prev)? {
                     Some(scores) => scores.to_dtype(DType::F32)?.to_vec1::<f32>()?,
                     None => Vec::new(),
                 }
             }
+            _ => Vec::new(),
         };
 
-        Ok(Draft { tokens, confidence })
+        Ok(Draft {
+            tokens: DraftTokens::Device(tokens),
+            confidence,
+        })
     }
 }
 
@@ -1403,6 +1417,10 @@ impl Speculator for DSparkSpeculator {
 
     fn max_draft(&self) -> usize {
         self.max_draft
+    }
+
+    fn want_confidence(&mut self, wanted: bool) {
+        self.confidence_wanted = wanted;
     }
 
     fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {

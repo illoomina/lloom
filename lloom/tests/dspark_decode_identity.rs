@@ -33,7 +33,7 @@
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
-use lloom::nn::speculator::{Draft, LayerTaps, SeqId, Speculator, TargetProbe};
+use lloom::nn::speculator::{Draft, DraftTokens, LayerTaps, SeqId, Speculator, TargetProbe};
 use lloom::nn::{DecodeOptions, IdentityProposer, Session, VarBuilder};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -171,10 +171,7 @@ impl Speculator for GarbageDrafter {
     fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
         Ok(active
             .iter()
-            .map(|_| Draft {
-                tokens: vec![self.token; self.k],
-                confidence: Vec::new(),
-            })
+            .map(|_| Draft::host(vec![self.token; self.k]))
             .collect())
     }
 
@@ -217,10 +214,7 @@ impl Speculator for RecordingDrafter {
         self.drafts += 1;
         Ok(active
             .iter()
-            .map(|_| Draft {
-                tokens: vec![0; self.k],
-                confidence: Vec::new(),
-            })
+            .map(|_| Draft::host(vec![0; self.k]))
             .collect())
     }
 
@@ -352,7 +346,7 @@ fn decode_speculative_is_byte_identical_to_greedy() -> Result<()> {
     // (§3.1a: run the non-vacuity arm and say so). A zero-length stream would
     // make any "identical" claim vacuous.
     assert!(
-        ref_ids.len() >= k + 1,
+        ref_ids.len() > k,
         "the greedy reference produced only {} tokens; the gate needs a stream long \
          enough to span more than one speculative round (got EOS={ref_eos})",
         ref_ids.len()
@@ -464,6 +458,266 @@ fn decode_speculative_identity_across_block_sizes() -> Result<()> {
             ref_ids, ids,
             "speculative decode at K={k} diverged from greedy — the accept prefix or the \
              verify window is K-dependent-wrong"
+        );
+    }
+    Ok(())
+}
+
+/// A proposal block for the greedy stream `truth` (the `k` tokens the target
+/// emits after the anchor) that is right up to position `j` and wrong there —
+/// so the accept length is known by construction: `j + 1` for `j < k`, and
+/// `k + 1` (every proposal right, plus the bonus) for `j == k`.
+fn adversarial_block(truth: &[u32], j: usize, vocab: u32) -> Vec<u32> {
+    let mut proposed = truth.to_vec();
+    if j < truth.len() {
+        proposed[j] = (truth[j] + 1) % vocab;
+        assert_ne!(proposed[j], truth[j]);
+    }
+    proposed
+}
+
+/// The device-resident verify (`verify_tokens`, the proposals as a tensor)
+/// accepts exactly what the host verify (`verify_step`, the proposals as a
+/// slice) accepts and leaves the cache in the same state — over adversarial
+/// blocks whose accepted length is fixed by construction rather than read off
+/// the other arm (`CONTRIBUTING.md` §3.1b: an absolute reference, not a shape).
+///
+/// The reference stream is greedy `Session::decode` on the same model; every
+/// accepted token must be that stream's, and the next `forward` on both caches
+/// must agree bit-for-bit AND continue the stream. A verify that fed the window
+/// one position off, dropped the anchor, split the joint readback at the wrong
+/// index, or resolved the cache to the wrong length fails one of these.
+fn verify_arms_agree_on(dev: &Device) -> Result<()> {
+    let k = 4usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+
+    let ref_ids = {
+        let cache = Cache::new(true, DType::F32, &cfg, dev)?;
+        let mut session = Session::new(&model, cache);
+        let mut spec = IdentityProposer;
+        let mut rb = Blocking::new(&eos_ids, dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let opts = DecodeOptions::new(24);
+        session
+            .decode(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                &prompt,
+                &opts,
+                &mut |_| Ok(()),
+            )?
+            .ids
+    };
+    // `ref_ids[0]` is the prefill's argmax (the anchor); the window's `k + 1`
+    // argmaxes are `ref_ids[1..=k + 1]`, and one more token checks the cache.
+    assert!(
+        ref_ids.len() >= k + 3,
+        "the greedy reference produced only {} tokens; the arms need k + 3 = {}",
+        ref_ids.len(),
+        k + 3
+    );
+    let pos = prompt.len();
+    let last = ref_ids[0];
+    let truth = &ref_ids[1..1 + k];
+    let prefill = || -> Result<Cache> {
+        let mut cache = Cache::new(true, DType::F32, &cfg, dev)?;
+        let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
+        model.forward(&input, 0, &mut cache)?;
+        Ok(cache)
+    };
+    let next_logits = |cache: &mut Cache, tail: u32, at: usize| -> Result<Vec<f32>> {
+        let input = Tensor::new(&[tail], dev)?.unsqueeze(0)?;
+        model
+            .forward(&input, at, cache)?
+            .flatten_all()?
+            .to_vec1::<f32>()
+    };
+    let argmax = |logits: &[f32]| -> u32 {
+        let mut best = 0usize;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > logits[best] {
+                best = i;
+            }
+        }
+        best as u32
+    };
+
+    let mut lengths_seen = Vec::new();
+    for j in 0..=k {
+        let proposed = adversarial_block(truth, j, cfg.vocab_size as u32);
+        let want_len = if j < k { j + 1 } else { k + 1 };
+
+        let mut cache_h = prefill()?;
+        let acc_h = model.verify_step(last, &proposed, pos, &mut cache_h)?;
+
+        let mut cache_d = prefill()?;
+        let proposed_t = Tensor::new(proposed.as_slice(), dev)?;
+        let acc_d = model.verify_tokens(last, &proposed_t, pos, &mut cache_d)?;
+
+        assert_eq!(
+            acc_h.len(),
+            want_len,
+            "j={j}: the host arm accepted {} where the block was built to accept {want_len}",
+            acc_h.len()
+        );
+        assert_eq!(
+            acc_h, acc_d,
+            "j={j}: the two arms accepted different tokens"
+        );
+        assert_eq!(
+            &acc_h[..],
+            &ref_ids[1..1 + want_len],
+            "j={j}: an accepted token is not the greedy stream's"
+        );
+
+        let tail = *acc_h.last().expect("never empty");
+        let at = pos + want_len;
+        let next_h = next_logits(&mut cache_h, tail, at)?;
+        let next_d = next_logits(&mut cache_d, tail, at)?;
+        assert_eq!(
+            next_h, next_d,
+            "j={j}: the caches diverged after resolve — the arms resolved to different lengths"
+        );
+        assert_eq!(
+            argmax(&next_h),
+            ref_ids[1 + want_len],
+            "j={j}: the resolved cache does not continue the greedy stream"
+        );
+        lengths_seen.push(want_len);
+    }
+    // Non-vacuity: the sweep exercised every accept length from 1 to k + 1.
+    assert_eq!(lengths_seen, (1..=k + 1).collect::<Vec<_>>());
+    Ok(())
+}
+
+#[test]
+fn verify_tokens_accepts_exactly_what_verify_step_accepts() -> Result<()> {
+    verify_arms_agree_on(&Device::Cpu)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn verify_tokens_accepts_exactly_what_verify_step_accepts_on_metal() -> Result<()> {
+    verify_arms_agree_on(&Device::new_metal(0)?)
+}
+
+/// A drafter that proposes garbage as a DEVICE-resident block — the shape
+/// `DSparkSpeculator` hands the loop — so the identity gate covers
+/// `verify_and_probe`'s `DraftTokens::Device` arm end to end, including the
+/// joint readback and the rollback that follows it.
+struct DeviceGarbageDrafter {
+    k: usize,
+    token: u32,
+    dev: Device,
+}
+
+impl Speculator for DeviceGarbageDrafter {
+    type Probe = LayerTaps<5>;
+
+    fn n_seq(&self) -> usize {
+        1
+    }
+
+    fn max_draft(&self) -> usize {
+        self.k
+    }
+
+    fn begin(&mut self, _seq: SeqId, _prompt: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        active
+            .iter()
+            .map(|_| {
+                Ok(Draft {
+                    tokens: DraftTokens::Device(Tensor::new(
+                        vec![self.token; self.k].as_slice(),
+                        &self.dev,
+                    )?),
+                    confidence: Vec::new(),
+                })
+            })
+            .collect()
+    }
+
+    fn observe(
+        &mut self,
+        _seq: SeqId,
+        _probe: &<Self::Probe as TargetProbe>::Output,
+        _accepted: &[u32],
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The token-identity gate through the device-resident draft seam: greedy
+/// `decode` and `decode_speculative` with a device-block garbage drafter agree
+/// byte for byte, across block sizes.
+#[test]
+fn decode_speculative_is_byte_identical_to_greedy_with_device_drafts() -> Result<()> {
+    let dev = Device::Cpu;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
+    let max_tokens = 32usize;
+    let ref_cfg = tiny_config(8);
+    let ref_model = build(&ref_cfg, &dev)?;
+    let eos_ids: Vec<u32> = ref_cfg.eos_token_id.into_iter().collect();
+    let ref_ids = {
+        let cache = Cache::new(true, DType::F32, &ref_cfg, &dev)?;
+        let mut session = Session::new(&ref_model, cache);
+        let mut spec = IdentityProposer;
+        let mut rb = Blocking::new(&eos_ids, &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let opts = DecodeOptions::new(max_tokens);
+        session
+            .decode(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                &prompt,
+                &opts,
+                &mut |_| Ok(()),
+            )?
+            .ids
+    };
+    assert!(
+        ref_ids.len() >= 9,
+        "reference too short to exercise the K sweep"
+    );
+
+    for k in [1usize, 3, 8] {
+        let cfg = tiny_config(k);
+        let model = build(&cfg, &dev)?;
+        let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let mut session = Session::new(&model, cache);
+        let mut spec = DeviceGarbageDrafter {
+            k,
+            token: 0,
+            dev: dev.clone(),
+        };
+        let mut rb = Blocking::new(&eos_ids, &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let opts = DecodeOptions::new(max_tokens);
+        let out = session.decode_speculative(
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &prompt,
+            &opts,
+            &eos_ids,
+            &mut |_| Ok(()),
+        )?;
+        assert_eq!(
+            ref_ids, out.ids,
+            "device-block speculative decode at K={k} diverged from greedy"
+        );
+        assert!(
+            out.stats.rounds.iter().all(|r| r.accepted >= 1),
+            "every round accepts at least the target's own token"
         );
     }
     Ok(())

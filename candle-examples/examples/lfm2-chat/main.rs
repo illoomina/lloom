@@ -432,9 +432,14 @@ fn main() -> Result<()> {
         // unbounded, which does not fly for many concurrent long generations — but
         // that is the serving path's decision, not this demo's. `LLOOM_CROWN_KV=in-place`
         // selects it for the A/B and for the replay work.
+        // Flipped: InPlace is now the crown default (was Cat). `LLOOM_CROWN_KV=cat`
+        // restores the old arm for the A/B. Being measured: InPlace's per-token
+        // cost (one `copy2d`/token/layer for K and V) vs Cat's O(N) realloc+copy
+        // — hunting the drain that made InPlace lose (58.3 vs 60.5) despite the
+        // better algorithm and the latent replay coverage (§9.2i).
         config.kv_append = match std::env::var("LLOOM_CROWN_KV").as_deref() {
-            Ok("in-place") => lloom::models::lfm2::KvAppend::InPlace,
-            _ => lloom::models::lfm2::KvAppend::Cat,
+            Ok("cat") => lloom::models::lfm2::KvAppend::Cat,
+            _ => lloom::models::lfm2::KvAppend::InPlace,
         };
         config.conv_state = lloom::models::lfm2::ConvState::Shuffle;
         config.gemv_silu = true;

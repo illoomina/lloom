@@ -703,6 +703,20 @@ fn main() -> Result<()> {
     if args.phase_sync && !args.dspark {
         anyhow::bail!("--phase-sync brackets the speculative round's phases; it needs --dspark");
     }
+    // A speculative round is not a steady-state step: its dispatch structure moves
+    // with the accepted length, so a run validated at its head goes stale at a
+    // later member -- whose command has already executed with the recorded
+    // bindings. That is §3.5's silent wrong answer, and it was observed: with
+    // the executor on this loop, 1 of 5 runs produced a different stream
+    // (`measurements/issue-688-icb-residency.md` §5). Refused rather than
+    // gated on `stale` after the fact, because by then the tokens are out.
+    if args.replay && args.dspark {
+        anyhow::bail!(
+            "--replay cannot be combined with --dspark: the speculative round's dispatch \
+             structure is not stable across rounds, every covered run goes stale mid-flight, \
+             and a stale member's ICB command has already run (DESIGN.md §11.3x)"
+        );
+    }
     let opts = DecodeOptions {
         max_tokens: args.max_tokens,
         budget,
@@ -916,8 +930,28 @@ fn main() -> Result<()> {
         out.eos,
     );
     #[cfg(feature = "metal")]
+    let mut replay_stale = 0usize;
+    #[cfg(feature = "metal")]
     if let Some(exec) = icb_exec.as_ref() {
         report_replay(exec, st.steps);
+        replay_stale = exec.stale_positions();
+    }
+    // GPU busy per step, when the census is on: the split between an arm
+    // costing the host and an arm costing the GPU (§11.3s landed GPU-side).
+    // `drain_all` above synchronised, so every completion handler has run.
+    #[cfg(feature = "metal")]
+    if candle::kernels::metal::profile::enabled() {
+        let s = candle::kernels::metal::profile::snapshot();
+        let steps = st.steps.max(1) as f64;
+        eprintln!(
+            "[profile: gpu_busy {:.3} ms/step (union over {} command buffers, {} timed), \
+             {:.1} dispatches/step, {} steps]",
+            1e3 * s.gpu_busy_union_s / steps,
+            s.command_buffers,
+            s.timed_command_buffers,
+            s.dispatches as f64 / steps,
+            st.steps,
+        );
     }
     #[cfg(feature = "metal")]
     if arena {
@@ -935,6 +969,19 @@ fn main() -> Result<()> {
                 None => eprintln!("[arena: not installed]"),
             }
         }
+    }
+    // A stale member of an in-flight run was replayed from a recording its live
+    // dispatch no longer matched. The run is poisoned from the next step, but
+    // the step it was seen on has already executed the recorded command (§3.5),
+    // so the stream above is not to be trusted -- say so where a script reads
+    // the exit status, not only in a counter it may not parse.
+    #[cfg(feature = "metal")]
+    if replay_stale > 0 {
+        anyhow::bail!(
+            "{replay_stale} replayed position(s) went stale inside an in-flight run; their ICB \
+             commands ran against the recorded bindings, so the stream above may be wrong \
+             (DESIGN.md §11.3x)"
+        );
     }
     Ok(())
 }

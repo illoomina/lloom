@@ -109,11 +109,11 @@ extern crate accelerate_src;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use lloom::nn::ops::KvQuant;
-use lloom::nn::VarBuilder;
+use clap::Parser;
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
-use clap::Parser;
+use lloom::nn::ops::KvQuant;
+use lloom::nn::VarBuilder;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -375,6 +375,7 @@ fn main() -> Result<()> {
     config.kv_append = match args.kv_append.as_str() {
         "cat" => KvAppend::Cat,
         "in-place" => KvAppend::InPlace,
+        "paged" => KvAppend::Paged,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
 

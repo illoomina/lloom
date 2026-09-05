@@ -278,3 +278,14 @@ impl crate::backend::BackendDevice for MetalDevice {
         Ok(())
     }
 }
+
+impl MetalStorage {
+    pub(crate) fn kv_scatter(
+        &self,
+        _: &mut Self,
+        _: &Self,
+        _: &crate::KvScatterGeometry,
+    ) -> Result<()> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+}

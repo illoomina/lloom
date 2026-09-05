@@ -323,6 +323,26 @@ impl KvPagePool {
         Ok(fresh)
     }
 
+    /// Discard the last `n` tokens of `seq`, keeping its pages.
+    ///
+    /// A speculative rollback (§10.2a) is a length decrement: the discarded
+    /// positions are above `len` and no read reaches them, and the page that
+    /// held them is the one the next append writes into again. Freeing it
+    /// would be wrong twice over — the sequence still owns the tokens below
+    /// it, and a page released while a command buffer reads it is the hazard
+    /// `PageQuarantine` exists for.
+    pub fn rewind(&mut self, seq: usize, n: usize) -> Result<(), PageError> {
+        let s = &mut self.seqs[seq];
+        if n > s.len {
+            return Err(PageError::TableFull {
+                seq,
+                capacity_pages: self.table_capacity_pages,
+            });
+        }
+        s.len -= n;
+        Ok(())
+    }
+
     /// The chunk table a kernel is handed for `seq`, at `pages_per_chunk`.
     ///
     /// Entry `c` is the **first page** of chunk `c`, which is exactly

@@ -242,6 +242,44 @@ fn a_straddling_chunk_is_detectable_at_k_greater_than_one() {
     assert!(p.chunk_pages_are_contiguous(2, 1));
 }
 
+/// A rewind is a length decrement that keeps the pages, so the next append
+/// writes into the page the discarded tokens occupied rather than allocating.
+///
+/// §10.2a's KV half of `resolve`: the discarded positions are above `len` and
+/// unreachable. Asserted as absolute page counts (`CONTRIBUTING.md` §3.1b rule
+/// 1): after rewinding 3 of 9 tokens the sequence still holds 3 pages, the
+/// re-append of 3 allocates **nothing**, and a rewind past the start is refused.
+#[test]
+fn a_rewind_keeps_the_pages_and_the_re_append_allocates_nothing() {
+    let mut p = pool(16);
+    p.append(0, 9).unwrap(); // pages 0,1,2 at page size 4
+    assert_eq!(p.seq(0).unwrap().pages().len(), 3);
+
+    p.rewind(0, 3).unwrap();
+    assert_eq!(p.seq(0).unwrap().len(), 6);
+    assert_eq!(
+        p.seq(0).unwrap().pages().len(),
+        3,
+        "a rewind must not free the page the discarded tokens sat in: the sequence \
+         still owns the tokens below them, and a page released while a command \
+         buffer reads it is the hazard the quarantine exists for"
+    );
+    assert_eq!(p.pages_free(), 13, "no page returned to the free list");
+
+    let fresh = p.append(0, 3).unwrap();
+    assert!(
+        fresh.is_empty(),
+        "re-appending into the kept page must allocate nothing, got {fresh:?}"
+    );
+    assert_eq!(p.seq(0).unwrap().len(), 9);
+    assert_eq!(p.table_for(0, 1), vec![0, 1, 2]);
+
+    assert!(
+        p.rewind(0, 10).is_err(),
+        "a rewind past the start is refused"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The GPU-liveness epoch (§10.3h's one non-fence obligation), #148.
 // ---------------------------------------------------------------------------

@@ -714,6 +714,7 @@ fn main() -> Result<()> {
     config.kv_append = match args.kv_append.as_str() {
         "cat" => KvAppend::Cat,
         "in-place" => KvAppend::InPlace,
+        "paged" => KvAppend::Paged,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
@@ -899,7 +900,7 @@ fn main() -> Result<()> {
         0
     };
     let rewindable_to = match (config.kv_append, config.conv_state) {
-        (KvAppend::InPlace, ConvState::RotatingRing { k }) => k,
+        (KvAppend::InPlace | KvAppend::Paged, ConvState::RotatingRing { k }) => k,
         _ => 0,
     };
     anyhow::ensure!(

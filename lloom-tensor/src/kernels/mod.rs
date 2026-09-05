@@ -42,7 +42,7 @@ pub use kernels::{
 // sites.
 pub use kernels::params::{
     constants_pool, default_param_style, set_constants_pool_enabled, set_default_param_style,
-    ConstantsPool, FlashCombineParams, FlashPartialParams, ShortconvRingParams,
+    ConstantsPool, FlashCombineParams, FlashPartialParams, FlashScatterParams, ShortconvRingParams,
     ShortconvStepParams,
 };
 // The SiLU variant axis (issue #599, `DESIGN.md` §12.2l). Named rather than

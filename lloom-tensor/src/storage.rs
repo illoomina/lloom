@@ -6,6 +6,27 @@ use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3}
 
 // We do not want to implement Clone on Storage as cloning may fail because of
 // out of memory. Instead try_clone should be used.
+/// The addressing of one `Tensor::kv_scatter_into` call, in elements.
+///
+/// Source rows are `[n_seqs, n_kv_heads, seq_len, head_dim]` at `src_stride`;
+/// row `(b, t)` lands at `b * dst_seq_stride + h * dst_head_stride +
+/// slots[b * seq_len + t] * dst_token_stride`. One struct so the CPU and Metal
+/// arms cannot disagree about what a slot means (§8.1b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvScatterGeometry {
+    pub n_seqs: usize,
+    pub n_kv_heads: usize,
+    pub seq_len: usize,
+    pub head_dim: usize,
+    pub src_stride: [usize; 4],
+    pub src_offset: usize,
+    pub dst_seq_stride: usize,
+    pub dst_head_stride: usize,
+    pub dst_token_stride: usize,
+    pub dst_offset: usize,
+    pub slots_offset: usize,
+}
+
 #[derive(Debug)]
 pub enum Storage {
     Cpu(CpuStorage),
@@ -851,6 +872,29 @@ impl Storage {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn kv_scatter(
+        &self,
+        dst: &mut Self,
+        slots: &Self,
+        g: &KvScatterGeometry,
+    ) -> Result<()> {
+        match (self, dst, slots) {
+            (Self::Cpu(src), Self::Cpu(dst), Self::Cpu(slots)) => src.kv_scatter(dst, slots, g),
+            (Self::Metal(src), Self::Metal(dst), Self::Metal(slots)) => {
+                Ok(src.kv_scatter(dst, slots, g)?)
+            }
+            (Self::Cuda(_), Self::Cuda(_), Self::Cuda(_)) => {
+                crate::bail!("kv_scatter is not implemented for the cuda backend")
+            }
+            (lhs, rhs, _) => Err(Error::DeviceMismatchBinaryOp {
+                lhs: lhs.device().location(),
+                rhs: rhs.device().location(),
+                op: "kv_scatter",
+            }
+            .bt()),
+        }
+    }
+
     pub(crate) fn copy2d(
         &self,
         dst: &mut Self,

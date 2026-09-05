@@ -971,6 +971,23 @@ fn copy2d_<T: Copy>(
     }
 }
 
+fn kv_scatter_<T: Copy>(src: &[T], dst: &mut [T], slots: &[u32], g: &crate::KvScatterGeometry) {
+    for b in 0..g.n_seqs {
+        for h in 0..g.n_kv_heads {
+            for t in 0..g.seq_len {
+                let slot = slots[g.slots_offset + b * g.seq_len + t] as usize;
+                let s =
+                    g.src_offset + b * g.src_stride[0] + h * g.src_stride[1] + t * g.src_stride[2];
+                let d = g.dst_offset
+                    + b * g.dst_seq_stride
+                    + h * g.dst_head_stride
+                    + slot * g.dst_token_stride;
+                dst[d..d + g.head_dim].copy_from_slice(&src[s..s + g.head_dim]);
+            }
+        }
+    }
+}
+
 fn copy_strided_src_<T: Copy>(src: &[T], dst: &mut [T], dst_offset: usize, src_l: &Layout) {
     match src_l.strided_blocks() {
         crate::StridedBlocks::SingleBlock { start_offset, len } => dst
@@ -3396,4 +3413,35 @@ macro_rules! map_dtype {
             s => Err(Error::UnsupportedDTypeForOp(s.dtype(), $name).bt())?,
         }
     };
+}
+
+impl CpuStorage {
+    /// The CPU arm of `Tensor::kv_scatter_into` — the reference the Metal
+    /// kernel is compared against.
+    pub(crate) fn kv_scatter(
+        &self,
+        dst: &mut Self,
+        slots: &Self,
+        g: &crate::KvScatterGeometry,
+    ) -> Result<()> {
+        let slots = match slots {
+            Self::U32(s) => s.as_slice(),
+            other => crate::bail!("kv_scatter needs U32 slots, got {:?}", other.dtype()),
+        };
+        match (self, dst) {
+            (Self::F16(src), Self::F16(dst)) => kv_scatter_(src, dst, slots, g),
+            (Self::BF16(src), Self::BF16(dst)) => kv_scatter_(src, dst, slots, g),
+            (Self::F32(src), Self::F32(dst)) => kv_scatter_(src, dst, slots, g),
+            (Self::F64(src), Self::F64(dst)) => kv_scatter_(src, dst, slots, g),
+            (Self::U8(src), Self::U8(dst)) => kv_scatter_(src, dst, slots, g),
+            (Self::U32(src), Self::U32(dst)) => kv_scatter_(src, dst, slots, g),
+            (Self::I64(src), Self::I64(dst)) => kv_scatter_(src, dst, slots, g),
+            (_, dst) => crate::bail!(
+                "kv_scatter dtype mismatch or unsupported dtype: {:?} into {:?}",
+                self.dtype(),
+                dst.dtype()
+            ),
+        }
+        Ok(())
+    }
 }

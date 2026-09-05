@@ -25,7 +25,7 @@
 //! chain is `#150 → #116`, and `#157 → #148`.
 
 use crate::kernels::kernel::KernelName;
-use crate::kernels::kernels::params::{FlashCombineParams, FlashPartialParams};
+use crate::kernels::kernels::params::{FlashCombineParams, FlashPartialParams, FlashScatterParams};
 use crate::kernels::utils::EncoderProvider;
 use crate::kernels::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
@@ -114,6 +114,12 @@ impl FlashKernel {
         Self::name("flash_decoding_single", dtype, head_dim)
     }
 
+    /// The KV write for one dtype: one token's rows scattered to table-chosen
+    /// slots. Per element, so it has no head-dimension instantiation.
+    pub fn scatter(dtype: FlashDType) -> String {
+        format!("flash_kv_scatter_{}", dtype.suffix())
+    }
+
     fn name(stem: &str, dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
         if !FLASH_HEAD_DIMS.contains(&head_dim) {
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
@@ -134,6 +140,7 @@ impl FlashKernel {
                 names.push(Self::name("flash_decoding_combine", dtype, head_dim).unwrap());
                 names.push(Self::name("flash_decoding_single", dtype, head_dim).unwrap());
             }
+            names.push(Self::scatter(dtype));
         }
         names
     }
@@ -218,6 +225,14 @@ impl FlashPartialParams {
     /// own region, which §3.5 makes silent corruption rather than an error, and
     /// a caller computing the two independently is exactly the hand-sync this
     /// function exists to remove.
+    ///
+    /// `k_stride[0]`/`v_stride[0]` is the **sequence** stride, and the kernel
+    /// reaches a batch row through it rather than by folding the batch into
+    /// the head index. For a `[B, H_kv, T, D]` cache it is the batch stride; for
+    /// a shared page pool it is **0**, and `table_stride` is how row `b` finds
+    /// its own chunk table (`chunk_table[b * table_stride + c]`). `table_stride`
+    /// is 0 when every row reads the same table — the contiguous cache, whose
+    /// table is the identity for every row.
     #[allow(clippy::too_many_arguments)]
     pub fn for_step(
         q_shape: &[usize],
@@ -228,9 +243,17 @@ impl FlashPartialParams {
         pages_per_chunk: usize,
         n_chunks: usize,
         chunk_capacity: usize,
+        table_stride: usize,
         alpha: f32,
         softcapping: f32,
     ) -> Result<Self, MetalKernelError> {
+        if q_shape[1] == 0 {
+            return Err(MetalKernelError::LoadFunctionError(
+                "flash-decoding: q has no heads, so the grid's (batch x head) index cannot be \
+                 split into a sequence and a head"
+                    .to_string(),
+            ));
+        }
         if chunk_capacity < n_chunks {
             return Err(MetalKernelError::LoadFunctionError(format!(
                 "flash-decoding scratch sized for {chunk_capacity} chunks but the step \
@@ -254,14 +277,51 @@ impl FlashPartialParams {
             chunk_capacity: chunk_capacity as i32,
             pages_per_chunk: pages_per_chunk as i32,
             page_size: page_size as i32,
+            heads_per_seq: q_shape[1] as i32,
+            table_stride: table_stride as i32,
             _pad: 0,
             k_head_stride: k_stride[1] as u64,
             v_head_stride: v_stride[1] as u64,
             k_token_stride: k_stride[2] as u64,
             v_token_stride: v_stride[2] as u64,
+            k_seq_stride: k_stride[0] as u64,
+            v_seq_stride: v_stride[0] as u64,
             scale,
             softcapping,
         })
+    }
+}
+
+impl FlashScatterParams {
+    /// Build the KV write's parameters for one pass.
+    ///
+    /// `src` is `[n_seqs, n_kv_heads, seq_len, head_dim]` with the given
+    /// strides; `dst_*` are the destination's strides in the same order, where
+    /// `dst_seq_stride` is 0 for a shared page pool. The slot table the kernel
+    /// reads has `n_seqs * seq_len` rows, one per `(sequence, token)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_write(
+        n_seqs: usize,
+        n_kv_heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+        src_stride: &[usize],
+        dst_seq_stride: usize,
+        dst_head_stride: usize,
+        dst_token_stride: usize,
+    ) -> Self {
+        Self {
+            n_rows: (n_seqs * seq_len) as i32,
+            seq_len: seq_len as i32,
+            n_kv_heads: n_kv_heads as i32,
+            head_dim: head_dim as i32,
+            src_seq_stride: src_stride[0] as u64,
+            src_head_stride: src_stride[1] as u64,
+            src_token_stride: src_stride[2] as u64,
+            dst_seq_stride: dst_seq_stride as u64,
+            dst_head_stride: dst_head_stride as u64,
+            dst_token_stride: dst_token_stride as u64,
+        }
     }
 }
 
@@ -362,8 +422,9 @@ pub fn call_flash_decoding(
     //
     // `scratch`/`combine_params`/`walk_order` are still allocated by the caller
     // but go unread here — sizing them is cheap and the caller does not know the
-    // chunk count until it has the params. `chunk_table` is likewise unused: at
-    // one chunk the table is the identity and the range is `[0, n_keys)`.
+    // chunk count until it has the params. `chunk_table` IS read: the single
+    // chunk starts at the page its table names, which is page 0 only on a
+    // fresh pool (§10.3h).
     if n_chunks == 1 {
         let name = FlashKernel::single(itype, head_dim)?;
         let pipeline =
@@ -380,7 +441,8 @@ pub fn call_flash_decoding(
                 (k_buffer, k_offset),
                 (v_buffer, v_offset),
                 Output::new(output),
-                partial_params
+                partial_params,
+                chunk_table
             )
         );
 
@@ -484,5 +546,62 @@ pub fn call_flash_decoding(
         encoder.dispatch_thread_groups(grid_dims, group_dims);
     }
 
+    Ok(())
+}
+
+/// Dispatch the KV write: `src`'s rows to `dst` at the token slots `slots`
+/// names, one thread per element.
+///
+/// `slots` holds `n_rows` `u32` entries and `scatter_params` a
+/// [`FlashScatterParams`] built by [`FlashScatterParams::for_write`]. Both are
+/// caller-owned buffers for the same reason the attention params are (§3.7c).
+#[allow(clippy::too_many_arguments)]
+pub fn call_flash_kv_scatter(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    src_offset: usize,
+    src: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+    slots: &Buffer,
+    scatter_params: &Buffer,
+    n_rows: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    itype: FlashDType,
+) -> Result<(), MetalKernelError> {
+    if n_rows == 0 || n_kv_heads == 0 || head_dim == 0 {
+        return Ok(());
+    }
+    let name = FlashKernel::scatter(itype);
+    let pipeline = kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "flash_kv_scatter rows={n_rows}");
+    set_params!(
+        encoder,
+        (
+            (src, src_offset),
+            Output::with_offset(dst, dst_offset),
+            slots,
+            scatter_params
+        )
+    );
+    let grid_dims = MTLSize {
+        width: head_dim,
+        height: n_kv_heads,
+        depth: n_rows,
+    };
+    // A threadgroup covers one head's vector: `head_dim` threads along `x`
+    // (at most the pipeline's width), one row of one head per group.
+    let width = head_dim.min(pipeline.max_total_threads_per_threadgroup());
+    let group_dims = MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_threads(grid_dims, group_dims);
     Ok(())
 }

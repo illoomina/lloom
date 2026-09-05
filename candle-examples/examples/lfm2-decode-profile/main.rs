@@ -46,16 +46,14 @@ extern crate accelerate_src;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use lloom::nn::ops::FlashScratchSizing;
-use lloom::nn::ops::KvQuant;
-use lloom::nn::VarBuilder;
+use clap::Parser;
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::token_ring::TokenRing;
 use lloom::generation::{LogitsProcessor, Sampling};
-use lloom::models::lfm2::{
-    AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model,
-};
-use clap::Parser;
+use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::nn::ops::FlashScratchSizing;
+use lloom::nn::ops::KvQuant;
+use lloom::nn::VarBuilder;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -767,6 +765,7 @@ fn kv_append_arm(kv: KvAppend) -> &'static str {
     match kv {
         KvAppend::Cat => "Cat",
         KvAppend::InPlace => "InPlace",
+        KvAppend::Paged => "Paged",
     }
 }
 
@@ -2954,7 +2953,8 @@ fn main() -> Result<()> {
     config.kv_append = match args.kv_append.as_str() {
         "cat" => lloom::models::lfm2::KvAppend::Cat,
         "in-place" => lloom::models::lfm2::KvAppend::InPlace,
-        other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
+        "paged" => lloom::models::lfm2::KvAppend::Paged,
+        other => anyhow::bail!("--kv-append must be `cat`, `in-place` or `paged`, got `{other}`"),
     };
 
     // Refused rather than defaulted, for `--kv-append`'s reason: an
@@ -3005,16 +3005,13 @@ fn main() -> Result<()> {
         let la: Vec<bool> = config
             .layer_types
             .iter()
-            .map(|t| {
-                matches!(
-                    t,
-                    lloom::models::lfm2::LayerType::FullAttention
-                )
-            })
+            .map(|t| matches!(t, lloom::models::lfm2::LayerType::FullAttention))
             .collect();
-        let mut budget = lloom::models::lfm2::MemoryBudget::new(
-            language_weight_bytes(&config, &la, dtype.size_in_bytes()),
-        );
+        let mut budget = lloom::models::lfm2::MemoryBudget::new(language_weight_bytes(
+            &config,
+            &la,
+            dtype.size_in_bytes(),
+        ));
         budget.batch = args.batch;
         budget.fraction = fraction;
         config.memory_budget = Some(budget);

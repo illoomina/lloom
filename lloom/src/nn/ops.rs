@@ -2413,6 +2413,19 @@ impl FlashScratchSizing {
     }
 }
 
+/// The page tables a paged FlashDecoding call reads through.
+///
+/// `entries` holds every sequence's chunk table, `stride` entries each — entry
+/// `b * stride + c` is the first page of sequence `b`'s chunk `c` — and
+/// `n_keys` is the live length, which the pool's token axis no longer carries.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // read by the Metal arm only, as `FlashDecoding`'s fields are
+struct PagedTable {
+    entries: Vec<u32>,
+    stride: usize,
+    n_keys: usize,
+}
+
 /// FlashDecoding: attention split over independent contiguous KV chunks, with
 /// an index-ordered combine (`DESIGN.md` §10.4, issue #116).
 ///
@@ -2432,6 +2445,10 @@ impl FlashScratchSizing {
 struct FlashDecoding {
     scale: f32,
     softcapping: f32,
+    /// `Some` when `k`/`v` are a shared page pool read through per-sequence
+    /// chunk tables rather than a `[B, H_kv, capacity, D]` cache
+    /// (`DESIGN.md` §10.3c).
+    paged: Option<PagedTable>,
     /// KV tokens per page — the **allocation** unit.
     page_size: usize,
     /// Pages per chunk: the `k` of `chunk_size = k * page_size`.
@@ -2546,7 +2563,50 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
                  axis and indexes queries by `head_idx * head_dim` (DESIGN.md 3.5)"
             );
         }
+        // A pool has no batch stride to check: its one "row" is read by every
+        // sequence through its own table, and the kernel takes a sequence
+        // stride of 0. The check below is the contiguous cache's.
+        if let Some(paged) = &self.paged {
+            let b_sz = q_l.dim(0)?;
+            let chunk = self.page_size * self.pages_per_chunk;
+            let need = flash_chunk_count(paged.n_keys, chunk);
+            if k_l.dim(0)? != 1 || v_l.dim(0)? != 1 {
+                lloom_tensor::bail!(
+                    "flash-decoding over a page pool needs a pool of one row, got k {:?}",
+                    k_l.dims()
+                );
+            }
+            if paged.n_keys == 0 || paged.n_keys > k_l.dim(2)? {
+                lloom_tensor::bail!(
+                    "flash-decoding over a page pool: {} live keys against a pool of {} slots",
+                    paged.n_keys,
+                    k_l.dim(2)?
+                );
+            }
+            if paged.entries.len() < need + (b_sz - 1) * paged.stride {
+                lloom_tensor::bail!(
+                    "flash-decoding over a page pool: {} table entries for {b_sz} sequences x \
+                     {need} chunks at stride {}",
+                    paged.entries.len(),
+                    paged.stride
+                );
+            }
+            let slots = k_l.dim(2)?;
+            for (i, &page) in paged.entries.iter().enumerate() {
+                let c = i % paged.stride.max(1);
+                let live = (paged.n_keys - (c * chunk).min(paged.n_keys)).min(chunk);
+                if c < need && page as usize * self.page_size + live > slots {
+                    lloom_tensor::bail!(
+                        "flash-decoding over a page pool: table entry {i} names page {page}, \
+                         whose chunk would read past the pool's {slots} slots (DESIGN.md 3.5)"
+                    );
+                }
+            }
+        }
         for (name, l) in [("k", k_l), ("v", v_l)] {
+            if self.paged.is_some() {
+                break;
+            }
             let (st, dims) = (l.stride(), l.dims());
             if st[0] != dims[1] * st[1] {
                 lloom_tensor::bail!(
@@ -2594,7 +2654,10 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         let b_sz = q_l.dim(0)?;
         let n_q_heads = b_sz * q_l.dim(1)?;
         let head_dim = q_l.dim(D::Minus1)?;
-        let n_keys = k_l.dim(2)?;
+        let n_keys = match &self.paged {
+            Some(p) => p.n_keys,
+            None => k_l.dim(2)?,
+        };
         let chunk_size = self.page_size * self.pages_per_chunk;
         let n_chunks = flash_chunk_count(n_keys, chunk_size);
         if n_chunks == 0 {
@@ -2675,19 +2738,46 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         // from an index — at B=1 the two coincide. Binding it now is what makes
         // the permuted-table test possible and what a paged cache would fill
         // differently.
-        let table = ChunkTable::Contiguous.entries(n_chunks, self.pages_per_chunk);
+        let (table, table_stride): (Vec<u32>, usize) = match &self.paged {
+            Some(p) => (p.entries.clone(), p.stride),
+            // Every row reads the one identity table.
+            None => (
+                ChunkTable::Contiguous.entries(n_chunks, self.pages_per_chunk),
+                0,
+            ),
+        };
         let chunk_table = device.new_buffer_with_data(&table)?;
 
+        // A pool is one row shared by every sequence: its sequence stride is
+        // 0, and its live length is the table's, not the token axis's.
+        let (k_shape, k_stride, v_stride): (Vec<usize>, Vec<usize>, Vec<usize>) = match &self.paged
+        {
+            Some(p) => {
+                let mut ks = k_l.dims().to_vec();
+                ks[2] = p.n_keys;
+                let mut kst = k_l.stride().to_vec();
+                kst[0] = 0;
+                let mut vst = v_l.stride().to_vec();
+                vst[0] = 0;
+                (ks, kst, vst)
+            }
+            None => (
+                k_l.dims().to_vec(),
+                k_l.stride().to_vec(),
+                v_l.stride().to_vec(),
+            ),
+        };
         let partial_params = device.new_buffer_with_data(std::slice::from_ref(
             &lloom_tensor::kernels::FlashPartialParams::for_step(
                 q_l.dims(),
-                k_l.dims(),
-                k_l.stride(),
-                v_l.stride(),
+                &k_shape,
+                &k_stride,
+                &v_stride,
                 self.page_size,
                 self.pages_per_chunk,
                 n_chunks,
                 chunk_capacity,
+                table_stride,
                 self.scale,
                 self.softcapping,
             )
@@ -2776,6 +2866,50 @@ pub fn flash_decoding(
         &FlashDecoding {
             scale,
             softcapping,
+            paged: None,
+            page_size,
+            pages_per_chunk,
+            scratch_sizing,
+            reserve_chunks,
+        },
+    )
+}
+
+/// FlashDecoding over a shared page pool (`DESIGN.md` §10.3c–§10.3h, #148).
+///
+/// `k`/`v` are one layer's pool, `[1, n_kv_heads, pool_pages * page_size,
+/// head_dim]`, holding every sequence's pages. `table` is every sequence's
+/// chunk table, `table_stride` entries each — entry `b * table_stride + c` is
+/// the first page of sequence `b`'s chunk `c` — and `n_keys` is the live
+/// length, the same for every sequence (the batch runs in lockstep). The
+/// kernel reaches a sequence through its table and never through a stride,
+/// and merges its chunks in index order whatever the table holds (§10.3h).
+#[allow(clippy::too_many_arguments)]
+pub fn flash_decoding_paged(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    page_size: usize,
+    pages_per_chunk: usize,
+    scratch_sizing: FlashScratchSizing,
+    reserve_chunks: usize,
+    table: Vec<u32>,
+    table_stride: usize,
+    n_keys: usize,
+) -> Result<Tensor> {
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &FlashDecoding {
+            scale,
+            softcapping,
+            paged: Some(PagedTable {
+                entries: table,
+                stride: table_stride,
+                n_keys,
+            }),
             page_size,
             pages_per_chunk,
             scratch_sizing,

@@ -82,16 +82,13 @@ using namespace metal;
 /// use. That rule is load-bearing here -- `n_keys` bounds the key loop and
 /// `softcapping` is tested inside it.
 ///
-/// Field order is chosen so the two 8-byte strides sit together and the struct
-/// needs no interior padding beyond the tail: 8 x int32 then 4 x size_t then
+/// Field order is chosen so the 8-byte strides sit together and the struct
+/// needs no interior padding beyond the tail: 10 x int32 then 6 x size_t then
 /// 2 x float. `flash_params_layout` ships the real offsets across the boundary
 /// rather than either side asserting its own (§11.3d).
 ///
-/// **The int32 count was 6 and is 8 as of #234**, which is why the sentence
-/// above is a statement about the current field list rather than a constant: an
-/// even count is what keeps the `size_t` block naturally aligned, and adding
-/// `chunk_capacity` alone would have made it 7 and inserted 4 bytes of padding
-/// the layout check would then have had to explain.
+/// The int32 count is kept even so the `size_t` block stays naturally aligned;
+/// `_pad` exists for that reason alone.
 struct FlashPartialParams {
   /// Query heads per KV head. 4 for LFM2 (32 q heads, 8 kv heads, §5.2).
   int gqa_factor;
@@ -132,6 +129,15 @@ struct FlashPartialParams {
   int pages_per_chunk;
   /// KV tokens per page. Equals `chunk_size` at `k = 1`.
   int page_size;
+  /// Query heads per SEQUENCE. The grid's `y` axis is `(batch x q head)`
+  /// flattened, so `head_idx / heads_per_seq` is the sequence and
+  /// `head_idx % heads_per_seq` the head within it. Splitting the flat index
+  /// here rather than folding the batch into `kv_head_idx` is what lets B
+  /// sequences read ONE pool through B different tables (§10.3c).
+  int heads_per_seq;
+  /// Entries between two sequences' chunk tables. 0 when every sequence reads
+  /// the same table (the contiguous cache, where the table is the identity).
+  int table_stride;
   /// Padding to keep the `size_t` block naturally aligned and the struct's
   /// layout stated rather than inferred. Written by the Rust side as 0 and read
   /// by nothing; `flash_params_layout` asserts the offsets either way, so this
@@ -150,6 +156,11 @@ struct FlashPartialParams {
   /// different value here rather than a different kernel.
   size_t k_token_stride;
   size_t v_token_stride;
+  /// Distance between two sequences' KV, in elements. `k_stride[0]` for a
+  /// `[B, H_kv, T, D]` cache; **0 for a shared page pool**, where a sequence is
+  /// reached through its table rather than through a stride.
+  size_t k_seq_stride;
+  size_t v_seq_stride;
   float scale;
   float softcapping;
 };
@@ -234,17 +245,23 @@ inline void flash_decoding_core(
   const float scale = p.scale;
   const float softcapping = p.softcapping;
 
-  const int kv_head_idx = (int)head_idx / gqa_factor;
+  // The flat grid index splits into (sequence, head-within-sequence), and only
+  // the second half is divided by the GQA factor. Folding the batch into
+  // `kv_head_idx` is address-identical for a contiguous `[B, H_kv, T, D]` cache
+  // and wrong for a shared pool, where a sequence has no stride and is reached
+  // through its own table (§10.3c).
+  const int seq_idx = (int)head_idx / p.heads_per_seq;
+  const int kv_head_idx = ((int)head_idx % p.heads_per_seq) / gqa_factor;
 
   thread U q[elem_per_thread];
   thread U k[elem_per_thread];
 
   queries += head_idx * D + simd_lid * elem_per_thread;
 
-  const device T* k_base =
-      keys + kv_head_idx * k_head_stride + simd_lid * elem_per_thread;
-  const device T* v_base =
-      values + kv_head_idx * v_head_stride + simd_lid * elem_per_thread;
+  const device T* k_base = keys + (size_t)seq_idx * p.k_seq_stride +
+                           kv_head_idx * k_head_stride + simd_lid * elem_per_thread;
+  const device T* v_base = values + (size_t)seq_idx * p.v_seq_stride +
+                           kv_head_idx * v_head_stride + simd_lid * elem_per_thread;
 
   for (int i = 0; i < elem_per_thread; i++) {
     q[i] = static_cast<U>(scale) * queries[i];
@@ -365,19 +382,26 @@ template <typename T, int D>
   // the innermost loop of a bandwidth-bound kernel.
   //
   // `chunk_table[c]` names a PAGE, and a chunk spans `pages_per_chunk` of them.
-  // Under a contiguous cache the pages of one chunk are consecutive, so the
-  // first page determines the range; a paged cache would resolve each page
-  // separately here, which is the loop this shape leaves room for.
-  const uint first_page = chunk_table[chunk_idx];
-  const int chunk_start = (int)first_page * page_size;
-  int chunk_end = chunk_start + pages_per_chunk * page_size;
-  if (chunk_end > n_keys) {
-    chunk_end = n_keys;
+  // The pages of one chunk are consecutive in the pool -- the allocator checks
+  // it (`KvPagePool::chunk_pages_are_contiguous`) -- so the first page
+  // determines the range. Each sequence has its own table at `seq * stride`.
+  const int seq_idx = head_idx / p.heads_per_seq;
+  const uint first_page = chunk_table[(size_t)seq_idx * p.table_stride + chunk_idx];
+  // The live count of THIS chunk is a property of the logical token axis --
+  // `n_keys - c * chunk_size`, clamped to a chunk -- and not of where the page
+  // sits in the pool. A clamp keyed on the physical position assumes pages
+  // appear in ascending token order, which a recycled pool does not honour;
+  // it read a truncated range for any chunk placed above the tail page. The
+  // partial last chunk walks the LIVE count rather than the reserved one:
+  // merging over a full last page folds in uninitialised memory, which §9.1a
+  // records as a silent wrong answer that no size check catches.
+  const int chunk_size = pages_per_chunk * page_size;
+  int n_live = n_keys - chunk_idx * chunk_size;
+  if (n_live > chunk_size) {
+    n_live = chunk_size;
   }
-  // The last chunk is partial, and the clamp above is what walks the LIVE
-  // count rather than the reserved one -- merging over a full last chunk folds
-  // in uninitialised memory, which §9.1a records as a silent wrong answer that
-  // no size check catches.
+  const int chunk_start = (int)first_page * page_size;
+  const int chunk_end = chunk_start + n_live;
 
   thread U o[elem_per_thread];
   U sum_exp_score, new_max, factor;
@@ -460,6 +484,11 @@ template <typename T, int D>
     const device T* values [[buffer(2)]],
     device T* out [[buffer(3)]],
     const device FlashPartialParams* params [[buffer(4)]],
+    // Read even though there is one chunk: its first page is wherever the
+    // sequence's table says, which is page 0 only on a fresh pool. A
+    // single-chunk path that assumed `[0, n_keys)` was correct for every
+    // contiguous cache and silently wrong for a recycled one (§10.3h).
+    const device uint* chunk_table [[buffer(5)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -475,16 +504,18 @@ template <typename T, int D>
 
   const FlashPartialParams p = *params;
   const int head_idx = tid.y;
+  const int seq_idx = head_idx / p.heads_per_seq;
 
-  // The whole live range, `[0, n_keys)`. This kernel is dispatched only when
-  // the caller computed `n_chunks == 1`, so the single chunk IS the cache: no
-  // table read, and `range_start = 0` cannot make the range empty for a real
-  // step (`n_keys >= 1` at decode).
+  // The whole live range, starting at the single chunk's first page. This
+  // kernel is dispatched only when the caller computed `n_chunks == 1`, so
+  // `n_keys` fits in that chunk and the range cannot be empty for a real step
+  // (`n_keys >= 1` at decode).
+  const int start = (int)chunk_table[(size_t)seq_idx * p.table_stride] * p.page_size;
   thread U o[elem_per_thread];
   U sum_exp_score, new_max, factor;
   bool empty;
   flash_decoding_core<T, D, BN, BD, elem_per_thread>(
-      queries, keys, values, p, 0, p.n_keys, outputs, max_scores,
+      queries, keys, values, p, start, start + p.n_keys, outputs, max_scores,
       sum_exp_scores, o, sum_exp_score, new_max, factor, empty, head_idx,
       simd_gid, simd_lid);
 
@@ -637,24 +668,76 @@ template <typename T, int D>
 }
 
 // ============================================================================
+// The KV write: one token's rows scattered to table-chosen slots
+// ============================================================================
+
+/// The scatter's scalars. 4 x int32 then 6 x size_t; no interior padding.
+struct FlashScatterParams {
+  /// Rows in `slots`: `n_seqs * seq_len`. Row `r` is sequence `r / seq_len`,
+  /// token `r % seq_len` of this pass.
+  int n_rows;
+  int seq_len;
+  int n_kv_heads;
+  int head_dim;
+  size_t src_seq_stride;
+  size_t src_head_stride;
+  size_t src_token_stride;
+  /// 0 for a shared page pool: a sequence is reached through its slots.
+  size_t dst_seq_stride;
+  size_t dst_head_stride;
+  size_t dst_token_stride;
+};
+
+/// Write `src[b, h, t, :]` to `dst` at token slot `slots[b * seq_len + t]`.
+///
+/// `copy2d` with a per-token destination -- vLLM's `slot_mapping` shape. The
+/// contiguous in-place cache is the case where every row's slot is `len + t`
+/// and `dst_seq_stride` is a batch stride; a page pool is the case where the
+/// slot is `page * page_size + offset` from the sequence's table and the
+/// sequence stride is 0. One kernel serves both, because a token is one token
+/// whatever page it lands in (§10.3e). One thread per element; the grid is
+/// `(head_dim, n_kv_heads, n_rows)`.
+template <typename T>
+[[kernel]] void flash_kv_scatter(
+    const device T* src [[buffer(0)]],
+    device T* dst [[buffer(1)]],
+    const device uint* slots [[buffer(2)]],
+    const device FlashScatterParams* params [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  const FlashScatterParams p = *params;
+  const int d = gid.x;
+  const int h = gid.y;
+  const int row = gid.z;
+  if (d >= p.head_dim || h >= p.n_kv_heads || row >= p.n_rows) {
+    return;
+  }
+  const int b = row / p.seq_len;
+  const int t = row % p.seq_len;
+  const size_t slot = slots[row];
+  const device T* s = src + (size_t)b * p.src_seq_stride + (size_t)h * p.src_head_stride +
+                      (size_t)t * p.src_token_stride + d;
+  device T* o = dst + (size_t)b * p.dst_seq_stride + (size_t)h * p.dst_head_stride +
+                slot * p.dst_token_stride + d;
+  *o = *s;
+}
+
+// ============================================================================
 // Layout, shipped across the boundary
 // ============================================================================
 
-// 72 as of #234, and it was 64 before: **eight** `int` fill 0..32, the four
-// `size_t` land 8-aligned at 32..64, and the two `float` at 64..72 need no
-// trailing pad only because 72 is already a multiple of the struct's 8-byte
-// alignment. `_pad` is what makes the `int` count even and keeps that true —
-// with seven ints the `size_t` block would have started at 28 and the compiler
-// would have inserted four bytes here rather than the field stating them.
+// 96: **ten** `int` fill 0..40, the six `size_t` land 8-aligned at 40..88, and
+// the two `float` at 88..96 need no trailing pad because 96 is a multiple of the
+// struct's 8-byte alignment. `_pad` is what makes the `int` count even and
+// keeps that true.
 //
-// **This literal was wrong on the first attempt and the compiler said so**,
-// which is the argument for the cross-boundary check rather than against it: a
-// `static_assert` catches the author's arithmetic, and
+// A `static_assert` catches the author's arithmetic, and
 // `every_family_params_layout_matches_metal` catches the two *sides*
 // disagreeing — a different failure, and the one #38 found live (§11.3d).
-static_assert(sizeof(FlashPartialParams) == 72, "FlashPartialParams layout");
+static_assert(sizeof(FlashPartialParams) == 96, "FlashPartialParams layout");
 static_assert(alignof(FlashPartialParams) == 8, "FlashPartialParams alignment");
 static_assert(sizeof(FlashCombineParams) == 8, "FlashCombineParams layout");
+static_assert(sizeof(FlashScatterParams) == 64, "FlashScatterParams layout");
+static_assert(alignof(FlashScatterParams) == 8, "FlashScatterParams alignment");
 
 // The offset is taken from a real `thread` instance rather than the usual
 // null-pointer form, which MSL rejects in constant evaluation (§11.3b).
@@ -670,6 +753,7 @@ static_assert(sizeof(FlashCombineParams) == 8, "FlashCombineParams layout");
   if (tid != 0) { return; }
   FlashPartialParams probe_FlashPartialParams;
   FlashCombineParams probe_FlashCombineParams;
+  FlashScatterParams probe_FlashScatterParams;
 
   out[0] = sizeof(FlashPartialParams);
   out[1] = flash_offsetof_rt(FlashPartialParams, gqa_factor);
@@ -679,16 +763,32 @@ static_assert(sizeof(FlashCombineParams) == 8, "FlashCombineParams layout");
   out[5] = flash_offsetof_rt(FlashPartialParams, chunk_capacity);
   out[6] = flash_offsetof_rt(FlashPartialParams, pages_per_chunk);
   out[7] = flash_offsetof_rt(FlashPartialParams, page_size);
-  out[8] = flash_offsetof_rt(FlashPartialParams, k_head_stride);
-  out[9] = flash_offsetof_rt(FlashPartialParams, v_head_stride);
-  out[10] = flash_offsetof_rt(FlashPartialParams, k_token_stride);
-  out[11] = flash_offsetof_rt(FlashPartialParams, v_token_stride);
-  out[12] = flash_offsetof_rt(FlashPartialParams, scale);
-  out[13] = flash_offsetof_rt(FlashPartialParams, softcapping);
+  out[8] = flash_offsetof_rt(FlashPartialParams, heads_per_seq);
+  out[9] = flash_offsetof_rt(FlashPartialParams, table_stride);
+  out[10] = flash_offsetof_rt(FlashPartialParams, k_head_stride);
+  out[11] = flash_offsetof_rt(FlashPartialParams, v_head_stride);
+  out[12] = flash_offsetof_rt(FlashPartialParams, k_token_stride);
+  out[13] = flash_offsetof_rt(FlashPartialParams, v_token_stride);
+  out[14] = flash_offsetof_rt(FlashPartialParams, k_seq_stride);
+  out[15] = flash_offsetof_rt(FlashPartialParams, v_seq_stride);
+  out[16] = flash_offsetof_rt(FlashPartialParams, scale);
+  out[17] = flash_offsetof_rt(FlashPartialParams, softcapping);
 
-  out[14] = sizeof(FlashCombineParams);
-  out[15] = flash_offsetof_rt(FlashCombineParams, n_chunks);
-  out[16] = flash_offsetof_rt(FlashCombineParams, chunk_capacity);
+  out[18] = sizeof(FlashCombineParams);
+  out[19] = flash_offsetof_rt(FlashCombineParams, n_chunks);
+  out[20] = flash_offsetof_rt(FlashCombineParams, chunk_capacity);
+
+  out[21] = sizeof(FlashScatterParams);
+  out[22] = flash_offsetof_rt(FlashScatterParams, n_rows);
+  out[23] = flash_offsetof_rt(FlashScatterParams, seq_len);
+  out[24] = flash_offsetof_rt(FlashScatterParams, n_kv_heads);
+  out[25] = flash_offsetof_rt(FlashScatterParams, head_dim);
+  out[26] = flash_offsetof_rt(FlashScatterParams, src_seq_stride);
+  out[27] = flash_offsetof_rt(FlashScatterParams, src_head_stride);
+  out[28] = flash_offsetof_rt(FlashScatterParams, src_token_stride);
+  out[29] = flash_offsetof_rt(FlashScatterParams, dst_seq_stride);
+  out[30] = flash_offsetof_rt(FlashScatterParams, dst_head_stride);
+  out[31] = flash_offsetof_rt(FlashScatterParams, dst_token_stride);
 }
 
 // ============================================================================
@@ -735,6 +835,7 @@ static_assert(sizeof(FlashCombineParams) == 8, "FlashCombineParams layout");
       const device type* values [[buffer(2)]],                                \
       device type* out [[buffer(3)]],                                         \
       const device FlashPartialParams* params [[buffer(4)]],                  \
+      const device uint* chunk_table [[buffer(5)]],                           \
       uint3 tid [[threadgroup_position_in_grid]],                             \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
       uint simd_lid [[thread_index_in_simdgroup]]);
@@ -747,6 +848,20 @@ static_assert(sizeof(FlashCombineParams) == 8, "FlashCombineParams layout");
 
 instantiate_flash_decoding_heads(float)
 instantiate_flash_decoding_heads(half)
+
+// The scatter is per element and has no head-dimension template: one
+// instantiation per dtype.
+#define instantiate_flash_kv_scatter(type)                                    \
+  template [[host_name("flash_kv_scatter_" #type)]]                           \
+  [[kernel]] void flash_kv_scatter<type>(                                     \
+      const device type* src [[buffer(0)]],                                   \
+      device type* dst [[buffer(1)]],                                         \
+      const device uint* slots [[buffer(2)]],                                 \
+      const device FlashScatterParams* params [[buffer(3)]],                  \
+      uint3 gid [[thread_position_in_grid]]);
+
+instantiate_flash_kv_scatter(float)
+instantiate_flash_kv_scatter(half)
 // clang-format on
 
 // **`bfloat` is deliberately not instantiated, and that is still a scope

@@ -1118,6 +1118,12 @@ pub struct FlashPartialParams {
     pub chunk_capacity: i32,
     pub pages_per_chunk: i32,
     pub page_size: i32,
+    /// Query heads per sequence: the grid's flat `(batch x head)` index splits
+    /// into a sequence and a head-within-sequence by this, and only the second
+    /// is divided by `gqa_factor`.
+    pub heads_per_seq: i32,
+    /// Entries between two sequences' chunk tables; 0 when they share one.
+    pub table_stride: i32,
     /// Keeps the `int` block even so the `size_t`s stay naturally aligned.
     /// Written as 0 and read by nothing; the layout kernel asserts the offsets
     /// either way, so this states an intent rather than carrying a value.
@@ -1126,6 +1132,9 @@ pub struct FlashPartialParams {
     pub v_head_stride: u64,
     pub k_token_stride: u64,
     pub v_token_stride: u64,
+    /// `k_stride[0]` for a `[B, H_kv, T, D]` cache; 0 for a shared page pool.
+    pub k_seq_stride: u64,
+    pub v_seq_stride: u64,
     pub scale: f32,
     pub softcapping: f32,
 }
@@ -1142,6 +1151,25 @@ pub struct FlashPartialParams {
 pub struct FlashCombineParams {
     pub n_chunks: i32,
     pub chunk_capacity: i32,
+}
+
+/// `flash_kv_scatter`'s scalars: one token's rows written to table-chosen
+/// slots (`DESIGN.md` §10.3e). `copy2d` with a per-token destination.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlashScatterParams {
+    /// Rows in the slot table: `n_seqs * seq_len`.
+    pub n_rows: i32,
+    pub seq_len: i32,
+    pub n_kv_heads: i32,
+    pub head_dim: i32,
+    pub src_seq_stride: u64,
+    pub src_head_stride: u64,
+    pub src_token_stride: u64,
+    /// 0 for a shared page pool, where a sequence is reached through its slots.
+    pub dst_seq_stride: u64,
+    pub dst_head_stride: u64,
+    pub dst_token_stride: u64,
 }
 
 /// The kernel in `flash_decoding.metal` that reports the device-side layout.
@@ -1192,6 +1220,14 @@ pub fn expected_flash_layout() -> Vec<(&'static str, u32)> {
             offset_of!(FlashPartialParams, page_size) as u32,
         ),
         (
+            "FlashPartialParams.heads_per_seq",
+            offset_of!(FlashPartialParams, heads_per_seq) as u32,
+        ),
+        (
+            "FlashPartialParams.table_stride",
+            offset_of!(FlashPartialParams, table_stride) as u32,
+        ),
+        (
             "FlashPartialParams.k_head_stride",
             offset_of!(FlashPartialParams, k_head_stride) as u32,
         ),
@@ -1206,6 +1242,14 @@ pub fn expected_flash_layout() -> Vec<(&'static str, u32)> {
         (
             "FlashPartialParams.v_token_stride",
             offset_of!(FlashPartialParams, v_token_stride) as u32,
+        ),
+        (
+            "FlashPartialParams.k_seq_stride",
+            offset_of!(FlashPartialParams, k_seq_stride) as u32,
+        ),
+        (
+            "FlashPartialParams.v_seq_stride",
+            offset_of!(FlashPartialParams, v_seq_stride) as u32,
         ),
         (
             "FlashPartialParams.scale",
@@ -1226,6 +1270,50 @@ pub fn expected_flash_layout() -> Vec<(&'static str, u32)> {
         (
             "FlashCombineParams.chunk_capacity",
             offset_of!(FlashCombineParams, chunk_capacity) as u32,
+        ),
+        (
+            "sizeof(FlashScatterParams)",
+            size_of::<FlashScatterParams>() as u32,
+        ),
+        (
+            "FlashScatterParams.n_rows",
+            offset_of!(FlashScatterParams, n_rows) as u32,
+        ),
+        (
+            "FlashScatterParams.seq_len",
+            offset_of!(FlashScatterParams, seq_len) as u32,
+        ),
+        (
+            "FlashScatterParams.n_kv_heads",
+            offset_of!(FlashScatterParams, n_kv_heads) as u32,
+        ),
+        (
+            "FlashScatterParams.head_dim",
+            offset_of!(FlashScatterParams, head_dim) as u32,
+        ),
+        (
+            "FlashScatterParams.src_seq_stride",
+            offset_of!(FlashScatterParams, src_seq_stride) as u32,
+        ),
+        (
+            "FlashScatterParams.src_head_stride",
+            offset_of!(FlashScatterParams, src_head_stride) as u32,
+        ),
+        (
+            "FlashScatterParams.src_token_stride",
+            offset_of!(FlashScatterParams, src_token_stride) as u32,
+        ),
+        (
+            "FlashScatterParams.dst_seq_stride",
+            offset_of!(FlashScatterParams, dst_seq_stride) as u32,
+        ),
+        (
+            "FlashScatterParams.dst_head_stride",
+            offset_of!(FlashScatterParams, dst_head_stride) as u32,
+        ),
+        (
+            "FlashScatterParams.dst_token_stride",
+            offset_of!(FlashScatterParams, dst_token_stride) as u32,
         ),
     ]
 }

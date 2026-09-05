@@ -5317,7 +5317,13 @@ fn every_family_params_layout_matches_metal() {
         // deliberately not a slot**: it carries no value, and asserting the
         // offset of a field the GPU never reads is the shape #103's finding 3
         // and #219 both name — half an assertion over a dead field.
-        ("flash_decoding.metal", 17),
+        //
+        // **32 as of #148**: `FlashPartialParams` gained `heads_per_seq`,
+        // `table_stride`, `k_seq_stride` and `v_seq_stride` (a shared page pool
+        // is read by B sequences through B tables, so the batch can no longer be
+        // folded into the head stride), 18 slots; and `FlashScatterParams`, the
+        // paged write's block, adds 11. The guard fired on both, as it should.
+        ("flash_decoding.metal", 32),
         // Issue #218's two structs, also in
         // `scaled_dot_product_attention.metal`: `SdpaQuantParams` (a `sizeof`
         // and eight fields) and `SdpaQuantWriteParams` (a `sizeof` and four).

@@ -665,6 +665,7 @@ fn main() -> Result<()> {
     // `cat` arm's digest under the `in-place` arm's name, which is #69's
     // vacuous run (§2.4, §9.2f).
     config.kv_append = match args.kv_append.as_str() {
+        "paged" => lloom::models::lfm2::KvAppend::Paged,
         "cat" => KvAppend::Cat,
         "in-place" => KvAppend::InPlace,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),

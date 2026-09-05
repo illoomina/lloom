@@ -26,12 +26,13 @@
 //!    the name. This is also what proves `flash_decoding.metal` compiles at
 //!    all, since the offline toolchain is not installed on this machine.
 
-use crate::kernels::kernels::params::{FlashCombineParams, FlashPartialParams};
+use crate::kernels::kernels::params::{FlashCombineParams, FlashPartialParams, FlashScatterParams};
 use crate::kernels::kernels::{
     flash_chunk_count, ChunkTable, FlashDType, FlashKernel, FLASH_HEAD_DIMS,
 };
+use crate::kernels::metal::kv_pages::KvPagePool;
 use crate::kernels::metal::{Commands, ResidencySet};
-use crate::kernels::{call_flash_decoding, Device, Kernels, Source};
+use crate::kernels::{call_flash_decoding, call_flash_kv_scatter, Device, Kernels, Source};
 use objc2_metal::MTLResourceOptions;
 use std::sync::Arc;
 
@@ -276,6 +277,7 @@ fn run_flash_sized(
             pages_per_chunk,
             n_chunks,
             chunk_capacity,
+            0,
             scale,
             1.0,
         )
@@ -750,150 +752,806 @@ fn permuted_chunk_table_is_read_by_index_not_by_walk() {
     }
 }
 
-/// A permuted table with a PARTIAL last page reads the wrong extent (#586).
+/// A permuted table with a PARTIAL last page reads the live count PER CHUNK,
+/// so a recycled pool's table reproduces the contiguous answer bit for bit.
 ///
-/// # What this pins, and why the test above cannot see it
+/// # The limit #586 recorded, and its repair
 ///
-/// `permuted_chunk_table_is_read_by_index_not_by_walk` uses `n_keys = 64` at
-/// `page_size = 32` — **exactly two full chunks** — so the kernel's clamp
+/// The kernel's clamp used to be `chunk_end = min(first_page * page_size +
+/// chunk_size, n_keys)` — keyed on the **physical** position, which assumes
+/// pages appear in ascending token order. A recycled pool does not honour
+/// that: `KvPagePool` hands pages back in free-list order, so a chunk placed
+/// above the tail page read a **truncated** range and a chunk placed below it
+/// read past its live tokens. #586 pinned that as a boundary of the kernel's
+/// correctness; this is the same fixture with the boundary removed, and the
+/// assertion inverted: the live count is now `min(chunk_size, n_keys - c *
+/// chunk_size)` — a property of the logical token axis — and the permuted arm
+/// must agree with the contiguous one exactly.
 ///
-/// ```text
-/// chunk_end = chunk_start + pages_per_chunk * page_size;
-/// if (chunk_end > n_keys) { chunk_end = n_keys; }
-/// ```
-///
-/// never fires. That clamp is `flash_decoding.metal`'s last-page handling and
-/// it assumes **pages appear in ascending token order** — true of a contiguous
-/// cache by construction, and the property a permuted table removes. `n_keys`
-/// is a *live length* in the token axis; under a permutation it stops being an
-/// upper bound on any individual chunk's range.
-///
-/// # This is a LIMIT being recorded, not a defect being fixed
-///
-/// Nothing on the shipping path can reach it: `ops.rs` builds
-/// `ChunkTable::Contiguous`, so `first_page` is ascending in `c` and the clamp
-/// only ever truncates the genuinely-last chunk. **The kernel is correct for
-/// every table it is currently handed.** What this test establishes is the
-/// boundary of that correctness, which is exactly what §10.3i asks for when it
-/// says the allocator must exist before the kernel: `KvPagePool::table_for`
-/// **can** produce a table this kernel would mis-read, and discovering that as
-/// a wrong answer later would be silent (§3.5).
-///
-/// So the assertion is on the *observable consequence* rather than on a hoped
-/// behaviour: chunk 0, pointed at the high page, must read a **truncated**
-/// range, and that is visible in the walk order and the partial it writes.
+/// The table is produced by an ordinary allocate / release / recycle history
+/// rather than written as a literal (§10.3i's reason for building the
+/// allocator first), and the KV is laid out **physically** through that table:
+/// logical chunk `c` lives at page `table[c]`. So the two arms read the same
+/// logical keys from different physical places, and a kernel that got any
+/// chunk's extent wrong reads different keys — which the bit comparison sees.
 #[test]
-fn a_permuted_table_with_a_partial_last_page_truncates_the_wrong_chunk() {
+fn a_recycled_table_with_a_partial_last_page_reproduces_the_contiguous_bits() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let head_dim = 64;
+    let n_q_heads = 4;
+    let n_kv_heads = 2;
+    let page_size = 32;
+    let pool_pages = 8;
+    // 80 keys at page 32: three chunks, the third HALF full. The shape every
+    // real paged cache has — a tail page mid-fill — and the one the identity
+    // table makes indistinguishable from a physical clamp.
+    let n_keys = 80;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // An ordinary history: sequence 0 takes three pages, sequence 1 one page,
+    // sequence 0 leaves and its pages are recycled, sequence 2 takes them back
+    // in free-list order.
+    let mut pool = KvPagePool::new(page_size, pool_pages, 4, 8);
+    pool.append(0, 3 * page_size).unwrap();
+    pool.append(1, page_size).unwrap();
+    let freed = pool.release(0);
+    pool.recycle(&freed).unwrap();
+    pool.append(2, n_keys).unwrap();
+    let table = pool.table_for(2, 1);
+    assert_eq!(
+        table,
+        vec![2, 1, 0],
+        "the recycled history must yield a NON-identity table"
+    );
+    assert!(pool.chunk_pages_are_contiguous(2, 1));
+
+    let queries = fill(n_q_heads * head_dim, 31);
+    // The logical KV: token `t` of head `h` at `h * n_keys * D + t * D`.
+    let logical_k = fill(n_kv_heads * n_keys * head_dim, 32);
+    let logical_v = fill(n_kv_heads * n_keys * head_dim, 33);
+
+    // Contiguous arm: the logical layout, reserved capacity 256.
+    let capacity = 256;
+    let (contig_k, contig_v) = lay_out_contiguous(
+        &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, capacity,
+    );
+    let n_chunks = flash_chunk_count(n_keys, page_size);
+    let contig = run_flash_raw(
+        &device,
+        &kernels,
+        &queries,
+        &contig_k,
+        &contig_v,
+        FlashGeometry {
+            n_seqs: 1,
+            heads_per_seq: n_q_heads,
+            n_kv_heads,
+            head_dim,
+            n_keys,
+            page_size,
+            pages_per_chunk: 1,
+            k_stride: [
+                n_kv_heads * capacity * head_dim,
+                capacity * head_dim,
+                head_dim,
+                1,
+            ],
+            table: ChunkTable::Contiguous.entries(n_chunks, 1),
+            table_stride: 0,
+        },
+        scale,
+    );
+
+    // Paged arm: one pool of `pool_pages` pages per head, logical chunk `c`
+    // stored at page `table[c]`.
+    let (paged_k, paged_v) = lay_out_paged(
+        &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, page_size, pool_pages, &table,
+    );
+    let pool_geometry = |table: Vec<u32>| FlashGeometry {
+        n_seqs: 1,
+        heads_per_seq: n_q_heads,
+        n_kv_heads,
+        head_dim,
+        n_keys,
+        page_size,
+        pages_per_chunk: 1,
+        // A pool has no sequence stride; the head stride spans every page.
+        k_stride: [0, pool_pages * page_size * head_dim, head_dim, 1],
+        table,
+        table_stride: 0,
+    };
+    let paged = run_flash_raw(
+        &device,
+        &kernels,
+        &queries,
+        &paged_k,
+        &paged_v,
+        pool_geometry(table.clone()),
+        scale,
+    );
+
+    assert_eq!(
+        contig.out, paged.out,
+        "a recycled table [2, 1, 0] with a half-full last page must reproduce the contiguous \
+         answer BIT FOR BIT: the live count of chunk c is min(chunk_size, n_keys - c * \
+         chunk_size), a property of the token axis, not of where the page sits (DESIGN.md \
+         10.3d, 10.3h)"
+    );
+    // Per chunk, not only in the merged output: chunk `c` must have read the
+    // same 32 (or 16) keys under both arms.
+    assert_eq!(
+        contig.maxs, paged.maxs,
+        "every chunk's maximum must agree, chunk for chunk"
+    );
+    assert_eq!(
+        contig.sums, paged.sums,
+        "every chunk's denominator must agree, chunk for chunk"
+    );
+    for h in 0..n_q_heads {
+        assert_eq!(
+            &paged.walk[h * n_chunks..(h + 1) * n_chunks],
+            &(0..n_chunks as u32).collect::<Vec<_>>()[..],
+            "head {h}: the combine must walk chunk INDICES ascending whatever the table holds"
+        );
+    }
+
+    // The fixture is capable of the other answer: the same pool read through
+    // the identity table — a kernel that ignored its table — is a different
+    // answer, because the pages are genuinely permuted (§15.1 #1).
+    let walked = run_flash_raw(
+        &device,
+        &kernels,
+        &queries,
+        &paged_k,
+        &paged_v,
+        pool_geometry(ChunkTable::Contiguous.entries(n_chunks, 1)),
+        scale,
+    );
+    assert_ne!(
+        contig.out, walked.out,
+        "degenerate fixture: reading the permuted pool through the identity table gave the \
+         contiguous answer, so the table is not being exercised"
+    );
+}
+
+/// The single-chunk path reads the page its table names, not page 0.
+///
+/// `flash_decoding_single` is dispatched at `n_chunks == 1` — the common decode
+/// band — and used to read `[0, n_keys)` on the ground that *"at one chunk the
+/// table is the identity"*. True of a contiguous cache and of a fresh pool;
+/// false of a recycled one, where the single page a short sequence occupies is
+/// whatever the free list handed back. A B=1 fresh-pool gate cannot see it
+/// (§10.3h): the arm below puts the data at page 3 and asks for it.
+#[test]
+fn the_single_chunk_path_reads_the_page_its_table_names() {
     let device = device();
     let kernels = Kernels::new();
 
     let head_dim = 64;
     let n_q_heads = 2;
     let n_kv_heads = 1;
-    let capacity = 128;
     let page_size = 32;
-    // **48, not 64**: two chunks of which the second is HALF full. This is the
-    // shape every real paged cache has -- a tail page mid-fill -- and it is the
-    // one case the identity table makes indistinguishable.
-    let n_keys = 48;
+    let pool_pages = 4;
+    let n_keys = 20;
     let scale = 1.0 / (head_dim as f32).sqrt();
-
-    let queries = fill(n_q_heads * head_dim, 31);
-    let keys = fill(n_kv_heads * capacity * head_dim, 32);
-    let values = fill(n_kv_heads * capacity * head_dim, 33);
-
-    let n_chunks = flash_chunk_count(n_keys, page_size);
     assert_eq!(
-        n_chunks, 2,
-        "48 keys at page 32 is two chunks, the second half full"
+        flash_chunk_count(n_keys, page_size),
+        1,
+        "the fixture must take the single path"
     );
 
-    let identity = run_partials(
+    let queries = fill(n_q_heads * head_dim, 61);
+    let logical_k = fill(n_kv_heads * n_keys * head_dim, 62);
+    let logical_v = fill(n_kv_heads * n_keys * head_dim, 63);
+
+    let capacity = 64;
+    let (contig_k, contig_v) = lay_out_contiguous(
+        &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, capacity,
+    );
+    let contig = run_flash_raw(
         &device,
         &kernels,
         &queries,
-        &keys,
-        &values,
-        n_q_heads,
+        &contig_k,
+        &contig_v,
+        FlashGeometry {
+            n_seqs: 1,
+            heads_per_seq: n_q_heads,
+            n_kv_heads,
+            head_dim,
+            n_keys,
+            page_size,
+            pages_per_chunk: 1,
+            k_stride: [
+                n_kv_heads * capacity * head_dim,
+                capacity * head_dim,
+                head_dim,
+                1,
+            ],
+            table: vec![0],
+            table_stride: 0,
+        },
+        scale,
+    );
+
+    let table = vec![3u32];
+    let (paged_k, paged_v) = lay_out_paged(
+        &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, page_size, pool_pages, &table,
+    );
+    let geometry = |table: Vec<u32>| FlashGeometry {
+        n_seqs: 1,
+        heads_per_seq: n_q_heads,
         n_kv_heads,
         head_dim,
-        capacity,
         n_keys,
         page_size,
-        scale,
-        &ChunkTable::Contiguous,
-    );
-    let permuted = run_partials(
+        pages_per_chunk: 1,
+        k_stride: [0, pool_pages * page_size * head_dim, head_dim, 1],
+        table,
+        table_stride: 0,
+    };
+    let paged = run_flash_raw(
         &device,
         &kernels,
         &queries,
-        &keys,
-        &values,
-        n_q_heads,
-        n_kv_heads,
-        head_dim,
-        capacity,
-        n_keys,
-        page_size,
+        &paged_k,
+        &paged_v,
+        geometry(table),
         scale,
-        &ChunkTable::Explicit(vec![1, 0]),
     );
-
-    // Under the IDENTITY table: chunk 0 covers tokens [0, 32) -- full -- and
-    // chunk 1 covers [32, 48) -- clamped to the live length, which is correct.
-    //
-    // Under the PERMUTED table: chunk 0 names page 1, so `chunk_start = 32` and
-    // `chunk_end = min(64, 48) = 48` -- it reads 16 keys where the page holds
-    // 32. Chunk 1 names page 0 and reads [0, 32) in full. So the permutation
-    // does NOT simply swap the two partials, and that asymmetry is the finding.
-    let (id_maxs, perm_maxs) = (&identity.1, &permuted.1);
-
-    // The fixture must be capable of the other answer (§15.1 #1): if the two
-    // chunks' maxima agreed, a swap would be unobservable.
+    assert_eq!(
+        contig.out, paged.out,
+        "the single-chunk path must read from page 3, where the table put the sequence, and \
+         reproduce the contiguous bits"
+    );
+    let page_zero = run_flash_raw(
+        &device,
+        &kernels,
+        &queries,
+        &paged_k,
+        &paged_v,
+        geometry(vec![0]),
+        scale,
+    );
     assert_ne!(
-        id_maxs[0], id_maxs[1],
-        "degenerate fixture: the chunks' maxima agree, so no permutation is observable"
+        contig.out, page_zero.out,
+        "degenerate fixture: page 0 of the pool gave the right answer, so the table is not \
+         being exercised"
+    );
+}
+
+/// B sequences read ONE pool through B tables, and each row reproduces its own
+/// B=1 answer bit for bit.
+///
+/// The batch is reached through `table_stride` and a sequence stride of 0,
+/// never by folding the batch into the head index — which is address-identical
+/// for a `[B, H_kv, T, D]` cache and wrong for a pool, where row `b`'s KV is at
+/// whatever pages its table names. Two sequences with DIFFERENT keys, queries
+/// and page sets, so a row reading its neighbour's pages is a different answer
+/// (§2.3.3 #7: a sequence's logits must not depend on its batch neighbours).
+#[test]
+fn b_sequences_read_one_pool_through_their_own_tables() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let head_dim = 64;
+    let heads_per_seq = 4;
+    let n_kv_heads = 2;
+    let page_size = 32;
+    let pool_pages = 4;
+    let n_keys = 40; // two chunks, the second a quarter full
+    let n_seqs = 2;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n_chunks = flash_chunk_count(n_keys, page_size);
+    assert_eq!(n_chunks, 2);
+
+    // Interleaved page sets: sequence 0 at pages [3, 1], sequence 1 at [0, 2].
+    let tables: [Vec<u32>; 2] = [vec![3, 1], vec![0, 2]];
+    let table_stride = 2;
+
+    let capacity = 64;
+    let mut references = Vec::new();
+    let mut pool_k = vec![0f32; n_kv_heads * pool_pages * page_size * head_dim];
+    let mut pool_v = pool_k.clone();
+    let mut all_queries = Vec::new();
+    for (b, table) in tables.iter().enumerate() {
+        let queries = fill(heads_per_seq * head_dim, 71 + b as u32);
+        let logical_k = fill(n_kv_heads * n_keys * head_dim, 81 + b as u32);
+        let logical_v = fill(n_kv_heads * n_keys * head_dim, 91 + b as u32);
+        let (contig_k, contig_v) = lay_out_contiguous(
+            &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, capacity,
+        );
+        references.push(run_flash_raw(
+            &device,
+            &kernels,
+            &queries,
+            &contig_k,
+            &contig_v,
+            FlashGeometry {
+                n_seqs: 1,
+                heads_per_seq,
+                n_kv_heads,
+                head_dim,
+                n_keys,
+                page_size,
+                pages_per_chunk: 1,
+                k_stride: [
+                    n_kv_heads * capacity * head_dim,
+                    capacity * head_dim,
+                    head_dim,
+                    1,
+                ],
+                table: ChunkTable::Contiguous.entries(n_chunks, 1),
+                table_stride: 0,
+            },
+            scale,
+        ));
+        // Both sequences into the one pool.
+        let (pk, pv) = lay_out_paged(
+            &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, page_size, pool_pages, table,
+        );
+        for (c, table_page) in table.iter().enumerate() {
+            for h in 0..n_kv_heads {
+                let live = (n_keys - c * page_size).min(page_size);
+                let base = h * pool_pages * page_size * head_dim
+                    + (*table_page as usize) * page_size * head_dim;
+                let n = live * head_dim;
+                pool_k[base..base + n].copy_from_slice(&pk[base..base + n]);
+                pool_v[base..base + n].copy_from_slice(&pv[base..base + n]);
+            }
+        }
+        all_queries.extend_from_slice(&queries);
+    }
+    assert_ne!(
+        references[0].out, references[1].out,
+        "degenerate fixture: the two sequences agree"
     );
 
-    for h in 0..n_q_heads {
-        // Chunk 1 under the permutation reads page 0 in full, which is exactly
-        // what chunk 0 read under the identity. This half DOES correspond.
+    let batched = run_flash_raw(
+        &device,
+        &kernels,
+        &all_queries,
+        &pool_k,
+        &pool_v,
+        FlashGeometry {
+            n_seqs,
+            heads_per_seq,
+            n_kv_heads,
+            head_dim,
+            n_keys,
+            page_size,
+            pages_per_chunk: 1,
+            k_stride: [0, pool_pages * page_size * head_dim, head_dim, 1],
+            table: tables.concat(),
+            table_stride,
+        },
+        scale,
+    );
+    let row = heads_per_seq * head_dim;
+    for (b, reference) in references.iter().enumerate() {
         assert_eq!(
-            perm_maxs[h * 2 + 1],
-            id_maxs[h * 2],
-            "head {h}: chunk 1 names page 0 and must read what chunk 0 read under the identity"
-        );
-        // Chunk 0 under the permutation reads page 1 **truncated to the live
-        // length**, so it must NOT equal what chunk 1 read under the identity
-        // -- the two cover the same 16 keys only by coincidence of this
-        // fixture, and they do here, so the honest assertion is the equality
-        // that DOES hold plus the statement of why.
-        //
-        // [32, 48) under the permutation and [32, 48) under the identity are
-        // the same range, so these agree -- which is the point: chunk 0 did
-        // NOT get page 1's 32 keys, it got the clamped 16.
-        assert_eq!(
-            perm_maxs[h * 2],
-            id_maxs[h * 2 + 1],
-            "head {h}: chunk 0 names page 1 but the clamp truncates it to the live length, \
-             so it reads the same 16 keys chunk 1 read under the identity -- NOT page 1 in full"
+            &batched.out[b * row..(b + 1) * row],
+            &reference.out[..],
+            "row {b} must reproduce its own B=1 answer bit for bit through its own table \
+             (DESIGN.md 2.3.3 #7, 10.3c)"
         );
     }
+}
 
-    // The load-bearing assertion, and the one that would fail if the clamp were
-    // ever made permutation-aware: the permuted arm reads FEWER keys in total
-    // than the identity arm, because page 1's upper half is unreachable through
-    // a clamp keyed on the token axis. Both arms visit both chunks; only the
-    // identity arm covers all 48 live keys.
-    //
-    // Expressed through the merged output, which is where a lost key shows up.
-    let (id_out, perm_out) = (&identity.0, &permuted.0);
-    assert_ne!(
-        id_out, perm_out,
-        "a permuted table with a partial last page must NOT reproduce the contiguous answer: \
-         if it does, either the clamp became permutation-aware or the fixture stopped \
-         exercising it, and a paged cache's correctness argument rests on knowing which"
+/// The KV write lands each `(sequence, token)` row at the slot its table names
+/// and nowhere else — asserted against a CPU placement of the same bytes,
+/// poison included.
+///
+/// An absolute reference (`CONTRIBUTING.md` §3.1b rule 1): the expected pool is
+/// built on the CPU from the same slot table, so a kernel writing one row to
+/// the wrong slot, the wrong head, or one element off fails on a named index —
+/// and the untouched poison is part of the comparison, so an extra write is as
+/// visible as a missing one.
+#[test]
+fn the_kv_scatter_writes_each_row_at_its_slot_and_nothing_else() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let head_dim = 64;
+    let n_kv_heads = 2;
+    let n_seqs = 2;
+    let seq_len = 3;
+    let page_size = 8;
+    let pool_pages = 4;
+    let tokens = pool_pages * page_size;
+
+    // Slots: sequence 0 fills page 1 from offset 1; sequence 1 is scattered.
+    let slots: Vec<u32> = vec![9, 10, 11, 24, 3, 5];
+    let src = fill(n_seqs * n_kv_heads * seq_len * head_dim, 101);
+    let src_stride = [
+        n_kv_heads * seq_len * head_dim,
+        seq_len * head_dim,
+        head_dim,
+        1,
+    ];
+    let dst_head_stride = tokens * head_dim;
+
+    // The CPU placement.
+    let mut expected = vec![-7.0f32; n_kv_heads * tokens * head_dim];
+    for b in 0..n_seqs {
+        for h in 0..n_kv_heads {
+            for t in 0..seq_len {
+                let slot = slots[b * seq_len + t] as usize;
+                for d in 0..head_dim {
+                    expected[h * dst_head_stride + slot * head_dim + d] =
+                        src[b * src_stride[0] + h * src_stride[1] + t * src_stride[2] + d];
+                }
+            }
+        }
+    }
+
+    let got = run_scatter(
+        &device,
+        &kernels,
+        &src,
+        &vec![-7.0f32; n_kv_heads * tokens * head_dim],
+        &slots,
+        FlashScatterParams::for_write(
+            n_seqs,
+            n_kv_heads,
+            seq_len,
+            head_dim,
+            &src_stride,
+            0,
+            dst_head_stride,
+            head_dim,
+        ),
+        n_kv_heads,
+        head_dim,
     );
+    assert_eq!(got.len(), expected.len());
+    if let Some((i, (g, e))) = got
+        .iter()
+        .zip(expected.iter())
+        .enumerate()
+        .find(|(_, (g, e))| g != e)
+    {
+        let h = i / dst_head_stride;
+        let slot = (i % dst_head_stride) / head_dim;
+        let d = i % head_dim;
+        panic!("pool differs from the CPU placement at head {h} slot {slot} dim {d}: got {g}, want {e}");
+    }
+}
+
+/// Write through the scatter with a pool's slots, read back through the paged
+/// attention with the pool's table, and reproduce the contiguous bits.
+///
+/// The composition the model path takes: the slot of logical token `t` is
+/// `table[t / P] * P + t % P` (vLLM's `slot_mapping`), and the chunk table the
+/// reader is handed is the same table. Both halves have to agree about what a
+/// table means for the answer to come out; a disagreement is a wrong key read
+/// silently (§3.5).
+#[test]
+fn scatter_then_paged_read_reproduces_the_contiguous_answer() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let head_dim = 64;
+    let n_q_heads = 4;
+    let n_kv_heads = 2;
+    let page_size = 32;
+    let pool_pages = 8;
+    let n_keys = 70; // three chunks, the third 6/32 full
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut pool = KvPagePool::new(page_size, pool_pages, 4, 8);
+    pool.append(0, 2 * page_size).unwrap();
+    pool.append(1, 2 * page_size).unwrap();
+    let freed = pool.release(0);
+    pool.recycle(&freed).unwrap();
+    pool.append(2, n_keys).unwrap();
+    let table = pool.table_for(2, 1);
+    assert_eq!(
+        table,
+        vec![1, 0, 4],
+        "recycled pages first, then a fresh one"
+    );
+
+    let queries = fill(n_q_heads * head_dim, 111);
+    // The logical KV as the model produces it: `[1, H_kv, n_keys, D]`.
+    let logical_k = fill(n_kv_heads * n_keys * head_dim, 112);
+    let logical_v = fill(n_kv_heads * n_keys * head_dim, 113);
+
+    let capacity = 256;
+    let (contig_k, contig_v) = lay_out_contiguous(
+        &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, capacity,
+    );
+    let n_chunks = flash_chunk_count(n_keys, page_size);
+    let contig = run_flash_raw(
+        &device,
+        &kernels,
+        &queries,
+        &contig_k,
+        &contig_v,
+        FlashGeometry {
+            n_seqs: 1,
+            heads_per_seq: n_q_heads,
+            n_kv_heads,
+            head_dim,
+            n_keys,
+            page_size,
+            pages_per_chunk: 1,
+            k_stride: [
+                n_kv_heads * capacity * head_dim,
+                capacity * head_dim,
+                head_dim,
+                1,
+            ],
+            table: ChunkTable::Contiguous.entries(n_chunks, 1),
+            table_stride: 0,
+        },
+        scale,
+    );
+
+    // One "prefill" write of all n_keys tokens through the scatter.
+    let slots: Vec<u32> = (0..n_keys)
+        .map(|t| table[t / page_size] * page_size as u32 + (t % page_size) as u32)
+        .collect();
+    let tokens = pool_pages * page_size;
+    let poison = vec![-7.0f32; n_kv_heads * tokens * head_dim];
+    let src_stride = [
+        n_kv_heads * n_keys * head_dim,
+        n_keys * head_dim,
+        head_dim,
+        1,
+    ];
+    let params = FlashScatterParams::for_write(
+        1,
+        n_kv_heads,
+        n_keys,
+        head_dim,
+        &src_stride,
+        0,
+        tokens * head_dim,
+        head_dim,
+    );
+    let pool_k = run_scatter(
+        &device, &kernels, &logical_k, &poison, &slots, params, n_kv_heads, head_dim,
+    );
+    let pool_v = run_scatter(
+        &device, &kernels, &logical_v, &poison, &slots, params, n_kv_heads, head_dim,
+    );
+
+    let paged = run_flash_raw(
+        &device,
+        &kernels,
+        &queries,
+        &pool_k,
+        &pool_v,
+        FlashGeometry {
+            n_seqs: 1,
+            heads_per_seq: n_q_heads,
+            n_kv_heads,
+            head_dim,
+            n_keys,
+            page_size,
+            pages_per_chunk: 1,
+            k_stride: [0, tokens * head_dim, head_dim, 1],
+            table: table.clone(),
+            table_stride: 0,
+        },
+        scale,
+    );
+    assert_eq!(
+        contig.out, paged.out,
+        "scatter through the table then read through the table must reproduce the contiguous \
+         bits; the poison the writer left untouched is what a wrong slot would read"
+    );
+}
+
+/// The paged fixtures' geometry, in one place so the tests above differ only
+/// in the numbers.
+struct FlashGeometry {
+    n_seqs: usize,
+    heads_per_seq: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_keys: usize,
+    page_size: usize,
+    pages_per_chunk: usize,
+    /// `[seq, head, token, dim]` strides of the K/V buffer. `[0]` is 0 for a
+    /// shared pool.
+    k_stride: [usize; 4],
+    table: Vec<u32>,
+    table_stride: usize,
+}
+
+struct FlashRun {
+    out: Vec<f32>,
+    sums: Vec<f32>,
+    maxs: Vec<f32>,
+    walk: Vec<u32>,
+}
+
+/// `[H_kv][capacity][D]` from a logical `[H_kv][n_keys][D]`.
+fn lay_out_contiguous(
+    logical_k: &[f32],
+    logical_v: &[f32],
+    n_kv_heads: usize,
+    n_keys: usize,
+    head_dim: usize,
+    capacity: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut k = vec![0f32; n_kv_heads * capacity * head_dim];
+    let mut v = vec![0f32; n_kv_heads * capacity * head_dim];
+    for h in 0..n_kv_heads {
+        let n = n_keys * head_dim;
+        k[h * capacity * head_dim..h * capacity * head_dim + n]
+            .copy_from_slice(&logical_k[h * n..(h + 1) * n]);
+        v[h * capacity * head_dim..h * capacity * head_dim + n]
+            .copy_from_slice(&logical_v[h * n..(h + 1) * n]);
+    }
+    (k, v)
+}
+
+/// `[H_kv][pool_pages * page_size][D]` from a logical `[H_kv][n_keys][D]`,
+/// logical chunk `c` stored at page `table[c]`. Unwritten pool bytes are a
+/// poison, so a read past a chunk's live count is visible.
+#[allow(clippy::too_many_arguments)]
+fn lay_out_paged(
+    logical_k: &[f32],
+    logical_v: &[f32],
+    n_kv_heads: usize,
+    n_keys: usize,
+    head_dim: usize,
+    page_size: usize,
+    pool_pages: usize,
+    table: &[u32],
+) -> (Vec<f32>, Vec<f32>) {
+    let tokens = pool_pages * page_size;
+    let mut k = vec![-7.0f32; n_kv_heads * tokens * head_dim];
+    let mut v = vec![-7.0f32; n_kv_heads * tokens * head_dim];
+    for h in 0..n_kv_heads {
+        for t in 0..n_keys {
+            let slot = table[t / page_size] as usize * page_size + t % page_size;
+            let src = h * n_keys * head_dim + t * head_dim;
+            let dst = h * tokens * head_dim + slot * head_dim;
+            k[dst..dst + head_dim].copy_from_slice(&logical_k[src..src + head_dim]);
+            v[dst..dst + head_dim].copy_from_slice(&logical_v[src..src + head_dim]);
+        }
+    }
+    (k, v)
+}
+
+/// One run at `Sizing::Grow` over an explicit geometry, returning the output,
+/// the per-chunk statistics and the walk order.
+fn run_flash_raw(
+    device: &Device,
+    kernels: &Kernels,
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    g: FlashGeometry,
+    scale: f32,
+) -> FlashRun {
+    let cmds = commands(device);
+    let n_q_heads = g.n_seqs * g.heads_per_seq;
+    let chunk_size = g.page_size * g.pages_per_chunk;
+    let n_chunks = flash_chunk_count(g.n_keys, chunk_size);
+    assert!(
+        g.table.len() >= n_chunks + (g.n_seqs - 1) * g.table_stride,
+        "the table must cover every sequence's chunks"
+    );
+
+    let q_buf = new_f32(device, queries);
+    let k_buf = new_f32(device, keys);
+    let v_buf = new_f32(device, values);
+    let out = device
+        .new_buffer(n_q_heads * g.head_dim * 4, SHARED)
+        .unwrap();
+    let partials = device
+        .new_buffer(n_q_heads * n_chunks * g.head_dim * 4, SHARED)
+        .unwrap();
+    let sums = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
+    let maxs = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
+    let table_buf = new_u32(device, &g.table);
+    let walk = new_u32(device, &vec![u32::MAX; n_q_heads * n_chunks]);
+
+    let q_shape = [g.n_seqs, g.heads_per_seq, 1, g.head_dim];
+    let k_shape = [g.n_seqs, g.n_kv_heads, g.n_keys, g.head_dim];
+    let pp = write_struct(
+        device,
+        FlashPartialParams::for_step(
+            &q_shape,
+            &k_shape,
+            &g.k_stride,
+            &g.k_stride,
+            g.page_size,
+            g.pages_per_chunk,
+            n_chunks,
+            n_chunks,
+            g.table_stride,
+            scale,
+            1.0,
+        )
+        .unwrap(),
+    );
+    let cp = write_struct(device, FlashCombineParams::for_step(n_chunks, n_chunks));
+
+    {
+        let guard = cmds.command_encoder().unwrap();
+        call_flash_decoding(
+            device,
+            &guard,
+            kernels,
+            0,
+            &q_buf,
+            0,
+            &k_buf,
+            0,
+            &v_buf,
+            &out,
+            &partials,
+            &sums,
+            &maxs,
+            &table_buf,
+            &pp,
+            &cp,
+            &walk,
+            n_q_heads,
+            g.head_dim,
+            n_chunks,
+            FlashDType::F32,
+        )
+        .unwrap();
+    }
+    cmds.wait_until_completed().unwrap();
+    let walk_p = walk.contents() as *const u32;
+    // SAFETY: shared storage sized for `n_q_heads * n_chunks` u32, waited.
+    let walk = unsafe { std::slice::from_raw_parts(walk_p, n_q_heads * n_chunks) }.to_vec();
+    FlashRun {
+        out: read_f32(&out, n_q_heads * g.head_dim),
+        sums: read_f32(&sums, n_q_heads * n_chunks),
+        maxs: read_f32(&maxs, n_q_heads * n_chunks),
+        walk,
+    }
+}
+
+/// One scatter of `src` into a copy of `dst_initial`, returning the pool.
+#[allow(clippy::too_many_arguments)]
+fn run_scatter(
+    device: &Device,
+    kernels: &Kernels,
+    src: &[f32],
+    dst_initial: &[f32],
+    slots: &[u32],
+    params: FlashScatterParams,
+    n_kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let cmds = commands(device);
+    let src_buf = new_f32(device, src);
+    let dst_buf = new_f32(device, dst_initial);
+    let slots_buf = new_u32(device, slots);
+    let pp = write_struct(device, params);
+    {
+        let guard = cmds.command_encoder().unwrap();
+        call_flash_kv_scatter(
+            device,
+            &guard,
+            kernels,
+            0,
+            &src_buf,
+            0,
+            &dst_buf,
+            &slots_buf,
+            &pp,
+            params.n_rows as usize,
+            n_kv_heads,
+            head_dim,
+            FlashDType::F32,
+        )
+        .unwrap();
+    }
+    cmds.wait_until_completed().unwrap();
+    read_f32(&dst_buf, dst_initial.len())
 }
 
 /// As [`run_flash`], returning `(partials, maxs)` so a test can assert on where
@@ -943,7 +1601,8 @@ fn run_partials(
         // `n_chunks` twice: the live count and the capacity, which is
         // `Sizing::Grow` and is what this fixture takes (#234).
         FlashPartialParams::for_step(
-            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, n_chunks, scale, 1.0,
+            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, n_chunks, 0, scale,
+            1.0,
         )
         .unwrap(),
     );
@@ -1135,7 +1794,8 @@ fn token_stride_is_read_from_the_parameter() {
         // `n_chunks` twice: the live count and the capacity, which is
         // `Sizing::Grow` and is what this fixture takes (#234).
         FlashPartialParams::for_step(
-            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, n_chunks, scale, 1.0,
+            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, n_chunks, 0, scale,
+            1.0,
         )
         .unwrap(),
     );
@@ -1294,7 +1954,8 @@ fn walk_order_of(
         // `n_chunks` twice: the live count and the capacity, which is
         // `Sizing::Grow` and is what this fixture takes (#234).
         FlashPartialParams::for_step(
-            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, n_chunks, scale, 1.0,
+            &q_shape, &k_shape, &k_stride, &k_stride, page_size, 1, n_chunks, n_chunks, 0, scale,
+            1.0,
         )
         .unwrap(),
     );

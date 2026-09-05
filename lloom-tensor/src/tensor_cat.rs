@@ -301,4 +301,105 @@ impl Tensor {
 
         Ok(())
     }
+
+    /// Write this `[n_seqs, n_kv_heads, seq_len, head_dim]` tensor's rows into
+    /// `dst` at the token slots `slots` names, in place.
+    ///
+    /// `slots` is a `U32` tensor of `n_seqs * seq_len` entries: row `b * seq_len
+    /// + t` is the token slot of sequence `b`'s `t`-th token. `dst` is a
+    /// contiguous 4-D `[_, n_kv_heads, tokens, head_dim]` buffer reached as
+    /// `b * dst_seq_stride + h * head_stride + slot * token_stride + d`, where
+    /// `dst_seq_stride` is 0 for a page pool shared by every sequence
+    /// (`DESIGN.md` §10.3c) and a batch stride for a `[B, H_kv, capacity, D]`
+    /// cache. `slice_set` with a per-token destination — the KV append a page
+    /// table needs, which a single `narrow` cannot express (§10.3e).
+    ///
+    /// `max_slot` is the largest entry of `slots`, from the host copy the
+    /// caller built it from. It is taken as an argument rather than read back
+    /// because reading a device tensor waits for every in-flight command
+    /// buffer — measured at **+6 ms per token** on a path that costs 32 — and
+    /// the slots are always computed on the host first. The bound is checked
+    /// against the destination here, so a pool sized for fewer tokens than the
+    /// slots name is an error rather than the silent overrun §3.5 describes.
+    pub fn kv_scatter_into(
+        &self,
+        dst: &Self,
+        slots: &Self,
+        max_slot: usize,
+        dst_seq_stride: usize,
+        dst_head_stride: usize,
+        dst_token_stride: usize,
+    ) -> Result<()> {
+        let (n_seqs, n_kv_heads, seq_len, head_dim) = self.dims4()?;
+        if !self.is_contiguous() || !dst.is_contiguous() || !slots.is_contiguous() {
+            Err(Error::RequiresContiguous { op: "kv-scatter" }.bt())?
+        }
+        if self.same_storage(dst) {
+            crate::bail!("cannot use kv_scatter_into when self and dst share their storage")
+        }
+        if self.dtype() != dst.dtype() {
+            Err(Error::DTypeMismatchBinaryOp {
+                lhs: self.dtype(),
+                rhs: dst.dtype(),
+                op: "kv-scatter",
+            }
+            .bt())?
+        }
+        if slots.dtype() != crate::DType::U32 {
+            crate::bail!("kv_scatter_into needs U32 slots, got {:?}", slots.dtype())
+        }
+        if slots.elem_count() != n_seqs * seq_len {
+            crate::bail!(
+                "kv_scatter_into: {} slots for {n_seqs} x {seq_len} rows",
+                slots.elem_count()
+            )
+        }
+        let dst_dims = dst.dims4()?;
+        if dst_dims.1 != n_kv_heads || dst_dims.3 != head_dim {
+            crate::bail!(
+                "kv_scatter_into: source [{n_seqs}, {n_kv_heads}, {seq_len}, {head_dim}] does \
+                 not match destination {:?} on heads or head_dim",
+                dst.dims()
+            )
+        }
+        // Every slot must land inside the destination: the write is a kernel
+        // under HazardTrackingModeUntracked and an overrun is silent (§3.5).
+        let tokens = dst_dims.2;
+        let seqs_reach = if n_seqs > 1 {
+            (n_seqs - 1) * dst_seq_stride
+        } else {
+            0
+        };
+        let last = seqs_reach
+            + (n_kv_heads - 1) * dst_head_stride
+            + max_slot * dst_token_stride
+            + head_dim;
+        if max_slot >= tokens || last > dst.elem_count() {
+            crate::bail!(
+                "kv_scatter_into: slot {max_slot} reaches element {last} of a {}-element \
+                 destination with {tokens} tokens",
+                dst.elem_count()
+            )
+        }
+        let geometry = crate::KvScatterGeometry {
+            n_seqs,
+            n_kv_heads,
+            seq_len,
+            head_dim,
+            src_stride: [
+                self.stride()[0],
+                self.stride()[1],
+                self.stride()[2],
+                self.stride()[3],
+            ],
+            src_offset: self.layout().start_offset(),
+            dst_seq_stride,
+            dst_head_stride,
+            dst_token_stride,
+            dst_offset: dst.layout().start_offset(),
+            slots_offset: slots.layout().start_offset(),
+        };
+        self.storage()
+            .kv_scatter(&mut dst.storage_mut(), &slots.storage(), &geometry)
+    }
 }

@@ -15,9 +15,13 @@ use lloom_macros::Config as ConfigDerive;
 // The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its
 // axis field are metal-gated exactly as its former crate dependency was.
 #[cfg(feature = "metal")]
+use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageQuarantine};
+#[cfg(feature = "metal")]
 use lloom_tensor::kernels::SiluImpl;
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor};
 use std::collections::{BTreeMap, HashMap};
+#[cfg(feature = "metal")]
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -476,6 +480,16 @@ pub enum KvAppend {
     /// §11.1a.1 actually wants — the buffer identity stops changing, because
     /// `narrow` shares storage and only rewrites the layout.
     InPlace,
+    /// One page pool per attention layer, shared by every sequence, addressed
+    /// through per-sequence page tables (`DESIGN.md` §10.3c–§10.3h).
+    ///
+    /// The write is `Tensor::kv_scatter_into` at the slots the table names and
+    /// the decode read is FlashDecoding over the pool through the table, so
+    /// this arm requires `AttnImpl::FlashDecoding` and refuses anything else.
+    /// A fresh pool hands out pages in order and is byte-identical to `InPlace`
+    /// in what it stores; a recycled one is not, which is the arm §10.3h's
+    /// hazard needs and a contiguous cache cannot produce.
+    Paged,
 }
 
 impl KvAppend {
@@ -485,8 +499,9 @@ impl KvAppend {
         match s {
             "cat" => Ok(KvAppend::Cat),
             "in-place" => Ok(KvAppend::InPlace),
+            "paged" => Ok(KvAppend::Paged),
             other => Err(format!(
-                "--kv-append must be `cat` or `in-place`, got `{other}`"
+                "--kv-append must be `cat`, `in-place` or `paged`, got `{other}`"
             )),
         }
     }
@@ -711,7 +726,7 @@ pub struct Config {
     #[axis(
         name = "KvAppend",
         flag = "kv-append",
-        variants = ["Cat", "InPlace"],
+        variants = ["Cat", "InPlace", "Paged"],
         default = "Cat",
         parser = "KvAppend::parse"
     )]
@@ -1236,6 +1251,277 @@ impl crate::nn::kv_cache::seam::KvCache for (KvSlot, KvSlot) {
     }
 }
 
+/// The `KvAppend::Paged` arm's storage (`DESIGN.md` §10.3c–§10.3h, #148).
+///
+/// One `KvPagePool` holds every sequence's page table — the tables are shared
+/// by all attention layers because every layer appends the same positions in
+/// the same pass — and each attention layer owns a (K, V) pool of
+/// `[1, n_kv_heads, pool_pages * page_size, head_dim]`. A page's tokens are a
+/// contiguous run inside a head, so a fresh pool stores exactly what the
+/// contiguous cache stores, byte for byte, and the FlashDecoding kernel reads
+/// it through the table with a sequence stride of 0.
+///
+/// Pages are allocated once per `page_size` tokens per sequence, at the first
+/// attention layer of a pass; the slot each token of the pass writes to is
+/// computed then, once, and reused by every layer. A released sequence's pages
+/// go to the `PageQuarantine` against the current GPU epoch and return to the
+/// free list only after that epoch completes (§10.3h's one non-fence
+/// obligation, §6.7 L4).
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+struct PagedKv {
+    page_size: usize,
+    pages_per_chunk: usize,
+    kv_capacity: usize,
+    /// Pool size in pages when set; otherwise `n_seqs * ceil(kv_capacity /
+    /// page_size)`, the reserve the contiguous cache holds.
+    pool_pages_override: Option<usize>,
+    /// Pages allocated and recycled before any sequence exists, so the
+    /// sequences' tables are not the identity — the fixture §10.3h needs at
+    /// the model level, reached through an ordinary allocation history.
+    churn_pages: usize,
+    pool: Option<KvPagePool>,
+    quarantine: PageQuarantine,
+    clock: Arc<GpuClock>,
+    /// Per layer, allocated on the layer's first write.
+    pools: Vec<Option<(Tensor, Tensor)>>,
+    n_seqs: usize,
+    /// Live tokens per sequence. Every sequence has the same length: the batch
+    /// runs in lockstep (#249's scope).
+    len: usize,
+    /// Tokens this pass appends.
+    pass_len: usize,
+    /// `[n_seqs * pass_len]` U32: the token slot of each `(sequence, token)`
+    /// this pass writes, and the largest of them (checked against the pool by
+    /// the scatter without a readback).
+    slots: Option<Tensor>,
+    max_slot: usize,
+    /// Every sequence's chunk table, `table_stride` entries each.
+    table: Vec<u32>,
+    table_stride: usize,
+}
+
+#[cfg(feature = "metal")]
+impl PagedKv {
+    fn new(
+        config: &Config,
+        kv_capacity: usize,
+        num_layers: usize,
+        clock: Arc<GpuClock>,
+    ) -> Result<Self> {
+        let env_usize = |name: &str| -> Result<Option<usize>> {
+            match std::env::var(name) {
+                Ok(v) => v.parse::<usize>().map(Some).map_err(|e| {
+                    lloom_tensor::Error::msg(format!("{name}={v:?} is not a page count: {e}"))
+                }),
+                Err(_) => Ok(None),
+            }
+        };
+        Ok(Self {
+            page_size: config.flash_page_size.max(1),
+            pages_per_chunk: config.flash_pages_per_chunk.max(1),
+            kv_capacity,
+            pool_pages_override: env_usize("LLOOM_148_POOL_PAGES")?,
+            churn_pages: env_usize("LLOOM_148_POOL_CHURN")?.unwrap_or(0),
+            pool: None,
+            quarantine: PageQuarantine::new(),
+            clock,
+            pools: vec![None; num_layers],
+            n_seqs: 0,
+            len: 0,
+            pass_len: 0,
+            slots: None,
+            max_slot: 0,
+            table: Vec::new(),
+            table_stride: 0,
+        })
+    }
+
+    fn pages_per_seq(&self) -> usize {
+        self.kv_capacity.div_ceil(self.page_size)
+    }
+
+    fn pool_pages(&self) -> usize {
+        self.pool_pages_override
+            .unwrap_or(self.n_seqs.max(1) * self.pages_per_seq())
+    }
+
+    /// Allocate this pass's pages for every sequence and compute the slots its
+    /// tokens write to. Runs once per forward pass, at the first attention
+    /// layer, because that is the first point the batch size is known.
+    fn begin_pass(&mut self, n_seqs: usize, seq_len: usize, device: &Device) -> Result<()> {
+        if self.pool.is_none() {
+            self.n_seqs = n_seqs;
+            let pool_pages = self.pool_pages();
+            // One extra table for the churn sequence, which allocates and
+            // leaves before any real sequence exists; a table one entry longer
+            // than the pool, so running out is reported as the pool's
+            // exhaustion (which names the knob) and never as a full table.
+            let mut pool = KvPagePool::new(self.page_size, pool_pages, n_seqs + 1, pool_pages + 1);
+            if self.churn_pages > 0 {
+                // No command buffer has read these pages, so recycling them
+                // without an epoch is safe here and only here.
+                pool.append(n_seqs, self.churn_pages * self.page_size)
+                    .map_err(lloom_tensor::Error::wrap)?;
+                let freed = pool.release(n_seqs);
+                pool.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
+            }
+            self.pool = Some(pool);
+        } else if n_seqs != self.n_seqs {
+            lloom_tensor::bail!(
+                "lfm2 paged KV: the batch changed from {} to {n_seqs} sequences mid-cache; \
+                 clear the cache first",
+                self.n_seqs
+            )
+        }
+        // Pages whose last reader has completed come back first, so a long
+        // session recycles rather than exhausts.
+        let ready = self
+            .quarantine
+            .drain_completed(self.clock.completed_count());
+        let (pool_pages, page_size) = (self.pool_pages(), self.page_size);
+        let pool = self.pool.as_mut().expect("created above");
+        pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
+
+        let start = self.len;
+        let mut slots = Vec::with_capacity(n_seqs * seq_len);
+        for s in 0..n_seqs {
+            pool.append(s, seq_len).map_err(|e| {
+                lloom_tensor::Error::msg(format!(
+                    "lfm2 paged KV, sequence {s}: {e}. The pool holds {pool_pages} pages of \
+                     {page_size} tokens (LLOOM_148_POOL_PAGES sets it; the default is B x \
+                     ceil(kv_capacity / page_size))"
+                ))
+            })?;
+            let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
+            for t in start..start + seq_len {
+                slots.push(
+                    (pages[t / self.page_size] * self.page_size as u32)
+                        + (t % self.page_size) as u32,
+                );
+            }
+        }
+        self.len = start + seq_len;
+        self.pass_len = seq_len;
+        self.max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
+        self.slots = Some(Tensor::new(slots.as_slice(), device)?);
+
+        // The chunk tables the reader is handed, one per sequence, all the
+        // same length because the batch is lockstep.
+        let n_chunks = self.len.div_ceil(self.page_size * self.pages_per_chunk);
+        self.table_stride = n_chunks;
+        self.table.clear();
+        for s in 0..n_seqs {
+            if !pool.chunk_pages_are_contiguous(s, self.pages_per_chunk) {
+                lloom_tensor::bail!(
+                    "lfm2 paged KV: sequence {s}'s pages do not form contiguous chunks at \
+                     pages_per_chunk={}; a recycled pool needs `--flash-k 1` (DESIGN.md 10.3d)",
+                    self.pages_per_chunk
+                )
+            }
+            let t = pool.table_for(s, self.pages_per_chunk);
+            debug_assert_eq!(t.len(), n_chunks);
+            self.table.extend_from_slice(&t);
+        }
+        Ok(())
+    }
+
+    /// Write this pass's K and V for one layer at the pass's slots.
+    fn write_layer(&mut self, block_idx: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+        let (b, n_kv_heads, seq_len, head_dim) = k.dims4()?;
+        if b != self.n_seqs || seq_len != self.pass_len {
+            lloom_tensor::bail!(
+                "lfm2 paged KV: layer {block_idx} writes [{b}, {n_kv_heads}, {seq_len}, \
+                 {head_dim}] against a pass of {} sequences x {} tokens",
+                self.n_seqs,
+                self.pass_len
+            )
+        }
+        let tokens = self.pool_pages() * self.page_size;
+        if self.pools[block_idx].is_none() {
+            let shape = (1, n_kv_heads, tokens, head_dim);
+            self.pools[block_idx] = Some((
+                Tensor::zeros(shape, k.dtype(), k.device())?,
+                Tensor::zeros(shape, v.dtype(), v.device())?,
+            ));
+        }
+        let slots = self
+            .slots
+            .as_ref()
+            .expect("begin_pass ran before the first layer");
+        let (pk, pv) = self.pools[block_idx].as_ref().expect("allocated above");
+        k.kv_scatter_into(pk, slots, self.max_slot, 0, tokens * head_dim, head_dim)?;
+        v.kv_scatter_into(pv, slots, self.max_slot, 0, tokens * head_dim, head_dim)?;
+        Ok(())
+    }
+
+    /// The first `n_prev` tokens of every sequence, gathered from the pool into
+    /// a `[n_seqs, n_kv_heads, n_prev, head_dim]` tensor. Prefill only.
+    fn gather_layer(
+        &self,
+        block_idx: usize,
+        n_seqs: usize,
+        n_prev: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let pool = self.pool.as_ref().expect("a pass has begun");
+        let (pk, pv) = self.pools[block_idx]
+            .as_ref()
+            .expect("the layer has a pool");
+        let mut ks = Vec::with_capacity(n_seqs);
+        let mut vs = Vec::with_capacity(n_seqs);
+        for s in 0..n_seqs {
+            let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
+            let ids: Vec<u32> = (0..n_prev)
+                .map(|t| {
+                    pages[t / self.page_size] * self.page_size as u32 + (t % self.page_size) as u32
+                })
+                .collect();
+            let ids = Tensor::new(ids.as_slice(), device)?;
+            ks.push(pk.index_select(&ids, 2)?);
+            vs.push(pv.index_select(&ids, 2)?);
+        }
+        Ok((Tensor::cat(&ks, 0)?, Tensor::cat(&vs, 0)?))
+    }
+
+    /// Drop every sequence, quarantining its pages against the epoch a
+    /// command buffer encoded now belongs to.
+    fn release_all(&mut self) {
+        if let Some(pool) = self.pool.as_mut() {
+            let mut freed = Vec::new();
+            for s in 0..self.n_seqs {
+                freed.extend(pool.release(s));
+            }
+            self.quarantine
+                .quarantine(self.clock.current_epoch(), freed);
+        }
+        self.len = 0;
+        self.pass_len = 0;
+        self.slots = None;
+        self.max_slot = 0;
+        self.table.clear();
+        self.table_stride = 0;
+    }
+
+    /// Discard the last `n` positions of every sequence: a length decrement,
+    /// the pages stay (§10.2a).
+    fn rewind(&mut self, n: usize) -> Result<()> {
+        if n > self.len {
+            lloom_tensor::bail!(
+                "lfm2 paged KV rewind past the start: {n} > len {}",
+                self.len
+            )
+        }
+        if let Some(pool) = self.pool.as_mut() {
+            for s in 0..self.n_seqs {
+                pool.rewind(s, n).map_err(lloom_tensor::Error::wrap)?;
+            }
+        }
+        self.len -= n;
+        Ok(())
+    }
+}
+
 /// Cache for LFM2 model supporting both attention KV cache and convolution state cache.
 #[derive(Debug, Clone)]
 pub struct Cache {
@@ -1253,6 +1539,13 @@ pub struct Cache {
     /// compiled and the unselected one allocates nothing -- `kv_slots`' own
     /// argument, one axis further out.
     quant_slots: Vec<(QuantKvSlot, QuantKvSlot)>,
+    /// The `KvAppend::Paged` arm's storage: the page tables, the epoch
+    /// quarantine and one (K, V) pool per attention layer.
+    #[cfg(feature = "metal")]
+    paged: Option<PagedKv>,
+    /// Set once per forward pass so the first attention layer of the pass
+    /// allocates this pass's pages and slots for every layer.
+    paged_pass_pending: bool,
     kv_append: KvAppend,
     kv_quant: KvQuant,
     /// The largest `kv_len` this cache admits, in tokens.
@@ -1503,6 +1796,32 @@ impl Cache {
         let sin = idx_theta.sin()?.to_dtype(dtype)?;
 
         let num_layers = config.num_hidden_layers;
+        if config.kv_append == KvAppend::Paged {
+            if config.attn_impl != AttnImpl::FlashDecoding {
+                lloom_tensor::bail!(
+                    "lfm2 `KvAppend::Paged` reads the pool through the chunk table, which only \
+                     the FlashDecoding kernels take: use `--attn flash` (DESIGN.md 10.3b)"
+                )
+            }
+            if config.kv_quant.is_on() {
+                lloom_tensor::bail!("lfm2 `KvAppend::Paged` has no quantized arm")
+            }
+            if !device.is_metal() {
+                lloom_tensor::bail!(
+                    "lfm2 `KvAppend::Paged` is Metal-only: the pool is read by a Metal kernel"
+                )
+            }
+        }
+        #[cfg(feature = "metal")]
+        let paged = if config.kv_append == KvAppend::Paged && use_kv_cache {
+            let clock = match device {
+                Device::Metal(d) => d.gpu_clock(),
+                _ => lloom_tensor::bail!("lfm2 `KvAppend::Paged` is Metal-only"),
+            };
+            Some(PagedKv::new(config, kv_capacity, num_layers, clock)?)
+        } else {
+            None
+        };
         Ok(Self {
             masks: HashMap::new(),
             use_kv_cache,
@@ -1518,6 +1837,9 @@ impl Cache {
                     )
                 })
                 .collect(),
+            #[cfg(feature = "metal")]
+            paged,
+            paged_pass_pending: false,
             kv_append: config.kv_append,
             kv_quant: config.kv_quant,
             kv_capacity,
@@ -1770,11 +2092,29 @@ impl Cache {
             k.reset();
             v.reset();
         });
+        #[cfg(feature = "metal")]
+        if let Some(p) = &mut self.paged {
+            p.release_all();
+        }
+        self.paged_pass_pending = false;
         self.conv_states.iter_mut().for_each(|v| *v = None);
         self.conv_phase = 0;
         self.conv_phase_prev = 0;
         self.conv_history = 0;
         self.conv_compact = false;
+    }
+
+    /// The page pool's live tokens, pages in use and pages held in quarantine,
+    /// on the `Paged` arm. `None` on the other arms.
+    #[cfg(feature = "metal")]
+    pub fn paged_stats(&self) -> Option<(usize, usize, usize)> {
+        self.paged.as_ref().map(|p| {
+            (
+                p.len,
+                p.pool.as_ref().map(|pool| pool.pages_in_use()).unwrap_or(0),
+                p.quarantine.held(),
+            )
+        })
     }
 
     /// How many positions [`Cache::rewind`] can currently discard.
@@ -1845,6 +2185,10 @@ impl Cache {
             }
             k_slot.rewind(n)?;
             v_slot.rewind(n)?;
+        }
+        #[cfg(feature = "metal")]
+        if let Some(p) = &mut self.paged {
+            p.rewind(n)?;
         }
         let width = self.conv_state.width(self.l_cache);
         self.conv_phase = (self.conv_phase + width - n) % width;
@@ -2026,6 +2370,10 @@ impl Cache {
             }
             k_slot.rewind(discard)?;
             v_slot.rewind(discard)?;
+        }
+        #[cfg(feature = "metal")]
+        if let Some(p) = &mut self.paged {
+            p.rewind(discard)?;
         }
 
         // Conv: a pointer move, and this is the line §10.2a's cost column means
@@ -2581,8 +2929,63 @@ impl Attention {
                     let v = v_slot.append(&v)?;
                     (k, v)
                 }
+                KvAppend::Paged => {
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        let _ = block_idx;
+                        lloom_tensor::bail!("lfm2 `KvAppend::Paged` is Metal-only")
+                    }
+                    #[cfg(feature = "metal")]
+                    {
+                        let k = k.contiguous()?;
+                        let v = v.contiguous()?;
+                        let device = cache.device.clone();
+                        let pending = std::mem::take(&mut cache.paged_pass_pending);
+                        let Some(paged) = cache.paged.as_mut() else {
+                            lloom_tensor::bail!("lfm2 `KvAppend::Paged` with no page pool")
+                        };
+                        if pending {
+                            paged.begin_pass(b_sz, seq_len, &device)?;
+                        }
+                        let n_prev = paged.len - paged.pass_len;
+                        // The write: this pass's tokens to the slots the table
+                        // names, one dispatch for K and one for V.
+                        paged.write_layer(block_idx, &k, &v)?;
+                        if seq_len == 1 {
+                            // Decode reads the pool through the table below;
+                            // the tensors handed on are the pool itself.
+                            let (pk, pv) = paged.pools[block_idx]
+                                .as_ref()
+                                .expect("write_layer allocates the layer's pool");
+                            (pk.clone(), pv.clone())
+                        } else if n_prev == 0 {
+                            // A first prefill attends over its own tokens.
+                            (k, v)
+                        } else {
+                            // A turn-boundary prefill (§10.9) attends over the
+                            // accumulated cache: gathered from the pool by
+                            // physical slot, then this pass's tokens. O(kv_len)
+                            // per prefill and never on the decode path.
+                            let (prev_k, prev_v) =
+                                paged.gather_layer(block_idx, b_sz, n_prev, &device)?;
+                            let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
+                            let v = Tensor::cat(&[&prev_v, &v], 2)?.contiguous()?;
+                            (k, v)
+                        }
+                    }
+                }
             }
         };
+
+        // The paged decode read. `KvAppend::Paged` requires
+        // `AttnImpl::FlashDecoding` at construction, so this is the only decode
+        // path the arm has; a dtype the kernels do not instantiate is an error
+        // here rather than a silent fallback to a kernel that cannot read a
+        // pool (§2.4).
+        #[cfg(feature = "metal")]
+        let paged_decode = cache.use_kv_cache && cache.kv_append == KvAppend::Paged && seq_len == 1;
+        #[cfg(not(feature = "metal"))]
+        let paged_decode = false;
 
         // The fused kernel is GQA-native — it derives `gqa_factor` from the head
         // counts and indexes `kv_head_idx = head_idx / gqa_factor` in registers
@@ -2590,7 +2993,38 @@ impl Attention {
         // the F32 upcast below are not merely unnecessary, they are the two
         // things being removed (`DESIGN.md` §6.2, §8.1 principle 4). Both
         // therefore have to stay *inside* the arm that needs them.
-        let y = if self.flash_decoding_applies(&q, seq_len) {
+        let y = if paged_decode {
+            #[cfg(not(feature = "metal"))]
+            unreachable!();
+            #[cfg(feature = "metal")]
+            {
+                if !matches!(q.dtype(), DType::F16 | DType::F32) {
+                    lloom_tensor::bail!(
+                        "lfm2 `KvAppend::Paged` decode at {:?}: flash_decoding.metal instantiates \
+                         f16 and f32 only",
+                        q.dtype()
+                    )
+                }
+                let paged = cache.paged.as_ref().expect("checked above");
+                let reserve_chunks = cache
+                    .kv_capacity
+                    .div_ceil((self.flash_page_size * self.flash_pages_per_chunk).max(1));
+                crate::nn::ops::flash_decoding_paged(
+                    &q,
+                    &k,
+                    &v,
+                    1f32 / (self.head_dim as f32).sqrt(),
+                    1.0,
+                    self.flash_page_size,
+                    self.flash_pages_per_chunk,
+                    self.flash_scratch_sizing,
+                    reserve_chunks,
+                    paged.table.clone(),
+                    paged.table_stride,
+                    paged.len,
+                )?
+            }
+        } else if self.flash_decoding_applies(&q, seq_len) {
             // Chunked attention over the contiguous cache. `page_size` is the
             // ALLOCATION granularity and `pages_per_chunk` the `k` of
             // `chunk_size = k * page_size` (§9.1d); both come from the config
@@ -3975,6 +4409,9 @@ impl Model {
     /// place: two owners of one decision is a shape that cannot be right, and it
     /// has already been wrong here once.
     fn advance_conv_phase(&self, seq_len: usize, cache: &mut Cache) {
+        // The page pool allocates this pass's pages at the first attention
+        // layer; this is the once-per-pass point that says a new pass began.
+        cache.paged_pass_pending = true;
         cache.conv_phase_prev = cache.conv_phase;
         if let ConvState::RotatingRing { k } = self.conv_state {
             let width = self.conv_state.width(self.l_cache);

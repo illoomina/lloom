@@ -3660,3 +3660,75 @@ mod issue_535_peek_is_not_blocking {
         }
     }
 }
+
+impl MetalStorage {
+    /// The Metal arm of `Tensor::kv_scatter_into`: one `flash_kv_scatter`
+    /// dispatch for every `(sequence, token)` row (`DESIGN.md` §10.3e).
+    pub(crate) fn kv_scatter(
+        &self,
+        dst: &mut Self,
+        slots: &Self,
+        g: &crate::KvScatterGeometry,
+    ) -> Result<()> {
+        use crate::kernels::{FlashDType, FlashScatterParams};
+        if self.dtype() != dst.dtype() {
+            crate::bail!(
+                "kv_scatter with inconsistent dtypes {:?} {:?}",
+                self.dtype(),
+                dst.dtype()
+            )
+        }
+        let itype = match self.dtype {
+            DType::F16 => FlashDType::F16,
+            DType::F32 => FlashDType::F32,
+            other => crate::bail!("Metal kv_scatter {other:?} not implemented"),
+        };
+        if slots.dtype != DType::U32 {
+            crate::bail!("Metal kv_scatter needs U32 slots, got {:?}", slots.dtype)
+        }
+        let n_rows = g.n_seqs * g.seq_len;
+        if n_rows == 0 || g.n_kv_heads == 0 || g.head_dim == 0 {
+            return Ok(());
+        }
+        let params = FlashScatterParams::for_write(
+            g.n_seqs,
+            g.n_kv_heads,
+            g.seq_len,
+            g.head_dim,
+            &g.src_stride,
+            g.dst_seq_stride,
+            g.dst_head_stride,
+            g.dst_token_stride,
+        );
+        let params_buf = self
+            .device
+            .new_buffer_with_data(std::slice::from_ref(&params))?;
+        // The slots are read at their layout offset; `Buffer` bindings carry an
+        // offset for the source and destination but the slot buffer is bound
+        // whole, so a non-zero start offset is refused rather than mis-read.
+        if g.slots_offset != 0 {
+            crate::bail!(
+                "Metal kv_scatter needs slots at offset 0, got {}",
+                g.slots_offset
+            )
+        }
+        let encoder = self.device.command_encoder()?;
+        crate::kernels::call_flash_kv_scatter(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            g.src_offset * self.dtype.size_in_bytes(),
+            &self.buffer,
+            g.dst_offset * dst.dtype.size_in_bytes(),
+            &dst.buffer,
+            &slots.buffer,
+            &params_buf,
+            n_rows,
+            g.n_kv_heads,
+            g.head_dim,
+            itype,
+        )
+        .map_err(MetalError::from)?;
+        Ok(())
+    }
+}

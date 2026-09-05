@@ -110,7 +110,7 @@ pub use indexer::{IndexOp, TensorIndexer};
 pub use layout::Layout;
 pub use nditer::NdIter;
 pub use shape::{Shape, D};
-pub use storage::Storage;
+pub use storage::{KvScatterGeometry, Storage};
 pub use streaming::{StreamTensor, StreamingBinOp, StreamingModule};
 pub use strided_index::{StridedBlocks, StridedIndex};
 pub use tensor::{Tensor, TensorId};

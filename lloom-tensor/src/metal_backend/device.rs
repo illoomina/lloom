@@ -712,6 +712,16 @@ impl MetalDevice {
         self.commands.completion_already_complete()
     }
 
+    /// The clock the buffer pools decide reuse against (`DESIGN.md` §6.3b).
+    ///
+    /// A page-pool caller quarantines released KV pages against
+    /// `current_epoch()` and recycles them once `completed_count()` has passed
+    /// it — the same two numbers the pools use, so a page cannot be handed to
+    /// a second sequence while a command buffer still reads it (§10.3h).
+    pub fn gpu_clock(&self) -> Arc<crate::kernels::metal::GpuClock> {
+        self.commands.clock()
+    }
+
     pub fn kernels(&self) -> &Kernels {
         &self.kernels
     }

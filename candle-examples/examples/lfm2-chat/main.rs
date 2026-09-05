@@ -50,12 +50,14 @@ struct Args {
     max_tokens: usize,
 
     /// Sampling temperature. 0 (the default) is greedy / argmax.
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, short = 't', default_value_t = 0.0)]
     temperature: f64,
 
-    /// Sampling seed (only matters when temperature > 0).
-    #[arg(long, default_value_t = 299792458)]
-    seed: u64,
+    /// Sampling seed (only matters when temperature > 0). If unset, a RANDOM
+    /// seed is drawn each run, so repeated `-t > 0` runs explore different
+    /// samples; pass an explicit value to reproduce a specific run.
+    #[arg(long)]
+    seed: Option<u64>,
 
     /// Force CPU even if a GPU is available.
     #[arg(long)]
@@ -526,7 +528,11 @@ fn main() -> Result<()> {
             temperature: args.temperature,
         }
     };
-    let mut logits_processor = LogitsProcessor::from_sampling(args.seed, sampling);
+    // Random seed when unspecified, so repeated `-t > 0` runs differ; a passed
+    // `--seed` reproduces. At temp 0 (greedy/argmax) the seed is irrelevant —
+    // the path is deterministic and does not sample.
+    let seed = args.seed.unwrap_or_else(rand::random::<u64>);
+    let mut logits_processor = LogitsProcessor::from_sampling(seed, sampling);
 
     // ---- prompt: read stdin, wrap in the LFM2 chat template ---------------
     let mut prompt = String::new();

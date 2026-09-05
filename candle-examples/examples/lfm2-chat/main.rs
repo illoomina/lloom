@@ -151,6 +151,14 @@ struct Args {
     /// one round's per-kernel census. Off for any throughput figure.
     #[arg(long)]
     phase_sync: bool,
+
+    /// Prepend the tokenizer's BOS (`<|startoftext|>`) to the templated prompt.
+    /// The checkpoint's chat template begins `{{- bos_token -}}` and llama.cpp
+    /// adds it; `tokenizers::encode(…, false)` does not, so without this flag
+    /// the model runs off its own template. Off by default: it moves every
+    /// digest, and the default flip is its own argued decision (§7.1a).
+    #[arg(long)]
+    bos: bool,
 }
 
 /// The LFM2.5-2.6B snapshot dir in the HF cache, if it is there.
@@ -513,11 +521,17 @@ fn main() -> Result<()> {
         .context("reading prompt from stdin")?;
     let prompt = prompt.trim();
     let text = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
-    let prompt_ids = tokenizer
+    let mut prompt_ids = tokenizer
         .encode(text.as_str(), false)
         .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?
         .get_ids()
         .to_vec();
+    if args.bos {
+        let bos = tokenizer
+            .token_to_id("<|startoftext|>")
+            .context("tokenizer has no <|startoftext|>")?;
+        prompt_ids.insert(0, bos);
+    }
 
     // ---- decode: one Session::decode call --------------------------------
     //
@@ -716,7 +730,7 @@ fn main() -> Result<()> {
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \
-         {} on {:?}; cache={cache_arm} kv={kv_arm} \
+         {} on {:?}; cache={cache_arm} kv={kv_arm} bos={} \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={}]",
         b(format!("{end_to_end:.1}")),
@@ -729,6 +743,7 @@ fn main() -> Result<()> {
         b(format!("{ttft_ms:.1}")),
         if dtype == DType::F16 { "f16" } else { "f32" },
         device,
+        args.bos,
         if args.dspark { "dspark" } else { &args.readback },
         args.lookahead,
         budget.arm(),

@@ -301,6 +301,13 @@ pub trait Probes<P: TargetProbe>: CausalLM {
         anchors: &[Anchor],
         cache: &mut Self::Cache,
     ) -> Result<(Vec<Vec<u32>>, P::Output)>;
+
+    /// Drain the probe the last non-verify pass (the prefill) left in `cache`,
+    /// covering every position that pass ran. A drafter is keyed from the
+    /// prompt with this before round 0 — the prompt is the context a draft
+    /// copies from, and a drafter that never sees it draws from the generated
+    /// tokens alone (`design/docs/speculation.md` §10.2w).
+    fn take_probe(&self, cache: &mut Self::Cache) -> Result<P::Output>;
 }
 
 /// How [`Session::speculative_round`] brackets its phases.

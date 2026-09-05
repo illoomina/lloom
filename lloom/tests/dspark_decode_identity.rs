@@ -114,7 +114,10 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
         match cfg.layer_types[l] {
             LayerType::Conv => {
                 fill(&format!("{p}.conv.in_proj.weight"), vec![3 * h, h])?;
-                fill(&format!("{p}.conv.conv.weight"), vec![h, 1, cfg.conv_l_cache])?;
+                fill(
+                    &format!("{p}.conv.conv.weight"),
+                    vec![h, 1, cfg.conv_l_cache],
+                )?;
                 fill(&format!("{p}.conv.out_proj.weight"), vec![h, h])?;
             }
             LayerType::FullAttention => {
@@ -123,8 +126,14 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
                 fill(&format!("{p}.self_attn.k_proj.weight"), vec![kv, h])?;
                 fill(&format!("{p}.self_attn.v_proj.weight"), vec![kv, h])?;
                 fill(&format!("{p}.self_attn.out_proj.weight"), vec![h, h])?;
-                fill(&format!("{p}.self_attn.q_layernorm.weight"), vec![cfg.head_dim()])?;
-                fill(&format!("{p}.self_attn.k_layernorm.weight"), vec![cfg.head_dim()])?;
+                fill(
+                    &format!("{p}.self_attn.q_layernorm.weight"),
+                    vec![cfg.head_dim()],
+                )?;
+                fill(
+                    &format!("{p}.self_attn.k_layernorm.weight"),
+                    vec![cfg.head_dim()],
+                )?;
             }
         }
     }
@@ -180,6 +189,124 @@ impl Speculator for GarbageDrafter {
     }
 }
 
+/// A drafter that records what the loop hands it: every `observe` call's
+/// (rows per tap, accepted) and whether a `draft` had already run. It drafts
+/// garbage, so the identity still holds and the record is the whole test.
+struct RecordingDrafter {
+    k: usize,
+    drafts: usize,
+    observed: Vec<(usize, usize, Vec<u32>)>, // (drafts before this observe, rows, accepted)
+}
+
+impl Speculator for RecordingDrafter {
+    type Probe = LayerTaps<5>;
+
+    fn n_seq(&self) -> usize {
+        1
+    }
+
+    fn max_draft(&self) -> usize {
+        self.k
+    }
+
+    fn begin(&mut self, _seq: SeqId, _prompt: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        self.drafts += 1;
+        Ok(active
+            .iter()
+            .map(|_| Draft {
+                tokens: vec![0; self.k],
+                confidence: Vec::new(),
+            })
+            .collect())
+    }
+
+    fn observe(
+        &mut self,
+        _seq: SeqId,
+        probe: &<Self::Probe as TargetProbe>::Output,
+        accepted: &[u32],
+    ) -> Result<()> {
+        assert_eq!(probe.len(), 5, "LayerTaps<5> hands five tensors");
+        let rows = probe[0].dim(1)?;
+        for t in probe {
+            assert_eq!(t.dim(1)?, rows, "every tap covers the same positions");
+        }
+        self.observed.push((self.drafts, rows, accepted.to_vec()));
+        Ok(())
+    }
+}
+
+/// The drafter is keyed from the WHOLE prompt before it drafts anything: the
+/// first `observe` arrives before the first `draft`, carries one row per prompt
+/// token in every tap, and names the prefill's argmax as the accepted tail —
+/// `lfm2-dspark-verify`'s `--prefill-ctx all`. Every later `observe` carries
+/// exactly the accepted rows of its round. A lazily-seeded loop (round 0 drafts
+/// on an empty context) fails the first assertion; a loop trimming the prefill
+/// probe to the last position fails the second.
+#[test]
+fn decode_speculative_seeds_the_drafter_from_every_prompt_position() -> Result<()> {
+    let dev = Device::Cpu;
+    let k = 4usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7 + 1, 9];
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+
+    let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut session = Session::new(&model, cache);
+    let mut spec = RecordingDrafter {
+        k,
+        drafts: 0,
+        observed: Vec::new(),
+    };
+    let mut rb = Blocking::new(&eos_ids, &dev)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let opts = DecodeOptions::new(24);
+    let out = session.decode_speculative(
+        &mut spec,
+        &mut rb,
+        &mut sampler,
+        &prompt,
+        &opts,
+        &eos_ids,
+        &mut |_: &[u32]| Ok(()),
+    )?;
+    assert!(out.ids.len() > k, "the run must span more than one round");
+
+    let (drafts_before, rows, accepted) = spec.observed.first().expect("an observe ran");
+    assert_eq!(
+        *drafts_before, 0,
+        "the prompt seed precedes the first draft"
+    );
+    assert_eq!(
+        *rows,
+        prompt.len(),
+        "the seed carries every prompt position"
+    );
+    assert_eq!(
+        accepted,
+        &out.ids[..1],
+        "the seed's accepted tail is the prefill's argmax"
+    );
+    assert_eq!(
+        spec.observed.len(),
+        out.stats.rounds.len() + 1,
+        "one observe per round, plus the seed"
+    );
+    for ((_, rows, accepted), round) in spec.observed[1..].iter().zip(&out.stats.rounds) {
+        assert_eq!(
+            *rows, round.accepted,
+            "a round's probe is trimmed to its accepted rows"
+        );
+        assert_eq!(accepted.len(), round.accepted);
+    }
+    Ok(())
+}
+
 /// The token-identity gate: greedy `decode` and speculative `decode_speculative`
 /// produce byte-identical ids for the same prompt.
 #[test]
@@ -214,7 +341,10 @@ fn decode_speculative_is_byte_identical_to_greedy() -> Result<()> {
                 Ok(())
             },
         )?;
-        assert_eq!(out.ids, ids, "the callback stream must equal the returned ids");
+        assert_eq!(
+            out.ids, ids,
+            "the callback stream must equal the returned ids"
+        );
         (out.ids, out.eos)
     };
 
@@ -249,7 +379,10 @@ fn decode_speculative_is_byte_identical_to_greedy() -> Result<()> {
                 Ok(())
             },
         )?;
-        assert_eq!(out.ids, ids, "the callback stream must equal the returned ids");
+        assert_eq!(
+            out.ids, ids,
+            "the callback stream must equal the returned ids"
+        );
         (out.ids, out.eos)
     };
 
@@ -260,7 +393,10 @@ fn decode_speculative_is_byte_identical_to_greedy() -> Result<()> {
          a garbage drafter cannot change the output. A divergence here is a bug in the \
          accept / rollback / re-key logic of decode_speculative."
     );
-    assert_eq!(ref_eos, spec_eos, "the two arms must agree on whether EOS ended the run");
+    assert_eq!(
+        ref_eos, spec_eos,
+        "the two arms must agree on whether EOS ended the run"
+    );
 
     Ok(())
 }
@@ -289,10 +425,20 @@ fn decode_speculative_identity_across_block_sizes() -> Result<()> {
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let opts = DecodeOptions::new(max_tokens);
         session
-            .decode(&mut spec, &mut rb, &mut sampler, &prompt, &opts, &mut |_| Ok(()))?
+            .decode(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                &prompt,
+                &opts,
+                &mut |_| Ok(()),
+            )?
             .ids
     };
-    assert!(ref_ids.len() >= 9, "reference too short to exercise the K sweep");
+    assert!(
+        ref_ids.len() >= 9,
+        "reference too short to exercise the K sweep"
+    );
 
     for k in [1usize, 2, 3, 5, 8] {
         let cfg = tiny_config(k);

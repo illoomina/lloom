@@ -287,46 +287,12 @@ fn select_tile_config(
         return tile;
     }
 
-    // Special case: For very small M (vector-matrix multiply),
-    // use the original 32x32 tile to avoid thread waste.
-    // When M is very small (< bm), using larger bm values causes significant
-    // thread underutilization because most threads in the M dimension have no work.
-    // This is critical for benchmarks like [1, 2048] @ [2048, 2048] (m=1).
-    //
-    // We use m < 16 as the threshold because:
-    // - For m=1 to m=15, even 32x32 tile has some waste but it's the smallest available
-    // - For m >= 16, the larger tiles can provide better throughput despite some waste
-    //
-    // # The threshold is a measurement arm as of issue #364
-    //
-    // `LLOOM_364_SKINNY_MAX` raises it, so the 32x32 tile is kept past 16 rather
-    // than yielding to `TILE_64_32_32_2_2`. **Off by default** (`DESIGN.md`
-    // §7.1a: no default is flipped without its own argued decision), so an
-    // unconfigured process selects byte-for-byte what shipped.
-    //
-    // It exists because the comment above is a *prediction* — *"the larger
-    // tiles can provide better throughput"* — and measured at one token's
-    // resolution it fails: crossing `m = 15 -> 16` costs **+17.9 % GPU busy for
-    // +6.7 % of work**, RESOLVED against a null, while the same one-token step
-    // inside either tile regime is unresolved. The larger tile is the expensive
-    // one at its own boundary.
-    //
-    // Read once (`OnceLock`), so this is not a per-dispatch `getenv` on a path
-    // §15.2 #10 forbids O(N) work on.
-    //
-    // # The tile below the threshold is 16×32, not 32×32 (issue #675)
-    //
-    // The comment above calls 32×32 "the smallest available"; 16-row tiles
-    // are instantiated and were only reachable through `LLOOM_383_TILE`.
-    // Measured on batched decode, where `m` is `B` (§13.4b), GPU busy per
-    // step against the 32×32 tile, 3 interleaved reps each, null 1.000:
-    // `m` = 2 **0.671**, 4 **0.682**, 8 **0.693**, 12 **0.700**, 15 **0.685**
-    // for 16×32, and 0.70–0.75 for 16×16 — a third of the step across the
-    // whole band, and the DSpark verify pass at `m` = 10 from 54.6 to 39.6 ms
-    // (`DESIGN.md` §10.2u). The 32×32 tile pads 10 rows to 32; the 16-row
-    // tile pads to 16 and issues twice the threadgroups over N, which is what
-    // a padded-thread-bound kernel wants. `LLOOM_383_TILE=32x32` restores the
-    // previous selection for an A/B.
+    // Small M: the narrowest instantiated tile, 16×32. A BM-row tile pads `m`
+    // to BM, and a tiled GEMM at small `m` is thread-bound, so the padding is
+    // the cost (§13.5n). Above the threshold the larger tiles are measured
+    // dearer at their own boundary (§13.5c); `LLOOM_364_SKINNY_MAX` is that
+    // measurement's arm, read once (`OnceLock`), off by default (§7.1a).
+    // `LLOOM_383_TILE` pins the tile for an A/B.
     if m < skinny_max() {
         return TILE_16_32_16_2_2;
     }
@@ -1432,39 +1398,42 @@ mod tile_config_gate {
         );
     }
 
-    /// **The claim: `select_tile_config` returns a BM=32 tile below `m` = 16.**
+    /// **The claim: `select_tile_config` returns the 16×32 tile below `m` = 16.**
     ///
-    /// This is what `DESIGN.md` §13.5b asserts as *"`select_tile_config`, rs:85:
-    /// `m < 16` → `TILE_32_32_16_2_2` unconditionally"* and what every figure in
-    /// that section's `align_M`/`align_N` branch reading is computed from. It is
-    /// read here from the function rather than from a comment beside it.
+    /// `DESIGN.md` §13.5n measured the instantiated 16-row tile a third cheaper
+    /// than the 32×32 one at every `m` in 2..15 (batched decode) and on the
+    /// `m = 10` DSpark verify, and made it the selection below the threshold;
+    /// §13.5b's *"`m < 16` → `TILE_32_32_16_2_2` unconditionally"* describes the
+    /// tree before that. The contract is read here from the function rather
+    /// than from a comment beside it.
     ///
     /// Every one of LFM2's 167 weight matmuls is asserted rather than a
-    /// representative, because §13.5b's own claim is quantified over all 167 and
-    /// the sites differ in `N_out` by 250× (512 to 128000).
+    /// representative, because the claim is quantified over all 167 and the
+    /// sites differ in `N_out` by 250× (512 to 128000).
     #[test]
-    fn below_the_threshold_every_lfm2_matmul_gets_the_32_32_tile() {
+    fn below_the_threshold_every_lfm2_matmul_gets_the_16_32_tile() {
         for m in 1..16 {
             for (label, _, n, k) in SITES {
                 let t = tile_at(m, *n, *k);
                 assert_eq!(
                     (t.bm, t.bn, t.bk, t.wm, t.wn),
-                    (32, 32, 16, 2, 2),
-                    "§13.5b: at m={m} the {label} matmul ({n}x{k}) must take \
-                     TILE_32_32_16_2_2; got {t:?}"
+                    (16, 32, 16, 2, 2),
+                    "§13.5n: at m={m} the {label} matmul ({n}x{k}) must take \
+                     TILE_16_32_16_2_2; got {t:?}"
                 );
             }
         }
     }
 
-    /// **The claim: the threshold is exactly 16, and crossing it leaves BM=32.**
+    /// **The claim: the threshold is exactly 16, and crossing it leaves BM=16.**
     ///
     /// `DESIGN.md` §13.5c pins the boundary *"exact at 16, pinned by
     /// bisection"* from a GPU census; this is the same boundary read off the
     /// function with no GPU. **Both sides are asserted** (§8.1g): a test that
     /// only checked the low side would pass on a function that returned the
-    /// 32×32 tile everywhere, which is precisely the `LLOOM_364_SKINNY_MAX`
-    /// arm and precisely the change §13.5c argues about.
+    /// 16×32 tile everywhere, which is precisely the `LLOOM_364_SKINNY_MAX`
+    /// arm and precisely the change §13.5c argues about. Above the threshold
+    /// the selection is exactly as #364 left it (§13.5n).
     #[test]
     fn the_threshold_is_at_sixteen_and_the_tile_changes_across_it() {
         let (n, k) = (2048, 2048);
@@ -1472,8 +1441,8 @@ mod tile_config_gate {
         let at = tile_at(16, n, k);
         assert_eq!(
             (below.bm, below.bn),
-            (32, 32),
-            "§13.5c: m=15 is the last m on the 32x32 tile"
+            (16, 32),
+            "§13.5n: m=15 is the last m on the 16x32 tile"
         );
         assert_eq!(
             (at.bm, at.bn, at.bk, at.wm, at.wn),

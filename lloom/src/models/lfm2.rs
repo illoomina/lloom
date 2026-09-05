@@ -4230,6 +4230,10 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
 
         Ok((vec![accepted], probe))
     }
+
+    fn take_probe(&self, cache: &mut Self::Cache) -> Result<Vec<Tensor>> {
+        Ok(cache.take_taps())
+    }
 }
 
 #[cfg(test)]

@@ -625,17 +625,18 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// (`lfm2-chat`'s shape) and is why speculation needs the rewindable cache
     /// (`RotatingRing` + `InPlace`) `advance`/`resolve` require.
     ///
-    /// # The drafter context is seeded lazily
+    /// # The drafter context is seeded from the prompt before round 0
     ///
-    /// `DSparkSpeculator` documents a caller seeding its context from the
-    /// prefill's taps (`begin` then `observe(seq, prefill_taps, &[])`). Extracting
-    /// the prefill probe is model-specific (LFM2's `Cache::take_taps`), so to keep
-    /// this method generic over `M` the first round instead drafts with an EMPTY
-    /// context and the round-0 `observe` keys it from the verify pass's own taps.
-    /// This is output-identical either way (the target verifies every token) and
-    /// costs only round-0 acceptance rate — the drafter is unconditioned for one
-    /// block, then fully seeded. `begin`/`observe` is the trait's own documented
-    /// lifecycle (`speculator.rs`), so this uses the seam as specified.
+    /// The prefill's probe (`Probes::take_probe`, every prompt position) is
+    /// handed to `observe` before the first draft, with the prefill's argmax as
+    /// the accepted tail — the `lfm2-dspark-verify` example's `--prefill-ctx
+    /// all`, which is what llama.cpp's `speculative.cpp::process` does. An
+    /// earlier form seeded lazily (round 0 drafted with an empty context and
+    /// the verify taps keyed it) on the claim that this cost only round-0
+    /// acceptance; measured, the drafter's context then never contained the
+    /// prompt at all, and acceptance on prompts a draft copies from fell by up
+    /// to half (`design/docs/speculation.md` §10.2w). Output-identical either
+    /// way: the target verifies every token.
     #[allow(clippy::too_many_arguments)]
     pub fn decode_speculative<S, R>(
         &mut self,
@@ -691,9 +692,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // the token whose logits produced the first draft — exactly as the
         // `lfm2-dspark-verify` example takes `logits.argmax` when it does not hold
         // the last prompt token back. `forward` taps (the tap hooks are woven into
-        // both entry points, `lfm2.rs`), so the cache carries the prefill's taps,
-        // but this method seeds lazily (see the method docs) and does not read
-        // them — they are cleared by the first verify pass's `begin_taps`.
+        // both entry points, `lfm2.rs`), so the cache carries the prefill's taps
+        // for `take_probe` below.
         let pos_before = self.seq.pos;
         let prefill_start = std::time::Instant::now();
         let input = Tensor::new(prompt, &device)?.unsqueeze(0)?;
@@ -709,10 +709,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             .argmax(lloom_tensor::D::Minus1)?
             .to_scalar::<u32>()?;
 
-        // Seed the drafter's per-seq state: `begin` sets the block anchor to the
-        // prompt's last token and clears the context. The context is keyed by the
-        // first round's `observe`, not here (the lazy seed).
+        // Seed the drafter's per-seq state: `begin` clears the context, then the
+        // prefill's probe keys it from every prompt position and the prefill's
+        // own argmax becomes the block anchor (the accepted tail) — the same
+        // state the first round would see after a fully-accepted prompt.
         spec.begin(seq, prompt)?;
+        let prefill_probe = self.model.take_probe(&mut self.seq.cache)?;
+        spec.observe(seq, &prefill_probe, std::slice::from_ref(&anchor_tok))?;
 
         // The prefill's own argmax is the first generated token — it is what
         // non-speculative greedy would emit as token 0 (the prefill logits' argmax),

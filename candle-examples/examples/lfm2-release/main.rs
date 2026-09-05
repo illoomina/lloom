@@ -234,6 +234,33 @@ struct Args {
     #[arg(long)]
     nonblocking_eos: bool,
 
+    /// Learn EOS host-side from the drained ids (`EosRead::HostOnDrain`, #677),
+    /// on `--token-ring` runs: the device never computes the EOS flag (~5
+    /// dispatches per token gone) and the loop learns EOS on the commit
+    /// cadence, so it overruns an EOS by up to a commit period and the cache
+    /// is rewound at the turn boundary. Needs `--lookahead 1` to mean
+    /// anything, and a rewindable cache (`--kv-append in-place --conv-state
+    /// rotating:K`, `K` at least the commit period) for `--turns` above 1.
+    /// Mutually exclusive with `--nonblocking-eos`. Off by default (§7.1a).
+    #[arg(long)]
+    host_drain: bool,
+
+    /// The most command buffers the host may leave in flight before it waits
+    /// for the GPU — explicit backpressure, decoupled from the EOS mechanism
+    /// (#677). `0` (the default) is off. Only real on an arm with no per-token
+    /// EOS wait (`--host-drain`), where nothing else bounds the host's lead.
+    #[arg(long, default_value_t = 0)]
+    max_in_flight: usize,
+
+    /// Carry the conv state across a multi-token pass as the convolution's left
+    /// context (`ConvPrefillCtx`, `DESIGN.md` §13.2f defect 1, #677). Off, a
+    /// follow-up turn's prefill zero-pads where the previous turn's last
+    /// `l_cache - 1` tokens belong, so `--turns 2` computes something a single
+    /// pass over the conversation does not. Off by default: every recorded
+    /// `--turns 3` digest belongs to the zero-padded arm (§7.1a).
+    #[arg(long, default_value_t = false)]
+    conv_prefill_ctx: bool,
+
     /// Forward passes the host may enqueue before it has learned the previous
     /// step's EOS, on `--token-ring` runs: `0` (the incumbent order — publish,
     /// wait, then encode the next forward) or `1` (encode the next forward,
@@ -347,6 +374,15 @@ struct Args {
     /// digest does not prove this arm inert.
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
+
+    /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
+    /// `conv1d` dispatch (§12.2 row 1, `ConvFused`, #668) — the crown's third
+    /// fusion, selectable here since #677 so this harness can run the
+    /// configuration `lfm2-chat` calls the crown. Moves the logits digest (a
+    /// serial f32 accumulation against a `simd_sum` tree) and not the tokens;
+    /// off by default (§7.1a).
+    #[arg(long, default_value_t = false)]
+    conv_fused: bool,
 }
 
 /// Parse LFM2.5-VL-3B's `config.json`.
@@ -693,6 +729,12 @@ fn main() -> Result<()> {
     // #116.
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
+    // Read by `ShortConv::new`, like the two above; rendered from `config`.
+    config.conv_fused = args.conv_fused;
+    // The conv writer's left context across a turn boundary (#677). Read by
+    // `ShortConv::new`, so it must be set before `Model::new` below, and
+    // rendered from `config` on the `RESULT` line (§7.1a-i).
+    config.conv_prefill_ctx = args.conv_prefill_ctx;
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
@@ -783,6 +825,16 @@ fn main() -> Result<()> {
         "--nonblocking-eos requires --token-ring (DESIGN.md §11.5, #535): the flag it \
          polls is published by the ring, so without it there is nothing to poll"
     );
+    anyhow::ensure!(
+        !args.host_drain || args.token_ring,
+        "--host-drain requires --token-ring (#677): it learns EOS from the ring's drained \
+         ids, so without the ring there is nothing to drain"
+    );
+    anyhow::ensure!(
+        !(args.host_drain && args.nonblocking_eos),
+        "--host-drain and --nonblocking-eos are two EOS-learning arms of one axis (EosRead); \
+         pick one"
+    );
     // B=1 is what this harness runs and what the slot is sized for; §6.6c
     // records the readback as `B` round trips per step at B>1, which makes the
     // slot `B` slots and is #263's change. Stated so the scope is in the
@@ -817,22 +869,64 @@ fn main() -> Result<()> {
         "--lookahead 1 needs --token-ring: the blocking arm learns EOS inside its readback, \
          so there is nothing to encode ahead of"
     );
+    // A multi-turn run on an arm that learns EOS late leaves the cache past
+    // the EOS, and the next turn prefills onto it unless the overrun can be
+    // rewound at the turn boundary (#677, `Session::reconcile`). Rewindable
+    // means `KvAppend::InPlace` (a length to decrement) with
+    // `ConvState::RotatingRing { k }` (history the phase can return to), `k` at
+    // least the overrun an arm can produce: 1 under `--lookahead 1`; under
+    // `--host-drain` a commit period PLUS the in-flight cap, because the drain
+    // that shows the EOS reads only what the GPU has published — a period's
+    // worth of forwards may be enqueued past the EOS before the commit, and the
+    // cap's worth may still be unpublished at that commit (measured: `steps:8`
+    // with cap 8 overran a `rotating:8` ring, `steps:4` with cap 4 did not).
+    // With no cap the host's lead is unbounded, so the drain arm is refused
+    // for a multi-turn run without one. The crown's `Cat` × `Shuffle` cannot
+    // rewind at all, so it is refused with `--turns` above 1 rather than
+    // moving the digest.
     anyhow::ensure!(
-        args.lookahead == 0 || args.turns.max(1) == 1,
-        "--lookahead 1 with --turns {}: the forward enqueued past an EOS leaves the cache one \
-         position long, and the next turn would prefill onto it and move the digest; this \
-         cache cannot rewind (DESIGN.md §10.2a). Use --turns 1 or --lookahead 0.",
+        !args.host_drain || args.turns.max(1) == 1 || args.max_in_flight > 0,
+        "--host-drain with --turns {}: without --max-in-flight the host's lead over the GPU \
+         is unbounded, so the overrun past an EOS has no bound a rewind can be sized to; \
+         pass --max-in-flight <N> (the overrun is then at most the commit period + N)",
         args.turns
+    );
+    let overrun_bound = if args.host_drain {
+        budget.period() + args.max_in_flight
+    } else if args.lookahead > 0 {
+        1
+    } else {
+        0
+    };
+    let rewindable_to = match (config.kv_append, config.conv_state) {
+        (KvAppend::InPlace, ConvState::RotatingRing { k }) => k,
+        _ => 0,
+    };
+    anyhow::ensure!(
+        overrun_bound == 0 || args.turns.max(1) == 1 || rewindable_to >= overrun_bound,
+        "--lookahead {}{} with --turns {}: this arm can leave the cache up to {} positions \
+         past an EOS, and the next turn would prefill onto them; the cache must be able to \
+         rewind that far (--kv-append in-place --conv-state rotating:K with K >= {}; this run \
+         has {:?} x {:?}, DESIGN.md §10.2a). Use --turns 1, or a rewindable cache.",
+        args.lookahead,
+        if args.host_drain { " --host-drain" } else { "" },
+        args.turns,
+        overrun_bound,
+        overrun_bound,
+        config.kv_append,
+        config.conv_state,
     );
     let opts = DecodeOptions {
         max_tokens: args.n,
         budget,
         lookahead: args.lookahead,
+        max_in_flight: args.max_in_flight,
         sample_split: args.sample_split,
     };
-    // The ring's device-side history is sized for the whole run — every turn
-    // — and refuses to overflow rather than silently dropping an id.
-    let capacity = args.n + args.turns + 1;
+    // The ring's device-side history is sized for the whole run — every turn,
+    // plus the overrun an arm may publish past each turn's EOS — and refuses
+    // to overflow rather than silently dropping an id.
+    let capacity = args.n + args.turns * (overrun_bound + 2) + 1;
 
     // ---- the timed window --------------------------------------------------
     //
@@ -845,6 +939,18 @@ fn main() -> Result<()> {
     // decode itself requires.
     let run = if !args.token_ring {
         let rb = Blocking::new(&eos_ids, &device)?;
+        run_turns(
+            &args,
+            &model,
+            cache,
+            rb,
+            &mut logits_processor,
+            &tokenizer,
+            &prompt_ids,
+            &opts,
+        )?
+    } else if args.host_drain {
+        let rb = Ring::new(&eos_ids, &device, capacity, EosRead::HostOnDrain)?;
         run_turns(
             &args,
             &model,
@@ -892,31 +998,49 @@ fn main() -> Result<()> {
         commits,
         max_in_flight,
         overrun,
+        rewound,
         arms,
+        eos_read,
         counters,
     } = run;
     // **Read back from the strategy that ran, not from the flags.** A wrong
     // arm compares equal to every run of that arm (§7.1a-i); the strategy is
-    // where the arm actually is.
+    // where the arm actually is. Both non-blocking EOS arms render
+    // `nonblocking_eos=true`; `eos_read` is what tells them apart.
+    let want_eos_read = if !args.token_ring {
+        "host"
+    } else if args.host_drain {
+        "drain"
+    } else if args.nonblocking_eos {
+        "poll"
+    } else {
+        "flag"
+    };
     anyhow::ensure!(
-        arms.token_ring == args.token_ring && arms.nonblocking_eos == args.nonblocking_eos,
-        "the strategy that ran renders token_ring={} nonblocking_eos={} against the flags \
-         {}/{}: the arm reported would not be the arm executed (DESIGN.md §7.1a-i)",
+        arms.token_ring == args.token_ring
+            && arms.nonblocking_eos == (args.nonblocking_eos || args.host_drain)
+            && eos_read == want_eos_read,
+        "the strategy that ran renders token_ring={} nonblocking_eos={} eos_read={} against \
+         the flags {}/{}/{}: the arm reported would not be the arm executed (DESIGN.md §7.1a-i)",
         arms.token_ring,
         arms.nonblocking_eos,
+        eos_read,
         args.token_ring,
-        args.nonblocking_eos
+        args.nonblocking_eos || args.host_drain,
+        want_eos_read
     );
     let ReadbackCounters {
         ring_publishes,
         ring_eos_publishes,
         poll_iters,
         poll_fallbacks,
+        ring_discarded,
     } = counters;
     // ---- the window is closed; everything below is after the clock ----------
 
-    // Every publish is either a token in the digest or an EOS that ended a
-    // turn. **This reconciles the engagement count against the digest**, which
+    // Every publish is either a token in the digest, an EOS that ended a
+    // turn, or — on the host-on-drain arm — an overrun the loop discarded.
+    // **This reconciles the engagement count against the digest**, which
     // is what makes `ring_publishes` evidence rather than decoration: a run
     // whose counter and token stream disagree has one of the two wrong, and
     // #500's whole finding is that a green board says nothing when nothing is
@@ -924,12 +1048,13 @@ fn main() -> Result<()> {
     // `--turns 3` run can publish three.)
     if args.token_ring {
         anyhow::ensure!(
-            ring_publishes == tokens.len() as u64 + ring_eos_publishes,
-            "published {} tokens but accounted for {} + {} EOS: the engagement \
-             count and the digest disagree",
+            ring_publishes == tokens.len() as u64 + ring_eos_publishes + ring_discarded,
+            "published {} tokens but accounted for {} + {} EOS + {} discarded: the \
+             engagement count and the digest disagree",
             ring_publishes,
             tokens.len(),
-            ring_eos_publishes
+            ring_eos_publishes,
+            ring_discarded
         );
         anyhow::ensure!(
             ring_publishes > 0,
@@ -1154,22 +1279,28 @@ fn main() -> Result<()> {
     println!();
     println!(
         "engagement            token_ring={} ring_publishes={} poll={} poll_iters={} \
-         max_in_flight={} nonblocking_eos={} poll_fallbacks={}",
+         max_in_flight={} nonblocking_eos={} poll_fallbacks={} eos_read={} ring_discarded={}",
         arms.token_ring,
         ring_publishes,
         poll.name(),
         poll_iters,
         max_in_flight,
         arms.nonblocking_eos,
-        poll_fallbacks
+        poll_fallbacks,
+        eos_read,
+        ring_discarded
     );
     println!(
-        "  decode loop         lookahead={} commit_budget={} commits={} overrun={} \
-         (Session::decode, DESIGN.md decode-driver stage 1)",
+        "  decode loop         lookahead={} commit_budget={} commits={} overrun={} rewound={} \
+         max_in_flight_cap={} conv_prefill_ctx={} \
+         (Session::decode, DESIGN.md decode-driver stage 1; #677 sequence layer)",
         args.lookahead,
         budget.arm(),
         commits,
-        overrun
+        overrun,
+        rewound,
+        args.max_in_flight,
+        config.conv_prefill_ctx
     );
     println!(
         "  completion arm      completion_wait={cw_name} completion_signals={cw_signals} \
@@ -1288,9 +1419,17 @@ fn main() -> Result<()> {
         ("CutPolicy", "Counter(50)".to_string()),
         ("GemvSilu", on_off(config.gemv_silu)),
         ("GemvResidual", on_off(config.gemv_residual)),
+        // #668's axis, rendered here since #677 (no harness rendered it before,
+        // which `lloom-runs`' renderability check reported as absent).
+        ("ConvFused", on_off(config.conv_fused)),
+        // #677: the conv writer's left context across a multi-token pass,
+        // read back from `config` (`ShortConv::new` consumed it).
+        ("ConvPrefillCtx", on_off(config.conv_prefill_ctx)),
         ("TokenRing", on_off(arms.token_ring)),
         ("Poll", poll_arm),
         ("NonblockingEos", on_off(arms.nonblocking_eos)),
+        // #677: how the loop learned EOS, from the strategy that ran.
+        ("EosRead", eos_read.to_string()),
         // The decode loop's two knobs (#673). Rendered from the resolved
         // values the loop ran under; `Lookahead` carries the count and
         // `CommitBudget` its period verbatim (§13.5m).
@@ -1318,8 +1457,9 @@ fn main() -> Result<()> {
          to_cpu_blit={} to_cpu_null_after_wait={} nonblocking_eos={} \
          poll_fallbacks={} peek_hit={} peek_unmapped={} poll_reads={} completion_wait={} \
          completion_signals={} completion_polls={} completion_fires={} \
-         gemv_silu={} gemv_residual={} \
-         lookahead={} commit_budget={} commits={} overrun={} \
+         gemv_silu={} gemv_residual={} conv_fused={} \
+         lookahead={} commit_budget={} commits={} overrun={} rewound={} \
+         max_in_flight_cap={} eos_read={} ring_discarded={} conv_prefill_ctx={} \
          config=[{}] token_digest={}",
         args.n,
         args.warmup,
@@ -1367,10 +1507,16 @@ fn main() -> Result<()> {
         // than from `args` (§7.1a-i).
         config.gemv_silu,
         config.gemv_residual,
+        config.conv_fused,
         args.lookahead,
         budget.arm(),
         commits,
         overrun,
+        rewound,
+        args.max_in_flight,
+        eos_read,
+        ring_discarded,
+        config.conv_prefill_ctx,
         config_line,
         token_digest
     );
@@ -1392,8 +1538,14 @@ struct Run {
     elapsed: std::time::Duration,
     commits: u64,
     max_in_flight: usize,
+    /// Positions the cache ran past a turn's EOS, summed over turns.
     overrun: usize,
+    /// Of those, the positions rewound at a turn boundary so the next turn
+    /// prefilled onto the last kept token (#677). The last turn's overrun is
+    /// left as it is — nothing follows it — so `rewound <= overrun`.
+    rewound: usize,
     arms: ReadbackArms,
+    eos_read: &'static str,
     counters: ReadbackCounters,
 }
 
@@ -1432,6 +1584,7 @@ fn run_turns<R: ReadbackStrategy>(
     let mut commits: u64 = 0;
     let mut max_in_flight = 0usize;
     let mut overrun = 0usize;
+    let mut rewound = 0usize;
     // The cache starts empty: turn 0's prefill is what appends the prompt, and
     // the session's position advances by each turn's length after it.
     let mut session = Session::new(model, cache);
@@ -1461,7 +1614,14 @@ fn run_turns<R: ReadbackStrategy>(
         // generation and whose digest is taken from the ids after the clock. A
         // per-batch drain would add readbacks the published figure must not carry.
         let out = session
-            .decode(&mut spec, &mut rb, sampler, &turn_ids, &turn_opts, &mut |_| Ok(()))
+            .decode(
+                &mut spec,
+                &mut rb,
+                sampler,
+                &turn_ids,
+                &turn_opts,
+                &mut |_| Ok(()),
+            )
             .with_context(|| format!("decoding turn {turn}"))?;
         turns_run = turn + 1;
         // Accumulated across turns; prefill is a different shape of work (§6.6)
@@ -1478,6 +1638,13 @@ fn run_turns<R: ReadbackStrategy>(
         if out.eos {
             hit_eos = true;
             if turn + 1 < args.turns.max(1) {
+                // The turn boundary (#677): an arm that learned EOS late left
+                // the cache past it; rewind so the next turn prefills onto the
+                // last kept token. The flag check in `main` guarantees the
+                // cache can, so a refusal here is a defect and not a policy.
+                rewound += session
+                    .reconcile()
+                    .with_context(|| format!("rewinding turn {turn}'s overrun"))?;
                 continue;
             }
         }
@@ -1497,7 +1664,9 @@ fn run_turns<R: ReadbackStrategy>(
         commits,
         max_in_flight,
         overrun,
+        rewound,
         arms: rb.arms(),
+        eos_read: rb.eos_read_arm(),
         counters: rb.counters(),
     })
 }

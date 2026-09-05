@@ -63,14 +63,15 @@ pub use layer_norm::{
     layer_norm, layer_norm_no_bias, rms_norm, LayerNorm, LayerNormConfig, RmsNorm,
 };
 pub use linear::{linear, linear_b, linear_no_bias, Linear};
-pub use model::{CacheReset, CausalLM, Model, Speculative, VisionEncoder};
+pub use model::{CacheReset, CacheRewind, CausalLM, Model, Speculative, VisionEncoder};
 pub use ops::Dropout;
 pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
 pub use speculator::{
-    Anchor, Draft, KvSource, LayerTaps, NextnHidden, NoProbe, PhaseCensus, ProbeHooks, Probes,
-    RoundProbe, RoundTiming, SeqId, Session, Speculator, TapSide, TapSpec, TargetProbe,
+    Anchor, Draft, KvSource, LayerTaps, NextnHidden, NoProbe, PhaseCensus, Prepared, ProbeHooks,
+    Probes, ReuseAction, RoundProbe, RoundTiming, SeqId, Sequence, Session, Speculator, TapSide,
+    TapSpec, TargetProbe,
 };
 pub use var_builder::VarBuilder;
 pub use var_map::VarMap;

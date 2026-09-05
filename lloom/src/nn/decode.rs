@@ -171,7 +171,13 @@ pub struct DecodeStats {
     pub commits: u64,
     /// The largest in-flight count `flush_and_prune` returned.
     pub max_in_flight: usize,
-    /// Forward passes enqueued past an EOS (0 or 1).
+    /// Forward passes enqueued past the last token this run returned — the
+    /// positions the cache holds beyond the sequence's token log. One under
+    /// `lookahead = 1` when EOS ended the run, up to a commit period under
+    /// `EosRead::HostOnDrain`, and whatever a speculative round accepted past a
+    /// mid-block EOS. Computed from the cache position, so a loop cannot
+    /// under-report it. The session carries it as [`Session::overrun`] until
+    /// [`Session::reconcile`] discards it.
     pub overrun: usize,
     /// The strategy's own counters.
     pub readback: ReadbackCounters,
@@ -237,6 +243,31 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         R: ReadbackStrategy,
     {
+        self.decode_until(spec, readback, sampler, prompt, opts, &mut |batch| {
+            on_tokens(batch)?;
+            Ok(true)
+        })
+    }
+
+    /// [`Self::decode`] whose streaming hook can end the run: a `false` from
+    /// `on_tokens` stops after the batch it was handed. The serving seam's stop
+    /// strings are decided on detokenized text the loop never sees, so the
+    /// consumer decides. A run stopped this way leaves no overrun — every
+    /// returned id was fed before its batch was streamed — and holds the last
+    /// logits, so it resumes like a run that reached `max_tokens`.
+    pub fn decode_until<S, R>(
+        &mut self,
+        spec: &mut S,
+        readback: &mut R,
+        sampler: &mut LogitsProcessor,
+        prompt: &[u32],
+        opts: &DecodeOptions,
+        on_tokens: &mut dyn FnMut(&[u32]) -> Result<bool>,
+    ) -> Result<DecodeOut>
+    where
+        S: Speculator,
+        R: ReadbackStrategy,
+    {
         if spec.max_draft() > 0 {
             lloom_tensor::bail!(
                 "Session::decode: a proposer with max_draft {} needs the speculative body \
@@ -260,8 +291,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 opts.lookahead
             );
         }
-        if prompt.is_empty() {
-            lloom_tensor::bail!("Session::decode: empty prompt");
+        if self.seq.overrun > 0 {
+            lloom_tensor::bail!(
+                "Session::decode: the cache is {} positions past the sequence's last token \
+                 (an earlier run's overrun); `Session::reconcile` or `Session::reset` first",
+                self.seq.overrun
+            );
+        }
+        // An empty prompt is a resume: continue from the logits the previous
+        // run left, which exist iff it ended with the cache one prediction
+        // ahead of the token log (`Session::prepare`'s `Resume`).
+        let resume = prompt.is_empty();
+        if resume && self.seq.last_logits.is_none() {
+            lloom_tensor::bail!("Session::decode: empty prompt and no held logits to resume from");
         }
         readback.check_sampler(sampler.sampling())?;
         spec.begin(SeqId(0), prompt)?;
@@ -279,13 +321,21 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         // Prefill: the whole prompt in one pass. Its GPU tail lands in the
         // first decode steps; what is timed here is the submission.
+        let pos_before = self.seq.pos;
         let prefill_start = std::time::Instant::now();
-        let input = Tensor::new(prompt, &device)?.unsqueeze(0)?;
-        let mut logits = self
-            .model
-            .forward(&input, self.pos, &mut self.cache)?
-            .squeeze(0)?;
-        self.pos += prompt.len();
+        let mut logits = match self.seq.last_logits.take() {
+            Some(held) if resume => held,
+            _ => {
+                let input = Tensor::new(prompt, &device)?.unsqueeze(0)?;
+                let logits = self
+                    .model
+                    .forward(&input, self.seq.pos, &mut self.seq.cache)?
+                    .squeeze(0)?;
+                self.seq.pos += prompt.len();
+                self.seq.tokens.extend_from_slice(prompt);
+                logits
+            }
+        };
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
 
         let mut produced = 0usize;
@@ -340,9 +390,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
                 logits = self
                     .model
-                    .forward(&feed, self.pos, &mut self.cache)?
+                    .forward(&feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
-                self.pos += 1;
+                self.seq.pos += 1;
             } else {
                 if opts.sample_split {
                     stats
@@ -353,9 +403,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // it retires the previous one.
                 logits = self
                     .model
-                    .forward(&feed, self.pos, &mut self.cache)?
+                    .forward(&feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
-                self.pos += 1;
+                self.seq.pos += 1;
                 // Backpressure AFTER the enqueue: the host has just added a
                 // command buffer, so cap how far it may run ahead of the GPU.
                 // A no-op on arms that pace themselves; on the host-on-drain arm
@@ -367,7 +417,6 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 if readback.eos_of_last()? {
                     produced -= 1;
                     eos = true;
-                    stats.overrun = 1;
                     break;
                 }
             }
@@ -412,20 +461,30 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     if let Some(k) = readback.eos_in_drained(&batch) {
                         // `batch[..k]` are good; `batch[k]` is EOS (excluded, as
                         // the per-token retraction excludes it); `batch[k+1..]`
-                        // are overrun (discarded). Reconcile `produced` down to
-                        // the good count so it matches `all_ids`.
+                        // are overrun (discarded), and so is everything the
+                        // strategy still holds undrained — told to it, so a later
+                        // call on the same strategy does not drain them as new
+                        // tokens. Reconcile `produced` down to the good count so
+                        // it matches `all_ids`.
                         let good = &batch[..k];
                         if !good.is_empty() {
-                            on_tokens(good)?;
+                            // The run is over either way; the hook's answer
+                            // changes nothing past an EOS.
+                            let _ = on_tokens(good)?;
                             all_ids.extend_from_slice(good);
                         }
+                        readback.note_eos_truncation(batch.len() - k - 1);
                         produced = all_ids.len();
                         eos = true;
                         stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
                         break;
                     }
-                    on_tokens(&batch)?;
+                    let go_on = on_tokens(&batch)?;
                     all_ids.extend_from_slice(&batch);
+                    if !go_on {
+                        stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
+                        break;
+                    }
                 }
             }
             stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
@@ -436,36 +495,29 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // forwards in flight and its incremental drain refuses to read past what
         // the GPU has published. `drain_all` synchronises up to the final slot,
         // so the tail is complete; streamed too, so a caller sees the last
-        // tokens, then folded into the full `ids`.
+        // tokens, then folded into the full `ids`. A host-on-drain arm that
+        // truncated at EOS above has already discarded its undrained slots, so
+        // its tail is empty and this costs it nothing.
         //
         // The tail is scanned for EOS too, for `EosRead::HostOnDrain`: if the run
         // ended on `max_tokens` (not an EOS `break` above) the EOS may sit in the
         // never-committed tail, and streaming it whole would emit tokens past it.
         // On the per-token arms `eos_in_drained` is `None`, so the tail streams
         // whole as before.
-        //
-        // The one case that skips the tail entirely is a host-on-drain arm that
-        // ALREADY truncated at EOS in the loop above (`eos && truncates_on_drain`):
-        // everything still in the ring past that point is the overrun it enqueued
-        // before it could stop, and draining it would emit tokens past the EOS.
-        // Every other arm drains unconditionally — the poll arm retracted its EOS
-        // token in `eos_of_last` and the remainder in the ring is all good, so it
-        // must still be streamed even after an EOS `break`.
-        if !(eos && readback.truncates_on_drain()) {
-            let tail = readback.drain_all()?;
-            if !tail.is_empty() {
-                if let Some(k) = readback.eos_in_drained(&tail) {
-                    let good = &tail[..k];
-                    if !good.is_empty() {
-                        on_tokens(good)?;
-                        all_ids.extend_from_slice(good);
-                    }
-                    produced = all_ids.len();
-                    eos = true;
-                } else {
-                    on_tokens(&tail)?;
-                    all_ids.extend_from_slice(&tail);
+        let tail = readback.drain_all()?;
+        if !tail.is_empty() {
+            if let Some(k) = readback.eos_in_drained(&tail) {
+                let good = &tail[..k];
+                if !good.is_empty() {
+                    let _ = on_tokens(good)?;
+                    all_ids.extend_from_slice(good);
                 }
+                readback.note_eos_truncation(tail.len() - k - 1);
+                produced = all_ids.len();
+                eos = true;
+            } else {
+                let _ = on_tokens(&tail)?;
+                all_ids.extend_from_slice(&tail);
             }
         }
         if all_ids.len() != produced {
@@ -476,6 +528,27 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 produced
             );
         }
+
+        // The sequence's bookkeeping, from the cache position rather than from
+        // the arm's own accounting: every returned id was fed before its
+        // successor's forward, so the cache holds the prompt, the returned ids
+        // and — on an arm that learns EOS late — the positions past them.
+        let fed = self.seq.pos - pos_before - prompt.len();
+        if fed < produced {
+            lloom_tensor::bail!(
+                "Session::decode: {fed} forwards ran for {produced} returned tokens — a \
+                 returned token whose forward never ran"
+            );
+        }
+        let overrun = fed - produced;
+        self.seq.tokens.extend_from_slice(&all_ids);
+        self.seq.overrun = overrun;
+        // The last forward's logits predict the token after the last returned
+        // one iff nothing overran; they are what a continuation of exactly this
+        // sequence resumes from. Past an EOS they predict nothing useful, but
+        // they are still the right logits for that position.
+        self.seq.last_logits = if overrun == 0 { Some(logits) } else { None };
+        stats.overrun = overrun;
         stats.produced = produced;
         stats.readback = readback.counters();
         Ok(DecodeOut {
@@ -594,6 +667,18 @@ impl<'m, M: CausalLM> Session<'m, M> {
         if prompt.is_empty() {
             lloom_tensor::bail!("Session::decode_speculative: empty prompt");
         }
+        if self.seq.overrun > 0 {
+            lloom_tensor::bail!(
+                "Session::decode_speculative: the cache is {} positions past the sequence's \
+                 last token (an earlier run's overrun); `Session::reconcile` or \
+                 `Session::reset` first",
+                self.seq.overrun
+            );
+        }
+        // A speculative run never leaves resumable logits (the verify reads
+        // its argmax back and keeps no per-position logits), so a held one from
+        // an earlier K=1 run is stale here.
+        self.seq.last_logits = None;
 
         let device = readback.device().clone();
         let seq = SeqId(0);
@@ -609,10 +694,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // both entry points, `lfm2.rs`), so the cache carries the prefill's taps,
         // but this method seeds lazily (see the method docs) and does not read
         // them — they are cleared by the first verify pass's `begin_taps`.
+        let pos_before = self.seq.pos;
         let prefill_start = std::time::Instant::now();
         let input = Tensor::new(prompt, &device)?.unsqueeze(0)?;
-        let logits = self.model.forward(&input, self.pos, &mut self.cache)?;
-        self.pos += prompt.len();
+        let logits = self
+            .model
+            .forward(&input, self.seq.pos, &mut self.seq.cache)?;
+        self.seq.pos += prompt.len();
+        self.seq.tokens.extend_from_slice(prompt);
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
 
         let mut anchor_tok = logits
@@ -658,7 +747,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // advanced the drafter's own anchor via `observe`.
             let anchor = Anchor {
                 last: anchor_tok,
-                pos: self.pos,
+                pos: self.seq.pos,
             };
             // The census is one round's worth of allocation; take it once,
             // past the warm-up rounds, so the breakdown carries which kernels
@@ -690,7 +779,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // there. The loop's anchor follows the accepted tail — which is what
             // `observe` set the drafter's own anchor to, kept in step here so the
             // next `Anchor` matches.
-            self.pos += accepted.len();
+            self.seq.pos += accepted.len();
             anchor_tok = *accepted.last().unwrap();
 
             // Publish the accepted tokens, stopping at the first EOS or at
@@ -729,12 +818,19 @@ impl<'m, M: CausalLM> Session<'m, M> {
             stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
         }
 
-        // A run that ends past an EOS the way `decode`'s lookahead=1 arm does:
-        // the accepted prefix was written to the cache before the EOS was seen.
-        // Reported so a caller can refuse to continue a conversation from it.
-        if eos {
-            stats.overrun = 1;
-        }
+        // The sequence's bookkeeping. The cache holds each round's window —
+        // the anchor and the proposals the target agreed with — so it runs one
+        // token BEHIND the stream while the run is going (the final anchor is
+        // streamed and not yet fed) and AHEAD of it when an EOS fell mid-block
+        // (the accepted tokens after it were fed before the host saw it). Both
+        // are read off the position: the fed ids are the stream's prefix of
+        // that length, and anything fed past the stream is overrun.
+        let fed = self.seq.pos - pos_before - prompt.len();
+        let in_cache = fed.min(produced);
+        self.seq.tokens.extend_from_slice(&all_ids[..in_cache]);
+        let overrun = fed - in_cache;
+        self.seq.overrun = overrun;
+        stats.overrun = overrun;
 
         stats.produced = produced;
         stats.readback = readback.counters();
@@ -793,12 +889,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // step — the same two shape buckets every real run takes.
         let prefill_tokens = vec![0u32; WARMUP_PREFILL_LEN];
         let prefill = Tensor::new(prefill_tokens.as_slice(), device)?.unsqueeze(0)?;
-        let _ = self.model.forward(&prefill, 0, &mut self.cache)?;
+        let _ = self.model.forward(&prefill, 0, &mut self.seq.cache)?;
 
         let decode = Tensor::new(&[0u32], device)?.unsqueeze(0)?;
         let _ = self
             .model
-            .forward(&decode, WARMUP_PREFILL_LEN, &mut self.cache)?;
+            .forward(&decode, WARMUP_PREFILL_LEN, &mut self.seq.cache)?;
 
         // Force the driver to finish compiling before the clock the caller is
         // about to stop; a cold pipeline creation left in flight would surface
@@ -807,8 +903,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         // Leave nothing behind: the warmup wrote KV, conv state and the position
         // counter, and the next call is the user's real prefill from position 0.
-        self.cache.reset();
-        self.pos = 0;
+        self.reset();
 
         Ok(cache_sizes(device))
     }

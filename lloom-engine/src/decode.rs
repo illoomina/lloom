@@ -3,17 +3,25 @@
 //! Extracted from amber's `Lfm2::generate_raw` (RESTRUCTURING §4, Wave F): the
 //! prompt rendering and tool parsing that wrapped it are the assistant's, but
 //! the loop between them — prefill, sample, detokenize, advance — is the
-//! engine's, and it is written here against `lloom`'s `CausalLM` seam so it
-//! drives any decoder-only model rather than `lfm2::Model` by name.
+//! engine's. Since #677 the loop itself is `lloom`'s `Session::decode` over the
+//! `Blocking` readback strategy (the host-side sampler, every sampling arm), so
+//! this crate carries no second loop (§11.5v named the one it used to carry);
+//! what it adds is the serving side: the incremental detokenize, the stop
+//! strings, and **content-addressed reuse** — a request is a whole token
+//! sequence, and `Session::prepare` reuses whatever prefix the session's cache
+//! already holds.
 //!
 //! Static dispatch only: the loop is generic over `M: CausalLM` so the
 //! per-token `forward` monomorphizes and LTO inlines it. `DESIGN.md` §15.2 #9 /
 //! `CONTRIBUTING.md` §3.6 — no `dyn` on the decode path. The `dyn`-per-request
 //! boundary is the [`crate::seam`] trait, one level out, where it is allowed.
 
-use lloom::generation::LogitsProcessor;
-use lloom::nn::CausalLM;
-use lloom_tensor::{Device, Result, Tensor};
+use lloom::generation::{Blocking, LogitsProcessor};
+use lloom::nn::{
+    CacheReset, CacheRewind, CausalLM, DecodeOptions, IdentityProposer, ReuseAction, Sequence,
+    Session,
+};
+use lloom_tensor::{Device, Result};
 
 /// Why a decode run stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,68 +63,80 @@ impl Default for DecodeParams {
     }
 }
 
-/// The outcome of a decode run: the full text, the tokens generated, and why it
-/// stopped.
+/// The outcome of a decode run: the full text, the tokens generated, why it
+/// stopped, and what the request reused of the session's cache.
 #[derive(Debug, Clone)]
 pub struct Decoded {
     pub text: String,
     pub tokens: Vec<u32>,
     pub stop: Stop,
+    /// How the request was matched against the session's cached tokens.
+    pub reuse: ReuseAction,
+    /// Prompt tokens whose state the cache already held and kept.
+    pub reused: usize,
+    /// Prompt tokens actually prefilled — the request's length minus `reused`,
+    /// except under [`ReuseAction::Resume`] where nothing is.
+    pub prefilled: usize,
 }
 
-/// A decode session: a borrowed target and the cache it threads across
-/// positions. The model is borrowed rather than owned so a session pins no
-/// weights alive beyond the run it drives — the same choice `lloom`'s
-/// speculative [`lloom::nn::Session`] makes.
+/// A decode session: a borrowed target and the sequence it drives — the cache,
+/// the ids whose state it holds, and the position. The model is borrowed rather
+/// than owned so a session pins no weights alive beyond the run it drives.
 ///
-/// `pos` is the sequence length already in the cache. A caller that decodes
-/// several turns against one cache reuses the session; a fresh conversation
-/// builds a fresh cache.
+/// A request is the WHOLE token sequence to continue, not the new tokens: the
+/// session reuses the prefix its cache already holds (`Session::prepare`) and
+/// prefills the rest. A caller that decodes several turns against one session
+/// therefore passes the growing conversation each time and pays only for the
+/// new turn; a fresh session with an empty cache prefills everything, which is
+/// what every request did before #677.
 pub struct DecodeSession<'m, M: CausalLM> {
-    model: &'m M,
-    cache: M::Cache,
+    session: Session<'m, M>,
     device: Device,
-    pos: usize,
 }
 
 impl<'m, M: CausalLM> DecodeSession<'m, M> {
     /// Pair a target with a cache it has already built ([`CausalLM::new_cache`]).
     /// `pos` is the number of positions already prefilled into that cache — 0
-    /// for a fresh one.
+    /// for a fresh one. A non-zero `pos` describes a cache whose contents this
+    /// session does not know, so the first request resets it (`Session::with_pos`).
     pub fn new(model: &'m M, cache: M::Cache, device: Device, pos: usize) -> Self {
         DecodeSession {
-            model,
-            cache,
+            session: Session::with_pos(model, cache, pos),
             device,
-            pos,
         }
+    }
+
+    /// Drive a sequence a serving layer held across requests ([`crate::SlotPool`]).
+    pub fn from_sequence(model: &'m M, seq: Sequence<M::Cache>, device: Device) -> Self {
+        DecodeSession {
+            session: Session::from_sequence(model, seq),
+            device,
+        }
+    }
+
+    /// Give the sequence back, to be held until the next request.
+    pub fn into_sequence(self) -> Sequence<M::Cache> {
+        self.session.into_sequence()
     }
 
     /// The cache, for a caller that inspects or seeds it between runs.
     pub fn cache_mut(&mut self) -> &mut M::Cache {
-        &mut self.cache
+        self.session.cache_mut()
     }
 
     /// Positions currently in the cache.
     pub fn pos(&self) -> usize {
-        self.pos
+        self.session.pos()
     }
 
-    /// Run `tokens` through the model as one forward pass, returning the last
-    /// position's logits and advancing `pos`. Prefill for a prompt, or a single
-    /// token during decode.
-    fn forward(&mut self, tokens: &[u32]) -> Result<Tensor> {
-        let input = Tensor::new(tokens, &self.device)?.unsqueeze(0)?;
-        let logits = self
-            .model
-            .forward(&input, self.pos, &mut self.cache)?
-            .squeeze(0)?;
-        self.pos += tokens.len();
-        Ok(logits)
+    /// The ids whose state the cache holds.
+    pub fn tokens(&self) -> &[u32] {
+        self.session.tokens()
     }
 
-    /// Decode from `prompt_ids`, streaming each completed text fragment to
-    /// `on_fragment` as it is produced. Returns the full decoded run.
+    /// Decode `prompt_ids` — the whole sequence to continue — streaming each
+    /// completed text fragment to `on_fragment` as it is produced. Returns the
+    /// full decoded run.
     ///
     /// The streaming primitive: a fragment is emitted only when the tokens
     /// since the last emission decode to complete text — a multi-byte character
@@ -139,50 +159,62 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         mut detokenize: impl FnMut(&[u32]) -> Result<String>,
         params: &DecodeParams,
         mut on_fragment: impl FnMut(&str),
-    ) -> Result<Decoded> {
-        let mut logits_processor =
-            LogitsProcessor::new(params.seed, params.temperature, params.top_p);
+    ) -> Result<Decoded>
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+        if params.eos_ids.is_empty() {
+            lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
+        }
+        let prepared = self.session.prepare(prompt_ids)?;
 
-        // Prefill: the whole prompt in one pass. `forward` returns only the last
-        // position's logits, so this doubles as the first sampling step.
-        let mut logits = self.forward(prompt_ids)?;
+        let mut sampler = LogitsProcessor::new(params.seed, params.temperature, params.top_p);
+        let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+        let mut spec = IdentityProposer;
+        let opts = DecodeOptions::new(params.max_tokens);
 
         let mut generated: Vec<u32> = Vec::with_capacity(params.max_tokens);
         let mut text = String::new();
         // Start of the run of generated tokens not yet emitted as text.
         let mut pending = 0usize;
-        let mut stop = Stop::Length;
+        let mut stopped_on_string = false;
 
-        while generated.len() < params.max_tokens {
-            let next = logits_processor.sample(&logits)?;
+        let out = self.session.decode_until(
+            &mut spec,
+            &mut readback,
+            &mut sampler,
+            &prepared.suffix,
+            &opts,
+            &mut |batch: &[u32]| {
+                generated.extend_from_slice(batch);
+                // Decode only the not-yet-emitted tokens, not the whole sequence
+                // each step: the latter is quadratic in output length.
+                let chunk = detokenize(&generated[pending..])?;
+                if !chunk.is_empty() && !chunk.ends_with('\u{FFFD}') {
+                    on_fragment(&chunk);
+                    text.push_str(&chunk);
+                    pending = generated.len();
+                }
+                if !params.stop_strings.is_empty()
+                    && params
+                        .stop_strings
+                        .iter()
+                        .any(|s| text.contains(s.as_str()))
+                {
+                    stopped_on_string = true;
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+        )?;
 
-            if params.eos_ids.contains(&next) {
-                stop = Stop::Eos;
-                break;
-            }
-            generated.push(next);
-
-            // Decode only the not-yet-emitted tokens, not the whole sequence
-            // each step: the latter is quadratic in output length.
-            let chunk = detokenize(&generated[pending..])?;
-            if !chunk.is_empty() && !chunk.ends_with('\u{FFFD}') {
-                on_fragment(&chunk);
-                text.push_str(&chunk);
-                pending = generated.len();
-            }
-
-            if !params.stop_strings.is_empty()
-                && params
-                    .stop_strings
-                    .iter()
-                    .any(|s| text.contains(s.as_str()))
-            {
-                stop = Stop::StopString;
-                break;
-            }
-
-            logits = self.forward(&[next])?;
-        }
+        let stop = if stopped_on_string {
+            Stop::StopString
+        } else if out.eos {
+            Stop::Eos
+        } else {
+            Stop::Length
+        };
 
         // Trim anything past the earliest stop sequence.
         if let Some(cut) = params
@@ -196,8 +228,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 
         Ok(Decoded {
             text,
-            tokens: generated,
+            tokens: out.ids,
             stop,
+            reuse: prepared.action,
+            reused: prepared.reused,
+            prefilled: prepared.suffix.len(),
         })
     }
 }
@@ -212,7 +247,11 @@ mod tests {
     /// test proves is that the seam is *callable* against the production model
     /// — if `lfm2::Model` did not satisfy `CausalLM`, this would not compile.
     #[allow(dead_code)]
-    fn drives<M: CausalLM>() {}
+    fn drives<M: CausalLM>()
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+    }
 
     #[test]
     fn decode_session_drives_lfm2() {

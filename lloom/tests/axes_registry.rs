@@ -19,6 +19,7 @@ use std::path::PathBuf;
 const EXPECTED_AXES: &[&str] = &[
     "AttnImpl",
     "ConvFused",
+    "ConvPrefillCtx",
     "ConvState",
     "GemvResidual",
     "GemvSilu",

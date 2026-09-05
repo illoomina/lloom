@@ -56,6 +56,11 @@ pub struct ReadbackCounters {
     pub poll_iters: u64,
     /// Steps on which the non-blocking poll gave up and took the blocking read.
     pub poll_fallbacks: u64,
+    /// Publishes discarded past an EOS the host learned late
+    /// ([`EosRead::HostOnDrain`]): the forwards the loop enqueued after the EOS
+    /// before the drain showed it. `ring_publishes == ids + ring_eos_publishes
+    /// + ring_discarded` is the reconciliation.
+    pub ring_discarded: u64,
 }
 
 /// How a decode step feeds the next forward pass and learns EOS.
@@ -137,15 +142,24 @@ pub trait ReadbackStrategy {
         None
     }
 
-    /// Whether this arm learns EOS by truncating a drained batch host-side
-    /// (rather than retracting a token per step). `true` only for
-    /// [`EosRead::HostOnDrain`]. The loop uses it to decide whether, after an EOS
-    /// it found in the loop body, the remaining ring content is overrun to
-    /// discard (this arm) or good tokens still to stream (every other arm, whose
-    /// EOS token was already retracted per step). Default `false`.
-    fn truncates_on_drain(&self) -> bool {
-        false
+    /// The loop found an EOS at [`Self::eos_in_drained`]'s index in a batch and
+    /// stopped: `dropped_in_batch` ids followed the EOS in that batch, and
+    /// everything the strategy still holds undrained is overrun too. The
+    /// strategy accounts for the EOS and the discards, and forgets the
+    /// undrained slots so a later run on the same strategy does not return
+    /// them as new tokens. Only the host-on-drain ring has anything to do;
+    /// the default is a no-op because the per-token arms never reach a batch
+    /// with an EOS in it.
+    fn note_eos_truncation(&mut self, dropped_in_batch: usize) {
+        let _ = dropped_in_batch;
     }
+
+    /// Which EOS-learning arm this strategy is, for the `RESULT` line: `host`
+    /// (the id is read back and compared at feed time), `flag` (the ring's
+    /// device flag, one blocking readback per step), `poll` (the flag polled
+    /// through the generation counter) or `drain` (host-side, from the drained
+    /// ids). Rendered from the strategy rather than from a flag (§7.1a-i).
+    fn eos_read_arm(&self) -> &'static str;
 
     /// Wait until the host is at most `cap` command buffers ahead of the GPU —
     /// explicit backpressure the loop calls after each enqueue when `cap > 0`.
@@ -243,6 +257,10 @@ impl ReadbackStrategy for Blocking {
         // The blocking arm's ids are already host-side and always complete, so
         // the final drain is the incremental one.
         Ok(std::mem::take(&mut self.ids))
+    }
+
+    fn eos_read_arm(&self) -> &'static str {
+        "host"
     }
 
     fn counters(&self) -> ReadbackCounters {
@@ -646,8 +664,24 @@ impl ReadbackStrategy for Ring {
         batch.iter().position(|id| self.eos_ids_host.contains(id))
     }
 
-    fn truncates_on_drain(&self) -> bool {
-        matches!(self.eos, EosRead::HostOnDrain)
+    fn note_eos_truncation(&mut self, dropped_in_batch: usize) {
+        // Only the host-on-drain arm can hand the loop a batch with an EOS in
+        // it; the others retracted theirs per step and never get here.
+        self.counters.ring_eos_publishes += 1;
+        // The undrained slots are overrun the loop enqueued before it could
+        // stop: forget them, so the next run's first drain starts at the next
+        // publish rather than returning them as its tokens.
+        let undrained = self.fed - self.cursor;
+        self.counters.ring_discarded += (dropped_in_batch + undrained) as u64;
+        self.cursor = self.fed;
+    }
+
+    fn eos_read_arm(&self) -> &'static str {
+        match self.eos {
+            EosRead::Blocking => "flag",
+            EosRead::Poll(_) => "poll",
+            EosRead::HostOnDrain => "drain",
+        }
     }
 
     fn apply_backpressure(&mut self, cap: usize) -> Result<()> {

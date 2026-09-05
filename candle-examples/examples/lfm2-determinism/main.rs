@@ -59,11 +59,11 @@ use anyhow::{Context, Result};
 use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use lloom::nn::ops::KvQuant;
-use lloom::nn::VarBuilder;
+use clap::Parser;
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
-use clap::Parser;
+use lloom::nn::ops::KvQuant;
+use lloom::nn::VarBuilder;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -392,6 +392,15 @@ struct Args {
     #[arg(long, default_value_t = false)]
     conv_fused: bool,
 
+    /// Carry the conv state across a turn-boundary prefill as the convolution's
+    /// left context (`ConvPrefillCtx`, `DESIGN.md` §13.2f defect 1, #677). Off,
+    /// every `--turns >= 2` pass zero-pads where the previous turn's last
+    /// `l_cache - 1` tokens belong. Off by default: the canonical §2.3.8c pairs
+    /// belong to the zero-padded arm (§7.1a). Moves both digests at `--turns 3`
+    /// and neither at `--turns 1`.
+    #[arg(long, default_value_t = false)]
+    conv_prefill_ctx: bool,
+
     /// Which SiLU implementation the 30 `usilu` dispatches resolve to
     /// (issue #599, `DESIGN.md` §12.2l).
     ///
@@ -698,6 +707,7 @@ fn main() -> Result<()> {
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
     config.conv_fused = args.conv_fused;
+    config.conv_prefill_ctx = args.conv_prefill_ctx;
     println!(
         "gemv epilogue: silu={} residual={}",
         config.gemv_silu, config.gemv_residual

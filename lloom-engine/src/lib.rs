@@ -20,6 +20,8 @@
 
 pub mod decode;
 pub mod seam;
+pub mod slots;
 
 pub use decode::{DecodeParams, DecodeSession, Decoded, Stop};
 pub use seam::Completer;
+pub use slots::{Routed, SlotPool, DEFAULT_SIMILARITY};

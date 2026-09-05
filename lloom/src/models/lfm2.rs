@@ -202,6 +202,7 @@ impl Lfm2Config {
             gemv_silu: false,
             gemv_residual: false,
             conv_fused: false,
+            conv_prefill_ctx: false,
             // No tap, per §7.1a: an empty `tap_layers` is what every existing
             // caller had before #363 and costs an `is_empty()` per layer. The
             // indices belong to a *drafter* checkpoint, so there is no
@@ -790,6 +791,19 @@ pub struct Config {
     /// the catalogue leaves open (llama.cpp's decode conv is one kernel).
     #[axis(name = "ConvFused", flag = "conv-fused", variants = ["off", "on"], default = "off", bool)]
     pub conv_fused: bool,
+    /// Carry the conv state across a multi-token pass onto a warm cache, as the
+    /// convolution's left context (`DESIGN.md` §13.2f defect 1, issue #677).
+    ///
+    /// The `seq_len > 1` conv writer zero-pads on the left, which is exact for
+    /// the first pass and wrong for every later one: the first `l_cache - 1`
+    /// outputs of a follow-up turn — or of a chunk, or of a prefix-reuse suffix
+    /// — convolve over zeros where the previous pass's last `bx` columns belong.
+    /// `on` prepends those columns instead, so a pass onto a warm cache computes
+    /// exactly what one pass over the concatenation computes. **Off by default**
+    /// (§7.1a): every recorded `--turns 3` digest belongs to the zero-padded
+    /// arm, and flipping it is its own argued decision.
+    #[axis(name = "ConvPrefillCtx", flag = "conv-prefill-ctx", variants = ["off", "on"], default = "off", bool)]
+    pub conv_prefill_ctx: bool,
     /// Which layers' **input residual** to capture into [`Cache::taps`], for a
     /// hidden-state-typed drafter (`DESIGN.md` §10.2m, issue #363).
     ///
@@ -920,6 +934,7 @@ impl Default for Config {
             gemv_silu: false,
             gemv_residual: false,
             conv_fused: false,
+            conv_prefill_ctx: false,
             tap_layers: Vec::new(),
             tap_dtype: DType::F32,
             #[cfg(feature = "metal")]
@@ -1268,6 +1283,16 @@ pub struct Cache {
     /// written exactly once per token, so their phases are equal at every point
     /// a layer reads them. Per-layer indices would be 22 copies of one number.
     conv_phase: usize,
+    /// `conv_phase` as it stood before this pass advanced it — the slot the
+    /// previous window ended at. Read by the multi-token conv writer under
+    /// `ConvPrefillCtx=on` to find the left context, since the advance that
+    /// precedes the layer loop has already reseeded `conv_phase` by then.
+    conv_phase_prev: usize,
+    /// Positions the ring has written since it was last seeded by a multi-token
+    /// pass, saturating at the ring's history depth. A rewind may only reach
+    /// slots the ring actually wrote: right after a prefill the history slots
+    /// are zeros, so the rewind horizon is `min(K, conv_history)`.
+    conv_history: usize,
     /// Set by `Model::forward` when the write slot has run out of slack, so the
     /// conv layers compact their window before writing this token.
     ///
@@ -1495,6 +1520,8 @@ impl Cache {
             kv_capacity,
             conv_states: vec![None; num_layers],
             conv_phase: 0,
+            conv_phase_prev: 0,
+            conv_history: 0,
             conv_compact: false,
             conv_state: config.conv_state,
             l_cache: config.conv_l_cache,
@@ -1742,7 +1769,84 @@ impl Cache {
         });
         self.conv_states.iter_mut().for_each(|v| *v = None);
         self.conv_phase = 0;
+        self.conv_phase_prev = 0;
+        self.conv_history = 0;
         self.conv_compact = false;
+    }
+
+    /// How many positions [`Cache::rewind`] can currently discard.
+    ///
+    /// Non-zero only on the rewindable configuration — `KvAppend::InPlace`
+    /// (a length to decrement) with `ConvState::RotatingRing { k }` (history
+    /// slots a phase move can return to) — and bounded by both the ring's `k`
+    /// and the positions the ring has written since its last seed: a multi-token
+    /// pass rebuilds the state with zeroed history (`lfm2_spec_conv_shape.rs`),
+    /// so there is nothing behind it to return to. Zero while a speculative
+    /// window is open.
+    pub fn rewind_horizon(&self) -> usize {
+        if self.speculative {
+            return 0;
+        }
+        if self.use_kv_cache && self.kv_append == KvAppend::Cat {
+            return 0;
+        }
+        match self.conv_state {
+            ConvState::RotatingRing { k } => k.min(self.conv_history),
+            _ => 0,
+        }
+    }
+
+    /// Discard the last `n` positions: KV by a length decrement, conv by a
+    /// phase move — `Cache::resolve`'s arithmetic outside a speculative window.
+    ///
+    /// This is what makes an EOS overrun a sequence-boundary event rather than
+    /// a reason to decode conservatively (issue #677): a loop that learns EOS
+    /// late leaves `n` forwards past it in the cache, and the next request
+    /// starts from the rewound state. Refused past [`Self::rewind_horizon`],
+    /// before anything is mutated, naming what would admit it.
+    pub fn rewind(&mut self, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let horizon = self.rewind_horizon();
+        if n > horizon {
+            let why = if self.speculative {
+                "a speculative window is open".to_string()
+            } else if self.use_kv_cache && self.kv_append == KvAppend::Cat {
+                "`KvAppend::Cat` has no length to rewind (`DESIGN.md` §10.2a)".to_string()
+            } else {
+                match self.conv_state {
+                    ConvState::RotatingRing { k } => format!(
+                        "`--conv-state rotating:{k}` keeps {k} history slots and {} have been \
+                         written since the last multi-token pass; use `rotating:{n}` or larger",
+                        self.conv_history
+                    ),
+                    other => format!(
+                        "{other:?} cannot rewind — only `RotatingRing` keeps the history a \
+                         rewind returns to (`DESIGN.md` §10.2a)"
+                    ),
+                }
+            };
+            lloom_tensor::bail!("lfm2 rewind({n}): horizon is {horizon} — {why}")
+        }
+        for (k_slot, v_slot) in self.kv_slots.iter_mut() {
+            if k_slot.all_data.is_none() {
+                continue;
+            }
+            k_slot.rewind(n)?;
+            v_slot.rewind(n)?;
+        }
+        for (k_slot, v_slot) in self.quant_slots.iter_mut() {
+            if k_slot.codes.is_none() {
+                continue;
+            }
+            k_slot.rewind(n)?;
+            v_slot.rewind(n)?;
+        }
+        let width = self.conv_state.width(self.l_cache);
+        self.conv_phase = (self.conv_phase + width - n) % width;
+        self.conv_history -= n;
+        Ok(())
     }
 
     /// The conv ring's current write slot.
@@ -2564,6 +2668,9 @@ struct ShortConv {
     /// its correctness is a CPU-backend parity check, not an unmoved digest
     /// (§2.3.5a).
     conv_fused: bool,
+    /// Carry the previous window across a multi-token pass as the left context
+    /// (`Config::conv_prefill_ctx`, `DESIGN.md` §13.2f defect 1).
+    prefill_ctx: bool,
     span: tracing::Span,
 }
 
@@ -2669,8 +2776,31 @@ impl ShortConv {
             conv_state: cfg.conv_state,
             gemv_residual: cfg.gemv_residual,
             conv_fused: cfg.conv_fused,
+            prefill_ctx: cfg.conv_prefill_ctx,
             span: tracing::span!(tracing::Level::TRACE, "shortconv"),
         })
+    }
+
+    /// The newest `l_cache - 1` columns of the live window, oldest first — the
+    /// left context a multi-token pass owes (`DESIGN.md` §13.2f). `prev_phase`
+    /// is the slot the window ended at before this pass advanced it; the
+    /// shuffle's window is the whole state and needs no phase.
+    fn window_tail(&self, state: &Tensor, prev_phase: usize) -> Result<Tensor> {
+        let n = self.l_cache - 1;
+        let tail = match self.conv_state {
+            ConvState::Shuffle => state.narrow(2, 1, n)?,
+            ConvState::SlidingRing { .. } => state.narrow(2, prev_phase + 2 - self.l_cache, n)?,
+            ConvState::RotatingRing { .. } => {
+                let width = self.conv_state.width(self.l_cache);
+                let mut cols = Vec::with_capacity(n);
+                for back in (0..n).rev() {
+                    let slot = (prev_phase + width - back) % width;
+                    cols.push(state.narrow(2, slot, 1)?);
+                }
+                Tensor::cat(&cols, 2)?
+            }
+        };
+        tail.contiguous()
     }
 
     /// Fold a conv window `[b, hidden, w]` against a `[hidden, w]` weight into
@@ -2737,29 +2867,29 @@ impl ShortConv {
         }
         #[cfg(feature = "metal")]
         {
-        let k = window.dims3()?.2;
-        if lloom_tensor::kernels::ConvKernel::conv1d_depthwise_k_scaled(k).is_none() {
-            return Ok(None);
-        }
-        if !window.device().is_metal() {
-            return Ok(None);
-        }
-        // The scaled kernel addresses the source as a DENSE `(b, c, l_in)` — its
-        // row base is `(b*c + c_idx) * l_in`, which is only the real element when
-        // dim-1's stride is `l_in`. A ring `window` is a `narrow` of a wider
-        // buffer (dim-1 stride is `width`, not `l_cache`), so it fails this and
-        // takes the unfused path; `Shuffle`'s state is exactly `[b, hidden,
-        // l_cache]` and passes. Making it contiguous here would add the copy the
-        // fusion exists to remove, so the guard refuses rather than repairs.
-        if !window.is_contiguous() {
-            return Ok(None);
-        }
-        // `weight` is `[hidden, k]` (squeezed); the scaled op reads it as the
-        // same `[c, k]` the plain `_k` kernel does. `c` must be contiguous in
-        // `[b, hidden, l_out]` for the flat `scale[tid]` read.
-        let c = c.contiguous()?;
-        let out = crate::nn::ops::conv1d_depthwise_scaled(window, weight, &c, k, 0)?;
-        Ok(Some(out))
+            let k = window.dims3()?.2;
+            if lloom_tensor::kernels::ConvKernel::conv1d_depthwise_k_scaled(k).is_none() {
+                return Ok(None);
+            }
+            if !window.device().is_metal() {
+                return Ok(None);
+            }
+            // The scaled kernel addresses the source as a DENSE `(b, c, l_in)` — its
+            // row base is `(b*c + c_idx) * l_in`, which is only the real element when
+            // dim-1's stride is `l_in`. A ring `window` is a `narrow` of a wider
+            // buffer (dim-1 stride is `width`, not `l_cache`), so it fails this and
+            // takes the unfused path; `Shuffle`'s state is exactly `[b, hidden,
+            // l_cache]` and passes. Making it contiguous here would add the copy the
+            // fusion exists to remove, so the guard refuses rather than repairs.
+            if !window.is_contiguous() {
+                return Ok(None);
+            }
+            // `weight` is `[hidden, k]` (squeezed); the scaled op reads it as the
+            // same `[c, k]` the plain `_k` kernel does. `c` must be contiguous in
+            // `[b, hidden, l_out]` for the flat `scale[tid]` read.
+            let c = c.contiguous()?;
+            let out = crate::nn::ops::conv1d_depthwise_scaled(window, weight, &c, k, 0)?;
+            Ok(Some(out))
         }
     }
 
@@ -2795,27 +2925,27 @@ impl ShortConv {
         }
         #[cfg(feature = "metal")]
         {
-        if !state.device().is_metal() {
-            return Ok(None);
-        }
-        let k = state.dims3()?.2;
-        if lloom_tensor::kernels::ConvKernel::shortconv_step_k(k).is_none() {
-            return Ok(None);
-        }
-        // The kernel reads `state` as dense `[b, hidden, k]` and writes a dense
-        // state back, so the incoming state must be contiguous (it is: prefill
-        // seeds it contiguous and this path writes it back contiguous).
-        if !state.is_contiguous() {
-            return Ok(None);
-        }
-        // b/x/c must share one layout — they are sibling narrows of the same
-        // `in_proj` output, so this holds — because the kernel takes a single
-        // `(stride_b, stride_c)` pair for all three.
-        if b.stride() != x.stride() || b.stride() != c.stride() {
-            return Ok(None);
-        }
-        let (out, new_state) = crate::nn::ops::shortconv_step(b, x, c, state, weight, k)?;
-        Ok(Some((out, new_state)))
+            if !state.device().is_metal() {
+                return Ok(None);
+            }
+            let k = state.dims3()?.2;
+            if lloom_tensor::kernels::ConvKernel::shortconv_step_k(k).is_none() {
+                return Ok(None);
+            }
+            // The kernel reads `state` as dense `[b, hidden, k]` and writes a dense
+            // state back, so the incoming state must be contiguous (it is: prefill
+            // seeds it contiguous and this path writes it back contiguous).
+            if !state.is_contiguous() {
+                return Ok(None);
+            }
+            // b/x/c must share one layout — they are sibling narrows of the same
+            // `in_proj` output, so this holds — because the kernel takes a single
+            // `(stride_b, stride_c)` pair for all three.
+            if b.stride() != x.stride() || b.stride() != c.stride() {
+                return Ok(None);
+            }
+            let (out, new_state) = crate::nn::ops::shortconv_step(b, x, c, state, weight, k)?;
+            Ok(Some((out, new_state)))
         }
     }
 
@@ -2917,9 +3047,11 @@ impl ShortConv {
         {
             let state = match &cache.conv_states[block_idx] {
                 Some(s) => s.clone(),
-                None => {
-                    Tensor::zeros((b_sz, self.hidden_size, self.l_cache), c.dtype(), c.device())?
-                }
+                None => Tensor::zeros(
+                    (b_sz, self.hidden_size, self.l_cache),
+                    c.dtype(),
+                    c.device(),
+                )?,
             };
             if let Some((conv_out, new_state)) =
                 self.shortconv_fused(&b, &x_proj, &c, &state, &conv_weight)?
@@ -3202,24 +3334,42 @@ impl ShortConv {
                 }
             }
         } else {
-            // Prefill: use Conv1d
+            // Prefill: use Conv1d.
+            //
+            // The left context (`DESIGN.md` §13.2f defect 1): a pass onto a
+            // warm cache owes the previous window's newest `l_cache - 1` `bx`
+            // columns as the convolution's left context in place of the zero
+            // padding, or its first `l_cache - 1` outputs convolve over zeros
+            // where the previous turn's tokens belong. Behind `ConvPrefillCtx`;
+            // off, this is the zero-padded pass every recorded digest belongs to.
+            let ctx = match &cache.conv_states[block_idx] {
+                Some(prev) if self.prefill_ctx && cache.use_kv_cache && self.l_cache > 1 => {
+                    Some(self.window_tail(prev, cache.conv_phase_prev)?)
+                }
+                _ => None,
+            };
+            let (conv_in, padding) = match &ctx {
+                Some(ctx) => (Tensor::cat(&[ctx, &bx], 2)?.contiguous()?, 0),
+                None => (bx.clone(), self.l_cache.saturating_sub(1)),
+            };
             let conv = Conv1d::new(
                 self.conv_weight.clone(),
                 None,
                 Conv1dConfig {
-                    padding: self.l_cache.saturating_sub(1),
+                    padding,
                     groups: self.hidden_size,
                     ..Default::default()
                 },
             );
-            let mut out = conv.forward(&bx)?;
+            let mut out = conv.forward(&conv_in)?;
             out = out.narrow(2, 0, seq_len)?;
 
             // Update cache with last l_cache tokens
             if cache.use_kv_cache && self.l_cache > 0 {
-                let start = seq_len.saturating_sub(self.l_cache);
-                let cache_len = seq_len - start;
-                let mut cache_src = bx.narrow(2, start, cache_len)?;
+                let src_len = conv_in.dim(2)?;
+                let start = src_len.saturating_sub(self.l_cache);
+                let cache_len = src_len - start;
+                let mut cache_src = conv_in.narrow(2, start, cache_len)?;
                 if cache_len < self.l_cache {
                     let pad = self.l_cache - cache_len;
                     let zeros = Tensor::zeros(
@@ -3254,11 +3404,7 @@ impl ShortConv {
         // kernel's store (`c_fused`, §12.2 row 1). The transpose to `[b, seq,
         // hidden]` for `out_proj` is unchanged either way; only the elementwise
         // `*C` dispatch and its barrier are removed on the fused arm.
-        let conv_out = if c_fused {
-            conv_out
-        } else {
-            (c * &conv_out)?
-        };
+        let conv_out = if c_fused { conv_out } else { (c * &conv_out)? };
         conv_out.transpose(1, 2)?.contiguous()
     }
 }
@@ -3788,7 +3934,8 @@ impl Model {
     /// place: two owners of one decision is a shape that cannot be right, and it
     /// has already been wrong here once.
     fn advance_conv_phase(&self, seq_len: usize, cache: &mut Cache) {
-        if let ConvState::RotatingRing { .. } = self.conv_state {
+        cache.conv_phase_prev = cache.conv_phase;
+        if let ConvState::RotatingRing { k } = self.conv_state {
             let width = self.conv_state.width(self.l_cache);
             cache.conv_compact = false;
             cache.conv_phase = if cache.speculative && seq_len > 1 {
@@ -3797,10 +3944,15 @@ impl Model {
                 // `seq_len` decode steps would have done. The layers derive
                 // each position's slot from the *pre-pass* phase, so this
                 // lands where the last position wrote.
+                cache.conv_history = (cache.conv_history + seq_len).min(k);
                 (cache.conv_phase + seq_len) % width
             } else if seq_len == 1 {
+                cache.conv_history = (cache.conv_history + 1).min(k);
                 (cache.conv_phase + 1) % width
             } else {
+                // A multi-token pass reseeds: the history slots are zeroed by
+                // the writer, so nothing behind the new window can be returned to.
+                cache.conv_history = 0;
                 self.l_cache - 1
             };
         } else if let ConvState::SlidingRing { .. } = self.conv_state {
@@ -3962,6 +4114,16 @@ impl CausalLM for Model {
         // or the tied `[vocab, hidden]` embedding), so its leading dim is the
         // vocabulary. 2D by construction, so `dims()[0]` cannot be absent.
         self.lm_head.weight().dims()[0]
+    }
+}
+
+impl crate::nn::model::CacheRewind for Cache {
+    fn rewind_horizon(&self) -> usize {
+        Cache::rewind_horizon(self)
+    }
+
+    fn rewind(&mut self, n: usize) -> Result<()> {
+        Cache::rewind(self, n)
     }
 }
 

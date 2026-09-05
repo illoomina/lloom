@@ -22,8 +22,8 @@
 //! drafter whose probe it can satisfy, so an MTP drafter against a target with no
 //! `h_nextn` head does not compile rather than failing at runtime (§3.4.3).
 
-use crate::nn::model::CausalLM;
-use lloom_tensor::{DType, Device, Result};
+use crate::nn::model::{CacheReset, CacheRewind, CausalLM};
+use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// A sequence slot on the serving side. The `Speculator` is constructed for a
 /// fixed number of these (server slots), and per-seq state lives *inside* the
@@ -367,6 +367,137 @@ impl RoundTiming {
     }
 }
 
+/// One sequence: a cache, the token ids whose state it holds, and how far it
+/// has been computed (issue #677, `design/docs/sequence-reuse-design.md`).
+///
+/// This is the unit both mature engines converge on — llama.cpp's slot
+/// (`server-context.cpp:100`, cached tokens beside the KV) and vLLM's request
+/// (`request.py`, `num_computed_tokens` beside the block table): **cached state
+/// keyed by token content**, with no request identity in it. A continuation is
+/// a prompt sharing this sequence's whole token log as a prefix; a divergent
+/// request shares part of it; a fresh one shares none. [`Session::prepare`] is
+/// that comparison, and it is the only place the three cases are told apart.
+///
+/// Separable from the [`Session`] that drives it so a serving layer can hold
+/// sequences across requests without holding a borrow of the model: build a
+/// `Session` from a sequence for one request and take it back afterwards
+/// ([`Session::from_sequence`], [`Session::into_sequence`]).
+pub struct Sequence<C> {
+    pub(crate) cache: C,
+    /// The ids at cache positions `0..pos - overrun`, in order.
+    pub(crate) tokens: Vec<u32>,
+    /// Positions in the cache; the next forward pass starts here.
+    pub(crate) pos: usize,
+    /// Positions past `tokens.len()` that a loop consumed after the sequence's
+    /// last kept token — the forwards an asynchronous loop enqueued before it
+    /// learned EOS. Discarded by [`Session::reconcile`]; a decode is refused
+    /// while it is non-zero.
+    pub(crate) overrun: usize,
+    /// The logits of the last fed position, when the run ended with the cache
+    /// exactly one prediction ahead of the token log and nothing overran — the
+    /// state a continuation resumes from without re-feeding anything.
+    pub(crate) last_logits: Option<Tensor>,
+    /// `false` for a cache prefilled by a caller that did not say with what
+    /// ([`Session::with_pos`]); such a sequence cannot be matched, only reset.
+    pub(crate) tokens_known: bool,
+}
+
+impl<C> Sequence<C> {
+    /// A fresh sequence over an empty cache.
+    pub fn new(cache: C) -> Self {
+        Self {
+            cache,
+            tokens: Vec::new(),
+            pos: 0,
+            overrun: 0,
+            last_logits: None,
+            tokens_known: true,
+        }
+    }
+
+    /// A sequence over a cache the caller has already filled with exactly
+    /// `tokens` — the state a serving layer restores, or a test builds.
+    pub fn with_tokens(cache: C, tokens: Vec<u32>) -> Self {
+        let pos = tokens.len();
+        Self {
+            cache,
+            tokens,
+            pos,
+            overrun: 0,
+            last_logits: None,
+            tokens_known: true,
+        }
+    }
+
+    /// The ids whose state the cache holds, in order.
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// Positions in the cache, the unreconciled overrun included.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Positions past the token log a loop consumed and nothing has discarded.
+    pub fn overrun(&self) -> usize {
+        self.overrun
+    }
+
+    /// Whether the token log describes the cache (false after [`Session::with_pos`]).
+    pub fn tokens_known(&self) -> bool {
+        self.tokens_known
+    }
+
+    /// The cache.
+    pub fn cache(&self) -> &C {
+        &self.cache
+    }
+
+    /// The cache, mutably.
+    pub fn cache_mut(&mut self) -> &mut C {
+        &mut self.cache
+    }
+
+    /// The length of the longest common prefix of the token log and `full`.
+    pub fn common_prefix(&self, full: &[u32]) -> usize {
+        self.tokens
+            .iter()
+            .zip(full.iter())
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+}
+
+/// What [`Session::prepare`] did to the sequence to make `full` decodable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReuseAction {
+    /// The whole token log is a prefix of `full`; only the suffix is prefilled.
+    Extend,
+    /// `full` diverged inside the rewind horizon: the cache was rewound by the
+    /// carried count and the suffix from the divergence is prefilled.
+    Rewound(usize),
+    /// `full` is exactly the token log and the last prediction is still held:
+    /// nothing is prefilled and the decode resumes from those logits.
+    Resume,
+    /// Nothing reusable — no overlap, a divergence past the horizon, or a cache
+    /// whose contents were unknown — so the cache was reset and `full` is
+    /// prefilled whole.
+    Fresh,
+}
+
+/// The outcome of [`Session::prepare`]: what to prefill and what was reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Prepared {
+    pub action: ReuseAction,
+    /// Tokens of `full` whose state the cache already held and kept.
+    pub reused: usize,
+    /// The tokens to feed to [`Session::decode`] as its prompt. Empty only for
+    /// [`ReuseAction::Resume`], which `decode` accepts as "continue from the
+    /// held logits".
+    pub suffix: Vec<u32>,
+}
+
 /// A target holding its own cache, driving speculative rounds. The typed pair
 /// (target, drafter) is checked where [`Session::speculative_step`] is
 /// instantiated — `M: Probes<S::Probe>` there — and the driver names neither
@@ -374,12 +505,11 @@ impl RoundTiming {
 ///
 /// Constructed with a cache the caller already built and prefilled
 /// ([`CausalLM::new_cache`]); the model is borrowed rather than owned so a
-/// session pins no weights alive beyond the round it drives.
+/// session pins no weights alive beyond the round it drives. The cache, the
+/// token log and the position travel together as a [`Sequence`].
 pub struct Session<'m, M: CausalLM> {
     pub(crate) model: &'m M,
-    pub(crate) cache: M::Cache,
-    /// Positions already in the cache; the next forward pass starts here.
-    pub(crate) pos: usize,
+    pub(crate) seq: Sequence<M::Cache>,
 }
 
 impl<'m, M: CausalLM> Session<'m, M> {
@@ -389,24 +519,157 @@ impl<'m, M: CausalLM> Session<'m, M> {
     pub fn new(model: &'m M, cache: M::Cache) -> Self {
         Self {
             model,
-            cache,
-            pos: 0,
+            seq: Sequence::new(cache),
         }
     }
 
-    /// As [`Self::new`], with `pos` positions already prefilled into `cache`.
+    /// As [`Self::new`], with `pos` positions already prefilled into `cache` by
+    /// the caller. What they hold is not known here, so the sequence cannot be
+    /// prefix-matched until it is reset; continuation by [`Self::decode`] works
+    /// as before.
     pub fn with_pos(model: &'m M, cache: M::Cache, pos: usize) -> Self {
-        Self { model, cache, pos }
+        let mut seq = Sequence::new(cache);
+        seq.pos = pos;
+        seq.tokens_known = pos == 0;
+        Self { model, seq }
+    }
+
+    /// Drive an existing sequence — a slot a serving layer held across requests.
+    pub fn from_sequence(model: &'m M, seq: Sequence<M::Cache>) -> Self {
+        Self { model, seq }
+    }
+
+    /// Give the sequence back, for a caller that holds it across requests.
+    pub fn into_sequence(self) -> Sequence<M::Cache> {
+        self.seq
+    }
+
+    /// The sequence this session drives.
+    pub fn sequence(&self) -> &Sequence<M::Cache> {
+        &self.seq
     }
 
     /// Positions currently in the cache.
     pub fn pos(&self) -> usize {
-        self.pos
+        self.seq.pos
+    }
+
+    /// The ids whose state the cache holds.
+    pub fn tokens(&self) -> &[u32] {
+        &self.seq.tokens
+    }
+
+    /// Positions past the token log that a loop consumed and nothing has yet
+    /// discarded — see [`Sequence::overrun`].
+    pub fn overrun(&self) -> usize {
+        self.seq.overrun
     }
 
     /// The target, for a caller composing a second seam over the same model.
     pub fn model(&self) -> &'m M {
         self.model
+    }
+
+    /// Discard the overrun, so the cache ends at the token log's last id.
+    ///
+    /// Returns how many positions were discarded. Refused when the cache's
+    /// rewind horizon is shorter than the overrun, naming the count; a caller
+    /// that can accept losing the sequence resets it instead ([`Self::reset`]).
+    pub fn reconcile(&mut self) -> Result<usize>
+    where
+        M::Cache: CacheRewind,
+    {
+        let n = self.seq.overrun;
+        if n == 0 {
+            return Ok(0);
+        }
+        self.seq.cache.rewind(n)?;
+        self.seq.pos -= n;
+        self.seq.overrun = 0;
+        Ok(n)
+    }
+
+    /// Return the sequence to empty: the cache reset, the token log cleared.
+    pub fn reset(&mut self)
+    where
+        M::Cache: CacheReset,
+    {
+        self.seq.cache.reset();
+        self.seq.tokens.clear();
+        self.seq.pos = 0;
+        self.seq.overrun = 0;
+        self.seq.last_logits = None;
+        self.seq.tokens_known = true;
+    }
+
+    /// Make the sequence decodable for `full` — the whole token sequence a
+    /// request wants continued — reusing whatever prefix the cache already
+    /// holds, and say what is left to prefill.
+    ///
+    /// The comparison is content only: the longest common prefix of the token
+    /// log and `full` (llama.cpp's `get_common_prefix`, `server-context.cpp:1584`).
+    /// A continuation of this sequence, a request diverging from it, and a
+    /// fresh request are the same operation at different prefix lengths —
+    /// nothing here knows which client sent `full`.
+    ///
+    /// An unreconciled overrun is discarded first, or the sequence is reset if
+    /// it cannot be. When `full` is entirely cached, the last id must still be
+    /// re-fed to produce a prediction unless the run that cached it left its
+    /// logits behind ([`ReuseAction::Resume`]).
+    pub fn prepare(&mut self, full: &[u32]) -> Result<Prepared>
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+        if full.is_empty() {
+            lloom_tensor::bail!("Session::prepare: empty sequence");
+        }
+        if self.seq.overrun > 0 && self.reconcile().is_err() {
+            self.reset();
+        }
+        if !self.seq.tokens_known {
+            self.reset();
+        }
+        let cached = self.seq.tokens.len();
+        if cached == 0 {
+            return Ok(Prepared {
+                action: ReuseAction::Fresh,
+                reused: 0,
+                suffix: full.to_vec(),
+            });
+        }
+        let lcp = self.seq.common_prefix(full);
+
+        if lcp == full.len() && lcp == cached && self.seq.last_logits.is_some() {
+            return Ok(Prepared {
+                action: ReuseAction::Resume,
+                reused: lcp,
+                suffix: Vec::new(),
+            });
+        }
+        // Everything cached: the last token must be re-fed for its prediction.
+        let keep = if lcp == full.len() { lcp - 1 } else { lcp };
+        let drop = cached - keep;
+        let action = if drop == 0 {
+            ReuseAction::Extend
+        } else if drop <= self.seq.cache.rewind_horizon() {
+            self.seq.cache.rewind(drop)?;
+            self.seq.pos -= drop;
+            self.seq.tokens.truncate(keep);
+            self.seq.last_logits = None;
+            ReuseAction::Rewound(drop)
+        } else {
+            self.reset();
+            ReuseAction::Fresh
+        };
+        let reused = match action {
+            ReuseAction::Fresh => 0,
+            _ => keep,
+        };
+        Ok(Prepared {
+            action,
+            reused,
+            suffix: full[reused..].to_vec(),
+        })
     }
 
     /// Drive one speculative round across the active sequences.
@@ -487,7 +750,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let t = std::time::Instant::now();
         let (accepted, probe_out) =
             self.model
-                .verify_and_probe(&drafts, anchors, &mut self.cache)?;
+                .verify_and_probe(&drafts, anchors, &mut self.seq.cache)?;
         let (gpu, disp, census) = probe.close()?;
         timing.verify_ns = t.elapsed().as_nanos() as u64;
         timing.verify_gpu_s = gpu;
@@ -508,7 +771,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
     /// The target's cache, for a caller that prefills before the first round.
     pub fn cache_mut(&mut self) -> &mut M::Cache {
-        &mut self.cache
+        &mut self.seq.cache
     }
 }
 

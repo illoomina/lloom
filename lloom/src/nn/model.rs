@@ -94,6 +94,29 @@ pub trait CacheReset {
     fn reset(&mut self);
 }
 
+/// A cache that can discard its most recent positions outside a speculative
+/// window — the sequence-boundary rewind (issue #677).
+///
+/// An asynchronous decode loop learns EOS after it has enqueued the forwards
+/// that consumed it, so the cache ends `n` positions past the last token the
+/// sequence keeps. With this seam the overrun is discarded where the sequence
+/// ends rather than avoided by decoding conservatively (`DecodeOptions::lookahead
+/// = 0`), and a prefix-reusing request that diverges inside the horizon rewinds
+/// to the divergence rather than starting from nothing. Kept off [`CausalLM`] for
+/// [`CacheReset`]'s reason: the locked trait is not widened, and a cache that
+/// cannot rewind reports a horizon of zero rather than being unable to compile.
+pub trait CacheRewind {
+    /// How many positions [`Self::rewind`] would currently accept. Zero for a
+    /// cache with no rewindable arm, and for a rewindable one while a
+    /// speculative window is open or nothing has been written since a
+    /// multi-token pass reseeded it.
+    fn rewind_horizon(&self) -> usize;
+
+    /// Discard the last `n` positions. Refused, before any mutation, past
+    /// [`Self::rewind_horizon`].
+    fn rewind(&mut self, n: usize) -> Result<()>;
+}
+
 /// The verifier's entry and the speculative rollback seam.
 ///
 /// Only a model that can rewind implements it. `forward_all` projects **every**

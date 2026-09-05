@@ -117,6 +117,10 @@ enum Arm {
     Blocking,
     RingBlocking,
     RingPoll,
+    /// The device never computes the EOS flag; the host learns it from the
+    /// drained ids on the commit cadence, so the run overruns an EOS by up to a
+    /// commit period (#677).
+    RingHostDrain,
 }
 
 /// One of the three arms, behind an enum rather than a `dyn`: the loop stays
@@ -143,6 +147,9 @@ fn strategy(arm: &Arm, device: &Device, capacity: usize) -> Result<AnyArm> {
             )?
             .with_poll_budget(20_000),
         ),
+        Arm::RingHostDrain => {
+            AnyArm::Ring(Ring::new(&[EOS], device, capacity, EosRead::HostOnDrain)?)
+        }
     })
 }
 
@@ -205,6 +212,30 @@ impl ReadbackStrategy for AnyArm {
             AnyArm::Ring(r) => r.drain_all(),
         }
     }
+    fn eos_in_drained(&self, batch: &[u32]) -> Option<usize> {
+        match self {
+            AnyArm::Blocking(b) => b.eos_in_drained(batch),
+            AnyArm::Ring(r) => r.eos_in_drained(batch),
+        }
+    }
+    fn note_eos_truncation(&mut self, dropped_in_batch: usize) {
+        match self {
+            AnyArm::Blocking(b) => b.note_eos_truncation(dropped_in_batch),
+            AnyArm::Ring(r) => r.note_eos_truncation(dropped_in_batch),
+        }
+    }
+    fn apply_backpressure(&mut self, cap: usize) -> Result<()> {
+        match self {
+            AnyArm::Blocking(b) => b.apply_backpressure(cap),
+            AnyArm::Ring(r) => r.apply_backpressure(cap),
+        }
+    }
+    fn eos_read_arm(&self) -> &'static str {
+        match self {
+            AnyArm::Blocking(b) => b.eos_read_arm(),
+            AnyArm::Ring(r) => r.eos_read_arm(),
+        }
+    }
     fn counters(&self) -> lloom::generation::ReadbackCounters {
         match self {
             AnyArm::Blocking(b) => b.counters(),
@@ -260,6 +291,7 @@ fn every_arm_produces_the_same_ids_as_the_host_chain() -> Result<()> {
             (Arm::RingBlocking, 1),
             (Arm::RingPoll, 0),
             (Arm::RingPoll, 1),
+            (Arm::RingHostDrain, 1),
         ] {
             let opts = DecodeOptions {
                 lookahead,
@@ -274,6 +306,79 @@ fn every_arm_produces_the_same_ids_as_the_host_chain() -> Result<()> {
             assert_eq!(pos, 1 + 24, "{device:?} lookahead {lookahead}");
             assert_eq!(out.stats.step_ns.len(), 24);
             assert_eq!(out.stats.overrun, 0);
+        }
+    }
+    Ok(())
+}
+
+/// The host-on-drain arm learns EOS from the drained ids, so it overruns by
+/// as many forwards as the commit period let it enqueue past the EOS — and
+/// it must report exactly that count, drop the overrun from the ids, and leave
+/// the ring clean for a second run on the same strategy (#677: at HEAD the
+/// arm reported `overrun = 0` and left the undrained overrun slots behind, so
+/// a second `decode` on the same ring would have returned them as tokens).
+#[test]
+fn the_host_drain_arm_reports_its_overrun_and_a_second_run_starts_clean() -> Result<()> {
+    for device in devices() {
+        let (want, hit) = chain(1, 64);
+        assert!(hit);
+        for period in [1usize, 4, 8] {
+            let model = Chain::new(&device)?;
+            let mut session = Session::new(&model, 0usize);
+            let mut spec = IdentityProposer;
+            let mut rb = strategy(&Arm::RingHostDrain, &device, 128)?;
+            let mut sampler = greedy();
+            let opts = DecodeOptions {
+                lookahead: 1,
+                budget: if period == 1 {
+                    CommitBudget::per_token()
+                } else {
+                    CommitBudget::steps(period)?
+                },
+                ..DecodeOptions::new(64)
+            };
+            let out = session.decode(&mut spec, &mut rb, &mut sampler, &[1], &opts, &mut sink)?;
+            assert_eq!(out.ids, want, "{device:?} steps:{period}");
+            assert!(out.eos);
+            // The EOS token was fed, plus everything enqueued before the drain
+            // that showed it: at least 1, at most a commit period's worth.
+            assert!(
+                out.stats.overrun >= 1 && out.stats.overrun <= period,
+                "{device:?} steps:{period}: overrun {} outside [1, {period}]",
+                out.stats.overrun
+            );
+            // The cache position is the token log plus the overrun, exactly.
+            assert_eq!(session.pos(), 1 + want.len() + out.stats.overrun);
+            assert_eq!(session.overrun(), out.stats.overrun);
+            assert_eq!(session.tokens(), [&[1u32][..], &want[..]].concat());
+            // Publishes reconcile: every publish is a kept id, the EOS, or a
+            // discarded overrun.
+            let c = out.stats.readback;
+            assert_eq!(
+                c.ring_publishes,
+                out.ids.len() as u64 + c.ring_eos_publishes + c.ring_discarded,
+                "{device:?} steps:{period}: {c:?} against {} ids",
+                out.ids.len()
+            );
+            assert_eq!(c.ring_eos_publishes, 1);
+            assert_eq!(c.ring_discarded as usize, out.stats.overrun - 1);
+
+            // A second run on the SAME ring, after the sequence is reset, must
+            // not see the first run's overrun slots as its own tokens. The
+            // position-counter cache resets by assignment.
+            session = Session::new(&model, 0usize);
+            let (want0, _) = chain(0, 12);
+            let opts2 = DecodeOptions {
+                max_tokens: 12,
+                ..opts
+            };
+            let out2 = session.decode(&mut spec, &mut rb, &mut sampler, &[0], &opts2, &mut sink)?;
+            assert_eq!(
+                out2.ids, want0,
+                "{device:?} steps:{period}: second run polluted"
+            );
+            assert_eq!(out2.stats.overrun, 0);
+            assert_eq!(rb.eos_read_arm(), "drain");
         }
     }
     Ok(())
@@ -599,6 +704,13 @@ fn the_arms_render_from_the_strategy() -> Result<()> {
     let p = Ring::new(&[EOS], &device, 4, EosRead::Poll(PollMechanism::default()))?;
     assert!(p.arms().token_ring && p.arms().nonblocking_eos);
     assert!(!b.admits_lookahead() && r.admits_lookahead() && p.admits_lookahead());
+    // The EOS-learning arm is the strategy's own answer, one spelling each.
+    let d = Ring::new(&[EOS], &device, 4, EosRead::HostOnDrain)?;
+    assert_eq!(b.eos_read_arm(), "host");
+    assert_eq!(r.eos_read_arm(), "flag");
+    assert_eq!(p.eos_read_arm(), "poll");
+    assert_eq!(d.eos_read_arm(), "drain");
+    assert!(d.arms().token_ring && d.arms().nonblocking_eos);
     Ok(())
 }
 

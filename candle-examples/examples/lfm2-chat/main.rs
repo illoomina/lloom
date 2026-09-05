@@ -118,6 +118,34 @@ struct Args {
     #[arg(long)]
     dspark: bool,
 
+    /// Install the ICB replay executor on the decode path (issue #146/#169). The
+    /// stable, packed subset of a decode step is recorded into an
+    /// `MTLIndirectCommandBuffer` and replayed each step instead of re-encoded on
+    /// the CPU. Forces `--param-style packed` (an ICB command cannot carry an
+    /// inline constant). The executor's own overhead was measured +2.28% in the
+    /// trace harness (§11.3s), BUT that number was single-turn/single-regime and
+    /// never run on this full non-blocking decode — this flag is how we A/B it
+    /// here. Off by default. Pair with `--replay-barriers skip-replayed` for the
+    /// separable barrier-suppression win (§11.3r, −0.83% GPU-side).
+    #[arg(long)]
+    replay: bool,
+
+    /// With `--replay`: whether candle's own `auto_barrier` still fires at a
+    /// position the ICB already replays. `always` (the shipped behavior — a
+    /// redundant barrier at 393 of 505 positions, §11.3p) or `skip-replayed`
+    /// (issue #144: suppress candle's barrier at a non-head replayed member,
+    /// keeping the ICB's own ordering). `skip-replayed` is the measured −0.83%
+    /// GPU-side win (§11.3r) and the reason to run replay at all at B=1.
+    #[arg(long, default_value = "skip-replayed")]
+    replay_barriers: String,
+
+    /// With `--replay`: how far back an ICB command's barrier scan looks —
+    /// `run-start` (#115's shipped behavior: barrier wherever a command conflicts
+    /// with anything earlier in the run) or `since-barrier` (scan only to the
+    /// previous barrier, matching candle's `auto_barrier`). §11.3l open question 3.
+    #[arg(long, default_value = "run-start")]
+    replay_barrier_scope: String,
+
     /// The draft block size K when `--dspark` is set — how many tokens the drafter
     /// proposes per round. The DSpark drafter's block is FIXED at
     /// `block_size − logits_start` (9 for the 2.6B DSpark checkpoint) and has no
@@ -476,6 +504,16 @@ fn main() -> Result<()> {
     // bytes, not anything this example selects. A warm page cache hides it (the
     // "sub-second" cold-vs-warm difference); the number the demo shows is the
     // honest steady one.
+    // `--replay` needs packed params BEFORE any recorded forward: an ICB command
+    // binds one `device const Params*`, not the inline scalars the split arm
+    // emits, so the step the executor records must already be packed. Set it here
+    // (before warmup) so the recorded shape matches the replayed one.
+    #[cfg(feature = "metal")]
+    if args.replay {
+        use candle::kernels::{set_default_param_style, ParamStyle};
+        set_default_param_style(ParamStyle::Packed);
+    }
+
     let model = Model::new(&config, vb).context("constructing LFM2")?;
     let cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
 
@@ -521,6 +559,40 @@ fn main() -> Result<()> {
         "[loaded in \x1b[1;96m{:.2}s\x1b[0m (mmap + construct + warmup: {libs} libs, {pipes} pipelines)]",
         load_start.elapsed().as_secs_f64()
     );
+
+    // Install the ICB replay executor AFTER warmup — so the warmup's forwards do
+    // not pollute the recorded step — and before the timed decode. The executor
+    // records `ICB_RECORD_STEPS` real decode steps, then replays the stable
+    // packed subset each step. `--replay-barriers skip-replayed` is the separable
+    // barrier-suppression win (§11.3r); `--replay-barrier-scope` is §11.3l's
+    // open question 3. Metal-only; a no-op wherever `--replay` is off.
+    #[cfg(feature = "metal")]
+    if args.replay {
+        use candle::kernels::metal::ExecutorSlot;
+        use candle::kernels::{BarrierScope, IcbExecutor, ReplayBarriers};
+        const ICB_RECORD_STEPS: usize = 3;
+        let scope = match args.replay_barrier_scope.as_str() {
+            "run-start" => BarrierScope::RunStart,
+            "since-barrier" => BarrierScope::SinceBarrier,
+            other => anyhow::bail!(
+                "--replay-barrier-scope must be `run-start` or `since-barrier`, got `{other}`"
+            ),
+        };
+        let barriers = match args.replay_barriers.as_str() {
+            "always" => ReplayBarriers::Always,
+            "skip-replayed" => ReplayBarriers::SkipReplayed,
+            other => anyhow::bail!(
+                "--replay-barriers must be `always` or `skip-replayed`, got `{other}`"
+            ),
+        };
+        // `configured` already returns `Arc<IcbExecutor>` — do not re-wrap it
+        // (the `Arc<Arc<_>>` is what does not coerce to `Arc<dyn Executor>`).
+        let exec = IcbExecutor::configured(ICB_RECORD_STEPS, scope, barriers);
+        if let Device::Metal(dev) = &device {
+            dev.set_executor(std::sync::Arc::new(ExecutorSlot::Custom(exec)));
+        }
+        eprintln!("[replay: ICB executor installed — barriers={barriers:?} scope={scope:?} param-style=packed]");
+    }
 
     let sampling = if args.temperature <= 0.0 {
         Sampling::ArgMax

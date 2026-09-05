@@ -663,9 +663,12 @@ impl IcbExecutor {
     /// each run's own residency set (`DESIGN.md` §11.3w's `runs x |resident|`,
     /// with `|resident|` per run rather than plan-wide).
     pub fn residency_per_step(&self) -> usize {
-        self.inner.lock().unwrap().plan.as_ref().map_or(0, |p| {
-            p.runs.iter().map(|r| r.range.resident.len()).sum()
-        })
+        self.inner
+            .lock()
+            .unwrap()
+            .plan
+            .as_ref()
+            .map_or(0, |p| p.runs.iter().map(|r| r.range.resident.len()).sum())
     }
 
     /// Distinct buffers bound across the whole plan -- what every run declared
@@ -681,12 +684,17 @@ impl IcbExecutor {
 
     /// Each run's residency set, as buffer addresses, in run order.
     pub fn run_residency(&self) -> Vec<Vec<usize>> {
-        self.inner.lock().unwrap().plan.as_ref().map_or(Vec::new(), |p| {
-            p.runs
-                .iter()
-                .map(|r| r.range.resident.iter().map(Buffer::raw_addr).collect())
-                .collect()
-        })
+        self.inner
+            .lock()
+            .unwrap()
+            .plan
+            .as_ref()
+            .map_or(Vec::new(), |p| {
+                p.runs
+                    .iter()
+                    .map(|r| r.range.resident.iter().map(Buffer::raw_addr).collect())
+                    .collect()
+            })
     }
 
     /// Barriers encoded onto ICB commands.
@@ -897,7 +905,9 @@ fn encode_plan(
             run_at[pos] = Some(runs.len());
             runs.push(RunBuild::open(pos, cmd_index));
         }
-        let run = runs.last_mut().expect("a run is open: the branch above opens one at cmd_index 0");
+        let run = runs
+            .last_mut()
+            .expect("a run is open: the branch above opens one at cmd_index 0");
         let d = &step[pos];
         // SAFETY: `cmd_index < covered.len()`, the count the ICB was created
         // with -- the loop is over exactly that slice.

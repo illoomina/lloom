@@ -2157,7 +2157,7 @@ impl ConstantsPool {
             counters.unchanged += 1;
             return Ok(slot.buf.clone());
         }
-        let idle = slot.clock != clock_id || clock.map_or(true, |c| c.is_complete(slot.epoch));
+        let idle = slot.clock != clock_id || clock.is_none_or(|c| c.is_complete(slot.epoch));
         if idle {
             write_block(&slot.buf, bytes);
             slot.epoch = epoch;

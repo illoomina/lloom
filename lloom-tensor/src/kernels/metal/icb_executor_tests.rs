@@ -634,8 +634,10 @@ fn run_two_runs(
     for _ in 0..steps {
         {
             let guard = cmds.command_encoder().unwrap();
-            let links: [(&crate::kernels::metal::Buffer, &crate::kernels::metal::Buffer); 5] =
-                [(&src, &a), (&a, &b), (&b, &a), (&a, &b), (&b, &a)];
+            let links: [(
+                &crate::kernels::metal::Buffer,
+                &crate::kernels::metal::Buffer,
+            ); 5] = [(&src, &a), (&a, &b), (&b, &a), (&a, &b), (&b, &a)];
             for (i, (from, to)) in links.iter().enumerate() {
                 // Position 2 binds its scalars inline, so no ICB command can
                 // hold it (§3.7c) and the covered positions split around it.
@@ -701,23 +703,56 @@ fn each_run_declares_only_the_buffers_its_own_commands_bind() {
     assert!(executor.is_replaying(), "nothing was replayed");
     let coverage = executor.coverage();
     assert_eq!(
-        (coverage.positions, coverage.covered, coverage.inline_constants),
+        (
+            coverage.positions,
+            coverage.covered,
+            coverage.inline_constants
+        ),
         (5, 4, 1),
         "the fixture is four packed positions around one classical: {coverage:?}"
     );
-    assert_eq!(executor.runs(), 2, "the classical position splits the covered set in two");
+    assert_eq!(
+        executor.runs(),
+        2,
+        "the classical position splits the covered set in two"
+    );
     assert_eq!(executor.stale_positions(), 0);
 
     let runs = executor.run_residency();
     assert_eq!(runs.len(), 2);
-    assert_eq!(runs[0].len(), 5, "run 0: src, a, b and two params blocks: {:?}", runs[0]);
-    assert_eq!(runs[1].len(), 4, "run 1: a, b and two params blocks: {:?}", runs[1]);
-    assert_eq!(executor.plan_resident(), 7, "src, a, b and four params blocks");
-    assert_eq!(executor.residency_per_step(), 9, "5 + 4, against a plan-wide 2 x 7 = 14");
+    assert_eq!(
+        runs[0].len(),
+        5,
+        "run 0: src, a, b and two params blocks: {:?}",
+        runs[0]
+    );
+    assert_eq!(
+        runs[1].len(),
+        4,
+        "run 1: a, b and two params blocks: {:?}",
+        runs[1]
+    );
+    assert_eq!(
+        executor.plan_resident(),
+        7,
+        "src, a, b and four params blocks"
+    );
+    assert_eq!(
+        executor.residency_per_step(),
+        9,
+        "5 + 4, against a plan-wide 2 x 7 = 14"
+    );
     for run in &runs {
-        assert!(run.contains(&a) && run.contains(&b), "every command binds a or b: {run:?}");
+        assert!(
+            run.contains(&a) && run.contains(&b),
+            "every command binds a or b: {run:?}"
+        );
     }
-    assert!(runs[0].contains(&src), "run 0's first command reads src: {:?}", runs[0]);
+    assert!(
+        runs[0].contains(&src),
+        "run 0's first command reads src: {:?}",
+        runs[0]
+    );
     assert!(
         !runs[1].contains(&src),
         "run 1 never binds src; declaring it there is the plan-wide set: {:?}",
@@ -726,6 +761,13 @@ fn each_run_declares_only_the_buffers_its_own_commands_bind() {
 
     // The replay still computes what the classical path did, with the narrower
     // declaration. Non-vacuity beside the equality, per §3.7a.
-    assert!(distinct(&replayed) > 2, "{} distinct values", distinct(&replayed));
-    assert_eq!(replayed, classical, "replayed output differs from the classical path");
+    assert!(
+        distinct(&replayed) > 2,
+        "{} distinct values",
+        distinct(&replayed)
+    );
+    assert_eq!(
+        replayed, classical,
+        "replayed output differs from the classical path"
+    );
 }

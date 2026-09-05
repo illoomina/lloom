@@ -38,7 +38,11 @@ fn a_slot_is_rewritten_only_after_its_last_reader_completes() {
     // Step 1, same bytes, epoch 0 still open: the slot itself, nothing written.
     pool.reset();
     let again = pool.next(&device, &a, Some(&clock)).unwrap();
-    assert_eq!(again.raw_addr(), slot.raw_addr(), "unchanged bytes must keep the slot's identity");
+    assert_eq!(
+        again.raw_addr(),
+        slot.raw_addr(),
+        "unchanged bytes must keep the slot's identity"
+    );
 
     // Step 2, new bytes, epoch 0 still open: the reader from step 1 may be
     // executing, so the dispatch gets a private buffer and the slot keeps `a`.
@@ -50,7 +54,11 @@ fn a_slot_is_rewritten_only_after_its_last_reader_completes() {
         "a slot whose reader may be in flight must not be rewritten"
     );
     assert_eq!(read(&private, b.len()), b);
-    assert_eq!(read(&slot, a.len()), a, "the slot must be left as its in-flight reader saw it");
+    assert_eq!(
+        read(&slot, a.len()),
+        a,
+        "the slot must be left as its in-flight reader saw it"
+    );
 
     // The GPU finishes epoch 0.
     let closed = clock.commit_epoch();
@@ -61,7 +69,11 @@ fn a_slot_is_rewritten_only_after_its_last_reader_completes() {
     // so the position's identity is back on the slot.
     pool.reset();
     let rewritten = pool.next(&device, &b, Some(&clock)).unwrap();
-    assert_eq!(rewritten.raw_addr(), slot.raw_addr(), "an idle slot is rewritten, not replaced");
+    assert_eq!(
+        rewritten.raw_addr(),
+        slot.raw_addr(),
+        "an idle slot is rewritten, not replaced"
+    );
     assert_eq!(read(&slot, b.len()), b);
 
     let c = pool.counters();

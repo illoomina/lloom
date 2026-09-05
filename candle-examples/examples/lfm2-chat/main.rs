@@ -655,7 +655,11 @@ fn main() -> Result<()> {
         eprintln!(
             "[replay: ICB executor installed — barriers={barriers:?} scope={scope:?} \
              param-style=packed arena={}]",
-            if arena { "packed (recorded from the first decode steps)" } else { "off" }
+            if arena {
+                "packed (recorded from the first decode steps)"
+            } else {
+                "off"
+            }
         );
     }
 
@@ -919,7 +923,11 @@ fn main() -> Result<()> {
         if dtype == DType::F16 { "f16" } else { "f32" },
         device,
         !args.no_bos,
-        if args.dspark { "dspark" } else { &args.readback },
+        if args.dspark {
+            "dspark"
+        } else {
+            &args.readback
+        },
         args.lookahead,
         budget.arm(),
         st.commits,
@@ -1016,7 +1024,8 @@ fn report_replay(exec: &candle::kernels::IcbExecutor, steps: u64) {
     // The residency arm is named from the plan, not from the variable that
     // selected it (§7.1a-i): per-run declares `residency_per_step`, plan-wide
     // declares `runs x plan_wide`.
-    let arm = if exec.runs() > 0 && exec.residency_per_step() == exec.runs() * exec.plan_resident() {
+    let arm = if exec.runs() > 0 && exec.residency_per_step() == exec.runs() * exec.plan_resident()
+    {
         "plan-wide"
     } else {
         "per-run"

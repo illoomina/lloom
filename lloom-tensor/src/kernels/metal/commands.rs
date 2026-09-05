@@ -696,7 +696,11 @@ impl Commands {
             // after work it never touches.
             let enc = state_guard
                 .current
-                .compute_command_encoder_with_executor(&fence, &self.prev_ce_outputs, &self.executor())
+                .compute_command_encoder_with_executor(
+                    &fence,
+                    &self.prev_ce_outputs,
+                    &self.executor(),
+                )
                 .with_clock(Arc::clone(&self.clock));
             // Hazard state is per encoder, so a barrier count is only
             // interpretable against the session boundaries (`DESIGN.md` §9.2e).

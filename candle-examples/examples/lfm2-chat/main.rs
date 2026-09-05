@@ -152,13 +152,19 @@ struct Args {
     #[arg(long)]
     phase_sync: bool,
 
-    /// Prepend the tokenizer's BOS (`<|startoftext|>`) to the templated prompt.
-    /// The checkpoint's chat template begins `{{- bos_token -}}` and llama.cpp
-    /// adds it; `tokenizers::encode(…, false)` does not, so without this flag
-    /// the model runs off its own template. Off by default: it moves every
-    /// digest, and the default flip is its own argued decision (§7.1a).
+    /// Drop the leading BOS (`<|startoftext|>`, 124894). It is prepended by
+    /// DEFAULT: `generation_config.json` and llama.cpp both start LFM2 with it,
+    /// and `tokenizers::encode(…, false)` does not, so omitting it ran the model
+    /// off its own template. With BOS on (and the EOS set corrected to
+    /// `<|im_end|>` only — the two are coupled), DSpark acceptance and throughput
+    /// rise on every prompt and replies terminate cleanly: measured
+    /// relativity 75.7 → 93.7, structured-extract 139 → 178 tok/s, short-factual
+    /// completes on EOS at 90.8. This flag restores the old off-template
+    /// tokenization for the A/B only; it lowers acceptance and, without the EOS
+    /// fix, drives a non-terminating ramble. Turning BOS on moves the canonical
+    /// digests — to the correct, template-conformant output.
     #[arg(long)]
-    bos: bool,
+    no_bos: bool,
 }
 
 /// The LFM2.5-2.6B snapshot dir in the HF cache, if it is there.
@@ -471,9 +477,17 @@ fn main() -> Result<()> {
     let cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
 
     // EOS ids: the config's, plus the chat-end / end-of-text tokens.
+    // Stop on `<|im_end|>` (124900) only — the model's declared EOS. `config.json`,
+    // `generation_config.json` (`eos_token_id: [124900]`) and the GGUF llama.cpp
+    // uses all agree on that single id. `<|endoftext|>` (124895) was ALSO added
+    // here, but nothing declares it an EOS — it is the base model's document
+    // separator, which the model can emit mid-reply; stopping on it cuts replies
+    // early and, in the speculative loop, lets the drafter propose a spurious
+    // boundary the target never treats as one. Removed to match the checkpoint's
+    // (and llama.cpp's) actual stop set.
     let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
-    for tok in ["<|im_end|>", "<|endoftext|>"] {
-        if let Some(id) = tokenizer.token_to_id(tok) {
+    if let Some(id) = tokenizer.token_to_id("<|im_end|>") {
+        if !eos_ids.contains(&id) {
             eos_ids.push(id);
         }
     }
@@ -526,10 +540,13 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?
         .get_ids()
         .to_vec();
-    if args.bos {
+    // BOS by default — the model's template start (see `--no-bos`). Coupled with
+    // the `<|im_end|>`-only EOS set above: together they lift acceptance and make
+    // replies terminate; BOS without the EOS fix drove a non-terminating ramble.
+    if !args.no_bos {
         let bos = tokenizer
             .token_to_id("<|startoftext|>")
-            .context("tokenizer has no <|startoftext|>")?;
+            .context("tokenizer has no <|startoftext|> — LFM2's BOS")?;
         prompt_ids.insert(0, bos);
     }
 
@@ -743,7 +760,7 @@ fn main() -> Result<()> {
         b(format!("{ttft_ms:.1}")),
         if dtype == DType::F16 { "f16" } else { "f32" },
         device,
-        args.bos,
+        !args.no_bos,
         if args.dspark { "dspark" } else { &args.readback },
         args.lookahead,
         budget.arm(),

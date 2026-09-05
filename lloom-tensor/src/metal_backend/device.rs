@@ -1,5 +1,6 @@
 use crate::{DType, Result};
 
+use crate::kernels::metal::CommandMarker;
 #[cfg(feature = "ug")]
 use crate::kernels::metal::ComputePipeline;
 use crate::kernels::{
@@ -611,6 +612,22 @@ impl MetalDevice {
     pub fn flush_and_wait_current(&self) -> Result<()> {
         self.commands
             .flush_and_wait_current()
+            .map_err(MetalError::from)?;
+        self.drain_completed_buffers();
+        Ok(())
+    }
+
+    /// Commit the current command buffer and return a marker for it
+    /// (`Commands::flush_marker`).
+    pub fn flush_marker(&self) -> Result<CommandMarker> {
+        Ok(self.commands.flush_marker().map_err(MetalError::from)?)
+    }
+
+    /// Wait on `marker`'s buffer only — later commits keep running — then
+    /// return completed buffers to their pools, as every wait here does.
+    pub fn wait_marker(&self, marker: &CommandMarker) -> Result<()> {
+        self.commands
+            .wait_marker(marker)
             .map_err(MetalError::from)?;
         self.drain_completed_buffers();
         Ok(())

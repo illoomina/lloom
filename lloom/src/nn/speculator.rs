@@ -369,6 +369,34 @@ pub trait Probes<P: TargetProbe>: CausalLM {
         cache: &mut Self::Cache,
     ) -> Result<(Vec<Vec<u32>>, P::Output)>;
 
+    /// The receipt of a verify pass that has been encoded and not read back.
+    type Pending;
+
+    /// Encode one sequence's verify — the target forward over `[last, draft…]`
+    /// and its argmax — and return without waiting for the GPU. The host learns
+    /// nothing here; [`Self::verify_complete`] reads the result back.
+    ///
+    /// The split is what lets a driver run another sequence's draft and
+    /// observe while this verify is on the GPU
+    /// ([`Session::decode_speculative_pipelined`]). [`Self::verify_and_probe`]
+    /// is the two halves back to back and stays the single-sequence path.
+    fn verify_enqueue(
+        &self,
+        draft: &Draft,
+        anchor: &Anchor,
+        cache: &mut Self::Cache,
+    ) -> Result<Self::Pending>;
+
+    /// Read back the pass [`Self::verify_enqueue`] encoded: the accepted tokens
+    /// (never empty) and the round's probe, with the cache resolved to the
+    /// accepted length. The wait is on the pass's own command buffer, so work
+    /// queued behind it — another sequence's round — keeps running.
+    fn verify_complete(
+        &self,
+        pending: Self::Pending,
+        cache: &mut Self::Cache,
+    ) -> Result<(Vec<u32>, P::Output)>;
+
     /// Drain the probe the last non-verify pass (the prefill) left in `cache`,
     /// covering every position that pass ran. A drafter is keyed from the
     /// prompt with this before round 0 — the prompt is the context a draft
@@ -423,6 +451,11 @@ pub struct RoundTiming {
     pub draft_ns: u64,
     pub verify_ns: u64,
     pub observe_ns: u64,
+    /// Under the pipelined driver, the two halves of `verify_ns`: the host's
+    /// encode of the verify, and the wait for its readback (which is where the
+    /// other sequences' work overlaps). Zero on the serial round.
+    pub verify_enqueue_ns: u64,
+    pub verify_wait_ns: u64,
     /// Host readbacks (each one a wait for the GPU) per phase, from the Metal
     /// backend's `to_cpu` counters; 0 off Metal. The speculative round owes
     /// exactly one, in the verify — the count is what shows a draft that
@@ -455,11 +488,11 @@ impl RoundTiming {
 
 /// Host readbacks performed so far by this process (Metal's two `to_cpu`
 /// paths summed); 0 on other backends.
-fn readbacks() -> u64 {
+pub(crate) fn readbacks() -> u64 {
     #[cfg(feature = "metal")]
     {
         let (fast, blit) = lloom_tensor::metal_backend::to_cpu_counts();
-        fast + blit
+        fast + blit + lloom_tensor::metal_backend::to_cpu_staged_count()
     }
     #[cfg(not(feature = "metal"))]
     {

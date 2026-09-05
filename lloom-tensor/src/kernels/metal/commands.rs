@@ -202,6 +202,20 @@ impl Drop for BlitCommandsGuard<'_> {
     }
 }
 
+/// A committed command buffer a caller can wait on by itself.
+///
+/// Taken by [`Commands::flush_marker`] once a result is fully encoded: waiting
+/// on it waits for that result and for nothing committed after it. The value
+/// [`Commands::flush_and_wait_current`] waits on is the queue's tail, which is
+/// the right wait for a single stream and the wrong one for two interleaved.
+#[derive(Clone, Debug)]
+pub struct CommandMarker {
+    cb: CommandBuffer,
+    /// The shared-event value encoded on the buffer for the async completion
+    /// arms; `None` on the blocking arm.
+    signalled: Option<u64>,
+}
+
 struct EntryState {
     current: CommandBuffer,
     in_flight: Vec<CommandBuffer>,
@@ -820,6 +834,49 @@ impl Commands {
                 .in_flight
                 .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
         }
+        Ok(())
+    }
+
+    /// Commit the current command buffer and return a marker for it.
+    ///
+    /// Everything encoded so far is at or before the marker (the queue is
+    /// FIFO), so [`Self::wait_marker`] waits for exactly that work and not for
+    /// anything committed afterwards. [`Self::flush_and_wait_current`] waits on
+    /// the tail of `in_flight` instead, which drains every later commit too —
+    /// the reason a readback in one sequence's round stalls behind another
+    /// sequence's queued work.
+    pub fn flush_marker(&self) -> Result<CommandMarker, MetalKernelError> {
+        let mut state = self.state.lock()?;
+        let signalled = self.commit_swap_locked(&mut state, 0)?;
+        let cb = state.in_flight.last().cloned().ok_or_else(|| {
+            MetalKernelError::CommandBufferError(
+                "flush_marker: commit_swap_locked left no buffer in flight".to_string(),
+            )
+        })?;
+        Ok(CommandMarker { cb, signalled })
+    }
+
+    /// Wait for the marker's buffer only; commits made after it keep running.
+    ///
+    /// Same completion seam and counters as [`Self::flush_and_wait_current`];
+    /// only the buffer waited on differs.
+    pub fn wait_marker(&self, marker: &CommandMarker) -> Result<(), MetalKernelError> {
+        let outcome = Self::ensure_completed_via(
+            &marker.cb,
+            self.completion_wait,
+            self.completion_event.as_ref(),
+            marker.signalled,
+        )?;
+        self.completion_polls
+            .fetch_add(outcome.polls, Ordering::Relaxed);
+        self.completion_fires
+            .fetch_add(outcome.fired, Ordering::Relaxed);
+        self.completion_already_complete
+            .fetch_add(outcome.already_complete, Ordering::Relaxed);
+        let mut state = self.state.lock()?;
+        state
+            .in_flight
+            .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
         Ok(())
     }
 

@@ -41,7 +41,7 @@
 use crate::generation::{CommitBudget, LogitsProcessor, ReadbackCounters, ReadbackStrategy};
 use crate::nn::model::{CacheReset, CausalLM};
 use crate::nn::speculator::{
-    Anchor, Draft, NoProbe, Probes, RoundProbe, RoundTiming, SeqId, Session, Speculator,
+    readbacks, Anchor, Draft, NoProbe, Probes, RoundProbe, RoundTiming, SeqId, Session, Speculator,
     TargetProbe,
 };
 use lloom_tensor::{Device, Result, Tensor};
@@ -130,6 +130,9 @@ pub struct RoundStats {
     pub accepted: usize,
     /// The three phases' brackets; see [`RoundTiming`].
     pub timing: RoundTiming,
+    /// Host time from the run's first prefill to this round's start, so rounds
+    /// of different sequences can be laid on one timeline.
+    pub start_ns: u64,
 }
 
 impl DecodeOptions {
@@ -187,6 +190,24 @@ pub struct DecodeOut {
     /// Whether the run stopped on an EOS rather than on `max_tokens`.
     pub eos: bool,
     pub stats: DecodeStats,
+}
+
+/// One sequence's cursor through [`Session::decode_speculative_pipelined`].
+struct Lane<P> {
+    anchor_tok: u32,
+    produced: usize,
+    eos: bool,
+    all_ids: Vec<u32>,
+    pos_before: usize,
+    prompt_len: usize,
+    stats: DecodeStats,
+    /// The verify in flight, if one is.
+    pending: Option<P>,
+    /// The in-flight round's draft and enqueue brackets, completed when its
+    /// verify is read back.
+    in_flight: RoundTiming,
+    round_start_ns: u64,
+    done: bool,
 }
 
 /// Commit without waiting and prune the in-flight queue, on the backends that
@@ -764,6 +785,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             stats.rounds.push(RoundStats {
                 accepted: accepted.len(),
                 timing,
+                start_ns: (step_start - prefill_start).as_nanos() as u64,
             });
             if accepted.is_empty() {
                 lloom_tensor::bail!(
@@ -836,6 +858,297 @@ impl<'m, M: CausalLM> Session<'m, M> {
             eos,
             stats,
         })
+    }
+
+    /// [`Self::decode_speculative`] over several sequences at once, their
+    /// rounds software-pipelined so one sequence's verify runs on the GPU while
+    /// another's draft and observe are encoded
+    /// (`design/docs/speculative-pipeline-scheduler-design.md` §4a, §10).
+    ///
+    /// # What overlaps, and what cannot
+    ///
+    /// Within one sequence the round is dependency-locked: the next draft reads
+    /// the context `observe` rebuilds from this verify's taps. Across sequences
+    /// there is no such edge — each has its own cache and its own drafter slot
+    /// — so the loop keeps one verify per live sequence enqueued and services
+    /// them in turn: complete `i`'s verify, observe, publish, draft and enqueue
+    /// `i`'s next verify, then move to `i + 1`, whose verify has meanwhile been
+    /// running. The GPU is fed for as long as the host's turnaround on one
+    /// sequence is shorter than the others' queued work.
+    ///
+    /// The readback that ends a verify waits on that verify's own command
+    /// buffer ([`Probes::verify_complete`]), not on the queue's tail; a
+    /// tail wait would drain the other sequences' verifies and serialise the
+    /// whole thing back to the solo round.
+    ///
+    /// # Correctness
+    ///
+    /// Each sequence's stream is byte-identical to `decode_speculative` run
+    /// solo — the drafter's `PerSeq` slots and the target caches are disjoint,
+    /// and the accept rule is the same `accept_prefix`. The per-sequence
+    /// bookkeeping (`pos`, `tokens`, `overrun`, EOS mid-block, the `max_tokens`
+    /// cut) is the serial loop's. `sessions[i]` is driven with drafter slot
+    /// `SeqId(i)` and prompt `prompts[i]`; `on_tokens` receives `(i, ids)`.
+    ///
+    /// Refused: fewer drafter slots than sessions, an empty prompt, a session
+    /// with an unreconciled overrun, a proposer with `max_draft() == 0`.
+    /// `opts.sample_split` has no per-phase meaning here and is ignored.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_speculative_pipelined<S>(
+        sessions: &mut [Self],
+        spec: &mut S,
+        prompts: &[&[u32]],
+        opts: &DecodeOptions,
+        eos_ids: &[u32],
+        device: &Device,
+        on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+    ) -> Result<Vec<DecodeOut>>
+    where
+        S: Speculator,
+        M: Probes<S::Probe>,
+    {
+        let n = sessions.len();
+        if n == 0 {
+            lloom_tensor::bail!("decode_speculative_pipelined: no sessions");
+        }
+        if prompts.len() != n {
+            lloom_tensor::bail!(
+                "decode_speculative_pipelined: {} sessions and {} prompts",
+                n,
+                prompts.len()
+            );
+        }
+        if spec.max_draft() == 0 {
+            lloom_tensor::bail!(
+                "decode_speculative_pipelined: the proposer has max_draft 0 (the K=1 identity); \
+                 it belongs on `Session::decode`"
+            );
+        }
+        if spec.n_seq() < n {
+            lloom_tensor::bail!(
+                "decode_speculative_pipelined: the proposer has {} sequence slots for {} sessions",
+                spec.n_seq(),
+                n
+            );
+        }
+        if eos_ids.is_empty() {
+            lloom_tensor::bail!(
+                "decode_speculative_pipelined: eos_ids is empty, so the loop would never terminate"
+            );
+        }
+        for (i, s) in sessions.iter().enumerate() {
+            if prompts[i].is_empty() {
+                lloom_tensor::bail!(
+                    "decode_speculative_pipelined: sequence {i} has an empty prompt"
+                );
+            }
+            if s.seq.overrun > 0 {
+                lloom_tensor::bail!(
+                    "decode_speculative_pipelined: sequence {i}'s cache is {} positions past its \
+                     last token (an earlier run's overrun); `Session::reconcile` or \
+                     `Session::reset` first",
+                    s.seq.overrun
+                );
+            }
+        }
+        spec.want_confidence(false);
+        let run_start = std::time::Instant::now();
+
+        let mut lanes: Vec<Lane<<M as Probes<S::Probe>>::Pending>> = Vec::with_capacity(n);
+
+        // Prefill every sequence before reading any back, so the GPU has all
+        // the prompts queued while the host waits on the first.
+        let mut logits = Vec::with_capacity(n);
+        for (i, s) in sessions.iter_mut().enumerate() {
+            s.seq.last_logits = None;
+            let pos_before = s.seq.pos;
+            let prefill_start = std::time::Instant::now();
+            let input = Tensor::new(prompts[i], device)?.unsqueeze(0)?;
+            let l = s.model.forward(&input, s.seq.pos, &mut s.seq.cache)?;
+            s.seq.pos += prompts[i].len();
+            s.seq.tokens.extend_from_slice(prompts[i]);
+            logits.push(l);
+            lanes.push(Lane {
+                anchor_tok: 0,
+                produced: 0,
+                eos: false,
+                all_ids: Vec::with_capacity(opts.max_tokens),
+                pos_before,
+                prompt_len: prompts[i].len(),
+                stats: DecodeStats {
+                    step_ns: Vec::with_capacity(opts.max_tokens),
+                    prefill_ns: prefill_start.elapsed().as_nanos() as u64,
+                    ..DecodeStats::default()
+                },
+                pending: None,
+                in_flight: RoundTiming::default(),
+                round_start_ns: 0,
+                done: false,
+            });
+        }
+
+        // Anchors and drafter seeds, as the serial loop: the prefill's argmax is
+        // token 0 and the block anchor; the drafter is keyed from every prompt
+        // position (`design/docs/speculation.md` §10.2w).
+        for i in 0..n {
+            let lane = &mut lanes[i];
+            let s = &mut sessions[i];
+            let anchor_tok = logits[i]
+                .squeeze(0)?
+                .argmax(lloom_tensor::D::Minus1)?
+                .to_scalar::<u32>()?;
+            spec.begin(SeqId(i), prompts[i])?;
+            let prefill_probe = s.model.take_probe(&mut s.seq.cache)?;
+            spec.observe(SeqId(i), &prefill_probe, std::slice::from_ref(&anchor_tok))?;
+            lane.anchor_tok = anchor_tok;
+            if eos_ids.contains(&anchor_tok) {
+                lane.eos = true;
+            } else if lane.produced < opts.max_tokens {
+                on_tokens(i, std::slice::from_ref(&anchor_tok))?;
+                lane.all_ids.push(anchor_tok);
+                lane.produced += 1;
+            }
+            lane.done = lane.eos || lane.produced >= opts.max_tokens;
+        }
+        drop(logits);
+
+        // Prime: one verify in flight per live sequence.
+        for i in 0..n {
+            if !lanes[i].done {
+                Self::pipeline_enqueue(&mut sessions[i], &mut lanes[i], spec, i, run_start)?;
+            }
+        }
+
+        // Steady state: service the in-flight verifies round-robin. Completing
+        // lane `i` waits on its own buffer only; its next verify is enqueued
+        // behind the others' before the loop moves on.
+        loop {
+            let mut progressed = false;
+            for i in 0..n {
+                let Some(pending) = lanes[i].pending.take() else {
+                    continue;
+                };
+                progressed = true;
+                let lane = &mut lanes[i];
+                let s = &mut sessions[i];
+                let mut timing = std::mem::take(&mut lane.in_flight);
+
+                let t = std::time::Instant::now();
+                let rb = readbacks();
+                let (accepted, probe_out) = s.model.verify_complete(pending, &mut s.seq.cache)?;
+                timing.verify_wait_ns = t.elapsed().as_nanos() as u64;
+                timing.verify_ns = timing.verify_enqueue_ns + timing.verify_wait_ns;
+                timing.verify_readbacks += readbacks() - rb;
+
+                let t = std::time::Instant::now();
+                let rb = readbacks();
+                spec.observe(SeqId(i), &probe_out, &accepted)?;
+                timing.observe_ns = t.elapsed().as_nanos() as u64;
+                timing.observe_readbacks = readbacks() - rb;
+
+                if accepted.is_empty() {
+                    lloom_tensor::bail!(
+                        "decode_speculative_pipelined: a verify round accepted zero tokens; the \
+                         target's own prediction at position 0 is always correct, so this is a \
+                         broken verify"
+                    );
+                }
+                lane.stats.steps += 1;
+                lane.stats.rounds.push(RoundStats {
+                    accepted: accepted.len(),
+                    timing,
+                    start_ns: lane.round_start_ns,
+                });
+                s.seq.pos += accepted.len();
+                lane.anchor_tok = *accepted.last().unwrap();
+
+                let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
+                for &id in &accepted {
+                    if eos_ids.contains(&id) {
+                        lane.eos = true;
+                        break;
+                    }
+                    if lane.produced + batch.len() >= opts.max_tokens {
+                        break;
+                    }
+                    batch.push(id);
+                }
+                if !batch.is_empty() {
+                    on_tokens(i, &batch)?;
+                    lane.all_ids.extend_from_slice(&batch);
+                    lane.produced += batch.len();
+                }
+                lane.stats.step_ns.push(
+                    (run_start.elapsed().as_nanos() as u64).saturating_sub(lane.round_start_ns),
+                );
+                lane.done = lane.eos || lane.produced >= opts.max_tokens;
+                if !lane.done {
+                    Self::pipeline_enqueue(s, lane, spec, i, run_start)?;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+
+        // Per-sequence bookkeeping, as the serial loop: the fed ids are the
+        // stream's prefix of the cache's length, anything past it is overrun.
+        let mut outs = Vec::with_capacity(n);
+        for (i, lane) in lanes.into_iter().enumerate() {
+            let s = &mut sessions[i];
+            let fed = s.seq.pos - lane.pos_before - lane.prompt_len;
+            let in_cache = fed.min(lane.produced);
+            s.seq.tokens.extend_from_slice(&lane.all_ids[..in_cache]);
+            let overrun = fed - in_cache;
+            s.seq.overrun = overrun;
+            let mut stats = lane.stats;
+            stats.overrun = overrun;
+            stats.produced = lane.produced;
+            outs.push(DecodeOut {
+                ids: lane.all_ids,
+                eos: lane.eos,
+                stats,
+            });
+        }
+        Ok(outs)
+    }
+
+    /// Draft sequence `i` and enqueue its verify, leaving the receipt in the
+    /// lane. The draft is one drafter forward; nothing here waits for the GPU.
+    fn pipeline_enqueue<S>(
+        s: &mut Self,
+        lane: &mut Lane<<M as Probes<S::Probe>>::Pending>,
+        spec: &mut S,
+        i: usize,
+        run_start: std::time::Instant,
+    ) -> Result<()>
+    where
+        S: Speculator,
+        M: Probes<S::Probe>,
+    {
+        let anchor = Anchor {
+            last: lane.anchor_tok,
+            pos: s.seq.pos,
+        };
+        lane.round_start_ns = run_start.elapsed().as_nanos() as u64;
+        let mut timing = RoundTiming::default();
+        let t = std::time::Instant::now();
+        let rb = readbacks();
+        let drafts = spec.draft(&[SeqId(i)])?;
+        let draft = drafts.into_iter().next().ok_or_else(|| {
+            lloom_tensor::Error::msg("decode_speculative_pipelined: the drafter returned no block")
+        })?;
+        timing.draft_ns = t.elapsed().as_nanos() as u64;
+        timing.draft_readbacks = readbacks() - rb;
+
+        let t = std::time::Instant::now();
+        let rb = readbacks();
+        let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache)?;
+        timing.verify_enqueue_ns = t.elapsed().as_nanos() as u64;
+        timing.verify_readbacks = readbacks() - rb;
+        lane.in_flight = timing;
+        lane.pending = Some(pending);
+        Ok(())
     }
 
     /// Compile the Metal pipelines the first real forward would otherwise

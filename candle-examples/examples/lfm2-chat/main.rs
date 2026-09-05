@@ -749,6 +749,7 @@ fn main() -> Result<()> {
     let kv_arm = match config.kv_append {
         KvAppend::InPlace => "inplace",
         KvAppend::Cat => "cat",
+        KvAppend::Paged => "paged",
     };
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \

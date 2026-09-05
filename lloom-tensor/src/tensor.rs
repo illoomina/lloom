@@ -67,6 +67,38 @@ impl AsRef<Tensor> for Tensor {
 /// Tensors are reference counted with [`Arc`] so cloning them is cheap.
 pub struct Tensor(Arc<Tensor_>);
 
+/// A rank-1 tensor staged for a host read that waits only on its producer
+/// ([`Tensor::stage_read`]).
+#[derive(Debug)]
+pub enum StagedRead {
+    /// The bytes and the command buffer that wrote them, on Metal.
+    #[cfg(feature = "metal")]
+    Metal(crate::metal_backend::StagedMetalRead),
+    /// A backend whose reads do not queue: read at `to_vec1` time.
+    Plain(Tensor),
+}
+
+impl StagedRead {
+    /// The staged elements. On Metal this waits for the producing command
+    /// buffer and nothing committed after it.
+    pub fn to_vec1<S: crate::WithDType>(&self) -> Result<Vec<S>> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(staged) => {
+                if staged.dtype() != S::DTYPE {
+                    crate::bail!(
+                        "StagedRead::to_vec1: staged {:?}, asked as {:?}",
+                        staged.dtype(),
+                        S::DTYPE
+                    );
+                }
+                staged.read::<S>()
+            }
+            Self::Plain(t) => t.to_vec1::<S>(),
+        }
+    }
+}
+
 impl std::ops::Deref for Tensor {
     type Target = Tensor_;
 
@@ -1975,6 +2007,36 @@ impl Tensor {
             Storage::Cuda(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
             Storage::Metal(storage) => from_cpu_storage(&storage.to_cpu_storage()?),
         }
+    }
+
+    /// Stage this rank-1 tensor for a host read that waits only on the work
+    /// that produced it ([`StagedRead::to_vec1`]).
+    ///
+    /// Every other read — [`Self::to_vec1`], [`Self::to_scalar`] — waits on
+    /// the device queue's tail, so a result encoded before other work drains
+    /// that work too. On Metal this copies the tensor's bytes into a mapped
+    /// staging buffer inside the producing command buffer and remembers that
+    /// buffer; the later read waits for it alone. Call it right after the last
+    /// op that writes the tensor. On the CPU and CUDA backends the staged read
+    /// is a plain `to_vec1` taken at read time.
+    pub fn stage_read(&self) -> Result<StagedRead> {
+        if self.rank() != 1 {
+            Err(Error::UnexpectedNumberOfDims {
+                expected: 1,
+                got: self.rank(),
+                shape: self.shape().clone(),
+            }
+            .bt())?
+        }
+        #[cfg(feature = "metal")]
+        if let Storage::Metal(storage) = &*self.storage() {
+            let (o1, o2) = match self.layout.contiguous_offsets() {
+                Some(o) => o,
+                None => crate::bail!("stage_read: the tensor must be contiguous"),
+            };
+            return Ok(StagedRead::Metal(storage.stage_read(o1, o2 - o1)?));
+        }
+        Ok(StagedRead::Plain(self.clone()))
     }
 
     /// Read a contiguous 1D tensor **without waiting for the GPU**, or `None`

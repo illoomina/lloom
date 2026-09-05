@@ -54,6 +54,10 @@ pub use crate::kernels::metal::CutPolicy;
 /// eighteen issues.
 pub use crate::kernels::metal::completion::CompletionWait;
 
+/// A point in the command stream a readback can wait on by itself
+/// (`Tensor::to_vec1_marked`, `Device::flush_marker`).
+pub use crate::kernels::metal::CommandMarker;
+
 /// The memory budget: predict the peak before allocating, and refuse (§9.5).
 ///
 /// Re-exported for the same reason `trace` is: a model deciding whether its
@@ -96,6 +100,51 @@ pub static TO_CPU_BLIT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub fn to_cpu_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (TO_CPU_FAST.load(Relaxed), TO_CPU_BLIT.load(Relaxed))
+}
+
+/// Engagement counter for staged readbacks (`MetalStorage::stage_read` →
+/// `StagedMetalRead::read`): each is a wait on the producing command buffer's
+/// own marker, not on the queue's tail.
+pub static TO_CPU_STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Staged readbacks completed since process start.
+pub fn to_cpu_staged_count() -> u64 {
+    TO_CPU_STAGED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A rank-1 storage's bytes copied to a CPU-mapped staging buffer and fenced by
+/// the command buffer that produced them (`MetalStorage::stage_read`).
+///
+/// `read` waits on that buffer only — work committed after the stage (another
+/// sequence's round) keeps running — where `to_cpu` waits on the queue's tail.
+/// The staging copy is one blit of the tensor's bytes encoded in the producer's
+/// own buffer, so it costs no extra wait; it exists because whether the source
+/// allocation is CPU-mapped is the pool's decision (§15.2 #12a's 16384 B
+/// threshold), and a read that fell back to `to_cpu` when it was not would
+/// silently become the tail wait it was meant to avoid.
+#[derive(Debug)]
+pub struct StagedMetalRead {
+    staging: Arc<PooledBuffer>,
+    count: usize,
+    dtype: DType,
+    marker: CommandMarker,
+    device: MetalDevice,
+}
+
+impl StagedMetalRead {
+    /// Wait for the producing command buffer and copy the staged bytes out.
+    pub fn read<T: Clone>(&self) -> Result<Vec<T>> {
+        self.device.wait_marker(&self.marker)?;
+        TO_CPU_STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The staging buffer is from the shared pool, so its mapping is not
+        // the allocator's choice; `read_to_vec` still refuses a null rather
+        // than reading one.
+        Ok(read_to_vec(&self.staging, self.count))
+    }
+
+    pub fn dtype(&self) -> DType {
+        self.dtype
+    }
 }
 
 pub fn to_cpu_force_blit() -> bool {
@@ -2193,6 +2242,42 @@ impl MetalStorage {
             buffer
         };
         Ok(Self::new(buffer, device.clone(), el_count, dtype))
+    }
+
+    /// Stage `count` elements starting at element `offset` for a later host
+    /// read that waits on the producing command buffer only.
+    ///
+    /// One blit into a fresh shared-pool buffer, encoded now — in the same
+    /// command buffer as the last write — then the marker that closes it.
+    /// `StagedMetalRead::read` waits on that marker and reads the copy.
+    pub(crate) fn stage_read(&self, offset: usize, count: usize) -> Result<StagedMetalRead> {
+        if offset + count > self.count {
+            crate::bail!(
+                "stage_read: {offset}+{count} elements past a storage of {}",
+                self.count
+            );
+        }
+        let elem = self.dtype.size_in_bytes();
+        let bytes = (count * elem).max(1);
+        let staging = self
+            .device
+            .new_buffer_builder()
+            .with_size(bytes)
+            .with_label("staged_read_dst")
+            .build()?;
+        {
+            let mut blit = self.device.blit_command_encoder()?;
+            blit.set_label("staged_read");
+            blit.copy_from_buffer(&self.buffer, offset * elem, &staging, 0, count * elem);
+        }
+        let marker = self.device.flush_marker()?;
+        Ok(StagedMetalRead {
+            staging,
+            count,
+            dtype: self.dtype,
+            marker,
+            device: self.device.clone(),
+        })
     }
 
     /// Read the buffer **without waiting for the GPU**, or `None` if it is not

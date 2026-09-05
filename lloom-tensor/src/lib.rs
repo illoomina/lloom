@@ -113,7 +113,7 @@ pub use shape::{Shape, D};
 pub use storage::{KvScatterGeometry, Storage};
 pub use streaming::{StreamTensor, StreamingBinOp, StreamingModule};
 pub use strided_index::{StridedBlocks, StridedIndex};
-pub use tensor::{Tensor, TensorId};
+pub use tensor::{StagedRead, Tensor, TensorId};
 pub use typed::{Backend, Cpu, Cuda, Metal, Typed};
 pub use variable::Var;
 

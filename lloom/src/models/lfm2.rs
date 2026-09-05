@@ -4561,6 +4561,86 @@ impl Model {
     }
 }
 
+/// A verify pass that has been encoded and not yet read back —
+/// [`Model::verify_tokens_enqueue`]'s receipt, consumed by
+/// [`Model::verify_tokens_complete`].
+///
+/// Holds the open window's `SpecToken`, so the pair inherits its discipline: an
+/// enqueued verify that is never completed leaves the cache mid-speculation,
+/// and the receipt is neither `Copy` nor droppable without a warning.
+#[must_use = "an enqueued verify must be completed, or the cache is left mid-speculation"]
+pub struct PendingVerify {
+    tok: SpecToken,
+    /// `[argmax[0..=k], proposed[0..k]]` — the round's one readback, staged
+    /// behind the command buffer that wrote it, so completing waits for this
+    /// pass and not for whatever was committed after it.
+    both: lloom_tensor::StagedRead,
+    k: usize,
+    /// This pass's layer-input taps, every window position; trimmed to the
+    /// accepted rows at completion.
+    taps: Vec<Tensor>,
+}
+
+impl Model {
+    /// The encode half of [`Self::verify_tokens`]: open the window, run the
+    /// pass over `[last, proposed…]`, and leave `[argmax, proposed]` on the
+    /// device behind a marker. Nothing here waits for the GPU.
+    pub fn verify_tokens_enqueue(
+        &self,
+        last: u32,
+        proposed: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<PendingVerify> {
+        let k = proposed.dims1()?;
+        if k == 0 {
+            lloom_tensor::bail!("lfm2 verify_tokens_enqueue: no proposed tokens")
+        }
+        if proposed.dtype() != DType::U32 {
+            lloom_tensor::bail!(
+                "lfm2 verify_tokens_enqueue: proposals must be U32 ids, got {:?}",
+                proposed.dtype()
+            )
+        }
+        let tok = cache.advance(k + 1)?;
+        let device = &cache.device;
+        let anchor = Tensor::new(&[last], device)?;
+        let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
+        let logits = self.forward_all(&input, index_pos, cache)?;
+        let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
+        let both = Tensor::cat(&[&argmax, proposed], 0)?.stage_read()?;
+        // The taps are this pass's; taken now so the cache carries none into
+        // the next pass on it.
+        let taps = cache.take_taps();
+        Ok(PendingVerify { tok, both, k, taps })
+    }
+
+    /// The readback half of [`Self::verify_tokens`]: wait for the pass's own
+    /// command buffer, accept, resolve the cache, and trim the taps to the
+    /// accepted rows. Same accept rule, same `resolve`, same bytes as the
+    /// one-call form; only where the host waits differs.
+    pub fn verify_tokens_complete(
+        &self,
+        pending: PendingVerify,
+        cache: &mut Cache,
+    ) -> Result<(Vec<u32>, Vec<Tensor>)> {
+        let PendingVerify { tok, both, k, taps } = pending;
+        let both = both.to_vec1::<u32>()?;
+        let (argmax, proposed) = both.split_at(k + 1);
+        let accepted = accept_prefix(argmax, proposed);
+        cache.resolve(tok, accepted.len())?;
+        let n_acc = accepted.len();
+        let probe = taps
+            .iter()
+            .map(|t| {
+                let seq = t.dim(1)?;
+                t.narrow(1, 0, n_acc.min(seq))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((accepted, probe))
+    }
+}
+
 /// The greedy accept rule over a verified window: the longest prefix where the
 /// target's argmax agrees with the proposal, plus the target's own token at the
 /// first disagreement — or, when every proposal agreed, the bonus at position
@@ -4713,6 +4793,36 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
             .collect::<Result<Vec<_>>>()?;
 
         Ok((vec![accepted], probe))
+    }
+
+    type Pending = PendingVerify;
+
+    fn verify_enqueue(
+        &self,
+        draft: &crate::nn::Draft,
+        anchor: &crate::nn::Anchor,
+        cache: &mut Self::Cache,
+    ) -> Result<PendingVerify> {
+        match &draft.tokens {
+            crate::nn::DraftTokens::Host(ids) => {
+                if ids.is_empty() {
+                    lloom_tensor::bail!("lfm2 verify_enqueue: no proposed tokens")
+                }
+                let ids = Tensor::new(ids.as_slice(), &cache.device)?;
+                self.verify_tokens_enqueue(anchor.last, &ids, anchor.pos, cache)
+            }
+            crate::nn::DraftTokens::Device(ids) => {
+                self.verify_tokens_enqueue(anchor.last, ids, anchor.pos, cache)
+            }
+        }
+    }
+
+    fn verify_complete(
+        &self,
+        pending: PendingVerify,
+        cache: &mut Self::Cache,
+    ) -> Result<(Vec<u32>, Vec<Tensor>)> {
+        self.verify_tokens_complete(pending, cache)
     }
 
     fn take_probe(&self, cache: &mut Self::Cache) -> Result<Vec<Tensor>> {

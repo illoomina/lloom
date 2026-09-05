@@ -558,6 +558,12 @@ fn verify_arms_agree_on(dev: &Device) -> Result<()> {
         let proposed_t = Tensor::new(proposed.as_slice(), dev)?;
         let acc_d = model.verify_tokens(last, &proposed_t, pos, &mut cache_d)?;
 
+        // The pipelined arm: the same pass split at the readback, the wait on
+        // its own marker (`verify_tokens_enqueue` / `verify_tokens_complete`).
+        let mut cache_p = prefill()?;
+        let pending = model.verify_tokens_enqueue(last, &proposed_t, pos, &mut cache_p)?;
+        let (acc_p, probe_p) = model.verify_tokens_complete(pending, &mut cache_p)?;
+
         assert_eq!(
             acc_h.len(),
             want_len,
@@ -568,6 +574,18 @@ fn verify_arms_agree_on(dev: &Device) -> Result<()> {
             acc_h, acc_d,
             "j={j}: the two arms accepted different tokens"
         );
+        assert_eq!(
+            acc_h, acc_p,
+            "j={j}: the split (enqueue/complete) arm accepted different tokens"
+        );
+        assert_eq!(probe_p.len(), 5, "the split arm hands back the five taps");
+        for t in &probe_p {
+            assert_eq!(
+                t.dim(1)?,
+                want_len,
+                "j={j}: the split arm's probe is trimmed to the accepted rows"
+            );
+        }
         assert_eq!(
             &acc_h[..],
             &ref_ids[1..1 + want_len],
@@ -581,6 +599,11 @@ fn verify_arms_agree_on(dev: &Device) -> Result<()> {
         assert_eq!(
             next_h, next_d,
             "j={j}: the caches diverged after resolve — the arms resolved to different lengths"
+        );
+        let next_p = next_logits(&mut cache_p, tail, at)?;
+        assert_eq!(
+            next_h, next_p,
+            "j={j}: the split arm's cache diverged after resolve"
         );
         assert_eq!(
             argmax(&next_h),
@@ -613,13 +636,15 @@ struct DeviceGarbageDrafter {
     k: usize,
     token: u32,
     dev: Device,
+    /// Sequence slots — the pipelined driver needs one per session.
+    n: usize,
 }
 
 impl Speculator for DeviceGarbageDrafter {
     type Probe = LayerTaps<5>;
 
     fn n_seq(&self) -> usize {
-        1
+        self.n
     }
 
     fn max_draft(&self) -> usize {
@@ -698,6 +723,7 @@ fn decode_speculative_is_byte_identical_to_greedy_with_device_drafts() -> Result
             k,
             token: 0,
             dev: dev.clone(),
+            n: 1,
         };
         let mut rb = Blocking::new(&eos_ids, &dev)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -718,6 +744,314 @@ fn decode_speculative_is_byte_identical_to_greedy_with_device_drafts() -> Result
         assert!(
             out.stats.rounds.iter().all(|r| r.accepted >= 1),
             "every round accepts at least the target's own token"
+        );
+    }
+    Ok(())
+}
+
+/// A drafter that proposes garbage for `n` slots and records every `observe`
+/// it receives as `(slot, accepted)`, so a test can check that the pipelined
+/// driver re-keys each sequence from its OWN verify and no other's.
+struct SlotRecordingDrafter {
+    k: usize,
+    n: usize,
+    observed: Vec<(usize, Vec<u32>)>,
+}
+
+impl Speculator for SlotRecordingDrafter {
+    type Probe = LayerTaps<5>;
+
+    fn n_seq(&self) -> usize {
+        self.n
+    }
+
+    fn max_draft(&self) -> usize {
+        self.k
+    }
+
+    fn begin(&mut self, _seq: SeqId, _prompt: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        Ok(active
+            .iter()
+            .map(|_| Draft::host(vec![0; self.k]))
+            .collect())
+    }
+
+    fn observe(
+        &mut self,
+        seq: SeqId,
+        probe: &<Self::Probe as TargetProbe>::Output,
+        accepted: &[u32],
+    ) -> Result<()> {
+        assert_eq!(probe.len(), 5, "LayerTaps<5> hands five tensors");
+        self.observed.push((seq.0, accepted.to_vec()));
+        Ok(())
+    }
+}
+
+/// Three prompts of different lengths and content: the solo reference streams
+/// differ from one another (a pipelined run that leaked one sequence's state
+/// into another would have somewhere to leak TO), and they end at different
+/// rounds, so the driver's handling of a lane finishing while others continue
+/// is on the path.
+const PIPELINE_PROMPTS: [&[u32]; 3] = [&[1, 2, 3, 4, 5], &[9, 8, 7, 6, 5, 4, 3, 2], &[2, 4, 6]];
+
+/// The pipelined driver's streams against the two references it must equal,
+/// on `dev`: each sequence's `decode_speculative` run solo, and greedy
+/// `decode`. Byte-identical per sequence, round for round, under `eos_ids`
+/// and `max_tokens`; `want_eos` / `want_cap` demand that at least one sequence
+/// end on an EOS inside the budget / run to the cap, so the two cuts the driver
+/// makes are on the path.
+fn pipelined_matches_solo_on(
+    dev: &Device,
+    max_tokens: usize,
+    extra_eos: &[u32],
+    want_eos: bool,
+    want_cap: bool,
+) -> Result<()> {
+    let k = 4usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, dev)?;
+    let mut eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+    eos_ids.extend_from_slice(extra_eos);
+
+    // Reference 1: greedy K=1 per prompt.
+    let greedy: Vec<Vec<u32>> = PIPELINE_PROMPTS
+        .iter()
+        .map(|prompt| -> Result<Vec<u32>> {
+            let cache = Cache::new(true, DType::F32, &cfg, dev)?;
+            let mut session = Session::new(&model, cache);
+            let mut spec = IdentityProposer;
+            let mut rb = Blocking::new(&eos_ids, dev)?;
+            let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+            let opts = DecodeOptions::new(max_tokens);
+            Ok(session
+                .decode(&mut spec, &mut rb, &mut sampler, prompt, &opts, &mut |_| {
+                    Ok(())
+                })?
+                .ids)
+        })
+        .collect::<Result<_>>()?;
+    // Non-vacuity: the streams are long enough to span more than one block and
+    // are not all the same stream (a leak needs somewhere to leak TO).
+    for g in &greedy {
+        assert!(g.len() > k, "a greedy reference is only {} tokens", g.len());
+    }
+    assert!(
+        greedy[0] != greedy[1] && greedy[1] != greedy[2],
+        "the reference streams must differ for a cross-sequence leak to be visible"
+    );
+
+    // Reference 2: each sequence through the serial speculative loop, solo.
+    let solo: Vec<lloom::nn::DecodeOut> = PIPELINE_PROMPTS
+        .iter()
+        .map(|prompt| -> Result<lloom::nn::DecodeOut> {
+            let cache = Cache::new(true, DType::F32, &cfg, dev)?;
+            let mut session = Session::new(&model, cache);
+            let mut spec = DeviceGarbageDrafter {
+                k,
+                token: 0,
+                dev: dev.clone(),
+                n: 1,
+            };
+            let mut rb = Blocking::new(&eos_ids, dev)?;
+            let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+            let opts = DecodeOptions::new(max_tokens);
+            session.decode_speculative(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                prompt,
+                &opts,
+                &eos_ids,
+                &mut |_| Ok(()),
+            )
+        })
+        .collect::<Result<_>>()?;
+    for (s, g) in solo.iter().zip(&greedy) {
+        assert_eq!(
+            &s.ids, g,
+            "the solo speculative stream is the greedy stream"
+        );
+    }
+    if want_eos {
+        assert!(
+            solo.iter().any(|o| o.eos),
+            "no sequence reached EOS within {max_tokens} tokens; the EOS-in-block path is untested"
+        );
+    }
+    if want_cap {
+        assert!(
+            solo.iter().any(|o| !o.eos && o.ids.len() == max_tokens),
+            "no sequence ran to the cap; the max_tokens cut is untested"
+        );
+    }
+
+    // Subject: the three sequences pipelined through one drafter with three slots.
+    let mut sessions: Vec<Session<'_, lloom::models::lfm2::Model>> = (0..PIPELINE_PROMPTS.len())
+        .map(|_| {
+            Ok(Session::new(
+                &model,
+                Cache::new(true, DType::F32, &cfg, dev)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let mut spec = DeviceGarbageDrafter {
+        k,
+        token: 0,
+        dev: dev.clone(),
+        n: PIPELINE_PROMPTS.len(),
+    };
+    let opts = DecodeOptions::new(max_tokens);
+    let mut streamed: Vec<Vec<u32>> = vec![Vec::new(); PIPELINE_PROMPTS.len()];
+    let outs = Session::decode_speculative_pipelined(
+        &mut sessions,
+        &mut spec,
+        &PIPELINE_PROMPTS,
+        &opts,
+        &eos_ids,
+        dev,
+        &mut |i, ids| {
+            streamed[i].extend_from_slice(ids);
+            Ok(())
+        },
+    )?;
+    assert_eq!(outs.len(), PIPELINE_PROMPTS.len());
+    for (i, out) in outs.iter().enumerate() {
+        assert_eq!(
+            out.ids, greedy[i],
+            "sequence {i}: the pipelined stream must be BYTE-IDENTICAL to greedy and to its \
+             solo speculative run — a divergence is a cross-sequence leak or a bookkeeping \
+             error in decode_speculative_pipelined"
+        );
+        assert_eq!(
+            out.ids, streamed[i],
+            "sequence {i}: the callback stream equals the ids"
+        );
+        assert_eq!(out.eos, solo[i].eos, "sequence {i}: EOS verdicts agree");
+        // Round for round: the same drafter proposes the same garbage, so the
+        // accept lengths must be the solo run's — a sequence whose rounds
+        // differ was verified against something not its own.
+        let solo_rounds: Vec<usize> = solo[i].stats.rounds.iter().map(|r| r.accepted).collect();
+        let pipe_rounds: Vec<usize> = out.stats.rounds.iter().map(|r| r.accepted).collect();
+        assert_eq!(
+            pipe_rounds, solo_rounds,
+            "sequence {i}: accepted-per-round differs from solo"
+        );
+        assert_eq!(
+            out.stats.overrun, solo[i].stats.overrun,
+            "sequence {i}: overrun differs"
+        );
+        assert_eq!(
+            sessions[i].tokens().len() + sessions[i].overrun(),
+            sessions[i].pos(),
+            "sequence {i}: the token log plus the overrun covers the cache"
+        );
+    }
+    let total_rounds: usize = outs.iter().map(|o| o.stats.rounds.len()).sum();
+    assert!(total_rounds >= 3, "the run spanned {total_rounds} rounds");
+    Ok(())
+}
+
+/// The token the tiny model's streams settle into ([0, 10, 0, 10, …]) after
+/// their prompt-specific openings: as an extra EOS it ends each sequence at a
+/// different position (13–15 tokens in), so with a cap of 14 one sequence
+/// stops on an EOS inside a block and another runs to the cap. Hardcoded rather
+/// than derived from the streams, so a fixture change fails the non-vacuity
+/// assertions above instead of silently choosing a different test.
+const SETTLED_TOKEN: u32 = 10;
+
+#[test]
+fn pipelined_decode_is_byte_identical_to_solo_speculative_and_greedy() -> Result<()> {
+    // Long streams, every sequence to the cap: the pipeline runs deep.
+    pipelined_matches_solo_on(&Device::Cpu, 96, &[], false, true)?;
+    // Short streams cut two ways: one on an EOS inside a block, one at the cap.
+    pipelined_matches_solo_on(&Device::Cpu, 14, &[SETTLED_TOKEN], true, true)
+}
+
+/// The same gate on Metal, where `verify_complete`'s wait is the staged read's
+/// own command buffer (`Tensor::stage_read`) rather than the queue's tail —
+/// the mechanism the CPU run cannot exercise.
+#[cfg(feature = "metal")]
+#[test]
+fn pipelined_decode_is_byte_identical_to_solo_speculative_and_greedy_on_metal() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    pipelined_matches_solo_on(&dev, 96, &[], false, true)?;
+    pipelined_matches_solo_on(&dev, 14, &[SETTLED_TOKEN], true, true)
+}
+
+/// Each sequence is re-keyed from its own verifies only: the `observe` calls
+/// the driver makes for slot `i` carry exactly slot `i`'s accepted tokens, in
+/// order, starting from its prompt seed — and the seed precedes its first
+/// draft, as the serial loop's does.
+#[test]
+fn pipelined_observe_is_keyed_per_sequence() -> Result<()> {
+    let dev = Device::Cpu;
+    let k = 4usize;
+    let max_tokens = 24usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, &dev)?;
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+    let n = PIPELINE_PROMPTS.len();
+    let mut sessions: Vec<Session<'_, lloom::models::lfm2::Model>> = (0..n)
+        .map(|_| {
+            Ok(Session::new(
+                &model,
+                Cache::new(true, DType::F32, &cfg, &dev)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let mut spec = SlotRecordingDrafter {
+        k,
+        n,
+        observed: Vec::new(),
+    };
+    let opts = DecodeOptions::new(max_tokens);
+    let outs = Session::decode_speculative_pipelined(
+        &mut sessions,
+        &mut spec,
+        &PIPELINE_PROMPTS,
+        &opts,
+        &eos_ids,
+        &dev,
+        &mut |_, _| Ok(()),
+    )?;
+    for (i, out) in outs.iter().enumerate() {
+        let mine: Vec<&Vec<u32>> = spec
+            .observed
+            .iter()
+            .filter(|(slot, _)| *slot == i)
+            .map(|(_, acc)| acc)
+            .collect();
+        assert_eq!(
+            mine.len(),
+            out.stats.rounds.len() + 1,
+            "sequence {i}: one observe per round plus the prompt seed"
+        );
+        // The seed names the anchor — the prefill's argmax, the stream's first id.
+        assert_eq!(
+            mine[0].as_slice(),
+            &out.ids[..1],
+            "sequence {i}: the seed's tail is the anchor"
+        );
+        // Every later observe is one round's accepted block, and the rounds
+        // concatenate to the stream (plus whatever an EOS or the cap cut off).
+        let mut accepted_all: Vec<u32> = Vec::new();
+        for (acc, round) in mine[1..].iter().zip(&out.stats.rounds) {
+            assert_eq!(
+                acc.len(),
+                round.accepted,
+                "sequence {i}: an observe's block is its round's"
+            );
+            accepted_all.extend_from_slice(acc);
+        }
+        let stream_after_anchor = &out.ids[1..];
+        assert!(
+            accepted_all.starts_with(stream_after_anchor),
+            "sequence {i}: the rounds' accepted blocks do not spell this sequence's stream"
         );
     }
     Ok(())

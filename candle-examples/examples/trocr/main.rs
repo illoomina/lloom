@@ -9,8 +9,8 @@ use clap::{Parser, ValueEnum};
 
 use candle::{DType, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_nn::VarBuilder;
-use candle_transformers::models::{trocr, vit};
+use lloom::nn::VarBuilder;
+use lloom::models::{trocr, vit};
 
 use tokenizers::Tokenizer;
 mod image_processor;
@@ -120,7 +120,7 @@ pub fn main() -> anyhow::Result<()> {
     let encoder_xs = model.encoder().forward(&image)?;
 
     let mut logits_processor =
-        candle_transformers::generation::LogitsProcessor::new(1337, None, None);
+        lloom::generation::LogitsProcessor::new(1337, None, None);
 
     let mut token_ids: Vec<u32> = vec![decoder_config.decoder_start_token_id];
     for index in 0..1000 {

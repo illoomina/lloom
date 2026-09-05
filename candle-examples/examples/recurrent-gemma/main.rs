@@ -7,13 +7,13 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use candle_transformers::models::quantized_recurrent_gemma::Model as QModel;
-use candle_transformers::models::recurrent_gemma::{Config, Model as BModel};
+use lloom::models::quantized_recurrent_gemma::Model as QModel;
+use lloom::models::recurrent_gemma::{Config, Model as BModel};
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
+use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -62,13 +62,13 @@ impl TextGeneration {
         device: &Device,
     ) -> Self {
         let sampling = match temp {
-            None => candle_transformers::generation::Sampling::ArgMax,
+            None => lloom::generation::Sampling::ArgMax,
             Some(temperature) => match top_p {
-                None => candle_transformers::generation::Sampling::TopK {
+                None => lloom::generation::Sampling::TopK {
                     temperature,
                     k: top_k,
                 },
-                Some(top_p) => candle_transformers::generation::Sampling::TopKThenTopP {
+                Some(top_p) => lloom::generation::Sampling::TopKThenTopP {
                     temperature,
                     k: top_k,
                     p: top_p,
@@ -120,7 +120,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],
@@ -293,7 +293,7 @@ fn main() -> Result<()> {
         DType::F32
     };
     let model = if args.quantized {
-        let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
             &filenames[0],
             &device,
         )?;

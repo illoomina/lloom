@@ -71,7 +71,7 @@ pub fn main() -> anyhow::Result<()> {
     let mut outputs = candle_onnx::simple_eval(&model, inputs)?;
     let output = outputs.remove(&graph.output[0].name).unwrap();
     let prs = match args.which {
-        Which::SqueezeNet => candle_nn::ops::softmax(&output, D::Minus1)?,
+        Which::SqueezeNet => lloom::nn::ops::softmax(&output, D::Minus1)?,
         Which::EfficientNet => output,
         Which::EsrGan => output,
     };

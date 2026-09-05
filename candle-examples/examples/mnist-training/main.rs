@@ -10,14 +10,14 @@ use rand::prelude::*;
 use rand::rng;
 
 use candle::{DType, Result, Tensor, D};
-use candle_nn::{loss, ops, Conv2d, Linear, Module, ModuleT, Optimizer, VarBuilder, VarMap};
+use lloom::nn::{loss, ops, Conv2d, Linear, Module, ModuleT, Optimizer, VarBuilder, VarMap};
 
 const IMAGE_DIM: usize = 784;
 const LABELS: usize = 10;
 
 fn linear_z(in_dim: usize, out_dim: usize, vs: VarBuilder) -> Result<Linear> {
-    let ws = vs.get_with_hints((out_dim, in_dim), "weight", candle_nn::init::ZERO)?;
-    let bs = vs.get_with_hints(out_dim, "bias", candle_nn::init::ZERO)?;
+    let ws = vs.get_with_hints((out_dim, in_dim), "weight", lloom::nn::init::ZERO)?;
+    let bs = vs.get_with_hints(out_dim, "bias", lloom::nn::init::ZERO)?;
     Ok(Linear::new(ws, Some(bs)))
 }
 
@@ -48,8 +48,8 @@ struct Mlp {
 
 impl Model for Mlp {
     fn new(vs: VarBuilder) -> Result<Self> {
-        let ln1 = candle_nn::linear(IMAGE_DIM, 100, vs.pp("ln1"))?;
-        let ln2 = candle_nn::linear(100, LABELS, vs.pp("ln2"))?;
+        let ln1 = lloom::nn::linear(IMAGE_DIM, 100, vs.pp("ln1"))?;
+        let ln2 = lloom::nn::linear(100, LABELS, vs.pp("ln2"))?;
         Ok(Self { ln1, ln2 })
     }
 
@@ -66,16 +66,16 @@ struct ConvNet {
     conv2: Conv2d,
     fc1: Linear,
     fc2: Linear,
-    dropout: candle_nn::Dropout,
+    dropout: lloom::nn::Dropout,
 }
 
 impl ConvNet {
     fn new(vs: VarBuilder) -> Result<Self> {
-        let conv1 = candle_nn::conv2d(1, 32, 5, Default::default(), vs.pp("c1"))?;
-        let conv2 = candle_nn::conv2d(32, 64, 5, Default::default(), vs.pp("c2"))?;
-        let fc1 = candle_nn::linear(1024, 1024, vs.pp("fc1"))?;
-        let fc2 = candle_nn::linear(1024, LABELS, vs.pp("fc2"))?;
-        let dropout = candle_nn::Dropout::new(0.5);
+        let conv1 = lloom::nn::conv2d(1, 32, 5, Default::default(), vs.pp("c1"))?;
+        let conv2 = lloom::nn::conv2d(32, 64, 5, Default::default(), vs.pp("c2"))?;
+        let fc1 = lloom::nn::linear(1024, 1024, vs.pp("fc1"))?;
+        let fc2 = lloom::nn::linear(1024, LABELS, vs.pp("fc2"))?;
+        let dropout = lloom::nn::Dropout::new(0.5);
         Ok(Self {
             conv1,
             conv2,
@@ -128,11 +128,11 @@ fn training_loop_cnn(
         varmap.load(load)?
     }
 
-    let adamw_params = candle_nn::ParamsAdamW {
+    let adamw_params = lloom::nn::ParamsAdamW {
         lr: args.learning_rate,
         ..Default::default()
     };
-    let mut opt = candle_nn::AdamW::new(varmap.all_vars(), adamw_params)?;
+    let mut opt = lloom::nn::AdamW::new(varmap.all_vars(), adamw_params)?;
     let test_images = m.test_images.to_device(&dev)?;
     let test_labels = m.test_labels.to_dtype(DType::U32)?.to_device(&dev)?;
     let n_batches = train_images.dim(0)? / BSIZE;
@@ -191,7 +191,7 @@ fn training_loop<M: Model>(
         varmap.load(load)?
     }
 
-    let mut sgd = candle_nn::SGD::new(varmap.all_vars(), args.learning_rate)?;
+    let mut sgd = lloom::nn::SGD::new(varmap.all_vars(), args.learning_rate)?;
     let test_images = m.test_images.to_device(&dev)?;
     let test_labels = m.test_labels.to_dtype(DType::U32)?.to_device(&dev)?;
     for epoch in 1..=args.epochs {

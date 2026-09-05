@@ -12,8 +12,8 @@ extern crate accelerate_src;
 use clap::Parser;
 
 use candle::{DType, IndexOp, D};
-use candle_nn::{Module, VarBuilder};
-use candle_transformers::models::dinov2reg4;
+use lloom::nn::{Module, VarBuilder};
+use lloom::models::dinov2reg4;
 
 #[derive(Parser)]
 struct Args {
@@ -58,7 +58,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = dinov2reg4::vit_base(vb)?;
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = candle_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = lloom::nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

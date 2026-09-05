@@ -1,0 +1,23 @@
+// The neural-net building blocks, merged in from candle-nn (RESTRUCTURING §7.1):
+// VarBuilder, ops, the layers and the Model/CausalLM/Speculative traits are now
+// the `nn` module of this crate rather than a separate crate below it. Reached
+// as `crate::nn::` internally and `lloom::nn::` by consumers.
+pub mod nn;
+
+// The within-crate axis registry (RESTRUCTURING §1.6): the authoritative,
+// link-time-collected `AXES` slice every `#[derive(Config)]` contributes to.
+pub mod axes;
+
+pub mod fused_moe;
+pub mod generation;
+// The hub module downloads checkpoints (hf-hub) and owns the tokenizer
+// (tokenizers), neither of which compiles to wasm32; a browser loads bytes and
+// tokenizes in JS (#656). Host-only.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hub;
+pub mod models;
+pub mod object_detection;
+pub mod pipelines;
+pub mod quantized_nn;
+pub mod quantized_var_builder;
+pub mod utils;

@@ -3,11 +3,11 @@ extern crate intel_mkl_src;
 
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
-use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
+use lloom::models::bert::{BertModel, Config as BertConfig, DTYPE};
 
 use anyhow::{Error as E, Result};
 use candle::{Device, Tensor};
-use candle_nn::VarBuilder;
+use lloom::nn::VarBuilder;
 use clap::Parser;
 use tokenizers::{PaddingParams, Tokenizer};
 

@@ -1,0 +1,15 @@
+[package]
+name = "lloom-macros"
+version.workspace = true
+edition.workspace = true
+description = "Derive macros for the lloom engine: #[derive(Config)] emits clap flags and the within-crate axis registry slice."
+repository.workspace = true
+license.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }

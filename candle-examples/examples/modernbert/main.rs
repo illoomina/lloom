@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Error as E, Result};
 use candle::{Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::modernbert;
+use lloom::nn::VarBuilder;
+use lloom::models::modernbert;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{PaddingParams, Tokenizer};

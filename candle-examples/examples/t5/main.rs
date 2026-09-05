@@ -6,12 +6,12 @@ extern crate accelerate_src;
 use std::io::Write;
 use std::path::PathBuf;
 
-use candle_transformers::models::t5;
+use lloom::models::t5;
 
 use anyhow::{Error as E, Result};
 use candle::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
+use lloom::generation::LogitsProcessor;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
@@ -263,7 +263,7 @@ fn main() -> Result<()> {
                         logits
                     } else {
                         let start_at = output_token_ids.len().saturating_sub(args.repeat_last_n);
-                        candle_transformers::utils::apply_repeat_penalty(
+                        lloom::utils::apply_repeat_penalty(
                             &logits,
                             args.repeat_penalty,
                             &output_token_ids[start_at..],

@@ -8,8 +8,8 @@ use anyhow::Error as E;
 use clap::Parser;
 
 use candle::{DType, Device, Tensor};
-use candle_nn::{ops::softmax, VarBuilder};
-use candle_transformers::models::clip;
+use lloom::nn::{ops::softmax, VarBuilder};
+use lloom::models::clip;
 
 use tokenizers::Tokenizer;
 

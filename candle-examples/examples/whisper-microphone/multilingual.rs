@@ -1,6 +1,6 @@
 use crate::{token_id, Model};
 use candle::{IndexOp, Result, Tensor, D};
-use candle_transformers::models::whisper::{self as m};
+use lloom::models::whisper::{self as m};
 use tokenizers::Tokenizer;
 
 const LANGUAGES: [(&str, &str); 99] = [
@@ -125,7 +125,7 @@ pub fn detect_language(model: &mut Model, tokenizer: &Tokenizer, mel: &Tensor) -
     let ys = model.decoder_forward(&tokens, &audio_features, true)?;
     let logits = model.decoder_final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
     let logits = logits.index_select(&language_token_ids, 0)?;
-    let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;
+    let probs = lloom::nn::ops::softmax(&logits, D::Minus1)?;
     let probs = probs.to_vec1::<f32>()?;
     let mut probs = LANGUAGES.iter().zip(probs.iter()).collect::<Vec<_>>();
     probs.sort_by(|(_, p1), (_, p2)| p2.total_cmp(p1));

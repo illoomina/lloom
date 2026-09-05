@@ -8,8 +8,8 @@ use anyhow::Error as E;
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, Device, Tensor};
-use candle_nn::{ops::softmax, VarBuilder};
-use candle_transformers::models::mobileclip;
+use lloom::nn::{ops::softmax, VarBuilder};
+use lloom::models::mobileclip;
 
 use tokenizers::Tokenizer;
 

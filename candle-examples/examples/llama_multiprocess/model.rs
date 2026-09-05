@@ -1,14 +1,14 @@
 use candle::backend::BackendStorage;
 use candle::{CpuStorage, CustomOp1, DType, Device, IndexOp, Layout, Result, Shape, Tensor, D};
-use candle_nn::var_builder::ShardedVarBuilder as VarBuilder;
-use candle_nn::{Embedding, Linear, Module, RmsNorm};
+use lloom::nn::var_builder::ShardedVarBuilder as VarBuilder;
+use lloom::nn::{Embedding, Linear, Module, RmsNorm};
 use cudarc::nccl::safe::{Comm, ReduceOp};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use super::MAX_SEQ_LEN;
 
-pub type Config = candle_transformers::models::llama::LlamaConfig;
+pub type Config = lloom::models::llama::LlamaConfig;
 
 struct TensorParallelColumnLinear {
     linear: Linear,
@@ -99,8 +99,8 @@ impl TensorParallelRowLinear {
     }
 }
 
-fn shard(dim: usize, rank: usize, world_size: usize) -> candle_nn::var_builder::Shard {
-    candle_nn::var_builder::Shard {
+fn shard(dim: usize, rank: usize, world_size: usize) -> lloom::nn::var_builder::Shard {
+    lloom::nn::var_builder::Shard {
         dim,
         rank,
         world_size,
@@ -197,7 +197,7 @@ impl CausalSelfAttention {
         let (_b_sz, _, seq_len, _hidden_size) = x.shape().dims4()?;
         let cos = self.cache.cos.narrow(0, index_pos, seq_len)?;
         let sin = self.cache.sin.narrow(0, index_pos, seq_len)?;
-        candle_nn::rotary_emb::rope(x, &cos, &sin)
+        lloom::nn::rotary_emb::rope(x, &cos, &sin)
     }
 
     fn forward(&self, x: &Tensor, index_pos: usize, block_idx: usize) -> Result<Tensor> {
@@ -270,7 +270,7 @@ impl CausalSelfAttention {
 
     fn repeat_kv(&self, x: Tensor) -> Result<Tensor> {
         let n_rep = self.num_attention_heads / self.num_key_value_heads;
-        candle_transformers::utils::repeat_kv(x, n_rep)
+        lloom::utils::repeat_kv(x, n_rep)
     }
 
     fn load(vb: VarBuilder, cache: &Cache, cfg: &Config, comm: Rc<Comm>) -> Result<Self> {

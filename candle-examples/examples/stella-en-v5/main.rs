@@ -9,12 +9,12 @@ use std::path::Path;
 use anyhow::{anyhow, Error as E, Result};
 use clap::Parser;
 
-use candle_transformers::models::stella_en_v5::{
+use lloom::models::stella_en_v5::{
     Config, EmbedDim as StellaEmbedDim, EmbeddingModel,
 };
 
 use candle::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
+use lloom::nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo};
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer};
 

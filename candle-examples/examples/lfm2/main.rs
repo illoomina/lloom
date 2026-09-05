@@ -22,9 +22,9 @@ use clap::Parser;
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{Cache, LayerType, Lfm2Config, Model};
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{Cache, LayerType, Lfm2Config, Model};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -122,7 +122,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],

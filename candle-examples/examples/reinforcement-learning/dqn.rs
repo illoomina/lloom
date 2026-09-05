@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use rand::{distr::Uniform, rng, Rng};
 
 use candle::{DType, Device, Error, Module, Result, Tensor};
-use candle_nn::loss::mse;
-use candle_nn::{linear, seq, Activation, AdamW, Optimizer, VarBuilder, VarMap};
+use lloom::nn::loss::mse;
+use lloom::nn::{linear, seq, Activation, AdamW, Optimizer, VarBuilder, VarMap};
 
 use crate::gym_env::GymEnv;
 

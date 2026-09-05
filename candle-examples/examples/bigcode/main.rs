@@ -7,11 +7,11 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use candle_transformers::models::bigcode::{Config, GPTBigCode};
+use lloom::models::bigcode::{Config, GPTBigCode};
 
 use candle::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
+use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 

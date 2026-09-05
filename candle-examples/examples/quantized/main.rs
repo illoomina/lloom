@@ -10,10 +10,10 @@ use tokenizers::Tokenizer;
 
 use candle::quantized::{ggml_file, gguf_file};
 use candle::Tensor;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use lloom::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::quantized_llama as model;
+use lloom::models::quantized_llama as model;
 use model::ModelWeights;
 
 const DEFAULT_PROMPT: &str = "My favorite theorem is ";
@@ -657,7 +657,7 @@ fn main() -> anyhow::Result<()> {
                 logits
             } else {
                 let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     args.repeat_penalty,
                     &all_tokens[start_at..],

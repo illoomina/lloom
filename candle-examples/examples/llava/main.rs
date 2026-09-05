@@ -2,16 +2,16 @@ pub mod constants;
 pub mod conversation;
 pub mod image_processor;
 
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::llama::Cache;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::llama::Cache;
 
 use anyhow::{bail, Error as E, Result};
 use candle::{DType, Device, IndexOp, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::llava::config::{
+use lloom::nn::VarBuilder;
+use lloom::models::llava::config::{
     HFGenerationConfig, HFLLaVAConfig, HFPreProcessorConfig,
 };
-use candle_transformers::models::llava::{config::LLaVAConfig, LLaVA};
+use lloom::models::llava::{config::LLaVAConfig, LLaVA};
 use clap::Parser;
 use constants::*;
 use conversation::Conversation;

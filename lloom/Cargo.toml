@@ -1,0 +1,81 @@
+[package]
+name = "lloom"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+readme = "README.md"
+
+[dependencies]
+# The tensor layer (candle-core + candle-metal-kernels merged, RESTRUCTURING
+# §7.1). Named `lloom-tensor`; the merged nn+transformers sources import it as
+# `lloom_tensor::`.
+lloom-tensor = { workspace = true }
+# The derive + the within-crate axis registry (RESTRUCTURING §1.6). `clap`
+# becomes a real dependency (not just a dev-dep) because `#[derive(Config)]`
+# emits a `clap::Args` companion for a library type -- the flags fall out of the
+# `#[axis]` tags rather than being hand-rolled per harness.
+lloom-macros = { workspace = true }
+linkme = { workspace = true }
+clap = { workspace = true }
+accelerate-src = { workspace = true, optional = true }
+byteorder = { workspace = true }
+candle-flash-attn = { workspace = true, optional = true }
+fancy-regex = { workspace = true }
+intel-mkl-src = { workspace = true, optional = true }
+num-traits = { workspace = true }
+rand = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_plain = { workspace = true }
+tracing = { workspace = true }
+# Merged in from candle-nn (RESTRUCTURING §7.1): the nn module's own deps.
+half = { workspace = true }
+thiserror = { workspace = true }
+safetensors = { workspace = true }
+objc2-metal = { workspace = true, optional = true }
+libc = { workspace = true }
+
+# The `hub` module downloads checkpoints (hf-hub -> native-tls/openssl) and owns
+# the tokenizer (tokenizers -> onig, a C library). Neither compiles to
+# wasm32-unknown-unknown, and neither is needed there: a browser loads model
+# bytes over `fetch` from JS and tokenizes in JS. So they are host-only, and the
+# `hub` module is `#[cfg(not(target_arch = "wasm32"))]` (#656).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+hf-hub = { workspace = true }
+tokenizers = { workspace = true, features = ["onig"] }
+
+[dev-dependencies]
+# The stateful sequence fuzzer over `TokenRing` (lloom #508). A dev-dependency,
+# so nothing shipping and no downstream consumer acquires it -- which is what
+# keeps `CONTRIBUTING.md` §4.1's "must not break CPU or CUDA backends" a
+# non-question here: the target is a test, backend-agnostic, and runs on
+# whichever of CPU and Metal is present.
+proptest = "1.11"
+# Merged in from candle-nn dev-deps (used by its tests and examples).
+# `clap` is now a normal dependency (the derive emits a `clap::Args` companion),
+# so it is not repeated here.
+anyhow = { workspace = true }
+rand_distr = { workspace = true }
+criterion = { workspace = true }
+
+[features]
+default = []
+accelerate = ["dep:accelerate-src", "lloom-tensor/accelerate"]
+cuda = ["lloom-tensor/cuda"]
+cudnn = ["lloom-tensor/cudnn"]
+flash-attn = ["cuda", "dep:candle-flash-attn"]
+mkl = ["dep:intel-mkl-src", "lloom-tensor/mkl"]
+metal = ["lloom-tensor/metal", "dep:objc2-metal"]
+metal-debug-labels = ["metal", "lloom-tensor/metal-debug-labels"]
+
+[[bench]]
+name = "bench_main"
+harness = false
+
+[[example]]
+name = "cpu_benchmarks"

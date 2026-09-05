@@ -4,12 +4,12 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle_transformers::object_detection::{non_maximum_suppression, Bbox};
+use lloom::object_detection::{non_maximum_suppression, Bbox};
 mod darknet;
 
 use anyhow::Result;
 use candle::{DType, Device, Tensor};
-use candle_nn::{Module, VarBuilder};
+use lloom::nn::{Module, VarBuilder};
 use clap::Parser;
 use image::{DynamicImage, ImageBuffer};
 

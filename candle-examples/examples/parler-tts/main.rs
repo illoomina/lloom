@@ -8,8 +8,8 @@ use anyhow::Error as E;
 use clap::Parser;
 
 use candle::{DType, IndexOp, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::parler_tts::{Config, Model};
+use lloom::nn::VarBuilder;
+use lloom::models::parler_tts::{Config, Model};
 use tokenizers::Tokenizer;
 
 #[derive(Parser)]
@@ -181,7 +181,7 @@ fn main() -> anyhow::Result<()> {
         .get_ids()
         .to_vec();
     let prompt_tokens = Tensor::new(prompt_tokens, &device)?.unsqueeze(0)?;
-    let lp = candle_transformers::generation::LogitsProcessor::new(
+    let lp = lloom::generation::LogitsProcessor::new(
         args.seed,
         Some(args.temperature),
         args.top_p,

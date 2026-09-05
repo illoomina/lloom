@@ -59,11 +59,11 @@ use anyhow::{Context, Result};
 use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use candle_nn::ops::KvQuant;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
 use clap::Parser;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
+use lloom::nn::ops::KvQuant;
+use lloom::nn::VarBuilder;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -232,6 +232,23 @@ struct Args {
     #[arg(long)]
     arena: bool,
 
+    /// Serve the arena's session-state declines from an owned region (#47,
+    /// `DESIGN.md` §9.2x).
+    ///
+    /// **This flag is why the digest gate matters for #47.** The region hands
+    /// out views of one owned allocation at planned offsets, so a wrong offset
+    /// aliases two session tenants — and §9.3 says nothing would report it. A
+    /// session tenant is read by the *next* step, so the corruption would appear
+    /// one token after the write that caused it, which is precisely the shape
+    /// §2.3.2 says looks like benign float noise. The digest is the only
+    /// available detector, and an **unmoved** pair is the required result rather
+    /// than a pleasant one: the region changes which buffer answers, never what
+    /// is computed.
+    ///
+    /// Requires `--arena`, and has a population only under `--kv-append cat`.
+    #[arg(long)]
+    session_region: bool,
+
     /// Arena layout: `packed` or `non-aliasing` (§9.3's reference).
     #[arg(long, default_value = "non-aliasing")]
     arena_layout: String,
@@ -366,6 +383,40 @@ struct Args {
     /// (§12.2h).
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
+
+    /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
+    /// `conv1d` dispatch (§12.2 row 1). **The digests MOVE** — the depthwise
+    /// kernel accumulates serially ascending in f32 where `sum_keepdim` uses a
+    /// `simd_sum` tree — so `--cpu --conv-fused` against `--cpu` is the §2.3.5a
+    /// discriminator that says it is a reordering rather than a defect.
+    #[arg(long, default_value_t = false)]
+    conv_fused: bool,
+
+    /// Carry the conv state across a turn-boundary prefill as the convolution's
+    /// left context (`ConvPrefillCtx`, `DESIGN.md` §13.2f defect 1, #677). Off,
+    /// every `--turns >= 2` pass zero-pads where the previous turn's last
+    /// `l_cache - 1` tokens belong. Off by default: the canonical §2.3.8c pairs
+    /// belong to the zero-padded arm (§7.1a). Moves both digests at `--turns 3`
+    /// and neither at `--turns 1`.
+    #[arg(long, default_value_t = false)]
+    conv_prefill_ctx: bool,
+
+    /// Which SiLU implementation the 30 `usilu` dispatches resolve to
+    /// (issue #599, `DESIGN.md` §12.2l).
+    ///
+    /// `exact` | `recip` | `literal` | `coarse4` | `coarse1` | `hardswish`,
+    /// in ascending error order. **`exact` is the default and resolves the
+    /// same `silu_f16` name it always did**, so an unconfigured run is
+    /// byte-identical (§7.1a).
+    ///
+    /// **Every arm but `exact` and `recip` MOVES THE DIGESTS by construction**
+    /// — that is what an approximation to SiLU does, and it is the point.
+    /// `recip` is the control: #604 measured it bit-identical, so an
+    /// unmoved digest there is the arm engaging correctly and a MOVED one is
+    /// a defect. Pair with `--force-tokens` and `--dump-logits` for §2.3.5a's
+    /// magnitude ladder, which is the quantity #599's absorption curve wants.
+    #[arg(long, default_value = "exact")]
+    silu_impl: String,
 
     /// How every kernel's scalars reach it: `split` (the default, one `setBytes`
     /// per scalar) or `packed` (one `device const Params*`, issue #115).
@@ -606,7 +657,7 @@ fn main() -> Result<()> {
     // reason as `--attn`: a silently-ignored flag makes a gate report on an arm
     // it did not run (§2.4).
     config.flash_scratch_sizing =
-        candle_nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
+        lloom::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
             .map_err(anyhow::Error::msg)?;
     println!("attention implementation: {:?}", config.attn_impl);
     // Refused rather than defaulted, for the same reason as `--attn`: an
@@ -629,12 +680,34 @@ fn main() -> Result<()> {
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     println!("conv state: {:?}", config.conv_state);
 
+    // #599's SiLU arm. Refused rather than defaulted, for `--conv-state`'s
+    // reason: an unrecognized value silently pinning `exact` would report the
+    // shipping arm's digest under a variant's name, which is #69's vacuous run
+    // (§2.4). Printed whether or not it is `exact` — a digest is only
+    // interpretable against the arm it was taken in.
+    let silu = candle::kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
+             `coarse1`, `hardswish`, got `{}`",
+            args.silu_impl
+        )
+    })?;
+    // The SiLU arm now rides `Config::silu_impl` (RESTRUCTURING §1.6): the field
+    // is the source of truth and `Model::new` pushes it into the kernel cache,
+    // so setting it here (rather than calling `set_silu_impl` directly) is what
+    // makes the run record it. Setting the atomic directly would be clobbered by
+    // `Model::new`'s push of `config.silu_impl`.
+    config.silu_impl = silu;
+    println!("silu impl: {}", silu.name());
+
     // The two GEMV epilogue fusions (#509's wiring of #484's and #509's
     // kernels). Printed whether or not they are set, because *inert* and
     // *unrecorded* are different facts (#241) and a digest is only
     // interpretable against the arm it was taken in (§2.3.7).
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
+    config.conv_fused = args.conv_fused;
+    config.conv_prefill_ctx = args.conv_prefill_ctx;
     println!(
         "gemv epilogue: silu={} residual={}",
         config.gemv_silu, config.gemv_residual
@@ -646,7 +719,7 @@ fn main() -> Result<()> {
     // that the two arms differ in something observable (§2.4, §9.2f).
     #[cfg(feature = "metal")]
     {
-        use candle_metal_kernels::{default_param_style, set_default_param_style, ParamStyle};
+        use candle::kernels::{default_param_style, set_default_param_style, ParamStyle};
         let want = match args.param_style.as_str() {
             "split" => ParamStyle::Split,
             "packed" => ParamStyle::Packed,
@@ -680,9 +753,9 @@ fn main() -> Result<()> {
              (DESIGN.md §3.7c), so under `split` every position is excluded and this would \
              gate an executor that replayed nothing"
         );
-        candle_metal_kernels::set_pipelines_support_icb(true)
+        candle::kernels::set_pipelines_support_icb(true)
             .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
-        candle_metal_kernels::set_constants_pool_enabled(true);
+        candle::kernels::set_constants_pool_enabled(true);
         println!("icb: enabled");
     }
     #[cfg(not(feature = "metal"))]
@@ -874,23 +947,23 @@ fn main() -> Result<()> {
     const ICB_RECORD_STEPS: usize = 3;
     #[cfg(feature = "metal")]
     let icb_barrier_scope = match args.icb_barrier_scope.as_str() {
-        "run-start" => candle_metal_kernels::BarrierScope::RunStart,
-        "since-barrier" => candle_metal_kernels::BarrierScope::SinceBarrier,
+        "run-start" => candle::kernels::BarrierScope::RunStart,
+        "since-barrier" => candle::kernels::BarrierScope::SinceBarrier,
         other => anyhow::bail!(
             "--icb-barrier-scope must be `run-start` or `since-barrier`, got `{other}`"
         ),
     };
     #[cfg(feature = "metal")]
     let icb_replay_barriers = match args.icb_replay_barriers.as_str() {
-        "always" => candle_metal_kernels::ReplayBarriers::Always,
-        "skip-replayed" => candle_metal_kernels::ReplayBarriers::SkipReplayed,
+        "always" => candle::kernels::ReplayBarriers::Always,
+        "skip-replayed" => candle::kernels::ReplayBarriers::SkipReplayed,
         other => anyhow::bail!(
             "--icb-replay-barriers must be `always` or `skip-replayed`, got `{other}`"
         ),
     };
     #[cfg(feature = "metal")]
     let icb_executor = args.icb.then(|| {
-        candle_metal_kernels::IcbExecutor::configured(
+        candle::kernels::IcbExecutor::configured(
             ICB_RECORD_STEPS,
             icb_barrier_scope,
             icb_replay_barriers,
@@ -1202,7 +1275,7 @@ fn main() -> Result<()> {
             if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
                 if decode_steps == icb_installed_at {
                     dev.set_executor(std::sync::Arc::new(
-                        candle_metal_kernels::metal::ExecutorSlot::Custom(exec.clone()),
+                        candle::kernels::metal::ExecutorSlot::Custom(exec.clone()),
                     ));
                 }
             }
@@ -1229,6 +1302,16 @@ fn main() -> Result<()> {
             if let (true, Some(dev)) = (args.arena, metal_device.as_ref()) {
                 dev.end_decode_step();
                 if decode_steps == ARENA_RECORD_STEPS - 1 {
+                    // Read BEFORE `finish_arena_recording`, which `take`s the
+                    // recorder the reservations are derived from (#47).
+                    let reservations = if args.session_region {
+                        dev.arena_recording_session_reservations(
+                            kv_len,
+                            lloom::models::lfm2::DEFAULT_KV_CAPACITY,
+                        )
+                    } else {
+                        None
+                    };
                     let plan = dev
                         .finish_arena_recording(arena_layout)
                         .context("arena recording produced no allocations")?;
@@ -1237,6 +1320,14 @@ fn main() -> Result<()> {
                     dev.install_arena(plan, arena_layout)
                         .context("installing the arena")?;
                     eprintln!("arena: {covered} of {total} ordinals served ({arena_layout:?})");
+                    // #47, after the arena because it serves what the arena
+                    // declines: the offer order is arena, region, pool.
+                    if let Some(res) = reservations {
+                        let bytes = dev
+                            .install_session_region(&res)
+                            .context("installing the session region")?;
+                        eprintln!("session region: {} tenants, {} B", res.len(), bytes);
+                    }
 
                     if gpu_offsets {
                         if !monotone {
@@ -1351,7 +1442,7 @@ fn main() -> Result<()> {
         // The correctness evidence is this harness's own digest.
         println!(
             "ICB replay barriers: {icb_replay_barriers:?}  suppressed={}",
-            candle_metal_kernels::metal::trace::barriers_suppressed(),
+            candle::kernels::metal::trace::barriers_suppressed(),
         );
         // Per kernel, with the reason attached, because the totals above cannot
         // distinguish a position that became *covered* from one that merely
@@ -1490,7 +1581,7 @@ fn main() -> Result<()> {
     // map, and reporting coverage without it invites reading an unmapped pool
     // as a verified one.
     {
-        use candle_metal_kernels::metal::poison;
+        use candle::kernels::metal::poison;
         if poison::ENABLED {
             let c = poison::counters();
             println!(

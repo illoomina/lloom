@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>lloom notebook — a real LFM2 token in the browser (#623)</title>
+<style>
+  body { font: 15px/1.6 ui-sans-serif, system-ui, sans-serif; margin: 2rem auto; max-width: 48rem; color: #1a1a1a; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  code, pre, .mono { font-family: ui-monospace, "SF Mono", monospace; }
+  .cell { border: 1px solid #ddd; border-radius: 8px; overflow: hidden; margin: 1rem 0; }
+  .cell-src { background: #1e1e2e; color: #cdd6f4; padding: 1rem; margin: 0; overflow-x: auto; font-size: 13px; }
+  .cell-bar { background: #f4f4f7; padding: .5rem 1rem; display: flex; gap: .5rem; align-items: center; border-top: 1px solid #ddd; }
+  .cell-out { padding: 1rem; }
+  button { font: inherit; padding: .4rem 1rem; border: 1px solid #888; border-radius: 6px; background: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .status { color: #666; font-size: 13px; }
+  .token { font-size: 1.6rem; font-weight: 600; background: #dff5e1; padding: .1rem .5rem; border-radius: 6px; }
+  .fp { color: #888; font-size: 12px; }
+  table.logits { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  table.logits td { padding: 2px 6px; font-size: 13px; }
+  .bar { height: 14px; background: #7aa2f7; border-radius: 3px; }
+  .barcell { width: 55%; }
+  .prompt-in { font: inherit; width: 22rem; padding: .3rem .5rem; }
+  .ok { color: #0a7d2c; } .err { color: #c0392b; }
+</style>
+</head>
+<body>
+
+<h1>A runnable notebook cell — a real LFM2 token, decoded in your browser</h1>
+
+<p>This page is the <b>fuller notebook</b> for
+<a href="https://github.com/ocean1/lloom/issues/623">#623</a>. The cell below is
+a single-file <code>lloom</code> snippet (the §602/§7.6 format). Clicking
+<b>Run</b> compiles nothing on your machine — it fetches a pre-compiled
+<code>wasm</code> module and a quantized <b>LFM2.5-350M</b> checkpoint, then runs
+<i>our actual engine</i> — the same CPU kernels §2.3.5a validates Metal against —
+to decode one real token in a <b>Web Worker</b> (killable: the interrupt story
+evcxr cannot offer). The result is the byte-identical CPU-reference token; the
+fingerprint below matches the native <code>reference_lfm2</code> oracle exactly.</p>
+
+<p class="status">Backend: CPU/WASM (no Metal — Metal does not exist in the
+browser; this is the parity oracle). Weights: quantized GGUF (~219 MB, fetched
+once). A raw bf16 LFM2 is ~5 GB and does not fit the wasm32 4 GiB ceiling — the
+quantized path is the real browser story.</p>
+
+<div class="cell">
+<pre class="cell-src">// lloom cell — decode one LFM2 token (single-file format, §602)
+use lloom::models::quantized_lfm2::ModelWeights;
+use lloom_tensor::quantized::{gguf_file, tokenizer::TokenizerFromGguf};
+use lloom_tensor::{Device, Tensor};
+
+let content   = gguf_file::Content::read(&amp;mut cursor)?;      // the GGUF
+let tokenizer = tokenizers::Tokenizer::from_gguf(&amp;content)?;  // embedded
+let ids       = tokenizer.encode(prompt, true)?.get_ids();
+let mut model = ModelWeights::from_gguf(content, &amp;mut cursor, &amp;Device::Cpu)?;
+let logits    = model.forward(&amp;Tensor::new(ids, &amp;dev)?.unsqueeze(0)?, 0)?;
+let next      = argmax(&amp;logits);                              // one real token</pre>
+<div class="cell-bar">
+  <input id="prompt" class="prompt-in" value="The capital of France is" />
+  <button id="run">▶ Run</button>
+  <button id="kill" disabled>■ Interrupt (terminate worker)</button>
+  <span id="status" class="status">idle.</span>
+</div>
+<div id="out" class="cell-out"><span class="status">— no output yet —</span></div>
+</div>
+
+<h2>What "rich display" means here (#623 point 3)</h2>
+<p>The cell renders a tensor — the next-token logit distribution — as an in-cell
+bar chart, not a text dump. In a browser this is trivial (it is a web page); no
+evcxr HTML-debug hack is needed.</p>
+
+<script type="module">
+const GGUF_URL = new URLSearchParams(location.search).get("gguf")
+  || "https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/resolve/main/LFM2.5-350M-Q4_K_M.gguf";
+
+const out = document.getElementById("out");
+const statusEl = document.getElementById("status");
+const runBtn = document.getElementById("run");
+const killBtn = document.getElementById("kill");
+
+let worker = null;
+function spawnWorker() {
+  worker = new Worker("./worker.js", { type: "module" });
+  worker.onmessage = onMessage;
+  worker.onerror = (e) => { setStatus("worker error: " + e.message, "err"); };
+}
+function setStatus(s, cls) { statusEl.className = "status " + (cls || ""); statusEl.textContent = s; }
+
+function renderDecoded(d, ms) {
+  const rows = d.topk.map((t) => {
+    const w = Math.max(2, Math.round((t.logit / d.topk[0].logit) * 100));
+    const isTop = t.id === d.token_id;
+    return `<tr>
+      <td class="mono">${t.id}</td>
+      <td class="mono">${JSON.stringify(t.text)}</td>
+      <td class="mono">${t.logit.toFixed(3)}</td>
+      <td class="barcell"><div class="bar" style="width:${w}%;${isTop ? "" : "background:#a9b8e8"}"></div></td>
+    </tr>`;
+  }).join("");
+  out.innerHTML = `
+    <div>next token → <span class="token">${JSON.stringify(d.token_text)}</span>
+      <span class="mono">(id ${d.token_id})</span> · <span class="ok">${ms.toFixed(0)} ms</span></div>
+    <table class="logits">${rows}</table>
+    <div class="fp">logits fingerprint <span class="mono">${d.logits_fp}</span>
+      · prompt ids <span class="mono">[${d.prompt_ids}]</span></div>`;
+}
+
+function onMessage(ev) {
+  const m = ev.data;
+  if (!m.ok) { setStatus("ERROR: " + m.error, "err"); window.__LFM2__ = { error: m.error }; runBtn.disabled = false; return; }
+  if (m.cmd === "status") { setStatus(m.result); return; }
+  if (m.cmd === "lfm2") {
+    const d = JSON.parse(m.result);
+    renderDecoded(d, m.ms);
+    setStatus(`done in ${m.ms.toFixed(0)} ms`, "ok");
+    runBtn.disabled = false;
+    // Headless-driver hook (the #623 oracle check reads this).
+    window.__LFM2__ = { ms: m.ms, ...d };
+    document.title = "LFM2:" + d.logits_fp;
+    console.log("LFM2_RESULT " + m.result + " ms=" + m.ms.toFixed(1));
+  }
+}
+
+runBtn.onclick = () => {
+  if (!worker) spawnWorker();
+  runBtn.disabled = false; killBtn.disabled = false;
+  runBtn.disabled = true;
+  setStatus("running…");
+  worker.postMessage({ cmd: "lfm2", url: GGUF_URL, prompt: document.getElementById("prompt").value });
+};
+
+killBtn.onclick = () => {
+  if (worker) { worker.terminate(); worker = null; }
+  setStatus("worker terminated (interrupt). Click Run to respawn.", "err");
+  runBtn.disabled = false; killBtn.disabled = true;
+};
+
+// Auto-run on load so a headless driver needs no interaction.
+window.addEventListener("load", () => { spawnWorker(); runBtn.click(); });
+</script>
+</body>
+</html>

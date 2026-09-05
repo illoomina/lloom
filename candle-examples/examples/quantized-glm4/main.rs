@@ -10,10 +10,10 @@ use tokenizers::Tokenizer;
 
 use candle::quantized::gguf_file;
 use candle::{DType, Tensor};
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use lloom::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::quantized_glm4::ModelWeights as GLM4;
+use lloom::models::quantized_glm4::ModelWeights as GLM4;
 
 const DEFAULT_PROMPT: &str = "Write a Rust function to calculate the factorial of a given number.";
 
@@ -289,7 +289,7 @@ fn main() -> anyhow::Result<()> {
             logits
         } else {
             let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
+            lloom::utils::apply_repeat_penalty(
                 &logits,
                 args.repeat_penalty,
                 &all_tokens[start_at..],

@@ -1,22 +1,37 @@
 [workspace]
 members = [
-    "candle-core",
-    "candle-datasets",
+    "lloom-tensor",
+    "lloom",
+    "lloom-engine",
+    "lloom-macros",
     "candle-examples",
-    "candle-nn",
-    "candle-pyo3",
-    "candle-transformers",
     "candle-ug",
-    "candle-wasm-examples/*",
     "candle-wasm-tests",
     "tensor-tools",
 ]
+# RESTRUCTURING §7.1: the engine is the two-crate floor (lloom-tensor +
+# lloom). The crates below consume candle-nn/candle-transformers, which no
+# longer exist under those names after the merge; they are peripheral consumers,
+# not the engine, and none builds in the default gate on this metal-only machine
+# (pyo3 needs a Python extension toolchain, the wasm examples need the wasm
+# target). They are kept in-tree for the breadth CI (§7.4) but moved out of the
+# default workspace until they are repointed at lloom (see the PR's
+# "what was NOT done" — the downstream-consumer decision is surfaced for the
+# owner, §6). candle-book/flash-attn/flash-attn-v3/kernels/onnx were already
+# excluded upstream.
 exclude = [
+    "candle-datasets",
+    "candle-pyo3",
+    "candle-wasm-examples",
+    # The #656 browser-runner spike: wasm32-only, its own workspace root. Its
+    # wasm deps (getrandom js backends, wasm-bindgen) must not enter the
+    # metal-only default resolve. Build it with `--target wasm32-unknown-unknown`
+    # from lloom-wasm/ (see its README).
+    "lloom-wasm",
     "candle-book",
     "candle-flash-attn",
     "candle-flash-attn-v3",
     "candle-kernels",
-    "candle-metal-kernels",
     "candle-onnx",
 ]
 resolver = "2"
@@ -35,15 +50,28 @@ ab_glyph = "0.2.23"
 accelerate-src = { version = "0.3.2" }
 anyhow = { version = "1", features = ["backtrace"] }
 byteorder = "1.4.3"
-candle = { path = "./candle-core", package = "candle-core", version = "0.11.0" }
+lloom-tensor = { path = "./lloom-tensor", version = "0.11.0" }
+lloom = { path = "./lloom", version = "0.11.0" }
+# The serving engine (RESTRUCTURING §4, §7.1): decode loop + request seam over
+# lloom's tier-1 API. Consumed by amber; consumes lloom, never the reverse.
+lloom-engine = { path = "./lloom-engine", version = "0.11.0" }
+# The engine's derive macros (RESTRUCTURING §1.6): #[derive(Config)] emits the
+# clap flags and the within-crate `AXES` distributed-slice contributions.
+lloom-macros = { path = "./lloom-macros", version = "0.11.0" }
+# The within-crate axis registry the derive contributes to, collected at link
+# time (RESTRUCTURING §1.6, feasibility-checked at HEAD on rustc 1.96.0).
+linkme = "0.3.37"
+# Transitional alias: candle-examples/candle-ug/candle-wasm-tests/tensor-tools
+# still name `candle::` (the tensor layer). Kept resolving to lloom-tensor so
+# those crates build unchanged; the engine crates now name `lloom_tensor::`
+# directly. Dropped when the remaining `candle::` consumers are repointed.
+candle = { path = "./lloom-tensor", package = "lloom-tensor", version = "0.11.0" }
 candle-datasets = { path = "./candle-datasets", version = "0.11.0" }
 candle-flash-attn = { path = "./candle-flash-attn", version = "0.11.0" }
+candle-hub = { path = "./candle-hub", version = "0.11.0" }
 candle-flash-attn-v3 = { path = "./candle-flash-attn-v3", version = "0.11.0" }
 candle-kernels = { path = "./candle-kernels", version = "0.11.0" }
-candle-metal-kernels = { path = "./candle-metal-kernels", version = "0.11.0" }
-candle-nn = { path = "./candle-nn", version = "0.11.0" }
 candle-onnx = { path = "./candle-onnx", version = "0.11.0" }
-candle-transformers = { path = "./candle-transformers", version = "0.11.0" }
 candle-ug = { path = "./candle-ug", version = "0.11.0" }
 clap = { version = "4.2.4", features = ["derive"] }
 criterion = { version = "0.8", default-features = false }
@@ -92,6 +120,10 @@ safetensors = "0.8.0"
 serde = { version = "1.0.171", features = ["derive"] }
 serde_plain = "1.0.2"
 serde_json = "1.0.99"
+# lloom-macros' proc-macro deps (RESTRUCTURING §1.6).
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
 thiserror = "2"
 tokenizers = { version = "0.22.0", default-features = false }
 tracing = "0.1.37"
@@ -103,8 +135,11 @@ ug-metal = "0.5.0"
 yoke = { version = "0.8.1", features = ["derive"] }
 zip = { version = "8.6.0", default-features = false }
 zerocopy = "0.8"
-objc2-metal = { version = "0.3.1" }
-objc2-foundation = { version = "0.3.1" }
+objc2-metal = { version = "0.3.2", features = ["block2"] }
+objc2-foundation = { version = "0.3.2" }
+objc2 = { version = "0.6.3" }
+block2 = { version = ">=0.6.1, <0.8.0", features = ["alloc"], default-features = false }
+once_cell = "1.21"
 
 # Ambrogio's codegen flags, adopted here so the two trees agree — DESIGN.md
 # §14.5a (#297) recorded their ABSENCE as the finding: candle's workspace

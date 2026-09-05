@@ -67,8 +67,8 @@
 
 use anyhow::{Context, Result};
 use candle::{DType, Device};
-use candle_nn::VarBuilder;
-use candle_transformers::models::lfm2::{Cache, Config, Lfm2Config, Model};
+use lloom::nn::VarBuilder;
+use lloom::models::lfm2::{Cache, Config, Lfm2Config, Model};
 use clap::Parser;
 use serde_json::Value;
 use std::path::{Path, PathBuf};

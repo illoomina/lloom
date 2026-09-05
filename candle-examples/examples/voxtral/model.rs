@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Error, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use candle::{utils, DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::voxtral;
-use candle_transformers::models::voxtral::{
+use lloom::nn::VarBuilder;
+use lloom::models::voxtral;
+use lloom::models::voxtral::{
     VoxtralCache, VoxtralConfig, VoxtralEncoderConfig, VoxtralForConditionalGeneration,
     VoxtralGenerationConfig, VoxtralLlamaConfig as LlamaConfig,
 };

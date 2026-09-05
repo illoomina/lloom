@@ -148,7 +148,7 @@ fn main() -> Result<()> {
     // argmax(logits/T + G) with G = -log(-log(U)), U ~ rand_uniform on the GPU.
     // Its noise comes from `rand_like` -- i.e. from the kernel #345 fixes.
     //
-    // The shipping `candle_nn::sampling::gumbel_softmax` is called DIRECTLY
+    // The shipping `lloom::nn::sampling::gumbel_softmax` is called DIRECTLY
     // rather than reimplemented here. A first version of this harness inlined
     // the same
     // arithmetic, and a mutation to the shipping function then left its number
@@ -159,7 +159,7 @@ fn main() -> Result<()> {
     // by reading it.
     let mut gumbel_counts = vec![0u64; vocab];
     for _ in 0..draws {
-        let idx = candle_nn::sampling::gumbel_softmax(&logits_t, temperature, 0)?
+        let idx = lloom::nn::sampling::gumbel_softmax(&logits_t, temperature, 0)?
             .to_scalar::<u32>()? as usize;
         gumbel_counts[idx] += 1;
     }

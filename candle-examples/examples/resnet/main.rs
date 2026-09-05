@@ -5,8 +5,8 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use candle::{DType, IndexOp, D};
-use candle_nn::{Module, VarBuilder};
-use candle_transformers::models::resnet;
+use lloom::nn::{Module, VarBuilder};
+use lloom::models::resnet;
 use clap::{Parser, ValueEnum};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -74,7 +74,7 @@ pub fn main() -> anyhow::Result<()> {
     };
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = candle_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = lloom::nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

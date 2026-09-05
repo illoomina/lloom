@@ -1,0 +1,45 @@
+[package]
+name = "lloom-engine"
+version.workspace = true
+edition.workspace = true
+description = "The serving engine: the decode loop, sampling and the streaming request seam over lloom's tier-1 API."
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+license.workspace = true
+
+[dependencies]
+# The inference core (RESTRUCTURING §7.1): the serving engine links lloom's
+# tier-1 API only -- CausalLM/Session/LogitsProcessor, the lfm2 model -- never
+# its internals (§7.1b). lloom-tensor comes through lloom for Tensor/Device.
+# The seam names no tokenizer library: the decode loop takes a detokenize
+# closure and the request seam takes a rendered prompt string, so the consumer
+# owns encoding (amber and the engine were on different `tokenizers` majors —
+# coupling them through the seam would force a lockstep bump). Kept out on
+# purpose.
+lloom = { workspace = true }
+lloom-tensor = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+# Examples encode/decode; the library itself names no tokenizer library (the
+# seam takes a rendered prompt and a detokenize closure), so this is dev-only.
+tokenizers = { workspace = true, features = ["onig"] }
+serde_json = { workspace = true }
+
+[[example]]
+name = "decode-smoke"
+# The example loads a real checkpoint, which needs a device; Metal is the only
+# backend on this machine. The loop itself is backend-agnostic.
+required-features = ["metal"]
+
+[features]
+default = []
+# Forwarded to lloom so a serving binary built for Metal pulls the Metal
+# kernels through the one dependency edge. CPU and CUDA stay buildable
+# (CONTRIBUTING §4.1) because the engine names no backend directly.
+metal = ["lloom/metal"]
+cuda = ["lloom/cuda"]
+accelerate = ["lloom/accelerate"]
+mkl = ["lloom/mkl"]

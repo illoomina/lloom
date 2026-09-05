@@ -46,13 +46,13 @@ extern crate accelerate_src;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use candle_nn::ops::FlashScratchSizing;
-use candle_nn::ops::KvQuant;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::poll::PollMechanism;
-use candle_transformers::generation::token_ring::TokenRing;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{
+use lloom::nn::ops::FlashScratchSizing;
+use lloom::nn::ops::KvQuant;
+use lloom::nn::VarBuilder;
+use lloom::generation::poll::PollMechanism;
+use lloom::generation::token_ring::TokenRing;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{
     AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model,
 };
 use clap::Parser;
@@ -202,7 +202,7 @@ fn flush_run_telemetry(args: &Args, rt_written: &mut usize) -> Result<()> {
     let Some(path) = args.run_telemetry_jsonl.as_ref() else {
         return Ok(());
     };
-    use candle_metal_kernels::metal::run_telemetry as rt;
+    use candle::kernels::metal::run_telemetry as rt;
     let run_id = args.run_id.clone().unwrap_or_else(|| "lfm2".to_string());
     let body = rt::to_jsonl(&run_id);
     *rt_written = body.len();
@@ -249,6 +249,34 @@ const KV_BYTES_PER_TOKEN: u64 = 2 * 8 * 64 * 2 * 8;
 /// driver's own allocated size tracks the pool while the footprint climbs, the
 /// growth is outside Metal's allocations; if both climb together, it is bytes
 /// and the question is whose. Neither reading is available from a pool counter.
+/// A `[u64; N]` as a JSON array, for the band rows.
+///
+/// Hand-rolled because this file writes its JSON by `format!` rather than
+/// through a serializer, and adding one for three fields would change how every
+/// other field is emitted -- which would invalidate the committed series' shape
+/// for a cosmetic gain.
+fn json_u64_array(xs: &[u64]) -> String {
+    let mut s = String::with_capacity(xs.len() * 8 + 2);
+    s.push('[');
+    for (i, x) in xs.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&x.to_string());
+    }
+    s.push(']');
+    s
+}
+
+/// Size bands for the overhang split (`DESIGN.md` §9.2u, #47).
+///
+/// Declared here rather than imported because `MemProbe` is compiled without
+/// the `metal` feature while `candle_metal_kernels` is not, and a `cfg` on a
+/// struct field would make the two builds different shapes.
+/// `band_names_match_the_pools` pins it to the pool's own constant on the
+/// `metal` build, so the two cannot drift.
+const SIZE_BAND_COUNT: usize = 4;
+
 #[derive(Clone, Copy, Debug, Default)]
 struct MemProbe {
     token: u64,
@@ -268,6 +296,41 @@ struct MemProbe {
     hits: u64,
     lookups: u64,
     buckets_probed: u64,
+    /// Bytes callers asked for, and bytes they were given (`DESIGN.md` §9.2s,
+    /// #47). Cumulative, so the overhang over a window is the difference of
+    /// two samples, exactly as `allocations` is used.
+    ///
+    /// **Not derivable from `allocated_bytes`**, which is why these are
+    /// separate fields rather than a computation over the ones above.
+    /// `allocated_bytes` counts what went to `newBufferWithLength` -- fresh
+    /// allocations only -- so it is blind to the pool HIT that is served from
+    /// a strictly larger bucket, and in steady-state decode almost every
+    /// acquisition is a hit. `served_bytes` counts every acquisition.
+    requested_bytes: u64,
+    served_bytes: u64,
+    /// The two fields above, split by the size band of the REQUEST
+    /// (`DESIGN.md` §9.2u, #47). Index-aligned with `SIZE_BAND_NAMES`,
+    /// cumulative like everything else here, and summing to `requested_bytes` /
+    /// `served_bytes` exactly -- which is what lets a band be read *against* the
+    /// headline rather than merely beside it.
+    ///
+    /// **This is what separates a growing request from a widening gap.** The
+    /// whole-pool ratio moves when either term moves, so on its own it cannot
+    /// say whether the allocator got worse or the workload asked for more.
+    /// Per band, the KV population's own growth is visible in its own row.
+    band_acquisitions: [u64; SIZE_BAND_COUNT],
+    band_requested_bytes: [u64; SIZE_BAND_COUNT],
+    band_served_bytes: [u64; SIZE_BAND_COUNT],
+    /// Range-query candidates rejected by the reuse-oversize bound
+    /// (`DESIGN.md` §9.2v, #47).
+    ///
+    /// **The arm's engagement proof.** A bound that is installed but never
+    /// binds and a bound that is not installed at all produce identical
+    /// `requested`/`served` sums, so this is the only field that separates
+    /// them -- #500's lesson that a mechanism with no production callers yields
+    /// a clean null indistinguishable from a real one, and that a counter is
+    /// the only thing that tells them apart.
+    oversize_declined: u64,
     residency: u64,
     /// Residency-set activity, cumulative (`DESIGN.md` §6.3e, issue #210).
     ///
@@ -314,6 +377,20 @@ impl MemProbe {
             hits: cs.hits + cp.hits,
             lookups: cs.lookups + cp.lookups,
             buckets_probed: cs.buckets_probed + cp.buckets_probed,
+            requested_bytes: cs.requested_bytes + cp.requested_bytes,
+            served_bytes: cs.served_bytes + cp.served_bytes,
+            // Summed over both pools, exactly as every counter above is, so a
+            // band row and the headline are over one population (§9.2u).
+            band_acquisitions: std::array::from_fn(|i| {
+                cs.bands[i].acquisitions + cp.bands[i].acquisitions
+            }),
+            band_requested_bytes: std::array::from_fn(|i| {
+                cs.bands[i].requested_bytes + cp.bands[i].requested_bytes
+            }),
+            band_served_bytes: std::array::from_fn(|i| {
+                cs.bands[i].served_bytes + cp.bands[i].served_bytes
+            }),
+            oversize_declined: cs.oversize_declined + cp.oversize_declined,
             residency: dev.residency_set_len() as u64,
             residency_commits: rc.commits,
             residency_added: rc.added,
@@ -378,7 +455,7 @@ impl MemProbe {
     /// figure the PR states rather than hides.
     #[cfg(feature = "metal")]
     fn emit_telemetry(&self, kv_bytes_per_token: u64) {
-        use candle_metal_kernels::metal::run_telemetry as rt;
+        use candle::kernels::metal::run_telemetry as rt;
 
         rt::set_token(self.token);
         rt::sample(
@@ -446,6 +523,9 @@ impl MemProbe {
              \"pool_free_buckets\":{},\"pool_pending_buffers\":{},\
              \"allocations\":{},\"allocated_bytes\":{},\"evicted\":{},\
              \"hits\":{},\"lookups\":{},\"buckets_probed\":{},\
+             \"requested_bytes\":{},\"served_bytes\":{},\
+             \"band_acquisitions\":{},\"band_requested_bytes\":{},\
+             \"band_served_bytes\":{},\"oversize_declined\":{},\
              \"residency\":{},\"residency_commits\":{},\
              \"residency_added\":{},\"residency_removed\":{},\
              \"residency_retired\":{},\"device_allocated\":{},\
@@ -466,6 +546,12 @@ impl MemProbe {
             self.hits,
             self.lookups,
             self.buckets_probed,
+            self.requested_bytes,
+            self.served_bytes,
+            json_u64_array(&self.band_acquisitions),
+            json_u64_array(&self.band_requested_bytes),
+            json_u64_array(&self.band_served_bytes),
+            self.oversize_declined,
             self.residency,
             self.residency_commits,
             self.residency_added,
@@ -526,6 +612,12 @@ struct Axes {
     layout: candle::metal_backend::ArenaLayout,
     /// #70's GPU bump allocator, rather than #69's CPU plan.
     gpu_offsets: bool,
+    /// #47's session region, for the population the arena declines.
+    session_region: bool,
+    /// The Metal device, so an axis arm can be read back from the mechanism
+    /// rather than echoed from the flag that asked for it (§7.1a-i).
+    #[cfg(feature = "metal")]
+    device: Option<candle::MetalDevice>,
     /// The attention arm, echoed for the run line.
     ///
     /// **The resolved enum, not the flag string** (issue #241). It was a
@@ -804,6 +896,20 @@ impl Axes {
             anyhow::bail!("--arena needs a Metal device");
         }
 
+        // #47's session region. Refused rather than silently ignored, on the
+        // reason every other axis here is refused: a flag that does nothing
+        // makes a run compare EQUAL to one that took the arm, which is the
+        // failure §7.1a-i names and the one a measurement cannot recover from.
+        if args.session_region && !args.arena {
+            anyhow::bail!(
+                "--session-region needs --arena: the reservations are derived from the \
+                 arena recording's two steps, which is what measures the per-token stride"
+            );
+        }
+        if args.session_region && !matches!(_device, Device::Metal(_)) {
+            anyhow::bail!("--session-region needs a Metal device");
+        }
+
         // ---- #567's three async arms, refused rather than defaulted --------
         //
         // Parsed before the clock for the reason every other axis here is: an
@@ -878,6 +984,12 @@ impl Axes {
             #[cfg(feature = "metal")]
             layout,
             gpu_offsets,
+            session_region: args.session_region,
+            #[cfg(feature = "metal")]
+            device: match _device {
+                Device::Metal(d) => Some(d.clone()),
+                _ => None,
+            },
             // Read back from the configuration the model was built from, not
             // re-parsed from the flag (#241). These three are the axes whose
             // arm is decided on `Config`, so this is where the arm actually is.
@@ -931,23 +1043,19 @@ impl Axes {
             // period *of the arm the device installed*. Without that assertion
             // it would be reading the flag (§7.1a-i).
             //
-            // **Both parameterised arms are read here** (#583). The wait arm's
-            // period is a TIMEOUT in milliseconds rather than a sleep in
-            // microseconds, and it is carried for the identical reason: an arm
-            // whose period does not reach the axis vector renders equal to the
-            // same arm at a different period.
+            // **The period comes from the ARM rather than from a match here**
+            // (#583). This was a local `match` naming each parameterised arm,
+            // which is a list that goes stale silently: an arm added without a
+            // branch falls into `_ => None` and renders **equal** to the same
+            // arm at every other period. `CompletionWait::period()` is the one
+            // place that knows, and it is an exhaustive match, so a new arm is
+            // a compile error there rather than a wrong axis vector here.
             #[cfg(feature = "metal")]
-            completion_wait_period: match candle::metal_backend::CompletionWait::from_str_arm(
+            completion_wait_period: candle::metal_backend::CompletionWait::from_str_arm(
                 &args.completion_wait,
-            ) {
-                Ok(candle::metal_backend::CompletionWait::SharedEventSleep { micros }) => {
-                    Some(micros)
-                }
-                Ok(candle::metal_backend::CompletionWait::SharedEventWait { timeout_ms }) => {
-                    Some(timeout_ms)
-                }
-                _ => None,
-            },
+            )
+            .ok()
+            .and_then(|a| a.period()),
             #[cfg(not(feature = "metal"))]
             completion_wait_period: None,
         })
@@ -1225,7 +1333,204 @@ impl Axes {
             // honestly `UNRECORDED` on it rather than silently `off`.
             p("MetalCflags", &Self::metal_cflags_arm()),
             p("MergedUnit", Self::merged_unit_arm()),
+            // The buffer-allocation granularity (§9.2, #586). Read back from
+            // `MetalDevice::buffer_alignment()` — the `OnceLock` `buf_size`
+            // itself reads — rather than from the environment variable, for
+            // `CompletionWait`'s reason: a flag echoed to itself is the
+            // two-parses-of-one-flag shape that made `--attn flash` report
+            // `AttnImpl=Generic` for the life of #116 (§7.1a-i).
+            //
+            // **Stated on every run, including the default one.** This axis had
+            // no selector at all until #586, so unlike every axis above it
+            // there is no interval of runs that took an arm without recording
+            // it — but the *reason* to state it at the default is
+            // `FlashPageSize`'s: a run at 128 and a run that predates the axis
+            // are different facts, and only the first can be pooled with a
+            // future 128 run.
+            //
+            // The arm is the byte count verbatim, `CutPolicy`'s rule: 64 and
+            // 256 are two granularities and a bare `aligned` would pool them.
+            p("BufferAlignment", &Self::buffer_alignment_arm()),
+            // The reuse-oversize bound (§9.2v, #47). Read back from the
+            // `OnceLock` `acquire` itself consults, on `BufferAlignment`'s
+            // reasoning exactly: a flag echoed to itself is §7.1a-i's
+            // present-and-wrong case, and this axis has the same failure
+            // available to it -- a run that rendered a bound it did not take
+            // would compare EQUAL to every real run of that arm.
+            //
+            // Stated on every run including the default `off`, for the same
+            // reason `BufferAlignment` is: this axis did not exist before #47,
+            // so a run at `off` and a run predating the axis are different
+            // facts, and only the first can be pooled with a future `off` run.
+            p("ReuseOversizeBound", &Self::reuse_oversize_bound_arm()),
+            // Same reasoning, and the same failure available to it: an arm
+            // echoed from the flag rather than read from the pool would render
+            // a policy the eviction path did not take (§7.1a-i). Stated on
+            // every run including the default `age`, since a run predating the
+            // axis and a run at `age` are different facts (§9.2w).
+            p("EvictionOrder", &Self::eviction_order_arm()),
+            // #599's SiLU variant axis (`DESIGN.md` §12.2l) — which of the
+            // seven implementations the 30 `usilu` dispatches per token
+            // resolve to.
+            //
+            // **Read back from `candle::kernels::silu_impl()`**, the same
+            // process state `MetalStorage::unary_impl` consults when it picks a
+            // `[[host_name]]`, on `ReuseOversizeBound`'s reasoning exactly: a
+            // flag echoed to itself is §7.1a-i's present-and-wrong case, and a
+            // run that rendered an arm it did not take would compare EQUAL to
+            // every real run of that arm.
+            //
+            // Stated on every run including the default `exact`, for
+            // `BufferAlignment`'s reason: this axis did not exist before #599,
+            // so a run at `exact` and a run predating the axis are different
+            // facts, and only the first can be pooled with a future `exact`
+            // run.
+            p("SiluImpl", Self::silu_impl_arm()),
+            // #47's session region (`DESIGN.md` §9.2x).
+            //
+            // **Read back from the device**, never echoed from the flag, on
+            // `ReuseOversizeBound`'s reasoning exactly: a run that rendered
+            // `on` while the install had silently produced no tenants would
+            // compare EQUAL to a real `on` run, which is §7.1a-i's
+            // present-and-wrong case and the failure #500 measured.
+            //
+            // The arm carries the **tenant count**, not a bare `on`, because
+            // "installed" and "installed and covering something" are different
+            // states and only the second is the arm anyone wants to pool on.
+            p("SessionRegion", &self.session_region_arm()),
         ]
+    }
+
+    /// The `SessionRegion` arm: what the device actually has installed.
+    ///
+    /// `off` when none is installed — the default and what ships — and
+    /// `tenants:<N>` naming the tenant count when one is, so an
+    /// installed-but-empty region renders `tenants:0` rather than passing for
+    /// a covering one.
+    ///
+    /// The count sits behind a `:` on `Poll`'s `sleep:<micros>` pattern rather
+    /// than glued on as `t56`, because `.bench/configurations.md` declares the
+    /// arm once as `tenants:<N>` and `lloom-runs`'s coverage check matches a
+    /// rendered arm to a declared one on the stem before the separator. A
+    /// glued spelling has no stem, so every run of it would read as an
+    /// undeclared arm and the declared one as never rendered — the first form
+    /// of this renderer did exactly that, and the check refused it.
+    ///
+    /// Reads the device rather than a field the install wrote, because a field
+    /// IS the flag echoed to itself one indirection later: it would render `t8`
+    /// for a run whose install silently produced nothing. This reaches the
+    /// `Option<SessionRegion>` the allocation path itself consults, which is the
+    /// only state that can answer honestly (§7.1a-i).
+    fn session_region_arm(&self) -> String {
+        #[cfg(feature = "metal")]
+        {
+            match self
+                .device
+                .as_ref()
+                .and_then(|d| d.session_region_tenants())
+            {
+                Some(n) => format!("tenants:{n}"),
+                None => "off".to_string(),
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a".to_string()
+        }
+    }
+
+    /// The `EvictionOrder` arm: the order `evict_over_budget` actually applies.
+    ///
+    /// `age` for the oldest-first behaviour that ships, spelled rather than
+    /// left empty, and `n/a` off Metal where there is no pool to evict from --
+    /// both following `ReuseOversizeBound` below.
+    ///
+    /// **These arms are strings, which removes §9.2v's rendering defect by
+    /// construction**: there is no `Display` rounding to disagree with the
+    /// registry about.
+    fn eviction_order_arm() -> String {
+        #[cfg(feature = "metal")]
+        {
+            candle::kernels::metal::buffer_pool::eviction_order()
+                .as_str()
+                .to_string()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a".to_string()
+        }
+    }
+
+    /// The `SiluImpl` arm: which SiLU the `usilu` dispatches resolve to.
+    ///
+    /// The CLI spelling, which is also what `.bench/configurations.md` §1
+    /// declares — `exact`, `recip`, `literal`, `coarse4`, `coarse1`,
+    /// `hardswish`, `relu`. Taken from `SiluImpl::name()` rather than written
+    /// as a literal here, so the harness and the registry cannot disagree about
+    /// an arm's name the way `ReuseOversizeBound`'s float rendering did (#47).
+    #[cfg(feature = "metal")]
+    fn silu_impl_arm() -> &'static str {
+        candle::kernels::silu_impl().name()
+    }
+
+    /// Without the Metal backend there is no SiLU kernel to select, so the axis
+    /// is honestly absent rather than defaulted to an arm nothing took.
+    #[cfg(not(feature = "metal"))]
+    fn silu_impl_arm() -> &'static str {
+        "UNRECORDED"
+    }
+
+    /// The `ReuseOversizeBound` arm: the ceiling `acquire` actually applies.
+    ///
+    /// `off` for the unbounded behaviour that ships, spelled rather than left
+    /// empty -- `MemoryBudget`'s rule, that an arm rendering as the empty
+    /// string is indistinguishable from a field the harness failed to fill.
+    /// `n/a` off Metal, following `BufferAlignment`: there is no pool for a
+    /// bound to apply to, which is a different fact from having taken the
+    /// default arm.
+    ///
+    /// # `{:.1}` rather than `{}`, and it is not cosmetic
+    ///
+    /// Rust's `Display` for `f64` drops a trailing zero, so `LLOOM_47_…=4.0`
+    /// renders `4` while `.bench/configurations.md` declares the arm `4.0` --
+    /// and the two then **fail to compare equal across a sweep**, which is
+    /// exactly the pooling failure the byte-count-verbatim rule exists to
+    /// prevent for `BufferAlignment`. One decimal place is canonical for every
+    /// bound a sweep would take; a bound needing more precision than that is
+    /// not a ratio anyone is choosing deliberately.
+    ///
+    /// **Caught by `every_registry_arm_is_renderable_by_the_harness`**, which
+    /// reads real `RESULT` lines rather than a rendering the test invented --
+    /// the check §7.1a exists for, firing in the direction that a declared arm
+    /// and a rendered arm had drifted apart.
+    fn reuse_oversize_bound_arm() -> String {
+        #[cfg(feature = "metal")]
+        {
+            match candle::kernels::metal::buffer_pool::reuse_oversize_bound() {
+                Some(v) => format!("{v:.1}"),
+                None => "off".to_string(),
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a".to_string()
+        }
+    }
+
+    /// The `BufferAlignment` arm: the granularity `buf_size` actually rounds to.
+    ///
+    /// `n/a` on a non-Metal build, following `CompletionWait`: there is no
+    /// Metal allocator for an alignment to apply to, which is a different fact
+    /// from having taken the default arm.
+    fn buffer_alignment_arm() -> String {
+        #[cfg(feature = "metal")]
+        {
+            candle::metal_backend::MetalDevice::buffer_alignment().to_string()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            "n/a".to_string()
+        }
     }
 
     /// The `MetalCflags` arm: the compile flags as the compiler resolved them.
@@ -1238,7 +1543,7 @@ impl Axes {
     fn metal_cflags_arm() -> String {
         #[cfg(feature = "metal")]
         {
-            candle_metal_kernels::metal_compile_flags()
+            candle::kernels::metal_compile_flags()
                 .map(|f| f.to_string())
                 .unwrap_or_else(|| "none".to_string())
         }
@@ -1256,7 +1561,7 @@ impl Axes {
     fn merged_unit_arm() -> &'static str {
         #[cfg(feature = "metal")]
         {
-            if candle_metal_kernels::merged_translation_unit() {
+            if candle::kernels::merged_translation_unit() {
                 "on"
             } else {
                 "off"
@@ -1624,14 +1929,31 @@ struct Args {
     /// §11.5t, issue #583).
     ///
     /// `synchronize` (the default and the incumbent), `shared-event`,
-    /// `shared-event-sleep[:<micros>]`, or `shared-event-wait[:<timeout_ms>]`.
+    /// `shared-event-sleep[:<micros>]`, `shared-event-wait[:<timeout_ms>]`, or
+    /// `shared-event-listener[:<timeout_ms>]`.
     ///
-    /// **The four arms are three designs, not four tunings** (#583). The two
+    /// **The five arms are four designs, not five tunings** (#583). The two
     /// middle arms are **poll loops** over `signaledValue`; `shared-event-wait`
     /// is `waitUntilSignaledValue:timeoutMS:` and **parks in the runtime**, so
     /// it reports `completion_polls=0` structurally. Its period is a **timeout
     /// in milliseconds** — a fail-safe that falls back to blocking, not a
     /// latency knob — where the sleeping arm's is a sleep in microseconds.
+    ///
+    /// **`shared-event-listener` is the fourth design and the only one where
+    /// the completion is DELIVERED rather than waited for** —
+    /// `notifyListener:atValue:block:` runs a block on a GCD worker, which
+    /// wakes this thread through a condvar. It also reports
+    /// `completion_polls=0`, and **that zero is not its engagement proof**: a
+    /// listener that has stopped firing falls back to blocking, is correct,
+    /// moves no digest, and reads the same 0. `completion_fires` is what
+    /// separates them, and a run selecting this arm with `completion_fires=0`
+    /// has **not taken it**.
+    ///
+    /// **A result from this arm carries a blind spot that must be stated where
+    /// it is used**: the block runs on a GCD queue, and §15.1i measures that
+    /// TSan cannot model the happens-before edge through Metal's dispatch — a
+    /// report there survives `-Zbuild-std` and is still false, so a genuine
+    /// ordering defect at that boundary would be indistinguishable.
     ///
     /// **Three axes on one seam, at different heights**, and they compose
     /// rather than substitute:
@@ -1843,6 +2165,17 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
+    /// Which SiLU implementation the 30 `usilu` dispatches resolve to
+    /// (#599, `DESIGN.md` §12.2l): `exact` | `recip` | `literal` | `coarse4` |
+    /// `coarse1` | `hardswish` | `relu`, in ascending error.
+    ///
+    /// **`exact` is the default and resolves the name that always shipped.**
+    /// Every arm but `exact` and `recip` moves `logits_sha256` by
+    /// construction — an approximation to SiLU computes different numbers, and
+    /// that is the axis rather than a defect.
+    #[arg(long, default_value = "exact")]
+    silu_impl: String,
+
     /// Decode steps recorded before the arena is installed.
     ///
     /// Two, not one: comparing two steps is what separates an activation from
@@ -1850,6 +2183,29 @@ struct Args {
     /// sized by `kv_len` (§9.1, #68 finding 4).
     #[arg(long, default_value_t = 2)]
     arena_record_steps: usize,
+
+    /// Serve the arena's session-state declines from an owned region (#47,
+    /// `DESIGN.md` §9.2x).
+    ///
+    /// # What this is, against `--arena` which it requires
+    ///
+    /// The arena is already an owned slab — one `MTLBuffer`, slots at fixed
+    /// offsets — but it serves only the ordinals whose size is **the same every
+    /// token**. Measured on this tree, every decline it makes is
+    /// `declined(session)`: the `Tensor::cat` KV copies under `--kv-append cat`,
+    /// which grow one token wider each step and carry **84.1 % of the residual
+    /// overhang** (§9.2u). This flag gives that population a second owned
+    /// allocation, sized once from the **measured** per-token stride to
+    /// `--kv-capacity` tokens, so no later token allocates for it.
+    ///
+    /// **`off` is the default and is what ships.** An unflagged run is the path
+    /// every recorded figure belongs to.
+    ///
+    /// Requires `--arena`: the reservations are derived from the arena
+    /// recording's two steps, which is the only thing in the tree that measures
+    /// a per-token stride rather than assuming one.
+    #[arg(long, default_value_t = false)]
+    session_region: bool,
 
     /// Tokens of KV reserved per sequence under `--kv-append in-place`.
     ///
@@ -1880,7 +2236,7 @@ struct Args {
     ///
     /// Ignored under `--kv-append cat`, which has no capacity: it reallocates
     /// the whole cache every token (§6.2), which is the thing being measured.
-    #[arg(long, default_value_t = candle_transformers::models::lfm2::DEFAULT_KV_CAPACITY)]
+    #[arg(long, default_value_t = lloom::models::lfm2::DEFAULT_KV_CAPACITY)]
     kv_capacity: usize,
 
     /// Print a progress line to stderr every N decode tokens. 0 disables it.
@@ -2559,13 +2915,32 @@ fn main() -> Result<()> {
     // kernels), construction-tier like `AttnImpl` beside them.
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
+    // #599's SiLU arm. Refused rather than defaulted, for `--conv-state`'s
+    // reason: an unrecognized value silently pinning `exact` would render
+    // `SiluImpl=exact` on a RESULT line for a run the caller asked to be a
+    // variant, and that line would then pool with every real `exact` run
+    // (§2.4, §7.1a-i).
+    #[cfg(feature = "metal")]
+    {
+        let silu = candle::kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
+                 `coarse1`, `hardswish`, `relu`, got `{}`",
+                args.silu_impl
+            )
+        })?;
+        // The SiLU arm rides `Config::silu_impl` now (RESTRUCTURING §1.6):
+        // `Model::new` pushes the field into the kernel cache, so setting the
+        // atomic directly here would be clobbered by that push.
+        config.silu_impl = silu;
+    }
     config.attn_impl = match args.attn.as_str() {
-        "generic" => candle_transformers::models::lfm2::AttnImpl::Generic,
-        "sdpa" => candle_transformers::models::lfm2::AttnImpl::Sdpa,
+        "generic" => lloom::models::lfm2::AttnImpl::Generic,
+        "sdpa" => lloom::models::lfm2::AttnImpl::Sdpa,
         // Issue #116. Selectable and never a default: 10.4's argument for it
         // is structural rather than measured, and the kv_len at which it pays
         // is #61's to find.
-        "flash" => candle_transformers::models::lfm2::AttnImpl::FlashDecoding,
+        "flash" => lloom::models::lfm2::AttnImpl::FlashDecoding,
         other => anyhow::bail!("--attn must be `generic`, `sdpa` or `flash`, got `{other}`"),
     };
     config.flash_page_size = args.flash_page_size;
@@ -2577,8 +2952,8 @@ fn main() -> Result<()> {
         FlashScratchSizing::parse(&args.flash_scratch_sizing).map_err(anyhow::Error::msg)?;
     // Refused rather than defaulted, for the same reason as `--attn`.
     config.kv_append = match args.kv_append.as_str() {
-        "cat" => candle_transformers::models::lfm2::KvAppend::Cat,
-        "in-place" => candle_transformers::models::lfm2::KvAppend::InPlace,
+        "cat" => lloom::models::lfm2::KvAppend::Cat,
+        "in-place" => lloom::models::lfm2::KvAppend::InPlace,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
 
@@ -2633,11 +3008,11 @@ fn main() -> Result<()> {
             .map(|t| {
                 matches!(
                     t,
-                    candle_transformers::models::lfm2::LayerType::FullAttention
+                    lloom::models::lfm2::LayerType::FullAttention
                 )
             })
             .collect();
-        let mut budget = candle_transformers::models::lfm2::MemoryBudget::new(
+        let mut budget = lloom::models::lfm2::MemoryBudget::new(
             language_weight_bytes(&config, &la, dtype.size_in_bytes()),
         );
         budget.batch = args.batch;
@@ -2677,7 +3052,7 @@ fn main() -> Result<()> {
     // of the run is the other half, and it is checked before the file is
     // written.
     if args.run_telemetry_jsonl.is_some() {
-        if !candle_metal_kernels::metal::run_telemetry::compiled() {
+        if !candle::kernels::metal::run_telemetry::compiled() {
             anyhow::bail!(
                 "--run-telemetry-jsonl needs the `metal-run-telemetry` feature, and this \
                  binary was built without it.\n  \
@@ -2688,7 +3063,7 @@ fn main() -> Result<()> {
                  so no harness could enable it at all.)"
             );
         }
-        candle_metal_kernels::metal::run_telemetry::set_enabled(true);
+        candle::kernels::metal::run_telemetry::set_enabled(true);
     }
 
     let sampling = if args.temperature <= 0. {
@@ -3784,6 +4159,15 @@ fn main() -> Result<()> {
                 if tokens.len() - 1 == axes.record_steps - 1 {
                     let excluded = dev.arena_recording_excluded();
                     let by_test = dev.arena_recording_excluded_by_test();
+                    // Read BEFORE `finish_arena_recording`, which `take`s the
+                    // recorder — the reservations are derived from the same two
+                    // steps the plan is, and after the take there is nothing
+                    // left to derive them from.
+                    let reservations = if axes.session_region {
+                        dev.arena_recording_session_reservations(kv_len, args.kv_capacity)
+                    } else {
+                        None
+                    };
                     let plan = dev
                         .finish_arena_recording(axes.layout)
                         .context("arena recording produced no allocations")?;
@@ -3814,6 +4198,33 @@ fn main() -> Result<()> {
                     );
                     dev.install_arena(plan, axes.layout)
                         .context("installing the arena")?;
+                    // #47's session region, after the arena because it serves
+                    // what the arena declines: the offer order in `new_buffer`
+                    // is arena first, region second, pool last.
+                    if let Some(res) = reservations {
+                        if res.is_empty() {
+                            // A result, not a nuisance: it means no ordinal grew
+                            // between the two recorded steps, which is what
+                            // `--kv-append in-place` produces. Said out loud
+                            // because an installed-but-empty region and an
+                            // uninstalled one are different states and only the
+                            // counters below distinguish them (#500).
+                            eprintln!(
+                                "session region: no growing ordinals were recorded, so nothing \
+                                 is reserved -- under `--kv-append in-place` the KV cache does \
+                                 not reallocate and this axis has no population to serve"
+                            );
+                        }
+                        let bytes = dev
+                            .install_session_region(&res)
+                            .context("installing the session region")?;
+                        eprintln!(
+                            "session region: {} tenants reserved to kv_capacity {}, {} B",
+                            res.len(),
+                            args.kv_capacity,
+                            bytes
+                        );
+                    }
                     if axes.gpu_offsets {
                         // Checked against the plan that was recorded, not
                         // against the layout's name: a plan that somehow is not
@@ -3940,7 +4351,7 @@ fn main() -> Result<()> {
     // -- the discrimination §2.4 requires after #69's determinism arm consumed
     // its own `OnceLock` and reported a passing digest for the unchanged path.
     if args.run_telemetry_jsonl.is_some() {
-        use candle_metal_kernels::metal::run_telemetry as rt;
+        use candle::kernels::metal::run_telemetry as rt;
         let accepted = rt::accepted();
         anyhow::ensure!(
             rt::engaged(),
@@ -4277,6 +4688,42 @@ fn main() -> Result<()> {
         println!("                                     the PREFILL's argmax (see the bracket)");
         println!("warm process: model already loaded. A cold-start TTFT adds §2.4a's load.");
         println!();
+    }
+
+    // #47's session region, reported whenever one is installed.
+    //
+    // **This is the engagement proof, and without it a null is unreadable**
+    // (#500): an installed region that served nothing and an uninstalled one
+    // produce identical pool counters, and only `offers`/`hits` separate them.
+    // The two declines are printed separately because they want opposite
+    // responses -- `unplanned` says widen the plan, `capacity` says the
+    // reservation was too small -- and a single number could mean either.
+    #[cfg(feature = "metal")]
+    if let Some(dev) = metal_device.as_ref() {
+        if let Some(c) = dev.session_region_counters() {
+            println!();
+            println!("=== session region (#47, DESIGN.md §9.2x) ===");
+            println!(
+                "  tenants             {}  reserving {} B",
+                dev.session_region_tenants().unwrap_or(0),
+                dev.session_region_bytes().unwrap_or(0)
+            );
+            println!(
+                "  offers / hits       {} / {}  ({:.1} % served)",
+                c.offers,
+                c.hits,
+                if c.offers > 0 {
+                    100.0 * c.hits as f64 / c.offers as f64
+                } else {
+                    0.0
+                }
+            );
+            println!(
+                "  declined            {} unplanned, {} past the reservation",
+                c.declined_unplanned, c.declined_capacity
+            );
+            println!();
+        }
     }
 
     println!(
@@ -4774,7 +5221,7 @@ fn main() -> Result<()> {
     // §3.1c warns about: a zero that is indistinguishable from a path that
     // never ran. `poll_reads` is the counter for the arm that actually carried
     // the run, and the pair is what makes either readable.
-    let poll_reads = candle_transformers::generation::token_ring::poll_read_count();
+    let poll_reads = lloom::generation::token_ring::poll_read_count();
     // Read back from the device rather than from the flag (§7.1a-i), and at a
     // different height from `peek_hit` rather than a duplicate of it:
     // `peek_hit` counts reads that skipped a wait, this counts waits that were
@@ -4786,6 +5233,19 @@ fn main() -> Result<()> {
     };
     #[cfg(not(feature = "metal"))]
     let (cw_signals, cw_polls) = (0u64, 0u64);
+    // The listener arm's own counter (#583), and it is a THIRD one because the
+    // two above cannot see this arm's failure. `shared-event-listener` reports
+    // `(signals > 0, polls == 0)` whether its notification block delivered or
+    // never fired and the wait fell back to blocking -- and the fallback is
+    // correct, so the values agree and both digests are unmoved either way.
+    // `completion_fires` is the only quantity that separates them.
+    #[cfg(feature = "metal")]
+    let (cw_fires, cw_already) = match &device {
+        Device::Metal(m) => (m.completion_fires(), m.completion_already_complete()),
+        _ => (0u64, 0u64),
+    };
+    #[cfg(not(feature = "metal"))]
+    let (cw_fires, cw_already) = (0u64, 0u64);
 
     // **The engagement assertions, not merely the prints.** §11.5i's finding is
     // that an unmoved digest on an arm that never engaged carries no
@@ -4818,6 +5278,37 @@ fn main() -> Result<()> {
         "completion arm {:?} encoded no signal, so this run's figures are the incumbent's \
          -- the mechanism did not engage (DESIGN.md §11.5o, §11.5i, §2.4)",
         axes.completion_wait
+    );
+    // **The listener arm needs its own assertion, and the one above cannot be
+    // it** (#583). A listener that never fires falls back to the blocking wait,
+    // which computes the right answer -- so `cw_signals` is nonzero, both
+    // digests are unmoved, every value assertion passes, and the run reports an
+    // arm it did not take. That is §7.1a-i's wrong-arm shape in the one place
+    // no pre-existing counter could see it, and Apple's own guidance is that a
+    // deallocated listener stops delivering silently.
+    // **`completion_signals` counts COMMITS and `completion_fires` counts
+    // WAITS, and the two are ~13.5:1 by construction** (#583). A signal is
+    // encoded in every `commit_swap_locked` — five call sites, and
+    // `CutPolicy::Counter(50)` cuts a buffer every 50 of 675 dispatches per
+    // token — while only `flush_and_wait_current` waits, once per token. So
+    // `fires ≈ n` is the listener firing on every wait there is, and comparing
+    // it against `signals` measures the cut policy rather than the mechanism.
+    //
+    // Measured, `completion_already_complete` is **0**, which excludes the
+    // other candidate explanation (that the readbacks arrive after the GPU has
+    // retired the buffer) rather than leaving it to be assumed.
+    #[cfg(feature = "metal")]
+    let cw_engaged_waits = cw_signals.saturating_sub(cw_already);
+    #[cfg(feature = "metal")]
+    anyhow::ensure!(
+        axes.completion_wait != Some("shared-event-listener")
+            || cw_engaged_waits == 0
+            || cw_fires > 0,
+        "completion arm shared-event-listener fired no notification block over {} tokens \
+         while {cw_engaged_waits} waits actually waited: the wait fell back to blocking \
+         and computed the right answer, so this run's figures belong to the incumbent \
+         (DESIGN.md §11.5u, §2.4)",
+        tokens.len()
     );
     // **The zero-GPU-work residue, and it is the DRAIN'S INNOCENCE** (lloom
     // #567, `DESIGN.md` §11.5r).
@@ -4914,6 +5405,7 @@ fn main() -> Result<()> {
          poll={} poll_iters={} poll_fallbacks={} max_in_flight={} \
          nonblocking_eos={} peek_hit={} peek_unmapped={} poll_reads={} \
          completion_wait={} completion_signals={} completion_polls={} \
+         completion_fires={} completion_already_complete={} \
          profiling={} config=[{}] candle_commit={} seed={} temp={} top_p={}",
         args.label,
         args.n,
@@ -5146,6 +5638,8 @@ fn main() -> Result<()> {
         axes.completion_wait_arm(),
         cw_signals,
         cw_polls,
+        cw_fires,
+        cw_already,
         profiling,
         axes.config_line(),
         // Passed in by the caller rather than read from git here.

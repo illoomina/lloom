@@ -1,0 +1,10 @@
+# wasm-bindgen generated bindings — regenerated from the .wasm by `make`.
+www/pkg/
+# build output
+target/
+Cargo.lock
+# model checkpoints are fetched at runtime, never committed (the GGUF is 219 MB;
+# the page fetches it from the Hub, or serve a local copy symlinked into www/).
+*.gguf
+www/*.gguf
+target-623/

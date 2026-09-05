@@ -13,8 +13,8 @@ use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, Device, Tensor};
-use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::llama::LlamaEosToks;
+use lloom::generation::LogitsProcessor;
+use lloom::models::llama::LlamaEosToks;
 use cudarc::driver::safe::CudaDevice;
 use cudarc::nccl::safe::{Comm, Id};
 use hf_hub::{api::sync::Api, Repo, RepoType};
@@ -181,7 +181,7 @@ fn main() -> Result<()> {
 
     println!("building the model");
     let vb = unsafe {
-        candle_nn::var_builder::ShardedSafeTensors::var_builder(&filenames, dtype, &device)?
+        lloom::nn::var_builder::ShardedSafeTensors::var_builder(&filenames, dtype, &device)?
     };
     let llama = Llama::load(vb, &cache, &config, comm)?;
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(E::msg)?;

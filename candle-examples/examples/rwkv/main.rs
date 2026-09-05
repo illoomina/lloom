@@ -7,17 +7,17 @@ extern crate accelerate_src;
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
 
-use candle_transformers::models::quantized_rwkv_v5::Model as Q5;
-use candle_transformers::models::quantized_rwkv_v6::Model as Q6;
-use candle_transformers::models::rwkv_v5::{Config, Model as M5, State, Tokenizer};
-use candle_transformers::models::rwkv_v6::Model as M6;
-use candle_transformers::models::rwkv_v7::{
+use lloom::models::quantized_rwkv_v5::Model as Q5;
+use lloom::models::quantized_rwkv_v6::Model as Q6;
+use lloom::models::rwkv_v5::{Config, Model as M5, State, Tokenizer};
+use lloom::models::rwkv_v6::Model as M6;
+use lloom::models::rwkv_v7::{
     Config as ConfigV7, Model as M7, ModelVersion, State as StateV7,
 };
 
 use candle::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
+use lloom::nn::VarBuilder;
+use lloom::generation::LogitsProcessor;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 
 const EOS_TOKEN_ID: u32 = 261;
@@ -100,7 +100,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],
@@ -755,7 +755,7 @@ fn main() -> Result<()> {
         let config: Config = serde_json::from_slice(&std::fs::read(config_filename.unwrap())?)?;
         let model = if args.quantized {
             let filename = &filenames[0];
-            let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
+            let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
                 filename, &device,
             )?;
             match args.which {

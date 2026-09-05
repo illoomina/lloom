@@ -1,7 +1,7 @@
 use candle::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::LogitsProcessor;
-use candle_transformers::models::codegeex4_9b::*;
+use lloom::nn::VarBuilder;
+use lloom::generation::LogitsProcessor;
+use lloom::models::codegeex4_9b::*;
 use clap::Parser;
 use hf_hub::{Repo, RepoType};
 use tokenizers::Tokenizer;
@@ -83,7 +83,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],

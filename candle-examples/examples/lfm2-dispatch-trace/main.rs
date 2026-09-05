@@ -37,9 +37,9 @@ extern crate accelerate_src;
 
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{
     AttnImpl, Cache, ConvState, KvAppend, Model,
 };
 use candle_examples::lfm2_setup::{
@@ -436,7 +436,7 @@ fn main() -> Result<()> {
     // same reason as the arm above. Read back from the crate rather than echoed
     // from `args`, so the printed line is what the kernels will use.
     {
-        use candle_metal_kernels::{default_param_style, set_default_param_style, ParamStyle};
+        use candle::kernels::{default_param_style, set_default_param_style, ParamStyle};
         let want = match args.param_style.as_str() {
             "split" => ParamStyle::Split,
             "packed" => ParamStyle::Packed,
@@ -469,9 +469,9 @@ fn main() -> Result<()> {
              (DESIGN.md §3.7c), so under `split` every position is excluded and the run would \
              report a working executor that replayed nothing"
         );
-        candle_metal_kernels::set_pipelines_support_icb(true)
+        candle::kernels::set_pipelines_support_icb(true)
             .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
-        candle_metal_kernels::set_constants_pool_enabled(true);
+        candle::kernels::set_constants_pool_enabled(true);
         println!("icb: enabled (pipelines support ICBs, constants pooled)");
     }
 
@@ -653,7 +653,7 @@ fn main() -> Result<()> {
     // recording.
     let icb_executor = args
         .icb
-        .then(|| candle_metal_kernels::IcbExecutor::new(ICB_RECORD_STEPS));
+        .then(|| candle::kernels::IcbExecutor::new(ICB_RECORD_STEPS));
     let icb_installed_at = if args.arena { record_steps } else { 0 };
 
     let mut tokens: Vec<u32> = Vec::new();
@@ -692,7 +692,7 @@ fn main() -> Result<()> {
         if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
             if step == icb_installed_at {
                 dev.set_executor(std::sync::Arc::new(
-                    candle_metal_kernels::metal::ExecutorSlot::Custom(exec.clone()),
+                    candle::kernels::metal::ExecutorSlot::Custom(exec.clone()),
                 ));
             }
         }
@@ -904,7 +904,7 @@ fn main() -> Result<()> {
         // `only` is the partition -- barriers attributable to exactly one
         // direction -- and it is the column that answers "these N are WAR, and
         // WAR is the one a different layout would remove."
-        use candle_metal_kernels::metal::encoder::HazardKind;
+        use candle::kernels::metal::encoder::HazardKind;
         let mut any = [0usize; 3];
         let mut only = [0usize; 3];
         let mut multi = 0usize;

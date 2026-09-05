@@ -1,6 +1,6 @@
 use anyhow::{Error as E, Ok, Result};
 use candle::{DType, IndexOp, Module, Tensor, D};
-use candle_transformers::models::{stable_diffusion, t5};
+use lloom::models::{stable_diffusion, t5};
 use std::path::PathBuf;
 use tokenizers::tokenizer::Tokenizer;
 
@@ -13,7 +13,7 @@ struct ClipWithTokenizer {
 
 impl ClipWithTokenizer {
     fn new(
-        vb: candle_nn::VarBuilder,
+        vb: lloom::nn::VarBuilder,
         config: stable_diffusion::clip::Config,
         tokenizer_path: &str,
         max_position_embeddings: usize,
@@ -81,7 +81,7 @@ struct T5WithTokenizer {
 }
 
 impl T5WithTokenizer {
-    fn new(vb: candle_nn::VarBuilder, max_position_embeddings: usize) -> Result<Self> {
+    fn new(vb: lloom::nn::VarBuilder, max_position_embeddings: usize) -> Result<Self> {
         let api = hf_hub::api::sync::Api::new()?;
         let repo = api.repo(hf_hub::Repo::with_revision(
             "google/t5-v1_1-xxl".to_string(),
@@ -126,7 +126,7 @@ impl T5WithTokenizer {
 pub struct StableDiffusion3TripleClipWithTokenizer {
     clip_l: ClipWithTokenizer,
     clip_g: ClipWithTokenizer,
-    clip_g_text_projection: candle_nn::Linear,
+    clip_g_text_projection: lloom::nn::Linear,
     t5: T5WithTokenizer,
 }
 
@@ -138,13 +138,13 @@ impl StableDiffusion3TripleClipWithTokenizer {
         device: &candle::Device,
     ) -> Result<Self> {
         let vb_clip_g = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&[clip_g_file], DType::F16, device)?
+            lloom::nn::VarBuilder::from_mmaped_safetensors(&[clip_g_file], DType::F16, device)?
         };
         let vb_clip_l = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&[clip_l_file], DType::F16, device)?
+            lloom::nn::VarBuilder::from_mmaped_safetensors(&[clip_l_file], DType::F16, device)?
         };
         let vb_t5 = unsafe {
-            candle_nn::VarBuilder::from_mmaped_safetensors(&[t5xxl_file], DType::F16, device)?
+            lloom::nn::VarBuilder::from_mmaped_safetensors(&[t5xxl_file], DType::F16, device)?
         };
         let max_position_embeddings = 77usize;
         let clip_l = ClipWithTokenizer::new(
@@ -155,7 +155,7 @@ impl StableDiffusion3TripleClipWithTokenizer {
         )?;
 
         let text_projection =
-            candle_nn::linear_no_bias(1280, 1280, vb_clip_g.pp("text_projection"))?;
+            lloom::nn::linear_no_bias(1280, 1280, vb_clip_g.pp("text_projection"))?;
 
         let clip_g = ClipWithTokenizer::new(
             vb_clip_g,
@@ -173,7 +173,7 @@ impl StableDiffusion3TripleClipWithTokenizer {
         })
     }
 
-    pub fn new(vb: candle_nn::VarBuilder) -> Result<Self> {
+    pub fn new(vb: lloom::nn::VarBuilder) -> Result<Self> {
         let max_position_embeddings = 77usize;
         let clip_l = ClipWithTokenizer::new(
             vb.pp("clip_l.transformer"),
@@ -190,7 +190,7 @@ impl StableDiffusion3TripleClipWithTokenizer {
         )?;
 
         let text_projection =
-            candle_nn::linear_no_bias(1280, 1280, vb.pp("clip_g.transformer.text_projection"))?;
+            lloom::nn::linear_no_bias(1280, 1280, vb.pp("clip_g.transformer.text_projection"))?;
 
         let t5 = T5WithTokenizer::new(vb.pp("t5xxl.transformer"), max_position_embeddings)?;
         Ok(Self {

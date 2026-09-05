@@ -1,7 +1,7 @@
 use anyhow::{Ok, Result};
-use candle_transformers::models::stable_diffusion::vae;
+use lloom::models::stable_diffusion::vae;
 
-pub fn build_sd3_vae_autoencoder(vb: candle_nn::VarBuilder) -> Result<vae::AutoEncoderKL> {
+pub fn build_sd3_vae_autoencoder(vb: lloom::nn::VarBuilder) -> Result<vae::AutoEncoderKL> {
     let config = vae::AutoEncoderKLConfig {
         block_out_channels: vec![128, 256, 512, 512],
         layers_per_block: 2,

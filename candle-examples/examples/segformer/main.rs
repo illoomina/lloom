@@ -1,7 +1,7 @@
 use candle::Device;
 use candle::Module;
-use candle_nn::VarBuilder;
-use candle_transformers::models::segformer::{
+use lloom::nn::VarBuilder;
+use lloom::models::segformer::{
     Config, ImageClassificationModel, SemanticSegmentationModel,
 };
 use clap::{Args, Parser, Subcommand};
@@ -134,7 +134,7 @@ fn classification_task(args: ClassificationArgs, device: &Device) -> anyhow::Res
     let num_labels = 7;
     let model = ImageClassificationModel::new(&config, num_labels, vb)?;
     let classification = model.forward(&image)?;
-    let classification = candle_nn::ops::softmax_last_dim(&classification)?;
+    let classification = lloom::nn::ops::softmax_last_dim(&classification)?;
     let classification = classification.squeeze(0)?;
     println!(
         "classification logits {:?}",

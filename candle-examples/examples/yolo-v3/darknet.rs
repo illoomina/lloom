@@ -1,5 +1,5 @@
 use candle::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{batch_norm, conv2d, conv2d_no_bias, Func, Module, VarBuilder};
+use lloom::nn::{batch_norm, conv2d, conv2d_no_bias, Func, Module, VarBuilder};
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -108,7 +108,7 @@ pub fn parse_config<T: AsRef<Path>>(path: T) -> Result<Darknet> {
 }
 
 enum Bl {
-    Layer(Box<dyn candle_nn::Module + Send + Sync>),
+    Layer(Box<dyn lloom::nn::Module + Send + Sync>),
     Route(Vec<usize>),
     Shortcut(usize),
     Yolo(usize, Vec<(usize, usize)>),
@@ -128,7 +128,7 @@ fn conv(vb: VarBuilder, index: usize, p: usize, b: &Block) -> Result<(usize, Bl)
         }
         Some(_) | None => (None, true),
     };
-    let conv_cfg = candle_nn::Conv2dConfig {
+    let conv_cfg = lloom::nn::Conv2dConfig {
         stride,
         padding,
         groups: 1,
@@ -145,7 +145,7 @@ fn conv(vb: VarBuilder, index: usize, p: usize, b: &Block) -> Result<(usize, Bl)
         "linear" => false,
         otherwise => candle::bail!("unsupported activation {}", otherwise),
     };
-    let func = candle_nn::func(move |xs| {
+    let func = lloom::nn::func(move |xs| {
         let xs = conv.forward(xs)?;
         let xs = match &bn {
             Some(bn) => xs.apply_t(bn, false)?,
@@ -162,7 +162,7 @@ fn conv(vb: VarBuilder, index: usize, p: usize, b: &Block) -> Result<(usize, Bl)
 }
 
 fn upsample(prev_channels: usize) -> Result<(usize, Bl)> {
-    let layer = candle_nn::func(|xs| {
+    let layer = lloom::nn::func(|xs| {
         let (_n, _c, h, w) = xs.dims4()?;
         xs.upsample_nearest2d(2 * h, 2 * w)
     });
@@ -250,9 +250,9 @@ fn detect(
     let ys02 = xs.i((.., .., 0..2))?;
     let ys24 = xs.i((.., .., 2..4))?;
     let ys4 = xs.i((.., .., 4..))?;
-    let ys02 = (candle_nn::ops::sigmoid(&ys02)?.add(&xy_offset)? * stride as f64)?;
+    let ys02 = (lloom::nn::ops::sigmoid(&ys02)?.add(&xy_offset)? * stride as f64)?;
     let ys24 = (ys24.exp()?.mul(&anchors)? * stride as f64)?;
-    let ys4 = candle_nn::ops::sigmoid(&ys4)?;
+    let ys4 = lloom::nn::ops::sigmoid(&ys4)?;
     let ys = Tensor::cat(&[ys02, ys24, ys4], 2)?;
     Ok(ys)
 }
@@ -284,7 +284,7 @@ impl Darknet {
             blocks.push(channels_and_bl);
         }
         let image_height = self.height()?;
-        let func = candle_nn::func(move |xs| {
+        let func = lloom::nn::func(move |xs| {
             let mut prev_ys: Vec<Tensor> = vec![];
             let mut detections: Vec<Tensor> = vec![];
             for (_, b) in blocks.iter() {

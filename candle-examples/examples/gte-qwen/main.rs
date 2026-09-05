@@ -7,10 +7,10 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use candle_transformers::models::qwen2::{Config, Model};
+use lloom::models::qwen2::{Config, Model};
 
 use candle::{DType, Tensor};
-use candle_nn::VarBuilder;
+use lloom::nn::VarBuilder;
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::{
     utils::padding::{PaddingDirection, PaddingParams, PaddingStrategy},

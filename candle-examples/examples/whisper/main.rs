@@ -11,7 +11,7 @@ extern crate intel_mkl_src;
 
 use anyhow::{Error as E, Result};
 use candle::{Device, IndexOp, Tensor};
-use candle_nn::{
+use lloom::nn::{
     ops::{log_softmax, softmax},
     VarBuilder,
 };
@@ -24,7 +24,7 @@ use tokenizers::Tokenizer;
 
 mod multilingual;
 
-use candle_transformers::models::whisper::{self as m, audio, Config};
+use lloom::models::whisper::{self as m, audio, Config};
 
 pub enum Model {
     Normal(m::model::Whisper),
@@ -733,7 +733,7 @@ fn main() -> Result<()> {
     println!("loaded mel: {:?}", mel.dims());
 
     let mut model = if args.quantized {
-        let vb = candle_transformers::quantized_var_builder::VarBuilder::from_gguf(
+        let vb = lloom::quantized_var_builder::VarBuilder::from_gguf(
             &weights_filename,
             &device,
         )?;

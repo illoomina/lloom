@@ -16,12 +16,12 @@ use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::io::Write;
 
-use candle_transformers::models::llama as model;
+use lloom::models::llama as model;
 use model::{Llama, LlamaConfig};
 
 const EOS_TOKEN: &str = "</s>";
@@ -258,7 +258,7 @@ fn main() -> Result<()> {
             logits
         } else {
             let start_at = tokens.len().saturating_sub(args.repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
+            lloom::utils::apply_repeat_penalty(
                 &logits,
                 args.repeat_penalty,
                 &tokens[start_at..],

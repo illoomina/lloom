@@ -1,0 +1,27 @@
+//! The serving engine (RESTRUCTURING §4, §7.1) — the vLLM-analog, `lloom-engine`
+//! (= §14.6's retired `llumos`). It links `lloom`'s tier-1 API and turns a model
+//! into a decode service: the decode loop, sampling, the token-streaming
+//! primitive, and the per-request seam.
+//!
+//! What lives here and what does not (RESTRUCTURING §4):
+//! - **here**: the decode loop ([`decode`]), driven over `lloom`'s `CausalLM`
+//!   seam so it is model-blind; the streaming primitive; the request seam
+//!   ([`seam`]).
+//! - **not here**: the OpenAI `/v1` facade and tool execution stay in amber
+//!   until §14.6's trigger (a second `/v1` consumer, #328). amber becomes a
+//!   consumer of this crate, rendering prompts and parsing tools around the
+//!   request seam.
+//!
+//! The optional `Speculator` (Wave C, `lloom::nn::Speculator`) plugs into the
+//! same decode session as the target's drafter; the speculative driver is
+//! `lloom::nn::Session::speculative_step`. The non-speculative loop here is
+//! `verify_step`'s sibling — the plain per-token path — and its first production
+//! caller (`RESTRUCTURING_DESIGN.md` §1.9, §10.1 wave F).
+
+pub mod decode;
+pub mod seam;
+pub mod slots;
+
+pub use decode::{DecodeParams, DecodeSession, Decoded, Stop};
+pub use seam::Completer;
+pub use slots::{Routed, SlotPool, DEFAULT_SIMILARITY};

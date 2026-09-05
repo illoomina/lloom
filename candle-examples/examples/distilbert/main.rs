@@ -3,13 +3,13 @@ extern crate intel_mkl_src;
 
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
-use candle_transformers::models::distilbert::{
+use lloom::models::distilbert::{
     Config, DistilBertForMaskedLM, DistilBertModel, DTYPE,
 };
 
 use anyhow::{Context, Error as E, Result};
 use candle::{Device, Tensor};
-use candle_nn::VarBuilder;
+use lloom::nn::VarBuilder;
 use clap::{Parser, ValueEnum};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::path::PathBuf;
@@ -246,7 +246,7 @@ fn process_masked_output(
             println!("Predictions for [MASK] at position {token_idx}:");
 
             let pos_logits = output.get(0)?.get(token_idx)?;
-            let probs = candle_nn::ops::softmax(&pos_logits, 0)?;
+            let probs = lloom::nn::ops::softmax(&pos_logits, 0)?;
             let (top_values, top_indices) = get_top_k(&probs, args.top_k)?;
 
             let values = top_values.to_vec1::<f32>()?;

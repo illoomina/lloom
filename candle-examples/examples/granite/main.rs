@@ -10,12 +10,12 @@ use anyhow::{bail, Error as E, Result};
 use clap::{Parser, ValueEnum};
 
 use candle::{DType, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use std::io::Write;
 
-use candle_transformers::models::granite as model;
+use lloom::models::granite as model;
 use model::{Granite, GraniteConfig};
 
 use std::time::Instant;
@@ -206,7 +206,7 @@ fn main() -> Result<()> {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(args.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     args.repeat_penalty,
                     &tokens[start_at..],

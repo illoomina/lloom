@@ -1,6 +1,6 @@
 use super::gym_env::{GymEnv, Step};
 use candle::{DType, Device, Error, Module, Result, Tensor};
-use candle_nn::{
+use lloom::nn::{
     linear, ops::log_softmax, ops::softmax, sequential::seq, Activation, AdamW, Optimizer,
     ParamsAdamW, VarBuilder, VarMap,
 };

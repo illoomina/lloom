@@ -1,0 +1,57 @@
+# This crate is excluded from the root workspace (wasm-only deps must not enter
+# the metal-only default resolve). An empty [workspace] makes it its own
+# workspace root so cargo does not try to attach it to the parent.
+[workspace]
+
+[package]
+name = "lloom-wasm"
+version = "0.11.0"
+edition = "2021"
+description = "Browser-runner feasibility spike (#656): lloom CPU backend to wasm32, one token in a Web Worker."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Excluded from the default workspace (see the root Cargo.toml `exclude` list):
+# this crate only builds for wasm32-unknown-unknown, and its wasm-specific deps
+# (getrandom js backends, wasm-bindgen) must not enter the metal-only default
+# resolve. Build it explicitly with `--target wasm32-unknown-unknown`.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The engine, CPU backend only (no `metal` feature -> no metal_backend in the
+# wasm build; that is the #656 premise being verified). lloom-tensor is the
+# tensor layer (candle-core+metal-kernels merged); the harness touches both.
+lloom = { path = "../lloom", default-features = false }
+lloom-tensor = { path = "../lloom-tensor", default-features = false }
+
+wasm-bindgen = "=0.2.100"
+js-sys = "0.3"
+console_error_panic_hook = "0.1.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The GGUF's embedded tokenizer is read via `lloom_tensor`'s `TokenizerFromGguf`,
+# which names `tokenizers` types. On wasm the `onig` C library will not compile,
+# so the feature set is target-split the same way `lloom-tensor` splits it.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["console"]
+
+# getrandom is pulled transitively (rand 0.9 -> getrandom 0.3; ahash/tokenizers
+# -> getrandom 0.3; some deps -> getrandom 0.2). On wasm32 each needs its JS
+# backend feature turned on, and feature unification means enabling it here
+# enables it for the whole graph. The 0.3 line ALSO needs the build-time cfg
+# `--cfg getrandom_backend="wasm_js"` (set in .cargo/config.toml).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
+# The GGUF's embedded tokenizer is read via `lloom_tensor`'s `TokenizerFromGguf`.
+# On wasm the `onig` C library will not compile, so `unstable_wasm` (pure-Rust
+# regex split) gives the same BPE. Native takes `onig` (above).
+tokenizers = { version = "0.22", default-features = false, features = ["unstable_wasm"] }

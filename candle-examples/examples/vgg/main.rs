@@ -5,8 +5,8 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use candle::{DType, IndexOp, D};
-use candle_nn::{ModuleT, VarBuilder};
-use candle_transformers::models::vgg::{Models, Vgg};
+use lloom::nn::{ModuleT, VarBuilder};
+use lloom::models::vgg::{Models, Vgg};
 use clap::{Parser, ValueEnum};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -55,7 +55,7 @@ pub fn main() -> anyhow::Result<()> {
     };
     let logits = model.forward_t(&image, /*train=*/ false)?;
 
-    let prs = candle_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = lloom::nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
 

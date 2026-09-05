@@ -7,7 +7,7 @@ extern crate accelerate_src;
 use anyhow::{Error as E, Result};
 use clap::Parser;
 
-use candle_transformers::models::gemma4::{
+use lloom::models::gemma4::{
     config::{Gemma4Config, Gemma4TextConfig},
     text::TextModel,
     Model,
@@ -15,8 +15,8 @@ use candle_transformers::models::gemma4::{
 
 use candle::{DType, Device, Tensor};
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
@@ -110,7 +110,7 @@ impl TextGeneration {
                 logits
             } else {
                 let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                candle_transformers::utils::apply_repeat_penalty(
+                lloom::utils::apply_repeat_penalty(
                     &logits,
                     self.repeat_penalty,
                     &tokens[start_at..],

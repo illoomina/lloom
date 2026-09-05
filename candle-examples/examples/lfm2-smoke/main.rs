@@ -109,10 +109,10 @@ extern crate accelerate_src;
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use candle_nn::ops::KvQuant;
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
+use lloom::nn::ops::KvQuant;
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
 use clap::Parser;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -279,6 +279,22 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
+    /// Which SiLU implementation the 30 `usilu` dispatches resolve to
+    /// (issue #599, `DESIGN.md` §12.2l).
+    ///
+    /// `exact` | `recip` | `literal` | `coarse4` | `coarse1` | `hardswish`,
+    /// in ascending error order. **`exact` is the default and is what ships**
+    /// — it resolves the same `silu_f16` name it always did, so an
+    /// unconfigured run is byte-identical (§7.1a).
+    ///
+    /// This is the text half of #599's absorption question. A coarser arm
+    /// moves the digests by construction, so `lfm2-determinism` cannot say
+    /// whether the model still WORKS under it — only this harness can
+    /// (§2.3.8d: three identical digests of a model emitting
+    /// `picture picture picture`).
+    #[arg(long, default_value = "exact")]
+    silu_impl: String,
+
     /// Print each turn's prompt and completion. On by default; `--quiet`
     /// leaves only the verdict lines, for a scripted gate.
     #[arg(long)]
@@ -353,7 +369,7 @@ fn main() -> Result<()> {
     // reason as `--attn`: a silently-ignored flag makes a gate report on an arm
     // it did not run (§2.4).
     config.flash_scratch_sizing =
-        candle_nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
+        lloom::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
             .map_err(anyhow::Error::msg)?;
     // Refused rather than defaulted, for the same reason as `--attn` above.
     config.kv_append = match args.kv_append.as_str() {
@@ -369,6 +385,25 @@ fn main() -> Result<()> {
 
     config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
     println!("conv state: {:?}", config.conv_state);
+
+    // #599's SiLU arm. Refused rather than defaulted, for `--attn`'s reason: a
+    // silently-ignored flag makes this harness report the exact arm's text
+    // under a coarse arm's name, which is precisely the absorption question
+    // answered wrong. Printed whether or not it is `exact`, because *inert* and
+    // *unrecorded* are different facts (#241) and a PASS is only interpretable
+    // against the arm it was taken in.
+    let silu = candle::kernels::SiluImpl::parse(&args.silu_impl).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--silu-impl must be one of `exact`, `recip`, `literal`, `coarse4`, \
+             `coarse1`, `hardswish`, got `{}`",
+            args.silu_impl
+        )
+    })?;
+    // The SiLU arm rides `Config::silu_impl` now (RESTRUCTURING §1.6):
+    // `Model::new` pushes the field into the kernel cache, so setting the atomic
+    // directly here would be clobbered by that push. Set the field instead.
+    config.silu_impl = silu;
+    println!("silu impl: {}", silu.name());
 
     // #509's wiring. Printed whether or not set: *inert* and *unrecorded* are
     // different facts (#241), and this harness's verdict is only interpretable

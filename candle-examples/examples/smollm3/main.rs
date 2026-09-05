@@ -12,14 +12,14 @@ use candle::{DType, Device, Tensor};
 use candle_examples::chat_template::{ChatTemplate, ChatTemplateOptions, Message};
 use candle_examples::token_output_stream::TokenOutputStream;
 
-use candle_nn::VarBuilder;
-use candle_transformers::generation::{LogitsProcessor, Sampling};
+use lloom::nn::VarBuilder;
+use lloom::generation::{LogitsProcessor, Sampling};
 use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 // Import both model implementations
-use candle_transformers::models::smol::quantized_smollm3::QuantizedModelForCausalLM;
-use candle_transformers::models::smol::smollm3::{Config, ModelForCausalLM};
+use lloom::models::smol::quantized_smollm3::QuantizedModelForCausalLM;
+use lloom::models::smol::smollm3::{Config, ModelForCausalLM};
 
 const DEFAULT_PROMPT: &str = "Write a Rust function to calculate the factorial of a given number.";
 
@@ -481,7 +481,7 @@ fn run_generation(
             logits
         } else {
             let start_at = all_tokens.len().saturating_sub(args.repeat_last_n);
-            candle_transformers::utils::apply_repeat_penalty(
+            lloom::utils::apply_repeat_penalty(
                 &logits,
                 args.repeat_penalty,
                 &all_tokens[start_at..],

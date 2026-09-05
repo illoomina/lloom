@@ -7,8 +7,8 @@ extern crate accelerate_src;
 use clap::Parser;
 
 use candle::{DType, IndexOp, D};
-use candle_nn::VarBuilder;
-use candle_transformers::models::vit;
+use lloom::nn::VarBuilder;
+use lloom::models::vit;
 
 #[derive(Parser)]
 struct Args {
@@ -43,7 +43,7 @@ pub fn main() -> anyhow::Result<()> {
     let model = vit::Model::new(&vit::Config::vit_base_patch16_224(), 1000, vb)?;
     println!("model built");
     let logits = model.forward(&image.unsqueeze(0)?)?;
-    let prs = candle_nn::ops::softmax(&logits, D::Minus1)?
+    let prs = lloom::nn::ops::softmax(&logits, D::Minus1)?
         .i(0)?
         .to_vec1::<f32>()?;
     let mut prs = prs.iter().enumerate().collect::<Vec<_>>();

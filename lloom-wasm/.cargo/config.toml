@@ -1,0 +1,8 @@
+# getrandom 0.3's wasm_js backend is selected at build time by this cfg, in
+# addition to the `wasm_js` cargo feature (see Cargo.toml). Without it the crate
+# fails to compile with "the wasm_js backend requires the wasm_js feature".
+[target.wasm32-unknown-unknown]
+# `+simd128` turns on the wasm SIMD ISA so the quantized `vec_dot` uses
+# `quantized::simd128` instead of the scalar `vec_dot_unopt` fallback — a large
+# speedup for the LFM2 forward pass (#623). Chrome 91+/Firefox 89+/Safari 16.4+.
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"', '-C', 'target-feature=+simd128']

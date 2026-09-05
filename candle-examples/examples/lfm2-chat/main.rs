@@ -705,10 +705,18 @@ fn main() -> Result<()> {
         report_rounds(st, args.phase_sync);
     }
 
+    // The KV-append arm within the cache config, so `cache=crown` is not
+    // ambiguous between the `Cat` and `InPlace` arms (they print the same
+    // `cache_arm` string otherwise; the crown default is `InPlace` since the
+    // A/B inverted, `LLOOM_CROWN_KV=cat` restores `Cat`).
+    let kv_arm = match config.kv_append {
+        KvAppend::InPlace => "inplace",
+        KvAppend::Cat => "cat",
+    };
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \
-         {} on {:?}; cache={cache_arm} \
+         {} on {:?}; cache={cache_arm} kv={kv_arm} \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={}]",
         b(format!("{end_to_end:.1}")),

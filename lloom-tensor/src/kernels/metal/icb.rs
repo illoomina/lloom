@@ -355,6 +355,11 @@ struct Inner {
     stale_positions: usize,
     /// Runs that went stale and are never replayed again.
     poisoned: std::collections::HashSet<usize>,
+    /// Windows still to be dropped before recording begins. See
+    /// [`IcbExecutor::set_warm_in`].
+    warm_in: usize,
+    /// Windows dropped by the warm-in, reported beside `discarded`.
+    warm_in_skipped: usize,
     /// Positions before this index are inside a run whose range already ran.
     suppress_until: usize,
     /// The run whose range was most recently requested, so a stale member can
@@ -484,10 +489,11 @@ impl IcbExecutor {
                 record_steps,
                 recording: Recording::default(),
                 plan: None,
-                range: None,
                 coverage: Coverage::default(),
                 stale_positions: 0,
                 poisoned: std::collections::HashSet::new(),
+                warm_in: 0,
+                warm_in_skipped: 0,
                 suppress_until: 0,
                 run_in_flight: 0,
                 position: 0,
@@ -495,6 +501,25 @@ impl IcbExecutor {
                 replay_barriers,
             }),
         })
+    }
+
+    /// Drop the first `windows` closed steps instead of recording them.
+    ///
+    /// A recording compares its windows position by position, so it has to
+    /// start once the operands are stable -- after the prefill's window, and
+    /// after any decode steps the allocator is still learning from: an arena
+    /// recorded over the first steps serves the ones after it, and the pooled
+    /// params blocks settle a step later still. The harnesses that drive their
+    /// own loop install the executor at that point instead; a loop that installs
+    /// it before the run begins says how many windows to let pass. Only
+    /// meaningful before the recording begins.
+    pub fn set_warm_in(&self, windows: usize) {
+        self.inner.lock().unwrap().warm_in = windows;
+    }
+
+    /// Windows the warm-in dropped.
+    pub fn warm_in_skipped(&self) -> usize {
+        self.inner.lock().unwrap().warm_in_skipped
     }
 
     /// Close the current step.
@@ -530,6 +555,12 @@ impl IcbExecutor {
                 inner.recording.pending.clear();
                 inner.recording.pending_retained.clear();
                 inner.recording.pending_pipeline = None;
+
+                if inner.warm_in > 0 {
+                    inner.warm_in -= 1;
+                    inner.warm_in_skipped += 1;
+                    return Ok(());
+                }
 
                 // The first window an executor sees is partial by construction:
                 // it opens wherever the caller installed the executor, which is

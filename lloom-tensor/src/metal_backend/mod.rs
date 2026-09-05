@@ -2640,6 +2640,8 @@ impl BackendDevice for MetalDevice {
             // allocation (`DESIGN.md` §9.2a, §11.1).
             arena: Arc::new(RwLock::new(None)),
             arena_recorder: Arc::new(Mutex::new(None)),
+            arena_auto: Arc::new(Mutex::new(None)),
+            arena_auto_report: Arc::new(Mutex::new(None)),
             // No session region until one is installed, on the same argument as
             // the arena above: the classical path is the default (#47).
             session_region: Arc::new(RwLock::new(None)),

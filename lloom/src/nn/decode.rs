@@ -229,6 +229,30 @@ fn end_executor_step(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Bracket one decode step's forward pass for the activation arena
+/// (`DESIGN.md` §9.2): the ordinal that ties an allocation to a slot restarts
+/// here, and an armed recording (`MetalDevice::arm_arena_recording`) observes
+/// the step and installs the arena when it has seen enough. No-ops with no
+/// arena installed or armed, and off Metal. The sampling before the forward and
+/// the drain after it stay outside, as the harnesses that record by hand keep
+/// them.
+fn begin_decode_step(device: &Device) {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        m.begin_decode_step();
+    }
+    let _ = device;
+}
+
+fn end_decode_step(device: &Device) -> Result<()> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        m.finish_decode_step()?;
+    }
+    let _ = device;
+    Ok(())
+}
+
 fn flush_and_prune(device: &Device) -> Result<Option<usize>> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
@@ -420,10 +444,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     eos = true;
                     break;
                 }
+                begin_decode_step(&device);
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
+                end_decode_step(&device)?;
                 self.seq.pos += 1;
             } else {
                 if opts.sample_split {
@@ -433,10 +459,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
                 // ENQUEUE, then learn. The GPU has this forward queued before
                 // it retires the previous one.
+                begin_decode_step(&device);
                 logits = self
                     .model
                     .forward(&feed, self.seq.pos, &mut self.seq.cache)?
                     .squeeze(0)?;
+                end_decode_step(&device)?;
                 self.seq.pos += 1;
                 // Backpressure AFTER the enqueue: the host has just added a
                 // command buffer, so cap how far it may run ahead of the GPU.

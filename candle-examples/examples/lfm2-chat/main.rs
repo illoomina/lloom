@@ -130,6 +130,13 @@ struct Args {
     #[arg(long)]
     replay: bool,
 
+    /// Install the activation arena (`DESIGN.md` §9.2) without the replay
+    /// executor: the arm that separates what the arena costs or buys on this
+    /// loop from what replay adds on top of it. `--replay` implies it. Recorded
+    /// from the first decode steps, as under `--replay`. Not under `--dspark`.
+    #[arg(long)]
+    arena: bool,
+
     /// With `--replay`: whether candle's own `auto_barrier` still fires at a
     /// position the ICB already replays. `always` (the shipped behavior — a
     /// redundant barrier at 393 of 505 positions, §11.3p) or `skip-replayed`
@@ -582,6 +589,28 @@ fn main() -> Result<()> {
     // A/B below is only about the executor if `covered > 0` and `replaying`.
     #[cfg(feature = "metal")]
     let mut icb_exec: Option<std::sync::Arc<candle::kernels::IcbExecutor>> = None;
+    // The arena's recording parameters, shared by `--arena` and `--replay`: one
+    // step skipped (the first token after the prefill allocates a different
+    // set), two recorded, installed at the end of the second.
+    #[cfg(feature = "metal")]
+    const ARENA_SKIP: usize = 1;
+    #[cfg(feature = "metal")]
+    const ARENA_RECORD_STEPS: usize = 2;
+    #[cfg(feature = "metal")]
+    let arena = (args.arena || args.replay) && !args.dspark;
+    #[cfg(feature = "metal")]
+    if arena {
+        if let Device::Metal(dev) = &device {
+            dev.arm_arena_recording(
+                candle::metal_backend::ArenaLayout::Packed,
+                ARENA_SKIP,
+                ARENA_RECORD_STEPS,
+            );
+        }
+        if !args.replay {
+            eprintln!("[arena: packed, recorded from the first decode steps; no executor]");
+        }
+    }
     #[cfg(feature = "metal")]
     if args.replay {
         use candle::kernels::metal::ExecutorSlot;
@@ -604,11 +633,30 @@ fn main() -> Result<()> {
         // `configured` already returns `Arc<IcbExecutor>` — do not re-wrap it
         // (the `Arc<Arc<_>>` is what does not coerce to `Arc<dyn Executor>`).
         let exec = IcbExecutor::configured(ICB_RECORD_STEPS, scope, barriers);
+        // The third thing a replay needs after packed params and the pool: stable
+        // buffer identity. Under the buffer pool every activation is a different
+        // buffer on every step (§9.2c), so every position reads as `varies` and
+        // coverage is zero. The activation arena (§9.2) is recorded from the
+        // decode loop's own steps -- one skipped, two recorded, installed at the
+        // end of the second -- through the brackets `Session::decode` calls. The
+        // executor lets the prefill's window, those three steps and one settling
+        // step pass before it records; §11.3 says why a recording taken earlier
+        // excludes everything for a reason that is not the executor's.
+        //
+        // Not under `--dspark`: a round's allocation order moves with the
+        // accepted length, and the arena serves by ordinal.
         if let Device::Metal(dev) = &device {
+            if arena {
+                exec.set_warm_in(1 + ARENA_SKIP + ARENA_RECORD_STEPS + 1);
+            }
             dev.set_executor(std::sync::Arc::new(ExecutorSlot::Custom(exec.clone())));
         }
         icb_exec = Some(exec);
-        eprintln!("[replay: ICB executor installed — barriers={barriers:?} scope={scope:?} param-style=packed]");
+        eprintln!(
+            "[replay: ICB executor installed — barriers={barriers:?} scope={scope:?} \
+             param-style=packed arena={}]",
+            if arena { "packed (recorded from the first decode steps)" } else { "off" }
+        );
     }
 
     let sampling = if args.temperature <= 0.0 {
@@ -871,6 +919,23 @@ fn main() -> Result<()> {
     if let Some(exec) = icb_exec.as_ref() {
         report_replay(exec, st.steps);
     }
+    #[cfg(feature = "metal")]
+    if arena {
+        if let Device::Metal(dev) = &device {
+            match dev.arena_auto_report() {
+                Some(r) => eprintln!(
+                    "[arena: {:?} installed after decode step {}: {} of {} ordinals served; \
+                     counters={:?}]",
+                    r.layout,
+                    r.installed_at_step,
+                    r.covered,
+                    r.total,
+                    dev.arena_counters(),
+                ),
+                None => eprintln!("[arena: not installed]"),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -897,16 +962,37 @@ fn report_replay(exec: &candle::kernels::IcbExecutor, steps: u64) {
         cov.inline_constants,
         cov.no_pipeline,
     );
+    eprintln!("[replay: warm_in_skipped={}]", exec.warm_in_skipped());
     let ranges = trace::execute_range_count();
     let use_resource = trace::use_resource_count();
     let steps = steps.max(1) as f64;
+    // The residency arm is named from the plan, not from the variable that
+    // selected it (§7.1a-i): per-run declares `residency_per_step`, plan-wide
+    // declares `runs x plan_wide`.
+    let arm = if exec.runs() > 0 && exec.residency_per_step() == exec.runs() * exec.plan_resident() {
+        "plan-wide"
+    } else {
+        "per-run"
+    };
     eprintln!(
         "[replay: execute_ranges={ranges} ({:.1}/step) useResource={use_resource} ({:.1}/step) \
-         barriers_suppressed={} constants_pool_slots={}]",
+         residency={arm} per_step={} plan_wide={} barriers_suppressed={}]",
         ranges as f64 / steps,
         use_resource as f64 / steps,
+        exec.residency_per_step(),
+        exec.plan_resident(),
         trace::barriers_suppressed(),
-        candle::kernels::constants_pool().map_or(0, |p| p.len()),
+    );
+    // The pool's four arms (`ConstantsPool`): `detached > 0` is the check that
+    // keeps a lookahead loop from rewriting a params block under an in-flight
+    // reader having fired; `rewritten` past the first steps means a position's
+    // block changes between steps and cannot be replayed from its slot.
+    let pool = candle::kernels::constants_pool()
+        .map(|p| (p.len(), p.counters()))
+        .unwrap_or_default();
+    eprintln!(
+        "[replay: constants_pool slots={} allocated={} unchanged={} rewritten={} detached={}]",
+        pool.0, pool.1.allocated, pool.1.unchanged, pool.1.rewritten, pool.1.detached,
     );
     for ((kernel, reason), n) in &cov.excluded_by_kernel {
         eprintln!("[replay excluded {n:4} {kernel:<44} {reason}]");

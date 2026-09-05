@@ -304,6 +304,13 @@ pub struct MetalDevice {
     /// record-then-replay, applied to allocation.
     pub(crate) arena_recorder: Arc<Mutex<Option<Arc<Mutex<ArenaRecorder>>>>>,
 
+    /// An arena recording the decode loop drives through
+    /// [`MetalDevice::begin_decode_step`] / [`MetalDevice::finish_decode_step`]
+    /// rather than a harness driving it by hand. `None` unless armed.
+    pub(crate) arena_auto: Arc<Mutex<Option<ArenaAutoRecord>>>,
+    /// What the last armed recording installed. See [`ArenaAutoReport`].
+    pub(crate) arena_auto_report: Arc<Mutex<Option<ArenaAutoReport>>>,
+
     /// The session region: one owned allocation serving the class the arena
     /// declines (#47, `DESIGN.md` §9.2x).
     ///
@@ -326,6 +333,38 @@ pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = RESOURCE_OPTIONS;
 pub const PRIVATE_RESOURCE_OPTIONS: MTLResourceOptions = objc2_metal::MTLResourceOptions(
     MTLResourceOptions::StorageModePrivate.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,
 );
+
+/// An arena recording in progress, driven by the decode-step brackets.
+///
+/// The harnesses record the arena by hand -- `begin_arena_recording` on one
+/// decode step, `next_arena_recording_step` on the next, `finish` + `install`
+/// after them -- around a loop they own. A loop that lives in the engine
+/// (`Session::decode`) cannot be edited per experiment, so the same sequence is
+/// driven from the brackets it already calls, and the recording is armed once
+/// before the run begins.
+#[derive(Clone, Copy, Debug)]
+pub struct ArenaAutoRecord {
+    pub layout: ArenaLayout,
+    /// Decode steps to let pass before recording. The first token after the
+    /// prefill allocates a different set (`begin_arena_recording`), so one.
+    pub skip: usize,
+    /// Steps to record. Two is the minimum a plan can be built from
+    /// (`next_arena_recording_step`).
+    pub record_steps: usize,
+    /// Decode steps begun since arming.
+    step: usize,
+}
+
+/// What an armed recording installed, for the harness to report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArenaAutoReport {
+    pub layout: ArenaLayout,
+    /// Ordinals the plan serves, of those recorded.
+    pub covered: usize,
+    pub total: usize,
+    /// The decode step (since arming) the arena was installed at the end of.
+    pub installed_at_step: usize,
+}
 
 impl std::fmt::Debug for MetalDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1014,11 +1053,86 @@ impl MetalDevice {
     /// ordinal.
     ///
     /// The ordinal is what ties an allocation to a slot, so it has to restart at
-    /// the same point every token. No-op when no arena is installed.
+    /// the same point every token. No-op when no arena is installed and no
+    /// recording is armed.
     pub fn begin_decode_step(&self) {
+        if let Ok(mut g) = self.arena_auto.lock() {
+            if let Some(auto) = g.as_mut() {
+                if auto.step == auto.skip {
+                    self.begin_arena_recording();
+                } else if auto.step > auto.skip && auto.step < auto.skip + auto.record_steps {
+                    self.next_arena_recording_step();
+                }
+            }
+        }
         if let Some(a) = self.arena_slot() {
             a.begin_step();
         }
+    }
+
+    /// Record the arena from the decode steps the loop is about to run, and
+    /// install it when the recording is complete.
+    ///
+    /// `skip` steps pass first, `record_steps` are recorded, and the arena is
+    /// installed at the end of the last recorded step; every step after that
+    /// is served from it. Takes effect through [`Self::begin_decode_step`] and
+    /// [`Self::finish_decode_step`], so a loop that brackets its steps with
+    /// those needs nothing else. Replaces an earlier arming.
+    pub fn arm_arena_recording(&self, layout: ArenaLayout, skip: usize, record_steps: usize) {
+        if let Ok(mut g) = self.arena_auto.lock() {
+            *g = Some(ArenaAutoRecord {
+                layout,
+                skip,
+                record_steps: record_steps.max(2),
+                step: 0,
+            });
+        }
+        if let Ok(mut r) = self.arena_auto_report.lock() {
+            *r = None;
+        }
+    }
+
+    /// What an armed recording installed, once it has.
+    pub fn arena_auto_report(&self) -> Option<ArenaAutoReport> {
+        self.arena_auto_report.lock().ok().and_then(|r| *r)
+    }
+
+    /// [`Self::end_decode_step`], plus the install an armed recording is due
+    /// (`arm_arena_recording`). What a decode loop calls after a step's forward
+    /// pass; the executor's step is closed separately (`end_executor_step`),
+    /// after everything the step encodes.
+    pub fn finish_decode_step(&self) -> Result<()> {
+        self.end_decode_step();
+        let due = self.arena_auto.lock().ok().and_then(|mut g| {
+            let auto = g.as_mut()?;
+            let step = auto.step;
+            auto.step += 1;
+            if step + 1 == auto.skip + auto.record_steps {
+                let layout = auto.layout;
+                *g = None;
+                Some((layout, step))
+            } else {
+                None
+            }
+        });
+        if let Some((layout, step)) = due {
+            let plan = self.finish_arena_recording(layout).ok_or_else(|| {
+                MetalError::Message(
+                    "arena recording over the decode steps produced no allocations".to_string(),
+                )
+            })?;
+            let (covered, total) = plan.covered();
+            self.install_arena(plan, layout)?;
+            if let Ok(mut r) = self.arena_auto_report.lock() {
+                *r = Some(ArenaAutoReport {
+                    layout,
+                    covered,
+                    total,
+                    installed_at_step: step,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Mark the end of a decode step. Allocations outside a step take the pool

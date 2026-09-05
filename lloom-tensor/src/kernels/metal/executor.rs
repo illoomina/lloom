@@ -26,7 +26,8 @@
 //! replay must therefore capture bindings as they happen, which is what
 //! [`Executor::will_bind_buffer`] exists for -- see `IcbFeasibility` below for
 //! why no such executor is included here.
-use crate::kernels::metal::{Buffer, ComputePipeline};
+use crate::kernels::metal::{Buffer, ComputePipeline, Device};
+use crate::kernels::MetalKernelError;
 use objc2_metal::MTLSize;
 
 /// One dispatch, as the executor sees it.
@@ -157,6 +158,16 @@ pub trait Executor: Send + Sync {
 
     /// Called when pipeline state is set, before it reaches Metal.
     fn will_set_pipeline(&self, _pipeline: &ComputePipeline) {}
+
+    /// The decode step just encoded is complete; the next dispatch opens a new one.
+    ///
+    /// Nothing inside the encoder knows where a step ends -- command buffers are
+    /// cut on a dispatch count, not on a token -- so the loop that owns the step
+    /// says so. A replaying executor keys its recording on this boundary; every
+    /// other executor ignores it, and the classical slot never reaches it.
+    fn end_step(&self, _device: &Device) -> Result<(), MetalKernelError> {
+        Ok(())
+    }
 }
 
 /// What an executor will do with the position about to be dispatched, as far as
@@ -322,6 +333,16 @@ impl ExecutorSlot {
         match self {
             ExecutorSlot::Classical => {}
             ExecutorSlot::Custom(e) => e.will_set_pipeline(pipeline),
+        }
+    }
+
+    /// Close the installed executor's step (see [`Executor::end_step`]). Once per
+    /// token, not per dispatch, so the branch here is not on §3.3's path.
+    #[inline]
+    pub fn end_step(&self, device: &Device) -> Result<(), MetalKernelError> {
+        match self {
+            ExecutorSlot::Classical => Ok(()),
+            ExecutorSlot::Custom(e) => e.end_step(device),
         }
     }
 }

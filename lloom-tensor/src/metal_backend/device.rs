@@ -1029,6 +1029,22 @@ impl MetalDevice {
         }
     }
 
+    /// Tell the installed executor the decode step is complete
+    /// (`Executor::end_step`, `DESIGN.md` §11.3).
+    ///
+    /// The decode loop calls this once per token, after everything the step
+    /// encodes. Separate from [`Self::end_decode_step`] because the harnesses
+    /// that drive an executor and an arena together close the two on their own
+    /// schedules, and closing an executor's step twice records an empty window.
+    /// A no-op under `ExecutorSlot::Classical`.
+    pub fn end_executor_step(&self) -> Result<()> {
+        self.commands
+            .executor()
+            .end_step(&self.device)
+            .map_err(MetalError::from)?;
+        Ok(())
+    }
+
     pub fn arena_counters(&self) -> Option<ArenaCounters> {
         self.arena_slot().map(|a| a.counters())
     }

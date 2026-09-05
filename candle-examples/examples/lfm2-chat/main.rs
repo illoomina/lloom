@@ -508,10 +508,21 @@ fn main() -> Result<()> {
     // binds one `device const Params*`, not the inline scalars the split arm
     // emits, so the step the executor records must already be packed. Set it here
     // (before warmup) so the recorded shape matches the replayed one.
+    // The other two switches replay needs, both process-wide and both before the
+    // first pipeline is built: `supportIndirectCommandBuffers` is a pipeline
+    // property (§3.7d -- encoding one without it segfaults), and the constants
+    // pool is what gives dispatch position N the same params buffer every step
+    // (without it every packed position varies and coverage is zero, §11.3d).
     #[cfg(feature = "metal")]
     if args.replay {
-        use candle::kernels::{set_default_param_style, ParamStyle};
+        use candle::kernels::{
+            set_constants_pool_enabled, set_default_param_style, set_pipelines_support_icb,
+            ParamStyle,
+        };
         set_default_param_style(ParamStyle::Packed);
+        set_pipelines_support_icb(true)
+            .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
+        set_constants_pool_enabled(true);
     }
 
     let model = Model::new(&config, vb).context("constructing LFM2")?;

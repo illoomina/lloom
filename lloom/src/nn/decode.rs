@@ -213,6 +213,22 @@ struct Lane<P> {
 /// Commit without waiting and prune the in-flight queue, on the backends that
 /// have one. `None` where there is no queue to prune — a CPU run reports no
 /// count, which is honest rather than zero (§14.1).
+/// Close the installed dispatch executor's step, on the backend that has one.
+///
+/// The executor cannot see a token boundary from inside the encoder, so the
+/// loop that owns the step declares it -- after the prefill, and after each
+/// step's or round's last dispatch, so the window an ICB executor records is
+/// one whole step and the same shape every time (`icb::IcbExecutor::end_step`).
+/// A no-op with no executor installed, and off Metal.
+fn end_executor_step(device: &Device) -> Result<()> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        m.end_executor_step()?;
+    }
+    let _ = device;
+    Ok(())
+}
+
 fn flush_and_prune(device: &Device) -> Result<Option<usize>> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
@@ -351,6 +367,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 logits
             }
         };
+        end_executor_step(&device)?;
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
 
         let mut produced = 0usize;
@@ -502,6 +519,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     }
                 }
             }
+            end_executor_step(&device)?;
             stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
         }
 
@@ -731,6 +749,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         spec.begin(seq, prompt)?;
         let prefill_probe = self.model.take_probe(&mut self.seq.cache)?;
         spec.observe(seq, &prefill_probe, std::slice::from_ref(&anchor_tok))?;
+        end_executor_step(&device)?;
 
         // The prefill's own argmax is the first generated token — it is what
         // non-speculative greedy would emit as token 0 (the prefill logits' argmax),
@@ -834,6 +853,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
             }
 
+            end_executor_step(&device)?;
             stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
         }
 

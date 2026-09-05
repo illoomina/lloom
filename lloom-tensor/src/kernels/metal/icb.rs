@@ -1183,4 +1183,11 @@ impl Executor for IcbExecutor {
         let mut inner = self.inner.lock().unwrap();
         inner.recording.pending_pipeline = Some(pipeline.clone());
     }
+
+    fn end_step(
+        &self,
+        device: &crate::kernels::metal::Device,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        IcbExecutor::end_step(self, device)
+    }
 }

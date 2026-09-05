@@ -411,7 +411,9 @@ pub enum AttnImpl {
     /// `crate::nn::ops::sdpa`, which is GQA-native and accumulates in F32
     /// internally, so neither `repeat_kv` nor the upcast is needed.
     ///
-    /// Metal only, and only for `seq_len == 1`; every other case falls back to
+    /// Metal only. `seq_len == 1` takes `sdpa_vector`; `seq_len > 1` — prefill,
+    /// a verify window, B>1 — takes the tiled `steel_attention`
+    /// (`Attention::sdpa_full_applies`). Every other case falls back to
     /// `Generic` rather than failing, so this is safe to set unconditionally.
     Sdpa,
     /// FlashDecoding: attention split over independent contiguous KV chunks,
@@ -428,8 +430,9 @@ pub enum AttnImpl {
     /// compiled and **none chosen**, because the axis that separates them could
     /// not be exercised.
     ///
-    /// Metal only, `seq_len == 1` only, f16/f32 only. Falls back to `Generic`
-    /// on any other case, as `Sdpa` does.
+    /// Metal only, `seq_len == 1` only, f16/f32 only. `seq_len > 1` takes the
+    /// tiled `steel_attention` as `Sdpa` does; any other case falls back to
+    /// `Generic`.
     FlashDecoding,
 }
 
@@ -2303,9 +2306,8 @@ impl Attention {
     /// fallback and never a failure. They are checked rather than assumed:
     ///
     /// * **Metal.** `Sdpa::cpu_fwd` bails outright; there is no CPU arm.
-    /// * **`seq_len == 1`.** `supports_sdpa_vector` requires it. Prefill is
-    ///   `call_sdpa_full`, whose mask handling differs — deliberately out of
-    ///   scope, see the type-level note on `AttnImpl::Sdpa`.
+    /// * **`seq_len == 1`.** `supports_sdpa_vector` requires it. `seq_len > 1`
+    ///   is `sdpa_full_applies`'s.
     /// * **dtype.** The kernel is instantiated for f16/bf16/f32 only.
     ///
     /// `head_dim == 64` and `32 % 8 == 0` also hold for LFM2 (§5.2) and are
@@ -2316,6 +2318,33 @@ impl Attention {
             && q.device().is_metal()
             && seq_len == 1
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
+    }
+
+    /// Whether this call can take the tiled `steel_attention` kernel — the
+    /// `seq_len > 1` sibling of `sdpa_vector` (`DESIGN.md` §10.2v). One
+    /// threadgroup per (query block, head), online softmax over K/V blocks,
+    /// GQA-native, K/V at their own dtype, the causal mask applied in-kernel
+    /// from the cache offset `kv_len - seq_len`. Verify, prefill and B>1 are
+    /// all this shape.
+    ///
+    /// Every fused arm takes it: the arm names the DECODE kernel, and there is
+    /// one multi-query kernel for both to share. A false is a fallback to the
+    /// generic path and never a failure — each condition is one `ops::sdpa`
+    /// would otherwise `bail!` on:
+    ///
+    /// * **Metal**, **`seq_len > 1`**, and every query has a key
+    ///   (`seq_len <= kv_len`, the shape `Sdpa::metal_fwd` admits).
+    /// * **dtype** f16/bf16/f32 and **`head_dim`** in the instantiated set;
+    ///   f32 has no `head_dim == 512` instantiation.
+    fn sdpa_full_applies(&self, q: &Tensor, seq_len: usize, kv_len: usize) -> bool {
+        const HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
+        self.attn_impl != AttnImpl::Generic
+            && q.device().is_metal()
+            && seq_len > 1
+            && seq_len <= kv_len
+            && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
+            && HEAD_DIMS.contains(&self.head_dim)
+            && !(self.head_dim == 512 && q.dtype() == DType::F32)
     }
 
     /// Whether this call can take the FlashDecoding kernels (issue #116).
@@ -2605,6 +2634,18 @@ impl Attention {
                 &v,
                 None,
                 false,
+                1f32 / (self.head_dim as f32).sqrt(),
+                1.0,
+            )?
+        } else if self.sdpa_full_applies(&q, seq_len, k.dim(2)?) {
+            // The causal mask is the kernel's own, from the cache offset
+            // `kv_len - seq_len`; `Cache::mask` is the generic arm's.
+            crate::nn::ops::sdpa(
+                &q,
+                &k,
+                &v,
+                None,
+                true,
                 1f32 / (self.head_dim as f32).sqrt(),
                 1.0,
             )?

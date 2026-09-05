@@ -26,12 +26,19 @@ pub enum SdpaDType {
     F32,
 }
 
-/// SDPA full is supported when:
-/// - q head dim == 64, 128
-/// - no mask
-/// - q heads == kv heads
-/// - final type != bf16 (TODO maybe just template this kernel too?)
-/// - q,k,v are contiguous
+/// The tiled multi-query attention (`steel_attention`): one threadgroup per
+/// (`BQ` query block, head), online softmax over `BK`-wide K/V blocks, f32
+/// accumulation in simdgroup matrices, GQA-native (`kv_head_idx = head /
+/// gqa_factor`), K/V read at their own dtype through `[B, H, L]` strides.
+///
+/// Supported: head dim in {32, 64, 72, 80, 96, 128, 256, 512} (512 not at f32),
+/// f16/bf16/f32, `q_seq <= k_seq`. `do_causal` masks in-kernel with the query
+/// rows offset to the END of the key range (`qL_off = kL - qL`), which is the
+/// cache shape: a verify or prefill pass over the last `qL` positions of `kL`.
+/// An explicit mask disables `do_causal` (it already encodes causality).
+///
+/// Every reduction is fixed-order — blocks ascend, the row reductions are the
+/// simdgroup tree — so a given build is bit-stable run to run (§2.3.3).
 ///
 /// # No packed sibling, and it needs none — issue #103
 ///

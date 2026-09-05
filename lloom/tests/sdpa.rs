@@ -473,4 +473,276 @@ mod metal_sdpa_tests {
         }
         Ok(())
     }
+
+    // ---------------------------------------------------------------------
+    // The tiled multi-query kernel (`steel_attention`, `call_sdpa_full`) at
+    // the shapes the model runs it in: a `seq_len > 1` window attending over a
+    // cache it sits at the END of (`DESIGN.md` §10.2v). A DSpark verify is
+    // `q_len = K + 1` over `kv_len = index_pos + K + 1`; a prefill is
+    // `q_len = kv_len`; both are GQA 4:1. The mask is the kernel's own
+    // (`do_causal`, offset `qL_off = kv_len - q_len`), so the reference below
+    // builds the same mask explicitly on the CPU backend.
+    //
+    // The sweep crosses every tile boundary the kernel has (`BQ = BK = 32`):
+    // `q_len` below, at and above one block; `kv_len` unaligned, aligned and
+    // a block past aligned. `kv_len % 32 == 0` with `q_len < 32` is the case
+    // that separates a bounded `kb_lim` from an unbounded one — an unbounded
+    // loop runs one K block past `kv_len` and skips the causal mask on the
+    // block that holds the window's own future keys.
+    // ---------------------------------------------------------------------
+
+    /// repeat_kv + matmul + causal mask + softmax + matmul, in f32, with the
+    /// query rows offset to the end of the key range. Mirrors what
+    /// `AttnImpl::Generic` computes for a `seq_len > 1` pass over a cache.
+    fn reference_causal_attention(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f64,
+    ) -> Result<Tensor> {
+        let (_, q_heads, q_len, _) = q.dims4()?;
+        let (_, kv_heads, kv_len, _) = k.dims4()?;
+        assert!(q_len <= kv_len, "every query must have a key");
+        let repeat = q_heads / kv_heads;
+
+        let k = repeat_kv(k, repeat)?;
+        let v = repeat_kv(v, repeat)?;
+
+        let q = q.to_dtype(DType::F32)?;
+        let k = k.to_dtype(DType::F32)?;
+        let v = v.to_dtype(DType::F32)?;
+
+        let att = (q.matmul(&k.t()?.contiguous()?)? * scale)?;
+        let off = kv_len - q_len;
+        let masked: Vec<u8> = (0..q_len)
+            .flat_map(|i| (0..kv_len).map(move |j| u8::from(j > i + off)))
+            .collect();
+        let mask =
+            Tensor::from_vec(masked, (q_len, kv_len), q.device())?.broadcast_as(att.shape())?;
+        let neg_inf = Tensor::new(f32::NEG_INFINITY, q.device())?.broadcast_as(att.shape())?;
+        let att = mask.where_cond(&neg_inf, &att)?;
+        let att = lloom::nn::ops::softmax_last_dim(&att)?;
+        att.matmul(&v.contiguous()?)
+    }
+
+    /// `(q_len, kv_len)` pairs: the verify window at unaligned, aligned and
+    /// past-aligned cache lengths, one-block and multi-block prefills, and a
+    /// partial trailing query block over a cache.
+    const FULL_CAUSAL_SHAPES: [(usize, usize); 14] = [
+        (10, 10),
+        (10, 11),
+        (10, 32),
+        (10, 41),
+        (10, 64),
+        (10, 70),
+        (10, 96),
+        (10, 137),
+        (2, 33),
+        (32, 32),
+        (32, 64),
+        (33, 33),
+        (34, 469),
+        (100, 128),
+    ];
+
+    /// Metal `sdpa` (`do_causal`, no mask tensor) at GQA 4:1 over a cache,
+    /// against the CPU backend, f32, across the tile-boundary sweep.
+    #[test]
+    fn sdpa_full_causal_gqa_over_a_cache_matches_cpu_backend_f32() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+
+        for &(q_len, kv_len) in &FULL_CAUSAL_SHAPES {
+            let mut rng =
+                rand::rngs::StdRng::seed_from_u64(675_000 + (q_len * 1000 + kv_len) as u64);
+
+            let q = randn(&mut rng, (1, LFM2_Q_HEADS, q_len, LFM2_HEAD_DIM), &cpu)?;
+            let k = randn(&mut rng, (1, LFM2_KV_HEADS, kv_len, LFM2_HEAD_DIM), &cpu)?;
+            let v = randn(&mut rng, (1, LFM2_KV_HEADS, kv_len, LFM2_HEAD_DIM), &cpu)?;
+
+            let want = reference_causal_attention(&q, &k, &v, scale)?;
+
+            let got = lloom::nn::ops::sdpa(
+                &q.to_device(&metal)?,
+                &k.to_device(&metal)?,
+                &v.to_device(&metal)?,
+                None,
+                true,
+                scale as f32,
+                1.,
+            )?
+            .to_device(&cpu)?;
+
+            let err = assert_matches_reference(
+                &got,
+                &want,
+                1e-5,
+                &format!("full causal f32 q_len={q_len} kv_len={kv_len}"),
+            )?;
+            println!(
+                "sdpa_full_causal_gqa_over_a_cache_matches_cpu_backend_f32: \
+                 q_len={q_len} kv_len={kv_len} max abs error {err:e}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The same at f16, what the model runs. The kernel scales `q` in f16
+    /// before the dot where the reference scales in f32 after it, so the two
+    /// round differently by construction; this bounds that difference.
+    #[test]
+    fn sdpa_full_causal_gqa_over_a_cache_matches_cpu_backend_f16() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+
+        for &(q_len, kv_len) in &FULL_CAUSAL_SHAPES {
+            let mut rng =
+                rand::rngs::StdRng::seed_from_u64(675_500 + (q_len * 1000 + kv_len) as u64);
+
+            let q = randn(&mut rng, (1, LFM2_Q_HEADS, q_len, LFM2_HEAD_DIM), &cpu)?;
+            let k = randn(&mut rng, (1, LFM2_KV_HEADS, kv_len, LFM2_HEAD_DIM), &cpu)?;
+            let v = randn(&mut rng, (1, LFM2_KV_HEADS, kv_len, LFM2_HEAD_DIM), &cpu)?;
+
+            // Round-trip through f16 on both arms so the inputs are identical bits.
+            let q16 = q.to_dtype(DType::F16)?;
+            let k16 = k.to_dtype(DType::F16)?;
+            let v16 = v.to_dtype(DType::F16)?;
+
+            let want = reference_causal_attention(&q16, &k16, &v16, scale)?;
+
+            let got = lloom::nn::ops::sdpa(
+                &q16.to_device(&metal)?,
+                &k16.to_device(&metal)?,
+                &v16.to_device(&metal)?,
+                None,
+                true,
+                scale as f32,
+                1.,
+            )?
+            .to_device(&cpu)?
+            .to_dtype(DType::F32)?;
+
+            let err = assert_matches_reference(
+                &got,
+                &want,
+                5e-3,
+                &format!("full causal f16 q_len={q_len} kv_len={kv_len}"),
+            )?;
+            println!(
+                "sdpa_full_causal_gqa_over_a_cache_matches_cpu_backend_f16: \
+                 q_len={q_len} kv_len={kv_len} max abs error {err:e}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The cache's own shape: a `[1, kv_heads, capacity, head_dim]` slot
+    /// narrowed to the live prefix, read through strides rather than copied.
+    /// The padding past `kv_len` is a sentinel that dwarfs any live score, so a
+    /// read past the live length shows up as a gross error rather than hiding
+    /// in the tolerance. Live lengths on both sides of a 32-block boundary.
+    #[test]
+    fn sdpa_full_causal_over_a_narrowed_kv_matches_cpu_backend() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        const Q_LEN: usize = 10;
+
+        for &(live, capacity) in &[(41usize, 512usize), (64, 512), (137, 512), (469, 2048)] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(675_900 + live as u64);
+
+            let q = randn(&mut rng, (1, LFM2_Q_HEADS, Q_LEN, LFM2_HEAD_DIM), &cpu)?;
+            let k_live = randn(&mut rng, (1, LFM2_KV_HEADS, live, LFM2_HEAD_DIM), &cpu)?;
+            let v_live = randn(&mut rng, (1, LFM2_KV_HEADS, live, LFM2_HEAD_DIM), &cpu)?;
+
+            let want = reference_causal_attention(&q, &k_live, &v_live, scale)?;
+
+            let pad_len = capacity - live;
+            let sentinel = 40f32;
+            let k_pad = Tensor::full(sentinel, (1, LFM2_KV_HEADS, pad_len, LFM2_HEAD_DIM), &cpu)?;
+            let v_pad = Tensor::full(sentinel, (1, LFM2_KV_HEADS, pad_len, LFM2_HEAD_DIM), &cpu)?;
+            let k_all = Tensor::cat(&[&k_live, &k_pad], 2)?.contiguous()?;
+            let v_all = Tensor::cat(&[&v_live, &v_pad], 2)?.contiguous()?;
+
+            let k = k_all.to_device(&metal)?.narrow(2, 0, live)?;
+            let v = v_all.to_device(&metal)?.narrow(2, 0, live)?;
+            assert!(
+                !k.is_contiguous(),
+                "live={live}: the narrow must stay strided"
+            );
+
+            let got =
+                lloom::nn::ops::sdpa(&q.to_device(&metal)?, &k, &v, None, true, scale as f32, 1.)?
+                    .to_device(&cpu)?;
+
+            let err = assert_matches_reference(
+                &got,
+                &want,
+                1e-5,
+                &format!("full causal narrowed kv live={live} cap={capacity}"),
+            )?;
+            println!(
+                "sdpa_full_causal_over_a_narrowed_kv: live={live} cap={capacity} max abs error {err:e}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Run to run, the kernel is bit-stable (`DESIGN.md` §2.3.3): every
+    /// reduction is fixed-order, so five dispatches of one input give one bit
+    /// pattern. Asserted on the f16 verify shape, at a cache length that
+    /// exercises the partial K block and the causal window together.
+    #[test]
+    fn sdpa_full_causal_is_bit_stable_run_to_run() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(675_777);
+
+        let q = randn(&mut rng, (1, LFM2_Q_HEADS, 10, LFM2_HEAD_DIM), &cpu)?
+            .to_dtype(DType::F16)?
+            .to_device(&metal)?;
+        let k = randn(&mut rng, (1, LFM2_KV_HEADS, 137, LFM2_HEAD_DIM), &cpu)?
+            .to_dtype(DType::F16)?
+            .to_device(&metal)?;
+        let v = randn(&mut rng, (1, LFM2_KV_HEADS, 137, LFM2_HEAD_DIM), &cpu)?
+            .to_dtype(DType::F16)?
+            .to_device(&metal)?;
+
+        let bits = |t: &Tensor| -> Result<Vec<u16>> {
+            Ok(t.to_device(&cpu)?
+                .flatten_all()?
+                .to_vec1::<half::f16>()?
+                .into_iter()
+                .map(|x| x.to_bits())
+                .collect())
+        };
+        let first = bits(&lloom::nn::ops::sdpa(
+            &q,
+            &k,
+            &v,
+            None,
+            true,
+            scale as f32,
+            1.,
+        )?)?;
+        let distinct = first.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(distinct >= 2, "vacuous: {distinct} distinct value(s)");
+        for run in 1..5 {
+            let again = bits(&lloom::nn::ops::sdpa(
+                &q,
+                &k,
+                &v,
+                None,
+                true,
+                scale as f32,
+                1.,
+            )?)?;
+            assert!(again == first, "run {run} differs from run 0");
+        }
+        println!("sdpa_full_causal_is_bit_stable_run_to_run: 5 runs, {} elements, {distinct} distinct, identical", first.len());
+        Ok(())
+    }
 }

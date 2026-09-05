@@ -38,7 +38,6 @@
 //! a stale command, because under `HazardTrackingModeUntracked` a wrong buffer
 //! is silent corruption rather than an error (§3.5).
 use crate::kernels::metal::{Buffer, ComputePipeline};
-use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLComputePipelineState, MTLDevice, MTLIndirectCommandBuffer,
@@ -347,8 +346,6 @@ struct Inner {
     record_steps: usize,
     recording: Recording,
     plan: Option<Plan>,
-    /// The ICB and its residency set, handed to the encoder at each run head.
-    range: Option<Arc<IcbRange>>,
     coverage: Coverage,
     /// Positions whose live dispatch stopped matching the recording.
     ///
@@ -394,18 +391,29 @@ struct Inner {
 /// applies to it. This is `DESIGN.md` §11.3's range trick used for the reason
 /// §11.3 gives -- a computed jump into a pre-encoded list -- rather than for a
 /// variable chunk count.
-#[derive(Clone, Copy, Debug)]
+///
+/// # Each run carries its own residency set
+///
+/// `useResource` has to be declared on the encoder that executes the range, so
+/// it is paid at every execute call. Declaring the whole plan's buffers at each
+/// of them is `runs x |plan|` calls per step -- 32 x 245 = 7840 on LFM2, against
+/// a sum over runs of 275 (`DESIGN.md` §11.3w) -- when a run's commands touch
+/// only 8 to 12 buffers. The set here is built from the same bindings the run's
+/// commands were encoded from, so it covers them by construction; a missed
+/// declaration is silent corruption rather than an error (§3.7).
 struct Run {
     /// First dispatch position in the run.
     start: usize,
     /// First ICB command index for the run.
     command: usize,
     len: usize,
+    /// The ICB and every buffer a command in this run binds.
+    range: Arc<IcbRange>,
 }
 
-/// The encoded ICB and the map from dispatch position to command index.
+/// The encoded ICB (held by each run's range) and the map from dispatch
+/// position to command index.
 struct Plan {
-    icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
     /// `command_of[pos]` is the ICB command index for that dispatch position, or
     /// `None` when the position is not covered.
     command_of: Vec<Option<usize>>,
@@ -416,8 +424,9 @@ struct Plan {
     /// The recording each covered position was encoded from, kept so a live
     /// dispatch can be checked against it before its command is trusted.
     reference: Vec<StepDispatch>,
-    /// Every buffer any encoded command binds, retained and made resident.
-    resident: Vec<Buffer>,
+    /// Distinct buffers bound across the whole plan. Reported, not declared: the
+    /// residency a step declares is the sum over runs of each run's own set.
+    plan_resident: usize,
     /// Barriers encoded on commands, so the ordering re-expressed inside the ICB
     /// is a reported quantity rather than an assumed one.
     barriers: usize,
@@ -619,6 +628,36 @@ impl IcbExecutor {
         self.inner.lock().unwrap().poisoned.len()
     }
 
+    /// `useResource` declarations one replayed step makes: the sum over runs of
+    /// each run's own residency set (`DESIGN.md` §11.3w's `runs x |resident|`,
+    /// with `|resident|` per run rather than plan-wide).
+    pub fn residency_per_step(&self) -> usize {
+        self.inner.lock().unwrap().plan.as_ref().map_or(0, |p| {
+            p.runs.iter().map(|r| r.range.resident.len()).sum()
+        })
+    }
+
+    /// Distinct buffers bound across the whole plan -- what every run declared
+    /// before residency was per run, and the `|resident|` in §11.3w's 7840.
+    pub fn plan_resident(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .plan
+            .as_ref()
+            .map_or(0, |p| p.plan_resident)
+    }
+
+    /// Each run's residency set, as buffer addresses, in run order.
+    pub fn run_residency(&self) -> Vec<Vec<usize>> {
+        self.inner.lock().unwrap().plan.as_ref().map_or(Vec::new(), |p| {
+            p.runs
+                .iter()
+                .map(|r| r.range.resident.iter().map(Buffer::raw_addr).collect())
+                .collect()
+        })
+    }
+
     /// Barriers encoded onto ICB commands.
     ///
     /// The ordering candle's `auto_barrier` would have emitted between the
@@ -729,12 +768,6 @@ impl Inner {
                 self.barrier_scope,
             )?)
         };
-        self.range = plan.as_ref().map(|p| {
-            Arc::new(IcbRange {
-                icb: p.icb.clone(),
-                resident: p.resident.clone(),
-            })
-        });
         self.coverage = coverage;
         self.plan = plan;
         Ok(())
@@ -806,10 +839,9 @@ fn encode_plan(
 
     let mut command_of = vec![None; positions];
     let mut run_at = vec![None; positions];
-    let mut runs: Vec<Run> = Vec::new();
+    let mut runs: Vec<RunBuild> = Vec::new();
     let mut reference = Vec::with_capacity(covered.len());
-    let mut resident: Vec<Buffer> = Vec::new();
-    let mut seen_resident = std::collections::HashSet::new();
+    let mut plan_resident = std::collections::HashSet::new();
     // Barriers encoded on commands, reported so the count is observed rather
     // than inferred -- §9.2f's rule, applied to the quantity this file adds.
     let mut barriers = 0usize;
@@ -824,10 +856,17 @@ fn encode_plan(
     let mut last_barrier_cmd: Option<usize> = None;
 
     for (cmd_index, &pos) in covered.iter().enumerate() {
-        if cmd_index > 0 && covered[cmd_index - 1] + 1 != pos {
+        // `covered` is ascending and `cmd_index` walks it, so a run's commands
+        // are consecutive in the ICB exactly when its positions are consecutive
+        // in the step -- which is what lets one `executeCommandsInBuffer` serve
+        // a whole run.
+        if cmd_index == 0 || covered[cmd_index - 1] + 1 != pos {
             run_first_cmd = cmd_index;
             last_barrier_cmd = None;
+            run_at[pos] = Some(runs.len());
+            runs.push(RunBuild::open(pos, cmd_index));
         }
+        let run = runs.last_mut().expect("a run is open: the branch above opens one at cmd_index 0");
         let d = &step[pos];
         // SAFETY: `cmd_index < covered.len()`, the count the ICB was created
         // with -- the loop is over exactly that slice.
@@ -920,14 +959,15 @@ fn encode_plan(
         }
 
         for (b, buf) in d.bindings.iter().zip(d.retained.iter()) {
-            // SAFETY: the buffer outlives the ICB -- it is retained in
-            // `resident` below and the plan owns both -- and the index is under
-            // `maxKernelBufferBindCount`, which was computed as the maximum over
-            // exactly these bindings.
+            // SAFETY: the buffer outlives the ICB -- it is retained in the run's
+            // residency set below and the plan owns both -- and the index is
+            // under `maxKernelBufferBindCount`, which was computed as the
+            // maximum over exactly these bindings.
             unsafe { cmd.setKernelBuffer_offset_atIndex(buf.as_ref(), b.offset, b.index) };
-            if seen_resident.insert(buf.raw_addr()) {
-                resident.push(buf.clone());
-            }
+            // The run's residency set is derived from the very binding just
+            // encoded, so it cannot fall behind the command.
+            run.bind(buf);
+            plan_resident.insert(buf.raw_addr());
         }
         let tg = MTLSize {
             width: d.threads_per_threadgroup.width,
@@ -959,22 +999,7 @@ fn encode_plan(
         }
         command_of[pos] = Some(cmd_index);
         reference.push(d.clone());
-
-        // Extend the run in progress, or open one. `covered` is ascending and
-        // `cmd_index` walks it, so a run's commands are consecutive in the ICB
-        // exactly when its positions are consecutive in the step -- which is
-        // what lets one `executeCommandsInBuffer` serve a whole run.
-        match runs.last_mut() {
-            Some(run) if run.start + run.len == pos => run.len += 1,
-            _ => {
-                run_at[pos] = Some(runs.len());
-                runs.push(Run {
-                    start: pos,
-                    command: cmd_index,
-                    len: 1,
-                });
-            }
-        }
+        run.len += 1;
     }
 
     // Trap 2 (§3.7a): commands the CPU never initialised are undefined
@@ -988,15 +1013,93 @@ fn encode_plan(
         unsafe { icb.indirectComputeCommandAtIndex(i) }.reset();
     }
 
+    // The measurement arm: every run declares the whole plan, which is what
+    // shipped before residency was per run and the `runs x |plan|` term
+    // §11.3w priced. Selected by environment so the two arms are one binary,
+    // and read back from the plan (`residency_per_step` against
+    // `runs x plan_resident`) rather than from the variable.
+    let plan_wide = residency_arm() == ResidencyArm::PlanWide;
+    let everything: Vec<Buffer> = if plan_wide {
+        let mut seen = std::collections::HashSet::new();
+        runs.iter()
+            .flat_map(|r| r.resident.iter())
+            .filter(|b| seen.insert(b.raw_addr()))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let runs = runs
+        .into_iter()
+        .map(|r| Run {
+            start: r.start,
+            command: r.command,
+            len: r.len,
+            range: Arc::new(IcbRange {
+                icb: icb.clone(),
+                resident: if plan_wide {
+                    everything.clone()
+                } else {
+                    r.resident
+                },
+            }),
+        })
+        .collect();
+
     Ok(Plan {
-        icb,
         command_of,
         runs,
         run_at,
         reference,
-        resident,
+        plan_resident: plan_resident.len(),
         barriers,
     })
+}
+
+/// Which residency set each run declares at its `executeCommandsInBuffer`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidencyArm {
+    /// The buffers the run's own commands bind. The default.
+    PerRun,
+    /// Every buffer the plan binds, at every run -- the pre-#688 declaration,
+    /// kept as the A/B's other arm. `LLOOM_688_RESIDENCY=plan-wide`.
+    PlanWide,
+}
+
+/// The arm in force, from `LLOOM_688_RESIDENCY`. Read at plan time, once.
+pub fn residency_arm() -> ResidencyArm {
+    match std::env::var("LLOOM_688_RESIDENCY").as_deref() {
+        Ok("plan-wide") => ResidencyArm::PlanWide,
+        _ => ResidencyArm::PerRun,
+    }
+}
+
+/// A run while its commands are being encoded.
+struct RunBuild {
+    start: usize,
+    command: usize,
+    len: usize,
+    resident: Vec<Buffer>,
+    seen: std::collections::HashSet<usize>,
+}
+
+impl RunBuild {
+    fn open(start: usize, command: usize) -> RunBuild {
+        RunBuild {
+            start,
+            command,
+            len: 0,
+            resident: Vec::new(),
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    /// A command in this run binds `buf`; declare it once per run.
+    fn bind(&mut self, buf: &Buffer) {
+        if self.seen.insert(buf.raw_addr()) {
+            self.resident.push(buf.clone());
+        }
+    }
 }
 
 fn pipeline_raw(p: &ComputePipeline) -> &ProtocolObject<dyn MTLComputePipelineState> {
@@ -1097,21 +1200,17 @@ impl Executor for IcbExecutor {
                     inner.poisoned.insert(run_index);
                     return DispatchAction::Encode;
                 }
-                let run = plan.runs[run_index];
-                let range = Arc::clone(
-                    inner
-                        .range
-                        .as_ref()
-                        .expect("a plan exists, so its IcbRange was built beside it"),
-                );
+                let run = &plan.runs[run_index];
+                let (start, command, len) = (run.start, run.command, run.len);
+                let range = Arc::clone(&run.range);
                 // Suppress the rest of this run: their commands run as part of
                 // the range being requested now.
-                inner.suppress_until = run.start + run.len;
+                inner.suppress_until = start + len;
                 inner.run_in_flight = run_index;
                 DispatchAction::ExecuteIcb {
                     icb: range,
-                    location: run.command,
-                    length: run.len,
+                    location: command,
+                    length: len,
                 }
             }
         }

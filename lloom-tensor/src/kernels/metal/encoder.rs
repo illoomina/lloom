@@ -667,10 +667,11 @@ impl ComputeCommandEncoder {
         location: usize,
         length: usize,
     ) {
-        // SAFETY: every resource an encoded command binds is in `resident` --
-        // the plan collects them as it encodes, so the set cannot fall behind
-        // the commands -- and residency has to be declared on *this* encoder,
-        // which is why it is done at every execute rather than once at install.
+        // SAFETY: every resource a command in this run binds is in the run's
+        // `resident` -- the plan collects them from the bindings as it encodes
+        // each command, so the set cannot fall behind the commands -- and
+        // residency has to be declared on *this* encoder, which is why it is
+        // done at every execute rather than once at install.
         // Omitting it is silent corruption rather than an error (`DESIGN.md`
         // §3.7), and unified memory can mask the omission.
         unsafe {

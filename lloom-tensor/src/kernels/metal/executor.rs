@@ -222,10 +222,11 @@ pub enum DispatchAction {
     },
 }
 
-/// An ICB and the resources its commands reference.
+/// An ICB and the resources the commands of one run reference.
 ///
-/// Bundled so a residency set cannot be forgotten at one of the call sites that
-/// executes a range -- there are as many of those as there are runs.
+/// Bundled so a residency set cannot be forgotten at the call site that executes
+/// a range, and one per run so that site declares the run's own buffers rather
+/// than the whole plan's (`DESIGN.md` §11.3w).
 pub struct IcbRange {
     pub icb: objc2::rc::Retained<
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>,

@@ -602,3 +602,130 @@ fn classical_never_reports_a_replayed_disposition() {
          second ordering source, so the axis has nothing to act on"
     );
 }
+
+/// Five `cos` dispatches with a classical one in the middle, so the covered
+/// positions form two runs: `[0, 1]` and `[3, 4]`.
+///
+/// Positions 0 and 1 bind `src -> a -> b`; positions 3 and 4 bind `a -> b -> a`.
+/// So `src` is bound by the first run only, which is what lets the test tell a
+/// per-run residency set from a plan-wide one by an absolute reference rather
+/// than by a count alone (`CONTRIBUTING.md` §3.1b). Returns the last output and
+/// the three buffers' addresses.
+fn run_two_runs(
+    steps: usize,
+    executor: Option<&Arc<IcbExecutor>>,
+    input: &[f32],
+) -> (Vec<f32>, [usize; 3]) {
+    let device = device();
+    let kernels = Kernels::new();
+    let cmds = commands(&device);
+    if let Some(e) = executor {
+        cmds.set_executor(Arc::new(ExecutorSlot::Custom(e.clone())));
+    }
+    let options = crate::kernels::RESOURCE_OPTIONS;
+    let bytes = std::mem::size_of_val(input);
+    let src = device
+        .new_buffer_with_data(input.as_ptr() as *const std::ffi::c_void, bytes, options)
+        .unwrap();
+    let a = device.new_buffer(bytes, options).unwrap();
+    let b = device.new_buffer(bytes, options).unwrap();
+    let packed = executor.is_some();
+
+    for _ in 0..steps {
+        {
+            let guard = cmds.command_encoder().unwrap();
+            let links: [(&crate::kernels::metal::Buffer, &crate::kernels::metal::Buffer); 5] =
+                [(&src, &a), (&a, &b), (&b, &a), (&a, &b), (&b, &a)];
+            for (i, (from, to)) in links.iter().enumerate() {
+                // Position 2 binds its scalars inline, so no ICB command can
+                // hold it (§3.7c) and the covered positions split around it.
+                if packed {
+                    set_default_param_style(if i == 2 {
+                        ParamStyle::Split
+                    } else {
+                        ParamStyle::Packed
+                    });
+                }
+                call_unary_contiguous(
+                    &device,
+                    &guard,
+                    &kernels,
+                    unary::contiguous::cos::FLOAT,
+                    std::mem::size_of::<f32>(),
+                    input.len(),
+                    BufferOffset {
+                        buffer: from,
+                        offset_in_bytes: 0,
+                    },
+                    to,
+                )
+                .unwrap();
+            }
+        }
+        cmds.flush_and_wait().unwrap();
+        if let Some(e) = executor {
+            e.end_step(&device).unwrap();
+        }
+    }
+
+    let ptr = a.contents() as *const f32;
+    // SAFETY: the command buffer has completed and `a` holds `input.len()` f32
+    // in shared storage -- the fifth link wrote it.
+    let out = unsafe { std::slice::from_raw_parts(ptr, input.len()) }.to_vec();
+    (out, [src.raw_addr(), a.raw_addr(), b.raw_addr()])
+}
+
+/// Each run's residency set is the buffers its own commands bind -- not the
+/// plan's.
+///
+/// `DESIGN.md` §11.3w: declaring the whole plan at every run head is
+/// `runs x |plan|` `useResource` calls per step, 28.5x what the runs touch. The
+/// absolute references here are the fixture's own geometry: run 0 binds
+/// `{src, a, b}` plus its two params blocks, run 1 binds `{a, b}` plus its two,
+/// the plan binds seven distinct buffers, and a plan-wide set would put `src`
+/// in run 1's declaration where its commands never bind it.
+#[test]
+fn each_run_declares_only_the_buffers_its_own_commands_bind() {
+    require_icb_support!("each_run_declares_only_the_buffers_its_own_commands_bind");
+    set_default_param_style(ParamStyle::Packed);
+    set_constants_pool_enabled(true);
+
+    let input: Vec<f32> = (0..512).map(|i| i as f32 / 16.0).collect();
+    let executor = IcbExecutor::new(2);
+    let (replayed, [src, a, b]) = run_two_runs(4, Some(&executor), &input);
+
+    set_default_param_style(ParamStyle::Split);
+    set_constants_pool_enabled(false);
+    let (classical, _) = run_two_runs(1, None, &input);
+
+    assert!(executor.is_replaying(), "nothing was replayed");
+    let coverage = executor.coverage();
+    assert_eq!(
+        (coverage.positions, coverage.covered, coverage.inline_constants),
+        (5, 4, 1),
+        "the fixture is four packed positions around one classical: {coverage:?}"
+    );
+    assert_eq!(executor.runs(), 2, "the classical position splits the covered set in two");
+    assert_eq!(executor.stale_positions(), 0);
+
+    let runs = executor.run_residency();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].len(), 5, "run 0: src, a, b and two params blocks: {:?}", runs[0]);
+    assert_eq!(runs[1].len(), 4, "run 1: a, b and two params blocks: {:?}", runs[1]);
+    assert_eq!(executor.plan_resident(), 7, "src, a, b and four params blocks");
+    assert_eq!(executor.residency_per_step(), 9, "5 + 4, against a plan-wide 2 x 7 = 14");
+    for run in &runs {
+        assert!(run.contains(&a) && run.contains(&b), "every command binds a or b: {run:?}");
+    }
+    assert!(runs[0].contains(&src), "run 0's first command reads src: {:?}", runs[0]);
+    assert!(
+        !runs[1].contains(&src),
+        "run 1 never binds src; declaring it there is the plan-wide set: {:?}",
+        runs[1]
+    );
+
+    // The replay still computes what the classical path did, with the narrower
+    // declaration. Non-vacuity beside the equality, per §3.7a.
+    assert!(distinct(&replayed) > 2, "{} distinct values", distinct(&replayed));
+    assert_eq!(replayed, classical, "replayed output differs from the classical path");
+}

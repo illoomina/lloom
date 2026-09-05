@@ -1445,6 +1445,39 @@ fn main() -> Result<()> {
             "ICB replay barriers: {icb_replay_barriers:?}  suppressed={}",
             candle::kernels::metal::trace::barriers_suppressed(),
         );
+        // The residency term (`DESIGN.md` §11.3w): what one replayed step
+        // declares, against what it would declare plan-wide, and what the
+        // encoder actually declared over the run. `useResource` is counted at
+        // the call site, so `per_step` here is a plan-time figure and the
+        // process-wide total is the observed one.
+        {
+            use candle::kernels::metal::trace;
+            let pool = candle::kernels::constants_pool()
+                .map(|p| p.counters())
+                .unwrap_or_default();
+            // The arm is named from the plan, not from the variable that
+            // selected it (§7.1a-i): per-run declares `per_step`, plan-wide
+            // declares `runs x plan_wide`.
+            let arm = if exec.residency_per_step() == exec.runs() * exec.plan_resident() {
+                "plan-wide"
+            } else {
+                "per-run"
+            };
+            println!(
+                "ICB residency arm={arm} per_step={} plan_wide={} runs={} execute_ranges={} \
+                 useResource_total={} pool_allocated={} pool_unchanged={} pool_rewritten={} \
+                 pool_detached={}",
+                exec.residency_per_step(),
+                exec.plan_resident(),
+                exec.runs(),
+                trace::execute_range_count(),
+                trace::use_resource_count(),
+                pool.allocated,
+                pool.unchanged,
+                pool.rewritten,
+                pool.detached,
+            );
+        }
         // Per kernel, with the reason attached, because the totals above cannot
         // distinguish a position that became *covered* from one that merely
         // changed which bucket excludes it. #103 gave `sdpa_vector` a packed

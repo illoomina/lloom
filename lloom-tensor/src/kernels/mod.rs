@@ -60,7 +60,7 @@ pub use metal::{ArenaCursor, ArenaOffsets, ARENA_DECLINED};
 // answer, so it should be as reachable as the executor that requires it.
 pub use metal::device::{pipelines_support_icb, set_pipelines_support_icb};
 // The ICB executor itself (`DESIGN.md` §17 Phase 2 item 10).
-pub use metal::icb::{BarrierScope, Coverage, IcbExecutor, ReplayBarriers};
+pub use metal::icb::{BarrierScope, Coverage, IcbExecutor, ReplayBarriers, ResidencyArm};
 // The scratch class's vocabulary (`DESIGN.md` §9.1, issue #71). Named rather
 // than arriving through a glob for the same reason as the line above: `Sizing`
 // is a compile-tier policy whose spellings must agree with the `[[host_name]]`

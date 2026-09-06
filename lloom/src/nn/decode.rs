@@ -1223,10 +1223,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// construction and a near-miss on the constants keys a *different* cache
     /// entry — the real forward would still compile cold. Running the production
     /// `forward` cannot miss a pipeline that same `forward` will later use for
-    /// the same shape bucket. The buckets are coarse (§13.5c: `m < 16` → 32×32,
-    /// `m >= 16` → the 64-tile), so one prefill across the `m >= 16` boundary
-    /// plus one decode step covers the set; [`WARMUP_PREFILL_LEN`] is chosen to
-    /// cross it.
+    /// the same shape bucket. The buckets are coarse (§13.5c: `m < 16` → the
+    /// 32×32 skinny tile, `m >= 16` → the 64-tile, `m == 1` → GEMV), but there
+    /// are **three**, not two: a single prefill sits on one side of the `m >= 16`
+    /// boundary (it is all one `m`) and the decode step is the GEMV, so
+    /// `1 < m < 16` is covered by neither. A short prefill
+    /// ([`WARMUP_PREFILL_SHORT_LEN`]) compiles the skinny tile, a
+    /// [`WARMUP_PREFILL_LEN`] prefill the 64-tile, and the decode step the GEMV —
+    /// the set every real run actually takes.
     ///
     /// Token id `0` is always a valid vocabulary index. The forward's output is
     /// discarded — only its compilation side effect is wanted — and
@@ -1243,16 +1247,33 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         M::Cache: CacheReset,
     {
-        // Prefill across the m >= 16 tile boundary (§13.5c), then one decode
-        // step — the same two shape buckets every real run takes.
+        // Prefill on BOTH sides of the m >= 16 tile boundary (§13.5c), then one
+        // decode step — the three shape buckets a real run takes, not two. A
+        // single len-`WARMUP_PREFILL_LEN` prefill is entirely `m = 32`, so it
+        // compiles only the `m >= 16` 64-tile; a decode step is `m = 1` (GEMV).
+        // Neither exercises `1 < m < 16`, so the `m < 16` **32×32 skinny tile**
+        // (`TILE_16_32_16_2_2`) was left cold and every short prompt — anything
+        // under 16 tokens — compiled it inside its own timed prefill (~2 ms,
+        // §13.1i), which is a fresh cost every process since the pipeline cache
+        // does not survive one. The skinny tile's `align_m = m % bm` constant is
+        // `false` for every `m < 16` (`bm = 16`, so `m % 16 = m != 0`), so one
+        // short prefill compiles the single variant they all need.
+        let short_tokens = vec![0u32; WARMUP_PREFILL_SHORT_LEN];
+        let short = Tensor::new(short_tokens.as_slice(), device)?.unsqueeze(0)?;
+        let _ = self.model.forward(&short, 0, &mut self.seq.cache)?;
+
         let prefill_tokens = vec![0u32; WARMUP_PREFILL_LEN];
         let prefill = Tensor::new(prefill_tokens.as_slice(), device)?.unsqueeze(0)?;
-        let _ = self.model.forward(&prefill, 0, &mut self.seq.cache)?;
-
-        let decode = Tensor::new(&[0u32], device)?.unsqueeze(0)?;
         let _ = self
             .model
-            .forward(&decode, WARMUP_PREFILL_LEN, &mut self.seq.cache)?;
+            .forward(&prefill, WARMUP_PREFILL_SHORT_LEN, &mut self.seq.cache)?;
+
+        let decode = Tensor::new(&[0u32], device)?.unsqueeze(0)?;
+        let _ = self.model.forward(
+            &decode,
+            WARMUP_PREFILL_SHORT_LEN + WARMUP_PREFILL_LEN,
+            &mut self.seq.cache,
+        )?;
 
         // Force the driver to finish compiling before the clock the caller is
         // about to stop; a cold pipeline creation left in flight would surface
@@ -1274,8 +1295,18 @@ const CENSUS_ROUND: u64 = 6;
 
 /// Prefill length for [`Session::warmup`], chosen to cross the
 /// `select_tile_config` `m >= 16` boundary (`DESIGN.md` §13.5c) so the warmup
-/// compiles the prefill GEMM tile the real path will use, not a smaller one.
+/// compiles the `m >= 16` 64-tile the long-prompt path uses.
 pub const WARMUP_PREFILL_LEN: usize = 32;
+
+/// Short prefill length for [`Session::warmup`], on the `m < 16` side of the tile
+/// boundary so the warmup also compiles the **skinny tile** (`TILE_16_32_16_2_2`,
+/// §13.5c) that every prompt under 16 tokens takes. Any `1 < m < 16` works and
+/// compiles the same pipeline — the tile's `align_m = m % bm` constant is `false`
+/// for all of them (`bm = 16`) — so a single short prefill covers the bucket.
+/// Without this, a short prompt compiled the skinny tile inside its own timed
+/// prefill (~2 ms cold, §13.1i), a fresh cost each process (the pipeline cache
+/// does not outlive one) and the whole of the short-prompt TTFT regression.
+pub const WARMUP_PREFILL_SHORT_LEN: usize = 8;
 
 /// The device's `(libraries, pipelines)` cache sizes, or `(0, 0)` off Metal.
 fn cache_sizes(device: &Device) -> (usize, usize) {

@@ -543,25 +543,56 @@ impl IcbExecutor {
         if let Some(pool) = crate::kernels::kernels::params::constants_pool() {
             pool.reset();
         }
-        let mut inner = self.inner.lock();
-        inner.position = 0;
-        // Per-step, not cumulative: a run's suppression window belongs to the
-        // step that opened it. `poisoned` is deliberately *not* reset -- a run
-        // that went stale once is not re-armed, see `dispatch_action`.
-        inner.suppress_until = 0;
-        inner.run_in_flight = 0;
-        match inner.phase {
-            Phase::Recording => {
-                let step = std::mem::take(&mut inner.recording.current);
-                inner.recording.pending.clear();
-                inner.recording.pending_retained.clear();
-                inner.recording.pending_pipeline = None;
+        // The recorded steps and the scope, taken out from under the lock when
+        // the window is complete, so the device work in `build_plan`
+        // (`encode_plan`) runs with `inner` released. `None` unless this step
+        // completes the recording.
+        let to_build: Option<(Vec<Vec<StepDispatch>>, BarrierScope)> = {
+            let mut inner = self.inner.lock();
+            inner.position = 0;
+            // Per-step, not cumulative: a run's suppression window belongs to the
+            // step that opened it. `poisoned` is deliberately *not* reset -- a run
+            // that went stale once is not re-armed, see `dispatch_action`.
+            inner.suppress_until = 0;
+            inner.run_in_flight = 0;
+            match inner.phase {
+                Phase::Recording => {
+                    let step = std::mem::take(&mut inner.recording.current);
+                    inner.recording.pending.clear();
+                    inner.recording.pending_retained.clear();
+                    inner.recording.pending_pipeline = None;
 
-                if inner.warm_in > 0 {
-                    inner.warm_in -= 1;
-                    inner.warm_in_skipped += 1;
-                    return Ok(());
+                    if inner.warm_in > 0 {
+                        inner.warm_in -= 1;
+                        inner.warm_in_skipped += 1;
+                        None
+                    } else {
+                        Self::accumulate_recording(&mut inner, step)
+                    }
                 }
+                Phase::Replaying => None,
+            }
+        };
+
+        // Device work with `inner` released; re-lock only to store the result.
+        if let Some((steps, scope)) = to_build {
+            let (coverage, plan) = Inner::build_plan(device, &steps, scope)?;
+            let mut inner = self.inner.lock();
+            inner.coverage = coverage;
+            inner.plan = plan;
+            inner.phase = Phase::Replaying;
+        }
+        Ok(())
+    }
+
+    /// Push `step` into the recording and, if the window is now complete, return
+    /// the steps to build a plan from (and the scope), taken out so the caller
+    /// can build with the lock released. Runs under the `inner` lock.
+    fn accumulate_recording(
+        inner: &mut Inner,
+        step: Vec<StepDispatch>,
+    ) -> Option<(Vec<Vec<StepDispatch>>, BarrierScope)> {
+        {
 
                 // The first window an executor sees is partial by construction:
                 // it opens wherever the caller installed the executor, which is
@@ -609,14 +640,18 @@ impl IcbExecutor {
                     }
                 }
 
-                if inner.recording.steps.len() >= inner.record_steps {
-                    inner.build_plan(device)?;
-                    inner.phase = Phase::Replaying;
-                }
+            if inner.recording.steps.len() >= inner.record_steps {
+                // Window complete: hand the steps and scope back so the caller
+                // builds the plan with the lock released, then re-locks to store
+                // it and flip to `Replaying`.
+                Some((
+                    std::mem::take(&mut inner.recording.steps),
+                    inner.barrier_scope,
+                ))
+            } else {
+                None
             }
-            Phase::Replaying => {}
         }
-        Ok(())
     }
 
     /// Coverage as observed, once a plan exists.
@@ -723,11 +758,19 @@ impl IcbExecutor {
 
 impl Inner {
     /// Decide what is replayable and encode it.
+    /// Build the replay plan from the recorded steps — the device work
+    /// (`encode_plan`, which allocates and encodes an `MTLIndirectCommandBuffer`)
+    /// is here, and it is deliberately **not** a `&mut self` method: `end_step`
+    /// takes the steps out from under the `inner` lock, drops the lock, calls
+    /// this, then re-locks briefly to store the result. Holding `inner` across
+    /// `encode_plan` would be a lock held across device work that commits and can
+    /// fire a driver-thread completion handler — a latent cross-thread deadlock
+    /// (the reason this was hoisted out).
     fn build_plan(
-        &mut self,
         device: &crate::kernels::metal::Device,
-    ) -> Result<(), crate::kernels::MetalKernelError> {
-        let steps = &self.recording.steps;
+        steps: &[Vec<StepDispatch>],
+        barrier_scope: BarrierScope,
+    ) -> Result<(Coverage, Option<Plan>), crate::kernels::MetalKernelError> {
         let n = steps[0].len();
         // A step whose dispatch count differs is not a steady-state step, and
         // comparing position-by-position across two different lengths would
@@ -800,12 +843,10 @@ impl Inner {
                 &steps[0],
                 &covered_positions,
                 n,
-                self.barrier_scope,
+                barrier_scope,
             )?)
         };
-        self.coverage = coverage;
-        self.plan = plan;
-        Ok(())
+        Ok((coverage, plan))
     }
 }
 

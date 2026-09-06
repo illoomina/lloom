@@ -43,7 +43,7 @@ pub use indexing::*;
 pub use indexing_names::IndexingKernel;
 pub use mlx_gemm::{
     call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_epilogue, call_mlx_gemv_full, call_mlx_gemv_with,
-    GemmDType, GemvEpilogue, GemvRmsNorm,
+    GemmDType, GemvEpilogue, GemvRmsNorm, SKINNY_TILE_MAX_M,
 };
 pub use scratch::{
     call_scratch_combine, call_scratch_partials, call_scratch_report, ScratchKernel, ScratchParams,

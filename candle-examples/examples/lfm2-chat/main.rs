@@ -896,6 +896,44 @@ fn main() -> Result<()> {
     // sampled in step 0). This is where the mmap'd weights fault in, so a cold
     // run's TTFT carries the load the `[loaded …]` line above deferred.
     let ttft_ms = (st.prefill_ns + st.step_ns.first().copied().unwrap_or(0)) as f64 / 1e6;
+    // The two TTFT terms apart, and the first steps by phase: `prefill_ns` is
+    // the prompt's encode, and under `lookahead = 1` step 0's EOS wait is where
+    // the prefill's GPU tail lands, so the split says which side a first-token
+    // cost sits on.
+    let ms = |ns: u64| ns as f64 / 1e6;
+    eprintln!(
+        "[ttft split: prefill {:.2} ms + step0 {:.2} ms; step_ns[1..={}] = {}; prompt_tokens={}]",
+        ms(st.prefill_ns),
+        ms(st.step_ns.first().copied().unwrap_or(0)),
+        st.step_ns.len().min(5).saturating_sub(1),
+        st.step_ns
+            .iter()
+            .skip(1)
+            .take(4)
+            .map(|&n| format!("{:.2}", ms(n)))
+            .collect::<Vec<_>>()
+            .join(" "),
+        prompt_ids.len(),
+    );
+    for (name, census) in [("prefill", &st.prefill_census), ("step 0", &st.step0_census)] {
+        if census.is_empty() {
+            continue;
+        }
+        let total: u64 = census.iter().map(|(_, n)| n).sum();
+        eprintln!("[{name} census: {total} dispatches, {} kernels]", census.len());
+        for (label, n) in census {
+            eprintln!("    {n:>6}  {label}");
+        }
+    }
+    for (i, p) in st.first_steps.iter().enumerate() {
+        eprintln!(
+            "[step {i} phases: sample {:.2} ms, forward {:.2} ms, backpressure {:.2} ms, eos_wait {:.2} ms]",
+            ms(p.sample_ns),
+            ms(p.forward_ns),
+            ms(p.backpressure_ns),
+            ms(p.eos_ns)
+        );
+    }
     // Bold bright-cyan on the figures worth eyeballing (the reset closes it), so
     // they stand out when scanning a terminal. `\x1b[1;96m` = bold + bright cyan,
     // `\x1b[0m` = reset. Only the numbers are wrapped; the labels stay plain.

@@ -32,7 +32,7 @@ pub use kernels::{
     call_mlx_gemv_full, call_mlx_gemv_with, cast::*, convolution::*, fill::*, flash_decoding::*,
     indexing::*, quantized::*, random::*, reduce::*, scratch::*, sdpa::*, sort::*, ternary::*,
     unary, unary::*, ConvKernel, GemmDType, GemvEpilogue, GemvRmsNorm, GgmlDType, IndexingKernel,
-    ParamStyle, ReduceKernel, SdpaQuantParams, SdpaQuantWriteParams,
+    ParamStyle, ReduceKernel, SdpaQuantParams, SdpaQuantWriteParams, SKINNY_TILE_MAX_M,
 };
 // The binding-style default, so a harness can reach the packed entry points
 // without every `call_*` growing an argument (issue #115). Named rather than

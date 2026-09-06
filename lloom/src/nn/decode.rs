@@ -164,7 +164,69 @@ pub struct DecodeStats {
     pub readback: ReadbackCounters,
     /// One entry per speculative round, empty on the baseline body.
     pub rounds: Vec<RoundStats>,
+    /// The first [`FIRST_STEPS_TRACED`] steps' host time, by phase, on the
+    /// `lookahead = 1` arm; empty on `lookahead = 0` and the speculative bodies.
+    pub first_steps: Vec<StepPhases>,
+    /// The prefill's dispatch census, `(kernel, count)`, under
+    /// `CANDLE_METAL_PROFILE=1`; empty otherwise and off Metal.
+    pub prefill_census: Vec<(String, u64)>,
+    /// Step 0's dispatch census, on the same terms.
+    pub step0_census: Vec<(String, u64)>,
 }
+
+/// The per-kernel dispatch counts so far, under `CANDLE_METAL_PROFILE=1`.
+/// `None` when the census is off, which is every timed run.
+fn census_snapshot() -> Option<std::collections::HashMap<String, u64>> {
+    #[cfg(feature = "metal")]
+    {
+        use lloom_tensor::kernels::metal::profile;
+        if profile::enabled() {
+            return Some(profile::snapshot().by_label.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// The dispatches between two census snapshots, sorted by count.
+fn census_delta(
+    before: &Option<std::collections::HashMap<String, u64>>,
+    after: Option<std::collections::HashMap<String, u64>>,
+) -> Vec<(String, u64)> {
+    let (Some(before), Some(after)) = (before, after) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, u64)> = after
+        .into_iter()
+        .filter_map(|(k, n)| {
+            let d = n - before.get(&k).copied().unwrap_or(0);
+            (d > 0).then_some((k, d))
+        })
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    out
+}
+
+/// Where one decode step's host time went, for the first few steps of a run.
+///
+/// TTFT is `prefill_ns + step_ns[0]`, and the first step is not a steady-state
+/// step: under `lookahead = 1` its EOS wait is where the prefill's GPU tail
+/// lands, and its forward is the first at the decode shape. The four brackets
+/// say which term carries a first-token cost; the sum is `step_ns[i]` minus
+/// the loop's own bookkeeping.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StepPhases {
+    /// `sample_and_feed`: the argmax and the ring publish, encode only.
+    pub sample_ns: u64,
+    /// The forward pass, encode only.
+    pub forward_ns: u64,
+    /// `apply_backpressure`: zero unless the host outran the GPU.
+    pub backpressure_ns: u64,
+    /// `eos_of_last`: the wait for this step's token to be published.
+    pub eos_ns: u64,
+}
+
+/// How many leading steps [`DecodeStats::first_steps`] brackets.
+pub const FIRST_STEPS_TRACED: u64 = 4;
 
 /// The outcome of one decode run.
 #[derive(Debug, Clone)]
@@ -433,6 +495,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // Prefill: the whole prompt in one pass. Its GPU tail lands in the
         // first decode steps; what is timed here is the submission.
         let pos_before = self.seq.pos;
+        let census_before = census_snapshot();
         let prefill_start = std::time::Instant::now();
         let mut logits = match self.seq.last_logits.take() {
             Some(held) if resume => held,
@@ -449,6 +512,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         };
         end_executor_step(&device)?;
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
+        let census_prefill = census_snapshot();
+        stats.prefill_census = census_delta(&census_before, census_prefill.clone());
 
         let mut produced = 0usize;
         let mut since_commit = 0usize;
@@ -527,10 +592,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // ENQUEUE, then learn. The GPU has this forward queued before
                 // it retires the previous one. The pacer bounds the enqueue:
                 // an arm with no per-token wait would otherwise run ahead
-                // without limit.
+                // without limit (#690's marker pacer, replacing the removed
+                // `apply_backpressure` spin).
+                let t_sample = sample_start.elapsed().as_nanos() as u64;
                 if pace {
                     pacer.before_forward(&device)?;
                 }
+                let t = std::time::Instant::now();
                 begin_decode_step(&device);
                 logits = self
                     .model
@@ -538,10 +606,28 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     .squeeze(0)?;
                 end_decode_step(&device)?;
                 self.seq.pos += 1;
+                let t_forward = t.elapsed().as_nanos() as u64;
+                // The in-flight bound AFTER the enqueue: retire the oldest
+                // marker if the host would exceed `IN_FLIGHT_STEPS` ahead. This
+                // is #690's pacer (Metal completion), which replaced the
+                // unbounded counter-spin `apply_backpressure` livelocked on.
+                // `backpressure_ns` reports what that bound cost this step.
+                let t = std::time::Instant::now();
                 if pace {
                     pacer.after_forward(&device)?;
                 }
-                if readback.eos_of_last()? {
+                let t_backpressure = t.elapsed().as_nanos() as u64;
+                let t = std::time::Instant::now();
+                let is_eos = readback.eos_of_last()?;
+                if stats.steps <= FIRST_STEPS_TRACED {
+                    stats.first_steps.push(StepPhases {
+                        sample_ns: t_sample,
+                        forward_ns: t_forward,
+                        backpressure_ns: t_backpressure,
+                        eos_ns: t.elapsed().as_nanos() as u64,
+                    });
+                }
+                if is_eos {
                     produced -= 1;
                     eos = true;
                     break;
@@ -616,6 +702,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
             end_executor_step(&device)?;
             stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
+            if stats.steps == 1 {
+                stats.step0_census = census_delta(&census_prefill, census_snapshot());
+            }
         }
 
         // After the clock: EVERY id not yet drained — `drain_all`, not the
@@ -1292,14 +1381,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// construction and a near-miss on the constants keys a *different* cache
     /// entry — the real forward would still compile cold. Running the production
     /// `forward` cannot miss a pipeline that same `forward` will later use for
-    /// the same shape bucket. The buckets are coarse (§13.5c: `m < 16` → the
-    /// 32×32 skinny tile, `m >= 16` → the 64-tile, `m == 1` → GEMV), but there
-    /// are **three**, not two: a single prefill sits on one side of the `m >= 16`
-    /// boundary (it is all one `m`) and the decode step is the GEMV, so
-    /// `1 < m < 16` is covered by neither. A short prefill
-    /// ([`WARMUP_PREFILL_SHORT_LEN`]) compiles the skinny tile, a
-    /// [`WARMUP_PREFILL_LEN`] prefill the 64-tile, and the decode step the GEMV —
-    /// the set every real run actually takes.
+    /// the same shape bucket. The buckets are the row tiles `select_tile_config`
+    /// picks by `m` (§13.5o: 16 rows to `m` = 32, 64 rows above; `m == 1` is
+    /// the GEMV), each in an aligned (`m % bm == 0`) and an unaligned variant —
+    /// four pipelines a prefill can land on, none of which a decode step
+    /// touches. [`WARMUP_PREFILL_LENS`] is one prefill per variant, then the
+    /// decode step is the GEMV: the set every real run actually takes.
     ///
     /// Token id `0` is always a valid vocabulary index. The forward's output is
     /// discarded — only its compilation side effect is wanted — and
@@ -1316,33 +1403,21 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         M::Cache: CacheReset,
     {
-        // Prefill on BOTH sides of the m >= 16 tile boundary (§13.5c), then one
-        // decode step — the three shape buckets a real run takes, not two. A
-        // single len-`WARMUP_PREFILL_LEN` prefill is entirely `m = 32`, so it
-        // compiles only the `m >= 16` 64-tile; a decode step is `m = 1` (GEMV).
-        // Neither exercises `1 < m < 16`, so the `m < 16` **32×32 skinny tile**
-        // (`TILE_16_32_16_2_2`) was left cold and every short prompt — anything
-        // under 16 tokens — compiled it inside its own timed prefill (~2 ms,
-        // §13.1i), which is a fresh cost every process since the pipeline cache
-        // does not survive one. The skinny tile's `align_m = m % bm` constant is
-        // `false` for every `m < 16` (`bm = 16`, so `m % 16 = m != 0`), so one
-        // short prefill compiles the single variant they all need.
-        let short_tokens = vec![0u32; WARMUP_PREFILL_SHORT_LEN];
-        let short = Tensor::new(short_tokens.as_slice(), device)?.unsqueeze(0)?;
-        let _ = self.model.forward(&short, 0, &mut self.seq.cache)?;
-
-        let prefill_tokens = vec![0u32; WARMUP_PREFILL_LEN];
-        let prefill = Tensor::new(prefill_tokens.as_slice(), device)?.unsqueeze(0)?;
-        let _ = self
-            .model
-            .forward(&prefill, WARMUP_PREFILL_SHORT_LEN, &mut self.seq.cache)?;
+        // One prefill per GEMM pipeline variant a prompt can select (each row
+        // tile, aligned and unaligned), then one decode step for the GEMV. A
+        // variant left cold here is compiled inside the first prompt's own timed
+        // prefill (~2 ms, §13.1i), a fresh cost every process since the
+        // pipeline cache does not outlive one.
+        let mut pos = 0;
+        for &len in &WARMUP_PREFILL_LENS {
+            let tokens = vec![0u32; len];
+            let prefill = Tensor::new(tokens.as_slice(), device)?.unsqueeze(0)?;
+            let _ = self.model.forward(&prefill, pos, &mut self.seq.cache)?;
+            pos += len;
+        }
 
         let decode = Tensor::new(&[0u32], device)?.unsqueeze(0)?;
-        let _ = self.model.forward(
-            &decode,
-            WARMUP_PREFILL_SHORT_LEN + WARMUP_PREFILL_LEN,
-            &mut self.seq.cache,
-        )?;
+        let _ = self.model.forward(&decode, pos, &mut self.seq.cache)?;
 
         // Force the driver to finish compiling before the clock the caller is
         // about to stop; a cold pipeline creation left in flight would surface
@@ -1362,20 +1437,15 @@ impl<'m, M: CausalLM> Session<'m, M> {
 /// early enough that a short run still reaches it.
 const CENSUS_ROUND: u64 = 6;
 
-/// Prefill length for [`Session::warmup`], chosen to cross the
-/// `select_tile_config` `m >= 16` boundary (`DESIGN.md` §13.5c) so the warmup
-/// compiles the `m >= 16` 64-tile the long-prompt path uses.
-pub const WARMUP_PREFILL_LEN: usize = 32;
-
-/// Short prefill length for [`Session::warmup`], on the `m < 16` side of the tile
-/// boundary so the warmup also compiles the **skinny tile** (`TILE_16_32_16_2_2`,
-/// §13.5c) that every prompt under 16 tokens takes. Any `1 < m < 16` works and
-/// compiles the same pipeline — the tile's `align_m = m % bm` constant is `false`
-/// for all of them (`bm = 16`) — so a single short prefill covers the bucket.
-/// Without this, a short prompt compiled the skinny tile inside its own timed
-/// prefill (~2 ms cold, §13.1i), a fresh cost each process (the pipeline cache
-/// does not outlive one) and the whole of the short-prompt TTFT regression.
-pub const WARMUP_PREFILL_SHORT_LEN: usize = 8;
+/// The prefill lengths [`Session::warmup`] runs, one per GEMM pipeline variant
+/// a prompt can select: the 16-row tile unaligned and aligned (`m` = 8, 16)
+/// and the 64-row tile unaligned and aligned (40, 64) — `select_tile_config`
+/// picks the row tile by `m` (§13.5o) and `align_m = m % bm` keys a second
+/// pipeline per tile. A length here that stopped matching a variant would leave
+/// that variant cold on the first prompt that selects it, the ~2 ms §13.1i
+/// prices a pipeline creation at (measured 40 ms of `prefill_ns` at `m` = 64
+/// before this list carried the aligned 64-row variant, §13.5o).
+pub const WARMUP_PREFILL_LENS: [usize; 4] = [8, 16, 40, 64];
 
 /// The device's `(libraries, pipelines)` cache sizes, or `(0, 0)` off Metal.
 fn cache_sizes(device: &Device) -> (usize, usize) {

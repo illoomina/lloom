@@ -173,12 +173,17 @@ fn derive_gemv_tile(out_vec_size: usize, in_vec_size: usize) -> (usize, usize, u
     }
 }
 
-/// The `m` below which `select_tile_config` takes the skinny tile
-/// (`TILE_16_32_16_2_2` as of issue #675; `TILE_32_32_16_2_2` before it).
+/// The largest `m` `select_tile_config` serves with the 16-row tile
+/// (`TILE_16_32_16_2_2`), inclusive. Measured cheapest of the three
+/// instantiated row tiles at every `m` to 32 and at 33..48; 64-row wins at 64
+/// and 49..63 is unmeasured, so the band ends where the canonical 34-token
+/// determinism prefill stays on its recorded tile (§13.5o).
+pub const SKINNY_TILE_MAX_M: usize = 32;
+
+/// The `m` below which `select_tile_config` takes the 16-row skinny tile.
 ///
-/// **16 is what ships**, which is `select_tile_config`'s own literal and what
-/// every recorded figure in this repository belongs to. `LLOOM_364_SKINNY_MAX`
-/// raises it for issue #364's threshold arm and is read **once**.
+/// `SKINNY_TILE_MAX_M + 1` is what ships (§13.5o). `LLOOM_364_SKINNY_MAX`
+/// moves it for issue #364's threshold arm and is read **once**.
 ///
 /// An unparseable value **panics** rather than falling back to the default:
 /// `DESIGN.md` §2.4 — *"make an invalid setting panic rather than fall back
@@ -191,7 +196,7 @@ fn skinny_max() -> usize {
         Ok(v) => v
             .parse()
             .unwrap_or_else(|_| panic!("LLOOM_364_SKINNY_MAX must be an integer, got {v:?}")),
-        Err(_) => 16,
+        Err(_) => SKINNY_TILE_MAX_M + 1,
     })
 }
 
@@ -287,12 +292,11 @@ fn select_tile_config(
         return tile;
     }
 
-    // Small M: the narrowest instantiated tile, 16×32. A BM-row tile pads `m`
-    // to BM, and a tiled GEMM at small `m` is thread-bound, so the padding is
-    // the cost (§13.5n). Above the threshold the larger tiles are measured
-    // dearer at their own boundary (§13.5c); `LLOOM_364_SKINNY_MAX` is that
-    // measurement's arm, read once (`OnceLock`), off by default (§7.1a).
-    // `LLOOM_383_TILE` pins the tile for an A/B.
+    // Small M: the 16-row tile. A BM-row tile pads `m` to BM and a tiled GEMM
+    // at small `m` is thread-bound (§13.5n), and two 16-row tiles still beat one
+    // 32- or 64-row tile up to the band's end (§13.5o); the 64-row selection
+    // below takes over above it. `LLOOM_364_SKINNY_MAX` moves the ceiling for
+    // an A/B, read once (`OnceLock`); `LLOOM_383_TILE` pins the tile outright.
     if m < skinny_max() {
         return TILE_16_32_16_2_2;
     }
@@ -1398,62 +1402,73 @@ mod tile_config_gate {
         );
     }
 
-    /// **The claim: `select_tile_config` returns the 16×32 tile below `m` = 16.**
+    /// **The claim: `select_tile_config` returns the 16×32 tile at every
+    /// `m` in 1..=32.**
     ///
     /// `DESIGN.md` §13.5n measured the instantiated 16-row tile a third cheaper
     /// than the 32×32 one at every `m` in 2..15 (batched decode) and on the
-    /// `m = 10` DSpark verify, and made it the selection below the threshold;
-    /// §13.5b's *"`m < 16` → `TILE_32_32_16_2_2` unconditionally"* describes the
-    /// tree before that. The contract is read here from the function rather
-    /// than from a comment beside it.
+    /// `m = 10` DSpark verify; §13.5o measured it against both wider tiles on
+    /// prefill at every `m` to 32 and closes the band there. The contract is
+    /// read here from the function rather than from a comment beside it.
     ///
     /// Every one of LFM2's 167 weight matmuls is asserted rather than a
     /// representative, because the claim is quantified over all 167 and the
     /// sites differ in `N_out` by 250× (512 to 128000).
     #[test]
-    fn below_the_threshold_every_lfm2_matmul_gets_the_16_32_tile() {
-        for m in 1..16 {
+    fn up_to_thirty_two_every_lfm2_matmul_gets_the_16_32_tile() {
+        for m in 1..=SKINNY_TILE_MAX_M {
             for (label, _, n, k) in SITES {
                 let t = tile_at(m, *n, *k);
                 assert_eq!(
                     (t.bm, t.bn, t.bk, t.wm, t.wn),
                     (16, 32, 16, 2, 2),
-                    "§13.5n: at m={m} the {label} matmul ({n}x{k}) must take \
+                    "§13.5o: at m={m} the {label} matmul ({n}x{k}) must take \
                      TILE_16_32_16_2_2; got {t:?}"
                 );
             }
         }
     }
 
-    /// **The claim: the threshold is exactly 16, and crossing it leaves BM=16.**
+    /// **The claim: the threshold is exactly at 32/33, and crossing it leaves
+    /// BM=16 for the 64-row tile.**
     ///
-    /// `DESIGN.md` §13.5c pins the boundary *"exact at 16, pinned by
-    /// bisection"* from a GPU census; this is the same boundary read off the
-    /// function with no GPU. **Both sides are asserted** (§8.1g): a test that
-    /// only checked the low side would pass on a function that returned the
-    /// 16×32 tile everywhere, which is precisely the `LLOOM_364_SKINNY_MAX`
-    /// arm and precisely the change §13.5c argues about. Above the threshold
-    /// the selection is exactly as #364 left it (§13.5n).
+    /// `DESIGN.md` §13.5c pinned the old `m < 16` boundary by bisection and
+    /// measured it 2× too low; §13.5o moves it to 32, the last `m` the sweep
+    /// resolved the 16-row tile cheapest at without moving the canonical
+    /// 34-token determinism prefill. **Both sides are asserted** (§8.1g): a test
+    /// that only checked the low side would pass on a function that returned the
+    /// 16×32 tile everywhere, which is precisely the `LLOOM_364_SKINNY_MAX` and
+    /// `LLOOM_383_TILE` arms. Above the threshold the selection is exactly as
+    /// #364 left it.
     #[test]
-    fn the_threshold_is_at_sixteen_and_the_tile_changes_across_it() {
+    fn the_threshold_is_at_thirty_two_and_the_tile_changes_across_it() {
         let (n, k) = (2048, 2048);
-        let below = tile_at(15, n, k);
-        let at = tile_at(16, n, k);
+        let shape = |t: TileConfig| (t.bm, t.bn, t.bk, t.wm, t.wn);
+        assert_eq!(SKINNY_TILE_MAX_M, 32, "§13.5o: the 16-row band ends at 32");
         assert_eq!(
-            (below.bm, below.bn),
-            (16, 32),
-            "§13.5n: m=15 is the last m on the 16x32 tile"
+            shape(tile_at(16, n, k)),
+            (16, 32, 16, 2, 2),
+            "m=16 (§13.5c's old cliff)"
         );
         assert_eq!(
-            (at.bm, at.bn, at.bk, at.wm, at.wn),
+            shape(tile_at(32, n, k)),
+            (16, 32, 16, 2, 2),
+            "m=32 is the last m on 16x32"
+        );
+        assert_eq!(
+            shape(tile_at(33, n, k)),
             (64, 32, 32, 2, 2),
-            "§13.5c: m=16 takes TILE_64_32_32_2_2 -- the larger tile, and the \
-             one measured +17.9 % of GPU busy for +6.7 % of work"
+            "m=33 takes TILE_64_32_32_2_2, #364's selection above the band"
+        );
+        assert_eq!(
+            shape(tile_at(34, n, k)),
+            (64, 32, 32, 2, 2),
+            "§2.3.8c's 34-token determinism prefill stays on the tile its digests were taken on"
         );
         assert_ne!(
-            (below.bm, below.bn, below.bk, below.wm, below.wn),
-            (at.bm, at.bn, at.bk, at.wm, at.wn),
-            "the boundary must be a boundary: if these agree, every §13.5c \
+            shape(tile_at(32, n, k)),
+            shape(tile_at(33, n, k)),
+            "the boundary must be a boundary: if these agree, every §13.5c/§13.5o \
              figure is a comparison of a tile against itself"
         );
     }

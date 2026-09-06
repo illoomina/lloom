@@ -12,7 +12,7 @@ use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 // Use Retained when appropriate. Gives us a more elegant way of handling memory (peaks) than autoreleasepool.
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
@@ -121,7 +121,7 @@ impl CutPolicy {
 
 /// Callbacks run after each command buffer completes. See
 /// [`Commands::on_command_buffer_complete`].
-type CompletionSubscribers = Arc<Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>>;
+type CompletionSubscribers = Arc<parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>>;
 
 fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, MetalKernelError> {
     command_queue.commandBuffer().map(CommandBuffer::new).ok_or(
@@ -131,7 +131,7 @@ fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, 
 
 /// RAII guard for compute command encoder operations.
 pub struct CommandsGuard<'a> {
-    guard: MutexGuard<'a, EntryState>,
+    guard: parking_lot::MutexGuard<'a, EntryState>,
 }
 
 impl AsRef<ComputeCommandEncoder> for CommandsGuard<'_> {
@@ -158,7 +158,7 @@ impl CommandsGuard<'_> {
 
 /// RAII guard for blit command encoder operations.
 pub struct BlitCommandsGuard<'a> {
-    _guard: MutexGuard<'a, EntryState>,
+    _guard: parking_lot::MutexGuard<'a, EntryState>,
     state: BlitCommandEncoder,
 }
 
@@ -254,7 +254,7 @@ pub struct Commands {
     /// 128 B *once* for the process and retrofitting a layout after a
     /// concurrency change is how the measurement gets attributed to the wrong
     /// thing.
-    state: CachePadded<Mutex<EntryState>>,
+    state: CachePadded<parking_lot::Mutex<EntryState>>,
     /// Its own line -- see `state` above.
     compute_count: CachePadded<AtomicUsize>,
     command_queue: CommandQueue,
@@ -290,7 +290,7 @@ pub struct Commands {
     /// a HashSet to deduplicate them, on every encoder. Maintaining it here makes
     /// encoder creation proportional to the number of distinct fences instead,
     /// which is typically small.
-    live_fences: Arc<Mutex<Vec<LiveFence>>>,
+    live_fences: Arc<parking_lot::Mutex<Vec<LiveFence>>>,
     /// How far the GPU has got through the command buffers submitted here.
     ///
     /// Shared with the buffer pools, which use it to decide when a released
@@ -310,7 +310,7 @@ pub struct Commands {
     /// setup-time action on a `&Commands` that is already shared; it is never
     /// touched per dispatch, because the encoder holds its own `Arc` to the
     /// slot from creation.
-    executor: Mutex<Arc<ExecutorSlot>>,
+    executor: parking_lot::Mutex<Arc<ExecutorSlot>>,
     /// How the host waits for a committed command buffer (`DESIGN.md` §11.5o,
     /// issue #559).
     ///
@@ -492,18 +492,18 @@ impl Commands {
         };
 
         Ok(Self {
-            state: CachePadded::new(Mutex::new(EntryState::new(cb))),
+            state: CachePadded::new(parking_lot::Mutex::new(EntryState::new(cb))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
             command_queue,
             compute_per_buffer,
             cut_policy,
             node_cut_pending: AtomicBool::new(false),
             device,
-            prev_ce_outputs: Arc::new(Mutex::new(HashMap::new())),
-            live_fences: Arc::new(Mutex::new(Vec::new())),
+            prev_ce_outputs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            live_fences: Arc::new(parking_lot::Mutex::new(Vec::new())),
             clock: Arc::new(GpuClock::new()),
-            on_complete: Arc::new(Mutex::new(Vec::new())),
-            executor: Mutex::new(Arc::new(ExecutorSlot::Classical)),
+            on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
             completion_wait,
             completion_event,
             completion_polls: AtomicU64::new(0),
@@ -578,17 +578,13 @@ impl Commands {
     /// encoder holds its slot from creation so that the per-dispatch path never
     /// has to take this lock. Call before encoding the work being measured.
     pub fn set_executor(&self, executor: Arc<ExecutorSlot>) {
-        if let Ok(mut slot) = self.executor.lock() {
-            *slot = executor;
-        }
+        // `parking_lot` guards are infallible -- no `Ok` to match.
+        *self.executor.lock() = executor;
     }
 
     /// The executor currently installed.
     pub fn executor(&self) -> Arc<ExecutorSlot> {
-        self.executor
-            .lock()
-            .map(|e| Arc::clone(&e))
-            .unwrap_or_else(|_| Arc::new(ExecutorSlot::Classical))
+        Arc::clone(&self.executor.lock())
     }
 
     /// The clock the buffer pools decide reuse against.
@@ -603,9 +599,7 @@ impl Commands {
     /// flight, and a buffer parked against one of those epochs would never be
     /// swept in.
     pub fn on_command_buffer_complete<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        if let Ok(mut subs) = self.on_complete.lock() {
-            subs.push(Arc::new(f));
-        }
+        self.on_complete.lock().push(Arc::new(f));
     }
 
     /// The cut policy in force (`DESIGN.md` §13.5m).
@@ -678,7 +672,7 @@ impl Commands {
     }
 
     pub fn command_encoder(&self) -> Result<CommandsGuard<'_>, MetalKernelError> {
-        let mut state_guard = self.state.lock().unwrap();
+        let mut state_guard = self.state.lock();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
 
@@ -718,7 +712,7 @@ impl Commands {
     }
 
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
-        let mut state_guard = self.state.lock().unwrap();
+        let mut state_guard = self.state.lock();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = self.should_cut(count);
 
@@ -746,7 +740,7 @@ impl Commands {
         // why the per-buffer waits in `copy_from_buffer` / `fill_buffer` are not
         // redundant with this one.
         {
-            let fences = self.live_fences.lock().unwrap();
+            let fences = self.live_fences.lock();
             for live in fences.iter() {
                 encoder.wait_for_fence(&live.fence);
             }
@@ -764,7 +758,7 @@ impl Commands {
 
     pub fn flush_and_wait(&self) -> Result<(), MetalKernelError> {
         let to_wait = {
-            let mut state = self.state.lock()?;
+            let mut state = self.state.lock();
             if self.compute_count.load(Ordering::Acquire) > 0 {
                 self.commit_swap_locked(&mut state, 0)?;
             }
@@ -788,8 +782,8 @@ impl Commands {
             }
         }
 
-        self.prev_ce_outputs.lock()?.clear();
-        self.live_fences.lock()?.clear();
+        self.prev_ce_outputs.write().clear();
+        self.live_fences.lock().clear();
 
         Ok(())
     }
@@ -806,7 +800,7 @@ impl Commands {
     /// path blocks.
     pub fn flush_and_wait_current(&self) -> Result<(), MetalKernelError> {
         let (cb, signalled) = {
-            let mut state = self.state.lock()?;
+            let mut state = self.state.lock();
             let signalled = self.commit_swap_locked(&mut state, 0)?;
             (state.in_flight.last().cloned(), signalled)
         };
@@ -832,7 +826,7 @@ impl Commands {
             self.completion_already_complete
                 .fetch_add(outcome.already_complete, Ordering::Relaxed);
             // queue is FIFO: everything committed before cb is done too
-            let mut state = self.state.lock()?;
+            let mut state = self.state.lock();
             state
                 .in_flight
                 .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
@@ -849,7 +843,7 @@ impl Commands {
     /// the reason a readback in one sequence's round stalls behind another
     /// sequence's queued work.
     pub fn flush_marker(&self) -> Result<CommandMarker, MetalKernelError> {
-        let mut state = self.state.lock()?;
+        let mut state = self.state.lock();
         let signalled = self.commit_swap_locked(&mut state, 0)?;
         let cb = state.in_flight.last().cloned().ok_or_else(|| {
             MetalKernelError::CommandBufferError(
@@ -876,7 +870,7 @@ impl Commands {
             .fetch_add(outcome.fired, Ordering::Relaxed);
         self.completion_already_complete
             .fetch_add(outcome.already_complete, Ordering::Relaxed);
-        let mut state = self.state.lock()?;
+        let mut state = self.state.lock();
         state
             .in_flight
             .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
@@ -884,7 +878,7 @@ impl Commands {
     }
 
     pub fn flush(&self) -> Result<(), MetalKernelError> {
-        let mut state = self.state.lock()?;
+        let mut state = self.state.lock();
         if self.compute_count.load(Ordering::Acquire) > 0 {
             self.commit_swap_locked(&mut state, 0)?;
         }
@@ -918,7 +912,7 @@ impl Commands {
     /// an instrument that cannot be shown to have engaged has not measured
     /// anything).
     pub fn flush_and_prune(&self) -> Result<usize, MetalKernelError> {
-        let mut state = self.state.lock()?;
+        let mut state = self.state.lock();
         if self.compute_count.load(Ordering::Acquire) > 0 {
             self.commit_swap_locked(&mut state, 0)?;
         }
@@ -959,7 +953,7 @@ impl Commands {
     /// have grown without a commit the caller made.
     #[cfg(test)]
     pub(crate) fn in_flight_len(&self) -> Result<usize, MetalKernelError> {
-        Ok(self.state.lock()?.in_flight.len())
+        Ok(self.state.lock().in_flight.len())
     }
 
     /// Commit the current buffer, swap in a fresh one, and return the value the
@@ -1013,11 +1007,7 @@ impl Commands {
         match state.current.status() {
             MTLCommandBufferStatus::NotEnqueued | MTLCommandBufferStatus::Enqueued => {
                 let clock = Arc::clone(&self.clock);
-                let subs: Vec<_> = self
-                    .on_complete
-                    .lock()
-                    .map(|s| s.clone())
-                    .unwrap_or_default();
+                let subs: Vec<_> = self.on_complete.lock().clone();
                 state.current.on_completion(move || {
                     // Order matters: the clock must show the epoch finished
                     // before subscribers look, or they find nothing drainable
@@ -1150,13 +1140,16 @@ impl Commands {
         use objc2_metal::MTLComputeCommandEncoder as _;
 
         let all_outputs = {
-            let s = encoder.state.lock().unwrap();
+            let s = encoder.state.lock();
             s.all_outputs.clone()
         };
 
         {
-            let mut prev_ce_outputs = self.prev_ce_outputs.lock().unwrap();
-            let mut fences = self.live_fences.lock().unwrap();
+            // Encode-thread write, once per encoder close (registers this
+            // encoder's outputs). Rare against the per-bind reads (issue: H2).
+            // `parking_lot` guards are infallible -- no `unwrap`.
+            let mut prev_ce_outputs = self.prev_ce_outputs.write();
+            let mut fences = self.live_fences.lock();
             let this_ptr = Arc::as_ptr(&encoder.fence) as usize;
             let mut claimed = 0usize;
 
@@ -1191,8 +1184,13 @@ impl Commands {
             let map_for_cleanup = Arc::clone(&self.prev_ce_outputs);
             let fences_for_cleanup = Arc::clone(&self.live_fences);
             let block = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                let mut map = map_for_cleanup.lock().unwrap();
-                let mut fences = fences_for_cleanup.lock().unwrap();
+                // The cross-thread writer (issue: H2). This runs on a Metal
+                // completion (driver) thread and removes this encoder's entries;
+                // it is the write the per-bind reads on the encode thread
+                // contend with, so it takes the write lock while they take read.
+                // `parking_lot` guards are infallible -- no `unwrap`.
+                let mut map = map_for_cleanup.write();
+                let mut fences = fences_for_cleanup.lock();
                 let ptr = Arc::as_ptr(&fence_for_cleanup) as usize;
                 for &buf in &all_outputs {
                     if let Some(f) = map.get(&buf) {

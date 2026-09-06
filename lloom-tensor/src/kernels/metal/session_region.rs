@@ -95,7 +95,8 @@
 use super::{Buffer, PooledBuffer};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Offsets are 128 B aligned, for §9.2's reason: it is safe for every Metal
 /// dtype (our fork's PR #8) and is also `hw.cachelinesize` on this machine, so
@@ -366,12 +367,8 @@ impl SessionRegion {
             return None;
         }
 
-        let Ok(mut handles) = self.inner.handles.lock() else {
-            // Poisoned: a caller panicked holding it. Declining is correct and
-            // costs coverage rather than correctness.
-            c.declined_unplanned.fetch_add(1, Ordering::Relaxed);
-            return None;
-        };
+        // `parking_lot` never poisons, so there is no lock error to decline on.
+        let mut handles = self.inner.handles.lock();
         let full = handles.entry(tenant).or_insert_with(|| {
             Arc::new(PooledBuffer::unpooled(
                 self.inner.base.view(span.offset, span.reserved),

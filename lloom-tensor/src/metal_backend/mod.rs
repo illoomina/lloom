@@ -17,7 +17,7 @@ use objc2_foundation::NSString;
 #[cfg(feature = "metal-debug-labels")]
 use objc2_metal::MTLCommandQueue;
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, PoisonError, RwLock, TryLockError};
+use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
 pub use device::{DeviceId, MetalDevice};
@@ -2585,7 +2585,7 @@ impl BackendDevice for MetalDevice {
         #[cfg(feature = "metal-debug-labels")]
         seed_buf.set_label("rng_seed");
         residency_set.insert(&seed_buf);
-        let seed = Arc::new(Mutex::new(seed_buf));
+        let seed = Arc::new(parking_lot::Mutex::new(seed_buf));
         let commands = Commands::new(command_queue, &residency_set).map_err(MetalError::from)?;
 
         // Both pools decide reuse against the GPU's progress through the command
@@ -2633,18 +2633,18 @@ impl BackendDevice for MetalDevice {
             private_buffers,
             kernels,
             seed,
-            seed_value: Arc::new(RwLock::new(299792458)),
+            seed_value: Arc::new(parking_lot::RwLock::new(299792458)),
             residency_set,
             // No arena until one is installed: the classical path is the
             // default, and the cost of the seam is one `Option` test per
             // allocation (`DESIGN.md` §9.2a, §11.1).
-            arena: Arc::new(RwLock::new(None)),
-            arena_recorder: Arc::new(Mutex::new(None)),
-            arena_auto: Arc::new(Mutex::new(None)),
-            arena_auto_report: Arc::new(Mutex::new(None)),
+            arena: Arc::new(parking_lot::RwLock::new(None)),
+            arena_recorder: Arc::new(parking_lot::Mutex::new(None)),
+            arena_auto: Arc::new(parking_lot::Mutex::new(None)),
+            arena_auto_report: Arc::new(parking_lot::Mutex::new(None)),
             // No session region until one is installed, on the same argument as
             // the arena above: the classical path is the default (#47).
-            session_region: Arc::new(RwLock::new(None)),
+            session_region: Arc::new(parking_lot::RwLock::new(None)),
         })
     }
 
@@ -2889,7 +2889,7 @@ impl BackendDevice for MetalDevice {
             min as f32,
             max as f32,
             shape.elem_count(),
-            &self.seed.lock().unwrap(),
+            &self.seed.lock(),
             &buffer,
         )
         .map_err(MetalError::from)?;
@@ -2929,7 +2929,7 @@ impl BackendDevice for MetalDevice {
             mean as f32,
             stddev as f32,
             shape.elem_count(),
-            &self.seed.lock().unwrap(),
+            &self.seed.lock(),
             &buffer,
         )
         .map_err(MetalError::from)?;
@@ -2943,9 +2943,9 @@ impl BackendDevice for MetalDevice {
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {
-        *self.seed_value.write().unwrap() = seed;
+        *self.seed_value.write() = seed;
 
-        let seed_buffer = self.seed.try_lock().map_err(MetalError::from)?;
+        let seed_buffer = self.seed.try_lock().ok_or(MetalError::LockError(LockError::WouldBlock))?;
         let contents = seed_buffer.data();
 
         // **The two words are written in the order the KERNEL reads them, which
@@ -2994,7 +2994,7 @@ impl BackendDevice for MetalDevice {
     }
 
     fn get_current_seed(&self) -> Result<u64> {
-        Ok(*self.seed_value.read().unwrap())
+        Ok(*self.seed_value.read())
     }
 
     fn synchronize(&self) -> Result<()> {

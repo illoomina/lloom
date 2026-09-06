@@ -2038,7 +2038,7 @@ pub(crate) fn finish_packed_params(
 ///
 /// [`GpuClock`]: crate::kernels::metal::GpuClock
 pub struct ConstantsPool {
-    inner: std::sync::Mutex<ConstantsPoolInner>,
+    inner: parking_lot::Mutex<ConstantsPoolInner>,
 }
 
 #[derive(Default)]
@@ -2101,7 +2101,7 @@ fn write_block(buf: &Buffer, bytes: &[u8]) {
 impl ConstantsPool {
     pub(crate) fn new() -> ConstantsPool {
         ConstantsPool {
-            inner: std::sync::Mutex::new(ConstantsPoolInner::default()),
+            inner: parking_lot::Mutex::new(ConstantsPoolInner::default()),
         }
     }
 
@@ -2116,7 +2116,7 @@ impl ConstantsPool {
         bytes: &[u8],
         clock: Option<&crate::kernels::metal::GpuClock>,
     ) -> Result<Buffer, MetalKernelError> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if bytes.len() > CONSTANTS_SLOT_BYTES {
             return Err(MetalKernelError::InvalidInput(format!(
                 "packed params block of {} bytes exceeds the {CONSTANTS_SLOT_BYTES} B pooled \
@@ -2173,7 +2173,7 @@ impl ConstantsPool {
 
     /// See [`ConstantsPoolCounters`].
     pub fn counters(&self) -> ConstantsPoolCounters {
-        self.inner.lock().unwrap().counters
+        self.inner.lock().counters
     }
 
     /// Start a new step: hand out the same buffers again, from the top.
@@ -2182,13 +2182,13 @@ impl ConstantsPool {
     /// step boundary and nowhere else -- resetting mid-step would give two live
     /// dispatches the same buffer.
     pub fn reset(&self) {
-        self.inner.lock().unwrap().cursor = 0;
+        self.inner.lock().cursor = 0;
     }
 
     /// How many distinct buffers the pool has handed out, i.e. the high-water
     /// mark of packed dispatches in one step.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().slots.len()
+        self.inner.lock().slots.len()
     }
 
     pub fn is_empty(&self) -> bool {

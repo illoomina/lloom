@@ -65,7 +65,7 @@ use super::cache_pad::CachePadded;
 use super::Buffer;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 /// Tracks how far the GPU has got through the command buffers submitted to it.
 ///
@@ -959,14 +959,14 @@ pub trait BufferEvictionObserver: Send + Sync {
 }
 
 pub struct PoolInner {
-    state: Mutex<PoolState>,
+    state: parking_lot::Mutex<PoolState>,
     /// How far the GPU has got. Shared with `Commands`, which advances it.
     clock: Arc<GpuClock>,
     /// Told when a free buffer is destroyed. See [`BufferEvictionObserver`].
     ///
     /// `None` for a pool with no second referent, which is every pool in the
     /// tests and the default `BufferPool::new`. The device installs one.
-    on_evict: Mutex<Option<Arc<dyn BufferEvictionObserver>>>,
+    on_evict: parking_lot::Mutex<Option<Arc<dyn BufferEvictionObserver>>>,
 }
 
 /// Default cap on bytes held in a free list.
@@ -986,7 +986,7 @@ const DEFAULT_FREE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 impl PoolInner {
     fn new(clock: Arc<GpuClock>) -> Self {
         Self {
-            state: Mutex::new(PoolState {
+            state: parking_lot::Mutex::new(PoolState {
                 free: BTreeMap::new(),
                 live_buffers: 0,
                 live_bytes: 0,
@@ -1005,14 +1005,14 @@ impl PoolInner {
                 counters: PoolCounters::default(),
             }),
             clock,
-            on_evict: Mutex::new(None),
+            on_evict: parking_lot::Mutex::new(None),
         }
     }
 
     /// The eviction observer, if one is installed. Cheap: one lock and a clone
     /// of an `Option<Arc>`, taken only when an eviction actually happens.
     fn eviction_observer(&self) -> Option<Arc<dyn BufferEvictionObserver>> {
-        self.on_evict.lock().ok().and_then(|o| o.clone())
+        self.on_evict.lock().clone()
     }
 
     /// Hands a buffer back. Called only from `PooledBuffer::drop`.
@@ -1029,12 +1029,7 @@ impl PoolInner {
     fn release(&self, buffer: Buffer, size: usize) {
         let epoch = self.clock.current_epoch();
 
-        let Ok(mut state) = self.state.lock() else {
-            // Poisoned: another thread panicked holding the lock. Dropping the
-            // buffer here is safe -- Metal frees it -- and is better than
-            // propagating a panic out of a destructor.
-            return;
-        };
+        let mut state = self.state.lock();
         state.counters.releases += 1;
         state.live_buffers = state.live_buffers.saturating_sub(1);
         state.live_bytes = state.live_bytes.saturating_sub(size);
@@ -1067,9 +1062,7 @@ impl PoolInner {
     /// `pending` is ordered by epoch, so this stops at the first entry still
     /// outstanding rather than walking the rest.
     fn drain_completed(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
+        let mut state = self.state.lock();
         let mut drained = 0u64;
         while let Some(front) = state.pending.front() {
             if !self.clock.is_complete(front.epoch) {
@@ -1151,13 +1144,7 @@ impl Drop for PoolInner {
         if !super::poison::ENABLED {
             return;
         }
-        let Ok(state) = self.state.lock() else {
-            // Poisoned lock: another thread panicked holding it. Leaving marks
-            // behind is the safe direction here — a false positive later is
-            // worse than none, but reaching into a `Mutex` whose invariants may
-            // be broken is worse than both.
-            return;
-        };
+        let state = self.state.lock();
         for bucket in state.free.values() {
             for buffer in bucket {
                 // SAFETY: the pool is being destroyed, so nothing can acquire
@@ -1363,7 +1350,7 @@ impl BufferPool {
     /// means an allocation it still lists whose handle is gone
     /// (`DESIGN.md` §6.3c). Replaces any previous observer.
     pub fn set_eviction_observer(&self, observer: Arc<dyn BufferEvictionObserver>) {
-        if let Ok(mut slot) = self.inner.on_evict.lock() {
+        { let mut slot = self.inner.on_evict.lock();
             *slot = Some(observer);
         }
     }
@@ -1389,7 +1376,7 @@ impl BufferPool {
     /// past the bound is still the right answer for a larger request, and
     /// `evict_over_budget` remains the only thing that destroys a free buffer.
     pub fn set_reuse_oversize_bound(&self, bound: Option<f64>) {
-        if let Ok(mut state) = self.inner.state.lock() {
+        { let mut state = self.inner.state.lock();
             state.oversize_bound = bound;
         }
     }
@@ -1406,7 +1393,7 @@ impl BufferPool {
     /// is next exceeded, and changing it is not itself a budget event. A caller
     /// wanting both calls [`Self::set_free_budget`] after this.
     pub fn set_eviction_order(&self, order: EvictionOrder) {
-        if let Ok(mut state) = self.inner.state.lock() {
+        { let mut state = self.inner.state.lock();
             state.eviction_order = order;
         }
     }
@@ -1416,20 +1403,14 @@ impl BufferPool {
     /// Read from the state the eviction path consults, never from the flag, so
     /// a harness reports the arm the process **took** (§7.1a-i).
     pub fn eviction_order(&self) -> EvictionOrder {
-        self.inner
-            .state
-            .lock()
-            .map(|s| s.eviction_order)
-            .unwrap_or(EvictionOrder::Age)
+        self.inner.state.lock().eviction_order
     }
 
     /// Sets the cap on bytes retained in the free list, evicting immediately if
     /// the new cap is already exceeded. See `DEFAULT_FREE_BUDGET_BYTES`.
     pub fn set_free_budget(&self, bytes: usize) {
         let evicted = {
-            let Ok(mut state) = self.inner.state.lock() else {
-                return;
-            };
+            let mut state = self.inner.state.lock();
             state.free_budget = bytes;
             state.evict_over_budget()
         };
@@ -1457,7 +1438,7 @@ impl BufferPool {
     /// [`ResidualCap`]. It calls into Metal nowhere and it cannot fire if
     /// admission was honest.
     pub fn set_residual_cap(&self, limit: usize, planned: usize) {
-        if let Ok(mut state) = self.inner.state.lock() {
+        { let mut state = self.inner.state.lock();
             state.residual = Some(ResidualCap { limit, planned });
         }
     }
@@ -1465,7 +1446,7 @@ impl BufferPool {
     /// Removes the residual cap, restoring the unbounded behaviour that
     /// shipped.
     pub fn clear_residual_cap(&self) {
-        if let Ok(mut state) = self.inner.state.lock() {
+        { let mut state = self.inner.state.lock();
             state.residual = None;
         }
     }
@@ -1476,7 +1457,7 @@ impl BufferPool {
     /// `live + free + pending − planned`. See [`ResidualCap::planned`] for why
     /// the subtraction is there and what comparing `live_bytes` alone would do.
     pub fn unplanned_bytes(&self) -> Option<usize> {
-        let state = self.inner.state.lock().ok()?;
+        let state = self.inner.state.lock();
         let cap = state.residual?;
         Some(state.unplanned_bytes(cap))
     }
@@ -1490,7 +1471,7 @@ impl BufferPool {
     /// `None` means the caller should allocate; it does **not** mean the pool
     /// holds nothing of that size, only that nothing of that size is free.
     pub fn acquire(&self, size: usize) -> Option<Arc<PooledBuffer>> {
-        let mut state = self.inner.state.lock().ok()?;
+        let mut state = self.inner.state.lock();
         state.counters.lookups += 1;
 
         // Exact hit. Checked separately from the range query below because it
@@ -1625,12 +1606,7 @@ impl BufferPool {
     /// +0.093 ms/token and the same bookkeeping with the Metal call skipped
     /// read baseline.
     pub fn check_residual(&self, size: usize) -> Result<(), ResidualExceeded> {
-        let Ok(state) = self.inner.state.lock() else {
-            // Poisoned. Refusing here would turn one thread's panic into a
-            // failure to allocate for every other, which is a worse outcome
-            // than the unbounded behaviour that shipped.
-            return Ok(());
-        };
+        let state = self.inner.state.lock();
         let Some(cap) = state.residual else {
             return Ok(());
         };
@@ -1708,7 +1684,7 @@ impl BufferPool {
             buffer.length(),
             buffer.base_offset(),
         );
-        if let Ok(mut state) = self.inner.state.lock() {
+        { let mut state = self.inner.state.lock();
             state.counters.allocations += 1;
             state.counters.allocated_bytes += size as u64;
             state.live_buffers += 1;
@@ -1756,7 +1732,7 @@ impl BufferPool {
              and the overhang would underflow (DESIGN.md §9.2)."
         );
         let handle = self.adopt(buffer, allocated);
-        if let Ok(mut state) = self.inner.state.lock() {
+        { let mut state = self.inner.state.lock();
             state.counters.requested_bytes += requested as u64;
             state.counters.served_bytes += allocated as u64;
             // The MISS half of the same split, banded on the same key as the
@@ -1785,7 +1761,7 @@ impl BufferPool {
         self.inner.drain_completed();
 
         let mut freed = Vec::new();
-        if let Ok(mut state) = self.inner.state.lock() {
+        { let mut state = self.inner.state.lock();
             for (_, mut bucket) in std::mem::take(&mut state.free) {
                 // Destroyed rather than reused, as in `evict_over_budget`: the
                 // mark comes off before the allocation goes, or it outlives the
@@ -1808,11 +1784,7 @@ impl BufferPool {
     }
 
     pub fn counters(&self) -> PoolCounters {
-        self.inner
-            .state
-            .lock()
-            .map(|s| s.counters)
-            .unwrap_or_default()
+        self.inner.state.lock().counters
     }
 
     /// Zeroes the event counters, so a caller can measure decode rather than
@@ -1825,7 +1797,7 @@ impl BufferPool {
     /// zeroed it while the buffers it counted were still parked. The live
     /// figures are [`Self::occupancy`]'s, and this does not touch them.
     pub fn reset_counters(&self) {
-        if let Ok(mut state) = self.inner.state.lock() {
+        { let mut state = self.inner.state.lock();
             state.counters = PoolCounters::default();
         }
     }
@@ -1835,9 +1807,7 @@ impl BufferPool {
     /// "live" counts handles still held by a caller; "free" counts buffers
     /// sitting in the free list ready to be handed out.
     pub fn occupancy(&self) -> PoolOccupancySnapshot {
-        let Ok(state) = self.inner.state.lock() else {
-            return PoolOccupancySnapshot::default();
-        };
+        let state = self.inner.state.lock();
         let free_buffers = state.free.values().map(|b| b.len()).sum();
         PoolOccupancySnapshot {
             live_buffers: state.live_buffers,

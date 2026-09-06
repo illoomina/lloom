@@ -12,7 +12,7 @@ use objc2::available;
 use objc2::rc::Retained;
 use objc2_foundation::NSString;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 #[derive(Debug, Clone)]
 pub enum KernelName {
@@ -177,11 +177,11 @@ impl Kernels {
     ) -> Result<Library, MetalKernelError> {
         let (key, source_content) = self.library_for(source);
 
-        if let Some(lib) = self.libraries.read()?.get(&key) {
+        if let Some(lib) = self.libraries.read().get(&key) {
             return Ok(lib.clone());
         }
 
-        let mut libraries = self.libraries.write()?;
+        let mut libraries = self.libraries.write();
         // Recheck after acquiring the write lock in case another thread inserted it.
         if let Some(lib) = libraries.get(&key) {
             Ok(lib.clone())
@@ -221,11 +221,11 @@ impl Kernels {
         constants: Option<ConstantValues>,
     ) -> Result<ComputePipeline, MetalKernelError> {
         let key = (source, name.into(), constants);
-        if let Some(pipeline) = self.pipelines.read()?.get(&key) {
+        if let Some(pipeline) = self.pipelines.read().get(&key) {
             return Ok(pipeline.clone());
         }
 
-        let mut pipelines = self.pipelines.write()?;
+        let mut pipelines = self.pipelines.write();
         // Recheck after acquiring the write lock in case another thread inserted it.
         if let Some(pipeline) = pipelines.get(&key) {
             Ok(pipeline.clone())
@@ -288,8 +288,8 @@ impl Kernels {
     /// compiled nothing would report `(0, 0)`, which is what a broken probe
     /// reports, and the pipeline total is what distinguishes them.
     pub fn cache_sizes(&self) -> (usize, usize) {
-        let libraries = self.libraries.read().map(|l| l.len()).unwrap_or(0);
-        let pipelines = self.pipelines.read().map(|p| p.len()).unwrap_or(0);
+        let libraries = self.libraries.read().len();
+        let pipelines = self.pipelines.read().len();
         (libraries, pipelines)
     }
 }
@@ -538,8 +538,8 @@ mod tests {
         assert!(pipelines
             .iter()
             .all(|pipeline| std::ptr::eq(pipelines[0].as_ref(), pipeline.as_ref())));
-        assert_eq!(kernels.libraries.read().unwrap().len(), 1);
-        assert_eq!(kernels.pipelines.read().unwrap().len(), 1);
+        assert_eq!(kernels.libraries.read().len(), 1);
+        assert_eq!(kernels.pipelines.read().len(), 1);
     }
 
     /// Issue #434. The passthrough is exercised **directly** rather than

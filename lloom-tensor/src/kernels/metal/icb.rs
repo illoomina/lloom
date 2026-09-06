@@ -44,7 +44,8 @@ use objc2_metal::{
     MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType, MTLIndirectComputeCommand,
     MTLResourceOptions, MTLSize,
 };
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use super::executor::{
     DispatchAction, DispatchRecord, Disposition, Executor, Grid, IcbRange, Size3,
@@ -514,12 +515,12 @@ impl IcbExecutor {
     /// it before the run begins says how many windows to let pass. Only
     /// meaningful before the recording begins.
     pub fn set_warm_in(&self, windows: usize) {
-        self.inner.lock().unwrap().warm_in = windows;
+        self.inner.lock().warm_in = windows;
     }
 
     /// Windows the warm-in dropped.
     pub fn warm_in_skipped(&self) -> usize {
-        self.inner.lock().unwrap().warm_in_skipped
+        self.inner.lock().warm_in_skipped
     }
 
     /// Close the current step.
@@ -542,7 +543,7 @@ impl IcbExecutor {
         if let Some(pool) = crate::kernels::kernels::params::constants_pool() {
             pool.reset();
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.position = 0;
         // Per-step, not cumulative: a run's suppression window belongs to the
         // step that opened it. `poisoned` is deliberately *not* reset -- a run
@@ -620,12 +621,12 @@ impl IcbExecutor {
 
     /// Coverage as observed, once a plan exists.
     pub fn coverage(&self) -> Coverage {
-        self.inner.lock().unwrap().coverage.clone()
+        self.inner.lock().coverage.clone()
     }
 
     /// Whether a plan has been built and is being replayed.
     pub fn is_replaying(&self) -> bool {
-        self.inner.lock().unwrap().phase == Phase::Replaying
+        self.inner.lock().phase == Phase::Replaying
     }
 
     /// Positions that fell back to the classical path because the live dispatch
@@ -636,7 +637,7 @@ impl IcbExecutor {
     /// it means coverage is lower than the plan claims, and reporting the plan's
     /// figure while this is nonzero would overstate what ran.
     pub fn stale_positions(&self) -> usize {
-        self.inner.lock().unwrap().stale_positions
+        self.inner.lock().stale_positions
     }
 
     /// How many contiguous runs the covered positions form.
@@ -648,7 +649,6 @@ impl IcbExecutor {
     pub fn runs(&self) -> usize {
         self.inner
             .lock()
-            .unwrap()
             .plan
             .as_ref()
             .map_or(0, |p| p.runs.len())
@@ -656,7 +656,7 @@ impl IcbExecutor {
 
     /// Runs that went stale and are no longer replayed.
     pub fn poisoned_runs(&self) -> usize {
-        self.inner.lock().unwrap().poisoned.len()
+        self.inner.lock().poisoned.len()
     }
 
     /// `useResource` declarations one replayed step makes: the sum over runs of
@@ -665,7 +665,6 @@ impl IcbExecutor {
     pub fn residency_per_step(&self) -> usize {
         self.inner
             .lock()
-            .unwrap()
             .plan
             .as_ref()
             .map_or(0, |p| p.runs.iter().map(|r| r.range.resident.len()).sum())
@@ -676,7 +675,6 @@ impl IcbExecutor {
     pub fn plan_resident(&self) -> usize {
         self.inner
             .lock()
-            .unwrap()
             .plan
             .as_ref()
             .map_or(0, |p| p.plan_resident)
@@ -686,7 +684,6 @@ impl IcbExecutor {
     pub fn run_residency(&self) -> Vec<Vec<usize>> {
         self.inner
             .lock()
-            .unwrap()
             .plan
             .as_ref()
             .map_or(Vec::new(), |p| {
@@ -707,7 +704,6 @@ impl IcbExecutor {
     pub fn encoded_barriers(&self) -> usize {
         self.inner
             .lock()
-            .unwrap()
             .plan
             .as_ref()
             .map_or(0, |p| p.barriers)
@@ -721,7 +717,7 @@ impl IcbExecutor {
     /// than one, or a nonzero count on a caller that *does* install at a
     /// boundary, means the boundary is in the wrong place.
     pub fn discarded_windows(&self) -> usize {
-        self.inner.lock().unwrap().recording.discarded
+        self.inner.lock().recording.discarded
     }
 }
 
@@ -1149,7 +1145,7 @@ fn pipeline_raw(p: &ComputePipeline) -> &ProtocolObject<dyn MTLComputePipelineSt
 
 impl Executor for IcbExecutor {
     fn dispatch_action(&self, record: &DispatchRecord) -> DispatchAction {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let pos = inner.position;
         inner.position += 1;
 
@@ -1291,7 +1287,7 @@ impl Executor for IcbExecutor {
     /// * a **poisoned or fallen-back** run never sets the window, so its members
     ///   are encoded classically and keep their barriers.
     fn disposition(&self) -> Disposition {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         if inner.replay_barriers != ReplayBarriers::SkipReplayed {
             return Disposition::Unknown;
         }
@@ -1308,7 +1304,7 @@ impl Executor for IcbExecutor {
     }
 
     fn will_bind_buffer(&self, index: usize, buffer: &Buffer, offset: usize, is_output: bool) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.recording.pending.push(BindingRecord {
             index,
             ptr: buffer.raw_addr(),
@@ -1320,7 +1316,7 @@ impl Executor for IcbExecutor {
     }
 
     fn will_set_pipeline(&self, pipeline: &ComputePipeline) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.recording.pending_pipeline = Some(pipeline.clone());
     }
 

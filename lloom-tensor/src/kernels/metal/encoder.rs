@@ -15,13 +15,30 @@ use std::{
     ptr,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
     },
 };
 
 /// Shared cross-encoder output map: maps buffer pointer -> fence of the last encoder that wrote it.
 /// Used by subsequent encoders to call waitForFence before reading those buffers.
-pub type PrevCeOutputs = Arc<Mutex<HashMap<usize, Arc<Fence>>>>;
+// A `parking_lot::RwLock`, not a `Mutex` and not std's `RwLock` (issue: H2
+// contention hygiene). This map is read on the **per-bind** path --
+// `wait_for_buffer` does a `get` for every buffer every dispatch, ~2000 times per
+// decode token -- and written far less often: once per encoder close
+// (`end_encoding` registers its outputs) and once per command-buffer
+// **completion**, the latter on a Metal driver thread. So the frequent access is
+// a read and the contending writer is cross-thread. A `Mutex` serialises the
+// reads against each other (a cost at B>1, where several encode threads share one
+// `Commands`) and blocks every read for the whole of any completion write; an
+// `RwLock` lets the reads run concurrently and shortens the blocked window to the
+// write itself. `parking_lot`'s is word-sized, allocation-free and adaptively
+// spinning, where std's on macOS is `pthread_rwlock_t` (allocates, no spin) --
+// the wrong primitive for a hot path this codebase otherwise builds from atomics
+// and WFE. Semantics are unchanged: the map is still the single cross-encoder
+// ordering source (`DESIGN.md` §3.5 -- a missed fence is silent corruption, so
+// the set of entries and when they are inserted or removed is byte-for-byte what
+// it was; only the lock implementation changed).
+pub type PrevCeOutputs = Arc<parking_lot::RwLock<HashMap<usize, Arc<Fence>>>>;
 
 fn size_tuple(size: MTLSize) -> (usize, usize, usize) {
     (size.width, size.height, size.depth)
@@ -450,7 +467,7 @@ pub struct ComputeCommandEncoder {
     /// Hazard tracking state. Arc shared between the canonical encoder in EntryState
     /// and the clone held by CommandsGuard. Uncontended in practice (CommandsGuard
     /// holds the outer Commands mutex for the entire kernel dispatch).
-    pub(crate) state: Arc<Mutex<EncoderState>>,
+    pub(crate) state: Arc<parking_lot::Mutex<EncoderState>>,
     /// Buffer -> fence of its last writer, so a bind can wait on just that
     /// buffer instead of on every live fence.
     pub(crate) prev_ce_outputs: PrevCeOutputs,
@@ -472,7 +489,7 @@ pub struct ComputeCommandEncoder {
     /// 5.1 % of non-GPU time, so per-bind additions are exactly the shape worth
     /// not paying by default.
     pub(crate) capturing: Arc<AtomicBool>,
-    pub(crate) param_capture: Arc<Mutex<ParamCapture>>,
+    pub(crate) param_capture: Arc<parking_lot::Mutex<ParamCapture>>,
     /// The clock the pooled constants buffers decide rewriting against
     /// (`ConstantsPool`). `None` on encoders built outside `Commands`, which
     /// have no in-flight work to order a CPU write behind.
@@ -537,11 +554,11 @@ impl ComputeCommandEncoder {
             raw,
             command_buffer,
             fence,
-            state: Arc::new(Mutex::new(EncoderState::with_hazard_key(hazard_key()))),
+            state: Arc::new(parking_lot::Mutex::new(EncoderState::with_hazard_key(hazard_key()))),
             prev_ce_outputs,
             executor,
             capturing: Arc::new(AtomicBool::new(false)),
-            param_capture: Arc::new(Mutex::new(ParamCapture::default())),
+            param_capture: Arc::new(parking_lot::Mutex::new(ParamCapture::default())),
             clock: None,
         }
     }
@@ -565,12 +582,14 @@ impl ComputeCommandEncoder {
     /// limited to buffers this encoder actually touches.
     fn wait_for_buffer(&self, ptr: usize) {
         let fence = {
-            let map = self.prev_ce_outputs.lock().unwrap();
+            // Per-bind read: the frequent access, and why the map is an `RwLock`.
+            // `parking_lot` guards are infallible -- no `unwrap`.
+            let map = self.prev_ce_outputs.read();
             map.get(&ptr).cloned()
         };
         let Some(fence) = fence else { return };
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock();
         if state.waited_fences.insert(Arc::as_ptr(&fence) as usize) {
             drop(state);
             self.raw.waitForFence(fence.raw());
@@ -636,7 +655,7 @@ impl ComputeCommandEncoder {
         if self.executor.is_classical() {
             return true;
         }
-        let kernel = self.state.lock().unwrap().current_pipeline.clone();
+        let kernel = self.state.lock().current_pipeline.clone();
         match self.executor.dispatch_action(&DispatchRecord {
             kernel,
             grid,
@@ -721,7 +740,7 @@ impl ComputeCommandEncoder {
             return;
         }
         let name = {
-            let s = self.state.lock().unwrap();
+            let s = self.state.lock();
             s.current_pipeline.clone()
         };
         if profiling {
@@ -755,7 +774,7 @@ impl ComputeCommandEncoder {
             crate::kernels::metal::executor::Disposition::ReplayedInFlightRun
         );
 
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock();
         if s.needs_barrier {
             if suppress {
                 // Do NOT emit, and do NOT discharge. The state is rolled exactly
@@ -856,7 +875,7 @@ impl ComputeCommandEncoder {
             // buffer's last writer only.
             self.wait_for_buffer(ptr);
             let range = Self::bound_range(buf, offset);
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock();
             let key = s.hazard_key;
             // Read-after-write within this encoder. See `read_hazards` for why a
             // read has exactly one possible direction (issue #185).
@@ -890,7 +909,7 @@ impl ComputeCommandEncoder {
             // Write-after-write or write-after-read against an earlier encoder.
             self.wait_for_buffer(ptr);
             let range = Self::bound_range(buf, offset);
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock();
             let key = s.hazard_key;
             // Write-after-write, and write-after-read. See `write_hazards` for
             // why both tests run where the original short-circuited on `||`
@@ -942,7 +961,7 @@ impl ComputeCommandEncoder {
         if !self.capturing.load(Ordering::Relaxed) {
             return false;
         }
-        let mut cap = self.param_capture.lock().unwrap();
+        let mut cap = self.param_capture.lock();
         // Match the layout the kernel will read: pad to the field's own
         // alignment before appending. `DESIGN.md` §15.1 -- a field at the wrong
         // offset is silent corruption, so the padding rule has to be the one
@@ -989,7 +1008,7 @@ impl ComputeCommandEncoder {
         self.wait_for_buffer(ptr);
         {
             let range = Self::bound_range(&buffer, 0);
-            let mut s = self.state.lock().unwrap();
+            let mut s = self.state.lock();
             let key = s.hazard_key;
             s.next_inputs.insert(key, range);
         }
@@ -1003,7 +1022,7 @@ impl ComputeCommandEncoder {
         // the dispatch -- releasing it at capture-close would drop it while the
         // GPU may still be reading, which is the in-flight-reuse failure
         // `DESIGN.md` §2.3.8b describes and no fence can see.
-        self.param_capture.lock().unwrap().staged.push(buffer);
+        self.param_capture.lock().staged.push(buffer);
         true
     }
 
@@ -1016,7 +1035,7 @@ impl ComputeCommandEncoder {
         if !self.capturing.load(Ordering::Relaxed) {
             return index;
         }
-        let mut cap = self.param_capture.lock().unwrap();
+        let mut cap = self.param_capture.lock();
         let slot = cap.next_buffer;
         cap.next_buffer += 1;
         slot
@@ -1027,7 +1046,7 @@ impl ComputeCommandEncoder {
     /// Scoped rather than persistent: [`Self::end_param_capture`] returns the
     /// bytes and closes it, so a capture cannot leak into the next dispatch.
     pub fn begin_param_capture(&self) {
-        let mut cap = self.param_capture.lock().unwrap();
+        let mut cap = self.param_capture.lock();
         cap.bytes.clear();
         cap.staged.clear();
         // Slot 0 is the params buffer, bound by the caller after the capture
@@ -1048,7 +1067,7 @@ impl ComputeCommandEncoder {
     /// would ship 12 bytes where the kernel reads 16.
     pub fn end_param_capture(&self, align: usize) -> (Vec<u8>, Vec<Buffer>) {
         self.capturing.store(false, Ordering::Relaxed);
-        let mut cap = self.param_capture.lock().unwrap();
+        let mut cap = self.param_capture.lock();
         let mut bytes = std::mem::take(&mut cap.bytes);
         let staged = std::mem::take(&mut cap.staged);
         while align != 0 && !bytes.len().is_multiple_of(align) {
@@ -1086,7 +1105,7 @@ impl ComputeCommandEncoder {
         // stored into is `Option<Arc<str>>` already, so this is a refcount bump
         // into a slot that was always shaped for one (issue #579).
         let name = pipeline.name_handle();
-        self.state.lock().unwrap().current_pipeline = name;
+        self.state.lock().current_pipeline = name;
     }
 
     /// Insert a memory barrier at buffers scope.
@@ -1194,9 +1213,10 @@ impl BlitCommandEncoder {
         self.update_fence(&self.fence);
         self.raw.endEncoding();
 
-        // Register outputs so subsequent encoders can wait.
+        // Register outputs so subsequent encoders can wait. A write, taken once
+        // per encoder close -- rare against the per-bind reads above.
         {
-            let mut map = self.prev_ce_outputs.lock().unwrap();
+            let mut map = self.prev_ce_outputs.write();
             for &out in &self.tracked_outputs {
                 map.insert(out, Arc::clone(&self.fence));
             }
@@ -1226,7 +1246,8 @@ impl BlitCommandEncoder {
         use objc2_metal::MTLBlitCommandEncoder as _;
 
         let fences: Vec<Arc<Fence>> = {
-            let map = self.prev_ce_outputs.lock().unwrap();
+            // A read of the ordering map (blit-after-blit); see `PrevCeOutputs`.
+            let map = self.prev_ce_outputs.read();
             let mut out: Vec<Arc<Fence>> = Vec::new();
             for ptr in ptrs {
                 if let Some(f) = map.get(ptr) {

@@ -3,7 +3,7 @@ use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySetDescriptor};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 /// What the set has done, so the cost model can be checked rather than quoted.
 ///
@@ -192,9 +192,7 @@ impl ResidencySet {
             return 0;
         };
         self.insert_batches.fetch_add(1, Ordering::Relaxed);
-        let Ok(mut members) = self.members.lock() else {
-            return 0;
-        };
+        let mut members = self.members.lock();
         let mut added = 0usize;
         for buf in bufs {
             if members.insert(allocation_key(buf)) {
@@ -226,9 +224,7 @@ impl ResidencySet {
             return 0;
         };
         self.remove_batches.fetch_add(1, Ordering::Relaxed);
-        let Ok(mut members) = self.members.lock() else {
-            return 0;
-        };
+        let mut members = self.members.lock();
         let mut removed = 0usize;
         for buf in bufs {
             if members.remove(&allocation_key(buf)) {
@@ -288,9 +284,7 @@ impl ResidencySet {
         if self.raw.is_none() {
             return 0;
         }
-        let Ok(mut members) = self.members.lock() else {
-            return 0;
-        };
+        let mut members = self.members.lock();
         let n = bufs
             .into_iter()
             .filter(|buf| members.remove(&allocation_key(buf)))
@@ -305,7 +299,7 @@ impl ResidencySet {
     /// guard exists to prevent is a machine panic, which is not a testable
     /// assertion -- so the tests assert on membership, which is.
     pub fn len(&self) -> usize {
-        self.members.lock().map(|m| m.len()).unwrap_or(0)
+        self.members.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -314,10 +308,7 @@ impl ResidencySet {
 
     /// Whether this buffer's allocation is currently in the set.
     pub fn contains(&self, buf: &Buffer) -> bool {
-        self.members
-            .lock()
-            .map(|m| m.contains(&allocation_key(buf)))
-            .unwrap_or(false)
+        self.members.lock().contains(&allocation_key(buf))
     }
 
     /// Empties the set, in one commit.
@@ -349,9 +340,7 @@ impl ResidencySet {
         let Some(set) = &self.raw else {
             return 0;
         };
-        let Ok(mut members) = self.members.lock() else {
-            return 0;
-        };
+        let mut members = self.members.lock();
         let n = members.len();
         set.removeAllAllocations();
         set.commit();

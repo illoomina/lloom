@@ -22,6 +22,17 @@ objc2-foundation = { workspace = true, optional = true }
 objc2 = { workspace = true, optional = true }
 block2 = { workspace = true, optional = true }
 once_cell = { workspace = true, optional = true }
+# Every lock this crate takes on a hot or per-op path -- the encoder's hazard
+# state (~2000 acquisitions/token), the command queue, the buffer pool, the
+# cross-encoder ordering map, tensor `Storage`, the pipeline cache -- is a
+# `parking_lot` lock, not std's. std's macOS `RwLock` is `pthread_rwlock_t`
+# (allocates, no adaptive spin) and even its `Mutex`, while `os_unfair_lock`,
+# forces a `Result`/`unwrap` branch per acquisition that a codebase built from
+# atomics and WFE should not pay thousands of times per token. `parking_lot`'s
+# are word-sized, allocation-free, adaptively spinning, and infallible (no poison,
+# no `unwrap`). A base dependency because `Storage` is on the CPU/CUDA path too;
+# it is pure-Rust and cross-platform, so those builds are unaffected.
+parking_lot = { workspace = true }
 tracing = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
 gemm = { workspace = true }

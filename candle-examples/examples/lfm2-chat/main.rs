@@ -92,12 +92,21 @@ struct Args {
     commit_budget: String,
 
     /// The most command buffers the host may leave in flight before it waits for
-    /// the GPU — explicit backpressure. `0` (the default) is off. Only meaningful
-    /// on the `ring-hostdrain` arm, which has no per-token EOS wait to pace it and
+    /// the GPU — explicit backpressure. `0` is off. Only meaningful on the
+    /// `ring-hostdrain` arm, which has no per-token EOS wait to pace it and
     /// otherwise runs the host arbitrarily far ahead of the GPU (measured: 63 vs
-    /// the poll arm's ~9). A value near the commit budget keeps in-flight bounded
-    /// like the poll arm while letting the GPU run ahead up to the cap.
-    #[arg(long, default_value_t = 0)]
+    /// the poll arm's ~9).
+    ///
+    /// **Defaults to 8** (= the commit budget's period, and ~the poll arm's
+    /// healthy lead): a value near the commit budget keeps in-flight bounded like
+    /// the poll arm while letting the GPU run ahead up to the cap. Off (`0`) let
+    /// the host ratchet to a 63-deep queue whose only bound was `flush_and_prune`
+    /// dropping *completed* buffers — a deep queue that cost the tail and left one
+    /// retained `CommandBuffer` (plus its completion handler churning the
+    /// cross-encoder ordering map) per token in flight. This bounds it. The cap
+    /// is byte-identical (`apply_backpressure` only paces the host); raise it if a
+    /// quiet machine shows it throttling, lower it to tighten the queue.
+    #[arg(long, default_value_t = 8)]
     max_in_flight: usize,
 
     /// Drive decode with the **DSpark** speculative drafter instead of the K=1

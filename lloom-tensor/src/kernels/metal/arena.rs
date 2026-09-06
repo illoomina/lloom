@@ -83,7 +83,8 @@
 // one of its own, to assert that installing an arena leaves it untouched.
 use super::{ArenaOffsets, Buffer, PooledBuffer};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use parking_lot::Mutex;
+use std::sync::{Arc, OnceLock};
 
 /// The recorder currently observing binds, if any.
 ///
@@ -105,7 +106,7 @@ fn observer_slot() -> &'static Mutex<Option<Arc<Mutex<ArenaRecorder>>>> {
 
 /// Install `recorder` as the bind observer, or clear it with `None`.
 pub fn set_bind_observer(recorder: Option<Arc<Mutex<ArenaRecorder>>>) {
-    if let Ok(mut slot) = observer_slot().lock() {
+    { let mut slot = observer_slot().lock();
         OBSERVING.store(recorder.is_some(), Ordering::Relaxed);
         *slot = recorder;
     }
@@ -123,9 +124,9 @@ pub fn note_bind(addr: usize) {
     if !observing_binds() {
         return;
     }
-    if let Ok(slot) = observer_slot().lock() {
+    { let slot = observer_slot().lock();
         if let Some(rec) = slot.as_ref() {
-            if let Ok(mut r) = rec.lock() {
+            { let mut r = rec.lock();
                 r.record_bind(addr);
             }
         }
@@ -138,9 +139,9 @@ pub fn note_dispatch() {
     if !observing_binds() {
         return;
     }
-    if let Ok(slot) = observer_slot().lock() {
+    { let slot = observer_slot().lock();
         if let Some(rec) = slot.as_ref() {
-            if let Ok(mut r) = rec.lock() {
+            { let mut r = rec.lock();
                 r.record_dispatch();
             }
         }

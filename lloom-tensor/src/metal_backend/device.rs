@@ -15,7 +15,8 @@ use crate::kernels::{
 use objc2_foundation::NSURL;
 use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
 
 use super::MetalError;
 
@@ -809,12 +810,12 @@ impl MetalDevice {
 
     /// The installed arena, if any. Cheap: one lock and an `Option` clone.
     fn arena_slot(&self) -> Option<Arena> {
-        self.arena.read().ok().and_then(|a| a.clone())
+        self.arena.read().clone()
     }
 
     /// The installed session region, if any. Cheap, on `arena_slot`'s argument.
     fn session_region_slot(&self) -> Option<SessionRegion> {
-        self.session_region.read().ok().and_then(|r| r.clone())
+        self.session_region.read().clone()
     }
 
     /// Install a session region serving the ordinals the arena declines as
@@ -847,7 +848,7 @@ impl MetalDevice {
         self.residency_set.insert(&base);
         let region = SessionRegion::new(base, plan)
             .map_err(|e| MetalError::Message(format!("session region rejected: {e}")))?;
-        if let Ok(mut slot) = self.session_region.write() {
+        { let mut slot = self.session_region.write();
             // Unregister the region being replaced while it still owns its base
             // — #489's ordering argument, which applies here for the same reason
             // it applies to the arena.
@@ -865,9 +866,7 @@ impl MetalDevice {
     /// **while the region still owns it**, so `removeAllocation` names an object
     /// that provably still exists (§6.3c, #489).
     pub fn clear_session_region(&self) {
-        let Ok(mut slot) = self.session_region.write() else {
-            return;
-        };
+        let mut slot = self.session_region.write();
         if let Some(region) = slot.as_ref() {
             self.residency_set.remove(region.base());
         }
@@ -920,7 +919,7 @@ impl MetalDevice {
         self.residency_set.insert(&base);
         let arena = Arena::new(base, plan, layout)
             .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
-        if let Ok(mut slot) = self.arena.write() {
+        { let mut slot = self.arena.write();
             // Unregister the arena being *replaced*, on the same argument as
             // `clear_arena` and while it still owns its base (issue #489). This
             // is latent today because nothing in the shipping engine replaces an
@@ -1036,9 +1035,7 @@ impl MetalDevice {
     /// survived from #69 (§15.2 #11b, on a lifetime path rather than a
     /// capability).
     pub fn clear_arena(&self) {
-        let Ok(mut slot) = self.arena.write() else {
-            return;
-        };
+        let mut slot = self.arena.write();
         if let Some(arena) = slot.as_ref() {
             self.residency_set.remove(arena.base());
         }
@@ -1056,7 +1053,7 @@ impl MetalDevice {
     /// the same point every token. No-op when no arena is installed and no
     /// recording is armed.
     pub fn begin_decode_step(&self) {
-        if let Ok(mut g) = self.arena_auto.lock() {
+        { let mut g = self.arena_auto.lock();
             if let Some(auto) = g.as_mut() {
                 if auto.step == auto.skip {
                     self.begin_arena_recording();
@@ -1079,7 +1076,7 @@ impl MetalDevice {
     /// [`Self::finish_decode_step`], so a loop that brackets its steps with
     /// those needs nothing else. Replaces an earlier arming.
     pub fn arm_arena_recording(&self, layout: ArenaLayout, skip: usize, record_steps: usize) {
-        if let Ok(mut g) = self.arena_auto.lock() {
+        { let mut g = self.arena_auto.lock();
             *g = Some(ArenaAutoRecord {
                 layout,
                 skip,
@@ -1087,14 +1084,14 @@ impl MetalDevice {
                 step: 0,
             });
         }
-        if let Ok(mut r) = self.arena_auto_report.lock() {
+        { let mut r = self.arena_auto_report.lock();
             *r = None;
         }
     }
 
     /// What an armed recording installed, once it has.
     pub fn arena_auto_report(&self) -> Option<ArenaAutoReport> {
-        self.arena_auto_report.lock().ok().and_then(|r| *r)
+        self.arena_auto_report.lock().clone()
     }
 
     /// [`Self::end_decode_step`], plus the install an armed recording is due
@@ -1103,7 +1100,10 @@ impl MetalDevice {
     /// after everything the step encodes.
     pub fn finish_decode_step(&self) -> Result<()> {
         self.end_decode_step();
-        let due = self.arena_auto.lock().ok().and_then(|mut g| {
+        // `parking_lot` guards are infallible; an IIFE returning `Option` keeps
+        // the `?` early-return the `and_then` closure used.
+        let due = (|| {
+            let mut g = self.arena_auto.lock();
             let auto = g.as_mut()?;
             let step = auto.step;
             auto.step += 1;
@@ -1114,7 +1114,7 @@ impl MetalDevice {
             } else {
                 None
             }
-        });
+        })();
         if let Some((layout, step)) = due {
             let plan = self.finish_arena_recording(layout).ok_or_else(|| {
                 MetalError::Message(
@@ -1123,7 +1123,7 @@ impl MetalDevice {
             })?;
             let (covered, total) = plan.covered();
             self.install_arena(plan, layout)?;
-            if let Ok(mut r) = self.arena_auto_report.lock() {
+            { let mut r = self.arena_auto_report.lock();
                 *r = Some(ArenaAutoReport {
                     layout,
                     covered,
@@ -1183,7 +1183,7 @@ impl MetalDevice {
         // The encoder observes binds, which is where an interval ends, so it
         // needs the same recorder this device is filling.
         crate::kernels::metal::arena::set_bind_observer(Some(Arc::clone(&rec)));
-        if let Ok(mut g) = self.arena_recorder.lock() {
+        { let mut g = self.arena_recorder.lock();
             *g = Some(rec);
         }
     }
@@ -1196,9 +1196,9 @@ impl MetalDevice {
     /// arena (`DESIGN.md` §9.1, #68 finding 4). #68's planner likewise requires
     /// two decode steps and refuses rather than silently returning nothing.
     pub fn next_arena_recording_step(&self) {
-        if let Ok(g) = self.arena_recorder.lock() {
+        { let g = self.arena_recorder.lock();
             if let Some(rec) = g.as_ref() {
-                if let Ok(mut r) = rec.lock() {
+                { let mut r = rec.lock();
                     r.next_step();
                 }
             }
@@ -1207,9 +1207,9 @@ impl MetalDevice {
 
     /// How many recorded ordinals were excluded as session state, of the total.
     pub fn arena_recording_excluded(&self) -> Option<(usize, usize)> {
-        let g = self.arena_recorder.lock().ok()?;
+        let g = self.arena_recorder.lock();
         let rec = g.as_ref()?;
-        let r = rec.lock().ok()?;
+        let r = rec.lock();
         Some(r.excluded())
     }
 
@@ -1226,9 +1226,9 @@ impl MetalDevice {
     /// The two counts overlap where both tests fire, so they do not sum to the
     /// total exclusion count.
     pub fn arena_recording_excluded_by_test(&self) -> Option<(usize, usize)> {
-        let g = self.arena_recorder.lock().ok()?;
+        let g = self.arena_recorder.lock();
         let rec = g.as_ref()?;
-        let r = rec.lock().ok()?;
+        let r = rec.lock();
         Some(r.excluded_by_test())
     }
 
@@ -1245,9 +1245,9 @@ impl MetalDevice {
         tokens_recorded: usize,
         capacity_tokens: usize,
     ) -> Option<Vec<(usize, usize)>> {
-        let g = self.arena_recorder.lock().ok()?;
+        let g = self.arena_recorder.lock();
         let rec = g.as_ref()?;
-        let r = rec.lock().ok()?;
+        let r = rec.lock();
         Some(r.session_reservations(tokens_recorded, capacity_tokens))
     }
 
@@ -1258,9 +1258,9 @@ impl MetalDevice {
     /// or the step allocated nothing.
     pub fn finish_arena_recording(&self, layout: ArenaLayout) -> Option<StepPlan> {
         crate::kernels::metal::arena::set_bind_observer(None);
-        let mut g = self.arena_recorder.lock().ok()?;
+        let mut g = self.arena_recorder.lock();
         let rec = g.take()?;
-        let r = rec.lock().ok()?;
+        let r = rec.lock();
         if r.is_empty() {
             return None;
         }
@@ -1386,13 +1386,11 @@ impl MetalDevice {
     /// drops -- see `ArenaRecorder::record_bind` for why the CPU's clock is the
     /// wrong one.
     fn note_for_recording(&self, buffer: Arc<PooledBuffer>, size: usize) -> Arc<PooledBuffer> {
-        let Ok(guard) = self.arena_recorder.lock() else {
-            return buffer;
-        };
+        let guard = self.arena_recorder.lock();
         let Some(rec) = guard.as_ref() else {
             return buffer;
         };
-        if let Ok(mut r) = rec.lock() {
+        { let mut r = rec.lock();
             r.record_alloc(buffer.raw_addr(), size);
         }
         buffer

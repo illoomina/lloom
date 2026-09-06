@@ -5,7 +5,8 @@ use crate::op::{BackpropOp, BinaryOp, CmpOp, Op, ReduceOp, UnaryOp};
 use crate::scalar::TensorOrScalar;
 use crate::shape::{Dim, Dims, ShapeWithOneHole};
 use crate::{bail, storage::Storage, DType, Device, Error, Layout, Result, Shape};
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Unique identifier for tensors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -2994,26 +2995,26 @@ impl Tensor {
         m.forward_t(self, train)
     }
 
-    pub(crate) fn storage(&self) -> std::sync::RwLockReadGuard<'_, Storage> {
-        self.storage.read().unwrap()
+    pub(crate) fn storage(&self) -> parking_lot::RwLockReadGuard<'_, Storage> {
+        self.storage.read()
     }
 
-    pub(crate) fn storage_mut(&self) -> std::sync::RwLockWriteGuard<'_, Storage> {
-        self.storage.write().unwrap()
+    pub(crate) fn storage_mut(&self) -> parking_lot::RwLockWriteGuard<'_, Storage> {
+        self.storage.write()
     }
 
     // If we extend the visibility of this function to be usable outside of this crate, we should
     // make it unsafe.
     pub(crate) fn storage_mut_and_layout(
         &self,
-    ) -> (std::sync::RwLockWriteGuard<'_, Storage>, &Layout) {
-        let storage = self.storage.write().unwrap();
+    ) -> (parking_lot::RwLockWriteGuard<'_, Storage>, &Layout) {
+        let storage = self.storage.write();
         (storage, &self.layout)
     }
 
     /// The storage used by this tensor, together with the layout to use to access it safely.
-    pub fn storage_and_layout(&self) -> (std::sync::RwLockReadGuard<'_, Storage>, &Layout) {
-        let storage = self.storage.read().unwrap();
+    pub fn storage_and_layout(&self) -> (parking_lot::RwLockReadGuard<'_, Storage>, &Layout) {
+        let storage = self.storage.read();
         (storage, &self.layout)
     }
 

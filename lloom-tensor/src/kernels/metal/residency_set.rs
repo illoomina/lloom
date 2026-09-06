@@ -115,6 +115,15 @@ pub struct ResidencySet {
     retired: AtomicU64,
     insert_batches: AtomicU64,
     remove_batches: AtomicU64,
+
+    /// Set by [`Self::add`] when an allocation has been `addAllocation`'d but not
+    /// yet `commit`ted, cleared by [`Self::commit_pending`]. The deferred-commit
+    /// path (`DESIGN.md` §6.3b): a pool MISS on the allocation path calls `add`
+    /// (one `addAllocation`, no `commit`), and the commit is batched to the next
+    /// command-buffer cut — so the first prefill's ~N misses cost one residency
+    /// commit rather than N. Steady decode reuses the warm pool, never misses,
+    /// so `dirty` stays false and `commit_pending` is a load-and-branch.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for ResidencySet {}
@@ -137,6 +146,7 @@ impl ResidencySet {
             retired: AtomicU64::new(0),
             insert_batches: AtomicU64::new(0),
             remove_batches: AtomicU64::new(0),
+            dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -169,6 +179,63 @@ impl ResidencySet {
 
     pub fn insert(&self, buf: &Buffer) -> usize {
         self.insert_batch(std::iter::once(buf))
+    }
+
+    /// `addAllocation` **without** committing — the deferred-commit half of the
+    /// allocation-path fix (`DESIGN.md` §6.3b). Makes `buf` a member and marks
+    /// the set dirty; the residency is not published to the queue until the next
+    /// [`Self::commit_pending`], which the command-buffer cut calls. A pool MISS
+    /// (`MetalDevice::new_buffer`) uses this instead of [`Self::insert`] so a
+    /// prefill that misses N buffers pays one commit at its first CB cut rather
+    /// than N commits inline (§6.3b prices a residency `commit` at ~0.087 ms, and
+    /// a cold-pool prefill misses on the order of a hundred buffers).
+    ///
+    /// SAFETY of the deferral: the buffer is added to the set object here, and
+    /// `commit_pending` runs at the top of `Commands::commit_swap_locked` —
+    /// before that command buffer is committed, hence before the GPU executes any
+    /// dispatch that binds it. The invariant `DESIGN.md` §3.7 needs (every
+    /// resource an executed command touches is resident) holds; only the *commit*
+    /// that publishes it is batched.
+    ///
+    /// Returns 1 if `buf` was newly added, 0 if already present (idempotent, as
+    /// [`Self::insert_batch`]).
+    pub fn add(&self, buf: &Buffer) -> usize {
+        let Some(set) = &self.raw else {
+            return 0;
+        };
+        let mut members = self.members.lock();
+        if members.insert(allocation_key(buf)) {
+            set.addAllocation(as_allocation(buf));
+            self.added.fetch_add(1, Ordering::Relaxed);
+            self.dirty.store(true, Ordering::Relaxed);
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Commit the residency set iff [`Self::add`] has staged an allocation since
+    /// the last commit. Called at each command-buffer cut
+    /// (`Commands::commit_swap_locked`), so staged allocations are published to
+    /// the queue before the command buffer that may bind them executes. A
+    /// load-and-branch when nothing is dirty — every steady decode step, which
+    /// reuses the warm pool and never misses.
+    ///
+    /// Returns true if a commit was issued.
+    pub fn commit_pending(&self) -> bool {
+        let Some(set) = &self.raw else {
+            return false;
+        };
+        // `swap` so a concurrent `add` between the load and the commit re-dirties
+        // rather than being lost: if it set `dirty` after this `swap` read false
+        // it stays true for the next cut; if before, we commit its allocation now.
+        if self.dirty.swap(false, Ordering::AcqRel) {
+            set.commit();
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Adds multiple buffers in a single commit.

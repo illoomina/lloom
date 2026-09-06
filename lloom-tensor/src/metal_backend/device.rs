@@ -1358,7 +1358,15 @@ impl MetalDevice {
                     .device
                     .new_buffer(alloc, PRIVATE_RESOURCE_OPTIONS)
                     .map_err(MetalError::from)?;
-                self.residency_set.insert(&new_buffer);
+                // `add`, not `insert`: stage the allocation (one `addAllocation`)
+                // and let the next command-buffer cut commit the residency set
+                // once, rather than committing per missed buffer. A cold-pool
+                // prefill misses ~a hundred buffers; §6.3b prices each residency
+                // commit at ~0.087 ms, so batching them to one commit is the
+                // whole of the first-forward residency cost (`commit_swap_locked`
+                // calls `commit_pending` before it commits, so the buffer is
+                // resident before any dispatch that binds it executes, §3.7).
+                self.residency_set.add(&new_buffer);
                 // `size` is the pre-rounding request and `alloc` is what Metal
                 // was given; `adopt_requesting` counts both so §9.2's residual
                 // overhang is derivable. The rounding happened at `alloc`

@@ -291,6 +291,13 @@ pub struct Commands {
     /// encoder creation proportional to the number of distinct fences instead,
     /// which is typically small.
     live_fences: Arc<parking_lot::Mutex<Vec<LiveFence>>>,
+    /// The queue's residency set, shared with the device that stages allocations
+    /// into it. Held so a command-buffer cut can publish deferred allocations:
+    /// `commit_swap_locked` calls [`ResidencySet::commit_pending`] before it
+    /// commits, so a pool MISS's `add` (`DESIGN.md` §6.3b) is made resident
+    /// before the command buffer that binds it executes, one commit per cut
+    /// rather than one per missed buffer.
+    residency_set: Arc<ResidencySet>,
     /// How far the GPU has got through the command buffers submitted here.
     ///
     /// Shared with the buffer pools, which use it to decide when a released
@@ -380,7 +387,7 @@ unsafe impl Sync for Commands {}
 impl Commands {
     pub fn new(
         command_queue: CommandQueue,
-        residency_set: &ResidencySet,
+        residency_set: Arc<ResidencySet>,
     ) -> Result<Self, MetalKernelError> {
         let compute_per_buffer = match std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER") {
             Ok(val) => val
@@ -436,6 +443,7 @@ impl Commands {
             compute_per_buffer,
             cut_policy,
             completion_wait,
+            residency_set,
         )
     }
 
@@ -454,7 +462,7 @@ impl Commands {
     /// construction path and the only difference is where the arm comes from.
     pub fn new_with_completion_wait(
         command_queue: CommandQueue,
-        residency_set: &ResidencySet,
+        residency_set: Arc<ResidencySet>,
         completion_wait: CompletionWait,
     ) -> Result<Self, MetalKernelError> {
         if let Some(raw) = residency_set.raw() {
@@ -469,6 +477,7 @@ impl Commands {
             DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
             CutPolicy::DispatchCounter,
             completion_wait,
+            residency_set,
         )
     }
 
@@ -479,6 +488,7 @@ impl Commands {
         compute_per_buffer: usize,
         cut_policy: CutPolicy,
         completion_wait: CompletionWait,
+        residency_set: Arc<ResidencySet>,
     ) -> Result<Self, MetalKernelError> {
         // The listener is allocated with the event and only for the arm that
         // needs one (#583). Its lifetime is then the engine's, which is the
@@ -501,6 +511,7 @@ impl Commands {
             device,
             prev_ce_outputs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             live_fences: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            residency_set,
             clock: Arc::new(GpuClock::new()),
             on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
             executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
@@ -970,6 +981,13 @@ impl Commands {
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
+
+        // Publish any allocations a pool MISS staged with `ResidencySet::add`
+        // (`DESIGN.md` §6.3b) before committing this command buffer, so every
+        // allocation its dispatches may bind is resident before the GPU executes
+        // them (§3.7). A load-and-branch when nothing was staged, which is every
+        // commit that did not follow a miss — the whole steady-state.
+        self.residency_set.commit_pending();
 
         // The signal goes here and it can go nowhere else. `encodeSignalEvent:
         // value:` is documented "may only be called if there is no current

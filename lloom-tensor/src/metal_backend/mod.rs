@@ -2586,7 +2586,8 @@ impl BackendDevice for MetalDevice {
         seed_buf.set_label("rng_seed");
         residency_set.insert(&seed_buf);
         let seed = Arc::new(parking_lot::Mutex::new(seed_buf));
-        let commands = Commands::new(command_queue, &residency_set).map_err(MetalError::from)?;
+        let commands =
+            Commands::new(command_queue, Arc::clone(&residency_set)).map_err(MetalError::from)?;
 
         // Both pools decide reuse against the GPU's progress through the command
         // queue, not against CPU refcounts. `Commands` owns that clock and is

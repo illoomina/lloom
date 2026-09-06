@@ -196,7 +196,15 @@ fn skinny_max() -> usize {
         Ok(v) => v
             .parse()
             .unwrap_or_else(|_| panic!("LLOOM_364_SKINNY_MAX must be an integer, got {v:?}")),
-        Err(_) => SKINNY_TILE_MAX_M + 1,
+        // #148: the 16-row tile serves the batch-collapsed decode m up to 63.
+        // At B>1 `check_batch_collapse` folds B into m, and the 16×32 tile wins
+        // to m=48 (§13.5o sweep) — #693 left the ceiling at SKINNY_TILE_MAX_M+1
+        // (=33) to keep the canonical 34-token prefill on its recorded tile, so
+        // raising the default to 64 MOVES those digests (§2.3.8c prefill pair,
+        // re-baselined here) in exchange for the B>1 decode win. 49..63 stays
+        // the 64-row tile's measured territory only at 64; below it 16×32 is the
+        // arm this ships.
+        Err(_) => 64,
     })
 }
 
@@ -1441,33 +1449,38 @@ mod tile_config_gate {
     /// `LLOOM_383_TILE` arms. Above the threshold the selection is exactly as
     /// #364 left it.
     #[test]
-    fn the_threshold_is_at_thirty_two_and_the_tile_changes_across_it() {
+    fn the_threshold_is_at_sixty_three_and_the_tile_changes_across_it() {
         let (n, k) = (2048, 2048);
         let shape = |t: TileConfig| (t.bm, t.bn, t.bk, t.wm, t.wn);
-        assert_eq!(SKINNY_TILE_MAX_M, 32, "§13.5o: the 16-row band ends at 32");
+        // #148 raised the shipped ceiling to 63 (skinny_max default 64): the
+        // 16-row tile serves the batch-collapsed decode m to 48 (§13.5o sweep)
+        // and this ships it to 63, taking the B>1 decode win at the cost of the
+        // 34-token canonical prefill's digests (re-baselined). SKINNY_TILE_MAX_M
+        // stays 32 — it names the PREFILL-measured band; skinny_max() is the
+        // shipped ceiling and they decoupled here.
         assert_eq!(
             shape(tile_at(16, n, k)),
             (16, 32, 16, 2, 2),
             "m=16 (§13.5c's old cliff)"
         );
         assert_eq!(
-            shape(tile_at(32, n, k)),
-            (16, 32, 16, 2, 2),
-            "m=32 is the last m on 16x32"
-        );
-        assert_eq!(
-            shape(tile_at(33, n, k)),
-            (64, 32, 32, 2, 2),
-            "m=33 takes TILE_64_32_32_2_2, #364's selection above the band"
-        );
-        assert_eq!(
             shape(tile_at(34, n, k)),
+            (16, 32, 16, 2, 2),
+            "#148: §2.3.8c's 34-token prefill now takes 16x32 — its digests moved (re-baselined)"
+        );
+        assert_eq!(
+            shape(tile_at(63, n, k)),
+            (16, 32, 16, 2, 2),
+            "m=63 is the last m on 16x32 (skinny_max default 64)"
+        );
+        assert_eq!(
+            shape(tile_at(64, n, k)),
             (64, 32, 32, 2, 2),
-            "§2.3.8c's 34-token determinism prefill stays on the tile its digests were taken on"
+            "m=64 takes TILE_64_32_32_2_2, #364's selection above the band"
         );
         assert_ne!(
-            shape(tile_at(32, n, k)),
-            shape(tile_at(33, n, k)),
+            shape(tile_at(63, n, k)),
+            shape(tile_at(64, n, k)),
             "the boundary must be a boundary: if these agree, every §13.5c/§13.5o \
              figure is a comparison of a tile against itself"
         );

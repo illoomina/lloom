@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use tokenizers::Tokenizer;
 
+mod concurrent;
+
 #[derive(Parser)]
 struct Args {
     /// Checkpoint directory (config.json, tokenizer.json, *.safetensors).
@@ -214,6 +216,43 @@ struct Args {
     /// it ON). `--gemv-residual false` forces it OFF for the #509 A/B.
     #[arg(long)]
     gemv_residual: Option<bool>,
+
+    // ---- multi-sequence modes (absorbed from the former lfm2-sequence) -------
+    /// `single` (default — read one prompt from stdin), `reuse` (a two-turn
+    /// conversation decoded with prefix reuse vs a fresh prefill), or
+    /// `concurrent` (`--sequences` predefined prompts interleaved on one model,
+    /// or pipelined under `--dspark`). The non-single modes print no token text —
+    /// they repaint a live raw-stats block and a RESULT line.
+    #[arg(long, default_value = "single")]
+    mode: String,
+
+    /// Sequences to run under `--mode concurrent` (at most 4). The prompts are a
+    /// varied predefined set (varied so the run exercises prefill).
+    #[arg(long, default_value_t = 2)]
+    sequences: usize,
+
+    /// Tokens per visit under `--mode concurrent` (non-speculative interleave).
+    #[arg(long, default_value_t = 16)]
+    chunk: usize,
+
+    /// The rotating ring's history depth under `--cache rewindable` (non-dspark):
+    /// the rewind horizon. `--dspark` sizes it from the drafter's block.
+    #[arg(long, default_value_t = 16)]
+    ring_k: usize,
+
+    /// Carry the conv state across a turn-boundary prefill (`ConvPrefillCtx`,
+    /// `DESIGN.md` §13.2f), for `--mode reuse`. Off by default (§7.1a).
+    #[arg(long)]
+    conv_prefill_ctx: bool,
+
+    /// Under `--mode concurrent --dspark`: which arm runs first, `solo` or
+    /// `pipelined`, so a rotation can alternate the order.
+    #[arg(long, default_value = "solo")]
+    first: String,
+
+    /// Under `--mode concurrent --dspark`: write every round of both arms as CSV.
+    #[arg(long)]
+    timeline: Option<PathBuf>,
 }
 
 /// The LFM2.5-2.6B snapshot dir in the HF cache, if it is there.
@@ -526,6 +565,9 @@ fn main() -> Result<()> {
     if let Some(v) = args.gemv_residual {
         config.gemv_residual = v;
     }
+    // `--mode reuse` carries the conv state across the turn-boundary prefill
+    // (§13.2f). Set on the config the model is built from; a no-op for `single`.
+    config.conv_prefill_ctx = args.conv_prefill_ctx;
 
     let files = weight_files(&model_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
@@ -604,6 +646,48 @@ fn main() -> Result<()> {
         "[loaded in \x1b[1;96m{:.2}s\x1b[0m (mmap + construct + warmup: {libs} libs, {pipes} pipelines)]",
         load_start.elapsed().as_secs_f64()
     );
+
+    // The multi-sequence modes (absorbed from lfm2-sequence) branch off here,
+    // after the shared load/warmup and before the single path's stdin read and
+    // the ICB replay install (which is a single-turn arm). They reuse `model`,
+    // `config`, `device` and `eos_ids` — for `--dspark` the config was already
+    // forced rewindable+taps above, so the built model is correct for the mode.
+    if args.mode != "single" {
+        if args.replay || args.arena {
+            anyhow::bail!(
+                "--replay/--arena are single-turn arms; they do not compose with --mode {} \
+                 (the executor records one sequence's step and the concurrent path drives many)",
+                args.mode
+            );
+        }
+        let encode = |text: &str| -> Result<Vec<u32>> {
+            Ok(tokenizer
+                .encode(text, false)
+                .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
+                .get_ids()
+                .to_vec())
+        };
+        let ctx = concurrent::Ctx {
+            model: &model,
+            config: &config,
+            device: &device,
+            dtype,
+            eos_ids: &eos_ids,
+            mode: &args.mode,
+            max_tokens: args.max_tokens,
+            readback: &args.readback,
+            lookahead: args.lookahead,
+            commit_budget: &args.commit_budget,
+            sequences: args.sequences,
+            chunk: args.chunk,
+            dspark: args.dspark,
+            dspark_setup: dspark_setup.as_ref().map(|s| (s.draft_dir.clone(), s.dcfg.clone())),
+            first: &args.first,
+            timeline: args.timeline.clone(),
+            encode: &encode,
+        };
+        return concurrent::run(ctx);
+    }
 
     // Install the ICB replay executor AFTER warmup — so the warmup's forwards do
     // not pollute the recorded step — and before the timed decode. The executor

@@ -161,20 +161,6 @@ pub trait ReadbackStrategy {
     /// ids). Rendered from the strategy rather than from a flag (§7.1a-i).
     fn eos_read_arm(&self) -> &'static str;
 
-    /// Wait until the host is at most `cap` command buffers ahead of the GPU —
-    /// explicit backpressure the loop calls after each enqueue when `cap > 0`.
-    ///
-    /// The default is a no-op: an arm that already paces itself (the blocking
-    /// arm reads every token back; the poll arm waits for each step's EOS) needs
-    /// no separate cap. The ring's stamped arms override this to wait, by the
-    /// same WFE mechanism the poll uses, on the published-generation counter —
-    /// and **only when actually more than `cap` ahead**, so when the GPU keeps up
-    /// it is a mapped read and a compare, not a wait.
-    fn apply_backpressure(&mut self, cap: usize) -> Result<()> {
-        let _ = cap;
-        Ok(())
-    }
-
     /// The engagement counters so far.
     fn counters(&self) -> ReadbackCounters;
 }
@@ -681,44 +667,6 @@ impl ReadbackStrategy for Ring {
             EosRead::Blocking => "flag",
             EosRead::Poll(_) => "poll",
             EosRead::HostOnDrain => "drain",
-        }
-    }
-
-    fn apply_backpressure(&mut self, cap: usize) -> Result<()> {
-        if cap == 0 {
-            return Ok(());
-        }
-        // In-flight is how far the host's enqueue count (`generation`) runs
-        // ahead of the GPU's published count (`published_generation`, the mapped
-        // stamp the drain already rides). Wait until that gap is within `cap`.
-        //
-        // The wait is the poll arm's own WFE on the step counter, but conditional
-        // rather than per-token: when the GPU is within `cap` this loop does not
-        // execute a single WFE — it is a mapped read (`published_generation`) and
-        // a subtraction. Only when the host has genuinely outrun the GPU does it
-        // arm the monitor and wait for the counter to advance, then re-check.
-        //
-        // If the counter is not mapped there is no non-blocking way to read the
-        // GPU's progress, so backpressure cannot be applied here; the arm falls
-        // back to the unbounded behaviour it had before this cap, which is the
-        // same degradation `poll_eos` takes when unmapped. `flush_and_prune` at
-        // the loop's commit cadence still bounds it loosely.
-        let Some(watched) = (unsafe { self.ring.step_addr() }) else {
-            return Ok(());
-        };
-        loop {
-            let published = self.ring.published_generation().unwrap_or(0) as usize;
-            let in_flight = self.generation as usize - published.min(self.generation as usize);
-            if in_flight <= cap {
-                return Ok(());
-            }
-            self.counters.poll_iters += 1;
-            // Wait for the counter to change from what we just saw; the compare
-            // inside `wait_on` skips the WFE if it has already advanced.
-            // SAFETY: `watched` is `step_addr`, valid while `self.ring` lives.
-            let seen = unsafe { watched.read_volatile() };
-            let poll = PollMechanism::default();
-            unsafe { poll.wait_on(watched, seen) };
         }
     }
 

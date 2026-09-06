@@ -104,10 +104,6 @@ struct Args {
     #[arg(long, default_value = "steps:8")]
     commit_budget: String,
 
-    /// In-flight cap for the host-on-drain arm; 0 is off.
-    #[arg(long, default_value_t = 0)]
-    max_in_flight: usize,
-
     /// Sequences to interleave under `--mode concurrent` (at most 4).
     #[arg(long, default_value_t = 2)]
     sequences: usize,
@@ -517,7 +513,6 @@ fn main() -> Result<()> {
         max_tokens: args.max_tokens,
         budget,
         lookahead,
-        max_in_flight: args.max_in_flight,
         sample_split: false,
     };
     // Enough ring slots for every turn or visit plus the overrun each may
@@ -541,14 +536,14 @@ fn main() -> Result<()> {
 
     let common = format!(
         "cache={} ring_k={} conv_prefill_ctx={} readback={} lookahead={} commit_budget={} \
-         max_in_flight={} max_tokens={} dtype={:?}",
+         in_flight_steps={} max_tokens={} dtype={:?}",
         args.cache,
         args.ring_k,
         config.conv_prefill_ctx,
         args.readback,
         lookahead,
         budget.arm(),
-        args.max_in_flight,
+        lloom::nn::decode::IN_FLIGHT_STEPS,
         args.max_tokens,
         dtype
     );

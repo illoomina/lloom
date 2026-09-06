@@ -67,6 +67,7 @@ use lloom::generation::{
     ReadbackStrategy, Ring, Sampling,
 };
 use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model};
+use lloom::nn::decode::IN_FLIGHT_STEPS;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session, VarBuilder};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -244,13 +245,6 @@ struct Args {
     /// Mutually exclusive with `--nonblocking-eos`. Off by default (§7.1a).
     #[arg(long)]
     host_drain: bool,
-
-    /// The most command buffers the host may leave in flight before it waits
-    /// for the GPU — explicit backpressure, decoupled from the EOS mechanism
-    /// (#677). `0` (the default) is off. Only real on an arm with no per-token
-    /// EOS wait (`--host-drain`), where nothing else bounds the host's lead.
-    #[arg(long, default_value_t = 0)]
-    max_in_flight: usize,
 
     /// Carry the conv state across a multi-token pass as the convolution's left
     /// context (`ConvPrefillCtx`, `DESIGN.md` §13.2f defect 1, #677). Off, a
@@ -885,15 +879,11 @@ fn main() -> Result<()> {
     // for a multi-turn run without one. The crown's `Cat` × `Shuffle` cannot
     // rewind at all, so it is refused with `--turns` above 1 rather than
     // moving the digest.
-    anyhow::ensure!(
-        !args.host_drain || args.turns.max(1) == 1 || args.max_in_flight > 0,
-        "--host-drain with --turns {}: without --max-in-flight the host's lead over the GPU \
-         is unbounded, so the overrun past an EOS has no bound a rewind can be sized to; \
-         pass --max-in-flight <N> (the overrun is then at most the commit period + N)",
-        args.turns
-    );
+    // The drain arm learns EOS at a commit, from the published slots: a
+    // period's forwards may be enqueued past the EOS before the commit, and
+    // the pacer's depth may still be unpublished at it.
     let overrun_bound = if args.host_drain {
-        budget.period() + args.max_in_flight
+        budget.period() + IN_FLIGHT_STEPS
     } else if args.lookahead > 0 {
         1
     } else {
@@ -921,7 +911,6 @@ fn main() -> Result<()> {
         max_tokens: args.n,
         budget,
         lookahead: args.lookahead,
-        max_in_flight: args.max_in_flight,
         sample_split: args.sample_split,
     };
     // The ring's device-side history is sized for the whole run — every turn,
@@ -1000,6 +989,8 @@ fn main() -> Result<()> {
         max_in_flight,
         overrun,
         rewound,
+        step_markers,
+        step_waits,
         arms,
         eos_read,
         counters,
@@ -1293,14 +1284,16 @@ fn main() -> Result<()> {
     );
     println!(
         "  decode loop         lookahead={} commit_budget={} commits={} overrun={} rewound={} \
-         max_in_flight_cap={} conv_prefill_ctx={} \
+         in_flight_steps={} step_markers={} step_waits={} conv_prefill_ctx={} \
          (Session::decode, DESIGN.md decode-driver stage 1; #677 sequence layer)",
         args.lookahead,
         budget.arm(),
         commits,
         overrun,
         rewound,
-        args.max_in_flight,
+        IN_FLIGHT_STEPS,
+        step_markers,
+        step_waits,
         config.conv_prefill_ctx
     );
     println!(
@@ -1379,6 +1372,15 @@ fn main() -> Result<()> {
         PollMechanism::Sleep(d) => format!("sleep:{}", d.as_micros()),
         other => other.name().to_string(),
     };
+    #[cfg(feature = "metal")]
+    let cut_policy_arm = match &device {
+        Device::Metal(m) => {
+            candle::metal_backend::CutPolicy::render(m.cut_policy(), m.compute_per_buffer())
+        }
+        _ => "n/a".to_string(),
+    };
+    #[cfg(not(feature = "metal"))]
+    let cut_policy_arm = "n/a".to_string();
     let config_line = [
         // Not selectable here; nothing on the LFM2 path dispatches the packed
         // variants (§11.3k). Stated at its pinned default.
@@ -1417,7 +1419,10 @@ fn main() -> Result<()> {
         // B=1 is what this harness runs (the ring's slot is sized for it, and
         // the source says so above).
         ("Batch", "1".to_string()),
-        ("CutPolicy", "Counter(50)".to_string()),
+        // Read back from the device: `CANDLE_METAL_*` is refused by this
+        // binary, so this can only ever be the default arm, but the mechanism
+        // that decides it is the one that renders it (§7.1a-i).
+        ("CutPolicy", cut_policy_arm),
         ("GemvSilu", on_off(config.gemv_silu)),
         ("GemvResidual", on_off(config.gemv_residual)),
         // #668's axis, rendered here since #677 (no harness rendered it before,
@@ -1460,8 +1465,8 @@ fn main() -> Result<()> {
          completion_signals={} completion_polls={} completion_fires={} \
          gemv_silu={} gemv_residual={} conv_fused={} \
          lookahead={} commit_budget={} commits={} overrun={} rewound={} \
-         max_in_flight_cap={} eos_read={} ring_discarded={} conv_prefill_ctx={} \
-         config=[{}] token_digest={}",
+         in_flight_steps={} step_markers={} step_waits={} eos_read={} ring_discarded={} \
+         conv_prefill_ctx={} config=[{}] token_digest={}",
         args.n,
         args.warmup,
         turns_run,
@@ -1514,7 +1519,9 @@ fn main() -> Result<()> {
         commits,
         overrun,
         rewound,
-        args.max_in_flight,
+        IN_FLIGHT_STEPS,
+        step_markers,
+        step_waits,
         eos_read,
         ring_discarded,
         config.conv_prefill_ctx,
@@ -1545,6 +1552,10 @@ struct Run {
     /// prefilled onto the last kept token (#677). The last turn's overrun is
     /// left as it is — nothing follows it — so `rewound <= overrun`.
     rewound: usize,
+    /// The pacer's engagement pair (`Session::decode`, `IN_FLIGHT_STEPS`):
+    /// markers taken, one per forward, and the ones the host had to wait on.
+    step_markers: u64,
+    step_waits: u64,
     arms: ReadbackArms,
     eos_read: &'static str,
     counters: ReadbackCounters,
@@ -1584,6 +1595,8 @@ fn run_turns<R: ReadbackStrategy>(
     let mut prefill_submit_ns: u64 = 0;
     let mut commits: u64 = 0;
     let mut max_in_flight = 0usize;
+    let mut step_markers = 0u64;
+    let mut step_waits = 0u64;
     let mut overrun = 0usize;
     let mut rewound = 0usize;
     // The cache starts empty: turn 0's prefill is what appends the prompt, and
@@ -1635,6 +1648,8 @@ fn run_turns<R: ReadbackStrategy>(
         sample_ns.extend_from_slice(&out.stats.sample_ns);
         commits += out.stats.commits;
         max_in_flight = max_in_flight.max(out.stats.max_in_flight);
+        step_markers += out.stats.step_markers;
+        step_waits += out.stats.step_waits;
         overrun += out.stats.overrun;
         if out.eos {
             hit_eos = true;
@@ -1666,6 +1681,8 @@ fn run_turns<R: ReadbackStrategy>(
         max_in_flight,
         overrun,
         rewound,
+        step_markers,
+        step_waits,
         arms: rb.arms(),
         eos_read: rb.eos_read_arm(),
         counters: rb.counters(),

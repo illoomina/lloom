@@ -76,7 +76,7 @@ macro_rules! require_icb_support {
 fn commands(device: &Device) -> Commands {
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(device));
-    Commands::new(queue, &residency_set).unwrap()
+    Commands::new(queue, residency_set).unwrap()
 }
 
 /// How many distinct values a result holds.
@@ -155,7 +155,7 @@ fn run_cos_steps(steps: usize, executor: Option<&Arc<IcbExecutor>>, input: &[f32
         }
         cmds.flush_and_wait().unwrap();
         if let Some(e) = executor {
-            e.end_step(&device).unwrap();
+            e.end_step(&device, &cmds).unwrap();
         }
     }
 
@@ -255,12 +255,13 @@ fn icb_plan_refuses_pipelines_without_icb_support() {
     let supported = crate::kernels::metal::device::pipelines_support_icb();
     let executor = IcbExecutor::new(2);
     let device = device();
+    let cmds = commands(&device);
 
     // Two empty steps produce a plan with zero positions, which is a legitimate
     // and uninteresting plan. What matters is that reaching the encode path with
     // unsupported pipelines is an error rather than a crash.
-    executor.end_step(&device).unwrap();
-    let result = executor.end_step(&device);
+    executor.end_step(&device, &cmds).unwrap();
+    let result = executor.end_step(&device, &cmds);
 
     if supported {
         assert!(
@@ -397,7 +398,7 @@ fn run_cos_chain(
         }
         cmds.flush_and_wait().unwrap();
         if let Some(e) = executor {
-            e.end_step(&device).unwrap();
+            e.end_step(&device, &cmds).unwrap();
         }
     }
 
@@ -666,7 +667,7 @@ fn run_two_runs(
         }
         cmds.flush_and_wait().unwrap();
         if let Some(e) = executor {
-            e.end_step(&device).unwrap();
+            e.end_step(&device, &cmds).unwrap();
         }
     }
 
@@ -769,5 +770,196 @@ fn each_run_declares_only_the_buffers_its_own_commands_bind() {
     assert_eq!(
         replayed, classical,
         "replayed output differs from the classical path"
+    );
+}
+
+/// One step of [`run_chain_shaped`]: a cos chain of `links` dispatches, with
+/// link `moved` (if any) writing a third buffer instead of the one the
+/// recording saw, so its binding identity -- and every later link's -- moves.
+#[derive(Clone, Copy)]
+struct ChainStep {
+    links: usize,
+    moved: Option<usize>,
+}
+
+/// Run a cos chain whose shape may change from step to step, returning the
+/// last link's output after the final step.
+///
+/// The fixture for replay under binding movement: the first steps are the
+/// steady state the executor records, a later step is the one whose operands
+/// move (a buffer reissued, a dispatch that vanished), and the property under
+/// test is that the executor computes what the classical path computes on
+/// *that* step -- not on the one it recorded.
+fn run_chain_shaped(
+    shape: &[ChainStep],
+    executor: Option<&Arc<IcbExecutor>>,
+    input: &[f32],
+) -> Vec<f32> {
+    let device = device();
+    let kernels = Kernels::new();
+    let cmds = commands(&device);
+    if let Some(e) = executor {
+        cmds.set_executor(Arc::new(ExecutorSlot::Custom(e.clone())));
+    }
+    let options = crate::kernels::RESOURCE_OPTIONS;
+    let bytes = std::mem::size_of_val(input);
+    let src = device
+        .new_buffer_with_data(input.as_ptr() as *const std::ffi::c_void, bytes, options)
+        .unwrap();
+    let a = device.new_buffer(bytes, options).unwrap();
+    let b = device.new_buffer(bytes, options).unwrap();
+    let c = device.new_buffer(bytes, options).unwrap();
+
+    let mut last = &a;
+    for step in shape {
+        {
+            let guard = cmds.command_encoder().unwrap();
+            let mut from = &src;
+            for link in 0..step.links {
+                let to = if step.moved == Some(link) {
+                    &c
+                } else if link % 2 == 0 {
+                    &a
+                } else {
+                    &b
+                };
+                call_unary_contiguous(
+                    &device,
+                    &guard,
+                    &kernels,
+                    unary::contiguous::cos::FLOAT,
+                    std::mem::size_of::<f32>(),
+                    input.len(),
+                    BufferOffset {
+                        buffer: from,
+                        offset_in_bytes: 0,
+                    },
+                    to,
+                )
+                .unwrap();
+                from = to;
+                last = to;
+            }
+        }
+        // The step closes before its work is committed, as the decode loop
+        // closes it: a range the executor still owes at the boundary lands on
+        // the queue ahead of this commit.
+        if let Some(e) = executor {
+            e.end_step(&device, &cmds).unwrap();
+        }
+        cmds.flush_and_wait().unwrap();
+    }
+    let ptr = last.contents() as *const f32;
+    // SAFETY: the command buffer has completed and the buffer holds
+    // `input.len()` f32 in shared storage.
+    unsafe { std::slice::from_raw_parts(ptr, input.len()) }.to_vec()
+}
+
+/// A member whose operand moved runs classically, the members before it run
+/// from the ICB, and the step computes what the classical path computes.
+///
+/// The run is validated position by position and issued at its tail, so the
+/// command encoded for the moved member never executes: the validated prefix
+/// is issued as a range, the moved member encodes as itself, and the rest of
+/// the run follows it classically. The counters say which path each took --
+/// one stale position, one prefix flush, one re-recording at the step's close
+/// -- and the equality says none of them ran twice or from the recording.
+///
+/// Mutation-verified: issuing the range at the head (the previous form) makes
+/// the moved link's recorded command write the buffer the recording saw, and
+/// the classical dispatch write the moved one, so the chain's later links read
+/// a value one cos short and the equality fails.
+#[test]
+fn a_member_whose_operand_moved_runs_classically_after_its_validated_prefix() {
+    require_icb_support!(
+        "a_member_whose_operand_moved_runs_classically_after_its_validated_prefix"
+    );
+    set_default_param_style(ParamStyle::Packed);
+    set_constants_pool_enabled(true);
+
+    let input: Vec<f32> = (0..512).map(|i| i as f32 / 16.0).collect();
+    let steady = ChainStep {
+        links: 5,
+        moved: None,
+    };
+    let moved = ChainStep {
+        links: 5,
+        moved: Some(2),
+    };
+    let shape = [steady, steady, steady, moved];
+    let executor = IcbExecutor::new(2);
+    let replayed = run_chain_shaped(&shape, Some(&executor), &input);
+    set_default_param_style(ParamStyle::Split);
+    set_constants_pool_enabled(false);
+    let classical = run_chain_shaped(&shape, None, &input);
+
+    assert!(executor.is_replaying() || executor.rerecordings() > 0);
+    assert_eq!(
+        executor.stale_positions(),
+        1,
+        "the moved member, and only it"
+    );
+    assert_eq!(
+        executor.prefix_flushes(),
+        1,
+        "its validated prefix was issued once"
+    );
+    assert_eq!(
+        executor.rerecordings(),
+        1,
+        "the plan is dropped at the stale step's close"
+    );
+    assert!(distinct(&classical) > 1, "vacuous fixture");
+    assert_eq!(
+        replayed, classical,
+        "the moved step computes what the classical path computes"
+    );
+}
+
+/// A step that ends inside a run issues the validated prefix at the boundary.
+///
+/// The members offered before the stream ended were suppressed on the promise
+/// of a range issued at the tail; the tail never came, so `end_step` issues
+/// what was validated on the queue it is handed. Without that the step's last
+/// dispatches would simply not run, and a read of their output would return
+/// the previous step's -- a plausible value, not an error (§3.5).
+#[test]
+fn a_step_that_ends_inside_a_run_issues_its_validated_prefix_at_the_boundary() {
+    require_icb_support!(
+        "a_step_that_ends_inside_a_run_issues_its_validated_prefix_at_the_boundary"
+    );
+    set_default_param_style(ParamStyle::Packed);
+    set_constants_pool_enabled(true);
+
+    let input: Vec<f32> = (0..512).map(|i| i as f32 / 16.0).collect();
+    let steady = ChainStep {
+        links: 5,
+        moved: None,
+    };
+    let short = ChainStep {
+        links: 3,
+        moved: None,
+    };
+    let shape = [steady, steady, steady, short];
+    let executor = IcbExecutor::new(2);
+    let replayed = run_chain_shaped(&shape, Some(&executor), &input);
+    set_default_param_style(ParamStyle::Split);
+    set_constants_pool_enabled(false);
+    let classical = run_chain_shaped(&shape, None, &input);
+
+    assert_eq!(
+        executor.stale_positions(),
+        0,
+        "every offered position matched"
+    );
+    assert_eq!(
+        executor.prefix_flushes(),
+        1,
+        "the prefix was issued at the step's close"
+    );
+    assert!(distinct(&classical) > 1, "vacuous fixture");
+    assert_eq!(
+        replayed, classical,
+        "the short step computes its three links"
     );
 }

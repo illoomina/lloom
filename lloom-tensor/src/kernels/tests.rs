@@ -11,7 +11,7 @@ use std::thread;
 fn commands(device: &Device) -> Commands {
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(&device));
-    Commands::new(queue, &residency_set).unwrap()
+    Commands::new(queue, residency_set).unwrap()
 }
 
 fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
@@ -2436,7 +2436,7 @@ fn commands_creation_and_encoder() {
     let device = Device::system_default().unwrap();
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(&device));
-    let commands = Commands::new(queue, &residency_set).unwrap();
+    let commands = Commands::new(queue, residency_set).unwrap();
 
     let encoder = commands.command_encoder().unwrap();
     drop(encoder);
@@ -2449,7 +2449,7 @@ fn commands_concurrent_acquisition() {
     let device = Device::system_default().unwrap();
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(&device));
-    let commands = Arc::new(Commands::new(queue, &residency_set).unwrap());
+    let commands = Arc::new(Commands::new(queue, residency_set).unwrap());
 
     let mut handles = vec![];
 

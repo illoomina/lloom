@@ -2643,6 +2643,8 @@ impl BackendDevice for MetalDevice {
             arena_recorder: Arc::new(parking_lot::Mutex::new(None)),
             arena_auto: Arc::new(parking_lot::Mutex::new(None)),
             arena_auto_report: Arc::new(parking_lot::Mutex::new(None)),
+            arena_rerecord: Arc::new(parking_lot::Mutex::new(None)),
+            arena_rerecordings: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // No session region until one is installed, on the same argument as
             // the arena above: the classical path is the default (#47).
             session_region: Arc::new(parking_lot::RwLock::new(None)),
@@ -2946,7 +2948,10 @@ impl BackendDevice for MetalDevice {
     fn set_seed(&self, seed: u64) -> Result<()> {
         *self.seed_value.write() = seed;
 
-        let seed_buffer = self.seed.try_lock().ok_or(MetalError::LockError(LockError::WouldBlock))?;
+        let seed_buffer = self
+            .seed
+            .try_lock()
+            .ok_or(MetalError::LockError(LockError::WouldBlock))?;
         let contents = seed_buffer.data();
 
         // **The two words are written in the order the KERNEL reads them, which

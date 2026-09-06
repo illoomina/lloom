@@ -82,8 +82,8 @@
 // layer 3 means -- the free list never sees them. The test module below imports
 // one of its own, to assert that installing an arena leaves it untouched.
 use super::{ArenaOffsets, Buffer, PooledBuffer};
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// The recorder currently observing binds, if any.
@@ -106,7 +106,8 @@ fn observer_slot() -> &'static Mutex<Option<Arc<Mutex<ArenaRecorder>>>> {
 
 /// Install `recorder` as the bind observer, or clear it with `None`.
 pub fn set_bind_observer(recorder: Option<Arc<Mutex<ArenaRecorder>>>) {
-    { let mut slot = observer_slot().lock();
+    {
+        let mut slot = observer_slot().lock();
         OBSERVING.store(recorder.is_some(), Ordering::Relaxed);
         *slot = recorder;
     }
@@ -124,24 +125,38 @@ pub fn note_bind(addr: usize) {
     if !observing_binds() {
         return;
     }
-    { let slot = observer_slot().lock();
+    {
+        let slot = observer_slot().lock();
         if let Some(rec) = slot.as_ref() {
-            { let mut r = rec.lock();
+            {
+                let mut r = rec.lock();
                 r.record_bind(addr);
             }
         }
     }
 }
 
+/// Dispatches encoded since the installed arena's step began -- the clock the
+/// plan's allocation positions are checked against (`Arena::acquire_attributed`).
+static STEP_DISPATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Whether an arena step is open, so the counter above advances only while
+/// something reads it. One relaxed load on the classical path.
+static DISPATCH_COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Report that a dispatch was encoded, advancing the position intervals live in.
 #[inline]
 pub fn note_dispatch() {
+    if DISPATCH_COUNTING.load(Ordering::Relaxed) {
+        STEP_DISPATCH.fetch_add(1, Ordering::Relaxed);
+    }
     if !observing_binds() {
         return;
     }
-    { let slot = observer_slot().lock();
+    {
+        let slot = observer_slot().lock();
         if let Some(rec) = slot.as_ref() {
-            { let mut r = rec.lock();
+            {
+                let mut r = rec.lock();
                 r.record_dispatch();
             }
         }
@@ -217,12 +232,52 @@ pub struct StepPlan {
     /// The size is carried so a request that does not match can also be
     /// declined, rather than silently served a slot of the wrong extent.
     by_ordinal: Vec<Option<(usize, usize)>>,
+    /// The dispatch position each ordinal was allocated at when the plan was
+    /// recorded, or empty for a plan built without a recording.
+    ///
+    /// The drift guard's second key. A size matches by coincidence often --
+    /// most activations of a decode step are the hidden size -- so a sequence
+    /// that gained or lost a dispatch before ordinal N can hand N a request of
+    /// the planned size for a *different* value, with a different lifetime,
+    /// and the packed layout would alias it (§9.3). The position it was
+    /// allocated at cannot coincide across such a shift.
+    alloc_at: Vec<usize>,
 }
 
 impl StepPlan {
     /// Build a plan from the per-ordinal `(slot, size)` assignment.
     pub fn new(slots: Vec<Slot>, by_ordinal: Vec<Option<(usize, usize)>>) -> Self {
-        Self { slots, by_ordinal }
+        Self {
+            slots,
+            by_ordinal,
+            alloc_at: Vec::new(),
+        }
+    }
+
+    /// Attach the dispatch position each ordinal was allocated at, one per
+    /// ordinal, so `Arena::acquire_attributed` can refuse a request that
+    /// arrives at a different position than the plan recorded.
+    pub fn with_alloc_positions(mut self, alloc_at: Vec<usize>) -> Self {
+        assert_eq!(
+            alloc_at.len(),
+            self.by_ordinal.len(),
+            "one allocation position per ordinal"
+        );
+        self.alloc_at = alloc_at;
+        self
+    }
+
+    /// The dispatch position ordinal `ordinal` was allocated at, when known.
+    pub fn alloc_position(&self, ordinal: usize) -> Option<usize> {
+        self.alloc_at.get(ordinal).copied()
+    }
+
+    /// Drop the allocation positions, for a plan whose intervals are a
+    /// fixture rather than a recording: the drift guard then has nothing to
+    /// check, and every ordinal is served on size alone.
+    pub fn without_alloc_positions(mut self) -> Self {
+        self.alloc_at.clear();
+        self
     }
 
     /// Ordinals the arena serves, against the total recorded.
@@ -424,6 +479,11 @@ pub struct ArenaCounters {
     pub declined_size: u64,
     /// Requests past the end of the plan.
     pub declined_exhausted: u64,
+    /// Steps on which a request arrived at a dispatch position other than the
+    /// one its ordinal was recorded at, so the sequence had drifted from the
+    /// plan. The arena stops serving for the rest of that step and reports
+    /// the drift for the loop to re-record (`Arena::take_drifted`).
+    pub declined_drift: u64,
     /// Decode steps begun.
     pub steps: u64,
     /// Times a GPU-computed offset table was verified equal to the plan and
@@ -468,6 +528,7 @@ struct LiveCounters {
     declined_session: AtomicU64,
     declined_size: AtomicU64,
     declined_exhausted: AtomicU64,
+    declined_drift: AtomicU64,
     steps: AtomicU64,
     gpu_verified: AtomicU64,
 }
@@ -480,6 +541,7 @@ impl LiveCounters {
             declined_session: self.declined_session.load(Ordering::Relaxed),
             declined_size: self.declined_size.load(Ordering::Relaxed),
             declined_exhausted: self.declined_exhausted.load(Ordering::Relaxed),
+            declined_drift: self.declined_drift.load(Ordering::Relaxed),
             steps: self.steps.load(Ordering::Relaxed),
             gpu_verified: self.gpu_verified.load(Ordering::Relaxed),
         }
@@ -491,6 +553,7 @@ impl LiveCounters {
         self.declined_session.store(0, Ordering::Relaxed);
         self.declined_size.store(0, Ordering::Relaxed);
         self.declined_exhausted.store(0, Ordering::Relaxed);
+        self.declined_drift.store(0, Ordering::Relaxed);
         self.steps.store(0, Ordering::Relaxed);
         self.gpu_verified.store(0, Ordering::Relaxed);
     }
@@ -544,6 +607,10 @@ pub enum ArenaDecline {
     Session,
     /// The request's size is not what this ordinal was planned for.
     SizeMismatch,
+    /// The request arrived at a different dispatch position than the ordinal
+    /// was recorded at: the step's sequence has drifted from the plan, and
+    /// the arena serves nothing more this step.
+    Drift,
 }
 
 /// What the arena did with one offered allocation.
@@ -596,6 +663,9 @@ struct ArenaInner {
     offsets: AtomicU8,
     /// Live counters, one relaxed atomic each (issue #562).
     counters: LiveCounters,
+    /// Set when a step's sequence drifted from the plan; read and cleared by
+    /// the loop at the step's close (`Arena::take_drifted`).
+    drifted: std::sync::atomic::AtomicBool,
     /// Allocation ordinal within the current decode step.
     ///
     /// Relaxed because a decode step is single-threaded through the model's
@@ -727,6 +797,7 @@ impl Arena {
                 // #69's path until a GPU table is verified against the plan.
                 offsets: AtomicU8::new(ArenaOffsets::Cpu.to_bits()),
                 counters: LiveCounters::default(),
+                drifted: std::sync::atomic::AtomicBool::new(false),
                 ordinal: AtomicUsize::new(0),
                 active: AtomicU64::new(0),
             }),
@@ -830,6 +901,8 @@ impl Arena {
     /// signal the dispatch-trace harness already takes for its per-step regions.
     pub fn begin_step(&self) {
         self.inner.ordinal.store(0, Ordering::Relaxed);
+        STEP_DISPATCH.store(0, Ordering::Relaxed);
+        DISPATCH_COUNTING.store(true, Ordering::Relaxed);
         self.inner.active.store(1, Ordering::Relaxed);
         self.inner.counters.steps.fetch_add(1, Ordering::Relaxed);
     }
@@ -837,6 +910,19 @@ impl Arena {
     /// Close the current step. Allocations outside a step go to the pool.
     pub fn end_step(&self) {
         self.inner.active.store(0, Ordering::Relaxed);
+        DISPATCH_COUNTING.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether a step drifted from the plan since this was last asked, and
+    /// clear it.
+    ///
+    /// A drifted plan describes a stream that no longer runs: every later
+    /// step would decline at the same position and serve the ordinals before
+    /// it, which is correct and covers less each time the sequence moves
+    /// again. The loop that installed the arena re-records it instead
+    /// (`MetalDevice::finish_decode_step`).
+    pub fn take_drifted(&self) -> bool {
+        self.inner.drifted.swap(false, Ordering::Relaxed)
     }
 
     pub fn is_active(&self) -> bool {
@@ -989,6 +1075,26 @@ impl Arena {
                 decline: Some(ArenaDecline::SizeMismatch),
             };
         }
+        // The position must match too. A size coincides across a shifted
+        // sequence -- the hidden size is most of a step's allocations -- and a
+        // request served at the planned slot for a *different* value has a
+        // lifetime the packing never modelled, which is §9.3's aliasing with
+        // no safety net. The dispatch position cannot coincide across a shift,
+        // so a mismatch here is the sequence having moved: this step is served
+        // no further, and the loop re-records.
+        if let Some(at) = plan_state.plan.alloc_position(ordinal) {
+            let now = STEP_DISPATCH.load(Ordering::Relaxed);
+            if at != now {
+                counters.declined_drift.fetch_add(1, Ordering::Relaxed);
+                self.inner.drifted.store(true, Ordering::Relaxed);
+                self.inner.active.store(0, Ordering::Relaxed);
+                return ArenaOffer {
+                    served: None,
+                    ordinal: Some(ordinal),
+                    decline: Some(ArenaDecline::Drift),
+                };
+            }
+        }
         counters.hits.fetch_add(1, Ordering::Relaxed);
         ArenaOffer {
             served: Some(Arc::clone(&plan_state.slot_handles[slot])),
@@ -1054,6 +1160,9 @@ impl std::fmt::Debug for Arena {
 /// at about one extra wide slot.
 pub fn plan_from_sizes(sizes: &[usize], last_use: &[usize], layout: ArenaLayout) -> StepPlan {
     let first_use: Vec<usize> = (0..sizes.len()).collect();
+    // A fixture's `first_use` is a liveness coordinate, not an observed
+    // dispatch position, so the plan carries no positions for the drift guard
+    // to compare against.
     plan_from_intervals(
         sizes,
         &first_use,
@@ -1061,6 +1170,7 @@ pub fn plan_from_sizes(sizes: &[usize], last_use: &[usize], layout: ArenaLayout)
         &vec![false; sizes.len()],
         layout,
     )
+    .without_alloc_positions()
 }
 
 /// As [`plan_from_sizes`], but with explicit liveness intervals and exclusions.
@@ -1120,7 +1230,7 @@ pub fn plan_from_intervals(
             by_ordinal.push(Some((slots.len() - 1, size)));
             cursor = align_up(cursor + size, ARENA_ALIGNMENT);
         }
-        return StepPlan::new(slots, by_ordinal);
+        return StepPlan::new(slots, by_ordinal).with_alloc_positions(first_use.to_vec());
     }
 
     // Size-major first-fit. Each slot holds values whose intervals are pairwise
@@ -1196,7 +1306,7 @@ pub fn plan_from_intervals(
         })
         .collect();
 
-    StepPlan::new(slots, by_ordinal)
+    StepPlan::new(slots, by_ordinal).with_alloc_positions(first_use.to_vec())
 }
 
 /// Round `x` up to a multiple of `a`.
@@ -1771,6 +1881,80 @@ mod tests {
         for (i, step) in per_step.iter().enumerate() {
             assert_eq!(step, first, "step {i} bound different offsets: {step:?}");
         }
+    }
+
+    /// A request that arrives at a different dispatch position than its
+    /// ordinal was recorded at is the sequence having drifted: it is declined,
+    /// the step is served no further, and the drift is reported once.
+    ///
+    /// The size gate cannot see this case -- the sizes here are identical --
+    /// and it is the case the model produces: attention routing to its
+    /// two-pass kernel at `kv_len` 1024 inserts a dispatch and three
+    /// allocations at every attention layer, so every later ordinal names a
+    /// different value than the plan packed a slot for.
+    #[test]
+    fn a_request_at_the_wrong_dispatch_position_is_a_drift_and_ends_the_step() {
+        let dev = device();
+        let sizes = [4096, 4096, 4096];
+        let first_use = [0, 1, 2];
+        let last_use = [1, 2, 3];
+        let plan = plan_from_intervals(
+            &sizes,
+            &first_use,
+            &last_use,
+            &[false; 3],
+            ArenaLayout::Packed,
+        );
+        assert_eq!(
+            plan.alloc_position(1),
+            Some(1),
+            "a recording carries its positions"
+        );
+        let base = dev
+            .new_buffer(plan.arena_bytes().max(1), crate::kernels::RESOURCE_OPTIONS)
+            .expect("arena allocation");
+        let arena = Arena::new(base, plan, ArenaLayout::Packed).expect("plan is valid");
+
+        // The recorded sequence: allocate, dispatch, allocate, dispatch, ...
+        arena.begin_step();
+        for &s in &sizes {
+            assert!(
+                arena.acquire(s).is_some(),
+                "the recorded sequence is served"
+            );
+            note_dispatch();
+        }
+        arena.end_step();
+        assert!(!arena.take_drifted(), "a matching step does not drift");
+        assert_eq!(arena.counters().hits, 3);
+
+        // The drifted sequence: one dispatch inserted before ordinal 1.
+        arena.begin_step();
+        assert!(
+            arena.acquire(sizes[0]).is_some(),
+            "ordinal 0 is where it was"
+        );
+        note_dispatch();
+        note_dispatch();
+        let offer = arena.acquire_attributed(sizes[1]);
+        assert!(offer.served.is_none());
+        assert_eq!(offer.decline, Some(ArenaDecline::Drift));
+        note_dispatch();
+        let after = arena.acquire_attributed(sizes[2]);
+        assert!(after.served.is_none(), "nothing is served after a drift");
+        assert_eq!(after.decline, Some(ArenaDecline::Inactive));
+        arena.end_step();
+        let c = arena.counters();
+        assert_eq!(
+            c.declined_drift, 1,
+            "the drift is counted once, at the position it was seen"
+        );
+        assert_eq!(c.hits, 4);
+        assert!(
+            arena.take_drifted(),
+            "the loop learns of it at the step's close"
+        );
+        assert!(!arena.take_drifted(), "and it is cleared by being taken");
     }
 
     /// A slot handle is never dropped while the arena lives, so it never enters

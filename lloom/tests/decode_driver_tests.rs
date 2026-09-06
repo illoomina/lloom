@@ -224,12 +224,6 @@ impl ReadbackStrategy for AnyArm {
             AnyArm::Ring(r) => r.note_eos_truncation(dropped_in_batch),
         }
     }
-    fn apply_backpressure(&mut self, cap: usize) -> Result<()> {
-        match self {
-            AnyArm::Blocking(b) => b.apply_backpressure(cap),
-            AnyArm::Ring(r) => r.apply_backpressure(cap),
-        }
-    }
     fn eos_read_arm(&self) -> &'static str {
         match self {
             AnyArm::Blocking(b) => b.eos_read_arm(),
@@ -731,5 +725,58 @@ fn the_ring_feeds_the_same_slot_every_step() -> Result<()> {
     assert_eq!(a.id(), b.id(), "two feeds returned two allocations");
     assert_eq!(rb.take_ids()?, vec![3, 3]);
     assert_eq!(rb.take_ids()?, Vec::<u32>::new());
+    Ok(())
+}
+
+/// The host's lead over the GPU is bounded by the step pacer on the arms
+/// whose commits the loop owns, and the bound engages only where the
+/// per-token wait does not already hold it.
+///
+/// `Session::decode` takes one marker per forward and waits on the marker
+/// `IN_FLIGHT_STEPS` back before encoding the next. On the poll arm the
+/// per-token EOS wait retires that forward first, so the pacer finds every
+/// marker complete and waits on none; on the drain arm nothing else paces the
+/// host, so the pacer is what bounds it, and the queue `flush_and_prune`
+/// observes stays within the depth plus the commit the loop itself makes.
+#[test]
+fn the_pacer_bounds_the_drain_arm_and_is_a_null_on_the_poll_arm() -> Result<()> {
+    use lloom::nn::decode::IN_FLIGHT_STEPS;
+    for device in devices() {
+        let opts = DecodeOptions {
+            lookahead: 1,
+            budget: CommitBudget::steps(8)?,
+            ..DecodeOptions::new(24)
+        };
+        let (out, _) = run(&device, &Arm::RingHostDrain, &[0], &opts)?;
+        // Markers are command buffers, so only a device with a queue takes
+        // them; the CPU reports none rather than a count it did not observe.
+        let want_markers = if matches!(device, Device::Metal(_)) {
+            out.stats.steps
+        } else {
+            0
+        };
+        assert_eq!(
+            out.stats.step_markers, want_markers,
+            "{device:?}: one marker per forward"
+        );
+        if matches!(device, Device::Metal(_)) {
+            assert!(
+                out.stats.max_in_flight <= IN_FLIGHT_STEPS + 1,
+                "{device:?}: {} command buffers in flight on the drain arm; the pacer's bound is {}",
+                out.stats.max_in_flight,
+                IN_FLIGHT_STEPS + 1
+            );
+        }
+        let (out, _) = run(&device, &Arm::RingPoll, &[0], &opts)?;
+        assert_eq!(out.stats.step_markers, want_markers, "{device:?}");
+        assert_eq!(
+            out.stats.step_waits, 0,
+            "{device:?}: the poll arm's own wait retires the marker before the pacer asks"
+        );
+        // The blocking arm's readback drains every step: no markers, its
+        // command stream the incumbent's.
+        let (out, _) = run(&device, &Arm::Blocking, &[0], &DecodeOptions::new(12))?;
+        assert_eq!(out.stats.step_markers, 0, "{device:?}");
+    }
     Ok(())
 }

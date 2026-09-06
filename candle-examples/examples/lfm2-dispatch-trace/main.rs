@@ -719,9 +719,9 @@ fn main() -> Result<()> {
         // dispatch-count guard is what turned the first form into an error
         // rather than a plausible zero-coverage result, and the second form is
         // what the count alone would not have caught.
-        if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
+        if let (Some(_), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
             if step >= icb_installed_at {
-                exec.end_step(dev.metal_device())
+                dev.end_executor_step()
                     .map_err(|e| anyhow::anyhow!("closing ICB step {step}: {e}"))?;
             }
         }
@@ -1170,7 +1170,9 @@ fn main() -> Result<()> {
         // matching its recording mid-run, so coverage is lower than the plan
         // claims and the figure above overstates what ran.
         println!("stale positions:          {}", exec.stale_positions());
-        println!("poisoned runs:            {}", exec.poisoned_runs());
+        println!("stale runs:               {}", exec.stale_runs());
+        println!("prefix flushes:           {}", exec.prefix_flushes());
+        println!("re-recordings:            {}", exec.rerecordings());
         // One is expected: the window opened at install time is partial.
         println!("discarded windows:        {}", exec.discarded_windows());
         // The ordering auto_barrier would have emitted between replayed

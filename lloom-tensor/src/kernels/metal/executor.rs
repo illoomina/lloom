@@ -26,7 +26,7 @@
 //! replay must therefore capture bindings as they happen, which is what
 //! [`Executor::will_bind_buffer`] exists for -- see `IcbFeasibility` below for
 //! why no such executor is included here.
-use crate::kernels::metal::{Buffer, ComputePipeline, Device};
+use crate::kernels::metal::{Buffer, Commands, ComputePipeline, Device};
 use crate::kernels::MetalKernelError;
 use objc2_metal::MTLSize;
 
@@ -165,7 +165,14 @@ pub trait Executor: Send + Sync {
     /// cut on a dispatch count, not on a token -- so the loop that owns the step
     /// says so. A replaying executor keys its recording on this boundary; every
     /// other executor ignores it, and the classical slot never reaches it.
-    fn end_step(&self, _device: &Device) -> Result<(), MetalKernelError> {
+    ///
+    /// `commands` is the queue the step was encoded on, for an executor that
+    /// still owes the stream work at the boundary: a replaying executor that
+    /// validates a run before executing it may reach the step's end with a
+    /// validated prefix it has not yet issued, and the only correct place for
+    /// that prefix is here, after the step's last dispatch and before the next
+    /// step's first.
+    fn end_step(&self, _device: &Device, _commands: &Commands) -> Result<(), MetalKernelError> {
         Ok(())
     }
 }
@@ -183,10 +190,10 @@ pub enum Disposition {
     /// [`Executor::disposition`] reports.
     #[default]
     Unknown,
-    /// This position is a **non-head member of a run that is already in
-    /// flight** -- its ICB command was executed by the range its run head
-    /// requested, and the ordering it needs was encoded onto that command as a
-    /// `setBarrier`.
+    /// This position is a **non-head member of a run being replayed** -- its
+    /// ICB command is in the range the run's tail issues once every member has
+    /// matched its recording, and the ordering it needs was encoded onto that
+    /// command as a `setBarrier`.
     ///
     /// This is the *only* disposition that licenses suppressing candle's
     /// barrier, and the narrowness is the whole of the argument
@@ -220,6 +227,21 @@ pub enum DispatchAction {
         location: usize,
         length: usize,
     },
+    /// Execute `length` ICB commands from `location` here, order this dispatch
+    /// after them with a barrier, **then encode it classically**.
+    ///
+    /// The shape a replaying executor needs when a run it is validating stops
+    /// matching part-way: the members it has already validated are issued as a
+    /// range and the one that did not match runs as the classical dispatch it
+    /// is, so no position executes from a recording its live dispatch
+    /// contradicts and none executes twice. The barrier is the encoder's, not
+    /// the executor's, because the dispatch's own `auto_barrier` ran before the
+    /// executor was consulted and cannot order it after commands issued later.
+    ExecuteIcbThenEncode {
+        icb: std::sync::Arc<IcbRange>,
+        location: usize,
+        length: usize,
+    },
 }
 
 /// An ICB and the resources the commands of one run reference.
@@ -232,6 +254,13 @@ pub struct IcbRange {
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>,
     >,
     pub resident: Vec<Buffer>,
+    /// The buffers a command in this run **writes**, by raw address, so the
+    /// encoder that executes the range can register them as its outputs. A
+    /// later encoder session orders its reads against a buffer's last writer
+    /// through that registration (`Commands::prev_ce_outputs`); a range whose
+    /// writes it did not carry would leave the reader unfenced under
+    /// `HazardTrackingModeUntracked` (§3.5).
+    pub written: Vec<usize>,
 }
 
 // SAFETY: the Metal objects held here are used under the owning executor's
@@ -340,10 +369,10 @@ impl ExecutorSlot {
     /// Close the installed executor's step (see [`Executor::end_step`]). Once per
     /// token, not per dispatch, so the branch here is not on §3.3's path.
     #[inline]
-    pub fn end_step(&self, device: &Device) -> Result<(), MetalKernelError> {
+    pub fn end_step(&self, device: &Device, commands: &Commands) -> Result<(), MetalKernelError> {
         match self {
             ExecutorSlot::Classical => Ok(()),
-            ExecutorSlot::Custom(e) => e.end_step(device),
+            ExecutorSlot::Custom(e) => e.end_step(device, commands),
         }
     }
 }

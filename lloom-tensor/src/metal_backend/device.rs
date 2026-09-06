@@ -14,8 +14,8 @@ use crate::kernels::{
 };
 use objc2_foundation::NSURL;
 use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
-use std::path::Path;
 use parking_lot::{Mutex, RwLock};
+use std::path::Path;
 use std::sync::Arc;
 
 use super::MetalError;
@@ -311,6 +311,11 @@ pub struct MetalDevice {
     pub(crate) arena_auto: Arc<Mutex<Option<ArenaAutoRecord>>>,
     /// What the last armed recording installed. See [`ArenaAutoReport`].
     pub(crate) arena_auto_report: Arc<Mutex<Option<ArenaAutoReport>>>,
+    /// How to record the arena again after a step drifts from its plan: the
+    /// layout and step count the last arming used. `None` until armed.
+    pub(crate) arena_rerecord: Arc<Mutex<Option<(ArenaLayout, usize)>>>,
+    /// Arenas dropped and re-armed after a drift (`Arena::take_drifted`).
+    pub(crate) arena_rerecordings: Arc<std::sync::atomic::AtomicU64>,
 
     /// The session region: one owned allocation serving the class the arena
     /// declines (#47, `DESIGN.md` §9.2x).
@@ -663,6 +668,11 @@ impl MetalDevice {
         Ok(self.commands.flush_marker().map_err(MetalError::from)?)
     }
 
+    /// Whether `marker`'s buffer has already retired, without waiting.
+    pub fn marker_complete(&self, marker: &CommandMarker) -> bool {
+        self.commands.marker_complete(marker)
+    }
+
     /// Wait on `marker`'s buffer only — later commits keep running — then
     /// return completed buffers to their pools, as every wait here does.
     pub fn wait_marker(&self, marker: &CommandMarker) -> Result<()> {
@@ -848,7 +858,8 @@ impl MetalDevice {
         self.residency_set.insert(&base);
         let region = SessionRegion::new(base, plan)
             .map_err(|e| MetalError::Message(format!("session region rejected: {e}")))?;
-        { let mut slot = self.session_region.write();
+        {
+            let mut slot = self.session_region.write();
             // Unregister the region being replaced while it still owns its base
             // — #489's ordering argument, which applies here for the same reason
             // it applies to the arena.
@@ -919,7 +930,8 @@ impl MetalDevice {
         self.residency_set.insert(&base);
         let arena = Arena::new(base, plan, layout)
             .map_err(|e| MetalError::Message(format!("arena plan rejected: {e}")))?;
-        { let mut slot = self.arena.write();
+        {
+            let mut slot = self.arena.write();
             // Unregister the arena being *replaced*, on the same argument as
             // `clear_arena` and while it still owns its base (issue #489). This
             // is latent today because nothing in the shipping engine replaces an
@@ -1053,7 +1065,8 @@ impl MetalDevice {
     /// the same point every token. No-op when no arena is installed and no
     /// recording is armed.
     pub fn begin_decode_step(&self) {
-        { let mut g = self.arena_auto.lock();
+        {
+            let mut g = self.arena_auto.lock();
             if let Some(auto) = g.as_mut() {
                 if auto.step == auto.skip {
                     self.begin_arena_recording();
@@ -1076,7 +1089,8 @@ impl MetalDevice {
     /// [`Self::finish_decode_step`], so a loop that brackets its steps with
     /// those needs nothing else. Replaces an earlier arming.
     pub fn arm_arena_recording(&self, layout: ArenaLayout, skip: usize, record_steps: usize) {
-        { let mut g = self.arena_auto.lock();
+        {
+            let mut g = self.arena_auto.lock();
             *g = Some(ArenaAutoRecord {
                 layout,
                 skip,
@@ -1084,9 +1098,21 @@ impl MetalDevice {
                 step: 0,
             });
         }
-        { let mut r = self.arena_auto_report.lock();
+        {
+            let mut r = self.arena_rerecord.lock();
+            *r = Some((layout, record_steps.max(2)));
+        }
+        {
+            let mut r = self.arena_auto_report.lock();
             *r = None;
         }
+    }
+
+    /// Arenas dropped and recorded again after a step drifted from their plan
+    /// (`Arena::take_drifted`).
+    pub fn arena_rerecordings(&self) -> u64 {
+        self.arena_rerecordings
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// What an armed recording installed, once it has.
@@ -1100,6 +1126,34 @@ impl MetalDevice {
     /// after everything the step encodes.
     pub fn finish_decode_step(&self) -> Result<()> {
         self.end_decode_step();
+        // A step that drifted from the plan is served no further (the arena
+        // deactivated itself at the drift) and the plan is dropped here: the
+        // sequence it describes no longer runs, and the recording is re-armed
+        // over the steps that follow -- none skipped, because the drifted
+        // sequence is the steady state now. Each re-recording is counted, so
+        // a run whose plan moved twice says so beside its coverage.
+        if let Some(arena) = self.arena_slot() {
+            if arena.take_drifted() {
+                let rearm = *self.arena_rerecord.lock();
+                self.clear_arena();
+                if let Some((layout, record_steps)) = rearm {
+                    // The drifted step is the record's step 0 (the count
+                    // below advances it), so `skip: 1` records from the next
+                    // step on -- nothing but the step that drifted is skipped.
+                    {
+                        let mut g = self.arena_auto.lock();
+                        *g = Some(ArenaAutoRecord {
+                            layout,
+                            skip: 1,
+                            record_steps,
+                            step: 0,
+                        });
+                    }
+                    self.arena_rerecordings
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
         // `parking_lot` guards are infallible; an IIFE returning `Option` keeps
         // the `?` early-return the `and_then` closure used.
         let due = (|| {
@@ -1123,7 +1177,8 @@ impl MetalDevice {
             })?;
             let (covered, total) = plan.covered();
             self.install_arena(plan, layout)?;
-            { let mut r = self.arena_auto_report.lock();
+            {
+                let mut r = self.arena_auto_report.lock();
                 *r = Some(ArenaAutoReport {
                     layout,
                     covered,
@@ -1154,7 +1209,7 @@ impl MetalDevice {
     pub fn end_executor_step(&self) -> Result<()> {
         self.commands
             .executor()
-            .end_step(&self.device)
+            .end_step(&self.device, &self.commands)
             .map_err(MetalError::from)?;
         Ok(())
     }
@@ -1183,7 +1238,8 @@ impl MetalDevice {
         // The encoder observes binds, which is where an interval ends, so it
         // needs the same recorder this device is filling.
         crate::kernels::metal::arena::set_bind_observer(Some(Arc::clone(&rec)));
-        { let mut g = self.arena_recorder.lock();
+        {
+            let mut g = self.arena_recorder.lock();
             *g = Some(rec);
         }
     }
@@ -1196,9 +1252,11 @@ impl MetalDevice {
     /// arena (`DESIGN.md` §9.1, #68 finding 4). #68's planner likewise requires
     /// two decode steps and refuses rather than silently returning nothing.
     pub fn next_arena_recording_step(&self) {
-        { let g = self.arena_recorder.lock();
+        {
+            let g = self.arena_recorder.lock();
             if let Some(rec) = g.as_ref() {
-                { let mut r = rec.lock();
+                {
+                    let mut r = rec.lock();
                     r.next_step();
                 }
             }
@@ -1398,7 +1456,8 @@ impl MetalDevice {
         let Some(rec) = guard.as_ref() else {
             return buffer;
         };
-        { let mut r = rec.lock();
+        {
+            let mut r = rec.lock();
             r.record_alloc(buffer.raw_addr(), size);
         }
         buffer

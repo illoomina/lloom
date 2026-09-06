@@ -41,7 +41,7 @@ fn device() -> Device {
 fn commands(device: &Device, arm: CompletionWait) -> Commands {
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(device));
-    Commands::new_with_completion_wait(queue, &residency_set, arm).unwrap()
+    Commands::new_with_completion_wait(queue, residency_set, arm).unwrap()
 }
 
 /// Dispatch one `affine` over `n` f32 and read the result back through the

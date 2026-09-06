@@ -91,24 +91,6 @@ struct Args {
     #[arg(long, default_value = "steps:8")]
     commit_budget: String,
 
-    /// The most command buffers the host may leave in flight before it waits for
-    /// the GPU — explicit backpressure. `0` is off. Only meaningful on the
-    /// `ring-hostdrain` arm, which has no per-token EOS wait to pace it and
-    /// otherwise runs the host arbitrarily far ahead of the GPU (measured: 63 vs
-    /// the poll arm's ~9).
-    ///
-    /// **Defaults to 8** (= the commit budget's period, and ~the poll arm's
-    /// healthy lead): a value near the commit budget keeps in-flight bounded like
-    /// the poll arm while letting the GPU run ahead up to the cap. Off (`0`) let
-    /// the host ratchet to a 63-deep queue whose only bound was `flush_and_prune`
-    /// dropping *completed* buffers — a deep queue that cost the tail and left one
-    /// retained `CommandBuffer` (plus its completion handler churning the
-    /// cross-encoder ordering map) per token in flight. This bounds it. The cap
-    /// is byte-identical (`apply_backpressure` only paces the host); raise it if a
-    /// quiet machine shows it throttling, lower it to tighten the queue.
-    #[arg(long, default_value_t = 8)]
-    max_in_flight: usize,
-
     /// Drive decode with the **DSpark** speculative drafter instead of the K=1
     /// identity proposer. The drafter proposes a block of up to `--draft` tokens
     /// per round and the target verifies them in one `forward_all`, accepting the
@@ -126,6 +108,14 @@ struct Args {
     /// acceptance rate; `--phase-sync` shows where a round's time goes.
     #[arg(long)]
     dspark: bool,
+
+    /// Never stop on EOS: the run produces exactly `-n` tokens. The EOS id set
+    /// is replaced by an id no tokenizer emits, so every arm's own EOS
+    /// mechanism (device flag, host compare, drain scan) still runs and simply
+    /// never fires. For long-run gates; the text degenerates past the model's
+    /// own stop and is not what a user would read.
+    #[arg(long)]
+    ignore_eos: bool,
 
     /// Install the ICB replay executor on the decode path (issue #146/#169). The
     /// stable, packed subset of a decode step is recorded into an
@@ -559,6 +549,9 @@ fn main() -> Result<()> {
             eos_ids.push(id);
         }
     }
+    if args.ignore_eos {
+        eos_ids = vec![u32::MAX];
+    }
 
     // Warm the Metal pipelines before the clock the user reads starts. A real
     // forward compiles the prefill GEMM-tile / F32-attention / batched-conv
@@ -657,6 +650,10 @@ fn main() -> Result<()> {
         if let Device::Metal(dev) = &device {
             if arena {
                 exec.set_warm_in(1 + ARENA_SKIP + ARENA_RECORD_STEPS + 1);
+                // After a stale step the arena re-records over the next
+                // `ARENA_RECORD_STEPS` steps and installs at the end of the
+                // last; the executor records after that and one settling step.
+                exec.set_rerecord_warm_in(ARENA_RECORD_STEPS + 1);
             }
             dev.set_executor(std::sync::Arc::new(ExecutorSlot::Custom(exec.clone())));
         }
@@ -717,24 +714,22 @@ fn main() -> Result<()> {
         anyhow::bail!("--phase-sync brackets the speculative round's phases; it needs --dspark");
     }
     // A speculative round is not a steady-state step: its dispatch structure moves
-    // with the accepted length, so a run validated at its head goes stale at a
-    // later member -- whose command has already executed with the recorded
-    // bindings. That is §3.5's silent wrong answer, and it was observed: with
-    // the executor on this loop, 1 of 5 runs produced a different stream
-    // (`measurements/issue-688-icb-residency.md` §5). Refused rather than
-    // gated on `stale` after the fact, because by then the tokens are out.
+    // with the accepted length, so every run goes stale within a few rounds. The
+    // executor validates a run before issuing it and re-records after a stale
+    // step, so the stream is correct either way -- but a plan that is dropped
+    // every few rounds covers nothing, and the arena is not armed here at all.
+    // Refused so the arm's name is not worn by a classical run (§7.1a-i).
     if args.replay && args.dspark {
         anyhow::bail!(
             "--replay cannot be combined with --dspark: the speculative round's dispatch \
-             structure is not stable across rounds, every covered run goes stale mid-flight, \
-             and a stale member's ICB command has already run (DESIGN.md §11.3x)"
+             structure is not stable across rounds, so the executor would re-record every \
+             few rounds and replay nothing (DESIGN.md §11.3x)"
         );
     }
     let opts = DecodeOptions {
         max_tokens: args.max_tokens,
         budget,
         lookahead: args.lookahead,
-        max_in_flight: args.max_in_flight,
         // Under the speculative body this is the per-phase drain (decode.rs).
         sample_split: args.phase_sync,
     };
@@ -920,6 +915,7 @@ fn main() -> Result<()> {
          {} {} , TTFT {} ms, \
          {} on {:?}; cache={cache_arm} kv={kv_arm} bos={} \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
+         step_markers={} step_waits={} cut={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={}]",
         b(format!("{end_to_end:.1}")),
         b(format!("{steady:.1}")),
@@ -941,17 +937,17 @@ fn main() -> Result<()> {
         budget.arm(),
         st.commits,
         st.max_in_flight,
+        st.step_markers,
+        st.step_waits,
+        cut_policy_arm(&device),
         st.readback.ring_publishes,
         st.readback.poll_fallbacks,
         st.overrun,
         out.eos,
     );
     #[cfg(feature = "metal")]
-    let mut replay_stale = 0usize;
-    #[cfg(feature = "metal")]
     if let Some(exec) = icb_exec.as_ref() {
         report_replay(exec, st.steps);
-        replay_stale = exec.stale_positions();
     }
     // GPU busy per step, when the census is on: the split between an arm
     // costing the host and an arm costing the GPU (§11.3s landed GPU-side).
@@ -976,31 +972,34 @@ fn main() -> Result<()> {
             match dev.arena_auto_report() {
                 Some(r) => eprintln!(
                     "[arena: {:?} installed after decode step {}: {} of {} ordinals served; \
-                     counters={:?}]",
+                     rerecordings={} counters={:?}]",
                     r.layout,
                     r.installed_at_step,
                     r.covered,
                     r.total,
+                    dev.arena_rerecordings(),
                     dev.arena_counters(),
                 ),
                 None => eprintln!("[arena: not installed]"),
             }
         }
     }
-    // A stale member of an in-flight run was replayed from a recording its live
-    // dispatch no longer matched. The run is poisoned from the next step, but
-    // the step it was seen on has already executed the recorded command (§3.5),
-    // so the stream above is not to be trusted -- say so where a script reads
-    // the exit status, not only in a counter it may not parse.
+    Ok(())
+}
+
+/// The command-buffer cut policy in force, read back from the device rather
+/// than from the environment that selected it (§7.1a-i), with the counter's
+/// period beside it.
+fn cut_policy_arm(device: &Device) -> String {
     #[cfg(feature = "metal")]
-    if replay_stale > 0 {
-        anyhow::bail!(
-            "{replay_stale} replayed position(s) went stale inside an in-flight run; their ICB \
-             commands ran against the recorded bindings, so the stream above may be wrong \
-             (DESIGN.md §11.3x)"
+    if let Device::Metal(dev) = device {
+        return candle::metal_backend::CutPolicy::render(
+            dev.cut_policy(),
+            dev.compute_per_buffer(),
         );
     }
-    Ok(())
+    let _ = device;
+    "n/a".to_string()
 }
 
 /// What the ICB executor did on this run: engagement first, then the residency
@@ -1012,15 +1011,17 @@ fn report_replay(exec: &candle::kernels::IcbExecutor, steps: u64) {
     let cov = exec.coverage();
     eprintln!(
         "[replay: replaying={} covered={}/{} runs={} barriers_encoded={} stale={} \
-         poisoned_runs={} discarded_windows={} excluded_varies={} excluded_inline_consts={} \
-         excluded_no_pipeline={}]",
+         stale_runs={} prefix_flushes={} rerecordings={} discarded_windows={} \
+         excluded_varies={} excluded_inline_consts={} excluded_no_pipeline={}]",
         exec.is_replaying(),
         cov.covered,
         cov.positions,
         exec.runs(),
         exec.encoded_barriers(),
         exec.stale_positions(),
-        exec.poisoned_runs(),
+        exec.stale_runs(),
+        exec.prefix_flushes(),
+        exec.rerecordings(),
         exec.discarded_windows(),
         cov.varies,
         cov.inline_constants,
@@ -1061,6 +1062,31 @@ fn report_replay(exec: &candle::kernels::IcbExecutor, steps: u64) {
     );
     for ((kernel, reason), n) in &cov.excluded_by_kernel {
         eprintln!("[replay excluded {n:4} {kernel:<44} {reason}]");
+    }
+    // What went stale, attributed: which axis of the recording moved, on which
+    // kernels, and the first occurrences dated by step -- a count says a run
+    // stopped matching, this says what moved and when.
+    let stale = exec.stale_report();
+    if !stale.first.is_empty() {
+        let by_axis: Vec<String> = stale
+            .by_axis
+            .iter()
+            .map(|(axis, n)| format!("{axis}={n}"))
+            .collect();
+        eprintln!(
+            "[replay stale: steps_with_stale={} by_axis: {}]",
+            stale.steps,
+            by_axis.join(" ")
+        );
+        for (kernel, n) in &stale.by_kernel {
+            eprintln!("[replay stale {n:4} {kernel}]");
+        }
+        for (step, pos, kernel, axis, at_head) in &stale.first {
+            eprintln!(
+                "[replay stale first: step={step} pos={pos} {kernel} {axis} {}]",
+                if *at_head { "head" } else { "member" }
+            );
+        }
     }
 }
 

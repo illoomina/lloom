@@ -37,7 +37,7 @@
 //! matching falls back to the classical path for that step rather than replaying
 //! a stale command, because under `HazardTrackingModeUntracked` a wrong buffer
 //! is silent corruption rather than an error (§3.5).
-use crate::kernels::metal::{Buffer, ComputePipeline};
+use crate::kernels::metal::{Buffer, Commands, ComputePipeline};
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLComputePipelineState, MTLDevice, MTLIndirectCommandBuffer,
@@ -354,18 +354,38 @@ struct Inner {
     /// means coverage is lower than the plan claims -- reporting the plan's
     /// figure while this is nonzero would overstate what ran.
     stale_positions: usize,
-    /// Runs that went stale and are never replayed again.
-    poisoned: std::collections::HashSet<usize>,
+    /// What went stale, attributed: the first axis of `replay_compatible` on
+    /// which each stale position differed, per kernel, and the first few
+    /// occurrences with the step they were seen on. A bare count says a run
+    /// stopped matching; this says which operand moved and when.
+    stale: StaleReport,
+    /// Steps closed so far, the clock `stale.first` is dated on.
+    step: u64,
+    /// Stale positions seen in the step being executed. Nonzero at the step's
+    /// close means the recording no longer describes the stream and the plan
+    /// is dropped for a new one (`IcbExecutor::end_step`).
+    stale_this_step: usize,
+    /// Distinct runs that went stale at least once under the current plan.
+    stale_runs: std::collections::HashSet<usize>,
+    /// Runs issued as a validated prefix because a later member stopped
+    /// matching: the members before it ran from the ICB, it and the rest ran
+    /// classically, none twice and none from a recording the live dispatch
+    /// contradicted.
+    prefix_flushes: usize,
+    /// Plans dropped and re-recorded after a step went stale.
+    rerecordings: usize,
+    /// Windows to let pass before a re-recording begins. See
+    /// [`IcbExecutor::set_rerecord_warm_in`].
+    rerecord_warm_in: usize,
     /// Windows still to be dropped before recording begins. See
     /// [`IcbExecutor::set_warm_in`].
     warm_in: usize,
     /// Windows dropped by the warm-in, reported beside `discarded`.
     warm_in_skipped: usize,
-    /// Positions before this index are inside a run whose range already ran.
-    suppress_until: usize,
-    /// The run whose range was most recently requested, so a stale member can
-    /// name the run to poison.
-    run_in_flight: usize,
+    /// The run whose head has validated and whose members are being validated
+    /// as they are offered. Its range is issued at the tail, once every member
+    /// has matched, or as a validated prefix at the first member that does not.
+    pending: Option<PendingRun>,
     /// Dispatch index within the step being executed.
     position: usize,
     /// How far back a barrier scan looks. See [`BarrierScope`].
@@ -373,6 +393,98 @@ struct Inner {
     /// Whether candle's own barrier is suppressed at replayed positions.
     /// See [`ReplayBarriers`].
     replay_barriers: ReplayBarriers,
+}
+
+/// Stale positions, attributed rather than counted.
+#[derive(Clone, Debug, Default)]
+pub struct StaleReport {
+    /// Stale positions per axis of `StepDispatch::replay_compatible`.
+    pub by_axis: std::collections::BTreeMap<&'static str, usize>,
+    /// Stale positions per kernel name.
+    pub by_kernel: std::collections::BTreeMap<String, usize>,
+    /// The first occurrences, in order: `(step, position, kernel, axis, at_head)`.
+    pub first: Vec<(u64, usize, String, &'static str, bool)>,
+    /// Steps on which at least one position went stale.
+    pub steps: usize,
+    last_step: Option<u64>,
+}
+
+/// How many occurrences `StaleReport::first` keeps.
+const STALE_FIRST_KEPT: usize = 64;
+
+impl StaleReport {
+    fn note(&mut self, step: u64, pos: usize, kernel: String, axis: &'static str, at_head: bool) {
+        *self.by_axis.entry(axis).or_default() += 1;
+        *self.by_kernel.entry(kernel.clone()).or_default() += 1;
+        if self.last_step != Some(step) {
+            self.last_step = Some(step);
+            self.steps += 1;
+        }
+        if self.first.len() < STALE_FIRST_KEPT {
+            self.first.push((step, pos, kernel, axis, at_head));
+        }
+    }
+}
+
+/// The first axis on which `live` stops matching `reference`, in the order
+/// `replay_compatible` compares them.
+fn stale_axis(reference: &StepDispatch, live: &StepDispatch) -> &'static str {
+    if reference.kernel != live.kernel {
+        return "kernel";
+    }
+    if reference.grid != live.grid {
+        return "grid";
+    }
+    if reference.threads_per_threadgroup != live.threads_per_threadgroup {
+        return "threadgroup";
+    }
+    if reference.bindings.len() != live.bindings.len() {
+        return "binding-count";
+    }
+    for (r, l) in reference.bindings.iter().zip(live.bindings.iter()) {
+        if r.index != l.index {
+            return "binding-index";
+        }
+        if r.ptr != l.ptr {
+            return "binding-identity";
+        }
+        if r.offset != l.offset {
+            return "binding-offset";
+        }
+        if r.len != l.len {
+            return "binding-length";
+        }
+        if r.is_output != l.is_output {
+            return "binding-direction";
+        }
+    }
+    "none"
+}
+
+/// A run whose head matched its recording and whose range has not been
+/// issued yet.
+///
+/// # Why a run executes at its tail and not at its head
+///
+/// The unit of validation is the run, but the unit of *knowledge* is the
+/// position: a member's live bindings are known only when it is offered, and
+/// an ICB command that has already executed cannot be un-executed. Issuing the
+/// range at the head therefore trusted every member on the head's word, and a
+/// member whose operand had moved -- a regime change inserting a dispatch, a
+/// pooled buffer reissued -- ran from the recording anyway, as §11.3x's
+/// *"a plausible wrong answer rather than a crash"*. Issuing at the tail means
+/// every command in the range was checked against the dispatch it replaces
+/// before it runs. The point in the stream is the same: nothing classical is
+/// encoded between a run's head and its tail, so the range lands between the
+/// same two uncovered neighbours either way.
+struct PendingRun {
+    run: usize,
+    start: usize,
+    command: usize,
+    len: usize,
+    /// Members matched so far, the head included.
+    validated: usize,
+    range: Arc<IcbRange>,
 }
 
 /// One maximal run of consecutive covered positions.
@@ -492,11 +604,16 @@ impl IcbExecutor {
                 plan: None,
                 coverage: Coverage::default(),
                 stale_positions: 0,
-                poisoned: std::collections::HashSet::new(),
+                stale: StaleReport::default(),
+                step: 0,
+                stale_this_step: 0,
+                stale_runs: std::collections::HashSet::new(),
+                prefix_flushes: 0,
+                rerecordings: 0,
+                rerecord_warm_in: 0,
                 warm_in: 0,
                 warm_in_skipped: 0,
-                suppress_until: 0,
-                run_in_flight: 0,
+                pending: None,
                 position: 0,
                 barrier_scope,
                 replay_barriers,
@@ -518,6 +635,21 @@ impl IcbExecutor {
         self.inner.lock().warm_in = windows;
     }
 
+    /// Windows to let pass before a plan dropped for going stale is recorded
+    /// again.
+    ///
+    /// A step that goes stale is one whose stream stopped matching the
+    /// recording -- on LFM2, attention routing to its two-pass kernel at
+    /// `kv_len` 1024 inserts dispatches and allocations at every attention
+    /// layer -- so the plan is dropped at that step's close and a new one
+    /// recorded. An allocator that re-records over the same event (the arena,
+    /// `MetalDevice::finish_decode_step`) needs its own steps first, or the new
+    /// recording sees pool-served operands and covers nothing; a loop that
+    /// runs no such allocator passes 0.
+    pub fn set_rerecord_warm_in(&self, windows: usize) {
+        self.inner.lock().rerecord_warm_in = windows;
+    }
+
     /// Windows the warm-in dropped.
     pub fn warm_in_skipped(&self) -> usize {
         self.inner.lock().warm_in_skipped
@@ -534,7 +666,24 @@ impl IcbExecutor {
     pub fn end_step(
         &self,
         device: &crate::kernels::metal::Device,
+        commands: &Commands,
     ) -> Result<(), crate::kernels::MetalKernelError> {
+        // A run still pending at the boundary is one the stream ended inside:
+        // its validated members were suppressed on the promise of a range that
+        // never got issued, and the only correct place for that range is here,
+        // after the step's last dispatch and before the next step's first.
+        // Taken out from under the lock, because issuing it reaches the queue.
+        let unissued = {
+            let mut inner = self.inner.lock();
+            inner.pending.take()
+        };
+        if let Some(p) = unissued {
+            let encoder = commands.command_encoder()?;
+            encoder
+                .as_ref()
+                .execute_icb_range(&p.range, p.command, p.validated);
+            self.inner.lock().prefix_flushes += 1;
+        }
         // The constants pool hands position N the same buffer every step, which
         // is what makes a packed dispatch's identity stable enough to encode
         // (see `ConstantsPool`). Its cursor is per step, so it resets here --
@@ -550,11 +699,22 @@ impl IcbExecutor {
         let to_build: Option<(Vec<Vec<StepDispatch>>, BarrierScope)> = {
             let mut inner = self.inner.lock();
             inner.position = 0;
-            // Per-step, not cumulative: a run's suppression window belongs to the
-            // step that opened it. `poisoned` is deliberately *not* reset -- a run
-            // that went stale once is not re-armed, see `dispatch_action`.
-            inner.suppress_until = 0;
-            inner.run_in_flight = 0;
+            inner.step += 1;
+            let stale_this_step = std::mem::take(&mut inner.stale_this_step);
+            // A stale step is a stream the recording no longer describes: the
+            // plan is dropped and recorded again rather than replayed as a
+            // shrinking set of runs that still match. Every position of the
+            // stale step itself ran validated -- at a head that fell back, or
+            // as a prefix -- so nothing is owed for it; what is owed is
+            // coverage on the steps after it.
+            if inner.phase == Phase::Replaying && stale_this_step > 0 {
+                inner.plan = None;
+                inner.phase = Phase::Recording;
+                inner.recording = Recording::default();
+                inner.stale_runs.clear();
+                inner.warm_in = inner.rerecord_warm_in;
+                inner.rerecordings += 1;
+            }
             match inner.phase {
                 Phase::Recording => {
                     let step = std::mem::take(&mut inner.recording.current);
@@ -593,52 +753,51 @@ impl IcbExecutor {
         step: Vec<StepDispatch>,
     ) -> Option<(Vec<Vec<StepDispatch>>, BarrierScope)> {
         {
-
-                // The first window an executor sees is partial by construction:
-                // it opens wherever the caller installed the executor, which is
-                // mid-step unless the caller happened to install exactly at a
-                // boundary. Measured on LFM2, installing after the arena's
-                // recording steps gives a first window of 554 dispatches and a
-                // second of 556 -- the two extra being the `softmax_f32` and
-                // `affine_f32` that sampling contributes, which the first window
-                // opened too late to see.
-                //
-                // Discarding a window whose length differs from its predecessor,
-                // rather than requiring the caller to install at the right
-                // instant, keeps that timing out of the harness. `record_steps`
-                // counts *usable* windows, so this cannot silently shorten the
-                // recording: a discarded window does not count toward it.
-                //
-                // A window is only discarded while there is nothing to compare
-                // against or it disagrees with what came before. Two consecutive
-                // agreeing windows start the recording proper, and a later
-                // disagreement is a genuine non-steady-state step -- which
-                // `build_plan` refuses rather than aligning, because positions
-                // are compared by index and a shifted window pairs unrelated
-                // dispatches.
-                let len = step.len();
-                match inner.recording.expected_len {
-                    None => {
-                        // Nothing to compare against yet: remember the shape and
-                        // keep the window as a candidate.
-                        inner.recording.expected_len = Some(len);
-                        inner.recording.steps.push(step);
-                    }
-                    Some(expected) if expected == len => {
-                        inner.recording.steps.push(step);
-                    }
-                    Some(expected) => {
-                        // Disagreement. The earlier windows are the suspect ones
-                        // -- a partial first window is the common case and a
-                        // model that changes shape mid-run is not -- so restart
-                        // from this one rather than discarding it.
-                        inner.recording.discarded += inner.recording.steps.len();
-                        inner.recording.steps.clear();
-                        inner.recording.expected_len = Some(len);
-                        inner.recording.steps.push(step);
-                        let _ = expected;
-                    }
+            // The first window an executor sees is partial by construction:
+            // it opens wherever the caller installed the executor, which is
+            // mid-step unless the caller happened to install exactly at a
+            // boundary. Measured on LFM2, installing after the arena's
+            // recording steps gives a first window of 554 dispatches and a
+            // second of 556 -- the two extra being the `softmax_f32` and
+            // `affine_f32` that sampling contributes, which the first window
+            // opened too late to see.
+            //
+            // Discarding a window whose length differs from its predecessor,
+            // rather than requiring the caller to install at the right
+            // instant, keeps that timing out of the harness. `record_steps`
+            // counts *usable* windows, so this cannot silently shorten the
+            // recording: a discarded window does not count toward it.
+            //
+            // A window is only discarded while there is nothing to compare
+            // against or it disagrees with what came before. Two consecutive
+            // agreeing windows start the recording proper, and a later
+            // disagreement is a genuine non-steady-state step -- which
+            // `build_plan` refuses rather than aligning, because positions
+            // are compared by index and a shifted window pairs unrelated
+            // dispatches.
+            let len = step.len();
+            match inner.recording.expected_len {
+                None => {
+                    // Nothing to compare against yet: remember the shape and
+                    // keep the window as a candidate.
+                    inner.recording.expected_len = Some(len);
+                    inner.recording.steps.push(step);
                 }
+                Some(expected) if expected == len => {
+                    inner.recording.steps.push(step);
+                }
+                Some(expected) => {
+                    // Disagreement. The earlier windows are the suspect ones
+                    // -- a partial first window is the common case and a
+                    // model that changes shape mid-run is not -- so restart
+                    // from this one rather than discarding it.
+                    inner.recording.discarded += inner.recording.steps.len();
+                    inner.recording.steps.clear();
+                    inner.recording.expected_len = Some(len);
+                    inner.recording.steps.push(step);
+                    let _ = expected;
+                }
+            }
 
             if inner.recording.steps.len() >= inner.record_steps {
                 // Window complete: hand the steps and scope back so the caller
@@ -664,15 +823,22 @@ impl IcbExecutor {
         self.inner.lock().phase == Phase::Replaying
     }
 
-    /// Positions that fell back to the classical path because the live dispatch
-    /// no longer matched what was recorded.
+    /// Positions whose live dispatch no longer matched what was recorded.
     ///
     /// Zero is the expected value on a steady-state decode. A nonzero count is
-    /// not a correctness problem -- the fallback is what keeps it correct -- but
-    /// it means coverage is lower than the plan claims, and reporting the plan's
-    /// figure while this is nonzero would overstate what ran.
+    /// not a correctness problem -- a stale head falls back, a stale member
+    /// closes its run at the validated prefix, and no command executes from a
+    /// recording its live dispatch contradicts -- but it means the plan no
+    /// longer describes the stream, which is why the step that shows one is
+    /// the step the plan is dropped and recorded again ([`Self::rerecordings`]).
     pub fn stale_positions(&self) -> usize {
         self.inner.lock().stale_positions
+    }
+
+    /// The stale positions, attributed by axis and kernel, with the first
+    /// occurrences dated by step.
+    pub fn stale_report(&self) -> StaleReport {
+        self.inner.lock().stale.clone()
     }
 
     /// How many contiguous runs the covered positions form.
@@ -682,16 +848,23 @@ impl IcbExecutor {
     /// replay is a single computed jump or many. Measured at 31 on
     /// `Sdpa × arena`; see `Run`.
     pub fn runs(&self) -> usize {
-        self.inner
-            .lock()
-            .plan
-            .as_ref()
-            .map_or(0, |p| p.runs.len())
+        self.inner.lock().plan.as_ref().map_or(0, |p| p.runs.len())
     }
 
-    /// Runs that went stale and are no longer replayed.
-    pub fn poisoned_runs(&self) -> usize {
-        self.inner.lock().poisoned.len()
+    /// Distinct runs that went stale at least once under the current plan.
+    pub fn stale_runs(&self) -> usize {
+        self.inner.lock().stale_runs.len()
+    }
+
+    /// Runs issued as a validated prefix because a later member stopped
+    /// matching, or because the step ended before the tail.
+    pub fn prefix_flushes(&self) -> usize {
+        self.inner.lock().prefix_flushes
+    }
+
+    /// Plans dropped and recorded again after a step went stale.
+    pub fn rerecordings(&self) -> usize {
+        self.inner.lock().rerecordings
     }
 
     /// `useResource` declarations one replayed step makes: the sum over runs of
@@ -717,16 +890,12 @@ impl IcbExecutor {
 
     /// Each run's residency set, as buffer addresses, in run order.
     pub fn run_residency(&self) -> Vec<Vec<usize>> {
-        self.inner
-            .lock()
-            .plan
-            .as_ref()
-            .map_or(Vec::new(), |p| {
-                p.runs
-                    .iter()
-                    .map(|r| r.range.resident.iter().map(Buffer::raw_addr).collect())
-                    .collect()
-            })
+        self.inner.lock().plan.as_ref().map_or(Vec::new(), |p| {
+            p.runs
+                .iter()
+                .map(|r| r.range.resident.iter().map(Buffer::raw_addr).collect())
+                .collect()
+        })
     }
 
     /// Barriers encoded onto ICB commands.
@@ -737,11 +906,7 @@ impl IcbExecutor {
     /// rather than assumed, because it is the quantity whose absence produced
     /// the only wrong answer this work has seen.
     pub fn encoded_barriers(&self) -> usize {
-        self.inner
-            .lock()
-            .plan
-            .as_ref()
-            .map_or(0, |p| p.barriers)
+        self.inner.lock().plan.as_ref().map_or(0, |p| p.barriers)
     }
 
     /// Recording windows discarded for disagreeing in dispatch count with what
@@ -753,6 +918,103 @@ impl IcbExecutor {
     /// boundary, means the boundary is in the wrong place.
     pub fn discarded_windows(&self) -> usize {
         self.inner.lock().recording.discarded
+    }
+}
+
+impl IcbExecutor {
+    /// What to do with position `pos` of a replaying step, whose live dispatch
+    /// is `live`.
+    ///
+    /// The validation half of §11.1a's record-and-validate, with the run as the
+    /// unit of *issue* and the position as the unit of *check*: a run's head
+    /// opens a pending run, each member is checked against its recording as it
+    /// is offered, and the range is issued only once its tail has matched.
+    /// Replaying a command whose buffers have moved is silent corruption under
+    /// `HazardTrackingModeUntracked` (§3.5), so a member that does not match
+    /// closes the run at that point -- the validated prefix is issued as a
+    /// range, the member itself and everything after it in the run encode
+    /// classically -- and no position executes twice, because a suppressed
+    /// member's command is exactly the one in the prefix.
+    fn replay_action(inner: &mut Inner, pos: usize, live: &StepDispatch) -> DispatchAction {
+        let step = inner.step;
+        let Some(plan) = inner.plan.as_ref() else {
+            return DispatchAction::Encode;
+        };
+
+        // Inside a pending run: this position's command is in the range the
+        // tail will issue, provided it still matches.
+        if let Some(p) = inner.pending.as_mut() {
+            let cmd = p.command + (pos - p.start);
+            if plan.reference[cmd].replay_compatible(live) {
+                p.validated += 1;
+                if pos + 1 == p.start + p.len {
+                    let p = inner.pending.take().expect("pending was Some");
+                    return DispatchAction::ExecuteIcb {
+                        icb: p.range,
+                        location: p.command,
+                        length: p.len,
+                    };
+                }
+                return DispatchAction::Suppress;
+            }
+            // The member moved. Issue what was validated, fence, and let this
+            // dispatch -- whose bindings are on the encoder right now -- run as
+            // itself. The rest of the run is offered position by position and
+            // encodes classically: no pending run, no `run_at` entry.
+            let axis = stale_axis(&plan.reference[cmd], live);
+            let kernel = live.kernel.as_deref().unwrap_or("<unnamed>").to_string();
+            let p = inner.pending.take().expect("pending was Some");
+            inner.stale.note(step, pos, kernel, axis, false);
+            inner.stale_positions += 1;
+            inner.stale_this_step += 1;
+            inner.stale_runs.insert(p.run);
+            inner.prefix_flushes += 1;
+            return DispatchAction::ExecuteIcbThenEncode {
+                icb: p.range,
+                location: p.command,
+                length: p.validated,
+            };
+        }
+
+        let Some(cmd) = plan.command_of.get(pos).copied().flatten() else {
+            // Not covered: the classical path runs it, which is what makes
+            // this executor partial rather than wrong.
+            return DispatchAction::Encode;
+        };
+        let Some(run_index) = plan.run_at.get(pos).copied().flatten() else {
+            // Covered, but neither a run head nor inside a pending run -- so
+            // its run closed early at a member that moved. Encode it.
+            return DispatchAction::Encode;
+        };
+        if !plan.reference[cmd].replay_compatible(live) {
+            let axis = stale_axis(&plan.reference[cmd], live);
+            let kernel = live.kernel.as_deref().unwrap_or("<unnamed>").to_string();
+            inner.stale.note(step, pos, kernel, axis, true);
+            inner.stale_positions += 1;
+            inner.stale_this_step += 1;
+            inner.stale_runs.insert(run_index);
+            return DispatchAction::Encode;
+        }
+        let run = &plan.runs[run_index];
+        let (start, command, len) = (run.start, run.command, run.len);
+        let range = Arc::clone(&run.range);
+        if len == 1 {
+            // A run of one is validated in full at its head.
+            return DispatchAction::ExecuteIcb {
+                icb: range,
+                location: command,
+                length: 1,
+            };
+        }
+        inner.pending = Some(PendingRun {
+            run: run_index,
+            start,
+            command,
+            len,
+            validated: 1,
+            range,
+        });
+        DispatchAction::Suppress
     }
 }
 
@@ -1044,7 +1306,7 @@ fn encode_plan(
             unsafe { cmd.setKernelBuffer_offset_atIndex(buf.as_ref(), b.offset, b.index) };
             // The run's residency set is derived from the very binding just
             // encoded, so it cannot fall behind the command.
-            run.bind(buf);
+            run.bind(buf, b.is_output);
             plan_resident.insert(buf.raw_addr());
         }
         let tg = MTLSize {
@@ -1097,6 +1359,15 @@ fn encode_plan(
     // and read back from the plan (`residency_per_step` against
     // `runs x plan_resident`) rather than from the variable.
     let plan_wide = residency_arm() == ResidencyArm::PlanWide;
+    let everything_written: Vec<usize> = if plan_wide {
+        let mut seen = std::collections::HashSet::new();
+        runs.iter()
+            .flat_map(|r| r.written.iter().copied())
+            .filter(|p| seen.insert(*p))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let everything: Vec<Buffer> = if plan_wide {
         let mut seen = std::collections::HashSet::new();
         runs.iter()
@@ -1119,6 +1390,11 @@ fn encode_plan(
                     everything.clone()
                 } else {
                     r.resident
+                },
+                written: if plan_wide {
+                    everything_written.clone()
+                } else {
+                    r.written
                 },
             }),
         })
@@ -1159,6 +1435,9 @@ struct RunBuild {
     len: usize,
     resident: Vec<Buffer>,
     seen: std::collections::HashSet<usize>,
+    /// Buffers a command in this run writes, once each.
+    written: Vec<usize>,
+    written_seen: std::collections::HashSet<usize>,
 }
 
 impl RunBuild {
@@ -1169,13 +1448,19 @@ impl RunBuild {
             len: 0,
             resident: Vec::new(),
             seen: std::collections::HashSet::new(),
+            written: Vec::new(),
+            written_seen: std::collections::HashSet::new(),
         }
     }
 
-    /// A command in this run binds `buf`; declare it once per run.
-    fn bind(&mut self, buf: &Buffer) {
+    /// A command in this run binds `buf`; declare it once per run, and once
+    /// among the run's writes if the command writes it.
+    fn bind(&mut self, buf: &Buffer, is_output: bool) {
         if self.seen.insert(buf.raw_addr()) {
             self.resident.push(buf.clone());
+        }
+        if is_output && self.written_seen.insert(buf.raw_addr()) {
+            self.written.push(buf.raw_addr());
         }
     }
 }
@@ -1210,87 +1495,7 @@ impl Executor for IcbExecutor {
                 // the replay was derived from.
                 DispatchAction::Encode
             }
-            Phase::Replaying => {
-                let Some(plan) = inner.plan.as_ref() else {
-                    return DispatchAction::Encode;
-                };
-                let Some(Some(cmd)) = plan.command_of.get(pos).copied() else {
-                    // Not covered: the classical path runs it, which is what
-                    // makes this executor partial rather than wrong.
-                    return DispatchAction::Encode;
-                };
-                // The live dispatch must still be what the command was encoded
-                // from. This is the validation half of §11.1a's
-                // record-and-validate: replaying a command whose buffers have
-                // moved is silent corruption under
-                // `HazardTrackingModeUntracked` (§3.5), so a mismatch falls back
-                // rather than trusting the plan.
-                //
-                // **The unit of that decision is the run, not the position.** A
-                // run is executed by one `executeCommandsInBuffer` at its head,
-                // so by the time a later member of the run is offered, its
-                // command has already run. Falling back *there* would encode the
-                // dispatch a second time and the position would execute twice --
-                // for `badd_f16` that is a residual added twice, which is a
-                // plausible wrong answer rather than a crash. So a run is
-                // validated as a whole, at its head, and either replays entirely
-                // or not at all.
-                //
-                // Positions inside a run are therefore not re-checked here: the
-                // head checked them, and its verdict is recorded in
-                // `suppress_until`.
-                // Inside a run whose head already executed the range.
-                if pos < inner.suppress_until {
-                    // Still checked, and the verdict is *reported* rather than
-                    // acted on: the command has already run, so encoding it now
-                    // would execute this position twice -- for `badd_f16` a
-                    // residual added twice, which is a plausible wrong answer
-                    // rather than a crash. What the check buys is that a run
-                    // going stale mid-flight becomes a nonzero `stale_positions`
-                    // the harness must report, instead of silence.
-                    //
-                    // It is not a race that can be lost quietly: a stale member
-                    // disables its run from the *next* step onward (`poisoned`),
-                    // and the digest gate is what says whether the step it was
-                    // first seen on was already wrong.
-                    if !plan.reference[cmd].replay_compatible(&live) {
-                        inner.stale_positions += 1;
-                        let run_index = inner.run_in_flight;
-                        inner.poisoned.insert(run_index);
-                    }
-                    return DispatchAction::Suppress;
-                }
-                let Some(run_index) = plan.run_at.get(pos).copied().flatten() else {
-                    // Covered, but neither a run head nor inside a live run --
-                    // so its run fell back at the head. Encode it classically.
-                    let _ = cmd;
-                    return DispatchAction::Encode;
-                };
-                // A run that ever went stale is never replayed again. One
-                // position's operands moving means the recording no longer
-                // describes this step, and re-arming it per step would rediscover
-                // that after executing the range rather than before.
-                if inner.poisoned.contains(&run_index) {
-                    return DispatchAction::Encode;
-                }
-                if !plan.reference[cmd].replay_compatible(&live) {
-                    inner.stale_positions += 1;
-                    inner.poisoned.insert(run_index);
-                    return DispatchAction::Encode;
-                }
-                let run = &plan.runs[run_index];
-                let (start, command, len) = (run.start, run.command, run.len);
-                let range = Arc::clone(&run.range);
-                // Suppress the rest of this run: their commands run as part of
-                // the range being requested now.
-                inner.suppress_until = start + len;
-                inner.run_in_flight = run_index;
-                DispatchAction::ExecuteIcb {
-                    icb: range,
-                    location: command,
-                    length: len,
-                }
-            }
+            Phase::Replaying => Self::replay_action(&mut inner, pos, &live),
         }
     }
 
@@ -1308,25 +1513,32 @@ impl Executor for IcbExecutor {
     /// the drain is the real one, and splitting the decision from it is the
     /// seam.
     ///
-    /// This reads `phase`, `suppress_until` and `poisoned` and **touches none of
-    /// the pending state**. `position` is likewise only read: the increment
-    /// stays in `dispatch_action`, so calling this any number of times per
-    /// dispatch -- including zero, which is what `ReplayBarriers::Always` does
-    /// -- leaves the executor's cursor exactly where it was.
+    /// This reads `phase` and the pending run and **touches none of the
+    /// pending state**. `position` is likewise only read: the increment stays
+    /// in `dispatch_action`, so calling this any number of times per dispatch
+    /// -- including zero, which is what `ReplayBarriers::Always` does -- leaves
+    /// the executor's cursor exactly where it was.
     ///
     /// # Why the answer is `ReplayedInFlightRun` and not "covered"
     ///
-    /// `pos < suppress_until` is precisely *"a non-head member of a run whose
-    /// head has already validated and executed its range"*, which is the
-    /// predicate `measurements/issue-144-predicate.md` argues and no wider:
+    /// A pending run is one whose head has matched and whose range will be
+    /// issued at its tail, so a position inside it is precisely *"a non-head
+    /// member of a run being replayed"*, which is the predicate
+    /// `measurements/issue-144-predicate.md` argues and no wider:
     ///
-    /// * a **run head** has `pos == suppress_until`'s lower bound at the moment
-    ///   it is offered and is therefore never inside the window -- so obstacle 1
-    ///   is discharged by construction rather than by an exclusion someone has
-    ///   to remember;
+    /// * a **run head** is offered while no run is pending -- the previous
+    ///   run's window closed at its tail -- so obstacle 1 is discharged by
+    ///   construction rather than by an exclusion someone has to remember;
     /// * a **gap** position is not in any run's window;
-    /// * a **poisoned or fallen-back** run never sets the window, so its members
-    ///   are encoded classically and keep their barriers.
+    /// * a **fallen-back** run never opens a window, so its members are
+    ///   encoded classically and keep their barriers.
+    ///
+    /// The barrier a member's `auto_barrier` would have emitted is deferred
+    /// rather than dropped (`encoder.rs`), so when the range is issued at the
+    /// tail the first classical dispatch after it still fences against the
+    /// run's writes; and a member that fails validation is fenced by the
+    /// encoder itself, after the validated prefix and before it
+    /// (`DispatchAction::ExecuteIcbThenEncode`).
     fn disposition(&self) -> Disposition {
         let inner = self.inner.lock();
         if inner.replay_barriers != ReplayBarriers::SkipReplayed {
@@ -1335,13 +1547,10 @@ impl Executor for IcbExecutor {
         if inner.phase != Phase::Replaying {
             return Disposition::Unknown;
         }
-        // Inside a run whose head already executed the range. The head itself is
-        // excluded: when a head is offered, `suppress_until` still holds the
-        // *previous* run's bound, which never covers it.
-        if inner.position < inner.suppress_until {
-            return Disposition::ReplayedInFlightRun;
+        match inner.pending.as_ref() {
+            Some(p) if inner.position < p.start + p.len => Disposition::ReplayedInFlightRun,
+            _ => Disposition::Unknown,
         }
-        Disposition::Unknown
     }
 
     fn will_bind_buffer(&self, index: usize, buffer: &Buffer, offset: usize, is_output: bool) {
@@ -1364,7 +1573,8 @@ impl Executor for IcbExecutor {
     fn end_step(
         &self,
         device: &crate::kernels::metal::Device,
+        commands: &Commands,
     ) -> Result<(), crate::kernels::MetalKernelError> {
-        IcbExecutor::end_step(self, device)
+        IcbExecutor::end_step(self, device, commands)
     }
 }

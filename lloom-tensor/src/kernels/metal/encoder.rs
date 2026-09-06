@@ -554,7 +554,9 @@ impl ComputeCommandEncoder {
             raw,
             command_buffer,
             fence,
-            state: Arc::new(parking_lot::Mutex::new(EncoderState::with_hazard_key(hazard_key()))),
+            state: Arc::new(parking_lot::Mutex::new(EncoderState::with_hazard_key(
+                hazard_key(),
+            ))),
             prev_ce_outputs,
             executor,
             capturing: Arc::new(AtomicBool::new(false)),
@@ -671,7 +673,33 @@ impl ComputeCommandEncoder {
                 self.execute_icb_range(&icb, location, length);
                 false
             }
+            DispatchAction::ExecuteIcbThenEncode {
+                icb,
+                location,
+                length,
+            } => {
+                self.execute_icb_range(&icb, location, length);
+                self.barrier_after_icb();
+                true
+            }
         }
+    }
+
+    /// Order the dispatch about to be encoded after a range issued a moment
+    /// ago, at a point its own `auto_barrier` has already passed.
+    ///
+    /// The hazard sets are left as they are rather than rolled: they already
+    /// hold this dispatch's bindings (bound before `auto_barrier` ran), and
+    /// the next position must still be checked against them. Only the latch
+    /// is discharged, because the fence just emitted is the one it asked for.
+    fn barrier_after_icb(&self) {
+        let mut s = self.state.lock();
+        self.raw.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        let kinds = s.pending_kinds.take();
+        trace::record_barrier_kinds(kinds);
+        trace::record_barrier();
+        crate::kernels::metal::hazard_audit::record_barrier(kinds);
+        s.needs_barrier = false;
     }
 
     /// Run `length` pre-encoded ICB commands from `location`, here.
@@ -680,12 +708,29 @@ impl ComputeCommandEncoder {
     /// commands land between the same two classically-encoded neighbours the
     /// originals had. `metal::icb::Run` carries why that placement is the whole
     /// of the correctness argument.
-    fn execute_icb_range(
+    pub(crate) fn execute_icb_range(
         &self,
         range: &crate::kernels::metal::executor::IcbRange,
         location: usize,
         length: usize,
     ) {
+        // The range is ordered against earlier encoder sessions here, on the
+        // encoder that executes it, and not only through the binds its
+        // members made: a run validated to its tail executes after every
+        // member's bind, and a cut between head and tail would leave those
+        // binds' fence waits on an encoder that has already ended. Waiting
+        // once per buffer is the same per-buffer wait a classical bind makes,
+        // and registering the writes is what lets the next session wait on
+        // this one.
+        for buf in &range.resident {
+            self.wait_for_buffer(buf.raw_ptr() as usize);
+        }
+        {
+            let mut s = self.state.lock();
+            for &ptr in &range.written {
+                s.all_outputs.insert(ptr);
+            }
+        }
         // SAFETY: every resource a command in this run binds is in the run's
         // `resident` -- the plan collects them from the bindings as it encodes
         // each command, so the set cannot fall behind the commands -- and

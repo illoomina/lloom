@@ -60,6 +60,17 @@ pub enum CutPolicy {
     /// The default and the shipping path; §13.5j's arm and every recorded
     /// digest belong to it.
     DispatchCounter,
+    /// Cut at the first node boundary once `compute_per_buffer` dispatches
+    /// have accumulated, and unconditionally at four periods.
+    ///
+    /// The counter's period as a *lower bound* on a session's length and the
+    /// graph's own boundaries as the places a seam may fall: the count stays
+    /// the counter's to within a node, the placement is the graph's, and a
+    /// stream that marks no nodes (a model that never calls
+    /// `mark_graph_node`) is still cut by the hard bound rather than growing
+    /// one command buffer for its whole pass. `CANDLE_METAL_CUT_POLICY=
+    /// node-aligned`.
+    NodeAligned,
     /// Cut on a layer-index partition: `n_cb` contiguous runs of the layer
     /// sequence, so every seam lands on a layer boundary and the session count
     /// is `n_cb` by construction.
@@ -84,8 +95,11 @@ impl CutPolicy {
     /// the previous token's `flush_and_wait_current` left. Cutting there would
     /// make the session count `n_cb + 1` and break the held-count property the
     /// arm exists to have.
+    ///
+    /// `since_cut` is how many dispatches the open session holds when the node
+    /// is reached; only `NodeAligned` reads it, against `compute_per_buffer`.
     #[inline]
-    pub fn cuts_at_node(&self, index: usize) -> bool {
+    pub fn cuts_at_node(&self, index: usize, since_cut: usize, compute_per_buffer: usize) -> bool {
         match self {
             // A dispatch counter has no notion of graph position, which is
             // §13.5i's whole finding. It cannot answer this question and does
@@ -94,6 +108,58 @@ impl CutPolicy {
             CutPolicy::NodeIndex { nodes_per_cb } => {
                 index > 0 && index.is_multiple_of(*nodes_per_cb)
             }
+            CutPolicy::NodeAligned => index > 0 && since_cut >= compute_per_buffer,
+        }
+    }
+
+    /// The dispatch count at which `NodeAligned` cuts whether or not a node
+    /// boundary has arrived, as a multiple of the period.
+    pub const NODE_ALIGNED_HARD_BOUND: usize = 4;
+
+    /// Whether a session `since_cut` dispatches long must be cut at this
+    /// dispatch, node or no node.
+    #[inline]
+    pub fn cuts_at_dispatch(&self, since_cut: usize, compute_per_buffer: usize) -> bool {
+        match self {
+            CutPolicy::DispatchCounter => since_cut >= compute_per_buffer,
+            CutPolicy::NodeIndex { .. } => false,
+            CutPolicy::NodeAligned => {
+                since_cut >= compute_per_buffer.saturating_mul(Self::NODE_ALIGNED_HARD_BOUND)
+            }
+        }
+    }
+
+    /// The arm as a `RESULT`-line token, with the period the counter arms
+    /// use: `Counter(50)`, `Node(3)`, `NodeAligned(50)`.
+    pub fn render(policy: CutPolicy, compute_per_buffer: usize) -> String {
+        match policy {
+            CutPolicy::DispatchCounter => format!("Counter({compute_per_buffer})"),
+            CutPolicy::NodeIndex { nodes_per_cb } => format!("Node({nodes_per_cb})"),
+            CutPolicy::NodeAligned => format!("NodeAligned({compute_per_buffer})"),
+        }
+    }
+
+    /// Parse the environment's spelling: `counter`, `node-aligned`, or
+    /// `nodes:<k>`.
+    pub fn from_env_str(s: &str) -> Result<CutPolicy, String> {
+        match s {
+            "counter" => Ok(CutPolicy::DispatchCounter),
+            "node-aligned" => Ok(CutPolicy::NodeAligned),
+            other => match other.strip_prefix("nodes:") {
+                Some(k) => {
+                    let n: usize = k
+                        .parse()
+                        .map_err(|_| format!("nodes:<k> needs a positive integer, got {k:?}"))?;
+                    if n == 0 {
+                        return Err("nodes:0 would cut at every node and then some".to_string());
+                    }
+                    Ok(CutPolicy::NodeIndex { nodes_per_cb: n })
+                }
+                None => Err(format!(
+                    "CANDLE_METAL_CUT_POLICY must be `counter`, `node-aligned` or `nodes:<k>`, \
+                     got {other:?}"
+                )),
+            },
         }
     }
 
@@ -115,6 +181,10 @@ impl CutPolicy {
             // why it cannot be held while placement moves (§13.5j).
             CutPolicy::DispatchCounter => n_dispatches.div_ceil(compute_per_buffer.max(1)),
             CutPolicy::NodeIndex { nodes_per_cb } => n_nodes.div_ceil((*nodes_per_cb).max(1)),
+            // At most the counter's count, at least one; the exact figure
+            // depends on where the nodes fall against the period and is
+            // read from the run rather than predicted here.
+            CutPolicy::NodeAligned => n_dispatches.div_ceil(compute_per_buffer.max(1)).max(1),
         }
     }
 }
@@ -415,7 +485,10 @@ impl Commands {
                 );
                 CutPolicy::NodeIndex { nodes_per_cb: n }
             }
-            _ => CutPolicy::DispatchCounter,
+            _ => match std::env::var("CANDLE_METAL_CUT_POLICY") {
+                Ok(val) => CutPolicy::from_env_str(&val).unwrap_or_else(|e| panic!("{e}")),
+                _ => CutPolicy::DispatchCounter,
+            },
         };
 
         if let Some(raw) = residency_set.raw() {
@@ -658,7 +731,11 @@ impl Commands {
     /// restatement of it beside the one that runs (§15.2 #12b's shape).
     #[inline]
     pub fn mark_graph_node(&self, index: usize) {
-        if self.cut_policy.cuts_at_node(index) {
+        let since_cut = self.compute_count.load(Ordering::Relaxed);
+        if self
+            .cut_policy
+            .cuts_at_node(index, since_cut, self.compute_per_buffer)
+        {
             self.node_cut_pending.store(true, Ordering::Relaxed);
         }
     }
@@ -679,6 +756,12 @@ impl Commands {
         match self.cut_policy {
             CutPolicy::DispatchCounter => count >= self.compute_per_buffer,
             CutPolicy::NodeIndex { .. } => self.node_cut_pending.swap(false, Ordering::Relaxed),
+            CutPolicy::NodeAligned => {
+                self.node_cut_pending.swap(false, Ordering::Relaxed)
+                    || self
+                        .cut_policy
+                        .cuts_at_dispatch(count, self.compute_per_buffer)
+            }
         }
     }
 
@@ -862,6 +945,11 @@ impl Commands {
             )
         })?;
         Ok(CommandMarker { cb, signalled })
+    }
+
+    /// Whether the marker's buffer has already retired, without waiting.
+    pub fn marker_complete(&self, marker: &CommandMarker) -> bool {
+        marker.cb.status() == MTLCommandBufferStatus::Completed
     }
 
     /// Wait for the marker's buffer only; commits made after it keep running.

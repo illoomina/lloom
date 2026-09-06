@@ -36,7 +36,7 @@ fn device() -> Device {
 fn commands(device: &Device) -> Commands {
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(device));
-    Commands::new(queue, &residency_set).unwrap()
+    Commands::new(queue, residency_set).unwrap()
 }
 
 fn read_f32(buf: &crate::kernels::Buffer, n: usize) -> Vec<f32> {

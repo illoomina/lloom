@@ -13,7 +13,7 @@ fn device() -> Device {
 fn commands(device: &Device) -> Commands {
     let queue = device.new_command_queue().unwrap();
     let residency_set = Arc::new(ResidencySet::new(device));
-    Commands::new(queue, &residency_set).unwrap()
+    Commands::new(queue, residency_set).unwrap()
 }
 
 /// Records what it is shown and forwards everything, so a run under it must

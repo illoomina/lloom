@@ -1593,6 +1593,9 @@ impl Axes {
                 Some((candle::metal_backend::CutPolicy::NodeIndex { nodes_per_cb }, _)) => {
                     format!("Node({nodes_per_cb})")
                 }
+                Some((candle::metal_backend::CutPolicy::NodeAligned, period)) => {
+                    format!("NodeAligned({period})")
+                }
                 // No Metal device, so there are no command buffers to cut.
                 // Distinct from either arm rather than folded into the default.
                 None => "n/a".to_string(),

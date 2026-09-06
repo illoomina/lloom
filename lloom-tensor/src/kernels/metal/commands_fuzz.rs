@@ -211,7 +211,7 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
         .new_command_queue()
         .map_err(|e| format!("new_command_queue: {e:?}"))?;
     let residency_set = Arc::new(ResidencySet::new(dev));
-    let cmds = Commands::new(queue, &residency_set).map_err(|e| format!("Commands::new: {e:?}"))?;
+    let cmds = Commands::new(queue, residency_set).map_err(|e| format!("Commands::new: {e:?}"))?;
     let kernels = Kernels::new();
 
     let options = crate::kernels::RESOURCE_OPTIONS;
@@ -581,18 +581,18 @@ fn in_flight_has_one_growth_site_and_three_shrink_sites() {
         .collect();
     assert_eq!(
         retains.len(),
-        2,
-        "expected exactly two retain-based shrink sites on in_flight \
-         (flush_and_wait_current's and flush_and_prune's), found {retains:#?}. \
+        3,
+        "expected exactly three retain-based shrink sites on in_flight \
+         (flush_and_wait_current's, flush_and_prune's and wait_marker's), found {retains:#?}. \
          Losing one is the unbounded-queue defect #493 repaired."
     );
 
     // The asymmetry §17's prediction rests on, stated as the number a reader
-    // can check: one unconditional push against three conditional removals, of
+    // can check: one unconditional push against four conditional removals, of
     // which exactly one does not block.
     assert_eq!(
         pushes.len() + takes.len() + retains.len(),
-        4,
+        5,
         "the growth/shrink census moved; the fuzzer's model is written against it"
     );
 }

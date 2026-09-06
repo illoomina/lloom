@@ -1293,9 +1293,9 @@ fn main() -> Result<()> {
             // dispatch in different steps -- which reads as "everything varies"
             // rather than as a misaligned boundary.
             #[cfg(feature = "metal")]
-            if let (Some(exec), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
+            if let (Some(_), Some(dev)) = (icb_executor.as_ref(), metal_device.as_ref()) {
                 if decode_steps >= icb_installed_at {
-                    exec.end_step(dev.metal_device())
+                    dev.end_executor_step()
                         .map_err(|e| anyhow::anyhow!("closing ICB step {decode_steps}: {e}"))?;
                 }
             }
@@ -1423,11 +1423,35 @@ fn main() -> Result<()> {
             exec.runs(),
             exec.encoded_barriers(),
             exec.stale_positions(),
-            exec.poisoned_runs(),
+            exec.stale_runs(),
             exec.discarded_windows(),
             cov.varies,
             cov.inline_constants,
         );
+        let stale = exec.stale_report();
+        if !stale.first.is_empty() {
+            let by_axis: Vec<String> = stale
+                .by_axis
+                .iter()
+                .map(|(axis, n)| format!("{axis}={n}"))
+                .collect();
+            println!(
+                "ICB stale: steps_with_stale={} prefix_flushes={} rerecordings={} by_axis: {}",
+                stale.steps,
+                exec.prefix_flushes(),
+                exec.rerecordings(),
+                by_axis.join(" ")
+            );
+            for (kernel, n) in &stale.by_kernel {
+                println!("ICB stale {n:4} {kernel}");
+            }
+            for (step, pos, kernel, axis, at_head) in stale.first.iter().take(16) {
+                println!(
+                    "ICB stale first: step={step} pos={pos} {kernel} {axis} {}",
+                    if *at_head { "head" } else { "member" }
+                );
+            }
+        }
         println!("ICB barrier scope: {icb_barrier_scope:?}");
         // Issue #144. Printed beside the scope because the two axes are
         // independent and a reader comparing arms needs both: `BarrierScope`

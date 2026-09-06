@@ -46,7 +46,7 @@ fn the_dispatch_counter_never_cuts_on_a_node() {
     let policy = CutPolicy::DispatchCounter;
     for index in 0..LFM2_LAYERS {
         assert!(
-            !policy.cuts_at_node(index),
+            !policy.cuts_at_node(index, 0, 50),
             "the counter cut at node {index}; the default path must be unchanged (§7.1a)"
         );
     }
@@ -60,11 +60,11 @@ fn node_zero_never_cuts_under_either_policy() {
     for nodes_per_cb in 1..=LFM2_LAYERS {
         let policy = CutPolicy::NodeIndex { nodes_per_cb };
         assert!(
-            !policy.cuts_at_node(0),
+            !policy.cuts_at_node(0, 0, 50),
             "node 0 cut at nodes_per_cb={nodes_per_cb}; that is one session too many"
         );
     }
-    assert!(!CutPolicy::DispatchCounter.cuts_at_node(0));
+    assert!(!CutPolicy::DispatchCounter.cuts_at_node(0, 0, 50));
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn the_partition_cuts_exactly_at_the_run_boundaries() {
     // arm puts its nine seams at exactly those layers (§13.5m's table).
     let policy = CutPolicy::NodeIndex { nodes_per_cb: 3 };
     let cuts: Vec<usize> = (0..LFM2_LAYERS)
-        .filter(|&i| policy.cuts_at_node(i))
+        .filter(|&i| policy.cuts_at_node(i, 0, 50))
         .collect();
     assert_eq!(
         cuts,
@@ -91,7 +91,9 @@ fn the_session_count_is_the_partition_count_by_construction() {
     // count while `COMPUTE_PER_BUFFER` cannot (§13.5j).
     for nodes_per_cb in 1..=LFM2_LAYERS {
         let policy = CutPolicy::NodeIndex { nodes_per_cb };
-        let interior = (0..LFM2_LAYERS).filter(|&i| policy.cuts_at_node(i)).count();
+        let interior = (0..LFM2_LAYERS)
+            .filter(|&i| policy.cuts_at_node(i, 0, 50))
+            .count();
         let expected = LFM2_LAYERS.div_ceil(nodes_per_cb);
         assert_eq!(
             interior + 1,
@@ -178,7 +180,7 @@ fn a_run_length_that_does_not_divide_the_layer_count_still_partitions() {
     // blindness in a second quantity.
     let policy = CutPolicy::NodeIndex { nodes_per_cb: 4 };
     let cuts: Vec<usize> = (0..LFM2_LAYERS)
-        .filter(|&i| policy.cuts_at_node(i))
+        .filter(|&i| policy.cuts_at_node(i, 0, 50))
         .collect();
     assert_eq!(cuts, vec![4, 8, 12, 16, 20, 24, 28]);
     assert_eq!(cuts.len() + 1, 8, "the short tail run is not counted");
@@ -197,7 +199,7 @@ fn a_run_length_of_one_cuts_at_every_layer() {
     // it: 30 layers, 29 interior boundaries, 30 sessions.
     let policy = CutPolicy::NodeIndex { nodes_per_cb: 1 };
     let cuts: Vec<usize> = (0..LFM2_LAYERS)
-        .filter(|&i| policy.cuts_at_node(i))
+        .filter(|&i| policy.cuts_at_node(i, 0, 50))
         .collect();
     assert_eq!(cuts.len(), LFM2_LAYERS - 1);
     assert_eq!(cuts.first(), Some(&1));
@@ -213,9 +215,71 @@ fn a_run_length_at_or_past_the_layer_count_cuts_nowhere() {
     for nodes_per_cb in [LFM2_LAYERS, LFM2_LAYERS + 1, 1024] {
         let policy = CutPolicy::NodeIndex { nodes_per_cb };
         assert_eq!(
-            (0..LFM2_LAYERS).filter(|&i| policy.cuts_at_node(i)).count(),
+            (0..LFM2_LAYERS)
+                .filter(|&i| policy.cuts_at_node(i, 0, 50))
+                .count(),
             0
         );
         assert_eq!(policy.sessions_for(LFM2_LAYERS, 50, LFM2_DISPATCHES), 1);
     }
+}
+
+#[test]
+fn node_aligned_cuts_at_the_first_node_after_the_period_and_never_before() {
+    // The counter's period as a lower bound on a session, the graph's
+    // boundaries as the only places a seam may fall: below the period no node
+    // cuts, at or past it every node but the first does.
+    let policy = CutPolicy::NodeAligned;
+    for index in 1..LFM2_LAYERS {
+        assert!(
+            !policy.cuts_at_node(index, 49, 50),
+            "node {index} cut below the period"
+        );
+        assert!(
+            policy.cuts_at_node(index, 50, 50),
+            "node {index} did not cut at the period"
+        );
+        assert!(
+            policy.cuts_at_node(index, 137, 50),
+            "node {index} did not cut past the period"
+        );
+    }
+    assert!(!policy.cuts_at_node(0, 500, 50), "node 0 never cuts");
+    // Between nodes only the hard bound cuts, at four periods, so a stream
+    // that marks no nodes is still bounded.
+    assert!(!policy.cuts_at_dispatch(199, 50));
+    assert!(policy.cuts_at_dispatch(200, 50));
+    // The counter arm cuts on the count alone and the index arm never does.
+    assert!(CutPolicy::DispatchCounter.cuts_at_dispatch(50, 50));
+    assert!(!CutPolicy::NodeIndex { nodes_per_cb: 3 }.cuts_at_dispatch(10_000, 50));
+}
+
+#[test]
+fn the_environment_spelling_round_trips() {
+    assert_eq!(
+        CutPolicy::from_env_str("counter"),
+        Ok(CutPolicy::DispatchCounter)
+    );
+    assert_eq!(
+        CutPolicy::from_env_str("node-aligned"),
+        Ok(CutPolicy::NodeAligned)
+    );
+    assert_eq!(
+        CutPolicy::from_env_str("nodes:3"),
+        Ok(CutPolicy::NodeIndex { nodes_per_cb: 3 })
+    );
+    assert!(CutPolicy::from_env_str("nodes:0").is_err());
+    assert!(CutPolicy::from_env_str("layers").is_err());
+    assert_eq!(
+        CutPolicy::render(CutPolicy::DispatchCounter, 50),
+        "Counter(50)"
+    );
+    assert_eq!(
+        CutPolicy::render(CutPolicy::NodeAligned, 50),
+        "NodeAligned(50)"
+    );
+    assert_eq!(
+        CutPolicy::render(CutPolicy::NodeIndex { nodes_per_cb: 3 }, 50),
+        "Node(3)"
+    );
 }

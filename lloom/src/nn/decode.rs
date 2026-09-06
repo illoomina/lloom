@@ -90,27 +90,6 @@ pub struct DecodeOptions {
     /// Forward passes the host may enqueue before it has learned the previous
     /// step's EOS: `0` or `1`. See the module docs for what `1` costs.
     pub lookahead: usize,
-    /// The most command buffers the host may leave in flight before it waits for
-    /// the GPU to catch up — explicit backpressure, decoupled from the EOS
-    /// mechanism. `0` is **off** (no cap).
-    ///
-    /// # Why this exists, and what it replaces
-    ///
-    /// On the poll arm the per-token EOS wait ([`ReadbackStrategy::eos_of_last`])
-    /// doubles as pacing: the host blocks ~every token, so it never runs more
-    /// than a handful of forwards ahead of the GPU. An arm that learns EOS off
-    /// the hot path ([`crate::generation::EosRead::HostOnDrain`]) has no such
-    /// wait, so nothing bounds how far the host runs ahead — measured, in-flight
-    /// ratcheted to 63 against the poll arm's ~9, and the deep queue cost the
-    /// tail. `flush_and_prune` only drops *completed* buffers; it never caps.
-    ///
-    /// This is the cap made explicit and per-arm: after each enqueue the loop
-    /// asks the strategy to apply backpressure, which waits (by the same WFE
-    /// mechanism the poll arm uses, on the published-generation counter) **only
-    /// when** the host is more than `max_in_flight` generations ahead — a mapped
-    /// read and a compare when it is not, so the GPU is free to run ahead up to
-    /// the cap rather than being throttled to one forward per token.
-    pub max_in_flight: usize,
     /// **Diagnostic, and it perturbs the thing it measures**: drain the GPU
     /// before each sample so the sample term can be timed apart from the
     /// forward pass (§11.2a). Off for every published number. Under
@@ -136,14 +115,12 @@ pub struct RoundStats {
 }
 
 impl DecodeOptions {
-    /// Greedy defaults: `max_tokens`, per-token commit, no lookahead, no
-    /// in-flight cap, no split.
+    /// Greedy defaults: `max_tokens`, per-token commit, no lookahead, no split.
     pub fn new(max_tokens: usize) -> Self {
         Self {
             max_tokens,
             budget: CommitBudget::per_token(),
             lookahead: 0,
-            max_in_flight: 0,
             sample_split: false,
         }
     }
@@ -168,6 +145,13 @@ pub struct DecodeStats {
     pub commits: u64,
     /// The largest in-flight count `flush_and_prune` returned.
     pub max_in_flight: usize,
+    /// Step markers taken: one per forward the loop committed at its end
+    /// ([`IN_FLIGHT_STEPS`]).
+    pub step_markers: u64,
+    /// Markers the loop had to wait on before encoding the next step -- the
+    /// host had run [`IN_FLIGHT_STEPS`] forwards ahead of the GPU. Zero on an
+    /// arm the per-token EOS wait already paces.
+    pub step_waits: u64,
     /// Forward passes enqueued past the last token this run returned — the
     /// positions the cache holds beyond the sequence's token log. One under
     /// `lookahead = 1` when EOS ended the run, up to a commit period under
@@ -262,6 +246,78 @@ fn flush_and_prune(device: &Device) -> Result<Option<usize>> {
     Ok(None)
 }
 
+/// Forward passes the host may have in flight -- committed and not yet
+/// retired -- once it has encoded the next one.
+///
+/// Two is the depth the paced arms already run at: under `lookahead = 1` the
+/// host waits for step `s`'s publish after encoding forward `s + 1`, and the
+/// publish depends on forward `s - 1`'s logits, so forward `s - 1` has retired
+/// before forward `s + 2` is encoded. The pacer makes the same bound hold on
+/// an arm with no per-token wait, and it is a constant rather than a knob
+/// because a deeper queue buys the GPU nothing -- the steps run serially on
+/// their own dependency chain -- and costs the host a retained command buffer
+/// and its completion handler per step it runs ahead (measured at 63 deep on
+/// the drain arm before this).
+pub const IN_FLIGHT_STEPS: usize = 2;
+
+/// The host's bound on how far it runs ahead of the GPU, as a wait on the
+/// command buffer that carried a step rather than on anything the GPU writes.
+///
+/// A marker is a committed command buffer; waiting on it is Metal's own
+/// completion, which retires or errors and cannot wait for a value that is
+/// never published. That is the whole difference from a cap spun on the ring's
+/// generation counter: a counter a stale replay stops advancing is a livelock,
+/// a command buffer that never retires is a reported error. When the GPU is
+/// within the bound the marker is already complete and the wait is a status
+/// read.
+struct StepPacer {
+    #[cfg(feature = "metal")]
+    markers: std::collections::VecDeque<lloom_tensor::metal_backend::CommandMarker>,
+    taken: u64,
+    waited: u64,
+}
+
+impl StepPacer {
+    fn new() -> Self {
+        Self {
+            #[cfg(feature = "metal")]
+            markers: std::collections::VecDeque::with_capacity(IN_FLIGHT_STEPS),
+            taken: 0,
+            waited: 0,
+        }
+    }
+
+    /// Before encoding a forward: retire the oldest marker if the bound would
+    /// otherwise be exceeded.
+    fn before_forward(&mut self, device: &Device) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = device {
+            while self.markers.len() >= IN_FLIGHT_STEPS {
+                let oldest = self.markers.pop_front().expect("len >= IN_FLIGHT_STEPS");
+                if !m.marker_complete(&oldest) {
+                    self.waited += 1;
+                }
+                m.wait_marker(&oldest)?;
+            }
+        }
+        let _ = device;
+        Ok(())
+    }
+
+    /// After encoding a forward: commit what the step encoded and keep the
+    /// marker. The cut this makes lands at the step boundary -- the one
+    /// dependency edge every step has, the publish the next forward reads.
+    fn after_forward(&mut self, device: &Device) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = device {
+            self.markers.push_back(m.flush_marker()?);
+            self.taken += 1;
+        }
+        let _ = device;
+        Ok(())
+    }
+}
+
 impl<'m, M: CausalLM> Session<'m, M> {
     /// Decode from `prompt` against this session's cache, advancing `pos`.
     ///
@@ -278,7 +334,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// commit and once at the end — the STREAMING hook, and it is streaming
     /// *without re-serializing*. On the ring arms the ids live device-side and a
     /// commit is where the GPU has already retired up to `fed` (the host is
-    /// `lookahead` steps ahead, `max_in_flight` deep), so draining
+    /// `lookahead` steps ahead, [`IN_FLIGHT_STEPS`] deep), so draining
     /// `ReadbackStrategy::take_ids` there reads work that is already done — one
     /// batched readback per commit, not the per-token round trip §11.5a deleted.
     /// A caller that does not stream passes a no-op; the tail drain at the end is
@@ -397,6 +453,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut produced = 0usize;
         let mut since_commit = 0usize;
         let mut eos = false;
+        // The in-flight bound, on the arms whose commits the loop owns. The
+        // blocking arm's readback drains the queue every step, so its stream
+        // stays the incumbent's.
+        let mut pacer = StepPacer::new();
+        let pace = readback.loop_commits();
         // Every id the loop drains, streamed or not, accumulates here so the
         // returned `ids` is complete and the reconciliation below counts the
         // whole run. Draining for the stream advances the strategy's cursor, so
@@ -444,6 +505,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     eos = true;
                     break;
                 }
+                if pace {
+                    pacer.before_forward(&device)?;
+                }
                 begin_decode_step(&device);
                 logits = self
                     .model
@@ -451,6 +515,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     .squeeze(0)?;
                 end_decode_step(&device)?;
                 self.seq.pos += 1;
+                if pace {
+                    pacer.after_forward(&device)?;
+                }
             } else {
                 if opts.sample_split {
                     stats
@@ -458,7 +525,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         .push(sample_start.elapsed().as_nanos() as u64);
                 }
                 // ENQUEUE, then learn. The GPU has this forward queued before
-                // it retires the previous one.
+                // it retires the previous one. The pacer bounds the enqueue:
+                // an arm with no per-token wait would otherwise run ahead
+                // without limit.
+                if pace {
+                    pacer.before_forward(&device)?;
+                }
                 begin_decode_step(&device);
                 logits = self
                     .model
@@ -466,13 +538,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     .squeeze(0)?;
                 end_decode_step(&device)?;
                 self.seq.pos += 1;
-                // Backpressure AFTER the enqueue: the host has just added a
-                // command buffer, so cap how far it may run ahead of the GPU.
-                // A no-op on arms that pace themselves; on the host-on-drain arm
-                // it is what replaces the pacing the per-token EOS wait used to
-                // provide, and it only waits when actually more than `cap` ahead.
-                if opts.max_in_flight > 0 {
-                    readback.apply_backpressure(opts.max_in_flight)?;
+                if pace {
+                    pacer.after_forward(&device)?;
                 }
                 if readback.eos_of_last()? {
                     produced -= 1;
@@ -611,6 +678,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         self.seq.last_logits = if overrun == 0 { Some(logits) } else { None };
         stats.overrun = overrun;
         stats.produced = produced;
+        stats.step_markers = pacer.taken;
+        stats.step_waits = pacer.waited;
         stats.readback = readback.counters();
         Ok(DecodeOut {
             ids: all_ids,

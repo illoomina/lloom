@@ -201,6 +201,19 @@ struct Args {
     /// digests — to the correct, template-conformant output.
     #[arg(long)]
     no_bos: bool,
+
+    /// Override the GEMV+SiLU epilogue fusion (§12.2d) regardless of the cache
+    /// arm's baked value. Unset = the arm's default (crown/rewindable bake it
+    /// ON). `--gemv-silu false` forces it OFF for the #509 A/B on this harness;
+    /// `--gemv-silu true` forces it on. Takes effect after the arm is selected.
+    #[arg(long)]
+    gemv_silu: Option<bool>,
+
+    /// Override the GEMV residual-add epilogue fusion (§12.2h) regardless of the
+    /// cache arm's baked value. Unset = the arm's default (crown/rewindable bake
+    /// it ON). `--gemv-residual false` forces it OFF for the #509 A/B.
+    #[arg(long)]
+    gemv_residual: Option<bool>,
 }
 
 /// The LFM2.5-2.6B snapshot dir in the HF cache, if it is there.
@@ -500,6 +513,18 @@ fn main() -> Result<()> {
         anyhow::bail!(
             "--cache must be `crown`, `rewindable` or `rewindable-notap`, got `{cache_arm}`"
         );
+    }
+
+    // #509 A/B override: the cache arms above bake the GEMV epilogues ON (crown
+    // 506-507, rewindable 458-459). These flags force either fusion regardless,
+    // so the crown-on vs crown-off delta is measurable on this harness (the
+    // library `Config::default` still ships them OFF; this measures the win
+    // before flipping that default). Unset leaves the arm's baked value.
+    if let Some(v) = args.gemv_silu {
+        config.gemv_silu = v;
+    }
+    if let Some(v) = args.gemv_residual {
+        config.gemv_residual = v;
     }
 
     let files = weight_files(&model_dir)?;

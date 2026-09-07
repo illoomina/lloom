@@ -126,7 +126,13 @@ quote = "1"
 proc-macro2 = "1"
 thiserror = "2"
 tokenizers = { version = "0.22.0", default-features = false }
-tracing = "0.1.37"
+# `release_max_level_info` compiles out every TRACE and DEBUG span/event in RELEASE
+# builds at COMPILE TIME — they become no-ops the optimizer removes entirely, so
+# the hot-path `span.enter()`s (mlp/attn/attn-rot/shortconv, all `Level::TRACE`,
+# ~30+ per forward × thousands of forwards) cost NOTHING in release. Debug/profile
+# builds keep them for tracing. No code change — the spans stay in the source; the
+# feature just gates their expansion.
+tracing = { version = "0.1.37", features = ["release_max_level_info"] }
 tracing-chrome = "0.7.1"
 tracing-subscriber = "0.3.7"
 ug = "0.5.0"

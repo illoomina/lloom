@@ -8,8 +8,10 @@
 //!   on one model in `--chunk`-token visits (non-speculative, time-sliced), or
 //!   — with `--dspark` — all of them through `Session::decode_speculative_pipelined`
 //!   (#685), which overlaps one sequence's draft/observe with the others'
-//!   verifies. Reports per-sequence identity against the solo stream and the
-//!   aggregate token rate.
+//!   verifies, or — with `--batched` — all of them through
+//!   `Session::decode_batched` (#694), one `m = B` forward per step for every
+//!   live sequence. Reports per-sequence identity against the solo stream and
+//!   the aggregate token rate.
 //!
 //! The concurrent modes print **no token text** (they are a throughput/identity
 //! surface, not a chat) and instead repaint a **live raw-stats block** on stderr
@@ -29,6 +31,7 @@ use lloom::generation::{
 use lloom::models::lfm2::{Cache, Config, Model};
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, ReuseAction, Session};
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -39,12 +42,31 @@ use std::time::Instant;
 /// prefill rather than sharing one prefix.
 const TURN_1: &str = "I am designing a cache for a single-threaded interpreter. Entries are immutable once written and the working set is about eight times the cache. What eviction policy should I start with, and why not LRU?";
 const TURN_2: &str = "Suppose I measure and find the hit rate is 40% lower than you predicted. What are the two most likely causes, and which measurement separates them?";
-const PROMPTS: [&str; 4] = [
+const PROMPTS: [&str; 8] = [
     "Name the three branches of the United States federal government.",
     "Count from one to forty, writing each number as a word on its own line, with no other text.",
     "Here is a Rust function that is missing its body:\n\nfn merge_sorted(a: &[i32], b: &[i32]) -> Vec<i32> {\n    // Merge two already-sorted slices into one sorted Vec.\n    // Do not allocate more than once.\n}\n\nWrite the body. Explain your choice of capacity for the allocation, and say what happens when one slice is empty.",
     "Extract every date, monetary amount, and party name from the paragraph below and return them as a JSON object with the keys \"dates\", \"amounts\", and \"parties\". Return only the JSON.\n\nOn 14 March 2019, Halloran Freight Ltd. agreed to pay Baswick Terminals the sum of 48,250 GBP in settlement of demurrage accrued between 2 January 2019 and 27 February 2019. A further 6,900 GBP was withheld pending inspection, to be released on or before 30 April 2019 unless Baswick Terminals lodged an objection.",
+    // The `design/workloads/prompts/` corpus (#549), embedded so a batched run
+    // at `--sequences` above four still has distinct prompts of distinct
+    // shapes. The four above ARE the corpus's `short-factual`,
+    // `low-entropy-list`, `code-completion` and `structured-extract`, so the
+    // four added here are the corpus members the built-ins do not already
+    // carry. Beyond eight the set cycles.
+    include_str!("../../../../design/workloads/prompts/long-summarize.txt"),
+    include_str!("../../../../design/workloads/prompts/multiturn-t1.txt"),
+    include_str!("../../../../design/workloads/prompts/multiturn-t2.txt"),
+    include_str!("../../../../design/workloads/prompts/multiturn-t3.txt"),
 ];
+
+/// The first `n` prompts of the run: the set above, cycled past its length so
+/// a row count the set does not cover still runs (two rows on one prompt
+/// decode identical streams, which is a free neighbour-independence check).
+fn prompt_set(n: usize) -> Vec<&'static str> {
+    (0..n)
+        .map(|i| PROMPTS[i % PROMPTS.len()].trim_end())
+        .collect()
+}
 
 /// What `run` needs from `main` after it has built the model, config and eos set.
 pub struct Ctx<'a> {
@@ -64,6 +86,16 @@ pub struct Ctx<'a> {
     /// `--dspark` — drive the concurrent sequences through the pipelined
     /// speculative driver instead of the time-sliced non-spec interleave.
     pub dspark: bool,
+    /// `--batched` — drive the concurrent sequences through the batched-forward
+    /// driver (`Session::decode_batched`, #694): one `m = B` forward per step.
+    pub batched: bool,
+    /// Under `--batched`: also run the rows in two separately batched halves
+    /// and assert each row's stream equals its full-batch stream — the
+    /// neighbour-independence check no digest sees.
+    pub check_independence: bool,
+    /// Under `--batched`: skip the solo arm (a tile A/B at a large `B` wants
+    /// only the batched arm's step; the identity columns then read `false`).
+    pub skip_solo: bool,
     /// The drafter dir + config, resolved by `main` when `--dspark` is set.
     pub dspark_setup: Option<(PathBuf, DSparkConfig)>,
     pub first: &'a str,
@@ -233,10 +265,7 @@ impl LiveStats {
                 let _ = writeln!(
                     err,
                     "  seq {i}: {:>4}/{:<4} tok  {} rounds  accept {:.2}/round  [{bar}]",
-                    self.tokens[i],
-                    self.targets[i],
-                    self.rounds[i],
-                    self.accept[i],
+                    self.tokens[i], self.targets[i], self.rounds[i], self.accept[i],
                 );
             } else {
                 let _ = writeln!(
@@ -291,6 +320,7 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
     match ctx.mode {
         "reuse" => run_reuse(&ctx, &opts, capacity, &common),
         "concurrent" if ctx.dspark => run_dspark_concurrent(&ctx, &common),
+        "concurrent" if ctx.batched => run_batched_concurrent(&ctx, &opts, capacity, &common),
         "concurrent" => run_concurrent(&ctx, &opts, capacity, &common),
         other => anyhow::bail!("--mode must be `single`, `reuse` or `concurrent`, got `{other}`"),
     }
@@ -386,10 +416,15 @@ fn run_reuse(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: &str)
 
 /// `--mode concurrent` (non-speculative): N sequences interleaved in `chunk`-token
 /// visits, live stats repainting per visit, then the RESULT line.
-fn run_concurrent(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: &str) -> Result<()> {
+fn run_concurrent(
+    ctx: &Ctx<'_>,
+    opts: &DecodeOptions,
+    capacity: usize,
+    common: &str,
+) -> Result<()> {
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
-    let n = ctx.sequences.clamp(1, PROMPTS.len());
-    let prompts: Vec<Vec<u32>> = PROMPTS[..n]
+    let n = ctx.sequences.max(1);
+    let prompts: Vec<Vec<u32>> = prompt_set(n)
         .iter()
         .map(|p| (ctx.encode)(&user_turn_text(p)))
         .collect::<Result<_>>()?;
@@ -409,7 +444,12 @@ fn run_concurrent(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: 
 
     // INTERLEAVED: round-robin visits, live-repainting the block per visit.
     let mut sessions: Vec<Session<'_, Model>> = (0..n)
-        .map(|_| Ok(Session::new(model, Cache::new(true, dtype, config, device)?)))
+        .map(|_| {
+            Ok(Session::new(
+                model,
+                Cache::new(true, dtype, config, device)?,
+            ))
+        })
         .collect::<Result<_>>()?;
     let mut arms: Vec<Arm> = (0..n)
         .map(|_| Arm::new(ctx.readback, ctx.eos_ids, device, capacity))
@@ -436,7 +476,13 @@ fn run_concurrent(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: 
                 max_tokens: want,
                 ..*opts
             };
-            let out = decode(&mut sessions[i], &mut arms[i], &prepared.suffix, &visit_opts)?.out;
+            let out = decode(
+                &mut sessions[i],
+                &mut arms[i],
+                &prepared.suffix,
+                &visit_opts,
+            )?
+            .out;
             streams[i].extend_from_slice(&out.ids);
             visits += 1;
             if out.eos || streams[i].len() >= ctx.max_tokens {
@@ -449,7 +495,11 @@ fn run_concurrent(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: 
     live.finish();
     let wall = t.elapsed().as_secs_f64();
     let total: usize = streams.iter().map(|s| s.len()).sum();
-    let identical: Vec<bool> = streams.iter().zip(solo.iter()).map(|(a, b)| a == b).collect();
+    let identical: Vec<bool> = streams
+        .iter()
+        .zip(solo.iter())
+        .map(|(a, b)| a == b)
+        .collect();
     for i in 0..n {
         eprintln!(
             "[seq {i}: solo {} tokens at {:.1} tok/s; interleaved {} tokens; {}]",
@@ -519,8 +569,8 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         .dspark_setup
         .as_ref()
         .context("--dspark set but no drafter resolved")?;
-    let n = ctx.sequences.clamp(1, PROMPTS.len());
-    let prompts: Vec<Vec<u32>> = PROMPTS[..n]
+    let n = ctx.sequences.max(1);
+    let prompts: Vec<Vec<u32>> = prompt_set(n)
         .iter()
         .map(|p| (ctx.encode)(&user_turn_text(p)))
         .collect::<Result<_>>()?;
@@ -532,8 +582,9 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
     }
     let longest = prompts.iter().map(|p| p.len()).max().unwrap_or(0);
     let max_pos = longest + ctx.max_tokens + dcfg.block_size + 64;
-    let dvb =
-        unsafe { lloom::nn::VarBuilder::from_mmaped_safetensors(&[draft_file], DType::F16, device)? };
+    let dvb = unsafe {
+        lloom::nn::VarBuilder::from_mmaped_safetensors(&[draft_file], DType::F16, device)?
+    };
     let drafter =
         DSparkDrafter::new(dcfg.clone(), max_pos, dvb).context("constructing DSpark drafter")?;
     let mut spec = DSparkSpeculator::new(
@@ -604,7 +655,12 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
     };
     let run_pipelined = |spec: &mut DSparkSpeculator| -> Result<SpecArm> {
         let mut sessions: Vec<Session<'_, Model>> = (0..n)
-            .map(|_| Ok(Session::new(model, Cache::new(true, dtype, config, device)?)))
+            .map(|_| {
+                Ok(Session::new(
+                    model,
+                    Cache::new(true, dtype, config, device)?,
+                ))
+            })
             .collect::<Result<_>>()?;
         let prompt_refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
         let mut streams: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -689,8 +745,9 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         );
     }
     if let Some(path) = &ctx.timeline {
-        let mut w =
-            String::from("arm,seq,round,start_ms,draft_ms,enqueue_ms,wait_ms,observe_ms,accepted\n");
+        let mut w = String::from(
+            "arm,seq,round,start_ms,draft_ms,enqueue_ms,wait_ms,observe_ms,accepted\n",
+        );
         for arm in [&solo, &pipe] {
             for (i, o) in arm.outs.iter().enumerate() {
                 for (r, round) in o.stats.rounds.iter().enumerate() {
@@ -728,6 +785,397 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         identical.iter().all(|&b| b),
         identical,
         pipe.streams.iter().map(|s| s.len()).collect::<Vec<_>>(),
+    );
+    Ok(())
+}
+
+/// The Metal profiler's `(gpu_busy_union_s, dispatches, command_buffers)`
+/// since the last reset, then reset; zeros when the profiler is off or off
+/// Metal. Taken per arm so an arm's GPU-busy is its own.
+fn profile_take() -> (f64, u64, u64) {
+    #[cfg(feature = "metal")]
+    {
+        use candle::kernels::metal::profile;
+        if profile::enabled() {
+            let s = profile::snapshot();
+            profile::reset();
+            return (s.gpu_busy_union_s, s.dispatches, s.command_buffers);
+        }
+    }
+    (0.0, 0, 0)
+}
+
+/// The per-kernel dispatch census since the last reset, under
+/// `CANDLE_METAL_PROFILE=1`; empty otherwise. Read BEFORE `profile_take`,
+/// which resets it.
+fn profile_census() -> HashMap<String, u64> {
+    #[cfg(feature = "metal")]
+    {
+        use candle::kernels::metal::profile;
+        if profile::enabled() {
+            return profile::snapshot().by_label.into_iter().collect();
+        }
+    }
+    HashMap::new()
+}
+
+/// One arm of the `--batched` concurrent run.
+struct BatchArm {
+    name: &'static str,
+    streams: Vec<Vec<u32>>,
+    outs: Vec<DecodeOut>,
+    wall_s: f64,
+    gpu_busy_s: f64,
+    dispatches: u64,
+    command_buffers: u64,
+    /// The weight-GEMM/GEMV kernels dispatched, from the census (engagement:
+    /// the batched arm must show `gemm_*` where solo shows `gemv_*`).
+    census: HashMap<String, u64>,
+}
+
+impl BatchArm {
+    fn tokens(&self) -> usize {
+        self.streams.iter().map(|s| s.len()).sum()
+    }
+    fn steps(&self) -> u64 {
+        self.outs.iter().map(|o| o.stats.steps).max().unwrap_or(0)
+    }
+}
+
+/// `--mode concurrent --batched`: every prompt solo through the selected
+/// readback arm (the crown loop), and all of them through
+/// `Session::decode_batched` — one `m = B` forward per step. Per-sequence
+/// identity against solo, the aggregate rates, GPU busy per arm from the
+/// profiler, and — under `--check-independence` — the rows re-run in two
+/// separately batched halves, each row asserted equal to its full-batch
+/// stream.
+fn run_batched_concurrent(
+    ctx: &Ctx<'_>,
+    opts: &DecodeOptions,
+    capacity: usize,
+    common: &str,
+) -> Result<()> {
+    let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
+    let n = ctx.sequences.max(1);
+    let prompts: Vec<Vec<u32>> = prompt_set(n)
+        .iter()
+        .map(|p| (ctx.encode)(&user_turn_text(p)))
+        .collect::<Result<_>>()?;
+    let prompt_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+    // The batched driver's own options: the lookahead is the arm's, the commit
+    // budget and sample split have no meaning under it.
+    let batched_opts = DecodeOptions {
+        max_tokens: ctx.max_tokens,
+        lookahead: ctx.lookahead.min(1),
+        ..DecodeOptions::new(ctx.max_tokens)
+    };
+
+    // Warm the batched GEMM pipelines at this `B` off the clock: the row-tile
+    // pipelines `Session::warmup` compiled are the prefill's; a batched step at
+    // `m = B` keys its own `align_m` variant (§13.1i).
+    {
+        let mut sessions: Vec<Session<'_, Model>> = (0..n)
+            .map(|_| {
+                Ok(Session::new(
+                    model,
+                    Cache::new(true, dtype, config, device)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+        let warm = DecodeOptions {
+            max_tokens: 4,
+            ..batched_opts
+        };
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let _ = Session::decode_batched(
+            &mut sessions,
+            &mut sampler,
+            &refs,
+            &warm,
+            ctx.eos_ids,
+            device,
+            &mut |_, _| Ok(()),
+        )?;
+        device.synchronize()?;
+        let _ = profile_take();
+    }
+
+    let run_solo = || -> Result<BatchArm> {
+        let mut live = LiveStats::new("solo", vec![ctx.max_tokens; n], false);
+        live.paint();
+        let t = Instant::now();
+        let mut outs = Vec::with_capacity(n);
+        for (i, p) in prompts.iter().enumerate() {
+            let mut s = Session::new(model, Cache::new(true, dtype, config, device)?);
+            let mut arm = Arm::new(ctx.readback, ctx.eos_ids, device, capacity)?;
+            let out = decode(&mut s, &mut arm, p, opts)?.out;
+            live.set(i, out.ids.len(), 0, true);
+            live.paint();
+            outs.push(out);
+        }
+        device.synchronize()?;
+        let wall_s = t.elapsed().as_secs_f64();
+        live.finish();
+        let census = profile_census();
+        let (gpu_busy_s, dispatches, command_buffers) = profile_take();
+        Ok(BatchArm {
+            name: "solo",
+            streams: outs.iter().map(|o| o.ids.clone()).collect(),
+            outs,
+            wall_s,
+            gpu_busy_s,
+            dispatches,
+            command_buffers,
+            census,
+        })
+    };
+    let run_batched = |label: &'static str, rows: &[usize]| -> Result<BatchArm> {
+        let mut sessions: Vec<Session<'_, Model>> = rows
+            .iter()
+            .map(|_| {
+                Ok(Session::new(
+                    model,
+                    Cache::new(true, dtype, config, device)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let refs: Vec<&[u32]> = rows.iter().map(|&i| prompts[i].as_slice()).collect();
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let mut streams: Vec<Vec<u32>> = vec![Vec::new(); rows.len()];
+        let mut live = LiveStats::new(label, vec![ctx.max_tokens; rows.len()], false);
+        live.paint();
+        let t = Instant::now();
+        let outs = Session::decode_batched(
+            &mut sessions,
+            &mut sampler,
+            &refs,
+            &batched_opts,
+            ctx.eos_ids,
+            device,
+            &mut |i, ids| {
+                streams[i].extend_from_slice(ids);
+                live.set(i, streams[i].len(), 0, false);
+                live.paint();
+                Ok(())
+            },
+        )?;
+        device.synchronize()?;
+        let wall_s = t.elapsed().as_secs_f64();
+        for (i, o) in outs.iter().enumerate() {
+            live.set(i, streams[i].len(), 0, true);
+            if o.ids != streams[i] {
+                anyhow::bail!("row {i}: the batched callback stream differs from its ids");
+            }
+        }
+        live.paint();
+        live.finish();
+        let census = profile_census();
+        let (gpu_busy_s, dispatches, command_buffers) = profile_take();
+        Ok(BatchArm {
+            name: label,
+            streams,
+            outs,
+            wall_s,
+            gpu_busy_s,
+            dispatches,
+            command_buffers,
+            census,
+        })
+    };
+
+    let all: Vec<usize> = (0..n).collect();
+    let empty_solo = || BatchArm {
+        name: "solo (skipped)",
+        streams: vec![Vec::new(); n],
+        outs: Vec::new(),
+        wall_s: f64::NAN,
+        gpu_busy_s: 0.0,
+        dispatches: 0,
+        command_buffers: 0,
+        census: HashMap::new(),
+    };
+    let (solo, batched) = match (ctx.first, ctx.skip_solo) {
+        (_, true) => (empty_solo(), run_batched("batched", &all)?),
+        ("solo", _) => {
+            let s = run_solo()?;
+            let b = run_batched("batched", &all)?;
+            (s, b)
+        }
+        ("batched", _) => {
+            let b = run_batched("batched", &all)?;
+            let s = run_solo()?;
+            (s, b)
+        }
+        (other, _) => anyhow::bail!("--first must be `solo` or `batched`, got `{other}`"),
+    };
+
+    // Identity against solo: tier 2 across the GEMV/GEMM seam (§13.5b), so
+    // the first divergence index is reported beside the verdict.
+    let mut identical = Vec::with_capacity(n);
+    let mut common_prefix = Vec::with_capacity(n);
+    for (i, &prompt_len) in prompt_lens.iter().enumerate() {
+        let same = batched.streams[i] == solo.streams[i];
+        let lcp = batched.streams[i]
+            .iter()
+            .zip(solo.streams[i].iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        identical.push(same);
+        common_prefix.push(lcp);
+        eprintln!(
+            "[seq {i}: prompt {prompt_len} tok; solo {} tokens eos={}; batched {} tokens eos={} overrun={}; {}{}]",
+            solo.streams[i].len(),
+            solo.outs.get(i).map(|o| o.eos).unwrap_or(false),
+            batched.streams[i].len(),
+            batched.outs[i].eos,
+            batched.outs[i].stats.overrun,
+            if same { "IDENTICAL" } else { "DIFFERS" },
+            if same {
+                String::new()
+            } else {
+                format!(" at {lcp} of {} / {}", batched.streams[i].len(), solo.streams[i].len())
+            }
+        );
+    }
+
+    // Neighbour independence: the same rows batched in two halves must give
+    // each row the full batch's stream — both arms take the `m > 1` GEMM,
+    // so this is exact where the solo comparison is tier 2.
+    let independent = if ctx.check_independence && n >= 2 {
+        let half = n / 2;
+        let lo: Vec<usize> = (0..half).collect();
+        let hi: Vec<usize> = (half..n).collect();
+        let a = run_batched("batched-lo", &lo)?;
+        let b = run_batched("batched-hi", &hi)?;
+        let mut ok = true;
+        for (k, &i) in lo.iter().enumerate() {
+            if a.streams[k] != batched.streams[i] {
+                ok = false;
+                eprintln!("[independence: row {i} differs between B={n} and B={half}]");
+            }
+        }
+        for (k, &i) in hi.iter().enumerate() {
+            if b.streams[k] != batched.streams[i] {
+                ok = false;
+                eprintln!(
+                    "[independence: row {i} differs between B={n} and B={}]",
+                    n - half
+                );
+            }
+        }
+        eprintln!(
+            "[independence: rows re-batched as {half} + {}: {}]",
+            n - half,
+            if ok { "IDENTICAL" } else { "DIFFERS" }
+        );
+        Some(ok)
+    } else {
+        None
+    };
+
+    // The batched arm's step shape: median step, mean live rows per step.
+    let mut step_ms: Vec<f64> = batched
+        .outs
+        .iter()
+        .flat_map(|o| o.stats.step_ns.iter().map(|&ns| ns as f64 / 1e6))
+        .collect();
+    step_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let batched_steps = batched.steps();
+    let row_steps: u64 = batched.outs.iter().map(|o| o.stats.steps).sum();
+    let mean_rows = if batched_steps > 0 {
+        row_steps as f64 / batched_steps as f64
+    } else {
+        0.0
+    };
+    let solo_steps: u64 = solo.outs.iter().map(|o| o.stats.steps).sum();
+    let gemm_disp = |c: &HashMap<String, u64>| -> u64 {
+        c.iter()
+            .filter(|(k, _)| k.starts_with("gemm_"))
+            .map(|(_, v)| v)
+            .sum()
+    };
+    let gemv_disp = |c: &HashMap<String, u64>| -> u64 {
+        c.iter()
+            .filter(|(k, _)| k.starts_with("gemv"))
+            .map(|(_, v)| v)
+            .sum()
+    };
+    for arm in [&solo, &batched] {
+        eprintln!(
+            "[{}: {} tokens in {:.3} s = {:.1} tok/s aggregate; gpu_busy {:.3} s ({:.1} %), \
+             {} dispatches, {} command buffers; gemm {} gemv {}]",
+            arm.name,
+            arm.tokens(),
+            arm.wall_s,
+            arm.tokens() as f64 / arm.wall_s,
+            arm.gpu_busy_s,
+            100.0 * arm.gpu_busy_s / arm.wall_s.max(1e-9),
+            arm.dispatches,
+            arm.command_buffers,
+            gemm_disp(&arm.census),
+            gemv_disp(&arm.census),
+        );
+        // The weight-matmul kernels by name, so the tile an arm took is read
+        // from the census rather than inferred from a flag (§2.4).
+        let mut mm: Vec<(&String, &u64)> = arm
+            .census
+            .iter()
+            .filter(|(k, _)| k.starts_with("gemm_") || k.starts_with("gemv"))
+            .collect();
+        mm.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        for (label, n) in mm.iter().take(6) {
+            eprintln!("    {n:>7}  {label}");
+        }
+    }
+    eprintln!(
+        "[batched: {batched_steps} steps, {mean_rows:.2} live rows/step mean, step median {:.3} ms, \
+         gpu_busy/step {:.3} ms, dispatches/step {:.1}; solo: {solo_steps} steps, \
+         gpu_busy/step {:.3} ms, dispatches/step {:.1}]",
+        if step_ms.is_empty() { f64::NAN } else { step_ms[step_ms.len() / 2] },
+        1e3 * batched.gpu_busy_s / batched_steps.max(1) as f64,
+        batched.dispatches as f64 / batched_steps.max(1) as f64,
+        1e3 * solo.gpu_busy_s / solo_steps.max(1) as f64,
+        solo.dispatches as f64 / solo_steps.max(1) as f64,
+    );
+    let speedup = (batched.tokens() as f64 / batched.wall_s) / (solo.tokens() as f64 / solo.wall_s);
+    println!(
+        "RESULT mode=concurrent batched=true first={} {common} batched_lookahead={} sequences={n} \
+         prompt_tokens={:?} solo_tokens={} solo_steps={} solo_wall_s={:.4} solo_aggregate_tok_s={:.4} \
+         solo_gpu_busy_s={:.4} solo_dispatches={} solo_gemm={} solo_gemv={} \
+         batched_tokens={} batched_steps={} batched_rows_per_step={:.4} batched_wall_s={:.4} \
+         batched_aggregate_tok_s={:.4} batched_gpu_busy_s={:.4} batched_dispatches={} \
+         batched_gemm={} batched_gemv={} batched_step_ms_median={:.4} \
+         speedup={:.4} identical={} per_seq_identical={:?} common_prefix={:?} independent={:?} \
+         per_seq_tokens={:?} per_seq_overrun={:?}",
+        ctx.first,
+        batched_opts.lookahead,
+        prompt_lens,
+        solo.tokens(),
+        solo_steps,
+        solo.wall_s,
+        solo.tokens() as f64 / solo.wall_s,
+        solo.gpu_busy_s,
+        solo.dispatches,
+        gemm_disp(&solo.census),
+        gemv_disp(&solo.census),
+        batched.tokens(),
+        batched_steps,
+        mean_rows,
+        batched.wall_s,
+        batched.tokens() as f64 / batched.wall_s,
+        batched.gpu_busy_s,
+        batched.dispatches,
+        gemm_disp(&batched.census),
+        gemv_disp(&batched.census),
+        if step_ms.is_empty() { f64::NAN } else { step_ms[step_ms.len() / 2] },
+        speedup,
+        identical.iter().all(|&b| b),
+        identical,
+        common_prefix,
+        independent,
+        batched.streams.iter().map(|s| s.len()).collect::<Vec<_>>(),
+        batched.outs.iter().map(|o| o.stats.overrun).collect::<Vec<_>>(),
     );
     Ok(())
 }

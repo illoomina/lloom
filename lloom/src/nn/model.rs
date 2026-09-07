@@ -73,6 +73,41 @@ pub trait CausalLM: Model {
     fn vocab_size(&self) -> usize;
 }
 
+/// One sequence's slot in a batched decode step: where its cache is and the
+/// position the step writes at ([`BatchedCausalLM::forward_rows`]).
+///
+/// The rows of one step are independent sequences — different prompts,
+/// different lengths, different caches — so the batch is a slice of these
+/// rather than one cache with a batch dimension. Nothing a row holds is
+/// shared with its neighbours, which is what makes a row's result independent
+/// of them (`DESIGN.md` §2.3.3 #7).
+pub struct Row<'a, C> {
+    /// The position this step's token is written at; the row's `kv_len`.
+    pub pos: usize,
+    pub cache: &'a mut C,
+}
+
+/// A model that can decode one token for each of several independent
+/// sequences in one forward pass (issue #694, `design/docs/batched-decode-design.md` §10).
+///
+/// `forward_rows` takes a `[B, 1]` token tensor and one [`Row`] per token and
+/// returns `[B, vocab]` logits. Every weight matrix is applied to all `B` rows
+/// as one `m = B` GEMM — the 5.394 GB weight sweep is paid once for the batch
+/// (§13.5) — while the per-sequence state (KV, conv window, RoPE position) is
+/// read and written per row against that row's own cache, so a row computes
+/// exactly what a `forward` of that token against that cache computes.
+///
+/// Kept off [`CausalLM`] for [`CacheReset`]'s reason: the locked trait is not
+/// widened, and a model that cannot batch need not implement it. The K=1
+/// batched driver ([`Session::decode_batched`](crate::nn::speculator::Session))
+/// is bounded on it.
+pub trait BatchedCausalLM: CausalLM {
+    /// One decode step for `rows.len()` sequences: `tokens` is `[B, 1]`, row
+    /// `i` of it is fed to `rows[i]`, and the result is `[B, vocab]` in the
+    /// same order. Every row's position advances by one.
+    fn forward_rows(&self, tokens: &Tensor, rows: &mut [Row<'_, Self::Cache>]) -> Result<Tensor>;
+}
+
 /// A cache that can be returned to its pre-prefill state.
 ///
 /// The one method [`Session::warmup`](crate::nn::speculator::Session) needs and

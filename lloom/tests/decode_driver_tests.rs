@@ -454,14 +454,20 @@ fn ring_publishes_reconcile_against_the_ids_and_the_eos() -> Result<()> {
 #[test]
 fn the_commit_cadence_follows_the_budget_only_with_lookahead() -> Result<()> {
     for device in devices() {
-        // Lookahead on: the loop commits on the budget and nowhere else.
+        // Lookahead on: the loop commits on the budget, PLUS the TTFT ramp —
+        // the first `period` tokens each commit (so the first token streams at
+        // its compute time, not after a full period; see `decode.rs`), then the
+        // steady `steps:4` cadence resumes. 12 steps at steps:4: 4 ramp commits
+        // (tokens 1..=4) + 2 steady commits (tokens 8 and 12) = 6. Without the
+        // ramp it was 3; the ramp trades 3 extra commits (each reading finished
+        // work, no wait) for a ~3× lower first-token latency.
         let opts = DecodeOptions {
             lookahead: 1,
             budget: CommitBudget::steps(4)?,
             ..DecodeOptions::new(12)
         };
         let (out, _) = run(&device, &Arm::RingPoll, &[0], &opts)?;
-        assert_eq!(out.stats.commits, 3, "{device:?}: 12 steps at steps:4");
+        assert_eq!(out.stats.commits, 6, "{device:?}: 12 steps at steps:4 + TTFT ramp");
         // Lookahead off: the publish must be committed before the wait, so the
         // loop commits per token whatever the budget says — the counter is
         // what makes that visible rather than silently ignored.

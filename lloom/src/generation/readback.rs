@@ -622,15 +622,40 @@ impl History {
         }
     }
 
-    /// The mapped drain — the hot path, **lock-free and (steady-state)
-    /// alloc-free**. Resolves each segment's CPU-mapped base pointer ONCE
-    /// (memoized in `seg_bases`; `peek_scalar_ptr` does not lock and the pointers
-    /// are stable), then reads whole closed tiles through them, base resolved
-    /// once per tile (a raw read per token, no bounds-checked index). `out` is
-    /// caller-owned and pre-sized, so no per-commit allocation. Returns `false`
-    /// if any segment is not CPU-mapped (the caller takes the copy fallback).
+    /// The mapped drain — the hot path, **lock-free, alloc-free, and scan-free**.
+    ///
+    /// **The window drain, recovered.** The live window `[drained, end)` is read as
+    /// a small number of CONTIGUOUS runs — one per segment the window spans —
+    /// whose bounds are COMPUTED by arithmetic (`tile_home` + `slots_per_seg`),
+    /// never by walking tiles. This is the single-ring window read (`peek` a base,
+    /// `copy_from_slice` a run) generalised to a ring of segments: the segment
+    /// boundary is the ONLY place a new base is taken. At `quantum == 1` (B=1) the
+    /// whole window inside one segment is ONE run — the dense page the consumer
+    /// wanted. The segment-hopping per-tile walk this replaced fragmented that into
+    /// a patch per tile; the window needs no such scan.
+    ///
+    /// Contiguity: a segment lays its tiles out consecutively
+    /// (`offset = (tile % tiles_per_seg) × quantum`), and at `quantum == 1` every
+    /// token is one full tile, so slots are dense and `token == slot` within a
+    /// segment. The run is `[home(drained) .. min(end, next-segment-boundary))`,
+    /// read in one shot. `end` is the published clamp, so every slot read is
+    /// finished, stable memory (§9.3 acquire: once `published ≥ N`, `[0..N)` are
+    /// written and never rewritten) — a plain `copy_from_slice`, no per-element
+    /// volatile (that cost ~1 tok/s at the ceiling).
+    ///
+    /// Requires `quantum == 1` (the greedy/crown path — dense, no waste tails). A
+    /// `quantum > 1` writer with partial tiles (DSpark/batched with variable
+    /// accepts) has waste gaps between tiles and takes `drain_copy`'s tile-aware
+    /// path; this hot window read is the dense case. Returns `false` if any segment
+    /// is not CPU-mapped (caller takes the copy fallback).
     #[cfg(feature = "metal")]
     fn drain_mapped(&mut self, end: usize, out: &mut Vec<u32>) -> bool {
+        // The window read is exact only for the dense (`quantum == 1`) layout,
+        // where `token == slot` within a segment. Defer the waste-tail case to the
+        // tile-aware copy path rather than scan tiles on the hot path.
+        if self.quantum != 1 {
+            return false;
+        }
         if self.seg_bases.is_none() {
             // Resolve once. All segments are the same size in the same pool, so
             // they map together or not at all; if any is unmapped, leave
@@ -646,45 +671,42 @@ impl History {
             }
         }
         out.clear();
+        let end = end.min(self.fed);
         if end <= self.drained {
             return true;
         }
-        // Read through the memoized pointers. Kept as an index snapshot so the
-        // borrow of `self.seg_bases` does not fight the `&mut self` walk.
-        while self.drained_tiles < self.tiles {
-            let slot = self.drained_tiles % self.total_tiles;
-            let count = self.tile_counts[slot] as usize;
-            if self.drained + count > end {
-                break;
-            }
-            let (seg, base) = self.tile_home(self.drained_tiles);
-            // BULK copy, NOT per-element volatile. The drain reads only `≤ end ≤
-            // published`, and the published-counter read is the acquire (§9.3's
-            // `mem_device` ordering: once the host observes `published ≥ N`, slots
-            // `[0..N]` are written AND stable — the GPU writes forward, never
-            // rewrites a published slot). So this tile's `count` real slots are
-            // finished, unchanging memory: a `copy_from_slice` is correct, and a
-            // per-element `read_volatile` was belt-and-suspenders AFTER the
-            // acquire — one that, at the ceiling, costs a coherency stall per
-            // element (measured: a single hot-path volatile is worth ~1 tok/s).
-            // One coalesced copy per tile instead of `count` poking loads.
-            //
-            // SAFETY: `seg_bases[seg]` is the mapped base of a buffer never
-            // reallocated for this ring's life; `[base, base+count) < segment_len`
-            // (a tile fits its segment); the range is `≤ published`, so the GPU is
-            // not writing it — no aliasing with a concurrent writer.
-            let ptr = self.seg_bases.as_ref().unwrap()[seg];
-            let src = unsafe { std::slice::from_raw_parts(ptr.add(base), count) };
+        // `quantum == 1`: slots == tokens, `slots_per_seg == tiles_per_seg`. Walk
+        // the window one segment-run at a time, bounds COMPUTED, no tile scan.
+        let slots_per_seg = self.tiles_per_seg; // × quantum, and quantum == 1
+        let bases = self.seg_bases.as_ref().unwrap();
+        while self.drained < end {
+            // `home` of the next token: which segment, which offset within it.
+            // `drained` is a token index == a tile index at quantum 1.
+            let (seg, off) = self.tile_home(self.drained);
+            // This run ends at the earlier of the window end and this segment's
+            // last slot — one contiguous span within a single mapped buffer.
+            let seg_remaining = slots_per_seg - off;
+            let run = (end - self.drained).min(seg_remaining);
+            // SAFETY: `bases[seg]` is the mapped base of a buffer never
+            // reallocated for this ring's life; `[off, off+run) ≤ slots_per_seg`
+            // (the run is clamped to the segment); `drained + run ≤ end ≤
+            // published`, so the GPU is not writing it — no aliasing.
+            let ptr = bases[seg];
+            let src = unsafe { std::slice::from_raw_parts(ptr.add(off), run) };
             out.extend_from_slice(src);
-            self.drained += count;
-            self.drained_tiles += 1;
+            self.drained += run;
         }
+        // Advance the tile cursor in lockstep (one tile per token at quantum 1) so
+        // the ring's live/lap accounting (`begin_step`) stays consistent.
+        self.drained_tiles = self.drained;
         true
     }
 
-    /// The copy fallback (unmapped segments): a `to_vec1` per segment
-    /// synchronises and is correct if a copy — the honest degradation, off the
-    /// hot path. Fills `out` (caller-owned, pre-sized).
+    /// The copy fallback (unmapped segments, or the `quantum > 1` waste-tail
+    /// layout): a `to_vec1` per segment synchronises and is correct if a copy —
+    /// the honest degradation, off the hot path. This path IS tile-aware
+    /// (`drain_into` walks tiles to skip waste), which the dense window read does
+    /// not need. Fills `out` (caller-owned, pre-sized).
     fn drain_copy(&mut self, end: usize, out: &mut Vec<u32>) -> Result<()> {
         let snapshots = self
             .segments
@@ -743,6 +765,29 @@ pub const POLL_BUDGET: u64 = 50_000_000;
 /// generation. [`Self::with_geometry`] sizes it exactly instead.
 pub const RING_HISTORY_SLOTS: usize = 4092;
 
+/// Default consumer-slack budget for the token-ring history: 4 MB of preallocated
+/// `U32` slots (≈ 1M tokens at quantum 1, ≈ 256 Private segments). Sized so a
+/// blocked consumer (a `print!` to a slow terminal, a stalled SSE flush) can lag
+/// by seconds of generation before the lap guard fires — the wall between the hot
+/// producer and a jittery consumer. Preallocated: costs memory, not per-step work.
+/// Overridable via `LLOOM_RING_SLACK_BYTES`.
+pub const RING_SLACK_BYTES_DEFAULT: usize = 4 * 1024 * 1024;
+
+/// The slot count for the consumer-slack window: `LLOOM_RING_SLACK_BYTES`
+/// (default [`RING_SLACK_BYTES_DEFAULT`]) worth of `U32` slots, rounded to a whole
+/// number of `quantum`-slot tiles so the geometry stays uniform. `0` disables the
+/// slack (fall back to the tight `cap()`), for the A/B baseline.
+fn history_slack_slots(quantum: usize) -> usize {
+    let bytes = std::env::var("LLOOM_RING_SLACK_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(RING_SLACK_BYTES_DEFAULT);
+    let slots = bytes / std::mem::size_of::<u32>();
+    // Round down to a whole number of tiles (uniform geometry); 0 => no slack.
+    let q = quantum.max(1);
+    (slots / q) * q
+}
+
 impl Ring {
     /// `capacity` bounds the ids one ring will accumulate across every decode
     /// call it serves; exceeding it is an error rather than a silent drop. The
@@ -761,19 +806,34 @@ impl Ring {
         Self::with_cap_and_quantum(eos_ids, device, capacity.max(RING_HISTORY_SLOTS), 1, eos)
     }
 
-    /// Construct sized EXACTLY from the per-step geometry (the ergonomic ctor).
-    /// `cap = Geometry::cap()` — tight, no margin — so the ring is as small as
-    /// correctness allows (tens to low hundreds of slots), always Private-mapped,
-    /// and an unbounded-until-EOS run streams zero-copy at any length. The lap is
-    /// provably impossible (the budget drains before the writer wraps); a
-    /// violation bails loudly rather than corrupting.
+    /// Construct sized from the per-step geometry PLUS a consumer-slack window.
+    ///
+    /// `Geometry::cap()` is the tight correctness bound — the minimum that cannot
+    /// lap while the drain keeps its commit cadence. But the drain runs the
+    /// consumer INLINE (`on_tokens` at each commit), so a consumer that blocks (a
+    /// `print!` to a slow terminal, an SSE flush) stalls the producer once the ring
+    /// fills. The cure is slack: allocate MANY more segments than `cap()` needs, so
+    /// the writer can run far ahead of a lagging consumer before the lap guard
+    /// fires. It is pure headroom — preallocated, so it costs memory, never
+    /// per-step work (the drain reads only the live window; empty segments are
+    /// never touched). And it is orthogonal to TTFT: the commit cadence (`period`)
+    /// is unchanged, so the first token still streams when it always did.
+    ///
+    /// The slack is a BYTE budget (`LLOOM_RING_SLACK_BYTES`, default
+    /// [`RING_SLACK_BYTES_DEFAULT`]); the ring is sized to the larger of the tight
+    /// `cap()` and that budget's slot count. The lap guard then tolerates
+    /// `total_tiles − 1` undrained tiles — the slack, in tiles — bailing loudly
+    /// only if the consumer falls that far behind (a real stall to surface, not
+    /// silent corruption). `cap()` itself is untouched, so the fuzz's tight-bound
+    /// checks and the geometry's own proof still hold.
     pub fn with_geometry(
         eos_ids: &[u32],
         device: &Device,
         geometry: Geometry,
         eos: EosRead,
     ) -> Result<Self> {
-        Self::with_cap_and_quantum(eos_ids, device, geometry.cap(), geometry.quantum(), eos)
+        let cap = geometry.cap().max(history_slack_slots(geometry.quantum()));
+        Self::with_cap_and_quantum(eos_ids, device, cap, geometry.quantum(), eos)
     }
 
     fn with_cap_and_quantum(
@@ -1341,4 +1401,91 @@ mod tests {
     const TILE_POISON_TEST: u32 = TILE_POISON;
     #[cfg(not(debug_assertions))]
     const TILE_POISON_TEST: u32 = 0xDEAD_B171;
+
+    /// The WINDOW drain (`drain_mapped`) on a REAL Metal device — the scan-free,
+    /// mapped-pointer path the deviceless `drain_into` fuzz above cannot reach.
+    /// This is the read the crown actually runs (`poll_fallbacks=0`), and its bug
+    /// class is the one this change fixes: a window that spans a SEGMENT BOUNDARY
+    /// must come back as one in-order run, not a fragmented patchwork.
+    ///
+    /// Forces ≥2 segments (a ring larger than one `SEG_MAX_SLOTS` segment) and
+    /// feeds a run long enough to WRAP across the boundary many times, draining on
+    /// a varying cadence so the window `[drained, end)` lands both inside a segment
+    /// and straddling two. Asserts the drained ids equal the fed ids exactly.
+    #[test]
+    fn history_window_drain_spans_segments_on_device() {
+        #[cfg(feature = "metal")]
+        {
+            let Ok(dev) = Device::new_metal(0) else {
+                eprintln!("no Metal device; skipping window-drain-on-device fuzz");
+                return;
+            };
+            // total_tiles > tiles_per_seg (== SEG_MAX_SLOTS at quantum 1) forces
+            // ≥2 segments. Ask for two segments' worth of slots.
+            let cap = SEG_MAX_SLOTS * 2 + 5;
+            let mut h = History::new(cap, 1, &dev).unwrap();
+            assert!(
+                h.segments.len() >= 2,
+                "test needs ≥2 segments, got {}",
+                h.segments.len()
+            );
+
+            let mut rng = SmallRng(0x5E6D_E175_0BAD_F00Du64);
+            let mut next_id = 1u32;
+            let mut fed_since_drain: Vec<u32> = Vec::new();
+            // Run well past 2× the ring so the window wraps the segment boundary
+            // repeatedly; ids stay non-zero so a stray init/poison slot is visible.
+            for step in 0..(SEG_MAX_SLOTS * 5) {
+                h.begin_step().unwrap();
+                let id = next_id;
+                // Keep ids non-zero so a stray init slot (0) or poison is visible.
+                next_id = next_id.wrapping_add(1);
+                if next_id == 0 {
+                    next_id = 1;
+                }
+                let one = Tensor::new(&[id], &dev).unwrap();
+                let (seg, off) = h.tile_home(h.tiles);
+                h.segments[seg].slice_set(&one, 0, off).unwrap();
+                h.wrote_one();
+                fed_since_drain.push(id);
+
+                // Vary the drain cadence (1..=7 steps) so the window sometimes
+                // sits inside one segment and sometimes straddles the boundary,
+                // but always before the ring could lap.
+                if step % (1 + rng.upto(7)) == 0 {
+                    // Close the open tile so the whole fed run is visible, then
+                    // drain the window by mapped pointer. Sync first: `slice_set`
+                    // enqueues an async copy, and this test reads the RAW mapped
+                    // buffer (`peek_scalar_ptr`) without the GPU-counter clamp the
+                    // production path uses (`published_generation`), so the writes
+                    // must be retired before the read. The property under test is
+                    // the window ARITHMETIC (which slots are read), not the
+                    // visibility ordering the counter handles in prod.
+                    dev.synchronize().unwrap();
+                    h.close_open_tile().unwrap();
+                    let end = h.generation();
+                    let mut out = Vec::new();
+                    let mapped = h.drain_mapped(end, &mut out);
+                    assert!(mapped, "drain_mapped must take the mapped path at quantum 1");
+                    assert_eq!(
+                        out, fed_since_drain,
+                        "window drain diverged at step {step} (seg-spanning run wrong)"
+                    );
+                    assert!(
+                        !out.contains(&TILE_POISON_TEST),
+                        "a poison/waste slot leaked into the window drain at step {step}"
+                    );
+                    fed_since_drain.clear();
+                }
+            }
+            // Final sweep: whatever remains must drain in order.
+            dev.synchronize().unwrap();
+            h.close_open_tile().unwrap();
+            let end = h.generation();
+            let mut out = Vec::new();
+            assert!(h.drain_mapped(end, &mut out));
+            assert_eq!(out, fed_since_drain, "final window drain diverged");
+            assert_eq!(h.undrained(), 0, "everything must be drained");
+        }
+    }
 }

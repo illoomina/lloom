@@ -27,7 +27,7 @@ use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
 };
-use lloom::models::lfm2::{Cache, ConvState, KvAppend, Lfm2Config, Model};
+use lloom::models::lfm2::{Cache, ConvState, KvAppend, Lfm2Config, Model, DEFAULT_KV_CAPACITY};
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, Session, VarBuilder};
 use std::io::Read;
@@ -908,8 +908,21 @@ fn main() -> Result<()> {
                 anyhow::bail!("{} does not exist", draft_file.display());
             }
             // Cover the largest absolute position the draft will attend: the prompt,
-            // every accepted token (≤ max_tokens), plus the block width and slack.
-            let max_pos = prompt_ids.len() + args.max_tokens + setup.dcfg.block_size + 64;
+            // every accepted token, plus the block width and slack. `max_tokens`
+            // is the token ceiling — EXCEPT `0` means UNBOUNDED (run until EOS),
+            // where it is NOT the bound: the run is bounded in practice by the KV
+            // cache (`DEFAULT_KV_CAPACITY`), which is the furthest the target — and
+            // so the drafter, which attends the same positions — can reach. Sizing
+            // the drafter's RoPE table from `max_tokens=0` gave it just
+            // `prompt+block+64` rows (89 for a 16-token prompt), so an unbounded
+            // `--dspark` run crashed the moment it drafted past ~position 82
+            // (`DSparkRotary::apply`'s `cos.narrow`). Use the KV ceiling instead.
+            let generation_ceiling = if args.max_tokens == 0 {
+                DEFAULT_KV_CAPACITY
+            } else {
+                args.max_tokens
+            };
+            let max_pos = prompt_ids.len() + generation_ceiling + setup.dcfg.block_size + 64;
             // F16 to match the target the block is embedded with — the drafter's
             // stored BF16 has no CPU matmul and would need a cast at every meeting
             // of the two dtypes (`lfm2_dspark.rs` `DSparkDrafter::new` docs).

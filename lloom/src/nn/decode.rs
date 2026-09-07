@@ -204,6 +204,14 @@ pub struct DecodeStats {
     pub steps: u64,
     /// Submission time of the prompt's forward pass — encode, not execution.
     pub prefill_ns: u64,
+    /// Compute time to the first token: prefill + the first decode step, stamped
+    /// ONCE (at step 0) so it survives release without any per-step clock read —
+    /// the fair, llama-bench-comparable TTFT (their synchronous `llama_decode` of
+    /// the prompt → first logits), measured here WITHOUT a forced sync (the async
+    /// pipeline is the design). Distinct from the CLI's `first_batch_at` (when the
+    /// host DRAINS the first token, which adds the commit cadence) and
+    /// `first_visible_at` (+ the consumer/print). 0 if the run produced nothing.
+    pub ttft_compute_ns: u64,
     /// Per-step host time, one entry per returned token. Under `lookahead = 1`
     /// the wait sits after the forward's encode, so the entry is still one
     /// token's cadence and not a submit time.
@@ -763,6 +771,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
             let feed = readback.sample_and_feed(sampler, &logits)?;
             produced += 1;
+
+            // The fair, llama-bench-comparable TTFT, stamped ONCE (step 0) — the
+            // first output token is the argmax of the prefill's last-position
+            // logits, sampled here, so `prefill_start.elapsed()` now is the host
+            // time to submit prefill + sample the first token. No forced sync (the
+            // async pipeline is the design — this is the honest difference from
+            // llama-bench, which blocks on `llama_decode`), no drain cadence, no
+            // consumer/print. ONE clock read per generation, so release-safe.
+            if stats.steps == 1 {
+                stats.ttft_compute_ns = prefill_start.elapsed().as_nanos() as u64;
+            }
 
             // Whether this step's commit is the loop's to make at all: the
             // blocking arm's own readback commits and waits every step, and a

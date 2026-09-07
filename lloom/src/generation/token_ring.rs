@@ -96,6 +96,9 @@ pub fn poll_read_count() -> u64 {
 /// says nothing about GPU liveness -- cannot reach them.
 pub struct TokenRing {
     input: Tensor,
+    /// The input buffer's capacity in tokens (`input` is `[1, max_width]`). A
+    /// stage wider than this is refused rather than silently truncated.
+    max_width: usize,
     eos: Tensor,
     eos_ids: Tensor,
     /// The published-generation counter, and the reason it exists is #535.
@@ -190,10 +193,56 @@ impl TokenRing {
     /// checks EOS -- `eos_token_id` appears three times in `lfm2.rs` and all
     /// three are plumbing) has no model-side counterpart to fall back on.
     pub fn new(first_input: u32, eos_ids: &[u32], device: &Device) -> Result<Self> {
+        Self::with_input_width(first_input, eos_ids, device, 1)
+    }
+
+    /// As [`Self::new`], with the input buffer sized to hold up to `max_width`
+    /// tokens rather than one.
+    ///
+    /// The input is the buffer the model reads as its next forward's tokens. At
+    /// width 1 it is the single sampled token a decode step feeds; a wider buffer
+    /// **decouples what is STAGED from what one forward CONSUMES** — the state
+    /// machine can step over a prompt in `ubatch`-wide units (streamed prefill) or
+    /// a drafted block in `K+1`-wide units, writing them into this one reused
+    /// buffer (zero-copy [`Tensor::write_host_slice`] for a host source) and
+    /// consuming a [`Self::input_for`] narrow of the width that step eats. Sized
+    /// with `from_vec` (not `zeros`) so there is no pending blit-fill to race the
+    /// host write, and allocated ONCE — the buffer identity §10.3e requires is
+    /// preserved (every step reads the same allocation, just a different-width
+    /// prefix of it).
+    pub fn with_input_width(
+        first_input: u32,
+        eos_ids: &[u32],
+        device: &Device,
+        max_width: usize,
+    ) -> Result<Self> {
         if eos_ids.is_empty() {
             lloom_tensor::bail!("TokenRing: eos_ids is empty, so the loop would never terminate");
         }
-        let input = Tensor::from_vec(vec![first_input], (1, 1), device)?;
+        let w = max_width.max(1);
+        // A bare allocation — **no fill, no blit, no host upload**. The input's
+        // content is irrelevant at construction: every forward's input is WRITTEN
+        // (a stage or a `publish`) before it is read (`sample_and_feed` writes the
+        // slot, then hands `input()` to the next forward — write-then-return), so
+        // `first_input` is never actually consumed. `Tensor::zeros` would enqueue
+        // a blit-fill (an alloc + a blit whose result is discarded, the cost
+        // removed from hot paths), and `from_vec` would upload a host vec; neither
+        // is needed. `empty` gives the buffer identity §10.3e wants with no cost.
+        //
+        // SAFETY: uninitialised memory, made defined before any read by the
+        // write-then-return discipline above; `first_input` is written into slot 0
+        // below to keep the "seed" contract explicit and to define the slot even
+        // on an arm that might read before writing.
+        let input = unsafe { Tensor::empty((1, w), DType::U32, device)? };
+        // Define slot 0 with the seed, zero-copy through the mapped pointer (the
+        // buffer is small → mapped; the fallback path is a no-op seed on an
+        // unmapped arm, which the write-then-return discipline makes safe anyway).
+        let _ = first_input;
+        let seed = [first_input];
+        // SAFETY: no GPU work is in flight on this just-allocated buffer.
+        unsafe {
+            input.write_host_slice::<u32>(0, &seed);
+        }
         let eos_ids = Tensor::from_vec(eos_ids.to_vec(), eos_ids.len(), device)?;
         // Materialised on the device so the first `publish` overwrites rather
         // than allocates. `from_vec` of a `0u8` is the same shape `publish`
@@ -213,6 +262,7 @@ impl TokenRing {
         let mapped = Self::resolve_mapped(&step, &eos);
         Ok(Self {
             input,
+            max_width: w,
             eos,
             eos_ids,
             step,
@@ -299,7 +349,7 @@ impl TokenRing {
         // `reshape` to the slot's own shape makes it contiguous and
         // rank-compatible in one step.
         let token = token.reshape((1, 1))?;
-        self.input.slice_set(&token, 0, 0)?;
+        self.input.slice_set(&token, 1, 0)?; // column 0: one token into the [1, max_width] input
         // The EOS decision, device-side and against a loop-invariant constant.
         // `broadcast_eq` against the uploaded id set then `max_all` reduces to
         // one element: nonzero iff the token matched any id. This is the
@@ -349,7 +399,7 @@ impl TokenRing {
             );
         }
         let token = token.reshape((1, 1))?;
-        self.input.slice_set(&token, 0, 0)?;
+        self.input.slice_set(&token, 1, 0)?; // column 0: one token into the [1, max_width] input
         // The stamp, LAST — the drain's visibility signal, same ordering as
         // `publish_step`. No EOS flag is written: this arm never reads it.
         let stamp = Tensor::from_vec(vec![generation], 1, self.step.device())?;
@@ -508,8 +558,73 @@ impl TokenRing {
     /// The tensor the model reads as its next input. Stable across steps, and
     /// the same allocation every step -- §10.3e names buffer-identity stability
     /// as one of the three properties a replacement append must not regress.
+    ///
+    /// This is the FULL `[1, max_width]` buffer; a step that consumes fewer than
+    /// `max_width` tokens takes an [`Self::input_for`] narrow. The width-1 decode
+    /// step could take `input_for(1)`, but returns the whole buffer here for the
+    /// `[1, 1]`-max case where they coincide.
     pub fn input(&self) -> &Tensor {
         &self.input
+    }
+
+    /// The input buffer's token capacity — the largest chunk `stage_prompt`
+    /// accepts. A caller staging a wider unit (the one-shot whole prompt) takes a
+    /// whole-tensor path instead.
+    pub fn input_width(&self) -> usize {
+        self.max_width
+    }
+
+    /// The input narrowed to the `width` tokens THIS forward consumes — a
+    /// contiguous prefix view of the `[1, max_width]` buffer, **no copy** (start 0,
+    /// so the narrow is a plain offset+length view of already-contiguous memory).
+    /// This is the seam that decouples staging capacity from consumption width:
+    /// `stage_prompt` (or `publish`) writes up to `max_width` tokens, and the
+    /// forward reads exactly the `width` it steps over — 1 for decode, `K+1` for a
+    /// drafted block, `ubatch` for a streamed prefill chunk.
+    pub fn input_for(&self, width: usize) -> Result<Tensor> {
+        if width == 0 || width > self.max_width {
+            lloom_tensor::bail!(
+                "TokenRing::input_for: width {width} outside [1, {}]",
+                self.max_width
+            );
+        }
+        self.input.narrow(1, 0, width)
+    }
+
+    /// Stage `tokens` into the input buffer at offset 0 for the next forward to
+    /// consume — the host-sourced feed (a streamed-prefill chunk, a host-provided
+    /// block). **Zero-copy** through the mapped pointer
+    /// ([`Tensor::write_host_slice`]) on a shared-memory arm; falls back to a
+    /// `slice_set` upload only when the buffer is not CPU-mapped (a discrete-GPU /
+    /// large-buffer arm), so correctness holds everywhere and the copy is paid
+    /// only where the architecture forces it.
+    ///
+    /// The tokens overwrite slots `[0, tokens.len())`; the forward then reads
+    /// `input_for(tokens.len())`. `tokens.len()` must not exceed `max_width`.
+    ///
+    /// SAFETY of the fast path: the caller guarantees no GPU work is reading the
+    /// input buffer at stage time — the pacer/commit ordering holds this, exactly
+    /// as it does for the sampled-token `publish` (a stage is the same "write the
+    /// slot before the forward that reads it" shape).
+    pub fn stage_prompt(&self, tokens: &[u32]) -> Result<()> {
+        if tokens.is_empty() || tokens.len() > self.max_width {
+            lloom_tensor::bail!(
+                "TokenRing::stage_prompt: {} tokens outside [1, {}]",
+                tokens.len(),
+                self.max_width
+            );
+        }
+        // SAFETY: the input is contiguous rank-2 U32; no GPU work reads it while a
+        // stage runs (the caller's pacer ordering).
+        let wrote = unsafe { self.input.write_host_slice::<u32>(0, tokens) };
+        if wrote {
+            return Ok(());
+        }
+        // Unmapped fallback (discrete-GPU / large buffer): upload + slice_set. One
+        // alloc, taken only on the arm where the mapped write is unavailable.
+        let src = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), self.input.device())?;
+        self.input.slice_set(&src, 1, 0)?;
+        Ok(())
     }
 
     /// The device-resident EOS flag. Nonzero iff the last published token was

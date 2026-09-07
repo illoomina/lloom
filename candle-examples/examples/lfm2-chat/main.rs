@@ -258,6 +258,19 @@ struct Args {
     #[arg(long, default_value_t = 16)]
     chunk: usize,
 
+    /// Prompt tokens per prefill micro-batch — the `n_ubatch` of the streamed
+    /// prefill. **`0` (default) is the incumbent one-shot** (the whole prompt in
+    /// one forward). A positive value steps the state machine over the prompt in
+    /// chunks of this width through the SAME in-flight pacer the decode loop uses,
+    /// so the pipeline spans prefill→decode with no drain and the host encodes the
+    /// next chunk while the GPU runs the current one. It is the TTFT-vs-throughput
+    /// dial: larger keeps the matmul units fuller (throughput; it reaches one-shot
+    /// as it reaches the prompt length), smaller overlaps more and frees the
+    /// pipeline for the first generated token sooner. Streamed multi-chunk turns
+    /// on the conv's left-context carry so it stays byte-identical to one-shot.
+    #[arg(long, default_value_t = 0)]
+    prefill_ubatch: usize,
+
     /// The rotating ring's history depth under `--cache rewindable` (non-dspark):
     /// the rewind horizon. `--dspark` sizes it from the drafter's block.
     #[arg(long, default_value_t = 16)]
@@ -590,7 +603,15 @@ fn main() -> Result<()> {
     }
     // `--mode reuse` carries the conv state across the turn-boundary prefill
     // (§13.2f). Set on the config the model is built from; a no-op for `single`.
-    config.conv_prefill_ctx = args.conv_prefill_ctx;
+    //
+    // Streamed prefill (`--prefill-ubatch > 0`) REQUIRES it: each chunk after the
+    // first is a `seq_len>1` pass onto a warm cache, and without the left-context
+    // carry the conv zero-pads the chunk boundary — a different convolution than
+    // one pass over the whole prompt, so the output diverges (measured: garbage
+    // from char 1). With it on, a chunked prefill computes exactly what one-shot
+    // does. A single chunk (or one-shot) is identical either way (cold cache, no
+    // left context to carry), so forcing it on when streaming is always safe.
+    config.conv_prefill_ctx = args.conv_prefill_ctx || args.prefill_ubatch > 0;
 
     let files = weight_files(&model_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
@@ -894,6 +915,8 @@ fn main() -> Result<()> {
         // Under the speculative body this is the per-phase drain (decode.rs).
         sample_split: args.phase_sync,
         in_flight_depth,
+        // 0 = one-shot prefill (incumbent); >0 streams the prompt through the pacer.
+        prefill_ubatch: args.prefill_ubatch,
     };
 
     // The DSpark proposer, built only when `--dspark` is set. It borrows the
@@ -1516,6 +1539,11 @@ fn decode_with(
         max_draft: 0,
         period: opts.budget.period(),
         lookahead: opts.lookahead,
+        // Widen the ring's input buffer to the streamed-prefill chunk so a chunk
+        // stages into one reused buffer; 0 leaves it at `quantum` (the one-shot
+        // path allocates its whole-prompt input tensor via the trait default, so
+        // the input buffer width is not consulted there).
+        max_input_width: opts.prefill_ubatch(),
     };
     let out = match readback {
         "blocking" => {

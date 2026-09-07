@@ -111,6 +111,19 @@ pub struct DecodeOptions {
     /// [`Session::warmup`]'s return, or left 0 to fall back to the floor when no
     /// warmup ran (CPU, or warmup skipped).
     pub in_flight_depth: usize,
+    /// Prompt tokens per prefill micro-batch (the `n_ubatch` of the streamed
+    /// prefill). **`0` means the whole prompt in one pass** — the incumbent
+    /// one-shot. A positive value feeds the prompt through the SAME in-flight
+    /// pacer the decode loop uses, in chunks of this width, so the pipeline spans
+    /// prefill→decode with no drain and host-encode(chunk N+1) overlaps
+    /// GPU(chunk N). It is the TTFT-vs-throughput dial: larger chunks keep the
+    /// matmul units fuller (throughput, and it approaches one-shot as it reaches
+    /// the prompt length); smaller chunks overlap more and free the pipeline for
+    /// concurrent decode sooner. Correctness across chunk boundaries needs the
+    /// conv's left-context carry (`Config::conv_prefill_ctx`), which the streamed
+    /// path turns on for a multi-chunk run; a single chunk is identical either
+    /// way (a cold cache has no left context to carry).
+    pub prefill_ubatch: usize,
 }
 
 /// One speculative round of [`Session::decode_speculative`], for the per-round
@@ -171,7 +184,14 @@ impl DecodeOptions {
             lookahead: 0,
             sample_split: false,
             in_flight_depth: 0,
+            prefill_ubatch: 0,
         }
+    }
+
+    /// Prompt tokens per prefill micro-batch, or the whole prompt in one pass when
+    /// `0` (the incumbent one-shot). See [`Self::prefill_ubatch`].
+    pub fn prefill_ubatch(&self) -> usize {
+        self.prefill_ubatch
     }
 }
 
@@ -611,22 +631,66 @@ impl<'m, M: CausalLM> Session<'m, M> {
             ..DecodeStats::default()
         };
 
-        // Prefill: the whole prompt in one pass. Its GPU tail lands in the
-        // first decode steps; what is timed here is the submission.
+        // The in-flight bound, created BEFORE the prefill so the prompt-steps and
+        // the generate-steps share ONE pacer — the pipeline spans prefill→decode
+        // with no drain at the boundary, and the pacer's depth lets the host encode
+        // the next unit while the GPU runs the current one (host↔GPU overlap). The
+        // blocking arm's readback drains the queue every step, so its stream stays
+        // the incumbent's; depth is the computed host/GPU balance
+        // (`opts.in_flight_depth`, from warmup) or the floor — not a constant.
+        let mut pacer = StepPacer::new(opts.pacer_depth());
+        let pace = readback.loop_commits();
+
+        // Prefill: the state machine STEPS OVER THE PROMPT before it steps over
+        // its own generated tokens — same stepping, different input source. Rather
+        // than one monolithic `forward(whole_prompt)` the host blocks on, the
+        // prompt flows in as `prefill_ubatch`-wide units through the shared pacer:
+        // each unit is staged into the ring's input buffer (zero-copy) and read as
+        // a narrow, exactly as a decode step feeds its one token. A unit does NOT
+        // sample (the tokens are given) and produces no output (nothing generated
+        // yet); only the LAST unit's last-position logits seed the first generate
+        // step. `prefill_ubatch == 0` means one unit over the whole prompt — the
+        // incumbent one-shot, so the default path is byte-identical.
+        //
+        // Correctness across unit boundaries: a `seq_len>1` conv writer zero-pads
+        // its left, exact only for a cold cache; a unit onto a WARM cache must
+        // carry the previous window (`Config::conv_prefill_ctx`). The caller turns
+        // that on when it streams (`prefill_ubatch>0`); a single unit is identical
+        // either way (a cold cache has no left context to carry).
         let pos_before = self.seq.pos;
         let census_before = census_snapshot();
         let prefill_start = std::time::Instant::now();
         let mut logits = match self.seq.last_logits.take() {
             Some(held) if resume => held,
             _ => {
-                let input = Tensor::new(prompt, &device)?.unsqueeze(0)?;
-                let logits = self
-                    .model
-                    .forward(&input, self.seq.pos, &mut self.seq.cache)?
-                    .squeeze(0)?;
-                self.seq.pos += prompt.len();
-                self.seq.tokens.extend_from_slice(prompt);
-                logits
+                let ubatch = opts.prefill_ubatch();
+                let step = if ubatch == 0 { prompt.len() } else { ubatch };
+                let mut last_logits = None;
+                let mut off = 0usize; // the machine's position over the prompt
+                while off < prompt.len() {
+                    let w = step.min(prompt.len() - off);
+                    let chunk = &prompt[off..off + w];
+                    // Stage this unit's tokens as the forward's input (zero-copy on
+                    // the ring arm), then step: bound the enqueue, forward, keep
+                    // the marker — the same `before/after_forward` a generate step
+                    // takes, so prompt units and generated tokens ride one pipeline.
+                    let input = readback.stage_prompt_chunk(chunk)?;
+                    if pace {
+                        pacer.before_forward(&device)?;
+                    }
+                    let out = self
+                        .model
+                        .forward(&input, self.seq.pos, &mut self.seq.cache)?
+                        .squeeze(0)?;
+                    if pace {
+                        pacer.after_forward(&device)?;
+                    }
+                    self.seq.pos += w;
+                    self.seq.tokens.extend_from_slice(chunk);
+                    last_logits = Some(out);
+                    off += w;
+                }
+                last_logits.expect("a non-empty prompt steps at least once")
             }
         };
         end_executor_step(&device)?;
@@ -637,12 +701,6 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut produced = 0usize;
         let mut since_commit = 0usize;
         let mut eos = false;
-        // The in-flight bound, on the arms whose commits the loop owns. The
-        // blocking arm's readback drains the queue every step, so its stream
-        // stays the incumbent's. Depth is the computed host/GPU balance
-        // (`opts.in_flight_depth`, from warmup) or the floor — not a constant.
-        let mut pacer = StepPacer::new(opts.pacer_depth());
-        let pace = readback.loop_commits();
         // Every id the loop drains, streamed or not, accumulates here so the
         // returned `ids` is complete and the reconciliation below counts the
         // whole run. Draining for the stream advances the strategy's cursor, so

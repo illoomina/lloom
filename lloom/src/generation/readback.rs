@@ -106,6 +106,21 @@ pub trait ReadbackStrategy {
     fn sample_and_feed(&mut self, sampler: &mut LogitsProcessor, logits: &Tensor)
         -> Result<Tensor>;
 
+    /// Stage a **prompt chunk** as the next forward's input and return the tensor
+    /// to feed it — the streamed-prefill counterpart of [`Self::sample_and_feed`],
+    /// where the tokens are GIVEN (the prompt) rather than sampled. The state
+    /// machine steps over the prompt in these chunks before it steps over its own
+    /// generated tokens; feeding a chunk here is one such step's input.
+    ///
+    /// **Default**: allocate a fresh `[1, n]` input tensor (the incumbent
+    /// `Tensor::new(prompt)` path) — correct for any arm, one alloc per chunk. The
+    /// ring arm overrides this to stage the tokens into its reused input buffer
+    /// (zero-copy [`TokenRing::stage_prompt`]) and return an `input_for` narrow,
+    /// so a streamed prefill pays no per-chunk allocation.
+    fn stage_prompt_chunk(&mut self, tokens: &[u32]) -> Result<Tensor> {
+        Tensor::new(tokens, self.device())?.unsqueeze(0)
+    }
+
     /// Was the token fed by the last [`Self::sample_and_feed`] an EOS? Waits
     /// by this arm's own mechanism until it knows; a `true` retracts that
     /// token from the ids [`Self::take_ids`] will return.
@@ -292,7 +307,7 @@ pub enum EosRead {
 /// bonus, proven at `decode.rs`'s accept loop). The live window the host can be
 /// behind is `period × quantum + batch × lookahead` (drain fires every `period`
 /// steps; lookahead enqueues that many extra forwards). See [`Geometry::cap`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Geometry {
     /// Sequences in the batch (`B`). 1 for the single-sequence chat path.
     pub batch: usize,
@@ -302,6 +317,13 @@ pub struct Geometry {
     pub period: usize,
     /// Forwards the host may enqueue before learning EOS (0 or 1).
     pub lookahead: usize,
+    /// The streamed-prefill micro-batch width (`prefill_ubatch`) — how many prompt
+    /// tokens one prefill step stages into the input buffer. `0` when the caller
+    /// does not stream the prefill (the input buffer is then sized to `quantum`,
+    /// the decode/draft width). Sizes the ring's input buffer to
+    /// `max(quantum, max_input_width)`; it does NOT affect `cap()` (the history
+    /// window) or the commit cadence.
+    pub max_input_width: usize,
 }
 
 impl Geometry {
@@ -803,7 +825,7 @@ impl Ring {
     /// [`Self::with_geometry`], which sizes the ring exactly from the run's own
     /// per-step geometry.
     pub fn new(eos_ids: &[u32], device: &Device, capacity: usize, eos: EosRead) -> Result<Self> {
-        Self::with_cap_and_quantum(eos_ids, device, capacity.max(RING_HISTORY_SLOTS), 1, eos)
+        Self::with_cap_and_quantum(eos_ids, device, capacity.max(RING_HISTORY_SLOTS), 1, 1, eos)
     }
 
     /// Construct sized from the per-step geometry PLUS a consumer-slack window.
@@ -833,7 +855,14 @@ impl Ring {
         eos: EosRead,
     ) -> Result<Self> {
         let cap = geometry.cap().max(history_slack_slots(geometry.quantum()));
-        Self::with_cap_and_quantum(eos_ids, device, cap, geometry.quantum(), eos)
+        // The input buffer holds at least one step's `quantum` tokens; streamed
+        // prefill widens it to `prefill_ubatch` when that is larger, so a chunk
+        // stages into one reused buffer. `quantum` covers decode (1) and a drafted
+        // block (`K+1`); `max_input_width` on the geometry is the streamed-prefill
+        // chunk width, 0 when the caller does not stream (then it is just
+        // `quantum`).
+        let max_input_width = geometry.max_input_width.max(geometry.quantum());
+        Self::with_cap_and_quantum(eos_ids, device, cap, geometry.quantum(), max_input_width, eos)
     }
 
     fn with_cap_and_quantum(
@@ -841,9 +870,10 @@ impl Ring {
         device: &Device,
         cap: usize,
         quantum: usize,
+        max_input_width: usize,
         eos: EosRead,
     ) -> Result<Self> {
-        let ring = TokenRing::new(0, eos_ids, device)?;
+        let ring = TokenRing::with_input_width(0, eos_ids, device, max_input_width)?;
         let history = History::new(cap, quantum, device)?;
         // Cache the EOS ids host-side only for the arm that compares them there;
         // the other arms read the device flag and never touch this.
@@ -899,6 +929,24 @@ impl ReadbackStrategy for Ring {
             // per-step blocking readback of the device flag.
             nonblocking_eos: matches!(self.eos, EosRead::Poll(_) | EosRead::HostOnDrain),
         }
+    }
+
+    /// Zero-copy prompt staging: write the chunk into the ring's reused input
+    /// buffer ([`TokenRing::stage_prompt`], mapped write with an upload fallback)
+    /// and return the `input_for` narrow the forward consumes — no per-chunk
+    /// `Tensor` allocation, unlike the trait default.
+    ///
+    /// Falls back to the default whole-tensor path when the chunk is WIDER than
+    /// the input buffer (`Geometry::max_input_width`) — the one-shot case, where
+    /// the buffer is sized to `quantum` (1 for greedy) but the "chunk" is the
+    /// whole prompt. So one-shot allocates its prompt tensor exactly as before,
+    /// and a streamed run (chunk ≤ the widened buffer) takes the zero-copy path.
+    fn stage_prompt_chunk(&mut self, tokens: &[u32]) -> Result<Tensor> {
+        if tokens.len() > self.ring.input_width() {
+            return Tensor::new(tokens, self.device())?.unsqueeze(0);
+        }
+        self.ring.stage_prompt(tokens)?;
+        self.ring.input_for(tokens.len())
     }
 
     fn admits_lookahead(&self) -> bool {
@@ -967,7 +1015,14 @@ impl ReadbackStrategy for Ring {
         // next `begin_step` (or the final drain) closes it. A batched writer
         // (quantum>1) would loop `next_slot`+`wrote_one` per accepted token
         // within the one tile, then let the next step close it.
-        Ok(self.ring.input().clone())
+        //
+        // Return the WIDTH-1 narrow, not the whole buffer: `publish` wrote one
+        // sampled token at slot 0, and a decode step consumes exactly that one. The
+        // input buffer may be WIDER than 1 (streamed prefill sized it to
+        // `max_input_width`), so feeding `input()` whole would hand the forward
+        // stale slots past the token. `input_for(1)` is a contiguous prefix view,
+        // no copy — the same allocation, just the one live slot.
+        self.ring.input_for(1)
     }
 
     fn eos_of_last(&mut self) -> Result<bool> {

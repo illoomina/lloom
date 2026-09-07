@@ -1,7 +1,7 @@
 use crate::kernels::source::{
-    AFFINE, ARENA_ALLOC, BINARY, CAST, CONV, FILL, FLASH_DECODING, GEMV, INDEXING, MERGED_MEMBERS,
-    MERGED_NON_MLX, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE, ROPE, SCRATCH, SDPA, SORT,
-    TERNARY, UNARY,
+    AFFINE, ARENA_ALLOC, BINARY, CAST, CONV, EOS_INDEX, FILL, FLASH_DECODING, GEMV, INDEXING,
+    MERGED_MEMBERS, MERGED_NON_MLX, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE, ROPE, SCRATCH,
+    SDPA, SORT, TERNARY, UNARY,
 };
 use crate::kernels::utils::get_env_bool;
 use crate::kernels::{
@@ -150,6 +150,7 @@ impl Kernels {
             Source::Binary => BINARY,
             Source::Cast => CAST,
             Source::Conv => CONV,
+            Source::EosIndex => EOS_INDEX,
             Source::Fill => FILL,
             Source::FlashDecoding => FLASH_DECODING,
             Source::Gemm => MLX_GEMM,
@@ -628,6 +629,7 @@ mod tests {
                 | Source::Binary
                 | Source::Cast
                 | Source::Conv
+                | Source::EosIndex
                 | Source::Fill
                 | Source::FlashDecoding
                 | Source::Gemv
@@ -663,6 +665,7 @@ mod tests {
             Source::Binary,
             Source::Cast,
             Source::Conv,
+            Source::EosIndex,
             Source::Fill,
             Source::FlashDecoding,
             Source::Gemm,
@@ -770,6 +773,7 @@ mod tests {
             Source::Binary,
             Source::Cast,
             Source::Conv,
+            Source::EosIndex,
             Source::Fill,
             Source::FlashDecoding,
             Source::Gemm,

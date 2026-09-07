@@ -508,11 +508,35 @@ impl KvAppend {
     }
 }
 
-/// How much KV a sequence may accumulate before [`KvAppend::InPlace`] declines.
+/// The KV ceiling the profiling harness and `lloom-serve` reserve by default,
+/// in tokens.
 ///
-/// **This value is not chosen on evidence, and that is deliberate.** See the
-/// `Cache::new_with` documentation for why, and for what would decide it.
+/// **Not what [`Cache::new`] uses.** A cache built through `new` takes the
+/// model's own `max_position_embeddings` as its ceiling and grows toward it in
+/// buckets of [`DEFAULT_KV_BUCKET`] tokens, each bucket admitted against the
+/// device before it is allocated (`Cache::prepare_pass`). This constant is the
+/// explicit `--kv-capacity` default of the harnesses that sweep the ceiling as
+/// an axis, kept at the value every recorded run of theirs was taken at.
 pub const DEFAULT_KV_CAPACITY: usize = 4096;
+
+/// How many tokens the KV slab grows by when a pass would overrun it.
+///
+/// # Why 4096
+///
+/// A grow costs one allocation plus one copy of the live slab per K and V
+/// plane of every attention layer, so the bucket trades over-allocation
+/// against how often that is paid. At LFM2's 16 KiB per position (§5.6's
+/// geometry, `admission::KV_BYTES_PER_TOKEN`) the bucket is 64 MiB at B=1,
+/// which is also the most a run can hold past what it uses. Against the full
+/// 131 072 positional ceiling it is 31 grows, one every ~75 s of decode at
+/// 55 tok/s, and the copies sum to ~31 GiB — a tenth of a second at §3.4's
+/// 349.7 GB/s spread over a forty-minute reply. The config's
+/// `block_multiple_of` (256) would pay 511 grows and hand the buffer pool 511
+/// distinct slab sizes, each a bucket it cannot reuse for the next; coarser
+/// (16 384) would hold 256 MiB for a one-line answer. 4096 is also the
+/// ceiling every recorded digest was taken under, so a reply that fits in one
+/// bucket allocates exactly what it did before growth existed.
+pub const DEFAULT_KV_BUCKET: usize = 4096;
 
 /// What admission needs that `Config` does not already carry (`DESIGN.md`
 /// §9.5d).
@@ -1034,10 +1058,53 @@ impl KvSlot {
         Ok(())
     }
 
+    /// Bytes the slab holds. Zero before the first append.
+    fn bytes(&self) -> usize {
+        self.all_data
+            .as_ref()
+            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+            .unwrap_or(0)
+    }
+
+    /// Widen the slab to `capacity` tokens, keeping every position where it is.
+    ///
+    /// Before the first append this is a number: the slab is allocated at the
+    /// new width when the first token arrives. After it, a fresh slab is
+    /// allocated at the new width and the old one is copied into its prefix
+    /// whole — every position, live or rewound, lands at the offset it had, so
+    /// the views this slot hands out afterwards read exactly the bytes the
+    /// views before it did. The copy is `slice_set`'s one `copy2d` per plane;
+    /// the old slab returns to the pool when the last view of it drops.
+    ///
+    /// **The buffer identity moves here, and only here.** §6.2b's property —
+    /// one `MTLBuffer` at one base every token — holds between grows; a grow
+    /// is the one event that re-binds it, paid once per bucket rather than
+    /// once per token. A replay executor sees the step as stale and re-records
+    /// (§11.3y); the arena sees a drift and re-records (§9.2z). Neither is a
+    /// wrong answer, and both are the documented price.
+    ///
+    /// A `capacity` at or below the current one is a no-op, never a shrink:
+    /// the caller decides the width, and this never discards a position.
+    fn grow_to(&mut self, capacity: usize) -> Result<()> {
+        if capacity <= self.capacity {
+            return Ok(());
+        }
+        if let Some(old) = self.all_data.as_ref() {
+            let mut shape = old.dims().to_vec();
+            shape[2] = capacity;
+            let grown = Tensor::zeros(shape, old.dtype(), old.device())?;
+            grown.slice_set(old, 2, 0)?;
+            self.all_data = Some(grown);
+        }
+        self.capacity = capacity;
+        Ok(())
+    }
+
     /// Append `src` along dim 2 and return the live prefix as a view.
     ///
-    /// Returns `Err` rather than reallocating when the capacity is exhausted —
-    /// see `Cache::new_with` for why that is a loud failure and not a `Grow`.
+    /// Returns `Err` rather than reallocating when the capacity is exhausted:
+    /// the slab is widened by `Cache::prepare_pass` before a pass appends, so
+    /// reaching this means an append ran outside a prepared pass.
     fn append(&mut self, src: &Tensor) -> Result<Tensor> {
         let seq_len = src.dim(2)?;
         if self.all_data.is_none() {
@@ -1049,7 +1116,8 @@ impl KvSlot {
         if self.len + seq_len > self.capacity {
             lloom_tensor::bail!(
                 "lfm2 KV cache exhausted: {} + {} > capacity {}. \
-                 Raise `Config::kv_capacity`; see `DESIGN.md` §6.2a on why no policy is chosen.",
+                 A pass widens the slab before it appends (`Cache::prepare_pass`); this \
+                 append ran outside a prepared pass.",
                 self.len,
                 seq_len,
                 self.capacity
@@ -1111,6 +1179,11 @@ struct QuantKvSlot {
     len: usize,
     capacity: usize,
     quant: KvQuant,
+    /// The plane geometry, recorded by `ensure` so a grow can re-lay the
+    /// planes at a wider stride without a source tensor in hand.
+    b_sz: usize,
+    n_heads: usize,
+    head_dim: usize,
 }
 
 impl QuantKvSlot {
@@ -1123,7 +1196,57 @@ impl QuantKvSlot {
             len: 0,
             capacity,
             quant,
+            b_sz: 0,
+            n_heads: 0,
+            head_dim: 0,
         }
+    }
+
+    /// Bytes the three planes hold. Zero before the first append.
+    fn bytes(&self) -> usize {
+        [&self.codes, &self.scales, &self.biases]
+            .into_iter()
+            .flatten()
+            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+            .sum()
+    }
+
+    /// Widen the planes to `capacity` tokens, keeping every position where it
+    /// is — `KvSlot::grow_to`'s contract on three planes.
+    ///
+    /// The planes are flat and `capacity` is their row stride (`[B, H,
+    /// capacity, D]` codes, `[B, H, capacity]` scales and biases), so the copy
+    /// is per `(batch, head)` row: each old row lands at the head of the
+    /// wider row it now has, which is one `copy2d` per plane through a
+    /// two-dimensional view of the same bytes. Positions above `len` are
+    /// carried too; they are unreachable either way.
+    fn grow_to(&mut self, capacity: usize) -> Result<()> {
+        if capacity <= self.capacity {
+            return Ok(());
+        }
+        if let Some(codes) = self.codes.as_ref() {
+            let rows = self.b_sz * self.n_heads;
+            let row = |cap: usize| -> Result<usize> {
+                self.quant
+                    .code_bytes(cap * self.head_dim)
+                    .ok_or_else(|| lloom_tensor::Error::msg("QuantKvSlot::grow_to on the Off arm"))
+            };
+            let (old_row, new_row) = (row(self.capacity)?, row(capacity)?);
+            let old = codes.reshape((rows, old_row))?;
+            let grown = Tensor::zeros((rows, new_row), DType::U8, codes.device())?;
+            grown.slice_set(&old, 1, 0)?;
+            self.codes = Some(grown.reshape(rows * new_row)?);
+            for plane in [&mut self.scales, &mut self.biases] {
+                if let Some(p) = plane.as_ref() {
+                    let old = p.reshape((rows, self.capacity))?;
+                    let grown = Tensor::zeros((rows, capacity), p.dtype(), p.device())?;
+                    grown.slice_set(&old, 1, 0)?;
+                    *plane = Some(grown.reshape(rows * capacity)?);
+                }
+            }
+        }
+        self.capacity = capacity;
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -1171,6 +1294,9 @@ impl QuantKvSlot {
         let scale_els = b_sz * n_heads * self.capacity;
         self.scales = Some(Tensor::zeros(scale_els, DType::F16, device)?);
         self.biases = Some(Tensor::zeros(scale_els, DType::F16, device)?);
+        self.b_sz = b_sz;
+        self.n_heads = n_heads;
+        self.head_dim = head_dim;
         Ok(())
     }
 
@@ -1273,9 +1399,13 @@ impl crate::nn::kv_cache::seam::KvCache for (KvSlot, KvSlot) {
 struct PagedKv {
     page_size: usize,
     pages_per_chunk: usize,
+    /// The ceiling, in tokens per sequence.
     kv_capacity: usize,
-    /// Pool size in pages when set; otherwise `n_seqs * ceil(kv_capacity /
-    /// page_size)`, the reserve the contiguous cache holds.
+    /// Tokens per sequence the pool is sized for now; grows by the cache's
+    /// bucket toward `kv_capacity` (`Cache::prepare_pass`).
+    slab: usize,
+    /// Pool size in pages when set; otherwise `n_seqs * ceil(slab /
+    /// page_size)`. An explicit size is pinned: it does not grow.
     pool_pages_override: Option<usize>,
     /// Pages allocated and recycled before any sequence exists, so the
     /// sequences' tables are not the identity — the fixture §10.3h needs at
@@ -1307,6 +1437,7 @@ impl PagedKv {
     fn new(
         config: &Config,
         kv_capacity: usize,
+        slab: usize,
         num_layers: usize,
         clock: Arc<GpuClock>,
     ) -> Result<Self> {
@@ -1322,6 +1453,7 @@ impl PagedKv {
             page_size: config.flash_page_size.max(1),
             pages_per_chunk: config.flash_pages_per_chunk.max(1),
             kv_capacity,
+            slab,
             pool_pages_override: env_usize("LLOOM_148_POOL_PAGES")?,
             churn_pages: env_usize("LLOOM_148_POOL_CHURN")?.unwrap_or(0),
             pool: None,
@@ -1339,12 +1471,70 @@ impl PagedKv {
     }
 
     fn pages_per_seq(&self) -> usize {
-        self.kv_capacity.div_ceil(self.page_size)
+        self.slab.div_ceil(self.page_size)
     }
 
     fn pool_pages(&self) -> usize {
         self.pool_pages_override
             .unwrap_or(self.n_seqs.max(1) * self.pages_per_seq())
+    }
+
+    /// Bytes the layer pools hold. Zero before the first write.
+    fn bytes(&self) -> usize {
+        self.pools
+            .iter()
+            .flatten()
+            .map(|(k, v)| {
+                k.elem_count() * k.dtype().size_in_bytes()
+                    + v.elem_count() * v.dtype().size_in_bytes()
+            })
+            .sum()
+    }
+
+    /// Tokens the pool would hold in total at `slab` tokens per sequence.
+    fn pool_tokens_at(&self, slab: usize) -> usize {
+        match self.pool_pages_override {
+            Some(pages) => pages * self.page_size,
+            None => self.n_seqs.max(1) * slab.div_ceil(self.page_size) * self.page_size,
+        }
+    }
+
+    /// Widen the pool to `slab` tokens per sequence — `KvSlot::grow_to`'s
+    /// contract on a pool.
+    ///
+    /// Every layer's pool is reallocated wider and the old one copied into its
+    /// prefix, so a page index names the same run of tokens before and after
+    /// and every table stays valid; the kernel reads `base + page × stride`,
+    /// and only the base moved. The free list gains the new pages *beneath*
+    /// the ones it holds (`KvPagePool::grow`), so a recycled page is still
+    /// handed out before a fresh one — the order a pool this wide from the
+    /// start would have taken. Under `LLOOM_148_POOL_PAGES` the pool is pinned
+    /// and exhaustion at it stays loud.
+    fn grow_to(&mut self, slab: usize) -> Result<()> {
+        let slab = slab.min(self.kv_capacity);
+        if slab <= self.slab {
+            return Ok(());
+        }
+        let old_pages = self.pool_pages();
+        self.slab = slab;
+        let new_pages = self.pool_pages();
+        match self.pool.as_mut() {
+            Some(pool) if new_pages > old_pages => pool.grow(new_pages - old_pages),
+            _ => return Ok(()),
+        }
+        let tokens = new_pages * self.page_size;
+        for layer in self.pools.iter_mut() {
+            if let Some((pk, pv)) = layer.as_ref() {
+                let mut shape = pk.dims().to_vec();
+                shape[2] = tokens;
+                let nk = Tensor::zeros(shape.clone(), pk.dtype(), pk.device())?;
+                nk.slice_set(pk, 2, 0)?;
+                let nv = Tensor::zeros(shape, pv.dtype(), pv.device())?;
+                nv.slice_set(pv, 2, 0)?;
+                *layer = Some((nk, nv));
+            }
+        }
+        Ok(())
     }
 
     /// Allocate this pass's pages for every sequence and compute the slots its
@@ -1390,8 +1580,8 @@ impl PagedKv {
             pool.append(s, seq_len).map_err(|e| {
                 lloom_tensor::Error::msg(format!(
                     "lfm2 paged KV, sequence {s}: {e}. The pool holds {pool_pages} pages of \
-                     {page_size} tokens (LLOOM_148_POOL_PAGES sets it; the default is B x \
-                     ceil(kv_capacity / page_size))"
+                     {page_size} tokens (LLOOM_148_POOL_PAGES pins it; unpinned it grows \
+                     with the KV slab, B x ceil(slab / page_size), toward the ceiling)"
                 ))
             })?;
             let pages = pool.seq(s).expect("sequence index within max_seqs").pages();
@@ -1523,6 +1713,57 @@ impl PagedKv {
     }
 }
 
+/// The KV slab's state, from [`Cache::kv_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvReport {
+    /// Positions held.
+    pub kv_len: usize,
+    /// Tokens the slab is sized for now.
+    pub slab: usize,
+    /// The ceiling the slab grows toward.
+    pub capacity: usize,
+    /// Tokens per grow.
+    pub bucket: usize,
+    /// Grows performed since construction or the last `clear`.
+    pub grows: usize,
+    /// Bytes the KV planes hold on the device.
+    pub bytes: usize,
+}
+
+/// A grow `Cache::plan_pass` sized and has not performed: the slab it would
+/// reach, from which, and what it costs. `Cache::apply_grow` performs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GrowPlan {
+    pub(crate) from: usize,
+    pub(crate) slab: usize,
+    pub(crate) bytes: usize,
+    pub(crate) kv_len: usize,
+    pub(crate) seq_len: usize,
+}
+
+impl GrowPlan {
+    /// Where the grow was asked for, for the refusal's message.
+    pub(crate) fn describe(&self) -> String {
+        format!(
+            "at {} + {} positions, widening the slab from {} to {} tokens",
+            self.kv_len, self.seq_len, self.from, self.slab
+        )
+    }
+}
+
+/// Bytes a KV grow may take the process's Metal allocation to: `fraction ×
+/// working_set`, `working_set` being `recommendedMaxWorkingSetSize` (§9.5c).
+pub fn kv_grow_budget(working_set: usize, fraction: f64) -> usize {
+    (working_set as f64 * fraction) as usize
+}
+
+/// Whether a grow of `grow` bytes fits beside `allocated` under
+/// [`kv_grow_budget`]. Pure, so `Cache::prepare_pass`'s memory refusal is
+/// tested without a device; exactly on the budget is admitted.
+pub fn kv_grow_fits(allocated: usize, working_set: usize, fraction: f64, grow: usize) -> bool {
+    allocated.saturating_add(grow) <= kv_grow_budget(working_set, fraction)
+}
+
 /// Cache for LFM2 model supporting both attention KV cache and convolution state cache.
 #[derive(Debug, Clone)]
 pub struct Cache {
@@ -1549,24 +1790,35 @@ pub struct Cache {
     paged_pass_pending: bool,
     kv_append: KvAppend,
     kv_quant: KvQuant,
-    /// The largest `kv_len` this cache admits, in tokens.
+    /// The largest `kv_len` this cache admits, in tokens: the smaller of
+    /// `Config::max_position_embeddings` and what the caller asked for.
     ///
-    /// **What `FlashScratchSizing::Reserve` reserves against** (#234), and the
-    /// reason it lives here rather than on `Config`: the reachable ceiling is
-    /// `kv_capacity`, which is a `Cache::new_with` argument and defaults to
-    /// `DEFAULT_KV_CAPACITY` (4096) — where `Config::max_position_embeddings`
-    /// is **128000**, the model's positional ceiling and not this run's. A
-    /// `Reserve` bounded by the second would reserve 31× what any step of this
-    /// cache can reach, which is not the policy's cost but a mis-stated bound
-    /// on it, and §9.1a's own table is what a reader would then compare it
-    /// against.
+    /// **A ceiling, not an allocation.** The slab starts at `kv_slab` and
+    /// grows toward this in buckets (`prepare_pass`). It is also what
+    /// `FlashScratchSizing::Reserve` reserves against (#234) and what admission
+    /// predicts the KV class at (`admit_memory_budget`): both want the largest
+    /// value a step of this cache can reach, and that is this.
     ///
-    /// Held for **both** `KvAppend` arms, though only `InPlace` has a
-    /// per-slot capacity: `Cat` reallocates and has no ceiling of its own, so
-    /// its reserve bound is this same configured number rather than something
-    /// derived from a slot that does not exist. That keeps the two arms
-    /// comparable on this axis, which is what an A/B across them needs.
+    /// Held for every `KvAppend` arm, though `Cat` has no slab: the ceiling
+    /// bounds it too, which keeps the arms comparable on this axis.
     kv_capacity: usize,
+    /// The grow granularity in tokens — [`DEFAULT_KV_BUCKET`] unless
+    /// [`Cache::with_kv_bucket`] said otherwise.
+    kv_bucket: usize,
+    /// Tokens the slab (or the pool, per sequence) is sized for now. Every
+    /// slot, plane and pool is at this width; only `prepare_pass` moves it.
+    kv_slab: usize,
+    /// Grows this cache has performed. Reported, never acted on.
+    kv_grows: usize,
+    /// The fraction of `recommendedMaxWorkingSetSize` a grow may take the
+    /// process's Metal allocation to (§9.5c's denominator): the configured
+    /// budget's fraction, else [`MemoryBudget::DEFAULT_FRACTION`], else
+    /// [`Cache::with_kv_grow_fraction`]'s.
+    kv_grow_fraction: f64,
+    /// Bytes one token of KV costs across every attention layer at this
+    /// cache's dtype and B=1 — the prediction a grow is admitted on before the
+    /// first append, when no plane has a shape to read.
+    kv_bytes_per_token: usize,
     // Conv state cache for convolution layers
     conv_states: Vec<Option<Tensor>>,
     /// The ring's rotating write index, in slots.
@@ -1687,64 +1939,83 @@ impl CacheReset for Cache {
 }
 
 impl Cache {
+    /// A cache whose KV grows in buckets toward the model's positional
+    /// ceiling: `kv_capacity` is `max_position_embeddings`. See
+    /// [`Cache::new_with`] for the ceiling and [`DEFAULT_KV_BUCKET`] for the
+    /// bucket.
     pub fn new(use_kv_cache: bool, dtype: DType, config: &Config, device: &Device) -> Result<Self> {
-        Self::new_with(use_kv_cache, dtype, config, device, DEFAULT_KV_CAPACITY)
+        Self::new_with(
+            use_kv_cache,
+            dtype,
+            config,
+            device,
+            config.max_position_embeddings,
+        )
     }
 
-    /// As [`Cache::new`], with the [`KvAppend::InPlace`] capacity given
-    /// explicitly.
+    /// As [`Cache::new`], with the KV ceiling given explicitly.
     ///
-    /// # The capacity is not decided, and this says so rather than picking
+    /// # The slab grows in buckets, and each bucket is admitted first
     ///
-    /// A moving write offset needs a bound on how far it may move. `DESIGN.md`
-    /// §9.1a faced the identical question for the scratch class and built
-    /// `Reserve`, `Grow` and `Bucket` while **choosing none**, because the axis
-    /// that separates them is `kv_len` and the largest value this project has
-    /// ever recorded is **2720** against a 128k target (§13.2). This issue hits
-    /// the same wall, and the same answer is the honest one.
+    /// `kv_capacity` is the largest `kv_len` this cache will hold, at most
+    /// `max_position_embeddings` — the RoPE tables are built to that, and a
+    /// position past them has no rotation. It is a **ceiling, not an
+    /// allocation**: the `InPlace` slab, the quantized planes and the paged
+    /// pool start at one bucket ([`DEFAULT_KV_BUCKET`] tokens, or
+    /// [`Cache::with_kv_bucket`]'s) and widen by a bucket whenever a pass
+    /// would overrun them, so a short reply pays for what it uses and a long
+    /// one is bounded by memory rather than by a constant. `Cat` has no slab
+    /// and grows by `Tensor::cat` as it always did; the ceiling applies to it
+    /// too.
     ///
-    /// What the three policies would cost here, computed from §5.6's 16 KiB per
-    /// token across all 8 attention layers at B=1, f16:
+    /// A grow happens in `prepare_pass`, at the top of a forward and **before
+    /// any state moves** — before the conv phase advances and before a layer
+    /// writes — because a refusal from inside a layer would leave the conv
+    /// ring one step ahead of the KV and a retry would diverge. Two things can
+    /// refuse there, and both leave the cache exactly as it was: the ceiling,
+    /// and memory. Memory is checked against the device itself —
+    /// `currentAllocatedSize` plus the bucket, against a fraction of
+    /// `recommendedMaxWorkingSetSize` (§9.5c's denominator; the fraction is a
+    /// declared budget's or [`MemoryBudget::DEFAULT_FRACTION`]) — so it holds
+    /// whether or not a caller declared a [`MemoryBudget`]. This machine has
+    /// been kernel-panicked twice by an allocation that found the limit by
+    /// crossing it (§9.5a); a grow that overran would be that failure again,
+    /// and the check is what makes it an error naming the numbers instead.
     ///
-    /// | `kv_len` | `Reserve` (128k) | `Grow` | `Bucket` |
-    /// |---|---|---|---|
-    /// | 2,720 — the largest ever measured | 2048 MiB | 42.5 MiB | 64 MiB |
-    /// | 32,768 | 2048 MiB | 512 MiB | 512 MiB |
-    /// | 131,072 | 2048 MiB | 2048 MiB | 2048 MiB |
+    /// # What the ceiling and the bucket cost, from §5.6's 16 KiB per token
     ///
-    /// They converge at the target and differ by ~48× in the regime we can
-    /// actually reach — which is precisely the shape that makes a measurement
-    /// here uninformative about the choice.
+    /// | `kv_len` | slab held | grows paid |
+    /// |---|---|---|
+    /// | 267 (a canonical reply) | 64 MiB | 0 |
+    /// | 4 096 | 64 MiB | 0 |
+    /// | 8 000 | 128 MiB | 1 |
+    /// | 32 768 | 512 MiB | 7 |
+    /// | 131 072 | 2048 MiB | 31 |
     ///
-    /// **What is chosen instead is a parameter with a default and a loud
-    /// failure.** `DEFAULT_KV_CAPACITY` is 4096: above the 2720 ceiling with
-    /// headroom, 64 MiB against a 5.2 GB pool (§6.3b), and small enough that
-    /// nobody mistakes it for a considered long-context answer. Exceeding it is
-    /// an error, not a silent reallocation — a `Grow` arm would put the
-    /// `Tensor::cat` this change exists to remove back on the path at exactly
-    /// the moment the cache is largest, and would move the buffer identity that
-    /// §11.1a.1 wants stable. Failing loudly keeps both properties true or
-    /// visibly absent, which is `DESIGN.md` §2.4's rule about instruments that
-    /// cannot be shown to have engaged.
+    /// Every grow copies the live slab into a wider one and re-binds the
+    /// buffer (`KvSlot::grow_to` says what that costs a replay executor and
+    /// the arena). Below one bucket nothing differs from a fixed 4096-token
+    /// cache: the same slab, the same buffer, the same stream.
     ///
-    /// **What would decide it** is a context-length curve — issue #61, and
-    /// `DESIGN.md` §13.2 records that no preset has evidence for the same
-    /// reason. Concretely: ms/token and peak footprint at `kv_len` across
-    /// 2k/8k/32k/128k, with the three policies as arms. Until that exists, any
-    /// value here is a guess, and this one is labelled as one.
+    /// # Admission at construction, when a budget is declared
+    ///
+    /// `admit_memory_budget` predicts the peak at the **ceiling** —
+    /// `kv_capacity × 16 KiB` — because §9.5d's admission is a predicted peak
+    /// checked once, and the peak of a run allowed to grow is its ceiling. A
+    /// caller that declares a budget on a machine that cannot hold the ceiling
+    /// is refused at construction and told to lower `kv_capacity`, which is
+    /// the decision admission exists to force early (§9.5g). The per-grow
+    /// check is the other half: it runs with or without a budget, and it sees
+    /// what admission cannot — everything the process allocated since.
     ///
     /// # Why not `crate::nn::kv_cache::KvCache`
     ///
     /// It is the same mechanism — `slice_set` at a moving offset, `narrow` to
-    /// read — and it was read before this was written; seven models in
-    /// `candle-transformers` already use it. It is not reused here because its
-    /// `append` implements exactly the `Grow` arm this function declines: on
-    /// exhaustion it does `Tensor::cat` with a fresh block
-    /// (`candle-nn/src/kv_cache.rs`), which reintroduces the reallocation and
-    /// moves the buffer identity. Taking `KvCache` would have been the smaller
-    /// diff and would have silently chosen the policy this section exists to
-    /// leave open. Making that a *choice* rather than an inheritance is the
-    /// reason for the local type, and it is a difference of about forty lines.
+    /// read — and it grows by `Tensor::cat` on exhaustion, every time, by
+    /// `max_seq_len`: a copy at the moment the cache is largest, with no
+    /// admission and no ceiling. The bucketed grow here is that copy made
+    /// rare, bounded and admitted, and the local type is what lets it keep
+    /// `rewind`, the quantized planes and the paged pool on one contract.
     pub fn new_with(
         use_kv_cache: bool,
         dtype: DType,
@@ -1763,6 +2034,24 @@ impl Cache {
         // and an admission check placed after them would not see them. Running
         // first means the refusal happens before any of it is allocated.
         Self::admit_memory_budget(config, device, kv_capacity)?;
+
+        // The ceiling is bounded by the RoPE tables built below: a position
+        // past `max_position_embeddings` has no rotation, and asking for a
+        // cache wider than that would fail at the first narrow past it —
+        // inside a layer, after the conv phase moved. Refused here instead.
+        if kv_capacity == 0 || kv_capacity > config.max_position_embeddings {
+            lloom_tensor::bail!(
+                "lfm2 kv_capacity {kv_capacity} is outside 1..={}: the model's \
+                 max_position_embeddings is the largest position the RoPE tables cover",
+                config.max_position_embeddings
+            )
+        }
+        let slab = DEFAULT_KV_BUCKET.min(kv_capacity);
+        let kv_bytes_per_token = Self::kv_bytes_per_token(config, dtype);
+        let kv_grow_fraction = config
+            .memory_budget
+            .map(|b| b.fraction)
+            .unwrap_or(MemoryBudget::DEFAULT_FRACTION);
 
         // #363's tap indices, checked here rather than left to `contains`.
         //
@@ -1819,7 +2108,7 @@ impl Cache {
                 Device::Metal(d) => d.gpu_clock(),
                 _ => lloom_tensor::bail!("lfm2 `KvAppend::Paged` is Metal-only"),
             };
-            Some(PagedKv::new(config, kv_capacity, num_layers, clock)?)
+            Some(PagedKv::new(config, kv_capacity, slab, num_layers, clock)?)
         } else {
             None
         };
@@ -1828,13 +2117,13 @@ impl Cache {
             use_kv_cache,
             kvs: vec![None; num_layers],
             kv_slots: (0..num_layers)
-                .map(|_| (KvSlot::new(kv_capacity), KvSlot::new(kv_capacity)))
+                .map(|_| (KvSlot::new(slab), KvSlot::new(slab)))
                 .collect(),
             quant_slots: (0..num_layers)
                 .map(|_| {
                     (
-                        QuantKvSlot::new(kv_capacity, config.kv_quant),
-                        QuantKvSlot::new(kv_capacity, config.kv_quant),
+                        QuantKvSlot::new(slab, config.kv_quant),
+                        QuantKvSlot::new(slab, config.kv_quant),
                     )
                 })
                 .collect(),
@@ -1844,6 +2133,11 @@ impl Cache {
             kv_append: config.kv_append,
             kv_quant: config.kv_quant,
             kv_capacity,
+            kv_bucket: DEFAULT_KV_BUCKET,
+            kv_slab: slab,
+            kv_grows: 0,
+            kv_grow_fraction,
+            kv_bytes_per_token,
             conv_states: vec![None; num_layers],
             conv_phase: 0,
             conv_phase_prev: 0,
@@ -1889,6 +2183,394 @@ impl Cache {
     pub fn take_taps(&mut self) -> Vec<Tensor> {
         let slots = std::mem::take(&mut self.taps);
         slots.into_iter().flatten().collect()
+    }
+
+    /// Grow the KV slab in buckets of `bucket` tokens rather than
+    /// [`DEFAULT_KV_BUCKET`].
+    ///
+    /// A knob for a measurement, not an axis: the bucket decides how often the
+    /// slab is reallocated and how much it holds past what it uses, never what
+    /// a kernel reads — a run at bucket 64 and a run at bucket 4096 emit the
+    /// same stream, which `lfm2_kv_growth.rs` asserts. Set it before the first
+    /// forward; a slab that is already allocated is refused rather than
+    /// resized.
+    pub fn with_kv_bucket(mut self, bucket: usize) -> Result<Self> {
+        if bucket == 0 {
+            lloom_tensor::bail!("lfm2 kv_bucket must be at least one token")
+        }
+        let allocated = self.kv_slots.iter().any(|(k, _)| k.all_data.is_some())
+            || self.quant_slots.iter().any(|(k, _)| k.codes.is_some());
+        if allocated {
+            lloom_tensor::bail!(
+                "lfm2 with_kv_bucket: the slab is already allocated; set the bucket before \
+                 the first forward"
+            )
+        }
+        self.kv_bucket = bucket;
+        self.set_slab(bucket.min(self.kv_capacity));
+        Ok(self)
+    }
+
+    /// The fraction of `recommendedMaxWorkingSetSize` the process's Metal
+    /// allocation may reach through a KV grow (`DESIGN.md` §9.5c's
+    /// denominator).
+    ///
+    /// Defaults to a declared budget's fraction, else
+    /// [`MemoryBudget::DEFAULT_FRACTION`]; a caller with no full budget to
+    /// declare — none of the shipping harnesses has one — can still bound the
+    /// one class that grows. Ignored off Metal, where no denominator exists.
+    pub fn with_kv_grow_fraction(mut self, fraction: f64) -> Result<Self> {
+        if !(fraction > 0.0 && fraction <= 1.0) {
+            lloom_tensor::bail!("lfm2 kv_grow_fraction must be in (0, 1], got {fraction}")
+        }
+        self.kv_grow_fraction = fraction;
+        Ok(self)
+    }
+
+    /// Positions the cache holds: the `kv_len` the next pass appends at.
+    ///
+    /// Read from the first plane that has one, which is the first attention
+    /// layer's — 22 of LFM2's 30 layers are conv and hold nothing here (§5.3).
+    /// Zero before the first pass and after `clear`.
+    pub fn kv_len(&self) -> usize {
+        if !self.use_kv_cache {
+            return 0;
+        }
+        if self.kv_quant.is_on() {
+            return self
+                .quant_slots
+                .iter()
+                .find(|(k, _)| k.codes.is_some())
+                .map(|(k, _)| k.len)
+                .unwrap_or(0);
+        }
+        match self.kv_append {
+            KvAppend::Cat => self
+                .kvs
+                .iter()
+                .flatten()
+                .next()
+                .and_then(|(k, _)| k.dim(2).ok())
+                .unwrap_or(0),
+            KvAppend::InPlace => self
+                .kv_slots
+                .iter()
+                .find(|(k, _)| k.all_data.is_some())
+                .map(|(k, _)| k.len)
+                .unwrap_or(0),
+            KvAppend::Paged => {
+                #[cfg(feature = "metal")]
+                {
+                    self.paged.as_ref().map(|p| p.len).unwrap_or(0)
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    0
+                }
+            }
+        }
+    }
+
+    /// The KV slab's state, for a run's memory report.
+    pub fn kv_report(&self) -> KvReport {
+        let bytes = if self.kv_quant.is_on() {
+            self.quant_slots
+                .iter()
+                .map(|(k, v)| k.bytes() + v.bytes())
+                .sum()
+        } else {
+            match self.kv_append {
+                KvAppend::Cat => self
+                    .kvs
+                    .iter()
+                    .flatten()
+                    .map(|(k, v)| {
+                        k.elem_count() * k.dtype().size_in_bytes()
+                            + v.elem_count() * v.dtype().size_in_bytes()
+                    })
+                    .sum(),
+                KvAppend::InPlace => self
+                    .kv_slots
+                    .iter()
+                    .map(|(k, v)| k.bytes() + v.bytes())
+                    .sum(),
+                KvAppend::Paged => {
+                    #[cfg(feature = "metal")]
+                    {
+                        self.paged.as_ref().map(|p| p.bytes()).unwrap_or(0)
+                    }
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        0
+                    }
+                }
+            }
+        };
+        KvReport {
+            kv_len: self.kv_len(),
+            slab: self.kv_slab,
+            capacity: self.kv_capacity,
+            bucket: self.kv_bucket,
+            grows: self.kv_grows,
+            bytes,
+        }
+    }
+
+    /// Make room for a pass of `seq_len` positions, or refuse before anything
+    /// moves.
+    ///
+    /// Called at the top of every entry point of `Model` — `forward`,
+    /// `forward_embeds`, `forward_all`, `forward_rows` per row — **before**
+    /// `advance_conv_phase`. That placement is the contract: a refusal here
+    /// leaves the KV length, the conv phase and every buffer exactly as they
+    /// were, so the same call can be retried (after memory returns, or with a
+    /// wider ceiling) and produce the stream an unrefused run would have.
+    /// Refusing from inside a layer would not: the conv ring is advanced once
+    /// per pass before the layers run, and a pass that advanced it and then
+    /// failed at layer 2's append leaves the ring one step ahead of the KV.
+    ///
+    /// Two refusals, in order. The ceiling — `kv_len + seq_len` past
+    /// `kv_capacity` — is a property of the model and the caller's choice and
+    /// names both. Memory is the device's: `currentAllocatedSize` plus the
+    /// bytes the bucket costs, against `kv_grow_fraction ×
+    /// recommendedMaxWorkingSetSize`. Both are `Err`, never a panic and never
+    /// a silent truncation, which is `DESIGN.md` §3.5's loud stop.
+    ///
+    /// When neither refuses and the slab is too narrow, every plane is widened
+    /// to the next bucket boundary (at most the ceiling) and the grow is
+    /// counted. A grow that fails part-way — the pool declining a buffer at
+    /// layer 5 — leaves the planes it widened widened and the rest as they
+    /// were; every plane is self-describing, nothing was written, and the next
+    /// call widens the remainder. Idempotent by construction.
+    pub(crate) fn prepare_pass(&mut self, seq_len: usize) -> Result<()> {
+        if let Some(plan) = self.plan_pass(seq_len)? {
+            self.admit_grow(plan.bytes, &plan.describe())?;
+            self.apply_grow(&plan)?;
+        }
+        Ok(())
+    }
+
+    /// The first half of `prepare_pass`: the ceiling, and the grow a pass of
+    /// `seq_len` positions would need — sized, not performed. No side effects,
+    /// so a caller with several caches (`forward_rows`) can refuse any of them
+    /// before growing any, and admit their grows as one sum.
+    pub(crate) fn plan_pass(&self, seq_len: usize) -> Result<Option<GrowPlan>> {
+        if !self.use_kv_cache || seq_len == 0 {
+            return Ok(None);
+        }
+        let kv_len = self.kv_len();
+        let need = kv_len + seq_len;
+        if need > self.kv_capacity {
+            lloom_tensor::bail!(
+                "lfm2 KV ceiling: {kv_len} + {seq_len} = {need} positions > kv_capacity {} \
+                 (the smaller of max_position_embeddings {} and the configured ceiling). \
+                 The reply stops here and nothing was written for this pass; raise the \
+                 ceiling (`--kv-capacity`, at most the model's positional ceiling) or bound \
+                 the run.",
+                self.kv_capacity,
+                self.cos.dim(0)?
+            )
+        }
+        if self.kv_append == KvAppend::Cat && !self.kv_quant.is_on() {
+            // No slab: `Tensor::cat` widens by one token per step and the
+            // ceiling above is the only bound this arm has.
+            return Ok(None);
+        }
+        if need <= self.kv_slab {
+            return Ok(None);
+        }
+        let slab = (need.div_ceil(self.kv_bucket) * self.kv_bucket).min(self.kv_capacity);
+        Ok(Some(GrowPlan {
+            from: self.kv_slab,
+            slab,
+            bytes: self.grow_bytes(slab),
+            kv_len,
+            seq_len,
+        }))
+    }
+
+    /// The second half: widen every plane to the plan's slab. Admission is the
+    /// caller's — `prepare_pass` admits one plan, `forward_rows` the sum of its
+    /// rows' — so this allocates and copies and nothing else.
+    pub(crate) fn apply_grow(&mut self, plan: &GrowPlan) -> Result<()> {
+        let slab = plan.slab;
+        if self.kv_quant.is_on() {
+            for (k, v) in self.quant_slots.iter_mut() {
+                k.grow_to(slab)?;
+                v.grow_to(slab)?;
+            }
+        } else {
+            match self.kv_append {
+                KvAppend::InPlace => {
+                    for (k, v) in self.kv_slots.iter_mut() {
+                        k.grow_to(slab)?;
+                        v.grow_to(slab)?;
+                    }
+                }
+                KvAppend::Paged =>
+                {
+                    #[cfg(feature = "metal")]
+                    if let Some(p) = self.paged.as_mut() {
+                        p.grow_to(slab)?;
+                    }
+                }
+                KvAppend::Cat => {}
+            }
+        }
+        self.kv_slab = slab;
+        self.kv_grows += 1;
+        Ok(())
+    }
+
+    /// Set every unallocated plane's width and the slab figure to `slab`. A
+    /// paged pool that already exists keeps its width, and the figure follows
+    /// it.
+    fn set_slab(&mut self, slab: usize) {
+        for (k, v) in self.kv_slots.iter_mut() {
+            k.capacity = slab;
+            v.capacity = slab;
+        }
+        for (k, v) in self.quant_slots.iter_mut() {
+            k.capacity = slab;
+            v.capacity = slab;
+        }
+        let mut slab = slab;
+        #[cfg(feature = "metal")]
+        if let Some(p) = self.paged.as_mut() {
+            if p.pool.is_none() {
+                p.slab = slab;
+            } else {
+                slab = p.slab;
+            }
+        }
+        self.kv_slab = slab;
+    }
+
+    /// Bytes widening the slab to `slab` tokens will allocate, read from an
+    /// allocated plane's shape when one exists (its batch is the truth) and
+    /// predicted from the geometry at B=1 before the first append.
+    fn grow_bytes(&self, slab: usize) -> usize {
+        let extra = slab.saturating_sub(self.kv_slab);
+        let elem = |t: &Tensor| t.dtype().size_in_bytes();
+        let per_token: usize = if self.kv_quant.is_on() {
+            self.quant_slots
+                .iter()
+                .flat_map(|(k, v)| [k, v])
+                .filter(|s| s.codes.is_some())
+                .map(|s| {
+                    let rows = s.b_sz * s.n_heads;
+                    rows * s.quant.code_bytes(s.head_dim).unwrap_or(0)
+                        + 2 * rows * DType::F16.size_in_bytes()
+                })
+                .sum()
+        } else {
+            match self.kv_append {
+                KvAppend::InPlace => self
+                    .kv_slots
+                    .iter()
+                    .flat_map(|(k, v)| [k, v])
+                    .filter_map(|s| s.all_data.as_ref())
+                    .map(|t| {
+                        let d = t.dims();
+                        d[0] * d[1] * d[3] * elem(t)
+                    })
+                    .sum(),
+                KvAppend::Paged => {
+                    #[cfg(feature = "metal")]
+                    {
+                        // A pool grows by whole pages for every sequence, so the
+                        // token count is the pool's, not the slab's.
+                        if let Some(p) = self.paged.as_ref() {
+                            let tokens = p
+                                .pool_tokens_at(slab)
+                                .saturating_sub(p.pool_tokens_at(self.kv_slab));
+                            let per_token: usize = p
+                                .pools
+                                .iter()
+                                .flatten()
+                                .map(|(k, v)| {
+                                    let (dk, dv) = (k.dims(), v.dims());
+                                    dk[0] * dk[1] * dk[3] * elem(k)
+                                        + dv[0] * dv[1] * dv[3] * elem(v)
+                                })
+                                .sum();
+                            if per_token > 0 {
+                                return per_token * tokens;
+                            }
+                            return self.kv_bytes_per_token * tokens;
+                        }
+                        0
+                    }
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        0
+                    }
+                }
+                KvAppend::Cat => 0,
+            }
+        };
+        if per_token == 0 {
+            self.kv_bytes_per_token * extra
+        } else {
+            per_token * extra
+        }
+    }
+
+    /// One token's KV across every attention layer at B=1, from the geometry
+    /// (§5.6): `2 × attention layers × kv_heads × head_dim × dtype`, or the
+    /// code bytes plus a scale and a bias per head vector on a quantized arm.
+    fn kv_bytes_per_token(config: &Config, dtype: DType) -> usize {
+        let attention_layers = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == LayerType::FullAttention)
+            .count();
+        let head_dim = config.head_dim();
+        let per_vector = match config.kv_quant.code_bytes(head_dim) {
+            Some(codes) => codes + 2 * DType::F16.size_in_bytes(),
+            None => head_dim * dtype.size_in_bytes(),
+        };
+        2 * attention_layers * config.num_key_value_heads * per_vector
+    }
+
+    /// The memory half of `prepare_pass`'s refusal, against the device.
+    ///
+    /// `currentAllocatedSize` is the whole process's Metal allocation — the
+    /// weights, the pool's retained free buffers, every intermediate in flight
+    /// — which is exactly the figure admission's prediction cannot see and the
+    /// one a grow has to fit beside. The comparison is [`kv_grow_fits`], kept
+    /// pure so the arithmetic is tested without a device.
+    #[cfg(feature = "metal")]
+    pub(crate) fn admit_grow(&self, grow: usize, what: &str) -> Result<()> {
+        let Ok(metal) = self.device.as_metal_device() else {
+            return Ok(());
+        };
+        let dev = metal.device();
+        let allocated = dev.current_allocated_size();
+        let working_set = dev.recommended_max_working_set_size();
+        if kv_grow_fits(allocated, working_set, self.kv_grow_fraction, grow) {
+            return Ok(());
+        }
+        let gb = |b: usize| b as f64 / 1e9;
+        lloom_tensor::bail!(
+            "lfm2 KV grow refused {what}: it needs {:.3} GB more, and the process already \
+             holds {:.2} GB of the {:.2} GB it may ({:.2} x recommendedMaxWorkingSetSize \
+             {:.2} GB). The reply stops here, before anything is written, rather than risk \
+             the machine (DESIGN.md 9.5, 3.5): raise the fraction (`--kv-grow-fraction`), \
+             free memory, or bound the run.",
+            gb(grow),
+            gb(allocated),
+            gb(kv_grow_budget(working_set, self.kv_grow_fraction)),
+            self.kv_grow_fraction,
+            gb(working_set),
+        )
+    }
+
+    /// No Metal, no `recommendedMaxWorkingSetSize`, nothing to check against —
+    /// `admit_memory_budget`'s stance (§9.5c).
+    #[cfg(not(feature = "metal"))]
+    pub(crate) fn admit_grow(&self, _grow: usize, _what: &str) -> Result<()> {
+        Ok(())
     }
 
     /// `DESIGN.md` §9.5's admission check: predict the peak, refuse before
@@ -2097,6 +2779,10 @@ impl Cache {
         if let Some(p) = &mut self.paged {
             p.release_all();
         }
+        // A new sequence starts at one bucket again: the slab was dropped with
+        // the buffers, and the next one is sized by what the next sequence
+        // needs. The paged pool is not dropped and keeps its width.
+        self.set_slab(self.kv_bucket.min(self.kv_capacity));
         self.paged_pass_pending = false;
         self.conv_states.iter_mut().for_each(|v| *v = None);
         self.conv_phase = 0;
@@ -4197,6 +4883,9 @@ impl Model {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
+        // Room for this pass, or a refusal that leaves everything as it was —
+        // BEFORE the conv phase advances below (`Cache::prepare_pass`).
+        cache.prepare_pass(seq_len)?;
 
         // The ring's write slot, advanced once per forward pass and read by all
         // 22 conv layers (`DESIGN.md` §10.2c -- it is conv state, so it lives in
@@ -4274,6 +4963,7 @@ impl Model {
         if rows.is_empty() {
             lloom_tensor::bail!("lfm2 forward_rows: no rows")
         }
+        let mut plans = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter_mut().enumerate() {
             if !row.cache.tap_layers.is_empty() {
                 lloom_tensor::bail!(
@@ -4287,6 +4977,26 @@ impl Model {
                     "lfm2 forward_rows: row {r}'s cache has an open speculative window"
                 )
             }
+            // Every row's ceiling before ANY row grows or moves: a refusal at
+            // row 3 must not leave rows 0..2 widened or with their conv phase
+            // advanced (`Cache::prepare_pass`).
+            plans.push(row.cache.plan_pass(1)?);
+        }
+        // One admission for the step's grows together, so a refusal on memory
+        // also comes before any row has grown.
+        let bytes: usize = plans.iter().flatten().map(|p| p.bytes).sum();
+        if bytes > 0 {
+            rows[0].cache.admit_grow(
+                bytes,
+                &format!("for a batched step over {} rows", rows.len()),
+            )?;
+        }
+        for (row, plan) in rows.iter_mut().zip(&plans) {
+            if let Some(plan) = plan {
+                row.cache.apply_grow(plan)?;
+            }
+        }
+        for row in rows.iter_mut() {
             // Per row, as `forward` does per pass: the ring's write slot and
             // the paged pool's pass marker are the row's own.
             self.advance_conv_phase(1, row.cache);
@@ -4344,6 +5054,7 @@ impl Model {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let (_, seq_len, _) = embeds.dims3()?;
+        cache.prepare_pass(seq_len)?;
         self.advance_conv_phase(seq_len, cache);
 
         let mut hidden_states = embeds.clone();
@@ -4398,6 +5109,7 @@ impl Model {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let (_, seq_len) = input_ids.dims2()?;
+        cache.prepare_pass(seq_len)?;
         self.advance_conv_phase(seq_len, cache);
 
         let mut hidden_states = self.embed_tokens.forward(input_ids)?;
@@ -5252,6 +5964,125 @@ mod tests {
         Ok(())
     }
 
+    /// Growing the slab keeps every position where it was, and the reference
+    /// is a slot that was that wide from the start plus the `cat` the slab
+    /// replaces.
+    #[test]
+    fn growing_the_slab_keeps_every_position_where_it_was() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut grown = KvSlot::new(2);
+        let mut wide = KvSlot::new(5);
+        for i in 0..2 {
+            grown.append(&token(i, &dev)?)?;
+            wide.append(&token(i, &dev)?)?;
+        }
+        let before = grown
+            .all_data
+            .as_ref()
+            .unwrap()
+            .narrow(2, 0, 2)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        grown.grow_to(5)?;
+        assert_eq!(grown.capacity, 5);
+        assert_eq!(grown.len, 2, "a grow moves no position");
+        assert_eq!(
+            grown.all_data.as_ref().unwrap().dims()[2],
+            5,
+            "the slab is five wide after the grow"
+        );
+        let after = grown
+            .all_data
+            .as_ref()
+            .unwrap()
+            .narrow(2, 0, 2)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        assert_eq!(before, after, "the live prefix reads the same bytes");
+        for i in 2..5 {
+            let g = grown.append(&token(i, &dev)?)?;
+            let w = wide.append(&token(i, &dev)?)?;
+            assert_eq!(
+                g.flatten_all()?.to_vec1::<f32>()?,
+                w.flatten_all()?.to_vec1::<f32>()?,
+                "grown and wide-from-the-start slots differ at len {}",
+                i + 1
+            );
+        }
+        let view = grown.all_data.as_ref().unwrap().narrow(2, 0, 5)?;
+        assert_eq!(
+            view.flatten_all()?.to_vec1::<f32>()?,
+            cat_reference(5, &dev)?.flatten_all()?.to_vec1::<f32>()?
+        );
+        Ok(())
+    }
+
+    /// A grow to the current width or below is a no-op: the same buffer, the
+    /// same width, never a shrink.
+    #[test]
+    fn a_grow_never_shrinks_and_never_reallocates_needlessly() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut slot = KvSlot::new(4);
+        slot.append(&token(0, &dev)?)?;
+        let id = slot.all_data.as_ref().unwrap().id();
+        slot.grow_to(4)?;
+        slot.grow_to(2)?;
+        assert_eq!(slot.capacity, 4);
+        assert_eq!(
+            slot.all_data.as_ref().unwrap().id(),
+            id,
+            "no-op grows keep the buffer"
+        );
+        slot.grow_to(6)?;
+        assert_ne!(
+            slot.all_data.as_ref().unwrap().id(),
+            id,
+            "a real grow re-binds it"
+        );
+        Ok(())
+    }
+
+    /// Before the first append a grow is a number: nothing is allocated, and
+    /// the first append allocates at the new width.
+    #[test]
+    fn a_grow_before_the_first_append_sets_the_width_and_allocates_nothing() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut slot = KvSlot::new(2);
+        slot.grow_to(6)?;
+        assert!(slot.all_data.is_none());
+        assert_eq!(slot.capacity, 6);
+        let view = slot.append(&token(0, &dev)?)?;
+        assert_eq!(view.dims()[2], 1);
+        assert_eq!(slot.all_data.as_ref().unwrap().dims()[2], 6);
+        Ok(())
+    }
+
+    /// `prepare_pass`'s memory arithmetic: inside the budget admits, exactly
+    /// on it admits, one byte past refuses, and the fraction is what moves it.
+    #[test]
+    fn a_kv_grow_fits_inside_the_fraction_and_not_past_it() {
+        let ws = 1_000_000;
+        assert_eq!(kv_grow_budget(ws, 0.5), 500_000);
+        assert!(
+            kv_grow_fits(0, ws, 0.5, 500_000),
+            "exactly on the budget is admitted"
+        );
+        assert!(
+            !kv_grow_fits(0, ws, 0.5, 500_001),
+            "one byte past is refused"
+        );
+        assert!(kv_grow_fits(400_000, ws, 0.5, 100_000));
+        assert!(!kv_grow_fits(400_001, ws, 0.5, 100_000));
+        assert!(
+            kv_grow_fits(400_001, ws, 0.6, 100_000),
+            "the fraction moves the verdict"
+        );
+        assert!(
+            !kv_grow_fits(usize::MAX, ws, 1.0, 1),
+            "saturating, never wrapping"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // A stateful fuzzer over the slot's append/rewind SEQUENCE (lloom #575).
     // -----------------------------------------------------------------------
@@ -5295,14 +6126,20 @@ mod tests {
         /// the error *text* — which becomes
         /// `"shape mismatch on target dim, dst: 2, src: 1 + 2"` instead of
         /// `"KV cache exhausted"`. That is a real and different property: the
-        /// slot's own message names the knob (`Config::kv_capacity`) a caller
-        /// must raise, where `slice_set`'s names two integers. So the two tests
+        /// slot's own message names the mechanism (an append outside a
+        /// prepared pass) where `slice_set`'s names two integers. So the two tests
         /// are **not** redundant and neither subsumes the other — this one
         /// catches a bound that lets the write through, that one catches a
         /// bound that stops naming itself. Recorded here because a doc comment
         /// promising more than its assertions deliver is the sentence a reader
         /// trusts (§3.1b rule 3).
         FillToCapacityThenOne,
+        /// Widen the slab by `by` positions: `Cache::prepare_pass`'s grow, at
+        /// slot level. The model's capacity moves with it and nothing else
+        /// does, which is the whole contract — every live position and every
+        /// rewound one stays where it was, and the boundary the fill symbol
+        /// above pins moves to the new width.
+        Grow { by: usize },
         /// A turn boundary, and the next turn runs at `heads` KV heads.
         ///
         /// **The head count is carried on the symbol deliberately.** `reset`'s
@@ -5359,6 +6196,8 @@ mod tests {
         /// A sequence that landed EXACTLY on capacity. The transition that
         /// makes the `>` in the bound check observable.
         filled_to_capacity: u64,
+        /// A grow of a slab that held positions: the copy, not the number.
+        grows: u64,
     }
 
     /// Drive one sequence against the real slot and the model, comparing the
@@ -5370,7 +6209,7 @@ mod tests {
     /// `[4,4,4]` is as flat as `[3,3,3]` -- and the reason this compares an
     /// absolute reference.
     fn run_slot_sequence(
-        capacity: usize,
+        mut capacity: usize,
         ops: &[SlotOp],
         dev: &Device,
     ) -> std::result::Result<SlotTransitions, String> {
@@ -5512,6 +6351,21 @@ mod tests {
                     }
                     t.rewinds_refused += 1;
                 }
+                SlotOp::Grow { by } => {
+                    let to = capacity + by;
+                    if slot.all_data.is_some() {
+                        t.grows += 1;
+                    }
+                    slot.grow_to(to)
+                        .map_err(|e| format!("op {i}: grow_to({to}) failed: {e}"))?;
+                    if slot.capacity != to {
+                        return Err(format!(
+                            "op {i}: grow_to({to}) left the capacity at {}",
+                            slot.capacity
+                        ));
+                    }
+                    capacity = to;
+                }
                 SlotOp::Reset { heads } => {
                     if !model.live.is_empty() {
                         t.resets_from_nonempty += 1;
@@ -5626,6 +6480,7 @@ mod tests {
                 .prop_map(|(k, accept)| SlotOp::Speculate { k, accept }),
             1 => Just(SlotOp::RewindPastStart),
             2 => Just(SlotOp::FillToCapacityThenOne),
+            1 => (1usize..=8).prop_map(|by| SlotOp::Grow { by }),
             // The head count VARIES across turns. A constant one makes the
             // fixture blind to `reset` keeping its buffer -- measured, and the
             // reason the symbol carries the shape at all.
@@ -5704,12 +6559,14 @@ mod tests {
             total.rewrote_discarded_positions += t.rewrote_discarded_positions;
             total.turns_changed_shape += t.turns_changed_shape;
             total.filled_to_capacity += t.filled_to_capacity;
+            total.grows += t.grows;
         }
 
         println!("FUZZ575 kvslot transitions: {total:?}");
-        let named: [(&str, u64); 11] = [
+        let named: [(&str, u64); 12] = [
             ("turns_changed_shape", total.turns_changed_shape),
             ("filled_to_capacity", total.filled_to_capacity),
+            ("grows", total.grows),
             ("appends", total.appends),
             ("speculations", total.speculations),
             ("full_accepts", total.full_accepts),

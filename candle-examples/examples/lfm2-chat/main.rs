@@ -27,7 +27,7 @@ use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
 };
-use lloom::models::lfm2::{Cache, ConvState, KvAppend, Lfm2Config, Model, DEFAULT_KV_CAPACITY};
+use lloom::models::lfm2::{Cache, ConvState, KvAppend, Lfm2Config, Model};
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, Session, VarBuilder};
 use std::io::Read;
@@ -112,6 +112,32 @@ struct Args {
     /// acceptance rate; `--phase-sync` shows where a round's time goes.
     #[arg(long)]
     dspark: bool,
+
+    /// The KV ceiling in positions (prompt plus reply). Defaults to the model's
+    /// `max_position_embeddings` — 131 072 on LFM2.5-2.6B. The cache does NOT
+    /// allocate this: it starts at one `--kv-bucket` and grows a bucket at a
+    /// time toward it, each grow admitted against the device first (see
+    /// `--kv-grow-fraction`). Passing the ceiling lower is a way to bound a run
+    /// by positions rather than by `-n`.
+    #[arg(long)]
+    kv_capacity: Option<usize>,
+
+    /// How many positions the KV slab grows by when a pass would overrun it.
+    /// 4096 (64 MiB at LFM2's 16 KiB/position) is the default and the one every
+    /// recorded digest was taken under; a smaller bucket grows more often and
+    /// holds less past the reply's end, and emits the same stream — the
+    /// `lfm2_kv_growth` gate asserts it. A measurement knob, not an axis.
+    #[arg(long, default_value_t = lloom::models::lfm2::DEFAULT_KV_BUCKET)]
+    kv_bucket: usize,
+
+    /// The fraction of `recommendedMaxWorkingSetSize` a KV grow may take the
+    /// process's Metal allocation to (§9.5c). Defaults to admission's 0.65. A
+    /// grow that would cross it is refused with the numbers, the run stops
+    /// there, and the tokens already streamed stand — never a kernel panic.
+    /// The positive control for that refusal: a value under the weights'
+    /// share (~0.10 on this machine) refuses the first grow.
+    #[arg(long)]
+    kv_grow_fraction: Option<f64>,
 
     /// Never stop on EOS: the run produces exactly `-n` tokens. The EOS id set
     /// is replaced by an id no tokenizer emits, so every arm's own EOS
@@ -622,7 +648,18 @@ fn main() -> Result<()> {
     }
 
     let model = Model::new(&config, vb).context("constructing LFM2")?;
-    let cache = Cache::new(true, dtype, &config, &device).context("allocating KV cache")?;
+    // The ceiling is the model's positional ceiling unless the user lowered
+    // it; the slab starts at one bucket and grows toward it (`Cache::new_with`).
+    let kv_capacity = args.kv_capacity.unwrap_or(config.max_position_embeddings);
+    let mut cache = Cache::new_with(true, dtype, &config, &device, kv_capacity)
+        .context("allocating KV cache")?
+        .with_kv_bucket(args.kv_bucket)
+        .context("--kv-bucket")?;
+    if let Some(fraction) = args.kv_grow_fraction {
+        cache = cache
+            .with_kv_grow_fraction(fraction)
+            .context("--kv-grow-fraction")?;
+    }
 
     // EOS ids: the config's, plus the chat-end / end-of-text tokens.
     // Stop on `<|im_end|>` (124900) only — the model's declared EOS. `config.json`,
@@ -911,14 +948,15 @@ fn main() -> Result<()> {
             // every accepted token, plus the block width and slack. `max_tokens`
             // is the token ceiling — EXCEPT `0` means UNBOUNDED (run until EOS),
             // where it is NOT the bound: the run is bounded in practice by the KV
-            // cache (`DEFAULT_KV_CAPACITY`), which is the furthest the target — and
+            // ceiling (`kv_capacity`, the model's positional ceiling unless
+            // `--kv-capacity` lowered it), which is the furthest the target — and
             // so the drafter, which attends the same positions — can reach. Sizing
             // the drafter's RoPE table from `max_tokens=0` gave it just
             // `prompt+block+64` rows (89 for a 16-token prompt), so an unbounded
             // `--dspark` run crashed the moment it drafted past ~position 82
             // (`DSparkRotary::apply`'s `cos.narrow`). Use the KV ceiling instead.
             let generation_ceiling = if args.max_tokens == 0 {
-                DEFAULT_KV_CAPACITY
+                kv_capacity
             } else {
                 args.max_tokens
             };
@@ -1156,6 +1194,34 @@ fn main() -> Result<()> {
         KvAppend::Cat => "cat",
         KvAppend::Paged => "paged",
     };
+    // The KV slab's state and the process's device allocation, so a run reports
+    // the memory it actually held at the length it reached rather than the
+    // ceiling it could have (§9.5's admission is a prediction; this is the
+    // reading).
+    {
+        let kv = session.sequence().cache().kv_report();
+        let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+        #[cfg(feature = "metal")]
+        let device_line = match &device {
+            Device::Metal(m) => format!(
+                " device_allocated={:.2} GB working_set={:.2} GB",
+                m.device().current_allocated_size() as f64 / 1e9,
+                m.device().recommended_max_working_set_size() as f64 / 1e9
+            ),
+            _ => String::new(),
+        };
+        #[cfg(not(feature = "metal"))]
+        let device_line = String::new();
+        eprintln!(
+            "[kv: len={} slab={} ceiling={} bucket={} grows={} kv_bytes={:.1} MiB{device_line}]",
+            kv.kv_len,
+            kv.slab,
+            kv.capacity,
+            kv.bucket,
+            kv.grows,
+            mib(kv.bytes)
+        );
+    }
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \

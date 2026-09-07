@@ -164,9 +164,10 @@ fn a_shared_page_returns_only_on_the_last_release() {
 
 /// Exhaustion is a loud failure and never a silent grow.
 ///
-/// §10.3f, following #150: growing the pool means reallocating the one buffer
-/// every kernel addresses, moving the base pointer §9.2d's `base + offset`
-/// reasoning rests on, at the moment the cache is largest.
+/// §10.3f, following #150: the pool cannot widen itself — it allocates no
+/// buffer — and it does not grow inside `append`. Growth is the cache's
+/// (`KvPagePool::grow`, before a pass, admitted first); a pool that is
+/// exhausted is at its ceiling or pinned, and says so.
 #[test]
 fn exhaustion_is_a_loud_failure() {
     let mut p = pool(2);
@@ -416,4 +417,97 @@ fn quarantining_nothing_records_nothing() {
         "1000 empty steps must leave the quarantine empty"
     );
     assert_eq!(q.held(), 0);
+}
+
+/// A grown pool hands out its fresh pages after every page it already held,
+/// in ascending order — the sequence a pool created that wide would have
+/// followed — so the two are indistinguishable from their tables on.
+#[test]
+fn growth_reproduces_a_pool_created_that_wide() {
+    let mut grown = pool(2);
+    let mut wide = pool(4);
+    for p in [&mut grown, &mut wide] {
+        p.append(0, 8).unwrap(); // pages 0, 1 on both
+    }
+    assert!(
+        matches!(
+            grown.append(1, 1),
+            Err(PageError::Exhausted { pool_pages: 2 })
+        ),
+        "the narrow pool is full before the grow (non-vacuity)"
+    );
+    grown.grow(2);
+    assert_eq!(grown.pool_pages(), 4);
+    assert_eq!(grown.pages_free(), 2);
+    for p in [&mut grown, &mut wide] {
+        p.append(1, 8).unwrap();
+    }
+    assert_eq!(
+        grown.table_for(1, 1),
+        vec![2, 3],
+        "fresh pages come in ascending order"
+    );
+    assert_eq!(grown.table_for(1, 1), wide.table_for(1, 1));
+    assert_eq!(
+        grown.table_for(0, 1),
+        wide.table_for(0, 1),
+        "existing tables are untouched"
+    );
+}
+
+/// The fresh pages go UNDER the free list, so a page recycled before the
+/// grow is still the next one handed out — a grown pool's table stays a
+/// function of the allocation history alone (DESIGN.md 10.3h), not of when
+/// it grew. The reference is again a pool created that wide.
+#[test]
+fn a_recycled_page_still_pops_before_a_fresh_one_after_a_grow() {
+    let mut grown = pool(2);
+    let mut wide = pool(4);
+    for p in [&mut grown, &mut wide] {
+        p.append(0, 8).unwrap();
+        let freed = p.release(0);
+        p.recycle(&freed).unwrap();
+    }
+    grown.grow(2);
+    for p in [&mut grown, &mut wide] {
+        p.append(1, 16).unwrap();
+    }
+    let table = grown.table_for(1, 1);
+    assert_eq!(table, wide.table_for(1, 1));
+    assert_ne!(
+        table,
+        vec![0, 1, 2, 3],
+        "the fixture is degenerate: a recycled page must reorder the table for this to \
+         say anything about free-list order"
+    );
+    assert_eq!(
+        &table[2..],
+        &[2, 3],
+        "and the fresh pages follow the recycled ones"
+    );
+}
+
+/// Growth widens the table capacity by the same count: a table that could
+/// not name the new pages would report `TableFull` for a pool with room.
+#[test]
+fn growth_widens_the_table_with_the_pool() {
+    let mut p = KvPagePool::new(4, 2, 1, 2);
+    p.append(0, 8).unwrap();
+    assert!(matches!(
+        p.append(0, 1),
+        Err(PageError::TableFull {
+            seq: 0,
+            capacity_pages: 2
+        })
+    ));
+    p.grow(1);
+    p.append(0, 4).unwrap();
+    assert_eq!(p.table_for(0, 1), vec![0, 1, 2]);
+    assert!(matches!(
+        p.append(0, 1),
+        Err(PageError::TableFull {
+            seq: 0,
+            capacity_pages: 3
+        })
+    ));
 }

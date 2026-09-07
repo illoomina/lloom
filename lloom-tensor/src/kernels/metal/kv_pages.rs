@@ -69,9 +69,12 @@
 //! **No eviction policy.** §10.3f decides the *mechanism* — a page returns to
 //! the free list when its refcount hits zero — and defers the *policy* (LRU,
 //! recompute, swap-to-host, preempt-a-sequence) to a scheduler that does not
-//! exist. Exhaustion is a loud failure, following #150, for §10.3f's reason: a
-//! `Grow` would move the base pointer every kernel addresses at the moment the
-//! cache is largest.
+//! exist. Exhaustion of a pool at its ceiling is a loud failure, following
+//! #150. **The pool does grow below the ceiling** — [`KvPagePool::grow`], driven
+//! by the cache in buckets and admitted against the device first — and the
+//! cost §10.3f named for that is paid as named: the pool buffer is reallocated
+//! and copied and its base pointer moves, once per bucket, with every page
+//! index and every table unchanged.
 //!
 //! **No eviction policy, and no page-walking kernel** — see above. What this
 //! module *does* now carry is the liveness half, added 2026-09-02 (#148):
@@ -104,10 +107,11 @@ pub type PageIdx = u32;
 
 /// Why a page allocation failed.
 ///
-/// Exhaustion is an error rather than a `Grow`, for #150's reason exactly
-/// (§10.3f): growing the pool means reallocating the one buffer every kernel
-/// addresses, moving the base pointer §9.2d's `base + offset` reasoning rests
-/// on, at the moment the cache is largest.
+/// Exhaustion is an error rather than a grow *here*: the pool is a pure
+/// function of its history and allocates no buffer, so it cannot widen itself.
+/// The cache widens it ([`KvPagePool::grow`]) before a pass that needs the
+/// room, up to its ceiling; a pool that is exhausted was pinned
+/// (`LLOOM_148_POOL_PAGES`) or is at that ceiling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageError {
     /// The free list is empty.
@@ -132,8 +136,9 @@ impl std::fmt::Display for PageError {
             PageError::Exhausted { pool_pages } => write!(
                 f,
                 "KV page pool exhausted: all {pool_pages} pages are allocated. Raise the pool \
-                 size; the pool does not grow, because growing it moves the base pointer every \
-                 kernel addresses (DESIGN.md 10.3f)"
+                 size: it grows with the KV slab up to the cache's ceiling (`kv_capacity`) \
+                 unless LLOOM_148_POOL_PAGES pins it, and one of those two is what it hit \
+                 (DESIGN.md 10.3f)"
             ),
             PageError::TableFull {
                 seq,
@@ -292,6 +297,26 @@ impl KvPagePool {
     /// A sequence's table.
     pub fn seq(&self, seq: usize) -> Option<&SeqPages> {
         self.seqs.get(seq)
+    }
+
+    /// Add `extra` pages to the pool, beneath the free pages it already holds.
+    ///
+    /// Growth is the cache's: it reallocates the pool buffer wider and copies
+    /// the old one into the prefix, so every existing page index still names
+    /// the run of tokens it did and no table needs a rewrite. The new pages
+    /// are spliced *under* the free list rather than pushed onto it, so a
+    /// recycled page keeps popping before a fresh one — the allocation order a
+    /// pool created this wide would have followed, which keeps a grown pool's
+    /// tables a function of the allocation history alone (§10.3h) rather than
+    /// of when it grew. The table capacity widens by the same count: a table
+    /// that could not name the new pages would report `TableFull` for a pool
+    /// with room.
+    pub fn grow(&mut self, extra: usize) {
+        let first = self.refcount.len() as PageIdx;
+        let fresh: Vec<PageIdx> = (first..first + extra as PageIdx).rev().collect();
+        self.free.splice(0..0, fresh);
+        self.refcount.extend(std::iter::repeat_n(0, extra));
+        self.table_capacity_pages += extra;
     }
 
     /// Append `n` tokens to `seq`, allocating pages as they are needed.

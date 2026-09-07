@@ -121,6 +121,19 @@ pub trait ReadbackStrategy {
         Tensor::new(tokens, self.device())?.unsqueeze(0)
     }
 
+    /// Publish the completion marker for the steps fed since the last call — the
+    /// per-commit-window write the drain clamps to and the host WFE-waits on.
+    ///
+    /// The loop calls this at each commit, so the marker is written at the commit
+    /// cadence (`live_every` steps) rather than per token. **The default is a
+    /// no-op**: the blocking arm has its own per-step readback, and the per-step
+    /// device-EOS arm already stamped inside [`Self::sample_and_feed`] (its marker
+    /// and its EOS flag coincide, `live_every == 1`). Only the arm that defers its
+    /// stamp to the commit window overrides this.
+    fn publish_marker(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Was the token fed by the last [`Self::sample_and_feed`] an EOS? Waits
     /// by this arm's own mechanism until it knows; a `true` retracts that
     /// token from the ids [`Self::take_ids`] will return.
@@ -1185,11 +1198,12 @@ impl ReadbackStrategy for Ring {
         match self.eos {
             EosRead::Poll(_) => self.ring.publish_step(&sampled, Some(self.generation))?,
             EosRead::Blocking => self.ring.publish(&sampled)?,
-            // No device EOS: input + stamp only, the ~5 EOS dispatches skipped.
-            // EOS is learned host-side from the drained batch (`eos_in_drained`).
-            EosRead::HostOnDrain => self
-                .ring
-                .publish_input_and_stamp(&sampled, self.generation)?,
+            // No device EOS and no per-step stamp: the input slot ONLY (the ~5 EOS
+            // dispatches AND the per-token stamp both skipped). EOS is learned
+            // host-side from the drained batch (`eos_in_drained`); the completion
+            // marker the drain clamps to is written once per commit window by
+            // [`ReadbackStrategy::publish_marker`], not per token.
+            EosRead::HostOnDrain => self.ring.publish_input(&sampled)?,
         }
         self.history.wrote_one();
         // The tile is left OPEN; `eos_of_last` may retract this token, and the
@@ -1204,6 +1218,19 @@ impl ReadbackStrategy for Ring {
         // stale slots past the token. `input_for(1)` is a contiguous prefix view,
         // no copy — the same allocation, just the one live slot.
         self.ring.input_for(1)
+    }
+
+    fn publish_marker(&mut self) -> Result<()> {
+        // Only the host-on-drain arm defers its stamp to the commit window; the
+        // poll arm stamped per step inside `sample_and_feed` (marker ≡ EOS flag),
+        // and the blocking arm has its own readback. `self.generation` is `fed`
+        // through the last fed step, so the marker publishes exactly the window
+        // the drain is about to read. Skip when nothing has been fed since the
+        // last marker (generation 0 is the unpublished sentinel).
+        if matches!(self.eos, EosRead::HostOnDrain) && self.generation > 0 {
+            self.ring.publish_marker(self.generation)?;
+        }
+        Ok(())
     }
 
     fn eos_of_last(&mut self) -> Result<bool> {

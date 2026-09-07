@@ -763,6 +763,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // The publish must reach the GPU before the host waits on it.
                 // Structural on this arm, not a budget choice, and counted.
                 if loop_commits {
+                    // The completion marker for the window closing at this commit,
+                    // encoded BEFORE the commit so its `slice_set` rides the
+                    // committing buffer AFTER this step's input slot — the ordering
+                    // the drain's clamp rests on (§3.5). A no-op on the arms that
+                    // stamp per step or read back per step.
+                    readback.publish_marker()?;
                     self.commit(&device, &mut stats)?;
                     since_commit = 0;
                     committed_this_step = true;
@@ -872,6 +878,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
             if loop_commits && !committed_this_step {
                 since_commit += 1;
                 if in_ttft_ramp || opts.budget.due(since_commit) {
+                    // The completion marker for the window closing here, encoded
+                    // before the commit so it rides the committing buffer after the
+                    // window's slots (§3.5). No-op on the per-step arms.
+                    readback.publish_marker()?;
                     self.commit(&device, &mut stats)?;
                     since_commit = 0;
                     committed_now = true;

@@ -111,6 +111,24 @@ pub struct TokenRing {
     /// The per-tile token capacity (`= inputs.quantum()`). A stage wider than this
     /// is refused rather than silently truncated.
     max_width: usize,
+    /// Pre-allocated CYCLED SOURCE ring for the generation stamp — the whole of
+    /// why [`Self::publish_marker`] does no hot-path allocation.
+    ///
+    /// Writing the stamp is `step.slice_set(src)`, and `slice_set` reads `src` at
+    /// GPU-EXECUTE time (not encode time). A single reused source would tear: the
+    /// host staging stamp N+1 into it could race the still-pending `slice_set` of
+    /// stamp N. The cure is the input ring's own discipline — cycle `depth + 1`
+    /// sources so the one being staged is never the one an in-flight `slice_set`
+    /// reads (the pacer bounds in-flight writes to `depth`). Reuses [`SegmentedRing`]
+    /// (quantum 1, `depth + 1` one-slot tiles), the same battle-tested
+    /// zero-copy-staged, mapped, pre-allocated mechanism as `inputs` — so the stamp
+    /// value is staged with `write_host_slice` (no alloc) and copied to `step` with
+    /// one queue-ordered `slice_set`, and NOTHING is allocated per publish.
+    marker_src: super::readback::SegmentedRing,
+    /// The marker-source tile the next stamp stages into; cycles over
+    /// `marker_src`'s `depth + 1` tiles. Single-thread (the decode loop owns it),
+    /// so a `Cell` rather than an atomic — exactly like `slot`.
+    marker_slot: std::cell::Cell<usize>,
     eos: Tensor,
     eos_ids: Tensor,
     /// The published-generation counter, and the reason it exists is #535.
@@ -257,6 +275,12 @@ impl TokenRing {
         // Seed tile 0's first slot (the first forward's input), zero-copy through the
         // mapped pointer.
         inputs.stage_at_tile(0, &[first_input])?;
+        // The marker-source ring: `n` (= depth + 1) one-slot tiles, quantum 1, so a
+        // stamp staged into the current tile is never the one an in-flight
+        // `slice_set` still reads (the pacer bounds in-flight to `depth`). Same
+        // pre-allocated, mapped, zero-copy-staged mechanism as `inputs` — no
+        // per-publish allocation. `n * 1` slots.
+        let marker_src = super::readback::SegmentedRing::new(n, 1, device)?;
         let eos_ids = Tensor::from_vec(eos_ids.to_vec(), eos_ids.len(), device)?;
         // Materialised on the device so the first `publish` overwrites rather
         // than allocates. `from_vec` of a `0u8` is the same shape `publish`
@@ -278,6 +302,8 @@ impl TokenRing {
             inputs,
             slot: std::cell::Cell::new(0),
             max_width: w,
+            marker_src,
+            marker_slot: std::cell::Cell::new(0),
             eos,
             eos_ids,
             step,
@@ -379,50 +405,79 @@ impl TokenRing {
             .max_all()?
             .reshape(1)?;
         self.eos.slice_set(&hit, 0, 0)?;
-        // The stamp, LAST. Everything a poller will read once it sees this
-        // value has been encoded before it.
+        // The stamp, LAST — but only when the caller stamps at THIS granularity.
+        // `Some(g)` is the per-step arm (the completion marker and the EOS flag
+        // coincide, `live_every == 1`); `None` is the batched arm, where the loop
+        // stamps once per commit window via [`Self::publish_marker`] instead, so
+        // the per-step path writes no stamp at all.
         if let Some(g) = generation {
-            let stamp = Tensor::from_vec(vec![g], 1, self.step.device())?;
-            self.step.slice_set(&stamp, 0, 0)?;
+            self.publish_marker(g)?;
         }
         Ok(())
     }
 
-    /// [`Self::publish_step`] **without the device EOS decision** — writes the
-    /// input slot and the generation stamp only, skipping the
-    /// `broadcast_eq → max_all → slice_set(eos)` that costs ~5 dispatches every
-    /// token in the command stream (`DESIGN.md` §11.5g's comparison).
+    /// Stamp the generation counter, LAST in queue order and WITHOUT a per-call
+    /// allocation — the completion marker the host WFE-waits on and the drain
+    /// clamps to ([`Self::published_generation`]).
     ///
-    /// For the [`crate::generation::EosRead::HostOnDrain`] arm, where EOS is not
-    /// learned per token from the device flag but host-side from the drained ids
-    /// (a plain Rust compare on the batch the drain already reads), so the flag
-    /// is never read and the dispatches that compute it are pure cost. The stamp
-    /// is still written last and is still the visibility signal the zero-copy
-    /// drain rides ([`Self::published_generation`]) — that protocol is unchanged,
-    /// only the EOS flag is gone.
+    /// This is the write the per-step `from_vec(vec![g])` used to fabricate a
+    /// fresh source buffer for every token. Here the source is pre-allocated: the
+    /// value stages into the current [`Self::marker_src`] tile through its mapped
+    /// pointer ([`Tensor::write_host_slice`], no alloc), and one queue-ordered
+    /// `slice_set` copies it to `step`. Cycling `depth + 1` source tiles is what
+    /// makes the host stage safe against the still-pending `slice_set` of a prior
+    /// stamp (the pacer bounds in-flight writes to `depth`) — the input ring's own
+    /// don't-overwrite-what-is-in-flight discipline (§10.3e), applied to the stamp.
     ///
-    /// The `eos` flag tensor is left at whatever it last held; nothing reads it
-    /// on this arm. A `generation` of 0 is rejected for [`Self::publish_step`]'s
-    /// reason.
-    pub fn publish_input_and_stamp(&self, token: &Tensor, generation: u32) -> Result<()> {
-        if token.dtype() != DType::U32 {
-            lloom_tensor::bail!(
-                "TokenRing::publish_input_and_stamp expects the U32 argmax output, got {:?}",
-                token.dtype()
-            );
-        }
+    /// Called either per step (the marker-coincides-with-EOS arm) or once per
+    /// commit window (the batched arm), so `generation` is whatever the host holds
+    /// as `fed` at that point. Ordering is the protocol: encoded after the input
+    /// slot and (on the per-step arm) the EOS flag, so a host that observes the
+    /// counter at `>= N` has those writes behind it in queue order (§9.3).
+    pub fn publish_marker(&self, generation: u32) -> Result<()> {
         if generation == 0 {
             lloom_tensor::bail!(
                 "TokenRing: generation 0 is the unpublished sentinel, ordinals start at 1"
             );
         }
+        // Cycle to a fresh source tile so the stage does not race an in-flight
+        // `slice_set` reading the previous one.
+        let n = self.marker_src.total_tiles();
+        let src_tile = (self.marker_slot.get() + 1) % n;
+        self.marker_slot.set(src_tile);
+        // Stage the value zero-copy (mapped write, no alloc); the fallback inside
+        // `stage_at_tile` covers an unmapped source. Then one queue-ordered copy to
+        // the persistent `step` word.
+        self.marker_src.stage_at_tile(src_tile, &[generation])?;
+        let src = self.marker_src.tile_view(src_tile, 1)?.reshape(1)?;
+        self.step.slice_set(&src, 0, 0)?;
+        Ok(())
+    }
+
+    /// Write the sampled token into the input slot ONLY — no device EOS decision
+    /// and no per-step stamp.
+    ///
+    /// This is the per-step path for the arms that do NOT stamp per token: the
+    /// batched arm learns EOS host-side or in a GPU window check, and the
+    /// completion marker is written once per commit window
+    /// ([`Self::publish_marker`]) rather than once per token. So the per-step path
+    /// is just the input slot — the next forward's input, device-written and
+    /// queue-ordered after the prior forward's read — and nothing the host reads.
+    ///
+    /// Skips both the `broadcast_eq → max_all → slice_set(eos)` (~5 dispatches,
+    /// `DESIGN.md` §11.5g) AND the per-step stamp (`from_vec` + `slice_set`) the
+    /// incumbent wrote every token. The `eos` flag tensor is left at whatever it
+    /// last held; nothing reads it on this arm.
+    pub fn publish_input(&self, token: &Tensor) -> Result<()> {
+        if token.dtype() != DType::U32 {
+            lloom_tensor::bail!(
+                "TokenRing::publish_input expects the U32 argmax output, got {:?}",
+                token.dtype()
+            );
+        }
         let token = token.reshape(1)?;
         let tile = self.next_slot();
         self.inputs.write_device_at_tile(tile, &token)?;
-        // The stamp, LAST — the drain's visibility signal, same ordering as
-        // `publish_step`. No EOS flag is written: this arm never reads it.
-        let stamp = Tensor::from_vec(vec![generation], 1, self.step.device())?;
-        self.step.slice_set(&stamp, 0, 0)?;
         Ok(())
     }
 

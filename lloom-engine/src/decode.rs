@@ -16,10 +16,12 @@
 //! `CONTRIBUTING.md` §3.6 — no `dyn` on the decode path. The `dyn`-per-request
 //! boundary is the [`crate::seam`] trait, one level out, where it is allowed.
 
-use lloom::generation::{Blocking, LogitsProcessor};
+use lloom::generation::poll::PollMechanism;
+use lloom::generation::readback::RING_HISTORY_SLOTS;
+use lloom::generation::{Blocking, CommitBudget, EosRead, LogitsProcessor, Ring, Sampling};
 use lloom::nn::{
-    CacheReset, CacheRewind, CausalLM, DecodeOptions, IdentityProposer, ReuseAction, Sequence,
-    Session,
+    CacheReset, CacheRewind, CausalLM, DecodeOptions, DecodeOut, DecodeStats, IdentityProposer,
+    ReuseAction, Sequence, Session,
 };
 use lloom_tensor::{Device, Result};
 
@@ -32,6 +34,79 @@ pub enum Stop {
     StopString,
     /// The token budget was exhausted.
     Length,
+    /// The consumer's fragment hook ended the run ([`DecodeSession::decode_until`]).
+    Cancelled,
+}
+
+/// Which readback strategy a run takes — where the per-token round trip sits
+/// (`design/docs/decode-driver-design.md`, seam A; `readback.rs`).
+///
+/// The serving crate used to hard-code [`Blocking`], the arm that reads every
+/// token back to the host and waits (§11.5a's 441 µs seam). The crown decode
+/// path is the device-resident [`Ring`] polled for EOS with one forward of
+/// lookahead (§11.5g, §11.2b), which `lfm2-chat` selects by hand; this enum is
+/// how a consumer selects it through the seam instead of re-writing that
+/// selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadbackArm {
+    /// The ring when the sampler can ride it (argmax or plain temperature),
+    /// the blocking arm otherwise — the choice [`Ring::check_sampler`]
+    /// would refuse is made here rather than failing the request.
+    Auto,
+    /// The host reads every token back; any sampler, no lookahead.
+    Blocking,
+    /// The device-resident token ring with the EOS flag polled.
+    Ring {
+        /// Forward passes the host enqueues before it has learned the
+        /// previous step's EOS: `0` or `1`. `1` is the crown arm and leaves
+        /// the cache one position past an EOS, which [`Session::prepare`]
+        /// reconciles or resets on the next request.
+        lookahead: usize,
+        /// Steps between commits of the in-flight queue; `1` is per-token.
+        commit_steps: usize,
+    },
+}
+
+impl ReadbackArm {
+    /// The crown selection: ring, one forward of lookahead, commit every 8
+    /// steps (`lfm2-chat`'s defaults, #520's flat queue bound).
+    pub const CROWN: ReadbackArm = ReadbackArm::Ring {
+        lookahead: 1,
+        commit_steps: 8,
+    };
+
+    /// Whether the ring arm can serve `sampling` without a host round trip
+    /// it would not report (`Ring::check_sampler`).
+    fn ring_admits(sampling: &Sampling) -> bool {
+        matches!(
+            sampling,
+            Sampling::ArgMax | Sampling::All { .. } | Sampling::GumbelSoftmax { .. }
+        )
+    }
+
+    /// The arm that runs for `sampling`: `Auto` resolves here, the explicit
+    /// arms pass through.
+    fn resolve(self, sampling: &Sampling) -> ReadbackArm {
+        match self {
+            ReadbackArm::Auto if Self::ring_admits(sampling) => ReadbackArm::CROWN,
+            ReadbackArm::Auto => ReadbackArm::Blocking,
+            other => other,
+        }
+    }
+
+    /// The arm's name for a report line: `blocking` or `ring-nonblocking`
+    /// with its lookahead and commit period, rendered from the resolved value
+    /// rather than from the request (§7.1a-i).
+    pub fn name(self) -> String {
+        match self {
+            ReadbackArm::Auto => "auto".to_string(),
+            ReadbackArm::Blocking => "blocking".to_string(),
+            ReadbackArm::Ring {
+                lookahead,
+                commit_steps,
+            } => format!("ring-nonblocking lookahead={lookahead} commit_steps={commit_steps}"),
+        }
+    }
 }
 
 /// Sampling and stopping knobs for one decode run. Engine-level: token ids and
@@ -48,6 +123,8 @@ pub struct DecodeParams {
     pub eos_ids: Vec<u32>,
     /// Text substrings that stop the run once they appear in the output.
     pub stop_strings: Vec<String>,
+    /// Which readback arm the run takes; [`ReadbackArm::Auto`] by default.
+    pub readback: ReadbackArm,
 }
 
 impl Default for DecodeParams {
@@ -59,6 +136,7 @@ impl Default for DecodeParams {
             max_tokens: 512,
             eos_ids: Vec::new(),
             stop_strings: Vec::new(),
+            readback: ReadbackArm::Auto,
         }
     }
 }
@@ -77,6 +155,12 @@ pub struct Decoded {
     /// Prompt tokens actually prefilled — the request's length minus `reused`,
     /// except under [`ReuseAction::Resume`] where nothing is.
     pub prefilled: usize,
+    /// The readback arm that ran, resolved (never [`ReadbackArm::Auto`]).
+    pub readback: ReadbackArm,
+    /// The loop's own counters — prefill submit time, per-step host time,
+    /// commits, ring engagement — so a consumer that reports throughput reads
+    /// the loop's clock rather than bracketing the call.
+    pub stats: DecodeStats,
 }
 
 /// A decode session: a borrowed target and the sequence it drives — the cache,
@@ -129,6 +213,37 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         self.session.pos()
     }
 
+    /// Return the sequence to empty: cache reset, token log cleared. A serving
+    /// layer that must not reuse state between requests — a benchmark cell
+    /// that measures a cold prefill — calls this before each one; a layer that
+    /// wants prefix reuse does not, and [`Session::prepare`] decides.
+    pub fn reset(&mut self)
+    where
+        M::Cache: CacheReset,
+    {
+        self.session.reset()
+    }
+
+    /// Compile the pipelines the first real forward would otherwise compile
+    /// inside its own timed window, then reset ([`Session::warmup`]). Returns
+    /// the device's `(libraries, pipelines)` cache sizes.
+    pub fn warmup(&mut self) -> Result<(usize, usize)>
+    where
+        M::Cache: CacheReset,
+    {
+        self.session.warmup(&self.device)
+    }
+
+    /// The device this session decodes on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// The target this session drives.
+    pub fn model(&self) -> &'m M {
+        self.session.model()
+    }
+
     /// The ids whose state the cache holds.
     pub fn tokens(&self) -> &[u32] {
         self.session.tokens()
@@ -156,9 +271,30 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     pub fn decode(
         &mut self,
         prompt_ids: &[u32],
-        mut detokenize: impl FnMut(&[u32]) -> Result<String>,
+        detokenize: impl FnMut(&[u32]) -> Result<String>,
         params: &DecodeParams,
         mut on_fragment: impl FnMut(&str),
+    ) -> Result<Decoded>
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+        self.decode_until(prompt_ids, detokenize, params, |frag| {
+            on_fragment(frag);
+            true
+        })
+    }
+
+    /// [`Self::decode`] whose fragment hook can end the run: a `false` stops
+    /// after the fragment it was handed, reported as [`Stop::Cancelled`]. The
+    /// serving layer's cancellation — a client that went away, a benchmark's
+    /// early abort on a degenerate sample — rides the same seam a stop string
+    /// does, so the loop needs no second path.
+    pub fn decode_until(
+        &mut self,
+        prompt_ids: &[u32],
+        mut detokenize: impl FnMut(&[u32]) -> Result<String>,
+        params: &DecodeParams,
+        mut on_fragment: impl FnMut(&str) -> bool,
     ) -> Result<Decoded>
     where
         M::Cache: CacheRewind + CacheReset,
@@ -169,46 +305,96 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let prepared = self.session.prepare(prompt_ids)?;
 
         let mut sampler = LogitsProcessor::new(params.seed, params.temperature, params.top_p);
-        let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+        let arm = params.readback.resolve(sampler.sampling());
         let mut spec = IdentityProposer;
-        let opts = DecodeOptions::new(params.max_tokens);
 
         let mut generated: Vec<u32> = Vec::with_capacity(params.max_tokens);
         let mut text = String::new();
         // Start of the run of generated tokens not yet emitted as text.
         let mut pending = 0usize;
         let mut stopped_on_string = false;
+        let mut cancelled = false;
 
-        let out = self.session.decode_until(
-            &mut spec,
-            &mut readback,
-            &mut sampler,
-            &prepared.suffix,
-            &opts,
-            &mut |batch: &[u32]| {
-                generated.extend_from_slice(batch);
-                // Decode only the not-yet-emitted tokens, not the whole sequence
-                // each step: the latter is quadratic in output length.
-                let chunk = detokenize(&generated[pending..])?;
-                if !chunk.is_empty() && !chunk.ends_with('\u{FFFD}') {
-                    on_fragment(&chunk);
-                    text.push_str(&chunk);
-                    pending = generated.len();
-                }
-                if !params.stop_strings.is_empty()
-                    && params
-                        .stop_strings
-                        .iter()
-                        .any(|s| text.contains(s.as_str()))
-                {
-                    stopped_on_string = true;
+        // The streaming hook, shared by every arm: decode only the
+        // not-yet-emitted tokens (the whole sequence each step is quadratic in
+        // output length), hold a run ending mid-character, and let a stop
+        // string end the run.
+        let mut on_tokens = |batch: &[u32]| -> Result<bool> {
+            generated.extend_from_slice(batch);
+            let chunk = detokenize(&generated[pending..])?;
+            if !chunk.is_empty() && !chunk.ends_with('\u{FFFD}') {
+                let go_on = on_fragment(&chunk);
+                text.push_str(&chunk);
+                pending = generated.len();
+                if !go_on {
+                    cancelled = true;
                     return Ok(false);
                 }
-                Ok(true)
-            },
-        )?;
+            }
+            if !params.stop_strings.is_empty()
+                && params
+                    .stop_strings
+                    .iter()
+                    .any(|s| text.contains(s.as_str()))
+            {
+                stopped_on_string = true;
+                return Ok(false);
+            }
+            Ok(true)
+        };
 
-        let stop = if stopped_on_string {
+        let out: DecodeOut = match arm {
+            ReadbackArm::Blocking => {
+                let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+                let opts = DecodeOptions::new(params.max_tokens);
+                self.session.decode_until(
+                    &mut spec,
+                    &mut readback,
+                    &mut sampler,
+                    &prepared.suffix,
+                    &opts,
+                    &mut on_tokens,
+                )?
+            }
+            ReadbackArm::Ring {
+                lookahead,
+                commit_steps,
+            } => {
+                // Sized for the whole generation; past `RING_HISTORY_SLOTS` the
+                // history is no longer CPU-mapped and each drain synchronises
+                // (`readback.rs`), which is a slower run and not a refusal.
+                let capacity = params.max_tokens.saturating_add(1).max(RING_HISTORY_SLOTS);
+                let mut readback = Ring::new(
+                    &params.eos_ids,
+                    &self.device,
+                    capacity,
+                    EosRead::Poll(PollMechanism::default()),
+                )?;
+                let opts = DecodeOptions {
+                    max_tokens: params.max_tokens,
+                    budget: if commit_steps <= 1 {
+                        CommitBudget::per_token()
+                    } else {
+                        CommitBudget::steps(commit_steps)?
+                    },
+                    lookahead,
+                    sample_split: false,
+                };
+                self.session.decode_until(
+                    &mut spec,
+                    &mut readback,
+                    &mut sampler,
+                    &prepared.suffix,
+                    &opts,
+                    &mut on_tokens,
+                )?
+            }
+            ReadbackArm::Auto => unreachable!("resolved above"),
+        };
+
+        let stop = if cancelled {
+            Stop::Cancelled
+        } else if stopped_on_string {
             Stop::StopString
         } else if out.eos {
             Stop::Eos
@@ -233,6 +419,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reuse: prepared.action,
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
+            readback: arm,
+            stats: out.stats,
         })
     }
 }
@@ -258,11 +446,39 @@ mod tests {
         drives::<lloom::models::lfm2::Model>();
     }
 
+    /// `Auto` takes the crown ring for the device-resident samplers and the
+    /// blocking arm for the ones that need a host sort (`Ring::check_sampler`),
+    /// and never leaves `Auto` in the resolved value a consumer reports.
+    #[test]
+    fn auto_resolves_by_sampler() {
+        let argmax = Sampling::ArgMax;
+        let temp = Sampling::All { temperature: 0.6 };
+        let top_p = Sampling::TopP {
+            p: 0.9,
+            temperature: 0.6,
+        };
+        assert_eq!(ReadbackArm::Auto.resolve(&argmax), ReadbackArm::CROWN);
+        assert_eq!(ReadbackArm::Auto.resolve(&temp), ReadbackArm::CROWN);
+        assert_eq!(ReadbackArm::Auto.resolve(&top_p), ReadbackArm::Blocking);
+        assert_eq!(
+            ReadbackArm::Blocking.resolve(&argmax),
+            ReadbackArm::Blocking
+        );
+        let ring = ReadbackArm::Ring {
+            lookahead: 0,
+            commit_steps: 1,
+        };
+        assert_eq!(ring.resolve(&top_p), ring);
+        assert_ne!(ReadbackArm::CROWN.name(), ReadbackArm::Blocking.name());
+        assert!(ReadbackArm::CROWN.name().contains("lookahead=1"));
+    }
+
     /// The stop reasons a caller matches on are exhaustive and distinct.
     #[test]
     fn stop_variants_are_distinct() {
         assert_ne!(Stop::Eos, Stop::Length);
         assert_ne!(Stop::StopString, Stop::Length);
         assert_ne!(Stop::Eos, Stop::StopString);
+        assert_ne!(Stop::Cancelled, Stop::StopString);
     }
 }

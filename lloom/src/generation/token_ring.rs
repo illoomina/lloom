@@ -95,9 +95,25 @@ pub fn poll_read_count() -> u64 {
 /// (§9.2a layer 3), so §6.7 L4's two-clocks defect -- `Arc::strong_count == 1`
 /// says nothing about GPU liveness -- cannot reach them.
 pub struct TokenRing {
-    input: Tensor,
-    /// The input buffer's capacity in tokens (`input` is `[1, max_width]`). A
-    /// stage wider than this is refused rather than silently truncated.
+    /// A small RING of input buffers, each `[1, max_width]`. One buffer is not
+    /// enough once forwards run concurrently under the pacer: a chunk's forward is
+    /// enqueued but not yet GPU-executed when the NEXT chunk stages its tokens, and
+    /// a host-side stage (`write_host_slice`) is NOT ordered on the GPU queue — so
+    /// overwriting the one buffer would race the in-flight forward's read (measured:
+    /// streamed prefill diverged until this ring; the blocking arm, which allocates
+    /// a fresh input per chunk, did not). `depth + 1` slots — the pacer holds at
+    /// most `depth` forwards in flight, so a slot is free again by the time the ring
+    /// laps back to it (the pacer waited on that forward's marker before enqueuing
+    /// `depth` later). The decode path (device-side `publish`, queue-ordered) does
+    /// not need this, but rotating through the slots is harmless there. This is the
+    /// input-side twin of the token-history ring's "don't overwrite what's in
+    /// flight" discipline (§10.3e).
+    inputs: Vec<Tensor>,
+    /// The slot the NEXT stage/publish writes and the next forward reads. Advances
+    /// once per input write, wrapping at `inputs.len()`.
+    slot: std::cell::Cell<usize>,
+    /// The input buffer's capacity in tokens (each is `[1, max_width]`). A stage
+    /// wider than this is refused rather than silently truncated.
     max_width: usize,
     eos: Tensor,
     eos_ids: Tensor,
@@ -193,55 +209,64 @@ impl TokenRing {
     /// checks EOS -- `eos_token_id` appears three times in `lfm2.rs` and all
     /// three are plumbing) has no model-side counterpart to fall back on.
     pub fn new(first_input: u32, eos_ids: &[u32], device: &Device) -> Result<Self> {
-        Self::with_input_width(first_input, eos_ids, device, 1)
+        Self::with_input_ring(first_input, eos_ids, device, 1, 1)
     }
 
     /// As [`Self::new`], with the input buffer sized to hold up to `max_width`
-    /// tokens rather than one.
-    ///
-    /// The input is the buffer the model reads as its next forward's tokens. At
-    /// width 1 it is the single sampled token a decode step feeds; a wider buffer
-    /// **decouples what is STAGED from what one forward CONSUMES** — the state
-    /// machine can step over a prompt in `ubatch`-wide units (streamed prefill) or
-    /// a drafted block in `K+1`-wide units, writing them into this one reused
-    /// buffer (zero-copy [`Tensor::write_host_slice`] for a host source) and
-    /// consuming a [`Self::input_for`] narrow of the width that step eats. Sized
-    /// with `from_vec` (not `zeros`) so there is no pending blit-fill to race the
-    /// host write, and allocated ONCE — the buffer identity §10.3e requires is
-    /// preserved (every step reads the same allocation, just a different-width
-    /// prefix of it).
+    /// tokens rather than one. One slot — for a caller with no concurrent forwards
+    /// staging host tokens (the incumbent single-input path).
     pub fn with_input_width(
         first_input: u32,
         eos_ids: &[u32],
         device: &Device,
         max_width: usize,
     ) -> Result<Self> {
+        Self::with_input_ring(first_input, eos_ids, device, max_width, 1)
+    }
+
+    /// As [`Self::with_input_width`], with an input RING of `n_slots` buffers so a
+    /// host-staged chunk does not overwrite an in-flight forward's input (see the
+    /// `inputs` field). `n_slots` = the pacer's in-flight depth + 1; `1` reduces to
+    /// the single-buffer path.
+    ///
+    /// Each buffer holds up to `max_width` tokens and **decouples what is STAGED
+    /// from what one forward CONSUMES** — the state machine steps over a prompt in
+    /// `ubatch`-wide units (streamed prefill) or a drafted block in `K+1`-wide
+    /// units, writing them into the current slot (zero-copy
+    /// [`Tensor::write_host_slice`] for a host source) and consuming a
+    /// [`Self::input_for`] narrow of the width that step eats. Buffers are
+    /// `Tensor::empty` (no fill, no blit, no host upload — the content is written
+    /// before it is read), allocated ONCE.
+    pub fn with_input_ring(
+        first_input: u32,
+        eos_ids: &[u32],
+        device: &Device,
+        max_width: usize,
+        n_slots: usize,
+    ) -> Result<Self> {
         if eos_ids.is_empty() {
             lloom_tensor::bail!("TokenRing: eos_ids is empty, so the loop would never terminate");
         }
         let w = max_width.max(1);
-        // A bare allocation — **no fill, no blit, no host upload**. The input's
-        // content is irrelevant at construction: every forward's input is WRITTEN
-        // (a stage or a `publish`) before it is read (`sample_and_feed` writes the
-        // slot, then hands `input()` to the next forward — write-then-return), so
-        // `first_input` is never actually consumed. `Tensor::zeros` would enqueue
-        // a blit-fill (an alloc + a blit whose result is discarded, the cost
-        // removed from hot paths), and `from_vec` would upload a host vec; neither
-        // is needed. `empty` gives the buffer identity §10.3e wants with no cost.
+        let n = n_slots.max(1);
+        // Bare allocations — no fill, no blit, no upload. The content is irrelevant
+        // at construction: every forward's input is WRITTEN (a stage or a `publish`)
+        // before it is read. `Tensor::zeros` would enqueue a blit-fill (alloc + a
+        // discarded blit, the cost removed from hot paths); `empty` gives the buffer
+        // identity §10.3e wants with none.
         //
         // SAFETY: uninitialised memory, made defined before any read by the
-        // write-then-return discipline above; `first_input` is written into slot 0
-        // below to keep the "seed" contract explicit and to define the slot even
-        // on an arm that might read before writing.
-        let input = unsafe { Tensor::empty((1, w), DType::U32, device)? };
-        // Define slot 0 with the seed, zero-copy through the mapped pointer (the
-        // buffer is small → mapped; the fallback path is a no-op seed on an
-        // unmapped arm, which the write-then-return discipline makes safe anyway).
-        let _ = first_input;
-        let seed = [first_input];
-        // SAFETY: no GPU work is in flight on this just-allocated buffer.
+        // write-then-return discipline; slot 0 is seeded below to define it even on
+        // an arm that might read before the first write.
+        let inputs = (0..n)
+            .map(|_| unsafe { Tensor::empty((1, w), DType::U32, device) })
+            .collect::<Result<Vec<_>>>()?;
+        // Seed slot 0 (the first forward's input), zero-copy through the mapped
+        // pointer; a no-op on an unmapped arm, which the write-then-return
+        // discipline makes safe anyway.
+        // SAFETY: no GPU work is in flight on these just-allocated buffers.
         unsafe {
-            input.write_host_slice::<u32>(0, &seed);
+            inputs[0].write_host_slice::<u32>(0, &[first_input]);
         }
         let eos_ids = Tensor::from_vec(eos_ids.to_vec(), eos_ids.len(), device)?;
         // Materialised on the device so the first `publish` overwrites rather
@@ -261,7 +286,8 @@ impl TokenRing {
         // the locking peek, which is two contracts in one function for no gain.
         let mapped = Self::resolve_mapped(&step, &eos);
         Ok(Self {
-            input,
+            inputs,
+            slot: std::cell::Cell::new(0),
             max_width: w,
             eos,
             eos_ids,
@@ -349,7 +375,7 @@ impl TokenRing {
         // `reshape` to the slot's own shape makes it contiguous and
         // rank-compatible in one step.
         let token = token.reshape((1, 1))?;
-        self.input.slice_set(&token, 1, 0)?; // column 0: one token into the [1, max_width] input
+        self.next_slot().slice_set(&token, 1, 0)?; // column 0 of a fresh slot: one token into the [1, max_width] input
         // The EOS decision, device-side and against a loop-invariant constant.
         // `broadcast_eq` against the uploaded id set then `max_all` reduces to
         // one element: nonzero iff the token matched any id. This is the
@@ -399,7 +425,7 @@ impl TokenRing {
             );
         }
         let token = token.reshape((1, 1))?;
-        self.input.slice_set(&token, 1, 0)?; // column 0: one token into the [1, max_width] input
+        self.next_slot().slice_set(&token, 1, 0)?; // column 0 of a fresh slot: one token into the [1, max_width] input
         // The stamp, LAST — the drain's visibility signal, same ordering as
         // `publish_step`. No EOS flag is written: this arm never reads it.
         let stamp = Tensor::from_vec(vec![generation], 1, self.step.device())?;
@@ -564,7 +590,7 @@ impl TokenRing {
     /// step could take `input_for(1)`, but returns the whole buffer here for the
     /// `[1, 1]`-max case where they coincide.
     pub fn input(&self) -> &Tensor {
-        &self.input
+        &self.inputs[self.slot.get()]
     }
 
     /// The input buffer's token capacity — the largest chunk `stage_prompt`
@@ -572,6 +598,16 @@ impl TokenRing {
     /// whole-tensor path instead.
     pub fn input_width(&self) -> usize {
         self.max_width
+    }
+
+    /// Advance to the next input slot and return a reference to it. Every write
+    /// (stage or publish) calls this FIRST so it targets a buffer no in-flight
+    /// forward is reading; `input()`/`input_for` then return this same slot for the
+    /// forward. With one slot it is the same buffer every time (the incumbent).
+    fn next_slot(&self) -> &Tensor {
+        let n = self.inputs.len();
+        self.slot.set((self.slot.get() + 1) % n);
+        &self.inputs[self.slot.get()]
     }
 
     /// The input narrowed to the `width` tokens THIS forward consumes — a
@@ -588,7 +624,9 @@ impl TokenRing {
                 self.max_width
             );
         }
-        self.input.narrow(1, 0, width)
+        // The CURRENT slot — the one the last stage/publish wrote (`next_slot`
+        // advanced to it), which is what the forward now reads.
+        self.input().narrow(1, 0, width)
     }
 
     /// Stage `tokens` into the input buffer at offset 0 for the next forward to
@@ -614,16 +652,21 @@ impl TokenRing {
                 self.max_width
             );
         }
-        // SAFETY: the input is contiguous rank-2 U32; no GPU work reads it while a
-        // stage runs (the caller's pacer ordering).
-        let wrote = unsafe { self.input.write_host_slice::<u32>(0, tokens) };
+        // Advance to a fresh slot so this stage does not overwrite a buffer an
+        // in-flight forward is still reading; the forward reads `input_for` on this
+        // same (now-current) slot.
+        let target = self.next_slot();
+        // SAFETY: the input is contiguous rank-2 U32; `next_slot` moved us to a
+        // buffer whose forward (if any) the pacer already waited on before this
+        // stage could be reached.
+        let wrote = unsafe { target.write_host_slice::<u32>(0, tokens) };
         if wrote {
             return Ok(());
         }
         // Unmapped fallback (discrete-GPU / large buffer): upload + slice_set. One
         // alloc, taken only on the arm where the mapped write is unavailable.
-        let src = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), self.input.device())?;
-        self.input.slice_set(&src, 1, 0)?;
+        let src = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), target.device())?;
+        target.slice_set(&src, 1, 0)?;
         Ok(())
     }
 

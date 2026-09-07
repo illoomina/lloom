@@ -1544,6 +1544,9 @@ fn decode_with(
         // path allocates its whole-prompt input tensor via the trait default, so
         // the input buffer width is not consulted there).
         max_input_width: opts.prefill_ubatch(),
+        // The input ring needs `depth + 1` buffers so a host-staged chunk does not
+        // race an in-flight forward's read; the pacer depth is what bounds that.
+        in_flight_depth: opts.pacer_depth(),
     };
     let out = match readback {
         "blocking" => {

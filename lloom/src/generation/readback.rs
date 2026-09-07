@@ -324,6 +324,13 @@ pub struct Geometry {
     /// `max(quantum, max_input_width)`; it does NOT affect `cap()` (the history
     /// window) or the commit cadence.
     pub max_input_width: usize,
+    /// The host/GPU in-flight depth (the pacer's bound). The input side needs
+    /// `depth + 1` buffers so a host-staged chunk does not overwrite a buffer an
+    /// in-flight forward is reading (see `TokenRing::inputs`). `0` reduces to a
+    /// single input buffer (the decode path, whose device-side writes are already
+    /// queue-ordered). Only matters when streaming a host token source
+    /// (`max_input_width > quantum`).
+    pub in_flight_depth: usize,
 }
 
 impl Geometry {
@@ -825,7 +832,7 @@ impl Ring {
     /// [`Self::with_geometry`], which sizes the ring exactly from the run's own
     /// per-step geometry.
     pub fn new(eos_ids: &[u32], device: &Device, capacity: usize, eos: EosRead) -> Result<Self> {
-        Self::with_cap_and_quantum(eos_ids, device, capacity.max(RING_HISTORY_SLOTS), 1, 1, eos)
+        Self::with_cap_and_quantum(eos_ids, device, capacity.max(RING_HISTORY_SLOTS), 1, 1, 1, eos)
     }
 
     /// Construct sized from the per-step geometry PLUS a consumer-slack window.
@@ -862,7 +869,25 @@ impl Ring {
         // chunk width, 0 when the caller does not stream (then it is just
         // `quantum`).
         let max_input_width = geometry.max_input_width.max(geometry.quantum());
-        Self::with_cap_and_quantum(eos_ids, device, cap, geometry.quantum(), max_input_width, eos)
+        // The input ring needs `depth + 1` buffers ONLY when a host source stages
+        // concurrently (streamed prefill, `max_input_width > quantum`); the decode
+        // path's device writes are queue-ordered and need one. `depth + 1` covers
+        // the pacer's in-flight window; the buffers are tiny (`[1, ubatch]`), so
+        // this is negligible memory.
+        let input_slots = if max_input_width > geometry.quantum() {
+            geometry.in_flight_depth + 1
+        } else {
+            1
+        };
+        Self::with_cap_and_quantum(
+            eos_ids,
+            device,
+            cap,
+            geometry.quantum(),
+            max_input_width,
+            input_slots,
+            eos,
+        )
     }
 
     fn with_cap_and_quantum(
@@ -871,9 +896,10 @@ impl Ring {
         cap: usize,
         quantum: usize,
         max_input_width: usize,
+        input_slots: usize,
         eos: EosRead,
     ) -> Result<Self> {
-        let ring = TokenRing::with_input_width(0, eos_ids, device, max_input_width)?;
+        let ring = TokenRing::with_input_ring(0, eos_ids, device, max_input_width, input_slots)?;
         let history = History::new(cap, quantum, device)?;
         // Cache the EOS ids host-side only for the arm that compares them there;
         // the other arms read the device flag and never touch this.

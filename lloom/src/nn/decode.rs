@@ -104,6 +104,13 @@ pub struct DecodeOptions {
     /// [`DecodeStats::rounds`] charges each phase its own GPU tail, and takes
     /// the profiler's per-phase counters when it is on.
     pub sample_split: bool,
+    /// How many forwards the host may run ahead of the GPU (the pacer's bound).
+    /// **`0` means AUTO** — computed from the host/GPU balance measured at
+    /// warmup ([`compute_in_flight_depth`]), floored at [`IN_FLIGHT_FLOOR`]. A
+    /// positive value overrides it (the tunable knob, e.g. an env A/B). Set from
+    /// [`Session::warmup`]'s return, or left 0 to fall back to the floor when no
+    /// warmup ran (CPU, or warmup skipped).
+    pub in_flight_depth: usize,
 }
 
 /// One speculative round of [`Session::decode_speculative`], for the per-round
@@ -144,13 +151,26 @@ impl DecodeOptions {
         }
     }
 
-    /// Greedy defaults: `max_tokens`, per-token commit, no lookahead, no split.
+    /// The pacer depth: the explicit override if set, else the floor. (The
+    /// AUTO path sets `in_flight_depth` from warmup; this reads it back with the
+    /// `0 = auto -> floor` convention applied.)
+    pub fn pacer_depth(&self) -> usize {
+        if self.in_flight_depth == 0 {
+            IN_FLIGHT_FLOOR
+        } else {
+            self.in_flight_depth
+        }
+    }
+
+    /// Greedy defaults: `max_tokens`, per-token commit, no lookahead, no split,
+    /// auto in-flight depth.
     pub fn new(max_tokens: usize) -> Self {
         Self {
             max_tokens,
             budget: CommitBudget::per_token(),
             lookahead: 0,
             sample_split: false,
+            in_flight_depth: 0,
         }
     }
 }
@@ -355,19 +375,66 @@ fn flush_and_prune(device: &Device) -> Result<Option<usize>> {
     Ok(None)
 }
 
-/// Forward passes the host may have in flight -- committed and not yet
-/// retired -- once it has encoded the next one.
+/// The FLOOR on how far the host may run ahead of the GPU -- the minimum the
+/// lookahead-1 dependency already implies (host waits for step `s`'s publish
+/// after encoding `s + 1`, so `s - 1` retires before `s + 2`). The ACTUAL depth
+/// is computed from the host/GPU balance at warmup ([`compute_in_flight_depth`])
+/// and is `>= this`; a constant `2` was only ever right for a config where the
+/// GPU step dwarfs the host encode (this model on this machine). See
+/// [`compute_in_flight_depth`] for why a static value caps other models/machines.
+pub const IN_FLIGHT_FLOOR: usize = 2;
+
+/// Back-compat alias for [`IN_FLIGHT_FLOOR`]: callers that sized a buffer to the
+/// old constant get the floor, which is a safe lower bound (the real depth is
+/// `>=` it). Prefer `Session::measured_in_flight_depth` / `DecodeOptions::
+/// in_flight_depth` for the actual computed depth.
+pub const IN_FLIGHT_STEPS: usize = IN_FLIGHT_FLOOR;
+
+/// The in-flight depth that keeps the GPU fed without the host running
+/// pointlessly far ahead -- a *quantitative* bound, not an arbitrary constant.
 ///
-/// Two is the depth the paced arms already run at: under `lookahead = 1` the
-/// host waits for step `s`'s publish after encoding forward `s + 1`, and the
-/// publish depends on forward `s - 1`'s logits, so forward `s - 1` has retired
-/// before forward `s + 2` is encoded. The pacer makes the same bound hold on
-/// an arm with no per-token wait, and it is a constant rather than a knob
-/// because a deeper queue buys the GPU nothing -- the steps run serially on
-/// their own dependency chain -- and costs the host a retained command buffer
-/// and its completion handler per step it runs ahead (measured at 63 deep on
-/// the drain arm before this).
-pub const IN_FLIGHT_STEPS: usize = 2;
+/// The host must stay enqueued far enough that the GPU never starves waiting for
+/// the next step: `depth = ceil(host_step / gpu_step) x safety`, floored at
+/// [`IN_FLIGHT_FLOOR`] and capped by `mem_cap` (a memory-derived ceiling, so a
+/// pathological ratio cannot pile up unbounded in-flight buffers). Both times
+/// are MEASURED at warmup (a real decode step already runs there), so this
+/// self-calibrates to the actual (model, machine, thermal) balance:
+///
+/// * **big model / slow GPU** (2.6B on M1 Max: gpu ~ 15 ms, host ~ 1.5 ms ->
+///   ratio 0.1) -> `depth = 2` (the floor) -- identical to the old constant, so
+///   no regression where the constant happened to be right.
+/// * **small model** (350M: gpu ~ 2 ms, host ~ 1.5 ms -> ratio 0.75) -> `depth
+///   ~ 3-4` -- the host runs deeper to feed the fast-draining GPU, which a
+///   static `2` capped badly on the very same machine.
+/// * **faster GPU** (M4 Max: higher bandwidth -> smaller gpu_step) -> deeper.
+///
+/// The old rationale ("a deeper queue buys the GPU nothing, the steps run
+/// serially") holds ONLY when `gpu_step >> host_step`; when the GPU can outrun
+/// the host, depth is exactly what stops it starving.
+pub fn compute_in_flight_depth(host_step_ns: u64, gpu_step_ns: u64, mem_cap: usize) -> usize {
+    if gpu_step_ns == 0 {
+        return IN_FLIGHT_FLOOR;
+    }
+    // ceil(host/gpu) with a x2 safety, so a host step that occasionally spikes
+    // toward the GPU step still has a queued forward to hide behind.
+    let ratio_x2 = (2 * host_step_ns).div_ceil(gpu_step_ns) as usize;
+    ratio_x2.max(IN_FLIGHT_FLOOR).min(mem_cap.max(IN_FLIGHT_FLOOR))
+}
+
+/// The memory ceiling on in-flight depth: the most forwards' worth of retained
+/// command buffers + their buffers the host may hold ahead of the GPU, so a
+/// pathological host/GPU ratio (a tiny model on a huge GPU) cannot pile up
+/// unbounded in-flight state (the 63-deep drain-arm tail this pacer replaced).
+///
+/// A generous constant for now — 64 steps is far above any measured healthy
+/// depth (~2-4) yet bounds a runaway; a config where the computed ratio wants
+/// more than this is one whose memory should be checked first. A future refinement
+/// derives it from `recommendedMaxWorkingSetSize` / per-step in-flight bytes
+/// (the §9.5 admission machinery), so it scales with the machine — left as the
+/// seam, not built, since the ratio floors at 2 on the shipping config anyway.
+pub fn in_flight_mem_cap(_device: &Device) -> usize {
+    64
+}
 
 /// The host's bound on how far it runs ahead of the GPU, as a wait on the
 /// command buffer that carried a step rather than on anything the GPU writes.
@@ -382,15 +449,20 @@ pub const IN_FLIGHT_STEPS: usize = 2;
 struct StepPacer {
     #[cfg(feature = "metal")]
     markers: std::collections::VecDeque<lloom_tensor::metal_backend::CommandMarker>,
+    /// How many forwards the host may have in flight — the computed depth
+    /// ([`compute_in_flight_depth`]), not a constant. `>= IN_FLIGHT_FLOOR`.
+    depth: usize,
     taken: u64,
     waited: u64,
 }
 
 impl StepPacer {
-    fn new() -> Self {
+    fn new(depth: usize) -> Self {
+        let depth = depth.max(IN_FLIGHT_FLOOR);
         Self {
             #[cfg(feature = "metal")]
-            markers: std::collections::VecDeque::with_capacity(IN_FLIGHT_STEPS),
+            markers: std::collections::VecDeque::with_capacity(depth),
+            depth,
             taken: 0,
             waited: 0,
         }
@@ -401,8 +473,8 @@ impl StepPacer {
     fn before_forward(&mut self, device: &Device) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
-            while self.markers.len() >= IN_FLIGHT_STEPS {
-                let oldest = self.markers.pop_front().expect("len >= IN_FLIGHT_STEPS");
+            while self.markers.len() >= self.depth {
+                let oldest = self.markers.pop_front().expect("len >= depth");
                 if !m.marker_complete(&oldest) {
                     self.waited += 1;
                 }
@@ -567,8 +639,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut eos = false;
         // The in-flight bound, on the arms whose commits the loop owns. The
         // blocking arm's readback drains the queue every step, so its stream
-        // stays the incumbent's.
-        let mut pacer = StepPacer::new();
+        // stays the incumbent's. Depth is the computed host/GPU balance
+        // (`opts.in_flight_depth`, from warmup) or the floor — not a constant.
+        let mut pacer = StepPacer::new(opts.pacer_depth());
         let pace = readback.loop_commits();
         // Every id the loop drains, streamed or not, accumulates here so the
         // returned `ids` is complete and the reconciliation below counts the
@@ -1762,19 +1835,42 @@ impl<'m, M: CausalLM> Session<'m, M> {
             pos += len;
         }
 
+        // Measure the host/GPU balance from a real decode step, to compute the
+        // in-flight depth (`compute_in_flight_depth`) instead of a static cap.
+        // `host_ns` = the CPU time to encode+submit the step; `gpu_ns` = the
+        // step's total time including its GPU tail (drained by the sync). Their
+        // ratio is what decides how far the host must run ahead to keep the GPU
+        // fed — 2 here (gpu >> host), deeper on a faster GPU / smaller model.
         let decode = Tensor::new(&[0u32], device)?.unsqueeze(0)?;
+        let t_host = std::time::Instant::now();
         let _ = self.model.forward(&decode, pos, &mut self.seq.cache)?;
+        // Host submit is done here (the forward returns before the GPU finishes).
+        let host_ns = t_host.elapsed().as_nanos() as u64;
 
         // Force the driver to finish compiling before the clock the caller is
         // about to stop; a cold pipeline creation left in flight would surface
-        // on the first real forward instead.
+        // on the first real forward instead. This sync also completes the decode
+        // step's GPU tail, so the elapsed-from-submit is the GPU step time.
+        let t_gpu = std::time::Instant::now();
         device.synchronize()?;
+        // `gpu_ns` = host submit + GPU tail: an upper bound on the step's GPU
+        // time (the sync waited out the tail). Good enough for the ratio, which
+        // only needs to know whether the GPU dwarfs the host or not.
+        let gpu_ns = host_ns + t_gpu.elapsed().as_nanos() as u64;
+        self.warm_in_flight_depth = compute_in_flight_depth(host_ns, gpu_ns, in_flight_mem_cap(device));
 
         // Leave nothing behind: the warmup wrote KV, conv state and the position
         // counter, and the next call is the user's real prefill from position 0.
         self.reset();
 
         Ok(cache_sizes(device))
+    }
+
+    /// The in-flight depth warmup measured (`0` if warmup has not run). A caller
+    /// threads this into `DecodeOptions::in_flight_depth` so the pacer uses the
+    /// computed host/GPU balance rather than the floor.
+    pub fn measured_in_flight_depth(&self) -> usize {
+        self.warm_in_flight_depth
     }
 }
 

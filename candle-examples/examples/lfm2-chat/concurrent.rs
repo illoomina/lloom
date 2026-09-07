@@ -304,6 +304,9 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         budget,
         lookahead,
         sample_split: false,
+        // Auto (floor) here — the concurrent non-spec interleave paces per
+        // visit; the computed depth is the single-decode path's concern.
+        in_flight_depth: 0,
     };
     let capacity = 8 * ctx.max_tokens + 8 * (budget.period() + 2);
 

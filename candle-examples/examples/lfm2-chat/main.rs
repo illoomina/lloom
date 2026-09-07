@@ -33,9 +33,100 @@ use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, Session, VarBuilder}
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 mod concurrent;
+
+/// A pre-allocated, lock-free single-producer/single-consumer ring of token ids —
+/// the seam that moves the terminal write OFF the decode thread.
+///
+/// The decode loop (producer) drains its device ring on the hot thread as before,
+/// then `push`es the ids here — atomic stores only, NO allocation, NO syscall, NO
+/// notify (the notify was what spiked `step_waits` when this was tried as an mpsc
+/// channel: a per-commit futex wake on the hot thread). A separate consumer thread
+/// `pop`s at its own cadence, detokenizes, and writes stdout — so a slow terminal
+/// stalls the CONSUMER, never the decode loop.
+///
+/// Fixed power-of-two capacity, sized once to cover the whole run, so `push` never
+/// finds it full in practice (a full ring means the consumer is wedged on a dead
+/// terminal — then, and only then, `push` spins, which is the correct place for a
+/// sustained-backpressure stall to land). `head`/`tail` are the classic SPSC
+/// cursors: the producer owns `tail`, the consumer owns `head`, and the
+/// release/acquire pair is the happens-before that publishes each slot's write
+/// ahead of the `tail` bump (§9.3's discipline, host-thread to host-thread this
+/// time rather than GPU to host).
+struct TokenSpsc {
+    slots: Box<[std::cell::UnsafeCell<u32>]>,
+    mask: usize,
+    /// Next slot the producer writes; `Release`-published so the consumer that
+    /// observes it sees the slot's write behind it.
+    tail: AtomicUsize,
+    /// Next slot the consumer reads.
+    head: AtomicUsize,
+    /// Producer sets this when the run is over; the consumer drains what remains
+    /// and then exits.
+    closed: AtomicBool,
+}
+
+// SAFETY: single-producer/single-consumer by contract — the producer only ever
+// touches `tail` (+ the slot at `tail`), the consumer only `head` (+ the slot at
+// `head`), and a slot is written by the producer strictly before its `tail`
+// release and read by the consumer strictly after its `tail` acquire, so the two
+// never touch the same slot concurrently. That makes the `UnsafeCell<u32>` sharing
+// sound across the two threads.
+unsafe impl Sync for TokenSpsc {}
+unsafe impl Send for TokenSpsc {}
+
+impl TokenSpsc {
+    /// Capacity is rounded up to a power of two `>= cap.max(1024)` so the mask
+    /// trick applies and a short run still gets a generous buffer.
+    fn new(cap: usize) -> Self {
+        let n = cap.max(1024).next_power_of_two();
+        let slots = (0..n)
+            .map(|_| std::cell::UnsafeCell::new(0u32))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            slots,
+            mask: n - 1,
+            tail: AtomicUsize::new(0),
+            head: AtomicUsize::new(0),
+            closed: AtomicBool::new(0 != 0),
+        }
+    }
+
+    /// Producer: push one id. Returns `false` if the ring is full (the consumer is
+    /// wedged); the caller decides whether to spin or drop. Non-blocking.
+    fn push(&self, id: u32) -> bool {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if tail.wrapping_sub(head) > self.mask {
+            return false; // full
+        }
+        // SAFETY: SPSC — only the producer writes this slot, and the consumer will
+        // not read it until it observes the `Release` store to `tail` below.
+        unsafe {
+            *self.slots[tail & self.mask].get() = id;
+        }
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Consumer: pop one id, or `None` if empty right now.
+    fn pop(&self) -> Option<u32> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head == tail {
+            return None; // empty
+        }
+        // SAFETY: the matching `Release` on `tail` above happens-before this read.
+        let id = unsafe { *self.slots[head & self.mask].get() };
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        Some(id)
+    }
+}
 
 #[derive(Parser)]
 struct Args {
@@ -993,24 +1084,88 @@ fn main() -> Result<()> {
     // this is the point: the drain reads finished work off the ring, it does not
     // wait, so streaming does not re-serialize the non-blocking path.
     use std::io::Write;
-    let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
     let decode_start = std::time::Instant::now();
-    // Wall-clock to the first token the consumer is HANDED (the batch arrives),
-    // and to the first VISIBLE token (a byte reaches stdout). Measurement seam.
+    // Wall-clock to the first token the consumer is HANDED (`first_batch_at`, on
+    // the decode thread when it pushes) and to the first VISIBLE token
+    // (`first_visible_ns`, on the CONSUMER thread when a byte reaches stdout).
+    // Measurement seam; the visible stamp is shared because it is set off-thread.
     let mut first_batch_at: Option<std::time::Duration> = None;
-    let mut first_visible_at: Option<std::time::Duration> = None;
+    let first_visible_ns = Arc::new(AtomicU64::new(0));
+
+    // The output decouple: the decode loop pushes ids into this SPSC (non-blocking,
+    // no syscall on the hot thread) and a separate consumer thread detokenizes and
+    // writes stdout. Sized to cover the whole run so `push` never blocks in
+    // practice. `-n 0` (unbounded) gets a generous 1M-slot ring.
+    let spsc_cap = if opts.max_tokens == 0 {
+        1 << 20
+    } else {
+        opts.max_tokens + 1024
+    };
+    let spsc = Arc::new(TokenSpsc::new(spsc_cap));
+
+    // The consumer thread: pop → detokenize → write stdout. A slow terminal stalls
+    // HERE, never the decode loop. Owns the tokenizer, the `TokenOutputStream` and
+    // the stdout handle for the whole run; parks briefly when the ring is empty
+    // (no notify from the producer — that per-commit futex wake is what spiked
+    // `step_waits` when this was an mpsc channel).
+    let consumer = {
+        let spsc = Arc::clone(&spsc);
+        let first_visible_ns = Arc::clone(&first_visible_ns);
+        std::thread::spawn(move || {
+            let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            loop {
+                match spsc.pop() {
+                    Some(id) => {
+                        if let Ok(Some(text)) = tos.next_token(id) {
+                            first_visible_ns
+                                .compare_exchange(
+                                    0,
+                                    decode_start.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .ok();
+                            // Direct write to the locked stdout; a write that the
+                            // kernel cannot take right now blocks THIS thread only.
+                            let _ = out.write_all(text.as_bytes());
+                            let _ = out.flush();
+                        }
+                    }
+                    None => {
+                        if spsc.closed.load(Ordering::Acquire) {
+                            break;
+                        }
+                        // Nothing right now: yield the core briefly rather than spin
+                        // a poll. ~200 µs is invisible at a terminal cadence and
+                        // costs the producer nothing.
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                }
+            }
+            // The tail the stream still holds (a partial multibyte run), then flush.
+            if let Ok(Some(rest)) = tos.decode_rest() {
+                let _ = out.write_all(rest.as_bytes());
+            }
+            let _ = out.flush();
+        })
+    };
+
     let out = {
+        // The hot-thread callback: push each drained id into the SPSC. Atomic
+        // stores only — no detokenize, no `print!`, no `flush`, no allocation, no
+        // notify. `push` returns false only if the ring is full (a wedged
+        // consumer), in which case spin until it drains — the one place a
+        // sustained-backpressure stall is allowed to land, and unreachable for a
+        // ring sized to the run.
         let mut on_tokens = |batch: &[u32]| -> candle::Result<()> {
             if first_batch_at.is_none() && !batch.is_empty() {
                 first_batch_at = Some(decode_start.elapsed());
             }
             for &id in batch {
-                if let Some(text) = tos.next_token(id)? {
-                    if first_visible_at.is_none() {
-                        first_visible_at = Some(decode_start.elapsed());
-                    }
-                    print!("{text}");
-                    std::io::stdout().flush().ok();
+                while !spsc.push(id) {
+                    std::hint::spin_loop();
                 }
             }
             Ok(())
@@ -1050,10 +1205,14 @@ fn main() -> Result<()> {
         }
     };
     let decode_elapsed = decode_start.elapsed();
-    // The tail the streaming decoder is still holding (a partial multibyte run).
-    if let Some(rest) = tos.decode_rest()? {
-        print!("{rest}");
-    }
+    // Signal the consumer no more ids are coming and wait for it to drain what
+    // remains, print the multibyte tail, and flush.
+    spsc.closed.store(true, Ordering::Release);
+    consumer.join().ok();
+    let first_visible_at = match first_visible_ns.load(Ordering::Relaxed) {
+        0 => None,
+        ns => Some(std::time::Duration::from_nanos(ns)),
+    };
 
     let out_ids = out.ids;
     let n = out_ids.len();

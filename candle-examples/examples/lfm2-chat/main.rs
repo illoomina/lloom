@@ -44,11 +44,13 @@ struct Args {
     #[arg(long)]
     model_dir: Option<PathBuf>,
 
-    /// Safety cap on new tokens; generation runs until the model emits EOS
-    /// (`<|im_end|>` / `<|endoftext|>`) and this is only the ceiling. Default is
-    /// generous so a normal reply — including LFM2.5's `<think>` block — finishes
-    /// on EOS rather than being truncated.
-    #[arg(long, short = 'n', default_value_t = 2048)]
+    /// New-token ceiling. **`0` (the default) means UNBOUNDED** — generation runs
+    /// until the model emits EOS (`<|im_end|>`), with no cap, streaming at any
+    /// length (the token-ring history wraps, so a long reply no longer bails). A
+    /// positive value is a hard cap that stops the run early even before EOS —
+    /// use it to bound a measurement or a runaway. (`--ignore-eos` with the
+    /// default is refused: nothing would ever stop it.)
+    #[arg(long, short = 'n', default_value_t = 0)]
     max_tokens: usize,
 
     /// Sampling temperature. 0 (the default) is greedy / argmax.
@@ -617,6 +619,14 @@ fn main() -> Result<()> {
         }
     }
     if args.ignore_eos {
+        // Contradiction: no EOS AND no token ceiling would never stop. Refuse
+        // rather than spin forever (§2.4 — a bad setting bails, not hangs).
+        if args.max_tokens == 0 {
+            anyhow::bail!(
+                "--ignore-eos with -n 0 (unbounded) would never terminate — pass a positive \
+                 -n to bound the run when EOS is disabled"
+            );
+        }
         eos_ids = vec![u32::MAX];
     }
 
@@ -1406,24 +1416,32 @@ fn decode_with(
     device: &Device,
     on_tokens: &mut dyn FnMut(&[u32]) -> candle::Result<()>,
 ) -> Result<DecodeOut> {
-    // The device-side id history, sized for this generation; `Ring::new` floors
-    // it at a few pages (`RING_HISTORY_FLOOR`), so a short run still gets a
-    // generous ring. It refuses to overflow.
-    let capacity = opts.max_tokens + 1;
+    // The device-side id history, sized EXACTLY from the per-step geometry — a
+    // wrapping ring whose live window is `period × quantum`, NOT the whole
+    // generation, so an unbounded (`-n 0`) run streams at any length by reusing
+    // the ring. B=1 greedy here (IdentityProposer): quantum = 1, so the ring is
+    // tens of slots, always CPU-mapped, zero-copy. (`Geometry::cap` is the tight,
+    // no-margin size; a lap is a loud bail, not silent corruption.)
+    let geometry = lloom::generation::Geometry {
+        batch: 1,
+        max_draft: 0,
+        period: opts.budget.period(),
+        lookahead: opts.lookahead,
+    };
     let out = match readback {
         "blocking" => {
             let mut rb = Blocking::new(eos_ids, device)?;
             session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?
         }
         "ring" => {
-            let mut rb = Ring::new(eos_ids, device, capacity, EosRead::Blocking)?;
+            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::Blocking)?;
             session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?
         }
         "ring-nonblocking" => {
-            let mut rb = Ring::new(
+            let mut rb = Ring::with_geometry(
                 eos_ids,
                 device,
-                capacity,
+                geometry,
                 EosRead::Poll(PollMechanism::default()),
             )?;
             let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
@@ -1447,7 +1465,7 @@ fn decode_with(
             // tokens are truncated from the output. Byte-identical to the poll
             // arm — the truncation lands at the same position the poll would
             // break at.
-            let mut rb = Ring::new(eos_ids, device, capacity, EosRead::HostOnDrain)?;
+            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::HostOnDrain)?;
             let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
             if !rb.poll_is_mapped() {
                 eprintln!(

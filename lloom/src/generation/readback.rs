@@ -284,6 +284,328 @@ pub enum EosRead {
     HostOnDrain,
 }
 
+/// The per-step token production geometry, known BEFORE the run (unlike a KV
+/// length): what sizes a lock-free history whose window never laps the drain.
+///
+/// `quantum = batch × (max_draft + 1)` is the most tokens ONE step/round can
+/// publish — 1 for B=1 greedy, `K+1` for DSpark (`accepted ≤ K` + the target's
+/// bonus, proven at `decode.rs`'s accept loop). The live window the host can be
+/// behind is `period × quantum + batch × lookahead` (drain fires every `period`
+/// steps; lookahead enqueues that many extra forwards). See [`Geometry::cap`].
+#[derive(Clone, Copy, Debug)]
+pub struct Geometry {
+    /// Sequences in the batch (`B`). 1 for the single-sequence chat path.
+    pub batch: usize,
+    /// The speculator's draft-block ceiling (`K`); 0 for greedy.
+    pub max_draft: usize,
+    /// The commit/drain period in steps (`steps:N` → N, `per-token` → 1).
+    pub period: usize,
+    /// Forwards the host may enqueue before learning EOS (0 or 1).
+    pub lookahead: usize,
+}
+
+impl Geometry {
+    /// The most tokens one step/round publishes: `batch × (max_draft + 1)`.
+    pub fn quantum(&self) -> usize {
+        self.batch.max(1) * (self.max_draft + 1)
+    }
+
+    /// The tight history capacity — no safety margin, derived exactly so a wrong
+    /// bound surfaces as the hard lap bail (caught by ASan/fuzz) rather than
+    /// hidden. `window = period × quantum + batch × lookahead`; `cap` rounds that
+    /// up to a whole `quantum` and adds ONE quantum of headroom for the
+    /// write-reset's dead tail (a step that would straddle the wrap resets to the
+    /// start, leaving ≤ `quantum − 1` slots unused). Provable: the loop drains
+    /// every `period` steps and each step adds ≤ `quantum`, so `fed − drained ≤
+    /// window ≤ cap − quantum` always.
+    pub fn cap(&self) -> usize {
+        let q = self.quantum();
+        let window = self.period.max(1) * q + self.batch.max(1) * self.lookahead;
+        // round window up to a multiple of q, then + q for the reset tail.
+        let rounded = window.div_ceil(q) * q;
+        rounded + q
+    }
+}
+
+/// A poison sentinel written into a tile's unused (waste) tail so a read of it
+/// — always a bug, since the drain only takes each tile's real prefix — is loud
+/// rather than a plausible stale token. Only paid in debug/ASan builds (the
+/// release write skips it; the geometry proves the waste is never read). Chosen
+/// as an id no tokenizer emits and one that stands out in a dump.
+#[cfg(debug_assertions)]
+const TILE_POISON: u32 = 0xDEAD_B171; // "DEAD BITs"
+
+/// Slots per segment ceiling: a `StorageModePrivate` buffer is CPU-mapped only
+/// below 16384 B (§15.2 #12a), i.e. < 4096 `U32` slots. Each ring segment stays
+/// under this so the strided drain reads it zero-copy — the property a single
+/// big buffer loses past 4092. 4092 (16368 B) is just inside the line. The ring
+/// grows by adding SEGMENTS, each of this size, rather than one buffer past it.
+const SEG_MAX_SLOTS: usize = 4092;
+
+/// The device-side id history: a **ring of segments** ("lord of the rings").
+/// Owns the tile placement and the lap invariant; the [`Ring`] keeps the publish
+/// protocol (slot-before-stamp ordering, the published clamp).
+///
+/// # Tiles, and why the read needs no scan
+///
+/// Each step writes into a `quantum`-slot **tile**, its real tokens front-packed,
+/// the tail wasted (and poisoned in debug). `quantum = batch × (max_draft+1)` is
+/// the most a step can produce, so a tile always fits and never straddles a
+/// segment boundary (segments are whole-tile multiples). The per-tile real count
+/// is recorded when the tile closes (`tile_counts`), so the drain is a **strided
+/// read with NO scan**: walk live tiles, take each tile's recorded real prefix
+/// through its segment's mapped pointer. At `quantum = 1` (B=1 greedy) every tile
+/// is one slot and this is a dense contiguous read; at `quantum > 1` (batched /
+/// speculative-in-one-forward) it is tile-strided. One path.
+///
+/// # Ring of segments, and why
+///
+/// `segments` is N separate `U32` buffers, each `tiles_per_seg · quantum` slots.
+/// The write walks tiles across the whole ring (`total_tiles = N ·
+/// tiles_per_seg`) and hops to the next segment at a segment boundary — a buffer
+/// switch, not index-wrap arithmetic. **Each segment is small enough to stay
+/// CPU-mapped under the 16384 B `StorageModePrivate` window (§15.2 #12a), so the
+/// read is zero-copy even when the whole ring exceeds that window** — the single
+/// buffer could not (a big-B window > 4092 slots falls off the map). N = 1 is the
+/// degenerate single-buffer case (the B=1 chat path); N > 1 is what lets big-B /
+/// long windows stay mapped. Growth is "add a segment", never a realloc-copy.
+///
+/// # The lock-free invariant
+///
+/// `tiles − drained_tiles ≤ total_tiles − 1`, held by construction: the commit
+/// budget drains every `period` steps and each step is one tile, so the writer
+/// never laps the un-drained reader (`Geometry::cap`). A violation (a future
+/// model whose per-step production the geometry does not bound) is a hard bail,
+/// never a silent overwrite (§3.5).
+struct History {
+    /// N segment buffers, each `tiles_per_seg · quantum` `U32` slots, each
+    /// Private-mapped (small → under the 16384 B window → zero-copy drain). N = 1
+    /// is the single-buffer case.
+    segments: Vec<Tensor>,
+    /// Slots per tile — the write stride and the read stride.
+    quantum: usize,
+    /// Tiles per segment (each segment is `tiles_per_seg · quantum` slots).
+    tiles_per_seg: usize,
+    /// `segments.len() · tiles_per_seg` — the ring's total tile count.
+    total_tiles: usize,
+    /// Total real tokens ever written (monotonic, EOS-retracted).
+    fed: usize,
+    /// Total real tokens ever drained (monotonic). Live window = `[drained, fed)`.
+    drained: usize,
+    /// Total tiles ever CLOSED (monotonic). The open tile (if any) is `tiles %
+    /// total_tiles`; `fed`/`drained` count tokens, `tiles` counts closed tiles.
+    tiles: usize,
+    /// Tiles fully consumed by the drain (monotonic); the drain advances whole
+    /// tiles at a time.
+    drained_tiles: usize,
+    /// Real tokens in each tile, indexed by `tile % total_tiles`, recorded at
+    /// close. What lets the strided read skip each tile's waste with no scan.
+    tile_counts: Vec<u16>,
+    /// Real tokens written into the currently open tile so far, `< quantum`; 0
+    /// when no tile is open (between close and the next `begin_step`).
+    in_tile: usize,
+    /// Whether a tile is currently open (written-to but not yet closed).
+    tile_open: bool,
+}
+
+impl History {
+    /// `cap` slots total across the ring, split into segments that each stay
+    /// under the mapping window. `quantum` slots per tile. N segments emerge from
+    /// how many whole-tile-multiples fit under [`SEG_MAX_SLOTS`].
+    fn new(cap: usize, quantum: usize, device: &Device) -> Result<Self> {
+        let q = quantum.max(1);
+        // Total whole tiles the requested cap holds; at least 2 so one is free
+        // for the writer while the other drains.
+        let total_tiles = (cap / q).max(2);
+        // Tiles per segment: as many as fit under the mapping window, at least 1.
+        // A segment is `tiles_per_seg · quantum` slots and must stay < 4096 slots
+        // (16384 B) to be CPU-mapped (§15.2 #12a) — the property the single big
+        // buffer lost past 4092.
+        let tiles_per_seg = (SEG_MAX_SLOTS / q).max(1);
+        let n_segments = total_tiles.div_ceil(tiles_per_seg).max(1);
+        // Round total_tiles up so every segment is full (uniform geometry).
+        let total_tiles = n_segments * tiles_per_seg;
+        let segments = (0..n_segments)
+            .map(|_| Tensor::zeros(tiles_per_seg * q, DType::U32, device))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            segments,
+            quantum: q,
+            tiles_per_seg,
+            total_tiles,
+            fed: 0,
+            drained: 0,
+            tiles: 0,
+            drained_tiles: 0,
+            tile_counts: vec![0u16; total_tiles],
+            in_tile: 0,
+            tile_open: false,
+        })
+    }
+
+    /// Physical home of a ring-tile index: which segment, and the slot offset of
+    /// its first token within that segment's buffer.
+    fn tile_home(&self, tile: usize) -> (usize, usize) {
+        let t = tile % self.total_tiles;
+        let seg = t / self.tiles_per_seg;
+        let offset = (t % self.tiles_per_seg) * self.quantum;
+        (seg, offset)
+    }
+
+    /// Begin this step's tile and return `(segment, offset)` for its FIRST token.
+    /// Lazily closes the previous step's tile (so `eos_of_last`'s retract could
+    /// still reach it), then checks the lap: the tile about to be reused must be
+    /// drained. Bails rather than overwriting — provably unreachable under the
+    /// known geometry, loud if a future per-step production exceeds `quantum`.
+    fn begin_step(&mut self) -> Result<(usize, usize)> {
+        self.close_open_tile()?;
+        // At most `total_tiles - 1` tiles may be undrained, leaving one to open.
+        let live_tiles = self.tiles - self.drained_tiles;
+        if live_tiles >= self.total_tiles {
+            lloom_tensor::bail!(
+                "Ring history lap: {live_tiles} live tiles ≥ {} — the drain fell behind the \
+                 geometry bound (period). This cannot happen under the known per-step geometry \
+                 (quantum {}); a per-step production larger than one tile needs the \
+                 unbounded-geometry fallback, not this ring.",
+                self.total_tiles,
+                self.quantum
+            );
+        }
+        self.in_tile = 0;
+        self.tile_open = true;
+        Ok(self.tile_home(self.tiles))
+    }
+
+    /// Record one real token just written into the open tile: advance `fed` and
+    /// the in-tile count.
+    fn wrote_one(&mut self) {
+        debug_assert!(self.tile_open && self.in_tile < self.quantum);
+        self.fed += 1;
+        self.in_tile += 1;
+    }
+
+    /// The `(segment, offset)` for the NEXT token within the open tile (a
+    /// multi-token, quantum>1 step: call `wrote_one` after each write). Used by
+    /// the quantum>1 fuzz test today; the batched (#694) writer's seam in prod.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn next_slot(&self) -> (usize, usize) {
+        let (seg, base) = self.tile_home(self.tiles);
+        (seg, base + self.in_tile)
+    }
+
+    /// Retract the last real token from the open tile (an EOS the loop excludes).
+    /// Valid between `wrote_one` and the next `begin_step`, where the retracting
+    /// arms call it (`eos_of_last`, right after the write).
+    fn retract_one(&mut self) {
+        if self.tile_open && self.in_tile > 0 {
+            self.in_tile -= 1;
+            self.fed -= 1;
+        }
+    }
+
+    /// Close the open tile if any: record its real count (`tile_counts`), poison
+    /// the waste tail in debug so a stray read is loud, and advance `tiles`.
+    /// Called lazily by the next `begin_step` and eagerly by the final drain.
+    fn close_open_tile(&mut self) -> Result<()> {
+        if !self.tile_open {
+            return Ok(());
+        }
+        self.tile_open = false;
+        if self.in_tile == 0 {
+            // The step's only token was an EOS, retracted — nothing to count, the
+            // tile stays available for reuse.
+            return Ok(());
+        }
+        let slot = self.tiles % self.total_tiles;
+        self.tile_counts[slot] = self.in_tile as u16;
+        #[cfg(debug_assertions)]
+        if self.in_tile < self.quantum {
+            let (seg, base) = self.tile_home(self.tiles);
+            let waste = self.quantum - self.in_tile;
+            let poison = Tensor::full(TILE_POISON, waste, self.segments[seg].device())?;
+            self.segments[seg].slice_set(&poison, 0, base + self.in_tile)?;
+        }
+        self.tiles += 1;
+        Ok(())
+    }
+
+    /// The generation ordinal = `fed` (one per published real token,
+    /// EOS-retracted). Matches the device stamp the drain clamps to.
+    fn generation(&self) -> usize {
+        self.fed
+    }
+
+    /// Undrained real tokens: the live window `[drained, fed)`.
+    fn undrained(&self) -> usize {
+        self.fed - self.drained
+    }
+
+    /// Forget the undrained window without reading it (the HostOnDrain arm's
+    /// overrun past an EOS): advance the drain cursors to `fed`, closing the open
+    /// tile, so a later run's first drain starts fresh. Returns the count
+    /// forgotten. No device read — the tokens are simply abandoned.
+    fn forget_undrained(&mut self) -> usize {
+        let n = self.fed - self.drained;
+        if self.tile_open {
+            if self.in_tile > 0 {
+                self.tile_counts[self.tiles % self.total_tiles] = self.in_tile as u16;
+                self.tiles += 1;
+            }
+            self.tile_open = false;
+            self.in_tile = 0;
+        }
+        self.drained = self.fed;
+        self.drained_tiles = self.tiles;
+        n
+    }
+
+    /// Drain real tokens `[drained, end)` (end already clamped to the published
+    /// generation and to `fed`), returning them in order and advancing the drain
+    /// cursors. `read(seg, slot) -> u32` reads one physical slot of one segment
+    /// (the caller supplies the mapped-pointer reader or the copy fallback).
+    ///
+    /// **The strided read, no scan**: walk whole tiles from `drained_tiles`,
+    /// reading each tile's recorded real count (`tile_counts`) from its segment,
+    /// skipping the waste tail. The layout is computed (`tile_home`), never
+    /// searched. At `quantum == 1` each tile is one slot and this is a dense
+    /// contiguous read; at `quantum > 1` it is the tile-strided read across
+    /// segments. One path — the quantum unifies them.
+    ///
+    /// `end` is a real-token index (typically `fed` clamped to the published
+    /// generation). The drain reads whole CLOSED tiles only — the open tile's
+    /// tokens are in `fed` but not yet in `tile_counts`, so the read stops at the
+    /// last closed tile and never past it. It also stops as soon as the next
+    /// whole tile would exceed `end` (the published clamp lands on a tile
+    /// boundary here because a tile == a step and the stamp is per step), so a
+    /// partially-visible tile is left for the next drain.
+    fn drain_upto<F: FnMut(usize, usize) -> u32>(
+        &mut self,
+        end: usize,
+        mut read: F,
+    ) -> Result<Vec<u32>> {
+        if end <= self.drained {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        // Advance whole closed tiles while the tile fits within `end` and there
+        // is a closed tile to read.
+        while self.drained_tiles < self.tiles {
+            let slot = self.drained_tiles % self.total_tiles;
+            let count = self.tile_counts[slot] as usize;
+            if self.drained + count > end {
+                break; // this tile is not fully visible yet; leave it.
+            }
+            let (seg, base) = self.tile_home(self.drained_tiles);
+            for j in 0..count {
+                out.push(read(seg, base + j));
+            }
+            self.drained += count;
+            self.drained_tiles += 1;
+        }
+        Ok(out)
+    }
+}
+
 /// The device-resident arms: the token never comes to the host, the next
 /// forward reads the ring's own slot, and the ids accumulate device-side.
 pub struct Ring {
@@ -291,13 +613,8 @@ pub struct Ring {
     eos: EosRead,
     /// Poll iterations before the non-blocking read gives up on a step.
     poll_budget: u64,
-    /// The device-side ids, `[capacity]` `U32`.
-    history: Tensor,
-    capacity: usize,
-    /// Tokens written into `history` so far, EOS retracted.
-    fed: usize,
-    /// Where the next `take_ids` starts reading.
-    cursor: usize,
+    /// The device-side id history (the wrapping ring behind the swap seam).
+    history: History,
     /// The ordinal stamped on the last publish; 0 before any.
     generation: u32,
     /// The EOS id set, host-side, for the [`EosRead::HostOnDrain`] compare.
@@ -328,10 +645,12 @@ pub const POLL_BUDGET: u64 = 50_000_000;
 /// unmeasured, and staying inside the Private mapping window keeps the write on
 /// the same footing as every other decode buffer.
 ///
-/// A generation longer than this many tokens is a real limit today —
-/// `sample_and_feed` bails rather than wrapping — and the fix when it matters is
-/// a genuine ring (wrap the write index, track a consumer lag) or a re-alloc,
-/// not a bigger flat buffer. Left as a bounded slot count for now, loudly.
+/// The raw ctor floors a caller's requested slot count here so a small explicit
+/// value still gets a generous window. The history is a **ring of segments** now
+/// (each ≤ [`SEG_MAX_SLOTS`]); a run longer than the ring reuses it (the drain
+/// recycles whole tiles), and a big window that exceeds one segment grows by
+/// adding segments — so this is a floor on the window, not a ceiling on the
+/// generation. [`Self::with_geometry`] sizes it exactly instead.
 pub const RING_HISTORY_SLOTS: usize = 4092;
 
 impl Ring {
@@ -339,21 +658,43 @@ impl Ring {
     /// call it serves; exceeding it is an error rather than a silent drop. The
     /// allocation is floored at [`RING_HISTORY_FLOOR`], so a caller that asks for
     /// less still gets a generous buffer.
+    /// Construct from an explicit slot count (the raw primitive). The history is
+    /// a wrapping ring of `capacity` slots; the write-reset keeps each step
+    /// contiguous and the drain recycles slots, so `capacity` need only cover the
+    /// live window (`period × quantum`), NOT the whole generation — an unbounded
+    /// run reuses the ring. Floored at [`RING_HISTORY_SLOTS`] so a small explicit
+    /// value still gives a wide mapped window; `quantum` defaults to 1 (the
+    /// greedy step), overridden by [`Self::with_geometry`]. Prefer
+    /// [`Self::with_geometry`], which sizes the ring exactly from the run's own
+    /// per-step geometry.
     pub fn new(eos_ids: &[u32], device: &Device, capacity: usize, eos: EosRead) -> Result<Self> {
+        Self::with_cap_and_quantum(eos_ids, device, capacity.max(RING_HISTORY_SLOTS), 1, eos)
+    }
+
+    /// Construct sized EXACTLY from the per-step geometry (the ergonomic ctor).
+    /// `cap = Geometry::cap()` — tight, no margin — so the ring is as small as
+    /// correctness allows (tens to low hundreds of slots), always Private-mapped,
+    /// and an unbounded-until-EOS run streams zero-copy at any length. The lap is
+    /// provably impossible (the budget drains before the writer wraps); a
+    /// violation bails loudly rather than corrupting.
+    pub fn with_geometry(
+        eos_ids: &[u32],
+        device: &Device,
+        geometry: Geometry,
+        eos: EosRead,
+    ) -> Result<Self> {
+        Self::with_cap_and_quantum(eos_ids, device, geometry.cap(), geometry.quantum(), eos)
+    }
+
+    fn with_cap_and_quantum(
+        eos_ids: &[u32],
+        device: &Device,
+        cap: usize,
+        quantum: usize,
+        eos: EosRead,
+    ) -> Result<Self> {
         let ring = TokenRing::new(0, eos_ids, device)?;
-        // Sized to hold the whole generation, but at least a wide mapped window
-        // and — for the zero-copy drain — ideally within [`RING_HISTORY_SLOTS`]
-        // so a Private allocation stays CPU-mapped. `Tensor::zeros` uses the
-        // default (Private on macOS) pool; below the mapping limit its
-        // `contents()` is non-null and `take_ids` reads it through a pointer with
-        // no copy. Above the limit (a > `RING_HISTORY_SLOTS`-token run) the pool
-        // hands back an unmapped buffer and `take_ids` falls back to a `to_vec1`
-        // snapshot, which is correct if slower — the honest degradation, not a
-        // silent one. Kept Private rather than forced Shared: the per-token
-        // `slice_set` write stays on the same footing as every other decode
-        // buffer, whose Shared-vs-Private write cost is unmeasured.
-        let capacity = capacity.max(RING_HISTORY_SLOTS);
-        let history = Tensor::zeros(capacity, DType::U32, device)?;
+        let history = History::new(cap, quantum, device)?;
         // Cache the EOS ids host-side only for the arm that compares them there;
         // the other arms read the device flag and never touch this.
         let eos_ids_host = if matches!(eos, EosRead::HostOnDrain) {
@@ -365,9 +706,6 @@ impl Ring {
             ring,
             eos,
             history,
-            capacity,
-            fed: 0,
-            cursor: 0,
             generation: 0,
             eos_ids_host,
             poll_budget: POLL_BUDGET,
@@ -440,30 +778,31 @@ impl ReadbackStrategy for Ring {
         sampler: &mut LogitsProcessor,
         logits: &Tensor,
     ) -> Result<Tensor> {
-        if self.fed >= self.capacity {
-            lloom_tensor::bail!(
-                "Ring: history capacity {} exhausted; size the ring for the whole generation",
-                self.capacity
-            );
-        }
         let sampled = sampler.sample_argmax_on_device(logits)?;
         self.counters.ring_publishes += 1;
+        // Begin this step's tile (one token per step on this arm → quantum=1 →
+        // each tile is one slot, so this is a dense write; the tile machinery is
+        // identity at quantum=1). `begin_step` lazily closes the previous tile —
+        // after `eos_of_last` had its chance to retract — and bails rather than
+        // overwriting un-drained data (provably unreachable under the geometry).
+        let (seg, offset) = self.history.begin_step()?;
 
         // Order matters, and it is the streaming protocol. The history slot is
         // written FIRST, then the stamp — so a host that observes the generation
-        // counter at `>= N` has, in queue order, `history[N-1]` written behind
-        // it. `publish_step` already documents its own three writes as
-        // "input, eos, stamp, stamp last"; the history write joins that ordering
-        // *ahead* of the stamp, which is what lets the zero-copy `take_ids` read
-        // `history[cursor..fed]` through the mapped pointer once the counter says
-        // those steps landed — without a `to_vec1` sync. Writing the history
-        // AFTER the stamp (the previous order) would let the counter run ahead of
-        // the slot and the drain read an unwritten slot (§9.3's ordering, applied
-        // to a second buffer).
+        // counter at `>= N` has, in queue order, the slot written behind it.
+        // `publish_step` documents its own writes as "input, eos, stamp, stamp
+        // last"; the history write joins that ordering *ahead* of the stamp,
+        // which lets the zero-copy `take_ids` read the tile through the mapped
+        // pointer once the counter says those steps landed — without a `to_vec1`
+        // sync. Writing the history AFTER the stamp would let the counter run
+        // ahead of the slot and the drain read an unwritten slot (§9.3's
+        // ordering, applied to a second buffer).
         self.generation += 1;
-        // Into the history at its own index, before the host knows whether it is
-        // EOS; `eos_of_last` retracts by moving the cursor back.
-        self.history.slice_set(&sampled.reshape(1)?, 0, self.fed)?;
+        // Into this step's tile (segment `seg`, `offset`), before the host knows
+        // whether it is EOS; `eos_of_last` retracts by stepping the tile cursor
+        // back. `begin_step` guaranteed the tile begins a contiguous run within
+        // one segment, so no step ever straddles a segment boundary.
+        self.history.segments[seg].slice_set(&sampled.reshape(1)?, 0, offset)?;
         match self.eos {
             EosRead::Poll(_) => self.ring.publish_step(&sampled, Some(self.generation))?,
             EosRead::Blocking => self.ring.publish(&sampled)?,
@@ -473,7 +812,11 @@ impl ReadbackStrategy for Ring {
                 .ring
                 .publish_input_and_stamp(&sampled, self.generation)?,
         }
-        self.fed += 1;
+        self.history.wrote_one();
+        // The tile is left OPEN; `eos_of_last` may retract this token, and the
+        // next `begin_step` (or the final drain) closes it. A batched writer
+        // (quantum>1) would loop `next_slot`+`wrote_one` per accepted token
+        // within the one tile, then let the next step close it.
         Ok(self.ring.input().clone())
     }
 
@@ -538,104 +881,97 @@ impl ReadbackStrategy for Ring {
         };
         if is_eos {
             self.counters.ring_eos_publishes += 1;
-            self.fed -= 1;
+            // Retract the EOS token from the still-open tile (the loop never
+            // streams it). The tile closes on the next `begin_step`.
+            self.history.retract_one();
         }
         Ok(is_eos)
     }
 
     fn take_ids(&mut self) -> Result<Vec<u32>> {
-        if self.cursor == self.fed {
+        if self.history.undrained() == 0 {
             return Ok(Vec::new());
         }
-        let start = self.cursor;
 
-        // How far it is SAFE to drain. On the stamped (poll) arm the loop may be
-        // ahead of the GPU (that is the lookahead), so `fed` counts slots the
-        // host has *enqueued* — not all of them are written yet. The published
-        // generation is the visibility signal (`published_generation` reads the
-        // GPU-written counter, which `sample_and_feed` writes AFTER the history
-        // slot): a value `g` means `history[0..g]` are written, so draining past
-        // it would read an unwritten slot as the buffer's init value — silent
-        // corruption (§3.5). Clamp to it. On the blocking arm there is no stamp,
-        // but its own per-step EOS `to_vec1` already synchronised up to `fed`, so
-        // every enqueued slot is visible and the full range is safe.
+        // How far it is SAFE to drain (real-token index). On the stamped (poll)
+        // arm the loop may be ahead of the GPU (the lookahead), so `fed` counts
+        // slots the host *enqueued* — not all written yet. The published
+        // generation is the visibility signal (`sample_and_feed` writes the slot
+        // BEFORE the stamp): `g` means real tokens `[0..g]` are written, so
+        // draining past it reads an unwritten slot (§3.5). Clamp to it. The
+        // blocking arm's own per-step `to_vec1` already synchronised up to `fed`.
+        let fed = self.history.generation();
         let end = match self.eos {
-            // Both stamped arms ride the same visibility signal: drain only up to
-            // the GPU-published generation, never past it. On `HostOnDrain` `fed`
-            // is never decremented (EOS is not retracted per token — the loop
-            // truncates the batch to the EOS position instead), so this returns
-            // every published id and the loop's own scan decides where to stop.
             EosRead::Poll(_) | EosRead::HostOnDrain => match self.ring.published_generation() {
-                // `g` counts published steps; each retracted EOS decremented
-                // `fed` but not the counter, so clamp both ways.
-                Some(g) => self.fed.min(g as usize),
-                // Unmapped counter (no visibility signal): fall back to the
-                // synchronising snapshot below, which is correct by force.
+                Some(g) => fed.min(g as usize),
+                // Unmapped counter (no visibility signal): the copy fallback below
+                // is correct by force (it synchronises), so drain to `fed` there.
                 None => 0,
             },
-            EosRead::Blocking => self.fed,
+            EosRead::Blocking => fed,
         };
 
-        // Fast path: read `[start..end]` straight from the mapped buffer — no copy
-        // of the whole history and, crucially, **no blit and no GPU drain**
-        // (`peek_scalar_ptr` "reaches nothing that waits on or orders against the
-        // GPU"). This is what keeps streaming non-blocking: called once per
-        // commit, it must not become a `waitUntilCompleted` per commit, which a
-        // `to_vec1` is (§15.2 #12 forbids that blit on the decode path). `end`
-        // bounds it to published slots; `read_volatile` because the GPU may still
-        // be writing *later* slots into the same buffer.
+        // Fast path: read straight from each segment's mapped buffer — no copy,
+        // no blit, no GPU drain (`peek_scalar_ptr` reaches nothing that waits on
+        // the GPU). Called once per commit, it must not become a
+        // `waitUntilCompleted` (§15.2 #12). The strided tile walk is in
+        // `drain_upto`; here we just supply the per-segment base pointers.
+        // `read_volatile` because the GPU may still be writing later slots.
         //
-        // SAFETY: `peek_scalar_ptr(start)` returns a pointer valid for
-        // `[start, count)` (it checks `start < count`); `history` is written in
-        // place and never reallocated for this ring's lifetime, so the mapping
-        // stays valid; `end <= fed <= capacity = count`, so every read is in
-        // bounds.
+        // SAFETY: `peek_scalar_ptr(0)` returns a base pointer valid for each
+        // segment's whole buffer; segments are written in place and never
+        // reallocated for this ring's lifetime, so the mappings stay valid; every
+        // (seg, slot) `drain_upto` reads is in bounds. All segments map or none
+        // (same size, same pool), so the all-`Some` check gates the fast path.
         #[cfg(feature = "metal")]
-        if end > start {
-            if let Some(base) = unsafe { self.history.peek_scalar_ptr::<u32>(start) } {
-                let n = end - start;
-                let mut ids = Vec::with_capacity(n);
-                for i in 0..n {
-                    ids.push(unsafe { base.add(i).read_volatile() });
-                }
-                self.cursor = end;
-                return Ok(ids);
+        if end > self.history.drained {
+            let bases: Option<Vec<*const u32>> = self
+                .history
+                .segments
+                .iter()
+                .map(|s| unsafe { s.peek_scalar_ptr::<u32>(0) })
+                .collect();
+            if let Some(bases) = bases {
+                return self
+                    .history
+                    .drain_upto(end, |seg, slot| unsafe { bases[seg].add(slot).read_volatile() });
             }
         }
-        // Off Metal there is no mapped pointer to peek; the snapshot below is
-        // the only path (`peek_scalar_ptr` is `cfg(feature = "metal")`).
         #[cfg(not(feature = "metal"))]
         let _ = end;
 
-        // Snapshot / fallback path. Taken when: the counter is unmapped (`end`
-        // forced to 0 above), or the history buffer itself is not CPU-mapped (a
-        // > `RING_HISTORY_SLOTS`-token run whose Private allocation exceeds the
-        // 16 KiB window). A `to_vec1` of the live prefix synchronises up to `fed`
-        // and is correct if a copy — the honest degradation. It is also the path
-        // the one-shot final drain and the digest gate take, where a contiguous
-        // `Vec` is the actual need. Drains the FULL `[start..fed]` because the
-        // `to_vec1` made all of it visible.
-        let n = self.fed - start;
-        let all = self.history.narrow(0, start, n)?.to_vec1::<u32>()?;
-        self.cursor = self.fed;
-        Ok(all)
+        // Copy fallback: a segment is not CPU-mapped (or the counter was unmapped,
+        // `end` forced to 0). A `to_vec1` of each segment synchronises and is
+        // correct if a copy — the honest degradation. Drains to `fed`.
+        let snapshots = self
+            .history
+            .segments
+            .iter()
+            .map(|s| s.to_vec1::<u32>())
+            .collect::<Result<Vec<_>>>()?;
+        self.history
+            .drain_upto(fed, |seg, slot| snapshots[seg][slot])
     }
 
     fn drain_all(&mut self) -> Result<Vec<u32>> {
-        if self.cursor == self.fed {
+        if self.history.undrained() == 0 {
             return Ok(Vec::new());
         }
-        // The final drain: completeness over non-blocking. `to_vec1` over the
-        // live `[cursor..fed]` **synchronises** up to the last enqueued slot,
-        // which is exactly what the poll arm needs here — it cannot otherwise
-        // know the tail landed, and its incremental `take_ids` deliberately
-        // refuses to read past the published counter. One `narrow` + `to_vec1`
-        // is the honest cost of learning the whole tail once, after the clock.
-        let start = self.cursor;
-        let n = self.fed - start;
-        let ids = self.history.narrow(0, start, n)?.to_vec1::<u32>()?;
-        self.cursor = self.fed;
-        Ok(ids)
+        // The final drain: completeness over non-blocking. Close the open tile
+        // first (the last step's tile is not yet counted), then `to_vec1` over each
+        // segment **synchronises** up to the last enqueued slot — what the poll arm
+        // needs here, since its incremental `take_ids` refuses to read past the
+        // published counter. Drains everything to `fed`.
+        self.history.close_open_tile()?;
+        let fed = self.history.generation();
+        let snapshots = self
+            .history
+            .segments
+            .iter()
+            .map(|s| s.to_vec1::<u32>())
+            .collect::<Result<Vec<_>>>()?;
+        self.history
+            .drain_upto(fed, |seg, slot| snapshots[seg][slot])
     }
 
     /// The host EOS check for [`EosRead::HostOnDrain`]: the index of the first
@@ -657,9 +993,8 @@ impl ReadbackStrategy for Ring {
         // The undrained slots are overrun the loop enqueued before it could
         // stop: forget them, so the next run's first drain starts at the next
         // publish rather than returning them as its tokens.
-        let undrained = self.fed - self.cursor;
+        let undrained = self.history.forget_undrained();
         self.counters.ring_discarded += (dropped_in_batch + undrained) as u64;
-        self.cursor = self.fed;
     }
 
     fn eos_read_arm(&self) -> &'static str {
@@ -785,4 +1120,158 @@ mod tests {
         assert!(CommitBudget::per_token().due(1));
         assert!(!CommitBudget::per_token().due(0));
     }
+
+    // ---- History: the ring-of-rings, driven directly (no Metal) -------------
+    //
+    // These exercise the tile placement, the segment hop, the write-reset
+    // (implicit: tiles never straddle), the strided read, and the lap invariant
+    // at quantum>1 — the path the GPU pipeline cannot reach until a batched
+    // (#694) writer exists. A CPU `Device` backs the buffers, so this runs
+    // anywhere, fast, under ASan/Miri. The oracle: whatever real tokens were
+    // written-and-kept must come back from the drain in order, with no waste and
+    // no overwrite.
+
+    /// A tiny deterministic PRNG (SplitMix64), so the fuzz is reproducible and
+    /// needs no `rand` dep. `Math.random`/`Date` are irrelevant here — a fixed
+    /// seed sweeps the space and any failure reproduces exactly.
+    struct SmallRng(u64);
+    impl SmallRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn upto(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Write `n` real tokens into the open tile of a `quantum>1` step, using the
+    /// `next_slot`/`wrote_one` seam a batched writer would — the test's stand-in
+    /// for that writer.
+    fn write_tile(h: &mut History, ids: &[u32]) {
+        for &id in ids {
+            let (seg, slot) = h.next_slot();
+            let one = Tensor::new(&[id], h.segments[seg].device()).unwrap();
+            h.segments[seg].slice_set(&one, 0, slot).unwrap();
+            h.wrote_one();
+        }
+    }
+
+    /// Drain via the copy path (the deviceless equivalent of the mapped read).
+    /// Closes the open tile first, so the test sees ALL kept tokens (the prod
+    /// incremental `take_ids` deliberately leaves the open tile for the next
+    /// drain; the final `drain_all` closes it — this mirrors `drain_all`).
+    fn drain(h: &mut History) -> Vec<u32> {
+        h.close_open_tile().unwrap();
+        let fed = h.generation();
+        let snapshots: Vec<Vec<u32>> =
+            h.segments.iter().map(|s| s.to_vec1::<u32>().unwrap()).collect();
+        h.drain_upto(fed, |seg, slot| snapshots[seg][slot]).unwrap()
+    }
+
+    #[test]
+    fn history_quantum1_is_a_dense_ring() {
+        // The B=1 degenerate case: quantum=1, each step one token; the drain must
+        // return exactly what was fed, and the ring must reuse slots (a run far
+        // longer than the ring does not lap because we drain each step).
+        let dev = Device::Cpu;
+        let mut h = History::new(8, 1, &dev).unwrap();
+        let mut expect = Vec::new();
+        for i in 0..100u32 {
+            h.begin_step().unwrap();
+            write_tile(&mut h, &[i]);
+            expect.push(i);
+            let got = drain(&mut h);
+            assert_eq!(got, &expect[expect.len() - got.len()..]);
+        }
+        // Everything drained, in order.
+        assert_eq!(h.undrained(), 0);
+    }
+
+    #[test]
+    fn history_quantum_gt1_strided_read_skips_waste() {
+        // A quantum=4 ring: each step writes 1..4 real tokens (the rest of the
+        // tile is waste). The drain must return ONLY the real tokens, in order,
+        // never a waste slot — the strided read's whole job. Drains every few
+        // steps so the ring wraps across its segments repeatedly.
+        let dev = Device::Cpu;
+        let quantum = 4;
+        // Small ring so it wraps often; SEG_MAX_SLOTS makes each segment large,
+        // so force several segments by asking for many tiles.
+        let mut h = History::new(quantum * 6, quantum, &dev).unwrap();
+        let mut rng = SmallRng(0xC0FF_EE00_1234_5678);
+        let mut expect = Vec::new();
+        let mut got_all = Vec::new();
+        let mut next_id = 1u32;
+        for step in 0..2000 {
+            h.begin_step().unwrap();
+            let n = 1 + rng.upto(quantum); // 1..=quantum real tokens
+            let ids: Vec<u32> = (0..n).map(|_| { let x = next_id; next_id += 1; x }).collect();
+            write_tile(&mut h, &ids);
+            expect.extend_from_slice(&ids);
+            // Drain on a varying cadence, but always before the window could lap
+            // (leave room: drain whenever we have >= a couple tiles live).
+            if step % 3 == 2 {
+                got_all.extend(drain(&mut h));
+            }
+        }
+        got_all.extend(drain(&mut h));
+        // Every real token, in order, no waste (waste is never 0-valued here:
+        // ids start at 1, and poison in debug would show as 0xDEADB171).
+        assert_eq!(got_all, expect, "strided read must return exactly the real tokens");
+        assert!(!got_all.contains(&TILE_POISON_TEST), "a poison/ waste slot leaked into the drain");
+    }
+
+    #[test]
+    fn history_lap_bails_not_corrupts() {
+        // If the writer opens more tiles than the ring holds without draining,
+        // the lap guard must BAIL (loud), never overwrite live data. `begin_step`
+        // lazily closes the previous tile, so the lap fires once enough tiles are
+        // CLOSED to leave no free tile; keep opening (never draining) and assert
+        // it bails before it could ever overwrite — and within a bounded number
+        // of steps (never silently accepts an unbounded backlog).
+        let dev = Device::Cpu;
+        let quantum = 2;
+        let mut h = History::new(quantum * 3, quantum, &dev).unwrap();
+        let n_tiles = h.total_tiles;
+        let mut bailed = false;
+        for i in 0..n_tiles + 2 {
+            match h.begin_step() {
+                Ok(_) => write_tile(&mut h, &[i as u32 + 1]),
+                Err(_) => {
+                    bailed = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            bailed,
+            "opening past the live-tile bound must bail within the ring's size, not overwrite"
+        );
+    }
+
+    #[test]
+    fn history_retract_drops_the_eos_token() {
+        // A tile whose last (only) token is retracted (an EOS) must not appear in
+        // the drain, and its tile must be reusable (not counted).
+        let dev = Device::Cpu;
+        let mut h = History::new(8, 1, &dev).unwrap();
+        h.begin_step().unwrap();
+        write_tile(&mut h, &[42]);
+        h.retract_one(); // 42 was an EOS
+        // Next step's token is the real one.
+        h.begin_step().unwrap();
+        write_tile(&mut h, &[7]);
+        let got = drain(&mut h);
+        assert_eq!(got, vec![7], "the retracted EOS must not be drained");
+    }
+
+    // The poison constant is debug-only; give the test a stable name for it.
+    #[cfg(debug_assertions)]
+    const TILE_POISON_TEST: u32 = TILE_POISON;
+    #[cfg(not(debug_assertions))]
+    const TILE_POISON_TEST: u32 = 0xDEAD_B171;
 }

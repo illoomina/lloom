@@ -83,7 +83,11 @@ impl Speculator for IdentityProposer {
 /// The knobs of one decode run.
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeOptions {
-    /// Tokens to produce at most; EOS may stop the run earlier.
+    /// Tokens to produce at most; EOS may stop the run earlier. **`0` means
+    /// UNBOUNDED** — run until EOS with no ceiling (the token-ring history wraps,
+    /// so an unbounded run streams at any length). A positive value is a hard
+    /// cap. Use [`Self::reached`]/[`Self::unbounded`] rather than comparing
+    /// directly, so the `0`-is-unbounded convention is honoured everywhere.
     pub max_tokens: usize,
     /// How often the loop commits and prunes the in-flight queue.
     pub budget: CommitBudget,
@@ -115,6 +119,29 @@ pub struct RoundStats {
 }
 
 impl DecodeOptions {
+    /// Whether the run has no token ceiling (`max_tokens == 0`) — it stops only
+    /// on EOS. See [`Self::max_tokens`].
+    pub fn unbounded(&self) -> bool {
+        self.max_tokens == 0
+    }
+
+    /// Whether `produced` tokens have reached the cap. Always `false` when
+    /// [`Self::unbounded`] (the `0`-is-unbounded convention), so the loops run
+    /// until EOS. Use this instead of `produced >= max_tokens`.
+    pub fn reached(&self, produced: usize) -> bool {
+        self.max_tokens != 0 && produced >= self.max_tokens
+    }
+
+    /// The remaining token budget from `produced`, or `usize::MAX` when
+    /// unbounded (for `min`-style clamps that want "no limit").
+    pub fn remaining(&self, produced: usize) -> usize {
+        if self.max_tokens == 0 {
+            usize::MAX
+        } else {
+            self.max_tokens.saturating_sub(produced)
+        }
+    }
+
     /// Greedy defaults: `max_tokens`, per-token commit, no lookahead, no split.
     pub fn new(max_tokens: usize) -> Self {
         Self {
@@ -531,7 +558,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut all_ids: Vec<u32> = Vec::with_capacity(opts.max_tokens);
 
         loop {
-            if produced >= opts.max_tokens {
+            if opts.reached(produced) {
                 break;
             }
             stats.steps += 1;
@@ -948,7 +975,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // The model wanted to stop immediately (an empty reply). Nothing is
             // produced and the run ends before any round.
             eos = true;
-        } else if produced < opts.max_tokens {
+        } else if !opts.reached(produced) {
             on_tokens(std::slice::from_ref(&anchor_tok))?;
             all_ids.push(anchor_tok);
             produced += 1;
@@ -958,7 +985,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // by the accepted length each round (`lfm2-dspark-verify`'s `index_pos`).
         let mut since_commit = 0usize;
 
-        while !eos && produced < opts.max_tokens {
+        while !eos && !opts.reached(produced) {
             stats.steps += 1;
             let step_start = std::time::Instant::now();
 
@@ -1016,7 +1043,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     eos = true;
                     break;
                 }
-                if produced + batch.len() >= opts.max_tokens {
+                if opts.reached(produced + batch.len()) {
                     break;
                 }
                 batch.push(id);
@@ -1209,12 +1236,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
             lane.anchor_tok = anchor_tok;
             if eos_ids.contains(&anchor_tok) {
                 lane.eos = true;
-            } else if lane.produced < opts.max_tokens {
+            } else if !opts.reached(lane.produced) {
                 on_tokens(i, std::slice::from_ref(&anchor_tok))?;
                 lane.all_ids.push(anchor_tok);
                 lane.produced += 1;
             }
-            lane.done = lane.eos || lane.produced >= opts.max_tokens;
+            lane.done = lane.eos || opts.reached(lane.produced);
         }
         drop(logits);
 
@@ -1274,7 +1301,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         lane.eos = true;
                         break;
                     }
-                    if lane.produced + batch.len() >= opts.max_tokens {
+                    if opts.reached(lane.produced + batch.len()) {
                         break;
                     }
                     batch.push(id);
@@ -1287,7 +1314,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 lane.stats.step_ns.push(
                     (run_start.elapsed().as_nanos() as u64).saturating_sub(lane.round_start_ns),
                 );
-                lane.done = lane.eos || lane.produced >= opts.max_tokens;
+                lane.done = lane.eos || opts.reached(lane.produced);
                 if !lane.done {
                     Self::pipeline_enqueue(s, lane, spec, i, run_start)?;
                 }

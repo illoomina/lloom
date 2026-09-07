@@ -11,7 +11,8 @@ pub mod readback;
 pub mod token_ring;
 
 pub use readback::{
-    Blocking, CommitBudget, EosRead, ReadbackArms, ReadbackCounters, ReadbackStrategy, Ring,
+    Blocking, CommitBudget, EosRead, Geometry, ReadbackArms, ReadbackCounters, ReadbackStrategy,
+    Ring,
 };
 
 #[derive(Clone, PartialEq, Debug)]

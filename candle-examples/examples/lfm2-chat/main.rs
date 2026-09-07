@@ -226,10 +226,31 @@ struct Args {
     #[arg(long, default_value = "single")]
     mode: String,
 
-    /// Sequences to run under `--mode concurrent` (at most 4). The prompts are a
-    /// varied predefined set (varied so the run exercises prefill).
+    /// Sequences to run under `--mode concurrent`. The prompts are a varied
+    /// predefined set of eight (varied so the run exercises prefill), cycled
+    /// past eight.
     #[arg(long, default_value_t = 2)]
     sequences: usize,
+
+    /// Under `--mode concurrent`: drive the sequences through the batched-forward
+    /// driver (`Session::decode_batched`, #694) — one `m = B` forward per step
+    /// for every live sequence, the weight sweep paid once per step — against
+    /// each prompt run solo on the selected readback arm. The batched arm takes
+    /// `--lookahead` (0: read the ids back before the next forward; 1: feed the
+    /// device ids and read back while the next step runs).
+    #[arg(long)]
+    batched: bool,
+
+    /// Under `--batched`: skip the neighbour-independence arm (the rows re-run
+    /// as two separately batched halves, each row asserted equal to its
+    /// full-batch stream). On by default; off for a timing-only rotation.
+    #[arg(long)]
+    no_independence_check: bool,
+
+    /// Under `--batched`: skip the solo arm — a tile A/B at a large `B` wants
+    /// only the batched step; the identity columns read `false`.
+    #[arg(long)]
+    skip_solo: bool,
 
     /// Tokens per visit under `--mode concurrent` (non-speculative interleave).
     #[arg(long, default_value_t = 16)]
@@ -653,6 +674,13 @@ fn main() -> Result<()> {
     // `config`, `device` and `eos_ids` — for `--dspark` the config was already
     // forced rewindable+taps above, so the built model is correct for the mode.
     if args.mode != "single" {
+        if args.batched && args.dspark {
+            anyhow::bail!(
+                "--batched drives the K=1 batched-forward body; a batched verify is not built \
+                 (design/docs/speculative-pipeline-scheduler-design.md §4b). Pick one of \
+                 --batched / --dspark"
+            );
+        }
         if args.replay || args.arena {
             anyhow::bail!(
                 "--replay/--arena are single-turn arms; they do not compose with --mode {} \
@@ -681,7 +709,12 @@ fn main() -> Result<()> {
             sequences: args.sequences,
             chunk: args.chunk,
             dspark: args.dspark,
-            dspark_setup: dspark_setup.as_ref().map(|s| (s.draft_dir.clone(), s.dcfg.clone())),
+            batched: args.batched,
+            check_independence: !args.no_independence_check,
+            skip_solo: args.skip_solo,
+            dspark_setup: dspark_setup
+                .as_ref()
+                .map(|s| (s.draft_dir.clone(), s.dcfg.clone())),
             first: &args.first,
             timeline: args.timeline.clone(),
             encode: &encode,
@@ -999,12 +1032,18 @@ fn main() -> Result<()> {
             .join(" "),
         prompt_ids.len(),
     );
-    for (name, census) in [("prefill", &st.prefill_census), ("step 0", &st.step0_census)] {
+    for (name, census) in [
+        ("prefill", &st.prefill_census),
+        ("step 0", &st.step0_census),
+    ] {
         if census.is_empty() {
             continue;
         }
         let total: u64 = census.iter().map(|(_, n)| n).sum();
-        eprintln!("[{name} census: {total} dispatches, {} kernels]", census.len());
+        eprintln!(
+            "[{name} census: {total} dispatches, {} kernels]",
+            census.len()
+        );
         for (label, n) in census {
             eprintln!("    {n:>6}  {label}");
         }

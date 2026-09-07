@@ -8,7 +8,8 @@
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
 use crate::nn::ops::{FlashScratchSizing, KvQuant};
 use crate::nn::{
-    CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, Speculative, VarBuilder,
+    BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, Row,
+    Speculative, VarBuilder,
 };
 use crate::utils::repeat_kv;
 use lloom_macros::Config as ConfigDerive;
@@ -2471,7 +2472,10 @@ fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Ten
 fn gemv_residual_applies(enabled: bool, x: &Tensor, proj: &Linear, residual: &Tensor) -> bool {
     enabled
         && x.device().is_metal()
-        && matches!(x.dims(), [_, 1, _] | [1, _])
+        // One row only: the fused op is a GEMV, and a `[B, 1, k]` input would
+        // dispatch it `B` times over the weight where the batched step reads
+        // the weight once through the `m = B` GEMM (§13.5).
+        && matches!(x.dims(), [1, 1, _] | [1, _])
         && x.dims().last() == Some(&proj.weight().dims()[1])
         && proj.bias().is_none()
         // `Linear::forward` reshapes a contiguous input and broadcasts a
@@ -2536,7 +2540,9 @@ impl Mlp {
         self.gemv_silu
             && x.device().is_metal()
             && x.dims().last() == Some(&self.gate_proj.weight().dims()[1])
-            && matches!(x.dims(), [_, 1, _] | [1, _])
+            // One row only, for `gemv_residual_applies`'s reason: at `B > 1`
+            // the fused GEMV would sweep `w1` once per row.
+            && matches!(x.dims(), [1, 1, _] | [1, _])
             && self.gate_proj.bias().is_none()
             // See `gemv_residual_applies`: the fused op serves the contiguous
             // layout `Linear::forward` reshapes, not the broadcast one.
@@ -2773,6 +2779,25 @@ impl Attention {
         self.forward(x, index_pos, block_idx, cache)? + residual
     }
 
+    /// [`Self::forward_add`] for one step of `rows.len()` independent
+    /// sequences (`BatchedCausalLM`): the projections run once over
+    /// `[B, 1, hidden]`, each row attends against its own cache. The residual
+    /// arm is decided as `forward_add` decides it, so a one-row batch is that
+    /// path exactly.
+    fn forward_rows_add(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [Row<'_, Cache>],
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let y = self.attend_rows(x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &y, &self.o_proj, residual) {
+            return crate::nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+        }
+        self.o_proj.forward(&y)? + residual
+    }
+
     /// Everything up to but excluding `out_proj`, so the two entry points
     /// above share one body and cannot drift in what they compute.
     fn attend(
@@ -2783,6 +2808,47 @@ impl Attention {
         cache: &mut Cache,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
+        let (b_sz, seq_len, _) = x.dims3()?;
+        let (q, k, v) = self.project(x)?;
+        let y = self.attend_projected(&q, &k, v, index_pos, block_idx, cache)?;
+        y.transpose(1, 2)?
+            .reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))
+    }
+
+    /// `attend` over independent rows: one set of projections for the batch,
+    /// then row `r` attends at `rows[r].pos` against `rows[r].cache` through
+    /// the same kernels, shapes and strides it would see as a batch of one —
+    /// `q`, `k` and `v` are narrowed per row, and a row of a contiguous
+    /// `[B, heads, 1, head_dim]` is itself a contiguous `[1, heads, 1, head_dim]`.
+    fn attend_rows(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [Row<'_, Cache>],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let (b_sz, seq_len, _) = x.dims3()?;
+        let (q, k, v) = self.project(x)?;
+        let mut ys = Vec::with_capacity(rows.len());
+        for (r, row) in rows.iter_mut().enumerate() {
+            ys.push(self.attend_projected(
+                &q.narrow(0, r, 1)?,
+                &k.narrow(0, r, 1)?,
+                v.narrow(0, r, 1)?,
+                row.pos,
+                block_idx,
+                row.cache,
+            )?);
+        }
+        let y = Tensor::cat(&ys, 0)?;
+        y.transpose(1, 2)?
+            .reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))
+    }
+
+    /// The three projections and the per-head QK norms: `x [b, seq, hidden]`
+    /// to `(q, k, v)` in `[b, heads, seq, head_dim]`, `q`/`k` normed and not
+    /// yet rotated, `v` contiguous.
+    fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
         let q = self.q_proj.forward(x)?;
@@ -2804,10 +2870,27 @@ impl Attention {
         // Apply per-head QK normalization
         let q = self.q_norm.forward(&q.contiguous()?)?;
         let k = self.k_norm.forward(&k.contiguous()?)?;
+        Ok((q, k, v))
+    }
+
+    /// RoPE, the KV append and the attention kernel against one cache: `q`
+    /// and `k` normed and unrotated, `v` contiguous, all
+    /// `[b, heads, seq, head_dim]`; returns `[b, heads, seq, head_dim]`,
+    /// un-transposed.
+    fn attend_projected(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        let (b_sz, _, seq_len, _) = q.dims4()?;
 
         // Apply rotary embeddings
-        let q = self.apply_rotary_emb(&q, index_pos, cache)?;
-        let k = self.apply_rotary_emb(&k, index_pos, cache)?;
+        let q = self.apply_rotary_emb(q, index_pos, cache)?;
+        let k = self.apply_rotary_emb(k, index_pos, cache)?;
 
         // The quantized arm (issue #218, `DESIGN.md` §10.7).
         //
@@ -2841,11 +2924,7 @@ impl Attention {
                     1.0,
                     cache.kv_quant,
                 )?;
-                return y.transpose(1, 2)?.reshape((
-                    b_sz,
-                    seq_len,
-                    self.num_attention_heads * self.head_dim,
-                ));
+                return Ok(y);
             }
         }
 
@@ -3110,8 +3189,7 @@ impl Attention {
             att.matmul(&v.contiguous()?)?.to_dtype(in_dtype)?
         };
 
-        y.transpose(1, 2)?
-            .reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))
+        Ok(y)
     }
 }
 
@@ -3494,14 +3572,56 @@ impl ShortConv {
         self.forward(x, block_idx, cache)? + residual
     }
 
+    /// [`Self::forward_add`] for one step of `rows.len()` independent
+    /// sequences (`BatchedCausalLM`): `in_proj` runs once over
+    /// `[B, 1, hidden]`, each row convolves against its own state. The
+    /// residual arm is decided as `forward_add` decides it.
+    fn forward_rows_add(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [Row<'_, Cache>],
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let conv_out = self.convolve_rows(x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
+            return crate::nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+        }
+        self.out_proj.forward(&conv_out)? + residual
+    }
+
     /// Everything up to but excluding `out_proj`, so the two entry points
     /// above share one body and cannot drift in what they compute.
     fn convolve(&self, x: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
         let _enter = self.span.enter();
-        let (b_sz, seq_len, _) = x.dims3()?;
-
         // Project input to B, C, X components
         let bcx = self.in_proj.forward(x)?.transpose(1, 2)?;
+        self.convolve_bcx(&bcx, block_idx, cache)
+    }
+
+    /// `convolve` over independent rows: one `in_proj` for the batch, then
+    /// row `r` takes the whole conv block against `rows[r].cache`. A row of
+    /// the projected `[B, 3·hidden, 1]` has the strides a batch of one has, so
+    /// every arm below sees the layout it was written for.
+    fn convolve_rows(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [Row<'_, Cache>],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let bcx = self.in_proj.forward(x)?.transpose(1, 2)?;
+        let mut outs = Vec::with_capacity(rows.len());
+        for (r, row) in rows.iter_mut().enumerate() {
+            outs.push(self.convolve_bcx(&bcx.narrow(0, r, 1)?, block_idx, row.cache)?);
+        }
+        Tensor::cat(&outs, 0)
+    }
+
+    /// The conv block after `in_proj`: `bcx` is `[b, 3·hidden, seq]` and the
+    /// result `[b, seq, hidden]` with the `*C` gate applied.
+    fn convolve_bcx(&self, bcx: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
+        let (b_sz, _, seq_len) = bcx.dims3()?;
         let b = bcx.narrow(1, 0, self.hidden_size)?;
         let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
         let x_proj = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
@@ -3956,6 +4076,27 @@ impl DecoderLayer {
         let x = self.post_attention_layernorm.forward(&x)?;
         self.mlp.forward_add(&x, residual)
     }
+
+    /// [`Self::forward`] for one step of `rows.len()` independent sequences:
+    /// the norms, the MLP and every projection run once over `[B, 1, hidden]`;
+    /// the attention or conv block runs per row against that row's cache.
+    fn forward_rows(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [Row<'_, Cache>],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let residual = x;
+        let x = self.input_layernorm.forward(x)?;
+        let x = match &self.kind {
+            LayerKind::Attention(attn) => attn.forward_rows_add(&x, block_idx, rows, residual)?,
+            LayerKind::ShortConv(conv) => conv.forward_rows_add(&x, block_idx, rows, residual)?,
+        };
+        let residual = &x;
+        let x = self.post_attention_layernorm.forward(&x)?;
+        self.mlp.forward_add(&x, residual)
+    }
 }
 
 /// LFM2 model for causal language modeling.
@@ -4095,6 +4236,72 @@ impl Model {
 
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let hidden_states = hidden_states.i((.., seq_len - 1, ..))?.contiguous()?;
+        let logits = self.lm_head.forward(&hidden_states)?;
+        logits.to_dtype(DType::F32)
+    }
+
+    /// One decode step for `rows.len()` independent sequences
+    /// (`BatchedCausalLM`, issue #694): `input_ids` is `[B, 1]`, row `i` is fed
+    /// to `rows[i]` at `rows[i].pos`, and the result is `[B, vocab]`.
+    ///
+    /// Every weight matrix — the projections, the MLP, `lm_head` — is applied
+    /// to all `B` rows in one `m = B` GEMM, so the 5.394 GB weight sweep is
+    /// paid once for the batch rather than once per token (§13.5). What is
+    /// per sequence — RoPE at the row's position, the KV append and the
+    /// attention read, the conv window — runs per row against that row's own
+    /// cache through the same kernels a `forward` of that token would take, so
+    /// a row's result does not depend on which rows sit beside it
+    /// (§2.3.3 #7). The rows may have any lengths.
+    ///
+    /// The step is `seq_len == 1` only; a prompt is prefilled through
+    /// [`Self::forward`] per sequence. Refused: a cache that taps (the taps are
+    /// per pass and a batched pass would have to split them) and one with an
+    /// open speculative window.
+    pub fn forward_rows(&self, input_ids: &Tensor, rows: &mut [Row<'_, Cache>]) -> Result<Tensor> {
+        let (b_sz, seq_len) = input_ids.dims2()?;
+        if seq_len != 1 {
+            lloom_tensor::bail!(
+                "lfm2 forward_rows: one token per row, got seq_len {seq_len}; prefill each \
+                 sequence through `forward`"
+            )
+        }
+        if b_sz != rows.len() {
+            lloom_tensor::bail!(
+                "lfm2 forward_rows: {b_sz} token rows for {} caches",
+                rows.len()
+            )
+        }
+        if rows.is_empty() {
+            lloom_tensor::bail!("lfm2 forward_rows: no rows")
+        }
+        for (r, row) in rows.iter_mut().enumerate() {
+            if !row.cache.tap_layers.is_empty() {
+                lloom_tensor::bail!(
+                    "lfm2 forward_rows: row {r}'s cache taps layers {:?}; a batched step does \
+                     not tap",
+                    row.cache.tap_layers
+                )
+            }
+            if row.cache.speculative {
+                lloom_tensor::bail!(
+                    "lfm2 forward_rows: row {r}'s cache has an open speculative window"
+                )
+            }
+            // Per row, as `forward` does per pass: the ring's write slot and
+            // the paged pool's pass marker are the row's own.
+            self.advance_conv_phase(1, row.cache);
+            Self::begin_taps(row.cache);
+        }
+
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        let device = rows[0].cache.device.clone();
+        for (block_idx, layer) in self.layers.iter().enumerate() {
+            mark_graph_node(&device, block_idx);
+            hidden_states = layer.forward_rows(&hidden_states, block_idx, rows)?;
+        }
+
+        let hidden_states = self.embedding_norm.forward(&hidden_states)?;
+        let hidden_states = hidden_states.i((.., 0, ..))?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
         logits.to_dtype(DType::F32)
     }
@@ -4712,6 +4919,12 @@ impl CausalLM for Model {
         // or the tied `[vocab, hidden]` embedding), so its leading dim is the
         // vocabulary. 2D by construction, so `dims()[0]` cannot be absent.
         self.lm_head.weight().dims()[0]
+    }
+}
+
+impl BatchedCausalLM for Model {
+    fn forward_rows(&self, tokens: &Tensor, rows: &mut [Row<'_, Self::Cache>]) -> Result<Tensor> {
+        Model::forward_rows(self, tokens, rows)
     }
 }
 

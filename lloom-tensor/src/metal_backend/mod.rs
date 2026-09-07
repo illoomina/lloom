@@ -2157,6 +2157,49 @@ impl MetalStorage {
         }
     }
 
+    /// The batched EOS-index reduction: over the first `n` `U32` token ids in this
+    /// storage, return a `[1]` `U32` storage whose element is the FIRST index whose
+    /// token is one of `eos_ids`' `n_eos` stop ids, or `n` if none. One dispatch
+    /// (the `eos_index` kernel), device-resident result — the `GpuBatched` EOS
+    /// arm's primitive. Both operands must be contiguous `U32`.
+    pub fn eos_index(
+        &self,
+        tokens_offset: usize,
+        n: usize,
+        eos_ids: &Self,
+        eos_offset: usize,
+        n_eos: usize,
+    ) -> Result<Self> {
+        if self.dtype != DType::U32 || eos_ids.dtype != DType::U32 {
+            crate::bail!(
+                "eos_index expects U32 tokens and U32 eos_ids, got {:?}/{:?}",
+                self.dtype,
+                eos_ids.dtype
+            );
+        }
+        let device = self.device().clone();
+        let buffer = device
+            .new_buffer_builder()
+            .with_size_for(1, DType::U32)
+            .with_label("eos_index")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        crate::kernels::call_eos_index(
+            &device.device,
+            &encoder,
+            &device.kernels,
+            self.buffer(),
+            tokens_offset,
+            n,
+            eos_ids.buffer(),
+            eos_offset,
+            n_eos,
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+        Ok(Self::new(buffer, device.clone(), 1, DType::U32))
+    }
+
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }
@@ -2449,6 +2492,40 @@ impl MetalStorage {
         // SAFETY: `src` is non-null and `index < self.count`, so the offset is
         // within the extent this storage was created with.
         Some(unsafe { (src as *const T).add(index) })
+    }
+
+    /// The write counterpart of [`Self::peek_scalar_ptr`]: copy `src` into this
+    /// buffer at element offset `index`, host-side, through the CPU-mapped
+    /// contents pointer — **no intermediate `Tensor`, no `newBufferWithBytes`
+    /// alloc, no blit**. Mirrors the read path's contract: it resolves an address
+    /// and `memcpy`s; it reaches nothing that waits on or orders against the GPU,
+    /// so the caller owns the ordering (as the ring's slot writes already do).
+    ///
+    /// Returns `false` if the buffer is not CPU-mapped (`contents()` null — a
+    /// `StorageModePrivate` allocation past the 16384 B window, §15.2 #12a) or the
+    /// write would run past the extent; the caller then takes the `slice_set`
+    /// upload fallback. `false` is a signal, not a panic.
+    ///
+    /// SAFETY: the caller guarantees `src` is valid for `src.len()` elements and
+    /// that no GPU work is concurrently reading `[index, index+len)` of this
+    /// buffer (the same discipline the mapped read relies on: writes happen while
+    /// the slot is not in flight).
+    pub(crate) unsafe fn write_host_slice<T: Copy>(&self, index: usize, src: &[T]) -> bool {
+        if index.saturating_add(src.len()) > self.count {
+            return false;
+        }
+        let dst = std::hint::black_box(self.buffer.contents());
+        if dst.is_null() {
+            return false;
+        }
+        // SAFETY: `dst` is non-null; `index + src.len() <= self.count`, so the
+        // destination range is within the buffer's extent; `src` is valid for
+        // `src.len()` per the caller's contract; the ranges do not overlap (src is
+        // host memory, dst is the mapped buffer).
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), (dst as *mut T).add(index), src.len());
+        }
+        true
     }
 
     pub(crate) fn to_cpu<T: Clone>(&self) -> Result<Vec<T>> {
@@ -3823,5 +3900,74 @@ impl MetalStorage {
         )
         .map_err(MetalError::from)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_host_slice_tests {
+    //! The zero-alloc host→device write (`Tensor::write_host_slice`) — the write
+    //! counterpart of `peek_scalar_ptr`, used to land a host token feed (a prompt
+    //! chunk, a drafted block) in a reused device buffer with no per-feed `Tensor`
+    //! allocation. Read-back is via `peek_scalar_ptr`: that is the SAME
+    //! mapped-contents path the GPU sees, and the only honest reflection of the
+    //! write. (`to_vec1` waits on the queue first, which for a freshly-allocated
+    //! buffer with a pending fill would run that fill and clobber a raw host write
+    //! — a real ordering fact, discharged by the caller writing a buffer with no
+    //! GPU op in flight, not something the primitive papers over.)
+    use crate::{Device, Tensor};
+
+    #[test]
+    fn round_trips_a_host_slice_through_the_mapped_pointer() {
+        let Ok(dev) = Device::new_metal(0) else {
+            eprintln!("no Metal device; skipping write_host_slice round-trip");
+            return;
+        };
+        // A `[1, N]` U32 buffer, small enough to be CPU-mapped (§15.2 #12a) — the
+        // shape and mapping the ring's input buffer has. `from_vec` gives it real
+        // contents to overwrite; no pending fill races the host write here.
+        let n = 8usize;
+        let scratch = Tensor::from_vec(vec![0u32; n], (1, n), &dev).unwrap();
+
+        // Write a chunk at offset 0 and read it back through the mapped pointer
+        // (what the forward's on-device read observes).
+        let chunk: Vec<u32> = (100..108).collect();
+        assert!(
+            unsafe { scratch.write_host_slice::<u32>(0, &chunk) },
+            "mapped write must succeed on a small (mapped) buffer"
+        );
+        let flat = scratch.reshape(n).unwrap();
+        for (i, &want) in chunk.iter().enumerate() {
+            let got = unsafe { flat.peek_scalar_ptr::<u32>(i) }.map(|p| unsafe { *p });
+            assert_eq!(got, Some(want), "slot {i} diverged after write");
+        }
+
+        // Overwrite the prefix with a narrower chunk (the next step reuses the
+        // same buffer, no realloc). The new prefix must read back; slots past it
+        // keep the old value (never read — the consumer narrows to the width).
+        let chunk_b: Vec<u32> = (200..203).collect();
+        assert!(unsafe { scratch.write_host_slice::<u32>(0, &chunk_b) });
+        for (i, &want) in chunk_b.iter().enumerate() {
+            let got = unsafe { flat.peek_scalar_ptr::<u32>(i) }.map(|p| unsafe { *p });
+            assert_eq!(got, Some(want), "slot {i} diverged after overwrite");
+        }
+    }
+
+    #[test]
+    fn writing_past_the_extent_or_wrong_dtype_signals_false_not_panic() {
+        let Ok(dev) = Device::new_metal(0) else {
+            return;
+        };
+        let scratch = Tensor::from_vec(vec![0u32; 4], (1, 4), &dev).unwrap();
+        // Slots [2,5) of a 4-slot buffer — past the extent. Must decline (false),
+        // leaving the caller its upload fallback, not panic or corrupt.
+        assert!(
+            !unsafe { scratch.write_host_slice::<u32>(2, &[1u32, 2, 3]) },
+            "an over-extent write must return false"
+        );
+        // A dtype mismatch (u8 into a u32 buffer) must also decline.
+        assert!(
+            !unsafe { scratch.write_host_slice::<u8>(0, &[1u8, 2]) },
+            "a dtype-mismatched write must return false"
+        );
     }
 }

@@ -56,6 +56,11 @@ pub const CAST: &str = with_utils!(
     include_str!("metal_src/cast.metal")
 );
 pub const CONV: &str = include_str!("metal_src/conv.metal");
+/// The batched EOS-index reduction (the `GpuBatched` EOS arm): one dispatch per
+/// commit window returns the first stop-token index or `n`. Self-contained (its
+/// own `#include`, an inlined threadgroup min-reduction), so NOT a `with_utils!`
+/// consumer and a translation unit of its own.
+pub const EOS_INDEX: &str = include_str!("metal_src/eos_index.metal");
 pub const FILL: &str = include_str!("metal_src/fill.metal");
 pub const FLASH_DECODING: &str = include_str!("metal_src/attention/flash_decoding.metal");
 pub const INDEXING: &str = with_utils!(
@@ -189,6 +194,8 @@ pub const MERGED_NON_MLX: &str = concat!(
     "\n",
     include_str!("metal_src/conv.metal"),
     "\n",
+    include_str!("metal_src/eos_index.metal"),
+    "\n",
     include_str!("metal_src/fill.metal"),
     "\n",
     include_str!("metal_src/attention/flash_decoding.metal"),
@@ -229,6 +236,7 @@ pub const MERGED_MEMBERS: &[Source] = &[
     Source::Binary,
     Source::Cast,
     Source::Conv,
+    Source::EosIndex,
     Source::Fill,
     Source::FlashDecoding,
     Source::Gemv,
@@ -252,6 +260,9 @@ pub enum Source {
     Binary,
     Cast,
     Conv,
+    /// The batched EOS-index reduction (the `GpuBatched` EOS arm, issue: the
+    /// per-token flag train's replacement). Its own translation unit.
+    EosIndex,
     Fill,
     /// FlashDecoding: attention split over independent contiguous KV chunks,
     /// with an index-ordered combine (`DESIGN.md` §10.4, §17 Phase 5 item 16,

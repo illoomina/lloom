@@ -307,6 +307,9 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         // Auto (floor) here — the concurrent non-spec interleave paces per
         // visit; the computed depth is the single-decode path's concern.
         in_flight_depth: 0,
+        // One-shot prefill: the concurrent interleave is not the streamed-prefill
+        // path (that is the single-decode CLI's dial).
+        prefill_ubatch: 0,
     };
     let capacity = 8 * ctx.max_tokens + 8 * (budget.period() + 2);
 

@@ -82,17 +82,25 @@ fn logits_peaked_at(at: usize, device: &Device) -> Result<Tensor> {
 /// loop does between one `forward` and the next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
-    /// Sample an ordinary (non-EOS) token and publish it.
+    /// Sample an ordinary (non-EOS) token and publish it (device-side write).
     PublishToken { id: u16 },
     /// Sample one of the EOS ids and publish it. Kept as its own symbol rather
     /// than left to chance: an EOS drawn uniformly from a 512-wide vocabulary
     /// would essentially never appear, and the accounting identity #520 broke
     /// is *about* EOS.
     PublishEos { which: u8 },
+    /// Stage a HOST chunk of `len` tokens into the input ring (the streamed-prefill
+    /// path — `stage_prompt` / a mapped host write). This is the op that exercises
+    /// the input ring's multi-token staging, tile cycling, and the in-flight-tile
+    /// discipline that a single-token publish alone does not. `len` is clamped to
+    /// the ring's tile width.
+    StageChunk { seed: u16, len: u8 },
     /// Read the flag, the way the loop's poll does.
     ReadFlag,
-    /// Read the input slot -- what the next `forward` would consume.
-    ReadInput,
+    /// Read the CURRENT input tile through the MAPPED pointer -- the same zero-copy
+    /// access the GPU forward makes -- and check it against the per-tile oracle,
+    /// including that no poison leaked (a wrong-tile or over-width read).
+    ReadInput { width: u8 },
     /// End the turn and begin the next one, as `lfm2-release` does on an EOS
     /// with turns remaining. **The operation the bool could not count.**
     NextTurn,
@@ -109,6 +117,17 @@ struct Model {
     input: Option<u32>,
     /// Whether the last published token was an EOS id.
     eos: bool,
+    /// **The per-tile oracle.** What each input tile currently holds, front-packed:
+    /// `tiles[t] = Some(chunk)` means the last write into tile `t` staged `chunk`
+    /// (its slots beyond `chunk.len()` still hold poison); `None` means never
+    /// written (all poison). Length = the ring's tile count. The cursor mirrors the
+    /// ring's `slot`: every write advances it, and a read checks `tiles[cursor]`.
+    /// This is the state a single-`input: Option<u32>` model cannot represent, and
+    /// it is what catches a read returning a WRONG tile (the in-flight race the
+    /// `depth + 1` ring exists to prevent) or a stale/over-width slot.
+    tiles: Vec<Option<Vec<u32>>>,
+    /// The current tile — mirrors `TokenRing::current_input_slot`.
+    cursor: usize,
     /// Tokens published this turn.
     published_this_turn: u64,
     /// Tokens published across all turns.
@@ -128,6 +147,8 @@ struct Model {
 pub struct Engagement {
     pub publishes: u64,
     pub eos_publishes: u64,
+    /// Host chunks staged into the input ring (the streamed-prefill path).
+    pub stages: u64,
     pub flag_reads: u64,
     pub input_reads: u64,
     pub turns: u64,
@@ -143,14 +164,55 @@ pub struct Engagement {
     pub max_eos_in_a_run: u64,
 }
 
+/// A sentinel no real token equals (the EOS ids are < 125000, ordinary tokens are
+/// clamped to `VOCAB`), so a read that returns it came from a never-staged slot.
+const INPUT_POISON: u32 = 0xDEAD_1701;
+/// The input tile width the fuzz's ring uses (a chunk holds up to this many tokens).
+const TILE_WIDTH: usize = 8;
+/// The input ring's tile count (`depth + 1`) — > 1 so the cursor actually cycles
+/// and the in-flight-tile paths are reachable (a single tile could never race).
+const INPUT_TILES: usize = 4;
+
 /// Run one generated sequence against the real ring and its model.
 pub fn run_sequence(device: &Device, ops: &[Op]) -> std::result::Result<Engagement, String> {
-    let ring = TokenRing::new(0, EOS, device).map_err(|e| format!("TokenRing::new: {e}"))?;
+    // A MULTI-TILE input ring (width `TILE_WIDTH`, `INPUT_TILES` tiles) so the
+    // cursor cycles and the in-flight-tile discipline is exercised — the single
+    // `[1,1]` ring `TokenRing::new` builds could not reach those states.
+    let mut ring = TokenRing::with_input_ring(0, EOS, device, TILE_WIDTH, INPUT_TILES)
+        .map_err(|e| format!("TokenRing::with_input_ring: {e}"))?;
+    // Realize the segments' construction-time zero-fill BEFORE poisoning: the
+    // `SegmentedRing` allocates with `Tensor::zeros`, whose blit-fill is queued;
+    // a host `poison_input` write followed by a later sync would run that fill AND
+    // CLOBBER the poison. Sync here so the zeros land first, then poison overwrites
+    // them for good. (Production never hits this: the history drain reads only
+    // published slots, never the unwritten fill.)
+    device
+        .synchronize()
+        .map_err(|e| format!("sync after ring construction: {e}"))?;
+    // Poison every input slot, so any read of a never-staged slot (wrong tile, or
+    // past a chunk's width) comes back as the loud sentinel, not a plausible stale
+    // token. The seed (0) the constructor wrote into tile 0 slot 0 is overwritten
+    // by this poison — the oracle starts every tile `None`.
+    ring.poison_input(INPUT_POISON)
+        .map_err(|e| format!("poison_input: {e}"))?;
+    // The ring's ACTUAL tile count — `SegmentedRing` rounds `total_tiles` up to
+    // fill whole segments, so it is not `INPUT_TILES` but `tiles_per_seg` (many).
+    // Mirror the real value or the cursor arithmetic drifts.
+    let n_tiles = ring.input_slot_count();
     let mut model = Model::default();
+    model.tiles = vec![None; n_tiles];
+    model.cursor = 0; // the constructor seeded tile 0; poison then reset it to None
     let mut eng = Engagement::default();
     model.turns = 1;
     eng.turns = 1;
     let mut eos_this_turn = false;
+
+    // Every input write advances the cursor first (the ring's `next_slot`), then
+    // records `chunk` into the new current tile. Mirrors `TokenRing`'s write path.
+    let advance_and_record = |model: &mut Model, chunk: Vec<u32>| {
+        model.cursor = (model.cursor + 1) % n_tiles;
+        model.tiles[model.cursor] = Some(chunk);
+    };
 
     for (i, op) in ops.iter().enumerate() {
         let at = |what: String| format!("after op {i} ({op:?}): {what}");
@@ -167,6 +229,9 @@ pub fn run_sequence(device: &Device, ops: &[Op]) -> std::result::Result<Engageme
                     .map_err(|e| at(format!("argmax: {e}")))?;
                 ring.publish(&sampled)
                     .map_err(|e| at(format!("publish: {e}")))?;
+                // A publish is a 1-token device write; it advances the cursor and
+                // records the single token as that tile's contents.
+                advance_and_record(&mut model, vec![token as u32]);
                 model.input = Some(token as u32);
                 model.eos = false;
                 model.published += 1;
@@ -182,6 +247,7 @@ pub fn run_sequence(device: &Device, ops: &[Op]) -> std::result::Result<Engageme
                 let sampled = Tensor::new(id, device).map_err(|e| at(format!("{e}")))?;
                 ring.publish(&sampled)
                     .map_err(|e| at(format!("publish: {e}")))?;
+                advance_and_record(&mut model, vec![id]);
                 model.input = Some(id);
                 model.eos = true;
                 model.published += 1;
@@ -190,6 +256,22 @@ pub fn run_sequence(device: &Device, ops: &[Op]) -> std::result::Result<Engageme
                 eng.publishes += 1;
                 eng.eos_publishes += 1;
                 eos_this_turn = true;
+            }
+            Op::StageChunk { seed, len } => {
+                // A host chunk of 1..=TILE_WIDTH distinct tokens, staged into a
+                // fresh tile (the streamed-prefill input path). Distinct values so
+                // a wrong-tile or shifted read is caught by content, not just poison.
+                let n = (*len as usize % TILE_WIDTH) + 1;
+                let chunk: Vec<u32> = (0..n)
+                    .map(|k| ((*seed as usize + k) % (VOCAB - 8) + 4) as u32)
+                    .collect();
+                ring.stage_prompt(&chunk)
+                    .map_err(|e| at(format!("stage_prompt: {e}")))?;
+                advance_and_record(&mut model, chunk);
+                // A stage does not touch the EOS flag or the publish accounting —
+                // it is input only. `model.input`/`eos` describe the last PUBLISH,
+                // unchanged here.
+                eng.stages += 1;
             }
             Op::ReadFlag => {
                 let flag = ring
@@ -209,22 +291,64 @@ pub fn run_sequence(device: &Device, ops: &[Op]) -> std::result::Result<Engageme
                     )));
                 }
             }
-            Op::ReadInput => {
-                let got = ring
-                    .input()
-                    .to_vec2::<u32>()
-                    .map_err(|e| at(format!("reading the input slot: {e}")))?;
+            Op::ReadInput { width } => {
+                let w = (*width as usize % TILE_WIDTH) + 1;
                 eng.input_reads += 1;
-                let got = got[0][0];
-                // Before the first publish the slot holds the constructor's
-                // `first_input`, which the loop never reads (`main.rs:637` --
-                // "the slot's contents before the first `publish` are never
-                // read"). Modelled as such rather than asserted against.
-                let want = model.input.unwrap_or(0);
-                if got != want {
+                // A host `StageChunk` write lands in the mapped view immediately, but
+                // a device `publish` write is queue-ordered (the GPU runs it later);
+                // in production the FORWARD reads the tile after the publish, both on
+                // the queue, so it is ordered — but this test's HOST peek would race
+                // it. Sync first so the mapped read reflects both write kinds; the
+                // fuzz is a correctness test, not a perf path, so the sync is free to
+                // spend. (This is the host/device ordering the pacer gives the real
+                // path, made explicit here.)
+                device
+                    .synchronize()
+                    .map_err(|e| at(format!("sync before input peek: {e}")))?;
+                // Read the current tile through the MAPPED pointer — the forward's
+                // real zero-copy access, not a `to_cpu` copy. `None` = unmapped
+                // (skip; nothing zero-copy to check on this arm).
+                let Some(got) = ring.peek_current_input(w) else {
+                    continue;
+                };
+                // The ring's cursor must match the oracle's, or the whole per-tile
+                // check is against the wrong tile.
+                if ring.current_input_slot() != model.cursor {
                     return Err(at(format!(
-                        "the input slot holds {got} where the last published token is {want}"
+                        "cursor drift: ring at tile {} but oracle at {}",
+                        ring.current_input_slot(),
+                        model.cursor
                     )));
+                }
+                match &model.tiles[model.cursor] {
+                    None => {
+                        // Never staged: every slot read must be poison. A real
+                        // token here means a read of an unwritten tile returned
+                        // stale/aliased data — the exact bug the ring must not have.
+                        if got.iter().any(|&v| v != INPUT_POISON) {
+                            return Err(at(format!(
+                                "tile {} was never staged but reads {got:?} (expected all \
+                                 {INPUT_POISON:#x} poison) — a read of an unwritten/aliased slot",
+                                model.cursor
+                            )));
+                        }
+                    }
+                    Some(chunk) => {
+                        // Staged: the first `min(w, chunk.len())` slots must equal
+                        // the chunk; any slot in `[chunk.len(), w)` is past the
+                        // staged prefix and must still be poison (an over-width read
+                        // must not surface a neighbour's token).
+                        for (k, &v) in got.iter().enumerate() {
+                            let want = chunk.get(k).copied().unwrap_or(INPUT_POISON);
+                            if v != want {
+                                return Err(at(format!(
+                                    "tile {} slot {k} reads {v} but the oracle says {want} \
+                                     (staged {chunk:?}, read width {w})",
+                                    model.cursor
+                                )));
+                            }
+                        }
+                    }
                 }
             }
             Op::NextTurn => {
@@ -286,8 +410,14 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         // Ordinary publishes dominate, as they do in a real generation.
         6 => any::<u16>().prop_map(|id| Op::PublishToken { id }),
+        // Host chunk stages (the streamed-prefill input path) — weighted so the
+        // cursor cycles through the input ring's tiles and interleaves with
+        // publishes, reaching the tile-reuse states a publish-only run cannot.
+        4 => (any::<u16>(), any::<u8>()).prop_map(|(seed, len)| Op::StageChunk { seed, len }),
         3 => Just(Op::ReadFlag),
-        3 => Just(Op::ReadInput),
+        // Read the input at a fuzzed width, so an over-width read (past a chunk's
+        // staged prefix, into poison) is exercised alongside exact-width reads.
+        3 => any::<u8>().prop_map(|width| Op::ReadInput { width }),
         // Weighted well above their natural rate: an EOS is one token in
         // hundreds in a real run, and the class under test is what happens when
         // there are several.
@@ -466,7 +596,7 @@ fn the_model_can_fail() -> Result<()> {
     let sampled = logits.argmax(lloom_tensor::D::Minus1)?;
     ring.publish(&sampled)?;
 
-    let got = ring.input().to_vec2::<u32>()?[0][0];
+    let got = ring.input_for(1)?.to_vec2::<u32>()?[0][0];
     assert_eq!(got, 7, "the ring holds what was published");
     assert_ne!(
         got, 8,
@@ -501,7 +631,7 @@ fn a_refused_publish_leaves_the_ring_unchanged() -> Result<()> {
         let ring = TokenRing::new(0, EOS, &device)?;
         let logits = logits_peaked_at(21, &device)?;
         ring.publish(&logits.argmax(lloom_tensor::D::Minus1)?)?;
-        let before_input = ring.input().to_vec2::<u32>()?[0][0];
+        let before_input = ring.input_for(1)?.to_vec2::<u32>()?[0][0];
         let before_flag = ring.eos_flag().to_vec1::<u8>()?[0];
 
         let wrong = Tensor::new(5f32, &device)?;
@@ -512,7 +642,7 @@ fn a_refused_publish_leaves_the_ring_unchanged() -> Result<()> {
         assert_eq!(wrong.dtype(), DType::F32);
 
         assert_eq!(
-            ring.input().to_vec2::<u32>()?[0][0],
+            ring.input_for(1)?.to_vec2::<u32>()?[0][0],
             before_input,
             "a refused publish must not move the input slot"
         );

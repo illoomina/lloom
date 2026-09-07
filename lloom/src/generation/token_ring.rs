@@ -95,7 +95,40 @@ pub fn poll_read_count() -> u64 {
 /// (§9.2a layer 3), so §6.7 L4's two-clocks defect -- `Arc::strong_count == 1`
 /// says nothing about GPU liveness -- cannot reach them.
 pub struct TokenRing {
-    input: Tensor,
+    /// The INPUT staging ring — a [`SegmentedRing`] whose tiles are input CHUNKS
+    /// (each `quantum = max_width` tokens wide), sized to `depth + 1` tiles so a
+    /// host-staged chunk never overwrites a buffer an in-flight forward is reading.
+    /// Reuses the history ring's segmented-mapped-buffer mechanism, so it stays
+    /// zero-copy at ANY chunk width (segments ≤ the 16384 B window) — unlike a flat
+    /// `[1, max_width]` buffer, which de-maps and copies per stage past 4092 slots.
+    /// The decode path (device-side `publish`, queue-ordered) does not strictly need
+    /// `depth + 1`, but cycling tiles is harmless there. The input-side twin of the
+    /// history's "don't overwrite what's in flight" discipline (§10.3e).
+    inputs: super::readback::SegmentedRing,
+    /// The tile the NEXT stage/publish writes and the next forward reads. Advances
+    /// once per input write, wrapping at the ring's tile count.
+    slot: std::cell::Cell<usize>,
+    /// The per-tile token capacity (`= inputs.quantum()`). A stage wider than this
+    /// is refused rather than silently truncated.
+    max_width: usize,
+    /// Pre-allocated CYCLED SOURCE ring for the generation stamp — the whole of
+    /// why [`Self::publish_marker`] does no hot-path allocation.
+    ///
+    /// Writing the stamp is `step.slice_set(src)`, and `slice_set` reads `src` at
+    /// GPU-EXECUTE time (not encode time). A single reused source would tear: the
+    /// host staging stamp N+1 into it could race the still-pending `slice_set` of
+    /// stamp N. The cure is the input ring's own discipline — cycle `depth + 1`
+    /// sources so the one being staged is never the one an in-flight `slice_set`
+    /// reads (the pacer bounds in-flight writes to `depth`). Reuses [`SegmentedRing`]
+    /// (quantum 1, `depth + 1` one-slot tiles), the same battle-tested
+    /// zero-copy-staged, mapped, pre-allocated mechanism as `inputs` — so the stamp
+    /// value is staged with `write_host_slice` (no alloc) and copied to `step` with
+    /// one queue-ordered `slice_set`, and NOTHING is allocated per publish.
+    marker_src: super::readback::SegmentedRing,
+    /// The marker-source tile the next stamp stages into; cycles over
+    /// `marker_src`'s `depth + 1` tiles. Single-thread (the decode loop owns it),
+    /// so a `Cell` rather than an atomic — exactly like `slot`.
+    marker_slot: std::cell::Cell<usize>,
     eos: Tensor,
     eos_ids: Tensor,
     /// The published-generation counter, and the reason it exists is #535.
@@ -190,10 +223,64 @@ impl TokenRing {
     /// checks EOS -- `eos_token_id` appears three times in `lfm2.rs` and all
     /// three are plumbing) has no model-side counterpart to fall back on.
     pub fn new(first_input: u32, eos_ids: &[u32], device: &Device) -> Result<Self> {
+        Self::with_input_ring(first_input, eos_ids, device, 1, 1)
+    }
+
+    /// As [`Self::new`], with the input buffer sized to hold up to `max_width`
+    /// tokens rather than one. One slot — for a caller with no concurrent forwards
+    /// staging host tokens (the incumbent single-input path).
+    pub fn with_input_width(
+        first_input: u32,
+        eos_ids: &[u32],
+        device: &Device,
+        max_width: usize,
+    ) -> Result<Self> {
+        Self::with_input_ring(first_input, eos_ids, device, max_width, 1)
+    }
+
+    /// As [`Self::with_input_width`], with an input RING of `n_slots` buffers so a
+    /// host-staged chunk does not overwrite an in-flight forward's input (see the
+    /// `inputs` field). `n_slots` = the pacer's in-flight depth + 1; `1` reduces to
+    /// the single-buffer path.
+    ///
+    /// Each buffer holds up to `max_width` tokens and **decouples what is STAGED
+    /// from what one forward CONSUMES** — the state machine steps over a prompt in
+    /// `ubatch`-wide units (streamed prefill) or a drafted block in `K+1`-wide
+    /// units, writing them into the current slot (zero-copy
+    /// [`Tensor::write_host_slice`] for a host source) and consuming a
+    /// [`Self::input_for`] narrow of the width that step eats. Buffers are
+    /// `Tensor::empty` (no fill, no blit, no host upload — the content is written
+    /// before it is read), allocated ONCE.
+    pub fn with_input_ring(
+        first_input: u32,
+        eos_ids: &[u32],
+        device: &Device,
+        max_width: usize,
+        n_slots: usize,
+    ) -> Result<Self> {
         if eos_ids.is_empty() {
             lloom_tensor::bail!("TokenRing: eos_ids is empty, so the loop would never terminate");
         }
-        let input = Tensor::from_vec(vec![first_input], (1, 1), device)?;
+        let w = max_width.max(1);
+        let n = n_slots.max(1);
+        // The input ring is a `SegmentedRing` whose TILE is one chunk (`quantum = w`
+        // tokens) and which holds `n` tiles (= `depth + 1`). `cap = n · w` slots;
+        // the segmentation keeps each buffer ≤ the 16384 B mapping window, so a
+        // chunk of ANY width up to a segment stages zero-copy — the property a flat
+        // `[1, w]` buffer loses past 4092 slots. (`SegmentedRing::new` zeros the
+        // segments once at construction; the content is overwritten before it is
+        // read, so the fill value is irrelevant — the seed below just makes slot 0's
+        // first token defined.)
+        let inputs = super::readback::SegmentedRing::new(n * w, w, device)?;
+        // Seed tile 0's first slot (the first forward's input), zero-copy through the
+        // mapped pointer.
+        inputs.stage_at_tile(0, &[first_input])?;
+        // The marker-source ring: `n` (= depth + 1) one-slot tiles, quantum 1, so a
+        // stamp staged into the current tile is never the one an in-flight
+        // `slice_set` still reads (the pacer bounds in-flight to `depth`). Same
+        // pre-allocated, mapped, zero-copy-staged mechanism as `inputs` — no
+        // per-publish allocation. `n * 1` slots.
+        let marker_src = super::readback::SegmentedRing::new(n, 1, device)?;
         let eos_ids = Tensor::from_vec(eos_ids.to_vec(), eos_ids.len(), device)?;
         // Materialised on the device so the first `publish` overwrites rather
         // than allocates. `from_vec` of a `0u8` is the same shape `publish`
@@ -212,7 +299,11 @@ impl TokenRing {
         // the locking peek, which is two contracts in one function for no gain.
         let mapped = Self::resolve_mapped(&step, &eos);
         Ok(Self {
-            input,
+            inputs,
+            slot: std::cell::Cell::new(0),
+            max_width: w,
+            marker_src,
+            marker_slot: std::cell::Cell::new(0),
             eos,
             eos_ids,
             step,
@@ -296,10 +387,13 @@ impl TokenRing {
             );
         }
         // `argmax` over the vocabulary dimension returns rank 0 (it squeezes);
-        // `reshape` to the slot's own shape makes it contiguous and
-        // rank-compatible in one step.
-        let token = token.reshape((1, 1))?;
-        self.input.slice_set(&token, 0, 0)?;
+        // `reshape` to `[1]` makes it a single contiguous slot value.
+        let token = token.reshape(1)?;
+        // Advance to a fresh tile, then device-write the token into its first slot
+        // (queue-ordered after the prior forward's read); the forward reads
+        // `input_for(1)` on this same tile.
+        let tile = self.next_slot();
+        self.inputs.write_device_at_tile(tile, &token)?;
         // The EOS decision, device-side and against a loop-invariant constant.
         // `broadcast_eq` against the uploaded id set then `max_all` reduces to
         // one element: nonzero iff the token matched any id. This is the
@@ -311,49 +405,79 @@ impl TokenRing {
             .max_all()?
             .reshape(1)?;
         self.eos.slice_set(&hit, 0, 0)?;
-        // The stamp, LAST. Everything a poller will read once it sees this
-        // value has been encoded before it.
+        // The stamp, LAST — but only when the caller stamps at THIS granularity.
+        // `Some(g)` is the per-step arm (the completion marker and the EOS flag
+        // coincide, `live_every == 1`); `None` is the batched arm, where the loop
+        // stamps once per commit window via [`Self::publish_marker`] instead, so
+        // the per-step path writes no stamp at all.
         if let Some(g) = generation {
-            let stamp = Tensor::from_vec(vec![g], 1, self.step.device())?;
-            self.step.slice_set(&stamp, 0, 0)?;
+            self.publish_marker(g)?;
         }
         Ok(())
     }
 
-    /// [`Self::publish_step`] **without the device EOS decision** — writes the
-    /// input slot and the generation stamp only, skipping the
-    /// `broadcast_eq → max_all → slice_set(eos)` that costs ~5 dispatches every
-    /// token in the command stream (`DESIGN.md` §11.5g's comparison).
+    /// Stamp the generation counter, LAST in queue order and WITHOUT a per-call
+    /// allocation — the completion marker the host WFE-waits on and the drain
+    /// clamps to ([`Self::published_generation`]).
     ///
-    /// For the [`crate::generation::EosRead::HostOnDrain`] arm, where EOS is not
-    /// learned per token from the device flag but host-side from the drained ids
-    /// (a plain Rust compare on the batch the drain already reads), so the flag
-    /// is never read and the dispatches that compute it are pure cost. The stamp
-    /// is still written last and is still the visibility signal the zero-copy
-    /// drain rides ([`Self::published_generation`]) — that protocol is unchanged,
-    /// only the EOS flag is gone.
+    /// This is the write the per-step `from_vec(vec![g])` used to fabricate a
+    /// fresh source buffer for every token. Here the source is pre-allocated: the
+    /// value stages into the current [`Self::marker_src`] tile through its mapped
+    /// pointer ([`Tensor::write_host_slice`], no alloc), and one queue-ordered
+    /// `slice_set` copies it to `step`. Cycling `depth + 1` source tiles is what
+    /// makes the host stage safe against the still-pending `slice_set` of a prior
+    /// stamp (the pacer bounds in-flight writes to `depth`) — the input ring's own
+    /// don't-overwrite-what-is-in-flight discipline (§10.3e), applied to the stamp.
     ///
-    /// The `eos` flag tensor is left at whatever it last held; nothing reads it
-    /// on this arm. A `generation` of 0 is rejected for [`Self::publish_step`]'s
-    /// reason.
-    pub fn publish_input_and_stamp(&self, token: &Tensor, generation: u32) -> Result<()> {
-        if token.dtype() != DType::U32 {
-            lloom_tensor::bail!(
-                "TokenRing::publish_input_and_stamp expects the U32 argmax output, got {:?}",
-                token.dtype()
-            );
-        }
+    /// Called either per step (the marker-coincides-with-EOS arm) or once per
+    /// commit window (the batched arm), so `generation` is whatever the host holds
+    /// as `fed` at that point. Ordering is the protocol: encoded after the input
+    /// slot and (on the per-step arm) the EOS flag, so a host that observes the
+    /// counter at `>= N` has those writes behind it in queue order (§9.3).
+    pub fn publish_marker(&self, generation: u32) -> Result<()> {
         if generation == 0 {
             lloom_tensor::bail!(
                 "TokenRing: generation 0 is the unpublished sentinel, ordinals start at 1"
             );
         }
-        let token = token.reshape((1, 1))?;
-        self.input.slice_set(&token, 0, 0)?;
-        // The stamp, LAST — the drain's visibility signal, same ordering as
-        // `publish_step`. No EOS flag is written: this arm never reads it.
-        let stamp = Tensor::from_vec(vec![generation], 1, self.step.device())?;
-        self.step.slice_set(&stamp, 0, 0)?;
+        // Cycle to a fresh source tile so the stage does not race an in-flight
+        // `slice_set` reading the previous one.
+        let n = self.marker_src.total_tiles();
+        let src_tile = (self.marker_slot.get() + 1) % n;
+        self.marker_slot.set(src_tile);
+        // Stage the value zero-copy (mapped write, no alloc); the fallback inside
+        // `stage_at_tile` covers an unmapped source. Then one queue-ordered copy to
+        // the persistent `step` word.
+        self.marker_src.stage_at_tile(src_tile, &[generation])?;
+        let src = self.marker_src.tile_view(src_tile, 1)?.reshape(1)?;
+        self.step.slice_set(&src, 0, 0)?;
+        Ok(())
+    }
+
+    /// Write the sampled token into the input slot ONLY — no device EOS decision
+    /// and no per-step stamp.
+    ///
+    /// This is the per-step path for the arms that do NOT stamp per token: the
+    /// batched arm learns EOS host-side or in a GPU window check, and the
+    /// completion marker is written once per commit window
+    /// ([`Self::publish_marker`]) rather than once per token. So the per-step path
+    /// is just the input slot — the next forward's input, device-written and
+    /// queue-ordered after the prior forward's read — and nothing the host reads.
+    ///
+    /// Skips both the `broadcast_eq → max_all → slice_set(eos)` (~5 dispatches,
+    /// `DESIGN.md` §11.5g) AND the per-step stamp (`from_vec` + `slice_set`) the
+    /// incumbent wrote every token. The `eos` flag tensor is left at whatever it
+    /// last held; nothing reads it on this arm.
+    pub fn publish_input(&self, token: &Tensor) -> Result<()> {
+        if token.dtype() != DType::U32 {
+            lloom_tensor::bail!(
+                "TokenRing::publish_input expects the U32 argmax output, got {:?}",
+                token.dtype()
+            );
+        }
+        let token = token.reshape(1)?;
+        let tile = self.next_slot();
+        self.inputs.write_device_at_tile(tile, &token)?;
         Ok(())
     }
 
@@ -364,6 +488,13 @@ impl TokenRing {
     /// step).
     pub fn eos_ids(&self) -> Result<Vec<u32>> {
         self.eos_ids.to_vec1::<u32>()
+    }
+
+    /// The EOS id set as the device tensor, for the `GpuBatched` arm's `eos_index`
+    /// dispatch (which compares the window against it on the GPU). A loop-invariant
+    /// device constant, uploaded once at construction.
+    pub fn eos_ids_tensor(&self) -> &Tensor {
+        &self.eos_ids
     }
 
     /// Non-blocking: has step `generation` published, and was it EOS? (#535)
@@ -508,8 +639,97 @@ impl TokenRing {
     /// The tensor the model reads as its next input. Stable across steps, and
     /// the same allocation every step -- §10.3e names buffer-identity stability
     /// as one of the three properties a replacement append must not regress.
-    pub fn input(&self) -> &Tensor {
-        &self.input
+    ///
+    /// The input ring's device — for a caller that needs it (e.g. the strategy's
+    /// `device()`), replacing the old whole-buffer `input()` accessor.
+    pub fn input_device(&self) -> &Tensor {
+        self.inputs.segment0()
+    }
+
+    /// The input tile's token capacity — the largest chunk `stage_prompt` accepts.
+    /// A caller staging a wider unit (the one-shot whole prompt) takes a
+    /// whole-tensor path instead.
+    pub fn input_width(&self) -> usize {
+        self.max_width
+    }
+
+    /// Advance the cursor to the next input TILE and return its index. Every write
+    /// (stage or publish) calls this FIRST so it targets a tile no in-flight forward
+    /// is reading; `input_for` then views this same tile for the forward. With one
+    /// tile it is the same tile every time (the incumbent).
+    fn next_slot(&self) -> usize {
+        let n = self.inputs.total_tiles();
+        self.slot.set((self.slot.get() + 1) % n);
+        self.slot.get()
+    }
+
+    /// The current input tile viewed as the `width` tokens THIS forward consumes —
+    /// a contiguous `[1, width]` prefix of the tile within one mapped segment, **no
+    /// copy**. This is the seam that decouples staging capacity from consumption
+    /// width: `stage_prompt` (or `publish`) writes up to `max_width` tokens into the
+    /// tile, and the forward reads exactly the `width` it steps over — 1 for decode,
+    /// `K+1` for a drafted block, `ubatch` for a streamed prefill chunk.
+    pub fn input_for(&self, width: usize) -> Result<Tensor> {
+        if width == 0 || width > self.max_width {
+            lloom_tensor::bail!(
+                "TokenRing::input_for: width {width} outside [1, {}]",
+                self.max_width
+            );
+        }
+        // The CURRENT tile — the one the last stage/publish wrote (`next_slot`
+        // advanced to it), which is what the forward now reads.
+        self.inputs.tile_view(self.slot.get(), width)
+    }
+
+    /// Stage `tokens` into the next input tile for the forward to consume — the
+    /// host-sourced feed (a streamed-prefill chunk, a host-provided block).
+    /// **Zero-copy** through the segment's mapped pointer, at ANY chunk width up to
+    /// a segment (the `SegmentedRing` keeps every segment mapped); an unmapped arm
+    /// falls back to one `slice_set` upload inside `stage_at_tile`.
+    ///
+    /// Advances to a fresh tile FIRST so this stage does not overwrite a tile an
+    /// in-flight forward is still reading; the forward then reads `input_for` on
+    /// this same (now-current) tile.
+    pub fn stage_prompt(&self, tokens: &[u32]) -> Result<()> {
+        if tokens.is_empty() || tokens.len() > self.max_width {
+            lloom_tensor::bail!(
+                "TokenRing::stage_prompt: {} tokens outside [1, {}]",
+                tokens.len(),
+                self.max_width
+            );
+        }
+        let tile = self.next_slot();
+        self.inputs.stage_at_tile(tile, tokens)
+    }
+
+    /// The current input TILE index (the one the last stage/publish wrote and the
+    /// forward reads). For a fuzz oracle that tracks per-tile contents.
+    #[cfg(feature = "metal")]
+    pub fn current_input_slot(&self) -> usize {
+        self.slot.get()
+    }
+
+    /// The number of input tiles (`depth + 1`) — the ring's cycle length. For a
+    /// fuzz oracle mirroring the cursor.
+    #[cfg(feature = "metal")]
+    pub fn input_slot_count(&self) -> usize {
+        self.inputs.total_tiles()
+    }
+
+    /// Read the CURRENT input tile's first `width` slots back through the mapped
+    /// pointer — the same zero-copy access the GPU forward makes. For fuzzing the
+    /// input ring on the real path (not a `to_cpu` copy). `None` if unmapped.
+    #[cfg(feature = "metal")]
+    pub fn peek_current_input(&mut self, width: usize) -> Option<Vec<u32>> {
+        let tile = self.slot.get();
+        self.inputs.peek_tile(tile, width)
+    }
+
+    /// Poison every input tile with a sentinel — a fuzz then asserts a read of a
+    /// never-staged slot returns it, catching a wrong-tile or over-width read.
+    #[cfg(feature = "metal")]
+    pub fn poison_input(&self, sentinel: u32) -> Result<()> {
+        self.inputs.poison_all(sentinel)
     }
 
     /// The device-resident EOS flag. Nonzero iff the last published token was

@@ -9040,3 +9040,137 @@ fn gemv_is_composed_with_utils_and_its_silu_epilogue_resolves() {
          above say nothing"
     );
 }
+
+// ---- eos_index: the batched EOS-index reduction (the GpuBatched arm) ---------
+//
+// One dispatch over a window of token ids returns the first index whose token is
+// a stop id, or `n` if none. The scalar reference is a plain `position` scan; the
+// kernel must agree with it for every window shape, including a non-power-of-two
+// length (the padding lanes must not corrupt the min-reduce) and a first-match at
+// index 0. Determinism: the same window returns the same index every run.
+
+/// The scalar reference the kernel must match: first index whose token is in the
+/// stop set, or `n`.
+fn eos_index_reference(tokens: &[u32], eos_ids: &[u32]) -> u32 {
+    tokens
+        .iter()
+        .position(|t| eos_ids.contains(t))
+        .map(|i| i as u32)
+        .unwrap_or(tokens.len() as u32)
+}
+
+fn run_eos_index(tokens: &[u32], eos_ids: &[u32]) -> u32 {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let tokens_buf = new_buffer(&device, tokens);
+    let eos_buf = new_buffer(&device, eos_ids);
+    let out = new_buffer(&device, &[u32::MAX]); // 1 word, pre-set to a value the kernel must overwrite
+    crate::kernels::kernels::call_eos_index(
+        &device,
+        &encoder,
+        &kernels,
+        &tokens_buf,
+        0,
+        tokens.len(),
+        &eos_buf,
+        0,
+        eos_ids.len(),
+        &out,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<u32>(&out, 1)[0]
+}
+
+#[test]
+fn eos_index_matches_the_scalar_scan() {
+    let eos = [2u32, 7, 100];
+    // A spread of windows: no match, match at the end, match in the middle,
+    // match at 0, multiple matches (first wins), and non-power-of-two lengths.
+    let windows: &[&[u32]] = &[
+        &[1, 3, 4, 5],           // none -> n
+        &[1, 3, 4, 7],           // match at 3
+        &[1, 7, 4, 5],           // match at 1
+        &[2, 3, 4, 5],           // match at 0
+        &[7, 2, 100, 7],         // multiple -> first (0)
+        &[1, 3, 4, 5, 6],        // n=5 (width padded to 8), none
+        &[1, 3, 4, 5, 100],      // n=5, match at 4 (the last real lane)
+        &[3, 3, 3, 3, 3, 3, 7],  // n=7, match at 6
+        &[100],                  // n=1, match at 0
+        &[5],                    // n=1, none
+    ];
+    for w in windows {
+        let got = run_eos_index(w, &eos);
+        let want = eos_index_reference(w, &eos);
+        assert_eq!(got, want, "eos_index disagreed with the scan on window {w:?}");
+    }
+}
+
+#[test]
+fn eos_index_is_deterministic() {
+    let eos = [2u32, 7];
+    let w = [1u32, 3, 7, 4, 2, 9]; // first match at index 2
+    let first = run_eos_index(&w, &eos);
+    assert_eq!(first, 2);
+    for _ in 0..8 {
+        assert_eq!(run_eos_index(&w, &eos), first, "eos_index must be deterministic");
+    }
+}
+
+/// The offset path: the token window is a slice at a NON-ZERO offset into a
+/// larger buffer (exactly what a `narrow` of a ring segment produces). The
+/// dispatch must honour the byte offset — a version that read from slot 0 would
+/// scan the wrong tokens and miss the EOS. This is the regression that shipped
+/// once (the end-to-end gate caught a 10x overrun; this catches it at the kernel).
+fn run_eos_index_at(buffer: &[u32], offset: usize, n: usize, eos_ids: &[u32]) -> u32 {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let tokens_buf = new_buffer(&device, buffer);
+    let eos_buf = new_buffer(&device, eos_ids);
+    let out = new_buffer(&device, &[u32::MAX]);
+    crate::kernels::kernels::call_eos_index(
+        &device,
+        &encoder,
+        &kernels,
+        &tokens_buf,
+        offset * std::mem::size_of::<u32>(), // BYTE offset, as Metal's setBuffer:offset:
+        n,
+        &eos_buf,
+        0,
+        eos_ids.len(),
+        &out,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<u32>(&out, 1)[0]
+}
+
+#[test]
+fn eos_index_honours_the_token_offset() {
+    let eos = [7u32];
+    // A 10-slot buffer; the window is slots [4..8). The EOS (7) sits at absolute
+    // slot 6 = window index 2. A dispatch ignoring the offset would scan [0..4)
+    // (slots 1,2,3,4 — no 7) and wrongly report "none" (n=4).
+    let buffer = [1u32, 2, 3, 4, 5, 9, 7, 8, 100, 100];
+    assert_eq!(run_eos_index_at(&buffer, 4, 4, &eos), 2, "must scan the window at the offset");
+    // A window with no EOS at its offset returns n even though an EOS exists
+    // OUTSIDE the window (slot 6): window [0..4) has no 7.
+    assert_eq!(run_eos_index_at(&buffer, 0, 4, &eos), 4, "must not see EOS outside the window");
+}
+
+#[test]
+fn eos_index_mutation_a_broken_min_would_fail() {
+    // The mutation guard: if the reduction took MAX instead of MIN (a plausible
+    // slip), a window with matches at BOTH a low and a high index would return the
+    // high one. This asserts the low (first) index is returned, so that mutation
+    // is caught rather than passing silently.
+    let eos = [7u32];
+    let w = [7u32, 1, 2, 7]; // matches at 0 and 3; MIN=0, a broken MAX would give 3
+    assert_eq!(run_eos_index(&w, &eos), 0, "must return the FIRST match, not the last");
+}

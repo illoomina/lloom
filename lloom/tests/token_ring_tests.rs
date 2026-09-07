@@ -57,8 +57,10 @@ fn devices() -> Vec<Device> {
 fn ring_matches_the_round_trip_and_keeps_one_allocation() -> Result<()> {
     for device in devices() {
         let vocab = 4096;
+        // The default ring is a ONE-tile input ring, so its single segment buffer
+        // is the stable in-place slot the round trip writes.
         let ring = TokenRing::new(7, EOS, &device)?;
-        let first_id = ring.input().id();
+        let first_id = ring.input_device().id();
 
         // Three steps at three *different* tokens. Moving the value every step
         // is what makes this non-vacuous: a `publish` that did nothing would
@@ -73,25 +75,31 @@ fn ring_matches_the_round_trip_and_keeps_one_allocation() -> Result<()> {
 
             ring.publish(&sampled)?;
 
+            // The forward reads the current tile as a `[1, 1]` view (`input_for`);
+            // it must hold the published token, same shape as the round trip.
+            let got = ring.input_for(1)?;
             assert_eq!(
-                ring.input().flatten_all()?.to_vec1::<u32>()?,
+                got.flatten_all()?.to_vec1::<u32>()?,
                 want_input.flatten_all()?.to_vec1::<u32>()?,
                 "ring slot disagrees with the round trip on {device:?}"
             );
             assert_eq!(
-                ring.input().dims(),
+                got.dims(),
                 want_input.dims(),
                 "ring slot shape disagrees with the round trip"
             );
         }
 
-        // The slot is the same `Tensor` throughout: `publish` writes through
-        // `slice_set` and never rebinds the field. A `Tensor::new` per step --
-        // the shipping path's shape -- would give a fresh id every step.
+        // The slot buffer is the same `Tensor` throughout: `publish` writes through
+        // `slice_set` into the (single) segment and never reallocates it. A
+        // `Tensor::new` per step -- the pre-ring shape -- would give a fresh id.
+        // (A multi-tile input ring cycles `depth+1` buffers, all pre-allocated; the
+        // "no per-step allocation" invariant holds either way. This one-tile ring
+        // keeps the strictest form: one stable id.)
         assert_eq!(
-            ring.input().id(),
+            ring.input_device().id(),
             first_id,
-            "the input slot was replaced; the write leg must be in place"
+            "the input slot was reallocated; the write leg must be in place"
         );
     }
     Ok(())
@@ -203,7 +211,7 @@ fn the_parity_comparison_can_fail() -> Result<()> {
         // A stale slot: what the ring would hold if `publish` were a no-op.
         let stale = Tensor::from_vec(vec![7u32], (1, 1), &device)?;
         assert_ne!(
-            ring.input().flatten_all()?.to_vec1::<u32>()?,
+            ring.input_for(1)?.flatten_all()?.to_vec1::<u32>()?,
             stale.flatten_all()?.to_vec1::<u32>()?,
             "the comparison cannot distinguish a written slot from a stale one, \
              so the parity test above proves nothing"
@@ -230,7 +238,7 @@ fn the_published_token_stays_on_the_device() -> Result<()> {
     assert!(sampled.device().is_metal(), "argmax left the device");
     ring.publish(&sampled)?;
     assert!(
-        ring.input().device().is_metal(),
+        ring.input_device().device().is_metal(),
         "the input slot left the device"
     );
     assert!(

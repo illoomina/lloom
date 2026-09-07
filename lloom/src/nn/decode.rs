@@ -111,6 +111,19 @@ pub struct DecodeOptions {
     /// [`Session::warmup`]'s return, or left 0 to fall back to the floor when no
     /// warmup ran (CPU, or warmup skipped).
     pub in_flight_depth: usize,
+    /// Prompt tokens per prefill micro-batch (the `n_ubatch` of the streamed
+    /// prefill). **`0` means the whole prompt in one pass** — the incumbent
+    /// one-shot. A positive value feeds the prompt through the SAME in-flight
+    /// pacer the decode loop uses, in chunks of this width, so the pipeline spans
+    /// prefill→decode with no drain and host-encode(chunk N+1) overlaps
+    /// GPU(chunk N). It is the TTFT-vs-throughput dial: larger chunks keep the
+    /// matmul units fuller (throughput, and it approaches one-shot as it reaches
+    /// the prompt length); smaller chunks overlap more and free the pipeline for
+    /// concurrent decode sooner. Correctness across chunk boundaries needs the
+    /// conv's left-context carry (`Config::conv_prefill_ctx`), which the streamed
+    /// path turns on for a multi-chunk run; a single chunk is identical either
+    /// way (a cold cache has no left context to carry).
+    pub prefill_ubatch: usize,
 }
 
 /// One speculative round of [`Session::decode_speculative`], for the per-round
@@ -171,7 +184,14 @@ impl DecodeOptions {
             lookahead: 0,
             sample_split: false,
             in_flight_depth: 0,
+            prefill_ubatch: 0,
         }
+    }
+
+    /// Prompt tokens per prefill micro-batch, or the whole prompt in one pass when
+    /// `0` (the incumbent one-shot). See [`Self::prefill_ubatch`].
+    pub fn prefill_ubatch(&self) -> usize {
+        self.prefill_ubatch
     }
 }
 
@@ -184,6 +204,14 @@ pub struct DecodeStats {
     pub steps: u64,
     /// Submission time of the prompt's forward pass — encode, not execution.
     pub prefill_ns: u64,
+    /// Compute time to the first token: prefill + the first decode step, stamped
+    /// ONCE (at step 0) so it survives release without any per-step clock read —
+    /// the fair, llama-bench-comparable TTFT (their synchronous `llama_decode` of
+    /// the prompt → first logits), measured here WITHOUT a forced sync (the async
+    /// pipeline is the design). Distinct from the CLI's `first_batch_at` (when the
+    /// host DRAINS the first token, which adds the commit cadence) and
+    /// `first_visible_at` (+ the consumer/print). 0 if the run produced nothing.
+    pub ttft_compute_ns: u64,
     /// Per-step host time, one entry per returned token. Under `lookahead = 1`
     /// the wait sits after the forward's encode, so the entry is still one
     /// token's cadence and not a submit time.
@@ -611,22 +639,91 @@ impl<'m, M: CausalLM> Session<'m, M> {
             ..DecodeStats::default()
         };
 
-        // Prefill: the whole prompt in one pass. Its GPU tail lands in the
-        // first decode steps; what is timed here is the submission.
+        // The in-flight bound, created BEFORE the prefill so the prompt-steps and
+        // the generate-steps share ONE pacer — the pipeline spans prefill→decode
+        // with no drain at the boundary, and the pacer's depth lets the host encode
+        // the next unit while the GPU runs the current one (host↔GPU overlap). The
+        // blocking arm's readback drains the queue every step, so its stream stays
+        // the incumbent's; depth is the computed host/GPU balance
+        // (`opts.in_flight_depth`, from warmup) or the floor — not a constant.
+        let mut pacer = StepPacer::new(opts.pacer_depth());
+        let pace = readback.loop_commits();
+
+        // Prefill: the state machine STEPS OVER THE PROMPT before it steps over
+        // its own generated tokens — same stepping, different input source. Rather
+        // than one monolithic `forward(whole_prompt)` the host blocks on, the
+        // prompt flows in as `prefill_ubatch`-wide units through the shared pacer:
+        // each unit is staged into the ring's input buffer (zero-copy) and read as
+        // a narrow, exactly as a decode step feeds its one token. A unit does NOT
+        // sample (the tokens are given) and produces no output (nothing generated
+        // yet); only the LAST unit's last-position logits seed the first generate
+        // step. `prefill_ubatch == 0` means one unit over the whole prompt — the
+        // incumbent one-shot, so the default path is byte-identical.
+        //
+        // Correctness across unit boundaries: a `seq_len>1` conv writer zero-pads
+        // its left, exact only for a cold cache; a unit onto a WARM cache must
+        // carry the previous window (`Config::conv_prefill_ctx`). The caller turns
+        // that on when it streams (`prefill_ubatch>0`); a single unit is identical
+        // either way (a cold cache has no left context to carry).
         let pos_before = self.seq.pos;
         let census_before = census_snapshot();
         let prefill_start = std::time::Instant::now();
         let mut logits = match self.seq.last_logits.take() {
             Some(held) if resume => held,
             _ => {
-                let input = Tensor::new(prompt, &device)?.unsqueeze(0)?;
-                let logits = self
-                    .model
-                    .forward(&input, self.seq.pos, &mut self.seq.cache)?
-                    .squeeze(0)?;
-                self.seq.pos += prompt.len();
-                self.seq.tokens.extend_from_slice(prompt);
-                logits
+                // THE ADAPTIVE SPARK→SEGMENT RAMP. The prefill weight-sweep is
+                // amortized over a forward's tokens, so MANY small chunks are slow
+                // (each re-reads the 5.4 GB of weights) — but the FIRST token cannot
+                // stream until its chunk lands, so a small FIRST chunk gets the
+                // machinery flowing early (low TTFT). The resolution: ramp the chunk
+                // width. Chunk 1 = `spark` (the tunable TTFT knob), then DOUBLE each
+                // chunk up to the whole remaining prompt. For a normal prompt this is
+                // "spark, then one-shot the rest" — the first token sparks early and
+                // the bulk is ONE big amortized forward, so TTFT drops without the
+                // per-chunk weight-sweep tax. `spark == 0` means one-shot (the whole
+                // prompt in one chunk): the incumbent, byte-identical, no ramp.
+                let spark = opts.prefill_ubatch();
+                let mut last_logits = None;
+                let mut off = 0usize; // the machine's position over the prompt
+                let mut step = if spark == 0 { prompt.len() } else { spark };
+                while off < prompt.len() {
+                    let w = step.min(prompt.len() - off);
+                    let chunk = &prompt[off..off + w];
+                    // Stage this unit's tokens as the forward's input — zero-copy on
+                    // the ring arm for a spark-sized chunk (≤ the input tile width),
+                    // a one-shot `Tensor::new` for the bigger amortizing chunks (few,
+                    // so the alloc is off the hot path). Then step: bound the
+                    // enqueue, forward, keep the marker — the same `before/
+                    // after_forward` a generate step takes, so prompt units and
+                    // generated tokens ride one pipeline.
+                    let input = readback.stage_prompt_chunk(chunk)?;
+                    if pace {
+                        pacer.before_forward(&device)?;
+                    }
+                    let out = self
+                        .model
+                        .forward(&input, self.seq.pos, &mut self.seq.cache)?
+                        .squeeze(0)?;
+                    if pace {
+                        pacer.after_forward(&device)?;
+                    }
+                    self.seq.pos += w;
+                    self.seq.tokens.extend_from_slice(chunk);
+                    last_logits = Some(out);
+                    off += w;
+                    // After the spark, jump straight to the WHOLE remaining prompt
+                    // (one big amortized forward) rather than doubling: the weight
+                    // sweep is per-forward, so the only way to pay it ~once on the
+                    // bulk is to feed the bulk in ONE chunk. Doubling would pay it
+                    // log(N) times; "spark + rest" pays it twice total (the spark's
+                    // small sweep + one bulk sweep). The GPU is already producing
+                    // after the spark, so the big chunk does not hurt TTFT — the
+                    // first token streamed off the spark. (A prompt larger than the
+                    // input machinery can hold in one pass would cap here; for the
+                    // chat path the whole rest fits.)
+                    step = prompt.len();
+                }
+                last_logits.expect("a non-empty prompt steps at least once")
             }
         };
         end_executor_step(&device)?;
@@ -637,12 +734,6 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut produced = 0usize;
         let mut since_commit = 0usize;
         let mut eos = false;
-        // The in-flight bound, on the arms whose commits the loop owns. The
-        // blocking arm's readback drains the queue every step, so its stream
-        // stays the incumbent's. Depth is the computed host/GPU balance
-        // (`opts.in_flight_depth`, from warmup) or the floor — not a constant.
-        let mut pacer = StepPacer::new(opts.pacer_depth());
-        let pace = readback.loop_commits();
         // Every id the loop drains, streamed or not, accumulates here so the
         // returned `ids` is complete and the reconciliation below counts the
         // whole run. Draining for the stream advances the strategy's cursor, so
@@ -655,14 +746,42 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 break;
             }
             stats.steps += 1;
+            // Only the first `FIRST_STEPS_TRACED` steps record per-phase timings —
+            // and only in a debug/profile build. In release `traced` is a constant
+            // `false`, so every `traced.then(Instant::now())` below is `None` and NO
+            // phase clock read (`mach_absolute_time()`) reaches even the first steps:
+            // the release decode path is free of per-step instrumentation entirely.
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            let traced = stats.steps <= FIRST_STEPS_TRACED;
+            #[cfg(not(any(debug_assertions, feature = "profile")))]
+            let traced = false;
+            // The per-step median clock read — DEBUG/PROFILE ONLY. In a plain
+            // release build this `mach_absolute_time()` (and the `step_ns.push`es it
+            // feeds) is compiled OUT, so the steady decode path takes no per-step
+            // clock read at all; release reports coarse tokens ÷ wall-clock instead
+            // (measured host-side, off the loop). `any(debug_assertions, profile)`.
+            #[cfg(any(debug_assertions, feature = "profile"))]
             let step_start = std::time::Instant::now();
             if opts.sample_split {
                 device.synchronize()?;
             }
-            let sample_start = std::time::Instant::now();
+            // `sample_start` feeds only the phase trace (`t_sample`) and the
+            // sample-split split; skip the clock read on the steady path.
+            let sample_start = (traced || opts.sample_split).then(std::time::Instant::now);
 
             let feed = readback.sample_and_feed(sampler, &logits)?;
             produced += 1;
+
+            // The fair, llama-bench-comparable TTFT, stamped ONCE (step 0) — the
+            // first output token is the argmax of the prefill's last-position
+            // logits, sampled here, so `prefill_start.elapsed()` now is the host
+            // time to submit prefill + sample the first token. No forced sync (the
+            // async pipeline is the design — this is the honest difference from
+            // llama-bench, which blocks on `llama_decode`), no drain cadence, no
+            // consumer/print. ONE clock read per generation, so release-safe.
+            if stats.steps == 1 {
+                stats.ttft_compute_ns = prefill_start.elapsed().as_nanos() as u64;
+            }
 
             // Whether this step's commit is the loop's to make at all: the
             // blocking arm's own readback commits and waits every step, and a
@@ -675,15 +794,22 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // The publish must reach the GPU before the host waits on it.
                 // Structural on this arm, not a budget choice, and counted.
                 if loop_commits {
+                    // The completion marker for the window closing at this commit,
+                    // encoded BEFORE the commit so its `slice_set` rides the
+                    // committing buffer AFTER this step's input slot — the ordering
+                    // the drain's clamp rests on (§3.5). A no-op on the arms that
+                    // stamp per step or read back per step. `force_live` during the
+                    // TTFT ramp so token 0 never waits `live_every` commits.
+                    readback.publish_marker(produced <= opts.budget.period())?;
                     self.commit(&device, &mut stats)?;
                     since_commit = 0;
                     committed_this_step = true;
                 }
                 let is_eos = readback.eos_of_last()?;
-                if opts.sample_split {
-                    stats
-                        .sample_ns
-                        .push(sample_start.elapsed().as_nanos() as u64);
+                if let Some(s) = sample_start {
+                    if opts.sample_split {
+                        stats.sample_ns.push(s.elapsed().as_nanos() as u64);
+                    }
                 }
                 if is_eos {
                     produced -= 1;
@@ -704,21 +830,29 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     pacer.after_forward(&device)?;
                 }
             } else {
-                if opts.sample_split {
-                    stats
-                        .sample_ns
-                        .push(sample_start.elapsed().as_nanos() as u64);
+                if let Some(s) = sample_start {
+                    if opts.sample_split {
+                        stats.sample_ns.push(s.elapsed().as_nanos() as u64);
+                    }
                 }
                 // ENQUEUE, then learn. The GPU has this forward queued before
                 // it retires the previous one. The pacer bounds the enqueue:
                 // an arm with no per-token wait would otherwise run ahead
                 // without limit (#690's marker pacer, replacing the removed
                 // `apply_backpressure` spin).
-                let t_sample = sample_start.elapsed().as_nanos() as u64;
+                //
+                // The per-PHASE timings (sample / forward / backpressure / eos) are
+                // recorded ONLY for the first `FIRST_STEPS_TRACED` steps (`traced`,
+                // set at the loop top). Every clock read is a `mach_absolute_time()`
+                // on the hot thread — a call the OS scheduler sees — so reading them
+                // on all 2382 steps and discarding them past step 4 was pure
+                // hot-path noise. Gated behind `traced`, so the steady path takes
+                // NONE; the one clock read it still needs is `step_ns` (the median).
+                let t_sample = sample_start.map_or(0, |s| s.elapsed().as_nanos() as u64);
                 if pace {
                     pacer.before_forward(&device)?;
                 }
-                let t = std::time::Instant::now();
+                let t = traced.then(std::time::Instant::now);
                 begin_decode_step(&device);
                 logits = self
                     .model
@@ -726,25 +860,25 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     .squeeze(0)?;
                 end_decode_step(&device)?;
                 self.seq.pos += 1;
-                let t_forward = t.elapsed().as_nanos() as u64;
+                let t_forward = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
                 // The in-flight bound AFTER the enqueue: retire the oldest
                 // marker if the host would exceed `IN_FLIGHT_STEPS` ahead. This
                 // is #690's pacer (Metal completion), which replaced the
                 // unbounded counter-spin `apply_backpressure` livelocked on.
                 // `backpressure_ns` reports what that bound cost this step.
-                let t = std::time::Instant::now();
+                let t = traced.then(std::time::Instant::now);
                 if pace {
                     pacer.after_forward(&device)?;
                 }
-                let t_backpressure = t.elapsed().as_nanos() as u64;
-                let t = std::time::Instant::now();
+                let t_backpressure = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
+                let t = traced.then(std::time::Instant::now);
                 let is_eos = readback.eos_of_last()?;
-                if stats.steps <= FIRST_STEPS_TRACED {
+                if traced {
                     stats.first_steps.push(StepPhases {
                         sample_ns: t_sample,
                         forward_ns: t_forward,
                         backpressure_ns: t_backpressure,
-                        eos_ns: t.elapsed().as_nanos() as u64,
+                        eos_ns: t.map_or(0, |t| t.elapsed().as_nanos() as u64),
                     });
                 }
                 if is_eos {
@@ -776,6 +910,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
             if loop_commits && !committed_this_step {
                 since_commit += 1;
                 if in_ttft_ramp || opts.budget.due(since_commit) {
+                    // The completion marker for the window closing here, encoded
+                    // before the commit so it rides the committing buffer after the
+                    // window's slots (§3.5). No-op on the per-step arms.
+                    // `force_live` during the TTFT ramp so early tokens stream at
+                    // once regardless of the wake cadence.
+                    readback.publish_marker(in_ttft_ramp)?;
                     self.commit(&device, &mut stats)?;
                     since_commit = 0;
                     committed_now = true;
@@ -824,21 +964,28 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         readback.note_eos_truncation(batch.len() - k - 1);
                         produced = all_ids.len();
                         eos = true;
+                        #[cfg(any(debug_assertions, feature = "profile"))]
                         stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
                         break;
                     }
                     let go_on = on_tokens(&batch)?;
                     all_ids.extend_from_slice(&batch);
                     if !go_on {
+                        #[cfg(any(debug_assertions, feature = "profile"))]
                         stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
                         break;
                     }
                 }
             }
             end_executor_step(&device)?;
-            stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
-            if stats.steps == 1 {
-                stats.step0_census = census_delta(&census_prefill, census_snapshot());
+            // The per-step median + the step-0 census: DEBUG/PROFILE ONLY. Release
+            // takes neither clock read nor census on the steady path.
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            {
+                stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
+                if stats.steps == 1 {
+                    stats.step0_census = census_delta(&census_prefill, census_snapshot());
+                }
             }
         }
 

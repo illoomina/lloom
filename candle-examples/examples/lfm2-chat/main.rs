@@ -33,9 +33,100 @@ use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, Session, VarBuilder}
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 mod concurrent;
+
+/// A pre-allocated, lock-free single-producer/single-consumer ring of token ids —
+/// the seam that moves the terminal write OFF the decode thread.
+///
+/// The decode loop (producer) drains its device ring on the hot thread as before,
+/// then `push`es the ids here — atomic stores only, NO allocation, NO syscall, NO
+/// notify (the notify was what spiked `step_waits` when this was tried as an mpsc
+/// channel: a per-commit futex wake on the hot thread). A separate consumer thread
+/// `pop`s at its own cadence, detokenizes, and writes stdout — so a slow terminal
+/// stalls the CONSUMER, never the decode loop.
+///
+/// Fixed power-of-two capacity, sized once to cover the whole run, so `push` never
+/// finds it full in practice (a full ring means the consumer is wedged on a dead
+/// terminal — then, and only then, `push` spins, which is the correct place for a
+/// sustained-backpressure stall to land). `head`/`tail` are the classic SPSC
+/// cursors: the producer owns `tail`, the consumer owns `head`, and the
+/// release/acquire pair is the happens-before that publishes each slot's write
+/// ahead of the `tail` bump (§9.3's discipline, host-thread to host-thread this
+/// time rather than GPU to host).
+struct TokenSpsc {
+    slots: Box<[std::cell::UnsafeCell<u32>]>,
+    mask: usize,
+    /// Next slot the producer writes; `Release`-published so the consumer that
+    /// observes it sees the slot's write behind it.
+    tail: AtomicUsize,
+    /// Next slot the consumer reads.
+    head: AtomicUsize,
+    /// Producer sets this when the run is over; the consumer drains what remains
+    /// and then exits.
+    closed: AtomicBool,
+}
+
+// SAFETY: single-producer/single-consumer by contract — the producer only ever
+// touches `tail` (+ the slot at `tail`), the consumer only `head` (+ the slot at
+// `head`), and a slot is written by the producer strictly before its `tail`
+// release and read by the consumer strictly after its `tail` acquire, so the two
+// never touch the same slot concurrently. That makes the `UnsafeCell<u32>` sharing
+// sound across the two threads.
+unsafe impl Sync for TokenSpsc {}
+unsafe impl Send for TokenSpsc {}
+
+impl TokenSpsc {
+    /// Capacity is rounded up to a power of two `>= cap.max(1024)` so the mask
+    /// trick applies and a short run still gets a generous buffer.
+    fn new(cap: usize) -> Self {
+        let n = cap.max(1024).next_power_of_two();
+        let slots = (0..n)
+            .map(|_| std::cell::UnsafeCell::new(0u32))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            slots,
+            mask: n - 1,
+            tail: AtomicUsize::new(0),
+            head: AtomicUsize::new(0),
+            closed: AtomicBool::new(0 != 0),
+        }
+    }
+
+    /// Producer: push one id. Returns `false` if the ring is full (the consumer is
+    /// wedged); the caller decides whether to spin or drop. Non-blocking.
+    fn push(&self, id: u32) -> bool {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if tail.wrapping_sub(head) > self.mask {
+            return false; // full
+        }
+        // SAFETY: SPSC — only the producer writes this slot, and the consumer will
+        // not read it until it observes the `Release` store to `tail` below.
+        unsafe {
+            *self.slots[tail & self.mask].get() = id;
+        }
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Consumer: pop one id, or `None` if empty right now.
+    fn pop(&self) -> Option<u32> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head == tail {
+            return None; // empty
+        }
+        // SAFETY: the matching `Release` on `tail` above happens-before this read.
+        let id = unsafe { *self.slots[head & self.mask].get() };
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        Some(id)
+    }
+}
 
 #[derive(Parser)]
 struct Args {
@@ -94,6 +185,17 @@ struct Args {
     /// never overflows and takes the commit off the per-token path.
     #[arg(long, default_value = "steps:8")]
     commit_budget: String,
+
+    /// How many commits between LIVE completion-marker writes on the
+    /// `ring-hostdrain` arm — the wake cadence. `1` writes the marker every commit
+    /// (the incumbent per-commit stamp); `N` wakes the host WFE-waiter every N
+    /// commits' worth of tokens, so the core gets a longer quiet window to go
+    /// dormant between waits (poll.rs: WFE is a bounded spin, not a cheap park, so
+    /// a longer wait is what lets it power down). The TTFT ramp still forces the
+    /// early commits live, so this cannot delay token 0. Only bites on
+    /// `ring-hostdrain` (the other arms stamp per step). **Defaults to 4.**
+    #[arg(long, default_value_t = lloom::generation::WAKE_LIVE_EVERY_DEFAULT)]
+    wake_cadence: usize,
 
     /// Drive decode with the **DSpark** speculative drafter instead of the K=1
     /// identity proposer. The drafter proposes a block of up to `--draft` tokens
@@ -283,6 +385,19 @@ struct Args {
     /// Tokens per visit under `--mode concurrent` (non-speculative interleave).
     #[arg(long, default_value_t = 16)]
     chunk: usize,
+
+    /// Prompt tokens per prefill micro-batch — the `n_ubatch` of the streamed
+    /// prefill. **`0` (default) is the incumbent one-shot** (the whole prompt in
+    /// one forward). A positive value steps the state machine over the prompt in
+    /// chunks of this width through the SAME in-flight pacer the decode loop uses,
+    /// so the pipeline spans prefill→decode with no drain and the host encodes the
+    /// next chunk while the GPU runs the current one. It is the TTFT-vs-throughput
+    /// dial: larger keeps the matmul units fuller (throughput; it reaches one-shot
+    /// as it reaches the prompt length), smaller overlaps more and frees the
+    /// pipeline for the first generated token sooner. Streamed multi-chunk turns
+    /// on the conv's left-context carry so it stays byte-identical to one-shot.
+    #[arg(long, default_value_t = 0)]
+    prefill_ubatch: usize,
 
     /// The rotating ring's history depth under `--cache rewindable` (non-dspark):
     /// the rewind horizon. `--dspark` sizes it from the drafter's block.
@@ -616,7 +731,15 @@ fn main() -> Result<()> {
     }
     // `--mode reuse` carries the conv state across the turn-boundary prefill
     // (§13.2f). Set on the config the model is built from; a no-op for `single`.
-    config.conv_prefill_ctx = args.conv_prefill_ctx;
+    //
+    // Streamed prefill (`--prefill-ubatch > 0`) REQUIRES it: each chunk after the
+    // first is a `seq_len>1` pass onto a warm cache, and without the left-context
+    // carry the conv zero-pads the chunk boundary — a different convolution than
+    // one pass over the whole prompt, so the output diverges (measured: garbage
+    // from char 1). With it on, a chunked prefill computes exactly what one-shot
+    // does. A single chunk (or one-shot) is identical either way (cold cache, no
+    // left context to carry), so forcing it on when streaming is always safe.
+    config.conv_prefill_ctx = args.conv_prefill_ctx || args.prefill_ubatch > 0;
 
     let files = weight_files(&model_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
@@ -931,6 +1054,8 @@ fn main() -> Result<()> {
         // Under the speculative body this is the per-phase drain (decode.rs).
         sample_split: args.phase_sync,
         in_flight_depth,
+        // 0 = one-shot prefill (incumbent); >0 streams the prompt through the pacer.
+        prefill_ubatch: args.prefill_ubatch,
     };
 
     // The DSpark proposer, built only when `--dspark` is set. It borrows the
@@ -997,31 +1122,88 @@ fn main() -> Result<()> {
     // this is the point: the drain reads finished work off the ring, it does not
     // wait, so streaming does not re-serialize the non-blocking path.
     use std::io::Write;
-    let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
     let decode_start = std::time::Instant::now();
-    // Wall-clock to the first token the consumer is HANDED (the batch arrives),
-    // and to the first VISIBLE token (a byte reaches stdout). The reported
-    // `ttft_ms` is compute-availability (prefill + step0); this pair is what the
-    // user actually waits, and the gap between them is the commit-cadence /
-    // consumer coupling we are chasing. Measurement seam only.
+    // Wall-clock to the first token the consumer is HANDED (`first_batch_at`, on
+    // the decode thread when it pushes) and to the first VISIBLE token
+    // (`first_visible_ns`, on the CONSUMER thread when a byte reaches stdout).
+    // Measurement seam; the visible stamp is shared because it is set off-thread.
     let mut first_batch_at: Option<std::time::Duration> = None;
-    let mut first_visible_at: Option<std::time::Duration> = None;
+    let first_visible_ns = Arc::new(AtomicU64::new(0));
+
+    // The output decouple: the decode loop pushes ids into this SPSC (non-blocking,
+    // no syscall on the hot thread) and a separate consumer thread detokenizes and
+    // writes stdout. Sized to cover the whole run so `push` never blocks in
+    // practice. `-n 0` (unbounded) gets a generous 1M-slot ring.
+    let spsc_cap = if opts.max_tokens == 0 {
+        1 << 20
+    } else {
+        opts.max_tokens + 1024
+    };
+    let spsc = Arc::new(TokenSpsc::new(spsc_cap));
+
+    // The consumer thread: pop → detokenize → write stdout. A slow terminal stalls
+    // HERE, never the decode loop. Owns the tokenizer, the `TokenOutputStream` and
+    // the stdout handle for the whole run; parks briefly when the ring is empty
+    // (no notify from the producer — that per-commit futex wake is what spiked
+    // `step_waits` when this was an mpsc channel).
+    let consumer = {
+        let spsc = Arc::clone(&spsc);
+        let first_visible_ns = Arc::clone(&first_visible_ns);
+        std::thread::spawn(move || {
+            let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            loop {
+                match spsc.pop() {
+                    Some(id) => {
+                        if let Ok(Some(text)) = tos.next_token(id) {
+                            first_visible_ns
+                                .compare_exchange(
+                                    0,
+                                    decode_start.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                )
+                                .ok();
+                            // Direct write to the locked stdout; a write that the
+                            // kernel cannot take right now blocks THIS thread only.
+                            let _ = out.write_all(text.as_bytes());
+                            let _ = out.flush();
+                        }
+                    }
+                    None => {
+                        if spsc.closed.load(Ordering::Acquire) {
+                            break;
+                        }
+                        // Nothing right now: yield the core briefly rather than spin
+                        // a poll. ~200 µs is invisible at a terminal cadence and
+                        // costs the producer nothing.
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                }
+            }
+            // The tail the stream still holds (a partial multibyte run), then flush.
+            if let Ok(Some(rest)) = tos.decode_rest() {
+                let _ = out.write_all(rest.as_bytes());
+            }
+            let _ = out.flush();
+        })
+    };
+
     let out = {
-        // Returns `candle::Result`, which is the type `Session::decode`'s callback
-        // wants: `candle` is the workspace alias for `lloom-tensor` in this tree,
-        // so `candle::Result` and `lloom_tensor::Result` are one type. `next_token`
-        // already returns it, so no map is needed.
+        // The hot-thread callback: push each drained id into the SPSC. Atomic
+        // stores only — no detokenize, no `print!`, no `flush`, no allocation, no
+        // notify. `push` returns false only if the ring is full (a wedged
+        // consumer), in which case spin until it drains — the one place a
+        // sustained-backpressure stall is allowed to land, and unreachable for a
+        // ring sized to the run.
         let mut on_tokens = |batch: &[u32]| -> candle::Result<()> {
             if first_batch_at.is_none() && !batch.is_empty() {
                 first_batch_at = Some(decode_start.elapsed());
             }
             for &id in batch {
-                if let Some(text) = tos.next_token(id)? {
-                    if first_visible_at.is_none() {
-                        first_visible_at = Some(decode_start.elapsed());
-                    }
-                    print!("{text}");
-                    std::io::stdout().flush().ok();
+                while !spsc.push(id) {
+                    std::hint::spin_loop();
                 }
             }
             Ok(())
@@ -1048,6 +1230,7 @@ fn main() -> Result<()> {
             }
             None => decode_with(
                 &args.readback,
+                args.wake_cadence,
                 &mut session,
                 &mut spec,
                 &mut logits_processor,
@@ -1060,11 +1243,14 @@ fn main() -> Result<()> {
         }
     };
     let decode_elapsed = decode_start.elapsed();
-    // The tail the streaming decoder is still holding (a partial multibyte run),
-    // then a newline so the reply is its own line before the perf report.
-    if let Some(rest) = tos.decode_rest()? {
-        print!("{rest}");
-    }
+    // Signal the consumer no more ids are coming and wait for it to drain what
+    // remains, print the multibyte tail, and flush.
+    spsc.closed.store(true, Ordering::Release);
+    consumer.join().ok();
+    let first_visible_at = match first_visible_ns.load(Ordering::Relaxed) {
+        0 => None,
+        ns => Some(std::time::Duration::from_nanos(ns)),
+    };
 
     let out_ids = out.ids;
     let n = out_ids.len();
@@ -1084,7 +1270,18 @@ fn main() -> Result<()> {
     //    loaded machine) drags the mean and says nothing about the steady path.
     let mut steps: Vec<u64> = st.step_ns.clone();
     let steady = if steps.is_empty() {
-        f64::NAN
+        // RELEASE (no per-step `step_ns` — the clock reads are compiled out of the
+        // hot path): the coarse llama-bench figure, measured host-side off the loop
+        // — generated tokens ÷ (decode wall-clock − prefill). No per-token
+        // `mach_absolute_time()` touched the steady path to produce it, so it cannot
+        // be skewed by the measurement itself. A debug/`--features profile` build
+        // takes the per-step median branch below instead.
+        let decode_only = decode_elapsed.as_secs_f64() - (st.prefill_ns as f64 / 1e9);
+        if decode_only > 0.0 {
+            n as f64 / decode_only
+        } else {
+            f64::NAN
+        }
     } else {
         // Median is taken on a sorted copy; the unsorted `step_ns[0]` above is the
         // first step, so sort AFTER reading the TTFT term.
@@ -1096,40 +1293,70 @@ fn main() -> Result<()> {
     // the first decode step (the first token is the prefill's own argmax, fed and
     // sampled in step 0). This is where the mmap'd weights fault in, so a cold
     // run's TTFT carries the load the `[loaded …]` line above deferred.
-    let ttft_ms = (st.prefill_ns + st.step_ns.first().copied().unwrap_or(0)) as f64 / 1e6;
-    // The measured user-facing latency: when the first batch was HANDED to the
-    // consumer vs the compute-availability `ttft_ms`. A gap ≫ 0 means the first
-    // token waited on the commit cadence (period), not on compute — the coupling
-    // the consumer decouple targets. Measurement seam.
+    // TTFT — the headline, made fair against llama-bench GIVEN our async design.
+    //
+    // llama-bench times a SYNCHRONOUS `llama_decode` (it blocks on the GPU) around
+    // the prompt and calls the elapsed span TTFT. We must NOT introduce that sync —
+    // the non-blocking pipeline is the whole design. The fair analog is the moment
+    // the host FIRST RECEIVES the first token, observed NON-BLOCKING on the hot
+    // thread and BEFORE any detokenize/print: `first_batch_at`. It captures the
+    // same span llama-bench's `-p` does (prefill + first-token compute, the GPU
+    // produced it and the host saw it) and excludes the same things (sampling,
+    // detokenize, print) — but without a forced sync, which is the honest
+    // architectural difference. The consumer-thread "to-screen" time is reported
+    // separately below (`visible`), it is NOT the headline.
+    //
+    // A debug/`--features profile` build additionally has the per-step `step_ns`
+    // and prints the finer compute term (`prefill + step0`) instead.
+    // Headline = the fair compute TTFT (A), always available now (stamped once at
+    // step 0, release-safe): prefill + first-token sample, no sync, no cadence, no
+    // print — the number comparable to llama-bench's `-p`.
+    let ttft_ms = st.ttft_compute_ns as f64 / 1e6;
+    // The seam apart: `received` is the fair, llama-bench-comparable TTFT (host
+    // gets the first token, non-blocking, no print) — the headline. `visible` is
+    // ours-only: the byte reaching stdout through the consumer thread, which
+    // includes detokenize + the consumer's poll + the terminal write. A gap
+    // `visible ≫ received` is the consumer/print cost the decouple moved OFF the
+    // hot path — real user-facing latency, but NOT what llama-bench times.
+    // Three TTFTs, because the architecture has three stages llama-bench does not
+    // separate: (A) compute — prefill + first-token sample, no sync/cadence/print,
+    // the llama-bench-comparable headline; (B) received — the host DRAINS the first
+    // token (A + the commit cadence / pipeline fill); visible — the byte reaches
+    // stdout (B + detokenize + the consumer thread). B−A is our cadence cost, and
+    // visible−B is the consumer/print the decouple moved off the hot path.
     eprintln!(
-        "[first-token wall-clock: batch-handed {} ms, visible {} ms | ttft(compute) {:.2} ms]",
+        "[first-token: compute {:.2} ms (fair TTFT, ~llama-bench) | received {} ms | visible {} ms (to stdout)]",
+        ttft_ms,
         first_batch_at
             .map(|d| format!("{:.2}", d.as_secs_f64() * 1e3))
             .unwrap_or_else(|| "n/a".into()),
         first_visible_at
             .map(|d| format!("{:.2}", d.as_secs_f64() * 1e3))
             .unwrap_or_else(|| "n/a".into()),
-        ttft_ms,
     );
     // The two TTFT terms apart, and the first steps by phase: `prefill_ns` is
     // the prompt's encode, and under `lookahead = 1` step 0's EOS wait is where
     // the prefill's GPU tail lands, so the split says which side a first-token
     // cost sits on.
     let ms = |ns: u64| ns as f64 / 1e6;
-    eprintln!(
-        "[ttft split: prefill {:.2} ms + step0 {:.2} ms; step_ns[1..={}] = {}; prompt_tokens={}]",
-        ms(st.prefill_ns),
-        ms(st.step_ns.first().copied().unwrap_or(0)),
-        st.step_ns.len().min(5).saturating_sub(1),
-        st.step_ns
-            .iter()
-            .skip(1)
-            .take(4)
-            .map(|&n| format!("{:.2}", ms(n)))
-            .collect::<Vec<_>>()
-            .join(" "),
-        prompt_ids.len(),
-    );
+    // The per-step split is a debug/profile detail — `step_ns` is empty in a plain
+    // release build (the reads are compiled out), so print it only when populated.
+    if !st.step_ns.is_empty() {
+        eprintln!(
+            "[ttft split: prefill {:.2} ms + step0 {:.2} ms; step_ns[1..={}] = {}; prompt_tokens={}]",
+            ms(st.prefill_ns),
+            ms(st.step_ns.first().copied().unwrap_or(0)),
+            st.step_ns.len().min(5).saturating_sub(1),
+            st.step_ns
+                .iter()
+                .skip(1)
+                .take(4)
+                .map(|&n| format!("{:.2}", ms(n)))
+                .collect::<Vec<_>>()
+                .join(" "),
+            prompt_ids.len(),
+        );
+    }
     for (name, census) in [
         ("prefill", &st.prefill_census),
         ("step 0", &st.step0_census),
@@ -1233,6 +1460,10 @@ fn main() -> Result<()> {
         b(format!("{steady:.1}")),
         if args.dspark {
             "rounds/s steady (median round); see the dspark line above for tok/s"
+        } else if st.step_ns.is_empty() {
+            // Release: coarse tokens ÷ (wall − prefill), measured host-side off the
+            // loop (llama-bench style); no per-step clock read skews it.
+            "tok/s steady (wall-clock, decode only)"
         } else {
             "tok/s steady (median decode step)"
         },
@@ -1562,6 +1793,7 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
 #[allow(clippy::too_many_arguments)]
 fn decode_with(
     readback: &str,
+    wake_cadence: usize,
     session: &mut Session<'_, Model>,
     spec: &mut IdentityProposer,
     sampler: &mut LogitsProcessor,
@@ -1582,6 +1814,14 @@ fn decode_with(
         max_draft: 0,
         period: opts.budget.period(),
         lookahead: opts.lookahead,
+        // Widen the ring's input buffer to the streamed-prefill chunk so a chunk
+        // stages into one reused buffer; 0 leaves it at `quantum` (the one-shot
+        // path allocates its whole-prompt input tensor via the trait default, so
+        // the input buffer width is not consulted there).
+        max_input_width: opts.prefill_ubatch(),
+        // The input ring needs `depth + 1` buffers so a host-staged chunk does not
+        // race an in-flight forward's read; the pacer depth is what bounds that.
+        in_flight_depth: opts.pacer_depth(),
     };
     let out = match readback {
         "blocking" => {
@@ -1620,7 +1860,11 @@ fn decode_with(
             // tokens are truncated from the output. Byte-identical to the poll
             // arm — the truncation lands at the same position the poll would
             // break at.
-            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::HostOnDrain)?;
+            // The wake-cadence knob only bites here: this arm defers its marker to
+            // the commit window, so `--wake-cadence N` wakes the host every N
+            // commits instead of every one (the other arms stamp per step).
+            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::HostOnDrain)?
+                .with_wake_cadence(wake_cadence);
             let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
             if !rb.poll_is_mapped() {
                 eprintln!(
@@ -1631,9 +1875,28 @@ fn decode_with(
             debug_assert!(rb.arms().nonblocking_eos);
             out
         }
+        "ring-gpubatch" => {
+            // Like ring-hostdrain (no per-token flag, marker deferred to the commit
+            // window, `--wake-cadence` bites), but EOS is learned by ONE batched
+            // `eos_index` GPU dispatch per window instead of a host scan — the host
+            // reads back a single index per commit. Byte-identical to the other
+            // arms: the truncation lands at the same EOS position, computed on the
+            // GPU rather than scanned on the CPU.
+            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::GpuBatched)?
+                .with_wake_cadence(wake_cadence);
+            let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
+            if !rb.poll_is_mapped() {
+                eprintln!(
+                    "[ring-gpubatch: the ring's words were not CPU-mapped; the drain took the \
+                     synchronising snapshot each commit]"
+                );
+            }
+            debug_assert!(rb.arms().nonblocking_eos);
+            out
+        }
         other => anyhow::bail!(
-            "--readback must be `blocking`, `ring`, `ring-nonblocking` or `ring-hostdrain`, \
-             got `{other}`"
+            "--readback must be `blocking`, `ring`, `ring-nonblocking`, `ring-hostdrain` or \
+             `ring-gpubatch`, got `{other}`"
         ),
     };
     Ok(out)

@@ -12,7 +12,7 @@ pub mod token_ring;
 
 pub use readback::{
     Blocking, CommitBudget, EosRead, Geometry, ReadbackArms, ReadbackCounters, ReadbackStrategy,
-    Ring,
+    Ring, WAKE_LIVE_EVERY_DEFAULT,
 };
 
 #[derive(Clone, PartialEq, Debug)]

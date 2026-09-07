@@ -67,7 +67,7 @@ impl CommandBuffer {
                     raw,
                     self.raw.clone(),
                     fence,
-                    Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+                    Arc::new(crate::kernels::metal::encoder::FenceMap::new()),
                 )
             })
             .unwrap()

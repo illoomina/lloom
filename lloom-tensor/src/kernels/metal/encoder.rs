@@ -38,7 +38,125 @@ use std::{
 // ordering source (`DESIGN.md` §3.5 -- a missed fence is silent corruption, so
 // the set of entries and when they are inserted or removed is byte-for-byte what
 // it was; only the lock implementation changed).
-pub type PrevCeOutputs = Arc<parking_lot::RwLock<HashMap<usize, Arc<Fence>>>>;
+pub type PrevCeOutputs = Arc<FenceMap>;
+
+/// The cross-command-encoder fence map, with a **precise, lock-free entry
+/// count** alongside it.
+///
+/// `wait_for_buffer` reads this ~2000x per token (every buffer, every dispatch),
+/// but a cross-CB fence exists only at the ~11 cut boundaries, so >95% of those
+/// reads find an EMPTY map. Taking the `RwLock` read to find nothing is what
+/// contends the driver-completion thread's write (`cleanup`) -- and since the
+/// driver fires on the OS scheduler's clock, that contention is the dominant
+/// run-to-run throughput VARIANCE (issue #700). The atomic `len` lets the common
+/// all-clear read skip the lock entirely ([`Self::is_empty`]).
+///
+/// The count is **precise** (`+1` on a new insert, `-1` on remove, `0` on
+/// clear), maintained under the write lock -- not a defensive `map.len()`
+/// recompute. A drift would be a bug, so a `debug_assert!(count == map.len())`
+/// after every mutation is the poison that catches it under fuzz/debug at zero
+/// release cost. The map field is private: every mutation goes through a counting
+/// method, so a missed bump is structurally impossible, not merely remembered.
+pub struct FenceMap {
+    map: parking_lot::RwLock<HashMap<usize, Arc<Fence>>>,
+    /// The exact entry count, mirrored for the lock-free `is_empty` fast path.
+    len: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for FenceMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FenceMap {
+    pub fn new() -> Self {
+        Self {
+            map: parking_lot::RwLock::new(HashMap::new()),
+            len: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Lock-free: is the map empty? The fast path for `wait_for_buffer` -- when
+    /// there is no outstanding cross-CB fence (the overwhelming common case), the
+    /// per-bind check takes no lock and does not contend the driver write.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len.load(std::sync::atomic::Ordering::Acquire) == 0
+    }
+
+    /// The fence for `ptr`, if any. Takes the read lock -- callers guard it with
+    /// [`Self::is_empty`] to skip it on the all-clear path.
+    pub fn get(&self, ptr: usize) -> Option<Arc<Fence>> {
+        self.map.read().get(&ptr).cloned()
+    }
+
+    /// Insert `ptr -> fence`, returning the previous fence if the key existed.
+    /// `+1` only on a NEW key (a replace does not change the count).
+    pub fn insert(&self, ptr: usize, fence: Arc<Fence>) -> Option<Arc<Fence>> {
+        let mut map = self.map.write();
+        let prev = map.insert(ptr, fence);
+        if prev.is_none() {
+            self.len.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        debug_assert_eq!(
+            self.len.load(std::sync::atomic::Ordering::Relaxed),
+            map.len(),
+            "FenceMap count drifted on insert"
+        );
+        prev
+    }
+
+    /// Remove `ptr`, returning its fence if present. `-1` on an actual removal.
+    pub fn remove(&self, ptr: usize) -> Option<Arc<Fence>> {
+        let mut map = self.map.write();
+        let removed = map.remove(&ptr);
+        if removed.is_some() {
+            self.len.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+        debug_assert_eq!(
+            self.len.load(std::sync::atomic::Ordering::Relaxed),
+            map.len(),
+            "FenceMap count drifted on remove"
+        );
+        removed
+    }
+
+    /// Remove `ptr` iff its current fence is `fence` (pointer-identity), atomically
+    /// under one write guard. Returns `true` if it removed. The driver-cleanup
+    /// handler uses this: the get + ptr_eq + remove must not be split into separate
+    /// lock trips, or a concurrent re-insert of the same buffer between the read and
+    /// the remove could drop a fence that is no longer ours. `-1` on removal.
+    pub fn remove_matching(&self, ptr: usize, fence: &Arc<Fence>) -> bool {
+        let mut map = self.map.write();
+        let matches = map.get(&ptr).is_some_and(|f| Arc::ptr_eq(f, fence));
+        if matches {
+            map.remove(&ptr);
+            self.len.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        }
+        debug_assert_eq!(
+            self.len.load(std::sync::atomic::Ordering::Relaxed),
+            map.len(),
+            "FenceMap count drifted on remove_matching"
+        );
+        matches
+    }
+
+    /// Clear the map. Count -> 0.
+    pub fn clear(&self) {
+        let mut map = self.map.write();
+        map.clear();
+        self.len.store(0, std::sync::atomic::Ordering::Release);
+        debug_assert_eq!(map.len(), 0);
+    }
+
+    /// Read-lock the map for a scan (the rare non-empty path — the fence-cleanup
+    /// handler walks all outputs). The count is NOT touched here; callers that
+    /// mutate during the scan use [`Self::remove`].
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<usize, Arc<Fence>>> {
+        self.map.read()
+    }
+}
 
 fn size_tuple(size: MTLSize) -> (usize, usize, usize) {
     (size.width, size.height, size.depth)
@@ -583,13 +701,18 @@ impl ComputeCommandEncoder {
     /// encoder already records every buffer it binds, so the wait can be
     /// limited to buffers this encoder actually touches.
     fn wait_for_buffer(&self, ptr: usize) {
-        let fence = {
-            // Per-bind read: the frequent access, and why the map is an `RwLock`.
-            // `parking_lot` guards are infallible -- no `unwrap`.
-            let map = self.prev_ce_outputs.read();
-            map.get(&ptr).cloned()
+        // Lock-free fast path: no outstanding cross-CB fence -> nothing to wait
+        // on, and (the point) no `RwLock` read to contend the driver-completion
+        // thread's write. This is the ~95% case (fences exist only at the ~11
+        // cut boundaries, not on the ~2000 binds/token), so the host read-storm
+        // that produced the run-to-run variance (#700) is gone on this path.
+        if self.prev_ce_outputs.is_empty() {
+            return;
+        }
+        // The rare non-empty case: take the read lock and look this ptr up.
+        let Some(fence) = self.prev_ce_outputs.get(ptr) else {
+            return;
         };
-        let Some(fence) = fence else { return };
 
         let mut state = self.state.lock();
         if state.waited_fences.insert(Arc::as_ptr(&fence) as usize) {
@@ -1260,11 +1383,8 @@ impl BlitCommandEncoder {
 
         // Register outputs so subsequent encoders can wait. A write, taken once
         // per encoder close -- rare against the per-bind reads above.
-        {
-            let mut map = self.prev_ce_outputs.write();
-            for &out in &self.tracked_outputs {
-                map.insert(out, Arc::clone(&self.fence));
-            }
+        for &out in &self.tracked_outputs {
+            self.prev_ce_outputs.insert(out, Arc::clone(&self.fence));
         }
     }
 
@@ -1289,6 +1409,12 @@ impl BlitCommandEncoder {
     /// same wait twice on the common path.
     fn wait_for_last_writers(&self, ptrs: &[usize]) {
         use objc2_metal::MTLBlitCommandEncoder as _;
+
+        // Lock-free fast path: no outstanding cross-encoder fence -> nothing to wait
+        // on. Mirrors `wait_for_buffer`; skips the read lock on the all-clear path.
+        if self.prev_ce_outputs.is_empty() {
+            return;
+        }
 
         let fences: Vec<Arc<Fence>> = {
             // A read of the ordering map (blit-after-blit); see `PrevCeOutputs`.
@@ -1374,6 +1500,134 @@ mod tests {
 
     fn r(ptr: usize, offset: usize, len: usize) -> BoundRange {
         BoundRange { ptr, offset, len }
+    }
+
+    /// A tiny deterministic PRNG (SplitMix64) -- reproducible, no `rand` dep. Same
+    /// generator the readback ring fuzz uses; a fixed seed sweeps the op space and
+    /// any failure reproduces exactly.
+    struct SmallRng(u64);
+    impl SmallRng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn upto(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// The precise `+1/-1` count in [`FenceMap`] is what the lock-free `is_empty`
+    /// fast path rests on: a drifted count either strands the fast path off forever
+    /// (a silent perf loss) or -- worse -- reports empty while a fence is still
+    /// live (a missed wait -> a data race). The design chose an exact count with a
+    /// `debug_assert` poison over a defensive `store(map.len())` precisely so a
+    /// drift surfaces here, in a fuzz, and not as a Heisenbug in the field.
+    ///
+    /// This drives a randomized `insert`/`remove`/`remove_matching`/`clear` stream
+    /// -- with duplicate keys (a replace must NOT bump the count), absent-key
+    /// removes (a no-op must NOT decrement), and wrong-fence `remove_matching` (a
+    /// mismatch must NOT decrement) -- against a reference `HashMap`, asserting the
+    /// count and membership match at every step. The internal `debug_assert_eq!`
+    /// fires too under a debug test build; the explicit asserts make the property
+    /// meaningful in a release test run as well.
+    #[test]
+    fn fence_map_count_never_drifts_under_fuzz() {
+        let Some(device) = crate::kernels::metal::Device::system_default() else {
+            eprintln!("no Metal device; skipping fence_map fuzz");
+            return;
+        };
+
+        // A small pool of distinct fences (distinct `Arc` identities) and a small
+        // pool of keys, so duplicate inserts and matching/mismatching removes
+        // actually collide rather than always hitting fresh entries.
+        let fences: Vec<Arc<Fence>> = (0..4).map(|_| Arc::new(Fence::new(&device))).collect();
+        let keys: [usize; 6] = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+
+        let fm = FenceMap::new();
+        // Reference: key -> index into `fences`, mirroring what `fm` should hold.
+        let mut reference: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+
+        let mut rng = SmallRng(0xFACE_F00D_0BAD_5EED);
+        for step in 0..20_000usize {
+            let op = rng.upto(5);
+            let key = keys[rng.upto(keys.len())];
+            let fi = rng.upto(fences.len());
+            match op {
+                // insert: +1 only if the key is new; a replace leaves the count.
+                0 | 1 => {
+                    let prev = fm.insert(key, Arc::clone(&fences[fi]));
+                    let ref_prev = reference.insert(key, fi);
+                    assert_eq!(
+                        prev.is_some(),
+                        ref_prev.is_some(),
+                        "step {step}: insert replace-signal disagreed"
+                    );
+                }
+                // remove: -1 iff present.
+                2 => {
+                    let removed = fm.remove(key);
+                    let ref_removed = reference.remove(&key);
+                    assert_eq!(
+                        removed.is_some(),
+                        ref_removed.is_some(),
+                        "step {step}: remove present-signal disagreed"
+                    );
+                }
+                // remove_matching: -1 iff present AND the fence identity matches.
+                3 => {
+                    let removed = fm.remove_matching(key, &fences[fi]);
+                    let ref_removed = reference.get(&key) == Some(&fi);
+                    if ref_removed {
+                        reference.remove(&key);
+                    }
+                    assert_eq!(
+                        removed, ref_removed,
+                        "step {step}: remove_matching identity-signal disagreed"
+                    );
+                }
+                // clear: count -> 0.
+                _ => {
+                    fm.clear();
+                    reference.clear();
+                }
+            }
+
+            // The invariant, checked every step: the lock-free count equals the
+            // real map size, `is_empty` agrees with the reference, and a spot-read
+            // resolves to the same fence identity the reference expects.
+            assert_eq!(
+                fm.read().len(),
+                reference.len(),
+                "step {step}: FenceMap size diverged from reference"
+            );
+            assert_eq!(
+                fm.is_empty(),
+                reference.is_empty(),
+                "step {step}: is_empty diverged from reference"
+            );
+            let probe = keys[rng.upto(keys.len())];
+            match (fm.get(probe), reference.get(&probe)) {
+                (Some(got), Some(&want_fi)) => assert!(
+                    Arc::ptr_eq(&got, &fences[want_fi]),
+                    "step {step}: get returned the wrong fence identity"
+                ),
+                (None, None) => {}
+                (a, b) => panic!(
+                    "step {step}: get membership diverged (fm={}, ref={})",
+                    a.is_some(),
+                    b.is_some()
+                ),
+            }
+        }
+
+        // Drain to empty and confirm the fast path re-arms.
+        fm.clear();
+        assert!(fm.is_empty(), "cleared map must read empty");
+        assert_eq!(fm.read().len(), 0, "cleared map must have size 0");
     }
 
     /// The property route (a) rests on: two bindings collide exactly when they

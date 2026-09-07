@@ -398,9 +398,14 @@ struct History {
     /// Tiles fully consumed by the drain (monotonic); the drain advances whole
     /// tiles at a time.
     drained_tiles: usize,
-    /// Real tokens in each tile, indexed by `tile % total_tiles`, recorded at
-    /// close. What lets the strided read skip each tile's waste with no scan.
-    tile_counts: Vec<u16>,
+    /// Real tokens in each tile (the OUT-side count, ≤ `quantum`), indexed by
+    /// `tile % total_tiles`, recorded at close. What lets the strided read skip
+    /// each tile's waste with no scan. `u32` not `u16`: `quantum = batch ×
+    /// (max_draft+1)` can exceed 65535 for a large batch, and a `u16` would
+    /// silently truncate the count — a wrong-output cap, not a loud one. This is
+    /// the N_out cap; N_in (a burst fed into the input slot) is a SEPARATE
+    /// structure and never sizes this ring.
+    tile_counts: Vec<u32>,
     /// Real tokens written into the currently open tile so far, `< quantum`; 0
     /// when no tile is open (between close and the next `begin_step`).
     in_tile: usize,
@@ -448,7 +453,7 @@ impl History {
             drained: 0,
             tiles: 0,
             drained_tiles: 0,
-            tile_counts: vec![0u16; total_tiles],
+            tile_counts: vec![0u32; total_tiles],
             in_tile: 0,
             tile_open: false,
             #[cfg(feature = "metal")]
@@ -530,7 +535,7 @@ impl History {
             return Ok(());
         }
         let slot = self.tiles % self.total_tiles;
-        self.tile_counts[slot] = self.in_tile as u16;
+        self.tile_counts[slot] = self.in_tile as u32;
         #[cfg(debug_assertions)]
         if self.in_tile < self.quantum {
             let (seg, base) = self.tile_home(self.tiles);
@@ -561,7 +566,7 @@ impl History {
         let n = self.fed - self.drained;
         if self.tile_open {
             if self.in_tile > 0 {
-                self.tile_counts[self.tiles % self.total_tiles] = self.in_tile as u16;
+                self.tile_counts[self.tiles % self.total_tiles] = self.in_tile as u32;
                 self.tiles += 1;
             }
             self.tile_open = false;

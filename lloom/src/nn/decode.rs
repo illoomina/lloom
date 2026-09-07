@@ -757,10 +757,25 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // The periodic machinery: the only place the lookahead arm
             // commits. A step that already committed before its wait is not
             // committed twice.
+            //
+            // EARLY-COMMIT RAMP (TTFT). The steady commit cadence is `period`
+            // (e.g. 8), which batches the drain — good for throughput. But the
+            // drain is the ONLY place a token streams to the consumer, so at
+            // `period = 8` the FIRST token the user sees waits for step 8: measured
+            // ~161 ms of user-visible first-token latency while the token was
+            // computed at ~48 ms. That is the reported TTFT made moot. So for the
+            // first `period` tokens, commit EVERY step — each reads finished work
+            // (the drain never waits, §11.5a), so it costs a commit, not a stall —
+            // and the first token streams as soon as it is computed. After the
+            // ramp the steady period takes over and throughput is unchanged. The
+            // ramp only SHORTENS early commits, so it cannot delay token 0; it is
+            // TTFT-safe by construction. `period == 1` (per-token) already commits
+            // every step, so the ramp is a no-op there.
+            let in_ttft_ramp = produced <= opts.budget.period();
             let mut committed_now = committed_this_step;
             if loop_commits && !committed_this_step {
                 since_commit += 1;
-                if opts.budget.due(since_commit) {
+                if in_ttft_ramp || opts.budget.due(since_commit) {
                     self.commit(&device, &mut stats)?;
                     since_commit = 0;
                     committed_now = true;

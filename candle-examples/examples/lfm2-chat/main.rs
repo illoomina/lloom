@@ -948,14 +948,27 @@ fn main() -> Result<()> {
     use std::io::Write;
     let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
     let decode_start = std::time::Instant::now();
+    // Wall-clock to the first token the consumer is HANDED (the batch arrives),
+    // and to the first VISIBLE token (a byte reaches stdout). The reported
+    // `ttft_ms` is compute-availability (prefill + step0); this pair is what the
+    // user actually waits, and the gap between them is the commit-cadence /
+    // consumer coupling we are chasing. Measurement seam only.
+    let mut first_batch_at: Option<std::time::Duration> = None;
+    let mut first_visible_at: Option<std::time::Duration> = None;
     let out = {
         // Returns `candle::Result`, which is the type `Session::decode`'s callback
         // wants: `candle` is the workspace alias for `lloom-tensor` in this tree,
         // so `candle::Result` and `lloom_tensor::Result` are one type. `next_token`
         // already returns it, so no map is needed.
         let mut on_tokens = |batch: &[u32]| -> candle::Result<()> {
+            if first_batch_at.is_none() && !batch.is_empty() {
+                first_batch_at = Some(decode_start.elapsed());
+            }
             for &id in batch {
                 if let Some(text) = tos.next_token(id)? {
+                    if first_visible_at.is_none() {
+                        first_visible_at = Some(decode_start.elapsed());
+                    }
                     print!("{text}");
                     std::io::stdout().flush().ok();
                 }
@@ -1033,6 +1046,20 @@ fn main() -> Result<()> {
     // sampled in step 0). This is where the mmap'd weights fault in, so a cold
     // run's TTFT carries the load the `[loaded …]` line above deferred.
     let ttft_ms = (st.prefill_ns + st.step_ns.first().copied().unwrap_or(0)) as f64 / 1e6;
+    // The measured user-facing latency: when the first batch was HANDED to the
+    // consumer vs the compute-availability `ttft_ms`. A gap ≫ 0 means the first
+    // token waited on the commit cadence (period), not on compute — the coupling
+    // the consumer decouple targets. Measurement seam.
+    eprintln!(
+        "[first-token wall-clock: batch-handed {} ms, visible {} ms | ttft(compute) {:.2} ms]",
+        first_batch_at
+            .map(|d| format!("{:.2}", d.as_secs_f64() * 1e3))
+            .unwrap_or_else(|| "n/a".into()),
+        first_visible_at
+            .map(|d| format!("{:.2}", d.as_secs_f64() * 1e3))
+            .unwrap_or_else(|| "n/a".into()),
+        ttft_ms,
+    );
     // The two TTFT terms apart, and the first steps by phase: `prefill_ns` is
     // the prompt's encode, and under `lookahead = 1` step 0's EOS wait is where
     // the prefill's GPU tail lands, so the split says which side a first-token

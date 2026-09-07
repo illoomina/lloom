@@ -379,6 +379,10 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     },
                     lookahead,
                     sample_split: false,
+                    // 0 = the pacer's floor (no warmup ran here) and the one-shot
+                    // prefill: the incumbent behaviour on both dials.
+                    in_flight_depth: 0,
+                    prefill_ubatch: 0,
                 };
                 self.session.decode_until(
                     &mut spec,

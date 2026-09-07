@@ -704,14 +704,12 @@ impl TokenRing {
 
     /// The current input TILE index (the one the last stage/publish wrote and the
     /// forward reads). For a fuzz oracle that tracks per-tile contents.
-    #[cfg(feature = "metal")]
     pub fn current_input_slot(&self) -> usize {
         self.slot.get()
     }
 
     /// The number of input tiles (`depth + 1`) — the ring's cycle length. For a
     /// fuzz oracle mirroring the cursor.
-    #[cfg(feature = "metal")]
     pub fn input_slot_count(&self) -> usize {
         self.inputs.total_tiles()
     }
@@ -719,7 +717,7 @@ impl TokenRing {
     /// Read the CURRENT input tile's first `width` slots back through the mapped
     /// pointer — the same zero-copy access the GPU forward makes. For fuzzing the
     /// input ring on the real path (not a `to_cpu` copy). `None` if unmapped.
-    #[cfg(feature = "metal")]
+    /// Without Metal the segment is host memory and the read is a plain copy.
     pub fn peek_current_input(&mut self, width: usize) -> Option<Vec<u32>> {
         let tile = self.slot.get();
         self.inputs.peek_tile(tile, width)
@@ -727,7 +725,6 @@ impl TokenRing {
 
     /// Poison every input tile with a sentinel — a fuzz then asserts a read of a
     /// never-staged slot returns it, catching a wrong-tile or over-width read.
-    #[cfg(feature = "metal")]
     pub fn poison_input(&self, sentinel: u32) -> Result<()> {
         self.inputs.poison_all(sentinel)
     }

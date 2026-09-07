@@ -560,23 +560,35 @@ impl SegmentedRing {
     /// is the memory this pointer sees). For fuzzing the input ring on the real
     /// path rather than through a `to_cpu` copy. `None` if the segment is unmapped
     /// (the caller then has no zero-copy read to check). `width ≤ quantum`.
-    #[cfg(feature = "metal")]
     pub(crate) fn peek_tile(&mut self, tile: usize, width: usize) -> Option<Vec<u32>> {
         debug_assert!(width <= self.quantum);
         let (seg, offset) = self.tile_home(tile);
-        let base = *self.resolve_bases()?.get(seg)?;
-        // SAFETY: `base` is the mapped base of a never-reallocated segment;
-        // `[offset, offset+width) ≤ segment len` (a tile fits its segment). A plain
-        // read of finished host-visible memory (no GPU writing it in the fuzz).
-        let src = unsafe { std::slice::from_raw_parts(base.add(offset), width) };
-        Some(src.to_vec())
+        #[cfg(feature = "metal")]
+        {
+            let base = *self.resolve_bases()?.get(seg)?;
+            // SAFETY: `base` is the mapped base of a never-reallocated segment;
+            // `[offset, offset+width) ≤ segment len` (a tile fits its segment). A plain
+            // read of finished host-visible memory (no GPU writing it in the fuzz).
+            let src = unsafe { std::slice::from_raw_parts(base.add(offset), width) };
+            Some(src.to_vec())
+        }
+        // Without Metal there is no mapped pointer and no other read path: the
+        // segment IS host memory, so the copy is the same read the forward makes.
+        #[cfg(not(feature = "metal"))]
+        {
+            self.segments
+                .get(seg)?
+                .narrow(0, offset, width)
+                .ok()?
+                .to_vec1::<u32>()
+                .ok()
+        }
     }
 
     /// Poison EVERY slot of every segment with a sentinel — for a fuzz that then
     /// asserts a read of a NEVER-STAGED slot (a wrong tile, or past a chunk's
     /// width) returns the sentinel rather than a plausible-stale token. Debug/test
     /// only. Uses the same mapped write the staging does.
-    #[cfg(feature = "metal")]
     pub(crate) fn poison_all(&self, sentinel: u32) -> Result<()> {
         for seg in &self.segments {
             let len = seg.elem_count();
@@ -1333,9 +1345,19 @@ impl ReadbackStrategy for Ring {
         if matches!(self.eos, EosRead::GpuBatched) {
             let pending = match self.history.window_view() {
                 Some(tokens) => {
-                    let n = tokens.elem_count();
-                    let idx = tokens.eos_index(n, self.ring.eos_ids_tensor())?;
-                    Some((idx, n))
+                    #[cfg(feature = "metal")]
+                    {
+                        let n = tokens.elem_count();
+                        let idx = tokens.eos_index(n, self.ring.eos_ids_tensor())?;
+                        Some((idx, n))
+                    }
+                    // `eos_index` is a Metal dispatch; without it there is nothing
+                    // to enqueue and the drain's host scan covers this commit.
+                    #[cfg(not(feature = "metal"))]
+                    {
+                        let _ = tokens;
+                        None
+                    }
                 }
                 None => None,
             };

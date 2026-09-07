@@ -2157,6 +2157,49 @@ impl MetalStorage {
         }
     }
 
+    /// The batched EOS-index reduction: over the first `n` `U32` token ids in this
+    /// storage, return a `[1]` `U32` storage whose element is the FIRST index whose
+    /// token is one of `eos_ids`' `n_eos` stop ids, or `n` if none. One dispatch
+    /// (the `eos_index` kernel), device-resident result — the `GpuBatched` EOS
+    /// arm's primitive. Both operands must be contiguous `U32`.
+    pub fn eos_index(
+        &self,
+        tokens_offset: usize,
+        n: usize,
+        eos_ids: &Self,
+        eos_offset: usize,
+        n_eos: usize,
+    ) -> Result<Self> {
+        if self.dtype != DType::U32 || eos_ids.dtype != DType::U32 {
+            crate::bail!(
+                "eos_index expects U32 tokens and U32 eos_ids, got {:?}/{:?}",
+                self.dtype,
+                eos_ids.dtype
+            );
+        }
+        let device = self.device().clone();
+        let buffer = device
+            .new_buffer_builder()
+            .with_size_for(1, DType::U32)
+            .with_label("eos_index")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        crate::kernels::call_eos_index(
+            &device.device,
+            &encoder,
+            &device.kernels,
+            self.buffer(),
+            tokens_offset,
+            n,
+            eos_ids.buffer(),
+            eos_offset,
+            n_eos,
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+        Ok(Self::new(buffer, device.clone(), 1, DType::U32))
+    }
+
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }

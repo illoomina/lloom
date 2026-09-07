@@ -2217,6 +2217,40 @@ impl Tensor {
         }
     }
 
+    /// The batched EOS-index reduction: over the first `n` `U32` token ids in this
+    /// (contiguous rank-1) tensor, return a `[1]` `U32` tensor whose element is the
+    /// FIRST index whose token is in `eos_ids`, or `n` if none. One GPU dispatch
+    /// (the `eos_index` kernel) — the `GpuBatched` EOS arm's device call, so the
+    /// host reads one word per commit window instead of scanning the tokens or
+    /// computing a per-token flag. Metal only; both tensors must be contiguous
+    /// rank-1 `U32`.
+    #[cfg(feature = "metal")]
+    pub fn eos_index(&self, n: usize, eos_ids: &Tensor) -> Result<Tensor> {
+        if self.rank() != 1 || !self.is_contiguous() || eos_ids.rank() != 1 {
+            crate::bail!("eos_index: tokens and eos_ids must be contiguous rank-1");
+        }
+        let n_eos = eos_ids.elem_count();
+        // The token tensor may be a `narrow` of a ring segment — a view with a
+        // non-zero start offset into the SAME buffer. That offset lives in the
+        // layout, not the buffer pointer, so it must be handed to the dispatch
+        // explicitly (else the kernel reads the segment's first `n` slots, not the
+        // window's). Byte offsets: Metal's `setBuffer:offset:` counts bytes.
+        let tok_off = self.layout().start_offset() * self.dtype().size_in_bytes();
+        let eos_off = eos_ids.layout().start_offset() * eos_ids.dtype().size_in_bytes();
+        let storage = match (&*self.storage(), &*eos_ids.storage()) {
+            (Storage::Metal(tokens), Storage::Metal(ids)) => {
+                tokens.eos_index(tok_off, n, ids, eos_off, n_eos)?
+            }
+            _ => crate::bail!("eos_index is a Metal-only op"),
+        };
+        Ok(from_storage(
+            Storage::Metal(storage),
+            (1,),
+            BackpropOp::none(),
+            false,
+        ))
+    }
+
     /// Write `src` into this tensor's CPU-mapped Metal buffer at element `index`,
     /// host-side and zero-alloc — **no intermediate `Tensor`, no `slice_set`
     /// upload, no blit** (the write counterpart of [`Self::peek_scalar_ptr`]).

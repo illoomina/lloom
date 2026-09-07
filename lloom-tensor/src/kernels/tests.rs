@@ -9075,6 +9075,7 @@ fn run_eos_index(tokens: &[u32], eos_ids: &[u32]) -> u32 {
         0,
         tokens.len(),
         &eos_buf,
+        0,
         eos_ids.len(),
         &out,
     )
@@ -9117,6 +9118,50 @@ fn eos_index_is_deterministic() {
     for _ in 0..8 {
         assert_eq!(run_eos_index(&w, &eos), first, "eos_index must be deterministic");
     }
+}
+
+/// The offset path: the token window is a slice at a NON-ZERO offset into a
+/// larger buffer (exactly what a `narrow` of a ring segment produces). The
+/// dispatch must honour the byte offset — a version that read from slot 0 would
+/// scan the wrong tokens and miss the EOS. This is the regression that shipped
+/// once (the end-to-end gate caught a 10x overrun; this catches it at the kernel).
+fn run_eos_index_at(buffer: &[u32], offset: usize, n: usize, eos_ids: &[u32]) -> u32 {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let tokens_buf = new_buffer(&device, buffer);
+    let eos_buf = new_buffer(&device, eos_ids);
+    let out = new_buffer(&device, &[u32::MAX]);
+    crate::kernels::kernels::call_eos_index(
+        &device,
+        &encoder,
+        &kernels,
+        &tokens_buf,
+        offset * std::mem::size_of::<u32>(), // BYTE offset, as Metal's setBuffer:offset:
+        n,
+        &eos_buf,
+        0,
+        eos_ids.len(),
+        &out,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<u32>(&out, 1)[0]
+}
+
+#[test]
+fn eos_index_honours_the_token_offset() {
+    let eos = [7u32];
+    // A 10-slot buffer; the window is slots [4..8). The EOS (7) sits at absolute
+    // slot 6 = window index 2. A dispatch ignoring the offset would scan [0..4)
+    // (slots 1,2,3,4 — no 7) and wrongly report "none" (n=4).
+    let buffer = [1u32, 2, 3, 4, 5, 9, 7, 8, 100, 100];
+    assert_eq!(run_eos_index_at(&buffer, 4, 4, &eos), 2, "must scan the window at the offset");
+    // A window with no EOS at its offset returns n even though an EOS exists
+    // OUTSIDE the window (slot 6): window [0..4) has no 7.
+    assert_eq!(run_eos_index_at(&buffer, 0, 4, &eos), 4, "must not see EOS outside the window");
 }
 
 #[test]

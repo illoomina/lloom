@@ -315,6 +315,21 @@ pub enum EosRead {
     /// mapped for the zero-copy drain; the drain's own fallback covers the
     /// unmapped case.
     HostOnDrain,
+    /// Learn EOS with a **batched GPU check, once per commit window** — the middle
+    /// ground between [`Self::Poll`] (a ~5-dispatch flag EVERY token) and
+    /// [`Self::HostOnDrain`] (a host scan, no GPU work). The per-step path writes
+    /// only the input slot (like `HostOnDrain`); at each commit the window's tokens
+    /// go through ONE `eos_index` dispatch (a full-threadgroup min-reduction) that
+    /// returns the first stop-token index in the window, or `n`. The host reads
+    /// that one index per commit and never scans the tokens itself — this holds at
+    /// B>1 too, where the GPU hands back the position per sequence.
+    ///
+    /// Same overrun trade as `HostOnDrain` (EOS discovered on the commit cadence,
+    /// ≤ a window past it), and it rides the same stamped counter for drain
+    /// visibility; the batched check is the added device work, paid once per window
+    /// rather than per token. A window that straddles a ring segment boundary or a
+    /// quantum>1 (waste-gap) layout falls back to the host scan for that drain.
+    GpuBatched,
 }
 
 /// The per-step token production geometry, known BEFORE the run (unlike a KV
@@ -761,6 +776,29 @@ impl History {
         self.fed - self.drained
     }
 
+    /// A `[n]` `U32` view of the undrained window `[drained, fed)` for the batched
+    /// EOS check — the tokens the GpuBatched arm scans in one dispatch. Returns the
+    /// view AND its start offset within the window (always 0 here — the window's
+    /// first token is index 0 of the returned view, so a found EOS index maps
+    /// directly to a window position). `None` (caller falls back to the host scan)
+    /// when the window is empty, the quantum is not 1 (waste-gap layout — the dense
+    /// window view is exact only at quantum 1, as `drain_mapped`), or the window
+    /// would straddle a segment boundary (a rare split the single-view kernel does
+    /// not cover; the host-scan fallback is correct there).
+    fn window_view(&self) -> Option<Tensor> {
+        let n = self.fed - self.drained;
+        if n == 0 || self.ring.quantum != 1 {
+            return None;
+        }
+        // quantum == 1: token index == slot index == tile index within a segment.
+        let (seg, off) = self.ring.tile_home(self.drained);
+        let slots_per_seg = self.ring.tiles_per_seg; // × quantum, quantum == 1
+        if off + n > slots_per_seg {
+            return None; // spans a segment boundary — fall back to the host scan.
+        }
+        self.ring.segments[seg].narrow(0, off, n).ok()
+    }
+
     /// Forget the undrained window without reading it (the HostOnDrain arm's
     /// overrun past an EOS): advance the drain cursors to `fed`, closing the open
     /// tile, so a later run's first drain starts fresh. Returns the count
@@ -945,11 +983,18 @@ pub struct Ring {
     history: History,
     /// The ordinal stamped on the last publish; 0 before any.
     generation: u32,
-    /// The EOS id set, host-side, for the [`EosRead::HostOnDrain`] compare.
-    /// Read back from the device ring once at construction (a loop invariant),
-    /// so the per-token path never touches it. Empty on the other arms, which
-    /// learn EOS from the device flag instead.
+    /// The EOS id set, host-side, for the [`EosRead::HostOnDrain`] (and the
+    /// `GpuBatched` fallback) compare. Read back from the device ring once at
+    /// construction (a loop invariant), so the per-token path never touches it.
+    /// Empty on the pure-device arms.
     eos_ids_host: Vec<u32>,
+    /// [`EosRead::GpuBatched`]: the `[1]` `U32` result of the window's `eos_index`
+    /// dispatch, enqueued at `publish_marker` and read back once at the drain
+    /// (`eos_in_drained`) — a per-commit sync, off the per-token path. Holds the
+    /// window length the position is relative to, so a host that gets index `< len`
+    /// knows an EOS fell at that window offset. `None` between commits and on every
+    /// other arm.
+    pending_eos_index: std::cell::RefCell<Option<(Tensor, usize)>>,
     counters: ReadbackCounters,
 }
 
@@ -1099,9 +1144,10 @@ impl Ring {
     ) -> Result<Self> {
         let ring = TokenRing::with_input_ring(0, eos_ids, device, max_input_width, input_slots)?;
         let history = History::new(cap, quantum, device)?;
-        // Cache the EOS ids host-side only for the arm that compares them there;
-        // the other arms read the device flag and never touch this.
-        let eos_ids_host = if matches!(eos, EosRead::HostOnDrain) {
+        // Cache the EOS ids host-side for the arms that need them there: the pure
+        // host compare (`HostOnDrain`) and the `GpuBatched` fallback + its `n_eos`.
+        // The per-token device-flag arms never touch this.
+        let eos_ids_host = if matches!(eos, EosRead::HostOnDrain | EosRead::GpuBatched) {
             ring.eos_ids()?
         } else {
             Vec::new()
@@ -1112,6 +1158,7 @@ impl Ring {
             history,
             generation: 0,
             eos_ids_host,
+            pending_eos_index: std::cell::RefCell::new(None),
             poll_budget: POLL_BUDGET,
             live_every: WAKE_LIVE_EVERY_DEFAULT,
             commits_since_live: std::cell::Cell::new(0),
@@ -1162,7 +1209,10 @@ impl ReadbackStrategy for Ring {
             token_ring: true,
             // Both the poll and the host-on-drain arms learn EOS without a
             // per-step blocking readback of the device flag.
-            nonblocking_eos: matches!(self.eos, EosRead::Poll(_) | EosRead::HostOnDrain),
+            nonblocking_eos: matches!(
+                self.eos,
+                EosRead::Poll(_) | EosRead::HostOnDrain | EosRead::GpuBatched
+            ),
         }
     }
 
@@ -1244,7 +1294,11 @@ impl ReadbackStrategy for Ring {
             // host-side from the drained batch (`eos_in_drained`); the completion
             // marker the drain clamps to is written once per commit window by
             // [`ReadbackStrategy::publish_marker`], not per token.
-            EosRead::HostOnDrain => self.ring.publish_input(&sampled)?,
+            // Both deferred-EOS arms write only the input slot per step; they learn
+            // EOS at the commit window (host scan for `HostOnDrain`, the batched
+            // `eos_index` dispatch for `GpuBatched`), and the marker is written once
+            // per window by `publish_marker`.
+            EosRead::HostOnDrain | EosRead::GpuBatched => self.ring.publish_input(&sampled)?,
         }
         self.history.wrote_one();
         // The tile is left OPEN; `eos_of_last` may retract this token, and the
@@ -1262,11 +1316,30 @@ impl ReadbackStrategy for Ring {
     }
 
     fn publish_marker(&mut self, force_live: bool) -> Result<()> {
-        // Only the host-on-drain arm defers its stamp to the commit window; the
+        // Only the deferred-EOS arms write their marker at the commit window; the
         // poll arm stamped per step inside `sample_and_feed` (marker ≡ EOS flag),
         // and the blocking arm has its own readback.
-        if !matches!(self.eos, EosRead::HostOnDrain) || self.generation == 0 {
+        if !matches!(self.eos, EosRead::HostOnDrain | EosRead::GpuBatched) || self.generation == 0 {
             return Ok(());
+        }
+        // GpuBatched: enqueue the batched EOS check over this window's tokens
+        // BEFORE the marker/commit, so the `eos_index` dispatch rides the committing
+        // buffer AFTER the window's slots (queue order) and its `[1]` result is
+        // ready to read back at the drain. The host reads that index once per
+        // commit (`eos_in_drained`), never scanning the tokens itself. A window that
+        // does not present a dense single-segment view (quantum>1, or a
+        // segment-boundary straddle) yields `None` here and the drain falls back to
+        // the host scan for this commit.
+        if matches!(self.eos, EosRead::GpuBatched) {
+            let pending = match self.history.window_view() {
+                Some(tokens) => {
+                    let n = tokens.elem_count();
+                    let idx = tokens.eos_index(n, self.ring.eos_ids_tensor())?;
+                    Some((idx, n))
+                }
+                None => None,
+            };
+            *self.pending_eos_index.borrow_mut() = pending;
         }
         // The wake-cadence throttle. A commit is LIVE — writes the device word the
         // host WFE-waits on — when the ramp forces it, or when `live_every`
@@ -1290,12 +1363,12 @@ impl ReadbackStrategy for Ring {
 
     fn eos_of_last(&mut self) -> Result<bool> {
         let is_eos = match self.eos {
-            // EOS is not learned per token on this arm — the device never
-            // computed the flag. The loop learns it from `eos_in_drained` on the
-            // batch it streams, so this always answers `false` and never
-            // retracts a token here (the retraction happens host-side, at the
-            // drain, when the batch is truncated to the EOS position).
-            EosRead::HostOnDrain => false,
+            // EOS is not learned per token on the deferred arms — the loop learns
+            // it from `eos_in_drained` on the batch it streams (a host scan for
+            // `HostOnDrain`, the batched `eos_index` result for `GpuBatched`), so
+            // this always answers `false` and never retracts here (the truncation
+            // happens host-side, at the drain).
+            EosRead::HostOnDrain | EosRead::GpuBatched => false,
             EosRead::Blocking => {
                 self.counters.poll_iters += 1;
                 self.ring.eos_flag().to_vec1::<u8>()?[0] != 0
@@ -1370,7 +1443,10 @@ impl ReadbackStrategy for Ring {
         // blocking arm's own per-step `to_vec1` already synchronised up to `fed`.
         let fed = self.history.generation();
         let end = match self.eos {
-            EosRead::Poll(_) | EosRead::HostOnDrain => match self.ring.published_generation() {
+            EosRead::Poll(_) | EosRead::HostOnDrain | EosRead::GpuBatched => match self
+                .ring
+                .published_generation()
+            {
                 Some(g) => fed.min(g as usize),
                 // Unmapped counter (no visibility signal): the copy fallback below
                 // is correct by force (it synchronises), so drain to `fed` there.
@@ -1417,14 +1493,38 @@ impl ReadbackStrategy for Ring {
         Ok(out)
     }
 
-    /// The host EOS check for [`EosRead::HostOnDrain`]: the index of the first
-    /// EOS id in `batch`, a plain Rust compare against the id set read back once
-    /// at construction (`eos_ids_host`). Costs no device work and no readback —
-    /// it runs on the batch the drain already produced. `None` (and empty
-    /// `eos_ids_host`) on every other arm, which learn EOS per token instead.
+    /// The EOS position in a drained `batch` for the deferred arms.
+    ///
+    /// - [`EosRead::HostOnDrain`]: a plain Rust `position` scan against the id set
+    ///   read back once at construction (`eos_ids_host`) — no device work.
+    /// - [`EosRead::GpuBatched`]: the index the window's `eos_index` dispatch
+    ///   already computed, read back ONCE here (a per-commit sync, off the
+    ///   per-token path). The window the GPU scanned is exactly this drained batch
+    ///   (`[drained, fed)` at the commit), so its index maps directly to a batch
+    ///   position; a `>= n` result means no EOS in the window. When the drain
+    ///   clamped SHORT of the matched index (the EOS token is fed but not yet
+    ///   drained this commit), the match is left for a later drain — returning it
+    ///   now would point past `batch`. If the window offered no dense view
+    ///   (`pending` is `None` — quantum>1 or a boundary straddle), fall back to the
+    ///   host scan.
+    ///
+    /// `None` (and empty `eos_ids_host`) on the per-token arms, which excluded EOS
+    /// already.
     fn eos_in_drained(&self, batch: &[u32]) -> Option<usize> {
         if self.eos_ids_host.is_empty() {
             return None;
+        }
+        if matches!(self.eos, EosRead::GpuBatched) {
+            if let Some((idx_t, n)) = self.pending_eos_index.borrow().as_ref() {
+                // Read the one index the dispatch wrote (per-commit sync).
+                let idx = idx_t.to_vec1::<u32>().ok()?.first().copied()? as usize;
+                if idx < *n && idx < batch.len() {
+                    return Some(idx);
+                }
+                // idx == n (no match) or the match is past what this drain took.
+                return None;
+            }
+            // No dense window view this commit — fall back to the host scan below.
         }
         batch.iter().position(|id| self.eos_ids_host.contains(id))
     }
@@ -1445,6 +1545,7 @@ impl ReadbackStrategy for Ring {
             EosRead::Blocking => "flag",
             EosRead::Poll(_) => "poll",
             EosRead::HostOnDrain => "drain",
+            EosRead::GpuBatched => "gpubatch",
         }
     }
 

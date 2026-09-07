@@ -24,6 +24,7 @@ pub fn call_eos_index(
     tokens_offset: usize,
     n: usize,
     eos_ids: &Buffer,
+    eos_offset: usize,
     n_eos: usize,
     out: &Buffer,
 ) -> Result<(), MetalKernelError> {
@@ -38,7 +39,7 @@ pub fn call_eos_index(
         (
             (tokens, tokens_offset),
             n as u32,
-            eos_ids,
+            (eos_ids, eos_offset),
             n_eos as u32,
             Output::new(out)
         )

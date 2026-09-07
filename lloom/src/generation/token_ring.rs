@@ -490,6 +490,13 @@ impl TokenRing {
         self.eos_ids.to_vec1::<u32>()
     }
 
+    /// The EOS id set as the device tensor, for the `GpuBatched` arm's `eos_index`
+    /// dispatch (which compares the window against it on the GPU). A loop-invariant
+    /// device constant, uploaded once at construction.
+    pub fn eos_ids_tensor(&self) -> &Tensor {
+        &self.eos_ids
+    }
+
     /// Non-blocking: has step `generation` published, and was it EOS? (#535)
     ///
     /// Returns `None` when the answer is not yet available *or* not available

@@ -1605,9 +1605,28 @@ fn decode_with(
             debug_assert!(rb.arms().nonblocking_eos);
             out
         }
+        "ring-gpubatch" => {
+            // Like ring-hostdrain (no per-token flag, marker deferred to the commit
+            // window, `--wake-cadence` bites), but EOS is learned by ONE batched
+            // `eos_index` GPU dispatch per window instead of a host scan — the host
+            // reads back a single index per commit. Byte-identical to the other
+            // arms: the truncation lands at the same EOS position, computed on the
+            // GPU rather than scanned on the CPU.
+            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::GpuBatched)?
+                .with_wake_cadence(wake_cadence);
+            let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
+            if !rb.poll_is_mapped() {
+                eprintln!(
+                    "[ring-gpubatch: the ring's words were not CPU-mapped; the drain took the \
+                     synchronising snapshot each commit]"
+                );
+            }
+            debug_assert!(rb.arms().nonblocking_eos);
+            out
+        }
         other => anyhow::bail!(
-            "--readback must be `blocking`, `ring`, `ring-nonblocking` or `ring-hostdrain`, \
-             got `{other}`"
+            "--readback must be `blocking`, `ring`, `ring-nonblocking`, `ring-hostdrain` or \
+             `ring-gpubatch`, got `{other}`"
         ),
     };
     Ok(out)

@@ -371,6 +371,90 @@ const TILE_POISON: u32 = 0xDEAD_B171; // "DEAD BITs"
 /// grows by adding SEGMENTS, each of this size, rather than one buffer past it.
 const SEG_MAX_SLOTS: usize = 4092;
 
+/// The segmented-buffer mechanism, shared by the OUTPUT history ring and (later)
+/// the INPUT staging ring — extracted so both use the SAME battle-tested zero-copy
+/// path rather than reinventing it (readback.rs's own N_in-vs-N_out note).
+///
+/// It owns ONLY the buffers and their addressing: `segments` (each ≤ [`SEG_MAX_SLOTS`]
+/// so it stays CPU-mapped under the 16384 B `StorageModePrivate` window §15.2 #12a),
+/// the tile geometry (`quantum` slots per tile, `tiles_per_seg`, `total_tiles`), the
+/// [`Self::tile_home`] arithmetic (a tile index → `(segment, slot-offset)`, tiles
+/// flowing across segments as ONE logical ring), and the memoized mapped base
+/// pointers ([`Self::seg_bases`], resolved once — segments are never reallocated).
+/// It does NOT own any read/write CURSOR or count — those are the caller's (the
+/// history keeps `fed`/`drained`/`tile_counts`; the input keeps its own). So this is
+/// pure placement + mapping, no policy, and introduces no lock, no allocation on any
+/// hot path, no blit, no volatile — exactly the existing mechanism, named.
+struct SegmentedRing {
+    /// N segment buffers, each `tiles_per_seg · quantum` `U32` slots, Private-mapped
+    /// (small → under the window → zero-copy). N = 1 is the single-buffer case.
+    segments: Vec<Tensor>,
+    /// Slots per tile — the write/read stride.
+    quantum: usize,
+    /// Tiles per segment (each segment is `tiles_per_seg · quantum` slots).
+    tiles_per_seg: usize,
+    /// `segments.len() · tiles_per_seg` — the ring's total tile count (the wrap).
+    total_tiles: usize,
+    /// The segments' CPU-mapped base pointers, resolved ONCE and memoized — stable
+    /// for the ring's life (segments never reallocated). `None` until first resolve;
+    /// `Some` once every segment mapped; stays `None` if any is unmapped (the caller
+    /// takes the copy fallback). `*const` is not `Send`/`Sync`, but a `Ring` is
+    /// single-consumer and never shared across threads (§11.5g).
+    #[cfg(feature = "metal")]
+    seg_bases: Option<Vec<*const u32>>,
+}
+
+impl SegmentedRing {
+    /// `cap` slots total, split into segments that each stay under the mapping
+    /// window; `quantum` slots per tile. N segments emerge from how many
+    /// whole-tile-multiples fit under [`SEG_MAX_SLOTS`]. `total_tiles` is rounded up
+    /// so every segment is full (uniform geometry). At least 2 tiles so one is free
+    /// for the writer while the other drains.
+    fn new(cap: usize, quantum: usize, device: &Device) -> Result<Self> {
+        let q = quantum.max(1);
+        let total_tiles = (cap / q).max(2);
+        let tiles_per_seg = (SEG_MAX_SLOTS / q).max(1);
+        let n_segments = total_tiles.div_ceil(tiles_per_seg).max(1);
+        let total_tiles = n_segments * tiles_per_seg;
+        let segments = (0..n_segments)
+            .map(|_| Tensor::zeros(tiles_per_seg * q, DType::U32, device))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            segments,
+            quantum: q,
+            tiles_per_seg,
+            total_tiles,
+            #[cfg(feature = "metal")]
+            seg_bases: None,
+        })
+    }
+
+    /// Physical home of a ring-tile index: which segment, and the slot offset of its
+    /// first token within that segment's buffer. Pure arithmetic, no scan.
+    fn tile_home(&self, tile: usize) -> (usize, usize) {
+        let t = tile % self.total_tiles;
+        let seg = t / self.tiles_per_seg;
+        let offset = (t % self.tiles_per_seg) * self.quantum;
+        (seg, offset)
+    }
+
+    /// Resolve (once) and return the memoized mapped base pointers, or `None` if any
+    /// segment is unmapped (the caller then takes the copy fallback). All segments
+    /// are the same size in the same pool, so they map together or not at all.
+    #[cfg(feature = "metal")]
+    fn resolve_bases(&mut self) -> Option<&[*const u32]> {
+        if self.seg_bases.is_none() {
+            let bases: Option<Vec<*const u32>> = self
+                .segments
+                .iter()
+                .map(|s| unsafe { s.peek_scalar_ptr::<u32>(0) })
+                .collect();
+            self.seg_bases = bases;
+        }
+        self.seg_bases.as_deref()
+    }
+}
+
 /// The device-side id history: a **ring of segments** ("lord of the rings").
 /// Owns the tile placement and the lap invariant; the [`Ring`] keeps the publish
 /// protocol (slot-before-stamp ordering, the published clamp).
@@ -407,16 +491,10 @@ const SEG_MAX_SLOTS: usize = 4092;
 /// model whose per-step production the geometry does not bound) is a hard bail,
 /// never a silent overwrite (§3.5).
 struct History {
-    /// N segment buffers, each `tiles_per_seg · quantum` `U32` slots, each
-    /// Private-mapped (small → under the 16384 B window → zero-copy drain). N = 1
-    /// is the single-buffer case.
-    segments: Vec<Tensor>,
-    /// Slots per tile — the write stride and the read stride.
-    quantum: usize,
-    /// Tiles per segment (each segment is `tiles_per_seg · quantum` slots).
-    tiles_per_seg: usize,
-    /// `segments.len() · tiles_per_seg` — the ring's total tile count.
-    total_tiles: usize,
+    /// The segmented-buffer mechanism (segments, tile geometry, `tile_home`, mapped
+    /// pointers). The history layers its OUTPUT state — the cursors and counts
+    /// below — over this shared placement primitive.
+    ring: SegmentedRing,
     /// Total real tokens ever written (monotonic, EOS-retracted).
     fed: usize,
     /// Total real tokens ever drained (monotonic). Live window = `[drained, fed)`.
@@ -440,44 +518,17 @@ struct History {
     in_tile: usize,
     /// Whether a tile is currently open (written-to but not yet closed).
     tile_open: bool,
-    /// The segments' CPU-mapped base pointers, resolved ONCE and memoized —
-    /// segments are written in place and never reallocated, so the pointers are
-    /// stable for the ring's life, and the first cut's per-commit
-    /// `peek_scalar_ptr` + `Vec::collect` was pure waste (a per-commit heap
-    /// allocation = the allocator lock on the hot path). `None` until the first
-    /// resolve; `Some(bases)` once every segment mapped; stays `None` if any is
-    /// unmapped (the copy fallback covers that). `*const` is not `Send`/`Sync`,
-    /// but a `Ring` is single-consumer and never shared across threads (§11.5g),
-    /// and `ReadbackStrategy` is used by monomorphized bound, never `dyn`/`Send`.
-    #[cfg(feature = "metal")]
-    seg_bases: Option<Vec<*const u32>>,
 }
 
 impl History {
     /// `cap` slots total across the ring, split into segments that each stay
-    /// under the mapping window. `quantum` slots per tile. N segments emerge from
-    /// how many whole-tile-multiples fit under [`SEG_MAX_SLOTS`].
+    /// under the mapping window. `quantum` slots per tile. The buffer geometry is
+    /// [`SegmentedRing`]; the history adds the output cursors + `tile_counts`.
     fn new(cap: usize, quantum: usize, device: &Device) -> Result<Self> {
-        let q = quantum.max(1);
-        // Total whole tiles the requested cap holds; at least 2 so one is free
-        // for the writer while the other drains.
-        let total_tiles = (cap / q).max(2);
-        // Tiles per segment: as many as fit under the mapping window, at least 1.
-        // A segment is `tiles_per_seg · quantum` slots and must stay < 4096 slots
-        // (16384 B) to be CPU-mapped (§15.2 #12a) — the property the single big
-        // buffer lost past 4092.
-        let tiles_per_seg = (SEG_MAX_SLOTS / q).max(1);
-        let n_segments = total_tiles.div_ceil(tiles_per_seg).max(1);
-        // Round total_tiles up so every segment is full (uniform geometry).
-        let total_tiles = n_segments * tiles_per_seg;
-        let segments = (0..n_segments)
-            .map(|_| Tensor::zeros(tiles_per_seg * q, DType::U32, device))
-            .collect::<Result<Vec<_>>>()?;
+        let ring = SegmentedRing::new(cap, quantum, device)?;
+        let total_tiles = ring.total_tiles;
         Ok(Self {
-            segments,
-            quantum: q,
-            tiles_per_seg,
-            total_tiles,
+            ring,
             fed: 0,
             drained: 0,
             tiles: 0,
@@ -485,18 +536,19 @@ impl History {
             tile_counts: vec![0u32; total_tiles],
             in_tile: 0,
             tile_open: false,
-            #[cfg(feature = "metal")]
-            seg_bases: None,
         })
     }
 
-    /// Physical home of a ring-tile index: which segment, and the slot offset of
-    /// its first token within that segment's buffer.
+    /// The ring's total tile count — the wrap. Delegated to the buffer geometry.
+    #[inline]
+    fn total_tiles(&self) -> usize {
+        self.ring.total_tiles
+    }
+
+    /// Physical home of a ring-tile index: `(segment, slot-offset)`. Delegated.
+    #[inline]
     fn tile_home(&self, tile: usize) -> (usize, usize) {
-        let t = tile % self.total_tiles;
-        let seg = t / self.tiles_per_seg;
-        let offset = (t % self.tiles_per_seg) * self.quantum;
-        (seg, offset)
+        self.ring.tile_home(tile)
     }
 
     /// Begin this step's tile and return `(segment, offset)` for its FIRST token.
@@ -508,14 +560,14 @@ impl History {
         self.close_open_tile()?;
         // At most `total_tiles - 1` tiles may be undrained, leaving one to open.
         let live_tiles = self.tiles - self.drained_tiles;
-        if live_tiles >= self.total_tiles {
+        if live_tiles >= self.total_tiles() {
             lloom_tensor::bail!(
                 "Ring history lap: {live_tiles} live tiles ≥ {} — the drain fell behind the \
                  geometry bound (period). This cannot happen under the known per-step geometry \
                  (quantum {}); a per-step production larger than one tile needs the \
                  unbounded-geometry fallback, not this ring.",
-                self.total_tiles,
-                self.quantum
+                self.total_tiles(),
+                self.ring.quantum
             );
         }
         self.in_tile = 0;
@@ -526,7 +578,7 @@ impl History {
     /// Record one real token just written into the open tile: advance `fed` and
     /// the in-tile count.
     fn wrote_one(&mut self) {
-        debug_assert!(self.tile_open && self.in_tile < self.quantum);
+        debug_assert!(self.tile_open && self.in_tile < self.ring.quantum);
         self.fed += 1;
         self.in_tile += 1;
     }
@@ -563,14 +615,14 @@ impl History {
             // tile stays available for reuse.
             return Ok(());
         }
-        let slot = self.tiles % self.total_tiles;
+        let slot = self.tiles % self.total_tiles();
         self.tile_counts[slot] = self.in_tile as u32;
         #[cfg(debug_assertions)]
-        if self.in_tile < self.quantum {
+        if self.in_tile < self.ring.quantum {
             let (seg, base) = self.tile_home(self.tiles);
-            let waste = self.quantum - self.in_tile;
-            let poison = Tensor::full(TILE_POISON, waste, self.segments[seg].device())?;
-            self.segments[seg].slice_set(&poison, 0, base + self.in_tile)?;
+            let waste = self.ring.quantum - self.in_tile;
+            let poison = Tensor::full(TILE_POISON, waste, self.ring.segments[seg].device())?;
+            self.ring.segments[seg].slice_set(&poison, 0, base + self.in_tile)?;
         }
         self.tiles += 1;
         Ok(())
@@ -595,7 +647,8 @@ impl History {
         let n = self.fed - self.drained;
         if self.tile_open {
             if self.in_tile > 0 {
-                self.tile_counts[self.tiles % self.total_tiles] = self.in_tile as u32;
+                let slot = self.tiles % self.total_tiles();
+                self.tile_counts[slot] = self.in_tile as u32;
                 self.tiles += 1;
             }
             self.tile_open = false;
@@ -637,7 +690,7 @@ impl History {
             return;
         }
         while self.drained_tiles < self.tiles {
-            let slot = self.drained_tiles % self.total_tiles;
+            let slot = self.drained_tiles % self.total_tiles();
             let count = self.tile_counts[slot] as usize;
             if self.drained + count > end {
                 break; // this tile is not fully visible yet; leave it.
@@ -682,22 +735,13 @@ impl History {
         // The window read is exact only for the dense (`quantum == 1`) layout,
         // where `token == slot` within a segment. Defer the waste-tail case to the
         // tile-aware copy path rather than scan tiles on the hot path.
-        if self.quantum != 1 {
+        if self.ring.quantum != 1 {
             return false;
         }
-        if self.seg_bases.is_none() {
-            // Resolve once. All segments are the same size in the same pool, so
-            // they map together or not at all; if any is unmapped, leave
-            // `seg_bases` None and signal the copy fallback.
-            let bases: Option<Vec<*const u32>> = self
-                .segments
-                .iter()
-                .map(|s| unsafe { s.peek_scalar_ptr::<u32>(0) })
-                .collect();
-            match bases {
-                Some(b) => self.seg_bases = Some(b),
-                None => return false,
-            }
+        // Resolve (once, memoized) the segments' mapped base pointers; unmapped →
+        // the copy fallback. The `&mut` borrow ends before the read loop below.
+        if self.ring.resolve_bases().is_none() {
+            return false;
         }
         out.clear();
         let end = end.min(self.fed);
@@ -706,12 +750,18 @@ impl History {
         }
         // `quantum == 1`: slots == tokens, `slots_per_seg == tiles_per_seg`. Walk
         // the window one segment-run at a time, bounds COMPUTED, no tile scan.
-        let slots_per_seg = self.tiles_per_seg; // × quantum, and quantum == 1
-        let bases = self.seg_bases.as_ref().unwrap();
+        let slots_per_seg = self.ring.tiles_per_seg; // × quantum, and quantum == 1
+        // Immutable borrow of the resolved bases + geometry for the loop (both from
+        // `self.ring`), so `tile_home` (also immutable) composes without conflict.
+        let bases = self
+            .ring
+            .seg_bases
+            .as_ref()
+            .expect("resolve_bases returned Some just above");
         while self.drained < end {
             // `home` of the next token: which segment, which offset within it.
             // `drained` is a token index == a tile index at quantum 1.
-            let (seg, off) = self.tile_home(self.drained);
+            let (seg, off) = self.ring.tile_home(self.drained);
             // This run ends at the earlier of the window end and this segment's
             // last slot — one contiguous span within a single mapped buffer.
             let seg_remaining = slots_per_seg - off;
@@ -738,6 +788,7 @@ impl History {
     /// not need. Fills `out` (caller-owned, pre-sized).
     fn drain_copy(&mut self, end: usize, out: &mut Vec<u32>) -> Result<()> {
         let snapshots = self
+            .ring
             .segments
             .iter()
             .map(|s| s.to_vec1::<u32>())
@@ -1026,7 +1077,7 @@ impl ReadbackStrategy for Ring {
         // whether it is EOS; `eos_of_last` retracts by stepping the tile cursor
         // back. `begin_step` guaranteed the tile begins a contiguous run within
         // one segment, so no step ever straddles a segment boundary.
-        self.history.segments[seg].slice_set(&sampled.reshape(1)?, 0, offset)?;
+        self.history.ring.segments[seg].slice_set(&sampled.reshape(1)?, 0, offset)?;
         match self.eos {
             EosRead::Poll(_) => self.ring.publish_step(&sampled, Some(self.generation))?,
             EosRead::Blocking => self.ring.publish(&sampled)?,
@@ -1360,8 +1411,8 @@ mod tests {
     fn write_tile(h: &mut History, ids: &[u32]) {
         for &id in ids {
             let (seg, slot) = h.next_slot();
-            let one = Tensor::new(&[id], h.segments[seg].device()).unwrap();
-            h.segments[seg].slice_set(&one, 0, slot).unwrap();
+            let one = Tensor::new(&[id], h.ring.segments[seg].device()).unwrap();
+            h.ring.segments[seg].slice_set(&one, 0, slot).unwrap();
             h.wrote_one();
         }
     }
@@ -1374,7 +1425,7 @@ mod tests {
         h.close_open_tile().unwrap();
         let fed = h.generation();
         let snapshots: Vec<Vec<u32>> =
-            h.segments.iter().map(|s| s.to_vec1::<u32>().unwrap()).collect();
+            h.ring.segments.iter().map(|s| s.to_vec1::<u32>().unwrap()).collect();
         let mut out = Vec::new();
         h.drain_into(fed, &mut out, |seg, slot| snapshots[seg][slot]);
         out
@@ -1444,7 +1495,7 @@ mod tests {
         let dev = Device::Cpu;
         let quantum = 2;
         let mut h = History::new(quantum * 3, quantum, &dev).unwrap();
-        let n_tiles = h.total_tiles;
+        let n_tiles = h.total_tiles();
         let mut bailed = false;
         for i in 0..n_tiles + 2 {
             match h.begin_step() {
@@ -1506,9 +1557,9 @@ mod tests {
             let cap = SEG_MAX_SLOTS * 2 + 5;
             let mut h = History::new(cap, 1, &dev).unwrap();
             assert!(
-                h.segments.len() >= 2,
+                h.ring.segments.len() >= 2,
                 "test needs ≥2 segments, got {}",
-                h.segments.len()
+                h.ring.segments.len()
             );
 
             let mut rng = SmallRng(0x5E6D_E175_0BAD_F00Du64);
@@ -1526,7 +1577,7 @@ mod tests {
                 }
                 let one = Tensor::new(&[id], &dev).unwrap();
                 let (seg, off) = h.tile_home(h.tiles);
-                h.segments[seg].slice_set(&one, 0, off).unwrap();
+                h.ring.segments[seg].slice_set(&one, 0, off).unwrap();
                 h.wrote_one();
                 fed_since_drain.push(id);
 

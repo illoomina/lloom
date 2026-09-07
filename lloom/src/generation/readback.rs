@@ -385,7 +385,7 @@ const SEG_MAX_SLOTS: usize = 4092;
 /// history keeps `fed`/`drained`/`tile_counts`; the input keeps its own). So this is
 /// pure placement + mapping, no policy, and introduces no lock, no allocation on any
 /// hot path, no blit, no volatile — exactly the existing mechanism, named.
-struct SegmentedRing {
+pub(crate) struct SegmentedRing {
     /// N segment buffers, each `tiles_per_seg · quantum` `U32` slots, Private-mapped
     /// (small → under the window → zero-copy). N = 1 is the single-buffer case.
     segments: Vec<Tensor>,
@@ -410,7 +410,7 @@ impl SegmentedRing {
     /// whole-tile-multiples fit under [`SEG_MAX_SLOTS`]. `total_tiles` is rounded up
     /// so every segment is full (uniform geometry). At least 2 tiles so one is free
     /// for the writer while the other drains.
-    fn new(cap: usize, quantum: usize, device: &Device) -> Result<Self> {
+    pub(crate) fn new(cap: usize, quantum: usize, device: &Device) -> Result<Self> {
         let q = quantum.max(1);
         let total_tiles = (cap / q).max(2);
         let tiles_per_seg = (SEG_MAX_SLOTS / q).max(1);
@@ -452,6 +452,110 @@ impl SegmentedRing {
             self.seg_bases = bases;
         }
         self.seg_bases.as_deref()
+    }
+
+    /// The ring's tile count (the wrap) — for a caller sizing its cursor to the
+    /// geometry.
+    pub(crate) fn total_tiles(&self) -> usize {
+        self.total_tiles
+    }
+    /// The first segment tensor — a stable handle for a caller that only needs the
+    /// device or a representative buffer (not a specific tile).
+    pub(crate) fn segment0(&self) -> &Tensor {
+        &self.segments[0]
+    }
+
+    /// Write a single DEVICE token (the sampled argmax) into `tile`'s first slot —
+    /// the decode-side input write. Device-side `slice_set`, so it is ordered on the
+    /// GPU queue AFTER the prior forward's read (unlike the host `stage_at_tile`,
+    /// which the caller must order via the pacer). `token` is a `[1]` U32 tensor.
+    pub(crate) fn write_device_at_tile(&self, tile: usize, token: &Tensor) -> Result<()> {
+        let (seg, offset) = self.tile_home(tile);
+        // The segment is a flat rank-1 `[len]` U32 buffer; set the one slot at
+        // `offset`. `token` is `[1]` (a single element), so this writes one slot.
+        self.segments[seg].slice_set(token, 0, offset)?;
+        Ok(())
+    }
+
+    /// Stage a host token slice into `tile`, front-packed at the tile's first slot
+    /// — the INPUT-side write. Zero-copy through the segment's CPU-mapped pointer
+    /// ([`Tensor::write_host_slice`]); an unmapped segment (discrete GPU / a tile
+    /// wider than the window) falls back to one `slice_set` upload. `tokens.len()`
+    /// must be `≤ quantum` (a tile holds one chunk of up to `quantum` tokens).
+    ///
+    /// SAFETY of the fast path: the caller guarantees no GPU work reads this tile
+    /// while the stage runs — the input ring cycles `depth + 1` tiles and the pacer
+    /// waited on a tile's forward before it laps back, exactly as the history's
+    /// write-before-read discipline holds (§10.3e).
+    pub(crate) fn stage_at_tile(&self, tile: usize, tokens: &[u32]) -> Result<()> {
+        debug_assert!(tokens.len() <= self.quantum, "chunk wider than a tile");
+        let (seg, offset) = self.tile_home(tile);
+        let buf = &self.segments[seg];
+        // Mapped write at the tile's slot offset — no intermediate tensor, no blit.
+        // SAFETY: `offset + tokens.len() ≤ (seg+1)·quantum ≤ segment len` (a tile
+        // fits its segment); the tile is not being read (caller's pacer ordering).
+        #[cfg(feature = "metal")]
+        {
+            if unsafe { buf.write_host_slice::<u32>(offset, tokens) } {
+                return Ok(());
+            }
+        }
+        // Unmapped fallback: upload + slice_set into the tile's slots. One alloc,
+        // taken only where the mapped write is unavailable. The segment is rank-1
+        // `[len]`, so write the `[n]` run at slot `offset`.
+        let src = Tensor::from_vec(tokens.to_vec(), tokens.len(), buf.device())?;
+        buf.slice_set(&src, 0, offset)?;
+        Ok(())
+    }
+
+    /// A `[1, width]` view of `tile`'s first `width` slots — the INPUT the forward
+    /// reads. A contiguous prefix of the tile's run within one mapped segment, so no
+    /// copy. `width ≤ quantum`.
+    pub(crate) fn tile_view(&self, tile: usize, width: usize) -> Result<Tensor> {
+        debug_assert!(width <= self.quantum, "view wider than a tile");
+        let (seg, offset) = self.tile_home(tile);
+        // The segment is a flat `[tiles_per_seg·quantum]` U32 buffer; the tile's
+        // window is `[offset, offset+width)`. Reshape to `[1, width]` for the model.
+        self.segments[seg]
+            .narrow(0, offset, width)?
+            .reshape((1, width))
+    }
+
+    /// Read `tile`'s first `width` slots back through the segment's CPU-MAPPED
+    /// pointer — the SAME zero-copy access the GPU forward makes of this input
+    /// (`embed_tokens` reads the device buffer, which for a Private-mapped segment
+    /// is the memory this pointer sees). For fuzzing the input ring on the real
+    /// path rather than through a `to_cpu` copy. `None` if the segment is unmapped
+    /// (the caller then has no zero-copy read to check). `width ≤ quantum`.
+    #[cfg(feature = "metal")]
+    pub(crate) fn peek_tile(&mut self, tile: usize, width: usize) -> Option<Vec<u32>> {
+        debug_assert!(width <= self.quantum);
+        let (seg, offset) = self.tile_home(tile);
+        let base = *self.resolve_bases()?.get(seg)?;
+        // SAFETY: `base` is the mapped base of a never-reallocated segment;
+        // `[offset, offset+width) ≤ segment len` (a tile fits its segment). A plain
+        // read of finished host-visible memory (no GPU writing it in the fuzz).
+        let src = unsafe { std::slice::from_raw_parts(base.add(offset), width) };
+        Some(src.to_vec())
+    }
+
+    /// Poison EVERY slot of every segment with a sentinel — for a fuzz that then
+    /// asserts a read of a NEVER-STAGED slot (a wrong tile, or past a chunk's
+    /// width) returns the sentinel rather than a plausible-stale token. Debug/test
+    /// only. Uses the same mapped write the staging does.
+    #[cfg(feature = "metal")]
+    pub(crate) fn poison_all(&self, sentinel: u32) -> Result<()> {
+        for seg in &self.segments {
+            let len = seg.elem_count();
+            let poison = vec![sentinel; len];
+            // SAFETY: writing the whole (mapped) segment; nothing reads it here.
+            if !unsafe { seg.write_host_slice::<u32>(0, &poison) } {
+                // Unmapped: fall back to a filled tensor.
+                let t = Tensor::from_vec(poison, len, seg.device())?;
+                seg.slice_set(&t, 0, 0)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -996,7 +1100,7 @@ impl Ring {
 
 impl ReadbackStrategy for Ring {
     fn device(&self) -> &Device {
-        self.ring.input().device()
+        self.ring.input_device().device()
     }
 
     fn arms(&self) -> ReadbackArms {

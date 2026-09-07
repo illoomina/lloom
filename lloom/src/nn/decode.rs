@@ -738,10 +738,22 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 break;
             }
             stats.steps += 1;
-            // Only the first `FIRST_STEPS_TRACED` steps record per-phase timings;
-            // computed once here so the steady path takes no phase-clock reads.
+            // Only the first `FIRST_STEPS_TRACED` steps record per-phase timings —
+            // and only in a debug/profile build. In release `traced` is a constant
+            // `false`, so every `traced.then(Instant::now())` below is `None` and NO
+            // phase clock read (`mach_absolute_time()`) reaches even the first steps:
+            // the release decode path is free of per-step instrumentation entirely.
+            #[cfg(any(debug_assertions, feature = "profile"))]
             let traced = stats.steps <= FIRST_STEPS_TRACED;
-            let step_start = std::time::Instant::now(); // the step_ns median — every step
+            #[cfg(not(any(debug_assertions, feature = "profile")))]
+            let traced = false;
+            // The per-step median clock read — DEBUG/PROFILE ONLY. In a plain
+            // release build this `mach_absolute_time()` (and the `step_ns.push`es it
+            // feeds) is compiled OUT, so the steady decode path takes no per-step
+            // clock read at all; release reports coarse tokens ÷ wall-clock instead
+            // (measured host-side, off the loop). `any(debug_assertions, profile)`.
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            let step_start = std::time::Instant::now();
             if opts.sample_split {
                 device.synchronize()?;
             }
@@ -933,21 +945,28 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         readback.note_eos_truncation(batch.len() - k - 1);
                         produced = all_ids.len();
                         eos = true;
+                        #[cfg(any(debug_assertions, feature = "profile"))]
                         stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
                         break;
                     }
                     let go_on = on_tokens(&batch)?;
                     all_ids.extend_from_slice(&batch);
                     if !go_on {
+                        #[cfg(any(debug_assertions, feature = "profile"))]
                         stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
                         break;
                     }
                 }
             }
             end_executor_step(&device)?;
-            stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
-            if stats.steps == 1 {
-                stats.step0_census = census_delta(&census_prefill, census_snapshot());
+            // The per-step median + the step-0 census: DEBUG/PROFILE ONLY. Release
+            // takes neither clock read nor census on the steady path.
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            {
+                stats.step_ns.push(step_start.elapsed().as_nanos() as u64);
+                if stats.steps == 1 {
+                    stats.step0_census = census_delta(&census_prefill, census_snapshot());
+                }
             }
         }
 

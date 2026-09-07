@@ -1073,7 +1073,18 @@ fn main() -> Result<()> {
     //    loaded machine) drags the mean and says nothing about the steady path.
     let mut steps: Vec<u64> = st.step_ns.clone();
     let steady = if steps.is_empty() {
-        f64::NAN
+        // RELEASE (no per-step `step_ns` — the clock reads are compiled out of the
+        // hot path): the coarse llama-bench figure, measured host-side off the loop
+        // — generated tokens ÷ (decode wall-clock − prefill). No per-token
+        // `mach_absolute_time()` touched the steady path to produce it, so it cannot
+        // be skewed by the measurement itself. A debug/`--features profile` build
+        // takes the per-step median branch below instead.
+        let decode_only = decode_elapsed.as_secs_f64() - (st.prefill_ns as f64 / 1e9);
+        if decode_only > 0.0 {
+            n as f64 / decode_only
+        } else {
+            f64::NAN
+        }
     } else {
         // Median is taken on a sorted copy; the unsorted `step_ns[0]` above is the
         // first step, so sort AFTER reading the TTFT term.
@@ -1085,7 +1096,18 @@ fn main() -> Result<()> {
     // the first decode step (the first token is the prefill's own argmax, fed and
     // sampled in step 0). This is where the mmap'd weights fault in, so a cold
     // run's TTFT carries the load the `[loaded …]` line above deferred.
-    let ttft_ms = (st.prefill_ns + st.step_ns.first().copied().unwrap_or(0)) as f64 / 1e6;
+    // TTFT: with the per-step reads compiled out (release), `step_ns[0]` is gone,
+    // so use the host-side wall-clock first-visible time — the real user-facing
+    // latency, measured off the loop. A debug/profile build has `step_ns[0]` and
+    // uses the compute term (`prefill + step0`).
+    let ttft_ms = if st.step_ns.is_empty() {
+        first_visible_at
+            .or(first_batch_at)
+            .map(|d| d.as_secs_f64() * 1e3)
+            .unwrap_or(f64::NAN)
+    } else {
+        (st.prefill_ns + st.step_ns.first().copied().unwrap_or(0)) as f64 / 1e6
+    };
     // The measured user-facing latency: when the first batch was HANDED to the
     // consumer vs the compute-availability `ttft_ms`. A gap ≫ 0 means the first
     // token waited on the commit cadence (period), not on compute — the coupling
@@ -1105,20 +1127,24 @@ fn main() -> Result<()> {
     // the prefill's GPU tail lands, so the split says which side a first-token
     // cost sits on.
     let ms = |ns: u64| ns as f64 / 1e6;
-    eprintln!(
-        "[ttft split: prefill {:.2} ms + step0 {:.2} ms; step_ns[1..={}] = {}; prompt_tokens={}]",
-        ms(st.prefill_ns),
-        ms(st.step_ns.first().copied().unwrap_or(0)),
-        st.step_ns.len().min(5).saturating_sub(1),
-        st.step_ns
-            .iter()
-            .skip(1)
-            .take(4)
-            .map(|&n| format!("{:.2}", ms(n)))
-            .collect::<Vec<_>>()
-            .join(" "),
-        prompt_ids.len(),
-    );
+    // The per-step split is a debug/profile detail — `step_ns` is empty in a plain
+    // release build (the reads are compiled out), so print it only when populated.
+    if !st.step_ns.is_empty() {
+        eprintln!(
+            "[ttft split: prefill {:.2} ms + step0 {:.2} ms; step_ns[1..={}] = {}; prompt_tokens={}]",
+            ms(st.prefill_ns),
+            ms(st.step_ns.first().copied().unwrap_or(0)),
+            st.step_ns.len().min(5).saturating_sub(1),
+            st.step_ns
+                .iter()
+                .skip(1)
+                .take(4)
+                .map(|&n| format!("{:.2}", ms(n)))
+                .collect::<Vec<_>>()
+                .join(" "),
+            prompt_ids.len(),
+        );
+    }
     for (name, census) in [
         ("prefill", &st.prefill_census),
         ("step 0", &st.step0_census),
@@ -1194,6 +1220,10 @@ fn main() -> Result<()> {
         b(format!("{steady:.1}")),
         if args.dspark {
             "rounds/s steady (median round); see the dspark line above for tok/s"
+        } else if st.step_ns.is_empty() {
+            // Release: coarse tokens ÷ (wall − prefill), measured host-side off the
+            // loop (llama-bench style); no per-step clock read skews it.
+            "tok/s steady (wall-clock, decode only)"
         } else {
             "tok/s steady (median decode step)"
         },

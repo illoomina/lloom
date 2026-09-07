@@ -9,6 +9,7 @@ use crate::kernels::MetalKernelError;
 use block2::RcBlock;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue};
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -581,7 +582,7 @@ impl Commands {
             cut_policy,
             node_cut_pending: AtomicBool::new(false),
             device,
-            prev_ce_outputs: Arc::new(crate::kernels::metal::encoder::FenceMap::new()),
+            prev_ce_outputs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             live_fences: Arc::new(parking_lot::Mutex::new(Vec::new())),
             residency_set,
             clock: Arc::new(GpuClock::new()),
@@ -875,7 +876,7 @@ impl Commands {
             }
         }
 
-        self.prev_ce_outputs.clear();
+        self.prev_ce_outputs.write().clear();
         self.live_fences.lock().clear();
 
         Ok(())
@@ -1253,6 +1254,7 @@ impl Commands {
             // Encode-thread write, once per encoder close (registers this
             // encoder's outputs). Rare against the per-bind reads (issue: H2).
             // `parking_lot` guards are infallible -- no `unwrap`.
+            let mut prev_ce_outputs = self.prev_ce_outputs.write();
             let mut fences = self.live_fences.lock();
             let this_ptr = Arc::as_ptr(&encoder.fence) as usize;
             let mut claimed = 0usize;
@@ -1260,7 +1262,7 @@ impl Commands {
             // Register our outputs so subsequent encoders can wait for us,
             // keeping `live_fences` consistent with the map.
             for output in all_outputs.iter() {
-                if let Some(prev) = self.prev_ce_outputs.insert(*output, encoder.fence.clone()) {
+                if let Some(prev) = prev_ce_outputs.insert(*output, encoder.fence.clone()) {
                     // Another fence owned this buffer; it loses one reference.
                     release_fence(&mut fences, Arc::as_ptr(&prev) as usize);
                 }
@@ -1293,11 +1295,15 @@ impl Commands {
                 // it is the write the per-bind reads on the encode thread
                 // contend with, so it takes the write lock while they take read.
                 // `parking_lot` guards are infallible -- no `unwrap`.
+                let mut map = map_for_cleanup.write();
                 let mut fences = fences_for_cleanup.lock();
                 let ptr = Arc::as_ptr(&fence_for_cleanup) as usize;
                 for &buf in &all_outputs {
-                    if map_for_cleanup.remove_matching(buf, &fence_for_cleanup) {
-                        release_fence(&mut fences, ptr);
+                    if let Some(f) = map.get(&buf) {
+                        if Arc::ptr_eq(f, &fence_for_cleanup) {
+                            map.remove(&buf);
+                            release_fence(&mut fences, ptr);
+                        }
                     }
                 }
             });

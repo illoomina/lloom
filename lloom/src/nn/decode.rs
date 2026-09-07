@@ -663,17 +663,31 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut logits = match self.seq.last_logits.take() {
             Some(held) if resume => held,
             _ => {
-                let ubatch = opts.prefill_ubatch();
-                let step = if ubatch == 0 { prompt.len() } else { ubatch };
+                // THE ADAPTIVE SPARK→SEGMENT RAMP. The prefill weight-sweep is
+                // amortized over a forward's tokens, so MANY small chunks are slow
+                // (each re-reads the 5.4 GB of weights) — but the FIRST token cannot
+                // stream until its chunk lands, so a small FIRST chunk gets the
+                // machinery flowing early (low TTFT). The resolution: ramp the chunk
+                // width. Chunk 1 = `spark` (the tunable TTFT knob), then DOUBLE each
+                // chunk up to the whole remaining prompt. For a normal prompt this is
+                // "spark, then one-shot the rest" — the first token sparks early and
+                // the bulk is ONE big amortized forward, so TTFT drops without the
+                // per-chunk weight-sweep tax. `spark == 0` means one-shot (the whole
+                // prompt in one chunk): the incumbent, byte-identical, no ramp.
+                let spark = opts.prefill_ubatch();
                 let mut last_logits = None;
                 let mut off = 0usize; // the machine's position over the prompt
+                let mut step = if spark == 0 { prompt.len() } else { spark };
                 while off < prompt.len() {
                     let w = step.min(prompt.len() - off);
                     let chunk = &prompt[off..off + w];
-                    // Stage this unit's tokens as the forward's input (zero-copy on
-                    // the ring arm), then step: bound the enqueue, forward, keep
-                    // the marker — the same `before/after_forward` a generate step
-                    // takes, so prompt units and generated tokens ride one pipeline.
+                    // Stage this unit's tokens as the forward's input — zero-copy on
+                    // the ring arm for a spark-sized chunk (≤ the input tile width),
+                    // a one-shot `Tensor::new` for the bigger amortizing chunks (few,
+                    // so the alloc is off the hot path). Then step: bound the
+                    // enqueue, forward, keep the marker — the same `before/
+                    // after_forward` a generate step takes, so prompt units and
+                    // generated tokens ride one pipeline.
                     let input = readback.stage_prompt_chunk(chunk)?;
                     if pace {
                         pacer.before_forward(&device)?;
@@ -689,6 +703,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     self.seq.tokens.extend_from_slice(chunk);
                     last_logits = Some(out);
                     off += w;
+                    // After the spark, jump straight to the WHOLE remaining prompt
+                    // (one big amortized forward) rather than doubling: the weight
+                    // sweep is per-forward, so the only way to pay it ~once on the
+                    // bulk is to feed the bulk in ONE chunk. Doubling would pay it
+                    // log(N) times; "spark + rest" pays it twice total (the spark's
+                    // small sweep + one bulk sweep). The GPU is already producing
+                    // after the spark, so the big chunk does not hurt TTFT — the
+                    // first token streamed off the spark. (A prompt larger than the
+                    // input machinery can hold in one pass would cap here; for the
+                    // chat path the whole rest fits.)
+                    step = prompt.len();
                 }
                 last_logits.expect("a non-empty prompt steps at least once")
             }
@@ -713,11 +738,16 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 break;
             }
             stats.steps += 1;
-            let step_start = std::time::Instant::now();
+            // Only the first `FIRST_STEPS_TRACED` steps record per-phase timings;
+            // computed once here so the steady path takes no phase-clock reads.
+            let traced = stats.steps <= FIRST_STEPS_TRACED;
+            let step_start = std::time::Instant::now(); // the step_ns median — every step
             if opts.sample_split {
                 device.synchronize()?;
             }
-            let sample_start = std::time::Instant::now();
+            // `sample_start` feeds only the phase trace (`t_sample`) and the
+            // sample-split split; skip the clock read on the steady path.
+            let sample_start = (traced || opts.sample_split).then(std::time::Instant::now);
 
             let feed = readback.sample_and_feed(sampler, &logits)?;
             produced += 1;
@@ -738,10 +768,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     committed_this_step = true;
                 }
                 let is_eos = readback.eos_of_last()?;
-                if opts.sample_split {
-                    stats
-                        .sample_ns
-                        .push(sample_start.elapsed().as_nanos() as u64);
+                if let Some(s) = sample_start {
+                    if opts.sample_split {
+                        stats.sample_ns.push(s.elapsed().as_nanos() as u64);
+                    }
                 }
                 if is_eos {
                     produced -= 1;
@@ -762,21 +792,29 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     pacer.after_forward(&device)?;
                 }
             } else {
-                if opts.sample_split {
-                    stats
-                        .sample_ns
-                        .push(sample_start.elapsed().as_nanos() as u64);
+                if let Some(s) = sample_start {
+                    if opts.sample_split {
+                        stats.sample_ns.push(s.elapsed().as_nanos() as u64);
+                    }
                 }
                 // ENQUEUE, then learn. The GPU has this forward queued before
                 // it retires the previous one. The pacer bounds the enqueue:
                 // an arm with no per-token wait would otherwise run ahead
                 // without limit (#690's marker pacer, replacing the removed
                 // `apply_backpressure` spin).
-                let t_sample = sample_start.elapsed().as_nanos() as u64;
+                //
+                // The per-PHASE timings (sample / forward / backpressure / eos) are
+                // recorded ONLY for the first `FIRST_STEPS_TRACED` steps (`traced`,
+                // set at the loop top). Every clock read is a `mach_absolute_time()`
+                // on the hot thread — a call the OS scheduler sees — so reading them
+                // on all 2382 steps and discarding them past step 4 was pure
+                // hot-path noise. Gated behind `traced`, so the steady path takes
+                // NONE; the one clock read it still needs is `step_ns` (the median).
+                let t_sample = sample_start.map_or(0, |s| s.elapsed().as_nanos() as u64);
                 if pace {
                     pacer.before_forward(&device)?;
                 }
-                let t = std::time::Instant::now();
+                let t = traced.then(std::time::Instant::now);
                 begin_decode_step(&device);
                 logits = self
                     .model
@@ -784,25 +822,25 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     .squeeze(0)?;
                 end_decode_step(&device)?;
                 self.seq.pos += 1;
-                let t_forward = t.elapsed().as_nanos() as u64;
+                let t_forward = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
                 // The in-flight bound AFTER the enqueue: retire the oldest
                 // marker if the host would exceed `IN_FLIGHT_STEPS` ahead. This
                 // is #690's pacer (Metal completion), which replaced the
                 // unbounded counter-spin `apply_backpressure` livelocked on.
                 // `backpressure_ns` reports what that bound cost this step.
-                let t = std::time::Instant::now();
+                let t = traced.then(std::time::Instant::now);
                 if pace {
                     pacer.after_forward(&device)?;
                 }
-                let t_backpressure = t.elapsed().as_nanos() as u64;
-                let t = std::time::Instant::now();
+                let t_backpressure = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
+                let t = traced.then(std::time::Instant::now);
                 let is_eos = readback.eos_of_last()?;
-                if stats.steps <= FIRST_STEPS_TRACED {
+                if traced {
                     stats.first_steps.push(StepPhases {
                         sample_ns: t_sample,
                         forward_ns: t_forward,
                         backpressure_ns: t_backpressure,
-                        eos_ns: t.elapsed().as_nanos() as u64,
+                        eos_ns: t.map_or(0, |t| t.elapsed().as_nanos() as u64),
                     });
                 }
                 if is_eos {

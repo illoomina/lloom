@@ -985,17 +985,10 @@ fn main() -> Result<()> {
     let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
     let decode_start = std::time::Instant::now();
     // Wall-clock to the first token the consumer is HANDED (the batch arrives),
-    // and to the first VISIBLE token (a byte reaches stdout). The reported
-    // `ttft_ms` is compute-availability (prefill + step0); this pair is what the
-    // user actually waits, and the gap between them is the commit-cadence /
-    // consumer coupling we are chasing. Measurement seam only.
+    // and to the first VISIBLE token (a byte reaches stdout). Measurement seam.
     let mut first_batch_at: Option<std::time::Duration> = None;
     let mut first_visible_at: Option<std::time::Duration> = None;
     let out = {
-        // Returns `candle::Result`, which is the type `Session::decode`'s callback
-        // wants: `candle` is the workspace alias for `lloom-tensor` in this tree,
-        // so `candle::Result` and `lloom_tensor::Result` are one type. `next_token`
-        // already returns it, so no map is needed.
         let mut on_tokens = |batch: &[u32]| -> candle::Result<()> {
             if first_batch_at.is_none() && !batch.is_empty() {
                 first_batch_at = Some(decode_start.elapsed());
@@ -1045,8 +1038,7 @@ fn main() -> Result<()> {
         }
     };
     let decode_elapsed = decode_start.elapsed();
-    // The tail the streaming decoder is still holding (a partial multibyte run),
-    // then a newline so the reply is its own line before the perf report.
+    // The tail the streaming decoder is still holding (a partial multibyte run).
     if let Some(rest) = tos.decode_rest()? {
         print!("{rest}");
     }

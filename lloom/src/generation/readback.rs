@@ -955,7 +955,7 @@ pub const RING_HISTORY_SLOTS: usize = 4092;
 /// by seconds of generation before the lap guard fires — the wall between the hot
 /// producer and a jittery consumer. Preallocated: costs memory, not per-step work.
 /// Overridable via `LLOOM_RING_SLACK_BYTES`.
-pub const RING_SLACK_BYTES_DEFAULT: usize = 4 * 1024 * 1024;
+pub const RING_SLACK_BYTES_DEFAULT: usize = 32 * 1024 * 1024;
 
 /// The slot count for the consumer-slack window: `LLOOM_RING_SLACK_BYTES`
 /// (default [`RING_SLACK_BYTES_DEFAULT`]) worth of `U32` slots, rounded to a whole

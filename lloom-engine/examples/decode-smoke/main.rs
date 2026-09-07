@@ -81,13 +81,21 @@ fn main() -> Result<()> {
     ];
 
     let mut ok = true;
+    // A request to the seam is the WHOLE token sequence to continue (#677,
+    // `Session::prepare`): turn 2 is turn 1's prompt, turn 1's reply, and the
+    // new turn, and the session reuses the prefix its cache holds. Passing only
+    // the new turn would prefix-match nothing, reset the cache, and decode
+    // turn 2 alone — which is not the accumulated-cache test this gate is.
+    let mut conversation: Vec<u32> = Vec::new();
     for (idx, prompt) in turns.iter().enumerate() {
         let templated = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
-        let ids = tokenizer
+        let turn = tokenizer
             .encode(templated.as_str(), idx == 0)
             .map_err(|e| anyhow::anyhow!("tokenizing turn {}: {e}", idx + 1))?
             .get_ids()
             .to_vec();
+        conversation.extend_from_slice(&turn);
+        let ids = conversation.clone();
 
         let params = DecodeParams {
             seed: 0,
@@ -107,13 +115,30 @@ fn main() -> Result<()> {
         };
 
         let decoded = session.decode(&ids, detok, &params, |_| {})?;
+        // The reply and the turn's end join the conversation the next turn
+        // continues; an EOS is not in `tokens` and is appended as the template's
+        // turn end.
+        conversation.extend_from_slice(&decoded.tokens);
+        if let Some(end) = tokenizer.token_to_id("<|im_end|>") {
+            conversation.push(end);
+        }
+        conversation.extend(
+            tokenizer
+                .encode("\n", false)
+                .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
+                .get_ids(),
+        );
         println!("--- turn {} ---", idx + 1);
         println!("prompt: {prompt}");
         println!("output: {}", decoded.text.trim());
         println!(
-            "        ({} tokens, {:?})",
+            "        ({} tokens, {:?}, reuse {:?}: {} reused, {} prefilled, readback {})",
             decoded.tokens.len(),
-            decoded.stop
+            decoded.stop,
+            decoded.reuse,
+            decoded.reused,
+            decoded.prefilled,
+            decoded.readback.name(),
         );
 
         // Turn 2's low-bar substring check, the §3.1a gate: a working cache

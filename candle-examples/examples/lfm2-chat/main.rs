@@ -845,12 +845,22 @@ fn main() -> Result<()> {
              few rounds and replay nothing (DESIGN.md §11.3x)"
         );
     }
+    // The in-flight depth: the host/GPU balance warmup measured (`compute_in_flight_depth`),
+    // so the pacer is not a static cap — 2 here (GPU step >> host encode), deeper
+    // on a faster GPU / smaller model. `LLOOM_IN_FLIGHT` overrides for an A/B.
+    let in_flight_depth = match std::env::var("LLOOM_IN_FLIGHT") {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("LLOOM_IN_FLIGHT must be an integer, got {v:?}")),
+        Err(_) => session.measured_in_flight_depth(),
+    };
     let opts = DecodeOptions {
         max_tokens: args.max_tokens,
         budget,
         lookahead: args.lookahead,
         // Under the speculative body this is the per-phase drain (decode.rs).
         sample_split: args.phase_sync,
+        in_flight_depth,
     };
 
     // The DSpark proposer, built only when `--dspark` is set. It borrows the

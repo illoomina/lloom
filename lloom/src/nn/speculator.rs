@@ -643,6 +643,9 @@ pub struct Prepared {
 pub struct Session<'m, M: CausalLM> {
     pub(crate) model: &'m M,
     pub(crate) seq: Sequence<M::Cache>,
+    /// The in-flight depth measured at warmup (`0` until `warmup` runs) — the
+    /// computed host/GPU balance the pacer uses instead of a static cap.
+    pub(crate) warm_in_flight_depth: usize,
 }
 
 impl<'m, M: CausalLM> Session<'m, M> {
@@ -653,6 +656,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         Self {
             model,
             seq: Sequence::new(cache),
+            warm_in_flight_depth: 0,
         }
     }
 
@@ -664,12 +668,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut seq = Sequence::new(cache);
         seq.pos = pos;
         seq.tokens_known = pos == 0;
-        Self { model, seq }
+        Self {
+            model,
+            seq,
+            warm_in_flight_depth: 0,
+        }
     }
 
     /// Drive an existing sequence — a slot a serving layer held across requests.
     pub fn from_sequence(model: &'m M, seq: Sequence<M::Cache>) -> Self {
-        Self { model, seq }
+        Self {
+            model,
+            seq,
+            warm_in_flight_depth: 0,
+        }
     }
 
     /// Give the sequence back, for a caller that holds it across requests.

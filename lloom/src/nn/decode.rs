@@ -204,6 +204,10 @@ pub struct DecodeStats {
     pub steps: u64,
     /// Submission time of the prompt's forward pass — encode, not execution.
     pub prefill_ns: u64,
+    /// Host time from the loop's exit to the run's return: the final drain
+    /// (`ReadbackStrategy::drain_all`, which waits for the GPU) and the
+    /// bookkeeping after it. Inside a caller's wall clock and outside the loop.
+    pub tail_ns: u64,
     /// Compute time to the first token: prefill + the first decode step, stamped
     /// ONCE (at step 0) so it survives release without any per-step clock read —
     /// the fair, llama-bench-comparable TTFT (their synchronous `llama_decode` of
@@ -244,6 +248,12 @@ pub struct DecodeStats {
     /// The first [`FIRST_STEPS_TRACED`] steps' host time, by phase, on the
     /// `lookahead = 1` arm; empty on `lookahead = 0` and the speculative bodies.
     pub first_steps: Vec<StepPhases>,
+    /// Every step's host time by phase, summed, on the `lookahead = 1` arm in a
+    /// debug or `profile` build (zero in release, where the clock reads are
+    /// compiled out): the steady-state split of the hot thread between encoding
+    /// and waiting for the GPU. `phase_steps` is the number of steps summed.
+    pub phase_totals: StepPhases,
+    pub phase_steps: u64,
     /// The prefill's dispatch census, `(kernel, count)`, under
     /// `CANDLE_METAL_PROFILE=1`; empty otherwise and off Metal.
     pub prefill_census: Vec<(String, u64)>,
@@ -304,6 +314,16 @@ pub struct StepPhases {
     pub backpressure_ns: u64,
     /// `eos_of_last`: the wait for this step's token to be published.
     pub eos_ns: u64,
+}
+
+impl StepPhases {
+    /// Accumulate `other` into this, saturating.
+    pub fn add(&mut self, other: &StepPhases) {
+        self.sample_ns = self.sample_ns.saturating_add(other.sample_ns);
+        self.forward_ns = self.forward_ns.saturating_add(other.forward_ns);
+        self.backpressure_ns = self.backpressure_ns.saturating_add(other.backpressure_ns);
+        self.eos_ns = self.eos_ns.saturating_add(other.eos_ns);
+    }
 }
 
 /// How many leading steps [`DecodeStats::first_steps`] brackets.
@@ -446,7 +466,9 @@ pub fn compute_in_flight_depth(host_step_ns: u64, gpu_step_ns: u64, mem_cap: usi
     // ceil(host/gpu) with a x2 safety, so a host step that occasionally spikes
     // toward the GPU step still has a queued forward to hide behind.
     let ratio_x2 = (2 * host_step_ns).div_ceil(gpu_step_ns) as usize;
-    ratio_x2.max(IN_FLIGHT_FLOOR).min(mem_cap.max(IN_FLIGHT_FLOOR))
+    ratio_x2
+        .max(IN_FLIGHT_FLOOR)
+        .min(mem_cap.max(IN_FLIGHT_FLOOR))
 }
 
 /// The memory ceiling on in-flight depth: the most forwards' worth of retained
@@ -751,10 +773,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // `false`, so every `traced.then(Instant::now())` below is `None` and NO
             // phase clock read (`mach_absolute_time()`) reaches even the first steps:
             // the release decode path is free of per-step instrumentation entirely.
+            // `timed`: every step's phases are bracketed and summed into
+            // `phase_totals` (the steady-state split); `traced`: the first few
+            // are also kept individually. Both are constant `false` in release.
             #[cfg(any(debug_assertions, feature = "profile"))]
-            let traced = stats.steps <= FIRST_STEPS_TRACED;
+            let timed = true;
             #[cfg(not(any(debug_assertions, feature = "profile")))]
-            let traced = false;
+            let timed = false;
+            let traced = timed && stats.steps <= FIRST_STEPS_TRACED;
             // The per-step median clock read — DEBUG/PROFILE ONLY. In a plain
             // release build this `mach_absolute_time()` (and the `step_ns.push`es it
             // feeds) is compiled OUT, so the steady decode path takes no per-step
@@ -767,7 +793,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
             // `sample_start` feeds only the phase trace (`t_sample`) and the
             // sample-split split; skip the clock read on the steady path.
-            let sample_start = (traced || opts.sample_split).then(std::time::Instant::now);
+            let sample_start = (timed || opts.sample_split).then(std::time::Instant::now);
 
             let feed = readback.sample_and_feed(sampler, &logits)?;
             produced += 1;
@@ -852,7 +878,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 if pace {
                     pacer.before_forward(&device)?;
                 }
-                let t = traced.then(std::time::Instant::now);
+                let t = timed.then(std::time::Instant::now);
                 begin_decode_step(&device);
                 logits = self
                     .model
@@ -866,20 +892,25 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // is #690's pacer (Metal completion), which replaced the
                 // unbounded counter-spin `apply_backpressure` livelocked on.
                 // `backpressure_ns` reports what that bound cost this step.
-                let t = traced.then(std::time::Instant::now);
+                let t = timed.then(std::time::Instant::now);
                 if pace {
                     pacer.after_forward(&device)?;
                 }
                 let t_backpressure = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
-                let t = traced.then(std::time::Instant::now);
+                let t = timed.then(std::time::Instant::now);
                 let is_eos = readback.eos_of_last()?;
-                if traced {
-                    stats.first_steps.push(StepPhases {
+                if timed {
+                    let phases = StepPhases {
                         sample_ns: t_sample,
                         forward_ns: t_forward,
                         backpressure_ns: t_backpressure,
                         eos_ns: t.map_or(0, |t| t.elapsed().as_nanos() as u64),
-                    });
+                    };
+                    stats.phase_totals.add(&phases);
+                    stats.phase_steps += 1;
+                    if traced {
+                        stats.first_steps.push(phases);
+                    }
                 }
                 if is_eos {
                     produced -= 1;
@@ -1003,6 +1034,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // never-committed tail, and streaming it whole would emit tokens past it.
         // On the per-token arms `eos_in_drained` is `None`, so the tail streams
         // whole as before.
+        let tail_start = std::time::Instant::now();
         let tail = readback.drain_all()?;
         if !tail.is_empty() {
             if let Some(k) = readback.eos_in_drained(&tail) {
@@ -1049,6 +1081,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         self.seq.last_logits = if overrun == 0 { Some(logits) } else { None };
         stats.overrun = overrun;
         stats.produced = produced;
+        stats.tail_ns = tail_start.elapsed().as_nanos() as u64;
         stats.step_markers = pacer.taken;
         stats.step_waits = pacer.waited;
         stats.readback = readback.counters();
@@ -2019,7 +2052,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // time (the sync waited out the tail). Good enough for the ratio, which
         // only needs to know whether the GPU dwarfs the host or not.
         let gpu_ns = host_ns + t_gpu.elapsed().as_nanos() as u64;
-        self.warm_in_flight_depth = compute_in_flight_depth(host_ns, gpu_ns, in_flight_mem_cap(device));
+        self.warm_in_flight_depth =
+            compute_in_flight_depth(host_ns, gpu_ns, in_flight_mem_cap(device));
 
         // Leave nothing behind: the warmup wrote KV, conv state and the position
         // counter, and the next call is the user's real prefill from position 0.

@@ -452,6 +452,11 @@ impl SegmentedRing {
         let segments = (0..n_segments)
             .map(|_| Tensor::zeros(tiles_per_seg * q, DType::U32, device))
             .collect::<Result<Vec<_>>>()?;
+        // The zero fills are GPU work, queued; a host write into a segment
+        // (`stage_at_tile`) before they execute is overwritten by them. One
+        // wait at construction — off every hot path — makes every later host
+        // write ordered after the fill.
+        device.synchronize()?;
         Ok(Self {
             segments,
             quantum: q,
@@ -594,11 +599,13 @@ impl SegmentedRing {
             let len = seg.elem_count();
             let poison = vec![sentinel; len];
             // SAFETY: writing the whole (mapped) segment; nothing reads it here.
-            if !unsafe { seg.write_host_slice::<u32>(0, &poison) } {
-                // Unmapped: fall back to a filled tensor.
-                let t = Tensor::from_vec(poison, len, seg.device())?;
-                seg.slice_set(&t, 0, 0)?;
+            #[cfg(feature = "metal")]
+            if unsafe { seg.write_host_slice::<u32>(0, &poison) } {
+                continue;
             }
+            // Unmapped, or off Metal: a filled tensor.
+            let t = Tensor::from_vec(poison, len, seg.device())?;
+            seg.slice_set(&t, 0, 0)?;
         }
         Ok(())
     }
@@ -797,6 +804,7 @@ impl History {
     /// window view is exact only at quantum 1, as `drain_mapped`), or the window
     /// would straddle a segment boundary (a rare split the single-view kernel does
     /// not cover; the host-scan fallback is correct there).
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
     fn window_view(&self) -> Option<Tensor> {
         let n = self.fed - self.drained;
         if n == 0 || self.ring.quantum != 1 {
@@ -856,7 +864,12 @@ impl History {
     /// per-token cost is a raw read, no bounds-checked index. Lock-free: the
     /// mapped read path (`peek_scalar_ptr`) does not lock; this adds no lock and
     /// no allocation.
-    fn drain_into<F: FnMut(usize, usize) -> u32>(&mut self, end: usize, out: &mut Vec<u32>, mut read: F) {
+    fn drain_into<F: FnMut(usize, usize) -> u32>(
+        &mut self,
+        end: usize,
+        out: &mut Vec<u32>,
+        mut read: F,
+    ) {
         out.clear();
         if end <= self.drained {
             return;
@@ -922,7 +935,8 @@ impl History {
         }
         // `quantum == 1`: slots == tokens, `slots_per_seg == tiles_per_seg`. Walk
         // the window one segment-run at a time, bounds COMPUTED, no tile scan.
-        let slots_per_seg = self.ring.tiles_per_seg; // × quantum, and quantum == 1
+        // `× quantum`, and `quantum == 1` here.
+        let slots_per_seg = self.ring.tiles_per_seg;
         // Immutable borrow of the resolved bases + geometry for the loop (both from
         // `self.ring`), so `tile_home` (also immutable) composes without conflict.
         let bases = self
@@ -959,14 +973,60 @@ impl History {
     /// (`drain_into` walks tiles to skip waste), which the dense window read does
     /// not need. Fills `out` (caller-owned, pre-sized).
     fn drain_copy(&mut self, end: usize, out: &mut Vec<u32>) -> Result<()> {
-        let snapshots = self
-            .ring
-            .segments
-            .iter()
-            .map(|s| s.to_vec1::<u32>())
-            .collect::<Result<Vec<_>>>()?;
-        self.drain_into(end, out, |seg, slot| snapshots[seg][slot]);
+        out.clear();
+        let end = end.min(self.fed);
+        if end <= self.drained {
+            return Ok(());
+        }
+        // Only the segments the undrained window spans are read back: each
+        // `to_vec1` is a blocking readback, and the ring holds many more
+        // segments (the consumer slack) than a window ever touches. At
+        // `quantum == 1` the window `[drained, end)` is dense (token == slot)
+        // and is read whole, the open tile's token included, exactly as the
+        // mapped read does; the tile walk is for the waste-tail layouts.
+        let mut snapshots: Vec<Option<Vec<u32>>> = vec![None; self.ring.segments.len()];
+        if self.ring.quantum == 1 {
+            let slots_per_seg = self.ring.tiles_per_seg;
+            while self.drained < end {
+                let (seg, off) = self.ring.tile_home(self.drained);
+                if snapshots[seg].is_none() {
+                    snapshots[seg] = Some(self.ring.segments[seg].to_vec1::<u32>()?);
+                }
+                let run = (end - self.drained).min(slots_per_seg - off);
+                if let Some(s) = snapshots[seg].as_ref() {
+                    out.extend_from_slice(&s[off..off + run]);
+                }
+                self.drained += run;
+            }
+            self.drained_tiles = self.drained;
+            return Ok(());
+        }
+        for tile in self.drained_tiles..self.tiles {
+            let (seg, _) = self.tile_home(tile);
+            if snapshots[seg].is_none() {
+                snapshots[seg] = Some(self.ring.segments[seg].to_vec1::<u32>()?);
+            }
+        }
+        self.drain_into(end, out, |seg, slot| {
+            snapshots[seg].as_ref().map_or(0, |s| s[slot])
+        });
         Ok(())
+    }
+
+    /// The final drain: everything to `fed`, after one wait for the GPU.
+    ///
+    /// One `synchronize` retires every in-flight write, after which the mapped
+    /// window read is exact; the copy path is taken only where a segment is
+    /// not mapped or the layout has waste tails (`quantum > 1`).
+    fn drain_all_into(&mut self, device: &Device, out: &mut Vec<u32>) -> Result<()> {
+        self.close_open_tile()?;
+        let fed = self.generation();
+        device.synchronize()?;
+        #[cfg(feature = "metal")]
+        if self.drain_mapped(fed, out) {
+            return Ok(());
+        }
+        self.drain_copy(fed, out)
     }
 }
 
@@ -1087,7 +1147,15 @@ impl Ring {
     /// [`Self::with_geometry`], which sizes the ring exactly from the run's own
     /// per-step geometry.
     pub fn new(eos_ids: &[u32], device: &Device, capacity: usize, eos: EosRead) -> Result<Self> {
-        Self::with_cap_and_quantum(eos_ids, device, capacity.max(RING_HISTORY_SLOTS), 1, 1, 1, eos)
+        Self::with_cap_and_quantum(
+            eos_ids,
+            device,
+            capacity.max(RING_HISTORY_SLOTS),
+            1,
+            1,
+            1,
+            eos,
+        )
     }
 
     /// Construct sized from the per-step geometry PLUS a consumer-slack window.
@@ -1343,6 +1411,9 @@ impl ReadbackStrategy for Ring {
         // segment-boundary straddle) yields `None` here and the drain falls back to
         // the host scan for this commit.
         if matches!(self.eos, EosRead::GpuBatched) {
+            // `eos_index` is a Metal kernel; off Metal the window has no dense
+            // device check and every drain takes the host scan.
+            #[cfg(feature = "metal")]
             let pending = match self.history.window_view() {
                 Some(tokens) => {
                     #[cfg(feature = "metal")]
@@ -1361,6 +1432,8 @@ impl ReadbackStrategy for Ring {
                 }
                 None => None,
             };
+            #[cfg(not(feature = "metal"))]
+            let pending = None;
             *self.pending_eos_index.borrow_mut() = pending;
         }
         // The wake-cadence throttle. A commit is LIVE — writes the device word the
@@ -1465,15 +1538,19 @@ impl ReadbackStrategy for Ring {
         // blocking arm's own per-step `to_vec1` already synchronised up to `fed`.
         let fed = self.history.generation();
         let end = match self.eos {
-            EosRead::Poll(_) | EosRead::HostOnDrain | EosRead::GpuBatched => match self
-                .ring
-                .published_generation()
-            {
-                Some(g) => fed.min(g as usize),
-                // Unmapped counter (no visibility signal): the copy fallback below
-                // is correct by force (it synchronises), so drain to `fed` there.
-                None => 0,
-            },
+            EosRead::Poll(_) | EosRead::HostOnDrain | EosRead::GpuBatched => {
+                match self.ring.published_generation() {
+                    Some(g) => fed.min(g as usize),
+                    // No visibility signal (the counter is not CPU-mapped): wait
+                    // for the GPU, after which everything fed is written and the
+                    // window can be read to `fed`. The honest degradation — a
+                    // drain that could not otherwise ever see the EOS.
+                    None => {
+                        self.ring.input_device().device().synchronize()?;
+                        fed
+                    }
+                }
+            }
             EosRead::Blocking => fed,
         };
 
@@ -1503,15 +1580,13 @@ impl ReadbackStrategy for Ring {
         if self.history.undrained() == 0 {
             return Ok(Vec::new());
         }
-        // The final drain: completeness over non-blocking. Close the open tile
-        // first (the last step's tile is not yet counted), then the copy path
-        // **synchronises** up to the last enqueued slot — what the poll arm needs
-        // here, since its incremental `take_ids` refuses to read past the
-        // published counter. Drains everything to `fed`.
-        self.history.close_open_tile()?;
-        let fed = self.history.generation();
+        // The final drain: completeness over non-blocking. One wait for the
+        // GPU, then the window is read — what the poll arm needs here, since
+        // its incremental `take_ids` refuses to read past the published
+        // counter. Drains everything to `fed`.
+        let device = self.ring.input_device().device().clone();
         let mut out = Vec::with_capacity(self.history.undrained());
-        self.history.drain_copy(fed, &mut out)?;
+        self.history.drain_all_into(&device, &mut out)?;
         Ok(out)
     }
 
@@ -1733,8 +1808,12 @@ mod tests {
     fn drain(h: &mut History) -> Vec<u32> {
         h.close_open_tile().unwrap();
         let fed = h.generation();
-        let snapshots: Vec<Vec<u32>> =
-            h.ring.segments.iter().map(|s| s.to_vec1::<u32>().unwrap()).collect();
+        let snapshots: Vec<Vec<u32>> = h
+            .ring
+            .segments
+            .iter()
+            .map(|s| s.to_vec1::<u32>().unwrap())
+            .collect();
         let mut out = Vec::new();
         h.drain_into(fed, &mut out, |seg, slot| snapshots[seg][slot]);
         out
@@ -1777,7 +1856,13 @@ mod tests {
         for step in 0..2000 {
             h.begin_step().unwrap();
             let n = 1 + rng.upto(quantum); // 1..=quantum real tokens
-            let ids: Vec<u32> = (0..n).map(|_| { let x = next_id; next_id += 1; x }).collect();
+            let ids: Vec<u32> = (0..n)
+                .map(|_| {
+                    let x = next_id;
+                    next_id += 1;
+                    x
+                })
+                .collect();
             write_tile(&mut h, &ids);
             expect.extend_from_slice(&ids);
             // Drain on a varying cadence, but always before the window could lap
@@ -1789,8 +1874,14 @@ mod tests {
         got_all.extend(drain(&mut h));
         // Every real token, in order, no waste (waste is never 0-valued here:
         // ids start at 1, and poison in debug would show as 0xDEADB171).
-        assert_eq!(got_all, expect, "strided read must return exactly the real tokens");
-        assert!(!got_all.contains(&TILE_POISON_TEST), "a poison/ waste slot leaked into the drain");
+        assert_eq!(
+            got_all, expect,
+            "strided read must return exactly the real tokens"
+        );
+        assert!(
+            !got_all.contains(&TILE_POISON_TEST),
+            "a poison/ waste slot leaked into the drain"
+        );
     }
 
     #[test]
@@ -1830,7 +1921,7 @@ mod tests {
         h.begin_step().unwrap();
         write_tile(&mut h, &[42]);
         h.retract_one(); // 42 was an EOS
-        // Next step's token is the real one.
+                         // Next step's token is the real one.
         h.begin_step().unwrap();
         write_tile(&mut h, &[7]);
         let got = drain(&mut h);
@@ -1907,7 +1998,10 @@ mod tests {
                     let end = h.generation();
                     let mut out = Vec::new();
                     let mapped = h.drain_mapped(end, &mut out);
-                    assert!(mapped, "drain_mapped must take the mapped path at quantum 1");
+                    assert!(
+                        mapped,
+                        "drain_mapped must take the mapped path at quantum 1"
+                    );
                     assert_eq!(
                         out, fed_since_drain,
                         "window drain diverged at step {step} (seg-spanning run wrong)"

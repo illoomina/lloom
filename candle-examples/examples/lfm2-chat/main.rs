@@ -1023,28 +1023,6 @@ fn main() -> Result<()> {
     let seed = args.seed.unwrap_or_else(rand::random::<u64>);
     let mut logits_processor = LogitsProcessor::from_sampling(seed, sampling);
 
-    // ---- prompt: read stdin, wrap in the LFM2 chat template ---------------
-    let mut prompt = String::new();
-    std::io::stdin()
-        .read_to_string(&mut prompt)
-        .context("reading prompt from stdin")?;
-    let prompt = prompt.trim();
-    let text = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
-    let mut prompt_ids = tokenizer
-        .encode(text.as_str(), false)
-        .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?
-        .get_ids()
-        .to_vec();
-    // BOS by default — the model's template start (see `--no-bos`). Coupled with
-    // the `<|im_end|>`-only EOS set above: together they lift acceptance and make
-    // replies terminate; BOS without the EOS fix drove a non-terminating ramble.
-    if !args.no_bos {
-        let bos = tokenizer
-            .token_to_id("<|startoftext|>")
-            .context("tokenizer has no <|startoftext|> — LFM2's BOS")?;
-        prompt_ids.insert(0, bos);
-    }
-
     // ---- decode: one Session::decode call --------------------------------
     //
     // The strategy is selected here and the loop never names it. Each arm is
@@ -1086,6 +1064,45 @@ fn main() -> Result<()> {
         // 0 = one-shot prefill (incumbent); >0 streams the prompt through the pacer.
         prefill_ubatch: args.prefill_ubatch,
     };
+
+    // The readback strategy is built BEFORE the prompt is read: it depends on
+    // nothing in the prompt, and a ring arm allocates its device history and
+    // the consumer slack here — tens of milliseconds a serving engine pays once
+    // per engine, not once per request, so it is kept off the TTFT clock.
+    // `--dspark` drives the speculative body over a `Blocking` handle instead.
+    let mut readback_arm = if dspark_setup.is_none() {
+        Some(build_readback(
+            &args.readback,
+            args.wake_cadence,
+            &opts,
+            &eos_ids,
+            &device,
+        )?)
+    } else {
+        None
+    };
+
+    // ---- prompt: read stdin, wrap in the LFM2 chat template ---------------
+    let mut prompt = String::new();
+    std::io::stdin()
+        .read_to_string(&mut prompt)
+        .context("reading prompt from stdin")?;
+    let prompt = prompt.trim();
+    let text = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
+    let mut prompt_ids = tokenizer
+        .encode(text.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("tokenizing prompt: {e}"))?
+        .get_ids()
+        .to_vec();
+    // BOS by default — the model's template start (see `--no-bos`). Coupled with
+    // the `<|im_end|>`-only EOS set above: together they lift acceptance and make
+    // replies terminate; BOS without the EOS fix drove a non-terminating ramble.
+    if !args.no_bos {
+        let bos = tokenizer
+            .token_to_id("<|startoftext|>")
+            .context("tokenizer has no <|startoftext|> — LFM2's BOS")?;
+        prompt_ids.insert(0, bos);
+    }
 
     // The DSpark proposer, built only when `--dspark` is set. It borrows the
     // target's token embedding and `lm_head` (the drafter ships neither — 62
@@ -1151,6 +1168,13 @@ fn main() -> Result<()> {
     // this is the point: the drain reads finished work off the ring, it does not
     // wait, so streaming does not re-serialize the non-blocking path.
     use std::io::Write;
+    // The profile window is the decode: warmup's and the load's command
+    // buffers are dropped so `gpu_busy / decode_wall` below is one window over
+    // one window. Warmup ended on a `synchronize`, so nothing is in flight.
+    #[cfg(feature = "metal")]
+    if candle::kernels::metal::profile::enabled() {
+        candle::kernels::metal::profile::reset();
+    }
     let decode_start = std::time::Instant::now();
     // Wall-clock to the first token the consumer is HANDED (`first_batch_at`, on
     // the decode thread when it pushes) and to the first VISIBLE token
@@ -1257,16 +1281,15 @@ fn main() -> Result<()> {
                     &mut on_tokens,
                 )?
             }
-            None => decode_with(
-                &args.readback,
-                args.wake_cadence,
+            None => decode_arm(
+                readback_arm
+                    .as_mut()
+                    .expect("a non-speculative run built its readback arm above"),
                 &mut session,
                 &mut spec,
                 &mut logits_processor,
                 &prompt_ids,
                 &opts,
-                &eos_ids,
-                &device,
                 &mut on_tokens,
             )?,
         }
@@ -1337,31 +1360,27 @@ fn main() -> Result<()> {
     //
     // A debug/`--features profile` build additionally has the per-step `step_ns`
     // and prints the finer compute term (`prefill + step0`) instead.
-    // Headline = the fair compute TTFT (A), always available now (stamped once at
-    // step 0, release-safe): prefill + first-token sample, no sync, no cadence, no
-    // print — the number comparable to llama-bench's `-p`.
-    let ttft_ms = st.ttft_compute_ns as f64 / 1e6;
-    // The seam apart: `received` is the fair, llama-bench-comparable TTFT (host
-    // gets the first token, non-blocking, no print) — the headline. `visible` is
-    // ours-only: the byte reaching stdout through the consumer thread, which
-    // includes detokenize + the consumer's poll + the terminal write. A gap
-    // `visible ≫ received` is the consumer/print cost the decouple moved OFF the
-    // hot path — real user-facing latency, but NOT what llama-bench times.
-    // Three TTFTs, because the architecture has three stages llama-bench does not
-    // separate: (A) compute — prefill + first-token sample, no sync/cadence/print,
-    // the llama-bench-comparable headline; (B) received — the host DRAINS the first
-    // token (A + the commit cadence / pipeline fill); visible — the byte reaches
-    // stdout (B + detokenize + the consumer thread). B−A is our cadence cost, and
-    // visible−B is the consumer/print the decouple moved off the hot path.
+    // Three stamps, named for what they measure. `submit` is the host's encode
+    // of the prompt plus the first argmax with NO wait on the GPU — a host
+    // submit time, not a time-to-token, and not what llama-bench's `pp` times
+    // (that call blocks on the prompt's execution). `received` is when the
+    // first token exists on the host: the strategy's own setup, the prefill's
+    // execution and the first drain — the TTFT, and what the RESULT line
+    // carries. `visible` adds the consumer thread and the tokenizer's boundary
+    // rule (a first piece that is not alphanumeric-terminated waits for the
+    // next token, which is one decode step).
+    let submit_ms = st.ttft_compute_ns as f64 / 1e6;
+    let ttft_ms = first_batch_at.map_or(f64::NAN, |d| d.as_secs_f64() * 1e3);
     eprintln!(
-        "[first-token: compute {:.2} ms (fair TTFT, ~llama-bench) | received {} ms | visible {} ms (to stdout)]",
-        ttft_ms,
+        "[first-token: submit {:.2} ms (host encode, no GPU wait) | received {} ms (TTFT) | visible {} ms (to stdout); tail after the loop {:.2} ms]",
+        submit_ms,
         first_batch_at
             .map(|d| format!("{:.2}", d.as_secs_f64() * 1e3))
             .unwrap_or_else(|| "n/a".into()),
         first_visible_at
             .map(|d| format!("{:.2}", d.as_secs_f64() * 1e3))
             .unwrap_or_else(|| "n/a".into()),
+        st.tail_ns as f64 / 1e6,
     );
     // The two TTFT terms apart, and the first steps by phase: `prefill_ns` is
     // the prompt's encode, and under `lookahead = 1` step 0's EOS wait is where
@@ -1541,6 +1560,55 @@ fn main() -> Result<()> {
             s.timed_command_buffers,
             s.dispatches as f64 / steps,
             st.steps,
+        );
+        // The falsifier of issue #702, on one window: the union of the decode's
+        // command-buffer GPU intervals against the decode's wall (prefill on both
+        // sides). `1 − busy/wall` is the time no command buffer was executing —
+        // an upper bound on GPU idle, since a buffer stalled on a fence inside
+        // its interval still counts as busy.
+        let wall = decode_elapsed.as_secs_f64();
+        eprintln!(
+            "[profile: gpu_busy_union {:.4} s / decode_wall {:.4} s = {:.4} busy/wall; \
+             gpu_span {:.4} s; gpu_busy_sum {:.4} s]",
+            s.gpu_busy_union_s,
+            wall,
+            s.gpu_busy_union_s / wall.max(1e-9),
+            s.gpu_span_s,
+            s.gpu_busy_sum_s,
+        );
+        // The command-buffer lifecycle, priced on the hot thread: what
+        // `commit_swap_locked` (encoder close, residency, signal, handlers,
+        // commit, next-buffer creation, swap) and `flush_and_prune` cost the
+        // encoding thread per step.
+        eprintln!(
+            "[profile: cb lifecycle on the hot thread: {:.1} commits/step at {:.1} µs each = \
+             {:.3} ms/step (of which commandBuffer() {:.3} ms/step); {:.2} prunes/step at \
+             {:.1} µs each = {:.3} ms/step]",
+            s.commits as f64 / steps,
+            s.commit_ns as f64 / 1e3 / s.commits.max(1) as f64,
+            s.commit_ns as f64 / 1e6 / steps,
+            s.create_cb_ns as f64 / 1e6 / steps,
+            s.prunes as f64 / steps,
+            s.prune_ns as f64 / 1e3 / s.prunes.max(1) as f64,
+            s.prune_ns as f64 / 1e6 / steps,
+        );
+    }
+    // The hot thread's steady-state split, every step summed (debug/profile
+    // builds only): how much of a step the host spends encoding against how
+    // much it spends waiting for the GPU to publish the token.
+    if st.phase_steps > 0 {
+        let n = st.phase_steps as f64;
+        let p = &st.phase_totals;
+        let total = (p.sample_ns + p.forward_ns + p.backpressure_ns + p.eos_ns) as f64;
+        eprintln!(
+            "[hot thread per step, mean over {} steps: sample {:.3} ms, forward (encode) {:.3} ms, \
+             backpressure {:.3} ms, eos_wait {:.3} ms; encoding {:.1} % of the bracketed step]",
+            st.phase_steps,
+            ms(p.sample_ns) / n,
+            ms(p.forward_ns) / n,
+            ms(p.backpressure_ns) / n,
+            ms(p.eos_ns) / n,
+            100.0 * (p.sample_ns + p.forward_ns) as f64 / total.max(1.0),
         );
     }
     #[cfg(feature = "metal")]
@@ -1818,25 +1886,22 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
     );
 }
 
-/// Build the selected strategy and run the loop over it.
-///
-/// Three arms, one call site each: the loop is generic and this is where the
-/// type is chosen. An unknown name is an error rather than a fallback (a run
-/// that reports one arm and executes another is the failure this refuses).
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn decode_with(
+/// One readback strategy, selected by name and held across the prompt read.
+enum ReadbackArm {
+    Blocking(Blocking),
+    Ring(Ring, &'static str),
+}
+
+/// Build the selected strategy. An unknown name is an error rather than a
+/// fallback (a run that reports one arm and executes another is the failure
+/// this refuses).
+fn build_readback(
     readback: &str,
     wake_cadence: usize,
-    session: &mut Session<'_, Model>,
-    spec: &mut IdentityProposer,
-    sampler: &mut LogitsProcessor,
-    prompt_ids: &[u32],
     opts: &DecodeOptions,
     eos_ids: &[u32],
     device: &Device,
-    on_tokens: &mut dyn FnMut(&[u32]) -> candle::Result<()>,
-) -> Result<DecodeOut> {
+) -> Result<ReadbackArm> {
     // The device-side id history, sized EXACTLY from the per-step geometry — a
     // wrapping ring whose live window is `period × quantum`, NOT the whole
     // generation, so an unbounded (`-n 0`) run streams at any length by reusing
@@ -1857,81 +1922,90 @@ fn decode_with(
         // race an in-flight forward's read; the pacer depth is what bounds that.
         in_flight_depth: opts.pacer_depth(),
     };
-    let out = match readback {
-        "blocking" => {
-            let mut rb = Blocking::new(eos_ids, device)?;
-            session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?
-        }
-        "ring" => {
-            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::Blocking)?;
-            session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?
-        }
-        "ring-nonblocking" => {
-            let mut rb = Ring::with_geometry(
+    let built = std::time::Instant::now();
+    let arm = match readback {
+        "blocking" => ReadbackArm::Blocking(Blocking::new(eos_ids, device)?),
+        "ring" => ReadbackArm::Ring(
+            Ring::with_geometry(eos_ids, device, geometry, EosRead::Blocking)?,
+            "ring",
+        ),
+        "ring-nonblocking" => ReadbackArm::Ring(
+            Ring::with_geometry(
                 eos_ids,
                 device,
                 geometry,
                 EosRead::Poll(PollMechanism::default()),
-            )?;
-            let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
-            // The arm that ran is the arm reported: a ring whose poll could not
-            // read the mapped words fell back to the blocking read on every
-            // step, and says so rather than passing as non-blocking.
-            if !rb.poll_is_mapped() {
-                eprintln!(
-                    "[ring-nonblocking: the ring's words were not CPU-mapped, every EOS read \
-                     took the blocking fallback ({} of {} steps)]",
-                    out.stats.readback.poll_fallbacks, out.stats.steps
-                );
-            }
-            debug_assert!(rb.arms().nonblocking_eos);
-            out
-        }
-        "ring-hostdrain" => {
-            // The device never computes the EOS flag (~5 dispatches/token gone);
-            // the host learns EOS from the drained ids on the commit cadence, so
-            // up to a commit-worth of forwards may run past the EOS and their
-            // tokens are truncated from the output. Byte-identical to the poll
-            // arm — the truncation lands at the same position the poll would
-            // break at.
-            // The wake-cadence knob only bites here: this arm defers its marker to
-            // the commit window, so `--wake-cadence N` wakes the host every N
-            // commits instead of every one (the other arms stamp per step).
-            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::HostOnDrain)?
-                .with_wake_cadence(wake_cadence);
-            let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
-            if !rb.poll_is_mapped() {
-                eprintln!(
-                    "[ring-hostdrain: the ring's words were not CPU-mapped; the drain took the \
-                     synchronising snapshot each commit]"
-                );
-            }
-            debug_assert!(rb.arms().nonblocking_eos);
-            out
-        }
-        "ring-gpubatch" => {
-            // Like ring-hostdrain (no per-token flag, marker deferred to the commit
-            // window, `--wake-cadence` bites), but EOS is learned by ONE batched
-            // `eos_index` GPU dispatch per window instead of a host scan — the host
-            // reads back a single index per commit. Byte-identical to the other
-            // arms: the truncation lands at the same EOS position, computed on the
-            // GPU rather than scanned on the CPU.
-            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::GpuBatched)?
-                .with_wake_cadence(wake_cadence);
-            let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
-            if !rb.poll_is_mapped() {
-                eprintln!(
-                    "[ring-gpubatch: the ring's words were not CPU-mapped; the drain took the \
-                     synchronising snapshot each commit]"
-                );
-            }
-            debug_assert!(rb.arms().nonblocking_eos);
-            out
-        }
+            )?,
+            "ring-nonblocking",
+        ),
+        // The device never computes the EOS flag (~5 dispatches/token gone);
+        // the host learns EOS from the drained ids on the commit cadence, so
+        // up to a commit-worth of forwards may run past the EOS and their
+        // tokens are truncated from the output. Byte-identical to the poll
+        // arm — the truncation lands at the same position the poll would
+        // break at. The wake-cadence knob only bites on the deferred-marker
+        // arms: `--wake-cadence N` wakes the host every N commits instead of
+        // every one (the other arms stamp per step).
+        "ring-hostdrain" => ReadbackArm::Ring(
+            Ring::with_geometry(eos_ids, device, geometry, EosRead::HostOnDrain)?
+                .with_wake_cadence(wake_cadence),
+            "ring-hostdrain",
+        ),
+        // Like ring-hostdrain, but EOS is learned by ONE batched `eos_index` GPU
+        // dispatch per window instead of a host scan — the host reads back a
+        // single index per commit. Byte-identical to the other arms.
+        "ring-gpubatch" => ReadbackArm::Ring(
+            Ring::with_geometry(eos_ids, device, geometry, EosRead::GpuBatched)?
+                .with_wake_cadence(wake_cadence),
+            "ring-gpubatch",
+        ),
         other => anyhow::bail!(
             "--readback must be `blocking`, `ring`, `ring-nonblocking`, `ring-hostdrain` or \
              `ring-gpubatch`, got `{other}`"
         ),
+    };
+    // Stamped because a ring arm allocates its history and the consumer slack
+    // here; the figure is what a serving engine pays once per engine.
+    eprintln!(
+        "[readback: {readback} built in {:.2} ms (LLOOM_RING_SLACK_BYTES={})]",
+        built.elapsed().as_secs_f64() * 1e3,
+        std::env::var("LLOOM_RING_SLACK_BYTES").unwrap_or_else(|_| "default".into()),
+    );
+    Ok(arm)
+}
+
+/// Run the loop over the built strategy. The loop is generic and this is where
+/// the type is chosen, one call site per arm.
+fn decode_arm(
+    arm: &mut ReadbackArm,
+    session: &mut Session<'_, Model>,
+    spec: &mut IdentityProposer,
+    sampler: &mut LogitsProcessor,
+    prompt_ids: &[u32],
+    opts: &DecodeOptions,
+    on_tokens: &mut dyn FnMut(&[u32]) -> candle::Result<()>,
+) -> Result<DecodeOut> {
+    let out = match arm {
+        ReadbackArm::Blocking(rb) => {
+            session.decode(spec, rb, sampler, prompt_ids, opts, on_tokens)?
+        }
+        ReadbackArm::Ring(rb, name) => {
+            let out = session.decode(spec, rb, sampler, prompt_ids, opts, on_tokens)?;
+            // The arm that ran is the arm reported: a ring whose poll could not
+            // read the mapped words fell back to the blocking read (or the
+            // synchronising snapshot at each drain), and says so rather than
+            // passing as non-blocking.
+            if !rb.poll_is_mapped() {
+                eprintln!(
+                    "[{name}: the ring's words were not CPU-mapped; the EOS read took the \
+                     blocking fallback ({} of {} steps) and each drain the synchronising \
+                     snapshot]",
+                    out.stats.readback.poll_fallbacks, out.stats.steps
+                );
+            }
+            debug_assert!(*name == "ring" || rb.arms().nonblocking_eos);
+            out
+        }
     };
     Ok(out)
 }

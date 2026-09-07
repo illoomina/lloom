@@ -82,6 +82,37 @@ static COMMAND_BUFFERS: AtomicU64 = AtomicU64::new(0);
 /// serialize the GPU (`DESIGN.md` §3.5), so the count belongs next to the
 /// dispatch count rather than being inferred from it.
 static ENCODERS: AtomicU64 = AtomicU64::new(0);
+/// Command-buffer lifecycle time spent on the encoding thread since the last
+/// reset: `commit_swap_locked` whole (end the encoder, publish residency,
+/// signal, handlers, commit, create the next buffer, swap), the
+/// `commandBuffer()` creation inside it, and `flush_and_prune` whole. The
+/// host-side price of a command-buffer seam, which the GPU-interval union
+/// cannot see (issue #702).
+static COMMITS: AtomicU64 = AtomicU64::new(0);
+static COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+static CREATE_CB_NS: AtomicU64 = AtomicU64::new(0);
+static PRUNES: AtomicU64 = AtomicU64::new(0);
+static PRUNE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one `commit_swap_locked`, `elapsed` on the calling thread.
+#[inline]
+pub fn record_commit(elapsed: std::time::Duration) {
+    COMMITS.fetch_add(1, Ordering::Relaxed);
+    COMMIT_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Record one `commandBuffer()` creation, `elapsed` on the calling thread.
+#[inline]
+pub fn record_create_cb(elapsed: std::time::Duration) {
+    CREATE_CB_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Record one `flush_and_prune`, `elapsed` on the calling thread.
+#[inline]
+pub fn record_prune(elapsed: std::time::Duration) {
+    PRUNES.fetch_add(1, Ordering::Relaxed);
+    PRUNE_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
 
 /// The key a dispatch with no recorded pipeline name is counted under.
 ///
@@ -225,6 +256,14 @@ pub struct Snapshot {
     pub gpu_span_s: f64,
     /// Dispatch counts by pipeline label, descending.
     pub by_label: Vec<(String, u64)>,
+    /// `commit_swap_locked` calls, and the encoding-thread time they took.
+    pub commits: u64,
+    pub commit_ns: u64,
+    /// The `commandBuffer()` creations inside those commits, encoding-thread time.
+    pub create_cb_ns: u64,
+    /// `flush_and_prune` calls, and the encoding-thread time they took.
+    pub prunes: u64,
+    pub prune_ns: u64,
 }
 
 /// Take the current totals without clearing them.
@@ -255,6 +294,11 @@ pub fn snapshot() -> Snapshot {
         gpu_busy_union_s: union,
         gpu_span_s: span,
         by_label,
+        commits: COMMITS.load(Ordering::Relaxed),
+        commit_ns: COMMIT_NS.load(Ordering::Relaxed),
+        create_cb_ns: CREATE_CB_NS.load(Ordering::Relaxed),
+        prunes: PRUNES.load(Ordering::Relaxed),
+        prune_ns: PRUNE_NS.load(Ordering::Relaxed),
     }
 }
 
@@ -266,6 +310,11 @@ pub fn reset() {
     DISPATCHES.store(0, Ordering::Relaxed);
     ENCODERS.store(0, Ordering::Relaxed);
     COMMAND_BUFFERS.store(0, Ordering::Relaxed);
+    COMMITS.store(0, Ordering::Relaxed);
+    COMMIT_NS.store(0, Ordering::Relaxed);
+    CREATE_CB_NS.store(0, Ordering::Relaxed);
+    PRUNES.store(0, Ordering::Relaxed);
+    PRUNE_NS.store(0, Ordering::Relaxed);
     let mut rec = recorder().lock().unwrap();
     rec.intervals.clear();
     rec.dispatches.clear();

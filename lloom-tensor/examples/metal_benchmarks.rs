@@ -66,7 +66,7 @@ fn run_gemm(f32: bool, n: usize) -> Result<()> {
     let mut iters = 0usize;
     for idx in 0.. {
         let command_queue = device.new_command_queue().unwrap();
-        let commands = Commands::new(command_queue, &residency_set).unwrap();
+        let commands = Commands::new(command_queue, residency_set.clone()).unwrap();
         let encoder = commands.command_encoder().unwrap();
         let start_time = std::time::Instant::now();
         lloom_tensor::kernels::call_mlx_gemm(

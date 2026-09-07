@@ -11,8 +11,8 @@ use crate::kernels::{
 use objc2::available;
 use objc2::rc::Retained;
 use objc2_foundation::NSString;
-use std::collections::HashMap;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub enum KernelName {
@@ -694,10 +694,10 @@ mod tests {
         // bad edit fails here rather than passing over an empty iteration.
         assert_eq!(
             MERGED_MEMBERS.len(),
-            17,
-            "17 non-MLX sources (#466 §4, +rope #659)"
+            18,
+            "18 non-MLX sources (#466 §4, +rope #659, +eos_index #702's tree)"
         );
-        assert_eq!(all.len(), 20, "20 Source variants");
+        assert_eq!(all.len(), 21, "21 Source variants");
     }
 
     /// Issue #477. The merged text **compiles**, and it contains kernels from
@@ -838,7 +838,7 @@ mod tests {
             }
             merged_keys.insert(key);
         }
-        assert_eq!(n_merged, 17, "17 sources must route to the merged library");
+        assert_eq!(n_merged, 18, "18 sources must route to the merged library");
         // 1 merged key + 3 MLX keys. A count of 20 would mean nothing merged.
         assert_eq!(
             merged_keys.len(),
@@ -881,8 +881,8 @@ mod tests {
         }
         assert_eq!(
             default_keys.len(),
-            20,
-            "the default arm must be 20 distinct libraries, unchanged"
+            21,
+            "the default arm must be 21 distinct libraries, unchanged"
         );
     }
 }

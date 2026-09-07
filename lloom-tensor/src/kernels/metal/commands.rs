@@ -1011,6 +1011,7 @@ impl Commands {
     /// an instrument that cannot be shown to have engaged has not measured
     /// anything).
     pub fn flush_and_prune(&self) -> Result<usize, MetalKernelError> {
+        let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
         let mut state = self.state.lock();
         if self.compute_count.load(Ordering::Acquire) > 0 {
             self.commit_swap_locked(&mut state, 0)?;
@@ -1028,6 +1029,9 @@ impl Commands {
         state
             .in_flight
             .retain(|c| c.status() != MTLCommandBufferStatus::Completed);
+        if let Some(t) = timed {
+            crate::kernels::metal::profile::record_prune(t.elapsed());
+        }
         Ok(state.in_flight.len())
     }
 
@@ -1066,6 +1070,9 @@ impl Commands {
         state: &mut EntryState,
         reset_to: usize,
     ) -> Result<Option<u64>, MetalKernelError> {
+        // Priced on the encoding thread under `CANDLE_METAL_PROFILE=1`: this
+        // is the host-side cost of a command-buffer seam (issue #702).
+        let timed = crate::kernels::metal::profile::enabled().then(std::time::Instant::now);
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
@@ -1137,10 +1144,17 @@ impl Commands {
                 self.clock.mark_completed(epoch);
             }
         }
+        let created = timed.map(|_| std::time::Instant::now());
         let new_cb = create_command_buffer(&self.command_queue)?;
+        if let Some(t) = created {
+            crate::kernels::metal::profile::record_create_cb(t.elapsed());
+        }
         let old_cb = std::mem::replace(&mut state.current, new_cb);
         state.in_flight.push(old_cb);
         self.compute_count.store(reset_to, Ordering::Release);
+        if let Some(t) = timed {
+            crate::kernels::metal::profile::record_commit(t.elapsed());
+        }
 
         Ok(signalled)
     }

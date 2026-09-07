@@ -18,7 +18,9 @@
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
+    WAKE_LIVE_EVERY_DEFAULT,
 };
+use lloom::nn::decode::IN_FLIGHT_STEPS;
 use lloom::nn::speculator::{Draft, NoProbe, SeqId, TargetProbe};
 use lloom::nn::{CausalLM, DecodeOptions, IdentityProposer, Model, Session, Speculator};
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -212,6 +214,21 @@ impl ReadbackStrategy for AnyArm {
             AnyArm::Ring(r) => r.drain_all(),
         }
     }
+    // The two defaulted methods are forwarded too: a wrapper that left them at
+    // the trait's no-op would drive a ring whose marker is never written, and
+    // every drain-arm assertion below would be about the wrapper.
+    fn stage_prompt_chunk(&mut self, tokens: &[u32]) -> Result<Tensor> {
+        match self {
+            AnyArm::Blocking(b) => b.stage_prompt_chunk(tokens),
+            AnyArm::Ring(r) => r.stage_prompt_chunk(tokens),
+        }
+    }
+    fn publish_marker(&mut self, force_live: bool) -> Result<()> {
+        match self {
+            AnyArm::Blocking(b) => b.publish_marker(force_live),
+            AnyArm::Ring(r) => r.publish_marker(force_live),
+        }
+    }
     fn eos_in_drained(&self, batch: &[u32]) -> Option<usize> {
         match self {
             AnyArm::Blocking(b) => b.eos_in_drained(batch),
@@ -335,10 +352,15 @@ fn the_host_drain_arm_reports_its_overrun_and_a_second_run_starts_clean() -> Res
             assert_eq!(out.ids, want, "{device:?} steps:{period}");
             assert!(out.eos);
             // The EOS token was fed, plus everything enqueued before the drain
-            // that showed it: at least 1, at most a commit period's worth.
+            // that showed it. The marker goes LIVE every `WAKE_LIVE_EVERY_DEFAULT`
+            // commits (one commit per `period` steps), and a drain reads the
+            // marker the GPU has executed — the previous live one, at worst —
+            // so the EOS can be seen up to two live windows late, plus the
+            // forwards the pacer lets the host keep in flight.
+            let bound = 2 * period * WAKE_LIVE_EVERY_DEFAULT + IN_FLIGHT_STEPS;
             assert!(
-                out.stats.overrun >= 1 && out.stats.overrun <= period,
-                "{device:?} steps:{period}: overrun {} outside [1, {period}]",
+                out.stats.overrun >= 1 && out.stats.overrun <= bound,
+                "{device:?} steps:{period}: overrun {} outside [1, {bound}]",
                 out.stats.overrun
             );
             // The cache position is the token log plus the overrun, exactly.
@@ -467,7 +489,10 @@ fn the_commit_cadence_follows_the_budget_only_with_lookahead() -> Result<()> {
             ..DecodeOptions::new(12)
         };
         let (out, _) = run(&device, &Arm::RingPoll, &[0], &opts)?;
-        assert_eq!(out.stats.commits, 6, "{device:?}: 12 steps at steps:4 + TTFT ramp");
+        assert_eq!(
+            out.stats.commits, 6,
+            "{device:?}: 12 steps at steps:4 + TTFT ramp"
+        );
         // Lookahead off: the publish must be committed before the wait, so the
         // loop commits per token whatever the budget says — the counter is
         // what makes that visible rather than silently ignored.
@@ -535,28 +560,30 @@ fn a_second_decode_continues_from_the_cache_position() -> Result<()> {
 }
 
 #[test]
-fn max_tokens_bounds_the_run_and_a_ring_too_small_is_refused() -> Result<()> {
+fn max_tokens_bounds_the_run_and_a_ring_smaller_than_the_run_is_reused() -> Result<()> {
     let device = Device::Cpu;
     let (out, _) = run(&device, &Arm::RingPoll, &[0], &DecodeOptions::new(5))?;
     assert_eq!(out.ids.len(), 5);
     let model = Chain::new(&device)?;
     let mut session = Session::new(&model, 0usize);
-    // `Ring::new` floors the history at `RING_HISTORY_SLOTS` (a few pages, so
-    // a short run gets a generous ring), so a refusal needs a run longer than
-    // the floor, not longer than the 3 asked for.
+    // `Ring::new` floors the history at `RING_HISTORY_SLOTS`; the history is a
+    // wrapping ring whose live window is the commit period, so a run longer
+    // than the whole ring reuses it rather than being refused — every id
+    // still comes back, in order, and the count reconciles.
     let floor = lloom::generation::readback::RING_HISTORY_SLOTS;
+    let (want, _) = chain(0, floor + 2);
     let mut rb = Ring::new(&[EOS], &device, 3, EosRead::Blocking)?;
-    let err = session
-        .decode(
-            &mut IdentityProposer,
-            &mut rb,
-            &mut greedy(),
-            &[0],
-            &DecodeOptions::new(floor + 2),
-            &mut sink,
-        )
-        .unwrap_err();
-    assert!(err.to_string().contains("capacity"), "{err}");
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut greedy(),
+        &[0],
+        &DecodeOptions::new(floor + 2),
+        &mut sink,
+    )?;
+    assert_eq!(out.ids.len(), floor + 2);
+    assert_eq!(out.ids, want);
+    assert_eq!(out.stats.readback.ring_publishes, (floor + 2) as u64);
     Ok(())
 }
 
@@ -728,7 +755,16 @@ fn the_ring_feeds_the_same_slot_every_step() -> Result<()> {
     let b = rb.sample_and_feed(&mut greedy(), &logits)?;
     assert!(!rb.eos_of_last()?);
     assert_eq!(a.to_vec2::<u32>()?, vec![vec![3]]);
-    assert_eq!(a.id(), b.id(), "two feeds returned two allocations");
+    // The feed is a `[1, width]` view of the ring's input tile, so two feeds
+    // are two views; the invariant is that they are views of ONE allocation.
+    {
+        let (sa, _) = a.storage_and_layout();
+        let (sb, _) = b.storage_and_layout();
+        assert!(
+            std::ptr::eq(&*sa, &*sb),
+            "two feeds returned two allocations"
+        );
+    }
     assert_eq!(rb.take_ids()?, vec![3, 3]);
     assert_eq!(rb.take_ids()?, Vec::<u32>::new());
     Ok(())
@@ -746,7 +782,6 @@ fn the_ring_feeds_the_same_slot_every_step() -> Result<()> {
 /// observes stays within the depth plus the commit the loop itself makes.
 #[test]
 fn the_pacer_bounds_the_drain_arm_and_is_a_null_on_the_poll_arm() -> Result<()> {
-    use lloom::nn::decode::IN_FLIGHT_STEPS;
     for device in devices() {
         let opts = DecodeOptions {
             lookahead: 1,
@@ -756,8 +791,10 @@ fn the_pacer_bounds_the_drain_arm_and_is_a_null_on_the_poll_arm() -> Result<()> 
         let (out, _) = run(&device, &Arm::RingHostDrain, &[0], &opts)?;
         // Markers are command buffers, so only a device with a queue takes
         // them; the CPU reports none rather than a count it did not observe.
+        // One per forward: the prompt's one unit (`prefill_ubatch = 0`) and a
+        // step's, since the prefill rides the same pacer as the decode.
         let want_markers = if matches!(device, Device::Metal(_)) {
-            out.stats.steps
+            out.stats.steps + 1
         } else {
             0
         };

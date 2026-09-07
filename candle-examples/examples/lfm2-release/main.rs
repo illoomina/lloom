@@ -62,6 +62,7 @@ use anyhow::{Context, Result};
 use candle::{DType, Device};
 use clap::Parser;
 use lloom::generation::poll::PollMechanism;
+use lloom::generation::WAKE_LIVE_EVERY_DEFAULT;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackArms, ReadbackCounters,
     ReadbackStrategy, Ring, Sampling,
@@ -879,11 +880,14 @@ fn main() -> Result<()> {
     // for a multi-turn run without one. The crown's `Cat` × `Shuffle` cannot
     // rewind at all, so it is refused with `--turns` above 1 rather than
     // moving the digest.
-    // The drain arm learns EOS at a commit, from the published slots: a
-    // period's forwards may be enqueued past the EOS before the commit, and
-    // the pacer's depth may still be unpublished at it.
+    // The drain arm learns EOS at a commit, from the published slots. The
+    // completion marker goes live every `WAKE_LIVE_EVERY_DEFAULT` commits and a
+    // drain reads the marker the GPU has executed — at worst the previous live
+    // one — so up to two live windows of forwards may be enqueued past the EOS
+    // before a drain shows it, and the pacer's depth may still be unpublished
+    // at it.
     let overrun_bound = if args.host_drain {
-        budget.period() + IN_FLIGHT_STEPS
+        2 * budget.period() * WAKE_LIVE_EVERY_DEFAULT + IN_FLIGHT_STEPS
     } else if args.lookahead > 0 {
         1
     } else {
@@ -912,6 +916,7 @@ fn main() -> Result<()> {
         budget,
         lookahead: args.lookahead,
         sample_split: args.sample_split,
+        ..DecodeOptions::new(args.n)
     };
     // The ring's device-side history is sized for the whole run — every turn,
     // plus the overrun an arm may publish past each turn's EOS — and refuses

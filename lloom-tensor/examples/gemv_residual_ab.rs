@@ -351,8 +351,9 @@ fn run_slot(
         let queue = device
             .new_command_queue()
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        let residency = ResidencySet::new(device);
-        let commands = Commands::new(queue, &residency).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        let residency = std::sync::Arc::new(ResidencySet::new(device));
+        let commands =
+            Commands::new(queue, residency.clone()).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let encoder = commands
             .command_encoder()
             .map_err(|e| anyhow::anyhow!("{e:?}"))?;

@@ -371,7 +371,7 @@ fn run_one(
     let live = plan.live_chunks();
     let queue = device.new_command_queue().map_err(anyhow::Error::msg)?;
     let residency = Arc::new(ResidencySet::new(device));
-    let cmds = Commands::new(queue, &residency).map_err(anyhow::Error::msg)?;
+    let cmds = Commands::new(queue, residency.clone()).map_err(anyhow::Error::msg)?;
 
     let partials = new_buffer(device, plan.bump_capacity().max(1))?;
     let out = new_buffer(device, geometry.n_heads * geometry.head_dim * 4)?;

@@ -767,8 +767,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     // encoded BEFORE the commit so its `slice_set` rides the
                     // committing buffer AFTER this step's input slot — the ordering
                     // the drain's clamp rests on (§3.5). A no-op on the arms that
-                    // stamp per step or read back per step.
-                    readback.publish_marker()?;
+                    // stamp per step or read back per step. `force_live` during the
+                    // TTFT ramp so token 0 never waits `live_every` commits.
+                    readback.publish_marker(produced <= opts.budget.period())?;
                     self.commit(&device, &mut stats)?;
                     since_commit = 0;
                     committed_this_step = true;
@@ -881,7 +882,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     // The completion marker for the window closing here, encoded
                     // before the commit so it rides the committing buffer after the
                     // window's slots (§3.5). No-op on the per-step arms.
-                    readback.publish_marker()?;
+                    // `force_live` during the TTFT ramp so early tokens stream at
+                    // once regardless of the wake cadence.
+                    readback.publish_marker(in_ttft_ramp)?;
                     self.commit(&device, &mut stats)?;
                     since_commit = 0;
                     committed_now = true;

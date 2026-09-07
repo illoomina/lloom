@@ -124,13 +124,18 @@ pub trait ReadbackStrategy {
     /// Publish the completion marker for the steps fed since the last call — the
     /// per-commit-window write the drain clamps to and the host WFE-waits on.
     ///
-    /// The loop calls this at each commit, so the marker is written at the commit
-    /// cadence (`live_every` steps) rather than per token. **The default is a
-    /// no-op**: the blocking arm has its own per-step readback, and the per-step
-    /// device-EOS arm already stamped inside [`Self::sample_and_feed`] (its marker
-    /// and its EOS flag coincide, `live_every == 1`). Only the arm that defers its
-    /// stamp to the commit window overrides this.
-    fn publish_marker(&mut self) -> Result<()> {
+    /// The loop calls this at each commit; the strategy decides whether THIS
+    /// commit is a LIVE marker write (advancing the device word the host waits on)
+    /// or a skipped one (the wake-cadence throttle). `force_live` is the loop's
+    /// signal that the marker must be written regardless of cadence — the TTFT
+    /// ramp passes it so token 0 never waits `live_every` commits.
+    ///
+    /// **The default is a no-op**: the blocking arm has its own per-step readback,
+    /// and the per-step device-EOS arm already stamped inside
+    /// [`Self::sample_and_feed`] (its marker and EOS flag coincide). Only the arm
+    /// that defers its stamp to the commit window overrides this.
+    fn publish_marker(&mut self, force_live: bool) -> Result<()> {
+        let _ = force_live;
         Ok(())
     }
 
@@ -922,6 +927,20 @@ pub struct Ring {
     eos: EosRead,
     /// Poll iterations before the non-blocking read gives up on a step.
     poll_budget: u64,
+    /// Commits between LIVE marker writes — the wake-cadence knob. `1` writes the
+    /// device marker every commit (the incumbent per-commit stamp); `N` writes it
+    /// every Nth commit so the host WFE-waiter wakes N-commits' worth of tokens at
+    /// a time and the core has a longer quiet window to go dormant between wakes
+    /// (`DESIGN.md` poll.rs: WFE is a bounded spin, not a cheap park — a longer
+    /// wait is what lets the core actually power down). The TTFT ramp overrides it
+    /// (`force_live`), so token 0 never waits N commits. Skipping a marker write
+    /// only makes the drain's clamp more conservative — it can never read an
+    /// unwritten slot (§3.5). Default [`WAKE_LIVE_EVERY_DEFAULT`]; single-thread
+    /// (the decode loop owns it), so a plain counter, not an atomic.
+    live_every: usize,
+    /// Commits since the last LIVE marker write; when it reaches `live_every` the
+    /// next commit is live and this resets.
+    commits_since_live: std::cell::Cell<usize>,
     /// The device-side id history (the wrapping ring behind the swap seam).
     history: History,
     /// The ordinal stamped on the last publish; 0 before any.
@@ -942,6 +961,17 @@ pub struct Ring {
 /// would hang silently. Generous against a ~19 ms step: it converts a hang
 /// into a counted fallback and times nothing.
 pub const POLL_BUDGET: u64 = 50_000_000;
+
+/// Commits between LIVE marker writes (the wake-cadence default, [`Ring::live_every`]).
+///
+/// `4` is a starting point, not a tuned optimum: it wakes the host WFE-waiter
+/// every ~4 commits' worth of tokens instead of every commit, trading a bounded
+/// overrun-in-visibility (the drain lags ≤ the un-written windows, caught up on
+/// the next live commit or the final `drain_all`) for a longer quiet window in
+/// which the core can go dormant (poll.rs: WFE is a bounded spin, so a longer
+/// wait is the only thing that lets it power down). `1` restores the per-commit
+/// stamp. Adaptive tuning later, as with the pacer's warmup-derived depth.
+pub const WAKE_LIVE_EVERY_DEFAULT: usize = 4;
 
 /// The id history slot count, chosen to stay CPU-mapped under **Private**
 /// storage so the streaming drain reads it through a mapped pointer with no copy
@@ -1083,6 +1113,8 @@ impl Ring {
             generation: 0,
             eos_ids_host,
             poll_budget: POLL_BUDGET,
+            live_every: WAKE_LIVE_EVERY_DEFAULT,
+            commits_since_live: std::cell::Cell::new(0),
             counters: ReadbackCounters::default(),
         })
     }
@@ -1092,6 +1124,15 @@ impl Ring {
     /// small to reach the command-buffer cut wants a short one.
     pub fn with_poll_budget(mut self, iterations: u64) -> Self {
         self.poll_budget = iterations.max(1);
+        self
+    }
+
+    /// Set the wake cadence: write the LIVE device marker every `commits` commits
+    /// ([`Ring::live_every`]). `1` is the per-commit stamp; `N` wakes the host
+    /// every N-commits' worth of tokens so the core can go dormant between waits.
+    /// Floored at 1. The TTFT ramp still forces the early commits live.
+    pub fn with_wake_cadence(mut self, commits: usize) -> Self {
+        self.live_every = commits.max(1);
         self
     }
 
@@ -1220,15 +1261,29 @@ impl ReadbackStrategy for Ring {
         self.ring.input_for(1)
     }
 
-    fn publish_marker(&mut self) -> Result<()> {
+    fn publish_marker(&mut self, force_live: bool) -> Result<()> {
         // Only the host-on-drain arm defers its stamp to the commit window; the
         // poll arm stamped per step inside `sample_and_feed` (marker ≡ EOS flag),
-        // and the blocking arm has its own readback. `self.generation` is `fed`
-        // through the last fed step, so the marker publishes exactly the window
-        // the drain is about to read. Skip when nothing has been fed since the
-        // last marker (generation 0 is the unpublished sentinel).
-        if matches!(self.eos, EosRead::HostOnDrain) && self.generation > 0 {
+        // and the blocking arm has its own readback.
+        if !matches!(self.eos, EosRead::HostOnDrain) || self.generation == 0 {
+            return Ok(());
+        }
+        // The wake-cadence throttle. A commit is LIVE — writes the device word the
+        // host WFE-waits on — when the ramp forces it, or when `live_every`
+        // commits have passed since the last live one. A non-live commit writes
+        // NOTHING: the device word stays at the last live value, so the drain
+        // clamps more conservatively and simply catches up on the next live commit
+        // (or the final `drain_all`, which force-synchronises). Skipping the write
+        // can never read an unwritten slot (§3.5) — it only defers visibility.
+        let since = self.commits_since_live.get() + 1;
+        let live = force_live || since >= self.live_every;
+        if live {
+            // `self.generation` is `fed` through the last fed step, so the marker
+            // publishes exactly the window the drain is about to read.
             self.ring.publish_marker(self.generation)?;
+            self.commits_since_live.set(0);
+        } else {
+            self.commits_since_live.set(since);
         }
         Ok(())
     }

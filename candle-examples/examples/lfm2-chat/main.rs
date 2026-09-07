@@ -95,6 +95,17 @@ struct Args {
     #[arg(long, default_value = "steps:8")]
     commit_budget: String,
 
+    /// How many commits between LIVE completion-marker writes on the
+    /// `ring-hostdrain` arm — the wake cadence. `1` writes the marker every commit
+    /// (the incumbent per-commit stamp); `N` wakes the host WFE-waiter every N
+    /// commits' worth of tokens, so the core gets a longer quiet window to go
+    /// dormant between waits (poll.rs: WFE is a bounded spin, not a cheap park, so
+    /// a longer wait is what lets it power down). The TTFT ramp still forces the
+    /// early commits live, so this cannot delay token 0. Only bites on
+    /// `ring-hostdrain` (the other arms stamp per step). **Defaults to 4.**
+    #[arg(long, default_value_t = lloom::generation::WAKE_LIVE_EVERY_DEFAULT)]
+    wake_cadence: usize,
+
     /// Drive decode with the **DSpark** speculative drafter instead of the K=1
     /// identity proposer. The drafter proposes a block of up to `--draft` tokens
     /// per round and the target verifies them in one `forward_all`, accepting the
@@ -1026,6 +1037,7 @@ fn main() -> Result<()> {
             }
             None => decode_with(
                 &args.readback,
+                args.wake_cadence,
                 &mut session,
                 &mut spec,
                 &mut logits_processor,
@@ -1511,6 +1523,7 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
 #[allow(clippy::too_many_arguments)]
 fn decode_with(
     readback: &str,
+    wake_cadence: usize,
     session: &mut Session<'_, Model>,
     spec: &mut IdentityProposer,
     sampler: &mut LogitsProcessor,
@@ -1577,7 +1590,11 @@ fn decode_with(
             // tokens are truncated from the output. Byte-identical to the poll
             // arm — the truncation lands at the same position the poll would
             // break at.
-            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::HostOnDrain)?;
+            // The wake-cadence knob only bites here: this arm defers its marker to
+            // the commit window, so `--wake-cadence N` wakes the host every N
+            // commits instead of every one (the other arms stamp per step).
+            let mut rb = Ring::with_geometry(eos_ids, device, geometry, EosRead::HostOnDrain)?
+                .with_wake_cadence(wake_cadence);
             let out = session.decode(spec, &mut rb, sampler, prompt_ids, opts, on_tokens)?;
             if !rb.poll_is_mapped() {
                 eprintln!(

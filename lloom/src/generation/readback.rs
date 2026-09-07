@@ -398,14 +398,30 @@ struct History {
     /// Tiles fully consumed by the drain (monotonic); the drain advances whole
     /// tiles at a time.
     drained_tiles: usize,
-    /// Real tokens in each tile, indexed by `tile % total_tiles`, recorded at
-    /// close. What lets the strided read skip each tile's waste with no scan.
-    tile_counts: Vec<u16>,
+    /// Real tokens in each tile (the OUT-side count, ≤ `quantum`), indexed by
+    /// `tile % total_tiles`, recorded at close. What lets the strided read skip
+    /// each tile's waste with no scan. `u32` not `u16`: `quantum = batch ×
+    /// (max_draft+1)` can exceed 65535 for a large batch, and a `u16` would
+    /// silently truncate the count — a wrong-output cap, not a loud one. This is
+    /// the N_out cap; N_in (a burst fed into the input slot) is a SEPARATE
+    /// structure and never sizes this ring.
+    tile_counts: Vec<u32>,
     /// Real tokens written into the currently open tile so far, `< quantum`; 0
     /// when no tile is open (between close and the next `begin_step`).
     in_tile: usize,
     /// Whether a tile is currently open (written-to but not yet closed).
     tile_open: bool,
+    /// The segments' CPU-mapped base pointers, resolved ONCE and memoized —
+    /// segments are written in place and never reallocated, so the pointers are
+    /// stable for the ring's life, and the first cut's per-commit
+    /// `peek_scalar_ptr` + `Vec::collect` was pure waste (a per-commit heap
+    /// allocation = the allocator lock on the hot path). `None` until the first
+    /// resolve; `Some(bases)` once every segment mapped; stays `None` if any is
+    /// unmapped (the copy fallback covers that). `*const` is not `Send`/`Sync`,
+    /// but a `Ring` is single-consumer and never shared across threads (§11.5g),
+    /// and `ReadbackStrategy` is used by monomorphized bound, never `dyn`/`Send`.
+    #[cfg(feature = "metal")]
+    seg_bases: Option<Vec<*const u32>>,
 }
 
 impl History {
@@ -437,9 +453,11 @@ impl History {
             drained: 0,
             tiles: 0,
             drained_tiles: 0,
-            tile_counts: vec![0u16; total_tiles],
+            tile_counts: vec![0u32; total_tiles],
             in_tile: 0,
             tile_open: false,
+            #[cfg(feature = "metal")]
+            seg_bases: None,
         })
     }
 
@@ -517,7 +535,7 @@ impl History {
             return Ok(());
         }
         let slot = self.tiles % self.total_tiles;
-        self.tile_counts[slot] = self.in_tile as u16;
+        self.tile_counts[slot] = self.in_tile as u32;
         #[cfg(debug_assertions)]
         if self.in_tile < self.quantum {
             let (seg, base) = self.tile_home(self.tiles);
@@ -548,7 +566,7 @@ impl History {
         let n = self.fed - self.drained;
         if self.tile_open {
             if self.in_tile > 0 {
-                self.tile_counts[self.tiles % self.total_tiles] = self.in_tile as u16;
+                self.tile_counts[self.tiles % self.total_tiles] = self.in_tile as u32;
                 self.tiles += 1;
             }
             self.tile_open = false;
@@ -578,17 +596,17 @@ impl History {
     /// whole tile would exceed `end` (the published clamp lands on a tile
     /// boundary here because a tile == a step and the stamp is per step), so a
     /// partially-visible tile is left for the next drain.
-    fn drain_upto<F: FnMut(usize, usize) -> u32>(
-        &mut self,
-        end: usize,
-        mut read: F,
-    ) -> Result<Vec<u32>> {
+    /// Fills `out` (a reused scratch buffer, cleared first — no per-call alloc)
+    /// with the drained tokens. `read(seg, slot)` resolves ONE physical slot; the
+    /// base is resolved once per tile (outside the inner per-token loop), so the
+    /// per-token cost is a raw read, no bounds-checked index. Lock-free: the
+    /// mapped read path (`peek_scalar_ptr`) does not lock; this adds no lock and
+    /// no allocation.
+    fn drain_into<F: FnMut(usize, usize) -> u32>(&mut self, end: usize, out: &mut Vec<u32>, mut read: F) {
+        out.clear();
         if end <= self.drained {
-            return Ok(Vec::new());
+            return;
         }
-        let mut out = Vec::new();
-        // Advance whole closed tiles while the tile fits within `end` and there
-        // is a closed tile to read.
         while self.drained_tiles < self.tiles {
             let slot = self.drained_tiles % self.total_tiles;
             let count = self.tile_counts[slot] as usize;
@@ -602,7 +620,69 @@ impl History {
             self.drained += count;
             self.drained_tiles += 1;
         }
-        Ok(out)
+    }
+
+    /// The mapped drain — the hot path, **lock-free and (steady-state)
+    /// alloc-free**. Resolves each segment's CPU-mapped base pointer ONCE
+    /// (memoized in `seg_bases`; `peek_scalar_ptr` does not lock and the pointers
+    /// are stable), then reads whole closed tiles through them, base resolved
+    /// once per tile (a raw read per token, no bounds-checked index). `out` is
+    /// caller-owned and pre-sized, so no per-commit allocation. Returns `false`
+    /// if any segment is not CPU-mapped (the caller takes the copy fallback).
+    #[cfg(feature = "metal")]
+    fn drain_mapped(&mut self, end: usize, out: &mut Vec<u32>) -> bool {
+        if self.seg_bases.is_none() {
+            // Resolve once. All segments are the same size in the same pool, so
+            // they map together or not at all; if any is unmapped, leave
+            // `seg_bases` None and signal the copy fallback.
+            let bases: Option<Vec<*const u32>> = self
+                .segments
+                .iter()
+                .map(|s| unsafe { s.peek_scalar_ptr::<u32>(0) })
+                .collect();
+            match bases {
+                Some(b) => self.seg_bases = Some(b),
+                None => return false,
+            }
+        }
+        out.clear();
+        if end <= self.drained {
+            return true;
+        }
+        // Read through the memoized pointers. Kept as an index snapshot so the
+        // borrow of `self.seg_bases` does not fight the `&mut self` walk.
+        while self.drained_tiles < self.tiles {
+            let slot = self.drained_tiles % self.total_tiles;
+            let count = self.tile_counts[slot] as usize;
+            if self.drained + count > end {
+                break;
+            }
+            let (seg, base) = self.tile_home(self.drained_tiles);
+            // SAFETY: `seg_bases[seg]` is the mapped base of a buffer never
+            // reallocated for this ring's life; `base + j < segment_len`; the GPU
+            // may still be writing LATER tiles, so `read_volatile`. The published
+            // clamp (`end`) keeps this off any slot the GPU has not finished.
+            let ptr = self.seg_bases.as_ref().unwrap()[seg];
+            for j in 0..count {
+                out.push(unsafe { ptr.add(base + j).read_volatile() });
+            }
+            self.drained += count;
+            self.drained_tiles += 1;
+        }
+        true
+    }
+
+    /// The copy fallback (unmapped segments): a `to_vec1` per segment
+    /// synchronises and is correct if a copy — the honest degradation, off the
+    /// hot path. Fills `out` (caller-owned, pre-sized).
+    fn drain_copy(&mut self, end: usize, out: &mut Vec<u32>) -> Result<()> {
+        let snapshots = self
+            .segments
+            .iter()
+            .map(|s| s.to_vec1::<u32>())
+            .collect::<Result<Vec<_>>>()?;
+        self.drain_into(end, out, |seg, slot| snapshots[seg][slot]);
+        Ok(())
     }
 }
 
@@ -911,46 +991,26 @@ impl ReadbackStrategy for Ring {
             EosRead::Blocking => fed,
         };
 
-        // Fast path: read straight from each segment's mapped buffer — no copy,
-        // no blit, no GPU drain (`peek_scalar_ptr` reaches nothing that waits on
-        // the GPU). Called once per commit, it must not become a
-        // `waitUntilCompleted` (§15.2 #12). The strided tile walk is in
-        // `drain_upto`; here we just supply the per-segment base pointers.
-        // `read_volatile` because the GPU may still be writing later slots.
-        //
-        // SAFETY: `peek_scalar_ptr(0)` returns a base pointer valid for each
-        // segment's whole buffer; segments are written in place and never
-        // reallocated for this ring's lifetime, so the mappings stay valid; every
-        // (seg, slot) `drain_upto` reads is in bounds. All segments map or none
-        // (same size, same pool), so the all-`Some` check gates the fast path.
+        // One sized allocation for the output (old-path parity — the flat ring
+        // alloc'd a `Vec` per call too); the per-commit `bases` `Vec` the first
+        // cut allocated is GONE (the mapped read memoizes the base pointers). So
+        // the hot drain is lock-free (`peek_scalar_ptr` does not lock, resolved
+        // once) with a single sized alloc, no growth-reallocs.
+        let mut out = Vec::with_capacity(self.history.undrained());
+
+        // Fast path: read straight from the segments' memoized mapped pointers —
+        // no copy, no blit, no `waitUntilCompleted` (§15.2 #12), no lock. Returns
+        // false only if a segment is unmapped, then the copy fallback runs.
         #[cfg(feature = "metal")]
-        if end > self.history.drained {
-            let bases: Option<Vec<*const u32>> = self
-                .history
-                .segments
-                .iter()
-                .map(|s| unsafe { s.peek_scalar_ptr::<u32>(0) })
-                .collect();
-            if let Some(bases) = bases {
-                return self
-                    .history
-                    .drain_upto(end, |seg, slot| unsafe { bases[seg].add(slot).read_volatile() });
-            }
+        if self.history.drain_mapped(end, &mut out) {
+            return Ok(out);
         }
         #[cfg(not(feature = "metal"))]
         let _ = end;
 
-        // Copy fallback: a segment is not CPU-mapped (or the counter was unmapped,
-        // `end` forced to 0). A `to_vec1` of each segment synchronises and is
-        // correct if a copy — the honest degradation. Drains to `fed`.
-        let snapshots = self
-            .history
-            .segments
-            .iter()
-            .map(|s| s.to_vec1::<u32>())
-            .collect::<Result<Vec<_>>>()?;
-        self.history
-            .drain_upto(fed, |seg, slot| snapshots[seg][slot])
+        // Copy fallback (unmapped): drains to `fed`, synchronising.
+        self.history.drain_copy(fed, &mut out)?;
+        Ok(out)
     }
 
     fn drain_all(&mut self) -> Result<Vec<u32>> {
@@ -958,20 +1018,15 @@ impl ReadbackStrategy for Ring {
             return Ok(Vec::new());
         }
         // The final drain: completeness over non-blocking. Close the open tile
-        // first (the last step's tile is not yet counted), then `to_vec1` over each
-        // segment **synchronises** up to the last enqueued slot — what the poll arm
-        // needs here, since its incremental `take_ids` refuses to read past the
+        // first (the last step's tile is not yet counted), then the copy path
+        // **synchronises** up to the last enqueued slot — what the poll arm needs
+        // here, since its incremental `take_ids` refuses to read past the
         // published counter. Drains everything to `fed`.
         self.history.close_open_tile()?;
         let fed = self.history.generation();
-        let snapshots = self
-            .history
-            .segments
-            .iter()
-            .map(|s| s.to_vec1::<u32>())
-            .collect::<Result<Vec<_>>>()?;
-        self.history
-            .drain_upto(fed, |seg, slot| snapshots[seg][slot])
+        let mut out = Vec::with_capacity(self.history.undrained());
+        self.history.drain_copy(fed, &mut out)?;
+        Ok(out)
     }
 
     /// The host EOS check for [`EosRead::HostOnDrain`]: the index of the first
@@ -1169,7 +1224,9 @@ mod tests {
         let fed = h.generation();
         let snapshots: Vec<Vec<u32>> =
             h.segments.iter().map(|s| s.to_vec1::<u32>().unwrap()).collect();
-        h.drain_upto(fed, |seg, slot| snapshots[seg][slot]).unwrap()
+        let mut out = Vec::new();
+        h.drain_into(fed, &mut out, |seg, slot| snapshots[seg][slot]);
+        out
     }
 
     #[test]

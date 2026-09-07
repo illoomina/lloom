@@ -1,0 +1,1087 @@
+//! `lloom-serve` — the engine as a process a client can drive (issue #695).
+//!
+//! One binary, two contracts on one loopback port:
+//!
+//! - the **OpenAI-compatible** surface a generic client speaks —
+//!   `/v1/completions` (with `ignore_eos` and a `usage` block),
+//!   `/v1/chat/completions` (streaming SSE, the checkpoint's own chat
+//!   template, `logprobs`), `/v1/models`, `/tokenize`;
+//! - the **benchmark sidecar** contract LiquidAI's `pipette` runners drive an
+//!   engine through (`Liquid4All/pipette-clients`, the MLX sidecar's shape):
+//!   `/prefill_throughput`, `/decode_throughput`, `/end_to_end_latency`,
+//!   `/max_memory_usage`, `/eval` + `/eval/abort`, `/health`, `/shutdown`,
+//!   and the `{"kind":"ready",…}` marker on stdout once the model is loaded.
+//!
+//! One request at a time: the engine sits behind a mutex and the decode loop
+//! runs on the request's thread. That is the serving shape a benchmark wants —
+//! every cell measures one cold request against an idle engine — and the
+//! throughput the crown path reaches at B=1. Concurrency across requests is
+//! #694's batched forward, not this binary's.
+//!
+//! Every timing this binary reports is the engine's own bracket
+//! (`DecodeStats`, or a `synchronize()`-closed window) and says which; the
+//! runner brackets the HTTP request itself for the latency cells.
+
+mod engine;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use engine::{Engine, LoadOptions, NEVER_EOS};
+use lloom_engine::{DecodeParams, Decoded, ReadbackArm, Stop};
+use serde_json::{json, Value};
+use std::collections::HashSet;
+use std::io::Write;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+
+/// The seed passage the throughput cells tile into their prompt when no
+/// `--prompt-seed-file` and no seed environment variable is given.
+const DEFAULT_SEED_TEXT: &str = "The loom threads warp and weft into cloth the way a decoder \
+threads its weights and its cache into text: one pass over the whole working set per token, \
+the same pattern every time, only the position moving. A benchmark that wants a prompt of an \
+exact length repeats a passage like this one until the count is met, because the count is the \
+work and the words are not. ";
+
+#[derive(Parser)]
+#[command(
+    name = "lloom-serve",
+    about = "Serve an LFM2 checkpoint over an OpenAI-compatible endpoint and the pipette benchmark sidecar contract"
+)]
+struct Args {
+    /// Checkpoint directory (config.json, tokenizer.json, *.safetensors,
+    /// chat_template.jinja). Defaults to LFM2_MODEL_DIR, then the LFM2.5-2.6B
+    /// snapshot in the HF cache.
+    #[arg(long)]
+    model_dir: Option<PathBuf>,
+
+    /// The `--model` spelling the MLX sidecar runner passes; an alias.
+    #[arg(long, hide = true)]
+    model: Option<PathBuf>,
+
+    /// Bind address. Loopback: this is a sidecar, not a public server.
+    #[arg(long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port; 0 picks a free one. The bound port is in the ready marker.
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+
+    /// The `model` id reported by `/v1/models` and accepted by requests.
+    /// Defaults to the checkpoint's Hub id when it is a HF-cache snapshot.
+    #[arg(long)]
+    model_name: Option<String>,
+
+    /// KV positions per request (prompt + generation). A request past it is
+    /// refused rather than reallocated. The standard pipette ladder tops out at
+    /// 8192 + 256.
+    #[arg(long, default_value_t = 8704)]
+    kv_capacity: usize,
+
+    /// Readback arm: `auto` (the device-resident ring with one forward of
+    /// lookahead where the sampler admits it, the blocking arm otherwise),
+    /// `ring`, or `blocking`.
+    #[arg(long, default_value = "auto")]
+    readback: String,
+
+    /// Reuse the cached prefix across requests (`Session::prepare`). Off by
+    /// default: a benchmark measures a cold prefill per request.
+    #[arg(long)]
+    reuse_prefix: bool,
+
+    /// Skip the pipeline warmup at load (the first prompt then compiles the
+    /// prefill pipelines inside its own TTFT).
+    #[arg(long)]
+    no_warmup: bool,
+
+    /// Force the CPU device.
+    #[arg(long)]
+    cpu: bool,
+
+    /// A file whose text is tiled into the throughput cells' prompts. Falls
+    /// back to `PIPETTE_PROMPT_SEED_TEXT` / `PIPETTE_MLX_PROMPT_SEED_TEXT`, then
+    /// a built-in passage.
+    #[arg(long)]
+    prompt_seed_file: Option<PathBuf>,
+
+    /// Default `max_tokens` for a request that names none.
+    #[arg(long, default_value_t = 512)]
+    max_tokens_default: usize,
+}
+
+/// State shared by every request thread.
+struct Shared {
+    engine: Mutex<Engine>,
+    /// Sample ids an `/eval/abort` asked the running `/eval` to stop early.
+    aborts: Mutex<HashSet<String>>,
+    server: Server,
+    model_name: String,
+    max_tokens_default: usize,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let model_dir = args
+        .model_dir
+        .clone()
+        .or(args.model.clone())
+        .or_else(engine::default_model_dir)
+        .context("no --model-dir given and the LFM2.5-2.6B snapshot was not in the HF cache")?;
+    let readback = match args.readback.as_str() {
+        "auto" => ReadbackArm::Auto,
+        "ring" | "ring-nonblocking" => ReadbackArm::CROWN,
+        "blocking" => ReadbackArm::Blocking,
+        other => anyhow::bail!("--readback must be auto, ring or blocking, got {other:?}"),
+    };
+    let seed_text = match &args.prompt_seed_file {
+        Some(p) => std::fs::read_to_string(p)
+            .with_context(|| format!("reading the prompt seed {}", p.display()))?,
+        None => std::env::var("PIPETTE_PROMPT_SEED_TEXT")
+            .or_else(|_| std::env::var("PIPETTE_MLX_PROMPT_SEED_TEXT"))
+            .unwrap_or_else(|_| DEFAULT_SEED_TEXT.to_string()),
+    };
+
+    let load_start = Instant::now();
+    let engine = Engine::load(LoadOptions {
+        model_dir: model_dir.clone(),
+        cpu: args.cpu,
+        kv_capacity: args.kv_capacity,
+        readback,
+        reuse_prefix: args.reuse_prefix,
+        warmup: !args.no_warmup,
+        seed_text,
+        model_name: args.model_name.clone(),
+    })?;
+    let model_name = engine.model_name.clone();
+    eprintln!(
+        "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={}]",
+        model_name,
+        model_dir.display(),
+        load_start.elapsed().as_secs_f64(),
+        engine.core.device,
+        args.kv_capacity,
+        readback.name(),
+        args.reuse_prefix,
+    );
+
+    let server = Server::http((args.host.as_str(), args.port))
+        .map_err(|e| anyhow::anyhow!("binding {}:{}: {e}", args.host, args.port))?;
+    let port = match server.server_addr() {
+        tiny_http::ListenAddr::IP(addr) => addr.port(),
+        #[allow(unreachable_patterns)]
+        _ => args.port,
+    };
+    let shared = Arc::new(Shared {
+        engine: Mutex::new(engine),
+        aborts: Mutex::new(HashSet::new()),
+        server,
+        model_name,
+        max_tokens_default: args.max_tokens_default,
+    });
+
+    // The ready marker the sidecar runner waits for, on stdout and nothing
+    // else on stdout before it. Everything the operator reads goes to stderr.
+    println!(
+        "{}",
+        json!({"kind": "ready", "host": args.host, "port": port})
+    );
+    std::io::stdout().flush().ok();
+    eprintln!("[serving on http://{}:{port}]", args.host);
+
+    loop {
+        let request = match shared.server.recv() {
+            Ok(r) => r,
+            Err(_) => break,
+        };
+        let path = request.url().split('?').next().unwrap_or("").to_string();
+        let method = request.method().clone();
+        match (method, path.as_str()) {
+            (Method::Get, "/health") => {
+                let _ = respond_json(request, 200, &json!({}));
+            }
+            (Method::Get, "/v1/models") => {
+                let _ = respond_json(request, 200, &models_body(&shared.model_name));
+            }
+            (Method::Post, "/eval/abort") => {
+                let _ = handle_abort(&shared, request);
+            }
+            (Method::Post, "/shutdown") => {
+                let _ = respond_json(request, 200, &json!({}));
+                eprintln!("[shutdown requested]");
+                break;
+            }
+            (Method::Post, _) => {
+                let shared = Arc::clone(&shared);
+                std::thread::spawn(move || {
+                    let path = path;
+                    let started = Instant::now();
+                    match handle_model_request(&shared, &path, request) {
+                        Ok(()) => {}
+                        Err(e) => eprintln!(
+                            "[{path} failed after {:.1} ms: {e:#}]",
+                            engine::ms(started.elapsed())
+                        ),
+                    }
+                });
+            }
+            _ => {
+                let _ = respond_error(request, 404, &format!("unknown endpoint: {path}"));
+            }
+        }
+    }
+    // A request thread still decoding holds the engine; wait for it so the
+    // model is not dropped under a running command buffer.
+    let _engine = shared.engine.lock();
+    Ok(())
+}
+
+// ---- routing ---------------------------------------------------------------
+
+fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Result<()> {
+    let mut body = String::new();
+    request
+        .as_reader()
+        .read_to_string(&mut body)
+        .context("reading the request body")?;
+    let value: Value = if body.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                respond_error(request, 400, &format!("request body is not JSON: {e}"))?;
+                return Ok(());
+            }
+        }
+    };
+    let result = match path {
+        "/tokenize" => tokenize(shared, &value).map(Reply::Json),
+        "/v1/completions" => completions(shared, &value, request.headers()),
+        "/v1/chat/completions" => chat_completions(shared, &value),
+        "/prefill_throughput" => prefill_throughput(shared, &value).map(Reply::Json),
+        "/decode_throughput" => decode_throughput(shared, &value).map(Reply::Json),
+        "/max_memory_usage" => max_memory_usage(shared, &value).map(Reply::Json),
+        "/end_to_end_latency" => end_to_end_latency(shared, &value).map(Reply::Json),
+        "/eval" => Ok(Reply::Eval(value)),
+        _ => Err(Failure::NotFound(format!("unknown endpoint: {path}"))),
+    };
+    match result {
+        Ok(Reply::Json(v)) => respond_json(request, 200, &v),
+        Ok(Reply::Stream(stream)) => stream_response(shared, request, stream),
+        Ok(Reply::Eval(v)) => eval(shared, request, &v),
+        Err(Failure::BadRequest(m)) => respond_error(request, 400, &m),
+        Err(Failure::NotFound(m)) => respond_error(request, 404, &m),
+        Err(Failure::Internal(e)) => respond_error(request, 500, &format!("{e:#}")),
+    }
+}
+
+enum Reply {
+    Json(Value),
+    Stream(StreamingRun),
+    Eval(Value),
+}
+
+/// A request whose body is produced while the decode runs.
+struct StreamingRun {
+    kind: StreamKind,
+    prompt_ids: Vec<u32>,
+    params: DecodeParams,
+    id: String,
+    model: String,
+}
+
+#[derive(Clone, Copy)]
+enum StreamKind {
+    Completion,
+    Chat,
+}
+
+enum Failure {
+    BadRequest(String),
+    NotFound(String),
+    Internal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for Failure {
+    fn from(e: anyhow::Error) -> Self {
+        Failure::Internal(e)
+    }
+}
+
+fn bad(msg: impl Into<String>) -> Failure {
+    Failure::BadRequest(msg.into())
+}
+
+type Handled<T> = std::result::Result<T, Failure>;
+
+// ---- /tokenize ---------------------------------------------------------------
+
+/// Both spellings: the MLX sidecar's `{prompt}` (always with special tokens)
+/// and vLLM's `{model, prompt, add_special_tokens}`; llama-server's
+/// `{content, add_special}` too. All report `tokens` and `count`.
+fn tokenize(shared: &Shared, v: &Value) -> Handled<Value> {
+    let text = v
+        .get("prompt")
+        .or_else(|| v.get("content"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("field 'prompt' must be a string"))?;
+    let add_special = v
+        .get("add_special_tokens")
+        .or_else(|| v.get("add_special"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let engine = lock(&shared.engine);
+    let ids = engine.encode(text, add_special)?;
+    Ok(json!({ "tokens": ids, "count": ids.len() }))
+}
+
+// ---- /v1/completions ---------------------------------------------------------
+
+fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply> {
+    let model = shared.model_name.clone();
+    let params = sampling_params(shared, v)?;
+    let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if v.get("n").and_then(Value::as_u64).unwrap_or(1) != 1 {
+        return Err(bad("n > 1 is not supported"));
+    }
+    if v.get("logprobs").map(|l| !l.is_null()).unwrap_or(false) {
+        return Err(bad("logprobs is not supported on /v1/completions"));
+    }
+    let prompt_ids = {
+        let engine = lock(&shared.engine);
+        match v.get("prompt") {
+            Some(Value::String(s)) => engine.encode(s, true)?,
+            Some(Value::Array(items)) if items.iter().all(Value::is_u64) => items
+                .iter()
+                .filter_map(Value::as_u64)
+                .map(|t| t as u32)
+                .collect(),
+            Some(Value::Array(items)) if items.len() == 1 && items[0].is_string() => {
+                engine.encode(items[0].as_str().unwrap_or(""), true)?
+            }
+            _ => {
+                return Err(bad(
+                    "field 'prompt' must be a string or an array of token ids",
+                ))
+            }
+        }
+    };
+    if prompt_ids.is_empty() {
+        return Err(bad("empty prompt"));
+    }
+    let id = format!("cmpl-{}", short_id());
+    if stream {
+        return Ok(Reply::Stream(StreamingRun {
+            kind: StreamKind::Completion,
+            prompt_ids,
+            params,
+            id,
+            model,
+        }));
+    }
+    let started = Instant::now();
+    let decoded = lock(&shared.engine).complete(&prompt_ids, &params, |_| {})?;
+    let elapsed = started.elapsed();
+    report(
+        "/v1/completions",
+        prompt_ids.len(),
+        &decoded,
+        engine::ms(elapsed),
+    );
+    Ok(Reply::Json(json!({
+        "id": id,
+        "object": "text_completion",
+        "created": now(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "text": decoded.text,
+            "logprobs": null,
+            "finish_reason": finish_reason(decoded.stop),
+        }],
+        "usage": usage(prompt_ids.len(), decoded.tokens.len()),
+        "timings": timings(prompt_ids.len(), &decoded, elapsed),
+    })))
+}
+
+// ---- /v1/chat/completions ----------------------------------------------------
+
+fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
+    let model = shared.model_name.clone();
+    let messages = v
+        .get("messages")
+        .filter(|m| m.is_array())
+        .ok_or_else(|| bad("field 'messages' must be an array"))?;
+    if messages.as_array().map(Vec::is_empty).unwrap_or(true) {
+        return Err(bad("messages must not be empty"));
+    }
+    if v.get("guided_choice").is_some() || v.get("guided_json").is_some() {
+        // Constrained decoding is not built; a 4xx is what a client that can
+        // fall back to `logprobs` looks for.
+        return Err(bad("guided decoding is not supported"));
+    }
+    let params = sampling_params(shared, v)?;
+    let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let want_logprobs = v.get("logprobs").and_then(Value::as_bool).unwrap_or(false);
+    let kwargs = v.get("chat_template_kwargs");
+
+    let prompt_ids = {
+        let engine = lock(&shared.engine);
+        let rendered = engine.render_chat(messages, kwargs)?;
+        let ids = engine.encode(&rendered, true)?;
+        if let Some(bos) = engine.text.bos_id {
+            if ids.iter().filter(|&&t| t == bos).count() > 1 {
+                eprintln!("[chat: the rendered template carries BOS twice; check bos_token]");
+            }
+        }
+        ids
+    };
+    let id = format!("chatcmpl-{}", short_id());
+
+    if want_logprobs {
+        if stream {
+            return Err(bad("logprobs with stream is not supported"));
+        }
+        let top_k = v
+            .get("top_logprobs")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 64) as usize;
+        if params.max_tokens != 1 {
+            return Err(bad("logprobs is supported for max_tokens = 1 only"));
+        }
+        // One forward: the argmax is the token, and its distribution is the
+        // logprobs block. Temperature does not apply on this path.
+        let mut engine = lock(&shared.engine);
+        let started = Instant::now();
+        let (argmax, top) = engine.next_token_logprobs(&prompt_ids, top_k)?;
+        let content = engine.token_str(argmax);
+        let token_lp = top
+            .iter()
+            .find(|(t, _)| *t == argmax)
+            .map(|(_, lp)| *lp)
+            .unwrap_or(f32::NEG_INFINITY);
+        let top_entries: Vec<Value> = top
+            .iter()
+            .map(|(t, lp)| json!({ "token": engine.token_str(*t), "logprob": lp }))
+            .collect();
+        eprintln!(
+            "[/v1/chat/completions logprobs: prompt_tokens={} top_logprobs={top_k} {:.1} ms]",
+            prompt_ids.len(),
+            engine::ms(started.elapsed())
+        );
+        return Ok(Reply::Json(json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": now(),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "logprobs": { "content": [{
+                    "token": content,
+                    "logprob": token_lp,
+                    "top_logprobs": top_entries,
+                }] },
+                "finish_reason": "length",
+            }],
+            "usage": usage(prompt_ids.len(), 1),
+        })));
+    }
+
+    if stream {
+        return Ok(Reply::Stream(StreamingRun {
+            kind: StreamKind::Chat,
+            prompt_ids,
+            params,
+            id,
+            model,
+        }));
+    }
+    let started = Instant::now();
+    let decoded = lock(&shared.engine).complete(&prompt_ids, &params, |_| {})?;
+    let elapsed = started.elapsed();
+    report(
+        "/v1/chat/completions",
+        prompt_ids.len(),
+        &decoded,
+        engine::ms(elapsed),
+    );
+    Ok(Reply::Json(json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": now(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": decoded.text },
+            "logprobs": null,
+            "finish_reason": finish_reason(decoded.stop),
+        }],
+        "usage": usage(prompt_ids.len(), decoded.tokens.len()),
+        "timings": timings(prompt_ids.len(), &decoded, elapsed),
+    })))
+}
+
+/// The sampling knobs both OpenAI endpoints share.
+fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
+    let max_tokens = v
+        .get("max_completion_tokens")
+        .or_else(|| v.get("max_tokens"))
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(shared.max_tokens_default);
+    if max_tokens == 0 {
+        return Err(bad("max_tokens must be positive"));
+    }
+    let temperature = match v.get("temperature") {
+        None | Some(Value::Null) => None,
+        Some(t) => Some(
+            t.as_f64()
+                .ok_or_else(|| bad("field 'temperature' must be a number"))?,
+        ),
+    };
+    let top_p = match v.get("top_p") {
+        None | Some(Value::Null) => None,
+        Some(p) => {
+            let p = p
+                .as_f64()
+                .ok_or_else(|| bad("field 'top_p' must be a number"))?;
+            // `1.0` is the OpenAI default and means no nucleus.
+            (p > 0.0 && p < 1.0).then_some(p)
+        }
+    };
+    // A sampled request with no seed draws a fresh one, so repeats are
+    // independent; a seeded one reproduces.
+    let seed = v
+        .get("seed")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(rand::random::<u64>);
+    let ignore_eos = v
+        .get("ignore_eos")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let stop_strings: Vec<String> = match v.get("stop") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        Some(_) => return Err(bad("field 'stop' must be a string or an array of strings")),
+    };
+    let (eos_ids, readback) = {
+        let engine = lock(&shared.engine);
+        let eos = if ignore_eos {
+            NEVER_EOS.to_vec()
+        } else {
+            engine.text.eos_ids.clone()
+        };
+        (eos, engine.readback)
+    };
+    Ok(DecodeParams {
+        seed,
+        temperature,
+        top_p,
+        max_tokens,
+        eos_ids,
+        stop_strings,
+        readback,
+    })
+}
+
+// ---- streaming (SSE) ---------------------------------------------------------
+
+/// Run the decode on this thread and write the OpenAI SSE stream as fragments
+/// arrive: chunked transfer through the request's raw writer, so a token is on
+/// the wire when the loop's commit drains it.
+fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Result<()> {
+    let endpoint = match run.kind {
+        StreamKind::Completion => "/v1/completions",
+        StreamKind::Chat => "/v1/chat/completions",
+    };
+    let mut w = ChunkedWriter::start(request, "text/event-stream")?;
+    let created = now();
+    if let StreamKind::Chat = run.kind {
+        w.event(&json!({
+            "id": run.id, "object": "chat.completion.chunk", "created": created,
+            "model": run.model,
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+        }))?;
+    }
+    let started = Instant::now();
+    let outcome = {
+        let mut engine = lock(&shared.engine);
+        let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
+        let mut write_err: Option<std::io::Error> = None;
+        let decoded = engine.complete(&run.prompt_ids, &run.params, |frag| {
+            if write_err.is_some() {
+                return;
+            }
+            let chunk = match kind {
+                StreamKind::Completion => json!({
+                    "id": id, "object": "text_completion", "created": created, "model": model,
+                    "choices": [{ "index": 0, "text": frag, "logprobs": null, "finish_reason": null }],
+                }),
+                StreamKind::Chat => json!({
+                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{ "index": 0, "delta": { "content": frag }, "finish_reason": null }],
+                }),
+            };
+            if let Err(e) = w.event(&chunk) {
+                write_err = Some(e);
+            }
+        });
+        (decoded, write_err)
+    };
+    let (decoded, write_err) = outcome;
+    let decoded = decoded?;
+    if let Some(e) = write_err {
+        anyhow::bail!("client went away mid-stream: {e}");
+    }
+    let elapsed = started.elapsed();
+    report(
+        endpoint,
+        run.prompt_ids.len(),
+        &decoded,
+        engine::ms(elapsed),
+    );
+    let usage = usage(run.prompt_ids.len(), decoded.tokens.len());
+    let last = match run.kind {
+        StreamKind::Completion => json!({
+            "id": run.id, "object": "text_completion", "created": created, "model": run.model,
+            "choices": [{ "index": 0, "text": "", "logprobs": null,
+                          "finish_reason": finish_reason(decoded.stop) }],
+            "usage": usage,
+            "timings": timings(run.prompt_ids.len(), &decoded, elapsed),
+        }),
+        StreamKind::Chat => json!({
+            "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason(decoded.stop) }],
+            "usage": usage,
+            "timings": timings(run.prompt_ids.len(), &decoded, elapsed),
+        }),
+    };
+    w.event(&last)?;
+    w.raw("data: [DONE]\n\n")?;
+    w.finish()
+}
+
+// ---- the pipette sidecar contract -------------------------------------------
+
+fn field_usize(v: &Value, name: &str) -> Handled<usize> {
+    match v.get(name) {
+        Some(n) => n
+            .as_u64()
+            .filter(|&n| n > 0)
+            .map(|n| n as usize)
+            .ok_or_else(|| bad(format!("field '{name}' must be a positive integer"))),
+        None => Err(bad(format!("field '{name}' must be a positive integer"))),
+    }
+}
+
+fn prefill_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
+    let prompt_tokens = field_usize(v, "prompt_tokens")?;
+    let t = lock(&shared.engine).prefill_throughput(prompt_tokens)?;
+    let prompt_tps = t.prompt_tokens as f64 / (t.prefill_ms / 1e3);
+    eprintln!(
+        "[/prefill_throughput: prompt_tokens={} prefill {:.2} ms = {prompt_tps:.1} tok/s]",
+        t.prompt_tokens, t.prefill_ms
+    );
+    Ok(json!({
+        "prompt_tps": prompt_tps,
+        "prompt_tokens": t.prompt_tokens,
+        "prefill_ms": t.prefill_ms,
+    }))
+}
+
+fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
+    let prompt_tokens = field_usize(v, "prompt_tokens")?;
+    let decode_tokens = field_usize(v, "decode_tokens")?;
+    let t = lock(&shared.engine).decode_throughput(prompt_tokens, decode_tokens)?;
+    let generation_tps = t.decode_tokens as f64 / (t.decode_ms / 1e3);
+    eprintln!(
+        "[/decode_throughput: prompt_tokens={} decode_tokens={} context {:.2} ms, decode {:.2} ms \
+         = {generation_tps:.1} tok/s, readback={}]",
+        t.prompt_tokens,
+        t.decode_tokens,
+        t.prefill_ms,
+        t.decode_ms,
+        t.readback.name()
+    );
+    Ok(json!({
+        "generation_tps": generation_tps,
+        "decode_tokens": t.decode_tokens,
+        "prompt_tokens": t.prompt_tokens,
+        "decode_ms": t.decode_ms,
+        "context_ms": t.prefill_ms,
+        "readback": t.readback.name(),
+    }))
+}
+
+fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
+    let prompt_tokens = field_usize(v, "prompt_tokens")?;
+    let decode_tokens = field_usize(v, "decode_tokens")?;
+    let mut engine = lock(&shared.engine);
+    let prompt = engine.seed_prompt(prompt_tokens);
+    let params = DecodeParams {
+        max_tokens: decode_tokens,
+        eos_ids: NEVER_EOS.to_vec(),
+        readback: engine.readback,
+        ..DecodeParams::default()
+    };
+    let decoded = engine.complete(&prompt, &params, |_| {})?;
+    eprintln!(
+        "[/max_memory_usage: prompt_tokens={} completion_tokens={}]",
+        prompt.len(),
+        decoded.tokens.len()
+    );
+    Ok(json!({
+        "prompt_tokens": prompt.len(),
+        "completion_tokens": decoded.tokens.len(),
+    }))
+}
+
+/// Tokenize inside the bracket, as a client-visible request would: the
+/// runner times the HTTP request; `total_ms` is the same window one layer in.
+fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
+    let prompt = v
+        .get("prompt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("field 'prompt' must be a string"))?;
+    let decode_tokens = field_usize(v, "decode_tokens")?;
+    let mut engine = lock(&shared.engine);
+    let started = Instant::now();
+    let ids = engine.encode(prompt, true)?;
+    let params = DecodeParams {
+        max_tokens: decode_tokens,
+        eos_ids: NEVER_EOS.to_vec(),
+        readback: engine.readback,
+        ..DecodeParams::default()
+    };
+    let decoded = engine.complete(&ids, &params, |_| {})?;
+    let total_ms = engine::ms(started.elapsed());
+    report("/end_to_end_latency", ids.len(), &decoded, total_ms);
+    Ok(json!({
+        "total_ms": total_ms,
+        "prompt_tokens": ids.len(),
+        "completion_tokens": decoded.tokens.len(),
+    }))
+}
+
+/// The eval stream: one JSONL event per sample start / chunk / done, then
+/// `eval_done`. The chat template is the checkpoint's; a sample an
+/// `/eval/abort` names is stopped at the next drained batch and its partial
+/// completion reported with `stopped_early`.
+fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
+    let samples = match v.get("samples").and_then(Value::as_array) {
+        Some(s) => s.clone(),
+        None => {
+            respond_error(request, 400, "field 'samples' must be a list")?;
+            return Ok(());
+        }
+    };
+    let max_tokens = match field_usize(v, "max_tokens") {
+        Ok(n) => n,
+        Err(_) => {
+            respond_error(
+                request,
+                400,
+                "field 'max_tokens' must be a positive integer",
+            )?;
+            return Ok(());
+        }
+    };
+    let done: HashSet<String> = v
+        .get("completions_done_ids")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let temperature = v.get("temperature").and_then(Value::as_f64).unwrap_or(0.0);
+    if !(0.0..=2.0).contains(&temperature) {
+        respond_error(
+            request,
+            400,
+            "field 'temperature' must be a number in [0.0, 2.0]",
+        )?;
+        return Ok(());
+    }
+    let enable_thinking = v.get("enable_thinking").cloned().unwrap_or(Value::Null);
+    let kwargs = if enable_thinking.is_null() {
+        None
+    } else {
+        Some(json!({ "enable_thinking": enable_thinking }))
+    };
+
+    let mut w = ChunkedWriter::start(request, "application/x-ndjson")?;
+    let mut engine = lock(&shared.engine);
+    let total = samples.len();
+    let run = (|| -> Result<()> {
+        for (i, sample) in samples.iter().enumerate() {
+            let sample_id = sample
+                .get("id")
+                .and_then(Value::as_str)
+                .context("eval sample missing id")?
+                .to_string();
+            if done.contains(&sample_id) {
+                eprintln!(
+                    "[eval {}/{total} id={sample_id} skipped, checkpointed]",
+                    i + 1
+                );
+                continue;
+            }
+            let messages = sample
+                .get("messages")
+                .context("eval sample missing messages")?;
+            let prompt = engine.render_chat(messages, kwargs.as_ref())?;
+            let ids = engine.encode(&prompt, true)?;
+            w.event_line(&json!({
+                "kind": "eval_sample_start", "sample_id": sample_id, "prompt": prompt,
+            }))?;
+            let params = DecodeParams {
+                seed: rand::random::<u64>(),
+                temperature: (temperature > 0.0).then_some(temperature),
+                top_p: None,
+                max_tokens,
+                eos_ids: engine.text.eos_ids.clone(),
+                stop_strings: Vec::new(),
+                readback: engine.readback,
+            };
+            let mut pending = String::new();
+            let mut write_err: Option<std::io::Error> = None;
+            let started = Instant::now();
+            let aborts = &shared.aborts;
+            let decoded = {
+                let sid = sample_id.clone();
+                // An abort ends the run through the decode seam's own hook,
+                // checked at every drained batch.
+                engine.complete_until(&ids, &params, |frag| {
+                    pending.push_str(frag);
+                    if pending.len() >= EVAL_CHUNK_FLUSH_BYTES && write_err.is_none() {
+                        if let Err(e) = w.event_line(&json!({
+                            "kind": "eval_sample_chunk", "sample_id": sid, "delta": pending,
+                        })) {
+                            write_err = Some(e);
+                        }
+                        pending.clear();
+                    }
+                    !lock(aborts).contains(&sid)
+                })
+            };
+            let decoded = decoded?;
+            if let Some(e) = write_err {
+                anyhow::bail!("client went away mid-eval: {e}");
+            }
+            let completion = decoded.text.clone();
+            let stopped_early = decoded.stop == Stop::Cancelled;
+            if stopped_early {
+                lock(aborts).remove(&sample_id);
+            }
+            eprintln!(
+                "[eval {}/{total} id={sample_id} {} tokens {:.1} ms {} readback={}]",
+                i + 1,
+                decoded.tokens.len(),
+                engine::ms(started.elapsed()),
+                if stopped_early {
+                    "stopped_early"
+                } else {
+                    "done"
+                },
+                decoded.readback.name(),
+            );
+            w.event_line(&json!({
+                "kind": "eval_sample_done", "sample_id": sample_id,
+                "completion": completion, "stopped_early": stopped_early,
+                "completion_tokens": decoded.tokens.len(),
+                "finish_reason": finish_reason(decoded.stop),
+            }))?;
+        }
+        w.event_line(&json!({ "kind": "eval_done" }))?;
+        Ok(())
+    })();
+    if let Err(e) = &run {
+        let _ = w.event_line(&json!({ "kind": "eval_error", "error": format!("{e:#}") }));
+    }
+    w.finish()?;
+    run
+}
+
+/// Bytes of completion text buffered before an `eval_sample_chunk` goes out.
+const EVAL_CHUNK_FLUSH_BYTES: usize = 256;
+
+fn handle_abort(shared: &Shared, mut request: Request) -> Result<()> {
+    let mut body = String::new();
+    request.as_reader().read_to_string(&mut body).ok();
+    let v: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+    match v.get("sample_id").and_then(Value::as_str) {
+        Some(id) => {
+            lock(&shared.aborts).insert(id.to_string());
+            eprintln!("[eval abort requested for {id}]");
+            respond_json(request, 200, &json!({ "sample_id": id }))
+        }
+        None => respond_error(request, 400, "field 'sample_id' must be a string"),
+    }
+}
+
+// ---- responses ---------------------------------------------------------------
+
+fn respond_json(request: Request, status: u16, body: &Value) -> Result<()> {
+    let text = body.to_string();
+    let response = Response::from_string(text)
+        .with_status_code(StatusCode(status))
+        .with_header(header("Content-Type", "application/json"));
+    request.respond(response).context("writing the response")
+}
+
+fn respond_error(request: Request, status: u16, message: &str) -> Result<()> {
+    let kind = match status {
+        400 => "invalid_request_error",
+        404 => "not_found_error",
+        _ => "server_error",
+    };
+    respond_json(
+        request,
+        status,
+        &json!({ "error": { "message": message, "type": kind, "code": status } }),
+    )
+}
+
+fn header(name: &str, value: &str) -> Header {
+    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header")
+}
+
+/// A chunked HTTP/1.1 response written by hand through the request's raw
+/// writer, so the body can be produced on the decoding thread as the loop
+/// drains tokens.
+struct ChunkedWriter {
+    w: Box<dyn Write + Send + 'static>,
+}
+
+impl ChunkedWriter {
+    fn start(request: Request, content_type: &str) -> Result<Self> {
+        let mut w = request.into_writer();
+        write!(
+            w,
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\n\
+             Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )?;
+        w.flush()?;
+        Ok(Self { w })
+    }
+
+    fn raw(&mut self, s: &str) -> std::io::Result<()> {
+        write!(self.w, "{:x}\r\n{s}\r\n", s.len())?;
+        self.w.flush()
+    }
+
+    /// One SSE event.
+    fn event(&mut self, v: &Value) -> std::io::Result<()> {
+        self.raw(&format!("data: {v}\n\n"))
+    }
+
+    /// One JSONL line.
+    fn event_line(&mut self, v: &Value) -> std::io::Result<()> {
+        self.raw(&format!("{v}\n"))
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.w.write_all(b"0\r\n\r\n")?;
+        self.w.flush()?;
+        Ok(())
+    }
+}
+
+// ---- small helpers -----------------------------------------------------------
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn short_id() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
+
+fn finish_reason(stop: Stop) -> &'static str {
+    match stop {
+        Stop::Eos | Stop::StopString => "stop",
+        Stop::Length => "length",
+        Stop::Cancelled => "cancelled",
+    }
+}
+
+fn usage(prompt: usize, completion: usize) -> Value {
+    json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    })
+}
+
+/// The engine's own brackets beside the request's wall clock: the prompt's
+/// submit time, the per-step host clock and the arm that ran. `predicted_ms`
+/// is the sum of the loop's steps — the decode window, prefill excluded.
+fn timings(prompt: usize, d: &Decoded, elapsed: std::time::Duration) -> Value {
+    let st = &d.stats;
+    let predicted_ms = st.step_ns.iter().sum::<u64>() as f64 / 1e6;
+    let n = d.tokens.len();
+    json!({
+        "prompt_n": prompt,
+        "prompt_submit_ms": st.prefill_ns as f64 / 1e6,
+        "predicted_n": n,
+        "predicted_ms": predicted_ms,
+        "predicted_per_second": if predicted_ms > 0.0 { n as f64 / (predicted_ms / 1e3) } else { 0.0 },
+        "total_ms": engine::ms(elapsed),
+        "readback": d.readback.name(),
+        "reuse": format!("{:?}", d.reuse),
+        "prefilled": d.prefilled,
+        "commits": st.commits,
+        "ring_publishes": st.readback.ring_publishes,
+        "poll_fallbacks": st.readback.poll_fallbacks,
+        "overrun": st.overrun,
+    })
+}
+
+fn report(endpoint: &str, prompt: usize, d: &Decoded, total_ms: f64) {
+    let st = &d.stats;
+    let mut steps: Vec<u64> = st.step_ns.clone();
+    steps.sort_unstable();
+    let steady = if steps.is_empty() {
+        0.0
+    } else {
+        1e9 / steps[steps.len() / 2] as f64
+    };
+    eprintln!(
+        "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
+         {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
+         commits={} poll_fallbacks={} overrun={}]",
+        d.tokens.len(),
+        d.stop,
+        d.readback.name(),
+        d.reuse,
+        d.prefilled,
+        st.commits,
+        st.readback.poll_fallbacks,
+        st.overrun,
+    );
+}
+
+fn models_body(model_name: &str) -> Value {
+    json!({
+        "object": "list",
+        "data": [{ "id": model_name, "object": "model", "created": now(), "owned_by": "lloom" }],
+    })
+}

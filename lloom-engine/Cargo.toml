@@ -21,6 +21,18 @@ lloom = { workspace = true }
 lloom-tensor = { workspace = true }
 thiserror = { workspace = true }
 
+# The `lloom-serve` binary only (feature `serve`): the library stays free of a
+# tokenizer, an HTTP stack and a template engine. A consumer that links the
+# library pays for none of these.
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokenizers = { workspace = true, features = ["onig"], optional = true }
+tiny_http = { version = "0.12", optional = true }
+hf-chat-template = { version = "1.0", optional = true }
+rand = { workspace = true, optional = true }
+
 [dev-dependencies]
 anyhow = { workspace = true }
 # Examples encode/decode; the library itself names no tokenizer library (the
@@ -34,6 +46,11 @@ name = "decode-smoke"
 # backend on this machine. The loop itself is backend-agnostic.
 required-features = ["metal"]
 
+[[bin]]
+name = "lloom-serve"
+path = "src/bin/lloom-serve/main.rs"
+required-features = ["serve"]
+
 [features]
 default = []
 # Forwarded to lloom so a serving binary built for Metal pulls the Metal
@@ -43,3 +60,16 @@ metal = ["lloom/metal"]
 cuda = ["lloom/cuda"]
 accelerate = ["lloom/accelerate"]
 mkl = ["lloom/mkl"]
+# The `lloom-serve` binary: the OpenAI-compatible endpoint and the benchmark
+# sidecar contract over the engine (issue #695). Backend-agnostic on its own;
+# pair with `metal` on Apple silicon.
+serve = [
+    "dep:anyhow",
+    "dep:clap",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokenizers",
+    "dep:tiny_http",
+    "dep:hf-chat-template",
+    "dep:rand",
+]

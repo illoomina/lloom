@@ -13,7 +13,7 @@
 use anyhow::{Context, Result};
 use lloom::models::lfm2::{self, AttnImpl, Cache, Model};
 use lloom::nn::VarBuilder;
-use lloom_engine::{DecodeParams, DecodeSession};
+use lloom_engine::{DecodeParams, DecodeSession, ReadbackArm};
 use lloom_tensor::{DType, Device};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -96,6 +96,8 @@ fn main() -> Result<()> {
             max_tokens: 64,
             eos_ids: eos_ids.clone(),
             stop_strings: Vec::new(),
+            // The gate arm: the blocking readback `lfm2-smoke` compares against.
+            readback: ReadbackArm::Blocking,
         };
 
         let tk = &tokenizer;

@@ -2217,6 +2217,49 @@ impl Tensor {
         }
     }
 
+    /// Write `src` into this tensor's CPU-mapped Metal buffer at element `index`,
+    /// host-side and zero-alloc — **no intermediate `Tensor`, no `slice_set`
+    /// upload, no blit** (the write counterpart of [`Self::peek_scalar_ptr`]).
+    /// This is how a host-sourced token feed (a prompt chunk, a drafted block)
+    /// lands in a reused device staging buffer without a per-feed allocation.
+    ///
+    /// Returns `true` if it wrote through the mapped pointer. Returns `false` when
+    /// the tensor is not a contiguous rank-1 `Metal` buffer of the matching dtype,
+    /// or the buffer is unmapped, or the range would overflow — the caller then
+    /// takes the `slice_set`-from-`Tensor` upload fallback. Never panics; `false`
+    /// is a signal.
+    ///
+    /// SAFETY: the caller guarantees no GPU work is concurrently reading
+    /// `[index, index+src.len())` of this buffer — the same discipline the mapped
+    /// read relies on (writes happen while the slot is not in flight; the pacer /
+    /// commit ordering is the caller's to hold).
+    pub unsafe fn write_host_slice<S: crate::WithDType>(&self, index: usize, src: &[S]) -> bool {
+        // Any contiguous shape: the write is into flat buffer memory, so `[1, N]`
+        // (the input staging scratch) is as valid as `[N]` — same bytes, same
+        // offsets. Only contiguity matters (a strided view has no single run).
+        if !self.is_contiguous() {
+            return false;
+        }
+        match &*self.storage() {
+            Storage::Metal(storage) => {
+                if storage.dtype() != S::DTYPE {
+                    return false;
+                }
+                let Some((o1, o2)) = self.layout.contiguous_offsets() else {
+                    return false;
+                };
+                let Some(at) = o1.checked_add(index) else {
+                    return false;
+                };
+                if at.saturating_add(src.len()) > o2 {
+                    return false;
+                }
+                storage.write_host_slice::<S>(at, src)
+            }
+            _ => false,
+        }
+    }
+
     /// Returns the data contained in a 2D tensor as a vector of vector of scalar values.
     pub fn to_vec2<S: crate::WithDType>(&self) -> Result<Vec<Vec<S>>> {
         let (dim1, dim2) = self.dims2()?;

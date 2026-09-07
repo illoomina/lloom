@@ -2275,6 +2275,11 @@ impl Tensor {
             return false;
         }
         match &*self.storage() {
+            // The arm is gated rather than the dummy backend stubbed, the way
+            // `peek_vec1` is: the no-`metal` surface stays unchanged and the
+            // CPU build (`cargo check -p lloom-tensor`, CI's cpu-no-metal job)
+            // keeps compiling.
+            #[cfg(feature = "metal")]
             Storage::Metal(storage) => {
                 if storage.dtype() != S::DTYPE {
                     return false;

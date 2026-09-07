@@ -347,6 +347,20 @@ struct Args {
     #[arg(long)]
     gemv_residual: Option<bool>,
 
+    /// Override the cache preset's attention arm: `sdpa` (the crown), `flash`
+    /// (FlashDecoding, the only arm that reads a paged pool) or `generic`. Unset
+    /// leaves the preset's. A measurement knob: it changes which kernel the
+    /// decode step takes, and the reply's logits move with it (§10.4a) while the
+    /// tokens do not on the recorded prompts.
+    #[arg(long)]
+    attn: Option<String>,
+
+    /// Override the cache preset's KV append arm: `cat`, `in-place` or `paged`
+    /// (`paged` needs `--attn flash`; refused otherwise). Unset leaves the
+    /// preset's (`in-place` on the crown, `LLOOM_CROWN_KV=cat` the old arm).
+    #[arg(long)]
+    kv_append: Option<String>,
+
     // ---- multi-sequence modes (absorbed from the former lfm2-sequence) -------
     /// `single` (default — read one prompt from stdin), `reuse` (a two-turn
     /// conversation decoded with prefix reuse vs a fresh prefill), or
@@ -728,6 +742,21 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.gemv_residual {
         config.gemv_residual = v;
+    }
+    // The attention and KV-append arms, overriding the preset so the paged pool
+    // (which only FlashDecoding reads) and the flash/sdpa pair are measurable on
+    // this loop rather than only on the profiler. Applied before `Model::new`
+    // and `Cache::new_with`, which both read them.
+    if let Some(a) = args.attn.as_deref() {
+        config.attn_impl = match a {
+            "sdpa" => lloom::models::lfm2::AttnImpl::Sdpa,
+            "flash" => lloom::models::lfm2::AttnImpl::FlashDecoding,
+            "generic" => lloom::models::lfm2::AttnImpl::Generic,
+            other => anyhow::bail!("--attn must be `sdpa`, `flash` or `generic`, got `{other}`"),
+        };
+    }
+    if let Some(kv) = args.kv_append.as_deref() {
+        config.kv_append = KvAppend::parse(kv).map_err(|e| anyhow::anyhow!(e))?;
     }
     // `--mode reuse` carries the conv state across the turn-boundary prefill
     // (§13.2f). Set on the config the model is built from; a no-op for `single`.
@@ -1421,6 +1450,11 @@ fn main() -> Result<()> {
         KvAppend::Cat => "cat",
         KvAppend::Paged => "paged",
     };
+    let attn_arm = match config.attn_impl {
+        lloom::models::lfm2::AttnImpl::Sdpa => "sdpa",
+        lloom::models::lfm2::AttnImpl::FlashDecoding => "flash",
+        lloom::models::lfm2::AttnImpl::Generic => "generic",
+    };
     // The KV slab's state and the process's device allocation, so a run reports
     // the memory it actually held at the length it reached rather than the
     // ceiling it could have (§9.5's admission is a prediction; this is the
@@ -1452,7 +1486,7 @@ fn main() -> Result<()> {
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \
-         {} on {:?}; cache={cache_arm} kv={kv_arm} bos={} \
+         {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} bos={} \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
          step_markers={} step_waits={} cut={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={}]",

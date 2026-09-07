@@ -3930,12 +3930,20 @@ fn main() -> Result<()> {
         } else {
             Some(Tensor::new(batch_rows.as_slice(), &device)?.reshape((batch, 1))?)
         };
-        let input = match (&owned_input, ring.as_ref()) {
+        // The ring's input is a `[1, 1]` view of the current input tile
+        // (`TokenRing::input_for`), not one stable buffer: the input cycles
+        // `depth + 1` tiles so a stage never overwrites a tile an in-flight
+        // forward reads. The view is held here for the forward.
+        let ring_input = match (&owned_input, ring.as_ref()) {
+            (None, Some(r)) => Some(r.input_for(1)?),
+            _ => None,
+        };
+        let input = match (&owned_input, ring_input.as_ref()) {
             (Some(t), _) => t,
             // `ring` is `Some` here whenever `owned_input` is `None`: the ring
             // is allocated in the sample block above, which runs before this on
             // every iteration of the ring arm.
-            (None, Some(r)) => r.input(),
+            (None, Some(t)) => t,
             (None, None) => anyhow::bail!(
                 "the ring arm reached the forward pass with no ring allocated, which is \
                  unreachable: the sample block allocates it on first use"
@@ -3966,12 +3974,18 @@ fn main() -> Result<()> {
         // allocation, and identity is exactly the question being asked.
         //
         // One pointer compare per token, off the GPU path.
-        if let Some(r) = ring.as_ref() {
+        // The pointer compare this arm carried (`ptr::eq(input, ring.input())`)
+        // has nothing to compare any more: the input is a per-step view of a
+        // cycling tile, and a `Tensor`'s storage identity is not public. What is
+        // asserted instead is the routing itself: on the ring arm no host tensor
+        // was built for this step, so the forward can only be reading the view
+        // the ring handed out.
+        if ring.is_some() {
             anyhow::ensure!(
-                std::ptr::eq(input, r.input()),
-                "step {}: the ring arm's forward pass is not reading the ring's own input \
-                 slot, so the token is being uploaded rather than published in place -- \
-                 the mechanism is wired and the routing is dead (DESIGN.md §11.5g, #500)",
+                owned_input.is_none(),
+                "step {}: the ring arm built a host input tensor, so the token is being \
+                 uploaded rather than published in place -- the mechanism is wired and \
+                 the routing is dead (DESIGN.md §11.5g, #500)",
                 tokens.len()
             );
         }

@@ -658,14 +658,24 @@ impl History {
                 break;
             }
             let (seg, base) = self.tile_home(self.drained_tiles);
+            // BULK copy, NOT per-element volatile. The drain reads only `≤ end ≤
+            // published`, and the published-counter read is the acquire (§9.3's
+            // `mem_device` ordering: once the host observes `published ≥ N`, slots
+            // `[0..N]` are written AND stable — the GPU writes forward, never
+            // rewrites a published slot). So this tile's `count` real slots are
+            // finished, unchanging memory: a `copy_from_slice` is correct, and a
+            // per-element `read_volatile` was belt-and-suspenders AFTER the
+            // acquire — one that, at the ceiling, costs a coherency stall per
+            // element (measured: a single hot-path volatile is worth ~1 tok/s).
+            // One coalesced copy per tile instead of `count` poking loads.
+            //
             // SAFETY: `seg_bases[seg]` is the mapped base of a buffer never
-            // reallocated for this ring's life; `base + j < segment_len`; the GPU
-            // may still be writing LATER tiles, so `read_volatile`. The published
-            // clamp (`end`) keeps this off any slot the GPU has not finished.
+            // reallocated for this ring's life; `[base, base+count) < segment_len`
+            // (a tile fits its segment); the range is `≤ published`, so the GPU is
+            // not writing it — no aliasing with a concurrent writer.
             let ptr = self.seg_bases.as_ref().unwrap()[seg];
-            for j in 0..count {
-                out.push(unsafe { ptr.add(base + j).read_volatile() });
-            }
+            let src = unsafe { std::slice::from_raw_parts(ptr.add(base), count) };
+            out.extend_from_slice(src);
             self.drained += count;
             self.drained_tiles += 1;
         }

@@ -1585,11 +1585,15 @@ fn main() -> Result<()> {
     // pin. Every device buffer is in the residency set already (§6.3b); this
     // counts the host side -- heap, stack, text, the CPU-mapped ring pages.
     let faults_before = rusage_faults();
-    // Wall-clock to the first token the consumer is HANDED (`first_batch_at`, on
-    // the decode thread when it pushes) and to the first VISIBLE token
-    // (`first_visible_ns`, on the CONSUMER thread when a byte reaches stdout).
-    // Measurement seam; the visible stamp is shared because it is set off-thread.
-    let mut first_batch_at: Option<std::time::Duration> = None;
+    // Wall-clock to the first token the host RECEIVES (`first_batch_ns`, the
+    // TTFT) and to the first VISIBLE token (`first_visible_ns`, when a byte
+    // reaches stdout). Both are shared atomics because either can be set
+    // off-thread: on the incumbent path the decode thread stamps `first_batch_ns`
+    // in `on_tokens` when it drains the first batch; on the `--stream-reader`
+    // path the reader thread stamps it on its first `read_new` that yields an id
+    // (BEFORE detokenize — the same "received, pre-print" semantics), because the
+    // hot loop no longer drains and `on_tokens` never fires. `0` = unset.
+    let first_batch_ns = Arc::new(AtomicU64::new(0));
     let first_visible_ns = Arc::new(AtomicU64::new(0));
     // The two hops between `received` and `visible`, on the consumer thread:
     // the first id popped off the SPSC, and the first id detokenized (lloom
@@ -1636,6 +1640,7 @@ fn main() -> Result<()> {
     //    commit cadence; this pops them. Used on the blocking arm, dspark, an
     //    unmapped ring, or without `--stream-reader`.
     let consumer = {
+        let first_batch_ns = Arc::clone(&first_batch_ns);
         let first_visible_ns = Arc::clone(&first_visible_ns);
         let first_pop_ns = Arc::clone(&first_pop_ns);
         let first_detok_ns = Arc::clone(&first_detok_ns);
@@ -1662,8 +1667,15 @@ fn main() -> Result<()> {
                     // returns only the published prefix `[cursor, published)`,
                     // never waiting; it stops at the first stop id itself (marks
                     // `ended`) so we never print past EOS.
-                    let mut emit =
+                    let emit =
                         |ids: &[u32], tos: &mut candle_examples::token_output_stream::TokenOutputStream, out: &mut std::io::StdoutLock<'_>| {
+                            if !ids.is_empty() {
+                                // TTFT on the reader path: the host has the first
+                                // token here, BEFORE detokenize — the same
+                                // "received" semantics `on_tokens` stamps on the
+                                // incumbent path. Once-only via `compare_exchange`.
+                                stamp_at(&first_batch_ns, decode_start);
+                            }
                             for &id in ids {
                                 stamp_at(&first_pop_ns, decode_start);
                                 let text = tos.next_token(id);
@@ -1761,8 +1773,16 @@ fn main() -> Result<()> {
         // sustained-backpressure stall is allowed to land, and unreachable for a
         // ring sized to the run.
         let mut on_tokens = |batch: &[u32]| -> candle::Result<()> {
-            if first_batch_at.is_none() && !batch.is_empty() {
-                first_batch_at = Some(decode_start.elapsed());
+            if !batch.is_empty()
+                && first_batch_ns
+                    .compare_exchange(
+                        0,
+                        decode_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
                 #[cfg(feature = "metal")]
                 if let Device::Metal(m) = &device {
                     device_allocated_at_first_token = Some(m.device().current_allocated_size());
@@ -1886,6 +1906,13 @@ fn main() -> Result<()> {
     // rule (a first piece that is not alphanumeric-terminated waits for the
     // next token, which is one decode step).
     let submit_ms = st.ttft_compute_ns as f64 / 1e6;
+    // `first_batch_ns` was stamped by whichever path saw the first token: the hot
+    // thread's `on_tokens` on the incumbent path, the reader thread on
+    // `--stream-reader`. `0` = never stamped (a zero-token run).
+    let first_batch_at = match first_batch_ns.load(Ordering::Relaxed) {
+        0 => None,
+        ns => Some(std::time::Duration::from_nanos(ns)),
+    };
     let ttft_ms = first_batch_at.map_or(f64::NAN, |d| d.as_secs_f64() * 1e3);
     let ms_or_na = |ns: u64| {
         if ns == 0 {

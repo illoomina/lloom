@@ -87,6 +87,12 @@ static HAZARD_KEY: AtomicBool = AtomicBool::new(false);
 /// Whether `CANDLE_METAL_HAZARD_KEY` has been consulted yet.
 static HAZARD_KEY_FROM_ENV: OnceLock<()> = OnceLock::new();
 
+/// Whether the key was chosen EXPLICITLY — by the environment or by
+/// [`set_hazard_key`] — as opposed to being the shipped default. An arena
+/// install selects `Range` only when nothing explicit has, so a harness that
+/// pins `pointer` to measure the wrong key on purpose keeps it.
+static HAZARD_KEY_EXPLICIT: AtomicBool = AtomicBool::new(false);
+
 /// Apply `CANDLE_METAL_HAZARD_KEY=range` if it is set, once per process.
 ///
 /// An environment switch rather than a parameter, so that **any** harness gets
@@ -100,8 +106,12 @@ fn init_hazard_key_from_env() {
     HAZARD_KEY_FROM_ENV.get_or_init(|| {
         if let Ok(v) = std::env::var("CANDLE_METAL_HAZARD_KEY") {
             match v.as_str() {
-                "range" => HAZARD_KEY.store(true, Ordering::Relaxed),
-                "pointer" | "ptr" | "" => {}
+                "range" => {
+                    HAZARD_KEY.store(true, Ordering::Relaxed);
+                    HAZARD_KEY_EXPLICIT.store(true, Ordering::Relaxed);
+                }
+                "pointer" | "ptr" => HAZARD_KEY_EXPLICIT.store(true, Ordering::Relaxed),
+                "" => {}
                 other => {
                     // Loudly, because the silent alternative is measuring the
                     // default while believing the variable was honoured.
@@ -123,6 +133,25 @@ pub fn set_hazard_key(key: HazardKey) {
     // rather than being overwritten at the next session.
     let _ = HAZARD_KEY_FROM_ENV.set(());
     HAZARD_KEY.store(key == HazardKey::Range, Ordering::Relaxed);
+    HAZARD_KEY_EXPLICIT.store(true, Ordering::Relaxed);
+}
+
+/// Select `key` unless the environment or a [`set_hazard_key`] call already
+/// chose one. Returns the key in force afterwards.
+///
+/// The arena's install calls this with [`HazardKey::Range`]: an arena puts
+/// every activation behind one pointer, so under the `Pointer` key every
+/// write-then-read pair inside it is a false dependency (`DESIGN.md` §9.2e —
+/// 497 / 475 / 446 barriers a token against the pool's 436 / 36 / 0), and
+/// route (a) is the key an arena is correct *and* cheap under. A key that
+/// only makes sense with the arena is selected by the arena; the explicit
+/// switches stay for the A/B that measures the wrong one on purpose.
+pub fn set_hazard_key_unless_explicit(key: HazardKey) -> HazardKey {
+    init_hazard_key_from_env();
+    if !HAZARD_KEY_EXPLICIT.load(Ordering::Relaxed) {
+        HAZARD_KEY.store(key == HazardKey::Range, Ordering::Relaxed);
+    }
+    hazard_key()
 }
 
 /// The keying new encoder sessions will use.

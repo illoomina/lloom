@@ -28,7 +28,8 @@ use device::{DeviceTeardown, ResidencyEvictionObserver};
 /// Re-exported for the same reason `trace` is below: a harness selecting a
 /// layout should not need a direct dependency on `candle-metal-kernels`.
 pub use crate::kernels::metal::{
-    hazard_key, set_hazard_key, ArenaCounters, ArenaLayout, HazardKey, Slot, StepPlan,
+    hazard_key, set_hazard_key, set_hazard_key_unless_explicit, ArenaCounters, ArenaLayout,
+    HazardKey, Slot, StepPlan,
 };
 
 /// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).

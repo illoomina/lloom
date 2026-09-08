@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use hf_chat_template::ChatTemplate;
 use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model};
 use lloom::nn::{Sequence, VarBuilder};
-use lloom_engine::{DecodeParams, DecodeSession, Decoded, ReadbackArm};
+use lloom_engine::{ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool};
 use lloom_tensor::{DType, Device, Tensor, D};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -27,6 +27,9 @@ pub struct Core {
     /// The one sequence every request drives, taken out for the request's
     /// session and put back after it.
     seq: Option<Sequence<Cache>>,
+    /// The token rings, one per EOS set, kept across requests (`RingPool`):
+    /// built at load, never inside a request's latency (#702).
+    rings: Option<RingPool>,
 }
 
 /// Text: the tokenizer, the checkpoint's own chat template, and the ids the
@@ -90,9 +93,12 @@ impl Core {
             .seq
             .take()
             .context("the sequence is checked out — a previous request panicked mid-decode")?;
-        let mut session = DecodeSession::from_sequence(&self.model, seq, self.device.clone());
+        let rings = self.rings.take().unwrap_or_default();
+        let mut session = DecodeSession::from_parts(&self.model, seq, self.device.clone(), rings);
         let out = f(&mut session);
-        self.seq = Some(session.into_sequence());
+        let (seq, rings) = session.into_parts();
+        self.seq = Some(seq);
+        self.rings = Some(rings);
         out
     }
 }
@@ -164,6 +170,7 @@ impl Engine {
                 model,
                 device,
                 seq: Some(Sequence::new(cache)),
+                rings: Some(RingPool::new()),
             },
             text: Text {
                 tokenizer,
@@ -182,6 +189,22 @@ impl Engine {
         if opts.warmup {
             let (libs, pipes) = engine.core.with_session(|s| Ok(s.warmup()?))?;
             eprintln!("[warmup: {libs} libraries, {pipes} pipelines compiled]");
+        }
+        // The two rings every request will want, built here rather than inside
+        // the first request of each kind (#702: ~35 ms each, plus a sync).
+        if !engine.core.device.is_cpu() {
+            let eos = engine.text.eos_ids.clone();
+            let t = Instant::now();
+            let built = engine.core.with_session(|s| {
+                let device = s.device().clone();
+                let a = s.rings().prepare(&eos, &device, ring_eos_read())?;
+                let b = s.rings().prepare(&NEVER_EOS, &device, ring_eos_read())?;
+                Ok(usize::from(a) + usize::from(b))
+            })?;
+            eprintln!(
+                "[rings: {built} built at load in {:.1} ms (the EOS set, never-EOS); reused by every request]",
+                ms(t.elapsed())
+            );
         }
         Ok(engine)
     }

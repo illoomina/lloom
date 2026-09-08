@@ -39,7 +39,8 @@
 //! is committed before step `s` retires.
 
 use crate::generation::{
-    CommitBudget, LogitsProcessor, ReadbackCounters, ReadbackStrategy, Sampling,
+    CommitBudget, HotThread, HotThreadReport, LogitsProcessor, ReadbackCounters, ReadbackStrategy,
+    Sampling,
 };
 use crate::nn::model::{BatchedCausalLM, CacheReset, CausalLM, Row};
 use crate::nn::speculator::{
@@ -254,6 +255,9 @@ pub struct DecodeStats {
     /// and waiting for the GPU. `phase_steps` is the number of steps summed.
     pub phase_totals: StepPhases,
     pub phase_steps: u64,
+    /// The decode thread's scheduling class for this run: what it was, what
+    /// the loop claimed (`generation::HotThread`), and whether that engaged.
+    pub hot_thread: HotThreadReport,
     /// The prefill's dispatch census, `(kernel, count)`, under
     /// `CANDLE_METAL_PROFILE=1`; empty otherwise and off Metal.
     pub prefill_census: Vec<(String, u64)>,
@@ -651,6 +655,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         spec.begin(SeqId(0), prompt)?;
 
         let device = readback.device().clone();
+        // The hot thread's scheduling class, held for the run and restored on
+        // return (`generation::hot_thread`): two syscalls a generation, none a
+        // step.
+        let hot_thread = HotThread::claim();
         let mut stats = DecodeStats {
             step_ns: Vec::with_capacity(opts.max_tokens),
             sample_ns: Vec::with_capacity(if opts.sample_split {
@@ -658,6 +666,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             } else {
                 0
             }),
+            hot_thread: hot_thread.report(),
             ..DecodeStats::default()
         };
 
@@ -768,6 +777,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 break;
             }
             stats.steps += 1;
+            // Under `CANDLE_METAL_PROFILE=1` only: tell the profile recorder
+            // which step the command buffers committed from here on belong to,
+            // so an idle gap between two buffers can be laid at a step (issue
+            // #702). A cached-bool check and nothing else on every other run.
+            #[cfg(feature = "metal")]
+            {
+                use lloom_tensor::kernels::metal::profile;
+                if profile::enabled() {
+                    profile::set_step(stats.steps);
+                }
+            }
             // Only the first `FIRST_STEPS_TRACED` steps record per-phase timings —
             // and only in a debug/profile build. In release `traced` is a constant
             // `false`, so every `traced.then(Instant::now())` below is `None` and NO
@@ -1217,8 +1237,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         let device = readback.device().clone();
         let seq = SeqId(0);
+        let hot_thread = HotThread::claim();
         let mut stats = DecodeStats {
             step_ns: Vec::with_capacity(opts.max_tokens),
+            hot_thread: hot_thread.report(),
             ..DecodeStats::default()
         };
 
@@ -1474,6 +1496,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         spec.want_confidence(false);
         let run_start = std::time::Instant::now();
+        let hot_thread = HotThread::claim();
 
         let mut lanes: Vec<Lane<<M as Probes<S::Probe>>::Pending>> = Vec::with_capacity(n);
 
@@ -1499,6 +1522,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 stats: DecodeStats {
                     step_ns: Vec::with_capacity(opts.max_tokens),
                     prefill_ns: prefill_start.elapsed().as_nanos() as u64,
+                    hot_thread: hot_thread.report(),
                     ..DecodeStats::default()
                 },
                 pending: None,
@@ -1773,6 +1797,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
         }
         let run_start = std::time::Instant::now();
+        let hot_thread = HotThread::claim();
 
         // Prefill every sequence before reading anything back: each prompt is
         // its own `forward` at its own length, queued behind the previous.
@@ -1803,6 +1828,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 stats: DecodeStats {
                     step_ns: Vec::with_capacity(opts.max_tokens),
                     prefill_ns: prefill_start.elapsed().as_nanos() as u64,
+                    hot_thread: hot_thread.report(),
                     ..DecodeStats::default()
                 },
             });

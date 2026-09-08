@@ -193,10 +193,37 @@ impl CutPolicy {
 /// [`Commands::on_command_buffer_complete`].
 type CompletionSubscribers = Arc<parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>>;
 
+/// Whether the queue hands out command buffers that do NOT retain the
+/// resources encoded into them (`commandBufferWithUnretainedReferences`).
+///
+/// Opt-in through `LLOOM_CB_UNRETAINED=1`, read once. The default retaining
+/// command buffer takes a strong reference to every buffer, pipeline and
+/// encoder argument it sees and releases them on completion -- objc retain
+/// traffic per encode that the hot path pays for nothing, because everything a
+/// decode step encodes is already held for the generation: pool buffers are
+/// parked in `pending` until their epoch completes (`BufferPool::drain_completed`),
+/// arena buffers live for the arena, pipelines for the process, and residency
+/// is the residency set's. That is the claim the unretained form rests on, and
+/// it is a claim about OUR liveness discipline rather than Metal's, which is why
+/// it is fuzzed rather than assumed: `lloom-fuzz`'s `cb_liveness` harness runs
+/// both kinds over a pool with a device-visible poison on free
+/// (`BufferPool::set_free_poison`) and reads every copy back.
+pub fn cb_unretained() -> bool {
+    static KIND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KIND.get_or_init(|| {
+        std::env::var("LLOOM_CB_UNRETAINED").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
 fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, MetalKernelError> {
-    command_queue.commandBuffer().map(CommandBuffer::new).ok_or(
-        MetalKernelError::FailedToCreateResource("CommandBuffer".to_string()),
-    )
+    let raw = if cb_unretained() {
+        command_queue.commandBufferWithUnretainedReferences()
+    } else {
+        command_queue.commandBuffer()
+    };
+    raw.map(CommandBuffer::new).ok_or(MetalKernelError::FailedToCreateResource(
+        "CommandBuffer".to_string(),
+    ))
 }
 
 /// RAII guard for compute command encoder operations.
@@ -1054,7 +1081,7 @@ impl Commands {
     /// already moved, which is §6.7 L4's two-clocks defect. It is sound for a
     /// *bound* check, which is the only thing that reads it: the queue cannot
     /// have grown without a commit the caller made.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn in_flight_len(&self) -> Result<usize, MetalKernelError> {
         Ok(self.state.lock().in_flight.len())
     }

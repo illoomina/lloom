@@ -1,0 +1,20 @@
+# The instrumentation is a property of this tree, not of an invocation nobody
+# recorded (§14.5a): `sancov-wrapper.sh` adds the SanitizerCoverage flags to
+# the engine crates (`lloom`, `lloom_tensor`) and this crate's own code, and to
+# nothing else -- rustc has no allowlist (`-fsanitize-coverage-allowlist` is a
+# clang driver option, rejected as `-Cllvm-args`), per-package rustflags are
+# nightly-only, and instrumenting every dependency measured 1 181 290 guards
+# for a 2 MiB map scanned per execution.
+#
+# `--target` is kept explicit: with it cargo keeps `build.rustflags` (the
+# parent config's `-C target-cpu=native`) off the host build scripts, and the
+# binaries land under `target/aarch64-apple-darwin/<profile>/`.
+[build]
+target = "aarch64-apple-darwin"
+rustc-wrapper = "./sancov-wrapper.sh"
+
+# The edges map `libafl_targets` compiles in, read by its build script. Sized
+# for the guard count with headroom; the count each binary prints at start
+# must stay below it (`campaign::run` refuses otherwise).
+[env]
+LIBAFL_EDGES_MAP_DEFAULT_SIZE = "1048576"

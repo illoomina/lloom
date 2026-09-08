@@ -967,6 +967,16 @@ pub struct PoolInner {
     /// `None` for a pool with no second referent, which is every pool in the
     /// tests and the default `BufferPool::new`. The device installs one.
     on_evict: parking_lot::Mutex<Option<Arc<dyn BufferEvictionObserver>>>,
+    /// A device-visible sentinel written over a buffer the moment it becomes
+    /// FREE (lloom #706). `0` = off; `0x100 | byte` = on. The host-side
+    /// `asan-poison` mark makes a host read of a free buffer a report; this makes
+    /// a GPU read of one -- a command buffer still reading a buffer the pool
+    /// has recycled, which is the defect an unretained command buffer turns
+    /// from a stale-but-plausible read into a use-after-free -- come back as
+    /// the sentinel, so a harness comparing copies against what it wrote sees
+    /// it. Fuzz builds only; production never writes a free buffer.
+    #[cfg(feature = "fuzzing")]
+    free_poison: std::sync::atomic::AtomicU16,
 }
 
 /// Default cap on bytes held in a free list.
@@ -1006,6 +1016,8 @@ impl PoolInner {
             }),
             clock,
             on_evict: parking_lot::Mutex::new(None),
+            #[cfg(feature = "fuzzing")]
+            free_poison: std::sync::atomic::AtomicU16::new(0),
         }
     }
 
@@ -1084,6 +1096,27 @@ impl PoolInner {
             // put it in `pending`) AND `is_complete` just said the GPU is done
             // with it. Inert without the `asan-poison` feature.
             unsafe { super::poison::poison_buffer(&entry.buffer) };
+            // The device-visible half of the same claim (#706): overwrite the
+            // memory itself, so a command buffer that is STILL reading it --
+            // which `is_complete` has just said cannot exist -- reads the
+            // sentinel rather than the bytes the last owner left. Shared
+            // storage, so a host write is what the GPU sees.
+            #[cfg(feature = "fuzzing")]
+            {
+                let poison = self.free_poison.load(std::sync::atomic::Ordering::Relaxed);
+                if poison & 0x100 != 0 && !entry.buffer.is_view() {
+                    // SAFETY: no handle exists (the last drop parked it) and
+                    // the GPU epoch it was released in is complete; the write
+                    // covers exactly the allocation.
+                    unsafe {
+                        std::ptr::write_bytes(
+                            entry.buffer.contents(),
+                            poison as u8,
+                            entry.buffer.length(),
+                        );
+                    }
+                }
+            }
             state.free_bytes += entry.size;
             state.free_order.push_back(entry.size);
             state.free.entry(entry.size).or_default().push(entry.buffer);
@@ -1360,6 +1393,16 @@ impl BufferPool {
     /// Call from a command buffer completion handler, once per command buffer.
     pub fn drain_completed(&self) {
         self.inner.drain_completed();
+    }
+
+    /// Write `byte` over every buffer the moment it becomes free (#706), or
+    /// stop. Fuzz builds only -- see `PoolInner::free_poison`.
+    #[cfg(feature = "fuzzing")]
+    pub fn set_free_poison(&self, byte: Option<u8>) {
+        self.inner.free_poison.store(
+            byte.map_or(0, |b| 0x100 | b as u16),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Selects the reuse-oversize bound for this pool (`DESIGN.md` §9.2v, #47).

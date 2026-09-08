@@ -83,13 +83,11 @@
 //!   §11.5h's return value exists to let a caller assert, and it is the one a
 //!   fuzzer can hold across arbitrary interleavings.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "fuzzing"))]
 
 use super::commands::Commands;
 use super::residency_set::ResidencySet;
 use crate::kernels::{call_unary_contiguous, unary, BufferOffset, Device, Kernels};
-use proptest::prelude::*;
-use proptest::test_runner::TestCaseError;
 use std::sync::Arc;
 
 /// One symbol of the submission alphabet.
@@ -388,6 +386,14 @@ pub struct Engagement {
     pub max_observed: usize,
 }
 
+// The generator and the properties: test-only, because proptest is a
+// dev-dependency and the model above is also driven by `lloom-fuzz` (#706).
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
+
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         // Encoding is what grows the queue without asking, so it is weighted
@@ -402,8 +408,20 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// ONE device per process, not one per case. `Device::system_default()` per
+/// proptest case logged "Context leak detected, CoreAnalytics returned false"
+/// once per case (lloom #706). Recorded beside it, because it is NOT fixed by
+/// this: in a DEBUG build the commands proptest at 4096 cases fails on the
+/// ~476th case with `flush_and_wait` returning `Internal Error (00000206)`,
+/// with or without this cache, while the same 4096 cases pass in `--release`
+/// and the release LibAFL harness runs 1 200 sequences in one process clean
+/// (`issue-706-raw/commands-proptest-4096*.log`). The 48-case default never
+/// reaches it; the debug-only exhaustion is open.
 fn device() -> Device {
-    Device::system_default().expect("no Metal device")
+    static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
+    DEVICE
+        .get_or_init(|| Device::system_default().expect("no Metal device"))
+        .clone()
 }
 
 proptest! {
@@ -595,4 +613,5 @@ fn in_flight_has_one_growth_site_and_three_shrink_sites() {
         5,
         "the growth/shrink census moved; the fuzzer's model is written against it"
     );
+}
 }

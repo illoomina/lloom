@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
@@ -602,23 +603,25 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         StreamKind::Completion => "/v1/completions",
         StreamKind::Chat => "/v1/chat/completions",
     };
-    let mut w = ChunkedWriter::start(request, "text/event-stream")?;
+    let sw = StreamWriter::start(ChunkedWriter::start(request, "text/event-stream")?);
     let created = now();
     if let StreamKind::Chat = run.kind {
-        w.event(&json!({
+        sw.event(&json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created,
             "model": run.model,
             "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
-        }))?;
+        }));
     }
     let started = Instant::now();
-    let outcome = {
+    let decoded = {
         let mut engine = lock(&shared.engine);
         let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
-        let mut write_err: Option<std::io::Error> = None;
-        let decoded = engine.complete(&run.prompt_ids, &run.params, |frag| {
-            if write_err.is_some() {
-                return;
+        // The callback runs on the decode thread: it serialises the chunk and
+        // queues it; the socket write happens on the writer thread. A client
+        // that went away stops the run at the next drained batch.
+        engine.complete_until(&run.prompt_ids, &run.params, |frag| {
+            if sw.client_gone() {
+                return false;
             }
             let chunk = match kind {
                 StreamKind::Completion => json!({
@@ -630,13 +633,11 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
                     "choices": [{ "index": 0, "delta": { "content": frag }, "finish_reason": null }],
                 }),
             };
-            if let Err(e) = w.event(&chunk) {
-                write_err = Some(e);
-            }
-        });
-        (decoded, write_err)
+            sw.event(&chunk);
+            true
+        })
     };
-    let (decoded, write_err) = outcome;
+    let (mut w, write_err) = sw.finish()?;
     let decoded = decoded?;
     if let Some(e) = write_err {
         anyhow::bail!("client went away mid-stream: {e}");
@@ -820,7 +821,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
         Some(json!({ "enable_thinking": enable_thinking }))
     };
 
-    let mut w = ChunkedWriter::start(request, "application/x-ndjson")?;
+    let sw = StreamWriter::start(ChunkedWriter::start(request, "application/x-ndjson")?);
     let mut engine = lock(&shared.engine);
     let total = samples.len();
     let run = (|| -> Result<()> {
@@ -842,9 +843,9 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                 .context("eval sample missing messages")?;
             let prompt = engine.render_chat(messages, kwargs.as_ref())?;
             let ids = engine.encode(&prompt, true)?;
-            w.event_line(&json!({
+            sw.event_line(&json!({
                 "kind": "eval_sample_start", "sample_id": sample_id, "prompt": prompt,
-            }))?;
+            }));
             let params = DecodeParams {
                 seed: rand::random::<u64>(),
                 temperature: (temperature > 0.0).then_some(temperature),
@@ -855,29 +856,27 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                 readback: engine.readback,
             };
             let mut pending = String::new();
-            let mut write_err: Option<std::io::Error> = None;
             let started = Instant::now();
             let aborts = &shared.aborts;
             let decoded = {
                 let sid = sample_id.clone();
                 // An abort ends the run through the decode seam's own hook,
-                // checked at every drained batch.
+                // checked at every drained batch; so does a client that went
+                // away (the writer thread latches the failed write).
                 engine.complete_until(&ids, &params, |frag| {
                     pending.push_str(frag);
-                    if pending.len() >= EVAL_CHUNK_FLUSH_BYTES && write_err.is_none() {
-                        if let Err(e) = w.event_line(&json!({
+                    if pending.len() >= EVAL_CHUNK_FLUSH_BYTES {
+                        sw.event_line(&json!({
                             "kind": "eval_sample_chunk", "sample_id": sid, "delta": pending,
-                        })) {
-                            write_err = Some(e);
-                        }
+                        }));
                         pending.clear();
                     }
-                    !lock(aborts).contains(&sid)
+                    !sw.client_gone() && !lock(aborts).contains(&sid)
                 })
             };
             let decoded = decoded?;
-            if let Some(e) = write_err {
-                anyhow::bail!("client went away mid-eval: {e}");
+            if sw.client_gone() {
+                anyhow::bail!("client went away mid-eval");
             }
             let completion = decoded.text.clone();
             let stopped_early = decoded.stop == Stop::Cancelled;
@@ -896,18 +895,22 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                 },
                 decoded.readback.name(),
             );
-            w.event_line(&json!({
+            sw.event_line(&json!({
                 "kind": "eval_sample_done", "sample_id": sample_id,
                 "completion": completion, "stopped_early": stopped_early,
                 "completion_tokens": decoded.tokens.len(),
                 "finish_reason": finish_reason(decoded.stop),
-            }))?;
+            }));
         }
-        w.event_line(&json!({ "kind": "eval_done" }))?;
+        sw.event_line(&json!({ "kind": "eval_done" }));
         Ok(())
     })();
     if let Err(e) = &run {
-        let _ = w.event_line(&json!({ "kind": "eval_error", "error": format!("{e:#}") }));
+        sw.event_line(&json!({ "kind": "eval_error", "error": format!("{e:#}") }));
+    }
+    let (w, write_err) = sw.finish()?;
+    if let Some(e) = write_err {
+        eprintln!("[eval: client went away: {e}]");
     }
     w.finish()?;
     run
@@ -987,10 +990,6 @@ impl ChunkedWriter {
     }
 
     /// One JSONL line.
-    fn event_line(&mut self, v: &Value) -> std::io::Result<()> {
-        self.raw(&format!("{v}\n"))
-    }
-
     fn finish(mut self) -> Result<()> {
         self.w.write_all(b"0\r\n\r\n")?;
         self.w.flush()?;
@@ -999,6 +998,91 @@ impl ChunkedWriter {
 }
 
 // ---- small helpers -----------------------------------------------------------
+
+/// A [`ChunkedWriter`] driven from its own thread, so the thread running the
+/// decode never blocks on the socket (issue #702 reopened: `lfm2-chat` moved
+/// its print off the hot thread in `352e8129`; this is the same seam for the
+/// server). Payloads are complete wire fragments (`data: …\n\n`, or a JSONL
+/// line) queued through an unbounded channel — the queue is the slack a slow
+/// client gets, the ring's own slack window being the other half. A write
+/// error is latched and reported by [`Self::client_gone`], which the decode's
+/// callback reads to stop the run; [`Self::finish`] drains the queue, joins
+/// the thread and hands the writer back for the trailer.
+struct StreamWriter {
+    tx: Option<std::sync::mpsc::Sender<String>>,
+    gone: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<(ChunkedWriter, Option<std::io::Error>)>>,
+}
+
+impl StreamWriter {
+    fn start(mut w: ChunkedWriter) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let gone = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&gone);
+        let thread = std::thread::spawn(move || {
+            let mut err = None;
+            for payload in rx {
+                if err.is_some() {
+                    continue;
+                }
+                if let Err(e) = w.raw(&payload) {
+                    flag.store(true, Ordering::Release);
+                    err = Some(e);
+                }
+            }
+            (w, err)
+        });
+        Self {
+            tx: Some(tx),
+            gone,
+            thread: Some(thread),
+        }
+    }
+
+    /// Queue one SSE event.
+    fn event(&self, v: &Value) {
+        self.send(format!("data: {v}\n\n"));
+    }
+
+    /// Queue one JSONL line.
+    fn event_line(&self, v: &Value) {
+        self.send(format!("{v}\n"));
+    }
+
+    fn send(&self, payload: String) {
+        if let Some(tx) = &self.tx {
+            // A closed receiver means the thread is gone, which `gone` reports.
+            let _ = tx.send(payload);
+        }
+    }
+
+    /// The client stopped reading: a write failed on the writer thread.
+    fn client_gone(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
+
+    /// Drain what is queued, stop the thread, and return the writer with the
+    /// first write error, if any.
+    fn finish(mut self) -> Result<(ChunkedWriter, Option<std::io::Error>)> {
+        drop(self.tx.take());
+        let handle = self
+            .thread
+            .take()
+            .context("stream writer already finished")?;
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("the stream writer thread panicked"))
+    }
+}
+
+impl Drop for StreamWriter {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
+}
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -1036,7 +1120,14 @@ fn usage(prompt: usize, completion: usize) -> Value {
 /// is the sum of the loop's steps — the decode window, prefill excluded.
 fn timings(prompt: usize, d: &Decoded, elapsed: std::time::Duration) -> Value {
     let st = &d.stats;
-    let predicted_ms = st.step_ns.iter().sum::<u64>() as f64 / 1e6;
+    // Release builds compile the per-step clock out (`step_ns` is empty, since
+    // `6c33cd89`), so the decode's window is the request's wall minus the
+    // prompt's submit — the same coarse figure `lfm2-chat` reports.
+    let predicted_ms = if st.step_ns.is_empty() {
+        (engine::ms(elapsed) - st.prefill_ns as f64 / 1e6).max(0.0)
+    } else {
+        st.step_ns.iter().sum::<u64>() as f64 / 1e6
+    };
     let n = d.tokens.len();
     json!({
         "prompt_n": prompt,

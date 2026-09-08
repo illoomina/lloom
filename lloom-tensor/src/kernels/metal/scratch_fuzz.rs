@@ -51,15 +51,14 @@
 //!   always 8, so a defect proportional to either is not multiplied by a
 //!   constant the model shares.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "fuzzing"))]
 
 use super::scratch::*;
 use super::{align_up, ARENA_ALIGNMENT};
-use proptest::prelude::*;
 
 /// LFM2's attention layer count (§5.3: attention at 2, 5, 9, 13, 17, 21, 24,
 /// 27), used where a run wants the shipping shape rather than a drawn one.
-const LFM2_ATTENTION_LAYERS: usize = 8;
+pub const LFM2_ATTENTION_LAYERS: usize = 8;
 
 /// §5.2's `max_position_embeddings`.
 const MAX_CONTEXT: usize = 131_072;
@@ -223,7 +222,8 @@ pub struct Transitions {
 }
 
 impl Transitions {
-    fn merge(&mut self, o: &Transitions) {
+    /// Fold another run's counts in (a campaign's total).
+    pub fn merge(&mut self, o: &Transitions) {
         self.crossed_chunk_boundary += o.crossed_chunk_boundary;
         self.crossed_bucket_rung += o.crossed_bucket_rung;
         self.reserve_refused += o.reserve_refused;
@@ -500,6 +500,13 @@ pub fn run_sequence(
     }
     Ok(t)
 }
+
+// The generator and the properties: test-only, because proptest is a
+// dev-dependency and the model above is also driven by `lloom-fuzz` (#706).
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
 // The generator.
@@ -862,4 +869,5 @@ fn the_driver_reports_a_divergence_when_the_model_is_wrong() {
         unaligned.check_disjoint().is_err(),
         "check_disjoint accepted a 64 B-aligned offset"
     );
+}
 }

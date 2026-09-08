@@ -173,9 +173,93 @@ pub struct Decoded {
 /// therefore passes the growing conversation each time and pays only for the
 /// new turn; a fresh session with an empty cache prefills everything, which is
 /// what every request did before #677.
+/// The token rings a serving process keeps across requests, one per EOS set.
+///
+/// A [`Ring`] is a wrapping history of `RING_HISTORY_SLOTS` plus the consumer
+/// slack (32 MiB by default, ~2 050 zero-filled segments): building one is
+/// ~35 ms of `Tensor::zeros` and a `synchronize` (issue #702, §11.5y's TTFT
+/// finding), and its capacity is its live window, not the generation, so one
+/// ring serves every run — mapped, which is also the fast drain (a history
+/// sized past `RING_HISTORY_SLOTS` is not CPU-mapped and snapshots on every
+/// drain). What a ring cannot change after construction is its EOS set
+/// (uploaded once, read by the `eos_index` kernel), so the pool is keyed on
+/// it; a serving binary holds two — the checkpoint's EOS ids and the
+/// never-EOS set its throughput cells use.
+///
+/// Built on first use, or ahead of it by [`RingPool::prepare`] at load, so no
+/// request pays the construction inside its own latency.
+#[derive(Default)]
+pub struct RingPool {
+    rings: Vec<(Vec<u32>, EosRead, Ring)>,
+}
+
+// SAFETY: a `Ring` is `!Send` only through `SegmentedRing::seg_bases`
+// (`readback.rs`), a cache of `*const u32` CPU mappings of Metal buffers the
+// ring itself owns — a mapping is valid from any thread for as long as its
+// buffer lives, and the buffer moves with the pool. Nothing in a ring is
+// thread-affine (no TLS, no Metal object that must be used on its creating
+// thread). A pool is driven by one thread at a time — a serving binary keeps
+// it behind the engine's mutex and hands it to whichever request thread holds
+// the lock — which is the same discipline the sequence beside it already has.
+unsafe impl Send for RingPool {}
+
+impl RingPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The ring for `eos_ids` under `eos`, built if the pool has none.
+    pub fn ring(&mut self, eos_ids: &[u32], device: &Device, eos: EosRead) -> Result<&mut Ring> {
+        let key = Self::key(eos_ids);
+        let at = match self
+            .rings
+            .iter()
+            .position(|(k, e, _)| *k == key && *e == eos)
+        {
+            Some(i) => i,
+            None => {
+                let ring = Ring::new(&key, device, RING_HISTORY_SLOTS, eos)?;
+                self.rings.push((key, eos, ring));
+                self.rings.len() - 1
+            }
+        };
+        Ok(&mut self.rings[at].2)
+    }
+
+    /// Build the ring for `eos_ids` now; `true` if this call built it.
+    pub fn prepare(&mut self, eos_ids: &[u32], device: &Device, eos: EosRead) -> Result<bool> {
+        let before = self.rings.len();
+        self.ring(eos_ids, device, eos)?;
+        Ok(self.rings.len() > before)
+    }
+
+    pub fn len(&self) -> usize {
+        self.rings.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rings.is_empty()
+    }
+
+    /// An EOS *set*: order and repeats do not change what the ring stops on.
+    fn key(eos_ids: &[u32]) -> Vec<u32> {
+        let mut k = eos_ids.to_vec();
+        k.sort_unstable();
+        k.dedup();
+        k
+    }
+}
+
+/// The EOS read the crown arm's ring takes: the poll, on the platform's
+/// default mechanism (`Wfe` on aarch64).
+pub fn ring_eos_read() -> EosRead {
+    EosRead::Poll(PollMechanism::default())
+}
+
 pub struct DecodeSession<'m, M: CausalLM> {
     session: Session<'m, M>,
     device: Device,
+    rings: RingPool,
 }
 
 impl<'m, M: CausalLM> DecodeSession<'m, M> {
@@ -187,15 +271,37 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         DecodeSession {
             session: Session::with_pos(model, cache, pos),
             device,
+            rings: RingPool::new(),
         }
     }
 
     /// Drive a sequence a serving layer held across requests ([`crate::SlotPool`]).
     pub fn from_sequence(model: &'m M, seq: Sequence<M::Cache>, device: Device) -> Self {
+        Self::from_parts(model, seq, device, RingPool::new())
+    }
+
+    /// Resume a sequence with the rings an earlier session built, so a serving
+    /// process pays a ring's construction once, not once per request.
+    pub fn from_parts(
+        model: &'m M,
+        seq: Sequence<M::Cache>,
+        device: Device,
+        rings: RingPool,
+    ) -> Self {
         DecodeSession {
             session: Session::from_sequence(model, seq),
             device,
+            rings,
         }
+    }
+
+    /// The sequence and the rings, to hand to the next session.
+    pub fn into_parts(self) -> (Sequence<M::Cache>, RingPool) {
+        (self.session.into_sequence(), self.rings)
+    }
+
+    pub fn rings(&mut self) -> &mut RingPool {
+        &mut self.rings
     }
 
     /// Give the sequence back, to be held until the next request.
@@ -360,16 +466,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 lookahead,
                 commit_steps,
             } => {
-                // Sized for the whole generation; past `RING_HISTORY_SLOTS` the
-                // history is no longer CPU-mapped and each drain synchronises
-                // (`readback.rs`), which is a slower run and not a refusal.
-                let capacity = params.max_tokens.saturating_add(1).max(RING_HISTORY_SLOTS);
-                let mut readback = Ring::new(
-                    &params.eos_ids,
-                    &self.device,
-                    capacity,
-                    EosRead::Poll(PollMechanism::default()),
-                )?;
+                // The pool's ring for this EOS set: built once per process (or
+                // at load, `RingPool::prepare`) and reused by every run.
+                let readback = self
+                    .rings
+                    .ring(&params.eos_ids, &self.device, ring_eos_read())?;
                 let opts = DecodeOptions {
                     max_tokens: params.max_tokens,
                     budget: if commit_steps <= 1 {
@@ -386,7 +487,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 };
                 self.session.decode_until(
                     &mut spec,
-                    &mut readback,
+                    readback,
                     &mut sampler,
                     &prepared.suffix,
                     &opts,
@@ -432,6 +533,16 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pool keys on the EOS *set*: a run that names the ids in another
+    /// order, or twice, reuses the ring built for the first.
+    #[test]
+    fn the_pool_keys_on_the_eos_set() {
+        assert_eq!(RingPool::key(&[7, 2, 7, 2, 9]), vec![2, 7, 9]);
+        assert_eq!(RingPool::key(&[9, 2, 7]), RingPool::key(&[2, 7, 9]));
+        assert_ne!(RingPool::key(&[2, 7]), RingPool::key(&[2, 7, 9]));
+        assert!(RingPool::new().is_empty());
+    }
 
     /// The decode session drives any `CausalLM`. Reachability the way §3.1c
     /// asks: a real end-to-end run needs weights (that is the `lfm2-smoke`

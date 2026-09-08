@@ -139,19 +139,24 @@ impl CommandBuffer {
         use block2::RcBlock;
         use std::ptr::NonNull;
 
-        if !crate::kernels::metal::profile::enabled() {
+        use crate::kernels::metal::profile;
+        if !profile::enabled() {
             return;
         }
-        let block = RcBlock::new(|cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+        // The commit stamp and the step are taken HERE, on the committing
+        // thread and in commit order -- the handler runs later, on Metal's
+        // thread, when neither is knowable. Registration immediately precedes
+        // the `commit` at both call sites, so the stamp reads a few
+        // microseconds early (issue #702: the bias is toward "seam").
+        let committed = profile::now_s();
+        let step = profile::current_step();
+        let block = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // SAFETY: Metal hands the completed command buffer to its own
             // completion handler, so the pointer is valid and non-null for the
             // duration of the call. Only the two timing properties are read,
             // and both are plain scalars valid in the completed state.
             let cb = unsafe { cb.as_ref() };
-            crate::kernels::metal::profile::record_command_buffer(
-                cb.GPUStartTime(),
-                cb.GPUEndTime(),
-            );
+            profile::record_command_buffer(cb.GPUStartTime(), cb.GPUEndTime(), committed, step);
         });
         unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
     }

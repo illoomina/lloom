@@ -1,0 +1,110 @@
+# The LibAFL campaign over the engine's stateful fuzzers (lloom #706).
+#
+# Its own workspace, deliberately: the harnesses are built with SanitizerCoverage
+# passes on EVERY target crate (`.cargo/config.toml`), a build the engine's own
+# workspace never wants in its `target/`, and `libafl` pulls a dependency tree the
+# engine never links. The engine crates come in by path with their `fuzzing`
+# feature on, which is the one seam this crate needs from them: the fuzz models
+# outside `#[cfg(test)]`, and the tile poison written in a release build.
+[workspace]
+
+[package]
+name = "lloom-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "LibAFL harnesses over lloom's stateful fuzz models"
+
+[dependencies]
+lloom = { path = "../lloom", features = ["fuzzing"] }
+lloom-tensor = { path = "../lloom-tensor", features = ["fuzzing"] }
+libafl = "0.16.1"
+libafl_bolts = "0.16.1"
+libafl_targets = { version = "0.16.1", features = ["sancov_pcguard_hitcounts"] }
+anyhow = "1"
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+
+[features]
+default = []
+# Forwarded so one `--features metal` builds the engine's Metal backend; the
+# four in-crate Metal targets need it (`required-features` below).
+metal = ["lloom/metal", "lloom-tensor/metal"]
+# The cmplog arm: the same instrumentation flags (every build carries the
+# `-sanitizer-coverage-trace-compares` hooks), but here `libafl_targets`
+# provides them and fills the cmplog map; without it `src/cmp_stubs.rs` provides
+# empty hooks so the regular build links.
+cmplog = ["libafl_targets/sancov_cmplog", "libafl_targets/cmplog"]
+
+# Release codegen, as the engine ships it (`../Cargo.toml` [profile.release]):
+# opt-level 3, one codegen unit, LTO. Two arms because §14.5c measured thin LTO
+# deleting a null-pointer check outright, and a fuzzer that only ever sees one
+# LTO mode cannot say which mode a finding belongs to. `debug = 1` keeps line
+# tables for the crash report; it changes no codegen.
+[profile.fuzz-thin]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+panic = "abort"
+
+[profile.fuzz-fat]
+inherits = "fuzz-thin"
+lto = "fat"
+
+# The ASan arm: release codegen with LTO OFF, because the SanitizerCoverage
+# module constructor does not survive `-Zsanitizer=address` + LTO on
+# aarch64-apple-darwin (`ld: initializer pointer has no target in
+# ...ctor...rcgu.o`, measured on fuzz-thin; `issue-706-raw/probes.log`).
+# §15.1k's `sanitize` profile held LTO off for a different reason; the same
+# setting is what links here.
+#
+#     RUSTFLAGS="-Zsanitizer=address" cargo +nightly build --profile fuzz-asan \
+#         --target-dir target-asan --bin fuzz_kv_slot --bin fuzz_token_ring
+[profile.fuzz-asan]
+inherits = "fuzz-thin"
+lto = "off"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[[bin]]
+name = "fuzz_token_ring"
+path = "src/bin/fuzz_token_ring.rs"
+
+[[bin]]
+name = "fuzz_kv_slot"
+path = "src/bin/fuzz_kv_slot.rs"
+
+[[bin]]
+name = "fuzz_kv_pages"
+path = "src/bin/fuzz_kv_pages.rs"
+
+[[bin]]
+name = "fuzz_buffer_pool"
+path = "src/bin/fuzz_buffer_pool.rs"
+required-features = ["metal"]
+
+[[bin]]
+name = "fuzz_commands"
+path = "src/bin/fuzz_commands.rs"
+required-features = ["metal"]
+
+[[bin]]
+name = "fuzz_scratch"
+path = "src/bin/fuzz_scratch.rs"
+required-features = ["metal"]
+
+[[bin]]
+name = "fuzz_cb_liveness"
+path = "src/bin/fuzz_cb_liveness.rs"
+required-features = ["metal"]
+
+# The persistent record's validation target: a planted state-carryover
+# failure (see the file). Not a fuzzer over the engine.
+[[bin]]
+name = "record_selftest"
+path = "src/bin/record_selftest.rs"

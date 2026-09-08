@@ -94,3 +94,13 @@ cold prefill), `--no-warmup`, `--cpu`, `--model-name`.
 
 One request at a time. Concurrent requests queue on the engine; B>1 is #694's
 batched forward and not this binary's.
+
+Two things a request never pays for (#702): the token ring — 32 MiB of
+consumer slack, ~35 ms to build — is built **once per EOS set at load**
+(`[rings: 2 built at load …]`; `RingPool` in `decode.rs`, keyed on the EOS
+set because the ring uploads it once) and reused by every run, its history
+wrapping (a ring's capacity is its live window, not the generation); and the
+streaming writes (`/v1/*` SSE, `/eval` JSONL) go through a **writer thread**
+(`StreamWriter` in `main.rs`), so the thread running the decode never blocks
+on the socket — a client that stops reading stalls the queue, not the GPU,
+and one that goes away stops the run at the next drained batch.

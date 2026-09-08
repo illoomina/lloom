@@ -53,6 +53,19 @@ panic = "abort"
 inherits = "fuzz-thin"
 lto = "fat"
 
+# The ASan arm: release codegen with LTO OFF, because the SanitizerCoverage
+# module constructor does not survive `-Zsanitizer=address` + LTO on
+# aarch64-apple-darwin (`ld: initializer pointer has no target in
+# ...ctor...rcgu.o`, measured on fuzz-thin; `issue-706-raw/probes.log`).
+# §15.1k's `sanitize` profile held LTO off for a different reason; the same
+# setting is what links here.
+#
+#     RUSTFLAGS="-Zsanitizer=address" cargo +nightly build --profile fuzz-asan \
+#         --target-dir target-asan --bin fuzz_kv_slot --bin fuzz_token_ring
+[profile.fuzz-asan]
+inherits = "fuzz-thin"
+lto = "off"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -89,3 +102,9 @@ required-features = ["metal"]
 name = "fuzz_cb_liveness"
 path = "src/bin/fuzz_cb_liveness.rs"
 required-features = ["metal"]
+
+# The persistent record's validation target: a planted state-carryover
+# failure (see the file). Not a fuzzer over the engine.
+[[bin]]
+name = "record_selftest"
+path = "src/bin/record_selftest.rs"

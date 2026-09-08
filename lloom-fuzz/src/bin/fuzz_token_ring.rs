@@ -17,14 +17,18 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let devs: Vec<Device> = match args.device.as_str() {
-        "cpu" => vec![Device::Cpu],
-        "metal" => vec![Device::new_metal(0)?],
-        _ => devices(),
-    };
+    let which = args.device.clone();
+    // Devices are created on the first execution, in the process that
+    // executes (see fuzz_cb_liveness.rs).
+    let devs: std::cell::OnceCell<Vec<Device>> = std::cell::OnceCell::new();
     lloom_fuzz::campaign::run(&args.cli, "token_ring", move |bytes| {
         let ops = lloom_fuzz::decode::token_ring(bytes);
-        for d in &devs {
+        let devs = devs.get_or_init(|| match which.as_str() {
+            "cpu" => vec![Device::Cpu],
+            "metal" => vec![Device::new_metal(0).expect("a Metal device")],
+            _ => devices(),
+        });
+        for d in devs {
             run_sequence(d, &ops).map_err(|e| format!("{d:?}: {e}"))?;
         }
         Ok(())

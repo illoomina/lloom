@@ -281,7 +281,12 @@ pub fn scratch(bytes: &[u8]) -> ScratchCase {
 
 /// The paged pool's alphabet (`crate::kv_pages_model::Op`), with the fixture.
 #[cfg(feature = "metal")]
-pub fn kv_pages(bytes: &[u8]) -> (crate::kv_pages_model::Fixture, Vec<crate::kv_pages_model::Op>) {
+pub fn kv_pages(
+    bytes: &[u8],
+) -> (
+    crate::kv_pages_model::Fixture,
+    Vec<crate::kv_pages_model::Op>,
+) {
     use crate::kv_pages_model::{Fixture, Op};
     let mut r = Reader::new(bytes);
     let fixture = Fixture {

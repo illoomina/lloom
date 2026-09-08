@@ -17,9 +17,11 @@ unretained command buffers.
 
 ## Build
 
-This crate is its own workspace, built with SanitizerCoverage on **every**
-target crate through `.cargo/config.toml` (`--target` is what keeps the flags
-off the host build scripts). Two LTO arms of the release codegen:
+This crate is its own workspace. SanitizerCoverage goes on the engine crates
+and this crate's own code — and on nothing else — through `sancov-wrapper.sh`,
+the `rustc-wrapper` in `.cargo/config.toml` keyed on `--crate-name` (rustc has
+no allowlist; instrumenting every dependency measured 1.18 M guards for a 2 MiB
+map scanned per execution). Two LTO arms of the release codegen:
 
 ```sh
 cd candle/lloom-fuzz
@@ -49,11 +51,12 @@ corpus through one LLMP broker — AFL++'s `-M`/`-S` in substance:
 LLOOM_FUZZ_MAIN=target/aarch64-apple-darwin/fuzz-thin-cmplog   # wherever the cmplog build went
 $LLOOM_FUZZ_MAIN/fuzz_kv_pages --cores 0 --port 1337 --corpus out/kv_pages/corpus --solutions out/kv_pages/solutions
 # terminal 2: the secondary, joins the broker
-target/aarch64-apple-darwin/fuzz-thin/fuzz_kv_pages --cores 1 --port 1337 --no-broker --corpus out/kv_pages/corpus --solutions out/kv_pages/solutions
+target/aarch64-apple-darwin/fuzz-thin/fuzz_kv_pages --cores 1 --port 1337 --broker false --corpus out/kv_pages/corpus --solutions out/kv_pages/solutions
 ```
 
-(Two builds with the same profile name overwrite each other's binaries; copy
-the cmplog build aside, or use `--target-dir`.)
+(Two builds with the same profile name overwrite each other's binaries; give
+the cmplog build `--target-dir target-cmplog`. `--client-log FILE` captures the
+clients' stdout/stderr, which the launcher otherwise silences.)
 
 Run campaigns under `lloom-arb share` so they never silently perturb a
 measurement (`CONTRIBUTING.md` §3.2b).
@@ -71,7 +74,12 @@ fuzz_cb_liveness --cb unretained --once  out/solutions/<id>          # the crash
 ```
 
 A failure that reproduces from the record and not from the single input is a
-state-carryover failure — the class the record exists for.
+state-carryover failure — the class the record exists for. `record_selftest`
+is the mechanism's validation target: a *planted* dependency (an input whose
+first byte is `0x43` fails iff the previous input's first byte was `0x42`),
+labelled as such because no engine harness carries state across inputs.
+Measured: the campaign's solution replays clean under `--once`; the record
+(9 inputs, `0006.bin` = `42…`, `0007.bin` = `43…`) fails at input 7.
 
 ## Poisons
 

@@ -109,6 +109,10 @@ pub struct Cli {
     /// Do not refuse an uninstrumented binary (for the positive control).
     #[arg(long)]
     pub allow_uninstrumented: bool,
+    /// Redirect the clients' stdout and stderr to this file (the launcher
+    /// silences them otherwise); the in-process crash report lands here.
+    #[arg(long)]
+    pub client_log: Option<PathBuf>,
 }
 
 /// The guards SanitizerCoverage reported at init, and the map they index.
@@ -168,6 +172,9 @@ where
 
     let harness = Rc::new(RefCell::new(harness));
 
+    if cli.once.is_some() || cli.replay.is_some() {
+        Record::install_crash_dump();
+    }
     if let Some(path) = &cli.once {
         let bytes = std::fs::read(path).with_context(|| path.display().to_string())?;
         record.push(&bytes);
@@ -178,7 +185,10 @@ where
             }
             Err(m) => {
                 let dir = record.dump(&m);
-                Err(anyhow!("oracle failure on {}: {m}\nrecord: {dir:?}", path.display()))
+                Err(anyhow!(
+                    "oracle failure on {}: {m}\nrecord: {dir:?}",
+                    path.display()
+                ))
             }
         };
     }
@@ -212,119 +222,134 @@ where
     let config_name = format!("{name}-{}", arm());
     let record = Record;
 
-    let mut run_client = |state: Option<_>, mut mgr, _client: ClientDescription| -> Result<(), Error> {
-        let edges_observer =
-            HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") }).track_indices();
-        let time_observer = TimeObserver::new("time");
-        let map_feedback = MaxMapFeedback::new(&edges_observer);
-        let calibration = CalibrationStage::new(&map_feedback);
-        let mut feedback = feedback_or!(map_feedback, TimeFeedback::new(&time_observer));
-        let mut objective = feedback_or_fast!(CrashFeedback::new(), TimeoutFeedback::new());
+    let mut run_client =
+        |state: Option<_>, mut mgr, _client: ClientDescription| -> Result<(), Error> {
+            let edges_observer =
+                HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") })
+                    .track_indices();
+            let time_observer = TimeObserver::new("time");
+            let map_feedback = MaxMapFeedback::new(&edges_observer);
+            let calibration = CalibrationStage::new(&map_feedback);
+            let mut feedback = feedback_or!(map_feedback, TimeFeedback::new(&time_observer));
+            let mut objective = feedback_or_fast!(CrashFeedback::new(), TimeoutFeedback::new());
 
-        let mut state = match state {
-            Some(s) => s,
-            None => StdState::new(
-                StdRand::with_seed(current_nanos()),
-                InMemoryOnDiskCorpus::new(&cli.corpus)?,
-                OnDiskCorpus::new(&cli.solutions)?,
-                &mut feedback,
-                &mut objective,
-            )?,
-        };
-        state.set_max_size(cli.max_len);
+            let mut state = match state {
+                Some(s) => s,
+                None => StdState::new(
+                    StdRand::with_seed(current_nanos()),
+                    InMemoryOnDiskCorpus::new(&cli.corpus)?,
+                    OnDiskCorpus::new(&cli.solutions)?,
+                    &mut feedback,
+                    &mut objective,
+                )?,
+            };
+            state.set_max_size(cli.max_len);
 
-        let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
-        let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
+            let scheduler =
+                IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
+            let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-        let h = Rc::clone(&harness);
-        let mut exec_harness = |input: &BytesInput| -> ExitKind {
-            let bytes = input.target_bytes();
-            let bytes: &[u8] = &bytes;
-            record.push(bytes);
-            match (h.borrow_mut())(bytes) {
-                Ok(()) => ExitKind::Ok,
-                Err(m) => {
-                    let dir = record.dump(&m);
-                    eprintln!("[{name}] oracle failure: {m}\n[{name}] record: {dir:?}");
-                    ExitKind::Crash
-                }
-            }
-        };
-        #[allow(deprecated)]
-        let mut executor = InProcessExecutor::with_timeout(
-            &mut exec_harness,
-            tuple_list!(edges_observer, time_observer),
-            &mut fuzzer,
-            &mut state,
-            &mut mgr,
-            timeout,
-        )?;
-
-        if state.must_load_initial_inputs() {
-            match &cli.seeds {
-                Some(dir) if dir.is_dir() => {
-                    state.load_initial_inputs(&mut fuzzer, &mut executor, &mut mgr, &[dir.clone()])?;
-                }
-                _ => {
-                    let mut generator = RandBytesGenerator::new(
-                        std::num::NonZeroUsize::new(64).expect("64 is non-zero"),
-                    );
-                    state.generate_initial_inputs(
-                        &mut fuzzer,
-                        &mut executor,
-                        &mut generator,
-                        &mut mgr,
-                        8,
-                    )?;
-                }
-            }
-            println!("[{name}] corpus: {} input(s)", state.corpus().count());
-        }
-
-        let mutational = StdMutationalStage::new(HavocScheduledMutator::new(havoc_mutations()));
-
-        #[cfg(feature = "cmplog")]
-        {
-            use libafl::mutators::token_mutations::I2SRandReplace;
-            use libafl::stages::TracingStage;
-            use libafl_targets::CmpLogObserver;
-
-            let cmplog_observer = CmpLogObserver::new("cmplog", true);
-            let h2 = Rc::clone(&harness);
-            let mut trace_harness = |input: &BytesInput| -> ExitKind {
+            let h = Rc::clone(&harness);
+            let mut exec_harness = |input: &BytesInput| -> ExitKind {
                 let bytes = input.target_bytes();
-                match (h2.borrow_mut())(&bytes) {
+                let bytes: &[u8] = &bytes;
+                record.push(bytes);
+                match (h.borrow_mut())(bytes) {
                     Ok(()) => ExitKind::Ok,
-                    Err(_) => ExitKind::Crash,
+                    Err(m) => {
+                        let dir = record.dump(&m);
+                        eprintln!("[{name}] oracle failure: {m}\n[{name}] record: {dir:?}");
+                        ExitKind::Crash
+                    }
                 }
             };
             #[allow(deprecated)]
-            let tracer = InProcessExecutor::with_timeout(
-                &mut trace_harness,
-                tuple_list!(cmplog_observer),
+            let mut executor = InProcessExecutor::with_timeout(
+                &mut exec_harness,
+                tuple_list!(edges_observer, time_observer),
                 &mut fuzzer,
                 &mut state,
                 &mut mgr,
                 timeout,
             )?;
-            let tracing = TracingStage::new(tracer);
-            let i2s = StdMutationalStage::new(HavocScheduledMutator::new(tuple_list!(
-                I2SRandReplace::new()
-            )));
-            let mut stages = tuple_list!(calibration, tracing, i2s, mutational);
-            fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
-        }
-        #[cfg(not(feature = "cmplog"))]
-        {
-            let mut stages = tuple_list!(calibration, mutational);
-            fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
-        }
-        Ok(())
-    };
+            // After the executor: LibAFL has installed its crash handlers and its
+            // panic hook, and ours must run first and chain to them.
+            Record::install_crash_dump();
+
+            if state.must_load_initial_inputs() {
+                match &cli.seeds {
+                    Some(dir) if dir.is_dir() => {
+                        state.load_initial_inputs(
+                            &mut fuzzer,
+                            &mut executor,
+                            &mut mgr,
+                            &[dir.clone()],
+                        )?;
+                    }
+                    _ => {
+                        let mut generator = RandBytesGenerator::new(
+                            std::num::NonZeroUsize::new(64).expect("64 is non-zero"),
+                        );
+                        state.generate_initial_inputs(
+                            &mut fuzzer,
+                            &mut executor,
+                            &mut generator,
+                            &mut mgr,
+                            8,
+                        )?;
+                    }
+                }
+                println!("[{name}] corpus: {} input(s)", state.corpus().count());
+            }
+
+            let mutational = StdMutationalStage::new(HavocScheduledMutator::new(havoc_mutations()));
+
+            #[cfg(feature = "cmplog")]
+            {
+                use libafl::mutators::token_mutations::I2SRandReplace;
+                use libafl::stages::TracingStage;
+                use libafl_targets::CmpLogObserver;
+
+                let cmplog_observer = CmpLogObserver::new("cmplog", true);
+                let h2 = Rc::clone(&harness);
+                let mut trace_harness = |input: &BytesInput| -> ExitKind {
+                    let bytes = input.target_bytes();
+                    match (h2.borrow_mut())(&bytes) {
+                        Ok(()) => ExitKind::Ok,
+                        Err(_) => ExitKind::Crash,
+                    }
+                };
+                #[allow(deprecated)]
+                let tracer = InProcessExecutor::with_timeout(
+                    &mut trace_harness,
+                    tuple_list!(cmplog_observer),
+                    &mut fuzzer,
+                    &mut state,
+                    &mut mgr,
+                    timeout,
+                )?;
+                let tracing = TracingStage::new(tracer);
+                let i2s = StdMutationalStage::new(HavocScheduledMutator::new(tuple_list!(
+                    I2SRandReplace::new()
+                )));
+                let mut stages = tuple_list!(calibration, tracing, i2s, mutational);
+                fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
+            }
+            #[cfg(not(feature = "cmplog"))]
+            {
+                let mut stages = tuple_list!(calibration, mutational);
+                fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
+            }
+            Ok(())
+        };
 
     let cores = Cores::from_cmdline(&cli.cores).map_err(|e| anyhow!("--cores: {e}"))?;
+    if cli.broker {
+        remove_stale_shmem_server_socket();
+    }
     let shmem_provider = StdShMemProvider::new().map_err(|e| anyhow!("shmem: {e}"))?;
     let monitor = MultiMonitor::new(|s| println!("{s}"));
+    let client_log: Option<String> = cli.client_log.as_ref().map(|p| p.display().to_string());
     let result = Launcher::builder()
         .shmem_provider(shmem_provider)
         .configuration(EventConfig::from_name(&config_name))
@@ -333,11 +358,40 @@ where
         .cores(&cores)
         .broker_port(cli.port)
         .spawn_broker(cli.broker)
-        .stdout_file(None)
+        // Re-execute the binary for each client rather than fork it: a forked
+        // child inherits the parent's Metal device and command queue, and
+        // every execution then dies in the driver (measured: 2 252 of 2 252
+        // executions were "objectives" on the first cb_liveness campaign).
+        // Re-executed clients create their own device in their own `main`.
+        .fork(false)
+        .stdout_file(client_log.as_deref())
+        .stderr_file(client_log.as_deref())
         .build()
         .launch();
     match result {
         Ok(()) | Err(Error::ShuttingDown) => Ok(()),
         Err(e) => Err(anyhow!("launcher: {e}")),
+    }
+}
+
+/// On macOS LibAFL's shared memory goes through a served provider whose unix
+/// socket lives in the working directory (`./libafl_unix_shmem_server`). A
+/// campaign killed by a signal leaves the file behind, and the next launch
+/// then fails with `ConnectionRefused` instead of starting a server (measured
+/// on the second campaign of this crate's life). Remove it iff nothing answers
+/// on it — a live campaign in the same directory keeps its socket.
+fn remove_stale_shmem_server_socket() {
+    let path = std::path::Path::new("./libafl_unix_shmem_server");
+    if !path.exists() {
+        return;
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return;
+    }
+    if std::fs::remove_file(path).is_ok() {
+        eprintln!(
+            "removed a stale {} (nothing was listening on it)",
+            path.display()
+        );
     }
 }

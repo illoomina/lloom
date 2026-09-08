@@ -74,9 +74,13 @@ static RING: std::sync::OnceLock<Ring> = std::sync::OnceLock::new();
 pub struct Record;
 
 impl Record {
-    /// Install the ring: `n` slots of [`MAX_INPUT`] bytes under `dir`, and the
-    /// panic hook and signal handlers that dump it. Idempotent after the first
-    /// call (the first `n`/`dir` win).
+    /// Install the ring: `n` slots of [`MAX_INPUT`] bytes under `dir`.
+    /// Idempotent after the first call (the first `n`/`dir` win). The panic
+    /// hook and the signal handlers are [`Record::install_crash_dump`], called
+    /// separately and AFTER LibAFL's executor has installed its own, so that
+    /// ours run first and chain to theirs -- a handler installed before the
+    /// executor is simply replaced by it (measured: 2 252 objectives and zero
+    /// records on the first Metal campaign).
     pub fn install(dir: &Path, n: usize) -> Record {
         let n = n.max(1);
         RING.get_or_init(|| {
@@ -94,7 +98,6 @@ impl Record {
                 dumping: AtomicBool::new(false),
             }
         });
-        Record::install_crash_dump();
         Record
     }
 
@@ -128,8 +131,8 @@ impl Record {
         Some(dir)
     }
 
-    /// The panic hook and signal handlers. Installed by [`Record::install`];
-    /// exposed so a harness that manages its own ring can still chain them.
+    /// The panic hook and signal handlers. Install AFTER the fuzzer's executor
+    /// exists (see [`Record::install`]); idempotent.
     pub fn install_crash_dump() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
@@ -158,10 +161,7 @@ impl Record {
                     sa.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
                     libc::sigemptyset(&mut sa.sa_mask);
                     if libc::sigaction(sig, &sa, &mut prev) == 0 {
-                        PREV_HANDLERS[sig_index(sig)].store(
-                            prev.sa_sigaction,
-                            Ordering::Release,
-                        );
+                        PREV_HANDLERS[sig_index(sig)].store(prev.sa_sigaction, Ordering::Release);
                     }
                 }
             }
@@ -193,7 +193,39 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         let mut reason = *b"signal 00\n";
         reason[7] = b'0' + ((sig / 10) % 10) as u8;
         reason[8] = b'0' + (sig % 10) as u8;
-        let _ = dump_raw(r, &reason);
+        if let Some(dir) = dump_raw(r, &reason) {
+            // The faulting address and the native backtrace, through
+            // `backtrace_symbols_fd` (libSystem's, writes straight to the fd).
+            // Not strictly async-signal-safe -- it is the last thing this
+            // handler does before chaining, and a crash here loses only the
+            // backtrace, never the record written above.
+            if let Ok(f) = fs::File::create(dir.join("bt.txt")) {
+                use std::os::unix::io::AsRawFd;
+                let fd = f.as_raw_fd();
+                // SAFETY: `info` is the kernel's siginfo for this delivery.
+                let addr = if info.is_null() {
+                    0usize
+                } else {
+                    unsafe { (*info).si_addr as usize }
+                };
+                let mut line = *b"si_addr=0x0000000000000000\n";
+                for i in 0..16 {
+                    let nib = ((addr >> (4 * (15 - i))) & 0xf) as u8;
+                    line[10 + i] = if nib < 10 {
+                        b'0' + nib
+                    } else {
+                        b'a' + nib - 10
+                    };
+                }
+                let _ = (&f).write_all(&line);
+                let mut frames = [std::ptr::null_mut::<libc::c_void>(); 96];
+                // SAFETY: a fixed-size frame buffer; libSystem walks the stack.
+                unsafe {
+                    let n = libc::backtrace(frames.as_mut_ptr(), frames.len() as libc::c_int);
+                    libc::backtrace_symbols_fd(frames.as_ptr(), n, fd);
+                }
+            }
+        }
     }
     // Chain to whatever was installed before us (LibAFL's handler, or the
     // default), so the fuzzer still sees the crash.
@@ -217,6 +249,12 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
 fn dump_raw(r: &Ring, reason: &[u8]) -> Option<PathBuf> {
     if r.dumping.swap(true, Ordering::AcqRel) {
         return None; // re-entrant (a crash inside a dump): leave the first one
+    }
+    if r.pushes.load(Ordering::Acquire) == 0 {
+        // Nothing was executed in this process (the broker, or a client that
+        // died before its first input): a record of nothing is noise.
+        r.dumping.store(false, Ordering::Release);
+        return None;
     }
     let seq = r.dumps.fetch_add(1, Ordering::AcqRel);
     let dir = r.dir.join(format!("record-{}-{seq}", std::process::id()));

@@ -38,11 +38,11 @@
 //! sharing that `Commands`' clock, and the host dropping, draining, trimming and
 //! re-acquiring buffers while copies of them are in flight.
 
+use lloom_tensor::kernels::metal::buffer::Buffer;
 use lloom_tensor::kernels::metal::buffer_pool::{BufferPool, PooledBuffer};
 use lloom_tensor::kernels::metal::commands::{cb_unretained, Commands};
 use lloom_tensor::kernels::metal::device::Device;
 use lloom_tensor::kernels::metal::residency_set::ResidencySet;
-use lloom_tensor::kernels::metal::buffer::Buffer;
 use lloom_tensor::kernels::RESOURCE_OPTIONS;
 use std::sync::Arc;
 
@@ -112,7 +112,8 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
         .new_command_queue()
         .map_err(|e| format!("new_command_queue: {e:?}"))?;
     let residency = Arc::new(ResidencySet::new(dev));
-    let cmds = Commands::new(queue, Arc::clone(&residency)).map_err(|e| format!("Commands::new: {e:?}"))?;
+    let cmds = Commands::new(queue, Arc::clone(&residency))
+        .map_err(|e| format!("Commands::new: {e:?}"))?;
     let pool = BufferPool::with_clock(cmds.clock());
     pool.set_free_poison(Some(FREE_POISON));
 
@@ -127,15 +128,16 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
     // non-zero is a drop of a buffer that may be in flight.
     let mut in_flight_copies = 0usize;
 
-    let verify = |pending: &mut Vec<Pending>, eng: &mut Engagement, at: &str| -> Result<(), String> {
-        for p in pending.drain(..) {
-            // SAFETY: the destination is shared storage the harness owns and
-            // the command buffer that wrote it has completed (the caller waited).
-            let got = unsafe { std::slice::from_raw_parts(p.dst.contents(), p.size) };
-            if let Some(k) = got.iter().position(|&b| b != p.expect) {
-                let bad = got[k];
-                let poison = got.iter().filter(|&&b| b == FREE_POISON).count();
-                return Err(format!(
+    let verify =
+        |pending: &mut Vec<Pending>, eng: &mut Engagement, at: &str| -> Result<(), String> {
+            for p in pending.drain(..) {
+                // SAFETY: the destination is shared storage the harness owns and
+                // the command buffer that wrote it has completed (the caller waited).
+                let got = unsafe { std::slice::from_raw_parts(p.dst.contents(), p.size) };
+                if let Some(k) = got.iter().position(|&b| b != p.expect) {
+                    let bad = got[k];
+                    let poison = got.iter().filter(|&&b| b == FREE_POISON).count();
+                    return Err(format!(
                     "{at}: copy of buffer #{} ({} B, pattern {:#04x}) reads {bad:#04x} at byte {k} \
                      ({poison} poison bytes of {}): {}",
                     p.src_id,
@@ -149,11 +151,11 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
                         "the copy does not match what the host wrote"
                     }
                 ));
+                }
+                eng.copies_verified += 1;
             }
-            eng.copies_verified += 1;
-        }
-        Ok(())
-    };
+            Ok(())
+        };
 
     for (i, op) in ops.iter().enumerate() {
         let at = |what: String| format!("after op {i} ({op:?}): {what}");

@@ -408,8 +408,20 @@ fn op_strategy() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// ONE device per process, not one per case. `Device::system_default()` per
+/// proptest case logged "Context leak detected, CoreAnalytics returned false"
+/// once per case (lloom #706). Recorded beside it, because it is NOT fixed by
+/// this: in a DEBUG build the commands proptest at 4096 cases fails on the
+/// ~476th case with `flush_and_wait` returning `Internal Error (00000206)`,
+/// with or without this cache, while the same 4096 cases pass in `--release`
+/// and the release LibAFL harness runs 1 200 sequences in one process clean
+/// (`issue-706-raw/commands-proptest-4096*.log`). The 48-case default never
+/// reaches it; the debug-only exhaustion is open.
 fn device() -> Device {
-    Device::system_default().expect("no Metal device")
+    static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
+    DEVICE
+        .get_or_init(|| Device::system_default().expect("no Metal device"))
+        .clone()
 }
 
 proptest! {

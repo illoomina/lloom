@@ -174,7 +174,12 @@ pub struct Engagement {
 /// model, checking the partition invariant and every observable after every
 /// operation.
 pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
-    let mut pool = KvPagePool::new(f.page_size, f.pool_pages, f.max_seqs, f.table_capacity_pages);
+    let mut pool = KvPagePool::new(
+        f.page_size,
+        f.pool_pages,
+        f.max_seqs,
+        f.table_capacity_pages,
+    );
     let mut quarantine = PageQuarantine::new();
     let clock = GpuClock::new();
     let mut model = Model::new(f);
@@ -255,7 +260,9 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
                         )));
                     }
                 } else {
-                    got.map_err(|e| at(format!("share_prefix({src}, {dst}, {pages}) refused: {e}")))?;
+                    got.map_err(|e| {
+                        at(format!("share_prefix({src}, {dst}, {pages}) refused: {e}"))
+                    })?;
                     for p in &shared {
                         model.refcount[*p as usize] += 1;
                         model.seqs[dst].0.push(*p);
@@ -356,9 +363,16 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
             Op::Table { seq, k } => {
                 let seq = seq as usize % n_seqs;
                 let table = pool.table_for(seq, k);
-                let want: Vec<PageIdx> = model.seqs[seq].0.iter().copied().step_by(k.max(1)).collect();
+                let want: Vec<PageIdx> = model.seqs[seq]
+                    .0
+                    .iter()
+                    .copied()
+                    .step_by(k.max(1))
+                    .collect();
                 if table != want {
-                    return Err(at(format!("table_for({seq}, {k}) = {table:?}, model {want:?}")));
+                    return Err(at(format!(
+                        "table_for({seq}, {k}) = {table:?}, model {want:?}"
+                    )));
                 }
                 let contiguous = pool.chunk_pages_are_contiguous(seq, k);
                 let want_contig = k.max(1) == 1
@@ -433,9 +447,7 @@ pub fn run_sequence(f: &Fixture, ops: &[Op]) -> Result<Engagement, String> {
             )));
         }
         for s in 0..n_seqs {
-            let sp = pool
-                .seq(s)
-                .ok_or_else(|| at(format!("seq({s}) missing")))?;
+            let sp = pool.seq(s).ok_or_else(|| at(format!("seq({s}) missing")))?;
             let (pages, len) = &model.seqs[s];
             if sp.pages() != pages.as_slice() || sp.len() != *len {
                 return Err(at(format!(
@@ -527,8 +539,14 @@ mod tests {
         assert_eq!(e.pages_allocated, 3);
         assert_eq!(e.pages_quarantined, 2);
         assert_eq!(e.drains_recycling, 1);
-        assert_eq!(e.reuse_after_drain, 1, "the re-append must take a recycled page");
-        assert_eq!(e.tables_non_identity, 1, "a recycled pool's table is not the identity");
+        assert_eq!(
+            e.reuse_after_drain, 1,
+            "the re-append must take a recycled page"
+        );
+        assert_eq!(
+            e.tables_non_identity, 1,
+            "a recycled pool's table is not the identity"
+        );
     }
 
     /// The comparison can fail: a model perturbed by one refcount is caught.

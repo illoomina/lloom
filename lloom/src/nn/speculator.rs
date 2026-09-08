@@ -403,6 +403,16 @@ pub trait Probes<P: TargetProbe>: CausalLM {
     /// copies from, and a drafter that never sees it draws from the generated
     /// tokens alone (`design/docs/speculation.md` §10.2w).
     fn take_probe(&self, cache: &mut Self::Cache) -> Result<P::Output>;
+
+    /// How many probes a forward has discarded untaken so far — a target that
+    /// overwrites its probe per forward reports the count, one that keeps
+    /// none reports 0. The drivers refuse a run in which it moves: a drafter
+    /// seeded past a dropped probe has missed positions, and only the accept
+    /// rate would ever show it.
+    fn probe_drops(&self, cache: &Self::Cache) -> u64 {
+        let _ = cache;
+        0
+    }
 }
 
 /// How [`Session::speculative_round`] brackets its phases.

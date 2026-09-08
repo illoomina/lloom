@@ -1909,6 +1909,11 @@ pub struct Cache {
     /// that does not tap allocates nothing here (§9.1's memory classes are
     /// unmoved).
     taps: Vec<Option<Tensor>>,
+    /// Tap sets a forward cleared before anyone took them. A drafter seeded
+    /// from a cache that dropped a set has missed those positions — the
+    /// defect no gate but the accept rate sees (§10.2n, §10.2w) — so the
+    /// speculative drivers refuse a run in which this moved.
+    taps_dropped: u64,
     /// `Config::tap_layers`, copied so the layer loop can test it without a
     /// `Model` in hand — `conv_state`/`l_cache`'s argument, one field further
     /// out.
@@ -2152,6 +2157,7 @@ impl Cache {
             // per-token path (§15.2 #10 is about lookup, but a realloc in the
             // layer loop is the same shape).
             taps: Vec::with_capacity(config.tap_layers.len()),
+            taps_dropped: 0,
             tap_layers: config.tap_layers.clone(),
             tap_dtype: config.tap_dtype,
             device: device.clone(),
@@ -2183,6 +2189,11 @@ impl Cache {
     pub fn take_taps(&mut self) -> Vec<Tensor> {
         let slots = std::mem::take(&mut self.taps);
         slots.into_iter().flatten().collect()
+    }
+
+    /// How many tap sets a forward has cleared untaken (see `taps_dropped`).
+    pub fn taps_dropped(&self) -> u64 {
+        self.taps_dropped
     }
 
     /// Grow the KV slab in buckets of `bucket` tokens rather than
@@ -5263,6 +5274,12 @@ impl Model {
     /// — the §10.2h shape, where a permutation is algebraically valid and
     /// silently pairs every slice with the wrong block of `W_c`.
     fn begin_taps(cache: &mut Cache) {
+        // A set still here was written by the previous forward and taken by
+        // nobody: counted, because dropping it silently is how a drafter ends
+        // up seeded from part of a prompt.
+        if cache.taps.iter().any(Option::is_some) {
+            cache.taps_dropped += 1;
+        }
         cache.taps.clear();
         cache.taps.resize(cache.tap_layers.len(), None);
     }
@@ -5753,6 +5770,10 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
     fn take_probe(&self, cache: &mut Self::Cache) -> Result<Vec<Tensor>> {
         Ok(cache.take_taps())
     }
+
+    fn probe_drops(&self, cache: &Self::Cache) -> u64 {
+        cache.taps_dropped()
+    }
 }
 
 /// The `KvSlot` sequence fuzzer's alphabet, model and driver (lloom #575),
@@ -6155,8 +6176,8 @@ pub mod kv_slot_fuzz {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::kv_slot_fuzz::*;
+    use super::*;
 
     /// The trait impls dispatch to the inherent entry points, checked at the
     /// bound rather than at a forward pass.

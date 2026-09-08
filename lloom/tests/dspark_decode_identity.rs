@@ -1056,3 +1056,292 @@ fn pipelined_observe_is_keyed_per_sequence() -> Result<()> {
     }
     Ok(())
 }
+
+/// The streamed prefill seeds the drafter from EVERY unit, not the last one.
+///
+/// `prefill_ubatch = 3` on an 8-token prompt runs `decode`'s two units (the
+/// 3-token spark, then the 5-token remainder). The drafter must see one
+/// `observe` per unit before it drafts — 3 rows with an empty accepted tail,
+/// then 5 rows with the prefill's argmax — and the two must sum to the prompt.
+/// A target that overwrites its taps per forward seeds the last unit alone
+/// unless each unit is taken as it lands; that lazily-dropped first unit is
+/// #364's defect (§10.2w) with every digest unmoved, and it fails the row
+/// count here.
+#[test]
+fn decode_speculative_streamed_prefill_seeds_every_unit() -> Result<()> {
+    let dev = Device::Cpu;
+    let k = 4usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 8, 9];
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+
+    let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut session = Session::new(&model, cache);
+    let mut spec = RecordingDrafter {
+        k,
+        drafts: 0,
+        observed: Vec::new(),
+    };
+    let mut rb = Blocking::new(&eos_ids, &dev)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let opts = DecodeOptions {
+        prefill_ubatch: 3,
+        ..DecodeOptions::new(24)
+    };
+    let out = session.decode_speculative(
+        &mut spec,
+        &mut rb,
+        &mut sampler,
+        &prompt,
+        &opts,
+        &eos_ids,
+        &mut |_: &[u32]| Ok(()),
+    )?;
+    assert!(out.ids.len() > k, "the run must span more than one round");
+
+    let seed: Vec<&(usize, usize, Vec<u32>)> = spec
+        .observed
+        .iter()
+        .take_while(|(drafts_before, _, _)| *drafts_before == 0)
+        .collect();
+    assert_eq!(
+        seed.len(),
+        2,
+        "one observe per prefill unit: the spark, then the remainder"
+    );
+    assert_eq!(seed[0].1, 3, "the spark unit's rows");
+    assert!(
+        seed[0].2.is_empty(),
+        "an intermediate unit leaves the anchor where `begin` put it"
+    );
+    assert_eq!(seed[1].1, 5, "the remainder's rows");
+    assert_eq!(
+        seed[1].2,
+        out.ids[..1],
+        "the last unit carries the prefill's argmax"
+    );
+    assert_eq!(
+        seed[0].1 + seed[1].1,
+        prompt.len(),
+        "the seed covers every prompt position"
+    );
+    assert_eq!(
+        spec.observed.len(),
+        out.stats.rounds.len() + 2,
+        "one observe per round, plus the two seed units"
+    );
+    Ok(())
+}
+
+/// Streamed speculative decode is byte-identical to streamed greedy decode:
+/// the target's prefill runs in the same units on both loops, so the same
+/// prompt gives the same ids whichever loop feeds it. (Against the one-shot
+/// greedy stream the streamed arms differ only where the target's own chunked
+/// prefill does — a property of the target, not of the drafter.)
+#[test]
+fn decode_speculative_streamed_is_byte_identical_to_greedy_streamed() -> Result<()> {
+    let dev = Device::Cpu;
+    let k = 4usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    let max_tokens = 40usize;
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+    let ubatch = 4usize;
+
+    let ref_ids = {
+        let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let mut session = Session::new(&model, cache);
+        let mut spec = IdentityProposer;
+        let mut rb = Blocking::new(&eos_ids, &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let opts = DecodeOptions {
+            prefill_ubatch: ubatch,
+            ..DecodeOptions::new(max_tokens)
+        };
+        session
+            .decode(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                &prompt,
+                &opts,
+                &mut |_: &[u32]| Ok(()),
+            )?
+            .ids
+    };
+    assert!(
+        ref_ids.len() > k,
+        "the greedy reference must span more than one round"
+    );
+
+    let spec_ids = {
+        let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        let mut session = Session::new(&model, cache);
+        let mut spec = GarbageDrafter { k, token: 0 };
+        let mut rb = Blocking::new(&eos_ids, &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let opts = DecodeOptions {
+            prefill_ubatch: ubatch,
+            ..DecodeOptions::new(max_tokens)
+        };
+        session
+            .decode_speculative(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                &prompt,
+                &opts,
+                &eos_ids,
+                &mut |_: &[u32]| Ok(()),
+            )?
+            .ids
+    };
+    assert_eq!(spec_ids, ref_ids, "streamed speculative != streamed greedy");
+    Ok(())
+}
+
+/// A target whose every `forward` is two forwards: the second clears the
+/// first's taps untaken, which is exactly "a forward ran between two probes"
+/// — the shape a streamed prefill that skipped a unit's probe would have. It
+/// delegates everything else to the tiny LFM2, so the only thing it changes
+/// is that one drop per forward.
+struct TwiceForward<'a>(&'a lloom::models::lfm2::Model);
+
+impl lloom::nn::Model for TwiceForward<'_> {
+    type Config = Config;
+    fn from_weights(_vb: lloom::nn::VarBuilder, _cfg: &Config) -> Result<Self> {
+        lloom_tensor::bail!("TwiceForward wraps a built model")
+    }
+}
+
+impl lloom::nn::CausalLM for TwiceForward<'_> {
+    type Cache = Cache;
+    fn new_cache(&self, cfg: &Config, dev: &Device) -> Result<Cache> {
+        self.0.new_cache(cfg, dev)
+    }
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.0.embed(tokens)
+    }
+    fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut Cache) -> Result<Tensor> {
+        // The second pass appends the same tokens AFTER the first's, so the
+        // cache stays well-formed (the driver's refusal must be the drop, not
+        // a shape error) and the second pass's `begin_taps` drops the first's.
+        let n = embeds.dim(1)?;
+        let _ = self.0.forward_embeds(embeds, pos, cache)?;
+        self.0.forward_embeds(embeds, pos + n, cache)
+    }
+    fn vocab_size(&self) -> usize {
+        self.0.vocab_size()
+    }
+}
+
+impl lloom::nn::speculator::Probes<LayerTaps<5>> for TwiceForward<'_> {
+    type Pending = lloom::models::lfm2::PendingVerify;
+    fn verify_and_probe(
+        &self,
+        drafts: &[Draft],
+        anchors: &[lloom::nn::speculator::Anchor],
+        cache: &mut Cache,
+    ) -> Result<(Vec<Vec<u32>>, Vec<Tensor>)> {
+        self.0.verify_and_probe(drafts, anchors, cache)
+    }
+    fn verify_enqueue(
+        &self,
+        draft: &Draft,
+        anchor: &lloom::nn::speculator::Anchor,
+        cache: &mut Cache,
+    ) -> Result<Self::Pending> {
+        self.0.verify_enqueue(draft, anchor, cache)
+    }
+    fn verify_complete(
+        &self,
+        pending: Self::Pending,
+        cache: &mut Cache,
+    ) -> Result<(Vec<u32>, Vec<Tensor>)> {
+        self.0.verify_complete(pending, cache)
+    }
+    fn take_probe(&self, cache: &mut Cache) -> Result<Vec<Tensor>> {
+        self.0.take_probe(cache)
+    }
+    fn probe_drops(&self, cache: &Cache) -> u64 {
+        self.0.probe_drops(cache)
+    }
+}
+
+/// A probe a forward clears untaken is counted, and a seed across which the
+/// count moves is refused. Two arms: the counter itself, on a bare cache; and
+/// the refusal, through a target whose every forward is two forwards (the
+/// second drops the first's taps). Taps left by whatever ran BEFORE the seed
+/// — a warmup's, a previous request's — are drained by the seed and do not
+/// refuse anything: the counter is checked across the seed's own probes only.
+#[test]
+fn decode_speculative_refuses_a_seed_that_dropped_a_probe() -> Result<()> {
+    let dev = Device::Cpu;
+    let k = 4usize;
+    let cfg = tiny_config(k);
+    let model = build(&cfg, &dev)?;
+    let eos_ids: Vec<u32> = cfg.eos_token_id.into_iter().collect();
+
+    let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    assert_eq!(cache.taps_dropped(), 0);
+    let taint = Tensor::new(&[1u32, 2, 3], &dev)?.unsqueeze(0)?;
+    model.forward(&taint, 0, &mut cache)?;
+    assert_eq!(cache.taps_dropped(), 0, "the taps are still there, untaken");
+    model.forward(&taint, 3, &mut cache)?;
+    assert_eq!(
+        cache.taps_dropped(),
+        1,
+        "the second forward cleared the first's taps"
+    );
+    let _ = cache.take_taps();
+
+    // Stale taps before the seed are drained, not refused: a warmup's leftovers.
+    {
+        let mut cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+        model.forward(&taint, 0, &mut cache)?;
+        cache.clear();
+        let mut session = Session::new(&model, cache);
+        let mut spec = GarbageDrafter { k, token: 0 };
+        let mut rb = Blocking::new(&eos_ids, &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let out = session.decode_speculative(
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &[4, 5, 6],
+            &DecodeOptions::new(8),
+            &eos_ids,
+            &mut |_: &[u32]| Ok(()),
+        )?;
+        assert!(
+            !out.ids.is_empty(),
+            "a seed over a warmup's leftover taps runs"
+        );
+    }
+
+    // A forward between two of the seed's own probes is refused.
+    let twice = TwiceForward(&model);
+    let cache = Cache::new(true, DType::F32, &cfg, &dev)?;
+    let mut session = Session::new(&twice, cache);
+    let mut spec = GarbageDrafter { k, token: 0 };
+    let mut rb = Blocking::new(&eos_ids, &dev)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let err = session
+        .decode_speculative(
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &[4, 5, 6],
+            &DecodeOptions::new(8),
+            &eos_ids,
+            &mut |_: &[u32]| Ok(()),
+        )
+        .expect_err("a seed over a dropped probe must be refused");
+    assert!(
+        err.to_string().contains("dropped 1 probe set"),
+        "the refusal names the drop: {err}"
+    );
+    Ok(())
+}

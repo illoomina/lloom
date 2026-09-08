@@ -26,6 +26,60 @@ pub enum SdpaDType {
     F32,
 }
 
+/// The tile `steel_attention` runs `head_dim` at: `(BQ, BK, WM, WN)`.
+///
+/// `Err` for a head dim the kernel does not instantiate, and for f32 at 512
+/// (the reduced tile does not fit f32 in threadgroup memory). One function so
+/// the dispatch and a paged caller's `page_size % BK` check read the same
+/// number.
+pub fn sdpa_full_tile(
+    head_dim: usize,
+    itype: SdpaDType,
+) -> Result<(usize, usize, usize, usize), MetalKernelError> {
+    if ![32, 64, 72, 80, 96, 128, 256, 512].contains(&head_dim) {
+        return Err(MetalKernelError::SdpaHeadSizeMismatch {
+            variation: "full",
+            got: head_dim,
+            expected: vec![32, 64, 72, 80, 96, 128, 256, 512],
+        });
+    }
+    // BD=512 uses reduced tiles to fit 32KB Metal threadgroup memory (f16/bf16 only).
+    if head_dim == 512 {
+        if itype == SdpaDType::F32 {
+            return Err(MetalKernelError::SdpaHeadSizeMismatch {
+                variation: "full (f32 unsupported at head_dim=512)",
+                got: head_dim,
+                expected: vec![32, 64, 72, 80, 96, 128, 256],
+            });
+        }
+        Ok((8, 8, 1, 1))
+    } else {
+        let bk = if head_dim < 128 { 32 } else { 16 };
+        Ok((32, bk, 4, 1))
+    }
+}
+
+/// A page pool's table for `call_sdpa_full_with` (`is_paged`, issue #708).
+///
+/// K and V are one pool `[1, H_kv, pool_tokens, D]` shared by every sequence
+/// of the dispatch; sequence `b`'s key `t` sits at slot `table[b *
+/// table_stride + t / page_size] * page_size + t % page_size`. The kernel
+/// re-seats its K/V block loaders once per `BK`-key block through the table
+/// and walks the page linearly from there, so `page_size` must be a multiple
+/// of the tile's `BK` ([`sdpa_full_tile`]) — a block that straddled two pages
+/// would read the wrong keys silently (§3.5). The K/V batch stride is ignored
+/// on this arm: the batch row is the table row.
+#[derive(Copy, Clone, Debug)]
+pub struct SdpaPageTable<'a> {
+    /// `u32` page indices, every sequence's table back to back.
+    pub table: &'a Buffer,
+    pub table_offset: usize,
+    /// Entries between two sequences' tables.
+    pub table_stride: usize,
+    /// KV tokens per page.
+    pub page_size: usize,
+}
+
 /// The tiled multi-query attention (`steel_attention`): one threadgroup per
 /// (`BQ` query block, head), online softmax over `BK`-wide K/V blocks, f32
 /// accumulation in simdgroup matrices, GQA-native (`kv_head_idx = head /
@@ -85,6 +139,69 @@ pub fn call_sdpa_full(
     do_causal: bool,
     itype: SdpaDType,
 ) -> Result<(), MetalKernelError> {
+    call_sdpa_full_with(
+        device,
+        ep,
+        kernels,
+        q_offset,
+        q_shape,
+        q_strides,
+        q_buffer,
+        k_offset,
+        k_shape,
+        k_strides,
+        k_buffer,
+        v_offset,
+        v_buffer,
+        v_strides,
+        mask_type,
+        mask_buffer,
+        m_strides,
+        output,
+        o_strides,
+        scale,
+        do_causal,
+        itype,
+        None,
+    )
+}
+
+/// As [`call_sdpa_full`], with the K/V address selected: contiguous strides
+/// (`None`) or a page pool read through per-sequence tables (`Some`, the
+/// `is_paged` function constant — issue #708, the `q_seq > 1` half of #148's
+/// page-walking read). One body for both arms, so the paged arm cannot drift
+/// from the kernel it is one address away from.
+///
+/// On the paged arm `k_shape[2]` is the LIVE key count (`kL`) and `k_strides`
+/// / `v_strides` are the pool's `[_, head, token]` strides; the batch stride is
+/// not read. The table is bound at `buffer(8)` and its params at `buffer(7)`,
+/// above the mask's `5`/`6`, so the two optional arms bind independently.
+#[allow(clippy::too_many_arguments)]
+pub fn call_sdpa_full_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    q_offset: usize,
+    q_shape: &[usize],
+    q_strides: &[usize],
+    q_buffer: &Buffer,
+    k_offset: usize,
+    k_shape: &[usize],
+    k_strides: &[usize],
+    k_buffer: &Buffer,
+    v_offset: usize,
+    v_buffer: &Buffer,
+    v_strides: &[usize],
+    mask_type: Option<SdpaDType>,
+    mask_buffer: Option<&Buffer>,
+    m_strides: Option<&[usize]>,
+    output: &Buffer,
+    o_strides: &[usize],
+    scale: f32,
+    do_causal: bool,
+    itype: SdpaDType,
+    paged: Option<SdpaPageTable<'_>>,
+) -> Result<(), MetalKernelError> {
     #[derive(Debug)]
     #[repr(C)]
     struct AttnParams {
@@ -115,29 +232,28 @@ pub fn call_sdpa_full(
         m_strides: [i64; 3],
     }
 
-    let bd = q_shape[q_shape.len() - 1];
-    if ![32, 64, 72, 80, 96, 128, 256, 512].contains(&bd) {
-        return Err(MetalKernelError::SdpaHeadSizeMismatch {
-            variation: "full",
-            got: bd,
-            expected: vec![32, 64, 72, 80, 96, 128, 256, 512],
-        });
-    };
+    /// Mirrors `AttnPagedParams` in `scaled_dot_product_attention.metal`.
+    #[derive(Debug)]
+    #[repr(C)]
+    struct AttnPagedParams {
+        page_size: i32,
+        table_stride: i32,
+    }
 
-    // BD=512 uses reduced tiles to fit 32KB threadgroup memory (f16/bf16 only).
-    let (bq, bk, wm, wn): (usize, usize, usize, usize) = if bd == 512 {
-        if itype == SdpaDType::F32 {
+    let bd = q_shape[q_shape.len() - 1];
+    let (bq, bk, wm, wn) = sdpa_full_tile(bd, itype)?;
+
+    if let Some(p) = &paged {
+        // A key block must sit inside one page: the loader is seated once per
+        // block and walks linearly from there.
+        if p.page_size == 0 || !p.page_size.is_multiple_of(bk) {
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
-                variation: "full (f32 unsupported at head_dim=512)",
-                got: bd,
-                expected: vec![32, 64, 72, 80, 96, 128, 256],
+                variation: "full (paged: page_size must be a multiple of the key block)",
+                got: p.page_size,
+                expected: vec![bk],
             });
         }
-        (8, 8, 1, 1)
-    } else {
-        let bk = if bd < 128 { 32 } else { 16 };
-        (32, bk, 4, 1)
-    };
+    }
 
     let b = q_shape[0];
     let h = q_shape[1];
@@ -147,8 +263,8 @@ pub fn call_sdpa_full(
     let ql = q_shape[2];
     let kl = k_shape[2];
 
-    let align_q = (ql % bq) == 0;
-    let align_k = (kl % bk) == 0;
+    let align_q = ql.is_multiple_of(bq);
+    let align_k = kl.is_multiple_of(bk);
     let has_mask = mask_buffer.is_some();
 
     // When an explicit additive mask is supplied it already encodes causality.
@@ -176,6 +292,7 @@ pub fn call_sdpa_full(
         (201, Value::Bool(/* align_K */ align_k)),
         (300, Value::Bool(/* has_mask */ has_mask)),
         (301, Value::Bool(/* do_causal */ do_causal)),
+        (302, Value::Bool(/* is_paged */ paged.is_some())),
     ]));
 
     #[cfg(feature = "debug-labels")]
@@ -245,6 +362,12 @@ pub fn call_sdpa_full(
         }
     }
 
+    impl EncoderParam for AttnPagedParams {
+        fn set_param(encoder: &ComputeCommandEncoder, position: usize, data: Self) {
+            encoder.set_bytes(position, &data);
+        }
+    }
+
     if let Some(mask) = mask_buffer {
         let mask_strides = m_strides.unwrap();
         let mask_params = AttnMaskParams {
@@ -278,6 +401,21 @@ pub fn call_sdpa_full(
                 params
             )
         );
+    }
+
+    // The paged bindings sit at fixed slots above the mask's, so they bind
+    // whether or not a mask is bound: `[[buffer(7)]]` and `[[buffer(8)]]` are
+    // absolute indices, and a function constant removing 5/6 shifts nothing.
+    if let Some(p) = &paged {
+        crate::kernels::utils::set_param(
+            encoder,
+            7,
+            AttnPagedParams {
+                page_size: p.page_size as i32,
+                table_stride: p.table_stride as i32,
+            },
+        );
+        crate::kernels::utils::set_param(encoder, 8, (p.table, p.table_offset));
     }
 
     let grid_dims = MTLSize {

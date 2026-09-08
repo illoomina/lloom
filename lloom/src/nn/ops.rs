@@ -1477,12 +1477,34 @@ impl Module for Identity {
     }
 }
 
+/// The page tables a paged `q_seq > 1` attention reads through (issue #708).
+///
+/// `entries` holds every sequence's table, `stride` entries each — entry
+/// `b * stride + i` is the page holding sequence `b`'s keys
+/// `[i * page_size, (i + 1) * page_size)` — and `n_keys` is the live length,
+/// the same for every sequence, which the pool's token axis no longer carries.
+/// `PagedTable`'s shape one kernel over: that one is indexed by CHUNK for the
+/// decode kernel, this one by PAGE for the tiled kernel's key blocks.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // read by the Metal arm only, as `Sdpa`'s fields are
+struct SdpaPagedTable {
+    entries: Vec<u32>,
+    stride: usize,
+    page_size: usize,
+    n_keys: usize,
+}
+
 #[allow(dead_code)]
 struct Sdpa {
     scale: f32,
     softcapping: f32,
     mask: Option<Tensor>,
     do_causal: bool,
+    /// `Some` when `k`/`v` are a shared page pool `[1, n_kv_heads,
+    /// pool_tokens, head_dim]` read through per-sequence page tables rather
+    /// than a strided cache (`DESIGN.md` §10.3c; issue #708). Metal, `q_seq >
+    /// 1`, no mask tensor.
+    paged: Option<SdpaPagedTable>,
 }
 
 impl lloom_tensor::CustomOp3 for Sdpa {
@@ -1596,6 +1618,70 @@ impl lloom_tensor::CustomOp3 for Sdpa {
             DType::F32 => SdpaDType::F32,
             other => lloom_tensor::bail!("unsupported sdpa type {other:?}"),
         };
+
+        // The paged arm: every condition is one the kernel cannot serve, and
+        // each fails loudly rather than reading something plausible — the pool
+        // is read through a table under untracked hazards, so a wrong address
+        // is §3.5's silent wrong answer.
+        if let Some(p) = &self.paged {
+            if q_seq == 1 {
+                lloom_tensor::bail!(
+                    "sdpa over a page pool is the multi-query kernel (q seq > 1); a decode step \
+                     over a pool is `flash_decoding_paged`"
+                );
+            }
+            if self.mask.is_some() {
+                lloom_tensor::bail!("sdpa over a page pool takes no mask tensor (use do_causal)");
+            }
+            if k_l.dim(0)? != 1 || v_l.dim(0)? != 1 {
+                lloom_tensor::bail!(
+                    "sdpa over a page pool needs a pool of one row, got k {:?}",
+                    k_l.dims()
+                );
+            }
+            if !k_l.is_contiguous() || !v_l.is_contiguous() {
+                lloom_tensor::bail!("sdpa over a page pool needs contiguous K and V pools");
+            }
+            let (_, bk, _, _) = lloom_tensor::kernels::sdpa_full_tile(q_head, itype)
+                .map_err(lloom_tensor::Error::wrap)?;
+            if p.page_size == 0 || !p.page_size.is_multiple_of(bk) {
+                lloom_tensor::bail!(
+                    "sdpa over a page pool: page_size {} must be a multiple of the kernel's key \
+                     block ({bk}) so a block never straddles two pages",
+                    p.page_size
+                );
+            }
+            let slots = k_l.dim(2)?;
+            if p.n_keys == 0 || p.n_keys > slots || q_seq > p.n_keys {
+                lloom_tensor::bail!(
+                    "sdpa over a page pool: {} live keys for {q_seq} queries against a pool of \
+                     {slots} slots",
+                    p.n_keys
+                );
+            }
+            let b_sz = q_l.dim(0)?;
+            let need = p.n_keys.div_ceil(p.page_size);
+            if p.stride < need || p.entries.len() < need + (b_sz - 1) * p.stride {
+                lloom_tensor::bail!(
+                    "sdpa over a page pool: {} table entries at stride {} for {b_sz} sequences x \
+                     {need} pages",
+                    p.entries.len(),
+                    p.stride
+                );
+            }
+            for (i, &page) in p.entries.iter().enumerate() {
+                let pi = i % p.stride;
+                if pi < need {
+                    let live = (p.n_keys - pi * p.page_size).min(p.page_size);
+                    if page as usize * p.page_size + live > slots {
+                        lloom_tensor::bail!(
+                            "sdpa over a page pool: table entry {i} names page {page}, which would \
+                             read past the pool's {slots} slots (DESIGN.md 3.5)"
+                        );
+                    }
+                }
+            }
+        }
 
         let encoder = q.device().command_encoder()?;
         if supports_sdpa_vector {
@@ -1716,7 +1802,41 @@ impl lloom_tensor::CustomOp3 for Sdpa {
                 (None, None, None)
             };
 
-            lloom_tensor::kernels::call_sdpa_full(
+            // A pool is one row read by every sequence through its table: the
+            // key extent handed to the kernel is the LIVE length and the batch
+            // stride is 0 — a sequence is never reached through a stride.
+            let (k_shape, k_stride, v_stride): (Vec<usize>, Vec<usize>, Vec<usize>) =
+                match &self.paged {
+                    Some(p) => {
+                        let mut ks = k_l.dims().to_vec();
+                        ks[2] = p.n_keys;
+                        let mut kst = k_l.stride().to_vec();
+                        kst[0] = 0;
+                        let mut vst = v_l.stride().to_vec();
+                        vst[0] = 0;
+                        (ks, kst, vst)
+                    }
+                    None => (
+                        k_l.dims().to_vec(),
+                        k_l.stride().to_vec(),
+                        v_l.stride().to_vec(),
+                    ),
+                };
+            let table = match &self.paged {
+                Some(p) => Some(device.new_buffer_with_data(&p.entries)?),
+                None => None,
+            };
+            let paged = match (&self.paged, &table) {
+                (Some(p), Some(t)) => Some(lloom_tensor::kernels::SdpaPageTable {
+                    table: t,
+                    table_offset: 0,
+                    table_stride: p.stride,
+                    page_size: p.page_size,
+                }),
+                _ => None,
+            };
+
+            lloom_tensor::kernels::call_sdpa_full_with(
                 q.device().device(),
                 &encoder,
                 q.device().kernels(),
@@ -1725,12 +1845,12 @@ impl lloom_tensor::CustomOp3 for Sdpa {
                 q_l.stride(),
                 q.buffer(),
                 k_l.start_offset() * k.dtype().size_in_bytes(),
-                k_l.dims(),
-                k_l.stride(),
+                &k_shape,
+                &k_stride,
                 k.buffer(),
                 v_l.start_offset() * v.dtype().size_in_bytes(),
                 v.buffer(),
-                v_l.stride(),
+                &v_stride,
                 mask_type,
                 mask_buffer,
                 mask_strides.as_deref(),
@@ -1739,6 +1859,7 @@ impl lloom_tensor::CustomOp3 for Sdpa {
                 self.scale,
                 self.do_causal,
                 itype,
+                paged,
             )
             .map_err(lloom_tensor::Error::wrap)?;
         } else {
@@ -1796,6 +1917,57 @@ pub fn sdpa(
             softcapping,
             mask: mask.cloned(),
             do_causal,
+            paged: None,
+        },
+    )
+}
+
+/// [`sdpa`] over a shared page pool — the `q_seq > 1` paged attention
+/// (`DESIGN.md` §10.3c–§10.3d; issue #708, and the read primitive #148's
+/// batched verify shares).
+///
+/// `k`/`v` are one layer's pool, `[1, n_kv_heads, pool_tokens * head_dim]`
+/// laid out `[1, n_kv_heads, pool_tokens, head_dim]` — a page's tokens a
+/// contiguous run inside a head, the layout `KvAppend::Paged` stores. `table`
+/// is every sequence's page table, `table_stride` entries each: entry
+/// `b * table_stride + i` is the page holding sequence `b`'s keys
+/// `[i * page_size, (i + 1) * page_size)`. `n_keys` is the live length, the
+/// same for every sequence. `q` is `[b, n_q_heads, q_seq, head_dim]` with
+/// `q_seq > 1`; the kernel is `steel_attention` with its K/V block loaders
+/// re-seated per key block through the table, so `page_size` must be a
+/// multiple of the kernel's key block (32 below `head_dim` 128, 16 at and
+/// above). `do_causal` masks with the queries offset to the end of the key
+/// range, as [`sdpa`] does; no mask tensor.
+///
+/// Metal only, `q_seq > 1` only. Every other case is an error rather than a
+/// fallback: the caller decides, because a silent fallback is what makes an
+/// A/B arm measure the wrong thing (`DESIGN.md` §2.4).
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_paged(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    do_causal: bool,
+    scale: f32,
+    page_size: usize,
+    table: Vec<u32>,
+    table_stride: usize,
+    n_keys: usize,
+) -> Result<Tensor> {
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &Sdpa {
+            scale,
+            softcapping: 1.0,
+            mask: None,
+            do_causal,
+            paged: Some(SdpaPagedTable {
+                entries: table,
+                stride: table_stride,
+                page_size,
+                n_keys,
+            }),
         },
     )
 }

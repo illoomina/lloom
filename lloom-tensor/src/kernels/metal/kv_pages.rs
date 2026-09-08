@@ -348,6 +348,38 @@ impl KvPagePool {
         Ok(fresh)
     }
 
+    /// Hold pages for `seq` so that `extra` more tokens fit past its live
+    /// length without allocating, returning the pages allocated by this call.
+    ///
+    /// A caller that writes past `len` without moving it — a speculative
+    /// drafter's own block, keyed after its context and attended in the same
+    /// pass, then overwritten by the next append (#708) — needs the slots to
+    /// exist while nothing but that caller reads them. The reserved pages are
+    /// the sequence's: [`Self::table_for`] names them, [`Self::append`] fills
+    /// them before allocating more, [`Self::rewind`] keeps them and
+    /// [`Self::release`] returns them with the rest.
+    pub fn reserve(&mut self, seq: usize, extra: usize) -> Result<Vec<PageIdx>, PageError> {
+        let mut fresh = Vec::new();
+        loop {
+            let s = &self.seqs[seq];
+            if s.pages.len() * self.page_size >= s.len + extra {
+                return Ok(fresh);
+            }
+            if s.pages.len() == self.table_capacity_pages {
+                return Err(PageError::TableFull {
+                    seq,
+                    capacity_pages: self.table_capacity_pages,
+                });
+            }
+            let page = self.free.pop().ok_or(PageError::Exhausted {
+                pool_pages: self.refcount.len(),
+            })?;
+            self.refcount[page as usize] += 1;
+            self.seqs[seq].pages.push(page);
+            fresh.push(page);
+        }
+    }
+
     /// Discard the last `n` tokens of `seq`, keeping its pages.
     ///
     /// A speculative rollback (§10.2a) is a length decrement: the discarded

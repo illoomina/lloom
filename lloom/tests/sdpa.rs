@@ -745,4 +745,482 @@ mod metal_sdpa_tests {
         println!("sdpa_full_causal_is_bit_stable_run_to_run: 5 runs, {} elements, {distinct} distinct, identical", first.len());
         Ok(())
     }
+
+    // ---------------------------------------------------------------------
+    // The paged arm of the tiled kernel (`sdpa_paged`, `is_paged`; issue #708):
+    // the same `steel_attention`, its K/V block loaders re-seated per 32-key
+    // block through a page table. K and V are one pool `[1, kv_heads,
+    // pool_tokens, head_dim]` and sequence `b`'s key `t` sits at
+    // `table[b * stride + t / P] * P + t % P`. The reference is the contiguous
+    // kernel over the same keys laid out in order — the SAME arithmetic in the
+    // SAME block order, so the two must agree bit for bit (§2.3.5a: the
+    // bit-identical case, preferred where it costs nothing) — and the eager
+    // f32 reference on the CPU backend beside it, so "both wrong the same
+    // way" is excluded rather than assumed.
+    //
+    // Every table here is a NON-IDENTITY permutation (§10.3h: a fixture that
+    // does not permute its table is testing the identity function), the pool
+    // holds unreferenced pages, and every slot the live keys do not occupy is a
+    // sentinel that dwarfs any live score, so a block seated on the wrong page
+    // or walked past its page is a gross error rather than a rounding one.
+    // ---------------------------------------------------------------------
+
+    /// A pool + permuted table holding `kv_len` live keys at `page_size`.
+    struct PagedFixture {
+        k_live: Tensor,
+        v_live: Tensor,
+        k_pool: Tensor,
+        v_pool: Tensor,
+        table: Vec<u32>,
+        page_size: usize,
+    }
+
+    /// Lay `kv_len` keys of `[1, kv_heads, kv_len, D]` (f32, CPU) into a pool
+    /// through a permuted table. `salt` moves the permutation so two sequences
+    /// in one test get different tables.
+    fn paged_fixture(
+        rng: &mut rand::rngs::StdRng,
+        kv_len: usize,
+        page_size: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        salt: usize,
+        cpu: &Device,
+    ) -> Result<PagedFixture> {
+        let n_pages = kv_len.div_ceil(page_size);
+        // Two pages the table never names, so a wrong page index has
+        // somewhere to land that is not another live page.
+        let pool_pages = n_pages + 2;
+        // A rotation, with entry 0 forced off page 0: never the identity, for
+        // any n_pages >= 1 and any salt.
+        let mut perm: Vec<u32> = (0..pool_pages as u32).collect();
+        perm.rotate_left((1 + salt) % pool_pages);
+        if perm[0] == 0 {
+            perm.swap(0, 1);
+        }
+        let table: Vec<u32> = perm[..n_pages].to_vec();
+        assert!(
+            table.iter().enumerate().any(|(i, &p)| p as usize != i),
+            "the fixture's table must not be the identity"
+        );
+
+        let k_live = randn(rng, (1, kv_heads, kv_len, head_dim), cpu)?;
+        let v_live = randn(rng, (1, kv_heads, kv_len, head_dim), cpu)?;
+        let pool_tokens = pool_pages * page_size;
+        let sentinel = 40f32;
+        let lay = |live: &Tensor| -> Result<Tensor> {
+            let src = live.flatten_all()?.to_vec1::<f32>()?;
+            let mut pool = vec![sentinel; kv_heads * pool_tokens * head_dim];
+            for h in 0..kv_heads {
+                for t in 0..kv_len {
+                    let slot = table[t / page_size] as usize * page_size + t % page_size;
+                    let s = (h * kv_len + t) * head_dim;
+                    let d = (h * pool_tokens + slot) * head_dim;
+                    pool[d..d + head_dim].copy_from_slice(&src[s..s + head_dim]);
+                }
+            }
+            Tensor::from_vec(pool, (1, kv_heads, pool_tokens, head_dim), cpu)
+        };
+        Ok(PagedFixture {
+            k_pool: lay(&k_live)?,
+            v_pool: lay(&v_live)?,
+            k_live,
+            v_live,
+            table,
+            page_size,
+        })
+    }
+
+    fn bits_of(t: &Tensor, cpu: &Device) -> Result<Vec<u32>> {
+        let t = t.to_device(cpu)?.flatten_all()?;
+        Ok(match t.dtype() {
+            DType::F32 => t.to_vec1::<f32>()?.into_iter().map(f32::to_bits).collect(),
+            DType::F16 => t
+                .to_vec1::<half::f16>()?
+                .into_iter()
+                .map(|x| x.to_bits() as u32)
+                .collect(),
+            DType::BF16 => t
+                .to_vec1::<half::bf16>()?
+                .into_iter()
+                .map(|x| x.to_bits() as u32)
+                .collect(),
+            other => panic!("bits_of: {other:?}"),
+        })
+    }
+
+    /// `(q_len, kv_len, page_size)`: the drafter's block (γ = 9) over a context
+    /// on both sides of a page boundary and of the 32-key block, a verify
+    /// window, a prefill-sized window, and page sizes 32 (one block per page,
+    /// every block seated on a different page), 64 and 256 (the shipped
+    /// default, where a partial last block sits mid-page).
+    const PAGED_SHAPES: [(usize, usize, usize); 12] = [
+        (9, 9, 32),
+        (9, 41, 32),
+        (9, 64, 32),
+        (9, 73, 64),
+        (9, 137, 64),
+        (9, 300, 256),
+        (9, 512, 256),
+        (10, 137, 32),
+        (32, 96, 32),
+        (33, 265, 64),
+        (34, 469, 256),
+        (100, 128, 32),
+    ];
+
+    /// The paged kernel against the contiguous kernel (bit for bit) and the
+    /// CPU eager reference, f32, bidirectional (`do_causal = false`, the
+    /// drafter's block) and causal (a verify window over a cache).
+    #[test]
+    fn sdpa_paged_matches_contiguous_bit_for_bit_f32() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        for &(q_len, kv_len, page_size) in &PAGED_SHAPES {
+            for causal in [false, true] {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(
+                    708_000 + (q_len * 100_000 + kv_len * 100 + page_size) as u64,
+                );
+                let q = randn(&mut rng, (1, LFM2_Q_HEADS, q_len, LFM2_HEAD_DIM), &cpu)?;
+                let f = paged_fixture(
+                    &mut rng,
+                    kv_len,
+                    page_size,
+                    LFM2_KV_HEADS,
+                    LFM2_HEAD_DIM,
+                    0,
+                    &cpu,
+                )?;
+                let want = if causal {
+                    reference_causal_attention(&q, &f.k_live, &f.v_live, scale)?
+                } else {
+                    reference_attention(&q, &f.k_live, &f.v_live, scale)?
+                };
+                let qm = q.to_device(&metal)?;
+                let contiguous = lloom::nn::ops::sdpa(
+                    &qm,
+                    &f.k_live.to_device(&metal)?,
+                    &f.v_live.to_device(&metal)?,
+                    None,
+                    causal,
+                    scale as f32,
+                    1.,
+                )?;
+                let paged = lloom::nn::ops::sdpa_paged(
+                    &qm,
+                    &f.k_pool.to_device(&metal)?,
+                    &f.v_pool.to_device(&metal)?,
+                    causal,
+                    scale as f32,
+                    f.page_size,
+                    f.table.clone(),
+                    f.table.len(),
+                    kv_len,
+                )?;
+                let what = format!(
+                    "paged f32 q_len={q_len} kv_len={kv_len} P={page_size} causal={causal}"
+                );
+                let err = assert_matches_reference(&paged.to_device(&cpu)?, &want, 1e-5, &what)?;
+                assert!(
+                    bits_of(&paged, &cpu)? == bits_of(&contiguous, &cpu)?,
+                    "{what}: the paged kernel differs from the contiguous kernel in bits"
+                );
+                println!("sdpa_paged_matches_contiguous_bit_for_bit_f32: {what} max abs error vs cpu {err:e}, bit-identical to contiguous");
+            }
+        }
+        Ok(())
+    }
+
+    /// The same at f16 and bf16 — the dtypes the drafter runs at (F16 in
+    /// `lfm2-chat`, the checkpoint's BF16 elsewhere). Bit-identical to the
+    /// contiguous kernel; the CPU reference bounds the f16 rounding as the
+    /// contiguous tests do.
+    #[test]
+    fn sdpa_paged_matches_contiguous_bit_for_bit_f16_bf16() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        for &(q_len, kv_len, page_size) in &PAGED_SHAPES {
+            for (dtype, causal) in [
+                (DType::F16, false),
+                (DType::F16, true),
+                (DType::BF16, false),
+            ] {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(
+                    708_500 + (q_len * 100_000 + kv_len * 100 + page_size) as u64,
+                );
+                let q = randn(&mut rng, (1, LFM2_Q_HEADS, q_len, LFM2_HEAD_DIM), &cpu)?;
+                let f = paged_fixture(
+                    &mut rng,
+                    kv_len,
+                    page_size,
+                    LFM2_KV_HEADS,
+                    LFM2_HEAD_DIM,
+                    1,
+                    &cpu,
+                )?;
+                // Round-trip through the dtype on every arm so the inputs are
+                // identical bits; the pool is rounded per element the same way.
+                let q16 = q.to_dtype(dtype)?;
+                let k16 = f.k_live.to_dtype(dtype)?;
+                let v16 = f.v_live.to_dtype(dtype)?;
+                let want = if causal {
+                    reference_causal_attention(&q16, &k16, &v16, scale)?
+                } else {
+                    reference_attention(&q16, &k16, &v16, scale)?
+                };
+                let qm = q16.to_device(&metal)?;
+                let contiguous = lloom::nn::ops::sdpa(
+                    &qm,
+                    &k16.to_device(&metal)?,
+                    &v16.to_device(&metal)?,
+                    None,
+                    causal,
+                    scale as f32,
+                    1.,
+                )?;
+                let paged = lloom::nn::ops::sdpa_paged(
+                    &qm,
+                    &f.k_pool.to_dtype(dtype)?.to_device(&metal)?,
+                    &f.v_pool.to_dtype(dtype)?.to_device(&metal)?,
+                    causal,
+                    scale as f32,
+                    f.page_size,
+                    f.table.clone(),
+                    f.table.len(),
+                    kv_len,
+                )?;
+                let what = format!(
+                    "paged {dtype:?} q_len={q_len} kv_len={kv_len} P={page_size} causal={causal}"
+                );
+                let tol = if dtype == DType::BF16 { 4e-2 } else { 5e-3 };
+                let err = assert_matches_reference(
+                    &paged.to_device(&cpu)?.to_dtype(DType::F32)?,
+                    &want,
+                    tol,
+                    &what,
+                )?;
+                assert!(
+                    bits_of(&paged, &cpu)? == bits_of(&contiguous, &cpu)?,
+                    "{what}: the paged kernel differs from the contiguous kernel in bits"
+                );
+                println!("sdpa_paged_matches_contiguous_bit_for_bit_f16_bf16: {what} max abs error vs cpu {err:e}, bit-identical to contiguous");
+            }
+        }
+        Ok(())
+    }
+
+    /// Two sequences over ONE pool through two different tables (#148's B>1
+    /// verify shape): each row is bit-identical to its own B=1 contiguous
+    /// answer, and the rows differ from each other — a kernel that read every
+    /// row through table 0, or the batch through a stride, fails one or the
+    /// other.
+    #[test]
+    fn sdpa_paged_b2_reads_each_sequence_through_its_own_table() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        const Q_LEN: usize = 10;
+        const KV_LEN: usize = 137;
+        const P: usize = 32;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(708_900);
+        let n_pages = KV_LEN.div_ceil(P);
+        // One pool holding both sequences' keys: sequence 0 on pages
+        // [0..n_pages) permuted, sequence 1 on the pages after them, permuted
+        // differently. Built by hand so the two tables are disjoint and
+        // neither is the identity.
+        let pool_pages = 2 * n_pages + 1;
+        let mut t0: Vec<u32> = (0..n_pages as u32).rev().collect();
+        t0.rotate_left(1);
+        let mut t1: Vec<u32> = (n_pages as u32..2 * n_pages as u32).collect();
+        t1.rotate_left(2);
+        t1.swap(0, n_pages - 1);
+        for (i, t) in [&t0, &t1].into_iter().enumerate() {
+            assert!(
+                t.iter()
+                    .enumerate()
+                    .any(|(j, &p)| p as usize != j + i * n_pages),
+                "table {i} must not be the identity over its own range"
+            );
+        }
+        let pool_tokens = pool_pages * P;
+        let sentinel = 40f32;
+        let mut k_pool = vec![sentinel; LFM2_KV_HEADS * pool_tokens * LFM2_HEAD_DIM];
+        let mut v_pool = k_pool.clone();
+        let mut lives = Vec::new();
+        for table in [&t0, &t1] {
+            let k = randn(&mut rng, (1, LFM2_KV_HEADS, KV_LEN, LFM2_HEAD_DIM), &cpu)?;
+            let v = randn(&mut rng, (1, LFM2_KV_HEADS, KV_LEN, LFM2_HEAD_DIM), &cpu)?;
+            for (live, pool) in [(&k, &mut k_pool), (&v, &mut v_pool)] {
+                let src = live.flatten_all()?.to_vec1::<f32>()?;
+                for h in 0..LFM2_KV_HEADS {
+                    for t in 0..KV_LEN {
+                        let slot = table[t / P] as usize * P + t % P;
+                        let s = (h * KV_LEN + t) * LFM2_HEAD_DIM;
+                        let d = (h * pool_tokens + slot) * LFM2_HEAD_DIM;
+                        pool[d..d + LFM2_HEAD_DIM].copy_from_slice(&src[s..s + LFM2_HEAD_DIM]);
+                    }
+                }
+            }
+            lives.push((k, v));
+        }
+        let k_pool =
+            Tensor::from_vec(k_pool, (1, LFM2_KV_HEADS, pool_tokens, LFM2_HEAD_DIM), &cpu)?
+                .to_device(&metal)?;
+        let v_pool =
+            Tensor::from_vec(v_pool, (1, LFM2_KV_HEADS, pool_tokens, LFM2_HEAD_DIM), &cpu)?
+                .to_device(&metal)?;
+        let q = randn(&mut rng, (2, LFM2_Q_HEADS, Q_LEN, LFM2_HEAD_DIM), &cpu)?;
+
+        let mut table = t0.clone();
+        table.extend_from_slice(&t1);
+        for causal in [false, true] {
+            let got = lloom::nn::ops::sdpa_paged(
+                &q.to_device(&metal)?,
+                &k_pool,
+                &v_pool,
+                causal,
+                scale as f32,
+                P,
+                table.clone(),
+                n_pages,
+                KV_LEN,
+            )?;
+            let mut row_bits = Vec::new();
+            for (b, (k, v)) in lives.iter().enumerate() {
+                let solo = lloom::nn::ops::sdpa(
+                    &q.narrow(0, b, 1)?.to_device(&metal)?,
+                    &k.to_device(&metal)?,
+                    &v.to_device(&metal)?,
+                    None,
+                    causal,
+                    scale as f32,
+                    1.,
+                )?;
+                let want = if causal {
+                    reference_causal_attention(&q.narrow(0, b, 1)?, k, v, scale)?
+                } else {
+                    reference_attention(&q.narrow(0, b, 1)?, k, v, scale)?
+                };
+                let row = got.narrow(0, b, 1)?.contiguous()?;
+                let what = format!("paged B=2 row {b} causal={causal}");
+                assert_matches_reference(&row.to_device(&cpu)?, &want, 1e-5, &what)?;
+                let bits = bits_of(&row, &cpu)?;
+                assert!(
+                    bits == bits_of(&solo, &cpu)?,
+                    "{what}: differs from its own B=1 answer"
+                );
+                row_bits.push(bits);
+            }
+            assert!(row_bits[0] != row_bits[1], "causal={causal}: the two rows are identical, so the test cannot tell the tables apart");
+            println!("sdpa_paged_b2_reads_each_sequence_through_its_own_table: causal={causal} both rows bit-identical to their B=1 contiguous answers");
+        }
+        Ok(())
+    }
+
+    /// Run to run, the paged kernel is bit-stable (`DESIGN.md` §2.3.3): the
+    /// page walk changes addresses, never the reduction order.
+    #[test]
+    fn sdpa_paged_is_bit_stable_run_to_run() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(708_777);
+        let q = randn(&mut rng, (1, LFM2_Q_HEADS, 9, LFM2_HEAD_DIM), &cpu)?
+            .to_dtype(DType::F16)?
+            .to_device(&metal)?;
+        let f = paged_fixture(&mut rng, 137, 32, LFM2_KV_HEADS, LFM2_HEAD_DIM, 2, &cpu)?;
+        let k = f.k_pool.to_dtype(DType::F16)?.to_device(&metal)?;
+        let v = f.v_pool.to_dtype(DType::F16)?.to_device(&metal)?;
+        let run = || {
+            lloom::nn::ops::sdpa_paged(
+                &q,
+                &k,
+                &v,
+                false,
+                scale as f32,
+                32,
+                f.table.clone(),
+                f.table.len(),
+                137,
+            )
+        };
+        let first = bits_of(&run()?, &cpu)?;
+        let distinct = first.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(distinct >= 2, "vacuous: {distinct} distinct value(s)");
+        for r in 1..5 {
+            assert!(
+                bits_of(&run()?, &cpu)? == first,
+                "run {r} differs from run 0"
+            );
+        }
+        println!("sdpa_paged_is_bit_stable_run_to_run: 5 runs, {} elements, {distinct} distinct, identical", first.len());
+        Ok(())
+    }
+
+    /// The refusals: a decode shape, a page that does not hold a whole key
+    /// block, and a table naming a page past the pool are errors, never a
+    /// plausible answer (§3.5).
+    #[test]
+    fn sdpa_paged_refuses_what_the_kernel_cannot_read() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(708_666);
+        let f = paged_fixture(&mut rng, 41, 32, LFM2_KV_HEADS, LFM2_HEAD_DIM, 0, &cpu)?;
+        let k = f.k_pool.to_device(&metal)?;
+        let v = f.v_pool.to_device(&metal)?;
+        let q9 = randn(&mut rng, (1, LFM2_Q_HEADS, 9, LFM2_HEAD_DIM), &cpu)?.to_device(&metal)?;
+        let q1 = randn(&mut rng, (1, LFM2_Q_HEADS, 1, LFM2_HEAD_DIM), &cpu)?.to_device(&metal)?;
+        let ok = lloom::nn::ops::sdpa_paged(
+            &q9,
+            &k,
+            &v,
+            false,
+            scale as f32,
+            32,
+            f.table.clone(),
+            2,
+            41,
+        );
+        assert!(ok.is_ok(), "the control must dispatch: {:?}", ok.err());
+        let decode = lloom::nn::ops::sdpa_paged(
+            &q1,
+            &k,
+            &v,
+            false,
+            scale as f32,
+            32,
+            f.table.clone(),
+            2,
+            41,
+        );
+        assert!(decode.is_err(), "q_seq == 1 must be refused");
+        let bad_page = lloom::nn::ops::sdpa_paged(
+            &q9,
+            &k,
+            &v,
+            false,
+            scale as f32,
+            48,
+            f.table.clone(),
+            2,
+            41,
+        );
+        assert!(
+            bad_page.is_err(),
+            "page_size 48 is not a multiple of the key block"
+        );
+        let past =
+            lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, vec![0, 99], 2, 41);
+        assert!(past.is_err(), "a page past the pool must be refused");
+        let short =
+            lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, vec![0], 1, 41);
+        assert!(
+            short.is_err(),
+            "a table shorter than the live pages must be refused"
+        );
+        Ok(())
+    }
 }

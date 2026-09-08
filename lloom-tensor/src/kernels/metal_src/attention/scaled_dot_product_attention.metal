@@ -1599,6 +1599,14 @@ struct BlockLoaderT {
   METAL_FUNC void next() {
     src += tile_stride;
   }
+
+  /* Re-seat this thread's read pointer at a new block base. A paged K/V
+   * (`is_paged`) resolves each key block's base through a page table rather
+   * than advancing linearly, so the loader is pointed at the block rather than
+   * stepped to it; the thread's own offset inside the block is unchanged. */
+  METAL_FUNC void seek(const device T* src_) {
+    src = src_ + bi * src_ld + bj;
+  }
 };
 
 // ============ "mlx/backend/metal/kernels/steel/utils/type_traits.h"
@@ -2504,6 +2512,20 @@ struct AttnMaskParams {
   int64_t M_strides[3]; ///< Mask  strides (B, H, qL, kL = 1)
 };
 
+/// The page-walking K/V address (`is_paged`): K and V are one pool,
+/// `[1, H_kv, pool_tokens, D]`, and sequence `b`'s key `t` lives at slot
+/// `page_table[b * table_stride + t / page_size] * page_size + t % page_size`.
+/// A key block never straddles a page (`page_size % BK == 0`, checked by the
+/// host), so the block loaders are re-seated once per block and walk the page
+/// linearly from there — the indirection is hoisted out of the inner loop
+/// exactly as `flash_decoding.metal` hoists its chunk lookup (§10.3d). The
+/// batch stride of K/V is 0 on this arm: a sequence is reached through its
+/// table row, never through a stride (§10.3c).
+struct AttnPagedParams {
+  int page_size; ///< KV tokens per page
+  int table_stride; ///< Entries between two sequences' tables
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // GEMM kernels
 ///////////////////////////////////////////////////////////////////////////////
@@ -2513,6 +2535,7 @@ constant bool align_K [[function_constant(201)]];
 
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
+constant bool is_paged [[function_constant(302)]];
 
 template <typename T>
 struct TransformScale {
@@ -2587,6 +2610,8 @@ template <
     const constant AttnParams* params [[buffer(4)]],
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
+    const constant AttnPagedParams* paged_params [[buffer(7), function_constant(is_paged)]],
+    const device uint* page_table [[buffer(8), function_constant(is_paged)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -2755,6 +2780,18 @@ template <
 
   // Loop over KV seq length
   for (int kb = 0; kb < kb_lim; kb++) {
+    // Paged K/V: seat both loaders at this block's page slot. The partial
+    // last block (`kL_rem` rows) still sits inside one page, so the masked
+    // `load_safe` below reads exactly the live rows from that base.
+    if (is_paged) {
+      const int t0 = kb * BK;
+      const int page_size = paged_params->page_size;
+      const uint page = page_table[tidl.z * paged_params->table_stride + t0 / page_size];
+      const int64_t slot = int64_t(page) * page_size + (t0 % page_size);
+      loader_k.seek(K + slot * params->K_strides[2]);
+      loader_v.seek(V + slot * params->V_strides[2]);
+    }
+
     // Load K block and apply scale
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!align_K && kb == (params->NK_aligned)) {
@@ -2956,9 +2993,12 @@ template <
       }
     }
 
-    // Prepare for next iteration
-    loader_k.next();
-    loader_v.next();
+    // Prepare for next iteration: the contiguous arm walks linearly; the paged
+    // arm is re-seated at the top of the loop.
+    if (!is_paged) {
+      loader_k.next();
+      loader_v.next();
+    }
   }
 
   // Normalize output

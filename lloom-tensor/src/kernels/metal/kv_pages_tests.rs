@@ -511,3 +511,42 @@ fn growth_widens_the_table_with_the_pool() {
         })
     ));
 }
+
+/// `reserve` holds pages past the live length; the appends that follow fill
+/// them before allocating, and the table names them (#708: the drafter's
+/// block slots, written after the context and overwritten by the next append).
+#[test]
+fn reserved_pages_are_filled_before_new_ones_are_allocated() {
+    let mut p = pool(16);
+    assert_eq!(
+        p.append(0, 3).unwrap(),
+        vec![0],
+        "the first token opens page 0"
+    );
+    // Room for 6 more past len 3 at page size 4: pages [0, 1, 2] (12 slots >= 9).
+    assert_eq!(p.reserve(0, 6).unwrap(), vec![1, 2]);
+    assert_eq!(p.table_for(0, 1), vec![0, 1, 2]);
+    assert_eq!(p.seq(0).unwrap().len(), 3, "reserve moves no live length");
+    // Already covered: a second reserve allocates nothing.
+    assert_eq!(p.reserve(0, 6).unwrap(), Vec::<u32>::new());
+    // Nine appends consume the reserve; the boundary token 13 opens page 3.
+    let fresh: Vec<usize> = (0..10).map(|_| p.append(0, 1).unwrap().len()).collect();
+    assert_eq!(fresh, vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    assert_eq!(p.table_for(0, 1), vec![0, 1, 2, 3]);
+    // A rewind keeps the reserved pages; a release returns them all.
+    p.rewind(0, 10).unwrap();
+    assert_eq!(p.table_for(0, 1), vec![0, 1, 2, 3]);
+    assert_eq!(p.release(0), vec![0, 1, 2, 3]);
+}
+
+/// A reserve past the pool is the same loud failure an append past it is.
+#[test]
+fn reserve_reports_exhaustion() {
+    let mut p = pool(2);
+    p.append(0, 1).unwrap();
+    assert_eq!(
+        p.reserve(0, 8),
+        Err(PageError::Exhausted { pool_pages: 2 }),
+        "8 more slots need 3 pages of 4 and the pool has 2"
+    );
+}

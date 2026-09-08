@@ -6,6 +6,7 @@
 use lloom_tensor::{DType, Error, Result, Tensor};
 use rand::{distr::Distribution, SeedableRng};
 
+pub mod hot_thread;
 pub mod poll;
 pub mod readback;
 pub mod token_ring;
@@ -14,6 +15,7 @@ pub mod token_ring;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod token_ring_fuzz;
 
+pub use hot_thread::{HotThread, HotThreadArm, HotThreadReport, QosClass};
 pub use readback::{
     Blocking, CommitBudget, EosRead, Geometry, ReadbackArms, ReadbackCounters, ReadbackStrategy,
     Ring, WAKE_LIVE_EVERY_DEFAULT,

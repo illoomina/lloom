@@ -46,10 +46,34 @@ pub struct GpuInterval {
     pub end: f64,
 }
 
+/// One completed command buffer: its GPU interval, the host's commit stamp in
+/// the same clock (`CLOCK_UPTIME_RAW`, domain A of `DESIGN.md` §3.4b, which
+/// `GPUStartTime`/`GPUEndTime` share), and the decode step it was committed
+/// in (`set_step`; 0 before the loop's first step).
+///
+/// The commit stamp is what turns a gap between two buffers into a verdict
+/// (issue #702): if the next buffer was committed **after** the previous one
+/// ended, the GPU had nothing to run and the host caused the idle
+/// (*starved*); if it was already committed, the idle is the driver's
+/// retire-and-start between two queued buffers (*seam*), which no host thread
+/// can shorten.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CommandBufferRecord {
+    pub interval: GpuInterval,
+    /// When the host committed this buffer, seconds in the GPU clock. Stamped
+    /// at completion-handler registration, which immediately precedes the
+    /// `commit` call, so it reads a few microseconds **early** -- the bias is
+    /// toward calling a gap a seam, never toward calling it starved.
+    pub committed: f64,
+    /// The decode step current at commit (`set_step`).
+    pub step: u64,
+}
+
 #[derive(Default)]
 struct Recorder {
-    /// GPU intervals of every command buffer that has completed.
-    intervals: Vec<GpuInterval>,
+    /// GPU intervals of every command buffer that has completed, with the
+    /// commit stamp and step that let a gap be attributed.
+    records: Vec<CommandBufferRecord>,
     /// Dispatches per pipeline label, for the per-token dispatch inventory.
     ///
     /// **Keyed on `Arc<str>` rather than `String`, so counting a dispatch
@@ -93,6 +117,50 @@ static COMMIT_NS: AtomicU64 = AtomicU64::new(0);
 static CREATE_CB_NS: AtomicU64 = AtomicU64::new(0);
 static PRUNES: AtomicU64 = AtomicU64::new(0);
 static PRUNE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The decode step the loop is in, for attributing a command buffer's gap to
+/// a step (`CommandBufferRecord::step`). Written once per step by the loop,
+/// only under `enabled()`; read at every completion-handler registration.
+static STEP: AtomicU64 = AtomicU64::new(0);
+
+/// Tell the recorder which decode step is current. One relaxed store; the
+/// loop calls it only when `enabled()`.
+#[inline]
+pub fn set_step(step: u64) {
+    STEP.store(step, Ordering::Relaxed);
+}
+
+/// The step current at this instant, as `set_step` last left it.
+#[inline]
+pub fn current_step() -> u64 {
+    STEP.load(Ordering::Relaxed)
+}
+
+/// Now, in seconds of the clock `GPUStartTime`/`GPUEndTime` are in.
+///
+/// `CLOCK_UPTIME_RAW` -- domain A of `DESIGN.md` §3.4b, one 24 MHz timebase
+/// shared by CPU and GPU on Apple silicon (`sampleTimestamps:gpuTimestamp:`
+/// is the identity there). Not `Instant`, which is the same clock but does not
+/// expose its absolute value. One `clock_gettime` per command buffer, under
+/// `enabled()` only.
+#[cfg(target_os = "macos")]
+pub fn now_s() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable `timespec`; `CLOCK_UPTIME_RAW` is a
+    // clock id Darwin accepts. The call cannot fail for it.
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut ts);
+    }
+    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn now_s() -> f64 {
+    0.0
+}
 
 /// Record one `commit_swap_locked`, `elapsed` on the calling thread.
 #[inline]
@@ -184,9 +252,10 @@ pub fn record_encoder() {
     ENCODERS.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Record a completed command buffer's GPU interval.
+/// Record a completed command buffer's GPU interval, with the host's commit
+/// stamp (`now_s` at registration) and the step it was committed in.
 #[inline]
-pub fn record_command_buffer(start: f64, end: f64) {
+pub fn record_command_buffer(start: f64, end: f64, committed: f64, step: u64) {
     if !enabled() {
         return;
     }
@@ -199,8 +268,12 @@ pub fn record_command_buffer(start: f64, end: f64) {
     recorder()
         .lock()
         .unwrap()
-        .intervals
-        .push(GpuInterval { start, end });
+        .records
+        .push(CommandBufferRecord {
+            interval: GpuInterval { start, end },
+            committed,
+            step,
+        });
 }
 
 /// Merge sorted intervals, returning (union duration, span from first start to last end).
@@ -237,6 +310,61 @@ fn union_and_span(intervals: &mut [GpuInterval]) -> (f64, f64) {
     (union, last_end - first_start)
 }
 
+/// One stretch of GPU idle between two consecutive command buffers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IdleGap {
+    /// Seconds from the previous buffer's end (the running maximum, so an
+    /// overlapped buffer cannot open a gap inside another's interval) to this
+    /// buffer's start.
+    pub idle: f64,
+    /// The part of `idle` the host is answerable for: how long after the
+    /// previous buffer ended this one was committed, clamped to `[0, idle]`.
+    /// Zero when this buffer was already queued -- then the whole gap is the
+    /// seam.
+    pub starved: f64,
+    /// The step this buffer (the one that ended the idle) was committed in.
+    pub step: u64,
+    /// The previous buffer's end and this buffer's start, GPU clock seconds.
+    pub prev_end: f64,
+    pub start: f64,
+}
+
+/// The idle gaps between consecutive command buffers, in start order.
+///
+/// Split out from [`snapshot`] so the attribution -- starved against seam, the
+/// running-maximum end that keeps an overlapped buffer from opening a gap --
+/// is testable without a GPU.
+fn idle_gaps(records: &mut [CommandBufferRecord]) -> Vec<IdleGap> {
+    records.sort_by(|a, b| {
+        a.interval
+            .start
+            .partial_cmp(&b.interval.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut gaps = Vec::new();
+    let mut prev_end = match records.first() {
+        Some(r) => r.interval.end,
+        None => return gaps,
+    };
+    for r in &records[1..] {
+        if r.interval.start > prev_end {
+            let idle = r.interval.start - prev_end;
+            let starved = (r.committed - prev_end).clamp(0.0, idle);
+            gaps.push(IdleGap {
+                idle,
+                starved,
+                step: r.step,
+                prev_end,
+                start: r.interval.start,
+            });
+        }
+        if r.interval.end > prev_end {
+            prev_end = r.interval.end;
+        }
+    }
+    gaps
+}
+
 /// A profiling window's totals.
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -264,15 +392,32 @@ pub struct Snapshot {
     /// `flush_and_prune` calls, and the encoding-thread time they took.
     pub prunes: u64,
     pub prune_ns: u64,
+    /// Every timed command buffer, in GPU start order: interval, commit stamp,
+    /// step. The raw series a dump or a plot reads (issue #702).
+    pub command_buffer_records: Vec<CommandBufferRecord>,
+    /// The idle between consecutive command buffers, attributed: the
+    /// distribution behind `1 − busy/wall`, which the union alone reports as
+    /// one sum (issue #702).
+    pub idle_gaps: Vec<IdleGap>,
+    /// `min(GPUStartTime − committed)` over the timed buffers, seconds. A
+    /// buffer cannot start before it is committed, so a negative value says
+    /// the two stamps are not in one clock and every `starved` figure is void.
+    pub min_start_after_commit_s: f64,
 }
 
 /// Take the current totals without clearing them.
 pub fn snapshot() -> Snapshot {
     let rec = recorder().lock().unwrap();
 
-    let mut intervals = rec.intervals.clone();
+    let mut records = rec.records.clone();
+    let mut intervals: Vec<GpuInterval> = records.iter().map(|r| r.interval).collect();
     let sum: f64 = intervals.iter().map(|i| i.end - i.start).sum();
     let (union, span) = union_and_span(&mut intervals);
+    let idle_gaps = idle_gaps(&mut records);
+    let min_start_after_commit_s = records
+        .iter()
+        .map(|r| r.interval.start - r.committed)
+        .fold(f64::INFINITY, f64::min);
 
     // `Snapshot` keeps `String` keys: it is taken once per window (a run, or a
     // token boundary under `--per-token`), never per dispatch, so the
@@ -299,6 +444,9 @@ pub fn snapshot() -> Snapshot {
         create_cb_ns: CREATE_CB_NS.load(Ordering::Relaxed),
         prunes: PRUNES.load(Ordering::Relaxed),
         prune_ns: PRUNE_NS.load(Ordering::Relaxed),
+        command_buffer_records: records,
+        idle_gaps,
+        min_start_after_commit_s,
     }
 }
 
@@ -315,8 +463,9 @@ pub fn reset() {
     CREATE_CB_NS.store(0, Ordering::Relaxed);
     PRUNES.store(0, Ordering::Relaxed);
     PRUNE_NS.store(0, Ordering::Relaxed);
+    STEP.store(0, Ordering::Relaxed);
     let mut rec = recorder().lock().unwrap();
-    rec.intervals.clear();
+    rec.records.clear();
     rec.dispatches.clear();
 }
 
@@ -421,6 +570,70 @@ mod tests {
     #[test]
     fn empty_is_zero() {
         assert_eq!(union_and_span(&mut []), (0.0, 0.0));
+        assert!(idle_gaps(&mut []).is_empty());
+    }
+
+    fn rec(start: f64, end: f64, committed: f64, step: u64) -> CommandBufferRecord {
+        CommandBufferRecord {
+            interval: GpuInterval { start, end },
+            committed,
+            step,
+        }
+    }
+
+    /// The attribution issue #702 rests on: a buffer committed before the
+    /// previous one ended leaves a pure seam; one committed after it ended
+    /// leaves a gap the host is answerable for up to the moment it committed.
+    #[test]
+    fn a_gap_is_starved_only_past_the_commit() {
+        let mut rs = vec![
+            rec(0.0, 1.0, -0.5, 1),
+            // queued at 0.5, before the first ended: the 0.1 idle is all seam.
+            rec(1.1, 2.0, 0.5, 2),
+            // committed at 2.3, after the second ended at 2.0: of the 0.5
+            // idle, 0.3 is starved and 0.2 is the seam after the commit.
+            rec(2.5, 3.0, 2.3, 3),
+        ];
+        let gaps = idle_gaps(&mut rs);
+        assert_eq!(gaps.len(), 2);
+        assert!((gaps[0].idle - 0.1).abs() < 1e-12);
+        assert_eq!(gaps[0].starved, 0.0);
+        assert_eq!(gaps[0].step, 2);
+        assert!((gaps[1].idle - 0.5).abs() < 1e-12);
+        assert!((gaps[1].starved - 0.3).abs() < 1e-12);
+        assert_eq!(gaps[1].step, 3);
+    }
+
+    /// A commit later than the start it precedes is a clock-domain error, not
+    /// a starvation: `starved` is clamped to the idle, never past it.
+    #[test]
+    fn starved_never_exceeds_the_idle() {
+        let mut rs = vec![rec(0.0, 1.0, 0.0, 1), rec(1.2, 2.0, 5.0, 2)];
+        let gaps = idle_gaps(&mut rs);
+        assert_eq!(gaps.len(), 1);
+        assert!((gaps[0].starved - gaps[0].idle).abs() < 1e-12);
+    }
+
+    /// An overlapped buffer -- one that ends inside a longer one -- must not
+    /// open a gap: the running maximum end, the same rule the union uses.
+    #[test]
+    fn a_contained_buffer_opens_no_gap() {
+        let mut rs = vec![
+            rec(0.0, 10.0, 0.0, 1),
+            rec(1.0, 2.0, 0.5, 1),
+            rec(10.5, 11.0, 9.0, 2),
+        ];
+        let gaps = idle_gaps(&mut rs);
+        assert_eq!(gaps.len(), 1);
+        assert!((gaps[0].prev_end - 10.0).abs() < 1e-12);
+        assert!((gaps[0].idle - 0.5).abs() < 1e-12);
+    }
+
+    /// Back-to-back and touching buffers leave nothing to record.
+    #[test]
+    fn touching_buffers_leave_no_gap() {
+        let mut rs = vec![rec(0.0, 1.0, 0.0, 1), rec(1.0, 2.0, 0.5, 1)];
+        assert!(idle_gaps(&mut rs).is_empty());
     }
 
     /// The census must not allocate per dispatch (issue #579).

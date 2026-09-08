@@ -171,6 +171,24 @@ pub struct DecodeOptions {
     /// two back), so a deeper bound lets the forwards overlap. Restored to the
     /// decode depth before the step loop, so it has no effect on steady decode.
     pub prefill_pacer_depth: usize,
+    /// Stream tokens through a caller-owned [`RingReader`] instead of the hot
+    /// loop's commit-cadence drain. `false` (default) is the incumbent: on a
+    /// ring arm the loop drains the device ring at each commit and hands the
+    /// batch to `on_tokens` — which batches visibility into commit-sized bursts.
+    /// `true` (ring arms only) means the loop does **not** drain or call
+    /// `on_tokens` per commit at all: the ids already live on the device ring,
+    /// the caller reads them per-token off a
+    /// [`RingReader`](crate::generation::readback::RingReader) (no sync, no
+    /// wait), and the loop materialises the host id vec **once** from the ring
+    /// at end-of-run (for `DecodeOut::ids` and the sequence's token log). This
+    /// removes the visibility serialization (tokens stream per-token, not
+    /// per-commit-burst) AND the redundant per-commit host mirror — the ring is
+    /// the record.
+    ///
+    /// No effect on the blocking arm (its ids are host-side per step; it streams
+    /// per token already) or on [`Self::decode_until`]'s stop return (a caller
+    /// that needs stop-strings under a reader thread signals the loop itself).
+    pub stream_via_reader: bool,
 }
 
 /// One speculative round of [`Session::decode_speculative`], for the per-round
@@ -235,6 +253,7 @@ impl DecodeOptions {
             prefill_schedule: None,
             prefill_bulk: 0,
             prefill_pacer_depth: 0,
+            stream_via_reader: false,
         }
     }
 
@@ -745,6 +764,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // (`opts.in_flight_depth`, from warmup) or the floor — not a constant.
         let mut pacer = StepPacer::new(opts.pacer_depth());
         let pace = readback.loop_commits();
+        // The caller streams off its own `RingReader`: the ring arm skips the
+        // hot-loop drain and materialises the host id vec once at end-of-run.
+        // `pace == loop_commits`, so this is the ring-arm condition. Only the ring
+        // arms carry a device-resident ring to read; the blocking arm is
+        // host-side per step and this is a no-op for it.
+        let reader_owned = opts.stream_via_reader && pace;
         // Run prefill deeper than decode when asked: prefill is compute-bound and
         // a chunked / many-small-forward prefill serializes at the decode depth of
         // 2 (each forward waits on the one two back). A deeper bound lets the
@@ -1097,7 +1122,15 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // (`!loop_commits`) the id is already host-side after this step's own
             // readback, so there is nothing to gate — it streams per token, which
             // is what that arm is.
-            let stream_now = if loop_commits { committed_now } else { true };
+            // When the caller streams through its own `RingReader`, the ring arm
+            // does NOT drain here: the ids live on the device ring (read
+            // per-token off the reader, no sync) and the host id vec is
+            // materialised once at end-of-run. `produced` and EOS are per-step
+            // signals (`produced += 1`, `eos_of_last`), independent of the drain,
+            // so the loop is correct without it. The blocking arm ignores this
+            // (its ids are host-side per step; nothing to defer). `reader_owned`
+            // is hoisted above the loop.
+            let stream_now = !reader_owned && if loop_commits { committed_now } else { true };
             if stream_now {
                 let batch = readback.take_ids()?;
                 if !batch.is_empty() {
@@ -1166,20 +1199,48 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // On the per-token arms `eos_in_drained` is `None`, so the tail streams
         // whole as before.
         let tail_start = std::time::Instant::now();
-        let tail = readback.drain_all()?;
-        if !tail.is_empty() {
-            if let Some(k) = readback.eos_in_drained(&tail) {
-                let good = &tail[..k];
-                if !good.is_empty() {
-                    let _ = on_tokens(good)?;
-                    all_ids.extend_from_slice(good);
+        if reader_owned {
+            // The reader streamed every token off the device ring already, and
+            // the loop drained nothing, so `all_ids` is empty. Materialise the
+            // host id vec ONCE here: `drain_all` synchronises and reads the whole
+            // published range — `produced` good ids plus, on the poll arm, the
+            // trailing EOS token (published before the loop broke) and, on a
+            // deferred arm, any overrun. `produced` is the per-step count with
+            // EOS already excluded, so the first `produced` ids are exactly the
+            // good sequence, in order — trim to it. No `on_tokens` (the reader is
+            // the stream). The count/EOS are authoritative from the loop.
+            all_ids = readback.drain_all()?;
+            all_ids.truncate(produced);
+        } else {
+            // After the clock: EVERY id not yet drained — `drain_all`, not the
+            // incremental `take_ids`, because the poll arm may still have the last
+            // forwards in flight and its incremental drain refuses to read past what
+            // the GPU has published. `drain_all` synchronises up to the final slot,
+            // so the tail is complete; streamed too, so a caller sees the last
+            // tokens, then folded into the full `ids`. A host-on-drain arm that
+            // truncated at EOS above has already discarded its undrained slots, so
+            // its tail is empty and this costs it nothing.
+            //
+            // The tail is scanned for EOS too, for `EosRead::HostOnDrain`: if the run
+            // ended on `max_tokens` (not an EOS `break` above) the EOS may sit in the
+            // never-committed tail, and streaming it whole would emit tokens past it.
+            // On the per-token arms `eos_in_drained` is `None`, so the tail streams
+            // whole as before.
+            let tail = readback.drain_all()?;
+            if !tail.is_empty() {
+                if let Some(k) = readback.eos_in_drained(&tail) {
+                    let good = &tail[..k];
+                    if !good.is_empty() {
+                        let _ = on_tokens(good)?;
+                        all_ids.extend_from_slice(good);
+                    }
+                    readback.note_eos_truncation(tail.len() - k - 1);
+                    produced = all_ids.len();
+                    eos = true;
+                } else {
+                    let _ = on_tokens(&tail)?;
+                    all_ids.extend_from_slice(&tail);
                 }
-                readback.note_eos_truncation(tail.len() - k - 1);
-                produced = all_ids.len();
-                eos = true;
-            } else {
-                let _ = on_tokens(&tail)?;
-                all_ids.extend_from_slice(&tail);
             }
         }
         if all_ids.len() != produced {

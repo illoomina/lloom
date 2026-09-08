@@ -478,6 +478,18 @@ struct Args {
     #[arg(long)]
     spark: Option<String>,
 
+    /// Stream tokens through a device-ring reader thread instead of the hot
+    /// loop's commit-cadence drain (`DecodeOptions::stream_via_reader`). On the
+    /// ring arms the ids already live on the device ring; a reader thread reads
+    /// them per-token (no sync) and detokenizes/prints, so the stream is
+    /// per-token rather than batched into commit-sized bursts, and the hot loop
+    /// stops maintaining a redundant per-commit host mirror. Off by default
+    /// (the incumbent commit-drained path). No effect on `--dspark` (the
+    /// speculative body streams its accepted block host-side) or the blocking
+    /// readback arm (host-side per token already).
+    #[arg(long)]
+    stream_reader: bool,
+
     /// The rotating ring's history depth under `--cache rewindable` (non-dspark):
     /// the rewind horizon. `--dspark` sizes it from the drafter's block.
     #[arg(long, default_value_t = 16)]
@@ -1375,7 +1387,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| panic!("LLOOM_IN_FLIGHT must be an integer, got {v:?}")),
         Err(_) => session.measured_in_flight_depth(),
     };
-    let opts = DecodeOptions {
+    let mut opts = DecodeOptions {
         max_tokens: args.max_tokens,
         budget,
         lookahead: args.lookahead,
@@ -1390,6 +1402,10 @@ fn main() -> Result<()> {
         prefill_bulk: spark_bulk,
         // `LLOOM_PREFILL_IN_FLIGHT`: deeper prefill overlap (0 = decode depth).
         prefill_pacer_depth,
+        // `--stream-reader`: set below, AFTER the readback arm is built and a
+        // `RingReader` is actually obtained — so it is never true without a
+        // reader thread to stream (which would silence the output entirely).
+        stream_via_reader: false,
     };
 
     // The readback strategy is built BEFORE the prompt is read: it depends on
@@ -1417,6 +1433,27 @@ fn main() -> Result<()> {
         );
         None
     };
+
+    // `--stream-reader`: take a `RingReader` over the arm's device ring BEFORE
+    // the run, if the arm carries one (ring arm, mapped, quantum 1). The reader
+    // thread (spawned below) streams per-token off it while the decode loop
+    // writes ahead of the published clamp — the ring's lock-free SPSC. Only when
+    // a reader is actually obtained does `stream_via_reader` turn on: with it on
+    // the engine skips the hot-loop drain, so a run with no reader thread would
+    // print nothing. `None` on the blocking arm / dspark / an unmapped ring →
+    // the incumbent commit-drained path.
+    let ring_reader = if args.stream_reader {
+        readback_arm.as_ref().and_then(|a| a.reader())
+    } else {
+        None
+    };
+    opts.stream_via_reader = ring_reader.is_some();
+    if args.stream_reader && ring_reader.is_none() {
+        eprintln!(
+            "[stream-reader: no device ring to read (blocking arm, --dspark, or an unmapped \
+             ring); falling back to the commit-drained stream]"
+        );
+    }
 
     // ---- prompt: read stdin, wrap in the LFM2 chat template ---------------
     let mut prompt = String::new();
@@ -1580,64 +1617,140 @@ fn main() -> Result<()> {
     };
     let spsc = Arc::new(TokenSpsc::new(spsc_cap));
 
-    // The consumer thread: pop → detokenize → write stdout. A slow terminal stalls
-    // HERE, never the decode loop. Owns the tokenizer, the `TokenOutputStream` and
-    // the stdout handle for the whole run; parks briefly when the ring is empty
-    // (no notify from the producer — that per-commit futex wake is what spiked
-    // `step_waits` when this was an mpsc channel).
+    // Signals the streaming thread that the decode loop is done, so it drains
+    // what the ring still holds and exits (the `RingReader` path's counterpart
+    // of `spsc.closed`; the SPSC path uses `spsc.closed` itself).
+    let stream_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The consumer thread: detokenize → write stdout. A slow terminal stalls
+    // HERE, never the decode loop. Owns the tokenizer, the `TokenOutputStream`
+    // and the stdout handle for the whole run; parks briefly when there is
+    // nothing to read.
+    //
+    // TWO sources, chosen by `--stream-reader`:
+    //  * `RingReader` (ring arm, `--stream-reader`): reads ids per-token
+    //    straight off the device ring (`read_new`, no sync, no wait), so the
+    //    stream is per-token rather than batched into commit-sized bursts, and
+    //    the hot loop drains nothing. This is the async-output path.
+    //  * `TokenSpsc` (the incumbent): the hot loop pushes drained batches at the
+    //    commit cadence; this pops them. Used on the blocking arm, dspark, an
+    //    unmapped ring, or without `--stream-reader`.
     let consumer = {
-        let spsc = Arc::clone(&spsc);
         let first_visible_ns = Arc::clone(&first_visible_ns);
         let first_pop_ns = Arc::clone(&first_pop_ns);
         let first_detok_ns = Arc::clone(&first_detok_ns);
         let visible_stamps = Arc::clone(&visible_stamps);
-        std::thread::spawn(move || {
-            let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            let stamp = |slot: &AtomicU64| {
-                slot.compare_exchange(
-                    0,
-                    decode_start.elapsed().as_nanos() as u64,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .ok();
-            };
-            loop {
-                match spsc.pop() {
-                    Some(id) => {
-                        stamp(&first_pop_ns);
-                        let text = tos.next_token(id);
-                        stamp(&first_detok_ns);
-                        if let Ok(Some(text)) = text {
-                            stamp(&first_visible_ns);
-                            // Direct write to the locked stdout; a write that the
-                            // kernel cannot take right now blocks THIS thread only.
-                            let _ = out.write_all(text.as_bytes());
-                            let _ = out.flush();
-                            if let Ok(mut v) = visible_stamps.lock() {
-                                v.push(decode_start.elapsed().as_nanos() as u64);
+        let stamp_at = move |slot: &AtomicU64, start: std::time::Instant| {
+            slot.compare_exchange(
+                0,
+                start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .ok();
+        };
+        match ring_reader {
+            Some(mut reader) => {
+                let stream_done = Arc::clone(&stream_done);
+                std::thread::spawn(move || {
+                    let mut tos =
+                        candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    let mut buf: Vec<u32> = Vec::with_capacity(64);
+                    // Emit every id the reader hands us, in order. `read_new`
+                    // returns only the published prefix `[cursor, published)`,
+                    // never waiting; it stops at the first stop id itself (marks
+                    // `ended`) so we never print past EOS.
+                    let mut emit =
+                        |ids: &[u32], tos: &mut candle_examples::token_output_stream::TokenOutputStream, out: &mut std::io::StdoutLock<'_>| {
+                            for &id in ids {
+                                stamp_at(&first_pop_ns, decode_start);
+                                let text = tos.next_token(id);
+                                stamp_at(&first_detok_ns, decode_start);
+                                if let Ok(Some(text)) = text {
+                                    stamp_at(&first_visible_ns, decode_start);
+                                    let _ = out.write_all(text.as_bytes());
+                                    let _ = out.flush();
+                                    if let Ok(mut v) = visible_stamps.lock() {
+                                        v.push(decode_start.elapsed().as_nanos() as u64);
+                                    }
+                                }
+                            }
+                        };
+                    loop {
+                        buf.clear();
+                        match reader.read_new(&mut buf) {
+                            Ok(0) => {
+                                // Nothing new. If the loop is done, one last read
+                                // (the loop may have published after our last
+                                // read) then exit; else park briefly.
+                                if stream_done.load(Ordering::Acquire) {
+                                    buf.clear();
+                                    if let Ok(n) = reader.read_new(&mut buf) {
+                                        if n > 0 {
+                                            emit(&buf, &mut tos, &mut out);
+                                        }
+                                    }
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_micros(200));
+                            }
+                            Ok(_) => emit(&buf, &mut tos, &mut out),
+                            Err(lap) => {
+                                // The writer overtook the reader (a wedged
+                                // terminal beyond the consumer-slack ring). Report
+                                // rather than print stale slots; the run's ids are
+                                // still complete (the loop's end-of-run drain is
+                                // the record). §9.3 lap.
+                                eprintln!("[stream-reader: {lap}]");
+                                break;
                             }
                         }
                     }
-                    None => {
-                        if spsc.closed.load(Ordering::Acquire) {
-                            break;
-                        }
-                        // Nothing right now: yield the core briefly rather than spin
-                        // a poll. ~200 µs is invisible at a terminal cadence and
-                        // costs the producer nothing.
-                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    if let Ok(Some(rest)) = tos.decode_rest() {
+                        let _ = out.write_all(rest.as_bytes());
                     }
-                }
+                    let _ = out.flush();
+                })
             }
-            // The tail the stream still holds (a partial multibyte run), then flush.
-            if let Ok(Some(rest)) = tos.decode_rest() {
-                let _ = out.write_all(rest.as_bytes());
+            None => {
+                let spsc = Arc::clone(&spsc);
+                std::thread::spawn(move || {
+                    let mut tos =
+                        candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    loop {
+                        match spsc.pop() {
+                            Some(id) => {
+                                stamp_at(&first_pop_ns, decode_start);
+                                let text = tos.next_token(id);
+                                stamp_at(&first_detok_ns, decode_start);
+                                if let Ok(Some(text)) = text {
+                                    stamp_at(&first_visible_ns, decode_start);
+                                    let _ = out.write_all(text.as_bytes());
+                                    let _ = out.flush();
+                                    if let Ok(mut v) = visible_stamps.lock() {
+                                        v.push(decode_start.elapsed().as_nanos() as u64);
+                                    }
+                                }
+                            }
+                            None => {
+                                if spsc.closed.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_micros(200));
+                            }
+                        }
+                    }
+                    if let Ok(Some(rest)) = tos.decode_rest() {
+                        let _ = out.write_all(rest.as_bytes());
+                    }
+                    let _ = out.flush();
+                })
             }
-            let _ = out.flush();
-        })
+        }
     };
 
     let out = {
@@ -1700,6 +1813,7 @@ fn main() -> Result<()> {
     // Signal the consumer no more ids are coming and wait for it to drain what
     // remains, print the multibyte tail, and flush.
     spsc.closed.store(true, Ordering::Release);
+    stream_done.store(true, Ordering::Release);
     consumer.join().ok();
     let first_visible_at = match first_visible_ns.load(Ordering::Relaxed) {
         0 => None,
@@ -2752,6 +2866,21 @@ fn churn_snapshot(m: &candle::MetalDevice) -> ChurnSnapshot {
 enum ReadbackArm {
     Blocking(Blocking),
     Ring(Ring, &'static str),
+}
+
+impl ReadbackArm {
+    /// A [`RingReader`] over the arm's device ring for a streaming reader
+    /// thread, or `None` on the blocking arm (host-side per token, nothing to
+    /// read off a device ring) or a ring whose words are not CPU-mapped /
+    /// `quantum > 1`. Taken BEFORE the decode run; the reader then streams
+    /// concurrently while the loop writes ahead of the published clamp (the
+    /// ring's lock-free SPSC, §9.3).
+    fn reader(&self) -> Option<lloom::generation::RingReader> {
+        match self {
+            ReadbackArm::Blocking(_) => None,
+            ReadbackArm::Ring(rb, _) => rb.reader(),
+        }
+    }
 }
 
 /// Build the selected strategy. An unknown name is an error rather than a

@@ -334,6 +334,9 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         prefill_schedule: None,
         prefill_bulk: 0,
         prefill_pacer_depth: 0,
+        // Concurrent collects per-sequence ids for identity checks, not a live
+        // per-token stream; the RingReader path is the single-turn streaming arm.
+        stream_via_reader: false,
     };
     let capacity = 8 * ctx.max_tokens + 8 * (budget.period() + 2);
 

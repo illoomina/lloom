@@ -570,6 +570,18 @@ impl DSparkMlp {
     }
 }
 
+/// `true` when `LLOOM_DSPARK_EAGER_ATTN` is set, forcing the drafter's
+/// bidirectional block attention onto the eager `matmul → softmax → matmul`
+/// arm even on Metal, so the fused `sdpa` arm and its reference can be A/B'd
+/// for a parity gate (`lfm2_dspark_backbone.rs`). Read once — fixed for the
+/// process, like `conv_c_fusion_disabled` and the other `LLOOM_*` toggles, and
+/// so off the per-draft hot path (§15.2 #10: no per-token env read).
+fn dspark_eager_attn() -> bool {
+    use std::sync::OnceLock;
+    static EAGER: OnceLock<bool> = OnceLock::new();
+    *EAGER.get_or_init(|| std::env::var("LLOOM_DSPARK_EAGER_ATTN").is_ok())
+}
+
 #[derive(Debug)]
 struct DSparkAttention {
     q_proj: Linear,
@@ -602,6 +614,18 @@ impl DSparkAttention {
             num_kv_groups: cfg.num_kv_groups(),
             head_dim: hd,
         })
+    }
+
+    /// Whether the fused `sdpa` kernel has an instantiation for this head dim.
+    ///
+    /// The same set the target's `sdpa_full_applies` gates on
+    /// (`lfm2.rs`, `metal/kernels/sdpa.rs`); `head_dim` is `64` on the 2.6B
+    /// drafter, which is in it. Kept as a named predicate so the Metal arm's
+    /// guard reads as one condition and a checkpoint with an un-instantiated
+    /// head dim falls to the eager arm rather than bailing in the kernel.
+    fn head_dim_instantiated(head_dim: usize) -> bool {
+        const HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
+        HEAD_DIMS.contains(&head_dim)
     }
 
     /// Project `H_ctx` into this layer's context K/V and append to `cache`.
@@ -701,13 +725,37 @@ impl DSparkAttention {
             _ => (k, v),
         };
 
-        let k = crate::utils::repeat_kv(k, self.num_kv_groups)?;
-        let v = crate::utils::repeat_kv(v, self.num_kv_groups)?;
-
         let scale = 1f64 / (self.head_dim as f64).sqrt();
-        let attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        let attn = crate::nn::ops::softmax_last_dim(&attn)?;
-        let out = attn.matmul(&v)?;
+
+        // Two arms, one answer. The eager arm below is the reference and the CPU
+        // path; the fused `sdpa` arm is Metal-only and byte-parity-tested against
+        // it (`lfm2_dspark_backbone.rs`). The block attention is **bidirectional**
+        // (§10.2m, no mask), so `do_causal = false` and `mask = None` — the full
+        // kernel then attends every key block with no `-inf` masking
+        // (`scaled_dot_product_attention.metal`'s `do_causal` is a function
+        // constant; false compiles the causal clamp out). The kernel is GQA-native
+        // (`kv_head_idx = head / gqa_factor`), so K/V stay at `num_kv_heads` and the
+        // two `repeat_kv` expansions the eager arm needs are gone — a dispatch cut
+        // on the draft, which is dispatch-bound (§10.2w). `Sdpa` has no CPU impl
+        // (`nn/ops.rs`, "SDPA has no cpu impl"), and the drafter runs on both
+        // backends (the backbone's CPU/Metal digests must agree, §10.2p), so the
+        // arm is gated on the device rather than made the only path.
+        let out = if q.device().is_metal()
+            && Self::head_dim_instantiated(self.head_dim)
+            && !dspark_eager_attn()
+        {
+            // `q`: [b, num_heads, seq, head_dim]; `k`/`v`: [b, num_kv_heads,
+            // ctx+seq, head_dim] — the layout `sdpa` reads, and `q_seq = seq > 1`
+            // always (the draft block is a fixed γ ≥ 2, §10.2m), so it takes the
+            // full-attention route rather than the seq==1 vector one.
+            crate::nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)?
+        } else {
+            let k = crate::utils::repeat_kv(k, self.num_kv_groups)?;
+            let v = crate::utils::repeat_kv(v, self.num_kv_groups)?;
+            let attn = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+            let attn = crate::nn::ops::softmax_last_dim(&attn)?;
+            attn.matmul(&v)?
+        };
 
         let out = out
             .transpose(1, 2)?

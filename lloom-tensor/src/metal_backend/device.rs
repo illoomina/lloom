@@ -925,6 +925,14 @@ impl MetalDevice {
     /// caller is asked to release anything, and removing the arena with
     /// [`Self::clear_arena`] returns the device to the classical path exactly.
     pub fn install_arena(&self, plan: StepPlan, layout: ArenaLayout) -> Result<()> {
+        // The arena is one pointer for every activation, so the hazard tracker
+        // must key on ranges to see only true edges (§9.2e/§9.2f, route (a)).
+        // Selected here, by the mechanism that needs it, unless a harness
+        // pinned the key on purpose. Takes effect at the next encoder session,
+        // which is before any dispatch binds an arena slot.
+        crate::kernels::metal::set_hazard_key_unless_explicit(
+            crate::kernels::metal::HazardKey::Range,
+        );
         // `bump_capacity`, not `arena_bytes`: the two differ when the last
         // slot's size is not a multiple of the 128 B alignment, and a GPU bump
         // allocator rounds every request including the last (issue #70). Sizing

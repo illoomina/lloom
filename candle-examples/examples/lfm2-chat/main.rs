@@ -277,6 +277,15 @@ struct Args {
     #[arg(long)]
     arena: bool,
 
+    /// The arena's layout: `packed` (values with disjoint liveness share a
+    /// slot — §9.2's 68 KB, and 267 true write-after-read barriers a token
+    /// from the reuse, §9.2f) or `non-aliasing` (every value its own slot, no
+    /// two ever share bytes — the reference layout, the classical barrier
+    /// count exactly, ~3.5 MB). Hazard keying follows the arena: `Range`
+    /// unless `CANDLE_METAL_HAZARD_KEY` pins it.
+    #[arg(long, default_value = "packed")]
+    arena_layout: String,
+
     /// Route every decode dispatch through its `_packed` entry point and install
     /// the constants pool, WITHOUT the ICB replay executor. The arm that
     /// isolates what moving scalars off `setBytes` (inline, zero-alloc) and into
@@ -975,16 +984,22 @@ fn main() -> Result<()> {
     #[cfg(feature = "metal")]
     let arena = (args.arena || args.replay) && !args.dspark;
     #[cfg(feature = "metal")]
+    let arena_layout = match args.arena_layout.as_str() {
+        "packed" => candle::metal_backend::ArenaLayout::Packed,
+        "non-aliasing" | "nonaliasing" | "reference" => {
+            candle::metal_backend::ArenaLayout::NonAliasing
+        }
+        other => anyhow::bail!("unknown --arena-layout {other:?}; want packed or non-aliasing"),
+    };
+    #[cfg(feature = "metal")]
     if arena {
         if let Device::Metal(dev) = &device {
-            dev.arm_arena_recording(
-                candle::metal_backend::ArenaLayout::Packed,
-                ARENA_SKIP,
-                ARENA_RECORD_STEPS,
-            );
+            dev.arm_arena_recording(arena_layout, ARENA_SKIP, ARENA_RECORD_STEPS);
         }
         if !args.replay {
-            eprintln!("[arena: packed, recorded from the first decode steps; no executor]");
+            eprintln!(
+                "[arena: {arena_layout:?}, recorded from the first decode steps; no executor]"
+            );
         }
     }
     #[cfg(feature = "metal")]
@@ -1230,8 +1245,9 @@ fn main() -> Result<()> {
     let first_detok_ns = Arc::new(AtomicU64::new(0));
     // Every stdout write's stamp, for the visible cadence (how bursty the
     // stream is at the terminal): one `u64` push per write, off the hot thread.
-    let visible_stamps: Arc<std::sync::Mutex<Vec<u64>>> =
-        Arc::new(std::sync::Mutex::new(Vec::with_capacity(spsc_cap_hint(opts.max_tokens))));
+    let visible_stamps: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(
+        Vec::with_capacity(spsc_cap_hint(opts.max_tokens)),
+    ));
     // Device memory at the first token the consumer is handed -- i.e. after the
     // prefill and the first step -- so a cut-period sweep can read what the
     // prefill's intermediates cost in `pending` (§13.5o's open question).
@@ -1816,13 +1832,16 @@ fn main() -> Result<()> {
     if arena {
         if let Device::Metal(dev) = &device {
             match dev.arena_auto_report() {
+                // The key is what the arena's cost rests on (§9.2e), so the
+                // line that says the arena engaged says which key it ran under.
                 Some(r) => eprintln!(
                     "[arena: {:?} installed after decode step {}: {} of {} ordinals served; \
-                     rerecordings={} counters={:?}]",
+                     hazard_key={:?} rerecordings={} counters={:?}]",
                     r.layout,
                     r.installed_at_step,
                     r.covered,
                     r.total,
+                    candle::metal_backend::hazard_key(),
                     dev.arena_rerecordings(),
                     dev.arena_counters(),
                 ),

@@ -446,6 +446,11 @@ impl SegmentedRing {
     /// so every segment is full (uniform geometry). At least 2 tiles so one is free
     /// for the writer while the other drains.
     pub(crate) fn new(cap: usize, quantum: usize, device: &Device) -> Result<Self> {
+        // One autorelease pool for the construction: every `Tensor::zeros` below
+        // is a blit fill in its own command buffer, and at the default slack
+        // that is ~2 050 encoders + buffers autoreleased on a thread with no
+        // pool (`AutoreleaseScope` docs). Drained when this returns.
+        let _pool = lloom_tensor::AutoreleaseScope::new();
         let q = quantum.max(1);
         let total_tiles = (cap / q).max(2);
         let tiles_per_seg = (SEG_MAX_SLOTS / q).max(1);

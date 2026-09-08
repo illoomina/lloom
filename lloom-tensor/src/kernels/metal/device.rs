@@ -255,6 +255,25 @@ impl Device {
     /// This implements the same logic as MLX's device type detection.
     /// Reference: refs/mlx/mlx/backend/metal/device.cpp
     pub fn device_type(&self) -> MetalDeviceType {
+        // Cached per device (keyed on `registryID`): `mlx_gemm` asks on EVERY
+        // GEMM dispatch, and the answer costs `-[MTLDevice architecture]` plus
+        // its name as an `NSString` -- two autoreleased objects per matmul that
+        // leaked on a thread with no pool (665 `MTLArchitecture` per 60 tokens,
+        // `measurements/issue-706-raw/probes.log`) and a String allocation on
+        // the hot path either way. The architecture of a device does not change.
+        static CACHE: std::sync::OnceLock<(u64, MetalDeviceType)> = std::sync::OnceLock::new();
+        let id = self.registry_id();
+        if let Some((cached_id, ty)) = CACHE.get() {
+            if *cached_id == id {
+                return *ty;
+            }
+        }
+        let ty = self.device_type_uncached();
+        let _ = CACHE.set((id, ty));
+        ty
+    }
+
+    fn device_type_uncached(&self) -> MetalDeviceType {
         let arch = self.architecture_name();
         match arch.chars().last() {
             Some('p') => MetalDeviceType::Phone,

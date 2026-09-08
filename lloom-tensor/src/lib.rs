@@ -67,6 +67,8 @@ mod dummy_metal_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
+pub mod autorelease;
+pub use autorelease::AutoreleaseScope;
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 // Merged from candle-metal-kernels (RESTRUCTURING §7.1): the Metal kernel layer

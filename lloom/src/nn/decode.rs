@@ -718,6 +718,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 let mut off = 0usize; // the machine's position over the prompt
                 let mut step = if spark == 0 { prompt.len() } else { spark };
                 while off < prompt.len() {
+                    // Drains this chunk's autoreleased encoders and command
+                    // buffers when the iteration ends (`AutoreleaseScope` docs).
+                    let _pool = lloom_tensor::AutoreleaseScope::new();
                     let w = step.min(prompt.len() - off);
                     let chunk = &prompt[off..off + w];
                     // Stage this unit's tokens as the forward's input — zero-copy on
@@ -776,6 +779,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
             if opts.reached(produced) {
                 break;
             }
+            // One autorelease pool per step, dropped last: the step's encoders
+            // and command buffers are released here instead of never (the
+            // release loop leaked ~200 autoreleased objects a token with no
+            // pool on the thread -- `AutoreleaseScope` docs).
+            let _pool = lloom_tensor::AutoreleaseScope::new();
             stats.steps += 1;
             // Under `CANDLE_METAL_PROFILE=1` only: tell the profile recorder
             // which step the command buffers committed from here on belong to,
@@ -1296,6 +1304,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut since_commit = 0usize;
 
         while !eos && !opts.reached(produced) {
+            let _pool = lloom_tensor::AutoreleaseScope::new(); // per window, see the decode loop
             stats.steps += 1;
             let step_start = std::time::Instant::now();
 
@@ -1568,6 +1577,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // lane `i` waits on its own buffer only; its next verify is enqueued
         // behind the others' before the loop moves on.
         loop {
+            let _pool = lloom_tensor::AutoreleaseScope::new(); // per round, see the decode loop
             let mut progressed = false;
             for i in 0..n {
                 let Some(pending) = lanes[i].pending.take() else {
@@ -1844,6 +1854,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         drop(logits_rows);
 
         while !live.is_empty() {
+            let _pool = lloom_tensor::AutoreleaseScope::new(); // per batched step, see the decode loop
             let step_start = std::time::Instant::now();
             let b = live.len();
             for &i in &live {

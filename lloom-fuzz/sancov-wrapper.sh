@@ -11,14 +11,26 @@
 #
 # Wired by `.cargo/config.toml` (`build.rustc-wrapper`). Build scripts and
 # proc-macros pass through untouched (their crate names never match).
+#
+# `LLOOM_FUZZ_ASAN=1` adds `-Zsanitizer=address` to the SAME crates (nightly
+# rustc): the sanitizer on the engine and the harness, not on LibAFL and its
+# ~200 dependencies -- a global `-Zsanitizer=address` does not link on
+# aarch64-apple-darwin (`ld: initializer pointer has no target` in LibAFL's
+# `ctor` dependency). rustc links the ASan runtime when the final crate is
+# sanitized, which every `fuzz_*` binary is.
 rustc="$1"; shift
+extra=""
+if [ "${LLOOM_FUZZ_ASAN:-0}" = "1" ]; then
+  extra="-Zsanitizer=address"
+fi
 case " $* " in
   *" --crate-name lloom "*|*" --crate-name lloom_tensor "*|*" --crate-name lloom_fuzz "*|*" --crate-name fuzz_"*)
     exec "$rustc" "$@" \
       -Cpasses=sancov-module \
       -Cllvm-args=-sanitizer-coverage-level=3 \
       -Cllvm-args=-sanitizer-coverage-trace-pc-guard \
-      -Cllvm-args=-sanitizer-coverage-trace-compares
+      -Cllvm-args=-sanitizer-coverage-trace-compares \
+      $extra
     ;;
   *)
     exec "$rustc" "$@"

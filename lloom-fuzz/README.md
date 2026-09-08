@@ -61,6 +61,26 @@ clients' stdout/stderr, which the launcher otherwise silences.)
 Run campaigns under `lloom-arb share` so they never silently perturb a
 measurement (`CONTRIBUTING.md` §3.2b).
 
+## The ASan arm
+
+The sanitizer goes on the engine crates and the harness — `LLOOM_FUZZ_ASAN=1`
+makes `sancov-wrapper.sh` add `-Zsanitizer=address` to the same crates it
+instruments — not on LibAFL (a global `-Zsanitizer=address` does not link on
+this target: `ld: initializer pointer has no target` in the `ctor` crate).
+No LTO, so the guard count is ~1.28 M and the map must be 2 MiB:
+
+```sh
+LIBAFL_EDGES_MAP_DEFAULT_SIZE=2097152 LLOOM_FUZZ_ASAN=1 \
+  cargo +nightly build --profile fuzz-asan --target-dir target-asan --bin fuzz_kv_slot --bin fuzz_token_ring
+nm target-asan/aarch64-apple-darwin/fuzz-asan/fuzz_kv_slot | grep -c __asan     # 3209: the runtime is linked
+```
+
+Measured: 3 209 `__asan` symbols, 14 049 shadow-address sites; `kv_slot` 60 s
+corpus 109 and `token_ring --device cpu` 60 s corpus 95, **0 reports** on
+both (`ASAN_OPTIONS=verbosity=1 … --once` prints `AddressSanitizer Init done`,
+so the runtime is live). The Metal harnesses are not built under ASan: the
+engine's own `sanitize` profile covers the device path (§15.1g).
+
 ## The persistent record
 
 Every client keeps the last `--record N` (default 64) inputs it executed. On an

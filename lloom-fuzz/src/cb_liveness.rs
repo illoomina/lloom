@@ -108,6 +108,13 @@ pub struct Engagement {
 
 /// Run one sequence. The oracle fires at every `FlushAndWait` and at the end.
 pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
+    // An autorelease pool per sequence: the queue, the command buffers and the
+    // blit encoders come back autoreleased, and a thread with no pool never
+    // releases them (see `commands_fuzz::run_sequence`).
+    objc2::rc::autoreleasepool(|_| run_sequence_inner(dev, ops))
+}
+
+fn run_sequence_inner(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
     let queue = dev
         .new_command_queue()
         .map_err(|e| format!("new_command_queue: {e:?}"))?;

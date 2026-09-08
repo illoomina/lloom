@@ -205,12 +205,28 @@ fn encode(
 /// shrinks. Per #494/#504: a 400-operation failing sequence is not a bug report
 /// and a 4-operation one is.
 pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
+    // An autorelease pool per sequence. `commandBuffer`, the encoders and the
+    // device return autoreleased objects; on a thread with no pool they are
+    // never released ("autoreleased with no pool in place - just leaking",
+    // `OBJC_DEBUG_MISSING_POOLS=YES`), and in a debug build -- where objc2's
+    // retain of an autoreleased return does not take the claim fast path --
+    // ~460 sequences of encoded work exhaust the process: the next commit
+    // returns `Internal Error (00000206)` (lloom #706 follow-up).
+    objc2::rc::autoreleasepool(|_| run_sequence_inner(dev, ops))
+}
+
+fn run_sequence_inner(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
     let queue = dev
         .new_command_queue()
         .map_err(|e| format!("new_command_queue: {e:?}"))?;
     let residency_set = Arc::new(ResidencySet::new(dev));
     let cmds = Commands::new(queue, residency_set).map_err(|e| format!("Commands::new: {e:?}"))?;
-    let kernels = Kernels::new();
+    // One pipeline cache per process, not per sequence: a fresh `Kernels`
+    // per run compiles the `cos` pipeline again for every sequence, and in a
+    // debug build ~460 of those exhaust the process (lloom #706 follow-up:
+    // `Internal Error (00000206)` on the next commit; release runs 1200 clean).
+    static KERNELS: std::sync::OnceLock<Kernels> = std::sync::OnceLock::new();
+    let kernels = KERNELS.get_or_init(Kernels::new);
 
     let options = crate::kernels::RESOURCE_OPTIONS;
     let input = [1.0f32; 64];
@@ -231,7 +247,7 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
 
         match op {
             Op::Encode { dispatches } => {
-                encode(dev, &kernels, &cmds, &src, &dst, *dispatches)
+                encode(dev, kernels, &cmds, &src, &dst, *dispatches)
                     .map_err(|e| at(&format!("encoding: {e}")))?;
                 // The encoder cuts when the dispatch counter reaches the
                 // period, so `n` dispatches produce as many commits as the

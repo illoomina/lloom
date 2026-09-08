@@ -23,6 +23,7 @@ libafl_bolts = "0.16.1"
 libafl_targets = { version = "0.16.1", features = ["sancov_pcguard_hitcounts"] }
 anyhow = "1"
 libc = "0.2"
+objc2 = "0.6"
 clap = { version = "4", features = ["derive"] }
 
 [features]
@@ -53,15 +54,17 @@ panic = "abort"
 inherits = "fuzz-thin"
 lto = "fat"
 
-# The ASan arm: release codegen with LTO OFF, because the SanitizerCoverage
-# module constructor does not survive `-Zsanitizer=address` + LTO on
-# aarch64-apple-darwin (`ld: initializer pointer has no target in
-# ...ctor...rcgu.o`, measured on fuzz-thin; `issue-706-raw/probes.log`).
-# §15.1k's `sanitize` profile held LTO off for a different reason; the same
-# setting is what links here.
+# The ASan arm: the sanitizer on the ENGINE crates and the harness only, put
+# there by `sancov-wrapper.sh` under `LLOOM_FUZZ_ASAN=1` (nightly rustc), and
+# LTO off. A global `-Zsanitizer=address` does not link on
+# aarch64-apple-darwin -- `ld: initializer pointer has no target` in LibAFL's
+# `ctor` dependency, with LTO on or off -- and LibAFL is not what the arm is
+# for. Without LTO the guard count is 1 275 228, so the edges map must be
+# raised for this build (`issue-706-raw/probes.log`):
 #
-#     RUSTFLAGS="-Zsanitizer=address" cargo +nightly build --profile fuzz-asan \
-#         --target-dir target-asan --bin fuzz_kv_slot --bin fuzz_token_ring
+#     LIBAFL_EDGES_MAP_DEFAULT_SIZE=2097152 LLOOM_FUZZ_ASAN=1 \
+#       cargo +nightly build --profile fuzz-asan --target-dir target-asan \
+#       --bin fuzz_kv_slot --bin fuzz_token_ring
 [profile.fuzz-asan]
 inherits = "fuzz-thin"
 lto = "off"

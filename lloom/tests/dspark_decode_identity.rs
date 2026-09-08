@@ -270,6 +270,7 @@ fn decode_speculative_seeds_the_drafter_from_every_prompt_position() -> Result<(
         &mut |_: &[u32]| Ok(()),
     )?;
     assert!(out.ids.len() > k, "the run must span more than one round");
+    assert_eq!(out.stats.prefill_units, 1, "one-shot: one forward");
 
     let (drafts_before, rows, accepted) = spec.observed.first().expect("an observe ran");
     assert_eq!(
@@ -1099,6 +1100,10 @@ fn decode_speculative_streamed_prefill_seeds_every_unit() -> Result<()> {
         &mut |_: &[u32]| Ok(()),
     )?;
     assert!(out.ids.len() > k, "the run must span more than one round");
+    assert_eq!(
+        out.stats.prefill_units, 2,
+        "two forwards: the spark, then the remainder"
+    );
 
     let seed: Vec<&(usize, usize, Vec<u32>)> = spec
         .observed
@@ -1160,16 +1165,19 @@ fn decode_speculative_streamed_is_byte_identical_to_greedy_streamed() -> Result<
             prefill_ubatch: ubatch,
             ..DecodeOptions::new(max_tokens)
         };
-        session
-            .decode(
-                &mut spec,
-                &mut rb,
-                &mut sampler,
-                &prompt,
-                &opts,
-                &mut |_: &[u32]| Ok(()),
-            )?
-            .ids
+        let out = session.decode(
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &prompt,
+            &opts,
+            &mut |_: &[u32]| Ok(()),
+        )?;
+        assert_eq!(
+            out.stats.prefill_units, 2,
+            "greedy: the spark, then the remainder"
+        );
+        out.ids
     };
     assert!(
         ref_ids.len() > k,
@@ -1186,17 +1194,20 @@ fn decode_speculative_streamed_is_byte_identical_to_greedy_streamed() -> Result<
             prefill_ubatch: ubatch,
             ..DecodeOptions::new(max_tokens)
         };
-        session
-            .decode_speculative(
-                &mut spec,
-                &mut rb,
-                &mut sampler,
-                &prompt,
-                &opts,
-                &eos_ids,
-                &mut |_: &[u32]| Ok(()),
-            )?
-            .ids
+        let out = session.decode_speculative(
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &prompt,
+            &opts,
+            &eos_ids,
+            &mut |_: &[u32]| Ok(()),
+        )?;
+        assert_eq!(
+            out.stats.prefill_units, 2,
+            "speculative: the spark, then the remainder"
+        );
+        out.ids
     };
     assert_eq!(spec_ids, ref_ids, "streamed speculative != streamed greedy");
     Ok(())

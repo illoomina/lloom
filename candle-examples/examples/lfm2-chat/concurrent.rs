@@ -83,6 +83,10 @@ pub struct Ctx<'a> {
     pub commit_budget: &'a str,
     pub sequences: usize,
     pub chunk: usize,
+    /// `--prefill-ubatch`: the prefill's spark under `--dspark` (both its
+    /// arms seed the drafter unit by unit, `Session::prefill_streamed`). The
+    /// K=1 interleave and the batched arm prefill one-shot and do not read it.
+    pub prefill_ubatch: usize,
     /// `--dspark` — drive the concurrent sequences through the pipelined
     /// speculative driver instead of the time-sliced non-spec interleave.
     pub dspark: bool,
@@ -609,6 +613,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
     );
     let opts = DecodeOptions {
         max_tokens: ctx.max_tokens,
+        prefill_ubatch: ctx.prefill_ubatch,
         ..DecodeOptions::new(ctx.max_tokens)
     };
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -778,10 +783,14 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
     let speedup = (pipe.tokens() as f64 / pipe.wall_s) / (solo.tokens() as f64 / solo.wall_s);
     println!(
         "RESULT mode=concurrent dspark=true first={} {common} k={k} sequences={n} \
+         prefill_ubatch={} solo_prefill_units={:?} pipelined_prefill_units={:?} \
          solo_tokens={} solo_rounds={} solo_wall_s={:.4} solo_aggregate_tok_s={:.4} \
          pipelined_tokens={} pipelined_rounds={} pipelined_wall_s={:.4} pipelined_aggregate_tok_s={:.4} \
          speedup={:.4} identical={} per_seq_identical={:?} per_seq_tokens={:?}",
         ctx.first,
+        ctx.prefill_ubatch,
+        solo.outs.iter().map(|o| o.stats.prefill_units).collect::<Vec<_>>(),
+        pipe.outs.iter().map(|o| o.stats.prefill_units).collect::<Vec<_>>(),
         solo.tokens(),
         solo.rounds(),
         solo.wall_s,

@@ -112,18 +112,23 @@ pub struct DecodeOptions {
     /// [`Session::warmup`]'s return, or left 0 to fall back to the floor when no
     /// warmup ran (CPU, or warmup skipped).
     pub in_flight_depth: usize,
-    /// Prompt tokens per prefill micro-batch (the `n_ubatch` of the streamed
-    /// prefill). **`0` means the whole prompt in one pass** — the incumbent
-    /// one-shot. A positive value feeds the prompt through the SAME in-flight
-    /// pacer the decode loop uses, in chunks of this width, so the pipeline spans
-    /// prefill→decode with no drain and host-encode(chunk N+1) overlaps
-    /// GPU(chunk N). It is the TTFT-vs-throughput dial: larger chunks keep the
-    /// matmul units fuller (throughput, and it approaches one-shot as it reaches
-    /// the prompt length); smaller chunks overlap more and free the pipeline for
-    /// concurrent decode sooner. Correctness across chunk boundaries needs the
-    /// conv's left-context carry (`Config::conv_prefill_ctx`), which the streamed
-    /// path turns on for a multi-chunk run; a single chunk is identical either
-    /// way (a cold cache has no left context to carry).
+    /// The spark: how many prompt tokens the FIRST prefill forward takes.
+    /// **`0` means the whole prompt in one pass** — the incumbent one-shot. A
+    /// positive value splits the prompt into TWO forwards, the spark and then
+    /// the whole remainder (not `prompt_len / ubatch` chunks: the weight sweep
+    /// is per forward, so the bulk is fed once), the first through the SAME
+    /// in-flight pacer the decode loop uses so the first token streams off the
+    /// spark while the bulk runs. It is the TTFT-vs-throughput dial: a wider
+    /// spark keeps the matmul units fuller and approaches one-shot as it
+    /// reaches the prompt length. Honoured by [`Session::decode`] and by both
+    /// speculative drivers ([`Session::decode_speculative`],
+    /// [`Session::decode_speculative_pipelined`], which seed the drafter from
+    /// each unit's probe as it lands); [`Session::decode_batched`] prefills
+    /// one-shot. Correctness across the unit boundary needs the conv's
+    /// left-context carry (`Config::conv_prefill_ctx`), which the streamed
+    /// path turns on; a single unit is identical either way (a cold cache has
+    /// no left context to carry). [`DecodeStats::prefill_units`] reports the
+    /// forwards a run actually took.
     pub prefill_ubatch: usize,
 }
 
@@ -189,8 +194,8 @@ impl DecodeOptions {
         }
     }
 
-    /// Prompt tokens per prefill micro-batch, or the whole prompt in one pass when
-    /// `0` (the incumbent one-shot). See [`Self::prefill_ubatch`].
+    /// The spark width, or the whole prompt in one pass when `0` (the incumbent
+    /// one-shot). See the `prefill_ubatch` field.
     pub fn prefill_ubatch(&self) -> usize {
         self.prefill_ubatch
     }
@@ -205,6 +210,12 @@ pub struct DecodeStats {
     pub steps: u64,
     /// Submission time of the prompt's forward pass — encode, not execution.
     pub prefill_ns: u64,
+    /// Forward passes the prompt took: 1 one-shot, 2 streamed (the spark, then
+    /// the remainder — `prefill_ubatch` names the spark's width, not a chunk
+    /// count), 0 when the run resumed from held logits. Read it off the run
+    /// rather than deriving it from the option: a unit count that is only ever
+    /// computed from `prompt_len / ubatch` is not a measurement.
+    pub prefill_units: usize,
     /// Host time from the loop's exit to the run's return: the final drain
     /// (`ReadbackStrategy::drain_all`, which waits for the GPU) and the
     /// bookkeeping after it. Inside a caller's wall clock and outside the loop.
@@ -699,6 +710,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let pos_before = self.seq.pos;
         let census_before = census_snapshot();
         let prefill_start = std::time::Instant::now();
+        let mut prefill_units = 0usize;
         let mut logits = match self.seq.last_logits.take() {
             Some(held) if resume => held,
             _ => {
@@ -745,6 +757,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     self.seq.tokens.extend_from_slice(chunk);
                     last_logits = Some(out);
                     off += w;
+                    prefill_units += 1;
                     // After the spark, jump straight to the WHOLE remaining prompt
                     // (one big amortized forward) rather than doubling: the weight
                     // sweep is per-forward, so the only way to pay it ~once on the
@@ -762,6 +775,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         };
         end_executor_step(&device)?;
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
+        stats.prefill_units = prefill_units;
         let census_prefill = census_snapshot();
         stats.prefill_census = census_delta(&census_before, census_prefill.clone());
 
@@ -1136,6 +1150,75 @@ impl<'m, M: CausalLM> Session<'m, M> {
         Ok(())
     }
 
+    /// Prefill `prompt` in the units `ubatch` names and seed `spec`'s sequence
+    /// `seq` from every one of them: `begin`, then per unit a forward, its
+    /// probe taken and `observe`d with an empty accepted tail — the drafter
+    /// keys the unit's positions into its own context at the offset it
+    /// carries — so the drafter's context covers the whole prompt when the
+    /// last unit's logits come back. Returns those logits and the LAST unit's
+    /// probe, still unobserved: the caller reads the argmax back (the one host
+    /// wait of a seed, kept out of here so a driver can prefill N sequences
+    /// before it waits on any) and observes with it as the accepted tail.
+    ///
+    /// The units are `decode`'s — `ubatch` first, then the remainder — and
+    /// `0` is the incumbent one-shot. A target that overwrites its probe per
+    /// forward would seed the drafter from the last unit alone if a unit were
+    /// skipped; `probe_drops` is checked across the seed so that is a refusal
+    /// rather than a lower accept rate nothing else sees (§10.2w). The third
+    /// element is the number of forwards taken (`DecodeStats::prefill_units`).
+    fn prefill_streamed<S>(
+        &mut self,
+        spec: &mut S,
+        seq: SeqId,
+        prompt: &[u32],
+        ubatch: usize,
+        device: &Device,
+    ) -> Result<(Tensor, <S::Probe as TargetProbe>::Output, usize)>
+    where
+        S: Speculator,
+        M: Probes<S::Probe>,
+    {
+        spec.begin(seq, prompt)?;
+        // Whatever an earlier forward left in the probe slots — a warmup's, a
+        // previous request's — predates this seed and is nobody's positions:
+        // drained here, so the count below can move only between two probes
+        // of THIS seed, which is the defect the refusal is for.
+        let _stale = self.model.take_probe(&mut self.seq.cache)?;
+        let drops_before = self.model.probe_drops(&self.seq.cache);
+        let mut off = 0usize;
+        let mut units = 0usize;
+        let mut step = if ubatch == 0 { prompt.len() } else { ubatch };
+        loop {
+            let _pool = lloom_tensor::AutoreleaseScope::new();
+            let w = step.min(prompt.len() - off);
+            let chunk = &prompt[off..off + w];
+            let input = Tensor::new(chunk, device)?.unsqueeze(0)?;
+            let logits = self
+                .model
+                .forward(&input, self.seq.pos, &mut self.seq.cache)?;
+            self.seq.pos += w;
+            self.seq.tokens.extend_from_slice(chunk);
+            off += w;
+            units += 1;
+            step = prompt.len();
+            let probe = self.model.take_probe(&mut self.seq.cache)?;
+            let drops = self.model.probe_drops(&self.seq.cache);
+            if drops != drops_before {
+                lloom_tensor::bail!(
+                    "Session: the target dropped {} probe set(s) during the prefill — a forward \
+                     ran between two probes, so the drafter would be seeded from part of the \
+                     prompt (design/docs/speculation.md §10.2w)",
+                    drops - drops_before
+                );
+            }
+            if off < prompt.len() {
+                spec.observe(seq, &probe, &[])?;
+            } else {
+                return Ok((logits, probe, units));
+            }
+        }
+    }
+
     /// Decode from `prompt` with a real speculative proposer — stage 2 of
     /// `design/docs/decode-driver-design.md` ("the speculative body").
     ///
@@ -1197,73 +1280,6 @@ impl<'m, M: CausalLM> Session<'m, M> {
     ///
     /// # The drafter context is seeded from the prompt before round 0
     ///
-
-    /// Prefill `prompt` in the units `ubatch` names and seed `spec`'s sequence
-    /// `seq` from every one of them: `begin`, then per unit a forward, its
-    /// probe taken and `observe`d with an empty accepted tail — the drafter
-    /// keys the unit's positions into its own context at the offset it
-    /// carries — so the drafter's context covers the whole prompt when the
-    /// last unit's logits come back. Returns those logits and the LAST unit's
-    /// probe, still unobserved: the caller reads the argmax back (the one host
-    /// wait of a seed, kept out of here so a driver can prefill N sequences
-    /// before it waits on any) and observes with it as the accepted tail.
-    ///
-    /// The units are `decode`'s — `ubatch` first, then the remainder — and
-    /// `0` is the incumbent one-shot. A target that overwrites its probe per
-    /// forward would seed the drafter from the last unit alone if a unit were
-    /// skipped; `probe_drops` is checked across the seed so that is a refusal
-    /// rather than a lower accept rate nothing else sees (§10.2w).
-    fn prefill_streamed<S>(
-        &mut self,
-        spec: &mut S,
-        seq: SeqId,
-        prompt: &[u32],
-        ubatch: usize,
-        device: &Device,
-    ) -> Result<(Tensor, <S::Probe as TargetProbe>::Output)>
-    where
-        S: Speculator,
-        M: Probes<S::Probe>,
-    {
-        spec.begin(seq, prompt)?;
-        // Whatever an earlier forward left in the probe slots — a warmup's, a
-        // previous request's — predates this seed and is nobody's positions:
-        // drained here, so the count below can move only between two probes
-        // of THIS seed, which is the defect the refusal is for.
-        let _stale = self.model.take_probe(&mut self.seq.cache)?;
-        let drops_before = self.model.probe_drops(&self.seq.cache);
-        let mut off = 0usize;
-        let mut step = if ubatch == 0 { prompt.len() } else { ubatch };
-        loop {
-            let _pool = lloom_tensor::AutoreleaseScope::new();
-            let w = step.min(prompt.len() - off);
-            let chunk = &prompt[off..off + w];
-            let input = Tensor::new(chunk, device)?.unsqueeze(0)?;
-            let logits = self
-                .model
-                .forward(&input, self.seq.pos, &mut self.seq.cache)?;
-            self.seq.pos += w;
-            self.seq.tokens.extend_from_slice(chunk);
-            off += w;
-            step = prompt.len();
-            let probe = self.model.take_probe(&mut self.seq.cache)?;
-            let drops = self.model.probe_drops(&self.seq.cache);
-            if drops != drops_before {
-                lloom_tensor::bail!(
-                    "Session: the target dropped {} probe set(s) during the prefill — a forward \
-                     ran between two probes, so the drafter would be seeded from part of the \
-                     prompt (design/docs/speculation.md §10.2w)",
-                    drops - drops_before
-                );
-            }
-            if off < prompt.len() {
-                spec.observe(seq, &probe, &[])?;
-            } else {
-                return Ok((logits, probe));
-            }
-        }
-    }
-
     /// The prefill's probe (`Probes::take_probe`, every prompt position) is
     /// handed to `observe` before the first draft, with the prefill's argmax as
     /// the accepted tail — the `lfm2-dspark-verify` example's `--prefill-ctx
@@ -1334,9 +1350,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // `logits.argmax` when it does not hold the last prompt token back.
         let pos_before = self.seq.pos;
         let prefill_start = std::time::Instant::now();
-        let (logits, prefill_probe) =
+        let (logits, prefill_probe, prefill_units) =
             self.prefill_streamed(spec, seq, prompt, opts.prefill_ubatch(), &device)?;
         stats.prefill_ns = prefill_start.elapsed().as_nanos() as u64;
+        stats.prefill_units = prefill_units;
 
         let mut anchor_tok = logits
             .squeeze(0)?
@@ -1586,9 +1603,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
             s.seq.last_logits = None;
             let pos_before = s.seq.pos;
             let prefill_start = std::time::Instant::now();
-            let l =
+            let (l, probe, prefill_units) =
                 s.prefill_streamed(spec, SeqId(i), prompts[i], opts.prefill_ubatch(), device)?;
-            logits.push(l);
+            logits.push((l, probe));
             lanes.push(Lane {
                 anchor_tok: 0,
                 produced: 0,
@@ -1599,6 +1616,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 stats: DecodeStats {
                     step_ns: Vec::with_capacity(opts.max_tokens),
                     prefill_ns: prefill_start.elapsed().as_nanos() as u64,
+                    prefill_units,
                     hot_thread: hot_thread.report(),
                     ..DecodeStats::default()
                 },
@@ -1880,14 +1898,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
         for (i, s) in sessions.iter_mut().enumerate() {
             let pos_before = s.seq.pos;
             let prefill_start = std::time::Instant::now();
-            let logits = match s.seq.last_logits.take() {
-                Some(held) if prompts[i].is_empty() => held.unsqueeze(0)?,
+            let (logits, prefill_units) = match s.seq.last_logits.take() {
+                Some(held) if prompts[i].is_empty() => (held.unsqueeze(0)?, 0),
                 _ => {
                     let input = Tensor::new(prompts[i], device)?.unsqueeze(0)?;
                     let logits = s.model.forward(&input, s.seq.pos, &mut s.seq.cache)?;
                     s.seq.pos += prompts[i].len();
                     s.seq.tokens.extend_from_slice(prompts[i]);
-                    logits
+                    (logits, 1)
                 }
             };
             logits_rows.push(logits);
@@ -1902,6 +1920,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 stats: DecodeStats {
                     step_ns: Vec::with_capacity(opts.max_tokens),
                     prefill_ns: prefill_start.elapsed().as_nanos() as u64,
+                    prefill_units,
                     hot_thread: hot_thread.report(),
                     ..DecodeStats::default()
                 },

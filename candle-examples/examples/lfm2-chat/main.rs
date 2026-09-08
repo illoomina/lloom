@@ -430,16 +430,18 @@ struct Args {
     #[arg(long, default_value_t = 16)]
     chunk: usize,
 
-    /// Prompt tokens per prefill micro-batch — the `n_ubatch` of the streamed
-    /// prefill. **`0` (default) is the incumbent one-shot** (the whole prompt in
-    /// one forward). A positive value steps the state machine over the prompt in
-    /// chunks of this width through the SAME in-flight pacer the decode loop uses,
-    /// so the pipeline spans prefill→decode with no drain and the host encodes the
-    /// next chunk while the GPU runs the current one. It is the TTFT-vs-throughput
-    /// dial: larger keeps the matmul units fuller (throughput; it reaches one-shot
-    /// as it reaches the prompt length), smaller overlaps more and frees the
-    /// pipeline for the first generated token sooner. Streamed multi-chunk turns
-    /// on the conv's left-context carry so it stays byte-identical to one-shot.
+    /// The prefill's spark: how many prompt tokens the FIRST forward takes.
+    /// **`0` (default) is the incumbent one-shot** (the whole prompt in one
+    /// forward). A positive value runs the prompt as TWO forwards — the spark,
+    /// then the whole remainder (not `prompt_len / N` chunks; the weight sweep
+    /// is per forward) — through the SAME in-flight pacer the decode loop uses,
+    /// so the first token streams off the spark while the bulk runs. It is the
+    /// TTFT-vs-throughput dial: a wider spark keeps the matmul units fuller and
+    /// reaches one-shot at the prompt length. Honoured by the K=1 loop and by
+    /// `--dspark` (the drafter is seeded from each unit as it lands). The
+    /// RESULT line reports the arm (`prefill_ubatch=`) and the forwards the run
+    /// took (`prefill_units=`). A two-unit run turns on the conv's left-context
+    /// carry so it stays byte-identical to one-shot.
     #[arg(long, default_value_t = 0)]
     prefill_ubatch: usize,
 
@@ -949,6 +951,7 @@ fn main() -> Result<()> {
             commit_budget: &args.commit_budget,
             sequences: args.sequences,
             chunk: args.chunk,
+            prefill_ubatch: args.prefill_ubatch,
             dspark: args.dspark,
             batched: args.batched,
             check_independence: !args.no_independence_check,
@@ -1653,7 +1656,8 @@ fn main() -> Result<()> {
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \
          {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} bos={} \
-         readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
+         readback={} lookahead={} prefill_ubatch={} prefill_units={} \
+         commit_budget={} commits={} max_in_flight={} \
          step_markers={} step_waits={} cut={} pipelined_cut={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={} param-style={}]",
         b(format!("{end_to_end:.1}")),
@@ -1677,6 +1681,8 @@ fn main() -> Result<()> {
             &args.readback
         },
         args.lookahead,
+        args.prefill_ubatch,
+        st.prefill_units,
         budget.arm(),
         st.commits,
         st.max_in_flight,

@@ -22,6 +22,8 @@ pub mod decode;
 pub mod seam;
 pub mod slots;
 
-pub use decode::{DecodeParams, DecodeSession, Decoded, ReadbackArm, Stop};
+pub use decode::{
+    ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool, Stop,
+};
 pub use seam::Completer;
 pub use slots::{Routed, SlotPool, DEFAULT_SIMILARITY};

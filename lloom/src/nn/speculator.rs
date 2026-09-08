@@ -362,11 +362,18 @@ pub trait Probes<P: TargetProbe>: CausalLM {
     /// Verify the drafts and extract the probe in one pass. Returns, per active
     /// sequence, the accepted tokens (never empty — the target's own prediction
     /// at position 0 is always correct), plus the probe output for the round.
+    ///
+    /// `eos_ids` is the run's stop set, and an EOS the target emits ends the
+    /// accepted prefix at itself: the accepted length is what the cache keeps,
+    /// what the probe is trimmed to and how far the driver's cursor moves, so
+    /// a prefix past an EOS would carry all three past the reply's end
+    /// (`design/docs/speculation.md` §10.2z-ii). Empty draws no boundary.
     fn verify_and_probe(
         &self,
         drafts: &[Draft],
         anchors: &[Anchor],
         cache: &mut Self::Cache,
+        eos_ids: &[u32],
     ) -> Result<(Vec<Vec<u32>>, P::Output)>;
 
     /// The receipt of a verify pass that has been encoded and not read back.
@@ -390,11 +397,13 @@ pub trait Probes<P: TargetProbe>: CausalLM {
     /// Read back the pass [`Self::verify_enqueue`] encoded: the accepted tokens
     /// (never empty) and the round's probe, with the cache resolved to the
     /// accepted length. The wait is on the pass's own command buffer, so work
-    /// queued behind it — another sequence's round — keeps running.
+    /// queued behind it — another sequence's round — keeps running. `eos_ids`
+    /// bounds the prefix as in [`Self::verify_and_probe`].
     fn verify_complete(
         &self,
         pending: Self::Pending,
         cache: &mut Self::Cache,
+        eos_ids: &[u32],
     ) -> Result<(Vec<u32>, P::Output)>;
 
     /// Drain the probe the last non-verify pass (the prefill) left in `cache`,
@@ -842,12 +851,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
         active: &[SeqId],
         anchors: &[Anchor],
         p_min: f32,
+        eos_ids: &[u32],
     ) -> Result<Vec<Vec<u32>>>
     where
         S: Speculator,
         M: Probes<S::Probe>,
     {
-        self.speculative_round(spec, active, anchors, p_min, RoundProbe::default())
+        self.speculative_round(spec, active, anchors, p_min, eos_ids, RoundProbe::default())
             .map(|(accepted, _)| accepted)
     }
 
@@ -872,6 +882,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         active: &[SeqId],
         anchors: &[Anchor],
         p_min: f32,
+        eos_ids: &[u32],
         probe: RoundProbe<'_>,
     ) -> Result<(Vec<Vec<u32>>, RoundTiming)>
     where
@@ -912,7 +923,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let rb = readbacks();
         let (accepted, probe_out) =
             self.model
-                .verify_and_probe(&drafts, anchors, &mut self.seq.cache)?;
+                .verify_and_probe(&drafts, anchors, &mut self.seq.cache, eos_ids)?;
         let (gpu, disp, census) = probe.close()?;
         timing.verify_ns = t.elapsed().as_nanos() as u64;
         timing.verify_readbacks = readbacks() - rb;

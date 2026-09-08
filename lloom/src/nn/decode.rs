@@ -1188,12 +1188,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// its device handle and its commit cadence.
     ///
     /// An EOS inside a block ends the run at that token: the tokens before it are
-    /// streamed, the EOS and anything after it are not. The cache has advanced
-    /// past the accepted prefix (`resolve` kept `accepted.len()` positions), so
-    /// like `decode`'s `lookahead = 1` arm it can end one region past the EOS —
-    /// which is safe for a single-turn run whose cache ends with it
-    /// (`lfm2-chat`'s shape) and is why speculation needs the rewindable cache
-    /// (`RotatingRing` + `InPlace`) `advance`/`resolve` require.
+    /// streamed, the EOS is not. The accepted prefix itself ends at the EOS
+    /// (`accept_prefix` takes `eos_ids`), so the cache keeps exactly the
+    /// streamed tokens' positions, the drafter is keyed with no position past
+    /// the EOS, and the run leaves no overrun — the conservative K=1 arm's
+    /// shape, not the lookahead's one-past-EOS.
     ///
     /// # The drafter context is seeded from the prompt before round 0
     ///
@@ -1396,7 +1395,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 },
                 census: opts.sample_split && stats.steps == CENSUS_ROUND,
             };
-            let (accepted, timing) = self.speculative_round(spec, &[seq], &[anchor], 0.0, probe)?;
+            let (accepted, timing) =
+                self.speculative_round(spec, &[seq], &[anchor], 0.0, eos_ids, probe)?;
             let accepted = accepted.into_iter().next().ok_or_else(|| {
                 lloom_tensor::Error::msg("decode_speculative: verify returned no sequence")
             })?;
@@ -1654,7 +1654,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
                 let t = std::time::Instant::now();
                 let rb = readbacks();
-                let (accepted, probe_out) = s.model.verify_complete(pending, &mut s.seq.cache)?;
+                let (accepted, probe_out) =
+                    s.model
+                        .verify_complete(pending, &mut s.seq.cache, eos_ids)?;
                 timing.verify_wait_ns = t.elapsed().as_nanos() as u64;
                 timing.verify_ns = timing.verify_enqueue_ns + timing.verify_wait_ns;
                 timing.verify_readbacks += readbacks() - rb;

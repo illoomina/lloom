@@ -552,17 +552,17 @@ fn verify_arms_agree_on(dev: &Device) -> Result<()> {
         let want_len = if j < k { j + 1 } else { k + 1 };
 
         let mut cache_h = prefill()?;
-        let acc_h = model.verify_step(last, &proposed, pos, &mut cache_h)?;
+        let acc_h = model.verify_step(last, &proposed, pos, &mut cache_h, &eos_ids)?;
 
         let mut cache_d = prefill()?;
         let proposed_t = Tensor::new(proposed.as_slice(), dev)?;
-        let acc_d = model.verify_tokens(last, &proposed_t, pos, &mut cache_d)?;
+        let acc_d = model.verify_tokens(last, &proposed_t, pos, &mut cache_d, &eos_ids)?;
 
         // The pipelined arm: the same pass split at the readback, the wait on
         // its own marker (`verify_tokens_enqueue` / `verify_tokens_complete`).
         let mut cache_p = prefill()?;
         let pending = model.verify_tokens_enqueue(last, &proposed_t, pos, &mut cache_p)?;
-        let (acc_p, probe_p) = model.verify_tokens_complete(pending, &mut cache_p)?;
+        let (acc_p, probe_p) = model.verify_tokens_complete(pending, &mut cache_p, &eos_ids)?;
 
         assert_eq!(
             acc_h.len(),
@@ -1244,8 +1244,9 @@ impl lloom::nn::speculator::Probes<LayerTaps<5>> for TwiceForward<'_> {
         drafts: &[Draft],
         anchors: &[lloom::nn::speculator::Anchor],
         cache: &mut Cache,
+        eos_ids: &[u32],
     ) -> Result<(Vec<Vec<u32>>, Vec<Tensor>)> {
-        self.0.verify_and_probe(drafts, anchors, cache)
+        self.0.verify_and_probe(drafts, anchors, cache, eos_ids)
     }
     fn verify_enqueue(
         &self,
@@ -1259,8 +1260,9 @@ impl lloom::nn::speculator::Probes<LayerTaps<5>> for TwiceForward<'_> {
         &self,
         pending: Self::Pending,
         cache: &mut Cache,
+        eos_ids: &[u32],
     ) -> Result<(Vec<u32>, Vec<Tensor>)> {
-        self.0.verify_complete(pending, cache)
+        self.0.verify_complete(pending, cache, eos_ids)
     }
     fn take_probe(&self, cache: &mut Cache) -> Result<Vec<Tensor>> {
         self.0.take_probe(cache)
@@ -1343,5 +1345,465 @@ fn decode_speculative_refuses_a_seed_that_dropped_a_probe() -> Result<()> {
         err.to_string().contains("dropped 1 probe set"),
         "the refusal names the drop: {err}"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// EOS is an accept boundary: nothing past it is fed, kept or keyed.
+// ---------------------------------------------------------------------------
+
+/// A drafter that proposes the target's OWN greedy continuation, taken from a
+/// stream decoded with no stop set — so it runs through the natural EOS and
+/// proposes the tokens the target really emits after it. Every proposal
+/// agrees, so the only thing that can end a round's prefix before `k + 1` is
+/// the EOS boundary, which is what the tests below exercise. It records every
+/// `observe` (rows per tap, accepted) and tracks the loop's cursor from them.
+struct StreamOracle {
+    k: usize,
+    stream: Vec<u32>,
+    /// Index in `stream` of the next token to propose.
+    next: usize,
+    observed: Vec<(usize, Vec<u32>)>,
+}
+
+impl Speculator for StreamOracle {
+    type Probe = LayerTaps<5>;
+
+    fn n_seq(&self) -> usize {
+        1
+    }
+
+    fn max_draft(&self) -> usize {
+        self.k
+    }
+
+    fn begin(&mut self, _seq: SeqId, _prompt: &[u32]) -> Result<()> {
+        self.next = 0;
+        Ok(())
+    }
+
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        let block: Vec<u32> = (0..self.k)
+            .map(|i| self.stream.get(self.next + i).copied().unwrap_or(0))
+            .collect();
+        Ok(active.iter().map(|_| Draft::host(block.clone())).collect())
+    }
+
+    fn observe(
+        &mut self,
+        _seq: SeqId,
+        probe: &<Self::Probe as TargetProbe>::Output,
+        accepted: &[u32],
+    ) -> Result<()> {
+        let rows = probe[0].dim(1)?;
+        self.next += accepted.len();
+        self.observed.push((rows, accepted.to_vec()));
+        Ok(())
+    }
+}
+
+/// The target's greedy stream with NO reachable stop, `n` tokens long.
+fn unstopped_stream(
+    model: &Model,
+    cfg: &Config,
+    dev: &Device,
+    prompt: &[u32],
+    n: usize,
+) -> Result<Vec<u32>> {
+    let never = vec![u32::MAX];
+    let cache = Cache::new(true, DType::F32, cfg, dev)?;
+    let mut session = Session::new(model, cache);
+    let mut rb = Blocking::new(&never, dev)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut sampler,
+        prompt,
+        &DecodeOptions::new(n),
+        &mut |_| Ok(()),
+    )?;
+    assert_eq!(out.ids.len(), n, "the unstopped stream ran to the budget");
+    Ok(out.ids)
+}
+
+/// An (EOS id, position) in `stream` that ends a run INSIDE a fully-agreeing
+/// block of `k`: the id's first appearance is at `cut`, and `cut` falls at an
+/// interior block position — neither the block's first token nor its bonus —
+/// so an oracle drafter proposes tokens past it that the target agrees with.
+/// Positions are the stream's: index 0 is the prefill's argmax (the first
+/// anchor), and round `r` covers `1 + r(k+1) ..= (r+1)(k+1)` when every
+/// proposal agrees.
+fn mid_block_eos(stream: &[u32], k: usize) -> Option<(u32, usize)> {
+    (2..stream.len()).find_map(|cut| {
+        let j = (cut - 1) % (k + 1);
+        let interior = j >= 1 && j < k;
+        let fresh = !stream[..cut].contains(&stream[cut]);
+        (interior && fresh).then_some((stream[cut], cut))
+    })
+}
+
+/// The mid-block-EOS fixture: `K = 4` and this prompt give an unstopped stream
+/// `[12, 0, 12, 0, …, 10, 0, 10, …]` whose first `10` is at index 14 — block
+/// position 3 of the third round, with two fully-accepted rounds before it
+/// and the target agreeing past it. Hardcoded rather than searched, so a
+/// fixture change fails here instead of silently choosing a different case.
+const EOS_FIXTURE_K: usize = 4;
+const EOS_FIXTURE_PROMPT: [u32; 8] = [9, 8, 7, 6, 5, 4, 3, 2];
+const EOS_FIXTURE_EOS: u32 = 10;
+const EOS_FIXTURE_CUT: usize = 14;
+/// A second turn whose continuation does not reach the fixture's EOS within
+/// eight tokens, so a two-turn comparison compares something.
+const EOS_FIXTURE_TURN2: [u32; 5] = [1, 2, 3, 4, 5];
+
+fn eos_fixture(dev: &Device) -> Result<(Config, Model, Vec<u32>)> {
+    let cfg = tiny_config(EOS_FIXTURE_K);
+    let model = build(&cfg, dev)?;
+    let stream = unstopped_stream(&model, &cfg, dev, &EOS_FIXTURE_PROMPT, 40)?;
+    assert_eq!(
+        mid_block_eos(&stream, EOS_FIXTURE_K),
+        Some((EOS_FIXTURE_EOS, EOS_FIXTURE_CUT)),
+        "the fixture moved: stream {stream:?}"
+    );
+    Ok((cfg, model, stream))
+}
+
+/// A run stopped by an EOS inside a block leaves the cache, the cursor and the
+/// drafter's context at the EOS — nothing past it fed, kept or keyed — on
+/// `dev`, through the serial driver:
+///
+/// - the stream is the greedy stream up to the EOS;
+/// - the cache holds exactly the prompt plus the streamed tokens (`pos`), with
+///   no overrun to reconcile — the conservative K=1 arm's shape;
+/// - the next forward on that cache is bit-identical to the K=1 arm's, so the
+///   KV length and the conv phase agree, not only the count;
+/// - the drafter's last `observe` ends at the EOS, every observe's rows are its
+///   accepted length, and the rows keyed sum to the positions fed.
+///
+/// The oracle proposes the target's true continuation past the EOS, so without
+/// the boundary the target agrees past it and the block runs to `k + 1`: the
+/// cache, cursor and drafter then hold `k - j` positions the reply does not have.
+fn eos_mid_block_on(dev: &Device) -> Result<()> {
+    let prompt: Vec<u32> = EOS_FIXTURE_PROMPT.to_vec();
+    let turn2: Vec<u32> = EOS_FIXTURE_TURN2.to_vec();
+    let (cfg, model, stream) = eos_fixture(dev)?;
+    let (k, eos, cut) = (EOS_FIXTURE_K, EOS_FIXTURE_EOS, EOS_FIXTURE_CUT);
+    let j = (cut - 1) % (k + 1);
+    let eos_ids = vec![eos];
+
+    // The absolute reference: greedy K=1, blocking (lookahead 0 — no overrun).
+    let mut reference = Session::new(&model, Cache::new(true, DType::F32, &cfg, dev)?);
+    let ref_out = {
+        let mut rb = Blocking::new(&eos_ids, dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        reference.decode(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut sampler,
+            &prompt,
+            &DecodeOptions::new(40),
+            &mut |_| Ok(()),
+        )?
+    };
+    assert!(ref_out.eos);
+    assert_eq!(ref_out.ids, stream[..cut]);
+    assert_eq!(ref_out.stats.overrun, 0);
+    assert_eq!(reference.pos(), prompt.len() + cut);
+
+    // The subject: the oracle through the serial speculative driver.
+    let mut subject = Session::new(&model, Cache::new(true, DType::F32, &cfg, dev)?);
+    let mut spec = StreamOracle {
+        k,
+        stream: stream.clone(),
+        next: 0,
+        observed: Vec::new(),
+    };
+    let out = {
+        let mut rb = Blocking::new(&eos_ids, dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        subject.decode_speculative(
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &prompt,
+            &DecodeOptions::new(40),
+            &eos_ids,
+            &mut |_| Ok(()),
+        )?
+    };
+    assert!(out.eos, "the run ends on the EOS");
+    assert_eq!(
+        out.ids,
+        stream[..cut],
+        "the stream is the greedy stream up to the EOS"
+    );
+    // Non-vacuity: every round before the last accepted the full block (the
+    // oracle is right), and the last round is the one the EOS cut.
+    let rounds: Vec<usize> = out.stats.rounds.iter().map(|r| r.accepted).collect();
+    assert!(rounds.len() >= 2, "the run spans {} rounds", rounds.len());
+    assert!(
+        rounds[..rounds.len() - 1].iter().all(|&n| n == k + 1),
+        "every round before the EOS accepts the whole block: {rounds:?}"
+    );
+    assert_eq!(
+        *rounds.last().unwrap(),
+        j + 1,
+        "the last round accepts through the EOS at block position {j}: {rounds:?}"
+    );
+
+    // The cache ends at the last streamed token: no overrun, `pos` the K=1 arm's.
+    assert_eq!(
+        out.stats.overrun, 0,
+        "an EOS inside a block leaves no overrun (the cache was fed past the EOS)"
+    );
+    assert_eq!(subject.overrun(), 0);
+    assert_eq!(
+        subject.pos(),
+        prompt.len() + cut,
+        "the cache holds exactly the prompt and the streamed tokens"
+    );
+    assert_eq!(subject.pos(), reference.pos());
+
+    // The drafter: keyed through the EOS and not past it.
+    let (rows_last, acc_last) = spec.observed.last().expect("an observe ran");
+    assert_eq!(
+        acc_last.last(),
+        Some(&eos),
+        "the last accepted block ends at the EOS"
+    );
+    assert_eq!(*rows_last, acc_last.len());
+    for (rows, acc) in &spec.observed[1..] {
+        assert_eq!(
+            *rows,
+            acc.len(),
+            "a round's probe is trimmed to its accepted rows"
+        );
+    }
+    let keyed: usize = spec.observed[1..].iter().map(|(rows, _)| rows).sum();
+    assert_eq!(
+        keyed, cut,
+        "the rows keyed into the drafter after the seed are exactly the positions fed"
+    );
+    let fed: Vec<u32> = spec.observed[1..]
+        .iter()
+        .flat_map(|(_, acc)| acc.iter().copied())
+        .collect();
+    assert_eq!(
+        fed,
+        stream[1..=cut],
+        "the accepted blocks, end to end, are the stream through the EOS and nothing past it"
+    );
+    assert_eq!(
+        spec.observed[0].1,
+        stream[..1],
+        "the seed's accepted tail is the first anchor"
+    );
+
+    // The state, not only the count: the KV length and the conv phase are the
+    // K=1 arm's, and the next forward on both caches agrees to well under the
+    // accumulation-order spread (a window's K/V come from a multi-position pass,
+    // the K=1 arm's from single positions — ulp-level, §2.3.5a tier 2). The
+    // control that makes the tolerance evidence: the same forward on the
+    // reference cache fed one position further is off by orders more.
+    assert_eq!(subject.cache_mut().kv_len(), reference.cache_mut().kv_len());
+    assert_eq!(
+        subject.cache_mut().conv_phase(),
+        reference.cache_mut().conv_phase()
+    );
+    let next = |session: &mut Session<'_, Model>| -> Result<Vec<f32>> {
+        let at = session.pos();
+        let input = Tensor::new(&[turn2[0]], dev)?.unsqueeze(0)?;
+        model
+            .forward(&input, at, session.cache_mut())?
+            .flatten_all()?
+            .to_vec1::<f32>()
+    };
+    let max_abs = |a: &[f32], b: &[f32]| -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    };
+    let a = next(&mut reference)?;
+    let b = next(&mut subject)?;
+    let d = max_abs(&a, &b);
+    assert!(
+        d < 1e-5,
+        "the cache after a mid-block EOS is not the K=1 arm's: next-forward max |d| = {d}"
+    );
+    // Control: one position further along the reference cache.
+    let input = Tensor::new(&[turn2[0]], dev)?.unsqueeze(0)?;
+    let c = model
+        .forward(&input, reference.pos() + 1, reference.cache_mut())?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let dc = max_abs(&b, &c);
+    assert!(
+        dc > 1e-3,
+        "the control (one extra position) must be visibly different: max |d| = {dc}"
+    );
+    Ok(())
+}
+
+#[test]
+fn decode_speculative_stops_the_cache_and_the_drafter_at_a_mid_block_eos() -> Result<()> {
+    eos_mid_block_on(&Device::Cpu)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn decode_speculative_stops_the_cache_and_the_drafter_at_a_mid_block_eos_on_metal() -> Result<()> {
+    eos_mid_block_on(&Device::new_metal(0)?)
+}
+
+/// The pipelined driver takes the same boundary through `verify_complete`:
+/// one sequence, the oracle, the EOS inside a block — the stream, the
+/// overrun and the cursor are the serial driver's.
+#[test]
+fn decode_speculative_pipelined_stops_at_a_mid_block_eos() -> Result<()> {
+    let dev = Device::Cpu;
+    let prompt: Vec<u32> = EOS_FIXTURE_PROMPT.to_vec();
+    let (cfg, model, stream) = eos_fixture(&dev)?;
+    let (k, eos, cut) = (EOS_FIXTURE_K, EOS_FIXTURE_EOS, EOS_FIXTURE_CUT);
+    let eos_ids = vec![eos];
+    let mut sessions = vec![Session::new(
+        &model,
+        Cache::new(true, DType::F32, &cfg, &dev)?,
+    )];
+    let mut spec = StreamOracle {
+        k,
+        stream: stream.clone(),
+        next: 0,
+        observed: Vec::new(),
+    };
+    let prompts: [&[u32]; 1] = [&prompt];
+    let outs = Session::decode_speculative_pipelined(
+        &mut sessions,
+        &mut spec,
+        &prompts,
+        &DecodeOptions::new(40),
+        &eos_ids,
+        &dev,
+        &mut |_, _| Ok(()),
+    )?;
+    let out = &outs[0];
+    assert!(out.eos);
+    assert_eq!(out.ids, stream[..cut]);
+    assert_eq!(out.stats.overrun, 0, "no overrun past a mid-block EOS");
+    assert_eq!(sessions[0].overrun(), 0);
+    assert_eq!(sessions[0].pos(), prompt.len() + cut);
+    let j = (cut - 1) % (k + 1);
+    assert_eq!(out.stats.rounds.last().map(|r| r.accepted), Some(j + 1));
+    assert_eq!(spec.observed.last().and_then(|(_, a)| a.last()), Some(&eos));
+    Ok(())
+}
+
+/// A second turn after a speculative turn that ended on a mid-block EOS is
+/// byte-identical to the second turn after the K=1 arm's: `prepare` finds the
+/// cache exactly at the reply's end (an Extend with nothing to reconcile), and
+/// the continuation — greedy, or speculative again — is the reference's.
+///
+/// Recorded alongside: with the boundary absent the cache holds `k - j`
+/// positions past the EOS, and `prepare` reconciles them by a rewind before
+/// the turn (`Session::reconcile`, §10.10) — so the continuation was already
+/// identical; what the boundary changes is that there is nothing to rewind.
+#[test]
+fn a_turn_after_a_mid_block_eos_continues_identically_with_nothing_to_reconcile() -> Result<()> {
+    use lloom::nn::ReuseAction;
+    let dev = Device::Cpu;
+    let prompt: Vec<u32> = EOS_FIXTURE_PROMPT.to_vec();
+    let turn2: Vec<u32> = EOS_FIXTURE_TURN2.to_vec();
+    let (cfg, model, stream) = eos_fixture(&dev)?;
+    let (k, eos, cut) = (EOS_FIXTURE_K, EOS_FIXTURE_EOS, EOS_FIXTURE_CUT);
+    let eos_ids = vec![eos];
+    let greedy = || LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+
+    // Reference: K=1 blocking, turn 1 to the EOS, turn 2 appended.
+    let reference = {
+        let mut s = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+        let mut rb = Blocking::new(&eos_ids, &dev)?;
+        let t1 = s.decode(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut greedy(),
+            &prompt,
+            &DecodeOptions::new(40),
+            &mut |_| Ok(()),
+        )?;
+        assert_eq!(t1.ids, stream[..cut]);
+        let full: Vec<u32> = [prompt.clone(), t1.ids.clone(), turn2.clone()].concat();
+        let p = s.prepare(&full)?;
+        assert_eq!(p.action, ReuseAction::Extend);
+        assert_eq!(p.suffix, turn2);
+        s.decode(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut greedy(),
+            &p.suffix,
+            &DecodeOptions::new(8),
+            &mut |_| Ok(()),
+        )?
+        .ids
+    };
+    assert_eq!(reference.len(), 8, "the second turn runs to its budget");
+
+    // Subject: speculative turn 1 (the oracle, EOS mid-block), then turn 2 on
+    // the K=1 arm and, separately, speculative again with a garbage drafter.
+    for speculative_turn2 in [false, true] {
+        let mut s = Session::new(&model, Cache::new(true, DType::F32, &cfg, &dev)?);
+        let mut spec = StreamOracle {
+            k,
+            stream: stream.clone(),
+            next: 0,
+            observed: Vec::new(),
+        };
+        let mut rb = Blocking::new(&eos_ids, &dev)?;
+        let t1 = s.decode_speculative(
+            &mut spec,
+            &mut rb,
+            &mut greedy(),
+            &prompt,
+            &DecodeOptions::new(40),
+            &eos_ids,
+            &mut |_| Ok(()),
+        )?;
+        assert!(t1.eos);
+        assert_eq!(t1.ids, stream[..cut]);
+        assert_eq!(s.overrun(), 0, "nothing to reconcile after a mid-block EOS");
+        let pos_after_t1 = s.pos();
+        let full: Vec<u32> = [prompt.clone(), t1.ids.clone(), turn2.clone()].concat();
+        let p = s.prepare(&full)?;
+        assert_eq!(p.action, ReuseAction::Extend);
+        assert_eq!(p.suffix, turn2);
+        assert_eq!(s.pos(), pos_after_t1, "prepare rewound nothing");
+        let t2 = if speculative_turn2 {
+            let mut garbage = GarbageDrafter { k, token: 0 };
+            s.decode_speculative(
+                &mut garbage,
+                &mut rb,
+                &mut greedy(),
+                &p.suffix,
+                &DecodeOptions::new(8),
+                &eos_ids,
+                &mut |_| Ok(()),
+            )?
+            .ids
+        } else {
+            s.decode(
+                &mut IdentityProposer,
+                &mut rb,
+                &mut greedy(),
+                &p.suffix,
+                &DecodeOptions::new(8),
+                &mut |_| Ok(()),
+            )?
+            .ids
+        };
+        assert_eq!(
+            t2, reference,
+            "turn 2 after a speculative mid-block-EOS turn 1 (speculative turn 2: \
+             {speculative_turn2}) is not the K=1 arm's"
+        );
+    }
     Ok(())
 }

@@ -5430,12 +5430,13 @@ impl Model {
         proposed: &[u32],
         index_pos: usize,
         cache: &mut Cache,
+        eos_ids: &[u32],
     ) -> Result<Vec<u32>> {
         if proposed.is_empty() {
             lloom_tensor::bail!("lfm2 verify_step: no proposed tokens")
         }
         let proposed = Tensor::new(proposed, &cache.device)?;
-        self.verify_tokens(last, &proposed, index_pos, cache)
+        self.verify_tokens(last, &proposed, index_pos, cache, eos_ids)
     }
 
     /// [`Self::verify_step`] over proposals that are already on the device — a
@@ -5449,12 +5450,17 @@ impl Model {
     /// a second wait for the GPU per round, and the draft→verify seam would be
     /// a device→host→device round-trip of ids the host does not use until
     /// this compare.
+    ///
+    /// `eos_ids` is the run's stop set: the accepted prefix ends at the first
+    /// EOS the target emits ([`accept_prefix`]), so the cache never holds a
+    /// position past the reply's end.
     pub fn verify_tokens(
         &self,
         last: u32,
         proposed: &Tensor,
         index_pos: usize,
         cache: &mut Cache,
+        eos_ids: &[u32],
     ) -> Result<Vec<u32>> {
         let k = proposed.dims1()?;
         if k == 0 {
@@ -5486,7 +5492,7 @@ impl Model {
         // buffer, so the host waits for the GPU once and compares locally.
         let both = Tensor::cat(&[&argmax, proposed], 0)?.to_vec1::<u32>()?;
         let (argmax, proposed) = both.split_at(k + 1);
-        let accepted = accept_prefix(argmax, proposed);
+        let accepted = accept_prefix(argmax, proposed, eos_ids);
 
         // `n` positions of state survive: `last` and the `n - 1` proposals the
         // target agreed with. The remaining `k + 1 - n` were written by the
@@ -5559,11 +5565,12 @@ impl Model {
         &self,
         pending: PendingVerify,
         cache: &mut Cache,
+        eos_ids: &[u32],
     ) -> Result<(Vec<u32>, Vec<Tensor>)> {
         let PendingVerify { tok, both, k, taps } = pending;
         let both = both.to_vec1::<u32>()?;
         let (argmax, proposed) = both.split_at(k + 1);
-        let accepted = accept_prefix(argmax, proposed);
+        let accepted = accept_prefix(argmax, proposed, eos_ids);
         cache.resolve(tok, accepted.len())?;
         let n_acc = accepted.len();
         let probe = taps
@@ -5589,14 +5596,21 @@ impl Model {
 /// returned token is a target argmax — and a rejection costs nothing, since
 /// the target's token at the mismatch is what plain decoding would have
 /// emitted there.
-pub fn accept_prefix(argmax: &[u32], proposed: &[u32]) -> Vec<u32> {
+///
+/// The prefix also ends at the first token in `eos_ids`, which is kept: a reply
+/// has no positions after its EOS, and the accepted length is what the cache
+/// keeps, what the drafter is keyed with and how far the cursor moves — so a
+/// prefix running past an EOS the drafter happened to propose would feed all
+/// three with tokens the sequence does not have (§10.2z-ii). An empty set draws
+/// no boundary.
+pub fn accept_prefix(argmax: &[u32], proposed: &[u32], eos_ids: &[u32]) -> Vec<u32> {
     let k = proposed.len();
     debug_assert_eq!(argmax.len(), k + 1, "argmax covers the k + 1 window");
     let mut accepted = Vec::with_capacity(k + 1);
     for i in 0..=k {
         let target = argmax[i];
         accepted.push(target);
-        if i < k && target != proposed[i] {
+        if eos_ids.contains(&target) || (i < k && target != proposed[i]) {
             break;
         }
     }
@@ -5699,6 +5713,7 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
         drafts: &[crate::nn::Draft],
         anchors: &[crate::nn::Anchor],
         cache: &mut Self::Cache,
+        eos_ids: &[u32],
     ) -> Result<(Vec<Vec<u32>>, Vec<Tensor>)> {
         if drafts.len() != 1 || anchors.len() != 1 {
             lloom_tensor::bail!(
@@ -5712,10 +5727,10 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
         let anchor = anchors[0];
         let accepted = match &drafts[0].tokens {
             crate::nn::DraftTokens::Host(ids) => {
-                self.verify_step(anchor.last, ids, anchor.pos, cache)?
+                self.verify_step(anchor.last, ids, anchor.pos, cache, eos_ids)?
             }
             crate::nn::DraftTokens::Device(ids) => {
-                self.verify_tokens(anchor.last, ids, anchor.pos, cache)?
+                self.verify_tokens(anchor.last, ids, anchor.pos, cache, eos_ids)?
             }
         };
 
@@ -5763,8 +5778,9 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
         &self,
         pending: PendingVerify,
         cache: &mut Self::Cache,
+        eos_ids: &[u32],
     ) -> Result<(Vec<u32>, Vec<Tensor>)> {
-        self.verify_tokens_complete(pending, cache)
+        self.verify_tokens_complete(pending, cache, eos_ids)
     }
 
     fn take_probe(&self, cache: &mut Self::Cache) -> Result<Vec<Tensor>> {
@@ -6211,13 +6227,69 @@ mod tests {
     #[test]
     fn accept_prefix_keeps_the_agreeing_prefix_plus_the_targets_token() {
         let argmax = [10u32, 11, 12, 13];
-        assert_eq!(accept_prefix(&argmax, &[10, 11, 12]), vec![10, 11, 12, 13]);
-        assert_eq!(accept_prefix(&argmax, &[99, 11, 12]), vec![10]);
-        assert_eq!(accept_prefix(&argmax, &[10, 99, 12]), vec![10, 11]);
-        assert_eq!(accept_prefix(&argmax, &[10, 11, 99]), vec![10, 11, 12]);
+        let no_eos: &[u32] = &[];
+        assert_eq!(
+            accept_prefix(&argmax, &[10, 11, 12], no_eos),
+            vec![10, 11, 12, 13]
+        );
+        assert_eq!(accept_prefix(&argmax, &[99, 11, 12], no_eos), vec![10]);
+        assert_eq!(accept_prefix(&argmax, &[10, 99, 12], no_eos), vec![10, 11]);
+        assert_eq!(
+            accept_prefix(&argmax, &[10, 11, 99], no_eos),
+            vec![10, 11, 12]
+        );
         // A proposal equal to the wrong position's argmax is still wrong.
-        assert_eq!(accept_prefix(&argmax, &[11, 12, 13]), vec![10]);
-        assert_eq!(accept_prefix(&[7], &[]), vec![7]);
+        assert_eq!(accept_prefix(&argmax, &[11, 12, 13], no_eos), vec![10]);
+        assert_eq!(accept_prefix(&[7], &[], no_eos), vec![7]);
+    }
+
+    /// An EOS the target emits ends the prefix at itself — kept, and nothing
+    /// past it — wherever it falls: an agreed interior position, position 0,
+    /// the bonus, or the mismatch position. An EOS that is only PROPOSED (the
+    /// target emitted something else) is an ordinary mismatch, and a set that
+    /// names no id in the window changes nothing.
+    #[test]
+    fn accept_prefix_ends_at_the_first_eos_the_target_emits() {
+        let eos: &[u32] = &[7, 8];
+        // Interior: the drafter proposed the EOS and the target agreed, then
+        // both continued past it. Cut at the EOS.
+        assert_eq!(
+            accept_prefix(&[10, 7, 12, 13], &[10, 7, 12], eos),
+            vec![10, 7]
+        );
+        // Position 0: the target's own first token is the EOS.
+        assert_eq!(accept_prefix(&[7, 11, 12, 13], &[7, 11, 12], eos), vec![7]);
+        // The bonus token: the whole block agreed and the target then stopped.
+        assert_eq!(
+            accept_prefix(&[10, 11, 12, 8], &[10, 11, 12], eos),
+            vec![10, 11, 12, 8]
+        );
+        // The mismatch position: the target emits EOS where the drafter
+        // proposed 99. One cut, same result as the mismatch alone.
+        assert_eq!(
+            accept_prefix(&[10, 7, 12, 13], &[10, 99, 12], eos),
+            vec![10, 7]
+        );
+        // A proposed EOS the target rejects is a mismatch, not a boundary.
+        assert_eq!(
+            accept_prefix(&[10, 11, 12, 13], &[10, 7, 12], eos),
+            vec![10, 11]
+        );
+        // The second id of the set cuts too.
+        assert_eq!(
+            accept_prefix(&[10, 8, 12, 13], &[10, 8, 12], eos),
+            vec![10, 8]
+        );
+        // No EOS in the window: the plain rule.
+        assert_eq!(
+            accept_prefix(&[10, 11, 12, 13], &[10, 11, 12], eos),
+            vec![10, 11, 12, 13]
+        );
+        // The empty set draws no boundary — the pre-boundary rule verbatim.
+        assert_eq!(
+            accept_prefix(&[10, 7, 12, 13], &[10, 7, 12], &[]),
+            vec![10, 7, 12, 13]
+        );
     }
 
     /// The two arms' shapes and contents, built the way `Attention::forward`

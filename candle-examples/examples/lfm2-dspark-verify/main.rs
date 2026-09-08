@@ -1181,7 +1181,7 @@ fn main() -> Result<()> {
         // matching prefix accepted, KV rewound and conv phase rolled for the
         // rest. This is `lfm2.rs:3199` and this loop is its first caller.
         let t_verify = std::time::Instant::now();
-        let accepted = spec_model.verify_step(last, &proposed, index_pos, &mut cache)?;
+        let accepted = spec_model.verify_step(last, &proposed, index_pos, &mut cache, &[])?;
         let b_verify = if args.timing {
             close_bracket(&device, t_verify)?
         } else {

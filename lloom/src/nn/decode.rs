@@ -84,7 +84,10 @@ impl Speculator for IdentityProposer {
 }
 
 /// The knobs of one decode run.
-#[derive(Debug, Clone, Copy)]
+// Not `Copy`: `prefill_schedule` is an owned `Vec`. `DecodeOptions` is passed
+// by reference everywhere (`opts: &DecodeOptions`), so this costs the hot path
+// nothing; the two struct-update sites (`..opts.clone()`) clone explicitly.
+#[derive(Debug, Clone)]
 pub struct DecodeOptions {
     /// Tokens to produce at most; EOS may stop the run earlier. **`0` means
     /// UNBOUNDED** — run until EOS with no ceiling (the token-ring history wraps,
@@ -130,6 +133,28 @@ pub struct DecodeOptions {
     /// no left context to carry). [`DecodeStats::prefill_units`] reports the
     /// forwards a run actually took.
     pub prefill_ubatch: usize,
+    /// An explicit prefill schedule: the exact widths of the forwards the
+    /// prompt is fed through, in order. **`None` (the default) keeps the
+    /// incumbent `prefill_ubatch` ramp** (one-shot, or spark-then-remainder) —
+    /// byte-identical to before this field existed. `Some(units)` overrides it:
+    /// the prompt is fed as forwards of `units[0], units[1], …` tokens, each
+    /// clamped to the remaining prompt, and any prompt left after the schedule
+    /// is exhausted is covered by `seq_len == 1` forwards (the tail).
+    ///
+    /// The point is to keep every prefill forward on an *aligned* GEMM tile
+    /// variant. `Model::forward` selects a tile by the row count `m` (= the
+    /// forward's `seq_len`) and compiles an M-boundary-guarded variant unless
+    /// `m % bm == 0` (`mlx_gemm::select_tile_config`, `align_m`); a one-shot
+    /// forward at an arbitrary `m = prompt.len()` lands on whatever variant that
+    /// `m` picks, frequently the slower guarded one on the largest forward of
+    /// the request. A schedule of aligned buckets ({16, 32} on the 16-row tile,
+    /// 64 on the 64-row tile) keeps each forward on the no-guard variant, and a
+    /// `1` unit is the `seq_len == 1` decode path. The CLI's `--spark` builds
+    /// this; see that flag.
+    ///
+    /// **Read once, in the prefill prologue** — the steady decode loop never
+    /// consults it, so a schedule adds no per-token cost on the hot path.
+    pub prefill_schedule: Option<Vec<usize>>,
 }
 
 /// One speculative round of [`Session::decode_speculative`], for the per-round
@@ -191,6 +216,7 @@ impl DecodeOptions {
             sample_split: false,
             in_flight_depth: 0,
             prefill_ubatch: 0,
+            prefill_schedule: None,
         }
     }
 
@@ -725,15 +751,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // the bulk is ONE big amortized forward, so TTFT drops without the
                 // per-chunk weight-sweep tax. `spark == 0` means one-shot (the whole
                 // prompt in one chunk): the incumbent, byte-identical, no ramp.
-                let spark = opts.prefill_ubatch();
+                // The widths of the forwards this prompt is fed through, in
+                // order. `None` schedule → the incumbent ramp (`prefill_widths`
+                // reproduces "one-shot" and "spark, then remainder" exactly);
+                // `Some` → the explicit schedule, bucket tail included. Computed
+                // once here, in the prologue: the steady loop below never reads
+                // it (hot-path-neutral).
+                let widths =
+                    prefill_widths(prompt.len(), opts.prefill_ubatch(), &opts.prefill_schedule);
                 let mut last_logits = None;
                 let mut off = 0usize; // the machine's position over the prompt
-                let mut step = if spark == 0 { prompt.len() } else { spark };
-                while off < prompt.len() {
+                for w in widths {
                     // Drains this chunk's autoreleased encoders and command
                     // buffers when the iteration ends (`AutoreleaseScope` docs).
                     let _pool = lloom_tensor::AutoreleaseScope::new();
-                    let w = step.min(prompt.len() - off);
                     let chunk = &prompt[off..off + w];
                     // Stage this unit's tokens as the forward's input — zero-copy on
                     // the ring arm for a spark-sized chunk (≤ the input tile width),
@@ -758,17 +789,6 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     last_logits = Some(out);
                     off += w;
                     prefill_units += 1;
-                    // After the spark, jump straight to the WHOLE remaining prompt
-                    // (one big amortized forward) rather than doubling: the weight
-                    // sweep is per-forward, so the only way to pay it ~once on the
-                    // bulk is to feed the bulk in ONE chunk. Doubling would pay it
-                    // log(N) times; "spark + rest" pays it twice total (the spark's
-                    // small sweep + one bulk sweep). The GPU is already producing
-                    // after the spark, so the big chunk does not hurt TTFT — the
-                    // first token streamed off the spark. (A prompt larger than the
-                    // input machinery can hold in one pass would cap here; for the
-                    // chat path the whole rest fits.)
-                    step = prompt.len();
                 }
                 last_logits.expect("a non-empty prompt steps at least once")
             }
@@ -2220,6 +2240,147 @@ const CENSUS_ROUND: u64 = 6;
 /// prices a pipeline creation at (measured 40 ms of `prefill_ns` at `m` = 64
 /// before this list carried the aligned 64-row variant, §13.5o).
 pub const WARMUP_PREFILL_LENS: [usize; 4] = [8, 16, 40, 64];
+
+/// The forward widths a prefill of `prompt_len` tokens is fed through, in order.
+///
+/// This is the one place the prefill's forward shape is decided, so the
+/// incumbent ramp and the explicit `--spark` schedule cannot drift.
+///
+/// * `schedule = None` — the **incumbent** `prefill_ubatch` ramp, reproduced
+///   byte-for-byte: `ubatch == 0` is one-shot (`[prompt_len]`); a positive
+///   `ubatch` is the spark then the whole remainder (`[ubatch, prompt_len −
+///   ubatch]`), clamped so a spark wider than the prompt is a single forward.
+/// * `schedule = Some(units)` — feed forwards of `units[0], units[1], …`, each
+///   clamped to what is left, stopping when the prompt is consumed; if the
+///   schedule runs out with prompt remaining, the **tail** is covered by
+///   `seq_len == 1` forwards. (A caller that wants the tail amortized puts a
+///   wide bucket last; the `1`-token tail is the safe default because every
+///   `m` past the schedule would otherwise be an arbitrary, possibly-unaligned
+///   width — the very thing the schedule exists to avoid.)
+///
+/// Total is always exactly `prompt_len` (each width ≤ the remainder, and the
+/// tail closes any gap), so the caller's `off` walks the prompt exactly once.
+/// An empty prompt yields no forwards.
+fn prefill_widths(
+    prompt_len: usize,
+    ubatch: usize,
+    schedule: &Option<Vec<usize>>,
+) -> Vec<usize> {
+    if prompt_len == 0 {
+        return Vec::new();
+    }
+    match schedule {
+        None => {
+            // The incumbent ramp: one-shot, or spark + remainder.
+            if ubatch == 0 || ubatch >= prompt_len {
+                vec![prompt_len]
+            } else {
+                vec![ubatch, prompt_len - ubatch]
+            }
+        }
+        Some(units) => {
+            let mut widths = Vec::new();
+            let mut left = prompt_len;
+            for &u in units {
+                if left == 0 {
+                    break;
+                }
+                let w = u.min(left);
+                if w == 0 {
+                    // A `0` in the schedule is a no-op unit, not a stall.
+                    continue;
+                }
+                widths.push(w);
+                left -= w;
+            }
+            // Cover any remaining prompt one token at a time — a `seq_len == 1`
+            // forward per leftover token, so no arbitrary-width forward sneaks
+            // in past the schedule.
+            for _ in 0..left {
+                widths.push(1);
+            }
+            widths
+        }
+    }
+}
+
+#[cfg(test)]
+mod prefill_widths_tests {
+    use super::prefill_widths;
+
+    // The `None` schedule must reproduce the incumbent ramp exactly — this is
+    // the byte-identity contract the crown rests on.
+    #[test]
+    fn none_one_shot_is_the_whole_prompt() {
+        assert_eq!(prefill_widths(400, 0, &None), vec![400]);
+        assert_eq!(prefill_widths(1, 0, &None), vec![1]);
+    }
+
+    #[test]
+    fn none_spark_is_spark_then_remainder() {
+        assert_eq!(prefill_widths(400, 16, &None), vec![16, 384]);
+        assert_eq!(prefill_widths(400, 64, &None), vec![64, 336]);
+    }
+
+    #[test]
+    fn none_spark_wider_than_prompt_is_one_shot() {
+        // A spark ≥ the prompt is a single forward, as the old `step.min` did.
+        assert_eq!(prefill_widths(10, 16, &None), vec![10]);
+        assert_eq!(prefill_widths(16, 16, &None), vec![16]);
+    }
+
+    #[test]
+    fn none_empty_prompt_is_no_forwards() {
+        assert_eq!(prefill_widths(0, 0, &None), Vec::<usize>::new());
+        assert_eq!(prefill_widths(0, 16, &None), Vec::<usize>::new());
+    }
+
+    // An explicit schedule feeds its units, then a `1`-token tail.
+    #[test]
+    fn schedule_fixed_bucket_covers_with_tail() {
+        // `--spark=16` on a 40-token prompt: [16], then 24 left → but the
+        // schedule is just [16]; the remaining 24 are 1-token forwards.
+        let want: Vec<usize> = std::iter::once(16).chain(std::iter::repeat(1).take(24)).collect();
+        assert_eq!(prefill_widths(40, 0, &Some(vec![16])), want);
+    }
+
+    #[test]
+    fn schedule_progressive_ramps_then_tail() {
+        // progressive:1,64 → units [1,16,32,64], prompt 200: 1+16+32+64=113
+        // consumed, 87 left as 1-token forwards.
+        let widths = prefill_widths(200, 0, &Some(vec![1, 16, 32, 64]));
+        assert_eq!(&widths[..4], &[1, 16, 32, 64]);
+        assert_eq!(widths.iter().sum::<usize>(), 200);
+        assert_eq!(widths.len(), 4 + 87);
+    }
+
+    #[test]
+    fn schedule_exhausted_exactly_has_no_tail() {
+        // A schedule whose units sum to the prompt leaves no tail.
+        assert_eq!(prefill_widths(64, 0, &Some(vec![64])), vec![64]);
+        assert_eq!(prefill_widths(48, 0, &Some(vec![16, 32])), vec![16, 32]);
+    }
+
+    #[test]
+    fn schedule_unit_wider_than_remainder_is_clamped() {
+        // A `64` unit on a 40-token prompt clamps to 40, no negative left.
+        assert_eq!(prefill_widths(40, 0, &Some(vec![64])), vec![40]);
+    }
+
+    #[test]
+    fn schedule_total_is_always_prompt_len() {
+        for &plen in &[1usize, 7, 16, 33, 64, 100, 347, 512] {
+            for units in [vec![1], vec![16], vec![64], vec![1, 16, 32, 64], vec![32, 32]] {
+                let widths = prefill_widths(plen, 0, &Some(units.clone()));
+                assert_eq!(
+                    widths.iter().sum::<usize>(),
+                    plen,
+                    "schedule {units:?} on prompt {plen} must total the prompt",
+                );
+            }
+        }
+    }
+}
 
 /// The device's `(libraries, pipelines)` cache sizes, or `(0, 0)` off Metal.
 fn cache_sizes(device: &Device) -> (usize, usize) {

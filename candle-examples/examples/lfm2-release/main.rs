@@ -1628,7 +1628,7 @@ fn run_turns<R: ReadbackStrategy>(
         // `turns_run` are what would otherwise move.
         let turn_opts = DecodeOptions {
             max_tokens: args.n - tokens.len(),
-            ..*opts
+            ..opts.clone()
         };
         // No streaming: this is the perf harness, whose number is the whole
         // generation and whose digest is taken from the ids after the clock. A

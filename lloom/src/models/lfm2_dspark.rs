@@ -2100,6 +2100,45 @@ impl DSparkSpeculator {
         self.ctx_kv
     }
 
+    /// Compile the drafter's pipelines off the clock, the drafter counterpart of
+    /// [`crate::nn::decode::Session::warmup`].
+    ///
+    /// The target's warmup compiles the *target's* GEMM/attention pipelines, but
+    /// the drafter runs its own: the backbone attention and projections at
+    /// `m = block_size` (γ), the shared `lm_head` over the block, the encoder
+    /// `fc` matmul, the Markov/confidence heads. None is a target shape, so all
+    /// are cold on the first real round — a fixed cost the first `--dspark` TTFT
+    /// carries every process (the pipeline cache does not outlive one). Running a
+    /// real `draft_one` here pays that compile at load, where no user clock runs;
+    /// `synchronize` forces it to *complete* rather than leak into round 0.
+    ///
+    /// A draft is **read-only** on the sequence (`draft_one(&self, &PerSeq)`; the
+    /// KV write is `observe`'s), so this leaves nothing behind — no reset needed.
+    /// It drafts on slot 0, which exists from construction (`last = 0`, empty
+    /// context, `ctx_offset = 0`): a block off the anchor `0` over an empty
+    /// context, which exercises every drafter pipeline a real block will.
+    ///
+    /// A no-op when there are no slots. `synchronize` is a device wait, so this
+    /// is a load-time call, never a per-round one.
+    pub fn warmup(&mut self, device: &Device) -> Result<()> {
+        if self.seqs.is_empty() {
+            return Ok(());
+        }
+        // Force the confidence head's pipeline too when the drafter has one, so
+        // a run that later asks for confidence pays no cold compile mid-stream.
+        // Restored after, so this does not change what round 0 computes.
+        let was_wanted = self.confidence_wanted;
+        self.confidence_wanted = self.drafter.confidence_head().is_some();
+        // Slot 0 exists (checked above) and a draft is read-only on it, so this
+        // borrow does not outlive the immutable draft and nothing is mutated.
+        let result = self.draft_one(&self.seqs[0]);
+        self.confidence_wanted = was_wanted;
+        result?;
+        // Complete the compile here rather than leaking it into round 0.
+        device.synchronize()?;
+        Ok(())
+    }
+
     fn seq_mut(&mut self, seq: SeqId) -> Result<&mut PerSeq> {
         self.seqs
             .get_mut(seq.0)

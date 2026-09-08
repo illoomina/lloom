@@ -330,6 +330,8 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         // One-shot prefill: the concurrent interleave is not the streamed-prefill
         // path (that is the single-decode CLI's dial).
         prefill_ubatch: 0,
+        // `--spark` is refused on the concurrent path (main.rs); one-shot here.
+        prefill_schedule: None,
     };
     let capacity = 8 * ctx.max_tokens + 8 * (budget.period() + 2);
 
@@ -502,7 +504,7 @@ fn run_concurrent(
             let want = ctx.chunk.min(ctx.max_tokens - streams[i].len());
             let visit_opts = DecodeOptions {
                 max_tokens: want,
-                ..*opts
+                ..opts.clone()
             };
             let out = decode(
                 &mut sessions[i],
@@ -921,7 +923,7 @@ fn run_batched_concurrent(
         let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
         let warm = DecodeOptions {
             max_tokens: 4,
-            ..batched_opts
+            ..batched_opts.clone()
         };
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let _ = Session::decode_batched(

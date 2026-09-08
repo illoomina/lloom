@@ -450,6 +450,34 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     prefill_ubatch: usize,
 
+    /// The prefill's forward schedule, in **aligned GEMM buckets**. Overrides
+    /// `--prefill-ubatch` when set; unset keeps the incumbent one-shot / ubatch
+    /// ramp, byte-identical.
+    ///
+    /// A prefill forward at an arbitrary `m` (= the prompt length, one-shot)
+    /// lands on whatever GEMM tile variant that `m` selects — often the slower
+    /// M-boundary-guarded one (`m % bm ≠ 0`) on the largest forward of the
+    /// request. `--spark` keeps every forward on an aligned bucket instead:
+    ///
+    ///   * `--spark=N` — a fixed first bucket, then a `seq_len == 1` tail.
+    ///     `N ∈ {1, 16, 32, 64}`: `1` is the `seq_len == 1` decode path, `16`
+    ///     and `32` are the aligned 16-row tile, `64` the aligned 64-row tile.
+    ///     `4`/`8` and other widths are rejected — they key the *unaligned*
+    ///     16-row variant (`m % 16 ≠ 0`), which is what this flag avoids.
+    ///   * `--spark=progressive:START,STOP` — ramp through the buckets from
+    ///     `START` to `STOP` (both in `{1, 16, 32, 64}`, `START ≤ STOP`), e.g.
+    ///     `progressive:1,64` feeds `1, 16, 32, 64`, then a `seq_len == 1` tail.
+    ///     A low-latency dial: the first token sparks off the narrow head while
+    ///     the wider buckets fill the units.
+    ///
+    /// The `1`-token tail is deliberate: it keeps the prompt's remainder off an
+    /// arbitrary-width forward. `--spark` forces the conv left-context carry on
+    /// (as `--prefill-ubatch` does) so a multi-forward prefill stays
+    /// byte-identical to one-shot. The RESULT line reports the schedule and each
+    /// forward's tile alignment (`spark=`).
+    #[arg(long)]
+    spark: Option<String>,
+
     /// The rotating ring's history depth under `--cache rewindable` (non-dspark):
     /// the rewind horizon. `--dspark` sizes it from the drafter's block.
     #[arg(long, default_value_t = 16)]
@@ -609,6 +637,147 @@ fn read_drafter_config(dir: &Path) -> Result<DSparkConfig> {
     })
 }
 
+/// The `--spark` grammar: parse a schedule string into the aligned-bucket
+/// forward widths [`DecodeOptions::prefill_schedule`] takes, and tag each width
+/// with the GEMM tile variant it selects for the RESULT line.
+mod spark {
+    use anyhow::{bail, Result};
+
+    /// The forward widths a `--spark` schedule may name. `1` is the
+    /// `seq_len == 1` decode path; `16`/`32` are the aligned 16-row GEMM tile
+    /// (`m % 16 == 0`, `mlx_gemm::SKINNY_TILE_MAX_M == 32`), `64` the aligned
+    /// 64-row tile. Widths off this set (`4`, `8`, …) key the *unaligned*
+    /// 16-row variant and are rejected — avoiding them is the point of the flag.
+    pub const BUCKETS: [usize; 4] = [1, 16, 32, 64];
+
+    /// The tile variant a prefill forward of `m` tokens selects, for reporting.
+    /// Mirrors `mlx_gemm::select_tile_config` + its `align_m = m % bm == 0`:
+    /// `m == 1` is the decode/GEMV path; `m < 33` the 16-row tile (aligned iff
+    /// `m % 16 == 0`); `m ≥ 33` the 64-row tile (aligned iff `m % 64 == 0`).
+    pub fn tile_tag(m: usize) -> &'static str {
+        const SKINNY_MAX: usize = 32; // mlx_gemm::SKINNY_TILE_MAX_M
+        if m == 1 {
+            "seq1"
+        } else if m <= SKINNY_MAX {
+            if m % 16 == 0 {
+                "16row-aligned"
+            } else {
+                "16row-UNALIGNED"
+            }
+        } else if m % 64 == 0 {
+            "64row-aligned"
+        } else {
+            "64row-UNALIGNED"
+        }
+    }
+
+    fn bucket_or_err(n: usize) -> Result<usize> {
+        if BUCKETS.contains(&n) {
+            Ok(n)
+        } else {
+            bail!(
+                "--spark bucket {n} is not aligned: it keys the unaligned 16-row GEMM \
+                 variant (m % 16 != 0, slower per DESIGN §13.5o). Use one of {BUCKETS:?} \
+                 (1 = seq_len 1; 16, 32 = aligned 16-row; 64 = aligned 64-row)."
+            )
+        }
+    }
+
+    /// Parse `--spark`. `"N"` → a fixed first bucket `[N]`;
+    /// `"progressive:START,STOP"` → the buckets from `START` to `STOP`
+    /// inclusive. The engine covers any prompt left after the schedule with a
+    /// `seq_len == 1` tail ([`super::DecodeOptions::prefill_schedule`]).
+    pub fn parse(s: &str) -> Result<Vec<usize>> {
+        let s = s.trim();
+        if let Some(range) = s.strip_prefix("progressive:") {
+            let (a, b) = range.split_once(',').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--spark=progressive:START,STOP needs two buckets, e.g. \
+                     progressive:1,64 (got {range:?})"
+                )
+            })?;
+            let start = bucket_or_err(a.trim().parse().map_err(|_| {
+                anyhow::anyhow!("--spark progressive START must be an integer, got {a:?}")
+            })?)?;
+            let stop = bucket_or_err(b.trim().parse().map_err(|_| {
+                anyhow::anyhow!("--spark progressive STOP must be an integer, got {b:?}")
+            })?)?;
+            if start > stop {
+                bail!("--spark=progressive:{start},{stop}: START must be <= STOP");
+            }
+            // The buckets in [start, stop], in ascending order.
+            Ok(BUCKETS
+                .iter()
+                .copied()
+                .filter(|&n| n >= start && n <= stop)
+                .collect())
+        } else {
+            let n = s.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "--spark takes a bucket ({BUCKETS:?}) or progressive:START,STOP, got {s:?}"
+                )
+            })?;
+            Ok(vec![bucket_or_err(n)?])
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn fixed_bucket_ok() {
+            assert_eq!(parse("16").unwrap(), vec![16]);
+            assert_eq!(parse("1").unwrap(), vec![1]);
+            assert_eq!(parse("64").unwrap(), vec![64]);
+        }
+
+        #[test]
+        fn fixed_non_bucket_rejected() {
+            assert!(parse("4").is_err());
+            assert!(parse("8").is_err());
+            assert!(parse("100").is_err());
+        }
+
+        #[test]
+        fn progressive_ramps_the_buckets() {
+            assert_eq!(parse("progressive:1,64").unwrap(), vec![1, 16, 32, 64]);
+            assert_eq!(parse("progressive:1,16").unwrap(), vec![1, 16]);
+            assert_eq!(parse("progressive:16,64").unwrap(), vec![16, 32, 64]);
+            assert_eq!(parse("progressive:1,32").unwrap(), vec![1, 16, 32]);
+        }
+
+        #[test]
+        fn progressive_bad_bounds_rejected() {
+            assert!(parse("progressive:64,1").is_err()); // start > stop
+            assert!(parse("progressive:4,64").is_err()); // 4 not a bucket
+            assert!(parse("progressive:1").is_err()); // missing STOP
+        }
+
+        #[test]
+        fn tile_tags_match_the_bucket_model() {
+            assert_eq!(tile_tag(1), "seq1");
+            assert_eq!(tile_tag(16), "16row-aligned");
+            assert_eq!(tile_tag(32), "16row-aligned");
+            assert_eq!(tile_tag(8), "16row-UNALIGNED");
+            assert_eq!(tile_tag(64), "64row-aligned");
+            assert_eq!(tile_tag(100), "64row-UNALIGNED");
+        }
+    }
+}
+
+/// The Metal kernel cache's `(libraries, pipelines)` sizes, or `(0, 0)` off
+/// Metal — so the drafter warmup can report how many pipelines it compiled
+/// (mirrors `Session::warmup`'s return, which the drafter path cannot reach).
+fn cache_sizes_of(device: &Device) -> (usize, usize) {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        return m.kernels().cache_sizes();
+    }
+    let _ = device;
+    (0, 0)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -646,6 +815,22 @@ fn main() -> Result<()> {
         // SAFETY: single-threaded here, before any drafter or thread exists.
         unsafe { std::env::set_var("LLOOM_DSPARK_CTX_KV", arm) };
     }
+
+    // `--spark` overrides `--prefill-ubatch`: an explicit aligned-bucket
+    // schedule for the prefill's forwards (`DecodeOptions::prefill_schedule`).
+    // Parsed once here (it does not depend on the prompt — the engine covers
+    // the tail); `None` keeps the incumbent ubatch ramp. Threaded into both the
+    // dspark and the crown `DecodeOptions` below.
+    let spark_schedule: Option<Vec<usize>> = match &args.spark {
+        Some(s) => Some(spark::parse(s).context("--spark")?),
+        None => None,
+    };
+    // A schedule that runs more than one forward is the chunked-prefill case
+    // and REQUIRES the conv left-context carry, exactly as `--prefill-ubatch`
+    // does (see `config.conv_prefill_ctx` below). A single-forward schedule
+    // (e.g. `--spark=64` on a ≤64-token prompt) needs no carry, but forcing it
+    // on is always safe (a single chunk is identical either way).
+    let spark_multi_forward = spark_schedule.as_ref().is_some_and(|u| u.len() > 1);
     let dspark_setup: Option<DsparkSetup> = if args.dspark {
         let draft_dir = args
             .draft_dir
@@ -810,7 +995,8 @@ fn main() -> Result<()> {
     // from char 1). With it on, a chunked prefill computes exactly what one-shot
     // does. A single chunk (or one-shot) is identical either way (cold cache, no
     // left context to carry), so forcing it on when streaming is always safe.
-    config.conv_prefill_ctx = args.conv_prefill_ctx || args.prefill_ubatch > 0;
+    config.conv_prefill_ctx =
+        args.conv_prefill_ctx || args.prefill_ubatch > 0 || spark_multi_forward;
 
     let files = weight_files(&model_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
@@ -922,6 +1108,18 @@ fn main() -> Result<()> {
     // `config`, `device` and `eos_ids` — for `--dspark` the config was already
     // forced rewindable+taps above, so the built model is correct for the mode.
     if args.mode != "single" {
+        // `--spark` reaches only the single-turn / `--dspark` `DecodeOptions`
+        // below; the concurrent path builds its own per-sequence schedules and
+        // does not thread it yet. Refuse rather than silently ignore it
+        // (§7.1a-i: a flag the run does not read is a value that means nothing).
+        if args.spark.is_some() {
+            anyhow::bail!(
+                "--spark is not wired into --mode {} yet (the concurrent path drives its own \
+                 per-sequence prefill); it is honoured on --mode single (crown and --dspark). \
+                 Use --prefill-ubatch for the concurrent path.",
+                args.mode
+            );
+        }
         if args.batched && args.dspark {
             anyhow::bail!(
                 "--batched drives the K=1 batched-forward body; a batched verify is not built \
@@ -1119,6 +1317,8 @@ fn main() -> Result<()> {
         in_flight_depth,
         // 0 = one-shot prefill (incumbent); >0 streams the prompt through the pacer.
         prefill_ubatch: args.prefill_ubatch,
+        // `--spark` (aligned-bucket schedule) overrides the ubatch ramp when set.
+        prefill_schedule: spark_schedule.clone(),
     };
 
     // The readback strategy is built BEFORE the prompt is read: it depends on
@@ -1212,7 +1412,7 @@ fn main() -> Result<()> {
                 setup.k + 1,
                 setup.k + 1
             );
-            let spec = DSparkSpeculator::new(
+            let mut spec = DSparkSpeculator::new(
                 drafter,
                 model.draft_embedding().clone(),
                 model.lm_head_linear().clone(),
@@ -1220,6 +1420,24 @@ fn main() -> Result<()> {
             )
             .context("constructing DSpark speculator")?;
             eprintln!("[dspark: context kv {}]", spec.ctx_kv().name());
+            // Warm the DRAFTER's pipelines off the clock, the counterpart of the
+            // target's `session.warmup` above. The target warmup compiles the
+            // target's GEMM/attention; the drafter runs its own (backbone at
+            // m=γ, the encoder `fc` matmul, the shared `lm_head` over the block,
+            // the Markov/confidence heads), none a target shape — so all are
+            // cold on round 0 and would land ~130 ms of compile on the first
+            // `--dspark` TTFT. Same `LLOOM_SKIP_WARMUP` gate as the target's,
+            // so the counterfactual (cold drafter) stays measurable.
+            if std::env::var("LLOOM_SKIP_WARMUP").is_err() {
+                let (dlibs, dpipes) = cache_sizes_of(&device);
+                spec.warmup(&device).context("warming DSpark drafter pipelines")?;
+                let (dlibs2, dpipes2) = cache_sizes_of(&device);
+                eprintln!(
+                    "[dspark: drafter warmup +{} libs +{} pipelines]",
+                    dlibs2.saturating_sub(dlibs),
+                    dpipes2.saturating_sub(dpipes),
+                );
+            }
             Some(spec)
         }
     };
@@ -1518,6 +1736,21 @@ fn main() -> Result<()> {
                 burst_1ms
             );
         }
+    }
+    // The `--spark` schedule and each of its forwards' GEMM tile variants —
+    // so a reader sees whether every prefill forward stayed on an aligned tile
+    // (the point of the flag), or `n/a` when the incumbent ramp ran. Printed
+    // only on the single path (the only one that reads `--spark`).
+    if let Some(units) = &spark_schedule {
+        let tags: Vec<String> = units
+            .iter()
+            .map(|&m| format!("{m}:{}", spark::tile_tag(m)))
+            .collect();
+        eprintln!(
+            "[spark: schedule=[{}] (then a seq_len=1 tail over the remainder); prefill_units={}]",
+            tags.join(", "),
+            st.prefill_units,
+        );
     }
     if let Some(bytes) = device_allocated_at_first_token {
         eprintln!(

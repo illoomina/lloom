@@ -82,6 +82,8 @@ use crate::models::with_tracing::{Embedding as TracedEmbedding, Linear as Traced
 use crate::nn::speculator::{Draft, DraftTokens, KvSource, LayerTaps, SeqId, Speculator};
 use crate::nn::{Linear, RmsNorm, VarBuilder};
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor, D};
+#[cfg(feature = "metal")]
+use std::sync::{Arc, Mutex};
 
 /// The drafter's context projection: `RMSNorm_enc(W_c · concat)`.
 ///
@@ -459,10 +461,98 @@ impl DSparkRotary {
 pub struct CtxCache {
     k: Option<Tensor>,
     v: Option<Tensor>,
+    /// The paged backing ([`CtxKv::Paged`]); `k`/`v` stay `None` on it.
+    #[cfg(feature = "metal")]
+    paged: Option<paged_ctx::PagedCtx>,
+}
+
+/// Where the drafter's context KV lives — the backing behind [`CtxCache`]
+/// (issue #708). A construction-time selection; the forward pass reads the
+/// cache through one seam whichever arm it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtxKv {
+    /// One contiguous `[1, H_kv, ctx, D]` tensor per layer, grown by
+    /// `Tensor::cat` on every append and concatenated with the block's own K/V
+    /// on every draft — O(ctx) copies per layer per round. What every recorded
+    /// digest belongs to.
+    Contiguous,
+    /// One page pool per layer (`KvPagePool`, `DESIGN.md` §10.3c), written by
+    /// `kv_scatter_into` at table-chosen slots and read by `sdpa_paged` through
+    /// the table: the context grows into pages (no copy) and the draft block is
+    /// written into slots reserved past the context (no concatenation). Metal
+    /// only.
+    Paged {
+        /// KV tokens per page; a multiple of the tiled kernel's 32-key block.
+        page_size: usize,
+        /// `true`: one pool per layer shared by every sequence — one buffer,
+        /// so every sequence's append is a write to the buffer every other
+        /// sequence reads, and the backend orders them (§3.5: buffer identity
+        /// is the hazard unit). `false`: one pool per layer PER SEQUENCE —
+        /// the sequences' buffers are disjoint and their command buffers can
+        /// overlap, which is the mechanism the pipelined driver's B>1 win
+        /// rests on (§10.2y).
+        shared: bool,
+    },
+}
+
+impl CtxKv {
+    /// §10.4's page size, the one the target's `KvAppend::Paged` ships at.
+    pub const DEFAULT_PAGE_SIZE: usize = 256;
+
+    /// `LLOOM_DSPARK_CTX_KV`: `contiguous` (the default when unset) or
+    /// `paged[:page_size]`. Read at construction, never on the hot path. A
+    /// value that parses as neither is an error rather than a fallback, so an
+    /// A/B arm cannot silently measure the other one (§2.4).
+    pub fn from_env() -> Result<Self> {
+        match std::env::var("LLOOM_DSPARK_CTX_KV") {
+            Err(_) => Ok(Self::Contiguous),
+            Ok(v) => Self::parse(&v),
+        }
+    }
+
+    /// `contiguous` | `paged[:<page_size>][:shared]`.
+    pub fn parse(v: &str) -> Result<Self> {
+        let v = v.trim();
+        if v.eq_ignore_ascii_case("contiguous") {
+            return Ok(Self::Contiguous);
+        }
+        let Some(rest) = v.strip_prefix("paged") else {
+            lloom_tensor::bail!(
+                "DSpark ctx kv {v:?}: expected `contiguous` or `paged[:<page_size>][:shared]` \
+                 (issue #708)"
+            )
+        };
+        let mut page_size = Self::DEFAULT_PAGE_SIZE;
+        let mut shared = false;
+        for part in rest.split(':').filter(|p| !p.is_empty()) {
+            if part.eq_ignore_ascii_case("shared") {
+                shared = true;
+            } else {
+                page_size = part.parse().map_err(|e| {
+                    lloom_tensor::Error::msg(format!("DSpark ctx kv `{v}`: `{part}`: {e}"))
+                })?;
+            }
+        }
+        Ok(Self::Paged { page_size, shared })
+    }
+
+    /// The arm's name, as a `RESULT` line spells it.
+    pub fn name(self) -> String {
+        match self {
+            Self::Contiguous => "contiguous".to_string(),
+            Self::Paged { page_size, shared } => {
+                format!("paged:{page_size}{}", if shared { ":shared" } else { "" })
+            }
+        }
+    }
 }
 
 impl CtxCache {
     pub fn len(&self) -> usize {
+        #[cfg(feature = "metal")]
+        if let Some(p) = &self.paged {
+            return p.len();
+        }
         match &self.k {
             Some(k) => k.dim(2).unwrap_or(0),
             None => 0,
@@ -474,11 +564,43 @@ impl CtxCache {
     }
 
     pub fn clear(&mut self) {
+        #[cfg(feature = "metal")]
+        if let Some(p) = &self.paged {
+            p.reset();
+            return;
+        }
         self.k = None;
         self.v = None;
     }
 
+    /// The paged arm's page table for this layer — the pages in token order,
+    /// reserved block pages included. `None` on the contiguous arm. For a
+    /// test that must show the table is NOT the identity (§10.3h), and a report.
+    pub fn page_table(&self) -> Option<Vec<u32>> {
+        #[cfg(feature = "metal")]
+        if let Some(p) = &self.paged {
+            return Some(p.table());
+        }
+        None
+    }
+
+    /// Which arm this cache is.
+    pub fn kind(&self) -> CtxKv {
+        #[cfg(feature = "metal")]
+        if let Some(p) = &self.paged {
+            return CtxKv::Paged {
+                page_size: p.page_size(),
+                shared: p.shared(),
+            };
+        }
+        CtxKv::Contiguous
+    }
+
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Some(p) = &self.paged {
+            return p.append(k, v);
+        }
         self.k = Some(match &self.k {
             None => k.clone(),
             Some(prev) => Tensor::cat(&[prev, k], 2)?.contiguous()?,
@@ -490,17 +612,34 @@ impl CtxCache {
         Ok(())
     }
 
+    /// The paged arm's read of `[context ‖ block]`: the block's `k`/`v`
+    /// (`[1, H_kv, block, D]`, roped) are written into the slots reserved
+    /// past the context and the pool is returned with the table that names
+    /// both. `None` on the contiguous arm, and on every non-Metal build.
+    #[cfg(feature = "metal")]
+    fn paged_view(&self, k: &Tensor, v: &Tensor) -> Result<Option<paged_ctx::PagedView>> {
+        match &self.paged {
+            Some(p) => p.block_view(k, v).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Drop the last `n` context positions — the draft-side half of a rollback.
     ///
     /// The draft has **no conv state** (all five `layer_types` are
     /// `full_attention`, §10.2l), so a rejection rolls back KV only, which is
     /// what this does. The target's conv rollback is the other half and is
-    /// §10.2m's K+1 snapshots.
+    /// §10.2m's K+1 snapshots. On the paged arm it is a length decrement — the
+    /// pages stay, as the target's `rewind` keeps them (§10.2a).
     pub fn truncate(&mut self, n: usize) -> Result<()> {
         let len = self.len();
         let keep = len.saturating_sub(n);
         if keep == len {
             return Ok(());
+        }
+        #[cfg(feature = "metal")]
+        if let Some(p) = &self.paged {
+            return p.rollback(keep);
         }
         if keep == 0 {
             self.clear();
@@ -509,6 +648,469 @@ impl CtxCache {
         self.k = Some(self.k.as_ref().unwrap().narrow(2, 0, keep)?.contiguous()?);
         self.v = Some(self.v.as_ref().unwrap().narrow(2, 0, keep)?.contiguous()?);
         Ok(())
+    }
+}
+
+/// The paged backing of [`CtxCache`] (issue #708): one `KvPagePool` per
+/// drafter layer, shared by every sequence the speculator drives.
+#[cfg(feature = "metal")]
+mod paged_ctx {
+    use super::{Arc, Device, Mutex, Result, Tensor};
+    use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageError, PageQuarantine};
+
+    /// Tokens per sequence the pool grows by — `lfm2.rs`'s `DEFAULT_KV_BUCKET`,
+    /// so a drafter and its target widen at the same cadence.
+    const BUCKET_TOKENS: usize = 4096;
+
+    /// The pool + table the tiled kernel reads a draft over.
+    pub(super) struct PagedView {
+        pub k: Tensor,
+        pub v: Tensor,
+        /// This sequence's pages, in token order — the whole table, reserved
+        /// block pages included.
+        pub table: Vec<u32>,
+        pub page_size: usize,
+        /// Context positions plus the block just written.
+        pub n_keys: usize,
+    }
+
+    impl PagedView {
+        /// One sequence, so the table stride is its length.
+        pub fn table_len(&self) -> usize {
+            self.table.len()
+        }
+    }
+
+    /// One layer's pool: the allocator (every sequence's table), its epoch
+    /// quarantine, and the `[1, H_kv, pool_pages × P, D]` K/V pools, allocated
+    /// at the first append at that append's dtype and geometry.
+    struct LayerPool {
+        pool: KvPagePool,
+        quarantine: PageQuarantine,
+        kv: Option<(Tensor, Tensor)>,
+        /// Per sequence: the `reserve` slots past its live length, as the U32
+        /// tensor the block scatter takes, and the largest of them.
+        block: Vec<Option<(Tensor, usize)>>,
+    }
+
+    /// The slot tensors one sequence's layers share within a round.
+    ///
+    /// Every layer appends the same positions of the same sequence, and the
+    /// layers' pools follow the same allocation history, so the slot vectors
+    /// they compute are the same vectors; uploading them once per round rather
+    /// than once per layer is what keeps the host side of an append at one
+    /// small buffer per round. **Shared by value, not by assumption**: a layer
+    /// reuses the tensor only when the vector it computed is equal to the one
+    /// uploaded, and uploads its own otherwise.
+    #[derive(Default)]
+    struct SeqSlots {
+        slots: Vec<u32>,
+        slots_t: Option<Tensor>,
+        block: Vec<u32>,
+        block_t: Option<Tensor>,
+    }
+
+    /// Every layer's pool, one clock. Behind a `Mutex` because the forward
+    /// pass reads the cache through `&CtxCache` and the draft block is written
+    /// into the pool from there; five short critical sections per round.
+    pub(super) struct DSparkCtxPool {
+        page_size: usize,
+        /// Slots kept free past every sequence's context for the draft block.
+        reserve: usize,
+        n_seqs: usize,
+        clock: Arc<GpuClock>,
+        layers: Vec<LayerPool>,
+        /// Per sequence, the slot tensors the layers share (see `SeqSlots`).
+        shared: Vec<SeqSlots>,
+    }
+
+    impl DSparkCtxPool {
+        fn new(
+            n_layers: usize,
+            n_seqs: usize,
+            page_size: usize,
+            reserve: usize,
+            clock: Arc<GpuClock>,
+        ) -> Self {
+            let pages_per_seq = (BUCKET_TOKENS + reserve).div_ceil(page_size);
+            let pool_pages = n_seqs.max(1) * pages_per_seq;
+            let layers = (0..n_layers)
+                .map(|_| LayerPool {
+                    // A table may reach the whole pool: exhaustion is reported
+                    // as the pool's, which names the grow, never as a full table.
+                    pool: KvPagePool::new(page_size, pool_pages, n_seqs.max(1), pool_pages + 1),
+                    quarantine: PageQuarantine::new(),
+                    kv: None,
+                    block: vec![None; n_seqs.max(1)],
+                })
+                .collect();
+            Self {
+                page_size,
+                reserve,
+                n_seqs: n_seqs.max(1),
+                clock,
+                layers,
+                shared: (0..n_seqs.max(1)).map(|_| SeqSlots::default()).collect(),
+            }
+        }
+
+        /// `slots` as a device tensor, uploaded once per distinct vector per
+        /// sequence and shared by the layers that compute the same one.
+        fn upload(
+            cached: &mut (Vec<u32>, Option<Tensor>),
+            slots: Vec<u32>,
+            device: &Device,
+        ) -> Result<Tensor> {
+            if let Some(t) = cached.1.as_ref() {
+                if cached.0 == slots {
+                    return Ok(t.clone());
+                }
+            }
+            let t = Tensor::new(slots.as_slice(), device)?;
+            *cached = (slots, Some(t.clone()));
+            Ok(t)
+        }
+
+        /// Widen `layer`'s pool by one bucket: the allocator gains pages
+        /// beneath its free list and the K/V pools are reallocated wider with
+        /// the old contents in their prefix, so every page index and table
+        /// stays valid (`KvPagePool::grow`'s contract; `PagedKv::grow_to`'s
+        /// shape).
+        fn grow(&mut self, layer: usize) -> Result<()> {
+            let extra = self.n_seqs * (BUCKET_TOKENS + self.reserve).div_ceil(self.page_size);
+            let lp = &mut self.layers[layer];
+            lp.pool.grow(extra);
+            if let Some((pk, pv)) = lp.kv.as_ref() {
+                let mut shape = pk.dims().to_vec();
+                shape[2] = lp.pool.pool_pages() * self.page_size;
+                let nk = Tensor::zeros(shape.clone(), pk.dtype(), pk.device())?;
+                nk.slice_set(pk, 2, 0)?;
+                let nv = Tensor::zeros(shape, pv.dtype(), pv.device())?;
+                nv.slice_set(pv, 2, 0)?;
+                lp.kv = Some((nk, nv));
+            }
+            Ok(())
+        }
+
+        /// The token slot of position `t` in `pages`.
+        fn slot(pages: &[u32], t: usize, page_size: usize) -> u32 {
+            pages[t / page_size] * page_size as u32 + (t % page_size) as u32
+        }
+
+        /// Append `[1, H_kv, n, D]` `k`/`v` to `(layer, seq)`: the context
+        /// grows by `n` positions and `reserve` slots stay held past it for
+        /// the block. Pages the GPU has finished reading come back first.
+        fn append(&mut self, layer: usize, seq: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+            let (b, n_kv_heads, n, head_dim) = k.dims4()?;
+            if b != 1 {
+                lloom_tensor::bail!("DSpark paged ctx: one sequence per append, got batch {b}");
+            }
+            let page_size = self.page_size;
+            let reserve = self.reserve;
+            let completed = self.clock.completed_count();
+            {
+                let lp = &mut self.layers[layer];
+                let ready = lp.quarantine.drain_completed(completed);
+                lp.pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
+            }
+            // Room for the append and the block behind it, a bucket at a time.
+            loop {
+                let lp = &mut self.layers[layer];
+                match lp.pool.reserve(seq, n + reserve) {
+                    Ok(_) => break,
+                    Err(PageError::Exhausted { .. }) => self.grow(layer)?,
+                    Err(e) => return Err(lloom_tensor::Error::wrap(e)),
+                }
+            }
+            let lp = &mut self.layers[layer];
+            let start = lp.pool.seq(seq).map(|s| s.len()).unwrap_or(0);
+            lp.pool.append(seq, n).map_err(lloom_tensor::Error::wrap)?;
+            let pages = lp
+                .pool
+                .seq(seq)
+                .expect("seq within n_seqs")
+                .pages()
+                .to_vec();
+            let slots: Vec<u32> = (start..start + n)
+                .map(|t| Self::slot(&pages, t, page_size))
+                .collect();
+            let block: Vec<u32> = (start + n..start + n + reserve)
+                .map(|t| Self::slot(&pages, t, page_size))
+                .collect();
+            let tokens = lp.pool.pool_pages() * page_size;
+            if lp.kv.is_none() {
+                let shape = (1, n_kv_heads, tokens, head_dim);
+                lp.kv = Some((
+                    Tensor::zeros(shape, k.dtype(), k.device())?,
+                    Tensor::zeros(shape, v.dtype(), v.device())?,
+                ));
+            }
+            let (pk, pv) = lp.kv.as_ref().expect("allocated above");
+            let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
+            let block_max = block.iter().copied().max().unwrap_or(0) as usize;
+            let sh = &mut self.shared[seq];
+            let mut pass = (std::mem::take(&mut sh.slots), sh.slots_t.take());
+            let slots = Self::upload(&mut pass, slots, k.device())?;
+            (sh.slots, sh.slots_t) = pass;
+            let mut blk = (std::mem::take(&mut sh.block), sh.block_t.take());
+            let block = Self::upload(&mut blk, block, k.device())?;
+            (sh.block, sh.block_t) = blk;
+            let k = k.contiguous()?;
+            let v = v.contiguous()?;
+            k.kv_scatter_into(pk, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
+            v.kv_scatter_into(pv, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
+            self.layers[layer].block[seq] = Some((block, block_max));
+            Ok(())
+        }
+
+        /// Write the block's `[1, H_kv, width, D]` `k`/`v` into `(layer,
+        /// seq)`'s reserved slots and hand back the pool with the table.
+        fn block_view(
+            &mut self,
+            layer: usize,
+            seq: usize,
+            k: &Tensor,
+            v: &Tensor,
+        ) -> Result<PagedView> {
+            let (b, _, width, head_dim) = k.dims4()?;
+            if b != 1 || width > self.reserve {
+                lloom_tensor::bail!(
+                    "DSpark paged ctx: a block of {width} positions (batch {b}) against {} \
+                     reserved slots",
+                    self.reserve
+                );
+            }
+            let page_size = self.page_size;
+            let lp = &self.layers[layer];
+            let Some((pk, pv)) = lp.kv.as_ref() else {
+                lloom_tensor::bail!(
+                    "DSpark paged ctx: a draft before any context was keyed (layer {layer}, \
+                     sequence {seq}); `observe` the prefill first"
+                );
+            };
+            let Some((block, block_max)) = lp.block[seq].as_ref() else {
+                lloom_tensor::bail!("DSpark paged ctx: no block slots for sequence {seq}");
+            };
+            let tokens = lp.pool.pool_pages() * page_size;
+            let slots = block.narrow(0, 0, width)?;
+            let k = k.contiguous()?;
+            let v = v.contiguous()?;
+            k.kv_scatter_into(pk, &slots, *block_max, 0, tokens * head_dim, head_dim)?;
+            v.kv_scatter_into(pv, &slots, *block_max, 0, tokens * head_dim, head_dim)?;
+            let s = lp.pool.seq(seq).expect("seq within n_seqs");
+            Ok(PagedView {
+                k: pk.clone(),
+                v: pv.clone(),
+                table: s.pages().to_vec(),
+                page_size,
+                n_keys: s.len() + width,
+            })
+        }
+
+        fn len(&self, layer: usize, seq: usize) -> usize {
+            self.layers[layer]
+                .pool
+                .seq(seq)
+                .map(|s| s.len())
+                .unwrap_or(0)
+        }
+
+        /// The layer's K/V pools, once an append has allocated them.
+        fn pools(&self, layer: usize) -> Result<(Tensor, Tensor)> {
+            match self.layers[layer].kv.as_ref() {
+                Some((k, v)) => Ok((k.clone(), v.clone())),
+                None => lloom_tensor::bail!("DSpark paged ctx: layer {layer} has no pool yet"),
+            }
+        }
+
+        /// Back to `to` positions: a length decrement, pages kept, the block
+        /// slots moved to follow the new end.
+        fn rollback(&mut self, layer: usize, seq: usize, to: usize) -> Result<()> {
+            let page_size = self.page_size;
+            let reserve = self.reserve;
+            let lp = &mut self.layers[layer];
+            let len = lp.pool.seq(seq).map(|s| s.len()).unwrap_or(0);
+            if to > len {
+                lloom_tensor::bail!("DSpark paged ctx: rollback to {to} past len {len}");
+            }
+            lp.pool
+                .rewind(seq, len - to)
+                .map_err(lloom_tensor::Error::wrap)?;
+            if let Some((block, _)) = lp.block[seq].as_ref() {
+                let device = block.device().clone();
+                let pages = lp
+                    .pool
+                    .seq(seq)
+                    .expect("seq within n_seqs")
+                    .pages()
+                    .to_vec();
+                let slots: Vec<u32> = (to..to + reserve)
+                    .map(|t| Self::slot(&pages, t, page_size))
+                    .collect();
+                let max = slots.iter().copied().max().unwrap_or(0) as usize;
+                let sh = &mut self.shared[seq];
+                let mut blk = (std::mem::take(&mut sh.block), sh.block_t.take());
+                let block = Self::upload(&mut blk, slots, &device)?;
+                (sh.block, sh.block_t) = blk;
+                self.layers[layer].block[seq] = Some((block, max));
+            }
+            Ok(())
+        }
+
+        /// Drop `(layer, seq)`'s pages into the quarantine against the epoch a
+        /// command buffer encoded now belongs to (§10.3h's one non-fence
+        /// obligation). Idempotent.
+        fn reset(&mut self, layer: usize, seq: usize) {
+            let epoch = self.clock.current_epoch();
+            let lp = &mut self.layers[layer];
+            if lp
+                .pool
+                .seq(seq)
+                .map(|s| s.pages().is_empty())
+                .unwrap_or(true)
+            {
+                return;
+            }
+            let freed = lp.pool.release(seq);
+            lp.quarantine.quarantine(epoch, freed);
+            lp.block[seq] = None;
+        }
+    }
+
+    /// One `(sequence, layer)` slot of a shared [`DSparkCtxPool`] — what a
+    /// paged [`super::CtxCache`] holds.
+    #[derive(Clone)]
+    pub(super) struct PagedCtx {
+        shared: Arc<Mutex<DSparkCtxPool>>,
+        seq: usize,
+        layer: usize,
+        page_size: usize,
+        /// Whether `shared` is one pool set for every sequence (`seq` indexes
+        /// its table) or this sequence's own (`seq` is 0 there).
+        pool_shared: bool,
+    }
+
+    impl std::fmt::Debug for PagedCtx {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PagedCtx")
+                .field("seq", &self.seq)
+                .field("layer", &self.layer)
+                .field("page_size", &self.page_size)
+                .finish()
+        }
+    }
+
+    impl PagedCtx {
+        /// `n_seqs × n_layers` handles over one pool set.
+        pub(super) fn make(
+            n_layers: usize,
+            n_seqs: usize,
+            page_size: usize,
+            reserve: usize,
+            shared: bool,
+            device: &Device,
+        ) -> Result<Vec<Vec<PagedCtx>>> {
+            let clock = match device {
+                Device::Metal(d) => d.gpu_clock(),
+                _ => lloom_tensor::bail!(
+                    "DSpark paged ctx is Metal-only: the pool is read by a Metal kernel"
+                ),
+            };
+            // The tiled kernel seats its loaders once per key block, so a page
+            // must hold whole blocks: 32 keys below head_dim 128, 16 at and
+            // above (`sdpa_full_tile`) — 32 covers both. `sdpa_paged` checks
+            // the exact tile at dispatch; this is the early, named refusal.
+            if page_size == 0 || !page_size.is_multiple_of(32) {
+                lloom_tensor::bail!(
+                    "DSpark paged ctx: page_size {page_size} must be a multiple of the tiled \
+                     kernel's 32-key block (issue #708)"
+                );
+            }
+            // One pool set for all sequences, or one per sequence: the handles
+            // are the same shape either way, and the difference is which
+            // buffer a sequence's append writes — every other sequence's, or
+            // its own.
+            let pools: Vec<Arc<Mutex<DSparkCtxPool>>> = if shared {
+                let one = Arc::new(Mutex::new(DSparkCtxPool::new(
+                    n_layers, n_seqs, page_size, reserve, clock,
+                )));
+                vec![one; n_seqs]
+            } else {
+                (0..n_seqs)
+                    .map(|_| {
+                        Arc::new(Mutex::new(DSparkCtxPool::new(
+                            n_layers,
+                            1,
+                            page_size,
+                            reserve,
+                            clock.clone(),
+                        )))
+                    })
+                    .collect()
+            };
+            Ok((0..n_seqs)
+                .map(|seq| {
+                    (0..n_layers)
+                        .map(|layer| PagedCtx {
+                            shared: pools[seq].clone(),
+                            seq: if shared { seq } else { 0 },
+                            layer,
+                            page_size,
+                            pool_shared: shared,
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, DSparkCtxPool> {
+            // A poisoned lock means a panic mid-append on another thread; the
+            // pool's bookkeeping is then unknown and continuing would read it.
+            self.shared.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        pub(super) fn page_size(&self) -> usize {
+            self.page_size
+        }
+
+        pub(super) fn shared(&self) -> bool {
+            self.pool_shared
+        }
+
+        pub(super) fn len(&self) -> usize {
+            self.lock().len(self.layer, self.seq)
+        }
+
+        pub(super) fn append(&self, k: &Tensor, v: &Tensor) -> Result<()> {
+            self.lock().append(self.layer, self.seq, k, v)
+        }
+
+        pub(super) fn block_view(&self, k: &Tensor, v: &Tensor) -> Result<PagedView> {
+            self.lock().block_view(self.layer, self.seq, k, v)
+        }
+
+        pub(super) fn rollback(&self, to: usize) -> Result<()> {
+            self.lock().rollback(self.layer, self.seq, to)
+        }
+
+        pub(super) fn reset(&self) {
+            self.lock().reset(self.layer, self.seq)
+        }
+
+        /// This layer's K/V pools.
+        pub(super) fn pools(&self) -> Result<(Tensor, Tensor)> {
+            self.lock().pools(self.layer)
+        }
+
+        /// This sequence's pages on this layer, in token order.
+        pub(super) fn table(&self) -> Vec<u32> {
+            let g = self.lock();
+            g.layers[self.layer]
+                .pool
+                .seq(self.seq)
+                .map(|s| s.pages().to_vec())
+                .unwrap_or_default()
+        }
     }
 }
 
@@ -522,6 +1124,11 @@ impl crate::nn::kv_cache::seam::KvCache for CtxCache {
 
     fn append<'a>(&'a mut self, k: &Tensor, v: &Tensor) -> Result<Self::View<'a>> {
         CtxCache::append(self, k, v)?;
+        #[cfg(feature = "metal")]
+        if let Some(p) = &self.paged {
+            // The live cache is the pool itself, read through the table.
+            return p.pools();
+        }
         Ok((
             self.k.as_ref().unwrap().clone(),
             self.v.as_ref().unwrap().clone(),
@@ -715,6 +1322,33 @@ impl DSparkAttention {
         let q = rotary.apply(&q, block_offset)?;
         let k = rotary.apply(&k, block_offset)?;
 
+        let scale = 1f64 / (self.head_dim as f64).sqrt();
+
+        // The paged arm (#708): the block's K/V go into the slots reserved past
+        // the context and the tiled kernel reads `[context ‖ block]` through
+        // the page table — no concatenation, no copy of the context. Same
+        // kernel as the fused arm below, its K/V address one page-walk apart,
+        // bit-identical on the same keys (`lloom/tests/sdpa.rs`).
+        #[cfg(feature = "metal")]
+        if let Some(view) = cache.paged_view(&k, &v)? {
+            let table_len = view.table_len();
+            let out = crate::nn::ops::sdpa_paged(
+                &q,
+                &view.k,
+                &view.v,
+                false,
+                scale as f32,
+                view.page_size,
+                view.table,
+                table_len,
+                view.n_keys,
+            )?;
+            let out = out
+                .transpose(1, 2)?
+                .reshape((b, seq, self.num_heads * self.head_dim))?;
+            return self.o_proj.forward(&out);
+        }
+
         // Context first, block second — the key order the context's own RoPE
         // offsets assume, and the order mlx-dspark concatenates in.
         let (k, v) = match (&cache.k, &cache.v) {
@@ -724,8 +1358,6 @@ impl DSparkAttention {
             ),
             _ => (k, v),
         };
-
-        let scale = 1f64 / (self.head_dim as f64).sqrt();
 
         // Two arms, one answer. The eager arm below is the reference and the CPU
         // path; the fused `sdpa` arm is Metal-only and byte-parity-tested against
@@ -1057,11 +1689,63 @@ impl DSparkDrafter {
         self.confidence.as_ref()
     }
 
-    /// One [`CtxCache`] per layer.
+    /// One [`CtxCache`] per layer, on the contiguous arm.
     pub fn make_ctx_caches(&self) -> Vec<CtxCache> {
         (0..self.layers.len())
             .map(|_| CtxCache::default())
             .collect()
+    }
+
+    /// `n_seqs` sequences' per-layer [`CtxCache`]s on `ctx_kv`.
+    ///
+    /// The paged arm builds one page pool per layer shared by every
+    /// sequence, with `block_size` slots reserved past each context for the
+    /// draft block (§10.2m: the block is attended with the context and not
+    /// retained), and refuses a non-Metal `device`. The contiguous arm needs
+    /// neither the device nor a shared anything.
+    pub fn make_ctx_caches_for(
+        &self,
+        ctx_kv: CtxKv,
+        n_seqs: usize,
+        device: &Device,
+    ) -> Result<Vec<Vec<CtxCache>>> {
+        match ctx_kv {
+            CtxKv::Contiguous => Ok((0..n_seqs).map(|_| self.make_ctx_caches()).collect()),
+            CtxKv::Paged { page_size, shared } => {
+                #[cfg(not(feature = "metal"))]
+                {
+                    let _ = (page_size, shared, device);
+                    lloom_tensor::bail!(
+                        "DSpark ctx kv `paged` is Metal-only: the pool is read by a Metal kernel \
+                         (issue #708)"
+                    )
+                }
+                #[cfg(feature = "metal")]
+                {
+                    let handles = paged_ctx::PagedCtx::make(
+                        self.layers.len(),
+                        n_seqs,
+                        page_size,
+                        self.cfg.block_size,
+                        shared,
+                        device,
+                    )?;
+                    Ok(handles
+                        .into_iter()
+                        .map(|per_layer| {
+                            per_layer
+                                .into_iter()
+                                .map(|p| CtxCache {
+                                    k: None,
+                                    v: None,
+                                    paged: Some(p),
+                                })
+                                .collect()
+                        })
+                        .collect())
+                }
+            }
+        }
     }
 
     /// Project the tapped target residuals and key/value them into every
@@ -1356,10 +2040,13 @@ pub struct DSparkSpeculator {
     /// ([`Speculator::want_confidence`]). The head is a forward and a host
     /// readback per round; off, the round's only readback is the verify's.
     confidence_wanted: bool,
+    /// The context KV arm every slot's caches were built on.
+    ctx_kv: CtxKv,
 }
 
 impl DSparkSpeculator {
-    /// Build a proposer for `n_seq` server slots.
+    /// Build a proposer for `n_seq` server slots, the context KV arm read
+    /// from `LLOOM_DSPARK_CTX_KV` ([`CtxKv::from_env`]; contiguous unset).
     ///
     /// `embed` and `lm_head` are the **target's** — cloned here so the drafter
     /// borrows the two shared projections without owning the target
@@ -1370,18 +2057,33 @@ impl DSparkSpeculator {
         embed: TracedEmbedding,
         lm_head: TracedLinear,
         n_seq: usize,
-    ) -> Self {
+    ) -> Result<Self> {
+        let ctx_kv = CtxKv::from_env()?;
+        Self::new_with_ctx(drafter, embed, lm_head, n_seq, ctx_kv)
+    }
+
+    /// [`Self::new`] with the context KV arm chosen by the caller.
+    pub fn new_with_ctx(
+        drafter: DSparkDrafter,
+        embed: TracedEmbedding,
+        lm_head: TracedLinear,
+        n_seq: usize,
+        ctx_kv: CtxKv,
+    ) -> Result<Self> {
         let block_size = drafter.config().block_size;
         let max_draft = drafter.config().max_draft();
-        let seqs = (0..n_seq)
-            .map(|_| PerSeq {
-                ctx: drafter.make_ctx_caches(),
+        let device = lm_head.weight().device().clone();
+        let seqs = drafter
+            .make_ctx_caches_for(ctx_kv, n_seq, &device)?
+            .into_iter()
+            .map(|ctx| PerSeq {
+                ctx,
                 ctx_offset: 0,
                 last: 0,
                 active: false,
             })
             .collect();
-        Self {
+        Ok(Self {
             drafter,
             embed,
             lm_head,
@@ -1389,7 +2091,13 @@ impl DSparkSpeculator {
             block_size,
             max_draft,
             confidence_wanted: false,
-        }
+            ctx_kv,
+        })
+    }
+
+    /// The context KV arm this proposer runs on.
+    pub fn ctx_kv(&self) -> CtxKv {
+        self.ctx_kv
     }
 
     fn seq_mut(&mut self, seq: SeqId) -> Result<&mut PerSeq> {

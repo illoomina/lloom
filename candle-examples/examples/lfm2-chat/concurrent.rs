@@ -598,11 +598,14 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         model.draft_embedding().clone(),
         model.lm_head_linear().clone(),
         n,
-    );
+    )
+    .context("constructing DSpark speculator")?;
     eprintln!(
-        "[dspark: drafter loaded, {} layers, K={k} (verify window {} positions), {n} slots]",
+        "[dspark: drafter loaded, {} layers, K={k} (verify window {} positions), {n} slots, \
+         context kv {}]",
         dcfg.num_hidden_layers,
-        k + 1
+        k + 1,
+        spec.ctx_kv().name()
     );
     let opts = DecodeOptions {
         max_tokens: ctx.max_tokens,

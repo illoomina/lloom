@@ -98,6 +98,12 @@ struct Args {
     /// one-layer-early convention this tree shipped before §10.2s.
     #[arg(long, default_value_t = 0)]
     tap_shift: i64,
+
+    /// Where the drafter keeps its context KV: `contiguous` or
+    /// `paged[:<page_size>]` (#708, Metal only). The drafted ids must not move
+    /// between the two — the page walk changes addresses, not arithmetic.
+    #[arg(long, default_value = "contiguous")]
+    ctx_kv: String,
 }
 
 fn newest_snapshot(repo: &str) -> Option<PathBuf> {
@@ -391,12 +397,17 @@ fn main() -> Result<()> {
     println!("anchor token      : {anchor}  (the target's own next-token argmax)");
 
     // ---- one drafting round ------------------------------------------------
-    let mut caches = drafter.make_ctx_caches();
+    let ctx_kv = lloom::models::lfm2_dspark::CtxKv::parse(&args.ctx_kv)?;
+    let mut caches = drafter
+        .make_ctx_caches_for(ctx_kv, 1, &device)?
+        .pop()
+        .expect("one sequence");
     drafter.update_context(&taps, 0, &mut caches)?;
     println!(
-        "context keyed     : {} positions per layer, {} layers",
+        "context keyed     : {} positions per layer, {} layers, {} kv",
         caches[0].len(),
-        caches.len()
+        caches.len(),
+        ctx_kv.name()
     );
 
     let cap = args.draft.min(dcfg.max_draft());
@@ -529,11 +540,12 @@ fn main() -> Result<()> {
 
     let dbytes: Vec<u8> = drafted.iter().flat_map(|t| t.to_le_bytes()).collect();
     println!(
-        "\nRESULT ctx_tokens={} anchor={} cap={} tap_shift={} drafted={:?} sha256={}",
+        "\nRESULT ctx_tokens={} anchor={} cap={} tap_shift={} ctx_kv={} drafted={:?} sha256={}",
         args.tokens,
         anchor,
         cap,
         args.tap_shift,
+        ctx_kv.name(),
         drafted,
         sha256(&dbytes)
     );

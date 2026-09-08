@@ -215,6 +215,15 @@ struct Args {
     #[arg(long)]
     dspark: bool,
 
+    /// Where the DSpark drafter keeps its context KV: `contiguous` (one tensor
+    /// per layer, `cat`-grown every round — what every recorded digest belongs
+    /// to) or `paged[:<page_size>]` (one page pool per layer read by the paged
+    /// `steel_attention`, #708). Sets `LLOOM_DSPARK_CTX_KV`, the switch the
+    /// speculator reads at construction, so the two harness modes and the
+    /// library agree on one source of truth; unset, the environment decides.
+    #[arg(long, value_name = "ARM")]
+    dspark_ctx: Option<String>,
+
     /// The KV ceiling in positions (prompt plus reply). Defaults to the model's
     /// `max_position_embeddings` — 131 072 on LFM2.5-2.6B. The cache does NOT
     /// allocate this: it starts at one `--kv-bucket` and grows a bucket at a
@@ -616,6 +625,11 @@ fn main() -> Result<()> {
     // the verify window's width (`K + 1`) sizes the conv ring, and taps must be
     // requested on the target's own layers. Only when `--dspark` is set; the
     // default path never reads a drafter.
+    if let Some(arm) = &args.dspark_ctx {
+        lloom::models::lfm2_dspark::CtxKv::parse(arm).context("--dspark-ctx")?;
+        // SAFETY: single-threaded here, before any drafter or thread exists.
+        unsafe { std::env::set_var("LLOOM_DSPARK_CTX_KV", arm) };
+    }
     let dspark_setup: Option<DsparkSetup> = if args.dspark {
         let draft_dir = args
             .draft_dir
@@ -1166,12 +1180,15 @@ fn main() -> Result<()> {
                 setup.k + 1,
                 setup.k + 1
             );
-            Some(DSparkSpeculator::new(
+            let spec = DSparkSpeculator::new(
                 drafter,
                 model.draft_embedding().clone(),
                 model.lm_head_linear().clone(),
                 1,
-            ))
+            )
+            .context("constructing DSpark speculator")?;
+            eprintln!("[dspark: context kv {}]", spec.ctx_kv().name());
+            Some(spec)
         }
     };
 

@@ -57,7 +57,7 @@ pub struct GpuInterval {
 /// (*starved*); if it was already committed, the idle is the driver's
 /// retire-and-start between two queued buffers (*seam*), which no host thread
 /// can shorten.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CommandBufferRecord {
     pub interval: GpuInterval,
     /// When the host committed this buffer, seconds in the GPU clock. Stamped
@@ -67,10 +67,23 @@ pub struct CommandBufferRecord {
     pub committed: f64,
     /// The decode step current at commit (`set_step`).
     pub step: u64,
+    /// The pipeline label of the LAST dispatch encoded before this buffer was
+    /// committed. Exact when a buffer holds one dispatch
+    /// (`CANDLE_METAL_COMPUTE_PER_BUFFER=1`, the per-kernel timing arm, lloom
+    /// #715); otherwise it names the buffer's last kernel only.
+    pub label: Option<Arc<str>>,
 }
+
+/// The label of the most recent dispatch, for [`record_command_buffer`] to
+/// stamp onto the buffer it is committed in. One slot, written at every
+/// dispatch under the recorder's lock it already takes.
+#[derive(Default)]
+struct LastLabel(Option<Arc<str>>);
 
 #[derive(Default)]
 struct Recorder {
+    /// See [`LastLabel`].
+    last_label: LastLabel,
     /// GPU intervals of every command buffer that has completed, with the
     /// commit stamp and step that let a gap be attributed.
     records: Vec<CommandBufferRecord>,
@@ -223,6 +236,7 @@ pub fn record_dispatch(label: Option<&Arc<str>>) {
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
     let mut rec = recorder().lock().unwrap();
     bump_label(&mut rec.dispatches, label.unwrap_or_else(|| unnamed()));
+    rec.last_label.0 = label.cloned();
 }
 
 /// Increment `label`'s count, cloning the handle only to create a new entry.
@@ -265,15 +279,37 @@ pub fn record_command_buffer(start: f64, end: f64, committed: f64, step: u64) {
     if start <= 0.0 || end <= start {
         return;
     }
-    recorder()
-        .lock()
-        .unwrap()
-        .records
-        .push(CommandBufferRecord {
-            interval: GpuInterval { start, end },
-            committed,
-            step,
-        });
+    let mut rec = recorder().lock().unwrap();
+    let label = rec.last_label.0.clone();
+    rec.records.push(CommandBufferRecord {
+        interval: GpuInterval { start, end },
+        committed,
+        step,
+        label,
+    });
+}
+
+/// GPU time per pipeline label over the recorded command buffers: `(label,
+/// buffers, total seconds)`, largest total first. Meaningful when every buffer
+/// held one dispatch (`CANDLE_METAL_COMPUTE_PER_BUFFER=1`); otherwise a buffer
+/// is charged to its last kernel and the table says so by its counts (a
+/// 50-dispatch buffer per label is not a kernel's time). Buffers with no
+/// label are reported under `<unlabelled>`.
+pub fn gpu_time_by_label() -> Vec<(String, u64, f64)> {
+    let rec = recorder().lock().unwrap();
+    let mut map: HashMap<String, (u64, f64)> = HashMap::new();
+    for r in &rec.records {
+        let key = r
+            .label
+            .as_deref()
+            .map_or_else(|| "<unlabelled>".to_string(), str::to_string);
+        let e = map.entry(key).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += r.interval.end - r.interval.start;
+    }
+    let mut v: Vec<(String, u64, f64)> = map.into_iter().map(|(k, (n, t))| (k, n, t)).collect();
+    v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    v
 }
 
 /// Merge sorted intervals, returning (union duration, span from first start to last end).
@@ -578,6 +614,7 @@ mod tests {
             interval: GpuInterval { start, end },
             committed,
             step,
+            label: None,
         }
     }
 

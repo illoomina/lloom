@@ -1206,6 +1206,19 @@ fn main() -> Result<()> {
     // Measurement seam; the visible stamp is shared because it is set off-thread.
     let mut first_batch_at: Option<std::time::Duration> = None;
     let first_visible_ns = Arc::new(AtomicU64::new(0));
+    // The two hops between `received` and `visible`, on the consumer thread:
+    // the first id popped off the SPSC, and the first id detokenized (lloom
+    // #715: the 32 ms between the two headline stamps had no owner).
+    let first_pop_ns = Arc::new(AtomicU64::new(0));
+    let first_detok_ns = Arc::new(AtomicU64::new(0));
+    // Every stdout write's stamp, for the visible cadence (how bursty the
+    // stream is at the terminal): one `u64` push per write, off the hot thread.
+    let visible_stamps: Arc<std::sync::Mutex<Vec<u64>>> =
+        Arc::new(std::sync::Mutex::new(Vec::with_capacity(spsc_cap_hint(opts.max_tokens))));
+    // Device memory at the first token the consumer is handed -- i.e. after the
+    // prefill and the first step -- so a cut-period sweep can read what the
+    // prefill's intermediates cost in `pending` (§13.5o's open question).
+    let mut device_allocated_at_first_token: Option<usize> = None;
 
     // The output decouple: the decode loop pushes ids into this SPSC (non-blocking,
     // no syscall on the hot thread) and a separate consumer thread detokenizes and
@@ -1226,26 +1239,37 @@ fn main() -> Result<()> {
     let consumer = {
         let spsc = Arc::clone(&spsc);
         let first_visible_ns = Arc::clone(&first_visible_ns);
+        let first_pop_ns = Arc::clone(&first_pop_ns);
+        let first_detok_ns = Arc::clone(&first_detok_ns);
+        let visible_stamps = Arc::clone(&visible_stamps);
         std::thread::spawn(move || {
             let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
+            let stamp = |slot: &AtomicU64| {
+                slot.compare_exchange(
+                    0,
+                    decode_start.elapsed().as_nanos() as u64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .ok();
+            };
             loop {
                 match spsc.pop() {
                     Some(id) => {
-                        if let Ok(Some(text)) = tos.next_token(id) {
-                            first_visible_ns
-                                .compare_exchange(
-                                    0,
-                                    decode_start.elapsed().as_nanos() as u64,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                )
-                                .ok();
+                        stamp(&first_pop_ns);
+                        let text = tos.next_token(id);
+                        stamp(&first_detok_ns);
+                        if let Ok(Some(text)) = text {
+                            stamp(&first_visible_ns);
                             // Direct write to the locked stdout; a write that the
                             // kernel cannot take right now blocks THIS thread only.
                             let _ = out.write_all(text.as_bytes());
                             let _ = out.flush();
+                            if let Ok(mut v) = visible_stamps.lock() {
+                                v.push(decode_start.elapsed().as_nanos() as u64);
+                            }
                         }
                     }
                     None => {
@@ -1277,6 +1301,10 @@ fn main() -> Result<()> {
         let mut on_tokens = |batch: &[u32]| -> candle::Result<()> {
             if first_batch_at.is_none() && !batch.is_empty() {
                 first_batch_at = Some(decode_start.elapsed());
+                #[cfg(feature = "metal")]
+                if let Device::Metal(m) = &device {
+                    device_allocated_at_first_token = Some(m.device().current_allocated_size());
+                }
             }
             for &id in batch {
                 while !spsc.push(id) {
@@ -1396,17 +1424,57 @@ fn main() -> Result<()> {
     // next token, which is one decode step).
     let submit_ms = st.ttft_compute_ns as f64 / 1e6;
     let ttft_ms = first_batch_at.map_or(f64::NAN, |d| d.as_secs_f64() * 1e3);
+    let ms_or_na = |ns: u64| {
+        if ns == 0 {
+            "n/a".to_string()
+        } else {
+            format!("{:.2}", ns as f64 / 1e6)
+        }
+    };
     eprintln!(
-        "[first-token: submit {:.2} ms (host encode, no GPU wait) | received {} ms (TTFT) | visible {} ms (to stdout); tail after the loop {:.2} ms]",
+        "[first-token: submit {:.2} ms (host encode, no GPU wait) | received {} ms (TTFT) | popped {} ms | detokenized {} ms | visible {} ms (to stdout); tail after the loop {:.2} ms]",
         submit_ms,
         first_batch_at
             .map(|d| format!("{:.2}", d.as_secs_f64() * 1e3))
             .unwrap_or_else(|| "n/a".into()),
+        ms_or_na(first_pop_ns.load(Ordering::Relaxed)),
+        ms_or_na(first_detok_ns.load(Ordering::Relaxed)),
         first_visible_at
             .map(|d| format!("{:.2}", d.as_secs_f64() * 1e3))
             .unwrap_or_else(|| "n/a".into()),
         st.tail_ns as f64 / 1e6,
     );
+    // The visible cadence: the gaps between consecutive stdout writes. A
+    // bursty stream (a commit budget of N steps, a wide cut period) shows up
+    // as a high p99 against a p50 near the step; the count says how many
+    // writes carried the run's tokens.
+    if let Ok(stamps) = visible_stamps.lock() {
+        if stamps.len() >= 2 {
+            let mut gaps: Vec<f64> = stamps
+                .windows(2)
+                .map(|w| (w[1] - w[0]) as f64 / 1e6)
+                .collect();
+            gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q = |f: f64| gaps[((gaps.len() - 1) as f64 * f) as usize];
+            let burst_1ms = gaps.iter().filter(|g| **g < 1.0).count();
+            eprintln!(
+                "[visible cadence: {} writes over {} tokens; gap p50 {:.2} / p90 {:.2} / p99 {:.2} / max {:.2} ms; {} gaps < 1 ms (tokens arriving in a burst)]",
+                stamps.len(),
+                n,
+                q(0.5),
+                q(0.9),
+                q(0.99),
+                gaps[gaps.len() - 1],
+                burst_1ms
+            );
+        }
+    }
+    if let Some(bytes) = device_allocated_at_first_token {
+        eprintln!(
+            "[prefill: device_allocated {:.3} GB at the first token (after the prefill and the first step)]",
+            bytes as f64 / 1e9
+        );
+    }
     // The two TTFT terms apart, and the first steps by phase: `prefill_ns` is
     // the prompt's encode, and under `lookahead = 1` step 0's EOS wait is where
     // the prefill's GPU tail lands, so the split says which side a first-token
@@ -1553,7 +1621,7 @@ fn main() -> Result<()> {
          {} {} , TTFT {} ms, \
          {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} bos={} \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
-         step_markers={} step_waits={} cut={} \
+         step_markers={} step_waits={} cut={} pipelined_cut={} \
          ring_publishes={} poll_fallbacks={} overrun={} eos={} param-style={}]",
         b(format!("{end_to_end:.1}")),
         b(format!("{steady:.1}")),
@@ -1582,6 +1650,7 @@ fn main() -> Result<()> {
         st.step_markers,
         st.step_waits,
         cut_policy_arm(&device),
+        pipelined_cut_arm(&device),
         st.readback.ring_publishes,
         st.readback.poll_fallbacks,
         st.overrun,
@@ -1614,6 +1683,31 @@ fn main() -> Result<()> {
     if candle::kernels::metal::profile::enabled() {
         let s = candle::kernels::metal::profile::snapshot();
         let steps = st.steps.max(1) as f64;
+        // GPU time by kernel, from each command buffer's last dispatch label.
+        // Exact only at CANDLE_METAL_COMPUTE_PER_BUFFER=1 (one dispatch per
+        // buffer -- the per-kernel arm, lloom #715/#716); at the default period
+        // a buffer is charged to its last kernel, and the `buffers` column
+        // (≈ dispatches/50) says so.
+        {
+            let by = candle::kernels::metal::profile::gpu_time_by_label();
+            let total: f64 = by.iter().map(|(_, _, t)| *t).sum();
+            eprintln!(
+                "[profile: gpu time by kernel ({} labels, {:.3} ms/step summed over {:.0} buffers/step; exact iff one dispatch per buffer):",
+                by.len(),
+                1e3 * total / steps,
+                by.iter().map(|(_, n, _)| *n as f64).sum::<f64>() / steps
+            );
+            for (label, buffers, secs) in by.iter().take(24) {
+                eprintln!(
+                    "    {:>8.3} ms/step  {:>6.1} buf/step  {:>7.1} µs/buf  {}",
+                    1e3 * secs / steps,
+                    *buffers as f64 / steps,
+                    1e6 * secs / (*buffers as f64).max(1.0),
+                    label
+                );
+            }
+            eprintln!("]");
+        }
         eprintln!(
             "[profile: gpu_busy {:.3} ms/step (union over {} command buffers, {} timed), \
              {:.1} dispatches/step, {} steps]",
@@ -1724,6 +1818,15 @@ fn main() -> Result<()> {
 
 /// The process's (minor, major) page-fault counts so far, from `getrusage`;
 /// zeros where it is unavailable.
+/// How many stdout writes a run can take: one per token at most.
+fn spsc_cap_hint(max_tokens: usize) -> usize {
+    if max_tokens == 0 {
+        1 << 16
+    } else {
+        max_tokens + 16
+    }
+}
+
 fn rusage_faults() -> (u64, u64) {
     #[cfg(unix)]
     {
@@ -1876,12 +1979,16 @@ fn report_idle_gaps(
         use std::io::Write;
         let write = || -> std::io::Result<()> {
             let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
-            writeln!(f, "step,committed_s,start_s,end_s")?;
+            writeln!(f, "step,committed_s,start_s,end_s,label")?;
             for r in &s.command_buffer_records {
                 writeln!(
                     f,
-                    "{},{:.9},{:.9},{:.9}",
-                    r.step, r.committed, r.interval.start, r.interval.end
+                    "{},{:.9},{:.9},{:.9},{}",
+                    r.step,
+                    r.committed,
+                    r.interval.start,
+                    r.interval.end,
+                    r.label.as_deref().unwrap_or("")
                 )?;
             }
             let mut f =
@@ -1915,6 +2022,19 @@ fn report_idle_gaps(
 /// The command-buffer cut policy in force, read back from the device rather
 /// than from the environment that selected it (§7.1a-i), with the counter's
 /// period beside it.
+/// The period a pipelined step loop raises the cut to
+/// (`Commands::pipelined_compute_per_buffer`), beside `cut=`: since lloom #715
+/// `cut=` names the default the prefill and a blocking loop run at, and a
+/// `lookahead ≥ 1` loop runs its steps at this one.
+fn pipelined_cut_arm(device: &Device) -> String {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(dev) = device {
+        return dev.pipelined_compute_per_buffer().to_string();
+    }
+    let _ = device;
+    "n/a".to_string()
+}
+
 fn cut_policy_arm(device: &Device) -> String {
     #[cfg(feature = "metal")]
     if let Device::Metal(dev) = device {

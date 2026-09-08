@@ -515,4 +515,49 @@ impl Device {
             Self::Metal(d) => d.synchronize(),
         }
     }
+
+    /// Raise the Metal command-buffer cut period to the PIPELINED loop's for
+    /// the enclosing scope, restoring the default on drop (lloom #715). For a
+    /// loop that encodes step `s+1` while the GPU runs step `s` a cut buys no
+    /// overlap and costs a seam; for a loop that waits on every step -- and
+    /// for a prefill -- the default period IS the overlap, so this is held
+    /// only around a pipelined step loop (`Commands`' two defaults). A no-op
+    /// on other backends.
+    pub fn pipelined_cut_period(&self) -> PipelinedCutPeriod {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => {
+                let restore = d.compute_per_buffer();
+                d.set_compute_per_buffer(d.pipelined_compute_per_buffer());
+                PipelinedCutPeriod {
+                    device: Some(d.clone()),
+                    restore,
+                }
+            }
+            _ => PipelinedCutPeriod {
+                #[cfg(feature = "metal")]
+                device: None,
+                restore: 0,
+            },
+        }
+    }
+}
+
+/// The guard [`Device::pipelined_cut_period`] returns; restores the period it
+/// found on drop.
+#[must_use = "the period is restored when this is dropped; bind it to `_pipelined`, not `_`"]
+pub struct PipelinedCutPeriod {
+    #[cfg(feature = "metal")]
+    device: Option<crate::MetalDevice>,
+    #[allow(dead_code)]
+    restore: usize,
+}
+
+impl Drop for PipelinedCutPeriod {
+    fn drop(&mut self) {
+        #[cfg(feature = "metal")]
+        if let Some(d) = &self.device {
+            d.set_compute_per_buffer(self.restore);
+        }
+    }
 }

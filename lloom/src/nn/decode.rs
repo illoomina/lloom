@@ -775,6 +775,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // `produced`, not either part alone.
         let mut all_ids: Vec<u32> = Vec::with_capacity(opts.max_tokens);
 
+        // With a lookahead the host encodes step `s+1` while the GPU runs step
+        // `s`, so a command-buffer cut inside a step buys no overlap and costs
+        // a seam: the step loop runs at the pipelined cut period (512, one
+        // interior cut a step at most) and the default (50) is restored when
+        // the loop ends. Without a lookahead the default is the overlap and
+        // stays (`Device::pipelined_cut_period`; lloom #715).
+        let _pipelined_period = (opts.lookahead >= 1).then(|| device.pipelined_cut_period());
+
         loop {
             if opts.reached(produced) {
                 break;

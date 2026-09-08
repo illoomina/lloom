@@ -18,7 +18,24 @@ use std::sync::Arc;
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
+/// The cut period: dispatches per command buffer. 50 is the shipping path and
+/// every recorded digest belongs to it; it is also the overlap granularity of a
+/// loop that WAITS on every step -- the GPU runs the first fifty dispatches
+/// while the host encodes the rest -- which is why a prefill and a blocking
+/// loop want it small (lloom #715: `lfm2-decode-profile` at 512 read −8.5 %,
+/// 20.0 vs 18.5 ms/token; a prompt in one buffer +1.6–2.6 ms of TTFT).
 const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
+/// The cut period for a PIPELINED decode loop -- one that encodes step `s+1`
+/// while the GPU runs step `s` (`lookahead ≥ 1`), so a cut buys no overlap and
+/// costs a seam. 512 is "at most one interior cut per decode step" for LFM2's
+/// ~345 dispatches, with margin; measured on the crown loop (#715,
+/// `measurements/issue-715-cut-period.md`): **+2.2 % [+1.9, +2.6] tok/s at
+/// 350, 512 and 1024 against 50**, streams byte-identical, the visible cadence
+/// the commit budget's, prefill memory unchanged. The decode loop raises the
+/// period to this for its steps (`Commands::set_compute_per_buffer`) and
+/// restores the default after; the prefill runs at the default.
+/// `CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER` overrides it.
+const DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER: usize = 512;
 
 /// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).
 ///
@@ -357,7 +374,10 @@ pub struct Commands {
     command_queue: CommandQueue,
     /// The maximum amount of [compute command encoder](https://developer.apple.com/documentation/metal/mtlcomputecommandencoder?language=objc)
     /// per [command buffer](https://developer.apple.com/documentation/metal/mtlcommandbuffer?language=objc)
-    compute_per_buffer: usize,
+    compute_per_buffer: AtomicUsize,
+    /// The pipelined loop's period (`CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER`,
+    /// default 512); see `DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER`.
+    pipelined_compute_per_buffer: usize,
     /// Where command buffers are cut (`DESIGN.md` §13.5m, issue #420 stage 3).
     ///
     /// Read once from the environment at construction, like
@@ -601,11 +621,19 @@ impl Commands {
             None
         };
 
+        let pipelined_compute_per_buffer =
+            match std::env::var("CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER") {
+                Ok(val) => val
+                    .parse()
+                    .unwrap_or(DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER),
+                _ => DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER,
+            };
         Ok(Self {
             state: CachePadded::new(parking_lot::Mutex::new(EntryState::new(cb))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),
             command_queue,
-            compute_per_buffer,
+            compute_per_buffer: AtomicUsize::new(compute_per_buffer.max(1)),
+            pipelined_compute_per_buffer: pipelined_compute_per_buffer.max(1),
             cut_policy,
             node_cut_pending: AtomicBool::new(false),
             device,
@@ -729,7 +757,23 @@ impl Commands {
     /// default and an arm that is inert are different facts, which is the
     /// distinction §7.1a-i's `ScratchSizing` note draws.
     pub fn compute_per_buffer(&self) -> usize {
+        self.compute_per_buffer.load(Ordering::Relaxed)
+    }
+
+    /// The period a pipelined decode loop raises the cut to (see the defaults
+    /// above).
+    pub fn pipelined_compute_per_buffer(&self) -> usize {
+        self.pipelined_compute_per_buffer
+    }
+
+    /// Change the counter cut's period. A relaxed store, read by the next
+    /// `command_encoder`; the running count since the last cut is untouched,
+    /// so a switch mid-session cuts when that count reaches the new period.
+    /// A pipelined decode loop raises the period for its steps through this
+    /// and restores the default after (`Device::pipelined_cut_period`).
+    pub fn set_compute_per_buffer(&self, period: usize) {
         self.compute_per_buffer
+            .store(period.max(1), Ordering::Relaxed);
     }
 
     /// Tell the executor the model has reached graph node `index`
@@ -761,7 +805,7 @@ impl Commands {
         let since_cut = self.compute_count.load(Ordering::Relaxed);
         if self
             .cut_policy
-            .cuts_at_node(index, since_cut, self.compute_per_buffer)
+            .cuts_at_node(index, since_cut, self.compute_per_buffer())
         {
             self.node_cut_pending.store(true, Ordering::Relaxed);
         }
@@ -781,13 +825,13 @@ impl Commands {
     /// a faithful dispatch count for anything else reading it.
     fn should_cut(&self, count: usize) -> bool {
         match self.cut_policy {
-            CutPolicy::DispatchCounter => count >= self.compute_per_buffer,
+            CutPolicy::DispatchCounter => count >= self.compute_per_buffer(),
             CutPolicy::NodeIndex { .. } => self.node_cut_pending.swap(false, Ordering::Relaxed),
             CutPolicy::NodeAligned => {
                 self.node_cut_pending.swap(false, Ordering::Relaxed)
                     || self
                         .cut_policy
-                        .cuts_at_dispatch(count, self.compute_per_buffer)
+                        .cuts_at_dispatch(count, self.compute_per_buffer())
             }
         }
     }

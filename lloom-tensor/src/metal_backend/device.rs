@@ -620,6 +620,16 @@ impl MetalDevice {
         self.commands.compute_per_buffer()
     }
 
+    /// The pipelined loop's cut period (`Commands::pipelined_compute_per_buffer`).
+    pub fn pipelined_compute_per_buffer(&self) -> usize {
+        self.commands.pipelined_compute_per_buffer()
+    }
+
+    /// Switch the counter cut's period (`Commands::set_compute_per_buffer`).
+    pub fn set_compute_per_buffer(&self, period: usize) {
+        self.commands.set_compute_per_buffer(period)
+    }
+
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>> {
         let command_encoder = self
             .commands

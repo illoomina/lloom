@@ -59,6 +59,22 @@ const PROMPTS: [&str; 8] = [
     include_str!("../../../../design/workloads/prompts/multiturn-t3.txt"),
 ];
 
+/// Render a knob's value only when the run read it. `--dspark` drives the
+/// speculative body over a fixed `Blocking` handle whose commit, lookahead and
+/// pacer paths it never enters (`Session::decode_speculative` commits only
+/// under a ring-owning strategy and holds no pipelined period), so
+/// `--readback`, `--lookahead`, `--commit-budget` and `--wake-cadence` are
+/// parsed there and unread. A value printed beside a run that did not read it
+/// compares equal to every run that did — §7.1a-i's wrong-arm shape — so it
+/// renders as unread instead.
+pub fn read_or_na(read: bool, value: impl std::fmt::Display) -> String {
+    if read {
+        value.to_string()
+    } else {
+        "n/a(dspark)".to_string()
+    }
+}
+
 /// The first `n` prompts of the run: the set above, cycled past its length so
 /// a row count the set does not cover still runs (two rows on one prompt
 /// decode identical streams, which is a free neighbour-independence check).
@@ -317,12 +333,14 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
     };
     let capacity = 8 * ctx.max_tokens + 8 * (budget.period() + 2);
 
+    // Under `--dspark` the speculative drivers read none of the readback knobs
+    // (`read_or_na`); the line names the arm that ran and marks the rest unread.
     let common = format!(
         "readback={} lookahead={} commit_budget={} in_flight_steps={} max_tokens={} dtype={:?}",
-        ctx.readback,
-        lookahead,
-        budget.arm(),
-        lloom::nn::decode::IN_FLIGHT_STEPS,
+        if ctx.dspark { "dspark" } else { ctx.readback },
+        read_or_na(!ctx.dspark, lookahead),
+        read_or_na(!ctx.dspark, budget.arm()),
+        read_or_na(!ctx.dspark, lloom::nn::decode::IN_FLIGHT_STEPS),
         ctx.max_tokens,
         ctx.dtype
     );
@@ -1201,4 +1219,19 @@ fn run_batched_concurrent(
 /// The ChatML user-turn wrapping, matching `lfm2-chat`'s single path.
 fn user_turn_text(p: &str) -> String {
     format!("<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_or_na;
+
+    /// A `--dspark` line must not report a readback knob the speculative body
+    /// never read; a K=1 line reports it verbatim.
+    #[test]
+    fn a_dspark_line_renders_unread_knobs_as_unread() {
+        assert_eq!(read_or_na(false, 1usize), "n/a(dspark)");
+        assert_eq!(read_or_na(false, "steps:8"), "n/a(dspark)");
+        assert_eq!(read_or_na(true, 1usize), "1");
+        assert_eq!(read_or_na(true, "steps:8"), "steps:8");
+    }
 }

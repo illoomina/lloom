@@ -1130,6 +1130,15 @@ fn main() -> Result<()> {
             &device,
         )?)
     } else {
+        // Said once, because the flags are accepted: the speculative body reads
+        // its tokens back every round (`verify_tokens`' argmax compare) and
+        // commits only under a ring-owning strategy, so none of these reach it
+        // and the RESULT line renders them unread (`concurrent::read_or_na`).
+        eprintln!(
+            "[dspark: --readback {} --lookahead {} --commit-budget {} --wake-cadence {} are not \
+             read by the speculative body; the RESULT line renders them n/a(dspark)]",
+            args.readback, args.lookahead, args.commit_budget, args.wake_cadence
+        );
         None
     };
 
@@ -1680,16 +1689,16 @@ fn main() -> Result<()> {
         } else {
             &args.readback
         },
-        args.lookahead,
+        concurrent::read_or_na(!args.dspark, args.lookahead),
         args.prefill_ubatch,
         st.prefill_units,
-        budget.arm(),
+        concurrent::read_or_na(!args.dspark, budget.arm()),
         st.commits,
         st.max_in_flight,
         st.step_markers,
         st.step_waits,
         cut_policy_arm(&device),
-        pipelined_cut_arm(&device),
+        concurrent::read_or_na(!args.dspark, pipelined_cut_arm(&device)),
         st.readback.ring_publishes,
         st.readback.poll_fallbacks,
         st.overrun,

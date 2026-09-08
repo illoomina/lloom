@@ -74,6 +74,13 @@ rand_distr = { workspace = true }
 
 [features]
 default = []
+# The stateful fuzz MODELS (`buffer_pool_fuzz`, `commands_fuzz`, `scratch_fuzz`)
+# and the one accessor they read, compiled OUTSIDE `#[cfg(test)]` so the
+# coverage-guided harnesses in `lloom-fuzz/` (lloom #706) can drive them. Off by
+# default; a release build with it off is byte-identical to one without it
+# (`measurements/issue-706-libafl-port.md`). The proptest generators and the
+# tests stay `#[cfg(test)]` -- proptest is a dev-dependency.
+fuzzing = []
 cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]

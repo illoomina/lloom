@@ -38,7 +38,7 @@
 //! rather than a 400-operation transcript (#494's own argument for proptest
 //! over a coverage-guided fuzzer).
 
-#![cfg(test)]
+#![cfg(any(test, feature = "fuzzing"))]
 
 use super::buffer_pool::{BufferPool, GpuClock, PooledBuffer};
 use super::device::Device;
@@ -512,6 +512,12 @@ fn compare(
     }
 }
 
+// The generators and the properties: test-only, because proptest is a
+// dev-dependency and the model above is also driven by `lloom-fuzz` (#706).
+#[cfg(test)]
+mod proptests {
+    use super::*;
+
 // ---------------------------------------------------------------------------
 // The generator, and the properties.
 // ---------------------------------------------------------------------------
@@ -889,4 +895,5 @@ proptest! {
             }
         }
     }
+}
 }

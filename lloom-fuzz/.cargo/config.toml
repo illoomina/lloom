@@ -1,0 +1,31 @@
+# The instrumentation is a property of this tree, not of an invocation nobody
+# recorded (§14.5a). `--target` is REQUIRED and is not a portability flourish:
+# with an explicit target cargo applies these rustflags to TARGET crates only, so
+# every engine crate is instrumented and the host build scripts are not — without
+# it `serde`'s build script links against `__sanitizer_cov_trace_pc_guard` and
+# fails (measured, `issue-706-raw/probes.log`).
+#
+# The parent config (`../.cargo/config.toml`) contributes `-C target-cpu=native`;
+# cargo merges the arrays, so the harness runs the same codegen `lfm2-chat` does.
+[build]
+target = "aarch64-apple-darwin"
+rustflags = [
+    "-Cpasses=sancov-module",
+    "-Cllvm-args=-sanitizer-coverage-level=3",
+    "-Cllvm-args=-sanitizer-coverage-trace-pc-guard",
+    "-Cllvm-args=-sanitizer-coverage-trace-compares",
+]
+# Every target crate is instrumented -- the ~200 dependency crates included --
+# because rustc exposes no way to restrict the pass: `-fsanitize-coverage-
+# allowlist` is a clang driver option, not an LLVM `cl::opt`, so
+# `-Cllvm-args=-sanitizer-coverage-allowlist=` is rejected (measured), and
+# per-package rustflags are nightly-only (`-Zprofile-rustflags`). Measured on
+# the fuzz-thin build: 1 181 290 guards for `fuzz_kv_pages`, of which the engine
+# crates are a minority. The cost is the map scan per execution; the feedback
+# over dependency code is inert rather than wrong.
+
+# The edges map `libafl_targets` compiles in, read by its build script. Sized
+# for the guard count above with headroom; the count each binary prints at
+# start must stay below it (`campaign::run` refuses otherwise).
+[env]
+LIBAFL_EDGES_MAP_DEFAULT_SIZE = "2097152"

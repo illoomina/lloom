@@ -9,6 +9,10 @@ use rand::{distr::Distribution, SeedableRng};
 pub mod poll;
 pub mod readback;
 pub mod token_ring;
+/// The token ring's stateful fuzz model and driver (#508), outside `#[cfg(test)]`
+/// under the `fuzzing` feature so `lloom-fuzz` (#706) can drive it.
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod token_ring_fuzz;
 
 pub use readback::{
     Blocking, CommitBudget, EosRead, Geometry, ReadbackArms, ReadbackCounters, ReadbackStrategy,

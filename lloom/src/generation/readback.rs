@@ -391,10 +391,12 @@ impl Geometry {
 
 /// A poison sentinel written into a tile's unused (waste) tail so a read of it
 /// — always a bug, since the drain only takes each tile's real prefix — is loud
-/// rather than a plausible stale token. Only paid in debug/ASan builds (the
-/// release write skips it; the geometry proves the waste is never read). Chosen
-/// as an id no tokenizer emits and one that stands out in a dump.
-#[cfg(debug_assertions)]
+/// rather than a plausible stale token. Only paid in debug/ASan builds and under
+/// the `fuzzing` feature (the release write skips it; the geometry proves the
+/// waste is never read, and the fuzz harnesses run release codegen and need the
+/// sentinel to prove it). Chosen as an id no tokenizer emits and one that stands
+/// out in a dump.
+#[cfg(any(debug_assertions, feature = "fuzzing"))]
 const TILE_POISON: u32 = 0xDEAD_B171; // "DEAD BITs"
 
 /// Slots per segment ceiling: a `StorageModePrivate` buffer is CPU-mapped only
@@ -773,7 +775,7 @@ impl History {
         }
         let slot = self.tiles % self.total_tiles();
         self.tile_counts[slot] = self.in_tile as u32;
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "fuzzing"))]
         if self.in_tile < self.ring.quantum {
             let (seg, base) = self.tile_home(self.tiles);
             let waste = self.ring.quantum - self.in_tile;
@@ -1929,9 +1931,9 @@ mod tests {
     }
 
     // The poison constant is debug-only; give the test a stable name for it.
-    #[cfg(debug_assertions)]
+    #[cfg(any(debug_assertions, feature = "fuzzing"))]
     const TILE_POISON_TEST: u32 = TILE_POISON;
-    #[cfg(not(debug_assertions))]
+    #[cfg(not(any(debug_assertions, feature = "fuzzing")))]
     const TILE_POISON_TEST: u32 = 0xDEAD_B171;
 
     /// The WINDOW drain (`drain_mapped`) on a REAL Metal device — the scan-free,

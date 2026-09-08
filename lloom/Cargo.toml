@@ -50,6 +50,9 @@ hf-hub = { workspace = true }
 tokenizers = { workspace = true, features = ["onig"] }
 
 [dev-dependencies]
+# The integration tests drive the fuzz models that live behind `fuzzing`; a
+# self dev-dependency is how cargo turns a feature on for a crate's own tests.
+lloom = { path = ".", features = ["fuzzing"] }
 # The stateful sequence fuzzer over `TokenRing` (lloom #508). A dev-dependency,
 # so nothing shipping and no downstream consumer acquires it -- which is what
 # keeps `CONTRIBUTING.md` §4.1's "must not break CPU or CUDA backends" a
@@ -74,6 +77,12 @@ default = []
 # release-like build with `--features profile` to profile without shipping the
 # reads. Gated as `any(debug_assertions, feature = "profile")`.
 profile = []
+# The fuzz models (`generation::token_ring_fuzz`, `models::lfm2::kv_slot_fuzz`)
+# outside `#[cfg(test)]`, and the tile poison written in a release build, so the
+# coverage-guided harnesses in `lloom-fuzz/` (lloom #706) drive the same models
+# and see the same sentinels the proptests do. Off by default; byte-identical
+# release binary with it off (`measurements/issue-706-libafl-port.md`).
+fuzzing = ["lloom-tensor/fuzzing"]
 accelerate = ["dep:accelerate-src", "lloom-tensor/accelerate"]
 cuda = ["lloom-tensor/cuda"]
 cudnn = ["lloom-tensor/cudnn"]

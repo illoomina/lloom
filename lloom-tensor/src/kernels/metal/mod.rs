@@ -11,8 +11,8 @@ mod arena_gpu_tests;
 pub mod buffer;
 pub mod buffer_pool;
 /// A stateful model-based fuzzer over the pool's public surface (#494).
-#[cfg(test)]
-mod buffer_pool_fuzz;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod buffer_pool_fuzz;
 /// Cache-line padding for control state written by two threads (issue #442).
 /// The unit is load-bearing -- 128 B per *struct instance*, never per element;
 /// the module docs carry the 64x blowup the second half prevents.
@@ -21,8 +21,8 @@ pub mod command_buffer;
 pub mod commands;
 /// A stateful model-based fuzzer over `Commands`' submission surface, holding
 /// `in_flight` bounded across arbitrary commit/prune/wait interleavings (#508).
-#[cfg(test)]
-mod commands_fuzz;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod commands_fuzz;
 /// How the host learns a command buffer finished: the blocking incumbent and
 /// two `MTLSharedEvent` arms behind one seam (#559, `DESIGN.md` §11.5o).
 ///
@@ -94,8 +94,8 @@ pub mod run_telemetry;
 pub mod scratch;
 /// A stateful fuzzer over the scratch class's long-context state machine, on
 /// the `kv_len` axis the four existing harnesses do not carry (#575).
-#[cfg(test)]
-mod scratch_fuzz;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod scratch_fuzz;
 #[cfg(test)]
 mod scratch_gpu_tests;
 #[cfg(test)]

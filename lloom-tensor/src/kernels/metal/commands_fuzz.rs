@@ -83,13 +83,11 @@
 //!   §11.5h's return value exists to let a caller assert, and it is the one a
 //!   fuzzer can hold across arbitrary interleavings.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "fuzzing"))]
 
 use super::commands::Commands;
 use super::residency_set::ResidencySet;
 use crate::kernels::{call_unary_contiguous, unary, BufferOffset, Device, Kernels};
-use proptest::prelude::*;
-use proptest::test_runner::TestCaseError;
 use std::sync::Arc;
 
 /// One symbol of the submission alphabet.
@@ -388,6 +386,14 @@ pub struct Engagement {
     pub max_observed: usize,
 }
 
+// The generator and the properties: test-only, because proptest is a
+// dev-dependency and the model above is also driven by `lloom-fuzz` (#706).
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
+
 fn op_strategy() -> impl Strategy<Value = Op> {
     prop_oneof![
         // Encoding is what grows the queue without asking, so it is weighted
@@ -595,4 +601,5 @@ fn in_flight_has_one_growth_site_and_three_shrink_sites() {
         5,
         "the growth/shrink census moved; the fuzzer's model is written against it"
     );
+}
 }

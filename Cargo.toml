@@ -33,6 +33,11 @@ exclude = [
     "candle-flash-attn-v3",
     "candle-kernels",
     "candle-onnx",
+    # The LibAFL harnesses (lloom #706): their own workspace root, because they are
+    # built with SanitizerCoverage passes on every target crate and pull a
+    # dependency tree the engine never links. Build from lloom-fuzz/ (see its
+    # README).
+    "lloom-fuzz",
 ]
 resolver = "2"
 

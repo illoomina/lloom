@@ -1909,6 +1909,13 @@ pub struct Cache {
     /// that does not tap allocates nothing here (§9.1's memory classes are
     /// unmoved).
     taps: Vec<Option<Tensor>>,
+    /// The verify window's anchor, a `[1]` `U32` slot this cache owns and
+    /// rewrites per round through the mapped pointer — where a `Tensor::new`
+    /// per round was an unpooled driver allocation, a residency add and a
+    /// residency commit at the next cut (§10.2z-iii's drains). Written only
+    /// between rounds, after the previous window's readback, so no queued
+    /// `cat` still reads it (the mapped write's own contract).
+    anchor_slot: Option<Tensor>,
     /// Tap sets a forward cleared before anyone took them. A drafter seeded
     /// from a cache that dropped a set has missed those positions — the
     /// defect no gate but the accept rate sees (§10.2n, §10.2w) — so the
@@ -2157,6 +2164,7 @@ impl Cache {
             // per-token path (§15.2 #10 is about lookup, but a realloc in the
             // layer loop is the same shape).
             taps: Vec::with_capacity(config.tap_layers.len()),
+            anchor_slot: None,
             taps_dropped: 0,
             tap_layers: config.tap_layers.clone(),
             tap_dtype: config.tap_dtype,
@@ -2194,6 +2202,28 @@ impl Cache {
     /// How many tap sets a forward has cleared untaken (see `taps_dropped`).
     pub fn taps_dropped(&self) -> u64 {
         self.taps_dropped
+    }
+
+    /// The verify anchor as a `[1]` device tensor: the cache's own slot,
+    /// rewritten in place through the mapped pointer, or — where no mapped
+    /// write is available (a non-Metal device) — a fresh upload.
+    fn anchor_tensor(&mut self, last: u32) -> Result<Tensor> {
+        // Created by an upload that carries the first value, not `zeros`: a
+        // pooled `zeros` is a fill blit still queued when the host would write
+        // through the mapping, and the fill lands last (the first verify's
+        // anchor read 0 that way).
+        if self.anchor_slot.is_none() {
+            let slot = Tensor::new(&[last], &self.device)?;
+            self.anchor_slot = Some(slot.clone());
+            return Ok(slot);
+        }
+        let slot = self.anchor_slot.as_ref().expect("set above");
+        // SAFETY: the slot is read only by this cache's verify window, whose
+        // readback completed before the next call rewrites it.
+        if unsafe { slot.write_host_slice::<u32>(0, &[last]) } {
+            return Ok(slot.clone());
+        }
+        Tensor::new(&[last], &self.device)
     }
 
     /// Grow the KV slab in buckets of `bucket` tokens rather than
@@ -5478,8 +5508,7 @@ impl Model {
 
         // `[last, proposed[0..k]]`: every proposal is fed, and the position
         // after the last one is where the bonus token comes from.
-        let device = &cache.device;
-        let anchor = Tensor::new(&[last], device)?;
+        let anchor = cache.anchor_tensor(last)?;
         let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
 
         // **One pass over the weights for k + 1 positions.** §9.1c: the weight
@@ -5490,7 +5519,13 @@ impl Model {
 
         // The one readback: `[argmax[0..=k], proposed[0..k]]` in a single
         // buffer, so the host waits for the GPU once and compares locally.
-        let both = Tensor::cat(&[&argmax, proposed], 0)?.to_vec1::<u32>()?;
+        // Staged (`stage_read`): the wait is on the buffer that produced it,
+        // not the queue's tail, and the staging copy is unconditional — a
+        // `to_vec1` here took the tail wait and, when the pool handed the
+        // 80-byte result an unmapped buffer, a second blit and wait behind it.
+        let both = Tensor::cat(&[&argmax, proposed], 0)?
+            .stage_read()?
+            .to_vec1::<u32>()?;
         let (argmax, proposed) = both.split_at(k + 1);
         let accepted = accept_prefix(argmax, proposed, eos_ids);
 
@@ -5545,8 +5580,7 @@ impl Model {
             )
         }
         let tok = cache.advance(k + 1)?;
-        let device = &cache.device;
-        let anchor = Tensor::new(&[last], device)?;
+        let anchor = cache.anchor_tensor(last)?;
         let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
         let logits = self.forward_all(&input, index_pos, cache)?;
         let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;

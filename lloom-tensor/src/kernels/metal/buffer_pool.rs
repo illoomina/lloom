@@ -198,6 +198,13 @@ pub struct PooledBuffer {
     /// one, so it goes back where a future request of that size will find it.
     size: usize,
 
+    /// For an unpooled buffer made resident at creation
+    /// (`MetalDevice::new_buffer_with_data`): the set to leave on drop. A
+    /// residency set retains what it holds (§6.3d), so an unpooled buffer that
+    /// never left it leaked its size per upload, and its stale key kept the
+    /// next allocation at that address out of the set.
+    residency: Option<Arc<super::ResidencySet>>,
+
     /// `Weak` so a leaked buffer cannot keep the whole device alive, and so a
     /// buffer outliving its pool drops cleanly instead of resurrecting it.
     pool: Weak<PoolInner>,
@@ -214,6 +221,22 @@ impl PooledBuffer {
             buffer: Some(buffer),
             size,
             pool: Weak::new(),
+            residency: None,
+        }
+    }
+
+    /// An unpooled buffer the caller inserted into `residency`; the drop
+    /// removes it (deferred to the next cut's commit) before Metal frees it.
+    pub fn unpooled_resident(
+        buffer: Buffer,
+        size: usize,
+        residency: Arc<super::ResidencySet>,
+    ) -> Self {
+        Self {
+            buffer: Some(buffer),
+            size,
+            pool: Weak::new(),
+            residency: Some(residency),
         }
     }
 
@@ -285,6 +308,9 @@ impl Drop for PooledBuffer {
             // SAFETY: nothing holds this buffer -- this is its last handle, and
             // the pool that could have handed out another is gone. Inert
             // without `asan-poison`.
+            if let Some(set) = &self.residency {
+                set.remove_deferred(&buffer);
+            }
             unsafe { super::poison::unpoison_buffer(&buffer) };
         }
     }
@@ -1618,6 +1644,7 @@ impl BufferPool {
             buffer: Some(buffer),
             size: bucket_size,
             pool: Arc::downgrade(&self.inner),
+            residency: None,
         }))
     }
 
@@ -1737,6 +1764,7 @@ impl BufferPool {
             buffer: Some(buffer),
             size,
             pool: Arc::downgrade(&self.inner),
+            residency: None,
         })
     }
 

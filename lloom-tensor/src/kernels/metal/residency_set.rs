@@ -311,6 +311,27 @@ impl ResidencySet {
         self.remove_batch(std::iter::once(buf))
     }
 
+    /// `removeAllocation` without the commit: the set goes dirty and the next
+    /// command-buffer cut's [`Self::commit_pending`] publishes it — the mirror
+    /// of [`Self::add`]. For a handle dropped on a hot path (an unpooled
+    /// upload freed after its forward), where an immediate `commit` per drop
+    /// would be a driver round-trip per token. Skips buffers the set does not
+    /// hold, for the same reason `remove_batch` does (§6.3c).
+    pub fn remove_deferred(&self, buf: &Buffer) -> usize {
+        let Some(set) = &self.raw else {
+            return 0;
+        };
+        let mut members = self.members.lock();
+        if members.remove(&allocation_key(buf)) {
+            set.removeAllocation(as_allocation(buf));
+            self.removed.fetch_add(1, Ordering::Relaxed);
+            self.dirty.store(true, Ordering::Relaxed);
+            1
+        } else {
+            0
+        }
+    }
+
     /// Forgets these buffers **without** calling Metal, for allocations whose
     /// handles are about to be destroyed.
     ///

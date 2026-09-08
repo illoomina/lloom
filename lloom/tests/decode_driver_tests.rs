@@ -26,6 +26,13 @@ use lloom::nn::{CausalLM, DecodeOptions, IdentityProposer, Model, Session, Specu
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 const VOCAB: usize = 64;
+
+/// Tests that read a GPU-load-dependent quantity (the pacer's in-flight
+/// count) or that put a load on the GPU (the repeated hazard sweep) take this
+/// so they do not run beside each other: `cargo test` runs the file's tests
+/// in parallel on one device, and a busy GPU retires buffers late — the
+/// pacer test read `4 in flight, bound 3` beside the sweep, and passes alone.
+static GPU_QUIET: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const EOS: u32 = 42;
 
 fn next_of(tok: u32) -> u32 {
@@ -115,6 +122,7 @@ fn greedy() -> LogitsProcessor {
     LogitsProcessor::from_sampling(0, Sampling::ArgMax)
 }
 
+#[derive(Debug, Clone, Copy)]
 enum Arm {
     Blocking,
     RingBlocking,
@@ -848,6 +856,7 @@ fn the_ring_feeds_the_same_slot_every_step() -> Result<()> {
 /// observes stays within the depth plus the commit the loop itself makes.
 #[test]
 fn the_pacer_bounds_the_drain_arm_and_is_a_null_on_the_poll_arm() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
     for device in devices() {
         let opts = DecodeOptions {
             lookahead: 1,
@@ -886,6 +895,101 @@ fn the_pacer_bounds_the_drain_arm_and_is_a_null_on_the_poll_arm() -> Result<()> 
         // command stream the incumbent's.
         let (out, _) = run(&device, &Arm::Blocking, &[0], &DecodeOptions::new(12))?;
         assert_eq!(out.stats.step_markers, 0, "{device:?}");
+    }
+    Ok(())
+}
+
+/// #722 follow-up, hypothesis 9: `TokenRing::publish_marker` stages the
+/// generation into `marker_src` with a HOST write and no ordering against the
+/// GPU copy that reads it (`write_host_slice`'s SAFETY clause is the caller's).
+/// `marker_src` has one tile on the non-streamed geometry. The poll arm's
+/// per-step wait orders the rewrite after the copy; the deferred arms have no
+/// per-step wait, so at a `per-token` budget under lookahead 1 the tile may be
+/// rewritten while the previous step's copy is still queued — the stamp would
+/// then read a NEWER generation, and the drain would clamp past a slot the GPU
+/// has not written (§3.5). If that happens the ids are not the host chain's.
+/// Repeated, because a race does not fail on demand. Reports; does not fix.
+#[test]
+fn deferred_arms_at_a_per_token_budget_never_drain_an_unwritten_slot() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        for arm in [
+            Arm::RingHostDrain,
+            Arm::RingGpuBatch,
+            Arm::RingGpuBatchNonblocking,
+        ] {
+            for rep in 0..20 {
+                for (start, n) in [(1u32, 64usize), (0, 200)] {
+                    let (want, _) = chain(start, n);
+                    let opts = DecodeOptions {
+                        lookahead: 1,
+                        budget: lloom::generation::CommitBudget::per_token(),
+                        ..DecodeOptions::new(n)
+                    };
+                    let (out, _) = run(&device, &arm, &[start], &opts)?;
+                    assert_eq!(
+                        out.ids, want,
+                        "{device:?} {arm:?} rep {rep} from {start}: the drain returned a slot the \
+                         GPU had not written (a stale or unwritten token)"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A [`RingReader`] taken before the run reads the same stream the loop
+/// returned, straight off the device ring, without touching the loop: the
+/// tokens up to the EOS (not included), `ended()` set by the stop id, and the
+/// published count equal to the loop's publishes. `None` off Metal.
+#[test]
+fn a_ring_reader_sees_the_loops_stream_off_the_ring() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        for (start, n) in [(1u32, 64usize), (0, 24)] {
+            let (want, hit) = chain(start, n);
+            let model = Chain::new(&device)?;
+            let mut session = Session::new(&model, 0usize);
+            let mut spec = IdentityProposer;
+            let mut rb = Ring::new(
+                &[EOS],
+                &device,
+                n + 4,
+                EosRead::Poll(PollMechanism::default()),
+            )?
+            .with_poll_budget(20_000);
+            let reader = rb.reader();
+            let opts = DecodeOptions {
+                lookahead: 1,
+                ..DecodeOptions::new(n)
+            };
+            let mut sampler = greedy();
+            let out =
+                session.decode(&mut spec, &mut rb, &mut sampler, &[start], &opts, &mut sink)?;
+            assert_eq!(out.ids, want);
+            match (&device, reader) {
+                (Device::Cpu, r) => assert!(r.is_none(), "no mapped words off Metal"),
+                (_, None) => panic!("{device:?}: the ring's words were not mapped"),
+                (_, Some(mut r)) => {
+                    let mut seen = Vec::new();
+                    let n_read = r.read_new(&mut seen).expect("the reader was not lapped");
+                    assert_eq!(seen, out.ids, "{device:?}: the reader's stream");
+                    assert_eq!(n_read, out.ids.len());
+                    assert_eq!(r.ended(), hit, "{device:?}: the stop id ends the reader");
+                    assert_eq!(
+                        r.published().map(u64::from),
+                        Some(out.stats.readback.ring_publishes),
+                        "{device:?}: the published word is the loop's publish count"
+                    );
+                    assert_eq!(
+                        r.read_new(&mut seen).expect("no lap"),
+                        0,
+                        "nothing new after"
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -438,6 +438,142 @@ impl Geometry {
     }
 }
 
+/// A zero-copy, lock-free view of a [`Ring`]'s published history for a thread
+/// that is not the decode loop — a consumer that wants to read the tokens
+/// straight off the device-resident ring instead of through a host queue.
+///
+/// It owns nothing the loop uses: clones of the segment tensors (so the
+/// buffers outlive it) and of the ring's `step` word, and its own cursor. The
+/// loop is never touched, locked or slowed by it: `published()` is one
+/// volatile load of the word the GPU stamps after each slot write (the same
+/// visibility signal the loop's own drain clamps to — the slot is written
+/// BEFORE the stamp, so `[0, published)` is readable), and `read_new` copies
+/// the slots between the cursor and that value through the mapped pointers.
+///
+/// Two contracts the reader carries itself, because the loop does not know it
+/// exists:
+///
+/// * **EOS**: the loop retracts an EOS token from its history and reuses the
+///   slot, but the stamp counted it; the reader stops at the first stop id it
+///   sees and reports `ended()` — after that it reads nothing more.
+/// * **Laps**: the loop's lap guard protects the loop's own drain, not this
+///   reader. If the reader falls more than `capacity` tokens behind the writer,
+///   `read_new` returns [`RingLap`] rather than stale slots; how far behind a
+///   consumer may fall is the ring's `capacity` (the consumer slack,
+///   `LLOOM_RING_SLACK_BYTES`), which the caller sizes.
+///
+/// Only the dense (`quantum == 1`, K=1) history has a slot-per-token layout a
+/// reader can index; [`Ring::reader`] returns `None` otherwise, and off Metal
+/// (no mapped words).
+#[derive(Debug)]
+pub struct RingReader {
+    segments: Vec<Tensor>,
+    step: Tensor,
+    tiles_per_seg: usize,
+    total_tiles: usize,
+    eos_ids: Vec<u32>,
+    cursor: usize,
+    ended: bool,
+}
+
+/// The writer overtook a [`RingReader`]: more than `capacity` tokens were
+/// published since the reader's `cursor`, so the slots between are no longer
+/// the tokens they were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingLap {
+    pub cursor: usize,
+    pub published: usize,
+    pub capacity: usize,
+}
+
+impl std::fmt::Display for RingLap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ring reader lapped: cursor {} published {} capacity {}",
+            self.cursor, self.published, self.capacity
+        )
+    }
+}
+
+impl RingReader {
+    /// The generation the GPU has published so far — one volatile load, no
+    /// lock, no wait. `None` if the word is not CPU-mapped.
+    pub fn published(&self) -> Option<u32> {
+        self.step.peek_scalar::<u32>(0)
+    }
+
+    /// Tokens consumed so far (EOS excluded), the reader's own position.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Whether a stop id ended the stream for this reader.
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+
+    /// The tokens published since the last call, appended to `out`; stops at
+    /// the first stop id (not appended) and marks the reader ended. Returns
+    /// how many were appended, or [`RingLap`] if the writer overtook the
+    /// cursor. Never waits: an unmapped word or segment reads as nothing new.
+    pub fn read_new(&mut self, out: &mut Vec<u32>) -> std::result::Result<usize, RingLap> {
+        if self.ended {
+            return Ok(0);
+        }
+        let Some(published) = self.published() else {
+            return Ok(0);
+        };
+        let published = published as usize;
+        if published <= self.cursor {
+            return Ok(0);
+        }
+        if published - self.cursor > self.total_tiles {
+            return Err(RingLap {
+                cursor: self.cursor,
+                published,
+                capacity: self.total_tiles,
+            });
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = published;
+            return Ok(0);
+        }
+        #[cfg(feature = "metal")]
+        {
+            let mut n = 0usize;
+            let mut cur_seg = usize::MAX;
+            let mut base: *const u32 = std::ptr::null();
+            while self.cursor < published {
+                let t = self.cursor % self.total_tiles;
+                let seg = t / self.tiles_per_seg;
+                let off = t % self.tiles_per_seg;
+                if seg != cur_seg {
+                    // SAFETY: a mapped pointer into a live buffer (the reader holds
+                    // the tensor); the slot at `off` was written before the stamp
+                    // that made `published` cover it.
+                    let Some(p) = (unsafe { self.segments[seg].peek_scalar_ptr::<u32>(0) }) else {
+                        return Ok(n);
+                    };
+                    base = p;
+                    cur_seg = seg;
+                }
+                // SAFETY: as above, `off < tiles_per_seg` slots into the segment.
+                let id = unsafe { base.add(off).read_volatile() };
+                self.cursor += 1;
+                if self.eos_ids.contains(&id) {
+                    self.ended = true;
+                    break;
+                }
+                out.push(id);
+                n += 1;
+            }
+            Ok(n)
+        }
+    }
+}
+
 /// A poison sentinel written into a tile's unused (waste) tail so a read of it
 /// — always a bug, since the drain only takes each tile's real prefix — is loud
 /// rather than a plausible stale token. Only paid in debug/ASan builds and under
@@ -1346,6 +1482,28 @@ impl Ring {
     /// The generation ordinal of the last publish.
     pub fn generation(&self) -> u32 {
         self.generation
+    }
+
+    /// A [`RingReader`] over this ring's history for another thread: `None`
+    /// off Metal, when the ring's words are not CPU-mapped, or on a
+    /// `quantum > 1` layout (no slot-per-token indexing). Take it before the
+    /// run; it costs the loop nothing afterwards.
+    pub fn reader(&self) -> Option<RingReader> {
+        if self.history.ring.quantum != 1 || !self.ring.poll_is_mapped() {
+            return None;
+        }
+        let step = self.ring.step_counter().clone();
+        step.peek_scalar::<u32>(0)?;
+        let eos_ids = self.ring.eos_ids().ok()?;
+        Some(RingReader {
+            segments: self.history.ring.segments.clone(),
+            step,
+            tiles_per_seg: self.history.ring.tiles_per_seg,
+            total_tiles: self.history.ring.total_tiles,
+            eos_ids,
+            cursor: 0,
+            ended: false,
+        })
     }
 }
 

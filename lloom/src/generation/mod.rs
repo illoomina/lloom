@@ -18,7 +18,7 @@ pub mod token_ring_fuzz;
 pub use hot_thread::{HotThread, HotThreadArm, HotThreadReport, QosClass};
 pub use readback::{
     Blocking, CommitBudget, EosRead, Geometry, ReadbackArms, ReadbackCounters, ReadbackStrategy,
-    Ring, WAKE_LIVE_EVERY_DEFAULT,
+    Ring, RingLap, RingReader, WAKE_LIVE_EVERY_DEFAULT,
 };
 
 #[derive(Clone, PartialEq, Debug)]

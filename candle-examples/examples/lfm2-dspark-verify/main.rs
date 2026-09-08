@@ -1147,7 +1147,10 @@ fn main() -> Result<()> {
         let base_logits = spec_model
             .draft_lm_head(&pred.to_dtype(DType::F16)?)?
             .to_dtype(DType::F32)?;
-        let proposed = drafter.sample_block(&base_logits, last)?.to_vec1::<u32>()?;
+        let anchor = Tensor::new(&[last], base_logits.device())?;
+        let proposed = drafter
+            .sample_block(&base_logits, &anchor)?
+            .to_vec1::<u32>()?;
         if let Some(d) = &args.dump_dir {
             if r < args.dump_rounds {
                 dump_f32(d, &format!("round{r}_block_hidden"), &hidden.squeeze(0)?)?;

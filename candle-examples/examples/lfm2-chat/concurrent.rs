@@ -332,6 +332,8 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         prefill_ubatch: 0,
         // `--spark` is refused on the concurrent path (main.rs); one-shot here.
         prefill_schedule: None,
+        prefill_bulk: 0,
+        prefill_pacer_depth: 0,
     };
     let capacity = 8 * ctx.max_tokens + 8 * (budget.period() + 2);
 

@@ -155,6 +155,22 @@ pub struct DecodeOptions {
     /// **Read once, in the prefill prologue** — the steady decode loop never
     /// consults it, so a schedule adds no per-token cost on the hot path.
     pub prefill_schedule: Option<Vec<usize>>,
+    /// The **bulk tile** width the prefill remainder is chopped into, after the
+    /// [`Self::prefill_schedule`] ramp is exhausted. `0` (the default) means the
+    /// remainder is a `seq_len == 1` tail (one forward per leftover token — the
+    /// pathological many-forwards case on a long prompt); a positive aligned
+    /// width (16 / 32 / 64) chops the remainder into that-wide forwards, each on
+    /// the no-guard GEMM variant, collapsing the forward count to
+    /// `remainder / bulk`. Only meaningful with `prefill_schedule = Some`.
+    pub prefill_bulk: usize,
+    /// The pacer's in-flight bound **during prefill** — how many prefill
+    /// forwards the host may run ahead of the GPU. `0` (the default) uses the
+    /// same depth as decode ([`Self::pacer_depth`]). A positive value runs
+    /// prefill deeper: a chunked / many-small-forward prefill is compute-bound
+    /// and serializes at the decode depth of 2 (each forward waits on the one
+    /// two back), so a deeper bound lets the forwards overlap. Restored to the
+    /// decode depth before the step loop, so it has no effect on steady decode.
+    pub prefill_pacer_depth: usize,
 }
 
 /// One speculative round of [`Session::decode_speculative`], for the per-round
@@ -217,6 +233,8 @@ impl DecodeOptions {
             in_flight_depth: 0,
             prefill_ubatch: 0,
             prefill_schedule: None,
+            prefill_bulk: 0,
+            prefill_pacer_depth: 0,
         }
     }
 
@@ -559,6 +577,17 @@ impl StepPacer {
         }
     }
 
+    /// Set the in-flight bound. Used to run the **prefill** at a different
+    /// (deeper) depth than steady decode: prefill is compute-bound and many
+    /// small forwards want to overlap, not serialize at the decode depth of 2.
+    /// Restored to the decode depth before the step loop. Does not retire
+    /// markers — only the bound the next `before_forward` enforces changes; a
+    /// LOWER depth is honoured on the next `before_forward` (it retires down to
+    /// the new bound then).
+    fn set_depth(&mut self, depth: usize) {
+        self.depth = depth.max(IN_FLIGHT_FLOOR);
+    }
+
     /// Before encoding a forward: retire the oldest marker if the bound would
     /// otherwise be exceeded.
     fn before_forward(&mut self, device: &Device) -> Result<()> {
@@ -716,6 +745,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // (`opts.in_flight_depth`, from warmup) or the floor — not a constant.
         let mut pacer = StepPacer::new(opts.pacer_depth());
         let pace = readback.loop_commits();
+        // Run prefill deeper than decode when asked: prefill is compute-bound and
+        // a chunked / many-small-forward prefill serializes at the decode depth of
+        // 2 (each forward waits on the one two back). A deeper bound lets the
+        // prefill forwards overlap. Restored to the decode depth after the prefill
+        // block, so steady decode is unaffected. `0` = same as decode.
+        if opts.prefill_pacer_depth > 0 {
+            pacer.set_depth(opts.prefill_pacer_depth);
+        }
 
         // Prefill: the state machine STEPS OVER THE PROMPT before it steps over
         // its own generated tokens — same stepping, different input source. Rather
@@ -757,8 +794,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // `Some` → the explicit schedule, bucket tail included. Computed
                 // once here, in the prologue: the steady loop below never reads
                 // it (hot-path-neutral).
-                let widths =
-                    prefill_widths(prompt.len(), opts.prefill_ubatch(), &opts.prefill_schedule);
+                let widths = prefill_widths(
+                    prompt.len(),
+                    opts.prefill_ubatch(),
+                    &opts.prefill_schedule,
+                    opts.prefill_bulk,
+                );
                 let mut last_logits = None;
                 let mut off = 0usize; // the machine's position over the prompt
                 for w in widths {
@@ -798,6 +839,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
         stats.prefill_units = prefill_units;
         let census_prefill = census_snapshot();
         stats.prefill_census = census_delta(&census_before, census_prefill.clone());
+        // Restore the decode in-flight bound: prefill's deeper bound (if any) is
+        // done. A lower depth here is honoured on the next `before_forward`,
+        // which retires markers down to it before the first decode step encodes.
+        if opts.prefill_pacer_depth > 0 {
+            pacer.set_depth(opts.pacer_depth());
+        }
 
         let mut produced = 0usize;
         let mut since_commit = 0usize;
@@ -2250,21 +2297,26 @@ pub const WARMUP_PREFILL_LENS: [usize; 4] = [8, 16, 40, 64];
 ///   byte-for-byte: `ubatch == 0` is one-shot (`[prompt_len]`); a positive
 ///   `ubatch` is the spark then the whole remainder (`[ubatch, prompt_len −
 ///   ubatch]`), clamped so a spark wider than the prompt is a single forward.
-/// * `schedule = Some(units)` — feed forwards of `units[0], units[1], …`, each
-///   clamped to what is left, stopping when the prompt is consumed; if the
-///   schedule runs out with prompt remaining, the **tail** is covered by
-///   `seq_len == 1` forwards. (A caller that wants the tail amortized puts a
-///   wide bucket last; the `1`-token tail is the safe default because every
-///   `m` past the schedule would otherwise be an arbitrary, possibly-unaligned
-///   width — the very thing the schedule exists to avoid.)
+/// * `schedule = Some(units)` — feed forwards of `units[0], units[1], …` (the
+///   **ramp**), each clamped to what is left; then cover the remainder with
+///   **`bulk`-wide forwards** (the bulk tile), and only the final `< bulk`
+///   tokens as a `seq_len == 1` tail. `bulk == 0` (or `bulk == 1`) means the
+///   whole remainder is the `seq_len == 1` tail — the pre-bulk behaviour.
+///
+///   The bulk tile is the fix for the many-tiny-forwards pathology: a ramp with
+///   a `1`-token tail over a long prompt runs one full weight sweep per leftover
+///   token (a 400-token prompt = ~400 forwards). Chopping the remainder at an
+///   *aligned* bulk width (16 / 32 / 64) instead keeps every bulk forward on the
+///   no-guard GEMM tile and collapses the forward count to `remainder / bulk`.
 ///
 /// Total is always exactly `prompt_len` (each width ≤ the remainder, and the
-/// tail closes any gap), so the caller's `off` walks the prompt exactly once.
-/// An empty prompt yields no forwards.
+/// bulk + tail close any gap), so the caller's `off` walks the prompt exactly
+/// once. An empty prompt yields no forwards.
 fn prefill_widths(
     prompt_len: usize,
     ubatch: usize,
     schedule: &Option<Vec<usize>>,
+    bulk: usize,
 ) -> Vec<usize> {
     if prompt_len == 0 {
         return Vec::new();
@@ -2293,9 +2345,16 @@ fn prefill_widths(
                 widths.push(w);
                 left -= w;
             }
-            // Cover any remaining prompt one token at a time — a `seq_len == 1`
-            // forward per leftover token, so no arbitrary-width forward sneaks
-            // in past the schedule.
+            // The remainder rides the bulk tile: `bulk`-wide forwards (each on
+            // an aligned GEMM variant), then the final `< bulk` tokens one at a
+            // time. `bulk <= 1` degenerates to the all-`seq_len==1` tail.
+            let bulk = bulk.max(1);
+            while left >= bulk && bulk > 1 {
+                widths.push(bulk);
+                left -= bulk;
+            }
+            // Whatever is left (`< bulk`, or all of it when `bulk <= 1`) as a
+            // `seq_len == 1` tail — no arbitrary-width forward sneaks in.
             for _ in 0..left {
                 widths.push(1);
             }
@@ -2309,46 +2368,47 @@ mod prefill_widths_tests {
     use super::prefill_widths;
 
     // The `None` schedule must reproduce the incumbent ramp exactly — this is
-    // the byte-identity contract the crown rests on.
+    // the byte-identity contract the crown rests on. `bulk` is irrelevant on the
+    // `None` path (no ramp), so pass 0.
     #[test]
     fn none_one_shot_is_the_whole_prompt() {
-        assert_eq!(prefill_widths(400, 0, &None), vec![400]);
-        assert_eq!(prefill_widths(1, 0, &None), vec![1]);
+        assert_eq!(prefill_widths(400, 0, &None, 0), vec![400]);
+        assert_eq!(prefill_widths(1, 0, &None, 0), vec![1]);
     }
 
     #[test]
     fn none_spark_is_spark_then_remainder() {
-        assert_eq!(prefill_widths(400, 16, &None), vec![16, 384]);
-        assert_eq!(prefill_widths(400, 64, &None), vec![64, 336]);
+        assert_eq!(prefill_widths(400, 16, &None, 0), vec![16, 384]);
+        assert_eq!(prefill_widths(400, 64, &None, 0), vec![64, 336]);
     }
 
     #[test]
     fn none_spark_wider_than_prompt_is_one_shot() {
         // A spark ≥ the prompt is a single forward, as the old `step.min` did.
-        assert_eq!(prefill_widths(10, 16, &None), vec![10]);
-        assert_eq!(prefill_widths(16, 16, &None), vec![16]);
+        assert_eq!(prefill_widths(10, 16, &None, 0), vec![10]);
+        assert_eq!(prefill_widths(16, 16, &None, 0), vec![16]);
     }
 
     #[test]
     fn none_empty_prompt_is_no_forwards() {
-        assert_eq!(prefill_widths(0, 0, &None), Vec::<usize>::new());
-        assert_eq!(prefill_widths(0, 16, &None), Vec::<usize>::new());
+        assert_eq!(prefill_widths(0, 0, &None, 0), Vec::<usize>::new());
+        assert_eq!(prefill_widths(0, 16, &None, 0), Vec::<usize>::new());
     }
 
-    // An explicit schedule feeds its units, then a `1`-token tail.
+    // With `bulk == 0` an explicit schedule feeds its units, then a `1`-token
+    // tail — the pre-bulk behaviour.
     #[test]
     fn schedule_fixed_bucket_covers_with_tail() {
-        // `--spark=16` on a 40-token prompt: [16], then 24 left → but the
-        // schedule is just [16]; the remaining 24 are 1-token forwards.
+        // `--spark=16` on a 40-token prompt, no bulk: [16], then 24×1.
         let want: Vec<usize> = std::iter::once(16).chain(std::iter::repeat(1).take(24)).collect();
-        assert_eq!(prefill_widths(40, 0, &Some(vec![16])), want);
+        assert_eq!(prefill_widths(40, 0, &Some(vec![16]), 0), want);
     }
 
     #[test]
     fn schedule_progressive_ramps_then_tail() {
-        // progressive:1,64 → units [1,16,32,64], prompt 200: 1+16+32+64=113
+        // progressive:1,64 → units [1,16,32,64], prompt 200, no bulk: 113
         // consumed, 87 left as 1-token forwards.
-        let widths = prefill_widths(200, 0, &Some(vec![1, 16, 32, 64]));
+        let widths = prefill_widths(200, 0, &Some(vec![1, 16, 32, 64]), 0);
         assert_eq!(&widths[..4], &[1, 16, 32, 64]);
         assert_eq!(widths.iter().sum::<usize>(), 200);
         assert_eq!(widths.len(), 4 + 87);
@@ -2357,26 +2417,74 @@ mod prefill_widths_tests {
     #[test]
     fn schedule_exhausted_exactly_has_no_tail() {
         // A schedule whose units sum to the prompt leaves no tail.
-        assert_eq!(prefill_widths(64, 0, &Some(vec![64])), vec![64]);
-        assert_eq!(prefill_widths(48, 0, &Some(vec![16, 32])), vec![16, 32]);
+        assert_eq!(prefill_widths(64, 0, &Some(vec![64]), 0), vec![64]);
+        assert_eq!(prefill_widths(48, 0, &Some(vec![16, 32]), 0), vec![16, 32]);
     }
 
     #[test]
     fn schedule_unit_wider_than_remainder_is_clamped() {
         // A `64` unit on a 40-token prompt clamps to 40, no negative left.
-        assert_eq!(prefill_widths(40, 0, &Some(vec![64])), vec![40]);
+        assert_eq!(prefill_widths(40, 0, &Some(vec![64]), 0), vec![40]);
+    }
+
+    // The bulk tile: after the ramp, the remainder rides `bulk`-wide forwards,
+    // then a `< bulk` tail. This is what collapses the many-tiny-forwards count.
+    #[test]
+    fn bulk_chops_remainder_into_bucket_forwards() {
+        // ramp [1,16] on a 200-token prompt, bulk 32: 1+16=17 consumed, 183
+        // left → 5×32=160, then 23 left as 1-token tail.
+        let widths = prefill_widths(200, 0, &Some(vec![1, 16]), 32);
+        assert_eq!(&widths[..2], &[1, 16]);
+        // five 32-wide bulk forwards
+        assert_eq!(widths.iter().filter(|&&w| w == 32).count(), 5);
+        // 23-token tail of 1s
+        assert_eq!(widths.iter().filter(|&&w| w == 1).count(), 1 + 23);
+        assert_eq!(widths.iter().sum::<usize>(), 200);
+        // FAR fewer forwards than the seq_len=1 tail would give (183 vs 2+5+23=30)
+        assert_eq!(widths.len(), 2 + 5 + 23);
+    }
+
+    #[test]
+    fn bulk_evenly_divides_has_no_tail() {
+        // ramp [16] on a 400-token prompt, bulk 64: 16 consumed, 384 left =
+        // 6×64 exactly, no tail.
+        let widths = prefill_widths(400, 0, &Some(vec![16]), 64);
+        assert_eq!(widths[0], 16);
+        assert_eq!(widths.iter().filter(|&&w| w == 64).count(), 6);
+        assert_eq!(widths.iter().filter(|&&w| w == 1).count(), 0);
+        assert_eq!(widths.iter().sum::<usize>(), 400);
+    }
+
+    #[test]
+    fn bulk_one_degenerates_to_seq_len_1_tail() {
+        // bulk 1 (or 0) is the pre-bulk behaviour: all-1 tail.
+        assert_eq!(
+            prefill_widths(20, 0, &Some(vec![16]), 1),
+            prefill_widths(20, 0, &Some(vec![16]), 0),
+        );
+    }
+
+    #[test]
+    fn bulk_larger_than_remainder_is_all_tail() {
+        // ramp [16] on 40, bulk 64: 24 left < 64 → no bulk forward, 24×1 tail.
+        let widths = prefill_widths(40, 0, &Some(vec![16]), 64);
+        assert_eq!(widths[0], 16);
+        assert_eq!(widths.iter().filter(|&&w| w == 1).count(), 24);
+        assert_eq!(widths.iter().sum::<usize>(), 40);
     }
 
     #[test]
     fn schedule_total_is_always_prompt_len() {
         for &plen in &[1usize, 7, 16, 33, 64, 100, 347, 512] {
             for units in [vec![1], vec![16], vec![64], vec![1, 16, 32, 64], vec![32, 32]] {
-                let widths = prefill_widths(plen, 0, &Some(units.clone()));
-                assert_eq!(
-                    widths.iter().sum::<usize>(),
-                    plen,
-                    "schedule {units:?} on prompt {plen} must total the prompt",
-                );
+                for bulk in [0usize, 1, 16, 32, 64] {
+                    let widths = prefill_widths(plen, 0, &Some(units.clone()), bulk);
+                    assert_eq!(
+                        widths.iter().sum::<usize>(),
+                        plen,
+                        "schedule {units:?} bulk {bulk} on prompt {plen} must total the prompt",
+                    );
+                }
             }
         }
     }

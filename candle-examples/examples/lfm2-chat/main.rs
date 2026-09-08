@@ -683,13 +683,41 @@ mod spark {
         }
     }
 
-    /// Parse `--spark`. `"N"` → a fixed first bucket `[N]`;
-    /// `"progressive:START,STOP"` → the buckets from `START` to `STOP`
-    /// inclusive. The engine covers any prompt left after the schedule with a
-    /// `seq_len == 1` tail ([`super::DecodeOptions::prefill_schedule`]).
-    pub fn parse(s: &str) -> Result<Vec<usize>> {
+    /// Parse `--spark` into `(ramp, bulk)`.
+    ///
+    /// Grammar: `RAMP[/tile:BULK]`.
+    /// * `RAMP` is `"N"` (a fixed first bucket `[N]`) or
+    ///   `"progressive:START,STOP"` (the buckets from `START` to `STOP`).
+    /// * the optional `/tile:BULK` sets the **bulk tile** — the remainder after
+    ///   the ramp is chopped into `BULK`-wide forwards (`BULK ∈ {16, 32, 64}`)
+    ///   instead of a `seq_len == 1` tail. Absent → `bulk = 0` (the `seq_len==1`
+    ///   tail, which is the many-tiny-forwards case on a long prompt).
+    ///
+    /// e.g. `1,16/tile:32` → ramp `[1, 16]`, remainder in 32-wide forwards;
+    /// `progressive:1,64/tile:64` → ramp `[1,16,32,64]`, remainder in 64-wide.
+    pub fn parse(s: &str) -> Result<(Vec<usize>, usize)> {
         let s = s.trim();
-        if let Some(range) = s.strip_prefix("progressive:") {
+        // Split off the optional `/tile:BULK` suffix first.
+        let (ramp_str, bulk) = match s.split_once("/tile:") {
+            Some((ramp, bulk_str)) => {
+                let b = bulk_str.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("--spark /tile:BULK must be an integer, got {bulk_str:?}")
+                })?;
+                if b == 1 {
+                    // `1` is not a GEMM bucket (it is the seq_len==1 path); a bulk
+                    // of 1 is just the tail, so reject it as a bulk tile to avoid
+                    // the confusing "bulk that is the tail" case.
+                    bail!(
+                        "--spark /tile:1 is not a bulk tile (1 = seq_len 1, the tail). \
+                         Use 16, 32 or 64, or omit /tile for the seq_len==1 tail."
+                    );
+                }
+                (ramp, bucket_or_err(b)?)
+            }
+            None => (s, 0),
+        };
+        let ramp_str = ramp_str.trim();
+        let ramp = if let Some(range) = ramp_str.strip_prefix("progressive:") {
             let (a, b) = range.split_once(',').ok_or_else(|| {
                 anyhow::anyhow!(
                     "--spark=progressive:START,STOP needs two buckets, e.g. \
@@ -706,19 +734,21 @@ mod spark {
                 bail!("--spark=progressive:{start},{stop}: START must be <= STOP");
             }
             // The buckets in [start, stop], in ascending order.
-            Ok(BUCKETS
+            BUCKETS
                 .iter()
                 .copied()
                 .filter(|&n| n >= start && n <= stop)
-                .collect())
+                .collect()
         } else {
-            let n = s.parse().map_err(|_| {
+            let n = ramp_str.parse().map_err(|_| {
                 anyhow::anyhow!(
-                    "--spark takes a bucket ({BUCKETS:?}) or progressive:START,STOP, got {s:?}"
+                    "--spark takes a bucket ({BUCKETS:?}) or progressive:START,STOP \
+                     (optionally with /tile:BULK), got {ramp_str:?}"
                 )
             })?;
-            Ok(vec![bucket_or_err(n)?])
-        }
+            vec![bucket_or_err(n)?]
+        };
+        Ok((ramp, bulk))
     }
 
     #[cfg(test)]
@@ -727,9 +757,10 @@ mod spark {
 
         #[test]
         fn fixed_bucket_ok() {
-            assert_eq!(parse("16").unwrap(), vec![16]);
-            assert_eq!(parse("1").unwrap(), vec![1]);
-            assert_eq!(parse("64").unwrap(), vec![64]);
+            // No /tile → bulk 0 (seq_len==1 tail).
+            assert_eq!(parse("16").unwrap(), (vec![16], 0));
+            assert_eq!(parse("1").unwrap(), (vec![1], 0));
+            assert_eq!(parse("64").unwrap(), (vec![64], 0));
         }
 
         #[test]
@@ -741,10 +772,10 @@ mod spark {
 
         #[test]
         fn progressive_ramps_the_buckets() {
-            assert_eq!(parse("progressive:1,64").unwrap(), vec![1, 16, 32, 64]);
-            assert_eq!(parse("progressive:1,16").unwrap(), vec![1, 16]);
-            assert_eq!(parse("progressive:16,64").unwrap(), vec![16, 32, 64]);
-            assert_eq!(parse("progressive:1,32").unwrap(), vec![1, 16, 32]);
+            assert_eq!(parse("progressive:1,64").unwrap(), (vec![1, 16, 32, 64], 0));
+            assert_eq!(parse("progressive:1,16").unwrap(), (vec![1, 16], 0));
+            assert_eq!(parse("progressive:16,64").unwrap(), (vec![16, 32, 64], 0));
+            assert_eq!(parse("progressive:1,32").unwrap(), (vec![1, 16, 32], 0));
         }
 
         #[test]
@@ -752,6 +783,27 @@ mod spark {
             assert!(parse("progressive:64,1").is_err()); // start > stop
             assert!(parse("progressive:4,64").is_err()); // 4 not a bucket
             assert!(parse("progressive:1").is_err()); // missing STOP
+        }
+
+        #[test]
+        fn bulk_tile_on_fixed_and_progressive() {
+            assert_eq!(parse("16/tile:32").unwrap(), (vec![16], 32));
+            assert_eq!(parse("1/tile:64").unwrap(), (vec![1], 64));
+            assert_eq!(
+                parse("progressive:1,64/tile:64").unwrap(),
+                (vec![1, 16, 32, 64], 64)
+            );
+            assert_eq!(
+                parse("progressive:1,16/tile:32").unwrap(),
+                (vec![1, 16], 32)
+            );
+        }
+
+        #[test]
+        fn bulk_tile_bad_values_rejected() {
+            assert!(parse("16/tile:4").is_err()); // 4 not a bucket
+            assert!(parse("16/tile:1").is_err()); // 1 = the tail, not a bulk
+            assert!(parse("16/tile:x").is_err()); // not an integer
         }
 
         #[test]
@@ -817,20 +869,35 @@ fn main() -> Result<()> {
     }
 
     // `--spark` overrides `--prefill-ubatch`: an explicit aligned-bucket
-    // schedule for the prefill's forwards (`DecodeOptions::prefill_schedule`).
-    // Parsed once here (it does not depend on the prompt — the engine covers
-    // the tail); `None` keeps the incumbent ubatch ramp. Threaded into both the
-    // dspark and the crown `DecodeOptions` below.
-    let spark_schedule: Option<Vec<usize>> = match &args.spark {
-        Some(s) => Some(spark::parse(s).context("--spark")?),
-        None => None,
+    // schedule (the ramp) plus an optional bulk tile for the remainder
+    // (`DecodeOptions::prefill_schedule` + `prefill_bulk`). Parsed once here (it
+    // does not depend on the prompt — the engine covers the tail); `None` keeps
+    // the incumbent ubatch ramp. Threaded into the crown `DecodeOptions` below.
+    let (spark_schedule, spark_bulk): (Option<Vec<usize>>, usize) = match &args.spark {
+        Some(s) => {
+            let (ramp, bulk) = spark::parse(s).context("--spark")?;
+            (Some(ramp), bulk)
+        }
+        None => (None, 0),
     };
-    // A schedule that runs more than one forward is the chunked-prefill case
-    // and REQUIRES the conv left-context carry, exactly as `--prefill-ubatch`
-    // does (see `config.conv_prefill_ctx` below). A single-forward schedule
-    // (e.g. `--spark=64` on a ≤64-token prompt) needs no carry, but forcing it
-    // on is always safe (a single chunk is identical either way).
-    let spark_multi_forward = spark_schedule.as_ref().is_some_and(|u| u.len() > 1);
+    // A prefill that runs more than one forward is the chunked case and REQUIRES
+    // the conv left-context carry, exactly as `--prefill-ubatch` does (see
+    // `config.conv_prefill_ctx` below). More than one forward happens when the
+    // ramp has >1 unit OR a bulk tile chops the remainder (bulk > 0). A
+    // single-forward schedule (e.g. `--spark=64` on a ≤64-token prompt, no bulk)
+    // needs no carry, but forcing it on is always safe (identical either way).
+    let spark_multi_forward =
+        spark_schedule.as_ref().is_some_and(|u| u.len() > 1) || spark_bulk > 0;
+    // The prefill pacer depth (`LLOOM_PREFILL_IN_FLIGHT`): how many prefill
+    // forwards the host may run ahead of the GPU. `0` (unset) = same as decode.
+    // Deeper lets a chunked / many-small prefill overlap instead of serializing
+    // at the decode depth of 2. An A/B knob (§2.4: an invalid value panics).
+    let prefill_pacer_depth = match std::env::var("LLOOM_PREFILL_IN_FLIGHT") {
+        Ok(v) => v.parse().unwrap_or_else(|_| {
+            panic!("LLOOM_PREFILL_IN_FLIGHT must be an integer, got {v:?}")
+        }),
+        Err(_) => 0usize,
+    };
     let dspark_setup: Option<DsparkSetup> = if args.dspark {
         let draft_dir = args
             .draft_dir
@@ -1319,6 +1386,10 @@ fn main() -> Result<()> {
         prefill_ubatch: args.prefill_ubatch,
         // `--spark` (aligned-bucket schedule) overrides the ubatch ramp when set.
         prefill_schedule: spark_schedule.clone(),
+        // The bulk tile the remainder rides after the ramp (0 = seq_len==1 tail).
+        prefill_bulk: spark_bulk,
+        // `LLOOM_PREFILL_IN_FLIGHT`: deeper prefill overlap (0 = decode depth).
+        prefill_pacer_depth,
     };
 
     // The readback strategy is built BEFORE the prompt is read: it depends on
@@ -1756,10 +1827,21 @@ fn main() -> Result<()> {
             .iter()
             .map(|&m| format!("{m}:{}", spark::tile_tag(m)))
             .collect();
+        let bulk = if spark_bulk > 0 {
+            format!("{spark_bulk}:{}", spark::tile_tag(spark_bulk))
+        } else {
+            "seq_len=1".to_string()
+        };
         eprintln!(
-            "[spark: schedule=[{}] (then a seq_len=1 tail over the remainder); prefill_units={}]",
+            "[spark: ramp=[{}] bulk={bulk} (remainder), then <bulk seq_len=1 tail; \
+             prefill_units={}{}]",
             tags.join(", "),
             st.prefill_units,
+            if prefill_pacer_depth > 0 {
+                format!("; prefill_in_flight={prefill_pacer_depth}")
+            } else {
+                String::new()
+            },
         );
     }
     if let Some(bytes) = device_allocated_at_first_token {

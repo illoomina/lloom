@@ -1176,6 +1176,11 @@ fn main() -> Result<()> {
         candle::kernels::metal::profile::reset();
     }
     let decode_start = std::time::Instant::now();
+    // Page faults the process takes during the decode (`getrusage`, two calls
+    // off the loop): the number that says whether there is anything left to
+    // pin. Every device buffer is in the residency set already (§6.3b); this
+    // counts the host side -- heap, stack, text, the CPU-mapped ring pages.
+    let faults_before = rusage_faults();
     // Wall-clock to the first token the consumer is HANDED (`first_batch_at`, on
     // the decode thread when it pushes) and to the first VISIBLE token
     // (`first_visible_ns`, on the CONSUMER thread when a byte reaches stdout).
@@ -1295,6 +1300,7 @@ fn main() -> Result<()> {
         }
     };
     let decode_elapsed = decode_start.elapsed();
+    let faults_after = rusage_faults();
     // Signal the consumer no more ids are coming and wait for it to drain what
     // remains, print the multibyte tail, and flush.
     spsc.closed.store(true, Ordering::Release);
@@ -1387,6 +1393,27 @@ fn main() -> Result<()> {
     // the prefill's GPU tail lands, so the split says which side a first-token
     // cost sits on.
     let ms = |ns: u64| ns as f64 / 1e6;
+    // The hot thread's scheduling class for the run (`generation::HotThread`,
+    // claimed inside `Session::decode*`) and the faults the process took
+    // meanwhile: engagement, not a flag (§2.4).
+    {
+        let h = &st.hot_thread;
+        eprintln!(
+            "[hot thread: qos {} → {} (arm {:?}{}); page faults during decode: minor {}, major {}]",
+            h.before.as_str(),
+            h.after.as_str(),
+            h.arm,
+            if h.engaged() {
+                ", engaged"
+            } else if h.set_errno != 0 {
+                ", set refused"
+            } else {
+                ""
+            },
+            faults_after.0.saturating_sub(faults_before.0),
+            faults_after.1.saturating_sub(faults_before.1),
+        );
+    }
     // The per-step split is a debug/profile detail — `step_ns` is empty in a plain
     // release build (the reads are compiled out), so print it only when populated.
     if !st.step_ns.is_empty() {
@@ -1658,6 +1685,21 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The process's (minor, major) page-fault counts so far, from `getrusage`;
+/// zeros where it is unavailable.
+fn rusage_faults() -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `rusage` is plain data; zeroed is a valid value, and the
+        // pointer passed is to that live local.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } == 0 {
+            return (ru.ru_minflt as u64, ru.ru_majflt as u64);
+        }
+    }
+    (0, 0)
 }
 
 /// `p`-quantile of an ascending `v` by nearest rank; NaN when empty.

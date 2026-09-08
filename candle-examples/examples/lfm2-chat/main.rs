@@ -268,6 +268,18 @@ struct Args {
     #[arg(long)]
     arena: bool,
 
+    /// Route every decode dispatch through its `_packed` entry point and install
+    /// the constants pool, WITHOUT the ICB replay executor. The arm that
+    /// isolates what moving scalars off `setBytes` (inline, zero-alloc) and into
+    /// a pool-bound params buffer costs on the crown loop, separately from what
+    /// replay adds on top of it — the same way `--arena` isolates the arena.
+    /// The pool makes packed alloc-free (a fresh `new_buffer_with_data` per
+    /// dispatch otherwise, §11.3d), so this measures the `setKernelBuffer`-vs-
+    /// `setBytes` bind cost at B=1, not allocation. `--replay` implies it (it
+    /// needs packed for coverage). Off by default; no perf claim is made for it.
+    #[arg(long)]
+    packed: bool,
+
     /// With `--replay`: whether candle's own `auto_barrier` still fires at a
     /// position the ICB already replays. `always` (the shipped behavior — a
     /// redundant barrier at 393 of 505 positions, §11.3p) or `skip-replayed`
@@ -787,16 +799,23 @@ fn main() -> Result<()> {
     // property (§3.7d -- encoding one without it segfaults), and the constants
     // pool is what gives dispatch position N the same params buffer every step
     // (without it every packed position varies and coverage is zero, §11.3d).
+    // Packed params + the constants pool are what replay needs for coverage, but
+    // they stand on their own: `--packed` installs exactly those two (the crown
+    // loop, dispatches routed through `_packed` and bound from the pool) without
+    // the ICB executor. `supportIndirectCommandBuffers` is a pipeline property
+    // (§3.7d -- encoding an ICB command without it segfaults) that ONLY the
+    // replay path needs, so it stays behind `--replay`; packed-without-ICB never
+    // encodes an ICB command and never touches it.
+    #[cfg(feature = "metal")]
+    if args.packed || args.replay {
+        use candle::kernels::{set_constants_pool_enabled, set_default_param_style, ParamStyle};
+        set_default_param_style(ParamStyle::Packed);
+        set_constants_pool_enabled(true);
+    }
     #[cfg(feature = "metal")]
     if args.replay {
-        use candle::kernels::{
-            set_constants_pool_enabled, set_default_param_style, set_pipelines_support_icb,
-            ParamStyle,
-        };
-        set_default_param_style(ParamStyle::Packed);
-        set_pipelines_support_icb(true)
+        candle::kernels::set_pipelines_support_icb(true)
             .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
-        set_constants_pool_enabled(true);
     }
 
     let model = Model::new(&config, vb).context("constructing LFM2")?;
@@ -1508,7 +1527,7 @@ fn main() -> Result<()> {
          {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} bos={} \
          readback={} lookahead={} commit_budget={} commits={} max_in_flight={} \
          step_markers={} step_waits={} cut={} \
-         ring_publishes={} poll_fallbacks={} overrun={} eos={}]",
+         ring_publishes={} poll_fallbacks={} overrun={} eos={} param-style={}]",
         b(format!("{end_to_end:.1}")),
         b(format!("{steady:.1}")),
         if args.dspark {
@@ -1540,10 +1559,26 @@ fn main() -> Result<()> {
         st.readback.poll_fallbacks,
         st.overrun,
         out.eos,
+        param_style_arm(),
     );
     #[cfg(feature = "metal")]
     if let Some(exec) = icb_exec.as_ref() {
         report_replay(exec, st.steps);
+    }
+    // `--packed` without `--replay`: no ICB executor to report, but the pool is
+    // live and its arms are what say whether packed stayed alloc-free on this
+    // loop (`detached`/`rewritten` past warm-up mean a position took a private
+    // buffer instead of a pooled slot — the alloc packed was meant to avoid).
+    #[cfg(feature = "metal")]
+    if args.packed && !args.replay {
+        let (slots, c) = candle::kernels::constants_pool()
+            .map(|p| (p.len(), p.counters()))
+            .unwrap_or_default();
+        eprintln!(
+            "[packed: constants_pool slots={slots} allocated={} unchanged={} rewritten={} \
+             detached={}]",
+            c.allocated, c.unchanged, c.rewritten, c.detached,
+        );
     }
     // GPU busy per step, when the census is on: the split between an arm
     // costing the host and an arm costing the GPU (§11.3s landed GPU-side).
@@ -1645,6 +1680,24 @@ fn cut_policy_arm(device: &Device) -> String {
     }
     let _ = device;
     "n/a".to_string()
+}
+
+/// The param style the decode path actually ran, read from the process-wide
+/// default rather than from the flag that set it (§7.1a-i): `--replay` and
+/// `--packed` both select `packed`, everything else is `split` (inline
+/// `setBytes`). Reported so a run's summary line names which bind path produced
+/// its number.
+fn param_style_arm() -> &'static str {
+    #[cfg(feature = "metal")]
+    {
+        use candle::kernels::ParamStyle;
+        return match candle::kernels::default_param_style() {
+            ParamStyle::Packed => "packed",
+            ParamStyle::Split => "split",
+        };
+    }
+    #[cfg(not(feature = "metal"))]
+    "split"
 }
 
 /// What the ICB executor did on this run: engagement first, then the residency

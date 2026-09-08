@@ -93,7 +93,7 @@ impl TokenSpsc {
             mask: n - 1,
             tail: AtomicUsize::new(0),
             head: AtomicUsize::new(0),
-            closed: AtomicBool::new(0 != 0),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -1592,6 +1592,7 @@ fn main() -> Result<()> {
             s.prune_ns as f64 / 1e3 / s.prunes.max(1) as f64,
             s.prune_ns as f64 / 1e6 / steps,
         );
+        report_idle_gaps(&s, st, wall);
     }
     // The hot thread's steady-state split, every step summed (debug/profile
     // builds only): how much of a step the host spends encoding against how
@@ -1609,6 +1610,33 @@ fn main() -> Result<()> {
             ms(p.backpressure_ns) / n,
             ms(p.eos_ns) / n,
             100.0 * (p.sample_ns + p.forward_ns) as f64 / total.max(1.0),
+        );
+    }
+    // The per-step host time's SHAPE (debug/profile builds, where `step_ns` is
+    // populated): the median is the RESULT line's `steady`; the mean, the tail
+    // percentiles and `mean/median` say how far the run is from one number, and
+    // the dump below puts every step beside its GPU idle so a slow step can be
+    // read against whether the GPU was idle in it (issue #702 reopened).
+    if st.step_ns.len() > 1 {
+        let mut v: Vec<f64> = st
+            .step_ns
+            .iter()
+            .skip(1)
+            .map(|&ns| ns as f64 / 1e6)
+            .collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        eprintln!(
+            "[step time, host, steps 2..={} (the first step carries the prefill's wait): p50 {:.3} / mean {:.3} / p90 {:.3} / \
+             p99 {:.3} / max {:.3} ms; mean/median {:.4}; steps over 1.5× the median: {}]",
+            v.len() + 1,
+            quantile(&v, 0.5),
+            mean,
+            quantile(&v, 0.9),
+            quantile(&v, 0.99),
+            v.last().copied().unwrap_or(f64::NAN),
+            mean / quantile(&v, 0.5).max(1e-9),
+            v.iter().filter(|&&x| x > 1.5 * quantile(&v, 0.5)).count(),
         );
     }
     #[cfg(feature = "metal")]
@@ -1630,6 +1658,181 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `p`-quantile of an ascending `v` by nearest rank; NaN when empty.
+fn quantile(v: &[f64], p: f64) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v[(((v.len() - 1) as f64) * p).round() as usize]
+}
+
+/// The GPU's idle between consecutive command buffers, as a distribution and
+/// attributed -- the instrument issue #702's reopening asked for. The union
+/// reports `1 − busy/wall` as one sum over the run; this says whether that
+/// idle is spread evenly (the seam between every pair of buffers, GPU-side)
+/// or concentrated in a few steps (a transient stall), and for each gap
+/// whether the next buffer was committed **after** the previous one ended
+/// (the host starved the GPU) or was already queued (the driver's seam,
+/// which no host thread can shorten).
+///
+/// `CANDLE_METAL_PROFILE_DUMP=<path>` writes the raw series: every command
+/// buffer (`<path>`: step, commit, start, end) and every step's idle beside
+/// its host step time (`<path>.steps.csv`), for the plot.
+#[cfg(feature = "metal")]
+fn report_idle_gaps(
+    s: &candle::kernels::metal::profile::Snapshot,
+    st: &lloom::nn::DecodeStats,
+    wall: f64,
+) {
+    let gaps = &s.idle_gaps;
+    let steps = st.steps.max(1) as f64;
+    let idle_total: f64 = gaps.iter().map(|g| g.idle).sum();
+    let starved_total: f64 = gaps.iter().map(|g| g.starved).sum();
+    let mut per_gap: Vec<f64> = gaps.iter().map(|g| g.idle * 1e6).collect();
+    per_gap.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!(
+        "[profile: gpu idle between command buffers: {} gaps over {} timed buffers, {:.3} ms = \
+         {:.2} % of decode_wall ({:.1} µs/step); starved (next buffer committed after the previous \
+         ended) {:.3} ms = {:.1} % of the idle, seam (already queued) {:.3} ms; per gap p50 {:.1} / \
+         p90 {:.1} / p99 {:.1} / max {:.1} µs; clock check min(GPUStartTime − committed) {:+.1} µs]",
+        gaps.len(),
+        s.timed_command_buffers,
+        1e3 * idle_total,
+        100.0 * idle_total / wall.max(1e-9),
+        1e6 * idle_total / steps,
+        1e3 * starved_total,
+        100.0 * starved_total / idle_total.max(1e-12),
+        1e3 * (idle_total - starved_total),
+        quantile(&per_gap, 0.5),
+        quantile(&per_gap, 0.9),
+        quantile(&per_gap, 0.99),
+        per_gap.last().copied().unwrap_or(f64::NAN),
+        1e6 * s.min_start_after_commit_s,
+    );
+    // Histogram of the gaps, count and ms per bucket.
+    let edges_us = [
+        20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+    ];
+    let mut count = vec![0u64; edges_us.len() + 1];
+    let mut sum_ms = vec![0f64; edges_us.len() + 1];
+    for g in gaps {
+        let us = g.idle * 1e6;
+        let b = edges_us
+            .iter()
+            .position(|&e| us < e)
+            .unwrap_or(edges_us.len());
+        count[b] += 1;
+        sum_ms[b] += g.idle * 1e3;
+    }
+    let mut hist = String::new();
+    for b in 0..count.len() {
+        let label = if b == 0 {
+            format!("<{}", edges_us[0])
+        } else if b == edges_us.len() {
+            format!("≥{}", edges_us[b - 1])
+        } else {
+            format!("{}–{}", edges_us[b - 1], edges_us[b])
+        };
+        hist.push_str(&format!("{label}: {} ({:.3} ms) | ", count[b], sum_ms[b]));
+    }
+    eprintln!(
+        "[profile: idle gap histogram, µs (count, ms): {}]",
+        hist.trim_end_matches(" | ")
+    );
+    // Per step: the idle laid at the step whose buffer ended it. Step 0 is
+    // everything committed before the loop's first step (the prefill).
+    let n = st.steps as usize + 1;
+    let mut step_idle = vec![0f64; n];
+    let mut step_starved = vec![0f64; n];
+    for g in gaps {
+        let i = (g.step as usize).min(n - 1);
+        step_idle[i] += g.idle;
+        step_starved[i] += g.starved;
+    }
+    if n > 1 {
+        let mut idx: Vec<usize> = (1..n).collect();
+        idx.sort_by(|&a, &b| {
+            step_idle[b]
+                .partial_cmp(&step_idle[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut sorted: Vec<f64> = idx.iter().map(|&i| step_idle[i] * 1e6).collect();
+        sorted.reverse();
+        let decode_idle: f64 = step_idle[1..].iter().sum();
+        let top = ((n - 1) as f64 * 0.05).ceil().max(1.0) as usize;
+        let top_idle: f64 = idx.iter().take(top).map(|&i| step_idle[i]).sum();
+        let mean_us = 1e6 * decode_idle / (n - 1) as f64;
+        let top5: Vec<String> = idx
+            .iter()
+            .take(5)
+            .map(|&i| {
+                format!(
+                    "step {} {:.0} µs (starved {:.0})",
+                    i,
+                    1e6 * step_idle[i],
+                    1e6 * step_starved[i]
+                )
+            })
+            .collect();
+        eprintln!(
+            "[profile: idle per step, steps 1..={}: p50 {:.1} / p90 {:.1} / p99 {:.1} / max {:.1} µs, \
+             mean {:.1}, mean/median {:.3}; the top {} steps (5 %) hold {:.1} % of the decode's idle; \
+             steps with zero idle: {}; top 5: {}; step 0 (before the loop) idle {:.3} ms, starved {:.3} ms]",
+            n - 1,
+            quantile(&sorted, 0.5),
+            quantile(&sorted, 0.9),
+            quantile(&sorted, 0.99),
+            sorted.last().copied().unwrap_or(f64::NAN),
+            mean_us,
+            mean_us / quantile(&sorted, 0.5).max(1e-9),
+            top,
+            100.0 * top_idle / decode_idle.max(1e-12),
+            step_idle[1..].iter().filter(|&&x| x == 0.0).count(),
+            top5.join(", "),
+            1e3 * step_idle[0],
+            1e3 * step_starved[0],
+        );
+    }
+    if let Ok(path) = std::env::var("CANDLE_METAL_PROFILE_DUMP") {
+        use std::io::Write;
+        let write = || -> std::io::Result<()> {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
+            writeln!(f, "step,committed_s,start_s,end_s")?;
+            for r in &s.command_buffer_records {
+                writeln!(
+                    f,
+                    "{},{:.9},{:.9},{:.9}",
+                    r.step, r.committed, r.interval.start, r.interval.end
+                )?;
+            }
+            let mut f =
+                std::io::BufWriter::new(std::fs::File::create(format!("{path}.steps.csv"))?);
+            writeln!(f, "step,idle_us,starved_us,step_ns")?;
+            for i in 0..n {
+                // `step_ns[k]` is step `k + 1`; step 0 has no host step time.
+                let ns = if i >= 1 { st.step_ns.get(i - 1) } else { None };
+                writeln!(
+                    f,
+                    "{},{:.3},{:.3},{}",
+                    i,
+                    1e6 * step_idle[i],
+                    1e6 * step_starved[i],
+                    ns.map(|n| n.to_string()).unwrap_or_default()
+                )?;
+            }
+            Ok(())
+        };
+        match write() {
+            Ok(()) => eprintln!(
+                "[profile: dumped {} command buffers to {path}, {} steps to {path}.steps.csv]",
+                s.command_buffer_records.len(),
+                n
+            ),
+            Err(e) => eprintln!("[profile: dump to {path} failed: {e}]"),
+        }
+    }
 }
 
 /// The command-buffer cut policy in force, read back from the device rather

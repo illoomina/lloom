@@ -768,6 +768,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 break;
             }
             stats.steps += 1;
+            // Under `CANDLE_METAL_PROFILE=1` only: tell the profile recorder
+            // which step the command buffers committed from here on belong to,
+            // so an idle gap between two buffers can be laid at a step (issue
+            // #702). A cached-bool check and nothing else on every other run.
+            #[cfg(feature = "metal")]
+            {
+                use lloom_tensor::kernels::metal::profile;
+                if profile::enabled() {
+                    profile::set_step(stats.steps);
+                }
+            }
             // Only the first `FIRST_STEPS_TRACED` steps record per-phase timings —
             // and only in a debug/profile build. In release `traced` is a constant
             // `false`, so every `traced.then(Instant::now())` below is `None` and NO

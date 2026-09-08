@@ -1879,10 +1879,10 @@ impl DSparkDrafter {
     /// and the host reads the ids back beside the verify's argmax, once. The
     /// arithmetic is unchanged: the same rows, the same products, the same
     /// argmax.
-    pub fn sample_block(&self, base_logits: &Tensor, first_prev: u32) -> Result<Tensor> {
+    pub fn sample_block(&self, base_logits: &Tensor, first_prev: &Tensor) -> Result<Tensor> {
         let (cap, _) = base_logits.dims2()?;
         let mut picks = Vec::with_capacity(cap);
-        let mut prev = Tensor::new(&[first_prev], base_logits.device())?;
+        let mut prev = first_prev.clone();
         for k in 0..cap {
             let row = base_logits.i(k)?;
             let row = match &self.markov {
@@ -1995,6 +1995,38 @@ struct PerSeq {
     last: u32,
     /// Whether this slot has been `begin`-seeded.
     active: bool,
+    /// `[1, block_size]` `U32`: the draft block's input ids, the mask ids
+    /// written once and slot 0 (the anchor) rewritten per round through the
+    /// mapped pointer — where `Tensor::new` per draft was an unpooled driver
+    /// allocation plus a residency add and commit (§10.2z-iii's drains).
+    block_slot: Tensor,
+    /// `[1]` `U32`: the anchor as a device tensor for `sample_block`'s first
+    /// `prev` and the confidence head, same discipline.
+    anchor_slot: Tensor,
+}
+
+impl PerSeq {
+    /// The block ids for `anchor`, on the device: the slot rewritten in place
+    /// when the mapped write is available, a fresh upload otherwise (CPU).
+    /// Written between rounds only — the previous draft's gather has run by
+    /// the time the verify that consumed it was read back.
+    fn block_ids(&self, drafter: &DSparkDrafter, anchor: u32, width: usize) -> Result<Tensor> {
+        // SAFETY: see above — no queued dispatch reads slot 0 at this point.
+        if unsafe { self.block_slot.write_host_slice::<u32>(0, &[anchor]) } {
+            return Ok(self.block_slot.clone());
+        }
+        let ids = drafter.block_input_ids(anchor, width);
+        Tensor::new(ids.as_slice(), self.block_slot.device())?.unsqueeze(0)
+    }
+
+    /// The anchor as a `[1]` device tensor, same slot discipline.
+    fn anchor_tensor(&self, anchor: u32) -> Result<Tensor> {
+        // SAFETY: as `block_ids`.
+        if unsafe { self.anchor_slot.write_host_slice::<u32>(0, &[anchor]) } {
+            return Ok(self.anchor_slot.clone());
+        }
+        Tensor::new(&[anchor], self.anchor_slot.device())
+    }
 }
 
 /// A DSpark proposer driving a fixed set of sequences — the [`Speculator`]
@@ -2073,16 +2105,23 @@ impl DSparkSpeculator {
         let block_size = drafter.config().block_size;
         let max_draft = drafter.config().max_draft();
         let device = lm_head.weight().device().clone();
+        let mask_block = drafter.block_input_ids(0, block_size);
         let seqs = drafter
             .make_ctx_caches_for(ctx_kv, n_seq, &device)?
             .into_iter()
-            .map(|ctx| PerSeq {
-                ctx,
-                ctx_offset: 0,
-                last: 0,
-                active: false,
+            .map(|ctx| {
+                Ok(PerSeq {
+                    ctx,
+                    ctx_offset: 0,
+                    last: 0,
+                    active: false,
+                    // Uploads, not `zeros`: a pooled `zeros` is a fill blit that
+                    // may still be queued when the first mapped write lands.
+                    block_slot: Tensor::new(mask_block.as_slice(), &device)?.unsqueeze(0)?,
+                    anchor_slot: Tensor::new(&[0u32], &device)?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             drafter,
             embed,
@@ -2148,9 +2187,7 @@ impl DSparkSpeculator {
     /// Draft one block for one already-seeded sequence — the verify example's
     /// per-round draft body, factored behind the seam.
     fn draft_one(&self, seq: &PerSeq) -> Result<Draft> {
-        let device = self.lm_head.weight().device();
-        let block_ids = self.drafter.block_input_ids(seq.last, self.block_size);
-        let block_tensor = Tensor::new(block_ids.as_slice(), device)?.unsqueeze(0)?;
+        let block_tensor = seq.block_ids(&self.drafter, seq.last, self.block_size)?;
         let block_embeds = self
             .drafter
             .embed_block(&self.embed.forward(&block_tensor)?)?;
@@ -2167,7 +2204,8 @@ impl DSparkSpeculator {
             .to_dtype(DType::F32)?;
         // The block stays on the device: the verify takes it as a tensor, and
         // the host sees the ids in the verify's own readback.
-        let tokens = self.drafter.sample_block(&base_logits, seq.last)?;
+        let anchor = seq.anchor_tensor(seq.last)?;
+        let tokens = self.drafter.sample_block(&base_logits, &anchor)?;
 
         // The confidence head, when present AND asked for, is the family's
         // `Draft.confidence` hint (§3.4.1). `prev_tokens[k]` precedes draft
@@ -2179,7 +2217,6 @@ impl DSparkSpeculator {
             Some(_) if self.confidence_wanted => {
                 let cap = tokens.dims1()?;
                 let head = self.drafter.head_slice(&hidden, cap)?.squeeze(0)?;
-                let anchor = Tensor::new(&[seq.last], device)?;
                 let prev = Tensor::cat(&[&anchor, &tokens.narrow(0, 0, cap - 1)?], 0)?;
                 match self.drafter.confidence_scores(&head, &prev)? {
                     Some(scores) => scores.to_dtype(DType::F32)?.to_vec1::<f32>()?,

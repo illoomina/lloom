@@ -1534,7 +1534,15 @@ impl MetalDevice {
         // Note this is a property of the *path*, not of buffer size: these
         // average 18.6 MB, so a size threshold does not separate them from
         // activations.
-        Ok(Arc::new(PooledBuffer::unpooled(new_buffer, size)))
+        //
+        // And it leaves the residency set on drop: the set retains what it
+        // holds, so an unpooled upload that stayed in it was never freed at
+        // all — neither these staging buffers nor a per-round `Tensor::new`.
+        Ok(Arc::new(PooledBuffer::unpooled_resident(
+            new_buffer,
+            size,
+            Arc::clone(&self.residency_set),
+        )))
     }
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<PooledBuffer>> {

@@ -471,8 +471,9 @@ fn main() -> Result<()> {
         .to_dtype(DType::F32)?;
     println!("\nbase logits       : {:?}", base_logits.dims());
 
+    let anchor_t = Tensor::new(&[anchor], base_logits.device())?;
     let drafted = drafter
-        .sample_block(&base_logits, anchor)?
+        .sample_block(&base_logits, &anchor_t)?
         .to_vec1::<u32>()?;
     println!("drafted block     : {drafted:?}");
 

@@ -1461,6 +1461,16 @@ fn main() -> Result<()> {
     if candle::kernels::metal::profile::enabled() {
         candle::kernels::metal::profile::reset();
     }
+    // The allocator-side counters at the start of the clock, so the run's own
+    // churn prints as deltas: pool misses (`allocations`), evictions, residency
+    // adds/removes/commits, and the readbacks split fast / blit / null-after-wait.
+    // A mechanism whose engagement nobody counts is one whose null reads as a
+    // result (§2.4); these existed and nothing printed them.
+    #[cfg(feature = "metal")]
+    let churn_before = match &device {
+        Device::Metal(m) => Some(churn_snapshot(m)),
+        _ => None,
+    };
     let decode_start = std::time::Instant::now();
     // Page faults the process takes during the decode (`getrusage`, two calls
     // off the loop): the number that says whether there is anything left to
@@ -1889,6 +1899,27 @@ fn main() -> Result<()> {
         };
         #[cfg(not(feature = "metal"))]
         let device_line = String::new();
+        #[cfg(feature = "metal")]
+        if let (Device::Metal(m), Some(before)) = (&device, churn_before.as_ref()) {
+            let after = churn_snapshot(m);
+            eprintln!(
+                "[churn over the run: pool lookups={} hits={} allocations={} evicted={} \
+                 trims={} | residency adds={} removes={} commits={} | to_cpu fast={} blit={} \
+                 null_after_wait={} staged={}]",
+                after.lookups - before.lookups,
+                after.hits - before.hits,
+                after.allocations - before.allocations,
+                after.evicted - before.evicted,
+                after.trims - before.trims,
+                after.res_added - before.res_added,
+                after.res_removed - before.res_removed,
+                after.res_commits - before.res_commits,
+                after.to_cpu_fast - before.to_cpu_fast,
+                after.to_cpu_blit - before.to_cpu_blit,
+                after.to_cpu_null - before.to_cpu_null,
+                after.to_cpu_staged - before.to_cpu_staged,
+            );
+        }
         eprintln!(
             "[kv: len={} slab={} ceiling={} bucket={} grows={} kv_bytes={:.1} MiB{device_line}]",
             kv.kv_len,
@@ -2593,6 +2624,46 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
         rb_verify as f64 / n,
         rb_observe as f64 / n,
     );
+}
+
+/// The allocator-side counters a run moves, summed over the shared and the
+/// private pool, read at the two ends of the decode clock and printed as deltas.
+#[cfg(feature = "metal")]
+#[derive(Clone, Copy, Default)]
+struct ChurnSnapshot {
+    lookups: u64,
+    hits: u64,
+    allocations: u64,
+    evicted: u64,
+    trims: u64,
+    res_added: u64,
+    res_removed: u64,
+    res_commits: u64,
+    to_cpu_fast: u64,
+    to_cpu_blit: u64,
+    to_cpu_null: u64,
+    to_cpu_staged: u64,
+}
+
+#[cfg(feature = "metal")]
+fn churn_snapshot(m: &candle::MetalDevice) -> ChurnSnapshot {
+    let (shared, private) = m.pool_counters();
+    let res = m.residency_counters();
+    let (fast, blit) = candle::metal_backend::to_cpu_counts();
+    ChurnSnapshot {
+        lookups: shared.lookups + private.lookups,
+        hits: shared.hits + private.hits,
+        allocations: shared.allocations + private.allocations,
+        evicted: shared.evicted + private.evicted,
+        trims: shared.trims + private.trims,
+        res_added: res.added,
+        res_removed: res.removed,
+        res_commits: res.commits,
+        to_cpu_fast: fast,
+        to_cpu_blit: blit,
+        to_cpu_null: candle::metal_backend::to_cpu_null_after_wait(),
+        to_cpu_staged: candle::metal_backend::to_cpu_staged_count(),
+    }
 }
 
 /// One readback strategy, selected by name and held across the prompt read.

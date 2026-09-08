@@ -254,6 +254,17 @@ pub struct IcbRange {
         objc2::runtime::ProtocolObject<dyn objc2_metal::MTLIndirectCommandBuffer>,
     >,
     pub resident: Vec<Buffer>,
+    /// `resident` as an array of `MTLResource` pointers, built ONCE here so the
+    /// per-execute residency declaration is a single `useResources:count:usage:`
+    /// rather than one `useResource:usage:` msgSend per buffer, every replay
+    /// (`ComputeCommandEncoder::execute_icb_range`). The pointers alias the
+    /// objc objects inside `resident`, which this struct owns for its lifetime, so
+    /// they stay valid as long as the range does — the same lifetime the `icb`
+    /// handle relies on. Kept alongside `resident` (not derived per call) because
+    /// building a fresh `Vec` each execute would put an allocation back on the
+    /// path the batching was meant to take off it.
+    pub resident_ptrs:
+        Vec<core::ptr::NonNull<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLResource>>>,
     /// The buffers a command in this run **writes**, by raw address, so the
     /// encoder that executes the range can register them as its outputs. A
     /// later encoder session orders its reads against a buffer's last writer

@@ -1380,23 +1380,39 @@ fn encode_plan(
     };
     let runs = runs
         .into_iter()
-        .map(|r| Run {
-            start: r.start,
-            command: r.command,
-            len: r.len,
-            range: Arc::new(IcbRange {
-                icb: icb.clone(),
-                resident: if plan_wide {
-                    everything.clone()
-                } else {
-                    r.resident
-                },
-                written: if plan_wide {
-                    everything_written.clone()
-                } else {
-                    r.written
-                },
-            }),
+        .map(|r| {
+            let resident = if plan_wide {
+                everything.clone()
+            } else {
+                r.resident
+            };
+            // Cache the `MTLResource` pointer array ONCE (from the same `resident`
+            // the range owns), so `execute_icb_range` declares residency with a
+            // single `useResources:count:usage:` instead of a per-buffer loop each
+            // replay — and without allocating a fresh array per execute.
+            let resident_ptrs = resident
+                .iter()
+                .map(|b| {
+                    let r: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLResource> =
+                        objc2::runtime::ProtocolObject::from_ref(b.as_ref());
+                    core::ptr::NonNull::from(r)
+                })
+                .collect();
+            Run {
+                start: r.start,
+                command: r.command,
+                len: r.len,
+                range: Arc::new(IcbRange {
+                    icb: icb.clone(),
+                    resident,
+                    resident_ptrs,
+                    written: if plan_wide {
+                        everything_written.clone()
+                    } else {
+                        r.written
+                    },
+                }),
+            }
         })
         .collect();
 

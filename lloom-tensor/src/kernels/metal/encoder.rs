@@ -739,9 +739,15 @@ impl ComputeCommandEncoder {
         // Omitting it is silent corruption rather than an error (`DESIGN.md`
         // §3.7), and unified memory can mask the omission.
         unsafe {
-            for buf in &range.resident {
-                self.raw.useResource_usage(
-                    ProtocolObject::from_ref(buf.as_ref()),
+            // One batched residency declaration for the whole run, from the array
+            // cached once at record (`IcbRange::resident_ptrs`) — a single
+            // `useResources:count:usage:` msgSend rather than one `useResource:`
+            // per buffer every replay. Skip when empty (a count-0 call takes a
+            // pointer nothing backs).
+            if let Some(first) = range.resident_ptrs.first() {
+                self.raw.useResources_count_usage(
+                    core::ptr::NonNull::from(first),
+                    range.resident_ptrs.len(),
                     MTLResourceUsage::Read | MTLResourceUsage::Write,
                 );
             }

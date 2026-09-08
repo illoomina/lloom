@@ -80,6 +80,16 @@ pub enum StagedRead {
 }
 
 impl StagedRead {
+    /// Whether [`Self::to_vec1`] would return without waiting: the producing
+    /// command buffer has completed (Metal), or the backend never queues.
+    pub fn is_complete(&self) -> bool {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(staged) => staged.is_complete(),
+            Self::Plain(_) => true,
+        }
+    }
+
     /// The staged elements. On Metal this waits for the producing command
     /// buffer and nothing committed after it.
     pub fn to_vec1<S: crate::WithDType>(&self) -> Result<Vec<S>> {

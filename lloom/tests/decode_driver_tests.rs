@@ -123,6 +123,11 @@ enum Arm {
     /// drained ids on the commit cadence, so the run overruns an EOS by up to a
     /// commit period (#677).
     RingHostDrain,
+    /// One `eos_index` dispatch per window, read with a tail wait.
+    RingGpuBatch,
+    /// The same index, staged ahead of the lookahead forward and read only
+    /// when its buffer has completed; the host scans otherwise.
+    RingGpuBatchNonblocking,
 }
 
 /// One of the three arms, behind an enum rather than a `dyn`: the loop stays
@@ -152,6 +157,15 @@ fn strategy(arm: &Arm, device: &Device, capacity: usize) -> Result<AnyArm> {
         Arm::RingHostDrain => {
             AnyArm::Ring(Ring::new(&[EOS], device, capacity, EosRead::HostOnDrain)?)
         }
+        Arm::RingGpuBatch => {
+            AnyArm::Ring(Ring::new(&[EOS], device, capacity, EosRead::GpuBatched)?)
+        }
+        Arm::RingGpuBatchNonblocking => AnyArm::Ring(Ring::new(
+            &[EOS],
+            device,
+            capacity,
+            EosRead::GpuBatchedNonblocking,
+        )?),
     })
 }
 
@@ -229,6 +243,12 @@ impl ReadbackStrategy for AnyArm {
             AnyArm::Ring(r) => r.publish_marker(force_live),
         }
     }
+    fn close_window(&mut self, in_ttft_ramp: bool) -> Result<()> {
+        match self {
+            AnyArm::Blocking(b) => b.close_window(in_ttft_ramp),
+            AnyArm::Ring(r) => r.close_window(in_ttft_ramp),
+        }
+    }
     fn eos_in_drained(&self, batch: &[u32]) -> Option<usize> {
         match self {
             AnyArm::Blocking(b) => b.eos_in_drained(batch),
@@ -303,6 +323,8 @@ fn every_arm_produces_the_same_ids_as_the_host_chain() -> Result<()> {
             (Arm::RingPoll, 0),
             (Arm::RingPoll, 1),
             (Arm::RingHostDrain, 1),
+            (Arm::RingGpuBatch, 1),
+            (Arm::RingGpuBatchNonblocking, 1),
         ] {
             let opts = DecodeOptions {
                 lookahead,
@@ -738,6 +760,50 @@ fn the_arms_render_from_the_strategy() -> Result<()> {
     assert_eq!(p.eos_read_arm(), "poll");
     assert_eq!(d.eos_read_arm(), "drain");
     assert!(d.arms().token_ring && d.arms().nonblocking_eos);
+    let g = Ring::new(&[EOS], &device, 4, EosRead::GpuBatched)?;
+    let gn = Ring::new(&[EOS], &device, 4, EosRead::GpuBatchedNonblocking)?;
+    assert_eq!(g.eos_read_arm(), "gpubatch");
+    assert_eq!(gn.eos_read_arm(), "gpubatch-nonblocking");
+    assert!(gn.arms().token_ring && gn.arms().nonblocking_eos);
+    Ok(())
+}
+
+/// The non-blocking batched arm answers every drain from a staged index whose
+/// buffer had completed, or from the host scan — and it counts which. Off
+/// Metal there is no `eos_index` kernel, so every drain is a host scan; on
+/// Metal the staged indices must answer at least some drains, or the arm is
+/// the host-drain arm wearing another name. Either way the ids and the EOS
+/// position are the host chain's, and the drain never waits on the tail.
+#[test]
+fn the_nonblocking_batched_arm_counts_which_path_answered_each_drain() -> Result<()> {
+    for device in devices() {
+        let (want, hit) = chain(1, 64);
+        assert!(hit);
+        let opts = DecodeOptions {
+            lookahead: 1,
+            budget: lloom::generation::CommitBudget::steps(4)?,
+            ..DecodeOptions::new(64)
+        };
+        let (out, _) = run(&device, &Arm::RingGpuBatchNonblocking, &[1], &opts)?;
+        assert_eq!(out.ids, want, "{device:?}");
+        assert!(out.eos, "{device:?}: the chain's EOS ends the run");
+        let c = out.stats.readback;
+        let drains = c.eos_index_hits + c.eos_index_late;
+        assert!(drains > 0, "{device:?}: no drain was ever answered");
+        match device {
+            Device::Cpu => assert_eq!(c.eos_index_hits, 0, "no eos_index kernel off Metal"),
+            _ => assert!(
+                c.eos_index_hits > 0,
+                "{device:?}: every drain fell back to the host scan (hits 0, late {})",
+                c.eos_index_late
+            ),
+        }
+        assert_eq!(
+            c.ring_publishes,
+            out.ids.len() as u64 + c.ring_eos_publishes + c.ring_discarded,
+            "{device:?}: publishes reconcile"
+        );
+    }
     Ok(())
 }
 

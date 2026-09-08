@@ -146,6 +146,13 @@ impl StagedMetalRead {
     pub fn dtype(&self) -> DType {
         self.dtype
     }
+
+    /// Whether the producing command buffer has completed — a marker query,
+    /// no wait — so a caller can read the staged bytes only when doing so
+    /// costs nothing and take another path when it would have to wait.
+    pub fn is_complete(&self) -> bool {
+        self.device.marker_complete(&self.marker)
+    }
 }
 
 pub fn to_cpu_force_blit() -> bool {

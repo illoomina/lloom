@@ -1032,6 +1032,7 @@ fn main() -> Result<()> {
         poll_iters,
         poll_fallbacks,
         ring_discarded,
+        ..
     } = counters;
     // ---- the window is closed; everything below is after the clock ----------
 

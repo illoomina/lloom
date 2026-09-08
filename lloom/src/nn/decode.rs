@@ -847,6 +847,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
             let feed = readback.sample_and_feed(sampler, &logits)?;
             produced += 1;
+            // A step whose commit is due below closes a drain window: let the
+            // strategy enqueue what that drain will read BEFORE the lookahead
+            // forward, so it completes with the window rather than a step later
+            // (`ReadbackStrategy::close_window`; a no-op on every arm but the
+            // non-blocking batched-EOS one). The condition mirrors the commit
+            // block's: every step under `lookahead = 0`, else the TTFT ramp or
+            // the budget's period.
+            if readback.loop_commits()
+                && (opts.lookahead == 0
+                    || produced <= opts.budget.period()
+                    || opts.budget.due(since_commit + 1))
+            {
+                readback.close_window(produced <= opts.budget.period())?;
+            }
 
             // The fair, llama-bench-comparable TTFT, stamped ONCE (step 0) — the
             // first output token is the argmax of the prefill's last-position

@@ -160,8 +160,13 @@ struct Args {
 
     /// How the sampled token feeds the next step and how EOS is learned:
     /// `blocking` (the token is read back every step), `ring` (device-resident
-    /// token, one blocking flag read per step) or `ring-nonblocking`
-    /// (device-resident token, the flag is polled). The ring arms need argmax
+    /// token, one blocking flag read per step), `ring-nonblocking`
+    /// (device-resident token, the flag is polled), `ring-hostdrain` (no device
+    /// EOS; the host scans each drained window), `ring-gpubatch` (one
+    /// `eos_index` dispatch per window, read with a tail wait) or
+    /// `ring-gpubatch-nonblocking` (the same index, staged ahead of the
+    /// lookahead forward and read only once complete; the host scans
+    /// otherwise — the RESULT line's `eos_index=hits/late`). The ring arms need argmax
     /// or plain temperature; top-p is refused on them. **Defaults to
     /// `ring-nonblocking`**: this example is a speed demo and it is the fastest
     /// arm — the token stays on the device AND the EOS flag is polled rather than
@@ -1668,7 +1673,7 @@ fn main() -> Result<()> {
          readback={} lookahead={} prefill_ubatch={} prefill_units={} \
          commit_budget={} commits={} max_in_flight={} \
          step_markers={} step_waits={} cut={} pipelined_cut={} \
-         ring_publishes={} poll_fallbacks={} overrun={} eos={} param-style={}]",
+         ring_publishes={} poll_fallbacks={} eos_index={}/{} overrun={} eos={} param-style={}]",
         b(format!("{end_to_end:.1}")),
         b(format!("{steady:.1}")),
         if args.dspark {
@@ -1701,6 +1706,8 @@ fn main() -> Result<()> {
         concurrent::read_or_na(!args.dspark, pipelined_cut_arm(&device)),
         st.readback.ring_publishes,
         st.readback.poll_fallbacks,
+        st.readback.eos_index_hits,
+        st.readback.eos_index_late,
         st.overrun,
         out.eos,
         param_style_arm(),
@@ -2428,9 +2435,18 @@ fn build_readback(
                 .with_wake_cadence(wake_cadence),
             "ring-gpubatch",
         ),
+        // ring-gpubatch without its per-window tail wait: the index is staged
+        // ahead of the lookahead forward and read only once its own buffer has
+        // completed; the host scans when it has not. `eos_index=hits/late` on
+        // the RESULT line says which answered.
+        "ring-gpubatch-nonblocking" => ReadbackArm::Ring(
+            Ring::with_geometry(eos_ids, device, geometry, EosRead::GpuBatchedNonblocking)?
+                .with_wake_cadence(wake_cadence),
+            "ring-gpubatch-nonblocking",
+        ),
         other => anyhow::bail!(
-            "--readback must be `blocking`, `ring`, `ring-nonblocking`, `ring-hostdrain` or \
-             `ring-gpubatch`, got `{other}`"
+            "--readback must be `blocking`, `ring`, `ring-nonblocking`, `ring-hostdrain`, \
+             `ring-gpubatch` or `ring-gpubatch-nonblocking`, got `{other}`"
         ),
     };
     // Stamped because a ring arm allocates its history and the consumer slack

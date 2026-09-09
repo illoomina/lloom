@@ -485,6 +485,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     in_flight_depth: 0,
                     prefill_ubatch: 0,
                     prefill_schedule: None,
+                    prefill_bulk: 0,
+                    prefill_pacer_depth: 0,
+                    stream_via_reader: false,
                     prefill_tile: 0,
                     prefill_chunk: 0,
                 };

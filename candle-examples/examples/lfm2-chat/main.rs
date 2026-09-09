@@ -537,6 +537,18 @@ struct Args {
     #[arg(long)]
     spark: Option<String>,
 
+    /// Stream tokens through a device-ring reader thread instead of the hot
+    /// loop's commit-cadence drain (`DecodeOptions::stream_via_reader`). On the
+    /// ring arms the ids already live on the device ring; a reader thread reads
+    /// them per-token (no sync) and detokenizes/prints, so the stream is
+    /// per-token rather than batched into commit-sized bursts, and the hot loop
+    /// stops maintaining a redundant per-commit host mirror. Off by default
+    /// (the incumbent commit-drained path). No effect on `--dspark` (the
+    /// speculative body streams its accepted block host-side) or the blocking
+    /// readback arm (host-side per token already).
+    #[arg(long)]
+    stream_reader: bool,
+
     /// The rotating ring's history depth under `--cache rewindable` (non-dspark):
     /// the rewind horizon. `--dspark` sizes it from the drafter's block.
     #[arg(long, default_value_t = 16)]
@@ -851,13 +863,41 @@ mod spark {
         }
     }
 
-    /// Parse `--spark`. `"N"` → a fixed first bucket `[N]`;
-    /// `"progressive:START,STOP"` → the buckets from `START` to `STOP`
-    /// inclusive. The engine covers any prompt left after the schedule with a
-    /// `seq_len == 1` tail ([`super::DecodeOptions::prefill_schedule`]).
-    pub fn parse(s: &str) -> Result<Vec<usize>> {
+    /// Parse `--spark` into `(ramp, bulk)`.
+    ///
+    /// Grammar: `RAMP[/tile:BULK]`.
+    /// * `RAMP` is `"N"` (a fixed first bucket `[N]`) or
+    ///   `"progressive:START,STOP"` (the buckets from `START` to `STOP`).
+    /// * the optional `/tile:BULK` sets the **bulk tile** — the remainder after
+    ///   the ramp is chopped into `BULK`-wide forwards (`BULK ∈ {16, 32, 64}`)
+    ///   instead of a `seq_len == 1` tail. Absent → `bulk = 0` (the `seq_len==1`
+    ///   tail, which is the many-tiny-forwards case on a long prompt).
+    ///
+    /// e.g. `1,16/tile:32` → ramp `[1, 16]`, remainder in 32-wide forwards;
+    /// `progressive:1,64/tile:64` → ramp `[1,16,32,64]`, remainder in 64-wide.
+    pub fn parse(s: &str) -> Result<(Vec<usize>, usize)> {
         let s = s.trim();
-        if let Some(range) = s.strip_prefix("progressive:") {
+        // Split off the optional `/tile:BULK` suffix first.
+        let (ramp_str, bulk) = match s.split_once("/tile:") {
+            Some((ramp, bulk_str)) => {
+                let b = bulk_str.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("--spark /tile:BULK must be an integer, got {bulk_str:?}")
+                })?;
+                if b == 1 {
+                    // `1` is not a GEMM bucket (it is the seq_len==1 path); a bulk
+                    // of 1 is just the tail, so reject it as a bulk tile to avoid
+                    // the confusing "bulk that is the tail" case.
+                    bail!(
+                        "--spark /tile:1 is not a bulk tile (1 = seq_len 1, the tail). \
+                         Use 16, 32 or 64, or omit /tile for the seq_len==1 tail."
+                    );
+                }
+                (ramp, bucket_or_err(b)?)
+            }
+            None => (s, 0),
+        };
+        let ramp_str = ramp_str.trim();
+        let ramp = if let Some(range) = ramp_str.strip_prefix("progressive:") {
             let (a, b) = range.split_once(',').ok_or_else(|| {
                 anyhow::anyhow!(
                     "--spark=progressive:START,STOP needs two buckets, e.g. \
@@ -874,19 +914,21 @@ mod spark {
                 bail!("--spark=progressive:{start},{stop}: START must be <= STOP");
             }
             // The buckets in [start, stop], in ascending order.
-            Ok(BUCKETS
+            BUCKETS
                 .iter()
                 .copied()
                 .filter(|&n| n >= start && n <= stop)
-                .collect())
+                .collect()
         } else {
-            let n = s.parse().map_err(|_| {
+            let n = ramp_str.parse().map_err(|_| {
                 anyhow::anyhow!(
-                    "--spark takes a bucket ({BUCKETS:?}) or progressive:START,STOP, got {s:?}"
+                    "--spark takes a bucket ({BUCKETS:?}) or progressive:START,STOP \
+                     (optionally with /tile:BULK), got {ramp_str:?}"
                 )
             })?;
-            Ok(vec![bucket_or_err(n)?])
-        }
+            vec![bucket_or_err(n)?]
+        };
+        Ok((ramp, bulk))
     }
 
     #[cfg(test)]
@@ -895,9 +937,10 @@ mod spark {
 
         #[test]
         fn fixed_bucket_ok() {
-            assert_eq!(parse("16").unwrap(), vec![16]);
-            assert_eq!(parse("1").unwrap(), vec![1]);
-            assert_eq!(parse("64").unwrap(), vec![64]);
+            // No /tile → bulk 0 (seq_len==1 tail).
+            assert_eq!(parse("16").unwrap(), (vec![16], 0));
+            assert_eq!(parse("1").unwrap(), (vec![1], 0));
+            assert_eq!(parse("64").unwrap(), (vec![64], 0));
         }
 
         #[test]
@@ -909,10 +952,10 @@ mod spark {
 
         #[test]
         fn progressive_ramps_the_buckets() {
-            assert_eq!(parse("progressive:1,64").unwrap(), vec![1, 16, 32, 64]);
-            assert_eq!(parse("progressive:1,16").unwrap(), vec![1, 16]);
-            assert_eq!(parse("progressive:16,64").unwrap(), vec![16, 32, 64]);
-            assert_eq!(parse("progressive:1,32").unwrap(), vec![1, 16, 32]);
+            assert_eq!(parse("progressive:1,64").unwrap(), (vec![1, 16, 32, 64], 0));
+            assert_eq!(parse("progressive:1,16").unwrap(), (vec![1, 16], 0));
+            assert_eq!(parse("progressive:16,64").unwrap(), (vec![16, 32, 64], 0));
+            assert_eq!(parse("progressive:1,32").unwrap(), (vec![1, 16, 32], 0));
         }
 
         #[test]
@@ -920,6 +963,27 @@ mod spark {
             assert!(parse("progressive:64,1").is_err()); // start > stop
             assert!(parse("progressive:4,64").is_err()); // 4 not a bucket
             assert!(parse("progressive:1").is_err()); // missing STOP
+        }
+
+        #[test]
+        fn bulk_tile_on_fixed_and_progressive() {
+            assert_eq!(parse("16/tile:32").unwrap(), (vec![16], 32));
+            assert_eq!(parse("1/tile:64").unwrap(), (vec![1], 64));
+            assert_eq!(
+                parse("progressive:1,64/tile:64").unwrap(),
+                (vec![1, 16, 32, 64], 64)
+            );
+            assert_eq!(
+                parse("progressive:1,16/tile:32").unwrap(),
+                (vec![1, 16], 32)
+            );
+        }
+
+        #[test]
+        fn bulk_tile_bad_values_rejected() {
+            assert!(parse("16/tile:4").is_err()); // 4 not a bucket
+            assert!(parse("16/tile:1").is_err()); // 1 = the tail, not a bulk
+            assert!(parse("16/tile:x").is_err()); // not an integer
         }
 
         #[test]
@@ -992,20 +1056,35 @@ fn main() -> Result<()> {
     }
 
     // `--spark` overrides `--prefill-ubatch`: an explicit aligned-bucket
-    // schedule for the prefill's forwards (`DecodeOptions::prefill_schedule`).
-    // Parsed once here (it does not depend on the prompt — the engine covers
-    // the tail); `None` keeps the incumbent ubatch ramp. Threaded into both the
-    // dspark and the crown `DecodeOptions` below.
-    let spark_schedule: Option<Vec<usize>> = match &args.spark {
-        Some(s) => Some(spark::parse(s).context("--spark")?),
-        None => None,
+    // schedule (the ramp) plus an optional bulk tile for the remainder
+    // (`DecodeOptions::prefill_schedule` + `prefill_bulk`). Parsed once here (it
+    // does not depend on the prompt — the engine covers the tail); `None` keeps
+    // the incumbent ubatch ramp. Threaded into the crown `DecodeOptions` below.
+    let (spark_schedule, spark_bulk): (Option<Vec<usize>>, usize) = match &args.spark {
+        Some(s) => {
+            let (ramp, bulk) = spark::parse(s).context("--spark")?;
+            (Some(ramp), bulk)
+        }
+        None => (None, 0),
     };
-    // A schedule that runs more than one forward is the chunked-prefill case
-    // and REQUIRES the conv left-context carry, exactly as `--prefill-ubatch`
-    // does (see `config.conv_prefill_ctx` below). A single-forward schedule
-    // (e.g. `--spark=64` on a ≤64-token prompt) needs no carry, but forcing it
-    // on is always safe (a single chunk is identical either way).
-    let spark_multi_forward = spark_schedule.as_ref().is_some_and(|u| u.len() > 1);
+    // A prefill that runs more than one forward is the chunked case and REQUIRES
+    // the conv left-context carry, exactly as `--prefill-ubatch` does (see
+    // `config.conv_prefill_ctx` below). More than one forward happens when the
+    // ramp has >1 unit OR a bulk tile chops the remainder (bulk > 0). A
+    // single-forward schedule (e.g. `--spark=64` on a ≤64-token prompt, no bulk)
+    // needs no carry, but forcing it on is always safe (identical either way).
+    let spark_multi_forward =
+        spark_schedule.as_ref().is_some_and(|u| u.len() > 1) || spark_bulk > 0;
+    // The prefill pacer depth (`LLOOM_PREFILL_IN_FLIGHT`): how many prefill
+    // forwards the host may run ahead of the GPU. `0` (unset) = same as decode.
+    // Deeper lets a chunked / many-small prefill overlap instead of serializing
+    // at the decode depth of 2. An A/B knob (§2.4: an invalid value panics).
+    let prefill_pacer_depth = match std::env::var("LLOOM_PREFILL_IN_FLIGHT") {
+        Ok(v) => v
+            .parse()
+            .unwrap_or_else(|_| panic!("LLOOM_PREFILL_IN_FLIGHT must be an integer, got {v:?}")),
+        Err(_) => 0usize,
+    };
     let dspark_setup: Option<DsparkSetup> = if args.dspark {
         let draft_dir = args
             .draft_dir
@@ -1508,7 +1587,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| panic!("LLOOM_IN_FLIGHT must be an integer, got {v:?}")),
         Err(_) => session.measured_in_flight_depth(),
     };
-    let opts = DecodeOptions {
+    let mut opts = DecodeOptions {
         max_tokens: args.max_tokens,
         budget,
         lookahead: args.lookahead,
@@ -1519,6 +1598,14 @@ fn main() -> Result<()> {
         prefill_ubatch: args.prefill_ubatch,
         // `--spark` (aligned-bucket schedule) overrides the ubatch ramp when set.
         prefill_schedule: spark_schedule.clone(),
+        // The bulk tile the remainder rides after the ramp (0 = seq_len==1 tail).
+        prefill_bulk: spark_bulk,
+        // `LLOOM_PREFILL_IN_FLIGHT`: deeper prefill overlap (0 = decode depth).
+        prefill_pacer_depth,
+        // `--stream-reader`: set below, AFTER the readback arm is built and a
+        // `RingReader` is actually obtained — so it is never true without a
+        // reader thread to stream (which would silence the output entirely).
+        stream_via_reader: false,
         // The tile bounds every prefill forward the ramp or the schedule names.
         prefill_tile: args.prefill_tile,
         // One sequence: nothing to interleave a chunk with.
@@ -1550,6 +1637,27 @@ fn main() -> Result<()> {
         );
         None
     };
+
+    // `--stream-reader`: take a `RingReader` over the arm's device ring BEFORE
+    // the run, if the arm carries one (ring arm, mapped, quantum 1). The reader
+    // thread (spawned below) streams per-token off it while the decode loop
+    // writes ahead of the published clamp — the ring's lock-free SPSC. Only when
+    // a reader is actually obtained does `stream_via_reader` turn on: with it on
+    // the engine skips the hot-loop drain, so a run with no reader thread would
+    // print nothing. `None` on the blocking arm / dspark / an unmapped ring →
+    // the incumbent commit-drained path.
+    let ring_reader = if args.stream_reader {
+        readback_arm.as_ref().and_then(|a| a.reader())
+    } else {
+        None
+    };
+    opts.stream_via_reader = ring_reader.is_some();
+    if args.stream_reader && ring_reader.is_none() {
+        eprintln!(
+            "[stream-reader: no device ring to read (blocking arm, --dspark, or an unmapped \
+             ring); falling back to the commit-drained stream]"
+        );
+    }
 
     // ---- prompt: read stdin, wrap in the LFM2 chat template ---------------
     let mut prompt = String::new();
@@ -1686,11 +1794,15 @@ fn main() -> Result<()> {
     // pin. Every device buffer is in the residency set already (§6.3b); this
     // counts the host side -- heap, stack, text, the CPU-mapped ring pages.
     let faults_before = rusage_faults();
-    // Wall-clock to the first token the consumer is HANDED (`first_batch_at`, on
-    // the decode thread when it pushes) and to the first VISIBLE token
-    // (`first_visible_ns`, on the CONSUMER thread when a byte reaches stdout).
-    // Measurement seam; the visible stamp is shared because it is set off-thread.
-    let mut first_batch_at: Option<std::time::Duration> = None;
+    // Wall-clock to the first token the host RECEIVES (`first_batch_ns`, the
+    // TTFT) and to the first VISIBLE token (`first_visible_ns`, when a byte
+    // reaches stdout). Both are shared atomics because either can be set
+    // off-thread: on the incumbent path the decode thread stamps `first_batch_ns`
+    // in `on_tokens` when it drains the first batch; on the `--stream-reader`
+    // path the reader thread stamps it on its first `read_new` that yields an id
+    // (BEFORE detokenize — the same "received, pre-print" semantics), because the
+    // hot loop no longer drains and `on_tokens` never fires. `0` = unset.
+    let first_batch_ns = Arc::new(AtomicU64::new(0));
     let first_visible_ns = Arc::new(AtomicU64::new(0));
     // The two hops between `received` and `visible`, on the consumer thread:
     // the first id popped off the SPSC, and the first id detokenized (lloom
@@ -1718,64 +1830,150 @@ fn main() -> Result<()> {
     };
     let spsc = Arc::new(TokenSpsc::new(spsc_cap));
 
-    // The consumer thread: pop → detokenize → write stdout. A slow terminal stalls
-    // HERE, never the decode loop. Owns the tokenizer, the `TokenOutputStream` and
-    // the stdout handle for the whole run; parks briefly when the ring is empty
-    // (no notify from the producer — that per-commit futex wake is what spiked
-    // `step_waits` when this was an mpsc channel).
+    // Signals the streaming thread that the decode loop is done, so it drains
+    // what the ring still holds and exits (the `RingReader` path's counterpart
+    // of `spsc.closed`; the SPSC path uses `spsc.closed` itself).
+    let stream_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // The consumer thread: detokenize → write stdout. A slow terminal stalls
+    // HERE, never the decode loop. Owns the tokenizer, the `TokenOutputStream`
+    // and the stdout handle for the whole run; parks briefly when there is
+    // nothing to read.
+    //
+    // TWO sources, chosen by `--stream-reader`:
+    //  * `RingReader` (ring arm, `--stream-reader`): reads ids per-token
+    //    straight off the device ring (`read_new`, no sync, no wait), so the
+    //    stream is per-token rather than batched into commit-sized bursts, and
+    //    the hot loop drains nothing. This is the async-output path.
+    //  * `TokenSpsc` (the incumbent): the hot loop pushes drained batches at the
+    //    commit cadence; this pops them. Used on the blocking arm, dspark, an
+    //    unmapped ring, or without `--stream-reader`.
     let consumer = {
-        let spsc = Arc::clone(&spsc);
+        let first_batch_ns = Arc::clone(&first_batch_ns);
         let first_visible_ns = Arc::clone(&first_visible_ns);
         let first_pop_ns = Arc::clone(&first_pop_ns);
         let first_detok_ns = Arc::clone(&first_detok_ns);
         let visible_stamps = Arc::clone(&visible_stamps);
-        std::thread::spawn(move || {
-            let mut tos = candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
-            let stdout = std::io::stdout();
-            let mut out = stdout.lock();
-            let stamp = |slot: &AtomicU64| {
-                slot.compare_exchange(
-                    0,
-                    decode_start.elapsed().as_nanos() as u64,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .ok();
-            };
-            loop {
-                match spsc.pop() {
-                    Some(id) => {
-                        stamp(&first_pop_ns);
-                        let text = tos.next_token(id);
-                        stamp(&first_detok_ns);
-                        if let Ok(Some(text)) = text {
-                            stamp(&first_visible_ns);
-                            // Direct write to the locked stdout; a write that the
-                            // kernel cannot take right now blocks THIS thread only.
-                            let _ = out.write_all(text.as_bytes());
-                            let _ = out.flush();
-                            if let Ok(mut v) = visible_stamps.lock() {
-                                v.push(decode_start.elapsed().as_nanos() as u64);
+        let stamp_at = move |slot: &AtomicU64, start: std::time::Instant| {
+            slot.compare_exchange(
+                0,
+                start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .ok();
+        };
+        match ring_reader {
+            Some(mut reader) => {
+                let stream_done = Arc::clone(&stream_done);
+                std::thread::spawn(move || {
+                    let mut tos =
+                        candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    let mut buf: Vec<u32> = Vec::with_capacity(64);
+                    // Emit every id the reader hands us, in order. `read_new`
+                    // returns only the published prefix `[cursor, published)`,
+                    // never waiting; it stops at the first stop id itself (marks
+                    // `ended`) so we never print past EOS.
+                    let emit =
+                        |ids: &[u32],
+                         tos: &mut candle_examples::token_output_stream::TokenOutputStream,
+                         out: &mut std::io::StdoutLock<'_>| {
+                            if !ids.is_empty() {
+                                // TTFT on the reader path: the host has the first
+                                // token here, BEFORE detokenize — the same
+                                // "received" semantics `on_tokens` stamps on the
+                                // incumbent path. Once-only via `compare_exchange`.
+                                stamp_at(&first_batch_ns, decode_start);
+                            }
+                            for &id in ids {
+                                stamp_at(&first_pop_ns, decode_start);
+                                let text = tos.next_token(id);
+                                stamp_at(&first_detok_ns, decode_start);
+                                if let Ok(Some(text)) = text {
+                                    stamp_at(&first_visible_ns, decode_start);
+                                    let _ = out.write_all(text.as_bytes());
+                                    let _ = out.flush();
+                                    if let Ok(mut v) = visible_stamps.lock() {
+                                        v.push(decode_start.elapsed().as_nanos() as u64);
+                                    }
+                                }
+                            }
+                        };
+                    loop {
+                        buf.clear();
+                        match reader.read_new(&mut buf) {
+                            Ok(0) => {
+                                // Nothing new. If the loop is done, one last read
+                                // (the loop may have published after our last
+                                // read) then exit; else park briefly.
+                                if stream_done.load(Ordering::Acquire) {
+                                    buf.clear();
+                                    if let Ok(n) = reader.read_new(&mut buf) {
+                                        if n > 0 {
+                                            emit(&buf, &mut tos, &mut out);
+                                        }
+                                    }
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_micros(200));
+                            }
+                            Ok(_) => emit(&buf, &mut tos, &mut out),
+                            Err(lap) => {
+                                // The writer overtook the reader (a wedged
+                                // terminal beyond the consumer-slack ring). Report
+                                // rather than print stale slots; the run's ids are
+                                // still complete (the loop's end-of-run drain is
+                                // the record). §9.3 lap.
+                                eprintln!("[stream-reader: {lap}]");
+                                break;
                             }
                         }
                     }
-                    None => {
-                        if spsc.closed.load(Ordering::Acquire) {
-                            break;
-                        }
-                        // Nothing right now: yield the core briefly rather than spin
-                        // a poll. ~200 µs is invisible at a terminal cadence and
-                        // costs the producer nothing.
-                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    if let Ok(Some(rest)) = tos.decode_rest() {
+                        let _ = out.write_all(rest.as_bytes());
                     }
-                }
+                    let _ = out.flush();
+                })
             }
-            // The tail the stream still holds (a partial multibyte run), then flush.
-            if let Ok(Some(rest)) = tos.decode_rest() {
-                let _ = out.write_all(rest.as_bytes());
+            None => {
+                let spsc = Arc::clone(&spsc);
+                std::thread::spawn(move || {
+                    let mut tos =
+                        candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
+                    let stdout = std::io::stdout();
+                    let mut out = stdout.lock();
+                    loop {
+                        match spsc.pop() {
+                            Some(id) => {
+                                stamp_at(&first_pop_ns, decode_start);
+                                let text = tos.next_token(id);
+                                stamp_at(&first_detok_ns, decode_start);
+                                if let Ok(Some(text)) = text {
+                                    stamp_at(&first_visible_ns, decode_start);
+                                    let _ = out.write_all(text.as_bytes());
+                                    let _ = out.flush();
+                                    if let Ok(mut v) = visible_stamps.lock() {
+                                        v.push(decode_start.elapsed().as_nanos() as u64);
+                                    }
+                                }
+                            }
+                            None => {
+                                if spsc.closed.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_micros(200));
+                            }
+                        }
+                    }
+                    if let Ok(Some(rest)) = tos.decode_rest() {
+                        let _ = out.write_all(rest.as_bytes());
+                    }
+                    let _ = out.flush();
+                })
             }
-            let _ = out.flush();
-        })
+        }
     };
 
     let out = {
@@ -1786,8 +1984,16 @@ fn main() -> Result<()> {
         // sustained-backpressure stall is allowed to land, and unreachable for a
         // ring sized to the run.
         let mut on_tokens = |batch: &[u32]| -> candle::Result<()> {
-            if first_batch_at.is_none() && !batch.is_empty() {
-                first_batch_at = Some(decode_start.elapsed());
+            if !batch.is_empty()
+                && first_batch_ns
+                    .compare_exchange(
+                        0,
+                        decode_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
                 #[cfg(feature = "metal")]
                 if let Device::Metal(m) = &device {
                     device_allocated_at_first_token = Some(m.device().current_allocated_size());
@@ -1838,6 +2044,7 @@ fn main() -> Result<()> {
     // Signal the consumer no more ids are coming and wait for it to drain what
     // remains, print the multibyte tail, and flush.
     spsc.closed.store(true, Ordering::Release);
+    stream_done.store(true, Ordering::Release);
     consumer.join().ok();
     let first_visible_at = match first_visible_ns.load(Ordering::Relaxed) {
         0 => None,
@@ -1910,6 +2117,13 @@ fn main() -> Result<()> {
     // rule (a first piece that is not alphanumeric-terminated waits for the
     // next token, which is one decode step).
     let submit_ms = st.ttft_compute_ns as f64 / 1e6;
+    // `first_batch_ns` was stamped by whichever path saw the first token: the hot
+    // thread's `on_tokens` on the incumbent path, the reader thread on
+    // `--stream-reader`. `0` = never stamped (a zero-token run).
+    let first_batch_at = match first_batch_ns.load(Ordering::Relaxed) {
+        0 => None,
+        ns => Some(std::time::Duration::from_nanos(ns)),
+    };
     let ttft_ms = first_batch_at.map_or(f64::NAN, |d| d.as_secs_f64() * 1e3);
     let ms_or_na = |ns: u64| {
         if ns == 0 {
@@ -1965,10 +2179,21 @@ fn main() -> Result<()> {
             .iter()
             .map(|&m| format!("{m}:{}", spark::tile_tag(m)))
             .collect();
+        let bulk = if spark_bulk > 0 {
+            format!("{spark_bulk}:{}", spark::tile_tag(spark_bulk))
+        } else {
+            "seq_len=1".to_string()
+        };
         eprintln!(
-            "[spark: schedule=[{}] (then a seq_len=1 tail over the remainder); prefill_units={}]",
+            "[spark: ramp=[{}] bulk={bulk} (remainder), then <bulk seq_len=1 tail; \
+             prefill_units={}{}]",
             tags.join(", "),
             st.prefill_units,
+            if prefill_pacer_depth > 0 {
+                format!("; prefill_in_flight={prefill_pacer_depth}")
+            } else {
+                String::new()
+            },
         );
     }
     if let Some(bytes) = device_allocated_at_first_token {
@@ -2888,6 +3113,21 @@ fn churn_snapshot(m: &candle::MetalDevice) -> ChurnSnapshot {
 enum ReadbackArm {
     Blocking(Blocking),
     Ring(Ring, &'static str),
+}
+
+impl ReadbackArm {
+    /// A [`RingReader`] over the arm's device ring for a streaming reader
+    /// thread, or `None` on the blocking arm (host-side per token, nothing to
+    /// read off a device ring) or a ring whose words are not CPU-mapped /
+    /// `quantum > 1`. Taken BEFORE the decode run; the reader then streams
+    /// concurrently while the loop writes ahead of the published clamp (the
+    /// ring's lock-free SPSC, §9.3).
+    fn reader(&self) -> Option<lloom::generation::RingReader> {
+        match self {
+            ReadbackArm::Blocking(_) => None,
+            ReadbackArm::Ring(rb, _) => rb.reader(),
+        }
+    }
 }
 
 /// Build the selected strategy. An unknown name is an error rather than a

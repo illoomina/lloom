@@ -396,6 +396,11 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         prefill_ubatch: 0,
         // `--spark` is refused on the concurrent path (main.rs); one-shot here.
         prefill_schedule: None,
+        prefill_bulk: 0,
+        prefill_pacer_depth: 0,
+        // Concurrent collects per-sequence ids for identity checks, not a live
+        // per-token stream; the RingReader path is the single-turn streaming arm.
+        stream_via_reader: false,
         // The tile bounds every prefill forward, a visit's chunk included.
         prefill_tile: ctx.prefill_tile,
         // The time-sliced interleave chunks at the visit level (`run_concurrent`)

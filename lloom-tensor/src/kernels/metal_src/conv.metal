@@ -1377,14 +1377,26 @@ template <typename T, typename A, ushort K_SIZE>
 }
 
 template <typename T, typename A>
+// The ring's state is an IN-OUT buffer: this pass's slot is written into the
+// buffer the previous pass left, which is what makes the ring a ring
+// (`DESIGN.md` §10.2a, §9.2aa). It is sound to alias because **each thread
+// owns one `(batch, channel)` row exclusively** -- `st` below is derived from
+// this thread's `b_idx`/`c_idx` and no thread reads another's row -- so there
+// is no cross-thread read-after-write, and within the row every read after
+// the first write is of a value this same thread wrote.
+//
+// It was two buffers, and the copy that carried the row over was the whole
+// difference: the fused arm allocated a fresh state per pass and the ring's
+// own point -- the buffer stays put -- was lost on exactly the arm the crown
+// defaults to (measured: 22 escaped ordinals per token, one per conv layer;
+// `pass-plan-design.md` §13).
 METAL_FUNC void shortconv_ring_body(
     thread const ShortconvRingParams &p,
     device const T *b_in,
     device const T *x_in,
     device const T *c_in,
-    device const T *state_in,
+    device T *state,
     device const T *weights,
-    device T *state_out,
     device T *dst,
     uint tid
 ) {
@@ -1397,11 +1409,9 @@ METAL_FUNC void shortconv_ring_body(
   const size_t c_idx = tid % hidden;
   const size_t b_idx = tid / hidden;
 
-  // This channel's ring row: carried over whole, then written per position.
+  // This channel's ring row, written in place per position. No carry loop:
+  // the row is already here, which is the point of the ring.
   const size_t st = (b_idx * hidden + c_idx) * width;
-  for (size_t s = 0; s < width; ++s) {
-    state_out[st + s] = state_in[st + s];
-  }
 
   const size_t proj = b_idx * p.proj_stride_b + c_idx * p.proj_stride_c;
   for (size_t i = 0; i < seq_len; ++i) {
@@ -1409,7 +1419,7 @@ METAL_FUNC void shortconv_ring_body(
     const size_t pi = proj + i * p.proj_stride_l;
     // `b * x` in T, as the elementwise kernel computes it.
     const T bx = b_in[pi] * x_in[pi];
-    state_out[st + phase] = bx;
+    state[st + phase] = bx;
 
     // The whole row against this slot's permuted weight, slot order, wide
     // accumulator, rounded once -- the depthwise fold's arithmetic exactly.
@@ -1421,7 +1431,7 @@ METAL_FUNC void shortconv_ring_body(
     A acc = static_cast<A>(0);
 #pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
     for (size_t s = 0; s < width; ++s) {
-      acc += static_cast<A>(state_out[st + s]) * static_cast<A>(w[s]);
+      acc += static_cast<A>(state[st + s]) * static_cast<A>(w[s]);
     }
     // Rounded to T, then gated in T -- the depthwise store followed by the
     // elementwise `* C`, in that order and at that width. The store to a
@@ -1447,9 +1457,8 @@ template <typename T, typename A>
     device const T *b_in,
     device const T *x_in,
     device const T *c_in,
-    device const T *state_in,
+    device T *state,
     device const T *weights,
-    device T *state_out,
     device T *dst,
     uint tid [[ thread_position_in_grid ]]
 ) {
@@ -1457,7 +1466,7 @@ template <typename T, typename A>
       dst_numel, hidden, seq_len, width, phase_last,
       proj_stride_b, proj_stride_c, proj_stride_l };
   shortconv_ring_body<T, A>(
-      p, b_in, x_in, c_in, state_in, weights, state_out, dst, tid);
+      p, b_in, x_in, c_in, state, weights, dst, tid);
 }
 
 template <typename T, typename A>
@@ -1466,15 +1475,14 @@ template <typename T, typename A>
     device const T *b_in,
     device const T *x_in,
     device const T *c_in,
-    device const T *state_in,
+    device T *state,
     device const T *weights,
-    device T *state_out,
     device T *dst,
     uint tid [[ thread_position_in_grid ]]
 ) {
   ShortconvRingParams p = *pp;
   shortconv_ring_body<T, A>(
-      p, b_in, x_in, c_in, state_in, weights, state_out, dst, tid);
+      p, b_in, x_in, c_in, state, weights, dst, tid);
 }
 
 // Layout, asserted rather than hoped.

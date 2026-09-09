@@ -149,11 +149,27 @@ fn run_with(
         Tensor::from_vec(fill(hidden * l_cache, 3), (hidden, l_cache), device)?.to_dtype(dtype)?;
     let table = table(&w, l_cache, width)?;
 
-    // The fused arm first: it does not write its inputs. The loop runs after,
-    // on its own copy of the ring (`reference` copies).
-    let got = lloom::nn::ops::shortconv_ring(&b, &x, &c, &state, &table, phase_last)?;
+    // **The fused arm writes its state IN PLACE** — that is the ring's point
+    // and what stops its state escaping a planned pass (`DESIGN.md` §9.2aa,
+    // `pass-plan-design.md` §13). So each arm gets its own ring: the fused
+    // one's is the tensor it mutates and then IS the result, and the loop's
+    // is `reference`'s own copy. Comparing the two rings afterwards is the
+    // stronger check it always was, now over a buffer the kernel edited
+    // rather than one it produced.
+    //
+    // `Tensor::copy` is shallow on Metal (`try_clone` returns `self.clone()`),
+    // so the fused arm's ring is built by its own `from_vec` rather than
+    // copied from `state` — a shallow copy would have the two arms share one
+    // buffer and the comparison would pass by aliasing.
+    let fused_state = Tensor::from_vec(
+        fill(b_sz * hidden * width, 2),
+        (b_sz, hidden, width),
+        device,
+    )?
+    .to_dtype(dtype)?;
+    let out = lloom::nn::ops::shortconv_ring(&b, &x, &c, &fused_state, &table, phase_last)?;
     let want = reference(&b, &x, &c, &state, &table, phase_last, l_cache)?;
-    Ok((got, want))
+    Ok(((out, fused_state), want))
 }
 
 fn assert_bits(name: &str, got: &Tensor, want: &Tensor) -> Result<()> {

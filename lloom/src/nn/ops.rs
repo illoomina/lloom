@@ -776,7 +776,7 @@ pub fn shortconv_ring(
     state: &Tensor,
     weights: &Tensor,
     phase_last: usize,
-) -> Result<(Tensor, Tensor)> {
+) -> Result<Tensor> {
     #[cfg(not(feature = "metal"))]
     {
         let _ = (b, x, c, state, weights, phase_last);
@@ -852,12 +852,11 @@ pub fn shortconv_ring(
         };
 
         let device = st_s.device();
-        let state_out = device
-            .new_buffer_builder()
-            .with_size_for(b_sz * hidden * width, dtype)
-            .with_label("shortconv_ring_state")
-            .build()
-            .map_err(lloom_tensor::Error::wrap)?;
+        // No state buffer is allocated: the ring is written IN PLACE, in the
+        // buffer the previous pass left (`DESIGN.md` §10.2a). The fused arm
+        // used to allocate a fresh one per pass, which cost the ring its own
+        // property — 22 escaped ordinals per token, one per conv layer, on
+        // the arm the crown defaults to (`pass-plan-design.md` §13).
         let out_numel = b_sz * seq_len * hidden;
         let dst = device
             .new_buffer_builder()
@@ -880,7 +879,6 @@ pub fn shortconv_ring(
             buffer_o(c_s.buffer(), c_l, dtype),
             buffer_o(st_s.buffer(), st_l, dtype),
             buffer_o(w_s.buffer(), w_l, dtype),
-            &state_out,
             &dst,
         )
         .map_err(lloom_tensor::Error::wrap)?;
@@ -893,19 +891,9 @@ pub fn shortconv_ring(
             BackpropOp::none(),
             false,
         );
-        let state_storage = lloom_tensor::MetalStorage::new(
-            state_out,
-            device.clone(),
-            b_sz * hidden * width,
-            dtype,
-        );
-        let new_state = Tensor::from_storage(
-            lloom_tensor::Storage::Metal(state_storage),
-            (b_sz, hidden, width),
-            BackpropOp::none(),
-            false,
-        );
-        Ok((out, new_state))
+        // The state tensor the caller passed IS the updated state; there is
+        // nothing to hand back.
+        Ok(out)
     }
 }
 

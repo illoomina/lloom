@@ -755,16 +755,16 @@ fn the_backend_hook_declines_by_default_and_metal_takes_it_up() -> Result<()> {
 }
 
 /// A RING conv arm reaches the no-allocation invariant — `escapes == 0` on
-/// every key — and the FUSED ring arm does not, because
-/// `shortconv_ring_fused` returns a NEW state tensor per pass rather than
-/// writing the one column into the ring it was handed
-/// (`crate::nn::ops::shortconv_ring` -> `(out, new_state)`, `lfm2.rs`).
+/// every key — **fused or not**.
 ///
-/// Both halves are asserted, so the day the fused kernel writes in place
-/// this test fails and says so rather than silently passing: the second
-/// half is a `>` on the escape count, not a `==`.
+/// It did not, until the fused kernel took its state as an in-out buffer:
+/// `shortconv_ring` returned `(out, new_state)` and allocated a fresh ring
+/// every pass, so the crown's own conv arm escaped every plan (22 ordinals
+/// per token, one per conv layer). Both arms are asserted, because the two
+/// must agree: the fusion is a dispatch-count change, never a change to
+/// where the ring lives.
 #[test]
-fn a_ring_conv_arm_has_no_escapes_and_the_fused_ring_still_does() -> Result<()> {
+fn a_ring_conv_arm_has_no_escapes_fused_or_not() -> Result<()> {
     let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
@@ -787,13 +787,12 @@ fn a_ring_conv_arm_has_no_escapes_and_the_fused_ring_still_does() -> Result<()> 
     assert_eq!(
         escapes_with(false)?,
         0,
-        "the ring writes its state in place, so nothing should outlive a pass"
+        "the unfused ring writes its state in place; nothing should outlive a pass"
     );
-    let fused = escapes_with(true)?;
-    assert!(
-        fused > 0,
-        "the fused ring kernel now writes in place — delete this half of the \
-         test and the finding in pass-plan-design.md §13 with it"
+    assert_eq!(
+        escapes_with(true)?,
+        0,
+        "the FUSED ring allocated a state per pass again — the in-out buffer regressed"
     );
     Ok(())
 }

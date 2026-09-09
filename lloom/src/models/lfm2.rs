@@ -4431,7 +4431,7 @@ impl ShortConv {
         c: &Tensor,
         state: &Tensor,
         phase_last: usize,
-    ) -> Result<Option<(Tensor, Tensor)>> {
+    ) -> Result<Option<Tensor>> {
         if !self.conv_fused || conv_c_fusion_disabled() {
             return Ok(None);
         }
@@ -4451,9 +4451,10 @@ impl ShortConv {
             if b.stride() != x.stride() || b.stride() != c.stride() {
                 return Ok(None);
             }
-            let (out, new_state) =
-                crate::nn::ops::shortconv_ring(b, x, c, state, table, phase_last)?;
-            Ok(Some((out, new_state)))
+            // `state` is written in place, so the caller's tensor is the
+            // updated ring and only the output comes back.
+            let out = crate::nn::ops::shortconv_ring(b, x, c, state, table, phase_last)?;
+            Ok(Some(out))
         }
     }
 
@@ -4629,11 +4630,16 @@ impl ShortConv {
             };
             // `Model::forward`/`forward_all` have advanced `conv_phase` to the
             // slot of this pass's LAST position (§10.2e's one owner).
-            if let Some((conv_out, new_state)) =
+            if let Some(conv_out) =
                 self.shortconv_ring_fused(&b, &x_proj, &c, &state, cache.conv_phase)?
             {
+                // The kernel wrote `state` IN PLACE. When the cache had none,
+                // `state` is the buffer allocated just above and must be
+                // kept; otherwise it is already the cache's own tensor and
+                // this stores the same handle back — which is what makes the
+                // ring's state stop escaping its pass (§9.2aa, §13).
                 if cache.use_kv_cache {
-                    cache.conv_states[block_idx] = Some(new_state);
+                    cache.conv_states[block_idx] = Some(state);
                 }
                 return Ok(conv_out);
             }

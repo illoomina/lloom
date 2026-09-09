@@ -460,9 +460,10 @@ pub fn call_shortconv_ring(
     b_in: BufferOffset,
     x_in: BufferOffset,
     c_in: BufferOffset,
-    state_in: BufferOffset,
+    // The ring's state, read AND written in place — see the kernel's note on
+    // why aliasing is sound (one `(batch, channel)` row per thread).
+    state: BufferOffset,
     weights: BufferOffset,
-    state_out: &Buffer,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
     call_shortconv_ring_with(
@@ -474,9 +475,8 @@ pub fn call_shortconv_ring(
         b_in,
         x_in,
         c_in,
-        state_in,
+        state,
         weights,
-        state_out,
         dst,
         ParamStyle::default(),
     )
@@ -493,9 +493,8 @@ pub fn call_shortconv_ring_with(
     b_in: BufferOffset,
     x_in: BufferOffset,
     c_in: BufferOffset,
-    state_in: BufferOffset,
+    state: BufferOffset,
     weights: BufferOffset,
-    state_out: &Buffer,
     dst: &Buffer,
     style: ParamStyle,
 ) -> Result<(), MetalKernelError> {
@@ -526,9 +525,11 @@ pub fn call_shortconv_ring_with(
             &b_in,
             &x_in,
             &c_in,
-            &state_in,
+            // `Output`, not a plain bind: the state is written, and the
+            // encoder's hazard tracker must see the write to order the next
+            // pass's read of the same range against it (§9.2e).
+            Output::from_buffer_offset(&state),
             &weights,
-            Output::new(state_out),
             Output::new(dst)
         )
     );

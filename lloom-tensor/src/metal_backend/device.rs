@@ -8,13 +8,15 @@ use crate::kernels::{
         session_region::{RegionCounters, RegionPlan},
         Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout, ArenaOffsets, ArenaRecorder,
         BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, MTLResourceOptions,
-        PoolCounters, PoolOccupancySnapshot, PooledBuffer, ResidencySet, SessionRegion, StepPlan,
+        PassKey, PassPlanCounters, PoolCounters, PoolOccupancySnapshot, PooledBuffer, ResidencySet,
+        SessionRegion, StepPlan,
     },
     Kernels,
 };
 use objc2_foundation::NSURL;
 use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -326,6 +328,74 @@ pub struct MetalDevice {
     /// session tenant is read by the *next* one. `None` until installed, which
     /// is every process that has not asked for it.
     pub(crate) session_region: Arc<RwLock<Option<SessionRegion>>>,
+
+    /// The pass-keyed plan cache (`DESIGN.md` §9.2aa): `None` until a
+    /// harness enables it, and then the thing `begin_pass`/`finish_pass`
+    /// drive. The arena slot above is what it installs per pass.
+    pub(crate) pass_plans: Arc<Mutex<Option<PassPlans>>>,
+}
+
+/// One forward pass's plan, cached by its [`PassKey`]. Every plan is served
+/// from ONE base buffer (`base`), sized to the largest cached plan: passes
+/// are sequential on the queue, so consecutive passes of different keys reuse
+/// the base exactly as consecutive decode steps reuse today's arena — by
+/// barrier order, one step ahead of the GPU (§9.2, §9.2z-i).
+///
+/// A key's plan is built from a recording of its FIRST pass and the pass
+/// AFTER it, whatever that pass's key: only the following pass can say which
+/// of the first pass's values it read (session state — the conv state, the
+/// held logits, a `Cat` KV), and those are excluded (`ArenaRecorder::
+/// plan_previous`). Both of those passes run on the pool, under the recorder,
+/// so every address the recorder keys on is a pool buffer's — an arena slot's
+/// `raw_addr` is its base's and would not attribute.
+pub struct PassPlans {
+    layout: ArenaLayout,
+    plans: HashMap<PassKey, StepPlan>,
+    /// Arenas built over the current base, per key; rebuilt lazily after a
+    /// base grow (an `Arena` holds views of the base it was built on).
+    arenas: HashMap<PassKey, Arena>,
+    base: Option<Buffer>,
+    base_generation: u64,
+    arena_generation: HashMap<PassKey, u64>,
+    /// A key recorded on its first sight, whose plan awaits the next pass.
+    pending: Option<PassKey>,
+    /// What the pass in progress is doing.
+    current: Option<PassState>,
+    counters: PassPlanCounters,
+}
+
+/// One cached plan as the harness reports it: `(key, ordinals served, ordinals recorded)`.
+pub type PassPlanEntry = (PassKey, usize, usize);
+
+#[derive(Clone, Copy, Debug)]
+enum PassState {
+    /// Under a cached plan.
+    Served(PassKey),
+    /// On the pool, recording this key's first sight (and closing `pending`
+    /// if one was waiting).
+    Recording {
+        key: PassKey,
+        closes: Option<PassKey>,
+    },
+    /// On the pool, only to close `pending`'s liveness (this key is already
+    /// cached or is being recorded again).
+    Observing { closes: PassKey },
+}
+
+impl PassPlans {
+    fn new(layout: ArenaLayout) -> Self {
+        Self {
+            layout,
+            plans: HashMap::new(),
+            arenas: HashMap::new(),
+            base: None,
+            base_generation: 0,
+            arena_generation: HashMap::new(),
+            pending: None,
+            current: None,
+            counters: PassPlanCounters::default(),
+        }
+    }
 }
 
 // Resource options used for creating buffers. Shared storage mode allows both CPU and GPU to access the buffer.
@@ -1214,6 +1284,202 @@ impl MetalDevice {
         if let Some(a) = self.arena_slot() {
             a.end_step();
         }
+    }
+
+    /// Turn the pass-keyed plan cache on (`DESIGN.md` §9.2aa). Off, the
+    /// pass brackets are the decode-step brackets they always were.
+    pub fn enable_pass_plans(&self, layout: ArenaLayout) {
+        let mut g = self.pass_plans.lock();
+        if g.is_none() {
+            *g = Some(PassPlans::new(layout));
+        }
+    }
+
+    pub fn pass_plans_enabled(&self) -> bool {
+        self.pass_plans.lock().is_some()
+    }
+
+    pub fn pass_plan_counters(&self) -> Option<PassPlanCounters> {
+        self.pass_plans.lock().as_ref().map(|p| p.counters)
+    }
+
+    /// Keys with a cached plan, and the base's bytes.
+    pub fn pass_plan_report(&self) -> Option<(Vec<PassPlanEntry>, usize)> {
+        let g = self.pass_plans.lock();
+        let p = g.as_ref()?;
+        let mut keys: Vec<PassPlanEntry> = p
+            .plans
+            .iter()
+            .map(|(k, plan)| {
+                let (covered, total) = plan.covered();
+                (*k, covered, total)
+            })
+            .collect();
+        keys.sort_by_key(|(k, _, _)| format!("{k:?}"));
+        Some((keys, p.base.as_ref().map_or(0, |b| b.length())))
+    }
+
+    /// Open a forward pass of shape `key`. Under a cached plan the pass is
+    /// served from the base; on a key's first sight, and on the pass after
+    /// it, the pass runs on the pool under the recorder. Falls back to
+    /// [`Self::begin_decode_step`] when the cache is off.
+    pub fn begin_pass(&self, key: PassKey) -> Result<()> {
+        let mut g = self.pass_plans.lock();
+        let Some(pp) = g.as_mut() else {
+            drop(g);
+            self.begin_decode_step();
+            return Ok(());
+        };
+        if pp.current.is_some() {
+            return Err(MetalError::Message(
+                "begin_pass: a pass is already open (finish_pass was not called)".to_string(),
+            )
+            .into());
+        }
+        // Whatever this pass does, the arena the last pass installed must not
+        // serve it: a pass is served only under its own key's plan.
+        self.clear_arena_keep_base();
+        let state = match (pp.pending, pp.plans.contains_key(&key)) {
+            (Some(closes), cached) => {
+                // The recorder still holds the pending key's pass as its
+                // current step; this pass becomes the step that says what
+                // escaped it.
+                self.next_arena_recording_step();
+                pp.counters.observed += 1;
+                if cached {
+                    PassState::Observing { closes }
+                } else {
+                    PassState::Recording {
+                        key,
+                        closes: Some(closes),
+                    }
+                }
+            }
+            (None, true) => {
+                let generation = pp.base_generation;
+                let stale = pp.arena_generation.get(&key) != Some(&generation);
+                if stale || !pp.arenas.contains_key(&key) {
+                    let plan = pp.plans.get(&key).expect("cached").clone();
+                    let base = pp.base.clone().expect("a cached plan has a base");
+                    let arena = Arena::new(base, plan, pp.layout)
+                        .map_err(|e| MetalError::Message(format!("pass plan rejected: {e}")))?;
+                    pp.arenas.insert(key, arena);
+                    pp.arena_generation.insert(key, generation);
+                }
+                let arena = pp.arenas.get(&key).expect("built above").clone();
+                crate::kernels::metal::set_hazard_key_unless_explicit(
+                    crate::kernels::metal::HazardKey::Range,
+                );
+                {
+                    let mut slot = self.arena.write();
+                    *slot = Some(arena.clone());
+                }
+                arena.begin_step();
+                pp.counters.served += 1;
+                PassState::Served(key)
+            }
+            (None, false) => {
+                self.begin_arena_recording();
+                pp.counters.recorded += 1;
+                PassState::Recording { key, closes: None }
+            }
+        };
+        pp.current = Some(state);
+        Ok(())
+    }
+
+    /// Close the pass `begin_pass` opened: build the plan a pending key was
+    /// waiting for, grow the base if it needs more, and register this pass's
+    /// key as pending if it was recorded. Falls back to
+    /// [`Self::finish_decode_step`] when the cache is off.
+    pub fn finish_pass(&self) -> Result<()> {
+        let mut g = self.pass_plans.lock();
+        let Some(pp) = g.as_mut() else {
+            drop(g);
+            return self.finish_decode_step();
+        };
+        let Some(state) = pp.current.take() else {
+            return Err(MetalError::Message("finish_pass: no pass is open".to_string()).into());
+        };
+        match state {
+            PassState::Served(key) => {
+                self.end_decode_step();
+                if let Some(arena) = self.arena_slot() {
+                    if arena.take_drifted() {
+                        // The sequence moved under this key: the plan is wrong
+                        // about it. Drop it; the next sight re-records.
+                        pp.plans.remove(&key);
+                        pp.arenas.remove(&key);
+                        pp.counters.evicted += 1;
+                    }
+                }
+                self.clear_arena_keep_base();
+            }
+            PassState::Recording { key, closes } => {
+                if let Some(closes) = closes {
+                    Self::close_pending(self, pp, closes)?;
+                }
+                if pp.plans.contains_key(&key) {
+                    // The key it closed was its own (two sightings back to
+                    // back): planned now, nothing left to observe.
+                    pp.pending = None;
+                    self.finish_arena_recording(pp.layout);
+                } else {
+                    // This pass's allocations are the recorder's current
+                    // step; the next pass says which of them escape.
+                    pp.pending = Some(key);
+                }
+            }
+            PassState::Observing { closes } => {
+                Self::close_pending(self, pp, closes)?;
+                pp.pending = None;
+                self.finish_arena_recording(pp.layout);
+            }
+        }
+        Ok(())
+    }
+
+    /// Build `closes`'s plan from the recorder's previous step (its first
+    /// sight) and this step's binds against it, and cache it.
+    fn close_pending(&self, pp: &mut PassPlans, closes: PassKey) -> Result<()> {
+        let plan = {
+            let g = self.arena_recorder.lock();
+            let rec = g.as_ref().ok_or_else(|| {
+                MetalError::Message("finish_pass: no recorder while a key was pending".to_string())
+            })?;
+            let r = rec.lock();
+            r.plan_previous(pp.layout)
+        };
+        let Some(plan) = plan else {
+            // The previous pass allocated nothing worth planning; forget it.
+            return Ok(());
+        };
+        let needed = plan.bump_capacity().max(plan.arena_bytes()).max(1);
+        let have = pp.base.as_ref().map_or(0, |b| b.length());
+        if needed > have {
+            let base = self
+                .device
+                .new_buffer(needed, PRIVATE_RESOURCE_OPTIONS)
+                .map_err(MetalError::from)?;
+            self.residency_set.insert(&base);
+            if let Some(previous) = pp.base.take() {
+                self.residency_set.remove(&previous);
+            }
+            pp.base = Some(base);
+            pp.base_generation += 1;
+            pp.arenas.clear();
+            pp.counters.base_grows += 1;
+        }
+        pp.plans.insert(closes, plan);
+        pp.counters.plans += 1;
+        Ok(())
+    }
+
+    /// Uninstall the arena slot without releasing any base: the pass cache
+    /// owns its base and the arena is one view of it per key.
+    fn clear_arena_keep_base(&self) {
+        let mut slot = self.arena.write();
+        *slot = None;
     }
 
     /// Tell the installed executor the decode step is complete

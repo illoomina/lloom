@@ -6027,6 +6027,10 @@ impl CausalLM for Model {
         Model::forward_embeds(self, embeds, pos, cache)
     }
 
+    fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
+        cache.prepare_pass(seq_len)
+    }
+
     fn forward(&self, tokens: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
         Model::forward(self, tokens, pos, cache)
     }

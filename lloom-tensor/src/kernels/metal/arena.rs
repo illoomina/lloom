@@ -163,6 +163,57 @@ pub fn note_dispatch() {
     }
 }
 
+/// The shape of one forward pass, as the key a cached plan is valid for
+/// (`DESIGN.md` §9.2aa). A plan is a slot assignment over an allocation
+/// sequence; the sequence is a function of what the pass computes, so two
+/// passes of one key allocate the same ordinals in the same positions and
+/// the drift guard refuses the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PassKind {
+    /// One decode step over `b` lockstep rows.
+    Decode { b: u16 },
+    /// One prefill forward of `w` tokens (a tile, a ramp unit, or the whole
+    /// prompt). `fresh` is the first pass on an empty cache, which allocates
+    /// the session state (KV slab, conv state) that every later pass finds
+    /// in place — a different allocation sequence, so a different key.
+    Prefill { w: u32, fresh: bool },
+    /// One speculative verify pass of `k` positions.
+    Verify { k: u16 },
+}
+
+/// A pass kind under the axes that change its dispatch sequence. `arms` is
+/// the caller's hash of those axes; the harnesses run one configuration per
+/// process and pass 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PassKey {
+    pub kind: PassKind,
+    pub arms: u64,
+}
+
+impl PassKey {
+    pub fn new(kind: PassKind) -> Self {
+        Self { kind, arms: 0 }
+    }
+}
+
+/// What the pass-keyed plan cache did over a run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PassPlanCounters {
+    /// Passes that ran under a cached plan.
+    pub served: u64,
+    /// Passes that ran on the pool while a key was recorded (its first sight).
+    pub recorded: u64,
+    /// Passes that ran on the pool because the previous pass's key was still
+    /// awaiting the cross-pass liveness check.
+    pub observed: u64,
+    /// Plans built.
+    pub plans: u64,
+    /// Plans dropped after the drift guard fired under them.
+    pub evicted: u64,
+    /// Times the shared base buffer was (re)allocated.
+    pub base_grows: u64,
+}
+
 /// Alignment of every slot, in bytes.
 ///
 /// 128 B, per §9.2 and our fork's PR #8. Two independent reasons land on the
@@ -1351,6 +1402,10 @@ pub struct ArenaRecorder {
     sizes: Vec<usize>,
     /// Dispatch position each value was allocated at.
     first_bind: Vec<usize>,
+    /// The previous step's intervals, kept so a plan can be built for the
+    /// previous step once this one has said which of its values survived.
+    previous_first_bind: Vec<usize>,
+    previous_last_bind: Vec<usize>,
     /// Dispatch position each value was last bound at -- **where its interval
     /// ends**, because binding is the clock the GPU orders execution by.
     last_bind: Vec<usize>,
@@ -1399,8 +1454,8 @@ impl ArenaRecorder {
     /// raises rather than silently returning an empty set.
     pub fn next_step(&mut self) {
         self.previous = std::mem::take(&mut self.sizes);
-        self.first_bind.clear();
-        self.last_bind.clear();
+        self.previous_first_bind = std::mem::take(&mut self.first_bind);
+        self.previous_last_bind = std::mem::take(&mut self.last_bind);
         // The address map is *carried*, not cleared. A value produced last step
         // and read in this one is session state, and dropping the map is what
         // made that invisible -- the bind found no owner and was discarded, so
@@ -1582,6 +1637,45 @@ impl ArenaRecorder {
             &self.excluded_flags(),
             layout,
         )
+    }
+
+    /// A plan for the PREVIOUS step, from its own intervals and the values of
+    /// it this step read (`DESIGN.md` §9.2aa). The two steps need not share a
+    /// shape: only the cross-step liveness test applies, since a value of the
+    /// previous step that this step bound is session state whatever this
+    /// step computes, and a size comparison across different shapes says
+    /// nothing. `None` before `next_step` has been called.
+    pub fn plan_previous(&self, layout: ArenaLayout) -> Option<StepPlan> {
+        let n = self.previous.len();
+        if n == 0 || self.previous_first_bind.len() != n || self.previous_last_bind.len() != n {
+            return None;
+        }
+        let excluded: Vec<bool> = (0..n).map(|i| self.survived.contains(&i)).collect();
+        Some(plan_from_intervals(
+            &self.previous,
+            &self.previous_first_bind,
+            &self.previous_last_bind,
+            &excluded,
+            layout,
+        ))
+    }
+
+    /// Ordinals of the previous step this step bound — the values that
+    /// escaped it — and how many the previous step allocated.
+    pub fn previous_escapes(&self) -> (usize, usize) {
+        (self.survived.len(), self.previous.len())
+    }
+
+    /// The dispatch position ordinal `i` of the CURRENT step was last bound
+    /// at, for tests that check a bind was observed.
+    pub fn last_bind_of(&self, i: usize) -> Option<usize> {
+        self.last_bind.get(i).copied()
+    }
+
+    /// Dispatches this step has counted so far — the position the next bind
+    /// would be recorded at.
+    pub fn dispatch_position(&self) -> usize {
+        self.dispatch
     }
 
     /// How many ordinals were excluded as session state, and how many recorded.

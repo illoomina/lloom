@@ -550,21 +550,68 @@ fn end_executor_step(device: &Device) -> Result<()> {
 /// arena installed or armed, and off Metal. The sampling before the forward and
 /// the drain after it stay outside, as the harnesses that record by hand keep
 /// them.
-fn begin_decode_step(device: &Device) {
-    #[cfg(feature = "metal")]
-    if let Device::Metal(m) = device {
-        m.begin_decode_step();
-    }
-    let _ = device;
+/// The shape of a forward pass, for the pass-keyed plan cache
+/// (`DESIGN.md` §9.2aa). Off-metal, and with the cache off, a bracket is the
+/// decode-step bracket it always was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassShape {
+    Decode {
+        b: usize,
+    },
+    /// `fresh`: the first pass on an empty cache (`pos == 0`).
+    Prefill {
+        w: usize,
+        fresh: bool,
+    },
+    Verify {
+        k: usize,
+    },
 }
 
-fn end_decode_step(device: &Device) -> Result<()> {
+#[cfg(feature = "metal")]
+fn pass_key(shape: PassShape) -> lloom_tensor::metal_backend::PassKey {
+    use lloom_tensor::metal_backend::{PassKey, PassKind};
+    let kind = match shape {
+        PassShape::Decode { b } => PassKind::Decode {
+            b: b.min(u16::MAX as usize) as u16,
+        },
+        PassShape::Prefill { w, fresh } => PassKind::Prefill {
+            w: w.min(u32::MAX as usize) as u32,
+            fresh,
+        },
+        PassShape::Verify { k } => PassKind::Verify {
+            k: k.min(u16::MAX as usize) as u16,
+        },
+    };
+    PassKey::new(kind)
+}
+
+fn begin_pass(device: &Device, shape: PassShape) -> Result<()> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
-        m.finish_decode_step()?;
+        m.begin_pass(pass_key(shape))?;
+    }
+    let _ = (device, shape);
+    Ok(())
+}
+
+fn end_pass(device: &Device) -> Result<()> {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        m.finish_pass()?;
     }
     let _ = device;
     Ok(())
+}
+
+fn begin_decode_step(device: &Device) {
+    // The decode step is the `Decode { b: 1 }` pass; with the cache off this
+    // is the legacy bracket, which cannot fail.
+    let _ = begin_pass(device, PassShape::Decode { b: 1 });
+}
+
+fn end_decode_step(device: &Device) -> Result<()> {
+    end_pass(device)
 }
 
 fn flush_and_prune(device: &Device) -> Result<Option<usize>> {
@@ -1025,6 +1072,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 if pace {
                     pacer.before_forward(&device)?;
                 }
+                self.model.prepare_pass(&mut self.seq.cache, 1)?;
                 begin_decode_step(&device);
                 logits = self
                     .model
@@ -1059,6 +1107,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     pacer.before_forward(&device)?;
                 }
                 let t = timed.then(std::time::Instant::now);
+                self.model.prepare_pass(&mut self.seq.cache, 1)?;
                 begin_decode_step(&device);
                 logits = self
                     .model
@@ -1369,10 +1418,24 @@ impl<'m, M: CausalLM> Session<'m, M> {
             if pace {
                 pacer.before_forward(&device)?;
             }
+            // The KV grow (`prepare_pass`) runs inside the model's forward,
+            // before layer 0, so it is inside this bracket: a session
+            // allocation the recorder excludes and no plan serves.
+            // Session allocations (the KV slab, a bucket grow) happen here,
+            // before the bracket, so the planned pass allocates nothing.
+            self.model.prepare_pass(&mut self.seq.cache, w)?;
+            begin_pass(
+                &device,
+                PassShape::Prefill {
+                    w,
+                    fresh: self.seq.pos == 0,
+                },
+            )?;
             let out = self
                 .model
                 .forward(&input, self.seq.pos, &mut self.seq.cache)?
                 .squeeze(0)?;
+            end_pass(&device)?;
             if pace {
                 pacer.after_forward(&device)?;
             }
@@ -2300,7 +2363,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     let _pool = lloom_tensor::AutoreleaseScope::new();
                     let unit = &prompt[off..off + w];
                     let input = Tensor::new(unit, device)?.unsqueeze(0)?;
-                    last = Some(s.model.forward(&input, s.seq.pos, &mut s.seq.cache)?);
+                    s.model.prepare_pass(&mut s.seq.cache, w)?;
+                    begin_pass(
+                        device,
+                        PassShape::Prefill {
+                            w,
+                            fresh: s.seq.pos == 0,
+                        },
+                    )?;
+                    let out = s.model.forward(&input, s.seq.pos, &mut s.seq.cache);
+                    end_pass(device)?;
+                    last = Some(out?);
                     s.seq.pos += w;
                     s.seq.tokens.extend_from_slice(unit);
                     off += w;
@@ -2653,6 +2726,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
             }
         }
+        for s in picked.iter_mut() {
+            model.prepare_pass(&mut s.seq.cache, 1)?;
+        }
         let mut rows: Vec<Row<'_, M::Cache>> = picked
             .iter_mut()
             .map(|s| Row {
@@ -2660,7 +2736,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 cache: &mut s.seq.cache,
             })
             .collect();
+        begin_pass(input.device(), PassShape::Decode { b: live.len() })?;
         let logits = model.forward_rows(input, &mut rows)?;
+        end_pass(input.device())?;
         drop(rows);
         for s in picked {
             s.seq.pos += 1;

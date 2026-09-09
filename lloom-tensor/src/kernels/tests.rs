@@ -9933,3 +9933,56 @@ fn rmsnorm_rope_f16_second_line_diagnostic() {
     eprintln!("i0 want: {:?}  got: {:?}", &t0[..4], &t0[4..]);
     eprintln!("i1 want: {:?}  got: {:?}", &t1[..4], &t1[4..]);
 }
+
+/// A blit reads and writes buffers as a dispatch binds them, and the arena
+/// recording must see it (`DESIGN.md` §9.2aa): a value whose last reader is a
+/// `copyFromBuffer` would otherwise end its interval at its producing
+/// dispatch and be aliased while the copy still reads it.
+#[test]
+fn a_blit_copy_extends_the_recorded_interval_of_both_buffers() {
+    use crate::kernels::metal::arena::{set_bind_observer, ArenaRecorder};
+    use parking_lot::Mutex;
+    let device = device();
+    let src = new_buffer(&device, &[1u32; 64]);
+    let dst = new_buffer(&device, &[0u32; 64]);
+    let rec = Arc::new(Mutex::new(ArenaRecorder::new()));
+    {
+        let mut r = rec.lock();
+        r.record_alloc(src.raw_addr(), 256);
+        r.record_alloc(dst.raw_addr(), 256);
+        // Three dispatches go by with neither buffer bound.
+        r.record_dispatch();
+        r.record_dispatch();
+        r.record_dispatch();
+    }
+    assert_eq!(rec.lock().last_bind_of(0), Some(0));
+    assert_eq!(rec.lock().last_bind_of(1), Some(0));
+    set_bind_observer(Some(Arc::clone(&rec)));
+    // While this recorder is the process's observer, every compute dispatch
+    // any concurrent test encodes advances its counter too, so the position
+    // the blit lands at is read off the recorder, not assumed to be 3.
+    let at_least = rec.lock().dispatch_position();
+    let commands = commands(&device);
+    {
+        let mut blit = commands.blit_command_encoder().unwrap();
+        blit.copy_from_buffer(&src, 0, &dst, 0, 256);
+    }
+    set_bind_observer(None);
+    commands.wait_until_completed().unwrap();
+    // Both intervals now end where the copy was encoded — at or after the
+    // third dispatch. Without the note in the blit encoder they read 0, the
+    // aliasing the note exists to prevent.
+    assert!(at_least >= 3);
+    let read = rec.lock().last_bind_of(0);
+    let write = rec.lock().last_bind_of(1);
+    assert!(
+        read.is_some_and(|p| p >= at_least),
+        "the blit's read was not recorded: {read:?} < {at_least}"
+    );
+    assert!(
+        write.is_some_and(|p| p >= at_least),
+        "the blit's write was not recorded: {write:?} < {at_least}"
+    );
+    assert_eq!(read_to_vec::<u32>(&dst, 64)[0], 1);
+}
+

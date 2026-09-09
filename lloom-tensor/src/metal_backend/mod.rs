@@ -29,7 +29,7 @@ use device::{DeviceTeardown, ResidencyEvictionObserver};
 /// layout should not need a direct dependency on `candle-metal-kernels`.
 pub use crate::kernels::metal::{
     hazard_key, set_hazard_key, set_hazard_key_unless_explicit, ArenaCounters, ArenaLayout,
-    HazardKey, Slot, StepPlan,
+    HazardKey, PassKey, PassKind, PassPlanCounters, Slot, StepPlan,
 };
 
 /// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).
@@ -2780,6 +2780,7 @@ impl BackendDevice for MetalDevice {
             // No session region until one is installed, on the same argument as
             // the arena above: the classical path is the default (#47).
             session_region: Arc::new(parking_lot::RwLock::new(None)),
+            pass_plans: Arc::new(parking_lot::Mutex::new(None)),
         })
     }
 

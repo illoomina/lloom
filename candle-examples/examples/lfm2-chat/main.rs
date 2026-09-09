@@ -404,6 +404,14 @@ struct Args {
     #[arg(long)]
     qkv_layout: Option<String>,
 
+    /// The pass-keyed plan cache (`DESIGN.md` §9.2aa): every forward pass —
+    /// each prefill tile, each decode step, each batched step — is served
+    /// from one arena base by a plan cached per pass shape, recorded on the
+    /// shape's first sight. Prints the cache's counters at the end; the
+    /// churn line's `allocations=` is what it is meant to take to zero.
+    #[arg(long)]
+    pass_plans: bool,
+
     // ---- multi-sequence modes (absorbed from the former lfm2-sequence) -------
     /// `single` (default — read one prompt from stdin), `reuse` (a two-turn
     /// conversation decoded with prefix reuse vs a fresh prefill), or
@@ -1250,6 +1258,16 @@ fn main() -> Result<()> {
     if let Some(q) = args.qkv_layout.as_deref() {
         config.qkv_layout =
             lloom::models::lfm2::QkvLayout::parse(q).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    #[cfg(feature = "metal")]
+    if args.pass_plans {
+        if args.arena || args.replay {
+            anyhow::bail!("--pass-plans and --arena/--replay both own the arena slot; pick one");
+        }
+        if let Device::Metal(m) = &device {
+            m.enable_pass_plans(candle::metal_backend::ArenaLayout::Packed);
+            eprintln!("[pass plans: on (Packed); every pass keyed, recorded on first sight]");
+        }
     }
     // `--mode reuse` carries the conv state across the turn-boundary prefill
     // (§13.2f). Set on the config the model is built from; a no-op for `single`.
@@ -2569,6 +2587,29 @@ fn main() -> Result<()> {
             mean / quantile(&v, 0.5).max(1e-9),
             v.iter().filter(|&&x| x > 1.5 * quantile(&v, 0.5)).count(),
         );
+    }
+    #[cfg(feature = "metal")]
+    if args.pass_plans {
+        if let Device::Metal(dev) = &device {
+            if let (Some(c), Some((keys, base))) = (dev.pass_plan_counters(), dev.pass_plan_report()) {
+                let keys: Vec<String> = keys
+                    .iter()
+                    .map(|(k, covered, total)| format!("{:?}={covered}/{total}", k.kind))
+                    .collect();
+                eprintln!(
+                    "[pass plans: served={} recorded={} observed={} plans={} evicted={} \
+                     base_grows={} base={:.1} MiB keys=[{}]]",
+                    c.served,
+                    c.recorded,
+                    c.observed,
+                    c.plans,
+                    c.evicted,
+                    c.base_grows,
+                    base as f64 / (1024.0 * 1024.0),
+                    keys.join(" ")
+                );
+            }
+        }
     }
     #[cfg(feature = "metal")]
     if arena {

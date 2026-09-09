@@ -70,6 +70,16 @@ pub trait CausalLM: Model {
         self.forward_embeds(&embeds, pos, cache)
     }
 
+    /// Make `cache` ready for a pass of `seq_len` tokens — every session
+    /// allocation the pass would otherwise make on entry (a KV slab, a
+    /// bucket grow), so that a planned pass allocates nothing of its own
+    /// (`DESIGN.md` §9.2aa). A driver calls it before its pass bracket;
+    /// `forward` may call it again and find nothing to do. The default is
+    /// a no-op for models with no such state.
+    fn prepare_pass(&self, _cache: &mut Self::Cache, _seq_len: usize) -> Result<()> {
+        Ok(())
+    }
+
     fn vocab_size(&self) -> usize;
 }
 

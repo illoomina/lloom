@@ -1371,6 +1371,12 @@ impl BlitCommandEncoder {
     ) {
         let src_ptr = src_buffer.raw_ptr() as usize;
         let dst_ptr = dst_buffer.raw_ptr() as usize;
+        // A blit reads and writes buffers exactly as a dispatch binds them, so
+        // an arena recording must see both: a value whose last reader is a
+        // blit would otherwise end its interval early and be aliased while
+        // the copy still reads it (`DESIGN.md` §9.2aa).
+        arena::note_bind(src_ptr);
+        arena::note_bind(dst_ptr);
         self.wait_for_last_writers(&[src_ptr, dst_ptr]);
 
         self.tracked_outputs.push(dst_ptr);
@@ -1389,6 +1395,7 @@ impl BlitCommandEncoder {
 
     pub fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
         let ptr = buffer.raw_ptr() as usize;
+        arena::note_bind(ptr);
         self.wait_for_last_writers(&[ptr]);
         self.tracked_outputs.push(ptr);
 

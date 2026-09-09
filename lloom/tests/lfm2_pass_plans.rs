@@ -753,3 +753,47 @@ fn the_backend_hook_declines_by_default_and_metal_takes_it_up() -> Result<()> {
     dev.finish_pass()?;
     Ok(())
 }
+
+/// A RING conv arm reaches the no-allocation invariant — `escapes == 0` on
+/// every key — and the FUSED ring arm does not, because
+/// `shortconv_ring_fused` returns a NEW state tensor per pass rather than
+/// writing the one column into the ring it was handed
+/// (`crate::nn::ops::shortconv_ring` -> `(out, new_state)`, `lfm2.rs`).
+///
+/// Both halves are asserted, so the day the fused kernel writes in place
+/// this test fails and says so rather than silently passing: the second
+/// half is a `>` on the escape count, not a `==`.
+#[test]
+fn a_ring_conv_arm_has_no_escapes_and_the_fused_ring_still_does() -> Result<()> {
+    let _serial = SERIAL.lock();
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!()
+    };
+    let prompt: Vec<u32> = (1..=10).collect();
+    let escapes_with = |conv_fused: bool| -> Result<u64> {
+        let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
+        cfg.conv_prefill_ctx = true;
+        cfg.conv_fused = conv_fused;
+        let model = build(&cfg, &dev)?;
+        m.enable_pass_plans(ArenaLayout::Packed);
+        let before = m.pass_plan_counters().unwrap().escapes;
+        for _ in 0..3 {
+            run_prompt(&model, &cfg, &dev, &prompt, 0, 6)?;
+        }
+        Ok(m.pass_plan_counters().unwrap().escapes - before)
+    };
+
+    assert_eq!(
+        escapes_with(false)?,
+        0,
+        "the ring writes its state in place, so nothing should outlive a pass"
+    );
+    let fused = escapes_with(true)?;
+    assert!(
+        fused > 0,
+        "the fused ring kernel now writes in place — delete this half of the \
+         test and the finding in pass-plan-design.md §13 with it"
+    );
+    Ok(())
+}

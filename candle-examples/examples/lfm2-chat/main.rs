@@ -501,6 +501,26 @@ struct Args {
     #[arg(long, default_value = "lru")]
     pass_widths: String,
 
+    /// The conv-state policy, over the arm `--cache` selects: `shuffle` (the
+    /// crown's, `narrow` + `cat` per layer per token), `sliding[:K[:slack]]`
+    /// (bit-identical, one in-place write, a compaction every `slack`), or
+    /// `rotating[:K]` (no compaction, constant dispatch count, and it MOVES
+    /// THE DIGESTS — §10.2g). `lfm2-release`, `lfm2-determinism` and
+    /// `lfm2-dispatch-trace` have carried this flag; this binary did not,
+    /// which left `--pass-plans` telling a caller to use a ring arm on the
+    /// one harness that could not select one (#727).
+    ///
+    /// Unset, the arm's own default stands: `shuffle` on `--cache crown`,
+    /// and `rotating:K+1` on the rewindable arms, which REQUIRE a rotating
+    /// ring for `Cache::advance` to rewind. Setting anything else there is
+    /// refused rather than silently overridden.
+    ///
+    /// A ring arm is what makes the no-allocation invariant reachable under
+    /// `--pass-plans`: the shuffle's per-layer state is a fresh tensor per
+    /// pass and escapes every plan.
+    #[arg(long)]
+    conv_state: Option<String>,
+
     /// Under `--mode concurrent`: sequence `i` ARRIVES at round (time-sliced)
     /// or step (`--batched`) `i × N`; `0` (default) admits every sequence at
     /// once. With `--long-prompt-tokens` this is the serving shape a chunk is
@@ -1216,6 +1236,21 @@ fn main() -> Result<()> {
         config.attn_impl = lloom::models::lfm2::AttnImpl::Sdpa;
         config.kv_append = KvAppend::InPlace;
         config.conv_state = ConvState::RotatingRing { k: k + 1 };
+        // `Cache::advance` rewinds only under a rotating ring wide enough for
+        // the verify window, so this arm owns its conv state. An explicit
+        // `--conv-state` that would change it is refused rather than ignored:
+        // silently overriding the caller is how a flag becomes a lie.
+        if let Some(want) = args.conv_state.as_deref() {
+            let want = ConvState::parse(want).map_err(|e| anyhow::anyhow!(e))?;
+            if want != (ConvState::RotatingRing { k: k + 1 }) {
+                anyhow::bail!(
+                    "--conv-state {want:?} does not compose with `--cache {cache_arm}`, which \
+                     rewinds and so requires `rotating:{}` (the K+1 verify window). Drop \
+                     --conv-state, or run --cache crown to choose the conv arm freely.",
+                    k + 1
+                );
+            }
+        }
         config.gemv_silu = true;
         config.gemv_residual = true;
         config.conv_fused = true;
@@ -1263,9 +1298,15 @@ fn main() -> Result<()> {
             Ok("cat") => lloom::models::lfm2::KvAppend::Cat,
             _ => lloom::models::lfm2::KvAppend::InPlace,
         };
-        config.conv_state = lloom::models::lfm2::ConvState::Shuffle;
+        config.conv_state = match args.conv_state.as_deref() {
+            Some(s) => ConvState::parse(s).map_err(|e| anyhow::anyhow!(e))?,
+            None => lloom::models::lfm2::ConvState::Shuffle,
+        };
         config.gemv_silu = true;
         config.gemv_residual = true;
+        // The whole-block conv fusion is the `Shuffle` arm's (§12.2 row 1);
+        // the ring arms have their own fused kernel and fall back to the
+        // per-position loop where it does not apply.
         config.conv_fused = true;
     } else {
         anyhow::bail!(

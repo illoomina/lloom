@@ -59,6 +59,13 @@ lloom = { path = ".", features = ["fuzzing"] }
 # non-question here: the target is a test, backend-agnostic, and runs on
 # whichever of CPU and Metal is present.
 proptest = "1.11"
+# The pass-plan tests serialise on one lock (the arena's bind observer and
+# dispatch clock are process globals). A `parking_lot` lock, not std's, for
+# `lloom-tensor/Cargo.toml`'s reason applied one crate out: std's macOS
+# `RwLock` is `pthread_rwlock_t` and even its `Mutex` forces a poison
+# `Result`/`unwrap` branch per acquisition. Nothing here is on a hot path,
+# but a std lock in this tree is a pattern the next test copies.
+parking_lot = { workspace = true }
 # Merged in from candle-nn dev-deps (used by its tests and examples).
 # `clap` is now a normal dependency (the derive emits a `clap::Args` companion),
 # so it is not repeated here.

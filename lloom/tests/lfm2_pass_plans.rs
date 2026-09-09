@@ -13,7 +13,11 @@ use lloom_tensor::{DType, Device, Result, Tensor};
 /// The recorder's bind observer and the dispatch clock are process globals
 /// (`arena.rs`), so two tests planning passes at once record each other's
 /// dispatches: every test here holds this for its whole body.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+///
+/// `parking_lot`, as every lock in this workspace is: infallible, so there is
+/// no poison `Result` to unwrap, and no `pthread_rwlock_t` behind it
+/// (`lloom-tensor/Cargo.toml`).
+static SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn tiny_config(conv_state: ConvState) -> Config {
     Config {
@@ -127,7 +131,7 @@ fn run_prompt(
 
 #[test]
 fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Result<()> {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
         unreachable!()
@@ -274,7 +278,7 @@ fn interleaved(
 /// path produces — on the recording passes and on the served ones.
 #[test]
 fn held_logits_survive_another_sessions_passes() -> Result<()> {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
         unreachable!()
@@ -320,7 +324,7 @@ fn held_logits_survive_another_sessions_passes() -> Result<()> {
 fn served_tiles_compute_the_pool_paths_logits_bit_for_bit() -> Result<()> {
     use lloom::nn::CausalLM;
     use lloom_tensor::metal_backend::PassKey;
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
         unreachable!()
@@ -398,7 +402,7 @@ fn served_tiles_compute_the_pool_paths_logits_bit_for_bit() -> Result<()> {
 fn ragged_steps_are_planned_under_both_width_arms() -> Result<()> {
     use lloom::generation::{LogitsProcessor, Sampling};
     use lloom::nn::{DecodeOptions, PassWidths, Session};
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
         unreachable!()
@@ -583,7 +587,7 @@ impl lloom::nn::speculator::Speculator for GarbageDrafter {
 fn a_planned_verify_keeps_the_drafters_taps_and_the_stream() -> Result<()> {
     use lloom::generation::{Blocking, LogitsProcessor, Sampling};
     use lloom::nn::{DecodeOptions, Session};
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
         unreachable!()
@@ -673,7 +677,7 @@ fn a_planned_verify_keeps_the_drafters_taps_and_the_stream() -> Result<()> {
 /// over, which is the same shape as a real machine being out of room.
 #[test]
 fn a_base_grow_over_the_budget_is_refused_before_it_allocates() -> Result<()> {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let dev = Device::new_metal(0)?;
     let Device::Metal(m) = &dev else {
         unreachable!()
@@ -718,7 +722,7 @@ fn a_base_grow_over_the_budget_is_refused_before_it_allocates() -> Result<()> {
 #[test]
 fn the_backend_hook_declines_by_default_and_metal_takes_it_up() -> Result<()> {
     use lloom_tensor::backend::PassShapeKey;
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _serial = SERIAL.lock();
     let shape = PassShapeKey::Decode { b: 1 };
 
     // The CPU has no plan cache: it declines, and closing is a no-op.

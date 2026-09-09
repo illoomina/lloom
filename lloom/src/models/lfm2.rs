@@ -3720,13 +3720,24 @@ impl Attention {
                     (k, v)
                 }
                 KvAppend::InPlace => {
-                    // `slice_set` requires a contiguous source. `k` comes from
-                    // `rope`, which returns a fresh contiguous tensor; `v` was
-                    // made contiguous above. Asserted rather than assumed,
-                    // because a non-contiguous source is an error here and a
-                    // silent full copy under `Tensor::cat`.
-                    let k = k.contiguous()?;
-                    let v = v.contiguous()?;
+                    // `slice_set` (inside `append`) requires a contiguous source.
+                    // `k` comes from `rope`, which returns a fresh contiguous
+                    // tensor; `v` was made contiguous above. So the sources are
+                    // ALREADY contiguous here and a `.contiguous()` call would be
+                    // a no-op clone (`Tensor::contiguous` returns `self.clone()`
+                    // when already contiguous) — confusing, and it reads as a
+                    // copy that never happens. Enforce the invariant with a
+                    // debug assertion instead: the contract the old `.contiguous()`
+                    // guaranteed, made explicit, compiled out in release. A future
+                    // change that makes either source strided fails loudly here
+                    // rather than silently copying (or mis-writing the slab).
+                    debug_assert!(
+                        k.is_contiguous() && v.is_contiguous(),
+                        "KvAppend::InPlace: slice_set needs contiguous k/v; \
+                         k.is_contiguous()={}, v.is_contiguous()={}",
+                        k.is_contiguous(),
+                        v.is_contiguous(),
+                    );
                     let (k_slot, v_slot) = &mut cache.kv_slots[block_idx];
                     // A turn boundary re-prefills without clearing, so this is
                     // a `seq_len > 1` append onto a non-empty slot. It is the

@@ -284,6 +284,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
+    /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
+    /// `conv1d` dispatch (`ConvFused`, §12.2 row 1). The digests move; the text
+    /// is expected identical, which is what this harness checks.
+    #[arg(long, default_value_t = false)]
+    conv_fused: bool,
+
     /// Who selects the GEMV epilogue fusions (`Fusion`, issue #732): `manual`
     /// (the two flags above as given) or `derived` (the optimizer's plan,
     /// derived at construction). The text is expected identical either way.
@@ -424,6 +430,7 @@ fn main() -> Result<()> {
     // against the arm it was taken in.
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
+    config.conv_fused = args.conv_fused;
     config.fusion =
         lloom::models::lfm2::FusionPolicy::parse(&args.fusion).map_err(anyhow::Error::msg)?;
     println!(

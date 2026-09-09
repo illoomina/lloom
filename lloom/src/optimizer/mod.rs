@@ -16,6 +16,7 @@
 //! exclusion set (P2's product) removes fragments by name the same way.
 
 pub mod egraph;
+pub mod exclusions;
 pub mod fragments;
 pub mod ir;
 pub mod numeric;
@@ -23,6 +24,7 @@ pub mod plan;
 
 use lloom_tensor::Result;
 
+pub use exclusions::{ExclusionSet, Verdict};
 pub use fragments::{catalogue, Fragment};
 pub use ir::{Census, Dim, Graph, Node, NodeId, Op, Shape};
 pub use numeric::NumericClass;
@@ -47,12 +49,42 @@ impl Default for Policy {
     /// (`design/docs/fusion.md` §12.2i). A `BitExact` budget admits none of
     /// today's fragments, which is a fact about the catalogue and not a
     /// reason to widen the budget silently.
+    ///
+    /// `excluded` is read off the embedded exclusion set
+    /// ([`exclusions::embedded`], P2): every catalogue fragment whose
+    /// transform the offline validation refused.
     fn default() -> Policy {
+        let set = exclusions::embedded();
+        let excluded = catalogue()
+            .into_iter()
+            .filter(|f| {
+                set.verdict(&ExclusionSet::fragment_transform(f.name)) == Some(Verdict::Exclude)
+            })
+            .map(|f| f.name.to_string())
+            .collect();
         Policy {
             budget: NumericClass::Rounding,
-            excluded: Vec::new(),
+            excluded,
             iterations: 8,
         }
+    }
+}
+
+impl Policy {
+    /// The catalogue fragments the exclusion set has NO verdict for under
+    /// this policy — admitted by class budget alone, and worth naming in a
+    /// report, since "unvalidated" and "validated admissible" are different
+    /// facts.
+    pub fn unvalidated(&self) -> Vec<String> {
+        let set = exclusions::embedded();
+        catalogue()
+            .into_iter()
+            .filter(|f| {
+                set.verdict(&ExclusionSet::fragment_transform(f.name))
+                    .is_none()
+            })
+            .map(|f| f.name.to_string())
+            .collect()
     }
 }
 

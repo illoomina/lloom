@@ -5184,9 +5184,38 @@ pub struct Model {
 /// naming the sites.
 #[cfg(not(target_arch = "wasm32"))]
 fn derive_fusion(cfg: &Config, dtype: DType) -> Result<Config> {
-    use crate::optimizer::{derive, Policy};
+    use crate::optimizer::{derive, exclusions, ExclusionSet, Policy, Verdict};
+
+    // The exclusion set speaks about every transform the offline validation
+    // ran, not only the fragments the derivation composes. An arm this config
+    // selects that the validation refused is refused here, by name and with
+    // its numbers — at construction, never per token.
+    let set = exclusions::embedded();
+    let mut selected: Vec<String> = Vec::new();
+    #[cfg(feature = "metal")]
+    selected.push(ExclusionSet::silu_transform(cfg.silu_impl.name()));
+    if cfg.conv_fused {
+        selected.push("conv_fused".to_string());
+    }
+    for transform in &selected {
+        if let Some(v) = set.get(transform) {
+            if v.verdict == Verdict::Exclude {
+                lloom_tensor::bail!(
+                    "lfm2 fusion=derived refuses `{transform}`: excluded by the offline validation \
+                     ({:.2} f16 ulp, last/first {:.3}, overrides {}, completion {}); \
+                     `design/measurements/issue-732-optimizer-p2.md`",
+                    v.max_f16_ulp,
+                    v.ratio_last_first,
+                    v.overrides,
+                    if v.text_identical { "identical" } else { "differs" }
+                )
+            }
+        }
+    }
+
     let graph = crate::models::lfm2_ir::decode_step(cfg, dtype);
-    let d = derive(&graph, &Policy::default())?;
+    let policy = Policy::default();
+    let d = derive(&graph, &policy)?;
     let plan = &d.plan;
 
     let uniform = |kind: &str, fragment: &str| -> Result<bool> {
@@ -5227,10 +5256,17 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<Config> {
             )
         }
     }
+    let unvalidated = policy.unvalidated();
     eprintln!(
         "lfm2 fusion=derived: {plan}; gemv_silu={gemv_silu} gemv_residual={gemv_residual} \
-         ({} refused, {:.1} ms)",
+         ({} refused, {} unvalidated{}, {:.1} ms)",
         d.refused.len(),
+        unvalidated.len(),
+        if unvalidated.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", unvalidated.join(" "))
+        },
         d.elapsed.as_secs_f64() * 1e3
     );
     let mut out = cfg.clone();

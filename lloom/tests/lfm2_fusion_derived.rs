@@ -232,3 +232,33 @@ fn manual_off_is_the_shipping_path_and_deterministic() -> Result<()> {
     assert_eq!(a, b);
     Ok(())
 }
+
+/// P2: the exclusion set is consulted for the arms the config selects, not
+/// only for the fragments the derivation composes. `silu_impl=relu` is the
+/// transform §12.2l measured degenerate (2307 f16 ulp, `ARAARAARA…`); under
+/// `Derived` a model selecting it is refused at construction, by name and
+/// with its numbers. Under `Manual` nothing changes — the arm stays selectable
+/// for the ladder it exists to measure.
+#[test]
+fn derived_refuses_an_excluded_silu_arm_at_construction() -> Result<()> {
+    let Ok(dev) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return Ok(());
+    };
+    let mut cfg = tiny_config(FusionPolicy::Derived, false, false);
+    cfg.silu_impl = lloom_tensor::kernels::SiluImpl::Relu;
+    let err = match build(&cfg, &dev) {
+        Ok(_) => panic!("Fusion=Derived must refuse the excluded `silu_impl=relu` arm"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("silu_impl=relu") && err.contains("excluded"),
+        "{err}"
+    );
+    eprintln!("{err}");
+    // Manual is untouched: the arm builds.
+    let mut manual = tiny_config(FusionPolicy::Manual, false, false);
+    manual.silu_impl = lloom_tensor::kernels::SiluImpl::Relu;
+    build(&manual, &dev)?;
+    Ok(())
+}

@@ -386,10 +386,65 @@ impl BoundSet {
         }
     }
 
+    /// Fold `other`'s bindings into this set, leaving `other` empty and
+    /// **keeping its capacity** for the next dispatch to refill.
+    ///
+    /// # Why this deduplicates, and why that is not an optimisation of
+    /// convenience (lloom #727)
+    ///
+    /// This runs once per DISPATCH from `auto_barrier`'s no-barrier branch.
+    /// `append` re-inserted every range without the containment check
+    /// `insert` applies, so a bucket grew by every binding made in the
+    /// encoder — and under an arena or pass-plan base every activation shares
+    /// ONE pointer, so one bucket takes all of it and every later `insert`
+    /// and `conflicts` scans the lot.
+    ///
+    /// **Measured as a NULL on the shipping config, and the reason is the cut
+    /// period** (lloom #727): `CANDLE_METAL_COMPUTE_PER_BUFFER` defaults to
+    /// 50, so an encoder holds ~50 dispatches, not a step's 338 — the bucket
+    /// reaches a few hundred ranges, where the linear scan is cheap. An
+    /// interleaved A/B on LFM2 showed 62.5/62.5/62.6 before and
+    /// 62.5/62.3/62.5 after, streams byte-identical.
+    ///
+    /// It is kept because it is correct and unconditionally cheaper —
+    /// duplicates cannot change what `conflicts` answers, so keeping them was
+    /// pure cost — and because the growth it removes is UNBOUNDED in the cut
+    /// period: an arm that widens the period (`pipelined_cut` is 512) or a
+    /// model with more dispatches per encoder pays the old shape
+    /// quadratically. The null is on this config, not on the mechanism.
+    ///
+    /// Deduplicating here is SEMANTICS-PRESERVING because `conflicts` asks
+    /// only whether some retained range overlaps the probe: a duplicate can
+    /// never change that answer, and `insert` already relies on exactly this
+    /// property (it skips a range the bucket already holds). What changes is
+    /// only how many copies of the same fact are kept.
+    ///
+    /// `drain()` rather than `mem::take` on the far side, and no reallocation
+    /// on this one: the buckets keep their capacity across dispatches instead
+    /// of being freed and regrown 338 times a step.
     fn absorb(&mut self, other: &mut BoundSet) {
         self.ptrs.extend(other.ptrs.drain());
-        for (ptr, mut v) in other.ranges.drain() {
-            self.ranges.entry(ptr).or_default().append(&mut v);
+        for (ptr, v) in other.ranges.iter_mut() {
+            let bucket = self.ranges.entry(*ptr).or_default();
+            for b in v.drain(..) {
+                if !bucket.contains(&b) {
+                    bucket.push(b);
+                }
+            }
+        }
+    }
+
+    /// Empty this set, keeping its allocated buckets for reuse.
+    ///
+    /// The counterpart to [`Self::absorb`]'s capacity discipline: the
+    /// per-dispatch rotation in `auto_barrier` used `mem::take`, which hands
+    /// the allocation away and leaves a fresh empty map to be regrown on the
+    /// next dispatch. Clearing keeps the buckets — the same pointers recur
+    /// every dispatch, so their capacity is exactly what is wanted next.
+    fn clear(&mut self) {
+        self.ptrs.clear();
+        for v in self.ranges.values_mut() {
+            v.clear();
         }
     }
 
@@ -914,10 +969,17 @@ impl ComputeCommandEncoder {
             s.prev_outputs = s.next_outputs.take();
             s.prev_inputs = s.next_inputs.take();
         } else {
-            let mut next_out = s.next_outputs.take();
-            s.prev_outputs.absorb(&mut next_out);
-            let mut next_in = s.next_inputs.take();
-            s.prev_inputs.absorb(&mut next_in);
+            // Absorb IN PLACE and clear, rather than `take` + absorb: the
+            // rotation happens once per dispatch, and handing the maps'
+            // allocations away each time made every dispatch regrow them
+            // (lloom #727, `BoundSet::absorb`).
+            // `&mut *s` once, then split the fields: the guard's `DerefMut`
+            // cannot be called twice in one expression.
+            let st = &mut *s;
+            st.prev_outputs.absorb(&mut st.next_outputs);
+            st.next_outputs.clear();
+            st.prev_inputs.absorb(&mut st.next_inputs);
+            st.next_inputs.clear();
         }
     }
 
@@ -1426,6 +1488,70 @@ mod tests {
     /// produces, since slots are laid out end to end at 128 B alignment. Getting
     /// the comparison non-strict would make every neighbouring slot conflict and
     /// silently give back the whole win.
+    /// What `auto_barrier`'s no-barrier branch costs per dispatch, against the
+    /// REAL `BoundSet` rather than a model of it (lloom #727).
+    ///
+    /// The branch does `next_*.take()` then `prev_*.absorb(&mut next)`, once
+    /// per dispatch. `absorb` drains both maps and re-appends every range into
+    /// `prev_*`, so its cost grows with what `prev_*` already holds — and
+    /// under a pass-plan or arena base EVERY activation shares one pointer, so
+    /// a single bucket accumulates every range and `insert`'s `contains` scans
+    /// it linearly. That is the shape this measures: 338 dispatches (an LFM2
+    /// decode step) x 6 binds, at 1 / 6 / 60 distinct pointers.
+    ///
+    /// Not an assertion of a time — a timing test would be flaky and would
+    /// pin the machine, not the code. It asserts the STRUCTURAL property,
+    /// which is stable: a range re-bound every dispatch is retained once, and
+    /// distinct ranges are all retained.
+    ///
+    /// The 338 here is a decode step's dispatch count, NOT one encoder's: the
+    /// cut period bounds an encoder at ~50 dispatches on the shipping config,
+    /// which is why the fix measured null there (see `absorb`).
+    #[test]
+    fn absorb_accumulates_every_range_into_one_bucket_under_a_shared_base() {
+        let dispatches = 338usize;
+        let binds = 6usize;
+        let mut prev = BoundSet::default();
+        for d in 0..dispatches {
+            let mut next = BoundSet::default();
+            for b in 0..binds {
+                // One base pointer, distinct 128 B slots — the arena's layout.
+                next.insert(HazardKey::Range, r(1, (d * binds + b) * 128, 128));
+            }
+            let mut taken = next.take();
+            prev.absorb(&mut taken);
+        }
+        // One bucket, and it holds each DISTINCT range once — `absorb`
+        // deduplicates as `insert` does. It used to `append` blindly, so this
+        // bucket held `dispatches * binds` entries and every later `contains`
+        // and `conflicts` scanned all of them (lloom #727).
+        let bucket = prev.ranges.get(&1).expect("the shared base's bucket");
+        assert_eq!(prev.ranges.len(), 1, "one shared base, one bucket");
+        assert_eq!(
+            bucket.len(),
+            dispatches * binds,
+            "these ranges ARE all distinct (disjoint 128 B slots), so none may \
+             be dropped: dedup must not lose a range"
+        );
+
+        // The property the fix buys, on the population that actually recurs:
+        // the SAME range re-bound every dispatch — a weight, a KV slab, the
+        // arena's own base — is kept once, not once per dispatch.
+        let mut prev = BoundSet::default();
+        for _ in 0..dispatches {
+            let mut next = BoundSet::default();
+            next.insert(HazardKey::Range, r(7, 0, 4096));
+            let mut taken = next.take();
+            prev.absorb(&mut taken);
+        }
+        assert_eq!(
+            prev.ranges.get(&7).map(Vec::len),
+            Some(1),
+            "a range re-bound every dispatch must be retained ONCE; \
+             appending blindly kept {dispatches} copies and scanned them all"
+        );
+    }
+
     #[test]
     fn ranges_overlap_exactly_when_they_share_a_byte() {
         assert!(

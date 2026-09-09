@@ -87,6 +87,19 @@ pub struct Row<'a, C> {
     pub cache: &'a mut C,
 }
 
+/// One row of a RAGGED batched forward ([`BatchedCausalLM::forward_ragged`]):
+/// `len` consecutive tokens of the flattened `[1, T]` input belong to this
+/// row, written at positions `pos..pos + len` of its own cache. A row of
+/// length 1 is a decode step and a longer one a prefill piece; they share the
+/// forward's weight sweep and nothing else.
+pub struct RaggedRow<'a, C> {
+    /// The position this row's first token is written at; the row's `kv_len`.
+    pub pos: usize,
+    /// How many of the input's tokens are this row's, in order.
+    pub len: usize,
+    pub cache: &'a mut C,
+}
+
 /// A model that can decode one token for each of several independent
 /// sequences in one forward pass (issue #694, `design/docs/batched-decode-design.md` §10).
 ///
@@ -106,6 +119,24 @@ pub trait BatchedCausalLM: CausalLM {
     /// `i` of it is fed to `rows[i]`, and the result is `[B, vocab]` in the
     /// same order. Every row's position advances by one.
     fn forward_rows(&self, tokens: &Tensor, rows: &mut [Row<'_, Self::Cache>]) -> Result<Tensor>;
+
+    /// One forward over a RAGGED batch: `tokens` is `[1, T]`, the rows' token
+    /// runs laid end to end (`rows[i].len` each, summing to `T`), run `i` fed
+    /// to `rows[i]` at `rows[i].pos`. Returns `[rows, vocab]`, each row's
+    /// logits at its LAST token. Every weight matrix is applied to all `T`
+    /// tokens in one GEMM, so a prefill piece and the decode rows beside it
+    /// ride ONE weight sweep — the fused chunked prefill (vLLM's shape) — and
+    /// what is per row runs per row against that row's cache exactly as
+    /// [`Self::forward_rows`] and `forward` do. Refused by default; a model
+    /// that can feed a ragged batch overrides it.
+    fn forward_ragged(
+        &self,
+        tokens: &Tensor,
+        rows: &mut [RaggedRow<'_, Self::Cache>],
+    ) -> Result<Tensor> {
+        let _ = (tokens, rows);
+        lloom_tensor::bail!("this model has no ragged batched forward")
+    }
 }
 
 /// A cache that can be returned to its pre-prefill state.

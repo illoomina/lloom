@@ -13,7 +13,9 @@
 //! refusals refuse. On the CPU and Metal backends.
 
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
-use lloom::nn::{BatchedCausalLM, CausalLM, DecodeOptions, IdentityProposer, Model, Row, Session};
+use lloom::nn::{
+    BatchedCausalLM, CausalLM, DecodeOptions, IdentityProposer, Model, RaggedRow, Row, Session,
+};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 const VOCAB: usize = 64;
@@ -97,6 +99,31 @@ impl CausalLM for Chain {
 }
 
 impl BatchedCausalLM for Chain {
+    /// The ragged pass: each row's logits are its last token's successor, and
+    /// its position counter advances by its run.
+    fn forward_ragged(&self, tokens: &Tensor, rows: &mut [RaggedRow<'_, usize>]) -> Result<Tensor> {
+        let (b, total) = tokens.dims2()?;
+        assert_eq!(b, 1, "a ragged input is [1, T]");
+        assert_eq!(total, rows.iter().map(|r| r.len).sum::<usize>());
+        let mut lasts = Vec::with_capacity(rows.len());
+        let mut off = 0;
+        for (r, row) in rows.iter_mut().enumerate() {
+            assert_eq!(
+                *row.cache, row.pos,
+                "row {r}: forward at pos {} against a cache of {}",
+                row.pos, row.cache
+            );
+            *row.cache += row.len;
+            off += row.len;
+            lasts.push((off - 1) as u32);
+        }
+        let last = tokens
+            .squeeze(0)?
+            .index_select(&Tensor::new(lasts.as_slice(), tokens.device())?, 0)?;
+        let next = self.table.index_select(&last, 0)?.to_dtype(DType::U32)?;
+        self.eye.index_select(&next, 0)
+    }
+
     fn forward_rows(&self, tokens: &Tensor, rows: &mut [Row<'_, usize>]) -> Result<Tensor> {
         let (b, seq) = tokens.dims2()?;
         assert_eq!(seq, 1, "a batched step is one token per row");
@@ -454,25 +481,20 @@ fn chunked_admission_and_late_arrivals_produce_the_solo_chains() -> Result<()> {
                     assert_eq!(&outs[i].ids, ids, "{tag}: row {i} ids");
                     assert_eq!(outs[i].eos, *eos, "{tag}: row {i} eos");
                     assert_eq!(streamed[i], outs[i].ids, "{tag}: row {i} streamed");
-                    // The forwards the prompt took: whole, or per chunk, each
-                    // bounded by the tile.
+                    // The forwards the prompt took: whole (tiled) at chunk 0,
+                    // else one ragged pass per piece, a piece being at most
+                    // the chunk and at most the tile.
                     let len = prompts[i].len();
-                    let pieces: Vec<usize> = if chunk == 0 {
-                        vec![len]
-                    } else {
-                        let mut v = Vec::new();
-                        let mut left = len;
-                        while left > 0 {
-                            let t = left.min(chunk);
-                            v.push(t);
-                            left -= t;
+                    let want_units: usize = if chunk == 0 {
+                        if tile == 0 {
+                            1
+                        } else {
+                            len.div_ceil(tile)
                         }
-                        v
+                    } else {
+                        let piece = if tile == 0 { chunk } else { chunk.min(tile) };
+                        len.div_ceil(piece)
                     };
-                    let want_units: usize = pieces
-                        .iter()
-                        .map(|&p| if tile == 0 { 1 } else { p.div_ceil(tile) })
-                        .sum();
                     assert_eq!(
                         outs[i].stats.prefill_units, want_units,
                         "{tag}: row {i} prefill forwards"
@@ -507,6 +529,16 @@ fn chunked_admission_and_late_arrivals_produce_the_solo_chains() -> Result<()> {
                     // row 1's one — so both decode from step 3. Row 2 takes
                     // steps 4–5 and decodes from step 6: row 1's fourth step.
                     assert_eq!(first3, Some(3), "{tag}: {widths:?}");
+                }
+                // The doc's own test-file rule (`CONTRIBUTING.md` §3.1b): a
+                // shape needs a control. The pieces are fed INSIDE the step's
+                // forward, so a row cannot have joined a step earlier than its
+                // last piece was fed — row 2's first live step is after step 4.
+                if chunk > 0 {
+                    assert!(
+                        first3.unwrap() >= 1,
+                        "{tag}: row 2 joined before its arrival: {widths:?}"
+                    );
                 }
             }
         }

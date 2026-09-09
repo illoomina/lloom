@@ -42,7 +42,7 @@ use crate::generation::{
     CommitBudget, HotThread, HotThreadReport, LogitsProcessor, ReadbackCounters, ReadbackStrategy,
     Sampling,
 };
-use crate::nn::model::{BatchedCausalLM, CacheReset, CausalLM, Row};
+use crate::nn::model::{BatchedCausalLM, CacheReset, CausalLM, RaggedRow, Row};
 use crate::nn::speculator::{
     readbacks, Anchor, Draft, NoProbe, Probes, RoundProbe, RoundTiming, SeqId, Session, Speculator,
     TargetProbe,
@@ -208,14 +208,17 @@ pub struct DecodeOptions {
     /// The CHUNK under [`Session::decode_batched`]: the most prompt tokens one
     /// pending row is prefilled by per batched step, interleaved with the
     /// live rows' decode (vLLM's chunked prefill, its token budget). **`0`
-    /// means every prompt is prefilled whole before the loop** — the
-    /// incumbent, no interleave. A positive value admits the rows' prompts a
-    /// chunk per step, one row at a time in order, each row joining the batch
-    /// at the step after its last chunk; a row's prompt KV is built
-    /// incrementally and its stream is what a whole prefill gives it. The
-    /// time-sliced driver's chunk is the caller's — it feeds [`Session::prefill`]
-    /// per visit — and the single-sequence loop has no other sequence to
-    /// interleave with, so neither reads this.
+    /// means every prompt is prefilled whole at its arrival** — the
+    /// incumbent, no interleave. A positive value feeds at most that many
+    /// prompt tokens per step over the pending rows in order, **as extra rows
+    /// of the step's own batched forward** ([`BatchedCausalLM::forward_ragged`])
+    /// — one weight sweep for the live rows' decode and the prompt pieces
+    /// together, no second forward — each row joining the batch at the step
+    /// after its last piece; a row's prompt KV is built incrementally and its
+    /// stream is what a whole prefill gives it. The tile bounds a piece too.
+    /// The time-sliced driver's chunk is the caller's — it feeds
+    /// [`Session::prefill`] per visit — and the single-sequence loop has no
+    /// other sequence to interleave with, so neither reads this.
     pub prefill_chunk: usize,
 }
 
@@ -2157,13 +2160,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// arrival step, in one forward (or in `opts.prefill_tile` forwards when
     /// the tile is set), before that step's batched decode is encoded: every
     /// live row's next token waits for the whole prompt. `prefill_chunk > 0`
-    /// feeds at most that many prompt tokens per step, of the earliest
-    /// arrived row whose prompt is not yet complete, AFTER the step's batched
-    /// forward is enqueued — so a long prompt is spread over many steps, each
-    /// live row's inter-token interval grows by one chunk's forward rather
-    /// than by the prompt, and the row joins the batch at the step after its
-    /// last chunk. The prompt's KV is built incrementally, which is exact
-    /// given the conv writer's left-context carry (`Config::conv_prefill_ctx`).
+    /// feeds at most that many prompt tokens per step, over the arrived rows
+    /// still pending in row order, each piece bounded by the tile — **as
+    /// extra rows of the step's own batched forward**
+    /// ([`BatchedCausalLM::forward_ragged`]): the live rows' next tokens and
+    /// the pieces are one `[1, T]` input, so the pieces ride the step's one
+    /// weight sweep and add no forward, no sweep and no per-forward cost of
+    /// their own (vLLM's chunked prefill: a scheduling of tokens into the
+    /// batch, not a second pass). A row joins the batch at the step after its
+    /// last piece, with that piece's logits. The prompt's KV is built
+    /// incrementally, which is exact given the conv writer's left-context
+    /// carry (`Config::conv_prefill_ctx`).
     ///
     /// A step with no live row and no arrived prompt to feed (every pending
     /// row's arrival is in the future) is an idle step: nothing is encoded,
@@ -2263,24 +2270,16 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut logits: Option<Tensor> = None;
         let mut step: u64 = 0;
 
-        // Feed prompt tokens for this step: with no chunk budget, every
-        // arrived row's whole remaining prompt; with one, `chunk` tokens of
-        // the earliest arrived row still pending. Returns the rows that
-        // completed their prompt, with their logits, in row order.
-        let admit = |sessions: &mut [Self],
-                     lanes: &mut [BatchLane],
-                     step: u64|
+        // Without a chunk budget an arrived row's whole remaining prompt is
+        // fed at its arrival step, before that step's decode is encoded (the
+        // tile still bounds each forward). Returns the rows that completed
+        // their prompt, with their logits, in row order.
+        let admit_whole = |sessions: &mut [Self],
+                           lanes: &mut [BatchLane],
+                           step: u64|
          -> Result<Vec<(usize, Tensor)>> {
             let mut joined = Vec::new();
-            let mut budget_left = if opts.prefill_chunk == 0 {
-                usize::MAX
-            } else {
-                opts.prefill_chunk
-            };
             for i in 0..n {
-                if budget_left == 0 {
-                    break;
-                }
                 let lane = &mut lanes[i];
                 if lane.joined || lane.arrival > step {
                     continue;
@@ -2294,23 +2293,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     joined.push((i, held.unsqueeze(0)?));
                     continue;
                 }
-                let start = lane
-                    .prefill_start
-                    .get_or_insert_with(std::time::Instant::now);
-                let remaining = prompt.len() - lane.prompt_off;
-                let take = if opts.prefill_chunk == 0 {
-                    remaining
-                } else {
-                    remaining.min(budget_left)
-                };
-                let piece = &prompt[lane.prompt_off..lane.prompt_off + take];
-                // The tile bounds each forward of the piece; the chunk is what
-                // this step feeds of it.
+                let start = std::time::Instant::now();
                 let mut last = None;
                 let mut off = 0usize;
-                for w in tile_widths(vec![take], opts.prefill_tile) {
+                for w in tile_widths(vec![prompt.len()], opts.prefill_tile) {
                     let _pool = lloom_tensor::AutoreleaseScope::new();
-                    let unit = &piece[off..off + w];
+                    let unit = &prompt[off..off + w];
                     let input = Tensor::new(unit, device)?.unsqueeze(0)?;
                     last = Some(s.model.forward(&input, s.seq.pos, &mut s.seq.cache)?);
                     s.seq.pos += w;
@@ -2318,17 +2306,58 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     off += w;
                     lane.stats.prefill_units += 1;
                 }
-                lane.prompt_off += take;
-                if opts.prefill_chunk > 0 {
-                    budget_left -= take;
-                }
+                lane.prompt_off = prompt.len();
                 lane.stats.prefill_ns = start.elapsed().as_nanos() as u64;
-                if lane.prompt_off == prompt.len() {
-                    lane.joined = true;
-                    joined.push((i, last.expect("a non-empty piece steps at least once")));
-                }
+                lane.joined = true;
+                joined.push((i, last.expect("a non-empty prompt steps at least once")));
             }
             Ok(joined)
+        };
+
+        // With a chunk budget: the prompt PIECES this step feeds — at most
+        // `prefill_chunk` tokens over the arrived rows still pending, in row
+        // order, each piece bounded by the tile — chosen here and fed INSIDE
+        // the step's batched forward as extra ragged rows, so they ride the
+        // live rows' weight sweep. Resumed rows (held logits) join at once.
+        // Returns `(pieces as (row, offset, len), resumed rows)`.
+        let select_pieces =
+            |lanes: &mut [BatchLane], step: u64| -> (Vec<(usize, usize, usize)>, Vec<usize>) {
+                let mut pieces = Vec::new();
+                let mut resumed = Vec::new();
+                let mut budget_left = opts.prefill_chunk;
+                for i in 0..n {
+                    if budget_left == 0 {
+                        break;
+                    }
+                    let lane = &mut lanes[i];
+                    if lane.joined || lane.arrival > step {
+                        continue;
+                    }
+                    if prompts[i].is_empty() {
+                        lane.joined = true;
+                        resumed.push(i);
+                        continue;
+                    }
+                    lane.prefill_start
+                        .get_or_insert_with(std::time::Instant::now);
+                    let remaining = prompts[i].len() - lane.prompt_off;
+                    let mut take = remaining.min(budget_left);
+                    if opts.prefill_tile > 0 {
+                        take = take.min(opts.prefill_tile);
+                    }
+                    pieces.push((i, lane.prompt_off, take));
+                    budget_left -= take;
+                }
+                (pieces, resumed)
+            };
+
+        // The pieces' tokens, in piece order, for the ragged input.
+        let piece_tokens = |pieces: &[(usize, usize, usize)]| -> Vec<u32> {
+            let mut v = Vec::with_capacity(pieces.iter().map(|p| p.2).sum());
+            for &(i, off, take) in pieces {
+                v.extend_from_slice(&prompts[i][off..off + take]);
+            }
+            v
         };
 
         loop {
@@ -2339,16 +2368,24 @@ impl<'m, M: CausalLM> Session<'m, M> {
             }
             let step_start = std::time::Instant::now();
             let b = live.len();
-            // Without a chunk budget an arrived prompt is fed whole before
-            // this step's decode — every live row waits on it, the
-            // head-of-line shape. With one, the chunk rides behind the
-            // decode below; when nothing is live there is nothing to ride
-            // behind, so it is fed here. `admit` runs once per step.
-            let mut joined = if opts.prefill_chunk == 0 || b == 0 {
-                admit(sessions, &mut lanes, step)?
+            let mut joined = if opts.prefill_chunk == 0 {
+                admit_whole(sessions, &mut lanes, step)?
             } else {
                 Vec::new()
             };
+            let (pieces, resumed) = if opts.prefill_chunk > 0 {
+                select_pieces(&mut lanes, step)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            for i in resumed {
+                let held = sessions[i]
+                    .seq
+                    .last_logits
+                    .take()
+                    .expect("checked at entry");
+                joined.push((i, held.unsqueeze(0)?));
+            }
             for &i in &live {
                 lanes[i].stats.steps += 1;
                 lanes[i].stats.batch_rows.push(b);
@@ -2359,8 +2396,21 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 _ => None,
             };
 
+            // `piece_logits` is `[pieces, vocab]` once the pieces have been
+            // fed — by the step's forward (the lookahead arm feeds them with
+            // the live rows' next tokens; the blocking arm with the kept
+            // rows' after the readback) or alone when nothing is live.
+            let mut piece_logits: Option<Tensor> = None;
             let (host_ids, next_logits) = match (&ids, opts.lookahead) {
-                (None, _) => (Vec::new(), None),
+                (None, _) => {
+                    if !pieces.is_empty() {
+                        let toks = piece_tokens(&pieces);
+                        let input = Tensor::new(toks.as_slice(), device)?.unsqueeze(0)?;
+                        piece_logits =
+                            Some(Self::forward_ragged_live(sessions, &[], &pieces, &input)?);
+                    }
+                    (Vec::new(), None)
+                }
                 (Some(ids), 0) => {
                     // Learn first, then feed: the readback waits on the queue's
                     // tail, which is exactly this step's argmax.
@@ -2369,17 +2419,22 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 (Some(ids), _) => {
                     // Stage the readback BEFORE the next forward is encoded, so
                     // the wait is on the argmax's command buffer and not on the
-                    // forward queued behind it; then feed the device ids.
+                    // forward queued behind it; then feed the device ids — and
+                    // the pieces with them, as extra rows of the same forward.
                     let staged = ids.stage_read()?;
-                    let input = ids.reshape((b, 1))?;
-                    let next = Self::forward_live(sessions, &live, &input)?;
+                    let next = if pieces.is_empty() {
+                        let input = ids.reshape((b, 1))?;
+                        Self::forward_live(sessions, &live, &input)?
+                    } else {
+                        let toks = piece_tokens(&pieces);
+                        let input = Tensor::cat(&[ids, &Tensor::new(toks.as_slice(), device)?], 0)?
+                            .unsqueeze(0)?;
+                        let all = Self::forward_ragged_live(sessions, &live, &pieces, &input)?;
+                        piece_logits = Some(all.narrow(0, b, pieces.len())?);
+                        all.narrow(0, 0, b)?
+                    };
                     for &i in &live {
                         lanes[i].stats.commits += 1;
-                    }
-                    // The chunk queues behind the batched forward and runs
-                    // while the host waits for this step's ids.
-                    if opts.prefill_chunk > 0 {
-                        joined = admit(sessions, &mut lanes, step)?;
                     }
                     (staged.to_vec1::<u32>()?, Some(next))
                 }
@@ -2434,23 +2489,54 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         .collect();
                     Some(next.index_select(&Tensor::new(keep.as_slice(), device)?, 0)?)
                 }
-                None if kept.is_empty() => None,
+                None if kept.is_empty() && pieces.is_empty() => None,
                 None => {
-                    // Blocking arm: feed the ids the host just read, live rows
-                    // only; under a chunk budget the chunk rides behind it.
-                    let next_ids: Vec<u32> = live
+                    // Blocking arm: feed the ids the host just read, kept rows
+                    // only — and the pieces with them, in one forward.
+                    let mut next_ids: Vec<u32> = live
                         .iter()
                         .enumerate()
                         .filter(|(_, i)| !lanes[**i].done)
                         .map(|(k, _)| host_ids[k])
                         .collect();
-                    let input =
-                        Tensor::new(next_ids.as_slice(), device)?.reshape((kept.len(), 1))?;
-                    Some(Self::forward_live(sessions, &kept, &input)?)
+                    if pieces.is_empty() {
+                        let input =
+                            Tensor::new(next_ids.as_slice(), device)?.reshape((kept.len(), 1))?;
+                        Some(Self::forward_live(sessions, &kept, &input)?)
+                    } else if b > 0 {
+                        next_ids.extend(piece_tokens(&pieces));
+                        let input = Tensor::new(next_ids.as_slice(), device)?.unsqueeze(0)?;
+                        let all = Self::forward_ragged_live(sessions, &kept, &pieces, &input)?;
+                        piece_logits = Some(all.narrow(0, kept.len(), pieces.len())?);
+                        if kept.is_empty() {
+                            None
+                        } else {
+                            Some(all.narrow(0, 0, kept.len())?)
+                        }
+                    } else {
+                        // `b == 0`: the pieces were fed above, alone.
+                        None
+                    }
                 }
             };
-            if opts.lookahead == 0 && opts.prefill_chunk > 0 && b > 0 {
-                joined = admit(sessions, &mut lanes, step)?;
+            // The pieces are fed: advance the rows' logs, and join the rows
+            // whose prompt is complete with the piece's logits.
+            for (j, &(i, off, take)) in pieces.iter().enumerate() {
+                let lane = &mut lanes[i];
+                sessions[i]
+                    .seq
+                    .tokens
+                    .extend_from_slice(&prompts[i][off..off + take]);
+                lane.prompt_off += take;
+                lane.stats.prefill_units += 1;
+                if let Some(start) = lane.prefill_start {
+                    lane.stats.prefill_ns = start.elapsed().as_nanos() as u64;
+                }
+                if lane.prompt_off == prompts[i].len() {
+                    lane.joined = true;
+                    let pl = piece_logits.as_ref().expect("a fed piece has logits");
+                    joined.push((i, pl.narrow(0, j, 1)?));
+                }
             }
             end_executor_step(device)?;
 
@@ -2501,6 +2587,51 @@ impl<'m, M: CausalLM> Session<'m, M> {
         }
         let _ = run_start;
         Ok(outs)
+    }
+
+    /// One RAGGED batched forward: the sessions named by `live` as one-token
+    /// rows (their next token each), then `pieces` as `(row, offset, len)`
+    /// prompt pieces, in that order — `input` is `[1, T]` laid out the same
+    /// way. Returns `[live + pieces, vocab]` and advances every row's
+    /// position by what it fed. A session may appear once across both lists.
+    fn forward_ragged_live(
+        sessions: &mut [Self],
+        live: &[usize],
+        pieces: &[(usize, usize, usize)],
+        input: &Tensor,
+    ) -> Result<Tensor>
+    where
+        M: BatchedCausalLM,
+    {
+        let model = sessions[0].model;
+        let mut slots: Vec<Option<&mut Self>> = sessions.iter_mut().map(Some).collect();
+        let mut picked: Vec<(&mut Self, usize)> = Vec::with_capacity(live.len() + pieces.len());
+        for &i in live {
+            match slots[i].take() {
+                Some(s) => picked.push((s, 1)),
+                None => lloom_tensor::bail!("decode_batched: row {i} appears twice in a step"),
+            }
+        }
+        for &(i, _, take) in pieces {
+            match slots[i].take() {
+                Some(s) => picked.push((s, take)),
+                None => lloom_tensor::bail!("decode_batched: row {i} appears twice in a step"),
+            }
+        }
+        let mut rows: Vec<RaggedRow<'_, M::Cache>> = picked
+            .iter_mut()
+            .map(|(s, len)| RaggedRow {
+                pos: s.seq.pos,
+                len: *len,
+                cache: &mut s.seq.cache,
+            })
+            .collect();
+        let logits = model.forward_ragged(input, &mut rows)?;
+        drop(rows);
+        for (s, len) in picked {
+            s.seq.pos += len;
+        }
+        Ok(logits)
     }
 
     /// One batched forward over the sessions named by `live`, in that order,

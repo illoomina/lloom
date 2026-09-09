@@ -83,7 +83,8 @@ use crate::nn::speculator::{Draft, DraftTokens, KvSource, LayerTaps, SeqId, Spec
 use crate::nn::{Linear, RmsNorm, VarBuilder};
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor, D};
 #[cfg(feature = "metal")]
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// The drafter's context projection: `RMSNorm_enc(W_c · concat)`.
 ///
@@ -713,6 +714,12 @@ mod paged_ctx {
     /// Every layer's pool, one clock. Behind a `Mutex` because the forward
     /// pass reads the cache through `&CtxCache` and the draft block is written
     /// into the pool from there; five short critical sections per round.
+    ///
+    /// A `parking_lot::Mutex` (`Cargo.toml`): those critical sections are on
+    /// the draft path, and std's would add a poison `Result` branch to each
+    /// of them. It also removes the recovery this code used to need — there
+    /// is no poisoning to recover from, so a panic mid-append no longer
+    /// leaves a lock whose guard has to be forced open.
     pub(super) struct DSparkCtxPool {
         page_size: usize,
         /// Slots kept free past every sequence's context for the draft block.
@@ -1063,10 +1070,13 @@ mod paged_ctx {
                 .collect())
         }
 
-        fn lock(&self) -> std::sync::MutexGuard<'_, DSparkCtxPool> {
-            // A poisoned lock means a panic mid-append on another thread; the
-            // pool's bookkeeping is then unknown and continuing would read it.
-            self.shared.lock().unwrap_or_else(|e| e.into_inner())
+        fn lock(&self) -> parking_lot::MutexGuard<'_, DSparkCtxPool> {
+            // No poison arm: `parking_lot` does not poison. What the std
+            // version's recovery said — that a panic mid-append leaves the
+            // pool's bookkeeping unknown — is unchanged and unhandled either
+            // way; this simply stops pretending the `unwrap_or_else` was
+            // doing something about it.
+            self.shared.lock()
         }
 
         pub(super) fn page_size(&self) -> usize {

@@ -803,7 +803,15 @@ pub struct SharedEvent {
 }
 
 /// The condvar-guarded state a notification block writes and a waiter reads.
-type NotifySlot = (std::sync::Mutex<NotifyState>, std::sync::Condvar);
+///
+/// `parking_lot`, as every lock in this crate is (`Cargo.toml`): std's macOS
+/// `Mutex` forces a poison `Result` per acquisition, and this one is taken on
+/// a **GCD worker** inside the notification block — a branch on a path whose
+/// whole purpose is to deliver a wake promptly. `parking_lot`'s pair is also
+/// word-sized and allocation-free, where std's `Condvar` on macOS carries a
+/// `pthread_cond_t`. The poison arms this removes were dead weight in both
+/// directions: neither the block nor the waiter can panic while holding it.
+type NotifySlot = (parking_lot::Mutex<NotifyState>, parking_lot::Condvar);
 
 /// What a fired notification block leaves for the waiting thread.
 ///
@@ -863,8 +871,8 @@ impl SharedEvent {
             next: std::sync::atomic::AtomicU64::new(0),
             listener: listener.then(MTLSharedEventListener::new),
             shared: CachePadded::new(std::sync::Arc::new((
-                std::sync::Mutex::new(NotifyState::default()),
-                std::sync::Condvar::new(),
+                parking_lot::Mutex::new(NotifyState::default()),
+                parking_lot::Condvar::new(),
             ))),
         })
     }
@@ -979,7 +987,8 @@ impl SharedEvent {
         let block = block2::RcBlock::new(
             move |_event: std::ptr::NonNull<ProtocolObject<dyn MTLSharedEvent>>, seen: u64| {
                 let (lock, cv) = &*shared;
-                if let Ok(mut st) = lock.lock() {
+                {
+                    let mut st = lock.lock();
                     st.seen = st.seen.max(seen);
                     st.fired += 1;
                 }
@@ -991,7 +1000,8 @@ impl SharedEvent {
 
         let before = {
             let (lock, _) = &**self.shared;
-            lock.lock().map(|st| st.fired).unwrap_or(0)
+            let st = lock.lock();
+            st.fired
         };
 
         // SAFETY: `block` is a valid `RcBlock` for the duration of the call, and
@@ -1005,18 +1015,19 @@ impl SharedEvent {
 
         let (lock, cv) = &**self.shared;
         let deadline = std::time::Duration::from_millis(timeout_ms);
-        let Ok(guard) = lock.lock() else {
-            return 0;
-        };
-        // `wait_timeout_while` re-checks the predicate on every wake, so a
+        let mut guard = lock.lock();
+        // `wait_while_for` re-checks the predicate on every wake, so a
         // spurious wake does not return early and a block that fired *before*
         // this thread parked is not missed -- the predicate reads state the
-        // block already wrote.
-        let Ok((guard, _timed_out)) =
-            cv.wait_timeout_while(guard, deadline, |st| st.seen < value && st.fired == before)
-        else {
-            return 0;
-        };
+        // block already wrote. `parking_lot` takes the guard by `&mut` and
+        // returns the timeout as a plain result, so the poison arm std needed
+        // here is gone; a timeout still falls through to the count below,
+        // which reads 0 and sends the caller to the blocking wait.
+        let _timed_out = cv.wait_while_for(
+            &mut guard,
+            |st| st.seen < value && st.fired == before,
+            deadline,
+        );
         // The count this wait observed, and 0 when nothing arrived. Reported
         // rather than a bool for the reason in the doc comment above.
         guard.fired.saturating_sub(before)

@@ -49,6 +49,14 @@ libc = { workspace = true }
 hf-hub = { workspace = true }
 tokenizers = { workspace = true, features = ["onig"] }
 
+# Every lock this crate takes is a `parking_lot` lock, not std's, for
+# `lloom-tensor/Cargo.toml`'s reason: std's macOS `RwLock` is
+# `pthread_rwlock_t` and even its `Mutex` forces a poison `Result`/`unwrap`
+# branch per acquisition. The DSpark paged-context pool is the shipping one
+# (`lfm2_dspark.rs`, five short critical sections per speculative round, on
+# the draft path); the pass-plan tests' serialiser is the other.
+parking_lot = { workspace = true }
+
 [dev-dependencies]
 # The integration tests drive the fuzz models that live behind `fuzzing`; a
 # self dev-dependency is how cargo turns a feature on for a crate's own tests.
@@ -60,12 +68,8 @@ lloom = { path = ".", features = ["fuzzing"] }
 # whichever of CPU and Metal is present.
 proptest = "1.11"
 # The pass-plan tests serialise on one lock (the arena's bind observer and
-# dispatch clock are process globals). A `parking_lot` lock, not std's, for
-# `lloom-tensor/Cargo.toml`'s reason applied one crate out: std's macOS
-# `RwLock` is `pthread_rwlock_t` and even its `Mutex` forces a poison
-# `Result`/`unwrap` branch per acquisition. Nothing here is on a hot path,
-# but a std lock in this tree is a pattern the next test copies.
-parking_lot = { workspace = true }
+# dispatch clock are process globals). See the normal dependency below —
+# `parking_lot` is this crate's lock everywhere, tests included.
 # Merged in from candle-nn dev-deps (used by its tests and examples).
 # `clap` is now a normal dependency (the derive emits a `clap::Args` companion),
 # so it is not repeated here.

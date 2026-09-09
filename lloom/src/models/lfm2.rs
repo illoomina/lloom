@@ -208,6 +208,7 @@ impl Lfm2Config {
             gemv_residual: false,
             conv_fused: false,
             conv_prefill_ctx: false,
+            qkv_layout: QkvLayout::default(),
             // No tap, per §7.1a: an empty `tap_layers` is what every existing
             // caller had before #363 and costs an `is_empty()` per layer. The
             // indices belong to a *drafter* checkpoint, so there is no
@@ -504,6 +505,56 @@ impl KvAppend {
             other => Err(format!(
                 "--kv-append must be `cat`, `in-place` or `paged`, got `{other}`"
             )),
+        }
+    }
+}
+
+/// How the attention projections reach their norms and the KV append: the
+/// `reshape → transpose(1, 2)` view is a copy at `seq_len > 1` and free at
+/// `seq_len == 1` (`DESIGN.md` §6.2c), and this axis decides what is done
+/// with it (`DESIGN.md` §6.2c, §12.2 row 6).
+///
+/// A construction-tier axis like [`KvAppend`]: every arm is compiled, the
+/// incumbent is the default, and the A/B is one field apart (§7.1a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QkvLayout {
+    /// `.contiguous()` on all three views, then `q_norm`/`k_norm` and the
+    /// append over dense tensors -- the shipping path. Three copies per
+    /// attention layer per multi-token pass; three clones at decode.
+    #[default]
+    Contiguous,
+    /// No copy: `q_norm`/`k_norm` read the transposed view through the
+    /// strided form of the same kernel (`rmsnorm_*_strided`, bit for bit the
+    /// contiguous kernel over a copy), and `V` is written into the KV slab
+    /// from its own layout by one strided-to-strided copy (`copy_nd`).
+    Strided,
+    /// `Strided`, and `q_norm + rope` / `k_norm + rope` each ONE dispatch
+    /// (`rmsnorm_rope_*`), so the norm's output never round-trips memory
+    /// before the rotation: `DESIGN.md` §12.2 row 6 at the norm seam rather
+    /// than the GEMV seam §12.2e rules out. Falls back to `Strided` where
+    /// the rows attend at different positions (`attend_rows`).
+    Fused,
+}
+
+impl QkvLayout {
+    /// Parse the `--qkv-layout` flag arm.
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "contiguous" => Ok(QkvLayout::Contiguous),
+            "strided" => Ok(QkvLayout::Strided),
+            "fused" => Ok(QkvLayout::Fused),
+            other => Err(format!(
+                "--qkv-layout must be `contiguous`, `strided` or `fused`, got `{other}`"
+            )),
+        }
+    }
+
+    /// The arm as a `RESULT`-line word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QkvLayout::Contiguous => "contiguous",
+            QkvLayout::Strided => "strided",
+            QkvLayout::Fused => "fused",
         }
     }
 }
@@ -847,6 +898,16 @@ pub struct Config {
     /// arm, and flipping it is its own argued decision.
     #[axis(name = "ConvPrefillCtx", flag = "conv-prefill-ctx", variants = ["off", "on"], default = "off", bool)]
     pub conv_prefill_ctx: bool,
+    /// How the Q/K/V `transpose` views reach the norms and the KV append
+    /// (`DESIGN.md` §6.2c). Defaults to the copying path, per §7.1a.
+    #[axis(
+        name = "QkvLayout",
+        flag = "qkv-layout",
+        variants = ["Contiguous", "Strided", "Fused"],
+        default = "Contiguous",
+        parser = "QkvLayout::parse"
+    )]
+    pub qkv_layout: QkvLayout,
     /// Which layers' **input residual** to capture into [`Cache::taps`], for a
     /// hidden-state-typed drafter (`DESIGN.md` §10.2m, issue #363).
     ///
@@ -978,6 +1039,7 @@ impl Default for Config {
             gemv_residual: false,
             conv_fused: false,
             conv_prefill_ctx: false,
+            qkv_layout: QkvLayout::default(),
             tap_layers: Vec::new(),
             tap_dtype: DType::F32,
             #[cfg(feature = "metal")]
@@ -3336,6 +3398,9 @@ struct Attention {
     /// Fuse the post-attention residual add onto `out_proj`'s GEMV store
     /// (§12.2h). 8 of the 60 `badd_f16` dispatches per token.
     gemv_residual: bool,
+    /// How the projections' `transpose` views reach the norms and the append
+    /// (`Config::qkv_layout`).
+    qkv_layout: QkvLayout,
     span: tracing::Span,
     span_rot: tracing::Span,
 }
@@ -3375,6 +3440,7 @@ impl Attention {
             flash_pages_per_chunk: cfg.flash_pages_per_chunk,
             flash_scratch_sizing: cfg.flash_scratch_sizing,
             gemv_residual: cfg.gemv_residual,
+            qkv_layout: cfg.qkv_layout,
             span: tracing::span!(tracing::Level::TRACE, "attn"),
             span_rot: tracing::span!(tracing::Level::TRACE, "attn-rot"),
         })
@@ -3536,8 +3602,8 @@ impl Attention {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
-        let (q, k, v) = self.project(x)?;
-        let y = self.attend_projected(&q, &k, v, index_pos, block_idx, cache)?;
+        let (q, k, v, rotated) = self.project(x, Some((index_pos, &*cache)))?;
+        let y = self.attend_projected(&q, &k, v, rotated, index_pos, block_idx, cache)?;
         y.transpose(1, 2)?
             .reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))
     }
@@ -3555,13 +3621,17 @@ impl Attention {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
-        let (q, k, v) = self.project(x)?;
+        // Rows attend at different positions, so the rotation is per row: the
+        // projections are normed here and rotated below, on every arm.
+        let (q, k, v, rotated) = self.project(x, None)?;
+        debug_assert!(!rotated);
         let mut ys = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter_mut().enumerate() {
             ys.push(self.attend_projected(
                 &q.narrow(0, r, 1)?,
                 &k.narrow(0, r, 1)?,
                 v.narrow(0, r, 1)?,
+                rotated,
                 row.pos,
                 block_idx,
                 row.cache,
@@ -3573,16 +3643,25 @@ impl Attention {
     }
 
     /// The three projections and the per-head QK norms: `x [b, seq, hidden]`
-    /// to `(q, k, v)` in `[b, heads, seq, head_dim]`, `q`/`k` normed and not
-    /// yet rotated, `v` contiguous.
-    fn project(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+    /// to `(q, k, v, rotated)` in `[b, heads, seq, head_dim]`. `q`/`k` are
+    /// normed; they are also rotated (`rotated == true`) on the `Fused` arm
+    /// when `rope_at` names the position. `v` is contiguous on the
+    /// `Contiguous` arm and the bare `transpose` view otherwise, which the
+    /// in-place append writes from where it lies (`Tensor::slice_set`).
+    fn project(
+        &self,
+        x: &Tensor,
+        rope_at: Option<(usize, &Cache)>,
+    ) -> Result<(Tensor, Tensor, Tensor, bool)> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
         let q = self.q_proj.forward(x)?;
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // Reshape to (batch, seq, num_heads, head_dim) then transpose to (batch, num_heads, seq, head_dim)
+        // Reshape to (batch, seq, num_heads, head_dim) then transpose to
+        // (batch, num_heads, seq, head_dim): a view, contiguous at
+        // `seq_len == 1` and strided otherwise (`DESIGN.md` §6.2c).
         let q = q
             .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
             .transpose(1, 2)?;
@@ -3591,24 +3670,48 @@ impl Attention {
             .transpose(1, 2)?;
         let v = v
             .reshape((b_sz, seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+            .transpose(1, 2)?;
 
-        // Apply per-head QK normalization
-        let q = self.q_norm.forward(&q.contiguous()?)?;
-        let k = self.k_norm.forward(&k.contiguous()?)?;
-        Ok((q, k, v))
+        match self.qkv_layout {
+            QkvLayout::Contiguous => {
+                let v = v.contiguous()?;
+                let q = self.q_norm.forward(&q.contiguous()?)?;
+                let k = self.k_norm.forward(&k.contiguous()?)?;
+                Ok((q, k, v, false))
+            }
+            QkvLayout::Strided => {
+                let q = self.q_norm.forward_view(&q)?;
+                let k = self.k_norm.forward_view(&k)?;
+                Ok((q, k, v, false))
+            }
+            QkvLayout::Fused => match rope_at {
+                Some((index_pos, cache)) => {
+                    let cos = cache.cos.narrow(0, index_pos, seq_len)?;
+                    let sin = cache.sin.narrow(0, index_pos, seq_len)?;
+                    let q = self.q_norm.forward_rope(&q, &cos, &sin)?;
+                    let k = self.k_norm.forward_rope(&k, &cos, &sin)?;
+                    Ok((q, k, v, true))
+                }
+                None => {
+                    let q = self.q_norm.forward_view(&q)?;
+                    let k = self.k_norm.forward_view(&k)?;
+                    Ok((q, k, v, false))
+                }
+            },
+        }
     }
 
-    /// RoPE, the KV append and the attention kernel against one cache: `q`
-    /// and `k` normed and unrotated, `v` contiguous, all
+    /// RoPE (unless `rotated`), the KV append and the attention kernel
+    /// against one cache: `q` and `k` normed, `v` as `project` left it, all
     /// `[b, heads, seq, head_dim]`; returns `[b, heads, seq, head_dim]`,
     /// un-transposed.
+    #[allow(clippy::too_many_arguments)]
     fn attend_projected(
         &self,
         q: &Tensor,
         k: &Tensor,
         v: Tensor,
+        rotated: bool,
         index_pos: usize,
         block_idx: usize,
         cache: &mut Cache,
@@ -3616,8 +3719,14 @@ impl Attention {
         let (b_sz, _, seq_len, _) = q.dims4()?;
 
         // Apply rotary embeddings
-        let q = self.apply_rotary_emb(q, index_pos, cache)?;
-        let k = self.apply_rotary_emb(k, index_pos, cache)?;
+        let (q, k) = if rotated {
+            (q.clone(), k.clone())
+        } else {
+            (
+                self.apply_rotary_emb(q, index_pos, cache)?,
+                self.apply_rotary_emb(k, index_pos, cache)?,
+            )
+        };
 
         // The quantized arm (issue #218, `DESIGN.md` §10.7).
         //
@@ -3657,7 +3766,9 @@ impl Attention {
 
         // Handle KV cache
         let (k, v) = if !cache.use_kv_cache {
-            (k, v)
+            // The attention kernels below want a dense `v`; a clone on the
+            // arms that already made it so.
+            (k, v.contiguous()?)
         } else if cache.kv_quant.is_on() {
             // **Prefill on the quantized arm reads the whole cache back.**
             //
@@ -3720,23 +3831,15 @@ impl Attention {
                     (k, v)
                 }
                 KvAppend::InPlace => {
-                    // `slice_set` (inside `append`) requires a contiguous source.
-                    // `k` comes from `rope`, which returns a fresh contiguous
-                    // tensor; `v` was made contiguous above. So the sources are
-                    // ALREADY contiguous here and a `.contiguous()` call would be
-                    // a no-op clone (`Tensor::contiguous` returns `self.clone()`
-                    // when already contiguous) — confusing, and it reads as a
-                    // copy that never happens. Enforce the invariant with a
-                    // debug assertion instead: the contract the old `.contiguous()`
-                    // guaranteed, made explicit, compiled out in release. A future
-                    // change that makes either source strided fails loudly here
-                    // rather than silently copying (or mis-writing the slab).
+                    // `k` comes from the norm or the rotation, a fresh
+                    // contiguous tensor, so `append`'s `slice_set` takes its
+                    // `copy2d`. `v` is the bare `transpose` view on the
+                    // `Strided`/`Fused` arms and `slice_set` writes it from
+                    // where it lies (one `copy_nd`); on `Contiguous` it was
+                    // copied in `project`.
                     debug_assert!(
-                        k.is_contiguous() && v.is_contiguous(),
-                        "KvAppend::InPlace: slice_set needs contiguous k/v; \
-                         k.is_contiguous()={}, v.is_contiguous()={}",
                         k.is_contiguous(),
-                        v.is_contiguous(),
+                        "KvAppend::InPlace: k should be contiguous here"
                     );
                     let (k_slot, v_slot) = &mut cache.kv_slots[block_idx];
                     // A turn boundary re-prefills without clearing, so this is

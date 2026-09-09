@@ -246,9 +246,46 @@ impl Tensor {
     /// back-propagation.
     pub fn slice_set<D: Dim>(&self, src: &Self, dim: D, offset: usize) -> Result<()> {
         let dim = dim.to_index(self.shape(), "slice-set")?;
-        if !self.is_contiguous() || !src.is_contiguous() {
+        if !self.is_contiguous() {
             Err(Error::RequiresContiguous { op: "slice-set" }.bt())?
         }
+        // A strided source is written where it lies, through the backend's
+        // strided-to-strided copy, so a `transpose` view reaches the window
+        // in one dispatch. A backend without one materialises the source
+        // first, which is what every caller did before.
+        if !src.is_contiguous() {
+            self.slice_set_checks(src, dim, offset)?;
+            let dst_l = self.layout().narrow(dim, offset, src.dims()[dim])?;
+            let done =
+                src.storage()
+                    .copy_strided_to(&mut self.storage_mut(), src.layout(), &dst_l)?;
+            if done {
+                return Ok(());
+            }
+            return self.slice_set(&src.contiguous()?, dim, offset);
+        }
+        self.slice_set_checks(src, dim, offset)?;
+        let block_size: usize = src.dims().iter().skip(1 + dim).product();
+        let d1: usize = src.dims().iter().take(dim).product();
+        let d2 = block_size * src.dims()[dim];
+        let dst_o = self.layout().start_offset() + offset * block_size;
+        let src_o = src.layout().start_offset();
+        src.storage().copy2d(
+            &mut self.storage_mut(),
+            d1,
+            d2,
+            /* src_s */ d2,
+            /* dst_s */ block_size * self.dims()[dim],
+            src_o,
+            dst_o,
+        )?;
+
+        Ok(())
+    }
+
+    /// The shape, dtype, device and storage checks `slice_set` makes before
+    /// writing, shared by its contiguous and strided source paths.
+    fn slice_set_checks(&self, src: &Self, dim: usize, offset: usize) -> Result<()> {
         if self.same_storage(src) {
             crate::bail!("cannot use slice_set when self and src share their storage")
         }
@@ -284,21 +321,6 @@ impl Tensor {
                 crate::bail!("shape mismatch on dim {dim_idx}, {v1} <> {v2}")
             }
         }
-        let block_size: usize = src.dims().iter().skip(1 + dim).product();
-        let d1: usize = src.dims().iter().take(dim).product();
-        let d2 = block_size * src.dims()[dim];
-        let dst_o = self.layout().start_offset() + offset * block_size;
-        let src_o = src.layout().start_offset();
-        src.storage().copy2d(
-            &mut self.storage_mut(),
-            d1,
-            d2,
-            /* src_s */ d2,
-            /* dst_s */ block_size * self.dims()[dim],
-            src_o,
-            dst_o,
-        )?;
-
         Ok(())
     }
 

@@ -197,6 +197,20 @@ impl RmsNorm {
     pub fn forward_diff(&self, xs: &Tensor) -> Result<Tensor> {
         self.0.forward(xs)
     }
+
+    /// The fused kernel over `xs` whatever its layout. `forward` sends a
+    /// strided input down the decomposed path (several dispatches, f32
+    /// internally); this reads it where it lies with the strided form of the
+    /// same kernel, so a `transpose` view needs no copy before its norm.
+    pub fn forward_view(&self, xs: &Tensor) -> Result<Tensor> {
+        crate::nn::ops::rms_norm(xs, &self.0.weight, self.0.eps as f32)
+    }
+
+    /// The norm and a RoPE rotation in one dispatch where
+    /// [`crate::nn::ops::rms_norm_rope_applies`], composed otherwise.
+    pub fn forward_rope(&self, xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        crate::nn::ops::rms_norm_rope(xs, &self.0.weight, cos, sin, self.0.eps as f32)
+    }
 }
 
 impl Module for RmsNorm {

@@ -871,6 +871,26 @@ impl Storage {
         }
     }
 
+    /// Both sides strided, one shape; `Ok(false)` when the backend declines.
+    pub(crate) fn copy_strided_to(
+        &self,
+        dst: &mut Self,
+        src_l: &Layout,
+        dst_l: &Layout,
+    ) -> Result<bool> {
+        match (self, dst) {
+            (Self::Cpu(src), Self::Cpu(dst)) => src.copy_strided_to(dst, src_l, dst_l),
+            (Self::Cuda(src), Self::Cuda(dst)) => Ok(src.copy_strided_to(dst, src_l, dst_l)?),
+            (Self::Metal(src), Self::Metal(dst)) => Ok(src.copy_strided_to(dst, src_l, dst_l)?),
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
+                lhs: lhs.device().location(),
+                rhs: rhs.device().location(),
+                op: "copy_strided_to",
+            }
+            .bt()),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn kv_scatter(
         &self,

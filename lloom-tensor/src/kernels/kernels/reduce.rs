@@ -1,14 +1,14 @@
 use crate::kernels::linear_split;
 use crate::kernels::utils::{BufferOffset, EncoderProvider};
 use crate::kernels::{
-    debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
-    Output, Source,
+    debug_group, set_params, Buffer, ComputeCommandEncoder, ComputePipeline, Device, Kernels,
+    MetalKernelError, Output, Source,
 };
 use objc2_metal::MTLSize;
 
 use crate::kernels::kernels::params::{
-    begin_packed_params, finish_packed_params, NormParams, ParamStyle, ReduceParams, RopeIParams,
-    RopeParams, RopeThdParams, SoftmaxParams,
+    begin_packed_params, finish_packed_params, NormExtParams, NormParams, ParamStyle, ReduceParams,
+    RopeIParams, RopeParams, RopeThdParams, SoftmaxParams,
 };
 
 /// Trailing alignment of each packed block, so its length matches the `sizeof`
@@ -18,6 +18,7 @@ use crate::kernels::kernels::params::{
 const REDUCE_PARAMS_ALIGN: usize = core::mem::align_of::<ReduceParams>();
 const SOFTMAX_PARAMS_ALIGN: usize = core::mem::align_of::<SoftmaxParams>();
 const NORM_PARAMS_ALIGN: usize = core::mem::align_of::<NormParams>();
+const NORM_EXT_PARAMS_ALIGN: usize = core::mem::align_of::<NormExtParams>();
 const ROPE_I_PARAMS_ALIGN: usize = core::mem::align_of::<RopeIParams>();
 const ROPE_PARAMS_ALIGN: usize = core::mem::align_of::<RopeParams>();
 const ROPE_THD_PARAMS_ALIGN: usize = core::mem::align_of::<RopeThdParams>();
@@ -408,6 +409,277 @@ pub fn call_rms_norm_with(
         depth: 1,
     };
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+/// The threadgroup width `call_rms_norm` dispatches for a row of `last_dim`
+/// elements: `min(max_threads, (last_dim / 2).next_power_of_two())`. Stated
+/// once, because the rotated form below requires it to equal `last_dim / 2`.
+fn rms_norm_width(pipeline: &ComputePipeline, last_dim: usize) -> usize {
+    std::cmp::min(
+        pipeline.max_total_threads_per_threadgroup(),
+        (last_dim / 2).next_power_of_two(),
+    )
+}
+
+/// The rows of a strided source: `shape` and `strides` describe the source as
+/// the caller sees it; the last dimension is the row. Returns
+/// `(numel, last_dim)`.
+fn rows_of(shape: &[usize]) -> Result<(usize, usize), MetalKernelError> {
+    let numel: usize = shape.iter().product();
+    let last_dim = match shape.last() {
+        Some(&d) if d > 0 => d,
+        _ => {
+            return Err(MetalKernelError::InvalidInput(format!(
+                "rms_norm over a strided source needs a non-empty last dimension, got {shape:?}"
+            )))
+        }
+    };
+    Ok((numel, last_dim))
+}
+
+/// RMSNorm over a strided source (`rms_norm_kernel_strided`), the source read
+/// through its own `shape`/`strides` and the normalised rows written
+/// contiguously. Same reduction, block size and rounding as [`call_rms_norm`];
+/// only the source addressing differs, so the output is the contiguous
+/// kernel's over a copy, bit for bit.
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_strided(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    eps: f32,
+    input: BufferOffset,
+    alpha: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    call_rms_norm_strided_with(
+        device,
+        ep,
+        kernels,
+        kernel_name,
+        shape,
+        strides,
+        eps,
+        input,
+        alpha,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_strided_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    shape: &[usize],
+    strides: &[usize],
+    eps: f32,
+    input: BufferOffset,
+    alpha: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let (numel, last_dim) = rows_of(shape)?;
+    let name = style.kernel_name(kernel_name);
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "rms_norm_strided {kernel_name} shape={shape:?} strides={strides:?}"
+    );
+
+    let shape_u32: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
+    let strides_u32: Vec<u32> = strides.iter().map(|&x| x as u32).collect();
+    let _capture = begin_packed_params(encoder, style);
+    set_params!(
+        encoder,
+        (
+            numel as u32,
+            shape.len() as u32,
+            shape_u32.as_slice(),
+            strides_u32.as_slice(),
+            last_dim as u32,
+            0u32,
+            eps,
+            &input,
+            Output::new(output),
+            &alpha
+        )
+    );
+    let _staged = finish_packed_params(device, encoder, style, NORM_EXT_PARAMS_ALIGN)?;
+
+    let width = rms_norm_width(&pipeline, last_dim);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: numel / last_dim,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// RMSNorm and RoPE in one dispatch (`rms_norm_rope_kernel[_strided]`): each
+/// row of `[b, h, t, d]` is normalised by `alpha` and rotated by the
+/// `[t, d/2]` `cos`/`sin` rows at its own position, `rope`'s pairing
+/// `(i, i + d/2)`. `strides` is `None` for a contiguous source.
+///
+/// Refused unless `d` is a power of two whose half fits one threadgroup: the
+/// kernel's thread `tid` must hold exactly the pair the rotation reads, which
+/// is the geometry `call_rms_norm` dispatches at those sizes and no other.
+/// A refusal is an `Err`, so a caller falls back to the two-dispatch path
+/// rather than reading a row the kernel did not write.
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_rope(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    shape: &[usize],
+    strides: Option<&[usize]>,
+    t_len: usize,
+    eps: f32,
+    input: BufferOffset,
+    alpha: BufferOffset,
+    cos: BufferOffset,
+    sin: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    call_rms_norm_rope_with(
+        device,
+        ep,
+        kernels,
+        kernel_name,
+        shape,
+        strides,
+        t_len,
+        eps,
+        input,
+        alpha,
+        cos,
+        sin,
+        output,
+        ParamStyle::default(),
+    )
+}
+
+/// Whether [`call_rms_norm_rope`] serves a row of `last_dim` elements on this
+/// device: a power of two whose half is one threadgroup.
+pub fn rms_norm_rope_applies(
+    device: &Device,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    last_dim: usize,
+) -> Result<bool, MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    Ok(last_dim >= 2
+        && last_dim.is_power_of_two()
+        && rms_norm_width(&pipeline, last_dim) * 2 == last_dim)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_rms_norm_rope_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    shape: &[usize],
+    strides: Option<&[usize]>,
+    t_len: usize,
+    eps: f32,
+    input: BufferOffset,
+    alpha: BufferOffset,
+    cos: BufferOffset,
+    sin: BufferOffset,
+    output: &Buffer,
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let (numel, last_dim) = rows_of(shape)?;
+    let name = style.kernel_name(kernel_name);
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, name)?;
+    let width = rms_norm_width(&pipeline, last_dim);
+    if t_len == 0 || !last_dim.is_power_of_two() || width * 2 != last_dim {
+        return Err(MetalKernelError::InvalidInput(format!(
+            "{kernel_name}: a row of {last_dim} at t_len {t_len} is not a power of two whose \
+             half is one threadgroup ({width}); take the two-dispatch path"
+        )));
+    }
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "rms_norm_rope {kernel_name} shape={shape:?} strides={strides:?} t_len={t_len}"
+    );
+
+    let shape_u32: Vec<u32> = shape.iter().map(|&x| x as u32).collect();
+    let _capture = begin_packed_params(encoder, style);
+    match strides {
+        Some(strides) => {
+            let strides_u32: Vec<u32> = strides.iter().map(|&x| x as u32).collect();
+            set_params!(
+                encoder,
+                (
+                    numel as u32,
+                    shape.len() as u32,
+                    shape_u32.as_slice(),
+                    strides_u32.as_slice(),
+                    last_dim as u32,
+                    t_len as u32,
+                    eps,
+                    &input,
+                    Output::new(output),
+                    &alpha,
+                    &cos,
+                    &sin
+                )
+            );
+        }
+        None => {
+            set_params!(
+                encoder,
+                (
+                    numel as u32,
+                    shape.len() as u32,
+                    last_dim as u32,
+                    t_len as u32,
+                    eps,
+                    &input,
+                    Output::new(output),
+                    &alpha,
+                    &cos,
+                    &sin
+                )
+            );
+        }
+    }
+    let _staged = finish_packed_params(device, encoder, style, NORM_EXT_PARAMS_ALIGN)?;
+
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: numel / last_dim,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
     Ok(())
 }
 

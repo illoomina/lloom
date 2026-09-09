@@ -396,6 +396,14 @@ struct Args {
     #[arg(long)]
     kv_append: Option<String>,
 
+    /// How the Q/K/V `transpose` views reach the norms and the KV append
+    /// (`QkvLayout`, `DESIGN.md` §6.2c): `contiguous` (the copying incumbent), `strided`
+    /// (the norms and the append read the views where they lie) or `fused`
+    /// (`strided`, and each QK norm + RoPE is one dispatch). Unset leaves the
+    /// library default, `contiguous`.
+    #[arg(long)]
+    qkv_layout: Option<String>,
+
     // ---- multi-sequence modes (absorbed from the former lfm2-sequence) -------
     /// `single` (default — read one prompt from stdin), `reuse` (a two-turn
     /// conversation decoded with prefix reuse vs a fresh prefill), or
@@ -1063,6 +1071,10 @@ fn main() -> Result<()> {
     }
     if let Some(kv) = args.kv_append.as_deref() {
         config.kv_append = KvAppend::parse(kv).map_err(|e| anyhow::anyhow!(e))?;
+    }
+    if let Some(q) = args.qkv_layout.as_deref() {
+        config.qkv_layout =
+            lloom::models::lfm2::QkvLayout::parse(q).map_err(|e| anyhow::anyhow!(e))?;
     }
     // `--mode reuse` carries the conv state across the turn-boundary prefill
     // (§13.2f). Set on the config the model is built from; a no-op for `single`.
@@ -2104,6 +2116,7 @@ fn main() -> Result<()> {
         lloom::models::lfm2::AttnImpl::FlashDecoding => "flash",
         lloom::models::lfm2::AttnImpl::Generic => "generic",
     };
+    let qkv_arm = config.qkv_layout.as_str();
     // The KV slab's state and the process's device allocation, so a run reports
     // the memory it actually held at the length it reached rather than the
     // ceiling it could have (§9.5's admission is a prediction; this is the
@@ -2156,7 +2169,7 @@ fn main() -> Result<()> {
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \
-         {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} bos={} \
+         {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} qkv={qkv_arm} bos={} \
          readback={} lookahead={} prefill_ubatch={} prefill_units={} \
          commit_budget={} commits={} max_in_flight={} \
          step_markers={} step_waits={} cut={} pipelined_cut={} \

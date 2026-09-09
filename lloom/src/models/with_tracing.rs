@@ -206,6 +206,20 @@ impl RmsNorm {
         let _enter = self.span.enter();
         self.inner.forward_diff(x)
     }
+
+    /// The fused kernel over `x` whatever its layout (a strided view is read
+    /// where it lies).
+    pub fn forward_view(&self, x: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        self.inner.forward_view(x)
+    }
+
+    /// The norm and a RoPE rotation in one dispatch where the fused kernel
+    /// applies, composed otherwise.
+    pub fn forward_rope(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        self.inner.forward_rope(x, cos, sin)
+    }
 }
 
 impl Module for RmsNorm {

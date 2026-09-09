@@ -1098,8 +1098,8 @@ impl lloom_tensor::CustomOp2 for RmsNorm {
             (dt1, dt2) => lloom_tensor::bail!("rmsnorm is not implemented for {dt1:?} {dt2:?}"),
         };
 
-        if !(l1.is_contiguous() && l2.is_contiguous()) {
-            lloom_tensor::bail!("Non contiguous rmsnorm is not implemented");
+        if !l2.is_contiguous() {
+            lloom_tensor::bail!("rmsnorm: alpha has to be contiguous");
         }
 
         let last_dim = l1.dims()[l1.shape().rank() - 1];
@@ -1109,18 +1109,151 @@ impl lloom_tensor::CustomOp2 for RmsNorm {
             .with_size_for(elem_count, s1.dtype())
             .with_label("rmsnorm")
             .build()?;
-        lloom_tensor::kernels::call_rms_norm(
+        if l1.is_contiguous() {
+            lloom_tensor::kernels::call_rms_norm(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                name,
+                elem_count,
+                last_dim,
+                self.eps,
+                s1.buffer(),
+                l1.start_offset() * s1.dtype().size_in_bytes(),
+                s2.buffer(),
+                l2.start_offset() * s2.dtype().size_in_bytes(),
+                &output,
+            )
+            .map_err(lloom_tensor::Error::wrap)?;
+        } else {
+            // A strided source -- a `transpose` view -- is read where it lies
+            // by the strided form of the same kernel: same reduction, same
+            // rounding, one dispatch and no copy (`DESIGN.md` §6.2c).
+            let strided = match name {
+                "rmsnorm_f32" => "rmsnorm_f32_strided",
+                "rmsnorm_f16" => "rmsnorm_f16_strided",
+                _ => "rmsnorm_bf16_strided",
+            };
+            lloom_tensor::kernels::call_rms_norm_strided(
+                device.metal_device(),
+                &encoder,
+                kernels,
+                strided,
+                l1.dims(),
+                l1.stride(),
+                self.eps,
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: s1.buffer(),
+                    offset_in_bytes: l1.start_offset() * s1.dtype().size_in_bytes(),
+                },
+                lloom_tensor::kernels::BufferOffset {
+                    buffer: s2.buffer(),
+                    offset_in_bytes: l2.start_offset() * s2.dtype().size_in_bytes(),
+                },
+                &output,
+            )
+            .map_err(lloom_tensor::Error::wrap)?;
+        }
+        let newstorage =
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
+        Ok((newstorage, l1.shape().clone()))
+    }
+}
+
+/// RMSNorm and RoPE in one dispatch: each `[.., t, d]` row normalised by
+/// `alpha` and rotated at its own position by the `[t, d/2]` `cos`/`sin`
+/// rows, `rope`'s pairing `(i, i + d/2)`. Metal only; see [`rms_norm_rope`]
+/// for the composed path every other device takes.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
+struct RmsNormRope {
+    eps: f32,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl lloom_tensor::CustomOp2 for RmsNormRope {
+    fn name(&self) -> &'static str {
+        "rms-norm-rope"
+    }
+
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!(
+            "rms_norm_rope: no cpu kernel; `rms_norm_rope` composes rms_norm and rope there"
+        )
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("rmsnorm_rope");
+        let kernels = device.kernels();
+        let (name, name_strided) = match (s1.dtype(), s2.dtype()) {
+            (DType::F32, DType::F32) => ("rmsnorm_rope_f32", "rmsnorm_rope_f32_strided"),
+            (DType::F16, DType::F16) => ("rmsnorm_rope_f16", "rmsnorm_rope_f16_strided"),
+            (DType::BF16, DType::BF16) => ("rmsnorm_rope_bf16", "rmsnorm_rope_bf16_strided"),
+            (dt1, dt2) => {
+                lloom_tensor::bail!("rmsnorm_rope is not implemented for {dt1:?} {dt2:?}")
+            }
+        };
+        if !l2.is_contiguous() {
+            lloom_tensor::bail!("rmsnorm_rope: alpha has to be contiguous");
+        }
+        let (_b, _h, t, _d) = l1.shape().dims4()?;
+        let (cos_s, cos_l) = self.cos.storage_and_layout();
+        let (sin_s, sin_l) = self.sin.storage_and_layout();
+        let (cos_s, sin_s) = match (&*cos_s, &*sin_s) {
+            (lloom_tensor::Storage::Metal(c), lloom_tensor::Storage::Metal(s)) => (c, s),
+            _ => lloom_tensor::bail!("rmsnorm_rope: cos/sin must be on the metal device"),
+        };
+        let elem_count = l1.shape().elem_count();
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, s1.dtype())
+            .with_label("rmsnorm_rope")
+            .build()?;
+        fn bo<'a>(
+            st: &'a lloom_tensor::MetalStorage,
+            l: &Layout,
+        ) -> lloom_tensor::kernels::BufferOffset<'a> {
+            use lloom_tensor::backend::BackendStorage;
+            lloom_tensor::kernels::BufferOffset {
+                buffer: st.buffer(),
+                offset_in_bytes: l.start_offset() * st.dtype().size_in_bytes(),
+            }
+        }
+        let (kernel, strides) = if l1.is_contiguous() {
+            (name, None)
+        } else {
+            (name_strided, Some(l1.stride()))
+        };
+        lloom_tensor::kernels::call_rms_norm_rope(
             device.metal_device(),
             &encoder,
             kernels,
-            name,
-            elem_count,
-            last_dim,
+            kernel,
+            l1.dims(),
+            strides,
+            t,
             self.eps,
-            s1.buffer(),
-            l1.start_offset() * s1.dtype().size_in_bytes(),
-            s2.buffer(),
-            l2.start_offset() * s2.dtype().size_in_bytes(),
+            bo(s1, l1),
+            bo(s2, l2),
+            bo(cos_s, cos_l),
+            bo(sin_s, sin_l),
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
@@ -1128,6 +1261,76 @@ impl lloom_tensor::CustomOp2 for RmsNorm {
             lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype());
         Ok((newstorage, l1.shape().clone()))
     }
+}
+
+/// Whether [`rms_norm_rope`] takes its fused kernel for `xs`: Metal, a
+/// `[b, h, t, d]` source with `d` a power of two whose half is one
+/// threadgroup, 2-D `[>= t, d/2]` contiguous `cos`/`sin` of `xs`'s dtype.
+/// False is the composed path, never a failure.
+pub fn rms_norm_rope_applies(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> bool {
+    #[cfg(feature = "metal")]
+    {
+        let Ok((_b, _h, t, d)) = xs.dims4() else {
+            return false;
+        };
+        let Ok((cos_t, cos_d)) = cos.dims2() else {
+            return false;
+        };
+        let Ok((sin_t, sin_d)) = sin.dims2() else {
+            return false;
+        };
+        let lloom_tensor::Device::Metal(dev) = xs.device() else {
+            return false;
+        };
+        let name = match xs.dtype() {
+            DType::F32 => "rmsnorm_rope_f32",
+            DType::F16 => "rmsnorm_rope_f16",
+            DType::BF16 => "rmsnorm_rope_bf16",
+            _ => return false,
+        };
+        t >= 1
+            && cos_t >= t
+            && sin_t >= t
+            && cos_d * 2 == d
+            && sin_d * 2 == d
+            && cos.dtype() == xs.dtype()
+            && sin.dtype() == xs.dtype()
+            && cos.is_contiguous()
+            && sin.is_contiguous()
+            && lloom_tensor::kernels::rms_norm_rope_applies(
+                dev.metal_device(),
+                dev.kernels(),
+                name,
+                d,
+            )
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (xs, cos, sin);
+        false
+    }
+}
+
+/// `rope(rms_norm(xs, alpha, eps), cos, sin)` as ONE dispatch where
+/// [`rms_norm_rope_applies`], and as the two ops composed everywhere else --
+/// which is also the reference the fused kernel is tested against. `xs` may
+/// be a strided view (a `transpose`); the fused kernel reads it where it lies.
+pub fn rms_norm_rope(
+    xs: &Tensor,
+    alpha: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    eps: f32,
+) -> Result<Tensor> {
+    if rms_norm_rope_applies(xs, cos, sin) {
+        let (_b, _h, t, _d) = xs.dims4()?;
+        let cos = cos.narrow(0, 0, t)?;
+        let sin = sin.narrow(0, 0, t)?;
+        return xs.apply_op2_no_bwd(alpha, &RmsNormRope { eps, cos, sin });
+    }
+    let normed = rms_norm(xs, alpha, eps)?;
+    crate::nn::rotary_emb::rope(&normed.contiguous()?, cos, sin)
 }
 
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
@@ -1143,6 +1346,9 @@ pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     x_normed.to_dtype(x_dtype)?.broadcast_mul(alpha)
 }
 
+/// RMSNorm over the last dimension. `xs` may be strided: on Metal the kernel
+/// reads it where it lies (`rmsnorm_*_strided`, bit for bit the contiguous
+/// kernel over a copy); elsewhere it is materialised first.
 pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     let hidden_size_xs = xs.dim(D::Minus1)?;
     let hidden_size_alpha = alpha.dims1()?;
@@ -1152,6 +1358,9 @@ pub fn rms_norm(xs: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
             xs.shape(),
             alpha.shape()
         )
+    }
+    if !xs.is_contiguous() && !xs.device().is_metal() {
+        return rms_norm(&xs.contiguous()?, alpha, eps);
     }
     xs.apply_op2_no_bwd(alpha, &RmsNorm { eps })
 }

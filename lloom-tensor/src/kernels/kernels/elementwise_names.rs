@@ -133,11 +133,14 @@ pub fn unary_names() -> Vec<(String, Presence)> {
     }
     v.push(("copy_i64".to_string(), Conditional));
     v.push(("copy_i64_strided".to_string(), Conditional));
+    // `init_copy2d` emits `copy_nd` beside `copy2d`, dtype for dtype.
     for t in COPY2D_TNAMES {
         v.push((format!("copy2d_{t}"), Unconditional));
+        v.push((format!("copy_nd_{t}"), Unconditional));
     }
     for t in CONDITIONAL_TNAMES {
         v.push((format!("copy2d_{t}"), Conditional));
+        v.push((format!("copy_nd_{t}"), Conditional));
     }
     for t in CONST_SET_TNAMES {
         v.push((format!("const_set_{t}"), Unconditional));

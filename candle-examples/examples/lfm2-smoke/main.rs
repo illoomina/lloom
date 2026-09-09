@@ -237,6 +237,11 @@ struct Args {
     #[arg(long, default_value = "cat")]
     kv_append: String,
 
+    /// How the Q/K/V `transpose` views reach the norms and the KV append
+    /// (`QkvLayout`, `DESIGN.md` §6.2c): `contiguous`, `strided` or `fused`.
+    #[arg(long, default_value = "contiguous")]
+    qkv_layout: String,
+
     /// KV cache element width: `off` (the f16 default), `int8` or `int4`
     /// (issue #218, `DESIGN.md` §10.7).
     ///
@@ -378,6 +383,8 @@ fn main() -> Result<()> {
         "paged" => KvAppend::Paged,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
+    config.qkv_layout =
+        lloom::models::lfm2::QkvLayout::parse(&args.qkv_layout).map_err(anyhow::Error::msg)?;
 
     // Refused rather than defaulted, for `--kv-append`'s reason: an
     // unrecognized value silently pinning the default would report the f16
@@ -591,10 +598,11 @@ fn main() -> Result<()> {
     }
 
     println!(
-        "SMOKE attn={:?} kv_append={:?} turn1_expect={:?} turn1_ok={} turn1_tokens={} \
-         turn2_expect={:?} turn2_ok={} turn2_tokens={} verdict={}",
+        "SMOKE attn={:?} kv_append={:?} qkv_layout={} turn1_expect={:?} turn1_ok={} \
+         turn1_tokens={} turn2_expect={:?} turn2_ok={} turn2_tokens={} verdict={}",
         config.attn_impl,
         config.kv_append,
+        config.qkv_layout.as_str(),
         args.expect_turn1,
         turn1_ok,
         turns[0].tokens,

@@ -288,6 +288,90 @@ pub fn call_const_set_strided_with(
     Ok(())
 }
 
+pub mod copy_nd {
+    pub struct Kernel(pub &'static str);
+    pub const FLOAT: Kernel = Kernel("copy_nd_f32");
+    pub const HALF: Kernel = Kernel("copy_nd_f16");
+    pub const BFLOAT: Kernel = Kernel("copy_nd_bf16");
+    pub const I64: Kernel = Kernel("copy_nd_i64");
+    pub const I32: Kernel = Kernel("copy_nd_i32");
+    pub const I16: Kernel = Kernel("copy_nd_i16");
+    pub const U32: Kernel = Kernel("copy_nd_u32");
+    pub const U8: Kernel = Kernel("copy_nd_u8");
+}
+
+/// `output[dst_strides · i] = input[src_strides · i]` over `shape`: a copy
+/// between two strided layouts of one shape, one thread per element. The
+/// offsets ride in the two `BufferOffset`s. See `copy_nd` in `unary.metal`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_copy_nd(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: copy_nd::Kernel,
+    shape: &[usize],
+    input: BufferOffset,
+    src_strides: &[usize],
+    output: BufferOffset,
+    dst_strides: &[usize],
+) -> Result<(), MetalKernelError> {
+    call_copy_nd_with(
+        device,
+        ep,
+        kernels,
+        name,
+        shape,
+        input,
+        src_strides,
+        output,
+        dst_strides,
+        ParamStyle::default(),
+    )
+}
+
+/// As [`call_copy_nd`], choosing how the scalars are bound.
+#[allow(clippy::too_many_arguments)]
+pub fn call_copy_nd_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: copy_nd::Kernel,
+    shape: &[usize],
+    input: BufferOffset,
+    src_strides: &[usize],
+    output: BufferOffset,
+    dst_strides: &[usize],
+    style: ParamStyle,
+) -> Result<(), MetalKernelError> {
+    let kernel = style.kernel_name(name.0);
+    let pipeline = kernels.load_pipeline(device, Source::Unary, kernel)?;
+
+    let length: usize = shape.iter().product();
+    let num_dims: usize = shape.len();
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, length);
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "copy_nd {} elems={length}", name.0);
+    let _capture = begin_packed_params(encoder, style);
+    set_params!(
+        encoder,
+        (
+            length,
+            num_dims,
+            shape,
+            src_strides,
+            dst_strides,
+            &input,
+            Output::from_buffer_offset(&output)
+        )
+    );
+    let _staged = finish_packed_params(device, encoder, style, UNARY_STRIDED_PARAMS_ALIGN)?;
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 pub mod copy2d {
     pub struct Kernel(pub &'static str);
     pub const FLOAT: Kernel = Kernel("copy2d_f32");

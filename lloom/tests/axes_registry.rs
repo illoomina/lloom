@@ -25,6 +25,7 @@ const EXPECTED_AXES: &[&str] = &[
     "GemvSilu",
     "KvAppend",
     "KvQuant",
+    "QkvLayout",
     "ScratchSizing",
     #[cfg(feature = "metal")]
     "SiluImpl",

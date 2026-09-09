@@ -1261,10 +1261,143 @@ struct is_valid_simd_type<RMS<T>, typename metal::enable_if_t<is_valid_simd_t<T>
     static constant constexpr bool value = true;
 };
 
+// The store half of RMSNorm, as a functor, so the reduction above it is
+// written once and the two ways a row leaves the kernel are selected by type
+// (§8.1b, CONTRIBUTING §3.6): `StoreNorm` writes the normalised row, and
+// `StoreRope<T>` writes it rotated -- rms_norm + rope in ONE dispatch, the
+// norm-seam fusion of `DESIGN.md` §12.2 row 6 (the GEMV seam it names fails
+// G2/G3, §12.2e; this seam does not).
+//
+// The normalised element is computed by ONE expression for both stores, so
+// the rounding is the shipping kernel's: `T(float(src) * total * float(alpha))`.
+struct StoreNorm {};
+
+template<typename T>
+struct StoreRope {
+    device const T *cos;
+    device const T *sin;
+    // Rows are `(b, h, t)` row-major, so a row's position is `dst_id % t_len`
+    // and its cos/sin row is that position (`rope`'s own `i_cs`, `stride_b` 0).
+    uint t_len;
+};
+
+// A value of `T` with exactly `T`'s precision. Under fast math the compiler
+// elides a `T(float)` conversion inside an expression and carries the value
+// in excess precision (measured: `T(x) * 1 - y * 0` differed from the stored
+// `T(x)` in 3 of 256 halves), and a plain `as_type` round trip is folded
+// away with it. Passing the bits through a `volatile` slot is not: the
+// integer is materialised, and what comes back is a `T` the compiler knows
+// nothing more about.
+template<typename T> struct bits_of;
+template<> struct bits_of<half> { typedef ushort type; };
+template<> struct bits_of<float> { typedef uint type; };
+#if defined(__HAVE_BFLOAT__)
+template<> struct bits_of<bfloat> { typedef ushort type; };
+#endif
+
+template<typename T>
+METAL_FUNC T rounded_to(T v) {
+    typedef typename bits_of<T>::type B;
+    volatile thread B slot = as_type<B>(v);
+    B b = slot;
+    return as_type<T>(b);
+}
+
+template<typename T, typename Indexer>
+METAL_FUNC T rms_norm_element(
+    device const T *src,
+    device const T *alpha,
+    const float total,
+    const uint i,
+    const uint offset,
+    Indexer indexer
+) {
+    if (alpha == nullptr) {
+        return static_cast<T>(static_cast<float>(src[indexer(i)]) * total);
+    }
+    return static_cast<T>(
+        static_cast<float>(src[indexer(i)]) * total * static_cast<float>(alpha[i - offset]));
+}
+
+// Fused single-round: keep `total` (the f32 rsqrt) in f32 through the
+// multiply and round ONCE at the store, rather than rounding `total` to T
+// first (and the product again). Measured MORE accurate than the
+// round-the-intermediate form -- closer to the f64 truth in 35 % of cases
+// against ~0 % -- because the two-kernel path this used to match rounds an
+// intermediate it need not. `DESIGN.md` §2.3.3c: the incumbent reference is
+// not ground truth, and here it is the worse discretisation.
+template<typename T, ushort BLOCKSIZE, typename Indexer>
+METAL_FUNC void rms_norm_store(
+    StoreNorm,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    const float total,
+    const uint offset,
+    const uint stop_idx,
+    const uint tid,
+    const uint dst_id,
+    Indexer indexer
+) {
+    const uint idx = tid + offset;
+    #pragma clang loop unroll(full)
+    for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
+        dst[i] = rms_norm_element<T, Indexer>(src, alpha, total, i, offset, indexer);
+    }
+}
+
+// Requires `2 * BLOCKSIZE == el_per_block` (a power-of-two `head_dim` whose
+// half fits one threadgroup): thread `tid` then holds exactly the pair
+// `(tid, tid + d/2)` the rotation reads, so the rotation needs no second pass
+// and no threadgroup exchange. The host refuses any other geometry. The
+// arithmetic is `rope.metal`'s, in `T`, on the ROUNDED normalised values --
+// what a separate `rope` dispatch would have read back.
+template<typename T, ushort BLOCKSIZE, typename Indexer>
+METAL_FUNC void rms_norm_store(
+    StoreRope<T> rope,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    const float total,
+    const uint offset,
+    const uint stop_idx,
+    const uint tid,
+    const uint dst_id,
+    Indexer indexer
+) {
+    const uint i0 = offset + tid;
+    const uint i1 = i0 + BLOCKSIZE;
+    if (i1 >= stop_idx) {
+        return;
+    }
+    // The normalised values are ROUNDED to `T` before the rotation, as the
+    // separate `rope` dispatch would have read them back: the compiler keeps
+    // a `T(float)` in excess precision otherwise, and the rotation of an
+    // unrounded value differs from `rope.metal`'s in the last bit (measured:
+    // 780 of 1920 f16 elements). Reinterpreting the bits pins the rounding.
+    const T v0 = rounded_to<T>(rms_norm_element<T, Indexer>(src, alpha, total, i0, offset, indexer));
+    const T v1 = rounded_to<T>(rms_norm_element<T, Indexer>(src, alpha, total, i1, offset, indexer));
+    const uint i_cs = (dst_id % rope.t_len) * BLOCKSIZE + tid;
+    const T c = rope.cos[i_cs];
+    const T s = rope.sin[i_cs];
+    // `rope.metal` writes `a * c - b * s` and `a * s + b * c`. Measured, the
+    // compiler rounds the product with `s` to `T` and fuses the product with
+    // `c` into the add on both lines (960 of 960 pairs match that form and
+    // no other). Spelled out so this kernel rounds where the separate
+    // dispatch does. The cast is a no-op at `half`/`float`; `bfloat`'s `fma`
+    // shim returns `float`.
+    const T p1 = rounded_to<T>(v1 * s);
+    const T p0 = rounded_to<T>(v0 * s);
+    dst[i0] = static_cast<T>(fma(v0, c, -p1));
+    dst[i1] = static_cast<T>(fma(v1, c, p0));
+}
+
 // Kernels
 template<
     typename T,
-    ushort BLOCKSIZE
+    ushort BLOCKSIZE,
+    typename Indexer,
+    typename Store
 >
 METAL_FUNC void rms_norm(
     const uint src_numel,
@@ -1275,12 +1408,12 @@ METAL_FUNC void rms_norm(
     const float eps,
     threadgroup RMS<float> shared[BLOCKSIZE],
     threadgroup float &total,
+    Indexer indexer,
+    Store store,
 
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]]
 ) {
-    using Indexer = indexer_t<uint, false>;
-    Indexer indexer;
     Divide fast_divide;
     loader<T, RMS<float>, RMSLoadOp<float>, BLOCKSIZE,  Indexer, uint> load;
     block_reducer<RMS<float>, RMSReduceOp<float>, BLOCKSIZE> reduce(shared);
@@ -1288,7 +1421,6 @@ METAL_FUNC void rms_norm(
     // Calculate offset for the threadgroup of current thread
     const uint offset = dst_id * el_per_block;
     const uint stop_idx = min(el_per_block + offset, src_numel);
-    const uint idx = tid + offset;
 
     // Load with reduction from global memory into shared memory
     RMS<float> value = load(
@@ -1309,28 +1441,13 @@ METAL_FUNC void rms_norm(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Fused single-round: keep `total` (the f32 rsqrt) in f32 through the
-    // multiply and round ONCE at the store, rather than rounding `total` to T
-    // first (and the product again). Measured MORE accurate than the
-    // round-the-intermediate form — closer to the f64 truth in 35 % of cases
-    // against ~0 % — because the two-kernel path this used to match rounds an
-    // intermediate it need not. `DESIGN.md` §2.3.3c: the incumbent reference is
-    // not ground truth, and here it is the worse discretisation.
-    if (alpha == nullptr) {
-        #pragma clang loop unroll(full)
-        for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
-            dst[i] = static_cast<T>(static_cast<float>(src[i]) * total);
-        }
-    } else {
-        #pragma clang loop unroll(full)
-        for (uint i = idx; i < stop_idx; i += BLOCKSIZE) {
-            dst[i] = static_cast<T>(
-                static_cast<float>(src[i]) * total * static_cast<float>(alpha[i - offset]));
-        }
-    }
+    rms_norm_store<T, BLOCKSIZE, Indexer>(
+        store, src, dst, alpha, total, offset, stop_idx, tid, dst_id, indexer);
 }
 
 
+// `indexer` and `store` are the enclosing entry point's, so one switch serves
+// the contiguous, strided and rotated forms.
 #define rms_norm_case(N)                                \
 case N: {                                               \
     threadgroup RMS<float> shared[N];                   \
@@ -1344,6 +1461,8 @@ case N: {                                               \
         eps,                                            \
         shared,                                         \
         total,                                          \
+        indexer,                                        \
+        store,                                          \
         tid,                                            \
         dst_id);                                        \
     break;                                              \
@@ -1380,6 +1499,8 @@ template<typename T>
     uint block_dim [[ threads_per_threadgroup ]]
 ) {
     NormParams p { in_src_numel, in_el_per_block, in_eps };
+    indexer_t<uint, false> indexer;
+    StoreNorm store;
     norm_entry(rms_norm_case)
 }
 
@@ -1394,12 +1515,171 @@ template<typename T>
     uint block_dim [[ threads_per_threadgroup ]]
 ) {
     NormParams p = *pp;
+    indexer_t<uint, false> indexer;
+    StoreNorm store;
     norm_entry(rms_norm_case)
 }
 
-#define init_rms_norm(tname, t)                             \
-    init_kernel("rmsnorm_" #tname, rms_norm_kernel, t)      \
-    init_kernel("rmsnorm_" #tname "_packed", rms_norm_kernel_packed, t)
+// The scalars of the strided and the rotated RMSNorm entry points. One struct
+// for the three, as `NormParams` is one for the two norms: `num_dims` is read
+// by the strided forms and `t_len` by the rotated ones, and binding a field a
+// form does not read keeps the packed block one shape. `dims` and `strides`
+// stay separate bindings for `ReduceParams`'s reason. Mirrored by
+// `NormExtParams` in `kernels/params.rs`.
+struct NormExtParams {
+    uint src_numel;
+    uint num_dims;
+    uint el_per_block;
+    uint t_len;
+    float eps;
+};
+
+#define norm_strided_indexer(PTR)                                       \
+    indexer_t<uint, true, PTR> indexer {                                \
+        p.num_dims, dims, strides, dims[p.num_dims - 1]                 \
+    };
+
+// RMSNorm over a strided source -- a `transpose` view, read where it lies --
+// writing the normalised rows contiguously. The reduction tree, the block
+// size and the rounding are `rms_norm_kernel`'s, line for line; only the
+// address of each source element differs.
+template<typename T>
+[[kernel]] void rms_norm_kernel_strided(
+    constant uint &in_src_numel,
+    constant uint &in_num_dims,
+    constant uint *dims,
+    constant uint *strides,
+    constant uint &in_el_per_block,
+    constant uint &in_t_len,
+    constant float &in_eps,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    NormExtParams p { in_src_numel, in_num_dims, in_el_per_block, in_t_len, in_eps };
+    norm_strided_indexer(constant const uint *)
+    StoreNorm store;
+    norm_entry(rms_norm_case)
+}
+
+template<typename T>
+[[kernel]] void rms_norm_kernel_strided_packed(
+    device const NormExtParams *pp,
+    device const uint *dims,
+    device const uint *strides,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    NormExtParams p = *pp;
+    norm_strided_indexer(device const uint *)
+    StoreNorm store;
+    norm_entry(rms_norm_case)
+}
+
+// RMSNorm + RoPE in one dispatch (`StoreRope`), contiguous and strided source.
+template<typename T>
+[[kernel]] void rms_norm_rope_kernel(
+    constant uint &in_src_numel,
+    constant uint &in_num_dims,
+    constant uint &in_el_per_block,
+    constant uint &in_t_len,
+    constant float &in_eps,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    device const T *cos,
+    device const T *sin,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    NormExtParams p { in_src_numel, in_num_dims, in_el_per_block, in_t_len, in_eps };
+    indexer_t<uint, false> indexer;
+    StoreRope<T> store { cos, sin, p.t_len };
+    norm_entry(rms_norm_case)
+}
+
+template<typename T>
+[[kernel]] void rms_norm_rope_kernel_packed(
+    device const NormExtParams *pp,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    device const T *cos,
+    device const T *sin,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    NormExtParams p = *pp;
+    indexer_t<uint, false> indexer;
+    StoreRope<T> store { cos, sin, p.t_len };
+    norm_entry(rms_norm_case)
+}
+
+template<typename T>
+[[kernel]] void rms_norm_rope_kernel_strided(
+    constant uint &in_src_numel,
+    constant uint &in_num_dims,
+    constant uint *dims,
+    constant uint *strides,
+    constant uint &in_el_per_block,
+    constant uint &in_t_len,
+    constant float &in_eps,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    device const T *cos,
+    device const T *sin,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    NormExtParams p { in_src_numel, in_num_dims, in_el_per_block, in_t_len, in_eps };
+    norm_strided_indexer(constant const uint *)
+    StoreRope<T> store { cos, sin, p.t_len };
+    norm_entry(rms_norm_case)
+}
+
+template<typename T>
+[[kernel]] void rms_norm_rope_kernel_strided_packed(
+    device const NormExtParams *pp,
+    device const uint *dims,
+    device const uint *strides,
+    device const T *src,
+    device T *dst,
+    device const T *alpha,
+    device const T *cos,
+    device const T *sin,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]],
+    uint block_dim [[ threads_per_threadgroup ]]
+) {
+    NormExtParams p = *pp;
+    norm_strided_indexer(device const uint *)
+    StoreRope<T> store { cos, sin, p.t_len };
+    norm_entry(rms_norm_case)
+}
+
+// One row per dtype instantiates the contiguous, strided and rotated forms
+// together, in both binding styles, so an arm cannot exist at one dtype and
+// not another.
+#define init_rms_norm(tname, t)                                                             \
+    init_kernel("rmsnorm_" #tname, rms_norm_kernel, t)                                      \
+    init_kernel("rmsnorm_" #tname "_packed", rms_norm_kernel_packed, t)                     \
+    init_kernel("rmsnorm_" #tname "_strided", rms_norm_kernel_strided, t)                   \
+    init_kernel("rmsnorm_" #tname "_strided_packed", rms_norm_kernel_strided_packed, t)     \
+    init_kernel("rmsnorm_rope_" #tname, rms_norm_rope_kernel, t)                            \
+    init_kernel("rmsnorm_rope_" #tname "_packed", rms_norm_rope_kernel_packed, t)           \
+    init_kernel("rmsnorm_rope_" #tname "_strided", rms_norm_rope_kernel_strided, t)         \
+    init_kernel("rmsnorm_rope_" #tname "_strided_packed", rms_norm_rope_kernel_strided_packed, t)
 
 ///////////////////////////////////////////////////////////////////////////////
 /// RMSNorm, reduction half only (issue #266, `DESIGN.md` §12.2 #2)
@@ -1767,14 +2047,17 @@ static_assert(alignof(SoftmaxParams) == 4, "SoftmaxParams alignment");
 static_assert(sizeof(NormParams) == 12, "NormParams layout");
 static_assert(alignof(NormParams) == 4, "NormParams alignment");
 
+static_assert(sizeof(NormExtParams) == 20, "NormExtParams layout");
+static_assert(alignof(NormExtParams) == 4, "NormExtParams alignment");
+
 // Reports each struct's size and every field's offset *as the compiled kernel
 // sees them*, for the host-side layout test to compare against Rust's own
 // figures. A `static_assert` proves the device side is self-consistent; only
 // shipping the numbers across the boundary proves the two sides agree, which is
 // the failure this exists to catch.
 //
-// Writes 11 slots; see `LAYOUT_SLOTS` in `kernels/params.rs` for what each
-// index means. The two orderings are declared once each, and the test fails if
+// Writes 17 slots; see `expected_reduce_layout` in `kernels/params.rs` for
+// what each index means. The two orderings are declared once each, and the test fails if
 // they disagree.
 //
 // The offset is taken from a real `thread` instance rather than the usual
@@ -1791,6 +2074,7 @@ static_assert(alignof(NormParams) == 4, "NormParams alignment");
     ReduceParams  probe_ReduceParams;
     SoftmaxParams probe_SoftmaxParams;
     NormParams    probe_NormParams;
+    NormExtParams probe_NormExtParams;
     out[ 0] = sizeof(ReduceParams);
     out[ 1] = offsetof_rt(ReduceParams, src_numel);
     out[ 2] = offsetof_rt(ReduceParams, num_dims);
@@ -1804,6 +2088,13 @@ static_assert(alignof(NormParams) == 4, "NormParams alignment");
     out[ 8] = offsetof_rt(NormParams, src_numel);
     out[ 9] = offsetof_rt(NormParams, el_per_block);
     out[10] = offsetof_rt(NormParams, eps);
+
+    out[11] = sizeof(NormExtParams);
+    out[12] = offsetof_rt(NormExtParams, src_numel);
+    out[13] = offsetof_rt(NormExtParams, num_dims);
+    out[14] = offsetof_rt(NormExtParams, el_per_block);
+    out[15] = offsetof_rt(NormExtParams, t_len);
+    out[16] = offsetof_rt(NormExtParams, eps);
 }
 
 init_rms_norm(f32, float)

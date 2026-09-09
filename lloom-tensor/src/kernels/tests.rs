@@ -2840,10 +2840,11 @@ fn reduce_names_resolve() {
     // its variants — an all-green run over zero names would otherwise pass.
     // 6 dtypes each for sum, mul, min, max, argmin and argmax in both their
     // contiguous and strided forms (12 families), plus 3 float dtypes each for
-    // softmax, rmsnorm, layernorm, rope, rope_i and rope_thd.
+    // softmax, rmsnorm, rmsnorm_strided, rmsnorm_rope, rmsnorm_rope_strided,
+    // layernorm, rope, rope_i and rope_thd.
     assert_eq!(
-        checked, 90,
-        "expected 90 declared reduce variants, found {checked}"
+        checked, 99,
+        "expected 99 declared reduce variants, found {checked}"
     );
 }
 
@@ -2893,6 +2894,9 @@ fn reduce_undeclared_dtype_has_no_name() {
     for family in [
         ReduceKernel::SOFTMAX,
         ReduceKernel::RMSNORM,
+        ReduceKernel::RMSNORM_STRIDED,
+        ReduceKernel::RMSNORM_ROPE,
+        ReduceKernel::RMSNORM_ROPE_STRIDED,
         ReduceKernel::LAYERNORM,
         ReduceKernel::ROPE,
         ReduceKernel::ROPE_I,
@@ -3226,8 +3230,8 @@ fn packed_names_resolve() {
         }
     }
     assert_eq!(
-        checked, 90,
-        "expected a packed counterpart for all 90 declared variants, found {checked}"
+        checked, 99,
+        "expected a packed counterpart for all 99 declared variants, found {checked}"
     );
 }
 
@@ -5285,7 +5289,7 @@ fn every_family_params_layout_matches_metal() {
         // `reduce.metal` into `rope/rope.metal` — 15 slots left with them. A
         // split is as deliberate as an addition and moves this number the same
         // way; the residual reports 11 (ReduceParams, SoftmaxParams, NormParams).
-        ("reduce.metal", 11),
+        ("reduce.metal", 17),
         // The three RoPE structs, split out of `reduce.metal` by #659. 15 slots:
         // RopeIParams (4), RopeParams (5), RopeThdParams (6), each a `sizeof`
         // plus its fields. One layout kernel reports all three, the `Flash` shape.
@@ -9091,21 +9095,24 @@ fn eos_index_matches_the_scalar_scan() {
     // A spread of windows: no match, match at the end, match in the middle,
     // match at 0, multiple matches (first wins), and non-power-of-two lengths.
     let windows: &[&[u32]] = &[
-        &[1, 3, 4, 5],           // none -> n
-        &[1, 3, 4, 7],           // match at 3
-        &[1, 7, 4, 5],           // match at 1
-        &[2, 3, 4, 5],           // match at 0
-        &[7, 2, 100, 7],         // multiple -> first (0)
-        &[1, 3, 4, 5, 6],        // n=5 (width padded to 8), none
-        &[1, 3, 4, 5, 100],      // n=5, match at 4 (the last real lane)
-        &[3, 3, 3, 3, 3, 3, 7],  // n=7, match at 6
-        &[100],                  // n=1, match at 0
-        &[5],                    // n=1, none
+        &[1, 3, 4, 5],          // none -> n
+        &[1, 3, 4, 7],          // match at 3
+        &[1, 7, 4, 5],          // match at 1
+        &[2, 3, 4, 5],          // match at 0
+        &[7, 2, 100, 7],        // multiple -> first (0)
+        &[1, 3, 4, 5, 6],       // n=5 (width padded to 8), none
+        &[1, 3, 4, 5, 100],     // n=5, match at 4 (the last real lane)
+        &[3, 3, 3, 3, 3, 3, 7], // n=7, match at 6
+        &[100],                 // n=1, match at 0
+        &[5],                   // n=1, none
     ];
     for w in windows {
         let got = run_eos_index(w, &eos);
         let want = eos_index_reference(w, &eos);
-        assert_eq!(got, want, "eos_index disagreed with the scan on window {w:?}");
+        assert_eq!(
+            got, want,
+            "eos_index disagreed with the scan on window {w:?}"
+        );
     }
 }
 
@@ -9116,7 +9123,11 @@ fn eos_index_is_deterministic() {
     let first = run_eos_index(&w, &eos);
     assert_eq!(first, 2);
     for _ in 0..8 {
-        assert_eq!(run_eos_index(&w, &eos), first, "eos_index must be deterministic");
+        assert_eq!(
+            run_eos_index(&w, &eos),
+            first,
+            "eos_index must be deterministic"
+        );
     }
 }
 
@@ -9158,10 +9169,18 @@ fn eos_index_honours_the_token_offset() {
     // slot 6 = window index 2. A dispatch ignoring the offset would scan [0..4)
     // (slots 1,2,3,4 — no 7) and wrongly report "none" (n=4).
     let buffer = [1u32, 2, 3, 4, 5, 9, 7, 8, 100, 100];
-    assert_eq!(run_eos_index_at(&buffer, 4, 4, &eos), 2, "must scan the window at the offset");
+    assert_eq!(
+        run_eos_index_at(&buffer, 4, 4, &eos),
+        2,
+        "must scan the window at the offset"
+    );
     // A window with no EOS at its offset returns n even though an EOS exists
     // OUTSIDE the window (slot 6): window [0..4) has no 7.
-    assert_eq!(run_eos_index_at(&buffer, 0, 4, &eos), 4, "must not see EOS outside the window");
+    assert_eq!(
+        run_eos_index_at(&buffer, 0, 4, &eos),
+        4,
+        "must not see EOS outside the window"
+    );
 }
 
 #[test]
@@ -9172,5 +9191,745 @@ fn eos_index_mutation_a_broken_min_would_fail() {
     // is caught rather than passing silently.
     let eos = [7u32];
     let w = [7u32, 1, 2, 7]; // matches at 0 and 3; MIN=0, a broken MAX would give 3
-    assert_eq!(run_eos_index(&w, &eos), 0, "must return the FIRST match, not the last");
+    assert_eq!(
+        run_eos_index(&w, &eos),
+        0,
+        "must return the FIRST match, not the last"
+    );
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// RMSNorm over a strided source, RMSNorm + RoPE in one dispatch, and the
+// strided-to-strided copy (`DESIGN.md` §12.2p). Each is checked against the
+// kernels it replaces, bit for bit, and each carries a control that proves
+// the new binding is read (`CONTRIBUTING.md` §3.1a, §3.1b).
+///////////////////////////////////////////////////////////////////////////////
+
+/// A `[b, t, h, d]` contiguous buffer, and the `[b, h, t, d]` view of it a
+/// `transpose(1, 2)` produces: the geometry `Attention::project` hands the
+/// norms at `seq_len > 1`.
+struct Bthd {
+    b: usize,
+    t: usize,
+    h: usize,
+    d: usize,
+}
+
+impl Bthd {
+    fn numel(&self) -> usize {
+        self.b * self.t * self.h * self.d
+    }
+    /// Shape and strides of the transposed view.
+    fn bhtd_view(&self) -> (Vec<usize>, Vec<usize>) {
+        (
+            vec![self.b, self.h, self.t, self.d],
+            vec![self.t * self.h * self.d, self.d, self.h * self.d, 1],
+        )
+    }
+    /// The transposed view materialised on the host, row-major `[b, h, t, d]`.
+    fn transpose_host<T: Copy>(&self, bthd: &[T]) -> Vec<T> {
+        let mut out = Vec::with_capacity(self.numel());
+        for bi in 0..self.b {
+            for hi in 0..self.h {
+                for ti in 0..self.t {
+                    let base = ((bi * self.t + ti) * self.h + hi) * self.d;
+                    out.extend_from_slice(&bthd[base..base + self.d]);
+                }
+            }
+        }
+        out
+    }
+}
+
+trait FromF32: Copy {
+    fn from_f32(v: f32) -> Self;
+}
+impl FromF32 for f16 {
+    fn from_f32(v: f32) -> Self {
+        f16::from_f32(v)
+    }
+}
+impl FromF32 for f32 {
+    fn from_f32(v: f32) -> Self {
+        v
+    }
+}
+
+fn ramp<T: FromF32>(n: usize, seed: usize) -> Vec<T> {
+    (0..n)
+        .map(|i| T::from_f32((((i * 53 + seed) % 89) as f32 - 44.0) / 17.0))
+        .collect()
+}
+
+trait BitEq: Copy {
+    fn bits(self) -> u32;
+}
+impl BitEq for f16 {
+    fn bits(self) -> u32 {
+        self.to_bits() as u32
+    }
+}
+impl BitEq for f32 {
+    fn bits(self) -> u32 {
+        self.to_bits()
+    }
+}
+
+fn assert_bits_equal<T: BitEq + std::fmt::Debug>(what: &str, got: &[T], want: &[T]) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let diff = got
+        .iter()
+        .zip(want)
+        .enumerate()
+        .filter(|(_, (a, b))| a.bits() != b.bits())
+        .count();
+    assert_eq!(
+        diff,
+        0,
+        "{what}: {diff} of {} elements differ; first mismatch (got, want) {:?}",
+        got.len(),
+        got.iter().zip(want).find(|(a, b)| a.bits() != b.bits()),
+    );
+}
+
+fn count_bits_differ<T: BitEq>(a: &[T], b: &[T]) -> usize {
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| x.bits() != y.bits())
+        .count()
+}
+
+fn bo(b: &Buffer) -> BufferOffset<'_> {
+    BufferOffset {
+        buffer: b,
+        offset_in_bytes: 0,
+    }
+}
+
+/// Run the contiguous `rmsnorm_*` over `src` (already `[b, h, t, d]`
+/// row-major), returning the normalised rows.
+fn rmsnorm_contiguous<T: Copy>(
+    device: &Device,
+    kernels: &Kernels,
+    name: &'static str,
+    src: &[T],
+    alpha: &[T],
+    d: usize,
+) -> Vec<T> {
+    let commands = commands(device);
+    let encoder = commands.command_encoder().unwrap();
+    let input = new_buffer(device, src);
+    let alpha_buf = new_buffer(device, alpha);
+    let output = new_buffer(device, src);
+    call_rms_norm(
+        device,
+        &encoder,
+        kernels,
+        name,
+        src.len(),
+        d,
+        1e-5,
+        &input,
+        0,
+        &alpha_buf,
+        0,
+        &output,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<T>(&output, src.len())
+}
+
+/// Run `rmsnorm_*_strided` over `bthd` presented through `(shape, strides)`.
+#[allow(clippy::too_many_arguments)]
+fn rmsnorm_strided<T: Copy>(
+    device: &Device,
+    kernels: &Kernels,
+    name: &'static str,
+    bthd: &[T],
+    shape: &[usize],
+    strides: &[usize],
+    alpha: &[T],
+    style: ParamStyle,
+) -> Vec<T> {
+    let commands = commands(device);
+    let encoder = commands.command_encoder().unwrap();
+    let input = new_buffer(device, bthd);
+    let alpha_buf = new_buffer(device, alpha);
+    let output = new_buffer(device, bthd);
+    call_rms_norm_strided_with(
+        device,
+        &encoder,
+        kernels,
+        name,
+        shape,
+        strides,
+        1e-5,
+        BufferOffset {
+            buffer: &input,
+            offset_in_bytes: 0,
+        },
+        BufferOffset {
+            buffer: &alpha_buf,
+            offset_in_bytes: 0,
+        },
+        &output,
+        style,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<T>(&output, bthd.len())
+}
+
+fn rmsnorm_strided_matches_contiguous_over_a_copy_at<T: FromF32 + BitEq + std::fmt::Debug>(
+    contiguous: &'static str,
+    strided: &'static str,
+) {
+    let device = device();
+    let kernels = Kernels::new();
+    let g = Bthd {
+        b: 2,
+        t: 5,
+        h: 3,
+        d: 64,
+    };
+    let bthd: Vec<T> = ramp(g.numel(), 0);
+    let alpha: Vec<T> = ramp(g.d, 7);
+    let (shape, strides) = g.bhtd_view();
+
+    let want = rmsnorm_contiguous(
+        &device,
+        &kernels,
+        contiguous,
+        &g.transpose_host(&bthd),
+        &alpha,
+        g.d,
+    );
+    let got = rmsnorm_strided(
+        &device,
+        &kernels,
+        strided,
+        &bthd,
+        &shape,
+        &strides,
+        &alpha,
+        ParamStyle::Split,
+    );
+    assert_bits_equal(strided, &got, &want);
+
+    // Control: the strides are read. Swapping the `h` and `t` strides presents
+    // the untransposed rows, which normalise to different values.
+    let wrong = vec![strides[0], strides[2], strides[1], strides[3]];
+    let control = rmsnorm_strided(
+        &device,
+        &kernels,
+        strided,
+        &bthd,
+        &shape,
+        &wrong,
+        &alpha,
+        ParamStyle::Split,
+    );
+    let moved = count_bits_differ(&control, &want);
+    assert!(
+        moved > 0,
+        "{strided}: a wrong stride set must move the output; it moved 0"
+    );
+}
+
+#[test]
+fn rmsnorm_strided_matches_the_contiguous_kernel_over_a_copy() {
+    rmsnorm_strided_matches_contiguous_over_a_copy_at::<f16>("rmsnorm_f16", "rmsnorm_f16_strided");
+    rmsnorm_strided_matches_contiguous_over_a_copy_at::<f32>("rmsnorm_f32", "rmsnorm_f32_strided");
+}
+
+#[test]
+fn packed_matches_split_for_rmsnorm_f16_strided() {
+    let device = device();
+    let kernels = Kernels::new();
+    let g = Bthd {
+        b: 1,
+        t: 4,
+        h: 8,
+        d: 64,
+    };
+    let bthd: Vec<f16> = ramp(g.numel(), 3);
+    let alpha: Vec<f16> = ramp(g.d, 11);
+    let (shape, strides) = g.bhtd_view();
+    let split = rmsnorm_strided(
+        &device,
+        &kernels,
+        "rmsnorm_f16_strided",
+        &bthd,
+        &shape,
+        &strides,
+        &alpha,
+        ParamStyle::Split,
+    );
+    let packed = rmsnorm_strided(
+        &device,
+        &kernels,
+        "rmsnorm_f16_strided",
+        &bthd,
+        &shape,
+        &strides,
+        &alpha,
+        ParamStyle::Packed,
+    );
+    assert_packed_matches_split("rmsnorm_f16_strided", &split, &packed);
+}
+
+/// The two-dispatch reference: `rmsnorm_*` over the transposed copy, then
+/// `rope_*` over its output with `[t, d/2]` tables.
+#[allow(clippy::too_many_arguments)]
+fn rmsnorm_then_rope<T: Copy>(
+    device: &Device,
+    kernels: &Kernels,
+    norm: &'static str,
+    rope: &'static str,
+    g: &Bthd,
+    bhtd: &[T],
+    alpha: &[T],
+    cos: &[T],
+    sin: &[T],
+) -> Vec<T> {
+    let normed = rmsnorm_contiguous(device, kernels, norm, bhtd, alpha, g.d);
+    let commands = commands(device);
+    let encoder = commands.command_encoder().unwrap();
+    let input = new_buffer(device, &normed);
+    let cos_buf = new_buffer(device, cos);
+    let sin_buf = new_buffer(device, sin);
+    let output = new_buffer(device, &normed);
+    call_rope(
+        device,
+        &encoder,
+        kernels,
+        rope,
+        g.b * g.h,
+        g.t * g.d,
+        g.d,
+        0,
+        &input,
+        0,
+        &cos_buf,
+        0,
+        &sin_buf,
+        0,
+        &output,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<T>(&output, normed.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rmsnorm_rope<T: Copy>(
+    device: &Device,
+    kernels: &Kernels,
+    name: &'static str,
+    src: &[T],
+    shape: &[usize],
+    strides: Option<&[usize]>,
+    t_len: usize,
+    alpha: &[T],
+    cos: &[T],
+    sin: &[T],
+    style: ParamStyle,
+) -> Vec<T> {
+    let commands = commands(device);
+    let encoder = commands.command_encoder().unwrap();
+    let input = new_buffer(device, src);
+    let alpha_buf = new_buffer(device, alpha);
+    let cos_buf = new_buffer(device, cos);
+    let sin_buf = new_buffer(device, sin);
+    let output = new_buffer(device, src);
+    call_rms_norm_rope_with(
+        device,
+        &encoder,
+        kernels,
+        name,
+        shape,
+        strides,
+        t_len,
+        1e-5,
+        bo(&input),
+        bo(&alpha_buf),
+        bo(&cos_buf),
+        bo(&sin_buf),
+        &output,
+        style,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec::<T>(&output, src.len())
+}
+
+fn rmsnorm_rope_matches_the_pair_at<T: FromF32 + BitEq + std::fmt::Debug>(
+    norm: &'static str,
+    rope: &'static str,
+    fused: &'static str,
+    fused_strided: &'static str,
+) {
+    let device = device();
+    let kernels = Kernels::new();
+    let g = Bthd {
+        b: 2,
+        t: 5,
+        h: 3,
+        d: 64,
+    };
+    let bthd: Vec<T> = ramp(g.numel(), 0);
+    let bhtd = g.transpose_host(&bthd);
+    let alpha: Vec<T> = ramp(g.d, 7);
+    let cos: Vec<T> = (0..g.t * g.d / 2)
+        .map(|i| T::from_f32(((i * 7) as f32 / 9.0).cos()))
+        .collect();
+    let sin: Vec<T> = (0..g.t * g.d / 2)
+        .map(|i| T::from_f32(((i * 7) as f32 / 9.0).sin()))
+        .collect();
+    let (shape, strides) = g.bhtd_view();
+
+    let want = rmsnorm_then_rope(&device, &kernels, norm, rope, &g, &bhtd, &alpha, &cos, &sin);
+    let got_contig = rmsnorm_rope(
+        &device,
+        &kernels,
+        fused,
+        &bhtd,
+        &shape,
+        None,
+        g.t,
+        &alpha,
+        &cos,
+        &sin,
+        ParamStyle::Split,
+    );
+    assert_bits_equal(fused, &got_contig, &want);
+    let got_strided = rmsnorm_rope(
+        &device,
+        &kernels,
+        fused_strided,
+        &bthd,
+        &shape,
+        Some(&strides),
+        g.t,
+        &alpha,
+        &cos,
+        &sin,
+        ParamStyle::Split,
+    );
+    assert_bits_equal(fused_strided, &got_strided, &want);
+
+    // Controls: the rotation is applied (the fused output is not the bare
+    // norm), and the position is read (a table shifted by one row moves it).
+    let bare = rmsnorm_contiguous(&device, &kernels, norm, &bhtd, &alpha, g.d);
+    assert!(
+        count_bits_differ(&got_contig, &bare) > 0,
+        "{fused}: output equals the unrotated norm"
+    );
+    let mut cos_shift = cos.clone();
+    cos_shift.rotate_left(g.d / 2);
+    let shifted = rmsnorm_rope(
+        &device,
+        &kernels,
+        fused,
+        &bhtd,
+        &shape,
+        None,
+        g.t,
+        &alpha,
+        &cos_shift,
+        &sin,
+        ParamStyle::Split,
+    );
+    assert!(
+        count_bits_differ(&shifted, &want) > 0,
+        "{fused}: a shifted cos table must move the output"
+    );
+}
+
+#[test]
+fn rmsnorm_rope_matches_rmsnorm_then_rope() {
+    rmsnorm_rope_matches_the_pair_at::<f16>(
+        "rmsnorm_f16",
+        "rope_f16",
+        "rmsnorm_rope_f16",
+        "rmsnorm_rope_f16_strided",
+    );
+    rmsnorm_rope_matches_the_pair_at::<f32>(
+        "rmsnorm_f32",
+        "rope_f32",
+        "rmsnorm_rope_f32",
+        "rmsnorm_rope_f32_strided",
+    );
+}
+
+#[test]
+fn rmsnorm_rope_refuses_a_row_its_threadgroup_cannot_pair() {
+    let device = device();
+    let kernels = Kernels::new();
+    // 96 is not a power of two: the threadgroup is 64 wide and thread `tid`
+    // would not hold `(tid, tid + 48)`. The host refuses rather than dispatch.
+    assert!(!rms_norm_rope_applies(&device, &kernels, "rmsnorm_rope_f16", 96).unwrap());
+    assert!(rms_norm_rope_applies(&device, &kernels, "rmsnorm_rope_f16", 64).unwrap());
+    assert!(rms_norm_rope_applies(&device, &kernels, "rmsnorm_rope_f16", 128).unwrap());
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let src: Vec<f16> = ramp(2 * 96, 0);
+    let alpha: Vec<f16> = ramp(96, 1);
+    let table: Vec<f16> = ramp(48, 2);
+    let input = new_buffer(&device, &src);
+    let alpha_buf = new_buffer(&device, &alpha);
+    let cos_buf = new_buffer(&device, &table);
+    let sin_buf = new_buffer(&device, &table);
+    let output = new_buffer(&device, &src);
+    let r = call_rms_norm_rope(
+        &device,
+        &encoder,
+        &kernels,
+        "rmsnorm_rope_f16",
+        &[1, 2, 1, 96],
+        None,
+        1,
+        1e-5,
+        bo(&input),
+        bo(&alpha_buf),
+        bo(&cos_buf),
+        bo(&sin_buf),
+        &output,
+    );
+    assert!(r.is_err(), "a 96-wide row must be refused");
+}
+
+#[test]
+fn packed_matches_split_for_rmsnorm_rope_f16() {
+    let device = device();
+    let kernels = Kernels::new();
+    let g = Bthd {
+        b: 1,
+        t: 3,
+        h: 8,
+        d: 64,
+    };
+    let bthd: Vec<f16> = ramp(g.numel(), 5);
+    let alpha: Vec<f16> = ramp(g.d, 11);
+    let cos: Vec<f16> = ramp(g.t * g.d / 2, 13);
+    let sin: Vec<f16> = ramp(g.t * g.d / 2, 17);
+    let (shape, strides) = g.bhtd_view();
+    for (name, st) in [
+        ("rmsnorm_rope_f16", None),
+        ("rmsnorm_rope_f16_strided", Some(strides.as_slice())),
+    ] {
+        let split = rmsnorm_rope(
+            &device,
+            &kernels,
+            name,
+            &bthd,
+            &shape,
+            st,
+            g.t,
+            &alpha,
+            &cos,
+            &sin,
+            ParamStyle::Split,
+        );
+        let packed = rmsnorm_rope(
+            &device,
+            &kernels,
+            name,
+            &bthd,
+            &shape,
+            st,
+            g.t,
+            &alpha,
+            &cos,
+            &sin,
+            ParamStyle::Packed,
+        );
+        assert_packed_matches_split(name, &split, &packed);
+    }
+}
+
+/// `copy_nd`: a `[b, h, t, d]` transposed view written into a `[b, h, T, d]`
+/// slab at rows `off..off + t` -- the KV append from the projection's own
+/// layout -- against the same write computed on the host.
+#[test]
+fn copy_nd_writes_a_transposed_view_into_a_strided_window() {
+    let device = device();
+    let kernels = Kernels::new();
+    let g = Bthd {
+        b: 2,
+        t: 3,
+        h: 4,
+        d: 8,
+    };
+    let cap = 7usize;
+    let off = 2usize;
+    let src: Vec<f16> = ramp(g.numel(), 0);
+    let (shape, src_strides) = g.bhtd_view();
+    let dst_strides = vec![g.h * cap * g.d, cap * g.d, g.d, 1];
+    let slab_len = g.b * g.h * cap * g.d;
+    let fill: Vec<f16> = vec![f16::from_f32(-9.0); slab_len];
+
+    let mut want = fill.clone();
+    for bi in 0..g.b {
+        for hi in 0..g.h {
+            for ti in 0..g.t {
+                for di in 0..g.d {
+                    let s = bi * src_strides[0] + hi * src_strides[1] + ti * src_strides[2] + di;
+                    let dpos = bi * dst_strides[0]
+                        + hi * dst_strides[1]
+                        + (off + ti) * dst_strides[2]
+                        + di;
+                    want[dpos] = src[s];
+                }
+            }
+        }
+    }
+
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let input = new_buffer(&device, &src);
+    let output = new_buffer(&device, &fill);
+    call_copy_nd(
+        &device,
+        &encoder,
+        &kernels,
+        copy_nd::HALF,
+        &shape,
+        BufferOffset {
+            buffer: &input,
+            offset_in_bytes: 0,
+        },
+        &src_strides,
+        BufferOffset {
+            buffer: &output,
+            offset_in_bytes: off * g.d * 2,
+        },
+        &dst_strides,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    let got = read_to_vec::<f16>(&output, slab_len);
+    assert_bits_equal("copy_nd_f16", &got, &want);
+    // The window is what moved: exactly `numel` slab elements left the fill.
+    let written = got
+        .iter()
+        .filter(|v| v.to_bits() != f16::from_f32(-9.0).to_bits())
+        .count();
+    assert_eq!(
+        written,
+        g.numel(),
+        "copy_nd wrote outside its window or missed part of it"
+    );
+}
+
+/// The host oracle that fixed the fused rotation's rounding (`DESIGN.md`
+/// §12.2p): for each line of the rotation, four candidate roundings of the
+/// pair -- single rounding, both products rounded, and each product rounded
+/// with the other fused -- tallied against the two-dispatch reference and
+/// against the fused kernel. The form the reference takes is the one that
+/// matches every pair; a fused kernel that matches the reference matches the
+/// same form. Ignored: a diagnostic, not a gate -- `rmsnorm_rope_matches_rmsnorm_then_rope`
+/// is the gate.
+#[test]
+#[ignore]
+fn rmsnorm_rope_f16_second_line_diagnostic() {
+    let device = device();
+    let kernels = Kernels::new();
+    let g = Bthd {
+        b: 2,
+        t: 5,
+        h: 3,
+        d: 64,
+    };
+    let bthd: Vec<f16> = ramp(g.numel(), 0);
+    let bhtd = g.transpose_host(&bthd);
+    let alpha: Vec<f16> = ramp(g.d, 7);
+    let cos: Vec<f16> = (0..g.t * g.d / 2)
+        .map(|i| f16::from_f32(((i * 7) as f32 / 9.0).cos()))
+        .collect();
+    let sin: Vec<f16> = (0..g.t * g.d / 2)
+        .map(|i| f16::from_f32(((i * 7) as f32 / 9.0).sin()))
+        .collect();
+    let (shape, _) = g.bhtd_view();
+    let want = rmsnorm_then_rope(
+        &device,
+        &kernels,
+        "rmsnorm_f16",
+        "rope_f16",
+        &g,
+        &bhtd,
+        &alpha,
+        &cos,
+        &sin,
+    );
+    let got = rmsnorm_rope(
+        &device,
+        &kernels,
+        "rmsnorm_rope_f16",
+        &bhtd,
+        &shape,
+        None,
+        g.t,
+        &alpha,
+        &cos,
+        &sin,
+        ParamStyle::Split,
+    );
+    let bare = rmsnorm_contiguous(&device, &kernels, "rmsnorm_f16", &bhtd, &alpha, g.d);
+    let half = g.d / 2;
+    let r = |x: f32| f16::from_f32(x).to_f32();
+    let mut t0 = [0usize; 8];
+    let mut t1 = [0usize; 8];
+    let (mut m0, mut m1) = (0, 0);
+    for row in 0..(g.b * g.h * g.t) {
+        let t = row % g.t;
+        for i in 0..half {
+            let i0 = row * g.d + i;
+            let i1 = i0 + half;
+            let (v0, v1) = (bare[i0].to_f32(), bare[i1].to_f32());
+            let (c, s) = (cos[t * half + i].to_f32(), sin[t * half + i].to_f32());
+            let c0 = [
+                f16::from_f32(v0 * c - v1 * s),       // single
+                f16::from_f32(r(v0 * c) - r(v1 * s)), // halfops
+                f16::from_f32(v0 * c - r(v1 * s)),    // fma(v0,c,-r(v1 s))
+                f16::from_f32(r(v0 * c) - v1 * s),    // fma(-v1,s,r(v0 c))
+            ];
+            let c1 = [
+                f16::from_f32(v0 * s + v1 * c),
+                f16::from_f32(r(v0 * s) + r(v1 * c)),
+                f16::from_f32(v0 * s + r(v1 * c)), // fma(v0,s,r(v1 c))
+                f16::from_f32(r(v0 * s) + v1 * c), // fma(v1,c,r(v0 s))
+            ];
+            if got[i0].to_bits() != want[i0].to_bits() {
+                m0 += 1;
+            }
+            if got[i1].to_bits() != want[i1].to_bits() {
+                m1 += 1;
+            }
+            for k in 0..4 {
+                if c0[k].to_bits() == want[i0].to_bits() {
+                    t0[k] += 1;
+                }
+                if c0[k].to_bits() == got[i0].to_bits() {
+                    t0[4 + k] += 1;
+                }
+                if c1[k].to_bits() == want[i1].to_bits() {
+                    t1[k] += 1;
+                }
+                if c1[k].to_bits() == got[i1].to_bits() {
+                    t1[4 + k] += 1;
+                }
+            }
+        }
+    }
+    let n = g.b * g.h * g.t * half;
+    eprintln!("pairs={n} mismatches i0={m0} i1={m1}");
+    eprintln!("i0 want: {:?}  got: {:?}", &t0[..4], &t0[4..]);
+    eprintln!("i1 want: {:?}  got: {:?}", &t1[..4], &t1[4..]);
 }

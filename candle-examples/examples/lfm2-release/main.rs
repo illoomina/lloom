@@ -256,6 +256,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     conv_prefill_ctx: bool,
 
+    /// How the Q/K/V `transpose` views reach the norms and the KV append
+    /// (`QkvLayout`, `DESIGN.md` §6.2c): `contiguous`, `strided` or `fused`. Rendered on
+    /// the `RESULT` line from `config`.
+    #[arg(long, default_value = "contiguous")]
+    qkv_layout: String,
+
     /// Forward passes the host may enqueue before it has learned the previous
     /// step's EOS, on `--token-ring` runs: `0` (the incumbent order — publish,
     /// wait, then encode the next forward) or `1` (encode the next forward,
@@ -731,6 +737,9 @@ fn main() -> Result<()> {
     // `ShortConv::new`, so it must be set before `Model::new` below, and
     // rendered from `config` on the `RESULT` line (§7.1a-i).
     config.conv_prefill_ctx = args.conv_prefill_ctx;
+    // Read by `Attention::new`, so before `Model::new`; rendered from `config`.
+    config.qkv_layout =
+        lloom::models::lfm2::QkvLayout::parse(&args.qkv_layout).map_err(anyhow::Error::msg)?;
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
@@ -1437,6 +1446,9 @@ fn main() -> Result<()> {
         // #677: the conv writer's left context across a multi-token pass,
         // read back from `config` (`ShortConv::new` consumed it).
         ("ConvPrefillCtx", on_off(config.conv_prefill_ctx)),
+        // The Q/K/V layout arm, read back from `config` (`Attention::new`
+        // consumed it).
+        ("QkvLayout", config.qkv_layout.as_str().to_string()),
         ("TokenRing", on_off(arms.token_ring)),
         ("Poll", poll_arm),
         ("NonblockingEos", on_off(arms.nonblocking_eos)),
@@ -1472,7 +1484,7 @@ fn main() -> Result<()> {
          gemv_silu={} gemv_residual={} conv_fused={} \
          lookahead={} commit_budget={} commits={} overrun={} rewound={} \
          in_flight_steps={} step_markers={} step_waits={} eos_read={} ring_discarded={} \
-         conv_prefill_ctx={} config=[{}] token_digest={}",
+         conv_prefill_ctx={} qkv_layout={} config=[{}] token_digest={}",
         args.n,
         args.warmup,
         turns_run,
@@ -1531,6 +1543,7 @@ fn main() -> Result<()> {
         eos_read,
         ring_discarded,
         config.conv_prefill_ctx,
+        config.qkv_layout.as_str(),
         config_line,
         token_digest
     );

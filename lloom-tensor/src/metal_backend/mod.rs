@@ -2086,6 +2086,53 @@ impl BackendStorage for MetalStorage {
         Ok(())
     }
 
+    fn copy_strided_to(&self, dst: &mut Self, src_l: &Layout, dst_l: &Layout) -> Result<bool> {
+        if src_l.shape() != dst_l.shape() {
+            crate::bail!(
+                "copy_strided_to: shape mismatch {:?} vs {:?}",
+                src_l.shape(),
+                dst_l.shape()
+            )
+        }
+        if self.dtype != dst.dtype() {
+            crate::bail!(
+                "copy_strided_to with inconsistent dtypes {:?} {:?}",
+                self.dtype,
+                dst.dtype()
+            )
+        }
+        if src_l.shape().elem_count() == 0 {
+            return Ok(true);
+        }
+        let kernel_name = match self.dtype {
+            DType::F32 => crate::kernels::copy_nd::FLOAT,
+            DType::F16 => crate::kernels::copy_nd::HALF,
+            DType::BF16 => crate::kernels::copy_nd::BFLOAT,
+            DType::I64 => crate::kernels::copy_nd::I64,
+            DType::I32 => crate::kernels::copy_nd::I32,
+            DType::I16 => crate::kernels::copy_nd::I16,
+            DType::U32 => crate::kernels::copy_nd::U32,
+            DType::U8 => crate::kernels::copy_nd::U8,
+            _ => return Ok(false),
+        };
+        let src = buffer_o(&self.buffer, src_l, self.dtype);
+        let out = buffer_o(&dst.buffer, dst_l, dst.dtype);
+        let encoder = self.device.command_encoder()?;
+        crate::kernels::call_copy_nd(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            kernel_name,
+            src_l.dims(),
+            src,
+            src_l.stride(),
+            out,
+            dst_l.stride(),
+        )
+        .map_err(MetalError::from)?;
+        Ok(true)
+    }
+
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
         if src_l.is_contiguous() && self.dtype == dst.dtype() {
             let mut blit = self.device.blit_command_encoder()?;

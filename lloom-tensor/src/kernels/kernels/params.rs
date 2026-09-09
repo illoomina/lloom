@@ -86,6 +86,21 @@ pub struct NormParams {
     pub eps: f32,
 }
 
+/// Scalars bound by the strided and the rotated RMSNorm entry points
+/// (`rms_norm_kernel_strided`, `rms_norm_rope_kernel[_strided]`). One struct
+/// for the three, as [`NormParams`] is one for the two norms: `num_dims` is
+/// read by the strided forms and `t_len` by the rotated ones. `dims` and
+/// `strides` are separate bindings, for [`ReduceParams`]'s reason.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NormExtParams {
+    pub src_numel: u32,
+    pub num_dims: u32,
+    pub el_per_block: u32,
+    pub t_len: u32,
+    pub eps: f32,
+}
+
 /// Scalars bound by `rope_i_kernel`. `u64` mirrors MSL's 8-byte `size_t`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1388,6 +1403,7 @@ pub fn expected_reduce_layout() -> Vec<(&'static str, u32)> {
     debug_assert_eq!(align_of::<ReduceParams>(), 4);
     debug_assert_eq!(align_of::<SoftmaxParams>(), 4);
     debug_assert_eq!(align_of::<NormParams>(), 4);
+    debug_assert_eq!(align_of::<NormExtParams>(), 4);
 
     vec![
         ("sizeof(ReduceParams)", size_of::<ReduceParams>() as u32),
@@ -1422,6 +1438,24 @@ pub fn expected_reduce_layout() -> Vec<(&'static str, u32)> {
             offset_of!(NormParams, el_per_block) as u32,
         ),
         ("NormParams.eps", offset_of!(NormParams, eps) as u32),
+        ("sizeof(NormExtParams)", size_of::<NormExtParams>() as u32),
+        (
+            "NormExtParams.src_numel",
+            offset_of!(NormExtParams, src_numel) as u32,
+        ),
+        (
+            "NormExtParams.num_dims",
+            offset_of!(NormExtParams, num_dims) as u32,
+        ),
+        (
+            "NormExtParams.el_per_block",
+            offset_of!(NormExtParams, el_per_block) as u32,
+        ),
+        (
+            "NormExtParams.t_len",
+            offset_of!(NormExtParams, t_len) as u32,
+        ),
+        ("NormExtParams.eps", offset_of!(NormExtParams, eps) as u32),
     ]
 }
 

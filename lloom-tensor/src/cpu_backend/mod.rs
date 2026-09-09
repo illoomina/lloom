@@ -988,6 +988,14 @@ fn kv_scatter_<T: Copy>(src: &[T], dst: &mut [T], slots: &[u32], g: &crate::KvSc
     }
 }
 
+fn copy_strided_to_<T: Copy>(src: &[T], dst: &mut [T], src_l: &Layout, dst_l: &Layout) {
+    let src_idx = crate::StridedIndex::from_layout(src_l);
+    let dst_idx = crate::StridedIndex::from_layout(dst_l);
+    for (s, d) in src_idx.zip(dst_idx) {
+        dst[d] = src[s];
+    }
+}
+
 fn copy_strided_src_<T: Copy>(src: &[T], dst: &mut [T], dst_offset: usize, src_l: &Layout) {
     match src_l.strided_blocks() {
         crate::StridedBlocks::SingleBlock { start_offset, len } => dst
@@ -2782,6 +2790,41 @@ impl BackendStorage for CpuStorage {
             }
         }
         Ok(())
+    }
+
+    fn copy_strided_to(&self, dst: &mut Self, src_l: &Layout, dst_l: &Layout) -> Result<bool> {
+        if src_l.shape() != dst_l.shape() {
+            crate::bail!(
+                "copy_strided_to: shape mismatch {:?} vs {:?}",
+                src_l.shape(),
+                dst_l.shape()
+            )
+        }
+        match (self, dst) {
+            (Self::U8(src), Self::U8(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::U32(src), Self::U32(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::I16(src), Self::I16(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::I32(src), Self::I32(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::I64(src), Self::I64(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::BF16(src), Self::BF16(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::F16(src), Self::F16(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::F32(src), Self::F32(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::F64(src), Self::F64(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::F8E4M3(src), Self::F8E4M3(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::F6E2M3(src), Self::F6E2M3(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::F6E3M2(src), Self::F6E3M2(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::F4(src), Self::F4(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (Self::F8E8M0(src), Self::F8E8M0(dst)) => copy_strided_to_(src, dst, src_l, dst_l),
+            (_, dst) => {
+                return Err(Error::DTypeMismatchBinaryOp {
+                    lhs: self.dtype(),
+                    rhs: dst.dtype(),
+                    op: "copy_strided_to",
+                }
+                .bt());
+            }
+        }
+        Ok(true)
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {

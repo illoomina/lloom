@@ -392,6 +392,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     conv_fused: bool,
 
+    /// How the Q/K/V `transpose` views reach the norms and the KV append
+    /// (`QkvLayout`, `DESIGN.md` §6.2c): `contiguous`, `strided` or `fused`. Every arm is
+    /// meant to leave both digests where `contiguous` has them.
+    #[arg(long, default_value = "contiguous")]
+    qkv_layout: String,
+
     /// Carry the conv state across a turn-boundary prefill as the convolution's
     /// left context (`ConvPrefillCtx`, `DESIGN.md` §13.2f defect 1, #677). Off,
     /// every `--turns >= 2` pass zero-pads where the previous turn's last
@@ -709,6 +715,9 @@ fn main() -> Result<()> {
     config.gemv_residual = args.gemv_residual;
     config.conv_fused = args.conv_fused;
     config.conv_prefill_ctx = args.conv_prefill_ctx;
+    config.qkv_layout =
+        lloom::models::lfm2::QkvLayout::parse(&args.qkv_layout).map_err(anyhow::Error::msg)?;
+    println!("qkv layout: {:?}", config.qkv_layout);
     println!(
         "gemv epilogue: silu={} residual={}",
         config.gemv_silu, config.gemv_residual

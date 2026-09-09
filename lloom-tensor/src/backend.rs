@@ -139,6 +139,15 @@ pub trait BackendStorage: Sized {
 
     fn copy_strided_src(&self, _: &mut Self, _: usize, _: &Layout) -> Result<()>;
 
+    /// Copy `src_l`'s elements of `self` into `dst_l`'s positions of `dst`,
+    /// both layouts of one shape and either of them strided. The `Option` is
+    /// the same shape as `conv1d_depthwise`'s decline: `Ok(false)` means the
+    /// backend has no such copy and the caller materialises the source; a
+    /// backend that returns `Ok(true)` has written every element.
+    fn copy_strided_to(&self, _: &mut Self, _src_l: &Layout, _dst_l: &Layout) -> Result<bool> {
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     // Similar to cudaMemcpy2D, though values are in elements and not in bytes.
     fn copy2d(

@@ -129,6 +129,44 @@ impl ReduceKernel {
         ],
     };
 
+    /// `rms_norm_kernel_strided`: the same reduction over a strided source
+    /// (a `transpose` view read where it lies), writing contiguous rows.
+    pub const RMSNORM_STRIDED: Self = Self {
+        source: crate::kernels::Source::Reduce,
+        stem: "rmsnorm",
+        tail: "_strided",
+        variants: &[
+            ("f32", "rmsnorm_f32_strided"),
+            ("f16", "rmsnorm_f16_strided"),
+            ("bf16", "rmsnorm_bf16_strided"),
+        ],
+    };
+
+    /// `rms_norm_rope_kernel`: RMSNorm and RoPE in one dispatch, over a
+    /// contiguous source.
+    pub const RMSNORM_ROPE: Self = Self {
+        source: crate::kernels::Source::Reduce,
+        stem: "rmsnorm_rope",
+        tail: "",
+        variants: &[
+            ("f32", "rmsnorm_rope_f32"),
+            ("f16", "rmsnorm_rope_f16"),
+            ("bf16", "rmsnorm_rope_bf16"),
+        ],
+    };
+
+    /// `rms_norm_rope_kernel_strided`: the fused form over a strided source.
+    pub const RMSNORM_ROPE_STRIDED: Self = Self {
+        source: crate::kernels::Source::Reduce,
+        stem: "rmsnorm_rope",
+        tail: "_strided",
+        variants: &[
+            ("f32", "rmsnorm_rope_f32_strided"),
+            ("f16", "rmsnorm_rope_f16_strided"),
+            ("bf16", "rmsnorm_rope_bf16_strided"),
+        ],
+    };
+
     pub const LAYERNORM: Self = Self {
         source: crate::kernels::Source::Reduce,
         stem: "layernorm",
@@ -193,6 +231,9 @@ impl ReduceKernel {
         Self::ARGMAX_STRIDED,
         Self::SOFTMAX,
         Self::RMSNORM,
+        Self::RMSNORM_STRIDED,
+        Self::RMSNORM_ROPE,
+        Self::RMSNORM_ROPE_STRIDED,
         Self::LAYERNORM,
         Self::ROPE,
         Self::ROPE_I,

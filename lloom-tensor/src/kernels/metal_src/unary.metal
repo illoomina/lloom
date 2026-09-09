@@ -230,6 +230,58 @@ METAL_FUNC void copy2d_body(
     output[dst_idx] = input[src_idx];
 }
 
+// A copy between two strided layouts of one shape: `output[dst_idx(i)] =
+// input[src_idx(i)]`, both indices through `get_strided_index`. `copy2d` is
+// this with both sides affine in one row index; `copy_*_strided` is this with
+// a contiguous destination. What neither can express is a `transpose` view
+// written into a window of a larger buffer -- a KV append from the
+// projection's own layout -- which is one dispatch here and two otherwise.
+template <typename T, typename PtrT>
+METAL_FUNC void copy_nd_body(
+    size_t dim,
+    size_t num_dims,
+    PtrT dims,
+    PtrT src_strides,
+    PtrT dst_strides,
+    device const T *input,
+    device T *output,
+    uint tid
+) {
+    if (tid >= dim) return;
+    uint src_idx = get_strided_index(tid, num_dims, dims, src_strides);
+    uint dst_idx = get_strided_index(tid, num_dims, dims, dst_strides);
+    output[dst_idx] = input[src_idx];
+}
+
+template <typename T>
+[[kernel]] void copy_nd(
+    constant size_t &dim,
+    constant size_t &num_dims,
+    constant size_t *dims,
+    constant size_t *src_strides,
+    constant size_t *dst_strides,
+    device const T *input,
+    device T *output,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    copy_nd_body<T, constant size_t *>(
+        dim, num_dims, dims, src_strides, dst_strides, input, output, tid);
+}
+
+template <typename T>
+[[kernel]] void copy_nd_packed(
+    device const UnaryStridedParams *pp,
+    device const size_t *dims,
+    device const size_t *src_strides,
+    device const size_t *dst_strides,
+    device const T *input,
+    device T *output,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    copy_nd_body<T, device const size_t *>(
+        pp->dim, pp->num_dims, dims, src_strides, dst_strides, input, output, tid);
+}
+
 template <typename T>
 [[kernel]] void copy2d(
     constant int64_t &d1,
@@ -570,7 +622,9 @@ static_assert(alignof(Copy2dParams) == 8, "Copy2dParams alignment");
 
 #define init_copy2d(tname, t)                                       \
     init_kernel("copy2d_" #tname, copy2d, t)                        \
-    init_kernel("copy2d_" #tname "_packed", copy2d_packed, t)
+    init_kernel("copy2d_" #tname "_packed", copy2d_packed, t)       \
+    init_kernel("copy_nd_" #tname, copy_nd, t)                      \
+    init_kernel("copy_nd_" #tname "_packed", copy_nd_packed, t)
 
 #define init_const_set(tname, t)                                                        \
     init_kernel("const_set_" #tname, const_set, t)                                      \

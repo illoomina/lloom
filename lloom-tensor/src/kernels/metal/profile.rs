@@ -296,20 +296,85 @@ pub fn record_command_buffer(start: f64, end: f64, committed: f64, step: u64) {
 /// 50-dispatch buffer per label is not a kernel's time). Buffers with no
 /// label are reported under `<unlabelled>`.
 pub fn gpu_time_by_label() -> Vec<(String, u64, f64)> {
+    gpu_time_by_label_detailed()
+        .into_iter()
+        .map(|k| (k.label, k.buffers, k.total_s))
+        .collect()
+}
+
+/// One label's command buffers, with the interval DISTRIBUTION beside the sum.
+///
+/// # Why the distribution and not just the total (lloom #727)
+///
+/// `GPUStartTime`/`GPUEndTime` bound a command buffer's **residency on the
+/// GPU**, not its execution. A buffer whose last dispatch is a one-element
+/// `copy2d_u32` measured **14.5 ms** here — four orders above the work —
+/// because the host synchronises inside it and the interval covers the wait.
+/// Summed, that appears as "13.3 ms/step of copy2d_u32" and the real
+/// arithmetic (every GEMV, rmsnorm, conv and attention kernel: **0.55 ms/step
+/// together**) disappears beneath an artifact.
+///
+/// The falsifier that identified it: the inflated label FOLLOWS THE READBACK
+/// ARM. `copy2d_u32` carries it on `ring-gpubatch-nonblocking`, a GEMV that
+/// costs 37 us elsewhere carries 9 907 us on `ring-nonblocking`, and the
+/// `blocking` arm — which syncs outside the buffer — shows every buffer at
+/// ~77 us with no outlier at all.
+///
+/// So the median is the honest per-buffer figure and the max says how much
+/// wait one buffer absorbed. A reader comparing `p50` against `max` sees the
+/// artifact directly instead of inferring it. The total is kept because it is
+/// what a caller summing to a step time needs, but it is no longer offered
+/// alone.
+pub fn gpu_time_by_label_detailed() -> Vec<LabelTiming> {
     let rec = recorder().lock().unwrap();
-    let mut map: HashMap<String, (u64, f64)> = HashMap::new();
+    let mut map: HashMap<String, Vec<f64>> = HashMap::new();
     for r in &rec.records {
         let key = r
             .label
             .as_deref()
             .map_or_else(|| "<unlabelled>".to_string(), str::to_string);
-        let e = map.entry(key).or_insert((0, 0.0));
-        e.0 += 1;
-        e.1 += r.interval.end - r.interval.start;
+        map.entry(key)
+            .or_default()
+            .push(r.interval.end - r.interval.start);
     }
-    let mut v: Vec<(String, u64, f64)> = map.into_iter().map(|(k, (n, t))| (k, n, t)).collect();
-    v.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    let mut v: Vec<LabelTiming> = map
+        .into_iter()
+        .map(|(label, mut xs)| {
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let q = |f: f64| xs[(((xs.len() - 1) as f64) * f) as usize];
+            LabelTiming {
+                label,
+                buffers: xs.len() as u64,
+                total_s: xs.iter().sum(),
+                p50_s: q(0.5),
+                p99_s: q(0.99),
+                max_s: xs[xs.len() - 1],
+            }
+        })
+        .collect();
+    v.sort_by(|a, b| {
+        b.total_s
+            .partial_cmp(&a.total_s)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     v
+}
+
+/// One label's command-buffer intervals: the sum, and the distribution that
+/// says whether the sum is execution or a host wait one buffer absorbed.
+#[derive(Clone, Debug)]
+pub struct LabelTiming {
+    pub label: String,
+    /// Command buffers whose last dispatch carried this label.
+    pub buffers: u64,
+    /// Sum of their intervals — what a step-time breakdown adds up.
+    pub total_s: f64,
+    /// The MEDIAN buffer's interval: the honest per-buffer figure.
+    pub p50_s: f64,
+    pub p99_s: f64,
+    /// The widest single interval. `max >> p50` means one buffer held a wait,
+    /// and this label's `total` is that wait, not this kernel's cost.
+    pub max_s: f64,
 }
 
 /// Merge sorted intervals, returning (union duration, span from first start to last end).

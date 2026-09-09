@@ -2628,21 +2628,46 @@ fn main() -> Result<()> {
         // a buffer is charged to its last kernel, and the `buffers` column
         // (≈ dispatches/50) says so.
         {
-            let by = candle::kernels::metal::profile::gpu_time_by_label();
-            let total: f64 = by.iter().map(|(_, _, t)| *t).sum();
+            let by = candle::kernels::metal::profile::gpu_time_by_label_detailed();
+            let total: f64 = by.iter().map(|k| k.total_s).sum();
             eprintln!(
-                "[profile: gpu time by kernel ({} labels, {:.3} ms/step summed over {:.0} buffers/step; exact iff one dispatch per buffer):",
+                "[profile: gpu time by kernel ({} labels, {:.3} ms/step summed over {:.0} buffers/step; \
+                 exact iff one dispatch per buffer. **p50 is the honest per-buffer figure**: a buffer's \
+                 interval bounds its RESIDENCY, so max >> p50 means that buffer absorbed a host wait and \
+                 this label's total is the wait, not the kernel — lloom #727):",
                 by.len(),
                 1e3 * total / steps,
-                by.iter().map(|(_, n, _)| *n as f64).sum::<f64>() / steps
+                by.iter().map(|k| k.buffers as f64).sum::<f64>() / steps
             );
-            for (label, buffers, secs) in by.iter().take(24) {
+            for k in by.iter().take(24) {
+                // The marker earns its place: it is what distinguishes a
+                // kernel that costs 13 ms from a buffer that waited 13 ms,
+                // and reading the totals alone got that backwards once.
+                // Two shapes, and the FIRST is the one that misled this
+                // investigation: a buffer resident for milliseconds on EVERY
+                // step (tight distribution, high p50) is holding something
+                // open across the step — a host round-trip, a sync — and its
+                // total is that hold, not the kernel's cost. The second is a
+                // single buffer absorbing one wait (max >> p50). A heuristic
+                // that only caught the second read the first as real work.
+                let held = k.p50_s > 1e-3;
+                let spiky = k.max_s > 8.0 * k.p50_s.max(1e-9) && k.max_s > 1e-3;
+                let flag = if held {
+                    "  <-- HELD OPEN every step: residency, not compute"
+                } else if spiky {
+                    "  <-- one buffer absorbed a wait"
+                } else {
+                    ""
+                };
                 eprintln!(
-                    "    {:>8.3} ms/step  {:>6.1} buf/step  {:>7.1} µs/buf  {}",
-                    1e3 * secs / steps,
-                    *buffers as f64 / steps,
-                    1e6 * secs / (*buffers as f64).max(1.0),
-                    label
+                    "    {:>8.3} ms/step  {:>6.1} buf/step  p50 {:>7.1} / p99 {:>8.1} / max {:>8.1} µs/buf  {}{}",
+                    1e3 * k.total_s / steps,
+                    k.buffers as f64 / steps,
+                    1e6 * k.p50_s,
+                    1e6 * k.p99_s,
+                    1e6 * k.max_s,
+                    k.label,
+                    flag
                 );
             }
             eprintln!("]");

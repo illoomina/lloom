@@ -738,7 +738,9 @@ impl FusionPolicy {
         match s {
             "manual" => Ok(FusionPolicy::Manual),
             "derived" => Ok(FusionPolicy::Derived),
-            other => Err(format!("--fusion must be `manual` or `derived`, got `{other}`")),
+            other => Err(format!(
+                "--fusion must be `manual` or `derived`, got `{other}`"
+            )),
         }
     }
 
@@ -5242,8 +5244,8 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<Config> {
         }
     };
     let gemv_silu = uniform("feed_forward.w1.weight", "silu")?;
-    let gemv_residual = uniform("feed_forward.w2.weight", "residual")?
-        && uniform("out_proj.weight", "residual")?;
+    let gemv_residual =
+        uniform("feed_forward.w2.weight", "residual")? && uniform("out_proj.weight", "residual")?;
     // Every fused site must be one of the two kinds the flags name.
     for (site, fragment) in &plan.sites {
         let known = (fragment == "silu" && site.ends_with("feed_forward.w1.weight"))

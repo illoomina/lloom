@@ -3471,7 +3471,10 @@ fn gemv_fused_metal(
         w_l.start_offset() * w.dtype().size_in_bytes(),
         w.buffer(),
         &output,
-        lloom_tensor::kernels::ParamStyle::Split,
+        // The process's style, as the unfused GEMV takes it: under
+        // `ParamStyle::Packed` the fused arm dispatches its packed sibling,
+        // which is what lets an ICB replay cover it (issue #732 P3).
+        lloom_tensor::kernels::default_param_style(),
         None,
         epilogue,
         operand,

@@ -990,19 +990,21 @@ pub fn call_mlx_gemv_epilogue(
                  tiles carry it -- see DESIGN.md 12.2 #3, issue #484"
             )));
         }
-        if style != ParamStyle::Split {
-            return Err(MetalKernelError::LoadFunctionError(
-                "gemv fused epilogue has no packed sibling; it adds no \
-                 bindings and no scalars, so a packed variant would differ \
-                 from the classical one in nothing but its name (issue #484)"
-                    .to_string(),
-            ));
-        }
+        // Both styles: the packed siblings (`gemv_silu_packed`,
+        // `gemv_residual_packed`) read the same params block `gemv_packed`
+        // does, so the name is the classical one with `_packed` appended, as
+        // `packed_name` would build it. Without them the fused arms were the largest
+        // class an ICB replay could not cover (§3.7c: no inline constants in
+        // a command) — 90 of 345 decode positions (issue #732 P3).
         epilogue.name_suffix()
     } else {
         ""
     };
 
+    // The style segment LAST: `packed_name` appends `_packed` to a finished
+    // classical name everywhere else, and the replay executor classifies a
+    // position by that trailing suffix (`icb.rs` `is_packed`), so a fused
+    // packed name is `…_axpby0_silu_packed`, never `…_packed_silu`.
     let name = format!(
         "{}_{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc0_axpby0{}{}{}",
         kernel_prefix,
@@ -1013,9 +1015,9 @@ pub fn call_mlx_gemv_epilogue(
         sn,
         tm,
         tn,
-        style.name_suffix(),
         norm_suffix,
-        epilogue_suffix
+        epilogue_suffix,
+        style.name_suffix()
     );
 
     let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;
@@ -1081,7 +1083,10 @@ pub fn call_mlx_gemv_epilogue(
     }
 
     // The fused epilogue's one binding, also at 15 -- the two fused arms are
-    // refused together above, so they never both bind it. `set_input_buffer`
+    // refused together above, so they never both bind it. The same index under
+    // both styles: the packed sibling declares `residual` at 15, past every
+    // slot the packed layout uses, and this bind happens after the capture
+    // has closed, so it is not renumbered. `set_input_buffer`
     // for the reason the prologue's comment gives, and here the RAW edge is
     // the one the whole issue is about: the residual is written by the layer's
     // previous op, and dropping that edge is silent corruption under

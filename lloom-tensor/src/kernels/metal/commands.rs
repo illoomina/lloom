@@ -228,7 +228,9 @@ type CompletionSubscribers = Arc<parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sy
 pub fn cb_unretained() -> bool {
     static KIND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *KIND.get_or_init(|| {
-        std::env::var("LLOOM_CB_UNRETAINED").map(|v| v == "1").unwrap_or(false)
+        std::env::var("LLOOM_CB_UNRETAINED")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 
@@ -238,9 +240,10 @@ fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, 
     } else {
         command_queue.commandBuffer()
     };
-    raw.map(CommandBuffer::new).ok_or(MetalKernelError::FailedToCreateResource(
-        "CommandBuffer".to_string(),
-    ))
+    raw.map(CommandBuffer::new)
+        .ok_or(MetalKernelError::FailedToCreateResource(
+            "CommandBuffer".to_string(),
+        ))
 }
 
 /// RAII guard for compute command encoder operations.
@@ -1330,9 +1333,13 @@ impl Commands {
         use objc2_metal::MTLCommandEncoder as _;
         use objc2_metal::MTLComputeCommandEncoder as _;
 
+        // The encoder is consumed here, so its output set is moved out rather
+        // than cloned: a `HashSet` cloned per encoder close is 14 clones a
+        // token (`CONTRIBUTING.md` §3.3a), and the capacity dies with the
+        // encoder either way.
         let all_outputs = {
-            let s = encoder.state.lock();
-            s.all_outputs.clone()
+            let mut s = encoder.state.lock();
+            std::mem::take(&mut s.all_outputs)
         };
 
         {

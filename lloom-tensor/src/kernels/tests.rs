@@ -3775,6 +3775,86 @@ fn packed_matches_split_for_gemv_f16() {
     assert_packed_matches_split("gemv_float16", &split, &packed);
 }
 
+/// The packed siblings of the two fused epilogues compute the classical
+/// arms' bits (issue #732 P3): the same `gemv_body`, the same epilogue
+/// functor, the params read from a block instead of `setBytes`. At f16 and
+/// LFM2's own K, both tiles, with a residual whose operand rides slot 15 on
+/// both styles.
+#[test]
+fn packed_matches_split_for_the_fused_epilogues_f16() {
+    for &(n_out, k) in &[(2048usize, 2048usize), (512, 2048)] {
+        let mat: Vec<f16> = (0..n_out * k)
+            .map(|i| f16::from_f32(((i * 37 % 101) as f32 - 50.0) / 50.0))
+            .collect();
+        let vec: Vec<f16> = (0..k)
+            .map(|i| f16::from_f32(((i * 53 % 97) as f32 - 48.0) / 48.0))
+            .collect();
+        let res: Vec<f16> = (0..n_out)
+            .map(|i| f16::from_f32(((i * 11 % 23) as f32 - 11.0) / 8.0))
+            .collect();
+        for epilogue in [GemvEpilogue::Silu, GemvEpilogue::Residual] {
+            let run = |style: ParamStyle| -> Vec<f16> {
+                let device = device();
+                let kernels = Kernels::new();
+                let commands = commands(&device);
+                let encoder = commands.command_encoder().unwrap();
+                let options = RESOURCE_OPTIONS;
+                let mk = |v: &[f16]| {
+                    device
+                        .new_buffer_with_data(
+                            v.as_ptr() as *const core::ffi::c_void,
+                            std::mem::size_of_val(v),
+                            options,
+                        )
+                        .unwrap()
+                };
+                let (mat_b, vec_b, res_b) = (mk(&mat), mk(&vec), mk(&res));
+                let output = device
+                    .new_buffer(n_out * core::mem::size_of::<f16>(), options)
+                    .unwrap();
+                let operand = epilogue.needs_operand().then_some((&res_b, 0usize));
+                // `x [1, k] @ w.t()` with `w [n_out, k]`: the Linear layout.
+                call_mlx_gemv_epilogue(
+                    &device,
+                    &encoder,
+                    &kernels,
+                    GemmDType::F16,
+                    (1, 1, n_out, k),
+                    &[k, k, 1],
+                    0,
+                    &vec_b,
+                    &[n_out * k, 1, k],
+                    0,
+                    &mat_b,
+                    &output,
+                    style,
+                    None,
+                    epilogue,
+                    operand,
+                )
+                .unwrap();
+                drop(encoder);
+                commands.wait_until_completed().unwrap();
+                read_to_vec(&output, n_out)
+            };
+            let split = run(ParamStyle::Split);
+            let packed = run(ParamStyle::Packed);
+            // Non-vacuity: the fused arm computed something (a SiLU of a
+            // non-trivial accumulator is not all zeros; a residual add moved
+            // the value off the residual).
+            assert!(
+                split.iter().any(|v| v.to_f32() != 0.0),
+                "{epilogue:?} n_out={n_out}: all zeros"
+            );
+            assert_packed_matches_split(
+                &format!("gemv_float16{}", epilogue.name_suffix()),
+                &split,
+                &packed,
+            );
+        }
+    }
+}
+
 /// Every classical gemv name has a `_packed` counterpart in the compiled
 /// library, and vice versa.
 ///
@@ -3812,6 +3892,31 @@ fn gemv_packed_names_resolve() {
     ];
 
     let mut checked = 0usize;
+    // The two fused epilogues and their packed siblings (issue #732 P3), at
+    // the two decode tiles `instantiate_gemv_epilogue_packed_blocks` names.
+    // The packed name is the classical one with `_packed` appended, as
+    // `packed_name` builds every other and as the replay executor's
+    // `is_packed` reads it.
+    for dtype in ["float32", "float16", "bfloat16"] {
+        for bm in [4, 8] {
+            for epilogue in ["_silu", "_residual"] {
+                let classical =
+                    format!("gemv_{dtype}_bm{bm}_bn1_sm1_sn32_tm4_tn4_nc0_axpby0{epilogue}");
+                let packed =
+                    format!("gemv_{dtype}_bm{bm}_bn1_sm1_sn32_tm4_tn4_nc0_axpby0{epilogue}_packed");
+                for name in [classical, packed] {
+                    kernels
+                        .load_pipeline(&device, Source::Gemv, name.clone())
+                        .unwrap_or_else(|e| panic!("{name} does not resolve: {e:?}"));
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        checked, 24,
+        "6 classical epilogue names and their 6 packed siblings, at 3 dtypes... twice the tiles"
+    );
     for (prefix, blocks) in [("gemv", &gemv_blocks[..]), ("gemv_t", &gemv_t_blocks[..])] {
         for dtype in ["float32", "float16", "bfloat16"] {
             for &(bm, bn, sm, sn, tm, tn) in blocks.iter() {
@@ -3834,8 +3939,9 @@ fn gemv_packed_names_resolve() {
         }
     }
     assert_eq!(
-        checked, 288,
-        "expected 144 classical + 144 packed gemv variants"
+        checked,
+        288 + 24,
+        "expected 144 classical + 144 packed gemv variants, and the 12 epilogue names with their 12 packed siblings"
     );
 }
 
@@ -7625,7 +7731,10 @@ fn gemv_fused_silu_is_refused_where_it_is_not_instantiated() {
         "the transposed kernel has no fused epilogue and must be refused"
     );
 
-    // The packed binding style has no fused sibling.
+    // The packed binding style HAS a fused sibling since #732 P3 (the ICB
+    // could not otherwise cover the fused arms, §3.7c), so this is the
+    // positive control of the refusals above: the same tile that is refused
+    // transposed is admitted packed.
     let packed = call_mlx_gemv_full(
         &device,
         &encoder,
@@ -7644,8 +7753,8 @@ fn gemv_fused_silu_is_refused_where_it_is_not_instantiated() {
         GemvEpilogue::Silu,
     );
     assert!(
-        packed.is_err(),
-        "the packed style has no fused epilogue and must be refused"
+        packed.is_ok(),
+        "the packed style has a fused epilogue sibling and must be admitted: {packed:?}"
     );
 
     // Prologue and epilogue together resolve a name that is not instantiated.

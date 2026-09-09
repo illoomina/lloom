@@ -1083,6 +1083,98 @@ void gemv_packed(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+/// The packed siblings of the two fused epilogues (issue #732 P3)
+///////////////////////////////////////////////////////////////////////////////
+
+// `gemv_packed`'s signature with the epilogue functor — what `gemv_silu` and
+// `gemv_residual` are to `gemv`. They exist because an ICB command cannot
+// carry an inline constant (§3.7c): under replay the classical epilogue arms
+// were the largest excluded class on the decode step (90 of 345 positions,
+// `inline-constants`), so the fusions the optimizer derives and the
+// re-expression that follows them could not meet. The residual keeps its
+// binding at 15, after every slot the packed layout uses, so the host binds
+// the operand at one index whichever style it runs.
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_silu_packed(
+    const device GemvParams* pp [[buffer(0)]],
+    const device T* mat [[buffer(1)]],
+    const device T* in_vec [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const device int* batch_shape [[buffer(4)]],
+    const device int64_t* vector_batch_stride [[buffer(5)]],
+    const device int64_t* matrix_batch_stride [[buffer(6)]],
+    const device int64_t* bias_batch_stride [[buffer(7)]],
+    const device T* bias [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueSilu<T, typename kernel_t::acc_type>;
+  gemv_tgp_memory(kernel_t);
+  GemvParams p = *pp;
+  const prologue_t prologue(nullptr, nullptr);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t>(
+      mat, in_vec, bias, out_vec,
+      p.in_vec_size, p.out_vec_size, p.matrix_ld, p.alpha, p.beta,
+      p.batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      bias_batch_stride, p.bias_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue, epilogue_t(),
+      tid, lid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_residual_packed(
+    const device GemvParams* pp [[buffer(0)]],
+    const device T* mat [[buffer(1)]],
+    const device T* in_vec [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const device int* batch_shape [[buffer(4)]],
+    const device int64_t* vector_batch_stride [[buffer(5)]],
+    const device int64_t* matrix_batch_stride [[buffer(6)]],
+    const device int64_t* bias_batch_stride [[buffer(7)]],
+    const device T* bias [[buffer(8)]],
+    const device T* residual [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueResidual<T, typename kernel_t::acc_type>;
+  gemv_tgp_memory(kernel_t);
+  GemvParams p = *pp;
+  const prologue_t prologue(nullptr, nullptr);
+  const epilogue_t epilogue(residual + tid.z * p.out_vec_size);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t>(
+      mat, in_vec, bias, out_vec,
+      p.in_vec_size, p.out_vec_size, p.matrix_ld, p.alpha, p.beta,
+      p.batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      bias_batch_stride, p.bias_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue, epilogue,
+      tid, lid, simd_gid, simd_lid);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 /// gemv_t kernel: vec [K] × mat [K, N] → out [N]
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -1355,6 +1447,32 @@ void gemv_t_packed(
   instantiate_gemv_residual_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
   instantiate_gemv_residual_helper(nm, itype, 8, 1, 1, 32, 4, 4)
 
+// The packed siblings of the two epilogue arms (issue #732 P3), named as every
+// packed name is: `_packed` LAST, `…_nc0_axpby0_silu_packed` — the replay
+// executor classifies a position by that suffix (`icb.rs` `is_packed`), so a
+// name carrying it anywhere else is a packed dispatch it cannot see. The same
+// two tiles as the classical arms, so `gemv_packed_names_resolve` can pin both
+// sets from one list.
+#define instantiate_gemv_silu_packed_helper(nm, itype, bm, bn, sm, sn, tm, tn)     \
+  template [[host_name(                                                             \
+      "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                           \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_silu_packed")]]                              \
+  [[kernel]] decltype(gemv_silu_packed<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_silu_packed<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
+#define instantiate_gemv_residual_packed_helper(nm, itype, bm, bn, sm, sn, tm, tn)     \
+  template [[host_name(                                                                 \
+      "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                               \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_residual_packed")]]                              \
+  [[kernel]] decltype(gemv_residual_packed<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_residual_packed<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
+#define instantiate_gemv_epilogue_packed_blocks(nm, itype)              \
+  instantiate_gemv_silu_packed_helper(nm, itype, 4, 1, 1, 32, 4, 4)     \
+  instantiate_gemv_silu_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4)     \
+  instantiate_gemv_residual_packed_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
+  instantiate_gemv_residual_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4)
+
 #define instantiate_gemv_nc_axpby(func, nm, itype, bm, bn, sm, sn, tm, tn)    \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 0)      \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 1)      \
@@ -1418,6 +1536,11 @@ instantiate_gemv_silu_blocks(bfloat16, bfloat)
 instantiate_gemv_residual_blocks(float32, float)
 instantiate_gemv_residual_blocks(float16, half)
 instantiate_gemv_residual_blocks(bfloat16, bfloat)
+
+// Their packed siblings (issue #732 P3): twelve names, the same two tiles.
+instantiate_gemv_epilogue_packed_blocks(float32, float)
+instantiate_gemv_epilogue_packed_blocks(float16, half)
+instantiate_gemv_epilogue_packed_blocks(bfloat16, bfloat)
 
 instantiate_gemv_t_blocks(float32, float)
 instantiate_gemv_t_blocks(float16, half)

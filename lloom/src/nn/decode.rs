@@ -780,6 +780,17 @@ pub const IN_FLIGHT_STEPS: usize = IN_FLIGHT_FLOOR;
 /// The in-flight depth that keeps the GPU fed without the host running
 /// pointlessly far ahead -- a *quantitative* bound, not an arbitrary constant.
 ///
+/// # The two times must be DISJOINT
+///
+/// `host_step_ns` is the host's encode+submit; `gpu_step_ns` is the GPU's own
+/// time for that step, **excluding** the host's. A caller that passes
+/// `host + gpu` as `gpu_step_ns` makes this function unable to return more
+/// than [`IN_FLIGHT_FLOOR`] -- `2·h / (h + t) <= 2` for every `t >= 0` -- and
+/// the calibration silently degrades to the constant it replaced. That was a
+/// real defect in [`Session::warmup`], caught by reading the arithmetic
+/// rather than by any test, which is why the disjointness is stated here and
+/// pinned by a unit test rather than left to the call site to remember.
+///
 /// The host must stay enqueued far enough that the GPU never starves waiting for
 /// the next step: `depth = ceil(host_step / gpu_step) x safety`, floored at
 /// [`IN_FLIGHT_FLOOR`] and capped by `mem_cap` (a memory-derived ceiling, so a
@@ -808,6 +819,22 @@ pub fn compute_in_flight_depth(host_step_ns: u64, gpu_step_ns: u64, mem_cap: usi
     ratio_x2
         .max(IN_FLIGHT_FLOOR)
         .min(mem_cap.max(IN_FLIGHT_FLOOR))
+}
+
+/// The depth `Session::warmup` installs, from the two times it measured.
+///
+/// A named function rather than an inline call so the CALLER's operands are
+/// testable: the defect this file carried was not in
+/// [`compute_in_flight_depth`] — which is correct — but in what `warmup`
+/// passed it (`host + tail` for the GPU time, which pins the result at
+/// [`IN_FLIGHT_FLOOR`] for every balance). A correct function with wrong
+/// operands is invisible to a test of the function, so the operand contract
+/// gets its own seam here.
+///
+/// `gpu_ns` MUST be the GPU tail alone. `warm_depth_rejects_host_inclusive_times`
+/// pins that by construction.
+pub fn warm_depth(host_ns: u64, gpu_ns: u64, mem_cap: usize) -> usize {
+    compute_in_flight_depth(host_ns, gpu_ns, mem_cap)
 }
 
 /// The memory ceiling on in-flight depth: the most forwards' worth of retained
@@ -3064,12 +3091,22 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // step's GPU tail, so the elapsed-from-submit is the GPU step time.
         let t_gpu = std::time::Instant::now();
         device.synchronize()?;
-        // `gpu_ns` = host submit + GPU tail: an upper bound on the step's GPU
-        // time (the sync waited out the tail). Good enough for the ratio, which
-        // only needs to know whether the GPU dwarfs the host or not.
-        let gpu_ns = host_ns + t_gpu.elapsed().as_nanos() as u64;
-        self.warm_in_flight_depth =
-            compute_in_flight_depth(host_ns, gpu_ns, in_flight_mem_cap(device));
+        // `gpu_ns` = the GPU TAIL alone — the time from submit-done to the
+        // step being finished — and **not** `host_ns + tail`.
+        //
+        // It was `host_ns + tail`, and that made the whole calibration dead
+        // code: the ratio is `2·host / gpu`, so putting `host` into `gpu`'s
+        // own definition bounds it at `2·host / (host + tail) <= 2` for every
+        // `tail >= 0`, which `ceil` then floors back to `IN_FLIGHT_FLOOR`.
+        // Every config got 2 — including the ones this function replaced a
+        // constant 2 to serve (a small model, a faster GPU, any config where
+        // the host encode approaches the GPU step). The doc's own worked
+        // examples ("ratio 0.75 -> depth ~3-4") were arithmetically
+        // unreachable. `compute_in_flight_depth_is_the_floor_only_when_the_gpu_dwarfs_the_host`
+        // pins it.
+        let gpu_ns = t_gpu.elapsed().as_nanos() as u64;
+        self.warm_in_flight_depth = warm_depth(host_ns, gpu_ns, in_flight_mem_cap(device));
+        self.warm_balance_ns = (host_ns, gpu_ns);
 
         // Leave nothing behind: the warmup wrote KV, conv state and the position
         // counter, and the next call is the user's real prefill from position 0.
@@ -3083,6 +3120,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// computed host/GPU balance rather than the floor.
     pub fn measured_in_flight_depth(&self) -> usize {
         self.warm_in_flight_depth
+    }
+
+    /// The `(host_ns, gpu_ns)` warmup measured, `(0, 0)` before it runs — so a
+    /// test (or a harness) can check the two are DISJOINT rather than trusting
+    /// the call site to have kept them so.
+    pub fn measured_balance_ns(&self) -> (u64, u64) {
+        self.warm_balance_ns
     }
 }
 
@@ -3196,6 +3240,91 @@ fn tile_widths(widths: Vec<usize>, tile: usize) -> Vec<usize> {
         }
     }
     tiled
+}
+
+#[cfg(test)]
+mod in_flight_depth_tests {
+    use super::{compute_in_flight_depth, warm_depth, StepPacer, IN_FLIGHT_FLOOR};
+
+    /// The in-flight depth calibrates to the host/GPU balance — and the two
+    /// times it is given must be DISJOINT for it to do so.
+    ///
+    /// This is the test that was missing when `Session::warmup` passed
+    /// `host + tail` as `gpu_step_ns`: that makes the ratio `2h/(h+t) <= 2`
+    /// for every `t >= 0`, so the function could never return more than the
+    /// floor and the calibration was dead code on every config. The
+    /// `host_inclusive` loop below reproduces the defect's arithmetic
+    /// directly, so a caller that reintroduces it fails here rather than
+    /// silently degrading to the constant this function replaced.
+    #[test]
+    fn the_in_flight_depth_calibrates_and_needs_disjoint_times() {
+        const CAP: usize = 64;
+        // The shipping config: the GPU step dwarfs the host encode, so the
+        // floor is genuinely right — this case is NOT evidence the maths works.
+        assert_eq!(compute_in_flight_depth(1_500_000, 15_000_000, CAP), 2);
+        // The host OUTRUNS the GPU — the case a constant 2 caps badly.
+        assert_eq!(compute_in_flight_depth(6_000_000, 2_000_000, CAP), 6);
+        assert_eq!(compute_in_flight_depth(10_000_000, 1_000_000, CAP), 20);
+        // The memory ceiling binds before a pathological ratio does.
+        assert_eq!(compute_in_flight_depth(1_000_000_000, 1_000_000, 8), 8);
+        // A GPU time of 0 cannot form a ratio; the floor stands.
+        assert_eq!(compute_in_flight_depth(5_000_000, 0, CAP), 2);
+
+        // **The defect, as arithmetic.** Passing `host + tail` for the GPU
+        // time pins the result at the floor for every balance, including the
+        // two above that must exceed it.
+        for &(host, tail) in &[
+            (1_500_000u64, 500_000u64),
+            (6_000_000, 2_000_000),
+            (10_000_000, 1_000_000),
+        ] {
+            assert_eq!(
+                compute_in_flight_depth(host, host + tail, CAP),
+                IN_FLIGHT_FLOOR,
+                "host-inclusive gpu_ns collapses to the floor: that IS the defect \
+                 (host={host} tail={tail})"
+            );
+        }
+        // ...and the disjoint form does not, for the same numbers.
+        assert!(compute_in_flight_depth(6_000_000, 2_000_000, CAP) > IN_FLIGHT_FLOOR);
+        assert!(compute_in_flight_depth(10_000_000, 1_000_000, CAP) > IN_FLIGHT_FLOOR);
+    }
+
+    /// The CALLER's operands, not the function's: `Session::warmup` must pass
+    /// the GPU tail alone as `gpu_step_ns`, and a host-inclusive value is
+    /// detectable from outside because the two times it recorded would then
+    /// satisfy `gpu >= host` by construction for every real measurement.
+    ///
+    /// This is the check the function-level test above cannot make — a
+    /// correct function given wrong operands is invisible to a test of the
+    /// function. `Session::measured_balance_ns` exists for this.
+    #[test]
+    fn warm_depth_rejects_host_inclusive_times() {
+        const CAP: usize = 64;
+        // A host-inclusive `gpu_ns` is `host + tail`, so it is >= host for
+        // any tail >= 0 AND the depth it yields is always the floor. Both
+        // together are the signature; either alone is not (a genuinely
+        // GPU-bound step also has gpu > host, and legitimately floors).
+        let host = 6_000_000u64;
+        let tail = 2_000_000u64;
+        assert_eq!(warm_depth(host, host + tail, CAP), IN_FLIGHT_FLOOR);
+        assert!(warm_depth(host, tail, CAP) > IN_FLIGHT_FLOOR);
+        // The shipping balance floors under BOTH forms, which is why this
+        // defect survived: on the config it was measured against, the wrong
+        // arithmetic and the right one agree.
+        let (h, t) = (1_500_000u64, 15_000_000u64);
+        assert_eq!(warm_depth(h, t, CAP), IN_FLIGHT_FLOOR);
+        assert_eq!(warm_depth(h, h + t, CAP), IN_FLIGHT_FLOOR);
+    }
+
+    /// `StepPacer::new` cannot be given less than the floor, whatever the
+    /// caller computed.
+    #[test]
+    fn the_pacer_floors_its_depth() {
+        assert_eq!(StepPacer::new(0).depth, IN_FLIGHT_FLOOR);
+        assert_eq!(StepPacer::new(1).depth, IN_FLIGHT_FLOOR);
+        assert_eq!(StepPacer::new(7).depth, 7);
+    }
 }
 
 #[cfg(test)]

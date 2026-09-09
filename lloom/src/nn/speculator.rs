@@ -671,6 +671,9 @@ pub struct Session<'m, M: CausalLM> {
     /// The in-flight depth measured at warmup (`0` until `warmup` runs) — the
     /// computed host/GPU balance the pacer uses instead of a static cap.
     pub(crate) warm_in_flight_depth: usize,
+    /// The `(host_ns, gpu_ns)` the depth above was computed from — kept so a
+    /// test can check the two are DISJOINT (`Session::measured_balance_ns`).
+    pub(crate) warm_balance_ns: (u64, u64),
 }
 
 impl<'m, M: CausalLM> Session<'m, M> {
@@ -682,6 +685,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             model,
             seq: Sequence::new(cache),
             warm_in_flight_depth: 0,
+            warm_balance_ns: (0, 0),
         }
     }
 
@@ -697,6 +701,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             model,
             seq,
             warm_in_flight_depth: 0,
+            warm_balance_ns: (0, 0),
         }
     }
 
@@ -706,6 +711,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             model,
             seq,
             warm_in_flight_depth: 0,
+            warm_balance_ns: (0, 0),
         }
     }
 

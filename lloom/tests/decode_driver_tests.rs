@@ -878,11 +878,29 @@ fn the_pacer_bounds_the_drain_arm_and_is_a_null_on_the_poll_arm() -> Result<()> 
             "{device:?}: one marker per forward"
         );
         if matches!(device, Device::Metal(_)) {
+            // **`max_in_flight` counts COMMAND BUFFERS, not forwards.** It is
+            // `flush_and_prune`'s return, and a single forward commits several
+            // buffers — the pacer's own marker, plus a `CutPolicy` cut every
+            // `compute_per_buffer` dispatches, plus the commit budget's. So it
+            // is NOT the pacer's depth and must not be compared against
+            // `IN_FLIGHT_STEPS`: that comparison held only because this
+            // fixture's steps are tiny, and it failed under machine load
+            // whenever the driver retired buffers more slowly (lloom #727,
+            // measurements §12 — a real run shows `max_in_flight=13` at
+            // `depth 2`).
+            //
+            // What the pacer actually bounds is FORWARDS in flight, and
+            // `step_markers` / `step_waits` above already pin that. What is
+            // asserted here is the property this arm exists to have: the
+            // count is BOUNDED — it does not grow with the run — which is
+            // what distinguishes the pacer from the unbounded drain it
+            // replaced. A generous ceiling, because the number of buffers per
+            // forward is a function of the cut period, not of the pacer.
             assert!(
-                out.stats.max_in_flight <= IN_FLIGHT_STEPS + 1,
-                "{device:?}: {} command buffers in flight on the drain arm; the pacer's bound is {}",
+                out.stats.max_in_flight <= 64,
+                "{device:?}: {} command buffers in flight on the drain arm — unbounded growth \
+                 is what the pacer exists to prevent (the bound is on FORWARDS; see step_waits)",
                 out.stats.max_in_flight,
-                IN_FLIGHT_STEPS + 1
             );
         }
         let (out, _) = run(&device, &Arm::RingPoll, &[0], &opts)?;

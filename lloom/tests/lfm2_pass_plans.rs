@@ -387,3 +387,129 @@ fn served_tiles_compute_the_pool_paths_logits_bit_for_bit() -> Result<()> {
     assert!(c.served >= 12, "the last two rounds are served: {c:?}");
     Ok(())
 }
+
+/// Three prompts of different lengths arriving one step apart, prefilled in
+/// pieces of at most `chunk` tokens that ride the batched step as ragged
+/// rows (#728). Every stream equals the pool path's under both width arms
+/// (the ladder only re-cuts the pieces), no key drifts, nothing escapes;
+/// with the ragged cache capped at 2 the excess layouts are dropped and
+/// re-recorded, and the streams still match.
+#[test]
+fn ragged_steps_are_planned_under_both_width_arms() -> Result<()> {
+    use lloom::generation::{LogitsProcessor, Sampling};
+    use lloom::nn::{DecodeOptions, PassWidths, Session};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!()
+    };
+    let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
+    cfg.conv_prefill_ctx = true;
+    let model = build(&cfg, &dev)?;
+    let prompts: Vec<Vec<u32>> = vec![(1..=10).collect(), (11..=17).collect(), (21..=33).collect()];
+    let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+    let arrivals = [0u64, 1, 2];
+    let run = |widths: PassWidths| -> Result<Vec<Vec<u32>>> {
+        let mut sessions: Vec<Session<'_, Model>> = prompts
+            .iter()
+            .map(|_| {
+                Ok(Session::new(
+                    &model,
+                    Cache::new(true, DType::F16, &cfg, &dev)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        let opts = DecodeOptions {
+            lookahead: 1,
+            prefill_chunk: 4,
+            pass_widths: widths,
+            ..DecodeOptions::new(5)
+        };
+        let outs = Session::decode_batched_admitted(
+            &mut sessions,
+            &mut LogitsProcessor::from_sampling(0, Sampling::ArgMax),
+            &refs,
+            &arrivals,
+            &opts,
+            &[u32::MAX],
+            &dev,
+            &mut |_, _| Ok(()),
+        )?;
+        Ok(outs.into_iter().map(|o| o.ids).collect())
+    };
+    let want = run(PassWidths::Lru)?;
+    assert_eq!(
+        run(PassWidths::Ladder)?,
+        want,
+        "the ladder re-cuts pieces, not streams"
+    );
+    assert!(want.iter().all(|ids| ids.len() == 5));
+
+    m.enable_pass_plans(ArenaLayout::Packed);
+    for widths in [PassWidths::Lru, PassWidths::Ladder] {
+        for round in 0..3 {
+            let got = run(widths)?;
+            assert_eq!(got, want, "{widths:?} round {round}");
+        }
+        let c = m.pass_plan_counters().unwrap();
+        let (keys, _) = m.pass_plan_report().unwrap();
+        let ragged: Vec<_> = keys
+            .iter()
+            .filter(|(k, ..)| matches!(k.kind, PassKind::Ragged { .. }))
+            .collect();
+        eprintln!(
+            "[{widths:?}] {c:?} ragged keys={} of {}",
+            ragged.len(),
+            keys.len()
+        );
+        for (k, covered, total, escapes) in &keys {
+            eprintln!(
+                "  {:?} {covered}/{total} escapes={escapes} {:?}",
+                k.kind,
+                m.pass_plan_escapes(k)
+            );
+        }
+        assert_eq!(c.evicted, 0, "{widths:?}: {c:?}");
+        assert_eq!(c.escapes, 0, "{widths:?}: {c:?}");
+        assert!(!ragged.is_empty(), "{widths:?}: no ragged pass was keyed");
+        assert!(
+            ragged.iter().all(|(_, covered, total, _)| covered == total),
+            "{widths:?}: a ragged plan declines ordinals: {ragged:?}"
+        );
+    }
+    // The `lru` bound: at most two ragged plans are kept — the older ones
+    // are dropped when the cap is lowered and as later layouts are planned,
+    // and a run whose layouts are being re-recorded still streams the same
+    // ids (a miss is a pool pass, never a wrong pass).
+    let before = m.pass_plan_counters().unwrap();
+    m.set_pass_plan_ragged_cap(2);
+    for round in 0..2 {
+        assert_eq!(run(PassWidths::Lru)?, want, "capped round {round}");
+    }
+    let c = m.pass_plan_counters().unwrap();
+    assert!(
+        c.capped > before.capped,
+        "the cap never dropped a plan: {c:?}"
+    );
+    assert!(c.escapes == 0, "{c:?}");
+    assert_eq!(c.evicted, 0, "{c:?}");
+    let (keys, _) = m.pass_plan_report().unwrap();
+    let ragged = keys
+        .iter()
+        .filter(|(k, ..)| matches!(k.kind, PassKind::Ragged { .. }))
+        .count();
+    assert!(ragged <= 2, "{ragged} ragged plans kept over a cap of 2");
+    Ok(())
+}
+
+#[test]
+fn the_ladder_rounds_down_to_a_rung() {
+    use lloom::nn::ladder_width;
+    assert_eq!(ladder_width(4, 4), 4);
+    assert_eq!(ladder_width(3, 4), 2);
+    assert_eq!(ladder_width(1, 4), 1);
+    assert_eq!(ladder_width(5, 6), 3);
+    assert_eq!(ladder_width(7, 0), 7);
+    assert_eq!(ladder_width(0, 8), 0);
+    assert_eq!(ladder_width(100, 8), 8);
+}

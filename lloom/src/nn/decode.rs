@@ -220,6 +220,62 @@ pub struct DecodeOptions {
     /// [`Session::prefill`] per visit — and the single-sequence loop has no
     /// other sequence to interleave with, so neither reads this.
     pub prefill_chunk: usize,
+    /// How the widths of the prompt PIECES a batched step feeds are chosen,
+    /// so the set of ragged pass shapes — and with it the plan cache's key
+    /// set (`DESIGN.md` §9.2aa, I4) — is bounded. An axis with two arms, to
+    /// be measured: [`PassWidths::Lru`] feeds each piece as wide as the chunk
+    /// and the tile allow (the incumbent schedule; every distinct layout is a
+    /// key, the cache bounds how many it keeps), [`PassWidths::Ladder`]
+    /// rounds a piece DOWN to a rung of `{top, top/2, …, 1}` (`top` = the
+    /// tile bounded by the chunk, else the chunk) so a prompt's pieces are
+    /// drawn from `O(log top)` widths. Read by [`Session::decode_batched`]
+    /// only; the single-sequence loop and the time-sliced driver feed whole
+    /// chunks (the harness applies the ladder to its visits itself).
+    pub pass_widths: PassWidths,
+}
+
+/// The arm of [`DecodeOptions::pass_widths`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PassWidths {
+    /// Pieces as wide as the chunk and the tile allow; the plan cache keeps
+    /// a bounded number of ragged layouts (`lru`).
+    #[default]
+    Lru,
+    /// Pieces rounded down to a rung of `{top, top/2, …, 1}` (`ladder`).
+    Ladder,
+}
+
+impl PassWidths {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "lru" => Ok(Self::Lru),
+            "ladder" => Ok(Self::Ladder),
+            other => Err(format!(
+                "unknown pass widths `{other}`; want `lru` or `ladder`"
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lru => "lru",
+            Self::Ladder => "ladder",
+        }
+    }
+}
+
+/// The widest rung of `{top, top/2, …, 1}` not above `take` — the
+/// [`PassWidths::Ladder`] width of a piece of at most `take` tokens. `top`
+/// or `take` of 0 leaves `take` as it is.
+pub fn ladder_width(take: usize, top: usize) -> usize {
+    if take == 0 || top == 0 {
+        return take;
+    }
+    let mut rung = top;
+    while rung > take {
+        rung = (rung / 2).max(1);
+    }
+    rung
 }
 
 /// One speculative round of [`Session::decode_speculative`], for the per-round
@@ -287,6 +343,7 @@ impl DecodeOptions {
             stream_via_reader: false,
             prefill_tile: 0,
             prefill_chunk: 0,
+            pass_widths: PassWidths::Lru,
         }
     }
 
@@ -566,6 +623,30 @@ pub enum PassShape {
     Verify {
         k: usize,
     },
+    /// A batched step of `live` decode rows and `pieces` ragged prompt
+    /// pieces whose `(width, fresh)`, in order, hash to `layout` (see
+    /// [`ragged_layout`]).
+    Ragged {
+        live: u16,
+        pieces: u16,
+        layout: u64,
+    },
+}
+
+/// FNV-1a over the pieces' `(width, fresh)` in order — the `layout` of a
+/// [`PassShape::Ragged`]. `fresh` is the piece being its row's first pass
+/// (the row's session state is allocated in it, and the conv has no left
+/// context to carry — a different dispatch sequence, as `Prefill { fresh }`
+/// is a different key). Backend-neutral so every driver keys the same way.
+pub fn ragged_layout(pieces: impl IntoIterator<Item = (usize, bool)>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (w, fresh) in pieces {
+        for b in ((w as u64) << 1 | fresh as u64).to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    h
 }
 
 #[cfg(feature = "metal")]
@@ -578,6 +659,15 @@ fn pass_key(shape: PassShape) -> lloom_tensor::metal_backend::PassKey {
         PassShape::Prefill { w, fresh } => PassKind::Prefill {
             w: w.min(u32::MAX as usize) as u32,
             fresh,
+        },
+        PassShape::Ragged {
+            live,
+            pieces,
+            layout,
+        } => PassKind::Ragged {
+            live,
+            pieces,
+            layout,
         },
         PassShape::Verify { k } => PassKind::Verify {
             k: k.min(u16::MAX as usize) as u16,
@@ -2465,6 +2555,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     if opts.prefill_tile > 0 {
                         take = take.min(opts.prefill_tile);
                     }
+                    if opts.pass_widths == PassWidths::Ladder {
+                        let top = if opts.prefill_tile > 0 {
+                            opts.prefill_tile.min(opts.prefill_chunk)
+                        } else {
+                            opts.prefill_chunk
+                        };
+                        take = ladder_width(take, top);
+                    }
                     pieces.push((i, lane.prompt_off, take));
                     budget_left -= take;
                 }
@@ -2739,6 +2837,20 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 None => lloom_tensor::bail!("decode_batched: row {i} appears twice in a step"),
             }
         }
+        // Session grows (a KV bucket) before the bracket, per row at its
+        // own width, so the planned pass allocates nothing that outlives it.
+        for (s, len) in picked.iter_mut() {
+            model.prepare_pass(&mut s.seq.cache, *len)?;
+        }
+        let shape = PassShape::Ragged {
+            live: live.len() as u16,
+            pieces: pieces.len() as u16,
+            layout: ragged_layout(
+                picked[live.len()..]
+                    .iter()
+                    .map(|(s, len)| (*len, s.seq.pos == 0)),
+            ),
+        };
         let mut rows: Vec<RaggedRow<'_, M::Cache>> = picked
             .iter_mut()
             .map(|(s, len)| RaggedRow {
@@ -2747,7 +2859,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 cache: &mut s.seq.cache,
             })
             .collect();
+        begin_pass(input.device(), shape)?;
         let logits = model.forward_ragged(input, &mut rows)?;
+        end_pass(input.device())?;
         drop(rows);
         for (s, len) in picked {
             s.seq.pos += len;

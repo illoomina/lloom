@@ -2784,6 +2784,7 @@ impl BackendDevice for MetalDevice {
             session_region: Arc::new(parking_lot::RwLock::new(None)),
             pass_plans: Arc::new(parking_lot::Mutex::new(None)),
             base_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pass_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         })
     }
 

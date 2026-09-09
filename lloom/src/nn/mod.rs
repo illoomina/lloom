@@ -55,8 +55,8 @@ pub use conv::{
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
 pub use decode::{
-    DecodeOptions, DecodeOut, DecodeStats, IdentityProposer, PrefillOut, RoundStats, StepPhases,
-    FIRST_STEPS_TRACED,
+    ladder_width, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, IdentityProposer,
+    PassWidths, PrefillOut, RoundStats, StepPhases, FIRST_STEPS_TRACED,
 };
 pub use embedding::{embedding, Embedding};
 pub use func::{func, func_t, Func, FuncT};

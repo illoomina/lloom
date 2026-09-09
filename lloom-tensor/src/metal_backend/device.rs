@@ -8,8 +8,8 @@ use crate::kernels::{
         session_region::{RegionCounters, RegionPlan},
         Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout, ArenaOffsets, ArenaRecorder,
         BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, MTLResourceOptions,
-        PassKey, PassPlanCounters, PoolCounters, PoolOccupancySnapshot, PooledBuffer, ResidencySet,
-        SessionRegion, StepPlan,
+        PassKey, PassKind, PassPlanCounters, PoolCounters, PoolOccupancySnapshot, PooledBuffer,
+        ResidencySet, SessionRegion, StepPlan,
     },
     Kernels,
 };
@@ -346,6 +346,14 @@ pub struct MetalDevice {
     /// dispatch and the plan's positions count dispatches; hence one flag
     /// for both, set before the first recorded pass.
     pub(crate) base_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// Under the pass cache: whether a pass is open (`begin_pass` ..
+    /// `finish_pass`). Bit 0 = the cache is on, bit 1 = a pass is open. The
+    /// recorder takes an allocation only while a pass is open: one made
+    /// BETWEEN passes (a sampler's ids, a staged input) is nobody's ordinal
+    /// — recorded, it would be charged to the pass before it and, read by
+    /// the pass after it, counted as that pass's escape (measured: exactly
+    /// one per batched step, the argmax's ids).
+    pub(crate) pass_state: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// One forward pass's plan, cached by its [`PassKey`]. Every plan is served
@@ -375,8 +383,14 @@ pub struct PassPlans {
     /// What the pass in progress is doing.
     current: Option<PassState>,
     counters: PassPlanCounters,
-    /// Per key: ordinals of its first sight the next pass read undeclared.
-    escapes: HashMap<PassKey, usize>,
+    /// Per key: ordinals of its first sight the next pass read undeclared,
+    /// as `(ordinal, bytes, allocated at dispatch, first read at dispatch of
+    /// the following pass)`.
+    escapes: HashMap<PassKey, Vec<(usize, usize, usize, usize)>>,
+    /// `Ragged` keys in the order their plans were built; the oldest goes
+    /// when there are more than `ragged_cap`.
+    ragged_order: std::collections::VecDeque<PassKey>,
+    ragged_cap: usize,
 }
 
 /// One cached plan as the harness reports it: `(key, ordinals served,
@@ -411,6 +425,8 @@ impl PassPlans {
             current: None,
             counters: PassPlanCounters::default(),
             escapes: HashMap::new(),
+            ragged_order: std::collections::VecDeque::new(),
+            ragged_cap: 32,
         }
     }
 }
@@ -1327,6 +1343,8 @@ impl MetalDevice {
     /// pass brackets are the decode-step brackets they always were.
     pub fn enable_pass_plans(&self, layout: ArenaLayout) {
         self.set_base_mode(true);
+        self.pass_state
+            .fetch_or(0b01, std::sync::atomic::Ordering::Relaxed);
         let mut g = self.pass_plans.lock();
         if g.is_none() {
             *g = Some(PassPlans::new(layout));
@@ -1335,6 +1353,27 @@ impl MetalDevice {
 
     pub fn pass_plans_enabled(&self) -> bool {
         self.pass_plans.lock().is_some()
+    }
+
+    /// How many `Ragged` plans the cache keeps (default 32); beyond it the
+    /// oldest is dropped and counted (`PassPlanCounters::capped`). The other
+    /// kinds are bounded by the configuration (one `Decode{B}` per B, one
+    /// `Prefill{w}` per width the schedule names) and are never dropped.
+    pub fn set_pass_plan_ragged_cap(&self, cap: usize) {
+        if let Some(pp) = self.pass_plans.lock().as_mut() {
+            pp.ragged_cap = cap.max(1);
+            // Lowering the cap drops the oldest at once rather than waiting
+            // for the next plan: the bound is on what is HELD.
+            while pp.ragged_order.len() > pp.ragged_cap {
+                if let Some(old) = pp.ragged_order.pop_front() {
+                    if pp.plans.remove(&old).is_some() {
+                        pp.arenas.remove(&old);
+                        pp.escapes.remove(&old);
+                        pp.counters.capped += 1;
+                    }
+                }
+            }
+        }
     }
 
     /// Whether an activation this device hands out may live in a slot a
@@ -1353,6 +1392,16 @@ impl MetalDevice {
         self.pass_plans.lock().as_ref().map(|p| p.counters)
     }
 
+    /// The undeclared escapes of `key`'s plan as `(ordinal, bytes, allocated
+    /// at dispatch, first read at dispatch of the following pass)` — empty
+    /// when it has none or no plan.
+    pub fn pass_plan_escapes(&self, key: &PassKey) -> Vec<(usize, usize, usize, usize)> {
+        let g = self.pass_plans.lock();
+        g.as_ref()
+            .and_then(|p| p.escapes.get(key).cloned())
+            .unwrap_or_default()
+    }
+
     /// Keys with a cached plan, and the base's bytes.
     pub fn pass_plan_report(&self) -> Option<(Vec<PassPlanEntry>, usize)> {
         let g = self.pass_plans.lock();
@@ -1362,7 +1411,7 @@ impl MetalDevice {
             .iter()
             .map(|(k, plan)| {
                 let (covered, total) = plan.covered();
-                (*k, covered, total, p.escapes.get(k).copied().unwrap_or(0))
+                (*k, covered, total, p.escapes.get(k).map_or(0, |e| e.len()))
             })
             .collect();
         keys.sort_by_key(|(k, ..)| format!("{k:?}"));
@@ -1386,6 +1435,8 @@ impl MetalDevice {
             )
             .into());
         }
+        self.pass_state
+            .fetch_or(0b10, std::sync::atomic::Ordering::Relaxed);
         // Whatever this pass does, the arena the last pass installed must not
         // serve it: a pass is served only under its own key's plan.
         self.clear_arena_keep_base();
@@ -1451,6 +1502,8 @@ impl MetalDevice {
         let Some(state) = pp.current.take() else {
             return Err(MetalError::Message("finish_pass: no pass is open".to_string()).into());
         };
+        self.pass_state
+            .fetch_and(!0b10, std::sync::atomic::Ordering::Relaxed);
         match state {
             PassState::Served(key) => {
                 self.end_decode_step();
@@ -1498,9 +1551,9 @@ impl MetalDevice {
                 MetalError::Message("finish_pass: no recorder while a key was pending".to_string())
             })?;
             let r = rec.lock();
-            (r.plan_previous(pp.layout), r.previous_undeclared())
+            (r.plan_previous(pp.layout), r.previous_undeclared_ordinals())
         };
-        pp.counters.escapes += undeclared as u64;
+        pp.counters.escapes += undeclared.len() as u64;
         pp.escapes.insert(closes, undeclared);
         let Some(plan) = plan else {
             // The previous pass allocated nothing worth planning; forget it.
@@ -1524,6 +1577,18 @@ impl MetalDevice {
         }
         pp.plans.insert(closes, plan);
         pp.counters.plans += 1;
+        if matches!(closes.kind, PassKind::Ragged { .. }) {
+            pp.ragged_order.push_back(closes);
+            while pp.ragged_order.len() > pp.ragged_cap {
+                if let Some(old) = pp.ragged_order.pop_front() {
+                    if pp.plans.remove(&old).is_some() {
+                        pp.arenas.remove(&old);
+                        pp.escapes.remove(&old);
+                        pp.counters.capped += 1;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1789,7 +1854,18 @@ impl MetalDevice {
     /// drops -- see `ArenaRecorder::record_bind` for why the CPU's clock is the
     /// wrong one.
     fn note_for_recording(&self, buffer: Arc<PooledBuffer>, size: usize) -> Arc<PooledBuffer> {
+        // Under the pass cache only a pass's own allocations are ordinals:
+        // one made between passes takes none, and the address it lands on
+        // stops naming the value that held it (`forget_addr`).
+        let between_passes = self.pass_state.load(std::sync::atomic::Ordering::Relaxed) == 0b01;
         let guard = self.arena_recorder.lock();
+        if between_passes {
+            if let Some(rec) = guard.as_ref() {
+                let mut r = rec.lock();
+                r.forget_addr(buffer.raw_addr());
+            }
+            return buffer;
+        }
         let Some(rec) = guard.as_ref() else {
             return buffer;
         };

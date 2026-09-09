@@ -220,6 +220,12 @@ pub enum PassKind {
     Prefill { w: u32, fresh: bool },
     /// One speculative verify pass of `k` positions.
     Verify { k: u16 },
+    /// One batched step of `live` decode rows with `pieces` prompt pieces
+    /// riding it as extra ragged rows (#728). `layout` hashes the pieces'
+    /// widths in order: the dispatch sequence is a function of every width,
+    /// so each distinct layout is its own key. The caller bounds the set —
+    /// the `ladder` arm quantises widths, the `lru` arm bounds the cache.
+    Ragged { live: u16, pieces: u16, layout: u64 },
 }
 
 /// A pass kind under the axes that change its dispatch sequence. `arms` is
@@ -259,6 +265,10 @@ pub struct PassPlanCounters {
     pub escapes: u64,
     /// Times the shared base buffer was (re)allocated.
     pub base_grows: u64,
+    /// `Ragged` plans dropped because the cache holds at most
+    /// `MetalDevice::set_pass_plan_ragged_cap` of them (the `lru` arm's
+    /// bound); a dropped layout is recorded again on its next sight.
+    pub capped: u64,
 }
 
 /// Alignment of every slot, in bytes.
@@ -1502,7 +1512,7 @@ pub struct ArenaRecorder {
     ///
     /// The direct measurement of "this value is session state" (§9.1): it is
     /// still being read a step after it was produced.
-    survived: std::collections::HashSet<usize>,
+    survived: std::collections::HashMap<usize, usize>,
     /// Ordinals of the CURRENT step allocated under an [`EscapeGuard`].
     declared: std::collections::HashSet<usize>,
     /// The previous step's `declared`, kept for [`Self::plan_previous`].
@@ -1609,7 +1619,7 @@ impl ArenaRecorder {
     /// allocation of one step is the Nth of the next.
     pub fn outlives_step(&self) -> Vec<bool> {
         let n = self.sizes.len();
-        (0..n).map(|i| self.survived.contains(&i)).collect()
+        (0..n).map(|i| self.survived.contains_key(&i)).collect()
     }
 
     /// Every ordinal the arena must decline: session state by either test.
@@ -1676,8 +1686,24 @@ impl ArenaRecorder {
         if let Some(&ordinal) = self.by_addr.get(&addr) {
             self.last_bind[ordinal] = self.dispatch;
         } else if let Some(&ordinal) = self.previous_by_addr.get(&addr) {
-            self.survived.insert(ordinal);
+            // The first bind's position in THIS step, for naming the escape.
+            self.survived.entry(ordinal).or_insert(self.dispatch);
         }
+    }
+
+    /// Forget the value at `addr`: an allocation was served there that is
+    /// NOT part of the recorded sequence (under the pass cache, one made
+    /// between two passes — a sampler's ids, a staged input, a cat of the
+    /// step's rows). It takes no ordinal, and the address must stop naming
+    /// whatever held it, or a bind of the NEW value is read as a bind of the
+    /// old one and the old one is reported as escaping its pass — a phantom
+    /// escape, and a hole punched in the plan for a value that never
+    /// outlived anything. Measured: exactly one per batched step before this
+    /// (the pool handing a between-pass allocation the address the step's
+    /// logits had just left).
+    pub fn forget_addr(&mut self, addr: usize) {
+        self.by_addr.remove(&addr);
+        self.previous_by_addr.remove(&addr);
     }
 
     /// Advance the dispatch counter. Called once per dispatch, in encode order.
@@ -1729,7 +1755,7 @@ impl ArenaRecorder {
             return None;
         }
         let excluded: Vec<bool> = (0..n)
-            .map(|i| self.survived.contains(&i) || self.previous_declared.contains(&i))
+            .map(|i| self.survived.contains_key(&i) || self.previous_declared.contains(&i))
             .collect();
         Some(plan_from_intervals(
             &self.previous,
@@ -1749,10 +1775,28 @@ impl ArenaRecorder {
     /// Ordinals of the previous step this step bound that no [`EscapeGuard`]
     /// had declared — the escapes the plan cache counts as holes.
     pub fn previous_undeclared(&self) -> usize {
-        self.survived
+        self.previous_undeclared_ordinals().len()
+    }
+
+    /// The same escapes as `(ordinal, bytes, allocated at dispatch, first
+    /// read at dispatch of the following step)`, sorted by ordinal — what
+    /// names an escape when one shows up.
+    pub fn previous_undeclared_ordinals(&self) -> Vec<(usize, usize, usize, usize)> {
+        let mut v: Vec<(usize, usize, usize, usize)> = self
+            .survived
             .iter()
-            .filter(|i| !self.previous_declared.contains(i))
-            .count()
+            .filter(|(i, _)| !self.previous_declared.contains(i))
+            .map(|(&i, &at)| {
+                (
+                    i,
+                    self.previous.get(i).copied().unwrap_or(0),
+                    self.previous_first_bind.get(i).copied().unwrap_or(0),
+                    at,
+                )
+            })
+            .collect();
+        v.sort_unstable();
+        v
     }
 
     /// The dispatch position ordinal `i` of the CURRENT step was last bound

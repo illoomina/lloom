@@ -492,6 +492,15 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     prefill_chunk: usize,
 
+    /// Under `--mode concurrent` with `--prefill-chunk`: how a prompt PIECE's
+    /// width is chosen — `lru` (default: as wide as the chunk and the tile
+    /// allow; the plan cache keeps a bounded number of ragged layouts) or
+    /// `ladder` (rounded down to a rung of `{top, top/2, …, 1}`, so the
+    /// pieces come from `O(log top)` widths). The two arms of `DESIGN.md`
+    /// §9.2aa I4, to be measured; a null without `--pass-plans`.
+    #[arg(long, default_value = "lru")]
+    pass_widths: String,
+
     /// Under `--mode concurrent`: sequence `i` ARRIVES at round (time-sliced)
     /// or step (`--batched`) `i × N`; `0` (default) admits every sequence at
     /// once. With `--long-prompt-tokens` this is the serving shape a chunk is
@@ -1467,6 +1476,8 @@ fn main() -> Result<()> {
             prefill_ubatch: args.prefill_ubatch,
             prefill_tile: args.prefill_tile,
             prefill_chunk: args.prefill_chunk,
+            pass_widths: lloom::nn::PassWidths::parse(&args.pass_widths)
+                .map_err(|e| anyhow::anyhow!(e))?,
             stagger: args.stagger,
             long_prompt_tokens: args.long_prompt_tokens,
             dspark: args.dspark,
@@ -1633,6 +1644,9 @@ fn main() -> Result<()> {
     let mut opts = DecodeOptions {
         max_tokens: args.max_tokens,
         budget,
+        // The single-turn loop feeds one prompt: it takes no ragged steps,
+        // so the width arm is a null here (`--mode concurrent` reads it).
+        pass_widths: lloom::nn::PassWidths::Lru,
         lookahead: args.lookahead,
         // Under the speculative body this is the per-phase drain (decode.rs).
         sample_split: args.phase_sync,
@@ -2619,15 +2633,17 @@ fn main() -> Result<()> {
                     .collect();
                 eprintln!(
                     "[pass plans: served={} recorded={} observed={} plans={} evicted={} \
-                     escapes={} base_grows={} base={:.1} MiB keys=[{}]]",
+                     escapes={} capped={} base_grows={} base={:.1} MiB widths={} keys=[{}]]",
                     c.served,
                     c.recorded,
                     c.observed,
                     c.plans,
                     c.evicted,
                     c.escapes,
+                    c.capped,
                     c.base_grows,
                     base as f64 / (1024.0 * 1024.0),
+                    args.pass_widths,
                     keys.join(" ")
                 );
             }

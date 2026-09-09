@@ -110,6 +110,9 @@ pub struct Ctx<'a> {
     /// visit (interleave) or per step (batched), between the others' decode.
     /// `0` prefills a prompt whole at its arrival.
     pub prefill_chunk: usize,
+    /// `--pass-widths`: how a prompt piece's width is chosen (`lru` |
+    /// `ladder`), on the batched arm's pieces and this driver's visits.
+    pub pass_widths: lloom::nn::PassWidths,
     /// `--stagger`: sequence `i` arrives at round/step `i × stagger`.
     pub stagger: usize,
     /// `--long-prompt-tokens`: the last sequence's synthetic prompt length in
@@ -406,6 +409,9 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         // The time-sliced interleave chunks at the visit level (`run_concurrent`)
         // and the batched driver reads its own copy (`run_batched_concurrent`).
         prefill_chunk: 0,
+        // A visit feeds one whole chunk; this driver applies the ladder to
+        // the visit's width itself (`run_concurrent`).
+        pass_widths: lloom::nn::PassWidths::Lru,
     };
     let capacity = 8 * ctx.max_tokens + 8 * (budget.period() + 2);
 
@@ -590,6 +596,15 @@ fn run_concurrent(
                 let remaining = prompts[i].len() - prefilled[i];
                 let take = if ctx.prefill_chunk == 0 {
                     remaining
+                } else if ctx.pass_widths == lloom::nn::PassWidths::Ladder {
+                    // The visit's width from the ladder's rungs (§9.2aa I4):
+                    // the tile bounded by the chunk is the top rung.
+                    let top = if ctx.prefill_tile > 0 {
+                        ctx.prefill_tile.min(ctx.prefill_chunk)
+                    } else {
+                        ctx.prefill_chunk
+                    };
+                    lloom::nn::ladder_width(remaining.min(ctx.prefill_chunk), top)
                 } else {
                     remaining.min(ctx.prefill_chunk)
                 };
@@ -1069,6 +1084,7 @@ fn run_batched_concurrent(
         lookahead: ctx.lookahead.min(1),
         prefill_tile: ctx.prefill_tile,
         prefill_chunk: ctx.prefill_chunk,
+        pass_widths: ctx.pass_widths,
         ..DecodeOptions::new(ctx.max_tokens)
     };
     // Row `i` arrives at step `i × stagger`.

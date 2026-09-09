@@ -55,7 +55,7 @@ pub use conv::{
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
 pub use decode::{
-    DecodeOptions, DecodeOut, DecodeStats, IdentityProposer, RoundStats, StepPhases,
+    DecodeOptions, DecodeOut, DecodeStats, IdentityProposer, PrefillOut, RoundStats, StepPhases,
     FIRST_STEPS_TRACED,
 };
 pub use embedding::{embedding, Embedding};

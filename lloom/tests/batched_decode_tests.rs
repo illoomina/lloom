@@ -400,3 +400,116 @@ fn the_refusals_refuse() -> Result<()> {
     assert!(err.to_string().contains("overrun"), "{err}");
     Ok(())
 }
+
+/// The CHUNK under the batched driver (lloom #728): rows admitted a chunk per
+/// step, rows arriving mid-run, and a tile bounding each prefill forward all
+/// produce their solo chains; the forwards a row's prompt took are counted
+/// off the run; and a row joins the batch at the step the design names.
+#[test]
+fn chunked_admission_and_late_arrivals_produce_the_solo_chains() -> Result<()> {
+    // Row 0's chain reaches EOS at its ninth token, row 1's never does (the
+    // cap ends it), row 2 arrives at step 4 with a four-token prompt.
+    let prompts: Vec<Vec<u32>> = vec![vec![9, 9, 9, 9, 9, 3, 1], vec![0], vec![9, 9, 9, 5]];
+    let arrivals = [0u64, 0, 4];
+    let max = 12;
+    let want: Vec<(Vec<u32>, bool)> = prompts
+        .iter()
+        .map(|p| chain(*p.last().unwrap(), max))
+        .collect();
+    assert!(
+        want[0].1 && !want[1].1,
+        "the fixture must mix EOS and cap endings"
+    );
+    for device in devices() {
+        for lookahead in [0usize, 1] {
+            for (chunk, tile) in [(0usize, 0usize), (0, 2), (1, 0), (2, 0), (3, 0), (3, 2)] {
+                let model: &'static Chain = Box::leak(Box::new(Chain::new(&device)?));
+                let mut sessions: Vec<Session<'static, Chain>> = prompts
+                    .iter()
+                    .map(|_| Session::new(model, 0usize))
+                    .collect();
+                let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+                let opts = DecodeOptions {
+                    lookahead,
+                    prefill_chunk: chunk,
+                    prefill_tile: tile,
+                    ..DecodeOptions::new(max)
+                };
+                let mut streamed: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+                let outs = Session::decode_batched_admitted(
+                    &mut sessions,
+                    &mut greedy(),
+                    &refs,
+                    &arrivals,
+                    &opts,
+                    &[EOS],
+                    &device,
+                    &mut |i, ids| {
+                        streamed[i].extend_from_slice(ids);
+                        Ok(())
+                    },
+                )?;
+                let tag = format!("{device:?} lookahead {lookahead} chunk {chunk} tile {tile}");
+                for (i, (ids, eos)) in want.iter().enumerate() {
+                    assert_eq!(&outs[i].ids, ids, "{tag}: row {i} ids");
+                    assert_eq!(outs[i].eos, *eos, "{tag}: row {i} eos");
+                    assert_eq!(streamed[i], outs[i].ids, "{tag}: row {i} streamed");
+                    // The forwards the prompt took: whole, or per chunk, each
+                    // bounded by the tile.
+                    let len = prompts[i].len();
+                    let pieces: Vec<usize> = if chunk == 0 {
+                        vec![len]
+                    } else {
+                        let mut v = Vec::new();
+                        let mut left = len;
+                        while left > 0 {
+                            let t = left.min(chunk);
+                            v.push(t);
+                            left -= t;
+                        }
+                        v
+                    };
+                    let want_units: usize = pieces
+                        .iter()
+                        .map(|&p| if tile == 0 { 1 } else { p.div_ceil(tile) })
+                        .sum();
+                    assert_eq!(
+                        outs[i].stats.prefill_units, want_units,
+                        "{tag}: row {i} prefill forwards"
+                    );
+                    // The positions fed past the prompt: every id plus the
+                    // overrun, except that the blocking arm streams a cap
+                    // row's last token without feeding it.
+                    let fed = sessions[i].pos() - len;
+                    let want_fed = if lookahead == 0 && !eos {
+                        ids.len() - 1
+                    } else {
+                        ids.len() + outs[i].stats.overrun
+                    };
+                    assert_eq!(fed, want_fed, "{tag}: row {i} positions fed");
+                }
+                // Row 2 joins after its arrival; the earliest it can decode is
+                // the step after its last chunk. Read off row 1's per-step
+                // batch width (row 1 outlives everyone).
+                let widths = &outs[1].stats.batch_rows;
+                let first3 = widths.iter().position(|&b| b == 3);
+                assert!(first3.is_some(), "{tag}: row 2 never joined: {widths:?}");
+                // Hand-derived for the two schedules the design names.
+                if chunk == 0 && tile == 0 {
+                    // Rows 0 and 1 are fed at step 0 and decode from step 1;
+                    // row 2 is fed whole at step 4 and decodes from step 5.
+                    assert_eq!(first3, Some(4), "{tag}: {widths:?}");
+                }
+                if chunk == 3 && tile == 0 {
+                    // The budget is a token budget over the pending rows in
+                    // order: steps 0–1 feed row 0 three tokens each, step 2
+                    // feeds its last token and, with two left in the budget,
+                    // row 1's one — so both decode from step 3. Row 2 takes
+                    // steps 4–5 and decodes from step 6: row 1's fourth step.
+                    assert_eq!(first3, Some(3), "{tag}: {widths:?}");
+                }
+            }
+        }
+    }
+    Ok(())
+}

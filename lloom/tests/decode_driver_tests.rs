@@ -993,3 +993,116 @@ fn a_ring_reader_sees_the_loops_stream_off_the_ring() -> Result<()> {
     }
     Ok(())
 }
+
+/// The TILE (lloom #728): a tiled prefill takes `ceil(prompt / tile)`
+/// forwards — counted off the run, not computed from the option — and the
+/// ids, the position and the token log are one-shot's. On a ring arm under
+/// Metal the pacer takes one marker per forward, prompt units included.
+#[test]
+fn a_tiled_prefill_takes_the_forwards_it_names_and_changes_nothing_else() -> Result<()> {
+    for device in devices() {
+        for arm in [Arm::Blocking, Arm::RingPoll] {
+            let lookahead = usize::from(matches!(arm, Arm::RingPoll));
+            let prompt: Vec<u32> = vec![9, 9, 9, 9, 9, 9, 9, 9, 9, 0];
+            let base_opts = DecodeOptions {
+                lookahead,
+                ..DecodeOptions::new(8)
+            };
+            let (base, base_pos) = run(&device, &arm, &prompt, &base_opts)?;
+            assert_eq!(base.stats.prefill_units, 1, "one-shot is one forward");
+            assert_eq!(base.ids, chain(0, 8).0);
+            for (tile, want_units) in [(3usize, 4usize), (5, 2), (10, 1), (64, 1)] {
+                let opts = DecodeOptions {
+                    prefill_tile: tile,
+                    ..base_opts.clone()
+                };
+                let (out, pos) = run(&device, &arm, &prompt, &opts)?;
+                assert_eq!(out.ids, base.ids, "{device:?} {arm:?} tile {tile}: ids");
+                assert_eq!(
+                    out.stats.prefill_units, want_units,
+                    "{device:?} {arm:?} tile {tile}: forwards"
+                );
+                assert_eq!(pos, base_pos, "{device:?} {arm:?} tile {tile}: position");
+                assert_eq!(out.stats.steps, base.stats.steps);
+                if matches!(device, Device::Metal(_)) && matches!(arm, Arm::RingPoll) {
+                    assert_eq!(
+                        out.stats.step_markers,
+                        out.stats.steps + want_units as u64,
+                        "{device:?} tile {tile}: one marker per forward, prompt units included"
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The CHUNK seam (lloom #728): a prompt fed in pieces through
+/// `Session::prefill`, then a decode with an empty prompt resuming from the
+/// held logits, is one decode over the whole prompt — same ids, same
+/// position, same token log — and an empty prefill is a no-op.
+#[test]
+fn a_prompt_prefilled_in_chunks_then_resumed_is_one_decode() -> Result<()> {
+    for device in devices() {
+        for arm in [Arm::Blocking, Arm::RingPoll] {
+            let lookahead = usize::from(matches!(arm, Arm::RingPoll));
+            let opts = DecodeOptions {
+                lookahead,
+                ..DecodeOptions::new(6)
+            };
+            let prompt = [9u32, 9, 9, 9, 9, 9, 9, 0];
+            let (reference, ref_pos) = run(&device, &arm, &prompt, &opts)?;
+
+            let model = Chain::new(&device)?;
+            let mut session = Session::new(&model, 0usize);
+            let mut spec = IdentityProposer;
+            let mut rb = strategy(&arm, &device, opts.max_tokens + 4)?;
+            let mut sampler = greedy();
+            assert_eq!(
+                session.prefill(&mut rb, &[], &opts)?,
+                lloom::nn::PrefillOut::default(),
+                "an empty prefill takes no forward"
+            );
+            let mut done = 0usize;
+            for chunk in [3usize, 3, 2] {
+                let out = session.prefill(&mut rb, &prompt[done..done + chunk], &opts)?;
+                assert_eq!(out.units, 1, "{device:?} {arm:?}: one forward per chunk");
+                done += chunk;
+                assert_eq!(session.pos(), done);
+                assert_eq!(session.tokens(), &prompt[..done]);
+            }
+            // The tile applies to a chunk too: a 4-token chunk at tile 3 is two forwards.
+            let mut tiled = Session::new(&model, 0usize);
+            let tiled_opts = DecodeOptions {
+                prefill_tile: 3,
+                ..opts.clone()
+            };
+            let mut rb_t = strategy(&arm, &device, opts.max_tokens + 4)?;
+            assert_eq!(
+                tiled.prefill(&mut rb_t, &prompt[..4], &tiled_opts)?.units,
+                2
+            );
+            assert_eq!(
+                tiled.prefill(&mut rb_t, &prompt[4..], &tiled_opts)?.units,
+                2
+            );
+
+            // Resume: the empty prompt continues from the held logits.
+            let out = session.decode(&mut spec, &mut rb, &mut sampler, &[], &opts, &mut sink)?;
+            assert_eq!(
+                out.ids, reference.ids,
+                "{device:?} {arm:?}: the chunked run's ids"
+            );
+            assert_eq!(out.eos, reference.eos);
+            assert_eq!(
+                out.stats.prefill_units, 0,
+                "a resume takes no prefill forward"
+            );
+            assert_eq!(session.pos(), ref_pos);
+            let out_t = tiled.decode(&mut spec, &mut rb_t, &mut sampler, &[], &opts, &mut sink)?;
+            assert_eq!(out_t.ids, reference.ids);
+            assert_eq!(tiled.pos(), ref_pos);
+        }
+    }
+    Ok(())
+}

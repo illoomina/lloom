@@ -484,6 +484,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     // prefill: the incumbent behaviour on both dials.
                     in_flight_depth: 0,
                     prefill_ubatch: 0,
+                    prefill_schedule: None,
+                    prefill_tile: 0,
+                    prefill_chunk: 0,
                 };
                 self.session.decode_until(
                     &mut spec,

@@ -450,6 +450,65 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     prefill_ubatch: usize,
 
+    /// The prefill TILE (llama.cpp's `n_ubatch`): the most prompt tokens ONE
+    /// forward takes. `0` (default) leaves every forward as wide as the ramp
+    /// or `--spark` makes it — the incumbent. A positive value feeds the
+    /// prompt as sequential forwards of at most this width (the last one
+    /// narrower), so the prompt's activation working set is bounded by the
+    /// tile rather than by the prompt (DESIGN §9.5n's `a·C² + b·C` at
+    /// `C = tile`) and every forward lands on one GEMM shape. Composes with
+    /// `--prefill-ubatch`/`--spark` (it bounds whatever forwards they name)
+    /// and forces the conv left-context carry on. Applies to the single path
+    /// and to every `--mode concurrent` arm; refused with `--dspark`, whose
+    /// seed does not read it. The RESULT line reports `prefill_tile=` and the
+    /// forwards taken (`prefill_units=`).
+    #[arg(long, default_value_t = 0)]
+    prefill_tile: usize,
+
+    /// Under `--mode concurrent`: the prefill CHUNK — the most prompt tokens
+    /// fed of ONE sequence per scheduler visit (the time-sliced interleave) or
+    /// per batched step (`--batched`), interleaved with the other sequences'
+    /// decode (vLLM's chunked prefill / `n_batch`'s token budget). `0`
+    /// (default) prefills a sequence's whole prompt at its arrival, before
+    /// anyone else decodes — the head-of-line-blocking shape. Every stream is
+    /// still byte-identical to its solo run; the chunk moves where the prompt
+    /// work sits between the others' tokens. Refused with `--dspark`.
+    #[arg(long, default_value_t = 0)]
+    prefill_chunk: usize,
+
+    /// Under `--mode concurrent`: sequence `i` ARRIVES at round (time-sliced)
+    /// or step (`--batched`) `i × N`; `0` (default) admits every sequence at
+    /// once. With `--long-prompt-tokens` this is the serving shape a chunk is
+    /// for: a long prompt lands while the earlier sequences are mid-reply, and
+    /// their inter-token gap during its prefill is what `--prefill-chunk`
+    /// bounds. Per-sequence TTFT is measured from the arrival.
+    #[arg(long, default_value_t = 0)]
+    stagger: usize,
+
+    /// Under `--mode concurrent`: give the LAST sequence a synthetic prompt of
+    /// exactly this many body tokens (the corpus's long-summarize text
+    /// repeated, wrapped in the chat template), so a long prompt arrives beside
+    /// the short corpus prompts. `0` (default) keeps the corpus prompt.
+    #[arg(long, default_value_t = 0)]
+    long_prompt_tokens: usize,
+
+    /// Sample, on a side thread every 10 ms for the whole run, the process's
+    /// `MTLDevice.currentAllocatedSize`, the buffer pool's live / free /
+    /// pending bytes and its `phys_footprint`, and print their PEAKS — the
+    /// gauge a prefill's activation excursion (§9.5o's `pending`) is read on.
+    /// Off the hot thread; a `MEMPEAK` line follows the RESULT line.
+    #[arg(long)]
+    mem_sample: bool,
+
+    /// The buffer pool's free-list budget in MiB (`MetalDevice::set_free_budget`;
+    /// 256 ships, §6.3b). A measurement arm for the tiled prefill: a budget
+    /// that holds one tile's activations lets the next tile reuse them instead
+    /// of allocating afresh (§9.5o measured the one-shot pass WORSE under a
+    /// larger budget — a retained buffer is still a byte the OS bills for).
+    /// Unset keeps the default. Not an axis; no default is flipped.
+    #[arg(long)]
+    free_budget_mb: Option<usize>,
+
     /// The prefill's forward schedule, in **aligned GEMM buckets**. Overrides
     /// `--prefill-ubatch` when set; unset keeps the incumbent one-shot / ubatch
     /// ramp, byte-identical.
@@ -640,6 +699,115 @@ fn read_drafter_config(dir: &Path) -> Result<DSparkConfig> {
 /// The `--spark` grammar: parse a schedule string into the aligned-bucket
 /// forward widths [`DecodeOptions::prefill_schedule`] takes, and tag each width
 /// with the GEMM tile variant it selects for the RESULT line.
+/// The peaks a [`MemSampler`] reduced its samples to, in bytes.
+#[derive(Debug, Clone, Copy, Default)]
+struct MemPeaks {
+    samples: u64,
+    /// `currentAllocatedSize` at the first sample: the run's floor (weights,
+    /// the pool's retained buffers), so the excursion is `peak − first`.
+    first_device_allocated: u64,
+    device_allocated: u64,
+    pool_live: u64,
+    pool_free: u64,
+    pool_pending: u64,
+    phys_footprint: u64,
+}
+
+impl MemPeaks {
+    /// The stderr line and the `MEMPEAK` stdout line (gauges: bytes, exact,
+    /// load-independent; the sample count says the thread ran).
+    fn report(&self) {
+        let gb = |b: u64| b as f64 / 1e9;
+        eprintln!(
+            "[mem: {} samples; device_allocated first {:.3} GB peak {:.3} GB (+{:.3}); pool peaks \
+             live {:.3} free {:.3} pending {:.3} GB; phys_footprint peak {:.3} GB]",
+            self.samples,
+            gb(self.first_device_allocated),
+            gb(self.device_allocated),
+            gb(self
+                .device_allocated
+                .saturating_sub(self.first_device_allocated)),
+            gb(self.pool_live),
+            gb(self.pool_free),
+            gb(self.pool_pending),
+            gb(self.phys_footprint),
+        );
+        println!(
+            "MEMPEAK samples={} first_device_gb={:.4} peak_device_gb={:.4} device_excursion_gb={:.4} \
+             peak_pool_live_gb={:.4} peak_pool_free_gb={:.4} peak_pool_pending_gb={:.4} \
+             peak_phys_gb={:.4}",
+            self.samples,
+            gb(self.first_device_allocated),
+            gb(self.device_allocated),
+            gb(self.device_allocated.saturating_sub(self.first_device_allocated)),
+            gb(self.pool_live),
+            gb(self.pool_free),
+            gb(self.pool_pending),
+            gb(self.phys_footprint),
+        );
+    }
+}
+
+/// A side-thread gauge of what the process holds — `MTLDevice.currentAllocatedSize`,
+/// the buffer pool's live / free / pending bytes and `phys_footprint` — sampled
+/// every 10 ms and reduced to peaks. Nothing on the decode thread; the pool
+/// counters are the pool's own mutexed reads, the footprint is one syscall.
+struct MemSampler {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<MemPeaks>,
+}
+
+impl MemSampler {
+    /// `None` off Metal, where none of the three gauges exists.
+    fn start(device: &Device) -> Option<Self> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = device {
+            let m = m.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                let mut peaks = MemPeaks::default();
+                loop {
+                    let (shared, private) = m.pool_occupancy();
+                    let dev = m.device().current_allocated_size() as u64;
+                    let phys = candle_examples::lfm2_setup::proc_footprint()
+                        .map(|(p, _)| p)
+                        .unwrap_or(0);
+                    if peaks.samples == 0 {
+                        peaks.first_device_allocated = dev;
+                    }
+                    peaks.samples += 1;
+                    peaks.device_allocated = peaks.device_allocated.max(dev);
+                    peaks.pool_live = peaks
+                        .pool_live
+                        .max((shared.live_bytes + private.live_bytes) as u64);
+                    peaks.pool_free = peaks
+                        .pool_free
+                        .max((shared.free_bytes + private.free_bytes) as u64);
+                    peaks.pool_pending = peaks
+                        .pool_pending
+                        .max((shared.pending_bytes + private.pending_bytes) as u64);
+                    peaks.phys_footprint = peaks.phys_footprint.max(phys);
+                    if flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                peaks
+            });
+            return Some(Self { stop, handle });
+        }
+        let _ = device;
+        None
+    }
+
+    /// Take one last sample and join.
+    fn stop(self) -> MemPeaks {
+        self.stop.store(true, Ordering::Release);
+        self.handle.join().unwrap_or_default()
+    }
+}
+
 mod spark {
     use anyhow::{bail, Result};
 
@@ -791,6 +959,13 @@ fn main() -> Result<()> {
     // candle_examples::device). F16 on GPU matches the inference path; CPU has
     // no f16 kernels for everything here, so it runs in f32.
     let device = candle_examples::device(args.cpu)?;
+    if let Some(mb) = args.free_budget_mb {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = &device {
+            m.set_free_budget(mb * 1024 * 1024);
+            eprintln!("[pool: free budget set to {mb} MiB]");
+        }
+    }
     let dtype = if device.is_cpu() {
         DType::F32
     } else {
@@ -995,8 +1170,21 @@ fn main() -> Result<()> {
     // from char 1). With it on, a chunked prefill computes exactly what one-shot
     // does. A single chunk (or one-shot) is identical either way (cold cache, no
     // left context to carry), so forcing it on when streaming is always safe.
-    config.conv_prefill_ctx =
-        args.conv_prefill_ctx || args.prefill_ubatch > 0 || spark_multi_forward;
+    config.conv_prefill_ctx = args.conv_prefill_ctx
+        || args.prefill_ubatch > 0
+        || spark_multi_forward
+        || args.prefill_tile > 0
+        || args.prefill_chunk > 0;
+    // The speculative drivers seed the drafter through `prefill_streamed`,
+    // which reads neither the tile nor the chunk; refused rather than
+    // rendered as an arm that did not run (§7.1a-i).
+    if args.dspark && (args.prefill_tile > 0 || args.prefill_chunk > 0) {
+        anyhow::bail!(
+            "--prefill-tile/--prefill-chunk are not read by --dspark (its seed is \
+             `Session::prefill_streamed`, the spark-then-remainder ramp); run them on the \
+             K=1 loop or the batched driver"
+        );
+    }
 
     let files = weight_files(&model_dir)?;
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
@@ -1155,6 +1343,10 @@ fn main() -> Result<()> {
             sequences: args.sequences,
             chunk: args.chunk,
             prefill_ubatch: args.prefill_ubatch,
+            prefill_tile: args.prefill_tile,
+            prefill_chunk: args.prefill_chunk,
+            stagger: args.stagger,
+            long_prompt_tokens: args.long_prompt_tokens,
             dspark: args.dspark,
             batched: args.batched,
             check_independence: !args.no_independence_check,
@@ -1166,7 +1358,15 @@ fn main() -> Result<()> {
             timeline: args.timeline.clone(),
             encode: &encode,
         };
-        return concurrent::run(ctx);
+        let sampler = args
+            .mem_sample
+            .then(|| MemSampler::start(&device))
+            .flatten();
+        let r = concurrent::run(ctx);
+        if let Some(s) = sampler {
+            s.stop().report();
+        }
+        return r;
     }
 
     // Install the ICB replay executor AFTER warmup — so the warmup's forwards do
@@ -1319,6 +1519,10 @@ fn main() -> Result<()> {
         prefill_ubatch: args.prefill_ubatch,
         // `--spark` (aligned-bucket schedule) overrides the ubatch ramp when set.
         prefill_schedule: spark_schedule.clone(),
+        // The tile bounds every prefill forward the ramp or the schedule names.
+        prefill_tile: args.prefill_tile,
+        // One sequence: nothing to interleave a chunk with.
+        prefill_chunk: 0,
     };
 
     // The readback strategy is built BEFORE the prompt is read: it depends on
@@ -1430,7 +1634,8 @@ fn main() -> Result<()> {
             // so the counterfactual (cold drafter) stays measurable.
             if std::env::var("LLOOM_SKIP_WARMUP").is_err() {
                 let (dlibs, dpipes) = cache_sizes_of(&device);
-                spec.warmup(&device).context("warming DSpark drafter pipelines")?;
+                spec.warmup(&device)
+                    .context("warming DSpark drafter pipelines")?;
                 let (dlibs2, dpipes2) = cache_sizes_of(&device);
                 eprintln!(
                     "[dspark: drafter warmup +{} libs +{} pipelines]",
@@ -1471,6 +1676,10 @@ fn main() -> Result<()> {
         Device::Metal(m) => Some(churn_snapshot(m)),
         _ => None,
     };
+    let mem_sampler = args
+        .mem_sample
+        .then(|| MemSampler::start(&device))
+        .flatten();
     let decode_start = std::time::Instant::now();
     // Page faults the process takes during the decode (`getrusage`, two calls
     // off the loop): the number that says whether there is anything left to
@@ -1930,12 +2139,13 @@ fn main() -> Result<()> {
             mib(kv.bytes)
         );
     }
+    let mem_peaks = mem_sampler.map(|s| s.stop());
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \
          {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} bos={} \
-         readback={} lookahead={} prefill_ubatch={} prefill_units={} \
-         commit_budget={} commits={} max_in_flight={} \
+         readback={} lookahead={} prefill_ubatch={} prefill_tile={} prefill_units={} \
+         prompt_tokens={} free_budget_mb={} commit_budget={} commits={} max_in_flight={} \
          step_markers={} step_waits={} cut={} pipelined_cut={} \
          ring_publishes={} poll_fallbacks={} eos_index={}/{} overrun={} eos={} param-style={}]",
         b(format!("{end_to_end:.1}")),
@@ -1960,7 +2170,12 @@ fn main() -> Result<()> {
         },
         concurrent::read_or_na(!args.dspark, args.lookahead),
         args.prefill_ubatch,
+        concurrent::read_or_na(!args.dspark, args.prefill_tile),
         st.prefill_units,
+        prompt_ids.len(),
+        args.free_budget_mb
+            .map(|mb| mb.to_string())
+            .unwrap_or_else(|| "default".to_string()),
         concurrent::read_or_na(!args.dspark, budget.arm()),
         st.commits,
         st.max_in_flight,
@@ -1976,6 +2191,9 @@ fn main() -> Result<()> {
         out.eos,
         param_style_arm(),
     );
+    if let Some(p) = mem_peaks {
+        p.report();
+    }
     #[cfg(feature = "metal")]
     if let Some(exec) = icb_exec.as_ref() {
         report_replay(exec, st.steps);
@@ -2697,7 +2915,7 @@ fn build_readback(
         // stages into one reused buffer; 0 leaves it at `quantum` (the one-shot
         // path allocates its whole-prompt input tensor via the trait default, so
         // the input buffer width is not consulted there).
-        max_input_width: opts.prefill_ubatch(),
+        max_input_width: opts.max_prefill_width(),
         // The input ring needs `depth + 1` buffers so a host-staged chunk does not
         // race an in-flight forward's read; the pacer depth is what bounds that.
         in_flight_depth: opts.pacer_depth(),

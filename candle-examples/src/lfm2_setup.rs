@@ -51,7 +51,8 @@ use std::path::{Path, PathBuf};
 /// Both of the last two change how much memory a token moves, so both matter to
 /// a bandwidth argument as well as to a digest.
 pub fn parse_config(raw: &str) -> Result<Config> {
-    let root: Value = serde_json::from_str(raw).map_err(|e| Error::msg(format!("parsing config.json: {e}")))?;
+    let root: Value =
+        serde_json::from_str(raw).map_err(|e| Error::msg(format!("parsing config.json: {e}")))?;
     let text = root.get("text_config").unwrap_or(&root);
     let mut obj = text
         .as_object()
@@ -170,4 +171,47 @@ pub fn default_model_dir() -> Option<PathBuf> {
         .collect();
     entries.sort();
     entries.pop()
+}
+
+/// The process's `(phys_footprint, resident_size)` in bytes from
+/// `proc_pid_rusage(RUSAGE_INFO_V6)`, or `None` off macOS or on a failed call.
+///
+/// Field offsets in `u64` words, read from `<sys/resource.h>`'s `struct
+/// rusage_info_v6` rather than recalled: the struct opens with `uint8_t
+/// ri_uuid[16]` (2 words), then `ri_user_time`, `ri_system_time`,
+/// `ri_pkg_idle_wkups`, `ri_interrupt_wkups`, `ri_pageins`, `ri_wired_size`,
+/// `ri_resident_size`, `ri_phys_footprint`. A wrong offset returns a plausible
+/// number rather than an error, so a caller sanity-checks the pair against what
+/// it knows the process holds.
+#[cfg(target_os = "macos")]
+pub fn proc_footprint() -> Option<(u64, u64)> {
+    const RUSAGE_INFO_V6: i32 = 6;
+    const W_RESIDENT: usize = 8;
+    const W_PHYS: usize = 9;
+    // 64 words = 512 B against the struct's ~472 B, so the call cannot write
+    // past the buffer even if a later SDK appends a field.
+    const WORDS: usize = 64;
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+    }
+    let mut buf = [0u64; WORDS];
+    // SAFETY: `proc_pid_rusage` writes at most `sizeof(rusage_info_v6)` bytes
+    // (~472) into the buffer, and `WORDS * 8 = 512` is larger, so the write is
+    // in bounds; the buffer outlives the call.
+    let rc = unsafe {
+        proc_pid_rusage(
+            std::process::id() as i32,
+            RUSAGE_INFO_V6,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some((buf[W_PHYS], buf[W_RESIDENT]))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn proc_footprint() -> Option<(u64, u64)> {
+    None
 }

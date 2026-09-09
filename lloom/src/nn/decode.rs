@@ -189,6 +189,34 @@ pub struct DecodeOptions {
     /// per token already) or on [`Self::decode_until`]'s stop return (a caller
     /// that needs stop-strings under a reader thread signals the loop itself).
     pub stream_via_reader: bool,
+    /// The TILE: the most prompt tokens one prefill forward may take
+    /// (llama.cpp's `n_ubatch`). **`0` means unbounded** — every forward is
+    /// as wide as the ramp or the schedule makes it, the incumbent. A
+    /// positive value splits any wider forward into sequential forwards of
+    /// at most this many tokens (the last one narrower), so the prompt's
+    /// activation working set — §9.5n's `a·C² + b·C`, the class admission
+    /// sums — is bounded by the tile rather than by the prompt, and the
+    /// buffers one tile's forward released are what the next tile's forward
+    /// reuses. Composes with the spark and the schedule: it bounds whatever
+    /// forwards they name. Read by every prefill this crate runs
+    /// ([`Session::decode`], [`Session::prefill`], [`Session::decode_batched`])
+    /// and by neither speculative driver, whose seed is `prefill_streamed`'s
+    /// two forwards. A tiled prefill onto a warm cache needs the conv's
+    /// left-context carry (`Config::conv_prefill_ctx`), as any multi-forward
+    /// prefill does.
+    pub prefill_tile: usize,
+    /// The CHUNK under [`Session::decode_batched`]: the most prompt tokens one
+    /// pending row is prefilled by per batched step, interleaved with the
+    /// live rows' decode (vLLM's chunked prefill, its token budget). **`0`
+    /// means every prompt is prefilled whole before the loop** — the
+    /// incumbent, no interleave. A positive value admits the rows' prompts a
+    /// chunk per step, one row at a time in order, each row joining the batch
+    /// at the step after its last chunk; a row's prompt KV is built
+    /// incrementally and its stream is what a whole prefill gives it. The
+    /// time-sliced driver's chunk is the caller's — it feeds [`Session::prefill`]
+    /// per visit — and the single-sequence loop has no other sequence to
+    /// interleave with, so neither reads this.
+    pub prefill_chunk: usize,
 }
 
 /// One speculative round of [`Session::decode_speculative`], for the per-round
@@ -254,6 +282,8 @@ impl DecodeOptions {
             prefill_bulk: 0,
             prefill_pacer_depth: 0,
             stream_via_reader: false,
+            prefill_tile: 0,
+            prefill_chunk: 0,
         }
     }
 
@@ -261,6 +291,23 @@ impl DecodeOptions {
     /// one-shot). See the `prefill_ubatch` field.
     pub fn prefill_ubatch(&self) -> usize {
         self.prefill_ubatch
+    }
+
+    /// The widest input one prefill forward can stage under these options:
+    /// what a ring's input tile must hold for every forward to stage
+    /// zero-copy. The tile when set (it bounds every forward), else the spark
+    /// (one-shot's whole-prompt forward takes the allocating fallback either
+    /// way), else the widest of the schedule's units and the bulk.
+    pub fn max_prefill_width(&self) -> usize {
+        if self.prefill_tile > 0 {
+            return self.prefill_tile;
+        }
+        let widest_unit = self
+            .prefill_schedule
+            .as_ref()
+            .and_then(|u| u.iter().copied().max())
+            .unwrap_or(0);
+        self.prefill_ubatch.max(widest_unit).max(self.prefill_bulk)
     }
 }
 
@@ -407,6 +454,20 @@ impl StepPhases {
 /// How many leading steps [`DecodeStats::first_steps`] brackets.
 pub const FIRST_STEPS_TRACED: u64 = 4;
 
+/// What one [`Session::prefill`] took: the counters a scheduler reports per
+/// visit. Zero on every field for an empty prompt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefillOut {
+    /// Forward passes the prompt took ([`DecodeStats::prefill_units`]).
+    pub units: usize,
+    /// Submission time of the forwards — encode, not execution.
+    pub prefill_ns: u64,
+    /// Step markers the pacer took, one per forward.
+    pub step_markers: u64,
+    /// Markers the pacer had to wait on before encoding a forward.
+    pub step_waits: u64,
+}
+
 /// The outcome of one decode run.
 #[derive(Debug, Clone)]
 pub struct DecodeOut {
@@ -447,6 +508,17 @@ struct BatchLane {
     /// returned id fed (the lookahead arm at `max_tokens`).
     last_logits: Option<Tensor>,
     stats: DecodeStats,
+    /// The step this row's prompt may start being fed (its arrival); `0` is
+    /// the run's start.
+    arrival: u64,
+    /// Prompt tokens fed so far; the row joins the batch once this reaches
+    /// `prompt_len` (or at once, on a resume with held logits).
+    prompt_off: usize,
+    /// Whether the row has joined the batch — its logits are in `logits`.
+    joined: bool,
+    /// The wall clock when the row's first prompt chunk was fed, for
+    /// `stats.prefill_ns` (the submit time from the first chunk to the last).
+    prefill_start: Option<std::time::Instant>,
 }
 
 /// Commit without waiting and prune the in-flight queue, on the backends that
@@ -802,61 +874,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let mut logits = match self.seq.last_logits.take() {
             Some(held) if resume => held,
             _ => {
-                // THE ADAPTIVE SPARK→SEGMENT RAMP. The prefill weight-sweep is
-                // amortized over a forward's tokens, so MANY small chunks are slow
-                // (each re-reads the 5.4 GB of weights) — but the FIRST token cannot
-                // stream until its chunk lands, so a small FIRST chunk gets the
-                // machinery flowing early (low TTFT). The resolution: ramp the chunk
-                // width. Chunk 1 = `spark` (the tunable TTFT knob), then DOUBLE each
-                // chunk up to the whole remaining prompt. For a normal prompt this is
-                // "spark, then one-shot the rest" — the first token sparks early and
-                // the bulk is ONE big amortized forward, so TTFT drops without the
-                // per-chunk weight-sweep tax. `spark == 0` means one-shot (the whole
-                // prompt in one chunk): the incumbent, byte-identical, no ramp.
-                // The widths of the forwards this prompt is fed through, in
-                // order. `None` schedule → the incumbent ramp (`prefill_widths`
-                // reproduces "one-shot" and "spark, then remainder" exactly);
-                // `Some` → the explicit schedule, bucket tail included. Computed
-                // once here, in the prologue: the steady loop below never reads
-                // it (hot-path-neutral).
-                let widths = prefill_widths(
-                    prompt.len(),
-                    opts.prefill_ubatch(),
-                    &opts.prefill_schedule,
-                    opts.prefill_bulk,
-                );
-                let mut last_logits = None;
-                let mut off = 0usize; // the machine's position over the prompt
-                for w in widths {
-                    // Drains this chunk's autoreleased encoders and command
-                    // buffers when the iteration ends (`AutoreleaseScope` docs).
-                    let _pool = lloom_tensor::AutoreleaseScope::new();
-                    let chunk = &prompt[off..off + w];
-                    // Stage this unit's tokens as the forward's input — zero-copy on
-                    // the ring arm for a spark-sized chunk (≤ the input tile width),
-                    // a one-shot `Tensor::new` for the bigger amortizing chunks (few,
-                    // so the alloc is off the hot path). Then step: bound the
-                    // enqueue, forward, keep the marker — the same `before/
-                    // after_forward` a generate step takes, so prompt units and
-                    // generated tokens ride one pipeline.
-                    let input = readback.stage_prompt_chunk(chunk)?;
-                    if pace {
-                        pacer.before_forward(&device)?;
-                    }
-                    let out = self
-                        .model
-                        .forward(&input, self.seq.pos, &mut self.seq.cache)?
-                        .squeeze(0)?;
-                    if pace {
-                        pacer.after_forward(&device)?;
-                    }
-                    self.seq.pos += w;
-                    self.seq.tokens.extend_from_slice(chunk);
-                    last_logits = Some(out);
-                    off += w;
-                    prefill_units += 1;
-                }
-                last_logits.expect("a non-empty prompt steps at least once")
+                let (last, units) =
+                    self.prefill_forwards(readback, prompt, opts, &mut pacer, pace)?;
+                prefill_units = units;
+                last.expect("a non-empty prompt steps at least once")
             }
         };
         end_executor_step(&device)?;
@@ -1290,6 +1311,134 @@ impl<'m, M: CausalLM> Session<'m, M> {
             stats.max_in_flight = stats.max_in_flight.max(in_flight);
         }
         Ok(())
+    }
+
+    /// Feed `prompt` through the model as the forwards [`prefill_widths`]
+    /// names, each paced by `pacer` exactly as a decode step is, and return
+    /// the last forward's last-position logits and the number of forwards.
+    ///
+    /// The state machine steps over the prompt before it steps over its own
+    /// generated tokens — same stepping, different input source. A unit is
+    /// staged into the strategy's input (zero-copy on the ring arm when it
+    /// fits the input tile, a fresh tensor otherwise), does not sample (the
+    /// tokens are given) and produces no output; only the last unit's logits
+    /// seed the first generated token. One unit over the whole prompt is the
+    /// incumbent one-shot pass, so the default is byte-identical.
+    ///
+    /// Correctness across unit boundaries is the conv writer's left-context
+    /// carry (`Config::conv_prefill_ctx`): a `seq_len > 1` pass onto a warm
+    /// cache zero-pads its left without it. The caller turns it on whenever
+    /// more than one forward can run; a single unit is identical either way.
+    fn prefill_forwards<R>(
+        &mut self,
+        readback: &mut R,
+        prompt: &[u32],
+        opts: &DecodeOptions,
+        pacer: &mut StepPacer,
+        pace: bool,
+    ) -> Result<(Option<Tensor>, usize)>
+    where
+        R: ReadbackStrategy,
+    {
+        let device = readback.device().clone();
+        // The widths of the forwards this prompt is fed through, in order:
+        // the incumbent ramp (one-shot, or spark then remainder), the explicit
+        // schedule with its tail, and the tile bound over either. Computed
+        // once, in the prologue; the steady loop never reads it.
+        let widths = tile_widths(
+            prefill_widths(
+                prompt.len(),
+                opts.prefill_ubatch(),
+                &opts.prefill_schedule,
+                opts.prefill_bulk,
+            ),
+            opts.prefill_tile,
+        );
+        let mut last_logits = None;
+        let mut units = 0usize;
+        let mut off = 0usize;
+        for w in widths {
+            // Drains this unit's autoreleased encoders and command buffers
+            // when the iteration ends (`AutoreleaseScope` docs).
+            let _pool = lloom_tensor::AutoreleaseScope::new();
+            let chunk = &prompt[off..off + w];
+            let input = readback.stage_prompt_chunk(chunk)?;
+            if pace {
+                pacer.before_forward(&device)?;
+            }
+            let out = self
+                .model
+                .forward(&input, self.seq.pos, &mut self.seq.cache)?
+                .squeeze(0)?;
+            if pace {
+                pacer.after_forward(&device)?;
+            }
+            self.seq.pos += w;
+            self.seq.tokens.extend_from_slice(chunk);
+            last_logits = Some(out);
+            off += w;
+            units += 1;
+        }
+        Ok((last_logits, units))
+    }
+
+    /// Prefill `prompt` onto this sequence and produce nothing: the logical
+    /// CHUNK seam. The cache and the token log advance by the prompt and the
+    /// last position's logits are held, so a later [`Self::decode`] with an
+    /// empty prompt resumes from them (`Session::prepare` reports `Resume`),
+    /// and a later call with more of the sequence extends it. A scheduler
+    /// that interleaves one request's prompt with other requests' decode
+    /// feeds each request `≤ budget` prompt tokens per visit through this and
+    /// visits the others between — the prompt's KV is built incrementally and
+    /// the final state is what one pass over the prompt leaves, given the
+    /// conv writer's left-context carry.
+    ///
+    /// The forwards taken are [`prefill_widths`]'s for `opts` (the tile bound
+    /// applies here too), paced by their own [`StepPacer`]; nothing waits for
+    /// the GPU at the end, so the next visit's work queues behind this one.
+    /// Refused on an unreconciled overrun, as `decode` is. An empty prompt is
+    /// a no-op that takes no forward.
+    pub fn prefill<R>(
+        &mut self,
+        readback: &mut R,
+        prompt: &[u32],
+        opts: &DecodeOptions,
+    ) -> Result<PrefillOut>
+    where
+        R: ReadbackStrategy,
+    {
+        if self.seq.overrun > 0 {
+            lloom_tensor::bail!(
+                "Session::prefill: the cache is {} positions past the sequence's last token \
+                 (an earlier run's overrun); `Session::reconcile` or `Session::reset` first",
+                self.seq.overrun
+            );
+        }
+        if prompt.is_empty() {
+            return Ok(PrefillOut::default());
+        }
+        let device = readback.device().clone();
+        // The prefill's own in-flight bound when one is set, as `decode` runs
+        // its prefill block at (`prefill_pacer_depth`); else the decode depth.
+        let depth = if opts.prefill_pacer_depth > 0 {
+            opts.prefill_pacer_depth
+        } else {
+            opts.pacer_depth()
+        };
+        let mut pacer = StepPacer::new(depth);
+        let pace = readback.loop_commits();
+        let start = std::time::Instant::now();
+        let (last, units) = self.prefill_forwards(readback, prompt, opts, &mut pacer, pace)?;
+        end_executor_step(&device)?;
+        // The held logits are the resumable state: a decode with an empty
+        // prompt continues from them, and a further prefill discards them.
+        self.seq.last_logits = last;
+        Ok(PrefillOut {
+            units,
+            prefill_ns: start.elapsed().as_nanos() as u64,
+            step_markers: pacer.taken,
+            step_waits: pacer.waited,
+        })
     }
 
     /// Prefill `prompt` in the units `ubatch` names and seed `spec`'s sequence
@@ -1989,6 +2138,51 @@ impl<'m, M: CausalLM> Session<'m, M> {
     where
         M: BatchedCausalLM,
     {
+        let arrivals = vec![0u64; sessions.len()];
+        Self::decode_batched_admitted(
+            sessions, sampler, prompts, &arrivals, opts, eos_ids, device, on_tokens,
+        )
+    }
+
+    /// [`Self::decode_batched`] with each row ARRIVING at a step of the run:
+    /// `arrivals[i]` is the first step (counting from 0) at which row `i`'s
+    /// prompt may be fed. A row whose arrival is `0` is admitted before the
+    /// first step, which is `decode_batched`'s shape; a later arrival joins a
+    /// batch that is already decoding — the serving shape, where a request
+    /// lands while others are mid-reply.
+    ///
+    /// # How a prompt is fed — `opts.prefill_chunk`, the CHUNK
+    ///
+    /// `prefill_chunk == 0` feeds an arrived row's whole prompt at its
+    /// arrival step, in one forward (or in `opts.prefill_tile` forwards when
+    /// the tile is set), before that step's batched decode is encoded: every
+    /// live row's next token waits for the whole prompt. `prefill_chunk > 0`
+    /// feeds at most that many prompt tokens per step, of the earliest
+    /// arrived row whose prompt is not yet complete, AFTER the step's batched
+    /// forward is enqueued — so a long prompt is spread over many steps, each
+    /// live row's inter-token interval grows by one chunk's forward rather
+    /// than by the prompt, and the row joins the batch at the step after its
+    /// last chunk. The prompt's KV is built incrementally, which is exact
+    /// given the conv writer's left-context carry (`Config::conv_prefill_ctx`).
+    ///
+    /// A step with no live row and no arrived prompt to feed (every pending
+    /// row's arrival is in the future) is an idle step: nothing is encoded,
+    /// and the step count advances so the arrival can come due. The run ends
+    /// when no row is live and none is pending.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_batched_admitted(
+        sessions: &mut [Self],
+        sampler: &mut LogitsProcessor,
+        prompts: &[&[u32]],
+        arrivals: &[u64],
+        opts: &DecodeOptions,
+        eos_ids: &[u32],
+        device: &Device,
+        on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+    ) -> Result<Vec<DecodeOut>>
+    where
+        M: BatchedCausalLM,
+    {
         let n = sessions.len();
         if n == 0 {
             lloom_tensor::bail!("decode_batched: no sessions");
@@ -1998,6 +2192,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 "decode_batched: {} sessions and {} prompts",
                 n,
                 prompts.len()
+            );
+        }
+        if arrivals.len() != n {
+            lloom_tensor::bail!(
+                "decode_batched: {} sessions and {} arrivals",
+                n,
+                arrivals.len()
             );
         }
         if eos_ids.is_empty() {
@@ -2035,77 +2236,153 @@ impl<'m, M: CausalLM> Session<'m, M> {
         let run_start = std::time::Instant::now();
         let hot_thread = HotThread::claim();
 
-        // Prefill every sequence before reading anything back: each prompt is
-        // its own `forward` at its own length, queued behind the previous.
-        let mut lanes: Vec<BatchLane> = Vec::with_capacity(n);
-        let mut logits_rows: Vec<Tensor> = Vec::with_capacity(n);
-        for (i, s) in sessions.iter_mut().enumerate() {
-            let pos_before = s.seq.pos;
-            let prefill_start = std::time::Instant::now();
-            let (logits, prefill_units) = match s.seq.last_logits.take() {
-                Some(held) if prompts[i].is_empty() => (held.unsqueeze(0)?, 0),
-                _ => {
-                    let input = Tensor::new(prompts[i], device)?.unsqueeze(0)?;
-                    let logits = s.model.forward(&input, s.seq.pos, &mut s.seq.cache)?;
-                    s.seq.pos += prompts[i].len();
-                    s.seq.tokens.extend_from_slice(prompts[i]);
-                    (logits, 1)
-                }
-            };
-            logits_rows.push(logits);
-            lanes.push(BatchLane {
+        let mut lanes: Vec<BatchLane> = (0..n)
+            .map(|i| BatchLane {
                 produced: 0,
                 eos: false,
                 done: opts.max_tokens == 0,
                 all_ids: Vec::with_capacity(opts.max_tokens),
-                pos_before,
+                pos_before: sessions[i].seq.pos,
                 prompt_len: prompts[i].len(),
                 last_logits: None,
                 stats: DecodeStats {
                     step_ns: Vec::with_capacity(opts.max_tokens),
-                    prefill_ns: prefill_start.elapsed().as_nanos() as u64,
-                    prefill_units,
                     hot_thread: hot_thread.report(),
                     ..DecodeStats::default()
                 },
-            });
-        }
-        end_executor_step(device)?;
+                arrival: arrivals[i],
+                prompt_off: 0,
+                joined: false,
+                prefill_start: None,
+            })
+            .collect();
 
-        // The live rows, in the order the logits' rows are in.
-        let mut live: Vec<usize> = (0..n).filter(|&i| !lanes[i].done).collect();
-        let mut logits = Tensor::cat(
-            &live.iter().map(|&i| &logits_rows[i]).collect::<Vec<_>>(),
-            0,
-        )?;
-        drop(logits_rows);
+        // The live rows, in the order the logits' rows are in; `logits` is
+        // `[live.len(), vocab]` (unset while nothing is live).
+        let mut live: Vec<usize> = Vec::with_capacity(n);
+        let mut logits: Option<Tensor> = None;
+        let mut step: u64 = 0;
 
-        while !live.is_empty() {
+        // Feed prompt tokens for this step: with no chunk budget, every
+        // arrived row's whole remaining prompt; with one, `chunk` tokens of
+        // the earliest arrived row still pending. Returns the rows that
+        // completed their prompt, with their logits, in row order.
+        let admit = |sessions: &mut [Self],
+                     lanes: &mut [BatchLane],
+                     step: u64|
+         -> Result<Vec<(usize, Tensor)>> {
+            let mut joined = Vec::new();
+            let mut budget_left = if opts.prefill_chunk == 0 {
+                usize::MAX
+            } else {
+                opts.prefill_chunk
+            };
+            for i in 0..n {
+                if budget_left == 0 {
+                    break;
+                }
+                let lane = &mut lanes[i];
+                if lane.joined || lane.arrival > step {
+                    continue;
+                }
+                let s = &mut sessions[i];
+                let prompt = prompts[i];
+                if prompt.is_empty() {
+                    // A resume: the held logits are the row's state.
+                    let held = s.seq.last_logits.take().expect("checked at entry");
+                    lane.joined = true;
+                    joined.push((i, held.unsqueeze(0)?));
+                    continue;
+                }
+                let start = lane
+                    .prefill_start
+                    .get_or_insert_with(std::time::Instant::now);
+                let remaining = prompt.len() - lane.prompt_off;
+                let take = if opts.prefill_chunk == 0 {
+                    remaining
+                } else {
+                    remaining.min(budget_left)
+                };
+                let piece = &prompt[lane.prompt_off..lane.prompt_off + take];
+                // The tile bounds each forward of the piece; the chunk is what
+                // this step feeds of it.
+                let mut last = None;
+                let mut off = 0usize;
+                for w in tile_widths(vec![take], opts.prefill_tile) {
+                    let _pool = lloom_tensor::AutoreleaseScope::new();
+                    let unit = &piece[off..off + w];
+                    let input = Tensor::new(unit, device)?.unsqueeze(0)?;
+                    last = Some(s.model.forward(&input, s.seq.pos, &mut s.seq.cache)?);
+                    s.seq.pos += w;
+                    s.seq.tokens.extend_from_slice(unit);
+                    off += w;
+                    lane.stats.prefill_units += 1;
+                }
+                lane.prompt_off += take;
+                if opts.prefill_chunk > 0 {
+                    budget_left -= take;
+                }
+                lane.stats.prefill_ns = start.elapsed().as_nanos() as u64;
+                if lane.prompt_off == prompt.len() {
+                    lane.joined = true;
+                    joined.push((i, last.expect("a non-empty piece steps at least once")));
+                }
+            }
+            Ok(joined)
+        };
+
+        loop {
             let _pool = lloom_tensor::AutoreleaseScope::new(); // per batched step, see the decode loop
+            let pending = (0..n).any(|i| !lanes[i].joined);
+            if live.is_empty() && !pending {
+                break;
+            }
             let step_start = std::time::Instant::now();
             let b = live.len();
+            // Without a chunk budget an arrived prompt is fed whole before
+            // this step's decode — every live row waits on it, the
+            // head-of-line shape. With one, the chunk rides behind the
+            // decode below; when nothing is live there is nothing to ride
+            // behind, so it is fed here. `admit` runs once per step.
+            let mut joined = if opts.prefill_chunk == 0 || b == 0 {
+                admit(sessions, &mut lanes, step)?
+            } else {
+                Vec::new()
+            };
             for &i in &live {
                 lanes[i].stats.steps += 1;
                 lanes[i].stats.batch_rows.push(b);
             }
             // One argmax over `[B, vocab]`: the ids stay on the device.
-            let ids = sampler.sample_argmax_on_device(&logits)?;
+            let ids = match &logits {
+                Some(l) if b > 0 => Some(sampler.sample_argmax_on_device(l)?),
+                _ => None,
+            };
 
-            let (host_ids, next_logits) = if opts.lookahead == 0 {
-                // Learn first, then feed: the readback waits on the queue's
-                // tail, which is exactly this step's argmax.
-                (ids.to_vec1::<u32>()?, None)
-            } else {
-                // Stage the readback BEFORE the next forward is encoded, so
-                // the wait is on the argmax's command buffer and not on the
-                // forward queued behind it; then feed the device ids.
-                let staged = ids.stage_read()?;
-                let input = ids.reshape((b, 1))?;
-                let next = Self::forward_live(sessions, &live, &input)?;
-                for &i in &live {
-                    lanes[i].stats.commits += 1;
+            let (host_ids, next_logits) = match (&ids, opts.lookahead) {
+                (None, _) => (Vec::new(), None),
+                (Some(ids), 0) => {
+                    // Learn first, then feed: the readback waits on the queue's
+                    // tail, which is exactly this step's argmax.
+                    (ids.to_vec1::<u32>()?, None)
                 }
-                (staged.to_vec1::<u32>()?, Some(next))
+                (Some(ids), _) => {
+                    // Stage the readback BEFORE the next forward is encoded, so
+                    // the wait is on the argmax's command buffer and not on the
+                    // forward queued behind it; then feed the device ids.
+                    let staged = ids.stage_read()?;
+                    let input = ids.reshape((b, 1))?;
+                    let next = Self::forward_live(sessions, &live, &input)?;
+                    for &i in &live {
+                        lanes[i].stats.commits += 1;
+                    }
+                    // The chunk queues behind the batched forward and runs
+                    // while the host waits for this step's ids.
+                    if opts.prefill_chunk > 0 {
+                        joined = admit(sessions, &mut lanes, step)?;
+                    }
+                    (staged.to_vec1::<u32>()?, Some(next))
+                }
             };
             if host_ids.len() != b {
                 lloom_tensor::bail!(
@@ -2141,16 +2418,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             for &i in &live {
                 lanes[i].stats.step_ns.push(step_ns);
             }
-            end_executor_step(device)?;
 
-            let next_live: Vec<usize> = live.iter().copied().filter(|&i| !lanes[i].done).collect();
-            if next_live.is_empty() {
-                break;
-            }
-            logits = match next_logits {
+            let kept: Vec<usize> = live.iter().copied().filter(|&i| !lanes[i].done).collect();
+            let kept_logits = match next_logits {
                 // The forward already ran for every row that was live; keep
                 // the rows still live, in their order.
-                Some(next) if next_live.len() == live.len() => next,
+                Some(next) if kept.len() == live.len() => Some(next),
+                Some(_) if kept.is_empty() => None,
                 Some(next) => {
                     let keep: Vec<u32> = live
                         .iter()
@@ -2158,10 +2432,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         .filter(|(_, i)| !lanes[**i].done)
                         .map(|(k, _)| k as u32)
                         .collect();
-                    next.index_select(&Tensor::new(keep.as_slice(), device)?, 0)?
+                    Some(next.index_select(&Tensor::new(keep.as_slice(), device)?, 0)?)
                 }
+                None if kept.is_empty() => None,
                 None => {
-                    // Blocking arm: feed the ids the host just read, live rows only.
+                    // Blocking arm: feed the ids the host just read, live rows
+                    // only; under a chunk budget the chunk rides behind it.
                     let next_ids: Vec<u32> = live
                         .iter()
                         .enumerate()
@@ -2169,11 +2445,37 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         .map(|(k, _)| host_ids[k])
                         .collect();
                     let input =
-                        Tensor::new(next_ids.as_slice(), device)?.reshape((next_live.len(), 1))?;
-                    Self::forward_live(sessions, &next_live, &input)?
+                        Tensor::new(next_ids.as_slice(), device)?.reshape((kept.len(), 1))?;
+                    Some(Self::forward_live(sessions, &kept, &input)?)
                 }
             };
+            if opts.lookahead == 0 && opts.prefill_chunk > 0 && b > 0 {
+                joined = admit(sessions, &mut lanes, step)?;
+            }
+            end_executor_step(device)?;
+
+            // Next step's rows: the kept rows, then the rows that joined this
+            // step, each with its own logits row. A row joining with `done`
+            // already set (`max_tokens == 0`) is retired at once.
+            let mut next_live = kept;
+            let mut rows: Vec<Tensor> = Vec::with_capacity(next_live.len() + joined.len());
+            if let Some(l) = kept_logits {
+                rows.push(l);
+            }
+            for (i, l) in joined {
+                if lanes[i].done {
+                    continue;
+                }
+                next_live.push(i);
+                rows.push(l);
+            }
+            logits = match rows.len() {
+                0 => None,
+                1 => Some(rows.remove(0)),
+                _ => Some(Tensor::cat(&rows, 0)?),
+            };
             live = next_live;
+            step += 1;
         }
 
         // Per-sequence bookkeeping, as the other bodies: the fed ids are the
@@ -2370,6 +2672,8 @@ pub const WARMUP_PREFILL_LENS: [usize; 4] = [8, 16, 40, 64];
 ///   *aligned* bulk width (16 / 32 / 64) instead keeps every bulk forward on the
 ///   no-guard GEMM tile and collapses the forward count to `remainder / bulk`.
 ///
+/// The TILE bound ([`tile_widths`]) is applied over the result by the callers.
+///
 /// Total is always exactly `prompt_len` (each width ≤ the remainder, and the
 /// bulk + tail close any gap), so the caller's `off` walks the prompt exactly
 /// once. An empty prompt yields no forwards.
@@ -2424,9 +2728,29 @@ fn prefill_widths(
     }
 }
 
+/// The TILE bound over [`prefill_widths`]'s result: every width above `tile`
+/// is split into sequential forwards of `tile` tokens and a narrower last
+/// one, so no forward is wider than the tile. `0` leaves the widths as they
+/// are. The total is unchanged.
+fn tile_widths(widths: Vec<usize>, tile: usize) -> Vec<usize> {
+    if tile == 0 {
+        return widths;
+    }
+    let mut tiled = Vec::with_capacity(widths.len());
+    for w in widths {
+        let mut left = w;
+        while left > 0 {
+            let t = left.min(tile);
+            tiled.push(t);
+            left -= t;
+        }
+    }
+    tiled
+}
+
 #[cfg(test)]
 mod prefill_widths_tests {
-    use super::prefill_widths;
+    use super::{prefill_widths, tile_widths};
 
     // The `None` schedule must reproduce the incumbent ramp exactly — this is
     // the byte-identity contract the crown rests on. `bulk` is irrelevant on the
@@ -2461,7 +2785,9 @@ mod prefill_widths_tests {
     #[test]
     fn schedule_fixed_bucket_covers_with_tail() {
         // `--spark=16` on a 40-token prompt, no bulk: [16], then 24×1.
-        let want: Vec<usize> = std::iter::once(16).chain(std::iter::repeat(1).take(24)).collect();
+        let want: Vec<usize> = std::iter::once(16)
+            .chain(std::iter::repeat(1).take(24))
+            .collect();
         assert_eq!(prefill_widths(40, 0, &Some(vec![16]), 0), want);
     }
 
@@ -2537,7 +2863,13 @@ mod prefill_widths_tests {
     #[test]
     fn schedule_total_is_always_prompt_len() {
         for &plen in &[1usize, 7, 16, 33, 64, 100, 347, 512] {
-            for units in [vec![1], vec![16], vec![64], vec![1, 16, 32, 64], vec![32, 32]] {
+            for units in [
+                vec![1],
+                vec![16],
+                vec![64],
+                vec![1, 16, 32, 64],
+                vec![32, 32],
+            ] {
                 for bulk in [0usize, 1, 16, 32, 64] {
                     let widths = prefill_widths(plen, 0, &Some(units.clone()), bulk);
                     assert_eq!(
@@ -2548,6 +2880,77 @@ mod prefill_widths_tests {
                 }
             }
         }
+    }
+
+    // The TILE bounds every forward the ramp, the schedule or the bulk names,
+    // and changes nothing when it is 0 or wider than every forward.
+    #[test]
+    fn tile_splits_one_shot_into_sequential_tiles_with_a_narrower_last() {
+        let tiled = |plen, tile| tile_widths(prefill_widths(plen, 0, &None, 0), tile);
+        assert_eq!(tiled(2048, 512), vec![512, 512, 512, 512]);
+        assert_eq!(tiled(1000, 512), vec![512, 488]);
+        assert_eq!(tiled(10, 3), vec![3, 3, 3, 1]);
+        // A tile at or above the prompt is one-shot, byte for byte.
+        assert_eq!(tiled(400, 400), vec![400]);
+        assert_eq!(tiled(400, 4096), vec![400]);
+    }
+
+    #[test]
+    fn tile_composes_with_the_spark_the_schedule_and_the_bulk() {
+        // The spark stays a spark; the remainder is tiled.
+        assert_eq!(
+            tile_widths(prefill_widths(400, 16, &None, 0), 128),
+            vec![16, 128, 128, 128]
+        );
+        // A schedule unit wider than the tile is split; the 1-token tail is not.
+        let widths = tile_widths(prefill_widths(100, 0, &Some(vec![64]), 0), 32);
+        assert_eq!(&widths[..2], &[32, 32]);
+        assert_eq!(widths.len(), 2 + 36);
+        assert!(widths[2..].iter().all(|&w| w == 1));
+        // A bulk wider than the tile is split too; a bulk at the tile is not.
+        let widths = tile_widths(prefill_widths(200, 0, &Some(vec![16]), 64), 32);
+        assert_eq!(widths.iter().sum::<usize>(), 200);
+        assert!(widths.iter().all(|&w| w <= 32));
+        assert_eq!(
+            tile_widths(prefill_widths(200, 0, &Some(vec![16]), 64), 64),
+            prefill_widths(200, 0, &Some(vec![16]), 64)
+        );
+    }
+
+    #[test]
+    fn tile_zero_is_the_incumbent_and_a_tile_never_widens_a_forward() {
+        for &plen in &[1usize, 7, 16, 33, 64, 100, 347, 512, 2049] {
+            for &ubatch in &[0usize, 16, 64] {
+                let base = prefill_widths(plen, ubatch, &None, 0);
+                assert_eq!(tile_widths(base.clone(), 0), base);
+                for &tile in &[1usize, 3, 16, 100, 512, 4096] {
+                    let tiled = tile_widths(base.clone(), tile);
+                    assert_eq!(tiled.iter().sum::<usize>(), plen, "tile {tile} on {plen}");
+                    assert!(
+                        tiled.iter().all(|&w| w <= tile && w > 0),
+                        "tile {tile} on {plen}: {tiled:?}"
+                    );
+                    // A tile wider than every base forward leaves the widths alone.
+                    if base.iter().all(|&w| w <= tile) {
+                        assert_eq!(tiled, base);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn max_prefill_width_is_the_tile_else_the_spark_else_the_widest_unit() {
+        let mut o = super::DecodeOptions::new(1);
+        assert_eq!(o.max_prefill_width(), 0);
+        o.prefill_ubatch = 16;
+        assert_eq!(o.max_prefill_width(), 16);
+        o.prefill_schedule = Some(vec![1, 16, 32, 64]);
+        assert_eq!(o.max_prefill_width(), 64);
+        o.prefill_bulk = 128;
+        assert_eq!(o.max_prefill_width(), 128);
+        o.prefill_tile = 24;
+        assert_eq!(o.max_prefill_width(), 24);
     }
 }
 

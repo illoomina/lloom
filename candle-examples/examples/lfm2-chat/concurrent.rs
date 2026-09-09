@@ -30,7 +30,7 @@ use lloom::generation::{
 };
 use lloom::models::lfm2::{Cache, Config, Model};
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
-use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, ReuseAction, Session};
+use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, PrefillOut, ReuseAction, Session};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -103,6 +103,18 @@ pub struct Ctx<'a> {
     /// arms seed the drafter unit by unit, `Session::prefill_streamed`). The
     /// K=1 interleave and the batched arm prefill one-shot and do not read it.
     pub prefill_ubatch: usize,
+    /// `--prefill-tile`: the most prompt tokens one prefill forward takes, on
+    /// the K=1 interleave and the batched arm (#728).
+    pub prefill_tile: usize,
+    /// `--prefill-chunk`: the most prompt tokens fed of one sequence per
+    /// visit (interleave) or per step (batched), between the others' decode.
+    /// `0` prefills a prompt whole at its arrival.
+    pub prefill_chunk: usize,
+    /// `--stagger`: sequence `i` arrives at round/step `i × stagger`.
+    pub stagger: usize,
+    /// `--long-prompt-tokens`: the last sequence's synthetic prompt length in
+    /// body tokens; `0` keeps the corpus prompt.
+    pub long_prompt_tokens: usize,
     /// `--dspark` — drive the concurrent sequences through the pipelined
     /// speculative driver instead of the time-sliced non-spec interleave.
     pub dspark: bool,
@@ -203,6 +215,58 @@ fn decode(
     let ttft_ms =
         (out.stats.prefill_ns + out.stats.step_ns.first().copied().unwrap_or(0)) as f64 / 1e6;
     Ok(Timed { out, wall, ttft_ms })
+}
+
+/// One prefill visit: feed `prompt` onto the session and produce nothing
+/// (`Session::prefill`, the CHUNK seam).
+fn prefill(
+    session: &mut Session<'_, Model>,
+    arm: &mut Arm,
+    prompt: &[u32],
+    opts: &DecodeOptions,
+) -> Result<PrefillOut> {
+    Ok(match arm {
+        Arm::Blocking(rb) => session.prefill(rb, prompt, opts)?,
+        Arm::Ring(rb) => session.prefill(rb, prompt, opts)?,
+    })
+}
+
+/// The `n` prompts of a concurrent run as ids: the corpus set, chat-wrapped —
+/// and, under `--long-prompt-tokens P`, the LAST sequence replaced by a
+/// synthetic prompt of exactly `P` body tokens (the corpus's long-summarize
+/// text repeated, cut at `P`, inside the same chat template), so a long prompt
+/// arrives beside the short ones.
+fn prompt_ids(ctx: &Ctx<'_>, n: usize) -> Result<Vec<Vec<u32>>> {
+    let mut prompts: Vec<Vec<u32>> = prompt_set(n)
+        .iter()
+        .map(|p| (ctx.encode)(&user_turn_text(p)))
+        .collect::<Result<_>>()?;
+    if ctx.long_prompt_tokens > 0 {
+        let target = ctx.long_prompt_tokens;
+        let body_text = PROMPTS[4].trim_end();
+        let mut body: Vec<u32> = Vec::new();
+        while body.len() < target {
+            body.extend((ctx.encode)(&format!("{body_text}\n\n"))?);
+        }
+        body.truncate(target);
+        let mut ids = (ctx.encode)("<|im_start|>user\n")?;
+        ids.extend(body);
+        ids.extend((ctx.encode)("<|im_end|>\n<|im_start|>assistant\n")?);
+        let last = n - 1;
+        prompts[last] = ids;
+    }
+    Ok(prompts)
+}
+
+/// Gaps between consecutive stamps, in ms: `(p50, max)`, `NaN` when fewer
+/// than two stamps.
+fn gap_stats_ms(stamps: &[f64]) -> (f64, f64) {
+    if stamps.len() < 2 {
+        return (f64::NAN, f64::NAN);
+    }
+    let gaps: Vec<f64> = stamps.windows(2).map(|w| (w[1] - w[0]) * 1e3).collect();
+    let max = gaps.iter().cloned().fold(f64::MIN, f64::max);
+    (median(gaps), max)
 }
 
 /// A live-updating raw-stats block on stderr, repainted in place. It moves the
@@ -337,6 +401,11 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         // Concurrent collects per-sequence ids for identity checks, not a live
         // per-token stream; the RingReader path is the single-turn streaming arm.
         stream_via_reader: false,
+        // The tile bounds every prefill forward, a visit's chunk included.
+        prefill_tile: ctx.prefill_tile,
+        // The time-sliced interleave chunks at the visit level (`run_concurrent`)
+        // and the batched driver reads its own copy (`run_batched_concurrent`).
+        prefill_chunk: 0,
     };
     let capacity = 8 * ctx.max_tokens + 8 * (budget.period() + 2);
 
@@ -459,10 +528,8 @@ fn run_concurrent(
 ) -> Result<()> {
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
     let n = ctx.sequences.max(1);
-    let prompts: Vec<Vec<u32>> = prompt_set(n)
-        .iter()
-        .map(|p| (ctx.encode)(&user_turn_text(p)))
-        .collect::<Result<_>>()?;
+    let prompts = prompt_ids(ctx, n)?;
+    let prompt_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
 
     // SOLO: each sequence alone (the identity + rate baseline).
     let mut solo: Vec<Vec<u32>> = Vec::with_capacity(n);
@@ -478,6 +545,13 @@ fn run_concurrent(
     }
 
     // INTERLEAVED: round-robin visits, live-repainting the block per visit.
+    // A sequence arrives at round `i × stagger`; while its prompt is not
+    // fully fed a visit is a PREFILL visit of at most `prefill_chunk` prompt
+    // tokens (the whole remainder when the chunk is 0) through
+    // `Session::prefill`, then its visits decode `chunk` tokens each, resuming
+    // through `prepare`. Per-sequence stamps: the arrival, the first token,
+    // and every visit that streamed a token (the inter-visit gap of a decoding
+    // sequence is what another sequence's prefill stretches).
     let mut sessions: Vec<Session<'_, Model>> = (0..n)
         .map(|_| {
             Ok(Session::new(
@@ -491,14 +565,48 @@ fn run_concurrent(
         .collect::<Result<_>>()?;
     let mut streams: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut done = vec![false; n];
+    let arrivals: Vec<usize> = (0..n).map(|i| i * ctx.stagger).collect();
+    let mut prefilled = vec![0usize; n];
+    let mut arrival_at: Vec<Option<f64>> = vec![None; n];
+    let mut first_token_at: Vec<Option<f64>> = vec![None; n];
+    let mut visit_stamps: Vec<Vec<f64>> = vec![Vec::new(); n];
+    let mut prefill_visits = vec![0usize; n];
+    let mut prefill_units = vec![0usize; n];
     let mut visits = 0usize;
     let mut resumes = 0usize;
+    let mut round = 0usize;
     let mut live = LiveStats::new("concurrent", vec![ctx.max_tokens; n], false);
     live.paint();
     let t = Instant::now();
     while done.iter().any(|d| !d) {
         for i in 0..n {
-            if done[i] {
+            if done[i] || arrivals[i] > round {
+                continue;
+            }
+            if arrival_at[i].is_none() {
+                arrival_at[i] = Some(t.elapsed().as_secs_f64());
+            }
+            if prefilled[i] < prompts[i].len() {
+                let remaining = prompts[i].len() - prefilled[i];
+                let take = if ctx.prefill_chunk == 0 {
+                    remaining
+                } else {
+                    remaining.min(ctx.prefill_chunk)
+                };
+                let prepared = sessions[i].prepare(&prompts[i][..prefilled[i] + take])?;
+                if prepared.suffix.len() != take {
+                    anyhow::bail!(
+                        "seq {i}: prepare handed {} tokens to prefill where the chunk is {take} \
+                         (action {:?})",
+                        prepared.suffix.len(),
+                        prepared.action
+                    );
+                }
+                let p = prefill(&mut sessions[i], &mut arms[i], &prepared.suffix, opts)?;
+                prefilled[i] += take;
+                prefill_visits[i] += 1;
+                prefill_units[i] += p.units;
+                visits += 1;
                 continue;
             }
             let full: Vec<u32> = [prompts[i].clone(), streams[i].clone()].concat();
@@ -518,6 +626,13 @@ fn run_concurrent(
                 &visit_opts,
             )?
             .out;
+            let now = t.elapsed().as_secs_f64();
+            if !out.ids.is_empty() {
+                if first_token_at[i].is_none() {
+                    first_token_at[i] = Some(now);
+                }
+                visit_stamps[i].push(now);
+            }
             streams[i].extend_from_slice(&out.ids);
             visits += 1;
             if out.eos || streams[i].len() >= ctx.max_tokens {
@@ -526,6 +641,7 @@ fn run_concurrent(
             live.set(i, streams[i].len(), 0, done[i]);
             live.paint();
         }
+        round += 1;
     }
     live.finish();
     let wall = t.elapsed().as_secs_f64();
@@ -535,9 +651,26 @@ fn run_concurrent(
         .zip(solo.iter())
         .map(|(a, b)| a == b)
         .collect();
+    let ttft_ms: Vec<f64> = (0..n)
+        .map(|i| match (arrival_at[i], first_token_at[i]) {
+            (Some(a), Some(f)) => (f - a) * 1e3,
+            _ => f64::NAN,
+        })
+        .collect();
+    let gaps: Vec<(f64, f64)> = visit_stamps.iter().map(|v| gap_stats_ms(v)).collect();
     for i in 0..n {
         eprintln!(
-            "[seq {i}: solo {} tokens at {:.1} tok/s; interleaved {} tokens; {}]",
+            "[seq {i}: prompt {} tok, arrival round {} at {:.1} ms; TTFT {:.1} ms; prefill visits {} \
+             ({} forwards); visit gap p50 {:.1} max {:.1} ms; solo {} tokens at {:.1} tok/s; \
+             interleaved {} tokens; {}]",
+            prompt_lens[i],
+            arrivals[i],
+            arrival_at[i].map(|a| a * 1e3).unwrap_or(f64::NAN),
+            ttft_ms[i],
+            prefill_visits[i],
+            prefill_units[i],
+            gaps[i].0,
+            gaps[i].1,
             solo[i].len(),
             solo_rates[i],
             streams[i].len(),
@@ -545,18 +678,31 @@ fn run_concurrent(
         );
     }
     eprintln!(
-        "[{n} sequences interleaved in {}-token visits: {total} tokens in {wall:.3} s = {:.1} tok/s aggregate; solo {:.1} tok/s mean]",
+        "[{n} sequences interleaved in {}-token visits (prefill chunk {}, tile {}, stagger {}): \
+         {total} tokens in {wall:.3} s = {:.1} tok/s aggregate; solo {:.1} tok/s mean]",
         ctx.chunk,
+        ctx.prefill_chunk,
+        ctx.prefill_tile,
+        ctx.stagger,
         total as f64 / wall,
         solo_rates.iter().sum::<f64>() / n as f64,
     );
     println!(
-        "RESULT mode=concurrent {common} eos_read={} sequences={n} chunk={} visits={} resumes={} \
-         total_tokens={} interleaved_wall_s={:.4} aggregate_tok_s={:.4} solo_wall_s={:.4} \
-         solo_mean_tok_s={:.4} identical={} per_seq_identical={:?} per_seq_tokens={:?}",
+        "RESULT mode=concurrent {common} eos_read={} sequences={n} chunk={} prefill_chunk={} \
+         prefill_tile={} stagger={} prompt_tokens={:?} visits={} prefill_visits={:?} \
+         prefill_units={:?} resumes={} total_tokens={} interleaved_wall_s={:.4} \
+         aggregate_tok_s={:.4} solo_wall_s={:.4} solo_mean_tok_s={:.4} identical={} \
+         per_seq_identical={:?} per_seq_tokens={:?} per_seq_ttft_ms={:?} \
+         per_seq_gap_p50_ms={:?} per_seq_gap_max_ms={:?}",
         arms[0].eos_read(),
         ctx.chunk,
+        ctx.prefill_chunk,
+        ctx.prefill_tile,
+        ctx.stagger,
+        prompt_lens,
         visits,
+        prefill_visits,
+        prefill_units,
         resumes,
         total,
         wall,
@@ -566,6 +712,16 @@ fn run_concurrent(
         identical.iter().all(|&b| b),
         identical,
         streams.iter().map(|s| s.len()).collect::<Vec<_>>(),
+        ttft_ms
+            .iter()
+            .map(|v| format!("{v:.1}"))
+            .collect::<Vec<_>>(),
+        gaps.iter()
+            .map(|g| format!("{:.1}", g.0))
+            .collect::<Vec<_>>(),
+        gaps.iter()
+            .map(|g| format!("{:.1}", g.1))
+            .collect::<Vec<_>>(),
     );
     Ok(())
 }
@@ -874,6 +1030,9 @@ struct BatchArm {
     /// The weight-GEMM/GEMV kernels dispatched, from the census (engagement:
     /// the batched arm must show `gemm_*` where solo shows `gemv_*`).
     census: HashMap<String, u64>,
+    /// Per row, the wall stamp (s since the arm's start) of every token the
+    /// callback handed over — the batched arm's TTFT and inter-token gaps.
+    stamps: Vec<Vec<f64>>,
 }
 
 impl BatchArm {
@@ -900,18 +1059,20 @@ fn run_batched_concurrent(
 ) -> Result<()> {
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
     let n = ctx.sequences.max(1);
-    let prompts: Vec<Vec<u32>> = prompt_set(n)
-        .iter()
-        .map(|p| (ctx.encode)(&user_turn_text(p)))
-        .collect::<Result<_>>()?;
+    let prompts = prompt_ids(ctx, n)?;
     let prompt_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
     // The batched driver's own options: the lookahead is the arm's, the commit
-    // budget and sample split have no meaning under it.
+    // budget and sample split have no meaning under it; the tile bounds each
+    // prefill forward and the chunk is the per-step prompt budget (#728).
     let batched_opts = DecodeOptions {
         max_tokens: ctx.max_tokens,
         lookahead: ctx.lookahead.min(1),
+        prefill_tile: ctx.prefill_tile,
+        prefill_chunk: ctx.prefill_chunk,
         ..DecodeOptions::new(ctx.max_tokens)
     };
+    // Row `i` arrives at step `i × stagger`.
+    let arrivals: Vec<u64> = (0..n).map(|i| (i * ctx.stagger) as u64).collect();
 
     // Warm the batched GEMM pipelines at this `B` off the clock: the row-tile
     // pipelines `Session::warmup` compiled are the prefill's; a batched step at
@@ -971,6 +1132,7 @@ fn run_batched_concurrent(
             dispatches,
             command_buffers,
             census,
+            stamps: vec![Vec::new(); n],
         })
     };
     let run_batched = |label: &'static str, rows: &[usize]| -> Result<BatchArm> {
@@ -984,20 +1146,25 @@ fn run_batched_concurrent(
             })
             .collect::<Result<_>>()?;
         let refs: Vec<&[u32]> = rows.iter().map(|&i| prompts[i].as_slice()).collect();
+        let row_arrivals: Vec<u64> = rows.iter().map(|&i| arrivals[i]).collect();
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let mut streams: Vec<Vec<u32>> = vec![Vec::new(); rows.len()];
+        let mut stamps: Vec<Vec<f64>> = vec![Vec::new(); rows.len()];
         let mut live = LiveStats::new(label, vec![ctx.max_tokens; rows.len()], false);
         live.paint();
         let t = Instant::now();
-        let outs = Session::decode_batched(
+        let outs = Session::decode_batched_admitted(
             &mut sessions,
             &mut sampler,
             &refs,
+            &row_arrivals,
             &batched_opts,
             ctx.eos_ids,
             device,
             &mut |i, ids| {
+                let now = t.elapsed().as_secs_f64();
                 streams[i].extend_from_slice(ids);
+                stamps[i].extend(ids.iter().map(|_| now));
                 live.set(i, streams[i].len(), 0, false);
                 live.paint();
                 Ok(())
@@ -1024,6 +1191,7 @@ fn run_batched_concurrent(
             dispatches,
             command_buffers,
             census,
+            stamps,
         })
     };
 
@@ -1037,6 +1205,7 @@ fn run_batched_concurrent(
         dispatches: 0,
         command_buffers: 0,
         census: HashMap::new(),
+        stamps: vec![Vec::new(); n],
     };
     let (solo, batched) = match (ctx.first, ctx.skip_solo) {
         (_, true) => (empty_solo(), run_batched("batched", &all)?),
@@ -1066,8 +1235,15 @@ fn run_batched_concurrent(
             .count();
         identical.push(same);
         common_prefix.push(lcp);
+        let (gap_p50, gap_max) = gap_stats_ms(&batched.stamps[i]);
         eprintln!(
-            "[seq {i}: prompt {prompt_len} tok; solo {} tokens eos={}; batched {} tokens eos={} overrun={}; {}{}]",
+            "[seq {i}: prompt {prompt_len} tok, arrival step {}; batched first token at {:.1} ms \
+             (prefill {} forwards), gap p50 {:.1} max {:.1} ms; solo {} tokens eos={}; batched {} tokens eos={} overrun={}; {}{}]",
+            arrivals[i],
+            batched.stamps[i].first().map(|s| s * 1e3).unwrap_or(f64::NAN),
+            batched.outs[i].stats.prefill_units,
+            gap_p50,
+            gap_max,
             solo.streams[i].len(),
             solo.outs.get(i).map(|o| o.eos).unwrap_or(false),
             batched.streams[i].len(),
@@ -1182,8 +1358,11 @@ fn run_batched_concurrent(
         solo.dispatches as f64 / solo_steps.max(1) as f64,
     );
     let speedup = (batched.tokens() as f64 / batched.wall_s) / (solo.tokens() as f64 / solo.wall_s);
+    let batched_gaps: Vec<(f64, f64)> = batched.stamps.iter().map(|v| gap_stats_ms(v)).collect();
     println!(
         "RESULT mode=concurrent batched=true first={} {common} batched_lookahead={} sequences={n} \
+         prefill_chunk={} prefill_tile={} stagger={} arrivals={:?} prefill_units={:?} \
+         first_token_ms={:?} gap_p50_ms={:?} gap_max_ms={:?} \
          prompt_tokens={:?} solo_tokens={} solo_steps={} solo_wall_s={:.4} solo_aggregate_tok_s={:.4} \
          solo_gpu_busy_s={:.4} solo_dispatches={} solo_gemm={} solo_gemv={} \
          batched_tokens={} batched_steps={} batched_rows_per_step={:.4} batched_wall_s={:.4} \
@@ -1193,6 +1372,18 @@ fn run_batched_concurrent(
          per_seq_tokens={:?} per_seq_overrun={:?}",
         ctx.first,
         batched_opts.lookahead,
+        ctx.prefill_chunk,
+        ctx.prefill_tile,
+        ctx.stagger,
+        arrivals,
+        batched.outs.iter().map(|o| o.stats.prefill_units).collect::<Vec<_>>(),
+        batched
+            .stamps
+            .iter()
+            .map(|v| format!("{:.1}", v.first().map(|s| s * 1e3).unwrap_or(f64::NAN)))
+            .collect::<Vec<_>>(),
+        batched_gaps.iter().map(|g| format!("{:.1}", g.0)).collect::<Vec<_>>(),
+        batched_gaps.iter().map(|g| format!("{:.1}", g.1)).collect::<Vec<_>>(),
         prompt_lens,
         solo.tokens(),
         solo_steps,

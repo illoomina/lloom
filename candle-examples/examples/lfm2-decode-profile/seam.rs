@@ -241,7 +241,9 @@ impl Drop for Seam {
 /// figure the decode thread reports — which is the point of measuring the two
 /// sides separately.
 fn splitter_like(s: &str) -> usize {
-    s.bytes().filter(|b| matches!(b, b'.' | b'!' | b'?')).count()
+    s.bytes()
+        .filter(|b| matches!(b, b'.' | b'!' | b'?'))
+        .count()
 }
 
 /// `anyhow::Context` without importing the trait into this module's namespace,

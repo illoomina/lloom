@@ -484,9 +484,12 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     // prefill: the incumbent behaviour on both dials.
                     in_flight_depth: 0,
                     prefill_ubatch: 0,
-                    // The streamed-prefill dials (`prefill_schedule`, `prefill_bulk`,
-                    // `prefill_pacer_depth`) at their incumbent values.
-                    ..DecodeOptions::new(params.max_tokens)
+                    prefill_schedule: None,
+                    prefill_bulk: 0,
+                    prefill_pacer_depth: 0,
+                    stream_via_reader: false,
+                    prefill_tile: 0,
+                    prefill_chunk: 0,
                 };
                 self.session.decode_until(
                     &mut spec,

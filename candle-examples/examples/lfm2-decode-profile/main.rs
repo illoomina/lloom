@@ -105,77 +105,11 @@ fn load_average() -> Option<f64> {
 }
 
 /// The process's own resident and physical footprint, from `proc_pid_rusage`
-/// (`DESIGN.md` §3.4a-i).
-///
-/// # Why the process figure has to be beside the pool figure
-///
-/// #204 measured the pool at long context and found it **flat** — live
-/// 5.422 → 5.470 GB over 1750 tokens with `pending_bytes` 0.000 at every
-/// sample — and then died of `kIOGPUCommandBufferCallbackErrorOutOfMemory`.
-/// Its own words: *"a flat pool locates the growth and does not name it."*
-/// A pool counter can only report what the pool holds; if the growth is
-/// outside the pool, no pool counter can see it, and adding more pool
-/// counters would keep answering the question that was already answered.
-///
-/// `phys_footprint` is the quantity the OS bills the process for, so it
-/// spans **every** allocation this process holds however it was made — pooled
-/// or not, ours or Metal's own. It is therefore the one number that can show
-/// growth the five classes do not name (§9.5f candidate 3), which is what
-/// §16 P0 #7 has been waiting on.
-///
-/// §3.4a-i measured this call at **0.5 µs**, and it is taken outside the
-/// per-token timing window.
-#[cfg(target_os = "macos")]
-fn proc_footprint() -> Option<(u64, u64)> {
-    const RUSAGE_INFO_V6: i32 = 6;
-
-    // Field offsets in `u64` words, **read from
-    // `<sys/resource.h>`'s `struct rusage_info_v6`** rather than recalled —
-    // `DESIGN.md` §15.3 #17, and the reason is that a wrong offset here returns
-    // a plausible number rather than an error. The struct opens with
-    // `uint8_t ri_uuid[16]` (2 words), then `ri_user_time`, `ri_system_time`,
-    // `ri_pkg_idle_wkups`, `ri_interrupt_wkups`, `ri_pageins`, `ri_wired_size`,
-    // `ri_resident_size`, `ri_phys_footprint`.
-    //
-    // The pair is sanity-checked by the caller rather than trusted: a
-    // `phys_footprint` below the weights this process has provably loaded is a
-    // misread rather than a small process, and §2.4's *"too good is a bug
-    // signal"* applies to a memory figure exactly as to a speedup.
-    const W_RESIDENT: usize = 8;
-    const W_PHYS: usize = 9;
-
-    // 64 words = 512 B against the struct's ~472 B, so the call cannot write
-    // past the buffer even if a later SDK appends a field.
-    const WORDS: usize = 64;
-
-    // Declared here rather than pulled from `libc`, which `candle-examples` does
-    // not depend on: adding a crate to a workspace manifest for two integers is
-    // a wider change than the measurement warrants.
-    extern "C" {
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
-    }
-    let mut buf = [0u64; WORDS];
-    // SAFETY: `proc_pid_rusage` writes at most `sizeof(rusage_info_v6)` bytes
-    // (~472) into the buffer, and `WORDS * 8 = 512` is larger, so the write is
-    // in bounds for a buffer this frame owns. A non-zero return means the call
-    // failed and the buffer is not read.
-    let rc = unsafe {
-        proc_pid_rusage(
-            std::process::id() as i32,
-            RUSAGE_INFO_V6,
-            buf.as_mut_ptr().cast(),
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    Some((buf[W_PHYS], buf[W_RESIDENT]))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn proc_footprint() -> Option<(u64, u64)> {
-    None
-}
+/// (`DESIGN.md` §3.4a-i): `phys_footprint` is the quantity the OS bills the
+/// process for, so it spans every allocation however it was made — the one
+/// number that can show growth the five classes do not name (§9.5f candidate
+/// 3). Shared with `lfm2-chat --mem-sample`.
+use candle_examples::lfm2_setup::proc_footprint;
 
 /// Write the by-class timeline recorded so far, truncating and rewriting.
 ///

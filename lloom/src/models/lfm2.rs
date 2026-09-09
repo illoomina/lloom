@@ -3698,7 +3698,7 @@ impl Attention {
             let q_r = q.narrow(1, off, len)?.transpose(1, 2)?.contiguous()?;
             let k_r = k.narrow(1, off, len)?.transpose(1, 2)?.contiguous()?;
             let v_r = v.narrow(1, off, len)?.transpose(1, 2)?.contiguous()?;
-            let y = self.attend_projected(&q_r, &k_r, v_r, row.pos, block_idx, row.cache)?;
+            let y = self.attend_projected(&q_r, &k_r, v_r, false, row.pos, block_idx, row.cache)?;
             ys.push(y.transpose(1, 2)?.reshape((
                 1,
                 len,

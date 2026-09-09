@@ -441,11 +441,24 @@ impl BoundSet {
     /// the allocation away and leaves a fresh empty map to be regrown on the
     /// next dispatch. Clearing keeps the buckets — the same pointers recur
     /// every dispatch, so their capacity is exactly what is wanted next.
+    ///
+    /// The entries are RETAINED empty rather than removed: a pointer bound on
+    /// one dispatch is overwhelmingly bound on the next (the weights, the KV
+    /// slab, the arena's base), so keeping the `Vec` is what makes
+    /// [`Self::insert`] allocation-free in the steady state. The map's own
+    /// size is bounded by the distinct buffers an encoder touches, which is
+    /// small and does not grow with dispatches.
     fn clear(&mut self) {
         self.ptrs.clear();
         for v in self.ranges.values_mut() {
             v.clear();
         }
+    }
+
+    /// Bytes this set is holding, for the test that pins the steady state.
+    #[cfg(test)]
+    fn bucket_capacity(&self) -> usize {
+        self.ranges.values().map(Vec::capacity).sum()
     }
 
     fn take(&mut self) -> BoundSet {
@@ -1550,6 +1563,61 @@ mod tests {
             "a range re-bound every dispatch must be retained ONCE; \
              appending blindly kept {dispatches} copies and scanned them all"
         );
+    }
+
+    /// The per-dispatch rotation is ALLOCATION-FREE in the steady state.
+    ///
+    /// `set_input_buffer`/`set_output_buffer` run ~2000 times per token, and
+    /// each one `insert`s into a `BoundSet`. If the rotation handed the map's
+    /// allocation away every dispatch (`mem::take`) the next dispatch would
+    /// regrow every bucket — a `HashMap` entry and a `Vec` push per bind,
+    /// 2000 times a token, for a population that is the SAME pointers every
+    /// dispatch.
+    ///
+    /// This pins the fix as a property rather than as a timing: after a warm
+    /// first dispatch, the buckets' capacity stops growing. It is asserted at
+    /// the structure level because a timing assertion here would pin the
+    /// machine, not the code — and because the end-to-end effect is a
+    /// measured null on the shipping config (lloom #727, measurements §25:
+    /// a +2.1 ms/step encode swing moves throughput 0.0, since the GPU step
+    /// dominates). The cost is real, bounded, and worth not paying; the
+    /// throughput claim is not made.
+    #[test]
+    fn the_per_dispatch_rotation_stops_allocating_once_warm() {
+        let mut prev = BoundSet::default();
+        let mut next = BoundSet::default();
+        // The steady-state population: a handful of pointers, re-bound every
+        // dispatch at the same ranges — weights, the KV slab, an arena base.
+        let binds = [
+            r(1, 0, 4096),
+            r(2, 0, 8192),
+            r(3, 128, 128),
+            r(1, 4096, 4096),
+        ];
+
+        let mut capacity_after = Vec::new();
+        for _ in 0..8 {
+            for b in binds {
+                next.insert(HazardKey::Range, b);
+            }
+            prev.absorb(&mut next);
+            next.clear();
+            capacity_after.push((prev.bucket_capacity(), next.bucket_capacity()));
+        }
+
+        // Warm after the first pass: neither set grows again.
+        let steady = capacity_after[1];
+        for (i, c) in capacity_after.iter().enumerate().skip(1) {
+            assert_eq!(
+                *c, steady,
+                "dispatch {i} changed the retained capacity {capacity_after:?} — the rotation \
+                 is reallocating per dispatch"
+            );
+        }
+        // And `prev` holds each distinct range once, not once per dispatch.
+        assert_eq!(prev.ranges.get(&1).map(Vec::len), Some(2));
+        assert_eq!(prev.ranges.get(&2).map(Vec::len), Some(1));
+        assert_eq!(prev.ranges.get(&3).map(Vec::len), Some(1));
     }
 
     #[test]

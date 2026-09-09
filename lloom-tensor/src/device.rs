@@ -516,6 +516,30 @@ impl Device {
         }
     }
 
+    /// Open a forward pass of shape `key` (`BackendDevice::begin_pass`,
+    /// `DESIGN.md` §9.2aa). `Ok(false)` means the device declined and the
+    /// pass allocates exactly as it did before — the CPU's answer, and
+    /// Metal's until the plan cache is enabled. Pair every `true` with
+    /// [`Self::finish_pass`].
+    pub fn begin_pass(&self, key: crate::backend::PassShapeKey) -> Result<bool> {
+        match self {
+            Self::Cpu => Ok(false),
+            Self::Cuda(d) => d.begin_pass(key),
+            // The inherent `MetalDevice::begin_pass` takes the backend's own
+            // key and shadows the trait's; name the trait explicitly.
+            Self::Metal(d) => crate::backend::BackendDevice::begin_pass(d, key),
+        }
+    }
+
+    /// Close the pass [`Self::begin_pass`] opened.
+    pub fn finish_pass(&self) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda(d) => d.finish_pass(),
+            Self::Metal(d) => crate::backend::BackendDevice::finish_pass(d),
+        }
+    }
+
     /// Raise the Metal command-buffer cut period to the PIPELINED loop's for
     /// the enclosing scope, restoring the default on drop (lloom #715). For a
     /// loop that encodes step `s+1` while the GPU runs step `s` a cut buys no

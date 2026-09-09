@@ -5729,6 +5729,14 @@ impl Model {
             // obligation with the party that knows the producer. Computed once
             // even when a layer fills two slots.
             if tapped.is_none() {
+                // The tap OUTLIVES this pass by construction: the drafter
+                // reads it in `observe`, after the round's verify has been
+                // closed, and the cross-pass detector cannot see that (it
+                // looks one pass ahead, and the next pass is another
+                // verify). Declared, so no plan ever serves it and a served
+                // verify does not hand the drafter a slot the next verify
+                // overwrites (`DESIGN.md` §9.2aa, escapes are declared).
+                let _declared = lloom_tensor::EscapeGuard::new();
                 tapped = Some(hidden.contiguous()?.to_dtype(cache.tap_dtype)?);
             }
             cache.taps[slot] = tapped.clone();

@@ -676,12 +676,50 @@ fn pass_key(shape: PassShape) -> lloom_tensor::metal_backend::PassKey {
     PassKey::new(kind)
 }
 
-fn begin_pass(device: &Device, shape: PassShape) -> Result<()> {
+/// This pass shape, as the backend-neutral key the `BackendDevice` hook
+/// takes (`DESIGN.md` §9.2aa step 8).
+fn shape_key(shape: PassShape) -> lloom_tensor::backend::PassShapeKey {
+    use lloom_tensor::backend::PassShapeKey as K;
+    match shape {
+        PassShape::Decode { b } => K::Decode {
+            b: b.min(u16::MAX as usize) as u16,
+        },
+        PassShape::Prefill { w, fresh } => K::Prefill {
+            w: w.min(u32::MAX as usize) as u32,
+            fresh,
+        },
+        PassShape::Verify { k } => K::Verify {
+            k: k.min(u16::MAX as usize) as u16,
+        },
+        PassShape::Ragged {
+            live,
+            pieces,
+            layout,
+        } => K::Ragged {
+            live,
+            pieces,
+            layout,
+        },
+    }
+}
+
+/// Open a planned pass of `shape` on `device`, through the backend seam
+/// (`BackendDevice::begin_pass`). A device that declines allocates exactly
+/// as it did before, so every driver brackets unconditionally and no call
+/// site carries a `#[cfg]` (`DESIGN.md` §9.2aa step 8).
+///
+/// On Metal with the cache off this still runs the legacy decode-step
+/// bracket the arena needs, which is why the Metal arm is not simply the
+/// hook: `MetalDevice::begin_pass` falls back to `begin_decode_step`.
+pub(crate) fn begin_pass(device: &Device, shape: PassShape) -> Result<()> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
+        // The legacy arena path lives under the same bracket, so Metal goes
+        // through its own entry point rather than the hook's early decline.
         m.begin_pass(pass_key(shape))?;
+        return Ok(());
     }
-    let _ = (device, shape);
+    device.begin_pass(shape_key(shape))?;
     Ok(())
 }
 
@@ -696,13 +734,13 @@ fn activations_may_be_reused(device: &Device) -> bool {
     false
 }
 
-fn end_pass(device: &Device) -> Result<()> {
+pub(crate) fn end_pass(device: &Device) -> Result<()> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
         m.finish_pass()?;
+        return Ok(());
     }
-    let _ = device;
-    Ok(())
+    device.finish_pass()
 }
 
 fn begin_decode_step(device: &Device) {
@@ -1906,8 +1944,30 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 },
                 census: opts.sample_split && stats.steps == CENSUS_ROUND,
             };
-            let (accepted, timing) =
-                self.speculative_round(spec, &[seq], &[anchor], 0.0, eos_ids, probe)?;
+            // The verify is a planned pass of `K + 1` positions
+            // (`DESIGN.md` §9.2aa): the drafter's own forwards and the
+            // observe are OUTSIDE it — they run on the drafter's model and
+            // its own caches, and `speculative_round` brackets them for the
+            // timing, not for the plan. `Verify { k }` is keyed on the
+            // window the round actually proposes, which shrinks when a
+            // confidence cut or the drafter's own bound truncates a draft,
+            // so a run takes one key per distinct window (at most `K`).
+            // The verify pass is planned (`DESIGN.md` §9.2aa): its window
+            // is `K + 1` positions — the drafter's block plus the target's
+            // bonus — and a round that drafts fewer (a confidence cut, a
+            // drafter's own bound) is a different sequence and a different
+            // key. The draft and the observe are outside the bracket: they
+            // run on the drafter's model and its own caches.
+            let k = (spec.max_draft() + 1).min(u16::MAX as usize) as u16;
+            let (accepted, timing) = self.speculative_round_keyed(
+                spec,
+                &[seq],
+                &[anchor],
+                0.0,
+                eos_ids,
+                probe,
+                Some((&device, PassShape::Verify { k: k as usize })),
+            )?;
             let accepted = accepted.into_iter().next().ok_or_else(|| {
                 lloom_tensor::Error::msg("decode_speculative: verify returned no sequence")
             })?;
@@ -2145,7 +2205,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // Prime: one verify in flight per live sequence.
         for i in 0..n {
             if !lanes[i].done {
-                Self::pipeline_enqueue(&mut sessions[i], &mut lanes[i], spec, i, run_start)?;
+                Self::pipeline_enqueue(
+                    &mut sessions[i],
+                    &mut lanes[i],
+                    spec,
+                    i,
+                    run_start,
+                    device,
+                )?;
             }
         }
 
@@ -2216,7 +2283,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 );
                 lane.done = lane.eos || opts.reached(lane.produced);
                 if !lane.done {
-                    Self::pipeline_enqueue(s, lane, spec, i, run_start)?;
+                    Self::pipeline_enqueue(s, lane, spec, i, run_start, device)?;
                 }
             }
             if !progressed {
@@ -2254,6 +2321,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         spec: &mut S,
         i: usize,
         run_start: std::time::Instant,
+        device: &Device,
     ) -> Result<()>
     where
         S: Speculator,
@@ -2276,7 +2344,18 @@ impl<'m, M: CausalLM> Session<'m, M> {
 
         let t = std::time::Instant::now();
         let rb = readbacks();
-        let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache)?;
+        // The planned pass is the ENCODE (`DESIGN.md` §9.2aa): a plan serves
+        // allocations, and `verify_enqueue` is where this round's are made.
+        // `verify_complete` reads a marker back and allocates nothing of the
+        // pass, and this driver interleaves OTHER sequences' rounds between
+        // the two halves — so a bracket spanning them would put another
+        // sequence's passes inside this one's, which is exactly the drift
+        // the key exists to refuse.
+        let k = (spec.max_draft() + 1).min(u16::MAX as usize);
+        begin_pass(device, PassShape::Verify { k })?;
+        let pending = s.model.verify_enqueue(&draft, &anchor, &mut s.seq.cache);
+        end_pass(device)?;
+        let pending = pending?;
         timing.verify_enqueue_ns = t.elapsed().as_nanos() as u64;
         timing.verify_readbacks = readbacks() - rb;
         lane.in_flight = timing;

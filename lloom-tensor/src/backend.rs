@@ -197,4 +197,53 @@ pub trait BackendDevice: Sized + std::fmt::Debug + Clone {
 
     /// Synchronize should block until all the operations on the device are completed.
     fn synchronize(&self) -> Result<()>;
+
+    /// Open a forward pass of shape `key` on this device, so its activations
+    /// can be served from a plan cached for that shape rather than allocated
+    /// (`DESIGN.md` §9.2aa, "planned passes").
+    ///
+    /// # Why this is a defaulted no-op rather than a required method
+    ///
+    /// The plan is *base + offsets*: a backend implements it by handing out
+    /// slices of one buffer it grew outside every pass. That shape is
+    /// expressible on any allocator (CUDA: one `cudaMalloc` base and
+    /// `DevicePtr` offsets), but nothing about the driver's correctness
+    /// depends on a backend taking it up — a backend that declines allocates
+    /// exactly as it did before, which is what CPU and CUDA do here.
+    /// Defaulting rather than requiring is §3.6's *add a variant behind a
+    /// seam, never rip out the block*: the pass brackets can be wired
+    /// through every driver once, and each backend opts in when it has the
+    /// mechanism, with no `#[cfg]` at the call sites.
+    ///
+    /// Returning `Ok(false)` means "not planned" and is not a failure. An
+    /// `Err` is a real refusal — a base grow the device cannot admit
+    /// (§9.5) — and stops the run before anything is allocated.
+    fn begin_pass(&self, _key: crate::backend::PassShapeKey) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Close the pass [`Self::begin_pass`] opened. A no-op on a backend that
+    /// declined it.
+    fn finish_pass(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The shape of a forward pass, backend-neutrally: what a plan is keyed by
+/// (`DESIGN.md` §9.2aa). Mirrors the Metal backend's `PassKind` without
+/// depending on it, so a driver names a pass shape once and every backend
+/// reads the same key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PassShapeKey {
+    /// One decode step over `b` lockstep rows.
+    Decode { b: u16 },
+    /// One prefill forward of `w` tokens; `fresh` is the first pass on an
+    /// empty cache, which allocates the session state every later pass finds
+    /// in place.
+    Prefill { w: u32, fresh: bool },
+    /// One speculative verify pass of `k` positions.
+    Verify { k: u16 },
+    /// One batched step of `live` decode rows with `pieces` prompt pieces
+    /// riding it, whose widths hash to `layout`.
+    Ragged { live: u16, pieces: u16, layout: u64 },
 }

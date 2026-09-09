@@ -895,6 +895,32 @@ impl<'m, M: CausalLM> Session<'m, M> {
         S: Speculator,
         M: Probes<S::Probe>,
     {
+        self.speculative_round_keyed(spec, active, anchors, p_min, eos_ids, probe, None)
+    }
+
+    /// [`Self::speculative_round`] with the VERIFY phase bracketed as a
+    /// planned pass of `verify_key`'s shape (`DESIGN.md` §9.2aa).
+    ///
+    /// Only the verify is bracketed. The draft and the observe run on the
+    /// DRAFTER's model and its own caches — a different allocation sequence
+    /// that the target's key would not describe — and the drafter's taps are
+    /// declared escapes at their producer (`lfm2.rs`, `tap_layer_input`), so
+    /// the verify's plan never serves the values `observe` reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn speculative_round_keyed<S>(
+        &mut self,
+        spec: &mut S,
+        active: &[SeqId],
+        anchors: &[Anchor],
+        p_min: f32,
+        eos_ids: &[u32],
+        probe: RoundProbe<'_>,
+        verify_key: Option<(&Device, crate::nn::decode::PassShape)>,
+    ) -> Result<(Vec<Vec<u32>>, RoundTiming)>
+    where
+        S: Speculator,
+        M: Probes<S::Probe>,
+    {
         let mut timing = RoundTiming::default();
         let t = std::time::Instant::now();
         let rb = readbacks();
@@ -927,9 +953,16 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // here: the verify's argmax, with the draft ids beside it.
         let t = std::time::Instant::now();
         let rb = readbacks();
-        let (accepted, probe_out) =
-            self.model
-                .verify_and_probe(&drafts, anchors, &mut self.seq.cache, eos_ids)?;
+        if let Some((device, shape)) = verify_key {
+            crate::nn::decode::begin_pass(device, shape)?;
+        }
+        let verified = self
+            .model
+            .verify_and_probe(&drafts, anchors, &mut self.seq.cache, eos_ids);
+        if let Some((device, _)) = verify_key {
+            crate::nn::decode::end_pass(device)?;
+        }
+        let (accepted, probe_out) = verified?;
         let (gpu, disp, census) = probe.close()?;
         timing.verify_ns = t.elapsed().as_nanos() as u64;
         timing.verify_readbacks = readbacks() - rb;

@@ -2699,6 +2699,27 @@ impl MetalStorage {
     }
 }
 
+impl MetalDevice {
+    /// This device's own key for a backend-neutral pass shape.
+    fn key_of(shape: crate::backend::PassShapeKey) -> PassKey {
+        use crate::backend::PassShapeKey as K;
+        PassKey::new(match shape {
+            K::Decode { b } => PassKind::Decode { b },
+            K::Prefill { w, fresh } => PassKind::Prefill { w, fresh },
+            K::Verify { k } => PassKind::Verify { k },
+            K::Ragged {
+                live,
+                pieces,
+                layout,
+            } => PassKind::Ragged {
+                live,
+                pieces,
+                layout,
+            },
+        })
+    }
+}
+
 impl BackendDevice for MetalDevice {
     type Storage = MetalStorage;
 
@@ -3142,6 +3163,26 @@ impl BackendDevice for MetalDevice {
 
     fn synchronize(&self) -> Result<()> {
         self.wait_until_completed()
+    }
+
+    /// Metal takes the hook up: the plan cache serves this pass's
+    /// activations from one base when it holds a plan for the shape, and
+    /// records the shape on its first sight otherwise (`DESIGN.md` §9.2aa).
+    /// Declines — `Ok(false)` — until `enable_pass_plans` turns the cache
+    /// on, so the brackets are inert on every arm that has not asked for it.
+    fn begin_pass(&self, key: crate::backend::PassShapeKey) -> Result<bool> {
+        if !self.pass_plans_enabled() {
+            return Ok(false);
+        }
+        MetalDevice::begin_pass(self, Self::key_of(key))?;
+        Ok(true)
+    }
+
+    fn finish_pass(&self) -> Result<()> {
+        if !self.pass_plans_enabled() {
+            return Ok(());
+        }
+        MetalDevice::finish_pass(self)
     }
 }
 

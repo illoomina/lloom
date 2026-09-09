@@ -513,3 +513,239 @@ fn the_ladder_rounds_down_to_a_rung() {
     assert_eq!(ladder_width(0, 8), 0);
     assert_eq!(ladder_width(100, 8), 8);
 }
+
+/// A drafter that proposes a constant block — almost always rejected, so the
+/// target's own correction advances the stream and the accept/rollback path is
+/// exercised every round (`dspark_decode_identity.rs`'s argument). It learns
+/// nothing from the probe, which is what makes the identity hold regardless.
+struct GarbageDrafter {
+    k: usize,
+    token: u32,
+    /// Every probe row count the loop handed back, to prove the taps the
+    /// drafter reads AFTER a planned verify are still its own memory.
+    seen: Vec<Vec<f32>>,
+}
+
+impl lloom::nn::speculator::Speculator for GarbageDrafter {
+    type Probe = lloom::nn::speculator::LayerTaps<5>;
+
+    fn n_seq(&self) -> usize {
+        1
+    }
+
+    fn max_draft(&self) -> usize {
+        self.k
+    }
+
+    fn begin(&mut self, _seq: lloom::nn::speculator::SeqId, _prompt: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
+    fn draft(
+        &mut self,
+        active: &[lloom::nn::speculator::SeqId],
+    ) -> Result<Vec<lloom::nn::speculator::Draft>> {
+        Ok(active
+            .iter()
+            .map(|_| lloom::nn::speculator::Draft::host(vec![self.token; self.k]))
+            .collect())
+    }
+
+    fn observe(
+        &mut self,
+        _seq: lloom::nn::speculator::SeqId,
+        probe: &<Self::Probe as lloom::nn::speculator::TargetProbe>::Output,
+        _accepted: &[u32],
+    ) -> Result<()> {
+        // Read the taps HERE — after the verify pass that produced them has
+        // been closed. Under a plan they live in a slot the next verify
+        // reuses unless they are declared escapes, so this read is the gate.
+        let mut row = Vec::new();
+        for t in probe {
+            row.extend(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?);
+        }
+        self.seen.push(row);
+        Ok(())
+    }
+}
+
+/// A speculative run under the plan cache: the verify pass is keyed
+/// `Verify { k: K + 1 }`, the drafter's taps are declared escapes, and the
+/// stream plus every probe the drafter read is identical to the pool path's
+/// over a recording round and two served rounds.
+///
+/// The probe comparison is what pins step 4's declaration on this path: the
+/// taps are produced INSIDE a verify and read AFTER it, which the cross-pass
+/// detector cannot see (the next pass is another verify), so without the
+/// `EscapeGuard` at `tap_layer_input` a served verify hands the drafter a
+/// slot the following verify overwrites.
+#[test]
+fn a_planned_verify_keeps_the_drafters_taps_and_the_stream() -> Result<()> {
+    use lloom::generation::{Blocking, LogitsProcessor, Sampling};
+    use lloom::nn::{DecodeOptions, Session};
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!()
+    };
+    let k = 3usize;
+    let mut cfg = tiny_config(ConvState::RotatingRing { k: k + 1 });
+    // The taps `LayerTaps<5>` needs, on layers this fixture has.
+    cfg.tap_layers = vec![0, 1, 2, 0, 1];
+    cfg.tap_dtype = DType::F32;
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = (1..=10).collect();
+    let eos: Vec<u32> = vec![u32::MAX];
+
+    let run = || -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
+        let mut session = Session::new(&model, Cache::new(true, DType::F16, &cfg, &dev)?);
+        let mut spec = GarbageDrafter {
+            k,
+            token: 0,
+            seen: Vec::new(),
+        };
+        let mut rb = Blocking::new(&eos, &dev)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let out = session.decode_speculative(
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            &prompt,
+            &DecodeOptions::new(8),
+            &eos,
+            &mut |_: &[u32]| Ok(()),
+        )?;
+        Ok((out.ids, spec.seen))
+    };
+
+    let (want_ids, want_probes) = run()?;
+    assert!(
+        want_ids.len() >= 4,
+        "the run must span rounds: {want_ids:?}"
+    );
+    assert!(want_probes.len() >= 2, "the drafter must observe rounds");
+
+    m.enable_pass_plans(ArenaLayout::Packed);
+    for round in 0..3 {
+        let (ids, probes) = run()?;
+        assert_eq!(ids, want_ids, "round {round}: the stream moved under plans");
+        assert_eq!(
+            probes.len(),
+            want_probes.len(),
+            "round {round}: a different number of observes"
+        );
+        for (i, (got, want)) in probes.iter().zip(&want_probes).enumerate() {
+            assert_eq!(
+                got, want,
+                "round {round}: the drafter's probe {i} was overwritten after its verify"
+            );
+        }
+    }
+    let (keys, _) = m.pass_plan_report().expect("cache on");
+    let verify: Vec<_> = keys
+        .iter()
+        .filter(|(key, ..)| matches!(key.kind, PassKind::Verify { .. }))
+        .collect();
+    let c = m.pass_plan_counters().unwrap();
+    eprintln!("[dspark] {c:?} verify keys={verify:?}");
+    assert_eq!(
+        verify.len(),
+        1,
+        "one verify window, one key: {:?}",
+        keys.iter().map(|(k, ..)| k.kind).collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(verify[0].0.kind, PassKind::Verify { k: w } if w as usize == k + 1),
+        "the key is the K+1 window: {:?}",
+        verify[0].0.kind
+    );
+    assert_eq!(c.evicted, 0, "a verify drifted under its own plan: {c:?}");
+    assert_eq!(c.escapes, 0, "the taps were not declared: {c:?}");
+    Ok(())
+}
+
+/// A base grow the machine cannot take is REFUSED before it is allocated
+/// (`DESIGN.md` §9.5, the KV grow's gate): the run stops with a message
+/// naming the key, nothing was allocated, and no plan was cached — so the
+/// pass would have run on the pool as it did before the cache existed.
+///
+/// Driven by setting the admitted fraction to a value the process is already
+/// over, which is the same shape as a real machine being out of room.
+#[test]
+fn a_base_grow_over_the_budget_is_refused_before_it_allocates() -> Result<()> {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!()
+    };
+    let cfg = tiny_config(ConvState::RotatingRing { k: 4 });
+    let model = build(&cfg, &dev)?;
+    let prompt: Vec<u32> = (1..=8).collect();
+
+    m.enable_pass_plans(ArenaLayout::Packed);
+    // A fraction the process is certainly already past, so the FIRST base
+    // grow — the one closing the first key — is the one refused.
+    m.set_pass_plan_admit_fraction(1e-9);
+    let err = run_prompt(&model, &cfg, &dev, &prompt, 0, 3).expect_err("the grow must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("pass plan base grow refused"),
+        "the refusal must name itself: {msg}"
+    );
+    assert!(
+        msg.contains("Nothing was allocated"),
+        "the refusal must say the run is intact: {msg}"
+    );
+    let c = m.pass_plan_counters().unwrap();
+    assert_eq!(c.plans, 0, "a plan was cached over a refused base: {c:?}");
+    assert_eq!(c.base_grows, 0, "the base grew after the refusal: {c:?}");
+
+    // With the check off the same run completes and caches its plans.
+    m.set_pass_plan_admit_fraction(0.0);
+    let ids = run_prompt(&model, &cfg, &dev, &prompt, 0, 3)?;
+    assert_eq!(ids.len(), 3);
+    let c = m.pass_plan_counters().unwrap();
+    assert!(c.plans > 0, "{c:?}");
+    assert!(c.base_grows > 0, "{c:?}");
+    Ok(())
+}
+
+/// The backend seam (`DESIGN.md` §9.2aa step 8): a device that has no plan
+/// cache DECLINES the bracket and allocates as it always did, so a driver
+/// brackets unconditionally and no call site carries a `#[cfg]`. Metal
+/// declines too until `enable_pass_plans` turns the cache on — which is what
+/// makes the brackets inert on every arm that did not ask for them.
+#[test]
+fn the_backend_hook_declines_by_default_and_metal_takes_it_up() -> Result<()> {
+    use lloom_tensor::backend::PassShapeKey;
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let shape = PassShapeKey::Decode { b: 1 };
+
+    // The CPU has no plan cache: it declines, and closing is a no-op.
+    let cpu = Device::Cpu;
+    assert!(!cpu.begin_pass(shape)?, "the CPU claimed to plan a pass");
+    cpu.finish_pass()?;
+
+    let dev = Device::new_metal(0)?;
+    let Device::Metal(m) = &dev else {
+        unreachable!()
+    };
+    // A fresh device has no cache enabled yet — but this process may have
+    // enabled it in an earlier test on the same device, so only the
+    // enabled-state implication is asserted, both ways.
+    let before = m.pass_plans_enabled();
+    assert_eq!(
+        dev.begin_pass(shape)?,
+        before,
+        "the hook must answer whether the cache is on"
+    );
+    dev.finish_pass()?;
+
+    m.enable_pass_plans(ArenaLayout::Packed);
+    assert!(
+        dev.begin_pass(shape)?,
+        "Metal declined the hook with the cache on"
+    );
+    dev.finish_pass()?;
+    Ok(())
+}

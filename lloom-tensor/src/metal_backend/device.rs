@@ -391,6 +391,13 @@ pub struct PassPlans {
     /// when there are more than `ragged_cap`.
     ragged_order: std::collections::VecDeque<PassKey>,
     ragged_cap: usize,
+    /// The fraction of `recommendedMaxWorkingSetSize` the process may hold
+    /// once the base is grown (`DESIGN.md` §9.5, the KV grow's gate). A base
+    /// grow is an allocation made OUTSIDE every pass and held for the run,
+    /// so it is admitted exactly as a KV bucket grow is: predicted, refused
+    /// before anything is allocated, and the run stops rather than risking
+    /// the machine. 0 turns the check off.
+    admit_fraction: f64,
 }
 
 /// One cached plan as the harness reports it: `(key, ordinals served,
@@ -427,6 +434,9 @@ impl PassPlans {
             escapes: HashMap::new(),
             ragged_order: std::collections::VecDeque::new(),
             ragged_cap: 32,
+            // The KV grow's default (`Cache::kv_grow_fraction`), so the two
+            // admissions speak of one budget rather than two.
+            admit_fraction: 0.85,
         }
     }
 }
@@ -1359,6 +1369,14 @@ impl MetalDevice {
     /// oldest is dropped and counted (`PassPlanCounters::capped`). The other
     /// kinds are bounded by the configuration (one `Decode{B}` per B, one
     /// `Prefill{w}` per width the schedule names) and are never dropped.
+    /// The fraction of `recommendedMaxWorkingSetSize` a base grow is
+    /// admitted against (default 0.85, the KV grow's); 0 turns the check off.
+    pub fn set_pass_plan_admit_fraction(&self, fraction: f64) {
+        if let Some(pp) = self.pass_plans.lock().as_mut() {
+            pp.admit_fraction = fraction.max(0.0);
+        }
+    }
+
     pub fn set_pass_plan_ragged_cap(&self, cap: usize) {
         if let Some(pp) = self.pass_plans.lock().as_mut() {
             pp.ragged_cap = cap.max(1);
@@ -1562,6 +1580,36 @@ impl MetalDevice {
         let needed = plan.bump_capacity().max(plan.arena_bytes()).max(1);
         let have = pp.base.as_ref().map_or(0, |b| b.length());
         if needed > have {
+            // Admitted before it is allocated (`DESIGN.md` §9.5): the base is
+            // held for the run, so a grow the machine cannot take must stop
+            // the run here rather than after the allocation. The OLD base is
+            // still held at this point and is released just below, so the
+            // grow charged is the difference — what the process's footprint
+            // actually rises by.
+            if pp.admit_fraction > 0.0 {
+                let grow = needed.saturating_sub(have);
+                let allocated = self.device.current_allocated_size();
+                let working_set = self.device.recommended_max_working_set_size();
+                let budget = (working_set as f64 * pp.admit_fraction) as usize;
+                if allocated.saturating_add(grow) > budget {
+                    let gb = |b: usize| b as f64 / 1e9;
+                    return Err(MetalError::Message(format!(
+                        "pass plan base grow refused for {:?}: it needs {:.3} GB more, and the \
+                         process already holds {:.2} GB of the {:.2} GB it may ({:.2} x \
+                         recommendedMaxWorkingSetSize {:.2} GB). Nothing was allocated and no \
+                         plan was cached; the pass runs on the pool as it did before \
+                         (DESIGN.md 9.5, 3.5). Raise the fraction, narrow the pass (a smaller \
+                         prefill tile), or bound the run.",
+                        closes.kind,
+                        gb(grow),
+                        gb(allocated),
+                        gb(budget),
+                        pp.admit_fraction,
+                        gb(working_set),
+                    ))
+                    .into());
+                }
+            }
             let base = self
                 .device
                 .new_buffer(needed, PRIVATE_RESOURCE_OPTIONS)

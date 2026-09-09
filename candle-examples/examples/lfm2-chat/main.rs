@@ -1035,6 +1035,41 @@ fn cache_sizes_of(device: &Device) -> (usize, usize) {
     (0, 0)
 }
 
+/// The pass-plan cache's end-of-run line, on every driver path (the
+/// concurrent modes return before the single-turn epilogue).
+#[cfg(feature = "metal")]
+fn report_pass_plans(device: &Device, widths: &str) {
+    if let Device::Metal(dev) = device {
+        if let (Some(c), Some((keys, base))) = (dev.pass_plan_counters(), dev.pass_plan_report()) {
+            let keys: Vec<String> = keys
+                .iter()
+                .map(|(k, covered, total, escapes)| {
+                    if *escapes > 0 {
+                        format!("{:?}={covered}/{total}(+{escapes} escaped)", k.kind)
+                    } else {
+                        format!("{:?}={covered}/{total}", k.kind)
+                    }
+                })
+                .collect();
+            eprintln!(
+                "[pass plans: served={} recorded={} observed={} plans={} evicted={} \
+                 escapes={} capped={} base_grows={} base={:.1} MiB widths={} keys=[{}]]",
+                c.served,
+                c.recorded,
+                c.observed,
+                c.plans,
+                c.evicted,
+                c.escapes,
+                c.capped,
+                c.base_grows,
+                base as f64 / (1024.0 * 1024.0),
+                widths,
+                keys.join(" ")
+            );
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -1498,6 +1533,10 @@ fn main() -> Result<()> {
         let r = concurrent::run(ctx);
         if let Some(s) = sampler {
             s.stop().report();
+        }
+        #[cfg(feature = "metal")]
+        if args.pass_plans {
+            report_pass_plans(&device, &args.pass_widths);
         }
         return r;
     }
@@ -2617,38 +2656,9 @@ fn main() -> Result<()> {
     }
     #[cfg(feature = "metal")]
     if args.pass_plans {
-        if let Device::Metal(dev) = &device {
-            if let (Some(c), Some((keys, base))) =
-                (dev.pass_plan_counters(), dev.pass_plan_report())
-            {
-                let keys: Vec<String> = keys
-                    .iter()
-                    .map(|(k, covered, total, escapes)| {
-                        if *escapes > 0 {
-                            format!("{:?}={covered}/{total}(+{escapes} escaped)", k.kind)
-                        } else {
-                            format!("{:?}={covered}/{total}", k.kind)
-                        }
-                    })
-                    .collect();
-                eprintln!(
-                    "[pass plans: served={} recorded={} observed={} plans={} evicted={} \
-                     escapes={} capped={} base_grows={} base={:.1} MiB widths={} keys=[{}]]",
-                    c.served,
-                    c.recorded,
-                    c.observed,
-                    c.plans,
-                    c.evicted,
-                    c.escapes,
-                    c.capped,
-                    c.base_grows,
-                    base as f64 / (1024.0 * 1024.0),
-                    args.pass_widths,
-                    keys.join(" ")
-                );
-            }
-        }
+        report_pass_plans(&device, &args.pass_widths);
     }
+
     #[cfg(feature = "metal")]
     if arena {
         if let Device::Metal(dev) = &device {

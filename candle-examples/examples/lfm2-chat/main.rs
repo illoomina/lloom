@@ -1084,7 +1084,15 @@ fn report_pass_plans(device: &Device, widths: &str) {
                 .iter()
                 .map(|(k, covered, total, escapes)| {
                     if *escapes > 0 {
-                        format!("{:?}={covered}/{total}(+{escapes} escaped)", k.kind)
+                        // The escapes' identities, not just a count:
+                        // (ordinal, bytes, allocated-at, first-read-at). A
+                        // count says a hole exists; the sizes say WHAT leaked,
+                        // which is what a fix needs (#727).
+                        format!(
+                            "{:?}={covered}/{total}(+{escapes} escaped {:?})",
+                            k.kind,
+                            dev.pass_plan_escapes(k)
+                        )
                     } else {
                         format!("{:?}={covered}/{total}", k.kind)
                     }

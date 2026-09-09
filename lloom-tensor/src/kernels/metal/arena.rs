@@ -1663,11 +1663,23 @@ impl ArenaRecorder {
         // The address now names this value. Any earlier value that had it has
         // been reused, and its own binds were recorded while it held it.
         //
-        // Nothing is removed from `previous_by_addr` here, and that is not an
-        // omission. `record_bind` consults `by_addr` first, so the entry this
-        // line writes already shadows any previous-step entry for the same
-        // address, and a `remove` beside it would be a line no test can fail --
-        // §15.2 #11. The shadowing is stated rather than duplicated.
+        // **The previous step's claim on this address is dropped, not just
+        // shadowed.** `record_bind` consults `by_addr` first, so shadowing
+        // covers every bind AFTER this allocation — but the pool recycles an
+        // address into a value the recorder has not reached yet, and a bind
+        // of that value BEFORE its `record_alloc` runs falls through to
+        // `previous_by_addr` and is charged to the previous step's ordinal as
+        // an escape that never happened. That is the phantom this removes.
+        //
+        // The old comment here said a `remove` would be "a line no test can
+        // fail". It was wrong, and
+        // `a_recycled_address_stops_naming_the_previous_steps_value` is the
+        // test: measured on the real model, the phantom count MOVED BETWEEN
+        // IDENTICAL RUNS (8 escapes then 7, different ordinals) — the
+        // signature of address reuse rather than of a value outliving its
+        // pass, since a real escape is the same ordinal every run (lloom
+        // #727, measurements §8.4 and §24).
+        self.previous_by_addr.remove(&addr);
         self.by_addr.insert(addr, ordinal);
     }
 
@@ -2242,6 +2254,46 @@ mod tests {
         let c = arena.counters();
         assert_eq!(c.declined_size, 4, "the size gate never engaged");
         assert_eq!(c.hits, 4);
+    }
+
+    /// An address the pool RECYCLES stops naming the previous step's value.
+    ///
+    /// The cross-step detector reads a bind that matches nothing in this step
+    /// against the previous step's address map, and calls a match an escape.
+    /// That is right for a value still being read — and wrong for an address
+    /// the pool has handed to a NEW value whose own `record_alloc` has not
+    /// run yet: the new value's first bind is then charged to the old
+    /// ordinal. Measured on the real model, that phantom count moved between
+    /// identical runs (8 escapes, then 7, different ordinals), which is the
+    /// signature — a real escape is the same ordinal every run.
+    #[test]
+    fn a_recycled_address_stops_naming_the_previous_steps_value() {
+        let mut rec = ArenaRecorder::new();
+        // Step 1: two values, neither read again.
+        rec.record_alloc(0x1000, 4096);
+        rec.record_alloc(0x2000, 4096);
+        rec.next_step();
+
+        // Step 2: the pool recycles 0x1000 into a new value. Its `record_alloc`
+        // runs, and a LATER bind of it must belong to this step.
+        rec.record_alloc(0x1000, 4096);
+        rec.record_dispatch();
+        rec.record_bind(0x1000);
+        assert_eq!(
+            rec.previous_escapes(),
+            (0, 2),
+            "a recycled address must not name the previous step's value"
+        );
+
+        // And the detector still works: 0x2000 was NOT reallocated, so a bind
+        // of it here is a genuine cross-step read.
+        rec.record_bind(0x2000);
+        assert_eq!(
+            rec.previous_escapes(),
+            (1, 2),
+            "a value still read a step later IS an escape; the fix must not \
+             blind the detector"
+        );
     }
 
     /// An allocation made under an [`EscapeGuard`] is DECLARED to outlive its

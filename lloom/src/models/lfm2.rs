@@ -8,8 +8,8 @@
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
 use crate::nn::ops::{FlashScratchSizing, KvQuant};
 use crate::nn::{
-    BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, Row,
-    Speculative, VarBuilder,
+    BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, RaggedRow,
+    Row, Speculative, VarBuilder,
 };
 use crate::utils::repeat_kv;
 use lloom_macros::Config as ConfigDerive;
@@ -3572,6 +3572,76 @@ impl Attention {
             .reshape((b_sz, seq_len, self.num_attention_heads * self.head_dim))
     }
 
+    /// [`Self::forward_add`] over a ragged batch (`BatchedCausalLM::forward_ragged`):
+    /// the projections run once over `[1, T, hidden]`, each row attends over
+    /// its own run of tokens against its own cache. `T == 1` is one decode
+    /// row, and takes the residual arm `forward_add` takes.
+    fn forward_ragged_add(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [RaggedRow<'_, Cache>],
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let y = self.attend_ragged(x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &y, &self.o_proj, residual) {
+            return crate::nn::ops::gemv_residual(&y, self.o_proj.weight(), residual);
+        }
+        self.o_proj.forward(&y)? + residual
+    }
+
+    /// `attend` over a ragged batch: one set of projections and one pair of
+    /// QK norms over all `T` tokens (the norm is per position, so norming
+    /// before the split is the same arithmetic), then row `r` attends over
+    /// its `len` tokens at `rows[r].pos` against `rows[r].cache` in the
+    /// `[1, heads, len, head_dim]` layout a pass of `len` tokens has. A
+    /// one-token row's slice is already that layout (no copy); a longer
+    /// row's takes the transpose copy `project` takes for a prefill.
+    fn attend_ragged(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [RaggedRow<'_, Cache>],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let (_, total, _) = x.dims3()?;
+        let q = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
+        let q = self.q_norm.forward(&q.reshape((
+            1,
+            total,
+            self.num_attention_heads,
+            self.head_dim,
+        ))?)?;
+        let k = self.k_norm.forward(&k.reshape((
+            1,
+            total,
+            self.num_key_value_heads,
+            self.head_dim,
+        ))?)?;
+        let v = v.reshape((1, total, self.num_key_value_heads, self.head_dim))?;
+        let mut ys = Vec::with_capacity(rows.len());
+        let mut off = 0usize;
+        for row in rows.iter_mut() {
+            let len = row.len;
+            let q_r = q.narrow(1, off, len)?.transpose(1, 2)?.contiguous()?;
+            let k_r = k.narrow(1, off, len)?.transpose(1, 2)?.contiguous()?;
+            let v_r = v.narrow(1, off, len)?.transpose(1, 2)?.contiguous()?;
+            let y = self.attend_projected(&q_r, &k_r, v_r, row.pos, block_idx, row.cache)?;
+            ys.push(y.transpose(1, 2)?.reshape((
+                1,
+                len,
+                self.num_attention_heads * self.head_dim,
+            ))?);
+            off += len;
+        }
+        if ys.len() == 1 {
+            return Ok(ys.remove(0));
+        }
+        Tensor::cat(&ys, 1)
+    }
+
     /// The three projections and the per-head QK norms: `x [b, seq, hidden]`
     /// to `(q, k, v)` in `[b, heads, seq, head_dim]`, `q`/`k` normed and not
     /// yet rotated, `v` contiguous.
@@ -4356,6 +4426,50 @@ impl ShortConv {
         Tensor::cat(&outs, 0)
     }
 
+    /// [`Self::forward_add`] over a ragged batch (`BatchedCausalLM::forward_ragged`):
+    /// `in_proj` runs once over `[1, T, hidden]`, each row convolves over its
+    /// own run against its own state.
+    fn forward_ragged_add(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [RaggedRow<'_, Cache>],
+        residual: &Tensor,
+    ) -> Result<Tensor> {
+        let conv_out = self.convolve_ragged(x, block_idx, rows)?;
+        if self.gemv_residual && gemv_residual_applies(true, &conv_out, &self.out_proj, residual) {
+            return crate::nn::ops::gemv_residual(&conv_out, self.out_proj.weight(), residual);
+        }
+        self.out_proj.forward(&conv_out)? + residual
+    }
+
+    /// `convolve` over a ragged batch: one `in_proj`, then row `r` takes the
+    /// whole conv block over its `len` tokens against `rows[r].cache`. A
+    /// row's `[1, 3·hidden, len]` is the transposed narrow a pass of `len`
+    /// tokens sees (for `len == 1`, the strides a batch of one has — the
+    /// fused decode arms' layout), so every arm below sees what it was
+    /// written for.
+    fn convolve_ragged(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [RaggedRow<'_, Cache>],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let bcx = self.in_proj.forward(x)?;
+        let mut outs = Vec::with_capacity(rows.len());
+        let mut off = 0usize;
+        for row in rows.iter_mut() {
+            let bcx_r = bcx.narrow(1, off, row.len)?.transpose(1, 2)?;
+            outs.push(self.convolve_bcx(&bcx_r, block_idx, row.cache)?);
+            off += row.len;
+        }
+        if outs.len() == 1 {
+            return Ok(outs.remove(0));
+        }
+        Tensor::cat(&outs, 1)
+    }
+
     /// The conv block after `in_proj`: `bcx` is `[b, 3·hidden, seq]` and the
     /// result `[b, seq, hidden]` with the `*C` gate applied.
     fn convolve_bcx(&self, bcx: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
@@ -4835,6 +4949,27 @@ impl DecoderLayer {
         let x = self.post_attention_layernorm.forward(&x)?;
         self.mlp.forward_add(&x, residual)
     }
+
+    /// [`Self::forward`] over a ragged batch: the norms, the MLP and every
+    /// projection run once over `[1, T, hidden]`; the attention or conv block
+    /// runs per row over that row's tokens against its cache.
+    fn forward_ragged(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [RaggedRow<'_, Cache>],
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let residual = x;
+        let x = self.input_layernorm.forward(x)?;
+        let x = match &self.kind {
+            LayerKind::Attention(attn) => attn.forward_ragged_add(&x, block_idx, rows, residual)?,
+            LayerKind::ShortConv(conv) => conv.forward_ragged_add(&x, block_idx, rows, residual)?,
+        };
+        let residual = &x;
+        let x = self.post_attention_layernorm.forward(&x)?;
+        self.mlp.forward_add(&x, residual)
+    }
 }
 
 /// LFM2 model for causal language modeling.
@@ -5064,6 +5199,97 @@ impl Model {
 
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let hidden_states = hidden_states.i((.., 0, ..))?.contiguous()?;
+        let logits = self.lm_head.forward(&hidden_states)?;
+        logits.to_dtype(DType::F32)
+    }
+
+    /// One forward over a RAGGED batch (`BatchedCausalLM::forward_ragged`):
+    /// `input_ids` is `[1, T]`, the rows' token runs end to end; row `i`'s
+    /// `rows[i].len` tokens are fed to `rows[i]` at `rows[i].pos`; the result
+    /// is `[rows, vocab]`, each row's logits at its last token.
+    ///
+    /// The weight-bearing ops — every projection, the MLP, `lm_head` — run
+    /// once over all `T` tokens, so a prefill piece and the decode rows beside
+    /// it pay ONE weight sweep (§13.5; the fused chunked prefill). What is per
+    /// sequence runs per row over that row's tokens against its own cache,
+    /// through the layouts `forward` (a row of `len > 1`) and `forward_rows`
+    /// (a row of `len == 1`) already take — so a row computes what it would
+    /// compute alone, and a one-row batch of `len` tokens is `forward`.
+    ///
+    /// Refused as `forward_rows` refuses: a cache that taps, or one with an
+    /// open speculative window; and a `T` that is not the rows' lengths' sum.
+    pub fn forward_ragged(
+        &self,
+        input_ids: &Tensor,
+        rows: &mut [RaggedRow<'_, Cache>],
+    ) -> Result<Tensor> {
+        let (b_sz, total) = input_ids.dims2()?;
+        if b_sz != 1 {
+            lloom_tensor::bail!("lfm2 forward_ragged: the input is `[1, T]`, got batch {b_sz}")
+        }
+        if rows.is_empty() {
+            lloom_tensor::bail!("lfm2 forward_ragged: no rows")
+        }
+        let lens: usize = rows.iter().map(|r| r.len).sum();
+        if lens != total || rows.iter().any(|r| r.len == 0) {
+            lloom_tensor::bail!(
+                "lfm2 forward_ragged: {total} tokens for rows of lengths {:?}",
+                rows.iter().map(|r| r.len).collect::<Vec<_>>()
+            )
+        }
+        let mut plans = Vec::with_capacity(rows.len());
+        for (r, row) in rows.iter_mut().enumerate() {
+            if !row.cache.tap_layers.is_empty() {
+                lloom_tensor::bail!(
+                    "lfm2 forward_ragged: row {r}'s cache taps layers {:?}; a batched pass does \
+                     not tap",
+                    row.cache.tap_layers
+                )
+            }
+            if row.cache.speculative {
+                lloom_tensor::bail!(
+                    "lfm2 forward_ragged: row {r}'s cache has an open speculative window"
+                )
+            }
+            plans.push(row.cache.plan_pass(row.len)?);
+        }
+        let bytes: usize = plans.iter().flatten().map(|p| p.bytes).sum();
+        if bytes > 0 {
+            rows[0].cache.admit_grow(
+                bytes,
+                &format!("for a ragged batched pass over {} rows", rows.len()),
+            )?;
+        }
+        for (row, plan) in rows.iter_mut().zip(&plans) {
+            if let Some(plan) = plan {
+                row.cache.apply_grow(plan)?;
+            }
+        }
+        for row in rows.iter_mut() {
+            self.advance_conv_phase(row.len, row.cache);
+            Self::begin_taps(row.cache);
+        }
+
+        let mut hidden_states = self.embed_tokens.forward(input_ids)?;
+        let device = rows[0].cache.device.clone();
+        for (block_idx, layer) in self.layers.iter().enumerate() {
+            mark_graph_node(&device, block_idx);
+            hidden_states = layer.forward_ragged(&hidden_states, block_idx, rows)?;
+        }
+
+        // Each row's last position, gathered in row order.
+        let hidden_states = self.embedding_norm.forward(&hidden_states)?;
+        let mut last = Vec::with_capacity(rows.len());
+        let mut off = 0u32;
+        for row in rows.iter() {
+            off += row.len as u32;
+            last.push(off - 1);
+        }
+        let idx = Tensor::new(last.as_slice(), &device)?;
+        let hidden_states = hidden_states
+            .squeeze(0)?
+            .index_select(&idx, 0)?
+            .contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
         logits.to_dtype(DType::F32)
     }
@@ -5713,6 +5939,14 @@ impl CausalLM for Model {
 impl BatchedCausalLM for Model {
     fn forward_rows(&self, tokens: &Tensor, rows: &mut [Row<'_, Self::Cache>]) -> Result<Tensor> {
         Model::forward_rows(self, tokens, rows)
+    }
+
+    fn forward_ragged(
+        &self,
+        tokens: &Tensor,
+        rows: &mut [RaggedRow<'_, Self::Cache>],
+    ) -> Result<Tensor> {
+        Model::forward_ragged(self, tokens, rows)
     }
 }
 

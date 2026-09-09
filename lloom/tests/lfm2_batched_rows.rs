@@ -29,7 +29,7 @@
 //! row would fail the second).
 
 use lloom::models::lfm2::{Cache, Config, ConvState, KvAppend, LayerType, Model};
-use lloom::nn::{Row, VarBuilder};
+use lloom::nn::{RaggedRow, Row, VarBuilder};
 use lloom_tensor::{DType, Device, IndexOp, Result, Tensor};
 
 /// A tiny LFM2 on the crown cache arms (`InPlace × Shuffle`), no taps: six
@@ -338,5 +338,125 @@ fn forward_rows_refuses_what_it_cannot_batch() -> Result<()> {
     let mut rows: Vec<Row<'_, Cache>> = Vec::new();
     let none = Tensor::new(&[0u32; 0], &dev)?.reshape((0, 1))?;
     assert!(model.forward_rows(&none, &mut rows).is_err());
+    Ok(())
+}
+
+/// The RAGGED pass (`Model::forward_ragged`, #728's fused chunk): two decode
+/// rows and one prefill piece in one forward, each row's logits its own
+/// `forward`'s. The piece row's reference is the strongest one available —
+/// ONE `forward` over its whole prompt, so the chunk boundary (a piece onto
+/// a warm cache, the conv writer carrying its left context) is checked
+/// against one pass over the concatenation, not against another chunked
+/// pass. `conv_prefill_ctx` is on for the reason §13.2f gives.
+fn ragged_arms(cfg: Config, dtype: DType, dev: &Device) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let model = build(&cfg, dtype, dev)?;
+    let decode_rows = rows();
+    let piece_prompt: Vec<u32> = vec![7, 22, 13, 4, 35, 18, 9, 26, 2, 41];
+    let split = 6;
+
+    // References: each decode row alone; the piece row as one whole prefill.
+    let mut solo = Vec::new();
+    for (prompt, next) in &decode_rows[..2] {
+        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
+        let _ = model.forward(&input, 0, &mut cache)?;
+        let input = Tensor::new(&[*next], dev)?.unsqueeze(0)?;
+        let logits = model.forward(&input, prompt.len(), &mut cache)?;
+        solo.push(logits.i(0)?.to_vec1::<f32>()?);
+    }
+    {
+        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let input = Tensor::new(piece_prompt.as_slice(), dev)?.unsqueeze(0)?;
+        let logits = model.forward(&input, 0, &mut cache)?;
+        solo.push(logits.i(0)?.to_vec1::<f32>()?);
+    }
+
+    // Subject: the decode rows' prompts prefilled, the piece row's first
+    // `split` tokens prefilled, then ONE ragged pass over
+    // `[next_0, next_1, piece_prompt[split..]]`.
+    let mut caches = Vec::new();
+    for (prompt, _) in &decode_rows[..2] {
+        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
+        let _ = model.forward(&input, 0, &mut cache)?;
+        caches.push(cache);
+    }
+    {
+        let mut cache = Cache::new(true, dtype, &cfg, dev)?;
+        let input = Tensor::new(&piece_prompt[..split], dev)?.unsqueeze(0)?;
+        let _ = model.forward(&input, 0, &mut cache)?;
+        caches.push(cache);
+    }
+    let mut tokens: Vec<u32> = decode_rows[..2].iter().map(|(_, n)| *n).collect();
+    tokens.extend_from_slice(&piece_prompt[split..]);
+    let input = Tensor::new(tokens.as_slice(), dev)?.unsqueeze(0)?;
+    let lens = [1usize, 1, piece_prompt.len() - split];
+    let poss = [decode_rows[0].0.len(), decode_rows[1].0.len(), split];
+    let mut row_refs: Vec<RaggedRow<'_, Cache>> = caches
+        .iter_mut()
+        .zip(lens.iter().zip(poss.iter()))
+        .map(|(cache, (&len, &pos))| RaggedRow { pos, len, cache })
+        .collect();
+    let logits = model.forward_ragged(&input, &mut row_refs)?;
+    assert_eq!(logits.dims(), &[3, cfg.vocab_size]);
+    let ragged: Vec<Vec<f32>> = (0..3)
+        .map(|r| logits.i(r)?.to_vec1::<f32>())
+        .collect::<Result<_>>()?;
+    Ok((solo, ragged))
+}
+
+#[test]
+fn each_row_of_a_ragged_pass_is_its_own_forward_on_the_cpu() -> Result<()> {
+    for conv_state in [ConvState::Shuffle, ConvState::RotatingRing { k: 2 }] {
+        let mut cfg = tiny_config_on(conv_state);
+        cfg.conv_prefill_ctx = true;
+        let (solo, ragged) = ragged_arms(cfg, DType::F32, &Device::Cpu)?;
+        assert_rows_differ(&ragged);
+        for (r, (s, b)) in solo.iter().zip(&ragged).enumerate() {
+            let d = max_abs_diff(s, b);
+            eprintln!("{conv_state:?} ragged row {r}: max |solo - ragged| = {d:e}");
+            assert!(d < TOL, "{conv_state:?} row {r}: max |solo - ragged| = {d}");
+            assert_eq!(argmax(s), argmax(b), "row {r}: the argmax moved");
+        }
+        // The control that makes the piece row's tolerance evidence: without
+        // the left-context carry the chunked prefill computes something one
+        // pass does not (§13.2f defect 1), and the piece row's logits move.
+        let mut off = tiny_config_on(conv_state);
+        off.conv_prefill_ctx = false;
+        let (solo_off, ragged_off) = ragged_arms(off, DType::F32, &Device::Cpu)?;
+        let d = max_abs_diff(&solo_off[2], &ragged_off[2]);
+        eprintln!("{conv_state:?} ragged piece row, carry off: max |solo - ragged| = {d:e}");
+        // Clean reads ~7e-9 on the piece row and the control ~8e-5 (four
+        // decades apart on this tiny model); the bound sits a decade above
+        // the tolerance so a control that stopped biting is a failure.
+        assert!(
+            d > 10.0 * TOL,
+            "{conv_state:?}: the carry-off control did not move the piece row ({d})"
+        );
+    }
+    Ok(())
+}
+
+/// Metal, f16, under the forced GEMM: every row of the ragged pass is
+/// bit-identical to its own forward, the piece row's to one pass over its
+/// whole prompt.
+#[cfg(feature = "metal")]
+#[test]
+fn each_row_of_a_ragged_pass_is_bit_identical_to_its_forward_under_the_gemm() -> Result<()> {
+    std::env::set_var("LLOOM_386_FORCE_GEMM", "m");
+    let dev = Device::new_metal(0)?;
+    let mut cfg = tiny_config();
+    cfg.conv_prefill_ctx = true;
+    let (solo, ragged) = ragged_arms(cfg, DType::F16, &dev)?;
+    assert_rows_differ(&ragged);
+    for (r, (s, b)) in solo.iter().zip(&ragged).enumerate() {
+        let d = max_abs_diff(s, b);
+        eprintln!("metal ragged row {r}: max |solo - ragged| = {d:e}");
+        assert_eq!(
+            d, 0.0,
+            "row {r}: the ragged row differs from its solo forward by {d}"
+        );
+        assert_eq!(argmax(s), argmax(b));
+    }
     Ok(())
 }

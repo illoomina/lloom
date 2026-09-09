@@ -208,6 +208,7 @@ impl Lfm2Config {
             gemv_residual: false,
             conv_fused: false,
             conv_prefill_ctx: false,
+            fusion: FusionPolicy::default(),
             qkv_layout: QkvLayout::default(),
             // No tap, per §7.1a: an empty `tap_layers` is what every existing
             // caller had before #363 and costs an `is_empty()` per layer. The
@@ -318,7 +319,7 @@ impl ConvState {
     /// Total slots allocated: the live window, the speculative history, and —
     /// for the sliding arm only — the slack the window slides through before it
     /// must be compacted. The rotating arm needs none, which is its point.
-    fn width(&self, l_cache: usize) -> usize {
+    pub(crate) fn width(&self, l_cache: usize) -> usize {
         match self {
             ConvState::Shuffle => l_cache,
             ConvState::SlidingRing { k, slack } => l_cache + k + slack,
@@ -717,6 +718,38 @@ pub fn report_weight_divergence(r: &lloom_tensor::metal_backend::admission::Weig
     eprintln!("lfm2: {}", r.describe());
 }
 
+/// Who decides which fusions a decode step takes (`DESIGN.md`
+/// `optimizer-design.md` §0.2, issue #732).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FusionPolicy {
+    /// The per-site flags as set: `gemv_silu`, `gemv_residual`. The incumbent,
+    /// and the arm every recorded digest belongs to.
+    #[default]
+    Manual,
+    /// The optimizer derives the plan from the step's IR and the fragment
+    /// catalogue at construction (`crate::optimizer`), and the derived plan
+    /// REPLACES the two epilogue flags. `conv_fused` is not an elementwise
+    /// fusion and stays as set.
+    Derived,
+}
+
+impl FusionPolicy {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "manual" => Ok(FusionPolicy::Manual),
+            "derived" => Ok(FusionPolicy::Derived),
+            other => Err(format!("--fusion must be `manual` or `derived`, got `{other}`")),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            FusionPolicy::Manual => "manual",
+            FusionPolicy::Derived => "derived",
+        }
+    }
+}
+
 /// The runtime config. The `#[axis]`-tagged fields are the engine's
 /// configuration axes (RESTRUCTURING §1.6): each contributes to `lloom::axes::AXES`
 /// at link time and becomes a `ConfigArgs` clap flag. The shape fields
@@ -898,6 +931,23 @@ pub struct Config {
     /// arm, and flipping it is its own argued decision.
     #[axis(name = "ConvPrefillCtx", flag = "conv-prefill-ctx", variants = ["off", "on"], default = "off", bool)]
     pub conv_prefill_ctx: bool,
+    /// Whether the epilogue fusions are selected by their flags or derived by
+    /// the optimizer at construction (issue #732, P1).
+    ///
+    /// **Defaults to `Manual`** (§7.1a): the derivation is a mechanism, and
+    /// every recorded digest belongs to the flag-selected arms. Under
+    /// `Derived` the plan is derived once in [`Model::new`] from
+    /// [`crate::models::lfm2_ir::decode_step`] — nothing runs per token — and
+    /// `gemv_silu`/`gemv_residual` are set from it, so a `Derived` run and the
+    /// `Manual` run whose flags match the plan compute the same bits.
+    #[axis(
+        name = "Fusion",
+        flag = "fusion",
+        variants = ["Manual", "Derived"],
+        default = "Manual",
+        parser = "FusionPolicy::parse"
+    )]
+    pub fusion: FusionPolicy,
     /// How the Q/K/V `transpose` views reach the norms and the KV append
     /// (`DESIGN.md` §6.2c). Defaults to the copying path, per §7.1a.
     #[axis(
@@ -1039,6 +1089,7 @@ impl Default for Config {
             gemv_residual: false,
             conv_fused: false,
             conv_prefill_ctx: false,
+            fusion: FusionPolicy::default(),
             qkv_layout: QkvLayout::default(),
             tap_layers: Vec::new(),
             tap_dtype: DType::F32,
@@ -5123,6 +5174,78 @@ pub struct Model {
     l_cache: usize,
 }
 
+/// Derive the epilogue plan for `cfg` and return the config with the two
+/// epilogue flags set from it (`crate::optimizer`, issue #732 P1).
+///
+/// The plan is per site; the runtime seam is two model-wide bools. A plan
+/// that fuses some sites of a kind and not others cannot be expressed by the
+/// bools, so it is refused rather than approximated — that would be a
+/// finding about the catalogue or the model, and it is reported as an error
+/// naming the sites.
+#[cfg(not(target_arch = "wasm32"))]
+fn derive_fusion(cfg: &Config, dtype: DType) -> Result<Config> {
+    use crate::optimizer::{derive, Policy};
+    let graph = crate::models::lfm2_ir::decode_step(cfg, dtype);
+    let d = derive(&graph, &Policy::default())?;
+    let plan = &d.plan;
+
+    let uniform = |kind: &str, fragment: &str| -> Result<bool> {
+        let sites: Vec<&str> = graph
+            .nodes()
+            .iter()
+            .filter(|n| n.op == crate::optimizer::Op::Weight && n.name.ends_with(kind))
+            .map(|n| n.name.as_str())
+            .collect();
+        let fused = sites
+            .iter()
+            .filter(|s| plan.sites.get(**s).map(String::as_str) == Some(fragment))
+            .count();
+        if fused == 0 {
+            Ok(false)
+        } else if fused == sites.len() {
+            Ok(true)
+        } else {
+            lloom_tensor::bail!(
+                "lfm2 fusion=derived: the plan fuses `{fragment}` onto {fused} of {} `{kind}` \
+                 sites, which the model-wide flag cannot express; plan: {plan}",
+                sites.len()
+            )
+        }
+    };
+    let gemv_silu = uniform("feed_forward.w1.weight", "silu")?;
+    let gemv_residual = uniform("feed_forward.w2.weight", "residual")?
+        && uniform("out_proj.weight", "residual")?;
+    // Every fused site must be one of the two kinds the flags name.
+    for (site, fragment) in &plan.sites {
+        let known = (fragment == "silu" && site.ends_with("feed_forward.w1.weight"))
+            || (fragment == "residual"
+                && (site.ends_with("feed_forward.w2.weight") || site.ends_with("out_proj.weight")));
+        if !known {
+            lloom_tensor::bail!(
+                "lfm2 fusion=derived: the plan fuses `{fragment}` onto `{site}`, a site no flag \
+                 selects; plan: {plan}"
+            )
+        }
+    }
+    eprintln!(
+        "lfm2 fusion=derived: {plan}; gemv_silu={gemv_silu} gemv_residual={gemv_residual} \
+         ({} refused, {:.1} ms)",
+        d.refused.len(),
+        d.elapsed.as_secs_f64() * 1e3
+    );
+    let mut out = cfg.clone();
+    out.gemv_silu = gemv_silu;
+    out.gemv_residual = gemv_residual;
+    Ok(out)
+}
+
+/// A browser build has no optimizer (`egglog` is host-only); the arm is
+/// refused rather than silently manual.
+#[cfg(target_arch = "wasm32")]
+fn derive_fusion(_cfg: &Config, _dtype: DType) -> Result<Config> {
+    lloom_tensor::bail!("lfm2 fusion=derived is not available on wasm32; use fusion=manual")
+}
+
 /// Announce that the forward pass has reached graph node `index`
 /// (`DESIGN.md` §13.5m, issue #420 stage 3).
 ///
@@ -5162,6 +5285,19 @@ fn mark_graph_node(_: &Device, _: usize) {}
 
 impl Model {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        // Under `Fusion=Derived` the optimizer decides the epilogue sites
+        // once, here, and the layers below read the same bools they always
+        // did: the derivation is construction-tier, the token path is
+        // untouched (`CONTRIBUTING.md` §3.3a).
+        let derived;
+        let cfg = match cfg.fusion {
+            FusionPolicy::Manual => cfg,
+            FusionPolicy::Derived => {
+                derived = derive_fusion(cfg, vb.dtype())?;
+                &derived
+            }
+        };
+
         // Push the SiLU steer arm into the kernel-layer cache (RESTRUCTURING
         // §1.6). The value is a `#[axis]` field on `Config` so a run records it;
         // the atomic in `lloom-tensor::kernels` is its cache, set once here at

@@ -17,6 +17,12 @@ pub mod generation;
 pub mod hub;
 pub mod models;
 pub mod object_detection;
+// The optimizer (`design/docs/optimizer-design.md`): the IR a model emits, the
+// egglog derivation over it, the fusion plan a construction consults. Host-only
+// for the same reason `hub` is — egglog is not built for wasm32 here, and a
+// browser build takes the manual arms.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod optimizer;
 pub mod pipelines;
 pub mod quantized_nn;
 pub mod quantized_var_builder;

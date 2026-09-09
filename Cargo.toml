@@ -66,6 +66,10 @@ lloom-macros = { path = "./lloom-macros", version = "0.11.0" }
 # The within-crate axis registry the derive contributes to, collected at link
 # time (RESTRUCTURING §1.6, feasibility-checked at HEAD on rustc 1.96.0).
 linkme = "0.3.37"
+# The optimizer's rewrite substrate (`design/docs/optimizer-design.md` §2.13):
+# equality saturation + Datalog, pure Rust. `bin` (its CLI, graphviz, mimalloc)
+# is off; only the library is linked.
+egglog = { version = "3.0.0", default-features = false }
 # Transitional alias: candle-examples/candle-ug/candle-wasm-tests/tensor-tools
 # still name `candle::` (the tensor layer). Kept resolving to lloom-tensor so
 # those crates build unchanged; the engine crates now name `lloom_tensor::`

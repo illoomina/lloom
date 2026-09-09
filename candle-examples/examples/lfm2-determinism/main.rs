@@ -407,6 +407,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     conv_prefill_ctx: bool,
 
+    /// Who selects the GEMV epilogue fusions (`Fusion`, issue #732): `manual`
+    /// (`--gemv-silu`/`--gemv-residual` as given) or `derived` (the optimizer
+    /// derives the plan from the decode step's IR at construction and sets
+    /// the two flags from it). A `derived` run is meant to reproduce the
+    /// digests of the `manual` run whose flags match its plan.
+    #[arg(long, default_value = "manual")]
+    fusion: String,
+
     /// Which SiLU implementation the 30 `usilu` dispatches resolve to
     /// (issue #599, `DESIGN.md` §12.2l).
     ///
@@ -718,9 +726,13 @@ fn main() -> Result<()> {
     config.qkv_layout =
         lloom::models::lfm2::QkvLayout::parse(&args.qkv_layout).map_err(anyhow::Error::msg)?;
     println!("qkv layout: {:?}", config.qkv_layout);
+    config.fusion =
+        lloom::models::lfm2::FusionPolicy::parse(&args.fusion).map_err(anyhow::Error::msg)?;
     println!(
-        "gemv epilogue: silu={} residual={}",
-        config.gemv_silu, config.gemv_residual
+        "gemv epilogue: silu={} residual={} fusion={}",
+        config.gemv_silu,
+        config.gemv_residual,
+        config.fusion.name()
     );
 
     // The binding-style axis (issue #115). Set before any dispatch, and read

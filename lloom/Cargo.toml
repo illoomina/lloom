@@ -48,6 +48,9 @@ libc = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 hf-hub = { workspace = true }
 tokenizers = { workspace = true, features = ["onig"] }
+# The optimizer's e-graph (`optimizer::egraph`). Host-only: a derivation runs
+# once at model construction and a browser build takes the manual arms.
+egglog = { workspace = true }
 
 # Every lock this crate takes is a `parking_lot` lock, not std's, for
 # `lloom-tensor/Cargo.toml`'s reason: std's macOS `RwLock` is

@@ -382,6 +382,14 @@ struct Args {
     #[arg(long)]
     gemv_residual: Option<bool>,
 
+    /// Who selects the GEMV epilogue fusions (`Fusion`, issue #732): `manual`
+    /// (the two flags above as the preset and the overrides leave them) or
+    /// `derived` (the optimizer derives the plan from the decode step's IR at
+    /// construction and sets the two flags from it; the derivation is printed).
+    /// Unset leaves the library default, `manual`.
+    #[arg(long)]
+    fusion: Option<String>,
+
     /// Override the cache preset's attention arm: `sdpa` (the crown), `flash`
     /// (FlashDecoding, the only arm that reads a paged pool) or `generic`. Unset
     /// leaves the preset's. A measurement knob: it changes which kernel the
@@ -1351,6 +1359,10 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.gemv_residual {
         config.gemv_residual = v;
+    }
+    if let Some(f) = args.fusion.as_deref() {
+        config.fusion =
+            lloom::models::lfm2::FusionPolicy::parse(f).map_err(|e| anyhow::anyhow!(e))?;
     }
     // The attention and KV-append arms, overriding the preset so the paged pool
     // (which only FlashDecoding reads) and the flash/sdpa pair are measurable on
@@ -2500,6 +2512,7 @@ fn main() -> Result<()> {
         lloom::models::lfm2::AttnImpl::Generic => "generic",
     };
     let qkv_arm = config.qkv_layout.as_str();
+    let fusion_arm = config.fusion.name();
     // The KV slab's state and the process's device allocation, so a run reports
     // the memory it actually held at the length it reached rather than the
     // ceiling it could have (§9.5's admission is a prediction; this is the
@@ -2553,7 +2566,7 @@ fn main() -> Result<()> {
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \
-         {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} qkv={qkv_arm} bos={} \
+         {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} qkv={qkv_arm} fusion={fusion_arm} bos={} \
          readback={} lookahead={} prefill_ubatch={} prefill_tile={} prefill_units={} \
          prompt_tokens={} free_budget_mb={} commit_budget={} commits={} max_in_flight={} \
          step_markers={} step_waits={} cut={} pipelined_cut={} \

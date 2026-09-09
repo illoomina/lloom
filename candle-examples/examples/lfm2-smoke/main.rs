@@ -284,6 +284,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
+    /// Who selects the GEMV epilogue fusions (`Fusion`, issue #732): `manual`
+    /// (the two flags above as given) or `derived` (the optimizer's plan,
+    /// derived at construction). The text is expected identical either way.
+    #[arg(long, default_value = "manual")]
+    fusion: String,
+
     /// Which SiLU implementation the 30 `usilu` dispatches resolve to
     /// (issue #599, `DESIGN.md` §12.2l).
     ///
@@ -418,6 +424,8 @@ fn main() -> Result<()> {
     // against the arm it was taken in.
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
+    config.fusion =
+        lloom::models::lfm2::FusionPolicy::parse(&args.fusion).map_err(anyhow::Error::msg)?;
     println!(
         "gemv epilogue: silu={} residual={}",
         config.gemv_silu, config.gemv_residual

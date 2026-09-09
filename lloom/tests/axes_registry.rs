@@ -21,6 +21,7 @@ const EXPECTED_AXES: &[&str] = &[
     "ConvFused",
     "ConvPrefillCtx",
     "ConvState",
+    "Fusion",
     "GemvResidual",
     "GemvSilu",
     "KvAppend",

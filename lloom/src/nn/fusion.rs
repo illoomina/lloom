@@ -41,6 +41,31 @@ mod sealed {
     pub trait Sealed {}
 }
 
+/// What an [`Elementwise`] block computes on the value it sees — the
+/// op-semantics the optimizer derives its rewrite rules from
+/// (`design/docs/optimizer-design.md` §5: store the semantics, derive the
+/// equivalence; never register the pair).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Semantics {
+    /// `y = x`. The identity blocks (`PrologueNone`, `EpilogueNone`).
+    Identity,
+    /// `y = silu(x)`.
+    Silu,
+    /// `y = x + operand[row]`, the operand read at the storing thread's own
+    /// output row.
+    AddOperand,
+}
+
+/// Which second operand an [`Operand`] type binds, as a value the optimizer
+/// can read off the type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperandKind {
+    /// No second buffer.
+    None,
+    /// One buffer of exactly the output extent, indexed by the output row.
+    RowIndexed,
+}
+
 /// G1 — a functor sees ONE accumulator value and its index (`gemv.metal:392`).
 ///
 /// A reduction cannot implement this: it has no `(Acc, usize) -> Acc` form.
@@ -57,6 +82,10 @@ pub trait Elementwise {
     const SUFFIX: &'static str;
     /// Where the transform is applied, for the §2.3.5a report.
     const PRECISION: Precision;
+    /// What the block computes. The optimizer's rule for this block is
+    /// derived from it: a standalone dispatch with these semantics whose
+    /// single-use input is a GEMV store is this block riding that store.
+    const SEMANTICS: Semantics;
 }
 
 /// The second operand a functor may bind (§12.2e: `kDoAxpby` is exactly this
@@ -65,17 +94,24 @@ pub trait Elementwise {
 /// `RowIndexed` = indexable by the storing thread's own output row — a residual
 /// is, a gate (`gate * up`, §12.2b) is NOT and cannot implement it, because a
 /// gate is a full vector of the INPUT extent.
-pub trait Operand: sealed::Sealed {}
+pub trait Operand: sealed::Sealed {
+    /// The operand's shape, readable off the type by the optimizer.
+    const KIND: OperandKind;
+}
 
 /// No second operand — a pure elementwise transform (SiLU).
 pub struct NoOperand;
 impl sealed::Sealed for NoOperand {}
-impl Operand for NoOperand {}
+impl Operand for NoOperand {
+    const KIND: OperandKind = OperandKind::None;
+}
 
 /// A second operand read at the storing thread's own output row (the residual).
 pub struct RowIndexed<T>(PhantomData<T>);
 impl<T> sealed::Sealed for RowIndexed<T> {}
-impl<T> Operand for RowIndexed<T> {}
+impl<T> Operand for RowIndexed<T> {
+    const KIND: OperandKind = OperandKind::RowIndexed;
+}
 
 /// Output side of the GEMV's output/input partition. Evaluated once per output
 /// element.
@@ -104,6 +140,7 @@ pub struct PrologueNone;
 impl Elementwise for PrologueNone {
     const SUFFIX: &'static str = "";
     const PRECISION: Precision = Precision::Store;
+    const SEMANTICS: Semantics = Semantics::Identity;
 }
 impl sealed::Sealed for PrologueNone {}
 impl Prologue for PrologueNone {}
@@ -113,6 +150,7 @@ pub struct EpilogueNone;
 impl Elementwise for EpilogueNone {
     const SUFFIX: &'static str = "";
     const PRECISION: Precision = Precision::Store;
+    const SEMANTICS: Semantics = Semantics::Identity;
 }
 impl Epilogue for EpilogueNone {
     type Operand = NoOperand;
@@ -124,6 +162,7 @@ pub struct Silu;
 impl Elementwise for Silu {
     const SUFFIX: &'static str = "_silu";
     const PRECISION: Precision = Precision::Accumulator;
+    const SEMANTICS: Semantics = Semantics::Silu;
 }
 impl Epilogue for Silu {
     type Operand = NoOperand;
@@ -142,6 +181,7 @@ pub struct Residual;
 impl Elementwise for Residual {
     const SUFFIX: &'static str = "_residual";
     const PRECISION: Precision = Precision::Accumulator;
+    const SEMANTICS: Semantics = Semantics::AddOperand;
 }
 impl Epilogue for Residual {
     type Operand = RowIndexed<half::f16>;

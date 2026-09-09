@@ -549,6 +549,10 @@ pub struct Sequence<C> {
     /// exactly one prediction ahead of the token log and nothing overran — the
     /// state a continuation resumes from without re-feeding anything.
     pub(crate) last_logits: Option<Tensor>,
+    /// Memory this sequence owns for `last_logits` when the device serves
+    /// activations from a reusable base (`Session::hold_logits`): allocated
+    /// once, outside every pass, and written by one copy per hold.
+    pub(crate) logits_hold: Option<Tensor>,
     /// `false` for a cache prefilled by a caller that did not say with what
     /// ([`Session::with_pos`]); such a sequence cannot be matched, only reset.
     pub(crate) tokens_known: bool,
@@ -563,6 +567,7 @@ impl<C> Sequence<C> {
             pos: 0,
             overrun: 0,
             last_logits: None,
+            logits_hold: None,
             tokens_known: true,
         }
     }
@@ -577,6 +582,7 @@ impl<C> Sequence<C> {
             pos,
             overrun: 0,
             last_logits: None,
+            logits_hold: None,
             tokens_known: true,
         }
     }

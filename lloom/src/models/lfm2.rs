@@ -4944,7 +4944,37 @@ impl ShortConv {
                     )?;
                     cache_src = Tensor::cat(&[cache_src, zeros], 2)?;
                 }
-                cache.conv_states[block_idx] = Some(cache_src.contiguous()?);
+                // The state OUTLIVES this pass: the next pass reads it. Under
+                // a pass plan (`DESIGN.md` §9.2aa) this pass's activations —
+                // `cache_src` among them — live in slots the next pass reuses,
+                // so the carry is written INTO the storage the cache already
+                // owns (one `copy2d`, ordered after this pass's own read of it
+                // by the barrier chain), and a cache with no state yet gets
+                // one allocated under an `EscapeGuard`, which no plan serves.
+                // This is what makes a prefill tile allocate nothing that
+                // escapes it: measured 2 undeclared escapes per tile on the
+                // tiny fixture before, 0 after (`lfm2_pass_plans.rs`).
+                let carried = cache_src.contiguous()?;
+                let owned = match &cache.conv_states[block_idx] {
+                    Some(prev)
+                        if prev.shape() == carried.shape()
+                            && prev.dtype() == carried.dtype()
+                            && prev.is_contiguous() =>
+                    {
+                        prev.slice_set(&carried, 2, 0)?;
+                        prev.clone()
+                    }
+                    _ => {
+                        // Not `Tensor::copy`: on Metal `try_clone` shares
+                        // the buffer, and the storage must be this cache's own.
+                        let _declared = lloom_tensor::EscapeGuard::new();
+                        let own =
+                            Tensor::zeros(carried.shape(), carried.dtype(), carried.device())?;
+                        own.slice_set(&carried, 2, 0)?;
+                        own
+                    }
+                };
+                cache.conv_states[block_idx] = Some(owned);
             }
 
             out

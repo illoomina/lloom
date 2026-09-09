@@ -143,6 +143,47 @@ static STEP_DISPATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// something reads it. One relaxed load on the classical path.
 static DISPATCH_COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Open [`EscapeGuard`]s. While one is open, every allocation is DECLARED to
+/// outlive its pass (`DESIGN.md` §9.2aa, "escapes are declared"): the
+/// recorder marks it excluded so no plan ever serves its ordinal, and an
+/// installed arena declines it, so it takes the pool (or a region tenant)
+/// whichever pass it is made in. A value a later pass of a *different* key
+/// reads — a drafter's tap, a probe's output — cannot be found by the
+/// cross-pass detector, which only sees the pass right after; the guard is
+/// how its producer says so up front.
+static ESCAPING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether an [`EscapeGuard`] is open. One relaxed load.
+#[inline(always)]
+pub fn escaping() -> bool {
+    ESCAPING.load(Ordering::Relaxed) > 0
+}
+
+/// Declares the allocations made while it is alive as escaping their pass.
+/// Nestable; process-wide, like the dispatch counter it composes with (the
+/// hot thread is the one encoding).
+#[must_use = "the guard declares escapes only while it is alive"]
+pub struct EscapeGuard(());
+
+impl EscapeGuard {
+    pub fn new() -> Self {
+        ESCAPING.fetch_add(1, Ordering::Relaxed);
+        Self(())
+    }
+}
+
+impl Default for EscapeGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for EscapeGuard {
+    fn drop(&mut self) {
+        ESCAPING.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Report that a dispatch was encoded, advancing the position intervals live in.
 #[inline]
 pub fn note_dispatch() {
@@ -210,6 +251,12 @@ pub struct PassPlanCounters {
     pub plans: u64,
     /// Plans dropped after the drift guard fired under them.
     pub evicted: u64,
+    /// Ordinals that outlived their pass UNDECLARED, summed over the plans
+    /// built: values the pass after a key's first sight read and no
+    /// [`EscapeGuard`] had claimed. Each is served from the pool (correct,
+    /// as under `--arena`) and each is a hole in the no-allocation invariant
+    /// — on the ring conv arm with the logits hold this is 0.
+    pub escapes: u64,
     /// Times the shared base buffer was (re)allocated.
     pub base_grows: u64,
 }
@@ -535,6 +582,8 @@ pub struct ArenaCounters {
     /// plan. The arena stops serving for the rest of that step and reports
     /// the drift for the loop to re-record (`Arena::take_drifted`).
     pub declined_drift: u64,
+    /// Requests made under an [`EscapeGuard`], declined as declared escapes.
+    pub declined_escaped: u64,
     /// Decode steps begun.
     pub steps: u64,
     /// Times a GPU-computed offset table was verified equal to the plan and
@@ -580,6 +629,7 @@ struct LiveCounters {
     declined_size: AtomicU64,
     declined_exhausted: AtomicU64,
     declined_drift: AtomicU64,
+    declined_escaped: AtomicU64,
     steps: AtomicU64,
     gpu_verified: AtomicU64,
 }
@@ -593,6 +643,7 @@ impl LiveCounters {
             declined_size: self.declined_size.load(Ordering::Relaxed),
             declined_exhausted: self.declined_exhausted.load(Ordering::Relaxed),
             declined_drift: self.declined_drift.load(Ordering::Relaxed),
+            declined_escaped: self.declined_escaped.load(Ordering::Relaxed),
             steps: self.steps.load(Ordering::Relaxed),
             gpu_verified: self.gpu_verified.load(Ordering::Relaxed),
         }
@@ -605,6 +656,7 @@ impl LiveCounters {
         self.declined_size.store(0, Ordering::Relaxed);
         self.declined_exhausted.store(0, Ordering::Relaxed);
         self.declined_drift.store(0, Ordering::Relaxed);
+        self.declined_escaped.store(0, Ordering::Relaxed);
         self.steps.store(0, Ordering::Relaxed);
         self.gpu_verified.store(0, Ordering::Relaxed);
     }
@@ -662,6 +714,9 @@ pub enum ArenaDecline {
     /// was recorded at: the step's sequence has drifted from the plan, and
     /// the arena serves nothing more this step.
     Drift,
+    /// Made under an [`EscapeGuard`]: declared to outlive the pass, so no
+    /// slot may hold it whatever the plan says about the ordinal.
+    Escaped,
 }
 
 /// What the arena did with one offered allocation.
@@ -1093,6 +1148,16 @@ impl Arena {
         let counters = &self.inner.counters;
         let plan_state = &self.inner.plan_state;
         counters.offers.fetch_add(1, Ordering::Relaxed);
+        // Declared to escape: the ordinal is consumed (the sequence is what
+        // it is) and the value is never a slot's, whatever the plan planned.
+        if escaping() {
+            counters.declined_escaped.fetch_add(1, Ordering::Relaxed);
+            return ArenaOffer {
+                served: None,
+                ordinal: Some(ordinal),
+                decline: Some(ArenaDecline::Escaped),
+            };
+        }
 
         let entry = match plan_state.plan.by_ordinal.get(ordinal) {
             Some(e) => *e,
@@ -1438,6 +1503,10 @@ pub struct ArenaRecorder {
     /// The direct measurement of "this value is session state" (§9.1): it is
     /// still being read a step after it was produced.
     survived: std::collections::HashSet<usize>,
+    /// Ordinals of the CURRENT step allocated under an [`EscapeGuard`].
+    declared: std::collections::HashSet<usize>,
+    /// The previous step's `declared`, kept for [`Self::plan_previous`].
+    previous_declared: std::collections::HashSet<usize>,
 }
 
 impl ArenaRecorder {
@@ -1462,6 +1531,7 @@ impl ArenaRecorder {
         // the interval stopped at the step boundary and the value looked like an
         // activation that died where it was produced. See `outlives_step`.
         self.previous_by_addr = std::mem::take(&mut self.by_addr);
+        self.previous_declared = std::mem::take(&mut self.declared);
         self.survived.clear();
         self.dispatch = 0;
         self.ordinal = 0;
@@ -1552,7 +1622,12 @@ impl ArenaRecorder {
         let cross = self.outlives_step();
         size.iter()
             .zip(cross.iter())
-            .map(|(a, b)| *a || *b)
+            .enumerate()
+            // Declared in either recorded step: a declaration that moved
+            // between two sightings of one shape fails toward the pool.
+            .map(|(i, (a, b))| {
+                *a || *b || self.declared.contains(&i) || self.previous_declared.contains(&i)
+            })
             .collect()
     }
 
@@ -1572,6 +1647,9 @@ impl ArenaRecorder {
         // says otherwise, dies there too.
         self.first_bind.push(self.dispatch);
         self.last_bind.push(self.dispatch);
+        if escaping() {
+            self.declared.insert(ordinal);
+        }
         // The address now names this value. Any earlier value that had it has
         // been reused, and its own binds were recorded while it held it.
         //
@@ -1650,7 +1728,9 @@ impl ArenaRecorder {
         if n == 0 || self.previous_first_bind.len() != n || self.previous_last_bind.len() != n {
             return None;
         }
-        let excluded: Vec<bool> = (0..n).map(|i| self.survived.contains(&i)).collect();
+        let excluded: Vec<bool> = (0..n)
+            .map(|i| self.survived.contains(&i) || self.previous_declared.contains(&i))
+            .collect();
         Some(plan_from_intervals(
             &self.previous,
             &self.previous_first_bind,
@@ -1664,6 +1744,15 @@ impl ArenaRecorder {
     /// escaped it — and how many the previous step allocated.
     pub fn previous_escapes(&self) -> (usize, usize) {
         (self.survived.len(), self.previous.len())
+    }
+
+    /// Ordinals of the previous step this step bound that no [`EscapeGuard`]
+    /// had declared — the escapes the plan cache counts as holes.
+    pub fn previous_undeclared(&self) -> usize {
+        self.survived
+            .iter()
+            .filter(|i| !self.previous_declared.contains(i))
+            .count()
     }
 
     /// The dispatch position ordinal `i` of the CURRENT step was last bound
@@ -2109,6 +2198,53 @@ mod tests {
         let c = arena.counters();
         assert_eq!(c.declined_size, 4, "the size gate never engaged");
         assert_eq!(c.hits, 4);
+    }
+
+    /// An allocation made under an [`EscapeGuard`] is DECLARED to outlive its
+    /// pass (§9.2aa): the recorder excludes its ordinal from the plan it
+    /// builds — for the current step and, through `plan_previous`, for the
+    /// step just closed — and an installed arena declines it even when the
+    /// plan has a slot for that ordinal.
+    #[test]
+    fn an_allocation_under_an_escape_guard_is_declared_and_never_served() {
+        let mut rec = ArenaRecorder::new();
+        rec.record_alloc(0x1000, 4096);
+        {
+            let _g = EscapeGuard::new();
+            rec.record_alloc(0x2000, 4096);
+        }
+        rec.record_alloc(0x3000, 4096);
+        assert!(!escaping(), "the guard outlived its scope");
+        assert_eq!(
+            rec.excluded_flags(),
+            vec![true, true, true],
+            "one step excludes all"
+        );
+        rec.next_step();
+        rec.record_alloc(0x1000, 4096);
+        rec.record_alloc(0x2000, 4096);
+        rec.record_alloc(0x3000, 4096);
+        // Across two steps of the same shape only the declared one is out.
+        assert_eq!(rec.excluded_flags(), vec![false, true, false]);
+        let prev = rec
+            .plan_previous(ArenaLayout::Packed)
+            .expect("two steps recorded");
+        assert_eq!(prev.request_sizes(), vec![4096, 0, 4096], "{prev:?}");
+        assert_eq!(rec.previous_undeclared(), 0);
+
+        let (arena, _pool) = arena_of(&[4096, 4096], &[1, 1], ArenaLayout::Packed);
+        arena.begin_step();
+        assert!(arena.acquire(4096).is_some());
+        {
+            let _g = EscapeGuard::new();
+            let offer = arena.acquire_attributed(4096);
+            assert!(offer.served.is_none(), "a declared escape was given a slot");
+            assert_eq!(offer.decline, Some(ArenaDecline::Escaped));
+            assert_eq!(offer.ordinal, Some(1), "the ordinal is still consumed");
+        }
+        arena.end_step();
+        assert_eq!(arena.counters().declined_escaped, 1);
+        assert_eq!(arena.counters().hits, 1);
     }
 
     /// Outside a decode step the arena declines everything, so prefill and

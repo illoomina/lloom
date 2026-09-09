@@ -333,6 +333,19 @@ pub struct MetalDevice {
     /// harness enables it, and then the thing `begin_pass`/`finish_pass`
     /// drive. The arena slot above is what it installs per pass.
     pub(crate) pass_plans: Arc<Mutex<Option<PassPlans>>>,
+    /// Whether activations may be served from a reusable base (an arena
+    /// installed or recording, or the pass cache on). While set, no BLIT
+    /// touches memory a compute dispatch may reuse: `copy2d`'s contiguous
+    /// case and `allocate_zeros` take compute kernels, which the encoder's
+    /// barrier chain orders; a blit encoder is outside that chain and, with
+    /// hazard tracking off, its read of a slot is not ordered against the
+    /// compute dispatch that next writes the slot (`DESIGN.md` §9.2aa —
+    /// measured: a served prefill tile's conv carry read through the blit
+    /// was wrong from its second tile, right through the compute kernel).
+    /// Recording and serving must take the SAME path, since a blit is not a
+    /// dispatch and the plan's positions count dispatches; hence one flag
+    /// for both, set before the first recorded pass.
+    pub(crate) base_mode: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One forward pass's plan, cached by its [`PassKey`]. Every plan is served
@@ -362,10 +375,13 @@ pub struct PassPlans {
     /// What the pass in progress is doing.
     current: Option<PassState>,
     counters: PassPlanCounters,
+    /// Per key: ordinals of its first sight the next pass read undeclared.
+    escapes: HashMap<PassKey, usize>,
 }
 
-/// One cached plan as the harness reports it: `(key, ordinals served, ordinals recorded)`.
-pub type PassPlanEntry = (PassKey, usize, usize);
+/// One cached plan as the harness reports it: `(key, ordinals served,
+/// ordinals recorded, undeclared escapes)`.
+pub type PassPlanEntry = (PassKey, usize, usize, usize);
 
 #[derive(Clone, Copy, Debug)]
 enum PassState {
@@ -394,6 +410,7 @@ impl PassPlans {
             pending: None,
             current: None,
             counters: PassPlanCounters::default(),
+            escapes: HashMap::new(),
         }
     }
 }
@@ -994,7 +1011,19 @@ impl MetalDevice {
     /// The arena is *additive* (§9.2a). Nothing about the pool changes, no
     /// caller is asked to release anything, and removing the arena with
     /// [`Self::clear_arena`] returns the device to the classical path exactly.
+    /// Whether copies and fills must avoid the blit encoder (see `base_mode`).
+    #[inline]
+    pub fn base_mode(&self) -> bool {
+        self.base_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set_base_mode(&self, on: bool) {
+        self.base_mode
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn install_arena(&self, plan: StepPlan, layout: ArenaLayout) -> Result<()> {
+        self.set_base_mode(true);
         // The arena is one pointer for every activation, so the hazard tracker
         // must key on ranges to see only true edges (§9.2e/§9.2f, route (a)).
         // Selected here, by the mechanism that needs it, unless a harness
@@ -1140,6 +1169,13 @@ impl MetalDevice {
             self.residency_set.remove(arena.base());
         }
         *slot = None;
+        drop(slot);
+        if !self.pass_plans_enabled()
+            && self.arena_recorder.lock().is_none()
+            && self.arena_auto.lock().is_none()
+        {
+            self.set_base_mode(false);
+        }
     }
 
     pub fn arena(&self) -> Option<Arena> {
@@ -1177,6 +1213,7 @@ impl MetalDevice {
     /// [`Self::finish_decode_step`], so a loop that brackets its steps with
     /// those needs nothing else. Replaces an earlier arming.
     pub fn arm_arena_recording(&self, layout: ArenaLayout, skip: usize, record_steps: usize) {
+        self.set_base_mode(true);
         {
             let mut g = self.arena_auto.lock();
             *g = Some(ArenaAutoRecord {
@@ -1289,6 +1326,7 @@ impl MetalDevice {
     /// Turn the pass-keyed plan cache on (`DESIGN.md` §9.2aa). Off, the
     /// pass brackets are the decode-step brackets they always were.
     pub fn enable_pass_plans(&self, layout: ArenaLayout) {
+        self.set_base_mode(true);
         let mut g = self.pass_plans.lock();
         if g.is_none() {
             *g = Some(PassPlans::new(layout));
@@ -1297,6 +1335,18 @@ impl MetalDevice {
 
     pub fn pass_plans_enabled(&self) -> bool {
         self.pass_plans.lock().is_some()
+    }
+
+    /// Whether an activation this device hands out may live in a slot a
+    /// later pass reuses — the pass cache is on, an arena is installed, or
+    /// one is being recorded. A value held ACROSS passes (resumable logits)
+    /// must then be copied into memory the holder owns before any other
+    /// pass is encoded (`DESIGN.md` §9.2aa, escapes are declared); off, the
+    /// pool keeps a held buffer alive for as long as it is referenced.
+    pub fn activations_may_be_reused(&self) -> bool {
+        self.pass_plans_enabled()
+            || self.arena_slot().is_some()
+            || self.arena_recorder.lock().is_some()
     }
 
     pub fn pass_plan_counters(&self) -> Option<PassPlanCounters> {
@@ -1312,10 +1362,10 @@ impl MetalDevice {
             .iter()
             .map(|(k, plan)| {
                 let (covered, total) = plan.covered();
-                (*k, covered, total)
+                (*k, covered, total, p.escapes.get(k).copied().unwrap_or(0))
             })
             .collect();
-        keys.sort_by_key(|(k, _, _)| format!("{k:?}"));
+        keys.sort_by_key(|(k, ..)| format!("{k:?}"));
         Some((keys, p.base.as_ref().map_or(0, |b| b.length())))
     }
 
@@ -1442,14 +1492,16 @@ impl MetalDevice {
     /// Build `closes`'s plan from the recorder's previous step (its first
     /// sight) and this step's binds against it, and cache it.
     fn close_pending(&self, pp: &mut PassPlans, closes: PassKey) -> Result<()> {
-        let plan = {
+        let (plan, undeclared) = {
             let g = self.arena_recorder.lock();
             let rec = g.as_ref().ok_or_else(|| {
                 MetalError::Message("finish_pass: no recorder while a key was pending".to_string())
             })?;
             let r = rec.lock();
-            r.plan_previous(pp.layout)
+            (r.plan_previous(pp.layout), r.previous_undeclared())
         };
+        pp.counters.escapes += undeclared as u64;
+        pp.escapes.insert(closes, undeclared);
         let Some(plan) = plan else {
             // The previous pass allocated nothing worth planning; forget it.
             return Ok(());
@@ -1518,6 +1570,7 @@ impl MetalDevice {
     /// token after prefill allocates a different set, and #68 plans from
     /// `decode[1]` for the same reason.
     pub fn begin_arena_recording(&self) {
+        self.set_base_mode(true);
         let rec = Arc::new(Mutex::new(ArenaRecorder::new()));
         // The encoder observes binds, which is where an interval ends, so it
         // needs the same recorder this device is filling.
@@ -1813,25 +1866,26 @@ impl MetalDevice {
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<PooledBuffer>> {
         let buffer = self.allocate_buffer(size_in_bytes)?;
+        if self.base_mode() {
+            // A compute fill, inside the barrier chain (see `base_mode`).
+            if size_in_bytes > 0 {
+                let encoder = self.command_encoder()?;
+                crate::kernels::kernels::call_const_fill(
+                    &self.device,
+                    &encoder,
+                    &self.kernels,
+                    "fill_u8",
+                    size_in_bytes,
+                    &buffer,
+                    0u8,
+                )
+                .map_err(crate::Error::wrap)?;
+            }
+            return Ok(buffer);
+        }
         let mut blit = self.blit_command_encoder()?;
         blit.set_label("zeros");
         blit.fill_buffer(&buffer, (0, buffer.length()), 0);
-        /*
-        // Alternative impl
-        if size_in_bytes > 0 {
-            let encoder = self.command_encoder()?;
-            call_const_fill(
-                &self.device,
-                &encoder,
-                &self.kernels,
-                "fill_u8",
-                size_in_bytes,
-                &buffer,
-                0u8,
-            )
-            .map_err(crate::Error::wrap)?;
-        }
-        */
         Ok(buffer)
     }
 

@@ -9985,4 +9985,3 @@ fn a_blit_copy_extends_the_recorded_interval_of_both_buffers() {
     );
     assert_eq!(read_to_vec::<u32>(&dst, 64)[0], 1);
 }
-

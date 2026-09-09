@@ -49,6 +49,7 @@
 
 #[cfg(feature = "accelerate")]
 mod accelerate;
+pub mod autorelease;
 pub mod backend;
 pub mod backprop;
 pub mod conv;
@@ -67,8 +68,22 @@ mod dummy_metal_backend;
 pub mod error;
 mod indexer;
 pub mod layout;
-pub mod autorelease;
 pub use autorelease::AutoreleaseScope;
+/// Declares the allocations made while it is alive as outliving their
+/// forward pass, so no pass plan ever serves them (`DESIGN.md` §9.2aa).
+#[cfg(feature = "metal")]
+pub use metal_backend::EscapeGuard;
+/// The same declaration on a backend with no plan cache: nothing there hands
+/// a later pass the memory an earlier one wrote, so it is a no-op.
+#[cfg(not(feature = "metal"))]
+#[derive(Default)]
+pub struct EscapeGuard(());
+#[cfg(not(feature = "metal"))]
+impl EscapeGuard {
+    pub fn new() -> Self {
+        Self(())
+    }
+}
 #[cfg(feature = "metal")]
 pub mod metal_backend;
 // Merged from candle-metal-kernels (RESTRUCTURING §7.1): the Metal kernel layer

@@ -1267,6 +1267,19 @@ fn main() -> Result<()> {
         if let Device::Metal(m) = &device {
             m.enable_pass_plans(candle::metal_backend::ArenaLayout::Packed);
             eprintln!("[pass plans: on (Packed); every pass keyed, recorded on first sight]");
+            if matches!(config.conv_state, ConvState::Shuffle) {
+                // The design (§9.2aa) refuses this arm by name; it is let
+                // through and COUNTED instead, because the crown's conv arm
+                // is the shuffle and its whole-block fusion is the shuffle's
+                // only (§12.2 row 1) — a refusal would keep the crown out of
+                // the no-allocation arm altogether. `escapes=` on the report
+                // line is the count of what the plans cannot serve.
+                eprintln!(
+                    "[pass plans: ConvState::Shuffle keeps each layer's conv state as a fresh \
+                     tensor per pass; those escape every plan and take the pool — the \
+                     no-allocation invariant needs a ring conv arm (§9.2aa)]"
+                );
+            }
         }
     }
     // `--mode reuse` carries the conv state across the turn-boundary prefill
@@ -2591,19 +2604,28 @@ fn main() -> Result<()> {
     #[cfg(feature = "metal")]
     if args.pass_plans {
         if let Device::Metal(dev) = &device {
-            if let (Some(c), Some((keys, base))) = (dev.pass_plan_counters(), dev.pass_plan_report()) {
+            if let (Some(c), Some((keys, base))) =
+                (dev.pass_plan_counters(), dev.pass_plan_report())
+            {
                 let keys: Vec<String> = keys
                     .iter()
-                    .map(|(k, covered, total)| format!("{:?}={covered}/{total}", k.kind))
+                    .map(|(k, covered, total, escapes)| {
+                        if *escapes > 0 {
+                            format!("{:?}={covered}/{total}(+{escapes} escaped)", k.kind)
+                        } else {
+                            format!("{:?}={covered}/{total}", k.kind)
+                        }
+                    })
                     .collect();
                 eprintln!(
                     "[pass plans: served={} recorded={} observed={} plans={} evicted={} \
-                     base_grows={} base={:.1} MiB keys=[{}]]",
+                     escapes={} base_grows={} base={:.1} MiB keys=[{}]]",
                     c.served,
                     c.recorded,
                     c.observed,
                     c.plans,
                     c.evicted,
+                    c.escapes,
                     c.base_grows,
                     base as f64 / (1024.0 * 1024.0),
                     keys.join(" ")

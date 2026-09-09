@@ -595,6 +595,17 @@ fn begin_pass(device: &Device, shape: PassShape) -> Result<()> {
     Ok(())
 }
 
+/// Whether `device` may hand a later pass the memory an earlier pass's
+/// activation lives in (`MetalDevice::activations_may_be_reused`).
+fn activations_may_be_reused(device: &Device) -> bool {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        return m.activations_may_be_reused();
+    }
+    let _ = device;
+    false
+}
+
 fn end_pass(device: &Device) -> Result<()> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
@@ -1343,7 +1354,11 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // one iff nothing overran; they are what a continuation of exactly this
         // sequence resumes from. Past an EOS they predict nothing useful, but
         // they are still the right logits for that position.
-        self.seq.last_logits = if overrun == 0 { Some(logits) } else { None };
+        self.seq.last_logits = if overrun == 0 {
+            Some(self.hold_logits(logits)?)
+        } else {
+            None
+        };
         stats.overrun = overrun;
         stats.produced = produced;
         stats.tail_ns = tail_start.elapsed().as_nanos() as u64;
@@ -1363,6 +1378,35 @@ impl<'m, M: CausalLM> Session<'m, M> {
             stats.max_in_flight = stats.max_in_flight.max(in_flight);
         }
         Ok(())
+    }
+
+    /// The logits a later call resumes from, in memory this sequence owns.
+    ///
+    /// A pass's output lives in the pass's memory: under the pass cache (or
+    /// the arena) that is a slot of one base every pass on the device reuses,
+    /// so logits held across passes — this sequence's next `decode` with an
+    /// empty prompt, a batched resume row, another session's passes in
+    /// between — would be read after their slot was overwritten. This copies
+    /// them into a per-sequence buffer allocated once, outside every pass (so
+    /// no plan ever serves it), by one dispatch encoded before any other pass
+    /// is: the barrier chain orders the read against the next writer. When
+    /// the device serves activations from the pool only, the held buffer is
+    /// its own and is returned as is (`DESIGN.md` §9.2aa, escapes are
+    /// declared).
+    fn hold_logits(&mut self, logits: Tensor) -> Result<Tensor> {
+        if !activations_may_be_reused(logits.device()) {
+            return Ok(logits);
+        }
+        let hold = match &self.seq.logits_hold {
+            Some(h) if h.shape() == logits.shape() && h.dtype() == logits.dtype() => h.clone(),
+            _ => {
+                let h = Tensor::zeros(logits.shape(), logits.dtype(), logits.device())?;
+                self.seq.logits_hold = Some(h.clone());
+                h
+            }
+        };
+        hold.slice_set(&logits, 0, 0)?;
+        Ok(hold)
     }
 
     /// Feed `prompt` through the model as the forwards [`prefill_widths`]
@@ -1498,7 +1542,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
         end_executor_step(&device)?;
         // The held logits are the resumable state: a decode with an empty
         // prompt continues from them, and a further prefill discards them.
-        self.seq.last_logits = last;
+        self.seq.last_logits = match last {
+            Some(l) => Some(self.hold_logits(l)?),
+            None => None,
+        };
         Ok(PrefillOut {
             units,
             prefill_ns: start.elapsed().as_nanos() as u64,
@@ -2538,7 +2585,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     // the logits after it exist and are the state a
                     // continuation resumes from.
                     if let Some(next) = &next_logits {
-                        lane.last_logits = Some(next.narrow(0, k, 1)?.squeeze(0)?);
+                        let row = next.narrow(0, k, 1)?.squeeze(0)?;
+                        lane.last_logits = Some(sessions[i].hold_logits(row)?);
                     }
                 }
             }

@@ -29,7 +29,7 @@ use device::{DeviceTeardown, ResidencyEvictionObserver};
 /// layout should not need a direct dependency on `candle-metal-kernels`.
 pub use crate::kernels::metal::{
     hazard_key, set_hazard_key, set_hazard_key_unless_explicit, ArenaCounters, ArenaLayout,
-    HazardKey, PassKey, PassKind, PassPlanCounters, Slot, StepPlan,
+    EscapeGuard, HazardKey, PassKey, PassKind, PassPlanCounters, Slot, StepPlan,
 };
 
 /// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).
@@ -2043,7 +2043,9 @@ impl BackendStorage for MetalStorage {
                 dst.dtype()
             )
         }
-        if src_s == d2 && dst_s == d2 {
+        // Not the blit under a base (`MetalDevice::base_mode`): the copy
+        // must sit in the compute encoder's barrier chain.
+        if src_s == d2 && dst_s == d2 && !self.device.base_mode() {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("copy2d_contiguous");
             let src_offset = src_o * self.dtype.size_in_bytes();
@@ -2781,6 +2783,7 @@ impl BackendDevice for MetalDevice {
             // the arena above: the classical path is the default (#47).
             session_region: Arc::new(parking_lot::RwLock::new(None)),
             pass_plans: Arc::new(parking_lot::Mutex::new(None)),
+            base_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 

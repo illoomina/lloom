@@ -521,6 +521,25 @@ struct Args {
     #[arg(long)]
     conv_state: Option<String>,
 
+    /// How many forward passes the host may have in flight ahead of the GPU
+    /// (`StepPacer`'s bound). Unset takes the depth WARMUP MEASURED from the
+    /// host/GPU balance — `ceil(2·host_encode / gpu_step)`, floored at 2 — so
+    /// a GPU-bound config gets 2 and a host-bound one gets more.
+    ///
+    /// A flag rather than only `LLOOM_IN_FLIGHT` (which it supersedes, and
+    /// which still wins if set) because an env var does not appear in
+    /// `--help`: the depth is a real A/B axis and an axis nobody can see is
+    /// an axis nobody runs. `0` means "use the measured depth", the same
+    /// convention `DecodeOptions::in_flight_depth` carries.
+    ///
+    /// **Raising it deepens the queue, it does not speed the GPU.** On a
+    /// GPU-bound run a deeper queue changes WHEN the host learns a token
+    /// (TTFT, which reads `received`) without changing how fast tokens are
+    /// produced (steady) — and it makes the visible stream burstier, since
+    /// the host runs ahead and the consumer sees tokens in clumps.
+    #[arg(long, default_value_t = 0)]
+    in_flight: usize,
+
     /// Under `--mode concurrent`: sequence `i` ARRIVES at round (time-sliced)
     /// or step (`--batched`) `i × N`; `0` (default) admits every sequence at
     /// once. With `--long-prompt-tokens` this is the serving shape a chunk is
@@ -1719,8 +1738,28 @@ fn main() -> Result<()> {
         Ok(v) => v
             .parse()
             .unwrap_or_else(|_| panic!("LLOOM_IN_FLIGHT must be an integer, got {v:?}")),
+        // `--in-flight 0` (the default) means "whatever warmup measured".
+        Err(_) if args.in_flight > 0 => args.in_flight,
         Err(_) => session.measured_in_flight_depth(),
     };
+    // The two times the depth was derived from, so a run says WHY it chose
+    // one — a depth is uninterpretable without the balance that produced it,
+    // and the balance is what a bad measurement corrupts (measurements §10).
+    {
+        let (host_ns, gpu_ns) = session.measured_balance_ns();
+        eprintln!(
+            "[in-flight: depth {in_flight_depth} (warmup measured {:.2} ms host encode / \
+             {:.2} ms gpu step -> {}){}]",
+            host_ns as f64 / 1e6,
+            gpu_ns as f64 / 1e6,
+            session.measured_in_flight_depth(),
+            if args.in_flight > 0 || std::env::var("LLOOM_IN_FLIGHT").is_ok() {
+                ", overridden"
+            } else {
+                ""
+            }
+        );
+    }
     let mut opts = DecodeOptions {
         max_tokens: args.max_tokens,
         budget,

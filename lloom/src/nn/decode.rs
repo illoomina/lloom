@@ -3073,12 +3073,24 @@ impl<'m, M: CausalLM> Session<'m, M> {
             pos += len;
         }
 
+        // **Drain the prefills before timing the decode step.** They are still
+        // in flight here — the forwards above return once submitted — so a
+        // `synchronize` after the decode step waits out ALL FIVE, and the
+        // "GPU step" it measures is the whole warmup's tail rather than one
+        // decode step's. Measured on this machine: 144 ms against a real
+        // steady step of 15.9 ms, a 9x overstatement, which drives the ratio
+        // `2·host/gpu` to zero and pins the depth at the floor for exactly the
+        // configs the calibration exists to serve. Same defect class as the
+        // host-inclusive `gpu_ns` above it — a correct formula fed a wrong
+        // operand — one layer out, and invisible for the same reason: on a
+        // GPU-bound config the floor is right either way (measurements §10).
+        device.synchronize()?;
+
         // Measure the host/GPU balance from a real decode step, to compute the
         // in-flight depth (`compute_in_flight_depth`) instead of a static cap.
-        // `host_ns` = the CPU time to encode+submit the step; `gpu_ns` = the
-        // step's total time including its GPU tail (drained by the sync). Their
-        // ratio is what decides how far the host must run ahead to keep the GPU
-        // fed — 2 here (gpu >> host), deeper on a faster GPU / smaller model.
+        // `host_ns` = the CPU time to encode+submit the step; `gpu_ns` = that
+        // step's GPU tail alone. Their ratio decides how far the host must run
+        // ahead to keep the GPU fed.
         let decode = Tensor::new(&[0u32], device)?.unsqueeze(0)?;
         let t_host = std::time::Instant::now();
         let _ = self.model.forward(&decode, pos, &mut self.seq.cache)?;

@@ -1902,25 +1902,32 @@ impl MetalDevice {
     /// drops -- see `ArenaRecorder::record_bind` for why the CPU's clock is the
     /// wrong one.
     fn note_for_recording(&self, buffer: Arc<PooledBuffer>, size: usize) -> Arc<PooledBuffer> {
+        // **One relaxed load on the allocation path when nothing records**,
+        // which is every run that did not ask for an arena or a plan cache.
+        // `observing_binds` is set exactly while a recorder is installed
+        // (`set_bind_observer`), and it is the same gate `note_bind` and
+        // `note_dispatch` take for the same reason: this function is called
+        // for every buffer the device hands out, and taking the recorder's
+        // lock to discover there is no recorder is a lock per allocation
+        // bought for nothing.
+        if !crate::kernels::metal::arena::observing_binds() {
+            return buffer;
+        }
         // Under the pass cache only a pass's own allocations are ordinals:
         // one made between passes takes none, and the address it lands on
         // stops naming the value that held it (`forget_addr`).
         let between_passes = self.pass_state.load(std::sync::atomic::Ordering::Relaxed) == 0b01;
         let guard = self.arena_recorder.lock();
-        if between_passes {
-            if let Some(rec) = guard.as_ref() {
-                let mut r = rec.lock();
-                r.forget_addr(buffer.raw_addr());
-            }
-            return buffer;
-        }
         let Some(rec) = guard.as_ref() else {
             return buffer;
         };
-        {
-            let mut r = rec.lock();
+        let mut r = rec.lock();
+        if between_passes {
+            r.forget_addr(buffer.raw_addr());
+        } else {
             r.record_alloc(buffer.raw_addr(), size);
         }
+        drop(r);
         buffer
     }
 

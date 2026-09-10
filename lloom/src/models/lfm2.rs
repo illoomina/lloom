@@ -752,6 +752,124 @@ impl FusionPolicy {
     }
 }
 
+/// What `Fusion=Derived` decided at construction, kept on the model for the
+/// record (`optimizer-design.md` §10c): the plan, what the exclusion set said
+/// about every transform the config selects — under the fp model each one's
+/// kernel computes in — which stateful regions carry more than one transform
+/// and whether a joint validation covers them, and the two closed-form gains
+/// §5a names. Nothing here is read per token.
+#[derive(Debug, Clone, Default)]
+pub struct FusionReport {
+    /// The derived plan (`FusionPlan`'s line).
+    pub plan: String,
+    pub gemv_silu: bool,
+    pub gemv_residual: bool,
+    /// The build's math mode the model was constructed under.
+    pub math_mode: &'static str,
+    /// Fragments the policy refused: (name, why).
+    pub refused: Vec<(String, String)>,
+    /// Selected transforms the set admits under the model they run: (name,
+    /// the kernel family it was looked up as).
+    pub validated: Vec<(String, String)>,
+    /// Selected transforms and fragments with no verdict under the model they
+    /// run: (name, why) — no entry, recorded under another model, or a
+    /// kernel with no declared model. Reported, not refused.
+    pub unvalidated: Vec<(String, String)>,
+    /// Stateful regions on which the config selects more than one transform.
+    pub compositions: Vec<Composition>,
+    /// Fused sites the plan placed inside a recurrence: (site, fragment,
+    /// region).
+    pub fused_in_stateful: Vec<(String, String, String)>,
+    /// The conv fold's gain, from the loaded weights.
+    pub conv_fold_gain: Option<ConvFoldGain>,
+}
+
+/// Several transforms selected on one recurrence. Their separate verdicts
+/// were each measured through the recurrence alone; they compose there only
+/// through a JOINT entry (§5a), named here if the set has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Composition {
+    pub region: String,
+    pub transforms: Vec<String>,
+    /// The joint entry's name when the set validates the combination under
+    /// the kernel that runs; `None` when it does not.
+    pub joint: Option<String>,
+}
+
+/// The conv fold's gain on a discrepancy in its state window — `Σ_j |w[c, j]|`
+/// per channel, the ∞-norm of the fold as a map from the window to its
+/// output — over every conv layer's loaded weights (§5a's closed form). The
+/// window itself is carried by a shift or a ring write: a permutation plus
+/// one new column, gain exactly 1, and it holds `taps − 1` past values, so a
+/// discrepancy leaves the window after `taps − 1` tokens by construction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvFoldGain {
+    pub layers: usize,
+    pub taps: usize,
+    pub channels: usize,
+    pub max: f32,
+    pub min: f32,
+    /// Channels whose fold is expansive (`L > 1`).
+    pub over_one: usize,
+}
+
+impl std::fmt::Display for FusionReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "lfm2 fusion=derived: {}; gemv_silu={} gemv_residual={} math={} ({} refused, {} validated, {} unvalidated",
+            self.plan,
+            self.gemv_silu,
+            self.gemv_residual,
+            self.math_mode,
+            self.refused.len(),
+            self.validated.len(),
+            self.unvalidated.len()
+        )?;
+        if !self.unvalidated.is_empty() {
+            write!(f, " [")?;
+            for (i, (name, why)) in self.unvalidated.iter().enumerate() {
+                if i > 0 {
+                    write!(f, "; ")?;
+                }
+                write!(f, "{name}: {why}")?;
+            }
+            write!(f, "]")?;
+        }
+        write!(f, ")")?;
+        for c in &self.compositions {
+            write!(f, " composition[{}: {}", c.region, c.transforms.join("+"))?;
+            match &c.joint {
+                Some(j) => write!(f, " validated jointly as `{j}`]")?,
+                None => write!(f, " NOT validated jointly]")?,
+            }
+        }
+        if !self.fused_in_stateful.is_empty() {
+            write!(f, " fused-in-stateful[")?;
+            for (i, (site, frag, region)) in self.fused_in_stateful.iter().enumerate() {
+                if i > 0 {
+                    write!(f, " ")?;
+                }
+                write!(f, "{site}:{frag}@{region}")?;
+            }
+            write!(f, "]")?;
+        }
+        if let Some(g) = &self.conv_fold_gain {
+            write!(
+                f,
+                " conv-ring[{} layers: fold gain L∞ max {:.3} min {:.3}, {} of {} channels expansive; window write L=1 (permutation), horizon {} tokens]",
+                g.layers,
+                g.max,
+                g.min,
+                g.over_one,
+                g.channels,
+                g.taps - 1
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// The runtime config. The `#[axis]`-tagged fields are the engine's
 /// configuration axes (RESTRUCTURING §1.6): each contributes to `lloom::axes::AXES`
 /// at link time and becomes a `ConfigArgs` clap flag. The shape fields
@@ -5169,6 +5287,8 @@ impl DecoderLayer {
 pub struct Model {
     embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
+    /// What `Fusion=Derived` decided at construction; `None` under `Manual`.
+    fusion_report: Option<FusionReport>,
     embedding_norm: RmsNorm,
     lm_head: Linear,
     dtype: DType,
@@ -5177,7 +5297,8 @@ pub struct Model {
 }
 
 /// Derive the epilogue plan for `cfg` and return the config with the two
-/// epilogue flags set from it (`crate::optimizer`, issue #732 P1).
+/// epilogue flags set from it, with the report (`crate::optimizer`, issue
+/// #732 P1/P2).
 ///
 /// The plan is per site; the runtime seam is two model-wide bools. A plan
 /// that fuses some sites of a kind and not others cannot be expressed by the
@@ -5185,33 +5306,158 @@ pub struct Model {
 /// finding about the catalogue or the model, and it is reported as an error
 /// naming the sites.
 #[cfg(not(target_arch = "wasm32"))]
-fn derive_fusion(cfg: &Config, dtype: DType) -> Result<Config> {
-    use crate::optimizer::{derive, exclusions, ExclusionSet, Policy, Verdict};
+fn derive_fusion(cfg: &Config, dtype: DType) -> Result<(Config, FusionReport)> {
+    use crate::optimizer::{
+        derive, exclusions, numeric, ExclusionSet, Lookup, Policy, RegionKind, TargetFpModel,
+        Verdict,
+    };
+
+    let set = exclusions::embedded();
+    let mut report = FusionReport {
+        math_mode: numeric::build_math_mode(),
+        ..Default::default()
+    };
 
     // The exclusion set speaks about every transform the offline validation
-    // ran, not only the fragments the derivation composes. An arm this config
-    // selects that the validation refused is refused here, by name and with
-    // its numbers — at construction, never per token.
-    let set = exclusions::embedded();
-    let mut selected: Vec<String> = Vec::new();
+    // ran, not only the fragments the derivation composes. Each arm this
+    // config selects is looked up UNDER the fp model of the kernel it runs:
+    // an arm the validation refused is refused here, by name and with its
+    // numbers; one it never measured, or measured under another kernel's
+    // model, is reported as unvalidated — at construction, never per token.
+    // (transform name, kernel family, the region it rewrites)
+    let mut selected: Vec<(String, &'static str, RegionKind)> = Vec::new();
     #[cfg(feature = "metal")]
-    selected.push(ExclusionSet::silu_transform(cfg.silu_impl.name()));
-    if cfg.conv_fused {
-        selected.push("conv_fused".to_string());
+    if cfg.silu_impl != lloom_tensor::kernels::SiluImpl::Exact {
+        selected.push((
+            ExclusionSet::silu_transform(cfg.silu_impl.name()),
+            "unary",
+            RegionKind::Straight,
+        ));
     }
-    for transform in &selected {
-        if let Some(v) = set.get(transform) {
-            if v.verdict == Verdict::Exclude {
+    // The conv arms: the fold's kernel depends on both flags, and the pair is
+    // ONE transform of the ring's kernel, not two composed.
+    let conv_state_arm = match cfg.conv_state {
+        ConvState::Shuffle => None,
+        ConvState::RotatingRing { .. } => Some("conv_state=rotating"),
+        ConvState::SlidingRing { .. } => Some("conv_state=ring"),
+    };
+    let conv_fused_family = match cfg.conv_state {
+        ConvState::Shuffle => "shortconv_step",
+        ConvState::RotatingRing { .. } => "shortconv_ring",
+        ConvState::SlidingRing { .. } => "conv1d_depthwise",
+    };
+    let mut conv_transforms: Vec<String> = Vec::new();
+    if cfg.conv_fused {
+        conv_transforms.push("conv_fused".to_string());
+    }
+    if let Some(arm) = conv_state_arm {
+        conv_transforms.push(arm.to_string());
+    }
+    match conv_transforms.as_slice() {
+        [] => {}
+        [one] => {
+            let family = if cfg.conv_fused {
+                conv_fused_family
+            } else {
+                "fast_sum"
+            };
+            selected.push((one.clone(), family, RegionKind::ConvRing));
+        }
+        _ => {
+            // Both: the separate entries were each measured through the
+            // recurrence alone and do not compose there by addition (§5a);
+            // what runs is the fused ring kernel, and its own joint entry is
+            // what admits it.
+            let joint = ExclusionSet::joint_transform(
+                &conv_transforms
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            );
+            let covered = match TargetFpModel::of_family(conv_fused_family) {
+                Some(m) => {
+                    matches!(set.lookup(&joint, &m), Lookup::Validated(v) if v.verdict == Verdict::Admit)
+                }
+                None => false,
+            };
+            report.compositions.push(Composition {
+                region: RegionKind::ConvRing.name().to_string(),
+                transforms: conv_transforms.clone(),
+                joint: covered.then(|| joint.clone()),
+            });
+            selected.push((joint, conv_fused_family, RegionKind::ConvRing));
+        }
+    }
+    let mut kv_transforms: Vec<(String, &'static str)> = Vec::new();
+    match cfg.attn_impl {
+        AttnImpl::Generic => {}
+        AttnImpl::Sdpa => kv_transforms.push(("attn=sdpa".to_string(), "sdpa_vector")),
+        AttnImpl::FlashDecoding => kv_transforms.push(("attn=flash".to_string(), "flash_decoding")),
+    }
+    match cfg.kv_quant {
+        KvQuant::Off => {}
+        other => kv_transforms.push((
+            format!("kv_quant={}", other.name().to_ascii_lowercase()),
+            "dequantize_kv",
+        )),
+    }
+    if kv_transforms.len() > 1 {
+        let names: Vec<&str> = kv_transforms.iter().map(|(n, _)| n.as_str()).collect();
+        let joint = ExclusionSet::joint_transform(&names);
+        report.compositions.push(Composition {
+            region: RegionKind::Kv.name().to_string(),
+            transforms: names.iter().map(|n| n.to_string()).collect(),
+            joint: set.get(&joint).map(|_| joint.clone()),
+        });
+    }
+    for (name, family) in kv_transforms {
+        selected.push((name, family, RegionKind::Kv));
+    }
+    match cfg.qkv_layout {
+        QkvLayout::Contiguous => {}
+        QkvLayout::Strided => selected.push((
+            "qkv_layout=strided".to_string(),
+            "rmsnorm",
+            RegionKind::Straight,
+        )),
+        QkvLayout::Fused => selected.push((
+            "qkv_layout=fused".to_string(),
+            "rmsnorm_rope",
+            RegionKind::Straight,
+        )),
+    }
+
+    for (transform, family, _region) in &selected {
+        let Some(model) = TargetFpModel::of_family(family) else {
+            report.unvalidated.push((
+                transform.clone(),
+                format!("no fp model declared for `{family}`"),
+            ));
+            continue;
+        };
+        match set.lookup(transform, &model) {
+            Lookup::Validated(v) if v.verdict == Verdict::Exclude => {
                 lloom_tensor::bail!(
                     "lfm2 fusion=derived refuses `{transform}`: excluded by the offline validation \
-                     ({:.2} f16 ulp, last/first {:.3}, overrides {}, completion {}); \
+                     ({:.2} f16 ulp, last/first {:.3}, overrides {}, completion {}; under {}); \
                      `design/measurements/issue-732-optimizer-p2.md`",
                     v.max_f16_ulp,
                     v.ratio_last_first,
                     v.overrides,
-                    if v.text_identical { "identical" } else { "differs" }
+                    if v.text_identical { "identical" } else { "differs" },
+                    v.model
                 )
             }
+            Lookup::Validated(_) => report
+                .validated
+                .push((transform.clone(), family.to_string())),
+            Lookup::ModelMismatch(v) => report.unvalidated.push((
+                transform.clone(),
+                format!("recorded under {}, runs `{family}` under {model}", v.model),
+            )),
+            Lookup::Unvalidated => report
+                .unvalidated
+                .push((transform.clone(), "no entry".to_string())),
         }
     }
 
@@ -5258,29 +5504,68 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<Config> {
             )
         }
     }
-    let unvalidated = policy.unvalidated();
-    eprintln!(
-        "lfm2 fusion=derived: {plan}; gemv_silu={gemv_silu} gemv_residual={gemv_residual} \
-         ({} refused, {} unvalidated{}, {:.1} ms)",
-        d.refused.len(),
-        unvalidated.len(),
-        if unvalidated.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", unvalidated.join(" "))
-        },
-        d.elapsed.as_secs_f64() * 1e3
-    );
+    for (name, why) in policy.unvalidated() {
+        report
+            .unvalidated
+            .push((ExclusionSet::fragment_transform(&name), why));
+    }
+    report.plan = plan.to_string();
+    report.gemv_silu = gemv_silu;
+    report.gemv_residual = gemv_residual;
+    report.refused = d.refused.clone();
+    report.fused_in_stateful = plan
+        .regions
+        .fused_in_stateful
+        .iter()
+        .map(|s| (s.site.clone(), s.fragment.clone(), s.region.to_string()))
+        .collect();
     let mut out = cfg.clone();
     out.gemv_silu = gemv_silu;
     out.gemv_residual = gemv_residual;
-    Ok(out)
+    Ok((out, report))
+}
+
+/// The conv fold's ∞-norm gain per channel over every conv layer's loaded
+/// weights (`FusionReport::conv_fold_gain`). Once, at construction, under
+/// `Fusion=Derived` only.
+fn conv_fold_gain(layers: &[DecoderLayer]) -> Result<Option<ConvFoldGain>> {
+    let mut gain = ConvFoldGain {
+        layers: 0,
+        taps: 0,
+        channels: 0,
+        max: f32::MIN,
+        min: f32::MAX,
+        over_one: 0,
+    };
+    for layer in layers {
+        let LayerKind::ShortConv(conv) = &layer.kind else {
+            continue;
+        };
+        let (h, _, k) = conv.conv_weight.dims3()?;
+        let w = conv
+            .conv_weight
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        gain.layers += 1;
+        gain.taps = k;
+        for c in 0..h {
+            let l: f32 = w[c * k..(c + 1) * k].iter().map(|x| x.abs()).sum();
+            gain.channels += 1;
+            gain.max = gain.max.max(l);
+            gain.min = gain.min.min(l);
+            if l > 1.0 {
+                gain.over_one += 1;
+            }
+        }
+    }
+    Ok((gain.layers > 0).then_some(gain))
 }
 
 /// A browser build has no optimizer (`egglog` is host-only); the arm is
 /// refused rather than silently manual.
 #[cfg(target_arch = "wasm32")]
-fn derive_fusion(_cfg: &Config, _dtype: DType) -> Result<Config> {
+fn derive_fusion(_cfg: &Config, _dtype: DType) -> Result<(Config, FusionReport)> {
     lloom_tensor::bail!("lfm2 fusion=derived is not available on wasm32; use fusion=manual")
 }
 
@@ -5328,10 +5613,13 @@ impl Model {
         // did: the derivation is construction-tier, the token path is
         // untouched (`CONTRIBUTING.md` §3.3a).
         let derived;
+        let mut report = None;
         let cfg = match cfg.fusion {
             FusionPolicy::Manual => cfg,
             FusionPolicy::Derived => {
-                derived = derive_fusion(cfg, vb.dtype())?;
+                let (d, r) = derive_fusion(cfg, vb.dtype())?;
+                derived = d;
+                report = Some(r);
                 &derived
             }
         };
@@ -5365,15 +5653,28 @@ impl Model {
             linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
 
+        // The closed-form gain §5a names wants the loaded weights, so it is
+        // read here, once, and the report is printed complete.
+        if let Some(r) = report.as_mut() {
+            r.conv_fold_gain = conv_fold_gain(&layers)?;
+            eprintln!("{r}");
+        }
+
         Ok(Self {
             embed_tokens,
             layers,
+            fusion_report: report,
             embedding_norm,
             lm_head,
             dtype: vb.dtype(),
             conv_state: cfg.conv_state,
             l_cache: cfg.conv_l_cache,
         })
+    }
+
+    /// What `Fusion=Derived` decided at construction; `None` under `Manual`.
+    pub fn fusion_report(&self) -> Option<&FusionReport> {
+        self.fusion_report.as_ref()
     }
 
     pub fn forward(

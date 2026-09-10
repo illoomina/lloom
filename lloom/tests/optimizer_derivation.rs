@@ -15,7 +15,7 @@
 
 use lloom::models::lfm2::{AttnImpl, Config, ConvState, KvAppend, LayerType, QkvLayout};
 use lloom::models::lfm2_ir::decode_step;
-use lloom::optimizer::{derive, NumericClass, Op, Policy, Seam};
+use lloom::optimizer::{derive, NumericClass, Op, Policy, Region, Seam};
 use lloom_tensor::DType;
 
 /// `LFM2.5-2.6B`'s `config.json`
@@ -275,5 +275,84 @@ fn the_other_arms_derive_the_same_sites() {
         assert_eq!(d.plan.sites_of("silu").len(), 30);
         assert_eq!(d.plan.sites_of("residual").len(), 60);
         assert_eq!(d.plan.dispatches_before() - d.plan.dispatches_after(), 90);
+    }
+}
+
+/// **The stateful regions are marked** (`optimizer-design.md` §5a, P2): the
+/// IR of the real step carries 22 conv-ring regions and 8 KV regions — one
+/// per layer of each kind in `LFM2.5-2.6B`'s `layer_types` — and none of the
+/// 90 fused sites sits in one: the epilogues ride `w1`, `w2` and the two
+/// `out_proj`s, all straight-line, and the fold's result never re-enters the
+/// window. Absolute references, per arm — the nodes of one conv layer's
+/// region: unfused Shuffle = the state, its `narrow`, the two copies, the
+/// window·weight product and the `fast_sum` (6); fused Shuffle = the state
+/// and `shortconv_step` (2); unfused rotating = the state, the ring write,
+/// the product, the sum (4); fused rotating = the state and `shortconv_ring`
+/// (2); unfused sliding = the rotating count plus the live `narrow` (5);
+/// fused sliding = the state, the write, the `narrow`, `conv1d_depthwise`
+/// (4). A KV region is the two caches, the two appends and the attention (5).
+#[test]
+fn the_stateful_regions_are_marked_and_no_fused_site_sits_in_one() {
+    for (conv_state, conv_fused, per_conv) in [
+        (ConvState::Shuffle, false, 6usize),
+        (ConvState::Shuffle, true, 2),
+        (ConvState::RotatingRing { k: 16 }, false, 4),
+        (ConvState::RotatingRing { k: 16 }, true, 2),
+        (ConvState::SlidingRing { k: 4, slack: 8 }, false, 5),
+        (ConvState::SlidingRing { k: 4, slack: 8 }, true, 4),
+    ] {
+        let mut cfg = lfm2_2_6b();
+        traced_arms(&mut cfg, conv_state);
+        cfg.conv_fused = conv_fused;
+        let g = decode_step(&cfg, DType::F16);
+        let regions = g.regions();
+        let conv: Vec<_> = regions
+            .iter()
+            .filter(|(r, _)| matches!(r, Region::ConvRing(_)))
+            .collect();
+        let kv: Vec<_> = regions
+            .iter()
+            .filter(|(r, _)| matches!(r, Region::Kv(_)))
+            .collect();
+        assert_eq!(conv.len(), 22, "{conv_state:?} fused={conv_fused}");
+        assert_eq!(kv.len(), 8, "{conv_state:?} fused={conv_fused}");
+        for (r, nodes) in &conv {
+            assert_eq!(
+                nodes.len(),
+                per_conv,
+                "{r} under {conv_state:?} fused={conv_fused}"
+            );
+        }
+        for (r, nodes) in &kv {
+            assert_eq!(nodes.len(), 5, "{r}");
+        }
+        // The layers marked are the conv and attention layers, by index.
+        let conv_layers: Vec<usize> = conv
+            .iter()
+            .map(|(r, _)| match r {
+                Region::ConvRing(l) => *l,
+                _ => unreachable!(),
+            })
+            .collect();
+        let expected: Vec<usize> = cfg
+            .layer_types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t == LayerType::Conv)
+            .map(|(l, _)| l)
+            .collect();
+        assert_eq!(conv_layers, expected);
+
+        let d = derive(&g, &Policy::default()).expect("derivation");
+        assert_eq!(d.plan.sites.len(), 90);
+        assert_eq!(d.plan.regions.conv_ring, 22);
+        assert_eq!(d.plan.regions.kv, 8);
+        assert_eq!(d.plan.regions.nodes, 22 * per_conv + 8 * 5);
+        assert!(
+            d.plan.regions.fused_in_stateful.is_empty(),
+            "{conv_state:?} fused={conv_fused}: {:?}",
+            d.plan.regions.fused_in_stateful
+        );
+        assert!(d.plan.to_string().contains("regions[conv-ring=22 kv=8"));
     }
 }

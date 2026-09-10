@@ -15,7 +15,9 @@
 
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{Cache, Config, FusionPolicy, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{
+    Cache, Composition, Config, ConvState, FusionPolicy, KvAppend, LayerType, Model,
+};
 use lloom::nn::VarBuilder;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -260,5 +262,139 @@ fn derived_refuses_an_excluded_silu_arm_at_construction() -> Result<()> {
     let mut manual = tiny_config(FusionPolicy::Manual, false, false);
     manual.silu_impl = lloom_tensor::kernels::SiluImpl::Relu;
     build(&manual, &dev)?;
+    Ok(())
+}
+
+/// P2, the model key and the regions (`optimizer-design.md` §5a, §10c): what
+/// the report says for the crown's conv arms. `conv_fused` on the rotating
+/// ring is the `shortconv_ring` kernel — ONE transform of the recurrence, not
+/// `conv_fused` and `conv_state=rotating` composed — and the set validates it
+/// jointly, under `tree=serial-rot`; the sliding ring under `conv_fused` runs
+/// `conv1d_depthwise`, which the set has no joint entry for, and the report
+/// says so instead of reusing the two separate verdicts. The tiny fixture's
+/// regions: one conv ring, one KV, no fused site in either.
+#[test]
+fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<()> {
+    let Ok(dev) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return Ok(());
+    };
+    // The crown's conv arms: the fused rotating ring.
+    let mut crown = tiny_config(FusionPolicy::Derived, false, false);
+    crown.conv_fused = true;
+    crown.conv_state = ConvState::RotatingRing { k: 0 };
+    let model = build(&crown, &dev)?;
+    let r = model.fusion_report().expect("Derived keeps its report");
+    eprintln!("{r}");
+    assert!(r.gemv_silu && r.gemv_residual);
+    assert_eq!(
+        r.compositions,
+        vec![Composition {
+            region: "conv-ring".to_string(),
+            transforms: vec!["conv_fused".to_string(), "conv_state=rotating".to_string()],
+            joint: Some("conv_fused+conv_state=rotating".to_string()),
+        }]
+    );
+    assert_eq!(
+        r.validated,
+        vec![(
+            "conv_fused+conv_state=rotating".to_string(),
+            "shortconv_ring".to_string()
+        )]
+    );
+    assert!(r.unvalidated.is_empty(), "{:?}", r.unvalidated);
+    assert!(r.fused_in_stateful.is_empty(), "{:?}", r.fused_in_stateful);
+    assert!(r.plan.contains("regions[conv-ring=1 kv=1 nodes=7 fused-in-stateful=0]"), "{}", r.plan);
+
+    // The sliding ring under `conv_fused` runs `conv1d_depthwise`: no joint
+    // entry, so the composition is reported as NOT validated jointly, and the
+    // pair is unvalidated under that kernel rather than admitted from the
+    // two separate entries.
+    let mut sliding = tiny_config(FusionPolicy::Derived, false, false);
+    sliding.conv_fused = true;
+    sliding.conv_state = ConvState::SlidingRing { k: 2, slack: 4 };
+    let model = build(&sliding, &dev)?;
+    let r = model.fusion_report().unwrap();
+    eprintln!("{r}");
+    assert_eq!(
+        r.compositions,
+        vec![Composition {
+            region: "conv-ring".to_string(),
+            transforms: vec!["conv_fused".to_string(), "conv_state=ring".to_string()],
+            joint: None,
+        }]
+    );
+    assert_eq!(
+        r.unvalidated,
+        vec![("conv_fused+conv_state=ring".to_string(), "no entry".to_string())]
+    );
+    assert!(r.validated.is_empty());
+
+    // `conv_fused` alone on the shuffle is `shortconv_step`, validated under
+    // its serial tree; `conv_state=rotating` alone is the unfused fold
+    // (`fast_sum`, store-width, simd tree), validated under that.
+    let mut step = tiny_config(FusionPolicy::Derived, false, false);
+    step.conv_fused = true;
+    let r = build(&step, &dev)?.fusion_report().unwrap().clone();
+    assert_eq!(r.validated, vec![("conv_fused".to_string(), "shortconv_step".to_string())]);
+    assert!(r.compositions.is_empty());
+    let mut rot = tiny_config(FusionPolicy::Derived, false, false);
+    rot.conv_state = ConvState::RotatingRing { k: 0 };
+    let r = build(&rot, &dev)?.fusion_report().unwrap().clone();
+    assert_eq!(r.validated, vec![("conv_state=rotating".to_string(), "fast_sum".to_string())]);
+    Ok(())
+}
+
+/// The closed-form gain §5a names, read from the loaded weights: the fold's
+/// ∞-norm per channel, `Σ_j |w[c, j]|`. The fixture fills
+/// `conv.conv.weight` (`[512, 1, 3]`) with `((i % 17) − 8) / 32` over the
+/// flattened index, so the gain is computable by hand — asserted as the
+/// absolute reference (`CONTRIBUTING.md` §3.1b rule 1), max, min and the
+/// count of expansive channels alike — and the horizon is `taps − 1 = 2`.
+#[test]
+fn the_conv_fold_gain_is_the_weights_norm_and_the_horizon_is_the_window() -> Result<()> {
+    let Ok(dev) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return Ok(());
+    };
+    let cfg = tiny_config(FusionPolicy::Derived, false, false);
+    let model = build(&cfg, &dev)?;
+    let g = model
+        .fusion_report()
+        .unwrap()
+        .conv_fold_gain
+        .clone()
+        .expect("one conv layer");
+    // By hand, at f16 (the fixture's dtype): every value ((i % 17) - 8) / 32
+    // is exact in f16, so the sum of three is exact too.
+    let h = cfg.hidden_size;
+    let k = cfg.conv_l_cache;
+    let mut max = f32::MIN;
+    let mut min = f32::MAX;
+    let mut over_one = 0;
+    for c in 0..h {
+        let l: f32 = (0..k)
+            .map(|j| ((((c * k + j) % 17) as f32) - 8.0) / 32.0)
+            .map(f32::abs)
+            .sum();
+        max = max.max(l);
+        min = min.min(l);
+        if l > 1.0 {
+            over_one += 1;
+        }
+    }
+    assert_eq!((g.layers, g.taps, g.channels), (1, 3, h));
+    assert_eq!((g.max, g.min, g.over_one), (max, min, over_one));
+    // The absolute values for this fill: the largest window is where the
+    // 17-cycle wraps, {7, 8, −8}/32 → 23/32; the smallest {−1, 0, 1}/32 →
+    // 2/32; no channel is expansive.
+    assert_eq!(g.max, 23.0 / 32.0);
+    assert_eq!(g.min, 2.0 / 32.0);
+    assert_eq!(g.over_one, 0);
+    assert!(model
+        .fusion_report()
+        .unwrap()
+        .to_string()
+        .contains("window write L=1 (permutation), horizon 2 tokens"));
     Ok(())
 }

@@ -453,11 +453,21 @@ pub fn merged_translation_unit() -> bool {
     })
 }
 
+/// Whether this process compiles its kernels under `MTLMathMode::Fast`
+/// (`CANDLE_METAL_ENABLE_FAST_MATH`, default on — Metal's own default,
+/// `DESIGN.md` §2.3.9). Read once: the value is fixed for the process, and it
+/// is part of the fp model every recorded digest and exclusion belongs to
+/// (`optimizer-design.md` §5a).
+pub fn fast_math_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| get_env_bool("CANDLE_METAL_ENABLE_FAST_MATH", true))
+}
+
 fn get_compile_options() -> Retained<MTLCompileOptions> {
     let compile_options = MTLCompileOptions::new();
     //unsafe { compile_options.setEnableLogging(true) };
 
-    let fast_math_enabled = get_env_bool("CANDLE_METAL_ENABLE_FAST_MATH", true);
+    let fast_math_enabled = fast_math_enabled();
     // Ref availability:
     // https://developer.apple.com/documentation/metal/mtlcompileoptions/mathmode
     if available!(macos = 15, ios = 18) {

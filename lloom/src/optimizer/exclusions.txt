@@ -1,22 +1,26 @@
 # The exclusion set (#732 P2): computed OFFLINE by design/tools/fusion-validate,
 # never by hand. Columns: name class max_f16_ulp ratio_last_first overrides
-# text_identical verdict. The verdict is derived from the numbers by ONE rule
-# (verdict.py: ulp <= 32, ratio <= 2, overrides == 0, text identical);
-# optimizer::exclusions re-derives it at load and refuses a disagreement.
-# Evidence: design/measurements/issue-732-optimizer-p2.md.
-gemv_silu rounding 2.00 1.000 0 yes admit
-gemv_residual rounding 2.12 1.333 0 yes admit
-gemv_silu+gemv_residual rounding 2.25 1.500 0 yes admit
-conv_fused reorder 2.50 1.231 0 yes admit
-conv_state=rotating reorder 3.00 1.333 0 yes admit
-conv_state=ring bit-exact 0.00 1.000 0 yes admit
-qkv_layout=strided bit-exact 0.00 1.000 0 yes admit
-qkv_layout=fused bit-exact 0.00 1.000 0 yes admit
-attn=sdpa tolerance 4.25 0.889 0 yes admit
-silu_impl=recip bit-exact 0.00 1.000 0 yes admit
-silu_impl=literal rounding 4.25 1.200 0 yes admit
-silu_impl=coarse4 tolerance 23.50 1.046 0 yes admit
-silu_impl=coarse1 tolerance 258.69 0.639 8 yes exclude
-silu_impl=hardswish tolerance 504.89 0.607 22 no exclude
-silu_impl=relu tolerance 2307.50 1.711 500 no exclude
-kv_quant=int8 tolerance 34.00 0.206 0 yes exclude
+# text_identical verdict fp_model region. The verdict is derived from the numbers
+# by ONE rule (verdict.py: ulp <= 32, ratio <= 2, overrides == 0, text
+# identical); optimizer::exclusions re-derives it at load and refuses a disagreement.
+# fp_model is the model the transform's kernel computed under (optimizer-design.md
+# 5a): a verdict is looked up UNDER a model and does not transfer to another. region
+# is what the transform rewrites; two transforms on one recurrence compose only
+# through a joint `a+b` entry. Evidence: design/measurements/issue-732-optimizer-p2.md.
+gemv_silu rounding 2.00 1.000 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
+gemv_residual rounding 2.12 1.333 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
+gemv_silu+gemv_residual rounding 2.25 1.500 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
+conv_fused reorder 2.50 1.231 0 yes admit fma=contract,acc=f32,tree=serial,denorm32=flush,denorm16=preserve conv-ring
+conv_fused+conv_state=rotating reorder 2.62 1.333 0 yes admit fma=contract,acc=f32,tree=serial-rot,denorm32=flush,denorm16=preserve conv-ring
+conv_state=rotating reorder 3.00 1.333 0 yes admit fma=contract,acc=store,tree=simd,denorm32=flush,denorm16=preserve conv-ring
+conv_state=ring bit-exact 0.00 1.000 0 yes admit fma=contract,acc=store,tree=simd,denorm32=flush,denorm16=preserve conv-ring
+qkv_layout=strided bit-exact 0.00 1.000 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
+qkv_layout=fused bit-exact 0.00 1.000 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
+attn=sdpa tolerance 4.25 0.889 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve kv
+silu_impl=recip bit-exact 0.00 1.000 0 yes admit fma=contract,acc=none,tree=none,denorm32=flush,denorm16=preserve straight
+silu_impl=literal rounding 4.25 1.200 0 yes admit fma=contract,acc=none,tree=none,denorm32=flush,denorm16=preserve straight
+silu_impl=coarse4 tolerance 23.50 1.046 0 yes admit fma=contract,acc=none,tree=none,denorm32=flush,denorm16=preserve straight
+silu_impl=coarse1 tolerance 258.69 0.639 8 yes exclude fma=contract,acc=none,tree=none,denorm32=flush,denorm16=preserve straight
+silu_impl=hardswish tolerance 504.89 0.607 22 no exclude fma=contract,acc=none,tree=none,denorm32=flush,denorm16=preserve straight
+silu_impl=relu tolerance 2307.50 1.711 500 no exclude fma=contract,acc=none,tree=none,denorm32=flush,denorm16=preserve straight
+kv_quant=int8 tolerance 34.00 0.206 0 yes exclude fma=contract,acc=none,tree=none,denorm32=flush,denorm16=preserve kv

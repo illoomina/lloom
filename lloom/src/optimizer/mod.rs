@@ -13,7 +13,10 @@
 //!
 //! The numeric obligation is a class ([`NumericClass`]) each fragment
 //! carries, checked against the policy's budget before its rule exists; an
-//! exclusion set (P2's product) removes fragments by name the same way.
+//! exclusion set (P2's product) removes fragments by name the same way —
+//! looked up under the fp model the fragment composes in, so a verdict
+//! recorded for another kernel's tree is never reused (§5a). The plan also
+//! reports the step's recurrences and which fused sites sit in one.
 
 pub mod egraph;
 pub mod exclusions;
@@ -24,11 +27,11 @@ pub mod plan;
 
 use lloom_tensor::Result;
 
-pub use exclusions::{ExclusionSet, Verdict};
+pub use exclusions::{ExclusionSet, Lookup, Verdict};
 pub use fragments::{catalogue, Fragment};
 pub use ir::{Census, Dim, Graph, Node, NodeId, Op, Shape};
-pub use numeric::NumericClass;
-pub use plan::{FusionPlan, Seam, Sites};
+pub use numeric::{NumericClass, Region, RegionKind, TargetFpModel};
+pub use plan::{FusionPlan, Regions, Seam, Sites, StatefulSite};
 
 /// What the derivation may do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,13 +55,18 @@ impl Default for Policy {
     ///
     /// `excluded` is read off the embedded exclusion set
     /// ([`exclusions::embedded`], P2): every catalogue fragment whose
-    /// transform the offline validation refused.
+    /// transform the offline validation refused — under the model the
+    /// fragment composes in. A verdict recorded under another model neither
+    /// excludes nor admits; it is reported by [`Policy::unvalidated`].
     fn default() -> Policy {
         let set = exclusions::embedded();
         let excluded = catalogue()
             .into_iter()
             .filter(|f| {
-                set.verdict(&ExclusionSet::fragment_transform(f.name)) == Some(Verdict::Exclude)
+                matches!(
+                    set.lookup(&ExclusionSet::fragment_transform(f.name), &f.model),
+                    Lookup::Validated(v) if v.verdict == Verdict::Exclude
+                )
             })
             .map(|f| f.name.to_string())
             .collect();
@@ -71,19 +79,26 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// The catalogue fragments the exclusion set has NO verdict for under
-    /// this policy — admitted by class budget alone, and worth naming in a
-    /// report, since "unvalidated" and "validated admissible" are different
-    /// facts.
-    pub fn unvalidated(&self) -> Vec<String> {
+    /// The catalogue fragments the exclusion set has NO verdict for under the
+    /// model they compose in — admitted by class budget alone, and worth
+    /// naming in a report, since "unvalidated" and "validated admissible" are
+    /// different facts. Each with the reason: no entry, or an entry recorded
+    /// under another model.
+    pub fn unvalidated(&self) -> Vec<(String, String)> {
         let set = exclusions::embedded();
         catalogue()
             .into_iter()
-            .filter(|f| {
-                set.verdict(&ExclusionSet::fragment_transform(f.name))
-                    .is_none()
+            .filter_map(|f| {
+                let t = ExclusionSet::fragment_transform(f.name);
+                match set.lookup(&t, &f.model) {
+                    Lookup::Validated(_) => None,
+                    Lookup::Unvalidated => Some((f.name.to_string(), "no entry".to_string())),
+                    Lookup::ModelMismatch(v) => Some((
+                        f.name.to_string(),
+                        format!("recorded under {}, composes under {}", v.model, f.model),
+                    )),
+                }
             })
-            .map(|f| f.name.to_string())
             .collect()
     }
 }
@@ -110,12 +125,15 @@ pub fn derive(graph: &Graph, policy: &Policy) -> Result<Derivation> {
 pub fn derive_with(graph: &Graph, policy: &Policy, catalogue: &[Fragment]) -> Result<Derivation> {
     let (admitted, refused) = egraph::admitted(policy, catalogue);
     let sat = egraph::derive(graph, &admitted, policy.iterations)?;
+    let sites = plan::sites(&sat.graph);
+    let regions = plan::regions(graph, &sites);
     let plan = FusionPlan {
-        sites: plan::sites(&sat.graph),
+        sites,
         class: sat.graph.numeric(),
         before: graph.census(),
         after: sat.graph.census(),
         seams: plan::seams(&sat.graph),
+        regions,
     };
     Ok(Derivation {
         plan,
@@ -182,6 +200,64 @@ mod tests {
                 }
             ]
         );
+    }
+
+    /// A fused site inside a recurrence is reported, not hidden: the
+    /// residual onto a GEMV whose add the emitter marked as a ring's state
+    /// write is `fused-in-stateful`; the same graph unmarked reports none.
+    #[test]
+    fn a_fused_site_in_a_marked_region_is_reported() {
+        let build = |mark: bool| {
+            let mut g = Graph::new();
+            let r = g.input("h", Shape::of(&[1, 1, 8]), DType::F16);
+            let w = g.weight("w", Shape::of(&[8, 8]), DType::F16);
+            let y = g.gemv(w, r);
+            let out = g.add(r, y);
+            g.mark_root(out);
+            if mark {
+                g.mark_region(out, Region::ConvRing(2));
+            }
+            g
+        };
+        let d = derive(&build(false), &Policy::default()).unwrap();
+        assert_eq!(d.plan.sites.get("w").map(String::as_str), Some("residual"));
+        assert_eq!(d.plan.regions, Regions::default());
+        let d = derive(&build(true), &Policy::default()).unwrap();
+        assert_eq!(d.plan.sites.get("w").map(String::as_str), Some("residual"));
+        assert_eq!(d.plan.regions.conv_ring, 1);
+        assert_eq!(d.plan.regions.nodes, 1);
+        assert_eq!(
+            d.plan.regions.fused_in_stateful,
+            vec![StatefulSite {
+                site: "w".to_string(),
+                fragment: "residual".to_string(),
+                region: Region::ConvRing(2),
+            }]
+        );
+        assert!(d
+            .plan
+            .to_string()
+            .contains("fused-in-stateful=1 w:residual@conv-ring@2"));
+    }
+
+    /// The default policy asks the set under each fragment's own model; a
+    /// fragment the set only knows under another model is unvalidated, with
+    /// the two models named.
+    #[test]
+    fn a_fragment_validated_under_another_model_is_unvalidated_here() {
+        let policy = Policy::default();
+        assert!(
+            policy.unvalidated().is_empty(),
+            "{:?}",
+            policy.unvalidated()
+        );
+        let set = exclusions::embedded();
+        let other = TargetFpModel::of_family("shortconv_step").unwrap();
+        for f in catalogue() {
+            let t = ExclusionSet::fragment_transform(f.name);
+            assert!(matches!(set.lookup(&t, &f.model), Lookup::Validated(_)));
+            assert!(matches!(set.lookup(&t, &other), Lookup::ModelMismatch(_)));
+        }
     }
 
     #[test]

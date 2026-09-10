@@ -6,13 +6,20 @@
 //! The graph is a DAG in an arena: a node names its inputs by [`NodeId`], and
 //! a value's use count is a property of the graph, not of the node — which is
 //! what the G3 adjacency gate (`design/docs/fusion.md` §12.2e) reads.
+//!
+//! A node also carries the [`Region`] it computes in: straight-line, or one
+//! of the step's recurrences (a conv layer's state window, an attention
+//! layer's KV cache). The emitter marks them; the plan reads them off the
+//! SOURCE graph (`plan::regions`), because a rewrite decision is a fact about
+//! where a site sits, and a per-rewrite verdict does not compose across a
+//! recurrence the way it does along a straight line (§5a).
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use lloom_tensor::DType;
 
-use super::numeric::NumericClass;
+use super::numeric::{NumericClass, Region};
 
 /// Index of a node in a [`Graph`].
 pub type NodeId = usize;
@@ -131,6 +138,9 @@ pub struct Node {
     pub shape: Shape,
     pub dtype: DType,
     pub numeric: NumericClass,
+    /// Where the node computes: straight-line unless the emitter marked it
+    /// as part of a recurrence ([`Graph::mark_region`]).
+    pub region: Region,
 }
 
 /// The kernel family a node's dispatch is counted under — the census key.
@@ -178,6 +188,24 @@ impl Graph {
         self.roots.push(id);
     }
 
+    /// Place `id` in `region`. The emitter calls this for every node of a
+    /// recurrence: the state it reads, the write that carries it to the next
+    /// token, and the reduction over it.
+    pub fn mark_region(&mut self, id: NodeId, region: Region) {
+        self.nodes[id].region = region;
+    }
+
+    /// The stateful regions and their nodes, in region order.
+    pub fn regions(&self) -> BTreeMap<Region, Vec<NodeId>> {
+        let mut out: BTreeMap<Region, Vec<NodeId>> = BTreeMap::new();
+        for (id, node) in self.nodes.iter().enumerate() {
+            if node.region.is_stateful() {
+                out.entry(node.region).or_default().push(id);
+            }
+        }
+        out
+    }
+
     pub fn push(&mut self, node: Node) -> NodeId {
         self.nodes.push(node);
         self.nodes.len() - 1
@@ -191,6 +219,7 @@ impl Graph {
             shape,
             dtype,
             numeric: NumericClass::BitExact,
+            region: Region::Straight,
         })
     }
 
@@ -202,6 +231,7 @@ impl Graph {
             shape,
             dtype,
             numeric: NumericClass::BitExact,
+            region: Region::Straight,
         })
     }
 
@@ -216,6 +246,7 @@ impl Graph {
             shape,
             dtype,
             numeric,
+            region: Region::Straight,
         })
     }
 
@@ -233,6 +264,7 @@ impl Graph {
             shape,
             dtype,
             numeric,
+            region: Region::Straight,
         })
     }
 
@@ -247,6 +279,7 @@ impl Graph {
             shape,
             dtype,
             numeric,
+            region: Region::Straight,
         })
     }
 
@@ -261,6 +294,7 @@ impl Graph {
             shape,
             dtype,
             numeric,
+            region: Region::Straight,
         })
     }
 
@@ -287,6 +321,7 @@ impl Graph {
             shape,
             dtype,
             numeric,
+            region: Region::Straight,
         })
     }
 
@@ -309,6 +344,7 @@ impl Graph {
             shape,
             dtype,
             numeric,
+            region: Region::Straight,
         })
     }
 
@@ -338,6 +374,7 @@ impl Graph {
             shape,
             dtype,
             numeric,
+            region: Region::Straight,
         })
     }
 
@@ -423,6 +460,27 @@ mod tests {
             !g.census().contains_key("narrow"),
             "a view is not a dispatch"
         );
+    }
+
+    #[test]
+    fn a_region_is_marked_by_the_emitter_and_read_off_the_graph() {
+        let mut g = Graph::new();
+        let x = g.input("x", Shape::of(&[1, 1, 8]), DType::F16);
+        let st = g.input("state", Shape::of(&[1, 8, 3]), DType::F16);
+        let w = g.weight("w", Shape::of(&[8, 8]), DType::F16);
+        let y = g.gemv(w, x);
+        let ring = g.opaque("copy2d", &[y, st], Shape::of(&[1, 8, 3]), DType::F16);
+        assert_eq!(
+            g.node(ring).region,
+            Region::Straight,
+            "unmarked is straight"
+        );
+        g.mark_region(st, Region::ConvRing(4));
+        g.mark_region(ring, Region::ConvRing(4));
+        let regions = g.regions();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[&Region::ConvRing(4)], vec![st, ring]);
+        assert_eq!(g.node(y).region, Region::Straight);
     }
 
     #[test]

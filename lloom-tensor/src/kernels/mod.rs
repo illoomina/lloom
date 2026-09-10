@@ -14,7 +14,7 @@ pub mod utils;
 pub use crate::{debug_group, metal_label, set_params};
 
 pub use err::MetalKernelError;
-pub use kernel::Kernels;
+pub use kernel::{fast_math_enabled, Kernels};
 // The two COMPILE-TIER arms, exported so a harness can state them on its
 // `RESULT` line (`DESIGN.md` §7.1a, §14.5a). Both are read back from the
 // `OnceLock` the compiler itself reads rather than echoed from a flag: an axis

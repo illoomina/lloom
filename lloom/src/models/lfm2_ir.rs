@@ -13,13 +13,23 @@
 //! arms that trace did not take are described from the source and say so
 //! below.
 //!
+//! The step's two recurrences are marked as regions (`optimizer-design.md`
+//! §5a): each conv layer's state window — the state read, the shift or ring
+//! write that carries it to the next token, and the fold over it — and each
+//! attention layer's KV cache — the cache read, the append, and the attention
+//! over `kv_len`. What the fold or the attention PRODUCES is straight-line:
+//! the conv output never re-enters the window, so the window's horizon is
+//! `k − 1` tokens by construction, and the attention output enters the
+//! residual stream, not the cache. The `*c` gate, the projections and the
+//! residual adds are straight-line.
+//!
 //! What this is NOT: a second implementation of the forward pass. It names
 //! kernel families and shapes; it computes nothing.
 
 use lloom_tensor::DType;
 
 use super::lfm2::{AttnImpl, Config, ConvState, KvAppend, LayerType, QkvLayout};
-use crate::optimizer::{Dim, Graph, NodeId, Shape};
+use crate::optimizer::{Dim, Graph, NodeId, Region, Shape};
 
 /// The IR of one decode step of `cfg` at `dtype`.
 pub fn decode_step(cfg: &Config, dtype: DType) -> Graph {
@@ -208,6 +218,11 @@ fn attention(g: &mut Graph, cfg: &Config, dtype: DType, p: &str, xn: NodeId, l: 
         Shape::of(&[1, heads, 1, hd]),
         dtype,
     );
+    // The KV recurrence: the cache, the append that carries this token's K/V
+    // to every later one, and the reduction over `kv_len`.
+    for id in [k_cache, v_cache, k_all, v_all, y] {
+        g.mark_region(id, Region::Kv(l));
+    }
     let y = g.view("reshape", y, Shape::of(&[1, 1, h]));
     let wo = g.weight(
         &format!("{p}.self_attn.out_proj.weight"),
@@ -247,16 +262,23 @@ fn conv(g: &mut Graph, cfg: &Config, dtype: DType, p: &str, xn: NodeId, l: usize
     );
     let w_conv = g.view("squeeze", w_conv, Shape::of(&[h, lc]));
     let state = g.input(&format!("conv.state@{l}"), Shape::of(&[1, h, width]), dtype);
+    // The state recurrence: the window read, whatever writes the next window,
+    // and the fold over it. Collected as they are emitted, marked once below.
+    let mut ring: Vec<NodeId> = vec![state];
 
     let out = match (cfg.conv_state, cfg.conv_fused) {
         // The whole block as one kernel: `bx`, the shift, the fold, `*c`, the
         // next state.
-        (ConvState::Shuffle, true) => g.opaque(
-            "shortconv_step",
-            &[b, x, c, state, w_conv],
-            Shape::of(&[1, h, 1]),
-            dtype,
-        ),
+        (ConvState::Shuffle, true) => {
+            let step = g.opaque(
+                "shortconv_step",
+                &[b, x, c, state, w_conv],
+                Shape::of(&[1, h, 1]),
+                dtype,
+            );
+            ring.push(step);
+            step
+        }
         // The ring writer as one kernel; the output arrives transposed with
         // `*c` applied, so the block ends here.
         (ConvState::RotatingRing { .. }, true) => {
@@ -266,6 +288,10 @@ fn conv(g: &mut Graph, cfg: &Config, dtype: DType, p: &str, xn: NodeId, l: usize
                 Shape::of(&[1, 1, h]),
                 dtype,
             );
+            ring.push(out);
+            for id in ring {
+                g.mark_region(id, Region::ConvRing(l));
+            }
             let w_out = g.weight(
                 &format!("{p}.conv.out_proj.weight"),
                 Shape::of(&[h, h]),
@@ -280,15 +306,21 @@ fn conv(g: &mut Graph, cfg: &Config, dtype: DType, p: &str, xn: NodeId, l: usize
                     // `cat([state[1..], bx])`: two copies into the new state.
                     let tail = g.view("narrow", state, Shape::of(&[1, h, lc - 1]));
                     let shifted = g.opaque("copy2d", &[tail], Shape::of(&[1, h, lc]), dtype);
-                    g.opaque("copy2d", &[bx, shifted], Shape::of(&[1, h, lc]), dtype)
+                    let next = g.opaque("copy2d", &[bx, shifted], Shape::of(&[1, h, lc]), dtype);
+                    ring.extend([tail, shifted, next]);
+                    next
                 }
                 ConvState::RotatingRing { .. } | ConvState::SlidingRing { .. } => {
                     // `slice_set` at the write slot: one copy into the ring.
-                    let ring = g.opaque("copy2d", &[bx, state], Shape::of(&[1, h, width]), dtype);
+                    let written =
+                        g.opaque("copy2d", &[bx, state], Shape::of(&[1, h, width]), dtype);
+                    ring.push(written);
                     if matches!(arm, ConvState::SlidingRing { .. }) {
-                        g.view("narrow", ring, Shape::of(&[1, h, lc]))
+                        let live = g.view("narrow", written, Shape::of(&[1, h, lc]));
+                        ring.push(live);
+                        live
                     } else {
-                        ring
+                        written
                     }
                 }
             };
@@ -301,20 +333,28 @@ fn conv(g: &mut Graph, cfg: &Config, dtype: DType, p: &str, xn: NodeId, l: usize
                 // `conv1d_depthwise_k`; the scaled `_c` variant folds `*c`
                 // only on the contiguous `Shuffle` window, handled above.
                 let w = g.view("unsqueeze", w_conv, Shape::of(&[h, 1, taps]));
-                g.opaque(
+                let conv = g.opaque(
                     "conv1d_depthwise",
                     &[window, w],
                     Shape::of(&[1, h, 1]),
                     dtype,
-                )
+                );
+                ring.push(conv);
+                conv
             } else {
                 let w = g.view("unsqueeze", w_conv, Shape::of(&[1, h, taps]));
                 let prod = g.mul(window, w);
-                g.opaque("fast_sum", &[prod], Shape::of(&[1, h, 1]), dtype)
+                let sum = g.opaque("fast_sum", &[prod], Shape::of(&[1, h, 1]), dtype);
+                ring.extend([prod, sum]);
+                sum
             };
+            // The `*c` gate reads the fold's result: straight-line.
             g.mul(c, conv)
         }
     };
+    for id in ring {
+        g.mark_region(id, Region::ConvRing(l));
+    }
     let out = g.view("transpose", out, Shape::of(&[1, 1, h]));
     let w_out = g.weight(
         &format!("{p}.conv.out_proj.weight"),

@@ -9,7 +9,7 @@
 
 use crate::nn::fusion::{Epilogue, Operand, OperandKind, Precision, Semantics};
 
-use super::numeric::NumericClass;
+use super::numeric::{NumericClass, TargetFpModel};
 
 /// One admissible epilogue block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +24,10 @@ pub struct Fragment {
     pub precision: Precision,
     /// The second buffer it binds, if any.
     pub operand: OperandKind,
+    /// The fp model the composition computes under: the GEMV's (the block
+    /// rides its store), under this build. A verdict the exclusion set
+    /// records for this fragment counts only under this model (§5a).
+    pub model: TargetFpModel,
 }
 
 impl Fragment {
@@ -47,6 +51,7 @@ fn describe<E: Epilogue>() -> Fragment {
         semantics: E::SEMANTICS,
         precision: E::PRECISION,
         operand: <E::Operand as Operand>::KIND,
+        model: TargetFpModel::of_family("gemv").expect("the GEMV's model is declared"),
     }
 }
 
@@ -78,5 +83,9 @@ mod tests {
         assert_eq!(cat[1].semantics, Semantics::AddOperand);
         assert_eq!(cat[1].operand, OperandKind::RowIndexed);
         assert_eq!(cat[1].class(), NumericClass::Rounding);
+        // Both compose into the GEMV, so both carry its model.
+        let gemv = TargetFpModel::of_family("gemv").unwrap();
+        assert_eq!(cat[0].model, gemv);
+        assert_eq!(cat[1].model, gemv);
     }
 }

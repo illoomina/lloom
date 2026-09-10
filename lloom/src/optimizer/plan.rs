@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use super::ir::{Census, Graph, Op};
-use super::numeric::NumericClass;
+use super::numeric::{NumericClass, Region};
 
 /// A weight site the plan fuses an epilogue onto, keyed by the weight's
 /// checkpoint name; the value is the fragment's name.
@@ -26,6 +26,31 @@ pub struct Seam {
     pub count: u64,
 }
 
+/// A fused site that sits in a recurrence: the verdict admitting its
+/// fragment was measured on a straight-line region and does not compose
+/// across the recurrence by addition (§5a). Reported, never approximated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatefulSite {
+    pub site: String,
+    pub fragment: String,
+    pub region: Region,
+}
+
+/// The step's recurrences, as the emitter marked them, and what the plan put
+/// inside them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Regions {
+    /// Conv layers with a state window.
+    pub conv_ring: usize,
+    /// Attention layers with a KV cache.
+    pub kv: usize,
+    /// Nodes marked stateful, over all regions.
+    pub nodes: usize,
+    /// Fused sites whose GEMV, or the elementwise dispatch it absorbed, was
+    /// marked stateful.
+    pub fused_in_stateful: Vec<StatefulSite>,
+}
+
 /// The result of deriving over one graph.
 #[derive(Debug, Clone)]
 pub struct FusionPlan {
@@ -39,6 +64,9 @@ pub struct FusionPlan {
     pub after: Census,
     /// The seams left unfused for want of a fragment, most frequent first.
     pub seams: Vec<Seam>,
+    /// The recurrences the source graph marked, and the fused sites inside
+    /// them.
+    pub regions: Regions,
 }
 
 impl FusionPlan {
@@ -86,8 +114,67 @@ impl fmt::Display for FusionPlan {
             }
             write!(f, "]")?;
         }
-        Ok(())
+        write!(
+            f,
+            " regions[conv-ring={} kv={} nodes={} fused-in-stateful={}",
+            self.regions.conv_ring,
+            self.regions.kv,
+            self.regions.nodes,
+            self.regions.fused_in_stateful.len()
+        )?;
+        for s in &self.regions.fused_in_stateful {
+            write!(f, " {}:{}@{}", s.site, s.fragment, s.region)?;
+        }
+        write!(f, "]")
     }
+}
+
+/// The recurrences of the SOURCE graph and the fused `sites` that fall in
+/// one: a site is stateful if its GEMV's node, or any elementwise reader the
+/// fusion absorbed (a `Silu`/`Add` whose input is that GEMV), was marked.
+/// Read off the source because the rebuilt graph is a fresh arena and the
+/// marks are the emitter's.
+pub fn regions(source: &Graph, sites: &Sites) -> Regions {
+    let marked = source.regions();
+    let mut out = Regions {
+        conv_ring: marked
+            .keys()
+            .filter(|r| matches!(r, Region::ConvRing(_)))
+            .count(),
+        kv: marked.keys().filter(|r| matches!(r, Region::Kv(_))).count(),
+        nodes: marked.values().map(Vec::len).sum(),
+        fused_in_stateful: Vec::new(),
+    };
+    for (id, node) in source.nodes().iter().enumerate() {
+        if node.op != Op::Gemv {
+            continue;
+        }
+        let w = source.node(node.inputs[0]);
+        let Some(fragment) = sites.get(&w.name) else {
+            continue;
+        };
+        let mut region = node.region;
+        if !region.is_stateful() {
+            // The elementwise dispatch the fusion absorbed.
+            for reader in source.nodes() {
+                if reader.op.is_elementwise()
+                    && reader.inputs.contains(&id)
+                    && reader.region.is_stateful()
+                {
+                    region = reader.region;
+                    break;
+                }
+            }
+        }
+        if region.is_stateful() {
+            out.fused_in_stateful.push(StatefulSite {
+                site: w.name.clone(),
+                fragment: fragment.clone(),
+                region,
+            });
+        }
+    }
+    out
 }
 
 /// The fused sites of a graph: each `Fused` node's weight name and fragment.

@@ -627,6 +627,21 @@ struct Args {
     #[arg(long)]
     stream_reader: bool,
 
+    /// The adaptive commit (lloom #735, `DecodeOptions::adaptive_commit`): the
+    /// loop closes its command buffer only when the GPU has started the
+    /// previous one, on no cadence — no per-step marker cut, no commit-cadence
+    /// drain, no TTFT ramp. Needs `--stream-reader` (the reader drains per
+    /// token and raises the stop flag on EOS) and a deferred EOS arm
+    /// (`--readback ring-hostdrain` / `ring-gpubatch*`); refused otherwise.
+    #[arg(long)]
+    adaptive_commit: bool,
+
+    /// Under `--adaptive-commit`: the most steps one buffer may hold before it
+    /// is closed regardless (0 = the loop's default, 8) — the bound on work
+    /// queued past an EOS, not a cadence.
+    #[arg(long, default_value_t = 0)]
+    run_ahead: usize,
+
     /// The rotating ring's history depth under `--cache rewindable` (non-dspark):
     /// the rewind horizon. `--dspark` sizes it from the drafter's block.
     #[arg(long, default_value_t = 16)]
@@ -1830,6 +1845,9 @@ fn main() -> Result<()> {
         // `RingReader` is actually obtained — so it is never true without a
         // reader thread to stream (which would silence the output entirely).
         stream_via_reader: false,
+        adaptive_commit: false,
+        run_ahead: 0,
+        stop: None,
         // The tile bounds every prefill forward the ramp or the schedule names.
         prefill_tile: args.prefill_tile,
         // One sequence: nothing to interleave a chunk with.
@@ -1841,6 +1859,13 @@ fn main() -> Result<()> {
     // the consumer slack here — tens of milliseconds a serving engine pays once
     // per engine, not once per request, so it is kept off the TTFT clock.
     // `--dspark` drives the speculative body over a `Blocking` handle instead.
+    // The adaptive commit's fields are set before the ring is built: the
+    // ring's input and marker-source rings are sized for the host's lead
+    // (`Geometry::in_flight_depth`), `3 × run_ahead` steps here.
+    if args.adaptive_commit {
+        opts.adaptive_commit = true;
+        opts.run_ahead = args.run_ahead;
+    }
     let mut readback_arm = if dspark_setup.is_none() {
         Some(build_readback(
             &args.readback,
@@ -1876,6 +1901,15 @@ fn main() -> Result<()> {
         None
     };
     opts.stream_via_reader = ring_reader.is_some();
+    // The reader's stop flag: raised when it reads an EOS off the ring; the
+    // loop checks it before each step under the adaptive commit.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    if args.adaptive_commit {
+        if ring_reader.is_none() {
+            anyhow::bail!("--adaptive-commit needs --stream-reader on a mapped ring arm");
+        }
+        opts.stop = Some(Arc::clone(&stop_flag));
+    }
     if args.stream_reader && ring_reader.is_none() {
         eprintln!(
             "[stream-reader: no device ring to read (blocking arm, --dspark, or an unmapped \
@@ -2090,6 +2124,7 @@ fn main() -> Result<()> {
         match ring_reader {
             Some(mut reader) => {
                 let stream_done = Arc::clone(&stream_done);
+                let stop_flag = Arc::clone(&stop_flag);
                 std::thread::spawn(move || {
                     let mut tos =
                         candle_examples::token_output_stream::TokenOutputStream::new(tokenizer);
@@ -2127,6 +2162,12 @@ fn main() -> Result<()> {
                         };
                     loop {
                         buf.clear();
+                        // EOS is usually the first unread id of a read, which
+                        // returns `Ok(0)` — so the flag is raised after every
+                        // read, not only after one that produced ids.
+                        if reader.ended() {
+                            stop_flag.store(true, Ordering::Release);
+                        }
                         match reader.read_new(&mut buf) {
                             Ok(0) => {
                                 // Nothing new. If the loop is done, one last read
@@ -2291,7 +2332,13 @@ fn main() -> Result<()> {
     //    sustains token-to-token, and the number to compare against the §320
     //    floor. The median, not the mean, because one scheduling hiccup (or a
     //    loaded machine) drags the mean and says nothing about the steady path.
-    let mut steps: Vec<u64> = st.step_ns.clone();
+    // Under the adaptive commit the host encodes ahead in bursts and `step_ns`
+    // is an encode time, not a token cadence: take the coarse figure.
+    let mut steps: Vec<u64> = if args.adaptive_commit {
+        Vec::new()
+    } else {
+        st.step_ns.clone()
+    };
     let steady = if steps.is_empty() {
         // RELEASE (no per-step `step_ns` — the clock reads are compiled out of the
         // hot path): the coarse llama-bench figure, measured host-side off the loop
@@ -2450,6 +2497,24 @@ fn main() -> Result<()> {
             },
             faults_after.0.saturating_sub(faults_before.0),
             faults_after.1.saturating_sub(faults_before.1),
+        );
+    }
+    if args.adaptive_commit {
+        eprintln!(
+            "[adaptive commit: {} buffers closed on the GPU starting the previous one + {} at the \
+             run-ahead bound ({}), over {} steps = {:.1} steps/buffer, max {} in one; stopped by \
+             the reader's EOS flag: {}]",
+            st.adaptive_commits,
+            st.run_ahead_closes,
+            if args.run_ahead == 0 {
+                8
+            } else {
+                args.run_ahead
+            },
+            st.steps,
+            st.steps as f64 / (st.adaptive_commits + st.run_ahead_closes).max(1) as f64,
+            st.max_steps_per_buffer,
+            st.stopped_by_flag,
         );
     }
     // The per-step split is a debug/profile detail — `step_ns` is empty in a plain
@@ -3413,8 +3478,11 @@ fn build_readback(
         // the input buffer width is not consulted there).
         max_input_width: opts.max_prefill_width(),
         // The input ring needs `depth + 1` buffers so a host-staged chunk does not
-        // race an in-flight forward's read; the pacer depth is what bounds that.
-        in_flight_depth: opts.pacer_depth(),
+        // race an in-flight forward's read; the pacer depth is what bounds that —
+        // and under the adaptive commit the host's lead is up to `3 × run_ahead`
+        // steps (two queued windows plus the open one), which the marker-source
+        // ring the per-step stamp is staged through has to cover as well.
+        in_flight_depth: opts.pacer_depth() + opts.adaptive_lead(),
     };
     let built = std::time::Instant::now();
     let arm = match readback {

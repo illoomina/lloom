@@ -547,6 +547,30 @@ impl Device {
     /// for a prefill -- the default period IS the overlap, so this is held
     /// only around a pipelined step loop (`Commands`' two defaults). A no-op
     /// on other backends.
+    /// Hold the cut period at `period` until the returned guard drops — the
+    /// adaptive-commit loop (lloom #735) holds it at `usize::MAX`, so the only
+    /// cuts a decode step sees are the ones the loop makes when the GPU has
+    /// started the previous buffer. The prefill and every other caller keep
+    /// the default. No-op off Metal.
+    pub fn cut_period_hold(&self, period: usize) -> PipelinedCutPeriod {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => {
+                let restore = d.compute_per_buffer();
+                d.set_compute_per_buffer(period);
+                PipelinedCutPeriod {
+                    device: Some(d.clone()),
+                    restore,
+                }
+            }
+            _ => PipelinedCutPeriod {
+                #[cfg(feature = "metal")]
+                device: None,
+                restore: period,
+            },
+        }
+    }
+
     pub fn pipelined_cut_period(&self) -> PipelinedCutPeriod {
         match self {
             #[cfg(feature = "metal")]

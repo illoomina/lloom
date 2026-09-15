@@ -189,6 +189,24 @@ pub struct DecodeOptions {
     /// per token already) or on [`Self::decode_until`]'s stop return (a caller
     /// that needs stop-strings under a reader thread signals the loop itself).
     pub stream_via_reader: bool,
+    /// The adaptive commit (lloom #735): the loop closes its command buffer
+    /// only when the GPU has started every buffer committed before it, on no
+    /// cadence of its own — a buffer holds whatever the host encoded while the
+    /// GPU ran the previous one. Requires `stream_via_reader` (the drain is the
+    /// reader's, per token, off this thread), a ring arm whose EOS read never
+    /// waits per step (`drain` / `gpubatch*` — a `poll` would wait on a stamp
+    /// inside an uncommitted buffer), and `lookahead == 1`. The cut period is
+    /// held at `usize::MAX` for the run, so the only cuts are the loop's.
+    pub adaptive_commit: bool,
+    /// Under `adaptive_commit`: the most steps the host may encode into one
+    /// buffer before closing it regardless (0 = 8). Not a cadence — a buffer
+    /// closes earlier whenever the GPU has caught up — but the bound on how
+    /// much work can sit queued past an EOS until the kernels gate on it.
+    pub run_ahead: usize,
+    /// Under `adaptive_commit`: a flag the reader thread raises when it has
+    /// seen EOS (`RingReader::ended`); the loop stops encoding at the next
+    /// step and reconciles the overrun. `None` runs to `max_tokens`.
+    pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The TILE: the most prompt tokens one prefill forward may take
     /// (llama.cpp's `n_ubatch`). **`0` means unbounded** — every forward is
     /// as wide as the ramp or the schedule makes it, the incumbent. A
@@ -319,6 +337,21 @@ impl DecodeOptions {
     /// The pacer depth: the explicit override if set, else the floor. (The
     /// AUTO path sets `in_flight_depth` from warmup; this reads it back with the
     /// `0 = auto -> floor` convention applied.)
+    /// Under `adaptive_commit`: how many steps the host may be ahead of the
+    /// oldest incomplete buffer — two run-ahead windows queued plus the open
+    /// one; 0 otherwise. What the ring's staged-through tiles are sized for.
+    pub fn adaptive_lead(&self) -> usize {
+        if self.adaptive_commit {
+            3 * if self.run_ahead == 0 {
+                8
+            } else {
+                self.run_ahead
+            }
+        } else {
+            0
+        }
+    }
+
     pub fn pacer_depth(&self) -> usize {
         if self.in_flight_depth == 0 {
             IN_FLIGHT_FLOOR
@@ -341,6 +374,9 @@ impl DecodeOptions {
             prefill_bulk: 0,
             prefill_pacer_depth: 0,
             stream_via_reader: false,
+            adaptive_commit: false,
+            run_ahead: 0,
+            stop: None,
             prefill_tile: 0,
             prefill_chunk: 0,
             pass_widths: PassWidths::Lru,
@@ -439,6 +475,14 @@ pub struct DecodeStats {
     /// The decode thread's scheduling class for this run: what it was, what
     /// the loop claimed (`generation::HotThread`), and whether that engaged.
     pub hot_thread: HotThreadReport,
+    /// Under `adaptive_commit`: buffers the loop closed because the GPU had
+    /// started the previous one, buffers closed at the `run_ahead` bound, the
+    /// most steps one buffer held, and whether the reader's stop flag ended
+    /// the run.
+    pub adaptive_commits: u64,
+    pub run_ahead_closes: u64,
+    pub max_steps_per_buffer: usize,
+    pub stopped_by_flag: bool,
     /// The prefill's dispatch census, `(kernel, count)`, under
     /// `CANDLE_METAL_PROFILE=1`; empty otherwise and off Metal.
     pub prefill_census: Vec<(String, u64)>,
@@ -870,6 +914,10 @@ struct StepPacer {
     depth: usize,
     taken: u64,
     waited: u64,
+    /// Under the adaptive commit (lloom #735): the steps each queued buffer
+    /// holds, and their sum — the bound is then in steps, not buffers.
+    sizes: std::collections::VecDeque<usize>,
+    queued_steps: usize,
 }
 
 impl StepPacer {
@@ -881,7 +929,28 @@ impl StepPacer {
             depth,
             taken: 0,
             waited: 0,
+            sizes: std::collections::VecDeque::with_capacity(depth),
+            queued_steps: 0,
         }
+    }
+
+    /// The adaptive commit's bound: wait while the steps queued in incomplete
+    /// buffers reach `max_queued`, retiring the oldest buffer each time.
+    fn before_forward_bounded(&mut self, device: &Device, max_queued: usize) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = device {
+            while self.queued_steps >= max_queued && !self.markers.is_empty() {
+                let oldest = self.markers.pop_front().expect("non-empty");
+                let steps = self.sizes.pop_front().unwrap_or(1);
+                if !m.marker_complete(&oldest) {
+                    self.waited += 1;
+                }
+                m.wait_marker(&oldest)?;
+                self.queued_steps = self.queued_steps.saturating_sub(steps);
+            }
+        }
+        let _ = (device, max_queued);
+        Ok(())
     }
 
     /// Set the in-flight bound. Used to run the **prefill** at a different
@@ -919,8 +988,65 @@ impl StepPacer {
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
             self.markers.push_back(m.flush_marker()?);
+            // One forward per marker on this path; the size keeps `sizes`
+            // aligned with `markers` for a loop that mixes both (the prefill
+            // marks per forward, the adaptive commit per buffer).
+            self.sizes.push_back(1);
+            self.queued_steps += 1;
             self.taken += 1;
         }
+        let _ = device;
+        Ok(())
+    }
+
+    /// Take a marker the adaptive commit produced (lloom #735): the bound is
+    /// then in buffers, each holding as many steps as the GPU let the host
+    /// encode.
+    fn push(&mut self, marker: PacerMarker, steps: usize) {
+        #[cfg(feature = "metal")]
+        {
+            self.markers.push_back(marker);
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = marker;
+        self.sizes.push_back(steps);
+        self.queued_steps += steps;
+        self.taken += 1;
+    }
+}
+
+#[cfg(feature = "metal")]
+type PacerMarker = lloom_tensor::metal_backend::CommandMarker;
+#[cfg(not(feature = "metal"))]
+type PacerMarker = ();
+
+/// The adaptive commit's two primitives; `None` / `()` off Metal, where the
+/// ring arms `adaptive_commit` requires do not exist.
+fn device_flush_marker_if_started(device: &Device) -> Result<Option<PacerMarker>> {
+    #[cfg(feature = "metal")]
+    {
+        if let Device::Metal(m) = device {
+            return m.flush_marker_if_started();
+        }
+        Ok(None)
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = device;
+        Ok(None)
+    }
+}
+
+fn device_flush_marker(device: &Device) -> Result<PacerMarker> {
+    #[cfg(feature = "metal")]
+    {
+        if let Device::Metal(m) = device {
+            return m.flush_marker();
+        }
+        lloom_tensor::bail!("adaptive_commit: not a Metal device")
+    }
+    #[cfg(not(feature = "metal"))]
+    {
         let _ = device;
         Ok(())
     }
@@ -1002,6 +1128,29 @@ impl<'m, M: CausalLM> Session<'m, M> {
                  overrun past an EOS is bounded at one forward only for lookahead <= 1",
                 opts.lookahead
             );
+        }
+        if opts.adaptive_commit {
+            if !opts.stream_via_reader {
+                lloom_tensor::bail!(
+                    "Session::decode: adaptive_commit needs stream_via_reader — the drain is \
+                     the reader's, per token; the loop's own drain rides commits it no longer makes"
+                );
+            }
+            if opts.lookahead != 1 {
+                lloom_tensor::bail!(
+                    "Session::decode: adaptive_commit needs lookahead 1 (got {}): the loop \
+                     encodes the next forward before anything is read back",
+                    opts.lookahead
+                );
+            }
+            if matches!(readback.eos_read_arm(), "poll" | "flag" | "host") {
+                lloom_tensor::bail!(
+                    "Session::decode: adaptive_commit on the `{}` EOS arm would wait per step on \
+                     a stamp inside an uncommitted buffer; use a deferred arm (`drain`, \
+                     `gpubatch`, `gpubatch-nonblocking`)",
+                    readback.eos_read_arm()
+                );
+            }
         }
         if opts.lookahead > 0 && !readback.admits_lookahead() {
             lloom_tensor::bail!(
@@ -1124,7 +1273,18 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // interior cut a step at most) and the default (50) is restored when
         // the loop ends. Without a lookahead the default is the overlap and
         // stays (`Device::pipelined_cut_period`; lloom #715).
-        let _pipelined_period = (opts.lookahead >= 1).then(|| device.pipelined_cut_period());
+        let _pipelined_period = if opts.adaptive_commit {
+            // Only the loop cuts: no counter cut inside a step or across them.
+            Some(device.cut_period_hold(usize::MAX))
+        } else {
+            (opts.lookahead >= 1).then(|| device.pipelined_cut_period())
+        };
+        let run_ahead = if opts.run_ahead == 0 {
+            8
+        } else {
+            opts.run_ahead
+        };
+        let mut steps_open = 0usize;
 
         loop {
             if opts.reached(produced) {
@@ -1134,6 +1294,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // and command buffers are released here instead of never (the
             // release loop leaked ~200 autoreleased objects a token with no
             // pool on the thread -- `AutoreleaseScope` docs).
+            if let Some(stop) = &opts.stop {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    stats.stopped_by_flag = true;
+                    break;
+                }
+            }
             let _pool = lloom_tensor::AutoreleaseScope::new();
             stats.steps += 1;
             // Under `CANDLE_METAL_PROFILE=1` only: tell the profile recorder
@@ -1175,6 +1341,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let sample_start = (timed || opts.sample_split).then(std::time::Instant::now);
 
             let feed = readback.sample_and_feed(sampler, &logits)?;
+            if opts.adaptive_commit {
+                // The reader drains on the stamp: the deferred arms write it
+                // only at commits, so under the adaptive commit it rides every
+                // step — HERE, before the next forward is encoded, so token g
+                // is readable as soon as its argmax has run, not after
+                // forward g+1 (one blit, as the poll arm's stamp is).
+                readback.publish_marker(true)?;
+            }
             produced += 1;
             // A step whose commit is due below closes a drain window: let the
             // strategy enqueue what that drain will read BEFORE the lookahead
@@ -1269,7 +1443,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // hot-path noise. Gated behind `traced`, so the steady path takes
                 // NONE; the one clock read it still needs is `step_ns` (the median).
                 let t_sample = sample_start.map_or(0, |s| s.elapsed().as_nanos() as u64);
-                if pace {
+                if opts.adaptive_commit {
+                    // Steps queued in incomplete buffers, not buffers: two
+                    // run-ahead windows deep, so one is running while the
+                    // other waits and the host is never the one being waited on.
+                    pacer.before_forward_bounded(&device, 2 * run_ahead)?;
+                } else if pace {
                     pacer.before_forward(&device)?;
                 }
                 let t = timed.then(std::time::Instant::now);
@@ -1288,7 +1467,27 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // unbounded counter-spin `apply_backpressure` livelocked on.
                 // `backpressure_ns` reports what that bound cost this step.
                 let t = timed.then(std::time::Instant::now);
-                if pace {
+                if opts.adaptive_commit {
+                    // The adaptive commit: close the buffer when the queue is
+                    // down to the running one, or at the run-ahead bound.
+                    steps_open += 1;
+                    let marker = match device_flush_marker_if_started(&device)? {
+                        Some(m) => {
+                            stats.adaptive_commits += 1;
+                            Some(m)
+                        }
+                        None if steps_open >= run_ahead => {
+                            stats.run_ahead_closes += 1;
+                            Some(device_flush_marker(&device)?)
+                        }
+                        None => None,
+                    };
+                    if let Some(m) = marker {
+                        stats.max_steps_per_buffer = stats.max_steps_per_buffer.max(steps_open);
+                        pacer.push(m, steps_open);
+                        steps_open = 0;
+                    }
+                } else if pace {
                     pacer.after_forward(&device)?;
                 }
                 let t_backpressure = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
@@ -1333,7 +1532,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // every step, so the ramp is a no-op there.
             let in_ttft_ramp = produced <= opts.budget.period();
             let mut committed_now = committed_this_step;
-            if loop_commits && !committed_this_step {
+            if loop_commits && !committed_this_step && !opts.adaptive_commit {
                 since_commit += 1;
                 if in_ttft_ramp || opts.budget.due(since_commit) {
                     // The completion marker for the window closing here, encoded
@@ -1450,6 +1649,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // the stream). The count/EOS are authoritative from the loop.
             all_ids = readback.drain_all()?;
             all_ids.truncate(produced);
+            // The reader stopped the run at an EOS it saw: the ids past it are
+            // the overrun (forwards already queued), reconciled below from the
+            // cache position as on every deferred arm.
+            if stats.stopped_by_flag {
+                if let Some(k) = readback.eos_in_drained(&all_ids) {
+                    readback.note_eos_truncation(all_ids.len() - k - 1);
+                    all_ids.truncate(k);
+                    produced = all_ids.len();
+                    eos = true;
+                }
+            }
         } else {
             // After the clock: EVERY id not yet drained — `drain_all`, not the
             // incremental `take_ids`, because the poll arm may still have the last

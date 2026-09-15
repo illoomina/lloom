@@ -1022,6 +1022,38 @@ impl Commands {
     }
 
     /// Whether the marker's buffer has already retired, without waiting.
+    /// Close and commit the open buffer **only when the queue is down to the
+    /// buffer the GPU is running** — the adaptive commit (lloom #735): refill
+    /// the queue the moment nothing is waiting behind the running buffer, and
+    /// never cut while a committed buffer is still queued. So a buffer holds
+    /// however many dispatches the host encoded while the GPU ran the previous
+    /// one, and the loop commits on no cadence of its own. `Scheduled` is not
+    /// the signal: an in-order queue schedules a buffer the moment it is
+    /// committed; "running" is the last buffer that is not yet `Completed`.
+    /// `None` when there is nothing encoded or more than one committed buffer
+    /// is still incomplete; the marker otherwise.
+    pub fn flush_marker_if_started(&self) -> Result<Option<CommandMarker>, MetalKernelError> {
+        if self.compute_count.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
+        let mut state = self.state.lock();
+        let incomplete = state
+            .in_flight
+            .iter()
+            .filter(|cb| cb.status() != MTLCommandBufferStatus::Completed)
+            .count();
+        if incomplete > 1 {
+            return Ok(None);
+        }
+        let signalled = self.commit_swap_locked(&mut state, 0)?;
+        let cb = state.in_flight.last().cloned().ok_or_else(|| {
+            MetalKernelError::CommandBufferError(
+                "flush_marker_if_started: commit_swap_locked left no buffer in flight".to_string(),
+            )
+        })?;
+        Ok(Some(CommandMarker { cb, signalled }))
+    }
+
     pub fn marker_complete(&self, marker: &CommandMarker) -> bool {
         marker.cb.status() == MTLCommandBufferStatus::Completed
     }

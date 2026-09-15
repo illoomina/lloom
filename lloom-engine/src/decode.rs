@@ -487,7 +487,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     prefill_schedule: None,
                     prefill_bulk: 0,
                     prefill_pacer_depth: 0,
+                    pass_widths: lloom::nn::PassWidths::Lru,
                     stream_via_reader: false,
+                    adaptive_commit: false,
+                    run_ahead: 0,
+                    stop: None,
                     prefill_tile: 0,
                     prefill_chunk: 0,
                 };

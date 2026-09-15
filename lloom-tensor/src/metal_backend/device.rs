@@ -796,6 +796,14 @@ impl MetalDevice {
         self.commands.marker_complete(marker)
     }
 
+    /// The adaptive commit (lloom #735): see `Commands::flush_marker_if_started`.
+    pub fn flush_marker_if_started(&self) -> Result<Option<CommandMarker>> {
+        Ok(self
+            .commands
+            .flush_marker_if_started()
+            .map_err(MetalError::from)?)
+    }
+
     /// Wait on `marker`'s buffer only — later commits keep running — then
     /// return completed buffers to their pools, as every wait here does.
     pub fn wait_marker(&self, marker: &CommandMarker) -> Result<()> {

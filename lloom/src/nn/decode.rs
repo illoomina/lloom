@@ -42,7 +42,8 @@ use crate::generation::{
     CommitBudget, HotThread, HotThreadReport, LogitsProcessor, ReadbackCounters, ReadbackStrategy,
     Sampling,
 };
-use crate::nn::model::{BatchedCausalLM, CacheReset, CausalLM, RaggedRow, Row};
+use crate::nn::batched::BatchDecoder;
+use crate::nn::model::{BatchedCausalLM, CacheReset, CausalLM};
 use crate::nn::speculator::{
     readbacks, Anchor, Draft, NoProbe, Probes, RoundProbe, RoundTiming, SeqId, Session, Speculator,
     TargetProbe,
@@ -205,7 +206,10 @@ pub struct DecodeOptions {
     pub run_ahead: usize,
     /// Under `adaptive_commit`: a flag the reader thread raises when it has
     /// seen EOS (`RingReader::ended`); the loop stops encoding at the next
-    /// step and reconciles the overrun. `None` runs to `max_tokens`.
+    /// step and reconciles the overrun. `None` runs to `max_tokens`. Also
+    /// read by [`Session::decode_speculative`] between rounds as a caller's
+    /// cancellation: a raised flag ends the run after the round in flight,
+    /// with the sequence's bookkeeping intact.
     pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Under `adaptive_commit`: the EOS gate (lloom #735 step 4,
     /// `Device::eos_gate_begin`). The decode kernels run in a variant that
@@ -623,31 +627,6 @@ struct Lane<P> {
     done: bool,
 }
 
-/// One sequence's cursor through [`Session::decode_batched`].
-struct BatchLane {
-    produced: usize,
-    eos: bool,
-    done: bool,
-    all_ids: Vec<u32>,
-    pos_before: usize,
-    prompt_len: usize,
-    /// The logits after the last fed token, when the row ended with every
-    /// returned id fed (the lookahead arm at `max_tokens`).
-    last_logits: Option<Tensor>,
-    stats: DecodeStats,
-    /// The step this row's prompt may start being fed (its arrival); `0` is
-    /// the run's start.
-    arrival: u64,
-    /// Prompt tokens fed so far; the row joins the batch once this reaches
-    /// `prompt_len` (or at once, on a resume with held logits).
-    prompt_off: usize,
-    /// Whether the row has joined the batch — its logits are in `logits`.
-    joined: bool,
-    /// The wall clock when the row's first prompt chunk was fed, for
-    /// `stats.prefill_ns` (the submit time from the first chunk to the last).
-    prefill_start: Option<std::time::Instant>,
-}
-
 /// Commit without waiting and prune the in-flight queue, on the backends that
 /// have one. `None` where there is no queue to prune — a CPU run reports no
 /// count, which is honest rather than zero (§14.1).
@@ -658,7 +637,7 @@ struct BatchLane {
 /// step's or round's last dispatch, so the window an ICB executor records is
 /// one whole step and the same shape every time (`icb::IcbExecutor::end_step`).
 /// A no-op with no executor installed, and off Metal.
-fn end_executor_step(device: &Device) -> Result<()> {
+pub(crate) fn end_executor_step(device: &Device) -> Result<()> {
     #[cfg(feature = "metal")]
     if let Device::Metal(m) = device {
         m.end_executor_step()?;
@@ -1853,7 +1832,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// the device serves activations from the pool only, the held buffer is
     /// its own and is returned as is (`DESIGN.md` §9.2aa, escapes are
     /// declared).
-    fn hold_logits(&mut self, logits: Tensor) -> Result<Tensor> {
+    pub(crate) fn hold_logits(&mut self, logits: Tensor) -> Result<Tensor> {
         if !activations_may_be_reused(logits.device()) {
             return Ok(logits);
         }
@@ -2250,7 +2229,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // by the accepted length each round (`lfm2-dspark-verify`'s `index_pos`).
         let mut since_commit = 0usize;
 
-        while !eos && !opts.reached(produced) {
+        let stopped = |opts: &DecodeOptions| {
+            opts.stop
+                .as_ref()
+                .map(|f| f.load(std::sync::atomic::Ordering::Acquire))
+                .unwrap_or(false)
+        };
+        while !eos && !opts.reached(produced) && !stopped(opts) {
             let _pool = lloom_tensor::AutoreleaseScope::new(); // per window, see the decode loop
             stats.steps += 1;
             let step_start = std::time::Instant::now();
@@ -2819,504 +2804,42 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 arrivals.len()
             );
         }
-        if eos_ids.is_empty() {
-            lloom_tensor::bail!(
-                "decode_batched: eos_ids is empty, so the loop would never terminate"
-            );
-        }
-        if opts.lookahead > 1 {
-            lloom_tensor::bail!(
-                "decode_batched: lookahead {} — a row runs at most one forward past its end",
-                opts.lookahead
-            );
-        }
         if sampler.sampling() != &Sampling::ArgMax {
             lloom_tensor::bail!(
                 "decode_batched: the batch is sampled on the device in one argmax; {:?} needs a \
-                 per-row host sample this body does not take",
+                 per-row host sample this body does not take (admit rows with their own \
+                 samplers through `BatchDecoder` for that)",
                 sampler.sampling()
             );
         }
-        for (i, s) in sessions.iter().enumerate() {
-            if s.seq.overrun > 0 {
-                lloom_tensor::bail!(
-                    "decode_batched: sequence {i}'s cache is {} positions past its last token (an \
-                     earlier run's overrun); `Session::reconcile` or `Session::reset` first",
-                    s.seq.overrun
-                );
-            }
-            if prompts[i].is_empty() && s.seq.last_logits.is_none() {
-                lloom_tensor::bail!(
-                    "decode_batched: sequence {i} has an empty prompt and no held logits to resume from"
-                );
-            }
+        // The closed batch is the open decoder with every row admitted up
+        // front at its arrival step, stepped until nothing is live or pending
+        // (`nn::batched::BatchDecoder`). A slot index is the row's index.
+        let mut decoder: BatchDecoder<'m, M, &mut Self> =
+            BatchDecoder::new(opts.clone(), eos_ids, device.clone())?;
+        let mut ids = Vec::with_capacity(n);
+        for (i, s) in sessions.iter_mut().enumerate() {
+            let id = decoder
+                .admit_at(s, prompts[i].to_vec(), Sampling::ArgMax, 0, arrivals[i])
+                .map_err(|e| lloom_tensor::Error::msg(format!("sequence {i}: {e}")))?;
+            debug_assert_eq!(id.slot(), i);
+            ids.push(id);
         }
-        let run_start = std::time::Instant::now();
-        let hot_thread = HotThread::claim();
-
-        let mut lanes: Vec<BatchLane> = (0..n)
-            .map(|i| BatchLane {
-                produced: 0,
-                eos: false,
-                done: opts.max_tokens == 0,
-                all_ids: Vec::with_capacity(opts.max_tokens),
-                pos_before: sessions[i].seq.pos,
-                prompt_len: prompts[i].len(),
-                last_logits: None,
-                stats: DecodeStats {
-                    step_ns: Vec::with_capacity(opts.max_tokens),
-                    hot_thread: hot_thread.report(),
-                    ..DecodeStats::default()
-                },
-                arrival: arrivals[i],
-                prompt_off: 0,
-                joined: false,
-                prefill_start: None,
+        while !decoder.is_idle() {
+            decoder.step(&mut |row, toks| on_tokens(row.slot(), toks))?;
+        }
+        let mut outs: Vec<Option<DecodeOut>> = (0..n).map(|_| None).collect();
+        for (id, _session, out) in decoder.take_finished() {
+            outs[id.slot()] = Some(out);
+        }
+        outs.into_iter()
+            .enumerate()
+            .map(|(i, o)| {
+                o.ok_or_else(|| {
+                    lloom_tensor::Error::msg(format!("decode_batched: row {i} never retired"))
+                })
             })
-            .collect();
-
-        // The live rows, in the order the logits' rows are in; `logits` is
-        // `[live.len(), vocab]` (unset while nothing is live).
-        let mut live: Vec<usize> = Vec::with_capacity(n);
-        let mut logits: Option<Tensor> = None;
-        let mut step: u64 = 0;
-
-        // Without a chunk budget an arrived row's whole remaining prompt is
-        // fed at its arrival step, before that step's decode is encoded (the
-        // tile still bounds each forward). Returns the rows that completed
-        // their prompt, with their logits, in row order.
-        let admit_whole = |sessions: &mut [Self],
-                           lanes: &mut [BatchLane],
-                           step: u64|
-         -> Result<Vec<(usize, Tensor)>> {
-            let mut joined = Vec::new();
-            for i in 0..n {
-                let lane = &mut lanes[i];
-                if lane.joined || lane.arrival > step {
-                    continue;
-                }
-                let s = &mut sessions[i];
-                let prompt = prompts[i];
-                if prompt.is_empty() {
-                    // A resume: the held logits are the row's state.
-                    let held = s.seq.last_logits.take().expect("checked at entry");
-                    lane.joined = true;
-                    joined.push((i, held.unsqueeze(0)?));
-                    continue;
-                }
-                let start = std::time::Instant::now();
-                let mut last = None;
-                let mut off = 0usize;
-                for w in tile_widths(vec![prompt.len()], opts.prefill_tile) {
-                    let _pool = lloom_tensor::AutoreleaseScope::new();
-                    let unit = &prompt[off..off + w];
-                    let input = Tensor::new(unit, device)?.unsqueeze(0)?;
-                    s.model.prepare_pass(&mut s.seq.cache, w)?;
-                    begin_pass(
-                        device,
-                        PassShape::Prefill {
-                            w,
-                            fresh: s.seq.pos == 0,
-                        },
-                    )?;
-                    let out = s.model.forward(&input, s.seq.pos, &mut s.seq.cache);
-                    end_pass(device)?;
-                    last = Some(out?);
-                    s.seq.pos += w;
-                    s.seq.tokens.extend_from_slice(unit);
-                    off += w;
-                    lane.stats.prefill_units += 1;
-                }
-                lane.prompt_off = prompt.len();
-                lane.stats.prefill_ns = start.elapsed().as_nanos() as u64;
-                lane.joined = true;
-                joined.push((i, last.expect("a non-empty prompt steps at least once")));
-            }
-            Ok(joined)
-        };
-
-        // With a chunk budget: the prompt PIECES this step feeds — at most
-        // `prefill_chunk` tokens over the arrived rows still pending, in row
-        // order, each piece bounded by the tile — chosen here and fed INSIDE
-        // the step's batched forward as extra ragged rows, so they ride the
-        // live rows' weight sweep. Resumed rows (held logits) join at once.
-        // Returns `(pieces as (row, offset, len), resumed rows)`.
-        let select_pieces =
-            |lanes: &mut [BatchLane], step: u64| -> (Vec<(usize, usize, usize)>, Vec<usize>) {
-                let mut pieces = Vec::new();
-                let mut resumed = Vec::new();
-                let mut budget_left = opts.prefill_chunk;
-                for i in 0..n {
-                    if budget_left == 0 {
-                        break;
-                    }
-                    let lane = &mut lanes[i];
-                    if lane.joined || lane.arrival > step {
-                        continue;
-                    }
-                    if prompts[i].is_empty() {
-                        lane.joined = true;
-                        resumed.push(i);
-                        continue;
-                    }
-                    lane.prefill_start
-                        .get_or_insert_with(std::time::Instant::now);
-                    let remaining = prompts[i].len() - lane.prompt_off;
-                    let mut take = remaining.min(budget_left);
-                    if opts.prefill_tile > 0 {
-                        take = take.min(opts.prefill_tile);
-                    }
-                    if opts.pass_widths == PassWidths::Ladder {
-                        let top = if opts.prefill_tile > 0 {
-                            opts.prefill_tile.min(opts.prefill_chunk)
-                        } else {
-                            opts.prefill_chunk
-                        };
-                        take = ladder_width(take, top);
-                    }
-                    pieces.push((i, lane.prompt_off, take));
-                    budget_left -= take;
-                }
-                (pieces, resumed)
-            };
-
-        // The pieces' tokens, in piece order, for the ragged input.
-        let piece_tokens = |pieces: &[(usize, usize, usize)]| -> Vec<u32> {
-            let mut v = Vec::with_capacity(pieces.iter().map(|p| p.2).sum());
-            for &(i, off, take) in pieces {
-                v.extend_from_slice(&prompts[i][off..off + take]);
-            }
-            v
-        };
-
-        loop {
-            let _pool = lloom_tensor::AutoreleaseScope::new(); // per batched step, see the decode loop
-            let pending = (0..n).any(|i| !lanes[i].joined);
-            if live.is_empty() && !pending {
-                break;
-            }
-            let step_start = std::time::Instant::now();
-            let b = live.len();
-            let mut joined = if opts.prefill_chunk == 0 {
-                admit_whole(sessions, &mut lanes, step)?
-            } else {
-                Vec::new()
-            };
-            let (pieces, resumed) = if opts.prefill_chunk > 0 {
-                select_pieces(&mut lanes, step)
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            for i in resumed {
-                let held = sessions[i]
-                    .seq
-                    .last_logits
-                    .take()
-                    .expect("checked at entry");
-                joined.push((i, held.unsqueeze(0)?));
-            }
-            for &i in &live {
-                lanes[i].stats.steps += 1;
-                lanes[i].stats.batch_rows.push(b);
-            }
-            // One argmax over `[B, vocab]`: the ids stay on the device.
-            let ids = match &logits {
-                Some(l) if b > 0 => Some(sampler.sample_argmax_on_device(l)?),
-                _ => None,
-            };
-
-            // `piece_logits` is `[pieces, vocab]` once the pieces have been
-            // fed — by the step's forward (the lookahead arm feeds them with
-            // the live rows' next tokens; the blocking arm with the kept
-            // rows' after the readback) or alone when nothing is live.
-            let mut piece_logits: Option<Tensor> = None;
-            let (host_ids, next_logits) = match (&ids, opts.lookahead) {
-                (None, _) => {
-                    if !pieces.is_empty() {
-                        let toks = piece_tokens(&pieces);
-                        let input = Tensor::new(toks.as_slice(), device)?.unsqueeze(0)?;
-                        piece_logits =
-                            Some(Self::forward_ragged_live(sessions, &[], &pieces, &input)?);
-                    }
-                    (Vec::new(), None)
-                }
-                (Some(ids), 0) => {
-                    // Learn first, then feed: the readback waits on the queue's
-                    // tail, which is exactly this step's argmax.
-                    (ids.to_vec1::<u32>()?, None)
-                }
-                (Some(ids), _) => {
-                    // Stage the readback BEFORE the next forward is encoded, so
-                    // the wait is on the argmax's command buffer and not on the
-                    // forward queued behind it; then feed the device ids — and
-                    // the pieces with them, as extra rows of the same forward.
-                    let staged = ids.stage_read()?;
-                    let next = if pieces.is_empty() {
-                        let input = ids.reshape((b, 1))?;
-                        Self::forward_live(sessions, &live, &input)?
-                    } else {
-                        let toks = piece_tokens(&pieces);
-                        let input = Tensor::cat(&[ids, &Tensor::new(toks.as_slice(), device)?], 0)?
-                            .unsqueeze(0)?;
-                        let all = Self::forward_ragged_live(sessions, &live, &pieces, &input)?;
-                        piece_logits = Some(all.narrow(0, b, pieces.len())?);
-                        all.narrow(0, 0, b)?
-                    };
-                    for &i in &live {
-                        lanes[i].stats.commits += 1;
-                    }
-                    (staged.to_vec1::<u32>()?, Some(next))
-                }
-            };
-            if host_ids.len() != b {
-                lloom_tensor::bail!(
-                    "decode_batched: {} ids read back for {b} live rows",
-                    host_ids.len()
-                );
-            }
-
-            // Stream and retire. An EOS is not streamed and ends its row; a
-            // row reaching `max_tokens` ends after its token is streamed.
-            for (k, &i) in live.iter().enumerate() {
-                let id = host_ids[k];
-                let lane = &mut lanes[i];
-                if eos_ids.contains(&id) {
-                    lane.eos = true;
-                    lane.done = true;
-                    continue;
-                }
-                on_tokens(i, std::slice::from_ref(&id))?;
-                lane.all_ids.push(id);
-                lane.produced += 1;
-                if lane.produced >= opts.max_tokens {
-                    lane.done = true;
-                    // Under the lookahead this row's last token was fed, so
-                    // the logits after it exist and are the state a
-                    // continuation resumes from.
-                    if let Some(next) = &next_logits {
-                        let row = next.narrow(0, k, 1)?.squeeze(0)?;
-                        lane.last_logits = Some(sessions[i].hold_logits(row)?);
-                    }
-                }
-            }
-            let step_ns = step_start.elapsed().as_nanos() as u64;
-            for &i in &live {
-                lanes[i].stats.step_ns.push(step_ns);
-            }
-
-            let kept: Vec<usize> = live.iter().copied().filter(|&i| !lanes[i].done).collect();
-            let kept_logits = match next_logits {
-                // The forward already ran for every row that was live; keep
-                // the rows still live, in their order.
-                Some(next) if kept.len() == live.len() => Some(next),
-                Some(_) if kept.is_empty() => None,
-                Some(next) => {
-                    let keep: Vec<u32> = live
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, i)| !lanes[**i].done)
-                        .map(|(k, _)| k as u32)
-                        .collect();
-                    Some(next.index_select(&Tensor::new(keep.as_slice(), device)?, 0)?)
-                }
-                None if kept.is_empty() && pieces.is_empty() => None,
-                None => {
-                    // Blocking arm: feed the ids the host just read, kept rows
-                    // only — and the pieces with them, in one forward.
-                    let mut next_ids: Vec<u32> = live
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, i)| !lanes[**i].done)
-                        .map(|(k, _)| host_ids[k])
-                        .collect();
-                    if pieces.is_empty() {
-                        let input =
-                            Tensor::new(next_ids.as_slice(), device)?.reshape((kept.len(), 1))?;
-                        Some(Self::forward_live(sessions, &kept, &input)?)
-                    } else if b > 0 {
-                        next_ids.extend(piece_tokens(&pieces));
-                        let input = Tensor::new(next_ids.as_slice(), device)?.unsqueeze(0)?;
-                        let all = Self::forward_ragged_live(sessions, &kept, &pieces, &input)?;
-                        piece_logits = Some(all.narrow(0, kept.len(), pieces.len())?);
-                        if kept.is_empty() {
-                            None
-                        } else {
-                            Some(all.narrow(0, 0, kept.len())?)
-                        }
-                    } else {
-                        // `b == 0`: the pieces were fed above, alone.
-                        None
-                    }
-                }
-            };
-            // The pieces are fed: advance the rows' logs, and join the rows
-            // whose prompt is complete with the piece's logits.
-            for (j, &(i, off, take)) in pieces.iter().enumerate() {
-                let lane = &mut lanes[i];
-                sessions[i]
-                    .seq
-                    .tokens
-                    .extend_from_slice(&prompts[i][off..off + take]);
-                lane.prompt_off += take;
-                lane.stats.prefill_units += 1;
-                if let Some(start) = lane.prefill_start {
-                    lane.stats.prefill_ns = start.elapsed().as_nanos() as u64;
-                }
-                if lane.prompt_off == prompts[i].len() {
-                    lane.joined = true;
-                    let pl = piece_logits.as_ref().expect("a fed piece has logits");
-                    joined.push((i, pl.narrow(0, j, 1)?));
-                }
-            }
-            end_executor_step(device)?;
-
-            // Next step's rows: the kept rows, then the rows that joined this
-            // step, each with its own logits row. A row joining with `done`
-            // already set (`max_tokens == 0`) is retired at once.
-            let mut next_live = kept;
-            let mut rows: Vec<Tensor> = Vec::with_capacity(next_live.len() + joined.len());
-            if let Some(l) = kept_logits {
-                rows.push(l);
-            }
-            for (i, l) in joined {
-                if lanes[i].done {
-                    continue;
-                }
-                next_live.push(i);
-                rows.push(l);
-            }
-            logits = match rows.len() {
-                0 => None,
-                1 => Some(rows.remove(0)),
-                _ => Some(Tensor::cat(&rows, 0)?),
-            };
-            live = next_live;
-            step += 1;
-        }
-
-        // Per-sequence bookkeeping, as the other bodies: the fed ids are the
-        // stream's prefix of the cache's length, anything fed past the
-        // stream is overrun.
-        let mut outs = Vec::with_capacity(n);
-        for (i, lane) in lanes.into_iter().enumerate() {
-            let s = &mut sessions[i];
-            let fed = s.seq.pos - lane.pos_before - lane.prompt_len;
-            let in_cache = fed.min(lane.produced);
-            s.seq.tokens.extend_from_slice(&lane.all_ids[..in_cache]);
-            let overrun = fed - in_cache;
-            s.seq.overrun = overrun;
-            s.seq.last_logits = if overrun == 0 { lane.last_logits } else { None };
-            let mut stats = lane.stats;
-            stats.overrun = overrun;
-            stats.produced = lane.produced;
-            outs.push(DecodeOut {
-                ids: lane.all_ids,
-                eos: lane.eos,
-                stats,
-            });
-        }
-        let _ = run_start;
-        Ok(outs)
-    }
-
-    /// One RAGGED batched forward: the sessions named by `live` as one-token
-    /// rows (their next token each), then `pieces` as `(row, offset, len)`
-    /// prompt pieces, in that order — `input` is `[1, T]` laid out the same
-    /// way. Returns `[live + pieces, vocab]` and advances every row's
-    /// position by what it fed. A session may appear once across both lists.
-    fn forward_ragged_live(
-        sessions: &mut [Self],
-        live: &[usize],
-        pieces: &[(usize, usize, usize)],
-        input: &Tensor,
-    ) -> Result<Tensor>
-    where
-        M: BatchedCausalLM,
-    {
-        let model = sessions[0].model;
-        let mut slots: Vec<Option<&mut Self>> = sessions.iter_mut().map(Some).collect();
-        let mut picked: Vec<(&mut Self, usize)> = Vec::with_capacity(live.len() + pieces.len());
-        for &i in live {
-            match slots[i].take() {
-                Some(s) => picked.push((s, 1)),
-                None => lloom_tensor::bail!("decode_batched: row {i} appears twice in a step"),
-            }
-        }
-        for &(i, _, take) in pieces {
-            match slots[i].take() {
-                Some(s) => picked.push((s, take)),
-                None => lloom_tensor::bail!("decode_batched: row {i} appears twice in a step"),
-            }
-        }
-        // Session grows (a KV bucket) before the bracket, per row at its
-        // own width, so the planned pass allocates nothing that outlives it.
-        for (s, len) in picked.iter_mut() {
-            model.prepare_pass(&mut s.seq.cache, *len)?;
-        }
-        let shape = PassShape::Ragged {
-            live: live.len() as u16,
-            pieces: pieces.len() as u16,
-            layout: ragged_layout(
-                picked[live.len()..]
-                    .iter()
-                    .map(|(s, len)| (*len, s.seq.pos == 0)),
-            ),
-        };
-        let mut rows: Vec<RaggedRow<'_, M::Cache>> = picked
-            .iter_mut()
-            .map(|(s, len)| RaggedRow {
-                pos: s.seq.pos,
-                len: *len,
-                cache: &mut s.seq.cache,
-            })
-            .collect();
-        begin_pass(input.device(), shape)?;
-        let logits = model.forward_ragged(input, &mut rows)?;
-        end_pass(input.device())?;
-        drop(rows);
-        for (s, len) in picked {
-            s.seq.pos += len;
-        }
-        Ok(logits)
-    }
-
-    /// One batched forward over the sessions named by `live`, in that order,
-    /// advancing each one's position.
-    fn forward_live(sessions: &mut [Self], live: &[usize], input: &Tensor) -> Result<Tensor>
-    where
-        M: BatchedCausalLM,
-    {
-        let model = sessions[0].model;
-        // Disjoint `&mut` borrows of the live sessions, in `live`'s order: the
-        // indices are distinct by construction (each row is live at most once).
-        let mut slots: Vec<Option<&mut Self>> = sessions.iter_mut().map(Some).collect();
-        let mut picked: Vec<&mut Self> = Vec::with_capacity(live.len());
-        for &i in live {
-            match slots[i].take() {
-                Some(s) => picked.push(s),
-                None => {
-                    lloom_tensor::bail!("decode_batched: row {i} appears twice in the live set")
-                }
-            }
-        }
-        for s in picked.iter_mut() {
-            model.prepare_pass(&mut s.seq.cache, 1)?;
-        }
-        let mut rows: Vec<Row<'_, M::Cache>> = picked
-            .iter_mut()
-            .map(|s| Row {
-                pos: s.seq.pos,
-                cache: &mut s.seq.cache,
-            })
-            .collect();
-        begin_pass(input.device(), PassShape::Decode { b: live.len() })?;
-        let logits = model.forward_rows(input, &mut rows)?;
-        end_pass(input.device())?;
-        drop(rows);
-        for s in picked {
-            s.seq.pos += 1;
-        }
-        Ok(logits)
+            .collect()
     }
 
     /// Compile the Metal pipelines the first real forward would otherwise
@@ -3543,7 +3066,7 @@ fn prefill_widths(
 /// is split into sequential forwards of `tile` tokens and a narrower last
 /// one, so no forward is wider than the tile. `0` leaves the widths as they
 /// are. The total is unchanged.
-fn tile_widths(widths: Vec<usize>, tile: usize) -> Vec<usize> {
+pub(crate) fn tile_widths(widths: Vec<usize>, tile: usize) -> Vec<usize> {
     if tile == 0 {
         return widths;
     }

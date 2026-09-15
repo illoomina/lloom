@@ -65,6 +65,22 @@ pub enum ReadbackArm {
         /// Steps between commits of the in-flight queue; `1` is per-token.
         commit_steps: usize,
     },
+    /// The speculative body ([`Session::decode_speculative`]): a DSpark
+    /// drafter proposes `k` tokens a round and the target verifies them in
+    /// one pass; the round's one readback is the verify's. Reported, never
+    /// selected by a request — the drafter is the process's.
+    Speculative {
+        /// The draft block width.
+        k: usize,
+    },
+    /// The batched driver (`Session::decode_batched`'s body, issue #148):
+    /// the row's token came from one device argmax over the batch (or the
+    /// per-row host sample) and a staged readback, beside `rows` other
+    /// sequences on the same weight sweep. Reported, never selected.
+    Batched {
+        /// Rows live in the batch when this one joined it.
+        rows: usize,
+    },
 }
 
 impl ReadbackArm {
@@ -105,6 +121,8 @@ impl ReadbackArm {
                 lookahead,
                 commit_steps,
             } => format!("ring-nonblocking lookahead={lookahead} commit_steps={commit_steps}"),
+            ReadbackArm::Speculative { k } => format!("dspark k={k}"),
+            ReadbackArm::Batched { rows } => format!("batched rows={rows}"),
         }
     }
 }
@@ -414,35 +432,21 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let arm = params.readback.resolve(sampler.sampling());
         let mut spec = IdentityProposer;
 
-        let mut generated: Vec<u32> = Vec::with_capacity(params.max_tokens);
-        let mut text = String::new();
-        // Start of the run of generated tokens not yet emitted as text.
-        let mut pending = 0usize;
+        let mut stream = crate::stream::TextStream::new(params.max_tokens);
         let mut stopped_on_string = false;
         let mut cancelled = false;
 
         // The streaming hook, shared by every arm: decode only the
-        // not-yet-emitted tokens (the whole sequence each step is quadratic in
-        // output length), hold a run ending mid-character, and let a stop
-        // string end the run.
+        // not-yet-emitted tokens, hold a run ending mid-character, and let a
+        // stop string end the run (`TextStream`).
         let mut on_tokens = |batch: &[u32]| -> Result<bool> {
-            generated.extend_from_slice(batch);
-            let chunk = detokenize(&generated[pending..])?;
-            if !chunk.is_empty() && !chunk.ends_with('\u{FFFD}') {
-                let go_on = on_fragment(&chunk);
-                text.push_str(&chunk);
-                pending = generated.len();
-                if !go_on {
+            if let Some(chunk) = stream.push(batch, &mut detokenize)? {
+                if !on_fragment(&chunk) {
                     cancelled = true;
                     return Ok(false);
                 }
             }
-            if !params.stop_strings.is_empty()
-                && params
-                    .stop_strings
-                    .iter()
-                    .any(|s| text.contains(s.as_str()))
-            {
+            if stream.hit_stop(&params.stop_strings) {
                 stopped_on_string = true;
                 return Ok(false);
             }
@@ -507,6 +511,12 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 )?
             }
             ReadbackArm::Auto => unreachable!("resolved above"),
+            ReadbackArm::Speculative { .. } | ReadbackArm::Batched { .. } => {
+                lloom_tensor::bail!(
+                    "DecodeSession::decode: {} is a reported arm, not a selectable one",
+                    arm.name()
+                )
+            }
         };
 
         let stop = if cancelled {
@@ -519,15 +529,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             Stop::Length
         };
 
-        // Trim anything past the earliest stop sequence.
-        if let Some(cut) = params
-            .stop_strings
-            .iter()
-            .filter_map(|s| text.find(s.as_str()))
-            .min()
-        {
-            text.truncate(cut);
-        }
+        let (text, _) = stream.finish(&params.stop_strings);
 
         Ok(Decoded {
             text,
@@ -537,6 +539,109 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
             readback: arm,
+            stats: out.stats,
+        })
+    }
+}
+
+impl<'m, M: CausalLM> DecodeSession<'m, M> {
+    /// [`Self::decode_until`] through the speculative body: `spec` drafts a
+    /// block per round and the target verifies it
+    /// ([`Session::decode_speculative`], `design/docs/speculation.md`
+    /// §10.2t). Greedy by construction — the verify accepts the target's
+    /// argmax — so a temperature on `params` is refused rather than served
+    /// as argmax under a sampled label. The fragment hook's `false` ends the
+    /// run after the round in flight (`DecodeOptions::stop`), reported as
+    /// [`Stop::Cancelled`]; a fully cached prompt cannot be resumed by this
+    /// body (its verify holds no per-position logits) and is refused, which
+    /// a caller that resets between requests never meets.
+    pub fn decode_speculative_until<S>(
+        &mut self,
+        spec: &mut S,
+        prompt_ids: &[u32],
+        mut detokenize: impl FnMut(&[u32]) -> Result<String>,
+        params: &DecodeParams,
+        mut on_fragment: impl FnMut(&str) -> bool,
+    ) -> Result<Decoded>
+    where
+        S: lloom::nn::Speculator,
+        M: lloom::nn::Probes<S::Probe>,
+        M::Cache: CacheRewind + CacheReset,
+    {
+        if params.eos_ids.is_empty() {
+            lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
+        }
+        let mut sampler = LogitsProcessor::new(params.seed, params.temperature, params.top_p);
+        if sampler.sampling() != &Sampling::ArgMax {
+            lloom_tensor::bail!(
+                "DecodeSession::decode_speculative: the speculative body decodes greedily (the \
+                 verify accepts the target's argmax); a temperature ({:?}) is refused rather \
+                 than served as argmax",
+                sampler.sampling()
+            );
+        }
+        let prepared = self.session.prepare(prompt_ids)?;
+        if prepared.suffix.is_empty() {
+            lloom_tensor::bail!(
+                "DecodeSession::decode_speculative: the prompt is entirely cached ({:?}) and the \
+                 speculative body cannot resume from held logits; reset the session first",
+                prepared.action
+            );
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut stream = crate::stream::TextStream::new(params.max_tokens);
+        let mut stopped_on_string = false;
+        let mut cancelled = false;
+        let mut on_tokens = |batch: &[u32]| -> Result<()> {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(());
+            }
+            if let Some(chunk) = stream.push(batch, &mut detokenize)? {
+                if !on_fragment(&chunk) {
+                    cancelled = true;
+                    stop.store(true, std::sync::atomic::Ordering::Release);
+                    return Ok(());
+                }
+            }
+            if stream.hit_stop(&params.stop_strings) {
+                stopped_on_string = true;
+                stop.store(true, std::sync::atomic::Ordering::Release);
+            }
+            Ok(())
+        };
+        let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+        let opts = DecodeOptions {
+            stop: Some(stop.clone()),
+            ..DecodeOptions::new(params.max_tokens)
+        };
+        let k = spec.max_draft();
+        let out = self.session.decode_speculative(
+            spec,
+            &mut readback,
+            &mut sampler,
+            &prepared.suffix,
+            &opts,
+            &params.eos_ids,
+            &mut on_tokens,
+        )?;
+        let stop_reason = if cancelled {
+            Stop::Cancelled
+        } else if stopped_on_string {
+            Stop::StopString
+        } else if out.eos {
+            Stop::Eos
+        } else {
+            Stop::Length
+        };
+        let (text, _) = stream.finish(&params.stop_strings);
+        Ok(Decoded {
+            text,
+            tokens: out.ids,
+            stop: stop_reason,
+            reuse: prepared.action,
+            reused: prepared.reused,
+            prefilled: prepared.suffix.len(),
+            readback: ReadbackArm::Speculative { k },
             stats: out.stats,
         })
     }

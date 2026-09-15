@@ -12,11 +12,16 @@
 //!   `/max_memory_usage`, `/eval` + `/eval/abort`, `/health`, `/shutdown`,
 //!   and the `{"kind":"ready",…}` marker on stdout once the model is loaded.
 //!
-//! One request at a time: the engine sits behind a mutex and the decode loop
-//! runs on the request's thread. That is the serving shape a benchmark wants —
-//! every cell measures one cold request against an idle engine — and the
-//! throughput the crown path reaches at B=1. Concurrency across requests is
-//! #694's batched forward, not this binary's.
+//! Two serving shapes (`--batch`, issue #148). At `--batch 1` the engine's
+//! one sequence sits behind a mutex and the decode loop runs on the request's
+//! thread — the shape a B=1 benchmark wants, every cell one cold request
+//! against an idle engine, at the crown path's throughput. At `--batch N`
+//! the continuous-batching scheduler runs on its own thread: requests from
+//! any number of clients join the running batch and leave it at their EOS
+//! (one `m = B` weight sweep per step for every live row), and the benchmark
+//! cells take a `batch` field to run `B` rows as one closed batch with the
+//! engine to themselves. `--dspark` runs the speculative body in either
+//! shape.
 //!
 //! Every timing this binary reports is the engine's own bracket
 //! (`DecodeStats`, or a `synchronize()`-closed window) and says which; the
@@ -27,6 +32,7 @@ mod engine;
 use anyhow::{Context, Result};
 use clap::Parser;
 use engine::{Engine, LoadOptions, NEVER_EOS};
+
 use lloom_engine::{DecodeParams, Decoded, ReadbackArm, Stop};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -109,11 +115,39 @@ struct Args {
     /// Default `max_tokens` for a request that names none.
     #[arg(long, default_value_t = 512)]
     max_tokens_default: usize,
+
+    /// The batch width: how many requests decode together, one weight sweep
+    /// per step for all of them (issue #148). `1` is the single-sequence
+    /// crown loop; `N > 1` starts the continuous-batching scheduler with `N`
+    /// sequences and lets the benchmark cells take `batch` up to `N`.
+    #[arg(long, default_value_t = 1)]
+    batch: usize,
+
+    /// Serve the speculative body (DSpark: a drafter proposes a block per
+    /// round, the target verifies it in one pass). Loads the newest
+    /// LFM2.5-2.6B-DSpark snapshot in the HF cache, or `--draft-dir`.
+    #[arg(long)]
+    dspark: bool,
+
+    /// The drafter checkpoint directory for `--dspark`.
+    #[arg(long)]
+    draft_dir: Option<PathBuf>,
+
+    /// The TILE: the most prompt tokens one prefill forward takes under
+    /// `--batch N` (lloom #728; `0` = unbounded). Default 512 at `N > 1`.
+    #[arg(long)]
+    prefill_tile: Option<usize>,
+
+    /// The CHUNK: the most prompt tokens fed per batched step for the rows
+    /// still prefilling, as extra ragged rows of the live rows' forward
+    /// (`0` = a whole prompt at its arrival). Default 512 at `N > 1`.
+    #[arg(long)]
+    prefill_chunk: Option<usize>,
 }
 
 /// State shared by every request thread.
 struct Shared {
-    engine: Mutex<Engine>,
+    engine: Engine,
     /// Sample ids an `/eval/abort` asked the running `/eval` to stop early.
     aborts: Mutex<HashSet<String>>,
     server: Server,
@@ -143,6 +177,14 @@ fn main() -> Result<()> {
             .unwrap_or_else(|_| DEFAULT_SEED_TEXT.to_string()),
     };
 
+    let batched = args.batch > 1;
+    let prefill_tile = args.prefill_tile.unwrap_or(if batched { 512 } else { 0 });
+    let prefill_chunk = args.prefill_chunk.unwrap_or(if batched { 512 } else { 0 });
+    let dspark = if args.dspark {
+        Some(args.draft_dir.clone().unwrap_or_default())
+    } else {
+        None
+    };
     let load_start = Instant::now();
     let engine = Engine::load(LoadOptions {
         model_dir: model_dir.clone(),
@@ -153,10 +195,15 @@ fn main() -> Result<()> {
         warmup: !args.no_warmup,
         seed_text,
         model_name: args.model_name.clone(),
+        batch: args.batch,
+        dspark,
+        prefill_tile,
+        prefill_chunk,
     })?;
     let model_name = engine.model_name.clone();
     eprintln!(
-        "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={}]",
+        "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} batch={} \
+         dspark={} prefill_tile={} prefill_chunk={}]",
         model_name,
         model_dir.display(),
         load_start.elapsed().as_secs_f64(),
@@ -164,6 +211,13 @@ fn main() -> Result<()> {
         args.kv_capacity,
         readback.name(),
         args.reuse_prefix,
+        args.batch,
+        engine
+            .dspark_k
+            .map(|k| format!("k={k}"))
+            .unwrap_or_else(|| "off".to_string()),
+        prefill_tile,
+        prefill_chunk,
     );
 
     let server = Server::http((args.host.as_str(), args.port))
@@ -174,7 +228,7 @@ fn main() -> Result<()> {
         _ => args.port,
     };
     let shared = Arc::new(Shared {
-        engine: Mutex::new(engine),
+        engine,
         aborts: Mutex::new(HashSet::new()),
         server,
         model_name,
@@ -231,9 +285,10 @@ fn main() -> Result<()> {
             }
         }
     }
-    // A request thread still decoding holds the engine; wait for it so the
-    // model is not dropped under a running command buffer.
-    let _engine = shared.engine.lock();
+    // A request thread still decoding holds the sequence, and the batch
+    // thread holds the pool; wait for both so the model is not dropped under
+    // a running command buffer.
+    shared.engine.shutdown();
     Ok(())
 }
 
@@ -332,8 +387,7 @@ fn tokenize(shared: &Shared, v: &Value) -> Handled<Value> {
         .or_else(|| v.get("add_special"))
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let engine = lock(&shared.engine);
-    let ids = engine.encode(text, add_special)?;
+    let ids = shared.engine.encode(text, add_special)?;
     Ok(json!({ "tokens": ids, "count": ids.len() }))
 }
 
@@ -350,7 +404,7 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
         return Err(bad("logprobs is not supported on /v1/completions"));
     }
     let prompt_ids = {
-        let engine = lock(&shared.engine);
+        let engine = &shared.engine;
         match v.get("prompt") {
             Some(Value::String(s)) => engine.encode(s, true)?,
             Some(Value::Array(items)) if items.iter().all(Value::is_u64) => items
@@ -382,7 +436,7 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
         }));
     }
     let started = Instant::now();
-    let decoded = lock(&shared.engine).complete(&prompt_ids, &params, |_| {})?;
+    let decoded = shared.engine.complete(&prompt_ids, &params, |_| {})?;
     let elapsed = started.elapsed();
     report(
         "/v1/completions",
@@ -428,7 +482,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     let kwargs = v.get("chat_template_kwargs");
 
     let prompt_ids = {
-        let engine = lock(&shared.engine);
+        let engine = &shared.engine;
         let rendered = engine.render_chat(messages, kwargs)?;
         let ids = engine.encode(&rendered, true)?;
         if let Some(bos) = engine.text.bos_id {
@@ -454,7 +508,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         }
         // One forward: the argmax is the token, and its distribution is the
         // logprobs block. Temperature does not apply on this path.
-        let mut engine = lock(&shared.engine);
+        let engine = &shared.engine;
         let started = Instant::now();
         let (argmax, top) = engine.next_token_logprobs(&prompt_ids, top_k)?;
         let content = engine.token_str(argmax);
@@ -501,7 +555,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         }));
     }
     let started = Instant::now();
-    let decoded = lock(&shared.engine).complete(&prompt_ids, &params, |_| {})?;
+    let decoded = shared.engine.complete(&prompt_ids, &params, |_| {})?;
     let elapsed = started.elapsed();
     report(
         "/v1/chat/completions",
@@ -574,7 +628,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         Some(_) => return Err(bad("field 'stop' must be a string or an array of strings")),
     };
     let (eos_ids, readback) = {
-        let engine = lock(&shared.engine);
+        let engine = &shared.engine;
         let eos = if ignore_eos {
             NEVER_EOS.to_vec()
         } else {
@@ -614,7 +668,7 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
     }
     let started = Instant::now();
     let decoded = {
-        let mut engine = lock(&shared.engine);
+        let engine = &shared.engine;
         let (id, model, kind) = (run.id.clone(), run.model.clone(), run.kind);
         // The callback runs on the decode thread: it serialises the chunk and
         // queues it; the socket write happens on the writer thread. A client
@@ -683,77 +737,145 @@ fn field_usize(v: &Value, name: &str) -> Handled<usize> {
     }
 }
 
+/// The `batch` a sidecar cell asks for: `B` rows in one closed batch
+/// (`1`, the default, is the single-request cell).
+fn field_batch(shared: &Shared, v: &Value) -> Handled<usize> {
+    let batch = match v.get("batch") {
+        None | Some(Value::Null) => 1,
+        Some(n) => n
+            .as_u64()
+            .filter(|&n| n > 0)
+            .map(|n| n as usize)
+            .ok_or_else(|| bad("field 'batch' must be a positive integer"))?,
+    };
+    shared
+        .engine
+        .check_batch(batch)
+        .map_err(|e| bad(e.to_string()))?;
+    Ok(batch)
+}
+
 fn prefill_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
     let prompt_tokens = field_usize(v, "prompt_tokens")?;
-    let t = lock(&shared.engine).prefill_throughput(prompt_tokens)?;
-    let prompt_tps = t.prompt_tokens as f64 / (t.prefill_ms / 1e3);
+    let batch = field_batch(shared, v)?;
+    let t = shared.engine.prefill_throughput(prompt_tokens, batch)?;
+    let total = t.prompt_tokens * t.batch;
+    let prompt_tps = total as f64 / (t.prefill_ms / 1e3);
     eprintln!(
-        "[/prefill_throughput: prompt_tokens={} prefill {:.2} ms = {prompt_tps:.1} tok/s]",
-        t.prompt_tokens, t.prefill_ms
+        "[/prefill_throughput: prompt_tokens={} batch={} ({} forwards) prefill {:.2} ms = {prompt_tps:.1} tok/s aggregate]",
+        t.prompt_tokens, t.batch, t.forwards, t.prefill_ms
     );
     Ok(json!({
         "prompt_tps": prompt_tps,
         "prompt_tokens": t.prompt_tokens,
+        "batch": t.batch,
+        "batch_prompt_tokens": total,
         "prefill_ms": t.prefill_ms,
+        "forwards": t.forwards,
     }))
 }
 
 fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
     let prompt_tokens = field_usize(v, "prompt_tokens")?;
     let decode_tokens = field_usize(v, "decode_tokens")?;
-    let t = lock(&shared.engine).decode_throughput(prompt_tokens, decode_tokens)?;
-    let generation_tps = t.decode_tokens as f64 / (t.decode_ms / 1e3);
+    let batch = field_batch(shared, v)?;
+    let t = shared
+        .engine
+        .decode_throughput(prompt_tokens, decode_tokens, batch)?;
+    let total: usize = t.row_tokens.iter().sum();
+    let generation_tps = total as f64 / (t.decode_ms / 1e3);
+    let per_row_tps = generation_tps / t.batch as f64;
     eprintln!(
-        "[/decode_throughput: prompt_tokens={} decode_tokens={} context {:.2} ms, decode {:.2} ms \
-         = {generation_tps:.1} tok/s, readback={}]",
+        "[/decode_throughput: prompt_tokens={} decode_tokens={} batch={} context {:.2} ms, decode {:.2} ms \
+         = {generation_tps:.1} tok/s aggregate ({per_row_tps:.1} per row), readback={}, bracket: {}]",
         t.prompt_tokens,
         t.decode_tokens,
+        t.batch,
         t.prefill_ms,
         t.decode_ms,
-        t.readback.name()
+        t.readback.name(),
+        t.bracket,
     );
     Ok(json!({
         "generation_tps": generation_tps,
+        "per_row_tps": per_row_tps,
         "decode_tokens": t.decode_tokens,
         "prompt_tokens": t.prompt_tokens,
+        "batch": t.batch,
+        "batch_decode_tokens": total,
         "decode_ms": t.decode_ms,
         "context_ms": t.prefill_ms,
         "readback": t.readback.name(),
+        "bracket": t.bracket,
     }))
+}
+
+/// `B` rows through the request path at once — the shape `B` clients make —
+/// each row a full request with `params`, run on `B` threads; the wall
+/// closes when the last row lands. Returns the rows in order.
+fn concurrent_rows(
+    shared: &Shared,
+    prompts: Vec<Vec<u32>>,
+    params: &DecodeParams,
+) -> Result<Vec<Decoded>> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = prompts
+            .iter()
+            .map(|ids| {
+                let params = params.clone();
+                scope.spawn(move || shared.engine.complete(ids, &params, |_| {}))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .map_err(|_| anyhow::anyhow!("a request thread panicked"))?
+            })
+            .collect()
+    })
 }
 
 fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
     let prompt_tokens = field_usize(v, "prompt_tokens")?;
     let decode_tokens = field_usize(v, "decode_tokens")?;
-    let mut engine = lock(&shared.engine);
-    let prompt = engine.seed_prompt(prompt_tokens);
+    let batch = field_batch(shared, v)?;
+    let engine = &shared.engine;
     let params = DecodeParams {
         max_tokens: decode_tokens,
         eos_ids: NEVER_EOS.to_vec(),
         readback: engine.readback,
         ..DecodeParams::default()
     };
-    let decoded = engine.complete(&prompt, &params, |_| {})?;
+    let prompts: Vec<Vec<u32>> = (0..batch)
+        .map(|r| engine.seed_prompt_row(prompt_tokens, r))
+        .collect();
+    let decoded = concurrent_rows(shared, prompts, &params)?;
+    let completion: usize = decoded.iter().map(|d| d.tokens.len()).sum();
     eprintln!(
-        "[/max_memory_usage: prompt_tokens={} completion_tokens={}]",
-        prompt.len(),
-        decoded.tokens.len()
+        "[/max_memory_usage: prompt_tokens={} batch={batch} completion_tokens={completion}]",
+        prompt_tokens
     );
     Ok(json!({
-        "prompt_tokens": prompt.len(),
-        "completion_tokens": decoded.tokens.len(),
+        "prompt_tokens": prompt_tokens,
+        "batch": batch,
+        "completion_tokens": completion / batch.max(1),
+        "batch_completion_tokens": completion,
     }))
 }
 
 /// Tokenize inside the bracket, as a client-visible request would: the
 /// runner times the HTTP request; `total_ms` is the same window one layer in.
+/// At `batch > 1` the same prompt is sent as `B` concurrent requests and the
+/// window closes when the last one lands (`per_row_ms` carries each).
 fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
     let prompt = v
         .get("prompt")
         .and_then(Value::as_str)
         .ok_or_else(|| bad("field 'prompt' must be a string"))?;
     let decode_tokens = field_usize(v, "decode_tokens")?;
-    let mut engine = lock(&shared.engine);
+    let batch = field_batch(shared, v)?;
+    let engine = &shared.engine;
     let started = Instant::now();
     let ids = engine.encode(prompt, true)?;
     let params = DecodeParams {
@@ -762,13 +884,64 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
         readback: engine.readback,
         ..DecodeParams::default()
     };
-    let decoded = engine.complete(&ids, &params, |_| {})?;
+    if batch == 1 {
+        let decoded = engine.complete(&ids, &params, |_| {})?;
+        let total_ms = engine::ms(started.elapsed());
+        report("/end_to_end_latency", ids.len(), &decoded, total_ms);
+        return Ok(json!({
+            "total_ms": total_ms,
+            "prompt_tokens": ids.len(),
+            "completion_tokens": decoded.tokens.len(),
+            "batch": 1,
+        }));
+    }
+    let prompts: Vec<Vec<u32>> = (0..batch).map(|_| ids.clone()).collect();
+    let (decoded, per_row_ms): (Vec<Decoded>, Vec<f64>) = std::thread::scope(|scope| {
+        let handles: Vec<_> = prompts
+            .iter()
+            .map(|p| {
+                let params = params.clone();
+                scope.spawn(move || {
+                    let t = Instant::now();
+                    let d = engine.complete(p, &params, |_| {});
+                    (d, engine::ms(t.elapsed()))
+                })
+            })
+            .collect();
+        let mut ds = Vec::new();
+        let mut ts = Vec::new();
+        for h in handles {
+            let (d, t) = h
+                .join()
+                .map_err(|_| anyhow::anyhow!("a request thread panicked"))?;
+            ds.push(d?);
+            ts.push(t);
+        }
+        Ok::<_, anyhow::Error>((ds, ts))
+    })?;
     let total_ms = engine::ms(started.elapsed());
-    report("/end_to_end_latency", ids.len(), &decoded, total_ms);
+    for (i, d) in decoded.iter().enumerate() {
+        report(
+            &format!("/end_to_end_latency row {i}/{batch}"),
+            ids.len(),
+            d,
+            per_row_ms[i],
+        );
+    }
+    let completion: Vec<usize> = decoded.iter().map(|d| d.tokens.len()).collect();
+    if completion.iter().any(|&c| c != decode_tokens) {
+        return Err(Failure::Internal(anyhow::anyhow!(
+            "rows produced {completion:?} tokens, expected {decode_tokens} each"
+        )));
+    }
     Ok(json!({
         "total_ms": total_ms,
         "prompt_tokens": ids.len(),
-        "completion_tokens": decoded.tokens.len(),
+        "completion_tokens": decode_tokens,
+        "batch": batch,
+        "batch_completion_tokens": completion.iter().sum::<usize>(),
+        "per_row_ms": per_row_ms,
+        "readback": decoded.first().map(|d| d.readback.name()),
     }))
 }
 
@@ -776,6 +949,12 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
 /// `eval_done`. The chat template is the checkpoint's; a sample an
 /// `/eval/abort` names is stopped at the next drained batch and its partial
 /// completion reported with `stopped_early`.
+///
+/// Under `--batch N` the samples run `N` at a time — `N` worker threads
+/// pulling from the list, each sample a request through the scheduler, so
+/// a sample joins the batch the moment one leaves it — and their events
+/// interleave on the stream, keyed by `sample_id`. At `--batch 1` one
+/// worker runs them in order, as before.
 fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
     let samples = match v.get("samples").and_then(Value::as_array) {
         Some(s) => s.clone(),
@@ -822,89 +1001,120 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
     };
 
     let sw = StreamWriter::start(ChunkedWriter::start(request, "application/x-ndjson")?);
-    let mut engine = lock(&shared.engine);
+    let engine = &shared.engine;
     let total = samples.len();
-    let run = (|| -> Result<()> {
-        for (i, sample) in samples.iter().enumerate() {
-            let sample_id = sample
-                .get("id")
-                .and_then(Value::as_str)
-                .context("eval sample missing id")?
-                .to_string();
-            if done.contains(&sample_id) {
-                eprintln!(
-                    "[eval {}/{total} id={sample_id} skipped, checkpointed]",
-                    i + 1
-                );
-                continue;
-            }
-            let messages = sample
-                .get("messages")
-                .context("eval sample missing messages")?;
-            let prompt = engine.render_chat(messages, kwargs.as_ref())?;
-            let ids = engine.encode(&prompt, true)?;
-            sw.event_line(&json!({
-                "kind": "eval_sample_start", "sample_id": sample_id, "prompt": prompt,
-            }));
-            let params = DecodeParams {
-                seed: rand::random::<u64>(),
-                temperature: (temperature > 0.0).then_some(temperature),
-                top_p: None,
-                max_tokens,
-                eos_ids: engine.text.eos_ids.clone(),
-                stop_strings: Vec::new(),
-                readback: engine.readback,
-            };
-            let mut pending = String::new();
-            let started = Instant::now();
-            let aborts = &shared.aborts;
-            let decoded = {
-                let sid = sample_id.clone();
-                // An abort ends the run through the decode seam's own hook,
-                // checked at every drained batch; so does a client that went
-                // away (the writer thread latches the failed write).
-                engine.complete_until(&ids, &params, |frag| {
-                    pending.push_str(frag);
-                    if pending.len() >= EVAL_CHUNK_FLUSH_BYTES {
+    let workers = engine.batch.max(1).min(total.max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let run = std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let (sw, samples, done, kwargs, next) = (&sw, &samples, &done, &kwargs, &next);
+                scope.spawn(move || -> Result<()> {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::AcqRel);
+                        if i >= samples.len() || sw.client_gone() {
+                            return Ok(());
+                        }
+                        let sample = &samples[i];
+                        let sample_id = sample
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .context("eval sample missing id")?
+                            .to_string();
+                        if done.contains(&sample_id) {
+                            eprintln!(
+                                "[eval {}/{total} id={sample_id} skipped, checkpointed]",
+                                i + 1
+                            );
+                            continue;
+                        }
+                        let messages = sample
+                            .get("messages")
+                            .context("eval sample missing messages")?;
+                        let prompt = engine.render_chat(messages, kwargs.as_ref())?;
+                        let ids = engine.encode(&prompt, true)?;
                         sw.event_line(&json!({
-                            "kind": "eval_sample_chunk", "sample_id": sid, "delta": pending,
+                            "kind": "eval_sample_start", "sample_id": sample_id, "prompt": prompt,
                         }));
-                        pending.clear();
+                        let params = DecodeParams {
+                            seed: rand::random::<u64>(),
+                            temperature: (temperature > 0.0).then_some(temperature),
+                            top_p: None,
+                            max_tokens,
+                            eos_ids: engine.text.eos_ids.clone(),
+                            stop_strings: Vec::new(),
+                            readback: engine.readback,
+                        };
+                        let mut pending = String::new();
+                        let started = Instant::now();
+                        let aborts = &shared.aborts;
+                        let decoded = {
+                            let sid = sample_id.clone();
+                            // An abort ends the run through the decode seam's own hook,
+                            // checked at every drained batch; so does a client that went
+                            // away (the writer thread latches the failed write).
+                            engine.complete_until(&ids, &params, |frag| {
+                                pending.push_str(frag);
+                                if pending.len() >= EVAL_CHUNK_FLUSH_BYTES {
+                                    sw.event_line(&json!({
+                                        "kind": "eval_sample_chunk", "sample_id": sid, "delta": pending,
+                                    }));
+                                    pending.clear();
+                                }
+                                !sw.client_gone() && !lock(aborts).contains(&sid)
+                            })
+                        };
+                        let decoded = decoded?;
+                        if sw.client_gone() {
+                            anyhow::bail!("client went away mid-eval");
+                        }
+                        let completion = decoded.text.clone();
+                        let stopped_early = decoded.stop == Stop::Cancelled;
+                        if stopped_early {
+                            lock(aborts).remove(&sample_id);
+                        }
+                        eprintln!(
+                            "[eval {}/{total} id={sample_id} {} tokens {:.1} ms {} readback={}]",
+                            i + 1,
+                            decoded.tokens.len(),
+                            engine::ms(started.elapsed()),
+                            if stopped_early {
+                                "stopped_early"
+                            } else {
+                                "done"
+                            },
+                            decoded.readback.name(),
+                        );
+                        sw.event_line(&json!({
+                            "kind": "eval_sample_done", "sample_id": sample_id,
+                            "completion": completion, "stopped_early": stopped_early,
+                            "completion_tokens": decoded.tokens.len(),
+                            "finish_reason": finish_reason(decoded.stop),
+                        }));
                     }
-                    !sw.client_gone() && !lock(aborts).contains(&sid)
                 })
-            };
-            let decoded = decoded?;
-            if sw.client_gone() {
-                anyhow::bail!("client went away mid-eval");
+            })
+            .collect();
+        let mut first_err = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(_) => {
+                    first_err.get_or_insert(anyhow::anyhow!("an eval worker panicked"));
+                }
             }
-            let completion = decoded.text.clone();
-            let stopped_early = decoded.stop == Stop::Cancelled;
-            if stopped_early {
-                lock(aborts).remove(&sample_id);
-            }
-            eprintln!(
-                "[eval {}/{total} id={sample_id} {} tokens {:.1} ms {} readback={}]",
-                i + 1,
-                decoded.tokens.len(),
-                engine::ms(started.elapsed()),
-                if stopped_early {
-                    "stopped_early"
-                } else {
-                    "done"
-                },
-                decoded.readback.name(),
-            );
-            sw.event_line(&json!({
-                "kind": "eval_sample_done", "sample_id": sample_id,
-                "completion": completion, "stopped_early": stopped_early,
-                "completion_tokens": decoded.tokens.len(),
-                "finish_reason": finish_reason(decoded.stop),
-            }));
         }
-        sw.event_line(&json!({ "kind": "eval_done" }));
-        Ok(())
-    })();
+        match first_err {
+            Some(e) => Err(e),
+            None => {
+                sw.event_line(&json!({ "kind": "eval_done" }));
+                Ok(())
+            }
+        }
+    });
     if let Err(e) = &run {
         sw.event_line(&json!({ "kind": "eval_error", "error": format!("{e:#}") }));
     }

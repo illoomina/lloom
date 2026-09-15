@@ -352,6 +352,80 @@ impl DSparkConfig {
         }
     }
 
+    /// The drafter's constants from its checkpoint directory's `config.json`
+    /// (the `lfm2-chat` / `lfm2-dspark-verify` reader, hoisted so a serving
+    /// binary loads the same drafter the same way).
+    ///
+    /// Never defaulted for the two fields a wrong default silently corrupts —
+    /// `rope_theta` and `rope_is_neox_style` alter no shape and no dispatch
+    /// count, and on a drafter there is not even a text gate to catch them
+    /// because the target verifies every token (`speculation.md` §10.2n).
+    pub fn read_from_dir(dir: &std::path::Path) -> Result<Self> {
+        let path = dir.join("config.json");
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| lloom_tensor::Error::msg(format!("reading {}: {e}", path.display())))?;
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| lloom_tensor::Error::msg(format!("parsing {}: {e}", path.display())))?;
+        let dfc = v.get("dflash_config").cloned().unwrap_or_else(|| v.clone());
+        let missing = |k: &str| lloom_tensor::Error::msg(format!("drafter config has no {k}"));
+        let usize_at = |k: &str| -> Result<usize> {
+            v.get(k)
+                .and_then(|x| x.as_u64())
+                .map(|n| n as usize)
+                .ok_or_else(|| missing(k))
+        };
+        let target_layer_ids: Vec<usize> = dfc
+            .get("target_layer_ids")
+            .and_then(|x| x.as_array())
+            .ok_or_else(|| missing("dflash_config.target_layer_ids"))?
+            .iter()
+            .filter_map(|x| x.as_u64().map(|n| n as usize))
+            .collect();
+        Ok(DSparkConfig {
+            hidden_size: usize_at("hidden_size")?,
+            num_hidden_layers: usize_at("num_hidden_layers")?,
+            num_attention_heads: usize_at("num_attention_heads")?,
+            num_key_value_heads: usize_at("num_key_value_heads")?,
+            head_dim: usize_at("head_dim")?,
+            intermediate_size: usize_at("intermediate_size")?,
+            vocab_size: usize_at("vocab_size")?,
+            rms_norm_eps: v
+                .get("rms_norm_eps")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(1e-5),
+            rope_theta: v
+                .get("rope_theta")
+                .and_then(|x| x.as_f64())
+                .ok_or_else(|| missing("rope_theta"))?,
+            rope_is_neox_style: v
+                .get("rope_is_neox_style")
+                .and_then(|x| x.as_bool())
+                .ok_or_else(|| missing("rope_is_neox_style"))?,
+            block_size: usize_at("block_size")?,
+            mask_token_id: dfc
+                .get("mask_token_id")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| missing("dflash_config.mask_token_id"))? as u32,
+            num_target_layers: dfc
+                .get("num_target_layers")
+                .and_then(|x| x.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(30),
+            target_layer_ids,
+            markov_rank: v
+                .get("markov_rank")
+                .and_then(|x| x.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(0),
+            enable_confidence_head: v
+                .get("enable_confidence_head")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            // Not a key in config.json — a property of the packaging (§10.2p).
+            logits_start: 0,
+        })
+    }
+
     /// The `Config::tap_layers` that deliver `target_layer_ids`' output residuals.
     ///
     /// The tap captures the residual **entering** a layer, and the drafter is

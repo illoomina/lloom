@@ -18,6 +18,7 @@
 pub mod activation;
 pub mod attention;
 pub mod batch_norm;
+pub mod batched;
 pub mod conv;
 pub mod cpu_flash_attention;
 pub mod decode;
@@ -54,6 +55,7 @@ pub use conv::{
     conv_transpose2d, conv_transpose2d_no_bias, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
+pub use batched::{BatchDecoder, RowId, StepReport};
 pub use decode::{
     ladder_width, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, IdentityProposer,
     PassWidths, PrefillOut, RoundStats, StepPhases, FIRST_STEPS_TRACED,

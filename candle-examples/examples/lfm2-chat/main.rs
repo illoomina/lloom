@@ -625,8 +625,9 @@ struct Args {
     /// loop closes its command buffer only when the GPU has started the
     /// previous one, on no cadence — no per-step marker cut, no commit-cadence
     /// drain, no TTFT ramp. Needs `--stream-reader` (the reader drains per
-    /// token and raises the stop flag on EOS) and a deferred EOS arm
-    /// (`--readback ring-hostdrain` / `ring-gpubatch*`); refused otherwise.
+    /// token and raises the stop flag on EOS) on a ring arm — the crown's
+    /// `ring-nonblocking` keeps its per-step device EOS byte and skips its
+    /// per-step wait; `ring-hostdrain` / `ring-gpubatch*` as they are.
     #[arg(long)]
     adaptive_commit: bool,
 
@@ -635,6 +636,14 @@ struct Args {
     /// queued past an EOS, not a cadence.
     #[arg(long, default_value_t = 0)]
     run_ahead: usize,
+
+    /// Under `--adaptive-commit`: the EOS gate (lloom #735 step 4,
+    /// `DecodeOptions::eos_gate`). The decode kernels run in a variant that
+    /// returns at once after a gate kernel has seen a stop token, so the
+    /// forwards queued past an EOS write nothing and the overrun is
+    /// reconciled without a rewind horizon.
+    #[arg(long)]
+    eos_gate: bool,
 
     /// The rotating ring's history depth under `--cache rewindable` (non-dspark):
     /// the rewind horizon. `--dspark` sizes it from the drafter's block.
@@ -1142,6 +1151,12 @@ fn report_pass_plans(device: &Device, widths: &str) {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    #[cfg(feature = "metal")]
+    if candle::kernels::metal::trace::trace_requested() {
+        // Record every dispatch for `report_trace_census`; off, this is one
+        // `OnceLock` read per dispatch (`trace.rs`).
+        candle::kernels::metal::trace::set_recording(true);
+    }
 
     let model_dir = args
         .model_dir
@@ -1820,6 +1835,7 @@ fn main() -> Result<()> {
         adaptive_commit: false,
         run_ahead: 0,
         stop: None,
+        eos_gate: false,
         // The tile bounds every prefill forward the ramp or the schedule names.
         prefill_tile: args.prefill_tile,
         // One sequence: nothing to interleave a chunk with.
@@ -1837,6 +1853,9 @@ fn main() -> Result<()> {
     if args.adaptive_commit {
         opts.adaptive_commit = true;
         opts.run_ahead = args.run_ahead;
+        opts.eos_gate = args.eos_gate;
+    } else if args.eos_gate {
+        anyhow::bail!("--eos-gate needs --adaptive-commit");
     }
     let mut readback_arm = if dspark_setup.is_none() {
         Some(build_readback(
@@ -2489,6 +2508,19 @@ fn main() -> Result<()> {
             st.stopped_by_flag,
         );
     }
+    if let Some(g) = st.eos_gate {
+        eprintln!(
+            "[eos gate: fired={} gate kernels={}; overrun {} forwards{}]",
+            g.fired,
+            g.steps,
+            st.overrun,
+            if st.overrun_unwritten {
+                ", none of which wrote the cache (reconciled by counters)"
+            } else {
+                ""
+            },
+        );
+    }
     // The per-step split is a debug/profile detail — `step_ns` is empty in a plain
     // release build (the reads are compiled out), so print it only when populated.
     if !st.step_ns.is_empty() {
@@ -2924,6 +2956,7 @@ fn report_idle_gaps(
     st: &lloom::nn::DecodeStats,
     wall: f64,
 ) {
+    report_trace_census(st.steps);
     let gaps = &s.idle_gaps;
     let steps = st.steps.max(1) as f64;
     let idle_total: f64 = gaps.iter().map(|g| g.idle).sum();
@@ -3127,6 +3160,36 @@ fn param_style_arm() -> &'static str {
 /// term (`DESIGN.md` §11.3w). `replaying=false` or `covered=0` means the A/B
 /// above compared the classical path against itself wearing this arm's name.
 #[cfg(feature = "metal")]
+/// Under `CANDLE_METAL_TRACE=1`: every kernel the run dispatched, with how
+/// many times and in which unit (threadgroups or threads), so the arms that
+/// need every dispatch to go one way (the EOS gate: indirect threadgroups)
+/// can show their coverage instead of asserting it. Whole-run counts; two
+/// runs a step apart give the per-step census by difference.
+fn report_trace_census(steps: u64) {
+    use candle::kernels::metal::trace;
+    if !trace::trace_requested() {
+        return;
+    }
+    let mut census: std::collections::BTreeMap<(String, bool), u64> = Default::default();
+    for d in trace::take_dispatches() {
+        *census.entry((d.pipeline, d.by_threadgroups)).or_default() += 1;
+    }
+    let total: u64 = census.values().sum();
+    let threads: u64 = census
+        .iter()
+        .filter(|((_, tg), _)| !tg)
+        .map(|(_, n)| n)
+        .sum();
+    eprintln!(
+        "[trace census: {total} dispatches over {steps} steps (whole run, prefill included), \
+         {} kernels, {threads} dispatched by threads]",
+        census.len()
+    );
+    for ((name, tg), n) in &census {
+        eprintln!("  {n:6} {} {name}", if *tg { "tg " } else { "thr" });
+    }
+}
+
 fn report_replay(exec: &candle::kernels::IcbExecutor, steps: u64) {
     use candle::kernels::metal::trace;
     let cov = exec.coverage();

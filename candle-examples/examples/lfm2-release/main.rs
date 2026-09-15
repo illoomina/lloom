@@ -73,6 +73,8 @@ use lloom::nn::{DecodeOptions, IdentityProposer, Session, VarBuilder};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 #[derive(Parser, Debug)]
@@ -246,6 +248,25 @@ struct Args {
     /// Mutually exclusive with `--nonblocking-eos`. Off by default (§7.1a).
     #[arg(long)]
     host_drain: bool,
+
+    /// The adaptive commit (lloom #735, `DecodeOptions::adaptive_commit`) on
+    /// the `--token-ring --host-drain` or `--token-ring --nonblocking-eos`
+    /// arm with `--lookahead 1`: the loop closes a buffer only when the GPU
+    /// has started the previous one, a reader thread per turn watches the
+    /// ring and raises the stop flag on EOS.
+    #[arg(long)]
+    adaptive_commit: bool,
+
+    /// Under `--adaptive-commit`: the run-ahead bound (0 = the loop's 8).
+    #[arg(long, default_value_t = 0)]
+    run_ahead: usize,
+
+    /// Under `--adaptive-commit`: the EOS gate (lloom #735 step 4,
+    /// `DecodeOptions::eos_gate`) — the forwards queued past an EOS write
+    /// nothing, so the overrun is reconciled by counters and `--turns` above
+    /// 1 needs no rewindable cache.
+    #[arg(long)]
+    eos_gate: bool,
 
     /// Carry the conv state across a multi-token pass as the convolution's left
     /// context (`ConvPrefillCtx`, `DESIGN.md` §13.2f defect 1, #677). Off, a
@@ -895,7 +916,24 @@ fn main() -> Result<()> {
     // one — so up to two live windows of forwards may be enqueued past the EOS
     // before a drain shows it, and the pacer's depth may still be unpublished
     // at it.
-    let overrun_bound = if args.host_drain {
+    let run_ahead = if args.run_ahead == 0 {
+        8
+    } else {
+        args.run_ahead
+    };
+    if args.adaptive_commit {
+        anyhow::ensure!(
+            args.token_ring && (args.host_drain || args.nonblocking_eos) && args.lookahead == 1,
+            "--adaptive-commit needs --token-ring with --host-drain or --nonblocking-eos, and \
+             --lookahead 1"
+        );
+    } else {
+        anyhow::ensure!(!args.eos_gate, "--eos-gate needs --adaptive-commit");
+    }
+    let overrun_bound = if args.adaptive_commit {
+        // Two run-ahead windows queued past the reader's flag plus the open one.
+        3 * run_ahead
+    } else if args.host_drain {
         2 * budget.period() * WAKE_LIVE_EVERY_DEFAULT + IN_FLIGHT_STEPS
     } else if args.lookahead > 0 {
         1
@@ -906,8 +944,14 @@ fn main() -> Result<()> {
         (KvAppend::InPlace | KvAppend::Paged, ConvState::RotatingRing { k }) => k,
         _ => 0,
     };
+    // Under the EOS gate the overrun's forwards wrote nothing, and
+    // `Session::reconcile` moves the counters back on any cache
+    // (`CacheRewind::rewind_unwritten`): no horizon needed.
     anyhow::ensure!(
-        overrun_bound == 0 || args.turns.max(1) == 1 || rewindable_to >= overrun_bound,
+        overrun_bound == 0
+            || args.turns.max(1) == 1
+            || rewindable_to >= overrun_bound
+            || (args.adaptive_commit && args.eos_gate),
         "--lookahead {}{} with --turns {}: this arm can leave the cache up to {} positions \
          past an EOS, and the next turn would prefill onto them; the cache must be able to \
          rewind that far (--kv-append in-place --conv-state rotating:K with K >= {}; this run \
@@ -925,12 +969,36 @@ fn main() -> Result<()> {
         budget,
         lookahead: args.lookahead,
         sample_split: args.sample_split,
+        adaptive_commit: args.adaptive_commit,
+        run_ahead: args.run_ahead,
+        eos_gate: args.eos_gate,
+        // The reader thread per turn (`run_turns`) is the drain.
+        stream_via_reader: args.adaptive_commit,
         ..DecodeOptions::new(args.n)
     };
     // The ring's device-side history is sized for the whole run — every turn,
     // plus the overrun an arm may publish past each turn's EOS — and refuses
     // to overflow rather than silently dropping an id.
     let capacity = args.n + args.turns * (overrun_bound + 2) + 1;
+    // Under the adaptive commit the ring is sized for the host's lead, as
+    // `lfm2-chat` sizes it: the input slots and the stamp's source tiles must
+    // outlive every forward still queued; the history is a ring the reader
+    // drains per token.
+    let geometry = lloom::generation::Geometry {
+        batch: 1,
+        max_draft: 0,
+        period: budget.period(),
+        lookahead: args.lookahead,
+        max_input_width: opts.max_prefill_width(),
+        in_flight_depth: opts.pacer_depth() + opts.adaptive_lead(),
+    };
+    let ring = |eos: EosRead| -> Result<Ring> {
+        Ok(if args.adaptive_commit {
+            Ring::with_geometry(&eos_ids, &device, geometry, eos)?
+        } else {
+            Ring::new(&eos_ids, &device, capacity, eos)?
+        })
+    };
 
     // ---- the timed window --------------------------------------------------
     //
@@ -954,7 +1022,7 @@ fn main() -> Result<()> {
             &opts,
         )?
     } else if args.host_drain {
-        let rb = Ring::new(&eos_ids, &device, capacity, EosRead::HostOnDrain)?;
+        let rb = ring(EosRead::HostOnDrain)?;
         run_turns(
             &args,
             &model,
@@ -966,7 +1034,7 @@ fn main() -> Result<()> {
             &opts,
         )?
     } else if args.nonblocking_eos {
-        let rb = Ring::new(&eos_ids, &device, capacity, EosRead::Poll(poll))?;
+        let rb = ring(EosRead::Poll(poll))?;
         run_turns(
             &args,
             &model,
@@ -1003,6 +1071,7 @@ fn main() -> Result<()> {
         max_in_flight,
         overrun,
         rewound,
+        unwritten,
         step_markers,
         step_waits,
         arms,
@@ -1299,13 +1368,14 @@ fn main() -> Result<()> {
     );
     println!(
         "  decode loop         lookahead={} commit_budget={} commits={} overrun={} rewound={} \
-         in_flight_steps={} step_markers={} step_waits={} conv_prefill_ctx={} \
+         unwritten={} in_flight_steps={} step_markers={} step_waits={} conv_prefill_ctx={} \
          (Session::decode, DESIGN.md decode-driver stage 1; #677 sequence layer)",
         args.lookahead,
         budget.arm(),
         commits,
         overrun,
         rewound,
+        unwritten,
         IN_FLIGHT_STEPS,
         step_markers,
         step_waits,
@@ -1482,7 +1552,7 @@ fn main() -> Result<()> {
          poll_fallbacks={} peek_hit={} peek_unmapped={} poll_reads={} completion_wait={} \
          completion_signals={} completion_polls={} completion_fires={} \
          gemv_silu={} gemv_residual={} conv_fused={} \
-         lookahead={} commit_budget={} commits={} overrun={} rewound={} \
+         lookahead={} commit_budget={} commits={} overrun={} rewound={} unwritten={} \
          in_flight_steps={} step_markers={} step_waits={} eos_read={} ring_discarded={} \
          conv_prefill_ctx={} qkv_layout={} config=[{}] token_digest={}",
         args.n,
@@ -1537,6 +1607,7 @@ fn main() -> Result<()> {
         commits,
         overrun,
         rewound,
+        unwritten,
         IN_FLIGHT_STEPS,
         step_markers,
         step_waits,
@@ -1571,6 +1642,9 @@ struct Run {
     /// prefilled onto the last kept token (#677). The last turn's overrun is
     /// left as it is — nothing follows it — so `rewound <= overrun`.
     rewound: usize,
+    /// Of the overrun, the positions the EOS gate kept out of the cache
+    /// (`DecodeStats::overrun_unwritten`); reconciled by counters.
+    unwritten: usize,
     /// The pacer's engagement pair (`Session::decode`, `IN_FLIGHT_STEPS`):
     /// markers taken, one per forward, and the ones the host had to wait on.
     step_markers: u64,
@@ -1618,6 +1692,7 @@ fn run_turns<R: ReadbackStrategy>(
     let mut step_waits = 0u64;
     let mut overrun = 0usize;
     let mut rewound = 0usize;
+    let mut unwritten = 0usize;
     // The cache starts empty: turn 0's prefill is what appends the prompt, and
     // the session's position advances by each turn's length after it.
     let mut session = Session::new(model, cache);
@@ -1639,9 +1714,43 @@ fn run_turns<R: ReadbackStrategy>(
         // The budget left for this turn. A turn opened with none left still
         // prefills — the previous loop shape did, and `final_kv_len` and
         // `turns_run` are what would otherwise move.
-        let turn_opts = DecodeOptions {
+        let mut turn_opts = DecodeOptions {
             max_tokens: args.n - tokens.len(),
             ..opts.clone()
+        };
+        // Under the adaptive commit: a reader per turn, resumed at the
+        // current stamp, raising the stop flag when it reads an EOS — the
+        // loop's only EOS signal on that arm (`lfm2-chat`'s stream reader,
+        // without the printing).
+        let watcher = if opts.adaptive_commit {
+            let mut reader = rb
+                .reader()
+                .context("--adaptive-commit needs a mapped ring (the reader)")?;
+            reader.resume_at_published();
+            let stop = Arc::new(AtomicBool::new(false));
+            let done = Arc::new(AtomicBool::new(false));
+            turn_opts.stop = Some(Arc::clone(&stop));
+            let done_w = Arc::clone(&done);
+            let handle = std::thread::spawn(move || {
+                let mut buf: Vec<u32> = Vec::with_capacity(64);
+                loop {
+                    buf.clear();
+                    if reader.read_new(&mut buf).is_err() {
+                        break;
+                    }
+                    if reader.ended() {
+                        stop.store(true, Ordering::Release);
+                        break;
+                    }
+                    if done_w.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            });
+            Some((done, handle))
+        } else {
+            None
         };
         // No streaming: this is the perf harness, whose number is the whole
         // generation and whose digest is taken from the ids after the clock. A
@@ -1656,6 +1765,13 @@ fn run_turns<R: ReadbackStrategy>(
                 &mut |_| Ok(()),
             )
             .with_context(|| format!("decoding turn {turn}"))?;
+        if let Some((done, handle)) = watcher {
+            done.store(true, Ordering::Release);
+            let _ = handle.join();
+        }
+        if out.stats.overrun_unwritten {
+            unwritten += out.stats.overrun;
+        }
         turns_run = turn + 1;
         // Accumulated across turns; prefill is a different shape of work (§6.6)
         // and is reported apart from the decode rate. **Submission time, not
@@ -1700,6 +1816,7 @@ fn run_turns<R: ReadbackStrategy>(
         max_in_flight,
         overrun,
         rewound,
+        unwritten,
         step_markers,
         step_waits,
         arms: rb.arms(),

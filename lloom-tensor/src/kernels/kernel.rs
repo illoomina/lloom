@@ -1,7 +1,7 @@
 use crate::kernels::source::{
-    AFFINE, ARENA_ALLOC, BINARY, CAST, CONV, EOS_INDEX, FILL, FLASH_DECODING, GEMV, INDEXING,
-    MERGED_MEMBERS, MERGED_NON_MLX, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE, ROPE, SCRATCH,
-    SDPA, SORT, TERNARY, UNARY,
+    AFFINE, ARENA_ALLOC, BINARY, CAST, CONV, EOS_GATE, EOS_INDEX, FILL, FLASH_DECODING, GEMV,
+    INDEXING, MERGED_MEMBERS, MERGED_NON_MLX, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM, REDUCE, ROPE,
+    SCRATCH, SDPA, SORT, TERNARY, UNARY,
 };
 use crate::kernels::utils::get_env_bool;
 use crate::kernels::{
@@ -91,7 +91,22 @@ type Pipelines = HashMap<(Source, KernelName, Option<ConstantValues>), ComputePi
 pub struct Kernels {
     libraries: RwLock<Libraries>,
     pipelines: RwLock<Pipelines>,
+    /// The EOS gate (lloom #735 step 4): while set, `load_pipeline` resolves
+    /// the sources carrying gated decode kernels to their function-constant
+    /// variant (`EOS_GATE_FUNCTION_CONSTANT` = true), which reads the gate's
+    /// flag at buffer index 30. A separate pipeline-cache key, so the plain
+    /// variants are untouched.
+    eos_gated: std::sync::atomic::AtomicBool,
 }
+
+/// The sources whose kernels carry `EOS_GATE_ARG` (`utils.metal`).
+const EOS_GATED_SOURCES: [Source; 5] = [
+    Source::Gemv,
+    Source::Reduce,
+    Source::Binary,
+    Source::Unary,
+    Source::Conv,
+];
 
 impl Default for Kernels {
     fn default() -> Self {
@@ -106,7 +121,19 @@ impl Kernels {
         Self {
             libraries,
             pipelines,
+            eos_gated: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Switch `load_pipeline` to (or from) the gated decode-kernel variants.
+    /// See `metal::eos_gate`.
+    pub fn set_eos_gated(&self, on: bool) {
+        self.eos_gated
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn eos_gated(&self) -> bool {
+        self.eos_gated.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Which library a [`Source`] resolves to, and the text to compile for it.
@@ -150,6 +177,7 @@ impl Kernels {
             Source::Binary => BINARY,
             Source::Cast => CAST,
             Source::Conv => CONV,
+            Source::EosGate => EOS_GATE,
             Source::EosIndex => EOS_INDEX,
             Source::Fill => FILL,
             Source::FlashDecoding => FLASH_DECODING,
@@ -256,7 +284,19 @@ impl Kernels {
         source: Source,
         name: impl Into<KernelName>,
     ) -> Result<ComputePipeline, MetalKernelError> {
-        self.load_pipeline_with_constants(device, source, name, None)
+        // A function that references a function constant can only be built
+        // specialized (Metal refuses `newFunctionWithName:` for it), so the
+        // gated sources are always loaded with the constant set — `false` is
+        // the plain variant, `true` the gated one; two cache keys.
+        let constants = if EOS_GATED_SOURCES.contains(&source) {
+            Some(ConstantValues::new(vec![(
+                crate::kernels::metal::eos_gate::EOS_GATE_FUNCTION_CONSTANT,
+                crate::kernels::metal::library::Value::Bool(self.eos_gated()),
+            )]))
+        } else {
+            None
+        };
+        self.load_pipeline_with_constants(device, source, name, constants)
     }
 
     /// How many distinct Metal libraries this cache has compiled, and how many
@@ -639,6 +679,7 @@ mod tests {
                 | Source::Binary
                 | Source::Cast
                 | Source::Conv
+                | Source::EosGate
                 | Source::EosIndex
                 | Source::Fill
                 | Source::FlashDecoding
@@ -675,6 +716,7 @@ mod tests {
             Source::Binary,
             Source::Cast,
             Source::Conv,
+            Source::EosGate,
             Source::EosIndex,
             Source::Fill,
             Source::FlashDecoding,
@@ -704,10 +746,10 @@ mod tests {
         // bad edit fails here rather than passing over an empty iteration.
         assert_eq!(
             MERGED_MEMBERS.len(),
-            18,
-            "18 non-MLX sources (#466 §4, +rope #659, +eos_index #702's tree)"
+            19,
+            "19 non-MLX sources (#466 §4, +rope #659, +eos_index #702's tree, +eos_gate #735)"
         );
-        assert_eq!(all.len(), 21, "21 Source variants");
+        assert_eq!(all.len(), 22, "22 Source variants");
     }
 
     /// Issue #477. The merged text **compiles**, and it contains kernels from
@@ -783,6 +825,7 @@ mod tests {
             Source::Binary,
             Source::Cast,
             Source::Conv,
+            Source::EosGate,
             Source::EosIndex,
             Source::Fill,
             Source::FlashDecoding,
@@ -848,7 +891,7 @@ mod tests {
             }
             merged_keys.insert(key);
         }
-        assert_eq!(n_merged, 18, "18 sources must route to the merged library");
+        assert_eq!(n_merged, 19, "19 sources must route to the merged library");
         // 1 merged key + 3 MLX keys. A count of 20 would mean nothing merged.
         assert_eq!(
             merged_keys.len(),
@@ -891,8 +934,8 @@ mod tests {
         }
         assert_eq!(
             default_keys.len(),
-            21,
-            "the default arm must be 21 distinct libraries, unchanged"
+            22,
+            "the default arm must be 22 distinct libraries, unchanged (+eos_gate #735)"
         );
     }
 }

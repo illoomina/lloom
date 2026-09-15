@@ -3,7 +3,7 @@ use crate::kernels::metal::{
     completion::{CompletionWait, SharedEvent, WaitOutcome},
     executor::ExecutorSlot,
     BlitCommandEncoder, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipeline, Device,
-    Fence, GpuClock, PrevCeOutputs, ResidencySet,
+    DispatchGate, Fence, GpuClock, PrevCeOutputs, ResidencySet,
 };
 use crate::kernels::MetalKernelError;
 use block2::RcBlock;
@@ -399,6 +399,9 @@ pub struct Commands {
     /// run, which is the position the partition names.
     node_cut_pending: AtomicBool,
     device: Device,
+    /// The EOS gate (lloom #735 step 4), shared with every encoder this
+    /// `Commands` opens; disarmed and unallocated until a decode loop arms it.
+    eos_gate: Arc<DispatchGate>,
     /// Global cross-encoder output map. Maps buffer pointer to the fence of the last encoder
     /// that wrote it, enabling cross-command-buffer ordering for HazardTrackingModeUntracked.
     prev_ce_outputs: PrevCeOutputs,
@@ -640,6 +643,7 @@ impl Commands {
             cut_policy,
             node_cut_pending: AtomicBool::new(false),
             device,
+            eos_gate: Arc::new(DispatchGate::new()),
             prev_ce_outputs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             live_fences: Arc::new(parking_lot::Mutex::new(Vec::new())),
             residency_set,
@@ -727,6 +731,28 @@ impl Commands {
     /// The executor currently installed.
     pub fn executor(&self) -> Arc<ExecutorSlot> {
         Arc::clone(&self.executor.lock())
+    }
+
+    /// The EOS gate every encoder of this `Commands` binds while it is armed
+    /// (lloom #735 step 4).
+    pub fn eos_gate(&self) -> &Arc<DispatchGate> {
+        &self.eos_gate
+    }
+
+    /// Bind the armed gate's flag on the encoder that is already open, if
+    /// any — `begin` may arm the gate mid-encoder (after a prefill).
+    pub fn bind_eos_gate_current(&self) {
+        let Some(flag) = self.eos_gate.armed_flag() else {
+            return;
+        };
+        let state = self.state.lock();
+        if let Some(enc) = &state.current_encoder {
+            enc.set_input_buffer(
+                crate::kernels::metal::eos_gate::EOS_GATE_FLAG_INDEX,
+                Some(flag),
+                0,
+            );
+        }
     }
 
     /// The clock the buffer pools decide reuse against.
@@ -864,6 +890,15 @@ impl Commands {
                     &self.executor(),
                 )
                 .with_clock(Arc::clone(&self.clock));
+            if let Some(flag) = self.eos_gate.armed_flag() {
+                // The EOS gate (lloom #735 step 4): the gated kernel variants
+                // read the flag at this index; bound once per encoder.
+                enc.set_input_buffer(
+                    crate::kernels::metal::eos_gate::EOS_GATE_FLAG_INDEX,
+                    Some(flag),
+                    0,
+                );
+            }
             // Hazard state is per encoder, so a barrier count is only
             // interpretable against the session boundaries (`DESIGN.md` §9.2e).
             crate::kernels::metal::trace::record_encoder_begin();

@@ -48,6 +48,9 @@ pub mod compute_pipeline;
 mod cut_policy_tests;
 pub mod device;
 pub mod encoder;
+pub mod eos_gate;
+#[cfg(test)]
+mod eos_gate_gpu_tests;
 pub mod executor;
 #[cfg(test)]
 mod executor_tests;
@@ -121,6 +124,7 @@ pub use commands::*;
 pub use compute_pipeline::*;
 pub use device::*;
 pub use encoder::*;
+pub use eos_gate::{DispatchGate, EosGateReport};
 pub use executor::*;
 pub use fence::*;
 pub use kv_pages::*;

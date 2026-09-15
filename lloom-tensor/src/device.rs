@@ -2,6 +2,17 @@ use crate::backend::BackendDevice;
 use crate::cpu_backend::CpuDevice;
 use crate::{CpuStorage, DType, Result, Shape, Storage, WithDType};
 
+/// What a run of the EOS gate did (lloom #735 step 4; `Device::eos_gate_end`).
+/// Defined here so a `DecodeStats` compiles off Metal too.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EosGateReport {
+    /// The sticky flag was up when the run ended: an EOS was seen, and every
+    /// gated kernel of every forward encoded after it returned at once.
+    pub fired: bool,
+    /// Gate kernels dispatched (`step` calls).
+    pub steps: u64,
+}
+
 /// A `DeviceLocation` represents a physical device whereas multiple `Device`
 /// can live on the same location (typically for cuda devices).
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -552,6 +563,65 @@ impl Device {
     /// cuts a decode step sees are the ones the loop makes when the GPU has
     /// started the previous buffer. The prefill and every other caller keep
     /// the default. No-op off Metal.
+    /// Arm the EOS gate for a decode run (lloom #735 step 4,
+    /// `kernels::metal::DispatchGate`): allocate its flag once, clear it,
+    /// switch the decode kernels to their gated variants. Refused off Metal
+    /// or with an ICB executor installed. Precondition: no gated work in
+    /// flight (the previous run drained).
+    pub fn eos_gate_begin(&self) -> Result<()> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => d.eos_gate_begin(),
+            _ => crate::bail!("eos gate: not a Metal device"),
+        }
+    }
+
+    /// Between a step's argmax and the next forward: encode the gate kernel
+    /// on `token` (the U32 scalar the next forward consumes) against `eos_ids`
+    /// (U32, the stop set). Every gated kernel encoded after it reads the flag
+    /// the kernel left.
+    pub fn eos_gate_step(&self, token: &crate::Tensor, eos_ids: &crate::Tensor) -> Result<()> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => {
+                if token.dtype() != DType::U32 || eos_ids.dtype() != DType::U32 {
+                    crate::bail!(
+                        "eos gate: token and eos_ids must be U32 (got {:?}, {:?})",
+                        token.dtype(),
+                        eos_ids.dtype()
+                    );
+                }
+                let n_eos = eos_ids.elem_count();
+                let (t_storage, t_layout) = token.storage_and_layout();
+                let (e_storage, e_layout) = eos_ids.storage_and_layout();
+                match (&*t_storage, &*e_storage) {
+                    (Storage::Metal(t), Storage::Metal(e)) => d.eos_gate_step(
+                        t,
+                        t_layout.start_offset() * DType::U32.size_in_bytes(),
+                        e,
+                        e_layout.start_offset() * DType::U32.size_in_bytes(),
+                        n_eos,
+                    ),
+                    _ => crate::bail!("eos gate: token and eos_ids must live on the Metal device"),
+                }
+            }
+            _ => {
+                let _ = (token, eos_ids);
+                crate::bail!("eos gate: not a Metal device")
+            }
+        }
+    }
+
+    /// Disarm the gate and report what it did. `None` off Metal. Precondition
+    /// as `eos_gate_begin`'s: the run drained, so `fired` is the last gate's.
+    pub fn eos_gate_end(&self) -> Option<EosGateReport> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => Some(d.eos_gate_end()),
+            _ => None,
+        }
+    }
+
     pub fn cut_period_hold(&self, period: usize) -> PipelinedCutPeriod {
         match self {
             #[cfg(feature = "metal")]

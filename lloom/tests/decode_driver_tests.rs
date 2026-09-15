@@ -1124,3 +1124,174 @@ fn a_prompt_prefilled_in_chunks_then_resumed_is_one_decode() -> Result<()> {
     }
     Ok(())
 }
+
+/// One run under the adaptive commit with the EOS gate, a reader thread as
+/// the loop's EOS signal (the shape `lfm2-chat --stream-reader
+/// --adaptive-commit --eos-gate` and `lfm2-release --turns N` run). Returns
+/// the run and what the reader saw. `resume` positions the reader at the
+/// current stamp (`RingReader::resume_at_published`) — what a follow-up turn
+/// needs; a reader at zero would re-read the earlier run and end on its EOS.
+fn adaptive_gated_run(
+    session: &mut Session<'_, Chain>,
+    rb: &mut Ring,
+    prompt: &[u32],
+    n: usize,
+    resume: bool,
+) -> Result<(lloom::nn::DecodeOut, Vec<u32>)> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let mut reader = rb.reader().expect("mapped ring");
+    if resume {
+        reader.resume_at_published();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let opts = DecodeOptions {
+        lookahead: 1,
+        stream_via_reader: true,
+        adaptive_commit: true,
+        run_ahead: 8,
+        eos_gate: true,
+        stop: Some(Arc::clone(&stop)),
+        ..DecodeOptions::new(n)
+    };
+    let watcher = {
+        let stop = Arc::clone(&stop);
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut seen = Vec::new();
+            loop {
+                buf.clear();
+                if reader.read_new(&mut buf).is_err() {
+                    break;
+                }
+                seen.extend_from_slice(&buf);
+                if reader.ended() {
+                    stop.store(true, Ordering::Release);
+                    break;
+                }
+                if done.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            seen
+        })
+    };
+    let mut spec = IdentityProposer;
+    let mut sampler = greedy();
+    let out = session.decode(&mut spec, rb, &mut sampler, prompt, &opts, &mut sink)?;
+    done.store(true, Ordering::Release);
+    let seen = watcher.join().expect("watcher");
+    Ok((out, seen))
+}
+
+fn adaptive_ring(device: &Device, arm: EosRead) -> Result<Ring> {
+    let geometry = lloom::generation::Geometry {
+        batch: 1,
+        max_draft: 0,
+        period: 8,
+        lookahead: 1,
+        max_input_width: 1,
+        in_flight_depth: 4 + 3 * 8,
+    };
+    Ring::with_geometry(&[EOS], device, geometry, arm)
+}
+
+/// A reader taken for a LATER run on the same ring resumes at the current
+/// stamp (`RingReader::resume_at_published`, lloom #735): it sees only the
+/// second run's tokens, not the first run's — whose EOS would have ended it
+/// at once. Two adaptive runs, as two turns are.
+#[test]
+fn a_resumed_reader_sees_only_the_later_run() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        if matches!(device, Device::Cpu) {
+            continue; // the reader and the gate are Metal
+        }
+        let model = Chain::new(&device)?;
+        let mut rb = adaptive_ring(&device, EosRead::HostOnDrain)?;
+        // Run 1 from 1: reaches EOS.
+        let (want1, hit1) = chain(1, 64);
+        assert!(hit1);
+        let mut session = Session::new(&model, 0usize);
+        let (out1, seen1) = adaptive_gated_run(&mut session, &mut rb, &[1], 64, false)?;
+        assert_eq!(out1.ids, want1);
+        assert_eq!(seen1, want1);
+        // Run 2 from 0 on a fresh session, the same ring, a resumed reader.
+        let (want2, hit2) = chain(0, 24);
+        assert!(!hit2);
+        let mut session = Session::new(&model, 0usize);
+        let (out2, seen2) = adaptive_gated_run(&mut session, &mut rb, &[0], 24, true)?;
+        assert_eq!(out2.ids, want2);
+        assert_eq!(
+            seen2, want2,
+            "{device:?}: the resumed reader's stream is run 2's"
+        );
+        // The un-resumed reader starts at zero, reads run 1's ids and ends
+        // on run 1's EOS — the failure `resume_at_published` exists for.
+        let mut stale = rb.reader().expect("mapped ring");
+        let mut seen = Vec::new();
+        stale.read_new(&mut seen).expect("no lap");
+        assert_eq!(seen, want1, "{device:?}: the stale reader reads run 1");
+        assert!(stale.ended());
+    }
+    Ok(())
+}
+
+/// The adaptive commit with the EOS gate on the toy (lloom #735 step 4): the
+/// reader thread's flag stops the loop, the gate reports it fired, and the
+/// overrun is marked unwritten — the plumbing `lfm2-release --turns 3
+/// --adaptive-commit --eos-gate` relies on to continue the crown's cache
+/// across turns (`issue-735-eos-gate.md` §4). The toy's own kernels are not
+/// in the gated set, so what this pins is the loop, the flag and the stats,
+/// not the kernels' early-out (`eos_gate_gpu_tests.rs` pins that).
+#[test]
+fn the_adaptive_commit_with_the_eos_gate_stops_on_the_readers_flag() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        if matches!(device, Device::Cpu) {
+            continue; // the gate and the reader are Metal
+        }
+        for arm in [
+            EosRead::HostOnDrain,
+            EosRead::Poll(PollMechanism::default()),
+        ] {
+            let model = Chain::new(&device)?;
+            let mut session = Session::new(&model, 0usize);
+            let mut rb = adaptive_ring(&device, arm)?;
+            let (want, hit) = chain(1, 200);
+            assert!(hit);
+            let (out, seen) = adaptive_gated_run(&mut session, &mut rb, &[1], 200, false)?;
+            assert_eq!(out.ids, want, "{arm:?}: the ids up to the EOS");
+            assert!(out.eos, "{arm:?}: EOS reported");
+            assert_eq!(seen, want, "{arm:?}: the reader's stream");
+            assert!(
+                out.stats.stopped_by_flag,
+                "{arm:?}: the reader's flag stopped the loop"
+            );
+            let gate = out.stats.eos_gate.expect("the gate ran");
+            assert!(gate.fired, "{arm:?}: the gate saw the EOS: {gate:?}");
+            assert_eq!(
+                gate.steps, out.stats.steps,
+                "{arm:?}: one gate kernel per step"
+            );
+            assert_eq!(
+                out.stats.overrun_unwritten,
+                out.stats.overrun > 0,
+                "{arm:?}: an overrun past a fired gate is unwritten: {:?}",
+                out.stats
+            );
+            assert_eq!(session.overrun_unwritten(), out.stats.overrun > 0);
+            // The EOS's own forward is the first of the overrun (nothing after
+            // it is kept), so the position is the prompt, the ids and the overrun.
+            assert_eq!(
+                session.pos(),
+                1 + want.len() + out.stats.overrun,
+                "{arm:?}: the position is the prompt, the ids and the overrun"
+            );
+        }
+    }
+    Ok(())
+}

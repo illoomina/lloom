@@ -796,6 +796,59 @@ impl MetalDevice {
         self.commands.marker_complete(marker)
     }
 
+    /// The EOS gate (lloom #735 step 4): see `kernels::metal::DispatchGate`.
+    /// Refused with an executor installed — the gate covers directly encoded
+    /// dispatches, not an ICB replay.
+    pub fn eos_gate_begin(&self) -> Result<()> {
+        if !self.commands.executor().is_classical() {
+            crate::bail!(
+                "eos gate: an executor is installed; the gate applies to directly encoded \
+                 dispatches only"
+            );
+        }
+        self.commands
+            .eos_gate()
+            .begin(&self.device)
+            .map_err(MetalError::from)?;
+        // Bind before any gated variant can be selected (`set_eos_gated`
+        // last): an open encoder gets the flag now, later ones at creation.
+        self.commands.bind_eos_gate_current();
+        self.kernels.set_eos_gated(true);
+        Ok(())
+    }
+
+    /// See `Device::eos_gate_step`. Offsets in bytes.
+    pub fn eos_gate_step(
+        &self,
+        token: &crate::MetalStorage,
+        token_offset: usize,
+        eos_ids: &crate::MetalStorage,
+        eos_offset: usize,
+        n_eos: usize,
+    ) -> Result<()> {
+        let encoder = self.command_encoder()?;
+        self.commands
+            .eos_gate()
+            .step(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                token.buffer(),
+                token_offset,
+                eos_ids.buffer(),
+                eos_offset,
+                n_eos,
+            )
+            .map_err(MetalError::from)?;
+        Ok(())
+    }
+
+    /// See `Device::eos_gate_end`.
+    pub fn eos_gate_end(&self) -> crate::EosGateReport {
+        self.kernels.set_eos_gated(false);
+        self.commands.eos_gate().end()
+    }
+
     /// The adaptive commit (lloom #735): see `Commands::flush_marker_if_started`.
     pub fn flush_marker_if_started(&self) -> Result<Option<CommandMarker>> {
         Ok(self

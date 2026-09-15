@@ -191,6 +191,18 @@ pub trait CacheRewind {
     /// Discard the last `n` positions. Refused, before any mutation, past
     /// [`Self::rewind_horizon`].
     fn rewind(&mut self, n: usize) -> Result<()>;
+
+    /// Discard the last `n` positions that were **never written on the
+    /// device**: the forwards that advanced the host's bookkeeping launched
+    /// nothing (lloom #735's EOS gate, `DecodeOptions::eos_gate`), so the
+    /// cache's contents already end where the sequence does and only the
+    /// counters move back. Not bounded by [`Self::rewind_horizon`] — the
+    /// horizon protects contents a real rewind would have to restore. A cache
+    /// whose per-step bookkeeping cannot be undone this way refuses. The
+    /// default is a real rewind.
+    fn rewind_unwritten(&mut self, n: usize) -> Result<()> {
+        self.rewind(n)
+    }
 }
 
 /// The verifier's entry and the speculative rollback seam.

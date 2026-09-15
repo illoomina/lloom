@@ -219,6 +219,20 @@ pub trait ReadbackStrategy {
     /// ids). Rendered from the strategy rather than from a flag (§7.1a-i).
     fn eos_read_arm(&self) -> &'static str;
 
+    /// The stop set as a U32 device tensor, for the EOS gate
+    /// (`DecodeOptions::eos_gate`) to compare the sampled token against on
+    /// the GPU. `None` on a strategy that holds no device copy.
+    fn eos_ids_tensor(&self) -> Option<&Tensor> {
+        None
+    }
+
+    /// A reader over the ring's mapped words for another thread
+    /// (`Ring::reader`); `None` on a strategy with no mapped ring. On the
+    /// trait so a loop generic over the strategy (`lfm2-release`) can take one.
+    fn reader(&self) -> Option<RingReader> {
+        None
+    }
+
     /// The engagement counters so far.
     fn counters(&self) -> ReadbackCounters;
 }
@@ -531,6 +545,23 @@ impl RingReader {
     /// Whether a stop id ended the stream for this reader.
     pub fn ended(&self) -> bool {
         self.ended
+    }
+
+    /// Skip everything published so far: a reader taken for a LATER run on the
+    /// same ring (a follow-up turn) starts at the current stamp instead of at
+    /// zero, where it would re-read the earlier runs' tokens — and their EOS,
+    /// which would end it at once. The stamp counter runs across runs; the
+    /// previous run's tail synchronised, so the word read here is final.
+    ///
+    /// Valid when every earlier run stamped once per token it wrote — the
+    /// adaptive commit's arms (`publish_marker` per step, no retraction). A
+    /// per-step poll run that ended on an EOS retracted that token's tile
+    /// (`eos_of_last`) but not its stamp, so after it the stamp is one ahead
+    /// of the tiles and a reader resumed here would start one token late.
+    pub fn resume_at_published(&mut self) {
+        if let Some(p) = self.published() {
+            self.cursor = p as usize;
+        }
     }
 
     /// The tokens published since the last call, appended to `out`; stops at
@@ -1434,11 +1465,18 @@ impl Ring {
         let ring = TokenRing::with_input_ring(0, eos_ids, device, max_input_width, input_slots)?;
         let history = History::new(cap, quantum, device)?;
         // Cache the EOS ids host-side for the arms that need them there: the pure
-        // host compare (`HostOnDrain`) and the `GpuBatched` fallback + its `n_eos`.
-        // The per-token device-flag arms never touch this.
+        // host compare (`HostOnDrain`) and the `GpuBatched` fallback + its `n_eos`,
+        // and the poll arm — which learns EOS per step and never reaches a batch
+        // with one in it on its own loop, but under the adaptive commit (lloom
+        // #735) the loop skips its per-step wait and finds the EOS in the drained
+        // ids at the end, through `eos_in_drained`'s host scan. The blocking arm
+        // never touches this.
         let eos_ids_host = if matches!(
             eos,
-            EosRead::HostOnDrain | EosRead::GpuBatched | EosRead::GpuBatchedNonblocking
+            EosRead::Poll(_)
+                | EosRead::HostOnDrain
+                | EosRead::GpuBatched
+                | EosRead::GpuBatchedNonblocking
         ) {
             ring.eos_ids()?
         } else {
@@ -1939,6 +1977,14 @@ impl ReadbackStrategy for Ring {
         // publish rather than returning them as its tokens.
         let undrained = self.history.forget_undrained();
         self.counters.ring_discarded += (dropped_in_batch + undrained) as u64;
+    }
+
+    fn eos_ids_tensor(&self) -> Option<&Tensor> {
+        Some(self.ring.eos_ids_tensor())
+    }
+
+    fn reader(&self) -> Option<RingReader> {
+        Ring::reader(self)
     }
 
     fn eos_read_arm(&self) -> &'static str {

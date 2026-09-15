@@ -5,6 +5,7 @@ pub mod cast;
 pub mod conv_names;
 pub mod convolution;
 pub mod elementwise_names;
+pub mod eos_gate;
 pub mod eos_index;
 pub mod fill;
 pub mod flash_decoding;
@@ -36,6 +37,7 @@ pub use cast::{
 };
 pub use conv_names::ConvKernel;
 pub use convolution::*;
+pub use eos_gate::call_eos_gate;
 pub use eos_index::call_eos_index;
 pub use fill::*;
 pub use flash_decoding::{

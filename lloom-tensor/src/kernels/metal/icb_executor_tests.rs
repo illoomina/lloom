@@ -1197,3 +1197,122 @@ fn the_quarantine_names_the_swiglu_and_only_the_swiglu() {
     ));
     assert!(!is_quarantined("rmsnorm_f16_packed"));
 }
+
+/// The model's MLP under replay WITH THE PREVIOUS STEP IN FLIGHT (lloom
+/// #732): every ingredient the crown has — f16, a `StorageModePrivate`
+/// arena, the swiglu reading x at +512000 and writing h at +0, the packed
+/// `w2` consumer reading h and writing its output INTO x's slot, thirty
+/// pairs a step — and, unlike every other test here, the step is committed
+/// without waiting: the next step is encoded while this one runs, as the
+/// loop does. `--readback blocking` (a wait every step) was the one arm on
+/// which the model's divergence vanished, so the in-flight predecessor is
+/// the ingredient the earlier harness lacked.
+///
+/// `LLOOM_ICB_QUARANTINE_OFF=1` lifts the quarantine for the run so the
+/// swiglu is actually replayed (it is quarantined by name on the tree).
+#[test]
+fn a_replayed_long_command_with_the_previous_step_in_flight() {
+    use crate::kernels::kernels::mlx_gemm::{call_mlx_gemv_epilogue, GemmDType, GemvEpilogue};
+    use crate::kernels::metal::encoder::{set_hazard_key, HazardKey};
+    use half::f16;
+    require_icb_support!("a_replayed_long_command_with_the_previous_step_in_flight");
+    let (k, n_out, reps, steps) = (2048usize, 10752usize, 30usize, 8usize);
+    let wait_each_step = std::env::var("LLOOM_ICB_WAIT").is_ok();
+    let run = |executor: Option<&Arc<IcbExecutor>>| -> Vec<f32> {
+        let device = device();
+        let kernels = Kernels::new();
+        let cmds = commands(&device);
+        if let Some(e) = executor {
+            cmds.set_executor(Arc::new(ExecutorSlot::Custom(e.clone())));
+        }
+        let shared = crate::kernels::RESOURCE_OPTIONS;
+        let private = objc2_metal::MTLResourceOptions(
+            objc2_metal::MTLResourceOptions::StorageModePrivate.0
+                | objc2_metal::MTLResourceOptions::HazardTrackingModeUntracked.0,
+        );
+        let mk = |v: &[f32]| -> crate::kernels::metal::Buffer {
+            let h: Vec<f16> = v.iter().map(|x| f16::from_f32(*x)).collect();
+            device
+                .new_buffer_with_data(h.as_ptr() as *const std::ffi::c_void, h.len() * 2, shared)
+                .unwrap()
+        };
+        let up: Vec<f32> = (0..n_out * k).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect();
+        let gate: Vec<f32> = (0..n_out * k).map(|i| ((i % 19) as f32 - 9.0) / 32.0).collect();
+        let w2: Vec<f32> = (0..n_out * k).map(|i| ((i % 23) as f32 - 11.0) / 256.0).collect();
+        let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+        let res: Vec<f32> = (0..k).map(|i| ((i % 5) as f32 - 2.0) / 8.0).collect();
+        let (up_buf, gate_buf, w2_buf) = (mk(&up), mk(&gate), mk(&w2));
+        let staging = device.new_buffer(1 << 20, shared).unwrap();
+        unsafe {
+            let v: Vec<f16> = vec.iter().map(|x| f16::from_f32(*x)).collect();
+            let r: Vec<f16> = res.iter().map(|x| f16::from_f32(*x)).collect();
+            std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, (staging.contents() as *mut u8).add(512000), k * 2);
+            std::ptr::copy_nonoverlapping(r.as_ptr() as *const u8, (staging.contents() as *mut u8).add(772096), k * 2);
+        }
+        let arena = device.new_buffer(1 << 20, private).unwrap();
+        {
+            let mut blit = cmds.blit_command_encoder().unwrap();
+            blit.copy_from_buffer(&staging, 0, &arena, 0, 1 << 20);
+        }
+        cmds.flush_and_wait().unwrap();
+        let x = arena.view(512000, 256000);
+        let h = arena.view(0, 512000);
+        let o = arena.view(512000, 256000);
+        let residual = arena.view(772096, 4096);
+        let style = if executor.is_some() { ParamStyle::Packed } else { ParamStyle::Split };
+        for _ in 0..steps {
+            for _ in 0..reps {
+                {
+                    let guard = cmds.command_encoder().unwrap();
+                    call_mlx_gemv_epilogue(
+                        &device, &guard, &kernels, GemmDType::F16, (1, 1, n_out, k),
+                        &[k, k, 1], 0, &x, &[1, k], 0, &up_buf, &h, style, None,
+                        GemvEpilogue::Swiglu, Some((&gate_buf, 0)),
+                    )
+                    .unwrap();
+                }
+                {
+                    let guard = cmds.command_encoder().unwrap();
+                    call_mlx_gemv_epilogue(
+                        &device, &guard, &kernels, GemmDType::F16, (1, 1, k, n_out),
+                        &[n_out, n_out, 1], 0, &h, &[1, n_out], 0, &w2_buf, &o, style, None,
+                        GemvEpilogue::Residual, Some((&residual, 0)),
+                    )
+                    .unwrap();
+                }
+            }
+            if wait_each_step {
+                cmds.flush_and_wait().unwrap();
+            } else {
+                cmds.flush().unwrap();
+            }
+            if let Some(e) = executor {
+                e.end_step(&device, &cmds).unwrap();
+            }
+        }
+        {
+            let mut blit = cmds.blit_command_encoder().unwrap();
+            blit.copy_from_buffer(&arena, 0, &staging, 0, 1 << 20);
+        }
+        cmds.flush_and_wait().unwrap();
+        unsafe { std::slice::from_raw_parts((staging.contents() as *const u8).add(512000) as *const f16, k) }
+            .iter()
+            .map(|v| v.to_f32())
+            .collect()
+    };
+    set_hazard_key(HazardKey::Range);
+    set_default_param_style(ParamStyle::Packed);
+    set_constants_pool_enabled(true);
+    let executor = IcbExecutor::new(2);
+    let replayed = run(Some(&executor));
+    set_default_param_style(ParamStyle::Split);
+    set_constants_pool_enabled(false);
+    let classical = run(None);
+    set_hazard_key(HazardKey::Pointer);
+    let cov = executor.coverage();
+    eprintln!("[F] wait_each_step={wait_each_step} covered={} quarantined={} stale={}", cov.covered, cov.quarantined, executor.stale_positions());
+    assert!(executor.is_replaying(), "never replayed");
+    let differing = replayed.iter().zip(&classical).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    eprintln!("[F] o differs on {differing}/{k}; replayed[..3]={:?} classical[..3]={:?}", &replayed[..3], &classical[..3]);
+    assert_eq!(differing, 0, "the residual stream after 8 in-flight steps differs from classical");
+}

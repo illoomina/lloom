@@ -305,6 +305,12 @@ pub enum Excluded {
 /// Until the ordering hole is found, the positions run classically and the
 /// exclusion table says so.
 pub fn is_quarantined(name: &str) -> bool {
+    // The reproducer's switch (`icb_executor_tests`): lift the quarantine so
+    // the divergence can be exercised. Test-only by construction — read once.
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("LLOOM_ICB_QUARANTINE_OFF").is_ok()) {
+        return false;
+    }
     name.contains("_swiglu_")
 }
 

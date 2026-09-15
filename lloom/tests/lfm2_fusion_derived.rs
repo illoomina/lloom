@@ -25,6 +25,10 @@ use lloom_tensor::{DType, Device, Result, Tensor};
 /// one attention layer, so every epilogue site kind is exercised, and sizes
 /// the fused GEMV tiles are instantiated for.
 fn tiny_config(fusion: FusionPolicy, gemv_silu: bool, gemv_residual: bool) -> Config {
+    // `Manual` with the flags on means ALL the hand flags the derivation
+    // reproduces: the SiLU, the residual and (since #732's gate fragment)
+    // the SwiGLU product on `w3`.
+    let gemv_gate = gemv_silu && gemv_residual;
     Config {
         vocab_size: 64,
         hidden_size: 512,
@@ -43,6 +47,7 @@ fn tiny_config(fusion: FusionPolicy, gemv_silu: bool, gemv_residual: bool) -> Co
         fusion,
         gemv_silu,
         gemv_residual,
+        gemv_gate,
         ..Default::default()
     }
 }
@@ -189,31 +194,42 @@ fn the_census_shows_the_derived_plan_taken() -> Result<()> {
 
     let silu_off = count(&off, |l| l.starts_with("silu"));
     let badd_off = count(&off, |l| l.starts_with("badd") || l.starts_with("add"));
+    let bmul_off = count(&off, |l| l.starts_with("bmul") || l.starts_with("mul"));
     let silu_on = count(&derived, |l| l.starts_with("silu"));
     let badd_on = count(&derived, |l| l.starts_with("badd") || l.starts_with("add"));
+    let bmul_on = count(&derived, |l| l.starts_with("bmul") || l.starts_with("mul"));
     let fused_silu = count(&derived, |l| l.starts_with("gemv") && l.ends_with("_silu"));
     let fused_res = count(&derived, |l| {
         l.starts_with("gemv") && l.ends_with("_residual")
     });
+    let fused_mul = count(&derived, |l| l.starts_with("gemv") && l.ends_with("_mul"));
     eprintln!(
-        "silu {silu_off} -> {silu_on}; badd {badd_off} -> {badd_on}; \
-         gemv_*_silu {fused_silu}; gemv_*_residual {fused_res}"
+        "silu {silu_off} -> {silu_on}; badd {badd_off} -> {badd_on}; bmul {bmul_off} -> {bmul_on}; \
+         gemv_*_silu {fused_silu}; gemv_*_residual {fused_res}; gemv_*_mul {fused_mul}"
     );
-    // The fixture's decode step: 2 MLPs (2 silu, 2 w2 residuals) + 1 conv
-    // out_proj + 1 attention out_proj residual — the absolute references.
-    assert_eq!((silu_off, badd_off), (2, 4), "the unfused arm's counts");
+    // The fixture's decode step: 2 MLPs (2 silu, 2 w2 residuals, 2 gate
+    // products) + 1 conv out_proj + 1 attention out_proj residual; the conv
+    // layer's three `bmul`s (`b*x`, `window*w`, `c*conv`) stay — the
+    // absolute references.
     assert_eq!(
-        (silu_on, badd_on),
-        (0, 0),
+        (silu_off, badd_off, bmul_off),
+        (2, 4, 5),
+        "the unfused arm's counts"
+    );
+    assert_eq!(
+        (silu_on, badd_on, bmul_on),
+        (0, 0, 3),
         "ABSENT: the replaced dispatches"
     );
     assert_eq!(
-        (fused_silu, fused_res),
-        (2, 4),
+        (fused_silu, fused_res, fused_mul),
+        (2, 4, 2),
         "PRESENT: the fused kernels"
     );
     assert_eq!(
-        count(&off, |l| l.ends_with("_silu") || l.ends_with("_residual")),
+        count(&off, |l| l.ends_with("_silu")
+            || l.ends_with("_residual")
+            || l.ends_with("_mul")),
         0
     );
     Ok(())
@@ -286,7 +302,7 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     let model = build(&crown, &dev)?;
     let r = model.fusion_report().expect("Derived keeps its report");
     eprintln!("{r}");
-    assert!(r.gemv_silu && r.gemv_residual);
+    assert!(r.gemv_silu && r.gemv_residual && r.gemv_gate);
     assert_eq!(
         r.compositions,
         vec![Composition {
@@ -304,7 +320,13 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     );
     assert!(r.unvalidated.is_empty(), "{:?}", r.unvalidated);
     assert!(r.fused_in_stateful.is_empty(), "{:?}", r.fused_in_stateful);
-    assert!(r.plan.contains("regions[conv-ring=1 kv=1 nodes=7 fused-in-stateful=0]"), "{}", r.plan);
+    assert!(
+        r.plan.contains("gemv_mul=2")
+            && r.plan
+                .contains("regions[conv-ring=1 kv=1 nodes=7 fused-in-stateful=0]"),
+        "{}",
+        r.plan
+    );
 
     // The sliding ring under `conv_fused` runs `conv1d_depthwise`: no joint
     // entry, so the composition is reported as NOT validated jointly, and the
@@ -326,7 +348,10 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     );
     assert_eq!(
         r.unvalidated,
-        vec![("conv_fused+conv_state=ring".to_string(), "no entry".to_string())]
+        vec![(
+            "conv_fused+conv_state=ring".to_string(),
+            "no entry".to_string()
+        )]
     );
     assert!(r.validated.is_empty());
 
@@ -336,12 +361,18 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     let mut step = tiny_config(FusionPolicy::Derived, false, false);
     step.conv_fused = true;
     let r = build(&step, &dev)?.fusion_report().unwrap().clone();
-    assert_eq!(r.validated, vec![("conv_fused".to_string(), "shortconv_step".to_string())]);
+    assert_eq!(
+        r.validated,
+        vec![("conv_fused".to_string(), "shortconv_step".to_string())]
+    );
     assert!(r.compositions.is_empty());
     let mut rot = tiny_config(FusionPolicy::Derived, false, false);
     rot.conv_state = ConvState::RotatingRing { k: 0 };
     let r = build(&rot, &dev)?.fusion_report().unwrap().clone();
-    assert_eq!(r.validated, vec![("conv_state=rotating".to_string(), "fast_sum".to_string())]);
+    assert_eq!(
+        r.validated,
+        vec![("conv_state=rotating".to_string(), "fast_sum".to_string())]
+    );
     Ok(())
 }
 

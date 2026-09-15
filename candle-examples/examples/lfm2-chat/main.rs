@@ -382,6 +382,12 @@ struct Args {
     #[arg(long)]
     gemv_residual: Option<bool>,
 
+    /// Override the SwiGLU gate-product epilogue fusion (`GemvGate`, #732,
+    /// §12.2e row 3b). No preset bakes it: unset leaves the library default,
+    /// off. `--gemv-gate true` is the A/B arm.
+    #[arg(long)]
+    gemv_gate: Option<bool>,
+
     /// Who selects the GEMV epilogue fusions (`Fusion`, issue #732): `manual`
     /// (the two flags above as the preset and the overrides leave them) or
     /// `derived` (the optimizer derives the plan from the decode step's IR at
@@ -1360,6 +1366,9 @@ fn main() -> Result<()> {
     if let Some(v) = args.gemv_residual {
         config.gemv_residual = v;
     }
+    if let Some(v) = args.gemv_gate {
+        config.gemv_gate = v;
+    }
     if let Some(f) = args.fusion.as_deref() {
         config.fusion =
             lloom::models::lfm2::FusionPolicy::parse(f).map_err(|e| anyhow::anyhow!(e))?;
@@ -1469,6 +1478,25 @@ fn main() -> Result<()> {
     }
 
     let model = Model::new(&config, vb).context("constructing LFM2")?;
+    // The three GEMV epilogue arms as the model RAN them — under `derived`
+    // the plan's, read off the report, not the flags the caller passed — so
+    // a run's summary line says which arm it was taken in rather than leaving
+    // an A/B's arms to its file names (§7.1a; #721's shout).
+    let epilogue_arms = {
+        let (silu, residual, gate) = match model.fusion_report() {
+            Some(r) => (r.gemv_silu, r.gemv_residual, r.gemv_gate),
+            None => (config.gemv_silu, config.gemv_residual, config.gemv_gate),
+        };
+        let on: Vec<&str> = [(silu, "silu"), (residual, "residual"), (gate, "gate")]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect();
+        if on.is_empty() {
+            "none".to_string()
+        } else {
+            on.join("+")
+        }
+    };
     // The ceiling is the model's positional ceiling unless the user lowered
     // it; the slab starts at one bucket and grows toward it (`Cache::new_with`).
     let kv_capacity = args.kv_capacity.unwrap_or(config.max_position_embeddings);
@@ -2566,7 +2594,7 @@ fn main() -> Result<()> {
     eprintln!(
         "[{n} tokens: {} tok/s end-to-end (prefill included), \
          {} {} , TTFT {} ms, \
-         {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} qkv={qkv_arm} fusion={fusion_arm} bos={} \
+         {} on {:?}; cache={cache_arm} attn={attn_arm} kv={kv_arm} qkv={qkv_arm} fusion={fusion_arm} epilogues={epilogue_arms} bos={} \
          readback={} lookahead={} prefill_ubatch={} prefill_tile={} prefill_units={} \
          prompt_tokens={} free_budget_mb={} commit_budget={} commits={} max_in_flight={} \
          step_markers={} step_waits={} cut={} pipelined_cut={} \

@@ -562,6 +562,17 @@ pub enum GemvEpilogue {
     /// `-DLLOOM_509_RESIDUAL_EPILOGUE` until then, which made a dispatch-tier
     /// choice depend on a compile-tier flag; the arm now resolves at one tier.
     Residual,
+    /// The gate product, `x * gate[out_row]` (issue #732, `DESIGN.md` §12.2e
+    /// row 3b at the producer end).
+    ///
+    /// The residual's binding and the residual's arity argument, with `*` for
+    /// `+`: the operand is read at the storing thread's own output row. Row 3b
+    /// failed G1 as a PROLOGUE on `w2`, where the gate is a full vector of the
+    /// input extent; at `w3`'s epilogue `silu(w1·x)[i]` is row `i`'s own value.
+    /// Replaces the `bmul_f16` of `silu(w1·x) * (w3·x)`, computing at the
+    /// accumulator's precision on the unrounded up-projection — one rounding
+    /// fewer, so it moves the digests by construction (§2.3.5a).
+    Mul,
 }
 
 impl GemvEpilogue {
@@ -577,6 +588,7 @@ impl GemvEpilogue {
             GemvEpilogue::None => "",
             GemvEpilogue::Silu => "_silu",
             GemvEpilogue::Residual => "_residual",
+            GemvEpilogue::Mul => "_mul",
         }
     }
 
@@ -590,7 +602,7 @@ impl GemvEpilogue {
     pub fn needs_operand(self) -> bool {
         match self {
             GemvEpilogue::None | GemvEpilogue::Silu => false,
-            GemvEpilogue::Residual => true,
+            GemvEpilogue::Residual | GemvEpilogue::Mul => true,
         }
     }
 }

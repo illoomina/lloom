@@ -3312,6 +3312,10 @@ pub enum GemvFusion {
     /// Residual add on the accumulator, replacing a `badd_f16` dispatch
     /// (#509). Reads the residual at the storing thread's own output row.
     Residual,
+    /// The gate product on the accumulator, replacing the `bmul_f16` of
+    /// `silu(w1·x) * (w3·x)` (#732, §12.2e row 3b at the producer end). Reads
+    /// the gate at the storing thread's own output row, as the residual does.
+    Mul,
 }
 
 /// A GEMV with an elementwise transform fused onto its store.
@@ -3407,6 +3411,7 @@ fn gemv_fused_metal(
         GemvFusion::Off => GemvEpilogue::None,
         GemvFusion::Silu => GemvEpilogue::Silu,
         GemvFusion::Residual => GemvEpilogue::Residual,
+        GemvFusion::Mul => GemvEpilogue::Mul,
     };
 
     // The residual is bound at the storing thread's own output position, so it
@@ -3419,20 +3424,20 @@ fn gemv_fused_metal(
         Some((r, r_l)) => {
             if r.dtype() != x.dtype() {
                 lloom_tensor::bail!(
-                    "gemv-fused: residual dtype {:?} must match x dtype {:?} (issue #509)",
+                    "gemv-fused: the operand's dtype {:?} must match x dtype {:?} (issue #509)",
                     r.dtype(),
                     x.dtype()
                 );
             }
             if r_l.shape().elem_count() != b * n {
                 lloom_tensor::bail!(
-                    "gemv-fused: residual has {} elements, expected b*n = {} (issue #509)",
+                    "gemv-fused: the operand has {} elements, expected b*n = {} (issue #509)",
                     r_l.shape().elem_count(),
                     b * n
                 );
             }
             if !r_l.is_contiguous() {
-                lloom_tensor::bail!("gemv-fused: residual must be contiguous (issue #509)");
+                lloom_tensor::bail!("gemv-fused: the operand must be contiguous (issue #509)");
             }
             Some((r.buffer(), r_l.start_offset() * r.dtype().size_in_bytes()))
         }
@@ -3600,4 +3605,21 @@ pub fn gemv_silu(x: &Tensor, weight: &Tensor) -> Result<Tensor> {
 pub fn gemv_residual(x: &Tensor, weight: &Tensor, residual: &Tensor) -> Result<Tensor> {
     use crate::nn::fusion::{gemv, Residual};
     gemv(weight).then(Residual::of(residual)).eval(x)
+}
+
+/// `(x @ weight.t()) * gate` in one dispatch — the SwiGLU product on `w3`'s
+/// store (issue #732, `DESIGN.md` §12.2e row 3b at the producer end).
+///
+/// The consuming site is `lfm2.rs`'s `silu(w1(x)) * w3(x)`: `gate` is the
+/// `[.., 1, n]` SiLU'd gate projection, read at the storing thread's own
+/// output row exactly as [`gemv_residual`]'s operand is. 30 `bmul_f16`
+/// dispatches per token.
+///
+/// **Moves the digests**: the product lands at the f32 accumulator on the
+/// unrounded up-projection where the pair multiplies two rounded stores at
+/// `T` (§2.3.5a). Metal, `m == 1`, no bias — see [`GemvFused`]. The typed
+/// spelling is `fusion::gemv(weight).then(fusion::Gate::of(gate)).eval(x)`.
+pub fn gemv_mul(x: &Tensor, weight: &Tensor, gate: &Tensor) -> Result<Tensor> {
+    use crate::nn::fusion::{gemv, Gate};
+    gemv(weight).then(Gate::of(gate)).eval(x)
 }

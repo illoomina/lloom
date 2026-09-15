@@ -170,21 +170,51 @@ mod tests {
     }
 
     #[test]
-    fn both_epilogues_are_derived_on_the_mlp() {
+    fn all_three_epilogues_are_derived_on_the_mlp() {
         let g = mlp(1);
         let d = derive(&g, &Policy::default()).unwrap();
         assert_eq!(d.plan.sites.get("w1").map(String::as_str), Some("silu"));
+        assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("mul"));
         assert_eq!(d.plan.sites.get("w2").map(String::as_str), Some("residual"));
-        assert_eq!(d.plan.sites.len(), 2);
+        assert_eq!(d.plan.sites.len(), 3);
         assert_eq!(d.plan.dispatches_before(), 7);
-        assert_eq!(d.plan.dispatches_after(), 5);
+        assert_eq!(d.plan.dispatches_after(), 4);
         assert_eq!(d.plan.class, NumericClass::Rounding);
         assert_eq!(d.plan.after.get("gemv_silu"), Some(&1));
+        assert_eq!(d.plan.after.get("gemv_mul"), Some(&1));
         assert_eq!(d.plan.after.get("gemv_residual"), Some(&1));
         assert!(!d.plan.after.contains_key("silu"));
+        assert!(!d.plan.after.contains_key("bmul"));
         assert!(!d.plan.after.contains_key("badd"));
-        // The gate*up product is the one seam left: a fused GEMV feeding a
-        // multiply the catalogue has no fragment for.
+        // No seam is left: the gate*up product rides `w3`'s store, its
+        // operand the fused SiLU'd gate.
+        assert!(d.plan.seams.is_empty(), "{:?}", d.plan.seams);
+        // The fused product's operand is the fused gate, not the bare GEMV.
+        let mul = d
+            .graph
+            .nodes()
+            .iter()
+            .find(|n| n.op == Op::Fused && n.name == "mul")
+            .unwrap();
+        let operand = d.graph.node(mul.inputs[2]);
+        assert_eq!(
+            (operand.op.clone(), operand.name.as_str()),
+            (Op::Fused, "silu")
+        );
+    }
+
+    /// With the gate fragment excluded, the SwiGLU product is the seam the
+    /// first catalogue left — pinned so the seam report stays exercised.
+    #[test]
+    fn without_the_gate_fragment_the_product_is_the_seam_left() {
+        let g = mlp(1);
+        let policy = Policy {
+            excluded: vec!["mul".to_string()],
+            ..Default::default()
+        };
+        let d = derive(&g, &policy).unwrap();
+        assert_eq!(d.plan.sites.len(), 2);
+        assert_eq!(d.plan.dispatches_after(), 5);
         assert_eq!(
             d.plan.seams,
             vec![
@@ -269,7 +299,7 @@ mod tests {
         };
         let d = derive(&g, &policy).unwrap();
         assert!(d.plan.sites.is_empty());
-        assert_eq!(d.refused.len(), 2);
+        assert_eq!(d.refused.len(), 3);
         assert_eq!(d.plan.dispatches_after(), 7);
         assert_eq!(d.plan.class, NumericClass::BitExact);
     }
@@ -284,6 +314,7 @@ mod tests {
         let d = derive(&g, &policy).unwrap();
         assert_eq!(d.plan.sites.get("w1"), None);
         assert_eq!(d.plan.sites.get("w2").map(String::as_str), Some("residual"));
+        assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("mul"));
         assert_eq!(
             d.refused,
             vec![(

@@ -233,6 +233,29 @@ struct EpilogueResidual {
   }
 };
 
+// The gate product: `x * gate[out_row]` (§12.2e row 3b at the PRODUCER end).
+//
+// The same binding and the same arity argument as `EpilogueResidual`: the
+// second operand is read at the storing thread's own output position, one
+// element per thread, no cross-thread data. §12.2b's `gate * up` failed G1
+// as a PROLOGUE on `w2` — there the gate is a full vector of `w2`'s INPUT
+// extent, walked once per threadgroup — and row 3b was classified only at
+// that seam. At `w3`'s epilogue the gate IS row-indexed: `silu(w1·x)[i]` for
+// output row `i`. The product lands at the accumulator's precision before the
+// narrowing cast, where the `bmul_f16` it replaces multiplies two rounded
+// stores at `T` — one rounding fewer, a different computation, so the arm
+// moves the digests by construction and owes §2.3.5a's discriminator.
+template <typename T, typename AccT>
+struct EpilogueMul {
+  const device T* gate;
+
+  METAL_FUNC EpilogueMul(const device T* gate_) : gate(gate_) {}
+
+  METAL_FUNC AccT operator()(AccT x, int i) const {
+    return x * static_cast<AccT>(gate[i]);
+  }
+};
+
 // RMSNorm's elementwise tail: `x * inv_rms * weight[i]`.
 //
 // `inv_rms` is a single f32 the reduction dispatch wrote, read once at
@@ -944,6 +967,61 @@ void gemv_residual(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+/// gemv with a fused gate-product epilogue (issue #732, §12.2e row 3b)
+///////////////////////////////////////////////////////////////////////////////
+
+// `gemv_residual`'s signature with `EpilogueMul`: the operand at 15, after
+// every classical slot, so the host binds it at one index for both epilogues
+// that read one.
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_mul(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    const device T* bias [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& matrix_ld [[buffer(6)]],
+    const constant float& alpha [[buffer(7)]],
+    const constant float& beta [[buffer(8)]],
+    const constant int& batch_ndim [[buffer(9)]],
+    const constant int* batch_shape [[buffer(10)]],
+    const constant int64_t* vector_batch_stride [[buffer(11)]],
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],
+    const constant int64_t* bias_batch_stride [[buffer(13)]],
+    const constant int& bias_stride [[buffer(14)]],
+    const device T* gate [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueMul<T, typename kernel_t::acc_type>;
+  gemv_tgp_memory(kernel_t);
+  const prologue_t prologue(nullptr, nullptr);
+  // `tid.z` is the batch index and the gate is one vector per batch item,
+  // matching `out_vec += tid.z * out_vec_size` in `gemv_body`.
+  const epilogue_t epilogue(gate + tid.z * out_vec_size);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t>(
+      mat, in_vec, bias, out_vec,
+      in_vec_size, out_vec_size, matrix_ld, alpha, beta,
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      bias_batch_stride, bias_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue, epilogue,
+      tid, lid, simd_gid, simd_lid);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 /// gemv with a fused RMSNorm prologue (issue #266, §12.2 #2)
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -1163,6 +1241,47 @@ void gemv_residual_packed(
   GemvParams p = *pp;
   const prologue_t prologue(nullptr, nullptr);
   const epilogue_t epilogue(residual + tid.z * p.out_vec_size);
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
+                 epilogue_t>(
+      mat, in_vec, bias, out_vec,
+      p.in_vec_size, p.out_vec_size, p.matrix_ld, p.alpha, p.beta,
+      p.batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      bias_batch_stride, p.bias_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      prologue, epilogue,
+      tid, lid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_mul_packed(
+    const device GemvParams* pp [[buffer(0)]],
+    const device T* mat [[buffer(1)]],
+    const device T* in_vec [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const device int* batch_shape [[buffer(4)]],
+    const device int64_t* vector_batch_stride [[buffer(5)]],
+    const device int64_t* matrix_batch_stride [[buffer(6)]],
+    const device int64_t* bias_batch_stride [[buffer(7)]],
+    const device T* bias [[buffer(8)]],
+    const device T* gate [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
+  using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
+  using epilogue_t = EpilogueMul<T, typename kernel_t::acc_type>;
+  gemv_tgp_memory(kernel_t);
+  GemvParams p = *pp;
+  const prologue_t prologue(nullptr, nullptr);
+  const epilogue_t epilogue(gate + tid.z * p.out_vec_size);
   gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,
                  epilogue_t>(
       mat, in_vec, bias, out_vec,
@@ -1447,6 +1566,21 @@ void gemv_t_packed(
   instantiate_gemv_residual_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
   instantiate_gemv_residual_helper(nm, itype, 8, 1, 1, 32, 4, 4)
 
+// The gate-product epilogue (issue #732), named by appending `_mul`. `bm8`
+// is the decode tile: the site is `w3` (K=2048, N=10752), the same shape as
+// `w1`'s; `bm4` is instantiated beside it for the parity fixture's second
+// tile, as the two arms above are.
+#define instantiate_gemv_mul_helper(nm, itype, bm, bn, sm, sn, tm, tn)      \
+  template [[host_name(                                                    \
+      "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                  \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_mul")]]                             \
+  [[kernel]] decltype(gemv_mul<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_mul<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
+#define instantiate_gemv_mul_blocks(nm, itype)              \
+  instantiate_gemv_mul_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
+  instantiate_gemv_mul_helper(nm, itype, 8, 1, 1, 32, 4, 4)
+
 // The packed siblings of the two epilogue arms (issue #732 P3), named as every
 // packed name is: `_packed` LAST, `…_nc0_axpby0_silu_packed` — the replay
 // executor classifies a position by that suffix (`icb.rs` `is_packed`), so a
@@ -1467,11 +1601,20 @@ void gemv_t_packed(
   [[kernel]] decltype(gemv_residual_packed<itype, bm, bn, sm, sn, tm, tn, false, false>) \
              gemv_residual_packed<itype, bm, bn, sm, sn, tm, tn, false, false>;
 
+#define instantiate_gemv_mul_packed_helper(nm, itype, bm, bn, sm, sn, tm, tn)     \
+  template [[host_name(                                                            \
+      "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                          \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_mul_packed")]]                              \
+  [[kernel]] decltype(gemv_mul_packed<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_mul_packed<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
 #define instantiate_gemv_epilogue_packed_blocks(nm, itype)              \
   instantiate_gemv_silu_packed_helper(nm, itype, 4, 1, 1, 32, 4, 4)     \
   instantiate_gemv_silu_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4)     \
   instantiate_gemv_residual_packed_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
-  instantiate_gemv_residual_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4)
+  instantiate_gemv_residual_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4) \
+  instantiate_gemv_mul_packed_helper(nm, itype, 4, 1, 1, 32, 4, 4)      \
+  instantiate_gemv_mul_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4)
 
 #define instantiate_gemv_nc_axpby(func, nm, itype, bm, bn, sm, sn, tm, tn)    \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 0)      \
@@ -1536,6 +1679,10 @@ instantiate_gemv_silu_blocks(bfloat16, bfloat)
 instantiate_gemv_residual_blocks(float32, float)
 instantiate_gemv_residual_blocks(float16, half)
 instantiate_gemv_residual_blocks(bfloat16, bfloat)
+
+instantiate_gemv_mul_blocks(float32, float)
+instantiate_gemv_mul_blocks(float16, half)
+instantiate_gemv_mul_blocks(bfloat16, bfloat)
 
 // Their packed siblings (issue #732 P3): twelve names, the same two tiles.
 instantiate_gemv_epilogue_packed_blocks(float32, float)

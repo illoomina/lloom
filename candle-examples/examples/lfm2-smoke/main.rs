@@ -284,6 +284,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
+    /// Fuse the SwiGLU product onto `w3`'s GEMV store (`GemvGate`, #732). The
+    /// digests move; the text is expected identical.
+    #[arg(long, default_value_t = false)]
+    gemv_gate: bool,
+
     /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
     /// `conv1d` dispatch (`ConvFused`, §12.2 row 1). The digests move; the text
     /// is expected identical, which is what this harness checks.
@@ -430,12 +435,13 @@ fn main() -> Result<()> {
     // against the arm it was taken in.
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
+    config.gemv_gate = args.gemv_gate;
     config.conv_fused = args.conv_fused;
     config.fusion =
         lloom::models::lfm2::FusionPolicy::parse(&args.fusion).map_err(anyhow::Error::msg)?;
     println!(
-        "gemv epilogue: silu={} residual={}",
-        config.gemv_silu, config.gemv_residual
+        "gemv epilogue: silu={} residual={} gate={}",
+        config.gemv_silu, config.gemv_residual, config.gemv_gate
     );
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))

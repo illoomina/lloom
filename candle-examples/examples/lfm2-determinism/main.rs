@@ -384,6 +384,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
+    /// Fuse the SwiGLU product `silu(w1(x)) * w3(x)` onto `w3`'s GEMV store
+    /// (`GemvGate`, #732, §12.2e row 3b). **The digests MOVE**: the product
+    /// lands at the f32 accumulator where `bmul_f16` multiplies two rounded
+    /// stores at `T`.
+    #[arg(long, default_value_t = false)]
+    gemv_gate: bool,
+
     /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
     /// `conv1d` dispatch (§12.2 row 1). **The digests MOVE** — the depthwise
     /// kernel accumulates serially ascending in f32 where `sum_keepdim` uses a
@@ -721,6 +728,7 @@ fn main() -> Result<()> {
     // interpretable against the arm it was taken in (§2.3.7).
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
+    config.gemv_gate = args.gemv_gate;
     config.conv_fused = args.conv_fused;
     config.conv_prefill_ctx = args.conv_prefill_ctx;
     config.qkv_layout =
@@ -729,9 +737,10 @@ fn main() -> Result<()> {
     config.fusion =
         lloom::models::lfm2::FusionPolicy::parse(&args.fusion).map_err(anyhow::Error::msg)?;
     println!(
-        "gemv epilogue: silu={} residual={} fusion={}",
+        "gemv epilogue: silu={} residual={} gate={} fusion={}",
         config.gemv_silu,
         config.gemv_residual,
+        config.gemv_gate,
         config.fusion.name()
     );
 

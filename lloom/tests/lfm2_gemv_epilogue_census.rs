@@ -23,11 +23,23 @@
 
 #![cfg(feature = "metal")]
 
-use lloom_tensor::{DType, Device, Result, Tensor};
-use lloom::nn::VarBuilder;
 use lloom::models::lfm2::{Cache, Config, KvAppend, LayerType, Model};
+use lloom::nn::VarBuilder;
+use lloom_tensor::{DType, Device, Result, Tensor};
+
+/// The dispatch census is process-wide (`profile::reset` / `snapshot`), and
+/// the test harness runs this file's tests on parallel threads: two decodes
+/// in flight at once read each other's dispatches into one snapshot (seen as
+/// `silu_f16: 2 -> 2` beside `gemv_*_silu: 0 -> 2` the moment a third test
+/// joined the file). Every census-reading test holds this for its whole
+/// off/on pair. `parking_lot`, per `CONTRIBUTING.md` §3.3a — test code too.
+static CENSUS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
+    tiny_config_with_gate(gemv_silu, gemv_residual, false)
+}
+
+fn tiny_config_with_gate(gemv_silu: bool, gemv_residual: bool, gemv_gate: bool) -> Config {
     Config {
         vocab_size: 64,
         hidden_size: 512,
@@ -58,6 +70,7 @@ fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
         memory_budget: None,
         gemv_silu,
         gemv_residual,
+        gemv_gate,
         // #363's tap: off, as every pre-#363 caller had it.
         tap_layers: Vec::new(),
         tap_dtype: DType::F32,
@@ -173,6 +186,7 @@ fn dump(tag: &str, census: &[(String, u64)]) {
 /// and a delta-only test cannot see it.
 #[test]
 fn the_census_shows_gemv_silu_replacing_the_silu_dispatch() -> Result<()> {
+    let _serial = CENSUS.lock();
     if !lloom_tensor::metal_backend::profile::enabled() {
         eprintln!(
             "SKIPPED: this test reads the dispatch census, which is only \
@@ -239,6 +253,7 @@ fn the_census_shows_gemv_silu_replacing_the_silu_dispatch() -> Result<()> {
 /// which is recorded only under `CANDLE_METAL_PROFILE=1`.
 #[test]
 fn the_census_shows_gemv_residual_replacing_the_add_dispatch() -> Result<()> {
+    let _serial = CENSUS.lock();
     if !lloom_tensor::metal_backend::profile::enabled() {
         eprintln!(
             "SKIPPED: this test reads the dispatch census, which is only \
@@ -293,6 +308,54 @@ fn the_census_shows_gemv_residual_replacing_the_add_dispatch() -> Result<()> {
         "ABSENT: the standalone add dispatches must FALL ({add_off} -> \
          {add_on}); a fusion that does not remove the dispatch it replaces has \
          added work"
+    );
+    Ok(())
+}
+
+/// The third epilogue (#732, §12.2e row 3b at the producer end): with
+/// `gemv_gate` on, the fused `gemv_*_mul` kernel is PRESENT and the MLP's
+/// `bmul` dispatches FALL — by exactly the number of MLPs in the fixture (2);
+/// the conv layer's three `bmul`s are untouched. The SiLU flag stays off, so
+/// the arm is shown not to depend on `gemv_silu`: the gate is `silu_f16`'s
+/// store either way.
+#[test]
+fn the_census_shows_gemv_mul_replacing_the_gate_product_dispatch() -> Result<()> {
+    let _serial = CENSUS.lock();
+    if !lloom_tensor::metal_backend::profile::enabled() {
+        eprintln!(
+            "SKIPPED: this test reads the dispatch census, which is only \
+             recorded under CANDLE_METAL_PROFILE=1. Re-run with it set."
+        );
+        return Ok(());
+    }
+    let Ok(dev) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return Ok(());
+    };
+    let off = decode_census(&tiny_config_with_gate(false, false, false), &dev)?;
+    dump("gemv_gate OFF", &off);
+    let on = decode_census(&tiny_config_with_gate(false, false, true), &dev)?;
+    dump("gemv_gate ON", &on);
+    assert!(
+        !off.is_empty() && off.iter().map(|(_, n)| *n).sum::<u64>() > 0,
+        "the census recorded no dispatches at all (§2.4)"
+    );
+    let bmul_off = count_matching(&off, |l| l.starts_with("bmul") || l.starts_with("mul"));
+    let fused_off = count_matching(&off, |l| l.starts_with("gemv") && l.ends_with("_mul"));
+    let bmul_on = count_matching(&on, |l| l.starts_with("bmul") || l.starts_with("mul"));
+    let fused_on = count_matching(&on, |l| l.starts_with("gemv") && l.ends_with("_mul"));
+    eprintln!("bmul_f16: {bmul_off} -> {bmul_on}   gemv_*_mul: {fused_off} -> {fused_on}");
+    // Absolute references: 2 MLP products + the conv layer's 3 (`b*x`,
+    // `window*w`, `c*conv`) = 5; the 2 MLP ones become the fused kernel.
+    assert_eq!(bmul_off, 5, "the unfused arm's bmul count");
+    assert_eq!(
+        fused_off, 0,
+        "the fused kernel must NOT be dispatched with the flag off (§7.1a)"
+    );
+    assert_eq!(fused_on, 2, "PRESENT: one gemv_*_mul per MLP");
+    assert_eq!(
+        bmul_on, 3,
+        "ABSENT: the MLP's bmul dispatches, and only those"
     );
     Ok(())
 }

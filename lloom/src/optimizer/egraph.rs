@@ -135,6 +135,18 @@ fn prelude(fragments: &[Fragment]) -> String {
                      ((union e (Fused w x (Epi_{name} r)))))"
                 );
             }
+            // The product of a GEMV store with a row-indexed operand: on the
+            // SwiGLU `mul(silu(w1·x), w3·x)` the bare `Gemv` child is `w3`'s
+            // (the gate side is `Silu(..)`, or `Fused` once its own rule has
+            // fired), so the operand is the gate and the fusion rides `w3`.
+            // `Mul`'s commutativity rewrite lets either operand order match.
+            (Semantics::MulOperand, OperandKind::RowIndexed) => {
+                let _ = writeln!(
+                    p,
+                    "(rule ((= e (Mul g r)) (= g (Gemv w x)) (= (rows g) 1))\n      \
+                     ((union e (Fused w x (Epi_{name} r)))))"
+                );
+            }
             // Identity is the unfused arm itself; any other pairing has no
             // rule shape yet and contributes nothing rather than a guess.
             _ => {}

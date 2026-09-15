@@ -206,6 +206,7 @@ impl Lfm2Config {
             // here — this change makes the arm reachable, nothing more.
             gemv_silu: false,
             gemv_residual: false,
+            gemv_gate: false,
             conv_fused: false,
             conv_prefill_ctx: false,
             fusion: FusionPolicy::default(),
@@ -722,13 +723,13 @@ pub fn report_weight_divergence(r: &lloom_tensor::metal_backend::admission::Weig
 /// `optimizer-design.md` §0.2, issue #732).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FusionPolicy {
-    /// The per-site flags as set: `gemv_silu`, `gemv_residual`. The incumbent,
-    /// and the arm every recorded digest belongs to.
+    /// The per-site flags as set: `gemv_silu`, `gemv_residual`, `gemv_gate`.
+    /// The incumbent, and the arm every recorded digest belongs to.
     #[default]
     Manual,
     /// The optimizer derives the plan from the step's IR and the fragment
     /// catalogue at construction (`crate::optimizer`), and the derived plan
-    /// REPLACES the two epilogue flags. `conv_fused` is not an elementwise
+    /// REPLACES the three epilogue flags. `conv_fused` is not an elementwise
     /// fusion and stays as set.
     Derived,
 }
@@ -764,6 +765,7 @@ pub struct FusionReport {
     pub plan: String,
     pub gemv_silu: bool,
     pub gemv_residual: bool,
+    pub gemv_gate: bool,
     /// The build's math mode the model was constructed under.
     pub math_mode: &'static str,
     /// Fragments the policy refused: (name, why).
@@ -817,10 +819,11 @@ impl std::fmt::Display for FusionReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "lfm2 fusion=derived: {}; gemv_silu={} gemv_residual={} math={} ({} refused, {} validated, {} unvalidated",
+            "lfm2 fusion=derived: {}; gemv_silu={} gemv_residual={} gemv_gate={} math={} ({} refused, {} validated, {} unvalidated",
             self.plan,
             self.gemv_silu,
             self.gemv_residual,
+            self.gemv_gate,
             self.math_mode,
             self.refused.len(),
             self.validated.len(),
@@ -1028,6 +1031,17 @@ pub struct Config {
     /// the f32 accumulator where `badd_f16` adds at `T` on the rounded store.
     #[axis(name = "GemvResidual", flag = "gemv-residual", variants = ["off", "on"], default = "off", bool)]
     pub gemv_residual: bool,
+    /// Fuse the SwiGLU product `silu(w1(x)) * w3(x)` onto `w3`'s GEMV store
+    /// (issue #732, `DESIGN.md` §12.2e row 3b at the producer end): the gate
+    /// is read at the storing thread's own output row, the residual's shape
+    /// with `*` for `+`. 30 `bmul_f16` dispatches per token.
+    ///
+    /// **Defaults to off**, per §7.1a. Metal, `seq_len == 1`; every other case
+    /// takes the eager path. **Moves the digests by construction**: the
+    /// product lands at the f32 accumulator on the unrounded up-projection
+    /// where the pair multiplies two rounded stores at `T` (§2.3.5a).
+    #[axis(name = "GemvGate", flag = "gemv-gate", variants = ["off", "on"], default = "off", bool)]
+    pub gemv_gate: bool,
     /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
     /// `conv1d` dispatch (§12.2 row 1). Off by default (§7.1a): it MOVES the
     /// digest — the depthwise kernel accumulates serially ascending in f32 where
@@ -1207,6 +1221,7 @@ impl Default for Config {
             memory_budget: None,
             gemv_silu: false,
             gemv_residual: false,
+            gemv_gate: false,
             conv_fused: false,
             conv_prefill_ctx: false,
             fusion: FusionPolicy::default(),
@@ -3468,6 +3483,9 @@ struct Mlp {
     /// Fuse the post-MLP residual add onto `w2`'s GEMV store (§12.2h). 30 of
     /// the 60 `badd_f16` dispatches per token.
     gemv_residual: bool,
+    /// Fuse the gate product onto `w3`'s GEMV store (§12.2e row 3b, #732).
+    /// The 30 `bmul_f16` dispatches per token.
+    gemv_gate: bool,
     span: tracing::Span,
 }
 
@@ -3485,6 +3503,7 @@ impl Mlp {
             down_proj,
             gemv_silu: cfg.gemv_silu,
             gemv_residual: cfg.gemv_residual,
+            gemv_gate: cfg.gemv_gate,
             span: tracing::span!(tracing::Level::TRACE, "mlp"),
         })
     }
@@ -3543,6 +3562,14 @@ impl Mlp {
         } else {
             crate::nn::ops::silu(&self.gate_proj.forward(x)?)?
         };
+        // The product on `w3`'s store, the gate its row-indexed operand: one
+        // dispatch for `w3` and the `bmul` (§12.2e row 3b, #732). The same
+        // applicability as the residual arm — `w3` has `w1`'s shape, and the
+        // gate is exactly `w3`'s output extent, contiguous, as `gemv_silu`
+        // and `silu` both store it.
+        if self.gemv_gate && gemv_residual_applies(true, x, &self.up_proj, &gate) {
+            return crate::nn::ops::gemv_mul(x, self.up_proj.weight(), &gate);
+        }
         let up = self.up_proj.forward(x)?;
         gate * up
     }
@@ -5492,9 +5519,11 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<(Config, FusionReport)> {
     let gemv_silu = uniform("feed_forward.w1.weight", "silu")?;
     let gemv_residual =
         uniform("feed_forward.w2.weight", "residual")? && uniform("out_proj.weight", "residual")?;
-    // Every fused site must be one of the two kinds the flags name.
+    let gemv_gate = uniform("feed_forward.w3.weight", "mul")?;
+    // Every fused site must be one of the three kinds the flags name.
     for (site, fragment) in &plan.sites {
         let known = (fragment == "silu" && site.ends_with("feed_forward.w1.weight"))
+            || (fragment == "mul" && site.ends_with("feed_forward.w3.weight"))
             || (fragment == "residual"
                 && (site.ends_with("feed_forward.w2.weight") || site.ends_with("out_proj.weight")));
         if !known {
@@ -5512,6 +5541,7 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<(Config, FusionReport)> {
     report.plan = plan.to_string();
     report.gemv_silu = gemv_silu;
     report.gemv_residual = gemv_residual;
+    report.gemv_gate = gemv_gate;
     report.refused = d.refused.clone();
     report.fused_in_stateful = plan
         .regions
@@ -5522,6 +5552,7 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<(Config, FusionReport)> {
     let mut out = cfg.clone();
     out.gemv_silu = gemv_silu;
     out.gemv_residual = gemv_residual;
+    out.gemv_gate = gemv_gate;
     Ok((out, report))
 }
 

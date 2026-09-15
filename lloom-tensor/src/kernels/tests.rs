@@ -3792,7 +3792,11 @@ fn packed_matches_split_for_the_fused_epilogues_f16() {
         let res: Vec<f16> = (0..n_out)
             .map(|i| f16::from_f32(((i * 11 % 23) as f32 - 11.0) / 8.0))
             .collect();
-        for epilogue in [GemvEpilogue::Silu, GemvEpilogue::Residual] {
+        for epilogue in [
+            GemvEpilogue::Silu,
+            GemvEpilogue::Residual,
+            GemvEpilogue::Mul,
+        ] {
             let run = |style: ParamStyle| -> Vec<f16> {
                 let device = device();
                 let kernels = Kernels::new();
@@ -3899,7 +3903,7 @@ fn gemv_packed_names_resolve() {
     // `is_packed` reads it.
     for dtype in ["float32", "float16", "bfloat16"] {
         for bm in [4, 8] {
-            for epilogue in ["_silu", "_residual"] {
+            for epilogue in ["_silu", "_residual", "_mul"] {
                 let classical =
                     format!("gemv_{dtype}_bm{bm}_bn1_sm1_sn32_tm4_tn4_nc0_axpby0{epilogue}");
                 let packed =
@@ -3914,8 +3918,8 @@ fn gemv_packed_names_resolve() {
         }
     }
     assert_eq!(
-        checked, 24,
-        "6 classical epilogue names and their 6 packed siblings, at 3 dtypes... twice the tiles"
+        checked, 36,
+        "9 classical epilogue names and their 9 packed siblings, at 3 dtypes... twice the tiles"
     );
     for (prefix, blocks) in [("gemv", &gemv_blocks[..]), ("gemv_t", &gemv_t_blocks[..])] {
         for dtype in ["float32", "float16", "bfloat16"] {
@@ -3940,8 +3944,8 @@ fn gemv_packed_names_resolve() {
     }
     assert_eq!(
         checked,
-        288 + 24,
-        "expected 144 classical + 144 packed gemv variants, and the 12 epilogue names with their 12 packed siblings"
+        288 + 36,
+        "expected 144 classical + 144 packed gemv variants, and the 18 epilogue names with their 18 packed siblings"
     );
 }
 
@@ -7945,6 +7949,153 @@ fn run_gemv_fused_residual(
 /// A CPU reference for the matmul followed by the residual add, computed in
 /// f64 so it is not itself one of the two f32 orderings being compared
 /// (§10.2g, §2.3.5a).
+/// `run_gemv_fused_residual` with the gate-product epilogue: the same
+/// operand binding (slot 15), `*` for `+`.
+fn run_gemv_fused_mul(
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &[f32],
+    lhs_stride: &[usize],
+    rhs: &[f32],
+    rhs_stride: &[usize],
+    gate: &[f32],
+) -> Vec<f32> {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+    let mk = |v: &[f32]| {
+        device
+            .new_buffer_with_data(
+                v.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(v),
+                options,
+            )
+            .unwrap()
+    };
+    let lhs_buf = mk(lhs);
+    let rhs_buf = mk(rhs);
+    let gate_buf = mk(gate);
+    let length = b * m * n;
+    let output = device
+        .new_buffer(length * core::mem::size_of::<f32>(), options)
+        .unwrap();
+    call_mlx_gemv_epilogue(
+        &device,
+        &encoder,
+        &kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        0,
+        &lhs_buf,
+        rhs_stride,
+        0,
+        &rhs_buf,
+        &output,
+        ParamStyle::Split,
+        None,
+        GemvEpilogue::Mul,
+        Some((&gate_buf, 0)),
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec(&output, length)
+}
+
+fn reference_gemv_mul(
+    (m_out, k): (usize, usize),
+    mat: &[f32],
+    vec: &[f32],
+    gate: &[f32],
+) -> Vec<f64> {
+    (0..m_out)
+        .map(|row| {
+            let mut acc = 0.0f64;
+            for c in 0..k {
+                acc += mat[row * k + c] as f64 * vec[c] as f64;
+            }
+            acc * gate[row] as f64
+        })
+        .collect()
+}
+
+/// The gate-product epilogue against an f64 reference, at both tiles, with a
+/// gate that varies with position and is never 1 or 0 — a constant gate cannot
+/// tell `gate[out_row]` from `gate[0]`, a 1 makes that row agree with no
+/// epilogue at all, and a 0 makes it agree with any epilogue that zeroes.
+#[test]
+fn gemv_fused_mul_matches_a_reference() {
+    for &(k, n_out, label) in &[
+        (2048usize, 512usize, "bm4, K divides blockN"),
+        (2048usize, 6144usize, "bm8 (w3's tile), K divides blockN"),
+        (2050usize, 512usize, "bm4, K leaves a 2-element tail"),
+        (2050usize, 6144usize, "bm8, K leaves a 2-element tail"),
+    ] {
+        let (b, m, n) = (1usize, n_out, 1usize);
+        let mat: Vec<f32> = (0..n_out * k)
+            .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+            .collect();
+        let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+        let gate: Vec<f32> = (0..n_out)
+            .map(|i| ((i % 23) as f32 - 11.0) / 8.0 + 0.0625)
+            .collect();
+        assert!(
+            gate.iter().all(|v| *v != 0.0 && *v != 1.0),
+            "{label}: the fixture's gate must have no 0 or 1 entry"
+        );
+        let got = run_gemv_fused_mul(
+            GemmDType::F32,
+            (b, m, n, k),
+            &mat,
+            &[m * k, k, 1],
+            &vec,
+            &[k, 1, 1],
+            &gate,
+        );
+        let want = reference_gemv_mul((n_out, k), &mat, &vec, &gate);
+        assert_eq!(got.len(), want.len(), "{label}: length");
+        let distinct = got
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            distinct >= 2,
+            "{label}: {distinct} distinct value(s); vacuous"
+        );
+        // Engagement: the product must differ from the bare GEMV at every row
+        // (the gate is never 1), and from the residual at every row.
+        let bare = reference_gemv_residual((n_out, k), &mat, &vec, &vec![0.0; n_out]);
+        let differs = got
+            .iter()
+            .zip(bare.iter())
+            .filter(|(g, w)| (**g as f64 - **w).abs() > 1e-6)
+            .count();
+        assert_eq!(
+            differs, n_out,
+            "{label}: the epilogue engaged on {differs} of {n_out} rows"
+        );
+        let mut worst = 0.0f64;
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            let denom = w.abs().max(1.0);
+            let rel = ((g as f64) - w).abs() / denom;
+            worst = worst.max(rel);
+            assert!(
+                rel < 2e-5,
+                "{label}: row {i}: fused {g} vs reference {w} (rel {rel:e})"
+            );
+        }
+        // No `worst > 0` non-vacuity arm here: the fixture's products are
+        // dyadic and the f32 accumulation is exact at these extents, so the
+        // f64 reference IS the kernel's answer. Engagement is the check above:
+        // every row differs from the bare GEMV, as a gate that is never 1 must.
+        eprintln!("{label}: worst rel {worst:e}");
+    }
+}
+
 fn reference_gemv_residual(
     (m_out, k): (usize, usize),
     mat: &[f32],

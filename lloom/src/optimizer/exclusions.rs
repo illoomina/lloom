@@ -445,7 +445,11 @@ mod tests {
     /// the test-side half of the declaration `verdict.py` writes.
     fn transform_family(name: &str) -> Option<&'static str> {
         Some(match name {
-            "gemv_silu" | "gemv_residual" | "gemv_silu+gemv_residual" => "gemv",
+            "gemv_silu"
+            | "gemv_residual"
+            | "gemv_silu+gemv_residual"
+            | "gemv_mul"
+            | "gemv_silu+gemv_residual+gemv_mul" => "gemv",
             "conv_fused" => "shortconv_step",
             "conv_fused+conv_state=rotating" => "shortconv_ring",
             "conv_state=rotating" | "conv_state=ring" => "fast_sum",
@@ -468,6 +472,8 @@ mod tests {
             "gemv_silu",
             "gemv_residual",
             "gemv_silu+gemv_residual",
+            "gemv_mul",
+            "gemv_silu+gemv_residual+gemv_mul",
             "conv_fused",
             "conv_fused+conv_state=rotating",
             "conv_state=rotating",

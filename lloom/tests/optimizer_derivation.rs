@@ -119,11 +119,12 @@ fn the_elementwise_family_is_186_of_538() {
 
 /// **The P1 gate.** The derivation over the unfused step independently
 /// arrives at the hand-written composition: SiLU onto every `w1` (30 sites,
-/// `Config::gemv_silu`) and the residual onto every `w2`, `out_proj` and
-/// `conv.out_proj` (30 + 8 + 22 = 60 sites, `Config::gemv_residual`) — and
-/// onto nothing else. 538 dispatches become 448: the 30 `silu_f16` and 60
-/// `badd_f16` the fused arms replace (`design/docs/fusion.md` §12.2i's
-/// census), in the `Rounding` class (§12.2i: 2.50 and 2.25 f16 ulp, flat).
+/// `Config::gemv_silu`), the residual onto every `w2`, `out_proj` and
+/// `conv.out_proj` (30 + 8 + 22 = 60 sites, `Config::gemv_residual`), and —
+/// since the gate fragment (#732, §12.2e row 3b) — the SwiGLU product onto
+/// every `w3` (30 sites, `Config::gemv_gate`); onto nothing else. 538
+/// dispatches become 418: the 30 `silu_f16`, 60 `badd_f16` and 30 MLP
+/// `bmul_f16` the fused arms replace, in the `Rounding` class.
 #[test]
 fn the_derivation_reproduces_the_hand_written_composition() {
     let mut cfg = lfm2_2_6b();
@@ -140,6 +141,14 @@ fn the_derivation_reproduces_the_hand_written_composition() {
     assert!(
         silu.iter().all(|s| s.ends_with(".feed_forward.w1.weight")),
         "{silu:?}"
+    );
+
+    let mut gate = plan.sites_of("mul");
+    gate.sort();
+    assert_eq!(gate.len(), 30, "gemv_mul sites: {gate:?}");
+    assert!(
+        gate.iter().all(|s| s.ends_with(".feed_forward.w3.weight")),
+        "{gate:?}"
     );
 
     let mut residual = plan.sites_of("residual");
@@ -160,24 +169,27 @@ fn the_derivation_reproduces_the_hand_written_composition() {
     assert_eq!((w2, attn, conv), (30, 8, 22));
     assert_eq!(
         plan.sites.len(),
-        90,
+        120,
         "nothing else is fused: {:?}",
         plan.sites
     );
 
     assert_eq!(plan.dispatches_before(), 538);
-    assert_eq!(plan.dispatches_after(), 448);
+    assert_eq!(plan.dispatches_after(), 418);
     assert_eq!(plan.after.get("silu"), None);
     assert_eq!(plan.after.get("badd"), None);
+    // The 30 MLP `bmul`s are gone; the 66 conv `bmul`s remain.
+    assert_eq!(plan.after.get("bmul"), Some(&66));
     assert_eq!(plan.after.get("gemv_silu"), Some(&30));
+    assert_eq!(plan.after.get("gemv_mul"), Some(&30));
     assert_eq!(plan.after.get("gemv_residual"), Some(&60));
-    assert_eq!(plan.after.get("gemv"), Some(&(167 - 90)));
+    assert_eq!(plan.after.get("gemv"), Some(&(167 - 120)));
     assert_eq!(plan.class, NumericClass::Rounding);
     assert!(d.refused.is_empty(), "{:?}", d.refused);
 
-    // The derived graph carries 90 fused nodes and no standalone silu/add.
+    // The derived graph carries 120 fused nodes and no standalone silu/add.
     let fused = d.graph.nodes().iter().filter(|n| n.op == Op::Fused).count();
-    assert_eq!(fused, 90);
+    assert_eq!(fused, 120);
     assert_eq!(
         d.graph
             .nodes()
@@ -195,8 +207,8 @@ fn the_derivation_reproduces_the_hand_written_composition() {
 ///
 /// Per conv layer (22): `bmul(state, w)` reads the second `copy2d` (the new
 /// state) — `copy2d>bmul`; `bmul(c, conv)` reads `fast_sum` — `fast_sum>bmul`.
-/// Per MLP (30): `bmul(gate, up)` reads the fused `gemv_silu` and the `w3`
-/// GEMV — `gemv_silu>bmul` and `gemv>bmul`. `bmul(b, x)` reads two views of
+/// The MLP's `bmul(gate, up)` is no longer a seam: it rides `w3`'s store
+/// (`gemv_mul`, #732's third fragment). `bmul(b, x)` reads two views of
 /// `in_proj`'s output, which has three readers: not a seam.
 #[test]
 fn the_seams_left_are_the_gap_the_catalogue_cannot_express() {
@@ -211,6 +223,17 @@ fn the_seams_left_are_the_gap_the_catalogue_cannot_express() {
     };
     assert_eq!(
         d.plan.seams,
+        vec![seam("copy2d", "bmul", 22), seam("fast_sum", "bmul", 22),]
+    );
+    // And with the gate fragment excluded, the SwiGLU seam the first
+    // catalogue reported comes back, at its count.
+    let policy = Policy {
+        excluded: vec!["mul".to_string()],
+        ..Default::default()
+    };
+    let d = derive(&g, &policy).expect("derivation");
+    assert_eq!(
+        d.plan.seams,
         vec![
             seam("gemv", "bmul", 30),
             seam("gemv_silu", "bmul", 30),
@@ -218,6 +241,7 @@ fn the_seams_left_are_the_gap_the_catalogue_cannot_express() {
             seam("fast_sum", "bmul", 22),
         ]
     );
+    assert_eq!(d.plan.dispatches_after(), 448);
 }
 
 /// The budget refuses what it cannot admit: at `BitExact` neither shipped
@@ -238,7 +262,7 @@ fn a_bit_exact_budget_derives_nothing_on_the_real_step() {
     assert!(d.plan.sites.is_empty());
     assert_eq!(d.plan.dispatches_after(), 538);
     assert_eq!(d.plan.class, NumericClass::BitExact);
-    assert_eq!(d.refused.len(), 2);
+    assert_eq!(d.refused.len(), 3);
     assert!(
         d.refused
             .iter()
@@ -269,12 +293,13 @@ fn the_other_arms_derive_the_same_sites() {
         let d = derive(&g, &Policy::default()).expect("derivation");
         assert_eq!(
             d.plan.sites.len(),
-            90,
+            120,
             "{conv_state:?} fused={conv_fused} {qkv:?}"
         );
         assert_eq!(d.plan.sites_of("silu").len(), 30);
+        assert_eq!(d.plan.sites_of("mul").len(), 30);
         assert_eq!(d.plan.sites_of("residual").len(), 60);
-        assert_eq!(d.plan.dispatches_before() - d.plan.dispatches_after(), 90);
+        assert_eq!(d.plan.dispatches_before() - d.plan.dispatches_after(), 120);
     }
 }
 
@@ -344,7 +369,7 @@ fn the_stateful_regions_are_marked_and_no_fused_site_sits_in_one() {
         assert_eq!(conv_layers, expected);
 
         let d = derive(&g, &Policy::default()).expect("derivation");
-        assert_eq!(d.plan.sites.len(), 90);
+        assert_eq!(d.plan.sites.len(), 120);
         assert_eq!(d.plan.regions.conv_ring, 22);
         assert_eq!(d.plan.regions.kv, 8);
         assert_eq!(d.plan.regions.nodes, 22 * per_conv + 8 * 5);

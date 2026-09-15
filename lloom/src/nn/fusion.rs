@@ -54,6 +54,9 @@ pub enum Semantics {
     /// `y = x + operand[row]`, the operand read at the storing thread's own
     /// output row.
     AddOperand,
+    /// `y = x * operand[row]`, the operand read at the storing thread's own
+    /// output row.
+    MulOperand,
 }
 
 /// Which second operand an [`Operand`] type binds, as a value the optimizer
@@ -199,6 +202,36 @@ pub struct BoundResidual<'r> {
     r: &'r Tensor,
 }
 
+/// The gate product on the accumulator, replacing the `bmul_f16` of
+/// `silu(w1·x) * (w3·x)` (#732, §12.2e row 3b at the producer end). Reads the
+/// gate at the storing thread's own output row — [`RowIndexed`], for the
+/// residual's reason: row 3b failed G1 as a prologue on `w2`, where the gate
+/// is a full vector of the INPUT extent; on `w3`'s store `silu(w1·x)[i]` is
+/// output row `i`'s own element.
+///
+/// Bound by [`Gate::of`]: `gemv(w3).then(Gate::of(&gate))`.
+pub struct Gate;
+impl Elementwise for Gate {
+    const SUFFIX: &'static str = "_mul";
+    const PRECISION: Precision = Precision::Accumulator;
+    const SEMANTICS: Semantics = Semantics::MulOperand;
+}
+impl Epilogue for Gate {
+    type Operand = RowIndexed<half::f16>;
+}
+impl Gate {
+    /// Bind the gate operand `g`, read at the storing thread's own output
+    /// row. `g` is `[.., 1, n]`, exactly the output extent, contiguous.
+    pub fn of(g: &Tensor) -> BoundGate<'_> {
+        BoundGate { g }
+    }
+}
+
+/// A [`Gate`] with its operand bound. Produced by [`Gate::of`].
+pub struct BoundGate<'g> {
+    g: &'g Tensor,
+}
+
 /// RoPE — the compile-fail proof for the epilogue seam. RoPE reads `i1` and
 /// `i1 + d/2` (`reduce.metal:1772`), not a single accumulator value, so it is
 /// **not** [`Elementwise`] and therefore cannot be an [`Epilogue`] or a
@@ -279,7 +312,7 @@ pub struct Gemv<P: Prologue = PrologueNone, E: Epilogue = EpilogueNone>(PhantomD
 /// This is the single place the type-level epilogue set is mapped to the
 /// runtime enum, so the two cannot drift: a new fusable `impl Epilogue` that
 /// forgets its `GemvFusion` arm has no `FusedArm` impl and cannot be applied
-/// through `Gemv`. `EpilogueNone`/`Silu`/`Residual` are the three fusable
+/// through `Gemv`. `EpilogueNone`/`Silu`/`Residual`/`Gate` are the four fusable
 /// arms `gemv.metal` instantiates.
 pub(crate) trait FusedArm: Epilogue {
     const ARM: GemvFusion;
@@ -292,6 +325,9 @@ impl FusedArm for Silu {
 }
 impl FusedArm for Residual {
     const ARM: GemvFusion = GemvFusion::Residual;
+}
+impl FusedArm for Gate {
+    const ARM: GemvFusion = GemvFusion::Mul;
 }
 
 // `FusedArm` is deliberately `pub(crate)` — it is the sealed drift-guard above,
@@ -400,6 +436,13 @@ impl EvalTail for BoundResidual<'_> {
     }
 }
 
+impl sealed::Sealed for BoundGate<'_> {}
+impl EvalTail for BoundGate<'_> {
+    fn eval_after_gemv(&self, w: &Tensor, x: &Tensor) -> Result<Tensor> {
+        Gemv::<PrologueNone, Gate>::apply(x, w, Some(self.g))
+    }
+}
+
 // --- De-fuse tails: a legal `Elementwise` that is NOT an admissible
 // `Epilogue`, so it runs as GEMV then a separate dispatch. No overlap with the
 // fused impls above: `Rope`/`QkNorm` are not `Epilogue`. ---
@@ -432,6 +475,7 @@ mod tests {
         assert_eq!(<EpilogueNone as FusedArm>::ARM, GemvFusion::Off);
         assert_eq!(<Silu as FusedArm>::ARM, GemvFusion::Silu);
         assert_eq!(<Residual as FusedArm>::ARM, GemvFusion::Residual);
+        assert_eq!(<Gate as FusedArm>::ARM, GemvFusion::Mul);
     }
 
     /// SiLU has no second operand; the residual reads one at its output row.
@@ -448,12 +492,16 @@ mod tests {
         // which needs the metal-gated `kernels` module.
         assert_eq!(Silu::SUFFIX, "_silu");
         assert_eq!(Residual::SUFFIX, "_residual");
+        assert_eq!(Gate::SUFFIX, "_mul");
+        assert_eq!(Gate::PRECISION, Precision::Accumulator);
+        assert_eq!(Gate::SEMANTICS, Semantics::MulOperand);
         assert_eq!(EpilogueNone::SUFFIX, "");
         // Type-level: `Silu::Operand == NoOperand`, `Residual::Operand ==
         // RowIndexed<f16>`. Named here so a change to either associated type is
         // a compile error at this assignment, not a silent kernel mismatch.
         let _: <Silu as Epilogue>::Operand = NoOperand;
         let _: <Residual as Epilogue>::Operand = RowIndexed::<half::f16>(PhantomData);
+        let _: <Gate as Epilogue>::Operand = RowIndexed::<half::f16>(PhantomData);
     }
 
     /// The typed `Epilogue::SUFFIX` equals the `[[host_name]]` suffix the
@@ -467,5 +515,6 @@ mod tests {
         assert_eq!(EpilogueNone::SUFFIX, GemvEpilogue::None.name_suffix());
         assert_eq!(Silu::SUFFIX, GemvEpilogue::Silu.name_suffix());
         assert_eq!(Residual::SUFFIX, GemvEpilogue::Residual.name_suffix());
+        assert_eq!(Gate::SUFFIX, GemvEpilogue::Mul.name_suffix());
     }
 }

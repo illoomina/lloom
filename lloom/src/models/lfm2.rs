@@ -840,6 +840,16 @@ impl std::fmt::Display for FusionReport {
             write!(f, "]")?;
         }
         write!(f, ")")?;
+        if !self.refused.is_empty() {
+            write!(f, " refused[")?;
+            for (i, (name, why)) in self.refused.iter().enumerate() {
+                if i > 0 {
+                    write!(f, "; ")?;
+                }
+                write!(f, "{name}: {why}")?;
+            }
+            write!(f, "]")?;
+        }
         for c in &self.compositions {
             write!(f, " composition[{}: {}", c.region, c.transforms.join("+"))?;
             match &c.joint {

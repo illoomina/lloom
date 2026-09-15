@@ -320,10 +320,14 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     );
     assert!(r.unvalidated.is_empty(), "{:?}", r.unvalidated);
     assert!(r.fused_in_stateful.is_empty(), "{:?}", r.fused_in_stateful);
+    // On the fixture's 512-wide weights the barrier term admits the gate (a
+    // 0.5 MB sweep costs less than a dispatch), so all three ride; the cost
+    // line is on the plan.
     assert!(
         r.plan.contains("gemv_mul=2")
             && r.plan
-                .contains("regions[conv-ring=1 kv=1 nodes=7 fused-in-stateful=0]"),
+                .contains("regions[conv-ring=1 kv=1 nodes=7 fused-in-stateful=0]")
+            && r.plan.contains(" cost[before: "),
         "{}",
         r.plan
     );

@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use super::cost::StepCost;
 use super::ir::{Census, Graph, Op};
 use super::numeric::{NumericClass, Region};
 
@@ -67,6 +68,9 @@ pub struct FusionPlan {
     /// The recurrences the source graph marked, and the fused sites inside
     /// them.
     pub regions: Regions,
+    /// The step's cost under the barrier model, before and after, when the
+    /// policy set one.
+    pub cost: Option<(StepCost, StepCost)>,
 }
 
 impl FusionPlan {
@@ -125,7 +129,15 @@ impl fmt::Display for FusionPlan {
         for s in &self.regions.fused_in_stateful {
             write!(f, " {}:{}@{}", s.site, s.fragment, s.region)?;
         }
-        write!(f, "]")
+        write!(f, "]")?;
+        if let Some((before, after)) = &self.cost {
+            write!(
+                f,
+                " cost[before: {before}; after: {after}; {:+.0} µs]",
+                after.total_us() - before.total_us()
+            )?;
+        }
+        Ok(())
     }
 }
 

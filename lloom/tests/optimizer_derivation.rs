@@ -16,6 +16,14 @@
 use lloom::models::lfm2::{AttnImpl, Config, ConvState, KvAppend, LayerType, QkvLayout};
 use lloom::models::lfm2_ir::decode_step;
 use lloom::optimizer::{derive, NumericClass, Op, Policy, Region, Seam};
+
+/// The extractor's own count, no barrier term: what the e-graph derives.
+fn by_dispatch_count() -> Policy {
+    Policy {
+        barrier_model: None,
+        ..Default::default()
+    }
+}
 use lloom_tensor::DType;
 
 /// `LFM2.5-2.6B`'s `config.json`
@@ -124,13 +132,16 @@ fn the_elementwise_family_is_186_of_538() {
 /// since the gate fragment (#732, §12.2e row 3b) — the SwiGLU product onto
 /// every `w3` (30 sites, `Config::gemv_gate`); onto nothing else. 538
 /// dispatches become 418: the 30 `silu_f16`, 60 `badd_f16` and 30 MLP
-/// `bmul_f16` the fused arms replace, in the `Rounding` class.
+/// `bmul_f16` the fused arms replace, in the `Rounding` class. This is the
+/// e-graph's extraction by dispatch count (`barrier_model: None`); the
+/// default policy's barrier term then refuses the gate on this shape —
+/// `the_barrier_term_refuses_the_gate_on_the_real_step` below.
 #[test]
 fn the_derivation_reproduces_the_hand_written_composition() {
     let mut cfg = lfm2_2_6b();
     traced_arms(&mut cfg, ConvState::Shuffle);
     let g = decode_step(&cfg, DType::F16);
-    let d = derive(&g, &Policy::default()).expect("derivation");
+    let d = derive(&g, &by_dispatch_count()).expect("derivation");
     let plan = &d.plan;
     eprintln!("plan: {plan}");
     eprintln!("egglog: {:.2} ms", d.elapsed.as_secs_f64() * 1e3);
@@ -215,7 +226,7 @@ fn the_seams_left_are_the_gap_the_catalogue_cannot_express() {
     let mut cfg = lfm2_2_6b();
     traced_arms(&mut cfg, ConvState::Shuffle);
     let g = decode_step(&cfg, DType::F16);
-    let d = derive(&g, &Policy::default()).expect("derivation");
+    let d = derive(&g, &by_dispatch_count()).expect("derivation");
     let seam = |producer: &str, consumer: &str, count: u64| Seam {
         producer: producer.into(),
         consumer: consumer.into(),
@@ -229,7 +240,7 @@ fn the_seams_left_are_the_gap_the_catalogue_cannot_express() {
     // catalogue reported comes back, at its count.
     let policy = Policy {
         excluded: vec!["mul".to_string()],
-        ..Default::default()
+        ..by_dispatch_count()
     };
     let d = derive(&g, &policy).expect("derivation");
     assert_eq!(
@@ -242,6 +253,79 @@ fn the_seams_left_are_the_gap_the_catalogue_cannot_express() {
         ]
     );
     assert_eq!(d.plan.dispatches_after(), 448);
+}
+
+/// **The barrier term on the real step** (`optimizer-design.md` §10e): the
+/// default policy prices the extracted step in emission order and refuses the
+/// gate fragment — its 30 sites take the `bmul` spacer out from between the
+/// layer's three 44 MB sweeps, so the product's barrier lands between `w1`
+/// and `w3` AND the residual's between `w3` and `w2`; the model charges each
+/// the smaller neighbour's sweep (55.8 µs) against the one 49 µs dispatch
+/// removed: **+62.4 µs per site, +1.87 ms per token** — and keeps SiLU and
+/// the residual, whose barriers sit beside a 2 µs kernel either way. So the
+/// plan is the crown's hand composition again (90 sites, 448), with the
+/// refusal and the marginal on the line. The crown measured −0.74 %
+/// (+0.13–0.16 ms/step) for the gate on: the SIGN the model predicts, at a
+/// magnitude it over-predicts ~12× (both constants predate the measurement;
+/// no constant was fitted — §10e names the missing one).
+#[test]
+fn the_barrier_term_refuses_the_gate_on_the_real_step() {
+    let mut cfg = lfm2_2_6b();
+    traced_arms(&mut cfg, ConvState::Shuffle);
+    let g = decode_step(&cfg, DType::F16);
+    let d = derive(&g, &Policy::default()).expect("derivation");
+    eprintln!("plan: {}", d.plan);
+    assert_eq!(d.plan.sites.len(), 90);
+    assert_eq!(d.plan.sites_of("mul").len(), 0);
+    assert_eq!(d.plan.dispatches_after(), 448);
+    assert_eq!(d.refused.len(), 1, "{:?}", d.refused);
+    assert_eq!(d.refused[0].0, "mul");
+    assert!(
+        d.refused[0]
+            .1
+            .contains("re-seated between gemv_silu and gemv_mul"),
+        "{}",
+        d.refused[0].1
+    );
+    let mul = d.marginals.iter().find(|m| m.fragment == "mul").unwrap();
+    assert_eq!(mul.sites, 30);
+    // By hand from the two declared constants. Fused, the product's
+    // node sits between two 44 MB sweeps and the model charges BOTH
+    // barriers at the smaller neighbour's bytes: before `gemv_mul`
+    // (`gemv_silu`'s w1 + x + out) and before `gemv_residual` (w2 +
+    // gated + r + out). Unfused, the `bmul` is the spacer on both sides
+    // and each barrier is its three 21.5 KB vectors. Less the dispatch.
+    let bw = 790e3;
+    let (w, x, o, r) = (
+        10752.0 * 2048.0 * 2.0,
+        2048.0 * 2.0,
+        10752.0 * 2.0,
+        2048.0 * 2.0,
+    );
+    let expect = (w + x + o) / bw + (w + o + r + r) / bw - 49.0 - 2.0 * (3.0 * o) / bw;
+    assert!(
+        (mul.per_site_us() - expect).abs() < 1e-6,
+        "{} vs {expect}",
+        mul.per_site_us()
+    );
+    // +62.4 µs per site, +1.87 ms per token in the model — the crown
+    // measured +0.13–0.16 ms: the SIGN is the term's claim, and its magnitude
+    // over-predicts ~12× because a barrier between two sweeps is charged the
+    // whole smaller sweep where the hardware loses only a drain (§10e).
+    assert!(
+        mul.delta_us > 1870.0 && mul.delta_us < 1875.0,
+        "{}",
+        mul.delta_us
+    );
+    for f in ["silu", "residual"] {
+        let m = d.marginals.iter().find(|m| m.fragment == f).unwrap();
+        assert!(m.delta_us < 0.0, "{f}: {m:?}");
+    }
+    let (before, after) = d.plan.cost.as_ref().unwrap();
+    assert_eq!((before.dispatches, after.dispatches), (538, 448));
+    assert!(after.total_us() < before.total_us());
+    // The seams the refusal leaves are P1's four.
+    assert_eq!(d.plan.seams.len(), 4, "{:?}", d.plan.seams);
 }
 
 /// The budget refuses what it cannot admit: at `BitExact` neither shipped
@@ -262,7 +346,7 @@ fn a_bit_exact_budget_derives_nothing_on_the_real_step() {
     assert!(d.plan.sites.is_empty());
     assert_eq!(d.plan.dispatches_after(), 538);
     assert_eq!(d.plan.class, NumericClass::BitExact);
-    assert_eq!(d.refused.len(), 3);
+    assert_eq!(d.refused.len(), 3, "{:?}", d.refused);
     assert!(
         d.refused
             .iter()
@@ -290,7 +374,7 @@ fn the_other_arms_derive_the_same_sites() {
         cfg.conv_fused = conv_fused;
         cfg.qkv_layout = qkv;
         let g = decode_step(&cfg, DType::F16);
-        let d = derive(&g, &Policy::default()).expect("derivation");
+        let d = derive(&g, &by_dispatch_count()).expect("derivation");
         assert_eq!(
             d.plan.sites.len(),
             120,
@@ -368,7 +452,7 @@ fn the_stateful_regions_are_marked_and_no_fused_site_sits_in_one() {
             .collect();
         assert_eq!(conv_layers, expected);
 
-        let d = derive(&g, &Policy::default()).expect("derivation");
+        let d = derive(&g, &by_dispatch_count()).expect("derivation");
         assert_eq!(d.plan.sites.len(), 120);
         assert_eq!(d.plan.regions.conv_ring, 22);
         assert_eq!(d.plan.regions.kv, 8);

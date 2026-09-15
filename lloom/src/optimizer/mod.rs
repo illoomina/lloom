@@ -18,6 +18,7 @@
 //! recorded for another kernel's tree is never reused (§5a). The plan also
 //! reports the step's recurrences and which fused sites sit in one.
 
+pub mod cost;
 pub mod egraph;
 pub mod exclusions;
 pub mod fragments;
@@ -27,6 +28,7 @@ pub mod plan;
 
 use lloom_tensor::Result;
 
+pub use cost::{CostModel, Marginal, StepCost};
 pub use exclusions::{ExclusionSet, Lookup, Verdict};
 pub use fragments::{catalogue, Fragment};
 pub use ir::{Census, Dim, Graph, Node, NodeId, Op, Shape};
@@ -34,7 +36,7 @@ pub use numeric::{NumericClass, Region, RegionKind, TargetFpModel};
 pub use plan::{FusionPlan, Regions, Seam, Sites, StatefulSite};
 
 /// What the derivation may do.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
     /// The weakest class a derived graph may land in. A fragment whose
     /// composition lands beyond it contributes no rule.
@@ -44,6 +46,12 @@ pub struct Policy {
     pub excluded: Vec<String>,
     /// egglog `run` iterations. The rules are local, so a handful saturates.
     pub iterations: usize,
+    /// The barrier-placement term (`cost`): after extraction, a fragment
+    /// whose sites cost more under it than they save — a dispatch removed
+    /// but its barrier re-seated between two sweeps — is unfused and
+    /// refused with the marginal named. `None` prices by dispatch count
+    /// alone, which is what the extractor does.
+    pub barrier_model: Option<CostModel>,
 }
 
 impl Default for Policy {
@@ -74,6 +82,7 @@ impl Default for Policy {
             budget: NumericClass::Rounding,
             excluded,
             iterations: 8,
+            barrier_model: Some(CostModel::default()),
         }
     }
 }
@@ -109,8 +118,13 @@ pub struct Derivation {
     pub plan: FusionPlan,
     /// The derived graph.
     pub graph: Graph,
-    /// Fragments the policy refused, with the reason.
+    /// Fragments the policy refused, with the reason — before the rules
+    /// (class, exclusion) or after extraction (the barrier term).
     pub refused: Vec<(String, String)>,
+    /// Every admitted fragment's marginal under the barrier model, when one
+    /// is set: what its sites cost the step against the same step with them
+    /// unfused.
+    pub marginals: Vec<Marginal>,
     /// The egglog program that ran.
     pub program: String,
     pub elapsed: std::time::Duration,
@@ -123,22 +137,72 @@ pub fn derive(graph: &Graph, policy: &Policy) -> Result<Derivation> {
 
 /// Derive over `graph` under `policy` with an explicit catalogue.
 pub fn derive_with(graph: &Graph, policy: &Policy, catalogue: &[Fragment]) -> Result<Derivation> {
-    let (admitted, refused) = egraph::admitted(policy, catalogue);
+    let (admitted, mut refused) = egraph::admitted(policy, catalogue);
     let sat = egraph::derive(graph, &admitted, policy.iterations)?;
-    let sites = plan::sites(&sat.graph);
+    let mut derived = sat.graph;
+
+    // The barrier term, over the extracted step in emission order (§10e):
+    // a fragment whose marginal is positive is unfused — the dispatch it
+    // removed cost less than the barrier it re-seated — and the marginal is
+    // the reason. Each fragment is judged against the step with the others
+    // in, most costly first, so a refusal is charged to the fragment that
+    // moved the barrier.
+    let mut marginals = Vec::new();
+    if let Some(model) = &policy.barrier_model {
+        let names: Vec<&str> = admitted.iter().map(|f| f.name).collect();
+        loop {
+            let m = cost::marginals(model, &derived, &names);
+            let worst = m
+                .iter()
+                .filter(|x| x.sites > 0 && x.delta_us > 0.0)
+                .max_by(|a, b| a.delta_us.total_cmp(&b.delta_us))
+                .cloned();
+            match worst {
+                Some(w) => {
+                    let between = w
+                        .between
+                        .as_ref()
+                        .map(|(a, b)| format!(", re-seated between {a} and {b}"))
+                        .unwrap_or_default();
+                    refused.push((
+                        w.fragment.clone(),
+                        format!(
+                            "barrier term: +{:.1} µs per site over {} sites{between}",
+                            w.per_site_us(),
+                            w.sites
+                        ),
+                    ));
+                    derived = cost::unfuse(&derived, &w.fragment);
+                    marginals.push(w);
+                }
+                None => {
+                    marginals.extend(m.into_iter().filter(|x| x.sites > 0));
+                    break;
+                }
+            }
+        }
+    }
+
+    let sites = plan::sites(&derived);
     let regions = plan::regions(graph, &sites);
+    let cost = policy
+        .barrier_model
+        .as_ref()
+        .map(|m| (cost::step_cost(m, graph), cost::step_cost(m, &derived)));
     let plan = FusionPlan {
         sites,
-        class: sat.graph.numeric(),
+        class: derived.numeric(),
         before: graph.census(),
-        after: sat.graph.census(),
-        seams: plan::seams(&sat.graph),
+        after: derived.census(),
+        seams: plan::seams(&derived),
         regions,
+        cost,
     };
     Ok(Derivation {
         plan,
-        graph: sat.graph,
+        graph: derived,
         refused,
+        marginals,
         program: sat.program,
         elapsed: sat.elapsed,
     })
@@ -201,6 +265,86 @@ mod tests {
             (operand.op.clone(), operand.name.as_str()),
             (Op::Fused, "silu")
         );
+    }
+
+    /// The barrier term, on an MLP at LFM2's shape (`w1`/`w3` `[10752,
+    /// 2048]` f16 = 44 MB each): the gate fragment removes a dispatch and
+    /// re-seats the product's barrier between the two sweeps, which the
+    /// model prices above the dispatch — refused, with the marginal named
+    /// and the pair it landed between; SiLU and the residual save. On the
+    /// small MLP above the same fragment is admitted: the verdict is the
+    /// weights', not the fragment's. `barrier_model: None` is the extractor's
+    /// own count and admits all three.
+    #[test]
+    fn the_barrier_term_refuses_the_gate_at_lfm2s_shape_and_admits_it_small() {
+        let mut g = Graph::new();
+        let r = g.input("h", Shape::of(&[1, 1, 2048]), DType::F16);
+        let nw = g.weight("norm", Shape::of(&[2048]), DType::F16);
+        let x = g.rms_norm(nw, r);
+        let w1 = g.weight("w1", Shape::of(&[10752, 2048]), DType::F16);
+        let w3 = g.weight("w3", Shape::of(&[10752, 2048]), DType::F16);
+        let w2 = g.weight("w2", Shape::of(&[2048, 10752]), DType::F16);
+        let gate = g.gemv(w1, x);
+        let gate = g.silu(gate);
+        let up = g.gemv(w3, x);
+        let gated = g.mul(gate, up);
+        let down = g.gemv(w2, gated);
+        let out = g.add(r, down);
+        g.mark_root(out);
+
+        let d = derive(&g, &Policy::default()).unwrap();
+        assert_eq!(d.plan.sites.get("w1").map(String::as_str), Some("silu"));
+        assert_eq!(d.plan.sites.get("w2").map(String::as_str), Some("residual"));
+        assert_eq!(d.plan.sites.get("w3"), None, "{:?}", d.plan.sites);
+        assert_eq!(d.plan.dispatches_after(), 5);
+        assert_eq!(d.refused.len(), 1, "{:?}", d.refused);
+        assert_eq!(d.refused[0].0, "mul");
+        assert!(
+            d.refused[0]
+                .1
+                .contains("re-seated between gemv_silu and gemv_mul"),
+            "{}",
+            d.refused[0].1
+        );
+        let mul = d.marginals.iter().find(|m| m.fragment == "mul").unwrap();
+        // By hand from the two declared constants. Fused, the product's
+        // node sits between two 44 MB sweeps and the model charges BOTH
+        // barriers at the smaller neighbour's bytes: before `gemv_mul`
+        // (`gemv_silu`'s w1 + x + out) and before `gemv_residual` (w2 +
+        // gated + r + out). Unfused, the `bmul` is the spacer on both sides
+        // and each barrier is its three 21.5 KB vectors. Less the dispatch.
+        let bw = 790e3;
+        let (w, x, o, r) = (
+            10752.0 * 2048.0 * 2.0,
+            2048.0 * 2.0,
+            10752.0 * 2.0,
+            2048.0 * 2.0,
+        );
+        let expect = (w + x + o) / bw + (w + o + r + r) / bw - 49.0 - 2.0 * (3.0 * o) / bw;
+        assert!(
+            (mul.per_site_us() - expect).abs() < 1e-6,
+            "{} vs {expect}",
+            mul.per_site_us()
+        );
+        for f in ["silu", "residual"] {
+            let m = d.marginals.iter().find(|m| m.fragment == f).unwrap();
+            assert!(m.delta_us < 0.0, "{f}: {m:?}");
+        }
+        assert!(d.plan.to_string().contains(" cost[before: "), "{}", d.plan);
+        let (before, after) = d.plan.cost.as_ref().unwrap();
+        assert!(after.total_us() < before.total_us());
+        // The seams the refusal leaves are the product's two.
+        assert_eq!(d.plan.seams.len(), 2, "{:?}", d.plan.seams);
+
+        let none = Policy {
+            barrier_model: None,
+            ..Default::default()
+        };
+        let d = derive(&g, &none).unwrap();
+        assert_eq!(d.plan.sites.len(), 3);
+        assert!(d.refused.is_empty());
+        assert!(d.marginals.is_empty());
+        assert!(d.plan.cost.is_none());
     }
 
     /// With the gate fragment excluded, the SwiGLU product is the seam the

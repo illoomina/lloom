@@ -357,3 +357,68 @@ fn paged_ctx_refuses_a_bad_page_size_and_the_cpu() -> Result<()> {
     assert!(CtxKv::parse("pagd").is_err());
     Ok(())
 }
+
+/// A draft before any context is observed — the drafter warmup's shape
+/// (`DSparkSpeculator::warmup`, which drafts on a fresh sequence to compile
+/// the drafter's pipelines off the clock): the paged arm keys an empty
+/// context on its first block view instead of refusing, computes what the
+/// contiguous arm computes, and the rounds that follow still match bit for
+/// bit — keying early moves nothing.
+#[test]
+fn a_draft_before_any_context_keys_the_paged_arm_and_matches() -> Result<()> {
+    let dtype = DType::F16;
+    let dev = Device::new_metal(0)?;
+    let drafter = tiny_drafter(dtype, &dev, 708)?;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(708_002);
+    let cfg = drafter.config().clone();
+    let mut twin = Twin {
+        contiguous: drafter
+            .make_ctx_caches_for(CtxKv::Contiguous, 1, &dev)?
+            .remove(0),
+        paged: drafter
+            .make_ctx_caches_for(
+                CtxKv::Paged {
+                    page_size: PAGE,
+                    shared: false,
+                },
+                1,
+                &dev,
+            )?
+            .remove(0),
+        offset: 0,
+    };
+    // The warmup's draft: no context yet, on both arms.
+    let block = randn(&mut rng, vec![1, cfg.block_size, cfg.hidden_size], &dev)?.to_dtype(dtype)?;
+    let hc = drafter.block_hidden(&block, 0, &twin.contiguous)?;
+    let hp = drafter.block_hidden(&block, 0, &twin.paged)?;
+    assert_eq!(
+        twin.paged[0].len(),
+        0,
+        "keying an empty context appends nothing"
+    );
+    let (bc, bp) = (bits(&hc)?, bits(&hp)?);
+    assert!(
+        bc.iter().collect::<std::collections::HashSet<_>>().len() > 8,
+        "vacuous"
+    );
+    assert!(bc == bp, "the empty-context draft differs between the arms");
+    // Then the ordinary rounds, as `run_arms` takes them.
+    twin.round(
+        &drafter,
+        &mut rng,
+        5,
+        dtype,
+        &dev,
+        "prefill of 5 after the warmup",
+    )?;
+    twin.round(&drafter, &mut rng, 3, dtype, &dev, "append of 3")?;
+    twin.round(
+        &drafter,
+        &mut rng,
+        40,
+        dtype,
+        &dev,
+        "append of 40 (a second page)",
+    )?;
+    Ok(())
+}

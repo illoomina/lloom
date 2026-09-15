@@ -870,6 +870,58 @@ mod paged_ctx {
             Ok(())
         }
 
+        /// Key `(layer, seq)` with an empty context: allocate the layer's pools
+        /// if it has none, hold `reserve` slots for the block, upload the block
+        /// slots. The length stays zero; `append` reserves on top of this and
+        /// recomputes the block slots past whatever it appends, so keying
+        /// early changes nothing about where the context lands.
+        fn key_empty(
+            &mut self,
+            layer: usize,
+            seq: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            dtype: lloom_tensor::DType,
+            device: &Device,
+        ) -> Result<()> {
+            let page_size = self.page_size;
+            let reserve = self.reserve;
+            loop {
+                let lp = &mut self.layers[layer];
+                match lp.pool.reserve(seq, reserve) {
+                    Ok(_) => break,
+                    Err(PageError::Exhausted { .. }) => self.grow(layer)?,
+                    Err(e) => return Err(lloom_tensor::Error::wrap(e)),
+                }
+            }
+            let lp = &mut self.layers[layer];
+            let start = lp.pool.seq(seq).map(|s| s.len()).unwrap_or(0);
+            let pages = lp
+                .pool
+                .seq(seq)
+                .expect("seq within n_seqs")
+                .pages()
+                .to_vec();
+            let block: Vec<u32> = (start..start + reserve)
+                .map(|t| Self::slot(&pages, t, page_size))
+                .collect();
+            let tokens = lp.pool.pool_pages() * page_size;
+            if lp.kv.is_none() {
+                let shape = (1, n_kv_heads, tokens, head_dim);
+                lp.kv = Some((
+                    Tensor::zeros(shape, dtype, device)?,
+                    Tensor::zeros(shape, dtype, device)?,
+                ));
+            }
+            let block_max = block.iter().copied().max().unwrap_or(0) as usize;
+            let sh = &mut self.shared[seq];
+            let mut blk = (std::mem::take(&mut sh.block), sh.block_t.take());
+            let block = Self::upload(&mut blk, block, device)?;
+            (sh.block, sh.block_t) = blk;
+            self.layers[layer].block[seq] = Some((block, block_max));
+            Ok(())
+        }
+
         /// Write the block's `[1, H_kv, width, D]` `k`/`v` into `(layer,
         /// seq)`'s reserved slots and hand back the pool with the table.
         fn block_view(
@@ -888,16 +940,20 @@ mod paged_ctx {
                 );
             }
             let page_size = self.page_size;
+            if self.layers[layer].kv.is_none() || self.layers[layer].block[seq].is_none() {
+                // A draft before any context — the drafter warmup's shape
+                // (`DSparkSpeculator::warmup` drafts before the prefill is
+                // observed, to compile the drafter's pipelines off the clock),
+                // and the contiguous arm's ordinary empty-context draft. Key an
+                // empty context: the pools allocated from the block's shape,
+                // `reserve` slots held for the block, the length still zero,
+                // so the first `append` lands exactly where it would have.
+                let (_, n_kv_heads, _, head_dim) = k.dims4()?;
+                self.key_empty(layer, seq, n_kv_heads, head_dim, k.dtype(), k.device())?;
+            }
             let lp = &self.layers[layer];
-            let Some((pk, pv)) = lp.kv.as_ref() else {
-                lloom_tensor::bail!(
-                    "DSpark paged ctx: a draft before any context was keyed (layer {layer}, \
-                     sequence {seq}); `observe` the prefill first"
-                );
-            };
-            let Some((block, block_max)) = lp.block[seq].as_ref() else {
-                lloom_tensor::bail!("DSpark paged ctx: no block slots for sequence {seq}");
-            };
+            let (pk, pv) = lp.kv.as_ref().expect("keyed above");
+            let (block, block_max) = lp.block[seq].as_ref().expect("keyed above");
             let tokens = lp.pool.pool_pages() * page_size;
             let slots = block.narrow(0, 0, width)?;
             let k = k.contiguous()?;

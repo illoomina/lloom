@@ -3193,9 +3193,14 @@ fn every_parity_arm_routes_through_the_helper() {
     // asserted rather than `> 0` so that an arm *lost* to a bad merge is a
     // failure too -- the same argument `packed_names_resolve` makes for
     // checking 90 rather than "some".
+    // 37 → 40 (lloom #732): three arms landed on `dev` without this count
+    // following them -- `rmsnorm_f16_strided` and `rmsnorm_rope_f16` with the
+    // QkvLayout work, `the_fused_epilogues_f16` with P3's packed siblings --
+    // so the lib suite carried one red test no gate ran: the CI CPU gate does
+    // not run the Metal lib tests, and the kernel harnesses filter by name.
     assert_eq!(
-        arms, 37,
-        "expected 37 parity arms, found {arms}; if a family was added or \
+        arms, 40,
+        "expected 40 parity arms, found {arms}; if a family was added or \
          removed, update this count deliberately rather than relaxing it"
     );
 }

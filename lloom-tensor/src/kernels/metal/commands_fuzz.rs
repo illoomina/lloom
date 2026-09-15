@@ -410,185 +410,185 @@ mod proptests {
     use proptest::prelude::*;
     use proptest::test_runner::TestCaseError;
 
-fn op_strategy() -> impl Strategy<Value = Op> {
-    prop_oneof![
-        // Encoding is what grows the queue without asking, so it is weighted
-        // highest. The range spans the default cut period (10) so a single
-        // `Encode` can cross it more than once.
-        6 => (1usize..24).prop_map(|dispatches| Op::Encode { dispatches }),
-        3 => Just(Op::FlushAndPrune),
-        2 => Just(Op::Flush),
-        2 => Just(Op::Settle),
-        1 => Just(Op::FlushAndWaitCurrent),
-        1 => Just(Op::FlushAndWait),
-    ]
-}
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            // Encoding is what grows the queue without asking, so it is weighted
+            // highest. The range spans the default cut period (10) so a single
+            // `Encode` can cross it more than once.
+            6 => (1usize..24).prop_map(|dispatches| Op::Encode { dispatches }),
+            3 => Just(Op::FlushAndPrune),
+            2 => Just(Op::Flush),
+            2 => Just(Op::Settle),
+            1 => Just(Op::FlushAndWaitCurrent),
+            1 => Just(Op::FlushAndWait),
+        ]
+    }
 
-/// ONE device per process, not one per case. `Device::system_default()` per
-/// proptest case logged "Context leak detected, CoreAnalytics returned false"
-/// once per case (lloom #706). Recorded beside it, because it is NOT fixed by
-/// this: in a DEBUG build the commands proptest at 4096 cases fails on the
-/// ~476th case with `flush_and_wait` returning `Internal Error (00000206)`,
-/// with or without this cache, while the same 4096 cases pass in `--release`
-/// and the release LibAFL harness runs 1 200 sequences in one process clean
-/// (`issue-706-raw/commands-proptest-4096*.log`). The 48-case default never
-/// reaches it; the debug-only exhaustion is open.
-fn device() -> Device {
-    static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
-    DEVICE
-        .get_or_init(|| Device::system_default().expect("no Metal device"))
-        .clone()
-}
+    /// ONE device per process, not one per case. `Device::system_default()` per
+    /// proptest case logged "Context leak detected, CoreAnalytics returned false"
+    /// once per case (lloom #706). Recorded beside it, because it is NOT fixed by
+    /// this: in a DEBUG build the commands proptest at 4096 cases fails on the
+    /// ~476th case with `flush_and_wait` returning `Internal Error (00000206)`,
+    /// with or without this cache, while the same 4096 cases pass in `--release`
+    /// and the release LibAFL harness runs 1 200 sequences in one process clean
+    /// (`issue-706-raw/commands-proptest-4096*.log`). The 48-case default never
+    /// reaches it; the debug-only exhaustion is open.
+    fn device() -> Device {
+        static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
+        DEVICE
+            .get_or_init(|| Device::system_default().expect("no Metal device"))
+            .clone()
+    }
 
-proptest! {
-    // Smaller than #504's 256 x 120 because every operation here submits real
-    // command buffers: the alphabet reaches the GPU where the pool's reached
-    // only the allocator. Sized against the same criterion -- a suite that runs
-    // every time is worth more than one that is skipped.
-    #![proptest_config(ProptestConfig {
-        cases: 48,
-        max_shrink_iters: 2048,
-        ..ProptestConfig::default()
-    })]
+    proptest! {
+        // Smaller than #504's 256 x 120 because every operation here submits real
+        // command buffers: the alphabet reaches the GPU where the pool's reached
+        // only the allocator. Sized against the same criterion -- a suite that runs
+        // every time is worth more than one that is skipped.
+        #![proptest_config(ProptestConfig {
+            cases: 48,
+            max_shrink_iters: 2048,
+            ..ProptestConfig::default()
+        })]
 
-    /// `in_flight` stays bounded by the commits since it was last emptied,
-    /// across arbitrary commit / prune / wait interleavings.
-    #[test]
-    fn in_flight_stays_bounded(ops in prop::collection::vec(op_strategy(), 1..40)) {
-        let dev = device();
-        if let Err(e) = run_sequence(&dev, &ops) {
-            return Err(TestCaseError::fail(e));
+        /// `in_flight` stays bounded by the commits since it was last emptied,
+        /// across arbitrary commit / prune / wait interleavings.
+        #[test]
+        fn in_flight_stays_bounded(ops in prop::collection::vec(op_strategy(), 1..40)) {
+            let dev = device();
+            if let Err(e) = run_sequence(&dev, &ops) {
+                return Err(TestCaseError::fail(e));
+            }
         }
     }
-}
 
-/// The generator reaches the states the property is about.
-///
-/// **#504's first probe read 5 894 163 ops/s and `evicted=0`** -- a trim every
-/// 4096 operations kept the free list under budget, so the eviction path never
-/// ran and it was timing a state machine with a third of its transitions dead.
-/// The equivalent here is a `flush_and_prune` that never prunes: if the GPU has
-/// finished nothing when `retain` runs, the non-blocking path is exercised only
-/// on its no-op arm and a green suite has observed nothing.
-#[test]
-fn the_generator_actually_reaches_the_interesting_states() {
-    use proptest::strategy::{Strategy, ValueTree};
-    use proptest::test_runner::{Config, TestRunner};
+    /// The generator reaches the states the property is about.
+    ///
+    /// **#504's first probe read 5 894 163 ops/s and `evicted=0`** -- a trim every
+    /// 4096 operations kept the free list under budget, so the eviction path never
+    /// ran and it was timing a state machine with a third of its transitions dead.
+    /// The equivalent here is a `flush_and_prune` that never prunes: if the GPU has
+    /// finished nothing when `retain` runs, the non-blocking path is exercised only
+    /// on its no-op arm and a green suite has observed nothing.
+    #[test]
+    fn the_generator_actually_reaches_the_interesting_states() {
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::{Config, TestRunner};
 
-    let dev = device();
-    let mut runner = TestRunner::new(Config {
-        cases: 32,
-        ..Config::default()
-    });
-    let strategy = prop::collection::vec(op_strategy(), 20..40);
+        let dev = device();
+        let mut runner = TestRunner::new(Config {
+            cases: 32,
+            ..Config::default()
+        });
+        let strategy = prop::collection::vec(op_strategy(), 20..40);
 
-    let mut total = Engagement::default();
-    for _ in 0..32 {
-        let ops = strategy
-            .new_tree(&mut runner)
-            .expect("strategy produces a value")
-            .current();
-        let e = run_sequence(&dev, &ops).expect("engagement run must not fail");
-        total.encoded += e.encoded;
-        total.commits += e.commits;
-        total.prunes += e.prunes;
-        total.blocking_drains += e.blocking_drains;
-        total.settles += e.settles;
-        total.pruned_something += e.pruned_something;
-        total.max_surviving = total.max_surviving.max(e.max_surviving);
-        total.max_observed = total.max_observed.max(e.max_observed);
-    }
+        let mut total = Engagement::default();
+        for _ in 0..32 {
+            let ops = strategy
+                .new_tree(&mut runner)
+                .expect("strategy produces a value")
+                .current();
+            let e = run_sequence(&dev, &ops).expect("engagement run must not fail");
+            total.encoded += e.encoded;
+            total.commits += e.commits;
+            total.prunes += e.prunes;
+            total.blocking_drains += e.blocking_drains;
+            total.settles += e.settles;
+            total.pruned_something += e.pruned_something;
+            total.max_surviving = total.max_surviving.max(e.max_surviving);
+            total.max_observed = total.max_observed.max(e.max_observed);
+        }
 
-    println!(
-        "FUZZ508 engagement encoded={} commits={} prunes={} pruned_something={} \
+        println!(
+            "FUZZ508 engagement encoded={} commits={} prunes={} pruned_something={} \
          blocking_drains={} settles={} max_surviving={} max_observed={}",
-        total.encoded,
-        total.commits,
-        total.prunes,
-        total.pruned_something,
-        total.blocking_drains,
-        total.settles,
-        total.max_surviving,
-        total.max_observed,
-    );
+            total.encoded,
+            total.commits,
+            total.prunes,
+            total.pruned_something,
+            total.blocking_drains,
+            total.settles,
+            total.max_surviving,
+            total.max_observed,
+        );
 
-    assert!(total.commits > 0, "the generator never committed a buffer");
-    assert!(
-        total.prunes > 0,
-        "the generator never called flush_and_prune, which is the operation under test"
-    );
-    assert!(
+        assert!(total.commits > 0, "the generator never committed a buffer");
+        assert!(
+            total.prunes > 0,
+            "the generator never called flush_and_prune, which is the operation under test"
+        );
+        assert!(
         total.blocking_drains > 0,
         "the generator never took a blocking drain, so the two shrink paths were never compared"
     );
-    assert!(
-        total.max_observed > 0,
-        "the queue was never non-empty: every observation saw a drained queue, so the \
+        assert!(
+            total.max_observed > 0,
+            "the queue was never non-empty: every observation saw a drained queue, so the \
          boundedness invariant was checked only against zero"
-    );
-    // **The one that earns its place**, and the analogue of #504's `evicted=0`.
-    assert!(
-        total.pruned_something > 0,
-        "flush_and_prune never removed a command buffer: the non-blocking prune was exercised \
+        );
+        // **The one that earns its place**, and the analogue of #504's `evicted=0`.
+        assert!(
+            total.pruned_something > 0,
+            "flush_and_prune never removed a command buffer: the non-blocking prune was exercised \
          only on its no-op arm, so a green suite says nothing about whether it prunes"
-    );
-}
+        );
+    }
 
-/// **One shrink site against one growth site, checked in source.**
-///
-/// §17's registered prediction for #508 rests on this asymmetry, and a runtime
-/// test cannot see it: whether `in_flight` has a second unconditional push is a
-/// property of the *text*, and a sequence that never reaches a new push cannot
-/// report one. Same reasoning, and the same mechanism, as
-/// `pool_counters_holds_accumulators_only` (#507) and `Buffer`'s
-/// `black_box` guard (#454).
-///
-/// Mutation-tested: adding a `state.in_flight.push(..)` outside
-/// `commit_swap_locked`, or removing the `retain` from `flush_and_prune`, makes
-/// this fail.
-///
-/// # It reads the whole file, and that is a correction
-///
-/// The first version sliced off everything after the first `#[cfg(test)]`,
-/// copying `pool_counters_holds_accumulators_only`'s guard against a check
-/// reading its own description. `commands.rs` has **no test module** -- so the
-/// only `#[cfg(test)]` in it is [`Commands::in_flight_len`], the accessor added
-/// for this very fuzzer, and the slice ended **57 lines before the push it was
-/// counting**. It read `found 0` and would have read `found 0` just as happily
-/// if the growth site had been deleted.
-///
-/// **A borrowed guard is not a free one**: the reason that split is right in
-/// `buffer_pool_fuzz` is that `buffer_pool.rs` has a test module quoting the
-/// defective line, and neither half of that is true here. The repair is to read
-/// the file and assert the *counts* are the ones a reader can check against the
-/// line numbers below -- plus a non-vacuity arm, because a pattern that matches
-/// nothing and a file that contains nothing look identical (§15.1a).
-#[test]
-fn in_flight_has_one_growth_site_and_three_shrink_sites() {
-    let src = include_str!("commands.rs");
+    /// **One shrink site against one growth site, checked in source.**
+    ///
+    /// §17's registered prediction for #508 rests on this asymmetry, and a runtime
+    /// test cannot see it: whether `in_flight` has a second unconditional push is a
+    /// property of the *text*, and a sequence that never reaches a new push cannot
+    /// report one. Same reasoning, and the same mechanism, as
+    /// `pool_counters_holds_accumulators_only` (#507) and `Buffer`'s
+    /// `black_box` guard (#454).
+    ///
+    /// Mutation-tested: adding a `state.in_flight.push(..)` outside
+    /// `commit_swap_locked`, or removing the `retain` from `flush_and_prune`, makes
+    /// this fail.
+    ///
+    /// # It reads the whole file, and that is a correction
+    ///
+    /// The first version sliced off everything after the first `#[cfg(test)]`,
+    /// copying `pool_counters_holds_accumulators_only`'s guard against a check
+    /// reading its own description. `commands.rs` has **no test module** -- so the
+    /// only `#[cfg(test)]` in it is [`Commands::in_flight_len`], the accessor added
+    /// for this very fuzzer, and the slice ended **57 lines before the push it was
+    /// counting**. It read `found 0` and would have read `found 0` just as happily
+    /// if the growth site had been deleted.
+    ///
+    /// **A borrowed guard is not a free one**: the reason that split is right in
+    /// `buffer_pool_fuzz` is that `buffer_pool.rs` has a test module quoting the
+    /// defective line, and neither half of that is true here. The repair is to read
+    /// the file and assert the *counts* are the ones a reader can check against the
+    /// line numbers below -- plus a non-vacuity arm, because a pattern that matches
+    /// nothing and a file that contains nothing look identical (§15.1a).
+    #[test]
+    fn in_flight_has_one_growth_site_and_three_shrink_sites() {
+        let src = include_str!("commands.rs");
 
-    // Non-vacuity: the file was found and is the one this test is about.
-    // Without it every count below is trivially satisfied by an empty string,
-    // which is #457's `nm | grep -c` shape -- the reader exits printing nothing
-    // and every pattern counts 0.
-    assert!(
-        src.contains("pub fn flush_and_prune"),
-        "commands.rs does not contain flush_and_prune: this test is reading the wrong text, \
+        // Non-vacuity: the file was found and is the one this test is about.
+        // Without it every count below is trivially satisfied by an empty string,
+        // which is #457's `nm | grep -c` shape -- the reader exits printing nothing
+        // and every pattern counts 0.
+        assert!(
+            src.contains("pub fn flush_and_prune"),
+            "commands.rs does not contain flush_and_prune: this test is reading the wrong text, \
          and every count below would be vacuous"
-    );
+        );
 
-    let sites = |needle: &str| -> Vec<(usize, &str)> {
-        src.lines()
-            .enumerate()
-            .filter(|(_, l)| l.contains(needle))
-            .map(|(i, l)| (i + 1, l.trim()))
-            .collect()
-    };
+        let sites = |needle: &str| -> Vec<(usize, &str)> {
+            src.lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains(needle))
+                .map(|(i, l)| (i + 1, l.trim()))
+                .collect()
+        };
 
-    // Growth: `push` onto `in_flight`. The fuzzer's bound counts commits, so it
-    // is only meaningful if a commit is the only thing that can grow the queue.
-    let pushes = sites("in_flight.push");
-    assert_eq!(
+        // Growth: `push` onto `in_flight`. The fuzzer's bound counts commits, so it
+        // is only meaningful if a commit is the only thing that can grow the queue.
+        let pushes = sites("in_flight.push");
+        assert_eq!(
         pushes.len(),
         1,
         "expected exactly one site pushing onto in_flight (commit_swap_locked's), found {:#?}. \
@@ -596,38 +596,38 @@ fn in_flight_has_one_growth_site_and_three_shrink_sites() {
         pushes
     );
 
-    // Shrink, counted per mechanism rather than per line, so a repair that
-    // removes the prune -- #513's own mutation, which read 63 in flight at
-    // n=64 -- fails here as well as in a run.
-    let takes = sites("mem::take(&mut state.in_flight)");
-    assert_eq!(
-        takes.len(),
-        1,
-        "expected exactly one mem::take of in_flight (flush_and_wait's), found {takes:#?}"
-    );
+        // Shrink, counted per mechanism rather than per line, so a repair that
+        // removes the prune -- #513's own mutation, which read 63 in flight at
+        // n=64 -- fails here as well as in a run.
+        let takes = sites("mem::take(&mut state.in_flight)");
+        assert_eq!(
+            takes.len(),
+            1,
+            "expected exactly one mem::take of in_flight (flush_and_wait's), found {takes:#?}"
+        );
 
-    // `retain` appears in prose too, so count executable occurrences only: a
-    // line that is a comment cannot shrink a queue. (`.retain(` with the
-    // receiver on the previous line is how both sites are formatted.)
-    let retains: Vec<(usize, &str)> = sites(".retain(")
-        .into_iter()
-        .filter(|(_, l)| !l.starts_with("//") && !l.starts_with("///"))
-        .collect();
-    assert_eq!(
-        retains.len(),
-        3,
-        "expected exactly three retain-based shrink sites on in_flight \
+        // `retain` appears in prose too, so count executable occurrences only: a
+        // line that is a comment cannot shrink a queue. (`.retain(` with the
+        // receiver on the previous line is how both sites are formatted.)
+        let retains: Vec<(usize, &str)> = sites(".retain(")
+            .into_iter()
+            .filter(|(_, l)| !l.starts_with("//") && !l.starts_with("///"))
+            .collect();
+        assert_eq!(
+            retains.len(),
+            3,
+            "expected exactly three retain-based shrink sites on in_flight \
          (flush_and_wait_current's, flush_and_prune's and wait_marker's), found {retains:#?}. \
          Losing one is the unbounded-queue defect #493 repaired."
-    );
+        );
 
-    // The asymmetry §17's prediction rests on, stated as the number a reader
-    // can check: one unconditional push against four conditional removals, of
-    // which exactly one does not block.
-    assert_eq!(
-        pushes.len() + takes.len() + retains.len(),
-        5,
-        "the growth/shrink census moved; the fuzzer's model is written against it"
-    );
-}
+        // The asymmetry §17's prediction rests on, stated as the number a reader
+        // can check: one unconditional push against four conditional removals, of
+        // which exactly one does not block.
+        assert_eq!(
+            pushes.len() + takes.len() + retains.len(),
+            5,
+            "the growth/shrink census moved; the fuzzer's model is written against it"
+        );
+    }
 }

@@ -40,6 +40,8 @@ mod completion_gpu_tests;
 #[cfg(test)]
 mod component_digest_tests;
 pub mod compute_pipeline;
+#[cfg(test)]
+mod constants_pool_tests;
 /// Where the command buffer is cut: the partition arithmetic (#420 stage 3).
 ///
 /// Pure functions, no device -- `scratch_tests.rs`'s split between the
@@ -53,6 +55,8 @@ pub mod executor;
 mod executor_tests;
 pub mod fence;
 #[cfg(test)]
+mod fence_probe_tests;
+#[cfg(test)]
 mod flash_decoding_tests;
 /// Strict ordering verification (issue #185). Every entry point is inert
 /// without the `hazard-audit` feature, so the module is declared
@@ -62,8 +66,6 @@ pub mod hazard_audit;
 #[cfg(test)]
 mod hazard_audit_tests;
 pub mod icb;
-#[cfg(test)]
-mod constants_pool_tests;
 #[cfg(test)]
 mod icb_executor_tests;
 #[cfg(test)]

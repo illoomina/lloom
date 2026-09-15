@@ -1409,7 +1409,8 @@ impl BufferPool {
     /// means an allocation it still lists whose handle is gone
     /// (`DESIGN.md` §6.3c). Replaces any previous observer.
     pub fn set_eviction_observer(&self, observer: Arc<dyn BufferEvictionObserver>) {
-        { let mut slot = self.inner.on_evict.lock();
+        {
+            let mut slot = self.inner.on_evict.lock();
             *slot = Some(observer);
         }
     }
@@ -1445,7 +1446,8 @@ impl BufferPool {
     /// past the bound is still the right answer for a larger request, and
     /// `evict_over_budget` remains the only thing that destroys a free buffer.
     pub fn set_reuse_oversize_bound(&self, bound: Option<f64>) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.oversize_bound = bound;
         }
     }
@@ -1462,7 +1464,8 @@ impl BufferPool {
     /// is next exceeded, and changing it is not itself a budget event. A caller
     /// wanting both calls [`Self::set_free_budget`] after this.
     pub fn set_eviction_order(&self, order: EvictionOrder) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.eviction_order = order;
         }
     }
@@ -1507,7 +1510,8 @@ impl BufferPool {
     /// [`ResidualCap`]. It calls into Metal nowhere and it cannot fire if
     /// admission was honest.
     pub fn set_residual_cap(&self, limit: usize, planned: usize) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.residual = Some(ResidualCap { limit, planned });
         }
     }
@@ -1515,7 +1519,8 @@ impl BufferPool {
     /// Removes the residual cap, restoring the unbounded behaviour that
     /// shipped.
     pub fn clear_residual_cap(&self) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.residual = None;
         }
     }
@@ -1754,7 +1759,8 @@ impl BufferPool {
             buffer.length(),
             buffer.base_offset(),
         );
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.counters.allocations += 1;
             state.counters.allocated_bytes += size as u64;
             state.live_buffers += 1;
@@ -1803,7 +1809,8 @@ impl BufferPool {
              and the overhang would underflow (DESIGN.md §9.2)."
         );
         let handle = self.adopt(buffer, allocated);
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.counters.requested_bytes += requested as u64;
             state.counters.served_bytes += allocated as u64;
             // The MISS half of the same split, banded on the same key as the
@@ -1832,7 +1839,8 @@ impl BufferPool {
         self.inner.drain_completed();
 
         let mut freed = Vec::new();
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             for (_, mut bucket) in std::mem::take(&mut state.free) {
                 // Destroyed rather than reused, as in `evict_over_budget`: the
                 // mark comes off before the allocation goes, or it outlives the
@@ -1868,7 +1876,8 @@ impl BufferPool {
     /// zeroed it while the buffers it counted were still parked. The live
     /// figures are [`Self::occupancy`]'s, and this does not touch them.
     pub fn reset_counters(&self) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.counters = PoolCounters::default();
         }
     }

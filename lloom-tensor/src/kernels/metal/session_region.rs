@@ -93,9 +93,9 @@
 //! mutation.
 
 use super::{Buffer, PooledBuffer};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
 use std::sync::Arc;
 
 /// Offsets are 128 B aligned, for §9.2's reason: it is safe for every Metal

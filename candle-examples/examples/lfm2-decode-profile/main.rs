@@ -3214,6 +3214,8 @@ fn main() -> Result<()> {
 
     // Per token: (wall seconds, gpu busy seconds, dispatches).
     let mut steps: Vec<(f64, f64, u64)> = Vec::with_capacity(args.n);
+    // Per-step cross-encoder fence-map reads, hits, and waits (lloom #732).
+    let mut fence_steps: Vec<(u64, u64, u64)> = Vec::with_capacity(args.n);
     // Per token, for the run record: `CLOCK_UPTIME_RAW` at the end of the token
     // and the `kv_len` it ran at. Pre-reserved, so the push inside the loop
     // cannot reallocate mid-window; the stamp itself is one
@@ -4089,7 +4091,7 @@ fn main() -> Result<()> {
         // drain-invariant and the CPU one is not**, which is the whole finding
         // and why the fields below are renamed rather than left to mean
         // something new under an old name.
-        let (gpu, disp) = if profiling {
+        let (gpu, disp, fence_counts) = if profiling {
             let s = profile::snapshot();
             profile::reset();
             // Kept from the last iteration: the counters are reset per token, so
@@ -4098,9 +4100,13 @@ fn main() -> Result<()> {
             last_token_kernels = s.by_label.clone();
             timed_cbs += s.timed_command_buffers;
             untimed_cbs += s.command_buffers.saturating_sub(s.timed_command_buffers);
-            (s.gpu_busy_union_s, s.dispatches)
+            (
+                s.gpu_busy_union_s,
+                s.dispatches,
+                (s.fence_probes, s.fence_hits, s.fence_waits),
+            )
         } else {
-            (0.0, 0)
+            (0.0, 0, (0, 0, 0))
         };
 
         // The arena is derived from the first `record_steps` decode steps and
@@ -4213,6 +4219,7 @@ fn main() -> Result<()> {
         }
 
         steps.push((wall, gpu, disp));
+        fence_steps.push(fence_counts);
         // Stamped after the timing snapshot, so the clock read is outside the
         // window it describes rather than inside it.
         step_stamps.push((run_record::now_ns(), kv_len));
@@ -4355,6 +4362,20 @@ fn main() -> Result<()> {
     let wall_mean: f64 = steady.iter().map(|s| s.0).sum::<f64>() / n_steady;
     let gpu_mean: f64 = steady.iter().map(|s| s.1).sum::<f64>() / n_steady;
     let disp_mean: f64 = steady.iter().map(|s| s.2 as f64).sum::<f64>() / n_steady;
+    // The fence-map traffic per step over the same steady window (lloom #732):
+    // reads of the cross-encoder map, reads that found a writer, and
+    // `waitForFence` calls. Zero with profiling off.
+    let (fence_probes_mean, fence_hits_mean, fence_waits_mean) = {
+        let fs = fence_steps
+            .get(warmup.min(fence_steps.len())..)
+            .unwrap_or(&[]);
+        let n = fs.len().max(1) as f64;
+        (
+            fs.iter().map(|f| f.0 as f64).sum::<f64>() / n,
+            fs.iter().map(|f| f.1 as f64).sum::<f64>() / n,
+            fs.iter().map(|f| f.2 as f64).sum::<f64>() / n,
+        )
+    };
 
     // ---- the speculative denominator (#284, §10.2i) ----------------------
     //
@@ -4773,6 +4794,10 @@ fn main() -> Result<()> {
         println!(
             "dispatches / step     {:.1}  (min {}, max {})",
             disp_mean, disp_min, disp_max
+        );
+        println!(
+            "fence map / step      {:.1} reads, {:.1} hits, {:.1} waits",
+            fence_probes_mean, fence_hits_mean, fence_waits_mean
         );
         // **The engagement proof §2.4 requires, and the reason it is computed
         // rather than read off the line above** (issue #249).
@@ -5346,7 +5371,9 @@ fn main() -> Result<()> {
          sample_in_buffer={} to_cpu_fast={} to_cpu_blit={} \
          to_cpu_null_after_wait={} step_ms_per_token={:.4} \
          dispatches_per_token={:.1} \
-         dispatches_per_forward={:.1} aggregate_tok_per_s={:.2} per_seq_tok_per_s={:.2} \
+         dispatches_per_forward={:.1} fence_probes_per_token={:.1} \
+         fence_hits_per_token={:.1} fence_waits_per_token={:.1} \
+         aggregate_tok_per_s={:.2} per_seq_tok_per_s={:.2} \
          batch_streams_identical={} spec_k={} spec_proposer={} spec_windows={} \
          spec_proposed={} spec_accepted={} spec_corrupted={} spec_accept_rate={:.4} \
          spec_tokens_per_step={:.4} spec_rows_agree={} prefill_ms={:.2} \
@@ -5448,6 +5475,9 @@ fn main() -> Result<()> {
         } else {
             0.0
         },
+        fence_probes_mean,
+        fence_hits_mean,
+        fence_waits_mean,
         // §13.4a's own quantity: `B / step_time`. Under `--speculate` a step
         // yields `spec_tokens_per_step` tokens per row rather than one, so the
         // rate is over the tokens the windows kept — the same divisor the

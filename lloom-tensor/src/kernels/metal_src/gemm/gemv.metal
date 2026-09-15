@@ -1294,6 +1294,280 @@ void gemv_mul_packed(
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+/// gemv_swiglu: TWO matrices per threadgroup, one store — §12.2 row 5 with
+/// row 3b's product in the same epilogue (issue #732)
+///////////////////////////////////////////////////////////////////////////////
+
+// `silu(gate·x) * (up·x)` for one block of output rows, both weights streamed
+// by the same threadgroup over the same input coefficients. There is no
+// barrier anywhere inside it: the two sweeps that `gemv_mul` put a barrier
+// between are one dispatch here, and the product is applied to the two
+// unrounded f32 accumulators — one rounding where the three-dispatch chain
+// (`gemv`, `silu`, `gemv`, `bmul`) rounds three times and the two-dispatch
+// chain (`gemv_silu`, `gemv_mul`) twice. `GEMVKernel::run`'s K-walk, with
+// the matrix loop run twice per block; the row selection, the loop bounds
+// and the simdgroup reduction are its, verbatim, so the two kernels cannot
+// disagree about which rows a threadgroup owns.
+//
+// Only the two decode tiles are instantiated, both `bn1`, so the threadgroup
+// reduction is compiled out; it is written for the general tile anyway with
+// a second region of threadgroup memory, so a third tile is one macro line.
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    typename AccT = typename GemvDefaultAccT<T>::type>
+struct GEMVSwigluKernel {
+  using acc_type = AccT;
+  using base_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, false>;
+
+  MLX_MTL_CONST int threadsM = BM * SM;
+  MLX_MTL_CONST int threadsN = BN * SN;
+  MLX_MTL_CONST int blockM = threadsM * TM;
+  MLX_MTL_CONST int blockN = threadsN * TN;
+  MLX_MTL_CONST short tgp_mem_size = BN > 1 ? 2 * BN * (blockM + TM) : 0;
+  MLX_MTL_CONST bool needs_tgp_reduction = BN > 1;
+
+  static METAL_FUNC void run(
+      const device T* mat_up,
+      const device T* mat_gate,
+      const device T* in_vec,
+      device T* out_vec,
+      const int in_vec_size,
+      const int out_vec_size,
+      const int matrix_ld,
+      threadgroup AccT* tgp_memory,
+      uint3 tid,
+      uint simd_gid,
+      uint simd_lid) {
+    thread AccT up[TM] = {0};
+    thread AccT gate[TM] = {0};
+    thread T inter[TN];
+    thread AccT v_coeff[TN];
+
+    const int thrM = SN != 32 ? (int)(simd_lid / SN) : 0;
+    const int thrN = SN != 32 ? (int)(simd_lid % SN) : (int)simd_lid;
+    const int sgN = BN != 1 ? (int)(simd_gid % BN) : 0;
+    const int simdM = BN != 1 ? SM * (int)(simd_gid / BN) : (int)(SM * simd_gid);
+    const int simdN = BN != 1 ? SN * (int)(simd_gid % BN) : 0;
+
+    int bm = (simdM + thrM) * TM;
+    int bn = (simdN + thrN) * TN;
+    int out_row = tid.x * blockM + bm;
+    if (out_row >= out_vec_size) return;
+    out_row = out_row + TM <= out_vec_size ? out_row : out_vec_size - TM;
+
+    mat_up += out_row * matrix_ld;
+    mat_gate += out_row * matrix_ld;
+
+    const int loop_stride = blockN;
+    const int in_size = in_vec_size;
+    const int n_iter = in_size / loop_stride;
+    const int last_iter = loop_stride * n_iter;
+    const int leftover = in_size - last_iter;
+
+    for (int i = 0; i < n_iter; ++i) {
+      base_t::template load_unsafe<AccT>(in_vec, v_coeff, bn);
+      int mat_offset = 0;
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tm = 0; tm < TM; tm++) {
+        base_t::load_unsafe(mat_up, inter, mat_offset + bn);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          up[tm] += inter[tn] * v_coeff[tn];
+        }
+        base_t::load_unsafe(mat_gate, inter, mat_offset + bn);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          gate[tm] += inter[tn] * v_coeff[tn];
+        }
+        mat_offset += matrix_ld;
+      }
+      bn += blockN;
+    }
+
+    if (leftover > 0) {
+      base_t::template load_safe<AccT>(in_vec, v_coeff, bn, in_size);
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tm = 0; tm < TM; tm++) {
+        base_t::load_safe(&mat_up[tm * matrix_ld], inter, bn, in_size);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          up[tm] += inter[tn] * v_coeff[tn];
+        }
+        base_t::load_safe(&mat_gate[tm * matrix_ld], inter, bn, in_size);
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tn = 0; tn < TN; tn++) {
+          gate[tm] += inter[tn] * v_coeff[tn];
+        }
+      }
+    }
+
+    MLX_MTL_PRAGMA_UNROLL
+    for (int tm = 0; tm < TM; tm++) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+        up[tm] += simd_shuffle_down(up[tm], sn);
+        gate[tm] += simd_shuffle_down(gate[tm], sn);
+      }
+    }
+
+    if (needs_tgp_reduction) {
+      threadgroup AccT* tgp_up = tgp_memory + sgN * (blockM + TM) + bm;
+      threadgroup AccT* tgp_gate = tgp_memory + BN * (blockM + TM) + sgN * (blockM + TM) + bm;
+      if (thrN == 0) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int tm = 0; tm < TM; tm++) {
+          tgp_up[tm] = up[tm];
+          tgp_gate[tm] = gate[tm];
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+        if (sgN == 0) {
+          MLX_MTL_PRAGMA_UNROLL
+          for (int sgn = 1; sgn < BN; sgn++) {
+            MLX_MTL_PRAGMA_UNROLL
+            for (int tm = 0; tm < TM; tm++) {
+              up[tm] += tgp_up[sgn * (blockM + TM) + tm];
+              gate[tm] += tgp_gate[sgn * (blockM + TM) + tm];
+            }
+          }
+        }
+      }
+    }
+
+    // The product on the two accumulators, one thread per output element,
+    // one rounding at the store.
+    if (simdN == 0 && thrN == 0) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tm = 0; tm < TM; tm++) {
+        out_vec[out_row + tm] = static_cast<T>(silu(gate[tm]) * up[tm]);
+      }
+    }
+  }
+};
+
+// The batch offsets and the call, shared by both binding styles; `gemv_body`'s
+// shape with the second matrix under the same batch stride.
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    typename ShapeP, typename StrideP>
+METAL_FUNC void gemv_swiglu_body(
+    const device T* mat_up,
+    const device T* mat_gate,
+    const device T* in_vec,
+    device T* out_vec,
+    const int in_vec_size,
+    const int out_vec_size,
+    const int matrix_ld,
+    const int batch_ndim,
+    ShapeP batch_shape,
+    StrideP vector_batch_stride,
+    StrideP matrix_batch_stride,
+    threadgroup typename GEMVSwigluKernel<T, BM, BN, SM, SN, TM, TN>::acc_type* tgp_memory,
+    uint3 tid,
+    uint simd_gid,
+    uint simd_lid) {
+  using kernel_t = GEMVSwigluKernel<T, BM, BN, SM, SN, TM, TN>;
+  if (kDoNCBatch) {
+    in_vec   += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, vector_batch_stride, batch_ndim);
+    mat_up   += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, matrix_batch_stride, batch_ndim);
+    mat_gate += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, matrix_batch_stride, batch_ndim);
+  } else {
+    in_vec   += tid.z * vector_batch_stride[0];
+    mat_up   += tid.z * matrix_batch_stride[0];
+    mat_gate += tid.z * matrix_batch_stride[0];
+  }
+  out_vec += tid.z * out_vec_size;
+  kernel_t::run(mat_up, mat_gate, in_vec, out_vec,
+                in_vec_size, out_vec_size, matrix_ld,
+                tgp_memory, tid, simd_gid, simd_lid);
+}
+
+// `gemv`'s classical signature — `mat` is the UP weight at 0 — with the gate
+// weight at 15, after every slot the classical layout declares. `bias`, the
+// axpby scalars and the bias strides are accepted and unread: the fused arms
+// are instantiated at `axpby0` only, as the two epilogues are.
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_swiglu(
+    const device T* mat [[buffer(0)]],
+    const device T* in_vec [[buffer(1)]],
+    const device T* bias [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const constant int& in_vec_size [[buffer(4)]],
+    const constant int& out_vec_size [[buffer(5)]],
+    const constant int& matrix_ld [[buffer(6)]],
+    const constant float& alpha [[buffer(7)]],
+    const constant float& beta [[buffer(8)]],
+    const constant int& batch_ndim [[buffer(9)]],
+    const constant int* batch_shape [[buffer(10)]],
+    const constant int64_t* vector_batch_stride [[buffer(11)]],
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],
+    const constant int64_t* bias_batch_stride [[buffer(13)]],
+    const constant int& bias_stride [[buffer(14)]],
+    const device T* mat_gate [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)bias; (void)alpha; (void)beta; (void)bias_batch_stride; (void)bias_stride; (void)lid;
+  using kernel_t = GEMVSwigluKernel<T, BM, BN, SM, SN, TM, TN>;
+  gemv_tgp_memory(kernel_t);
+  gemv_swiglu_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch>(
+      mat, mat_gate, in_vec, out_vec,
+      in_vec_size, out_vec_size, matrix_ld,
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      tid, simd_gid, simd_lid);
+}
+
+template <
+    typename T,
+    const int BM, const int BN,
+    const int SM, const int SN,
+    const int TM, const int TN,
+    const bool kDoNCBatch,
+    const bool kDoAxpby>
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]
+void gemv_swiglu_packed(
+    const device GemvParams* pp [[buffer(0)]],
+    const device T* mat [[buffer(1)]],
+    const device T* in_vec [[buffer(2)]],
+    device T* out_vec [[buffer(3)]],
+    const device int* batch_shape [[buffer(4)]],
+    const device int64_t* vector_batch_stride [[buffer(5)]],
+    const device int64_t* matrix_batch_stride [[buffer(6)]],
+    const device int64_t* bias_batch_stride [[buffer(7)]],
+    const device T* bias [[buffer(8)]],
+    const device T* mat_gate [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 lid [[thread_position_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  (void)bias; (void)bias_batch_stride; (void)lid;
+  using kernel_t = GEMVSwigluKernel<T, BM, BN, SM, SN, TM, TN>;
+  gemv_tgp_memory(kernel_t);
+  GemvParams p = *pp;
+  gemv_swiglu_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch>(
+      mat, mat_gate, in_vec, out_vec,
+      p.in_vec_size, p.out_vec_size, p.matrix_ld,
+      p.batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,
+      tid, simd_gid, simd_lid);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 /// gemv_t kernel: vec [K] × mat [K, N] → out [N]
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -1581,6 +1855,19 @@ void gemv_t_packed(
   instantiate_gemv_mul_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
   instantiate_gemv_mul_helper(nm, itype, 8, 1, 1, 32, 4, 4)
 
+// The two-weight SwiGLU kernel (issue #732, §12.2 row 5 + row 3b), named by
+// appending `_swiglu`; the same two tiles.
+#define instantiate_gemv_swiglu_helper(nm, itype, bm, bn, sm, sn, tm, tn)      \
+  template [[host_name(                                                       \
+      "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                     \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_swiglu")]]                             \
+  [[kernel]] decltype(gemv_swiglu<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_swiglu<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
+#define instantiate_gemv_swiglu_blocks(nm, itype)              \
+  instantiate_gemv_swiglu_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
+  instantiate_gemv_swiglu_helper(nm, itype, 8, 1, 1, 32, 4, 4)
+
 // The packed siblings of the two epilogue arms (issue #732 P3), named as every
 // packed name is: `_packed` LAST, `…_nc0_axpby0_silu_packed` — the replay
 // executor classifies a position by that suffix (`icb.rs` `is_packed`), so a
@@ -1608,13 +1895,22 @@ void gemv_t_packed(
   [[kernel]] decltype(gemv_mul_packed<itype, bm, bn, sm, sn, tm, tn, false, false>) \
              gemv_mul_packed<itype, bm, bn, sm, sn, tm, tn, false, false>;
 
+#define instantiate_gemv_swiglu_packed_helper(nm, itype, bm, bn, sm, sn, tm, tn)     \
+  template [[host_name(                                                               \
+      "gemv_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                             \
+      "_tm" #tm "_tn" #tn "_nc0_axpby0_swiglu_packed")]]                              \
+  [[kernel]] decltype(gemv_swiglu_packed<itype, bm, bn, sm, sn, tm, tn, false, false>) \
+             gemv_swiglu_packed<itype, bm, bn, sm, sn, tm, tn, false, false>;
+
 #define instantiate_gemv_epilogue_packed_blocks(nm, itype)              \
   instantiate_gemv_silu_packed_helper(nm, itype, 4, 1, 1, 32, 4, 4)     \
   instantiate_gemv_silu_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4)     \
   instantiate_gemv_residual_packed_helper(nm, itype, 4, 1, 1, 32, 4, 4) \
   instantiate_gemv_residual_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4) \
   instantiate_gemv_mul_packed_helper(nm, itype, 4, 1, 1, 32, 4, 4)      \
-  instantiate_gemv_mul_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4)
+  instantiate_gemv_mul_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4)      \
+  instantiate_gemv_swiglu_packed_helper(nm, itype, 4, 1, 1, 32, 4, 4)   \
+  instantiate_gemv_swiglu_packed_helper(nm, itype, 8, 1, 1, 32, 4, 4)
 
 #define instantiate_gemv_nc_axpby(func, nm, itype, bm, bn, sm, sn, tm, tn)    \
   instantiate_gemv_helper(func, nm, itype, bm, bn, sm, sn, tm, tn, 0, 0)      \
@@ -1683,6 +1979,10 @@ instantiate_gemv_residual_blocks(bfloat16, bfloat)
 instantiate_gemv_mul_blocks(float32, float)
 instantiate_gemv_mul_blocks(float16, half)
 instantiate_gemv_mul_blocks(bfloat16, bfloat)
+
+instantiate_gemv_swiglu_blocks(float32, float)
+instantiate_gemv_swiglu_blocks(float16, half)
+instantiate_gemv_swiglu_blocks(bfloat16, bfloat)
 
 // Their packed siblings (issue #732 P3): twelve names, the same two tiles.
 instantiate_gemv_epilogue_packed_blocks(float32, float)

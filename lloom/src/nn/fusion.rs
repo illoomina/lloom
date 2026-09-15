@@ -57,6 +57,10 @@ pub enum Semantics {
     /// `y = x * operand[row]`, the operand read at the storing thread's own
     /// output row.
     MulOperand,
+    /// `y = silu(operand·in) * x` — the operand is a second WEIGHT of the
+    /// GEMV's own shape, streamed beside it; the block sees two accumulators
+    /// for its row and stores their product.
+    SwigluGate,
 }
 
 /// Which second operand an [`Operand`] type binds, as a value the optimizer
@@ -67,6 +71,9 @@ pub enum OperandKind {
     None,
     /// One buffer of exactly the output extent, indexed by the output row.
     RowIndexed,
+    /// A second weight matrix of the GEMV's own `[n, k]`, swept by the same
+    /// threadgroup over the same input coefficients.
+    Weight,
 }
 
 /// G1 — a functor sees ONE accumulator value and its index (`gemv.metal:392`).
@@ -114,6 +121,14 @@ pub struct RowIndexed<T>(PhantomData<T>);
 impl<T> sealed::Sealed for RowIndexed<T> {}
 impl<T> Operand for RowIndexed<T> {
     const KIND: OperandKind = OperandKind::RowIndexed;
+}
+
+/// A second weight of the GEMV's own shape, streamed beside it (the SwiGLU's
+/// gate projection).
+pub struct WeightOperand<T>(PhantomData<T>);
+impl<T> sealed::Sealed for WeightOperand<T> {}
+impl<T> Operand for WeightOperand<T> {
+    const KIND: OperandKind = OperandKind::Weight;
 }
 
 /// Output side of the GEMV's output/input partition. Evaluated once per output
@@ -232,6 +247,35 @@ pub struct BoundGate<'g> {
     g: &'g Tensor,
 }
 
+/// The two-weight SwiGLU (#732, §12.2 row 5 with row 3b's product): the up
+/// GEMV with the gate WEIGHT as its operand — both `[n, k]`, swept by the same
+/// threadgroup — storing `silu(gate·x) * (up·x)` from two unrounded
+/// accumulators. Replaces four dispatches (`gemv`, `silu`, `gemv`, `bmul`),
+/// or `gemv_silu` + `gemv_mul`, and, unlike the latter, puts no barrier
+/// between the two sweeps.
+///
+/// Bound by [`Swiglu::of`]: `gemv(w3).then(Swiglu::of(&w1))`.
+pub struct Swiglu;
+impl Elementwise for Swiglu {
+    const SUFFIX: &'static str = "_swiglu";
+    const PRECISION: Precision = Precision::Accumulator;
+    const SEMANTICS: Semantics = Semantics::SwigluGate;
+}
+impl Epilogue for Swiglu {
+    type Operand = WeightOperand<half::f16>;
+}
+impl Swiglu {
+    /// Bind the gate weight `w`, `[n, k]`, the up weight's shape, contiguous.
+    pub fn of(w: &Tensor) -> BoundSwiglu<'_> {
+        BoundSwiglu { w }
+    }
+}
+
+/// A [`Swiglu`] with its gate weight bound. Produced by [`Swiglu::of`].
+pub struct BoundSwiglu<'w> {
+    w: &'w Tensor,
+}
+
 /// RoPE — the compile-fail proof for the epilogue seam. RoPE reads `i1` and
 /// `i1 + d/2` (`reduce.metal:1772`), not a single accumulator value, so it is
 /// **not** [`Elementwise`] and therefore cannot be an [`Epilogue`] or a
@@ -312,8 +356,8 @@ pub struct Gemv<P: Prologue = PrologueNone, E: Epilogue = EpilogueNone>(PhantomD
 /// This is the single place the type-level epilogue set is mapped to the
 /// runtime enum, so the two cannot drift: a new fusable `impl Epilogue` that
 /// forgets its `GemvFusion` arm has no `FusedArm` impl and cannot be applied
-/// through `Gemv`. `EpilogueNone`/`Silu`/`Residual`/`Gate` are the four fusable
-/// arms `gemv.metal` instantiates.
+/// through `Gemv`. `EpilogueNone`/`Silu`/`Residual`/`Gate`/`Swiglu` are the
+/// five fusable arms `gemv.metal` instantiates.
 pub(crate) trait FusedArm: Epilogue {
     const ARM: GemvFusion;
 }
@@ -328,6 +372,9 @@ impl FusedArm for Residual {
 }
 impl FusedArm for Gate {
     const ARM: GemvFusion = GemvFusion::Mul;
+}
+impl FusedArm for Swiglu {
+    const ARM: GemvFusion = GemvFusion::Swiglu;
 }
 
 // `FusedArm` is deliberately `pub(crate)` — it is the sealed drift-guard above,
@@ -443,6 +490,13 @@ impl EvalTail for BoundGate<'_> {
     }
 }
 
+impl sealed::Sealed for BoundSwiglu<'_> {}
+impl EvalTail for BoundSwiglu<'_> {
+    fn eval_after_gemv(&self, w: &Tensor, x: &Tensor) -> Result<Tensor> {
+        Gemv::<PrologueNone, Swiglu>::apply(x, w, Some(self.w))
+    }
+}
+
 // --- De-fuse tails: a legal `Elementwise` that is NOT an admissible
 // `Epilogue`, so it runs as GEMV then a separate dispatch. No overlap with the
 // fused impls above: `Rope`/`QkNorm` are not `Epilogue`. ---
@@ -476,6 +530,7 @@ mod tests {
         assert_eq!(<Silu as FusedArm>::ARM, GemvFusion::Silu);
         assert_eq!(<Residual as FusedArm>::ARM, GemvFusion::Residual);
         assert_eq!(<Gate as FusedArm>::ARM, GemvFusion::Mul);
+        assert_eq!(<Swiglu as FusedArm>::ARM, GemvFusion::Swiglu);
     }
 
     /// SiLU has no second operand; the residual reads one at its output row.
@@ -495,6 +550,9 @@ mod tests {
         assert_eq!(Gate::SUFFIX, "_mul");
         assert_eq!(Gate::PRECISION, Precision::Accumulator);
         assert_eq!(Gate::SEMANTICS, Semantics::MulOperand);
+        assert_eq!(Swiglu::SUFFIX, "_swiglu");
+        assert_eq!(Swiglu::SEMANTICS, Semantics::SwigluGate);
+        let _: <Swiglu as Epilogue>::Operand = WeightOperand::<half::f16>(PhantomData);
         assert_eq!(EpilogueNone::SUFFIX, "");
         // Type-level: `Silu::Operand == NoOperand`, `Residual::Operand ==
         // RowIndexed<f16>`. Named here so a change to either associated type is
@@ -516,5 +574,6 @@ mod tests {
         assert_eq!(Silu::SUFFIX, GemvEpilogue::Silu.name_suffix());
         assert_eq!(Residual::SUFFIX, GemvEpilogue::Residual.name_suffix());
         assert_eq!(Gate::SUFFIX, GemvEpilogue::Mul.name_suffix());
+        assert_eq!(Swiglu::SUFFIX, GemvEpilogue::Swiglu.name_suffix());
     }
 }

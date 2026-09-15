@@ -284,10 +284,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
-    /// Fuse the SwiGLU product onto `w3`'s GEMV store (`GemvGate`, #732). The
-    /// digests move; the text is expected identical.
-    #[arg(long, default_value_t = false)]
-    gemv_gate: bool,
+    /// How the SwiGLU product is dispatched (`GemvGate`, #732): `off` |
+    /// `mul` | `swiglu`. The digests move; the text is expected identical.
+    #[arg(long, default_value = "off")]
+    gemv_gate: String,
 
     /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
     /// `conv1d` dispatch (`ConvFused`, §12.2 row 1). The digests move; the text
@@ -435,13 +435,16 @@ fn main() -> Result<()> {
     // against the arm it was taken in.
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
-    config.gemv_gate = args.gemv_gate;
+    config.gemv_gate =
+        lloom::models::lfm2::GateFusion::parse(&args.gemv_gate).map_err(anyhow::Error::msg)?;
     config.conv_fused = args.conv_fused;
     config.fusion =
         lloom::models::lfm2::FusionPolicy::parse(&args.fusion).map_err(anyhow::Error::msg)?;
     println!(
         "gemv epilogue: silu={} residual={} gate={}",
-        config.gemv_silu, config.gemv_residual, config.gemv_gate
+        config.gemv_silu,
+        config.gemv_residual,
+        config.gemv_gate.name()
     );
 
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))

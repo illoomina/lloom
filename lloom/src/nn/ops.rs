@@ -3316,6 +3316,11 @@ pub enum GemvFusion {
     /// `silu(w1·x) * (w3·x)` (#732, §12.2e row 3b at the producer end). Reads
     /// the gate at the storing thread's own output row, as the residual does.
     Mul,
+    /// The two-weight SwiGLU: `silu(gate·x) * (up·x)` in one dispatch, both
+    /// weights streamed by the same threadgroup, no barrier between the two
+    /// sweeps (#732, §12.2 row 5 + row 3b). The third tensor is the gate
+    /// WEIGHT, `[n, k]`.
+    Swiglu,
 }
 
 /// A GEMV with an elementwise transform fused onto its store.
@@ -3412,6 +3417,7 @@ fn gemv_fused_metal(
         GemvFusion::Silu => GemvEpilogue::Silu,
         GemvFusion::Residual => GemvEpilogue::Residual,
         GemvFusion::Mul => GemvEpilogue::Mul,
+        GemvFusion::Swiglu => GemvEpilogue::Swiglu,
     };
 
     // The residual is bound at the storing thread's own output position, so it
@@ -3429,11 +3435,25 @@ fn gemv_fused_metal(
                     x.dtype()
                 );
             }
-            if r_l.shape().elem_count() != b * n {
+            // A row-indexed operand is exactly the output extent; the
+            // SwiGLU's operand is the gate weight, `[n, k]` like the up
+            // weight it is streamed beside.
+            let expected = match fusion {
+                GemvFusion::Swiglu => n * k,
+                _ => b * n,
+            };
+            if r_l.shape().elem_count() != expected {
                 lloom_tensor::bail!(
-                    "gemv-fused: the operand has {} elements, expected b*n = {} (issue #509)",
+                    "gemv-fused: the operand has {} elements, expected {} (issue #509)",
                     r_l.shape().elem_count(),
-                    b * n
+                    expected
+                );
+            }
+            if matches!(fusion, GemvFusion::Swiglu) && r_l.dims() != w_l.dims() {
+                lloom_tensor::bail!(
+                    "gemv-swiglu: the gate weight {:?} must have the up weight's shape {:?}",
+                    r_l.dims(),
+                    w_l.dims()
                 );
             }
             if !r_l.is_contiguous() {
@@ -3622,4 +3642,16 @@ pub fn gemv_residual(x: &Tensor, weight: &Tensor, residual: &Tensor) -> Result<T
 pub fn gemv_mul(x: &Tensor, weight: &Tensor, gate: &Tensor) -> Result<Tensor> {
     use crate::nn::fusion::{gemv, Gate};
     gemv(weight).then(Gate::of(gate)).eval(x)
+}
+
+/// `silu(x @ gate_weight.t()) * (x @ up_weight.t())` in one dispatch — the
+/// two-weight SwiGLU (issue #732, `DESIGN.md` §12.2 row 5 with row 3b's
+/// product): both `[n, k]` weights streamed by the same threadgroup, no
+/// barrier between the two sweeps, one rounding at the store. Replaces
+/// `gemv`, `silu`, `gemv` and `bmul` — or `gemv_silu` and `gemv_mul` — on the
+/// MLP's gate. Metal, `m == 1`, no bias. The typed spelling is
+/// `fusion::gemv(up_weight).then(fusion::Swiglu::of(gate_weight)).eval(x)`.
+pub fn gemv_swiglu(x: &Tensor, up_weight: &Tensor, gate_weight: &Tensor) -> Result<Tensor> {
+    use crate::nn::fusion::{gemv, Swiglu};
+    gemv(up_weight).then(Swiglu::of(gate_weight)).eval(x)
 }

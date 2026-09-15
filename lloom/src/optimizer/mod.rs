@@ -233,10 +233,50 @@ mod tests {
         g
     }
 
+    /// The whole catalogue on one MLP: the extractor takes the two-weight
+    /// kernel for the gate (one dispatch where SiLU + the product are two),
+    /// the residual on `w2`; 7 dispatches → 3, `w1` never dispatched alone.
+    #[test]
+    fn the_swiglu_kernel_is_derived_over_the_pair_on_the_mlp() {
+        let g = mlp(1);
+        let d = derive(&g, &Policy::default()).unwrap();
+        assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("swiglu"));
+        assert_eq!(d.plan.sites.get("w2").map(String::as_str), Some("residual"));
+        assert_eq!(d.plan.sites.get("w1"), None, "{:?}", d.plan.sites);
+        assert_eq!(d.plan.sites.len(), 2);
+        assert_eq!(d.plan.dispatches_before(), 7);
+        assert_eq!(d.plan.dispatches_after(), 3);
+        assert_eq!(d.plan.class, NumericClass::Rounding);
+        assert_eq!(d.plan.after.get("gemv_swiglu"), Some(&1));
+        assert_eq!(d.plan.after.get("gemv_residual"), Some(&1));
+        assert_eq!(d.plan.after.get("gemv"), None);
+        assert!(!d.plan.after.contains_key("silu"));
+        assert!(!d.plan.after.contains_key("bmul"));
+        assert!(d.plan.seams.is_empty(), "{:?}", d.plan.seams);
+        // The fused node's operand is the gate WEIGHT.
+        let sw = d
+            .graph
+            .nodes()
+            .iter()
+            .find(|n| n.op == Op::Fused && n.name == "swiglu")
+            .unwrap();
+        let operand = d.graph.node(sw.inputs[2]);
+        assert_eq!(
+            (operand.op.clone(), operand.name.as_str()),
+            (Op::Weight, "w1")
+        );
+    }
+
+    /// With the two-weight kernel excluded, the pair it supersedes: SiLU on
+    /// `w1`, the product on `w3` with the fused gate as its operand.
     #[test]
     fn all_three_epilogues_are_derived_on_the_mlp() {
         let g = mlp(1);
-        let d = derive(&g, &Policy::default()).unwrap();
+        let policy = Policy {
+            excluded: vec!["swiglu".to_string()],
+            ..Default::default()
+        };
+        let d = derive(&g, &policy).unwrap();
         assert_eq!(d.plan.sites.get("w1").map(String::as_str), Some("silu"));
         assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("mul"));
         assert_eq!(d.plan.sites.get("w2").map(String::as_str), Some("residual"));
@@ -268,13 +308,16 @@ mod tests {
     }
 
     /// The barrier term, on an MLP at LFM2's shape (`w1`/`w3` `[10752,
-    /// 2048]` f16 = 44 MB each): the gate fragment removes a dispatch and
-    /// re-seats the product's barrier between the two sweeps, which the
-    /// model prices above the dispatch — refused, with the marginal named
-    /// and the pair it landed between; SiLU and the residual save. On the
-    /// small MLP above the same fragment is admitted: the verdict is the
-    /// weights', not the fragment's. `barrier_model: None` is the extractor's
-    /// own count and admits all three.
+    /// 2048]` f16 = 44 MB each), with the two-weight kernel excluded so the
+    /// gate is the `mul` fragment: it removes a dispatch and re-seats the
+    /// product's barrier between the two sweeps, which the model prices above
+    /// the dispatch — refused, with the marginal named and the pair it landed
+    /// between; SiLU and the residual save. On the small MLP above the same
+    /// fragment is admitted: the verdict is the weights', not the fragment's.
+    /// `barrier_model: None` is the extractor's own count and admits all
+    /// three. And the two-weight kernel at this shape is admitted at a margin
+    /// the crown's loss could not dent: one dispatch for four, its only
+    /// barrier the residual's beside `w2`.
     #[test]
     fn the_barrier_term_refuses_the_gate_at_lfm2s_shape_and_admits_it_small() {
         let mut g = Graph::new();
@@ -292,19 +335,19 @@ mod tests {
         let out = g.add(r, down);
         g.mark_root(out);
 
-        let d = derive(&g, &Policy::default()).unwrap();
+        let no_swiglu = Policy {
+            excluded: vec!["swiglu".to_string()],
+            ..Default::default()
+        };
+        let d = derive(&g, &no_swiglu).unwrap();
         assert_eq!(d.plan.sites.get("w1").map(String::as_str), Some("silu"));
         assert_eq!(d.plan.sites.get("w2").map(String::as_str), Some("residual"));
         assert_eq!(d.plan.sites.get("w3"), None, "{:?}", d.plan.sites);
         assert_eq!(d.plan.dispatches_after(), 5);
-        assert_eq!(d.refused.len(), 1, "{:?}", d.refused);
-        assert_eq!(d.refused[0].0, "mul");
+        let (_, why) = d.refused.iter().find(|(n, _)| n == "mul").unwrap();
         assert!(
-            d.refused[0]
-                .1
-                .contains("re-seated between gemv_silu and gemv_mul"),
-            "{}",
-            d.refused[0].1
+            why.contains("re-seated between gemv_silu and gemv_mul"),
+            "{why}"
         );
         let mul = d.marginals.iter().find(|m| m.fragment == "mul").unwrap();
         // By hand from the two declared constants. Fused, the product's
@@ -338,22 +381,30 @@ mod tests {
 
         let none = Policy {
             barrier_model: None,
+            excluded: vec!["swiglu".to_string()],
             ..Default::default()
         };
         let d = derive(&g, &none).unwrap();
         assert_eq!(d.plan.sites.len(), 3);
-        assert!(d.refused.is_empty());
+        assert_eq!(d.refused.len(), 1);
         assert!(d.marginals.is_empty());
         assert!(d.plan.cost.is_none());
+
+        let d = derive(&g, &Policy::default()).unwrap();
+        assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("swiglu"));
+        assert_eq!(d.plan.dispatches_after(), 3);
+        assert!(d.refused.is_empty(), "{:?}", d.refused);
+        let sw = d.marginals.iter().find(|m| m.fragment == "swiglu").unwrap();
+        assert!(sw.delta_us < -80.0, "{sw:?}");
     }
 
-    /// With the gate fragment excluded, the SwiGLU product is the seam the
+    /// With both gate fragments excluded, the SwiGLU product is the seam the
     /// first catalogue left — pinned so the seam report stays exercised.
     #[test]
     fn without_the_gate_fragment_the_product_is_the_seam_left() {
         let g = mlp(1);
         let policy = Policy {
-            excluded: vec!["mul".to_string()],
+            excluded: vec!["mul".to_string(), "swiglu".to_string()],
             ..Default::default()
         };
         let d = derive(&g, &policy).unwrap();
@@ -443,7 +494,7 @@ mod tests {
         };
         let d = derive(&g, &policy).unwrap();
         assert!(d.plan.sites.is_empty());
-        assert_eq!(d.refused.len(), 3);
+        assert_eq!(d.refused.len(), 4);
         assert_eq!(d.plan.dispatches_after(), 7);
         assert_eq!(d.plan.class, NumericClass::BitExact);
     }
@@ -452,7 +503,7 @@ mod tests {
     fn the_exclusion_set_removes_a_fragment_by_name() {
         let g = mlp(1);
         let policy = Policy {
-            excluded: vec!["silu".to_string()],
+            excluded: vec!["silu".to_string(), "swiglu".to_string()],
             ..Default::default()
         };
         let d = derive(&g, &policy).unwrap();
@@ -461,10 +512,16 @@ mod tests {
         assert_eq!(d.plan.sites.get("w3").map(String::as_str), Some("mul"));
         assert_eq!(
             d.refused,
-            vec![(
-                "silu".to_string(),
-                "excluded by the exclusion set".to_string()
-            )]
+            vec![
+                (
+                    "silu".to_string(),
+                    "excluded by the exclusion set".to_string()
+                ),
+                (
+                    "swiglu".to_string(),
+                    "excluded by the exclusion set".to_string()
+                )
+            ]
         );
     }
 

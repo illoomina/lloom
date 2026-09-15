@@ -206,7 +206,7 @@ impl Lfm2Config {
             // here — this change makes the arm reachable, nothing more.
             gemv_silu: false,
             gemv_residual: false,
-            gemv_gate: false,
+            gemv_gate: GateFusion::Off,
             conv_fused: false,
             conv_prefill_ctx: false,
             fusion: FusionPolicy::default(),
@@ -753,6 +753,54 @@ impl FusionPolicy {
     }
 }
 
+/// How the SwiGLU gate product `silu(w1·x) * (w3·x)` is dispatched (issue
+/// #732, `DESIGN.md` §12.2e row 3b, §12.2 row 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GateFusion {
+    /// `w3`'s GEMV, then a `bmul_f16` against the (fused or not) SiLU'd gate.
+    /// What ships.
+    #[default]
+    Off,
+    /// The product rides `w3`'s store with the gate as a row-indexed operand
+    /// (`gemv_mul`): one dispatch fewer, and the product's barrier re-seated
+    /// between `w1`'s and `w3`'s sweeps — measured a loss on the crown.
+    Mul,
+    /// Both weights swept by one kernel (`gemv_swiglu`): `w1`, `w3`, the SiLU
+    /// and the product in one dispatch, no barrier between the sweeps. Under
+    /// it `gemv_silu` is moot — `w1` is never dispatched alone.
+    Swiglu,
+}
+
+impl GateFusion {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s {
+            "off" => Ok(GateFusion::Off),
+            "mul" => Ok(GateFusion::Mul),
+            "swiglu" => Ok(GateFusion::Swiglu),
+            other => Err(format!(
+                "--gemv-gate must be `off`, `mul` or `swiglu`, got `{other}`"
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            GateFusion::Off => "off",
+            GateFusion::Mul => "mul",
+            GateFusion::Swiglu => "swiglu",
+        }
+    }
+
+    /// The fragment name the optimizer's plan spells this arm as.
+    pub fn fragment(self) -> Option<&'static str> {
+        match self {
+            GateFusion::Off => None,
+            GateFusion::Mul => Some("mul"),
+            GateFusion::Swiglu => Some("swiglu"),
+        }
+    }
+}
+
 /// What `Fusion=Derived` decided at construction, kept on the model for the
 /// record (`optimizer-design.md` §10c): the plan, what the exclusion set said
 /// about every transform the config selects — under the fp model each one's
@@ -765,7 +813,7 @@ pub struct FusionReport {
     pub plan: String,
     pub gemv_silu: bool,
     pub gemv_residual: bool,
-    pub gemv_gate: bool,
+    pub gemv_gate: GateFusion,
     /// The build's math mode the model was constructed under.
     pub math_mode: &'static str,
     /// Fragments the policy refused: (name, why).
@@ -823,7 +871,7 @@ impl std::fmt::Display for FusionReport {
             self.plan,
             self.gemv_silu,
             self.gemv_residual,
-            self.gemv_gate,
+            self.gemv_gate.name(),
             self.math_mode,
             self.refused.len(),
             self.validated.len(),
@@ -1041,17 +1089,25 @@ pub struct Config {
     /// the f32 accumulator where `badd_f16` adds at `T` on the rounded store.
     #[axis(name = "GemvResidual", flag = "gemv-residual", variants = ["off", "on"], default = "off", bool)]
     pub gemv_residual: bool,
-    /// Fuse the SwiGLU product `silu(w1(x)) * w3(x)` onto `w3`'s GEMV store
-    /// (issue #732, `DESIGN.md` §12.2e row 3b at the producer end): the gate
-    /// is read at the storing thread's own output row, the residual's shape
-    /// with `*` for `+`. 30 `bmul_f16` dispatches per token.
+    /// How the SwiGLU product `silu(w1(x)) * w3(x)` is dispatched (issue
+    /// #732, `DESIGN.md` §12.2e row 3b, §12.2 row 5): `off` — `w3`'s GEMV
+    /// then a `bmul_f16`; `mul` — the product on `w3`'s store with the gate
+    /// as a row-indexed operand (one dispatch fewer, the barrier re-seated
+    /// between the two sweeps, measured a loss); `swiglu` — both weights in
+    /// one kernel, no barrier between the sweeps (three dispatches fewer).
     ///
-    /// **Defaults to off**, per §7.1a. Metal, `seq_len == 1`; every other case
-    /// takes the eager path. **Moves the digests by construction**: the
-    /// product lands at the f32 accumulator on the unrounded up-projection
-    /// where the pair multiplies two rounded stores at `T` (§2.3.5a).
-    #[axis(name = "GemvGate", flag = "gemv-gate", variants = ["off", "on"], default = "off", bool)]
-    pub gemv_gate: bool,
+    /// **Defaults to off**, per §7.1a. Metal, `seq_len == 1`; every other
+    /// case takes the eager path. **Both arms move the digests by
+    /// construction**: the product lands on the f32 accumulators where the
+    /// pair multiplies rounded stores at `T` (§2.3.5a).
+    #[axis(
+        name = "GemvGate",
+        flag = "gemv-gate",
+        variants = ["off", "mul", "swiglu"],
+        default = "off",
+        parser = "GateFusion::parse"
+    )]
+    pub gemv_gate: GateFusion,
     /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
     /// `conv1d` dispatch (§12.2 row 1). Off by default (§7.1a): it MOVES the
     /// digest — the depthwise kernel accumulates serially ascending in f32 where
@@ -1231,7 +1287,7 @@ impl Default for Config {
             memory_budget: None,
             gemv_silu: false,
             gemv_residual: false,
-            gemv_gate: false,
+            gemv_gate: GateFusion::Off,
             conv_fused: false,
             conv_prefill_ctx: false,
             fusion: FusionPolicy::default(),
@@ -3493,9 +3549,8 @@ struct Mlp {
     /// Fuse the post-MLP residual add onto `w2`'s GEMV store (§12.2h). 30 of
     /// the 60 `badd_f16` dispatches per token.
     gemv_residual: bool,
-    /// Fuse the gate product onto `w3`'s GEMV store (§12.2e row 3b, #732).
-    /// The 30 `bmul_f16` dispatches per token.
-    gemv_gate: bool,
+    /// How the gate product is dispatched (§12.2e row 3b, §12.2 row 5, #732).
+    gemv_gate: GateFusion,
     span: tracing::Span,
 }
 
@@ -3564,6 +3619,13 @@ impl Mlp {
     /// `silu(w1(x)) * w3(x)` — the SwiGLU gate, shared by both entry points so
     /// the two cannot drift in what they compute.
     fn gated(&self, x: &Tensor) -> Result<Tensor> {
+        // Both weights in one kernel: `w1`, `w3`, the SiLU and the product,
+        // no barrier between the two sweeps (§12.2 row 5 with row 3b's
+        // product, #732). Under it the SiLU arm is moot — `w1` is never
+        // dispatched alone — so it is tried first.
+        if self.gemv_swiglu_applies(x) {
+            return crate::nn::ops::gemv_swiglu(x, self.up_proj.weight(), self.gate_proj.weight());
+        }
         // The fused arm replaces `gemv` + `silu_f16` with one dispatch, and
         // computes SiLU on the f32 accumulator rather than on the rounded
         // store — so it MOVES THE DIGESTS by construction (§12.2d, §2.3.5a).
@@ -3577,11 +3639,29 @@ impl Mlp {
         // applicability as the residual arm — `w3` has `w1`'s shape, and the
         // gate is exactly `w3`'s output extent, contiguous, as `gemv_silu`
         // and `silu` both store it.
-        if self.gemv_gate && gemv_residual_applies(true, x, &self.up_proj, &gate) {
+        if self.gemv_gate == GateFusion::Mul && gemv_residual_applies(true, x, &self.up_proj, &gate)
+        {
             return crate::nn::ops::gemv_mul(x, self.up_proj.weight(), &gate);
         }
         let up = self.up_proj.forward(x)?;
         gate * up
+    }
+
+    /// Whether the two-weight kernel serves this call: `gemv_silu_applies`'s
+    /// conditions on `w1`, and `w3` the same shape and layout — the kernel
+    /// streams both under one leading dimension.
+    fn gemv_swiglu_applies(&self, x: &Tensor) -> bool {
+        self.gemv_gate == GateFusion::Swiglu
+            && x.device().is_metal()
+            && x.dims().last() == Some(&self.gate_proj.weight().dims()[1])
+            && matches!(x.dims(), [1, 1, _] | [1, _])
+            && self.gate_proj.bias().is_none()
+            && self.up_proj.bias().is_none()
+            && x.is_contiguous()
+            && self.gate_proj.weight().is_contiguous()
+            && self.up_proj.weight().is_contiguous()
+            && self.gate_proj.weight().dims() == self.up_proj.weight().dims()
+            && matches!(x.dtype(), DType::F16 | DType::BF16 | DType::F32)
     }
 }
 
@@ -5529,11 +5609,18 @@ fn derive_fusion(cfg: &Config, dtype: DType) -> Result<(Config, FusionReport)> {
     let gemv_silu = uniform("feed_forward.w1.weight", "silu")?;
     let gemv_residual =
         uniform("feed_forward.w2.weight", "residual")? && uniform("out_proj.weight", "residual")?;
-    let gemv_gate = uniform("feed_forward.w3.weight", "mul")?;
-    // Every fused site must be one of the three kinds the flags name.
+    let gemv_gate = if uniform("feed_forward.w3.weight", "swiglu")? {
+        GateFusion::Swiglu
+    } else if uniform("feed_forward.w3.weight", "mul")? {
+        GateFusion::Mul
+    } else {
+        GateFusion::Off
+    };
+    // Every fused site must be one of the kinds the flags name.
     for (site, fragment) in &plan.sites {
         let known = (fragment == "silu" && site.ends_with("feed_forward.w1.weight"))
-            || (fragment == "mul" && site.ends_with("feed_forward.w3.weight"))
+            || ((fragment == "mul" || fragment == "swiglu")
+                && site.ends_with("feed_forward.w3.weight"))
             || (fragment == "residual"
                 && (site.ends_with("feed_forward.w2.weight") || site.ends_with("out_proj.weight")));
         if !known {

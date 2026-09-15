@@ -12,6 +12,8 @@ gemv_residual rounding 2.12 1.333 0 yes admit fma=contract,acc=f32,tree=simd,den
 gemv_silu+gemv_residual rounding 2.25 1.500 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
 gemv_mul rounding 2.50 1.280 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
 gemv_silu+gemv_residual+gemv_mul rounding 2.75 1.333 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
+gemv_swiglu rounding 3.50 1.143 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
+gemv_residual+gemv_swiglu rounding 2.75 1.333 0 yes admit fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve straight
 conv_fused reorder 2.50 1.231 0 yes admit fma=contract,acc=f32,tree=serial,denorm32=flush,denorm16=preserve conv-ring
 conv_fused+conv_state=rotating reorder 2.62 1.333 0 yes admit fma=contract,acc=f32,tree=serial-rot,denorm32=flush,denorm16=preserve conv-ring
 conv_state=rotating reorder 3.00 1.333 0 yes admit fma=contract,acc=store,tree=simd,denorm32=flush,denorm16=preserve conv-ring

@@ -247,6 +247,14 @@ pub fn unfuse(graph: &Graph, fragment: &str) -> Graph {
                     // The emitter's operand order: `mul(gate, up)`, the gate
                     // first — so the pair is priced in the order the layer runs.
                     ("mul", Some(&r)) => out.mul(r, g),
+                    // The two-weight kernel stands for four dispatches:
+                    // `gemv(w1)`, `silu`, `gemv(w3)`, `mul(gate, up)` — the
+                    // emitter's order. `inputs[2]` is the gate WEIGHT.
+                    ("swiglu", Some(&w1)) => {
+                        let gate = out.gemv(w1, inputs[1]);
+                        let gate = out.silu(gate);
+                        out.mul(gate, g)
+                    }
                     (other, _) => panic!("optimizer: no unfused pair for fragment `{other}`"),
                 }
             }

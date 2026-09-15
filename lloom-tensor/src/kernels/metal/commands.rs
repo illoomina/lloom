@@ -1371,6 +1371,15 @@ impl Commands {
         // encoder either way.
         let all_outputs = {
             let mut s = encoder.state.lock();
+            // Once per encoder close, off the per-bind path: the session's
+            // fence-probe counts into the profiler (lloom #732).
+            if crate::kernels::metal::profile::enabled() {
+                crate::kernels::metal::profile::record_fence_stats(
+                    s.fence_probes,
+                    s.fence_hits,
+                    s.fence_waits,
+                );
+            }
             std::mem::take(&mut s.all_outputs)
         };
 

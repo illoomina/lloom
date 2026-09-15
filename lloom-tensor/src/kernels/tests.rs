@@ -3193,9 +3193,14 @@ fn every_parity_arm_routes_through_the_helper() {
     // asserted rather than `> 0` so that an arm *lost* to a bad merge is a
     // failure too -- the same argument `packed_names_resolve` makes for
     // checking 90 rather than "some".
+    // 37 → 40 (lloom #732): three arms landed on `dev` without this count
+    // following them -- `rmsnorm_f16_strided` and `rmsnorm_rope_f16` with the
+    // QkvLayout work, `the_fused_epilogues_f16` with P3's packed siblings --
+    // so the lib suite carried one red test no gate ran: the CI CPU gate does
+    // not run the Metal lib tests, and the kernel harnesses filter by name.
     assert_eq!(
-        arms, 37,
-        "expected 37 parity arms, found {arms}; if a family was added or \
+        arms, 40,
+        "expected 40 parity arms, found {arms}; if a family was added or \
          removed, update this count deliberately rather than relaxing it"
     );
 }
@@ -3796,6 +3801,7 @@ fn packed_matches_split_for_the_fused_epilogues_f16() {
             GemvEpilogue::Silu,
             GemvEpilogue::Residual,
             GemvEpilogue::Mul,
+            GemvEpilogue::Swiglu,
         ] {
             let run = |style: ParamStyle| -> Vec<f16> {
                 let device = device();
@@ -3813,10 +3819,17 @@ fn packed_matches_split_for_the_fused_epilogues_f16() {
                         .unwrap()
                 };
                 let (mat_b, vec_b, res_b) = (mk(&mat), mk(&vec), mk(&res));
+                // The SwiGLU's operand is a second weight of `mat`'s shape:
+                // `mat` itself, reversed, so the two sweeps differ.
+                let gate_w: Vec<f16> = mat.iter().rev().copied().collect();
+                let gate_b = mk(&gate_w);
                 let output = device
                     .new_buffer(n_out * core::mem::size_of::<f16>(), options)
                     .unwrap();
-                let operand = epilogue.needs_operand().then_some((&res_b, 0usize));
+                let operand = match epilogue {
+                    GemvEpilogue::Swiglu => Some((&gate_b, 0usize)),
+                    e => e.needs_operand().then_some((&res_b, 0usize)),
+                };
                 // `x [1, k] @ w.t()` with `w [n_out, k]`: the Linear layout.
                 call_mlx_gemv_epilogue(
                     &device,
@@ -3903,7 +3916,7 @@ fn gemv_packed_names_resolve() {
     // `is_packed` reads it.
     for dtype in ["float32", "float16", "bfloat16"] {
         for bm in [4, 8] {
-            for epilogue in ["_silu", "_residual", "_mul"] {
+            for epilogue in ["_silu", "_residual", "_mul", "_swiglu"] {
                 let classical =
                     format!("gemv_{dtype}_bm{bm}_bn1_sm1_sn32_tm4_tn4_nc0_axpby0{epilogue}");
                 let packed =
@@ -3918,8 +3931,8 @@ fn gemv_packed_names_resolve() {
         }
     }
     assert_eq!(
-        checked, 36,
-        "9 classical epilogue names and their 9 packed siblings, at 3 dtypes... twice the tiles"
+        checked, 48,
+        "12 classical epilogue names and their 12 packed siblings, at 3 dtypes... twice the tiles"
     );
     for (prefix, blocks) in [("gemv", &gemv_blocks[..]), ("gemv_t", &gemv_t_blocks[..])] {
         for dtype in ["float32", "float16", "bfloat16"] {
@@ -3944,8 +3957,8 @@ fn gemv_packed_names_resolve() {
     }
     assert_eq!(
         checked,
-        288 + 36,
-        "expected 144 classical + 144 packed gemv variants, and the 18 epilogue names with their 18 packed siblings"
+        288 + 48,
+        "expected 144 classical + 144 packed gemv variants, and the 24 epilogue names with their 24 packed siblings"
     );
 }
 
@@ -8092,6 +8105,157 @@ fn gemv_fused_mul_matches_a_reference() {
         // dyadic and the f32 accumulation is exact at these extents, so the
         // f64 reference IS the kernel's answer. Engagement is the check above:
         // every row differs from the bare GEMV, as a gate that is never 1 must.
+        eprintln!("{label}: worst rel {worst:e}");
+    }
+}
+
+/// `run_gemv_fused_mul` with the two-weight kernel: the operand is the GATE
+/// WEIGHT, `[n_out, k]` like `mat`.
+fn run_gemv_fused_swiglu(
+    dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &[f32],
+    lhs_stride: &[usize],
+    rhs: &[f32],
+    rhs_stride: &[usize],
+    gate_w: &[f32],
+) -> Vec<f32> {
+    let device = device();
+    let kernels = Kernels::new();
+    let commands = commands(&device);
+    let encoder = commands.command_encoder().unwrap();
+    let options = RESOURCE_OPTIONS;
+    let mk = |v: &[f32]| {
+        device
+            .new_buffer_with_data(
+                v.as_ptr() as *const core::ffi::c_void,
+                std::mem::size_of_val(v),
+                options,
+            )
+            .unwrap()
+    };
+    let lhs_buf = mk(lhs);
+    let rhs_buf = mk(rhs);
+    let gate_buf = mk(gate_w);
+    let length = b * m * n;
+    let output = device
+        .new_buffer(length * core::mem::size_of::<f32>(), options)
+        .unwrap();
+    call_mlx_gemv_epilogue(
+        &device,
+        &encoder,
+        &kernels,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        0,
+        &lhs_buf,
+        rhs_stride,
+        0,
+        &rhs_buf,
+        &output,
+        ParamStyle::Split,
+        None,
+        GemvEpilogue::Swiglu,
+        Some((&gate_buf, 0)),
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    read_to_vec(&output, length)
+}
+
+fn reference_gemv_swiglu(
+    (m_out, k): (usize, usize),
+    up: &[f32],
+    gate: &[f32],
+    vec: &[f32],
+) -> Vec<f64> {
+    (0..m_out)
+        .map(|row| {
+            let mut u = 0.0f64;
+            let mut g = 0.0f64;
+            for c in 0..k {
+                u += up[row * k + c] as f64 * vec[c] as f64;
+                g += gate[row * k + c] as f64 * vec[c] as f64;
+            }
+            (g / (1.0 + (-g).exp())) * u
+        })
+        .collect()
+}
+
+/// The two-weight kernel against an f64 reference at both tiles, with two
+/// DIFFERENT weights (a kernel sweeping one matrix twice reads wrong), the
+/// gate accumulator negative somewhere so SiLU is not the identity (the SiLU
+/// test's own non-vacuity arm), and the product differing from the bare up
+/// GEMV on nearly every row.
+#[test]
+fn gemv_fused_swiglu_matches_a_reference() {
+    for &(k, n_out, label) in &[
+        (2048usize, 512usize, "bm4, K divides blockN"),
+        (2048usize, 6144usize, "bm8 (w1/w3's tile), K divides blockN"),
+        (2050usize, 512usize, "bm4, K leaves a 2-element tail"),
+        (2050usize, 6144usize, "bm8, K leaves a 2-element tail"),
+    ] {
+        let (b, m, n) = (1usize, n_out, 1usize);
+        let up: Vec<f32> = (0..n_out * k)
+            .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+            .collect();
+        let gate: Vec<f32> = (0..n_out * k)
+            .map(|i| ((i % 19) as f32 - 9.0) / 32.0)
+            .collect();
+        let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+        let got = run_gemv_fused_swiglu(
+            GemmDType::F32,
+            (b, m, n, k),
+            &up,
+            &[m * k, k, 1],
+            &vec,
+            &[k, 1, 1],
+            &gate,
+        );
+        let want = reference_gemv_swiglu((n_out, k), &up, &gate, &vec);
+        assert_eq!(got.len(), want.len(), "{label}: length");
+        let distinct = got
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert!(
+            distinct >= 2,
+            "{label}: {distinct} distinct value(s); vacuous"
+        );
+        let gate_acc: Vec<f64> = (0..n_out)
+            .map(|row| {
+                (0..k)
+                    .map(|c| gate[row * k + c] as f64 * vec[c] as f64)
+                    .sum()
+            })
+            .collect();
+        assert!(
+            gate_acc.iter().any(|g| *g < 0.0),
+            "{label}: no negative gate"
+        );
+        let bare = reference_gemv_residual((n_out, k), &up, &vec, &vec![0.0; n_out]);
+        let differs = got
+            .iter()
+            .zip(bare.iter())
+            .filter(|(g, w)| (**g as f64 - **w).abs() > 1e-6)
+            .count();
+        assert!(
+            differs > n_out * 9 / 10,
+            "{label}: engaged on {differs} of {n_out}"
+        );
+        let mut worst = 0.0f64;
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            let denom = w.abs().max(1.0);
+            let rel = ((g as f64) - w).abs() / denom;
+            worst = worst.max(rel);
+            assert!(
+                rel < 2e-5,
+                "{label}: row {i}: fused {g} vs reference {w} (rel {rel:e})"
+            );
+        }
         eprintln!("{label}: worst rel {worst:e}");
     }
 }

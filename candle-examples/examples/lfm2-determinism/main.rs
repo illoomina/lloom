@@ -384,12 +384,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
-    /// Fuse the SwiGLU product `silu(w1(x)) * w3(x)` onto `w3`'s GEMV store
-    /// (`GemvGate`, #732, §12.2e row 3b). **The digests MOVE**: the product
-    /// lands at the f32 accumulator where `bmul_f16` multiplies two rounded
-    /// stores at `T`.
-    #[arg(long, default_value_t = false)]
-    gemv_gate: bool,
+    /// How the SwiGLU product is dispatched (`GemvGate`, #732): `off` |
+    /// `mul` (the product on `w3`'s store, §12.2e row 3b) | `swiglu` (both
+    /// weights in one kernel, §12.2 row 5). **Both arms MOVE the digests**:
+    /// the product lands on the f32 accumulators where `bmul_f16` multiplies
+    /// rounded stores at `T`.
+    #[arg(long, default_value = "off")]
+    gemv_gate: String,
 
     /// Fold the decode conv's `broadcast_mul + sum_keepdim` into one depthwise
     /// `conv1d` dispatch (§12.2 row 1). **The digests MOVE** — the depthwise
@@ -728,7 +729,8 @@ fn main() -> Result<()> {
     // interpretable against the arm it was taken in (§2.3.7).
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
-    config.gemv_gate = args.gemv_gate;
+    config.gemv_gate =
+        lloom::models::lfm2::GateFusion::parse(&args.gemv_gate).map_err(anyhow::Error::msg)?;
     config.conv_fused = args.conv_fused;
     config.conv_prefill_ctx = args.conv_prefill_ctx;
     config.qkv_layout =
@@ -740,7 +742,7 @@ fn main() -> Result<()> {
         "gemv epilogue: silu={} residual={} gate={} fusion={}",
         config.gemv_silu,
         config.gemv_residual,
-        config.gemv_gate,
+        config.gemv_gate.name(),
         config.fusion.name()
     );
 

@@ -16,7 +16,7 @@
 #![cfg(feature = "metal")]
 
 use lloom::models::lfm2::{
-    Cache, Composition, Config, ConvState, FusionPolicy, KvAppend, LayerType, Model,
+    Cache, Composition, Config, ConvState, FusionPolicy, GateFusion, KvAppend, LayerType, Model,
 };
 use lloom::nn::VarBuilder;
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -26,9 +26,13 @@ use lloom_tensor::{DType, Device, Result, Tensor};
 /// the fused GEMV tiles are instantiated for.
 fn tiny_config(fusion: FusionPolicy, gemv_silu: bool, gemv_residual: bool) -> Config {
     // `Manual` with the flags on means ALL the hand flags the derivation
-    // reproduces: the SiLU, the residual and (since #732's gate fragment)
-    // the SwiGLU product on `w3`.
-    let gemv_gate = gemv_silu && gemv_residual;
+    // reproduces: the residual and, for the gate, the two-weight kernel —
+    // under which the SiLU flag is moot (`w1` is never dispatched alone).
+    let gemv_gate = if gemv_silu && gemv_residual {
+        GateFusion::Swiglu
+    } else {
+        GateFusion::Off
+    };
     Config {
         vocab_size: 64,
         hidden_size: 512,
@@ -203,9 +207,13 @@ fn the_census_shows_the_derived_plan_taken() -> Result<()> {
         l.starts_with("gemv") && l.ends_with("_residual")
     });
     let fused_mul = count(&derived, |l| l.starts_with("gemv") && l.ends_with("_mul"));
+    let fused_swiglu = count(&derived, |l| {
+        l.starts_with("gemv") && l.ends_with("_swiglu")
+    });
     eprintln!(
         "silu {silu_off} -> {silu_on}; badd {badd_off} -> {badd_on}; bmul {bmul_off} -> {bmul_on}; \
-         gemv_*_silu {fused_silu}; gemv_*_residual {fused_res}; gemv_*_mul {fused_mul}"
+         gemv_*_silu {fused_silu}; gemv_*_residual {fused_res}; gemv_*_mul {fused_mul}; \
+         gemv_*_swiglu {fused_swiglu}"
     );
     // The fixture's decode step: 2 MLPs (2 silu, 2 w2 residuals, 2 gate
     // products) + 1 conv out_proj + 1 attention out_proj residual; the conv
@@ -221,15 +229,20 @@ fn the_census_shows_the_derived_plan_taken() -> Result<()> {
         (0, 0, 3),
         "ABSENT: the replaced dispatches"
     );
+    // The two-weight kernel takes the gate: no `gemv_*_silu` and no
+    // `gemv_*_mul` beside it — one dispatch per MLP for the four.
     assert_eq!(
-        (fused_silu, fused_res, fused_mul),
-        (2, 4, 2),
+        (fused_silu, fused_res, fused_mul, fused_swiglu),
+        (0, 4, 0, 2),
         "PRESENT: the fused kernels"
     );
     assert_eq!(
-        count(&off, |l| l.ends_with("_silu")
-            || l.ends_with("_residual")
-            || l.ends_with("_mul")),
+        count(&off, |l| {
+            l.ends_with("_silu")
+                || l.ends_with("_residual")
+                || l.ends_with("_mul")
+                || l.ends_with("_swiglu")
+        }),
         0
     );
     Ok(())
@@ -302,7 +315,7 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     let model = build(&crown, &dev)?;
     let r = model.fusion_report().expect("Derived keeps its report");
     eprintln!("{r}");
-    assert!(r.gemv_silu && r.gemv_residual && r.gemv_gate);
+    assert!(!r.gemv_silu && r.gemv_residual && r.gemv_gate == GateFusion::Swiglu);
     assert_eq!(
         r.compositions,
         vec![Composition {
@@ -324,7 +337,7 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
     // 0.5 MB sweep costs less than a dispatch), so all three ride; the cost
     // line is on the plan.
     assert!(
-        r.plan.contains("gemv_mul=2")
+        r.plan.contains("gemv_swiglu=2")
             && r.plan
                 .contains("regions[conv-ring=1 kv=1 nodes=7 fused-in-stateful=0]")
             && r.plan.contains(" cost[before: "),

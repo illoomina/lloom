@@ -130,6 +130,14 @@ static COMMIT_NS: AtomicU64 = AtomicU64::new(0);
 static CREATE_CB_NS: AtomicU64 = AtomicU64::new(0);
 static PRUNES: AtomicU64 = AtomicU64::new(0);
 static PRUNE_NS: AtomicU64 = AtomicU64::new(0);
+/// Cross-encoder fence-map reads, hits, and `waitForFence` calls, summed once
+/// per encoder close from the session's own counters (`EncoderState`) -- so a
+/// decode step's per-bind cost has a count beside the dispatch count (lloom
+/// #727 §27 counted 1101 reads per step from a trace; #732 made the count a
+/// profiler figure and changed it).
+static FENCE_PROBES: AtomicU64 = AtomicU64::new(0);
+static FENCE_HITS: AtomicU64 = AtomicU64::new(0);
+static FENCE_WAITS: AtomicU64 = AtomicU64::new(0);
 
 /// The decode step the loop is in, for attributing a command buffer's gap to
 /// a step (`CommandBufferRecord::step`). Written once per step by the loop,
@@ -255,6 +263,15 @@ fn bump_label(map: &mut HashMap<Arc<str>, u64>, label: &Arc<str>) {
     } else {
         map.insert(Arc::clone(label), 1);
     }
+}
+
+/// Add one encoder session's fence-probe counts. Called at encoder close,
+/// already behind `enabled()` at the call site.
+#[inline]
+pub fn record_fence_stats(probes: u32, hits: u32, waits: u32) {
+    FENCE_PROBES.fetch_add(u64::from(probes), Ordering::Relaxed);
+    FENCE_HITS.fetch_add(u64::from(hits), Ordering::Relaxed);
+    FENCE_WAITS.fetch_add(u64::from(waits), Ordering::Relaxed);
 }
 
 /// Record that a compute encoder was opened.
@@ -493,6 +510,10 @@ pub struct Snapshot {
     /// `flush_and_prune` calls, and the encoding-thread time they took.
     pub prunes: u64,
     pub prune_ns: u64,
+    /// Cross-encoder fence-map reads, hits, and waits (see `FENCE_PROBES`).
+    pub fence_probes: u64,
+    pub fence_hits: u64,
+    pub fence_waits: u64,
     /// Every timed command buffer, in GPU start order: interval, commit stamp,
     /// step. The raw series a dump or a plot reads (issue #702).
     pub command_buffer_records: Vec<CommandBufferRecord>,
@@ -545,6 +566,9 @@ pub fn snapshot() -> Snapshot {
         create_cb_ns: CREATE_CB_NS.load(Ordering::Relaxed),
         prunes: PRUNES.load(Ordering::Relaxed),
         prune_ns: PRUNE_NS.load(Ordering::Relaxed),
+        fence_probes: FENCE_PROBES.load(Ordering::Relaxed),
+        fence_hits: FENCE_HITS.load(Ordering::Relaxed),
+        fence_waits: FENCE_WAITS.load(Ordering::Relaxed),
         command_buffer_records: records,
         idle_gaps,
         min_start_after_commit_s,
@@ -564,6 +588,9 @@ pub fn reset() {
     CREATE_CB_NS.store(0, Ordering::Relaxed);
     PRUNES.store(0, Ordering::Relaxed);
     PRUNE_NS.store(0, Ordering::Relaxed);
+    FENCE_PROBES.store(0, Ordering::Relaxed);
+    FENCE_HITS.store(0, Ordering::Relaxed);
+    FENCE_WAITS.store(0, Ordering::Relaxed);
     STEP.store(0, Ordering::Relaxed);
     let mut rec = recorder().lock().unwrap();
     rec.records.clear();

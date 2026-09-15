@@ -520,6 +520,24 @@ pub struct EncoderState {
     /// Fences already waited on this session, so a buffer bound repeatedly does
     /// not re-emit the same wait.
     pub waited_fences: HashSet<usize>,
+    /// Buffers whose last writer this session has already been ordered after,
+    /// so a buffer bound repeatedly does not re-read the cross-encoder map.
+    ///
+    /// The second bind of a buffer in one session cannot find a different
+    /// writer than the first: sessions on one `Commands` are sequential (the
+    /// guard holds the outer lock for the whole dispatch, and an encoder is
+    /// registered into the map only when it ends), so the only concurrent
+    /// writer to the map is the completion thread *removing* entries -- which
+    /// turns a hit into a miss, never a miss into a hit. Counted on a real
+    /// decode step before this set existed: 1101 map reads, 46 that could
+    /// matter (lloom #727 §27; #732 measured the change).
+    pub probed: HashSet<usize>,
+    /// Cross-encoder map reads, hits, and `waitForFence` calls this session.
+    /// Plain counters under the lock the bind already holds, summed into the
+    /// profiler once at encoder close -- no per-bind atomic.
+    pub fence_probes: u32,
+    pub fence_hits: u32,
+    pub fence_waits: u32,
     /// Name of the pipeline most recently set, so a dispatch can be attributed
     /// to a kernel. Only maintained when an executor is installed or profiling
     /// is on -- Metal has no way to read the bound pipeline back, and doing so
@@ -549,6 +567,10 @@ impl EncoderState {
             pending_kinds: HazardKinds::NONE,
             all_outputs: HashSet::new(),
             waited_fences: HashSet::new(),
+            probed: HashSet::new(),
+            fence_probes: 0,
+            fence_hits: 0,
+            fence_waits: 0,
             current_pipeline: None,
         }
     }
@@ -674,25 +696,42 @@ impl ComputeCommandEncoder {
         self.clock.as_deref()
     }
 
-    /// Wait on the fence of `ptr`'s last writer, if any, and only once.
+    /// Order this session after the last writer of `ptr`, if any -- reading the
+    /// cross-encoder map once per buffer per session, and waiting once per
+    /// fence.
     ///
-    /// This replaces waiting on every live fence at encoder creation. The
-    /// encoder already records every buffer it binds, so the wait can be
-    /// limited to buffers this encoder actually touches.
-    fn wait_for_buffer(&self, ptr: usize) {
+    /// Called under the session's state lock, which the bind takes anyway for
+    /// its hazard bookkeeping: one acquisition per bind where there were two
+    /// (the map's `RwLock` and this one on a hit). The map read is skipped
+    /// for a buffer this session has already probed -- see
+    /// `EncoderState::probed` for why a repeat cannot find a different writer.
+    /// The `waitForFence` is issued with the lock held; the guard already
+    /// holds the outer `Commands` lock for the whole dispatch, so nothing
+    /// contends, and the call does not re-enter this state.
+    fn wait_for_buffer(&self, s: &mut EncoderState, ptr: usize) {
+        if !s.probed.insert(ptr) {
+            return;
+        }
+        s.fence_probes += 1;
         let fence = {
-            // Per-bind read: the frequent access, and why the map is an `RwLock`.
-            // `parking_lot` guards are infallible -- no `unwrap`.
+            // Per-buffer-per-session read: the frequent access, and why the map
+            // is an `RwLock`. `parking_lot` guards are infallible -- no `unwrap`.
             let map = self.prev_ce_outputs.read();
             map.get(&ptr).cloned()
         };
         let Some(fence) = fence else { return };
-
-        let mut state = self.state.lock();
-        if state.waited_fences.insert(Arc::as_ptr(&fence) as usize) {
-            drop(state);
+        s.fence_hits += 1;
+        if s.waited_fences.insert(Arc::as_ptr(&fence) as usize) {
+            s.fence_waits += 1;
             self.raw.waitForFence(fence.raw());
         }
+    }
+
+    /// `(map reads, hits, waits)` this session has made -- the engagement
+    /// counters the fence-probe gate asserts absolutely.
+    pub(crate) fn fence_stats(&self) -> (u32, u32, u32) {
+        let s = self.state.lock();
+        (s.fence_probes, s.fence_hits, s.fence_waits)
     }
 
     pub fn set_threadgroup_memory_length(&self, index: usize, length: usize) {
@@ -819,11 +858,11 @@ impl ComputeCommandEncoder {
         // once per buffer is the same per-buffer wait a classical bind makes,
         // and registering the writes is what lets the next session wait on
         // this one.
-        for buf in &range.resident {
-            self.wait_for_buffer(buf.raw_ptr() as usize);
-        }
         {
             let mut s = self.state.lock();
+            for buf in &range.resident {
+                self.wait_for_buffer(&mut s, buf.raw_ptr() as usize);
+            }
             for &ptr in &range.written {
                 s.all_outputs.insert(ptr);
             }
@@ -1026,11 +1065,11 @@ impl ComputeCommandEncoder {
             // The clock a liveness recording must use: a value is live until the
             // last dispatch that binds it (`DESIGN.md` §6.7 L4).
             arena::note_bind(ptr);
-            // Read-after-write against an earlier encoder: order against that
-            // buffer's last writer only.
-            self.wait_for_buffer(ptr);
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock();
+            // Read-after-write against an earlier encoder: order against that
+            // buffer's last writer only, under the lock this bind holds anyway.
+            self.wait_for_buffer(&mut s, ptr);
             let key = s.hazard_key;
             // Read-after-write within this encoder. See `read_hazards` for why a
             // read has exactly one possible direction (issue #185).
@@ -1061,10 +1100,10 @@ impl ComputeCommandEncoder {
             let ptr = buf.raw_ptr() as usize;
             trace::record_binding(index, ptr, offset, buf.length(), true);
             arena::note_bind(ptr);
-            // Write-after-write or write-after-read against an earlier encoder.
-            self.wait_for_buffer(ptr);
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock();
+            // Write-after-write or write-after-read against an earlier encoder.
+            self.wait_for_buffer(&mut s, ptr);
             let key = s.hazard_key;
             // Write-after-write, and write-after-read. See `write_hazards` for
             // why both tests run where the original short-circuited on `||`
@@ -1160,10 +1199,10 @@ impl ComputeCommandEncoder {
         // Bound directly rather than through `set_input_buffer`, which would
         // renumber a second time.
         let ptr = buffer.raw_ptr() as usize;
-        self.wait_for_buffer(ptr);
         {
             let range = Self::bound_range(&buffer, 0);
             let mut s = self.state.lock();
+            self.wait_for_buffer(&mut s, ptr);
             let key = s.hazard_key;
             s.next_inputs.insert(key, range);
         }

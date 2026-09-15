@@ -17,10 +17,12 @@ use lloom::models::lfm2::{AttnImpl, Config, ConvState, KvAppend, LayerType, QkvL
 use lloom::models::lfm2_ir::decode_step;
 use lloom::optimizer::{derive, NumericClass, Op, Policy, Region, Seam};
 
-/// The extractor's own count, no barrier term: what the e-graph derives.
+/// The extractor's own count, no barrier term, the two-weight kernel out of
+/// the catalogue: what the e-graph derives over the three epilogues.
 fn by_dispatch_count() -> Policy {
     Policy {
         barrier_model: None,
+        excluded: vec!["swiglu".to_string()],
         ..Default::default()
     }
 }
@@ -196,7 +198,14 @@ fn the_derivation_reproduces_the_hand_written_composition() {
     assert_eq!(plan.after.get("gemv_residual"), Some(&60));
     assert_eq!(plan.after.get("gemv"), Some(&(167 - 120)));
     assert_eq!(plan.class, NumericClass::Rounding);
-    assert!(d.refused.is_empty(), "{:?}", d.refused);
+    // Only the two-weight kernel is refused, by the policy that excludes it.
+    assert_eq!(
+        d.refused,
+        vec![(
+            "swiglu".to_string(),
+            "excluded by the exclusion set".to_string()
+        )]
+    );
 
     // The derived graph carries 120 fused nodes and no standalone silu/add.
     let fused = d.graph.nodes().iter().filter(|n| n.op == Op::Fused).count();
@@ -239,7 +248,7 @@ fn the_seams_left_are_the_gap_the_catalogue_cannot_express() {
     // And with the gate fragment excluded, the SwiGLU seam the first
     // catalogue reported comes back, at its count.
     let policy = Policy {
-        excluded: vec!["mul".to_string()],
+        excluded: vec!["mul".to_string(), "swiglu".to_string()],
         ..by_dispatch_count()
     };
     let d = derive(&g, &policy).expect("derivation");
@@ -273,19 +282,19 @@ fn the_barrier_term_refuses_the_gate_on_the_real_step() {
     let mut cfg = lfm2_2_6b();
     traced_arms(&mut cfg, ConvState::Shuffle);
     let g = decode_step(&cfg, DType::F16);
-    let d = derive(&g, &Policy::default()).expect("derivation");
+    let policy = Policy {
+        excluded: vec!["swiglu".to_string()],
+        ..Default::default()
+    };
+    let d = derive(&g, &policy).expect("derivation");
     eprintln!("plan: {}", d.plan);
     assert_eq!(d.plan.sites.len(), 90);
     assert_eq!(d.plan.sites_of("mul").len(), 0);
     assert_eq!(d.plan.dispatches_after(), 448);
-    assert_eq!(d.refused.len(), 1, "{:?}", d.refused);
-    assert_eq!(d.refused[0].0, "mul");
+    let (_, why) = d.refused.iter().find(|(n, _)| n == "mul").unwrap();
     assert!(
-        d.refused[0]
-            .1
-            .contains("re-seated between gemv_silu and gemv_mul"),
-        "{}",
-        d.refused[0].1
+        why.contains("re-seated between gemv_silu and gemv_mul"),
+        "{why}"
     );
     let mul = d.marginals.iter().find(|m| m.fragment == "mul").unwrap();
     assert_eq!(mul.sites, 30);
@@ -346,7 +355,7 @@ fn a_bit_exact_budget_derives_nothing_on_the_real_step() {
     assert!(d.plan.sites.is_empty());
     assert_eq!(d.plan.dispatches_after(), 538);
     assert_eq!(d.plan.class, NumericClass::BitExact);
-    assert_eq!(d.refused.len(), 3, "{:?}", d.refused);
+    assert_eq!(d.refused.len(), 4, "{:?}", d.refused);
     assert!(
         d.refused
             .iter()
@@ -464,4 +473,45 @@ fn the_stateful_regions_are_marked_and_no_fused_site_sits_in_one() {
         );
         assert!(d.plan.to_string().contains("regions[conv-ring=22 kv=8"));
     }
+}
+
+/// **The two-weight kernel on the real step** (`§12.2 row 5` with row 3b's
+/// product, #732): under the default policy the extractor takes `gemv_swiglu`
+/// on every `w3` — one dispatch where `gemv_silu` + `gemv_mul` were two and
+/// the unfused chain four — and the barrier term admits it: its one barrier
+/// is the residual's beside `w2`, and it removes three dispatches per site.
+/// 90 sites (30 `w3` + 60 residual; `w1` never dispatched alone), **538 →
+/// 388**, nothing refused, the seams left the conv chain's.
+#[test]
+fn the_two_weight_kernel_is_derived_on_the_real_step() {
+    let mut cfg = lfm2_2_6b();
+    traced_arms(&mut cfg, ConvState::Shuffle);
+    let g = decode_step(&cfg, DType::F16);
+    let d = derive(&g, &Policy::default()).expect("derivation");
+    eprintln!("plan: {}", d.plan);
+    assert_eq!(d.plan.sites_of("swiglu").len(), 30);
+    assert!(d
+        .plan
+        .sites_of("swiglu")
+        .iter()
+        .all(|s| s.ends_with(".feed_forward.w3.weight")));
+    assert_eq!(d.plan.sites_of("residual").len(), 60);
+    assert_eq!(d.plan.sites_of("silu").len(), 0);
+    assert_eq!(d.plan.sites_of("mul").len(), 0);
+    assert_eq!(d.plan.sites.len(), 90);
+    assert_eq!(d.plan.dispatches_before(), 538);
+    assert_eq!(d.plan.dispatches_after(), 388);
+    assert_eq!(d.plan.after.get("gemv_swiglu"), Some(&30));
+    assert_eq!(d.plan.after.get("gemv_residual"), Some(&60));
+    // Both `w1` and `w3` leave the plain count (60), and the 60 residual sites.
+    assert_eq!(d.plan.after.get("gemv"), Some(&(167 - 120)));
+    assert_eq!(d.plan.after.get("silu"), None);
+    assert_eq!(d.plan.after.get("bmul"), Some(&66));
+    assert!(d.refused.is_empty(), "{:?}", d.refused);
+    let sw = d.marginals.iter().find(|m| m.fragment == "swiglu").unwrap();
+    assert_eq!(sw.sites, 30);
+    assert!(sw.delta_us < 0.0, "{sw:?}");
+    assert_eq!(d.plan.seams.len(), 2, "{:?}", d.plan.seams);
+    let (before, after) = d.plan.cost.as_ref().unwrap();
+    assert_eq!((before.dispatches, after.dispatches), (538, 388));
 }

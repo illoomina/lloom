@@ -545,6 +545,10 @@ pub struct Sequence<C> {
     /// learned EOS. Discarded by [`Session::reconcile`]; a decode is refused
     /// while it is non-zero.
     pub(crate) overrun: usize,
+    /// The overrun's forwards launched nothing on the device (lloom #735's
+    /// EOS gate): `reconcile` moves the counters back
+    /// (`CacheRewind::rewind_unwritten`) instead of rewinding contents.
+    pub(crate) overrun_unwritten: bool,
     /// The logits of the last fed position, when the run ended with the cache
     /// exactly one prediction ahead of the token log and nothing overran — the
     /// state a continuation resumes from without re-feeding anything.
@@ -566,6 +570,7 @@ impl<C> Sequence<C> {
             tokens: Vec::new(),
             pos: 0,
             overrun: 0,
+            overrun_unwritten: false,
             last_logits: None,
             logits_hold: None,
             tokens_known: true,
@@ -581,6 +586,7 @@ impl<C> Sequence<C> {
             tokens,
             pos,
             overrun: 0,
+            overrun_unwritten: false,
             last_logits: None,
             logits_hold: None,
             tokens_known: true,
@@ -759,10 +765,23 @@ impl<'m, M: CausalLM> Session<'m, M> {
         if n == 0 {
             return Ok(0);
         }
-        self.seq.cache.rewind(n)?;
+        if self.seq.overrun_unwritten {
+            // The gated forwards wrote nothing: counters only, no horizon.
+            self.seq.cache.rewind_unwritten(n)?;
+        } else {
+            self.seq.cache.rewind(n)?;
+        }
         self.seq.pos -= n;
         self.seq.overrun = 0;
+        self.seq.overrun_unwritten = false;
         Ok(n)
+    }
+
+    /// Whether the pending overrun's forwards launched nothing on the device
+    /// (lloom #735's EOS gate), so [`Self::reconcile`] needs no rewind
+    /// horizon.
+    pub fn overrun_unwritten(&self) -> bool {
+        self.seq.overrun > 0 && self.seq.overrun_unwritten
     }
 
     /// Return the sequence to empty: the cache reset, the token log cleared.
@@ -774,6 +793,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
         self.seq.tokens.clear();
         self.seq.pos = 0;
         self.seq.overrun = 0;
+        self.seq.overrun_unwritten = false;
         self.seq.last_logits = None;
         self.seq.tokens_known = true;
     }

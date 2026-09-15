@@ -140,8 +140,10 @@ template <typename T, typename U, typename binary, uint W = work_per_thread<T>()
     device const T *left,
     device const T *right,
     device U *output,
-    uint tid [[thread_position_in_grid]]
+    uint tid [[thread_position_in_grid]],
+    EOS_GATE_ARG
 ) {
+    EOS_GATE_CHECK
     binary_body<T, U, binary, W>(dim, left, right, output, tid);
 }
 
@@ -151,8 +153,10 @@ template <typename T, typename U, typename binary, uint W = work_per_thread<T>()
     device const T *left,
     device const T *right,
     device U *output,
-    uint tid [[thread_position_in_grid]]
+    uint tid [[thread_position_in_grid]],
+    EOS_GATE_ARG
 ) {
+    EOS_GATE_CHECK
     binary_body<T, U, binary, W>(pp->dim, left, right, output, tid);
 }
 

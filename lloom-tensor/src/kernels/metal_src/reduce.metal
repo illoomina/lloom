@@ -1496,8 +1496,10 @@ template<typename T>
     constant float &in_eps,
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]],
-    uint block_dim [[ threads_per_threadgroup ]]
+    uint block_dim [[ threads_per_threadgroup ]],
+    EOS_GATE_ARG
 ) {
+    EOS_GATE_CHECK
     NormParams p { in_src_numel, in_el_per_block, in_eps };
     indexer_t<uint, false> indexer;
     StoreNorm store;
@@ -1512,8 +1514,10 @@ template<typename T>
     device const T *alpha,
     uint tid [[ thread_index_in_threadgroup ]],
     uint dst_id [[ threadgroup_position_in_grid ]],
-    uint block_dim [[ threads_per_threadgroup ]]
+    uint block_dim [[ threads_per_threadgroup ]],
+    EOS_GATE_ARG
 ) {
+    EOS_GATE_CHECK
     NormParams p = *pp;
     indexer_t<uint, false> indexer;
     StoreNorm store;

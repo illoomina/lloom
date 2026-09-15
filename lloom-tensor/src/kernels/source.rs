@@ -61,6 +61,10 @@ pub const CONV: &str = include_str!("metal_src/conv.metal");
 /// own `#include`, an inlined threadgroup min-reduction), so NOT a `with_utils!`
 /// consumer and a translation unit of its own.
 pub const EOS_INDEX: &str = include_str!("metal_src/eos_index.metal");
+/// The EOS gate (lloom #735 step 4): one threadgroup that zeroes the next
+/// decode step's indirect-dispatch table when the sampled token is a stop
+/// token (or the sticky flag is already up). Self-contained like `EOS_INDEX`.
+pub const EOS_GATE: &str = include_str!("metal_src/eos_gate.metal");
 pub const FILL: &str = include_str!("metal_src/fill.metal");
 pub const FLASH_DECODING: &str = include_str!("metal_src/attention/flash_decoding.metal");
 pub const INDEXING: &str = with_utils!(
@@ -194,6 +198,8 @@ pub const MERGED_NON_MLX: &str = concat!(
     "\n",
     include_str!("metal_src/conv.metal"),
     "\n",
+    include_str!("metal_src/eos_gate.metal"),
+    "\n",
     include_str!("metal_src/eos_index.metal"),
     "\n",
     include_str!("metal_src/fill.metal"),
@@ -236,6 +242,7 @@ pub const MERGED_MEMBERS: &[Source] = &[
     Source::Binary,
     Source::Cast,
     Source::Conv,
+    Source::EosGate,
     Source::EosIndex,
     Source::Fill,
     Source::FlashDecoding,
@@ -262,6 +269,7 @@ pub enum Source {
     Conv,
     /// The batched EOS-index reduction (the `GpuBatched` EOS arm, issue: the
     /// per-token flag train's replacement). Its own translation unit.
+    EosGate,
     EosIndex,
     Fill,
     /// FlashDecoding: attention split over independent contiguous KV chunks,

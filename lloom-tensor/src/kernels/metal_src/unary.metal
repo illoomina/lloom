@@ -290,8 +290,10 @@ template <typename T>
     constant int64_t &dst_s,
     device const T *input,
     device T *output,
-    uint2 idx [[thread_position_in_grid]]
+    uint2 idx [[thread_position_in_grid]],
+    EOS_GATE_ARG
 ) {
+    EOS_GATE_CHECK
     copy2d_body<T>(d1, d2, src_s, dst_s, input, output, idx);
 }
 
@@ -300,8 +302,10 @@ template <typename T>
     device const Copy2dParams *pp,
     device const T *input,
     device T *output,
-    uint2 idx [[thread_position_in_grid]]
+    uint2 idx [[thread_position_in_grid]],
+    EOS_GATE_ARG
 ) {
+    EOS_GATE_CHECK
     copy2d_body<T>(pp->d1, pp->d2, pp->src_s, pp->dst_s, input, output, idx);
 }
 

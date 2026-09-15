@@ -3244,6 +3244,72 @@ impl Cache {
     /// this index, so a test asserting the contract has to be able to read it.
     /// Read-only: the phase is advanced by `Model::forward` alone, which is the
     /// one-owner property §10.2e records as having already been wrong once.
+    /// The last `n` positions were never written (lloom #735's EOS gate):
+    /// move the counters back, touch no contents. See
+    /// [`crate::nn::model::CacheRewind::rewind_unwritten`].
+    ///
+    /// Per arm: the KV slabs and the paged pool decrement their lengths (the
+    /// rows past the new end were never written; the next append overwrites
+    /// them). `Shuffle` keeps no per-step conv counter — its phase never moves
+    /// on a single-token pass — so nothing to undo. `RotatingRing` advanced
+    /// `conv_phase`/`conv_history` per step on the host and is stepped back
+    /// the same way. Refused: `KvAppend::Cat` (its length is the tensor's; a
+    /// gated `cat` still grew it with unwritten rows — narrowing it is a copy
+    /// this seam does not make), `SlidingRing` (its compaction pass is a
+    /// device write scheduled from the same counter), and an open speculative
+    /// window.
+    pub fn rewind_unwritten(&mut self, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if self.speculative {
+            lloom_tensor::bail!("lfm2 rewind_unwritten({n}): a speculative window is open");
+        }
+        if self.use_kv_cache && self.kv_append == KvAppend::Cat {
+            lloom_tensor::bail!(
+                "lfm2 rewind_unwritten({n}): `KvAppend::Cat` has no length to move back; the \
+                 EOS gate needs `in-place` or `paged`"
+            );
+        }
+        if let ConvState::SlidingRing { .. } = self.conv_state {
+            lloom_tensor::bail!(
+                "lfm2 rewind_unwritten({n}): the sliding conv ring's compaction is scheduled \
+                 from the per-step counter; the EOS gate needs `shuffle` or `rotating`"
+            );
+        }
+        for (k_slot, v_slot) in self.kv_slots.iter_mut() {
+            if k_slot.all_data.is_none() {
+                continue;
+            }
+            k_slot.rewind(n)?;
+            v_slot.rewind(n)?;
+        }
+        for (k_slot, v_slot) in self.quant_slots.iter_mut() {
+            if k_slot.codes.is_none() {
+                continue;
+            }
+            k_slot.rewind(n)?;
+            v_slot.rewind(n)?;
+        }
+        #[cfg(feature = "metal")]
+        if let Some(p) = &mut self.paged {
+            p.rewind(n)?;
+        }
+        if let ConvState::RotatingRing { .. } = self.conv_state {
+            if n > self.conv_history {
+                lloom_tensor::bail!(
+                    "lfm2 rewind_unwritten({n}): only {} rotating-ring steps since the last \
+                     multi-token pass",
+                    self.conv_history
+                );
+            }
+            let width = self.conv_state.width(self.l_cache);
+            self.conv_phase = (self.conv_phase + width - n) % width;
+            self.conv_history -= n;
+        }
+        Ok(())
+    }
+
     pub fn conv_phase(&self) -> usize {
         self.conv_phase
     }
@@ -6711,6 +6777,10 @@ impl crate::nn::model::CacheRewind for Cache {
 
     fn rewind(&mut self, n: usize) -> Result<()> {
         Cache::rewind(self, n)
+    }
+
+    fn rewind_unwritten(&mut self, n: usize) -> Result<()> {
+        Cache::rewind_unwritten(self, n)
     }
 }
 

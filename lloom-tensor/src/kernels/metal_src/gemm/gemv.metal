@@ -806,7 +806,9 @@ void gemv(
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    EOS_GATE_ARG) {
+    EOS_GATE_CHECK
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   using epilogue_t = EpilogueNone<T, typename kernel_t::acc_type>;
@@ -868,7 +870,9 @@ void gemv_silu(
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    EOS_GATE_ARG) {
+    EOS_GATE_CHECK
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   using epilogue_t = EpilogueSilu<T, typename kernel_t::acc_type>;
@@ -946,7 +950,9 @@ void gemv_residual(
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    EOS_GATE_ARG) {
+    EOS_GATE_CHECK
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   using epilogue_t = EpilogueResidual<T, typename kernel_t::acc_type>;
@@ -1072,7 +1078,9 @@ void gemv_rmsnorm(
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    EOS_GATE_ARG) {
+    EOS_GATE_CHECK
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueRmsNorm<T, typename kernel_t::acc_type>;
   using epilogue_t = EpilogueNone<T, typename kernel_t::acc_type>;
@@ -1142,7 +1150,9 @@ void gemv_packed(
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    EOS_GATE_ARG) {
+    EOS_GATE_CHECK
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   using epilogue_t = EpilogueNone<T, typename kernel_t::acc_type>;
@@ -1193,7 +1203,9 @@ void gemv_silu_packed(
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    EOS_GATE_ARG) {
+    EOS_GATE_CHECK
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   using epilogue_t = EpilogueSilu<T, typename kernel_t::acc_type>;
@@ -1233,7 +1245,9 @@ void gemv_residual_packed(
     uint3 tid [[threadgroup_position_in_grid]],
     uint3 lid [[thread_position_in_threadgroup]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
-    uint simd_lid [[thread_index_in_simdgroup]]) {
+    uint simd_lid [[thread_index_in_simdgroup]],
+    EOS_GATE_ARG) {
+    EOS_GATE_CHECK
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby>;
   using prologue_t = PrologueNone<T, typename kernel_t::acc_type>;
   using epilogue_t = EpilogueResidual<T, typename kernel_t::acc_type>;

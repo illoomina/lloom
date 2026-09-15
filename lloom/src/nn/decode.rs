@@ -207,6 +207,17 @@ pub struct DecodeOptions {
     /// seen EOS (`RingReader::ended`); the loop stops encoding at the next
     /// step and reconciles the overrun. `None` runs to `max_tokens`.
     pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Under `adaptive_commit`: the EOS gate (lloom #735 step 4,
+    /// `Device::eos_gate_begin`). The decode kernels run in a variant that
+    /// returns at once while a flag a tiny gate kernel raises on the sampled
+    /// token being a stop token is set, so the forwards queued past an EOS
+    /// write nothing: no cache write past the EOS, and
+    /// the overrun is reconciled by moving counters back
+    /// (`CacheRewind::rewind_unwritten`) rather than rewinding contents —
+    /// which the crown's cache (`Shuffle`, in-place KV) cannot do at all.
+    /// Needs a strategy with a device copy of the stop set
+    /// (`ReadbackStrategy::eos_ids_tensor`) and no ICB executor.
+    pub eos_gate: bool,
     /// The TILE: the most prompt tokens one prefill forward may take
     /// (llama.cpp's `n_ubatch`). **`0` means unbounded** — every forward is
     /// as wide as the ramp or the schedule makes it, the incumbent. A
@@ -377,6 +388,7 @@ impl DecodeOptions {
             adaptive_commit: false,
             run_ahead: 0,
             stop: None,
+            eos_gate: false,
             prefill_tile: 0,
             prefill_chunk: 0,
             pass_widths: PassWidths::Lru,
@@ -483,6 +495,11 @@ pub struct DecodeStats {
     pub run_ahead_closes: u64,
     pub max_steps_per_buffer: usize,
     pub stopped_by_flag: bool,
+    /// Under `eos_gate`: what the gate did (`Device::eos_gate_end`).
+    pub eos_gate: Option<lloom_tensor::EosGateReport>,
+    /// The overrun's forwards launched nothing (the gate fired), so the
+    /// session reconciles it without a rewind horizon.
+    pub overrun_unwritten: bool,
     /// The prefill's dispatch census, `(kernel, count)`, under
     /// `CANDLE_METAL_PROFILE=1`; empty otherwise and off Metal.
     pub prefill_census: Vec<(String, u64)>,
@@ -1020,6 +1037,24 @@ type PacerMarker = lloom_tensor::metal_backend::CommandMarker;
 #[cfg(not(feature = "metal"))]
 type PacerMarker = ();
 
+/// Disarms the EOS gate when dropped (`Device::eos_gate_end`), so no exit
+/// path of `decode_until` leaves it armed; `finish` takes the report.
+struct EosGateGuard<'a>(&'a Device);
+
+impl EosGateGuard<'_> {
+    fn finish(self) -> lloom_tensor::EosGateReport {
+        let report = self.0.eos_gate_end().unwrap_or_default();
+        std::mem::forget(self);
+        report
+    }
+}
+
+impl Drop for EosGateGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.eos_gate_end();
+    }
+}
+
 /// The adaptive commit's two primitives; `None` / `()` off Metal, where the
 /// ring arms `adaptive_commit` requires do not exist.
 fn device_flush_marker_if_started(device: &Device) -> Result<Option<PacerMarker>> {
@@ -1143,11 +1178,26 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     opts.lookahead
                 );
             }
-            if matches!(readback.eos_read_arm(), "poll" | "flag" | "host") {
+            if matches!(readback.eos_read_arm(), "flag" | "host") {
                 lloom_tensor::bail!(
-                    "Session::decode: adaptive_commit on the `{}` EOS arm would wait per step on \
-                     a stamp inside an uncommitted buffer; use a deferred arm (`drain`, \
-                     `gpubatch`, `gpubatch-nonblocking`)",
+                    "Session::decode: adaptive_commit on the `{}` EOS arm reads the token back \
+                     per step; use a ring arm (`poll`, `drain`, `gpubatch`, \
+                     `gpubatch-nonblocking`)",
+                    readback.eos_read_arm()
+                );
+            }
+        }
+        if opts.eos_gate {
+            if !opts.adaptive_commit {
+                lloom_tensor::bail!(
+                    "Session::decode: eos_gate needs adaptive_commit — it gates the forwards \
+                     that loop queues past an EOS"
+                );
+            }
+            if readback.eos_ids_tensor().is_none() {
+                lloom_tensor::bail!(
+                    "Session::decode: eos_gate on the `{}` strategy, which holds no device copy \
+                     of the stop set for the gate kernel to compare against",
                     readback.eos_read_arm()
                 );
             }
@@ -1285,6 +1335,15 @@ impl<'m, M: CausalLM> Session<'m, M> {
             opts.run_ahead
         };
         let mut steps_open = 0usize;
+        // Armed here, disarmed on every exit path (the guard's `Drop`): an
+        // armed gate outliving the run would route the next prefill through
+        // a stale table.
+        let eos_gate = if opts.eos_gate {
+            device.eos_gate_begin()?;
+            Some(EosGateGuard(&device))
+        } else {
+            None
+        };
 
         loop {
             if opts.reached(produced) {
@@ -1348,6 +1407,14 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // is readable as soon as its argmax has run, not after
                 // forward g+1 (one blit, as the poll arm's stamp is).
                 readback.publish_marker(true)?;
+                if opts.eos_gate {
+                    // The gate on the token this forward consumes, then the
+                    // forward's dispatches through the table it may zero.
+                    let eos_ids = readback
+                        .eos_ids_tensor()
+                        .ok_or_else(|| lloom_tensor::Error::Msg("eos_gate: no stop set".into()))?;
+                    device.eos_gate_step(&feed, eos_ids)?;
+                }
             }
             produced += 1;
             // A step whose commit is due below closes a drain window: let the
@@ -1492,7 +1559,15 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 }
                 let t_backpressure = t.map_or(0, |t| t.elapsed().as_nanos() as u64);
                 let t = timed.then(std::time::Instant::now);
-                let is_eos = readback.eos_of_last()?;
+                // Under the adaptive commit nothing on this thread waits on the
+                // token: the poll arm's `eos_of_last` would WFE on a stamp inside
+                // an uncommitted buffer, and EOS is the reader's flag (its device
+                // EOS byte still lands every step — the gate's input).
+                let is_eos = if opts.adaptive_commit {
+                    false
+                } else {
+                    readback.eos_of_last()?
+                };
                 if timed {
                     let phases = StepPhases {
                         sample_ns: t_sample,
@@ -1649,10 +1724,12 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // the stream). The count/EOS are authoritative from the loop.
             all_ids = readback.drain_all()?;
             all_ids.truncate(produced);
-            // The reader stopped the run at an EOS it saw: the ids past it are
-            // the overrun (forwards already queued), reconciled below from the
-            // cache position as on every deferred arm.
-            if stats.stopped_by_flag {
+            // The reader stopped the run at an EOS it saw — or `max_tokens`
+            // arrived first, with the EOS inside the last window: the ids past
+            // it are the overrun (forwards already queued), reconciled below
+            // from the cache position as on every deferred arm. Scanned on
+            // every adaptive run, not only the flag-stopped ones.
+            if opts.adaptive_commit {
                 if let Some(k) = readback.eos_in_drained(&all_ids) {
                     readback.note_eos_truncation(all_ids.len() - k - 1);
                     all_ids.truncate(k);
@@ -1725,6 +1802,16 @@ impl<'m, M: CausalLM> Session<'m, M> {
             None
         };
         stats.overrun = overrun;
+        if let Some(guard) = eos_gate {
+            let report = guard.finish();
+            if report.fired && overrun > 0 {
+                // Every forward past the EOS launched nothing: the cache's
+                // contents end at the EOS; only the counters are ahead.
+                self.seq.overrun_unwritten = true;
+                stats.overrun_unwritten = true;
+            }
+            stats.eos_gate = Some(report);
+        }
         stats.produced = produced;
         stats.tail_ns = tail_start.elapsed().as_nanos() as u64;
         stats.step_markers = pacer.taken;

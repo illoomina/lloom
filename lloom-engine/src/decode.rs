@@ -492,6 +492,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     adaptive_commit: false,
                     run_ahead: 0,
                     stop: None,
+                    eos_gate: false,
                     prefill_tile: 0,
                     prefill_chunk: 0,
                 };

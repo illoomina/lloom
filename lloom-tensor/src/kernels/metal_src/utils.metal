@@ -223,3 +223,18 @@ template<typename T>
 constexpr uint work_per_thread() {
     return div_ceil<8, sizeof(T)>();
 }
+
+// lloom #735 step 4: the EOS gate. A decode kernel instantiated with function
+// constant 777 = true takes one extra argument -- the gate's flag word, bound
+// once per encoder at buffer index 30 -- and returns before doing anything
+// when it is set: the forwards a no-K decode loop queued past an EOS launch
+// their threadgroups but write nothing. The plain instantiation has no such
+// argument and no such read. Guarded because the merged translation unit
+// (`source.rs`) sees this block through `utils.metal` and again in
+// `conv.metal`, which is not a `with_utils!` consumer.
+#ifndef LLOOM_EOS_GATE_DECL
+#define LLOOM_EOS_GATE_DECL
+constant bool eos_gated [[function_constant(777)]];
+#define EOS_GATE_ARG device const uint *eos_gate_flag [[buffer(30), function_constant(eos_gated)]]
+#define EOS_GATE_CHECK if (eos_gated && eos_gate_flag[0] != 0) { return; }
+#endif

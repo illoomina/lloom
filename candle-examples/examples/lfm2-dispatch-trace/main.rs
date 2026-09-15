@@ -1165,6 +1165,7 @@ fn main() -> Result<()> {
         println!("execute calls per step:   {} (one per run)", exec.runs());
         println!("excluded, varies:         {}", cov.varies);
         println!("excluded, inline consts:  {}", cov.inline_constants);
+        println!("excluded, quarantined:     {}", cov.quarantined);
         println!("excluded, no pipeline:    {}", cov.no_pipeline);
         // Zero is the expected value. Nonzero means a replayed position stopped
         // matching its recording mid-run, so coverage is lower than the plan

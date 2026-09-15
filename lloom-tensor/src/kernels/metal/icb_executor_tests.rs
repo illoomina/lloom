@@ -963,3 +963,237 @@ fn a_step_that_ends_inside_a_run_issues_its_validated_prefix_at_the_boundary() {
         "the short step computes its three links"
     );
 }
+
+/// One fused-epilogue GEMV per step over fixed buffers, optionally through
+/// `executor`, returning the last step's output as f32 (lloom #732).
+///
+/// `orient`: `Weight` = `(1, n_out, 1, k)` with the weight on the left,
+/// `Model` = `(1, 1, n_out, k)` with the vector on the left and the weight's
+/// transposed strides `[1, k]` — the call `nn::ops::gemv_fused_metal` makes.
+/// The operand at slot 15 is a row vector for `Residual` and `Mul`, a second
+/// `[n_out, k]` weight for `Swiglu`.
+#[derive(Clone, Copy)]
+enum Orient {
+    Weight,
+    Model,
+}
+
+fn run_gemv_epilogue_steps(
+    steps: usize,
+    executor: Option<&Arc<IcbExecutor>>,
+    epilogue: crate::kernels::kernels::mlx_gemm::GemvEpilogue,
+    (k, n_out): (usize, usize),
+    dtype: crate::kernels::kernels::mlx_gemm::GemmDType,
+    orient: Orient,
+) -> Vec<f32> {
+    use crate::kernels::kernels::mlx_gemm::{call_mlx_gemv_epilogue, GemmDType, GemvEpilogue};
+    use half::f16;
+    let device = device();
+    let kernels = Kernels::new();
+    let cmds = commands(&device);
+    if let Some(e) = executor {
+        cmds.set_executor(Arc::new(ExecutorSlot::Custom(e.clone())));
+    }
+    let options = crate::kernels::RESOURCE_OPTIONS;
+    let up: Vec<f32> = (0..n_out * k)
+        .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+        .collect();
+    let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+    let operand: Vec<f32> = match epilogue {
+        GemvEpilogue::Swiglu => (0..n_out * k)
+            .map(|i| ((i % 19) as f32 - 9.0) / 32.0)
+            .collect(),
+        _ => (0..n_out).map(|i| ((i % 7) as f32 - 3.0) / 4.0).collect(),
+    };
+    let mk = |v: &[f32]| -> crate::kernels::metal::Buffer {
+        match dtype {
+            GemmDType::F16 => {
+                let h: Vec<f16> = v.iter().map(|x| f16::from_f32(*x)).collect();
+                device
+                    .new_buffer_with_data(
+                        h.as_ptr() as *const std::ffi::c_void,
+                        h.len() * 2,
+                        options,
+                    )
+                    .unwrap()
+            }
+            _ => device
+                .new_buffer_with_data(
+                    v.as_ptr() as *const std::ffi::c_void,
+                    std::mem::size_of_val(v),
+                    options,
+                )
+                .unwrap(),
+        }
+    };
+    let elt = if matches!(dtype, GemmDType::F16) {
+        2usize
+    } else {
+        4
+    };
+    let (up_buf, vec_buf, op_buf) = (mk(&up), mk(&vec), mk(&operand));
+    let out = device.new_buffer(n_out * elt, options).unwrap();
+    let style = if executor.is_some() {
+        ParamStyle::Packed
+    } else {
+        ParamStyle::Split
+    };
+    for _ in 0..steps {
+        {
+            let guard = cmds.command_encoder().unwrap();
+            match orient {
+                Orient::Weight => call_mlx_gemv_epilogue(
+                    &device,
+                    &guard,
+                    &kernels,
+                    dtype,
+                    (1, n_out, 1, k),
+                    &[n_out * k, k, 1],
+                    0,
+                    &up_buf,
+                    &[k, 1, 1],
+                    0,
+                    &vec_buf,
+                    &out,
+                    style,
+                    None,
+                    epilogue,
+                    Some((&op_buf, 0)),
+                )
+                .unwrap(),
+                Orient::Model => call_mlx_gemv_epilogue(
+                    &device,
+                    &guard,
+                    &kernels,
+                    dtype,
+                    (1, 1, n_out, k),
+                    &[k, k, 1],
+                    0,
+                    &vec_buf,
+                    &[1, k],
+                    0,
+                    &up_buf,
+                    &out,
+                    style,
+                    None,
+                    epilogue,
+                    Some((&op_buf, 0)),
+                )
+                .unwrap(),
+            }
+        }
+        cmds.flush_and_wait().unwrap();
+        if let Some(e) = executor {
+            e.end_step(&device, &cmds).unwrap();
+        }
+    }
+    // SAFETY: completed, shared storage, `n_out` elements of `dtype`.
+    match dtype {
+        GemmDType::F16 => {
+            unsafe { std::slice::from_raw_parts(out.contents() as *const f16, n_out) }
+                .iter()
+                .map(|h| h.to_f32())
+                .collect()
+        }
+        _ => unsafe { std::slice::from_raw_parts(out.contents() as *const f32, n_out) }.to_vec(),
+    }
+}
+
+/// A replayed fused-epilogue GEMV computes what the classical one did, bit
+/// for bit — every operand-carrying epilogue, both dtypes, both
+/// orientations, at the model's tiles including its FFN shape (lloom #732).
+///
+/// This is the kernel-level gate row 5 was missing; it passes, and that is
+/// the finding beside it: on the model the replayed `_swiglu_packed` output
+/// diverges from the classical dispatch (`measurements/
+/// issue-732-replay-on-the-loop.md` §5), so the kernel replays correctly in
+/// isolation and wrongly in the chain — the quarantine (`is_quarantined`)
+/// stands on the model-level digest, not on this test.
+#[test]
+fn replayed_fused_gemv_epilogues_match_the_classical_ones() {
+    use crate::kernels::kernels::mlx_gemm::{GemmDType, GemvEpilogue};
+    require_icb_support!("replayed_fused_gemv_epilogues_match_the_classical_ones");
+    for dtype in [GemmDType::F32, GemmDType::F16] {
+        for &(epilogue, label) in &[
+            (GemvEpilogue::Residual, "residual"),
+            (GemvEpilogue::Mul, "mul"),
+            (GemvEpilogue::Swiglu, "swiglu"),
+        ] {
+            for &shape in &[(2048usize, 512usize), (2048, 6144), (2048, 10752)] {
+                for orient in [Orient::Weight, Orient::Model] {
+                    set_default_param_style(ParamStyle::Packed);
+                    set_constants_pool_enabled(true);
+                    let executor = IcbExecutor::new(2);
+                    let replayed =
+                        run_gemv_epilogue_steps(6, Some(&executor), epilogue, shape, dtype, orient);
+                    set_default_param_style(ParamStyle::Split);
+                    set_constants_pool_enabled(false);
+                    let classical =
+                        run_gemv_epilogue_steps(1, None, epilogue, shape, dtype, orient);
+                    assert!(
+                        executor.is_replaying(),
+                        "{label} {dtype:?} {shape:?}: never replayed"
+                    );
+                    let coverage = executor.coverage();
+                    // The swiglu is quarantined on the model (`is_quarantined`), so
+                    // under the executor its position is excluded and this arm
+                    // compares classical against classical — stated rather than
+                    // silently vacuous: the row still checks the exclusion engages.
+                    if matches!(epilogue, GemvEpilogue::Swiglu) {
+                        assert_eq!(
+                            coverage.quarantined, 1,
+                            "{label}: the quarantine did not engage"
+                        );
+                        assert_eq!(coverage.covered, 0);
+                        continue;
+                    }
+                    assert!(
+                        coverage.covered > 0,
+                        "{label} {dtype:?} {shape:?}: nothing covered: {coverage:?}"
+                    );
+                    assert_eq!(
+                        executor.stale_positions(),
+                        0,
+                        "{label} {dtype:?} {shape:?}: stale"
+                    );
+                    assert!(
+                        distinct(&replayed) > 2,
+                        "{label} {dtype:?} {shape:?}: vacuous replayed output"
+                    );
+                    let differing = replayed
+                        .iter()
+                        .zip(classical.iter())
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    assert_eq!(
+                        differing, 0,
+                        "{label} {dtype:?} {shape:?}: replayed output differs from classical on {differing} of {} rows",
+                        classical.len()
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The quarantine list engages on the packed swiglu name and nothing else
+/// (lloom #732): a mutation that empties it is what the model-level digest
+/// gate (`lfm2-smoke --replay --gemv-gate swiglu`) catches; this pins the
+/// predicate itself.
+#[test]
+fn the_quarantine_names_the_swiglu_and_only_the_swiglu() {
+    use crate::kernels::metal::icb::is_quarantined;
+    assert!(is_quarantined(
+        "gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_swiglu_packed"
+    ));
+    assert!(!is_quarantined(
+        "gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_mul_packed"
+    ));
+    assert!(!is_quarantined(
+        "gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_residual_packed"
+    ));
+    assert!(!is_quarantined(
+        "gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_packed"
+    ));
+    assert!(!is_quarantined("rmsnorm_f16_packed"));
+}

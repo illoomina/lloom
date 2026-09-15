@@ -286,6 +286,26 @@ pub enum Excluded {
     /// The kernel binds its constants inline, so no ICB command can hold it
     /// (§3.7c). Observed as a name without the `_packed` suffix.
     InlineConstants,
+    /// The kernel is on the quarantine list ([`is_quarantined`]): replayed
+    /// from an ICB on the model its output diverges from the classical
+    /// dispatch, and the cause is open (lloom #732, `measurements/
+    /// issue-732-replay-on-the-loop.md` §5). It runs classically until then.
+    Quarantined,
+}
+
+/// Kernels the plan refuses to replay because a replayed instance was
+/// measured computing something other than its classical dispatch on the
+/// real model — while the same kernel replays correctly in isolation
+/// (`icb_executor_tests::replayed_fused_gemv_epilogues_match_the_classical_ones`
+/// and `a_classical_consumer_of_a_replayed_long_command`). lloom #732 found
+/// this with the two-weight SwiGLU GEMV (`_swiglu_packed`: the crown's reply
+/// diverges from token ~12 with the swiglu positions replayed and is
+/// byte-identical with them excluded), reproduced it with a plain `gemv_mul`
+/// made three times slower, and could not reproduce it outside the model.
+/// Until the ordering hole is found, the positions run classically and the
+/// exclusion table says so.
+pub fn is_quarantined(name: &str) -> bool {
+    name.contains("_swiglu_")
 }
 
 /// What one recording pass learned about the decode step.
@@ -323,6 +343,8 @@ pub struct Coverage {
     pub positions: usize,
     pub covered: usize,
     pub varies: usize,
+    /// Positions excluded by the quarantine list (`is_quarantined`).
+    pub quarantined: usize,
     pub no_pipeline: usize,
     pub inline_constants: usize,
     /// Covered positions per kernel name, so a report can say *what* is replayed
@@ -1069,6 +1091,8 @@ impl Inner {
                 exclude = Some(Excluded::InlineConstants);
             } else if !steps[1..].iter().all(|s| base.replay_compatible(&s[pos])) {
                 exclude = Some(Excluded::Varies);
+            } else if is_quarantined(&name) {
+                exclude = Some(Excluded::Quarantined);
             }
 
             match exclude {
@@ -1090,6 +1114,10 @@ impl Inner {
                         Excluded::InlineConstants => {
                             coverage.inline_constants += 1;
                             "inline-constants"
+                        }
+                        Excluded::Quarantined => {
+                            coverage.quarantined += 1;
+                            "quarantined"
                         }
                     };
                     *coverage.excluded_by_kernel.entry((name, tag)).or_default() += 1;

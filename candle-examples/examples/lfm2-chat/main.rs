@@ -3231,7 +3231,7 @@ fn report_replay(exec: &candle::kernels::IcbExecutor, steps: u64) {
     eprintln!(
         "[replay: replaying={} covered={}/{} runs={} barriers_encoded={} stale={} \
          stale_runs={} prefix_flushes={} rerecordings={} discarded_windows={} \
-         excluded_varies={} excluded_inline_consts={} excluded_no_pipeline={}]",
+         excluded_varies={} excluded_inline_consts={} excluded_no_pipeline={} excluded_quarantined={}]",
         exec.is_replaying(),
         cov.covered,
         cov.positions,
@@ -3245,6 +3245,7 @@ fn report_replay(exec: &candle::kernels::IcbExecutor, steps: u64) {
         cov.varies,
         cov.inline_constants,
         cov.no_pipeline,
+        cov.quarantined,
     );
     eprintln!("[replay: warm_in_skipped={}]", exec.warm_in_skipped());
     let ranges = trace::execute_range_count();

@@ -408,6 +408,7 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         run_ahead: 0,
         stop: None,
         eos_gate: false,
+        fused_publish: true,
         // The tile bounds every prefill forward, a visit's chunk included.
         prefill_tile: ctx.prefill_tile,
         // The time-sliced interleave chunks at the visit level (`run_concurrent`)

@@ -612,6 +612,73 @@ impl Device {
         }
     }
 
+    /// The fused publish (lloom #735 step 5): one dispatch that takes the
+    /// argmax of `logits` (F16 or F32, contiguous), writes the token to
+    /// `token_slot` and `history_slot` (U32 views of one element), raises the
+    /// EOS gate's flag if the token is in `eos_ids` (U32; only while the gate
+    /// is armed), fences, and stamps `generation` into `step` (U32, one
+    /// element) — the chain of `cast`, `argmax`, three blits and the gate
+    /// kernel as one launch. The argmax follows `reduce.metal`'s rule (the
+    /// greatest value, the lowest index on ties). Metal only.
+    pub fn argmax_publish(
+        &self,
+        logits: &crate::Tensor,
+        token_slot: &crate::Tensor,
+        history_slot: &crate::Tensor,
+        eos_ids: &crate::Tensor,
+        step: &crate::Tensor,
+        generation: u32,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => {
+                for (name, t) in [
+                    ("token_slot", token_slot),
+                    ("history_slot", history_slot),
+                    ("eos_ids", eos_ids),
+                    ("step", step),
+                ] {
+                    if t.dtype() != DType::U32 {
+                        crate::bail!("argmax_publish: {name} must be U32, got {:?}", t.dtype());
+                    }
+                }
+                if !logits.is_contiguous() {
+                    crate::bail!("argmax_publish: logits must be contiguous");
+                }
+                let n = logits.elem_count();
+                let n_eos = eos_ids.elem_count();
+                let (ls, ll) = logits.storage_and_layout();
+                let (ts, tl) = token_slot.storage_and_layout();
+                let (hs, hl) = history_slot.storage_and_layout();
+                let (es, el) = eos_ids.storage_and_layout();
+                let (ss, sl) = step.storage_and_layout();
+                let u = DType::U32.size_in_bytes();
+                match (&*ls, &*ts, &*hs, &*es, &*ss) {
+                    (
+                        Storage::Metal(l),
+                        Storage::Metal(t),
+                        Storage::Metal(h),
+                        Storage::Metal(e),
+                        Storage::Metal(s),
+                    ) => d.argmax_publish(
+                        (l, ll.start_offset() * logits.dtype().size_in_bytes()),
+                        n,
+                        (t, tl.start_offset() * u),
+                        (h, hl.start_offset() * u),
+                        (e, el.start_offset() * u, n_eos),
+                        (s, sl.start_offset() * u),
+                        generation,
+                    ),
+                    _ => crate::bail!("argmax_publish: every tensor must live on the Metal device"),
+                }
+            }
+            _ => {
+                let _ = (logits, token_slot, history_slot, eos_ids, step, generation);
+                crate::bail!("argmax_publish: not a Metal device")
+            }
+        }
+    }
+
     /// Disarm the gate and report what it did. `None` off Metal. Precondition
     /// as `eos_gate_begin`'s: the run drained, so `fired` is the last gate's.
     pub fn eos_gate_end(&self) -> Option<EosGateReport> {

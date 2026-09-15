@@ -218,6 +218,11 @@ pub struct DecodeOptions {
     /// Needs a strategy with a device copy of the stop set
     /// (`ReadbackStrategy::eos_ids_tensor`) and no ICB executor.
     pub eos_gate: bool,
+    /// Under `adaptive_commit`: publish each step with the fused
+    /// argmax·eos·stamp kernel (lloom #735 step 5, `Device::argmax_publish`)
+    /// where the strategy can (`ReadbackStrategy::set_fused_publish`). On by
+    /// default; off is the six-launch chain, kept as the A/B arm.
+    pub fused_publish: bool,
     /// The TILE: the most prompt tokens one prefill forward may take
     /// (llama.cpp's `n_ubatch`). **`0` means unbounded** — every forward is
     /// as wide as the ramp or the schedule makes it, the incumbent. A
@@ -389,6 +394,7 @@ impl DecodeOptions {
             run_ahead: 0,
             stop: None,
             eos_gate: false,
+            fused_publish: true,
             prefill_tile: 0,
             prefill_chunk: 0,
             pass_widths: PassWidths::Lru,
@@ -1344,6 +1350,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
         } else {
             None
         };
+        // The fused publish (lloom #735 step 5) where the strategy can take it.
+        readback.set_fused_publish(opts.adaptive_commit && opts.fused_publish);
 
         loop {
             if opts.reached(produced) {
@@ -1400,7 +1408,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let sample_start = (timed || opts.sample_split).then(std::time::Instant::now);
 
             let feed = readback.sample_and_feed(sampler, &logits)?;
-            if opts.adaptive_commit {
+            if opts.adaptive_commit && !readback.publishes_fused() {
                 // The reader drains on the stamp: the deferred arms write it
                 // only at commits, so under the adaptive commit it rides every
                 // step — HERE, before the next forward is encoded, so token g

@@ -220,3 +220,120 @@ fn the_gated_variant_is_a_separate_pipeline_and_the_plain_one_is_untouched() {
     assert!(!std::ptr::eq(plain.as_ref(), gated.as_ref()));
     assert!(std::ptr::eq(plain.as_ref(), plain_again.as_ref()));
 }
+
+/// The fused publish (`call_argmax_publish`, lloom #735 step 5) against the
+/// host: the greatest value, the lowest index on ties — `reduce.metal`'s
+/// `indexed<T>` rule, which `fast_argmax` implements — into both slots, the
+/// flag iff the token is a stop token, the stamp last.
+#[test]
+fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
+    use crate::kernels::call_argmax_publish;
+    let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue().unwrap();
+    let residency_set = Arc::new(ResidencySet::new(&device));
+    let cmds =
+        Commands::new_with_completion_wait(queue, residency_set, CompletionWait::Synchronize)
+            .unwrap();
+    let kernels = Kernels::new();
+    // A fixed LCG so the case is reproducible; values on a coarse grid so ties
+    // are common (about one in eight values shares the maximum bucket).
+    let mut seed = 0x2545_F491u32;
+    let mut next = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        seed
+    };
+    for (n, planted) in [
+        (65_536usize, None),
+        (1_000, Some(7usize)),
+        (64, Some(63)),
+        (3, None),
+    ] {
+        for _ in 0..3 {
+            let mut vals: Vec<f32> = (0..n).map(|_| (next() % 64) as f32 - 32.0).collect();
+            if let Some(p) = planted {
+                // Two copies of the maximum: the lower index must win.
+                let m = vals.iter().cloned().fold(f32::MIN, f32::max);
+                vals[p] = m;
+                vals[(p + 5) % n] = m;
+            }
+            let host = vals
+                .iter()
+                .enumerate()
+                .fold((0usize, f32::MIN), |(bi, bv), (i, &v)| {
+                    if v > bv || (v == bv && i < bi) {
+                        (i, v)
+                    } else {
+                        (bi, bv)
+                    }
+                })
+                .0 as u32;
+            let halves: Vec<u16> = vals
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_bits())
+                .collect();
+            let logits16 = device
+                .new_buffer_with_data(halves.as_ptr() as *const std::ffi::c_void, n * 2, SHARED)
+                .unwrap();
+            let logits32 = device
+                .new_buffer_with_data(vals.as_ptr() as *const std::ffi::c_void, n * 4, SHARED)
+                .unwrap();
+            for (kernel, logits) in [
+                ("argmax_publish_f16", &logits16),
+                ("argmax_publish_f32", &logits32),
+            ] {
+                for eos_is_the_token in [false, true] {
+                    let slots = device.new_buffer(64, SHARED).unwrap();
+                    zero(&slots, 64);
+                    let eos = device.new_buffer(8, SHARED).unwrap();
+                    write_u32(
+                        &eos,
+                        &[if eos_is_the_token { host } else { host + 1 }, 999_999],
+                    );
+                    let flag = device.new_buffer(4, SHARED).unwrap();
+                    zero(&flag, 4);
+                    {
+                        let enc = cmds.command_encoder().unwrap();
+                        call_argmax_publish(
+                            &device,
+                            &enc,
+                            &kernels,
+                            kernel,
+                            BufferOffset::zero_offset(logits),
+                            n,
+                            BufferOffset {
+                                buffer: &slots,
+                                offset_in_bytes: 4,
+                            },
+                            BufferOffset {
+                                buffer: &slots,
+                                offset_in_bytes: 12,
+                            },
+                            BufferOffset::zero_offset(&eos),
+                            2,
+                            &flag,
+                            BufferOffset {
+                                buffer: &slots,
+                                offset_in_bytes: 20,
+                            },
+                            77,
+                        )
+                        .unwrap();
+                    }
+                    cmds.flush_and_wait_current().unwrap();
+                    let out =
+                        unsafe { std::slice::from_raw_parts(slots.contents() as *const u32, 8) };
+                    assert_eq!(out[1], host, "{kernel} n={n}: the token slot");
+                    assert_eq!(out[3], host, "{kernel} n={n}: the history slot");
+                    assert_eq!(out[5], 77, "{kernel} n={n}: the stamp");
+                    assert_eq!(
+                        [out[0], out[2], out[4], out[6]],
+                        [0; 4],
+                        "{kernel}: neighbours untouched"
+                    );
+                    let f = unsafe { (flag.contents() as *const u32).read() };
+                    assert_eq!(f, eos_is_the_token as u32, "{kernel} n={n}: the flag");
+                }
+            }
+        }
+    }
+}

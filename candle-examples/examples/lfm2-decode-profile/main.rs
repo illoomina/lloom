@@ -619,7 +619,7 @@ struct Axes {
     /// built from, so that is where the arm actually is.
     gemv_silu: bool,
     gemv_residual: bool,
-    gemv_gate: bool,
+    gemv_gate: lloom::models::lfm2::GateFusion,
     /// The non-blocking token path (§11.5g, #513's wiring), and its two
     /// sub-arms (#535, #559). Lloom #567 brings all three onto this harness.
     ///
@@ -1207,7 +1207,7 @@ impl Axes {
                 "GemvResidual",
                 if self.gemv_residual { "on" } else { "off" },
             ),
-            p("GemvGate", if self.gemv_gate { "on" } else { "off" }),
+            p("GemvGate", self.gemv_gate.name()),
             // The three async arms (§11.5g/§11.5n/§11.5o), brought onto this
             // harness by #567 so one binary can select them **beside** the two
             // epilogues above and report `step_ms_per_token` over the pair.
@@ -2104,11 +2104,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gemv_residual: bool,
 
-    /// Fuse the SwiGLU product `silu(w1(x)) * w3(x)` onto `w3`'s GEMV store
-    /// (`GemvGate`, #732, §12.2e row 3b at the producer end). Moves the
-    /// digests by construction; 30 `bmul_f16` dispatches per token.
-    #[arg(long, default_value_t = false)]
-    gemv_gate: bool,
+    /// How the SwiGLU product is dispatched (`GemvGate`, #732): `off` |
+    /// `mul` | `swiglu`. Moves the digests by construction.
+    #[arg(long, default_value = "off")]
+    gemv_gate: String,
 
     /// Which SiLU implementation the 30 `usilu` dispatches resolve to
     /// (#599, `DESIGN.md` §12.2l): `exact` | `recip` | `literal` | `coarse4` |
@@ -2860,7 +2859,8 @@ fn main() -> Result<()> {
     // kernels), construction-tier like `AttnImpl` beside them.
     config.gemv_silu = args.gemv_silu;
     config.gemv_residual = args.gemv_residual;
-    config.gemv_gate = args.gemv_gate;
+    config.gemv_gate =
+        lloom::models::lfm2::GateFusion::parse(&args.gemv_gate).map_err(anyhow::Error::msg)?;
     // #599's SiLU arm. Refused rather than defaulted, for `--conv-state`'s
     // reason: an unrecognized value silently pinning `exact` would render
     // `SiluImpl=exact` on a RESULT line for a run the caller asked to be a

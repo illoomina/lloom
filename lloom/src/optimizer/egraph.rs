@@ -96,7 +96,7 @@ fn prelude(fragments: &[Fragment]) -> String {
             OperandKind::None => {
                 let _ = write!(p, " (Epi_{} :cost 0)", f.name);
             }
-            OperandKind::RowIndexed => {
+            OperandKind::RowIndexed | OperandKind::Weight => {
                 let _ = write!(p, " (Epi_{} Expr :cost 0)", f.name);
             }
         }
@@ -145,6 +145,19 @@ fn prelude(fragments: &[Fragment]) -> String {
                     p,
                     "(rule ((= e (Mul g r)) (= g (Gemv w x)) (= (rows g) 1))\n      \
                      ((union e (Fused w x (Epi_{name} r)))))"
+                );
+            }
+            // The two-weight SwiGLU: the product of a SiLU'd GEMV and a bare
+            // GEMV over ONE input becomes the bare GEMV with the other's
+            // weight as its operand. Both GEMVs are single-use by the cut
+            // (a multi-use store is a leaf and does not match `Gemv`), and
+            // the SiLU side matches whether it is still `Silu(Gemv ..)` or
+            // already the fused `gemv_silu` — one e-class.
+            (Semantics::SwigluGate, OperandKind::Weight) => {
+                let _ = writeln!(
+                    p,
+                    "(rule ((= e (Mul s u)) (= s (Silu g)) (= g (Gemv w1 x)) (= u (Gemv w3 x)) \
+                     (= (rows u) 1))\n      ((union e (Fused w3 x (Epi_{name} w1)))))"
                 );
             }
             // Identity is the unfused arm itself; any other pairing has no

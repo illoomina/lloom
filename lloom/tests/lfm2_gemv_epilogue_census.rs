@@ -23,7 +23,7 @@
 
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{Cache, Config, KvAppend, LayerType, Model};
+use lloom::models::lfm2::{Cache, Config, GateFusion, KvAppend, LayerType, Model};
 use lloom::nn::VarBuilder;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
@@ -36,10 +36,10 @@ use lloom_tensor::{DType, Device, Result, Tensor};
 static CENSUS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
-    tiny_config_with_gate(gemv_silu, gemv_residual, false)
+    tiny_config_with_gate(gemv_silu, gemv_residual, GateFusion::Off)
 }
 
-fn tiny_config_with_gate(gemv_silu: bool, gemv_residual: bool, gemv_gate: bool) -> Config {
+fn tiny_config_with_gate(gemv_silu: bool, gemv_residual: bool, gemv_gate: GateFusion) -> Config {
     Config {
         vocab_size: 64,
         hidden_size: 512,
@@ -332,10 +332,10 @@ fn the_census_shows_gemv_mul_replacing_the_gate_product_dispatch() -> Result<()>
         eprintln!("no Metal device; skipping");
         return Ok(());
     };
-    let off = decode_census(&tiny_config_with_gate(false, false, false), &dev)?;
+    let off = decode_census(&tiny_config_with_gate(false, false, GateFusion::Off), &dev)?;
     dump("gemv_gate OFF", &off);
-    let on = decode_census(&tiny_config_with_gate(false, false, true), &dev)?;
-    dump("gemv_gate ON", &on);
+    let on = decode_census(&tiny_config_with_gate(false, false, GateFusion::Mul), &dev)?;
+    dump("gemv_gate MUL", &on);
     assert!(
         !off.is_empty() && off.iter().map(|(_, n)| *n).sum::<u64>() > 0,
         "the census recorded no dispatches at all (§2.4)"
@@ -356,6 +356,79 @@ fn the_census_shows_gemv_mul_replacing_the_gate_product_dispatch() -> Result<()>
     assert_eq!(
         bmul_on, 3,
         "ABSENT: the MLP's bmul dispatches, and only those"
+    );
+    Ok(())
+}
+
+/// The two-weight kernel (#732, §12.2 row 5 with row 3b's product): under
+/// `GemvGate=swiglu` — the SiLU flag off, so nothing else fuses the gate —
+/// `gemv_*_swiglu` is PRESENT once per MLP, and the four dispatches it
+/// stands for are ABSENT: the standalone `silu` (2 → 0), the MLP's `bmul`
+/// (5 → 3), and both projections' plain GEMVs (the `gemv` count falls by 4,
+/// `w1` and `w3` for two MLPs). No `gemv_*_silu`, no `gemv_*_mul` beside it.
+#[test]
+fn the_census_shows_gemv_swiglu_replacing_four_dispatches() -> Result<()> {
+    let _serial = CENSUS.lock();
+    if !lloom_tensor::metal_backend::profile::enabled() {
+        eprintln!(
+            "SKIPPED: this test reads the dispatch census, which is only \
+             recorded under CANDLE_METAL_PROFILE=1. Re-run with it set."
+        );
+        return Ok(());
+    }
+    let Ok(dev) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return Ok(());
+    };
+    let off = decode_census(&tiny_config_with_gate(false, false, GateFusion::Off), &dev)?;
+    dump("gemv_gate OFF", &off);
+    let on = decode_census(
+        &tiny_config_with_gate(false, false, GateFusion::Swiglu),
+        &dev,
+    )?;
+    dump("gemv_gate SWIGLU", &on);
+    assert!(
+        !off.is_empty() && off.iter().map(|(_, n)| *n).sum::<u64>() > 0,
+        "the census recorded no dispatches at all (§2.4)"
+    );
+    let plain = |c: &[(String, u64)]| {
+        count_matching(c, |l| {
+            l.starts_with("gemv")
+                && !l.ends_with("_silu")
+                && !l.ends_with("_residual")
+                && !l.ends_with("_mul")
+                && !l.ends_with("_swiglu")
+        })
+    };
+    let silu_off = count_matching(&off, |l| l.starts_with("silu"));
+    let bmul_off = count_matching(&off, |l| l.starts_with("bmul") || l.starts_with("mul"));
+    let silu_on = count_matching(&on, |l| l.starts_with("silu"));
+    let bmul_on = count_matching(&on, |l| l.starts_with("bmul") || l.starts_with("mul"));
+    let swiglu_on = count_matching(&on, |l| l.starts_with("gemv") && l.ends_with("_swiglu"));
+    let other_fused_on = count_matching(&on, |l| {
+        l.starts_with("gemv") && (l.ends_with("_silu") || l.ends_with("_mul"))
+    });
+    eprintln!(
+        "silu {silu_off} -> {silu_on}; bmul {bmul_off} -> {bmul_on}; plain gemv {} -> {}; \
+         gemv_*_swiglu {swiglu_on}; gemv_*_{{silu,mul}} {other_fused_on}",
+        plain(&off),
+        plain(&on)
+    );
+    assert_eq!((silu_off, bmul_off), (2, 5), "the unfused arm's counts");
+    assert_eq!(swiglu_on, 2, "PRESENT: one gemv_*_swiglu per MLP");
+    assert_eq!(
+        (silu_on, bmul_on),
+        (0, 3),
+        "ABSENT: the SiLU and the MLP's product"
+    );
+    assert_eq!(
+        plain(&off) - plain(&on),
+        4,
+        "ABSENT: w1's and w3's plain GEMVs, two MLPs"
+    );
+    assert_eq!(
+        other_fused_on, 0,
+        "nothing else fuses the gate beside the two-weight kernel"
     );
     Ok(())
 }

@@ -382,11 +382,12 @@ struct Args {
     #[arg(long)]
     gemv_residual: Option<bool>,
 
-    /// Override the SwiGLU gate-product epilogue fusion (`GemvGate`, #732,
-    /// §12.2e row 3b). No preset bakes it: unset leaves the library default,
-    /// off. `--gemv-gate true` is the A/B arm.
+    /// How the SwiGLU product is dispatched (`GemvGate`, #732): `off` |
+    /// `mul` (§12.2e row 3b, the product on `w3`'s store) | `swiglu`
+    /// (§12.2 row 5, both weights in one kernel). No preset bakes it: unset
+    /// leaves the library default, `off`.
     #[arg(long)]
-    gemv_gate: Option<bool>,
+    gemv_gate: Option<String>,
 
     /// Who selects the GEMV epilogue fusions (`Fusion`, issue #732): `manual`
     /// (the two flags above as the preset and the overrides leave them) or
@@ -1366,8 +1367,9 @@ fn main() -> Result<()> {
     if let Some(v) = args.gemv_residual {
         config.gemv_residual = v;
     }
-    if let Some(v) = args.gemv_gate {
-        config.gemv_gate = v;
+    if let Some(v) = args.gemv_gate.as_deref() {
+        config.gemv_gate =
+            lloom::models::lfm2::GateFusion::parse(v).map_err(|e| anyhow::anyhow!(e))?;
     }
     if let Some(f) = args.fusion.as_deref() {
         config.fusion =
@@ -1487,10 +1489,15 @@ fn main() -> Result<()> {
             Some(r) => (r.gemv_silu, r.gemv_residual, r.gemv_gate),
             None => (config.gemv_silu, config.gemv_residual, config.gemv_gate),
         };
-        let on: Vec<&str> = [(silu, "silu"), (residual, "residual"), (gate, "gate")]
-            .into_iter()
-            .filter_map(|(on, name)| on.then_some(name))
-            .collect();
+        let gate_name = gate.fragment();
+        let on: Vec<&str> = [
+            (silu, Some("silu")),
+            (residual, Some("residual")),
+            (gate_name.is_some(), gate_name),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| if on { name } else { None })
+        .collect();
         if on.is_empty() {
             "none".to_string()
         } else {

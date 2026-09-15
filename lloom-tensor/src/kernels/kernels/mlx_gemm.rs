@@ -573,6 +573,14 @@ pub enum GemvEpilogue {
     /// accumulator's precision on the unrounded up-projection — one rounding
     /// fewer, so it moves the digests by construction (§2.3.5a).
     Mul,
+    /// The two-weight SwiGLU, `silu(gate·x) * (up·x)` — `mat` is the up
+    /// weight and the operand at 15 the GATE WEIGHT, `[n, k]` like `mat`,
+    /// streamed by the same threadgroup over the same input coefficients
+    /// (issue #732, `DESIGN.md` §12.2 row 5 with row 3b's product). Not an
+    /// epilogue on one accumulator: two accumulators per output row and no
+    /// barrier between the two sweeps, which is what `Mul` could not have.
+    /// One rounding at the store where the two-dispatch chain rounds twice.
+    Swiglu,
 }
 
 impl GemvEpilogue {
@@ -589,6 +597,7 @@ impl GemvEpilogue {
             GemvEpilogue::Silu => "_silu",
             GemvEpilogue::Residual => "_residual",
             GemvEpilogue::Mul => "_mul",
+            GemvEpilogue::Swiglu => "_swiglu",
         }
     }
 
@@ -602,7 +611,7 @@ impl GemvEpilogue {
     pub fn needs_operand(self) -> bool {
         match self {
             GemvEpilogue::None | GemvEpilogue::Silu => false,
-            GemvEpilogue::Residual | GemvEpilogue::Mul => true,
+            GemvEpilogue::Residual | GemvEpilogue::Mul | GemvEpilogue::Swiglu => true,
         }
     }
 }

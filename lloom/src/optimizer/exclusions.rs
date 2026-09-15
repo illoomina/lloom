@@ -449,7 +449,9 @@ mod tests {
             | "gemv_residual"
             | "gemv_silu+gemv_residual"
             | "gemv_mul"
-            | "gemv_silu+gemv_residual+gemv_mul" => "gemv",
+            | "gemv_silu+gemv_residual+gemv_mul"
+            | "gemv_swiglu"
+            | "gemv_residual+gemv_swiglu" => "gemv",
             "conv_fused" => "shortconv_step",
             "conv_fused+conv_state=rotating" => "shortconv_ring",
             "conv_state=rotating" | "conv_state=ring" => "fast_sum",
@@ -474,6 +476,8 @@ mod tests {
             "gemv_silu+gemv_residual",
             "gemv_mul",
             "gemv_silu+gemv_residual+gemv_mul",
+            "gemv_swiglu",
+            "gemv_residual+gemv_swiglu",
             "conv_fused",
             "conv_fused+conv_state=rotating",
             "conv_state=rotating",

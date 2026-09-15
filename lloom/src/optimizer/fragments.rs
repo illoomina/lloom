@@ -59,11 +59,12 @@ fn describe<E: Epilogue>() -> Fragment {
 /// `EpilogueNone` excluded, being the unfused arm itself). A new
 /// `impl Epilogue` is added here, and nowhere else, to become derivable.
 pub fn catalogue() -> Vec<Fragment> {
-    use crate::nn::fusion::{Gate, Residual, Silu};
+    use crate::nn::fusion::{Gate, Residual, Silu, Swiglu};
     vec![
         describe::<Silu>(),
         describe::<Residual>(),
         describe::<Gate>(),
+        describe::<Swiglu>(),
     ]
 }
 
@@ -75,9 +76,9 @@ mod tests {
     /// suffixes, semantics and operands are the impls'. Absolute references
     /// (`CONTRIBUTING.md` §3.1b rule 1).
     #[test]
-    fn the_catalogue_is_the_three_shipped_epilogues() {
+    fn the_catalogue_is_the_four_shipped_epilogues() {
         let cat = catalogue();
-        assert_eq!(cat.len(), 3);
+        assert_eq!(cat.len(), 4);
         assert_eq!(cat[0].name, "silu");
         assert_eq!(cat[0].semantics, Semantics::Silu);
         assert_eq!(cat[0].operand, OperandKind::None);
@@ -91,6 +92,10 @@ mod tests {
         assert_eq!(cat[2].semantics, Semantics::MulOperand);
         assert_eq!(cat[2].operand, OperandKind::RowIndexed);
         assert_eq!(cat[2].class(), NumericClass::Rounding);
+        assert_eq!(cat[3].name, "swiglu");
+        assert_eq!(cat[3].semantics, Semantics::SwigluGate);
+        assert_eq!(cat[3].operand, OperandKind::Weight);
+        assert_eq!(cat[3].class(), NumericClass::Rounding);
         // All compose into the GEMV, so all carry its model.
         let gemv = TargetFpModel::of_family("gemv").unwrap();
         for f in &cat {

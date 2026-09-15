@@ -972,6 +972,7 @@ fn main() -> Result<()> {
         adaptive_commit: args.adaptive_commit,
         run_ahead: args.run_ahead,
         eos_gate: args.eos_gate,
+        fused_publish: true,
         // The reader thread per turn (`run_turns`) is the drain.
         stream_via_reader: args.adaptive_commit,
         ..DecodeOptions::new(args.n)

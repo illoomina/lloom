@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_limits>
 
 using namespace metal;
 
@@ -28,3 +29,92 @@ kernel void eos_gate_u32(
         }
     }
 }
+
+// The fused publish (lloom #735, step 5): argmax over the logits, the token
+// into the input slot and the history slot, the EOS test into the gate's flag,
+// a device fence, then the generation stamp — the six-launch chain of
+// `cast → argmax → three blits → gate` as one dispatch of one threadgroup.
+// The argmax is `reduce.metal`'s `indexed<T>` rule exactly: the greatest value,
+// the lowest index on ties, each partial starting at {0, lowest()}, values
+// compared as float (which is what `cast_f16_f32 → fast_argmax_f32` compared).
+// The stamp is written by thread 0 after a device-scope barrier, so a reader
+// that observes the stamp observes the slots behind it — the ordering the
+// three queue-ordered blits gave.
+template <typename T>
+METAL_FUNC void argmax_publish_body(
+    device const T *logits,
+    uint n,
+    device uint *token_slot,
+    device uint *history_slot,
+    device const uint *eos_ids,
+    uint n_eos,
+    device uint *flag,
+    device uint *step,
+    uint generation,
+    uint tid,
+    uint width,
+    threadgroup float *sh_v,
+    threadgroup uint *sh_i
+) {
+    float best = numeric_limits<float>::lowest();
+    uint bi = 0;
+    for (uint i = tid; i < n; i += width) {
+        float v = float(logits[i]);
+        if (v > best || (v == best && i < bi)) {
+            best = v;
+            bi = i;
+        }
+    }
+    sh_v[tid] = best;
+    sh_i[tid] = bi;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = width / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sh_v[tid + s];
+            uint oi = sh_i[tid + s];
+            if (ov > sh_v[tid] || (ov == sh_v[tid] && oi < sh_i[tid])) {
+                sh_v[tid] = ov;
+                sh_i[tid] = oi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        uint t = sh_i[0];
+        token_slot[0] = t;
+        history_slot[0] = t;
+        for (uint j = 0; j < n_eos; ++j) {
+            if (t == eos_ids[j]) {
+                flag[0] = 1;
+                break;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0) {
+        step[0] = generation;
+    }
+}
+
+#define ARGMAX_PUBLISH(NAME, T)                                                  \
+kernel void NAME(                                                                \
+    device const T    *logits       [[buffer(0)]],                               \
+    constant uint     &n            [[buffer(1)]],                               \
+    device uint       *token_slot   [[buffer(2)]],                               \
+    device uint       *history_slot [[buffer(3)]],                               \
+    device const uint *eos_ids      [[buffer(4)]],                               \
+    constant uint     &n_eos        [[buffer(5)]],                               \
+    device uint       *flag         [[buffer(6)]],                               \
+    device uint       *step         [[buffer(7)]],                               \
+    constant uint     &generation   [[buffer(8)]],                               \
+    uint tid   [[thread_index_in_threadgroup]],                                  \
+    uint width [[threads_per_threadgroup]]                                       \
+) {                                                                              \
+    threadgroup float sh_v[1024];                                                \
+    threadgroup uint sh_i[1024];                                                 \
+    argmax_publish_body<T>(logits, n, token_slot, history_slot, eos_ids, n_eos,  \
+                           flag, step, generation, tid, width, sh_v, sh_i);      \
+}
+
+ARGMAX_PUBLISH(argmax_publish_f16, half)
+ARGMAX_PUBLISH(argmax_publish_f32, float)

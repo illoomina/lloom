@@ -652,6 +652,12 @@ struct Args {
     #[arg(long)]
     eos_gate: bool,
 
+    /// Under `--adaptive-commit`: publish with the six-launch chain (cast,
+    /// argmax, three blits, the gate kernel) instead of the fused
+    /// argmax·eos·stamp kernel (lloom #735 step 5) — the A/B arm.
+    #[arg(long)]
+    no_fused_publish: bool,
+
     /// The rotating ring's history depth under `--cache rewindable` (non-dspark):
     /// the rewind horizon. `--dspark` sizes it from the drafter's block.
     #[arg(long, default_value_t = 16)]
@@ -1871,6 +1877,7 @@ fn main() -> Result<()> {
         run_ahead: 0,
         stop: None,
         eos_gate: false,
+        fused_publish: true,
         // The tile bounds every prefill forward the ramp or the schedule names.
         prefill_tile: args.prefill_tile,
         // One sequence: nothing to interleave a chunk with.
@@ -1889,6 +1896,7 @@ fn main() -> Result<()> {
         opts.adaptive_commit = true;
         opts.run_ahead = args.run_ahead;
         opts.eos_gate = args.eos_gate;
+        opts.fused_publish = !args.no_fused_publish;
     } else if args.eos_gate {
         anyhow::bail!("--eos-gate needs --adaptive-commit");
     }
@@ -2529,7 +2537,7 @@ fn main() -> Result<()> {
         eprintln!(
             "[adaptive commit: {} buffers closed on the GPU starting the previous one + {} at the \
              run-ahead bound ({}), over {} steps = {:.1} steps/buffer, max {} in one; stopped by \
-             the reader's EOS flag: {}]",
+             the reader's EOS flag: {}; fused publishes {}/{}]",
             st.adaptive_commits,
             st.run_ahead_closes,
             if args.run_ahead == 0 {
@@ -2541,6 +2549,8 @@ fn main() -> Result<()> {
             st.steps as f64 / (st.adaptive_commits + st.run_ahead_closes).max(1) as f64,
             st.max_steps_per_buffer,
             st.stopped_by_flag,
+            st.readback.fused_publishes,
+            st.readback.ring_publishes,
         );
     }
     if let Some(g) = st.eos_gate {

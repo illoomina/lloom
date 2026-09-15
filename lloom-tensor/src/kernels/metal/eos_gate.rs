@@ -146,6 +146,12 @@ impl DispatchGate {
         Ok(())
     }
 
+    /// The fused publish (`call_argmax_publish`) did this step's EOS test:
+    /// count it as a gate step.
+    pub fn note_step(&self) {
+        self.steps.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Disarm and report. Precondition as `begin`'s: the run drained, so the
     /// flag read here is the last gate kernel's.
     pub fn end(&self) -> EosGateReport {

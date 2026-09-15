@@ -50,6 +50,10 @@ pub struct ReadbackArms {
 pub struct ReadbackCounters {
     /// Tokens published into the ring's input slot.
     pub ring_publishes: u64,
+    /// Of those, the ones the fused argmax·eos·stamp kernel published
+    /// (`Device::argmax_publish`, lloom #735 step 5): one dispatch in place of
+    /// the cast, the argmax, three blits and the gate kernel.
+    pub fused_publishes: u64,
     /// Publishes that turned out to be EOS and were retracted from the history.
     pub ring_eos_publishes: u64,
     /// Iterations of the EOS wait, across every step.
@@ -231,6 +235,19 @@ pub trait ReadbackStrategy {
     /// trait so a loop generic over the strategy (`lfm2-release`) can take one.
     fn reader(&self) -> Option<RingReader> {
         None
+    }
+
+    /// Under the adaptive commit: publish each step with the fused
+    /// argmax·eos·stamp kernel (`Device::argmax_publish`) where the strategy
+    /// can — the ring with an argmax sampler on Metal. While
+    /// [`Self::publishes_fused`], the loop skips its own stamp and gate step:
+    /// the kernel did both.
+    fn set_fused_publish(&mut self, on: bool) {
+        let _ = on;
+    }
+
+    fn publishes_fused(&self) -> bool {
+        false
     }
 
     /// The engagement counters so far.
@@ -1288,6 +1305,9 @@ pub struct Ring {
     history: History,
     /// The ordinal stamped on the last publish; 0 before any.
     generation: u32,
+    /// `set_fused_publish`: the loop asked for the fused publish; taken on a
+    /// mapped ring when the sampler is argmax (`sample_and_feed`).
+    fused_publish: bool,
     /// The EOS id set, host-side, for the [`EosRead::HostOnDrain`] (and the
     /// `GpuBatched` fallback) compare. Read back from the device ring once at
     /// construction (a loop invariant), so the per-token path never touches it.
@@ -1487,6 +1507,7 @@ impl Ring {
             eos,
             history,
             generation: 0,
+            fused_publish: false,
             eos_ids_host,
             pending_eos_index: std::cell::RefCell::new(None),
             staged_eos: std::cell::RefCell::new(Vec::with_capacity(2)),
@@ -1636,6 +1657,34 @@ impl ReadbackStrategy for Ring {
         sampler: &mut LogitsProcessor,
         logits: &Tensor,
     ) -> Result<Tensor> {
+        if self.fused_publish && matches!(sampler.sampling(), Sampling::ArgMax) {
+            // The fused publish (lloom #735 step 5): the argmax, the history
+            // slot, the input slot, the EOS test and the stamp in one
+            // dispatch. Same order of effects as below — the slots land, a
+            // device fence, then the stamp — so a reader that sees the stamp
+            // sees the token.
+            let logits = if logits.rank() == 1 {
+                logits.clone()
+            } else {
+                logits.flatten_all()?
+            };
+            self.counters.ring_publishes += 1;
+            self.counters.fused_publishes += 1;
+            let (seg, offset) = self.history.begin_step()?;
+            self.generation += 1;
+            let history_slot = self.history.ring.segments[seg].narrow(0, offset, 1)?;
+            let token_slot = self.ring.next_input_slot_view()?;
+            self.device().argmax_publish(
+                &logits,
+                &token_slot,
+                &history_slot,
+                self.ring.eos_ids_tensor(),
+                self.ring.step_counter(),
+                self.generation,
+            )?;
+            self.history.wrote_one();
+            return self.ring.input_for(1);
+        }
         let sampled = sampler.sample_argmax_on_device(logits)?;
         self.counters.ring_publishes += 1;
         // Begin this step's tile (one token per step on this arm → quantum=1 →
@@ -1693,6 +1742,10 @@ impl ReadbackStrategy for Ring {
     }
 
     fn publish_marker(&mut self, force_live: bool) -> Result<()> {
+        // The fused publish stamped inside `sample_and_feed`.
+        if self.fused_publish {
+            return Ok(());
+        }
         // Only the deferred-EOS arms write their marker at the commit window; the
         // poll arm stamped per step inside `sample_and_feed` (marker ≡ EOS flag),
         // and the blocking arm has its own readback.
@@ -1985,6 +2038,14 @@ impl ReadbackStrategy for Ring {
 
     fn reader(&self) -> Option<RingReader> {
         Ring::reader(self)
+    }
+
+    fn set_fused_publish(&mut self, on: bool) {
+        self.fused_publish = on && self.ring.poll_is_mapped();
+    }
+
+    fn publishes_fused(&self) -> bool {
+        self.fused_publish
     }
 
     fn eos_read_arm(&self) -> &'static str {

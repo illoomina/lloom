@@ -636,6 +636,15 @@ impl TokenRing {
         &self.step
     }
 
+    /// Advance to the next input tile and return it as a `[1]` U32 view — the
+    /// slot the fused publish (`Device::argmax_publish`, lloom #735 step 5)
+    /// writes the sampled token into on the GPU, in place of
+    /// [`Self::publish_input`]'s blit. `input_for(1)` then reads the same tile.
+    pub(crate) fn next_input_slot_view(&self) -> Result<Tensor> {
+        let tile = self.next_slot();
+        self.inputs.tile_view(tile, 1)?.reshape(1)
+    }
+
     /// The tensor the model reads as its next input. Stable across steps, and
     /// the same allocation every step -- §10.3e names buffer-identity stability
     /// as one of the three properties a replacement append must not regress.

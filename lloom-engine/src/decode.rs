@@ -493,6 +493,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     run_ahead: 0,
                     stop: None,
                     eos_gate: false,
+                    fused_publish: true,
                     prefill_tile: 0,
                     prefill_chunk: 0,
                 };

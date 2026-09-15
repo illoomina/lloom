@@ -843,6 +843,67 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// See `Device::argmax_publish`. Storages with byte offsets; `n` logits of
+    /// `dtype` (F16 or F32). The gate's flag is written iff the gate is
+    /// armed, with a buffers-scope barrier behind the dispatch so the gated
+    /// variants (which read it outside the hazard tracker) see it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn argmax_publish(
+        &self,
+        logits: (&crate::MetalStorage, usize),
+        n: usize,
+        token_slot: (&crate::MetalStorage, usize),
+        history_slot: (&crate::MetalStorage, usize),
+        eos_ids: (&crate::MetalStorage, usize, usize),
+        step: (&crate::MetalStorage, usize),
+        generation: u32,
+    ) -> Result<()> {
+        let kernel = match logits.0.dtype {
+            DType::F16 => "argmax_publish_f16",
+            DType::F32 => "argmax_publish_f32",
+            other => crate::bail!("argmax_publish: logits must be F16 or F32, got {other:?}"),
+        };
+        let gate = self.commands.eos_gate();
+        let armed = gate.armed_flag();
+        let dummy: &crate::kernels::metal::Buffer = step.0.buffer();
+        let (flag, n_eos) = match armed {
+            Some(flag) => (flag, eos_ids.2),
+            None => (dummy, 0),
+        };
+        fn bo(s: &crate::MetalStorage, off: usize) -> crate::kernels::BufferOffset<'_> {
+            crate::kernels::BufferOffset {
+                buffer: s.buffer(),
+                offset_in_bytes: off,
+            }
+        }
+        let encoder = self.command_encoder()?;
+        crate::kernels::call_argmax_publish(
+            &self.device,
+            &encoder,
+            &self.kernels,
+            kernel,
+            bo(logits.0, logits.1),
+            n,
+            bo(token_slot.0, token_slot.1),
+            bo(history_slot.0, history_slot.1),
+            bo(eos_ids.0, eos_ids.1),
+            n_eos,
+            flag,
+            bo(step.0, step.1),
+            generation,
+        )
+        .map_err(MetalError::from)?;
+        if armed.is_some() {
+            use crate::kernels::utils::EncoderProvider;
+            let guard = &encoder;
+            let enc = guard.encoder();
+            let enc: &crate::kernels::metal::ComputeCommandEncoder = enc.as_ref();
+            enc.insert_memory_barrier();
+            gate.note_step();
+        }
+        Ok(())
+    }
+
     /// See `Device::eos_gate_end`.
     pub fn eos_gate_end(&self) -> crate::EosGateReport {
         self.kernels.set_eos_gated(false);

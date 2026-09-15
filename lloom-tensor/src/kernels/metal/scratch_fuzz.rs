@@ -508,368 +508,366 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
-    // ---------------------------------------------------------------------------
-    // The generator.
-    // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// The generator.
+// ---------------------------------------------------------------------------
 
-    /// `page_size` values, drawn rather than fixed at 256.
-    ///
-    /// **Not all 256 deliberately.** §10.4 marks 256 UNVERIFIED, and #574's mutant 2
-    /// is the general lesson: a fixture where the quantity under test is constant
-    /// across the reduction cannot see a defect in it. A page size that is the same
-    /// everywhere makes `chunks()` a constant divisor and hides any defect
-    /// proportional to it. 100 is included because it makes the planes layout's
-    /// region size a non-128-multiple as well, so `align_up` is load-bearing under
-    /// *both* layouts for at least one drawn shape.
-    fn page_size_strategy() -> impl Strategy<Value = usize> {
-        prop_oneof![
-            6 => Just(256usize),
-            2 => prop::sample::select(vec![64usize, 128, 512, 1024]),
-            1 => Just(100usize),
-        ]
-    }
+/// `page_size` values, drawn rather than fixed at 256.
+///
+/// **Not all 256 deliberately.** §10.4 marks 256 UNVERIFIED, and #574's mutant 2
+/// is the general lesson: a fixture where the quantity under test is constant
+/// across the reduction cannot see a defect in it. A page size that is the same
+/// everywhere makes `chunks()` a constant divisor and hides any defect
+/// proportional to it. 100 is included because it makes the planes layout's
+/// region size a non-128-multiple as well, so `align_up` is load-bearing under
+/// *both* layouts for at least one drawn shape.
+fn page_size_strategy() -> impl Strategy<Value = usize> {
+    prop_oneof![
+        6 => Just(256usize),
+        2 => prop::sample::select(vec![64usize, 128, 512, 1024]),
+        1 => Just(100usize),
+    ]
+}
 
-    fn geometry_strategy() -> impl Strategy<Value = PartialsGeometry> {
-        (
-            prop::sample::select(vec![1usize, 8, 32]),
-            prop::sample::select(vec![32usize, 64, 96, 128]),
-            page_size_strategy(),
-            Just(1usize),
-        )
-            .prop_map(|(n_heads, head_dim, page_size, batch)| PartialsGeometry {
-                n_heads,
-                head_dim,
-                page_size,
-                batch,
-            })
-    }
+fn geometry_strategy() -> impl Strategy<Value = PartialsGeometry> {
+    (
+        prop::sample::select(vec![1usize, 8, 32]),
+        prop::sample::select(vec![32usize, 64, 96, 128]),
+        page_size_strategy(),
+        Just(1usize),
+    )
+        .prop_map(|(n_heads, head_dim, page_size, batch)| PartialsGeometry {
+            n_heads,
+            head_dim,
+            page_size,
+            batch,
+        })
+}
 
-    fn sizing_strategy() -> impl Strategy<Value = Sizing> {
-        prop::sample::select(Sizing::ALL.to_vec())
-    }
+fn sizing_strategy() -> impl Strategy<Value = Sizing> {
+    prop::sample::select(Sizing::ALL.to_vec())
+}
 
-    fn layout_strategy() -> impl Strategy<Value = ScratchLayout> {
-        prop_oneof![
-            Just(ScratchLayout::Planes),
-            // Drawn as often as `Planes`: this is the layout whose 264 B record is
-            // not a 128-multiple, so it is the one where `align_up` can fail
-            // (§9.2c, #70).
-            Just(ScratchLayout::Interleaved),
-        ]
-    }
+fn layout_strategy() -> impl Strategy<Value = ScratchLayout> {
+    prop_oneof![
+        Just(ScratchLayout::Planes),
+        // Drawn as often as `Planes`: this is the layout whose 264 B record is
+        // not a 128-multiple, so it is the one where `align_up` can fail
+        // (§9.2c, #70).
+        Just(ScratchLayout::Interleaved),
+    ]
+}
 
-    /// The boundaries worth landing on: chunk edges, every bucket rung, and the
-    /// max context.
-    fn boundary_strategy() -> impl Strategy<Value = usize> {
-        prop_oneof![
-            prop::sample::select(BUCKET_LADDER.to_vec()),
-            Just(MAX_CONTEXT),
-            Just(16_384usize),
-            (1usize..512).prop_map(|c| c * 256),
-        ]
-    }
+/// The boundaries worth landing on: chunk edges, every bucket rung, and the
+/// max context.
+fn boundary_strategy() -> impl Strategy<Value = usize> {
+    prop_oneof![
+        prop::sample::select(BUCKET_LADDER.to_vec()),
+        Just(MAX_CONTEXT),
+        Just(16_384usize),
+        (1usize..512).prop_map(|c| c * 256),
+    ]
+}
 
-    fn op_strategy() -> impl Strategy<Value = Op> {
-        prop_oneof![
-            // Appends dominate, as they do in a decode loop.
-            10 => prop_oneof![
-                6 => Just(1usize),
-                3 => 1usize..64,
-                1 => 1usize..4096,
-            ].prop_map(|n| Op::Append { n }),
-            4 => (boundary_strategy(), -2i8..=2).prop_map(|(boundary, delta)| Op::SeekNear {
-                boundary,
-                delta,
-            }),
-            1 => Just(Op::Reset),
-            2 => sizing_strategy().prop_map(|sizing| Op::Repolicy { sizing }),
-            2 => layout_strategy().prop_map(|layout| Op::Relayout { layout }),
-        ]
-    }
+fn op_strategy() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        // Appends dominate, as they do in a decode loop.
+        10 => prop_oneof![
+            6 => Just(1usize),
+            3 => 1usize..64,
+            1 => 1usize..4096,
+        ].prop_map(|n| Op::Append { n }),
+        4 => (boundary_strategy(), -2i8..=2).prop_map(|(boundary, delta)| Op::SeekNear {
+            boundary,
+            delta,
+        }),
+        1 => Just(Op::Reset),
+        2 => sizing_strategy().prop_map(|sizing| Op::Repolicy { sizing }),
+        2 => layout_strategy().prop_map(|layout| Op::Relayout { layout }),
+    ]
+}
 
-    proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 512,
-            max_shrink_iters: 4096,
-            ..ProptestConfig::default()
-        })]
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 512,
+        max_shrink_iters: 4096,
+        ..ProptestConfig::default()
+    })]
 
-        /// `plan_scratch` agrees with a model of its contract at every `kv_len` an
-        /// arbitrary decode walk reaches, under every policy and layout.
-        #[test]
-        fn the_plan_matches_its_model_over_a_long_context_walk(
-            geometry in geometry_strategy(),
-            layers in 1usize..=32,
-            sizing in sizing_strategy(),
-            layout in layout_strategy(),
-            ops in prop::collection::vec(op_strategy(), 1..160),
-        ) {
-            if let Err(e) = run_sequence(geometry, layers, sizing, layout, &ops) {
-                return Err(TestCaseError::fail(e));
-            }
-        }
-    }
-
-    proptest! {
-        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
-
-        /// **A region is never sized for fewer chunks than the step will write.**
-        ///
-        /// This is the property the whole class exists for: §3.5 records that under
-        /// `HazardTrackingModeUntracked` an overrun is *silent*, so a plan that
-        /// admits when it should refuse produces corruption with nothing reporting
-        /// it. Stated over the admitted arm only -- a refusal is the safe outcome.
-        #[test]
-        fn an_admitted_plan_is_never_smaller_than_the_live_step(
-            geometry in geometry_strategy(),
-            layers in 1usize..=32,
-            sizing in sizing_strategy(),
-            layout in layout_strategy(),
-            kv_len in 0usize..200_000,
-        ) {
-            let Ok(plan) = plan_scratch(&geometry, kv_len, layers, sizing, layout, MAX_CONTEXT) else {
-                return Ok(());
-            };
-            let live = plan.live_chunks();
-            for (i, r) in plan.regions().iter().enumerate() {
-                prop_assert!(
-                    r.chunks >= live,
-                    "region {i} sized for {} chunks at kv_len {kv_len} where {live} are live under \
-                     {sizing:?}: the step writes past the region and DESIGN.md §3.5 says nothing \
-                     catches it",
-                    r.chunks
-                );
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------------------
-    // Engagement: the generator reaches the states the properties are about.
-    // ---------------------------------------------------------------------------
-
-    /// **Which `(state, op)` transitions the campaign reached, and which it did
-    /// not.**
-    ///
-    /// #575 asks for exactly this and says why: high line coverage is compatible
-    /// with never having taken a transition -- #546 measured 208 prunes, zero of
-    /// which removed anything, on a green suite. So this asserts on *transitions*,
-    /// and prints the full table so an unreached one is visible rather than
-    /// inferred.
-    ///
-    /// Without it the two properties above are #504's `evicted = 0`: a green result
-    /// that measured nothing.
+    /// `plan_scratch` agrees with a model of its contract at every `kv_len` an
+    /// arbitrary decode walk reaches, under every policy and layout.
     #[test]
-    fn the_generator_reaches_every_transition_and_names_the_ones_it_does_not() {
-        use proptest::strategy::{Strategy, ValueTree};
-        use proptest::test_runner::{Config, TestRunner};
+    fn the_plan_matches_its_model_over_a_long_context_walk(
+        geometry in geometry_strategy(),
+        layers in 1usize..=32,
+        sizing in sizing_strategy(),
+        layout in layout_strategy(),
+        ops in prop::collection::vec(op_strategy(), 1..160),
+    ) {
+        if let Err(e) = run_sequence(geometry, layers, sizing, layout, &ops) {
+            return Err(TestCaseError::fail(e));
+        }
+    }
+}
 
-        // **A FIXED seed, deliberately.** This test is a gate, and a gate whose
-        // verdict depends on an unseeded RNG is one that goes red on an unrelated
-        // PR and gets deleted rather than believed -- #516's `ptr_eq` shape, which
-        // failed on a tree whose routing was correct. Measured here: the first
-        // version drew its own seed and read `capacity_exceeds_values` at 5236 on
-        // one run and **0** on the next, because that transition needs
-        // `n_heads != 32` (32 * (d+2) * 4 is a 128-multiple for every instantiated
-        // `head_dim`, so the region size is always aligned) AND `layers > 1` (with
-        // one region the cursor never rounds a non-final slot). A run that drew
-        // `n_heads = 32` throughout reached it zero times, correctly, and the gate
-        // reported a defect that was the generator's.
-        let mut runner = TestRunner::new_with_rng(
-            Config {
-                cases: 512,
-                ..Config::default()
-            },
-            proptest::test_runner::TestRng::deterministic_rng(
-                proptest::test_runner::RngAlgorithm::ChaCha,
-            ),
-        );
-        let strategy = (
-            geometry_strategy(),
-            // At least two layers, so the bump cursor rounds a slot that is not the
-            // last one -- the only way `bump_capacity` can exceed `arena_bytes`.
-            2usize..=32,
-            sizing_strategy(),
-            layout_strategy(),
-            prop::collection::vec(op_strategy(), 60..160),
-        );
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
 
-        let mut total = Transitions::default();
-        let mut runs = 0u64;
-        for _ in 0..512 {
-            let (geometry, layers, sizing, layout, ops) = strategy
-                .new_tree(&mut runner)
-                .expect("strategy produces a value")
-                .current();
-            match run_sequence(geometry, layers, sizing, layout, &ops) {
-                Ok(t) => {
-                    total.merge(&t);
-                    runs += 1;
-                }
-                Err(e) => {
-                    panic!("engagement run diverged, which the property should have caught: {e}")
-                }
+    /// **A region is never sized for fewer chunks than the step will write.**
+    ///
+    /// This is the property the whole class exists for: §3.5 records that under
+    /// `HazardTrackingModeUntracked` an overrun is *silent*, so a plan that
+    /// admits when it should refuse produces corruption with nothing reporting
+    /// it. Stated over the admitted arm only -- a refusal is the safe outcome.
+    #[test]
+    fn an_admitted_plan_is_never_smaller_than_the_live_step(
+        geometry in geometry_strategy(),
+        layers in 1usize..=32,
+        sizing in sizing_strategy(),
+        layout in layout_strategy(),
+        kv_len in 0usize..200_000,
+    ) {
+        let Ok(plan) = plan_scratch(&geometry, kv_len, layers, sizing, layout, MAX_CONTEXT) else {
+            return Ok(());
+        };
+        let live = plan.live_chunks();
+        for (i, r) in plan.regions().iter().enumerate() {
+            prop_assert!(
+                r.chunks >= live,
+                "region {i} sized for {} chunks at kv_len {kv_len} where {live} are live under \
+                 {sizing:?}: the step writes past the region and DESIGN.md §3.5 says nothing \
+                 catches it",
+                r.chunks
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Engagement: the generator reaches the states the properties are about.
+// ---------------------------------------------------------------------------
+
+/// **Which `(state, op)` transitions the campaign reached, and which it did
+/// not.**
+///
+/// #575 asks for exactly this and says why: high line coverage is compatible
+/// with never having taken a transition -- #546 measured 208 prunes, zero of
+/// which removed anything, on a green suite. So this asserts on *transitions*,
+/// and prints the full table so an unreached one is visible rather than
+/// inferred.
+///
+/// Without it the two properties above are #504's `evicted = 0`: a green result
+/// that measured nothing.
+#[test]
+fn the_generator_reaches_every_transition_and_names_the_ones_it_does_not() {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::{Config, TestRunner};
+
+    // **A FIXED seed, deliberately.** This test is a gate, and a gate whose
+    // verdict depends on an unseeded RNG is one that goes red on an unrelated
+    // PR and gets deleted rather than believed -- #516's `ptr_eq` shape, which
+    // failed on a tree whose routing was correct. Measured here: the first
+    // version drew its own seed and read `capacity_exceeds_values` at 5236 on
+    // one run and **0** on the next, because that transition needs
+    // `n_heads != 32` (32 * (d+2) * 4 is a 128-multiple for every instantiated
+    // `head_dim`, so the region size is always aligned) AND `layers > 1` (with
+    // one region the cursor never rounds a non-final slot). A run that drew
+    // `n_heads = 32` throughout reached it zero times, correctly, and the gate
+    // reported a defect that was the generator's.
+    let mut runner = TestRunner::new_with_rng(
+        Config {
+            cases: 512,
+            ..Config::default()
+        },
+        proptest::test_runner::TestRng::deterministic_rng(
+            proptest::test_runner::RngAlgorithm::ChaCha,
+        ),
+    );
+    let strategy = (
+        geometry_strategy(),
+        // At least two layers, so the bump cursor rounds a slot that is not the
+        // last one -- the only way `bump_capacity` can exceed `arena_bytes`.
+        2usize..=32,
+        sizing_strategy(),
+        layout_strategy(),
+        prop::collection::vec(op_strategy(), 60..160),
+    );
+
+    let mut total = Transitions::default();
+    let mut runs = 0u64;
+    for _ in 0..512 {
+        let (geometry, layers, sizing, layout, ops) = strategy
+            .new_tree(&mut runner)
+            .expect("strategy produces a value")
+            .current();
+        match run_sequence(geometry, layers, sizing, layout, &ops) {
+            Ok(t) => {
+                total.merge(&t);
+                runs += 1;
             }
+            Err(e) => panic!("engagement run diverged, which the property should have caught: {e}"),
         }
+    }
 
-        // The `n_heads != 32` half, pinned rather than drawn: an unaligned region
-        // size is what makes `capacity_exceeds_values` reachable at all, and
-        // leaving it to the draw is what made this gate flaky.
-        for heads in [1usize, 8] {
-            let g = PartialsGeometry {
-                n_heads: heads,
-                head_dim: 64,
-                page_size: 256,
-                batch: 1,
-            };
-            let t = run_sequence(
-                g,
-                LFM2_ATTENTION_LAYERS,
-                Sizing::Grow,
-                ScratchLayout::Planes,
-                &[Op::Append { n: 256 }],
-            )
-            .expect("the pinned unaligned geometry plans");
-            total.merge(&t);
-        }
+    // The `n_heads != 32` half, pinned rather than drawn: an unaligned region
+    // size is what makes `capacity_exceeds_values` reachable at all, and
+    // leaving it to the draw is what made this gate flaky.
+    for heads in [1usize, 8] {
+        let g = PartialsGeometry {
+            n_heads: heads,
+            head_dim: 64,
+            page_size: 256,
+            batch: 1,
+        };
+        let t = run_sequence(
+            g,
+            LFM2_ATTENTION_LAYERS,
+            Sizing::Grow,
+            ScratchLayout::Planes,
+            &[Op::Append { n: 256 }],
+        )
+        .expect("the pinned unaligned geometry plans");
+        total.merge(&t);
+    }
 
-        println!("FUZZ575 scratch transitions over {runs} runs:");
-        for (name, n) in total.named() {
-            println!("FUZZ575   {name:<26} {n}");
-        }
+    println!("FUZZ575 scratch transitions over {runs} runs:");
+    for (name, n) in total.named() {
+        println!("FUZZ575   {name:<26} {n}");
+    }
 
-        let unreached = total.unreached();
-        assert!(
-            unreached.is_empty(),
-            "the generator never reached these transitions: {unreached:?}\n\
+    let unreached = total.unreached();
+    assert!(
+        unreached.is_empty(),
+        "the generator never reached these transitions: {unreached:?}\n\
          An unreached transition is the finding (#575). Either the generator cannot \
          produce the state -- in which case the properties above say nothing about it -- \
          or the state is unreachable and the transition should not be listed."
-        );
-    }
+    );
+}
 
-    // ---------------------------------------------------------------------------
-    // Non-vacuity: the harness can fail.
-    // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Non-vacuity: the harness can fail.
+// ---------------------------------------------------------------------------
 
-    /// **The driver reports a divergence when the model is wrong.**
-    ///
-    /// §3.1a rule 4: all-GREEN is as suspicious as all-RED, and neither extreme is
-    /// self-validating. This perturbs the *model* -- not the production code, which
-    /// stays untouched -- and shows `run_sequence` says so. It is the inverted arm
-    /// every harness in `measurements/` carries.
-    ///
-    /// Three perturbations, one per comparison the driver makes, because a single
-    /// one only shows that *some* check fires.
-    #[test]
-    fn the_driver_reports_a_divergence_when_the_model_is_wrong() {
-        let geometry = PartialsGeometry::default();
-        let ops = [Op::Append { n: 1000 }, Op::Append { n: 1000 }];
+/// **The driver reports a divergence when the model is wrong.**
+///
+/// §3.1a rule 4: all-GREEN is as suspicious as all-RED, and neither extreme is
+/// self-validating. This perturbs the *model* -- not the production code, which
+/// stays untouched -- and shows `run_sequence` says so. It is the inverted arm
+/// every harness in `measurements/` carries.
+///
+/// Three perturbations, one per comparison the driver makes, because a single
+/// one only shows that *some* check fires.
+#[test]
+fn the_driver_reports_a_divergence_when_the_model_is_wrong() {
+    let geometry = PartialsGeometry::default();
+    let ops = [Op::Append { n: 1000 }, Op::Append { n: 1000 }];
 
-        // The clean arm FIRST, and it must be green or every RED below is
-        // uninterpretable (§3.1a rule 1).
-        let clean = run_sequence(
-            geometry,
+    // The clean arm FIRST, and it must be green or every RED below is
+    // uninterpretable (§3.1a rule 1).
+    let clean = run_sequence(
+        geometry,
+        LFM2_ATTENTION_LAYERS,
+        Sizing::Grow,
+        ScratchLayout::Planes,
+        &ops,
+    );
+    assert!(
+        clean.is_ok(),
+        "the clean arm must pass before any perturbation is readable: {clean:?}"
+    );
+
+    // 1. Wrong layer count -> region-count divergence.
+    let e = run_sequence(
+        geometry,
+        LFM2_ATTENTION_LAYERS,
+        Sizing::Grow,
+        ScratchLayout::Planes,
+        &ops,
+    );
+    assert!(e.is_ok());
+    let wrong_layers = {
+        // Ask the plan for 8 layers and the model for 9 by driving the model
+        // through a different `layers` than `plan_scratch` receives. Done by
+        // calling the pieces directly, since `run_sequence` keeps them in step.
+        let plan = plan_scratch(
+            &geometry,
+            2000,
             LFM2_ATTENTION_LAYERS,
             Sizing::Grow,
             ScratchLayout::Planes,
-            &ops,
-        );
-        assert!(
-            clean.is_ok(),
-            "the clean arm must pass before any perturbation is readable: {clean:?}"
-        );
+            MAX_CONTEXT,
+        )
+        .expect("plans at 2000");
+        plan.regions().len() != LFM2_ATTENTION_LAYERS + 1
+    };
+    assert!(
+        wrong_layers,
+        "a region count that matches a wrong model would make the check vacuous"
+    );
 
-        // 1. Wrong layer count -> region-count divergence.
-        let e = run_sequence(
-            geometry,
-            LFM2_ATTENTION_LAYERS,
-            Sizing::Grow,
-            ScratchLayout::Planes,
-            &ops,
-        );
-        assert!(e.is_ok());
-        let wrong_layers = {
-            // Ask the plan for 8 layers and the model for 9 by driving the model
-            // through a different `layers` than `plan_scratch` receives. Done by
-            // calling the pieces directly, since `run_sequence` keeps them in step.
-            let plan = plan_scratch(
-                &geometry,
-                2000,
-                LFM2_ATTENTION_LAYERS,
-                Sizing::Grow,
-                ScratchLayout::Planes,
-                MAX_CONTEXT,
-            )
-            .expect("plans at 2000");
-            plan.regions().len() != LFM2_ATTENTION_LAYERS + 1
-        };
-        assert!(
-            wrong_layers,
-            "a region count that matches a wrong model would make the check vacuous"
-        );
-
-        // 2. A deliberately broken plan is rejected by the checks the driver runs.
-        let overlapping = ScratchPlan::from_parts(
-            vec![
-                ScratchRegion {
-                    offset: 0,
-                    size: 4096,
-                    chunks: 1,
-                },
-                ScratchRegion {
-                    offset: 2048,
-                    size: 4096,
-                    chunks: 1,
-                },
-            ],
-            Sizing::Grow,
-            ScratchLayout::Planes,
-            CombineOrder::Index,
-            256,
-            1,
-        );
-        assert!(
-            overlapping.check_disjoint().is_err(),
-            "check_disjoint accepted two overlapping regions, so the driver's call to it \
-         proves nothing"
-        );
-
-        // 3. A completion-ordered plan is rejected.
-        let completion = ScratchPlan::from_parts(
-            vec![ScratchRegion {
+    // 2. A deliberately broken plan is rejected by the checks the driver runs.
+    let overlapping = ScratchPlan::from_parts(
+        vec![
+            ScratchRegion {
                 offset: 0,
                 size: 4096,
                 chunks: 1,
-            }],
-            Sizing::Grow,
-            ScratchLayout::Planes,
-            CombineOrder::Completion,
-            256,
-            1,
-        );
-        assert!(
-            completion.check_index_ordered().is_err(),
-            "check_index_ordered accepted a Completion order, so the driver's call to it \
-         proves nothing"
-        );
-
-        // 4. An unaligned offset is rejected -- the #70 axis, and the one a
-        // Planes-only fixture cannot exercise.
-        let unaligned = ScratchPlan::from_parts(
-            vec![ScratchRegion {
-                offset: 64,
+            },
+            ScratchRegion {
+                offset: 2048,
                 size: 4096,
                 chunks: 1,
-            }],
-            Sizing::Grow,
-            ScratchLayout::Interleaved,
-            CombineOrder::Index,
-            256,
-            1,
-        );
-        assert!(
-            unaligned.check_disjoint().is_err(),
-            "check_disjoint accepted a 64 B-aligned offset"
-        );
-    }
+            },
+        ],
+        Sizing::Grow,
+        ScratchLayout::Planes,
+        CombineOrder::Index,
+        256,
+        1,
+    );
+    assert!(
+        overlapping.check_disjoint().is_err(),
+        "check_disjoint accepted two overlapping regions, so the driver's call to it \
+         proves nothing"
+    );
+
+    // 3. A completion-ordered plan is rejected.
+    let completion = ScratchPlan::from_parts(
+        vec![ScratchRegion {
+            offset: 0,
+            size: 4096,
+            chunks: 1,
+        }],
+        Sizing::Grow,
+        ScratchLayout::Planes,
+        CombineOrder::Completion,
+        256,
+        1,
+    );
+    assert!(
+        completion.check_index_ordered().is_err(),
+        "check_index_ordered accepted a Completion order, so the driver's call to it \
+         proves nothing"
+    );
+
+    // 4. An unaligned offset is rejected -- the #70 axis, and the one a
+    // Planes-only fixture cannot exercise.
+    let unaligned = ScratchPlan::from_parts(
+        vec![ScratchRegion {
+            offset: 64,
+            size: 4096,
+            chunks: 1,
+        }],
+        Sizing::Grow,
+        ScratchLayout::Interleaved,
+        CombineOrder::Index,
+        256,
+        1,
+    );
+    assert!(
+        unaligned.check_disjoint().is_err(),
+        "check_disjoint accepted a 64 B-aligned offset"
+    );
+}
 }

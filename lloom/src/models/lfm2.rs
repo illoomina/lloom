@@ -2212,13 +2212,35 @@ impl PagedKv {
         Ok(())
     }
 
-    /// Drop slot `slot`'s pages into the quarantine.
-    fn release_slot(&mut self, slot: usize) {
-        if let Some(pool) = self.pool.as_mut() {
-            let freed = pool.release(slot);
-            self.quarantine
-                .quarantine(self.clock.current_epoch(), freed);
-        }
+    /// Drop slot `slot`'s pages into the quarantine; returns the pages whose
+    /// last referent this was.
+    fn release_slot(&mut self, slot: usize) -> Vec<u32> {
+        let Some(pool) = self.pool.as_mut() else {
+            return Vec::new();
+        };
+        let freed = pool.release(slot);
+        self.quarantine
+            .quarantine(self.clock.current_epoch(), freed.clone());
+        freed
+    }
+
+    /// Slot `slot`'s page table.
+    fn row_pages(&self, slot: usize) -> Vec<u32> {
+        self.pool
+            .as_ref()
+            .and_then(|p| p.seq(slot))
+            .map(|s| s.pages().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Point `dst`'s first `n_pages` at `src`'s (`KvPagePool::share_prefix`).
+    fn share_pages(&mut self, src: usize, dst: usize, n_pages: usize) -> Result<()> {
+        let pool = self
+            .pool
+            .as_mut()
+            .ok_or_else(|| lloom_tensor::Error::msg("lfm2 paged KV: the shared pool is unset"))?;
+        pool.share_prefix(src, dst, n_pages)
+            .map_err(lloom_tensor::Error::wrap)
     }
 
     /// Pages allocated to at least one slot, and pages free.
@@ -2289,6 +2311,11 @@ struct BatchInner {
     /// The batched conv arm's `(slots, phases)` index buffers, reused while
     /// the rows and phases are those they were built for.
     row_index: Option<RowIndex>,
+    /// The conv rings after a page's LAST token, keyed by the page: taken
+    /// when a row's pass begins at a page boundary, dropped when the page's
+    /// last referent goes. What a row sharing the page starts its own ring
+    /// from (`batched-decode-design.md` §12.3).
+    snapshots: HashMap<u32, RingSnapshot>,
     /// Whether the layers take the batched arms (one dispatch per kernel for
     /// the batch) or the per-row loop over the same pool — the A/B, and the
     /// identity gate's two arms. `LLOOM_148_ROWS_ARM=per-row` turns them off.
@@ -2296,6 +2323,15 @@ struct BatchInner {
     /// Batched-arm dispatch groups taken (attention and conv layers), a
     /// counter the gate reads so the arm cannot be silently skipped.
     shared_calls: u64,
+}
+
+/// A row's conv rings — one `[1, hidden, width]` per conv layer — and the
+/// ring's write phase, as they stood after a page's last token.
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+struct RingSnapshot {
+    rings: Vec<Option<Tensor>>,
+    phase: usize,
 }
 
 #[cfg(feature = "metal")]
@@ -2320,8 +2356,20 @@ struct SlotLease {
 impl Drop for SlotLease {
     fn drop(&mut self) {
         let mut g = self.inner.lock();
-        g.kv.release_slot(self.slot);
+        g.release(self.slot);
         g.free.push(self.slot);
+    }
+}
+
+#[cfg(feature = "metal")]
+impl BatchInner {
+    /// Drop `slot`'s pages (into the quarantine) and the snapshots of the
+    /// pages that had no other referent.
+    fn release(&mut self, slot: usize) {
+        let freed = self.kv.release_slot(slot);
+        for p in freed {
+            self.snapshots.remove(&p);
+        }
     }
 }
 
@@ -2380,12 +2428,37 @@ impl BatchPool {
                     slots,
                     free: (0..slots).rev().collect(),
                     row_index: None,
+                    snapshots: HashMap::new(),
                     batched_arms: std::env::var("LLOOM_148_ROWS_ARM")
                         .map(|v| v != "per-row")
                         .unwrap_or(true),
                     shared_calls: 0,
                 })),
             })
+        }
+    }
+
+    /// Tokens per page — the sharing granularity (§12.3).
+    pub fn page_size(&self) -> usize {
+        #[cfg(feature = "metal")]
+        {
+            self.inner.lock().kv.page_size
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            0
+        }
+    }
+
+    /// Ring snapshots held (one per completed page still referenced).
+    pub fn snapshots(&self) -> usize {
+        #[cfg(feature = "metal")]
+        {
+            self.inner.lock().snapshots.len()
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            0
         }
     }
 
@@ -2757,6 +2830,12 @@ fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
         .collect()
 }
 
+impl crate::nn::model::CacheShare for Cache {
+    fn share_prefix_from(&mut self, src: &Self, n_tokens: usize) -> Result<usize> {
+        Cache::share_prefix_from(self, src, n_tokens)
+    }
+}
+
 impl CacheReset for Cache {
     /// Delegates to [`Cache::clear`] — the tested total reset (kvs, kv/quant
     /// slots, conv states, conv phase and compaction flag). This is what lets
@@ -3126,6 +3205,117 @@ impl Cache {
             return Ok(Some(view));
         }
         Ok(None)
+    }
+
+    /// On the batch arm, when this row's length is a positive multiple of
+    /// the page size: snapshot every conv ring (after the page's last
+    /// token) under the page, for a sharer (§12.3). A no-op otherwise.
+    #[cfg(feature = "metal")]
+    fn snapshot_page_boundary(&mut self) -> Result<()> {
+        let Some(b) = &self.batch else {
+            return Ok(());
+        };
+        let slot = b.slot();
+        let pool = b.pool.clone();
+        let mut g = pool.inner.lock();
+        let p = g.kv.page_size;
+        let len = g.kv.row_len(slot);
+        if len == 0 || len % p != 0 {
+            return Ok(());
+        }
+        let pages = g.kv.row_pages(slot);
+        let Some(&page) = pages.get(len / p - 1) else {
+            return Ok(());
+        };
+        let mut rings = Vec::with_capacity(g.conv.len());
+        for t in g.conv.iter() {
+            rings.push(match t {
+                Some(pool_t) => {
+                    let view = pool_t.narrow(0, slot, 1)?;
+                    // A real copy (`Tensor::copy` is shallow on Metal).
+                    let own = Tensor::zeros(view.dims(), view.dtype(), view.device())?;
+                    own.slice_set(&view, 2, 0)?;
+                    Some(own)
+                }
+                None => None,
+            });
+        }
+        g.snapshots.insert(
+            page,
+            RingSnapshot {
+                rings,
+                phase: self.conv_phase,
+            },
+        );
+        Ok(())
+    }
+
+    /// Share `src`'s first whole pages covering at most `n_tokens` tokens
+    /// with this (empty) row — the pages by reference, the conv rings from
+    /// the snapshot after the last shared page — and return the tokens
+    /// shared (a multiple of the page size, 0 when nothing could be:
+    /// `batched-decode-design.md` §12.3). The caller then feeds the tokens
+    /// after them at that position, with the conv's left context restored.
+    #[allow(unused_variables)]
+    pub fn share_prefix_from(&mut self, src: &Cache, n_tokens: usize) -> Result<usize> {
+        #[cfg(not(feature = "metal"))]
+        {
+            Ok(0)
+        }
+        #[cfg(feature = "metal")]
+        {
+            let (Some(d), Some(s)) = (&self.batch, &src.batch) else {
+                lloom_tensor::bail!("lfm2 share_prefix_from: both rows must be slots of a BatchPool")
+            };
+            if !d.pool.same(&s.pool) {
+                lloom_tensor::bail!("lfm2 share_prefix_from: the rows are in different pools")
+            }
+            let (dslot, sslot) = (d.slot(), s.slot());
+            if dslot == sslot {
+                lloom_tensor::bail!("lfm2 share_prefix_from: a row cannot share with itself")
+            }
+            if self.kv_len() != 0 {
+                lloom_tensor::bail!(
+                    "lfm2 share_prefix_from: the sharing row holds {} tokens; a share starts \
+                     from an empty row",
+                    self.kv_len()
+                )
+            }
+            let pool = d.pool.clone();
+            let snap = {
+                let mut g = pool.inner.lock();
+                let p = g.kv.page_size;
+                let src_len = g.kv.row_len(sslot);
+                let pages = g.kv.row_pages(sslot);
+                let mut n_pages = (n_tokens / p).min(src_len / p).min(pages.len());
+                // Only a page with its ring snapshot can be the last shared
+                // one: walk down until one has it.
+                while n_pages > 0 && !g.snapshots.contains_key(&pages[n_pages - 1]) {
+                    n_pages -= 1;
+                }
+                if n_pages == 0 {
+                    return Ok(0);
+                }
+                g.kv.share_pages(sslot, dslot, n_pages)?;
+                let snap = g.snapshots[&pages[n_pages - 1]].clone();
+                (snap, n_pages * p)
+            };
+            let (snap, shared) = snap;
+            for (layer, ring) in snap.rings.iter().enumerate() {
+                let Some(r) = ring else { continue };
+                let (_, hidden, width) = r.dims3()?;
+                let view = self
+                    .conv_state_view(layer, hidden, width, r.dtype())?
+                    .expect("a batch row's conv view exists");
+                view.slice_set(r, 2, 0)?;
+            }
+            self.conv_phase = snap.phase;
+            self.conv_phase_prev = snap.phase;
+            self.conv_history = 0;
+            self.conv_compact = false;
+            self.paged_pass_pending = false;
+            Ok(shared)
+        }
     }
 
     /// Store layer `layer`'s conv state: on the batch arm into the row's
@@ -3828,7 +4018,7 @@ impl Cache {
         }
         #[cfg(feature = "metal")]
         if let Some(b) = &mut self.batch {
-            b.pool.inner.lock().kv.release_slot(b.slot());
+            b.pool.inner.lock().release(b.slot());
             b.pass = None;
         }
         // A new sequence starts at one bucket again: the slab was dropped with
@@ -7674,8 +7864,18 @@ impl Model {
         // layer; this is the once-per-pass point that says a new pass began.
         cache.paged_pass_pending = true;
         #[cfg(feature = "metal")]
-        if let Some(b) = &mut cache.batch {
-            b.pass = None;
+        if cache.batch.is_some() {
+            if let Some(b) = &mut cache.batch {
+                b.pass = None;
+            }
+            // A pass beginning at a page boundary: the ring holds the state
+            // after the page's last token — what a row sharing the page
+            // starts from (§12.3). Taken BEFORE this pass writes anything.
+            if let Err(e) = cache.snapshot_page_boundary() {
+                // A snapshot is an optimisation for a sharer; the pass itself
+                // is unaffected, so the failure is logged, not raised.
+                eprintln!("lfm2 batch: ring snapshot failed: {e}");
+            }
         }
         cache.conv_phase_prev = cache.conv_phase;
         if let ConvState::RotatingRing { k } = self.conv_state {

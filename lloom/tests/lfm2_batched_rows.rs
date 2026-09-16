@@ -687,3 +687,120 @@ mod pool_arms {
         Ok(())
     }
 }
+
+#[cfg(feature = "metal")]
+mod prefix_share {
+    use super::*;
+    use lloom::models::lfm2::{AttnImpl, BatchPool};
+
+    fn share_config() -> Config {
+        let mut cfg = tiny_config_on(ConvState::RotatingRing { k: 2 });
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.kv_append = KvAppend::Paged;
+        cfg.attn_impl = AttnImpl::FlashDecoding;
+        cfg.flash_page_size = 32;
+        cfg.flash_pages_per_chunk = 1;
+        cfg.conv_fused = true;
+        // A prefill in pieces reads the ring the previous piece left — the
+        // writer a shared prefix's remainder needs (§10.10, §12.3).
+        cfg.conv_prefill_ctx = true;
+        cfg
+    }
+
+    /// Prefill `prompt` in pieces of `piece` tokens through `forward`, so
+    /// every piece boundary is a pass boundary (and a page boundary when
+    /// `piece` is the page): the state a sharer starts from is snapshotted
+    /// there. Returns the last piece's logits.
+    fn prefill_pieces(model: &Model, cache: &mut Cache, prompt: &[u32], piece: usize, dev: &Device) -> Result<Tensor> {
+        let mut pos = 0;
+        let mut last = None;
+        while pos < prompt.len() {
+            let n = piece.min(prompt.len() - pos);
+            let input = Tensor::new(&prompt[pos..pos + n], dev)?.unsqueeze(0)?;
+            last = Some(model.forward(&input, pos, cache)?);
+            pos += n;
+        }
+        Ok(last.expect("a non-empty prompt"))
+    }
+
+    /// A row that SHARES two pages of another's prompt and prefills the six
+    /// tokens after them computes what a fresh row prefilling all 70 does —
+    /// the remainder's logits and a decode step after it, bit for bit — and
+    /// the pool holds the shared pages once.
+    #[test]
+    fn a_shared_prefix_reproduces_the_fresh_prefill_bit_for_bit() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = share_config();
+        for dtype in [DType::F32, DType::F16] {
+            let model = build(&cfg, dtype, &dev)?;
+            let pool = BatchPool::new(&cfg, &dev, 4, 128)?;
+            let prompt: Vec<u32> = (0..70u32).map(|i| (i * 13 + 7) % 48).collect();
+            let question: Vec<u32> = prompt[64..].to_vec();
+            let next = 21u32;
+
+            // The source: the whole prompt, in page-sized pieces (its passes
+            // begin at 32 and 64: two snapshots).
+            let mut src = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let _ = prefill_pieces(&model, &mut src, &prompt, 32, &dev)?;
+            assert_eq!(src.kv_len(), 70);
+            assert!(pool.snapshots() >= 2, "snapshots at the two page boundaries");
+
+            // The reference: a fresh row, the same pieces.
+            let mut fresh = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let want_tail = prefill_pieces(&model, &mut fresh, &prompt, 32, &dev)?;
+            let pages_before = pool.report().pages_in_use;
+
+            // The sharer: two pages from the source, then the remainder.
+            let mut shared = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let n = shared.share_prefix_from(&src, 64)?;
+            assert_eq!(n, 64, "two whole pages shared");
+            assert_eq!(shared.kv_len(), 64);
+            let input = Tensor::new(question.as_slice(), &dev)?.unsqueeze(0)?;
+            let got_tail = model.forward(&input, 64, &mut shared)?;
+            assert_eq!(shared.kv_len(), 70);
+            // The shared pages are held once: the sharer added only its tail page.
+            assert_eq!(pool.report().pages_in_use, pages_before + 1);
+
+            let bits = |t: &Tensor| -> Result<Vec<u32>> {
+                Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect())
+            };
+            assert_eq!(bits(&got_tail)?, bits(&want_tail)?, "the remainder's logits ({dtype:?})");
+
+            // A decode step on both.
+            let input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
+            let a = model.forward(&input, 70, &mut fresh)?;
+            let b = model.forward(&input, 70, &mut shared)?;
+            assert_eq!(bits(&a)?, bits(&b)?, "the step after ({dtype:?})");
+            // Non-vacuity: the logits depend on the prefix — a row that
+            // prefilled only the remainder differs.
+            let mut bare = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let q = Tensor::new(question.as_slice(), &dev)?.unsqueeze(0)?;
+            let c = model.forward(&q, 0, &mut bare)?;
+            assert_ne!(bits(&c)?, bits(&want_tail)?, "the prefix matters");
+        }
+        Ok(())
+    }
+
+    /// The share refuses what it cannot do: a non-empty sharer, a source in
+    /// another pool, a prefix shorter than a page (0 shared).
+    #[test]
+    fn share_refusals_and_the_page_floor() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = share_config();
+        let dtype = DType::F32;
+        let model = build(&cfg, dtype, &dev)?;
+        let pool = BatchPool::new(&cfg, &dev, 3, 128)?;
+        let other = BatchPool::new(&cfg, &dev, 1, 128)?;
+        let prompt: Vec<u32> = (0..40u32).map(|i| (i * 5 + 1) % 48).collect();
+        let mut src = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        let _ = prefill_pieces(&model, &mut src, &prompt, 32, &dev)?;
+        let mut a = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        assert_eq!(a.share_prefix_from(&src, 20)?, 0, "below a page: nothing");
+        assert_eq!(a.share_prefix_from(&src, 40)?, 32, "one page of the 40");
+        assert!(a.share_prefix_from(&src, 32).is_err(), "a non-empty sharer is refused");
+        let mut foreign = Cache::for_batch(true, dtype, &cfg, &dev, &other)?;
+        assert!(foreign.share_prefix_from(&src, 32).is_err(), "another pool is refused");
+        Ok(())
+    }
+}

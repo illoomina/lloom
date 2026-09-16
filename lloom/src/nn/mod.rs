@@ -69,7 +69,7 @@ pub use layer_norm::{
 };
 pub use linear::{linear, linear_b, linear_no_bias, Linear};
 pub use model::{
-    BatchedCausalLM, CacheReset, CacheRewind, CausalLM, Model, RaggedRow, Row, Speculative,
+    BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, Model, RaggedRow, Row, Speculative,
     VisionEncoder,
 };
 pub use ops::Dropout;

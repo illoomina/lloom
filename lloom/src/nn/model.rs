@@ -149,6 +149,16 @@ pub trait BatchedCausalLM: CausalLM {
     }
 }
 
+/// A cache that can start from another row's cached prefix without
+/// recomputing it — pages by reference, the conv state restored — as the
+/// rows of one `BatchPool` can (`batched-decode-design.md` §12.3).
+pub trait CacheShare {
+    /// Share `src`'s first whole pages covering at most `n_tokens` tokens
+    /// with this empty cache; returns the tokens shared (0 when none could
+    /// be). The caller feeds the rest at that position.
+    fn share_prefix_from(&mut self, src: &Self, n_tokens: usize) -> Result<usize>;
+}
+
 /// A cache that can be returned to its pre-prefill state.
 ///
 /// The one method [`Session::warmup`](crate::nn::speculator::Session) needs and

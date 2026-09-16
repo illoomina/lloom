@@ -22,7 +22,7 @@
 //! drafter whose probe it can satisfy, so an MTP drafter against a target with no
 //! `h_nextn` head does not compile rather than failing at runtime (§3.4.3).
 
-use crate::nn::model::{CacheReset, CacheRewind, CausalLM};
+use crate::nn::model::{CacheReset, CacheRewind, CacheShare, CausalLM};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// A sequence slot on the serving side. The `Speculator` is constructed for a
@@ -648,6 +648,10 @@ pub enum ReuseAction {
     /// whose contents were unknown — so the cache was reset and `full` is
     /// prefilled whole.
     Fresh,
+    /// The cache was reset, then the carried count of tokens was SHARED from
+    /// another row's cache — its pages by reference, its conv state restored
+    /// (`CacheShare`) — and the suffix after them is prefilled.
+    Shared(usize),
 }
 
 /// The outcome of [`Session::prepare`]: what to prefill and what was reused.
@@ -796,6 +800,49 @@ impl<'m, M: CausalLM> Session<'m, M> {
         self.seq.overrun_unwritten = false;
         self.seq.last_logits = None;
         self.seq.tokens_known = true;
+    }
+
+    /// [`Self::prepare`], and when it finds nothing of its own to reuse, a
+    /// share of `src`'s cached prefix: the longest common prefix of `src_log`
+    /// (what `src` holds, token for token) and `full`, rounded down to what
+    /// [`CacheShare::share_prefix_from`] can give (whole pages, at most
+    /// `full.len() - 1` so a prediction is still produced), the token log and
+    /// position set past it. `src` must hold at least `src_log.len()` tokens.
+    pub fn prepare_shared(
+        &mut self,
+        full: &[u32],
+        src: &M::Cache,
+        src_log: &[u32],
+    ) -> Result<Prepared>
+    where
+        M::Cache: CacheRewind + CacheReset + CacheShare,
+    {
+        let prepared = self.prepare(full)?;
+        if prepared.action != ReuseAction::Fresh || full.len() < 2 {
+            return Ok(prepared);
+        }
+        let lcp = src_log
+            .iter()
+            .zip(full.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let want = lcp.min(full.len() - 1);
+        if want == 0 {
+            return Ok(prepared);
+        }
+        let shared = self.seq.cache.share_prefix_from(src, want)?;
+        if shared == 0 {
+            return Ok(prepared);
+        }
+        self.seq.tokens = full[..shared].to_vec();
+        self.seq.pos = shared;
+        self.seq.tokens_known = true;
+        self.seq.last_logits = None;
+        Ok(Prepared {
+            action: ReuseAction::Shared(shared),
+            reused: shared,
+            suffix: full[shared..].to_vec(),
+        })
     }
 
     /// Make the sequence decodable for `full` — the whole token sequence a

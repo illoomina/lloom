@@ -40,7 +40,7 @@ use std::sync::Arc;
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::nn::{
     BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, DecodeOptions,
-    DecodeOut, DecodeStats, ReuseAction, RowId, Session,
+    DecodeOut, DecodeStats, ReuseAction, RowDriver, RowId, Session,
 };
 use lloom_tensor::{Device, Result};
 
@@ -69,6 +69,34 @@ pub enum BatchEvent {
 
 /// A hook the scheduler calls after every step with its counters.
 pub type CountersHook = Box<dyn Fn(&BatchCounters) + Send>;
+
+/// The scheduler's continuous driver, boxed: the K=1 batched loop or the
+/// speculative one, one surface (`RowDriver`).
+pub type Driver<'m, M> = Box<dyn RowDriver<'m, M, Session<'m, M>> + 'm>;
+
+/// What the scheduler's `extra` can build its continuous driver from: the
+/// speculative loop when it holds a proposer, else nothing (the K=1
+/// `BatchDecoder`). Built on the scheduler's thread, where the model borrow
+/// lives.
+pub trait MakeDriver<M: BatchedCausalLM> {
+    fn make_driver<'m>(
+        &mut self,
+        model: &'m M,
+        opts: &DecodeOptions,
+        device: &Device,
+    ) -> Result<Option<Driver<'m, M>>>;
+}
+
+impl<M: BatchedCausalLM> MakeDriver<M> for () {
+    fn make_driver<'m>(
+        &mut self,
+        _model: &'m M,
+        _opts: &DecodeOptions,
+        _device: &Device,
+    ) -> Result<Option<Driver<'m, M>>> {
+        Ok(None)
+    }
+}
 
 /// A retired row's outcome.
 #[derive(Debug, Clone)]
@@ -246,7 +274,7 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
     share_prefix: bool,
     mode: BatchMode<M, E>,
     extra: E,
-    decoder: BatchDecoder<'m, M, Session<'m, M>>,
+    decoder: Driver<'m, M>,
     inflight: HashMap<RowId, InFlight>,
     waiting: VecDeque<(BatchRequest, Sender<BatchEvent>)>,
     closed: VecDeque<ClosedJob<M, E>>,
@@ -277,10 +305,11 @@ pub struct BatchConfig<M: CausalLM, E> {
 
 impl<'m, M, E> BatchScheduler<'m, M, E>
 where
-    M: BatchedCausalLM,
+    M: BatchedCausalLM + 'm,
     M::Cache: CacheReset + CacheRewind + CacheShare,
+    E: MakeDriver<M>,
 {
-    fn new(model: &'m M, cfg: BatchConfig<M, E>, rx: Receiver<Job<M, E>>) -> Result<Self> {
+    fn new(model: &'m M, mut cfg: BatchConfig<M, E>, rx: Receiver<Job<M, E>>) -> Result<Self> {
         if cfg.max_rows == 0 {
             lloom_tensor::bail!("batch scheduler: max_rows must be positive");
         }
@@ -294,7 +323,14 @@ where
         // Every row needs an EOS set of its own; the decoder's is a floor
         // the rows' params refine per request (`admit` re-checks), so the
         // decoder is built with a placeholder no id matches.
-        let decoder = BatchDecoder::new(cfg.opts.clone(), &[u32::MAX], cfg.device.clone())?;
+        let decoder: Driver<'m, M> = match cfg.extra.make_driver(model, &cfg.opts, &cfg.device)? {
+            Some(d) => d,
+            None => Box::new(BatchDecoder::new(
+                cfg.opts.clone(),
+                &[u32::MAX],
+                cfg.device.clone(),
+            )?),
+        };
         Ok(Self {
             model,
             device: cfg.device,
@@ -837,7 +873,7 @@ where
     S: Send + Sync + 'static,
     M: BatchedCausalLM + Sync + 'static,
     M::Cache: CacheReset + CacheRewind + CacheShare + Send + 'static,
-    E: Send + 'static,
+    E: MakeDriver<M> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
     let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();

@@ -190,6 +190,15 @@ pub struct Anchor {
     pub pos: usize,
 }
 
+/// One row of a batched verify ([`Probes::verify_rows_enqueue`]): its cache,
+/// its anchor and its draft.
+pub struct VerifyRowRef<'a, C> {
+    pub cache: &'a mut C,
+    pub anchor: Anchor,
+    pub draft: &'a Draft,
+}
+
+
 /// The ids of one drafted block, where the family produced them.
 ///
 /// A drafter that samples on the device (DSpark's `sample_block` argmax
@@ -315,6 +324,38 @@ pub trait Speculator {
     ) -> Result<()>;
 }
 
+/// A borrowed proposer is a proposer: a driver that owns its `S` can be
+/// handed `&mut S` for a closed run (`Session::decode_spec_batched`).
+impl<T: Speculator> Speculator for &mut T {
+    type Probe = T::Probe;
+    fn n_seq(&self) -> usize {
+        T::n_seq(self)
+    }
+    fn kv_source(&self) -> KvSource {
+        T::kv_source(self)
+    }
+    fn max_draft(&self) -> usize {
+        T::max_draft(self)
+    }
+    fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
+        T::begin(self, seq, prompt)
+    }
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        T::draft(self, active)
+    }
+    fn want_confidence(&mut self, wanted: bool) {
+        T::want_confidence(self, wanted)
+    }
+    fn observe(
+        &mut self,
+        seq: SeqId,
+        probe: &<Self::Probe as TargetProbe>::Output,
+        accepted: &[u32],
+    ) -> Result<()> {
+        T::observe(self, seq, probe, accepted)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Layer 3 — the verify/accept loop, family-blind; the pairing proof.
 // ---------------------------------------------------------------------------
@@ -405,6 +446,35 @@ pub trait Probes<P: TargetProbe>: CausalLM {
         cache: &mut Self::Cache,
         eos_ids: &[u32],
     ) -> Result<(Vec<u32>, P::Output)>;
+
+    /// The receipt of a verify over several rows' windows in ONE pass
+    /// ([`Self::verify_rows_enqueue`]).
+    type PendingRows;
+
+    /// Encode several rows' verifies as one target pass — every row's
+    /// `[last, draft…]` window laid end to end, one weight sweep, each row
+    /// against its own cache (`batched-decode-design.md` §12.4). Per row the
+    /// arithmetic of [`Self::verify_enqueue`]. A model without a batched
+    /// verify refuses.
+    fn verify_rows_enqueue(
+        &self,
+        rows: &mut [VerifyRowRef<'_, Self::Cache>],
+    ) -> Result<Self::PendingRows> {
+        let _ = rows;
+        lloom_tensor::bail!("this model has no batched verify")
+    }
+
+    /// Read back [`Self::verify_rows_enqueue`]'s pass: per row, as
+    /// [`Self::verify_complete`].
+    fn verify_rows_complete(
+        &self,
+        pending: Self::PendingRows,
+        caches: &mut [&mut Self::Cache],
+        eos_ids: &[u32],
+    ) -> Result<Vec<(Vec<u32>, P::Output)>> {
+        let _ = (pending, caches, eos_ids);
+        lloom_tensor::bail!("this model has no batched verify")
+    }
 
     /// Drain the probe the last non-verify pass (the prefill) left in `cache`,
     /// covering every position that pass ran. A drafter is keyed from the

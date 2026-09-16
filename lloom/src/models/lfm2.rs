@@ -8524,6 +8524,48 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
         self.verify_tokens_complete(pending, cache, eos_ids)
     }
 
+    type PendingRows = PendingRows;
+
+    fn verify_rows_enqueue(
+        &self,
+        rows: &mut [crate::nn::VerifyRowRef<'_, Self::Cache>],
+    ) -> Result<PendingRows> {
+        // The drafts as device ids, one tensor per row (a host draft is
+        // uploaded; a device one is taken as it is).
+        let ids: Vec<Tensor> = rows
+            .iter()
+            .map(|r| match &r.draft.tokens {
+                crate::nn::DraftTokens::Host(v) => {
+                    if v.is_empty() {
+                        lloom_tensor::bail!("lfm2 verify_rows_enqueue: a row proposes no tokens")
+                    }
+                    Tensor::new(v.as_slice(), &r.cache.device)
+                }
+                crate::nn::DraftTokens::Device(t) => Ok(t.clone()),
+            })
+            .collect::<Result<_>>()?;
+        let mut vrows: Vec<VerifyRow<'_>> = rows
+            .iter_mut()
+            .zip(ids.iter())
+            .map(|(r, t)| VerifyRow {
+                cache: &mut *r.cache,
+                last: r.anchor.last,
+                pos: r.anchor.pos,
+                proposed: t,
+            })
+            .collect();
+        Model::verify_rows_enqueue(self, &mut vrows)
+    }
+
+    fn verify_rows_complete(
+        &self,
+        pending: PendingRows,
+        caches: &mut [&mut Self::Cache],
+        eos_ids: &[u32],
+    ) -> Result<Vec<(Vec<u32>, Vec<Tensor>)>> {
+        Model::verify_rows_complete(self, pending, caches, eos_ids)
+    }
+
     fn take_probe(&self, cache: &mut Self::Cache) -> Result<Vec<Tensor>> {
         Ok(cache.take_taps())
     }

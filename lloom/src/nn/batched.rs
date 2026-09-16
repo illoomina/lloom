@@ -45,8 +45,8 @@ use lloom_tensor::{Device, Result, Tensor};
 /// slot's next occupant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RowId {
-    slot: usize,
-    generation: u64,
+    pub(crate) slot: usize,
+    pub(crate) generation: u64,
 }
 
 impl RowId {
@@ -118,6 +118,88 @@ pub struct StepReport {
     pub retired: usize,
     /// Rows still pending admission — arrived but their prompt not yet fed.
     pub pending: usize,
+}
+
+/// What a scheduler drives, step by step: rows admitted at any step,
+/// cancelled, retired with their outcome — the K=1 batched loop
+/// ([`BatchDecoder`]) or the speculative one
+/// ([`SpecBatchDecoder`](crate::nn::SpecBatchDecoder)), one surface
+/// (`batched-decode-design.md` §12.4).
+pub trait RowDriver<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> {
+    #[allow(clippy::too_many_arguments)]
+    fn admit_with_eos(
+        &mut self,
+        session: R,
+        prompt: Vec<u32>,
+        sampling: Sampling,
+        seed: u64,
+        eos_ids: &[u32],
+        max_tokens: usize,
+    ) -> Result<RowId>;
+    fn step(&mut self, on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>) -> Result<StepReport>;
+    fn cancel(&mut self, id: RowId) -> bool;
+    fn take_finished(&mut self) -> Vec<(RowId, R, DecodeOut)>;
+    fn drain_rows(&mut self) -> Vec<R>;
+    fn is_idle(&self) -> bool;
+    fn rows(&self) -> usize;
+    fn live_rows(&self) -> usize;
+    fn pending_rows(&self) -> usize;
+    fn row_ids(&self) -> Vec<RowId>;
+    fn row_source(&self, id: RowId) -> Option<(&[u32], &M::Cache, bool)>;
+    fn row_prospective_log(&self, id: RowId) -> Option<Vec<u32>>;
+    fn holds(&self, id: RowId) -> bool;
+}
+
+impl<'m, M: BatchedCausalLM + 'm, R: BorrowMut<Session<'m, M>>> RowDriver<'m, M, R>
+    for BatchDecoder<'m, M, R>
+{
+    fn admit_with_eos(
+        &mut self,
+        session: R,
+        prompt: Vec<u32>,
+        sampling: Sampling,
+        seed: u64,
+        eos_ids: &[u32],
+        max_tokens: usize,
+    ) -> Result<RowId> {
+        BatchDecoder::admit_with_eos(self, session, prompt, sampling, seed, eos_ids, max_tokens)
+    }
+    fn step(&mut self, on_tokens: &mut dyn FnMut(RowId, &[u32]) -> Result<()>) -> Result<StepReport> {
+        BatchDecoder::step(self, on_tokens)
+    }
+    fn cancel(&mut self, id: RowId) -> bool {
+        BatchDecoder::cancel(self, id)
+    }
+    fn take_finished(&mut self) -> Vec<(RowId, R, DecodeOut)> {
+        BatchDecoder::take_finished(self)
+    }
+    fn drain_rows(&mut self) -> Vec<R> {
+        BatchDecoder::drain_rows(self)
+    }
+    fn is_idle(&self) -> bool {
+        BatchDecoder::is_idle(self)
+    }
+    fn rows(&self) -> usize {
+        BatchDecoder::rows(self)
+    }
+    fn live_rows(&self) -> usize {
+        BatchDecoder::live_rows(self)
+    }
+    fn pending_rows(&self) -> usize {
+        BatchDecoder::pending_rows(self)
+    }
+    fn row_ids(&self) -> Vec<RowId> {
+        BatchDecoder::row_ids(self)
+    }
+    fn row_source(&self, id: RowId) -> Option<(&[u32], &M::Cache, bool)> {
+        BatchDecoder::row_source(self, id)
+    }
+    fn row_prospective_log(&self, id: RowId) -> Option<Vec<u32>> {
+        BatchDecoder::row_prospective_log(self, id)
+    }
+    fn holds(&self, id: RowId) -> bool {
+        BatchDecoder::holds(self, id)
+    }
 }
 
 /// The batched decode loop, one step at a time.

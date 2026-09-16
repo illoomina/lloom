@@ -2018,7 +2018,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// skipped; `probe_drops` is checked across the seed so that is a refusal
     /// rather than a lower accept rate nothing else sees (§10.2w). The third
     /// element is the number of forwards taken (`DecodeStats::prefill_units`).
-    fn prefill_streamed<S>(
+    pub(crate) fn prefill_streamed<S>(
         &mut self,
         spec: &mut S,
         seq: SeqId,

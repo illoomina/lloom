@@ -60,7 +60,43 @@ struct Single {
 
 /// The drafter the batch thread holds (`--dspark --batch N`): the static
 /// body's and the closed jobs'.
-pub type Extra = Option<DSparkSpeculator>;
+/// The batch thread's proposers: one for the closed cells (the static
+/// pipelined body, `decode_spec_batched`), one the continuous speculative
+/// driver takes for itself at start (`MakeDriver`). Two drafters, so a cell
+/// can run while the continuous driver holds its own — the cost of one
+/// drafter's weights again (`batched-decode-design.md` §12.4).
+pub struct Speculators {
+    pub closed: Option<DSparkSpeculator>,
+    pub continuous: Option<DSparkSpeculator>,
+    /// The continuous driver's EOS set (the verify's accept rule reads one
+    /// set per batch).
+    pub eos_ids: Vec<u32>,
+}
+
+impl lloom_engine::MakeDriver<Model> for Speculators {
+    fn make_driver<'m>(
+        &mut self,
+        model: &'m Model,
+        opts: &DecodeOptions,
+        device: &Device,
+    ) -> lloom_tensor::Result<Option<lloom_engine::Driver<'m, Model>>> {
+        let _ = model;
+        match self.continuous.take() {
+            Some(spec) => {
+                let dec = lloom::nn::SpecBatchDecoder::<'m, Model, DSparkSpeculator, Session<'m, Model>>::new(
+                    spec,
+                    opts.clone(),
+                    &self.eos_ids,
+                    device.clone(),
+                )?;
+                Ok(Some(Box::new(dec)))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+pub type Extra = Speculators;
 
 /// Text: the tokenizer, the checkpoint's own chat template, and the ids the
 /// requests are shaped by.
@@ -175,7 +211,7 @@ impl RowsArm {
         }
     }
 
-    fn pooled(self) -> bool {
+    pub fn pooled(self) -> bool {
         matches!(self, Self::Pool | Self::PoolPerRow)
     }
 }
@@ -283,15 +319,8 @@ impl Engine {
             anyhow::bail!("--share-prefix needs `--batch N --rows pool` (the rows share one pool)");
         }
         match &dcfg {
-            Some(dcfg) => {
-                if pooled {
-                    anyhow::bail!(
-                        "--rows pool is the K=1 batched loop's; `--dspark --batch N` runs the \
-                         static pipelined driver on private rewindable caches (--rows private)"
-                    );
-                }
-                rewindable_config(&mut config, dcfg)
-            }
+            Some(dcfg) if pooled => pool_spec_config(&mut config, dcfg),
+            Some(dcfg) => rewindable_config(&mut config, dcfg),
             None if pooled => pool_config(&mut config),
             None => crown_config(&mut config),
         }
@@ -499,10 +528,20 @@ impl Engine {
             }
         }
         let pool = SlotPool::new(opts.batch, || caches.pop().expect("one cache per slot"));
-        let extra: Extra = if dcfg.is_some() {
-            Some(build_spec(opts.batch)?)
-        } else {
-            None
+        // The closed cells' proposer, and — on the pool arms — the continuous
+        // driver's own (two drafters; §12.4).
+        let extra: Extra = Speculators {
+            closed: if dcfg.is_some() {
+                Some(build_spec(opts.batch)?)
+            } else {
+                None
+            },
+            continuous: if dcfg.is_some() && pooled {
+                Some(build_spec(opts.batch)?)
+            } else {
+                None
+            },
+            eos_ids: engine.text.eos_ids.clone(),
         };
         let batch_opts = DecodeOptions {
             lookahead: 1,
@@ -510,7 +549,9 @@ impl Engine {
             prefill_chunk: opts.prefill_chunk,
             ..DecodeOptions::new(0)
         };
-        let mode: BatchMode<Model, Extra> = if dcfg.is_some() {
+        // `--dspark` on private caches runs the static pipelined driver; on
+        // the pool arms the continuous speculative driver (§12.4).
+        let mode: BatchMode<Model, Extra> = if dcfg.is_some() && !pooled {
             BatchMode::Static(Box::new(static_dspark_body))
         } else {
             BatchMode::Continuous
@@ -849,6 +890,7 @@ impl Engine {
         let tile = self.prefill_tile;
         let chunk = self.prefill_chunk;
         let dspark = self.dspark_k.is_some();
+        let pooled = self.rows.pooled();
         let gauge = MemGauge::start(&self.core.device, self.mem_sample);
         let (elapsed, forwards) = self.closed(move |idle| -> Result<(Duration, usize)> {
             with_sessions(idle, batch, |idle, sessions| {
@@ -860,10 +902,15 @@ impl Engine {
                     // of output per row.
                     let spec = idle
                         .extra
+                        .closed
                         .as_mut()
                         .context("no drafter on the batch thread")?;
-                    let opts = DecodeOptions::new(1);
-                    let outs = Session::decode_speculative_pipelined(
+                    let opts = DecodeOptions {
+                        prefill_tile: tile,
+                        ..DecodeOptions::new(1)
+                    };
+                    let outs = run_spec_rows(
+                        pooled,
                         sessions,
                         spec,
                         &refs,
@@ -929,6 +976,7 @@ impl Engine {
             .collect();
         let tile = self.prefill_tile;
         let dspark_k = self.dspark_k;
+        let pooled = self.rows.pooled();
         let gauge = MemGauge::start(&self.core.device, self.mem_sample);
         let mut timing = self.closed(move |idle| -> Result<DecodeTiming> {
             with_sessions(idle, batch, |idle, sessions| {
@@ -941,11 +989,16 @@ impl Engine {
                         // the prefills' GPU tail is inside the bracket.
                         let spec = idle
                             .extra
+                            .closed
                             .as_mut()
                             .context("no drafter on the batch thread")?;
-                        let opts = DecodeOptions::new(decode_tokens);
+                        let opts = DecodeOptions {
+                            prefill_tile: tile,
+                            ..DecodeOptions::new(decode_tokens)
+                        };
                         let t = Instant::now();
-                        let outs = Session::decode_speculative_pipelined(
+                        let outs = run_spec_rows(
+                            pooled,
                             sessions,
                             spec,
                             &refs,
@@ -1278,6 +1331,27 @@ fn take_sessions<'m>(idle: &mut Idle<'_, 'm, Model, Extra>, n: usize) -> Result<
 /// through the one drafter (`Session::decode_speculative_pipelined`, §10.2y).
 /// Greedy, one EOS set per batch — mixed sets are refused rather than served
 /// under the first row's.
+/// A closed speculative run over `sessions`: the batched loop
+/// (`decode_spec_batched`, one target pass per round) on the pool arms, the
+/// static pipelined driver on private caches.
+#[allow(clippy::too_many_arguments)]
+fn run_spec_rows<'m>(
+    pooled: bool,
+    sessions: &mut [Session<'m, Model>],
+    spec: &mut DSparkSpeculator,
+    prompts: &[&[u32]],
+    opts: &DecodeOptions,
+    eos_ids: &[u32],
+    device: &Device,
+    on_tokens: &mut dyn FnMut(usize, &[u32]) -> lloom_tensor::Result<()>,
+) -> lloom_tensor::Result<Vec<lloom::nn::DecodeOut>> {
+    if pooled {
+        Session::decode_spec_batched(sessions, spec, prompts, opts, eos_ids, device, on_tokens)
+    } else {
+        Session::decode_speculative_pipelined(sessions, spec, prompts, opts, eos_ids, device, on_tokens)
+    }
+}
+
 fn static_dspark_body<'a, 'm>(
     idle: &mut Idle<'a, 'm, Model, Extra>,
     sessions: &mut [Session<'m, Model>],
@@ -1287,6 +1361,7 @@ fn static_dspark_body<'a, 'm>(
 ) -> lloom_tensor::Result<Vec<DecodeOut>> {
     let spec = idle
         .extra
+        .closed
         .as_mut()
         .ok_or_else(|| lloom_tensor::Error::msg("no drafter on the batch thread"))?;
     let first = specs
@@ -1536,6 +1611,20 @@ fn pool_config(config: &mut Config) {
     config.gemv_silu = true;
     config.gemv_residual = true;
     config.conv_fused = true;
+}
+
+/// The pool arms under `--dspark` (§12.4): the paged pool and the flash
+/// read, a ring wide enough for the verify window, the drafter's taps.
+fn pool_spec_config(config: &mut Config, dcfg: &DSparkConfig) {
+    let k = dcfg.max_draft();
+    config.attn_impl = AttnImpl::FlashDecoding;
+    config.kv_append = KvAppend::Paged;
+    config.conv_state = ConvState::RotatingRing { k: k + 1 };
+    config.gemv_silu = true;
+    config.gemv_residual = true;
+    config.conv_fused = true;
+    config.tap_dtype = DType::F32;
+    config.tap_layers = dcfg.tap_layers();
 }
 
 fn crown_config(config: &mut Config) {

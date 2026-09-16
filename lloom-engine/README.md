@@ -90,7 +90,27 @@ runner exports), else a built-in paragraph.
 Flags: `--kv-capacity` (positions per request, default 8704 = the ladder's
 8192 + 256 + slack; a request past it is refused, not reallocated),
 `--readback auto|ring|blocking`, `--reuse-prefix` (off: a benchmark measures a
-cold prefill), `--no-warmup`, `--cpu`, `--model-name`, and the two below.
+cold prefill), `--no-warmup`, `--cpu`, `--model-name`, the two below, and the
+memory guards:
+
+- `--prefill-tile` (default **512**, every path): the most prompt tokens one
+  prefill forward takes. A prefill's activation working set is bounded by the
+  tile — two tiles' worth, ~4.5 GB at 512 — rather than by the prompt; one
+  forward over the whole prompt is ~3.9 MB of `pending` activation per token
+  (37.8 GB at 8192 measured, and a 32k one-shot cell is what panicked this
+  machine, #148). Every multi-tile prefill is paced against the GPU on every
+  readback arm. `0` is the one-shot, admitted only if the budget below allows
+  the KV ceiling's worth of activations.
+- `--memory-fraction` (default 0.65; `0` = off): `MemoryBudget` admission —
+  the weights, the KV ceiling's cache, the tile's activations and the scratch
+  are predicted at load against `recommendedMaxWorkingSetSize` and refused with
+  the reductions listed if they do not fit; a KV grow past the fraction is
+  refused at the grow.
+- `--mem-sample`: hold the memory gauges' peaks over every benchmark cell at
+  10 ms and put them on the response (`mem`: `device_allocated`, the pool's
+  live / free / `pending`, `phys_footprint`, `recommendedMaxWorkingSetSize`,
+  before / peak / after). A gauge run, not a timing run. `GET /health` reads the
+  gauges once at any time.
 
 ### `--batch N` — continuous batching (issue #148)
 

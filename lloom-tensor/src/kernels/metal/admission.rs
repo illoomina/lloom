@@ -375,6 +375,13 @@ pub struct Budget {
     pub max_seq_len: usize,
     /// Model geometry for the activation class. LFM2's by default (§5.2).
     pub prefill_geometry: PrefillGeometry,
+    /// The rows the activation class is computed for: `batch` (the default,
+    /// `None`) when every row runs its own forward; `Some(1)` for a serving
+    /// loop whose step is ONE ragged forward over all rows' tokens
+    /// (`BatchedCausalLM::forward_ragged`, issue #148) — there the activation
+    /// working set is one forward of `max_seq_len` tokens, not `batch` of
+    /// them, while KV and conv state stay per row.
+    pub activation_rows: Option<usize>,
 }
 
 impl Budget {
@@ -396,6 +403,7 @@ impl Budget {
             // prefills says so; see [`Budget::with_prefill`].
             max_seq_len: 1,
             prefill_geometry: PrefillGeometry::default(),
+            activation_rows: None,
         }
     }
 
@@ -437,7 +445,7 @@ impl Budget {
             // quadratic term §13.2b identifies and §13.4c measured.
             activations: prefill_activation_bytes(
                 self.max_seq_len,
-                self.batch,
+                self.activation_rows.unwrap_or(self.batch),
                 self.prefill_geometry,
             ),
             scratch,

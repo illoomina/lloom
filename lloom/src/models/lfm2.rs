@@ -657,6 +657,12 @@ pub struct MemoryBudget {
     /// the same honest limit: the contract is checkable and the caller still
     /// has to state it.
     pub max_seq_len: usize,
+    /// The rows the activation class is computed for — `None` = `batch`
+    /// (every row its own forward); `Some(1)` for the batched serving loop,
+    /// whose step is one ragged forward over every row's tokens
+    /// (`admission::Budget::activation_rows`, issue #148). KV and conv state
+    /// are per row either way.
+    pub activation_rows: Option<usize>,
 }
 
 impl MemoryBudget {
@@ -690,6 +696,7 @@ impl MemoryBudget {
             // Decode. #306: see the field's own doc comment for why this is 1
             // and not `max_position_embeddings`.
             max_seq_len: 1,
+            activation_rows: None,
         }
     }
 
@@ -2995,6 +3002,7 @@ impl Cache {
         // not a constant. Taken from the caller because admission runs before
         // any pass exists to measure -- see `MemoryBudget::max_seq_len`.
         b.max_seq_len = budget.max_seq_len;
+        b.activation_rows = budget.activation_rows;
         // The geometry that class is computed from, taken from `Config` rather
         // than from `PrefillGeometry::default()` so a model with different
         // dimensions is sized correctly and cannot silently inherit LFM2's.

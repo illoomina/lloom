@@ -253,6 +253,13 @@ impl Engine {
             } else {
                 opts.kv_capacity
             });
+            if opts.batch > 1 {
+                // The scheduler's step is ONE ragged forward: the chunk's
+                // prompt tokens plus one token per live row, whatever `N` —
+                // not `N` forwards of a tile each. KV and conv stay per row.
+                budget.max_seq_len += opts.batch;
+                budget.activation_rows = Some(1);
+            }
             config.memory_budget = Some(budget);
         }
 

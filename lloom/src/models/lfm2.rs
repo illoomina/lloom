@@ -4994,7 +4994,7 @@ impl Attention {
     fn rows_share_a_pool<'a>(&self, caches: impl Iterator<Item = &'a Cache>, dtype: DType) -> bool {
         let mut first: Option<&Cache> = None;
         for c in caches {
-            if c.batch.is_none() || !c.use_kv_cache || c.kv_quant.is_on() || !c.tap_layers.is_empty() {
+            if c.batch.is_none() || !c.use_kv_cache || c.kv_quant.is_on() {
                 return false;
             }
             match first {
@@ -6224,7 +6224,7 @@ impl ShortConv {
         }
         let mut first: Option<&Cache> = None;
         for c in caches {
-            if c.batch.is_none() || !c.use_kv_cache || c.speculative {
+            if c.batch.is_none() || !c.use_kv_cache {
                 return false;
             }
             match first {
@@ -7478,6 +7478,30 @@ impl Model {
         input_ids: &Tensor,
         rows: &mut [RaggedRow<'_, Cache>],
     ) -> Result<Tensor> {
+        self.forward_ragged_impl(input_ids, rows, false, false)
+    }
+
+    /// [`Self::forward_ragged`] for a SPECULATIVE round over several rows
+    /// (`batched-decode-design.md` §12.4): every row's window is open
+    /// (`Cache::advance`), the result is `[1, T, vocab]` — every position's
+    /// logits, the verify's — and each row's layer-input taps are taken over
+    /// its own span (`Cache::take_taps`, per row), so the drafter is fed per
+    /// row exactly what a one-row verify feeds it.
+    pub fn forward_ragged_all(
+        &self,
+        input_ids: &Tensor,
+        rows: &mut [RaggedRow<'_, Cache>],
+    ) -> Result<Tensor> {
+        self.forward_ragged_impl(input_ids, rows, true, true)
+    }
+
+    fn forward_ragged_impl(
+        &self,
+        input_ids: &Tensor,
+        rows: &mut [RaggedRow<'_, Cache>],
+        all_positions: bool,
+        speculative: bool,
+    ) -> Result<Tensor> {
         let (b_sz, total) = input_ids.dims2()?;
         if b_sz != 1 {
             lloom_tensor::bail!("lfm2 forward_ragged: the input is `[1, T]`, got batch {b_sz}")
@@ -7494,16 +7518,12 @@ impl Model {
         }
         let mut plans = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter_mut().enumerate() {
-            if !row.cache.tap_layers.is_empty() {
+            if row.cache.speculative != speculative {
                 lloom_tensor::bail!(
-                    "lfm2 forward_ragged: row {r}'s cache taps layers {:?}; a batched pass does \
-                     not tap",
-                    row.cache.tap_layers
-                )
-            }
-            if row.cache.speculative {
-                lloom_tensor::bail!(
-                    "lfm2 forward_ragged: row {r}'s cache has an open speculative window"
+                    "lfm2 forward_ragged: row {r}'s cache {} an open speculative window; this \
+                     pass is {}",
+                    if row.cache.speculative { "has" } else { "has not" },
+                    if speculative { "a verify (open every row first)" } else { "not a verify" }
                 )
             }
             plans.push(row.cache.plan_pass(row.len)?);
@@ -7529,11 +7549,17 @@ impl Model {
         let device = rows[0].cache.device.clone();
         for (block_idx, layer) in self.layers.iter().enumerate() {
             mark_graph_node(&device, block_idx);
+            Self::tap_layer_input_rows(&hidden_states, block_idx, rows)?;
             hidden_states = layer.forward_ragged(&hidden_states, block_idx, rows)?;
         }
 
-        // Each row's last position, gathered in row order.
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
+        if all_positions {
+            let logits = self.lm_head.forward(&hidden_states.contiguous()?)?;
+            return logits.to_dtype(DType::F32);
+        }
+
+        // Each row's last position, gathered in row order.
         let mut last = Vec::with_capacity(rows.len());
         let mut off = 0u32;
         for row in rows.iter() {
@@ -7835,6 +7861,25 @@ impl Model {
     /// ascending — so the slot is where the *consumer* expects this layer, and
     /// the loop's own order is irrelevant. A layer listed twice fills both its
     /// slots, which is what a consumer asking for it twice means.
+    /// [`Self::tap_layer_input`] over a ragged pass: row `r`'s taps are its
+    /// span of the `[1, T, hidden]` residual, so each row's probe is what a
+    /// one-row pass would have tapped.
+    fn tap_layer_input_rows(
+        hidden: &Tensor,
+        block_idx: usize,
+        rows: &mut [RaggedRow<'_, Cache>],
+    ) -> Result<()> {
+        let mut off = 0usize;
+        for row in rows.iter_mut() {
+            if !row.cache.tap_layers.is_empty() && row.cache.tap_layers.contains(&block_idx) {
+                let span = hidden.narrow(1, off, row.len)?;
+                Self::tap_layer_input(&span, block_idx, row.cache)?;
+            }
+            off += row.len;
+        }
+        Ok(())
+    }
+
     fn tap_layer_input(hidden: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<()> {
         if cache.tap_layers.is_empty() {
             return Ok(());
@@ -8151,6 +8196,138 @@ impl Model {
 /// prefix running past an EOS the drafter happened to propose would feed all
 /// three with tokens the sequence does not have (§10.2z-ii). An empty set draws
 /// no boundary.
+/// The receipt of a ragged verify over several rows (`Model::verify_rows_enqueue`).
+pub struct PendingRows {
+    toks: Vec<SpecToken>,
+    ks: Vec<usize>,
+    /// `[argmax over every window position (T), every row's proposed (Σk)]`.
+    both: lloom_tensor::StagedRead,
+    /// Per row, its taps over its window.
+    taps: Vec<Vec<Tensor>>,
+}
+
+/// One row of a ragged verify: its cache, the anchor (last committed token
+/// and the window's position) and the proposed ids (`[k]`, U32, on the
+/// device).
+pub struct VerifyRow<'a> {
+    pub cache: &'a mut Cache,
+    pub last: u32,
+    pub pos: usize,
+    pub proposed: &'a Tensor,
+}
+
+impl Model {
+    /// The verify of several rows' windows as ONE ragged pass
+    /// (`batched-decode-design.md` §12.4): every row's window opened, the
+    /// `[last, proposed…]` runs laid end to end, one forward over all of
+    /// them, the argmax of every position and the proposals staged behind
+    /// the pass. Nothing waits for the GPU; [`Self::verify_rows_complete`]
+    /// reads back. Per row it is [`Self::verify_tokens_enqueue`]'s
+    /// arithmetic — the same window against the same cache.
+    pub fn verify_rows_enqueue(&self, rows: &mut [VerifyRow<'_>]) -> Result<PendingRows> {
+        if rows.is_empty() {
+            lloom_tensor::bail!("lfm2 verify_rows_enqueue: no rows")
+        }
+        let device = rows[0].cache.device.clone();
+        let mut toks = Vec::with_capacity(rows.len());
+        let mut ks = Vec::with_capacity(rows.len());
+        let mut pieces = Vec::with_capacity(rows.len());
+        let mut proposed_all = Vec::with_capacity(rows.len());
+        for row in rows.iter_mut() {
+            let k = row.proposed.dims1()?;
+            if k == 0 {
+                lloom_tensor::bail!("lfm2 verify_rows_enqueue: a row proposes no tokens")
+            }
+            if row.proposed.dtype() != DType::U32 {
+                lloom_tensor::bail!(
+                    "lfm2 verify_rows_enqueue: proposals must be U32 ids, got {:?}",
+                    row.proposed.dtype()
+                )
+            }
+            toks.push(row.cache.advance(k + 1)?);
+            ks.push(k);
+            let anchor = row.cache.anchor_tensor(row.last)?;
+            pieces.push(Tensor::cat(&[&anchor, row.proposed], 0)?);
+            proposed_all.push(row.proposed.clone());
+        }
+        let input = Tensor::cat(&pieces, 0)?.unsqueeze(0)?;
+        let mut ragged: Vec<RaggedRow<'_, Cache>> = rows
+            .iter_mut()
+            .zip(ks.iter())
+            .map(|(row, &k)| RaggedRow {
+                pos: row.pos,
+                len: k + 1,
+                cache: &mut *row.cache,
+            })
+            .collect();
+        let logits = self.forward_ragged_all(&input, &mut ragged)?;
+        drop(ragged);
+        let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
+        let mut both_parts: Vec<Tensor> = vec![argmax];
+        both_parts.extend(proposed_all);
+        let both = Tensor::cat(&both_parts, 0)?.stage_read()?;
+        let taps = rows
+            .iter_mut()
+            .map(|row| row.cache.take_taps())
+            .collect();
+        let _ = device;
+        Ok(PendingRows {
+            toks,
+            ks,
+            both,
+            taps,
+        })
+    }
+
+    /// Read back a ragged verify: per row its accepted tokens (never empty)
+    /// and its probe trimmed to them, the cache resolved to the accepted
+    /// length — [`Self::verify_tokens_complete`] per row.
+    pub fn verify_rows_complete(
+        &self,
+        pending: PendingRows,
+        caches: &mut [&mut Cache],
+        eos_ids: &[u32],
+    ) -> Result<Vec<(Vec<u32>, Vec<Tensor>)>> {
+        let PendingRows {
+            toks,
+            ks,
+            both,
+            taps,
+        } = pending;
+        if caches.len() != toks.len() {
+            lloom_tensor::bail!(
+                "lfm2 verify_rows_complete: {} caches for a verify of {} rows",
+                caches.len(),
+                toks.len()
+            )
+        }
+        let both = both.to_vec1::<u32>()?;
+        let t: usize = ks.iter().map(|k| k + 1).sum();
+        let (argmax_all, proposed_all) = both.split_at(t);
+        let mut out = Vec::with_capacity(caches.len());
+        let (mut off_a, mut off_p) = (0usize, 0usize);
+        for ((r, cache), tok) in caches.iter_mut().enumerate().zip(toks.into_iter()) {
+            let k = ks[r];
+            let argmax = &argmax_all[off_a..off_a + k + 1];
+            let proposed = &proposed_all[off_p..off_p + k];
+            off_a += k + 1;
+            off_p += k;
+            let accepted = accept_prefix(argmax, proposed, eos_ids);
+            cache.resolve(tok, accepted.len())?;
+            let n_acc = accepted.len();
+            let probe = taps[r]
+                .iter()
+                .map(|t| {
+                    let seq = t.dim(1)?;
+                    t.narrow(1, 0, n_acc.min(seq))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            out.push((accepted, probe));
+        }
+        Ok(out)
+    }
+}
+
 pub fn accept_prefix(argmax: &[u32], proposed: &[u32], eos_ids: &[u32]) -> Vec<u32> {
     let k = proposed.len();
     debug_assert_eq!(argmax.len(), k + 1, "argmax covers the k + 1 window");

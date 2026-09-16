@@ -804,3 +804,142 @@ mod prefix_share {
         Ok(())
     }
 }
+
+#[cfg(feature = "metal")]
+mod ragged_verify {
+    use super::*;
+    use lloom::models::lfm2::{AttnImpl, BatchPool, VerifyRow};
+
+    /// The pool's arms with a speculative ring (K = 2 drafts + the anchor)
+    /// and two tapped layers, as a DSpark target has.
+    fn verify_config() -> Config {
+        let mut cfg = tiny_config_on(ConvState::RotatingRing { k: 3 });
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.kv_append = KvAppend::Paged;
+        cfg.attn_impl = AttnImpl::FlashDecoding;
+        cfg.flash_page_size = 32;
+        cfg.flash_pages_per_chunk = 1;
+        cfg.conv_fused = true;
+        cfg.conv_prefill_ctx = true;
+        cfg.tap_layers = vec![1, 3];
+        cfg.tap_dtype = DType::F32;
+        cfg
+    }
+
+    fn bits(t: &Tensor) -> Result<Vec<u32>> {
+        Ok(t.to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect())
+    }
+
+    /// Three rows' windows verified as one ragged pass (the batched arms on)
+    /// against each row's own `verify_tokens_enqueue`/`complete` on a pool
+    /// with the arms off: the accepted tokens, the probes (per row, trimmed)
+    /// and a decode step after the resolve — bit for bit.
+    #[test]
+    fn a_ragged_verify_is_each_rows_own_verify_bit_for_bit() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = verify_config();
+        let eos = [7u32];
+        for dtype in [DType::F32, DType::F16] {
+            let model = build(&cfg, dtype, &dev)?;
+            let rows = pool_rows_for_verify();
+            // Two pools, one per arm, the same three rows prefilled the same way.
+            let mut arms = Vec::new();
+            for batched in [false, true] {
+                let pool = BatchPool::new(&cfg, &dev, 4, 128)?;
+                pool.set_batched_arms(batched);
+                let mut caches = Vec::new();
+                for (prompt, _) in &rows {
+                    let mut c = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+                    let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
+                    let _ = model.forward(&input, 0, &mut c)?;
+                    let _ = c.take_taps();
+                    caches.push(c);
+                }
+                arms.push((pool, caches));
+            }
+            // The drafts: two tokens per row; row 0's first draft is the
+            // target's own prediction (found by a throwaway one-row verify),
+            // so it accepts past position 0; the others are arbitrary.
+            let lasts: Vec<u32> = rows.iter().map(|(_, n)| *n).collect();
+            let predicted = {
+                let pool = BatchPool::new(&cfg, &dev, 1, 128)?;
+                let mut c = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+                let input = Tensor::new(rows[0].0.as_slice(), &dev)?.unsqueeze(0)?;
+                let _ = model.forward(&input, 0, &mut c)?;
+                let _ = c.take_taps();
+                let proposed = Tensor::new(&[0u32, 0], &dev)?;
+                let pending = model.verify_tokens_enqueue(lasts[0], &proposed, rows[0].0.len(), &mut c)?;
+                let (accepted, _) = model.verify_tokens_complete(pending, &mut c, &eos)?;
+                accepted[0]
+            };
+            let drafts: Vec<Vec<u32>> = vec![vec![predicted, 33], vec![3, 3], vec![21, 40]];
+
+            // Reference: per row, the one-row verify (arms off).
+            let (_, ref_caches) = &mut arms[0];
+            let mut want = Vec::new();
+            for (r, c) in ref_caches.iter_mut().enumerate() {
+                let proposed = Tensor::new(drafts[r].as_slice(), &dev)?;
+                let pending = model.verify_tokens_enqueue(lasts[r], &proposed, rows[r].0.len(), c)?;
+                let (accepted, probe) = model.verify_tokens_complete(pending, c, &eos)?;
+                want.push((accepted, probe));
+            }
+            // Subject: the ragged verify (arms on).
+            let (pool_on, sub_caches) = &mut arms[1];
+            let proposed: Vec<Tensor> = drafts
+                .iter()
+                .map(|d| Tensor::new(d.as_slice(), &dev))
+                .collect::<Result<_>>()?;
+            let mut vrows: Vec<VerifyRow<'_>> = sub_caches
+                .iter_mut()
+                .enumerate()
+                .map(|(r, c)| VerifyRow {
+                    cache: c,
+                    last: lasts[r],
+                    pos: rows[r].0.len(),
+                    proposed: &proposed[r],
+                })
+                .collect();
+            let pending = model.verify_rows_enqueue(&mut vrows)?;
+            drop(vrows);
+            let mut refs: Vec<&mut Cache> = sub_caches.iter_mut().collect();
+            let got = model.verify_rows_complete(pending, &mut refs, &eos)?;
+            drop(refs);
+            assert!(pool_on.shared_calls() > 0, "the batched arms ran the verify");
+
+            for r in 0..rows.len() {
+                assert_eq!(got[r].0, want[r].0, "row {r} accepted ({dtype:?})");
+                assert!(!got[r].0.is_empty());
+                assert_eq!(got[r].1.len(), want[r].1.len(), "row {r} probe count");
+                for (a, b) in got[r].1.iter().zip(want[r].1.iter()) {
+                    assert_eq!(a.dims(), b.dims(), "row {r} probe shape");
+                    assert_eq!(bits(a)?, bits(b)?, "row {r} probe bits ({dtype:?})");
+                }
+            }
+            // At least one row accepted past position 0 and one did not.
+            let ns: Vec<usize> = got.iter().map(|(a, _)| a.len()).collect();
+            assert!(ns.iter().any(|&n| n > 1) && ns.iter().any(|&n| n == 1), "accepted {ns:?}");
+
+            // A decode step after the resolve, per row, both arms per-row.
+            for r in 0..rows.len() {
+                let next = *got[r].0.last().unwrap();
+                let pos = rows[r].0.len() + got[r].0.len();
+                let input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
+                let a = model.forward(&input, pos, &mut arms[0].1[r])?;
+                let b = model.forward(&input, pos, &mut arms[1].1[r])?;
+                assert_eq!(bits(&a)?, bits(&b)?, "row {r} step after ({dtype:?})");
+            }
+        }
+        Ok(())
+    }
+
+    fn pool_rows_for_verify() -> Vec<(Vec<u32>, u32)> {
+        let long: Vec<u32> = (0..36u32).map(|i| (i * 7 + 3) % 48).collect();
+        vec![(vec![3, 11, 20, 5, 9], 12), (vec![40, 2], 33), (long, 21)]
+    }
+}

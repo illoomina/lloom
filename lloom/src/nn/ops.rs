@@ -843,7 +843,9 @@ fn shortconv_ring_impl(
                 );
             }
             if !rs.is_contiguous() || !rp.is_contiguous() {
-                lloom_tensor::bail!("shortconv_ring_rows: row_slots and row_phases must be contiguous");
+                lloom_tensor::bail!(
+                    "shortconv_ring_rows: row_slots and row_phases must be contiguous"
+                );
             }
         }
         if seq_len == 0 || seq_len > width {
@@ -1759,7 +1761,9 @@ impl Module for Identity {
 /// `entries` holds every sequence's table, `stride` entries each — entry
 /// `b * stride + i` is the page holding sequence `b`'s keys
 /// `[i * page_size, (i + 1) * page_size)` — and `n_keys` is the live length,
-/// the same for every sequence, which the pool's token axis no longer carries.
+/// which the pool's token axis no longer carries: one entry every sequence
+/// reads, or one per sequence for a ragged batch (rows of different live
+/// lengths in one dispatch, `batched-decode-design.md` §12.2 change 3).
 /// `PagedTable`'s shape one kernel over: that one is indexed by CHUNK for the
 /// decode kernel, this one by PAGE for the tiled kernel's key blocks.
 #[derive(Debug, Clone)]
@@ -1768,7 +1772,22 @@ struct SdpaPagedTable {
     entries: Vec<u32>,
     stride: usize,
     page_size: usize,
-    n_keys: usize,
+    n_keys: Vec<u32>,
+}
+
+#[allow(dead_code)]
+impl SdpaPagedTable {
+    fn max_keys(&self) -> usize {
+        self.n_keys.iter().copied().max().unwrap_or(0) as usize
+    }
+
+    fn keys_of(&self, b: usize) -> usize {
+        if self.n_keys.len() == 1 {
+            self.n_keys[0] as usize
+        } else {
+            self.n_keys.get(b).copied().unwrap_or(0) as usize
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -1929,15 +1948,24 @@ impl lloom_tensor::CustomOp3 for Sdpa {
                 );
             }
             let slots = k_l.dim(2)?;
-            if p.n_keys == 0 || p.n_keys > slots || q_seq > p.n_keys {
+            let b_sz = q_l.dim(0)?;
+            if p.n_keys.len() != 1 && p.n_keys.len() != b_sz {
                 lloom_tensor::bail!(
-                    "sdpa over a page pool: {} live keys for {q_seq} queries against a pool of \
-                     {slots} slots",
-                    p.n_keys
+                    "sdpa over a page pool: {} live key counts for {b_sz} sequences (one for the \
+                     batch, or one per row)",
+                    p.n_keys.len()
                 );
             }
-            let b_sz = q_l.dim(0)?;
-            let need = p.n_keys.div_ceil(p.page_size);
+            for (b, &n) in p.n_keys.iter().enumerate() {
+                let n = n as usize;
+                if n == 0 || n > slots || q_seq > n {
+                    lloom_tensor::bail!(
+                        "sdpa over a page pool: row {b} has {n} live keys for {q_seq} queries \
+                         against a pool of {slots} slots"
+                    );
+                }
+            }
+            let need = p.max_keys().div_ceil(p.page_size);
             if p.stride < need || p.entries.len() < need + (b_sz - 1) * p.stride {
                 lloom_tensor::bail!(
                     "sdpa over a page pool: {} table entries at stride {} for {b_sz} sequences x \
@@ -1947,9 +1975,10 @@ impl lloom_tensor::CustomOp3 for Sdpa {
                 );
             }
             for (i, &page) in p.entries.iter().enumerate() {
-                let pi = i % p.stride;
-                if pi < need {
-                    let live = (p.n_keys - pi * p.page_size).min(p.page_size);
+                let (b, pi) = (i / p.stride, i % p.stride);
+                let n = p.keys_of(b);
+                if pi < n.div_ceil(p.page_size) {
+                    let live = (n - pi * p.page_size).min(p.page_size);
                     if page as usize * p.page_size + live > slots {
                         lloom_tensor::bail!(
                             "sdpa over a page pool: table entry {i} names page {page}, which would \
@@ -2086,7 +2115,7 @@ impl lloom_tensor::CustomOp3 for Sdpa {
                 match &self.paged {
                     Some(p) => {
                         let mut ks = k_l.dims().to_vec();
-                        ks[2] = p.n_keys;
+                        ks[2] = p.max_keys();
                         let mut kst = k_l.stride().to_vec();
                         kst[0] = 0;
                         let mut vst = v_l.stride().to_vec();
@@ -2099,16 +2128,27 @@ impl lloom_tensor::CustomOp3 for Sdpa {
                         v_l.stride().to_vec(),
                     ),
                 };
+            // The table and the live counts: one count every row reads
+            // (stride 0), or one per row (stride 1).
             let table = match &self.paged {
-                Some(p) => Some(device.new_buffer_with_data(&p.entries)?),
+                Some(p) => {
+                    let keys: Vec<i32> = p.n_keys.iter().map(|&n| n as i32).collect();
+                    Some((
+                        device.new_buffer_with_data(&p.entries)?,
+                        device.new_buffer_with_data(&keys)?,
+                    ))
+                }
                 None => None,
             };
             let paged = match (&self.paged, &table) {
-                (Some(p), Some(t)) => Some(lloom_tensor::kernels::SdpaPageTable {
+                (Some(p), Some((t, n))) => Some(lloom_tensor::kernels::SdpaPageTable {
                     table: t,
                     table_offset: 0,
                     table_stride: p.stride,
                     page_size: p.page_size,
+                    n_keys: n,
+                    n_keys_offset: 0,
+                    n_keys_stride: usize::from(p.n_keys.len() > 1),
                 }),
                 _ => None,
             };
@@ -2230,6 +2270,41 @@ pub fn sdpa_paged(
     table: Vec<u32>,
     table_stride: usize,
     n_keys: usize,
+) -> Result<Tensor> {
+    sdpa_paged_ragged(
+        q,
+        k,
+        v,
+        do_causal,
+        scale,
+        page_size,
+        table,
+        table_stride,
+        vec![n_keys as u32],
+    )
+}
+
+/// [`sdpa_paged`] over a RAGGED batch: row `b` of `q` (`[b, n_q_heads,
+/// q_seq, head_dim]`, every row the same `q_seq`) attends over its own
+/// `n_keys[b]` live keys through its own page table (`table[b * table_stride
+/// ..]`), in ONE dispatch for the batch (`batched-decode-design.md` §12.2
+/// change 3). Every row's table must be `table_stride` entries long — the
+/// longest row's page count — padded past its own pages with any page (a
+/// page past a row's live count is never read). With `do_causal` each row's
+/// queries sit at the end of ITS key range. Bit-identical per row to that
+/// row's own [`sdpa_paged`] call: the blocks, the masks and the reduction
+/// are the row's alone. A one-entry `n_keys` is the lockstep batch.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_paged_ragged(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    do_causal: bool,
+    scale: f32,
+    page_size: usize,
+    table: Vec<u32>,
+    table_stride: usize,
+    n_keys: Vec<u32>,
 ) -> Result<Tensor> {
     q.apply_op3_no_bwd(
         k,
@@ -2875,6 +2950,10 @@ struct PagedTable {
     entries: Vec<u32>,
     stride: usize,
     n_keys: Vec<u32>,
+    /// `entries` and `n_keys` already on the device (`U32`, contiguous, offset
+    /// 0), uploaded once per pass by the caller and bound as they are; `None`
+    /// uploads both per call.
+    bound: Option<(Tensor, Tensor)>,
 }
 
 impl PagedTable {
@@ -3230,7 +3309,14 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
                 0,
             ),
         };
-        let chunk_table = device.new_buffer_with_data(&table)?;
+        // The table and the live counts: the caller's device tensors when it
+        // bound them (one upload per pass, `RowsPass`), else uploaded here.
+        let bound = self.paged.as_ref().and_then(|p| p.bound.as_ref());
+        let bound_guards = bound.map(|(t, n)| (t.storage_and_layout(), n.storage_and_layout()));
+        let uploaded = match bound {
+            None => Some(device.new_buffer_with_data(&table)?),
+            Some(_) => None,
+        };
 
         // A pool is one row shared by every sequence: its sequence stride is
         // 0, and its live length is the table's, not the token axis's.
@@ -3256,12 +3342,38 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         // (a ragged batch through one dispatch, §12.2). `n_keys` in the
         // params stays the longest row's — the dispatch depth.
         let (keys_per_seq, ragged): (Vec<i32>, bool) = match &self.paged {
-            Some(p) if p.n_keys.len() > 1 => {
-                (p.n_keys.iter().map(|&n| n as i32).collect(), true)
-            }
+            Some(p) if p.n_keys.len() > 1 => (p.n_keys.iter().map(|&n| n as i32).collect(), true),
             _ => (vec![n_keys as i32], false),
         };
-        let n_keys_per_seq = device.new_buffer_with_data(&keys_per_seq)?;
+        let uploaded_keys = match bound {
+            None => Some(device.new_buffer_with_data(&keys_per_seq)?),
+            Some(_) => None,
+        };
+        let (chunk_table, n_keys_per_seq): (
+            &lloom_tensor::kernels::metal::buffer::Buffer,
+            &lloom_tensor::kernels::metal::buffer::Buffer,
+        ) = match (&bound_guards, &uploaded, &uploaded_keys) {
+            (Some(((ts, tl), (ns, nl))), _, _) => {
+                if tl.start_offset() != 0 || nl.start_offset() != 0 {
+                    lloom_tensor::bail!(
+                        "flash-decoding: a bound table or live-count tensor must start at offset 0"
+                    );
+                }
+                let t = match &**ts {
+                    lloom_tensor::Storage::Metal(m) => m.buffer(),
+                    _ => lloom_tensor::bail!("flash-decoding: the bound table must be on metal"),
+                };
+                let n = match &**ns {
+                    lloom_tensor::Storage::Metal(m) => m.buffer(),
+                    _ => lloom_tensor::bail!(
+                        "flash-decoding: the bound live counts must be on metal"
+                    ),
+                };
+                (t, n)
+            }
+            (None, Some(t), Some(n)) => (t, n),
+            _ => unreachable!("either bound or uploaded"),
+        };
         let mut partial = lloom_tensor::kernels::FlashPartialParams::for_step(
             q_l.dims(),
             &k_shape,
@@ -3304,11 +3416,11 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
             &partials,
             &sums,
             &maxs,
-            &chunk_table,
+            chunk_table,
             &partial_params,
             &combine_params,
             &walk_order,
-            &n_keys_per_seq,
+            n_keys_per_seq,
             n_q_heads,
             head_dim,
             n_chunks,
@@ -3417,6 +3529,64 @@ pub fn flash_decoding_paged_ragged(
                 entries: table,
                 stride: table_stride,
                 n_keys,
+                bound: None,
+            }),
+            page_size,
+            pages_per_chunk,
+            scratch_sizing,
+            reserve_chunks,
+        },
+    )
+}
+
+/// [`flash_decoding_paged_ragged`] with the table and the live counts
+/// ALREADY on the device — `tables_t` (`U32 [b * table_stride]`) and
+/// `n_keys_t` (`U32 [b]`, or `[1]` for a lockstep batch), the same values as
+/// `table` / `n_keys`, which stay as the host's copy for the bounds checks.
+/// A batched pass uploads them once and every attention layer binds them
+/// (`batched-decode-design.md` §12.2), where the per-call form uploads two
+/// buffers per layer.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_decoding_paged_ragged_bound(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    page_size: usize,
+    pages_per_chunk: usize,
+    scratch_sizing: FlashScratchSizing,
+    reserve_chunks: usize,
+    table: Vec<u32>,
+    table_stride: usize,
+    n_keys: Vec<u32>,
+    tables_t: &Tensor,
+    n_keys_t: &Tensor,
+) -> Result<Tensor> {
+    if tables_t.dtype() != DType::U32 || n_keys_t.dtype() != DType::U32 {
+        lloom_tensor::bail!("flash-decoding: the bound table and live counts must be U32");
+    }
+    if tables_t.elem_count() < table.len() || n_keys_t.elem_count() < n_keys.len() {
+        lloom_tensor::bail!(
+            "flash-decoding: the bound table ({}) or live counts ({}) are shorter than the host's \
+             ({}, {})",
+            tables_t.elem_count(),
+            n_keys_t.elem_count(),
+            table.len(),
+            n_keys.len()
+        );
+    }
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &FlashDecoding {
+            scale,
+            softcapping,
+            paged: Some(PagedTable {
+                entries: table,
+                stride: table_stride,
+                n_keys,
+                bound: Some((tables_t.clone(), n_keys_t.clone())),
             }),
             page_size,
             pages_per_chunk,
@@ -3450,6 +3620,7 @@ pub fn flash_decoding_paged(
                 entries: table,
                 stride: table_stride,
                 n_keys: vec![n_keys as u32],
+                bound: None,
             }),
             page_size,
             pages_per_chunk,

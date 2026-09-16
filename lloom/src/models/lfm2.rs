@@ -16,7 +16,7 @@ use lloom_macros::Config as ConfigDerive;
 // The SiLU steer arm is a Metal kernel switch (`unary.rs`), so the type and its
 // axis field are metal-gated exactly as its former crate dependency was.
 #[cfg(feature = "metal")]
-use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageQuarantine};
+use lloom_tensor::kernels::metal::{GpuClock, KvPagePool, PageError, PageQuarantine};
 #[cfg(feature = "metal")]
 use lloom_tensor::kernels::SiluImpl;
 use lloom_tensor::{DType, Device, IndexOp, Module, Result, Tensor};
@@ -2103,7 +2103,23 @@ impl PagedKv {
         for &(slot, n) in rows {
             let start = pool.seq(slot).map(|s| s.len()).unwrap_or(0);
             prev.push(start);
-            pool.append(slot, n).map_err(|e| {
+            let appended = match pool.append(slot, n) {
+                // A full pool whose free pages sit in the quarantine — the
+                // rows a burst just released, against an epoch nothing has
+                // committed since (a reset between requests encodes no
+                // dispatch of its own): wait the GPU out once and recycle
+                // them, rather than refusing a pool that is free in fact.
+                Err(PageError::Exhausted { .. }) if !self.quarantine.is_empty() => {
+                    device.synchronize()?;
+                    let ready = self
+                        .quarantine
+                        .drain_completed(self.clock.completed_count());
+                    pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
+                    pool.append(slot, n)
+                }
+                other => other,
+            };
+            appended.map_err(|e| {
                 lloom_tensor::Error::msg(format!(
                     "lfm2 paged KV, slot {slot}: {e}. The pool holds {pool_pages} pages of \
                      {page_size} tokens (LLOOM_148_POOL_PAGES pins it; unpinned it grows \
@@ -2144,6 +2160,29 @@ impl PagedKv {
             t.resize(table_stride, 0);
             tables.extend(t);
         }
+        // Uploaded here, once, and bound by every attention layer of the pass
+        // (`flash_decoding_paged_ragged_bound`): the per-layer upload was the
+        // pool arm's per-row host cost (§12.8).
+        let tables_t = Tensor::new(tables.as_slice(), device)?;
+        let n_keys_t = Tensor::new(n_keys.as_slice(), device)?;
+        let dec_rows: Vec<usize> = (0..rows.len()).filter(|&r| rows[r].1 == 1).collect();
+        let dec = if dec_rows.is_empty() || dec_rows.len() == rows.len() {
+            None
+        } else {
+            let mut t = Vec::with_capacity(dec_rows.len() * table_stride);
+            let mut n = Vec::with_capacity(dec_rows.len());
+            for &r in &dec_rows {
+                t.extend_from_slice(&tables[r * table_stride..(r + 1) * table_stride]);
+                n.push(n_keys[r]);
+            }
+            Some(DecRows {
+                tables_t: Tensor::new(t.as_slice(), device)?,
+                n_keys_t: Tensor::new(n.as_slice(), device)?,
+                rows: dec_rows,
+                tables: t,
+                n_keys: n,
+            })
+        };
         Ok(RowsPass {
             rows: rows.to_vec(),
             slots: Tensor::new(slots.as_slice(), device)?,
@@ -2153,6 +2192,9 @@ impl PagedKv {
             n_keys,
             pages,
             prev,
+            tables_t,
+            n_keys_t,
+            dec,
         })
     }
 
@@ -2276,6 +2318,25 @@ pub(crate) struct RowsPass {
     pages: Vec<Vec<u32>>,
     /// Every row's live length BEFORE the pass.
     prev: Vec<usize>,
+    /// `tables` and `n_keys` on the device, `U32`, uploaded once per pass.
+    tables_t: Tensor,
+    n_keys_t: Tensor,
+    /// The one-token rows' own tables and counts when the pass also feeds
+    /// longer rows (a piece, a verify window); `None` when every row is a
+    /// decode row (the whole pass is the subset) or none is.
+    dec: Option<DecRows>,
+}
+
+/// The decode rows of a pass with longer rows beside them: their pass
+/// indices, tables and live counts, on the host and on the device.
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+struct DecRows {
+    rows: Vec<usize>,
+    tables: Vec<u32>,
+    n_keys: Vec<u32>,
+    tables_t: Tensor,
+    n_keys_t: Tensor,
 }
 
 #[cfg(feature = "metal")]
@@ -2566,6 +2627,19 @@ struct BatchSlot {
     /// This row's own pass (the per-row path), opened at the first attention
     /// layer of a pass and dropped when the next pass begins.
     pass: Option<Arc<RowsPass>>,
+    /// The row's live length when the current pass began — the position of
+    /// the pass's first token, which the conv layers (some of them before
+    /// the pass's first attention layer, so before the pass's pages exist)
+    /// need to place a page boundary inside a piece.
+    pass_start: usize,
+    /// Tokens per page, read once at the lease.
+    page_size: usize,
+    /// The conv rings after a page's last token for every page boundary
+    /// INSIDE this pass's piece, by the token's position: each conv layer
+    /// fills its ring as it writes the piece; `flush_ring_snapshots` keys
+    /// them by page when the pass ends and its pages exist (§12.3, the
+    /// share granularity as the page rather than the chunk).
+    staged_snaps: Vec<(usize, Vec<Option<Tensor>>)>,
 }
 
 #[cfg(feature = "metal")]
@@ -3123,10 +3197,14 @@ impl Cache {
             // this row's: its pages are the shared pool's.
             cache.paged = None;
             let lease = pool.lease()?;
+            let page_size = pool.page_size();
             cache.batch = Some(BatchSlot {
                 pool: pool.clone(),
                 lease: Arc::new(lease),
                 pass: None,
+                pass_start: 0,
+                page_size,
+                staged_snaps: Vec::new(),
             });
             Ok(cache)
         }
@@ -3211,9 +3289,11 @@ impl Cache {
         Ok(None)
     }
 
-    /// On the batch arm, when this row's length is a positive multiple of
-    /// the page size: snapshot every conv ring (after the page's last
-    /// token) under the page, for a sharer (§12.3). A no-op otherwise.
+    /// On the batch arm, at a pass's start: record the row's length as the
+    /// pass's start position and, when that length is a positive multiple
+    /// of the page size and the page has no snapshot yet, snapshot every
+    /// conv ring (after the page's last token) under the page, for a sharer
+    /// (§12.3). A no-op otherwise.
     #[cfg(feature = "metal")]
     fn snapshot_page_boundary(&mut self) -> Result<()> {
         let Some(b) = &self.batch else {
@@ -3224,6 +3304,9 @@ impl Cache {
         let mut g = pool.inner.lock();
         let p = g.kv.page_size;
         let len = g.kv.row_len(slot);
+        if let Some(b) = &mut self.batch {
+            b.pass_start = len;
+        }
         if len == 0 || len % p != 0 {
             return Ok(());
         }
@@ -3231,6 +3314,10 @@ impl Cache {
         let Some(&page) = pages.get(len / p - 1) else {
             return Ok(());
         };
+        if g.snapshots.contains_key(&page) {
+            // Taken inside the piece that completed the page.
+            return Ok(());
+        }
         let mut rings = Vec::with_capacity(g.conv.len());
         for t in g.conv.iter() {
             rings.push(match t {
@@ -3252,6 +3339,92 @@ impl Cache {
             },
         );
         Ok(())
+    }
+
+    /// On the batch arm, inside a multi-token conv pass: for every page
+    /// boundary the piece crosses, the ring after that page's last token —
+    /// the last `l_cache` columns of `conv_in` (the left context and the
+    /// piece's `bx`) ending at the boundary, at the front of a `width`-wide
+    /// ring, the rest zero: byte for byte what the writer stores when a
+    /// piece ENDS at that token — staged under the token's position for
+    /// layer `layer`. Keyed by page at the pass's end
+    /// (`flush_ring_snapshots`), when the pass's pages exist.
+    #[cfg(feature = "metal")]
+    #[allow(clippy::too_many_arguments)]
+    fn stage_piece_snapshots(
+        &mut self,
+        layer: usize,
+        conv_in: &Tensor,
+        ctx_len: usize,
+        seq_len: usize,
+        l_cache: usize,
+        width: usize,
+        n_layers: usize,
+    ) -> Result<()> {
+        let Some(b) = &self.batch else {
+            return Ok(());
+        };
+        let (start, p) = (b.pass_start, b.page_size);
+        if p == 0 || l_cache == 0 {
+            return Ok(());
+        }
+        let (_, hidden, _) = conv_in.dims3()?;
+        for i in 0..seq_len {
+            let t = start + i;
+            if (t + 1) % p != 0 {
+                continue;
+            }
+            let ci = ctx_len + i;
+            let take = (ci + 1).min(l_cache);
+            let cols = conv_in.narrow(2, ci + 1 - take, take)?;
+            let ring = Tensor::zeros((1, hidden, width), conv_in.dtype(), conv_in.device())?;
+            ring.slice_set(&cols.contiguous()?, 2, l_cache - take)?;
+            let b = self.batch.as_mut().expect("checked above");
+            let entry = match b.staged_snaps.iter_mut().find(|(pos, _)| *pos == t) {
+                Some(e) => e,
+                None => {
+                    b.staged_snaps.push((t, vec![None; n_layers]));
+                    b.staged_snaps.last_mut().expect("pushed")
+                }
+            };
+            if entry.1.len() < n_layers {
+                entry.1.resize(n_layers, None);
+            }
+            entry.1[layer] = Some(ring);
+        }
+        Ok(())
+    }
+
+    /// Key the rings staged by `stage_piece_snapshots` by their pages, once
+    /// the pass that wrote them has appended its tokens (so the pages exist
+    /// in the row's table). A no-op when nothing is staged.
+    #[cfg(feature = "metal")]
+    fn flush_ring_snapshots(&mut self) {
+        let Some(b) = &mut self.batch else {
+            return;
+        };
+        if b.staged_snaps.is_empty() {
+            return;
+        }
+        let staged = std::mem::take(&mut b.staged_snaps);
+        let slot = b.slot();
+        let pool = b.pool.clone();
+        let phase = self.l_cache.saturating_sub(1);
+        let mut g = pool.inner.lock();
+        let p = g.kv.page_size;
+        let pages = g.kv.row_pages(slot);
+        let len = g.kv.row_len(slot);
+        for (t, rings) in staged {
+            // A boundary past the row's live length (the pass was rolled
+            // back below it) names no page.
+            if t >= len {
+                continue;
+            }
+            let Some(&page) = pages.get(t / p) else {
+                continue;
+            };
+            g.snapshots.insert(page, RingSnapshot { rings, phase });
+        }
     }
 
     /// Share `src`'s first whole pages covering at most `n_tokens` tokens
@@ -5109,7 +5282,7 @@ impl Attention {
                 .expect("write_rows allocates the layer's pool");
             (pk.clone(), pv.clone())
         };
-        let y = crate::nn::ops::flash_decoding_paged_ragged(
+        let y = crate::nn::ops::flash_decoding_paged_ragged_bound(
             &q,
             &pk,
             &pv,
@@ -5122,6 +5295,8 @@ impl Attention {
             pass.tables.clone(),
             pass.table_stride,
             pass.n_keys.clone(),
+            &pass.tables_t,
+            &pass.n_keys_t,
         )?;
         Ok(Some(y.transpose(1, 2)?.reshape((
             b_sz,
@@ -5188,8 +5363,12 @@ impl Attention {
         };
 
         // The one-token rows, in one dispatch: their queries gathered to
-        // `[nd, H, 1, D]`, their tables and live counts sub-selected.
-        let dec: Vec<usize> = (0..rows.len()).filter(|&r| rows[r].len == 1).collect();
+        // `[nd, H, 1, D]`, their tables and live counts the pass's (every
+        // row) or the pass's decode subset, uploaded once at `begin_rows`.
+        let dec: Vec<usize> = match &pass.dec {
+            Some(d) => d.rows.clone(),
+            None => (0..rows.len()).filter(|&r| rows[r].len == 1).collect(),
+        };
         let mut y_dec: Option<Tensor> = None;
         if !dec.is_empty() {
             let nd = dec.len();
@@ -5204,14 +5383,16 @@ impl Attention {
                 .transpose(1, 2)?
                 .contiguous()?
                 .reshape((nd, self.num_attention_heads, 1, self.head_dim))?;
-            let stride = pass.table_stride;
-            let mut tables = Vec::with_capacity(nd * stride);
-            let mut n_keys = Vec::with_capacity(nd);
-            for &r in &dec {
-                tables.extend_from_slice(&pass.tables[r * stride..(r + 1) * stride]);
-                n_keys.push(pass.n_keys[r]);
-            }
-            y_dec = Some(crate::nn::ops::flash_decoding_paged_ragged(
+            let (tables, n_keys, tables_t, n_keys_t) = match &pass.dec {
+                Some(d) => (d.tables.clone(), d.n_keys.clone(), &d.tables_t, &d.n_keys_t),
+                None => (
+                    pass.tables.clone(),
+                    pass.n_keys.clone(),
+                    &pass.tables_t,
+                    &pass.n_keys_t,
+                ),
+            };
+            y_dec = Some(crate::nn::ops::flash_decoding_paged_ragged_bound(
                 &q_d,
                 &pk,
                 &pv,
@@ -5222,38 +5403,98 @@ impl Attention {
                 self.flash_scratch_sizing,
                 reserve_chunks,
                 tables,
-                stride,
+                pass.table_stride,
                 n_keys,
+                tables_t,
+                n_keys_t,
             )?);
         }
 
+        // The longer rows (verify windows, prompt pieces), grouped by length:
+        // each group ONE steel dispatch over its rows' page tables, every row
+        // at its own live count with the causal mask at the end of its own
+        // key range (§12.2 change 3). A speculative round's windows are all
+        // `K + 1` wide, so they are one group and one dispatch.
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (r, row) in rows.iter().enumerate() {
+            if row.len > 1 {
+                match groups.iter_mut().find(|(l, _)| *l == row.len) {
+                    Some((_, g)) => g.push(r),
+                    None => groups.push((row.len, vec![r])),
+                }
+            }
+        }
+        let mut y_long: Vec<Option<Tensor>> = (0..rows.len()).map(|_| None).collect();
+        for (len, grp) in &groups {
+            let n = grp.len();
+            let offs: Vec<usize> = grp.iter().map(|&r| pass.span(r).0).collect();
+            // `[n, H, len, D]`: the rows' spans, adjacent (one narrow) or
+            // gathered (one index_select), then the heads brought forward.
+            let adjacent = offs.windows(2).all(|w| w[1] == w[0] + len);
+            let q_g = if n == 1 {
+                q_t.narrow(2, offs[0], *len)?.contiguous()?
+            } else {
+                let flat = if adjacent {
+                    q_t.narrow(2, offs[0], n * len)?
+                } else {
+                    let mut idx: Vec<u32> = Vec::with_capacity(n * len);
+                    for &o in &offs {
+                        idx.extend((o..o + len).map(|t| t as u32));
+                    }
+                    q_t.index_select(&Tensor::new(idx.as_slice(), &device)?, 2)?
+                };
+                flat.reshape((self.num_attention_heads, n, *len, self.head_dim))?
+                    .transpose(0, 1)?
+                    .contiguous()?
+            };
+            let stride = grp
+                .iter()
+                .map(|&r| pass.pages[r].len())
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let mut tables = Vec::with_capacity(n * stride);
+            let mut n_keys = Vec::with_capacity(n);
+            for &r in grp {
+                let mut t = pass.pages[r].clone();
+                t.resize(stride, 0);
+                tables.extend(t);
+                n_keys.push(pass.n_keys[r]);
+            }
+            let y_g = crate::nn::ops::sdpa_paged_ragged(
+                &q_g,
+                &pk,
+                &pv,
+                true,
+                scale,
+                self.flash_page_size,
+                tables,
+                stride,
+                n_keys,
+            )?;
+            for (j, &r) in grp.iter().enumerate() {
+                y_long[r] = Some(y_g.narrow(0, j, 1)?);
+            }
+        }
+
         // Assemble in row order: a decode row from the batched read, a
-        // longer row from its own steel read over its page table.
+        // longer row from its group's read.
         let mut ys = Vec::with_capacity(rows.len());
         let mut j = 0usize;
-        for (r, row) in rows.iter().enumerate() {
-            let (off, len) = pass.span(r);
+        for r in 0..rows.len() {
+            let (_, len) = pass.span(r);
             let y = if len == 1 {
-                let y = y_dec.as_ref().expect("a decode row was read").narrow(0, j, 1)?;
+                let y = y_dec
+                    .as_ref()
+                    .expect("a decode row was read")
+                    .narrow(0, j, 1)?;
                 j += 1;
                 y
             } else {
-                let q_r = q_t.narrow(2, off, len)?.contiguous()?;
-                let pages = pass.pages[r].clone();
-                let stride = pages.len();
-                crate::nn::ops::sdpa_paged(
-                    &q_r,
-                    &pk,
-                    &pv,
-                    true,
-                    scale,
-                    self.flash_page_size,
-                    pages,
-                    stride,
-                    pass.n_keys[r] as usize,
-                )?
+                y_long[r]
+                    .take()
+                    .expect("a longer row was read with its group")
             };
-            let _ = row;
             ys.push(y.transpose(1, 2)?.reshape((
                 1,
                 len,
@@ -6708,6 +6949,22 @@ impl ShortConv {
                 Some(ctx) => (Tensor::cat(&[ctx, &bx], 2)?.contiguous()?, 0),
                 None => (bx.clone(), self.l_cache.saturating_sub(1)),
             };
+            // A batch row's piece crossing a page boundary leaves the ring
+            // after that page's last token for a sharer (§12.3).
+            #[cfg(feature = "metal")]
+            if cache.batch.is_some() && cache.use_kv_cache && b_sz == 1 {
+                let ctx_len = ctx.as_ref().map(|c| c.dim(2)).transpose()?.unwrap_or(0);
+                let width = self.conv_state.width(self.l_cache);
+                cache.stage_piece_snapshots(
+                    block_idx,
+                    &conv_in,
+                    ctx_len,
+                    seq_len,
+                    self.l_cache,
+                    width,
+                    cache.conv_states.len(),
+                )?;
+            }
             let conv = Conv1d::new(
                 self.conv_weight.clone(),
                 None,
@@ -7364,6 +7621,8 @@ impl Model {
             hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
         }
 
+        #[cfg(feature = "metal")]
+        cache.flush_ring_snapshots();
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let hidden_states = hidden_states.i((.., seq_len - 1, ..))?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
@@ -7553,6 +7812,10 @@ impl Model {
             hidden_states = layer.forward_ragged(&hidden_states, block_idx, rows)?;
         }
 
+        #[cfg(feature = "metal")]
+        for row in rows.iter_mut() {
+            row.cache.flush_ring_snapshots();
+        }
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
         if all_positions {
             let logits = self.lm_head.forward(&hidden_states.contiguous()?)?;
@@ -7624,6 +7887,8 @@ impl Model {
             hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
         }
 
+        #[cfg(feature = "metal")]
+        cache.flush_ring_snapshots();
         let hidden_states = self.embedding_norm.forward(&hidden_states)?;
         let hidden_states = hidden_states.i((.., seq_len - 1, ..))?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
@@ -7686,6 +7951,8 @@ impl Model {
             Self::tap_layer_input(&hidden_states, block_idx, cache)?;
             hidden_states = layer.forward(&hidden_states, index_pos, block_idx, cache)?;
         }
+        #[cfg(feature = "metal")]
+        cache.flush_ring_snapshots();
         let hidden_states = self.embedding_norm.forward(&hidden_states)?.contiguous()?;
         let logits = self.lm_head.forward(&hidden_states)?;
         logits.to_dtype(DType::F32)

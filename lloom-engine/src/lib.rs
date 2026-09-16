@@ -27,7 +27,7 @@ pub mod stream;
 pub use batch::{
     spawn as spawn_batch, BatchConfig, BatchCounters, BatchDone, BatchEvent, BatchHandle,
     BatchMode, BatchRequest, ClosedJob, CountersHook, Driver, Idle, MakeDriver, RowSpec,
-    StaticBody,
+    StaticBody, drive_closed_rows,
 };
 pub use decode::{
     ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool, Stop,

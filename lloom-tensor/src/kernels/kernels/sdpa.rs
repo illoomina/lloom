@@ -78,6 +78,14 @@ pub struct SdpaPageTable<'a> {
     pub table_stride: usize,
     /// KV tokens per page.
     pub page_size: usize,
+    /// `i32` live key counts: sequence `b` reads entry `b * n_keys_stride`,
+    /// so a stride of 0 is one count for the whole dispatch (`k_shape[2]`)
+    /// and a stride of 1 a count per row — B rows of different live lengths
+    /// in one dispatch, each over its own key blocks and its own causal
+    /// offset (`batched-decode-design.md` §12.2 change 3).
+    pub n_keys: &'a Buffer,
+    pub n_keys_offset: usize,
+    pub n_keys_stride: usize,
 }
 
 /// The tiled multi-query attention (`steel_attention`): one threadgroup per
@@ -172,7 +180,8 @@ pub fn call_sdpa_full(
 /// page-walking read). One body for both arms, so the paged arm cannot drift
 /// from the kernel it is one address away from.
 ///
-/// On the paged arm `k_shape[2]` is the LIVE key count (`kL`) and `k_strides`
+/// On the paged arm `k_shape[2]` is the LIVE key count (`kL`; the longest
+/// row's when the counts are per row) and `k_strides`
 /// / `v_strides` are the pool's `[_, head, token]` strides; the batch stride is
 /// not read. The table is bound at `buffer(8)` and its params at `buffer(7)`,
 /// above the mask's `5`/`6`, so the two optional arms bind independently.
@@ -238,6 +247,7 @@ pub fn call_sdpa_full_with(
     struct AttnPagedParams {
         page_size: i32,
         table_stride: i32,
+        n_keys_stride: i32,
     }
 
     let bd = q_shape[q_shape.len() - 1];
@@ -264,7 +274,10 @@ pub fn call_sdpa_full_with(
     let kl = k_shape[2];
 
     let align_q = ql.is_multiple_of(bq);
-    let align_k = kl.is_multiple_of(bk);
+    // Per-row live counts differ in their alignment; the kernel then derives
+    // each row's partial block from its own count, and the aligned rows take
+    // the same loads they would under `align_K`.
+    let align_k = kl.is_multiple_of(bk) && paged.is_none_or(|p| p.n_keys_stride == 0);
     let has_mask = mask_buffer.is_some();
 
     // When an explicit additive mask is supplied it already encodes causality.
@@ -413,9 +426,11 @@ pub fn call_sdpa_full_with(
             AttnPagedParams {
                 page_size: p.page_size as i32,
                 table_stride: p.table_stride as i32,
+                n_keys_stride: p.n_keys_stride as i32,
             },
         );
         crate::kernels::utils::set_param(encoder, 8, (p.table, p.table_offset));
+        crate::kernels::utils::set_param(encoder, 9, (p.n_keys, p.n_keys_offset));
     }
 
     let grid_dims = MTLSize {

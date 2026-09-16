@@ -2524,6 +2524,7 @@ struct AttnMaskParams {
 struct AttnPagedParams {
   int page_size; ///< KV tokens per page
   int table_stride; ///< Entries between two sequences' tables
+  int n_keys_stride; ///< Entries between two sequences' live key counts (0: one count for the dispatch)
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -2612,6 +2613,7 @@ template <
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const constant AttnPagedParams* paged_params [[buffer(7), function_constant(is_paged)]],
     const device uint* page_table [[buffer(8), function_constant(is_paged)]],
+    const device int* n_keys_per_seq [[buffer(9), function_constant(is_paged)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -2762,18 +2764,36 @@ template <
     max_score[i] = Limits<AccumType>::min;
   }
 
+  // The key range this sequence attends: the dispatch's on the contiguous
+  // arm; on the paged arm the sequence's OWN live count (`n_keys_per_seq`,
+  // stride 0 = one count for the batch), so rows of different lengths run in
+  // one dispatch, each over its own blocks with its own causal offset. The
+  // host compiles `align_K` off whenever the counts differ.
+  int kL = params->kL;
+  int NK = params->NK;
+  int NK_aligned = params->NK_aligned;
+  int kL_rem = params->kL_rem;
+  int qL_off = params->qL_off;
+  if (is_paged) {
+    kL = n_keys_per_seq[tidl.z * paged_params->n_keys_stride];
+    NK = (kL + BK - 1) / BK;
+    NK_aligned = kL / BK;
+    kL_rem = kL - NK_aligned * BK;
+    qL_off = kL - params->qL;
+  }
+
   // The causal window is [kb_min_causal, kb_lim): blocks below it are fully
   // visible, blocks at or above it are masked element-wise. Both are clamped
   // to the key range: a partial query block's `q_max` overshoots `kL`.
-  int kb_lim = params->NK;
-  int kb_min_causal = params->NK;
+  int kb_lim = NK;
+  int kb_min_causal = NK;
 
   if (do_causal) {
-    int q_max = (tid.x + 1) * BQ + params->qL_off;
+    int q_max = (tid.x + 1) * BQ + qL_off;
     kb_lim = (q_max + BK - 1) / BK;
-    kb_lim = min(params->NK, kb_lim);
+    kb_lim = min(NK, kb_lim);
 
-    int q_min = tid.x * BQ + params->qL_off;
+    int q_min = tid.x * BQ + qL_off;
     q_min = max(0, q_min);
     kb_min_causal = (q_min / BK);
   }
@@ -2794,8 +2814,8 @@ template <
 
     // Load K block and apply scale
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (!align_K && kb == (params->NK_aligned)) {
-      loader_k.load_safe(short2(BD, params->kL_rem));
+    if (!align_K && kb == (NK_aligned)) {
+      loader_k.load_safe(short2(BD, kL_rem));
     } else {
       loader_k.load_unsafe();
     }
@@ -2820,7 +2840,7 @@ template <
     }
 
     // Mask out length sequence
-    if (!align_K && kb == (params->NK_aligned)) {
+    if (!align_K && kb == (NK_aligned)) {
       using stile_t = decltype(Stile);
       using selem_t = typename stile_t::elem_type;
       constexpr auto neg_inf = -metal::numeric_limits<selem_t>::infinity();
@@ -2832,7 +2852,7 @@ template <
           short col_pos = sn + (j * stile_t::kFragCols);
           STEEL_PRAGMA_UNROLL
           for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
-            if ((col_pos + jj) >= params->kL_rem) {
+            if ((col_pos + jj) >= kL_rem) {
               Stile.frag_at(i, j)[jj] = neg_inf;
             }
           }
@@ -2849,7 +2869,7 @@ template <
       STEEL_PRAGMA_UNROLL
       for (short i = 0; i < stile_t::kTileRows; i++) {
         const int row_pos =
-            tid.x * BQ + params->qL_off + tm + sm + (i * stile_t::kFragRows);
+            tid.x * BQ + qL_off + tm + sm + (i * stile_t::kFragRows);
         STEEL_PRAGMA_UNROLL
         for (short j = 0; j < stile_t::kTileCols; j++) {
           const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
@@ -2890,7 +2910,7 @@ template <
               int(mask_params->M_strides[2]),
               Int<1>{},
               params->qL,
-              params->kL,
+              kL,
               row_pos,
               col_pos);
 
@@ -2910,8 +2930,8 @@ template <
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Load V blocks
-    if (!align_K && kb == (params->NK_aligned)) {
-      loader_v.load_safe(short2(BD, params->kL_rem));
+    if (!align_K && kb == (NK_aligned)) {
+      loader_v.load_safe(short2(BD, kL_rem));
     } else {
       loader_v.load_unsafe();
     }

@@ -106,6 +106,8 @@ fn main() -> Result<()> {
             stop_strings: Vec::new(),
             // The gate arm: the blocking readback `lfm2-smoke` compares against.
             readback: ReadbackArm::Blocking,
+            // One forward per turn, as the gate takes it.
+            prefill_tile: 0,
         };
 
         let tk = &tokenizer;

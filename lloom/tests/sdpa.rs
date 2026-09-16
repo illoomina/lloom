@@ -1119,6 +1119,156 @@ mod metal_sdpa_tests {
         Ok(())
     }
 
+    /// Three sequences of DIFFERENT live lengths over one pool in ONE
+    /// dispatch (`sdpa_paged_ragged`, `batched-decode-design.md` §12.2 change
+    /// 3): every row bit-identical to its own B=1 `sdpa_paged` call over its
+    /// own table, and to the contiguous kernel on the same keys — causal (a
+    /// verify window at the end of each row's own key range) and not (the
+    /// drafter's block). The lengths straddle the 32-key block differently
+    /// (one aligned, two not), so the per-row partial block is exercised in
+    /// the same dispatch as an aligned row.
+    #[test]
+    fn sdpa_paged_ragged_rows_read_their_own_live_counts_bit_for_bit() -> Result<()> {
+        let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
+        let metal = Device::new_metal(0)?;
+        let cpu = Device::Cpu;
+        const Q_LEN: usize = 10;
+        const P: usize = 32;
+        let kv_lens = [45usize, 128, 301];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(148_301);
+        let pages: Vec<usize> = kv_lens.iter().map(|n| n.div_ceil(P)).collect();
+        let stride = *pages.iter().max().unwrap();
+        let pool_pages: usize = pages.iter().sum::<usize>() + 2;
+        // Disjoint, permuted tables: row r's pages are a rotated slice of the
+        // pool's pages after the rows before it, never the identity.
+        let mut tables: Vec<Vec<u32>> = Vec::new();
+        let mut base = 1u32;
+        for (r, &n) in pages.iter().enumerate() {
+            let mut t: Vec<u32> = (base..base + n as u32).collect();
+            // One rotation per row plus one: never the identity at n >= 2,
+            // and a different permutation per row.
+            t.rotate_left((r + 1) % n.max(1));
+            if t.iter()
+                .enumerate()
+                .all(|(j, &p)| p as usize == j + base as usize)
+            {
+                t.rotate_left(1);
+            }
+            assert!(
+                t.iter()
+                    .enumerate()
+                    .any(|(j, &p)| p as usize != j + base as usize),
+                "row {r}'s table must not be the identity over its range"
+            );
+            tables.push(t);
+            base += n as u32;
+        }
+        let pool_tokens = pool_pages * P;
+        let sentinel = 40f32;
+        let mut k_pool = vec![sentinel; LFM2_KV_HEADS * pool_tokens * LFM2_HEAD_DIM];
+        let mut v_pool = k_pool.clone();
+        let mut lives = Vec::new();
+        for (r, &kv_len) in kv_lens.iter().enumerate() {
+            let k = randn(&mut rng, (1, LFM2_KV_HEADS, kv_len, LFM2_HEAD_DIM), &cpu)?;
+            let v = randn(&mut rng, (1, LFM2_KV_HEADS, kv_len, LFM2_HEAD_DIM), &cpu)?;
+            for (live, pool) in [(&k, &mut k_pool), (&v, &mut v_pool)] {
+                let src = live.flatten_all()?.to_vec1::<f32>()?;
+                for h in 0..LFM2_KV_HEADS {
+                    for t in 0..kv_len {
+                        let slot = tables[r][t / P] as usize * P + t % P;
+                        let s = (h * kv_len + t) * LFM2_HEAD_DIM;
+                        let d = (h * pool_tokens + slot) * LFM2_HEAD_DIM;
+                        pool[d..d + LFM2_HEAD_DIM].copy_from_slice(&src[s..s + LFM2_HEAD_DIM]);
+                    }
+                }
+            }
+            lives.push((k, v));
+        }
+        let k_pool =
+            Tensor::from_vec(k_pool, (1, LFM2_KV_HEADS, pool_tokens, LFM2_HEAD_DIM), &cpu)?
+                .to_device(&metal)?;
+        let v_pool =
+            Tensor::from_vec(v_pool, (1, LFM2_KV_HEADS, pool_tokens, LFM2_HEAD_DIM), &cpu)?
+                .to_device(&metal)?;
+        let q = randn(
+            &mut rng,
+            (kv_lens.len(), LFM2_Q_HEADS, Q_LEN, LFM2_HEAD_DIM),
+            &cpu,
+        )?;
+
+        let mut ragged_table = Vec::with_capacity(kv_lens.len() * stride);
+        for t in &tables {
+            let mut t = t.clone();
+            t.resize(stride, 0);
+            ragged_table.extend(t);
+        }
+        let n_keys: Vec<u32> = kv_lens.iter().map(|&n| n as u32).collect();
+        for causal in [false, true] {
+            let got = lloom::nn::ops::sdpa_paged_ragged(
+                &q.to_device(&metal)?,
+                &k_pool,
+                &v_pool,
+                causal,
+                scale as f32,
+                P,
+                ragged_table.clone(),
+                stride,
+                n_keys.clone(),
+            )?;
+            let mut row_bits = Vec::new();
+            for (b, (k, v)) in lives.iter().enumerate() {
+                let q_b = q.narrow(0, b, 1)?;
+                let own = lloom::nn::ops::sdpa_paged(
+                    &q_b.to_device(&metal)?,
+                    &k_pool,
+                    &v_pool,
+                    causal,
+                    scale as f32,
+                    P,
+                    tables[b].clone(),
+                    tables[b].len(),
+                    kv_lens[b],
+                )?;
+                let solo = lloom::nn::ops::sdpa(
+                    &q_b.to_device(&metal)?,
+                    &k.to_device(&metal)?,
+                    &v.to_device(&metal)?,
+                    None,
+                    causal,
+                    scale as f32,
+                    1.,
+                )?;
+                let want = if causal {
+                    reference_causal_attention(&q_b, k, v, scale)?
+                } else {
+                    reference_attention(&q_b, k, v, scale)?
+                };
+                let row = got.narrow(0, b, 1)?.contiguous()?;
+                let what = format!("paged ragged row {b} (kv {}) causal={causal}", kv_lens[b]);
+                assert_matches_reference(&row.to_device(&cpu)?, &want, 1e-5, &what)?;
+                let bits = bits_of(&row, &cpu)?;
+                assert!(
+                    bits == bits_of(&own, &cpu)?,
+                    "{what}: differs from its own B=1 paged answer"
+                );
+                assert!(
+                    bits == bits_of(&solo, &cpu)?,
+                    "{what}: differs from the contiguous kernel"
+                );
+                row_bits.push(bits);
+            }
+            assert!(
+                row_bits[0] != row_bits[1] && row_bits[1] != row_bits[2],
+                "causal={causal}: two rows are identical, so the test cannot tell the counts apart"
+            );
+            println!(
+                "sdpa_paged_ragged_rows_read_their_own_live_counts_bit_for_bit: causal={causal} \
+                 rows {kv_lens:?} each bit-identical to its own B=1 paged and contiguous answers"
+            );
+        }
+        Ok(())
+    }
+
     /// Run to run, the paged kernel is bit-stable (`DESIGN.md` §2.3.3): the
     /// page walk changes addresses, never the reduction order.
     #[test]

@@ -405,7 +405,8 @@ impl DSparkConfig {
             mask_token_id: dfc
                 .get("mask_token_id")
                 .and_then(|x| x.as_u64())
-                .ok_or_else(|| missing("dflash_config.mask_token_id"))? as u32,
+                .ok_or_else(|| missing("dflash_config.mask_token_id"))?
+                as u32,
             num_target_layers: dfc
                 .get("num_target_layers")
                 .and_then(|x| x.as_u64())
@@ -495,11 +496,40 @@ impl DSparkRotary {
         let (_, _, seq_len, _) = x.dims4()?;
         let cos = self.cos.narrow(0, offset, seq_len)?;
         let sin = self.sin.narrow(0, offset, seq_len)?;
+        self.apply_with(x, &cos, &sin)
+    }
+
+    /// The `cos`/`sin` rows for `seq_len` positions starting at each of
+    /// `offsets`: `[B, seq_len, head_dim / 2]`, one gather for a batch of
+    /// rows at their own positions — the rope kernels index a 3-D table per
+    /// batch row. Taken once per draft and shared by every layer.
+    pub fn rows(&self, offsets: &[usize], seq_len: usize) -> Result<(Tensor, Tensor)> {
+        let mut idx: Vec<u32> = Vec::with_capacity(offsets.len() * seq_len);
+        for &o in offsets {
+            idx.extend((o..o + seq_len).map(|p| p as u32));
+        }
+        let idx = Tensor::new(idx.as_slice(), self.cos.device())?;
+        let half = self.cos.dim(1)?;
+        let cos = self
+            .cos
+            .index_select(&idx, 0)?
+            .reshape((offsets.len(), seq_len, half))?;
+        let sin = self
+            .sin
+            .index_select(&idx, 0)?
+            .reshape((offsets.len(), seq_len, half))?;
+        Ok((cos, sin))
+    }
+
+    /// [`Self::apply`] with the table rows in hand: `cos`/`sin` are
+    /// `[seq, head_dim / 2]` (every batch row at the same positions) or
+    /// `[B, seq, head_dim / 2]` (each at its own).
+    pub fn apply_with(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let x = x.contiguous()?;
         if self.interleaved {
-            crate::nn::rotary_emb::rope_i(&x, &cos, &sin)
+            crate::nn::rotary_emb::rope_i(&x, cos, sin)
         } else {
-            crate::nn::rotary_emb::rope(&x, &cos, &sin)
+            crate::nn::rotary_emb::rope(&x, cos, sin)
         }
     }
 }
@@ -699,6 +729,36 @@ impl CtxCache {
         }
     }
 
+    /// [`Self::paged_view`] for B sequences at once: every cache a slot of
+    /// ONE shared pool set (`CtxKv::Paged { shared: true }`), the B blocks'
+    /// `k`/`v` (`[B, H_kv, block, D]`) scattered into their reserved slots
+    /// in one dispatch, the pool returned with B tables and B live counts —
+    /// what `sdpa_paged_ragged` reads in one dispatch. `None` when the rows
+    /// do not share a pool (the contiguous arm, one pool set per sequence),
+    /// and the caller attends per row.
+    #[cfg(feature = "metal")]
+    fn paged_rows_view(
+        caches: &[&CtxCache],
+        k: &Tensor,
+        v: &Tensor,
+        active: Option<&Tensor>,
+    ) -> Result<Option<paged_ctx::PagedRowsView>> {
+        let Some(first) = caches.first().and_then(|c| c.paged.as_ref()) else {
+            return Ok(None);
+        };
+        if !first.shared() {
+            return Ok(None);
+        }
+        let mut seqs = Vec::with_capacity(caches.len());
+        for c in caches {
+            match &c.paged {
+                Some(p) if p.same_pool(first) => seqs.push(p.seq()),
+                _ => return Ok(None),
+            }
+        }
+        first.block_view_rows(&seqs, k, v, active).map(Some)
+    }
+
     /// Drop the last `n` context positions — the draft-side half of a rollback.
     ///
     /// The draft has **no conv state** (all five `layer_types` are
@@ -737,6 +797,19 @@ mod paged_ctx {
     /// so a drafter and its target widen at the same cadence.
     const BUCKET_TOKENS: usize = 4096;
 
+    /// The pool, B tables and B live counts the tiled kernel reads B rows'
+    /// drafts over in one dispatch (`sdpa_paged_ragged`).
+    pub(super) struct PagedRowsView {
+        pub k: Tensor,
+        pub v: Tensor,
+        /// Every row's pages, `stride` entries each, padded with page 0.
+        pub tables: Vec<u32>,
+        pub stride: usize,
+        pub page_size: usize,
+        /// Per row: its context positions plus the block just written.
+        pub n_keys: Vec<u32>,
+    }
+
     /// The pool + table the tiled kernel reads a draft over.
     pub(super) struct PagedView {
         pub k: Tensor,
@@ -766,6 +839,13 @@ mod paged_ctx {
         /// Per sequence: the `reserve` slots past its live length, as the U32
         /// tensor the block scatter takes, and the largest of them.
         block: Vec<Option<(Tensor, usize)>>,
+        /// Every sequence's block slots in one `[n_seqs * reserve]` U32
+        /// tensor, sequence `s` at `s * reserve`, kept in step with `block`
+        /// through the mapped pointer: the batched draft's scatter takes the
+        /// active rows' slice of it in one dispatch. `None` until a host
+        /// write fails to map (CPU), when the batched view falls back to a
+        /// per-round upload.
+        block_all: Option<Tensor>,
     }
 
     /// The slot tensors one sequence's layers share within a round.
@@ -823,6 +903,7 @@ mod paged_ctx {
                     quarantine: PageQuarantine::new(),
                     kv: None,
                     block: vec![None; n_seqs.max(1)],
+                    block_all: None,
                 })
                 .collect();
             Self {
@@ -918,6 +999,7 @@ mod paged_ctx {
             let block: Vec<u32> = (start + n..start + n + reserve)
                 .map(|t| Self::slot(&pages, t, page_size))
                 .collect();
+            let block_vec = block.clone();
             let tokens = lp.pool.pool_pages() * page_size;
             if lp.kv.is_none() {
                 let shape = (1, n_kv_heads, tokens, head_dim);
@@ -940,7 +1022,47 @@ mod paged_ctx {
             let v = v.contiguous()?;
             k.kv_scatter_into(pk, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
             v.kv_scatter_into(pv, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
-            self.layers[layer].block[seq] = Some((block, block_max));
+            let device = k.device().clone();
+            self.set_block(layer, seq, block, block_max, &block_vec, &device)?;
+            Ok(())
+        }
+
+        /// Record `(layer, seq)`'s block slots — the per-sequence tensor the
+        /// single-row view scatters through, and the same `reserve` entries
+        /// written in place into the layer's `block_all` for the batched
+        /// view. Written between rounds only (an append, a rollback, a key),
+        /// when no queued dispatch reads either — the previous draft's
+        /// scatter completed with the verify that consumed it.
+        fn set_block(
+            &mut self,
+            layer: usize,
+            seq: usize,
+            block: Tensor,
+            block_max: usize,
+            slots: &[u32],
+            device: &Device,
+        ) -> Result<()> {
+            let (n_seqs, reserve) = (self.n_seqs, self.reserve);
+            let lp = &mut self.layers[layer];
+            lp.block[seq] = Some((block, block_max));
+            if slots.len() != reserve {
+                lloom_tensor::bail!(
+                    "DSpark paged ctx: {} block slots for a reserve of {reserve}",
+                    slots.len()
+                );
+            }
+            if lp.block_all.is_none() {
+                // An upload, not `zeros`: a pooled fill blit may still be
+                // queued when the first mapped write lands.
+                let zeros = vec![0u32; n_seqs * reserve];
+                lp.block_all = Some(Tensor::new(zeros.as_slice(), device)?);
+            }
+            let all = lp.block_all.as_ref().expect("set above");
+            // SAFETY: between rounds; see above.
+            if !unsafe { all.write_host_slice::<u32>(seq * reserve, slots) } {
+                // Unmapped (CPU): the batched view rebuilds from `block`.
+                lp.block_all = None;
+            }
             Ok(())
         }
 
@@ -988,11 +1110,12 @@ mod paged_ctx {
                 ));
             }
             let block_max = block.iter().copied().max().unwrap_or(0) as usize;
+            let block_vec = block.clone();
             let sh = &mut self.shared[seq];
             let mut blk = (std::mem::take(&mut sh.block), sh.block_t.take());
             let block = Self::upload(&mut blk, block, device)?;
             (sh.block, sh.block_t) = blk;
-            self.layers[layer].block[seq] = Some((block, block_max));
+            self.set_block(layer, seq, block, block_max, &block_vec, device)?;
             Ok(())
         }
 
@@ -1044,6 +1167,95 @@ mod paged_ctx {
             })
         }
 
+        /// [`Self::block_view`] for `seqs` at once: the B blocks' `k`/`v`
+        /// (`[B, H_kv, width, D]`, row `b` sequence `seqs[b]`'s) scattered
+        /// into their reserved slots in ONE dispatch through the layer's
+        /// `block_all` (the active rows' slice when `seqs` is `0..B`, else a
+        /// gather by `active`), the pool handed back with every row's table
+        /// and live count for `sdpa_paged_ragged`.
+        fn block_view_rows(
+            &mut self,
+            layer: usize,
+            seqs: &[usize],
+            k: &Tensor,
+            v: &Tensor,
+            active: Option<&Tensor>,
+        ) -> Result<PagedRowsView> {
+            let (b, n_kv_heads, width, head_dim) = k.dims4()?;
+            if b != seqs.len() || width > self.reserve {
+                lloom_tensor::bail!(
+                    "DSpark paged ctx: blocks [{b}, _, {width}, _] for {} sequences against {} \
+                     reserved slots",
+                    seqs.len(),
+                    self.reserve
+                );
+            }
+            let page_size = self.page_size;
+            let reserve = self.reserve;
+            for &seq in seqs {
+                if self.layers[layer].kv.is_none() || self.layers[layer].block[seq].is_none() {
+                    self.key_empty(layer, seq, n_kv_heads, head_dim, k.dtype(), k.device())?;
+                }
+            }
+            let lp = &self.layers[layer];
+            let (pk, pv) = lp.kv.as_ref().expect("keyed above");
+            let tokens = lp.pool.pool_pages() * page_size;
+            let prefix = seqs.iter().enumerate().all(|(i, &s)| s == i);
+            // The B rows' block slots as one `[B * width]` list, in row order.
+            let slots = match (&lp.block_all, active) {
+                (Some(all), _) if prefix && width == reserve => all.narrow(0, 0, b * reserve)?,
+                (Some(all), Some(idx)) if width == reserve => all
+                    .reshape((self.n_seqs, reserve))?
+                    .index_select(idx, 0)?
+                    .flatten_all()?,
+                _ => {
+                    let parts: Vec<Tensor> = seqs
+                        .iter()
+                        .map(|&s| {
+                            lp.block[s]
+                                .as_ref()
+                                .expect("keyed above")
+                                .0
+                                .narrow(0, 0, width)
+                        })
+                        .collect::<Result<_>>()?;
+                    Tensor::cat(&parts, 0)?
+                }
+            };
+            let max_slot = seqs
+                .iter()
+                .map(|&s| lp.block[s].as_ref().expect("keyed above").1)
+                .max()
+                .unwrap_or(0);
+            let k = k.contiguous()?;
+            let v = v.contiguous()?;
+            k.kv_scatter_into(pk, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
+            v.kv_scatter_into(pv, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
+            let stride = seqs
+                .iter()
+                .map(|&s| lp.pool.seq(s).map(|p| p.pages().len()).unwrap_or(0))
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let mut tables = Vec::with_capacity(b * stride);
+            let mut n_keys = Vec::with_capacity(b);
+            for &s in seqs {
+                let sp = lp.pool.seq(s).expect("seq within n_seqs");
+                let mut t = sp.pages().to_vec();
+                t.resize(stride, 0);
+                tables.extend(t);
+                n_keys.push((sp.len() + width) as u32);
+            }
+            Ok(PagedRowsView {
+                k: pk.clone(),
+                v: pv.clone(),
+                tables,
+                stride,
+                page_size,
+                n_keys,
+            })
+        }
+
         fn len(&self, layer: usize, seq: usize) -> usize {
             self.layers[layer]
                 .pool
@@ -1085,11 +1297,12 @@ mod paged_ctx {
                     .map(|t| Self::slot(&pages, t, page_size))
                     .collect();
                 let max = slots.iter().copied().max().unwrap_or(0) as usize;
+                let slots_vec = slots.clone();
                 let sh = &mut self.shared[seq];
                 let mut blk = (std::mem::take(&mut sh.block), sh.block_t.take());
                 let block = Self::upload(&mut blk, slots, &device)?;
                 (sh.block, sh.block_t) = blk;
-                self.layers[layer].block[seq] = Some((block, max));
+                self.set_block(layer, seq, block, max, &slots_vec, &device)?;
             }
             Ok(())
         }
@@ -1227,6 +1440,27 @@ mod paged_ctx {
 
         pub(super) fn block_view(&self, k: &Tensor, v: &Tensor) -> Result<PagedView> {
             self.lock().block_view(self.layer, self.seq, k, v)
+        }
+
+        /// Whether `other` is a handle over the same pool set (the batched
+        /// draft's one-dispatch condition).
+        pub(super) fn same_pool(&self, other: &PagedCtx) -> bool {
+            Arc::ptr_eq(&self.shared, &other.shared) && self.layer == other.layer
+        }
+
+        pub(super) fn seq(&self) -> usize {
+            self.seq
+        }
+
+        /// [`Self::block_view`] for the rows `seqs` of this handle's pool set.
+        pub(super) fn block_view_rows(
+            &self,
+            seqs: &[usize],
+            k: &Tensor,
+            v: &Tensor,
+            active: Option<&Tensor>,
+        ) -> Result<PagedRowsView> {
+            self.lock().block_view_rows(self.layer, seqs, k, v, active)
         }
 
         pub(super) fn rollback(&self, to: usize) -> Result<()> {
@@ -1441,7 +1675,95 @@ impl DSparkAttention {
         cache: &CtxCache,
     ) -> Result<Tensor> {
         let (b, seq, _) = hidden.dims3()?;
+        let (q, k, v) = self.project(hidden)?;
+        let q = rotary.apply(&q, block_offset)?;
+        let k = rotary.apply(&k, block_offset)?;
+        let out = self.attend_one(&q, &k, &v, cache)?;
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, seq, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out)
+    }
 
+    /// [`Self::forward`] over B rows in ONE pass: the projections, the norms,
+    /// the RoPE (each row at its own position through `cos`/`sin`
+    /// `[B, seq, D/2]`) and `o_proj` batched at `m = B·seq`; the attention
+    /// one `sdpa_paged_ragged` dispatch when the rows' caches are slots of
+    /// one shared paged pool, else per row over its own context — the same
+    /// kernels a one-row draft takes, per row (`batched-decode-design.md`
+    /// §12.8's batched draft). `caches[b]` is row `b`'s cache for this layer.
+    fn forward_rows(
+        &self,
+        hidden: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        rotary: &DSparkRotary,
+        caches: &[&CtxCache],
+        active: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b, seq, _) = hidden.dims3()?;
+        if caches.len() != b {
+            lloom_tensor::bail!("DSpark forward_rows: {b} rows and {} caches", caches.len());
+        }
+        let (q, k, v) = self.project(hidden)?;
+        let q = rotary.apply_with(&q, cos, sin)?;
+        let k = rotary.apply_with(&k, cos, sin)?;
+        let scale = 1f64 / (self.head_dim as f64).sqrt();
+        #[cfg(feature = "metal")]
+        let out = match CtxCache::paged_rows_view(caches, &k, &v, active)? {
+            Some(view) => crate::nn::ops::sdpa_paged_ragged(
+                &q,
+                &view.k,
+                &view.v,
+                false,
+                scale as f32,
+                view.page_size,
+                view.tables,
+                view.stride,
+                view.n_keys,
+            )?,
+            None => self.attend_rows_each(&q, &k, &v, caches)?,
+        };
+        #[cfg(not(feature = "metal"))]
+        let out = {
+            let _ = (active, scale);
+            self.attend_rows_each(&q, &k, &v, caches)?
+        };
+        let out = out
+            .transpose(1, 2)?
+            .reshape((b, seq, self.num_heads * self.head_dim))?;
+        self.o_proj.forward(&out)
+    }
+
+    /// Each row's attention over its own context, the rows' outputs stacked:
+    /// the arm when the caches share no pool.
+    fn attend_rows_each(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        caches: &[&CtxCache],
+    ) -> Result<Tensor> {
+        let mut outs = Vec::with_capacity(caches.len());
+        for (r, cache) in caches.iter().enumerate() {
+            outs.push(self.attend_one(
+                &q.narrow(0, r, 1)?,
+                &k.narrow(0, r, 1)?,
+                &v.narrow(0, r, 1)?,
+                cache,
+            )?);
+        }
+        if outs.len() == 1 {
+            return Ok(outs.remove(0));
+        }
+        Tensor::cat(&outs, 0)
+    }
+
+    /// The three projections and the per-head norms over `[b, seq, hidden]`:
+    /// `(q, k, v)` in `[b, heads, seq, head_dim]`, `q`/`k` normed and NOT yet
+    /// rotated.
+    fn project(&self, hidden: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let (b, seq, _) = hidden.dims3()?;
         let q = self
             .q_proj
             .forward(hidden)?
@@ -1456,12 +1778,15 @@ impl DSparkAttention {
             .reshape((b, seq, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-
         let q = self.norm_heads(&q, &self.q_norm, b, seq, self.num_heads)?;
         let k = self.norm_heads(&k, &self.k_norm, b, seq, self.num_kv_heads)?;
-        let q = rotary.apply(&q, block_offset)?;
-        let k = rotary.apply(&k, block_offset)?;
+        Ok((q, k, v))
+    }
 
+    /// One row's block attention over `[context ‖ block]`: `q`/`k`/`v` are
+    /// the rotated `[1, heads, seq, D]` projections; the result is
+    /// `[1, heads, seq, D]` before `o_proj`.
+    fn attend_one(&self, q: &Tensor, k: &Tensor, v: &Tensor, cache: &CtxCache) -> Result<Tensor> {
         let scale = 1f64 / (self.head_dim as f64).sqrt();
 
         // The paged arm (#708): the block's K/V go into the slots reserved past
@@ -1470,10 +1795,10 @@ impl DSparkAttention {
         // kernel as the fused arm below, its K/V address one page-walk apart,
         // bit-identical on the same keys (`lloom/tests/sdpa.rs`).
         #[cfg(feature = "metal")]
-        if let Some(view) = cache.paged_view(&k, &v)? {
+        if let Some(view) = cache.paged_view(k, v)? {
             let table_len = view.table_len();
-            let out = crate::nn::ops::sdpa_paged(
-                &q,
+            return crate::nn::ops::sdpa_paged(
+                q,
                 &view.k,
                 &view.v,
                 false,
@@ -1482,21 +1807,17 @@ impl DSparkAttention {
                 view.table,
                 table_len,
                 view.n_keys,
-            )?;
-            let out = out
-                .transpose(1, 2)?
-                .reshape((b, seq, self.num_heads * self.head_dim))?;
-            return self.o_proj.forward(&out);
+            );
         }
 
         // Context first, block second — the key order the context's own RoPE
         // offsets assume, and the order mlx-dspark concatenates in.
         let (k, v) = match (&cache.k, &cache.v) {
             (Some(ck), Some(cv)) => (
-                Tensor::cat(&[ck, &k], 2)?.contiguous()?,
-                Tensor::cat(&[cv, &v], 2)?.contiguous()?,
+                Tensor::cat(&[ck, k], 2)?.contiguous()?,
+                Tensor::cat(&[cv, v], 2)?.contiguous()?,
             ),
-            _ => (k, v),
+            _ => (k.clone(), v.clone()),
         };
 
         // Two arms, one answer. The eager arm below is the reference and the CPU
@@ -1520,7 +1841,7 @@ impl DSparkAttention {
             // ctx+seq, head_dim] — the layout `sdpa` reads, and `q_seq = seq > 1`
             // always (the draft block is a fixed γ ≥ 2, §10.2m), so it takes the
             // full-attention route rather than the seq==1 vector one.
-            crate::nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)?
+            crate::nn::ops::sdpa(q, &k, &v, None, false, scale as f32, 1.0)?
         } else {
             let k = crate::utils::repeat_kv(k, self.num_kv_groups)?;
             let v = crate::utils::repeat_kv(v, self.num_kv_groups)?;
@@ -1528,11 +1849,7 @@ impl DSparkAttention {
             let attn = crate::nn::ops::softmax_last_dim(&attn)?;
             attn.matmul(&v)?
         };
-
-        let out = out
-            .transpose(1, 2)?
-            .reshape((b, seq, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&out)
+        Ok(out)
     }
 }
 
@@ -1573,6 +1890,28 @@ impl DSparkLayer {
         let residual = hidden;
         let h = self.input_layernorm.forward(hidden)?;
         let h = self.self_attn.forward(&h, block_offset, rotary, cache)?;
+        let h = (residual + h)?;
+        let residual = &h;
+        let x = self.post_attention_layernorm.forward(&h)?;
+        let x = self.mlp.forward(&x)?;
+        residual + x
+    }
+
+    /// [`Self::forward`] over B rows at once (`DSparkAttention::forward_rows`).
+    fn forward_rows(
+        &self,
+        hidden: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        rotary: &DSparkRotary,
+        caches: &[&CtxCache],
+        active: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let residual = hidden;
+        let h = self.input_layernorm.forward(hidden)?;
+        let h = self
+            .self_attn
+            .forward_rows(&h, cos, sin, rotary, caches, active)?;
         let h = (residual + h)?;
         let residual = &h;
         let x = self.post_attention_layernorm.forward(&h)?;
@@ -1649,6 +1988,16 @@ impl MarkovHead {
         let rank = r.dim(1)?;
         let w2 = self.w2.to_dtype(r.dtype())?;
         w2.matmul(&r.reshape((rank, 1))?)?.squeeze(1)
+    }
+
+    /// [`Self::step_bias_at`] for B previous tokens at once (`[B]` `U32`):
+    /// `[B, vocab]`, one `W₂ · W₁[tokens]ᵀ` for the batch. The same products
+    /// per row; the tile's accumulation order is the GEMM's (§2.3.3 tier 2),
+    /// which moves a draft only at a near-tie and never the verified stream.
+    pub fn step_bias_rows(&self, tokens: &Tensor) -> Result<Tensor> {
+        let r = self.prev_embeddings(tokens)?; // [B, rank]
+        let w2 = self.w2.to_dtype(r.dtype())?; // [vocab, rank]
+        w2.matmul(&r.t()?.contiguous()?)?.t()?.contiguous() // [B, vocab]
     }
 }
 
@@ -1977,6 +2326,47 @@ impl DSparkDrafter {
         self.norm.forward(&h)
     }
 
+    /// [`Self::block_hidden`] over B rows at once: `block_embeds` is
+    /// `[B, width, hidden]`, row `b` attends its own `caches[b]` (one cache
+    /// per layer) at its own `offsets[b]`. Returns `[B, width, hidden]` after
+    /// the final norm. The projections, norms and MLPs run once at
+    /// `m = B·width`; the attention is one dispatch over a shared paged pool,
+    /// else per row (`DSparkAttention::forward_rows`). `active`, when the
+    /// rows are a subset of a shared pool's sequences, is their `[B]` `U32`
+    /// index into it.
+    pub fn block_hidden_rows(
+        &self,
+        block_embeds: &Tensor,
+        offsets: &[usize],
+        caches: &[&[CtxCache]],
+        active: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b, width, _) = block_embeds.dims3()?;
+        if caches.len() != b || offsets.len() != b {
+            lloom_tensor::bail!(
+                "DSpark block_hidden_rows: {b} rows, {} cache sets, {} offsets (issue #148)",
+                caches.len(),
+                offsets.len()
+            );
+        }
+        for (r, c) in caches.iter().enumerate() {
+            if c.len() != self.layers.len() {
+                lloom_tensor::bail!(
+                    "DSpark drafter has {} layers and row {r} has {} context caches",
+                    self.layers.len(),
+                    c.len()
+                );
+            }
+        }
+        let (cos, sin) = self.rotary.rows(offsets, width)?;
+        let mut h = block_embeds.clone();
+        for (l, layer) in self.layers.iter().enumerate() {
+            let row_caches: Vec<&CtxCache> = caches.iter().map(|c| &c[l]).collect();
+            h = layer.forward_rows(&h, &cos, &sin, &self.rotary, &row_caches, active)?;
+        }
+        self.norm.forward(&h)
+    }
+
     /// The block positions whose logits are draft predictions:
     /// `[:, logits_start .. logits_start + cap, :]`.
     ///
@@ -2039,6 +2429,36 @@ impl DSparkDrafter {
         Tensor::cat(&picks, 0)
     }
 
+    /// [`Self::sample_block`] over B rows: `base_logits` is `[B, cap, vocab]`,
+    /// `first_prev` the B anchors (`[B]` `U32`); returns `[B, cap]` `U32`,
+    /// the chain on the device — at each position one bias for the batch
+    /// (`MarkovHead::step_bias_rows`) and one argmax over `[B, vocab]`.
+    pub fn sample_block_rows(&self, base_logits: &Tensor, first_prev: &Tensor) -> Result<Tensor> {
+        let (b, cap, _) = base_logits.dims3()?;
+        if first_prev.dims1()? != b {
+            lloom_tensor::bail!(
+                "DSpark sample_block_rows: {b} rows and {} anchors",
+                first_prev.dims1()?
+            );
+        }
+        let mut picks = Vec::with_capacity(cap);
+        let mut prev = first_prev.clone();
+        for k in 0..cap {
+            let rows = base_logits.narrow(1, k, 1)?.squeeze(1)?; // [B, vocab]
+            let rows = match &self.markov {
+                None => rows,
+                Some(m) => {
+                    let bias = m.step_bias_rows(&prev)?.to_dtype(rows.dtype())?;
+                    (rows + bias)?
+                }
+            };
+            let next = rows.argmax(D::Minus1)?; // [B]
+            picks.push(next.unsqueeze(1)?);
+            prev = next;
+        }
+        Tensor::cat(&picks, 1)
+    }
+
     /// Per-position accept probabilities for a drafted block.
     ///
     /// `block_hidden` is [`Self::head_slice`]'s output squeezed to
@@ -2073,6 +2493,23 @@ impl DSparkDrafter {
         let hidden = block_hidden.to_dtype(self.dtype)?;
         let feats = Tensor::cat(&[&hidden, &prev], D::Minus1)?.contiguous()?;
         Ok(Some(head.forward(&feats)?))
+    }
+
+    /// [`Self::confidence_scores`] over B rows: `block_hidden` `[B, cap,
+    /// hidden]`, `prev_tokens` `[B, cap]`; returns `[B, cap]`. The head is
+    /// per position, so the rows are one `[B·cap]` batch through it.
+    pub fn confidence_scores_rows(
+        &self,
+        block_hidden: &Tensor,
+        prev_tokens: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        let (b, cap, hidden) = block_hidden.dims3()?;
+        let flat = block_hidden.reshape((b * cap, hidden))?;
+        let prev = prev_tokens.reshape(b * cap)?;
+        Ok(match self.confidence_scores(&flat, &prev)? {
+            Some(scores) => Some(scores.reshape((b, cap))?),
+            None => None,
+        })
     }
 }
 
@@ -2214,6 +2651,16 @@ pub struct DSparkSpeculator {
     confidence_wanted: bool,
     /// The context KV arm every slot's caches were built on.
     ctx_kv: CtxKv,
+    /// The batched draft's device slots, one row per sequence, rewritten in
+    /// place through the mapped pointer between rounds (`PerSeq::block_slot`'s
+    /// discipline): every sequence's block ids `[n_seq, block_size]`, its
+    /// anchor `[n_seq]`, and the active rows' indices `[n_seq]`.
+    blocks: Tensor,
+    anchors: Tensor,
+    active_slot: Tensor,
+    /// Drafts taken batched (`draft` over more than one row), for a gate that
+    /// asserts the batched arm ran.
+    batched_drafts: u64,
 }
 
 impl DSparkSpeculator {
@@ -2262,6 +2709,16 @@ impl DSparkSpeculator {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let rows = n_seq.max(1);
+        let all_blocks: Vec<u32> = mask_block
+            .iter()
+            .copied()
+            .cycle()
+            .take(rows * block_size)
+            .collect();
+        let blocks = Tensor::new(all_blocks.as_slice(), &device)?.reshape((rows, block_size))?;
+        let anchors = Tensor::new(vec![0u32; rows].as_slice(), &device)?;
+        let active_slot = Tensor::new(vec![0u32; rows].as_slice(), &device)?;
         Ok(Self {
             drafter,
             embed,
@@ -2271,7 +2728,16 @@ impl DSparkSpeculator {
             max_draft,
             confidence_wanted: false,
             ctx_kv,
+            blocks,
+            anchors,
+            active_slot,
+            batched_drafts: 0,
         })
+    }
+
+    /// Drafts taken over more than one row in one drafter pass.
+    pub fn batched_drafts(&self) -> u64 {
+        self.batched_drafts
     }
 
     /// The context KV arm this proposer runs on.
@@ -2316,6 +2782,132 @@ impl DSparkSpeculator {
         // Complete the compile here rather than leaking it into round 0.
         device.synchronize()?;
         Ok(())
+    }
+
+    /// [`Self::warmup`] for the batched draft: one `n`-row draft over the
+    /// first `n` slots (empty contexts), so the `m = n·γ` GEMMs, the ragged
+    /// paged attention and the batched Markov chain compile off the clock.
+    pub fn warmup_rows(&mut self, n: usize, device: &Device) -> Result<()> {
+        let n = n.min(self.seqs.len());
+        if n < 2 {
+            return self.warmup(device);
+        }
+        let was_wanted = self.confidence_wanted;
+        self.confidence_wanted = self.drafter.confidence_head().is_some();
+        let active: Vec<SeqId> = (0..n).map(SeqId).collect();
+        let result = self.draft_rows(&active);
+        self.confidence_wanted = was_wanted;
+        result?;
+        device.synchronize()?;
+        Ok(())
+    }
+
+    /// The batched draft: every row's block in ONE drafter pass — the
+    /// block ids and anchors gathered from the per-sequence slots, one
+    /// `[B, γ]` embedding, `block_hidden_rows`, one `lm_head` over the B
+    /// blocks' prediction slots, the Markov chain over `[B, vocab]` per
+    /// position — and B `Draft`s, each row's tokens a `[cap]` view of the
+    /// `[B, cap]` block on the device.
+    fn draft_rows(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        let b = active.len();
+        let device = self.blocks.device().clone();
+        let mut mapped = true;
+        let mut ids_host: Vec<u32> = Vec::new();
+        let mut anchors_host: Vec<u32> = Vec::with_capacity(b);
+        let mut offsets = Vec::with_capacity(b);
+        for &seq in active {
+            let s = self
+                .seqs
+                .get(seq.0)
+                .ok_or_else(|| lloom_tensor::Error::msg(format!("DSpark: no slot {}", seq.0)))?;
+            // SAFETY: between rounds — the previous draft's gathers have run
+            // by the time the verify that consumed it was read back.
+            mapped &= unsafe {
+                self.blocks
+                    .write_host_slice::<u32>(seq.0 * self.block_size, &[s.last])
+            };
+            mapped &= unsafe { self.anchors.write_host_slice::<u32>(seq.0, &[s.last]) };
+            anchors_host.push(s.last);
+            offsets.push(s.ctx_offset);
+        }
+        let prefix = active.iter().enumerate().all(|(i, s)| s.0 == i);
+        let (ids, anchors, active_t) = if mapped && prefix {
+            (
+                self.blocks.narrow(0, 0, b)?,
+                self.anchors.narrow(0, 0, b)?,
+                None,
+            )
+        } else if mapped {
+            let idx: Vec<u32> = active.iter().map(|s| s.0 as u32).collect();
+            // SAFETY: as above.
+            let ok = unsafe { self.active_slot.write_host_slice::<u32>(0, &idx) };
+            let idx_t = if ok {
+                self.active_slot.narrow(0, 0, b)?
+            } else {
+                Tensor::new(idx.as_slice(), &device)?
+            };
+            (
+                self.blocks.index_select(&idx_t, 0)?,
+                self.anchors.index_select(&idx_t, 0)?,
+                Some(idx_t),
+            )
+        } else {
+            // Unmapped storage (CPU): upload the batch.
+            for &a in &anchors_host {
+                ids_host.extend(self.drafter.block_input_ids(a, self.block_size));
+            }
+            let idx: Vec<u32> = active.iter().map(|s| s.0 as u32).collect();
+            (
+                Tensor::new(ids_host.as_slice(), &device)?.reshape((b, self.block_size))?,
+                Tensor::new(anchors_host.as_slice(), &device)?,
+                if prefix {
+                    None
+                } else {
+                    Some(Tensor::new(idx.as_slice(), &device)?)
+                },
+            )
+        };
+        let caches: Vec<&[CtxCache]> = active
+            .iter()
+            .map(|s| self.seqs[s.0].ctx.as_slice())
+            .collect();
+        let block_embeds = self.drafter.embed_block(&self.embed.forward(&ids)?)?;
+        let hidden =
+            self.drafter
+                .block_hidden_rows(&block_embeds, &offsets, &caches, active_t.as_ref())?;
+        let pred = self.drafter.head_slice(&hidden, self.max_draft)?; // [B, cap, hidden]
+        let (_, cap, h) = pred.dims3()?;
+        let base_logits = self
+            .lm_head
+            .forward(
+                &pred
+                    .reshape((b * cap, h))?
+                    .to_dtype(self.embed.embeddings().dtype())?,
+            )?
+            .to_dtype(DType::F32)?
+            .reshape((b, cap, ()))?;
+        let tokens = self.drafter.sample_block_rows(&base_logits, &anchors)?; // [B, cap]
+        let confidence: Vec<Vec<f32>> = match self.drafter.confidence_head() {
+            Some(_) if self.confidence_wanted => {
+                let head = self.drafter.head_slice(&hidden, cap)?;
+                let prev =
+                    Tensor::cat(&[&anchors.unsqueeze(1)?, &tokens.narrow(1, 0, cap - 1)?], 1)?;
+                match self.drafter.confidence_scores_rows(&head, &prev)? {
+                    Some(scores) => scores.to_dtype(DType::F32)?.to_vec2::<f32>()?,
+                    None => vec![Vec::new(); b],
+                }
+            }
+            _ => vec![Vec::new(); b],
+        };
+        self.batched_drafts += 1;
+        let mut out = Vec::with_capacity(b);
+        for (r, conf) in confidence.into_iter().enumerate() {
+            out.push(Draft {
+                tokens: DraftTokens::Device(tokens.narrow(0, r, 1)?.squeeze(0)?),
+                confidence: conf,
+            });
+        }
+        Ok(out)
     }
 
     fn seq_mut(&mut self, seq: SeqId) -> Result<&mut PerSeq> {
@@ -2407,11 +2999,6 @@ impl Speculator for DSparkSpeculator {
     }
 
     fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
-        // Per-seq state is private and `draft_one` reads it immutably, so the
-        // batch is built without a mutable borrow of `self.seqs` outliving the
-        // loop. B>1 amortizes the target's verify pass (§10.2r); the proposals
-        // themselves are per-seq drafter forwards.
-        let mut out = Vec::with_capacity(active.len());
         for &seq in active {
             let s = self
                 .seqs
@@ -2420,9 +3007,16 @@ impl Speculator for DSparkSpeculator {
             if !s.active {
                 lloom_tensor::bail!("DSpark: draft on sequence {} before begin()", seq.0);
             }
-            out.push(self.draft_one(s)?);
         }
-        Ok(out)
+        // One row is the one-row draft, byte for byte; more than one is ONE
+        // drafter pass over every row's block (`draft_rows`): the drafter's
+        // weights swept once for the batch, the block attention of a shared
+        // paged pool in one dispatch — the round's serial drafts were the
+        // term that flattened continuous DSpark past B = 2 (§12.8).
+        if active.len() == 1 {
+            return Ok(vec![self.draft_one(&self.seqs[active[0].0])?]);
+        }
+        self.draft_rows(active)
     }
 
     fn observe(

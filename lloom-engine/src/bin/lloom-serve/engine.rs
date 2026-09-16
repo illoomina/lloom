@@ -23,7 +23,7 @@ use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::lfm2::{
     AttnImpl, BatchPool, Cache, Config, ConvState, KvAppend, Lfm2Config, MemoryBudget, Model,
 };
-use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
+use lloom::models::lfm2_dspark::{CtxKv, DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, Sequence, Session, VarBuilder};
 use lloom_engine::{
     ring_eos_read, spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRequest,
@@ -58,16 +58,17 @@ struct Single {
     spec: Option<DSparkSpeculator>,
 }
 
-/// The drafter the batch thread holds (`--dspark --batch N`): the static
-/// body's and the closed jobs'.
-/// The batch thread's proposers: one for the closed cells (the static
-/// pipelined body, `decode_spec_batched`), one the continuous speculative
-/// driver takes for itself at start (`MakeDriver`). Two drafters, so a cell
-/// can run while the continuous driver holds its own — the cost of one
-/// drafter's weights again (`batched-decode-design.md` §12.4).
+/// The batch thread's ONE drafter (`--dspark --batch N`). On the pool arms
+/// the continuous speculative driver takes it at start (`MakeDriver`) and
+/// the closed cells run THROUGH that driver (`Idle::driver`,
+/// `drive_closed_rows`); on the private arm the static pipelined body and
+/// the closed cells borrow it here. One drafter's weights either way
+/// (`batched-decode-design.md` §12.9).
 pub struct Speculators {
-    pub closed: Option<DSparkSpeculator>,
-    pub continuous: Option<DSparkSpeculator>,
+    pub spec: Option<DSparkSpeculator>,
+    /// Whether the scheduler's continuous driver is the speculative loop
+    /// (the pool arms): `make_driver` then takes `spec` for it.
+    pub continuous: bool,
     /// The continuous driver's EOS set (the verify's accept rule reads one
     /// set per batch).
     pub eos_ids: Vec<u32>,
@@ -81,14 +82,17 @@ impl lloom_engine::MakeDriver<Model> for Speculators {
         device: &Device,
     ) -> lloom_tensor::Result<Option<lloom_engine::Driver<'m, Model>>> {
         let _ = model;
-        match self.continuous.take() {
+        if !self.continuous {
+            return Ok(None);
+        }
+        match self.spec.take() {
             Some(spec) => {
-                let dec = lloom::nn::SpecBatchDecoder::<'m, Model, DSparkSpeculator, Session<'m, Model>>::new(
-                    spec,
-                    opts.clone(),
-                    &self.eos_ids,
-                    device.clone(),
-                )?;
+                let dec = lloom::nn::SpecBatchDecoder::<
+                    'm,
+                    Model,
+                    DSparkSpeculator,
+                    Session<'m, Model>,
+                >::new(spec, opts.clone(), &self.eos_ids, device.clone())?;
                 Ok(Some(Box::new(dec)))
             }
             None => Ok(None),
@@ -480,11 +484,27 @@ impl Engine {
             };
             let drafter = DSparkDrafter::new(dcfg.clone(), max_pos, dvb)
                 .context("constructing DSpark drafter")?;
-            let mut spec = DSparkSpeculator::new(
+            // The drafter's context KV: on the pool arms at N > 1 one paged
+            // pool set shared by every sequence — the shape the batched
+            // draft's block attention reads in ONE dispatch (§12.9); a
+            // per-sequence pool or the contiguous arm attends per row. The
+            // static pipelined driver (private) keeps the contiguous default
+            // (§10.2z: a shared pool costs THAT driver its overlap). An
+            // explicit `LLOOM_DSPARK_CTX_KV` wins on every arm.
+            let ctx_kv = match std::env::var("LLOOM_DSPARK_CTX_KV") {
+                Ok(v) => CtxKv::parse(&v)?,
+                Err(_) if pooled && n_seq > 1 => CtxKv::Paged {
+                    page_size: CtxKv::DEFAULT_PAGE_SIZE,
+                    shared: true,
+                },
+                Err(_) => CtxKv::Contiguous,
+            };
+            let mut spec = DSparkSpeculator::new_with_ctx(
                 drafter,
                 core.model.draft_embedding().clone(),
                 core.model.lm_head_linear().clone(),
                 n_seq,
+                ctx_kv,
             )
             .context("constructing DSpark speculator")?;
             eprintln!(
@@ -497,7 +517,9 @@ impl Engine {
                 spec.ctx_kv().name()
             );
             if opts.warmup {
-                spec.warmup(&core.device)
+                // The batched draft's pipelines too (`m = n_seq·γ`, the
+                // ragged paged attention, the batched Markov chain).
+                spec.warmup_rows(n_seq, &core.device)
                     .context("warming DSpark drafter pipelines")?;
             }
             Ok(spec)
@@ -532,19 +554,16 @@ impl Engine {
             }
         }
         let pool = SlotPool::new(opts.batch, || caches.pop().expect("one cache per slot"));
-        // The closed cells' proposer, and — on the pool arms — the continuous
-        // driver's own (two drafters; §12.4).
+        // The one drafter: the continuous driver's on the pool arms (the
+        // closed cells run through the driver), the static body's and the
+        // closed cells' on the private arm (§12.9).
         let extra: Extra = Speculators {
-            closed: if dcfg.is_some() {
+            spec: if dcfg.is_some() {
                 Some(build_spec(opts.batch)?)
             } else {
                 None
             },
-            continuous: if dcfg.is_some() && pooled {
-                Some(build_spec(opts.batch)?)
-            } else {
-                None
-            },
+            continuous: dcfg.is_some() && pooled,
             eos_ids: engine.text.eos_ids.clone(),
         };
         let batch_opts = DecodeOptions {
@@ -580,45 +599,82 @@ impl Engine {
             opts.batch,
             opts.prefill_tile,
             opts.prefill_chunk,
-            if dcfg.is_some() {
-                "static batches through the pipelined speculative driver"
-            } else {
-                "continuous batching"
+            match (dcfg.is_some(), pooled) {
+                (true, true) => "continuous speculative batching (one drafter, batched drafts)",
+                (true, false) => "static batches through the pipelined speculative driver",
+                (false, _) => "continuous batching",
             }
         );
         engine.sched = Some(handle);
         *lock(&engine.sched_thread) = Some(thread);
-        if opts.warmup && dcfg.is_none() {
+        if opts.warmup {
             // The batched GEMM pipelines at `m = N` key their own `align_m`
-            // variants (§13.1i): compile them off every request's clock.
+            // variants (§13.1i), the prefill piece's at `m = tile` and, under
+            // `--dspark`, the batched draft's and the ragged verify's: compile
+            // them off every request's clock, with `N` rows — a one-row
+            // warmup left the first batched cell paying them (§12.8: the
+            // rotation-1 pool cells up to 15 % under rotation 2's).
             let n = opts.batch;
-            let tile = opts.prefill_tile;
+            let tile = opts.prefill_tile.max(8);
+            let dspark = dcfg.is_some();
             engine
                 .closed(move |idle| -> Result<()> {
                     with_sessions(idle, n, |idle, sessions| {
-                        let prompt: Vec<u32> = vec![0u32; 8];
-                        let prompts: Vec<&[u32]> = vec![prompt.as_slice(); n];
+                        // One prompt a tile long beside the short ones: the
+                        // piece GEMMs and the long row's attention compile too.
+                        let short: Vec<u32> = vec![0u32; 8];
+                        let long: Vec<u32> = vec![0u32; tile];
+                        let prompts: Vec<&[u32]> = (0..n)
+                            .map(|i| {
+                                if i == 0 {
+                                    long.as_slice()
+                                } else {
+                                    short.as_slice()
+                                }
+                            })
+                            .collect();
                         let warm = DecodeOptions {
                             lookahead: 1,
                             prefill_tile: tile,
                             ..DecodeOptions::new(4)
                         };
-                        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
-                        let _ = Session::decode_batched(
-                            sessions,
-                            &mut sampler,
-                            &prompts,
-                            &warm,
-                            &NEVER_EOS,
-                            idle.device,
-                            &mut |_, _| Ok(()),
-                        )?;
+                        if dspark {
+                            let _ = run_spec_rows(
+                                pooled,
+                                idle,
+                                sessions,
+                                &prompts,
+                                &warm,
+                                &NEVER_EOS,
+                                &mut |_, _| Ok(()),
+                            )?;
+                        } else {
+                            let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+                            let _ = Session::decode_batched(
+                                sessions,
+                                &mut sampler,
+                                &prompts,
+                                &warm,
+                                &NEVER_EOS,
+                                idle.device,
+                                &mut |_, _| Ok(()),
+                            )?;
+                        }
                         idle.device.synchronize()?;
                         Ok(())
                     })
                 })
                 .context("warming the batched pipelines")??;
-            eprintln!("[batch: warmed the m={} pipelines]", opts.batch);
+            eprintln!(
+                "[batch: warmed the m={} pipelines{} ({} rows, one prompt of {tile})]",
+                opts.batch,
+                if dspark {
+                    " and the speculative round's"
+                } else {
+                    ""
+                },
+                n
+            );
         }
         Ok(engine)
     }
@@ -902,25 +958,19 @@ impl Engine {
                 let t = Instant::now();
                 let forwards = if dspark {
                     // The speculative driver has no prefill-only entry; its
-                    // prefill is the pipelined driver's streamed one, one token
-                    // of output per row.
-                    let spec = idle
-                        .extra
-                        .closed
-                        .as_mut()
-                        .context("no drafter on the batch thread")?;
+                    // prefill is the speculative loop's streamed one, one
+                    // token of output per row.
                     let opts = DecodeOptions {
                         prefill_tile: tile,
                         ..DecodeOptions::new(1)
                     };
                     let outs = run_spec_rows(
                         pooled,
+                        idle,
                         sessions,
-                        spec,
                         &refs,
                         &opts,
                         &NEVER_EOS,
-                        idle.device,
                         &mut |_, _| Ok(()),
                     )?;
                     outs.iter().map(|o| o.stats.prefill_units).sum()
@@ -991,11 +1041,6 @@ impl Engine {
                         // decode (its verify holds no resumable logits): one run of
                         // `D` tokens per row, the prompts' submit time subtracted;
                         // the prefills' GPU tail is inside the bracket.
-                        let spec = idle
-                            .extra
-                            .closed
-                            .as_mut()
-                            .context("no drafter on the batch thread")?;
                         let opts = DecodeOptions {
                             prefill_tile: tile,
                             ..DecodeOptions::new(decode_tokens)
@@ -1003,12 +1048,11 @@ impl Engine {
                         let t = Instant::now();
                         let outs = run_spec_rows(
                             pooled,
+                            idle,
                             sessions,
-                            spec,
                             &refs,
                             &opts,
                             &NEVER_EOS,
-                            idle.device,
                             &mut |_, _| Ok(()),
                         )?;
                         idle.device.synchronize()?;
@@ -1321,14 +1365,22 @@ impl<'m> TakenSessions<'m> {
 
 /// Run `f` over `n` sequences checked out of the pool and reset, and put
 /// them back — reset again — whatever `f` returned: a failed cell must not
-/// cost the pool a slot.
+/// cost the pool a slot. `f` may move the sessions out and back (a run
+/// through the scheduler's driver does), as long as it returns them all.
 fn with_sessions<'m, T>(
     idle: &mut Idle<'_, 'm, Model, Extra>,
     n: usize,
-    f: impl FnOnce(&mut Idle<'_, 'm, Model, Extra>, &mut [Session<'m, Model>]) -> Result<T>,
+    f: impl FnOnce(&mut Idle<'_, 'm, Model, Extra>, &mut Vec<Session<'m, Model>>) -> Result<T>,
 ) -> Result<T> {
     let mut taken = take_sessions(idle, n)?;
     let out = f(idle, &mut taken.sessions);
+    if taken.sessions.len() != taken.slots.len() {
+        return Err(anyhow::anyhow!(
+            "a closed job returned {} of {} sessions; the pool has lost slots",
+            taken.sessions.len(),
+            taken.slots.len()
+        ));
+    }
     taken.give_back(idle);
     out
 }
@@ -1349,30 +1401,53 @@ fn take_sessions<'m>(idle: &mut Idle<'_, 'm, Model, Extra>, n: usize) -> Result<
     Ok(TakenSessions { sessions, slots })
 }
 
-/// The static body under `--dspark --batch N`: every row's round pipelined
-/// through the one drafter (`Session::decode_speculative_pipelined`, §10.2y).
-/// Greedy, one EOS set per batch — mixed sets are refused rather than served
-/// under the first row's.
-/// A closed speculative run over `sessions`: the batched loop
-/// (`decode_spec_batched`, one target pass per round) on the pool arms, the
-/// static pipelined driver on private caches.
-#[allow(clippy::too_many_arguments)]
+/// A closed speculative run over `sessions`: THROUGH the scheduler's
+/// continuous driver on the pool arms (the speculative batched loop and its
+/// one drafter, `drive_closed_rows`), the static pipelined driver over the
+/// batch thread's drafter on private caches. Greedy, one EOS set.
 fn run_spec_rows<'m>(
     pooled: bool,
-    sessions: &mut [Session<'m, Model>],
-    spec: &mut DSparkSpeculator,
+    idle: &mut Idle<'_, 'm, Model, Extra>,
+    sessions: &mut Vec<Session<'m, Model>>,
     prompts: &[&[u32]],
     opts: &DecodeOptions,
     eos_ids: &[u32],
-    device: &Device,
     on_tokens: &mut dyn FnMut(usize, &[u32]) -> lloom_tensor::Result<()>,
-) -> lloom_tensor::Result<Vec<lloom::nn::DecodeOut>> {
+) -> Result<Vec<lloom::nn::DecodeOut>> {
     if pooled {
-        Session::decode_spec_batched(sessions, spec, prompts, opts, eos_ids, device, on_tokens)
-    } else {
-        Session::decode_speculative_pipelined(sessions, spec, prompts, opts, eos_ids, device, on_tokens)
+        let owned = std::mem::take(sessions);
+        let (back, outs) = lloom_engine::drive_closed_rows(
+            idle.driver,
+            owned,
+            prompts,
+            eos_ids,
+            opts.max_tokens,
+            on_tokens,
+        );
+        *sessions = back;
+        return Ok(outs?);
     }
+    let spec = idle
+        .extra
+        .spec
+        .as_mut()
+        .context("no drafter on the batch thread")?;
+    Ok(Session::decode_speculative_pipelined(
+        sessions,
+        spec,
+        prompts,
+        opts,
+        eos_ids,
+        idle.device,
+        on_tokens,
+    )?)
 }
+
+/// The static body under `--dspark --batch N --rows private`: every row's
+/// round pipelined through the one drafter
+/// (`Session::decode_speculative_pipelined`, §10.2y). Greedy, one EOS set
+/// per batch — mixed sets are refused rather than served under the first
+/// row's.
 
 fn static_dspark_body<'a, 'm>(
     idle: &mut Idle<'a, 'm, Model, Extra>,
@@ -1383,7 +1458,7 @@ fn static_dspark_body<'a, 'm>(
 ) -> lloom_tensor::Result<Vec<DecodeOut>> {
     let spec = idle
         .extra
-        .closed
+        .spec
         .as_mut()
         .ok_or_else(|| lloom_tensor::Error::msg("no drafter on the batch thread"))?;
     let first = specs

@@ -39,8 +39,8 @@ use std::sync::Arc;
 
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::nn::{
-    BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, DecodeOptions,
-    DecodeOut, DecodeStats, ReuseAction, RowDriver, RowId, Session,
+    BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CacheShare, DecodeOptions, DecodeOut,
+    DecodeStats, ReuseAction, RowDriver, RowId, Session,
 };
 use lloom_tensor::{Device, Result};
 
@@ -114,7 +114,7 @@ pub struct BatchDone {
 }
 
 /// What a closed job is handed: the engine, idle.
-pub struct Idle<'a, 'm, M: CausalLM, E> {
+pub struct Idle<'a, 'm, M: BatchedCausalLM, E> {
     pub model: &'m M,
     pub device: &'a Device,
     /// The sequences, all of them checked in.
@@ -124,6 +124,102 @@ pub struct Idle<'a, 'm, M: CausalLM, E> {
     pub opts: &'a DecodeOptions,
     /// The consumer's own state on the scheduler thread (a drafter, say).
     pub extra: &'a mut E,
+    /// The scheduler's continuous driver, idle: a closed job may run its
+    /// rows THROUGH it ([`drive_closed_rows`]) — the speculative driver's
+    /// one proposer serves the closed cells too, where a second drafter did
+    /// (`batched-decode-design.md` §12.9).
+    pub driver: &'a mut Driver<'m, M>,
+}
+
+/// Run `sessions` as one closed batch through `driver`: every row admitted
+/// at once (greedy, `eos_ids`, `max_tokens`), stepped until the driver is
+/// idle, the sessions handed back in the order they came with each row's
+/// outcome. On an error the driver is drained so no session is lost — a
+/// failed cell must not cost the pool a slot.
+#[allow(clippy::type_complexity)]
+pub fn drive_closed_rows<'m, M: BatchedCausalLM + 'm>(
+    driver: &mut Driver<'m, M>,
+    sessions: Vec<Session<'m, M>>,
+    prompts: &[&[u32]],
+    eos_ids: &[u32],
+    max_tokens: usize,
+    on_tokens: &mut dyn FnMut(usize, &[u32]) -> Result<()>,
+) -> (Vec<Session<'m, M>>, Result<Vec<DecodeOut>>) {
+    let n = sessions.len();
+    if prompts.len() != n {
+        return (
+            sessions,
+            Err(lloom_tensor::Error::msg(format!(
+                "drive_closed_rows: {n} sessions and {} prompts",
+                prompts.len()
+            ))),
+        );
+    }
+    if !driver.is_idle() {
+        return (
+            sessions,
+            Err(lloom_tensor::Error::msg(
+                "drive_closed_rows: the driver holds rows; a closed job needs it idle",
+            )),
+        );
+    }
+    let mut ids: Vec<RowId> = Vec::with_capacity(n);
+    // Admitted in order; a row the driver refuses is dropped by `admit`
+    // (the driver's contract), the rows after it are handed back untouched.
+    let mut rest: Vec<Session<'m, M>> = sessions;
+    rest.reverse();
+    while let Some(s) = rest.pop() {
+        let i = ids.len();
+        match driver.admit_with_eos(
+            s,
+            prompts[i].to_vec(),
+            Sampling::ArgMax,
+            0,
+            eos_ids,
+            max_tokens,
+        ) {
+            Ok(id) => ids.push(id),
+            Err(e) => {
+                let mut back = driver.drain_rows();
+                rest.reverse();
+                back.append(&mut rest);
+                return (back, Err(e));
+            }
+        }
+    }
+    let run = (|| -> Result<Vec<Option<(Session<'m, M>, DecodeOut)>>> {
+        let mut outs: Vec<Option<(Session<'m, M>, DecodeOut)>> = (0..n).map(|_| None).collect();
+        while !driver.is_idle() {
+            driver.step(&mut |row, toks| {
+                let i = ids
+                    .iter()
+                    .position(|&id| id == row)
+                    .expect("an admitted row");
+                on_tokens(i, toks)
+            })?;
+            for (row, session, out) in driver.take_finished() {
+                let i = ids
+                    .iter()
+                    .position(|&id| id == row)
+                    .expect("an admitted row");
+                outs[i] = Some((session, out));
+            }
+        }
+        Ok(outs)
+    })();
+    match run {
+        Ok(outs) => {
+            let mut sessions = Vec::with_capacity(n);
+            let mut results = Vec::with_capacity(n);
+            for o in outs {
+                let (s, out) = o.expect("every row finished");
+                sessions.push(s);
+                results.push(out);
+            }
+            (sessions, Ok(results))
+        }
+        Err(e) => (driver.drain_rows(), Err(e)),
+    }
 }
 
 /// A job that runs on the scheduler thread with nothing else live.
@@ -154,25 +250,25 @@ pub type StaticBody<M, E> = Box<
 >;
 
 /// How the scheduler decodes its rows.
-pub enum BatchMode<M: CausalLM, E> {
+pub enum BatchMode<M: BatchedCausalLM, E> {
     /// Rows join and leave the batch per step (`BatchDecoder`).
     Continuous,
     /// Rows run in static batches through the body, up to the width each.
     Static(StaticBody<M, E>),
 }
 
-enum Job<M: CausalLM, E> {
+enum Job<M: BatchedCausalLM, E> {
     Request(BatchRequest, Sender<BatchEvent>),
     Closed(ClosedJob<M, E>),
     Shutdown,
 }
 
 /// The request threads' handle: submit rows, queue closed jobs.
-pub struct BatchHandle<M: CausalLM, E> {
+pub struct BatchHandle<M: BatchedCausalLM, E> {
     tx: Sender<Job<M, E>>,
 }
 
-impl<M: CausalLM, E> Clone for BatchHandle<M, E> {
+impl<M: BatchedCausalLM, E> Clone for BatchHandle<M, E> {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
@@ -180,7 +276,7 @@ impl<M: CausalLM, E> Clone for BatchHandle<M, E> {
     }
 }
 
-impl<M: CausalLM, E> BatchHandle<M, E> {
+impl<M: BatchedCausalLM, E> BatchHandle<M, E> {
     /// Queue a row; its events arrive on the returned receiver.
     pub fn submit(&self, req: BatchRequest) -> Receiver<BatchEvent> {
         let (tx, rx) = mpsc::channel();
@@ -285,7 +381,7 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
 }
 
 /// What [`spawn`] needs to build the scheduler on its thread.
-pub struct BatchConfig<M: CausalLM, E> {
+pub struct BatchConfig<M: BatchedCausalLM, E> {
     pub device: Device,
     pub pool: SlotPool<M::Cache>,
     pub rings: RingPool,
@@ -360,6 +456,7 @@ where
             rings: &mut self.rings,
             opts: &self.opts,
             extra: &mut self.extra,
+            driver: &mut self.decoder,
         }
     }
 
@@ -751,6 +848,7 @@ where
                 rings: &mut self.rings,
                 opts: &self.opts,
                 extra: &mut self.extra,
+                driver: &mut self.decoder,
             };
             let senders: Vec<&Sender<BatchEvent>> = meta
                 .iter()
@@ -905,6 +1003,7 @@ mod tests {
     //! `batched_decode_tests` — the next token is a fixed function of the
     //! last, so every row's expected stream derives from its prompt.
     use super::*;
+    use lloom::nn::CausalLM;
     use lloom::nn::{CacheReset, CacheRewind, Model as ModelTrait, RaggedRow, Row, VarBuilder};
     use lloom_tensor::{DType, Tensor};
     use std::time::Duration;

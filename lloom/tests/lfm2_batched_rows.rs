@@ -686,6 +686,52 @@ mod pool_arms {
         assert_ne!(c.batch_slot(), b.batch_slot());
         Ok(())
     }
+
+    /// A pool filled by one burst of rows is usable by the next: the rows'
+    /// pages go to the epoch quarantine when their caches drop, and a pass
+    /// that finds the pool full waits the GPU out once and recycles them
+    /// rather than refusing (§12.9 item 6 — the serving defect: a second
+    /// burst on `--rows pool` without `--reuse-prefix` read "KV page pool
+    /// exhausted" with every page free in fact).
+    #[test]
+    fn a_full_pool_recycles_its_released_pages_at_the_next_pass() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        let dtype = DType::F32;
+        let model = build(&cfg, dtype, &dev)?;
+        // Two slots, 64 tokens each at page 32: four pages, filled by two
+        // rows of 40 tokens (two pages each).
+        let pool = BatchPool::new(&cfg, &dev, 2, 64)?;
+        let prompt: Vec<u32> = (0..40u32).map(|i| (i * 5 + 1) % 48).collect();
+        let want = {
+            let mut a = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let mut b = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
+            let la = model.forward(&input, 0, &mut a)?;
+            let _ = model.forward(&input, 0, &mut b)?;
+            let r = pool.report();
+            assert_eq!(r.pages_in_use, 4, "the burst fills the pool: {r:?}");
+            assert_eq!(r.pages_free, 0);
+            la.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?
+        };
+        // Both caches dropped: their pages are quarantined against the
+        // current epoch, which nothing has committed since.
+        let mut c = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        let mut d = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
+        let lc = model
+            .forward(&input, 0, &mut c)
+            .expect("the second burst's prefill finds the released pages");
+        let _ = model.forward(&input, 0, &mut d)?;
+        let got = lc.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the recycled pages compute what the fresh ones did"
+        );
+        assert_eq!(pool.report().pages_in_use, 4);
+        Ok(())
+    }
 }
 
 #[cfg(feature = "metal")]
@@ -727,34 +773,47 @@ mod prefix_share {
     /// A row that SHARES two pages of another's prompt and prefills the six
     /// tokens after them computes what a fresh row prefilling all 70 does —
     /// the remainder's logits and a decode step after it, bit for bit — and
-    /// the pool holds the shared pages once.
+    /// the pool holds the shared pages once. The source is prefilled in
+    /// pieces of 32 (every page boundary a pass boundary), of 70 (one piece,
+    /// both boundaries INSIDE it) and of 40 (one boundary inside each of two
+    /// pieces): the share is two whole pages whichever way the source's
+    /// passes fell — the granularity is the page, not the piece (§12.3).
     #[test]
     fn a_shared_prefix_reproduces_the_fresh_prefill_bit_for_bit() -> Result<()> {
         let dev = Device::new_metal(0)?;
         let cfg = share_config();
-        for dtype in [DType::F32, DType::F16] {
+        for (dtype, piece) in [
+            (DType::F32, 32usize),
+            (DType::F16, 32),
+            (DType::F32, 70),
+            (DType::F16, 70),
+            (DType::F32, 40),
+        ] {
             let model = build(&cfg, dtype, &dev)?;
             let pool = BatchPool::new(&cfg, &dev, 4, 128)?;
             let prompt: Vec<u32> = (0..70u32).map(|i| (i * 13 + 7) % 48).collect();
             let question: Vec<u32> = prompt[64..].to_vec();
             let next = 21u32;
 
-            // The source: the whole prompt, in page-sized pieces (its passes
-            // begin at 32 and 64: two snapshots).
+            // The source: the whole prompt, in `piece`-token pieces.
             let mut src = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
-            let _ = prefill_pieces(&model, &mut src, &prompt, 32, &dev)?;
+            let _ = prefill_pieces(&model, &mut src, &prompt, piece, &dev)?;
             assert_eq!(src.kv_len(), 70);
-            assert!(pool.snapshots() >= 2, "snapshots at the two page boundaries");
+            assert!(
+                pool.snapshots() >= 2,
+                "piece {piece}: snapshots at the two page boundaries, got {}",
+                pool.snapshots()
+            );
 
             // The reference: a fresh row, the same pieces.
             let mut fresh = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
-            let want_tail = prefill_pieces(&model, &mut fresh, &prompt, 32, &dev)?;
+            let want_tail = prefill_pieces(&model, &mut fresh, &prompt, piece, &dev)?;
             let pages_before = pool.report().pages_in_use;
 
             // The sharer: two pages from the source, then the remainder.
             let mut shared = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
             let n = shared.share_prefix_from(&src, 64)?;
-            assert_eq!(n, 64, "two whole pages shared");
+            assert_eq!(n, 64, "piece {piece}: two whole pages shared");
             assert_eq!(shared.kv_len(), 64);
             let input = Tensor::new(question.as_slice(), &dev)?.unsqueeze(0)?;
             let got_tail = model.forward(&input, 64, &mut shared)?;
@@ -765,13 +824,17 @@ mod prefix_share {
             let bits = |t: &Tensor| -> Result<Vec<u32>> {
                 Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect())
             };
-            assert_eq!(bits(&got_tail)?, bits(&want_tail)?, "the remainder's logits ({dtype:?})");
+            assert_eq!(bits(&got_tail)?, bits(&want_tail)?, "the remainder's logits ({dtype:?}, piece {piece})");
 
             // A decode step on both.
             let input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
             let a = model.forward(&input, 70, &mut fresh)?;
             let b = model.forward(&input, 70, &mut shared)?;
-            assert_eq!(bits(&a)?, bits(&b)?, "the step after ({dtype:?})");
+            assert_eq!(
+                bits(&a)?,
+                bits(&b)?,
+                "the step after ({dtype:?}, piece {piece})"
+            );
             // Non-vacuity: the logits depend on the prefix — a row that
             // prefilled only the remainder differs.
             let mut bare = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;

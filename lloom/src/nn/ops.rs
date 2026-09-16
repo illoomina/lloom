@@ -777,9 +777,42 @@ pub fn shortconv_ring(
     weights: &Tensor,
     phase_last: usize,
 ) -> Result<Tensor> {
+    shortconv_ring_impl(b, x, c, state, weights, phase_last, None)
+}
+
+/// [`shortconv_ring`] over a SLOT-INDEXED batch: `state` is a pool of rings
+/// `[slots, hidden, width]`, batch row `b` of `b`/`x`/`c` writes ring
+/// `row_slots[b]` at phase `row_phases[b]` (`batched-decode-design.md`
+/// §12.2) — one dispatch for rows at different rings and phases, bit-identical
+/// per row to [`shortconv_ring`] on that ring's `narrow(0, slot, 1)` view at
+/// that phase. `row_slots`/`row_phases` are `u32` tensors of the batch size on
+/// the same device; the rows' slots must be distinct (each thread owns its
+/// ring row).
+pub fn shortconv_ring_rows(
+    b: &Tensor,
+    x: &Tensor,
+    c: &Tensor,
+    state: &Tensor,
+    weights: &Tensor,
+    row_slots: &Tensor,
+    row_phases: &Tensor,
+) -> Result<Tensor> {
+    shortconv_ring_impl(b, x, c, state, weights, 0, Some((row_slots, row_phases)))
+}
+
+#[allow(unused_variables)]
+fn shortconv_ring_impl(
+    b: &Tensor,
+    x: &Tensor,
+    c: &Tensor,
+    state: &Tensor,
+    weights: &Tensor,
+    phase_last: usize,
+    rows: Option<(&Tensor, &Tensor)>,
+) -> Result<Tensor> {
     #[cfg(not(feature = "metal"))]
     {
-        let _ = (b, x, c, state, weights, phase_last);
+        let _ = (b, x, c, state, weights, phase_last, rows);
         lloom_tensor::bail!("shortconv_ring is metal-only; use the unfused conv arm off Metal")
     }
     #[cfg(feature = "metal")]
@@ -787,12 +820,32 @@ pub fn shortconv_ring(
         use lloom_tensor::backend::BackendStorage;
         use lloom_tensor::metal_backend::buffer_o;
 
-        let (b_sz, hidden, width) = state.dims3().map_err(|e| {
+        let (slots, hidden, width) = state.dims3().map_err(|e| {
             lloom_tensor::Error::msg(format!(
                 "shortconv_ring: state must be [b, hidden, width]: {e}"
             ))
         })?;
-        let (_, _, seq_len) = b.dims3()?;
+        let (b_sz, _, seq_len) = b.dims3()?;
+        if rows.is_none() && b_sz != slots {
+            lloom_tensor::bail!(
+                "shortconv_ring: {b_sz} batch rows against a state of {slots} rings"
+            );
+        }
+        if let Some((rs, rp)) = rows {
+            if rs.dtype() != DType::U32 || rp.dtype() != DType::U32 {
+                lloom_tensor::bail!("shortconv_ring_rows: row_slots and row_phases must be u32");
+            }
+            if rs.dims() != [b_sz] || rp.dims() != [b_sz] {
+                lloom_tensor::bail!(
+                    "shortconv_ring_rows: row_slots {:?} / row_phases {:?} for {b_sz} rows",
+                    rs.dims(),
+                    rp.dims()
+                );
+            }
+            if !rs.is_contiguous() || !rp.is_contiguous() {
+                lloom_tensor::bail!("shortconv_ring_rows: row_slots and row_phases must be contiguous");
+            }
+        }
         if seq_len == 0 || seq_len > width {
             lloom_tensor::bail!(
                 "shortconv_ring: {seq_len} positions into a {width}-wide ring; a pass writes \
@@ -849,6 +902,31 @@ pub fn shortconv_ring(
             proj_stride_b: stride[0] as u64,
             proj_stride_c: stride[1] as u64,
             proj_stride_l: stride[2] as u64,
+            per_row: rows.is_some() as u64,
+        };
+        // The per-row index buffers, or — unread at `per_row == 0` — the
+        // weights' buffer bound in their place, so no buffer is allocated
+        // for a binding the kernel never dereferences.
+        let (rs_guard, rp_guard) = match rows {
+            Some((rs, rp)) => {
+                let (a, al) = rs.storage_and_layout();
+                let (b2, bl) = rp.storage_and_layout();
+                if al.start_offset() != 0 || bl.start_offset() != 0 {
+                    lloom_tensor::bail!("shortconv_ring_rows: row buffers must start at offset 0");
+                }
+                (Some(a), Some(b2))
+            }
+            None => (None, None),
+        };
+        let rs_buf = match rs_guard.as_deref() {
+            Some(lloom_tensor::Storage::Metal(m)) => m.buffer(),
+            Some(_) => lloom_tensor::bail!("shortconv_ring_rows: row_slots must be on metal"),
+            None => w_s.buffer(),
+        };
+        let rp_buf = match rp_guard.as_deref() {
+            Some(lloom_tensor::Storage::Metal(m)) => m.buffer(),
+            Some(_) => lloom_tensor::bail!("shortconv_ring_rows: row_phases must be on metal"),
+            None => w_s.buffer(),
         };
 
         let device = st_s.device();
@@ -880,6 +958,8 @@ pub fn shortconv_ring(
             buffer_o(st_s.buffer(), st_l, dtype),
             buffer_o(w_s.buffer(), w_l, dtype),
             &dst,
+            rs_buf,
+            rp_buf,
         )
         .map_err(lloom_tensor::Error::wrap)?;
 
@@ -3369,7 +3449,7 @@ pub fn flash_decoding_paged(
             paged: Some(PagedTable {
                 entries: table,
                 stride: table_stride,
-                n_keys,
+                n_keys: vec![n_keys as u32],
             }),
             page_size,
             pages_per_chunk,

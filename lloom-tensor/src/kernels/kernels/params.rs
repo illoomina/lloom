@@ -346,6 +346,10 @@ pub struct ShortconvRingParams {
     pub proj_stride_b: u64,
     pub proj_stride_c: u64,
     pub proj_stride_l: u64,
+    /// 1: batch row `b` is ring `row_slots[b]` of a state POOL at phase
+    /// `row_phases[b]` (`batched-decode-design.md` §12.2); 0: ring `b` at
+    /// `phase_last`.
+    pub per_row: u64,
 }
 
 /// The kernel in `conv.metal` that reports the device-side layout.
@@ -657,6 +661,10 @@ pub fn expected_conv_layout() -> Vec<(&'static str, u32)> {
         (
             "ShortconvRingParams.proj_stride_l",
             offset_of!(ShortconvRingParams, proj_stride_l) as u32,
+        ),
+        (
+            "ShortconvRingParams.per_row",
+            offset_of!(ShortconvRingParams, per_row) as u32,
         ),
     ]
 }

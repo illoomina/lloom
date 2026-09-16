@@ -5422,7 +5422,7 @@ fn every_family_params_layout_matches_metal() {
         ("cast.metal", 5),
         ("affine.metal", 16),
         ("gemv.metal", 8),
-        ("conv.metal", 79),
+        ("conv.metal", 80),
         // 27 until #219, which removed `left_size` from all four of this
         // file's structs — four `offsetof` rows, one per struct. A **removal**
         // is as deliberate as an addition and moves this number the same way;

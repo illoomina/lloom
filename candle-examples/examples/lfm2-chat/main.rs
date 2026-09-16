@@ -1524,11 +1524,19 @@ fn main() -> Result<()> {
     }
 
     // `--rows pool*` forces the pool's arms BEFORE the model is built: the
-    // ring's permuted weight table and the flash read are the model's.
+    // ring's permuted weight table and the flash read are the model's. The
+    // ring keeps the width a rewindable arm (`--dspark`, `--cache rewindable`)
+    // or an explicit `--conv-state rotating:N` already set — a speculative
+    // window of K+1 needs K+1 history slots (`Cache::advance`) — and is the
+    // one-slot ring the K=1 pool loop takes otherwise.
     if matches!(args.rows.as_str(), "pool" | "pool-per-row") {
         config.attn_impl = lloom::models::lfm2::AttnImpl::FlashDecoding;
         config.kv_append = KvAppend::Paged;
-        config.conv_state = ConvState::RotatingRing { k: 1 };
+        let k = match config.conv_state {
+            ConvState::RotatingRing { k } => k.max(1),
+            _ => 1,
+        };
+        config.conv_state = ConvState::RotatingRing { k };
         config.conv_fused = true;
     }
     let model = Model::new(&config, vb).context("constructing LFM2")?;
@@ -1576,10 +1584,16 @@ fn main() -> Result<()> {
         }
         other => anyhow::bail!("--rows must be pool, pool-per-row or private, got {other:?}"),
     };
-    let mut cache = Cache::new_with(true, dtype, &config, &device, kv_capacity)
-        .context("allocating KV cache")?
-        .with_kv_bucket(args.kv_bucket)
-        .context("--kv-bucket")?;
+    // Under `--rows pool*` the one sequence is a slot of the pool (the arm
+    // `lloom-serve --rows pool` runs), else its own cache.
+    let mut cache = match &pool {
+        Some(p) => Cache::for_batch(true, dtype, &config, &device, p)
+            .context("leasing the sequence's pool slot")?,
+        None => Cache::new_with(true, dtype, &config, &device, kv_capacity)
+            .context("allocating KV cache")?,
+    }
+    .with_kv_bucket(args.kv_bucket)
+    .context("--kv-bucket")?;
     if let Some(fraction) = args.kv_grow_fraction {
         cache = cache
             .with_kv_grow_fraction(fraction)

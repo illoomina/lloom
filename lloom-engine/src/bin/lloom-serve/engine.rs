@@ -244,8 +244,12 @@ impl Engine {
             let mut budget = MemoryBudget::new(weight_bytes);
             budget.batch = opts.batch;
             budget.fraction = opts.memory_fraction;
+            // The longest forward this process runs: the tile — or the chunk,
+            // when the batched steps feed more prompt tokens than one tile per
+            // step (`--prefill-chunk` above the tile fuses several rows' pieces
+            // into one forward, whose working set is the chunk's).
             budget = budget.with_prefill(if opts.prefill_tile > 0 {
-                opts.prefill_tile
+                opts.prefill_tile.max(opts.prefill_chunk)
             } else {
                 opts.kv_capacity
             });
@@ -700,9 +704,13 @@ impl Engine {
 
     /// Time one prefill of `n` seed tokens on a fresh cache: the forward
     /// submitted and the device drained, nothing else in the bracket. At
-    /// `batch > 1`, `batch` prompts of `n` tokens each are fed as ONE ragged
-    /// forward (the CHUNK spanning every row; the tile still bounds each
-    /// piece) and the bracket closes when the device drains.
+    /// `batch > 1`, `batch` prompts of `n` tokens each arrive together and
+    /// are fed as the scheduler feeds them — at most `--prefill-chunk`
+    /// prompt tokens per step as ragged rows of one forward, each piece
+    /// tile-bounded — and the bracket closes when the device drains; the
+    /// aggregate is `batch × n` over that. A chunk above the tile fuses
+    /// several rows' pieces into one forward whose working set is the
+    /// chunk's, which is why the budget is sized at the chunk (`load`).
     pub fn prefill_throughput(&self, n: usize, batch: usize) -> Result<PrefillTiming> {
         self.check_fits(n, 1)?;
         if batch <= 1 {
@@ -742,6 +750,7 @@ impl Engine {
         self.check_batch(batch)?;
         let prompts: Vec<Vec<u32>> = (0..batch).map(|r| self.seed_prompt_row(n, r)).collect();
         let tile = self.prefill_tile;
+        let chunk = self.prefill_chunk;
         let dspark = self.dspark_k.is_some();
         let gauge = MemGauge::start(&self.core.device, self.mem_sample);
         let (elapsed, forwards) = self.closed(move |idle| -> Result<(Duration, usize)> {
@@ -771,7 +780,7 @@ impl Engine {
                     let opts = DecodeOptions {
                         lookahead: 1,
                         prefill_tile: tile,
-                        prefill_chunk: n * batch,
+                        prefill_chunk: chunk,
                         ..DecodeOptions::new(0)
                     };
                     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -784,10 +793,7 @@ impl Engine {
                         idle.device,
                         &mut |_, _| Ok(()),
                     )?;
-                    outs.iter()
-                        .map(|o| o.stats.prefill_units)
-                        .max()
-                        .unwrap_or(0)
+                    outs.iter().map(|o| o.stats.prefill_units).sum()
                 };
                 idle.device.synchronize()?;
                 let elapsed = t.elapsed();

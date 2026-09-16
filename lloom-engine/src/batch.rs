@@ -63,9 +63,12 @@ pub struct BatchRequest {
 #[derive(Debug)]
 pub enum BatchEvent {
     Tokens(Vec<u32>),
-    Done(BatchDone),
+    Done(Box<BatchDone>),
     Error(String),
 }
+
+/// A hook the scheduler calls after every step with its counters.
+pub type CountersHook = Box<dyn Fn(&BatchCounters) + Send>;
 
 /// A retired row's outcome.
 #[derive(Debug, Clone)]
@@ -189,6 +192,15 @@ impl<M: CausalLM, E> BatchHandle<M, E> {
     }
 }
 
+/// A static batch row's routing, its `prepare` outcome, its sender and its
+/// cancel flag, held while the body runs.
+type StaticRowMeta = (
+    usize,
+    lloom::nn::Prepared,
+    Sender<BatchEvent>,
+    Arc<AtomicBool>,
+);
+
 struct InFlight {
     tx: Sender<BatchEvent>,
     cancel: Arc<AtomicBool>,
@@ -228,7 +240,7 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
     rx: Receiver<Job<M, E>>,
     counters: BatchCounters,
     /// Under the static mode, the rows the current batch used, by pool slot.
-    on_counters: Option<Box<dyn Fn(&BatchCounters) + Send>>,
+    on_counters: Option<CountersHook>,
 }
 
 /// What [`spawn`] needs to build the scheduler on its thread.
@@ -245,7 +257,7 @@ pub struct BatchConfig<M: CausalLM, E> {
     pub mode: BatchMode<M, E>,
     pub extra: E,
     /// Called after every step with the counters (a log line).
-    pub on_counters: Option<Box<dyn Fn(&BatchCounters) + Send>>,
+    pub on_counters: Option<CountersHook>,
 }
 
 impl<'m, M, E> BatchScheduler<'m, M, E>
@@ -382,7 +394,7 @@ where
                 break;
             };
             if req.cancel.load(Ordering::Acquire) {
-                let _ = tx.send(BatchEvent::Done(BatchDone {
+                let _ = tx.send(BatchEvent::Done(Box::new(BatchDone {
                     tokens: Vec::new(),
                     eos: false,
                     cancelled: true,
@@ -391,7 +403,7 @@ where
                     reused: 0,
                     prefilled: 0,
                     joined_beside: 0,
-                }));
+                })));
                 continue;
             }
             let (slot, session, prepared) = match self.prepare(&req) {
@@ -463,7 +475,7 @@ where
             let cancelled = f.cancel.load(Ordering::Acquire) && !out.eos;
             let seq = session.into_sequence();
             self.pool.release(f.slot, seq);
-            let _ = f.tx.send(BatchEvent::Done(BatchDone {
+            let _ = f.tx.send(BatchEvent::Done(Box::new(BatchDone {
                 tokens: out.ids,
                 eos: out.eos,
                 cancelled,
@@ -472,7 +484,7 @@ where
                 reused: f.reused,
                 prefilled: f.prefilled,
                 joined_beside: f.joined_beside,
-            }));
+            })));
         }
         if let Some(cb) = &self.on_counters {
             cb(&self.counters);
@@ -493,14 +505,7 @@ where
             return Ok(());
         }
         let mut sessions = Vec::with_capacity(rows.len());
-        let mut meta: Vec<
-            Option<(
-                usize,
-                lloom::nn::Prepared,
-                Sender<BatchEvent>,
-                Arc<AtomicBool>,
-            )>,
-        > = Vec::with_capacity(rows.len());
+        let mut meta: Vec<Option<StaticRowMeta>> = Vec::with_capacity(rows.len());
         let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
         let mut specs: Vec<RowSpec> = Vec::with_capacity(rows.len());
         for (req, tx) in rows {
@@ -580,7 +585,7 @@ where
             self.counters.admitted += 1;
             self.counters.retired += 1;
             self.pool.release(slot, session.into_sequence());
-            let _ = tx.send(BatchEvent::Done(BatchDone {
+            let _ = tx.send(BatchEvent::Done(Box::new(BatchDone {
                 tokens: out.ids,
                 eos: out.eos,
                 cancelled: cancel.load(Ordering::Acquire) && !out.eos,
@@ -589,7 +594,7 @@ where
                 reused: prepared.reused,
                 prefilled: prepared.suffix.len(),
                 joined_beside: 0,
-            }));
+            })));
         }
         if let Some(cb) = &self.on_counters {
             cb(&self.counters);
@@ -864,7 +869,7 @@ mod tests {
         loop {
             match rx.recv_timeout(Duration::from_secs(30)).expect("an event") {
                 BatchEvent::Tokens(ids) => streamed.extend(ids),
-                BatchEvent::Done(d) => return (streamed, d),
+                BatchEvent::Done(d) => return (streamed, *d),
                 BatchEvent::Error(e) => panic!("row failed: {e}"),
             }
         }

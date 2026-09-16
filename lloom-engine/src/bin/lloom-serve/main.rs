@@ -245,9 +245,7 @@ fn main() -> Result<()> {
     );
     eprintln!(
         "[{}]",
-        engine::MemSnapshot::read(&engine.core.device)
-            .json()
-            .to_string()
+        engine::MemSnapshot::read(&engine.core.device).json()
     );
 
     let server = Server::http((args.host.as_str(), args.port))

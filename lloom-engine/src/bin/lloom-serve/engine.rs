@@ -666,7 +666,7 @@ impl Engine {
                         cancel.store(true, Ordering::Release);
                     }
                 }
-                Ok(BatchEvent::Done(d)) => break d,
+                Ok(BatchEvent::Done(d)) => break *d,
                 Ok(BatchEvent::Error(e)) => anyhow::bail!("batch: {e}"),
                 Err(_) => anyhow::bail!("batch: the scheduler dropped the request"),
             }
@@ -1321,11 +1321,14 @@ impl MemReport {
     }
 }
 
+/// The 10 ms sampler's stop flag and thread, joined for `(peak, samples)`.
+type PeakSampler = (Arc<AtomicBool>, std::thread::JoinHandle<(MemSnapshot, u64)>);
+
 /// The gauge around one cell: a reading before, a reading after, and under
 /// `--mem-sample` a 10 ms thread holding the peaks in between.
 pub struct MemGauge {
     before: MemSnapshot,
-    sampler: Option<(Arc<AtomicBool>, std::thread::JoinHandle<(MemSnapshot, u64)>)>,
+    sampler: Option<PeakSampler>,
 }
 
 impl MemGauge {
@@ -1383,7 +1386,7 @@ impl MemGauge {
 
 /// The process's `phys_footprint` and resident size, from `proc_pid_rusage`
 /// (`RUSAGE_INFO_V6`; the two words at their struct offsets).
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", feature = "metal"))]
 fn proc_footprint() -> Option<(u64, u64)> {
     const RUSAGE_INFO_V6: i32 = 6;
     const W_RESIDENT: usize = 8;
@@ -1409,7 +1412,8 @@ fn proc_footprint() -> Option<(u64, u64)> {
     Some((buf[W_PHYS], buf[W_RESIDENT]))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[allow(dead_code)]
 fn proc_footprint() -> Option<(u64, u64)> {
     None
 }

@@ -279,7 +279,7 @@ impl FlashPartialParams {
             page_size: page_size as i32,
             heads_per_seq: q_shape[1] as i32,
             table_stride: table_stride as i32,
-            _pad: 0,
+            n_keys_stride: 0,
             k_head_stride: k_stride[1] as u64,
             v_head_stride: v_stride[1] as u64,
             k_token_stride: k_stride[2] as u64,
@@ -406,6 +406,11 @@ pub fn call_flash_decoding(
     // than behind a flag: it is one store per chunk per head by one lane, and
     // a debug-only buffer is one the shipping path never proves it can fill.
     walk_order: &Buffer,
+    // The live key count per sequence, `i32` entries read at
+    // `params.n_keys_stride` per row: one entry at stride 0 for a lockstep
+    // batch, one per row at stride 1 for a ragged one (§12.2). Caller-owned
+    // for the reason the params blocks are.
+    n_keys_per_seq: &Buffer,
     n_q_heads: usize,
     head_dim: usize,
     n_chunks: usize,
@@ -442,7 +447,8 @@ pub fn call_flash_decoding(
                 (v_buffer, v_offset),
                 Output::new(output),
                 partial_params,
-                chunk_table
+                chunk_table,
+                n_keys_per_seq
             )
         );
 
@@ -486,7 +492,8 @@ pub fn call_flash_decoding(
                 Output::new(sums),
                 Output::new(maxs),
                 chunk_table,
-                partial_params
+                partial_params,
+                n_keys_per_seq
             )
         );
 

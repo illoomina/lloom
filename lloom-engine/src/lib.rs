@@ -18,12 +18,20 @@
 //! `verify_step`'s sibling — the plain per-token path — and its first production
 //! caller (`RESTRUCTURING_DESIGN.md` §1.9, §10.1 wave F).
 
+pub mod batch;
 pub mod decode;
 pub mod seam;
 pub mod slots;
+pub mod stream;
 
+pub use batch::{
+    spawn as spawn_batch, BatchConfig, BatchCounters, BatchDone, BatchEvent, BatchHandle,
+    BatchMode, BatchRequest, ClosedJob, CountersHook, Driver, Idle, MakeDriver, RowSpec,
+    StaticBody,
+};
 pub use decode::{
     ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool, Stop,
 };
 pub use seam::Completer;
 pub use slots::{Routed, SlotPool, DEFAULT_SIMILARITY};
+pub use stream::TextStream;

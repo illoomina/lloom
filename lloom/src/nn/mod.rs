@@ -18,6 +18,8 @@
 pub mod activation;
 pub mod attention;
 pub mod batch_norm;
+pub mod batched;
+mod batched_spec;
 pub mod conv;
 pub mod cpu_flash_attention;
 pub mod decode;
@@ -54,6 +56,8 @@ pub use conv::{
     conv_transpose2d, conv_transpose2d_no_bias, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
+pub use batched::{BatchDecoder, RowDriver, RowId, StepReport};
+pub use batched_spec::SpecBatchDecoder;
 pub use decode::{
     ladder_width, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, IdentityProposer,
     PassWidths, PrefillOut, RoundStats, StepPhases, FIRST_STEPS_TRACED,
@@ -67,7 +71,7 @@ pub use layer_norm::{
 };
 pub use linear::{linear, linear_b, linear_no_bias, Linear};
 pub use model::{
-    BatchedCausalLM, CacheReset, CacheRewind, CausalLM, Model, RaggedRow, Row, Speculative,
+    BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, Model, RaggedRow, Row, Speculative,
     VisionEncoder,
 };
 pub use ops::Dropout;
@@ -77,7 +81,7 @@ pub use sequential::{seq, Sequential};
 pub use speculator::{
     Anchor, Draft, DraftTokens, KvSource, LayerTaps, NextnHidden, NoProbe, PhaseCensus, Prepared,
     ProbeHooks, Probes, ReuseAction, RoundProbe, RoundTiming, SeqId, Sequence, Session, Speculator,
-    TapSide, TapSpec, TargetProbe,
+    TapSide, TapSpec, TargetProbe, VerifyRowRef,
 };
 pub use var_builder::VarBuilder;
 pub use var_map::VarMap;

@@ -1,18 +1,40 @@
 //! The loaded model and the operations every endpoint is a thin shape over.
 //!
-//! One model, one device-side sequence, one request at a time (the caller
-//! holds the mutex). Every operation here is expressed over `lloom`'s tier-1
-//! API and `lloom_engine::DecodeSession` — nothing reaches into a model's
-//! internals (RESTRUCTURING §7.1b).
+//! Two serving shapes, selected at load by `--batch`:
+//!
+//! - **`--batch 1`** (the default): one sequence, one request at a time, the
+//!   crown decode loop on the request's thread (`DecodeSession` over the
+//!   device-resident ring) — the incumbent path, byte for byte. With
+//!   `--dspark` the same shape runs the speculative body.
+//! - **`--batch N`**: the continuous-batching scheduler (`lloom_engine::batch`)
+//!   on its own thread over a pool of `N` sequences; requests from any number
+//!   of client threads join the running batch and leave it at their EOS. The
+//!   benchmark cells run as closed jobs on that thread with the engine to
+//!   themselves. With `--dspark` the scheduler runs static batches through
+//!   the pipelined speculative driver.
+//!
+//! Every operation here is expressed over `lloom`'s tier-1 API and the
+//! `lloom_engine` seams — nothing reaches into a model's internals
+//! (RESTRUCTURING §7.1b).
 
 use anyhow::{Context, Result};
 use hf_chat_template::ChatTemplate;
-use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model};
-use lloom::nn::{Sequence, VarBuilder};
-use lloom_engine::{ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool};
+use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::models::lfm2::{
+    AttnImpl, BatchPool, Cache, Config, ConvState, KvAppend, Lfm2Config, MemoryBudget, Model,
+};
+use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
+use lloom::nn::{DecodeOptions, DecodeOut, Sequence, Session, VarBuilder};
+use lloom_engine::{
+    ring_eos_read, spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRequest,
+    DecodeParams, DecodeSession, Decoded, Idle, ReadbackArm, RingPool, RowSpec, SlotPool, Stop,
+    TextStream,
+};
 use lloom_tensor::{DType, Device, Tensor, D};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
 
@@ -20,17 +42,61 @@ use tokenizers::Tokenizer;
 /// simply never matches, so a run produces exactly `max_tokens` tokens.
 pub const NEVER_EOS: [u32; 1] = [u32::MAX];
 
-/// The model, its cache and the device: the half a decode borrows.
+/// The model and the device: the half every request borrows, shared with
+/// the batch thread.
 pub struct Core {
     pub model: Model,
     pub device: Device,
-    /// The one sequence every request drives, taken out for the request's
-    /// session and put back after it.
-    seq: Option<Sequence<Cache>>,
-    /// The token rings, one per EOS set, kept across requests (`RingPool`):
-    /// built at load, never inside a request's latency (#702).
-    rings: Option<RingPool>,
 }
+
+/// The `--batch 1` state: the one sequence every request drives, taken out
+/// for the request's session and put back after it, the token rings kept
+/// across requests (`RingPool`, built at load, #702), and the drafter.
+struct Single {
+    seq: Option<Sequence<Cache>>,
+    rings: Option<RingPool>,
+    spec: Option<DSparkSpeculator>,
+}
+
+/// The drafter the batch thread holds (`--dspark --batch N`): the static
+/// body's and the closed jobs'.
+/// The batch thread's proposers: one for the closed cells (the static
+/// pipelined body, `decode_spec_batched`), one the continuous speculative
+/// driver takes for itself at start (`MakeDriver`). Two drafters, so a cell
+/// can run while the continuous driver holds its own — the cost of one
+/// drafter's weights again (`batched-decode-design.md` §12.4).
+pub struct Speculators {
+    pub closed: Option<DSparkSpeculator>,
+    pub continuous: Option<DSparkSpeculator>,
+    /// The continuous driver's EOS set (the verify's accept rule reads one
+    /// set per batch).
+    pub eos_ids: Vec<u32>,
+}
+
+impl lloom_engine::MakeDriver<Model> for Speculators {
+    fn make_driver<'m>(
+        &mut self,
+        model: &'m Model,
+        opts: &DecodeOptions,
+        device: &Device,
+    ) -> lloom_tensor::Result<Option<lloom_engine::Driver<'m, Model>>> {
+        let _ = model;
+        match self.continuous.take() {
+            Some(spec) => {
+                let dec = lloom::nn::SpecBatchDecoder::<'m, Model, DSparkSpeculator, Session<'m, Model>>::new(
+                    spec,
+                    opts.clone(),
+                    &self.eos_ids,
+                    device.clone(),
+                )?;
+                Ok(Some(Box::new(dec)))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+pub type Extra = Speculators;
 
 /// Text: the tokenizer, the checkpoint's own chat template, and the ids the
 /// requests are shaped by.
@@ -46,7 +112,7 @@ pub struct Text {
 }
 
 pub struct Engine {
-    pub core: Core,
+    pub core: Arc<Core>,
     pub text: Text,
     pub model_name: String,
     pub kv_capacity: usize,
@@ -55,6 +121,24 @@ pub struct Engine {
     /// default: a benchmark cell measures a cold prefill, and a repeated prompt
     /// would otherwise resume from the previous request's state.
     pub reuse_prefix: bool,
+    /// The batch width `N` of `--batch N`; `1` is the single-sequence path.
+    pub batch: usize,
+    /// The draft block width under `--dspark`.
+    pub dspark_k: Option<usize>,
+    pub prefill_tile: usize,
+    pub prefill_chunk: usize,
+    pub memory_fraction: f64,
+    pub mem_sample: bool,
+    /// How the rows of a batched step hold their state (`--rows`).
+    pub rows: RowsArm,
+    /// The rows' shared pool on the `pool` arms (`batched-decode-design.md`
+    /// §12.2); `None` on `private` and at `--batch 1`.
+    pub pool: Option<BatchPool>,
+    /// `--share-prefix`.
+    pub share_prefix: bool,
+    single: Mutex<Single>,
+    sched: Option<BatchHandle<Model, Extra>>,
+    sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 pub struct LoadOptions {
@@ -66,36 +150,115 @@ pub struct LoadOptions {
     pub warmup: bool,
     pub seed_text: String,
     pub model_name: Option<String>,
+    pub batch: usize,
+    /// `Some(dir)` loads the DSpark drafter from `dir` (or the newest
+    /// LFM2.5-2.6B-DSpark snapshot in the HF cache when the path is empty).
+    pub dspark: Option<PathBuf>,
+    pub prefill_tile: usize,
+    pub prefill_chunk: usize,
+    /// The fraction of `recommendedMaxWorkingSetSize` the process may claim
+    /// (`MemoryBudget`, §9.5d); `0` turns admission off — the unguarded arm.
+    pub memory_fraction: f64,
+    /// Sample the memory gauges at 10 ms around every cell and report the
+    /// peaks. A gauge run, not a timing run: the sampler perturbs TTFT
+    /// (issue #728's `--mem-sample` finding).
+    pub mem_sample: bool,
+    /// How a batched step's rows hold their state (`--rows`).
+    pub rows: RowsArm,
+    /// Share a request's prefix from another row's cache by page (§12.3);
+    /// the `pool` arms only.
+    pub share_prefix: bool,
+}
+
+/// How the rows of `--batch N` hold their KV and conv state, and how a step
+/// reads them (`batched-decode-design.md` §12.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsArm {
+    /// Every row a slot of one `BatchPool` (`Paged × FlashDecoding ×
+    /// RotatingRing`); the attention and the conv of the whole batch in one
+    /// dispatch per kernel. The default at `--batch N`.
+    Pool,
+    /// The same pool, the per-row loop over it — the A/B arm, one dispatch
+    /// per row per kernel, the same arithmetic.
+    PoolPerRow,
+    /// A private crown cache per row (`Sdpa × InPlace × Shuffle`), the
+    /// per-row loop — #742's arm.
+    Private,
+}
+
+impl RowsArm {
+    pub fn parse(s: &str, batched: bool, dspark: bool) -> Result<Self> {
+        Ok(match s {
+            "auto" => {
+                if batched && !dspark {
+                    Self::Pool
+                } else {
+                    Self::Private
+                }
+            }
+            "pool" => Self::Pool,
+            "pool-per-row" => Self::PoolPerRow,
+            "private" => Self::Private,
+            other => anyhow::bail!("--rows must be auto, pool, pool-per-row or private, got {other:?}"),
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pool => "pool",
+            Self::PoolPerRow => "pool-per-row",
+            Self::Private => "private",
+        }
+    }
+
+    pub fn pooled(self) -> bool {
+        matches!(self, Self::Pool | Self::PoolPerRow)
+    }
 }
 
 /// What one throughput cell measured, in the sidecar's units.
 pub struct PrefillTiming {
     pub prompt_tokens: usize,
+    pub batch: usize,
     pub prefill_ms: f64,
+    /// Forwards the batch's prompts took.
+    pub forwards: usize,
+    pub mem: MemReport,
 }
 
 pub struct DecodeTiming {
     pub prompt_tokens: usize,
     pub decode_tokens: usize,
+    pub batch: usize,
     pub prefill_ms: f64,
     pub decode_ms: f64,
     pub readback: ReadbackArm,
+    /// What `decode_ms` brackets.
+    pub bracket: &'static str,
+    /// Per row, the tokens decoded inside the bracket.
+    pub row_tokens: Vec<usize>,
+    /// Per row, the speculative rounds run and the mean accepted per round
+    /// (empty on the K=1 arms).
+    pub row_rounds: Vec<usize>,
+    pub row_accepted: Vec<f64>,
+    pub mem: MemReport,
 }
 
-impl Core {
+impl Single {
     /// Run `f` over a session on the held sequence, and put the sequence back
     /// whatever `f` returned.
-    pub fn with_session<T>(
+    fn with_session<T>(
         &mut self,
-        f: impl FnOnce(&mut DecodeSession<'_, Model>) -> Result<T>,
+        core: &Core,
+        f: impl FnOnce(&mut DecodeSession<'_, Model>, &mut Option<DSparkSpeculator>) -> Result<T>,
     ) -> Result<T> {
         let seq = self
             .seq
             .take()
             .context("the sequence is checked out — a previous request panicked mid-decode")?;
         let rings = self.rings.take().unwrap_or_default();
-        let mut session = DecodeSession::from_parts(&self.model, seq, self.device.clone(), rings);
-        let out = f(&mut session);
+        let mut session = DecodeSession::from_parts(&core.model, seq, core.device.clone(), rings);
+        let out = f(&mut session, &mut self.spec);
         let (seq, rings) = session.into_parts();
         self.seq = Some(seq);
         self.rings = Some(rings);
@@ -116,6 +279,9 @@ impl Engine {
         } else {
             DType::F16
         };
+        if opts.batch == 0 {
+            anyhow::bail!("--batch must be positive");
+        }
 
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
@@ -123,13 +289,92 @@ impl Engine {
             serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)
                 .context("parsing config.json")?;
         let mut config = config.into_config(false);
-        crown_config(&mut config);
+
+        // The drafter's config first: the target's cache arms depend on it
+        // (the verify window sizes the conv ring, the taps feed the drafter).
+        let dspark_dir = match &opts.dspark {
+            None => None,
+            Some(p) if p.as_os_str().is_empty() => Some(
+                newest_snapshot("models--LiquidAI--LFM2.5-2.6B-DSpark").context(
+                    "no LFM2.5-2.6B-DSpark snapshot in the HF cache and no --draft-dir; the \
+                     drafter is trained against THIS target (design/docs/speculation.md §10.2l)",
+                )?,
+            ),
+            Some(p) => Some(p.clone()),
+        };
+        let dcfg = match &dspark_dir {
+            Some(dir) => {
+                let dcfg = DSparkConfig::read_from_dir(dir)
+                    .with_context(|| format!("reading the drafter config in {}", dir.display()))?;
+                if dcfg.hidden_size != config.hidden_size {
+                    anyhow::bail!(
+                        "drafter hidden {} != target hidden {} — the drafter is not this target's \
+                         (design/docs/speculation.md §10.2l)",
+                        dcfg.hidden_size,
+                        config.hidden_size
+                    );
+                }
+                Some(dcfg)
+            }
+            None => None,
+        };
+        let pooled = opts.batch > 1 && opts.rows.pooled();
+        if opts.share_prefix && !pooled {
+            anyhow::bail!("--share-prefix needs `--batch N --rows pool` (the rows share one pool)");
+        }
+        match &dcfg {
+            Some(dcfg) if pooled => pool_spec_config(&mut config, dcfg),
+            Some(dcfg) => rewindable_config(&mut config, dcfg),
+            None if pooled => pool_config(&mut config),
+            None => crown_config(&mut config),
+        }
+        // A prefill fed in more than one forward — a tile, a chunk — needs
+        // the conv's left-context carry, or the conv zero-pads each piece's
+        // left edge and computes something one pass does not (§13.2f
+        // defect 1). One forward is identical either way.
+        config.conv_prefill_ctx = opts.prefill_tile > 0 || opts.prefill_chunk > 0;
+        // Admission (§9.5d): predict the peak at the configured ceiling and
+        // refuse at load rather than find the limit by dying. The activation
+        // term is a function of the LONGEST forward this process will run
+        // (#306): the tile when one is set, else the whole KV ceiling — a
+        // one-shot prefill's working set grows with the prompt (~3.5 MB per
+        // token on the crown, #728), which is what a 32k-token one-shot
+        // prefill turned into a kernel panic on this machine (#148).
+        let weight_bytes: usize = weight_files(&model_dir)?
+            .iter()
+            .map(|f| std::fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0))
+            .sum();
+        if opts.memory_fraction > 0.0 {
+            let mut budget = MemoryBudget::new(weight_bytes);
+            budget.batch = opts.batch;
+            budget.fraction = opts.memory_fraction;
+            // The longest forward this process runs: the tile — or the chunk,
+            // when the batched steps feed more prompt tokens than one tile per
+            // step (`--prefill-chunk` above the tile fuses several rows' pieces
+            // into one forward, whose working set is the chunk's).
+            budget = budget.with_prefill(if opts.prefill_tile > 0 {
+                opts.prefill_tile.max(opts.prefill_chunk)
+            } else {
+                opts.kv_capacity
+            });
+            if opts.batch > 1 {
+                // The scheduler's step is ONE ragged forward: the chunk's
+                // prompt tokens plus one token per live row, whatever `N` —
+                // not `N` forwards of a tile each. KV and conv stay per row.
+                budget.max_seq_len += opts.batch;
+                budget.activation_rows = Some(1);
+            }
+            config.memory_budget = Some(budget);
+        }
 
         let files = weight_files(&model_dir)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
         let model = Model::new(&config, vb).context("constructing LFM2")?;
-        let cache = Cache::new_with(true, dtype, &config, &device, opts.kv_capacity)
-            .context("allocating the KV cache")?;
+        let make_cache = |device: &Device| {
+            Cache::new_with(true, dtype, &config, device, opts.kv_capacity)
+                .context("allocating the KV cache")
+        };
+        let cache = make_cache(&device)?;
 
         // Stop on the checkpoint's declared EOS plus `<|im_end|>` (the chat
         // turn end), as `lfm2-chat` does.
@@ -165,13 +410,9 @@ impl Engine {
             .model_name
             .unwrap_or_else(|| model_name_from_dir(&model_dir));
 
+        let core = Arc::new(Core { model, device });
         let mut engine = Engine {
-            core: Core {
-                model,
-                device,
-                seq: Some(Sequence::new(cache)),
-                rings: Some(RingPool::new()),
-            },
+            core: Arc::clone(&core),
             text: Text {
                 tokenizer,
                 template,
@@ -184,18 +425,34 @@ impl Engine {
             kv_capacity: opts.kv_capacity,
             readback: opts.readback,
             reuse_prefix: opts.reuse_prefix,
+            batch: opts.batch,
+            dspark_k: dcfg.as_ref().map(|d| d.max_draft()),
+            prefill_tile: opts.prefill_tile,
+            prefill_chunk: opts.prefill_chunk,
+            memory_fraction: opts.memory_fraction,
+            mem_sample: opts.mem_sample,
+            rows: if opts.batch > 1 { opts.rows } else { RowsArm::Private },
+            pool: None,
+            share_prefix: opts.share_prefix && opts.batch > 1 && opts.rows.pooled(),
+            single: Mutex::new(Single {
+                seq: Some(Sequence::new(cache)),
+                rings: Some(RingPool::new()),
+                spec: None,
+            }),
+            sched: None,
+            sched_thread: Mutex::new(None),
         };
 
         if opts.warmup {
-            let (libs, pipes) = engine.core.with_session(|s| Ok(s.warmup()?))?;
+            let (libs, pipes) = engine.with_single(|s, _| Ok(s.warmup()?))?;
             eprintln!("[warmup: {libs} libraries, {pipes} pipelines compiled]");
         }
         // The two rings every request will want, built here rather than inside
         // the first request of each kind (#702: ~35 ms each, plus a sync).
-        if !engine.core.device.is_cpu() {
+        if !core.device.is_cpu() && opts.batch == 1 {
             let eos = engine.text.eos_ids.clone();
             let t = Instant::now();
-            let built = engine.core.with_session(|s| {
+            let built = engine.with_single(|s, _| {
                 let device = s.device().clone();
                 let a = s.rings().prepare(&eos, &device, ring_eos_read())?;
                 let b = s.rings().prepare(&NEVER_EOS, &device, ring_eos_read())?;
@@ -206,7 +463,195 @@ impl Engine {
                 ms(t.elapsed())
             );
         }
+
+        // The drafter: one per serving shape (the single path's, or the
+        // batch thread's with `N` slots), its pipelines warmed off the clock.
+        let build_spec = |n_seq: usize| -> Result<DSparkSpeculator> {
+            let (dir, dcfg) = (dspark_dir.as_ref().unwrap(), dcfg.as_ref().unwrap());
+            let draft_file = dir.join("model.safetensors");
+            if !draft_file.exists() {
+                anyhow::bail!("{} does not exist", draft_file.display());
+            }
+            // The largest absolute position a draft attends: the KV ceiling
+            // plus the block and slack (`lfm2-chat`'s sizing).
+            let max_pos = opts.kv_capacity + dcfg.block_size + 64;
+            let dvb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&[draft_file], DType::F16, &core.device)?
+            };
+            let drafter = DSparkDrafter::new(dcfg.clone(), max_pos, dvb)
+                .context("constructing DSpark drafter")?;
+            let mut spec = DSparkSpeculator::new(
+                drafter,
+                core.model.draft_embedding().clone(),
+                core.model.lm_head_linear().clone(),
+                n_seq,
+            )
+            .context("constructing DSpark speculator")?;
+            eprintln!(
+                "[dspark: drafter loaded from {}, {} layers, K={} (verify window {} positions), \
+                 {n_seq} slots, context kv {}]",
+                dir.display(),
+                dcfg.num_hidden_layers,
+                dcfg.max_draft(),
+                dcfg.max_draft() + 1,
+                spec.ctx_kv().name()
+            );
+            if opts.warmup {
+                spec.warmup(&core.device)
+                    .context("warming DSpark drafter pipelines")?;
+            }
+            Ok(spec)
+        };
+
+        if opts.batch == 1 {
+            if dcfg.is_some() {
+                let spec = build_spec(1)?;
+                lock(&engine.single).spec = Some(spec);
+            }
+            return Ok(engine);
+        }
+
+        // `--batch N`: the pool and the scheduler thread. On the `pool` arms
+        // every row is a slot of one `BatchPool` (§12.2); on `private` a
+        // crown cache of its own.
+        let mut caches = Vec::with_capacity(opts.batch);
+        if pooled {
+            let pool = BatchPool::new(&config, &core.device, opts.batch, opts.kv_capacity)
+                .context("allocating the rows' shared pool")?;
+            pool.set_batched_arms(opts.rows == RowsArm::Pool);
+            for _ in 0..opts.batch {
+                caches.push(
+                    Cache::for_batch(true, dtype, &config, &core.device, &pool)
+                        .context("leasing a row's slot")?,
+                );
+            }
+            engine.pool = Some(pool);
+        } else {
+            for _ in 0..opts.batch {
+                caches.push(make_cache(&core.device)?);
+            }
+        }
+        let pool = SlotPool::new(opts.batch, || caches.pop().expect("one cache per slot"));
+        // The closed cells' proposer, and — on the pool arms — the continuous
+        // driver's own (two drafters; §12.4).
+        let extra: Extra = Speculators {
+            closed: if dcfg.is_some() {
+                Some(build_spec(opts.batch)?)
+            } else {
+                None
+            },
+            continuous: if dcfg.is_some() && pooled {
+                Some(build_spec(opts.batch)?)
+            } else {
+                None
+            },
+            eos_ids: engine.text.eos_ids.clone(),
+        };
+        let batch_opts = DecodeOptions {
+            lookahead: 1,
+            prefill_tile: opts.prefill_tile,
+            prefill_chunk: opts.prefill_chunk,
+            ..DecodeOptions::new(0)
+        };
+        // `--dspark` on private caches runs the static pipelined driver; on
+        // the pool arms the continuous speculative driver (§12.4).
+        let mode: BatchMode<Model, Extra> = if dcfg.is_some() && !pooled {
+            BatchMode::Static(Box::new(static_dspark_body))
+        } else {
+            BatchMode::Continuous
+        };
+        let cfg = BatchConfig {
+            device: core.device.clone(),
+            pool,
+            rings: RingPool::new(),
+            opts: batch_opts,
+            max_rows: opts.batch,
+            reuse_prefix: opts.reuse_prefix,
+            share_prefix: opts.share_prefix,
+            mode,
+            extra,
+            on_counters: None,
+        };
+        let (handle, thread) = spawn_batch(Arc::clone(&core), |c: &Core| &c.model, cfg)
+            .map_err(|e| anyhow::anyhow!("starting the batch scheduler: {e}"))?;
+        eprintln!(
+            "[batch: scheduler up, {} sequences, {} rows per step, tile {} chunk {}, {}]",
+            opts.batch,
+            opts.batch,
+            opts.prefill_tile,
+            opts.prefill_chunk,
+            if dcfg.is_some() {
+                "static batches through the pipelined speculative driver"
+            } else {
+                "continuous batching"
+            }
+        );
+        engine.sched = Some(handle);
+        *lock(&engine.sched_thread) = Some(thread);
+        if opts.warmup && dcfg.is_none() {
+            // The batched GEMM pipelines at `m = N` key their own `align_m`
+            // variants (§13.1i): compile them off every request's clock.
+            let n = opts.batch;
+            let tile = opts.prefill_tile;
+            engine
+                .closed(move |idle| -> Result<()> {
+                    with_sessions(idle, n, |idle, sessions| {
+                        let prompt: Vec<u32> = vec![0u32; 8];
+                        let prompts: Vec<&[u32]> = vec![prompt.as_slice(); n];
+                        let warm = DecodeOptions {
+                            lookahead: 1,
+                            prefill_tile: tile,
+                            ..DecodeOptions::new(4)
+                        };
+                        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+                        let _ = Session::decode_batched(
+                            sessions,
+                            &mut sampler,
+                            &prompts,
+                            &warm,
+                            &NEVER_EOS,
+                            idle.device,
+                            &mut |_, _| Ok(()),
+                        )?;
+                        idle.device.synchronize()?;
+                        Ok(())
+                    })
+                })
+                .context("warming the batched pipelines")??;
+            eprintln!("[batch: warmed the m={} pipelines]", opts.batch);
+        }
         Ok(engine)
+    }
+
+    fn with_single<T>(
+        &self,
+        f: impl FnOnce(&mut DecodeSession<'_, Model>, &mut Option<DSparkSpeculator>) -> Result<T>,
+    ) -> Result<T> {
+        lock(&self.single).with_session(&self.core, f)
+    }
+
+    /// Run a closed job on the batch thread and wait for it.
+    pub fn closed<T: Send + 'static>(
+        &self,
+        job: impl for<'a, 'm> FnOnce(&mut Idle<'a, 'm, Model, Extra>) -> T + Send + 'static,
+    ) -> Result<T> {
+        let sched = self
+            .sched
+            .as_ref()
+            .context("no batch scheduler (start lloom-serve with --batch N)")?;
+        sched
+            .run_closed_blocking(job)
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Stop the batch thread, if one runs, after the rows it holds retire.
+    pub fn shutdown(&self) {
+        if let Some(s) = &self.sched {
+            s.shutdown();
+        }
+        if let Some(t) = lock(&self.sched_thread).take() {
+            let _ = t.join();
+        }
     }
 
     // ---- tokens ---------------------------------------------------------
@@ -246,6 +691,14 @@ impl Engine {
         (0..n).map(|i| seed[i % seed.len()]).collect()
     }
 
+    /// The seed tiled to `n` ids, starting `row` seed tokens in, so `B` rows
+    /// of one batch carry different prompts (a shared prompt would share a
+    /// prefix and skip the prefill work a cell exists to measure).
+    pub fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
+        let seed = &self.text.seed_tokens;
+        (0..n).map(|i| seed[(i + row * 7) % seed.len()]).collect()
+    }
+
     /// Render `messages` through the checkpoint's own chat template with the
     /// generation prompt appended. `kwargs` are extra template variables
     /// (`chat_template_kwargs`, e.g. `enable_thinking`).
@@ -269,12 +722,21 @@ impl Engine {
             .map_err(|e| anyhow::anyhow!("rendering the chat template: {e}"))
     }
 
+    fn detok(&self) -> impl FnMut(&[u32]) -> lloom_tensor::Result<String> + '_ {
+        |ids: &[u32]| -> lloom_tensor::Result<String> {
+            self.text
+                .tokenizer
+                .decode(ids, false)
+                .map_err(|e| lloom_tensor::Error::Msg(format!("detokenize: {e}")))
+        }
+    }
+
     // ---- decode ---------------------------------------------------------
 
     /// One decode over `prompt_ids` from a fresh sequence (unless prefix reuse
     /// is on), streaming text fragments to `on_fragment`.
     pub fn complete(
-        &mut self,
+        &self,
         prompt_ids: &[u32],
         params: &DecodeParams,
         mut on_fragment: impl FnMut(&str),
@@ -287,49 +749,211 @@ impl Engine {
 
     /// [`Self::complete`] whose hook can end the run early (`false`).
     pub fn complete_until(
-        &mut self,
+        &self,
         prompt_ids: &[u32],
         params: &DecodeParams,
         on_fragment: impl FnMut(&str) -> bool,
     ) -> Result<Decoded> {
         self.check_fits(prompt_ids.len(), params.max_tokens)?;
-        let text = &self.text;
+        if let Some(sched) = &self.sched {
+            return self.complete_batched(sched, prompt_ids, params, on_fragment);
+        }
         let reuse = self.reuse_prefix;
-        self.core.with_session(|s| {
+        let detok = self.detok();
+        self.with_single(|s, spec| {
             if !reuse {
                 s.reset();
             }
-            let detok = |ids: &[u32]| -> lloom_tensor::Result<String> {
-                text.tokenizer
-                    .decode(ids, false)
-                    .map_err(|e| lloom_tensor::Error::Msg(format!("detokenize: {e}")))
-            };
-            s.decode_until(prompt_ids, detok, params, on_fragment)
-                .map_err(anyhow::Error::from)
+            match spec {
+                Some(spec) => s
+                    .decode_speculative_until(spec, prompt_ids, detok, params, on_fragment)
+                    .map_err(anyhow::Error::from),
+                None => s
+                    .decode_until(prompt_ids, detok, params, on_fragment)
+                    .map_err(anyhow::Error::from),
+            }
+        })
+    }
+
+    /// A request through the batch scheduler: submitted, its tokens read off
+    /// the channel and streamed as text, its outcome the row's.
+    fn complete_batched(
+        &self,
+        sched: &BatchHandle<Model, Extra>,
+        prompt_ids: &[u32],
+        params: &DecodeParams,
+        mut on_fragment: impl FnMut(&str) -> bool,
+    ) -> Result<Decoded> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = sched.submit(BatchRequest {
+            prompt_ids: prompt_ids.to_vec(),
+            params: params.clone(),
+            cancel: Arc::clone(&cancel),
+        });
+        let mut detok = self.detok();
+        let mut stream = TextStream::new(params.max_tokens);
+        let mut stopped_on_string = false;
+        let mut cancelled = false;
+        let done = loop {
+            match rx.recv() {
+                Ok(BatchEvent::Tokens(ids)) => {
+                    if cancel.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if let Some(chunk) = stream.push(&ids, &mut detok)? {
+                        if !on_fragment(&chunk) {
+                            cancelled = true;
+                            cancel.store(true, Ordering::Release);
+                            continue;
+                        }
+                    }
+                    if stream.hit_stop(&params.stop_strings) {
+                        stopped_on_string = true;
+                        cancel.store(true, Ordering::Release);
+                    }
+                }
+                Ok(BatchEvent::Done(d)) => break *d,
+                Ok(BatchEvent::Error(e)) => anyhow::bail!("batch: {e}"),
+                Err(_) => anyhow::bail!("batch: the scheduler dropped the request"),
+            }
+        };
+        let stop = if cancelled || (done.cancelled && !stopped_on_string) {
+            Stop::Cancelled
+        } else if stopped_on_string {
+            Stop::StopString
+        } else if done.eos {
+            Stop::Eos
+        } else {
+            Stop::Length
+        };
+        let (text, _) = stream.finish(&params.stop_strings);
+        Ok(Decoded {
+            text,
+            tokens: done.tokens,
+            stop,
+            reuse: done.reuse,
+            reused: done.reused,
+            prefilled: done.prefilled,
+            readback: match self.dspark_k {
+                Some(k) => ReadbackArm::Speculative { k },
+                None => ReadbackArm::Batched {
+                    rows: done.joined_beside,
+                },
+            },
+            stats: done.stats,
         })
     }
 
     /// Time one prefill of `n` seed tokens on a fresh cache: the forward
-    /// submitted and the device drained, nothing else in the bracket.
-    pub fn prefill_throughput(&mut self, n: usize) -> Result<PrefillTiming> {
+    /// submitted and the device drained, nothing else in the bracket. At
+    /// `batch > 1`, `batch` prompts of `n` tokens each arrive together and
+    /// are fed as the scheduler feeds them — at most `--prefill-chunk`
+    /// prompt tokens per step as ragged rows of one forward, each piece
+    /// tile-bounded — and the bracket closes when the device drains; the
+    /// aggregate is `batch × n` over that. A chunk above the tile fuses
+    /// several rows' pieces into one forward whose working set is the
+    /// chunk's, which is why the budget is sized at the chunk (`load`).
+    pub fn prefill_throughput(&self, n: usize, batch: usize) -> Result<PrefillTiming> {
         self.check_fits(n, 1)?;
-        let ids = self.seed_prompt(n);
-        let device = self.core.device.clone();
-        let prefill = self.core.with_session(|s| {
-            s.reset();
-            let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
-            let t = Instant::now();
-            let _ = s.model().forward(&input, 0, s.cache_mut())?;
-            device.synchronize()?;
-            let elapsed = t.elapsed();
-            // The forward wrote into the cache behind the session's token
-            // log; nothing downstream may read that state.
-            s.reset();
-            Ok(elapsed)
-        })?;
+        if batch <= 1 {
+            let ids = self.seed_prompt(n);
+            let device = self.core.device.clone();
+            let tile = self.prefill_tile;
+            let gauge = MemGauge::start(&device, self.mem_sample);
+            let (prefill, forwards) = self.with_single(|s, _| {
+                s.reset();
+                // The prompt in tiles of at most `prefill_tile` tokens (all
+                // of it in one forward at tile 0), each forward paced against
+                // the GPU (`DecodeSession::prefill`), so the working set is
+                // bounded by the tile rather than by the prompt.
+                let params = DecodeParams {
+                    max_tokens: 1,
+                    eos_ids: NEVER_EOS.to_vec(),
+                    prefill_tile: tile,
+                    ..DecodeParams::default()
+                };
+                let t = Instant::now();
+                let out = s.prefill(&ids, &params)?;
+                device.synchronize()?;
+                let elapsed = t.elapsed();
+                // The forwards wrote into the cache behind the session's token
+                // log; nothing downstream may read that state.
+                s.reset();
+                Ok((elapsed, out.units))
+            })?;
+            return Ok(PrefillTiming {
+                prompt_tokens: n,
+                batch: 1,
+                prefill_ms: ms(prefill),
+                forwards,
+                mem: gauge.finish(&device),
+            });
+        }
+        self.check_batch(batch)?;
+        let prompts: Vec<Vec<u32>> = (0..batch).map(|r| self.seed_prompt_row(n, r)).collect();
+        let tile = self.prefill_tile;
+        let chunk = self.prefill_chunk;
+        let dspark = self.dspark_k.is_some();
+        let pooled = self.rows.pooled();
+        let gauge = MemGauge::start(&self.core.device, self.mem_sample);
+        let (elapsed, forwards) = self.closed(move |idle| -> Result<(Duration, usize)> {
+            with_sessions(idle, batch, |idle, sessions| {
+                let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+                let t = Instant::now();
+                let forwards = if dspark {
+                    // The speculative driver has no prefill-only entry; its
+                    // prefill is the pipelined driver's streamed one, one token
+                    // of output per row.
+                    let spec = idle
+                        .extra
+                        .closed
+                        .as_mut()
+                        .context("no drafter on the batch thread")?;
+                    let opts = DecodeOptions {
+                        prefill_tile: tile,
+                        ..DecodeOptions::new(1)
+                    };
+                    let outs = run_spec_rows(
+                        pooled,
+                        sessions,
+                        spec,
+                        &refs,
+                        &opts,
+                        &NEVER_EOS,
+                        idle.device,
+                        &mut |_, _| Ok(()),
+                    )?;
+                    outs.iter().map(|o| o.stats.prefill_units).sum()
+                } else {
+                    let opts = DecodeOptions {
+                        lookahead: 1,
+                        prefill_tile: tile,
+                        prefill_chunk: chunk,
+                        ..DecodeOptions::new(0)
+                    };
+                    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+                    let outs = Session::decode_batched(
+                        sessions,
+                        &mut sampler,
+                        &refs,
+                        &opts,
+                        &NEVER_EOS,
+                        idle.device,
+                        &mut |_, _| Ok(()),
+                    )?;
+                    outs.iter().map(|o| o.stats.prefill_units).sum()
+                };
+                idle.device.synchronize()?;
+                let elapsed = t.elapsed();
+                Ok((elapsed, forwards))
+            })
+        })??;
         Ok(PrefillTiming {
             prompt_tokens: n,
-            prefill_ms: ms(prefill),
+            batch,
+            prefill_ms: ms(elapsed),
+            forwards,
+            mem: gauge.finish(&self.core.device),
         })
     }
 
@@ -337,32 +961,223 @@ impl Engine {
     /// (`llama-bench --n-depth P --n-gen D`'s shape): the prompt is prefilled
     /// and its first token sampled outside the bracket, the device drained,
     /// then `D` tokens — `D` forwards and `D` samples — are timed to the last
-    /// one landing. EOS never fires.
+    /// one landing. EOS never fires. At `batch > 1` every row's context is
+    /// built outside the bracket and the `D` batched steps are timed
+    /// together: `decode_ms` is the batch's, `generation_tps` the aggregate.
     pub fn decode_throughput(
-        &mut self,
+        &self,
+        prompt_tokens: usize,
+        decode_tokens: usize,
+        batch: usize,
+    ) -> Result<DecodeTiming> {
+        self.check_fits(prompt_tokens, decode_tokens + 1)?;
+        if batch <= 1 && self.sched.is_none() {
+            return self.decode_throughput_single(prompt_tokens, decode_tokens);
+        }
+        self.check_batch(batch)?;
+        let prompts: Vec<Vec<u32>> = (0..batch)
+            .map(|r| self.seed_prompt_row(prompt_tokens, r))
+            .collect();
+        let tile = self.prefill_tile;
+        let dspark_k = self.dspark_k;
+        let pooled = self.rows.pooled();
+        let gauge = MemGauge::start(&self.core.device, self.mem_sample);
+        let mut timing = self.closed(move |idle| -> Result<DecodeTiming> {
+            with_sessions(idle, batch, |idle, sessions| {
+                let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+                let out =
+                    if let Some(k) = dspark_k {
+                        // The speculative body cannot split the context from the
+                        // decode (its verify holds no resumable logits): one run of
+                        // `D` tokens per row, the prompts' submit time subtracted;
+                        // the prefills' GPU tail is inside the bracket.
+                        let spec = idle
+                            .extra
+                            .closed
+                            .as_mut()
+                            .context("no drafter on the batch thread")?;
+                        let opts = DecodeOptions {
+                            prefill_tile: tile,
+                            ..DecodeOptions::new(decode_tokens)
+                        };
+                        let t = Instant::now();
+                        let outs = run_spec_rows(
+                            pooled,
+                            sessions,
+                            spec,
+                            &refs,
+                            &opts,
+                            &NEVER_EOS,
+                            idle.device,
+                            &mut |_, _| Ok(()),
+                        )?;
+                        idle.device.synchronize()?;
+                        let wall = ms(t.elapsed());
+                        let prefill_ms: f64 =
+                            outs.iter().map(|o| o.stats.prefill_ns as f64 / 1e6).sum();
+                        DecodeTiming {
+                    prompt_tokens,
+                    decode_tokens,
+                    batch,
+                    prefill_ms,
+                    decode_ms: (wall - prefill_ms).max(0.0),
+                    readback: ReadbackArm::Speculative { k },
+                    bracket: if pooled {
+                        "run wall minus the join prefills (each waited on: the rounds alone)"
+                    } else {
+                        "run wall minus the prompts' submit; the prefills' GPU tail is inside"
+                    },
+                    row_tokens: outs.iter().map(|o| o.ids.len()).collect(),
+                    row_rounds: outs.iter().map(|o| o.stats.rounds.len()).collect(),
+                    row_accepted: outs
+                        .iter()
+                        .map(|o| {
+                            let n = o.stats.rounds.len().max(1) as f64;
+                            o.stats.rounds.iter().map(|r| r.accepted as f64).sum::<f64>() / n
+                        })
+                        .collect(),
+                    mem: MemReport::default(),
+                }
+                    } else {
+                        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+                        let ctx = DecodeOptions {
+                            lookahead: 1,
+                            prefill_tile: tile,
+                            ..DecodeOptions::new(1)
+                        };
+                        let t = Instant::now();
+                        let first = Session::decode_batched(
+                            sessions,
+                            &mut sampler,
+                            &refs,
+                            &ctx,
+                            &NEVER_EOS,
+                            idle.device,
+                            &mut |_, _| Ok(()),
+                        )?;
+                        idle.device.synchronize()?;
+                        let prefill_ms = ms(t.elapsed());
+                        for (i, o) in first.iter().enumerate() {
+                            if o.ids.len() != 1 {
+                                anyhow::bail!(
+                                    "row {i}: the context run produced {} tokens, expected 1",
+                                    o.ids.len()
+                                );
+                            }
+                        }
+                        // The rows resume from the logits the context run held: an
+                        // empty prompt per row, nothing re-fed.
+                        let empty: Vec<&[u32]> = vec![&[]; batch];
+                        let dec = DecodeOptions {
+                            lookahead: 1,
+                            ..DecodeOptions::new(decode_tokens)
+                        };
+                        let t = Instant::now();
+                        let outs = Session::decode_batched(
+                            sessions,
+                            &mut sampler,
+                            &empty,
+                            &dec,
+                            &NEVER_EOS,
+                            idle.device,
+                            &mut |_, _| Ok(()),
+                        )?;
+                        idle.device.synchronize()?;
+                        let decode_ms = ms(t.elapsed());
+                        for (i, o) in outs.iter().enumerate() {
+                            if o.ids.len() != decode_tokens {
+                                anyhow::bail!(
+                            "row {i}: the decode run produced {} tokens, expected {decode_tokens}",
+                            o.ids.len()
+                        );
+                            }
+                            if o.stats.prefill_units != 0 {
+                                anyhow::bail!(
+                            "row {i}: the decode run prefilled ({} forwards); the context was \
+                             expected to resume",
+                            o.stats.prefill_units
+                        );
+                            }
+                        }
+                        DecodeTiming {
+                    prompt_tokens,
+                    decode_tokens,
+                    batch,
+                    prefill_ms,
+                    decode_ms,
+                    readback: ReadbackArm::Batched { rows: batch },
+                    bracket: "D batched steps after every row's context, resumed from held logits",
+                    row_tokens: outs.iter().map(|o| o.ids.len()).collect(),
+                    row_rounds: Vec::new(),
+                    row_accepted: Vec::new(),
+                    mem: MemReport::default(),
+                }
+                    };
+                Ok(out)
+            })
+        })??;
+        timing.mem = gauge.finish(&self.core.device);
+        Ok(timing)
+    }
+
+    fn decode_throughput_single(
+        &self,
         prompt_tokens: usize,
         decode_tokens: usize,
     ) -> Result<DecodeTiming> {
-        self.check_fits(prompt_tokens, decode_tokens + 1)?;
         let prompt = self.seed_prompt(prompt_tokens);
         let device = self.core.device.clone();
-        let text = &self.text;
         let readback = self.readback;
-        self.core.with_session(|s| {
+        let prefill_tile = self.prefill_tile;
+        let detok = self.detok();
+        let gauge = MemGauge::start(&device, self.mem_sample);
+        let mut timing = self.with_single(|s, spec| {
             s.reset();
-            let detok = |ids: &[u32]| -> lloom_tensor::Result<String> {
-                text.tokenizer
-                    .decode(ids, false)
-                    .map_err(|e| lloom_tensor::Error::Msg(format!("detokenize: {e}")))
-            };
+            if let Some(spec) = spec {
+                // One run of `D` tokens; the prompt's submit time subtracted
+                // (the prefill's GPU tail is inside the bracket).
+                let params = DecodeParams {
+                    max_tokens: decode_tokens,
+                    eos_ids: NEVER_EOS.to_vec(),
+                    readback,
+                    ..DecodeParams::default()
+                };
+                let t = Instant::now();
+                let run = s.decode_speculative_until(spec, &prompt, detok, &params, |_| true)?;
+                device.synchronize()?;
+                let wall = ms(t.elapsed());
+                let prefill_ms = run.stats.prefill_ns as f64 / 1e6;
+                if run.tokens.len() != decode_tokens {
+                    anyhow::bail!(
+                        "the decode run produced {} tokens, expected {decode_tokens}",
+                        run.tokens.len()
+                    );
+                }
+                s.reset();
+                return Ok(DecodeTiming {
+                    prompt_tokens,
+                    decode_tokens,
+                    batch: 1,
+                    prefill_ms,
+                    decode_ms: (wall - prefill_ms).max(0.0),
+                    readback: run.readback,
+                    bracket: "run wall minus the prompt's submit; the prefill's GPU tail is inside",
+                    row_tokens: vec![run.tokens.len()],
+                row_rounds: Vec::new(),
+                row_accepted: Vec::new(),
+                    mem: MemReport::default(),
+                });
+            }
+            let mut detok = detok;
             let params = DecodeParams {
                 max_tokens: 1,
                 eos_ids: NEVER_EOS.to_vec(),
                 readback,
+                prefill_tile,
                 ..DecodeParams::default()
             };
             let t = Instant::now();
-            let first = s.decode(&prompt, detok, &params, |_| {})?;
+            let first = s.decode(&prompt, &mut detok, &params, |_| {})?;
             device.synchronize()?;
             let prefill_ms = ms(t.elapsed());
             if first.tokens.len() != 1 {
@@ -379,10 +1194,11 @@ impl Engine {
                 max_tokens: decode_tokens,
                 eos_ids: NEVER_EOS.to_vec(),
                 readback,
+                prefill_tile,
                 ..DecodeParams::default()
             };
             let t = Instant::now();
-            let run = s.decode(&all, detok, &params, |_| {})?;
+            let run = s.decode(&all, &mut detok, &params, |_| {})?;
             let decode_ms = ms(t.elapsed());
             if run.tokens.len() != decode_tokens {
                 anyhow::bail!(
@@ -402,41 +1218,62 @@ impl Engine {
             Ok(DecodeTiming {
                 prompt_tokens,
                 decode_tokens,
+                batch: 1,
                 prefill_ms,
                 decode_ms,
                 readback: run.readback,
+                bracket: "D steps after the context, resumed from held logits",
+                row_tokens: vec![run.tokens.len()],
+                row_rounds: Vec::new(),
+                row_accepted: Vec::new(),
+                mem: MemReport::default(),
             })
-        })
+        })?;
+        timing.mem = gauge.finish(&device);
+        Ok(timing)
     }
 
     /// The next-token log-probabilities after `prompt_ids`: the `k` most
     /// likely ids with their log-probs, and the argmax. One forward on a fresh
     /// cache; the logits come to the host once.
     pub fn next_token_logprobs(
-        &mut self,
+        &self,
         prompt_ids: &[u32],
         k: usize,
     ) -> Result<(u32, Vec<(u32, f32)>)> {
         self.check_fits(prompt_ids.len(), 1)?;
         let device = self.core.device.clone();
-        self.core.with_session(|s| {
-            s.reset();
-            let input = Tensor::new(prompt_ids, &device)?.unsqueeze(0)?;
-            let logits = s.model().forward(&input, 0, s.cache_mut())?;
-            s.reset();
-            let logits = logits.squeeze(0)?.to_dtype(DType::F32)?;
-            let logp = lloom::nn::ops::log_softmax(&logits, D::Minus1)?;
-            let v: Vec<f32> = logp.to_vec1()?;
-            let mut idx: Vec<usize> = (0..v.len()).collect();
-            let k = k.min(v.len());
-            idx.select_nth_unstable_by(k.saturating_sub(1).min(v.len() - 1), |&a, &b| {
-                v[b].total_cmp(&v[a])
-            });
-            let mut top: Vec<(u32, f32)> = idx[..k].iter().map(|&i| (i as u32, v[i])).collect();
-            top.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let argmax = top.first().map(|t| t.0).context("empty vocabulary")?;
-            Ok((argmax, top))
-        })
+        let ids = prompt_ids.to_vec();
+        let logits = if self.sched.is_some() {
+            self.closed(move |idle| -> Result<Tensor> {
+                with_sessions(idle, 1, |idle, sessions| {
+                    let s = &mut sessions[0];
+                    let input = Tensor::new(ids.as_slice(), idle.device)?.unsqueeze(0)?;
+                    let logits = idle.model.forward(&input, 0, s.cache_mut())?;
+                    let v = logits.squeeze(0)?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                    Tensor::from_vec(v, logits.dim(1)?, &Device::Cpu).map_err(anyhow::Error::from)
+                })
+            })??
+        } else {
+            self.with_single(|s, _| {
+                s.reset();
+                let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
+                let logits = s.model().forward(&input, 0, s.cache_mut())?;
+                s.reset();
+                Ok(logits.squeeze(0)?.to_dtype(DType::F32)?)
+            })?
+        };
+        let logp = lloom::nn::ops::log_softmax(&logits, D::Minus1)?;
+        let v: Vec<f32> = logp.to_vec1()?;
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        let k = k.min(v.len());
+        idx.select_nth_unstable_by(k.saturating_sub(1).min(v.len() - 1), |&a, &b| {
+            v[b].total_cmp(&v[a])
+        });
+        let mut top: Vec<(u32, f32)> = idx[..k].iter().map(|&i| (i as u32, v[i])).collect();
+        top.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let argmax = top.first().map(|t| t.0).context("empty vocabulary")?;
+        Ok((argmax, top))
     }
 
     fn check_fits(&self, prompt: usize, gen: usize) -> Result<()> {
@@ -450,6 +1287,335 @@ impl Engine {
         }
         Ok(())
     }
+
+    /// A cell's `batch` must fit the pool the server was started with.
+    pub fn check_batch(&self, batch: usize) -> Result<()> {
+        if batch == 0 {
+            anyhow::bail!("batch must be positive");
+        }
+        if batch > self.batch {
+            anyhow::bail!(
+                "batch {batch} exceeds the server's --batch {} (start lloom-serve with --batch >= {batch})",
+                self.batch
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `n` sequences checked out of the pool for a closed job, reset, and the
+/// slots to return them to.
+struct TakenSessions<'m> {
+    sessions: Vec<Session<'m, Model>>,
+    slots: Vec<usize>,
+}
+
+impl<'m> TakenSessions<'m> {
+    fn give_back(self, idle: &mut Idle<'_, 'm, Model, Extra>) {
+        for (slot, mut s) in self.slots.into_iter().zip(self.sessions) {
+            s.reset();
+            idle.pool.release(slot, s.into_sequence());
+        }
+    }
+}
+
+/// Run `f` over `n` sequences checked out of the pool and reset, and put
+/// them back — reset again — whatever `f` returned: a failed cell must not
+/// cost the pool a slot.
+fn with_sessions<'m, T>(
+    idle: &mut Idle<'_, 'm, Model, Extra>,
+    n: usize,
+    f: impl FnOnce(&mut Idle<'_, 'm, Model, Extra>, &mut [Session<'m, Model>]) -> Result<T>,
+) -> Result<T> {
+    let mut taken = take_sessions(idle, n)?;
+    let out = f(idle, &mut taken.sessions);
+    taken.give_back(idle);
+    out
+}
+
+fn take_sessions<'m>(idle: &mut Idle<'_, 'm, Model, Extra>, n: usize) -> Result<TakenSessions<'m>> {
+    let mut sessions = Vec::with_capacity(n);
+    let mut slots = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (routed, seq) = idle
+            .pool
+            .acquire(&[])
+            .context("a closed job found the pool empty")?;
+        let mut s = Session::from_sequence(idle.model, seq);
+        s.reset();
+        sessions.push(s);
+        slots.push(routed.slot);
+    }
+    Ok(TakenSessions { sessions, slots })
+}
+
+/// The static body under `--dspark --batch N`: every row's round pipelined
+/// through the one drafter (`Session::decode_speculative_pipelined`, §10.2y).
+/// Greedy, one EOS set per batch — mixed sets are refused rather than served
+/// under the first row's.
+/// A closed speculative run over `sessions`: the batched loop
+/// (`decode_spec_batched`, one target pass per round) on the pool arms, the
+/// static pipelined driver on private caches.
+#[allow(clippy::too_many_arguments)]
+fn run_spec_rows<'m>(
+    pooled: bool,
+    sessions: &mut [Session<'m, Model>],
+    spec: &mut DSparkSpeculator,
+    prompts: &[&[u32]],
+    opts: &DecodeOptions,
+    eos_ids: &[u32],
+    device: &Device,
+    on_tokens: &mut dyn FnMut(usize, &[u32]) -> lloom_tensor::Result<()>,
+) -> lloom_tensor::Result<Vec<lloom::nn::DecodeOut>> {
+    if pooled {
+        Session::decode_spec_batched(sessions, spec, prompts, opts, eos_ids, device, on_tokens)
+    } else {
+        Session::decode_speculative_pipelined(sessions, spec, prompts, opts, eos_ids, device, on_tokens)
+    }
+}
+
+fn static_dspark_body<'a, 'm>(
+    idle: &mut Idle<'a, 'm, Model, Extra>,
+    sessions: &mut [Session<'m, Model>],
+    prompts: &[&[u32]],
+    specs: &[RowSpec],
+    on_tokens: &mut dyn FnMut(usize, &[u32]) -> lloom_tensor::Result<()>,
+) -> lloom_tensor::Result<Vec<DecodeOut>> {
+    let spec = idle
+        .extra
+        .closed
+        .as_mut()
+        .ok_or_else(|| lloom_tensor::Error::msg("no drafter on the batch thread"))?;
+    let first = specs
+        .first()
+        .ok_or_else(|| lloom_tensor::Error::msg("an empty static batch"))?;
+    for (i, s) in specs.iter().enumerate() {
+        if s.sampling != Sampling::ArgMax {
+            lloom_tensor::bail!(
+                "row {i}: the speculative body decodes greedily; a temperature is refused"
+            );
+        }
+        if s.eos_ids != first.eos_ids {
+            lloom_tensor::bail!(
+                "row {i}: a static speculative batch runs one EOS set; this row's differs from \
+                 row 0's"
+            );
+        }
+    }
+    let max_tokens = specs.iter().map(|s| s.max_tokens).max().unwrap_or(0);
+    let opts = DecodeOptions::new(max_tokens);
+    let caps: Vec<usize> = specs.iter().map(|s| s.max_tokens).collect();
+    let mut outs = Session::decode_speculative_pipelined(
+        sessions,
+        spec,
+        prompts,
+        &opts,
+        &first.eos_ids,
+        idle.device,
+        &mut |i, ids| {
+            // Every row runs to the batch's widest cap; a row past its own
+            // is cut here and below.
+            on_tokens(i, ids)
+        },
+    )?;
+    for (o, cap) in outs.iter_mut().zip(caps) {
+        if cap > 0 && o.ids.len() > cap {
+            o.ids.truncate(cap);
+            o.stats.produced = cap;
+        }
+    }
+    Ok(outs)
+}
+
+/// One reading of the process's memory: the device's allocated bytes, the
+/// pool's live / free / pending (CPU-released, awaiting the GPU — §9.5o's
+/// class) bytes, and the process's `phys_footprint`, against Metal's
+/// `recommendedMaxWorkingSetSize`. Every field is 0 off Metal.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemSnapshot {
+    pub device_allocated: u64,
+    pub pool_live: u64,
+    pub pool_free: u64,
+    pub pool_pending: u64,
+    pub phys_footprint: u64,
+    pub working_set: u64,
+}
+
+impl MemSnapshot {
+    pub fn read(device: &Device) -> Self {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = device {
+            let (shared, private) = m.pool_occupancy();
+            return Self {
+                device_allocated: m.device().current_allocated_size() as u64,
+                pool_live: (shared.live_bytes + private.live_bytes) as u64,
+                pool_free: (shared.free_bytes + private.free_bytes) as u64,
+                pool_pending: (shared.pending_bytes + private.pending_bytes) as u64,
+                phys_footprint: proc_footprint().map(|(p, _)| p).unwrap_or(0),
+                working_set: m.device().recommended_max_working_set_size() as u64,
+            };
+        }
+        let _ = device;
+        Self::default()
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "device_allocated_bytes": self.device_allocated,
+            "pool_live_bytes": self.pool_live,
+            "pool_free_bytes": self.pool_free,
+            "pool_pending_bytes": self.pool_pending,
+            "phys_footprint_bytes": self.phys_footprint,
+            "recommended_max_working_set_bytes": self.working_set,
+        })
+    }
+}
+
+/// What a cell's memory gauge reports: the readings before and after, and —
+/// under `--mem-sample` — the peaks over the cell.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemReport {
+    pub before: MemSnapshot,
+    pub after: MemSnapshot,
+    /// Peaks over the cell; `None` when the sampler was off.
+    pub peak: Option<MemSnapshot>,
+    pub samples: u64,
+}
+
+impl MemReport {
+    pub fn json(&self) -> Value {
+        let mut v = json!({
+            "before": self.before.json(),
+            "after": self.after.json(),
+            "sampled": self.peak.is_some(),
+            "samples": self.samples,
+        });
+        if let Some(p) = &self.peak {
+            v["peak"] = p.json();
+        }
+        v
+    }
+
+    /// One line for the log: the peak (or the after) device bytes and the
+    /// footprint, and what the cell left behind.
+    pub fn line(&self) -> String {
+        let gb = |b: u64| b as f64 / 1e9;
+        match &self.peak {
+            Some(p) => format!(
+                "mem: device {:.2} -> peak {:.2} -> {:.2} GB, pending peak {:.2} GB, phys peak {:.2} GB ({} samples)",
+                gb(self.before.device_allocated),
+                gb(p.device_allocated),
+                gb(self.after.device_allocated),
+                gb(p.pool_pending),
+                gb(p.phys_footprint),
+                self.samples
+            ),
+            None => format!(
+                "mem: device {:.2} -> {:.2} GB, phys {:.2} -> {:.2} GB",
+                gb(self.before.device_allocated),
+                gb(self.after.device_allocated),
+                gb(self.before.phys_footprint),
+                gb(self.after.phys_footprint)
+            ),
+        }
+    }
+}
+
+/// The 10 ms sampler's stop flag and thread, joined for `(peak, samples)`.
+type PeakSampler = (Arc<AtomicBool>, std::thread::JoinHandle<(MemSnapshot, u64)>);
+
+/// The gauge around one cell: a reading before, a reading after, and under
+/// `--mem-sample` a 10 ms thread holding the peaks in between.
+pub struct MemGauge {
+    before: MemSnapshot,
+    sampler: Option<PeakSampler>,
+}
+
+impl MemGauge {
+    pub fn start(device: &Device, sample: bool) -> Self {
+        let before = MemSnapshot::read(device);
+        let sampler = if sample && !device.is_cpu() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let device = device.clone();
+            let handle = std::thread::spawn(move || {
+                let mut peak = MemSnapshot::default();
+                let mut samples = 0u64;
+                loop {
+                    let s = MemSnapshot::read(&device);
+                    peak.device_allocated = peak.device_allocated.max(s.device_allocated);
+                    peak.pool_live = peak.pool_live.max(s.pool_live);
+                    peak.pool_free = peak.pool_free.max(s.pool_free);
+                    peak.pool_pending = peak.pool_pending.max(s.pool_pending);
+                    peak.phys_footprint = peak.phys_footprint.max(s.phys_footprint);
+                    peak.working_set = s.working_set;
+                    samples += 1;
+                    if flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                (peak, samples)
+            });
+            Some((stop, handle))
+        } else {
+            None
+        };
+        Self { before, sampler }
+    }
+
+    pub fn finish(self, device: &Device) -> MemReport {
+        let (peak, samples) = match self.sampler {
+            Some((stop, handle)) => {
+                stop.store(true, Ordering::Release);
+                match handle.join() {
+                    Ok((p, n)) => (Some(p), n),
+                    Err(_) => (None, 0),
+                }
+            }
+            None => (None, 0),
+        };
+        MemReport {
+            before: self.before,
+            after: MemSnapshot::read(device),
+            peak,
+            samples,
+        }
+    }
+}
+
+/// The process's `phys_footprint` and resident size, from `proc_pid_rusage`
+/// (`RUSAGE_INFO_V6`; the two words at their struct offsets).
+#[cfg(all(target_os = "macos", feature = "metal"))]
+fn proc_footprint() -> Option<(u64, u64)> {
+    const RUSAGE_INFO_V6: i32 = 6;
+    const W_RESIDENT: usize = 8;
+    const W_PHYS: usize = 9;
+    const WORDS: usize = 64;
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+    }
+    let mut buf = [0u64; WORDS];
+    // SAFETY: `proc_pid_rusage` writes at most `sizeof(rusage_info_v6)` bytes
+    // (~472) into the buffer, and `WORDS * 8 = 512` is larger, so the write is
+    // in bounds; the buffer outlives the call.
+    let rc = unsafe {
+        proc_pid_rusage(
+            std::process::id() as i32,
+            RUSAGE_INFO_V6,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some((buf[W_PHYS], buf[W_RESIDENT]))
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[allow(dead_code)]
+fn proc_footprint() -> Option<(u64, u64)> {
+    None
 }
 
 /// The crown decode configuration `lfm2-chat --cache crown` bakes in: the
@@ -457,6 +1623,32 @@ impl Engine {
 /// token-identical to the generic path (§13.5, §12.2d, §12.2h). The library's
 /// `Config` ships the conservative arms (§7.1a); a serving binary turns the
 /// measured ones on.
+/// The rows' shared-pool configuration (`--rows pool`, `batched-decode-design.md`
+/// §12.2): the paged pool the slot-indexed kernels read, the in-place ring
+/// they write, the crown's fused epilogues.
+fn pool_config(config: &mut Config) {
+    config.attn_impl = AttnImpl::FlashDecoding;
+    config.kv_append = KvAppend::Paged;
+    config.conv_state = ConvState::RotatingRing { k: 1 };
+    config.gemv_silu = true;
+    config.gemv_residual = true;
+    config.conv_fused = true;
+}
+
+/// The pool arms under `--dspark` (§12.4): the paged pool and the flash
+/// read, a ring wide enough for the verify window, the drafter's taps.
+fn pool_spec_config(config: &mut Config, dcfg: &DSparkConfig) {
+    let k = dcfg.max_draft();
+    config.attn_impl = AttnImpl::FlashDecoding;
+    config.kv_append = KvAppend::Paged;
+    config.conv_state = ConvState::RotatingRing { k: k + 1 };
+    config.gemv_silu = true;
+    config.gemv_residual = true;
+    config.conv_fused = true;
+    config.tap_dtype = DType::F32;
+    config.tap_layers = dcfg.tap_layers();
+}
+
 fn crown_config(config: &mut Config) {
     config.attn_impl = AttnImpl::Sdpa;
     config.kv_append = KvAppend::InPlace;
@@ -464,6 +1656,23 @@ fn crown_config(config: &mut Config) {
     config.gemv_silu = true;
     config.gemv_residual = true;
     config.conv_fused = true;
+}
+
+/// The REWINDABLE configuration the speculative body needs (`lfm2-chat
+/// --cache rewindable`): `Cache::advance` rewinds only under a rotating ring
+/// wide enough for the verify window (the shuffle is destructive) and
+/// `Cache::resolve` only under `InPlace` (the `Cat` arm has no length to
+/// rewind); the taps feed the drafter's projection at F32 (§10.2m).
+fn rewindable_config(config: &mut Config, dcfg: &DSparkConfig) {
+    let k = dcfg.max_draft();
+    config.attn_impl = AttnImpl::Sdpa;
+    config.kv_append = KvAppend::InPlace;
+    config.conv_state = ConvState::RotatingRing { k: k + 1 };
+    config.gemv_silu = true;
+    config.gemv_residual = true;
+    config.conv_fused = true;
+    config.tap_dtype = DType::F32;
+    config.tap_layers = dcfg.tap_layers();
 }
 
 fn open_device() -> Result<Device> {
@@ -504,23 +1713,30 @@ pub fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(names.into_iter().map(|n| dir.join(n)).collect())
 }
 
+/// The newest snapshot of `repo` in the HF cache, if any.
+fn newest_snapshot(repo: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let base = PathBuf::from(home)
+        .join(".cache/huggingface/hub")
+        .join(repo)
+        .join("snapshots");
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(&base)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.join("config.json").exists())
+        .collect();
+    entries.sort();
+    entries.pop()
+}
+
 /// The LFM2.5-2.6B snapshot in the HF cache, if it is there
 /// (`LFM2_MODEL_DIR` first).
 pub fn default_model_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("LFM2_MODEL_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var("HOME").ok()?;
-    let snapshots =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--LiquidAI--LFM2.5-2.6B/snapshots");
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(&snapshots)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.join("config.json").is_file())
-        .collect();
-    entries.sort();
-    entries.pop()
+    newest_snapshot("models--LiquidAI--LFM2.5-2.6B")
 }
 
 /// `models--Org--Name/snapshots/<hash>` → `Org/Name`; a plain directory → its
@@ -539,6 +1755,10 @@ fn model_name_from_dir(dir: &Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("lloom")
         .to_string()
+}
+
+pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn ms(d: Duration) -> f64 {

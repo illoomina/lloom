@@ -465,6 +465,11 @@ pub fn call_shortconv_ring(
     state: BufferOffset,
     weights: BufferOffset,
     dst: &Buffer,
+    // `params.per_row == 1`: `u32` per batch row, the ring of the state pool
+    // row `b` writes and the phase it writes at. Unread at `per_row == 0`
+    // (bind any buffer).
+    row_slots: &Buffer,
+    row_phases: &Buffer,
 ) -> Result<(), MetalKernelError> {
     call_shortconv_ring_with(
         device,
@@ -478,6 +483,8 @@ pub fn call_shortconv_ring(
         state,
         weights,
         dst,
+        row_slots,
+        row_phases,
         ParamStyle::default(),
     )
 }
@@ -496,6 +503,8 @@ pub fn call_shortconv_ring_with(
     state: BufferOffset,
     weights: BufferOffset,
     dst: &Buffer,
+    row_slots: &Buffer,
+    row_phases: &Buffer,
     style: ParamStyle,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Conv, style.kernel_name(name))?;
@@ -522,6 +531,7 @@ pub fn call_shortconv_ring_with(
             params.proj_stride_b as usize,
             params.proj_stride_c as usize,
             params.proj_stride_l as usize,
+            params.per_row as usize,
             &b_in,
             &x_in,
             &c_in,
@@ -530,7 +540,9 @@ pub fn call_shortconv_ring_with(
             // pass's read of the same range against it (§9.2e).
             Output::from_buffer_offset(&state),
             &weights,
-            Output::new(dst)
+            Output::new(dst),
+            row_slots,
+            row_phases
         )
     );
     let _staged = finish_packed_params(device, encoder, style, SHORTCONV_RING_PARAMS_ALIGN)?;

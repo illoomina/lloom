@@ -545,3 +545,278 @@ fn chunked_admission_and_late_arrivals_produce_the_solo_chains() -> Result<()> {
     }
     Ok(())
 }
+
+// ---- the open decoder (`BatchDecoder`, issue #148) --------------------------
+
+use lloom::nn::{BatchDecoder, RowId};
+
+/// Step the decoder until nothing is live or pending, streaming into `streams`
+/// keyed by slot, and return the rows retired along the way.
+fn drain<'m, R: std::borrow::BorrowMut<Session<'m, Chain>>>(
+    dec: &mut BatchDecoder<'m, Chain, R>,
+    streams: &mut Vec<Vec<u32>>,
+) -> Result<Vec<(RowId, R, lloom::nn::DecodeOut)>> {
+    let mut finished = Vec::new();
+    while !dec.is_idle() {
+        dec.step(&mut |row, ids| {
+            streams[row.slot()].extend_from_slice(ids);
+            Ok(())
+        })?;
+        finished.extend(dec.take_finished());
+    }
+    Ok(finished)
+}
+
+/// A row admitted while others are mid-reply joins the batch at the next
+/// step and produces its solo chain; the rows already live are undisturbed;
+/// a retired row hands its session back with the closed driver's bookkeeping.
+#[test]
+fn a_row_admitted_mid_run_joins_the_batch_and_decodes_its_own_chain() -> Result<()> {
+    for device in devices() {
+        for lookahead in [0usize, 1] {
+            for chunk in [0usize, 2] {
+                let model = Chain::new(&device)?;
+                let opts = DecodeOptions {
+                    lookahead,
+                    prefill_chunk: chunk,
+                    ..DecodeOptions::new(12)
+                };
+                let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+                    BatchDecoder::new(opts, &[EOS], device.clone())?;
+                let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];
+                let a = dec.admit(Session::new(&model, 0usize), vec![0], Sampling::ArgMax, 0)?;
+                let b = dec.admit(
+                    Session::new(&model, 0usize),
+                    vec![3, 1],
+                    Sampling::ArgMax,
+                    0,
+                )?;
+                // Three steps with two rows live, then a third row arrives.
+                let mut finished = Vec::new();
+                for _ in 0..3 {
+                    dec.step(&mut |row, ids| {
+                        streams[row.slot()].extend_from_slice(ids);
+                        Ok(())
+                    })?;
+                    finished.extend(dec.take_finished());
+                }
+                let live_before = dec.live_rows();
+                let c = dec.admit(
+                    Session::new(&model, 0usize),
+                    vec![9, 9, 9, 5],
+                    Sampling::ArgMax,
+                    0,
+                )?;
+                assert_eq!(dec.rows(), 3, "three rows held");
+                assert_eq!(dec.pending_rows(), 1, "the new row is pending");
+                finished.extend(drain(&mut dec, &mut streams)?);
+                let tag = format!("{device:?} lookahead {lookahead} chunk {chunk}");
+                assert_eq!(finished.len(), 3, "{tag}: every row retires");
+                assert!(
+                    dec.is_idle() && dec.rows() == 0,
+                    "{tag}: nothing held after"
+                );
+                // Row b is the EOS row of the fixture (chain from 1 ends at its
+                // ninth token); it ran with two live rows at least.
+                assert!(live_before >= 1, "{tag}: rows were live at the arrival");
+                for (id, session, out) in &finished {
+                    let (start, prompt_len) = if *id == a {
+                        (0u32, 1usize)
+                    } else if *id == b {
+                        (1, 2)
+                    } else if *id == c {
+                        (5, 4)
+                    } else {
+                        panic!("{tag}: an unknown row retired");
+                    };
+                    let (want, want_eos) = chain(start, 12);
+                    assert_eq!(out.ids, want, "{tag}: row {} ids", id.slot());
+                    assert_eq!(out.eos, want_eos, "{tag}: row {} eos", id.slot());
+                    assert_eq!(streams[id.slot()], out.ids, "{tag}: streamed = ids");
+                    // The handed-back session carries the closed driver's
+                    // bookkeeping: prompt then the fed ids, overrun per arm.
+                    assert_eq!(&session.tokens()[..prompt_len].len(), &prompt_len);
+                    let fed = session.pos() - prompt_len;
+                    let want_overrun = if lookahead == 1 && want_eos { 1 } else { 0 };
+                    assert_eq!(out.stats.overrun, want_overrun, "{tag}: overrun");
+                    assert_eq!(session.overrun(), want_overrun);
+                    assert_eq!(&session.tokens()[prompt_len..], &want[..fed - want_overrun]);
+                }
+                // The late row joined a batch that was already decoding: its
+                // first step saw more than one live row (the cap row outlives it
+                // or at least shares its first steps).
+                let c_out = finished.iter().find(|(id, _, _)| *id == c).unwrap();
+                assert!(
+                    c_out.2.stats.batch_rows.first().copied().unwrap_or(0) >= 2,
+                    "{tag}: the late row's first step had {:?} live rows",
+                    c_out.2.stats.batch_rows
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A cancelled row retires with the stream it produced so far, its session's
+/// token log ending where the stream does; a row cancelled while its prompt
+/// is still pending retires without ever joining. The other rows finish
+/// their chains regardless.
+#[test]
+fn a_cancelled_row_retires_with_what_it_produced() -> Result<()> {
+    for device in devices() {
+        for lookahead in [0usize, 1] {
+            let model = Chain::new(&device)?;
+            let opts = DecodeOptions {
+                lookahead,
+                prefill_chunk: 1,
+                ..DecodeOptions::new(12)
+            };
+            let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+                BatchDecoder::new(opts, &[EOS], device.clone())?;
+            let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];
+            let keep = dec.admit(Session::new(&model, 0usize), vec![0], Sampling::ArgMax, 0)?;
+            let cut = dec.admit(Session::new(&model, 0usize), vec![0], Sampling::ArgMax, 0)?;
+            // A four-token prompt at a one-token chunk is pending for four steps.
+            let pending = dec.admit(
+                Session::new(&model, 0usize),
+                vec![9, 9, 9, 5],
+                Sampling::ArgMax,
+                0,
+            )?;
+            let mut finished = Vec::new();
+            for _ in 0..4 {
+                dec.step(&mut |row, ids| {
+                    streams[row.slot()].extend_from_slice(ids);
+                    Ok(())
+                })?;
+                finished.extend(dec.take_finished());
+            }
+            let produced_at_cancel = streams[cut.slot()].len();
+            assert!(
+                produced_at_cancel > 0,
+                "the cut row produced before the cancel"
+            );
+            assert!(dec.cancel(cut), "a held row is cancellable");
+            assert!(dec.cancel(pending), "a pending row is cancellable");
+            assert!(
+                !dec.cancel(cut) || dec.holds(cut),
+                "cancel is idempotent while held"
+            );
+            finished.extend(drain(&mut dec, &mut streams)?);
+            let tag = format!("{device:?} lookahead {lookahead}");
+            assert_eq!(finished.len(), 3, "{tag}: all three retire");
+            let (_, cut_session, cut_out) = finished.iter().find(|(id, _, _)| *id == cut).unwrap();
+            assert_eq!(
+                cut_out.ids.len(),
+                produced_at_cancel,
+                "{tag}: the cut row's stream"
+            );
+            assert!(!cut_out.eos);
+            // The token log is the prompt plus the stream's fed prefix; the
+            // lookahead arm's extra forward is the overrun, reconcilable.
+            assert_eq!(&cut_session.tokens()[..1], &[0]);
+            assert_eq!(
+                cut_session.tokens().len() + cut_session.overrun(),
+                cut_session.pos(),
+                "{tag}: log + overrun = position"
+            );
+            let (_, pending_session, pending_out) =
+                finished.iter().find(|(id, _, _)| *id == pending).unwrap();
+            assert!(
+                pending_out.ids.is_empty(),
+                "{tag}: a pending row produced nothing"
+            );
+            assert!(
+                pending_session.pos() <= 4
+                    && pending_session.tokens().len() == pending_session.pos(),
+                "{tag}: the pending row's log is the prompt it fed ({} of 4)",
+                pending_session.pos()
+            );
+            assert!(
+                !dec.holds(cut) && !dec.holds(pending),
+                "{tag}: stale ids are not held"
+            );
+            let (_, _, keep_out) = finished.iter().find(|(id, _, _)| *id == keep).unwrap();
+            assert_eq!(keep_out.ids, chain(0, 12).0, "{tag}: the kept row's chain");
+        }
+    }
+    Ok(())
+}
+
+/// The host arm: a row with a temperature sampler draws from its own seeded
+/// stream, so its ids are the same whether it decodes alone or beside other
+/// rows; the argmax rows beside it still produce their chains (sampled on
+/// the host on that step, which is the same argmax); and a mixed batch is
+/// fed the host ids, so no row overruns whatever the lookahead option says.
+#[test]
+fn a_temperature_row_draws_from_its_own_seed_beside_any_neighbours() -> Result<()> {
+    for device in devices() {
+        let model = Chain::new(&device)?;
+        let sampled = |neighbours: usize, seed: u64, lookahead: usize| -> Result<Vec<u32>> {
+            let opts = DecodeOptions {
+                lookahead,
+                ..DecodeOptions::new(10)
+            };
+            let mut dec: BatchDecoder<'_, Chain, Session<'_, Chain>> =
+                BatchDecoder::new(opts, &[EOS], device.clone())?;
+            let mut streams: Vec<Vec<u32>> = vec![Vec::new(); 8];
+            let t = dec.admit(
+                Session::new(&model, 0usize),
+                vec![3, 1],
+                Sampling::All { temperature: 1.0 },
+                seed,
+            )?;
+            let mut argmax_rows = Vec::new();
+            for k in 0..neighbours {
+                argmax_rows.push(dec.admit(
+                    Session::new(&model, 0usize),
+                    vec![k as u32],
+                    Sampling::ArgMax,
+                    0,
+                )?);
+            }
+            let finished = drain(&mut dec, &mut streams)?;
+            for (id, session, out) in &finished {
+                if let Some(k) = argmax_rows.iter().position(|r| r == id) {
+                    let (want, _) = chain(k as u32, 10);
+                    assert_eq!(out.ids, want, "argmax row {k} beside a temperature row");
+                }
+                // The host arm feeds the sampled ids, so nothing runs past its end.
+                assert_eq!(
+                    out.stats.overrun,
+                    0,
+                    "row {}: no overrun on the host arm",
+                    id.slot()
+                );
+                assert_eq!(session.overrun(), 0);
+            }
+            Ok(streams[t.slot()].clone())
+        };
+        let alone = sampled(0, 7, 1)?;
+        let with_two = sampled(2, 7, 1)?;
+        let with_three_blocking = sampled(3, 7, 0)?;
+        assert!(!alone.is_empty());
+        assert_eq!(
+            alone, with_two,
+            "{device:?}: the draw depends on the neighbours"
+        );
+        assert_eq!(
+            alone, with_three_blocking,
+            "{device:?}: the draw depends on the arm"
+        );
+        // Non-vacuity: the seed is what the draw depends on.
+        let other_seed = sampled(0, 8, 1)?;
+        assert_ne!(
+            alone, other_seed,
+            "{device:?}: two seeds drew the same stream"
+        );
+        // And a temperature draw is not the argmax chain (the fixture's
+        // one-hot logits put ~4 % on the peak at t = 1).
+        assert_ne!(
+            alone,
+            chain(1, 10).0,
+            "{device:?}: the temperature row argmaxed"
+        );
+    }
+    Ok(())
+}

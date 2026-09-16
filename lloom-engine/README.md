@@ -90,10 +90,72 @@ runner exports), else a built-in paragraph.
 Flags: `--kv-capacity` (positions per request, default 8704 = the ladder's
 8192 + 256 + slack; a request past it is refused, not reallocated),
 `--readback auto|ring|blocking`, `--reuse-prefix` (off: a benchmark measures a
-cold prefill), `--no-warmup`, `--cpu`, `--model-name`.
+cold prefill), `--no-warmup`, `--cpu`, `--model-name`, the two below, and the
+memory guards:
 
-One request at a time. Concurrent requests queue on the engine; B>1 is #694's
-batched forward and not this binary's.
+- `--prefill-tile` (default **512**, every path): the most prompt tokens one
+  prefill forward takes. A prefill's activation working set is bounded by the
+  tile — two tiles' worth, ~4.5 GB at 512 — rather than by the prompt; one
+  forward over the whole prompt is ~3.9 MB of `pending` activation per token
+  (37.8 GB at 8192 measured, and a 32k one-shot cell is what panicked this
+  machine, #148). Every multi-tile prefill is paced against the GPU on every
+  readback arm. `0` is the one-shot, admitted only if the budget below allows
+  the KV ceiling's worth of activations.
+- `--memory-fraction` (default 0.65; `0` = off): `MemoryBudget` admission —
+  the weights, the KV ceiling's cache, the tile's activations and the scratch
+  are predicted at load against `recommendedMaxWorkingSetSize` and refused with
+  the reductions listed if they do not fit; a KV grow past the fraction is
+  refused at the grow.
+- `--mem-sample`: hold the memory gauges' peaks over every benchmark cell at
+  10 ms and put them on the response (`mem`: `device_allocated`, the pool's
+  live / free / `pending`, `phys_footprint`, `recommendedMaxWorkingSetSize`,
+  before / peak / after). A gauge run, not a timing run. `GET /health` reads the
+  gauges once at any time.
+
+### `--batch N` — continuous batching (issue #148)
+
+`--batch 1` (the default) is the shape above: one sequence, one request at a
+time, the crown loop on the request's thread. `--batch N` starts the
+continuous-batching scheduler (`lloom_engine::batch`) on its own thread over a
+pool of `N` sequences: requests from any number of clients join the running
+batch at the next step and leave it at their EOS — every live row's next token
+and every arriving prompt's next chunk ride ONE `m = B` weight sweep per step
+(`BatchedCausalLM::forward_ragged`, the CHUNK of #728) — so `N` concurrent
+`/v1/completions` decode at the batched aggregate rather than queueing. A row's
+token stream is the batched driver's (a device argmax over `[B, vocab]` and a
+staged readback per step, `readback: "batched rows=k"`); a row with a
+temperature is sampled on the host by its own seeded sampler, so its draw does
+not depend on its neighbours. Prefix reuse across requests is `SlotPool`'s
+routing (`--reuse-prefix`).
+
+The benchmark cells take a `batch` field (`1` by default, at most `N`):
+
+| endpoint | `batch` > 1 runs |
+|---|---|
+| `/prefill_throughput {prompt_tokens, batch}` | `batch` prompts of `prompt_tokens` each as ONE ragged forward (tile-bounded pieces); `prompt_tps` is the aggregate over `batch × prompt_tokens` |
+| `/decode_throughput {prompt_tokens, decode_tokens, batch}` | every row's context built outside the bracket, then `decode_tokens` batched steps timed together; `generation_tps` is the aggregate, `per_row_tps` its share; `bracket` says what the window holds |
+| `/end_to_end_latency {prompt, decode_tokens, batch}` | the same request `batch` times at once through the request path; `total_ms` closes when the last lands, `per_row_ms` carries each |
+| `/max_memory_usage {prompt_tokens, decode_tokens, batch}` | `batch` concurrent requests resident at once |
+| `/eval` | the samples `N` at a time, `N` workers pulling from the list; events interleave on the stream keyed by `sample_id` |
+
+These closed cells run on the scheduler thread with nothing else live (the
+engine to themselves, as at `--batch 1`). `--prefill-tile` and
+`--prefill-chunk` (both 512 at `N > 1`, 0 = unbounded / whole) are the batched
+steps' prefill bounds (#728).
+
+### `--dspark` — the speculative body
+
+Loads the LFM2.5-2.6B-DSpark drafter (`--draft-dir`, or the newest snapshot in
+the HF cache) and serves every request through `Session::decode_speculative`
+(`design/docs/speculation.md` §10.2t): a block of `K = 9` proposals per round,
+verified by the target in one pass, `readback: "dspark k=9"`. Greedy by
+construction — a `temperature` is refused, not served as argmax. With
+`--batch N` the scheduler runs the rows in STATIC batches through the pipelined
+driver (`decode_speculative_pipelined`, §10.2y): the waiting requests up to
+`N` at once, to completion, then the next — a row cannot join mid-batch there.
+The `/decode_throughput` bracket under `--dspark` is the run's wall minus the
+prompt's submit (the speculative body holds no resumable logits to split the
+context from the decode); the response's `bracket` field says so.
 
 Two things a request never pays for (#702): the token ring — 32 MiB of
 consumer slack, ~35 ms to build — is built **once per EOS set at load**

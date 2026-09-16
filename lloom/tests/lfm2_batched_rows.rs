@@ -460,3 +460,487 @@ fn each_row_of_a_ragged_pass_is_bit_identical_to_its_forward_under_the_gemm() ->
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The shared pool's arms (`batched-decode-design.md` §12.2): every row a slot
+// of one `BatchPool`, the attention and the conv of the whole batch in one
+// dispatch per kernel — against the per-row loop over the SAME pool, which
+// is the same arithmetic (each row's own table, own live count, own ring at
+// its own phase) and must therefore agree to the bit; and the pool's per-row
+// path against the private paged cache it is built from.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metal")]
+mod pool_arms {
+    use super::*;
+    use lloom::models::lfm2::{AttnImpl, BatchPool};
+
+    /// The pool's arms: `Paged × FlashDecoding × RotatingRing`, the fused
+    /// ring, a 4-token page so the prompts span pages.
+    fn pool_config() -> Config {
+        let mut cfg = tiny_config_on(ConvState::RotatingRing { k: 2 });
+        // The flash kernels instantiate head dims 32/64/96/128: two heads of 32.
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.kv_append = KvAppend::Paged;
+        cfg.attn_impl = AttnImpl::FlashDecoding;
+        // The steel paged read needs a page of whole 32-key blocks; the
+        // prompts below span two pages, so both flash paths (one chunk, two
+        // chunks) and a page boundary are exercised.
+        cfg.flash_page_size = 32;
+        cfg.flash_pages_per_chunk = 1;
+        cfg.conv_fused = true;
+        cfg
+    }
+
+    /// Three rows: two short, one past a page boundary (36 tokens at page 32).
+    fn pool_rows() -> Vec<(Vec<u32>, u32)> {
+        let long: Vec<u32> = (0..36u32).map(|i| (i * 7 + 3) % 48).collect();
+        vec![(vec![3, 11, 20, 5, 9], 12), (vec![40, 2], 33), (long, 21)]
+    }
+
+    /// A 40-token prompt for the piece row: 6 prefilled, 34 fed as the piece.
+    fn piece_prompt() -> Vec<u32> {
+        (0..40u32).map(|i| (i * 11 + 5) % 48).collect()
+    }
+
+    fn logits_rows(t: &Tensor) -> Result<Vec<Vec<f32>>> {
+        (0..t.dim(0)?)
+            .map(|r| t.i(r)?.to_vec1::<f32>())
+            .collect()
+    }
+
+    fn assert_bit_equal(what: &str, a: &[Vec<f32>], b: &[Vec<f32>]) {
+        assert_eq!(a.len(), b.len(), "{what}: row count");
+        for (r, (x, y)) in a.iter().zip(b).enumerate() {
+            let bits_a: Vec<u32> = x.iter().map(|v| v.to_bits()).collect();
+            let bits_b: Vec<u32> = y.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(
+                bits_a, bits_b,
+                "{what}: row {r} differs (max |d| = {})",
+                max_abs_diff(x, y)
+            );
+        }
+    }
+
+    /// Two decode steps over three rows on a pool, with the batched arms on
+    /// or off: the logits of both steps.
+    fn pool_steps(cfg: &Config, dtype: DType, dev: &Device, batched: bool) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, u64)> {
+        let model = build(cfg, dtype, dev)?;
+        let rows = pool_rows();
+        let pool = BatchPool::new(cfg, dev, 4, 64)?;
+        pool.set_batched_arms(batched);
+        let mut caches = Vec::with_capacity(rows.len());
+        for (prompt, _) in &rows {
+            let mut cache = Cache::for_batch(true, dtype, cfg, dev, &pool)?;
+            let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
+            let _ = model.forward(&input, 0, &mut cache)?;
+            caches.push(cache);
+        }
+        let nexts: Vec<u32> = rows.iter().map(|(_, n)| *n).collect();
+        let input = Tensor::new(nexts.as_slice(), dev)?.reshape((rows.len(), 1))?;
+        let mut row_refs: Vec<Row<'_, Cache>> = caches
+            .iter_mut()
+            .zip(rows.iter())
+            .map(|(cache, (prompt, _))| Row {
+                pos: prompt.len(),
+                cache,
+            })
+            .collect();
+        let step1 = model.forward_rows(&input, &mut row_refs)?;
+        drop(row_refs);
+        // A second step at the next position, feeding fixed tokens.
+        let nexts2: Vec<u32> = nexts.iter().map(|n| (n + 5) % cfg.vocab_size as u32).collect();
+        let input2 = Tensor::new(nexts2.as_slice(), dev)?.reshape((rows.len(), 1))?;
+        let mut row_refs: Vec<Row<'_, Cache>> = caches
+            .iter_mut()
+            .zip(rows.iter())
+            .map(|(cache, (prompt, _))| Row {
+                pos: prompt.len() + 1,
+                cache,
+            })
+            .collect();
+        let step2 = model.forward_rows(&input2, &mut row_refs)?;
+        Ok((logits_rows(&step1)?, logits_rows(&step2)?, pool.shared_calls()))
+    }
+
+    #[test]
+    fn the_batched_arms_reproduce_the_per_row_loop_over_the_same_pool_bit_for_bit() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        for dtype in [DType::F32, DType::F16] {
+            let (b1, b2, calls_on) = pool_steps(&cfg, dtype, &dev, true)?;
+            let (p1, p2, calls_off) = pool_steps(&cfg, dtype, &dev, false)?;
+            assert!(calls_on > 0, "the batched arms ran ({calls_on} layer calls)");
+            assert_eq!(calls_off, 0, "the per-row arm took no batched call");
+            assert_bit_equal(&format!("step 1 {dtype:?}"), &b1, &p1);
+            assert_bit_equal(&format!("step 2 {dtype:?}"), &b2, &p2);
+            assert_rows_differ(&b1);
+            assert_rows_differ(&b2);
+        }
+        Ok(())
+    }
+
+    /// The pool's per-row path against a private paged cache on the same
+    /// config: the same kernels over a table of one sequence.
+    #[test]
+    fn a_pool_row_alone_is_the_private_paged_cache() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        let dtype = DType::F32;
+        let model = build(&cfg, dtype, &dev)?;
+        let pool = BatchPool::new(&cfg, &dev, 2, 64)?;
+        for (prompt, next) in pool_rows() {
+            let mut private = Cache::new(true, dtype, &cfg, &dev)?;
+            let mut pooled = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
+            let _ = model.forward(&input, 0, &mut private)?;
+            let _ = model.forward(&input, 0, &mut pooled)?;
+            let input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
+            let a = model.forward(&input, prompt.len(), &mut private)?;
+            let b = model.forward(&input, prompt.len(), &mut pooled)?;
+            assert_bit_equal("pool row vs private cache", &logits_rows(&a)?, &logits_rows(&b)?);
+            assert_eq!(pooled.kv_len(), prompt.len() + 1);
+        }
+        Ok(())
+    }
+
+    /// The ragged pass on the pool — two decode rows beside a prompt piece —
+    /// with the batched arms on against off.
+    fn pool_ragged(cfg: &Config, dtype: DType, dev: &Device, batched: bool) -> Result<(Vec<Vec<f32>>, u64)> {
+        let model = build(cfg, dtype, dev)?;
+        let decode_rows = pool_rows();
+        let piece_prompt = piece_prompt();
+        let split = 6;
+        let pool = BatchPool::new(cfg, dev, 4, 64)?;
+        pool.set_batched_arms(batched);
+        let mut caches = Vec::new();
+        for (prompt, _) in &decode_rows[..2] {
+            let mut cache = Cache::for_batch(true, dtype, cfg, dev, &pool)?;
+            let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
+            let _ = model.forward(&input, 0, &mut cache)?;
+            caches.push(cache);
+        }
+        {
+            let mut cache = Cache::for_batch(true, dtype, cfg, dev, &pool)?;
+            let input = Tensor::new(&piece_prompt[..split], dev)?.unsqueeze(0)?;
+            let _ = model.forward(&input, 0, &mut cache)?;
+            caches.push(cache);
+        }
+        let mut tokens: Vec<u32> = decode_rows[..2].iter().map(|(_, n)| *n).collect();
+        tokens.extend_from_slice(&piece_prompt[split..]);
+        let input = Tensor::new(tokens.as_slice(), dev)?.unsqueeze(0)?;
+        let lens = [1usize, 1, piece_prompt.len() - split];
+        let poss = [decode_rows[0].0.len(), decode_rows[1].0.len(), split];
+        let mut row_refs: Vec<RaggedRow<'_, Cache>> = caches
+            .iter_mut()
+            .zip(lens.iter().zip(poss.iter()))
+            .map(|(cache, (&len, &pos))| RaggedRow { pos, len, cache })
+            .collect();
+        let logits = model.forward_ragged(&input, &mut row_refs)?;
+        drop(row_refs);
+        // And a plain step after it, every row now a decode row.
+        let nexts: Vec<u32> = vec![12, 33, 21];
+        let input = Tensor::new(nexts.as_slice(), dev)?.reshape((3, 1))?;
+        let poss2 = [poss[0] + 1, poss[1] + 1, piece_prompt.len()];
+        let mut row_refs: Vec<Row<'_, Cache>> = caches
+            .iter_mut()
+            .zip(poss2.iter())
+            .map(|(cache, &pos)| Row { pos, cache })
+            .collect();
+        let step = model.forward_rows(&input, &mut row_refs)?;
+        let mut out = logits_rows(&logits)?;
+        out.extend(logits_rows(&step)?);
+        Ok((out, pool.shared_calls()))
+    }
+
+    #[test]
+    fn the_ragged_batched_arms_reproduce_the_per_row_loop_bit_for_bit() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        for dtype in [DType::F32, DType::F16] {
+            let (on, calls_on) = pool_ragged(&cfg, dtype, &dev, true)?;
+            let (off, calls_off) = pool_ragged(&cfg, dtype, &dev, false)?;
+            assert!(calls_on > 0);
+            assert_eq!(calls_off, 0);
+            assert_bit_equal(&format!("ragged + step {dtype:?}"), &on, &off);
+            assert_rows_differ(&on[..3]);
+        }
+        Ok(())
+    }
+
+    /// A slot returns to the pool when its cache drops, and a cleared row
+    /// starts over on a zeroed ring.
+    #[test]
+    fn slots_are_leased_and_returned() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        let pool = BatchPool::new(&cfg, &dev, 2, 64)?;
+        let a = Cache::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
+        let b = Cache::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
+        assert!(Cache::for_batch(true, DType::F32, &cfg, &dev, &pool).is_err());
+        assert_eq!(pool.report().slots_free, 0);
+        drop(a);
+        assert_eq!(pool.report().slots_free, 1);
+        let c = Cache::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
+        assert_ne!(c.batch_slot(), b.batch_slot());
+        Ok(())
+    }
+}
+
+#[cfg(feature = "metal")]
+mod prefix_share {
+    use super::*;
+    use lloom::models::lfm2::{AttnImpl, BatchPool};
+
+    fn share_config() -> Config {
+        let mut cfg = tiny_config_on(ConvState::RotatingRing { k: 2 });
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.kv_append = KvAppend::Paged;
+        cfg.attn_impl = AttnImpl::FlashDecoding;
+        cfg.flash_page_size = 32;
+        cfg.flash_pages_per_chunk = 1;
+        cfg.conv_fused = true;
+        // A prefill in pieces reads the ring the previous piece left — the
+        // writer a shared prefix's remainder needs (§10.10, §12.3).
+        cfg.conv_prefill_ctx = true;
+        cfg
+    }
+
+    /// Prefill `prompt` in pieces of `piece` tokens through `forward`, so
+    /// every piece boundary is a pass boundary (and a page boundary when
+    /// `piece` is the page): the state a sharer starts from is snapshotted
+    /// there. Returns the last piece's logits.
+    fn prefill_pieces(model: &Model, cache: &mut Cache, prompt: &[u32], piece: usize, dev: &Device) -> Result<Tensor> {
+        let mut pos = 0;
+        let mut last = None;
+        while pos < prompt.len() {
+            let n = piece.min(prompt.len() - pos);
+            let input = Tensor::new(&prompt[pos..pos + n], dev)?.unsqueeze(0)?;
+            last = Some(model.forward(&input, pos, cache)?);
+            pos += n;
+        }
+        Ok(last.expect("a non-empty prompt"))
+    }
+
+    /// A row that SHARES two pages of another's prompt and prefills the six
+    /// tokens after them computes what a fresh row prefilling all 70 does —
+    /// the remainder's logits and a decode step after it, bit for bit — and
+    /// the pool holds the shared pages once.
+    #[test]
+    fn a_shared_prefix_reproduces_the_fresh_prefill_bit_for_bit() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = share_config();
+        for dtype in [DType::F32, DType::F16] {
+            let model = build(&cfg, dtype, &dev)?;
+            let pool = BatchPool::new(&cfg, &dev, 4, 128)?;
+            let prompt: Vec<u32> = (0..70u32).map(|i| (i * 13 + 7) % 48).collect();
+            let question: Vec<u32> = prompt[64..].to_vec();
+            let next = 21u32;
+
+            // The source: the whole prompt, in page-sized pieces (its passes
+            // begin at 32 and 64: two snapshots).
+            let mut src = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let _ = prefill_pieces(&model, &mut src, &prompt, 32, &dev)?;
+            assert_eq!(src.kv_len(), 70);
+            assert!(pool.snapshots() >= 2, "snapshots at the two page boundaries");
+
+            // The reference: a fresh row, the same pieces.
+            let mut fresh = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let want_tail = prefill_pieces(&model, &mut fresh, &prompt, 32, &dev)?;
+            let pages_before = pool.report().pages_in_use;
+
+            // The sharer: two pages from the source, then the remainder.
+            let mut shared = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let n = shared.share_prefix_from(&src, 64)?;
+            assert_eq!(n, 64, "two whole pages shared");
+            assert_eq!(shared.kv_len(), 64);
+            let input = Tensor::new(question.as_slice(), &dev)?.unsqueeze(0)?;
+            let got_tail = model.forward(&input, 64, &mut shared)?;
+            assert_eq!(shared.kv_len(), 70);
+            // The shared pages are held once: the sharer added only its tail page.
+            assert_eq!(pool.report().pages_in_use, pages_before + 1);
+
+            let bits = |t: &Tensor| -> Result<Vec<u32>> {
+                Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?.iter().map(|v| v.to_bits()).collect())
+            };
+            assert_eq!(bits(&got_tail)?, bits(&want_tail)?, "the remainder's logits ({dtype:?})");
+
+            // A decode step on both.
+            let input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
+            let a = model.forward(&input, 70, &mut fresh)?;
+            let b = model.forward(&input, 70, &mut shared)?;
+            assert_eq!(bits(&a)?, bits(&b)?, "the step after ({dtype:?})");
+            // Non-vacuity: the logits depend on the prefix — a row that
+            // prefilled only the remainder differs.
+            let mut bare = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let q = Tensor::new(question.as_slice(), &dev)?.unsqueeze(0)?;
+            let c = model.forward(&q, 0, &mut bare)?;
+            assert_ne!(bits(&c)?, bits(&want_tail)?, "the prefix matters");
+        }
+        Ok(())
+    }
+
+    /// The share refuses what it cannot do: a non-empty sharer, a source in
+    /// another pool, a prefix shorter than a page (0 shared).
+    #[test]
+    fn share_refusals_and_the_page_floor() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = share_config();
+        let dtype = DType::F32;
+        let model = build(&cfg, dtype, &dev)?;
+        let pool = BatchPool::new(&cfg, &dev, 3, 128)?;
+        let other = BatchPool::new(&cfg, &dev, 1, 128)?;
+        let prompt: Vec<u32> = (0..40u32).map(|i| (i * 5 + 1) % 48).collect();
+        let mut src = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        let _ = prefill_pieces(&model, &mut src, &prompt, 32, &dev)?;
+        let mut a = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+        assert_eq!(a.share_prefix_from(&src, 20)?, 0, "below a page: nothing");
+        assert_eq!(a.share_prefix_from(&src, 40)?, 32, "one page of the 40");
+        assert!(a.share_prefix_from(&src, 32).is_err(), "a non-empty sharer is refused");
+        let mut foreign = Cache::for_batch(true, dtype, &cfg, &dev, &other)?;
+        assert!(foreign.share_prefix_from(&src, 32).is_err(), "another pool is refused");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "metal")]
+mod ragged_verify {
+    use super::*;
+    use lloom::models::lfm2::{AttnImpl, BatchPool, VerifyRow};
+
+    /// The pool's arms with a speculative ring (K = 2 drafts + the anchor)
+    /// and two tapped layers, as a DSpark target has.
+    fn verify_config() -> Config {
+        let mut cfg = tiny_config_on(ConvState::RotatingRing { k: 3 });
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.kv_append = KvAppend::Paged;
+        cfg.attn_impl = AttnImpl::FlashDecoding;
+        cfg.flash_page_size = 32;
+        cfg.flash_pages_per_chunk = 1;
+        cfg.conv_fused = true;
+        cfg.conv_prefill_ctx = true;
+        cfg.tap_layers = vec![1, 3];
+        cfg.tap_dtype = DType::F32;
+        cfg
+    }
+
+    fn bits(t: &Tensor) -> Result<Vec<u32>> {
+        Ok(t.to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect())
+    }
+
+    /// Three rows' windows verified as one ragged pass (the batched arms on)
+    /// against each row's own `verify_tokens_enqueue`/`complete` on a pool
+    /// with the arms off: the accepted tokens, the probes (per row, trimmed)
+    /// and a decode step after the resolve — bit for bit.
+    #[test]
+    fn a_ragged_verify_is_each_rows_own_verify_bit_for_bit() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = verify_config();
+        let eos = [7u32];
+        for dtype in [DType::F32, DType::F16] {
+            let model = build(&cfg, dtype, &dev)?;
+            let rows = pool_rows_for_verify();
+            // Two pools, one per arm, the same three rows prefilled the same way.
+            let mut arms = Vec::new();
+            for batched in [false, true] {
+                let pool = BatchPool::new(&cfg, &dev, 4, 128)?;
+                pool.set_batched_arms(batched);
+                let mut caches = Vec::new();
+                for (prompt, _) in &rows {
+                    let mut c = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+                    let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
+                    let _ = model.forward(&input, 0, &mut c)?;
+                    let _ = c.take_taps();
+                    caches.push(c);
+                }
+                arms.push((pool, caches));
+            }
+            // The drafts: two tokens per row; row 0's first draft is the
+            // target's own prediction (found by a throwaway one-row verify),
+            // so it accepts past position 0; the others are arbitrary.
+            let lasts: Vec<u32> = rows.iter().map(|(_, n)| *n).collect();
+            let predicted = {
+                let pool = BatchPool::new(&cfg, &dev, 1, 128)?;
+                let mut c = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+                let input = Tensor::new(rows[0].0.as_slice(), &dev)?.unsqueeze(0)?;
+                let _ = model.forward(&input, 0, &mut c)?;
+                let _ = c.take_taps();
+                let proposed = Tensor::new(&[0u32, 0], &dev)?;
+                let pending = model.verify_tokens_enqueue(lasts[0], &proposed, rows[0].0.len(), &mut c)?;
+                let (accepted, _) = model.verify_tokens_complete(pending, &mut c, &eos)?;
+                accepted[0]
+            };
+            let drafts: Vec<Vec<u32>> = vec![vec![predicted, 33], vec![3, 3], vec![21, 40]];
+
+            // Reference: per row, the one-row verify (arms off).
+            let (_, ref_caches) = &mut arms[0];
+            let mut want = Vec::new();
+            for (r, c) in ref_caches.iter_mut().enumerate() {
+                let proposed = Tensor::new(drafts[r].as_slice(), &dev)?;
+                let pending = model.verify_tokens_enqueue(lasts[r], &proposed, rows[r].0.len(), c)?;
+                let (accepted, probe) = model.verify_tokens_complete(pending, c, &eos)?;
+                want.push((accepted, probe));
+            }
+            // Subject: the ragged verify (arms on).
+            let (pool_on, sub_caches) = &mut arms[1];
+            let proposed: Vec<Tensor> = drafts
+                .iter()
+                .map(|d| Tensor::new(d.as_slice(), &dev))
+                .collect::<Result<_>>()?;
+            let mut vrows: Vec<VerifyRow<'_>> = sub_caches
+                .iter_mut()
+                .enumerate()
+                .map(|(r, c)| VerifyRow {
+                    cache: c,
+                    last: lasts[r],
+                    pos: rows[r].0.len(),
+                    proposed: &proposed[r],
+                })
+                .collect();
+            let pending = model.verify_rows_enqueue(&mut vrows)?;
+            drop(vrows);
+            let mut refs: Vec<&mut Cache> = sub_caches.iter_mut().collect();
+            let eos_sets: Vec<&[u32]> = vec![&eos[..]; refs.len()];
+            let got = model.verify_rows_complete(pending, &mut refs, &eos_sets)?;
+            drop(refs);
+            assert!(pool_on.shared_calls() > 0, "the batched arms ran the verify");
+
+            for r in 0..rows.len() {
+                assert_eq!(got[r].0, want[r].0, "row {r} accepted ({dtype:?})");
+                assert!(!got[r].0.is_empty());
+                assert_eq!(got[r].1.len(), want[r].1.len(), "row {r} probe count");
+                for (a, b) in got[r].1.iter().zip(want[r].1.iter()) {
+                    assert_eq!(a.dims(), b.dims(), "row {r} probe shape");
+                    assert_eq!(bits(a)?, bits(b)?, "row {r} probe bits ({dtype:?})");
+                }
+            }
+            // At least one row accepted past position 0 and one did not.
+            let ns: Vec<usize> = got.iter().map(|(a, _)| a.len()).collect();
+            assert!(ns.iter().any(|&n| n > 1) && ns.iter().any(|&n| n == 1), "accepted {ns:?}");
+
+            // A decode step after the resolve, per row, both arms per-row.
+            for r in 0..rows.len() {
+                let next = *got[r].0.last().unwrap();
+                let pos = rows[r].0.len() + got[r].0.len();
+                let input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
+                let a = model.forward(&input, pos, &mut arms[0].1[r])?;
+                let b = model.forward(&input, pos, &mut arms[1].1[r])?;
+                assert_eq!(bits(&a)?, bits(&b)?, "row {r} step after ({dtype:?})");
+            }
+        }
+        Ok(())
+    }
+
+    fn pool_rows_for_verify() -> Vec<(Vec<u32>, u32)> {
+        let long: Vec<u32> = (0..36u32).map(|i| (i * 7 + 3) % 48).collect();
+        vec![(vec![3, 11, 20, 5, 9], 12), (vec![40, 2], 33), (long, 21)]
+    }
+}

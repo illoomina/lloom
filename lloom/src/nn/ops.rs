@@ -777,9 +777,42 @@ pub fn shortconv_ring(
     weights: &Tensor,
     phase_last: usize,
 ) -> Result<Tensor> {
+    shortconv_ring_impl(b, x, c, state, weights, phase_last, None)
+}
+
+/// [`shortconv_ring`] over a SLOT-INDEXED batch: `state` is a pool of rings
+/// `[slots, hidden, width]`, batch row `b` of `b`/`x`/`c` writes ring
+/// `row_slots[b]` at phase `row_phases[b]` (`batched-decode-design.md`
+/// §12.2) — one dispatch for rows at different rings and phases, bit-identical
+/// per row to [`shortconv_ring`] on that ring's `narrow(0, slot, 1)` view at
+/// that phase. `row_slots`/`row_phases` are `u32` tensors of the batch size on
+/// the same device; the rows' slots must be distinct (each thread owns its
+/// ring row).
+pub fn shortconv_ring_rows(
+    b: &Tensor,
+    x: &Tensor,
+    c: &Tensor,
+    state: &Tensor,
+    weights: &Tensor,
+    row_slots: &Tensor,
+    row_phases: &Tensor,
+) -> Result<Tensor> {
+    shortconv_ring_impl(b, x, c, state, weights, 0, Some((row_slots, row_phases)))
+}
+
+#[allow(unused_variables)]
+fn shortconv_ring_impl(
+    b: &Tensor,
+    x: &Tensor,
+    c: &Tensor,
+    state: &Tensor,
+    weights: &Tensor,
+    phase_last: usize,
+    rows: Option<(&Tensor, &Tensor)>,
+) -> Result<Tensor> {
     #[cfg(not(feature = "metal"))]
     {
-        let _ = (b, x, c, state, weights, phase_last);
+        let _ = (b, x, c, state, weights, phase_last, rows);
         lloom_tensor::bail!("shortconv_ring is metal-only; use the unfused conv arm off Metal")
     }
     #[cfg(feature = "metal")]
@@ -787,12 +820,32 @@ pub fn shortconv_ring(
         use lloom_tensor::backend::BackendStorage;
         use lloom_tensor::metal_backend::buffer_o;
 
-        let (b_sz, hidden, width) = state.dims3().map_err(|e| {
+        let (slots, hidden, width) = state.dims3().map_err(|e| {
             lloom_tensor::Error::msg(format!(
                 "shortconv_ring: state must be [b, hidden, width]: {e}"
             ))
         })?;
-        let (_, _, seq_len) = b.dims3()?;
+        let (b_sz, _, seq_len) = b.dims3()?;
+        if rows.is_none() && b_sz != slots {
+            lloom_tensor::bail!(
+                "shortconv_ring: {b_sz} batch rows against a state of {slots} rings"
+            );
+        }
+        if let Some((rs, rp)) = rows {
+            if rs.dtype() != DType::U32 || rp.dtype() != DType::U32 {
+                lloom_tensor::bail!("shortconv_ring_rows: row_slots and row_phases must be u32");
+            }
+            if rs.dims() != [b_sz] || rp.dims() != [b_sz] {
+                lloom_tensor::bail!(
+                    "shortconv_ring_rows: row_slots {:?} / row_phases {:?} for {b_sz} rows",
+                    rs.dims(),
+                    rp.dims()
+                );
+            }
+            if !rs.is_contiguous() || !rp.is_contiguous() {
+                lloom_tensor::bail!("shortconv_ring_rows: row_slots and row_phases must be contiguous");
+            }
+        }
         if seq_len == 0 || seq_len > width {
             lloom_tensor::bail!(
                 "shortconv_ring: {seq_len} positions into a {width}-wide ring; a pass writes \
@@ -849,6 +902,31 @@ pub fn shortconv_ring(
             proj_stride_b: stride[0] as u64,
             proj_stride_c: stride[1] as u64,
             proj_stride_l: stride[2] as u64,
+            per_row: rows.is_some() as u64,
+        };
+        // The per-row index buffers, or — unread at `per_row == 0` — the
+        // weights' buffer bound in their place, so no buffer is allocated
+        // for a binding the kernel never dereferences.
+        let (rs_guard, rp_guard) = match rows {
+            Some((rs, rp)) => {
+                let (a, al) = rs.storage_and_layout();
+                let (b2, bl) = rp.storage_and_layout();
+                if al.start_offset() != 0 || bl.start_offset() != 0 {
+                    lloom_tensor::bail!("shortconv_ring_rows: row buffers must start at offset 0");
+                }
+                (Some(a), Some(b2))
+            }
+            None => (None, None),
+        };
+        let rs_buf = match rs_guard.as_deref() {
+            Some(lloom_tensor::Storage::Metal(m)) => m.buffer(),
+            Some(_) => lloom_tensor::bail!("shortconv_ring_rows: row_slots must be on metal"),
+            None => w_s.buffer(),
+        };
+        let rp_buf = match rp_guard.as_deref() {
+            Some(lloom_tensor::Storage::Metal(m)) => m.buffer(),
+            Some(_) => lloom_tensor::bail!("shortconv_ring_rows: row_phases must be on metal"),
+            None => w_s.buffer(),
         };
 
         let device = st_s.device();
@@ -880,6 +958,8 @@ pub fn shortconv_ring(
             buffer_o(st_s.buffer(), st_l, dtype),
             buffer_o(w_s.buffer(), w_l, dtype),
             &dst,
+            rs_buf,
+            rp_buf,
         )
         .map_err(lloom_tensor::Error::wrap)?;
 
@@ -2786,13 +2866,31 @@ impl FlashScratchSizing {
 ///
 /// `entries` holds every sequence's chunk table, `stride` entries each — entry
 /// `b * stride + c` is the first page of sequence `b`'s chunk `c` — and
-/// `n_keys` is the live length, which the pool's token axis no longer carries.
+/// `n_keys` is the live length per sequence, which the pool's token axis no
+/// longer carries: one entry for a lockstep batch (every row reads it), one
+/// per row for a ragged one (`batched-decode-design.md` §12.2).
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // read by the Metal arm only, as `FlashDecoding`'s fields are
 struct PagedTable {
     entries: Vec<u32>,
     stride: usize,
-    n_keys: usize,
+    n_keys: Vec<u32>,
+}
+
+impl PagedTable {
+    /// The longest row's live length: the dispatch depth.
+    fn max_keys(&self) -> usize {
+        self.n_keys.iter().copied().max().unwrap_or(0) as usize
+    }
+
+    /// Row `b`'s live length.
+    fn keys_of(&self, b: usize) -> usize {
+        if self.n_keys.len() == 1 {
+            self.n_keys[0] as usize
+        } else {
+            self.n_keys.get(b).copied().unwrap_or(0) as usize
+        }
+    }
 }
 
 /// FlashDecoding: attention split over independent contiguous KV chunks, with
@@ -2938,19 +3036,34 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         if let Some(paged) = &self.paged {
             let b_sz = q_l.dim(0)?;
             let chunk = self.page_size * self.pages_per_chunk;
-            let need = flash_chunk_count(paged.n_keys, chunk);
+            let need = flash_chunk_count(paged.max_keys(), chunk);
             if k_l.dim(0)? != 1 || v_l.dim(0)? != 1 {
                 lloom_tensor::bail!(
                     "flash-decoding over a page pool needs a pool of one row, got k {:?}",
                     k_l.dims()
                 );
             }
-            if paged.n_keys == 0 || paged.n_keys > k_l.dim(2)? {
+            if paged.n_keys.len() != 1 && paged.n_keys.len() != b_sz {
                 lloom_tensor::bail!(
-                    "flash-decoding over a page pool: {} live keys against a pool of {} slots",
-                    paged.n_keys,
-                    k_l.dim(2)?
+                    "flash-decoding over a page pool: {} live key counts for {b_sz} sequences \
+                     (one for the batch, or one per row)",
+                    paged.n_keys.len()
                 );
+            }
+            if paged.n_keys.len() > 1 && paged.stride == 0 {
+                lloom_tensor::bail!(
+                    "flash-decoding over a page pool: per-row live key counts need per-row \
+                     tables (table stride 0 shares one table)"
+                );
+            }
+            for (b, &n) in paged.n_keys.iter().enumerate() {
+                if n == 0 || n as usize > k_l.dim(2)? {
+                    lloom_tensor::bail!(
+                        "flash-decoding over a page pool: row {b} has {n} live keys against a \
+                         pool of {} slots",
+                        k_l.dim(2)?
+                    );
+                }
             }
             if paged.entries.len() < need + (b_sz - 1) * paged.stride {
                 lloom_tensor::bail!(
@@ -2962,9 +3075,11 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
             }
             let slots = k_l.dim(2)?;
             for (i, &page) in paged.entries.iter().enumerate() {
-                let c = i % paged.stride.max(1);
-                let live = (paged.n_keys - (c * chunk).min(paged.n_keys)).min(chunk);
-                if c < need && page as usize * self.page_size + live > slots {
+                let stride = paged.stride.max(1);
+                let (b, c) = (i / stride, i % stride);
+                let n_keys = paged.keys_of(b);
+                let live = (n_keys - (c * chunk).min(n_keys)).min(chunk);
+                if live > 0 && page as usize * self.page_size + live > slots {
                     lloom_tensor::bail!(
                         "flash-decoding over a page pool: table entry {i} names page {page}, \
                          whose chunk would read past the pool's {slots} slots (DESIGN.md 3.5)"
@@ -3024,7 +3139,7 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         let n_q_heads = b_sz * q_l.dim(1)?;
         let head_dim = q_l.dim(D::Minus1)?;
         let n_keys = match &self.paged {
-            Some(p) => p.n_keys,
+            Some(p) => p.max_keys(),
             None => k_l.dim(2)?,
         };
         let chunk_size = self.page_size * self.pages_per_chunk;
@@ -3123,7 +3238,7 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         {
             Some(p) => {
                 let mut ks = k_l.dims().to_vec();
-                ks[2] = p.n_keys;
+                ks[2] = p.max_keys();
                 let mut kst = k_l.stride().to_vec();
                 kst[0] = 0;
                 let mut vst = v_l.stride().to_vec();
@@ -3136,22 +3251,35 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
                 v_l.stride().to_vec(),
             ),
         };
-        let partial_params = device.new_buffer_with_data(std::slice::from_ref(
-            &lloom_tensor::kernels::FlashPartialParams::for_step(
-                q_l.dims(),
-                &k_shape,
-                &k_stride,
-                &v_stride,
-                self.page_size,
-                self.pages_per_chunk,
-                n_chunks,
-                chunk_capacity,
-                table_stride,
-                self.scale,
-                self.softcapping,
-            )
-            .map_err(lloom_tensor::Error::wrap)?,
-        ))?;
+        // The live key count the kernel reads per row: one entry every row
+        // reads (the lockstep batch, the contiguous cache) or one per row
+        // (a ragged batch through one dispatch, §12.2). `n_keys` in the
+        // params stays the longest row's — the dispatch depth.
+        let (keys_per_seq, ragged): (Vec<i32>, bool) = match &self.paged {
+            Some(p) if p.n_keys.len() > 1 => {
+                (p.n_keys.iter().map(|&n| n as i32).collect(), true)
+            }
+            _ => (vec![n_keys as i32], false),
+        };
+        let n_keys_per_seq = device.new_buffer_with_data(&keys_per_seq)?;
+        let mut partial = lloom_tensor::kernels::FlashPartialParams::for_step(
+            q_l.dims(),
+            &k_shape,
+            &k_stride,
+            &v_stride,
+            self.page_size,
+            self.pages_per_chunk,
+            n_chunks,
+            chunk_capacity,
+            table_stride,
+            self.scale,
+            self.softcapping,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        if ragged {
+            partial = partial.with_keys_per_sequence();
+        }
+        let partial_params = device.new_buffer_with_data(std::slice::from_ref(&partial))?;
         let combine_params = device.new_buffer_with_data(std::slice::from_ref(
             // The pair this call has taken since #116, and the reason the
             // partial pass needed the same one: the combine reads at the
@@ -3180,6 +3308,7 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
             &partial_params,
             &combine_params,
             &walk_order,
+            &n_keys_per_seq,
             n_q_heads,
             head_dim,
             n_chunks,
@@ -3254,6 +3383,49 @@ pub fn flash_decoding(
 /// kernel reaches a sequence through its table and never through a stride,
 /// and merges its chunks in index order whatever the table holds (§10.3h).
 #[allow(clippy::too_many_arguments)]
+/// [`flash_decoding_paged`] over a RAGGED batch: row `b` of `q` attends over
+/// its own `n_keys[b]` live keys through its own chunk table
+/// (`table[b * table_stride ..]`), in ONE dispatch pair for the batch
+/// (`batched-decode-design.md` §12.2). Every row's tables must be
+/// `table_stride` entries long — the longest row's chunk count — padded past
+/// the row's own chunks with any page (a chunk past a row's live count is
+/// an empty range the kernel never reads). Bit-identical per row to that
+/// row's own `flash_decoding_paged` call: the partials and the merge order
+/// are the row's alone.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_decoding_paged_ragged(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    page_size: usize,
+    pages_per_chunk: usize,
+    scratch_sizing: FlashScratchSizing,
+    reserve_chunks: usize,
+    table: Vec<u32>,
+    table_stride: usize,
+    n_keys: Vec<u32>,
+) -> Result<Tensor> {
+    q.apply_op3_no_bwd(
+        k,
+        v,
+        &FlashDecoding {
+            scale,
+            softcapping,
+            paged: Some(PagedTable {
+                entries: table,
+                stride: table_stride,
+                n_keys,
+            }),
+            page_size,
+            pages_per_chunk,
+            scratch_sizing,
+            reserve_chunks,
+        },
+    )
+}
+
 pub fn flash_decoding_paged(
     q: &Tensor,
     k: &Tensor,
@@ -3277,7 +3449,7 @@ pub fn flash_decoding_paged(
             paged: Some(PagedTable {
                 entries: table,
                 stride: table_stride,
-                n_keys,
+                n_keys: vec![n_keys as u32],
             }),
             page_size,
             pages_per_chunk,

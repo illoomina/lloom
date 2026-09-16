@@ -165,6 +165,19 @@ impl<C> SlotPool<C> {
     pub fn tokens(&self, slot: usize) -> Option<&[u32]> {
         self.slots.get(slot)?.seq.as_ref().map(|s| s.tokens())
     }
+
+    /// An idle slot's sequence.
+    pub fn sequence(&self, slot: usize) -> Option<&Sequence<C>> {
+        self.slots.get(slot)?.seq.as_ref()
+    }
+
+    /// Every idle slot's sequence, with its slot index.
+    pub fn idle_sequences(&self) -> impl Iterator<Item = (usize, &Sequence<C>)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.seq.as_ref().map(|s| (i, s)))
+    }
 }
 
 #[cfg(test)]

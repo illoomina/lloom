@@ -497,3 +497,95 @@ fn refuses_a_window_wider_than_the_ring() -> Result<()> {
     let _ = D::Minus1;
     Ok(())
 }
+
+/// The slot-indexed batch (`shortconv_ring_rows`, `batched-decode-design.md`
+/// §12.2): three rows writing rings 4, 0 and 2 of a six-ring pool at phases
+/// 0, 2 and 5 in ONE dispatch, against three `shortconv_ring` calls on the
+/// rings' own `narrow(0, slot, 1)` views at those phases — every output row
+/// and the whole pool (the three untouched rings included) bit-equal, at the
+/// decode shape (`seq_len = 1`) and the verify shape (`seq_len = 3`).
+fn per_row_case(seq_len: usize, dtype: DType, device: &Device) -> Result<()> {
+    let (b_sz, hidden, l_cache, k) = (3usize, 16usize, 3usize, 4usize);
+    let width = l_cache + k;
+    let slots: [u32; 3] = [4, 0, 2];
+    let phases: [u32; 3] = [0, 2, 5];
+    let pool_rings = 6;
+
+    let bcx = Tensor::from_vec(
+        fill(b_sz * 3 * hidden * seq_len, 11),
+        (b_sz, seq_len, 3 * hidden),
+        device,
+    )?
+    .to_dtype(dtype)?
+    .transpose(1, 2)?;
+    let b = bcx.narrow(1, 0, hidden)?;
+    let c = bcx.narrow(1, hidden, hidden)?;
+    let x = bcx.narrow(1, 2 * hidden, hidden)?;
+    let w =
+        Tensor::from_vec(fill(hidden * l_cache, 3), (hidden, l_cache), device)?.to_dtype(dtype)?;
+    let table = table(&w, l_cache, width)?;
+    // Two pools of the same bytes (`Tensor::copy` is shallow on Metal).
+    let pool_ref = Tensor::from_vec(
+        fill(pool_rings * hidden * width, 12),
+        (pool_rings, hidden, width),
+        device,
+    )?
+    .to_dtype(dtype)?;
+    let pool_rows = Tensor::from_vec(
+        fill(pool_rings * hidden * width, 12),
+        (pool_rings, hidden, width),
+        device,
+    )?
+    .to_dtype(dtype)?;
+
+    let mut want_rows = Vec::with_capacity(b_sz);
+    for r in 0..b_sz {
+        let ring = pool_ref.narrow(0, slots[r] as usize, 1)?;
+        let out = lloom::nn::ops::shortconv_ring(
+            &b.narrow(0, r, 1)?,
+            &x.narrow(0, r, 1)?,
+            &c.narrow(0, r, 1)?,
+            &ring,
+            &table,
+            phases[r] as usize,
+        )?;
+        want_rows.push(out);
+    }
+    let want = Tensor::cat(&want_rows, 0)?;
+
+    let row_slots = Tensor::new(&slots[..], device)?;
+    let row_phases = Tensor::new(&phases[..], device)?;
+    let got =
+        lloom::nn::ops::shortconv_ring_rows(&b, &x, &c, &pool_rows, &table, &row_slots, &row_phases)?;
+
+    assert_bits(&format!("out seq_len={seq_len}"), &got, &want)?;
+    assert_bits(&format!("pool seq_len={seq_len}"), &pool_rows, &pool_ref)?;
+    // Not vacuous: the written rings differ from the untouched ones' bytes.
+    let fresh = Tensor::from_vec(
+        fill(pool_rings * hidden * width, 12),
+        (pool_rings, hidden, width),
+        device,
+    )?
+    .to_dtype(dtype)?;
+    for &s in &slots {
+        let moved = pool_rows
+            .narrow(0, s as usize, 1)?
+            .to_dtype(DType::F32)?
+            .ne(&fresh.narrow(0, s as usize, 1)?.to_dtype(DType::F32)?)?
+            .to_dtype(DType::F32)?
+            .sum_all()?
+            .to_scalar::<f32>()?;
+        assert!(moved > 0.0, "ring {s} was written");
+    }
+    Ok(())
+}
+
+#[test]
+fn per_row_slots_and_phases_match_the_per_ring_calls() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    for dtype in [DType::F32, DType::F16] {
+        per_row_case(1, dtype, &device)?;
+        per_row_case(3, dtype, &device)?;
+    }
+    Ok(())
+}

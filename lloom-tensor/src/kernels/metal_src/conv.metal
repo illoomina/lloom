@@ -171,6 +171,10 @@ struct ShortconvRingParams {
     size_t proj_stride_b;  // stride to step one batch in b/x/c
     size_t proj_stride_c;  // stride to step one channel in b/x/c
     size_t proj_stride_l;  // stride to step one position in b/x/c
+    // 1: batch row `b` is ring `row_slots[b]` of the state pool at phase
+    // `row_phases[b]` (a slot-indexed batch, `batched-decode-design.md`
+    // §12.2); 0: row `b` is ring `b` at `phase_last`, the buffers unread.
+    size_t per_row;
 };
 
 // Kernels
@@ -1417,6 +1421,8 @@ METAL_FUNC void shortconv_ring_body(
     device T *state,
     device const T *weights,
     device T *dst,
+    device const uint *row_slots,
+    device const uint *row_phases,
     uint tid
 ) {
   if (tid >= p.dst_numel) {
@@ -1429,12 +1435,16 @@ METAL_FUNC void shortconv_ring_body(
   const size_t b_idx = tid / hidden;
 
   // This channel's ring row, written in place per position. No carry loop:
-  // the row is already here, which is the point of the ring.
-  const size_t st = (b_idx * hidden + c_idx) * width;
+  // the row is already here, which is the point of the ring. A slot-indexed
+  // batch names the row and its phase per batch row; the state is then a
+  // pool of rings and `b_idx` is where the row's projection sits.
+  const size_t ring = p.per_row ? (size_t)row_slots[b_idx] : b_idx;
+  const size_t phase_last = p.per_row ? (size_t)row_phases[b_idx] : p.phase_last;
+  const size_t st = (ring * hidden + c_idx) * width;
 
   const size_t proj = b_idx * p.proj_stride_b + c_idx * p.proj_stride_c;
   for (size_t i = 0; i < seq_len; ++i) {
-    const size_t phase = (p.phase_last + width - (seq_len - 1 - i)) % width;
+    const size_t phase = (phase_last + width - (seq_len - 1 - i)) % width;
     const size_t pi = proj + i * p.proj_stride_l;
     // `b * x` in T, as the elementwise kernel computes it.
     const T bx = b_in[pi] * x_in[pi];
@@ -1473,19 +1483,22 @@ template <typename T, typename A>
     constant size_t &proj_stride_b,
     constant size_t &proj_stride_c,
     constant size_t &proj_stride_l,
+    constant size_t &per_row,
     device const T *b_in,
     device const T *x_in,
     device const T *c_in,
     device T *state,
     device const T *weights,
     device T *dst,
+    device const uint *row_slots,
+    device const uint *row_phases,
     uint tid [[ thread_position_in_grid ]]
 ) {
   ShortconvRingParams p {
       dst_numel, hidden, seq_len, width, phase_last,
-      proj_stride_b, proj_stride_c, proj_stride_l };
+      proj_stride_b, proj_stride_c, proj_stride_l, per_row };
   shortconv_ring_body<T, A>(
-      p, b_in, x_in, c_in, state, weights, dst, tid);
+      p, b_in, x_in, c_in, state, weights, dst, row_slots, row_phases, tid);
 }
 
 template <typename T, typename A>
@@ -1497,11 +1510,13 @@ template <typename T, typename A>
     device T *state,
     device const T *weights,
     device T *dst,
+    device const uint *row_slots,
+    device const uint *row_phases,
     uint tid [[ thread_position_in_grid ]]
 ) {
   ShortconvRingParams p = *pp;
   shortconv_ring_body<T, A>(
-      p, b_in, x_in, c_in, state, weights, dst, tid);
+      p, b_in, x_in, c_in, state, weights, dst, row_slots, row_phases, tid);
 }
 
 // Layout, asserted rather than hoped.
@@ -1555,7 +1570,7 @@ static_assert(alignof(Conv1dDepthwiseKParams) == 8, "Conv1dDepthwiseKParams alig
 static_assert(sizeof(ShortconvStepParams) == 32, "ShortconvStepParams layout");
 static_assert(alignof(ShortconvStepParams) == 8, "ShortconvStepParams alignment");
 
-static_assert(sizeof(ShortconvRingParams) == 64, "ShortconvRingParams layout");
+static_assert(sizeof(ShortconvRingParams) == 72, "ShortconvRingParams layout");
 static_assert(alignof(ShortconvRingParams) == 8, "ShortconvRingParams alignment");
 
 // The offset is taken from a real `thread` instance rather than the usual
@@ -1672,6 +1687,7 @@ static_assert(alignof(ShortconvRingParams) == 8, "ShortconvRingParams alignment"
     out[76] = offsetof_rt(ShortconvRingParams, proj_stride_b);
     out[77] = offsetof_rt(ShortconvRingParams, proj_stride_c);
     out[78] = offsetof_rt(ShortconvRingParams, proj_stride_l);
+    out[79] = offsetof_rt(ShortconvRingParams, per_row);
 }
 
 // Explicit instantiation. `decltype(func<...>)` restates the template's own

@@ -22,7 +22,7 @@
 //! drafter whose probe it can satisfy, so an MTP drafter against a target with no
 //! `h_nextn` head does not compile rather than failing at runtime (§3.4.3).
 
-use crate::nn::model::{CacheReset, CacheRewind, CausalLM};
+use crate::nn::model::{CacheReset, CacheRewind, CacheShare, CausalLM};
 use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// A sequence slot on the serving side. The `Speculator` is constructed for a
@@ -190,6 +190,15 @@ pub struct Anchor {
     pub pos: usize,
 }
 
+/// One row of a batched verify ([`Probes::verify_rows_enqueue`]): its cache,
+/// its anchor and its draft.
+pub struct VerifyRowRef<'a, C> {
+    pub cache: &'a mut C,
+    pub anchor: Anchor,
+    pub draft: &'a Draft,
+}
+
+
 /// The ids of one drafted block, where the family produced them.
 ///
 /// A drafter that samples on the device (DSpark's `sample_block` argmax
@@ -315,6 +324,38 @@ pub trait Speculator {
     ) -> Result<()>;
 }
 
+/// A borrowed proposer is a proposer: a driver that owns its `S` can be
+/// handed `&mut S` for a closed run (`Session::decode_spec_batched`).
+impl<T: Speculator> Speculator for &mut T {
+    type Probe = T::Probe;
+    fn n_seq(&self) -> usize {
+        T::n_seq(self)
+    }
+    fn kv_source(&self) -> KvSource {
+        T::kv_source(self)
+    }
+    fn max_draft(&self) -> usize {
+        T::max_draft(self)
+    }
+    fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
+        T::begin(self, seq, prompt)
+    }
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        T::draft(self, active)
+    }
+    fn want_confidence(&mut self, wanted: bool) {
+        T::want_confidence(self, wanted)
+    }
+    fn observe(
+        &mut self,
+        seq: SeqId,
+        probe: &<Self::Probe as TargetProbe>::Output,
+        accepted: &[u32],
+    ) -> Result<()> {
+        T::observe(self, seq, probe, accepted)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Layer 3 — the verify/accept loop, family-blind; the pairing proof.
 // ---------------------------------------------------------------------------
@@ -405,6 +446,36 @@ pub trait Probes<P: TargetProbe>: CausalLM {
         cache: &mut Self::Cache,
         eos_ids: &[u32],
     ) -> Result<(Vec<u32>, P::Output)>;
+
+    /// The receipt of a verify over several rows' windows in ONE pass
+    /// ([`Self::verify_rows_enqueue`]).
+    type PendingRows;
+
+    /// Encode several rows' verifies as one target pass — every row's
+    /// `[last, draft…]` window laid end to end, one weight sweep, each row
+    /// against its own cache (`batched-decode-design.md` §12.4). Per row the
+    /// arithmetic of [`Self::verify_enqueue`]. A model without a batched
+    /// verify refuses.
+    fn verify_rows_enqueue(
+        &self,
+        rows: &mut [VerifyRowRef<'_, Self::Cache>],
+    ) -> Result<Self::PendingRows> {
+        let _ = rows;
+        lloom_tensor::bail!("this model has no batched verify")
+    }
+
+    /// Read back [`Self::verify_rows_enqueue`]'s pass: per row, as
+    /// [`Self::verify_complete`], each row's accepted prefix bounded by its
+    /// own EOS set (`eos_sets[r]`).
+    fn verify_rows_complete(
+        &self,
+        pending: Self::PendingRows,
+        caches: &mut [&mut Self::Cache],
+        eos_sets: &[&[u32]],
+    ) -> Result<Vec<(Vec<u32>, P::Output)>> {
+        let _ = (pending, caches, eos_sets);
+        lloom_tensor::bail!("this model has no batched verify")
+    }
 
     /// Drain the probe the last non-verify pass (the prefill) left in `cache`,
     /// covering every position that pass ran. A drafter is keyed from the
@@ -648,6 +719,10 @@ pub enum ReuseAction {
     /// whose contents were unknown — so the cache was reset and `full` is
     /// prefilled whole.
     Fresh,
+    /// The cache was reset, then the carried count of tokens was SHARED from
+    /// another row's cache — its pages by reference, its conv state restored
+    /// (`CacheShare`) — and the suffix after them is prefilled.
+    Shared(usize),
 }
 
 /// The outcome of [`Session::prepare`]: what to prefill and what was reused.
@@ -796,6 +871,49 @@ impl<'m, M: CausalLM> Session<'m, M> {
         self.seq.overrun_unwritten = false;
         self.seq.last_logits = None;
         self.seq.tokens_known = true;
+    }
+
+    /// [`Self::prepare`], and when it finds nothing of its own to reuse, a
+    /// share of `src`'s cached prefix: the longest common prefix of `src_log`
+    /// (what `src` holds, token for token) and `full`, rounded down to what
+    /// [`CacheShare::share_prefix_from`] can give (whole pages, at most
+    /// `full.len() - 1` so a prediction is still produced), the token log and
+    /// position set past it. `src` must hold at least `src_log.len()` tokens.
+    pub fn prepare_shared(
+        &mut self,
+        full: &[u32],
+        src: &M::Cache,
+        src_log: &[u32],
+    ) -> Result<Prepared>
+    where
+        M::Cache: CacheRewind + CacheReset + CacheShare,
+    {
+        let prepared = self.prepare(full)?;
+        if prepared.action != ReuseAction::Fresh || full.len() < 2 {
+            return Ok(prepared);
+        }
+        let lcp = src_log
+            .iter()
+            .zip(full.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let want = lcp.min(full.len() - 1);
+        if want == 0 {
+            return Ok(prepared);
+        }
+        let shared = self.seq.cache.share_prefix_from(src, want)?;
+        if shared == 0 {
+            return Ok(prepared);
+        }
+        self.seq.tokens = full[..shared].to_vec();
+        self.seq.pos = shared;
+        self.seq.tokens_known = true;
+        self.seq.last_logits = None;
+        Ok(Prepared {
+            action: ReuseAction::Shared(shared),
+            reused: shared,
+            suffix: full[shared..].to_vec(),
+        })
     }
 
     /// Make the sequence decodable for `full` — the whole token sequence a

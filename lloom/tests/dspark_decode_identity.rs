@@ -1250,6 +1250,7 @@ impl lloom::nn::CausalLM for TwiceForward<'_> {
 
 impl lloom::nn::speculator::Probes<LayerTaps<5>> for TwiceForward<'_> {
     type Pending = lloom::models::lfm2::PendingVerify;
+    type PendingRows = ();
     fn verify_and_probe(
         &self,
         drafts: &[Draft],

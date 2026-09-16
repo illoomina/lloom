@@ -908,7 +908,8 @@ mod ragged_verify {
             let pending = model.verify_rows_enqueue(&mut vrows)?;
             drop(vrows);
             let mut refs: Vec<&mut Cache> = sub_caches.iter_mut().collect();
-            let got = model.verify_rows_complete(pending, &mut refs, &eos)?;
+            let eos_sets: Vec<&[u32]> = vec![&eos[..]; refs.len()];
+            let got = model.verify_rows_complete(pending, &mut refs, &eos_sets)?;
             drop(refs);
             assert!(pool_on.shared_calls() > 0, "the batched arms ran the verify");
 

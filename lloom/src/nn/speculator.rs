@@ -465,14 +465,15 @@ pub trait Probes<P: TargetProbe>: CausalLM {
     }
 
     /// Read back [`Self::verify_rows_enqueue`]'s pass: per row, as
-    /// [`Self::verify_complete`].
+    /// [`Self::verify_complete`], each row's accepted prefix bounded by its
+    /// own EOS set (`eos_sets[r]`).
     fn verify_rows_complete(
         &self,
         pending: Self::PendingRows,
         caches: &mut [&mut Self::Cache],
-        eos_ids: &[u32],
+        eos_sets: &[&[u32]],
     ) -> Result<Vec<(Vec<u32>, P::Output)>> {
-        let _ = (pending, caches, eos_ids);
+        let _ = (pending, caches, eos_sets);
         lloom_tensor::bail!("this model has no batched verify")
     }
 

@@ -8286,7 +8286,7 @@ impl Model {
         &self,
         pending: PendingRows,
         caches: &mut [&mut Cache],
-        eos_ids: &[u32],
+        eos_sets: &[&[u32]],
     ) -> Result<Vec<(Vec<u32>, Vec<Tensor>)>> {
         let PendingRows {
             toks,
@@ -8294,10 +8294,11 @@ impl Model {
             both,
             taps,
         } = pending;
-        if caches.len() != toks.len() {
+        if caches.len() != toks.len() || eos_sets.len() != toks.len() {
             lloom_tensor::bail!(
-                "lfm2 verify_rows_complete: {} caches for a verify of {} rows",
+                "lfm2 verify_rows_complete: {} caches and {} EOS sets for a verify of {} rows",
                 caches.len(),
+                eos_sets.len(),
                 toks.len()
             )
         }
@@ -8312,7 +8313,7 @@ impl Model {
             let proposed = &proposed_all[off_p..off_p + k];
             off_a += k + 1;
             off_p += k;
-            let accepted = accept_prefix(argmax, proposed, eos_ids);
+            let accepted = accept_prefix(argmax, proposed, eos_sets[r]);
             cache.resolve(tok, accepted.len())?;
             let n_acc = accepted.len();
             let probe = taps[r]
@@ -8561,9 +8562,9 @@ impl crate::nn::Probes<crate::nn::LayerTaps<5>> for Model {
         &self,
         pending: PendingRows,
         caches: &mut [&mut Self::Cache],
-        eos_ids: &[u32],
+        eos_sets: &[&[u32]],
     ) -> Result<Vec<(Vec<u32>, Vec<Tensor>)>> {
-        Model::verify_rows_complete(self, pending, caches, eos_ids)
+        Model::verify_rows_complete(self, pending, caches, eos_sets)
     }
 
     fn take_probe(&self, cache: &mut Self::Cache) -> Result<Vec<Tensor>> {

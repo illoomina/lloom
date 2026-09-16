@@ -43,6 +43,8 @@ struct Lane {
     stats: DecodeStats,
     max_tokens: usize,
     round_start_ns: u64,
+    /// The row's own EOS set: the verify's accept rule reads it per window.
+    eos_ids: Vec<u32>,
 }
 
 impl Lane {
@@ -183,7 +185,7 @@ where
             lane.anchor_tok = anchor;
             lane.joined = true;
             joined += 1;
-            if self.eos_ids.contains(&anchor) {
+            if lane.eos_ids.contains(&anchor) {
                 lane.eos = true;
                 lane.done = true;
             } else if !lane.reached(lane.produced) {
@@ -279,6 +281,8 @@ where
 
         let t = std::time::Instant::now();
         let rb = readbacks();
+        let eos_owned: Vec<Vec<u32>> = picked.iter().map(|s| s.lane.eos_ids.clone()).collect();
+        let eos_sets: Vec<&[u32]> = eos_owned.iter().map(|v| v.as_slice()).collect();
         let mut caches: Vec<&mut M::Cache> = picked
             .iter_mut()
             .map(|s| {
@@ -286,7 +290,7 @@ where
                 &mut sess.seq.cache
             })
             .collect();
-        let results = model.verify_rows_complete(pending, &mut caches, &self.eos_ids)?;
+        let results = model.verify_rows_complete(pending, &mut caches, &eos_sets)?;
         drop(caches);
         let verify_wait_ns = t.elapsed().as_nanos() as u64;
         let verify_readbacks = enqueue_readbacks + readbacks() - rb;
@@ -336,7 +340,7 @@ where
             }
             let mut batch: Vec<u32> = Vec::with_capacity(accepted.len());
             for &tok in &accepted {
-                if self.eos_ids.contains(&tok) {
+                if lane.eos_ids.contains(&tok) {
                     lane.eos = true;
                     break;
                 }
@@ -406,11 +410,8 @@ where
                  the target's argmax); a temperature is refused rather than served as argmax"
             );
         }
-        if eos_ids != self.eos_ids.as_slice() {
-            lloom_tensor::bail!(
-                "decode_spec_batched: the batch runs one EOS set (the verify's accept rule reads \
-                 it per window); this row's differs"
-            );
+        if eos_ids.is_empty() {
+            lloom_tensor::bail!("decode_spec_batched: an empty EOS set; the row would never end");
         }
         if prompt.is_empty() {
             lloom_tensor::bail!("decode_spec_batched: an empty prompt (no resume on this loop)");
@@ -450,6 +451,7 @@ where
             },
             max_tokens,
             round_start_ns: 0,
+            eos_ids: eos_ids.to_vec(),
         };
         let _ = &lane.round_start_ns;
         let slot = Slot {

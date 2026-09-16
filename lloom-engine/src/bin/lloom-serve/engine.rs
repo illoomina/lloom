@@ -191,10 +191,15 @@ pub enum RowsArm {
 }
 
 impl RowsArm {
-    pub fn parse(s: &str, batched: bool, dspark: bool) -> Result<Self> {
+    pub fn parse(s: &str, batched: bool) -> Result<Self> {
         Ok(match s {
+            // `--batch N` is the pool on both loops: the continuous
+            // speculative loop on the pool (the batched draft and re-key,
+            // one drafter) beats the static pipelined driver on private
+            // caches on every measured cell (`batched-decode-design.md`
+            // §12.10); `private` stays the named control arm.
             "auto" => {
-                if batched && !dspark {
+                if batched {
                     Self::Pool
                 } else {
                     Self::Private
@@ -245,7 +250,88 @@ pub struct DecodeTiming {
     /// (empty on the K=1 arms).
     pub row_rounds: Vec<usize>,
     pub row_accepted: Vec<f64>,
+    /// Per row, the host time its rounds spent in each phase — draft,
+    /// verify (enqueue + wait), observe — summed over the row's rounds, in
+    /// ms (`RoundTiming`; empty on the K=1 arms). On the batched loop a
+    /// round's phases are the batch's, so the rows differ only by how many
+    /// rounds each ran.
+    pub row_draft_ms: Vec<f64>,
+    pub row_verify_ms: Vec<f64>,
+    pub row_observe_ms: Vec<f64>,
+    /// The Metal profile counters over the timed bracket, when
+    /// `CANDLE_METAL_PROFILE=1` (a census run: the recorder costs a lock and a
+    /// hash per dispatch, so its timing is not the arm's; `None` otherwise).
+    pub profile: Option<ProfileReport>,
     pub mem: MemReport,
+}
+
+/// What the dispatch recorder saw over one timed bracket: the counts, the
+/// GPU-busy union over the bracket's command buffers, and the per-kernel
+/// dispatch census (`lloom_tensor::kernels::metal::profile::Snapshot`).
+pub struct ProfileReport {
+    pub dispatches: u64,
+    pub command_buffers: u64,
+    pub encoders: u64,
+    pub gpu_busy_ms: f64,
+    pub gpu_span_ms: f64,
+    pub by_label: Vec<(String, u64)>,
+    /// GPU time by kernel from each command buffer's LAST dispatch label —
+    /// `(label, buffers, total_ms, p50_ms)`; exact only at
+    /// `CANDLE_METAL_COMPUTE_PER_BUFFER=1` (one dispatch per buffer), else a
+    /// buffer is charged to its last kernel (`lfm2-chat`'s reading, #727).
+    pub gpu_by_label: Vec<(String, u64, f64, f64)>,
+}
+
+impl ProfileReport {
+    pub fn json(&self) -> Value {
+        json!({
+            "dispatches": self.dispatches,
+            "command_buffers": self.command_buffers,
+            "encoders": self.encoders,
+            "gpu_busy_ms": self.gpu_busy_ms,
+            "gpu_span_ms": self.gpu_span_ms,
+            "by_label": self.by_label.iter().map(|(k, n)| json!([k, n])).collect::<Vec<_>>(),
+            "gpu_by_label": self
+                .gpu_by_label
+                .iter()
+                .map(|(k, b, t, p)| json!([k, b, t, p]))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// Zero the dispatch recorder before a timed bracket (a no-op unless
+/// `CANDLE_METAL_PROFILE=1`).
+fn profile_reset() {
+    #[cfg(feature = "metal")]
+    if lloom_tensor::kernels::metal::profile::enabled() {
+        lloom_tensor::kernels::metal::profile::reset();
+    }
+}
+
+/// The recorder's snapshot after a bracket the caller has synchronised
+/// (every completion handler has run), or `None` when it is off.
+fn profile_take() -> Option<ProfileReport> {
+    #[cfg(feature = "metal")]
+    {
+        use lloom_tensor::kernels::metal::profile;
+        if profile::enabled() {
+            let s = profile::snapshot();
+            return Some(ProfileReport {
+                dispatches: s.dispatches,
+                command_buffers: s.command_buffers,
+                encoders: s.encoders,
+                gpu_busy_ms: 1e3 * s.gpu_busy_union_s,
+                gpu_span_ms: 1e3 * s.gpu_span_s,
+                by_label: s.by_label,
+                gpu_by_label: profile::gpu_time_by_label_detailed()
+                    .into_iter()
+                    .map(|k| (k.label, k.buffers, 1e3 * k.total_s, 1e3 * k.p50_s))
+                    .collect(),
+            });
+        }
+    }
+    None
 }
 
 impl Single {
@@ -1045,6 +1131,7 @@ impl Engine {
                             prefill_tile: tile,
                             ..DecodeOptions::new(decode_tokens)
                         };
+                        profile_reset();
                         let t = Instant::now();
                         let outs = run_spec_rows(
                             pooled,
@@ -1057,6 +1144,7 @@ impl Engine {
                         )?;
                         idle.device.synchronize()?;
                         let wall = ms(t.elapsed());
+                        let prof = profile_take();
                         let prefill_ms: f64 =
                             outs.iter().map(|o| o.stats.prefill_ns as f64 / 1e6).sum();
                         DecodeTiming {
@@ -1080,6 +1168,19 @@ impl Engine {
                             o.stats.rounds.iter().map(|r| r.accepted as f64).sum::<f64>() / n
                         })
                         .collect(),
+                    row_draft_ms: outs
+                        .iter()
+                        .map(|o| o.stats.rounds.iter().map(|r| r.timing.draft_ns).sum::<u64>() as f64 / 1e6)
+                        .collect(),
+                    row_verify_ms: outs
+                        .iter()
+                        .map(|o| o.stats.rounds.iter().map(|r| r.timing.verify_ns).sum::<u64>() as f64 / 1e6)
+                        .collect(),
+                    row_observe_ms: outs
+                        .iter()
+                        .map(|o| o.stats.rounds.iter().map(|r| r.timing.observe_ns).sum::<u64>() as f64 / 1e6)
+                        .collect(),
+                    profile: prof,
                     mem: MemReport::default(),
                 }
                     } else {
@@ -1116,6 +1217,7 @@ impl Engine {
                             lookahead: 1,
                             ..DecodeOptions::new(decode_tokens)
                         };
+                        profile_reset();
                         let t = Instant::now();
                         let outs = Session::decode_batched(
                             sessions,
@@ -1128,6 +1230,7 @@ impl Engine {
                         )?;
                         idle.device.synchronize()?;
                         let decode_ms = ms(t.elapsed());
+                        let prof = profile_take();
                         for (i, o) in outs.iter().enumerate() {
                             if o.ids.len() != decode_tokens {
                                 anyhow::bail!(
@@ -1154,6 +1257,10 @@ impl Engine {
                     row_tokens: outs.iter().map(|o| o.ids.len()).collect(),
                     row_rounds: Vec::new(),
                     row_accepted: Vec::new(),
+                    row_draft_ms: Vec::new(),
+                    row_verify_ms: Vec::new(),
+                    row_observe_ms: Vec::new(),
+                    profile: prof,
                     mem: MemReport::default(),
                 }
                     };
@@ -1209,6 +1316,10 @@ impl Engine {
                     row_tokens: vec![run.tokens.len()],
                 row_rounds: Vec::new(),
                 row_accepted: Vec::new(),
+                row_draft_ms: Vec::new(),
+                row_verify_ms: Vec::new(),
+                row_observe_ms: Vec::new(),
+                profile: None,
                     mem: MemReport::default(),
                 });
             }
@@ -1270,6 +1381,10 @@ impl Engine {
                 row_tokens: vec![run.tokens.len()],
                 row_rounds: Vec::new(),
                 row_accepted: Vec::new(),
+                row_draft_ms: Vec::new(),
+                row_verify_ms: Vec::new(),
+                row_observe_ms: Vec::new(),
+                profile: None,
                 mem: MemReport::default(),
             })
         })?;

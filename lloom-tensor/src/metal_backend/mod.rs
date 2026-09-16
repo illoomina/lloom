@@ -3974,15 +3974,6 @@ impl MetalStorage {
         let params_buf = self
             .device
             .new_buffer_with_data(std::slice::from_ref(&params))?;
-        // The slots are read at their layout offset; `Buffer` bindings carry an
-        // offset for the source and destination but the slot buffer is bound
-        // whole, so a non-zero start offset is refused rather than mis-read.
-        if g.slots_offset != 0 {
-            crate::bail!(
-                "Metal kv_scatter needs slots at offset 0, got {}",
-                g.slots_offset
-            )
-        }
         let encoder = self.device.command_encoder()?;
         crate::kernels::call_flash_kv_scatter(
             &self.device.device,
@@ -3993,6 +3984,7 @@ impl MetalStorage {
             g.dst_offset * dst.dtype.size_in_bytes(),
             &dst.buffer,
             &slots.buffer,
+            g.slots_offset * DType::U32.size_in_bytes(),
             &params_buf,
             n_rows,
             g.n_kv_heads,

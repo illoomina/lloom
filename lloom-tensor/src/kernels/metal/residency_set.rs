@@ -226,6 +226,21 @@ impl ResidencySet {
         let Some(set) = &self.raw else {
             return false;
         };
+        // The steady state — nothing staged — never takes the lock.
+        if !self.dirty.load(Ordering::Acquire) {
+            return false;
+        }
+        // Under `members`, as every other `commit` here is: a commit applies
+        // the set's pending adds AND removes, and two threads applying the same
+        // list — this one at a command-buffer cut on the encode thread, an
+        // eviction's `remove_batch` on Metal's completion thread — release an
+        // allocation once too often. Measured: a `--rows private` server's
+        // allocation burst (adds staged here, evictions on the completion
+        // thread) crashed on Metal's completion queue in an `objc_release`
+        // (§10.7's shape), and under `NSZombieEnabled` the extra release was
+        // this `commit` sending `release` to a freed `MTLBuffer`
+        // (`batched-decode-design.md` §12.10).
+        let _members = self.members.lock();
         // `swap` so a concurrent `add` between the load and the commit re-dirties
         // rather than being lost: if it set `dirty` after this `swap` read false
         // it stays true for the next cut; if before, we commit its allocation now.

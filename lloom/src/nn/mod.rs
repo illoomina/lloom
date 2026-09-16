@@ -79,7 +79,8 @@ pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
 pub use speculator::{
-    Anchor, Draft, DraftTokens, KvSource, LayerTaps, NextnHidden, NoProbe, PhaseCensus, Prepared,
+    Anchor, Draft, DraftTokens, KvSource, LayerTaps, NextnHidden, NoProbe, ObserveRow, PhaseCensus,
+    Prepared,
     ProbeHooks, Probes, ReuseAction, RoundProbe, RoundTiming, SeqId, Sequence, Session, Speculator,
     TapSide, TapSpec, TargetProbe, VerifyRowRef,
 };

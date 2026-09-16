@@ -11,14 +11,20 @@
 //! batched pass that read one row's offset, one row's table or one row's
 //! live count for every row fails.
 //!
+//! The batched context re-key (§12.10) is the round's other half: one
+//! `update_context_rows` over every row's accepted taps computes, per row,
+//! what `update_context` computes for that row alone — the reference again
+//! the one-row path, the comparison through the production consumer (the
+//! next block's hidden states over the re-keyed context).
+//!
 //! Metal only: the shared paged pool is Metal, and the drafted ids are
 //! compared on the arm the serving loop runs.
 #![cfg(feature = "metal")]
 
-use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, LayerType, Model};
-use lloom::models::lfm2_dspark::{CtxKv, DSparkConfig, DSparkDrafter, DSparkSpeculator};
-use lloom::nn::speculator::{DraftTokens, SeqId, Speculator};
-use lloom::nn::VarBuilder;
+use lloom::models::lfm2::{AttnImpl, BatchPool, Cache, Config, ConvState, KvAppend, LayerType, Model};
+use lloom::models::lfm2_dspark::{CtxCache, CtxKv, DSparkConfig, DSparkDrafter, DSparkSpeculator};
+use lloom::nn::speculator::{DraftTokens, SeqId, Session, Speculator};
+use lloom::nn::{DecodeOptions, VarBuilder};
 use lloom_tensor::{DType, Device, Result, Tensor};
 use rand::SeedableRng;
 use rand_distr::Distribution;
@@ -391,6 +397,387 @@ fn a_batched_draft_proposes_what_each_rows_own_draft_proposes() -> Result<()> {
         println!(
             "shared={shared}: batched drafts equal the one-row drafts on {} rows: {want:?}",
             prompts.len()
+        );
+    }
+    Ok(())
+}
+
+fn ctx_kv_for(shared: bool) -> CtxKv {
+    if shared {
+        CtxKv::Paged {
+            page_size: PAGE,
+            shared: true,
+        }
+    } else {
+        CtxKv::Contiguous
+    }
+}
+
+fn max_abs_diff(a: &Tensor, b: &Tensor) -> Result<(f32, usize)> {
+    let a = a.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let b = b.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let mut max = 0f32;
+    let mut n = 0usize;
+    for (x, y) in a.iter().zip(&b) {
+        let d = (x - y).abs();
+        if d > 0.0 {
+            n += 1;
+        }
+        max = max.max(d);
+    }
+    Ok((max, n))
+}
+
+/// Three rows' contexts (5, 40 and 70 positions), then a round's accepted
+/// taps of 3, 7 and 2 positions keyed into each row at its own offset —
+/// `update_context_rows` over the three rows against `update_context` per
+/// row, the re-keyed contexts compared through their production consumer,
+/// each row's `block_hidden` over one block at the row's new offset: bit
+/// for bit, on the shared paged pool (the page tables equal too) and on
+/// contiguous caches, at f32 and f16. The oracle's sensitivity is shown in
+/// the same test: the round keyed one position off moves the bits.
+#[test]
+fn update_context_rows_keys_what_each_rows_own_update_context_keys_bit_for_bit() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    for dtype in [DType::F32, DType::F16] {
+        let drafter = tiny_drafter(dtype, &dev, 150)?;
+        let cfg = drafter.config().clone();
+        let n_tap = cfg.target_layer_ids.len();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(150_001);
+        let ctx = [5usize, 40, 70];
+        let acc = [3usize, 7, 2];
+        for shared in [true, false] {
+            let ctx_kv = ctx_kv_for(shared);
+            // Three cache sets with the same prefix state (per-row appends on
+            // all three): the reference, the subject, and the wrong-offset
+            // control.
+            let mut a = drafter.make_ctx_caches_for(ctx_kv, 3, &dev)?;
+            let mut b = drafter.make_ctx_caches_for(ctx_kv, 3, &dev)?;
+            let mut c = drafter.make_ctx_caches_for(ctx_kv, 3, &dev)?;
+            for r in 0..3 {
+                let taps: Vec<Tensor> = (0..n_tap)
+                    .map(|_| randn(&mut rng, vec![1, ctx[r], cfg.hidden_size], &dev))
+                    .collect::<Result<_>>()?;
+                drafter.update_context(&taps, 0, &mut a[r])?;
+                drafter.update_context(&taps, 0, &mut b[r])?;
+                drafter.update_context(&taps, 0, &mut c[r])?;
+            }
+            let round: Vec<Vec<Tensor>> = (0..3)
+                .map(|r| {
+                    (0..n_tap)
+                        .map(|_| randn(&mut rng, vec![1, acc[r], cfg.hidden_size], &dev))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<_>>()?;
+            // Reference: per row, at its own offset. Control: one position off.
+            for r in 0..3 {
+                drafter.update_context(&round[r], ctx[r], &mut a[r])?;
+                drafter.update_context(&round[r], ctx[r] + 1, &mut c[r])?;
+            }
+            // Subject: the three rows in ONE pass.
+            {
+                let taps: Vec<&[Tensor]> = round.iter().map(|t| t.as_slice()).collect();
+                let mut caches: Vec<&mut [CtxCache]> =
+                    b.iter_mut().map(|s| s.as_mut_slice()).collect();
+                drafter.update_context_rows(&taps, &ctx, &mut caches)?;
+            }
+            let blocks = randn(&mut rng, vec![3, cfg.block_size, cfg.hidden_size], &dev)?
+                .to_dtype(dtype)?;
+            for r in 0..3 {
+                let off = ctx[r] + acc[r];
+                assert_eq!(a[r][0].len(), off, "row {r} reference length");
+                assert_eq!(b[r][0].len(), off, "row {r} subject length");
+                if shared {
+                    assert_eq!(a[r][0].page_table(), b[r][0].page_table(), "row {r} table");
+                }
+                let block = blocks.narrow(0, r, 1)?;
+                let ha = drafter.block_hidden(&block, off, &a[r])?;
+                let hb = drafter.block_hidden(&block, off, &b[r])?;
+                let hc = drafter.block_hidden(&block, off, &c[r])?;
+                let (x, y) = (bits(&ha)?, bits(&hb)?);
+                let distinct = x.iter().collect::<std::collections::HashSet<_>>().len();
+                assert!(distinct > 8, "row {r} vacuous ({distinct} distinct)");
+                assert!(
+                    x == y,
+                    "{dtype:?} shared={shared}: row {r} (ctx {} + {}) differs between the batched \
+                     and the per-row re-key",
+                    ctx[r],
+                    acc[r]
+                );
+                assert!(
+                    x != bits(&hc)?,
+                    "{dtype:?} shared={shared}: row {r}: the block does not see the round's keys \
+                     (one position off reads the same bits)"
+                );
+            }
+            println!(
+                "{dtype:?} shared={shared}: update_context_rows bit-identical to update_context on 3 rows ({acc:?} accepted onto {ctx:?})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A row that accepted ONE position keys its context through the GEMM in
+/// the batched pass (`m = Σn`) where alone it took the GEMV route (`m = 1`)
+/// — the §10.4 tier-2 seam. Measured here rather than assumed: the moved
+/// bits are a reordering (bounded), the drafted block over the re-keyed
+/// context is the same, and the rows with two or more positions stay bit
+/// for bit.
+#[test]
+fn a_one_position_row_moves_only_by_the_gemv_seam() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    for dtype in [DType::F32, DType::F16] {
+        let drafter = tiny_drafter(dtype, &dev, 151)?;
+        let cfg = drafter.config().clone();
+        let n_tap = cfg.target_layer_ids.len();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(151_001);
+        let ctx = [12usize, 40, 7];
+        let acc = [1usize, 4, 1];
+        let ctx_kv = ctx_kv_for(true);
+        let mut a = drafter.make_ctx_caches_for(ctx_kv, 3, &dev)?;
+        let mut b = drafter.make_ctx_caches_for(ctx_kv, 3, &dev)?;
+        for r in 0..3 {
+            let taps: Vec<Tensor> = (0..n_tap)
+                .map(|_| randn(&mut rng, vec![1, ctx[r], cfg.hidden_size], &dev))
+                .collect::<Result<_>>()?;
+            drafter.update_context(&taps, 0, &mut a[r])?;
+            drafter.update_context(&taps, 0, &mut b[r])?;
+        }
+        let round: Vec<Vec<Tensor>> = (0..3)
+            .map(|r| {
+                (0..n_tap)
+                    .map(|_| randn(&mut rng, vec![1, acc[r], cfg.hidden_size], &dev))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<_>>()?;
+        for r in 0..3 {
+            drafter.update_context(&round[r], ctx[r], &mut a[r])?;
+        }
+        {
+            let taps: Vec<&[Tensor]> = round.iter().map(|t| t.as_slice()).collect();
+            let mut caches: Vec<&mut [CtxCache]> = b.iter_mut().map(|s| s.as_mut_slice()).collect();
+            drafter.update_context_rows(&taps, &ctx, &mut caches)?;
+        }
+        let blocks = randn(&mut rng, vec![3, cfg.block_size, cfg.hidden_size], &dev)?
+            .to_dtype(dtype)?;
+        for r in 0..3 {
+            let off = ctx[r] + acc[r];
+            let block = blocks.narrow(0, r, 1)?;
+            let ha = drafter.block_hidden(&block, off, &a[r])?;
+            let hb = drafter.block_hidden(&block, off, &b[r])?;
+            let (max, moved) = max_abs_diff(&ha, &hb)?;
+            let scale = ha
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            if acc[r] >= 2 {
+                assert!(
+                    bits(&ha)? == bits(&hb)?,
+                    "{dtype:?}: row {r} ({} positions) is on the GEMM on both arms and differs",
+                    acc[r]
+                );
+            } else {
+                // The seam: a reordering of one dot product per key, never a
+                // different key. Bounded loosely; the measured figure is the
+                // line below.
+                assert!(
+                    max <= 1e-2 * scale.max(1.0),
+                    "{dtype:?}: row {r} (1 position) moved by {max} (scale {scale}) across the GEMV seam"
+                );
+            }
+            println!(
+                "{dtype:?}: row {r} ({} accepted): max |Δ| {max:.3e} over {moved} elements (scale {scale:.3e})",
+                acc[r]
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The seam the loop drives: two `DSparkSpeculator`s over the same drafter
+/// and target, three sequences seeded from their own prompts, then a round's
+/// accepted taps handed to one through `observe` per row and to the other
+/// through ONE `observe_rows` — the next batched draft proposes the same
+/// ids per row on both, on the shared paged pool and the contiguous arm; a
+/// second round with one-position rows likewise.
+#[test]
+fn a_batched_observe_keys_what_each_rows_own_observe_keys() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let dtype = DType::F16;
+    let tcfg = target_cfg();
+    let model = tiny_target(&tcfg, dtype, &dev)?;
+    let prompts: Vec<Vec<u32>> = vec![
+        vec![3, 11, 20, 5, 9],
+        (0..36u32).map(|i| (i * 7 + 3) % 46).collect(),
+        vec![40, 2, 17, 17, 6, 21, 8, 30, 31, 32, 33, 1],
+    ];
+    let hidden = tcfg.hidden_size;
+    let n_tap = tcfg.tap_layers.len();
+    for shared in [true, false] {
+        let mut specs = Vec::new();
+        for _ in 0..2 {
+            let mut spec = DSparkSpeculator::new_with_ctx(
+                tiny_drafter(dtype, &dev, 152)?,
+                model.draft_embedding().clone(),
+                model.lm_head_linear().clone(),
+                prompts.len(),
+                ctx_kv_for(shared),
+            )?;
+            for (i, p) in prompts.iter().enumerate() {
+                let mut cache = Cache::new(true, dtype, &tcfg, &dev)?;
+                let input = Tensor::new(p.as_slice(), &dev)?.unsqueeze(0)?;
+                let logits = model.forward(&input, 0, &mut cache)?;
+                let taps = cache.take_taps();
+                let anchor = logits
+                    .squeeze(0)?
+                    .argmax(lloom_tensor::D::Minus1)?
+                    .to_scalar::<u32>()?;
+                spec.begin(SeqId(i), p)?;
+                spec.observe(SeqId(i), &taps, &[anchor])?;
+            }
+            specs.push(spec);
+        }
+        let ids = |d: &lloom::nn::speculator::Draft| -> Result<Vec<u32>> {
+            match &d.tokens {
+                DraftTokens::Device(t) => t.to_vec1::<u32>(),
+                DraftTokens::Host(v) => Ok(v.clone()),
+            }
+        };
+        let all: Vec<SeqId> = (0..prompts.len()).map(SeqId).collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(152_001);
+        for (round, acc) in [[3usize, 6, 2], [1, 4, 1]].iter().enumerate() {
+            let taps: Vec<Vec<Tensor>> = (0..3)
+                .map(|r| {
+                    (0..n_tap)
+                        .map(|_| randn(&mut rng, vec![1, acc[r], hidden], &dev))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<_>>()?;
+            let accepted: Vec<Vec<u32>> = (0..3)
+                .map(|r| (0..acc[r] as u32).map(|k| (k * 5 + 7 * r as u32 + 1) % 46).collect())
+                .collect();
+            // Reference: per row.
+            for r in 0..3 {
+                specs[0].observe(SeqId(r), &taps[r], &accepted[r])?;
+            }
+            // Subject: one call.
+            {
+                let rows: Vec<(SeqId, &Vec<Tensor>, &[u32])> = (0..3)
+                    .map(|r| (SeqId(r), &taps[r], accepted[r].as_slice()))
+                    .collect();
+                specs[1].observe_rows(&rows)?;
+            }
+            assert_eq!(
+                specs[1].batched_observes(),
+                round as u64 + 1,
+                "observe_rows over 3 rows took the batched arm"
+            );
+            assert_eq!(specs[0].batched_observes(), 0);
+            if shared {
+                let n_layers = drafter_cfg().num_hidden_layers as u64;
+                assert_eq!(
+                    specs[1].batched_appends(),
+                    Some((round as u64 + 1) * n_layers),
+                    "the shared pool took one scatter per layer per batched re-key"
+                );
+                assert_eq!(specs[0].batched_appends(), Some(0));
+            } else {
+                assert_eq!(specs[1].batched_appends(), None);
+            }
+            let want: Vec<Vec<u32>> = specs[0].draft(&all)?.iter().map(ids).collect::<Result<_>>()?;
+            let got: Vec<Vec<u32>> = specs[1].draft(&all)?.iter().map(ids).collect::<Result<_>>()?;
+            for r in 0..3 {
+                assert_eq!(
+                    got[r], want[r],
+                    "shared={shared} round {round}: row {r}'s draft after the batched re-key differs from \
+                     the per-row re-key's"
+                );
+            }
+            assert!(
+                want[0] != want[1] || want[1] != want[2],
+                "every row drafted the same block"
+            );
+            println!("shared={shared} round {round} ({acc:?} accepted): drafts identical: {want:?}");
+        }
+    }
+    Ok(())
+}
+
+/// The loop itself: `Session::decode_spec_batched` over three rows of one
+/// `BatchPool` (the batched draft, the ragged verify, the batched re-key —
+/// every round's three phases on their batched arms) produces, per row,
+/// the stream the same row produces alone (a one-row batch: the one-row
+/// draft, the one-row verify, the one-row re-key), and the round took the
+/// batched re-key arm at all.
+#[test]
+fn the_speculative_batched_loop_streams_what_each_row_streams_alone() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let dtype = DType::F16;
+    let tcfg = target_cfg();
+    let model = tiny_target(&tcfg, dtype, &dev)?;
+    let prompts: Vec<Vec<u32>> = vec![
+        vec![3, 11, 20, 5, 9],
+        (0..36u32).map(|i| (i * 7 + 3) % 46).collect(),
+        vec![40, 2, 17, 17, 6, 21, 8, 30, 31, 32, 33, 1],
+    ];
+    let never_eos = [u32::MAX];
+    let opts = DecodeOptions::new(14);
+    let run = |rows: &[usize], shared: bool| -> Result<(Vec<Vec<u32>>, u64, u64)> {
+        let pool = BatchPool::new(&tcfg, &dev, rows.len(), 128)?;
+        pool.set_batched_arms(true);
+        let mut sessions: Vec<Session<'_, Model>> = rows
+            .iter()
+            .map(|_| Ok(Session::new(&model, Cache::for_batch(true, dtype, &tcfg, &dev, &pool)?)))
+            .collect::<Result<_>>()?;
+        let mut spec = DSparkSpeculator::new_with_ctx(
+            tiny_drafter(dtype, &dev, 153)?,
+            model.draft_embedding().clone(),
+            model.lm_head_linear().clone(),
+            rows.len(),
+            ctx_kv_for(shared),
+        )?;
+        let refs: Vec<&[u32]> = rows.iter().map(|&r| prompts[r].as_slice()).collect();
+        let outs = Session::decode_spec_batched(
+            &mut sessions,
+            &mut spec,
+            &refs,
+            &opts,
+            &never_eos,
+            &dev,
+            &mut |_, _| Ok(()),
+        )?;
+        Ok((
+            outs.into_iter().map(|o| o.ids).collect(),
+            spec.batched_drafts(),
+            spec.batched_observes(),
+        ))
+    };
+    for shared in [true, false] {
+        let mut solo = Vec::new();
+        for r in 0..prompts.len() {
+            let (ids, _, observes) = run(&[r], shared)?;
+            assert_eq!(observes, 0, "a one-row batch is the one-row re-key");
+            solo.push(ids.into_iter().next().unwrap());
+        }
+        let (ids, drafts, observes) = run(&[0, 1, 2], shared)?;
+        assert!(drafts >= 1, "the batched draft ran");
+        assert!(
+            observes >= 1,
+            "the round re-keyed its rows through observe_rows (took {observes} batched re-keys)"
+        );
+        for r in 0..prompts.len() {
+            assert_eq!(ids[r].len(), 14, "row {r} produced its cap");
+            assert_eq!(
+                ids[r], solo[r],
+                "shared={shared}: row {r}'s batched stream differs from its own"
+            );
+        }
+        assert!(solo[0] != solo[1] || solo[1] != solo[2], "the rows streamed one text");
+        println!(
+            "shared={shared}: 3 rows through the speculative batched loop stream what each streams alone ({drafts} batched drafts, {observes} batched re-keys): {ids:?}"
         );
     }
     Ok(())

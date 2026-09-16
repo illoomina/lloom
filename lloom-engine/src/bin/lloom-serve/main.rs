@@ -166,8 +166,10 @@ struct Args {
 
     /// How the rows of `--batch N` hold their state: `pool` (one shared
     /// paged pool, the attention and conv of the batch in one dispatch per
-    /// kernel — the default at `N > 1`), `pool-per-row` (the same pool, the
-    /// per-row loop: the A/B arm), `private` (a crown cache per row).
+    /// kernel — the default at `N > 1`, under `--dspark` too, where it is
+    /// the continuous speculative loop), `pool-per-row` (the same pool, the
+    /// per-row loop: the A/B arm), `private` (a crown cache per row; under
+    /// `--dspark` the static pipelined driver).
     #[arg(long, default_value = "auto")]
     rows: String,
 
@@ -220,7 +222,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let rows = engine::RowsArm::parse(&args.rows, batched, args.dspark)?;
+    let rows = engine::RowsArm::parse(&args.rows, batched)?;
     let load_start = Instant::now();
     let engine = Engine::load(LoadOptions {
         model_dir: model_dir.clone(),
@@ -874,6 +876,47 @@ fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
         t.bracket,
         t.mem.line(),
     );
+    if let Some(p) = &t.profile {
+        let steps = if t.row_rounds.is_empty() {
+            t.decode_tokens.max(1) as f64
+        } else {
+            t.row_rounds.iter().copied().max().unwrap_or(1).max(1) as f64
+        };
+        eprintln!(
+            "[/decode_throughput profile: gpu_busy {:.2} ms over the bracket ({:.3} ms per step/round of {steps:.0}), span {:.2} ms, {} dispatches ({:.1} per step), {} command buffers, {} encoders; top kernels: {}]",
+            p.gpu_busy_ms,
+            p.gpu_busy_ms / steps,
+            p.gpu_span_ms,
+            p.dispatches,
+            p.dispatches as f64 / steps,
+            p.command_buffers,
+            p.encoders,
+            p.by_label
+                .iter()
+                .take(12)
+                .map(|(k, n)| format!("{k}={n}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    if !t.row_rounds.is_empty() {
+        // The round's phases, per round, on the row that ran the most rounds
+        // (the batch's longest-lived row: its rounds are the batch's).
+        let (r, &rounds) = t
+            .row_rounds
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, &n)| n)
+            .expect("non-empty");
+        let per = |v: &Vec<f64>| v[r] / rounds.max(1) as f64;
+        eprintln!(
+            "[/decode_throughput rounds: row {r} ran {rounds} rounds at {:.2} accepted; per round draft {:.2} ms, verify {:.2} ms, observe {:.2} ms]",
+            t.row_accepted[r],
+            per(&t.row_draft_ms),
+            per(&t.row_verify_ms),
+            per(&t.row_observe_ms),
+        );
+    }
     Ok(json!({
         "generation_tps": generation_tps,
         "per_row_tps": per_row_tps,
@@ -886,6 +929,10 @@ fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
         "row_tokens": t.row_tokens,
         "row_rounds": t.row_rounds,
         "row_accepted": t.row_accepted,
+        "row_draft_ms": t.row_draft_ms,
+        "row_verify_ms": t.row_verify_ms,
+        "row_observe_ms": t.row_observe_ms,
+        "profile": t.profile.as_ref().map(|p| p.json()),
         "readback": t.readback.name(),
         "bracket": t.bracket,
         "mem": t.mem.json(),

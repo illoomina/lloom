@@ -10,9 +10,10 @@
 //! contexts), the rows' `[last, draft…]` windows laid end to end as one
 //! ragged pass over the rows' caches — the weight sweep once for the batch,
 //! each row against its own KV and ring — one readback of every position's
-//! argmax, then per row the accepted prefix, the cache resolved to it, the
-//! probe handed to the drafter, the tokens streamed. Argmax only: the verify
-//! accepts the target's own prediction.
+//! argmax, then per row the accepted prefix and the cache resolved to it,
+//! every row's probe handed to the drafter in ONE `observe_rows` (the
+//! drafter's context re-keyed for the batch in one pass), the tokens
+//! streamed. Argmax only: the verify accepts the target's own prediction.
 
 use std::borrow::{Borrow, BorrowMut};
 
@@ -24,7 +25,7 @@ use crate::nn::decode::{
 use crate::nn::RoundTiming;
 use crate::nn::model::BatchedCausalLM;
 use crate::nn::speculator::{
-    readbacks, Anchor, Probes, SeqId, Session, Speculator, VerifyRowRef,
+    readbacks, Anchor, ObserveRow, Probes, SeqId, Session, Speculator, VerifyRowRef,
 };
 use crate::nn::{RowDriver, RowId, StepReport};
 use lloom_tensor::{Device, Result};
@@ -296,18 +297,29 @@ where
         let verify_readbacks = enqueue_readbacks + readbacks() - rb;
         end_executor_step(&self.device)?;
 
-        for ((s, (accepted, probe)), &i) in picked.iter_mut().zip(results.into_iter()).zip(live) {
-            if accepted.is_empty() {
+        // Every row's accepted taps to the drafter in one call: the context
+        // re-key of B rows is one projection and one K/V pass per layer
+        // (`Speculator::observe_rows`), where a call per row was B serial
+        // passes and B scatters per layer (`batched-decode-design.md` §12.10).
+        let t = std::time::Instant::now();
+        let rb = readbacks();
+        {
+            let rows: Vec<ObserveRow<'_, S::Probe>> = picked
+                .iter()
+                .zip(results.iter())
+                .map(|(s, (accepted, probe))| (s.seq, probe, accepted.as_slice()))
+                .collect();
+            if rows.iter().any(|(_, _, accepted)| accepted.is_empty()) {
                 lloom_tensor::bail!(
                     "decode_spec_batched: a verify round accepted zero tokens; the target's own \
                      prediction at position 0 is always correct, so this is a broken verify"
                 );
             }
-            let t = std::time::Instant::now();
-            let rb = readbacks();
-            self.spec.observe(s.seq, &probe, &accepted)?;
-            let observe_ns = t.elapsed().as_nanos() as u64;
-            let observe_readbacks = readbacks() - rb;
+            self.spec.observe_rows(&rows)?;
+        }
+        let observe_ns = t.elapsed().as_nanos() as u64;
+        let observe_readbacks = readbacks() - rb;
+        for ((s, (accepted, _probe)), &i) in picked.iter_mut().zip(results.into_iter()).zip(live) {
             {
                 let sess: &mut Session<'m, M> = s.session.borrow_mut();
                 sess.seq.pos += accepted.len();

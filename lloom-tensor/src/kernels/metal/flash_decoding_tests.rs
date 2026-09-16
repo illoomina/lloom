@@ -1823,6 +1823,7 @@ fn run_scatter(
             0,
             &dst_buf,
             &slots_buf,
+            0,
             &pp,
             params.n_rows as usize,
             n_kv_heads,

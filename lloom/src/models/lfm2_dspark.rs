@@ -521,6 +521,19 @@ impl DSparkRotary {
         Ok((cos, sin))
     }
 
+    /// The table rows of `positions` (absolute, in any order): `cos`/`sin`
+    /// `[n, head_dim / 2]`. The 2-D form [`Self::apply_with`] reads one row
+    /// per sequence position, so B rows' context positions laid end to end
+    /// as one sequence are rotated at every position's own offset in one
+    /// call — the batched context re-key's shape.
+    pub fn at_positions(&self, positions: &[u32]) -> Result<(Tensor, Tensor)> {
+        let idx = Tensor::new(positions, self.cos.device())?;
+        Ok((
+            self.cos.index_select(&idx, 0)?,
+            self.sin.index_select(&idx, 0)?,
+        ))
+    }
+
     /// [`Self::apply`] with the table rows in hand: `cos`/`sin` are
     /// `[seq, head_dim / 2]` (every batch row at the same positions) or
     /// `[B, seq, head_dim / 2]` (each at its own).
@@ -689,6 +702,16 @@ impl CtxCache {
         None
     }
 
+    /// Batched appends (`append_rows` over a shared paged pool) the pool
+    /// behind this cache has taken; `None` off the paged arm.
+    pub fn batched_appends(&self) -> Option<u64> {
+        #[cfg(feature = "metal")]
+        if let Some(p) = &self.paged {
+            return Some(p.batched_appends());
+        }
+        None
+    }
+
     /// Which arm this cache is.
     pub fn kind(&self) -> CtxKv {
         #[cfg(feature = "metal")]
@@ -714,6 +737,55 @@ impl CtxCache {
             None => v.clone(),
             Some(prev) => Tensor::cat(&[prev, v], 2)?.contiguous()?,
         });
+        Ok(())
+    }
+
+    /// [`Self::append`] for B rows at once: `k`/`v` are `[1, H_kv, Σlens, D]`,
+    /// row `r`'s `lens[r]` positions laid end to end in `caches`' order. When
+    /// every row is a slot of ONE shared paged pool the rows' keys land in one
+    /// scatter per pool through one slot list (`DSparkCtxPool::append_rows`);
+    /// otherwise each row appends its own slice — the same append it takes
+    /// alone.
+    fn append_rows(
+        caches: &mut [&mut CtxCache],
+        lens: &[usize],
+        k: &Tensor,
+        v: &Tensor,
+    ) -> Result<()> {
+        if caches.len() != lens.len() {
+            lloom_tensor::bail!(
+                "DSpark append_rows: {} caches and {} lengths",
+                caches.len(),
+                lens.len()
+            );
+        }
+        #[cfg(feature = "metal")]
+        {
+            let shared = match caches.first().and_then(|c| c.paged.as_ref()) {
+                Some(first) if first.shared() => caches
+                    .iter()
+                    .all(|c| c.paged.as_ref().map(|p| p.same_pool(first)).unwrap_or(false)),
+                _ => false,
+            };
+            if shared {
+                let seqs: Vec<usize> = caches
+                    .iter()
+                    .map(|c| c.paged.as_ref().expect("checked above").seq())
+                    .collect();
+                let first = caches[0].paged.as_ref().expect("checked above");
+                return first.append_rows(&seqs, lens, k, v);
+            }
+        }
+        let mut off = 0usize;
+        for (c, &n) in caches.iter_mut().zip(lens) {
+            if n > 0 {
+                c.append(
+                    &k.narrow(2, off, n)?.contiguous()?,
+                    &v.narrow(2, off, n)?.contiguous()?,
+                )?;
+            }
+            off += n;
+        }
         Ok(())
     }
 
@@ -848,7 +920,7 @@ mod paged_ctx {
         block_all: Option<Tensor>,
     }
 
-    /// The slot tensors one sequence's layers share within a round.
+    /// The slot tensor one sequence's layers share within a round.
     ///
     /// Every layer appends the same positions of the same sequence, and the
     /// layers' pools follow the same allocation history, so the slot vectors
@@ -856,13 +928,12 @@ mod paged_ctx {
     /// than once per layer is what keeps the host side of an append at one
     /// small buffer per round. **Shared by value, not by assumption**: a layer
     /// reuses the tensor only when the vector it computed is equal to the one
-    /// uploaded, and uploads its own otherwise.
+    /// uploaded, and uploads its own otherwise. The block slots need no upload
+    /// at all: they are written in place into the layer's `block_all`.
     #[derive(Default)]
     struct SeqSlots {
         slots: Vec<u32>,
         slots_t: Option<Tensor>,
-        block: Vec<u32>,
-        block_t: Option<Tensor>,
     }
 
     /// Every layer's pool, one clock. Behind a `Mutex` because the forward
@@ -883,6 +954,12 @@ mod paged_ctx {
         layers: Vec<LayerPool>,
         /// Per sequence, the slot tensors the layers share (see `SeqSlots`).
         shared: Vec<SeqSlots>,
+        /// The batched append's flat slot list (`append_rows`), shared by the
+        /// layers the same way.
+        rows: (Vec<u32>, Option<Tensor>),
+        /// Batched appends taken (`append_rows` calls, one per layer per
+        /// round), for a gate that asserts the one-scatter arm ran.
+        batched_appends: u64,
     }
 
     impl DSparkCtxPool {
@@ -913,6 +990,8 @@ mod paged_ctx {
                 clock,
                 layers,
                 shared: (0..n_seqs.max(1)).map(|_| SeqSlots::default()).collect(),
+                rows: (Vec::new(), None),
+                batched_appends: 0,
             }
         }
 
@@ -999,7 +1078,6 @@ mod paged_ctx {
             let block: Vec<u32> = (start + n..start + n + reserve)
                 .map(|t| Self::slot(&pages, t, page_size))
                 .collect();
-            let block_vec = block.clone();
             let tokens = lp.pool.pool_pages() * page_size;
             if lp.kv.is_none() {
                 let shape = (1, n_kv_heads, tokens, head_dim);
@@ -1010,59 +1088,149 @@ mod paged_ctx {
             }
             let (pk, pv) = lp.kv.as_ref().expect("allocated above");
             let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
-            let block_max = block.iter().copied().max().unwrap_or(0) as usize;
             let sh = &mut self.shared[seq];
             let mut pass = (std::mem::take(&mut sh.slots), sh.slots_t.take());
             let slots = Self::upload(&mut pass, slots, k.device())?;
             (sh.slots, sh.slots_t) = pass;
-            let mut blk = (std::mem::take(&mut sh.block), sh.block_t.take());
-            let block = Self::upload(&mut blk, block, k.device())?;
-            (sh.block, sh.block_t) = blk;
             let k = k.contiguous()?;
             let v = v.contiguous()?;
             k.kv_scatter_into(pk, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
             v.kv_scatter_into(pv, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
             let device = k.device().clone();
-            self.set_block(layer, seq, block, block_max, &block_vec, &device)?;
+            self.set_block(layer, seq, &block, &device)?;
             Ok(())
         }
 
-        /// Record `(layer, seq)`'s block slots — the per-sequence tensor the
-        /// single-row view scatters through, and the same `reserve` entries
-        /// written in place into the layer's `block_all` for the batched
-        /// view. Written between rounds only (an append, a rollback, a key),
-        /// when no queued dispatch reads either — the previous draft's
-        /// scatter completed with the verify that consumed it.
+        /// [`Self::append`] for `seqs` at once: `k`/`v` are `[1, H_kv, Σlens,
+        /// D]`, row `r`'s `lens[r]` positions laid end to end in `seqs`'s
+        /// order. Every row's context grows by its own count with `append`'s
+        /// bookkeeping; the rows' slots go up as ONE list (shared by the
+        /// layers, as a row's are) and the keys land in one scatter per pool.
+        fn append_rows(
+            &mut self,
+            layer: usize,
+            seqs: &[usize],
+            lens: &[usize],
+            k: &Tensor,
+            v: &Tensor,
+        ) -> Result<()> {
+            let (b, n_kv_heads, t, head_dim) = k.dims4()?;
+            if b != 1 || seqs.len() != lens.len() || lens.iter().sum::<usize>() != t {
+                lloom_tensor::bail!(
+                    "DSpark paged ctx: a batched append of [{b}, _, {t}, _] for {} rows of \
+                     {lens:?} positions",
+                    seqs.len()
+                );
+            }
+            let page_size = self.page_size;
+            let reserve = self.reserve;
+            let completed = self.clock.completed_count();
+            {
+                let lp = &mut self.layers[layer];
+                let ready = lp.quarantine.drain_completed(completed);
+                lp.pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
+            }
+            let mut slots: Vec<u32> = Vec::with_capacity(t);
+            let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
+            for (&seq, &n) in seqs.iter().zip(lens) {
+                loop {
+                    let lp = &mut self.layers[layer];
+                    match lp.pool.reserve(seq, n + reserve) {
+                        Ok(_) => break,
+                        Err(PageError::Exhausted { .. }) => self.grow(layer)?,
+                        Err(e) => return Err(lloom_tensor::Error::wrap(e)),
+                    }
+                }
+                let lp = &mut self.layers[layer];
+                let start = lp.pool.seq(seq).map(|s| s.len()).unwrap_or(0);
+                lp.pool.append(seq, n).map_err(lloom_tensor::Error::wrap)?;
+                let pages = lp
+                    .pool
+                    .seq(seq)
+                    .expect("seq within n_seqs")
+                    .pages()
+                    .to_vec();
+                slots.extend((start..start + n).map(|t| Self::slot(&pages, t, page_size)));
+                blocks.push(
+                    (start + n..start + n + reserve)
+                        .map(|t| Self::slot(&pages, t, page_size))
+                        .collect(),
+                );
+            }
+            let lp = &mut self.layers[layer];
+            let tokens = lp.pool.pool_pages() * page_size;
+            if lp.kv.is_none() {
+                let shape = (1, n_kv_heads, tokens, head_dim);
+                lp.kv = Some((
+                    Tensor::zeros(shape, k.dtype(), k.device())?,
+                    Tensor::zeros(shape, v.dtype(), v.device())?,
+                ));
+            }
+            let (pk, pv) = lp.kv.as_ref().expect("allocated above");
+            let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
+            let mut pass = (std::mem::take(&mut self.rows.0), self.rows.1.take());
+            let slots_t = Self::upload(&mut pass, slots, k.device())?;
+            self.rows = pass;
+            let k = k.contiguous()?;
+            let v = v.contiguous()?;
+            k.kv_scatter_into(pk, &slots_t, max_slot, 0, tokens * head_dim, head_dim)?;
+            v.kv_scatter_into(pv, &slots_t, max_slot, 0, tokens * head_dim, head_dim)?;
+            let device = k.device().clone();
+            for (&seq, block) in seqs.iter().zip(&blocks) {
+                self.set_block(layer, seq, block, &device)?;
+            }
+            self.batched_appends += 1;
+            Ok(())
+        }
+
+        /// Record `(layer, seq)`'s block slots: the `reserve` entries written
+        /// in place into the layer's `block_all`, whose row `seq` is then the
+        /// per-sequence tensor the single-row view scatters through (a view,
+        /// no upload) and whose active rows the batched view takes. Written
+        /// between rounds only (an append, a rollback, a key), when no queued
+        /// dispatch reads it — the previous draft's scatter completed with
+        /// the verify that consumed it.
         fn set_block(
             &mut self,
             layer: usize,
             seq: usize,
-            block: Tensor,
-            block_max: usize,
             slots: &[u32],
             device: &Device,
         ) -> Result<()> {
             let (n_seqs, reserve) = (self.n_seqs, self.reserve);
-            let lp = &mut self.layers[layer];
-            lp.block[seq] = Some((block, block_max));
             if slots.len() != reserve {
                 lloom_tensor::bail!(
                     "DSpark paged ctx: {} block slots for a reserve of {reserve}",
                     slots.len()
                 );
             }
+            let block_max = slots.iter().copied().max().unwrap_or(0) as usize;
+            let lp = &mut self.layers[layer];
             if lp.block_all.is_none() {
                 // An upload, not `zeros`: a pooled fill blit may still be
                 // queued when the first mapped write lands.
                 let zeros = vec![0u32; n_seqs * reserve];
                 lp.block_all = Some(Tensor::new(zeros.as_slice(), device)?);
             }
-            let all = lp.block_all.as_ref().expect("set above");
-            // SAFETY: between rounds; see above.
-            if !unsafe { all.write_host_slice::<u32>(seq * reserve, slots) } {
-                // Unmapped (CPU): the batched view rebuilds from `block`.
-                lp.block_all = None;
-            }
+            let mapped = {
+                let all = lp.block_all.as_ref().expect("set above");
+                // SAFETY: between rounds; see above.
+                if unsafe { all.write_host_slice::<u32>(seq * reserve, slots) } {
+                    Some(all.narrow(0, seq * reserve, reserve)?)
+                } else {
+                    None
+                }
+            };
+            let block = match mapped {
+                Some(view) => view,
+                None => {
+                    // Unmapped (CPU): a per-sequence upload; the batched view
+                    // rebuilds from `block`.
+                    lp.block_all = None;
+                    Tensor::new(slots, device)?
+                }
+            };
+            lp.block[seq] = Some((block, block_max));
             Ok(())
         }
 
@@ -1109,13 +1277,7 @@ mod paged_ctx {
                     Tensor::zeros(shape, dtype, device)?,
                 ));
             }
-            let block_max = block.iter().copied().max().unwrap_or(0) as usize;
-            let block_vec = block.clone();
-            let sh = &mut self.shared[seq];
-            let mut blk = (std::mem::take(&mut sh.block), sh.block_t.take());
-            let block = Self::upload(&mut blk, block, device)?;
-            (sh.block, sh.block_t) = blk;
-            self.set_block(layer, seq, block, block_max, &block_vec, device)?;
+            self.set_block(layer, seq, &block, device)?;
             Ok(())
         }
 
@@ -1296,13 +1458,7 @@ mod paged_ctx {
                 let slots: Vec<u32> = (to..to + reserve)
                     .map(|t| Self::slot(&pages, t, page_size))
                     .collect();
-                let max = slots.iter().copied().max().unwrap_or(0) as usize;
-                let slots_vec = slots.clone();
-                let sh = &mut self.shared[seq];
-                let mut blk = (std::mem::take(&mut sh.block), sh.block_t.take());
-                let block = Self::upload(&mut blk, slots, &device)?;
-                (sh.block, sh.block_t) = blk;
-                self.set_block(layer, seq, block, max, &slots_vec, &device)?;
+                self.set_block(layer, seq, &slots, &device)?;
             }
             Ok(())
         }
@@ -1438,6 +1594,18 @@ mod paged_ctx {
             self.lock().append(self.layer, self.seq, k, v)
         }
 
+        /// [`Self::append`] for the rows `seqs` of this handle's pool set at
+        /// once (`DSparkCtxPool::append_rows`).
+        pub(super) fn append_rows(
+            &self,
+            seqs: &[usize],
+            lens: &[usize],
+            k: &Tensor,
+            v: &Tensor,
+        ) -> Result<()> {
+            self.lock().append_rows(self.layer, seqs, lens, k, v)
+        }
+
         pub(super) fn block_view(&self, k: &Tensor, v: &Tensor) -> Result<PagedView> {
             self.lock().block_view(self.layer, self.seq, k, v)
         }
@@ -1465,6 +1633,11 @@ mod paged_ctx {
 
         pub(super) fn rollback(&self, to: usize) -> Result<()> {
             self.lock().rollback(self.layer, self.seq, to)
+        }
+
+        /// Batched appends this handle's pool set has taken.
+        pub(super) fn batched_appends(&self) -> u64 {
+            self.lock().batched_appends
         }
 
         pub(super) fn reset(&self) {
@@ -1637,6 +1810,37 @@ impl DSparkAttention {
         let k = self.norm_heads(&k, &self.k_norm, b, seq, self.num_kv_heads)?;
         let k = rotary.apply(&k, offset)?;
         cache.append(&k, &v)
+    }
+
+    /// [`Self::update_ctx`] for B rows in one pass: `fused` is `[1, Σlens,
+    /// hidden]`, row `r`'s `lens[r]` positions laid end to end; `cos`/`sin`
+    /// are the table rows of every position (`[Σlens, D/2]`, each at its own
+    /// row's context offset); `caches[r]` is row `r`'s cache for this layer.
+    /// One `k_proj`/`v_proj`, one norm and one RoPE at `m = Σlens`, then
+    /// [`CtxCache::append_rows`].
+    fn update_ctx_rows(
+        &self,
+        fused: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        rotary: &DSparkRotary,
+        lens: &[usize],
+        caches: &mut [&mut CtxCache],
+    ) -> Result<()> {
+        let (b, t, _) = fused.dims3()?;
+        let k = self
+            .k_proj
+            .forward(fused)?
+            .reshape((b, t, self.num_kv_heads, self.head_dim))?;
+        let v = self
+            .v_proj
+            .forward(fused)?
+            .reshape((b, t, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        let k = self.norm_heads(&k, &self.k_norm, b, t, self.num_kv_heads)?;
+        let k = rotary.apply_with(&k, cos, sin)?;
+        CtxCache::append_rows(caches, lens, &k, &v)
     }
 
     /// Per-head RMS norm on `[b, seq, heads, head_dim]`, returning
@@ -2272,6 +2476,77 @@ impl DSparkDrafter {
         Ok(())
     }
 
+    /// [`Self::update_context`] for B rows in ONE pass: `taps[r]` is row
+    /// `r`'s tapped residuals (`n_tap` tensors of `[1, n_r, hidden]`),
+    /// `offsets[r]` the context position its rows key at, `caches[r]` its
+    /// per-layer context caches. The rows' taps are laid end to end as one
+    /// `[1, Σn_r, ·]` sequence: one projection, then per layer one
+    /// `k_proj`/`v_proj`, one norm, one RoPE at every position's own offset
+    /// (`DSparkRotary::at_positions`) and one scatter per pool when the rows
+    /// share one (`CtxCache::append_rows`). Per row this is `update_context`'s
+    /// arithmetic at `m = Σn_r` instead of `m = n_r` — bit-identical on the
+    /// GEMM tile set (`n_r ≥ 2`); a one-position row keys through the GEMM
+    /// where alone it took the GEMV route, the §10.4 tier-2 seam, which moves
+    /// the drafter's context by a reordering and never the verified stream.
+    pub fn update_context_rows(
+        &self,
+        taps: &[&[Tensor]],
+        offsets: &[usize],
+        caches: &mut [&mut [CtxCache]],
+    ) -> Result<()> {
+        let b = taps.len();
+        if offsets.len() != b || caches.len() != b {
+            lloom_tensor::bail!(
+                "DSpark update_context_rows: {b} rows of taps, {} offsets, {} cache sets",
+                offsets.len(),
+                caches.len()
+            );
+        }
+        let n_tap = self.projection.n_tap();
+        let mut lens = Vec::with_capacity(b);
+        for (r, t) in taps.iter().enumerate() {
+            if t.len() != n_tap {
+                lloom_tensor::bail!(
+                    "DSpark update_context_rows: row {r} has {} taps, the projection consumes \
+                     {n_tap}",
+                    t.len()
+                );
+            }
+            if caches[r].len() != self.layers.len() {
+                lloom_tensor::bail!(
+                    "DSpark drafter has {} layers and row {r} has {} context caches",
+                    self.layers.len(),
+                    caches[r].len()
+                );
+            }
+            let (_, n, _) = t[0].dims3()?;
+            if n == 0 {
+                lloom_tensor::bail!("DSpark update_context_rows: row {r} has no positions");
+            }
+            lens.push(n);
+        }
+        let cat_taps: Vec<Tensor> = (0..n_tap)
+            .map(|i| {
+                let parts: Vec<&Tensor> = taps.iter().map(|t| &t[i]).collect();
+                Tensor::cat(&parts, 1)
+            })
+            .collect::<Result<_>>()?;
+        let fused = self.projection.forward(&cat_taps)?.to_dtype(self.dtype)?;
+        let mut positions: Vec<u32> = Vec::with_capacity(lens.iter().sum());
+        for (&off, &n) in offsets.iter().zip(&lens) {
+            positions.extend((off..off + n).map(|p| p as u32));
+        }
+        let (cos, sin) = self.rotary.at_positions(&positions)?;
+        for (l, layer) in self.layers.iter().enumerate() {
+            let mut row_caches: Vec<&mut CtxCache> =
+                caches.iter_mut().map(|c| &mut c[l]).collect();
+            layer
+                .self_attn
+                .update_ctx_rows(&fused, &cos, &sin, &self.rotary, &lens, &mut row_caches)?;
+        }
+        Ok(())
+    }
+
     /// The dtype the backbone computes in — the checkpoint's, BF16 here.
     ///
     /// Exposed because a caller embedding the draft block with the *target's*
@@ -2661,6 +2936,9 @@ pub struct DSparkSpeculator {
     /// Drafts taken batched (`draft` over more than one row), for a gate that
     /// asserts the batched arm ran.
     batched_drafts: u64,
+    /// Context re-keys taken batched (`observe_rows` over more than one
+    /// row), the same gate's other half.
+    batched_observes: u64,
 }
 
 impl DSparkSpeculator {
@@ -2732,12 +3010,27 @@ impl DSparkSpeculator {
             anchors,
             active_slot,
             batched_drafts: 0,
+            batched_observes: 0,
         })
     }
 
     /// Drafts taken over more than one row in one drafter pass.
     pub fn batched_drafts(&self) -> u64 {
         self.batched_drafts
+    }
+
+    /// Context re-keys taken over more than one row in one pass.
+    pub fn batched_observes(&self) -> u64 {
+        self.batched_observes
+    }
+
+    /// One-scatter appends the drafter's shared paged pool has taken (per
+    /// layer per batched re-key); `None` off the shared paged arm.
+    pub fn batched_appends(&self) -> Option<u64> {
+        let CtxKv::Paged { shared: true, .. } = self.ctx_kv else {
+            return None;
+        };
+        self.seqs.first().and_then(|s| s.ctx.first()).and_then(|c| c.batched_appends())
     }
 
     /// The context KV arm this proposer runs on.
@@ -3042,6 +3335,50 @@ impl Speculator for DSparkSpeculator {
         if let Some(&t) = accepted.last() {
             s.last = t;
         }
+        Ok(())
+    }
+
+    fn observe_rows(
+        &mut self,
+        rows: &[crate::nn::speculator::ObserveRow<'_, Self::Probe>],
+    ) -> Result<()> {
+        // One row is the one-row re-key, byte for byte; more than one is ONE
+        // pass over every row's accepted taps (`update_context_rows`): the
+        // projection and each layer's K/V once for the batch, the keys in one
+        // scatter per pool — where a call per row was B serial passes, the
+        // round's term after the batched draft (§12.10).
+        if rows.len() < 2 {
+            for (seq, probe, accepted) in rows {
+                self.observe(*seq, probe, accepted)?;
+            }
+            return Ok(());
+        }
+        let drafter = &self.drafter;
+        let mut taken: Vec<Option<&mut PerSeq>> = self.seqs.iter_mut().map(Some).collect();
+        let mut picked: Vec<&mut PerSeq> = Vec::with_capacity(rows.len());
+        for (seq, _, _) in rows {
+            match taken.get_mut(seq.0).and_then(|s| s.take()) {
+                Some(s) => picked.push(s),
+                None => lloom_tensor::bail!(
+                    "DSpark: observe_rows on slot {} (no such slot, or one slot twice in a round)",
+                    seq.0
+                ),
+            }
+        }
+        let taps: Vec<&[Tensor]> = rows.iter().map(|(_, p, _)| p.as_slice()).collect();
+        let offsets: Vec<usize> = picked.iter().map(|s| s.ctx_offset).collect();
+        {
+            let mut caches: Vec<&mut [CtxCache]> =
+                picked.iter_mut().map(|s| s.ctx.as_mut_slice()).collect();
+            drafter.update_context_rows(&taps, &offsets, &mut caches)?;
+        }
+        for (s, (_, _, accepted)) in picked.iter_mut().zip(rows) {
+            s.ctx_offset = s.ctx.first().map(|c| c.len()).unwrap_or(s.ctx_offset);
+            if let Some(&t) = accepted.last() {
+                s.last = t;
+            }
+        }
+        self.batched_observes += 1;
         Ok(())
     }
 }

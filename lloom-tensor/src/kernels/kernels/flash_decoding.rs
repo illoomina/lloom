@@ -559,9 +559,11 @@ pub fn call_flash_decoding(
 /// Dispatch the KV write: `src`'s rows to `dst` at the token slots `slots`
 /// names, one thread per element.
 ///
-/// `slots` holds `n_rows` `u32` entries and `scatter_params` a
-/// [`FlashScatterParams`] built by [`FlashScatterParams::for_write`]. Both are
-/// caller-owned buffers for the same reason the attention params are (§3.7c).
+/// `slots` holds `n_rows` `u32` entries from byte `slots_offset` (a view of a
+/// larger slot table binds at its offset, as the source and destination do)
+/// and `scatter_params` a [`FlashScatterParams`] built by
+/// [`FlashScatterParams::for_write`]. Both are caller-owned buffers for the
+/// same reason the attention params are (§3.7c).
 #[allow(clippy::too_many_arguments)]
 pub fn call_flash_kv_scatter(
     device: &Device,
@@ -572,6 +574,7 @@ pub fn call_flash_kv_scatter(
     dst_offset: usize,
     dst: &Buffer,
     slots: &Buffer,
+    slots_offset: usize,
     scatter_params: &Buffer,
     n_rows: usize,
     n_kv_heads: usize,
@@ -592,7 +595,7 @@ pub fn call_flash_kv_scatter(
         (
             (src, src_offset),
             Output::with_offset(dst, dst_offset),
-            slots,
+            (slots, slots_offset),
             scatter_params
         )
     );

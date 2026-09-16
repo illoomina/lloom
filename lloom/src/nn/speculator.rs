@@ -267,6 +267,11 @@ impl Draft {
     }
 }
 
+/// One verified row of a round, as [`Speculator::observe_rows`] takes it:
+/// the sequence, what the target's forward extracted for it, and the tokens
+/// the target kept.
+pub type ObserveRow<'a, P> = (SeqId, &'a <P as TargetProbe>::Output, &'a [u32]);
+
 /// A speculative proposer: one target, one drafter family.
 ///
 /// Constructed for a fixed number of sequences (server slots); per-seq state
@@ -322,6 +327,18 @@ pub trait Speculator {
         probe: &<Self::Probe as TargetProbe>::Output,
         accepted: &[u32],
     ) -> Result<()>;
+
+    /// [`Self::observe`] for every live row of a round at once: `rows[i]` is
+    /// `(seq, probe, accepted)`, the round's B verified rows. The default is
+    /// the per-row call in order; a family whose state update batches
+    /// (DSpark's context re-key: one projection and one K/V pass per layer
+    /// for the B rows' accepted taps) overrides it.
+    fn observe_rows(&mut self, rows: &[ObserveRow<'_, Self::Probe>]) -> Result<()> {
+        for (seq, probe, accepted) in rows {
+            self.observe(*seq, probe, accepted)?;
+        }
+        Ok(())
+    }
 }
 
 /// A borrowed proposer is a proposer: a driver that owns its `S` can be
@@ -353,6 +370,9 @@ impl<T: Speculator> Speculator for &mut T {
         accepted: &[u32],
     ) -> Result<()> {
         T::observe(self, seq, probe, accepted)
+    }
+    fn observe_rows(&mut self, rows: &[ObserveRow<'_, Self::Probe>]) -> Result<()> {
+        T::observe_rows(self, rows)
     }
 }
 

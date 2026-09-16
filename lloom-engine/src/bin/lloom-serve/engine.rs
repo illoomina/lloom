@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use hf_chat_template::ChatTemplate;
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::lfm2::{
-    AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, MemoryBudget, Model,
+    AttnImpl, BatchPool, Cache, Config, ConvState, KvAppend, Lfm2Config, MemoryBudget, Model,
 };
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, Sequence, Session, VarBuilder};
@@ -93,6 +93,11 @@ pub struct Engine {
     pub prefill_chunk: usize,
     pub memory_fraction: f64,
     pub mem_sample: bool,
+    /// How the rows of a batched step hold their state (`--rows`).
+    pub rows: RowsArm,
+    /// The rows' shared pool on the `pool` arms (`batched-decode-design.md`
+    /// §12.2); `None` on `private` and at `--batch 1`.
+    pub pool: Option<BatchPool>,
     single: Mutex<Single>,
     sched: Option<BatchHandle<Model, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -120,6 +125,54 @@ pub struct LoadOptions {
     /// peaks. A gauge run, not a timing run: the sampler perturbs TTFT
     /// (issue #728's `--mem-sample` finding).
     pub mem_sample: bool,
+    /// How a batched step's rows hold their state (`--rows`).
+    pub rows: RowsArm,
+}
+
+/// How the rows of `--batch N` hold their KV and conv state, and how a step
+/// reads them (`batched-decode-design.md` §12.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsArm {
+    /// Every row a slot of one `BatchPool` (`Paged × FlashDecoding ×
+    /// RotatingRing`); the attention and the conv of the whole batch in one
+    /// dispatch per kernel. The default at `--batch N`.
+    Pool,
+    /// The same pool, the per-row loop over it — the A/B arm, one dispatch
+    /// per row per kernel, the same arithmetic.
+    PoolPerRow,
+    /// A private crown cache per row (`Sdpa × InPlace × Shuffle`), the
+    /// per-row loop — #742's arm.
+    Private,
+}
+
+impl RowsArm {
+    pub fn parse(s: &str, batched: bool, dspark: bool) -> Result<Self> {
+        Ok(match s {
+            "auto" => {
+                if batched && !dspark {
+                    Self::Pool
+                } else {
+                    Self::Private
+                }
+            }
+            "pool" => Self::Pool,
+            "pool-per-row" => Self::PoolPerRow,
+            "private" => Self::Private,
+            other => anyhow::bail!("--rows must be auto, pool, pool-per-row or private, got {other:?}"),
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pool => "pool",
+            Self::PoolPerRow => "pool-per-row",
+            Self::Private => "private",
+        }
+    }
+
+    fn pooled(self) -> bool {
+        matches!(self, Self::Pool | Self::PoolPerRow)
+    }
 }
 
 /// What one throughput cell measured, in the sidecar's units.
@@ -220,8 +273,18 @@ impl Engine {
             }
             None => None,
         };
+        let pooled = opts.batch > 1 && opts.rows.pooled();
         match &dcfg {
-            Some(dcfg) => rewindable_config(&mut config, dcfg),
+            Some(dcfg) => {
+                if pooled {
+                    anyhow::bail!(
+                        "--rows pool is the K=1 batched loop's; `--dspark --batch N` runs the \
+                         static pipelined driver on private rewindable caches (--rows private)"
+                    );
+                }
+                rewindable_config(&mut config, dcfg)
+            }
+            None if pooled => pool_config(&mut config),
             None => crown_config(&mut config),
         }
         // A prefill fed in more than one forward — a tile, a chunk — needs
@@ -327,6 +390,8 @@ impl Engine {
             prefill_chunk: opts.prefill_chunk,
             memory_fraction: opts.memory_fraction,
             mem_sample: opts.mem_sample,
+            rows: if opts.batch > 1 { opts.rows } else { RowsArm::Private },
+            pool: None,
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -404,10 +469,25 @@ impl Engine {
             return Ok(engine);
         }
 
-        // `--batch N`: the pool and the scheduler thread.
+        // `--batch N`: the pool and the scheduler thread. On the `pool` arms
+        // every row is a slot of one `BatchPool` (§12.2); on `private` a
+        // crown cache of its own.
         let mut caches = Vec::with_capacity(opts.batch);
-        for _ in 0..opts.batch {
-            caches.push(make_cache(&core.device)?);
+        if pooled {
+            let pool = BatchPool::new(&config, &core.device, opts.batch, opts.kv_capacity)
+                .context("allocating the rows' shared pool")?;
+            pool.set_batched_arms(opts.rows == RowsArm::Pool);
+            for _ in 0..opts.batch {
+                caches.push(
+                    Cache::for_batch(true, dtype, &config, &core.device, &pool)
+                        .context("leasing a row's slot")?,
+                );
+            }
+            engine.pool = Some(pool);
+        } else {
+            for _ in 0..opts.batch {
+                caches.push(make_cache(&core.device)?);
+            }
         }
         let pool = SlotPool::new(opts.batch, || caches.pop().expect("one cache per slot"));
         let extra: Extra = if dcfg.is_some() {
@@ -1436,6 +1516,18 @@ fn proc_footprint() -> Option<(u64, u64)> {
 /// token-identical to the generic path (§13.5, §12.2d, §12.2h). The library's
 /// `Config` ships the conservative arms (§7.1a); a serving binary turns the
 /// measured ones on.
+/// The rows' shared-pool configuration (`--rows pool`, `batched-decode-design.md`
+/// §12.2): the paged pool the slot-indexed kernels read, the in-place ring
+/// they write, the crown's fused epilogues.
+fn pool_config(config: &mut Config) {
+    config.attn_impl = AttnImpl::FlashDecoding;
+    config.kv_append = KvAppend::Paged;
+    config.conv_state = ConvState::RotatingRing { k: 1 };
+    config.gemv_silu = true;
+    config.gemv_residual = true;
+    config.conv_fused = true;
+}
+
 fn crown_config(config: &mut Config) {
     config.attn_impl = AttnImpl::Sdpa;
     config.kv_append = KvAppend::InPlace;

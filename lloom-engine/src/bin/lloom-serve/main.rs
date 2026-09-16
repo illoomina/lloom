@@ -163,6 +163,13 @@ struct Args {
     /// gauges once at any time.
     #[arg(long)]
     mem_sample: bool,
+
+    /// How the rows of `--batch N` hold their state: `pool` (one shared
+    /// paged pool, the attention and conv of the batch in one dispatch per
+    /// kernel — the default at `N > 1`), `pool-per-row` (the same pool, the
+    /// per-row loop: the A/B arm), `private` (a crown cache per row).
+    #[arg(long, default_value = "auto")]
+    rows: String,
 }
 
 /// State shared by every request thread.
@@ -205,6 +212,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let rows = engine::RowsArm::parse(&args.rows, batched, args.dspark)?;
     let load_start = Instant::now();
     let engine = Engine::load(LoadOptions {
         model_dir: model_dir.clone(),
@@ -221,11 +229,12 @@ fn main() -> Result<()> {
         prefill_chunk,
         memory_fraction: args.memory_fraction,
         mem_sample: args.mem_sample,
+        rows,
     })?;
     let model_name = engine.model_name.clone();
     eprintln!(
         "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} batch={} \
-         dspark={} prefill_tile={} prefill_chunk={} memory_fraction={} mem_sample={}]",
+         dspark={} prefill_tile={} prefill_chunk={} memory_fraction={} mem_sample={} rows={}]",
         model_name,
         model_dir.display(),
         load_start.elapsed().as_secs_f64(),
@@ -242,6 +251,7 @@ fn main() -> Result<()> {
         prefill_chunk,
         args.memory_fraction,
         args.mem_sample,
+        engine.rows.name(),
     );
     eprintln!(
         "[{}]",
@@ -293,6 +303,20 @@ fn main() -> Result<()> {
                         "prefill_chunk": shared.engine.prefill_chunk,
                         "memory_fraction": shared.engine.memory_fraction,
                         "kv_capacity": shared.engine.kv_capacity,
+                        "rows": shared.engine.rows.name(),
+                        "pool": shared.engine.pool.as_ref().map(|p| {
+                            let r = p.report();
+                            json!({
+                                "slots": r.slots,
+                                "slots_free": r.slots_free,
+                                "pages_in_use": r.pages_in_use,
+                                "pages_free": r.pages_free,
+                                "kv_bytes": r.kv_bytes,
+                                "conv_bytes": r.conv_bytes,
+                                "batched_arms": p.batched_arms(),
+                                "shared_calls": p.shared_calls(),
+                            })
+                        }),
                     }),
                 );
             }

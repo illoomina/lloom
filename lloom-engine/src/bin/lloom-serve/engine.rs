@@ -98,6 +98,8 @@ pub struct Engine {
     /// The rows' shared pool on the `pool` arms (`batched-decode-design.md`
     /// §12.2); `None` on `private` and at `--batch 1`.
     pub pool: Option<BatchPool>,
+    /// `--share-prefix`.
+    pub share_prefix: bool,
     single: Mutex<Single>,
     sched: Option<BatchHandle<Model, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -127,6 +129,9 @@ pub struct LoadOptions {
     pub mem_sample: bool,
     /// How a batched step's rows hold their state (`--rows`).
     pub rows: RowsArm,
+    /// Share a request's prefix from another row's cache by page (§12.3);
+    /// the `pool` arms only.
+    pub share_prefix: bool,
 }
 
 /// How the rows of `--batch N` hold their KV and conv state, and how a step
@@ -274,6 +279,9 @@ impl Engine {
             None => None,
         };
         let pooled = opts.batch > 1 && opts.rows.pooled();
+        if opts.share_prefix && !pooled {
+            anyhow::bail!("--share-prefix needs `--batch N --rows pool` (the rows share one pool)");
+        }
         match &dcfg {
             Some(dcfg) => {
                 if pooled {
@@ -392,6 +400,7 @@ impl Engine {
             mem_sample: opts.mem_sample,
             rows: if opts.batch > 1 { opts.rows } else { RowsArm::Private },
             pool: None,
+            share_prefix: opts.share_prefix && opts.batch > 1 && opts.rows.pooled(),
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -513,6 +522,7 @@ impl Engine {
             opts: batch_opts,
             max_rows: opts.batch,
             reuse_prefix: opts.reuse_prefix,
+            share_prefix: opts.share_prefix,
             mode,
             extra,
             on_counters: None,

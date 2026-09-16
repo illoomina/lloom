@@ -170,6 +170,14 @@ struct Args {
     /// per-row loop: the A/B arm), `private` (a crown cache per row).
     #[arg(long, default_value = "auto")]
     rows: String,
+
+    /// Share a request's prompt prefix from another row's cache, by page —
+    /// an idle slot's or a live row's; a request whose prefix a live row is
+    /// still feeding waits for it (`batched-decode-design.md` §12.3). The
+    /// `pool` arms only. Off by default: the benchmark cells feed one prompt
+    /// to every row and would otherwise measure the share.
+    #[arg(long)]
+    share_prefix: bool,
 }
 
 /// State shared by every request thread.
@@ -230,6 +238,7 @@ fn main() -> Result<()> {
         memory_fraction: args.memory_fraction,
         mem_sample: args.mem_sample,
         rows,
+        share_prefix: args.share_prefix,
     })?;
     let model_name = engine.model_name.clone();
     eprintln!(
@@ -304,6 +313,7 @@ fn main() -> Result<()> {
                         "memory_fraction": shared.engine.memory_fraction,
                         "kv_capacity": shared.engine.kv_capacity,
                         "rows": shared.engine.rows.name(),
+                        "share_prefix": shared.engine.share_prefix,
                         "pool": shared.engine.pool.as_ref().map(|p| {
                             let r = p.report();
                             json!({

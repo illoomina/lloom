@@ -2834,6 +2834,10 @@ impl crate::nn::model::CacheShare for Cache {
     fn share_prefix_from(&mut self, src: &Self, n_tokens: usize) -> Result<usize> {
         Cache::share_prefix_from(self, src, n_tokens)
     }
+
+    fn share_granularity(&self) -> usize {
+        self.batch_pool().map(|p| p.page_size()).unwrap_or(0)
+    }
 }
 
 impl CacheReset for Cache {

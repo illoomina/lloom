@@ -39,8 +39,8 @@ use std::sync::Arc;
 
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::nn::{
-    BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CausalLM, DecodeOptions, DecodeOut,
-    DecodeStats, ReuseAction, RowId, Session,
+    BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, DecodeOptions,
+    DecodeOut, DecodeStats, ReuseAction, RowId, Session,
 };
 use lloom_tensor::{Device, Result};
 
@@ -201,6 +201,14 @@ type StaticRowMeta = (
     Arc<AtomicBool>,
 );
 
+/// Where a request's prefix is shared from: an idle slot of the pool or a
+/// live row of the decoder, and the tokens (whole pages) it can give.
+#[derive(Debug, Clone, Copy)]
+enum ShareSource {
+    Idle(usize, usize),
+    Live(RowId, usize),
+}
+
 struct InFlight {
     tx: Sender<BatchEvent>,
     cancel: Arc<AtomicBool>,
@@ -220,6 +228,8 @@ pub struct BatchCounters {
     pub max_live: usize,
     pub closed_jobs: u64,
     pub static_batches: u64,
+    /// Admissions deferred for a live row's prefix still being fed (§12.3).
+    pub share_waits: u64,
 }
 
 /// The scheduler: built and run on one thread ([`spawn`]).
@@ -231,6 +241,9 @@ pub struct BatchScheduler<'m, M: BatchedCausalLM, E> {
     opts: DecodeOptions,
     max_rows: usize,
     reuse_prefix: bool,
+    /// Share a request's prefix from another row's cache — an idle slot's or
+    /// a live row's — by page (`CacheShare`, §12.3). Implies `reuse_prefix`.
+    share_prefix: bool,
     mode: BatchMode<M, E>,
     extra: E,
     decoder: BatchDecoder<'m, M, Session<'m, M>>,
@@ -254,6 +267,8 @@ pub struct BatchConfig<M: CausalLM, E> {
     /// Reuse a routed sequence's cached prefix (`Session::prepare`); off, a
     /// request starts from a reset sequence.
     pub reuse_prefix: bool,
+    /// Share a request's prefix from another row's cache, by page (§12.3).
+    pub share_prefix: bool,
     pub mode: BatchMode<M, E>,
     pub extra: E,
     /// Called after every step with the counters (a log line).
@@ -263,7 +278,7 @@ pub struct BatchConfig<M: CausalLM, E> {
 impl<'m, M, E> BatchScheduler<'m, M, E>
 where
     M: BatchedCausalLM,
-    M::Cache: CacheReset + CacheRewind,
+    M::Cache: CacheReset + CacheRewind + CacheShare,
 {
     fn new(model: &'m M, cfg: BatchConfig<M, E>, rx: Receiver<Job<M, E>>) -> Result<Self> {
         if cfg.max_rows == 0 {
@@ -287,7 +302,8 @@ where
             rings: cfg.rings,
             opts: cfg.opts,
             max_rows: cfg.max_rows,
-            reuse_prefix: cfg.reuse_prefix,
+            reuse_prefix: cfg.reuse_prefix || cfg.share_prefix,
+            share_prefix: cfg.share_prefix,
             mode: cfg.mode,
             extra: cfg.extra,
             decoder,
@@ -371,7 +387,27 @@ where
         if !self.reuse_prefix {
             session.reset();
         }
-        let prepared = match session.prepare(&req.prompt_ids) {
+        // The share source, when the routed slot has nothing of its own: the
+        // idle slot or live row holding the longest common prefix, at least
+        // a page of it.
+        let source = if self.share_prefix {
+            self.share_source(&req.prompt_ids)
+        } else {
+            None
+        };
+        let prepared = match source {
+            Some(ShareSource::Idle(slot, lcp)) => {
+                let src = self.pool.sequence(slot).expect("an idle slot");
+                let log = &src.tokens()[..lcp];
+                session.prepare_shared(&req.prompt_ids, src.cache(), log)
+            }
+            Some(ShareSource::Live(id, lcp)) => {
+                let (fed, cache, _) = self.decoder.row_source(id).expect("a held row");
+                session.prepare_shared(&req.prompt_ids, cache, &fed[..lcp])
+            }
+            None => session.prepare(&req.prompt_ids),
+        };
+        let prepared = match prepared {
             Ok(p) => p,
             Err(e) => {
                 self.pool.release(routed.slot, session.into_sequence());
@@ -379,6 +415,95 @@ where
             }
         };
         Ok((routed.slot, session, prepared))
+    }
+
+    /// The share unit, from any sequence's cache (0: sharing is impossible).
+    fn share_page(&self) -> usize {
+        self.pool
+            .idle_sequences()
+            .next()
+            .map(|(_, s)| s.cache().share_granularity())
+            .or_else(|| {
+                self.decoder
+                    .row_ids()
+                    .into_iter()
+                    .find_map(|id| self.decoder.row_source(id).map(|(_, c, _)| c.share_granularity()))
+            })
+            .unwrap_or(0)
+    }
+
+    /// The best source for `prompt`'s prefix: the idle slot or live row whose
+    /// CACHED tokens share the longest prefix with it, if that is at least a
+    /// page (rounded down to whole pages, and to `prompt.len() - 1`).
+    fn share_source(&self, prompt: &[u32]) -> Option<ShareSource> {
+        let page = self.share_page();
+        if page == 0 || prompt.len() < 2 {
+            return None;
+        }
+        let cap = prompt.len() - 1;
+        let lcp_of = |log: &[u32]| -> usize {
+            let n = log.iter().zip(prompt.iter()).take_while(|(a, b)| a == b).count();
+            (n.min(cap) / page) * page
+        };
+        let mut best: Option<ShareSource> = None;
+        let mut best_n = 0usize;
+        for (slot, seq) in self.pool.idle_sequences() {
+            if !seq.tokens_known() {
+                continue;
+            }
+            let n = lcp_of(seq.tokens());
+            if n >= page && n > best_n {
+                best_n = n;
+                best = Some(ShareSource::Idle(slot, n));
+            }
+        }
+        for id in self.decoder.row_ids() {
+            let Some((fed, _, _)) = self.decoder.row_source(id) else { continue };
+            let n = lcp_of(fed);
+            if n >= page && n > best_n {
+                best_n = n;
+                best = Some(ShareSource::Live(id, n));
+            }
+        }
+        best
+    }
+
+    /// Whether `prompt` should WAIT for a live row still feeding a prompt it
+    /// shares more than a page with: the tokens the row has fed so far share
+    /// less than the two prompts do, and the row's prompt is not yet in — a
+    /// burst of requests on one long prefix then prefills it once (§12.3).
+    fn share_pending(&self, prompt: &[u32]) -> bool {
+        let page = self.share_page();
+        if page == 0 || prompt.len() < 2 {
+            return false;
+        }
+        let cap = prompt.len() - 1;
+        let pages_of = |log: &[u32]| -> usize {
+            let n = log.iter().zip(prompt.iter()).take_while(|(a, b)| a == b).count();
+            n.min(cap) / page
+        };
+        // What the idle slots already give: a live row must beat it to be
+        // worth waiting for.
+        let idle_best = self
+            .pool
+            .idle_sequences()
+            .filter(|(_, s)| s.tokens_known())
+            .map(|(_, s)| pages_of(s.tokens()))
+            .max()
+            .unwrap_or(0);
+        for id in self.decoder.row_ids() {
+            let Some((fed, _, complete)) = self.decoder.row_source(id) else { continue };
+            if complete {
+                continue;
+            }
+            let Some(full) = self.decoder.row_prompt(id) else { continue };
+            let could = pages_of(full);
+            let has = pages_of(fed);
+            if could > has && could > idle_best {
+                return true;
+            }
+        }
+        false
     }
 
     fn sampling_of(params: &DecodeParams) -> Sampling {
@@ -405,6 +530,15 @@ where
                     joined_beside: 0,
                 })));
                 continue;
+            }
+            // A request sharing more than a page with a live row's prompt
+            // that is still being fed waits for the pages to exist, rather
+            // than prefilling the same prefix beside it (§12.3). The queue
+            // holds behind it: a burst on one prefix is one prefill.
+            if self.share_prefix && self.share_pending(&req.prompt_ids) {
+                self.counters.share_waits += 1;
+                self.waiting.push_front((req, tx));
+                break;
             }
             let (slot, session, prepared) = match self.prepare(&req) {
                 Ok(p) => p,
@@ -674,7 +808,7 @@ pub fn spawn<S, M, E>(
 where
     S: Send + Sync + 'static,
     M: BatchedCausalLM + Sync + 'static,
-    M::Cache: CacheReset + CacheRewind + Send + 'static,
+    M::Cache: CacheReset + CacheRewind + CacheShare + Send + 'static,
     E: Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
@@ -737,6 +871,15 @@ mod tests {
     impl CacheReset for Pos {
         fn reset(&mut self) {
             self.0 = 0;
+        }
+    }
+
+    impl CacheShare for Pos {
+        fn share_prefix_from(&mut self, _src: &Self, _n: usize) -> lloom_tensor::Result<usize> {
+            Ok(0)
+        }
+        fn share_granularity(&self) -> usize {
+            0
         }
     }
 
@@ -857,6 +1000,7 @@ mod tests {
             },
             max_rows,
             reuse_prefix: false,
+            share_prefix: false,
             mode,
             extra: (),
             on_counters: None,

@@ -157,6 +157,10 @@ pub trait CacheShare {
     /// with this empty cache; returns the tokens shared (0 when none could
     /// be). The caller feeds the rest at that position.
     fn share_prefix_from(&mut self, src: &Self, n_tokens: usize) -> Result<usize>;
+
+    /// The unit a share is rounded down to (the page), in tokens; 0 when
+    /// this cache cannot share at all.
+    fn share_granularity(&self) -> usize;
 }
 
 /// A cache that can be returned to its pre-prefill state.

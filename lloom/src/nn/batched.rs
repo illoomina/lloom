@@ -29,7 +29,7 @@
 //! next forward is then fed the host ids, which is the `lookahead = 0` order
 //! whatever the option says. Mixed batches take the host arm for every row.
 
-use std::borrow::BorrowMut;
+use std::borrow::{Borrow, BorrowMut};
 
 use crate::generation::{HotThread, LogitsProcessor, Sampling};
 use crate::nn::decode::{
@@ -387,6 +387,36 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             .get(id.slot)
             .and_then(|s| s.as_ref())
             .filter(|s| s.generation == id.generation)
+    }
+
+    /// The rows this decoder holds (live, pending or finished-not-taken).
+    pub fn row_ids(&self) -> Vec<RowId> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                s.as_ref().map(|s| RowId {
+                    slot: i,
+                    generation: s.generation,
+                })
+            })
+            .collect()
+    }
+
+    /// What of row `id`'s prompt its cache holds so far — the prompt tokens
+    /// fed — with the cache and whether the whole prompt is in (a row still
+    /// prefilling has more to come). For a caller sharing a cached prefix
+    /// (`batched-decode-design.md` §12.3).
+    pub fn row_source(&self, id: RowId) -> Option<(&[u32], &M::Cache, bool)> {
+        let s = self.slot_of(id)?;
+        let session: &Session<'m, M> = Borrow::borrow(&s.session);
+        let fed = s.lane.prompt_off.min(s.prompt.len());
+        Some((&s.prompt[..fed], &session.seq.cache, fed == s.prompt.len()))
+    }
+
+    /// Row `id`'s whole prompt.
+    pub fn row_prompt(&self, id: RowId) -> Option<&[u32]> {
+        self.slot_of(id).map(|s| s.prompt.as_slice())
     }
 
     /// Whether `id` names a row this decoder still holds.

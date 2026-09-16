@@ -451,6 +451,14 @@ struct Args {
     #[arg(long)]
     batched: bool,
 
+    /// Under `--batched`: how the rows hold their state — `pool` (every row
+    /// a slot of one `BatchPool`, the attention and conv of the batch in one
+    /// dispatch per kernel: `Paged × FlashDecoding × RotatingRing`, forced),
+    /// `pool-per-row` (the same pool, the per-row loop) or `private` (a
+    /// cache per row on the `--cache` arm; the default).
+    #[arg(long, default_value = "private")]
+    rows: String,
+
     /// Under `--batched`: skip the neighbour-independence arm (the rows re-run
     /// as two separately batched halves, each row asserted equal to its
     /// full-batch stream). On by default; off for a timing-only rotation.
@@ -1515,6 +1523,14 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
     }
 
+    // `--rows pool*` forces the pool's arms BEFORE the model is built: the
+    // ring's permuted weight table and the flash read are the model's.
+    if matches!(args.rows.as_str(), "pool" | "pool-per-row") {
+        config.attn_impl = lloom::models::lfm2::AttnImpl::FlashDecoding;
+        config.kv_append = KvAppend::Paged;
+        config.conv_state = ConvState::RotatingRing { k: 1 };
+        config.conv_fused = true;
+    }
     let model = Model::new(&config, vb).context("constructing LFM2")?;
     // The three GEMV epilogue arms as the model RAN them — under `derived`
     // the plan's, read off the report, not the flags the caller passed — so
@@ -1543,6 +1559,23 @@ fn main() -> Result<()> {
     // The ceiling is the model's positional ceiling unless the user lowered
     // it; the slab starts at one bucket and grows toward it (`Cache::new_with`).
     let kv_capacity = args.kv_capacity.unwrap_or(config.max_position_embeddings);
+    // `--rows pool*` (`batched-decode-design.md` §12.2): the rows' shared
+    // pool, sized for the concurrent harness's sequences and its solo and
+    // identity sessions. Forces the pool's arms before the model is built.
+    let pool = match args.rows.as_str() {
+        "private" => None,
+        "pool" | "pool-per-row" => {
+            let p = lloom::models::lfm2::BatchPool::new(
+                &config,
+                &device,
+                args.sequences.max(1) + 3,
+                kv_capacity,
+            )?;
+            p.set_batched_arms(args.rows == "pool");
+            Some(p)
+        }
+        other => anyhow::bail!("--rows must be pool, pool-per-row or private, got {other:?}"),
+    };
     let mut cache = Cache::new_with(true, dtype, &config, &device, kv_capacity)
         .context("allocating KV cache")?
         .with_kv_bucket(args.kv_bucket)
@@ -1668,6 +1701,7 @@ fn main() -> Result<()> {
             long_prompt_tokens: args.long_prompt_tokens,
             dspark: args.dspark,
             batched: args.batched,
+            pool: pool.as_ref(),
             check_independence: !args.no_independence_check,
             skip_solo: args.skip_solo,
             dspark_setup: dspark_setup

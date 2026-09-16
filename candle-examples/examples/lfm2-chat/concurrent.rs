@@ -28,7 +28,7 @@ use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
 };
-use lloom::models::lfm2::{Cache, Config, Model};
+use lloom::models::lfm2::{BatchPool, Cache, Config, Model};
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, PrefillOut, ReuseAction, Session};
 use std::collections::HashMap;
@@ -124,6 +124,9 @@ pub struct Ctx<'a> {
     /// `--batched` — drive the concurrent sequences through the batched-forward
     /// driver (`Session::decode_batched`, #694): one `m = B` forward per step.
     pub batched: bool,
+    /// Under `--rows pool|pool-per-row`: the pool every sequence's cache is
+    /// a slot of (`batched-decode-design.md` §12.2).
+    pub pool: Option<&'a BatchPool>,
     /// Under `--batched`: also run the rows in two separately batched halves
     /// and assert each row's stream equals its full-batch stream — the
     /// neighbour-independence check no digest sees.
@@ -379,6 +382,19 @@ impl LiveStats {
 }
 
 /// Entry point from `main` once `mode != "single"`.
+/// A sequence's cache: a slot of the pool under `--rows pool*`, else its own.
+fn new_cache(
+    pool: Option<&BatchPool>,
+    dtype: DType,
+    config: &Config,
+    device: &Device,
+) -> Result<Cache> {
+    Ok(match pool {
+        Some(p) => Cache::for_batch(true, dtype, config, device, p)?,
+        None => Cache::new(true, dtype, config, device)?,
+    })
+}
+
 pub fn run(ctx: Ctx<'_>) -> Result<()> {
     let budget = CommitBudget::from_str(ctx.commit_budget).map_err(anyhow::Error::msg)?;
     let lookahead = if ctx.readback == "blocking" {
@@ -446,7 +462,7 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
 fn run_reuse(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: &str) -> Result<()> {
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
     let turn1 = (ctx.encode)(&user_turn_text(TURN_1))?;
-    let mut session = Session::new(model, Cache::new(true, dtype, config, device)?);
+    let mut session = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
     let mut arm = Arm::new(ctx.readback, ctx.eos_ids, device, capacity)?;
     let t1 = decode(&mut session, &mut arm, &turn1, opts)?;
     let reply1 = t1.out.ids.clone();
@@ -473,7 +489,7 @@ fn run_reuse(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: &str)
     let t2 = decode(&mut session, &mut arm, &prepared.suffix, opts)?;
     let reply2_reuse = t2.out.ids.clone();
 
-    let mut fresh = Session::new(model, Cache::new(true, dtype, config, device)?);
+    let mut fresh = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
     let mut arm_f = Arm::new(ctx.readback, ctx.eos_ids, device, capacity)?;
     let tf = decode(&mut fresh, &mut arm_f, &full2, opts)?;
     let reply2_fresh = tf.out.ids.clone();
@@ -547,7 +563,7 @@ fn run_concurrent(
     let mut solo_wall = 0f64;
     let mut solo_rates = Vec::with_capacity(n);
     for p in &prompts {
-        let mut s = Session::new(model, Cache::new(true, dtype, config, device)?);
+        let mut s = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
         let mut arm = Arm::new(ctx.readback, ctx.eos_ids, device, capacity)?;
         let t = decode(&mut s, &mut arm, p, opts)?;
         solo_wall += t.wall.as_secs_f64();
@@ -567,7 +583,7 @@ fn run_concurrent(
         .map(|_| {
             Ok(Session::new(
                 model,
-                Cache::new(true, dtype, config, device)?,
+                new_cache(ctx.pool, dtype, config, device)?,
             ))
         })
         .collect::<Result<_>>()?;
@@ -821,7 +837,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
 
     // Warm the drafter's pipelines off every clock below.
     {
-        let mut s = Session::new(model, Cache::new(true, dtype, config, device)?);
+        let mut s = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
         let mut rb = Blocking::new(ctx.eos_ids, device)?;
         let warm = DecodeOptions::new(16);
         let _ = s.decode_speculative(
@@ -842,7 +858,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         let mut live = LiveStats::new("solo", vec![ctx.max_tokens; n], true);
         live.paint();
         for (i, p) in prompts.iter().enumerate() {
-            let mut s = Session::new(model, Cache::new(true, dtype, config, device)?);
+            let mut s = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
             let mut rb = Blocking::new(ctx.eos_ids, device)?;
             let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
             let out = s.decode_speculative(
@@ -873,7 +889,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
             .map(|_| {
                 Ok(Session::new(
                     model,
-                    Cache::new(true, dtype, config, device)?,
+                    new_cache(ctx.pool, dtype, config, device)?,
                 ))
             })
             .collect::<Result<_>>()?;
@@ -1103,7 +1119,7 @@ fn run_batched_concurrent(
             .map(|_| {
                 Ok(Session::new(
                     model,
-                    Cache::new(true, dtype, config, device)?,
+                    new_cache(ctx.pool, dtype, config, device)?,
                 ))
             })
             .collect::<Result<_>>()?;
@@ -1132,7 +1148,7 @@ fn run_batched_concurrent(
         let t = Instant::now();
         let mut outs = Vec::with_capacity(n);
         for (i, p) in prompts.iter().enumerate() {
-            let mut s = Session::new(model, Cache::new(true, dtype, config, device)?);
+            let mut s = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
             let mut arm = Arm::new(ctx.readback, ctx.eos_ids, device, capacity)?;
             let out = decode(&mut s, &mut arm, p, opts)?.out;
             live.set(i, out.ids.len(), 0, true);
@@ -1162,7 +1178,7 @@ fn run_batched_concurrent(
             .map(|_| {
                 Ok(Session::new(
                     model,
-                    Cache::new(true, dtype, config, device)?,
+                    new_cache(ctx.pool, dtype, config, device)?,
                 ))
             })
             .collect::<Result<_>>()?;

@@ -403,15 +403,27 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             .collect()
     }
 
-    /// What of row `id`'s prompt its cache holds so far — the prompt tokens
-    /// fed — with the cache and whether the whole prompt is in (a row still
-    /// prefilling has more to come). For a caller sharing a cached prefix
+    /// What row `id`'s cache holds so far — its token log: a prefix it
+    /// reused or shared plus the prompt tokens fed since — with the cache
+    /// and whether the whole prompt is in (a row still prefilling has more
+    /// to come). For a caller sharing a cached prefix
     /// (`batched-decode-design.md` §12.3).
     pub fn row_source(&self, id: RowId) -> Option<(&[u32], &M::Cache, bool)> {
         let s = self.slot_of(id)?;
         let session: &Session<'m, M> = Borrow::borrow(&s.session);
         let fed = s.lane.prompt_off.min(s.prompt.len());
-        Some((&s.prompt[..fed], &session.seq.cache, fed == s.prompt.len()))
+        Some((session.seq.tokens(), &session.seq.cache, fed == s.prompt.len()))
+    }
+
+    /// The token log row `id`'s cache will hold once its prompt is in: what
+    /// it holds now plus the prompt tokens still to feed.
+    pub fn row_prospective_log(&self, id: RowId) -> Option<Vec<u32>> {
+        let s = self.slot_of(id)?;
+        let session: &Session<'m, M> = Borrow::borrow(&s.session);
+        let fed = s.lane.prompt_off.min(s.prompt.len());
+        let mut log = session.seq.tokens().to_vec();
+        log.extend_from_slice(&s.prompt[fed..]);
+        Some(log)
     }
 
     /// Row `id`'s whole prompt.

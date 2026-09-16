@@ -3291,11 +3291,22 @@ impl Cache {
                 let p = g.kv.page_size;
                 let src_len = g.kv.row_len(sslot);
                 let pages = g.kv.row_pages(sslot);
-                let mut n_pages = (n_tokens / p).min(src_len / p).min(pages.len());
+                let asked = (n_tokens / p).min(src_len / p).min(pages.len());
+                let mut n_pages = asked;
                 // Only a page with its ring snapshot can be the last shared
                 // one: walk down until one has it.
                 while n_pages > 0 && !g.snapshots.contains_key(&pages[n_pages - 1]) {
                     n_pages -= 1;
+                }
+                if std::env::var_os("LLOOM_148_SHARE_TRACE").is_some() {
+                    let have: Vec<usize> = (0..pages.len())
+                        .filter(|&i| g.snapshots.contains_key(&pages[i]))
+                        .collect();
+                    eprintln!(
+                        "[share: slot {sslot} -> {dslot}: asked {n_tokens} tokens = {asked} pages of \
+                         src_len {src_len} ({} pages), snapshots at pages {have:?}, sharing {n_pages}]",
+                        pages.len()
+                    );
                 }
                 if n_pages == 0 {
                     return Ok(0);

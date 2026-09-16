@@ -496,10 +496,20 @@ where
             if complete {
                 continue;
             }
-            let Some(full) = self.decoder.row_prompt(id) else { continue };
-            let could = pages_of(full);
-            let has = pages_of(fed);
-            if could > has && could > idle_best {
+            let Some(full) = self.decoder.row_prospective_log(id) else { continue };
+            let could = pages_of(&full);
+            // Until the row's prompt is fully in, the ring snapshot of its
+            // last shared page may not exist yet (it is taken when the NEXT
+            // pass begins): wait for the whole prompt, not for the pages.
+            if could > idle_best {
+                if std::env::var_os("LLOOM_148_SHARE_TRACE").is_some() {
+                    eprintln!(
+                        "[share: waiting for row {id:?}: {could} pages of its {}-token prompt \
+                         ({} fed), idle slots give {idle_best}]",
+                        full.len(),
+                        fed.len()
+                    );
+                }
                 return true;
             }
         }
@@ -540,6 +550,7 @@ where
                 self.waiting.push_front((req, tx));
                 break;
             }
+            let t_prep = std::time::Instant::now();
             let (slot, session, prepared) = match self.prepare(&req) {
                 Ok(p) => p,
                 Err(e) => {
@@ -547,6 +558,17 @@ where
                     continue;
                 }
             };
+            if std::env::var_os("LLOOM_148_SHARE_TRACE").is_some() {
+                eprintln!(
+                    "[share: prepared slot {slot} {:?} reused {} suffix {} in {:.1} ms; live {} waiting {}]",
+                    prepared.action,
+                    prepared.reused,
+                    prepared.suffix.len(),
+                    t_prep.elapsed().as_secs_f64() * 1e3,
+                    self.decoder.live_rows(),
+                    self.waiting.len()
+                );
+            }
             let sampling = Self::sampling_of(&req.params);
             let joined_beside = self.decoder.live_rows();
             // The row's own EOS set: the decoder stops a row on its own
@@ -601,6 +623,12 @@ where
         })?;
         self.counters.steps += 1;
         self.counters.max_live = self.counters.max_live.max(report.live);
+        if std::env::var_os("LLOOM_148_SHARE_TRACE").is_some() {
+            eprintln!(
+                "[share: step {}: live {} pieces {} ({} tokens) retired {} pending {}]",
+                self.counters.steps, report.live, report.pieces, report.piece_tokens, report.retired, report.pending
+            );
+        }
         for (id, session, out) in self.decoder.take_finished() {
             let Some(f) = self.inflight.remove(&id) else {
                 continue;

@@ -24,7 +24,7 @@ use lloom::models::lfm2::{
     AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, MemoryBudget, Model,
 };
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
-use lloom::nn::{CausalLM, DecodeOptions, DecodeOut, Sequence, Session, VarBuilder};
+use lloom::nn::{DecodeOptions, DecodeOut, Sequence, Session, VarBuilder};
 use lloom_engine::{
     ring_eos_read, spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRequest,
     DecodeParams, DecodeSession, Decoded, Idle, ReadbackArm, RingPool, RowSpec, SlotPool, Stop,

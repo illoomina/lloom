@@ -1889,6 +1889,15 @@ impl<'m, M: CausalLM> Session<'m, M> {
             ),
             opts.prefill_tile,
         );
+        // A prefill of more than one forward is paced whatever the arm: on
+        // the blocking arm nothing else bounds the units in flight (its own
+        // readback comes per decode step, and a prompt unit produces none),
+        // so the host would encode every tile back to back with all of their
+        // activations pending at once — 11.3 GB for an 8192-token prompt in
+        // 512-token tiles against 4.5 GB paced, the tile bounding nothing
+        // (issue #148, `measurements/issue-148-serving-batch.md` §7). A
+        // one-unit prefill keeps the arm's own command stream.
+        let pace = pace || widths.len() > 1;
         let mut last_logits = None;
         let mut units = 0usize;
         let mut off = 0usize;

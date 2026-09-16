@@ -2032,6 +2032,474 @@ impl PagedKv {
         self.len -= n;
         Ok(())
     }
+
+    // ---- The SLOT-INDEXED pool (`batched-decode-design.md` §12.2) ----
+    //
+    // One pool shared by every row of a batched loop, each row a SLOT with
+    // its own table and its own length; a pass names the rows it feeds and
+    // how many tokens each, in row order. The lockstep fields above (`len`,
+    // `pass_len`, `slots`, `table`) are the per-cache arm's and unused here.
+
+    /// A pool for `slots` sequences, created at once (the per-cache arm
+    /// creates its pool at the first pass, when it learns its batch).
+    fn new_shared(
+        config: &Config,
+        kv_capacity: usize,
+        slab: usize,
+        num_layers: usize,
+        clock: Arc<GpuClock>,
+        slots: usize,
+    ) -> Result<Self> {
+        let mut kv = Self::new(config, kv_capacity, slab, num_layers, clock)?;
+        kv.n_seqs = slots;
+        let pool_pages = kv.pool_pages();
+        let mut pool = KvPagePool::new(kv.page_size, pool_pages, slots + 1, pool_pages + 1);
+        if kv.churn_pages > 0 {
+            pool.append(slots, kv.churn_pages * kv.page_size)
+                .map_err(lloom_tensor::Error::wrap)?;
+            let freed = pool.release(slots);
+            pool.recycle(&freed).map_err(lloom_tensor::Error::wrap)?;
+        }
+        kv.pool = Some(pool);
+        Ok(kv)
+    }
+
+    /// Slot `slot`'s live length.
+    fn row_len(&self, slot: usize) -> usize {
+        self.pool
+            .as_ref()
+            .and_then(|p| p.seq(slot))
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// Bytes widening the pool to `slab` tokens per slot would allocate, at
+    /// `per_token` bytes a token across the layers.
+    fn grow_bytes_to(&self, slab: usize, per_token: usize) -> usize {
+        let slab = slab.min(self.kv_capacity);
+        self.pool_tokens_at(slab)
+            .saturating_sub(self.pool_tokens_at(self.slab))
+            .saturating_mul(per_token)
+    }
+
+    /// Open a pass over `rows` — `(slot, tokens)` each, in the order the
+    /// pass's `[1, T]` tokens are laid out — appending every row's tokens to
+    /// its table and computing the token slots the write scatters to and
+    /// the tables the read walks. Runs once per pass, at its first attention
+    /// layer; every layer of the pass reuses the result.
+    fn begin_rows(&mut self, rows: &[(usize, usize)], device: &Device) -> Result<RowsPass> {
+        let ready = self
+            .quarantine
+            .drain_completed(self.clock.completed_count());
+        let (pool_pages, page_size, ppc) = (self.pool_pages(), self.page_size, self.pages_per_chunk);
+        let pool = self
+            .pool
+            .as_mut()
+            .ok_or_else(|| lloom_tensor::Error::msg("lfm2 paged KV: the shared pool is unset"))?;
+        pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
+
+        let mut slots: Vec<u32> = Vec::new();
+        let mut prev = Vec::with_capacity(rows.len());
+        for &(slot, n) in rows {
+            let start = pool.seq(slot).map(|s| s.len()).unwrap_or(0);
+            prev.push(start);
+            pool.append(slot, n).map_err(|e| {
+                lloom_tensor::Error::msg(format!(
+                    "lfm2 paged KV, slot {slot}: {e}. The pool holds {pool_pages} pages of \
+                     {page_size} tokens (LLOOM_148_POOL_PAGES pins it; unpinned it grows \
+                     with the KV slab, slots x ceil(slab / page_size), toward the ceiling)"
+                ))
+            })?;
+            let pages = pool.seq(slot).expect("slot index within max_seqs").pages();
+            for t in start..start + n {
+                slots.push((pages[t / page_size] * page_size as u32) + (t % page_size) as u32);
+            }
+        }
+        let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
+
+        let chunk = page_size * ppc;
+        let mut n_keys = Vec::with_capacity(rows.len());
+        let mut pages = Vec::with_capacity(rows.len());
+        let mut per_row = Vec::with_capacity(rows.len());
+        for &(slot, _) in rows {
+            let seq = pool.seq(slot).expect("slot index within max_seqs");
+            if !pool.chunk_pages_are_contiguous(slot, ppc) {
+                lloom_tensor::bail!(
+                    "lfm2 paged KV: slot {slot}'s pages do not form contiguous chunks at \
+                     pages_per_chunk={ppc}; a recycled pool needs `--flash-k 1` (DESIGN.md 10.3d)"
+                )
+            }
+            n_keys.push(seq.len() as u32);
+            pages.push(seq.pages().to_vec());
+            per_row.push(pool.table_for(slot, ppc));
+        }
+        let table_stride = n_keys
+            .iter()
+            .map(|&n| (n as usize).div_ceil(chunk))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let mut tables = Vec::with_capacity(rows.len() * table_stride);
+        for mut t in per_row {
+            t.resize(table_stride, 0);
+            tables.extend(t);
+        }
+        Ok(RowsPass {
+            rows: rows.to_vec(),
+            slots: Tensor::new(slots.as_slice(), device)?,
+            max_slot,
+            tables,
+            table_stride,
+            n_keys,
+            pages,
+            prev,
+        })
+    }
+
+    /// Write one layer's K and V for a pass: `k`/`v` are `[1, H_kv, T, D]`
+    /// (the rows' tokens end to end in the pass's row order) or
+    /// `[B, H_kv, 1, D]` (a decode batch, one token per row): the scatter's
+    /// row `r` is `(r / t, r % t)`, which is the pass's row order either way.
+    fn write_rows(&mut self, block_idx: usize, k: &Tensor, v: &Tensor, pass: &RowsPass) -> Result<()> {
+        let (b, n_kv_heads, t, head_dim) = k.dims4()?;
+        let want = pass.slots.dim(0)?;
+        if b * t != want {
+            lloom_tensor::bail!(
+                "lfm2 paged KV: layer {block_idx} writes [{b}, {n_kv_heads}, {t}, {head_dim}] \
+                 against a pass of {want} tokens"
+            )
+        }
+        let tokens = self.pool_pages() * self.page_size;
+        if self.pools[block_idx].is_none() {
+            let shape = (1, n_kv_heads, tokens, head_dim);
+            self.pools[block_idx] = Some((
+                Tensor::zeros(shape, k.dtype(), k.device())?,
+                Tensor::zeros(shape, v.dtype(), v.device())?,
+            ));
+        }
+        let (pk, pv) = self.pools[block_idx].as_ref().expect("allocated above");
+        k.kv_scatter_into(pk, &pass.slots, pass.max_slot, 0, tokens * head_dim, head_dim)?;
+        v.kv_scatter_into(pv, &pass.slots, pass.max_slot, 0, tokens * head_dim, head_dim)?;
+        Ok(())
+    }
+
+    /// Slot `slot`'s first `n_prev` tokens of one layer, gathered from the
+    /// pool into `[1, H_kv, n_prev, D]`. A turn-boundary prefill only.
+    fn gather_row(
+        &self,
+        block_idx: usize,
+        slot: usize,
+        n_prev: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor)> {
+        let pool = self.pool.as_ref().expect("a shared pool exists from construction");
+        let (pk, pv) = self.pools[block_idx]
+            .as_ref()
+            .expect("the layer has a pool once a token was written");
+        let pages = pool.seq(slot).expect("slot index within max_seqs").pages();
+        let ids: Vec<u32> = (0..n_prev)
+            .map(|t| pages[t / self.page_size] * self.page_size as u32 + (t % self.page_size) as u32)
+            .collect();
+        let ids = Tensor::new(ids.as_slice(), device)?;
+        Ok((pk.index_select(&ids, 2)?, pv.index_select(&ids, 2)?))
+    }
+
+    /// Discard slot `slot`'s last `n` positions (the pages stay, §10.2a).
+    fn rewind_slot(&mut self, slot: usize, n: usize) -> Result<()> {
+        if let Some(pool) = self.pool.as_mut() {
+            pool.rewind(slot, n).map_err(lloom_tensor::Error::wrap)?;
+        }
+        Ok(())
+    }
+
+    /// Drop slot `slot`'s pages into the quarantine.
+    fn release_slot(&mut self, slot: usize) {
+        if let Some(pool) = self.pool.as_mut() {
+            let freed = pool.release(slot);
+            self.quarantine
+                .quarantine(self.clock.current_epoch(), freed);
+        }
+    }
+
+    /// Pages allocated to at least one slot, and pages free.
+    fn page_counts(&self) -> (usize, usize) {
+        self.pool
+            .as_ref()
+            .map(|p| (p.pages_in_use(), p.pages_free()))
+            .unwrap_or((0, 0))
+    }
+}
+
+/// One pass of a slot-indexed batch through the shared pool: the rows it
+/// fed, the token slots their tokens went to, and the tables the read walks
+/// (`batched-decode-design.md` §12.2). Built by `PagedKv::begin_rows` at the
+/// pass's first attention layer and read by every layer of the pass.
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+pub(crate) struct RowsPass {
+    /// `(slot, tokens)` per row, in the pass's row order.
+    rows: Vec<(usize, usize)>,
+    /// The token slot of every `(row, token)` this pass writes, in row
+    /// order — `[T]` u32, the scatter's slot list.
+    slots: Tensor,
+    max_slot: usize,
+    /// Every row's chunk table, `table_stride` entries each (the longest
+    /// row's chunk count; a row's spare entries name page 0 and are never
+    /// read — a chunk past the row's live count is empty).
+    tables: Vec<u32>,
+    table_stride: usize,
+    /// Every row's live length AFTER the pass.
+    n_keys: Vec<u32>,
+    /// Every row's page table (a multi-token row's steel read walks pages).
+    pages: Vec<Vec<u32>>,
+    /// Every row's live length BEFORE the pass.
+    prev: Vec<usize>,
+}
+
+#[cfg(feature = "metal")]
+impl RowsPass {
+    /// Row `r`'s position in the pass's `[1, T]` token axis and its length.
+    fn span(&self, r: usize) -> (usize, usize) {
+        let off: usize = self.rows[..r].iter().map(|&(_, n)| n).sum();
+        (off, self.rows[r].1)
+    }
+}
+
+/// The state a batched loop's rows share: one paged KV pool with a table
+/// per SLOT, and one ring pool per conv layer with a ring per slot
+/// (`batched-decode-design.md` §12.2). A row's [`Cache`] holds a lease on a
+/// slot ([`Cache::for_batch`]); the per-row kernels address the slot, and
+/// the batched arms of the layer address every live row in one dispatch.
+#[derive(Debug, Clone)]
+pub struct BatchPool {
+    #[cfg(feature = "metal")]
+    inner: Arc<parking_lot::Mutex<BatchInner>>,
+    #[cfg(not(feature = "metal"))]
+    _off: (),
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+struct BatchInner {
+    kv: PagedKv,
+    /// Per conv layer, `[slots, hidden, width]`, allocated on first use.
+    conv: Vec<Option<Tensor>>,
+    slots: usize,
+    free: Vec<usize>,
+    /// The batched conv arm's `(slots, phases)` index buffers, reused while
+    /// the rows and phases are those they were built for.
+    row_index: Option<RowIndex>,
+    /// Whether the layers take the batched arms (one dispatch per kernel for
+    /// the batch) or the per-row loop over the same pool — the A/B, and the
+    /// identity gate's two arms. `LLOOM_148_ROWS_ARM=per-row` turns them off.
+    batched_arms: bool,
+    /// Batched-arm dispatch groups taken (attention and conv layers), a
+    /// counter the gate reads so the arm cannot be silently skipped.
+    shared_calls: u64,
+}
+
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+struct RowIndex {
+    slots: Vec<u32>,
+    phases: Vec<u32>,
+    slots_t: Tensor,
+    phases_t: Tensor,
+}
+
+/// A lease on one slot of a [`BatchPool`]; the slot's pages and ring return
+/// to the pool when the last holder drops it.
+#[cfg(feature = "metal")]
+#[derive(Debug)]
+struct SlotLease {
+    inner: Arc<parking_lot::Mutex<BatchInner>>,
+    slot: usize,
+}
+
+#[cfg(feature = "metal")]
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        let mut g = self.inner.lock();
+        g.kv.release_slot(self.slot);
+        g.free.push(self.slot);
+    }
+}
+
+/// What a [`BatchPool`] holds, for a gauge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchPoolReport {
+    pub slots: usize,
+    pub slots_free: usize,
+    pub pages_in_use: usize,
+    pub pages_free: usize,
+    pub kv_bytes: usize,
+    pub conv_bytes: usize,
+}
+
+impl BatchPool {
+    /// A pool for `slots` rows on `config`'s arms. Refused off Metal, and on
+    /// any arm but `Paged × FlashDecoding × RotatingRing` — the one whose
+    /// per-row kernels take a slot (§12.2).
+    #[allow(unused_variables)]
+    pub fn new(config: &Config, device: &Device, slots: usize, kv_capacity: usize) -> Result<Self> {
+        #[cfg(not(feature = "metal"))]
+        {
+            lloom_tensor::bail!("lfm2 BatchPool is Metal-only: the pool is read by Metal kernels")
+        }
+        #[cfg(feature = "metal")]
+        {
+            if slots == 0 {
+                lloom_tensor::bail!("lfm2 BatchPool: no slots")
+            }
+            if config.kv_append != KvAppend::Paged || config.attn_impl != AttnImpl::FlashDecoding {
+                lloom_tensor::bail!(
+                    "lfm2 BatchPool needs `KvAppend::Paged` and `AttnImpl::FlashDecoding` \
+                     (batched-decode-design.md 12.2), got {:?} x {:?}",
+                    config.kv_append,
+                    config.attn_impl
+                )
+            }
+            if !matches!(config.conv_state, ConvState::RotatingRing { .. }) {
+                lloom_tensor::bail!(
+                    "lfm2 BatchPool needs `ConvState::RotatingRing` (the in-place ring the \
+                     slot-indexed conv kernel writes), got {:?}",
+                    config.conv_state
+                )
+            }
+            let clock = match device {
+                Device::Metal(d) => d.gpu_clock(),
+                _ => lloom_tensor::bail!("lfm2 BatchPool is Metal-only"),
+            };
+            let kv_capacity = kv_capacity.min(config.max_position_embeddings).max(1);
+            let slab = DEFAULT_KV_BUCKET.min(kv_capacity);
+            let kv = PagedKv::new_shared(config, kv_capacity, slab, config.num_hidden_layers, clock, slots)?;
+            Ok(Self {
+                inner: Arc::new(parking_lot::Mutex::new(BatchInner {
+                    kv,
+                    conv: vec![None; config.num_hidden_layers],
+                    slots,
+                    free: (0..slots).rev().collect(),
+                    row_index: None,
+                    batched_arms: std::env::var("LLOOM_148_ROWS_ARM")
+                        .map(|v| v != "per-row")
+                        .unwrap_or(true),
+                    shared_calls: 0,
+                })),
+            })
+        }
+    }
+
+    /// The ceiling in tokens per slot.
+    pub fn kv_capacity(&self) -> usize {
+        #[cfg(feature = "metal")]
+        {
+            self.inner.lock().kv.kv_capacity
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            0
+        }
+    }
+
+    /// Slots, pages and bytes held now.
+    pub fn report(&self) -> BatchPoolReport {
+        #[cfg(not(feature = "metal"))]
+        {
+            BatchPoolReport::default()
+        }
+        #[cfg(feature = "metal")]
+        {
+            let g = self.inner.lock();
+            let (pages_in_use, pages_free) = g.kv.page_counts();
+            BatchPoolReport {
+                slots: g.slots,
+                slots_free: g.free.len(),
+                pages_in_use,
+                pages_free,
+                kv_bytes: g.kv.bytes(),
+                conv_bytes: g
+                    .conv
+                    .iter()
+                    .flatten()
+                    .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+                    .sum(),
+            }
+        }
+    }
+
+    /// Take the batched arms (`true`, the default) or the per-row loop over
+    /// the same pool. The two are one arithmetic; the gate compares them.
+    #[allow(unused_variables)]
+    pub fn set_batched_arms(&self, on: bool) {
+        #[cfg(feature = "metal")]
+        {
+            self.inner.lock().batched_arms = on;
+        }
+    }
+
+    /// Whether the batched arms are on.
+    pub fn batched_arms(&self) -> bool {
+        #[cfg(feature = "metal")]
+        {
+            self.inner.lock().batched_arms
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            false
+        }
+    }
+
+    /// Batched-arm dispatch groups taken so far (one per attention or conv
+    /// layer per pass that went through the batched arm).
+    pub fn shared_calls(&self) -> u64 {
+        #[cfg(feature = "metal")]
+        {
+            self.inner.lock().shared_calls
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            0
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn lease(&self) -> Result<SlotLease> {
+        let slot = {
+            let mut g = self.inner.lock();
+            g.free.pop()
+        };
+        match slot {
+            Some(slot) => Ok(SlotLease {
+                inner: self.inner.clone(),
+                slot,
+            }),
+            None => lloom_tensor::bail!("lfm2 BatchPool: every slot is leased"),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+/// A row's place in a [`BatchPool`]: its slot lease and, within a pass, the
+/// pass it is part of.
+#[cfg(feature = "metal")]
+#[derive(Debug, Clone)]
+struct BatchSlot {
+    pool: BatchPool,
+    lease: Arc<SlotLease>,
+    /// This row's own pass (the per-row path), opened at the first attention
+    /// layer of a pass and dropped when the next pass begins.
+    pass: Option<Arc<RowsPass>>,
+}
+
+#[cfg(feature = "metal")]
+impl BatchSlot {
+    fn slot(&self) -> usize {
+        self.lease.slot
+    }
 }
 
 /// The KV slab's state, from [`Cache::kv_report`].
@@ -2060,6 +2528,24 @@ pub(crate) struct GrowPlan {
     pub(crate) bytes: usize,
     pub(crate) kv_len: usize,
     pub(crate) seq_len: usize,
+    /// The grow is a shared [`BatchPool`]'s: rows of one pool plan the same
+    /// grow, and a batched pass admits it once (`Model::forward_rows`).
+    pub(crate) shared: bool,
+}
+
+/// The bytes a batched pass's grows take together: every private plan's,
+/// and a shared pool's once (its rows all plan the same grow).
+fn grow_bytes_of(plans: &[Option<GrowPlan>]) -> usize {
+    let mut private = 0usize;
+    let mut shared = 0usize;
+    for p in plans.iter().flatten() {
+        if p.shared {
+            shared = shared.max(p.bytes);
+        } else {
+            private += p.bytes;
+        }
+    }
+    private + shared
 }
 
 impl GrowPlan {
@@ -2111,6 +2597,11 @@ pub struct Cache {
     /// quarantine and one (K, V) pool per attention layer.
     #[cfg(feature = "metal")]
     paged: Option<PagedKv>,
+    /// The row's slot in a shared [`BatchPool`] (`Cache::for_batch`): the
+    /// KV pages and the conv ring live in the pool, addressed by slot, and
+    /// `paged` above is `None`.
+    #[cfg(feature = "metal")]
+    batch: Option<BatchSlot>,
     /// Set once per forward pass so the first attention layer of the pass
     /// allocates this pass's pages and slots for every layer.
     paged_pass_pending: bool,
@@ -2467,6 +2958,8 @@ impl Cache {
                 .collect(),
             #[cfg(feature = "metal")]
             paged,
+            #[cfg(feature = "metal")]
+            batch: None,
             paged_pass_pending: false,
             kv_append: config.kv_append,
             kv_quant: config.kv_quant,
@@ -2520,6 +3013,147 @@ impl Cache {
     /// can only be empty if no pass has run, and a partially-filled vector
     /// would mean a layer index the loop never reached — which the constructor
     /// has already refused.
+    /// A cache whose KV pages and conv ring live in `pool`, at a slot leased
+    /// here and returned when the cache drops (`batched-decode-design.md`
+    /// §12.2). `config` must be the pool's (`Paged × FlashDecoding ×
+    /// RotatingRing`); everything else — positions, taps, the token log's
+    /// owner — is the row's own, as on any cache.
+    #[allow(unused_variables)]
+    pub fn for_batch(
+        use_kv_cache: bool,
+        dtype: DType,
+        config: &Config,
+        device: &Device,
+        pool: &BatchPool,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "metal"))]
+        {
+            lloom_tensor::bail!("lfm2 Cache::for_batch is Metal-only")
+        }
+        #[cfg(feature = "metal")]
+        {
+            if !use_kv_cache {
+                lloom_tensor::bail!("lfm2 Cache::for_batch: a batch row keeps its KV")
+            }
+            let mut cache = Self::new_with(true, dtype, config, device, pool.kv_capacity())?;
+            // The per-cache pool `new_with` built for the `Paged` arm is not
+            // this row's: its pages are the shared pool's.
+            cache.paged = None;
+            let lease = pool.lease()?;
+            cache.batch = Some(BatchSlot {
+                pool: pool.clone(),
+                lease: Arc::new(lease),
+                pass: None,
+            });
+            Ok(cache)
+        }
+    }
+
+    /// The row's slot in its [`BatchPool`], if it has one.
+    pub fn batch_slot(&self) -> Option<usize> {
+        #[cfg(feature = "metal")]
+        {
+            self.batch.as_ref().map(|b| b.slot())
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            None
+        }
+    }
+
+    /// The pool the row belongs to, if any.
+    pub fn batch_pool(&self) -> Option<&BatchPool> {
+        #[cfg(feature = "metal")]
+        {
+            self.batch.as_ref().map(|b| &b.pool)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            None
+        }
+    }
+
+    /// Whether `other` is a row of the same pool.
+    #[cfg(feature = "metal")]
+    fn shares_pool_with(&self, other: &Self) -> bool {
+        match (&self.batch, &other.batch) {
+            (Some(a), Some(b)) => a.pool.same(&b.pool),
+            _ => false,
+        }
+    }
+
+    /// Layer `layer`'s conv state for this row: on the batch arm the row's
+    /// ring of the pool's `[slots, hidden, width]` — bound on first use and
+    /// zeroed — and elsewhere whatever the cache holds. `None` off the
+    /// batch arm when nothing has been written.
+    #[allow(unused_variables)]
+    fn conv_state_view(
+        &mut self,
+        layer: usize,
+        hidden: usize,
+        width: usize,
+        dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        if let Some(t) = &self.conv_states[layer] {
+            return Ok(Some(t.clone()));
+        }
+        #[cfg(feature = "metal")]
+        if let Some(b) = &self.batch {
+            let slot = b.slot();
+            let view = {
+                let mut g = b.pool.inner.lock();
+                let slots = g.slots;
+                if g.conv[layer].is_none() {
+                    g.conv[layer] = Some(Tensor::zeros((slots, hidden, width), dtype, &self.device)?);
+                }
+                g.conv[layer]
+                    .as_ref()
+                    .expect("allocated above")
+                    .narrow(0, slot, 1)?
+            };
+            if view.dtype() != dtype || view.dims() != [1, hidden, width] {
+                lloom_tensor::bail!(
+                    "lfm2 batch conv pool: layer {layer} is {:?} {:?}, this row needs [1, {hidden}, \
+                     {width}] {dtype:?}",
+                    view.dims(),
+                    view.dtype()
+                )
+            }
+            // A fresh binding is a fresh ring: the slot's previous owner left
+            // its window here.
+            view.zero_set()?;
+            self.conv_states[layer] = Some(view.clone());
+            return Ok(Some(view));
+        }
+        Ok(None)
+    }
+
+    /// Store layer `layer`'s conv state: on the batch arm into the row's
+    /// ring of the pool (the pool row IS the state every kernel reads, so a
+    /// state produced elsewhere is copied in), else as the cache's tensor.
+    fn set_conv_state(&mut self, layer: usize, state: Tensor) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if self.batch.is_some() {
+            let (_, hidden, width) = state.dims3()?;
+            let view = self
+                .conv_state_view(layer, hidden, width, state.dtype())?
+                .expect("a batch row's conv view exists");
+            if view.id() != state.id() {
+                if state.dims() != view.dims() {
+                    lloom_tensor::bail!(
+                        "lfm2 batch conv pool: a {:?} state for a {:?} ring",
+                        state.dims(),
+                        view.dims()
+                    )
+                }
+                view.slice_set(&state.contiguous()?, 2, 0)?;
+            }
+            return Ok(());
+        }
+        self.conv_states[layer] = Some(state);
+        Ok(())
+    }
+
     pub fn take_taps(&mut self) -> Vec<Tensor> {
         let slots = std::mem::take(&mut self.taps);
         slots.into_iter().flatten().collect()
@@ -2628,6 +3262,9 @@ impl Cache {
             KvAppend::Paged => {
                 #[cfg(feature = "metal")]
                 {
+                    if let Some(b) = &self.batch {
+                        return b.pool.inner.lock().kv.row_len(b.slot());
+                    }
                     self.paged.as_ref().map(|p| p.len).unwrap_or(0)
                 }
                 #[cfg(not(feature = "metal"))]
@@ -2664,7 +3301,13 @@ impl Cache {
                 KvAppend::Paged => {
                     #[cfg(feature = "metal")]
                     {
-                        self.paged.as_ref().map(|p| p.bytes()).unwrap_or(0)
+                        if let Some(b) = &self.batch {
+                            // The pool's, shared by every row: a gauge reads
+                            // it once through `BatchPool::report`.
+                            b.pool.inner.lock().kv.bytes()
+                        } else {
+                            self.paged.as_ref().map(|p| p.bytes()).unwrap_or(0)
+                        }
                     }
                     #[cfg(not(feature = "metal"))]
                     {
@@ -2743,6 +3386,22 @@ impl Cache {
             // ceiling above is the only bound this arm has.
             return Ok(None);
         }
+        #[cfg(feature = "metal")]
+        if let Some(b) = &self.batch {
+            let g = b.pool.inner.lock();
+            if need <= g.kv.slab {
+                return Ok(None);
+            }
+            let slab = (need.div_ceil(self.kv_bucket) * self.kv_bucket).min(self.kv_capacity);
+            return Ok(Some(GrowPlan {
+                from: g.kv.slab,
+                slab,
+                bytes: g.kv.grow_bytes_to(slab, self.kv_bytes_per_token),
+                kv_len,
+                seq_len,
+                shared: true,
+            }));
+        }
         if need <= self.kv_slab {
             return Ok(None);
         }
@@ -2753,6 +3412,7 @@ impl Cache {
             bytes: self.grow_bytes(slab),
             kv_len,
             seq_len,
+            shared: false,
         }))
     }
 
@@ -2779,6 +3439,10 @@ impl Cache {
                     #[cfg(feature = "metal")]
                     if let Some(p) = self.paged.as_mut() {
                         p.grow_to(slab)?;
+                    }
+                    #[cfg(feature = "metal")]
+                    if let Some(b) = &self.batch {
+                        b.pool.inner.lock().kv.grow_to(slab)?;
                     }
                 }
                 KvAppend::Cat => {}
@@ -2809,6 +3473,10 @@ impl Cache {
             } else {
                 slab = p.slab;
             }
+        }
+        #[cfg(feature = "metal")]
+        if let Some(b) = &self.batch {
+            slab = b.pool.inner.lock().kv.slab;
         }
         self.kv_slab = slab;
     }
@@ -3158,11 +3826,18 @@ impl Cache {
         if let Some(p) = &mut self.paged {
             p.release_all();
         }
+        #[cfg(feature = "metal")]
+        if let Some(b) = &mut self.batch {
+            b.pool.inner.lock().kv.release_slot(b.slot());
+            b.pass = None;
+        }
         // A new sequence starts at one bucket again: the slab was dropped with
         // the buffers, and the next one is sized by what the next sequence
         // needs. The paged pool is not dropped and keeps its width.
         self.set_slab(self.kv_bucket.min(self.kv_capacity));
         self.paged_pass_pending = false;
+        // On the batch arm the ring is a pool row: `None` here, and the
+        // next pass binds the row again and zeroes it (`conv_state_view`).
         self.conv_states.iter_mut().for_each(|v| *v = None);
         self.conv_phase = 0;
         self.conv_phase_prev = 0;
@@ -3255,6 +3930,10 @@ impl Cache {
         #[cfg(feature = "metal")]
         if let Some(p) = &mut self.paged {
             p.rewind(n)?;
+        }
+        #[cfg(feature = "metal")]
+        if let Some(b) = &self.batch {
+            b.pool.inner.lock().kv.rewind_slot(b.slot(), n)?;
         }
         let width = self.conv_state.width(self.l_cache);
         self.conv_phase = (self.conv_phase + width - n) % width;
@@ -3506,6 +4185,10 @@ impl Cache {
         #[cfg(feature = "metal")]
         if let Some(p) = &mut self.paged {
             p.rewind(discard)?;
+        }
+        #[cfg(feature = "metal")]
+        if let Some(b) = &self.batch {
+            b.pool.inner.lock().kv.rewind_slot(b.slot(), discard)?;
         }
 
         // Conv: a pointer move, and this is the line §10.2a's cost column means
@@ -3999,6 +4682,10 @@ impl Attention {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b_sz, seq_len, _) = x.dims3()?;
+        #[cfg(feature = "metal")]
+        if let Some(y) = self.attend_rows_shared(x, block_idx, rows)? {
+            return Ok(y);
+        }
         // Rows attend at different positions, so the rotation is per row: the
         // projections are normed here and rotated below, on every arm.
         let (q, k, v, rotated) = self.project(x, None)?;
@@ -4069,6 +4756,10 @@ impl Attention {
             self.head_dim,
         ))?)?;
         let v = v.reshape((1, total, self.num_key_value_heads, self.head_dim))?;
+        #[cfg(feature = "metal")]
+        if let Some(y) = self.attend_ragged_shared(&q, &k, &v, block_idx, rows)? {
+            return Ok(y);
+        }
         let mut ys = Vec::with_capacity(rows.len());
         let mut off = 0usize;
         for row in rows.iter_mut() {
@@ -4088,6 +4779,286 @@ impl Attention {
             return Ok(ys.remove(0));
         }
         Tensor::cat(&ys, 1)
+    }
+
+    /// Whether every row is a slot of ONE [`BatchPool`] the batched arms can
+    /// address in one dispatch (`batched-decode-design.md` §12.2): all on the
+    /// pool, keeping their KV, unquantized, untapped, and the dtype the flash
+    /// kernels instantiate.
+    #[cfg(feature = "metal")]
+    fn rows_share_a_pool<'a>(&self, caches: impl Iterator<Item = &'a Cache>, dtype: DType) -> bool {
+        let mut first: Option<&Cache> = None;
+        for c in caches {
+            if c.batch.is_none() || !c.use_kv_cache || c.kv_quant.is_on() || !c.tap_layers.is_empty() {
+                return false;
+            }
+            match first {
+                None => first = Some(c),
+                Some(f) => {
+                    if !f.shares_pool_with(c) {
+                        return false;
+                    }
+                }
+            }
+        }
+        match first {
+            Some(f) => {
+                matches!(dtype, DType::F16 | DType::F32)
+                    && f.batch.as_ref().expect("checked").pool.inner.lock().batched_arms
+            }
+            None => false,
+        }
+    }
+
+    /// The pass the batched arm reads and writes: opened at the pass's first
+    /// attention layer (every row's `paged_pass_pending` is set), reused by
+    /// the layers after it. `rows` are `(slot, tokens)` in the pass's order.
+    #[cfg(feature = "metal")]
+    fn shared_pass(
+        pool: &BatchPool,
+        caches: &mut [&mut Cache],
+        rows: &[(usize, usize)],
+        device: &Device,
+    ) -> Result<Arc<RowsPass>> {
+        let pending = caches.iter().any(|c| c.paged_pass_pending);
+        if pending {
+            for c in caches.iter_mut() {
+                c.paged_pass_pending = false;
+            }
+            let pass = Arc::new(pool.inner.lock().kv.begin_rows(rows, device)?);
+            for c in caches.iter_mut() {
+                if let Some(b) = c.batch.as_mut() {
+                    b.pass = Some(pass.clone());
+                }
+            }
+            return Ok(pass);
+        }
+        let pass = caches[0]
+            .batch
+            .as_ref()
+            .and_then(|b| b.pass.clone())
+            .ok_or_else(|| lloom_tensor::Error::msg("lfm2 batched arm: no pass is open"))?;
+        if pass.rows != rows {
+            lloom_tensor::bail!(
+                "lfm2 batched arm: the rows changed mid-pass ({:?} against the open pass's {:?})",
+                rows,
+                pass.rows
+            )
+        }
+        Ok(pass)
+    }
+
+    /// `attend_rows` in one dispatch per kernel for the whole batch, when the
+    /// rows share a pool (§12.2): one rotation at every row's own position
+    /// (`cos`/`sin` gathered per row), one scatter of the B tokens, one paged
+    /// read over B tables with B live counts. `None` when the rows cannot
+    /// batch, and the per-row loop runs.
+    #[cfg(feature = "metal")]
+    fn attend_rows_shared(
+        &self,
+        x: &Tensor,
+        block_idx: usize,
+        rows: &mut [Row<'_, Cache>],
+    ) -> Result<Option<Tensor>> {
+        if !self.rows_share_a_pool(rows.iter().map(|r| &*r.cache), x.dtype()) {
+            return Ok(None);
+        }
+        let (b_sz, seq_len, _) = x.dims3()?;
+        if seq_len != 1 {
+            return Ok(None);
+        }
+        let device = x.device().clone();
+        let (q, k, v, rotated) = self.project(x, None)?;
+        debug_assert!(!rotated);
+        let q = q.contiguous()?;
+        let k = k.contiguous()?;
+        let v = v.contiguous()?;
+
+        // RoPE at every row's own position: the tables' rows gathered per
+        // batch row, `[B, 1, D/2]`, which the rope kernel indexes per batch.
+        let pos: Vec<u32> = rows.iter().map(|r| r.pos as u32).collect();
+        let pos_t = Tensor::new(pos.as_slice(), &device)?;
+        let cos = rows[0].cache.cos.index_select(&pos_t, 0)?.unsqueeze(1)?;
+        let sin = rows[0].cache.sin.index_select(&pos_t, 0)?.unsqueeze(1)?;
+        let q = crate::nn::rotary_emb::rope(&q, &cos, &sin)?;
+        let k = crate::nn::rotary_emb::rope(&k, &cos, &sin)?;
+
+        let pool = rows[0].cache.batch.as_ref().expect("checked").pool.clone();
+        let slots: Vec<(usize, usize)> = rows
+            .iter()
+            .map(|r| (r.cache.batch.as_ref().expect("checked").slot(), 1))
+            .collect();
+        let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
+        let pass = Self::shared_pass(&pool, &mut caches, &slots, &device)?;
+        let reserve_chunks = caches[0]
+            .kv_capacity
+            .div_ceil((self.flash_page_size * self.flash_pages_per_chunk).max(1));
+        drop(caches);
+
+        let (pk, pv) = {
+            let mut g = pool.inner.lock();
+            g.shared_calls += 1;
+            g.kv.write_rows(block_idx, &k, &v, &pass)?;
+            let (pk, pv) = g.kv.pools[block_idx]
+                .as_ref()
+                .expect("write_rows allocates the layer's pool");
+            (pk.clone(), pv.clone())
+        };
+        let y = crate::nn::ops::flash_decoding_paged_ragged(
+            &q,
+            &pk,
+            &pv,
+            1f32 / (self.head_dim as f32).sqrt(),
+            1.0,
+            self.flash_page_size,
+            self.flash_pages_per_chunk,
+            self.flash_scratch_sizing,
+            reserve_chunks,
+            pass.tables.clone(),
+            pass.table_stride,
+            pass.n_keys.clone(),
+        )?;
+        Ok(Some(y.transpose(1, 2)?.reshape((
+            b_sz,
+            1,
+            self.num_attention_heads * self.head_dim,
+        ))?))
+    }
+
+    /// `attend_ragged` over a shared pool (§12.2): one rotation for all `T`
+    /// tokens at their own positions, one scatter, the one-token rows read
+    /// in one paged dispatch, and each longer row (a prompt piece) read by
+    /// the steel kernel over its own page table with the causal mask inside
+    /// its window. `q`/`k`/`v` are `[1, T, heads, D]`, normed.
+    #[cfg(feature = "metal")]
+    fn attend_ragged_shared(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        block_idx: usize,
+        rows: &mut [RaggedRow<'_, Cache>],
+    ) -> Result<Option<Tensor>> {
+        if !self.rows_share_a_pool(rows.iter().map(|r| &*r.cache), q.dtype()) {
+            return Ok(None);
+        }
+        let device = q.device().clone();
+        let total = q.dim(1)?;
+        let scale = 1f32 / (self.head_dim as f32).sqrt();
+
+        // Every token's position, in the pass's order.
+        let mut pos: Vec<u32> = Vec::with_capacity(total);
+        for r in rows.iter() {
+            pos.extend((r.pos..r.pos + r.len).map(|p| p as u32));
+        }
+        let pos_t = Tensor::new(pos.as_slice(), &device)?;
+        let cos = rows[0].cache.cos.index_select(&pos_t, 0)?;
+        let sin = rows[0].cache.sin.index_select(&pos_t, 0)?;
+        let q_t = q.transpose(1, 2)?.contiguous()?; // [1, H, T, D]
+        let k_t = k.transpose(1, 2)?.contiguous()?;
+        let v_t = v.transpose(1, 2)?.contiguous()?;
+        let q_t = crate::nn::rotary_emb::rope(&q_t, &cos, &sin)?;
+        let k_t = crate::nn::rotary_emb::rope(&k_t, &cos, &sin)?;
+
+        let pool = rows[0].cache.batch.as_ref().expect("checked").pool.clone();
+        let slots: Vec<(usize, usize)> = rows
+            .iter()
+            .map(|r| (r.cache.batch.as_ref().expect("checked").slot(), r.len))
+            .collect();
+        let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
+        let pass = Self::shared_pass(&pool, &mut caches, &slots, &device)?;
+        let reserve_chunks = caches[0]
+            .kv_capacity
+            .div_ceil((self.flash_page_size * self.flash_pages_per_chunk).max(1));
+        drop(caches);
+
+        let (pk, pv) = {
+            let mut g = pool.inner.lock();
+            g.shared_calls += 1;
+            g.kv.write_rows(block_idx, &k_t, &v_t, &pass)?;
+            let (pk, pv) = g.kv.pools[block_idx]
+                .as_ref()
+                .expect("write_rows allocates the layer's pool");
+            (pk.clone(), pv.clone())
+        };
+
+        // The one-token rows, in one dispatch: their queries gathered to
+        // `[nd, H, 1, D]`, their tables and live counts sub-selected.
+        let dec: Vec<usize> = (0..rows.len()).filter(|&r| rows[r].len == 1).collect();
+        let mut y_dec: Option<Tensor> = None;
+        if !dec.is_empty() {
+            let nd = dec.len();
+            let idx: Vec<u32> = dec.iter().map(|&r| pass.span(r).0 as u32).collect();
+            let prefix = idx.iter().enumerate().all(|(i, &t)| t as usize == i);
+            let q_d = if prefix {
+                q_t.narrow(2, 0, nd)?
+            } else {
+                q_t.index_select(&Tensor::new(idx.as_slice(), &device)?, 2)?
+            };
+            let q_d = q_d
+                .transpose(1, 2)?
+                .contiguous()?
+                .reshape((nd, self.num_attention_heads, 1, self.head_dim))?;
+            let stride = pass.table_stride;
+            let mut tables = Vec::with_capacity(nd * stride);
+            let mut n_keys = Vec::with_capacity(nd);
+            for &r in &dec {
+                tables.extend_from_slice(&pass.tables[r * stride..(r + 1) * stride]);
+                n_keys.push(pass.n_keys[r]);
+            }
+            y_dec = Some(crate::nn::ops::flash_decoding_paged_ragged(
+                &q_d,
+                &pk,
+                &pv,
+                scale,
+                1.0,
+                self.flash_page_size,
+                self.flash_pages_per_chunk,
+                self.flash_scratch_sizing,
+                reserve_chunks,
+                tables,
+                stride,
+                n_keys,
+            )?);
+        }
+
+        // Assemble in row order: a decode row from the batched read, a
+        // longer row from its own steel read over its page table.
+        let mut ys = Vec::with_capacity(rows.len());
+        let mut j = 0usize;
+        for (r, row) in rows.iter().enumerate() {
+            let (off, len) = pass.span(r);
+            let y = if len == 1 {
+                let y = y_dec.as_ref().expect("a decode row was read").narrow(0, j, 1)?;
+                j += 1;
+                y
+            } else {
+                let q_r = q_t.narrow(2, off, len)?.contiguous()?;
+                let pages = pass.pages[r].clone();
+                let stride = pages.len();
+                crate::nn::ops::sdpa_paged(
+                    &q_r,
+                    &pk,
+                    &pv,
+                    true,
+                    scale,
+                    self.flash_page_size,
+                    pages,
+                    stride,
+                    pass.n_keys[r] as usize,
+                )?
+            };
+            let _ = row;
+            ys.push(y.transpose(1, 2)?.reshape((
+                1,
+                len,
+                self.num_attention_heads * self.head_dim,
+            ))?);
+        }
+        if ys.len() == 1 {
+            return Ok(Some(ys.remove(0)));
+        }
+        Ok(Some(Tensor::cat(&ys, 1)?))
     }
 
     /// The three projections and the per-head QK norms: `x [b, seq, hidden]`
@@ -4309,6 +5280,59 @@ impl Attention {
                         let v = v.contiguous()?;
                         let device = cache.device.clone();
                         let pending = std::mem::take(&mut cache.paged_pass_pending);
+                        if cache.batch.is_some() {
+                            // A row of a shared pool, attending alone: its own
+                            // pass over its slot — the per-row path the
+                            // batched arm (`attend_rows_shared`) is checked
+                            // against, bit for bit.
+                            if b_sz != 1 {
+                                lloom_tensor::bail!(
+                                    "lfm2 batch row: a row's cache holds one sequence, got a \
+                                     batch of {b_sz}"
+                                )
+                            }
+                            let pass = if pending {
+                                let slot = cache.batch.as_ref().expect("checked").slot();
+                                let pool = cache.batch.as_ref().expect("checked").pool.clone();
+                                let pass = Arc::new(pool.inner.lock().kv.begin_rows(
+                                    &[(slot, seq_len)],
+                                    &device,
+                                )?);
+                                cache.batch.as_mut().expect("checked").pass = Some(pass.clone());
+                                pass
+                            } else {
+                                cache
+                                    .batch
+                                    .as_ref()
+                                    .expect("checked")
+                                    .pass
+                                    .clone()
+                                    .ok_or_else(|| {
+                                        lloom_tensor::Error::msg(
+                                            "lfm2 batch row: a layer ran before the pass opened",
+                                        )
+                                    })?
+                            };
+                            let pool = cache.batch.as_ref().expect("checked").pool.clone();
+                            let mut g = pool.inner.lock();
+                            g.kv.write_rows(block_idx, &k, &v, &pass)?;
+                            let n_prev = pass.prev[0];
+                            if seq_len == 1 {
+                                let (pk, pv) = g.kv.pools[block_idx]
+                                    .as_ref()
+                                    .expect("write_rows allocates the layer's pool");
+                                (pk.clone(), pv.clone())
+                            } else if n_prev == 0 {
+                                (k, v)
+                            } else {
+                                let slot = pass.rows[0].0;
+                                let (prev_k, prev_v) =
+                                    g.kv.gather_row(block_idx, slot, n_prev, &device)?;
+                                let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
+                                let v = Tensor::cat(&[&prev_v, &v], 2)?.contiguous()?;
+                                (k, v)
+                            }
+                        } else {
                         let Some(paged) = cache.paged.as_mut() else {
                             lloom_tensor::bail!("lfm2 `KvAppend::Paged` with no page pool")
                         };
@@ -4339,6 +5363,7 @@ impl Attention {
                             let k = Tensor::cat(&[&prev_k, &k], 2)?.contiguous()?;
                             let v = Tensor::cat(&[&prev_v, &v], 2)?.contiguous()?;
                             (k, v)
+                        }
                         }
                     }
                 }
@@ -4373,10 +5398,29 @@ impl Attention {
                         q.dtype()
                     )
                 }
-                let paged = cache.paged.as_ref().expect("checked above");
                 let reserve_chunks = cache
                     .kv_capacity
                     .div_ceil((self.flash_page_size * self.flash_pages_per_chunk).max(1));
+                if let Some(b) = &cache.batch {
+                    let pass = b.pass.as_ref().ok_or_else(|| {
+                        lloom_tensor::Error::msg("lfm2 batch row: reading before the pass opened")
+                    })?;
+                    crate::nn::ops::flash_decoding_paged_ragged(
+                        &q,
+                        &k,
+                        &v,
+                        1f32 / (self.head_dim as f32).sqrt(),
+                        1.0,
+                        self.flash_page_size,
+                        self.flash_pages_per_chunk,
+                        self.flash_scratch_sizing,
+                        reserve_chunks,
+                        pass.tables.clone(),
+                        pass.table_stride,
+                        pass.n_keys.clone(),
+                    )?
+                } else {
+                let paged = cache.paged.as_ref().expect("checked above");
                 crate::nn::ops::flash_decoding_paged(
                     &q,
                     &k,
@@ -4391,6 +5435,7 @@ impl Attention {
                     paged.table_stride,
                     paged.len,
                 )?
+                }
             }
         } else if self.flash_decoding_applies(&q, seq_len) {
             // Chunked attention over the contiguous cache. `page_size` is the
@@ -4901,6 +5946,10 @@ impl ShortConv {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let bcx = self.in_proj.forward(x)?.transpose(1, 2)?;
+        #[cfg(feature = "metal")]
+        if let Some(out) = self.convolve_rows_shared(&bcx, block_idx, rows)? {
+            return Ok(out);
+        }
         let mut outs = Vec::with_capacity(rows.len());
         for (r, row) in rows.iter_mut().enumerate() {
             outs.push(self.convolve_bcx(&bcx.narrow(0, r, 1)?, block_idx, row.cache)?);
@@ -4939,6 +5988,10 @@ impl ShortConv {
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let bcx = self.in_proj.forward(x)?;
+        #[cfg(feature = "metal")]
+        if let Some(out) = self.convolve_ragged_shared(&bcx, block_idx, rows)? {
+            return Ok(out);
+        }
         let mut outs = Vec::with_capacity(rows.len());
         let mut off = 0usize;
         for row in rows.iter_mut() {
@@ -4952,10 +6005,174 @@ impl ShortConv {
         Tensor::cat(&outs, 1)
     }
 
+    /// Whether the rows are slots of one pool the slot-indexed ring kernel
+    /// can write in one dispatch (§12.2): the fused `RotatingRing` arm, every
+    /// row on the same pool, none speculating.
+    #[cfg(feature = "metal")]
+    fn rows_share_a_ring_pool<'a>(&self, caches: impl Iterator<Item = &'a Cache>) -> bool {
+        if !matches!(self.conv_state, ConvState::RotatingRing { .. })
+            || !self.conv_fused
+            || conv_c_fusion_disabled()
+            || self.rotating_table.is_none()
+        {
+            return false;
+        }
+        let mut first: Option<&Cache> = None;
+        for c in caches {
+            if c.batch.is_none() || !c.use_kv_cache || c.speculative {
+                return false;
+            }
+            match first {
+                None => first = Some(c),
+                Some(f) => {
+                    if !f.shares_pool_with(c) {
+                        return false;
+                    }
+                }
+            }
+        }
+        match first {
+            Some(f) => f.batch.as_ref().expect("checked").pool.inner.lock().batched_arms,
+            None => false,
+        }
+    }
+
+    /// The ring write for `caches`' rows — `[B, 3·hidden, 1]` projections
+    /// laid out row by row — in one dispatch over the pool's rings, each row
+    /// at its own slot and phase. Returns `[B, 1, hidden]` with `*C` applied.
+    #[cfg(feature = "metal")]
+    fn ring_rows_shared(
+        &self,
+        bcx: &Tensor,
+        block_idx: usize,
+        caches: &mut [&mut Cache],
+    ) -> Result<Tensor> {
+        let width = self.conv_state.width(self.l_cache);
+        let dtype = bcx.dtype();
+        let device = bcx.device().clone();
+        let mut slots = Vec::with_capacity(caches.len());
+        let mut phases = Vec::with_capacity(caches.len());
+        for c in caches.iter_mut() {
+            // Bind (and on a fresh lease zero) the row's ring, so the pool's
+            // row is the state this row's every kernel reads.
+            c.conv_state_view(block_idx, self.hidden_size, width, dtype)?;
+            slots.push(c.batch.as_ref().expect("checked").slot() as u32);
+            phases.push(c.conv_phase as u32);
+        }
+        let pool = caches[0].batch.as_ref().expect("checked").pool.clone();
+        let (pool_t, slots_t, phases_t) = {
+            let mut g = pool.inner.lock();
+            g.shared_calls += 1;
+            let pool_t = g.conv[block_idx]
+                .clone()
+                .expect("conv_state_view allocated the layer's pool");
+            let fresh = match &g.row_index {
+                Some(ix) => ix.slots != slots || ix.phases != phases,
+                None => true,
+            };
+            if fresh {
+                g.row_index = Some(RowIndex {
+                    slots: slots.clone(),
+                    phases: phases.clone(),
+                    slots_t: Tensor::new(slots.as_slice(), &device)?,
+                    phases_t: Tensor::new(phases.as_slice(), &device)?,
+                });
+            }
+            let ix = g.row_index.as_ref().expect("set above");
+            (pool_t, ix.slots_t.clone(), ix.phases_t.clone())
+        };
+        let b = bcx.narrow(1, 0, self.hidden_size)?;
+        let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
+        let x = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
+        let table = self.rotating_table.as_ref().expect("checked");
+        crate::nn::ops::shortconv_ring_rows(&b, &x, &c, &pool_t, table, &slots_t, &phases_t)
+    }
+
+    /// `convolve_rows` in one dispatch (§12.2). `bcx` is `[B, 3·hidden, 1]`.
+    #[cfg(feature = "metal")]
+    fn convolve_rows_shared(
+        &self,
+        bcx: &Tensor,
+        block_idx: usize,
+        rows: &mut [Row<'_, Cache>],
+    ) -> Result<Option<Tensor>> {
+        if !self.rows_share_a_ring_pool(rows.iter().map(|r| &*r.cache)) {
+            return Ok(None);
+        }
+        let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
+        Ok(Some(self.ring_rows_shared(bcx, block_idx, &mut caches)?))
+    }
+
+    /// `convolve_ragged` over a shared pool: the one-token rows' ring writes
+    /// in one dispatch, each longer row (a prompt piece) through the
+    /// multi-token writer on its own ring. `bcx` is `[1, T, 3·hidden]`.
+    #[cfg(feature = "metal")]
+    fn convolve_ragged_shared(
+        &self,
+        bcx: &Tensor,
+        block_idx: usize,
+        rows: &mut [RaggedRow<'_, Cache>],
+    ) -> Result<Option<Tensor>> {
+        if !self.rows_share_a_ring_pool(rows.iter().map(|r| &*r.cache)) {
+            return Ok(None);
+        }
+        let device = bcx.device().clone();
+        let mut offs = Vec::with_capacity(rows.len());
+        let mut off = 0usize;
+        for r in rows.iter() {
+            offs.push(off);
+            off += r.len;
+        }
+        let dec: Vec<usize> = (0..rows.len()).filter(|&r| rows[r].len == 1).collect();
+        let mut out_dec: Option<Tensor> = None;
+        if !dec.is_empty() {
+            let nd = dec.len();
+            let prefix = dec.iter().enumerate().all(|(i, &r)| offs[r] == i);
+            let bcx_d = if prefix {
+                bcx.narrow(1, 0, nd)?
+            } else {
+                let idx: Vec<u32> = dec.iter().map(|&r| offs[r] as u32).collect();
+                bcx.index_select(&Tensor::new(idx.as_slice(), &device)?, 1)?
+            };
+            // `[1, nd, 3·hidden]` contiguous is `[nd, 3·hidden, 1]` with the
+            // strides a batch of one-token rows has.
+            let bcx_d = bcx_d.contiguous()?.reshape((nd, 3 * self.hidden_size, 1))?;
+            let mut caches: Vec<&mut Cache> = Vec::with_capacity(nd);
+            let mut taken: Vec<Option<&mut RaggedRow<'_, Cache>>> =
+                rows.iter_mut().map(Some).collect();
+            for &r in &dec {
+                caches.push(&mut *taken[r].take().expect("each row once").cache);
+            }
+            out_dec = Some(self.ring_rows_shared(&bcx_d, block_idx, &mut caches)?);
+        }
+        let mut outs = Vec::with_capacity(rows.len());
+        let mut j = 0usize;
+        for (r, row) in rows.iter_mut().enumerate() {
+            if row.len == 1 {
+                outs.push(out_dec.as_ref().expect("a decode row was written").narrow(0, j, 1)?);
+                j += 1;
+            } else {
+                let bcx_r = bcx.narrow(1, offs[r], row.len)?.transpose(1, 2)?;
+                outs.push(self.convolve_bcx(&bcx_r, block_idx, row.cache)?);
+            }
+        }
+        if outs.len() == 1 {
+            return Ok(Some(outs.remove(0)));
+        }
+        Ok(Some(Tensor::cat(&outs, 1)?))
+    }
+
     /// The conv block after `in_proj`: `bcx` is `[b, 3·hidden, seq]` and the
     /// result `[b, seq, hidden]` with the `*C` gate applied.
     fn convolve_bcx(&self, bcx: &Tensor, block_idx: usize, cache: &mut Cache) -> Result<Tensor> {
         let (b_sz, _, seq_len) = bcx.dims3()?;
+        // A batch row's ring is a row of the pool: bound before any arm below
+        // reads `conv_states`, so what they read and write is the pool's row.
+        #[cfg(feature = "metal")]
+        if cache.batch.is_some() && cache.use_kv_cache {
+            let width = self.conv_state.width(self.l_cache);
+            cache.conv_state_view(block_idx, self.hidden_size, width, bcx.dtype())?;
+        }
         let b = bcx.narrow(1, 0, self.hidden_size)?;
         let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
         let x_proj = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
@@ -4986,7 +6203,7 @@ impl ShortConv {
                 self.shortconv_fused(&b, &x_proj, &c, &state, &conv_weight)?
             {
                 if cache.use_kv_cache {
-                    cache.conv_states[block_idx] = Some(new_state);
+                    cache.set_conv_state(block_idx, new_state)?;
                 }
                 // `c` is already applied in the kernel store; only the transpose
                 // to `[b, seq, hidden]` for `out_proj` remains.
@@ -5017,7 +6234,7 @@ impl ShortConv {
                 // this stores the same handle back — which is what makes the
                 // ring's state stop escaping its pass (§9.2aa, §13).
                 if cache.use_kv_cache {
-                    cache.conv_states[block_idx] = Some(state);
+                    cache.set_conv_state(block_idx, state)?;
                 }
                 return Ok(conv_out);
             }
@@ -5103,7 +6320,7 @@ impl ShortConv {
             }
 
             if cache.use_kv_cache {
-                cache.conv_states[block_idx] = Some(state.clone());
+                cache.set_conv_state(block_idx, state.clone())?;
             }
             Tensor::cat(&outs, 2)?.contiguous()?
         } else if seq_len == 1 {
@@ -5138,7 +6355,7 @@ impl ShortConv {
                     state.slice_set(&bx, 2, phase)?;
 
                     if cache.use_kv_cache {
-                        cache.conv_states[block_idx] = Some(state.clone());
+                        cache.set_conv_state(block_idx, state.clone())?;
                     }
 
                     // Built at load time, one per phase -- so the per-token cost
@@ -5199,7 +6416,7 @@ impl ShortConv {
                     state.slice_set(&bx, 2, phase)?;
 
                     if cache.use_kv_cache {
-                        cache.conv_states[block_idx] = Some(state.clone());
+                        cache.set_conv_state(block_idx, state.clone())?;
                     }
 
                     // The live window is `l_cache` *contiguous* slots ending at
@@ -5230,7 +6447,7 @@ impl ShortConv {
                     }
 
                     if cache.use_kv_cache {
-                        cache.conv_states[block_idx] = Some(state.clone());
+                        cache.set_conv_state(block_idx, state.clone())?;
                     }
 
                     // Apply convolution as element-wise multiply and sum.
@@ -5358,7 +6575,7 @@ impl ShortConv {
                         own
                     }
                 };
-                cache.conv_states[block_idx] = Some(owned);
+                cache.set_conv_state(block_idx, owned)?;
             }
 
             out
@@ -6002,8 +7219,9 @@ impl Model {
             plans.push(row.cache.plan_pass(1)?);
         }
         // One admission for the step's grows together, so a refusal on memory
-        // also comes before any row has grown.
-        let bytes: usize = plans.iter().flatten().map(|p| p.bytes).sum();
+        // also comes before any row has grown. Rows of one shared pool plan
+        // the same grow: admitted once.
+        let bytes = grow_bytes_of(&plans);
         if bytes > 0 {
             rows[0].cache.admit_grow(
                 bytes,
@@ -6085,7 +7303,7 @@ impl Model {
             }
             plans.push(row.cache.plan_pass(row.len)?);
         }
-        let bytes: usize = plans.iter().flatten().map(|p| p.bytes).sum();
+        let bytes = grow_bytes_of(&plans);
         if bytes > 0 {
             rows[0].cache.admit_grow(
                 bytes,
@@ -6455,6 +7673,10 @@ impl Model {
         // The page pool allocates this pass's pages at the first attention
         // layer; this is the once-per-pass point that says a new pass began.
         cache.paged_pass_pending = true;
+        #[cfg(feature = "metal")]
+        if let Some(b) = &mut cache.batch {
+            b.pass = None;
+        }
         cache.conv_phase_prev = cache.conv_phase;
         if let ConvState::RotatingRing { k } = self.conv_state {
             let width = self.conv_state.width(self.l_cache);

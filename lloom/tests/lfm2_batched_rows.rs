@@ -460,3 +460,230 @@ fn each_row_of_a_ragged_pass_is_bit_identical_to_its_forward_under_the_gemm() ->
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The shared pool's arms (`batched-decode-design.md` §12.2): every row a slot
+// of one `BatchPool`, the attention and the conv of the whole batch in one
+// dispatch per kernel — against the per-row loop over the SAME pool, which
+// is the same arithmetic (each row's own table, own live count, own ring at
+// its own phase) and must therefore agree to the bit; and the pool's per-row
+// path against the private paged cache it is built from.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "metal")]
+mod pool_arms {
+    use super::*;
+    use lloom::models::lfm2::{AttnImpl, BatchPool};
+
+    /// The pool's arms: `Paged × FlashDecoding × RotatingRing`, the fused
+    /// ring, a 4-token page so the prompts span pages.
+    fn pool_config() -> Config {
+        let mut cfg = tiny_config_on(ConvState::RotatingRing { k: 2 });
+        // The flash kernels instantiate head dims 32/64/96/128: two heads of 32.
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 128;
+        cfg.kv_append = KvAppend::Paged;
+        cfg.attn_impl = AttnImpl::FlashDecoding;
+        // The steel paged read needs a page of whole 32-key blocks; the
+        // prompts below span two pages, so both flash paths (one chunk, two
+        // chunks) and a page boundary are exercised.
+        cfg.flash_page_size = 32;
+        cfg.flash_pages_per_chunk = 1;
+        cfg.conv_fused = true;
+        cfg
+    }
+
+    /// Three rows: two short, one past a page boundary (36 tokens at page 32).
+    fn pool_rows() -> Vec<(Vec<u32>, u32)> {
+        let long: Vec<u32> = (0..36u32).map(|i| (i * 7 + 3) % 48).collect();
+        vec![(vec![3, 11, 20, 5, 9], 12), (vec![40, 2], 33), (long, 21)]
+    }
+
+    /// A 40-token prompt for the piece row: 6 prefilled, 34 fed as the piece.
+    fn piece_prompt() -> Vec<u32> {
+        (0..40u32).map(|i| (i * 11 + 5) % 48).collect()
+    }
+
+    fn logits_rows(t: &Tensor) -> Result<Vec<Vec<f32>>> {
+        (0..t.dim(0)?)
+            .map(|r| t.i(r)?.to_vec1::<f32>())
+            .collect()
+    }
+
+    fn assert_bit_equal(what: &str, a: &[Vec<f32>], b: &[Vec<f32>]) {
+        assert_eq!(a.len(), b.len(), "{what}: row count");
+        for (r, (x, y)) in a.iter().zip(b).enumerate() {
+            let bits_a: Vec<u32> = x.iter().map(|v| v.to_bits()).collect();
+            let bits_b: Vec<u32> = y.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(
+                bits_a, bits_b,
+                "{what}: row {r} differs (max |d| = {})",
+                max_abs_diff(x, y)
+            );
+        }
+    }
+
+    /// Two decode steps over three rows on a pool, with the batched arms on
+    /// or off: the logits of both steps.
+    fn pool_steps(cfg: &Config, dtype: DType, dev: &Device, batched: bool) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, u64)> {
+        let model = build(cfg, dtype, dev)?;
+        let rows = pool_rows();
+        let pool = BatchPool::new(cfg, dev, 4, 64)?;
+        pool.set_batched_arms(batched);
+        let mut caches = Vec::with_capacity(rows.len());
+        for (prompt, _) in &rows {
+            let mut cache = Cache::for_batch(true, dtype, cfg, dev, &pool)?;
+            let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
+            let _ = model.forward(&input, 0, &mut cache)?;
+            caches.push(cache);
+        }
+        let nexts: Vec<u32> = rows.iter().map(|(_, n)| *n).collect();
+        let input = Tensor::new(nexts.as_slice(), dev)?.reshape((rows.len(), 1))?;
+        let mut row_refs: Vec<Row<'_, Cache>> = caches
+            .iter_mut()
+            .zip(rows.iter())
+            .map(|(cache, (prompt, _))| Row {
+                pos: prompt.len(),
+                cache,
+            })
+            .collect();
+        let step1 = model.forward_rows(&input, &mut row_refs)?;
+        drop(row_refs);
+        // A second step at the next position, feeding fixed tokens.
+        let nexts2: Vec<u32> = nexts.iter().map(|n| (n + 5) % cfg.vocab_size as u32).collect();
+        let input2 = Tensor::new(nexts2.as_slice(), dev)?.reshape((rows.len(), 1))?;
+        let mut row_refs: Vec<Row<'_, Cache>> = caches
+            .iter_mut()
+            .zip(rows.iter())
+            .map(|(cache, (prompt, _))| Row {
+                pos: prompt.len() + 1,
+                cache,
+            })
+            .collect();
+        let step2 = model.forward_rows(&input2, &mut row_refs)?;
+        Ok((logits_rows(&step1)?, logits_rows(&step2)?, pool.shared_calls()))
+    }
+
+    #[test]
+    fn the_batched_arms_reproduce_the_per_row_loop_over_the_same_pool_bit_for_bit() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        for dtype in [DType::F32, DType::F16] {
+            let (b1, b2, calls_on) = pool_steps(&cfg, dtype, &dev, true)?;
+            let (p1, p2, calls_off) = pool_steps(&cfg, dtype, &dev, false)?;
+            assert!(calls_on > 0, "the batched arms ran ({calls_on} layer calls)");
+            assert_eq!(calls_off, 0, "the per-row arm took no batched call");
+            assert_bit_equal(&format!("step 1 {dtype:?}"), &b1, &p1);
+            assert_bit_equal(&format!("step 2 {dtype:?}"), &b2, &p2);
+            assert_rows_differ(&b1);
+            assert_rows_differ(&b2);
+        }
+        Ok(())
+    }
+
+    /// The pool's per-row path against a private paged cache on the same
+    /// config: the same kernels over a table of one sequence.
+    #[test]
+    fn a_pool_row_alone_is_the_private_paged_cache() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        let dtype = DType::F32;
+        let model = build(&cfg, dtype, &dev)?;
+        let pool = BatchPool::new(&cfg, &dev, 2, 64)?;
+        for (prompt, next) in pool_rows() {
+            let mut private = Cache::new(true, dtype, &cfg, &dev)?;
+            let mut pooled = Cache::for_batch(true, dtype, &cfg, &dev, &pool)?;
+            let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
+            let _ = model.forward(&input, 0, &mut private)?;
+            let _ = model.forward(&input, 0, &mut pooled)?;
+            let input = Tensor::new(&[next], &dev)?.unsqueeze(0)?;
+            let a = model.forward(&input, prompt.len(), &mut private)?;
+            let b = model.forward(&input, prompt.len(), &mut pooled)?;
+            assert_bit_equal("pool row vs private cache", &logits_rows(&a)?, &logits_rows(&b)?);
+            assert_eq!(pooled.kv_len(), prompt.len() + 1);
+        }
+        Ok(())
+    }
+
+    /// The ragged pass on the pool — two decode rows beside a prompt piece —
+    /// with the batched arms on against off.
+    fn pool_ragged(cfg: &Config, dtype: DType, dev: &Device, batched: bool) -> Result<(Vec<Vec<f32>>, u64)> {
+        let model = build(cfg, dtype, dev)?;
+        let decode_rows = pool_rows();
+        let piece_prompt = piece_prompt();
+        let split = 6;
+        let pool = BatchPool::new(cfg, dev, 4, 64)?;
+        pool.set_batched_arms(batched);
+        let mut caches = Vec::new();
+        for (prompt, _) in &decode_rows[..2] {
+            let mut cache = Cache::for_batch(true, dtype, cfg, dev, &pool)?;
+            let input = Tensor::new(prompt.as_slice(), dev)?.unsqueeze(0)?;
+            let _ = model.forward(&input, 0, &mut cache)?;
+            caches.push(cache);
+        }
+        {
+            let mut cache = Cache::for_batch(true, dtype, cfg, dev, &pool)?;
+            let input = Tensor::new(&piece_prompt[..split], dev)?.unsqueeze(0)?;
+            let _ = model.forward(&input, 0, &mut cache)?;
+            caches.push(cache);
+        }
+        let mut tokens: Vec<u32> = decode_rows[..2].iter().map(|(_, n)| *n).collect();
+        tokens.extend_from_slice(&piece_prompt[split..]);
+        let input = Tensor::new(tokens.as_slice(), dev)?.unsqueeze(0)?;
+        let lens = [1usize, 1, piece_prompt.len() - split];
+        let poss = [decode_rows[0].0.len(), decode_rows[1].0.len(), split];
+        let mut row_refs: Vec<RaggedRow<'_, Cache>> = caches
+            .iter_mut()
+            .zip(lens.iter().zip(poss.iter()))
+            .map(|(cache, (&len, &pos))| RaggedRow { pos, len, cache })
+            .collect();
+        let logits = model.forward_ragged(&input, &mut row_refs)?;
+        drop(row_refs);
+        // And a plain step after it, every row now a decode row.
+        let nexts: Vec<u32> = vec![12, 33, 21];
+        let input = Tensor::new(nexts.as_slice(), dev)?.reshape((3, 1))?;
+        let poss2 = [poss[0] + 1, poss[1] + 1, piece_prompt.len()];
+        let mut row_refs: Vec<Row<'_, Cache>> = caches
+            .iter_mut()
+            .zip(poss2.iter())
+            .map(|(cache, &pos)| Row { pos, cache })
+            .collect();
+        let step = model.forward_rows(&input, &mut row_refs)?;
+        let mut out = logits_rows(&logits)?;
+        out.extend(logits_rows(&step)?);
+        Ok((out, pool.shared_calls()))
+    }
+
+    #[test]
+    fn the_ragged_batched_arms_reproduce_the_per_row_loop_bit_for_bit() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        for dtype in [DType::F32, DType::F16] {
+            let (on, calls_on) = pool_ragged(&cfg, dtype, &dev, true)?;
+            let (off, calls_off) = pool_ragged(&cfg, dtype, &dev, false)?;
+            assert!(calls_on > 0);
+            assert_eq!(calls_off, 0);
+            assert_bit_equal(&format!("ragged + step {dtype:?}"), &on, &off);
+            assert_rows_differ(&on[..3]);
+        }
+        Ok(())
+    }
+
+    /// A slot returns to the pool when its cache drops, and a cleared row
+    /// starts over on a zeroed ring.
+    #[test]
+    fn slots_are_leased_and_returned() -> Result<()> {
+        let dev = Device::new_metal(0)?;
+        let cfg = pool_config();
+        let pool = BatchPool::new(&cfg, &dev, 2, 64)?;
+        let a = Cache::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
+        let b = Cache::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
+        assert!(Cache::for_batch(true, DType::F32, &cfg, &dev, &pool).is_err());
+        assert_eq!(pool.report().slots_free, 0);
+        drop(a);
+        assert_eq!(pool.report().slots_free, 1);
+        let c = Cache::for_batch(true, DType::F32, &cfg, &dev, &pool)?;
+        assert_ne!(c.batch_slot(), b.batch_slot());
+        Ok(())
+    }
+}

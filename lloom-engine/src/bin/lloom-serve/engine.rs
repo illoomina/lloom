@@ -20,9 +20,11 @@
 use anyhow::{Context, Result};
 use hf_chat_template::ChatTemplate;
 use lloom::generation::{LogitsProcessor, Sampling};
-use lloom::models::lfm2::{AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, Model};
+use lloom::models::lfm2::{
+    AttnImpl, Cache, Config, ConvState, KvAppend, Lfm2Config, MemoryBudget, Model,
+};
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
-use lloom::nn::{DecodeOptions, DecodeOut, Sequence, Session, VarBuilder};
+use lloom::nn::{CausalLM, DecodeOptions, DecodeOut, Sequence, Session, VarBuilder};
 use lloom_engine::{
     ring_eos_read, spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRequest,
     DecodeParams, DecodeSession, Decoded, Idle, ReadbackArm, RingPool, RowSpec, SlotPool, Stop,
@@ -88,8 +90,9 @@ pub struct Engine {
     /// The draft block width under `--dspark`.
     pub dspark_k: Option<usize>,
     pub prefill_tile: usize,
-    #[allow(dead_code)]
     pub prefill_chunk: usize,
+    pub memory_fraction: f64,
+    pub mem_sample: bool,
     single: Mutex<Single>,
     sched: Option<BatchHandle<Model, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -110,6 +113,13 @@ pub struct LoadOptions {
     pub dspark: Option<PathBuf>,
     pub prefill_tile: usize,
     pub prefill_chunk: usize,
+    /// The fraction of `recommendedMaxWorkingSetSize` the process may claim
+    /// (`MemoryBudget`, §9.5d); `0` turns admission off — the unguarded arm.
+    pub memory_fraction: f64,
+    /// Sample the memory gauges at 10 ms around every cell and report the
+    /// peaks. A gauge run, not a timing run: the sampler perturbs TTFT
+    /// (issue #728's `--mem-sample` finding).
+    pub mem_sample: bool,
 }
 
 /// What one throughput cell measured, in the sidecar's units.
@@ -119,6 +129,7 @@ pub struct PrefillTiming {
     pub prefill_ms: f64,
     /// Forwards the batch's prompts took.
     pub forwards: usize,
+    pub mem: MemReport,
 }
 
 pub struct DecodeTiming {
@@ -132,6 +143,7 @@ pub struct DecodeTiming {
     pub bracket: &'static str,
     /// Per row, the tokens decoded inside the bracket.
     pub row_tokens: Vec<usize>,
+    pub mem: MemReport,
 }
 
 impl Single {
@@ -212,6 +224,33 @@ impl Engine {
             Some(dcfg) => rewindable_config(&mut config, dcfg),
             None => crown_config(&mut config),
         }
+        // A prefill fed in more than one forward — a tile, a chunk — needs
+        // the conv's left-context carry, or the conv zero-pads each piece's
+        // left edge and computes something one pass does not (§13.2f
+        // defect 1). One forward is identical either way.
+        config.conv_prefill_ctx = opts.prefill_tile > 0 || opts.prefill_chunk > 0;
+        // Admission (§9.5d): predict the peak at the configured ceiling and
+        // refuse at load rather than find the limit by dying. The activation
+        // term is a function of the LONGEST forward this process will run
+        // (#306): the tile when one is set, else the whole KV ceiling — a
+        // one-shot prefill's working set grows with the prompt (~3.5 MB per
+        // token on the crown, #728), which is what a 32k-token one-shot
+        // prefill turned into a kernel panic on this machine (#148).
+        let weight_bytes: usize = weight_files(&model_dir)?
+            .iter()
+            .map(|f| std::fs::metadata(f).map(|m| m.len() as usize).unwrap_or(0))
+            .sum();
+        if opts.memory_fraction > 0.0 {
+            let mut budget = MemoryBudget::new(weight_bytes);
+            budget.batch = opts.batch;
+            budget.fraction = opts.memory_fraction;
+            budget = budget.with_prefill(if opts.prefill_tile > 0 {
+                opts.prefill_tile
+            } else {
+                opts.kv_capacity
+            });
+            config.memory_budget = Some(budget);
+        }
 
         let files = weight_files(&model_dir)?;
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
@@ -275,6 +314,8 @@ impl Engine {
             dspark_k: dcfg.as_ref().map(|d| d.max_draft()),
             prefill_tile: opts.prefill_tile,
             prefill_chunk: opts.prefill_chunk,
+            memory_fraction: opts.memory_fraction,
+            mem_sample: opts.mem_sample,
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -667,29 +708,42 @@ impl Engine {
         if batch <= 1 {
             let ids = self.seed_prompt(n);
             let device = self.core.device.clone();
-            let prefill = self.with_single(|s, _| {
+            let tile = self.prefill_tile;
+            let gauge = MemGauge::start(&device, self.mem_sample);
+            let (prefill, forwards) = self.with_single(|s, _| {
                 s.reset();
-                let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
+                // The prompt in tiles of at most `prefill_tile` tokens (all
+                // of it in one forward at tile 0), each forward paced against
+                // the GPU (`DecodeSession::prefill`), so the working set is
+                // bounded by the tile rather than by the prompt.
+                let params = DecodeParams {
+                    max_tokens: 1,
+                    eos_ids: NEVER_EOS.to_vec(),
+                    prefill_tile: tile,
+                    ..DecodeParams::default()
+                };
                 let t = Instant::now();
-                let _ = s.model().forward(&input, 0, s.cache_mut())?;
+                let out = s.prefill(&ids, &params)?;
                 device.synchronize()?;
                 let elapsed = t.elapsed();
-                // The forward wrote into the cache behind the session's token
+                // The forwards wrote into the cache behind the session's token
                 // log; nothing downstream may read that state.
                 s.reset();
-                Ok(elapsed)
+                Ok((elapsed, out.units))
             })?;
             return Ok(PrefillTiming {
                 prompt_tokens: n,
                 batch: 1,
                 prefill_ms: ms(prefill),
-                forwards: 1,
+                forwards,
+                mem: gauge.finish(&device),
             });
         }
         self.check_batch(batch)?;
         let prompts: Vec<Vec<u32>> = (0..batch).map(|r| self.seed_prompt_row(n, r)).collect();
         let tile = self.prefill_tile;
         let dspark = self.dspark_k.is_some();
+        let gauge = MemGauge::start(&self.core.device, self.mem_sample);
         let (elapsed, forwards) = self.closed(move |idle| -> Result<(Duration, usize)> {
             with_sessions(idle, batch, |idle, sessions| {
                 let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
@@ -745,6 +799,7 @@ impl Engine {
             batch,
             prefill_ms: ms(elapsed),
             forwards,
+            mem: gauge.finish(&self.core.device),
         })
     }
 
@@ -771,7 +826,8 @@ impl Engine {
             .collect();
         let tile = self.prefill_tile;
         let dspark_k = self.dspark_k;
-        let timing = self.closed(move |idle| -> Result<DecodeTiming> {
+        let gauge = MemGauge::start(&self.core.device, self.mem_sample);
+        let mut timing = self.closed(move |idle| -> Result<DecodeTiming> {
             with_sessions(idle, batch, |idle, sessions| {
                 let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
                 let out =
@@ -808,6 +864,7 @@ impl Engine {
                     readback: ReadbackArm::Speculative { k },
                     bracket: "run wall minus the prompts' submit; the prefills' GPU tail is inside",
                     row_tokens: outs.iter().map(|o| o.ids.len()).collect(),
+                    mem: MemReport::default(),
                 }
                     } else {
                         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -879,11 +936,13 @@ impl Engine {
                     readback: ReadbackArm::Batched { rows: batch },
                     bracket: "D batched steps after every row's context, resumed from held logits",
                     row_tokens: outs.iter().map(|o| o.ids.len()).collect(),
+                    mem: MemReport::default(),
                 }
                     };
                 Ok(out)
             })
         })??;
+        timing.mem = gauge.finish(&self.core.device);
         Ok(timing)
     }
 
@@ -895,8 +954,10 @@ impl Engine {
         let prompt = self.seed_prompt(prompt_tokens);
         let device = self.core.device.clone();
         let readback = self.readback;
+        let prefill_tile = self.prefill_tile;
         let detok = self.detok();
-        self.with_single(|s, spec| {
+        let gauge = MemGauge::start(&device, self.mem_sample);
+        let mut timing = self.with_single(|s, spec| {
             s.reset();
             if let Some(spec) = spec {
                 // One run of `D` tokens; the prompt's submit time subtracted
@@ -928,6 +989,7 @@ impl Engine {
                     readback: run.readback,
                     bracket: "run wall minus the prompt's submit; the prefill's GPU tail is inside",
                     row_tokens: vec![run.tokens.len()],
+                    mem: MemReport::default(),
                 });
             }
             let mut detok = detok;
@@ -935,6 +997,7 @@ impl Engine {
                 max_tokens: 1,
                 eos_ids: NEVER_EOS.to_vec(),
                 readback,
+                prefill_tile,
                 ..DecodeParams::default()
             };
             let t = Instant::now();
@@ -955,6 +1018,7 @@ impl Engine {
                 max_tokens: decode_tokens,
                 eos_ids: NEVER_EOS.to_vec(),
                 readback,
+                prefill_tile,
                 ..DecodeParams::default()
             };
             let t = Instant::now();
@@ -984,8 +1048,11 @@ impl Engine {
                 readback: run.readback,
                 bracket: "D steps after the context, resumed from held logits",
                 row_tokens: vec![run.tokens.len()],
+                mem: MemReport::default(),
             })
-        })
+        })?;
+        timing.mem = gauge.finish(&device);
+        Ok(timing)
     }
 
     /// The next-token log-probabilities after `prompt_ids`: the `k` most
@@ -1158,6 +1225,193 @@ fn static_dspark_body<'a, 'm>(
         }
     }
     Ok(outs)
+}
+
+/// One reading of the process's memory: the device's allocated bytes, the
+/// pool's live / free / pending (CPU-released, awaiting the GPU — §9.5o's
+/// class) bytes, and the process's `phys_footprint`, against Metal's
+/// `recommendedMaxWorkingSetSize`. Every field is 0 off Metal.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemSnapshot {
+    pub device_allocated: u64,
+    pub pool_live: u64,
+    pub pool_free: u64,
+    pub pool_pending: u64,
+    pub phys_footprint: u64,
+    pub working_set: u64,
+}
+
+impl MemSnapshot {
+    pub fn read(device: &Device) -> Self {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = device {
+            let (shared, private) = m.pool_occupancy();
+            return Self {
+                device_allocated: m.device().current_allocated_size() as u64,
+                pool_live: (shared.live_bytes + private.live_bytes) as u64,
+                pool_free: (shared.free_bytes + private.free_bytes) as u64,
+                pool_pending: (shared.pending_bytes + private.pending_bytes) as u64,
+                phys_footprint: proc_footprint().map(|(p, _)| p).unwrap_or(0),
+                working_set: m.device().recommended_max_working_set_size() as u64,
+            };
+        }
+        let _ = device;
+        Self::default()
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "device_allocated_bytes": self.device_allocated,
+            "pool_live_bytes": self.pool_live,
+            "pool_free_bytes": self.pool_free,
+            "pool_pending_bytes": self.pool_pending,
+            "phys_footprint_bytes": self.phys_footprint,
+            "recommended_max_working_set_bytes": self.working_set,
+        })
+    }
+}
+
+/// What a cell's memory gauge reports: the readings before and after, and —
+/// under `--mem-sample` — the peaks over the cell.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemReport {
+    pub before: MemSnapshot,
+    pub after: MemSnapshot,
+    /// Peaks over the cell; `None` when the sampler was off.
+    pub peak: Option<MemSnapshot>,
+    pub samples: u64,
+}
+
+impl MemReport {
+    pub fn json(&self) -> Value {
+        let mut v = json!({
+            "before": self.before.json(),
+            "after": self.after.json(),
+            "sampled": self.peak.is_some(),
+            "samples": self.samples,
+        });
+        if let Some(p) = &self.peak {
+            v["peak"] = p.json();
+        }
+        v
+    }
+
+    /// One line for the log: the peak (or the after) device bytes and the
+    /// footprint, and what the cell left behind.
+    pub fn line(&self) -> String {
+        let gb = |b: u64| b as f64 / 1e9;
+        match &self.peak {
+            Some(p) => format!(
+                "mem: device {:.2} -> peak {:.2} -> {:.2} GB, pending peak {:.2} GB, phys peak {:.2} GB ({} samples)",
+                gb(self.before.device_allocated),
+                gb(p.device_allocated),
+                gb(self.after.device_allocated),
+                gb(p.pool_pending),
+                gb(p.phys_footprint),
+                self.samples
+            ),
+            None => format!(
+                "mem: device {:.2} -> {:.2} GB, phys {:.2} -> {:.2} GB",
+                gb(self.before.device_allocated),
+                gb(self.after.device_allocated),
+                gb(self.before.phys_footprint),
+                gb(self.after.phys_footprint)
+            ),
+        }
+    }
+}
+
+/// The gauge around one cell: a reading before, a reading after, and under
+/// `--mem-sample` a 10 ms thread holding the peaks in between.
+pub struct MemGauge {
+    before: MemSnapshot,
+    sampler: Option<(Arc<AtomicBool>, std::thread::JoinHandle<(MemSnapshot, u64)>)>,
+}
+
+impl MemGauge {
+    pub fn start(device: &Device, sample: bool) -> Self {
+        let before = MemSnapshot::read(device);
+        let sampler = if sample && !device.is_cpu() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let device = device.clone();
+            let handle = std::thread::spawn(move || {
+                let mut peak = MemSnapshot::default();
+                let mut samples = 0u64;
+                loop {
+                    let s = MemSnapshot::read(&device);
+                    peak.device_allocated = peak.device_allocated.max(s.device_allocated);
+                    peak.pool_live = peak.pool_live.max(s.pool_live);
+                    peak.pool_free = peak.pool_free.max(s.pool_free);
+                    peak.pool_pending = peak.pool_pending.max(s.pool_pending);
+                    peak.phys_footprint = peak.phys_footprint.max(s.phys_footprint);
+                    peak.working_set = s.working_set;
+                    samples += 1;
+                    if flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                (peak, samples)
+            });
+            Some((stop, handle))
+        } else {
+            None
+        };
+        Self { before, sampler }
+    }
+
+    pub fn finish(self, device: &Device) -> MemReport {
+        let (peak, samples) = match self.sampler {
+            Some((stop, handle)) => {
+                stop.store(true, Ordering::Release);
+                match handle.join() {
+                    Ok((p, n)) => (Some(p), n),
+                    Err(_) => (None, 0),
+                }
+            }
+            None => (None, 0),
+        };
+        MemReport {
+            before: self.before,
+            after: MemSnapshot::read(device),
+            peak,
+            samples,
+        }
+    }
+}
+
+/// The process's `phys_footprint` and resident size, from `proc_pid_rusage`
+/// (`RUSAGE_INFO_V6`; the two words at their struct offsets).
+#[cfg(target_os = "macos")]
+fn proc_footprint() -> Option<(u64, u64)> {
+    const RUSAGE_INFO_V6: i32 = 6;
+    const W_RESIDENT: usize = 8;
+    const W_PHYS: usize = 9;
+    const WORDS: usize = 64;
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+    }
+    let mut buf = [0u64; WORDS];
+    // SAFETY: `proc_pid_rusage` writes at most `sizeof(rusage_info_v6)` bytes
+    // (~472) into the buffer, and `WORDS * 8 = 512` is larger, so the write is
+    // in bounds; the buffer outlives the call.
+    let rc = unsafe {
+        proc_pid_rusage(
+            std::process::id() as i32,
+            RUSAGE_INFO_V6,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    Some((buf[W_PHYS], buf[W_RESIDENT]))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn proc_footprint() -> Option<(u64, u64)> {
+    None
 }
 
 /// The crown decode configuration `lfm2-chat --cache crown` bakes in: the

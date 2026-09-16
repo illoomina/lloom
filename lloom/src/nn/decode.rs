@@ -908,7 +908,7 @@ pub fn in_flight_mem_cap(_device: &Device) -> usize {
 /// a command buffer that never retires is a reported error. When the GPU is
 /// within the bound the marker is already complete and the wait is a status
 /// read.
-struct StepPacer {
+pub(crate) struct StepPacer {
     #[cfg(feature = "metal")]
     markers: std::collections::VecDeque<lloom_tensor::metal_backend::CommandMarker>,
     /// How many forwards the host may have in flight — the computed depth
@@ -923,7 +923,7 @@ struct StepPacer {
 }
 
 impl StepPacer {
-    fn new(depth: usize) -> Self {
+    pub(crate) fn new(depth: usize) -> Self {
         let depth = depth.max(IN_FLIGHT_FLOOR);
         Self {
             #[cfg(feature = "metal")]
@@ -968,7 +968,7 @@ impl StepPacer {
 
     /// Before encoding a forward: retire the oldest marker if the bound would
     /// otherwise be exceeded.
-    fn before_forward(&mut self, device: &Device) -> Result<()> {
+    pub(crate) fn before_forward(&mut self, device: &Device) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
             while self.markers.len() >= self.depth {
@@ -986,7 +986,7 @@ impl StepPacer {
     /// After encoding a forward: commit what the step encoded and keep the
     /// marker. The cut this makes lands at the step boundary -- the one
     /// dependency edge every step has, the publish the next forward reads.
-    fn after_forward(&mut self, device: &Device) -> Result<()> {
+    pub(crate) fn after_forward(&mut self, device: &Device) -> Result<()> {
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
             self.markers.push_back(m.flush_marker()?);

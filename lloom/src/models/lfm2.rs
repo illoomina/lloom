@@ -2078,6 +2078,11 @@ pub fn kv_grow_fits(allocated: usize, working_set: usize, fraction: f64, grow: u
     allocated.saturating_add(grow) <= kv_grow_budget(working_set, fraction)
 }
 
+/// The most cached causal masks a cache holds before the map is emptied: a
+/// decode step's `[1, kv_len]` mask and a prefill tile's `[tile, kv_len]` are
+/// each keyed on their `kv_len`, so a long run names one new shape per step or
+/// tile and nothing ever asks for an old one again.
+const MASK_CACHE_ENTRIES: usize = 16;
 /// Cache for LFM2 model supporting both attention KV cache and convolution state cache.
 #[derive(Debug, Clone)]
 pub struct Cache {
@@ -3107,6 +3112,16 @@ impl Cache {
         if let Some(mask) = self.masks.get(&(seq_len, kv_len)) {
             Ok(mask.clone())
         } else {
+            // Every distinct `(seq_len, kv_len)` is a new `[seq_len, kv_len]`
+            // u8 tensor, and a prefill fed in tiles onto a growing cache names
+            // a new pair per tile — unbounded, the entries sum to
+            // `seq_len · kv_len² / (2 · tile)` bytes over a prompt (8.6 GB for
+            // a 131k prompt in 512-token tiles). A mask is reused only across
+            // passes at the same shape, so the map is bounded here and dropped
+            // with the sequence state (`clear`).
+            if self.masks.len() >= MASK_CACHE_ENTRIES {
+                self.masks.clear();
+            }
             let mask = crate::utils::build_causal_mask(seq_len, index_pos, &self.device)?;
             self.masks.insert((seq_len, kv_len), mask.clone());
             Ok(mask)
@@ -3121,6 +3136,7 @@ impl Cache {
     /// sequence may have a different batch size, so keeping the allocation
     /// would pin `b_sz` from the previous one.
     pub fn clear(&mut self) {
+        self.masks.clear();
         self.kvs.iter_mut().for_each(|v| *v = None);
         self.kv_slots.iter_mut().for_each(|(k, v)| {
             k.reset();

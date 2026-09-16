@@ -133,8 +133,12 @@ struct Args {
     #[arg(long)]
     draft_dir: Option<PathBuf>,
 
-    /// The TILE: the most prompt tokens one prefill forward takes under
-    /// `--batch N` (lloom #728; `0` = unbounded). Default 512 at `N > 1`.
+    /// The TILE: the most prompt tokens one prefill forward takes (lloom
+    /// #728). Default 512 — the bound on a prefill's activation working set,
+    /// which otherwise grows with the prompt (~3.5 MB per token on the crown:
+    /// a 32k-token one-shot prefill is what panicked this machine, #148).
+    /// `0` is one forward over the whole prompt, admitted only if the memory
+    /// budget allows the KV ceiling's worth of activations.
     #[arg(long)]
     prefill_tile: Option<usize>,
 
@@ -143,6 +147,22 @@ struct Args {
     /// (`0` = a whole prompt at its arrival). Default 512 at `N > 1`.
     #[arg(long)]
     prefill_chunk: Option<usize>,
+
+    /// The fraction of Metal's `recommendedMaxWorkingSetSize` this process
+    /// may claim (`MemoryBudget`, §9.5d): the KV ceiling's worth of cache, the
+    /// tile's worth of activations and the weights are predicted at load and
+    /// refused if they do not fit; a KV grow past it is refused at the grow.
+    /// `0` turns admission off — the unguarded arm, for a measurement that
+    /// wants it.
+    #[arg(long, default_value_t = 0.65)]
+    memory_fraction: f64,
+
+    /// Sample the memory gauges at 10 ms around every benchmark cell and
+    /// report the peaks (`mem` on the response). A gauge run — it perturbs
+    /// the timing it sits beside — so off by default; `/health` reads the
+    /// gauges once at any time.
+    #[arg(long)]
+    mem_sample: bool,
 }
 
 /// State shared by every request thread.
@@ -178,7 +198,7 @@ fn main() -> Result<()> {
     };
 
     let batched = args.batch > 1;
-    let prefill_tile = args.prefill_tile.unwrap_or(if batched { 512 } else { 0 });
+    let prefill_tile = args.prefill_tile.unwrap_or(512);
     let prefill_chunk = args.prefill_chunk.unwrap_or(if batched { 512 } else { 0 });
     let dspark = if args.dspark {
         Some(args.draft_dir.clone().unwrap_or_default())
@@ -199,11 +219,13 @@ fn main() -> Result<()> {
         dspark,
         prefill_tile,
         prefill_chunk,
+        memory_fraction: args.memory_fraction,
+        mem_sample: args.mem_sample,
     })?;
     let model_name = engine.model_name.clone();
     eprintln!(
         "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} batch={} \
-         dspark={} prefill_tile={} prefill_chunk={}]",
+         dspark={} prefill_tile={} prefill_chunk={} memory_fraction={} mem_sample={}]",
         model_name,
         model_dir.display(),
         load_start.elapsed().as_secs_f64(),
@@ -218,6 +240,14 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| "off".to_string()),
         prefill_tile,
         prefill_chunk,
+        args.memory_fraction,
+        args.mem_sample,
+    );
+    eprintln!(
+        "[{}]",
+        engine::MemSnapshot::read(&engine.core.device)
+            .json()
+            .to_string()
     );
 
     let server = Server::http((args.host.as_str(), args.port))
@@ -253,7 +283,20 @@ fn main() -> Result<()> {
         let method = request.method().clone();
         match (method, path.as_str()) {
             (Method::Get, "/health") => {
-                let _ = respond_json(request, 200, &json!({}));
+                // The memory gauges, read once: what the process holds now.
+                let mem = engine::MemSnapshot::read(&shared.engine.core.device).json();
+                let _ = respond_json(
+                    request,
+                    200,
+                    &json!({
+                        "mem": mem,
+                        "batch": shared.engine.batch,
+                        "prefill_tile": shared.engine.prefill_tile,
+                        "prefill_chunk": shared.engine.prefill_chunk,
+                        "memory_fraction": shared.engine.memory_fraction,
+                        "kv_capacity": shared.engine.kv_capacity,
+                    }),
+                );
             }
             (Method::Get, "/v1/models") => {
                 let _ = respond_json(request, 200, &models_body(&shared.model_name));
@@ -644,6 +687,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         eos_ids,
         stop_strings,
         readback,
+        prefill_tile: shared.engine.prefill_tile,
     })
 }
 
@@ -762,8 +806,8 @@ fn prefill_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
     let total = t.prompt_tokens * t.batch;
     let prompt_tps = total as f64 / (t.prefill_ms / 1e3);
     eprintln!(
-        "[/prefill_throughput: prompt_tokens={} batch={} ({} forwards) prefill {:.2} ms = {prompt_tps:.1} tok/s aggregate]",
-        t.prompt_tokens, t.batch, t.forwards, t.prefill_ms
+        "[/prefill_throughput: prompt_tokens={} batch={} ({} forwards) prefill {:.2} ms = {prompt_tps:.1} tok/s aggregate; {}]",
+        t.prompt_tokens, t.batch, t.forwards, t.prefill_ms, t.mem.line()
     );
     Ok(json!({
         "prompt_tps": prompt_tps,
@@ -772,6 +816,7 @@ fn prefill_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
         "batch_prompt_tokens": total,
         "prefill_ms": t.prefill_ms,
         "forwards": t.forwards,
+        "mem": t.mem.json(),
     }))
 }
 
@@ -787,7 +832,7 @@ fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
     let per_row_tps = generation_tps / t.batch as f64;
     eprintln!(
         "[/decode_throughput: prompt_tokens={} decode_tokens={} batch={} context {:.2} ms, decode {:.2} ms \
-         = {generation_tps:.1} tok/s aggregate ({per_row_tps:.1} per row), readback={}, bracket: {}]",
+         = {generation_tps:.1} tok/s aggregate ({per_row_tps:.1} per row), readback={}, bracket: {}; {}]",
         t.prompt_tokens,
         t.decode_tokens,
         t.batch,
@@ -795,6 +840,7 @@ fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
         t.decode_ms,
         t.readback.name(),
         t.bracket,
+        t.mem.line(),
     );
     Ok(json!({
         "generation_tps": generation_tps,
@@ -807,6 +853,7 @@ fn decode_throughput(shared: &Shared, v: &Value) -> Handled<Value> {
         "context_ms": t.prefill_ms,
         "readback": t.readback.name(),
         "bracket": t.bracket,
+        "mem": t.mem.json(),
     }))
 }
 
@@ -845,6 +892,7 @@ fn max_memory_usage(shared: &Shared, v: &Value) -> Handled<Value> {
         max_tokens: decode_tokens,
         eos_ids: NEVER_EOS.to_vec(),
         readback: engine.readback,
+        prefill_tile: engine.prefill_tile,
         ..DecodeParams::default()
     };
     let prompts: Vec<Vec<u32>> = (0..batch)
@@ -882,6 +930,7 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
         max_tokens: decode_tokens,
         eos_ids: NEVER_EOS.to_vec(),
         readback: engine.readback,
+        prefill_tile: engine.prefill_tile,
         ..DecodeParams::default()
     };
     if batch == 1 {
@@ -1044,6 +1093,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             eos_ids: engine.text.eos_ids.clone(),
                             stop_strings: Vec::new(),
                             readback: engine.readback,
+                            prefill_tile: engine.prefill_tile,
                         };
                         let mut pending = String::new();
                         let started = Instant::now();

@@ -34,7 +34,7 @@ use std::borrow::BorrowMut;
 use crate::generation::{HotThread, LogitsProcessor, Sampling};
 use crate::nn::decode::{
     begin_pass, end_executor_step, end_pass, ladder_width, ragged_layout, tile_widths,
-    DecodeOptions, DecodeOut, DecodeStats, PassShape, PassWidths,
+    DecodeOptions, DecodeOut, DecodeStats, PassShape, PassWidths, StepPacer,
 };
 use crate::nn::model::{BatchedCausalLM, RaggedRow, Row};
 use crate::nn::speculator::Session;
@@ -138,6 +138,19 @@ pub struct BatchDecoder<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> {
     /// The batch argmax, for the device arm (argmax needs no seed).
     device_sampler: LogitsProcessor,
     hot_thread: HotThread,
+    /// The bound on how many forwards the host may have in flight, as the
+    /// single-sequence loop bounds it (`opts.pacer_depth()`, the floor of 2).
+    ///
+    /// Without it a step with no live row — the prompt-only phase of a
+    /// closed batch, every tile of a whole-prompt admission — has no readback
+    /// to wait on, and the host encodes every tile back to back: their
+    /// activations are all `pending` at once (§9.5o), bounded only by
+    /// Metal's per-queue command-buffer cap. Measured before this bound
+    /// (`issue-148-raw/ctx128k/ladder-tiled.log`): a 512-token tile at
+    /// 8192 → 65536 tokens peaked at 11–13 GB of `pending`, 17–20 GB
+    /// device-allocated, against the ~4 GB two tiles' worth the tile is
+    /// meant to bound (#728 §2).
+    pacer: StepPacer,
 }
 
 impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R> {
@@ -157,6 +170,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 opts.lookahead
             );
         }
+        let depth = opts.pacer_depth();
         Ok(Self {
             opts,
             eos_ids: eos_ids.to_vec(),
@@ -170,6 +184,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
             finished: Vec::new(),
             device_sampler: LogitsProcessor::from_sampling(0, Sampling::ArgMax),
             hot_thread: HotThread::claim(),
+            pacer: StepPacer::new(depth),
         })
     }
 
@@ -451,6 +466,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 let unit = &slot.prompt[off..off + w];
                 let input = Tensor::new(unit, &device)?.unsqueeze(0)?;
                 s.model.prepare_pass(&mut s.seq.cache, w)?;
+                self.pacer.before_forward(&device)?;
                 begin_pass(
                     &device,
                     PassShape::Prefill {
@@ -460,6 +476,7 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 )?;
                 let out = s.model.forward(&input, s.seq.pos, &mut s.seq.cache);
                 end_pass(&device)?;
+                self.pacer.after_forward(&device)?;
                 last = Some(out?);
                 s.seq.pos += w;
                 s.seq.tokens.extend_from_slice(unit);
@@ -909,9 +926,11 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 cache: &mut s.seq.cache,
             })
             .collect();
+        self.pacer.before_forward(input.device())?;
         begin_pass(input.device(), shape)?;
         let logits = model.forward_ragged(input, &mut rows)?;
         end_pass(input.device())?;
+        self.pacer.after_forward(input.device())?;
         drop(rows);
         for (s, len) in picked {
             s.seq.pos += len;
@@ -949,9 +968,11 @@ impl<'m, M: BatchedCausalLM, R: BorrowMut<Session<'m, M>>> BatchDecoder<'m, M, R
                 cache: &mut s.seq.cache,
             })
             .collect();
+        self.pacer.before_forward(input.device())?;
         begin_pass(input.device(), PassShape::Decode { b: live.len() })?;
         let logits = model.forward_rows(input, &mut rows)?;
         end_pass(input.device())?;
+        self.pacer.after_forward(input.device())?;
         drop(rows);
         for s in picked {
             s.seq.pos += 1;

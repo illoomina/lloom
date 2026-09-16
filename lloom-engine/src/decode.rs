@@ -143,6 +143,13 @@ pub struct DecodeParams {
     pub stop_strings: Vec<String>,
     /// Which readback arm the run takes; [`ReadbackArm::Auto`] by default.
     pub readback: ReadbackArm,
+    /// The TILE: the most prompt tokens one prefill forward takes
+    /// (`DecodeOptions::prefill_tile`, lloom #728). `0` is one forward over
+    /// the whole prompt, whose activation working set grows with the prompt
+    /// (~3.5 MB per token on the crown); a positive tile bounds it to the
+    /// tile's worth whatever the prompt. The model's `conv_prefill_ctx` must
+    /// be on for a tiled prefill to compute what one pass does.
+    pub prefill_tile: usize,
 }
 
 impl Default for DecodeParams {
@@ -155,6 +162,7 @@ impl Default for DecodeParams {
             eos_ids: Vec::new(),
             stop_strings: Vec::new(),
             readback: ReadbackArm::Auto,
+            prefill_tile: 0,
         }
     }
 }
@@ -373,6 +381,34 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         self.session.tokens()
     }
 
+    /// Feed `prompt_ids` onto the session's cache and produce nothing
+    /// (`Session::prefill`): the prompt in tiles of `params.prefill_tile`
+    /// tokens, each forward paced against the GPU exactly as the decode loop
+    /// paces its own — at most `IN_FLIGHT_FLOOR` forwards in flight, so the
+    /// activation working set is two tiles' worth whatever the prompt (#728
+    /// §2). The session's held logits are the resumable state afterwards.
+    ///
+    /// The prefill-throughput cell's entry: a tile loop written by hand
+    /// around `forward` has no pacer, and the host then encodes every tile
+    /// back to back with all of their activations `pending` at once
+    /// (`issue-148-serving-batch.md` §7: 11.4 GB against 4.5 GB paced, same
+    /// tile, same prompt).
+    pub fn prefill(
+        &mut self,
+        prompt_ids: &[u32],
+        params: &DecodeParams,
+    ) -> Result<lloom::nn::PrefillOut> {
+        if params.eos_ids.is_empty() {
+            lloom_tensor::bail!("DecodeSession::prefill: eos_ids is empty; a run needs an EOS set");
+        }
+        let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+        let opts = DecodeOptions {
+            prefill_tile: params.prefill_tile,
+            ..DecodeOptions::new(params.max_tokens.max(1))
+        };
+        self.session.prefill(&mut readback, prompt_ids, &opts)
+    }
+
     /// Decode `prompt_ids` — the whole sequence to continue — streaming each
     /// completed text fragment to `on_fragment` as it is produced. Returns the
     /// full decoded run.
@@ -456,7 +492,10 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let out: DecodeOut = match arm {
             ReadbackArm::Blocking => {
                 let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
-                let opts = DecodeOptions::new(params.max_tokens);
+                let opts = DecodeOptions {
+                    prefill_tile: params.prefill_tile,
+                    ..DecodeOptions::new(params.max_tokens)
+                };
                 self.session.decode_until(
                     &mut spec,
                     &mut readback,
@@ -498,7 +537,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     stop: None,
                     eos_gate: false,
                     fused_publish: true,
-                    prefill_tile: 0,
+                    prefill_tile: params.prefill_tile,
                     prefill_chunk: 0,
                 };
                 self.session.decode_until(

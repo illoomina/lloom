@@ -237,6 +237,10 @@ pub struct DecodeTiming {
     pub bracket: &'static str,
     /// Per row, the tokens decoded inside the bracket.
     pub row_tokens: Vec<usize>,
+    /// Per row, the speculative rounds run and the mean accepted per round
+    /// (empty on the K=1 arms).
+    pub row_rounds: Vec<usize>,
+    pub row_accepted: Vec<f64>,
     pub mem: MemReport,
 }
 
@@ -1018,8 +1022,20 @@ impl Engine {
                     prefill_ms,
                     decode_ms: (wall - prefill_ms).max(0.0),
                     readback: ReadbackArm::Speculative { k },
-                    bracket: "run wall minus the prompts' submit; the prefills' GPU tail is inside",
+                    bracket: if pooled {
+                        "run wall minus the join prefills (each waited on: the rounds alone)"
+                    } else {
+                        "run wall minus the prompts' submit; the prefills' GPU tail is inside"
+                    },
                     row_tokens: outs.iter().map(|o| o.ids.len()).collect(),
+                    row_rounds: outs.iter().map(|o| o.stats.rounds.len()).collect(),
+                    row_accepted: outs
+                        .iter()
+                        .map(|o| {
+                            let n = o.stats.rounds.len().max(1) as f64;
+                            o.stats.rounds.iter().map(|r| r.accepted as f64).sum::<f64>() / n
+                        })
+                        .collect(),
                     mem: MemReport::default(),
                 }
                     } else {
@@ -1092,6 +1108,8 @@ impl Engine {
                     readback: ReadbackArm::Batched { rows: batch },
                     bracket: "D batched steps after every row's context, resumed from held logits",
                     row_tokens: outs.iter().map(|o| o.ids.len()).collect(),
+                    row_rounds: Vec::new(),
+                    row_accepted: Vec::new(),
                     mem: MemReport::default(),
                 }
                     };
@@ -1145,6 +1163,8 @@ impl Engine {
                     readback: run.readback,
                     bracket: "run wall minus the prompt's submit; the prefill's GPU tail is inside",
                     row_tokens: vec![run.tokens.len()],
+                row_rounds: Vec::new(),
+                row_accepted: Vec::new(),
                     mem: MemReport::default(),
                 });
             }
@@ -1204,6 +1224,8 @@ impl Engine {
                 readback: run.readback,
                 bracket: "D steps after the context, resumed from held logits",
                 row_tokens: vec![run.tokens.len()],
+                row_rounds: Vec::new(),
+                row_accepted: Vec::new(),
                 mem: MemReport::default(),
             })
         })?;

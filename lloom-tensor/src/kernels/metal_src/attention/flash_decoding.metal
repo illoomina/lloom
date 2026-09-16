@@ -88,7 +88,7 @@ using namespace metal;
 /// rather than either side asserting its own (§11.3d).
 ///
 /// The int32 count is kept even so the `size_t` block stays naturally aligned;
-/// `_pad` exists for that reason alone.
+/// `n_keys_stride` sits in what was the padding slot.
 struct FlashPartialParams {
   /// Query heads per KV head. 4 for LFM2 (32 q heads, 8 kv heads, §5.2).
   int gqa_factor;
@@ -138,11 +138,12 @@ struct FlashPartialParams {
   /// Entries between two sequences' chunk tables. 0 when every sequence reads
   /// the same table (the contiguous cache, where the table is the identity).
   int table_stride;
-  /// Padding to keep the `size_t` block naturally aligned and the struct's
-  /// layout stated rather than inferred. Written by the Rust side as 0 and read
-  /// by nothing; `flash_params_layout` asserts the offsets either way, so this
-  /// is a declaration of intent rather than a load-bearing field.
-  int _pad;
+  /// Entries between two sequences' live key counts in the `n_keys_per_seq`
+  /// buffer: 0 when every sequence reads entry 0 (a lockstep batch, the
+  /// contiguous cache), 1 when row `b` reads its own (`batched-decode-design.md`
+  /// §12.2: a ragged batch through one dispatch). Took the `_pad` slot that
+  /// kept the `int` count even, so the layout is unchanged.
+  int n_keys_stride;
   /// Distance between two KV heads, in elements. `k_stride[1]` -- the same
   /// quantity `sdpa_vector` takes, and it is the RESERVED capacity where
   /// `n_keys` is the LIVE length. Those being different numbers is what lets a
@@ -351,6 +352,11 @@ template <typename T, int D>
     // header note on why a B=1 gate cannot otherwise discriminate.
     const device uint* chunk_table [[buffer(6)]],
     const device FlashPartialParams* params [[buffer(7)]],
+    // The live key count per sequence: `n_keys_per_seq[seq * n_keys_stride]`.
+    // A ragged batch (§12.2) gives every row its own; a chunk past a row's
+    // count is an EMPTY range and writes the merge's identity below, so the
+    // dispatch depth is the longest row's and the combine needs no change.
+    const device int* n_keys_per_seq [[buffer(8)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -368,12 +374,12 @@ template <typename T, int D>
   // `device` is general memory where `constant` is a cached read-only space,
   // and these are read inside the key loop.
   const FlashPartialParams p = *params;
-  const int n_keys = p.n_keys;
   const int pages_per_chunk = p.pages_per_chunk;
   const int page_size = p.page_size;
 
   const int head_idx = tid.y;
   const int chunk_idx = tid.z;
+  const int n_keys = n_keys_per_seq[(size_t)(head_idx / p.heads_per_seq) * p.n_keys_stride];
 
   // The chunk's KV range, resolved ONCE at chunk entry rather than per key
   // (§10.3d). At `k = 1` this is one table read; at `k > 1` it is `k` of them,
@@ -489,6 +495,7 @@ template <typename T, int D>
     // single-chunk path that assumed `[0, n_keys)` was correct for every
     // contiguous cache and silently wrong for a recycled one (§10.3h).
     const device uint* chunk_table [[buffer(5)]],
+    const device int* n_keys_per_seq [[buffer(6)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -505,6 +512,7 @@ template <typename T, int D>
   const FlashPartialParams p = *params;
   const int head_idx = tid.y;
   const int seq_idx = head_idx / p.heads_per_seq;
+  const int n_keys = n_keys_per_seq[(size_t)seq_idx * p.n_keys_stride];
 
   // The whole live range, starting at the single chunk's first page. This
   // kernel is dispatched only when the caller computed `n_chunks == 1`, so
@@ -515,7 +523,7 @@ template <typename T, int D>
   U sum_exp_score, new_max, factor;
   bool empty;
   flash_decoding_core<T, D, BN, BD, elem_per_thread>(
-      queries, keys, values, p, start, start + p.n_keys, outputs, max_scores,
+      queries, keys, values, p, start, start + n_keys, outputs, max_scores,
       sum_exp_scores, o, sum_exp_score, new_max, factor, empty, head_idx,
       simd_gid, simd_lid);
 
@@ -727,8 +735,8 @@ template <typename T>
 
 // 96: **ten** `int` fill 0..40, the six `size_t` land 8-aligned at 40..88, and
 // the two `float` at 88..96 need no trailing pad because 96 is a multiple of the
-// struct's 8-byte alignment. `_pad` is what makes the `int` count even and
-// keeps that true.
+// struct's 8-byte alignment. `n_keys_stride` is what makes the `int` count
+// even and keeps that true.
 //
 // A `static_assert` catches the author's arithmetic, and
 // `every_family_params_layout_matches_metal` catches the two *sides*
@@ -814,6 +822,7 @@ static_assert(alignof(FlashScatterParams) == 8, "FlashScatterParams alignment");
       device float* maxs [[buffer(5)]],                                       \
       const device uint* chunk_table [[buffer(6)]],                           \
       const device FlashPartialParams* params [[buffer(7)]],                  \
+      const device int* n_keys_per_seq [[buffer(8)]],                         \
       uint3 tid [[threadgroup_position_in_grid]],                             \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
       uint simd_lid [[thread_index_in_simdgroup]]);                           \
@@ -836,6 +845,7 @@ static_assert(alignof(FlashScatterParams) == 8, "FlashScatterParams alignment");
       device type* out [[buffer(3)]],                                         \
       const device FlashPartialParams* params [[buffer(4)]],                  \
       const device uint* chunk_table [[buffer(5)]],                           \
+      const device int* n_keys_per_seq [[buffer(6)]],                         \
       uint3 tid [[threadgroup_position_in_grid]],                             \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
       uint simd_lid [[thread_index_in_simdgroup]]);

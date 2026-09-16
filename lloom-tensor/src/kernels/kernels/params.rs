@@ -1114,7 +1114,7 @@ pub fn expected_sdpa_quant_layout() -> Vec<(&'static str, u32)> {
 ///
 /// Field order mirrors the Metal struct exactly: **eight** `int` then four
 /// `size_t` then two `float`, so the `size_t`s land 8-aligned with no interior
-/// padding. The count was six before #234, and `_pad` is what keeps it even —
+/// padding. The count was six before #234, and `n_keys_stride` (once padding) is what keeps it even —
 /// adding `chunk_capacity` alone would have made it seven and inserted four
 /// bytes of padding the layout check would then have had to explain rather than
 /// state. `flash_params_layout` ships the real offsets across the boundary
@@ -1139,10 +1139,12 @@ pub struct FlashPartialParams {
     pub heads_per_seq: i32,
     /// Entries between two sequences' chunk tables; 0 when they share one.
     pub table_stride: i32,
-    /// Keeps the `int` block even so the `size_t`s stay naturally aligned.
-    /// Written as 0 and read by nothing; the layout kernel asserts the offsets
-    /// either way, so this states an intent rather than carrying a value.
-    pub _pad: i32,
+    /// Entries between two sequences' live key counts in the kernel's
+    /// `n_keys_per_seq` buffer: 0 when every row reads entry 0 (a lockstep
+    /// batch, the contiguous cache — `n_keys` above is that entry), 1 when
+    /// row `b` reads its own (a ragged batch, `batched-decode-design.md`
+    /// §12.2). Occupies the slot that kept the `int` block even.
+    pub n_keys_stride: i32,
     pub k_head_stride: u64,
     pub v_head_stride: u64,
     pub k_token_stride: u64,
@@ -1152,6 +1154,18 @@ pub struct FlashPartialParams {
     pub v_seq_stride: u64,
     pub scale: f32,
     pub softcapping: f32,
+}
+
+impl FlashPartialParams {
+    /// Read the live key count per sequence (`n_keys_per_seq[b]`) rather than
+    /// one count for the batch: a ragged batch through one dispatch (§12.2).
+    /// `n_keys` stays the LONGEST row's — the dispatch depth — and a chunk past
+    /// a row's own count is an empty range the partial writes as the merge's
+    /// identity, so the combine is unchanged.
+    pub fn with_keys_per_sequence(mut self) -> Self {
+        self.n_keys_stride = 1;
+        self
+    }
 }
 
 /// `flash_decoding_combine`'s scalars.

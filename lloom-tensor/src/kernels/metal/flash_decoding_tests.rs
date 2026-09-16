@@ -253,6 +253,7 @@ fn run_flash_sized(
     // writes one entry per walked chunk, so a larger buffer would leave a tail
     // the merge-order assertion cannot interpret.
     let walk = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
+    let keys_buf = new_u32(device, &[n_keys as u32]);
 
     let q_shape = [1usize, n_q_heads, 1, head_dim];
     let k_shape = [1usize, n_kv_heads, n_keys, head_dim];
@@ -308,6 +309,7 @@ fn run_flash_sized(
             &pp,
             &cp,
             &walk,
+            &keys_buf,
             n_q_heads,
             head_dim,
             n_chunks,
@@ -1140,6 +1142,253 @@ fn b_sequences_read_one_pool_through_their_own_tables() {
     }
 }
 
+/// A RAGGED batch — three sequences of 40, 17 and 100 live keys over one pool
+/// through one dispatch pair — reads each row's OWN live count
+/// (`n_keys_per_seq`, `batched-decode-design.md` §12.2) and reproduces each
+/// row's B=1 answer bit for bit. The dispatch depth is the longest row's
+/// (4 chunks at page 32); the shorter rows' spare chunks are empty ranges
+/// the partial writes as the merge's identity, and the combine — unchanged,
+/// walking every chunk by index — must skip them, which the walk order
+/// (every chunk visited, for every row) and the bits together assert.
+#[test]
+fn ragged_rows_read_their_own_live_counts_bit_for_bit() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let head_dim = 64;
+    let heads_per_seq = 4;
+    let n_kv_heads = 2;
+    let page_size = 32;
+    let pool_pages = 8;
+    let keys = [40usize, 17, 100];
+    let n_seqs = keys.len();
+    let longest = 100;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n_chunks = flash_chunk_count(longest, page_size);
+    assert_eq!(n_chunks, 4);
+
+    // Interleaved page sets; every row's table is padded to the longest
+    // row's chunk count with a page the row never reads.
+    let tables: [Vec<u32>; 3] = [vec![6, 1, 0, 0], vec![3, 0, 0, 0], vec![7, 2, 5, 4]];
+    let table_stride = 4;
+
+    let capacity = 128;
+    let mut references = Vec::new();
+    let mut pool_k = vec![-7.0f32; n_kv_heads * pool_pages * page_size * head_dim];
+    let mut pool_v = pool_k.clone();
+    let mut all_queries = Vec::new();
+    for (b, table) in tables.iter().enumerate() {
+        let n_keys = keys[b];
+        let own_chunks = flash_chunk_count(n_keys, page_size);
+        let queries = fill(heads_per_seq * head_dim, 171 + b as u32);
+        let logical_k = fill(n_kv_heads * n_keys * head_dim, 181 + b as u32);
+        let logical_v = fill(n_kv_heads * n_keys * head_dim, 191 + b as u32);
+        let (contig_k, contig_v) = lay_out_contiguous(
+            &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, capacity,
+        );
+        references.push(run_flash_raw(
+            &device,
+            &kernels,
+            &queries,
+            &contig_k,
+            &contig_v,
+            FlashGeometry {
+                n_seqs: 1,
+                heads_per_seq,
+                n_kv_heads,
+                head_dim,
+                n_keys,
+                page_size,
+                pages_per_chunk: 1,
+                k_stride: [
+                    n_kv_heads * capacity * head_dim,
+                    capacity * head_dim,
+                    head_dim,
+                    1,
+                ],
+                table: ChunkTable::Contiguous.entries(own_chunks, 1),
+                table_stride: 0,
+            },
+            scale,
+        ));
+        let (pk, pv) = lay_out_paged(
+            &logical_k,
+            &logical_v,
+            n_kv_heads,
+            n_keys,
+            head_dim,
+            page_size,
+            pool_pages,
+            &table[..own_chunks],
+        );
+        for (c, table_page) in table[..own_chunks].iter().enumerate() {
+            for h in 0..n_kv_heads {
+                let live = (n_keys - c * page_size).min(page_size);
+                let base = h * pool_pages * page_size * head_dim
+                    + (*table_page as usize) * page_size * head_dim;
+                let n = live * head_dim;
+                pool_k[base..base + n].copy_from_slice(&pk[base..base + n]);
+                pool_v[base..base + n].copy_from_slice(&pv[base..base + n]);
+            }
+        }
+        all_queries.extend_from_slice(&queries);
+    }
+
+    let batched = run_flash_with(
+        &device,
+        &kernels,
+        &all_queries,
+        &pool_k,
+        &pool_v,
+        FlashGeometry {
+            n_seqs,
+            heads_per_seq,
+            n_kv_heads,
+            head_dim,
+            n_keys: longest,
+            page_size,
+            pages_per_chunk: 1,
+            k_stride: [0, pool_pages * page_size * head_dim, head_dim, 1],
+            table: tables.concat(),
+            table_stride,
+        },
+        Some(&keys),
+        scale,
+    );
+    let row = heads_per_seq * head_dim;
+    for (b, reference) in references.iter().enumerate() {
+        assert_eq!(
+            &batched.out[b * row..(b + 1) * row],
+            &reference.out[..],
+            "row {b} ({} keys) must reproduce its own B=1 answer bit for bit through its own \
+             table and live count (DESIGN.md 2.3.3 #7; batched-decode-design.md 12.2)",
+            keys[b]
+        );
+        // The spare chunks past the row's own are the merge's identity.
+        let own_chunks = flash_chunk_count(keys[b], page_size);
+        for h in 0..heads_per_seq {
+            let head = b * heads_per_seq + h;
+            for c in own_chunks..n_chunks {
+                assert_eq!(batched.sums[head * n_chunks + c], 0.0, "row {b} head {h} chunk {c}");
+                assert_eq!(
+                    batched.maxs[head * n_chunks + c],
+                    f32::NEG_INFINITY,
+                    "row {b} head {h} chunk {c}"
+                );
+            }
+            // The combine walked every chunk by index, empties included.
+            let walked = &batched.walk[head * n_chunks..(head + 1) * n_chunks];
+            assert_eq!(walked, &[0, 1, 2, 3], "row {b} head {h} walk order");
+        }
+    }
+}
+
+/// The same ragged batch on the SINGLE-CHUNK path: 20, 7 and 32 live keys at
+/// page 32 is one chunk for every row, so `flash_decoding_single` runs and
+/// reads each row's own count — the path the multi-chunk fixture above never
+/// reaches (a mutation there survived it; this is the test that kills it).
+#[test]
+fn ragged_rows_on_the_single_chunk_path_read_their_own_live_counts() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let head_dim = 64;
+    let heads_per_seq = 4;
+    let n_kv_heads = 2;
+    let page_size = 32;
+    let pool_pages = 4;
+    let keys = [20usize, 7, 32];
+    let n_seqs = keys.len();
+    let longest = 32;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    assert_eq!(flash_chunk_count(longest, page_size), 1);
+
+    let tables: [Vec<u32>; 3] = [vec![2], vec![0], vec![3]];
+    let table_stride = 1;
+
+    let capacity = 64;
+    let mut references = Vec::new();
+    let mut pool_k = vec![-7.0f32; n_kv_heads * pool_pages * page_size * head_dim];
+    let mut pool_v = pool_k.clone();
+    let mut all_queries = Vec::new();
+    for (b, table) in tables.iter().enumerate() {
+        let n_keys = keys[b];
+        let queries = fill(heads_per_seq * head_dim, 271 + b as u32);
+        let logical_k = fill(n_kv_heads * n_keys * head_dim, 281 + b as u32);
+        let logical_v = fill(n_kv_heads * n_keys * head_dim, 291 + b as u32);
+        let (contig_k, contig_v) = lay_out_contiguous(
+            &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, capacity,
+        );
+        references.push(run_flash_raw(
+            &device,
+            &kernels,
+            &queries,
+            &contig_k,
+            &contig_v,
+            FlashGeometry {
+                n_seqs: 1,
+                heads_per_seq,
+                n_kv_heads,
+                head_dim,
+                n_keys,
+                page_size,
+                pages_per_chunk: 1,
+                k_stride: [
+                    n_kv_heads * capacity * head_dim,
+                    capacity * head_dim,
+                    head_dim,
+                    1,
+                ],
+                table: ChunkTable::Contiguous.entries(1, 1),
+                table_stride: 0,
+            },
+            scale,
+        ));
+        let (pk, pv) = lay_out_paged(
+            &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, page_size, pool_pages, table,
+        );
+        for h in 0..n_kv_heads {
+            let base = h * pool_pages * page_size * head_dim
+                + (table[0] as usize) * page_size * head_dim;
+            let n = n_keys * head_dim;
+            pool_k[base..base + n].copy_from_slice(&pk[base..base + n]);
+            pool_v[base..base + n].copy_from_slice(&pv[base..base + n]);
+        }
+        all_queries.extend_from_slice(&queries);
+    }
+
+    let batched = run_flash_with(
+        &device,
+        &kernels,
+        &all_queries,
+        &pool_k,
+        &pool_v,
+        FlashGeometry {
+            n_seqs,
+            heads_per_seq,
+            n_kv_heads,
+            head_dim,
+            n_keys: longest,
+            page_size,
+            pages_per_chunk: 1,
+            k_stride: [0, pool_pages * page_size * head_dim, head_dim, 1],
+            table: tables.concat(),
+            table_stride,
+        },
+        Some(&keys),
+        scale,
+    );
+    let row = heads_per_seq * head_dim;
+    for (b, reference) in references.iter().enumerate() {
+        assert_eq!(
+            &batched.out[b * row..(b + 1) * row],
+            &reference.out[..],
+            "row {b} ({} keys) on the single-chunk path must reproduce its own B=1 answer",
+            keys[b]
+        );
+    }
+}
+
 /// The KV write lands each `(sequence, token)` row at the slot its table names
 /// and nowhere else — asserted against a CPU placement of the same bytes,
 /// poison included.
@@ -1431,10 +1680,40 @@ fn run_flash_raw(
     g: FlashGeometry,
     scale: f32,
 ) -> FlashRun {
+    run_flash_with(device, kernels, queries, keys, values, g, None, scale)
+}
+
+/// [`run_flash_raw`] with a live key count PER SEQUENCE when `keys_per_seq`
+/// is given (`g.n_keys` is then the longest row's, the dispatch depth), the
+/// ragged batch `batched-decode-design.md` §12.2 reads in one dispatch.
+#[allow(clippy::too_many_arguments)]
+fn run_flash_with(
+    device: &Device,
+    kernels: &Kernels,
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    g: FlashGeometry,
+    keys_per_seq: Option<&[usize]>,
+    scale: f32,
+) -> FlashRun {
     let cmds = commands(device);
     let n_q_heads = g.n_seqs * g.heads_per_seq;
     let chunk_size = g.page_size * g.pages_per_chunk;
     let n_chunks = flash_chunk_count(g.n_keys, chunk_size);
+    if let Some(k) = keys_per_seq {
+        assert_eq!(k.len(), g.n_seqs, "one live count per sequence");
+        assert_eq!(
+            k.iter().copied().max(),
+            Some(g.n_keys),
+            "`n_keys` is the longest row's"
+        );
+    }
+    let key_counts: Vec<u32> = match keys_per_seq {
+        Some(k) => k.iter().map(|&n| n as u32).collect(),
+        None => vec![g.n_keys as u32],
+    };
+    let keys_buf = new_u32(device, &key_counts);
     assert!(
         g.table.len() >= n_chunks + (g.n_seqs - 1) * g.table_stride,
         "the table must cover every sequence's chunks"
@@ -1456,23 +1735,24 @@ fn run_flash_raw(
 
     let q_shape = [g.n_seqs, g.heads_per_seq, 1, g.head_dim];
     let k_shape = [g.n_seqs, g.n_kv_heads, g.n_keys, g.head_dim];
-    let pp = write_struct(
-        device,
-        FlashPartialParams::for_step(
-            &q_shape,
-            &k_shape,
-            &g.k_stride,
-            &g.k_stride,
-            g.page_size,
-            g.pages_per_chunk,
-            n_chunks,
-            n_chunks,
-            g.table_stride,
-            scale,
-            1.0,
-        )
-        .unwrap(),
-    );
+    let mut partial = FlashPartialParams::for_step(
+        &q_shape,
+        &k_shape,
+        &g.k_stride,
+        &g.k_stride,
+        g.page_size,
+        g.pages_per_chunk,
+        n_chunks,
+        n_chunks,
+        g.table_stride,
+        scale,
+        1.0,
+    )
+    .unwrap();
+    if keys_per_seq.is_some() {
+        partial = partial.with_keys_per_sequence();
+    }
+    let pp = write_struct(device, partial);
     let cp = write_struct(device, FlashCombineParams::for_step(n_chunks, n_chunks));
 
     {
@@ -1495,6 +1775,7 @@ fn run_flash_raw(
             &pp,
             &cp,
             &walk,
+            &keys_buf,
             n_q_heads,
             g.head_dim,
             n_chunks,
@@ -1586,6 +1867,7 @@ fn run_partials(
     let maxs = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
     let table_buf = new_u32(device, &table.entries(n_chunks, 1));
     let walk = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
+    let keys_buf = new_u32(device, &[n_keys as u32]);
 
     let q_shape = [1usize, n_q_heads, 1, head_dim];
     let k_shape = [1usize, n_kv_heads, n_keys, head_dim];
@@ -1628,6 +1910,7 @@ fn run_partials(
             &pp,
             &cp,
             &walk,
+            &keys_buf,
             n_q_heads,
             head_dim,
             n_chunks,
@@ -1783,6 +2066,7 @@ fn token_stride_is_read_from_the_parameter() {
     let maxs = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
     let table_buf = new_u32(&device, &ChunkTable::Contiguous.entries(n_chunks, 1));
     let walk = device.new_buffer(n_q_heads * n_chunks * 4, SHARED).unwrap();
+    let keys_buf = new_u32(&device, &[n_keys as u32]);
 
     let q_shape = [1usize, n_q_heads, 1, head_dim];
     let k_shape = [1usize, n_kv_heads, n_keys, head_dim];
@@ -1821,6 +2105,7 @@ fn token_stride_is_read_from_the_parameter() {
             &pp,
             &cp,
             &walk,
+            &keys_buf,
             n_q_heads,
             head_dim,
             n_chunks,
@@ -1939,6 +2224,7 @@ fn walk_order_of(
     // plausible 0 -- the same reason 9.1a reads its partials back against a
     // poisoned buffer instead of trusting a zero.
     let walk = new_u32(device, &vec![u32::MAX; n_q_heads * n_chunks]);
+    let keys_buf = new_u32(device, &[n_keys as u32]);
 
     let q_shape = [1usize, n_q_heads, 1, head_dim];
     let k_shape = [1usize, n_kv_heads, n_keys, head_dim];
@@ -1981,6 +2267,7 @@ fn walk_order_of(
             &pp,
             &cp,
             &walk,
+            &keys_buf,
             n_q_heads,
             head_dim,
             n_chunks,

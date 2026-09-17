@@ -64,6 +64,13 @@ pub enum ReadbackArm {
         lookahead: usize,
         /// Steps between commits of the in-flight queue; `1` is per-token.
         commit_steps: usize,
+        /// The adaptive commit (`lfm2-chat --adaptive-commit --stream-reader`):
+        /// a buffer is closed when the GPU starts the previous one rather than
+        /// every `commit_steps`, and the token drain is a reader thread's, off
+        /// the loop's path. Measured +0.5 tok/s on the B=1 crown (#148, record
+        /// §8.1). Needs a CPU-mapped ring and lookahead 1; falls back to the
+        /// fixed cadence where the ring has no reader.
+        adaptive: bool,
     },
     /// The speculative body ([`Session::decode_speculative`]): a DSpark
     /// drafter proposes `k` tokens a round and the target verifies them in
@@ -89,6 +96,15 @@ impl ReadbackArm {
     pub const CROWN: ReadbackArm = ReadbackArm::Ring {
         lookahead: 1,
         commit_steps: 8,
+        adaptive: true,
+    };
+
+    /// The ring arm at the fixed cadence — the crown before the adaptive
+    /// commit (`--readback ring-fixed`): the A/B control, not a default.
+    pub const RING_FIXED: ReadbackArm = ReadbackArm::Ring {
+        lookahead: 1,
+        commit_steps: 8,
+        adaptive: false,
     };
 
     /// Whether the ring arm can serve `sampling` without a host round trip
@@ -120,7 +136,11 @@ impl ReadbackArm {
             ReadbackArm::Ring {
                 lookahead,
                 commit_steps,
-            } => format!("ring-nonblocking lookahead={lookahead} commit_steps={commit_steps}"),
+                adaptive,
+            } => format!(
+                "ring-nonblocking lookahead={lookahead} commit_steps={commit_steps}{}",
+                if adaptive { " adaptive" } else { "" }
+            ),
             ReadbackArm::Speculative { k } => format!("dspark k={k}"),
             ReadbackArm::Batched { rows } => format!("batched rows={rows}"),
         }
@@ -431,9 +451,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     pub fn decode(
         &mut self,
         prompt_ids: &[u32],
-        detokenize: impl FnMut(&[u32]) -> Result<String>,
+        detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
         params: &DecodeParams,
-        mut on_fragment: impl FnMut(&str),
+        mut on_fragment: impl FnMut(&str) + Send,
     ) -> Result<Decoded>
     where
         M::Cache: CacheRewind + CacheReset,
@@ -452,9 +472,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
     pub fn decode_until(
         &mut self,
         prompt_ids: &[u32],
-        mut detokenize: impl FnMut(&[u32]) -> Result<String>,
+        mut detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
         params: &DecodeParams,
-        mut on_fragment: impl FnMut(&str) -> bool,
+        mut on_fragment: impl FnMut(&str) -> bool + Send,
     ) -> Result<Decoded>
     where
         M::Cache: CacheRewind + CacheReset,
@@ -508,12 +528,22 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             ReadbackArm::Ring {
                 lookahead,
                 commit_steps,
+                adaptive,
             } => {
                 // The pool's ring for this EOS set: built once per process (or
                 // at load, `RingPool::prepare`) and reused by every run.
                 let readback = self
                     .rings
                     .ring(&params.eos_ids, &self.device, ring_eos_read())?;
+                // The adaptive arm needs the ring's reader (a CPU-mapped ring)
+                // and lookahead 1 (`Session::decode`'s own check); without a
+                // reader it is the fixed cadence, reported as such.
+                let reader = if adaptive && lookahead == 1 {
+                    readback.reader()
+                } else {
+                    None
+                };
+                let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let opts = DecodeOptions {
                     max_tokens: params.max_tokens,
                     budget: if commit_steps <= 1 {
@@ -531,23 +561,90 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     prefill_bulk: 0,
                     prefill_pacer_depth: 0,
                     pass_widths: lloom::nn::PassWidths::Lru,
-                    stream_via_reader: false,
-                    adaptive_commit: false,
+                    stream_via_reader: reader.is_some(),
+                    adaptive_commit: reader.is_some(),
                     run_ahead: 0,
-                    stop: None,
+                    stop: reader.is_some().then(|| std::sync::Arc::clone(&stop_flag)),
                     eos_gate: false,
                     fused_publish: true,
                     prefill_tile: params.prefill_tile,
                     prefill_chunk: 0,
                 };
-                self.session.decode_until(
-                    &mut spec,
-                    readback,
-                    &mut sampler,
-                    &prepared.suffix,
-                    &opts,
-                    &mut on_tokens,
-                )?
+                match reader {
+                    None => self.session.decode_until(
+                        &mut spec,
+                        readback,
+                        &mut sampler,
+                        &prepared.suffix,
+                        &opts,
+                        &mut on_tokens,
+                    )?,
+                    Some(mut reader) => {
+                        // The drain is the reader's (`lfm2-chat --stream-reader`):
+                        // a scoped thread reads the ring as the GPU publishes and
+                        // runs the same streaming hook; the loop neither reads
+                        // tokens back nor commits on a cadence. A stop string or
+                        // a cancelled consumer raises `stop_flag`, which the loop
+                        // checks before each step; an EOS the ring has seen
+                        // raises it too. After the loop returns, one last read
+                        // takes what was published behind the reader's cursor.
+                        let stream_done = std::sync::atomic::AtomicBool::new(false);
+                        let (out, drained) = std::thread::scope(|s| {
+                            let hook = &mut on_tokens;
+                            let stop_flag = &stop_flag;
+                            let stream_done = &stream_done;
+                            let worker = s.spawn(move || -> Result<()> {
+                                let mut buf: Vec<u32> = Vec::with_capacity(64);
+                                loop {
+                                    buf.clear();
+                                    if reader.ended() {
+                                        stop_flag.store(true, std::sync::atomic::Ordering::Release);
+                                    }
+                                    match reader.read_new(&mut buf) {
+                                        Ok(0) => {
+                                            if stream_done.load(std::sync::atomic::Ordering::Acquire) {
+                                                buf.clear();
+                                                if let Ok(n) = reader.read_new(&mut buf) {
+                                                    if n > 0 && !hook(&buf)? {
+                                                        stop_flag.store(
+                                                            true,
+                                                            std::sync::atomic::Ordering::Release,
+                                                        );
+                                                    }
+                                                }
+                                                return Ok(());
+                                            }
+                                            std::thread::sleep(std::time::Duration::from_micros(200));
+                                        }
+                                        Ok(_) => {
+                                            if !hook(&buf)? {
+                                                stop_flag.store(true, std::sync::atomic::Ordering::Release);
+                                            }
+                                        }
+                                        Err(lap) => {
+                                            lloom_tensor::bail!("ring reader: {lap}");
+                                        }
+                                    }
+                                }
+                            });
+                            let out = self.session.decode_until(
+                                &mut spec,
+                                readback,
+                                &mut sampler,
+                                &prepared.suffix,
+                                &opts,
+                                &mut |_: &[u32]| Ok(true),
+                            );
+                            stream_done.store(true, std::sync::atomic::Ordering::Release);
+                            let drained = worker.join().map_err(|_| {
+                                lloom_tensor::Error::msg("ring reader thread panicked")
+                            });
+                            (out, drained)
+                        });
+                        drained??;
+                        out?
+                    }
+                }
             }
             ReadbackArm::Auto => unreachable!("resolved above"),
             ReadbackArm::Speculative { .. } | ReadbackArm::Batched { .. } => {
@@ -598,9 +695,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         &mut self,
         spec: &mut S,
         prompt_ids: &[u32],
-        mut detokenize: impl FnMut(&[u32]) -> Result<String>,
+        mut detokenize: impl FnMut(&[u32]) -> Result<String> + Send,
         params: &DecodeParams,
-        mut on_fragment: impl FnMut(&str) -> bool,
+        mut on_fragment: impl FnMut(&str) -> bool + Send,
     ) -> Result<Decoded>
     where
         S: lloom::nn::Speculator,
@@ -738,6 +835,7 @@ mod tests {
         let ring = ReadbackArm::Ring {
             lookahead: 0,
             commit_steps: 1,
+            adaptive: false,
         };
         assert_eq!(ring.resolve(&top_p), ring);
         assert_ne!(ReadbackArm::CROWN.name(), ReadbackArm::Blocking.name());

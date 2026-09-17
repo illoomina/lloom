@@ -203,8 +203,11 @@ fn main() -> Result<()> {
     let readback = match args.readback.as_str() {
         "auto" => ReadbackArm::Auto,
         "ring" | "ring-nonblocking" => ReadbackArm::CROWN,
+        "ring-fixed" => ReadbackArm::RING_FIXED,
         "blocking" => ReadbackArm::Blocking,
-        other => anyhow::bail!("--readback must be auto, ring or blocking, got {other:?}"),
+        other => anyhow::bail!(
+            "--readback must be auto, ring, ring-fixed or blocking, got {other:?}"
+        ),
     };
     let seed_text = match &args.prompt_seed_file {
         Some(p) => std::fs::read_to_string(p)

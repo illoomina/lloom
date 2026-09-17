@@ -20,7 +20,7 @@
 use anyhow::{Context, Result};
 use hf_chat_template::ChatTemplate;
 use lloom::generation::{LogitsProcessor, Sampling};
-use lloom::models::lfm2::{
+use lloom::models::lfm2::{QkvLayout, 
     AttnImpl, BatchPool, Cache, Config, ConvState, KvAppend, Lfm2Config, MemoryBudget, Model,
 };
 use lloom::models::lfm2_dspark::{CtxKv, DSparkConfig, DSparkDrafter, DSparkSpeculator};
@@ -893,7 +893,7 @@ impl Engine {
         &self,
         prompt_ids: &[u32],
         params: &DecodeParams,
-        mut on_fragment: impl FnMut(&str),
+        mut on_fragment: impl FnMut(&str) + Send,
     ) -> Result<Decoded> {
         self.complete_until(prompt_ids, params, |frag| {
             on_fragment(frag);
@@ -906,7 +906,7 @@ impl Engine {
         &self,
         prompt_ids: &[u32],
         params: &DecodeParams,
-        on_fragment: impl FnMut(&str) -> bool,
+        on_fragment: impl FnMut(&str) -> bool + Send,
     ) -> Result<Decoded> {
         self.check_fits(prompt_ids.len(), params.max_tokens)?;
         if let Some(sched) = &self.sched {
@@ -936,7 +936,7 @@ impl Engine {
         sched: &BatchHandle<Model, Extra>,
         prompt_ids: &[u32],
         params: &DecodeParams,
-        mut on_fragment: impl FnMut(&str) -> bool,
+        mut on_fragment: impl FnMut(&str) -> bool + Send,
     ) -> Result<Decoded> {
         let cancel = Arc::new(AtomicBool::new(false));
         let rx = sched.submit(BatchRequest {
@@ -1829,6 +1829,14 @@ fn proc_footprint() -> Option<(u64, u64)> {
 /// §12.2): the paged pool the slot-indexed kernels read, the in-place ring
 /// they write, the crown's fused epilogues.
 fn pool_config(config: &mut Config) {
+    // The fused q/k/v layout (`lfm2-chat --qkv-layout=fused`): no `.contiguous()`
+    // copies of the three views at decode — the norms read the transposed view
+    // strided and V lands in the slab directly; bit for bit the contiguous path.
+    // Measured on the serving line (#148, the B=1 defaults pass, record §8):
+    // lfm2-chat 64.0 / 63.7 vs 63.6 / 63.5, the server's B=1 cell 63.1 / 63.1 /
+    // 63.2 vs 62.8 / 63.0 / 63.0 (six alternations) — +0.2–0.3 tok/s, every
+    // pair the same way; a wash at B=8 (235.3 / 232.2 vs 235.6 / 234.6).
+    config.qkv_layout = QkvLayout::Fused;
     config.attn_impl = AttnImpl::FlashDecoding;
     config.kv_append = KvAppend::Paged;
     config.conv_state = ConvState::RotatingRing { k: 1 };
@@ -1841,6 +1849,7 @@ fn pool_config(config: &mut Config) {
 /// read, a ring wide enough for the verify window, the drafter's taps.
 fn pool_spec_config(config: &mut Config, dcfg: &DSparkConfig) {
     let k = dcfg.max_draft();
+    config.qkv_layout = QkvLayout::Fused;
     config.attn_impl = AttnImpl::FlashDecoding;
     config.kv_append = KvAppend::Paged;
     config.conv_state = ConvState::RotatingRing { k: k + 1 };
@@ -1852,6 +1861,14 @@ fn pool_spec_config(config: &mut Config, dcfg: &DSparkConfig) {
 }
 
 fn crown_config(config: &mut Config) {
+    // The fused q/k/v layout (`lfm2-chat --qkv-layout=fused`): no `.contiguous()`
+    // copies of the three views at decode — the norms read the transposed view
+    // strided and V lands in the slab directly; bit for bit the contiguous path.
+    // Measured on the serving line (#148, the B=1 defaults pass, record §8):
+    // lfm2-chat 64.0 / 63.7 vs 63.6 / 63.5, the server's B=1 cell 63.1 / 63.1 /
+    // 63.2 vs 62.8 / 63.0 / 63.0 (six alternations) — +0.2–0.3 tok/s, every
+    // pair the same way; a wash at B=8 (235.3 / 232.2 vs 235.6 / 234.6).
+    config.qkv_layout = QkvLayout::Fused;
     config.attn_impl = AttnImpl::Sdpa;
     config.kv_append = KvAppend::InPlace;
     config.conv_state = ConvState::Shuffle;
@@ -1867,6 +1884,7 @@ fn crown_config(config: &mut Config) {
 /// rewind); the taps feed the drafter's projection at F32 (§10.2m).
 fn rewindable_config(config: &mut Config, dcfg: &DSparkConfig) {
     let k = dcfg.max_draft();
+    config.qkv_layout = QkvLayout::Fused;
     config.attn_impl = AttnImpl::Sdpa;
     config.kv_append = KvAppend::InPlace;
     config.conv_state = ConvState::RotatingRing { k: k + 1 };

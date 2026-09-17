@@ -53,6 +53,51 @@ pub fn call_eos_gate(
 /// (pass any buffer). One threadgroup, as wide as the pipeline allows up to
 /// 1024, a power of two (the reduction tree).
 #[allow(clippy::too_many_arguments)]
+/// `words_publish`: `n` u32 words from `src` into the mapped `out`, then the
+/// `generation` stamp into `step` (data first, a device barrier, then the
+/// stamp — the fused publish's order). One threadgroup.
+#[allow(clippy::too_many_arguments)]
+pub fn call_words_publish(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    src: BufferOffset,
+    n: usize,
+    out: BufferOffset,
+    step: BufferOffset,
+    generation: u32,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::EosGate, "words_publish")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "words_publish n={n} gen={generation}");
+    set_params!(
+        encoder,
+        (
+            &src,
+            n as u32,
+            Output::from_buffer_offset(&out),
+            Output::from_buffer_offset(&step),
+            generation
+        )
+    );
+    let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 pub fn call_argmax_publish(
     device: &Device,
     ep: impl EncoderProvider,

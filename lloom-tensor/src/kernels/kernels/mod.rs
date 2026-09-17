@@ -37,7 +37,7 @@ pub use cast::{
 };
 pub use conv_names::ConvKernel;
 pub use convolution::*;
-pub use eos_gate::{call_argmax_publish, call_eos_gate};
+pub use eos_gate::{call_argmax_publish, call_eos_gate, call_words_publish};
 pub use eos_index::call_eos_index;
 pub use fill::*;
 pub use flash_decoding::{

@@ -2425,3 +2425,37 @@ fn walk_order_of(
 // one. §11.3i: *a family absent from the call-site list was never checked,
 // which looks exactly like a family that passes.* Writing a per-family body
 // here would put back the call site that mechanism removed.
+
+/// `words_publish` + a host poll on the stamp (#148): the words land in the
+/// mapped buffer and the stamp becomes visible to a `read_volatile` poll
+/// without a wait on the command buffer — and how long that takes.
+#[test]
+fn words_publish_stamp_is_visible_to_a_host_poll() {
+    use crate::{Device, Tensor};
+    let dev = Device::new_metal(0).unwrap();
+    let src = Tensor::from_vec((1..=19u32).collect::<Vec<_>>(), 19, &dev).unwrap();
+    let out = Tensor::from_vec(vec![0u32; 64], 64, &dev).unwrap();
+    let step = Tensor::from_vec(vec![0u32], 1, &dev).unwrap();
+    let out_ptr = unsafe { out.peek_scalar_ptr::<u32>(0) }.expect("mapped");
+    let step_ptr = unsafe { step.peek_scalar_ptr::<u32>(0) }.expect("mapped");
+    for gen in 1..=3u32 {
+        let src = (src.clone() + 0.0).unwrap_or(src.clone());
+        dev.words_publish(&src, 19, &out, &step, gen).unwrap();
+        let Device::Metal(m) = &dev else { unreachable!() };
+        m.flush_and_prune().unwrap();
+        let t = std::time::Instant::now();
+        let mut spins = 0u64;
+        loop {
+            let seen = unsafe { std::ptr::read_volatile(step_ptr) };
+            if seen == gen {
+                break;
+            }
+            spins += 1;
+            assert!(t.elapsed().as_secs() < 5, "gen {gen}: stamp never seen (saw {seen}) after {spins} spins");
+            std::hint::spin_loop();
+        }
+        let words: Vec<u32> = (0..19).map(|i| unsafe { std::ptr::read_volatile(out_ptr.add(i)) }).collect();
+        assert_eq!(words, (1..=19u32).collect::<Vec<_>>(), "gen {gen}");
+        println!("words_publish_stamp_is_visible_to_a_host_poll: gen {gen} seen after {spins} spins, {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+}

@@ -2963,6 +2963,157 @@ pub struct Cache {
     cos: Tensor,
     sin: Tensor,
     device: Device,
+    /// The speculative round's readback words, resident and CPU-mapped
+    /// (`VerifyWords`); `None` until the first verify, or off Metal. A cloned
+    /// cache starts without them (two caches must not share one stamp).
+    verify_words: VerifyWordsSlot,
+}
+
+#[derive(Default)]
+struct VerifyWordsSlot(Option<VerifyWords>);
+
+impl Clone for VerifyWordsSlot {
+    fn clone(&self) -> Self {
+        VerifyWordsSlot(None)
+    }
+}
+
+impl std::fmt::Debug for VerifyWordsSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some(w) => write!(f, "VerifyWords(cap {}, generation {})", w.cap, w.generation),
+            None => f.write_str("VerifyWords(none)"),
+        }
+    }
+}
+
+/// The verify's `[argmax, proposed]` words as a PUBLISH rather than a
+/// readback (#148): a CPU-mapped U32 buffer the `words_publish` kernel copies
+/// the round's words into behind a device barrier, then stamps `step` with
+/// the round's generation. The host polls the stamp (`PollMechanism`, the
+/// ring's own wait) and reads the words in place into `host` — no wait on
+/// the command buffer's completion handler, no `to_cpu`, no `Vec` per round.
+/// A poll that outlives `POLL_BUDGET` falls back to `Device::synchronize`
+/// and then reads the same words, so the path is never wrong, only slower.
+/// The raw addresses are kept as `usize` beside the tensors that own them
+/// (the ring's `Mapped` does the same): the buffers are written in place
+/// and never reallocated while a verify is pending.
+struct VerifyWords {
+    out: Tensor,
+    step: Tensor,
+    out_ptr: usize,
+    step_ptr: usize,
+    cap: usize,
+    generation: u32,
+    host: Vec<u32>,
+}
+
+/// A verify's published words: where to poll, what to expect, how many.
+#[derive(Clone, Copy)]
+struct Published {
+    out_ptr: usize,
+    step_ptr: usize,
+    generation: u32,
+    n: usize,
+}
+
+impl VerifyWords {
+    /// Mapped words for at least `need` u32s on `device`; `None` off Metal or
+    /// on a buffer the host cannot map (the caller then reads back).
+    fn ensure<'a>(
+        slot: &'a mut VerifyWordsSlot,
+        need: usize,
+        device: &Device,
+    ) -> Option<&'a mut VerifyWords> {
+        if !device.is_metal() {
+            return None;
+        }
+        let slot = &mut slot.0;
+        let fresh = !matches!(slot, Some(w) if w.cap >= need);
+        if fresh {
+            let cap = need.max(64).next_power_of_two();
+            let out = Tensor::from_vec(vec![0u32; cap], cap, device).ok()?;
+            let step = Tensor::from_vec(vec![0u32], 1, device).ok()?;
+            // SAFETY: read only through `read_volatile`, after the stamp says
+            // the GPU wrote the words; the tensors are held beside the addresses.
+            let out_ptr = unsafe { out.peek_scalar_ptr::<u32>(0)? } as usize;
+            let step_ptr = unsafe { step.peek_scalar_ptr::<u32>(0)? } as usize;
+            let generation = slot.as_ref().map_or(0, |w| w.generation);
+            *slot = Some(VerifyWords {
+                out,
+                step,
+                out_ptr,
+                step_ptr,
+                cap,
+                generation,
+                host: Vec::with_capacity(cap),
+            });
+        }
+        slot.as_mut()
+    }
+
+    /// Encode the publish of `src`'s first `n` words for this round; the
+    /// receipt the completion polls.
+    fn publish(&mut self, src: &Tensor, n: usize, device: &Device) -> Result<Published> {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        device.words_publish(src, n, &self.out, &self.step, self.generation)?;
+        // Committed now, without a wait — what `stage_read` did with its
+        // marker: the poll below is on a buffer the GPU has, not on one the
+        // host still holds open (that was a `POLL_BUDGET` of spinning on a
+        // stamp nothing was going to write).
+        if let Device::Metal(m) = device {
+            m.flush_and_prune()?;
+        }
+        Ok(Published {
+            out_ptr: self.out_ptr,
+            step_ptr: self.step_ptr,
+            generation: self.generation,
+            n,
+        })
+    }
+
+    /// Wait for the round's stamp and read its words into `host`.
+    fn complete(&mut self, p: Published, device: &Device) -> Result<&[u32]> {
+        let poll = crate::generation::poll::PollMechanism::default();
+        let step = p.step_ptr as *const u32;
+        let mut spins: u64 = 0;
+        let t0 = std::time::Instant::now();
+        let mut fell_back = false;
+        let first = unsafe { std::ptr::read_volatile(step) };
+        loop {
+            // SAFETY: `step` is the mapped stamp of a tensor this struct holds.
+            let seen = unsafe { std::ptr::read_volatile(step) };
+            if seen == p.generation {
+                break;
+            }
+            spins += 1;
+            if spins > crate::generation::readback::POLL_BUDGET {
+                device.synchronize()?;
+                fell_back = true;
+                break;
+            }
+            // SAFETY: as above; `wait_on` returns when the word moves or a
+            // timeout elapses, never touches it.
+            unsafe { poll.wait_on(step, seen) };
+        }
+        if std::env::var_os("LLOOM_VERIFY_POLL_TRACE").is_some() {
+            eprintln!(
+                "[verify poll: gen {} first {} now {} spins {spins} {:.3} ms fallback={fell_back} n={}]",
+                p.generation,
+                first,
+                unsafe { std::ptr::read_volatile(step) },
+                t0.elapsed().as_secs_f64() * 1e3,
+                p.n
+            );
+        }
+        self.host.clear();
+        for i in 0..p.n {
+            // SAFETY: the stamp is behind a device barrier over the words.
+            self.host
+                .push(unsafe { std::ptr::read_volatile((p.out_ptr as *const u32).add(i)) });
+        }
+        Ok(&self.host)
+    }
 }
 
 fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
@@ -3211,6 +3362,7 @@ impl Cache {
             taps: Vec::with_capacity(config.tap_layers.len()),
             anchor_slot: None,
             taps_dropped: 0,
+            verify_words: VerifyWordsSlot(None),
             tap_layers: config.tap_layers.clone(),
             tap_dtype: config.tap_dtype,
             device: device.clone(),
@@ -8424,11 +8576,25 @@ impl Model {
         // not the queue's tail, and the staging copy is unconditional — a
         // `to_vec1` here took the tail wait and, when the pool handed the
         // 80-byte result an unmapped buffer, a second blit and wait behind it.
-        let both = Tensor::cat(&[&argmax, proposed], 0)?
-            .stage_read()?
-            .to_vec1::<u32>()?;
-        let (argmax, proposed) = both.split_at(k + 1);
-        let accepted = accept_prefix(argmax, proposed, eos_ids);
+        // As a publish where the host can map the words (`VerifyWords`): the
+        // stamp is polled, the words read in place; the staged readback
+        // where it cannot.
+        let both_t = Tensor::cat(&[&argmax, proposed], 0)?;
+        let n = 2 * k + 1;
+        let device = cache.device.clone();
+        let accepted = match VerifyWords::ensure(&mut cache.verify_words, n, &device) {
+            Some(w) => {
+                let p = w.publish(&both_t, n, &device)?;
+                let both = w.complete(p, &device)?;
+                let (argmax, proposed) = both.split_at(k + 1);
+                accept_prefix(argmax, proposed, eos_ids)
+            }
+            None => {
+                let both = both_t.stage_read()?.to_vec1::<u32>()?;
+                let (argmax, proposed) = both.split_at(k + 1);
+                accept_prefix(argmax, proposed, eos_ids)
+            }
+        };
 
         // `n` positions of state survive: `last` and the `n - 1` proposals the
         // target agreed with. The remaining `k + 1 - n` were written by the
@@ -8452,7 +8618,10 @@ pub struct PendingVerify {
     /// `[argmax[0..=k], proposed[0..k]]` — the round's one readback, staged
     /// behind the command buffer that wrote it, so completing waits for this
     /// pass and not for whatever was committed after it.
-    both: lloom_tensor::StagedRead,
+    both: Option<lloom_tensor::StagedRead>,
+    /// The words as a publish instead (`VerifyWords`); `both` is the staged
+    /// readback where the host cannot map the buffer.
+    published: Option<Published>,
     k: usize,
     /// This pass's layer-input taps, every window position; trimmed to the
     /// accepted rows at completion.
@@ -8485,11 +8654,27 @@ impl Model {
         let input = Tensor::cat(&[&anchor, proposed], 0)?.reshape((1, k + 1))?;
         let logits = self.forward_all(&input, index_pos, cache)?;
         let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
-        let both = Tensor::cat(&[&argmax, proposed], 0)?.stage_read()?;
+        let both_t = Tensor::cat(&[&argmax, proposed], 0)?;
+        let n = 2 * k + 1;
+        let device = cache.device.clone();
+        let published = VerifyWords::ensure(&mut cache.verify_words, n, &device)
+            .map(|w| w.publish(&both_t, n, &device))
+            .transpose()?;
+        let both = if published.is_some() {
+            None
+        } else {
+            Some(both_t.stage_read()?)
+        };
         // The taps are this pass's; taken now so the cache carries none into
         // the next pass on it.
         let taps = cache.take_taps();
-        Ok(PendingVerify { tok, both, k, taps })
+        Ok(PendingVerify {
+            tok,
+            both,
+            published,
+            k,
+            taps,
+        })
     }
 
     /// The readback half of [`Self::verify_tokens`]: wait for the pass's own
@@ -8502,10 +8687,32 @@ impl Model {
         cache: &mut Cache,
         eos_ids: &[u32],
     ) -> Result<(Vec<u32>, Vec<Tensor>)> {
-        let PendingVerify { tok, both, k, taps } = pending;
-        let both = both.to_vec1::<u32>()?;
-        let (argmax, proposed) = both.split_at(k + 1);
-        let accepted = accept_prefix(argmax, proposed, eos_ids);
+        let PendingVerify {
+            tok,
+            both,
+            published,
+            k,
+            taps,
+        } = pending;
+        let device = cache.device.clone();
+        let accepted = match (published, both) {
+            (Some(p), _) => {
+                let words = cache
+                    .verify_words
+                    .0
+                    .as_mut()
+                    .ok_or_else(|| lloom_tensor::Error::msg("verify words vanished"))?;
+                let both = words.complete(p, &device)?;
+                let (argmax, proposed) = both.split_at(k + 1);
+                accept_prefix(argmax, proposed, eos_ids)
+            }
+            (None, Some(both)) => {
+                let both = both.to_vec1::<u32>()?;
+                let (argmax, proposed) = both.split_at(k + 1);
+                accept_prefix(argmax, proposed, eos_ids)
+            }
+            (None, None) => lloom_tensor::bail!("verify_tokens_complete: no readback"),
+        };
         cache.resolve(tok, accepted.len())?;
         let n_acc = accepted.len();
         let probe = taps
@@ -8543,7 +8750,9 @@ pub struct PendingRows {
     toks: Vec<SpecToken>,
     ks: Vec<usize>,
     /// `[argmax over every window position (T), every row's proposed (Σk)]`.
-    both: lloom_tensor::StagedRead,
+    both: Option<lloom_tensor::StagedRead>,
+    /// As `PendingVerify::published`, on the first row's cache.
+    published: Option<Published>,
     /// Per row, its taps over its window.
     taps: Vec<Vec<Tensor>>,
 }
@@ -8607,16 +8816,25 @@ impl Model {
         let argmax = logits.i(0)?.argmax(lloom_tensor::D::Minus1)?;
         let mut both_parts: Vec<Tensor> = vec![argmax];
         both_parts.extend(proposed_all);
-        let both = Tensor::cat(&both_parts, 0)?.stage_read()?;
+        let both_t = Tensor::cat(&both_parts, 0)?;
+        let n = both_t.dims1()?;
+        let published = VerifyWords::ensure(&mut rows[0].cache.verify_words, n, &device)
+            .map(|w| w.publish(&both_t, n, &device))
+            .transpose()?;
+        let both = if published.is_some() {
+            None
+        } else {
+            Some(both_t.stage_read()?)
+        };
         let taps = rows
             .iter_mut()
             .map(|row| row.cache.take_taps())
             .collect();
-        let _ = device;
         Ok(PendingRows {
             toks,
             ks,
             both,
+            published,
             taps,
         })
     }
@@ -8634,6 +8852,7 @@ impl Model {
             toks,
             ks,
             both,
+            published,
             taps,
         } = pending;
         if caches.len() != toks.len() || eos_sets.len() != toks.len() {
@@ -8644,7 +8863,19 @@ impl Model {
                 toks.len()
             )
         }
-        let both = both.to_vec1::<u32>()?;
+        let both: Vec<u32> = match (published, both) {
+            (Some(p), _) => {
+                let device = caches[0].device.clone();
+                let words = caches[0]
+                    .verify_words
+                    .0
+                    .as_mut()
+                    .ok_or_else(|| lloom_tensor::Error::msg("verify words vanished"))?;
+                words.complete(p, &device)?.to_vec()
+            }
+            (None, Some(both)) => both.to_vec1::<u32>()?,
+            (None, None) => lloom_tensor::bail!("verify_rows_complete: no readback"),
+        };
         let t: usize = ks.iter().map(|k| k + 1).sum();
         let (argmax_all, proposed_all) = both.split_at(t);
         let mut out = Vec::with_capacity(caches.len());

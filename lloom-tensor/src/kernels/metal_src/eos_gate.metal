@@ -118,3 +118,27 @@ kernel void NAME(                                                               
 
 ARGMAX_PUBLISH(argmax_publish_f16, half)
 ARGMAX_PUBLISH(argmax_publish_f32, float)
+
+// The speculative round's readback as a publish (lloom #148): the verify's
+// `[argmax, proposed]` words copied into a CPU-mapped buffer the host keeps,
+// a device-scope barrier, then the generation stamp by thread 0 — the same
+// data-then-stamp order as `argmax_publish_body`, so a host that polls the
+// stamp reads the words behind it without waiting on the command buffer's
+// completion handler.
+kernel void words_publish(
+    device const uint *src        [[buffer(0)]],
+    constant uint     &n          [[buffer(1)]],
+    device uint       *out        [[buffer(2)]],
+    device uint       *step       [[buffer(3)]],
+    constant uint     &generation [[buffer(4)]],
+    uint tid   [[thread_index_in_threadgroup]],
+    uint width [[threads_per_threadgroup]]
+) {
+    for (uint i = tid; i < n; i += width) {
+        out[i] = src[i];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid == 0) {
+        step[0] = generation;
+    }
+}

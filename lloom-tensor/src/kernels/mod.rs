@@ -29,6 +29,7 @@ pub use kernel::{merged_translation_unit, metal_compile_flags};
 pub use kernels::{
     affine::*, arena_alloc::*, call_binary_contiguous, call_binary_contiguous_with,
     call_argmax_publish, call_binary_strided, call_binary_strided_with, call_eos_gate,
+    call_words_publish,
     call_eos_index, call_mlx_gemm, call_mlx_gemv_epilogue, call_mlx_gemv_full,
     call_mlx_gemv_with, cast::*, convolution::*, fill::*, flash_decoding::*, indexing::*,
     quantized::*, random::*, reduce::*, scratch::*, sdpa::*, sort::*, ternary::*, unary,

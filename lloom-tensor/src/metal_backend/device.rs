@@ -992,6 +992,40 @@ impl MetalDevice {
     }
 
     /// See `Device::eos_gate_end`.
+    /// The speculative round's readback as a publish (`words_publish`): `n`
+    /// u32 words of `src` copied into the caller's CPU-mapped `out`, then
+    /// `generation` stamped into `step` behind a device barrier. The host
+    /// polls the stamp and reads the words in place — no completion-handler
+    /// wait, no `to_cpu` (#148).
+    pub fn words_publish(
+        &self,
+        src: (&crate::MetalStorage, usize),
+        n: usize,
+        out: (&crate::MetalStorage, usize),
+        step: (&crate::MetalStorage, usize),
+        generation: u32,
+    ) -> Result<()> {
+        fn bo(s: &crate::MetalStorage, off: usize) -> crate::kernels::BufferOffset<'_> {
+            crate::kernels::BufferOffset {
+                buffer: s.buffer(),
+                offset_in_bytes: off,
+            }
+        }
+        let encoder = self.command_encoder()?;
+        crate::kernels::call_words_publish(
+            &self.device,
+            &encoder,
+            &self.kernels,
+            bo(src.0, src.1),
+            n,
+            bo(out.0, out.1),
+            bo(step.0, step.1),
+            generation,
+        )
+        .map_err(MetalError::from)?;
+        Ok(())
+    }
+
     pub fn eos_gate_end(&self) -> crate::EosGateReport {
         self.kernels.set_eos_gated(false);
         self.commands.eos_gate().end()

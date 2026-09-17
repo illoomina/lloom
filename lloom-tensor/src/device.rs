@@ -620,6 +620,56 @@ impl Device {
     /// element) — the chain of `cast`, `argmax`, three blits and the gate
     /// kernel as one launch. The argmax follows `reduce.metal`'s rule (the
     /// greatest value, the lowest index on ties). Metal only.
+    /// `words_publish` (Metal): `n` U32 words of `src` copied into the
+    /// CPU-mapped `out`, then `generation` stamped into `step` behind a
+    /// device barrier — the fused publish's data-then-stamp order, for a
+    /// host that polls `step` and reads `out` in place (lloom #148, the
+    /// speculative verify's readback).
+    pub fn words_publish(
+        &self,
+        src: &crate::Tensor,
+        n: usize,
+        out: &crate::Tensor,
+        step: &crate::Tensor,
+        generation: u32,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => {
+                for (name, t) in [("src", src), ("out", out), ("step", step)] {
+                    if t.dtype() != DType::U32 {
+                        crate::bail!("words_publish: {name} must be U32, got {:?}", t.dtype());
+                    }
+                    if !t.is_contiguous() {
+                        crate::bail!("words_publish: {name} must be contiguous");
+                    }
+                }
+                if src.elem_count() < n || out.elem_count() < n {
+                    crate::bail!(
+                        "words_publish: {n} words from {} into {}",
+                        src.elem_count(),
+                        out.elem_count()
+                    );
+                }
+                let (ss, sl) = src.storage_and_layout();
+                let (os, ol) = out.storage_and_layout();
+                let (ps, pl) = step.storage_and_layout();
+                let u = DType::U32.size_in_bytes();
+                match (&*ss, &*os, &*ps) {
+                    (Storage::Metal(s), Storage::Metal(o), Storage::Metal(p)) => d.words_publish(
+                        (s, sl.start_offset() * u),
+                        n,
+                        (o, ol.start_offset() * u),
+                        (p, pl.start_offset() * u),
+                        generation,
+                    ),
+                    _ => crate::bail!("words_publish: every tensor must live on the Metal device"),
+                }
+            }
+            _ => crate::bail!("words_publish: Metal only"),
+        }
+    }
+
     pub fn argmax_publish(
         &self,
         logits: &crate::Tensor,

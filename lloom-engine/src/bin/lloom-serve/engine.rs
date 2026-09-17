@@ -404,6 +404,20 @@ impl Engine {
                 m.set_free_budget(1024 * 1024 * 1024);
             }
         }
+        // Measured on natural text (#148, record §8.3): the speculative loop
+        // on the pool is +14 % at B=4 and a LOSS at B ≥ 8 (−7 % / −40 % at
+        // 8 / 16, 2.1–2.4 accepted of 9 per round against a B × 10-position
+        // verify); structured prompts (7.8–8.3 accepted) pay at every B.
+        // Said once at load; the flag is honoured either way.
+        if dspark_dir.is_some() && opts.batch >= 8 {
+            eprintln!(
+                "[dspark: at --batch {} the speculative loop measured slower than plain \
+                 batched decode on natural text (−7 % at 8, −40 % at 16; +14 % at 4); it \
+                 pays where the drafter's acceptance is high (structured, repetitive \
+                 context). Serving it as asked.]",
+                opts.batch
+            );
+        }
         let dcfg = match &dspark_dir {
             Some(dir) => {
                 let dcfg = DSparkConfig::read_from_dir(dir)

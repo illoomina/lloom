@@ -630,10 +630,23 @@ template <typename T, int D>
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
+  // Eight simdgroups per head (lloom #148): chunk `c` is merged by simdgroup
+  // `c mod BN`, each simdgroup walking ITS chunks in ascending index order,
+  // then the BN partial merges are summed in simdgroup order 0..BN-1
+  // through threadgroup memory. The order is still a fixed function of the
+  // chunk INDEX — §10.3h's requirement is that the table is never walked,
+  // and it is not — so the bits are stable run to run; they differ from the
+  // one-simdgroup serial merge this replaced (a different summation tree),
+  // which is why that change is an arm of its own in the record. What it
+  // buys: the serial 32-deep dependent loop over chunks becomes 4 deep at
+  // 8k, on 256 threads instead of 32.
+  constexpr int BN = 8;
   constexpr int BD = 32;
   constexpr int elem_per_thread = D / BD;
 
   typedef float U;
+
+  threadgroup U red[BN * D];
 
   const FlashCombineParams p = *params;
   const int n_chunks = p.n_chunks;
@@ -682,17 +695,13 @@ template <typename T, int D>
   }
 
   const int lane_base = (int)simd_lid * elem_per_thread;
-  int visited = 0;
-  for (int c = 0; c < n_chunks; ++c) {
-    // Recorded before the skip, so the log is the order the loop VISITS rather
-    // than the order it accumulates: an empty chunk contributes nothing and
-    // still occupies a position in the sequence. Logging after the skip would
-    // make a reversed loop over a fixture with no empty chunks indistinguishable
-    // from a forward one whose empties fell differently.
-    if (simd_lid == 0 && simd_gid == 0) {
-      walk_order[(size_t)head_idx * n_chunks + visited] = (uint)c;
+  // Recorded before the skip, at position `c` by whichever simdgroup merges
+  // it: the audit reads the ascending index sequence an index-ordered merge
+  // produces; an empty chunk still occupies its position.
+  for (int c = (int)simd_gid; c < n_chunks; c += BN) {
+    if (simd_lid == 0) {
+      walk_order[(size_t)head_idx * n_chunks + c] = (uint)c;
     }
-    visited += 1;
     if (head_sums[c] == 0.0f) {
       continue;
     }
@@ -703,11 +712,20 @@ template <typename T, int D>
     }
   }
 
+  // The BN partial merges, summed in simdgroup order by simdgroup 0.
+  for (int i = 0; i < elem_per_thread; i++) {
+    red[simd_gid * D + lane_base + i] = acc[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   const U inv_denom = denom > 0 ? 1.0f / denom : 0.0f;
   device T* head_out = out + (size_t)head_idx * D + lane_base;
   if (simd_gid == 0) {
     for (int i = 0; i < elem_per_thread; i++) {
-      head_out[i] = static_cast<T>(acc[i] * inv_denom);
+      U v = 0;
+      for (int g = 0; g < BN; g++) {
+        v += red[g * D + lane_base + i];
+      }
+      head_out[i] = static_cast<T>(v * inv_denom);
     }
   }
 }

@@ -46,13 +46,6 @@ pub fn call_eos_gate(
     encoder.dispatch_thread_groups(one, one);
     Ok(())
 }
-
-/// The fused publish (lloom #735 step 5): see `argmax_publish_body` in
-/// `metal_src/eos_gate.metal`. `kernel` is `argmax_publish_f16` or
-/// `argmax_publish_f32`; every offset in bytes. `n_eos == 0` skips the flag
-/// (pass any buffer). One threadgroup, as wide as the pipeline allows up to
-/// 1024, a power of two (the reduction tree).
-#[allow(clippy::too_many_arguments)]
 /// `words_publish`: `n` u32 words from `src` into the mapped `out`, then the
 /// `generation` stamp into `step` (data first, a device barrier, then the
 /// stamp — the fused publish's order). One threadgroup.
@@ -98,6 +91,14 @@ pub fn call_words_publish(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+
+/// The fused publish (lloom #735 step 5): see `argmax_publish_body` in
+/// `metal_src/eos_gate.metal`. `kernel` is `argmax_publish_f16` or
+/// `argmax_publish_f32`; every offset in bytes. `n_eos == 0` skips the flag
+/// (pass any buffer). One threadgroup, as wide as the pipeline allows up to
+/// 1024, a power of two (the reduction tree).
+#[allow(clippy::too_many_arguments)]
 pub fn call_argmax_publish(
     device: &Device,
     ep: impl EncoderProvider,

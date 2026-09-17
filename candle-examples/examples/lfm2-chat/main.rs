@@ -23,6 +23,20 @@
 use anyhow::{Context, Result};
 use candle::{DType, Device};
 use clap::Parser;
+
+/// `--verbose`: the once-per-run diagnostic lines. Errors, refusals, the rate
+/// line, the `RESULT` / `DSPARK_ROUNDS` lines and every explicitly requested
+/// report (`--profile`, `--replay`, `--pass-plans`, `--mem-sample`) print
+/// regardless.
+static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+macro_rules! diag {
+    ($($t:tt)*) => {
+        if VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($t)*);
+        }
+    };
+}
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
@@ -594,6 +608,13 @@ struct Args {
     /// Off the hot thread; a `MEMPEAK` line follows the RESULT line.
     #[arg(long)]
     mem_sample: bool,
+
+    /// Print the run's diagnostics on stderr — the load / in-flight / first-token /
+    /// cadence / churn / pool / kv lines and the dspark round summary. Off by
+    /// default: a release run prints the rate line, the RESULT line and errors.
+    /// The measurement scripts pass it (their `grep`s read those lines).
+    #[arg(long, short = 'v')]
+    verbose: bool,
 
     /// The buffer pool's free-list budget in MiB (`MetalDevice::set_free_budget`;
     /// 256 ships, §6.3b). A measurement arm for the tiled prefill: a budget
@@ -1180,6 +1201,7 @@ fn report_pass_plans(device: &Device, widths: &str) {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    VERBOSE.store(args.verbose, std::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "metal")]
     if candle::kernels::metal::trace::trace_requested() {
         // Record every dispatch for `report_trace_census`; off, this is one
@@ -1210,7 +1232,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = &device {
             m.set_free_budget(mb * 1024 * 1024);
-            eprintln!(
+            diag!(
                 "[pool: free budget set to {mb} MiB{}]",
                 if args.free_budget_mb.is_none() { " (the dspark default)" } else { "" }
             );
@@ -1670,7 +1692,7 @@ fn main() -> Result<()> {
     // safetensors are memory mapped, so the weight *bytes* fault in lazily on the
     // first forward, but the pipelines are now compiled, so the first prompt's
     // TTFT is real prefill work rather than compilation.
-    eprintln!(
+    diag!(
         "[loaded in \x1b[1;96m{:.2}s\x1b[0m (mmap + construct + warmup: {libs} libs, {pipes} pipelines)]",
         load_start.elapsed().as_secs_f64()
     );
@@ -1907,7 +1929,7 @@ fn main() -> Result<()> {
     // and the balance is what a bad measurement corrupts (measurements §10).
     {
         let (host_ns, gpu_ns) = session.measured_balance_ns();
-        eprintln!(
+        diag!(
             "[in-flight: depth {in_flight_depth} (warmup measured {:.2} ms host encode / \
              {:.2} ms gpu step -> {}){}]",
             host_ns as f64 / 1e6,
@@ -1982,7 +2004,7 @@ fn main() -> Result<()> {
         // its tokens back every round (`verify_tokens`' argmax compare) and
         // commits only under a ring-owning strategy, so none of these reach it
         // and the RESULT line renders them unread (`concurrent::read_or_na`).
-        eprintln!(
+        diag!(
             "[dspark: --readback {} --lookahead {} --commit-budget {} --wake-cadence {} are not \
              read by the speculative body; the RESULT line renders them n/a(dspark)]",
             args.readback, args.lookahead, args.commit_budget, args.wake_cadence
@@ -2014,7 +2036,7 @@ fn main() -> Result<()> {
                 // above: accepted and rendered n/a, not refused — one command
                 // line serves both arms (#148, the B=1 defaults pass: the
                 // matrix's dspark cells refused this and measured nothing).
-                eprintln!(
+                diag!(
                     "[dspark: --adaptive-commit is not read by the speculative body; the RESULT \
                      line renders it n/a(dspark)]"
                 );
@@ -2026,7 +2048,7 @@ fn main() -> Result<()> {
         }
     }
     if args.stream_reader && ring_reader.is_none() {
-        eprintln!(
+        diag!(
             "[stream-reader: no device ring to read (blocking arm, --dspark, or an unmapped \
              ring); falling back to the commit-drained stream]"
         );
@@ -2089,7 +2111,7 @@ fn main() -> Result<()> {
                 unsafe { VarBuilder::from_mmaped_safetensors(&[draft_file], DType::F16, &device)? };
             let drafter = DSparkDrafter::new(setup.dcfg.clone(), max_pos, dvb)
                 .context("constructing DSpark drafter")?;
-            eprintln!(
+            diag!(
                 "[dspark: drafter loaded, {} layers, draft block K={} (verify window {} positions, \
                  conv ring reserves {} history slots)]",
                 setup.dcfg.num_hidden_layers,
@@ -2104,7 +2126,7 @@ fn main() -> Result<()> {
                 1,
             )
             .context("constructing DSpark speculator")?;
-            eprintln!("[dspark: context kv {}]", spec.ctx_kv().name());
+            diag!("[dspark: context kv {}]", spec.ctx_kv().name());
             // Warm the DRAFTER's pipelines off the clock, the counterpart of the
             // target's `session.warmup` above. The target warmup compiles the
             // target's GEMM/attention; the drafter runs its own (backbone at
@@ -2118,7 +2140,7 @@ fn main() -> Result<()> {
                 spec.warmup(&device)
                     .context("warming DSpark drafter pipelines")?;
                 let (dlibs2, dpipes2) = cache_sizes_of(&device);
-                eprintln!(
+                diag!(
                     "[dspark: drafter warmup +{} libs +{} pipelines]",
                     dlibs2.saturating_sub(dlibs),
                     dpipes2.saturating_sub(dpipes),
@@ -2518,7 +2540,7 @@ fn main() -> Result<()> {
             format!("{:.2}", ns as f64 / 1e6)
         }
     };
-    eprintln!(
+    diag!(
         "[first-token: submit {:.2} ms (host encode, no GPU wait) | received {} ms (TTFT) | popped {} ms | detokenized {} ms | visible {} ms (to stdout); tail after the loop {:.2} ms]",
         submit_ms,
         first_batch_at
@@ -2544,7 +2566,7 @@ fn main() -> Result<()> {
             gaps.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let q = |f: f64| gaps[((gaps.len() - 1) as f64 * f) as usize];
             let burst_1ms = gaps.iter().filter(|g| **g < 1.0).count();
-            eprintln!(
+            diag!(
                 "[visible cadence: {} writes over {} tokens; gap p50 {:.2} / p90 {:.2} / p99 {:.2} / max {:.2} ms; {} gaps < 1 ms (tokens arriving in a burst)]",
                 stamps.len(),
                 n,
@@ -2583,7 +2605,7 @@ fn main() -> Result<()> {
         );
     }
     if let Some(bytes) = device_allocated_at_first_token {
-        eprintln!(
+        diag!(
             "[prefill: device_allocated {:.3} GB at the first token (after the prefill and the first step)]",
             bytes as f64 / 1e9
         );
@@ -2598,7 +2620,7 @@ fn main() -> Result<()> {
     // meanwhile: engagement, not a flag (§2.4).
     {
         let h = &st.hot_thread;
-        eprintln!(
+        diag!(
             "[hot thread: qos {} → {} (arm {:?}{}); page faults during decode: minor {}, major {}]",
             h.before.as_str(),
             h.after.as_str(),
@@ -2615,7 +2637,7 @@ fn main() -> Result<()> {
         );
     }
     if args.adaptive_commit {
-        eprintln!(
+        diag!(
             "[adaptive commit: {} buffers closed on the GPU starting the previous one + {} at the \
              run-ahead bound ({}), over {} steps = {:.1} steps/buffer, max {} in one; stopped by \
              the reader's EOS flag: {}; fused publishes {}/{}]",
@@ -2650,7 +2672,7 @@ fn main() -> Result<()> {
     // The per-step split is a debug/profile detail — `step_ns` is empty in a plain
     // release build (the reads are compiled out), so print it only when populated.
     if !st.step_ns.is_empty() {
-        eprintln!(
+        diag!(
             "[ttft split: prefill {:.2} ms + step0 {:.2} ms; step_ns[1..={}] = {}; prompt_tokens={}]",
             ms(st.prefill_ns),
             ms(st.step_ns.first().copied().unwrap_or(0)),
@@ -2709,7 +2731,7 @@ fn main() -> Result<()> {
         let tokens_per_round = round_tokens as f64 / rounds as f64;
         let steady_tok_s = steady * tokens_per_round; // rounds/s × tokens/round
         let setup = dspark_setup.as_ref().expect("--dspark implies a setup");
-        eprintln!(
+        diag!(
             "[dspark: {} accepted-tokens/round (mean over {} rounds), \
              {} tok/s steady (rounds/s × tokens/round), K={}]",
             b(format!("{tokens_per_round:.2}")),
@@ -2757,7 +2779,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "metal")]
         if let (Device::Metal(m), Some(before)) = (&device, churn_before.as_ref()) {
             let after = churn_snapshot(m);
-            eprintln!(
+            diag!(
                 "[churn over the run: pool lookups={} hits={} allocations={} evicted={} \
                  trims={} | residency adds={} removes={} commits={} | to_cpu fast={} blit={} \
                  null_after_wait={} staged={}]",
@@ -2795,7 +2817,7 @@ fn main() -> Result<()> {
             };
             let clock = m.gpu_clock();
             let (c_hits, c_misses) = m.constants_counters();
-            eprintln!(
+            diag!(
                 "[pool free at end: shared {} | private {}; clock epochs submitted={} \
                  completed={}; constants cache hits={c_hits} misses={c_misses}]",
                 fmt(&shared),
@@ -2804,7 +2826,7 @@ fn main() -> Result<()> {
                 clock.completed_count()
             );
         }
-        eprintln!(
+        diag!(
             "[kv: len={} slab={} ceiling={} bucket={} grows={} kv_bytes={:.1} MiB{device_line}]",
             kv.kv_len,
             kv.slab,
@@ -3019,7 +3041,7 @@ fn main() -> Result<()> {
             .collect();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mean = v.iter().sum::<f64>() / v.len() as f64;
-        eprintln!(
+        diag!(
             "[step time, host, steps 2..={} (the first step carries the prefill's wait): p50 {:.3} / mean {:.3} / p90 {:.3} / \
              p99 {:.3} / max {:.3} ms; mean/median {:.4}; steps over 1.5× the median: {}]",
             v.len() + 1,
@@ -3443,7 +3465,7 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
     const WARMUP_ROUNDS: usize = 4;
     let rounds = &st.rounds;
     if rounds.len() <= WARMUP_ROUNDS {
-        eprintln!(
+        diag!(
             "[dspark rounds: only {} rounds, fewer than the {WARMUP_ROUNDS} dropped as warm-up; \
              no breakdown]",
             rounds.len()
@@ -3473,14 +3495,14 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
     let med_verify = median(timed.iter().map(|r| ms(r.timing.verify_ns)).collect());
     let med_observe = median(timed.iter().map(|r| ms(r.timing.observe_ns)).collect());
     let e = accepted as f64;
-    eprintln!(
+    diag!(
         "[dspark rounds: {} timed ({WARMUP_ROUNDS} warm-up dropped), {accepted} tokens accepted, \
          {tokens_per_round:.3} tokens/round; phase_sync={phase_sync}]",
         timed.len()
     );
-    eprintln!("[dspark per round, ms (median | mean):  draft {med_draft:.3} | {:.3}   verify {med_verify:.3} | {:.3}   observe {med_observe:.3} | {:.3}   round {med_round:.3} | {:.3}]",
+    diag!("[dspark per round, ms (median | mean):  draft {med_draft:.3} | {:.3}   verify {med_verify:.3} | {:.3}   observe {med_observe:.3} | {:.3}   round {med_round:.3} | {:.3}]",
         sum_draft / n, sum_verify / n, sum_observe / n, sum_round / n);
-    eprintln!("[dspark per accepted token, ms (ratio of sums):  draft {:.3}   verify {:.3}   observe {:.3}   total {:.3}]",
+    diag!("[dspark per accepted token, ms (ratio of sums):  draft {:.3}   verify {:.3}   observe {:.3}   total {:.3}]",
         sum_draft / e, sum_verify / e, sum_observe / e, sum_round / e);
     // The accepted-length distribution: the round cost is paid whatever the
     // acceptance, so this is the other factor in the per-token figure.
@@ -3488,7 +3510,7 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
     for r in timed {
         hist[r.accepted] += 1;
     }
-    eprintln!(
+    diag!(
         "[dspark accepted-per-round histogram (1..): {}]",
         hist.iter()
             .enumerate()
@@ -3503,7 +3525,7 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
     let rb_draft: u64 = timed.iter().map(|r| r.timing.draft_readbacks).sum();
     let rb_verify: u64 = timed.iter().map(|r| r.timing.verify_readbacks).sum();
     let rb_observe: u64 = timed.iter().map(|r| r.timing.observe_readbacks).sum();
-    eprintln!(
+    diag!(
         "[dspark host readbacks per round (mean):  draft {:.2}   verify {:.2}   observe {:.2}   round {:.2}]",
         rb_draft as f64 / n,
         rb_verify as f64 / n,
@@ -3518,10 +3540,10 @@ fn report_rounds(st: &lloom::nn::DecodeStats, phase_sync: bool) {
     let disp_observe: u64 = timed.iter().map(|r| r.timing.observe_disp).sum();
     let profiled = disp_draft + disp_verify + disp_observe > 0;
     if profiled {
-        eprintln!("[dspark GPU-busy per round, ms (mean of union):  draft {:.3}   verify {:.3}   observe {:.3}   round {:.3}  — idle (wall−busy) {:.3}]",
+        diag!("[dspark GPU-busy per round, ms (mean of union):  draft {:.3}   verify {:.3}   observe {:.3}   round {:.3}  — idle (wall−busy) {:.3}]",
             gpu_draft / n, gpu_verify / n, gpu_observe / n, (gpu_draft + gpu_verify + gpu_observe) / n,
             (sum_round - gpu_draft - gpu_verify - gpu_observe) / n);
-        eprintln!(
+        diag!(
             "[dspark dispatches per round (mean):  draft {:.1}   verify {:.1}   observe {:.1}]",
             disp_draft as f64 / n,
             disp_verify as f64 / n,
@@ -3728,7 +3750,7 @@ fn build_readback(
     };
     // Stamped because a ring arm allocates its history and the consumer slack
     // here; the figure is what a serving engine pays once per engine.
-    eprintln!(
+    diag!(
         "[readback: {readback} built in {:.2} ms (LLOOM_RING_SLACK_BYTES={})]",
         built.elapsed().as_secs_f64() * 1e3,
         std::env::var("LLOOM_RING_SLACK_BYTES").unwrap_or_else(|_| "default".into()),

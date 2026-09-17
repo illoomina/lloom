@@ -207,6 +207,12 @@ fn run_flash(
 /// without a capacity above the live count, every fixture runs at a stride the
 /// two readings of that field agree on, and a stride bug is invisible.
 #[allow(clippy::too_many_arguments)]
+/// The partial pass's threadgroup width the fixtures run at: the kernel as
+/// shipped. `run_flash_sized_width` takes the width; the narrow variant's own
+/// fixture passes 8.
+const PARTIAL_WIDTH: usize = 32;
+
+#[allow(clippy::too_many_arguments)]
 fn run_flash_sized(
     device: &Device,
     kernels: &Kernels,
@@ -223,6 +229,45 @@ fn run_flash_sized(
     scale: f32,
     table: &ChunkTable,
     chunk_capacity: usize,
+) -> Vec<f32> {
+    run_flash_sized_width(
+        device,
+        kernels,
+        queries,
+        keys,
+        values,
+        n_q_heads,
+        n_kv_heads,
+        head_dim,
+        capacity,
+        n_keys,
+        page_size,
+        pages_per_chunk,
+        scale,
+        table,
+        chunk_capacity,
+        PARTIAL_WIDTH,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_flash_sized_width(
+    device: &Device,
+    kernels: &Kernels,
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    capacity: usize,
+    n_keys: usize,
+    page_size: usize,
+    pages_per_chunk: usize,
+    scale: f32,
+    table: &ChunkTable,
+    chunk_capacity: usize,
+    partial_width: usize,
 ) -> Vec<f32> {
     let cmds = commands(device);
     let chunk_size = page_size * pages_per_chunk;
@@ -314,6 +359,7 @@ fn run_flash_sized(
             head_dim,
             n_chunks,
             FlashDType::F32,
+            partial_width,
         )
         .unwrap();
     }
@@ -349,10 +395,12 @@ fn flash_names_resolve() {
 /// error rather than a `LoadFunctionError` from inside a forward pass.
 #[test]
 fn flash_refuses_an_uninstantiated_head_dim() {
-    assert!(FlashKernel::partial(FlashDType::F16, 63).is_err());
+    assert!(FlashKernel::partial(FlashDType::F16, 63, 32).is_err());
+    assert!(FlashKernel::partial(FlashDType::F16, 64, 16).is_err());
     assert!(FlashKernel::combine(FlashDType::F16, 512).is_err());
     for hd in FLASH_HEAD_DIMS {
-        assert!(FlashKernel::partial(FlashDType::F16, hd).is_ok());
+        assert!(FlashKernel::partial(FlashDType::F16, hd, 32).is_ok());
+        assert!(FlashKernel::partial(FlashDType::F16, hd, 8).is_ok());
     }
 }
 
@@ -424,6 +472,81 @@ fn flash_matches_the_scalar_reference() {
 /// single-pass attention is FlashDecoding with `n_chunks == 1`*. The
 /// `page_size >= n_keys` arm below **is** that degenerate case, so it is tested
 /// rather than argued.
+/// The narrow partial (`flash_decoding_partial8`, `BN = 8`): against the
+/// f64 reference at the square arm's tolerance over multi-chunk lengths,
+/// bit-stable run to run, and within tolerance of the square arm — NOT
+/// bit-identical to it (a different key order per simdgroup and a different
+/// reduction tree), which is why it is an instantiation of its own.
+#[test]
+fn the_narrow_partial_matches_the_reference_and_is_bit_stable() {
+    let device = device();
+    let kernels = Kernels::new();
+
+    let head_dim = 64;
+    let n_q_heads = 8;
+    let n_kv_heads = 2;
+    let capacity = 4096;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let page_size = 256;
+
+    for &n_keys in &[257usize, 300, 1000, 2720, 4096] {
+        let queries = fill(n_q_heads * head_dim, 11);
+        let keys = fill(n_kv_heads * capacity * head_dim, 12);
+        let values = fill(n_kv_heads * capacity * head_dim, 13);
+        let n_chunks = flash_chunk_count(n_keys, page_size);
+        assert!(n_chunks > 1, "the partial pass must run: {n_keys} keys");
+        let run = |width: usize| {
+            run_flash_sized_width(
+                &device,
+                &kernels,
+                &queries,
+                &keys,
+                &values,
+                n_q_heads,
+                n_kv_heads,
+                head_dim,
+                capacity,
+                n_keys,
+                page_size,
+                1,
+                scale,
+                &ChunkTable::Contiguous,
+                n_chunks,
+                width,
+            )
+        };
+        let narrow = run(8);
+        let again = run(8);
+        assert!(
+            narrow.iter().zip(again.iter()).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "n_keys={n_keys}: the narrow partial is not bit-stable run to run"
+        );
+        let square = run(32);
+        let want = reference_attention(
+            &queries, &keys, &values, n_q_heads, n_kv_heads, head_dim, capacity, n_keys, scale,
+        );
+        let mut worst = 0f32;
+        let mut vs_square = 0f32;
+        for ((n, s), w) in narrow.iter().zip(square.iter()).zip(want.iter()) {
+            worst = worst.max((n - w).abs());
+            vs_square = vs_square.max((n - s).abs());
+        }
+        assert!(
+            worst < 2e-5,
+            "n_keys={n_keys} chunks={n_chunks}: narrow partial worst |delta| = {worst:e} against \
+             the f64 reference"
+        );
+        assert!(
+            vs_square < 2e-5,
+            "n_keys={n_keys}: narrow vs square partial |delta| = {vs_square:e}"
+        );
+        println!(
+            "the_narrow_partial_matches_the_reference_and_is_bit_stable: n_keys={n_keys} \
+             chunks={n_chunks} worst vs reference {worst:e}, vs square {vs_square:e}, bit-stable"
+        );
+    }
+}
+
 #[test]
 fn flash_is_invariant_to_the_chunk_count() {
     let device = device();
@@ -1780,6 +1903,7 @@ fn run_flash_with(
             g.head_dim,
             n_chunks,
             FlashDType::F32,
+            PARTIAL_WIDTH,
         )
         .unwrap();
     }
@@ -1916,6 +2040,7 @@ fn run_partials(
             head_dim,
             n_chunks,
             FlashDType::F32,
+            PARTIAL_WIDTH,
         )
         .unwrap();
     }
@@ -2111,6 +2236,7 @@ fn token_stride_is_read_from_the_parameter() {
             head_dim,
             n_chunks,
             FlashDType::F32,
+            PARTIAL_WIDTH,
         )
         .unwrap();
     }
@@ -2273,6 +2399,7 @@ fn walk_order_of(
             head_dim,
             n_chunks,
             FlashDType::F32,
+            PARTIAL_WIDTH,
         )
         .unwrap();
     }

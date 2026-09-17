@@ -392,6 +392,18 @@ impl Engine {
             ),
             Some(p) => Some(p.clone()),
         };
+        // The speculative arm's pool budget: 1024 MiB, sized from measurement
+        // (#148, the B=1 defaults pass; `lfm2-chat` applies the same default):
+        // a round is two models' activations plus the verify's logits,
+        // released a few rounds later under the nonblocking readback, and at
+        // the 256 MiB ceiling that working set is evicted as it frees — ~10
+        // allocations and a residency commit per round; at 1024, none.
+        #[cfg(feature = "metal")]
+        if dspark_dir.is_some() {
+            if let Device::Metal(m) = &device {
+                m.set_free_budget(1024 * 1024 * 1024);
+            }
+        }
         let dcfg = match &dspark_dir {
             Some(dir) => {
                 let dcfg = DSparkConfig::read_from_dir(dir)

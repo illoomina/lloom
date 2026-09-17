@@ -5361,9 +5361,9 @@ impl Attention {
             self.flash_pages_per_chunk,
             self.flash_scratch_sizing,
             reserve_chunks,
-            pass.tables.clone(),
+            &pass.tables,
             pass.table_stride,
-            pass.n_keys.clone(),
+            &pass.n_keys,
             &pass.tables_t,
             &pass.n_keys_t,
         )?;
@@ -5452,11 +5452,12 @@ impl Attention {
                 .transpose(1, 2)?
                 .contiguous()?
                 .reshape((nd, self.num_attention_heads, 1, self.head_dim))?;
+            // Borrowed from the pass: no `Vec` clone per layer per step.
             let (tables, n_keys, tables_t, n_keys_t) = match &pass.dec {
-                Some(d) => (d.tables.clone(), d.n_keys.clone(), &d.tables_t, &d.n_keys_t),
+                Some(d) => (&d.tables[..], &d.n_keys[..], &d.tables_t, &d.n_keys_t),
                 None => (
-                    pass.tables.clone(),
-                    pass.n_keys.clone(),
+                    &pass.tables[..],
+                    &pass.n_keys[..],
                     &pass.tables_t,
                     &pass.n_keys_t,
                 ),
@@ -5494,6 +5495,10 @@ impl Attention {
             }
         }
         let mut y_long: Vec<Option<Tensor>> = (0..rows.len()).map(|_| None).collect();
+        // One table / count scratch for every group (cleared per group), the
+        // rows' page lists read in place.
+        let mut tables: Vec<u32> = Vec::new();
+        let mut n_keys: Vec<u32> = Vec::new();
         for (len, grp) in &groups {
             let n = grp.len();
             let offs: Vec<usize> = grp.iter().map(|&r| pass.span(r).0).collect();
@@ -5522,12 +5527,12 @@ impl Attention {
                 .max()
                 .unwrap_or(1)
                 .max(1);
-            let mut tables = Vec::with_capacity(n * stride);
-            let mut n_keys = Vec::with_capacity(n);
+            tables.clear();
+            n_keys.clear();
             for &r in grp {
-                let mut t = pass.pages[r].clone();
-                t.resize(stride, 0);
-                tables.extend(t);
+                let p = &pass.pages[r];
+                tables.extend_from_slice(p);
+                tables.extend(std::iter::repeat_n(0, stride - p.len()));
                 n_keys.push(pass.n_keys[r]);
             }
             let y_g = crate::nn::ops::sdpa_paged_ragged(
@@ -5537,9 +5542,9 @@ impl Attention {
                 true,
                 scale,
                 self.flash_page_size,
-                tables,
+                &tables,
                 stride,
-                n_keys,
+                &n_keys,
             )?;
             for (j, &r) in grp.iter().enumerate() {
                 y_long[r] = Some(y_g.narrow(0, j, 1)?);

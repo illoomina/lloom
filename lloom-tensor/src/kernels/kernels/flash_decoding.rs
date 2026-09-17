@@ -88,6 +88,11 @@ impl FlashDType {
 /// against the compiled library is what stops that.
 pub const FLASH_HEAD_DIMS: [usize; 4] = [32, 64, 96, 128];
 
+/// The partial pass's threadgroup widths, in simdgroups: 32 (1024 threads,
+/// 8 keys per simdgroup over a 256-key chunk) and 8 (256 threads, 32 keys
+/// per simdgroup — `sdpa_vector_2pass_1`'s shape).
+pub const FLASH_PARTIAL_WIDTHS: [usize; 2] = [32, 8];
+
 /// Every `[[host_name]]` `flash_decoding.metal` declares.
 ///
 /// A checked registry rather than a generated one, for §8.1b's reason: candle
@@ -99,8 +104,25 @@ pub struct FlashKernel;
 
 impl FlashKernel {
     /// The partial-pass kernel for one `(dtype, head_dim)`.
-    pub fn partial(dtype: FlashDType, head_dim: usize) -> Result<String, MetalKernelError> {
-        Self::name("flash_decoding_partial", dtype, head_dim)
+    /// The partial pass at a threadgroup `width` of 32 simdgroups (the
+    /// kernel as shipped) or 8 (`flash_decoding_partial8`; the geometry of
+    /// `sdpa_vector_2pass_1`, `FLASH_PARTIAL_WIDTHS`).
+    pub fn partial(
+        dtype: FlashDType,
+        head_dim: usize,
+        width: usize,
+    ) -> Result<String, MetalKernelError> {
+        let stem = match width {
+            32 => "flash_decoding_partial",
+            8 => "flash_decoding_partial8",
+            _ => {
+                return Err(MetalKernelError::LoadFunctionError(format!(
+                    "flash_decoding partial width {width}: instantiated at {:?}",
+                    FLASH_PARTIAL_WIDTHS
+                )))
+            }
+        };
+        Self::name(stem, dtype, head_dim)
     }
 
     /// The combine-pass kernel for one `(dtype, head_dim)`.
@@ -137,6 +159,7 @@ impl FlashKernel {
         for dtype in [FlashDType::F16, FlashDType::F32] {
             for head_dim in FLASH_HEAD_DIMS {
                 names.push(Self::name("flash_decoding_partial", dtype, head_dim).unwrap());
+                names.push(Self::name("flash_decoding_partial8", dtype, head_dim).unwrap());
                 names.push(Self::name("flash_decoding_combine", dtype, head_dim).unwrap());
                 names.push(Self::name("flash_decoding_single", dtype, head_dim).unwrap());
             }
@@ -415,6 +438,10 @@ pub fn call_flash_decoding(
     head_dim: usize,
     n_chunks: usize,
     itype: FlashDType,
+    // The partial pass's threadgroup width in simdgroups
+    // (`FLASH_PARTIAL_WIDTHS`); the single-chunk and combine passes have
+    // their own fixed geometry.
+    partial_width: usize,
 ) -> Result<(), MetalKernelError> {
     // The single-chunk fast path: at `n_chunks == 1` the split-K machinery
     // manufactures no parallelism (one chunk is one threadgroup per head), and
@@ -471,7 +498,7 @@ pub fn call_flash_decoding(
 
     // Pass 1 -- partials.
     {
-        let name = FlashKernel::partial(itype, head_dim)?;
+        let name = FlashKernel::partial(itype, head_dim, partial_width)?;
         let pipeline =
             kernels.load_pipeline(device, Source::FlashDecoding, KernelName::Value(name))?;
         let encoder = ep.encoder();
@@ -507,8 +534,9 @@ pub fn call_flash_decoding(
             height: n_q_heads,
             depth: n_chunks,
         };
+        // `partial_width` simdgroups of 32: the kernel's `BN`.
         let group_dims = MTLSize {
-            width: 32 * 32,
+            width: partial_width * 32,
             height: 1,
             depth: 1,
         };

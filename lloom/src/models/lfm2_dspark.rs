@@ -458,11 +458,31 @@ impl DSparkConfig {
 /// happens to carry, and *not* the 1e6 §5.2 records for VL-3B). Sharing would
 /// make the drafter silently inherit whichever target it is bolted onto, which
 /// is the §5.11 trap with the checkpoints swapped.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DSparkRotary {
     cos: Tensor,
     sin: Tensor,
     interleaved: bool,
+    /// The batched rows' position index (`at_positions`), resident: the
+    /// positions it holds, the tensor, and the epoch of the last gather that
+    /// read it — written in place once that epoch completed (the round's
+    /// verify readback), a fresh tensor otherwise; the same rule as the
+    /// context pool's slot tensors (`paged_ctx::SeqSlots`). Behind a mutex
+    /// because the forward takes `&self`; one short section per draft.
+    #[cfg(feature = "metal")]
+    positions: Mutex<(Vec<u32>, Option<Tensor>, u64)>,
+}
+
+impl Clone for DSparkRotary {
+    fn clone(&self) -> Self {
+        Self {
+            cos: self.cos.clone(),
+            sin: self.sin.clone(),
+            interleaved: self.interleaved,
+            #[cfg(feature = "metal")]
+            positions: Mutex::new((Vec::new(), None, 0)),
+        }
+    }
 }
 
 impl DSparkRotary {
@@ -482,6 +502,8 @@ impl DSparkRotary {
             cos: freqs.cos()?.to_dtype(dtype)?,
             sin: freqs.sin()?.to_dtype(dtype)?,
             interleaved: !cfg.rope_is_neox_style,
+            #[cfg(feature = "metal")]
+            positions: Mutex::new((Vec::new(), None, 0)),
         })
     }
 
@@ -527,11 +549,50 @@ impl DSparkRotary {
     /// as one sequence are rotated at every position's own offset in one
     /// call — the batched context re-key's shape.
     pub fn at_positions(&self, positions: &[u32]) -> Result<(Tensor, Tensor)> {
-        let idx = Tensor::new(positions, self.cos.device())?;
+        let idx = self.position_index(positions)?;
         Ok((
             self.cos.index_select(&idx, 0)?,
             self.sin.index_select(&idx, 0)?,
         ))
+    }
+
+    /// `positions` as a U32 device tensor — the resident one (see the
+    /// field) on Metal, an upload elsewhere.
+    fn position_index(&self, positions: &[u32]) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = self.cos.device() {
+            let clock = m.gpu_clock();
+            let n = positions.len();
+            let mut g = self.positions.lock();
+            let (held, tensor, epoch) = &mut *g;
+            if let Some(t) = tensor.as_ref() {
+                if held.as_slice() == positions {
+                    *epoch = clock.current_epoch();
+                    return t.narrow(0, 0, n);
+                }
+                // SAFETY: the last gather's epoch is complete.
+                if t.dim(0)? >= n
+                    && clock.is_complete(*epoch)
+                    && unsafe { t.write_host_slice::<u32>(0, positions) }
+                {
+                    held.clear();
+                    held.extend_from_slice(positions);
+                    *epoch = clock.current_epoch();
+                    return t.narrow(0, 0, n);
+                }
+            }
+            let have = tensor.as_ref().and_then(|t| t.dim(0).ok()).unwrap_or(0);
+            let cap = n.max(have).max(64).next_power_of_two();
+            held.clear();
+            held.extend_from_slice(positions);
+            held.resize(cap, 0);
+            let t = Tensor::new(held.as_slice(), self.cos.device())?;
+            held.truncate(n);
+            *tensor = Some(t.clone());
+            *epoch = clock.current_epoch();
+            return t.narrow(0, 0, n);
+        }
+        Tensor::new(positions, self.cos.device())
     }
 
     /// [`Self::apply`] with the table rows in hand: `cos`/`sin` are
@@ -794,9 +855,15 @@ impl CtxCache {
     /// past the context and the pool is returned with the table that names
     /// both. `None` on the contiguous arm, and on every non-Metal build.
     #[cfg(feature = "metal")]
-    fn paged_view(&self, k: &Tensor, v: &Tensor) -> Result<Option<paged_ctx::PagedView>> {
+    fn paged_attend(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+    ) -> Result<Option<Tensor>> {
         match &self.paged {
-            Some(p) => p.block_view(k, v).map(Some),
+            Some(p) => p.attend_block(q, k, v, scale).map(Some),
             None => Ok(None),
         }
     }
@@ -809,12 +876,14 @@ impl CtxCache {
     /// do not share a pool (the contiguous arm, one pool set per sequence),
     /// and the caller attends per row.
     #[cfg(feature = "metal")]
-    fn paged_rows_view(
+    fn paged_attend_rows(
         caches: &[&CtxCache],
+        q: &Tensor,
         k: &Tensor,
         v: &Tensor,
         active: Option<&Tensor>,
-    ) -> Result<Option<paged_ctx::PagedRowsView>> {
+        scale: f32,
+    ) -> Result<Option<Tensor>> {
         let Some(first) = caches.first().and_then(|c| c.paged.as_ref()) else {
             return Ok(None);
         };
@@ -828,7 +897,9 @@ impl CtxCache {
                 _ => return Ok(None),
             }
         }
-        first.block_view_rows(&seqs, k, v, active).map(Some)
+        first
+            .attend_block_rows(&seqs, q, k, v, active, scale)
+            .map(Some)
     }
 
     /// Drop the last `n` context positions — the draft-side half of a rollback.
@@ -869,38 +940,6 @@ mod paged_ctx {
     /// so a drafter and its target widen at the same cadence.
     const BUCKET_TOKENS: usize = 4096;
 
-    /// The pool, B tables and B live counts the tiled kernel reads B rows'
-    /// drafts over in one dispatch (`sdpa_paged_ragged`).
-    pub(super) struct PagedRowsView {
-        pub k: Tensor,
-        pub v: Tensor,
-        /// Every row's pages, `stride` entries each, padded with page 0.
-        pub tables: Vec<u32>,
-        pub stride: usize,
-        pub page_size: usize,
-        /// Per row: its context positions plus the block just written.
-        pub n_keys: Vec<u32>,
-    }
-
-    /// The pool + table the tiled kernel reads a draft over.
-    pub(super) struct PagedView {
-        pub k: Tensor,
-        pub v: Tensor,
-        /// This sequence's pages, in token order — the whole table, reserved
-        /// block pages included.
-        pub table: Vec<u32>,
-        pub page_size: usize,
-        /// Context positions plus the block just written.
-        pub n_keys: usize,
-    }
-
-    impl PagedView {
-        /// One sequence, so the table stride is its length.
-        pub fn table_len(&self) -> usize {
-            self.table.len()
-        }
-    }
-
     /// One layer's pool: the allocator (every sequence's table), its epoch
     /// quarantine, and the `[1, H_kv, pool_pages × P, D]` K/V pools, allocated
     /// at the first append at that append's dtype and geometry.
@@ -918,6 +957,12 @@ mod paged_ctx {
         /// write fails to map (CPU), when the batched view falls back to a
         /// per-round upload.
         block_all: Option<Tensor>,
+        /// What `block_all` holds, on the host: the source of a fresh tensor
+        /// when the in-place write is not safe.
+        block_host: Vec<u32>,
+        /// The epoch of the last dispatch that read or wrote `block_all`; an
+        /// in-place write waits for it to be complete, else a fresh tensor.
+        block_epoch: u64,
     }
 
     /// The slot tensor one sequence's layers share within a round.
@@ -930,10 +975,24 @@ mod paged_ctx {
     /// reuses the tensor only when the vector it computed is equal to the one
     /// uploaded, and uploads its own otherwise. The block slots need no upload
     /// at all: they are written in place into the layer's `block_all`.
+    ///
+    /// The slot tensor is RESIDENT: sized for the append (grown by doubling
+    /// when one outgrows it), written in place and narrowed to the count — no
+    /// upload, no allocation per round. `slots` shadows what the tensor
+    /// holds and `epoch` is the epoch of the last dispatch that read it (the
+    /// scatter encoded right after the write). The rules, in order:
+    /// the same slots again (the layers compute the same ones) → the tensor
+    /// as it is; different slots and that epoch complete (the round's verify
+    /// readback fenced it) → written in place; different slots and a reader
+    /// possibly in flight → a fresh tensor, the old one living on in the
+    /// queued command buffer. The third arm is what a caller with no fence
+    /// between appends (a test keying two rounds back to back) hits; the
+    /// clock decides, not an assumption about the caller.
     #[derive(Default)]
     struct SeqSlots {
         slots: Vec<u32>,
         slots_t: Option<Tensor>,
+        epoch: u64,
     }
 
     /// Every layer's pool, one clock. Behind a `Mutex` because the forward
@@ -956,7 +1015,15 @@ mod paged_ctx {
         shared: Vec<SeqSlots>,
         /// The batched append's flat slot list (`append_rows`), shared by the
         /// layers the same way.
-        rows: (Vec<u32>, Option<Tensor>),
+        rows: SeqSlots,
+        /// Host scratch kept across rounds (capacity retained; no `Vec` per
+        /// call): a block's slots, the batched append's B blocks' slots laid
+        /// end to end, the batched read's padded tables and live counts.
+        scratch_slots: Vec<u32>,
+        scratch_block: Vec<u32>,
+        scratch_blocks: Vec<u32>,
+        scratch_tables: Vec<u32>,
+        scratch_keys: Vec<u32>,
         /// Batched appends taken (`append_rows` calls, one per layer per
         /// round), for a gate that asserts the one-scatter arm ran.
         batched_appends: u64,
@@ -981,6 +1048,8 @@ mod paged_ctx {
                     kv: None,
                     block: vec![None; n_seqs.max(1)],
                     block_all: None,
+                    block_host: Vec::new(),
+                    block_epoch: 0,
                 })
                 .collect();
             Self {
@@ -990,26 +1059,55 @@ mod paged_ctx {
                 clock,
                 layers,
                 shared: (0..n_seqs.max(1)).map(|_| SeqSlots::default()).collect(),
-                rows: (Vec::new(), None),
+                rows: SeqSlots::default(),
+                scratch_slots: Vec::new(),
+                scratch_block: Vec::new(),
+                scratch_blocks: Vec::new(),
+                scratch_tables: Vec::new(),
+                scratch_keys: Vec::new(),
                 batched_appends: 0,
             }
         }
 
-        /// `slots` as a device tensor, uploaded once per distinct vector per
-        /// sequence and shared by the layers that compute the same one.
+        /// `slots` (computed into a scratch) as a device tensor, per
+        /// `SeqSlots`'s rules: the resident tensor as it is, written in
+        /// place, or a fresh one — the slots in its prefix, uploaded, so no
+        /// fill dispatch races the host write. `slots` and the shadow are
+        /// swapped, so the caller's scratch keeps a capacity either way.
         fn upload(
-            cached: &mut (Vec<u32>, Option<Tensor>),
-            slots: Vec<u32>,
+            cached: &mut SeqSlots,
+            slots: &mut Vec<u32>,
             device: &Device,
+            clock: &GpuClock,
         ) -> Result<Tensor> {
-            if let Some(t) = cached.1.as_ref() {
-                if cached.0 == slots {
-                    return Ok(t.clone());
+            let n = slots.len();
+            if let Some(t) = cached.slots_t.as_ref() {
+                if cached.slots == *slots {
+                    cached.epoch = clock.current_epoch();
+                    return t.narrow(0, 0, n);
                 }
             }
-            let t = Tensor::new(slots.as_slice(), device)?;
-            *cached = (slots, Some(t.clone()));
-            Ok(t)
+            std::mem::swap(&mut cached.slots, slots);
+            if let Some(t) = cached.slots_t.as_ref() {
+                // SAFETY: the epoch of the last reader is complete.
+                if t.dim(0)? >= n
+                    && clock.is_complete(cached.epoch)
+                    && unsafe { t.write_host_slice::<u32>(0, &cached.slots) }
+                {
+                    cached.epoch = clock.current_epoch();
+                    return t.narrow(0, 0, n);
+                }
+            }
+            let have = cached.slots_t.as_ref().and_then(|t| t.dim(0).ok()).unwrap_or(0);
+            let cap = n.max(have).max(64).next_power_of_two();
+            let mut init = std::mem::take(&mut cached.slots);
+            init.resize(cap, 0);
+            let t = Tensor::new(init.as_slice(), device)?;
+            init.truncate(n);
+            cached.slots = init;
+            cached.slots_t = Some(t.clone());
+            cached.epoch = clock.current_epoch();
+            t.narrow(0, 0, n)
         }
 
         /// Widen `layer`'s pool by one bucket: the allocator gains pages
@@ -1066,18 +1164,19 @@ mod paged_ctx {
             let lp = &mut self.layers[layer];
             let start = lp.pool.seq(seq).map(|s| s.len()).unwrap_or(0);
             lp.pool.append(seq, n).map_err(lloom_tensor::Error::wrap)?;
-            let pages = lp
-                .pool
-                .seq(seq)
-                .expect("seq within n_seqs")
-                .pages()
-                .to_vec();
-            let slots: Vec<u32> = (start..start + n)
-                .map(|t| Self::slot(&pages, t, page_size))
-                .collect();
-            let block: Vec<u32> = (start + n..start + n + reserve)
-                .map(|t| Self::slot(&pages, t, page_size))
-                .collect();
+            let sh = &mut self.shared[seq];
+            let slots = &mut self.scratch_slots;
+            let mut block = std::mem::take(&mut self.scratch_block);
+            {
+                // The page list read in place; the slots into the scratch.
+                let pages = lp.pool.seq(seq).expect("seq within n_seqs").pages();
+                slots.clear();
+                slots.extend((start..start + n).map(|t| Self::slot(pages, t, page_size)));
+                block.clear();
+                block.extend(
+                    (start + n..start + n + reserve).map(|t| Self::slot(pages, t, page_size)),
+                );
+            }
             let tokens = lp.pool.pool_pages() * page_size;
             if lp.kv.is_none() {
                 let shape = (1, n_kv_heads, tokens, head_dim);
@@ -1088,17 +1187,14 @@ mod paged_ctx {
             }
             let (pk, pv) = lp.kv.as_ref().expect("allocated above");
             let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
-            let sh = &mut self.shared[seq];
-            let mut pass = (std::mem::take(&mut sh.slots), sh.slots_t.take());
-            let slots = Self::upload(&mut pass, slots, k.device())?;
-            (sh.slots, sh.slots_t) = pass;
+            let slots = Self::upload(sh, slots, k.device(), &self.clock)?;
             let k = k.contiguous()?;
             let v = v.contiguous()?;
             k.kv_scatter_into(pk, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
             v.kv_scatter_into(pv, &slots, max_slot, 0, tokens * head_dim, head_dim)?;
-            let device = k.device().clone();
-            self.set_block(layer, seq, &block, &device)?;
-            Ok(())
+            let r = self.set_block(layer, seq, &block, k.device());
+            self.scratch_block = block;
+            r
         }
 
         /// [`Self::append`] for `seqs` at once: `k`/`v` are `[1, H_kv, Σlens,
@@ -1130,8 +1226,10 @@ mod paged_ctx {
                 let ready = lp.quarantine.drain_completed(completed);
                 lp.pool.recycle(&ready).map_err(lloom_tensor::Error::wrap)?;
             }
-            let mut slots: Vec<u32> = Vec::with_capacity(t);
-            let mut blocks: Vec<Vec<u32>> = Vec::with_capacity(seqs.len());
+            let mut slots = std::mem::take(&mut self.scratch_slots);
+            slots.clear();
+            let mut blocks = std::mem::take(&mut self.scratch_blocks);
+            blocks.clear();
             for (&seq, &n) in seqs.iter().zip(lens) {
                 loop {
                     let lp = &mut self.layers[layer];
@@ -1144,17 +1242,10 @@ mod paged_ctx {
                 let lp = &mut self.layers[layer];
                 let start = lp.pool.seq(seq).map(|s| s.len()).unwrap_or(0);
                 lp.pool.append(seq, n).map_err(lloom_tensor::Error::wrap)?;
-                let pages = lp
-                    .pool
-                    .seq(seq)
-                    .expect("seq within n_seqs")
-                    .pages()
-                    .to_vec();
-                slots.extend((start..start + n).map(|t| Self::slot(&pages, t, page_size)));
-                blocks.push(
-                    (start + n..start + n + reserve)
-                        .map(|t| Self::slot(&pages, t, page_size))
-                        .collect(),
+                let pages = lp.pool.seq(seq).expect("seq within n_seqs").pages();
+                slots.extend((start..start + n).map(|t| Self::slot(pages, t, page_size)));
+                blocks.extend(
+                    (start + n..start + n + reserve).map(|t| Self::slot(pages, t, page_size)),
                 );
             }
             let lp = &mut self.layers[layer];
@@ -1168,17 +1259,21 @@ mod paged_ctx {
             }
             let (pk, pv) = lp.kv.as_ref().expect("allocated above");
             let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
-            let mut pass = (std::mem::take(&mut self.rows.0), self.rows.1.take());
-            let slots_t = Self::upload(&mut pass, slots, k.device())?;
-            self.rows = pass;
+            let slots_t = Self::upload(&mut self.rows, &mut slots, k.device(), &self.clock)?;
+            self.scratch_slots = slots;
             let k = k.contiguous()?;
             let v = v.contiguous()?;
             k.kv_scatter_into(pk, &slots_t, max_slot, 0, tokens * head_dim, head_dim)?;
             v.kv_scatter_into(pv, &slots_t, max_slot, 0, tokens * head_dim, head_dim)?;
-            let device = k.device().clone();
-            for (&seq, block) in seqs.iter().zip(&blocks) {
-                self.set_block(layer, seq, block, &device)?;
+            let mut r = Ok(());
+            for (&seq, block) in seqs.iter().zip(blocks.chunks_exact(reserve)) {
+                r = self.set_block(layer, seq, block, k.device());
+                if r.is_err() {
+                    break;
+                }
             }
+            self.scratch_blocks = blocks;
+            r?;
             self.batched_appends += 1;
             Ok(())
         }
@@ -1205,31 +1300,38 @@ mod paged_ctx {
                 );
             }
             let block_max = slots.iter().copied().max().unwrap_or(0) as usize;
+            let now = self.clock.current_epoch();
+            let settled = self.clock.is_complete(self.layers[layer].block_epoch);
             let lp = &mut self.layers[layer];
-            if lp.block_all.is_none() {
-                // An upload, not `zeros`: a pooled fill blit may still be
-                // queued when the first mapped write lands.
-                let zeros = vec![0u32; n_seqs * reserve];
-                lp.block_all = Some(Tensor::new(zeros.as_slice(), device)?);
+            if lp.block_host.len() != n_seqs * reserve {
+                lp.block_host = vec![0u32; n_seqs * reserve];
             }
-            let mapped = {
-                let all = lp.block_all.as_ref().expect("set above");
-                // SAFETY: between rounds; see above.
-                if unsafe { all.write_host_slice::<u32>(seq * reserve, slots) } {
+            lp.block_host[seq * reserve..(seq + 1) * reserve].copy_from_slice(slots);
+            // In place when every dispatch that read `block_all` has
+            // completed (the round's verify readback); else a fresh tensor
+            // from the host copy — an upload, not `zeros`, so no pooled fill
+            // blit races the write — the old one living on in the queued
+            // command buffer. The clock decides, as `SeqSlots` says; a CPU
+            // device (no mapping) takes the fresh-tensor arm every time.
+            let mapped = match lp.block_all.as_ref() {
+                // SAFETY: `settled` — no queued dispatch reads the tensor.
+                Some(all)
+                    if settled && unsafe { all.write_host_slice::<u32>(seq * reserve, slots) } =>
+                {
                     Some(all.narrow(0, seq * reserve, reserve)?)
-                } else {
-                    None
                 }
+                _ => None,
             };
             let block = match mapped {
                 Some(view) => view,
                 None => {
-                    // Unmapped (CPU): a per-sequence upload; the batched view
-                    // rebuilds from `block`.
-                    lp.block_all = None;
-                    Tensor::new(slots, device)?
+                    let all = Tensor::new(lp.block_host.as_slice(), device)?;
+                    let view = all.narrow(0, seq * reserve, reserve)?;
+                    lp.block_all = Some(all);
+                    view
                 }
             };
+            lp.block_epoch = now;
             lp.block[seq] = Some((block, block_max));
             Ok(())
         }
@@ -1260,15 +1362,12 @@ mod paged_ctx {
             }
             let lp = &mut self.layers[layer];
             let start = lp.pool.seq(seq).map(|s| s.len()).unwrap_or(0);
-            let pages = lp
-                .pool
-                .seq(seq)
-                .expect("seq within n_seqs")
-                .pages()
-                .to_vec();
-            let block: Vec<u32> = (start..start + reserve)
-                .map(|t| Self::slot(&pages, t, page_size))
-                .collect();
+            let mut block = std::mem::take(&mut self.scratch_block);
+            {
+                let pages = lp.pool.seq(seq).expect("seq within n_seqs").pages();
+                block.clear();
+                block.extend((start..start + reserve).map(|t| Self::slot(pages, t, page_size)));
+            }
             let tokens = lp.pool.pool_pages() * page_size;
             if lp.kv.is_none() {
                 let shape = (1, n_kv_heads, tokens, head_dim);
@@ -1277,19 +1376,26 @@ mod paged_ctx {
                     Tensor::zeros(shape, dtype, device)?,
                 ));
             }
-            self.set_block(layer, seq, &block, device)?;
-            Ok(())
+            let r = self.set_block(layer, seq, &block, device);
+            self.scratch_block = block;
+            r
         }
 
         /// Write the block's `[1, H_kv, width, D]` `k`/`v` into `(layer,
-        /// seq)`'s reserved slots and hand back the pool with the table.
-        fn block_view(
+        /// seq)`'s reserved slots and read `q` over the context plus the
+        /// block through the tiled paged kernel — dispatched here, under the
+        /// lock, so the kernel reads the sequence's page list in place (no
+        /// table copied out per draft per layer).
+        #[allow(clippy::too_many_arguments)]
+        fn attend_block(
             &mut self,
             layer: usize,
             seq: usize,
+            q: &Tensor,
             k: &Tensor,
             v: &Tensor,
-        ) -> Result<PagedView> {
+            scale: f32,
+        ) -> Result<Tensor> {
             let (b, _, width, head_dim) = k.dims4()?;
             if b != 1 || width > self.reserve {
                 lloom_tensor::bail!(
@@ -1310,7 +1416,10 @@ mod paged_ctx {
                 let (_, n_kv_heads, _, head_dim) = k.dims4()?;
                 self.key_empty(layer, seq, n_kv_heads, head_dim, k.dtype(), k.device())?;
             }
-            let lp = &self.layers[layer];
+            let now = self.clock.current_epoch();
+            let lp = &mut self.layers[layer];
+            lp.block_epoch = now;
+            let lp = &*lp;
             let (pk, pv) = lp.kv.as_ref().expect("keyed above");
             let (block, block_max) = lp.block[seq].as_ref().expect("keyed above");
             let tokens = lp.pool.pool_pages() * page_size;
@@ -1320,29 +1429,38 @@ mod paged_ctx {
             k.kv_scatter_into(pk, &slots, *block_max, 0, tokens * head_dim, head_dim)?;
             v.kv_scatter_into(pv, &slots, *block_max, 0, tokens * head_dim, head_dim)?;
             let s = lp.pool.seq(seq).expect("seq within n_seqs");
-            Ok(PagedView {
-                k: pk.clone(),
-                v: pv.clone(),
-                table: s.pages().to_vec(),
+            let table = s.pages();
+            crate::nn::ops::sdpa_paged(
+                q,
+                pk,
+                pv,
+                false,
+                scale,
                 page_size,
-                n_keys: s.len() + width,
-            })
+                table,
+                table.len(),
+                s.len() + width,
+            )
         }
 
-        /// [`Self::block_view`] for `seqs` at once: the B blocks' `k`/`v`
+        /// [`Self::attend_block`] for `seqs` at once: the B blocks' `k`/`v`
         /// (`[B, H_kv, width, D]`, row `b` sequence `seqs[b]`'s) scattered
         /// into their reserved slots in ONE dispatch through the layer's
         /// `block_all` (the active rows' slice when `seqs` is `0..B`, else a
-        /// gather by `active`), the pool handed back with every row's table
-        /// and live count for `sdpa_paged_ragged`.
-        fn block_view_rows(
+        /// gather by `active`), then `q` read over every row's context plus
+        /// block in one `sdpa_paged_ragged` dispatch; the rows' padded
+        /// tables and live counts are built into the pool's scratch.
+        #[allow(clippy::too_many_arguments)]
+        fn attend_block_rows(
             &mut self,
             layer: usize,
             seqs: &[usize],
+            q: &Tensor,
             k: &Tensor,
             v: &Tensor,
             active: Option<&Tensor>,
-        ) -> Result<PagedRowsView> {
+            scale: f32,
+        ) -> Result<Tensor> {
             let (b, n_kv_heads, width, head_dim) = k.dims4()?;
             if b != seqs.len() || width > self.reserve {
                 lloom_tensor::bail!(
@@ -1359,7 +1477,10 @@ mod paged_ctx {
                     self.key_empty(layer, seq, n_kv_heads, head_dim, k.dtype(), k.device())?;
                 }
             }
-            let lp = &self.layers[layer];
+            let now = self.clock.current_epoch();
+            let lp = &mut self.layers[layer];
+            lp.block_epoch = now;
+            let lp = &*lp;
             let (pk, pv) = lp.kv.as_ref().expect("keyed above");
             let tokens = lp.pool.pool_pages() * page_size;
             let prefix = seqs.iter().enumerate().all(|(i, &s)| s == i);
@@ -1399,23 +1520,20 @@ mod paged_ctx {
                 .max()
                 .unwrap_or(1)
                 .max(1);
-            let mut tables = Vec::with_capacity(b * stride);
-            let mut n_keys = Vec::with_capacity(b);
+            let tables = &mut self.scratch_tables;
+            let n_keys = &mut self.scratch_keys;
+            tables.clear();
+            n_keys.clear();
             for &s in seqs {
                 let sp = lp.pool.seq(s).expect("seq within n_seqs");
-                let mut t = sp.pages().to_vec();
-                t.resize(stride, 0);
-                tables.extend(t);
+                let p = sp.pages();
+                tables.extend_from_slice(p);
+                tables.extend(std::iter::repeat_n(0, stride - p.len()));
                 n_keys.push((sp.len() + width) as u32);
             }
-            Ok(PagedRowsView {
-                k: pk.clone(),
-                v: pv.clone(),
-                tables,
-                stride,
-                page_size,
-                n_keys,
-            })
+            crate::nn::ops::sdpa_paged_ragged(
+                q, pk, pv, false, scale, page_size, tables, stride, n_keys,
+            )
         }
 
         fn len(&self, layer: usize, seq: usize) -> usize {
@@ -1449,16 +1567,15 @@ mod paged_ctx {
                 .map_err(lloom_tensor::Error::wrap)?;
             if let Some((block, _)) = lp.block[seq].as_ref() {
                 let device = block.device().clone();
-                let pages = lp
-                    .pool
-                    .seq(seq)
-                    .expect("seq within n_seqs")
-                    .pages()
-                    .to_vec();
-                let slots: Vec<u32> = (to..to + reserve)
-                    .map(|t| Self::slot(&pages, t, page_size))
-                    .collect();
-                self.set_block(layer, seq, &slots, &device)?;
+                let mut slots = std::mem::take(&mut self.scratch_block);
+                {
+                    let pages = lp.pool.seq(seq).expect("seq within n_seqs").pages();
+                    slots.clear();
+                    slots.extend((to..to + reserve).map(|t| Self::slot(pages, t, page_size)));
+                }
+                let r = self.set_block(layer, seq, &slots, &device);
+                self.scratch_block = slots;
+                r?;
             }
             Ok(())
         }
@@ -1606,8 +1723,14 @@ mod paged_ctx {
             self.lock().append_rows(self.layer, seqs, lens, k, v)
         }
 
-        pub(super) fn block_view(&self, k: &Tensor, v: &Tensor) -> Result<PagedView> {
-            self.lock().block_view(self.layer, self.seq, k, v)
+        pub(super) fn attend_block(
+            &self,
+            q: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
+            scale: f32,
+        ) -> Result<Tensor> {
+            self.lock().attend_block(self.layer, self.seq, q, k, v, scale)
         }
 
         /// Whether `other` is a handle over the same pool set (the batched
@@ -1621,14 +1744,18 @@ mod paged_ctx {
         }
 
         /// [`Self::block_view`] for the rows `seqs` of this handle's pool set.
-        pub(super) fn block_view_rows(
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn attend_block_rows(
             &self,
             seqs: &[usize],
+            q: &Tensor,
             k: &Tensor,
             v: &Tensor,
             active: Option<&Tensor>,
-        ) -> Result<PagedRowsView> {
-            self.lock().block_view_rows(self.layer, seqs, k, v, active)
+            scale: f32,
+        ) -> Result<Tensor> {
+            self.lock()
+                .attend_block_rows(self.layer, seqs, q, k, v, active, scale)
         }
 
         pub(super) fn rollback(&self, to: usize) -> Result<()> {
@@ -1914,18 +2041,8 @@ impl DSparkAttention {
         let k = rotary.apply_with(&k, cos, sin)?;
         let scale = 1f64 / (self.head_dim as f64).sqrt();
         #[cfg(feature = "metal")]
-        let out = match CtxCache::paged_rows_view(caches, &k, &v, active)? {
-            Some(view) => crate::nn::ops::sdpa_paged_ragged(
-                &q,
-                &view.k,
-                &view.v,
-                false,
-                scale as f32,
-                view.page_size,
-                view.tables,
-                view.stride,
-                view.n_keys,
-            )?,
+        let out = match CtxCache::paged_attend_rows(caches, &q, &k, &v, active, scale as f32)? {
+            Some(out) => out,
             None => self.attend_rows_each(&q, &k, &v, caches)?,
         };
         #[cfg(not(feature = "metal"))]
@@ -1999,19 +2116,8 @@ impl DSparkAttention {
         // kernel as the fused arm below, its K/V address one page-walk apart,
         // bit-identical on the same keys (`lloom/tests/sdpa.rs`).
         #[cfg(feature = "metal")]
-        if let Some(view) = cache.paged_view(k, v)? {
-            let table_len = view.table_len();
-            return crate::nn::ops::sdpa_paged(
-                q,
-                &view.k,
-                &view.v,
-                false,
-                scale as f32,
-                view.page_size,
-                view.table,
-                table_len,
-                view.n_keys,
-            );
+        if let Some(out) = cache.paged_attend(q, k, v, scale as f32)? {
+            return Ok(out);
         }
 
         // Context first, block second — the key order the context's own RoPE

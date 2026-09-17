@@ -29,7 +29,7 @@ use device::{ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver};
 /// layout should not need a direct dependency on `candle-metal-kernels`.
 pub use crate::kernels::metal::{
     hazard_key, set_hazard_key, set_hazard_key_unless_explicit, ArenaCounters, ArenaLayout,
-    EscapeGuard, HazardKey, PassKey, PassKind, PassPlanCounters, Slot, StepPlan,
+    EscapeGuard, FreeSummary, HazardKey, PassKey, PassKind, PassPlanCounters, Slot, StepPlan,
 };
 
 /// Where a command buffer is cut (`DESIGN.md` §13.5m, issue #420 stage 3).

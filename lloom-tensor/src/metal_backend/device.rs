@@ -8,7 +8,8 @@ use crate::kernels::{
         session_region::{RegionCounters, RegionPlan},
         Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout, ArenaOffsets, ArenaRecorder,
         BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, MTLResourceOptions,
-        PassKey, PassKind, PassPlanCounters, PoolCounters, PoolOccupancySnapshot, PooledBuffer,
+        FreeSummary, PassKey, PassKind, PassPlanCounters, PoolCounters, PoolOccupancySnapshot,
+        PooledBuffer,
         ResidencySet, SessionRegion, StepPlan,
     },
     Kernels,
@@ -570,12 +571,6 @@ fn pod_bytes<T: Copy>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
 }
 
-/// The bytes of a slice of plain data, for [`MetalDevice::constant_buffer`].
-pub fn slice_bytes<T: Copy>(s: &[T]) -> &[u8] {
-    // SAFETY: as `pod_bytes`; `u32`/`i32` slices have no padding.
-    unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), std::mem::size_of_val(s)) }
-}
-
 impl MetalDevice {
     #[cfg(all(feature = "ug", not(target_arch = "wasm32"), not(target_os = "ios")))]
     pub fn compile(
@@ -742,6 +737,21 @@ impl MetalDevice {
     /// Scan and reuse counters for both pools. See `buffer_pool`.
     pub fn pool_counters(&self) -> (PoolCounters, PoolCounters) {
         (self.buffers.counters(), self.private_buffers.counters())
+    }
+
+    /// The by-value constants cache's hits and misses (`ConstantsByValue`):
+    /// on a decode arm a miss per token is a params block or table whose
+    /// bytes change every step and does not belong in the cache.
+    pub fn constants_counters(&self) -> (u64, u64) {
+        self.constants.counters()
+    }
+
+    /// What both free lists hold right now (`BufferPool::free_summary`).
+    pub fn pool_free_summary(&self, top: usize) -> (FreeSummary, FreeSummary) {
+        (
+            self.buffers.free_summary(top),
+            self.private_buffers.free_summary(top),
+        )
     }
 
     pub fn reset_pool_counters(&self) {

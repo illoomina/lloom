@@ -1766,17 +1766,23 @@ impl Module for Identity {
 /// lengths in one dispatch, `batched-decode-design.md` §12.2 change 3).
 /// `PagedTable`'s shape one kernel over: that one is indexed by CHUNK for the
 /// decode kernel, this one by PAGE for the tiled kernel's key blocks.
+///
+/// Borrowed: the op lives for one `apply_op3`, so the caller's table (a
+/// paged cache's page list, the drafter's pool's) is read in place — no
+/// clone per call. On Metal the table is bound through the device's
+/// by-value constants cache (the same buffer until the pages change) and
+/// the counts, which change every step, go up through the buffer pool.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // read by the Metal arm only, as `Sdpa`'s fields are
-struct SdpaPagedTable {
-    entries: Vec<u32>,
+struct SdpaPagedTable<'a> {
+    entries: &'a [u32],
     stride: usize,
     page_size: usize,
-    n_keys: Vec<u32>,
+    n_keys: &'a [u32],
 }
 
 #[allow(dead_code)]
-impl SdpaPagedTable {
+impl SdpaPagedTable<'_> {
     fn max_keys(&self) -> usize {
         self.n_keys.iter().copied().max().unwrap_or(0) as usize
     }
@@ -1791,7 +1797,7 @@ impl SdpaPagedTable {
 }
 
 #[allow(dead_code)]
-struct Sdpa {
+struct Sdpa<'a> {
     scale: f32,
     softcapping: f32,
     mask: Option<Tensor>,
@@ -1800,10 +1806,10 @@ struct Sdpa {
     /// pool_tokens, head_dim]` read through per-sequence page tables rather
     /// than a strided cache (`DESIGN.md` §10.3c; issue #708). Metal, `q_seq >
     /// 1`, no mask tensor.
-    paged: Option<SdpaPagedTable>,
+    paged: Option<SdpaPagedTable<'a>>,
 }
 
-impl lloom_tensor::CustomOp3 for Sdpa {
+impl lloom_tensor::CustomOp3 for Sdpa<'_> {
     fn name(&self) -> &'static str {
         "metal-sdpa"
     }
@@ -2111,31 +2117,43 @@ impl lloom_tensor::CustomOp3 for Sdpa {
             // A pool is one row read by every sequence through its table: the
             // key extent handed to the kernel is the LIVE length and the batch
             // stride is 0 — a sequence is never reached through a stride.
-            let (k_shape, k_stride, v_stride): (Vec<usize>, Vec<usize>, Vec<usize>) =
-                match &self.paged {
-                    Some(p) => {
-                        let mut ks = k_l.dims().to_vec();
-                        ks[2] = p.max_keys();
-                        let mut kst = k_l.stride().to_vec();
-                        kst[0] = 0;
-                        let mut vst = v_l.stride().to_vec();
-                        vst[0] = 0;
-                        (ks, kst, vst)
-                    }
-                    None => (
-                        k_l.dims().to_vec(),
-                        k_l.stride().to_vec(),
-                        v_l.stride().to_vec(),
-                    ),
-                };
+            // Four dims (checked above); arrays, not `Vec`s — this runs
+            // per draft per layer.
+            let mut k_shape: [usize; 4] = k_l.dims().try_into().map_err(|_| {
+                lloom_tensor::Error::Msg(format!("sdpa: k must be 4-D, got {:?}", k_l.dims()))
+            })?;
+            let mut k_stride: [usize; 4] = k_l.stride().try_into().map_err(|_| {
+                lloom_tensor::Error::Msg(format!("sdpa: k must be 4-D, got {:?}", k_l.dims()))
+            })?;
+            let mut v_stride: [usize; 4] = v_l.stride().try_into().map_err(|_| {
+                lloom_tensor::Error::Msg(format!("sdpa: v must be 4-D, got {:?}", v_l.dims()))
+            })?;
+            if let Some(p) = &self.paged {
+                k_shape[2] = p.max_keys();
+                k_stride[0] = 0;
+                v_stride[0] = 0;
+            }
             // The table and the live counts: one count every row reads
-            // (stride 0), or one per row (stride 1).
+            // (stride 0), or one per row (stride 1). The table is bound by
+            // value — the same buffer until the pages change (§6.3j); the
+            // counts change every step and go through the pool (a per-step
+            // value keyed in the cache would evict the stable entries).
             let table = match &self.paged {
                 Some(p) => {
-                    let keys: Vec<i32> = p.n_keys.iter().map(|&n| n as i32).collect();
+                    let mut small = [0i32; 64];
+                    let mut large: Vec<i32> = Vec::new();
+                    let keys: &[i32] = if p.n_keys.len() <= small.len() {
+                        for (d, &n) in small.iter_mut().zip(p.n_keys) {
+                            *d = n as i32;
+                        }
+                        &small[..p.n_keys.len()]
+                    } else {
+                        large.extend(p.n_keys.iter().map(|&n| n as i32));
+                        &large
+                    };
                     Some((
-                        device.new_buffer_with_data(&p.entries)?,
-                        device.new_buffer_with_data(&keys)?,
+                        device.constant_buffer(slice_bytes(p.entries))?,
+                        device.new_buffer_with_data(keys)?,
                     ))
                 }
                 None => None,
@@ -2267,7 +2285,7 @@ pub fn sdpa_paged(
     do_causal: bool,
     scale: f32,
     page_size: usize,
-    table: Vec<u32>,
+    table: &[u32],
     table_stride: usize,
     n_keys: usize,
 ) -> Result<Tensor> {
@@ -2280,8 +2298,33 @@ pub fn sdpa_paged(
         page_size,
         table,
         table_stride,
-        vec![n_keys as u32],
+        &[n_keys as u32],
     )
+}
+
+/// The FlashDecoding partial pass's threadgroup width in simdgroups
+/// (`FLASH_PARTIAL_WIDTHS`): 32 as shipped, or 8 — `sdpa_vector_2pass_1`'s
+/// geometry, 32 keys per simdgroup over a 256-key chunk — through
+/// `LLOOM_FLASH_PARTIAL_BN=8`. An A/B knob (issue #148's B=1 defaults pass:
+/// the paged arm loses to `sdpa_vector_2pass` past ~4k keys and the two
+/// kernels differ only in this geometry), read once; not a config field
+/// until an arm earns it.
+#[cfg(feature = "metal")]
+fn flash_partial_width() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        match std::env::var("LLOOM_FLASH_PARTIAL_BN").ok().as_deref() {
+            Some("8") => 8,
+            Some("32") | None => 32,
+            Some(other) => {
+                eprintln!(
+                    "LLOOM_FLASH_PARTIAL_BN={other:?}: expected 8 or 32, using 32 (the kernel as \
+                     shipped)"
+                );
+                32
+            }
+        }
+    })
 }
 
 /// [`sdpa_paged`] over a RAGGED batch: row `b` of `q` (`[b, n_q_heads,
@@ -2302,9 +2345,9 @@ pub fn sdpa_paged_ragged(
     do_causal: bool,
     scale: f32,
     page_size: usize,
-    table: Vec<u32>,
+    table: &[u32],
     table_stride: usize,
-    n_keys: Vec<u32>,
+    n_keys: &[u32],
 ) -> Result<Tensor> {
     q.apply_op3_no_bwd(
         k,
@@ -3497,6 +3540,7 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
             head_dim,
             n_chunks,
             itype,
+            flash_partial_width(),
         )
         .map_err(lloom_tensor::Error::wrap)?;
 
@@ -3630,9 +3674,9 @@ pub fn flash_decoding_paged_ragged_bound(
     pages_per_chunk: usize,
     scratch_sizing: FlashScratchSizing,
     reserve_chunks: usize,
-    table: Vec<u32>,
+    table: &[u32],
     table_stride: usize,
-    n_keys: Vec<u32>,
+    n_keys: &[u32],
     tables_t: &Tensor,
     n_keys_t: &Tensor,
 ) -> Result<Tensor> {
@@ -3656,9 +3700,9 @@ pub fn flash_decoding_paged_ragged_bound(
             scale,
             softcapping,
             paged: Some(PagedTable {
-                entries: &table,
+                entries: table,
                 stride: table_stride,
-                n_keys: PagedKeys::Rows(&n_keys),
+                n_keys: PagedKeys::Rows(n_keys),
                 bound: Some((tables_t, n_keys_t)),
                 table_t: None,
             }),

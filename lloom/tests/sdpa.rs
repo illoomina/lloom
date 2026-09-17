@@ -914,7 +914,7 @@ mod metal_sdpa_tests {
                     causal,
                     scale as f32,
                     f.page_size,
-                    f.table.clone(),
+                    &f.table,
                     f.table.len(),
                     kv_len,
                 )?;
@@ -987,7 +987,7 @@ mod metal_sdpa_tests {
                     causal,
                     scale as f32,
                     f.page_size,
-                    f.table.clone(),
+                    &f.table,
                     f.table.len(),
                     kv_len,
                 )?;
@@ -1083,7 +1083,7 @@ mod metal_sdpa_tests {
                 causal,
                 scale as f32,
                 P,
-                table.clone(),
+                &table,
                 n_pages,
                 KV_LEN,
             )?;
@@ -1211,9 +1211,9 @@ mod metal_sdpa_tests {
                 causal,
                 scale as f32,
                 P,
-                ragged_table.clone(),
+                &ragged_table,
                 stride,
-                n_keys.clone(),
+                &n_keys,
             )?;
             let mut row_bits = Vec::new();
             for (b, (k, v)) in lives.iter().enumerate() {
@@ -1225,7 +1225,7 @@ mod metal_sdpa_tests {
                     causal,
                     scale as f32,
                     P,
-                    tables[b].clone(),
+                    &tables[b],
                     tables[b].len(),
                     kv_lens[b],
                 )?;
@@ -1291,7 +1291,7 @@ mod metal_sdpa_tests {
                 false,
                 scale as f32,
                 32,
-                f.table.clone(),
+                &f.table,
                 f.table.len(),
                 137,
             )
@@ -1330,7 +1330,7 @@ mod metal_sdpa_tests {
             false,
             scale as f32,
             32,
-            f.table.clone(),
+            &f.table,
             2,
             41,
         );
@@ -1342,7 +1342,7 @@ mod metal_sdpa_tests {
             false,
             scale as f32,
             32,
-            f.table.clone(),
+            &f.table,
             2,
             41,
         );
@@ -1354,7 +1354,7 @@ mod metal_sdpa_tests {
             false,
             scale as f32,
             48,
-            f.table.clone(),
+            &f.table,
             2,
             41,
         );
@@ -1363,10 +1363,10 @@ mod metal_sdpa_tests {
             "page_size 48 is not a multiple of the key block"
         );
         let past =
-            lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, vec![0, 99], 2, 41);
+            lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, &[0, 99], 2, 41);
         assert!(past.is_err(), "a page past the pool must be refused");
         let short =
-            lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, vec![0], 1, 41);
+            lloom::nn::ops::sdpa_paged(&q9, &k, &v, false, scale as f32, 32, &[0], 1, 41);
         assert!(
             short.is_err(),
             "a table shorter than the live pages must be refused"

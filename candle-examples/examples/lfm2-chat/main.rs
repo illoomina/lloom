@@ -1197,11 +1197,23 @@ fn main() -> Result<()> {
     // candle_examples::device). F16 on GPU matches the inference path; CPU has
     // no f16 kernels for everything here, so it runs in f32.
     let device = candle_examples::device(args.cpu)?;
-    if let Some(mb) = args.free_budget_mb {
+    // The speculative arm's default is 1024 MiB, sized from measurement (#148,
+    // the B=1 defaults pass): a round is two models' worth of activations plus
+    // the verify's logits (5 + 2.5 MB), released only when their command
+    // buffers complete — a few rounds later under the nonblocking readback —
+    // and at the 256 MiB ceiling that working set is evicted as it frees:
+    // 4126 allocations, 3937 evictions and 421 residency commits over 400
+    // tokens (~10 allocations and one commit per round); at 1024 MiB, 4 / 0 /
+    // 2. The plain decode arm stays at 256 (its steady state is far below it).
+    let free_budget_mb = args.free_budget_mb.or(args.dspark.then_some(1024));
+    if let Some(mb) = free_budget_mb {
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = &device {
             m.set_free_budget(mb * 1024 * 1024);
-            eprintln!("[pool: free budget set to {mb} MiB]");
+            eprintln!(
+                "[pool: free budget set to {mb} MiB{}]",
+                if args.free_budget_mb.is_none() { " (the dspark default)" } else { "" }
+            );
         }
     }
     let dtype = if device.is_cpu() {
@@ -1997,9 +2009,21 @@ fn main() -> Result<()> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     if args.adaptive_commit {
         if ring_reader.is_none() {
-            anyhow::bail!("--adaptive-commit needs --stream-reader on a mapped ring arm");
+            if args.dspark {
+                // The speculative body owns no ring, like the flags noticed
+                // above: accepted and rendered n/a, not refused — one command
+                // line serves both arms (#148, the B=1 defaults pass: the
+                // matrix's dspark cells refused this and measured nothing).
+                eprintln!(
+                    "[dspark: --adaptive-commit is not read by the speculative body; the RESULT \
+                     line renders it n/a(dspark)]"
+                );
+            } else {
+                anyhow::bail!("--adaptive-commit needs --stream-reader on a mapped ring arm");
+            }
+        } else {
+            opts.stop = Some(Arc::clone(&stop_flag));
         }
-        opts.stop = Some(Arc::clone(&stop_flag));
     }
     if args.stream_reader && ring_reader.is_none() {
         eprintln!(
@@ -2750,6 +2774,35 @@ fn main() -> Result<()> {
                 after.to_cpu_null - before.to_cpu_null,
                 after.to_cpu_staged - before.to_cpu_staged,
             );
+            // What fills the free budget (`DEFAULT_FREE_BUDGET_BYTES`): an
+            // allocation count that grows with `n` beside evictions is the
+            // budget evicting what the step needs to make room for what sits
+            // free and unasked-for; this names the sizes that sit.
+            let (shared, private) = m.pool_free_summary(6);
+            let fmt = |s: &candle::metal_backend::FreeSummary| {
+                let top: Vec<String> = s
+                    .top
+                    .iter()
+                    .map(|(size, n)| format!("{:.1}MB×{n}", *size as f64 / 1048576.0))
+                    .collect();
+                format!(
+                    "{:.0}/{:.0} MB in {} buffers, top {}",
+                    s.bytes as f64 / 1048576.0,
+                    s.budget as f64 / 1048576.0,
+                    s.buffers,
+                    top.join(" ")
+                )
+            };
+            let clock = m.gpu_clock();
+            let (c_hits, c_misses) = m.constants_counters();
+            eprintln!(
+                "[pool free at end: shared {} | private {}; clock epochs submitted={} \
+                 completed={}; constants cache hits={c_hits} misses={c_misses}]",
+                fmt(&shared),
+                fmt(&private),
+                clock.current_epoch(),
+                clock.completed_count()
+            );
         }
         eprintln!(
             "[kv: len={} slab={} ceiling={} bucket={} grows={} kv_bytes={:.1} MiB{device_line}]",
@@ -2795,7 +2848,7 @@ fn main() -> Result<()> {
         concurrent::read_or_na(!args.dspark, args.prefill_tile),
         st.prefill_units,
         prompt_ids.len(),
-        args.free_budget_mb
+        free_budget_mb
             .map(|mb| mb.to_string())
             .unwrap_or_else(|| "default".to_string()),
         concurrent::read_or_na(!args.dspark, budget.arm()),

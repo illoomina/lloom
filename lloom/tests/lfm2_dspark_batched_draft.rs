@@ -524,6 +524,59 @@ fn update_context_rows_keys_what_each_rows_own_update_context_keys_bit_for_bit()
 /// bits are a reordering (bounded), the drafted block over the re-keyed
 /// context is the same, and the rows with two or more positions stay bit
 /// for bit.
+/// A draft whose dispatch is still queued must read the block slots it was
+/// encoded against, whatever the host does next: the next append rewrites
+/// the block table, and the pool may only do that IN PLACE once the clock
+/// says the draft's epoch completed (`LayerPool::block_epoch`) — else it
+/// takes a fresh tensor and the queued draft keeps the old one. Arm A syncs
+/// between the draft and the append (the round's verify readback, in
+/// production); arm B does not. Their drafts must be bit-identical.
+#[test]
+fn a_queued_draft_is_not_disturbed_by_the_next_append() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    for shared in [true, false] {
+        let drafter = tiny_drafter(DType::F32, &dev, 151)?;
+        let cfg = drafter.config().clone();
+        let n_tap = cfg.target_layer_ids.len();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(151_001);
+        let ctx_kv = ctx_kv_for(shared);
+        let mut a = drafter.make_ctx_caches_for(ctx_kv, 1, &dev)?;
+        let mut b = drafter.make_ctx_caches_for(ctx_kv, 1, &dev)?;
+        let ctx = 40usize;
+        let taps: Vec<Tensor> = (0..n_tap)
+            .map(|_| randn(&mut rng, vec![1, ctx, cfg.hidden_size], &dev))
+            .collect::<Result<_>>()?;
+        drafter.update_context(&taps, 0, &mut a[0])?;
+        drafter.update_context(&taps, 0, &mut b[0])?;
+        dev.synchronize()?;
+        let block = randn(&mut rng, vec![1, cfg.block_size, cfg.hidden_size], &dev)?;
+        let round: Vec<Tensor> = (0..n_tap)
+            .map(|_| randn(&mut rng, vec![1, 3, cfg.hidden_size], &dev))
+            .collect::<Result<_>>()?;
+        // Arm A: fenced between the draft and the append.
+        let ha = drafter.block_hidden(&block, ctx, &a[0])?;
+        dev.synchronize()?;
+        drafter.update_context(&round, ctx, &mut a[0])?;
+        // Arm B: the append lands while the draft may still be queued.
+        let hb = drafter.block_hidden(&block, ctx, &b[0])?;
+        drafter.update_context(&round, ctx, &mut b[0])?;
+        let (x, y) = (bits(&ha)?, bits(&hb)?);
+        let distinct = x.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(distinct > 8, "shared={shared}: vacuous ({distinct} distinct)");
+        assert!(
+            x == y,
+            "shared={shared}: the draft encoded before the append differs from the fenced one"
+        );
+        // And the rounds after: both arms' next drafts equal too.
+        let block2 = randn(&mut rng, vec![1, cfg.block_size, cfg.hidden_size], &dev)?;
+        let ha2 = drafter.block_hidden(&block2, ctx + 3, &a[0])?;
+        let hb2 = drafter.block_hidden(&block2, ctx + 3, &b[0])?;
+        assert!(bits(&ha2)? == bits(&hb2)?, "shared={shared}: the next draft differs");
+        println!("shared={shared}: a queued draft is undisturbed by the next append (bit-identical to the fenced arm)");
+    }
+    Ok(())
+}
+
 #[test]
 fn a_one_position_row_moves_only_by_the_gemv_seam() -> Result<()> {
     let dev = Device::new_metal(0)?;

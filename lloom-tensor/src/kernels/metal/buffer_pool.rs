@@ -113,6 +113,45 @@ use std::sync::{Arc, Weak};
 /// **This is the write/write case and it is the one that pays.** A read-mostly
 /// flag measures 0.96x -- a wash -- and is deliberately not padded anywhere;
 /// [`super::cache_pad`] carries that measurement and the unit the rule needs.
+/// `LLOOM_POOL_TRACE=1`: every fresh allocation the pool adopts, with the
+/// `lloom` frames that asked for it, on stderr — the diagnostic for a
+/// `[churn]` line whose allocations grow with the token count (a per-token
+/// miss is a per-token `newBufferWithLength`, and the counters say how many
+/// but not who). Read once; off, this is one relaxed load per allocation.
+fn trace_on() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(0);
+    let on = match ON.load(Ordering::Relaxed) {
+        0 => {
+            let v = if std::env::var_os("LLOOM_POOL_TRACE").is_some_and(|v| v == "1") {
+                2
+            } else {
+                1
+            };
+            ON.store(v, Ordering::Relaxed);
+            v
+        }
+        v => v,
+    };
+    on == 2
+}
+
+/// The trace line for one fresh allocation: the size, the pool's state for
+/// that size at the miss (`why`: free and pending buffers of the same size,
+/// the pending queue's head epoch against the clock — a miss with the size
+/// PENDING and its epoch incomplete is the deferred-release window, not a
+/// leak), and the `lloom` frames that asked.
+fn trace_allocation(size: usize, why: &str) {
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    let frames: Vec<&str> = bt
+        .lines()
+        .filter(|l| l.contains("lloom") && !l.contains("trace_allocation") && !l.contains(".rs:"))
+        .map(|l| l.trim().trim_start_matches(|c: char| c.is_ascii_digit() || c == ':').trim())
+        .take(6)
+        .collect();
+    eprintln!("[pool alloc {size} B; {why}] {}", frames.join(" <- "));
+}
+
 #[derive(Debug)]
 pub struct GpuClock {
     /// Host thread, per committed command buffer.
@@ -343,6 +382,16 @@ impl Drop for PooledBuffer {
 /// accumulator cannot express the defect. That is `DESIGN.md` §6.7 **L2** --
 /// state duplicated and then not kept -- and a duplicate that can disagree is
 /// worse than one that cannot.
+/// A free list's contents at one instant (`BufferPool::free_summary`).
+#[derive(Debug, Default, Clone)]
+pub struct FreeSummary {
+    pub bytes: usize,
+    pub buffers: usize,
+    pub budget: usize,
+    /// The largest size classes by bytes held: `(size, count)`.
+    pub top: Vec<(usize, usize)>,
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PoolCounters {
     /// Calls into `acquire`.
@@ -1754,11 +1803,28 @@ impl BufferPool {
             buffer.length(),
             buffer.base_offset(),
         );
-        { let mut state = self.inner.state.lock();
+        let why = { let mut state = self.inner.state.lock();
             state.counters.allocations += 1;
             state.counters.allocated_bytes += size as u64;
             state.live_buffers += 1;
             state.live_bytes += size;
+            if trace_on() {
+                let pending_same = state.pending.iter().filter(|p| p.size == size).count();
+                let free_same = state.free.get(&size).map_or(0, |b| b.len());
+                let head = state.pending.front().map(|p| p.epoch);
+                Some(format!(
+                    "free_same={free_same} pending_same={pending_same} pending={} head_epoch={head:?} \
+                     completed={} current={}",
+                    state.pending.len(),
+                    self.inner.clock.completed_count(),
+                    self.inner.clock.current_epoch()
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some(why) = why {
+            trace_allocation(size, &why);
         }
         Arc::new(PooledBuffer {
             buffer: Some(buffer),
@@ -1856,6 +1922,28 @@ impl BufferPool {
 
     pub fn counters(&self) -> PoolCounters {
         self.inner.state.lock().counters
+    }
+
+    /// What the free list holds right now: total bytes and buffers, and the
+    /// `top` size classes by bytes as `(size, count)`. Diagnostic, one lock:
+    /// a `[churn]` line whose allocations grow with the token count says
+    /// something is being evicted and re-allocated; this says what is
+    /// FILLING the budget (`DEFAULT_FREE_BUDGET_BYTES`) so those evictions
+    /// happen — the sizes that sit free and are never asked for again.
+    pub fn free_summary(&self, top: usize) -> FreeSummary {
+        let state = self.inner.state.lock();
+        let mut classes: Vec<(usize, usize)> = state
+            .free
+            .iter()
+            .map(|(&size, bucket)| (size, bucket.len()))
+            .collect();
+        classes.sort_by(|a, b| (b.0 * b.1).cmp(&(a.0 * a.1)));
+        FreeSummary {
+            bytes: state.free_bytes,
+            buffers: classes.iter().map(|c| c.1).sum(),
+            budget: state.free_budget,
+            top: classes.into_iter().take(top).collect(),
+        }
     }
 
     /// Zeroes the event counters, so a caller can measure decode rather than

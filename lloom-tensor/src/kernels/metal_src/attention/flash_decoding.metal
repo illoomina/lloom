@@ -317,10 +317,13 @@ inline void flash_decoding_core(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
-  max_score = max_scores[simd_lid];
+  // Lanes past `BN` (a narrow threadgroup, `BN = 8`) carry the merge's
+  // identity; at `BN = 32` the selects are identities and the arithmetic is
+  // the same instructions as before them.
+  max_score = (simd_lid < BN) ? max_scores[simd_lid] : -INFINITY;
   U new_max = simd_max(max_score);
   U factor = fast::exp(max_score - new_max);
-  sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+  sum_exp_score = simd_sum(((simd_lid < BN) ? sum_exp_scores[simd_lid] : 0.0f) * factor);
 
   // An EMPTY range contributes nothing and must not poison the merge. It arises
   // when `n_keys` does not fill the range's first key -- reachable whenever
@@ -337,7 +340,16 @@ inline void flash_decoding_core(
 /// `T` is the storage type and accumulation is in `float` regardless: §8.1
 /// principle 4, and §9.1a records that this class cannot be shrunk to f16
 /// because the combine merges what the accumulation bought.
-template <typename T, int D>
+/// `BN` is the threadgroup's WIDTH in simdgroups — how many keys of a chunk
+/// are walked at once, and so how many keys each simdgroup walks in
+/// sequence: at the 256-key chunk, `BN = 32` (1024 threads) walks 8 keys per
+/// simdgroup and reduces 32 partial states; `BN = 8` (256 threads, the
+/// geometry of `sdpa_vector_2pass_1`, which walks 32 keys per simdgroup at
+/// 8k) walks 32 and reduces 8. The two are separate instantiations
+/// (`flash_decoding_partial` / `flash_decoding_partial8`) selected by the
+/// host; their key order per simdgroup and their reduction trees differ, so
+/// they are each bit-stable and NOT bit-identical to each other.
+template <typename T, int D, int BN>
 [[kernel]] void flash_decoding_partial(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
@@ -350,17 +362,16 @@ template <typename T, int D>
     // The chunk table: `chunk_table[c]` is the FIRST PAGE of chunk `c`.
     // At B=1 contiguous it is the identity, and it is bound anyway -- see the
     // header note on why a B=1 gate cannot otherwise discriminate.
-    const device uint* chunk_table [[buffer(6)]],
-    const device FlashPartialParams* params [[buffer(7)]],
+    const constant uint* chunk_table [[buffer(6)]],
+    const constant FlashPartialParams* params [[buffer(7)]],
     // The live key count per sequence: `n_keys_per_seq[seq * n_keys_stride]`.
     // A ragged batch (§12.2) gives every row its own; a chunk past a row's
     // count is an EMPTY range and writes the merge's identity below, so the
     // dispatch depth is the longest row's and the combine needs no change.
-    const device int* n_keys_per_seq [[buffer(8)]],
+    const constant int* n_keys_per_seq [[buffer(8)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
-  constexpr int BN = 32;
   constexpr int BD = 32;
   constexpr int elem_per_thread = D / BD;
 
@@ -370,9 +381,12 @@ template <typename T, int D>
   threadgroup U max_scores[BN];
   threadgroup U sum_exp_scores[BN];
 
-  // One structure load into registers (§11.3e). Not `params->field` per use:
-  // `device` is general memory where `constant` is a cached read-only space,
-  // and these are read inside the key loop.
+  // One structure load into registers (§11.3e), from the `constant` address
+  // space: the block, the chunk table and the live counts are read-only for
+  // the dispatch and bound as buffers all the same (the host side is
+  // unchanged) — `constant` is the cached read-only space, `device` general
+  // memory, and at 8k keys a layer runs 768 threadgroups that each read them
+  // once (#148: the same bits, one less general-memory load per threadgroup).
   const FlashPartialParams p = *params;
   const int pages_per_chunk = p.pages_per_chunk;
   const int page_size = p.page_size;
@@ -442,13 +456,36 @@ template <typename T, int D>
   // rescaling to a global max -- both are the combine's job, because only it
   // sees every chunk. Storing a normalised partial would make the merge
   // non-associative and is the shape that forces a completion-order merge.
-  for (int i = 0; i < elem_per_thread; i++) {
-    outputs[simd_lid * BD + simd_gid] = o[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    U v = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (simd_lid == 0) {
-      acc_out[simd_gid * elem_per_thread + i] = empty ? 0.0f : v;
+  if constexpr (BN == BD) {
+    // Square: transpose through threadgroup memory so simdgroup `g` sums
+    // lane `g`'s element across the BN simdgroups in one `simd_sum`.
+    for (int i = 0; i < elem_per_thread; i++) {
+      outputs[simd_lid * BD + simd_gid] = o[i];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      U v = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_lid == 0) {
+        acc_out[simd_gid * elem_per_thread + i] = empty ? 0.0f : v;
+      }
+    }
+  } else {
+    // Narrow: every simdgroup rescales its own accumulator to the
+    // threadgroup max (its factor is lane `simd_gid`'s above, recomputed
+    // from the same inputs) and simdgroup 0 sums the BN entries of each
+    // lane in index order — `sdpa_vector_2pass_1`'s tail, the same
+    // element layout as the square arm's.
+    for (int i = 0; i < elem_per_thread; i++) {
+      outputs[simd_lid * BN + simd_gid] =
+          o[i] * fast::exp(max_scores[simd_gid] - new_max);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_gid == 0) {
+        U v = outputs[simd_lid * BN];
+        for (int j = 1; j < BN; j++) {
+          v += outputs[simd_lid * BN + j];
+        }
+        acc_out[simd_lid * elem_per_thread + i] = empty ? 0.0f : v;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   }
 }
@@ -489,13 +526,13 @@ template <typename T, int D>
     const device T* keys [[buffer(1)]],
     const device T* values [[buffer(2)]],
     device T* out [[buffer(3)]],
-    const device FlashPartialParams* params [[buffer(4)]],
+    const constant FlashPartialParams* params [[buffer(4)]],
     // Read even though there is one chunk: its first page is wherever the
     // sequence's table says, which is page 0 only on a fresh pool. A
     // single-chunk path that assumed `[0, n_keys)` was correct for every
     // contiguous cache and silently wrong for a recycled one (§10.3h).
-    const device uint* chunk_table [[buffer(5)]],
-    const device int* n_keys_per_seq [[buffer(6)]],
+    const constant uint* chunk_table [[buffer(5)]],
+    const constant int* n_keys_per_seq [[buffer(6)]],
     uint3 tid [[threadgroup_position_in_grid]],
     uint simd_gid [[simdgroup_index_in_threadgroup]],
     uint simd_lid [[thread_index_in_simdgroup]]) {
@@ -579,7 +616,7 @@ template <typename T, int D>
     const device float* sums [[buffer(1)]],
     const device float* maxs [[buffer(2)]],
     device T* out [[buffer(3)]],
-    const device FlashCombineParams* params [[buffer(4)]],
+    const constant FlashCombineParams* params [[buffer(4)]],
     // The chunk indices this kernel actually walked, in the order it walked
     // them. **The merge order is asserted against this and not against the
     // output**, because §10.4 records that reversing the loop *"is caught by
@@ -811,28 +848,32 @@ static_assert(alignof(FlashScatterParams) == 8, "FlashScatterParams alignment");
 // resolves every name below against the compiled library.
 
 // clang-format off
-#define instantiate_flash_decoding(type, head_dim)                            \
-  template [[host_name("flash_decoding_partial_" #type "_" #head_dim)]]       \
-  [[kernel]] void flash_decoding_partial<type, head_dim>(                     \
+#define instantiate_flash_decoding_partial(type, head_dim, bn, name)         \
+  template [[host_name(name "_" #type "_" #head_dim)]]                        \
+  [[kernel]] void flash_decoding_partial<type, head_dim, bn>(                 \
       const device type* queries [[buffer(0)]],                               \
       const device type* keys [[buffer(1)]],                                  \
       const device type* values [[buffer(2)]],                                \
       device float* partials [[buffer(3)]],                                   \
       device float* sums [[buffer(4)]],                                       \
       device float* maxs [[buffer(5)]],                                       \
-      const device uint* chunk_table [[buffer(6)]],                           \
-      const device FlashPartialParams* params [[buffer(7)]],                  \
-      const device int* n_keys_per_seq [[buffer(8)]],                         \
+      const constant uint* chunk_table [[buffer(6)]],                           \
+      const constant FlashPartialParams* params [[buffer(7)]],                  \
+      const constant int* n_keys_per_seq [[buffer(8)]],                         \
       uint3 tid [[threadgroup_position_in_grid]],                             \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
-      uint simd_lid [[thread_index_in_simdgroup]]);                           \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_flash_decoding(type, head_dim)                            \
+  instantiate_flash_decoding_partial(type, head_dim, 32, "flash_decoding_partial") \
+  instantiate_flash_decoding_partial(type, head_dim, 8, "flash_decoding_partial8") \
   template [[host_name("flash_decoding_combine_" #type "_" #head_dim)]]       \
   [[kernel]] void flash_decoding_combine<type, head_dim>(                     \
       const device float* partials [[buffer(0)]],                             \
       const device float* sums [[buffer(1)]],                                 \
       const device float* maxs [[buffer(2)]],                                 \
       device type* out [[buffer(3)]],                                         \
-      const device FlashCombineParams* params [[buffer(4)]],                  \
+      const constant FlashCombineParams* params [[buffer(4)]],                  \
       device uint* walk_order [[buffer(5)]],                                  \
       uint3 tid [[threadgroup_position_in_grid]],                             \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
@@ -843,9 +884,9 @@ static_assert(alignof(FlashScatterParams) == 8, "FlashScatterParams alignment");
       const device type* keys [[buffer(1)]],                                  \
       const device type* values [[buffer(2)]],                                \
       device type* out [[buffer(3)]],                                         \
-      const device FlashPartialParams* params [[buffer(4)]],                  \
-      const device uint* chunk_table [[buffer(5)]],                           \
-      const device int* n_keys_per_seq [[buffer(6)]],                         \
+      const constant FlashPartialParams* params [[buffer(4)]],                  \
+      const constant uint* chunk_table [[buffer(5)]],                           \
+      const constant int* n_keys_per_seq [[buffer(6)]],                         \
       uint3 tid [[threadgroup_position_in_grid]],                             \
       uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
       uint simd_lid [[thread_index_in_simdgroup]]);

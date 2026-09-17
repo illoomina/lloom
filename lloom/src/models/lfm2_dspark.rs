@@ -3382,6 +3382,7 @@ impl Speculator for DSparkSpeculator {
         self.max_draft
     }
 
+
     fn want_confidence(&mut self, wanted: bool) {
         self.confidence_wanted = wanted;
     }
@@ -3486,5 +3487,18 @@ impl Speculator for DSparkSpeculator {
         }
         self.batched_observes += 1;
         Ok(())
+    }
+}
+
+impl DSparkSpeculator {
+    /// Draft `k` positions per round instead of the drafter's block width:
+    /// the block is still predicted whole and its first `k` proposed, so the
+    /// verify window is `k + 1` positions. Clamped to `1..=block`. A lever
+    /// for wide batches, where a `B × (K + 1)` verify against ~2.4 accepted
+    /// of 9 on natural text costs more than it returns (lloom #148, record
+    /// §8.3): fewer positions per row for the same accepted prefix.
+    pub fn set_max_draft(&mut self, k: usize) {
+        let block = self.drafter.config().max_draft();
+        self.max_draft = k.clamp(1, block);
     }
 }

@@ -240,6 +240,12 @@ impl Drop for DeviceTeardown {
 
 #[derive(Clone)]
 pub struct MetalDevice {
+    /// Argument blocks and small tables keyed by their bytes, so a value a
+    /// kernel is handed every step — a params block, a chunk table, a live
+    /// count — is uploaded once and bound by the same buffer until it
+    /// changes. Declared first so it drops first: its buffers return to the
+    /// pool before the teardown below waits the GPU out.
+    pub(crate) constants: Arc<ConstantsByValue>,
     /// Empties the residency set, after waiting for the GPU, when the last
     /// handle to this device drops. Declared **first** so it runs before the
     /// pools free the buffers the set lists (`DESIGN.md` §6.3c).
@@ -497,6 +503,77 @@ impl std::ops::Deref for MetalDevice {
     fn deref(&self) -> &Self::Target {
         &self.device
     }
+}
+
+/// Uploads at most this long are served from the buffer pool rather than
+/// allocated (`MetalDevice::new_buffer_with_data`): every per-step argument
+/// block, chunk table and slot list is well under it; a prompt of thousands of
+/// ids or a weight staging buffer is not.
+pub const SMALL_UPLOAD_BYTES: usize = 16 * 1024;
+
+/// Device buffers keyed by their contents (`MetalDevice::constant_buffer`).
+///
+/// A kernel's argument block is a value: the same bytes every step until a
+/// shape changes. Uploading it per call — even as a pool hit — is a lookup, a
+/// copy and a fresh buffer identity per dispatch; keyed by value, a repeated
+/// block is the SAME buffer, which is also what an ICB command needs to bind
+/// (§11.3l: a params buffer allocated per call makes ICB coverage zero).
+/// The buffers are read-only for the GPU, so one may be bound by any number
+/// of in-flight dispatches. Bounded FIFO: an evicted entry's buffer goes back
+/// to the pool on the pool's own clock (§6.3b), so an in-flight reader is
+/// never disturbed. Keys are small (the cap on an entry's bytes is
+/// `CONSTANT_MAX_BYTES`); the miss path is one pooled upload.
+pub struct ConstantsByValue {
+    inner: Mutex<ConstantsInner>,
+}
+
+#[derive(Default)]
+struct ConstantsInner {
+    map: HashMap<Vec<u8>, Arc<PooledBuffer>>,
+    order: std::collections::VecDeque<Vec<u8>>,
+    hits: u64,
+    misses: u64,
+}
+
+/// Entries held at most; past it the oldest is evicted.
+const CONSTANT_ENTRIES: usize = 512;
+/// The largest value the cache keys — a chunk table of 131072 / 256 = 512
+/// entries is 2 KiB; a params block is under 128 B.
+const CONSTANT_MAX_BYTES: usize = 4096;
+
+impl ConstantsByValue {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(ConstantsInner::default()),
+        }
+    }
+
+    /// `(hits, misses)` since creation.
+    pub fn counters(&self) -> (u64, u64) {
+        let g = self.inner.lock();
+        (g.hits, g.misses)
+    }
+}
+
+impl Default for ConstantsByValue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The bytes of a `#[repr(C)]` plain-data value, for [`MetalDevice::constant_of`].
+fn pod_bytes<T: Copy>(v: &T) -> &[u8] {
+    // SAFETY: `T: Copy` and the callers are `#[repr(C)]` parameter blocks
+    // that are already uploaded byte for byte by `new_buffer_with_data`; a
+    // padding byte that differs between two equal values costs a cache miss,
+    // never a wrong binding.
+    unsafe { std::slice::from_raw_parts((v as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
+}
+
+/// The bytes of a slice of plain data, for [`MetalDevice::constant_buffer`].
+pub fn slice_bytes<T: Copy>(s: &[T]) -> &[u8] {
+    // SAFETY: as `pod_bytes`; `u32`/`i32` slices have no padding.
+    unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), std::mem::size_of_val(s)) }
 }
 
 impl MetalDevice {
@@ -2078,8 +2155,62 @@ impl MetalDevice {
     ///
     /// Does not require synchronization, as [newBufferWithBytes](https://developer.apple.com/documentation/metal/mtldevice/1433429-newbufferwithbytes)
     /// allocates the buffer and copies over the existing data before returning the MTLBuffer.
+    /// The device buffer holding exactly `bytes`, shared with every other
+    /// caller that asked for the same bytes ([`ConstantsByValue`]). For a
+    /// kernel's argument block, chunk table or live count: a repeated value
+    /// costs a hash and a lock, a new one a pooled upload. Larger than
+    /// `CONSTANT_MAX_BYTES` falls back to an upload.
+    pub fn constant_buffer(&self, bytes: &[u8]) -> Result<Arc<PooledBuffer>> {
+        if bytes.len() > CONSTANT_MAX_BYTES {
+            return self.new_buffer_with_data(bytes);
+        }
+        {
+            let mut g = self.constants.inner.lock();
+            if let Some(b) = g.map.get(bytes) {
+                let b = Arc::clone(b);
+                g.hits += 1;
+                return Ok(b);
+            }
+        }
+        let buf = self.new_buffer_with_data(bytes)?;
+        let mut g = self.constants.inner.lock();
+        g.misses += 1;
+        if g.map.len() >= CONSTANT_ENTRIES {
+            if let Some(old) = g.order.pop_front() {
+                g.map.remove(&old);
+            }
+        }
+        g.map.insert(bytes.to_vec(), Arc::clone(&buf));
+        g.order.push_back(bytes.to_vec());
+        Ok(buf)
+    }
+
+    /// [`Self::constant_buffer`] for one plain-data value (a params block).
+    pub fn constant_of<T: Copy>(&self, v: &T) -> Result<Arc<PooledBuffer>> {
+        self.constant_buffer(pod_bytes(v))
+    }
+
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<PooledBuffer>> {
         let size = core::mem::size_of_val(data);
+        // A small upload is served from the buffer pool and filled on the host:
+        // an acquired buffer has no GPU reader (reuse waits for completion,
+        // §6.3b), so a host write into it is what `newBufferWithBytes` did
+        // without the driver allocation, the residency `addAllocation` +
+        // `commit` per call and the deferred remove — three Metal calls per
+        // upload. The paged FlashDecoding arm made ~50 of these per decode
+        // step (its params blocks, chunk table, live count and slot list)
+        // where the crown's `setBytes` params make none; the pool's hit is a
+        // lock and a hash (§3.3a). The large uploads below (weight staging,
+        // whole prompts) keep the unpooled path for the reason it records.
+        if size > 0 && size <= SMALL_UPLOAD_BYTES {
+            let buffer = self.allocate_buffer(size)?;
+            // SAFETY: the pool handed out a buffer at least `size` bytes long
+            // whose last GPU reader has completed, and `data` is `size` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), buffer.contents(), size);
+            }
+            return Ok(buffer);
+        }
         let new_buffer = self
             .device
             .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)

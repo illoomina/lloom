@@ -21,7 +21,7 @@ use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
 pub use device::{DeviceId, MetalDevice};
-use device::{DeviceTeardown, ResidencyEvictionObserver};
+use device::{ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver};
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
 ///
@@ -2781,6 +2781,7 @@ impl BackendDevice for MetalDevice {
         ));
 
         Ok(Self {
+            constants: Arc::new(ConstantsByValue::new()),
             teardown,
             id: DeviceId::new(),
             device,
@@ -3971,9 +3972,7 @@ impl MetalStorage {
             g.dst_head_stride,
             g.dst_token_stride,
         );
-        let params_buf = self
-            .device
-            .new_buffer_with_data(std::slice::from_ref(&params))?;
+        let params_buf = self.device.constant_of(&params)?;
         let encoder = self.device.command_encoder()?;
         crate::kernels::call_flash_kv_scatter(
             &self.device.device,

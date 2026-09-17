@@ -1751,6 +1751,18 @@ struct PagedKv {
     /// Every sequence's chunk table, `table_stride` entries each.
     table: Vec<u32>,
     table_stride: usize,
+    /// `table` resident on the device for the one-sequence read: `U32`, sized
+    /// for the ceiling, its first `table_written` entries the host's. A
+    /// chunk's entry never changes once written (pages do not move; a rewind
+    /// shortens the length, not the table), so a new chunk is appended in
+    /// place past what any in-flight step reads; a table that changed inside
+    /// the written prefix (a reset's recycled pages) gets a fresh tensor —
+    /// the in-flight steps hold the old buffer through their command buffers.
+    table_t: Option<Tensor>,
+    table_written: usize,
+    /// What `table_t`'s first `table_written` entries hold — the host's copy
+    /// of what it wrote, so the prefix check reads no device memory.
+    table_shadow: Vec<u32>,
 }
 
 #[cfg(feature = "metal")]
@@ -1788,6 +1800,9 @@ impl PagedKv {
             max_slot: 0,
             table: Vec::new(),
             table_stride: 0,
+            table_t: None,
+            table_written: 0,
+            table_shadow: Vec::new(),
         })
     }
 
@@ -1934,6 +1949,60 @@ impl PagedKv {
             let t = pool.table_for(s, self.pages_per_chunk);
             debug_assert_eq!(t.len(), n_chunks);
             self.table.extend_from_slice(&t);
+        }
+        self.sync_resident_table(n_seqs, device)?;
+        Ok(())
+    }
+
+    /// Keep the one-sequence resident table in step with `table`: append the
+    /// new entries in place, or start a fresh tensor when the written prefix
+    /// changed or the batch is not one sequence (then the read binds by value).
+    fn sync_resident_table(&mut self, n_seqs: usize, device: &Device) -> Result<()> {
+        if n_seqs != 1 || !device.is_metal() {
+            self.table_t = None;
+            self.table_written = 0;
+            return Ok(());
+        }
+        let capacity = self
+            .kv_capacity
+            .div_ceil((self.page_size * self.pages_per_chunk).max(1))
+            .max(self.table.len());
+        let fresh = match &self.table_t {
+            Some(t) => {
+                t.elem_count() < self.table.len()
+                    || self.table_written > self.table.len()
+                    || {
+                        // The written prefix must still be the table's prefix
+                        // (a host compare against what was written; never a
+                        // device read on the step).
+                        let written = self.table_written.min(self.table.len());
+                        self.table_shadow[..written] != self.table[..written]
+                    }
+            }
+            None => true,
+        };
+        if fresh {
+            let mut init = self.table.clone();
+            init.resize(capacity, 0);
+            self.table_t = Some(Tensor::new(init.as_slice(), device)?);
+            self.table_written = self.table.len();
+            self.table_shadow.clear();
+            self.table_shadow.extend_from_slice(&self.table);
+            return Ok(());
+        }
+        if self.table.len() > self.table_written {
+            let t = self.table_t.as_ref().expect("checked above");
+            let start = self.table_written;
+            // SAFETY: entries past `table_written` are read by no queued
+            // dispatch (each step reads its own chunk count), and the prefix
+            // is untouched.
+            if !unsafe { t.write_host_slice::<u32>(start, &self.table[start..]) } {
+                let mut init = self.table.clone();
+                init.resize(capacity, 0);
+                self.table_t = Some(Tensor::new(init.as_slice(), device)?);
+            }
+            self.table_shadow.extend_from_slice(&self.table[start..]);
+            self.table_written = self.table.len();
         }
         Ok(())
     }
@@ -5867,7 +5936,7 @@ impl Attention {
                     )?
                 } else {
                 let paged = cache.paged.as_ref().expect("checked above");
-                crate::nn::ops::flash_decoding_paged(
+                crate::nn::ops::flash_decoding_paged_resident(
                     &q,
                     &k,
                     &v,
@@ -5877,9 +5946,10 @@ impl Attention {
                     self.flash_pages_per_chunk,
                     self.flash_scratch_sizing,
                     reserve_chunks,
-                    paged.table.clone(),
+                    &paged.table,
                     paged.table_stride,
                     paged.len,
+                    paged.table_t.as_ref(),
                 )?
                 }
             }

@@ -397,6 +397,14 @@ struct Args {
     #[arg(long)]
     fusion: Option<String>,
 
+    /// Under `--attn flash`: pages per FlashDecoding chunk (`k` of
+    /// `chunk_size = k × page_size`; 1, the shipped value, is a 256-key chunk
+    /// per partial threadgroup). A probe of the partial kernel's geometry at
+    /// long context; `k > 1` needs the pool's pages chunk-contiguous, which a
+    /// fresh single-sequence pool is and a recycled one is not (§10.3d).
+    #[arg(long, default_value_t = 1)]
+    flash_k: usize,
+
     /// Override the cache preset's attention arm: `sdpa` (the crown), `flash`
     /// (FlashDecoding, the only arm that reads a paged pool) or `generic`. Unset
     /// leaves the preset's. A measurement knob: it changes which kernel the
@@ -1433,6 +1441,7 @@ fn main() -> Result<()> {
     }
     if let Some(kv) = args.kv_append.as_deref() {
         config.kv_append = KvAppend::parse(kv).map_err(|e| anyhow::anyhow!(e))?;
+        config.flash_pages_per_chunk = args.flash_k.max(1);
     }
     if let Some(q) = args.qkv_layout.as_deref() {
         config.qkv_layout =

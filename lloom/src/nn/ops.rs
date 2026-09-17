@@ -2937,6 +2937,34 @@ impl FlashScratchSizing {
     }
 }
 
+/// The live key counts of a paged read: one for the batch (the B=1 decode
+/// step's, inline) or one per row, borrowed from the caller for the call.
+#[derive(Debug, Clone, Copy)]
+enum PagedKeys<'a> {
+    One(u32),
+    Rows(&'a [u32]),
+}
+
+impl PagedKeys<'_> {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            PagedKeys::One(n) => std::slice::from_ref(n),
+            PagedKeys::Rows(r) => r,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+/// The bytes of a `u32` / `i32` slice, for `MetalDevice::constant_buffer`.
+#[cfg(feature = "metal")]
+fn slice_bytes<T: Copy>(s: &[T]) -> &[u8] {
+    // SAFETY: plain integers, no padding; the view lives as long as `s`.
+    unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), std::mem::size_of_val(s)) }
+}
+
 /// The page tables a paged FlashDecoding call reads through.
 ///
 /// `entries` holds every sequence's chunk table, `stride` entries each — entry
@@ -2946,28 +2974,37 @@ impl FlashScratchSizing {
 /// per row for a ragged one (`batched-decode-design.md` §12.2).
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // read by the Metal arm only, as `FlashDecoding`'s fields are
-struct PagedTable {
-    entries: Vec<u32>,
+struct PagedTable<'a> {
+    /// Every row's chunk table, borrowed from the cache for the call: the op
+    /// lives for one `apply_op3`, so nothing is copied or refcounted — the
+    /// host owns one table and the device one buffer of it.
+    entries: &'a [u32],
     stride: usize,
-    n_keys: Vec<u32>,
+    n_keys: PagedKeys<'a>,
     /// `entries` and `n_keys` already on the device (`U32`, contiguous, offset
-    /// 0), uploaded once per pass by the caller and bound as they are; `None`
-    /// uploads both per call.
-    bound: Option<(Tensor, Tensor)>,
+    /// 0), uploaded once per pass by the caller and bound as they are (the
+    /// batched rows' `RowsPass`); `None` binds by value
+    /// (`MetalDevice::constant_buffer`).
+    bound: Option<(&'a Tensor, &'a Tensor)>,
+    /// The table alone already on the device — the one-sequence cache's
+    /// resident table, appended in place as chunks are added — with the live
+    /// count bound by value per step.
+    table_t: Option<&'a Tensor>,
 }
 
-impl PagedTable {
+impl PagedTable<'_> {
     /// The longest row's live length: the dispatch depth.
     fn max_keys(&self) -> usize {
-        self.n_keys.iter().copied().max().unwrap_or(0) as usize
+        self.n_keys.as_slice().iter().copied().max().unwrap_or(0) as usize
     }
 
     /// Row `b`'s live length.
     fn keys_of(&self, b: usize) -> usize {
-        if self.n_keys.len() == 1 {
-            self.n_keys[0] as usize
+        let keys = self.n_keys.as_slice();
+        if keys.len() == 1 {
+            keys[0] as usize
         } else {
-            self.n_keys.get(b).copied().unwrap_or(0) as usize
+            keys.get(b).copied().unwrap_or(0) as usize
         }
     }
 }
@@ -2988,13 +3025,13 @@ impl PagedTable {
 /// lets #61's context curve decide the crossover instead of a constant deciding
 /// it now.
 #[allow(dead_code)]
-struct FlashDecoding {
+struct FlashDecoding<'a> {
     scale: f32,
     softcapping: f32,
     /// `Some` when `k`/`v` are a shared page pool read through per-sequence
     /// chunk tables rather than a `[B, H_kv, capacity, D]` cache
     /// (`DESIGN.md` §10.3c).
-    paged: Option<PagedTable>,
+    paged: Option<PagedTable<'a>>,
     /// KV tokens per page — the **allocation** unit.
     page_size: usize,
     /// Pages per chunk: the `k` of `chunk_size = k * page_size`.
@@ -3024,7 +3061,7 @@ struct FlashDecoding {
     reserve_chunks: usize,
 }
 
-impl lloom_tensor::CustomOp3 for FlashDecoding {
+impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
     fn name(&self) -> &'static str {
         "metal-flash-decoding"
     }
@@ -3056,7 +3093,7 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
 
         let device = q.device();
 
-        let out_dims = vec![q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
+        let out_dims = [q_l.dim(0)?, q_l.dim(1)?, q_l.dim(2)?, v_l.dim(3)?];
         let elem_count: usize = out_dims.iter().product();
         let out_shape = Shape::from_dims(&out_dims);
         let out_layout = Layout::contiguous(out_shape.clone());
@@ -3135,7 +3172,7 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
                      tables (table stride 0 shares one table)"
                 );
             }
-            for (b, &n) in paged.n_keys.iter().enumerate() {
+            for (b, &n) in paged.n_keys.as_slice().iter().enumerate() {
                 if n == 0 || n as usize > k_l.dim(2)? {
                     lloom_tensor::bail!(
                         "flash-decoding over a page pool: row {b} has {n} live keys against a \
@@ -3253,10 +3290,8 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         // caller selected, and `Grow` when nobody selects — which is what
         // shipped, byte for byte.
         let sizing = self.scratch_sizing.to_metal();
-        let rungs: Vec<usize> = lloom_tensor::kernels::BUCKET_LADDER
-            .iter()
-            .map(|&kv| flash_chunk_count(kv, chunk_size))
-            .collect();
+        let rungs: [usize; 3] =
+            lloom_tensor::kernels::BUCKET_LADDER.map(|kv| flash_chunk_count(kv, chunk_size));
         let chunk_capacity = sizing
             .sized_chunks(n_chunks, self.reserve_chunks, &rungs)
             .map_err(lloom_tensor::Error::msg)?;
@@ -3301,21 +3336,26 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         // from an index — at B=1 the two coincide. Binding it now is what makes
         // the permuted-table test possible and what a paged cache would fill
         // differently.
-        let (table, table_stride): (Vec<u32>, usize) = match &self.paged {
-            Some(p) => (p.entries.clone(), p.stride),
+        let (table, table_stride): (std::borrow::Cow<'_, [u32]>, usize) = match &self.paged {
+            Some(p) => (std::borrow::Cow::Borrowed(p.entries), p.stride),
             // Every row reads the one identity table.
             None => (
-                ChunkTable::Contiguous.entries(n_chunks, self.pages_per_chunk),
+                std::borrow::Cow::Owned(ChunkTable::Contiguous.entries(n_chunks, self.pages_per_chunk)),
                 0,
             ),
         };
         // The table and the live counts: the caller's device tensors when it
-        // bound them (one upload per pass, `RowsPass`), else uploaded here.
-        let bound = self.paged.as_ref().and_then(|p| p.bound.as_ref());
+        // bound them (one upload per pass, `RowsPass`), else bound BY VALUE —
+        // the same table is the same buffer across the layers of a step and
+        // across steps until a chunk is added; the live count is one small
+        // entry per step (`MetalDevice::constant_buffer`).
+        let bound = self.paged.as_ref().and_then(|p| p.bound);
         let bound_guards = bound.map(|(t, n)| (t.storage_and_layout(), n.storage_and_layout()));
-        let uploaded = match bound {
-            None => Some(device.new_buffer_with_data(&table)?),
-            Some(_) => None,
+        let resident_table = self.paged.as_ref().and_then(|p| p.table_t);
+        let resident_guard = resident_table.map(|t| t.storage_and_layout());
+        let uploaded = match (bound, resident_table) {
+            (None, None) => Some(device.constant_buffer(slice_bytes(&table))?),
+            _ => None,
         };
 
         // A pool is one row shared by every sequence: its sequence stride is
@@ -3341,18 +3381,42 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         // reads (the lockstep batch, the contiguous cache) or one per row
         // (a ragged batch through one dispatch, §12.2). `n_keys` in the
         // params stays the longest row's — the dispatch depth.
-        let (keys_per_seq, ragged): (Vec<i32>, bool) = match &self.paged {
-            Some(p) if p.n_keys.len() > 1 => (p.n_keys.iter().map(|&n| n as i32).collect(), true),
-            _ => (vec![n_keys as i32], false),
-        };
+        let ragged = matches!(&self.paged, Some(p) if p.n_keys.len() > 1);
         let uploaded_keys = match bound {
-            None => Some(device.new_buffer_with_data(&keys_per_seq)?),
+            None => {
+                let one = [n_keys as i32];
+                let rows: Vec<i32>;
+                let keys: &[i32] = match &self.paged {
+                    Some(p) if ragged => {
+                        rows = p.n_keys.as_slice().iter().map(|&n| n as i32).collect();
+                        &rows
+                    }
+                    _ => &one,
+                };
+                // The live count changes every step, so it goes through the
+                // pool (a hit once the bucket is warm), NOT the by-value
+                // cache — keyed there it would be a fresh entry per token and
+                // its FIFO would evict the stable tables and params blocks
+                // behind it (measured: 6–10 pool misses per token).
+                Some(device.new_buffer_with_data(keys)?)
+            }
             Some(_) => None,
         };
         let (chunk_table, n_keys_per_seq): (
             &lloom_tensor::kernels::metal::buffer::Buffer,
             &lloom_tensor::kernels::metal::buffer::Buffer,
         ) = match (&bound_guards, &uploaded, &uploaded_keys) {
+            (None, None, Some(n)) if resident_guard.is_some() => {
+                let (ts, tl) = resident_guard.as_ref().expect("checked");
+                if tl.start_offset() != 0 {
+                    lloom_tensor::bail!("flash-decoding: a resident table must start at offset 0");
+                }
+                let t = match &**ts {
+                    lloom_tensor::Storage::Metal(m) => m.buffer(),
+                    _ => lloom_tensor::bail!("flash-decoding: the resident table must be on metal"),
+                };
+                (t, n)
+            }
             (Some(((ts, tl), (ns, nl))), _, _) => {
                 if tl.start_offset() != 0 || nl.start_offset() != 0 {
                     lloom_tensor::bail!(
@@ -3391,14 +3455,22 @@ impl lloom_tensor::CustomOp3 for FlashDecoding {
         if ragged {
             partial = partial.with_keys_per_sequence();
         }
-        let partial_params = device.new_buffer_with_data(std::slice::from_ref(&partial))?;
-        let combine_params = device.new_buffer_with_data(std::slice::from_ref(
-            // The pair this call has taken since #116, and the reason the
-            // partial pass needed the same one: the combine reads at the
-            // capacity stride and merges to the live count. Both sides of the
-            // region now agree about its shape.
-            &lloom_tensor::kernels::FlashCombineParams::for_step(n_chunks, chunk_capacity),
-        ))?;
+        // Every kernel reads the live count from `n_keys_per_seq` (the
+        // partial, the single-chunk path and the combine alike); the block's
+        // own `n_keys` is read by none of them. Held at zero so the block's
+        // bytes — and so its by-value buffer — are the same every step until
+        // a chunk is added, instead of a fresh entry per token.
+        partial.n_keys = 0;
+        // Both blocks bound by value: the same bytes every step until a chunk
+        // is added, so the same buffer — no upload, no allocation, and the
+        // stable identity an ICB command would need (`flash_decoding.rs`).
+        let partial_params = device.constant_of(&partial)?;
+        // The pair this call has taken since #116, and the reason the
+        // partial pass needed the same one: the combine reads at the
+        // capacity stride and merges to the live count. Both sides of the
+        // region now agree about its shape.
+        let combine = lloom_tensor::kernels::FlashCombineParams::for_step(n_chunks, chunk_capacity);
+        let combine_params = device.constant_of(&combine)?;
 
         let encoder = q.device().command_encoder()?;
         encoder.set_label("flash_decoding");
@@ -3526,10 +3598,11 @@ pub fn flash_decoding_paged_ragged(
             scale,
             softcapping,
             paged: Some(PagedTable {
-                entries: table,
+                entries: &table,
                 stride: table_stride,
-                n_keys,
+                n_keys: PagedKeys::Rows(&n_keys),
                 bound: None,
+                table_t: None,
             }),
             page_size,
             pages_per_chunk,
@@ -3583,10 +3656,11 @@ pub fn flash_decoding_paged_ragged_bound(
             scale,
             softcapping,
             paged: Some(PagedTable {
-                entries: table,
+                entries: &table,
                 stride: table_stride,
-                n_keys,
-                bound: Some((tables_t.clone(), n_keys_t.clone())),
+                n_keys: PagedKeys::Rows(&n_keys),
+                bound: Some((tables_t, n_keys_t)),
+                table_t: None,
             }),
             page_size,
             pages_per_chunk,
@@ -3610,6 +3684,54 @@ pub fn flash_decoding_paged(
     table_stride: usize,
     n_keys: usize,
 ) -> Result<Tensor> {
+    flash_decoding_paged_resident(
+        q,
+        k,
+        v,
+        scale,
+        softcapping,
+        page_size,
+        pages_per_chunk,
+        scratch_sizing,
+        reserve_chunks,
+        &table,
+        table_stride,
+        n_keys,
+        None,
+    )
+}
+
+/// [`flash_decoding_paged`] for the one-sequence decode step: the table
+/// borrowed (nothing copied), the live count inline, and — when the cache
+/// keeps its table resident on the device (`table_t`, appended in place as
+/// chunks are added) — the table bound as it is, so a step allocates and
+/// uploads nothing but its 4-byte count.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_decoding_paged_resident(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f32,
+    softcapping: f32,
+    page_size: usize,
+    pages_per_chunk: usize,
+    scratch_sizing: FlashScratchSizing,
+    reserve_chunks: usize,
+    table: &[u32],
+    table_stride: usize,
+    n_keys: usize,
+    table_t: Option<&Tensor>,
+) -> Result<Tensor> {
+    if let Some(t) = table_t {
+        if t.dtype() != DType::U32 || t.elem_count() < table.len() {
+            lloom_tensor::bail!(
+                "flash-decoding: the resident table must be U32 and hold the host's {} entries \
+                 (has {})",
+                table.len(),
+                t.elem_count()
+            );
+        }
+    }
     q.apply_op3_no_bwd(
         k,
         v,
@@ -3619,8 +3741,9 @@ pub fn flash_decoding_paged(
             paged: Some(PagedTable {
                 entries: table,
                 stride: table_stride,
-                n_keys: vec![n_keys as u32],
+                n_keys: PagedKeys::One(n_keys as u32),
                 bound: None,
+                table_t,
             }),
             page_size,
             pages_per_chunk,

@@ -7,8 +7,14 @@
 //! the blocks behind issue #747's seams (the `ForwardObserver` observation seam,
 //! the `MoeLayer`/`ExpertResidency` residency seam) on the `Resident` path.
 
+pub mod config;
 pub mod deltanet;
+pub mod deltanet_block;
 pub mod hc;
+pub mod moe;
 
+pub use config::{Config, LayerKind};
 pub use deltanet::{DeltaNetDims, decode_step};
+pub use deltanet_block::GatedDeltaNet;
 pub use hc::HyperConnection;
+pub use moe::{ExpertResidency, MoeLayer, Resident};

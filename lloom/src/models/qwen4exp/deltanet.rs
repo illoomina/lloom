@@ -209,6 +209,38 @@ pub fn gate_and_beta(
     Ok((g, beta))
 }
 
+/// One decode-step of the depthwise causal conv over the concat-QKV channels
+/// (k=4, no bias — `ssm_conv1d`), mirroring the shift-and-fold pattern Mamba2
+/// uses: shift the per-channel window, append the new token, fold against the
+/// k-wide weight. The window is a [`RecurrentState`] channel (a second recurrent
+/// state alongside `S`), so it migrates and rolls back with the sequence.
+///
+/// `x` is `[channels]` (this token's concat-QKV projection), `weight` is
+/// `[channels, k]` (the depthwise kernel), `window` is the `[channels, k]` state
+/// (oldest..newest, `None` = zero). Returns `(conv_out [channels], new_window)`.
+pub fn conv_decode_step(
+    x: &Tensor,
+    weight: &Tensor,
+    window: Option<&Tensor>,
+    channels: usize,
+    k: usize,
+) -> Result<(Tensor, Tensor)> {
+    let dev = x.device();
+    let dt = x.dtype();
+    // window [channels, k], newest at column k-1.
+    let win = match window {
+        Some(w) => w.clone(),
+        None => Tensor::zeros((channels, k), dt, dev)?,
+    };
+    // shift left by one, append x at the last column.
+    let shifted = win.narrow(1, 1, k - 1)?; // [channels, k-1]
+    let x_col = x.reshape((channels, 1))?;
+    let new_win = Tensor::cat(&[&shifted, &x_col], 1)?; // [channels, k]
+    // fold: sum_i weight[:,i] * window[:,i].
+    let folded = (new_win.contiguous()? * weight)?.sum(1)?; // [channels]
+    Ok((folded, new_win))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +380,25 @@ mod tests {
         for (x, y) in nl.iter().zip(&nf) {
             assert!((x - y).abs() < 1e-6);
         }
+    }
+
+    /// The decode conv shifts the window and folds against the k-wide weight,
+    /// exactly the causal depthwise conv. Two tokens through a 1-channel k=3 conv,
+    /// checked by hand.
+    #[test]
+    fn conv_decode_step_folds_causal_window() {
+        let dev = Device::Cpu;
+        let (ch, k) = (1usize, 3usize);
+        // weight [1,3] = [w0,w1,w2]; conv folds oldest..newest = w0*x_{t-2}+w1*x_{t-1}+w2*x_t.
+        let w = Tensor::from_vec(vec![0.5f32, 1.0, 2.0], (ch, k), &dev).unwrap();
+        // token 1 (x=1) onto a zero window: window=[0,0,1], out = 0.5*0+1*0+2*1 = 2.
+        let x1 = Tensor::from_vec(vec![1f32], ch, &dev).unwrap();
+        let (o1, win1) = conv_decode_step(&x1, &w, None, ch, k).unwrap();
+        assert_eq!(o1.to_vec1::<f32>().unwrap()[0], 2.0);
+        // token 2 (x=3): window shifts to [0,1,3], out = 0.5*0+1*1+2*3 = 7.
+        let x2 = Tensor::from_vec(vec![3f32], ch, &dev).unwrap();
+        let (o2, _win2) = conv_decode_step(&x2, &w, Some(&win1), ch, k).unwrap();
+        assert_eq!(o2.to_vec1::<f32>().unwrap()[0], 7.0);
     }
 
     /// softplus matches log(1+exp(x)) including at large |x| (no overflow).

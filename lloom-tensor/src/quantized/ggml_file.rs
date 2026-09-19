@@ -1,6 +1,6 @@
 //! Support for the GGML file format.
 
-use super::{k_quants, GgmlDType, QStorage};
+use super::{iq_quants, k_quants, GgmlDType, QStorage};
 use crate::{Device, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
@@ -183,6 +183,30 @@ pub fn qtensor_from_ggml(
         }
         GgmlDType::Q6K => {
             from_raw_data::<k_quants::BlockQ6K>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ2XXS => {
+            from_raw_data::<iq_quants::BlockIQ2xxs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ2XS => {
+            from_raw_data::<iq_quants::BlockIQ2xs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ2S => {
+            from_raw_data::<iq_quants::BlockIQ2s>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ3XXS => {
+            from_raw_data::<iq_quants::BlockIQ3xxs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ3S => {
+            from_raw_data::<iq_quants::BlockIQ3s>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ4NL => {
+            from_raw_data::<iq_quants::BlockIQ4nl>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::IQ4XS => {
+            from_raw_data::<iq_quants::BlockIQ4xs>(raw_data, size_in_bytes, dims, device)
+        }
+        GgmlDType::Q2_0 => {
+            from_raw_data::<iq_quants::BlockQ2_0>(raw_data, size_in_bytes, dims, device)
         }
         _ => crate::bail!("quantized type {ggml_dtype:?} is not supported yet"),
     }

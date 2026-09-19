@@ -116,6 +116,7 @@ pub mod qwen2_moe;
 pub mod qwen3;
 pub mod qwen3_moe;
 pub mod qwen3_vl;
+pub mod qwen4exp;
 pub mod recurrent_gemma;
 pub mod repvgg;
 pub mod resnet;

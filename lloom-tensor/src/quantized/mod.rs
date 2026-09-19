@@ -11,6 +11,8 @@ mod dummy_metal;
 pub mod ggml_file;
 pub mod gguf_file;
 pub mod imatrix_file;
+pub mod iq_grids;
+pub mod iq_quants;
 pub mod k_quants;
 #[cfg(feature = "metal")]
 pub mod metal;
@@ -110,6 +112,27 @@ impl QStorage {
                 GgmlDType::Q6K => metal::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => metal::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => metal::load_quantized(d, as_t_slice::<bf16>(data)),
+                // IQ / Q2_0: raw blocks uploaded as-is; the Metal `mul_mv_iq*`
+                // kernels dequantize on the fly (dequant-in-kernel, no separate
+                // dequant pass). `load_quantized` is generic over the block type.
+                GgmlDType::IQ2XXS => {
+                    metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ2xxs>(data))
+                }
+                GgmlDType::IQ2XS => {
+                    metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ2xs>(data))
+                }
+                GgmlDType::IQ2S => metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ2s>(data)),
+                GgmlDType::IQ3XXS => {
+                    metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ3xxs>(data))
+                }
+                GgmlDType::IQ3S => metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ3s>(data)),
+                GgmlDType::IQ4NL => {
+                    metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ4nl>(data))
+                }
+                GgmlDType::IQ4XS => {
+                    metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ4xs>(data))
+                }
+                GgmlDType::Q2_0 => metal::load_quantized(d, as_t_slice::<iq_quants::BlockQ2_0>(data)),
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -127,6 +150,19 @@ impl QStorage {
                 GgmlDType::Q6K => cuda::load_quantized(d, as_t_slice::<BlockQ6K>(data)),
                 GgmlDType::Q8K => cuda::load_quantized(d, as_t_slice::<BlockQ8K>(data)),
                 GgmlDType::BF16 => cuda::load_quantized(d, as_t_slice::<bf16>(data)),
+                // IQ / Q2_0 are not wired for the CUDA matmul path in lloom; the
+                // GSQ-RCO checkpoints these serve run on Metal / CPU. Refuse
+                // rather than upload blocks no CUDA kernel can read.
+                GgmlDType::IQ2XXS
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ4NL
+                | GgmlDType::IQ4XS
+                | GgmlDType::Q2_0 => {
+                    crate::bail!("{dtype:?} is not supported on the CUDA quantized path")
+                }
             },
         }
     }
@@ -293,6 +329,17 @@ pub enum GgmlDType {
     Q5K,
     Q6K,
     Q8K,
+    // IQ-family and the GSQ-RCO fork's Q2_0 (type code 42). Read-only: lloom
+    // dequantizes these (CPU `to_float` in `iq_quants`, Metal `mul_mv_iq*`), it
+    // does not quantize to them. Codes per ggml.h; Q2_0 per the qwen4exp fork.
+    IQ2XXS,
+    IQ2XS,
+    IQ2S,
+    IQ3XXS,
+    IQ3S,
+    IQ4NL,
+    IQ4XS,
+    Q2_0,
 }
 
 impl GgmlDType {
@@ -312,8 +359,17 @@ impl GgmlDType {
             13 => Self::Q5K,
             14 => Self::Q6K,
             15 => Self::Q8K,
+            16 => Self::IQ2XXS,
+            17 => Self::IQ2XS,
+            18 => Self::IQ3XXS,
+            20 => Self::IQ4NL,
+            21 => Self::IQ3S,
+            22 => Self::IQ2S,
+            23 => Self::IQ4XS,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             30 => Self::BF16,
+            // Q2_0: the qwen4exp / GSQ-RCO fork's own type (GGML_TYPE_Q2_0=42).
+            42 => Self::Q2_0,
             _ => crate::bail!("unknown dtype for tensor {u}"),
         };
         Ok(dtype)
@@ -335,8 +391,16 @@ impl GgmlDType {
             Self::Q5K => 13,
             Self::Q6K => 14,
             Self::Q8K => 15,
+            Self::IQ2XXS => 16,
+            Self::IQ2XS => 17,
+            Self::IQ3XXS => 18,
+            Self::IQ4NL => 20,
+            Self::IQ3S => 21,
+            Self::IQ2S => 22,
+            Self::IQ4XS => 23,
             // https://github.com/ggerganov/ggml/blob/29d87fc6676e7ed0cdfdec0804b06001d9c2bb44/include/ggml.h#L389
             Self::BF16 => 30,
+            Self::Q2_0 => 42,
         }
     }
 
@@ -358,6 +422,38 @@ impl GgmlDType {
             Self::Q6K => Box::new(vec![BlockQ6K::zeros(); elem_count / BlockQ6K::BLCK_SIZE]),
             Self::Q8K => Box::new(vec![BlockQ8K::zeros(); elem_count / BlockQ8K::BLCK_SIZE]),
             Self::BF16 => Box::new(vec![bf16::zeros(); elem_count]),
+            Self::IQ2XXS => Box::new(vec![
+                iq_quants::BlockIQ2xxs::zeros();
+                elem_count / iq_quants::BlockIQ2xxs::BLCK_SIZE
+            ]),
+            Self::IQ2XS => Box::new(vec![
+                iq_quants::BlockIQ2xs::zeros();
+                elem_count / iq_quants::BlockIQ2xs::BLCK_SIZE
+            ]),
+            Self::IQ2S => Box::new(vec![
+                iq_quants::BlockIQ2s::zeros();
+                elem_count / iq_quants::BlockIQ2s::BLCK_SIZE
+            ]),
+            Self::IQ3XXS => Box::new(vec![
+                iq_quants::BlockIQ3xxs::zeros();
+                elem_count / iq_quants::BlockIQ3xxs::BLCK_SIZE
+            ]),
+            Self::IQ3S => Box::new(vec![
+                iq_quants::BlockIQ3s::zeros();
+                elem_count / iq_quants::BlockIQ3s::BLCK_SIZE
+            ]),
+            Self::IQ4NL => Box::new(vec![
+                iq_quants::BlockIQ4nl::zeros();
+                elem_count / iq_quants::BlockIQ4nl::BLCK_SIZE
+            ]),
+            Self::IQ4XS => Box::new(vec![
+                iq_quants::BlockIQ4xs::zeros();
+                elem_count / iq_quants::BlockIQ4xs::BLCK_SIZE
+            ]),
+            Self::Q2_0 => Box::new(vec![
+                iq_quants::BlockQ2_0::zeros();
+                elem_count / iq_quants::BlockQ2_0::BLCK_SIZE
+            ]),
         }
     }
 
@@ -379,6 +475,14 @@ impl GgmlDType {
             Self::Q6K => Box::new(as_t_slice::<BlockQ6K>(data).to_vec()),
             Self::Q8K => Box::new(as_t_slice::<BlockQ8K>(data).to_vec()),
             Self::BF16 => Box::new(as_t_slice::<bf16>(data).to_vec()),
+            Self::IQ2XXS => Box::new(as_t_slice::<iq_quants::BlockIQ2xxs>(data).to_vec()),
+            Self::IQ2XS => Box::new(as_t_slice::<iq_quants::BlockIQ2xs>(data).to_vec()),
+            Self::IQ2S => Box::new(as_t_slice::<iq_quants::BlockIQ2s>(data).to_vec()),
+            Self::IQ3XXS => Box::new(as_t_slice::<iq_quants::BlockIQ3xxs>(data).to_vec()),
+            Self::IQ3S => Box::new(as_t_slice::<iq_quants::BlockIQ3s>(data).to_vec()),
+            Self::IQ4NL => Box::new(as_t_slice::<iq_quants::BlockIQ4nl>(data).to_vec()),
+            Self::IQ4XS => Box::new(as_t_slice::<iq_quants::BlockIQ4xs>(data).to_vec()),
+            Self::Q2_0 => Box::new(as_t_slice::<iq_quants::BlockQ2_0>(data).to_vec()),
         }
     }
 
@@ -401,6 +505,14 @@ impl GgmlDType {
             Self::Q5K => std::mem::size_of::<BlockQ5K>(),
             Self::Q6K => std::mem::size_of::<BlockQ6K>(),
             Self::Q8K => std::mem::size_of::<BlockQ8K>(),
+            Self::IQ2XXS => std::mem::size_of::<iq_quants::BlockIQ2xxs>(),
+            Self::IQ2XS => std::mem::size_of::<iq_quants::BlockIQ2xs>(),
+            Self::IQ2S => std::mem::size_of::<iq_quants::BlockIQ2s>(),
+            Self::IQ3XXS => std::mem::size_of::<iq_quants::BlockIQ3xxs>(),
+            Self::IQ3S => std::mem::size_of::<iq_quants::BlockIQ3s>(),
+            Self::IQ4NL => std::mem::size_of::<iq_quants::BlockIQ4nl>(),
+            Self::IQ4XS => std::mem::size_of::<iq_quants::BlockIQ4xs>(),
+            Self::Q2_0 => std::mem::size_of::<iq_quants::BlockQ2_0>(),
         }
     }
 
@@ -416,6 +528,15 @@ impl GgmlDType {
             Self::Q8_0 => k_quants::QK8_0,
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
+            // IQ super-block types use QK_K=256; IQ4_NL and Q2_0 are small blocks.
+            Self::IQ2XXS
+            | Self::IQ2XS
+            | Self::IQ2S
+            | Self::IQ3XXS
+            | Self::IQ3S
+            | Self::IQ4XS => k_quants::QK_K,
+            Self::IQ4NL => iq_quants::QK4_NL,
+            Self::Q2_0 => iq_quants::QK2_0,
         }
     }
 }

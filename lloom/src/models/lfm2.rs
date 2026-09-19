@@ -3025,31 +3025,45 @@ impl VerifyWords {
         need: usize,
         device: &Device,
     ) -> Option<&'a mut VerifyWords> {
-        if !device.is_metal() {
-            return None;
+        // The mapped-words fast path is a Metal-only optimisation: it reads the
+        // stamp and the words in place through pointers into `Shared` buffers
+        // (`peek_scalar_ptr`, `flush_and_prune`). Off Metal there is nothing to
+        // map, so every caller falls back to a staged readback (`stage_read`),
+        // and the whole path is `#[cfg]`-compiled out rather than guarded only
+        // at runtime — a no-metal build has no `peek_scalar_ptr` to name.
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = (slot, need, device);
+            None
         }
-        let slot = &mut slot.0;
-        let fresh = !matches!(slot, Some(w) if w.cap >= need);
-        if fresh {
-            let cap = need.max(64).next_power_of_two();
-            let out = Tensor::from_vec(vec![0u32; cap], cap, device).ok()?;
-            let step = Tensor::from_vec(vec![0u32], 1, device).ok()?;
-            // SAFETY: read only through `read_volatile`, after the stamp says
-            // the GPU wrote the words; the tensors are held beside the addresses.
-            let out_ptr = unsafe { out.peek_scalar_ptr::<u32>(0)? } as usize;
-            let step_ptr = unsafe { step.peek_scalar_ptr::<u32>(0)? } as usize;
-            let generation = slot.as_ref().map_or(0, |w| w.generation);
-            *slot = Some(VerifyWords {
-                out,
-                step,
-                out_ptr,
-                step_ptr,
-                cap,
-                generation,
-                host: Vec::with_capacity(cap),
-            });
+        #[cfg(feature = "metal")]
+        {
+            if !device.is_metal() {
+                return None;
+            }
+            let slot = &mut slot.0;
+            let fresh = !matches!(slot, Some(w) if w.cap >= need);
+            if fresh {
+                let cap = need.max(64).next_power_of_two();
+                let out = Tensor::from_vec(vec![0u32; cap], cap, device).ok()?;
+                let step = Tensor::from_vec(vec![0u32], 1, device).ok()?;
+                // SAFETY: read only through `read_volatile`, after the stamp says
+                // the GPU wrote the words; the tensors are held beside the addresses.
+                let out_ptr = unsafe { out.peek_scalar_ptr::<u32>(0)? } as usize;
+                let step_ptr = unsafe { step.peek_scalar_ptr::<u32>(0)? } as usize;
+                let generation = slot.as_ref().map_or(0, |w| w.generation);
+                *slot = Some(VerifyWords {
+                    out,
+                    step,
+                    out_ptr,
+                    step_ptr,
+                    cap,
+                    generation,
+                    host: Vec::with_capacity(cap),
+                });
+            }
+            slot.as_mut()
         }
-        slot.as_mut()
     }
 
     /// Encode the publish of `src`'s first `n` words for this round; the
@@ -3060,7 +3074,9 @@ impl VerifyWords {
         // Committed now, without a wait — what `stage_read` did with its
         // marker: the poll below is on a buffer the GPU has, not on one the
         // host still holds open (that was a `POLL_BUDGET` of spinning on a
-        // stamp nothing was going to write).
+        // stamp nothing was going to write). Metal-only: `publish` is only
+        // reached from the `Some(w)` arm, which `ensure` yields on Metal alone.
+        #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
             m.flush_and_prune()?;
         }

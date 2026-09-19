@@ -35,7 +35,9 @@ pub mod linear;
 pub mod loss;
 pub mod model;
 pub mod moe;
+pub mod observer;
 pub mod ops;
+pub mod recurrent;
 pub mod optim;
 pub mod rnn;
 pub mod rotary_emb;
@@ -74,6 +76,11 @@ pub use model::{
     BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, Model, RaggedRow, Row, Speculative,
     VisionEncoder,
 };
+pub use observer::{
+    ForwardObserver, HcStatePoint, HookKind, HookPlan, HookPoint, LayerInputPoint,
+    LayerOutputPoint, NextnHiddenPoint,
+};
+pub use recurrent::RecurrentState;
 pub use ops::Dropout;
 pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};

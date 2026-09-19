@@ -127,7 +127,8 @@ pub struct Engine {
     pub reuse_prefix: bool,
     /// The batch width `N` of `--batch N`; `1` is the single-sequence path.
     pub batch: usize,
-    /// The draft block width under `--dspark`.
+    /// The draft block width under `--dspark`: the drafter's block, or
+    /// `--dspark-k` (clamped to the block).
     pub dspark_k: Option<usize>,
     pub prefill_tile: usize,
     pub prefill_chunk: usize,
@@ -172,6 +173,9 @@ pub struct LoadOptions {
     /// Share a request's prefix from another row's cache by page (§12.3);
     /// the `pool` arms only.
     pub share_prefix: bool,
+    /// `--dspark-k`: draft this many positions per round instead of the
+    /// drafter's block (clamped to it).
+    pub dspark_k: Option<usize>,
 }
 
 /// How the rows of `--batch N` hold their KV and conv state, and how a step
@@ -404,6 +408,20 @@ impl Engine {
                 m.set_free_budget(1024 * 1024 * 1024);
             }
         }
+        // Measured on natural text (#148, record §8.3): the speculative loop
+        // on the pool is +14 % at B=4 and a LOSS at B ≥ 8 (−7 % / −40 % at
+        // 8 / 16, 2.1–2.4 accepted of 9 per round against a B × 10-position
+        // verify); structured prompts (7.8–8.3 accepted) pay at every B.
+        // Said once at load; the flag is honoured either way.
+        if dspark_dir.is_some() && opts.batch >= 16 && opts.dspark_k.is_none() {
+            eprintln!(
+                "[dspark: at --batch {} the speculative loop measured slower than plain \
+                 batched decode on natural text even at the batch's draft length (K=3: −13 % \
+                 at 16; +52 % at 4, +14 % at 8); it pays where the drafter's acceptance is \
+                 high (structured, repetitive context). Serving it as asked.]",
+                opts.batch
+            );
+        }
         let dcfg = match &dspark_dir {
             Some(dir) => {
                 let dcfg = DSparkConfig::read_from_dir(dir)
@@ -528,7 +546,15 @@ impl Engine {
             readback: opts.readback,
             reuse_prefix: opts.reuse_prefix,
             batch: opts.batch,
-            dspark_k: dcfg.as_ref().map(|d| d.max_draft()),
+            dspark_k: dcfg.as_ref().map(|d| {
+                opts.dspark_k
+                    .unwrap_or(match opts.batch {
+                        0 | 1 => d.max_draft(),
+                        2 | 3 => 5,
+                        _ => 3,
+                    })
+                    .clamp(1, d.max_draft())
+            }),
             prefill_tile: opts.prefill_tile,
             prefill_chunk: opts.prefill_chunk,
             memory_fraction: opts.memory_fraction,
@@ -605,13 +631,38 @@ impl Engine {
                 ctx_kv,
             )
             .context("constructing DSpark speculator")?;
+            // The draft length by batch (lloom #148, record §8.11): the
+            // verify window is `K + 1` positions per row and its cost per row
+            // is the window, while the accepted prefix on natural text barely
+            // moves with K (2.43 at 9, 2.20 at 3) — at B=1 the window rides
+            // one weight sweep for free and the full block wins (156 / 126 /
+            // 96 tok/s at 9 / 5 / 3); at B=2 K=5 (240 vs 217 / 170); from
+            // B=4 K=3 (196 vs 142 at 4, 267 vs 216 at 8, 391 vs 259 at 16).
+            // `--dspark-k` overrides.
+            let k = opts.dspark_k.unwrap_or(match opts.batch {
+                0 | 1 => dcfg.max_draft(),
+                2 | 3 => 5,
+                _ => 3,
+            });
+            spec.set_max_draft(k);
+            let k = lloom::nn::Speculator::max_draft(&spec);
             eprintln!(
-                "[dspark: drafter loaded from {}, {} layers, K={} (verify window {} positions), \
+                "[dspark: drafter loaded from {}, {} layers, K={} (verify window {} positions{}), \
                  {n_seq} slots, context kv {}]",
                 dir.display(),
                 dcfg.num_hidden_layers,
-                dcfg.max_draft(),
-                dcfg.max_draft() + 1,
+                k,
+                k + 1,
+                if opts.dspark_k.is_some() {
+                    format!("; --dspark-k, the drafter's block is {}", dcfg.max_draft())
+                } else if k < dcfg.max_draft() {
+                    format!(
+                        "; the batch's default, the drafter's block is {}",
+                        dcfg.max_draft()
+                    )
+                } else {
+                    String::new()
+                },
                 spec.ctx_kv().name()
             );
             if opts.warmup {

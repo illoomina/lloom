@@ -573,8 +573,10 @@ pub fn call_flash_decoding(
             height: n_q_heads,
             depth: 1,
         };
+        // Eight simdgroups per head: the kernel's `BN` (chunks striped across
+        // them, a fixed-order sum at the end).
         let group_dims = MTLSize {
-            width: 32,
+            width: 8 * 32,
             height: 1,
             depth: 1,
         };

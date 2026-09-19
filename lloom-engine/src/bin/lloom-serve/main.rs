@@ -133,6 +133,13 @@ struct Args {
     #[arg(long)]
     draft_dir: Option<PathBuf>,
 
+    /// Under `--dspark`: propose this many positions per round instead of the
+    /// drafter's block width (9), clamped to it. The verify window is
+    /// `K + 1` positions per row; at wide batches a shorter window costs
+    /// less per row for nearly the same accepted prefix (lloom #148).
+    #[arg(long)]
+    dspark_k: Option<usize>,
+
     /// The TILE: the most prompt tokens one prefill forward takes (lloom
     /// #728). Default 512 — the bound on a prefill's activation working set,
     /// which otherwise grows with the prompt (~3.5 MB per token on the crown:
@@ -244,6 +251,7 @@ fn main() -> Result<()> {
         mem_sample: args.mem_sample,
         rows,
         share_prefix: args.share_prefix,
+        dspark_k: args.dspark_k,
     })?;
     let model_name = engine.model_name.clone();
     eprintln!(

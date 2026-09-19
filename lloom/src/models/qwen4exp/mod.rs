@@ -11,10 +11,14 @@ pub mod config;
 pub mod deltanet;
 pub mod deltanet_block;
 pub mod hc;
+pub mod model;
 pub mod moe;
+pub mod qsa;
 
 pub use config::{Config, LayerKind};
 pub use deltanet::{DeltaNetDims, decode_step};
 pub use deltanet_block::GatedDeltaNet;
 pub use hc::HyperConnection;
+pub use model::{Cache, Layer, Mixer, Qwen4Exp};
 pub use moe::{ExpertResidency, MoeLayer, Resident};
+pub use qsa::{KvCache, QsaAttention};

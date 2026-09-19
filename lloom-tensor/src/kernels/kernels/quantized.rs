@@ -22,6 +22,14 @@ pub enum GgmlDType {
     F16,
     F32,
     BF16,
+    IQ2XXS,
+    IQ2XS,
+    IQ2S,
+    IQ3XXS,
+    IQ3S,
+    IQ4NL,
+    IQ4XS,
+    Q2_0,
 }
 
 impl GgmlDType {
@@ -42,6 +50,13 @@ impl GgmlDType {
                 | GgmlDType::Q4K
                 | GgmlDType::Q5K
                 | GgmlDType::Q6K
+                | GgmlDType::IQ2XXS
+                | GgmlDType::IQ2XS
+                | GgmlDType::IQ2S
+                | GgmlDType::IQ3XXS
+                | GgmlDType::IQ3S
+                | GgmlDType::IQ4NL
+                | GgmlDType::IQ4XS
         )
     }
 }
@@ -228,6 +243,21 @@ pub fn call_quantized_matmul_mv_t(
             let align = 8;
             (nth0, nth1, align)
         }
+        // IQ family: threadgroup dims per llama.cpp ggml-metal.m (nth0=4,
+        // nth1=16), N_DST=4 rows per group. Q2_0 (fork, 64-block) uses the same.
+        GgmlDType::IQ2XXS
+        | GgmlDType::IQ2XS
+        | GgmlDType::IQ2S
+        | GgmlDType::IQ3XXS
+        | GgmlDType::IQ3S
+        | GgmlDType::IQ4NL
+        | GgmlDType::IQ4XS
+        | GgmlDType::Q2_0 => {
+            let nth0 = 4;
+            let nth1 = 16;
+            let align = 4;
+            (nth0, nth1, align)
+        }
     };
     let thread_groups_count = MTLSize {
         width: divide(ne01 as usize, align),
@@ -265,6 +295,21 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::Q4K => Some("kernel_mul_mv_q4_K"),
         GgmlDType::Q5K => Some("kernel_mul_mv_q5_K"),
         GgmlDType::Q6K => Some("kernel_mul_mv_q6_K"),
+        GgmlDType::IQ2XXS => Some("kernel_mul_mv_iq2_xxs"),
+        GgmlDType::IQ2XS => Some("kernel_mul_mv_iq2_xs"),
+        GgmlDType::IQ2S => Some("kernel_mul_mv_iq2_s"),
+        GgmlDType::IQ3XXS => Some("kernel_mul_mv_iq3_xxs"),
+        GgmlDType::IQ3S => Some("kernel_mul_mv_iq3_s"),
+        GgmlDType::IQ4NL => Some("kernel_mul_mv_iq4_nl"),
+        GgmlDType::IQ4XS => Some("kernel_mul_mv_iq4_xs"),
+        // Q2_0 is the GSQ-RCO fork's custom type; lloom's quantized.metal has no
+        // `mul_mv_q2_0` kernel for it yet. Refuse rather than name a kernel that
+        // does not exist.
+        GgmlDType::Q2_0 => {
+            return Err(MetalKernelError::LoadFunctionError(
+                "kernel_mul_mv_q2_0 not present; dequantize Q2_0 before a Metal matmul".into(),
+            ))
+        }
         // Dense and Q8-family weights: no genericized #750 core, f32 store only.
         GgmlDType::Q8_1
         | GgmlDType::Q8K
@@ -300,10 +345,28 @@ pub fn call_quantized_matmul_mv_t(
         }
     };
 
+    // The IQ kernels stage a codebook (grid + signs) into threadgroup memory
+    // (`shared_values [[threadgroup(0)]]`); the K-quant kernels do not use it.
+    // llama.cpp sizes the IQ shared buffer at 8192 bytes.
+    let iq_shared = matches!(
+        dtype,
+        GgmlDType::IQ2XXS
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ2S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ4NL
+            | GgmlDType::IQ4XS
+            | GgmlDType::Q2_0
+    );
+
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name.clone())?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
+    if iq_shared {
+        encoder.set_threadgroup_memory_length(0, 8192);
+    }
     debug_group!(encoder, "qmm_mv {name} B={b} M={m} K={k} N={n}");
 
     set_params!(
@@ -404,6 +467,14 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::F32 => "kernel_mul_mm_f32_f32",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "qmatmul"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "qmatmul"))?,
+        GgmlDType::IQ2XXS => "kernel_mul_mm_iq2_xxs_f32",
+        GgmlDType::IQ2XS => "kernel_mul_mm_iq2_xs_f32",
+        GgmlDType::IQ2S => "kernel_mul_mm_iq2_s_f32",
+        GgmlDType::IQ3XXS => "kernel_mul_mm_iq3_xxs_f32",
+        GgmlDType::IQ3S => "kernel_mul_mm_iq3_s_f32",
+        GgmlDType::IQ4NL => "kernel_mul_mm_iq4_nl_f32",
+        GgmlDType::IQ4XS => "kernel_mul_mm_iq4_xs_f32",
+        GgmlDType::Q2_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q2_0", "qmatmul"))?,
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -472,6 +543,14 @@ pub fn call_quantized_get_rows(
         GgmlDType::Q6K => "kernel_get_rows_q6_K",
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "get_rows"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "get_rows"))?,
+        GgmlDType::IQ2XXS => "kernel_get_rows_iq2_xxs",
+        GgmlDType::IQ2XS => "kernel_get_rows_iq2_xs",
+        GgmlDType::IQ2S => "kernel_get_rows_iq2_s",
+        GgmlDType::IQ3XXS => "kernel_get_rows_iq3_xxs",
+        GgmlDType::IQ3S => "kernel_get_rows_iq3_s",
+        GgmlDType::IQ4NL => "kernel_get_rows_iq4_nl",
+        GgmlDType::IQ4XS => "kernel_get_rows_iq4_xs",
+        GgmlDType::Q2_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q2_0", "get_rows"))?,
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;

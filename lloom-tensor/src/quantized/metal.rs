@@ -115,6 +115,46 @@ impl QMetalStorage {
                 let vec: Vec<crate::quantized::BlockQ8K> = read_to_vec(&buffer, block_len);
                 crate::quantized::BlockQ8K::to_float(&vec, &mut out);
             }
+            GgmlDType::IQ2XXS => {
+                let vec: Vec<crate::quantized::iq_quants::BlockIQ2xxs> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::iq_quants::BlockIQ2xxs::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ2XS => {
+                let vec: Vec<crate::quantized::iq_quants::BlockIQ2xs> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::iq_quants::BlockIQ2xs::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ2S => {
+                let vec: Vec<crate::quantized::iq_quants::BlockIQ2s> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::iq_quants::BlockIQ2s::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ3XXS => {
+                let vec: Vec<crate::quantized::iq_quants::BlockIQ3xxs> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::iq_quants::BlockIQ3xxs::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ3S => {
+                let vec: Vec<crate::quantized::iq_quants::BlockIQ3s> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::iq_quants::BlockIQ3s::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ4NL => {
+                let vec: Vec<crate::quantized::iq_quants::BlockIQ4nl> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::iq_quants::BlockIQ4nl::to_float(&vec, &mut out);
+            }
+            GgmlDType::IQ4XS => {
+                let vec: Vec<crate::quantized::iq_quants::BlockIQ4xs> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::iq_quants::BlockIQ4xs::to_float(&vec, &mut out);
+            }
+            GgmlDType::Q2_0 => {
+                let vec: Vec<crate::quantized::iq_quants::BlockQ2_0> =
+                    read_to_vec(&buffer, block_len);
+                crate::quantized::iq_quants::BlockQ2_0::to_float(&vec, &mut out);
+            }
         }
 
         let buffer = self
@@ -559,6 +599,14 @@ impl From<GgmlDType> for crate::kernels::GgmlDType {
             GgmlDType::F16 => crate::kernels::GgmlDType::F16,
             GgmlDType::F32 => crate::kernels::GgmlDType::F32,
             GgmlDType::BF16 => crate::kernels::GgmlDType::BF16,
+            GgmlDType::IQ2XXS => crate::kernels::GgmlDType::IQ2XXS,
+            GgmlDType::IQ2XS => crate::kernels::GgmlDType::IQ2XS,
+            GgmlDType::IQ2S => crate::kernels::GgmlDType::IQ2S,
+            GgmlDType::IQ3XXS => crate::kernels::GgmlDType::IQ3XXS,
+            GgmlDType::IQ3S => crate::kernels::GgmlDType::IQ3S,
+            GgmlDType::IQ4NL => crate::kernels::GgmlDType::IQ4NL,
+            GgmlDType::IQ4XS => crate::kernels::GgmlDType::IQ4XS,
+            GgmlDType::Q2_0 => crate::kernels::GgmlDType::Q2_0,
         }
     }
 }

@@ -2337,7 +2337,20 @@ impl MetalDevice {
             .device
             .new_buffer(size, RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
-        self.residency_set.insert(&new_buffer);
+        // `add`, not `insert`: the deferred-commit batching the private pool's
+        // miss already uses (§6.3b). Stage the allocation (one `addAllocation`)
+        // and let the next command-buffer cut commit the residency set once via
+        // `commit_pending`, rather than one `commit` per missed buffer. This is
+        // the Shared pool (`self.buffers`) that serves the KV reserve
+        // (`KvSlot::append` -> `Tensor::zeros` -> here); the earlier
+        // residency-batching fix converted only the private pool and left this
+        // path committing per miss, so a cold-pool prefill still paid a residency
+        // commit for every Shared miss (§6.3b prices each commit at ~0.087 ms and
+        // a cold prefill misses on the order of a hundred buffers).
+        // `commit_pending` (`Commands::commit_swap_locked`) publishes the staged
+        // buffers before any dispatch that binds them executes (§3.7), so the
+        // residency invariant holds and the result is byte-identical.
+        self.residency_set.add(&new_buffer);
         Ok(self.buffers.adopt_requesting(new_buffer, requested, size))
     }
 

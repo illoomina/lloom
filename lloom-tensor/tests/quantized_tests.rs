@@ -1513,3 +1513,120 @@ test_device!(
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_cuda,
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_metal
 );
+
+/// Issue #750: the `(f16, f32, f16)` quantized matmul-vec arm reads f16
+/// activations, accumulates in f32 (§8.1.4) and stores f16 — a quantized weight
+/// no longer forces f32 activations. This is the copy-free path (no eager
+/// dequant-to-buffer, §3.3a): the packed quant weight is read in place.
+///
+/// The arm is gated by parity against the byte-identical `(f32, f32, f32)` arm,
+/// within the accumulate model's bound: the two arms compute the SAME products in
+/// the SAME order on the SAME f32 accumulator; they differ only in that the f16
+/// arm reads the activation at f16 and rounds the store to f16 (`NumericClass::
+/// Rounding`), so the disagreement is f16-store-scale, not reduction-scale.
+///
+/// Uses the `m == 1` decode shape, which is the path that routes through
+/// `fwd_mv` and so through the genericized `mul_vec_q_n`/`kernel_mul_mv_qK` cores.
+#[cfg(feature = "metal")]
+fn f16_arm_matches_f32_arm(dtype: GgmlDType) -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let (m, k, n) = (1usize, 256usize, 128usize);
+
+    let lhs_data = (0..(m * k))
+        .map(|v| (v as f32 / (m * k) as f32) - 0.5)
+        .collect::<Vec<_>>();
+    let rhs_data = (0..(k * n))
+        .map(|v| (v as f32 / (n * k) as f32) - 0.5)
+        .collect::<Vec<_>>();
+
+    // The quantized weight (shared by both arms).
+    let rhs = Tensor::from_slice(&rhs_data, (k, n), &device)?;
+    let qtensor = quantized::QTensor::quantize(&rhs.t()?, dtype)?;
+    let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
+
+    // f32 activation -> (f32,f32,f32) arm (byte-identical to pre-#750).
+    let lhs_f32 = Tensor::from_slice(&lhs_data, (m, k), &device)?;
+    let res_f32 = matmul.forward(&lhs_f32)?;
+    assert_eq!(res_f32.dtype(), DType::F32, "f32 activation -> f32 store");
+
+    // Absolute reference (CONTRIBUTING §3.1b: assert against a reference, not just
+    // the sibling arm — a symmetric corruption of the shared GEMV core would leave
+    // the two arms agreeing with each other while both drift from the true
+    // product). The `m == 1` GEMV core must agree with a full-precision matmul
+    // within the quant error, so a store-scaling mutation turns this red where the
+    // arm-vs-arm comparison alone stays green.
+    let full = lhs_f32.matmul(&rhs)?;
+    let rel_ref = ((&full - &res_f32)?.abs()? / (full.abs()? + 1e-4)?)?
+        .mean_all()?
+        .to_scalar::<f32>()?;
+    assert!(
+        rel_ref <= 0.05,
+        "f32 GEMV arm diverges from full-precision reference for {dtype:?}: \
+         mean rel error {rel_ref} > 0.05 (the quant error bound)"
+    );
+
+    // f16 activation -> (f16,f32,f16) arm (the new copy-free arm).
+    let lhs_f16 = lhs_f32.to_dtype(DType::F16)?;
+    let res_f16 = matmul.forward(&lhs_f16)?;
+    assert_eq!(
+        res_f16.dtype(),
+        DType::F16,
+        "f16 activation -> f16 store (issue #750 arm)"
+    );
+
+    // Parity within the accumulate model's bound. Compared at f32; the only
+    // divergence is the f16 read of the activation and the f16 store rounding, so
+    // a relative error at f16-store scale is expected and a reduction-scale error
+    // would mean the accumulator changed width (it must not).
+    let a = res_f32.to_dtype(DType::F32)?;
+    let b = res_f16.to_dtype(DType::F32)?;
+    let rel = ((&a - &b)?.abs()? / (a.abs()? + 1e-4)?)?
+        .mean_all()?
+        .to_scalar::<f32>()?;
+    assert!(
+        rel <= 0.01,
+        "f16 arm diverges from f32 arm for {dtype:?}: mean rel error {rel} > 0.01\n\
+         f32:\n{a}\nf16:\n{b}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn quant_f16_arm_matches_f32_arm_q4_0() -> Result<()> {
+    f16_arm_matches_f32_arm(GgmlDType::Q4_0)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn quant_f16_arm_matches_f32_arm_q8_0() -> Result<()> {
+    f16_arm_matches_f32_arm(GgmlDType::Q8_0)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn quant_f16_arm_matches_f32_arm_q4k() -> Result<()> {
+    f16_arm_matches_f32_arm(GgmlDType::Q4K)
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn quant_f16_arm_matches_f32_arm_q6k() -> Result<()> {
+    f16_arm_matches_f32_arm(GgmlDType::Q6K)
+}
+
+/// Issue #750: the M5 native-integer arm `(i8, i32, i8)` is a DECLARED triple —
+/// the optimizer models it as `NumericClass::BitExact` and it is one instantiation
+/// of the generic core, not a fork — but its Metal kernel body is UNIMPLEMENTED
+/// (no M5 hardware here to gate or measure; at B=1 decode never dispatches
+/// `simdgroup_matrix`, §13.5a, so it is a prefill/B>1 lever). The dispatch layer
+/// gates on `is_implemented()` and refuses it rather than resolving a missing
+/// kernel; the float arms are implemented.
+#[cfg(feature = "metal")]
+#[test]
+fn m5_native_int_arm_is_declared_but_unimplemented() {
+    use lloom_tensor::kernels::GemvTriple;
+    assert!(!GemvTriple::I8I32I8.is_implemented(), "M5 int arm is declared but unimplemented");
+    assert!(GemvTriple::F32F32F32.is_implemented());
+    assert!(GemvTriple::F16F32F16.is_implemented());
+}

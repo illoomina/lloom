@@ -68,7 +68,8 @@ pub use params::{
     UpsampleNearest2dParams,
 };
 pub use quantized::{
-    call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,
+    call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GemvFloat,
+    GemvTriple, GgmlDType,
 };
 pub use random::*;
 pub use reduce::*;

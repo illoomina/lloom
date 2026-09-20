@@ -109,8 +109,139 @@ pub enum Accum {
     F32,
     /// The tensor's own dtype (`T`): at f16 the accumulator is f16.
     Store,
+    /// An integer accumulator (issue #750, the M5 native-int arm): the reduction
+    /// sums integer products into an integer register (`int32`), where addition
+    /// is associative and exact, so any summation order gives the same result.
+    /// This is [`NumericClass::BitExact`] by construction — the class this enum's
+    /// F32/Store arms cannot reach because float addition is not associative.
+    Int,
     /// No reduction — an elementwise kernel.
     None,
+}
+
+/// A dtype leg of a block's `(activation, accumulate, store)` triple (issue #750,
+/// `DESIGN.md` §8.1.4). The triple is the type-level declaration a matmul/reduction
+/// block makes; [`TargetFpModel`] carries it so a rewrite over the block is
+/// modelled under the dtypes it actually runs, and a lossy triple is refused where
+/// the block declares full precision mandatory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Leg {
+    /// 32-bit float.
+    F32,
+    /// 16-bit float (IEEE half).
+    F16,
+    /// bfloat16.
+    BF16,
+    /// A signed 8-bit integer operand (an activation or store leg on the M5 arm).
+    I8,
+    /// A signed 32-bit integer accumulator (the M5 arm's accumulate leg).
+    I32,
+}
+
+impl Leg {
+    /// Whether this leg is an integer type. An all-integer accumulate is exact
+    /// and associative ([`Accum::Int`]); a float accumulate is neither.
+    pub fn is_int(self) -> bool {
+        matches!(self, Leg::I8 | Leg::I32)
+    }
+
+    /// The CLI/model spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            Leg::F32 => "f32",
+            Leg::F16 => "f16",
+            Leg::BF16 => "bf16",
+            Leg::I8 => "i8",
+            Leg::I32 => "i32",
+        }
+    }
+}
+
+/// The `(activation, accumulate, store)` dtype triple a block declares (issue
+/// #750). The accumulate leg is the one that decides the numeric class: an F32
+/// accumulate is the §8.1.4 default (float, non-associative, [`NumericClass::
+/// Rounding`] against a store-typed epilogue), an integer accumulate is exact
+/// ([`NumericClass::BitExact`]), and a store-typed float accumulate is the
+/// reduction-length-growing [`NumericClass::ReorderEquiv`] the fused arms avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DtypeTriple {
+    pub act: Leg,
+    pub acc: Leg,
+    pub store: Leg,
+}
+
+impl DtypeTriple {
+    /// The reference `(f16, f32, f16)` triple LFM2's dense blocks and the #750
+    /// quantized f16 arm run under.
+    pub const F16_F32_F16: DtypeTriple = DtypeTriple {
+        act: Leg::F16,
+        acc: Leg::F32,
+        store: Leg::F16,
+    };
+    /// The `(f32, f32, f32)` triple — the historical quantized lock.
+    pub const F32_F32_F32: DtypeTriple = DtypeTriple {
+        act: Leg::F32,
+        acc: Leg::F32,
+        store: Leg::F32,
+    };
+    /// The M5 native-int `(i8, i32, i8)` triple. Registered as declared-but-
+    /// unimplemented (issue #750, out of scope: no M5 hardware); its numeric
+    /// class is [`NumericClass::BitExact`] because the accumulate is integer.
+    pub const I8_I32_I8: DtypeTriple = DtypeTriple {
+        act: Leg::I8,
+        acc: Leg::I32,
+        store: Leg::I8,
+    };
+
+    /// The [`Accum`] leg this triple's accumulate maps to. An integer accumulate
+    /// is [`Accum::Int`]; an f32 accumulate is [`Accum::F32`] (the §8.1.4 default,
+    /// whatever the store); a *narrower-than-f32* float accumulate (acc at the
+    /// store width, and that width below f32) is [`Accum::Store`] — the
+    /// reduction-length-growing arm the fused paths avoid.
+    pub fn accum(self) -> Accum {
+        if self.acc.is_int() {
+            Accum::Int
+        } else if self.acc == Leg::F32 {
+            Accum::F32
+        } else {
+            // A float accumulate narrower than f32 (e.g. an f16 accumulator):
+            // accumulates at the store width, the `ReorderEquiv` arm.
+            Accum::Store
+        }
+    }
+
+    /// The numeric class of a matmul/reduction under this triple, relative to a
+    /// full-precision reference. An integer accumulate is bit-exact; an f32
+    /// accumulate stored at a narrower float is [`NumericClass::Rounding`] (the
+    /// store rounds, the accumulator does not, and the bound does not grow with
+    /// the reduction length); an accumulate at the store width is
+    /// [`NumericClass::ReorderEquiv`] (the bound grows with `K`).
+    pub fn numeric_class(self) -> NumericClass {
+        match self.accum() {
+            Accum::Int => NumericClass::BitExact,
+            Accum::F32 => {
+                if self.store == Leg::F32 {
+                    // Full-width throughout: same products, same roundings.
+                    NumericClass::BitExact
+                } else {
+                    // Narrower float store on an f32 accumulator.
+                    NumericClass::Rounding
+                }
+            }
+            Accum::Store => NumericClass::ReorderEquiv,
+            Accum::None => NumericClass::BitExact,
+        }
+    }
+
+    /// Whether a block that declares full-precision-mandatory (`acc:f32`
+    /// throughout, and never a narrower store that would round — issue #750's GDN
+    /// `S`, the QSA indexer score, the N-gram hash) may run under this triple.
+    /// Such a path refuses any triple whose numeric class is lossier than
+    /// [`NumericClass::BitExact`]: a rounding or reorder-equiv arm is exactly what
+    /// it declares it must not take, and an integer arm is a different computation.
+    pub fn is_full_precision(self) -> bool {
+        self.acc == Leg::F32 && self.store == Leg::F32 && !self.act.is_int()
+    }
 }
 
 /// The shape of a kernel's reduction.
@@ -228,8 +359,11 @@ impl TargetFpModel {
                     accum = Some(match v {
                         "f32" => Accum::F32,
                         "store" => Accum::Store,
+                        "int" => Accum::Int,
                         "none" => Accum::None,
-                        other => return Err(format!("acc must be f32|store|none, got `{other}`")),
+                        other => {
+                            return Err(format!("acc must be f32|store|int|none, got `{other}`"))
+                        }
                     })
                 }
                 "tree" => {
@@ -286,6 +420,7 @@ impl fmt::Display for TargetFpModel {
             match self.accum {
                 Accum::F32 => "f32",
                 Accum::Store => "store",
+                Accum::Int => "int",
                 Accum::None => "none",
             },
             match self.tree {
@@ -504,6 +639,56 @@ mod tests {
             m.to_string(),
             "fma=contract,acc=f32,tree=simd,denorm32=flush,denorm16=preserve"
         );
+    }
+
+    /// Issue #750: the `(activation, accumulate, store)` triple is modelable —
+    /// every declared triple maps to a numeric class — and an fp-mandatory path
+    /// refuses a lossy triple.
+    #[test]
+    fn a_dtype_triple_is_modelable_and_an_fp_mandatory_path_refuses_a_lossy_one() {
+        // The reference f16 arm: f32 accumulate, f16 store -> Rounding (the store
+        // rounds, the accumulator does not; the bound does not grow with K).
+        let f16 = DtypeTriple::F16_F32_F16;
+        assert_eq!(f16.accum(), Accum::F32);
+        assert_eq!(f16.numeric_class(), NumericClass::Rounding);
+
+        // The historical lock: full float width throughout -> BitExact.
+        let f32 = DtypeTriple::F32_F32_F32;
+        assert_eq!(f32.accum(), Accum::F32);
+        assert_eq!(f32.numeric_class(), NumericClass::BitExact);
+
+        // The M5 native-int arm: integer accumulate is exact and associative ->
+        // BitExact, the class no float accumulate can reach (issue #750).
+        let int = DtypeTriple::I8_I32_I8;
+        assert_eq!(int.accum(), Accum::Int);
+        assert_eq!(int.numeric_class(), NumericClass::BitExact);
+        assert_eq!(int.acc.name(), "i32");
+
+        // A triple-declared fusion is modelable within a budget iff its class is
+        // within that budget — the same `within` the rewrite admission uses.
+        assert!(f16.numeric_class().within(NumericClass::Rounding));
+        assert!(!f16.numeric_class().within(NumericClass::BitExact));
+        assert!(int.numeric_class().within(NumericClass::BitExact));
+
+        // An fp-mandatory path (GDN `S`, QSA indexer score, N-gram hash: acc:f32
+        // throughout) refuses any lossy triple. Only the full-precision float
+        // triple is accepted; the f16-store arm rounds and the int arm is a
+        // different computation, so both are refused.
+        assert!(f32.is_full_precision());
+        assert!(!f16.is_full_precision(), "f16 store rounds -> refused");
+        assert!(!int.is_full_precision(), "int is a different computation");
+
+        // The `Accum::Int` leg round-trips through the model spelling, so a
+        // recorded integer-accumulate model parses back to itself.
+        let m = TargetFpModel {
+            fma: FmaContraction::Contract,
+            accum: Accum::Int,
+            tree: ReductionTree::Simd,
+            denormals_f32: Denormals::Flush,
+            denormals_f16: Denormals::Preserve,
+        };
+        assert_eq!(TargetFpModel::parse(&m.to_string()), Ok(m));
+        assert!(m.to_string().contains("acc=int"));
     }
 
     #[test]

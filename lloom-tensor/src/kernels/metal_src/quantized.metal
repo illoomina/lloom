@@ -2309,11 +2309,17 @@ inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thre
 //      quantizations where the block size is 32. It also does not
 //      guard against the number of rows not being divisible by
 //      N_DST, so this is another explicit assumption of the implementation.
-template<typename block_q_type, int nr, int nsg, int nw>
-void mul_vec_q_n_f32_impl(
+// The dtype triple `(ACT, ACC, STORE)` (issue #750, `DESIGN.md` §8.1.4): the
+// activation `src1` is read as `ACT`, accumulate in `ACC = float` (§8.1.4 —
+// accumulate in F32, store in the working dtype), result written as `STORE`. The
+// `(float, float, float)` instantiation is byte-identical to the pre-#750
+// `mul_vec_q_n_f32_impl`; only the load cast on `src1` and the store cast on `dst`
+// are typed, the accumulator stays `float`.
+template<typename block_q_type, int nr, int nsg, int nw, typename ACT = float, typename STORE = float>
+void mul_vec_q_n_impl(
         device const void  * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT   * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -2339,7 +2345,7 @@ void mul_vec_q_n_f32_impl(
     const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_q_type * x = (device const block_q_type *) src0 + offset0;
-    device const float        * y = (device const float        *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT          * y = (device const ACT          *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[16]; // src1 vector cache
     float sumf[nr] = {0.f};
@@ -2347,7 +2353,7 @@ void mul_vec_q_n_f32_impl(
     const int ix = (tiisg/2);
     const int il = (tiisg%2)*8;
 
-    device const float * yb = y + ix * QK4_0 + il;
+    device const ACT * yb = y + ix * QK4_0 + il;
 
     // each thread in a SIMD group deals with half a block.
     for (int ib = ix; ib < nb; ib += nw/2) {
@@ -2372,9 +2378,31 @@ void mul_vec_q_n_f32_impl(
     for (int row = 0; row < nr; ++row) {
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < ne01) {
-            dst[im*ne0*ne1 + r1*ne0 + first_row + row] = tot;
+            dst[im*ne0*ne1 + r1*ne0 + first_row + row] = (STORE)(tot);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized mul_vec_q_n_impl (issue #750).
+template<typename block_q_type, int nr, int nsg, int nw>
+void mul_vec_q_n_f32_impl(
+        device const void  * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3 tgpig, uint tiisg, uint sgitg) {
+    mul_vec_q_n_impl<block_q_type, nr, nsg, nw, float, float>(
+        src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3,
+        shared_values, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_mul_mv_q4_0_f32(
@@ -2484,10 +2512,11 @@ kernel void kernel_mul_mv_q5_1_f32(
 
 #define NB_Q8_0 8
 
-void kernel_mul_mv_q8_0_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_q8_0_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -2518,7 +2547,7 @@ void kernel_mul_mv_q8_0_f32_impl(
     const uint offset0 = first_row * nb + (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_q8_0 * x = (device const block_q8_0 *) src0 + offset0;
-    device const float      * y = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT      * y = (device const ACT      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[NB_Q8_0];
     float sumf[nr]={0.f};
@@ -2526,7 +2555,7 @@ void kernel_mul_mv_q8_0_f32_impl(
     const int ix = tiisg/4;
     const int il = tiisg%4;
 
-    device const float * yb = y + ix * QK8_0 + NB_Q8_0*il;
+    device const ACT * yb = y + ix * QK8_0 + NB_Q8_0*il;
 
     // each thread in a SIMD group deals with NB_Q8_0 quants at a time
     for (int ib = ix; ib < nb; ib += nw/4) {
@@ -2549,9 +2578,30 @@ void kernel_mul_mv_q8_0_f32_impl(
     for (int row = 0; row < nr; ++row) {
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < ne01) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = tot;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(tot);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_q8_0_impl (issue #750).
+void kernel_mul_mv_q8_0_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q8_0_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q8_0_f32")]]
@@ -4570,10 +4620,11 @@ kernel void kernel_concat(
     }
 }
 
-void kernel_mul_mv_q2_K_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_q2_K_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -4602,7 +4653,7 @@ void kernel_mul_mv_q2_K_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_q2_K * x = (device const block_q2_K *) src0 + ib_row + offset0;
-    device const float      * y = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT      * y = (device const ACT      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
     float sumf[N_DST]={0.f}, all_sum;
@@ -4615,7 +4666,7 @@ void kernel_mul_mv_q2_K_f32_impl(
     const int ir = it%4;     // 0...3
     const int is = (8*ir)/16;// 0 or 1
 
-    device const float * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
+    device const ACT * y4 = y + ix * QK_K + 128 * iq + 8 * ir;
 
     for (int ib = ix; ib < nb; ib += 4) {
 
@@ -4664,9 +4715,30 @@ void kernel_mul_mv_q2_K_f32_impl(
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_q2_K_impl (issue #750).
+void kernel_mul_mv_q2_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q2_K_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q2_K_f32")]]
@@ -4697,10 +4769,11 @@ kernel void kernel_mul_mv_q2_K_f32(
     kernel_mul_mv_q2_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q3_K_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_q3_K_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -4729,7 +4802,7 @@ void kernel_mul_mv_q3_K_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_q3_K * x = (device const block_q3_K *) src0 + first_row*nb + offset0;
-    device const float     * yy = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT     * yy = (device const ACT      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
 
@@ -4771,7 +4844,7 @@ void kernel_mul_mv_q3_K_f32_impl(
 
     const int step = sizeof(block_q3_K) * nb / 2;
 
-    device const float * y1 = yy + ix*QK_K + y_offset;
+    device const ACT * y1 = yy + ix*QK_K + y_offset;
 
     uint32_t scales32, aux32;
     thread uint16_t * scales16 = (thread uint16_t *)&scales32;
@@ -4851,9 +4924,30 @@ void kernel_mul_mv_q3_K_f32_impl(
     }
     if (tiisg == 0) {
         for (int row = 0; row < 2; ++row) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = sumf1[row];
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(sumf1[row]);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_q3_K_impl (issue #750).
+void kernel_mul_mv_q3_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q3_K_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q3_K_f32")]]
@@ -4884,10 +4978,11 @@ kernel void kernel_mul_mv_q3_K_f32(
     kernel_mul_mv_q3_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q4_K_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_q4_K_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -4925,7 +5020,7 @@ void kernel_mul_mv_q4_K_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_q4_K * x = (device const block_q4_K *) src0 + ib_row + offset0;
-    device const float      * y = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT      * y = (device const ACT      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[16];
     float yh[16];
@@ -4933,7 +5028,7 @@ void kernel_mul_mv_q4_K_f32_impl(
 
     const int step = sizeof(block_q4_K) * nb / 2;
 
-    device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
+    device const ACT * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
@@ -4993,9 +5088,30 @@ void kernel_mul_mv_q4_K_f32_impl(
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_q4_K_impl (issue #750).
+void kernel_mul_mv_q4_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q4_K_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q4_K_f32")]]
@@ -5026,10 +5142,11 @@ kernel void kernel_mul_mv_q4_K_f32(
     kernel_mul_mv_q4_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q5_K_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_q5_K_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5058,7 +5175,7 @@ void kernel_mul_mv_q5_K_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_q5_K * x = (device const block_q5_K *) src0 + first_row*nb + offset0;
-    device const float     * yy = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT     * yy = (device const ACT      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float sumf[2]={0.f};
 
@@ -5088,7 +5205,7 @@ void kernel_mul_mv_q5_K_f32_impl(
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
-    device const float * y1 = yy + ix*QK_K + y_offset;
+    device const ACT * y1 = yy + ix*QK_K + y_offset;
 
     for (int i = ix; i < nb; i += 4) {
 
@@ -5097,7 +5214,7 @@ void kernel_mul_mv_q5_K_f32_impl(
         device const half * dh = &x[i].d;
         device const uint16_t * a = (device const uint16_t *)x[i].scales + iq;
 
-        device const float * y2 = y1 + 128;
+        device const ACT * y2 = y1 + 128;
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
         for (int l = 0; l < 8; ++l) {
             yl[l+0] = y1[l+ 0]; sumy[0] += yl[l+0];
@@ -5150,9 +5267,30 @@ void kernel_mul_mv_q5_K_f32_impl(
     for (int row = 0; row < 2; ++row) {
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = tot;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(tot);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_q5_K_impl (issue #750).
+void kernel_mul_mv_q5_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q5_K_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q5_K_f32")]]
@@ -5183,10 +5321,11 @@ kernel void kernel_mul_mv_q5_K_f32(
     kernel_mul_mv_q5_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_q6_K_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_q6_K_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5220,7 +5359,7 @@ void kernel_mul_mv_q6_K_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_q6_K * x = (device const block_q6_K *) src0 + row * nb + offset0;
-    device const float     * yy = (device const float      *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT     * yy = (device const ACT      *) src1 + r1*ne10 + im*ne00*ne1;
 
     float sumf = 0;
 
@@ -5243,7 +5382,7 @@ void kernel_mul_mv_q6_K_f32_impl(
         device const uint8_t * qh = x[i].qh + q_offset_h;
         device const int8_t  * sc = x[i].scales + is;
 
-        device const float * y = yy + i * QK_K + y_offset;
+        device const ACT * y = yy + i * QK_K + y_offset;
 
         const float dall = x[i].d;
 
@@ -5261,8 +5400,29 @@ void kernel_mul_mv_q6_K_f32_impl(
 
     const float tot = simd_sum(sumf);
     if (tiisg == 0) {
-        dst[r1*ne0 + im*ne0*ne1 + row] = tot;
+        dst[r1*ne0 + im*ne0*ne1 + row] = (STORE)(tot);
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_q6_K_impl (issue #750).
+void kernel_mul_mv_q6_K_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_q6_K_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q6_K_f32")]]
@@ -5295,10 +5455,11 @@ kernel void kernel_mul_mv_q6_K_f32(
 
 // ======================= "True" 2-bit
 
-void kernel_mul_mv_iq2_xxs_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq2_xxs_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5327,7 +5488,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_iq2_xxs * x = (device const block_iq2_xxs *) src0 + ib_row + offset0;
-    device const float         * y = (device const float         *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT         * y = (device const ACT         *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
     float sumf[N_DST]={0.f}, all_sum;
@@ -5348,7 +5509,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
 
     const int ix = tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    device const ACT * y4 = y + 32 * ix;
 
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
 
@@ -5390,9 +5551,30 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.25f;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum * 0.25f);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq2_xxs_impl (issue #750).
+void kernel_mul_mv_iq2_xxs_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_iq2_xxs_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_iq2_xxs_f32")]]
@@ -5424,10 +5606,11 @@ kernel void kernel_mul_mv_iq2_xxs_f32(
     kernel_mul_mv_iq2_xxs_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_iq2_xs_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq2_xs_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5456,7 +5639,7 @@ void kernel_mul_mv_iq2_xs_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_iq2_xs * x = (device const block_iq2_xs *) src0 + ib_row + offset0;
-    device const float        * y = (device const float        *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT        * y = (device const ACT        *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
     float sumf[N_DST]={0.f}, all_sum;
@@ -5477,7 +5660,7 @@ void kernel_mul_mv_iq2_xs_f32_impl(
 
     const int ix = tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    device const ACT * y4 = y + 32 * ix;
 
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
 
@@ -5529,9 +5712,30 @@ void kernel_mul_mv_iq2_xs_f32_impl(
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.25f;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum * 0.25f);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq2_xs_impl (issue #750).
+void kernel_mul_mv_iq2_xs_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_iq2_xs_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_iq2_xs_f32")]]
@@ -5563,10 +5767,11 @@ kernel void kernel_mul_mv_iq2_xs_f32(
     kernel_mul_mv_iq2_xs_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_iq3_xxs_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq3_xxs_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5595,7 +5800,7 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_iq3_xxs * x = (device const block_iq3_xxs *) src0 + ib_row + offset0;
-    device const float         * y = (device const float         *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT         * y = (device const ACT         *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
     float sumf[N_DST]={0.f}, all_sum;
@@ -5616,7 +5821,7 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
 
     const int ix = tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    device const ACT * y4 = y + 32 * ix;
 
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
 
@@ -5661,9 +5866,30 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.5f;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum * 0.5f);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq3_xxs_impl (issue #750).
+void kernel_mul_mv_iq3_xxs_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_iq3_xxs_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_iq3_xxs_f32")]]
@@ -5695,10 +5921,11 @@ kernel void kernel_mul_mv_iq3_xxs_f32(
     kernel_mul_mv_iq3_xxs_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_iq3_s_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq3_s_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5727,7 +5954,7 @@ void kernel_mul_mv_iq3_s_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_iq3_s * x = (device const block_iq3_s *) src0 + ib_row + offset0;
-    device const float       * y = (device const float       *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT       * y = (device const ACT       *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
     float sumf[N_DST]={0.f}, all_sum;
@@ -5744,7 +5971,7 @@ void kernel_mul_mv_iq3_s_f32_impl(
 
     const int ix = tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    device const ACT * y4 = y + 32 * ix;
 
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
 
@@ -5793,9 +6020,30 @@ void kernel_mul_mv_iq3_s_f32_impl(
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq3_s_impl (issue #750).
+void kernel_mul_mv_iq3_s_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_iq3_s_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_iq3_s_f32")]]
@@ -5827,10 +6075,11 @@ kernel void kernel_mul_mv_iq3_s_f32(
     kernel_mul_mv_iq3_s_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_iq2_s_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq2_s_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5859,7 +6108,7 @@ void kernel_mul_mv_iq2_s_f32_impl(
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
     device const block_iq2_s * x = (device const block_iq2_s *) src0 + ib_row + offset0;
-    device const float       * y = (device const float       *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT       * y = (device const ACT       *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
     float sumf[N_DST]={0.f}, all_sum;
@@ -5876,7 +6125,7 @@ void kernel_mul_mv_iq2_s_f32_impl(
 
     const int ix = tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    device const ACT * y4 = y + 32 * ix;
 
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
 
@@ -5926,9 +6175,30 @@ void kernel_mul_mv_iq2_s_f32_impl(
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum * 0.25f;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum * 0.25f);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq2_s_impl (issue #750).
+void kernel_mul_mv_iq2_s_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_iq2_s_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_iq2_s_f32")]]
@@ -5960,10 +6230,11 @@ kernel void kernel_mul_mv_iq2_s_f32(
     kernel_mul_mv_iq2_s_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
-void kernel_mul_mv_iq1_s_f32_impl(
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq1_s_impl(
         device const  void * src0,
-        device const float * src1,
-        device       float * dst,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -5991,7 +6262,7 @@ void kernel_mul_mv_iq1_s_f32_impl(
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
     device const block_iq1_s * x = (device const block_iq1_s *) src0 + ib_row + offset0;
-    device const float       * y = (device const float       *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT       * y = (device const ACT       *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
     float sumf[N_DST]={0.f}, all_sum;
@@ -6000,7 +6271,7 @@ void kernel_mul_mv_iq1_s_f32_impl(
 
     const int ix = tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    device const ACT * y4 = y + 32 * ix;
 
     for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
 
@@ -6045,15 +6316,37 @@ void kernel_mul_mv_iq1_s_f32_impl(
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
 }
 
-void kernel_mul_mv_iq1_m_f32_impl(
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq1_s_impl (issue #750).
+void kernel_mul_mv_iq1_s_f32_impl(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_iq1_s_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq1_m_impl(
+        device const  void * src0,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -6081,7 +6374,7 @@ void kernel_mul_mv_iq1_m_f32_impl(
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
     device const block_iq1_m * x = (device const block_iq1_m *) src0 + ib_row + offset0;
-    device const float       * y = (device const float       *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT       * y = (device const ACT       *) src1 + r1*ne10 + im*ne00*ne1;
 
     float yl[32];
     float sumf[N_DST]={0.f}, all_sum;
@@ -6090,7 +6383,7 @@ void kernel_mul_mv_iq1_m_f32_impl(
 
     const int ix = tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    device const ACT * y4 = y + 32 * ix;
 
     iq1m_scale_t scale;
 
@@ -6144,15 +6437,37 @@ void kernel_mul_mv_iq1_m_f32_impl(
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
 }
 
-void kernel_mul_mv_iq4_nl_f32_impl(
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq1_m_impl (issue #750).
+void kernel_mul_mv_iq1_m_f32_impl(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_iq1_m_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq4_nl_impl(
+        device const  void * src0,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -6180,7 +6495,7 @@ void kernel_mul_mv_iq4_nl_f32_impl(
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
     device const block_iq4_nl * x = (device const block_iq4_nl *) src0 + ib_row + offset0;
-    device const float        * y = (device const float        *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT        * y = (device const ACT        *) src1 + r1*ne10 + im*ne00*ne1;
 
     const int ix = tiisg/2;  // 0...15
     const int it = tiisg%2;  // 0 or 1
@@ -6191,7 +6506,7 @@ void kernel_mul_mv_iq4_nl_f32_impl(
     float4 yl[4];
     float sumf[2]={0.f}, all_sum;
 
-    device const float * yb = y + ix * QK4_NL + it * 8;
+    device const ACT * yb = y + ix * QK4_NL + it * 8;
 
     uint32_t aux32[2];
     thread const uint8_t * q8 = (thread const uint8_t *)aux32;
@@ -6200,8 +6515,8 @@ void kernel_mul_mv_iq4_nl_f32_impl(
 
     for (int ib = ix; ib < nb; ib += 16) {
 
-        device const float4 * y4 = (device const float4 *)yb;
-        yl[0] = y4[0]; yl[1] = y4[4]; yl[2] = y4[1]; yl[3] = y4[5];
+        device const vec<ACT, 4> * y4 = (device const vec<ACT, 4> *)yb;
+        yl[0] = float4(y4[0]); yl[1] = float4(y4[4]); yl[2] = float4(y4[1]); yl[3] = float4(y4[5]);
 
         for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
 
@@ -6238,15 +6553,37 @@ void kernel_mul_mv_iq4_nl_f32_impl(
     for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
 }
 
-void kernel_mul_mv_iq4_xs_f32_impl(
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq4_nl_impl (issue #750).
+void kernel_mul_mv_iq4_nl_f32_impl(
         device const  void * src0,
         device const float * src1,
         device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_iq4_nl_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+
+template<typename ACT = float, typename STORE = float>
+void kernel_mul_mv_iq4_xs_impl(
+        device const  void * src0,
+        device const ACT * src1,
+        device       STORE * dst,
                    int64_t   ne00,
                    int64_t   ne01,
                    int64_t   ne02,
@@ -6274,7 +6611,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
     device const block_iq4_xs * x = (device const block_iq4_xs *) src0 + ib_row + offset0;
-    device const float        * y = (device const float        *) src1 + r1*ne10 + im*ne00*ne1;
+    device const ACT        * y = (device const ACT        *) src1 + r1*ne10 + im*ne00*ne1;
 
     const int ix = tiisg/16;  // 0 or 1
     const int it = tiisg%16;  // 0...15
@@ -6287,7 +6624,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
     float4 yl[4];
     float sumf[2]={0.f}, all_sum;
 
-    device const float * yb = y + ix * QK_K + ib * 32 + il * 8;
+    device const ACT * yb = y + ix * QK_K + ib * 32 + il * 8;
 
     uint32_t aux32[2];
     thread const uint8_t * q8 = (thread const uint8_t *)aux32;
@@ -6296,8 +6633,8 @@ void kernel_mul_mv_iq4_xs_f32_impl(
 
     for (int ibl = ix; ibl < nb; ibl += 2) {
 
-        device const float4 * y4 = (device const float4 *)yb;
-        yl[0] = y4[0]; yl[1] = y4[4]; yl[2] = y4[1]; yl[3] = y4[5];
+        device const vec<ACT, 4> * y4 = (device const vec<ACT, 4> *)yb;
+        yl[0] = float4(y4[0]); yl[1] = float4(y4[4]); yl[2] = float4(y4[1]); yl[3] = float4(y4[5]);
 
         for (int row = 0; row < 2; ++row) {
 
@@ -6333,9 +6670,30 @@ void kernel_mul_mv_iq4_xs_f32_impl(
     for (int row = 0; row < 2; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
+}
+
+// Byte-identical (float,float,float) alias of the genericized kernel_mul_mv_iq4_xs_impl (issue #750).
+void kernel_mul_mv_iq4_xs_f32_impl(
+        device const  void * src0,
+        device const float * src1,
+        device       float * dst,
+                   int64_t   ne00,
+                   int64_t   ne01,
+                   int64_t   ne02,
+                   int64_t   ne10,
+                   int64_t   ne12,
+                   int64_t   ne0,
+                   int64_t   ne1,
+                   uint      r2,
+                   uint      r3,
+        threadgroup int8_t * shared_values,
+                   uint3     tgpig,
+                   uint      tiisg,
+                   uint      sgitg) {
+    kernel_mul_mv_iq4_xs_impl<float, float>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_iq1_s_f32")]]
@@ -7739,3 +8097,550 @@ kernel void kernel_pool_2d_avg_f32(
 
     o_ptr[cur_oh * OW + cur_ow] = res;
 }
+
+// ---- issue #750: (ACT, ACC=f32, STORE) quant GEMV arm ----
+// Additive f16-activations + f16-store arm for the quantized matmul-vec path. The `_f32`
+// wrappers above are UNTOUCHED (byte-identical); these are a pure addition instantiating the
+// same genericized `_impl` cores at `(half, half)`. A quantized weight no longer forces f32
+// activations/store — it matches the dense `_f16_f16` GEMV arm. The accumulator stays `float`
+// in every core (§8.1.4), so this is `NumericClass::Rounding` vs the f32 arm (store rounding at
+// f16), gated by the quantized-matmul parity test.
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q4_0_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_vec_q_n_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, ACT, STORE>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+template [[host_name("kernel_mul_mv_q4_0_f16_f16")]] kernel decltype(kernel_mul_mv_q4_0_generic<half, half>) kernel_mul_mv_q4_0_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q4_1_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_vec_q_n_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, ACT, STORE>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+template [[host_name("kernel_mul_mv_q4_1_f16_f16")]] kernel decltype(kernel_mul_mv_q4_1_generic<half, half>) kernel_mul_mv_q4_1_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q5_0_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_vec_q_n_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH, ACT, STORE>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+template [[host_name("kernel_mul_mv_q5_0_f16_f16")]] kernel decltype(kernel_mul_mv_q5_0_generic<half, half>) kernel_mul_mv_q5_0_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q5_1_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    mul_vec_q_n_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH, ACT, STORE>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+template [[host_name("kernel_mul_mv_q5_1_f16_f16")]] kernel decltype(kernel_mul_mv_q5_1_generic<half, half>) kernel_mul_mv_q5_1_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q8_0_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_impl<ACT, STORE>(src0,src1,dst,ne00,ne01,ne02,ne10,ne12,ne0,ne1,r2,r3,nullptr,tgpig,tiisg,sgitg);
+}
+template [[host_name("kernel_mul_mv_q8_0_f16_f16")]] kernel decltype(kernel_mul_mv_q8_0_generic<half, half>) kernel_mul_mv_q8_0_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q2_K_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q2_K_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_q2_K_f16_f16")]] kernel decltype(kernel_mul_mv_q2_K_generic<half, half>) kernel_mul_mv_q2_K_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q3_K_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q3_K_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_q3_K_f16_f16")]] kernel decltype(kernel_mul_mv_q3_K_generic<half, half>) kernel_mul_mv_q3_K_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q4_K_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q4_K_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_q4_K_f16_f16")]] kernel decltype(kernel_mul_mv_q4_K_generic<half, half>) kernel_mul_mv_q4_K_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q5_K_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q5_K_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_q5_K_f16_f16")]] kernel decltype(kernel_mul_mv_q5_K_generic<half, half>) kernel_mul_mv_q5_K_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_q6_K_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q6_K_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_q6_K_f16_f16")]] kernel decltype(kernel_mul_mv_q6_K_generic<half, half>) kernel_mul_mv_q6_K_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_iq2_xxs_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        threadgroup int8_t * shared_values [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq2_xxs_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_iq2_xxs_f16_f16")]] kernel decltype(kernel_mul_mv_iq2_xxs_generic<half, half>) kernel_mul_mv_iq2_xxs_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_iq2_xs_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        threadgroup int8_t * shared_values [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq2_xs_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_iq2_xs_f16_f16")]] kernel decltype(kernel_mul_mv_iq2_xs_generic<half, half>) kernel_mul_mv_iq2_xs_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_iq3_xxs_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        threadgroup int8_t * shared_values [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq3_xxs_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_iq3_xxs_f16_f16")]] kernel decltype(kernel_mul_mv_iq3_xxs_generic<half, half>) kernel_mul_mv_iq3_xxs_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_iq3_s_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        threadgroup int8_t * shared_values [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq3_s_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_iq3_s_f16_f16")]] kernel decltype(kernel_mul_mv_iq3_s_generic<half, half>) kernel_mul_mv_iq3_s_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_iq2_s_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        threadgroup int8_t * shared_values [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq2_s_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_iq2_s_f16_f16")]] kernel decltype(kernel_mul_mv_iq2_s_generic<half, half>) kernel_mul_mv_iq2_s_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_iq1_s_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq1_s_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_iq1_s_f16_f16")]] kernel decltype(kernel_mul_mv_iq1_s_generic<half, half>) kernel_mul_mv_iq1_s_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_iq1_m_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq1_m_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_iq1_m_f16_f16")]] kernel decltype(kernel_mul_mv_iq1_m_generic<half, half>) kernel_mul_mv_iq1_m_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_iq4_nl_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        threadgroup int8_t * shared_values [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq4_nl_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_iq4_nl_f16_f16")]] kernel decltype(kernel_mul_mv_iq4_nl_generic<half, half>) kernel_mul_mv_iq4_nl_generic<half, half>;
+
+template<typename ACT, typename STORE>
+kernel void kernel_mul_mv_iq4_xs_generic(
+        device const  void * src0,
+        device const ACT   * src1,
+        device       STORE * dst,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        threadgroup int8_t * shared_values [[threadgroup(0)]],
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint  tiisg[[thread_index_in_simdgroup]],
+        uint  sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq4_xs_impl<ACT, STORE>(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, shared_values, tgpig, tiisg, sgitg);
+}
+template [[host_name("kernel_mul_mv_iq4_xs_f16_f16")]] kernel decltype(kernel_mul_mv_iq4_xs_generic<half, half>) kernel_mul_mv_iq4_xs_generic<half, half>;

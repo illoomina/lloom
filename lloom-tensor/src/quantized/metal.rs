@@ -313,9 +313,36 @@ impl QMetalStorage {
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
         let device = storage.device().clone();
+
+        // Issue #750: the activation dtype chooses the `(activation, accumulate,
+        // store)` triple. An f16 activation reads and stores f16 (accumulating in
+        // f32 — §8.1.4), so a quantized weight no longer forces the activation and
+        // store to f32; anything else keeps the historical `(f32, f32, f32)` arm,
+        // which is byte-identical to the pre-#750 kernel. The store dtype follows
+        // the store leg of the triple, so `dst` is allocated and tagged to match.
+        use crate::kernels::{GemvFloat, GemvTriple};
+        let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
+        let triple = match storage.dtype() {
+            DType::F32 => GemvTriple::F32F32F32,
+            DType::F16 if ggml_dtype.has_gemv_triple() => GemvTriple::F16F32F16,
+            // An f16 activation on a weight whose core has no f16 arm (dense/Q8),
+            // or any other activation dtype, is not a triple this dispatch can
+            // serve. Refuse rather than read the buffer under the wrong dtype
+            // (§8.1.4: the kernel reads `src1` as the triple's activation leg, so
+            // a mismatched buffer is silent corruption, not an error).
+            other => crate::bail!(
+                "quantized matmul-vec has no ({other:?}, f32, _) arm for weight {:?}",
+                self.dtype
+            ),
+        };
+        let store_dtype = match triple.store() {
+            GemvFloat::F16 => DType::F16,
+            GemvFloat::F32 => DType::F32,
+        };
+
         let dst = device
             .new_buffer_builder()
-            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_size_for(dst_shape.elem_count(), store_dtype)
             .with_label("qmatmul")
             .build()?;
         let encoder = device.command_encoder()?;
@@ -326,18 +353,19 @@ impl QMetalStorage {
                 device.device(),
                 &encoder,
                 device.kernels(),
-                self.dtype.into(),
+                ggml_dtype,
+                triple,
                 (1, 1, n, k),
                 storage.buffer(),
                 (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
                 &self.buffer,
-                batch_id * n * DType::F32.size_in_bytes(),
+                batch_id * n * store_dtype.size_in_bytes(),
                 &dst,
             )
             .map_err(MetalError::from)?;
         }
         let dst_storage =
-            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), store_dtype);
         Ok((dst_storage, dst_shape))
     }
 

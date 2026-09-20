@@ -15,9 +15,17 @@
 //!
 //! `B` is a zero-sized marker, so `Typed<B>` is one pointer wide and every
 //! method monomorphizes: no `dyn`, nothing on the per-token path pays for the
-//! view (§3.6). It is designed to share its type axis with #620's
-//! `Param`/`Frozen` — a second type-level axis on the same struct — so those
-//! land as `Param<Typed<B>>`-shaped wrappers without a change here.
+//! view (§3.6). It is designed to share its type axis with two further
+//! type-level axes on the same struct (RESTRUCTURING §6 — "all three are axes on
+//! the one struct"):
+//! - #620's `Param`/`Frozen` (the train/frozen axis), landing as
+//!   `Param<Typed<B>>`-shaped wrappers without a change here; and
+//! - the **dtype axis** (#750): the `(activation, accumulate, store)` triple a
+//!   block declares. Its runtime half — the kernel-dispatch selector — is built
+//!   (`GemvTriple`/`GemvFloat` in `kernels::`, and the numeric model's
+//!   `DtypeTriple` in `lloom::optimizer::numeric`); its type-level half on this
+//!   struct is co-scheduled with the `Param`/`Frozen` axis, so the compile-error-
+//!   on-mismatch composition is `Param<Typed<B, Dtype>>` when both land.
 
 use crate::{Device, Error, Result, Tensor};
 use std::marker::PhantomData;

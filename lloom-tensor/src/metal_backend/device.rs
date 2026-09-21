@@ -2267,6 +2267,27 @@ impl MetalDevice {
         *ON.get_or_init(|| std::env::var_os("LLOOM_UNPOOLED_UPLOADS").is_some())
     }
 
+    /// A Shared buffer of `size` bytes the host writes and the GPU reads once,
+    /// outside every pool: a fresh `newBuffer` registered in the residency set
+    /// and unregistered when the handle drops (the `unpooled_resident` drop).
+    /// The staging tier of a streamed weight load (`QMetalStorage::write_with`)
+    /// takes this rather than `allocate_buffer` because a pooled host upload is
+    /// the one tenant class whose reuse gate is known to leak at long context
+    /// (lloom #748 / PR #754, which records it as `docs/invariants.md` §15.1m) — a recycled Shared buffer
+    /// written by the host while a still-running command buffer reads it.
+    pub fn new_unpooled_shared(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+        let buffer = self
+            .device
+            .new_buffer(size.max(1), RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&buffer);
+        Ok(Arc::new(PooledBuffer::unpooled_resident(
+            buffer,
+            size,
+            Arc::clone(&self.residency_set),
+        )))
+    }
+
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<PooledBuffer>> {
         let unpooled_uploads = Self::unpooled;
         let size = core::mem::size_of_val(data);

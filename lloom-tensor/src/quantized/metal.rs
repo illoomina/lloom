@@ -588,13 +588,20 @@ impl QMetalStorage {
     }
 
     /// Overwrite `len` bytes at `offset` with what `fill` writes: the bytes go
-    /// into a pooled Shared staging buffer on the host and are copied into
-    /// this storage by a `copy2d` dispatch on the current compute encoder —
+    /// into a Shared staging buffer on the host and are copied into this
+    /// storage by a `copy2d` dispatch on the current compute encoder —
     /// deliberately NOT a blit, so the write sits in the encoder's hazard
     /// chain and is ordered after every earlier dispatch that read the
     /// destination (a blit encoder waits only on the destination's last
-    /// writer). The staging buffer returns to its pool when its epoch
-    /// completes, so it is never handed out while the copy is in flight.
+    /// writer).
+    ///
+    /// The staging buffer is unpooled (`MetalDevice::new_unpooled_shared`, one
+    /// allocation per call, freed when the copy's handle drops): a pooled
+    /// Shared buffer written by the host is the one tenant class whose reuse
+    /// gate is known to leak at long context (lloom #748, `docs/invariants.md`
+    /// §15.1m), and a leaked staging buffer would land a stale plane. The
+    /// pooled path stays behind `LLOOM_STREAM_POOLED_STAGING` (read once) as
+    /// the A/B instrument for whoever fixes the gate; never the default.
     pub fn write_with(
         &self,
         offset: usize,
@@ -611,7 +618,11 @@ impl QMetalStorage {
         if len == 0 {
             return Ok(());
         }
-        let staging = self.device.allocate_buffer(len)?;
+        let staging = if pooled_staging() {
+            self.device.allocate_buffer(len)?
+        } else {
+            self.device.new_unpooled_shared(len)?
+        };
         let ptr = std::hint::black_box(staging.contents());
         if ptr.is_null() {
             crate::bail!("write_with: the staging buffer has no CPU mapping (len={len})")
@@ -662,6 +673,14 @@ impl QMetalStorage {
         self.device.flush_and_wait_current()?;
         Ok(read_to_vec::<u8>(&buffer, self.storage_size_in_bytes()))
     }
+}
+
+/// `LLOOM_STREAM_POOLED_STAGING` (read once): stage streamed weight loads
+/// through the Shared buffer pool instead of an unpooled buffer per load. An
+/// A/B instrument for the pool's host-upload reuse gate (lloom #748); off.
+fn pooled_staging() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LLOOM_STREAM_POOLED_STAGING").is_some())
 }
 
 pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(

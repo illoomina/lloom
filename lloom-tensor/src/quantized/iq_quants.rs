@@ -333,8 +333,7 @@ pub struct BlockIQ3s {
     pub signs: [u8; QK_K / 8],
     pub scales: [u8; IQ3S_N_SCALE],
 }
-const _: () =
-    assert!(std::mem::size_of::<BlockIQ3s>() == 2 + 13 * (QK_K / 32) + IQ3S_N_SCALE);
+const _: () = assert!(std::mem::size_of::<BlockIQ3s>() == 2 + 13 * (QK_K / 32) + IQ3S_N_SCALE);
 
 impl GgmlType for BlockIQ3s {
     const DTYPE: GgmlDType = GgmlDType::IQ3S;
@@ -453,8 +452,7 @@ pub struct BlockIQ4xs {
     pub scales_l: [u8; QK_K / 64],
     pub qs: [u8; QK_K / 2],
 }
-const _: () =
-    assert!(std::mem::size_of::<BlockIQ4xs>() == 2 + 2 + QK_K / 64 + QK_K / 2);
+const _: () = assert!(std::mem::size_of::<BlockIQ4xs>() == 2 + 2 + QK_K / 64 + QK_K / 2);
 
 impl GgmlType for BlockIQ4xs {
     const DTYPE: GgmlDType = GgmlDType::IQ4XS;

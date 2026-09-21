@@ -92,7 +92,7 @@ impl lloom_engine::MakeDriver<Model> for Speculators {
                     Model,
                     DSparkSpeculator,
                     Session<'m, Model>,
-                >::new(spec, opts.clone(), &self.eos_ids, device.clone())?;
+                >::new(spec, opts.clone(), device.clone())?;
                 Ok(Some(Box::new(dec)))
             }
             None => Ok(None),

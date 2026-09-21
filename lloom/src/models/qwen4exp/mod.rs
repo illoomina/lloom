@@ -11,6 +11,7 @@ pub mod config;
 pub mod deltanet;
 pub mod deltanet_block;
 pub mod hc;
+pub mod loader;
 pub mod model;
 pub mod moe;
 pub mod qsa;

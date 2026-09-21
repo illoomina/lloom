@@ -59,3 +59,30 @@ fn header_parses_and_iq_q2_0_tensors_dequant() {
         eprintln!("{name}: {} elems, first {:?}", v.len(), &v[..4.min(v.len())]);
     }
 }
+
+/// Shape/type dump of the tensors the loader binds (blk.0 linear, blk.3 full,
+/// top level) — run with `--ignored --nocapture` to read the artifact.
+#[test]
+#[ignore = "needs the 44 GB IQ3_XXS checkpoint present"]
+fn dump_loader_facing_shapes() {
+    let Some(path) = checkpoint_path() else { return };
+    let mut f = std::fs::File::open(&path).expect("open gguf");
+    let content = gguf_file::Content::read(&mut f).expect("parse gguf header");
+    let mut names: Vec<&String> = content.tensor_infos.keys().collect();
+    names.sort();
+    for name in names {
+        if !name.starts_with("blk.") || name.starts_with("blk.0.") || name.starts_with("blk.3.") || name.starts_with("blk.1.ple") {
+            let ti = &content.tensor_infos[name];
+            eprintln!("{name}: {:?} {:?}", ti.ggml_dtype, ti.shape.dims());
+        }
+    }
+    let mut keys: Vec<&String> = content.metadata.keys().collect();
+    keys.sort();
+    for k in keys {
+        if k.starts_with("qwen4exp.") || k.starts_with("general.") {
+            let v = &content.metadata[k];
+            let s = format!("{v:?}");
+            eprintln!("META {k} = {}", &s[..s.len().min(160)]);
+        }
+    }
+}

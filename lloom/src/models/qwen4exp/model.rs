@@ -14,7 +14,10 @@ use super::deltanet_block::GatedDeltaNet;
 use super::hc::HyperConnection;
 use super::moe::{ExpertResidency, MoeLayer};
 use super::qsa::{KvCache, QsaAttention};
+use super::moe::Resident;
+use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
+use crate::nn::var_builder::VarBuilder;
 use crate::nn::RecurrentState;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{Module, Result, Tensor, D};
@@ -33,6 +36,12 @@ pub struct Layer<R: ExpertResidency> {
     mixer: Mixer,
     hc_ffn: HyperConnection,
     moe: MoeLayer<R>,
+}
+
+impl<R: ExpertResidency> Layer<R> {
+    pub fn new(hc_attn: HyperConnection, mixer: Mixer, hc_ffn: HyperConnection, moe: MoeLayer<R>) -> Self {
+        Self { hc_attn, mixer, hc_ffn, moe }
+    }
 }
 
 /// The per-sequence state the forward threads: DeltaNet `S`, the conv window,
@@ -72,7 +81,10 @@ impl Cache {
 /// The assembled model.
 #[derive(Debug, Clone)]
 pub struct Qwen4Exp<R: ExpertResidency> {
-    embed_tokens: crate::nn::Embedding,
+    /// `token_embd.weight` `[vocab, hidden]` — a `QMatMul` so the real IQ3_S
+    /// table is gathered by the quantized `get_rows` kernel, never dequantized
+    /// whole (2.5 GB at f32).
+    embed_tokens: QMatMul,
     layers: Vec<Layer<R>>,
     /// Final HC collapse (the head mixer that carries the output norm).
     hc_head: HyperConnection,
@@ -83,7 +95,7 @@ pub struct Qwen4Exp<R: ExpertResidency> {
 
 impl<R: ExpertResidency> Qwen4Exp<R> {
     pub fn new(
-        embed_tokens: crate::nn::Embedding,
+        embed_tokens: QMatMul,
         layers: Vec<Layer<R>>,
         hc_head: HyperConnection,
         lm_head: QMatMul,
@@ -96,6 +108,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         &self.cfg
     }
 
+    /// Embed `tokens [b, seq]` → `[b, seq, hidden]` without running a layer.
+    pub fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.embedding(tokens)
+    }
+
     /// One decode token: `input_id [1,1]` → logits `[1, vocab]`, threading the
     /// state and calling the observer at each layer's carry. `obs = &mut ()` on
     /// the crown path compiles to zero observation cost.
@@ -105,12 +122,44 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         cache: &mut Cache,
         obs: &mut O,
     ) -> Result<Tensor> {
+        let h = self.embed(input_id)?; // [1, 1, d]
+        self.decode_embed(&h, cache, obs)
+    }
+
+    /// Run a sequence `embeds [1, seq, hidden]` one position at a time from
+    /// `cache.pos`, returning the LAST position's logits `[1, vocab]`. Prefill is
+    /// the decode recurrence replayed (Kernel B, the chunkwise prefill, is
+    /// #748's); correct, and what the light gate needs.
+    pub fn forward_embeds<O: ForwardObserver>(
+        &self,
+        embeds: &Tensor,
+        cache: &mut Cache,
+        obs: &mut O,
+    ) -> Result<Tensor> {
+        let (b, seq, _) = embeds.dims3()?;
+        if b != 1 || seq == 0 {
+            lloom_tensor::bail!("qwen4exp forward takes one sequence of >= 1 tokens, got {:?}", embeds.shape())
+        }
+        let mut logits = None;
+        for t in 0..seq {
+            let h = embeds.narrow(1, t, 1)?;
+            logits = Some(self.decode_embed(&h, cache, obs)?);
+        }
+        Ok(logits.expect("seq >= 1"))
+    }
+
+    /// One position from its embedding `h [1, 1, hidden]` → logits `[1, vocab]`.
+    pub fn decode_embed<O: ForwardObserver>(
+        &self,
+        h: &Tensor,
+        cache: &mut Cache,
+        obs: &mut O,
+    ) -> Result<Tensor> {
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
 
-        // embed → broadcast into the n-stream HC carry `res_hc [1, 1, n*d]`.
+        // broadcast the embedding into the n-stream HC carry `res_hc [1, 1, n*d]`.
         // The reference inits the streams from the embed broadcast across n.
-        let h = self.embed_tokens.forward(input_id)?; // [1, 1, d]
         let mut res_hc = h.broadcast_as((1, 1, n, d))?.reshape((1, 1, n * d))?.contiguous()?;
 
         for (l, layer) in self.layers.iter().enumerate() {
@@ -159,6 +208,46 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     }
 }
 
+impl ModelTrait for Qwen4Exp<Resident> {
+    type Config = Config;
+
+    /// The checkpoint is GGUF (a non-uniform per-tensor quant); the safetensors
+    /// `VarBuilder` path has no weights to offer. Load with
+    /// [`Qwen4Exp::from_gguf`](super::loader).
+    fn from_weights(_vb: VarBuilder, _cfg: &Self::Config) -> Result<Self> {
+        lloom_tensor::bail!("qwen4exp loads from GGUF: use Qwen4Exp::from_gguf")
+    }
+}
+
+impl CausalLM for Qwen4Exp<Resident> {
+    type Cache = Cache;
+
+    fn new_cache(&self, cfg: &Self::Config, _dev: &lloom_tensor::Device) -> Result<Self::Cache> {
+        Ok(Cache::new(cfg))
+    }
+
+    fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+        Qwen4Exp::embed(self, tokens)
+    }
+
+    fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
+        if pos != cache.pos {
+            lloom_tensor::bail!("qwen4exp: pos {pos} != cache position {}", cache.pos)
+        }
+        Qwen4Exp::forward_embeds(self, embeds, cache, &mut ())
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+}
+
+impl CacheReset for Cache {
+    fn reset(&mut self) {
+        Cache::reset(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,8 +256,17 @@ mod tests {
     use super::super::hc::HyperConnection;
     use super::super::moe::{MoeLayer, Resident};
     use super::super::qsa::QsaAttention;
-    use crate::nn::{Embedding, RmsNorm};
+    use crate::nn::RmsNorm;
+    use lloom_tensor::quantized::{GgmlDType, QTensor};
     use lloom_tensor::{DType, Device};
+    use std::sync::Arc;
+
+    /// A stacked `[e, out, inp]` expert weight as an F32-typed `QTensor`.
+    fn stacked(e: usize, out: usize, inp: usize, seed: f32, dev: &Device) -> Arc<QTensor> {
+        let v: Vec<f32> = (0..e * out * inp).map(|i| ((i as f32 * 0.011 + seed).cos()) * 0.1).collect();
+        let t = Tensor::from_vec(v, (e, out, inp), dev).unwrap();
+        Arc::new(QTensor::quantize(&t, GgmlDType::F32).unwrap())
+    }
 
     fn lin(out: usize, inp: usize, seed: f32, dev: &Device) -> QMatMul {
         let v: Vec<f32> = (0..out * inp).map(|i| ((i as f32 * 0.007 + seed).sin()) * 0.08).collect();
@@ -242,9 +340,9 @@ mod tests {
         MoeLayer::new(
             lin(ne, d, 1.0, dev),
             Resident::new(
-                (0..ne).map(|e| lin(ff, d, e as f32, dev)).collect(),
-                (0..ne).map(|e| lin(ff, d, e as f32 + 100.0, dev)).collect(),
-                (0..ne).map(|e| lin(d, ff, e as f32 + 200.0, dev)).collect(),
+                stacked(ne, ff, d, 1.0, dev),
+                stacked(ne, ff, d, 100.0, dev),
+                stacked(ne, d, ff, 200.0, dev),
             ),
             lin(sh, d, 2.0, dev),
             lin(sh, d, 3.0, dev),
@@ -264,8 +362,7 @@ mod tests {
         let dev = Device::Cpu;
         let cfg = Config::tiny(); // [L, L, L, F]
         // Non-zero embedding table (a zero table gives zero input → zero logits).
-        let embed_w = wt((cfg.vocab_size, cfg.hidden_size), 0.5, &dev);
-        let embed = Embedding::new(embed_w, cfg.hidden_size);
+        let embed = QMatMul::Tensor(wt((cfg.vocab_size, cfg.hidden_size), 0.5, &dev));
 
         let layers: Vec<Layer<Resident>> = (0..cfg.n_layers)
             .map(|l| {

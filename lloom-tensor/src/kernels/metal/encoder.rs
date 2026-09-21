@@ -728,7 +728,10 @@ impl ComputeCommandEncoder {
     }
 
     /// `(map reads, hits, waits)` this session has made -- the engagement
-    /// counters the fence-probe gate asserts absolutely.
+    /// counters the fence-probe gate (`fence_probe_tests`) asserts absolutely.
+    /// Test-only: the shipping consumer is the encoder close, which reads the
+    /// fields under the lock it already holds and sums them into the profiler.
+    #[cfg(test)]
     pub(crate) fn fence_stats(&self) -> (u32, u32, u32) {
         let s = self.state.lock();
         (s.fence_probes, s.fence_hits, s.fence_waits)

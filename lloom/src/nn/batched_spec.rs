@@ -73,7 +73,6 @@ where
 {
     spec: S,
     opts: DecodeOptions,
-    eos_ids: Vec<u32>,
     device: Device,
     slots: Vec<Option<Slot<'m, M, R>>>,
     free: Vec<usize>,
@@ -93,13 +92,11 @@ where
     S: Speculator,
     R: BorrowMut<Session<'m, M>>,
 {
-    /// An empty batch over `spec`, whose sequence slots bound the width;
-    /// rows stop on `eos_ids` (one set for the batch: the verify's accept
-    /// rule reads it per window).
-    pub fn new(spec: S, opts: DecodeOptions, eos_ids: &[u32], device: Device) -> Result<Self> {
-        if eos_ids.is_empty() {
-            lloom_tensor::bail!("decode_spec_batched: eos_ids is empty, so a row would never end");
-        }
+    /// An empty batch over `spec`, whose sequence slots bound the width. There
+    /// is no batch-level EOS set: every row carries its own (`admit_with_eos`,
+    /// which refuses an empty one) and the ragged verify reads it per window —
+    /// the cells' never-EOS rows sit beside a request's.
+    pub fn new(spec: S, opts: DecodeOptions, device: Device) -> Result<Self> {
         if spec.max_draft() == 0 {
             lloom_tensor::bail!(
                 "decode_spec_batched: the proposer has max_draft 0 (the K=1 identity); it belongs \
@@ -114,7 +111,6 @@ where
             free_seq: (0..spec.n_seq()).rev().collect(),
             spec,
             opts,
-            eos_ids: eos_ids.to_vec(),
             device,
             slots: Vec::new(),
             free: Vec::new(),
@@ -659,7 +655,7 @@ where
             );
         }
         let mut dec: SpecBatchDecoder<'m, M, &mut S, &mut Session<'m, M>> =
-            SpecBatchDecoder::new(spec, opts.clone(), eos_ids, device.clone())?;
+            SpecBatchDecoder::new(spec, opts.clone(), device.clone())?;
         let mut ids = Vec::with_capacity(n);
         for (s, p) in sessions.iter_mut().zip(prompts) {
             ids.push(dec.admit_with_eos(

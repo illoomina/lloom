@@ -88,6 +88,14 @@ struct Args {
     #[arg(long)]
     state_digest: bool,
 
+    /// Feed the prompt in segments ending at these positions (comma list, e.g.
+    /// `512,2048`) and, with `--state-digest`, print a `STATE ... phase=at<N>`
+    /// checksum after each — a bisection aid locating WHERE in the prompt two
+    /// runs first diverge. The model chunks each segment exactly as it chunks
+    /// the whole prompt when the splits fall on chunk boundaries.
+    #[arg(long, value_delimiter = ',')]
+    prompt_split: Vec<usize>,
+
     /// Print per-layer activation statistics (finite count, max |x|, mean |x|)
     /// of the HC carry for the FIRST prompt token, through the observer seam,
     /// plus the final logits' statistics. A bisection aid, not a gate.
@@ -190,6 +198,16 @@ fn main() -> Result<()> {
     } else {
         Device::new_metal(0)?
     };
+    // `QWEN4EXP_POOL_POISON=<hex byte>`: the #706 GPU-side free-buffer poison
+    // (a `fuzzing`-feature build; inert otherwise). A bisection aid for the
+    // long-context divergence: a still-reading command buffer sees the
+    // sentinel instead of a plausible stale value.
+    if let (Ok(hex), Device::Metal(m)) = (std::env::var("QWEN4EXP_POOL_POISON"), &device) {
+        let byte = u8::from_str_radix(hex.trim_start_matches("0x"), 16)
+            .map_err(|e| anyhow::anyhow!("QWEN4EXP_POOL_POISON={hex}: {e}"))?;
+        m.set_free_poison(Some(byte));
+        eprintln!("pool free-poison armed: 0x{byte:02x}");
+    }
 
     let tokenizer = Tokenizer::from_file(&tokenizer).map_err(anyhow::Error::msg)?;
     let mut eos_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>"]
@@ -296,8 +314,31 @@ fn main() -> Result<()> {
             }
         }
         let t1 = std::time::Instant::now();
-        let input = Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &device)?;
-        let mut logits = model.forward(&input, 0, &mut cache)?; // [1, vocab]
+        let mut logits = None;
+        let mut fed = 0usize;
+        let mut splits: Vec<usize> = args
+            .prompt_split
+            .iter()
+            .copied()
+            .filter(|&n| n > 0 && n < prompt_ids.len())
+            .collect();
+        splits.sort_unstable();
+        splits.dedup();
+        splits.push(prompt_ids.len());
+        for end in splits {
+            let seg = &prompt_ids[fed..end];
+            let input = Tensor::from_vec(seg.to_vec(), (1, seg.len()), &device)?;
+            logits = Some(model.forward(&input, cache.pos, &mut cache)?); // [1, vocab]
+            fed = end;
+            if args.state_digest && end < prompt_ids.len() {
+                for (name, sum, nonfinite) in cache.checksums()? {
+                    println!(
+                        "STATE run={run} phase=at{end} {name}={sum:016x} nonfinite={nonfinite}"
+                    );
+                }
+            }
+        }
+        let mut logits = logits.expect("a non-empty prompt");
         let prefill_ms = t1.elapsed().as_millis();
         if args.state_digest {
             for (name, sum, nonfinite) in cache.checksums()? {

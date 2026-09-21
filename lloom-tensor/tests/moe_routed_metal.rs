@@ -323,6 +323,111 @@ fn routed_iq3_xxs_gate_shape() -> Result<()> {
     routed_matches_reference(GgmlDType::IQ3XXS, false, 1e-4)
 }
 
+/// The `(f16, f32, f16)` routed arm (issue #748, #750 item B) against the
+/// dense f32 reference: f16 activations in, f16 planes out, within the f16
+/// store's rounding; at a row count that is not a multiple of the tile, so a
+/// spill into the next plane would show; and against the f32 routed arm on
+/// the same inputs, within the f16 store's rounding of the f32 result — the
+/// two arms are the same core at two store widths, not two computations.
+fn routed_f16_matches_reference(dtype: GgmlDType, in_dim1_is_topk: bool, n: usize) -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let e = 6usize;
+    let (batch, topk, k) = (2usize, 3usize, 256usize);
+    let in_dim1 = if in_dim1_is_topk { topk } else { 1 };
+    let (w, w_ref) = stacked_weight(dtype, (e, n, k), 23, &dev)?;
+    let x = activations((batch, in_dim1, k), 0.4)?;
+    let ids: Vec<u32> = vec![5, 0, 5, 2, 4, 5];
+    let ids_t = Tensor::from_vec(ids.clone(), (batch, topk), &Device::Cpu)?.to_device(&dev)?;
+    // The reference sees the f16-rounded activations the kernel reads.
+    let x16 = x.to_dtype(DType::F16)?;
+    let want = dense_reference(&x16.to_dtype(DType::F32)?, &w_ref, &ids, topk)?;
+
+    let got16 = w.indexed_moe_forward(&x16.to_device(&dev)?, &ids_t)?;
+    assert_eq!(got16.dims(), &[batch, topk, n]);
+    assert_eq!(got16.dtype(), DType::F16, "the f16 arm must store f16");
+    let err = mean_rel_err(&got16, &want)?;
+    assert!(
+        err < 4e-3,
+        "{dtype:?} in_dim1={in_dim1} n={n}: f16 routed arm diverges from the dense reference: mean rel err {err}"
+    );
+
+    // Against the f32 arm on the same (f16-rounded) activations: the f32 arm's
+    // planes rounded to f16 must equal the f16 arm's planes to the ulp scale.
+    let got32 = w.indexed_moe_forward(&x16.to_dtype(DType::F32)?.to_device(&dev)?, &ids_t)?;
+    assert_eq!(got32.dtype(), DType::F32);
+    let a = got16
+        .to_device(&Device::Cpu)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let b = got32
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    // The f32 arm's planes rounded to f16 are the f16 arm's planes, to the
+    // last place: the two arms are the same core, the f16 store is the only
+    // rounding. Measured in units of the f16 ulp at the value's own exponent.
+    let mut worst = 0f32;
+    let mut worst_at = (0usize, 0f32, 0f32);
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        let y16 = half::f16::from_f32(*y).to_f32();
+        let exp = if *y == 0.0 { -24 } else { y.abs().log2().floor() as i32 };
+        let ulp = 2f32.powi((exp - 10).max(-24));
+        let d = (x - y16).abs() / ulp;
+        if d > worst {
+            worst = d;
+            worst_at = (i, *x, *y);
+        }
+    }
+    assert!(
+        worst <= 1.0,
+        "{dtype:?} in_dim1={in_dim1} n={n}: f16 arm vs f32 arm rounded to f16 differ by {worst} f16 ulps at {worst_at:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn routed_f16_q4_0_gate_shape() -> Result<()> {
+    routed_f16_matches_reference(GgmlDType::Q4_0, false, 40)
+}
+#[test]
+fn routed_f16_q4k_down_shape() -> Result<()> {
+    routed_f16_matches_reference(GgmlDType::Q4K, true, 40)
+}
+#[test]
+fn routed_f16_iq2_xxs_rows_not_multiple_of_tile() -> Result<()> {
+    routed_f16_matches_reference(GgmlDType::IQ2XXS, false, 37)
+}
+#[test]
+fn routed_f16_iq4_nl_down_shape() -> Result<()> {
+    routed_f16_matches_reference(GgmlDType::IQ4NL, true, 40)
+}
+#[test]
+fn routed_f16_iq3_s_rows_not_multiple_of_tile() -> Result<()> {
+    routed_f16_matches_reference(GgmlDType::IQ3S, true, 37)
+}
+#[test]
+fn routed_f16_q2_0_gate_shape() -> Result<()> {
+    routed_f16_matches_reference(GgmlDType::Q2_0, false, 40)
+}
+#[test]
+fn routed_f16_q2_0_down_shape() -> Result<()> {
+    routed_f16_matches_reference(GgmlDType::Q2_0, true, 37)
+}
+
+/// A dense/Q8 weight has no f16 routed arm: an f16 activation is refused,
+/// never read under the wrong dtype.
+#[test]
+fn routed_f16_refuses_dense_weight() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let (e, n, k) = (2usize, 8usize, 64usize);
+    let w = QTensor::quantize(&Tensor::zeros((e, n, k), DType::F32, &dev)?, GgmlDType::F32)?;
+    let x = Tensor::zeros((1, 1, k), DType::F16, &dev)?;
+    let ids = Tensor::from_vec(vec![0u32, 1], (1, 2), &dev)?;
+    assert!(w.indexed_moe_forward(&x, &ids).is_err());
+    Ok(())
+}
+
 /// The Qwen decode shape at reduced width: 512 experts are too many for a
 /// fixture, but the expert-stride arithmetic (`nb02`) is what a wrong offset
 /// corrupts, so use enough experts that a mis-stride lands on a different,

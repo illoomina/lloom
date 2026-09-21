@@ -85,12 +85,21 @@ pub struct Config {
     /// `qwen4exp.expert_shared_feed_forward_length` = 640.
     pub shared_expert_intermediate_size: usize,
 
-    // ---- N-gram PLE (out of scope for the decode-correctness path, kept for completeness) ----
+    // ---- N-gram PLE ----
     /// `qwen4exp.ple.layers` — the single PLE layer (blk.1 in the GGUF; the i±1
     /// layer-offset the doc flags). Empty if the model has no PLE.
     pub ple_layers: Vec<usize>,
     /// `qwen4exp.ple.ngram_size` = 3.
     pub ple_ngram_size: usize,
+    /// `qwen4exp.ple.heads_per_ngram` = 8.
+    pub ple_heads_per_ngram: usize,
+    /// `qwen4exp.ple.conv_kernel` = 4.
+    pub ple_conv_kernel: usize,
+    /// `qwen4exp.embedding_length_per_layer_input` = 160 (the table's row width).
+    pub ple_head_dim: usize,
+    /// `qwen4exp.ple.image_token_id` — the id hashed for a position that
+    /// carries an embedding but no token (an image); EOS when absent.
+    pub ple_image_token_id: Option<u32>,
 
     // ---- tokens ----
     /// `bos = eos` = 248044.
@@ -178,6 +187,10 @@ impl Config {
             shared_expert_intermediate_size: 640,
             ple_layers: vec![1],
             ple_ngram_size: 3,
+            ple_heads_per_ngram: 8,
+            ple_conv_kernel: 4,
+            ple_head_dim: 160,
+            ple_image_token_id: Some(248056),
             bos_token_id: 248044,
             eos_token_id: 248044,
         }
@@ -219,6 +232,10 @@ impl Config {
             shared_expert_intermediate_size: 16,
             ple_layers: vec![],
             ple_ngram_size: 3,
+            ple_heads_per_ngram: 2,
+            ple_conv_kernel: 4,
+            ple_head_dim: 4,
+            ple_image_token_id: None,
             bos_token_id: 1,
             eos_token_id: 2,
         }

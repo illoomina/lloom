@@ -243,3 +243,35 @@ fn a_sortedness_check_alone_cannot_discriminate() -> Result<()> {
     assert!(is_permutation(&idx, n), "the fixed kernel is a permutation");
     Ok(())
 }
+
+/// Ties, and run-to-run identity under them (issue #748). The QSA indexer
+/// ranks ReLU'd block scores, many of which are exactly 0, with the ascending
+/// multi-block path; the selection is read back as cell indices, so a
+/// returned index that is not in `0..n` gathers from outside the cache and a
+/// different permutation of equal keys each run is a different logits digest
+/// each run. At the widths the long-context gate ran (526 and 937 blocks) and
+/// with every row half zeros: every result must be a permutation of `0..n`,
+/// sorted by key, and identical across 16 dispatches.
+#[test]
+fn ascending_sort_with_ties_is_a_permutation_and_repeatable() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    for &n in &[64usize, 526, 937, 2051, 4100] {
+        let v: Vec<f32> = (0..n)
+            .map(|i| if i % 2 == 0 { 0.0 } else { -(((i * 7919) % 1013) as f32) })
+            .collect();
+        let t = Tensor::from_vec(v.clone(), (1, n), &dev)?;
+        let mut first: Option<Vec<u32>> = None;
+        for rep in 0..16 {
+            let idx = t.arg_sort_last_dim(true)?.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u32>()?;
+            assert!(is_permutation(&idx, n), "n={n} rep={rep}: not a permutation of 0..n: {:?}", &idx[..8.min(n)]);
+            for w in idx.windows(2) {
+                assert!(v[w[0] as usize] <= v[w[1] as usize], "n={n} rep={rep}: not sorted");
+            }
+            match &first {
+                None => first = Some(idx),
+                Some(f) => assert_eq!(f, &idx, "n={n} rep={rep}: a different permutation of equal keys than the first dispatch"),
+            }
+        }
+    }
+    Ok(())
+}

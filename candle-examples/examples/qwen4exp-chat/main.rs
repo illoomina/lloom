@@ -14,6 +14,8 @@
 use anyhow::{Context, Result};
 use candle::{Device, Tensor};
 use clap::Parser;
+use lloom::models::qwen4exp::loader::LoadOptions;
+use lloom::models::qwen4exp::model::PrefillMode;
 use lloom::models::qwen4exp::{Cache, Qwen4Exp, Resident};
 use lloom::nn::model::CausalLM;
 use lloom::nn::observer::{ForwardObserver, HookPoint};
@@ -34,6 +36,27 @@ struct Args {
     /// tokenizer.json. Default: the HF cache's Qwen/Qwen3.8-Flash-Next snapshot.
     #[arg(long)]
     tokenizer: Option<PathBuf>,
+
+    /// The GGUF shard holding the N-gram PLE table (`per_layer_token_embd`).
+    /// Default: the `-00002-of-00002` sibling of `--gguf` when it exists.
+    #[arg(long)]
+    ple_shard: Option<PathBuf>,
+
+    /// Load without the N-gram PLE (the #747 baseline the digests were
+    /// recorded on).
+    #[arg(long)]
+    no_ple: bool,
+
+    /// How the prompt is run: `chunk` (Kernel B + chunk attention, the
+    /// reference prefill graph) or `replay` (the decode recurrence one position
+    /// at a time, #747's path).
+    #[arg(long, default_value = "chunk")]
+    prefill: String,
+
+    /// The routed experts' activation dtype: `f32` (the byte-identical routed
+    /// arm) or `f16` (the `(f16, f32, f16)` arm, issue #748).
+    #[arg(long, default_value = "f32")]
+    moe_act: String,
 
     #[arg(
         long,
@@ -58,6 +81,12 @@ struct Args {
 
     #[arg(long)]
     cpu: bool,
+
+    /// After the prompt and after generation, print a checksum per state
+    /// channel and layer (`STATE`), and a per-step logits checksum (`STEP`),
+    /// so two runs can be diffed for where they first diverge.
+    #[arg(long)]
+    state_digest: bool,
 
     /// Print per-layer activation statistics (finite count, max |x|, mean |x|)
     /// of the HC carry for the FIRST prompt token, through the observer seam,
@@ -174,18 +203,49 @@ fn main() -> Result<()> {
         std::fs::File::open(&gguf).with_context(|| format!("open {}", gguf.display()))?;
     let content = candle::quantized::gguf_file::Content::read(&mut file)?;
     let n_tensors = content.tensor_infos.len();
-    let model: Qwen4Exp<Resident> = Qwen4Exp::from_gguf(content, &mut file, &device)?;
+    let ple_shard = if args.no_ple {
+        None
+    } else {
+        match args.ple_shard {
+            Some(p) => Some(p),
+            None => {
+                let name = gguf
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                let sibling = gguf.with_file_name(name.replace("00001-of-00002", "00002-of-00002"));
+                (sibling != gguf && sibling.exists()).then_some(sibling)
+            }
+        }
+    };
+    let moe_act = match args.moe_act.as_str() {
+        "f32" => None,
+        "f16" => Some(candle::DType::F16),
+        other => anyhow::bail!("--moe-act {other}: f32 | f16"),
+    };
+    let opts = LoadOptions { ple_shard, moe_act };
+    let mut model: Qwen4Exp<Resident> =
+        Qwen4Exp::from_gguf_with(content, &mut file, &device, &opts)?;
+    let prefill_mode = match args.prefill.as_str() {
+        "chunk" => PrefillMode::Chunk,
+        "replay" => PrefillMode::Replay,
+        other => anyhow::bail!("--prefill {other}: chunk | replay"),
+    };
+    model.set_prefill_mode(prefill_mode);
     let cfg = model.config().clone();
     let load_ms = t0.elapsed().as_millis();
     println!(
-        "LOADED gguf={} tensors={n_tensors} layers={} hidden={} vocab={} experts={}x{} device={:?} load_ms={load_ms}",
+        "LOADED gguf={} tensors={n_tensors} layers={} hidden={} vocab={} experts={}x{} device={:?} ple={} prefill={:?} moe_act={} load_ms={load_ms}",
         gguf.display(),
         cfg.n_layers,
         cfg.hidden_size,
         cfg.vocab_size,
         cfg.n_experts,
         cfg.n_experts_per_tok,
-        device
+        device,
+        if model.has_ple() { "on" } else { "off" },
+        prefill_mode,
+        args.moe_act
     );
 
     let text = if args.raw {
@@ -224,6 +284,7 @@ fn main() -> Result<()> {
                 let input = Tensor::from_vec(vec![tok], (1, 1), &device)?;
                 let h = model.embed(&input)?;
                 let (_, e_nonfinite, e_maxabs, _) = stats(&h)?;
+                probe_cache.set_pending_tokens(&[tok]);
                 let logits = model.decode_embed(&h, &mut probe_cache, &mut probe)?;
                 let (n, nonfinite, maxabs, meanabs) = stats(&logits)?;
                 println!(
@@ -238,8 +299,37 @@ fn main() -> Result<()> {
         let input = Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &device)?;
         let mut logits = model.forward(&input, 0, &mut cache)?; // [1, vocab]
         let prefill_ms = t1.elapsed().as_millis();
+        if args.state_digest {
+            for (name, sum, nonfinite) in cache.checksums()? {
+                println!("STATE run={run} phase=prompt {name}={sum:016x} nonfinite={nonfinite}");
+            }
+        }
+        let mut step_no = 0usize;
         let mut generated: Vec<u32> = Vec::with_capacity(args.max_tokens);
         let mut hit_eos = false;
+        // The logits digest covers every position's full logit row (prefill's
+        // last position + each generated step), so a computation that moves
+        // by rounding while the argmax holds is still visible.
+        let mut lh = sha256::Sha256::new();
+        let mut logits_max = f32::MIN;
+        let mut digest_logits = |t: &Tensor, lh: &mut sha256::Sha256| -> Result<()> {
+            let v = t.flatten_all()?.to_vec1::<f32>()?;
+            for x in &v {
+                lh.update(&x.to_le_bytes());
+                logits_max = logits_max.max(*x);
+            }
+            Ok(())
+        };
+        digest_logits(&logits, &mut lh)?;
+        if args.state_digest {
+            let v = logits.flatten_all()?.to_vec1::<f32>()?;
+            let mut h = 0xcbf29ce484222325u64;
+            for x in &v {
+                h ^= x.to_bits() as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            println!("STEP run={run} step={step_no} logits={h:016x}");
+        }
         for _ in 0..args.max_tokens {
             let next = argmax(&logits)?;
             if eos_ids.contains(&next) {
@@ -249,8 +339,25 @@ fn main() -> Result<()> {
             generated.push(next);
             let input = Tensor::from_vec(vec![next], (1, 1), &device)?;
             logits = model.forward(&input, cache.pos, &mut cache)?;
+            digest_logits(&logits, &mut lh)?;
+            step_no += 1;
+            if args.state_digest {
+                let v = logits.flatten_all()?.to_vec1::<f32>()?;
+                let mut h = 0xcbf29ce484222325u64;
+                for x in &v {
+                    h ^= x.to_bits() as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                println!("STEP run={run} step={step_no} logits={h:016x}");
+            }
+        }
+        if args.state_digest {
+            for (name, sum, nonfinite) in cache.checksums()? {
+                println!("STATE run={run} phase=end {name}={sum:016x} nonfinite={nonfinite}");
+            }
         }
         let decode_ms = t1.elapsed().as_millis() - prefill_ms;
+        let logits_digest = sha256::hex(&lh.finalize());
         let mut h = sha256::Sha256::new();
         for t in &generated {
             h.update(&t.to_le_bytes());
@@ -271,7 +378,7 @@ fn main() -> Result<()> {
                 .join(",")
         );
         println!(
-            "RESULT run={run} tokens_sha256={digest} prompt_tokens={} generated={} hit_eos={hit_eos} prefill_ms={prefill_ms} decode_ms={decode_ms} max_tokens={}",
+            "RESULT run={run} tokens_sha256={digest} logits_sha256={logits_digest} logits_max={logits_max:.4} prompt_tokens={} generated={} hit_eos={hit_eos} prefill_ms={prefill_ms} decode_ms={decode_ms} max_tokens={}",
             prompt_ids.len(),
             generated.len(),
             args.max_tokens

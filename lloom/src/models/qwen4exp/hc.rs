@@ -45,6 +45,24 @@ pub struct HyperConnection {
     eps: f32,
 }
 
+/// Grouped RMSNorm over an n-stream carry `x [b, seq, n·d]`: normalize PER
+/// STREAM (over `d`, with the unit alpha `unit_d [d]`), then scale all streams
+/// by the `[n·d]` γ (the converter folds each γ to `1 + w`). The HC brackets and
+/// the PLE's three norms share this one definition.
+pub(crate) fn grouped_rms_norm(
+    x: &Tensor,
+    unit_d: &Tensor,
+    gamma: &Tensor,
+    n: usize,
+    d: usize,
+    eps: f32,
+) -> Result<Tensor> {
+    let (b, seq, _) = x.dims3()?;
+    let x_s = x.reshape((b, seq, n, d))?;
+    let xn = ops::rms_norm(&x_s, unit_d, eps)?;
+    xn.reshape((b, seq, n * d))?.broadcast_mul(gamma)
+}
+
 impl HyperConnection {
     pub fn new(
         norm_w: Tensor,
@@ -77,13 +95,7 @@ impl HyperConnection {
     /// `inject = inject·xn`.
     pub fn mix(&self, h: &Tensor) -> Result<(Tensor, Tensor)> {
         let (b, seq, _) = h.dims3()?;
-        // Grouped RMSNorm: normalize PER STREAM (over d), then scale all streams
-        // by the [n*d] γ. Reshape to [b, seq, n, d], RMS over d with a unit
-        // alpha, reshape back, multiply by γ.
-        let h_s = h.reshape((b, seq, self.n, self.d))?;
-        let xn = ops::rms_norm(&h_s, &self.unit_d, self.eps)?;
-        let xn = xn.reshape((b, seq, self.n * self.d))?;
-        let xn = xn.broadcast_mul(&self.norm_w)?; // [b, seq, n*d]
+        let xn = grouped_rms_norm(h, &self.unit_d, &self.norm_w, self.n, self.d, self.eps)?; // [b, seq, n*d]
 
         // Low-rank gate prediction on the normed carry.
         let lo = self.down.forward(&xn)?; // [b, seq, hc_lr]

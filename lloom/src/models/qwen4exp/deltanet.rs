@@ -241,6 +241,238 @@ pub fn conv_decode_step(
     Ok((folded, new_win))
 }
 
+/// The chunk size Kernel B tiles a sequence into (the reference's `CS` for the
+/// gated-delta / GDA case, `delta-net-base.cpp`; FLA's default).
+pub const CHUNK_SIZE: usize = 64;
+
+/// The gated delta-rule prefill (Kernel B): the chunkwise WY form of the
+/// recurrence over `seq` positions at once, for ONE sequence.
+///
+/// Inputs are conv'd, gated, L2-normed and GQA-repeated to `h_v` heads, laid
+/// out position-major:
+/// - `q`, `k`: `[seq, h_v, d_k]` (`q` pre-scaled by `1/√d_k`)
+/// - `v`: `[seq, h_v, d_v]`
+/// - `g`: `[seq, h_v]` the per-position log-decay (`exp` applied here)
+/// - `beta`: `[seq, h_v]` the write strength (already `sigmoid`'d)
+/// - `state`: `[d_k, d_v, h_v]` fp32 head-last (the channel's layout; `None` = zero)
+///
+/// Returns `(o [seq, h_v, d_v], new_state [d_k, d_v, h_v])`, all fp32.
+///
+/// Per chunk of `chunk` positions (reference `build_delta_net_chunking`, FLA
+/// `chunk_gated_delta_rule`): with `G = cumsum(g)` inside the chunk and
+/// `decay[b, a] = exp(G[b] − G[a])` for `a ≤ b`,
+/// `A = tril₋₁(diag(β) K Kᵀ ⊙ decay)`, `T = (I + A)⁻¹` (unit-lower, so the
+/// nilpotent product `∏ (I + (−A)^{2ⁱ})`), `U = T·diag(β)V`,
+/// `W = T·(diag(β)K ⊙ exp(G))`; then chunk by chunk `V' = U − W·S`,
+/// `O = (Q ⊙ exp(G))·S + (Q Kᵀ ⊙ decay)·V'`, `S ← exp(G_last)·S + (K ⊙
+/// exp(G_last − G))ᵀ·V'`. Positions past `seq` are zero-padded (`g = 0`,
+/// `k = v = 0`: no decay, no write). Pure tensor-op composition, fp32.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_forward(
+    dims: DeltaNetDims,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: Option<&Tensor>,
+    chunk: usize,
+) -> Result<(Tensor, Tensor)> {
+    let (h_v, d_k, d_v) = (dims.h_v, dims.d_k, dims.d_v);
+    let dev = q.device();
+    let dt = lloom_tensor::DType::F32;
+    let (seq, hq, dq) = q.dims3()?;
+    if hq != h_v || dq != d_k || chunk == 0 {
+        lloom_tensor::bail!(
+            "chunk_forward: q {:?} vs dims {dims:?} chunk {chunk}",
+            q.shape()
+        )
+    }
+    let pad = (chunk - seq % chunk) % chunk;
+    let padded = seq + pad;
+    let nc = padded / chunk;
+
+    // Head-first, chunked: [h_v, nc, cs, d].
+    let to_chunks = |t: &Tensor, d: usize| -> Result<Tensor> {
+        let t = t.to_dtype(dt)?.transpose(0, 1)?.contiguous()?; // [h_v, seq, d]
+        let t = if pad > 0 {
+            t.pad_with_zeros(1, 0, pad)?
+        } else {
+            t
+        };
+        t.reshape((h_v, nc, chunk, d))
+    };
+    let q = to_chunks(q, d_k)?;
+    let k = to_chunks(k, d_k)?;
+    let v = to_chunks(v, d_v)?;
+    let g = to_chunks(&g.unsqueeze(2)?, 1)?.squeeze(3)?; // [h_v, nc, cs]
+    let b = to_chunks(&beta.unsqueeze(2)?, 1)?; // [h_v, nc, cs, 1]
+
+    let s0 = match state {
+        Some(s) => s.to_dtype(dt)?.permute((2, 0, 1))?.contiguous()?, // [h_v, d_k, d_v]
+        None => Tensor::zeros((h_v, d_k, d_v), dt, dev)?,
+    };
+
+    // Cumulative log-decay inside each chunk, and the pairwise decay matrix
+    // exp(G[b] − G[a]) masked to a ≤ b (the masked entries are set to a large
+    // negative BEFORE the exp, so no inf·0).
+    let g_cs = g.cumsum(2)?; // [h_v, nc, cs]
+    let gi = g_cs.unsqueeze(3)?.broadcast_as((h_v, nc, chunk, chunk))?; // row b
+    let gj = g_cs.unsqueeze(2)?.broadcast_as((h_v, nc, chunk, chunk))?; // col a
+    let diff = (gi - gj)?;
+    let lower = Tensor::tril2(chunk, lloom_tensor::DType::U8, dev)?
+        .broadcast_as((h_v, nc, chunk, chunk))?
+        .contiguous()?;
+    let strict = (Tensor::tril2(chunk, lloom_tensor::DType::U8, dev)?
+        - Tensor::eye(chunk, lloom_tensor::DType::U8, dev)?)?
+    .broadcast_as((h_v, nc, chunk, chunk))?
+    .contiguous()?;
+    let neg = Tensor::full(-1e30f32, (h_v, nc, chunk, chunk), dev)?;
+    let decay = lower.where_cond(&diff, &neg)?.exp()?; // 0 above the diagonal
+    let zero = Tensor::zeros((h_v, nc, chunk, chunk), dt, dev)?;
+
+    let k_beta = k.broadcast_mul(&b)?; // [h_v, nc, cs, d_k]
+    let v_beta = v.broadcast_mul(&b)?; // [h_v, nc, cs, d_v]
+    let k_t = k.transpose(2, 3)?.contiguous()?; // [h_v, nc, d_k, cs]
+
+    // A = tril₋₁((β K) Kᵀ ⊙ decay); T = (I + A)⁻¹ by forward substitution.
+    let a = k_beta.matmul(&k_t)?.mul(&decay)?; // [h_v, nc, cs(b), cs(a)]
+    let a = strict.where_cond(&a, &zero)?;
+    let t = unit_lower_inverse(&a)?;
+
+    let g_exp = g_cs.exp()?.unsqueeze(3)?; // [h_v, nc, cs, 1]
+    let u = t.matmul(&v_beta)?; // [h_v, nc, cs, d_v]
+    let w = t.matmul(&k_beta.broadcast_mul(&g_exp)?)?; // [h_v, nc, cs, d_k]
+    let q_g = q.broadcast_mul(&g_exp)?; // [h_v, nc, cs, d_k]
+    let kq = q.matmul(&k_t)?.mul(&decay)?; // [h_v, nc, cs(b), cs(a)], a ≤ b
+    let g_last = g_cs.narrow(2, chunk - 1, 1)?; // [h_v, nc, 1]
+    let g_diff = g_last.broadcast_sub(&g_cs)?.exp()?.unsqueeze(3)?; // [h_v, nc, cs, 1]
+    let kg_t = k.broadcast_mul(&g_diff)?.transpose(2, 3)?.contiguous()?; // [h_v, nc, d_k, cs]
+    let g_last_exp = g_last.exp()?; // [h_v, nc, 1]
+
+    let mut s = s0;
+    let mut outs = Vec::with_capacity(nc);
+    for c in 0..nc {
+        let w_c = w.narrow(1, c, 1)?.squeeze(1)?; // [h_v, cs, d_k]
+        let u_c = u.narrow(1, c, 1)?.squeeze(1)?; // [h_v, cs, d_v]
+        let v_new = (u_c - w_c.matmul(&s)?)?; // [h_v, cs, d_v]
+        let q_g_c = q_g.narrow(1, c, 1)?.squeeze(1)?;
+        let kq_c = kq.narrow(1, c, 1)?.squeeze(1)?;
+        let o_c = (q_g_c.matmul(&s)? + kq_c.matmul(&v_new)?)?; // [h_v, cs, d_v]
+        outs.push(o_c);
+        let kg_c = kg_t.narrow(1, c, 1)?.squeeze(1)?; // [h_v, d_k, cs]
+        let gl = g_last_exp.narrow(1, c, 1)?.reshape((h_v, 1, 1))?;
+        s = (s.broadcast_mul(&gl)? + kg_c.matmul(&v_new)?)?;
+    }
+    let o = Tensor::cat(&outs, 1)?; // [h_v, padded, d_v]
+    let o = o.narrow(1, 0, seq)?.transpose(0, 1)?.contiguous()?; // [seq, h_v, d_v]
+    let new_state = s.permute((1, 2, 0))?.contiguous()?; // [d_k, d_v, h_v]
+    Ok((o, new_state))
+}
+
+/// `(I + A)⁻¹` for a strictly-lower-triangular `A [.., n, n]` (batched over the
+/// leading dims), by forward substitution: row `i` of the inverse is
+/// `e_i − Σ_{j<i} A[i, j] · T[j, :]`, each row from the rows before it.
+///
+/// This is the reference's `solve_tri` / FLA's row loop, and it is the
+/// numerically stable form. The nilpotent identity `(I + A)⁻¹ = ∏ (I +
+/// (−A)^{2ⁱ})` is exact in arithmetic and catastrophic in fp32 on real keys:
+/// within a chunk the L2-normed keys are near-identical, `β ≈ 1` and the
+/// decay ≈ 1, so `A` is close to the all-ones strictly-lower matrix, whose
+/// powers reach `C(63, 31) ≈ 4.6e17` while the inverse is bidiagonal `±1`;
+/// summing those terms in fp32 leaves garbage of ~1e11 that overflows the
+/// state two chunks later (measured: NaN at layer 0 on a 643-token prompt).
+pub fn unit_lower_inverse(a: &Tensor) -> Result<Tensor> {
+    let dims = a.dims().to_vec();
+    let n = dims[dims.len() - 1];
+    if dims[dims.len() - 2] != n {
+        lloom_tensor::bail!("unit_lower_inverse: not square {:?}", a.shape())
+    }
+    let dt = a.dtype();
+    let dev = a.device();
+    let lead: Vec<usize> = dims[..dims.len() - 2].to_vec();
+    let neg_a = a.neg()?;
+    // rows[i] is [.., 1, n]
+    let mut rows: Vec<Tensor> = Vec::with_capacity(n);
+    let mut row_shape = lead.clone();
+    row_shape.extend([1, n]);
+    let e = Tensor::eye(n, dt, dev)?; // [n, n]
+    for i in 0..n {
+        let e_i = e
+            .narrow(0, i, 1)?
+            .broadcast_as(row_shape.as_slice())?
+            .contiguous()?;
+        if i == 0 {
+            rows.push(e_i);
+            continue;
+        }
+        // T[i, :] = e_i + (−A)[i, :i] · T[:i, :]
+        let coeffs = neg_a.narrow(dims.len() - 2, i, 1)?.narrow(dims.len() - 1, 0, i)?; // [.., 1, i]
+        let prev = Tensor::cat(&rows, dims.len() - 2)?; // [.., i, n]
+        let t_i = (e_i + coeffs.matmul(&prev)?)?; // [.., 1, n]
+        rows.push(t_i);
+    }
+    Tensor::cat(&rows, dims.len() - 2)
+}
+
+/// The depthwise causal conv over a whole chunk `x [seq, channels]` against
+/// the carried window (the same `[channels, k]` window `conv_decode_step`
+/// keeps: the last `k` inputs, newest last). Returns `(conv_out [seq,
+/// channels], new_window)`; position by position it equals `conv_decode_step`.
+pub fn conv_prefill(
+    x: &Tensor,
+    weight: &Tensor,
+    window: Option<&Tensor>,
+    channels: usize,
+    k: usize,
+) -> Result<(Tensor, Tensor)> {
+    let dev = x.device();
+    let dt = x.dtype();
+    let seq = x.dim(0)?;
+    let x_t = x.t()?.contiguous()?; // [channels, seq]
+    let history = match window {
+        Some(w) => w.to_dtype(dt)?.narrow(1, 1, k - 1)?, // the last k−1 inputs
+        None => Tensor::zeros((channels, k - 1), dt, dev)?,
+    };
+    let padded = Tensor::cat(&[&history, &x_t], 1)?; // [channels, k−1+seq]
+    let w = weight.to_dtype(dt)?;
+    let mut acc: Option<Tensor> = None;
+    for tap in 0..k {
+        let cols = padded.narrow(1, tap, seq)?;
+        let term = cols.broadcast_mul(&w.narrow(1, tap, 1)?)?;
+        acc = Some(match acc {
+            Some(a) => (a + term)?,
+            None => term,
+        });
+    }
+    let out = acc.expect("k >= 1").t()?.contiguous()?; // [seq, channels]
+    let new_window = padded.narrow(1, seq - 1, k)?.contiguous()?; // last k inputs
+    Ok((out, new_window))
+}
+
+/// [`gqa_expand`] over a position-major `[seq, h_k, d]` → `[seq, h_v, d]`,
+/// the same head map (tile: v-head `j` reads k-head `j % h_k`).
+pub fn gqa_expand_seq<const INTERLEAVE: bool>(
+    x: &Tensor,
+    h_k: usize,
+    h_v: usize,
+) -> Result<Tensor> {
+    if h_k == h_v {
+        return Ok(x.clone());
+    }
+    let (seq, _, d) = x.dims3()?;
+    let rep = h_v / h_k;
+    if INTERLEAVE {
+        x.reshape((seq, h_k, 1, d))?
+            .broadcast_as((seq, h_k, rep, d))?
+            .reshape((seq, h_v, d))
+    } else {
+        x.reshape((seq, 1, h_k, d))?
+            .broadcast_as((seq, rep, h_k, d))?
+            .reshape((seq, h_v, d))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +713,262 @@ mod tests {
         let va = oa.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let vb = ob.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(va.iter().zip(&vb).any(|(a, b)| (a - b).abs() > 1e-4));
+    }
+
+    /// Kernel B equals Kernel A replayed: the chunked prefill's outputs and
+    /// final state match the sequential decode over the same positions, with
+    /// a nonzero initial state, at a sequence that is not a multiple of the
+    /// chunk (padding) and spans several chunks. fp32 reorder only.
+    #[test]
+    fn chunk_forward_matches_sequential_decode() {
+        let dev = Device::Cpu;
+        let dims = DeltaNetDims {
+            d_k: 6,
+            d_v: 5,
+            h_k: 2,
+            h_v: 4,
+        };
+        let (h_v, d_k, d_v) = (dims.h_v, dims.d_k, dims.d_v);
+        for (seq, chunk) in [(1usize, 4usize), (3, 4), (4, 4), (11, 4), (23, 8), (7, 64)] {
+            let mk = |n: usize, seed: f32, scale: f32| -> Vec<f32> {
+                (0..n)
+                    .map(|i| ((i as f32 * 0.731 + seed).sin()) * scale)
+                    .collect()
+            };
+            let q = Tensor::from_vec(mk(seq * h_v * d_k, 0.1, 0.8), (seq, h_v, d_k), &dev).unwrap();
+            let k = Tensor::from_vec(mk(seq * h_v * d_k, 0.2, 0.8), (seq, h_v, d_k), &dev).unwrap();
+            let v = Tensor::from_vec(mk(seq * h_v * d_v, 0.3, 1.0), (seq, h_v, d_v), &dev).unwrap();
+            // log-decay in (−3, 0), β in (0, 1)
+            let g = Tensor::from_vec(
+                mk(seq * h_v, 0.4, 1.0)
+                    .iter()
+                    .map(|x| -1.5 - 1.4 * x)
+                    .collect::<Vec<_>>(),
+                (seq, h_v),
+                &dev,
+            )
+            .unwrap();
+            let beta = Tensor::from_vec(
+                mk(seq * h_v, 0.5, 1.0)
+                    .iter()
+                    .map(|x| 0.5 + 0.45 * x)
+                    .collect::<Vec<_>>(),
+                (seq, h_v),
+                &dev,
+            )
+            .unwrap();
+            let s0 =
+                Tensor::from_vec(mk(d_k * d_v * h_v, 0.6, 0.3), (d_k, d_v, h_v), &dev).unwrap();
+
+            // Sequential reference: Kernel A per position.
+            let mut s_ref = s0.clone();
+            let mut o_ref = Vec::with_capacity(seq);
+            for t in 0..seq {
+                let (o, ns) = decode_step::<false>(
+                    dims,
+                    &q.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                    &k.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                    &v.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                    &g.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                    &beta.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                    Some(&s_ref),
+                )
+                .unwrap();
+                o_ref.push(o);
+                s_ref = ns;
+            }
+            let o_ref = Tensor::stack(&o_ref, 0).unwrap();
+
+            let (o, s) = chunk_forward(dims, &q, &k, &v, &g, &beta, Some(&s0), chunk).unwrap();
+            assert_eq!(o.dims(), &[seq, h_v, d_v]);
+            assert_eq!(s.dims(), &[d_k, d_v, h_v]);
+            let (a, b) = (
+                o.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                o_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            );
+            let scale = b.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+            let maxdiff = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                maxdiff <= 2e-5 * scale,
+                "seq {seq} chunk {chunk}: outputs differ by {maxdiff} at scale {scale}"
+            );
+            let (sa, sb) = (
+                s.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                s_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            );
+            let sscale = sb.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+            let smax = sa
+                .iter()
+                .zip(&sb)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                smax <= 2e-5 * sscale,
+                "seq {seq} chunk {chunk}: states differ by {smax} at scale {sscale}"
+            );
+            assert!(scale > 1e-3 && sscale > 1e-3, "degenerate fixture");
+        }
+    }
+
+    /// The real-model regime that broke the first Kernel B: near-identical
+    /// L2-normed keys, β ≈ 1, decay ≈ 1, a full 64-chunk. Kernel B must still
+    /// equal Kernel A replayed (fp32 reorder only).
+    #[test]
+    fn chunk_forward_is_stable_on_near_identical_keys() {
+        let dev = Device::Cpu;
+        let dims = DeltaNetDims {
+            d_k: 8,
+            d_v: 8,
+            h_k: 1,
+            h_v: 1,
+        };
+        let (h_v, d_k, d_v) = (dims.h_v, dims.d_k, dims.d_v);
+        let seq = 130;
+        // keys: a unit vector plus a tiny per-position perturbation, renormalized.
+        let mut kv_ = Vec::with_capacity(seq * d_k);
+        for t in 0..seq {
+            let mut v: Vec<f32> = (0..d_k).map(|i| 1.0 + 0.01 * ((t * 7 + i) as f32 * 0.3).sin()).collect();
+            let nrm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in &mut v {
+                *x /= nrm;
+            }
+            kv_.extend(v);
+        }
+        let k = Tensor::from_vec(kv_.clone(), (seq, h_v, d_k), &dev).unwrap();
+        let q = Tensor::from_vec(kv_.iter().map(|x| x * 0.9).collect::<Vec<_>>(), (seq, h_v, d_k), &dev).unwrap();
+        let v = Tensor::from_vec((0..seq * d_v).map(|i| (i as f32 * 0.11).cos()).collect::<Vec<_>>(), (seq, h_v, d_v), &dev).unwrap();
+        let g = Tensor::from_vec(vec![-0.001f32; seq * h_v], (seq, h_v), &dev).unwrap();
+        let beta = Tensor::from_vec(vec![0.999f32; seq * h_v], (seq, h_v), &dev).unwrap();
+        let mut s_ref: Option<Tensor> = None;
+        let mut o_ref = Vec::with_capacity(seq);
+        for t in 0..seq {
+            let (o, ns) = decode_step::<false>(
+                dims,
+                &q.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                &k.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                &v.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                &g.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                &beta.narrow(0, t, 1).unwrap().squeeze(0).unwrap(),
+                s_ref.as_ref(),
+            )
+            .unwrap();
+            o_ref.push(o);
+            s_ref = Some(ns);
+        }
+        let o_ref = Tensor::stack(&o_ref, 0).unwrap();
+        let (o, s) = chunk_forward(dims, &q, &k, &v, &g, &beta, None, 64).unwrap();
+        let (a, b) = (
+            o.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            o_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        assert!(a.iter().all(|x| x.is_finite()), "non-finite output");
+        let scale = b.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+        let maxdiff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        assert!(maxdiff <= 1e-4 * scale, "outputs differ by {maxdiff} at scale {scale}");
+        let (sa, sb) = (
+            s.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            s_ref.unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        let sscale = sb.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+        let smax = sa.iter().zip(&sb).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        assert!(smax <= 1e-4 * sscale, "states differ by {smax} at scale {sscale}");
+    }
+
+    /// The chunk conv equals the per-position conv with the same carried
+    /// window, including the window it leaves behind.
+    #[test]
+    fn conv_prefill_matches_decode_steps() {
+        let dev = Device::Cpu;
+        let (ch, k, seq) = (3usize, 4usize, 9usize);
+        let w = Tensor::from_vec(
+            (0..ch * k)
+                .map(|i| (i as f32 * 0.3).cos())
+                .collect::<Vec<_>>(),
+            (ch, k),
+            &dev,
+        )
+        .unwrap();
+        let x = Tensor::from_vec(
+            (0..seq * ch)
+                .map(|i| (i as f32 * 0.17).sin())
+                .collect::<Vec<_>>(),
+            (seq, ch),
+            &dev,
+        )
+        .unwrap();
+        let w0 = Tensor::from_vec(
+            (0..ch * k)
+                .map(|i| (i as f32 * 0.5).sin())
+                .collect::<Vec<_>>(),
+            (ch, k),
+            &dev,
+        )
+        .unwrap();
+        // Chunk.
+        let (out, win) = conv_prefill(&x, &w, Some(&w0), ch, k).unwrap();
+        // Steps.
+        let mut cur = w0.clone();
+        let mut rows = Vec::new();
+        for t in 0..seq {
+            let xt = x.narrow(0, t, 1).unwrap().squeeze(0).unwrap();
+            let (o, nw) = conv_decode_step(&xt, &w, Some(&cur), ch, k).unwrap();
+            rows.push(o);
+            cur = nw;
+        }
+        let out_ref = Tensor::stack(&rows, 0).unwrap();
+        let (a, b) = (
+            out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            out_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-5, "{a:?} vs {b:?}");
+        }
+        let (wa, wb) = (
+            win.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            cur.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        assert_eq!(wa, wb);
+    }
+
+    /// Forward substitution inverts `I + A` for a strictly-lower `A`, batched,
+    /// and stays exact on the hard case — the all-ones strictly-lower matrix
+    /// at n = 64, whose inverse is bidiagonal (1 on the diagonal, −1 below)
+    /// while its Neumann terms reach ~1e17. The nilpotent doubling product
+    /// this replaced fails this fixture by ~1e11 (the NaN on the real model).
+    #[test]
+    fn unit_lower_inverse_is_stable_on_the_hard_case() {
+        let dev = Device::Cpu;
+        let n = 64usize;
+        let dt = lloom_tensor::DType::F32;
+        let strict = (Tensor::tril2(n, dt, &dev).unwrap() - Tensor::eye(n, dt, &dev).unwrap()).unwrap();
+        // batched: [2, n, n] with the all-ones case and a random case
+        let dense = Tensor::from_vec(
+            (0..n * n).map(|i| (i as f32 * 0.37).sin()).collect::<Vec<_>>(),
+            (n, n),
+            &dev,
+        )
+        .unwrap();
+        let random = (dense * &strict).unwrap();
+        let a = Tensor::stack(&[&strict, &random], 0).unwrap();
+        let t = unit_lower_inverse(&a).unwrap();
+        assert_eq!(t.dims(), &[2, n, n]);
+        let eye = Tensor::eye(n, dt, &dev).unwrap();
+        let ones_t = t.get(0).unwrap().to_vec2::<f32>().unwrap();
+        for i in 0..n {
+            for j in 0..n {
+                let want = if i == j { 1.0 } else if j + 1 == i { -1.0 } else { 0.0 };
+                assert!((ones_t[i][j] - want).abs() < 1e-6, "all-ones inverse at ({i},{j}): {}", ones_t[i][j]);
+            }
+        }
+        let prod = (&eye + a.get(1).unwrap()).unwrap().matmul(&t.get(1).unwrap()).unwrap();
+        let p = prod.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let e = eye.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (x, y) in p.iter().zip(&e) {
+            assert!((x - y).abs() < 1e-4, "(I+A)·T is not I");
+        }
     }
 }

@@ -14,6 +14,7 @@ pub mod hc;
 pub mod loader;
 pub mod model;
 pub mod moe;
+pub mod ple;
 pub mod qsa;
 
 pub use config::{Config, LayerKind};
@@ -22,7 +23,8 @@ pub use deltanet_block::GatedDeltaNet;
 pub use hc::HyperConnection;
 pub use model::{Cache, Layer, Mixer, Qwen4Exp};
 pub use moe::{ExpertResidency, MoeLayer, Resident};
-pub use qsa::{KvCache, QsaAttention};
+pub use ple::{MmapPleTable, NgramHash, NgramWindow, PleLayer, PleTable};
+pub use qsa::{Indexer, KvCache, QsaAttention};
 
 /// Sub-block activation trace, for bisecting a non-finite forward on the real
 /// model. Off unless `QWEN4EXP_TRACE` is set (read once); when on, each

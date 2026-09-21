@@ -16,7 +16,8 @@ use super::deltanet_block::GatedDeltaNet;
 use super::hc::HyperConnection;
 use super::model::{Layer, Mixer, Qwen4Exp};
 use super::moe::{MoeLayer, Resident};
-use super::qsa::QsaAttention;
+use super::ple::{MmapPleTable, NgramHash, PleLayer, PleTable};
+use super::qsa::{Indexer, QsaAttention};
 use crate::nn::RmsNorm;
 use lloom_tensor::quantized::gguf_file::{Content, Value};
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
@@ -37,15 +38,29 @@ fn md_f32(md: &HashMap<String, Value>, key: &str) -> Result<f64> {
         None => lloom_tensor::bail!("gguf metadata has no `{key}`"),
     }
 }
-fn md_i32_array(md: &HashMap<String, Value>, key: &str) -> Result<Vec<i64>> {
+fn value_as_i64(v: &Value) -> Result<i64> {
+    Ok(match v {
+        Value::U8(x) => *x as i64,
+        Value::I8(x) => *x as i64,
+        Value::U16(x) => *x as i64,
+        Value::I16(x) => *x as i64,
+        Value::U32(x) => *x as i64,
+        Value::I32(x) => *x as i64,
+        Value::U64(x) => *x as i64,
+        Value::I64(x) => *x,
+        other => lloom_tensor::bail!("gguf metadata value {other:?} is not an integer"),
+    })
+}
+/// An integer array of any width (the converter writes `ple.*` as u64, the
+/// layer arrays as i32).
+fn md_int_array(md: &HashMap<String, Value>, key: &str) -> Result<Vec<i64>> {
     match md.get(key) {
-        Some(v) => v
-            .to_vec()?
-            .iter()
-            .map(|x| x.to_i32().map(|x| x as i64))
-            .collect(),
+        Some(v) => v.to_vec()?.iter().map(value_as_i64).collect(),
         None => lloom_tensor::bail!("gguf metadata has no `{key}`"),
     }
+}
+fn md_i32_array(md: &HashMap<String, Value>, key: &str) -> Result<Vec<i64>> {
+    md_int_array(md, key)
 }
 
 impl Config {
@@ -145,6 +160,14 @@ impl Config {
             )?,
             ple_layers,
             ple_ngram_size: md_u32(md, "qwen4exp.ple.ngram_size").unwrap_or(3),
+            ple_heads_per_ngram: md_u32(md, "qwen4exp.ple.heads_per_ngram").unwrap_or(8),
+            ple_conv_kernel: md_u32(md, "qwen4exp.ple.conv_kernel").unwrap_or(4),
+            ple_head_dim: md_u32(md, "qwen4exp.embedding_length_per_layer_input").unwrap_or(0),
+            ple_image_token_id: md
+                .get("qwen4exp.ple.image_token_id")
+                .map(|v| v.to_u32())
+                .transpose()?
+                .filter(|&id| id != 0),
             bos_token_id: eos,
             eos_token_id: eos,
         })
@@ -191,16 +214,51 @@ impl<R: Read + Seek> Gguf<'_, R> {
     }
 }
 
+/// What besides the first shard a load may take.
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// The GGUF shard holding `per_layer_token_embd.weight` (the N-gram PLE
+    /// table). `None` loads the model without the PLE — the layer-1 injection
+    /// is skipped, which is the #747 baseline the digests were recorded on.
+    pub ple_shard: Option<std::path::PathBuf>,
+    /// The routed experts' activation dtype (`None` = f32, the byte-identical
+    /// routed arm; `Some(F16)` = the `(f16, f32, f16)` arm).
+    pub moe_act: Option<lloom_tensor::DType>,
+}
+
 impl Qwen4Exp<Resident> {
-    /// Load the model from an open GGUF shard (the first shard carries the whole
-    /// text model; the second holds only the N-gram PLE table, which the decode
-    /// path does not read).
+    /// Load the model from an open GGUF shard, without the N-gram PLE (see
+    /// [`Self::from_gguf_with`]).
     pub fn from_gguf<R: Read + Seek>(
         content: Content,
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_gguf_with(content, reader, device, &LoadOptions::default())
+    }
+
+    /// Load the model from an open GGUF shard (the first shard carries the whole
+    /// text model), plus the PLE table's shard when `opts.ple_shard` names it.
+    pub fn from_gguf_with<R: Read + Seek>(
+        content: Content,
+        reader: &mut R,
+        device: &Device,
+        opts: &LoadOptions,
+    ) -> Result<Self> {
         let mut cfg = Config::from_gguf_metadata(&content.metadata)?;
+        let ple_hash = match (&opts.ple_shard, cfg.ple_layers.first()) {
+            (Some(_), Some(_)) => {
+                let md = &content.metadata;
+                Some(NgramHash::new(
+                    md_int_array(md, "qwen4exp.ple.layer_multipliers")?,
+                    md_int_array(md, "qwen4exp.ple.head_vocab_sizes")?,
+                    md_int_array(md, "qwen4exp.ple.head_offsets")?,
+                    cfg.ple_heads_per_ngram,
+                    cfg.eos_token_id,
+                )?)
+            }
+            _ => None,
+        };
         let mut gg = Gguf {
             content,
             reader,
@@ -262,18 +320,27 @@ impl Qwen4Exp<Resident> {
                     gg.qmat(&format!("{p}.ssm_out.weight"))?,
                     &cfg,
                 )),
-                // The Lightning indexer (`indexer.*`) is not loaded: at context
-                // <= indexer_budget QSA is dense QK-norm GQA byte-exactly; the
-                // long-context selection is #748's.
-                LayerKind::Full => Mixer::Full(QsaAttention::new(
-                    gg.qmat(&format!("{p}.attn_q.weight"))?,
-                    gg.qmat(&format!("{p}.attn_k.weight"))?,
-                    gg.qmat(&format!("{p}.attn_v.weight"))?,
-                    gg.qmat(&format!("{p}.attn_output.weight"))?,
-                    RmsNorm::new(gg.f32(&format!("{p}.attn_q_norm.weight"))?, cfg.norm_eps),
-                    RmsNorm::new(gg.f32(&format!("{p}.attn_k_norm.weight"))?, cfg.norm_eps),
-                    &cfg,
-                )),
+                LayerKind::Full => {
+                    let indexer = Indexer::new(
+                        gg.qmat(&format!("{p}.indexer.q_proj.weight"))?,
+                        gg.qmat(&format!("{p}.indexer.k_proj.weight"))?,
+                        RmsNorm::new(gg.f32(&format!("{p}.indexer.q_norm.weight"))?, cfg.norm_eps),
+                        RmsNorm::new(gg.f32(&format!("{p}.indexer.k_norm.weight"))?, cfg.norm_eps),
+                        &cfg,
+                    )?;
+                    Mixer::Full(
+                        QsaAttention::new(
+                            gg.qmat(&format!("{p}.attn_q.weight"))?,
+                            gg.qmat(&format!("{p}.attn_k.weight"))?,
+                            gg.qmat(&format!("{p}.attn_v.weight"))?,
+                            gg.qmat(&format!("{p}.attn_output.weight"))?,
+                            RmsNorm::new(gg.f32(&format!("{p}.attn_q_norm.weight"))?, cfg.norm_eps),
+                            RmsNorm::new(gg.f32(&format!("{p}.attn_k_norm.weight"))?, cfg.norm_eps),
+                            &cfg,
+                        )
+                        .with_indexer(indexer),
+                    )
+                }
             };
             let experts = Resident::new(
                 gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,
@@ -295,6 +362,37 @@ impl Qwen4Exp<Resident> {
             layers.push(Layer::new(hc_attn, mixer, hc_ffn, moe));
         }
 
-        Ok(Qwen4Exp::new(embed_tokens, layers, hc_head, lm_head, cfg))
+        let mut model = Qwen4Exp::new(embed_tokens, layers, hc_head, lm_head, cfg.clone());
+        if let Some(dt) = opts.moe_act {
+            model.set_routed_act(dt);
+        }
+        if let (Some(hash), Some(shard), Some(&l)) =
+            (ple_hash, &opts.ple_shard, cfg.ple_layers.first())
+        {
+            let p = format!("blk.{l}");
+            let block = PleLayer::new(
+                gg.qmat(&format!("{p}.ple_key.weight"))?,
+                gg.qmat(&format!("{p}.ple_value.weight"))?,
+                gg.f32(&format!("{p}.ple_norm_key.weight"))?,
+                gg.f32(&format!("{p}.ple_norm_query.weight"))?,
+                gg.f32(&format!("{p}.ple_norm_conv.weight"))?,
+                // ggml `[k, hc_dim]` → candle `[hc_dim, k]`.
+                gg.f32(&format!("{p}.ple_conv1d.weight"))?,
+                n,
+                d,
+                cfg.ple_ngram_size,
+                eps,
+            )?;
+            let table = MmapPleTable::open(shard)?;
+            if table.rows() < hash.total_rows() as usize {
+                lloom_tensor::bail!(
+                    "ple table has {} rows, the hash needs {}",
+                    table.rows(),
+                    hash.total_rows()
+                )
+            }
+            model.set_ple(l, hash, PleTable::Mmap(table), block)?;
+        }
+        Ok(model)
     }
 }

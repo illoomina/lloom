@@ -66,6 +66,17 @@ pub struct RecurrentState {
     window_open: bool,
 }
 
+/// Whether every state write replaces the slab with a fresh copy instead of
+/// writing it in place (`QWEN4EXP_STATE_WRITE=copy`, read once). A debugging
+/// instrument behind a gate (§3.3a): an allocation per layer per token,
+/// never the shipping path.
+fn state_write_by_copy() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("QWEN4EXP_STATE_WRITE").map(|v| v == "copy").unwrap_or(false)
+    })
+}
+
 impl RecurrentState {
     /// A fresh channel for `n_layers`, every layer at its implicit zero state.
     /// No device buffers yet — the slab is allocated lazily on first write, at
@@ -98,6 +109,14 @@ impl RecurrentState {
         match &self.slab[l] {
             // Steady state: copy into the existing buffer in place.
             Some(buf) => {
+                if state_write_by_copy() {
+                    // Instrument: replace the slab with a fresh own-storage copy
+                    // instead of writing it in place (the A/B for an in-place
+                    // write hazard; `QWEN4EXP_STATE_WRITE=copy`, read once).
+                    let _declared = lloom_tensor::EscapeGuard::new();
+                    self.slab[l] = Some(next.copy()?);
+                    return Ok(());
+                }
                 if buf.id() != next.id() {
                     if buf.dims() != next.dims() {
                         lloom_tensor::bail!(

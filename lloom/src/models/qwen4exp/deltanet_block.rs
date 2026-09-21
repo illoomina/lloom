@@ -8,7 +8,8 @@
 
 use super::config::Config;
 use super::deltanet::{
-    conv_decode_step, decode_step, gate_and_beta, gqa_expand, l2_norm_last, q_scale, DeltaNetDims,
+    chunk_forward, conv_decode_step, conv_prefill, decode_step, gate_and_beta, gqa_expand,
+    gqa_expand_seq, l2_norm_last, q_scale, DeltaNetDims, CHUNK_SIZE,
 };
 use crate::nn::{ops, RecurrentState};
 use lloom_tensor::quantized::QMatMul;
@@ -156,6 +157,71 @@ impl GatedDeltaNet {
         self.ssm_out.forward(&gated)
     }
 
+    /// A whole chunk `x [1, seq, hidden]` → `[1, seq, hidden]` (Kernel B), the
+    /// same composition as [`Self::decode`] with the conv over the chunk and
+    /// the chunkwise recurrence; leaves the state channels where `seq` decode
+    /// steps would (position by position, to fp32 reorder).
+    pub fn prefill(
+        &self,
+        x: &Tensor,
+        l: usize,
+        s_state: &mut RecurrentState,
+        conv_state: &mut RecurrentState,
+    ) -> Result<Tensor> {
+        let dims = self.dims;
+        let (d_k, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
+        let (b, seq, _) = x.dims3()?;
+        if b != 1 {
+            lloom_tensor::bail!("deltanet prefill takes one sequence, got {:?}", x.shape())
+        }
+        let qkv = self.wqkv.forward(x)?; // [1, seq, conv_channels]
+        let z = self.wqkv_gate.forward(x)?; // [1, seq, value_dim]
+        let (g, beta) = gate_and_beta(
+            x,
+            &self.ssm_beta,
+            &self.ssm_alpha,
+            &self.ssm_dt,
+            &self.ssm_a,
+        )?;
+        let g = g.reshape((seq, h_v))?;
+        let beta = beta.reshape((seq, h_v))?;
+
+        let qkv = qkv.reshape((seq, self.conv_channels))?;
+        let (conv_out, new_win) = conv_prefill(
+            &qkv,
+            &self.conv_weight,
+            conv_state.get(l),
+            self.conv_channels,
+            self.conv_k,
+        )?;
+        conv_state.write(l, new_win)?;
+        let conv_out = ops::silu(&conv_out)?; // [seq, conv_channels]
+
+        let q = conv_out
+            .narrow(1, 0, self.key_dim)?
+            .reshape((seq, h_k, d_k))?;
+        let k = conv_out
+            .narrow(1, self.key_dim, self.key_dim)?
+            .reshape((seq, h_k, d_k))?;
+        let v = conv_out
+            .narrow(1, 2 * self.key_dim, self.value_dim)?
+            .reshape((seq, h_v, dims.d_v))?;
+        let q = l2_norm_last(&q, self.norm_eps)?;
+        let k = l2_norm_last(&k, self.norm_eps)?;
+        let q = gqa_expand_seq::<false>(&q, h_k, h_v)?;
+        let k = gqa_expand_seq::<false>(&k, h_k, h_v)?;
+        let q = q_scale(&q, d_k)?;
+
+        let (o, new_s) = chunk_forward(dims, &q, &k, &v, &g, &beta, s_state.get(l), CHUNK_SIZE)?;
+        s_state.write(l, new_s)?;
+
+        let o_flat = o.reshape((1, seq, self.value_dim))?;
+        let normed = self.gated_rms_norm(&o_flat)?;
+        let z_gate = ops::sigmoid(&z.to_dtype(normed.dtype())?)?;
+        let gated = (normed * z_gate)?;
+        self.ssm_out.forward(&gated)
+    }
+
     /// GatedRMSNorm over the value-head dim with the `ssm_norm` weight. `o` is
     /// `[1, 1, value_dim]`; normalize per value-head (over d_v) then scale.
     fn gated_rms_norm(&self, o: &Tensor) -> Result<Tensor> {
@@ -261,6 +327,273 @@ mod tests {
         // The state channel holds this layer's S now.
         assert!(s_state.get(0).is_some());
         assert!(conv_state.get(0).is_some());
+    }
+
+    /// The chunk path equals the per-token path on a whole block (conv window,
+    /// gates, recurrence, gated norm, out-proj): same outputs per position and
+    /// the same state channels afterwards, from a mid-sequence state, at a
+    /// length past one chunk. The block's own composition is the reference —
+    /// `chunk_forward`'s parity against Kernel A is pinned in `deltanet`.
+    #[test]
+    fn prefill_matches_decode_replay() {
+        let dev = Device::Cpu;
+        let cfg = Config::tiny();
+        let d = cfg.hidden_size;
+        let conv_ch = cfg.conv_channels();
+        let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
+        let h_v = cfg.ssm_dt_rank;
+        let d_v = cfg.ssm_state_size;
+        let blk = GatedDeltaNet::new(
+            lin(conv_ch, d, &dev),
+            lin(value_dim, d, &dev),
+            vecw(conv_ch * cfg.ssm_conv_kernel, &dev, |i| {
+                ((i as f32 * 0.03).cos()) * 0.2
+            })
+            .reshape((conv_ch, cfg.ssm_conv_kernel))
+            .unwrap(),
+            vecw(h_v, &dev, |i| -0.5 - 0.01 * i as f32),
+            vecw(h_v, &dev, |i| 0.1 * i as f32),
+            lin(h_v, d, &dev),
+            lin(h_v, d, &dev),
+            vecw(d_v, &dev, |i| 1.0 + 0.05 * i as f32),
+            lin(d, value_dim, &dev),
+            &cfg,
+        );
+        let tok = |seed: f32| -> Vec<f32> {
+            (0..d)
+                .map(|i| ((i as f32 * 0.05 + seed).sin()) * 0.6)
+                .collect()
+        };
+        // Warm both paths with the same 3 decode tokens, then compare a
+        // 70-position chunk (more than CHUNK_SIZE = 64) against 70 decode steps.
+        let (mut s_a, mut c_a) = (RecurrentState::new(1), RecurrentState::new(1));
+        let (mut s_b, mut c_b) = (RecurrentState::new(1), RecurrentState::new(1));
+        for t in 0..3 {
+            let x = Tensor::from_vec(tok(t as f32), (1, 1, d), &dev).unwrap();
+            blk.decode(&x, 0, &mut s_a, &mut c_a).unwrap();
+            blk.decode(&x, 0, &mut s_b, &mut c_b).unwrap();
+        }
+        let seq = 70;
+        let flat: Vec<f32> = (0..seq).flat_map(|t| tok(10.0 + t as f32)).collect();
+        let x = Tensor::from_vec(flat, (1, seq, d), &dev).unwrap();
+        let out = blk.prefill(&x, 0, &mut s_a, &mut c_a).unwrap();
+        assert_eq!(out.dims(), &[1, seq, d]);
+        let mut rows = Vec::with_capacity(seq);
+        for t in 0..seq {
+            rows.push(
+                blk.decode(&x.narrow(1, t, 1).unwrap(), 0, &mut s_b, &mut c_b)
+                    .unwrap(),
+            );
+        }
+        let out_ref = Tensor::cat(&rows, 1).unwrap();
+        let (a, b) = (
+            out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            out_ref.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        let scale = b.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+        let maxdiff = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            maxdiff <= 1e-4 * scale,
+            "outputs differ by {maxdiff} at scale {scale}"
+        );
+        for (name, ca, cb) in [("S", &s_a, &s_b), ("conv", &c_a, &c_b)] {
+            let (va, vb) = (
+                ca.get(0)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                cb.get(0)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+            );
+            let sc = vb.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+            let md = va
+                .iter()
+                .zip(&vb)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                md <= 1e-4 * sc,
+                "{name} state differs by {md} at scale {sc}"
+            );
+        }
+    }
+
+    /// The Metal chunk path matches the CPU chunk path on the real head
+    /// geometry (16 k-heads → 48 v-heads, d 128, conv 10240 channels) at a
+    /// small hidden size: same weights on both devices, 70 positions (past one
+    /// chunk), outputs and both state channels equal within f32 reduction noise.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn prefill_metal_matches_cpu() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let d = cfg.hidden_size;
+        let conv_ch = cfg.conv_channels();
+        let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
+        let h_v = cfg.ssm_dt_rank;
+        let d_v = cfg.ssm_state_size;
+        let build = |dev: &Device| {
+            let lin = |out: usize, inp: usize, seed: f32| {
+                QMatMul::Tensor(
+                    Tensor::from_vec(
+                        (0..out * inp)
+                            .map(|i| ((i as f32 * 0.017 + seed).sin()) * 0.05)
+                            .collect::<Vec<_>>(),
+                        (out, inp),
+                        dev,
+                    )
+                    .unwrap(),
+                )
+            };
+            let vecw = |n: usize, f: &dyn Fn(usize) -> f32| {
+                Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, dev).unwrap()
+            };
+            GatedDeltaNet::new(
+                lin(conv_ch, d, 1.0),
+                lin(value_dim, d, 2.0),
+                vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
+                    ((i as f32 * 0.03).cos()) * 0.2
+                })
+                .reshape((conv_ch, cfg.ssm_conv_kernel))
+                .unwrap(),
+                vecw(h_v, &|i| -0.5 - 0.01 * i as f32),
+                vecw(h_v, &|i| 0.1 * (i % 7) as f32),
+                lin(h_v, d, 4.0),
+                lin(h_v, d, 5.0),
+                vecw(d_v, &|i| 1.0 + 0.01 * (i % 5) as f32),
+                lin(d, value_dim, 6.0),
+                &cfg,
+            )
+        };
+        let (b_cpu, b_gpu) = (build(&cpu), build(&gpu));
+        let seq = 70;
+        let flat: Vec<f32> = (0..seq * d)
+            .map(|i| ((i as f32 * 0.05).sin()) * 0.6)
+            .collect();
+        let x_cpu = Tensor::from_vec(flat.clone(), (1, seq, d), &cpu).unwrap();
+        let x_gpu = Tensor::from_vec(flat, (1, seq, d), &gpu).unwrap();
+        let (mut sc, mut cc) = (RecurrentState::new(1), RecurrentState::new(1));
+        let (mut sg, mut cg) = (RecurrentState::new(1), RecurrentState::new(1));
+        let oc = b_cpu.prefill(&x_cpu, 0, &mut sc, &mut cc).unwrap();
+        let og = b_gpu.prefill(&x_gpu, 0, &mut sg, &mut cg).unwrap();
+        let cmp = |name: &str, a: &Tensor, b: &Tensor, tol: f32| {
+            let va = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let vb = b
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(va.len(), vb.len());
+            assert_eq!(
+                vb.iter().filter(|x| !x.is_finite()).count(),
+                0,
+                "{name}: non-finite on Metal"
+            );
+            let scale = va.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
+            let md = va
+                .iter()
+                .zip(&vb)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                md <= tol * scale,
+                "{name}: Metal/CPU differ by {md} at scale {scale}"
+            );
+        };
+        cmp("output", &oc, &og, 2e-3);
+        cmp("S", sc.get(0).unwrap(), sg.get(0).unwrap(), 2e-3);
+        cmp("conv", cc.get(0).unwrap(), cg.get(0).unwrap(), 1e-4);
+    }
+
+    /// Run-to-run identity of the decode path at the real geometry (16 → 48
+    /// heads × 128, 10240 conv channels) over 1500 steps, twice from fresh
+    /// state channels: every step's output bit-identical. The state is
+    /// rewritten in place every step (`RecurrentState::write`), so a missing
+    /// read-before-write fence on the slab would show here as a step whose
+    /// two passes disagree.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn decode_is_repeatable_at_real_geometry() {
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let d = cfg.hidden_size;
+        let conv_ch = cfg.conv_channels();
+        let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
+        let h_v = cfg.ssm_dt_rank;
+        let d_v = cfg.ssm_state_size;
+        let lin = |out: usize, inp: usize, seed: f32| {
+            QMatMul::Tensor(
+                Tensor::from_vec(
+                    (0..out * inp).map(|i| ((i as f32 * 0.017 + seed).sin()) * 0.05).collect::<Vec<_>>(),
+                    (out, inp),
+                    &gpu,
+                )
+                .unwrap(),
+            )
+        };
+        let vecw = |n: usize, f: &dyn Fn(usize) -> f32| Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, &gpu).unwrap();
+        let blk = GatedDeltaNet::new(
+            lin(conv_ch, d, 1.0),
+            lin(value_dim, d, 2.0),
+            vecw(conv_ch * cfg.ssm_conv_kernel, &|i| ((i as f32 * 0.03).cos()) * 0.2)
+                .reshape((conv_ch, cfg.ssm_conv_kernel))
+                .unwrap(),
+            vecw(h_v, &|i| -0.5 - 0.01 * i as f32),
+            vecw(h_v, &|i| 0.1 * (i % 7) as f32),
+            lin(h_v, d, 4.0),
+            lin(h_v, d, 5.0),
+            vecw(d_v, &|i| 1.0 + 0.01 * (i % 5) as f32),
+            lin(d, value_dim, 6.0),
+            &cfg,
+        );
+        let steps = 1500usize;
+        let xs: Vec<Tensor> = (0..steps)
+            .map(|t| {
+                Tensor::from_vec(
+                    (0..d).map(|i| ((i as f32 * 0.05 + t as f32).sin()) * 0.6).collect::<Vec<f32>>(),
+                    (1, 1, d),
+                    &gpu,
+                )
+                .unwrap()
+            })
+            .collect();
+        let run = || -> Vec<Vec<f32>> {
+            let (mut s, mut c) = (RecurrentState::new(1), RecurrentState::new(1));
+            xs.iter()
+                .map(|x| {
+                    blk.decode(x, 0, &mut s, &mut c)
+                        .unwrap()
+                        .to_device(&Device::Cpu)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                })
+                .collect()
+        };
+        let a = run();
+        let b = run();
+        for (t, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(x.iter().all(|v| v.is_finite()), "step {t}: non-finite");
+            let n_diff = x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+            assert_eq!(n_diff, 0, "step {t}: {n_diff} of {} values differ between two identical passes", x.len());
+        }
     }
 
     /// The block runs on a `Config::tiny` FULL-attn interval layer index too

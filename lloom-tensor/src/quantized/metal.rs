@@ -524,16 +524,27 @@ impl QMetalStorage {
     ) -> Result<(MetalStorage, Shape)> {
         use crate::MetalError;
 
+        use crate::kernels::{GemvFloat, GemvTriple};
         let (n_experts, n, k) = self_shape.dims3()?;
         if !input_l.is_contiguous() || !ids_l.is_contiguous() {
             crate::bail!("indexed_moe_forward needs contiguous input and ids")
         }
-        if input.dtype() != DType::F32 {
-            crate::bail!(
-                "indexed_moe_forward on Metal takes f32 activations, got {:?}",
-                input.dtype()
-            )
-        }
+        // The activation dtype chooses the triple, as the plain matmul-vec does
+        // (issue #748): f16 activations read and store f16 on the quantized
+        // rows; f32 keeps the byte-identical `_f32` routed arm.
+        let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
+        let triple = match input.dtype() {
+            DType::F32 => GemvTriple::F32F32F32,
+            DType::F16 if ggml_dtype.has_gemv_triple() => GemvTriple::F16F32F16,
+            other => crate::bail!(
+                "indexed_moe_forward on Metal has no ({other:?}, f32, _) arm for weight {:?}",
+                self.dtype
+            ),
+        };
+        let store_dtype = match triple.store() {
+            GemvFloat::F16 => DType::F16,
+            GemvFloat::F32 => DType::F32,
+        };
         if ids.dtype() != DType::U32 {
             crate::bail!("indexed_moe_forward ids must be u32, got {:?}", ids.dtype())
         }
@@ -552,7 +563,7 @@ impl QMetalStorage {
         let dst_shape = Shape::from((batch, topk, n));
         let dst = device
             .new_buffer_builder()
-            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_size_for(dst_shape.elem_count(), store_dtype)
             .with_label("qmatmul_id")
             .build()?;
         let encoder = device.command_encoder()?;
@@ -560,18 +571,19 @@ impl QMetalStorage {
             device.device(),
             &encoder,
             device.kernels(),
-            self.dtype.into(),
+            ggml_dtype,
+            triple,
             (n_experts, n, k),
             (batch, topk, in_dim1),
             &self.buffer,
             input.buffer(),
-            input_l.start_offset() * DType::F32.size_in_bytes(),
+            input_l.start_offset() * input.dtype().size_in_bytes(),
             ids.buffer(),
             ids_l.start_offset() * DType::U32.size_in_bytes(),
             &dst,
         )
         .map_err(MetalError::from)?;
-        let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+        let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), store_dtype);
         Ok((out, dst_shape))
     }
 

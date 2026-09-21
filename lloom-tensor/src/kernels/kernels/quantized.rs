@@ -426,14 +426,18 @@ pub fn call_quantized_matmul_mv_t(
 /// `batch * topk` planes — the kernel decodes `(token, slot)` from the plane
 /// index and the per-dtype core sees a plain `m == 1` GEMV.
 ///
-/// f32 activations and store only: the `_id` kernels wrap the cores' f32
-/// aliases (the f16 routed arm is #750 item B, additive when its caller lands).
+/// `triple` picks the `(activation, accumulate, store)` arm: `(f32, f32,
+/// f32)` wraps the cores' f32 aliases; `(f16, f32, f16)` (issue #748, #750
+/// item B) wraps the same genericized cores at `<half, half>` — quantized
+/// weight rows only, as the plain dispatch. `src1` is read and `dst` written
+/// in the triple's legs.
 #[allow(clippy::too_many_arguments)]
 pub fn call_quantized_matmul_mv_id_t(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
     dtype: GgmlDType,
+    triple: GemvTriple,
     (n_experts, n, k): (usize, usize, usize),
     (batch, topk, in_dim1): (usize, usize, usize),
     src0: &Buffer,
@@ -443,6 +447,18 @@ pub fn call_quantized_matmul_mv_id_t(
     ids_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    if !triple.is_implemented() {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "declared-unimplemented GemvTriple (M5 native-int)",
+            "routed quantized matmul-vec",
+        ));
+    }
+    if triple != GemvTriple::F32F32F32 && !dtype.has_gemv_triple() {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "non-f32 GemvTriple",
+            "dense/Q8 routed quantized matmul-vec",
+        ));
+    }
     let stem = match dtype {
         GgmlDType::F32 => "f32",
         GgmlDType::F16 => "f16",
@@ -471,7 +487,15 @@ pub fn call_quantized_matmul_mv_id_t(
             ))
         }
     };
-    let name = format!("kernel_mul_mv_id_{stem}_f32");
+    let name = format!("kernel_mul_mv_id_{stem}_{}", triple.name_suffix());
+    let act_size = match triple.activation() {
+        GemvFloat::F32 => core::mem::size_of::<f32>(),
+        GemvFloat::F16 => 2,
+    } as u64;
+    let store_size = match triple.store() {
+        GemvFloat::F32 => core::mem::size_of::<f32>(),
+        GemvFloat::F16 => 2,
+    } as u64;
     if in_dim1 != 1 && in_dim1 != topk {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
             "routed matmul-vec activation dim1 must be 1 or topk",
@@ -493,12 +517,12 @@ pub fn call_quantized_matmul_mv_id_t(
     let ne11 = in_dim1 as i64;
     let ne12 = batch as i64;
     let ne13 = 1i64;
-    let nb10 = core::mem::size_of::<f32>() as u64;
-    let nb11 = (k * core::mem::size_of::<f32>()) as u64;
-    let nb12 = (in_dim1 * k * core::mem::size_of::<f32>()) as u64;
+    let nb10 = act_size;
+    let nb11 = k as u64 * act_size;
+    let nb12 = (in_dim1 * k) as u64 * act_size;
     let ne0 = n as i64;
     let ne1 = topk as i64;
-    let nb1 = (n * core::mem::size_of::<f32>()) as u64;
+    let nb1 = n as u64 * store_size;
 
     let (nth0, nth1, align) = mv_threadgroup(dtype);
     let thread_groups_count = MTLSize {

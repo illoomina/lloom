@@ -84,6 +84,11 @@ pub struct MoeLayer<R: ExpertResidency> {
     /// Shared-expert gate `hidden -> 1` (`ffn_gate_inp_shexp`).
     sh_router: QMatMul,
     n_experts_per_tok: usize,
+    /// The activation dtype of the routed dispatch — its `(activation, f32,
+    /// store)` triple (§15.2a): `F32` is the byte-identical `_f32` routed arm,
+    /// `F16` the `(f16, f32, f16)` arm (issue #748). The combine over slots
+    /// stays f32 either way.
+    routed_act: DType,
 }
 
 impl<R: ExpertResidency> MoeLayer<R> {
@@ -105,30 +110,50 @@ impl<R: ExpertResidency> MoeLayer<R> {
             sh_down,
             sh_router,
             n_experts_per_tok: cfg.n_experts_per_tok,
+            routed_act: DType::F32,
         }
+    }
+
+    /// Select the routed dispatch's activation dtype (`F32` or `F16`).
+    pub fn set_routed_act(&mut self, dtype: DType) {
+        self.routed_act = dtype;
+    }
+
+    pub fn routed_act(&self) -> DType {
+        self.routed_act
     }
 
     /// One decode token through the MoE. `x` is `[1, 1, hidden]`, returns
     /// `[1, 1, hidden]` = routed top-k combine + gated shared expert.
+    pub fn decode(&self, x: &Tensor) -> Result<Tensor> {
+        self.forward(x)
+    }
+
+    /// `x [1, seq, hidden]` → `[1, seq, hidden]`, every position routed on
+    /// its own: routed top-k combine + gated shared expert.
     ///
     /// Everything stays on the device: the top-k ids feed the routed dispatch
-    /// directly and the weighted sum over slots is a broadcast-multiply and a
-    /// reduction. Correctness-first: the routing is a softmax over all experts,
-    /// top-k, renormalize (reference `build_moe_ffn`).
-    pub fn decode(&self, x: &Tensor) -> Result<Tensor> {
-        let hidden = x.dim(D::Minus1)?;
+    /// directly (`seq` planes of `topk` slots) and the weighted sum over slots
+    /// is a broadcast-multiply and a reduction. Correctness-first: the routing
+    /// is a softmax over all experts, top-k, renormalize (reference
+    /// `build_moe_ffn`).
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, seq, hidden) = x.dims3()?;
+        if b != 1 {
+            lloom_tensor::bail!("moe takes one sequence, got {:?}", x.shape())
+        }
         let topk = self.n_experts_per_tok;
-        let x1 = x.reshape((1, hidden))?; // [1, hidden]
+        let x1 = x.reshape((seq, hidden))?; // [seq, hidden]
 
         // Router: softmax over all experts, then top-k select + renormalize.
-        let logits = self.router.forward(&x1)?.to_dtype(DType::F32)?; // [1, n_experts]
+        let logits = self.router.forward(&x1)?.to_dtype(DType::F32)?; // [seq, n_experts]
         super::trace("moe.logits", usize::MAX, &logits);
-        let probs = ops::softmax_last_dim(&logits)?; // [1, n_experts]
+        let probs = ops::softmax_last_dim(&logits)?; // [seq, n_experts]
         let ids = probs
             .arg_sort_last_dim(false)?
             .narrow(D::Minus1, 0, topk)?
-            .contiguous()?; // [1, topk] u32
-        let w = probs.gather(&ids, D::Minus1)?; // [1, topk]
+            .contiguous()?; // [seq, topk] u32
+        let w = probs.gather(&ids, D::Minus1)?; // [seq, topk]
         let w = w.broadcast_div(&w.sum_keepdim(D::Minus1)?)?;
         if super::trace_enabled() {
             eprintln!(
@@ -138,26 +163,28 @@ impl<R: ExpertResidency> MoeLayer<R> {
             );
         }
 
-        // The selected experts' SwiGLU, one routed dispatch per projection.
-        let x3 = x1.to_dtype(DType::F32)?.reshape((1, 1, hidden))?; // [1, 1, hidden]
-        let (g, u) = self.experts.gate_up(&x3, &ids)?; // [1, topk, n_ff] each
+        // The selected experts' SwiGLU, one routed dispatch per projection,
+        // in the routed arm's activation dtype.
+        let x3 = x1.to_dtype(self.routed_act)?.reshape((seq, 1, hidden))?; // [seq, 1, hidden]
+        let (g, u) = self.experts.gate_up(&x3, &ids)?; // [seq, topk, n_ff] each
         super::trace("moe.g", usize::MAX, &g);
         super::trace("moe.u", usize::MAX, &u);
         let h = (ops::silu(&g)? * u)?;
-        let y = self.experts.down(&h, &ids)?; // [1, topk, hidden]
+        let y = self.experts.down(&h, &ids)?; // [seq, topk, hidden]
         super::trace("moe.y", usize::MAX, &y);
         let routed = y
-            .broadcast_mul(&w.reshape((1, topk, 1))?)?
+            .to_dtype(DType::F32)?
+            .broadcast_mul(&w.reshape((seq, topk, 1))?)?
             .sum(1)?
-            .to_dtype(x1.dtype())?; // [1, hidden]
+            .to_dtype(x1.dtype())?; // [seq, hidden]
 
         // Shared expert: SwiGLU gated by sigmoid(sh_router·x), always on.
         let shared = swiglu(&x1, &self.sh_gate, &self.sh_up, &self.sh_down)?;
-        let sh_gate_v = ops::sigmoid(&self.sh_router.forward(&x1)?.to_dtype(shared.dtype())?)?; // [1, 1]
+        let sh_gate_v = ops::sigmoid(&self.sh_router.forward(&x1)?.to_dtype(shared.dtype())?)?; // [seq, 1]
         let shared = shared.broadcast_mul(&sh_gate_v)?;
 
         let out = (routed + shared)?;
-        out.reshape((1, 1, hidden))
+        out.reshape((1, seq, hidden))
     }
 }
 
@@ -319,6 +346,57 @@ mod tests {
             assert!((g - w).abs() < 1e-5, "mismatch at {i}: got {g} want {w}");
         }
         assert!(want.iter().any(|w| w.abs() > 1e-6), "degenerate reference");
+    }
+
+    /// A chunk through `forward` equals its positions through `decode` one by
+    /// one (per-position routing, the `seq`-plane routed dispatch, the
+    /// per-row combine).
+    #[test]
+    fn forward_over_seq_matches_per_position_decode() {
+        let dev = Device::Cpu;
+        let mut cfg = Config::tiny();
+        cfg.n_experts = 6;
+        cfg.n_experts_per_tok = 3;
+        let (h, ff, ne) = (cfg.hidden_size, cfg.moe_intermediate_size, cfg.n_experts);
+        let moe = MoeLayer::new(
+            lin(ne, h, 1.0, &dev),
+            Resident::new(
+                stacked(ne, ff, h, 1.0, &dev),
+                stacked(ne, ff, h, 2.0, &dev),
+                stacked(ne, h, ff, 3.0, &dev),
+            ),
+            lin(ff, h, 2.0, &dev),
+            lin(ff, h, 3.0, &dev),
+            lin(h, ff, 4.0, &dev),
+            lin(1, h, 5.0, &dev),
+            &cfg,
+        );
+        let seq = 5;
+        let x = Tensor::from_vec(
+            (0..seq * h)
+                .map(|i| ((i as f32) * 0.07).sin() * 0.4)
+                .collect::<Vec<f32>>(),
+            (1, seq, h),
+            &dev,
+        )
+        .unwrap();
+        let all = moe.forward(&x).unwrap();
+        assert_eq!(all.dims(), &[1, seq, h]);
+        for t in 0..seq {
+            let one = moe.decode(&x.narrow(1, t, 1).unwrap()).unwrap();
+            let (a, b) = (
+                all.narrow(1, t, 1)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap(),
+                one.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            );
+            for (x, y) in a.iter().zip(&b) {
+                assert!((x - y).abs() < 1e-5, "position {t}: {a:?} vs {b:?}");
+            }
+        }
     }
 
     /// Router selects exactly `n_experts_per_tok` experts and the path runs

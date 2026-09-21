@@ -49,6 +49,7 @@ pub struct GatedDeltaNet {
 
 impl GatedDeltaNet {
     /// The per-layer geometry, from the config.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         wqkv: QMatMul,
         wqkv_gate: QMatMul,

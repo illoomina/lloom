@@ -3,8 +3,8 @@
 //! For context ≤ `indexer_budget` (2048) QSA is BYTE-IDENTICAL to dense QK-norm
 //! GQA attention: the reference's Lightning indexer returns
 //! `width = min(n_kv, budget + r − 1)`, which is every cell when `n_kv ≤ budget`
-//! (`qwen4exp.cpp:665`). So this builds the dense path — QK-norm + partial-mRoPE
-//! + output-gate + `wo` — which is correct (not approximate) for ≤2048 tokens;
+//! (`qwen4exp.cpp:665`). So this builds the dense path — QK-norm, partial-mRoPE,
+//! output-gate, `wo` — which is correct (not approximate) for ≤2048 tokens;
 //! the indexer sparsification (the risky kernel) is the long-context path, and is
 //! deferred (`design/docs/models/qwen3.8-flash-next.md`, "the #28734 lesson").
 //!

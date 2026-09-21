@@ -17,9 +17,40 @@ pub mod moe;
 pub mod qsa;
 
 pub use config::{Config, LayerKind};
-pub use deltanet::{DeltaNetDims, decode_step};
+pub use deltanet::{decode_step, DeltaNetDims};
 pub use deltanet_block::GatedDeltaNet;
 pub use hc::HyperConnection;
 pub use model::{Cache, Layer, Mixer, Qwen4Exp};
 pub use moe::{ExpertResidency, MoeLayer, Resident};
 pub use qsa::{KvCache, QsaAttention};
+
+/// Sub-block activation trace, for bisecting a non-finite forward on the real
+/// model. Off unless `QWEN4EXP_TRACE` is set (read once); when on, each
+/// sub-block's output is read back and summarized — a debugging instrument
+/// behind a gate (§3.3a), never on the shipping path.
+pub(crate) fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_TRACE").is_some())
+}
+
+pub(crate) fn trace(tag: &str, l: usize, t: &lloom_tensor::Tensor) {
+    if !trace_enabled() {
+        return;
+    }
+    let v = t
+        .flatten_all()
+        .and_then(|t| t.to_dtype(lloom_tensor::DType::F32))
+        .and_then(|t| t.to_vec1::<f32>())
+        .unwrap_or_default();
+    let nonfinite = v.iter().filter(|x| !x.is_finite()).count();
+    let maxabs = v
+        .iter()
+        .filter(|x| x.is_finite())
+        .fold(0f32, |m, x| m.max(x.abs()));
+    if nonfinite > 0 || l <= 4 {
+        eprintln!(
+            "TRACE layer={l} {tag} n={} nonfinite={nonfinite} maxabs={maxabs:.4e}",
+            v.len()
+        );
+    }
+}

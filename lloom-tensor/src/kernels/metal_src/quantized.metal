@@ -4893,7 +4893,7 @@ void kernel_mul_mv_q2_K_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
@@ -5102,7 +5102,7 @@ void kernel_mul_mv_q3_K_impl(
         sumf1[row] = simd_sum(sumf);
     }
     if (tiisg == 0) {
-        for (int row = 0; row < 2; ++row) {
+        for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(sumf1[row]);
         }
     }
@@ -5266,7 +5266,7 @@ void kernel_mul_mv_q4_K_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
@@ -5445,7 +5445,7 @@ void kernel_mul_mv_q5_K_impl(
 
     for (int row = 0; row < 2; ++row) {
         const float tot = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(tot);
         }
     }
@@ -5578,7 +5578,7 @@ void kernel_mul_mv_q6_K_impl(
     }
 
     const float tot = simd_sum(sumf);
-    if (tiisg == 0) {
+    if (tiisg == 0 && row < ne01) {
         dst[r1*ne0 + im*ne0*ne1 + row] = (STORE)(tot);
     }
 }
@@ -5729,7 +5729,7 @@ void kernel_mul_mv_iq2_xxs_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum * 0.25f);
         }
     }
@@ -5890,7 +5890,7 @@ void kernel_mul_mv_iq2_xs_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum * 0.25f);
         }
     }
@@ -6044,7 +6044,7 @@ void kernel_mul_mv_iq3_xxs_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum * 0.5f);
         }
     }
@@ -6198,7 +6198,7 @@ void kernel_mul_mv_iq3_s_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
@@ -6353,7 +6353,7 @@ void kernel_mul_mv_iq2_s_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum * 0.25f);
         }
     }
@@ -6494,7 +6494,7 @@ void kernel_mul_mv_iq1_s_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
@@ -6615,7 +6615,7 @@ void kernel_mul_mv_iq1_m_impl(
 
     for (int row = 0; row < N_DST; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
@@ -6731,7 +6731,7 @@ void kernel_mul_mv_iq4_nl_impl(
 
     for (int row = 0; row < 2 && first_row + row < ne01; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }
@@ -6848,7 +6848,7 @@ void kernel_mul_mv_iq4_xs_impl(
 
     for (int row = 0; row < 2; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
         }
     }

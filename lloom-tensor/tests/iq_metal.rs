@@ -192,3 +192,24 @@ fn iq_embedding_matches_cpu_dequant_reference() -> Result<()> {
     }
     Ok(())
 }
+
+/// The one-superblock case (`k == 256`, `nb == 1`): the K-quant-shaped cores
+/// walk 32-blocks across simdgroup lanes and advance per-row pointers by `nb`
+/// blocks, so `nb == 1` is the tightest layout.
+#[test]
+fn iq_gemv_f32_matches_reference_at_one_superblock() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let (n, k) = (40usize, 256usize);
+    for dtype in TYPES {
+        let (w, w_ref) = weight(dtype, n, k, 13, &dev)?;
+        let x = activations(1, k)?;
+        let want = x.matmul(&w_ref.t()?)?;
+        let got = QMatMul::from_qtensor(w)?.forward(&x.to_device(&dev)?)?;
+        let err = mean_rel_err(&got, &want)?;
+        assert!(
+            err < 1e-4,
+            "{dtype:?} f32 GEMV at k=256: mean rel err {err}"
+        );
+    }
+    Ok(())
+}

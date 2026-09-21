@@ -102,7 +102,13 @@ impl GatedDeltaNet {
         let z = self.wqkv_gate.forward(x)?; // [1,1,value_dim]
 
         // gate: β = σ(ssm_beta·x); g = ssm_a·softplus(ssm_alpha·x + dt_bias).
-        let (g, beta) = gate_and_beta(x, &self.ssm_beta, &self.ssm_alpha, &self.ssm_dt, &self.ssm_a)?;
+        let (g, beta) = gate_and_beta(
+            x,
+            &self.ssm_beta,
+            &self.ssm_alpha,
+            &self.ssm_dt,
+            &self.ssm_a,
+        )?;
         let g = g.reshape(h_v)?; // [h_v]
         let beta = beta.reshape(h_v)?; // [h_v]
 
@@ -206,17 +212,19 @@ mod tests {
         let d_v = cfg.ssm_state_size;
 
         let blk = GatedDeltaNet::new(
-            lin(conv_ch, d, &dev),                     // wqkv
-            lin(value_dim, d, &dev),                   // wqkv_gate
-            vecw(conv_ch * cfg.ssm_conv_kernel, &dev, |i| ((i as f32 * 0.03).cos()) * 0.2)
-                .reshape((conv_ch, cfg.ssm_conv_kernel))
-                .unwrap(), // conv_weight [conv_ch, k]
+            lin(conv_ch, d, &dev),   // wqkv
+            lin(value_dim, d, &dev), // wqkv_gate
+            vecw(conv_ch * cfg.ssm_conv_kernel, &dev, |i| {
+                ((i as f32 * 0.03).cos()) * 0.2
+            })
+            .reshape((conv_ch, cfg.ssm_conv_kernel))
+            .unwrap(), // conv_weight [conv_ch, k]
             vecw(h_v, &dev, |i| -0.5 - 0.01 * i as f32), // ssm_a = -exp(A_log) (negative)
-            vecw(h_v, &dev, |_| 0.0),                    // ssm_dt bias
-            lin(h_v, d, &dev),                           // ssm_alpha
-            lin(h_v, d, &dev),                           // ssm_beta
-            vecw(d_v, &dev, |_| 1.0),                     // ssm_norm (unit γ)
-            lin(d, value_dim, &dev),                      // ssm_out
+            vecw(h_v, &dev, |_| 0.0), // ssm_dt bias
+            lin(h_v, d, &dev),       // ssm_alpha
+            lin(h_v, d, &dev),       // ssm_beta
+            vecw(d_v, &dev, |_| 1.0), // ssm_norm (unit γ)
+            lin(d, value_dim, &dev), // ssm_out
             &cfg,
         );
 
@@ -225,7 +233,9 @@ mod tests {
 
         let tok = |seed: f32| {
             Tensor::from_vec(
-                (0..d).map(|i| ((i as f32 * 0.05 + seed).sin()) * 0.3).collect::<Vec<f32>>(),
+                (0..d)
+                    .map(|i| ((i as f32 * 0.05 + seed).sin()) * 0.3)
+                    .collect::<Vec<f32>>(),
                 (1, 1, d),
                 &dev,
             )

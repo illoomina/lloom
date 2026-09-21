@@ -74,6 +74,27 @@ fn stacked_weight(
                 .collect();
             as_bytes(&blocks).to_vec()
         }
+        GgmlDType::IQ2XXS
+        | GgmlDType::IQ2XS
+        | GgmlDType::IQ2S
+        | GgmlDType::IQ3XXS
+        | GgmlDType::IQ3S
+        | GgmlDType::IQ4XS => {
+            // Raw blocks: LCG bytes with a sane f16 scale at offset 0 of every
+            // block (every byte pattern is a valid codebook block).
+            let (bs, ts) = (dtype.block_size(), dtype.type_size());
+            let n_blocks = e * n * k / bs;
+            let mut next = lcg(seed);
+            let mut raw = vec![0u8; n_blocks * ts];
+            for b in raw.iter_mut() {
+                *b = next();
+            }
+            for i in 0..n_blocks {
+                let d = f16::from_f32(0.02 + 0.015 * ((i as f32) * 0.37).sin());
+                raw[i * ts..i * ts + 2].copy_from_slice(&d.to_le_bytes());
+            }
+            raw
+        }
         _ => {
             // Quantizable types: quantize a smooth f32 weight on the CPU.
             let w = (0..e * n * k)
@@ -132,8 +153,32 @@ fn mean_rel_err(got: &Tensor, want: &Tensor) -> Result<f32> {
 /// layout. `ids` repeats an expert across slots and across the batch so the
 /// same weight plane is read from two `(b, t)` positions.
 fn routed_matches_reference(dtype: GgmlDType, in_dim1_is_topk: bool, tol: f32) -> Result<()> {
+    routed_matches_reference_n(dtype, in_dim1_is_topk, 40, tol)
+}
+
+/// As above with the row count `n` chosen by the caller. `n = 37` is not a
+/// multiple of the rows a threadgroup covers, so the last threadgroup of every
+/// `(b, t)` plane has rows past `n`: a core that stores them unguarded writes
+/// into the NEXT plane's first rows — invisible on a plain `[1, n]` GEMV
+/// (the over-write lands in buffer padding), corrupting on the routed one.
+fn routed_matches_reference_n(
+    dtype: GgmlDType,
+    in_dim1_is_topk: bool,
+    n: usize,
+    tol: f32,
+) -> Result<()> {
+    routed_matches_reference_nk(dtype, in_dim1_is_topk, n, 256, tol)
+}
+
+fn routed_matches_reference_nk(
+    dtype: GgmlDType,
+    in_dim1_is_topk: bool,
+    n: usize,
+    k: usize,
+    tol: f32,
+) -> Result<()> {
     let dev = Device::new_metal(0)?;
-    let (e, n, k) = (6usize, 40usize, 256usize);
+    let e = 6usize;
     let (batch, topk) = (2usize, 3usize);
     let in_dim1 = if in_dim1_is_topk { topk } else { 1 };
     let (w, w_ref) = stacked_weight(dtype, (e, n, k), 17, &dev)?;
@@ -147,6 +192,27 @@ fn routed_matches_reference(dtype: GgmlDType, in_dim1_is_topk: bool, tol: f32) -
     assert_eq!(got.dims(), &[batch, topk, n]);
     assert_eq!(got.dtype(), DType::F32);
     let err = mean_rel_err(&got, &want)?;
+    if err >= tol {
+        // on failure, show where: per-plane max |diff| and a few values
+        let g = got.to_device(&Device::Cpu)?;
+        for b in 0..batch {
+            for t in 0..topk {
+                let gp = g.get(b)?.get(t)?.to_vec1::<f32>()?;
+                let wp = want.get(b)?.get(t)?.to_vec1::<f32>()?;
+                let maxd = gp
+                    .iter()
+                    .zip(&wp)
+                    .map(|(a, c)| (a - c).abs())
+                    .fold(0f32, f32::max);
+                eprintln!(
+                    "plane b={b} t={t} expert={} maxdiff={maxd:.3e} got[..4]={:?} want[..4]={:?}",
+                    ids[b * topk + t],
+                    &gp[..4],
+                    &wp[..4]
+                );
+            }
+        }
+    }
     assert!(
         err < tol,
         "{dtype:?} in_dim1={in_dim1}: Metal routed matmul diverges from the dense \
@@ -202,6 +268,61 @@ fn routed_q2_0_down_shape() -> Result<()> {
     routed_matches_reference(GgmlDType::Q2_0, true, 1e-4)
 }
 
+#[test]
+fn routed_iq2_xxs_gate_shape() -> Result<()> {
+    routed_matches_reference(GgmlDType::IQ2XXS, false, 1e-4)
+}
+#[test]
+fn routed_iq3_s_down_shape() -> Result<()> {
+    routed_matches_reference(GgmlDType::IQ3S, true, 1e-4)
+}
+#[test]
+fn routed_iq4_xs_gate_shape() -> Result<()> {
+    routed_matches_reference(GgmlDType::IQ4XS, false, 1e-4)
+}
+
+/// Rows not a multiple of the threadgroup's row tile (see
+/// `routed_matches_reference_n`): the cores whose store is unguarded upstream
+/// (the K-quants and the IQ2/IQ3/IQ4_XS family) must not spill into the next
+/// plane.
+#[test]
+fn routed_q4k_rows_not_multiple_of_tile() -> Result<()> {
+    routed_matches_reference_n(GgmlDType::Q4K, false, 37, 1e-4)
+}
+#[test]
+fn routed_iq2_xxs_rows_not_multiple_of_tile() -> Result<()> {
+    routed_matches_reference_n(GgmlDType::IQ2XXS, true, 37, 1e-4)
+}
+#[test]
+fn routed_iq3_s_rows_not_multiple_of_tile() -> Result<()> {
+    routed_matches_reference_n(GgmlDType::IQ3S, false, 37, 1e-4)
+}
+#[test]
+fn routed_q6k_rows_not_multiple_of_tile() -> Result<()> {
+    routed_matches_reference_n(GgmlDType::Q6K, false, 37, 1e-4)
+}
+#[test]
+fn routed_iq4_nl_rows_not_multiple_of_tile() -> Result<()> {
+    routed_matches_reference_n(GgmlDType::IQ4NL, false, 37, 1e-4)
+}
+
+#[test]
+fn routed_iq2_xxs_two_superblocks() -> Result<()> {
+    routed_matches_reference_nk(GgmlDType::IQ2XXS, false, 40, 512, 1e-4)
+}
+#[test]
+fn routed_iq2_xs_gate_shape() -> Result<()> {
+    routed_matches_reference(GgmlDType::IQ2XS, false, 1e-4)
+}
+#[test]
+fn routed_iq2_s_gate_shape() -> Result<()> {
+    routed_matches_reference(GgmlDType::IQ2S, false, 1e-4)
+}
+#[test]
+fn routed_iq3_xxs_gate_shape() -> Result<()> {
+    routed_matches_reference(GgmlDType::IQ3XXS, false, 1e-4)
+}
+
 /// The Qwen decode shape at reduced width: 512 experts are too many for a
 /// fixture, but the expert-stride arithmetic (`nb02`) is what a wrong offset
 /// corrupts, so use enough experts that a mis-stride lands on a different,
@@ -255,5 +376,41 @@ fn routed_is_bit_identical_across_runs() -> Result<()> {
         assert_eq!(first, again, "run {run} differs from run 0");
     }
     let _ = D::Minus1;
+    Ok(())
+}
+
+/// Diagnostic: per-plane error map for the routed IQ2_XXS one-superblock case.
+#[test]
+#[ignore]
+fn diag_routed_iq2_xxs_planes() -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let (e, n, k) = (6usize, 40usize, 256usize);
+    let (batch, topk) = (2usize, 3usize);
+    let (w, w_ref) = stacked_weight(GgmlDType::IQ2XXS, (e, n, k), 17, &dev)?;
+    let x = activations((batch, 1, k), 0.2)?;
+    for ids in [
+        vec![5u32, 0, 5, 2, 4, 5],
+        vec![0u32, 0, 0, 0, 0, 0],
+        vec![1u32, 1, 1, 1, 1, 1],
+        vec![0u32, 1, 2, 3, 4, 5],
+    ] {
+        let ids_t = Tensor::from_vec(ids.clone(), (batch, topk), &Device::Cpu)?;
+        let want = dense_reference(&x, &w_ref, &ids, topk)?;
+        let got = w.indexed_moe_forward(&x.to_device(&dev)?, &ids_t.to_device(&dev)?)?;
+        let g = got.to_device(&Device::Cpu)?;
+        for b in 0..batch {
+            for t in 0..topk {
+                let gp = g.get(b)?.get(t)?.to_vec1::<f32>()?;
+                let wp = want.get(b)?.get(t)?.to_vec1::<f32>()?;
+                let maxd = gp
+                    .iter()
+                    .zip(&wp)
+                    .map(|(a, c)| (a - c).abs())
+                    .fold(0f32, f32::max);
+                let first_bad = gp.iter().zip(&wp).position(|(a, c)| (a - c).abs() > 1e-3);
+                eprintln!("ids={ids:?} plane b={b} t={t} expert={} maxdiff={maxd:.3e} first_bad_row={first_bad:?} got[0..3]={:?} want[0..3]={:?}", ids[b*topk+t], &gp[..3], &wp[..3]);
+            }
+        }
+    }
     Ok(())
 }

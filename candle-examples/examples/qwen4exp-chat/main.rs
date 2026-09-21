@@ -66,24 +66,62 @@ struct Args {
     probe: bool,
 }
 
-/// Per-layer activation statistics through the `ForwardObserver` seam.
-struct Probe;
+/// Activation statistics through the `ForwardObserver` seam: verbose prints
+/// every point; otherwise it folds a step's points into (first non-finite
+/// layer, max |x| over the HC carry) for a per-step summary line.
+struct Probe {
+    verbose: bool,
+    first_nonfinite: Option<(usize, lloom::nn::observer::HookKind)>,
+    max_abs: f32,
+}
+
+impl Probe {
+    fn new(verbose: bool) -> Self {
+        Self {
+            verbose,
+            first_nonfinite: None,
+            max_abs: 0.0,
+        }
+    }
+    fn reset(&mut self) {
+        self.first_nonfinite = None;
+        self.max_abs = 0.0;
+    }
+}
 
 fn stats(t: &Tensor) -> Result<(usize, usize, f32, f32)> {
-    let v = t.flatten_all()?.to_dtype(candle::DType::F32)?.to_vec1::<f32>()?;
+    let v = t
+        .flatten_all()?
+        .to_dtype(candle::DType::F32)?
+        .to_vec1::<f32>()?;
     let nonfinite = v.iter().filter(|x| !x.is_finite()).count();
-    let maxabs = v.iter().filter(|x| x.is_finite()).fold(0f32, |m, x| m.max(x.abs()));
-    let meanabs = v.iter().filter(|x| x.is_finite()).map(|x| x.abs()).sum::<f32>() / v.len().max(1) as f32;
+    let maxabs = v
+        .iter()
+        .filter(|x| x.is_finite())
+        .fold(0f32, |m, x| m.max(x.abs()));
+    let meanabs = v
+        .iter()
+        .filter(|x| x.is_finite())
+        .map(|x| x.abs())
+        .sum::<f32>()
+        / v.len().max(1) as f32;
     Ok((v.len(), nonfinite, maxabs, meanabs))
 }
 
 impl ForwardObserver for Probe {
     fn at<P: HookPoint>(&mut self, layer: usize, value: &Tensor) -> candle::Result<()> {
-        let (n, nonfinite, maxabs, meanabs) = stats(value).map_err(|e| candle::Error::Msg(e.to_string()))?;
-        println!(
-            "PROBE layer={layer} point={:?} n={n} nonfinite={nonfinite} maxabs={maxabs:.4e} meanabs={meanabs:.4e}",
-            P::KIND
-        );
+        let (n, nonfinite, maxabs, meanabs) =
+            stats(value).map_err(|e| candle::Error::Msg(e.to_string()))?;
+        if nonfinite > 0 && self.first_nonfinite.is_none() {
+            self.first_nonfinite = Some((layer, P::KIND));
+        }
+        self.max_abs = self.max_abs.max(maxabs);
+        if self.verbose {
+            println!(
+                "PROBE layer={layer} point={:?} n={n} nonfinite={nonfinite} maxabs={maxabs:.4e} meanabs={meanabs:.4e}",
+                P::KIND
+            );
+        }
         Ok(())
     }
     fn wants<P: HookPoint>(&self, _layer: usize) -> bool {
@@ -175,10 +213,26 @@ fn main() -> Result<()> {
             let h = model.embed(&first)?;
             let (n, nonfinite, maxabs, meanabs) = stats(&h)?;
             println!("PROBE embed token={} n={n} nonfinite={nonfinite} maxabs={maxabs:.4e} meanabs={meanabs:.4e}", prompt_ids[0]);
+            // Every prompt position, one at a time, with a per-step summary
+            // (the first step verbose): where does the state-threaded forward
+            // first go non-finite, and how does the carry's magnitude move.
             let mut probe_cache: Cache = model.new_cache(&cfg, &device)?;
-            let logits = model.decode_embed(&h, &mut probe_cache, &mut Probe)?;
-            let (n, nonfinite, maxabs, meanabs) = stats(&logits)?;
-            println!("PROBE logits n={n} nonfinite={nonfinite} maxabs={maxabs:.4e} meanabs={meanabs:.4e} argmax={}", argmax(&logits)?);
+            let mut probe = Probe::new(true);
+            for (t, &tok) in prompt_ids.iter().enumerate() {
+                probe.reset();
+                probe.verbose = t == 0;
+                let input = Tensor::from_vec(vec![tok], (1, 1), &device)?;
+                let h = model.embed(&input)?;
+                let (_, e_nonfinite, e_maxabs, _) = stats(&h)?;
+                let logits = model.decode_embed(&h, &mut probe_cache, &mut probe)?;
+                let (n, nonfinite, maxabs, meanabs) = stats(&logits)?;
+                println!(
+                    "PROBE step={t} token={tok} embed_nonfinite={e_nonfinite} embed_maxabs={e_maxabs:.3e} first_nonfinite={:?} carry_maxabs={:.3e} logits: n={n} nonfinite={nonfinite} maxabs={maxabs:.4e} meanabs={meanabs:.4e} argmax={}",
+                    probe.first_nonfinite,
+                    probe.max_abs,
+                    argmax(&logits)?
+                );
+            }
         }
         let t1 = std::time::Instant::now();
         let input = Tensor::from_vec(prompt_ids.clone(), (1, prompt_ids.len()), &device)?;

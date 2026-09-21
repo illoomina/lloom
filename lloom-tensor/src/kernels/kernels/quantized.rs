@@ -211,15 +211,23 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
             let align = 8;
             (nth0, nth1, align)
         }
-        // IQ family: threadgroup dims per llama.cpp ggml-metal.m (nth0=4,
-        // nth1=16), N_DST=4 rows per group.
+        // IQ family: 64 threads = 2 simdgroups. Rows per threadgroup is the
+        // core's rows-per-simdgroup x 2 (llama.cpp's N_R0_* x N_SG_*): 4 x 2 for
+        // the IQ2/IQ3 cores, 2 x 2 for IQ4_NL/IQ4_XS. Over-dispatching (a smaller
+        // `align`) makes threadgroups whose rows are all past `ne01`; the cores
+        // guard their stores, but the routed dispatch has `batch * topk` planes
+        // and wasted threadgroups per plane are wasted per plane.
         GgmlDType::IQ2XXS
         | GgmlDType::IQ2XS
         | GgmlDType::IQ2S
         | GgmlDType::IQ3XXS
-        | GgmlDType::IQ3S
-        | GgmlDType::IQ4NL
-        | GgmlDType::IQ4XS => {
+        | GgmlDType::IQ3S => {
+            let nth0 = 4;
+            let nth1 = 16;
+            let align = 8;
+            (nth0, nth1, align)
+        }
+        GgmlDType::IQ4NL | GgmlDType::IQ4XS => {
             let nth0 = 4;
             let nth1 = 16;
             let align = 4;

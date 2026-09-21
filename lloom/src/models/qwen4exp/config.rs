@@ -237,12 +237,28 @@ mod tests {
         let cfg = Config::flash_next();
         assert_eq!(cfg.layer_types.len(), 48);
         for (i, k) in cfg.layer_types.iter().enumerate() {
-            let want = if (i + 1) % 4 == 0 { LayerKind::Full } else { LayerKind::Linear };
+            let want = if (i + 1) % 4 == 0 {
+                LayerKind::Full
+            } else {
+                LayerKind::Linear
+            };
             assert_eq!(*k, want, "layer {i}");
         }
         // 36 linear + 12 full.
-        assert_eq!(cfg.layer_types.iter().filter(|k| **k == LayerKind::Full).count(), 12);
-        assert_eq!(cfg.layer_types.iter().filter(|k| **k == LayerKind::Linear).count(), 36);
+        assert_eq!(
+            cfg.layer_types
+                .iter()
+                .filter(|k| **k == LayerKind::Full)
+                .count(),
+            12
+        );
+        assert_eq!(
+            cfg.layer_types
+                .iter()
+                .filter(|k| **k == LayerKind::Linear)
+                .count(),
+            36
+        );
     }
 
     /// The Step-0 traps that change no shape and pass every gate but the text
@@ -258,7 +274,10 @@ mod tests {
         assert_eq!(cfg.mrope_section, [11, 11, 10, 0]);
         // partial rotary 0.25 → 64 of 256 head dims get RoPE.
         assert_eq!(cfg.partial_rotary_factor, 0.25);
-        assert_eq!((cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize, 64);
+        assert_eq!(
+            (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize,
+            64
+        );
         // norm eps 1e-6.
         assert_eq!(cfg.norm_eps, 1e-6);
         // bos == eos == 248044 (the checkpoint has no distinct pad).

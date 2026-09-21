@@ -180,7 +180,7 @@ pub fn softplus(x: &Tensor) -> Result<Tensor> {
     let zeros = x.zeros_like()?;
     let max0 = x.maximum(&zeros)?; // max(x, 0)
     let neg_abs = x.abs()?.neg()?; // -|x|
-    // log1p(exp(-|x|)) = log(1 + exp(-|x|)); exp(-|x|) ∈ (0,1] so no overflow.
+                                   // log1p(exp(-|x|)) = log(1 + exp(-|x|)); exp(-|x|) ∈ (0,1] so no overflow.
     let log1p = (neg_abs.exp()? + 1.0)?.log()?;
     max0 + log1p
 }
@@ -236,7 +236,7 @@ pub fn conv_decode_step(
     let shifted = win.narrow(1, 1, k - 1)?; // [channels, k-1]
     let x_col = x.reshape((channels, 1))?;
     let new_win = Tensor::cat(&[&shifted, &x_col], 1)?; // [channels, k]
-    // fold: sum_i weight[:,i] * window[:,i].
+                                                        // fold: sum_i weight[:,i] * window[:,i].
     let folded = (new_win.contiguous()? * weight)?.sum(1)?; // [channels]
     Ok((folded, new_win))
 }
@@ -301,7 +301,12 @@ mod tests {
     #[test]
     fn decode_step_matches_scalar_reference() {
         let dev = Device::Cpu;
-        let dims = DeltaNetDims { d_k: 3, d_v: 3, h_k: 2, h_v: 2 };
+        let dims = DeltaNetDims {
+            d_k: 3,
+            d_v: 3,
+            h_k: 2,
+            h_v: 2,
+        };
         let (h_v, d_k, d_v) = (dims.h_v, dims.d_k, dims.d_v);
         // Deterministic pseudo-inputs.
         let mk = |n: usize, seed: f32| -> Vec<f32> {
@@ -348,7 +353,12 @@ mod tests {
     #[test]
     fn state_layout_variants_agree_on_output() {
         let dev = Device::Cpu;
-        let dims = DeltaNetDims { d_k: 3, d_v: 3, h_k: 2, h_v: 2 };
+        let dims = DeltaNetDims {
+            d_k: 3,
+            d_v: 3,
+            h_k: 2,
+            h_v: 2,
+        };
         let (h_v, d_k, d_v) = (dims.h_v, dims.d_k, dims.d_v);
         let mk = |n: usize, s: f32| -> Vec<f32> {
             (0..n).map(|i| (i as f32 * 0.29 + s).cos()).collect()
@@ -374,8 +384,15 @@ mod tests {
         // And the stored states are transposes of each other.
         assert_eq!(ns_last.dims(), &[d_k, d_v, h_v]);
         assert_eq!(ns_first.dims(), &[h_v, d_k, d_v]);
-        let nl = ns_last.permute((2, 0, 1)).unwrap().contiguous().unwrap()
-            .flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let nl = ns_last
+            .permute((2, 0, 1))
+            .unwrap()
+            .contiguous()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
         let nf = ns_first.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         for (x, y) in nl.iter().zip(&nf) {
             assert!((x - y).abs() < 1e-6);
@@ -446,7 +463,12 @@ mod tests {
         // Sanity that the reference itself is sensitive to the gate: two
         // different g give different outputs, so a test comparing them is live.
         let dev = Device::Cpu;
-        let dims = DeltaNetDims { d_k: 2, d_v: 2, h_k: 1, h_v: 1 };
+        let dims = DeltaNetDims {
+            d_k: 2,
+            d_v: 2,
+            h_k: 1,
+            h_v: 1,
+        };
         let q = Tensor::from_vec(vec![1f32, 0.5], (1, 2), &dev).unwrap();
         let k = Tensor::from_vec(vec![0.3f32, 0.7], (1, 2), &dev).unwrap();
         let v = Tensor::from_vec(vec![1f32, -1.0], (1, 2), &dev).unwrap();

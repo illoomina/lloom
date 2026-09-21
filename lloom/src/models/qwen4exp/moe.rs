@@ -122,6 +122,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
 
         // Router: softmax over all experts, then top-k select + renormalize.
         let logits = self.router.forward(&x1)?.to_dtype(DType::F32)?; // [1, n_experts]
+        super::trace("moe.logits", usize::MAX, &logits);
         let probs = ops::softmax_last_dim(&logits)?; // [1, n_experts]
         let ids = probs
             .arg_sort_last_dim(false)?
@@ -129,12 +130,22 @@ impl<R: ExpertResidency> MoeLayer<R> {
             .contiguous()?; // [1, topk] u32
         let w = probs.gather(&ids, D::Minus1)?; // [1, topk]
         let w = w.broadcast_div(&w.sum_keepdim(D::Minus1)?)?;
+        if super::trace_enabled() {
+            eprintln!(
+                "TRACE moe.ids={:?} w={:?}",
+                ids.flatten_all()?.to_vec1::<u32>()?,
+                w.flatten_all()?.to_vec1::<f32>()?
+            );
+        }
 
         // The selected experts' SwiGLU, one routed dispatch per projection.
         let x3 = x1.to_dtype(DType::F32)?.reshape((1, 1, hidden))?; // [1, 1, hidden]
         let (g, u) = self.experts.gate_up(&x3, &ids)?; // [1, topk, n_ff] each
+        super::trace("moe.g", usize::MAX, &g);
+        super::trace("moe.u", usize::MAX, &u);
         let h = (ops::silu(&g)? * u)?;
         let y = self.experts.down(&h, &ids)?; // [1, topk, hidden]
+        super::trace("moe.y", usize::MAX, &y);
         let routed = y
             .broadcast_mul(&w.reshape((1, topk, 1))?)?
             .sum(1)?

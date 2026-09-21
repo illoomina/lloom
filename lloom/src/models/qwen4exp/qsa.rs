@@ -203,7 +203,9 @@ mod tests {
 
     fn lin(out: usize, inp: usize, seed: f32, dev: &Device) -> QMatMul {
         let n = out * inp;
-        let v: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.011 + seed).sin()) * 0.1).collect();
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.011 + seed).sin()) * 0.1)
+            .collect();
         QMatMul::Tensor(Tensor::from_vec(v, (out, inp), dev).unwrap())
     }
     fn rms(dim: usize, dev: &Device) -> RmsNorm {
@@ -229,7 +231,9 @@ mod tests {
         let mut kv = KvCache::default();
         let tok = |s: f32| {
             Tensor::from_vec(
-                (0..h).map(|i| ((i as f32 * 0.05 + s).sin()) * 0.3).collect::<Vec<f32>>(),
+                (0..h)
+                    .map(|i| ((i as f32 * 0.05 + s).sin()) * 0.3)
+                    .collect::<Vec<f32>>(),
                 (1, 1, h),
                 &dev,
             )
@@ -254,23 +258,97 @@ mod tests {
         let dev = Device::Cpu;
         let cfg = Config::tiny();
         let attn = QsaAttention::new(
-            lin(4, 4, 0.0, &dev), lin(4, 4, 0.0, &dev), lin(4, 4, 0.0, &dev), lin(4, 4, 0.0, &dev),
-            rms(cfg.head_dim, &dev), rms(cfg.head_dim, &dev), &cfg,
+            lin(4, 4, 0.0, &dev),
+            lin(4, 4, 0.0, &dev),
+            lin(4, 4, 0.0, &dev),
+            lin(4, 4, 0.0, &dev),
+            rms(cfg.head_dim, &dev),
+            rms(cfg.head_dim, &dev),
+            &cfg,
         );
         let hd = cfg.head_dim;
         let n_rot = (hd as f64 * cfg.partial_rotary_factor) as usize;
         let x = Tensor::ones((1, hd), DType::F32, &dev).unwrap(); // [h=1, hd]
-        // pos 0: cos=1, sin=0 → rope is identity, whole vector unchanged.
+                                                                  // pos 0: cos=1, sin=0 → rope is identity, whole vector unchanged.
         let (c0, s0) = attn.rope_cs(0, &dev).unwrap();
         let y0 = attn.partial_rope(&x, &c0, &s0).unwrap();
         let y0v = y0.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert!(y0v.iter().all(|&v| (v - 1.0).abs() < 1e-5), "pos0 rope must be identity");
+        assert!(
+            y0v.iter().all(|&v| (v - 1.0).abs() < 1e-5),
+            "pos0 rope must be identity"
+        );
         // pos 5: the tail dims (>= n_rot) stay exactly 1.0 (unrotated).
         let (c, s) = attn.rope_cs(5, &dev).unwrap();
         let y = attn.partial_rope(&x, &c, &s).unwrap();
         let yv = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         for &v in &yv[n_rot..] {
             assert!((v - 1.0).abs() < 1e-5, "tail dim rotated: {yv:?}");
+        }
+    }
+    /// The Metal decode matches the CPU decode over three positions on the
+    /// real head geometry (24/2 heads, head_dim 256, 64 rotated dims): same
+    /// weights on both devices, per-step outputs finite and equal within f32
+    /// reduction noise. Position 0 is rope-blind (sin = 0), so the later
+    /// positions are the ones that see the KV growth, the rope and the
+    /// softmax over more than one key.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn qsa_metal_matches_cpu_over_three_tokens() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 256; // small in-proj, real head geometry
+        let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
+        let build = |dev: &Device| {
+            QsaAttention::new(
+                lin(nh * hd * 2, h, 1.0, dev),
+                lin(nkv * hd, h, 2.0, dev),
+                lin(nkv * hd, h, 3.0, dev),
+                lin(h, nh * hd, 4.0, dev),
+                rms(hd, dev),
+                rms(hd, dev),
+                &cfg,
+            )
+        };
+        let (a_cpu, a_gpu) = (build(&cpu), build(&gpu));
+        let (mut kv_cpu, mut kv_gpu) = (KvCache::default(), KvCache::default());
+        for step in 0..3 {
+            let x: Vec<f32> = (0..h)
+                .map(|i| ((i as f32 * 0.05 + step as f32).sin()) * 0.3)
+                .collect();
+            let xc = Tensor::from_vec(x.clone(), (1, 1, h), &cpu).unwrap();
+            let xg = Tensor::from_vec(x, (1, 1, h), &gpu).unwrap();
+            let oc = a_cpu
+                .decode(&xc, &mut kv_cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let og = a_gpu
+                .decode(&xg, &mut kv_gpu)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let nonfinite = og.iter().filter(|v| !v.is_finite()).count();
+            assert_eq!(
+                nonfinite, 0,
+                "step {step}: {nonfinite} non-finite values on Metal"
+            );
+            let maxdiff = oc
+                .iter()
+                .zip(&og)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let scale = oc.iter().map(|a| a.abs()).fold(0f32, f32::max);
+            assert!(
+                maxdiff <= 1e-3 * scale.max(1e-3),
+                "step {step}: Metal/CPU max diff {maxdiff} at scale {scale}"
+            );
         }
     }
 }

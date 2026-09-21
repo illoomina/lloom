@@ -15,6 +15,7 @@ use super::hc::HyperConnection;
 use super::moe::Resident;
 use super::moe::{ExpertResidency, MoeLayer};
 use super::qsa::{KvCache, QsaAttention};
+use super::trace;
 use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
 use crate::nn::var_builder::VarBuilder;
@@ -193,19 +194,26 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 
             // HC prologue (attn bracket): collapse streams → mixer input.
             let (cur, inject) = layer.hc_attn.mix(&res_hc)?; // cur [1,1,d]
+            trace("attn.mix", l, &cur);
+            trace("attn.inject", l, &inject);
             let mixed = match &layer.mixer {
                 Mixer::Linear(dn) => {
                     dn.decode(&cur, l, &mut cache.s_state, &mut cache.conv_state)?
                 }
                 Mixer::Full(qsa) => qsa.decode(&cur, &mut cache.kv[l])?,
             };
+            trace("mixer", l, &mixed);
             // HC epilogue: scatter the mixer output back across the streams.
             res_hc = layer.hc_attn.combine(&res_hc, &mixed, &inject)?;
+            trace("attn.combine", l, &res_hc);
 
             // HC prologue (ffn bracket) → MoE → HC epilogue.
             let (cur, inject) = layer.hc_ffn.mix(&res_hc)?;
+            trace("ffn.mix", l, &cur);
             let moe_out = layer.moe.decode(&cur)?;
+            trace("moe", l, &moe_out);
             res_hc = layer.hc_ffn.combine(&res_hc, &moe_out, &inject)?;
+            trace("ffn.combine", l, &res_hc);
 
             // observe the collapsed layer output (d-wide) — the DSpark/MTP tap side.
             if obs.wants::<LayerOutputPoint>(l) {

@@ -121,18 +121,24 @@ impl QStorage {
                 GgmlDType::IQ2XS => {
                     metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ2xs>(data))
                 }
-                GgmlDType::IQ2S => metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ2s>(data)),
+                GgmlDType::IQ2S => {
+                    metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ2s>(data))
+                }
                 GgmlDType::IQ3XXS => {
                     metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ3xxs>(data))
                 }
-                GgmlDType::IQ3S => metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ3s>(data)),
+                GgmlDType::IQ3S => {
+                    metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ3s>(data))
+                }
                 GgmlDType::IQ4NL => {
                     metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ4nl>(data))
                 }
                 GgmlDType::IQ4XS => {
                     metal::load_quantized(d, as_t_slice::<iq_quants::BlockIQ4xs>(data))
                 }
-                GgmlDType::Q2_0 => metal::load_quantized(d, as_t_slice::<iq_quants::BlockQ2_0>(data)),
+                GgmlDType::Q2_0 => {
+                    metal::load_quantized(d, as_t_slice::<iq_quants::BlockQ2_0>(data))
+                }
             },
             Device::Cuda(d) => match dtype {
                 GgmlDType::F32 => cuda::load_quantized(d, as_t_slice::<f32>(data)),
@@ -529,12 +535,9 @@ impl GgmlDType {
             Self::Q8_1 => k_quants::QK8_1,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => k_quants::QK_K,
             // IQ super-block types use QK_K=256; IQ4_NL and Q2_0 are small blocks.
-            Self::IQ2XXS
-            | Self::IQ2XS
-            | Self::IQ2S
-            | Self::IQ3XXS
-            | Self::IQ3S
-            | Self::IQ4XS => k_quants::QK_K,
+            Self::IQ2XXS | Self::IQ2XS | Self::IQ2S | Self::IQ3XXS | Self::IQ3S | Self::IQ4XS => {
+                k_quants::QK_K
+            }
             Self::IQ4NL => iq_quants::QK4_NL,
             Self::Q2_0 => iq_quants::QK2_0,
         }
@@ -589,7 +592,10 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
         dst: &mut [f32],
     ) -> Result<()> {
         if !k.is_multiple_of(T::BLCK_SIZE) {
-            crate::bail!("routed matmul k {k} is not divisible by block size {}", T::BLCK_SIZE)
+            crate::bail!(
+                "routed matmul k {k} is not divisible by block size {}",
+                T::BLCK_SIZE
+            )
         }
         let row_blocks = k / T::BLCK_SIZE;
         if self.len() != n_experts * n * row_blocks {
@@ -927,8 +933,20 @@ impl QTensor {
         self.storage.size_in_bytes()
     }
 
+    /// The packed bytes, exactly `elem_count / block_size * type_size` of
+    /// them: a pool-backed storage (Metal) hands back its whole bucket, which
+    /// is rounded up past the tensor (§11.5n), and a byte view that carries the
+    /// padding is not a multiple of the block size for most types.
     pub fn data(&self) -> Result<Cow<'_, [u8]>> {
-        self.storage.data()
+        let exact = self.shape.elem_count() / self.dtype().block_size() * self.dtype().type_size();
+        Ok(match self.storage.data()? {
+            Cow::Borrowed(b) if b.len() > exact => Cow::Borrowed(&b[..exact]),
+            Cow::Owned(mut v) if v.len() > exact => {
+                v.truncate(exact);
+                Cow::Owned(v)
+            }
+            other => other,
+        })
     }
 
     /// Routed-expert matmul over a stacked quantized weight `[n_experts, n, k]`:
@@ -991,9 +1009,21 @@ impl QTensor {
                 let x = x.flatten_all()?.to_vec1::<f32>()?;
                 let ids = ids.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?;
                 let mut out = vec![0f32; batch * topk * n];
-                s.matmul_t_indexed((n_experts, n, k), &x, in_dim1, &ids, (batch, topk), &mut out)?;
+                s.matmul_t_indexed(
+                    (n_experts, n, k),
+                    &x,
+                    in_dim1,
+                    &ids,
+                    (batch, topk),
+                    &mut out,
+                )?;
                 let storage = Storage::Cpu(CpuStorage::F32(out));
-                Ok(crate::tensor::from_storage(storage, (batch, topk, n), none, false))
+                Ok(crate::tensor::from_storage(
+                    storage,
+                    (batch, topk, n),
+                    none,
+                    false,
+                ))
             }
         }
     }

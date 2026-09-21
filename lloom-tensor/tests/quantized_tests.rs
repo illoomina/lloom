@@ -1117,6 +1117,19 @@ fn ggml_reference_matmul_error(dtype: GgmlDType) -> Result<f32> {
 
         // Not from the ggml repo.
         GgmlDType::Q8K => 0.00065,
+
+        // Read-only quants (no `from_float`): nothing to quantize a reference
+        // against, so the ggml matmul-error test has no row for them.
+        GgmlDType::IQ2XXS
+        | GgmlDType::IQ2XS
+        | GgmlDType::IQ2S
+        | GgmlDType::IQ3XXS
+        | GgmlDType::IQ3S
+        | GgmlDType::IQ4NL
+        | GgmlDType::IQ4XS
+        | GgmlDType::Q2_0 => {
+            lloom_tensor::bail!("no ggml reference matmul error for read-only quant {dtype:?}")
+        }
     };
     Ok(err)
 }

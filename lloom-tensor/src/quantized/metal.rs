@@ -282,10 +282,13 @@ impl QMetalStorage {
                 self.dtype.block_size()
             )
         }
+        // The pool serves the smallest free bucket at or above the request
+        // (§11.5n), so the buffer may be LARGER than the tensor; only a
+        // buffer too small to hold `rows` is a defect.
         let expected_size = rows * hidden * self.dtype.type_size() / self.dtype.block_size();
-        if self.storage_size_in_bytes() != expected_size {
+        if self.storage_size_in_bytes() < expected_size {
             crate::bail!(
-                "quantized tensor has {} bytes, expected {expected_size}",
+                "quantized tensor has {} bytes, expected at least {expected_size}",
                 self.storage_size_in_bytes()
             )
         }

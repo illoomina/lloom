@@ -509,6 +509,73 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+
+    /// Routed-expert matmul over a stacked quantized weight `[n_experts, n, k]`
+    /// (the MoE seam `QTensor::indexed_moe_forward`, CUDA's contract): `input`
+    /// `[batch, in_dim1, k]` f32 with `in_dim1 ∈ {1, topk}`, `ids` `[batch,
+    /// topk]` u32 → `[batch, topk, n]` f32, one `kernel_mul_mv_id` dispatch.
+    /// The weight stays packed; each core dequantizes in-kernel (§3.3a).
+    pub fn indexed_moe_forward(
+        &self,
+        self_shape: &Shape,
+        input: &MetalStorage,
+        input_l: &Layout,
+        ids: &MetalStorage,
+        ids_l: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        use crate::MetalError;
+
+        let (n_experts, n, k) = self_shape.dims3()?;
+        if !input_l.is_contiguous() || !ids_l.is_contiguous() {
+            crate::bail!("indexed_moe_forward needs contiguous input and ids")
+        }
+        if input.dtype() != DType::F32 {
+            crate::bail!(
+                "indexed_moe_forward on Metal takes f32 activations, got {:?}",
+                input.dtype()
+            )
+        }
+        if ids.dtype() != DType::U32 {
+            crate::bail!("indexed_moe_forward ids must be u32, got {:?}", ids.dtype())
+        }
+        let (batch, in_dim1, k_in) = input_l.shape().dims3()?;
+        let (batch_ids, topk) = ids_l.shape().dims2()?;
+        if k_in != k {
+            crate::bail!("indexed_moe_forward: input k {k_in} != weight k {k}")
+        }
+        if batch != batch_ids {
+            crate::bail!("indexed_moe_forward: input batch {batch} != ids batch {batch_ids}")
+        }
+        if in_dim1 != 1 && in_dim1 != topk {
+            crate::bail!("indexed_moe_forward: input dim1 {in_dim1} must be 1 or topk {topk}")
+        }
+        let device = self.device.clone();
+        let dst_shape = Shape::from((batch, topk, n));
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_label("qmatmul_id")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        crate::kernels::call_quantized_matmul_mv_id_t(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            self.dtype.into(),
+            (n_experts, n, k),
+            (batch, topk, in_dim1),
+            &self.buffer,
+            input.buffer(),
+            input_l.start_offset() * DType::F32.size_in_bytes(),
+            ids.buffer(),
+            ids_l.start_offset() * DType::U32.size_in_bytes(),
+            &dst,
+        )
+        .map_err(MetalError::from)?;
+        let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+        Ok((out, dst_shape))
+    }
+
     pub fn data(&self) -> Result<Vec<u8>> {
         let buffer = self
             .device

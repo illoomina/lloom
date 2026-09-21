@@ -547,6 +547,19 @@ pub trait QuantizedType: Send + Sync {
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()>;
     fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()>;
     fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage>;
+    /// Routed matmul over stacked experts (see `QTensor::indexed_moe_forward`):
+    /// `x` is `[batch, in_dim1, k]` flattened, `ids` `[batch, topk]` flattened,
+    /// `dst` `[batch, topk, n]` flattened.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_t_indexed(
+        &self,
+        enk: (usize, usize, usize),
+        x: &[f32],
+        in_dim1: usize,
+        ids: &[u32],
+        bt: (usize, usize),
+        dst: &mut [f32],
+    ) -> Result<()>;
     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage>;
     fn storage_size_in_bytes(&self) -> usize;
     fn as_ptr(&self) -> *const u8;
@@ -564,6 +577,49 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     }
     fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
         k_quants::matmul_f16(mkn, lhs, self.as_slice(), dst)
+    }
+
+    fn matmul_t_indexed(
+        &self,
+        (n_experts, n, k): (usize, usize, usize),
+        x: &[f32],
+        in_dim1: usize,
+        ids: &[u32],
+        (batch, topk): (usize, usize),
+        dst: &mut [f32],
+    ) -> Result<()> {
+        if !k.is_multiple_of(T::BLCK_SIZE) {
+            crate::bail!("routed matmul k {k} is not divisible by block size {}", T::BLCK_SIZE)
+        }
+        let row_blocks = k / T::BLCK_SIZE;
+        if self.len() != n_experts * n * row_blocks {
+            crate::bail!(
+                "quantized tensor has {} blocks, expected {}",
+                self.len(),
+                n_experts * n * row_blocks
+            )
+        }
+        // Dequantize one weight row at a time and dot it against the activation:
+        // the reference arm, correct for every block type (`to_float` exists for
+        // the read-only quants where `vec_dot` does not).
+        let mut row = vec![0f32; k];
+        for b in 0..batch {
+            for t in 0..topk {
+                let e = ids[b * topk + t] as usize;
+                if e >= n_experts {
+                    crate::bail!("expert id {e} is out of range for {n_experts} experts")
+                }
+                let xi = if in_dim1 == 1 { 0 } else { t };
+                let xrow = &x[(b * in_dim1 + xi) * k..(b * in_dim1 + xi + 1) * k];
+                let out = &mut dst[(b * topk + t) * n..(b * topk + t + 1) * n];
+                for (r, o) in out.iter_mut().enumerate() {
+                    let blocks = &self[(e * n + r) * row_blocks..(e * n + r + 1) * row_blocks];
+                    T::to_float(blocks, &mut row);
+                    *o = row.iter().zip(xrow).map(|(w, x)| w * x).sum();
+                }
+            }
+        }
+        Ok(())
     }
 
     fn embedding(&self, ids: &[u32], rows: usize, hidden: usize) -> Result<CpuStorage> {
@@ -875,7 +931,13 @@ impl QTensor {
         self.storage.data()
     }
 
+    /// Routed-expert matmul over a stacked quantized weight `[n_experts, n, k]`:
+    /// `x` `[batch, in_dim1, k]` with `in_dim1 ∈ {1, topk}`, `ids` `[batch, topk]`
+    /// → `[batch, topk, n]`, where plane `(b, t)` is `x[b, t or 0] · Wᵀ[ids[b, t]]`.
+    /// The weight stays packed on every backend; the CPU arm dequantizes rows on
+    /// the fly and is the reference the Metal `mul_mv_id` arm is gated against.
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        let none = crate::op::BackpropOp::none();
         match &self.storage {
             QStorage::Cuda(s) => match (&*x.storage(), &*ids.storage()) {
                 (Storage::Cuda(x_storage), Storage::Cuda(ids_storage)) => {
@@ -889,16 +951,49 @@ impl QTensor {
                     Ok(crate::tensor::from_storage(
                         Storage::Cuda(storage),
                         out_shape,
-                        crate::op::BackpropOp::none(),
+                        none,
                         false,
                     ))
                 }
-                _ => {
-                    panic!("Non-cuda indexed_moe_forward is not implemented!");
-                }
+                _ => crate::bail!("indexed_moe_forward: x and ids must be on the weight's device"),
             },
-            _ => {
-                panic!("indexed_moe_forward is not implemented in this platform!");
+            QStorage::Metal(s) => match (&*x.storage(), &*ids.storage()) {
+                (Storage::Metal(x_storage), Storage::Metal(ids_storage)) => {
+                    let (storage, out_shape) = s.indexed_moe_forward(
+                        self.shape(),
+                        x_storage,
+                        x.layout(),
+                        ids_storage,
+                        ids.layout(),
+                    )?;
+                    Ok(crate::tensor::from_storage(
+                        Storage::Metal(storage),
+                        out_shape,
+                        none,
+                        false,
+                    ))
+                }
+                _ => crate::bail!("indexed_moe_forward: x and ids must be on the weight's device"),
+            },
+            QStorage::Cpu(s) => {
+                let (n_experts, n, k) = self.shape().dims3()?;
+                let (batch, in_dim1, k_in) = x.dims3()?;
+                let (batch_ids, topk) = ids.dims2()?;
+                if k_in != k || batch != batch_ids || (in_dim1 != 1 && in_dim1 != topk) {
+                    crate::bail!(
+                        "indexed_moe_forward: x {:?} / ids {:?} do not fit weight {:?}",
+                        x.shape(),
+                        ids.shape(),
+                        self.shape()
+                    )
+                }
+                let x = x.to_dtype(DType::F32)?.contiguous()?;
+                let x = x.flatten_all()?.to_vec1::<f32>()?;
+                let ids = ids.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?;
+                let mut out = vec![0f32; batch * topk * n];
+                s.matmul_t_indexed((n_experts, n, k), &x, in_dim1, &ids, (batch, topk), &mut out)?;
+                let storage = Storage::Cpu(CpuStorage::F32(out));
+                Ok(crate::tensor::from_storage(storage, (batch, topk, n), none, false))
             }
         }
     }

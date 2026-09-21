@@ -57,6 +57,7 @@ impl GgmlDType {
                 | GgmlDType::IQ3S
                 | GgmlDType::IQ4NL
                 | GgmlDType::IQ4XS
+                | GgmlDType::Q2_0
         )
     }
 }
@@ -154,45 +155,13 @@ impl GemvTriple {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn call_quantized_matmul_mv_t(
-    device: &Device,
-    ep: impl EncoderProvider,
-    kernels: &Kernels,
-    dtype: GgmlDType,
-    triple: GemvTriple,
-    (b, m, n, k): (usize, usize, usize, usize),
-    lhs: &Buffer,
-    lhs_offset: usize,
-    rhs: &Buffer,
-    dst_offset: usize,
-    dst: &Buffer,
-) -> Result<(), MetalKernelError> {
-    // Everything is in reverse
-    let ne00 = k as i64;
-    let ne01 = n as i64;
-    let ne02 = b as i64;
-    let ne03 = 1i64;
 
-    let nb00 = 0i64;
-    let nb01 = 0i64;
-    let nb02 = 0i64;
-
-    let ne10 = k as i64;
-    let ne11 = m as i64;
-    let ne12 = b as i64;
-    let ne13 = 1i64;
-
-    let nb10 = 0i64;
-    let nb11 = 0i64;
-    let nb12 = 0i64;
-
-    let ne0 = n as i64;
-    let ne1 = m as i64;
-    let r2: u32 = (ne12 / ne02) as u32;
-    let r3: u32 = (ne13 / ne03) as u32;
-
-    let (nth0, nth1, align) = match dtype {
+/// Threadgroup geometry of the matmul-vec kernels per weight dtype:
+/// `(threads.x, threads.y, rows per threadgroup)` — the same table the plain
+/// and the routed (`mul_mv_id`) dispatches use, since the routed kernel wraps
+/// the plain per-dtype core.
+fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
+    match dtype {
         GgmlDType::Q4_0
         | GgmlDType::Q4_1
         | GgmlDType::Q5_0
@@ -244,21 +213,84 @@ pub fn call_quantized_matmul_mv_t(
             (nth0, nth1, align)
         }
         // IQ family: threadgroup dims per llama.cpp ggml-metal.m (nth0=4,
-        // nth1=16), N_DST=4 rows per group. Q2_0 (fork, 64-block) uses the same.
+        // nth1=16), N_DST=4 rows per group.
         GgmlDType::IQ2XXS
         | GgmlDType::IQ2XS
         | GgmlDType::IQ2S
         | GgmlDType::IQ3XXS
         | GgmlDType::IQ3S
         | GgmlDType::IQ4NL
-        | GgmlDType::IQ4XS
-        | GgmlDType::Q2_0 => {
+        | GgmlDType::IQ4XS => {
             let nth0 = 4;
             let nth1 = 16;
             let align = 4;
             (nth0, nth1, align)
         }
-    };
+        // Q2_0: 8 rows per simdgroup x 2 simdgroups (the fork's N_R0_Q2_0 /
+        // N_SG_Q2_0), so 16 rows per threadgroup.
+        GgmlDType::Q2_0 => {
+            let nth0 = 32;
+            let nth1 = 2;
+            let align = 16;
+            (nth0, nth1, align)
+        }
+    }
+}
+
+/// Whether the dtype's matmul-vec core stages a codebook into threadgroup
+/// memory (`shared_values [[threadgroup(0)]]`, 8192 bytes per llama.cpp).
+fn needs_iq_shared(dtype: GgmlDType) -> bool {
+    matches!(
+        dtype,
+        GgmlDType::IQ2XXS
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ2S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ4NL
+            | GgmlDType::IQ4XS
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_t(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    triple: GemvTriple,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs: &Buffer,
+    lhs_offset: usize,
+    rhs: &Buffer,
+    dst_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    // Everything is in reverse
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = b as i64;
+    let ne03 = 1i64;
+
+    let nb00 = 0i64;
+    let nb01 = 0i64;
+    let nb02 = 0i64;
+
+    let ne10 = k as i64;
+    let ne11 = m as i64;
+    let ne12 = b as i64;
+    let ne13 = 1i64;
+
+    let nb10 = 0i64;
+    let nb11 = 0i64;
+    let nb12 = 0i64;
+
+    let ne0 = n as i64;
+    let ne1 = m as i64;
+    let r2: u32 = (ne12 / ne02) as u32;
+    let r3: u32 = (ne13 / ne03) as u32;
+
+    let (nth0, nth1, align) = mv_threadgroup(dtype);
     let thread_groups_count = MTLSize {
         width: divide(ne01 as usize, align),
         height: ne11 as usize,
@@ -302,14 +334,7 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::IQ3S => Some("kernel_mul_mv_iq3_s"),
         GgmlDType::IQ4NL => Some("kernel_mul_mv_iq4_nl"),
         GgmlDType::IQ4XS => Some("kernel_mul_mv_iq4_xs"),
-        // Q2_0 is the GSQ-RCO fork's custom type; lloom's quantized.metal has no
-        // `mul_mv_q2_0` kernel for it yet. Refuse rather than name a kernel that
-        // does not exist.
-        GgmlDType::Q2_0 => {
-            return Err(MetalKernelError::LoadFunctionError(
-                "kernel_mul_mv_q2_0 not present; dequantize Q2_0 before a Metal matmul".into(),
-            ))
-        }
+        GgmlDType::Q2_0 => Some("kernel_mul_mv_q2_0"),
         // Dense and Q8-family weights: no genericized #750 core, f32 store only.
         GgmlDType::Q8_1
         | GgmlDType::Q8K
@@ -345,20 +370,7 @@ pub fn call_quantized_matmul_mv_t(
         }
     };
 
-    // The IQ kernels stage a codebook (grid + signs) into threadgroup memory
-    // (`shared_values [[threadgroup(0)]]`); the K-quant kernels do not use it.
-    // llama.cpp sizes the IQ shared buffer at 8192 bytes.
-    let iq_shared = matches!(
-        dtype,
-        GgmlDType::IQ2XXS
-            | GgmlDType::IQ2XS
-            | GgmlDType::IQ2S
-            | GgmlDType::IQ3XXS
-            | GgmlDType::IQ3S
-            | GgmlDType::IQ4NL
-            | GgmlDType::IQ4XS
-            | GgmlDType::Q2_0
-    );
+    let iq_shared = needs_iq_shared(dtype);
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name.clone())?;
     let encoder = ep.encoder();
@@ -396,6 +408,204 @@ pub fn call_quantized_matmul_mv_t(
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
+}
+
+
+/// The routed-expert matmul-vec (`kernel_mul_mv_id_<q>_f32`): for every
+/// `(token, slot)` pair, one GEMV of `src1`'s row against expert
+/// `ids[token][slot]` of the stacked weight `[n_experts, n, k]`.
+///
+/// `src1` is `[batch, in_dim1, k]` f32 with `in_dim1 ∈ {1, topk}` (one
+/// activation per token, or one per selected slot — the down-projection
+/// case); `ids` is `[batch, topk]` i32/u32; `dst` is `[batch, topk, n]` f32.
+/// Grid: rows per threadgroup as the plain dispatch, one threadgroup column,
+/// `batch * topk` planes — the kernel decodes `(token, slot)` from the plane
+/// index and the per-dtype core sees a plain `m == 1` GEMV.
+///
+/// f32 activations and store only: the `_id` kernels wrap the cores' f32
+/// aliases (the f16 routed arm is #750 item B, additive when its caller lands).
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_id_t(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    (n_experts, n, k): (usize, usize, usize),
+    (batch, topk, in_dim1): (usize, usize, usize),
+    src0: &Buffer,
+    src1: &Buffer,
+    src1_offset: usize,
+    ids: &Buffer,
+    ids_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let stem = match dtype {
+        GgmlDType::F32 => "f32",
+        GgmlDType::F16 => "f16",
+        GgmlDType::Q4_0 => "q4_0",
+        GgmlDType::Q4_1 => "q4_1",
+        GgmlDType::Q5_0 => "q5_0",
+        GgmlDType::Q5_1 => "q5_1",
+        GgmlDType::Q8_0 => "q8_0",
+        GgmlDType::Q2K => "q2_K",
+        GgmlDType::Q3K => "q3_K",
+        GgmlDType::Q4K => "q4_K",
+        GgmlDType::Q5K => "q5_K",
+        GgmlDType::Q6K => "q6_K",
+        GgmlDType::IQ2XXS => "iq2_xxs",
+        GgmlDType::IQ2XS => "iq2_xs",
+        GgmlDType::IQ2S => "iq2_s",
+        GgmlDType::IQ3XXS => "iq3_xxs",
+        GgmlDType::IQ3S => "iq3_s",
+        GgmlDType::IQ4NL => "iq4_nl",
+        GgmlDType::IQ4XS => "iq4_xs",
+        GgmlDType::Q2_0 => "q2_0",
+        GgmlDType::Q8_1 | GgmlDType::Q8K | GgmlDType::BF16 => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "no kernel_mul_mv_id arm for this weight dtype",
+                "routed quantized matmul-vec",
+            ))
+        }
+    };
+    let name = format!("kernel_mul_mv_id_{stem}_f32");
+    if in_dim1 != 1 && in_dim1 != topk {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "routed matmul-vec activation dim1 must be 1 or topk",
+            "routed quantized matmul-vec",
+        ));
+    }
+
+    // Everything is in reverse (ggml order).
+    let nei0 = topk as i64;
+    let nei1 = batch as i64;
+    let nbi1 = (topk * core::mem::size_of::<u32>()) as u64;
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = n_experts as i64;
+    let nb00 = 0u64;
+    let nb01 = 0u64;
+    let nb02 = (n * (k / dtype_block_size(dtype)) * dtype_type_size(dtype)) as u64;
+    let ne10 = k as i64;
+    let ne11 = in_dim1 as i64;
+    let ne12 = batch as i64;
+    let ne13 = 1i64;
+    let nb10 = core::mem::size_of::<f32>() as u64;
+    let nb11 = (k * core::mem::size_of::<f32>()) as u64;
+    let nb12 = (in_dim1 * k * core::mem::size_of::<f32>()) as u64;
+    let ne0 = n as i64;
+    let ne1 = topk as i64;
+    let nb1 = (n * core::mem::size_of::<f32>()) as u64;
+
+    let (nth0, nth1, align) = mv_threadgroup(dtype);
+    let thread_groups_count = MTLSize {
+        width: divide(n, align),
+        height: 1,
+        depth: batch * topk,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: nth0,
+        height: nth1,
+        depth: 1,
+    };
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name.clone())?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    if needs_iq_shared(dtype) {
+        encoder.set_threadgroup_memory_length(0, 8192);
+    }
+    debug_group!(
+        encoder,
+        "qmm_mv_id {name} E={n_experts} B={batch} topk={topk} K={k} N={n}"
+    );
+
+    set_params!(
+        encoder,
+        (
+            src0,
+            (src1, src1_offset),
+            Output::new(dst),
+            (ids, ids_offset),
+            nei0,
+            nei1,
+            nbi1,
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            ne13,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            nb1
+        )
+    );
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
+}
+
+/// Elements per block of a weight dtype (the ggml `blck_size`).
+fn dtype_block_size(dtype: GgmlDType) -> usize {
+    match dtype {
+        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => 1,
+        GgmlDType::Q4_0
+        | GgmlDType::Q4_1
+        | GgmlDType::Q5_0
+        | GgmlDType::Q5_1
+        | GgmlDType::Q8_0
+        | GgmlDType::Q8_1
+        | GgmlDType::IQ4NL => 32,
+        GgmlDType::Q2_0 => 64,
+        GgmlDType::Q2K
+        | GgmlDType::Q3K
+        | GgmlDType::Q4K
+        | GgmlDType::Q5K
+        | GgmlDType::Q6K
+        | GgmlDType::Q8K
+        | GgmlDType::IQ2XXS
+        | GgmlDType::IQ2XS
+        | GgmlDType::IQ2S
+        | GgmlDType::IQ3XXS
+        | GgmlDType::IQ3S
+        | GgmlDType::IQ4XS => 256,
+    }
+}
+
+/// Bytes per block of a weight dtype (the ggml `type_size`).
+fn dtype_type_size(dtype: GgmlDType) -> usize {
+    match dtype {
+        GgmlDType::F32 => 4,
+        GgmlDType::F16 | GgmlDType::BF16 => 2,
+        GgmlDType::Q4_0 => 18,
+        GgmlDType::Q4_1 => 20,
+        GgmlDType::Q5_0 => 22,
+        GgmlDType::Q5_1 => 24,
+        GgmlDType::Q8_0 => 34,
+        GgmlDType::Q8_1 => 36,
+        GgmlDType::Q2K => 84,
+        GgmlDType::Q3K => 110,
+        GgmlDType::Q4K => 144,
+        GgmlDType::Q5K => 176,
+        GgmlDType::Q6K => 210,
+        GgmlDType::Q8K => 292,
+        GgmlDType::IQ2XXS => 66,
+        GgmlDType::IQ2XS => 74,
+        GgmlDType::IQ2S => 82,
+        GgmlDType::IQ3XXS => 98,
+        GgmlDType::IQ3S => 110,
+        GgmlDType::IQ4NL => 18,
+        GgmlDType::IQ4XS => 136,
+        GgmlDType::Q2_0 => 18,
+    }
 }
 
 /// - src0 is usually weight
@@ -474,7 +684,7 @@ pub fn call_quantized_matmul_mm_t(
         GgmlDType::IQ3S => "kernel_mul_mm_iq3_s_f32",
         GgmlDType::IQ4NL => "kernel_mul_mm_iq4_nl_f32",
         GgmlDType::IQ4XS => "kernel_mul_mm_iq4_xs_f32",
-        GgmlDType::Q2_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q2_0", "qmatmul"))?,
+        GgmlDType::Q2_0 => "kernel_mul_mm_q2_0_f32",
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
@@ -550,7 +760,7 @@ pub fn call_quantized_get_rows(
         GgmlDType::IQ3S => "kernel_get_rows_iq3_s",
         GgmlDType::IQ4NL => "kernel_get_rows_iq4_nl",
         GgmlDType::IQ4XS => "kernel_get_rows_iq4_xs",
-        GgmlDType::Q2_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q2_0", "get_rows"))?,
+        GgmlDType::Q2_0 => "kernel_get_rows_q2_0",
     };
 
     let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;

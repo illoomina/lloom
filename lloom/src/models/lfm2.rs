@@ -8918,19 +8918,7 @@ impl Model {
     }
 }
 
-pub fn accept_prefix(argmax: &[u32], proposed: &[u32], eos_ids: &[u32]) -> Vec<u32> {
-    let k = proposed.len();
-    debug_assert_eq!(argmax.len(), k + 1, "argmax covers the k + 1 window");
-    let mut accepted = Vec::with_capacity(k + 1);
-    for i in 0..=k {
-        let target = argmax[i];
-        accepted.push(target);
-        if eos_ids.contains(&target) || (i < k && target != proposed[i]) {
-            break;
-        }
-    }
-    accepted
-}
+pub use crate::nn::speculator::accept_prefix;
 
 // The engine's model traits over LFM2's existing entry points
 // (`RESTRUCTURING_DESIGN.md` §3.1). No computation is threaded through them that

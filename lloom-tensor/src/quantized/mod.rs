@@ -279,6 +279,40 @@ impl QStorage {
         }
     }
 
+    /// Overwrite `len` packed bytes at `offset` with whatever `fill` writes
+    /// into the slice it is handed — a streamed weight tier landing one
+    /// expert's blocks in a resident slot (`nn::expert_stream`). On the CPU
+    /// the slice is the storage itself; on Metal it is a pooled Shared staging
+    /// buffer copied into the storage by a compute-encoder copy, so the write
+    /// is ordered by the encoder's hazard chain after every earlier reader of
+    /// the slot (a blit would sit outside that chain, `MetalStorage::copy2d`).
+    fn write_with(
+        &mut self,
+        offset: usize,
+        len: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            QStorage::Cpu(storage) => {
+                let size = storage.storage_size_in_bytes();
+                if offset + len > size {
+                    crate::bail!(
+                        "write_with: {offset}+{len} past the {size}-byte quantized storage"
+                    )
+                }
+                // SAFETY: `as_mut_ptr` addresses `size` initialised bytes of
+                // plain-old-data blocks and the range was bounds-checked; the
+                // `&mut self` borrow excludes every other access.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(storage.as_mut_ptr().add(offset), len)
+                };
+                fill(dst)
+            }
+            QStorage::Metal(storage) => storage.write_with(offset, len, fill),
+            QStorage::Cuda(_) => crate::bail!("write_with is not implemented on CUDA"),
+        }
+    }
+
     fn data(&self) -> Result<Cow<'_, [u8]>> {
         match self {
             QStorage::Cpu(storage) => {
@@ -566,6 +600,9 @@ pub trait QuantizedType: Send + Sync {
     fn dequantize(&self, elem_count: usize) -> Result<CpuStorage>;
     fn storage_size_in_bytes(&self) -> usize;
     fn as_ptr(&self) -> *const u8;
+    /// The packed bytes, writable: the seam a streamed weight tier fills a
+    /// resident slot through (`QTensor::write_with`).
+    fn as_mut_ptr(&mut self) -> *mut u8;
     fn block_size(&self) -> usize;
     #[allow(clippy::wrong_self_convention)]
     fn from_float(&mut self, xs: &[f32]);
@@ -688,6 +725,10 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
 
     fn as_ptr(&self) -> *const u8 {
         self.as_ptr() as *const u8
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr() as *mut u8
     }
 }
 
@@ -931,6 +972,43 @@ impl QTensor {
 
     pub fn storage_size_in_bytes(&self) -> usize {
         self.storage.size_in_bytes()
+    }
+
+    /// An all-zero packed tensor of `dtype` on `device`, to be filled in
+    /// place with [`Self::write_with`] — the resident slot pool of a streamed
+    /// weight tier.
+    pub fn zeros<S: Into<Shape>>(shape: S, dtype: GgmlDType, device: &Device) -> Result<Self> {
+        let shape = shape.into();
+        check_shape(&shape, dtype.block_size())?;
+        let storage = device.qzeros(shape.elem_count(), dtype)?;
+        Self::new(storage, shape)
+    }
+
+    /// Overwrite `len` packed bytes at byte `offset` with what `fill` writes
+    /// into the slice it is handed. Bounds-checked against the exact packed
+    /// size; the Metal arm goes through the compute encoder so the write is
+    /// ordered after every earlier reader of those bytes (`QStorage::write_with`).
+    pub fn write_with(
+        &mut self,
+        offset: usize,
+        len: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        let exact = self.shape.elem_count() / self.dtype().block_size() * self.dtype().type_size();
+        if offset + len > exact {
+            crate::bail!("write_with: {offset}+{len} past the {exact}-byte tensor")
+        }
+        self.storage.write_with(offset, len, fill)
+    }
+
+    /// The Metal buffer behind this tensor, for a subsystem that writes it
+    /// through another queue (`kernels::metal::io_queue`).
+    #[cfg(feature = "metal")]
+    pub fn metal_buffer(&self) -> Result<&crate::kernels::metal::Buffer> {
+        match &self.storage {
+            QStorage::Metal(s) => Ok(s.buffer()),
+            _ => crate::bail!("metal_buffer: not a Metal quantized tensor"),
+        }
     }
 
     /// The packed bytes, exactly `elem_count / block_size * type_size` of

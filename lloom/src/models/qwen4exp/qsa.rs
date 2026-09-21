@@ -85,6 +85,17 @@ impl KvCache {
     pub fn n_blocks(&self) -> usize {
         self.blocks.current_seq_len()
     }
+    /// `(tokens, compressed blocks)` held — what a speculative window records.
+    pub fn lens(&self) -> (usize, usize) {
+        (self.len(), self.n_blocks())
+    }
+    /// Keep the first `tokens` positions (k, v, raw indexer keys) and the
+    /// first `blocks` compressed keys — a rejected speculative tail.
+    pub fn truncate(&mut self, tokens: usize, blocks: usize) {
+        self.inner.truncate(tokens);
+        self.raw_keys.truncate(tokens);
+        self.blocks.truncate(blocks);
+    }
     /// The live `(k, v, raw indexer keys, compressed keys)` views, for a
     /// state probe (`None` where nothing was written).
     pub fn state_views(&self) -> Result<[Option<Tensor>; 4]> {

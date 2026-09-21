@@ -1,0 +1,955 @@
+//! Expert residency — the seam a top-k MoE layer applies its routed experts
+//! through, and its two strategies: `Resident` (every expert in memory) and
+//! `Streamed` (a slot pool filled from the checkpoint on demand)
+//! (`design/docs/expert-streaming.md` §20.4, §20.6).
+//!
+//! Model-independent: a layer hands the strategy the router's expert ids and
+//! gets back the ids the routed kernel reads (`plan` + `ensure`), then
+//! dispatches the same `mul_mv_id` kernels over whatever tensor the strategy
+//! holds (`gate_up`, `down`). `Resident` monomorphizes to one group and the
+//! ids untouched — no readback, no map, the path a non-streamed model takes.
+//!
+//! `Streamed` keeps per layer three packed slot pools (gate, up, down — an
+//! expert is resident in all three or none) and ONE residency map keyed by
+//! expert id. Per forward it reads the top-k ids back once (the host has to
+//! know the routing to load anything; a prefetch policy is what removes that
+//! sync, §20.3, phase 1), groups the rows so each group's expert union fits
+//! the pool, and per group loads the misses into LRU-chosen unpinned slots
+//! before the dispatch. Two loader arms (§20.4a): `Pread` reads the expert's
+//! bytes from the file into a staging buffer that a compute-encoder copy lands
+//! in the slot, so the write is ordered after every earlier reader of the slot
+//! by the encoder's own hazard chain; `Io` (`MTLIOCommandQueue`) loads the
+//! file straight into the slot, ordered by shared events on both queues. On
+//! neither arm does an eviction wait on the GPU.
+
+use lloom_tensor::quantized::gguf_file::Content;
+use lloom_tensor::quantized::{GgmlDType, QTensor};
+use lloom_tensor::{Device, Result, Tensor};
+use std::fs::File;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+/// The rows of one routed dispatch and the expert ids they select.
+#[derive(Debug, Clone)]
+pub struct RoutedGroup {
+    /// The rows of the layer's `ids [rows, topk]` this group covers.
+    pub rows: Range<usize>,
+    ids: GroupIds,
+}
+
+#[derive(Debug, Clone)]
+enum GroupIds {
+    /// The ids as the router produced them, on the device (`Resident`).
+    Device(Tensor),
+    /// The ids read back to the host, row-major `[rows · topk]` (`Streamed`).
+    Host { ids: Vec<u32>, topk: usize },
+}
+
+/// How a layer's routed experts are held and applied.
+///
+/// The contract is the routed matmul's: the strategy receives the activation
+/// and the ids of the selected experts and returns the per-slot projections,
+/// `[rows, topk, n]`, plane `(r, t)` for `ids[r, t]` — so the combine above
+/// the seam never learns whether the experts were resident or streamed.
+pub trait ExpertResidency {
+    /// Group the rows of `ids [rows, topk]` (u32, on the device) into
+    /// dispatchable groups: `Resident` returns one group; `Streamed` groups
+    /// rows so each group's distinct experts fit its slot pool.
+    fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>>;
+
+    /// Make the group's experts resident and return the ids the dispatch reads,
+    /// `[rows, topk]` u32 on the device — the group's ids themselves for
+    /// `Resident`, slot indices for `Streamed`.
+    fn ensure(&self, group: &RoutedGroup) -> Result<Tensor>;
+
+    /// `gate` and `up` projections of `x [rows, 1, hidden]` through the experts
+    /// `slot_ids [rows, topk]`: each `[rows, topk, n_ff]`.
+    fn gate_up(&self, x: &Tensor, slot_ids: &Tensor) -> Result<(Tensor, Tensor)>;
+
+    /// `down` projection of `h [rows, topk, n_ff]` through `slot_ids`:
+    /// `[rows, topk, hidden]`.
+    fn down(&self, h: &Tensor, slot_ids: &Tensor) -> Result<Tensor>;
+}
+
+/// All experts resident in RAM: the small-model / big-RAM case, zero streaming
+/// overhead. Holds the checkpoint's stacked expert tensors as they come —
+/// `ffn_{gate,up}_exps [n_expert, n_ff, hidden]`, `ffn_down_exps [n_expert,
+/// hidden, n_ff]` — packed; the routed kernel reads the selected experts'
+/// blocks in place.
+#[derive(Debug, Clone)]
+pub struct Resident {
+    gate: Arc<QTensor>,
+    up: Arc<QTensor>,
+    down: Arc<QTensor>,
+}
+
+impl Resident {
+    pub fn new(gate: Arc<QTensor>, up: Arc<QTensor>, down: Arc<QTensor>) -> Self {
+        Self { gate, up, down }
+    }
+}
+
+impl ExpertResidency for Resident {
+    #[inline]
+    fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>> {
+        let rows = ids.dim(0)?;
+        Ok(vec![RoutedGroup {
+            rows: 0..rows,
+            ids: GroupIds::Device(ids.clone()),
+        }])
+    }
+    #[inline]
+    fn ensure(&self, group: &RoutedGroup) -> Result<Tensor> {
+        match &group.ids {
+            GroupIds::Device(t) => Ok(t.clone()),
+            GroupIds::Host { .. } => lloom_tensor::bail!("Resident::ensure: a host-planned group"),
+        }
+    }
+    #[inline]
+    fn gate_up(&self, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        Ok((
+            self.gate.indexed_moe_forward(x, ids)?,
+            self.up.indexed_moe_forward(x, ids)?,
+        ))
+    }
+    #[inline]
+    fn down(&self, h: &Tensor, ids: &Tensor) -> Result<Tensor> {
+        self.down.indexed_moe_forward(h, ids)
+    }
+}
+
+/// One stacked expert tensor in a GGUF file, addressed by expert: plane `e`
+/// is the contiguous byte range `[e · plane_bytes, (e+1) · plane_bytes)` of
+/// the tensor's data (rows are whole blocks, so a plane is whole blocks).
+pub struct ExpertSource {
+    file: Arc<File>,
+    path: PathBuf,
+    #[cfg(feature = "metal")]
+    io: Option<lloom_tensor::kernels::metal::io_queue::IoFile>,
+    data_start: u64,
+    plane_bytes: usize,
+    n_experts: usize,
+    n: usize,
+    k: usize,
+    dtype: GgmlDType,
+}
+
+impl std::fmt::Debug for ExpertSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ExpertSource {{ {} [{}, {}, {}] {:?} @{} plane={} }}",
+            self.path.display(),
+            self.n_experts,
+            self.n,
+            self.k,
+            self.dtype,
+            self.data_start,
+            self.plane_bytes
+        )
+    }
+}
+
+impl ExpertSource {
+    /// Locate tensor `name` (`[n_experts, n, k]`) in the shard `content` was
+    /// read from at `path`. Reads no expert bytes.
+    pub fn from_gguf(content: &Content, path: &Path, name: &str) -> Result<Self> {
+        let info = match content.tensor_infos.get(name) {
+            Some(i) => i,
+            None => lloom_tensor::bail!("{} has no tensor `{name}`", path.display()),
+        };
+        let (n_experts, n, k) = info.shape.dims3()?;
+        let dtype = info.ggml_dtype;
+        if !k.is_multiple_of(dtype.block_size()) {
+            lloom_tensor::bail!(
+                "`{name}`: k {k} is not a multiple of the {dtype:?} block ({})",
+                dtype.block_size()
+            )
+        }
+        let plane_bytes = n * (k / dtype.block_size()) * dtype.type_size();
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        let data_start = content.tensor_data_offset + info.offset;
+        let need = data_start + (n_experts * plane_bytes) as u64;
+        if need > len {
+            lloom_tensor::bail!(
+                "`{name}` needs {need} bytes of {}, which has {len}",
+                path.display()
+            )
+        }
+        Ok(Self {
+            file: Arc::new(file),
+            path: path.to_path_buf(),
+            #[cfg(feature = "metal")]
+            io: None,
+            data_start,
+            plane_bytes,
+            n_experts,
+            n,
+            k,
+            dtype,
+        })
+    }
+
+    pub fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+    pub fn dtype(&self) -> GgmlDType {
+        self.dtype
+    }
+    /// Bytes of one expert's plane.
+    pub fn plane_bytes(&self) -> usize {
+        self.plane_bytes
+    }
+    /// `(n, k)` of one expert's matrix.
+    pub fn dims(&self) -> (usize, usize) {
+        (self.n, self.k)
+    }
+    /// The byte offset of expert `e`'s plane in the file.
+    pub fn plane_offset(&self, e: usize) -> u64 {
+        self.data_start + (e * self.plane_bytes) as u64
+    }
+
+    /// Read expert `e`'s plane into `dst` (exactly `plane_bytes`).
+    pub fn read_plane(&self, e: usize, dst: &mut [u8]) -> Result<()> {
+        if e >= self.n_experts {
+            lloom_tensor::bail!("expert {e} out of {}", self.n_experts)
+        }
+        if dst.len() != self.plane_bytes {
+            lloom_tensor::bail!(
+                "read_plane: {} bytes requested, a plane is {}",
+                dst.len(),
+                self.plane_bytes
+            )
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(dst, self.plane_offset(e))?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            lloom_tensor::bail!("ExpertSource::read_plane needs a positional read (unix)")
+        }
+    }
+}
+
+/// Which primitive moves an expert's bytes into its slot (§20.4a).
+#[derive(Clone)]
+pub enum LoaderArm {
+    /// `pread` into a staging buffer, landed by a compute-encoder copy
+    /// (candidate A; the only arm on the CPU).
+    Pread,
+    /// `MTLIOCommandQueue` loads straight into the slot, ordered by shared
+    /// events (candidate B). One queue shared by every layer.
+    #[cfg(feature = "metal")]
+    Io(Arc<lloom_tensor::kernels::metal::io_queue::IoQueue>),
+}
+
+impl std::fmt::Debug for LoaderArm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoaderArm::Pread => write!(f, "Pread"),
+            #[cfg(feature = "metal")]
+            LoaderArm::Io(q) => write!(f, "Io({q:?})"),
+        }
+    }
+}
+
+impl LoaderArm {
+    pub fn name(&self) -> &'static str {
+        match self {
+            LoaderArm::Pread => "pread",
+            #[cfg(feature = "metal")]
+            LoaderArm::Io(_) => "io",
+        }
+    }
+}
+
+/// Expert id → slot, slot → expert, an LRU tick per slot and pin flags. The
+/// query is one indexed load; the victim search is over the (small) slot
+/// count and runs only on a miss.
+#[derive(Debug, Clone)]
+pub struct ResidencyMap {
+    slot_of: Vec<u32>,
+    expert_in: Vec<u32>,
+    last_use: Vec<u64>,
+    pinned: Vec<bool>,
+    tick: u64,
+}
+
+const NONE: u32 = u32::MAX;
+
+impl ResidencyMap {
+    pub fn new(n_experts: usize, n_slots: usize) -> Self {
+        Self {
+            slot_of: vec![NONE; n_experts],
+            expert_in: vec![NONE; n_slots],
+            last_use: vec![0; n_slots],
+            pinned: vec![false; n_slots],
+            tick: 0,
+        }
+    }
+
+    pub fn n_slots(&self) -> usize {
+        self.expert_in.len()
+    }
+
+    /// The slot holding expert `e`, if resident.
+    pub fn slot_of(&self, e: usize) -> Option<usize> {
+        match self.slot_of[e] {
+            NONE => None,
+            s => Some(s as usize),
+        }
+    }
+
+    /// Resident experts, in slot order.
+    pub fn resident(&self) -> Vec<u32> {
+        self.expert_in
+            .iter()
+            .copied()
+            .filter(|&e| e != NONE)
+            .collect()
+    }
+
+    /// Open a new use epoch (one per `ensure`).
+    fn begin(&mut self) -> u64 {
+        self.tick += 1;
+        self.tick
+    }
+
+    fn touch(&mut self, slot: usize, tick: u64) {
+        self.last_use[slot] = tick;
+    }
+
+    /// The least-recently-used unpinned slot not used in epoch `tick`, and
+    /// whether it held an expert (an eviction).
+    fn victim(&self, tick: u64) -> Option<(usize, bool)> {
+        let mut best: Option<(usize, u64)> = None;
+        for s in 0..self.expert_in.len() {
+            if self.pinned[s] || self.last_use[s] == tick {
+                continue;
+            }
+            // An empty slot wins outright.
+            if self.expert_in[s] == NONE {
+                return Some((s, false));
+            }
+            match best {
+                Some((_, t)) if t <= self.last_use[s] => {}
+                _ => best = Some((s, self.last_use[s])),
+            }
+        }
+        best.map(|(s, _)| (s, true))
+    }
+
+    fn install(&mut self, slot: usize, e: usize) {
+        let old = self.expert_in[slot];
+        if old != NONE {
+            self.slot_of[old as usize] = NONE;
+        }
+        self.expert_in[slot] = e as u32;
+        self.slot_of[e] = slot as u32;
+    }
+
+    fn set_pinned(&mut self, slot: usize, pinned: bool) {
+        self.pinned[slot] = pinned;
+    }
+
+    pub fn pinned_count(&self) -> usize {
+        self.pinned.iter().filter(|&&p| p).count()
+    }
+}
+
+/// Per-`Streamed` counters, relaxed atomics (an instrument, read off the
+/// hot path).
+#[derive(Debug, Default)]
+pub struct StreamCounters {
+    pub plans: AtomicU64,
+    pub groups: AtomicU64,
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
+    pub evictions: AtomicU64,
+    pub bytes_loaded: AtomicU64,
+}
+
+/// A snapshot of [`StreamCounters`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamStats {
+    pub plans: u64,
+    pub groups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub bytes_loaded: u64,
+}
+
+impl StreamCounters {
+    pub fn snapshot(&self) -> StreamStats {
+        StreamStats {
+            plans: self.plans.load(Ordering::Relaxed),
+            groups: self.groups.load(Ordering::Relaxed),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            bytes_loaded: self.bytes_loaded.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl std::ops::AddAssign for StreamStats {
+    fn add_assign(&mut self, o: Self) {
+        self.plans += o.plans;
+        self.groups += o.groups;
+        self.hits += o.hits;
+        self.misses += o.misses;
+        self.evictions += o.evictions;
+        self.bytes_loaded += o.bytes_loaded;
+    }
+}
+
+/// A strategy that keeps streaming counters (`Streamed`); `Resident` reports
+/// zeros so a harness can print one line for either.
+pub trait HasStreamStats {
+    fn stream_stats(&self) -> StreamStats;
+}
+
+impl HasStreamStats for Resident {
+    fn stream_stats(&self) -> StreamStats {
+        StreamStats::default()
+    }
+}
+
+impl HasStreamStats for Streamed {
+    fn stream_stats(&self) -> StreamStats {
+        self.stats()
+    }
+}
+
+struct SlotPool {
+    qt: QTensor,
+    plane_bytes: usize,
+}
+
+struct Inner {
+    /// gate, up, down.
+    pools: [SlotPool; 3],
+    sources: [ExpertSource; 3],
+    map: ResidencyMap,
+    loader: LoaderArm,
+    device: Device,
+}
+
+/// The routed experts streamed from the checkpoint into a slot pool (§20.6).
+pub struct Streamed {
+    inner: parking_lot::Mutex<Inner>,
+    counters: StreamCounters,
+    n_experts: usize,
+    n_slots: usize,
+}
+
+impl std::fmt::Debug for Streamed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Streamed {{ experts: {}, slots: {}, {:?} }}",
+            self.n_experts,
+            self.n_slots,
+            self.counters.snapshot()
+        )
+    }
+}
+
+impl Streamed {
+    /// A pool of `n_slots` experts per projection over the three sources
+    /// (gate, up, down — the same expert count each), filled by `loader`.
+    pub fn new(
+        gate: ExpertSource,
+        up: ExpertSource,
+        down: ExpertSource,
+        n_slots: usize,
+        loader: LoaderArm,
+        device: &Device,
+    ) -> Result<Self> {
+        let n_experts = gate.n_experts();
+        if up.n_experts() != n_experts || down.n_experts() != n_experts {
+            lloom_tensor::bail!(
+                "expert counts differ: gate {} up {} down {}",
+                n_experts,
+                up.n_experts(),
+                down.n_experts()
+            )
+        }
+        if n_slots == 0 || n_slots > n_experts {
+            lloom_tensor::bail!("slot pool of {n_slots} for {n_experts} experts")
+        }
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut sources = [gate, up, down];
+        #[cfg(feature = "metal")]
+        if let LoaderArm::Io(q) = &loader {
+            for s in sources.iter_mut() {
+                s.io = Some(q.open(&s.path).map_err(lloom_tensor::Error::wrap)?);
+            }
+        }
+        let pool = |s: &ExpertSource| -> Result<SlotPool> {
+            let (n, k) = s.dims();
+            Ok(SlotPool {
+                qt: QTensor::zeros((n_slots, n, k), s.dtype(), device)?,
+                plane_bytes: s.plane_bytes(),
+            })
+        };
+        let pools = [pool(&sources[0])?, pool(&sources[1])?, pool(&sources[2])?];
+        Ok(Self {
+            inner: parking_lot::Mutex::new(Inner {
+                pools,
+                sources,
+                map: ResidencyMap::new(n_experts, n_slots),
+                loader,
+                device: device.clone(),
+            }),
+            counters: StreamCounters::default(),
+            n_experts,
+            n_slots,
+        })
+    }
+
+    pub fn n_slots(&self) -> usize {
+        self.n_slots
+    }
+
+    pub fn n_experts(&self) -> usize {
+        self.n_experts
+    }
+
+    pub fn stats(&self) -> StreamStats {
+        self.counters.snapshot()
+    }
+
+    /// The loader arm's name.
+    pub fn loader_name(&self) -> &'static str {
+        self.inner.lock().loader.name()
+    }
+
+    /// Resident bytes across the three pools.
+    pub fn pool_bytes(&self) -> usize {
+        let inner = self.inner.lock();
+        inner
+            .pools
+            .iter()
+            .map(|p| p.qt.storage_size_in_bytes())
+            .sum()
+    }
+
+    /// Load `experts` and pin them: they are never evicted until
+    /// [`Self::unpin_all`]. The static hot set (§20.3 R2).
+    pub fn pin(&self, experts: &[u32]) -> Result<()> {
+        if experts.len() >= self.n_slots {
+            lloom_tensor::bail!(
+                "pinning {} experts leaves no free slot of {}",
+                experts.len(),
+                self.n_slots
+            )
+        }
+        let mut inner = self.inner.lock();
+        let tick = inner.map.begin();
+        let slots = self.resolve(&mut inner, experts, tick)?;
+        for s in slots {
+            inner.map.set_pinned(s, true);
+        }
+        Ok(())
+    }
+
+    pub fn unpin_all(&self) {
+        let mut inner = self.inner.lock();
+        for s in 0..self.n_slots {
+            inner.map.set_pinned(s, false);
+        }
+    }
+
+    /// Make every expert of `experts` resident within epoch `tick`, loading
+    /// the misses; returns each one's slot.
+    fn resolve(&self, inner: &mut Inner, experts: &[u32], tick: u64) -> Result<Vec<usize>> {
+        let mut slots = Vec::with_capacity(experts.len());
+        let mut misses: Vec<(usize, usize)> = Vec::new();
+        for &e in experts {
+            let e = e as usize;
+            if e >= self.n_experts {
+                lloom_tensor::bail!("expert {e} out of {}", self.n_experts)
+            }
+            let slot = match inner.map.slot_of(e) {
+                Some(s) => {
+                    self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                    s
+                }
+                None => {
+                    let (s, evicted) = match inner.map.victim(tick) {
+                        Some(v) => v,
+                        None => lloom_tensor::bail!(
+                            "the slot pool ({} slots, {} pinned) cannot hold this group's {} experts",
+                            self.n_slots,
+                            inner.map.pinned_count(),
+                            experts.len()
+                        ),
+                    };
+                    inner.map.install(s, e);
+                    self.counters.misses.fetch_add(1, Ordering::Relaxed);
+                    if evicted {
+                        self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                    }
+                    misses.push((e, s));
+                    s
+                }
+            };
+            inner.map.touch(slot, tick);
+            slots.push(slot);
+        }
+        if !misses.is_empty() {
+            self.load(inner, &misses)?;
+        }
+        Ok(slots)
+    }
+
+    /// Land `(expert, slot)` pairs in all three pools.
+    fn load(&self, inner: &mut Inner, misses: &[(usize, usize)]) -> Result<()> {
+        let mut bytes = 0u64;
+        match inner.loader.clone() {
+            LoaderArm::Pread => {
+                let Inner { pools, sources, .. } = inner;
+                for (pool, src) in pools.iter_mut().zip(sources.iter()) {
+                    let plane = pool.plane_bytes;
+                    for &(e, s) in misses {
+                        pool.qt
+                            .write_with(s * plane, plane, &mut |dst| src.read_plane(e, dst))?;
+                        bytes += plane as u64;
+                    }
+                }
+            }
+            #[cfg(feature = "metal")]
+            LoaderArm::Io(queue) => {
+                use lloom_tensor::kernels::metal::io_queue::IoLoad;
+                let commands = match &inner.device {
+                    Device::Metal(d) => d.commands().clone(),
+                    _ => lloom_tensor::bail!("the io loader arm needs a Metal device"),
+                };
+                let mut loads = Vec::with_capacity(misses.len() * 3);
+                for (pool, src) in inner.pools.iter().zip(inner.sources.iter()) {
+                    let dst = pool.qt.metal_buffer()?;
+                    let file = match &src.io {
+                        Some(f) => f,
+                        None => {
+                            lloom_tensor::bail!("io arm: {} was not opened", src.path.display())
+                        }
+                    };
+                    let plane = pool.plane_bytes;
+                    for &(e, s) in misses {
+                        loads.push(IoLoad {
+                            dst,
+                            dst_offset: s * plane,
+                            file,
+                            src_offset: src.plane_offset(e),
+                            len: plane,
+                        });
+                        bytes += plane as u64;
+                    }
+                }
+                queue
+                    .load_ordered(&commands, &loads)
+                    .map_err(lloom_tensor::Error::wrap)?;
+            }
+        }
+        self.counters
+            .bytes_loaded
+            .fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Greedy row grouping: consecutive rows whose distinct experts fit `n_slots`.
+fn plan_rows(ids: &[u32], rows: usize, topk: usize, n_slots: usize) -> Vec<Range<usize>> {
+    let mut groups = Vec::new();
+    let mut start = 0usize;
+    let mut distinct: Vec<u32> = Vec::with_capacity(n_slots);
+    for r in 0..rows {
+        let row = &ids[r * topk..(r + 1) * topk];
+        let mut added: Vec<u32> = Vec::new();
+        for &e in row {
+            if !distinct.contains(&e) && !added.contains(&e) {
+                added.push(e);
+            }
+        }
+        if distinct.len() + added.len() > n_slots && r > start {
+            groups.push(start..r);
+            start = r;
+            distinct.clear();
+            distinct.extend(row.iter().copied());
+            distinct.sort_unstable();
+            distinct.dedup();
+        } else {
+            distinct.extend(added);
+        }
+    }
+    groups.push(start..rows);
+    groups
+}
+
+impl ExpertResidency for Streamed {
+    fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>> {
+        let (rows, topk) = ids.dims2()?;
+        let host: Vec<u32> = ids.flatten_all()?.to_vec1::<u32>()?;
+        self.counters.plans.fetch_add(1, Ordering::Relaxed);
+        let groups = plan_rows(&host, rows, topk, self.n_slots);
+        self.counters
+            .groups
+            .fetch_add(groups.len() as u64, Ordering::Relaxed);
+        Ok(groups
+            .into_iter()
+            .map(|r| RoutedGroup {
+                ids: GroupIds::Host {
+                    ids: host[r.start * topk..r.end * topk].to_vec(),
+                    topk,
+                },
+                rows: r,
+            })
+            .collect())
+    }
+
+    fn ensure(&self, group: &RoutedGroup) -> Result<Tensor> {
+        let (ids, topk) = match &group.ids {
+            GroupIds::Host { ids, topk } => (ids, *topk),
+            GroupIds::Device(_) => lloom_tensor::bail!("Streamed::ensure: a device-planned group"),
+        };
+        let mut distinct: Vec<u32> = ids.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut inner = self.inner.lock();
+        let tick = inner.map.begin();
+        let slots = self.resolve(&mut inner, &distinct, tick)?;
+        let slot_ids: Vec<u32> = ids
+            .iter()
+            .map(|e| {
+                let i = distinct.binary_search(e).expect("distinct covers ids");
+                slots[i] as u32
+            })
+            .collect();
+        Tensor::from_vec(slot_ids, (group.rows.len(), topk), &inner.device)
+    }
+
+    fn gate_up(&self, x: &Tensor, slot_ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        let inner = self.inner.lock();
+        Ok((
+            inner.pools[0].qt.indexed_moe_forward(x, slot_ids)?,
+            inner.pools[1].qt.indexed_moe_forward(x, slot_ids)?,
+        ))
+    }
+
+    fn down(&self, h: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
+        let inner = self.inner.lock();
+        inner.pools[2].qt.indexed_moe_forward(h, slot_ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lloom_tensor::quantized::gguf_file;
+
+    /// A stacked `[e, out, inp]` expert weight quantized to `dtype`.
+    fn stacked(e: usize, out: usize, inp: usize, seed: f32, dtype: GgmlDType) -> QTensor {
+        let n = e * out * inp;
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.011 + seed).cos()) * 0.1)
+            .collect();
+        let t = Tensor::from_vec(v, (e, out, inp), &Device::Cpu).unwrap();
+        QTensor::quantize(&t, dtype).unwrap()
+    }
+
+    /// Write `tensors` to a fresh GGUF at a unique temp path (tests run in
+    /// parallel in one process, so the pid alone would collide).
+    fn write_gguf(tensors: &[(&str, &QTensor)]) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "lloom-expert-stream-{}-{}.gguf",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut f = File::create(&path).unwrap();
+        gguf_file::write(&mut f, &[], tensors).unwrap();
+        path
+    }
+
+    fn open(path: &Path, name: &str) -> ExpertSource {
+        let mut f = File::open(path).unwrap();
+        let content = Content::read(&mut f).unwrap();
+        ExpertSource::from_gguf(&content, path, name).unwrap()
+    }
+
+    fn ids(rows: usize, topk: usize, n_experts: usize, seed: usize) -> Tensor {
+        let v: Vec<u32> = (0..rows * topk)
+            .map(|i| ((i * 7 + seed * 13 + i / topk) % n_experts) as u32)
+            .collect();
+        Tensor::from_vec(v, (rows, topk), &Device::Cpu).unwrap()
+    }
+
+    fn x(rows: usize, k: usize, seed: f32) -> Tensor {
+        let v: Vec<f32> = (0..rows * k)
+            .map(|i| ((i as f32) * 0.07 + seed).sin() * 0.4)
+            .collect();
+        Tensor::from_vec(v, (rows, 1, k), &Device::Cpu).unwrap()
+    }
+
+    fn run<R: ExpertResidency>(r: &R, x3: &Tensor, ids: &Tensor) -> Vec<f32> {
+        let groups = r.plan(ids).unwrap();
+        let mut ys = Vec::new();
+        for g in &groups {
+            let slot_ids = r.ensure(g).unwrap();
+            let xg = x3.narrow(0, g.rows.start, g.rows.len()).unwrap();
+            let (gt, u) = r.gate_up(&xg, &slot_ids).unwrap();
+            let h = (crate::nn::ops::silu(&gt).unwrap() * u).unwrap();
+            ys.push(r.down(&h, &slot_ids).unwrap());
+        }
+        let y = Tensor::cat(&ys, 0).unwrap();
+        y.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// Streamed == Resident bit for bit over decode rows and a chunk whose
+    /// expert union exceeds the pool (several groups, evictions), for a float
+    /// stack and a real block type; the counters prove the streaming ran.
+    fn streamed_matches_resident(dtype: GgmlDType) {
+        let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let resident = Resident::new(Arc::new(gate), Arc::new(up), Arc::new(down));
+        let n_slots = 5; // < e, and < a chunk's union
+        let streamed = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            n_slots,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+
+        // decode rows, one at a time (temporal reuse → hits)
+        for t in 0..8 {
+            let xs = x(1, d, t as f32);
+            let id = ids(1, topk, e, t % 3);
+            assert_eq!(
+                run(&resident, &xs, &id),
+                run(&streamed, &xs, &id),
+                "token {t}"
+            );
+        }
+        // a chunk of 9 rows: union 12 > 5 slots → groups + evictions
+        let xs = x(9, d, 0.5);
+        let id = ids(9, topk, e, 4);
+        let groups = streamed.plan(&id).unwrap();
+        assert!(
+            groups.len() >= 2,
+            "expected several groups, got {}",
+            groups.len()
+        );
+        assert_eq!(run(&resident, &xs, &id), run(&streamed, &xs, &id), "chunk");
+
+        let s = streamed.stats();
+        // 8 decode plans + the chunk's plan above + the chunk plan inside `run`.
+        assert!(s.plans == 10, "plans {}", s.plans);
+        assert!(s.hits > 0, "no hits: {s:?}");
+        assert!(
+            s.misses > 0 && s.evictions > 0,
+            "no eviction exercised: {s:?}"
+        );
+        let plane: usize = [ff * d, ff * d, d * ff]
+            .iter()
+            .map(|n| n / dtype.block_size() * dtype.type_size())
+            .sum();
+        assert_eq!(
+            s.bytes_loaded,
+            s.misses * plane as u64,
+            "bytes loaded must be misses × the three planes"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn streamed_matches_resident_f32() {
+        streamed_matches_resident(GgmlDType::F32);
+    }
+
+    #[test]
+    fn streamed_matches_resident_q8_0() {
+        streamed_matches_resident(GgmlDType::Q8_0);
+    }
+
+    /// Pinned experts survive an eviction pass; the pool refuses a pin set
+    /// that leaves no free slot.
+    #[test]
+    fn pinned_experts_are_never_evicted() {
+        let (e, ff, d, topk) = (10usize, 32usize, 32usize, 2usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::F32);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::F32);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            4,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        streamed.pin(&[7, 8]).unwrap();
+        assert!(
+            streamed.pin(&[0, 1, 2, 3]).is_err(),
+            "a pin set must leave a free slot"
+        );
+        for t in 0..6 {
+            let id = ids(1, topk, 7, t); // experts 0..7 only, churning the 2 free slots
+            let xs = x(1, d, 0.0);
+            let _ = run(&streamed, &xs, &id);
+        }
+        let inner = streamed.inner.lock();
+        assert!(inner.map.slot_of(7).is_some() && inner.map.slot_of(8).is_some());
+        drop(inner);
+        assert!(streamed.stats().evictions > 0);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A group wider than the pool is refused rather than silently narrowed.
+    #[test]
+    fn a_row_wider_than_the_pool_is_refused() {
+        let (e, ff, d) = (8usize, 32usize, 32usize);
+        let gate = stacked(e, ff, d, 1.0, GgmlDType::F32);
+        let up = stacked(e, ff, d, 2.0, GgmlDType::F32);
+        let down = stacked(e, d, ff, 3.0, GgmlDType::F32);
+        let path = write_gguf(&[("g", &gate), ("u", &up), ("d", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "g"),
+            open(&path, "u"),
+            open(&path, "d"),
+            3,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        let id = Tensor::from_vec(vec![0u32, 1, 2, 3], (1, 4), &Device::Cpu).unwrap();
+        let g = streamed.plan(&id).unwrap();
+        assert!(streamed.ensure(&g[0]).is_err());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn plan_rows_groups_by_union() {
+        // rows: {0,1} {1,2} {3,4} {5,6} with 4 slots → {0,1,2} fits, {3,4}
+        // would make 5 → cut; {3,4,5,6} fits → [0..2] [2..4]
+        let ids = [0u32, 1, 1, 2, 3, 4, 5, 6];
+        assert_eq!(plan_rows(&ids, 4, 2, 4), vec![0..2, 2..4]);
+        assert_eq!(plan_rows(&ids, 4, 2, 3), vec![0..2, 2..3, 3..4]);
+        assert_eq!(plan_rows(&ids, 4, 2, 8), vec![0..4]);
+    }
+}

@@ -77,6 +77,15 @@ impl QMetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    pub fn write_with(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _fill: &mut dyn FnMut(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     pub fn indexed_moe_forward(
         &self,
         _: &crate::Shape,

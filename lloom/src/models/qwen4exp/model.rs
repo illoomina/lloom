@@ -12,7 +12,6 @@
 use super::config::Config;
 use super::deltanet_block::GatedDeltaNet;
 use super::hc::HyperConnection;
-use super::moe::Resident;
 use super::moe::{ExpertResidency, MoeLayer};
 use super::ple::{NgramHash, NgramWindow, PleLayer, PleTable};
 use super::qsa::{KvCache, QsaAttention};
@@ -54,6 +53,77 @@ impl<R: ExpertResidency> Layer<R> {
             moe,
         }
     }
+
+    pub fn mixer(&self) -> &Mixer {
+        &self.mixer
+    }
+
+    pub fn moe(&self) -> &MoeLayer<R> {
+        &self.moe
+    }
+
+    pub fn moe_mut(&mut self) -> &mut MoeLayer<R> {
+        &mut self.moe
+    }
+
+    /// The `[.., d]` collapse of a carry through this layer's ffn bracket —
+    /// the per-layer value the observer reports (`LayerOutputPoint`).
+    pub fn collapsed(&self, res_hc: &Tensor) -> Result<Tensor> {
+        Ok(self.hc_ffn.mix(res_hc)?.0)
+    }
+
+    /// One position through the layer: `res_hc [1, 1, n·d]` → the new carry,
+    /// plus the token-mixer's and the MoE's outputs (the non-finite watch reads
+    /// them). State channel / KV slot `l` of `cache`.
+    pub fn decode_parts(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        cache: &mut Cache,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        // HC prologue (attn bracket): collapse streams → mixer input.
+        let (cur, inject) = self.hc_attn.mix(res_hc)?; // cur [1,1,d]
+        trace("attn.mix", l, &cur);
+        trace("attn.inject", l, &inject);
+        let mixed = match &self.mixer {
+            Mixer::Linear(dn) => dn.decode(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
+            Mixer::Full(qsa) => qsa.decode(&cur, &mut cache.kv[l])?,
+        };
+        trace("mixer", l, &mixed);
+        // HC epilogue: scatter the mixer output back across the streams.
+        let res_hc = self.hc_attn.combine(res_hc, &mixed, &inject)?;
+        trace("attn.combine", l, &res_hc);
+
+        // HC prologue (ffn bracket) → MoE → HC epilogue.
+        let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
+        trace("ffn.mix", l, &cur);
+        let moe_out = self.moe.decode(&cur)?;
+        trace("moe", l, &moe_out);
+        let res_hc = self.hc_ffn.combine(&res_hc, &moe_out, &inject)?;
+        trace("ffn.combine", l, &res_hc);
+        Ok((res_hc, mixed, moe_out))
+    }
+
+    /// One position through the layer ([`Self::decode_parts`]'s carry).
+    pub fn decode(&self, res_hc: &Tensor, l: usize, cache: &mut Cache) -> Result<Tensor> {
+        Ok(self.decode_parts(res_hc, l, cache)?.0)
+    }
+
+    /// A chunk through the layer: `res_hc [1, seq, n·d]` → the new carry
+    /// (DeltaNet Kernel B / dense chunk attention, per-row MoE).
+    pub fn prefill(&self, res_hc: &Tensor, l: usize, cache: &mut Cache) -> Result<Tensor> {
+        let (cur, inject) = self.hc_attn.mix(res_hc)?; // [1, seq, d]
+        let mixed = match &self.mixer {
+            Mixer::Linear(dn) => dn.prefill(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
+            Mixer::Full(qsa) => qsa.prefill(&cur, &mut cache.kv[l])?,
+        };
+        trace("mixer", l, &mixed);
+        let res_hc = self.hc_attn.combine(res_hc, &mixed, &inject)?;
+        let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
+        let moe_out = self.moe.forward(&cur)?;
+        trace("moe", l, &moe_out);
+        self.hc_ffn.combine(&res_hc, &moe_out, &inject)
+    }
 }
 
 /// The per-sequence state the forward threads: DeltaNet `S`, the conv window,
@@ -78,20 +148,51 @@ pub struct Cache {
     pub pending_tokens: std::collections::VecDeque<u32>,
     /// Decode position (number of tokens seen).
     pub pos: usize,
+    /// Retain every forward's pre-final-mixer carry `[1, seq, n·d]` (the
+    /// `NextnHidden` probe an MTP drafter reads) until [`Self::take_nextn`].
+    /// Off, a forward keeps nothing.
+    pub want_nextn: bool,
+    nextn: Vec<Tensor>,
+    /// Retained carries a verify pass found untaken and discarded.
+    nextn_drops: u64,
+    /// The open speculative window's pre-window bookkeeping, if any.
+    window: Option<CacheWindow>,
+}
+
+/// What a speculative window must put back besides the recurrent channels'
+/// own snapshots: per-layer KV lengths, the n-gram window, the pending token
+/// ids and the position.
+#[derive(Debug, Clone)]
+struct CacheWindow {
+    kv: Vec<(usize, usize)>,
+    ngram: NgramWindow,
+    pending_tokens: std::collections::VecDeque<u32>,
+    pos: usize,
 }
 
 impl Cache {
     pub fn new(cfg: &Config) -> Self {
+        Self::with_layers(cfg, cfg.n_layers)
+    }
+
+    /// A cache for `n_layers` layers of `cfg`'s geometry (an MTP head's single
+    /// layer shares the model's shapes, not its depth).
+    pub fn with_layers(cfg: &Config, n_layers: usize) -> Self {
         Self {
-            s_state: RecurrentState::new(cfg.n_layers),
-            conv_state: RecurrentState::new(cfg.n_layers),
-            kv: vec![KvCache::default(); cfg.n_layers],
-            ple_conv: RecurrentState::new(cfg.n_layers),
+            s_state: RecurrentState::new(n_layers),
+            conv_state: RecurrentState::new(n_layers),
+            kv: vec![KvCache::default(); n_layers],
+            ple_conv: RecurrentState::new(n_layers),
             ngram: NgramWindow::new(cfg.ple_ngram_size.saturating_sub(1)),
             pending_tokens: std::collections::VecDeque::new(),
             pos: 0,
+            want_nextn: false,
+            nextn: Vec::new(),
+            nextn_drops: 0,
+            window: None,
         }
     }
+
     pub fn reset(&mut self) {
         self.s_state.reset();
         self.conv_state.reset();
@@ -102,6 +203,94 @@ impl Cache {
         self.ngram.reset();
         self.pending_tokens.clear();
         self.pos = 0;
+        self.nextn.clear();
+        self.window = None;
+    }
+
+    /// The carries retained since the last take, concatenated along the
+    /// sequence: `[1, positions, n·d]`, or `None` if nothing was retained.
+    pub fn take_nextn(&mut self) -> Result<Option<Tensor>> {
+        let rows = std::mem::take(&mut self.nextn);
+        match rows.len() {
+            0 => Ok(None),
+            1 => Ok(rows.into_iter().next()),
+            _ => Ok(Some(Tensor::cat(&rows, 1)?)),
+        }
+    }
+
+    fn keep_nextn(&mut self, res_hc: &Tensor) {
+        if self.want_nextn {
+            self.nextn.push(res_hc.clone());
+        }
+    }
+
+    /// Discard whatever is retained, counting it as a dropped probe.
+    pub(crate) fn drop_nextn(&mut self) {
+        if !self.nextn.is_empty() {
+            self.nextn_drops += 1;
+            self.nextn.clear();
+        }
+    }
+
+    /// Retained carries discarded untaken so far (`Probes::probe_drops`).
+    pub fn nextn_drops(&self) -> u64 {
+        self.nextn_drops
+    }
+
+    /// Open a speculative window: snapshot every state channel and the
+    /// lengths a verify pass will advance, so a partially-accepted window can
+    /// be put back (§10.2a). One window at a time.
+    pub fn open_window(&mut self) -> Result<()> {
+        if self.window.is_some() {
+            lloom_tensor::bail!("qwen4exp cache: a speculative window is already open")
+        }
+        self.s_state.open_window()?;
+        self.conv_state.open_window()?;
+        self.ple_conv.open_window()?;
+        self.window = Some(CacheWindow {
+            kv: self.kv.iter().map(|k| k.lens()).collect(),
+            ngram: self.ngram.clone(),
+            pending_tokens: self.pending_tokens.clone(),
+            pos: self.pos,
+        });
+        Ok(())
+    }
+
+    /// Put the cache back to where the window was opened: the recurrent
+    /// channels from their snapshots, the KV caches by length, the n-gram
+    /// window, the pending ids and the position. The caller replays the
+    /// accepted prefix afterwards (the decode recurrence is replayable, so a
+    /// checkpoint + replay is the rollback, §10.2a).
+    pub fn rewind_window(&mut self) -> Result<()> {
+        let w = match self.window.take() {
+            Some(w) => w,
+            None => lloom_tensor::bail!("qwen4exp cache: no speculative window is open"),
+        };
+        self.s_state.rewind_to_window()?;
+        self.conv_state.rewind_to_window()?;
+        self.ple_conv.rewind_to_window()?;
+        for (k, &(tokens, blocks)) in self.kv.iter_mut().zip(&w.kv) {
+            k.truncate(tokens, blocks);
+        }
+        self.ngram = w.ngram;
+        self.pending_tokens = w.pending_tokens;
+        self.pos = w.pos;
+        Ok(())
+    }
+
+    /// Close the window keeping everything the pass wrote.
+    pub fn resolve_window(&mut self) -> Result<()> {
+        if self.window.take().is_none() {
+            lloom_tensor::bail!("qwen4exp cache: no speculative window is open")
+        }
+        self.s_state.resolve_window()?;
+        self.conv_state.resolve_window()?;
+        self.ple_conv.resolve_window()?;
+        Ok(())
+    }
+
+    pub fn window_open(&self) -> bool {
+        self.window.is_some()
     }
 
     /// A checksum (FNV over the f32 bit patterns) and a non-finite count per
@@ -261,6 +450,32 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         &self.cfg
     }
 
+    /// The device the weights live on.
+    pub fn device(&self) -> lloom_tensor::Device {
+        match &self.lm_head {
+            QMatMul::QTensor(q) => q.device(),
+            QMatMul::Tensor(t) | QMatMul::TensorF16(t) => t.device().clone(),
+        }
+    }
+
+    /// The token embedding (`token_embd`), shared with an MTP drafter.
+    pub fn embed_tokens(&self) -> &QMatMul {
+        &self.embed_tokens
+    }
+
+    /// The `lm_head`, shared with an MTP drafter.
+    pub fn lm_head(&self) -> &QMatMul {
+        &self.lm_head
+    }
+
+    pub fn layers(&self) -> &[Layer<R>] {
+        &self.layers
+    }
+
+    pub fn layers_mut(&mut self) -> &mut [Layer<R>] {
+        &mut self.layers
+    }
+
     /// Attach the N-gram PLE at `layer`.
     pub fn set_ple(
         &mut self,
@@ -287,6 +502,29 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// Whether the N-gram PLE is attached.
     pub fn has_ple(&self) -> bool {
         self.ple.is_some()
+    }
+
+    /// The PLE hot-row cache's `(hits, misses)`, if a cached table is attached.
+    pub fn ple_cache_stats(&self) -> Option<(u64, u64)> {
+        match &self.ple {
+            Some(p) => match &p.table {
+                PleTable::Cached(_) => Some(p.table.cache_stats()),
+                _ => None,
+            },
+            None => None,
+        }
+    }
+
+    /// Every layer's expert-residency counters summed (`Streamed` only).
+    pub fn stream_stats(&self) -> crate::nn::expert_stream::StreamStats
+    where
+        R: crate::nn::expert_stream::HasStreamStats,
+    {
+        let mut s = crate::nn::expert_stream::StreamStats::default();
+        for l in &self.layers {
+            s += l.moe().experts().stream_stats();
+        }
+        s
     }
 
     /// The PLE delta for the positions of `res_hc [1, seq, n·d]`: hash each
@@ -407,24 +645,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             if obs.wants::<HcStatePoint>(l) {
                 obs.at::<HcStatePoint>(l, &res_hc)?;
             }
-            let (cur, inject) = layer.hc_attn.mix(&res_hc)?; // [1, seq, d]
-            let mixed = match &layer.mixer {
-                Mixer::Linear(dn) => {
-                    dn.prefill(&cur, l, &mut cache.s_state, &mut cache.conv_state)?
-                }
-                Mixer::Full(qsa) => qsa.prefill(&cur, &mut cache.kv[l])?,
-            };
-            trace("mixer", l, &mixed);
-            res_hc = layer.hc_attn.combine(&res_hc, &mixed, &inject)?;
-            let (cur, inject) = layer.hc_ffn.mix(&res_hc)?;
-            let moe_out = layer.moe.forward(&cur)?;
-            trace("moe", l, &moe_out);
-            res_hc = layer.hc_ffn.combine(&res_hc, &moe_out, &inject)?;
+            res_hc = layer.prefill(&res_hc, l, cache)?;
             if obs.wants::<LayerOutputPoint>(l) {
-                let (collapsed, _) = layer.hc_ffn.mix(&res_hc)?;
-                obs.at::<LayerOutputPoint>(l, &collapsed)?;
+                obs.at::<LayerOutputPoint>(l, &layer.collapsed(&res_hc)?)?;
             }
         }
+        cache.keep_nextn(&res_hc);
 
         // Only the last position feeds the head.
         let last = res_hc.narrow(1, seq - 1, 1)?;
@@ -471,41 +697,19 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 obs.at::<HcStatePoint>(l, &res_hc)?;
             }
 
-            // HC prologue (attn bracket): collapse streams → mixer input.
-            let (cur, inject) = layer.hc_attn.mix(&res_hc)?; // cur [1,1,d]
-            trace("attn.mix", l, &cur);
-            trace("attn.inject", l, &inject);
-            let mixed = match &layer.mixer {
-                Mixer::Linear(dn) => {
-                    dn.decode(&cur, l, &mut cache.s_state, &mut cache.conv_state)?
-                }
-                Mixer::Full(qsa) => qsa.decode(&cur, &mut cache.kv[l])?,
-            };
-            trace("mixer", l, &mixed);
+            let (next, mixed, moe_out) = layer.decode_parts(&res_hc, l, cache)?;
             if watch {
                 watched.push(nonfinite_probe(&mixed)?);
-            }
-            // HC epilogue: scatter the mixer output back across the streams.
-            res_hc = layer.hc_attn.combine(&res_hc, &mixed, &inject)?;
-            trace("attn.combine", l, &res_hc);
-
-            // HC prologue (ffn bracket) → MoE → HC epilogue.
-            let (cur, inject) = layer.hc_ffn.mix(&res_hc)?;
-            trace("ffn.mix", l, &cur);
-            let moe_out = layer.moe.decode(&cur)?;
-            trace("moe", l, &moe_out);
-            if watch {
                 watched.push(nonfinite_probe(&moe_out)?);
             }
-            res_hc = layer.hc_ffn.combine(&res_hc, &moe_out, &inject)?;
-            trace("ffn.combine", l, &res_hc);
+            res_hc = next;
 
             // observe the collapsed layer output (d-wide) — the DSpark/MTP tap side.
             if obs.wants::<LayerOutputPoint>(l) {
-                let (collapsed, _) = layer.hc_ffn.mix(&res_hc)?;
-                obs.at::<LayerOutputPoint>(l, &collapsed)?;
+                obs.at::<LayerOutputPoint>(l, &layer.collapsed(&res_hc)?)?;
             }
         }
+        cache.keep_nextn(&res_hc);
 
         if watch && !watched.is_empty() {
             // One readback per token: the first non-finite (layer, sub-block).
@@ -549,7 +753,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     }
 }
 
-impl ModelTrait for Qwen4Exp<Resident> {
+impl<R: ExpertResidency> ModelTrait for Qwen4Exp<R> {
     type Config = Config;
 
     /// The checkpoint is GGUF (a non-uniform per-tensor quant); the safetensors
@@ -560,7 +764,7 @@ impl ModelTrait for Qwen4Exp<Resident> {
     }
 }
 
-impl CausalLM for Qwen4Exp<Resident> {
+impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
     type Cache = Cache;
 
     fn new_cache(&self, cfg: &Self::Config, _dev: &lloom_tensor::Device) -> Result<Self::Cache> {
@@ -606,112 +810,11 @@ impl CacheReset for Cache {
 #[cfg(test)]
 mod tests {
     use super::super::config::LayerKind;
-    use super::super::deltanet_block::GatedDeltaNet;
-    use super::super::hc::HyperConnection;
-    use super::super::moe::{MoeLayer, Resident};
-    use super::super::qsa::QsaAttention;
+    use super::super::moe::Resident;
+    use super::super::testing::{deltanet, hc, lin, moe, ones, qsa, wt};
     use super::*;
-    use crate::nn::RmsNorm;
-    use lloom_tensor::quantized::{GgmlDType, QTensor};
-    use lloom_tensor::{DType, Device};
-    use std::sync::Arc;
-
-    /// A stacked `[e, out, inp]` expert weight as an F32-typed `QTensor`.
-    fn stacked(e: usize, out: usize, inp: usize, seed: f32, dev: &Device) -> Arc<QTensor> {
-        let v: Vec<f32> = (0..e * out * inp)
-            .map(|i| ((i as f32 * 0.011 + seed).cos()) * 0.1)
-            .collect();
-        let t = Tensor::from_vec(v, (e, out, inp), dev).unwrap();
-        Arc::new(QTensor::quantize(&t, GgmlDType::F32).unwrap())
-    }
-
-    fn lin(out: usize, inp: usize, seed: f32, dev: &Device) -> QMatMul {
-        let v: Vec<f32> = (0..out * inp)
-            .map(|i| ((i as f32 * 0.007 + seed).sin()) * 0.08)
-            .collect();
-        QMatMul::Tensor(Tensor::from_vec(v, (out, inp), dev).unwrap())
-    }
-    fn ones(n: usize, dev: &Device) -> Tensor {
-        Tensor::ones(n, DType::F32, dev).unwrap()
-    }
-    fn wt(shape: (usize, usize), seed: f32, dev: &Device) -> Tensor {
-        let (r, c) = shape;
-        Tensor::from_vec(
-            (0..r * c)
-                .map(|i| ((i as f32 * 0.009 + seed).cos()) * 0.05)
-                .collect::<Vec<f32>>(),
-            (r, c),
-            dev,
-        )
-        .unwrap()
-    }
-
-    fn hc(cfg: &Config, seed: f32, dev: &Device) -> HyperConnection {
-        let hc_dim = cfg.hc_dim();
-        HyperConnection::new(
-            ones(hc_dim, dev),                                // norm_w
-            lin(cfg.hc_lowrank, hc_dim, seed, dev),           // down
-            lin(hc_dim, cfg.hc_lowrank, seed + 1.0, dev),     // up
-            Some(lin(cfg.hc_count, hc_dim, seed + 2.0, dev)), // inject → n
-            cfg.hc_count,
-            cfg.hidden_size,
-            cfg.norm_eps as f32,
-        )
-        .unwrap()
-    }
-
-    fn deltanet(cfg: &Config, dev: &Device) -> GatedDeltaNet {
-        let d = cfg.hidden_size;
-        let cc = cfg.conv_channels();
-        let vd = cfg.ssm_state_size * cfg.ssm_dt_rank;
-        let hv = cfg.ssm_dt_rank;
-        GatedDeltaNet::new(
-            lin(cc, d, 1.0, dev),
-            lin(vd, d, 2.0, dev),
-            wt((cc, cfg.ssm_conv_kernel), 3.0, dev),
-            Tensor::from_vec((0..hv).map(|_| -0.5f32).collect::<Vec<_>>(), hv, dev).unwrap(),
-            Tensor::zeros(hv, DType::F32, dev).unwrap(),
-            lin(hv, d, 4.0, dev),
-            lin(hv, d, 5.0, dev),
-            ones(cfg.ssm_state_size, dev),
-            lin(d, vd, 6.0, dev),
-            cfg,
-        )
-    }
-
-    fn qsa(cfg: &Config, dev: &Device) -> QsaAttention {
-        let d = cfg.hidden_size;
-        let (hd, nh, nkv) = (cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
-        QsaAttention::new(
-            lin(nh * hd * 2, d, 1.0, dev),
-            lin(nkv * hd, d, 2.0, dev),
-            lin(nkv * hd, d, 3.0, dev),
-            lin(d, nh * hd, 4.0, dev),
-            RmsNorm::new(ones(hd, dev), cfg.norm_eps),
-            RmsNorm::new(ones(hd, dev), cfg.norm_eps),
-            cfg,
-        )
-    }
-
-    fn moe(cfg: &Config, dev: &Device) -> MoeLayer<Resident> {
-        let d = cfg.hidden_size;
-        let ff = cfg.moe_intermediate_size;
-        let ne = cfg.n_experts;
-        let sh = cfg.shared_expert_intermediate_size;
-        MoeLayer::new(
-            lin(ne, d, 1.0, dev),
-            Resident::new(
-                stacked(ne, ff, d, 1.0, dev),
-                stacked(ne, ff, d, 100.0, dev),
-                stacked(ne, d, ff, 200.0, dev),
-            ),
-            lin(sh, d, 2.0, dev),
-            lin(sh, d, 3.0, dev),
-            lin(d, sh, 4.0, dev),
-            lin(1, d, 5.0, dev),
-            cfg,
-        )
-    }
+    use lloom_tensor::quantized::QMatMul;
+    use lloom_tensor::Device;
 
     /// The WHOLE model decodes end to end at tiny dims: embed → 4 layers
     /// ([L,L,L,F] — DeltaNet ×3 + QSA ×1, each wrapped by HC, each with MoE) →

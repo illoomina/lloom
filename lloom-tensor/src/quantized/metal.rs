@@ -587,6 +587,66 @@ impl QMetalStorage {
         Ok((out, dst_shape))
     }
 
+    /// Overwrite `len` bytes at `offset` with what `fill` writes: the bytes go
+    /// into a pooled Shared staging buffer on the host and are copied into
+    /// this storage by a `copy2d` dispatch on the current compute encoder —
+    /// deliberately NOT a blit, so the write sits in the encoder's hazard
+    /// chain and is ordered after every earlier dispatch that read the
+    /// destination (a blit encoder waits only on the destination's last
+    /// writer). The staging buffer returns to its pool when its epoch
+    /// completes, so it is never handed out while the copy is in flight.
+    pub fn write_with(
+        &self,
+        offset: usize,
+        len: usize,
+        fill: &mut dyn FnMut(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        use crate::MetalError;
+        if offset + len > self.buffer.length() {
+            crate::bail!(
+                "write_with: {offset}+{len} past the {}-byte buffer",
+                self.buffer.length()
+            )
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let staging = self.device.allocate_buffer(len)?;
+        let ptr = std::hint::black_box(staging.contents());
+        if ptr.is_null() {
+            crate::bail!("write_with: the staging buffer has no CPU mapping (len={len})")
+        }
+        // SAFETY: a pooled Shared buffer of at least `len` bytes whose last
+        // GPU reader has completed (pool reuse waits for the epoch), mapped at
+        // `ptr`; the slice is dropped before the buffer is bound.
+        let dst = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        fill(dst)?;
+        // Four bytes per thread when the range allows it, one otherwise.
+        let (kernel, width) = if offset.is_multiple_of(4) && len.is_multiple_of(4) {
+            (crate::kernels::copy2d::U32, 4)
+        } else {
+            (crate::kernels::copy2d::U8, 1)
+        };
+        let n = len / width;
+        let encoder = self.device.command_encoder()?;
+        crate::kernels::call_copy2d(
+            self.device.device(),
+            &encoder,
+            self.device.kernels(),
+            kernel,
+            &staging,
+            &self.buffer,
+            1,
+            n,
+            n,
+            n,
+            0,
+            offset,
+        )
+        .map_err(MetalError::from)?;
+        Ok(())
+    }
+
     pub fn data(&self) -> Result<Vec<u8>> {
         let buffer = self
             .device

@@ -14,16 +14,20 @@ pub mod hc;
 pub mod loader;
 pub mod model;
 pub mod moe;
+pub mod mtp;
 pub mod ple;
 pub mod qsa;
+pub mod testing;
 
 pub use config::{Config, LayerKind};
 pub use deltanet::{decode_step, DeltaNetDims};
 pub use deltanet_block::GatedDeltaNet;
 pub use hc::HyperConnection;
+pub use loader::{LoadOptions, StreamLoader, StreamOptions};
 pub use model::{Cache, Layer, Mixer, Qwen4Exp};
-pub use moe::{ExpertResidency, MoeLayer, Resident};
-pub use ple::{MmapPleTable, NgramHash, NgramWindow, PleLayer, PleTable};
+pub use moe::{ExpertResidency, MoeLayer, Resident, Streamed};
+pub use mtp::{MtpDrafter, MtpHead};
+pub use ple::{CachedPleTable, MmapPleTable, NgramHash, NgramWindow, PleLayer, PleTable};
 pub use qsa::{Indexer, KvCache, QsaAttention};
 
 /// Sub-block activation trace, for bisecting a non-finite forward on the real

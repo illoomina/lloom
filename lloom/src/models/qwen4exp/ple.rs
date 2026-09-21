@@ -257,6 +257,12 @@ pub enum PleTable {
     /// The real table: a memory map of the GGUF shard that holds
     /// `per_layer_token_embd.weight`, rows dequantized on read.
     Mmap(MmapPleTable),
+    /// The memory map behind a hot-row cache of packed rows keyed on row id
+    /// (§20.1a's streamed tier): a hit skips the file read, a miss reads the
+    /// row and caches it, evicting the least recently used. The bytes a row
+    /// dequantizes from are the file's either way — the gather is
+    /// byte-identical to `Mmap`.
+    Cached(CachedPleTable),
     /// A small dense `[rows, head_dim]` f32 table (tests).
     Dense(Tensor),
 }
@@ -267,6 +273,7 @@ impl PleTable {
     pub fn gather(&self, ids: &[i64], dev: &Device) -> Result<Tensor> {
         match self {
             PleTable::Mmap(m) => m.gather(ids, dev),
+            PleTable::Cached(c) => c.gather(ids, dev),
             PleTable::Dense(t) => {
                 let rows = t.dim(0)? as i64;
                 let ids: Vec<u32> = ids
@@ -288,9 +295,209 @@ impl PleTable {
     pub fn head_dim(&self) -> Result<usize> {
         match self {
             PleTable::Mmap(m) => Ok(m.head_dim),
+            PleTable::Cached(c) => Ok(c.inner.head_dim),
             PleTable::Dense(t) => t.dim(1),
         }
     }
+
+    /// `(hits, misses)` of the hot-row cache; zeros for the other arms.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        match self {
+            PleTable::Cached(c) => c.stats(),
+            _ => (0, 0),
+        }
+    }
+}
+
+/// A hot-row cache over an [`MmapPleTable`]: up to `capacity` packed rows,
+/// least recently used evicted first. Rows are Zipfian in a token stream, so
+/// a small pinned head covers most lookups (§20.1a).
+#[derive(Debug)]
+pub struct CachedPleTable {
+    inner: MmapPleTable,
+    lru: parking_lot::Mutex<RowLru>,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+}
+
+/// Packed rows in `capacity` slots with an intrusive LRU list over the slots
+/// (`prev`/`next` by slot index; `head` most recent, `tail` least).
+#[derive(Debug)]
+struct RowLru {
+    row_bytes: usize,
+    capacity: usize,
+    slot_of: std::collections::HashMap<i64, u32>,
+    id_in: Vec<i64>,
+    bytes: Vec<u8>,
+    prev: Vec<u32>,
+    next: Vec<u32>,
+    head: u32,
+    tail: u32,
+    len: usize,
+}
+
+const NO_SLOT: u32 = u32::MAX;
+
+impl RowLru {
+    fn new(row_bytes: usize, capacity: usize) -> Self {
+        Self {
+            row_bytes,
+            capacity,
+            slot_of: std::collections::HashMap::with_capacity(capacity),
+            id_in: vec![-1; capacity],
+            bytes: vec![0; capacity * row_bytes],
+            prev: vec![NO_SLOT; capacity],
+            next: vec![NO_SLOT; capacity],
+            head: NO_SLOT,
+            tail: NO_SLOT,
+            len: 0,
+        }
+    }
+
+    fn unlink(&mut self, s: u32) {
+        let (p, n) = (self.prev[s as usize], self.next[s as usize]);
+        if p == NO_SLOT {
+            self.head = n;
+        } else {
+            self.next[p as usize] = n;
+        }
+        if n == NO_SLOT {
+            self.tail = p;
+        } else {
+            self.prev[n as usize] = p;
+        }
+        self.prev[s as usize] = NO_SLOT;
+        self.next[s as usize] = NO_SLOT;
+    }
+
+    fn push_front(&mut self, s: u32) {
+        self.prev[s as usize] = NO_SLOT;
+        self.next[s as usize] = self.head;
+        if self.head != NO_SLOT {
+            self.prev[self.head as usize] = s;
+        }
+        self.head = s;
+        if self.tail == NO_SLOT {
+            self.tail = s;
+        }
+    }
+
+    /// The row's bytes if cached, moved to most-recent.
+    fn get(&mut self, id: i64) -> Option<&[u8]> {
+        let s = *self.slot_of.get(&id)?;
+        if self.head != s {
+            self.unlink(s);
+            self.push_front(s);
+        }
+        let start = s as usize * self.row_bytes;
+        Some(&self.bytes[start..start + self.row_bytes])
+    }
+
+    /// Insert `row` for `id` (not present), evicting the least recent when
+    /// full.
+    fn insert(&mut self, id: i64, row: &[u8]) {
+        let s = if self.len < self.capacity {
+            let s = self.len as u32;
+            self.len += 1;
+            s
+        } else {
+            let s = self.tail;
+            self.unlink(s);
+            let old = self.id_in[s as usize];
+            self.slot_of.remove(&old);
+            s
+        };
+        self.id_in[s as usize] = id;
+        self.slot_of.insert(id, s);
+        let start = s as usize * self.row_bytes;
+        self.bytes[start..start + self.row_bytes].copy_from_slice(row);
+        self.push_front(s);
+    }
+}
+
+impl CachedPleTable {
+    /// `capacity` packed rows over `inner` (at 90 B a row, 1 M rows is 90 MB).
+    pub fn new(inner: MmapPleTable, capacity: usize) -> Result<Self> {
+        if capacity == 0 {
+            lloom_tensor::bail!("ple row cache needs a capacity")
+        }
+        let row_bytes = inner.row_bytes;
+        Ok(Self {
+            inner,
+            lru: parking_lot::Mutex::new(RowLru::new(row_bytes, capacity)),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.hits.load(Relaxed), self.misses.load(Relaxed))
+    }
+
+    pub fn rows(&self) -> usize {
+        self.inner.rows()
+    }
+
+    pub fn gather(&self, ids: &[i64], dev: &Device) -> Result<Tensor> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let hd = self.inner.head_dim;
+        let mut out = vec![0f32; ids.len() * hd];
+        let mut lru = self.lru.lock();
+        for (i, &id) in ids.iter().enumerate() {
+            let dst = &mut out[i * hd..(i + 1) * hd];
+            if let Some(row) = lru.get(id) {
+                self.hits.fetch_add(1, Relaxed);
+                dequant_row(self.inner.dtype, row, dst)?;
+                continue;
+            }
+            self.misses.fetch_add(1, Relaxed);
+            let row = self.inner.packed_row(id)?;
+            dequant_row(self.inner.dtype, row, dst)?;
+            lru.insert(id, row);
+        }
+        drop(lru);
+        Tensor::from_vec(out, ids.len() * hd, dev)
+    }
+}
+
+/// Dequantize one packed row of `dtype` into `out`.
+fn dequant_row(dtype: GgmlDType, bytes: &[u8], out: &mut [f32]) -> Result<()> {
+    match dtype {
+        GgmlDType::IQ4NL => {
+            use lloom_tensor::quantized::iq_quants::BlockIQ4nl;
+            let bs = std::mem::size_of::<BlockIQ4nl>();
+            let blocks: Vec<BlockIQ4nl> = bytes
+                .chunks_exact(bs)
+                .map(|b| {
+                    let mut qs = [0u8; 16];
+                    qs.copy_from_slice(&b[2..18]);
+                    BlockIQ4nl {
+                        d: half::f16::from_le_bytes([b[0], b[1]]),
+                        qs,
+                    }
+                })
+                .collect();
+            BlockIQ4nl::to_float(&blocks, out);
+        }
+        GgmlDType::F32 => {
+            for (o, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
+                *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        }
+        GgmlDType::F16 => {
+            for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                *o = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+            }
+        }
+        GgmlDType::BF16 => {
+            for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
+                *o = half::bf16::from_le_bytes([b[0], b[1]]).to_f32();
+            }
+        }
+        other => lloom_tensor::bail!("ple table dtype {other:?}"),
+    }
+    Ok(())
 }
 
 /// The memory-mapped `per_layer_token_embd.weight`: `[rows, head_dim]` in a
@@ -351,48 +558,18 @@ impl MmapPleTable {
         self.rows
     }
 
-    /// Dequantize row `id` into `out` (`head_dim` floats).
-    fn row(&self, id: i64, out: &mut [f32]) -> Result<()> {
+    /// The packed bytes of row `id`.
+    fn packed_row(&self, id: i64) -> Result<&[u8]> {
         if id < 0 || id as usize >= self.rows {
             lloom_tensor::bail!("ple row {id} out of {}", self.rows)
         }
         let start = self.data_start + id as usize * self.row_bytes;
-        let bytes = &self.mmap[start..start + self.row_bytes];
-        match self.dtype {
-            GgmlDType::IQ4NL => {
-                use lloom_tensor::quantized::iq_quants::BlockIQ4nl;
-                let bs = std::mem::size_of::<BlockIQ4nl>();
-                let blocks: Vec<BlockIQ4nl> = bytes
-                    .chunks_exact(bs)
-                    .map(|b| {
-                        let mut qs = [0u8; 16];
-                        qs.copy_from_slice(&b[2..18]);
-                        BlockIQ4nl {
-                            d: half::f16::from_le_bytes([b[0], b[1]]),
-                            qs,
-                        }
-                    })
-                    .collect();
-                BlockIQ4nl::to_float(&blocks, out);
-            }
-            GgmlDType::F32 => {
-                for (o, b) in out.iter_mut().zip(bytes.chunks_exact(4)) {
-                    *o = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                }
-            }
-            GgmlDType::F16 => {
-                for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-                    *o = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
-                }
-            }
-            GgmlDType::BF16 => {
-                for (o, b) in out.iter_mut().zip(bytes.chunks_exact(2)) {
-                    *o = half::bf16::from_le_bytes([b[0], b[1]]).to_f32();
-                }
-            }
-            other => lloom_tensor::bail!("ple table dtype {other:?}"),
-        }
-        Ok(())
+        Ok(&self.mmap[start..start + self.row_bytes])
+    }
+
+    /// Dequantize row `id` into `out` (`head_dim` floats).
+    fn row(&self, id: i64, out: &mut [f32]) -> Result<()> {
+        dequant_row(self.dtype, self.packed_row(id)?, out)
     }
 
     pub fn gather(&self, ids: &[i64], dev: &Device) -> Result<Tensor> {

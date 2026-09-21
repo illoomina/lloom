@@ -914,6 +914,40 @@ impl Commands {
         Ok(CommandsGuard { guard: state_guard })
     }
 
+    /// Signal `event` to `value` on the current command buffer, after every
+    /// command encoded so far — the compute side of an ordering with another
+    /// queue (an `MTLIOCommandQueue` load into a buffer this queue has been
+    /// reading, `io_queue`). Ends the open compute encoder, which Metal
+    /// requires; the next dispatch opens a new one.
+    pub fn encode_signal_event(
+        &self,
+        event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        let mut state = self.state.lock();
+        if let Some(enc) = state.current_encoder.take() {
+            self.end_encoding(enc);
+        }
+        state.current.signal_event(event, value);
+        Ok(())
+    }
+
+    /// Make every command encoded after this one on the current command
+    /// buffer wait for `event` to reach `value` (the other half of
+    /// [`Self::encode_signal_event`]). Ends the open compute encoder.
+    pub fn encode_wait_for_event(
+        &self,
+        event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+        value: u64,
+    ) -> Result<(), MetalKernelError> {
+        let mut state = self.state.lock();
+        if let Some(enc) = state.current_encoder.take() {
+            self.end_encoding(enc);
+        }
+        state.current.wait_for_event(event, value);
+        Ok(())
+    }
+
     pub fn blit_command_encoder(&self) -> Result<BlitCommandsGuard<'_>, MetalKernelError> {
         let mut state_guard = self.state.lock();
         let count = self.compute_count.fetch_add(1, Ordering::Relaxed);

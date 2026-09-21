@@ -1,9 +1,11 @@
 //! MoE FFN block behind the `ExpertResidency` seam (§20.6).
 //!
-//! `MoeLayer` is generic over an `ExpertResidency` strategy so a `Resident`
-//! model (all experts in RAM) monomorphizes to a no-loader path (§3.6 HARD RULE,
-//! static dispatch — no `dyn` on decode), and issue 3's `Streamed` impl plugs in
-//! without a forward-pass edit. This issue builds only `Resident`.
+//! `MoeLayer` is generic over an `ExpertResidency` strategy
+//! (`nn::expert_stream`, the model-independent seam) so a `Resident` model
+//! (all experts in RAM) monomorphizes to a no-loader path (§3.6 HARD RULE,
+//! static dispatch — no `dyn` on decode) and `Streamed` plugs in with the same
+//! forward: the strategy groups the routed rows and resolves their expert ids
+//! to what the kernel reads; the dispatch and the combine are shared.
 //!
 //! Routing (reference `build_moe_ffn`, softmax gating): `probs = softmax(router·x)`
 //! over all experts → top-k → renormalize the top-k weights → weighted sum of the
@@ -16,59 +18,10 @@
 
 use super::config::Config;
 use crate::nn::ops;
-use lloom_tensor::quantized::{QMatMul, QTensor};
+use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Module, Result, Tensor, D};
-use std::sync::Arc;
 
-/// How a layer's routed experts are held and applied. `Resident` = all in RAM
-/// (this issue); a `Streamed` impl (issue 3) selects the same seam by type.
-///
-/// The contract is the routed matmul's: the strategy receives the activation
-/// and the selected expert ids and returns the per-slot projections, so a
-/// `Streamed` impl can ensure residency for exactly `ids` (and prefetch from
-/// them) before dispatching the same kernel. The residency query is resolved
-/// at plan time (here, trivially — every expert is present), never an O(N)
-/// scan on the per-token path (§3.3).
-pub trait ExpertResidency {
-    /// `gate` and `up` projections of `x [batch, 1, hidden]` through experts
-    /// `ids [batch, topk]`: each `[batch, topk, n_ff]`.
-    fn gate_up(&self, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)>;
-    /// `down` projection of `h [batch, topk, n_ff]` through experts `ids`:
-    /// `[batch, topk, hidden]`.
-    fn down(&self, h: &Tensor, ids: &Tensor) -> Result<Tensor>;
-}
-
-/// All experts resident in RAM: the small-model / big-RAM case, zero streaming
-/// overhead. Holds the GGUF's stacked expert tensors as they come —
-/// `ffn_{gate,up}_exps [n_expert, n_ff, hidden]`, `ffn_down_exps [n_expert,
-/// hidden, n_ff]` — packed; the routed kernel reads the selected experts'
-/// blocks in place.
-#[derive(Debug, Clone)]
-pub struct Resident {
-    gate: Arc<QTensor>,
-    up: Arc<QTensor>,
-    down: Arc<QTensor>,
-}
-
-impl Resident {
-    pub fn new(gate: Arc<QTensor>, up: Arc<QTensor>, down: Arc<QTensor>) -> Self {
-        Self { gate, up, down }
-    }
-}
-
-impl ExpertResidency for Resident {
-    #[inline]
-    fn gate_up(&self, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)> {
-        Ok((
-            self.gate.indexed_moe_forward(x, ids)?,
-            self.up.indexed_moe_forward(x, ids)?,
-        ))
-    }
-    #[inline]
-    fn down(&self, h: &Tensor, ids: &Tensor) -> Result<Tensor> {
-        self.down.indexed_moe_forward(h, ids)
-    }
-}
+pub use crate::nn::expert_stream::{ExpertResidency, Resident, RoutedGroup, Streamed};
 
 /// One layer's MoE, generic over the residency strategy (static dispatch).
 #[derive(Debug, Clone)]
@@ -123,6 +76,11 @@ impl<R: ExpertResidency> MoeLayer<R> {
         self.routed_act
     }
 
+    /// The residency strategy behind the routed experts.
+    pub fn experts(&self) -> &R {
+        &self.experts
+    }
+
     /// One decode token through the MoE. `x` is `[1, 1, hidden]`, returns
     /// `[1, 1, hidden]` = routed top-k combine + gated shared expert.
     pub fn decode(&self, x: &Tensor) -> Result<Tensor> {
@@ -163,14 +121,31 @@ impl<R: ExpertResidency> MoeLayer<R> {
             );
         }
 
-        // The selected experts' SwiGLU, one routed dispatch per projection,
-        // in the routed arm's activation dtype.
+        // The selected experts' SwiGLU, one routed dispatch per projection
+        // per group, in the routed arm's activation dtype. `Resident` plans
+        // one group over the ids as they are; `Streamed` groups the rows to
+        // its slot pool and resolves each group's ids to slots first.
         let x3 = x1.to_dtype(self.routed_act)?.reshape((seq, 1, hidden))?; // [seq, 1, hidden]
-        let (g, u) = self.experts.gate_up(&x3, &ids)?; // [seq, topk, n_ff] each
-        super::trace("moe.g", usize::MAX, &g);
-        super::trace("moe.u", usize::MAX, &u);
-        let h = (ops::silu(&g)? * u)?;
-        let y = self.experts.down(&h, &ids)?; // [seq, topk, hidden]
+        let groups = self.experts.plan(&ids)?;
+        let mut ys = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let slot_ids = self.experts.ensure(group)?;
+            let xg = if groups.len() == 1 {
+                x3.clone()
+            } else {
+                x3.narrow(0, group.rows.start, group.rows.len())?
+            };
+            let (g, u) = self.experts.gate_up(&xg, &slot_ids)?; // [rows, topk, n_ff] each
+            super::trace("moe.g", usize::MAX, &g);
+            super::trace("moe.u", usize::MAX, &u);
+            let h = (ops::silu(&g)? * u)?;
+            ys.push(self.experts.down(&h, &slot_ids)?); // [rows, topk, hidden]
+        }
+        let y = if ys.len() == 1 {
+            ys.pop().expect("one group")
+        } else {
+            Tensor::cat(&ys, 0)?
+        };
         super::trace("moe.y", usize::MAX, &y);
         let routed = y
             .to_dtype(DType::F32)?
@@ -198,8 +173,9 @@ fn swiglu(x: &Tensor, gate: &QMatMul, up: &QMatMul, down: &QMatMul) -> Result<Te
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lloom_tensor::quantized::GgmlDType;
+    use lloom_tensor::quantized::{GgmlDType, QTensor};
     use lloom_tensor::Device;
+    use std::sync::Arc;
 
     fn lin(out: usize, inp: usize, seed: f32, dev: &Device) -> QMatMul {
         let n = out * inp;

@@ -69,6 +69,7 @@ pub mod hazard_audit;
 #[cfg(test)]
 mod hazard_audit_tests;
 pub mod icb;
+pub mod io_queue;
 #[cfg(test)]
 mod icb_executor_tests;
 #[cfg(test)]

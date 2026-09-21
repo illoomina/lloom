@@ -138,6 +138,15 @@ impl Cache {
         self.all_data = None;
     }
 
+    /// Keep the first `len` positions and forget the rest — a speculative
+    /// window's rejected tail (the bytes stay in the slab; the length is what
+    /// the readers see). A `len` past the current length is a no-op.
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.current_seq_len {
+            self.current_seq_len = len;
+        }
+    }
+
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
@@ -225,6 +234,12 @@ impl KvCache {
 
     pub fn current_seq_len(&self) -> usize {
         self.k.current_seq_len()
+    }
+
+    /// Keep the first `len` positions of both caches ([`Cache::truncate`]).
+    pub fn truncate(&mut self, len: usize) {
+        self.k.truncate(len);
+        self.v.truncate(len);
     }
 
     pub fn reset(&mut self) {

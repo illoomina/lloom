@@ -25,6 +25,7 @@ pub mod cpu_flash_attention;
 pub mod decode;
 pub mod embedding;
 pub mod encoding;
+pub mod expert_stream;
 pub mod func;
 pub mod fusion;
 pub mod group_norm;
@@ -65,6 +66,7 @@ pub use decode::{
     PassWidths, PrefillOut, RoundStats, StepPhases, FIRST_STEPS_TRACED,
 };
 pub use embedding::{embedding, Embedding};
+pub use expert_stream::{ExpertResidency, ExpertSource, LoaderArm, Resident, RoutedGroup, Streamed};
 pub use func::{func, func_t, Func, FuncT};
 pub use group_norm::{group_norm, GroupNorm};
 pub use init::Init;

@@ -1,6 +1,7 @@
 //! GGUF loader for Qwen3.8-Flash-Next: the `qwen4exp.*` header → `Config`, the
 //! tensor table → the blocks, on the `Resident` path (every expert stack in
-//! memory, packed).
+//! memory, packed) or the `Streamed` path (the expert stacks left in the file
+//! and streamed into a slot pool, `nn::expert_stream`).
 //!
 //! Tensor names follow the llama.cpp converter (PR #27742); shapes are candle
 //! row-major (ggml `ne` reversed), so `ffn_gate_exps` is `[n_expert, n_ff,
@@ -10,20 +11,27 @@
 //! tensors (`QMatMul::TensorF16` — f16 GEMV, f32 accumulate) rather than f32,
 //! which halves their footprint; f32 vectors (norms, conv, `ssm_a`, `dt.bias`)
 //! are dequantized as they are.
+//!
+//! A checkpoint may be split across shards (`split.count`); a tensor is read
+//! from whichever shard holds it, and the PLE table from the shard that holds
+//! `per_layer_token_embd.weight`.
 
 use super::config::{Config, LayerKind};
 use super::deltanet_block::GatedDeltaNet;
 use super::hc::HyperConnection;
 use super::model::{Layer, Mixer, Qwen4Exp};
-use super::moe::{MoeLayer, Resident};
-use super::ple::{MmapPleTable, NgramHash, PleLayer, PleTable};
+use super::moe::{ExpertResidency, MoeLayer, Resident, Streamed};
+use super::ple::{CachedPleTable, MmapPleTable, NgramHash, PleLayer, PleTable};
 use super::qsa::{Indexer, QsaAttention};
+use crate::nn::expert_stream::{ExpertSource, LoaderArm};
 use crate::nn::RmsNorm;
 use lloom_tensor::quantized::gguf_file::{Content, Value};
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use lloom_tensor::{Device, Result, Tensor};
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{Read, Seek};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 fn md_u32(md: &HashMap<String, Value>, key: &str) -> Result<usize> {
@@ -174,21 +182,71 @@ impl Config {
     }
 }
 
-/// The loader's view of one open shard: header + reader + device.
-struct Gguf<'a, R: Read + Seek> {
+/// One open shard: header, reader, and the path it was opened from (`None`
+/// for a caller-supplied reader).
+struct Shard<'a, R: Read + Seek> {
     content: Content,
     reader: &'a mut R,
+    path: Option<PathBuf>,
+}
+
+/// The loader's view of a checkpoint: its shards, a name → shard index, the
+/// device.
+struct Gguf<'a, R: Read + Seek> {
+    shards: Vec<Shard<'a, R>>,
+    index: HashMap<String, usize>,
     device: Device,
 }
 
-impl<R: Read + Seek> Gguf<'_, R> {
+impl<'a, R: Read + Seek> Gguf<'a, R> {
+    fn new(shards: Vec<Shard<'a, R>>, device: &Device) -> Result<Self> {
+        let mut index = HashMap::new();
+        for (i, s) in shards.iter().enumerate() {
+            for name in s.content.tensor_infos.keys() {
+                if index.insert(name.clone(), i).is_some() {
+                    lloom_tensor::bail!("tensor `{name}` appears in two shards")
+                }
+            }
+        }
+        Ok(Self {
+            shards,
+            index,
+            device: device.clone(),
+        })
+    }
+    fn metadata(&self) -> &HashMap<String, Value> {
+        &self.shards[0].content.metadata
+    }
+    fn shard_of(&self, name: &str) -> Result<usize> {
+        match self.index.get(name) {
+            Some(&i) => Ok(i),
+            None => lloom_tensor::bail!("gguf has no tensor `{name}`"),
+        }
+    }
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
-        self.content.tensor(self.reader, name, &self.device)
+        let i = self.shard_of(name)?;
+        let device = self.device.clone();
+        let s = &mut self.shards[i];
+        s.content.tensor(s.reader, name, &device)
     }
     fn shape(&self, name: &str) -> Result<Vec<usize>> {
-        match self.content.tensor_infos.get(name) {
+        let i = self.shard_of(name)?;
+        match self.shards[i].content.tensor_infos.get(name) {
             Some(ti) => Ok(ti.shape.dims().to_vec()),
             None => lloom_tensor::bail!("gguf has no tensor `{name}`"),
+        }
+    }
+    /// The shard holding `name`, as `(header, path)`; a shard without a path
+    /// cannot be streamed from.
+    fn locate(&self, name: &str) -> Result<(&Content, &Path)> {
+        let i = self.shard_of(name)?;
+        let s = &self.shards[i];
+        match &s.path {
+            Some(p) => Ok((&s.content, p)),
+            None => lloom_tensor::bail!(
+                "tensor `{name}` is in a shard opened from a reader, not a path; \
+                 streaming needs the file"
+            ),
         }
     }
     /// A matrix as the matmul operand: quantized types stay packed; BF16/F16/
@@ -214,16 +272,53 @@ impl<R: Read + Seek> Gguf<'_, R> {
     }
 }
 
+/// Which loader primitive streams the experts (§20.4a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StreamLoader {
+    /// `pread` + a compute-encoder copy into the slot (candidate A).
+    #[default]
+    Pread,
+    /// `MTLIOCommandQueue` straight into the slot (candidate B, Metal only).
+    Io,
+}
+
+/// How the routed experts are streamed.
+#[derive(Debug, Clone)]
+pub struct StreamOptions {
+    /// Resident experts per layer per projection (the slot pool).
+    pub slots: usize,
+    pub loader: StreamLoader,
+}
+
 /// What besides the first shard a load may take.
 #[derive(Debug, Clone, Default)]
 pub struct LoadOptions {
     /// The GGUF shard holding `per_layer_token_embd.weight` (the N-gram PLE
     /// table). `None` loads the model without the PLE — the layer-1 injection
     /// is skipped, which is the #747 baseline the digests were recorded on.
+    /// For a sharded load the table is found in the shards themselves when
+    /// this is `None` and `ple` is on.
     pub ple_shard: Option<std::path::PathBuf>,
+    /// Attach the PLE from the shards that were opened (multi-shard loads).
+    pub ple: bool,
     /// The routed experts' activation dtype (`None` = f32, the byte-identical
     /// routed arm; `Some(F16)` = the `(f16, f32, f16)` arm).
     pub moe_act: Option<lloom_tensor::DType>,
+    /// Rows of the PLE hot-row cache (`PleTable::Cached`); `None` reads the
+    /// memory map on every gather.
+    pub ple_cache_rows: Option<usize>,
+}
+
+/// Open every shard at `paths`, headers only.
+fn open_shards(paths: &[PathBuf]) -> Result<(Vec<Content>, Vec<File>)> {
+    let mut contents = Vec::with_capacity(paths.len());
+    let mut files = Vec::with_capacity(paths.len());
+    for p in paths {
+        let mut f = File::open(p)?;
+        contents.push(Content::read(&mut f)?);
+        files.push(f);
+    }
+    Ok((contents, files))
 }
 
 impl Qwen4Exp<Resident> {
@@ -245,154 +340,264 @@ impl Qwen4Exp<Resident> {
         device: &Device,
         opts: &LoadOptions,
     ) -> Result<Self> {
-        let mut cfg = Config::from_gguf_metadata(&content.metadata)?;
-        let ple_hash = match (&opts.ple_shard, cfg.ple_layers.first()) {
-            (Some(_), Some(_)) => {
-                let md = &content.metadata;
-                Some(NgramHash::new(
-                    md_int_array(md, "qwen4exp.ple.layer_multipliers")?,
-                    md_int_array(md, "qwen4exp.ple.head_vocab_sizes")?,
-                    md_int_array(md, "qwen4exp.ple.head_offsets")?,
-                    cfg.ple_heads_per_ngram,
-                    cfg.eos_token_id,
-                )?)
-            }
-            _ => None,
-        };
-        let mut gg = Gguf {
-            content,
-            reader,
-            device: device.clone(),
-        };
-
-        let embed_shape = gg.shape("token_embd.weight")?;
-        if embed_shape.len() != 2 || embed_shape[1] != cfg.hidden_size {
-            lloom_tensor::bail!(
-                "token_embd.weight has shape {embed_shape:?}, expected [vocab, {}]",
-                cfg.hidden_size
-            )
-        }
-        cfg.vocab_size = embed_shape[0];
-
-        let d = cfg.hidden_size;
-        let n = cfg.hc_count;
-        let eps = cfg.norm_eps as f32;
-
-        let embed_tokens = QMatMul::QTensor(gg.packed("token_embd.weight")?);
-        let lm_head = gg.qmat("output.weight")?;
-
-        // Per-layer brackets carry an inject predictor; the head mixer
-        // (`output_hc_*`) has none — its collapse goes straight to lm_head
-        // (the reference passes nullptr there).
-        let hc = |gg: &mut Gguf<'_, R>, p: &str, inject: bool| -> Result<HyperConnection> {
-            let inject = if inject {
-                Some(gg.qmat(&format!("{p}_inject.weight"))?)
-            } else {
-                None
-            };
-            HyperConnection::new(
-                gg.f32(&format!("{p}_norm.weight"))?,
-                gg.qmat(&format!("{p}_down.weight"))?,
-                gg.qmat(&format!("{p}_up.weight"))?,
-                inject,
-                n,
-                d,
-                eps,
-            )
-        };
-        let hc_head = hc(&mut gg, "output_hc", false)?;
-
-        let mut layers = Vec::with_capacity(cfg.n_layers);
-        for l in 0..cfg.n_layers {
+        let mut gg = Gguf::new(
+            vec![Shard {
+                content,
+                reader,
+                path: None,
+            }],
+            device,
+        )?;
+        build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
-            let hc_attn = hc(&mut gg, &format!("{p}.hc_attn"), true)?;
-            let hc_ffn = hc(&mut gg, &format!("{p}.hc_ffn"), true)?;
-            let mixer = match cfg.layer_types[l] {
-                LayerKind::Linear => Mixer::Linear(GatedDeltaNet::new(
-                    gg.qmat(&format!("{p}.attn_qkv.weight"))?,
-                    gg.qmat(&format!("{p}.attn_gate.weight"))?,
-                    gg.f32(&format!("{p}.ssm_conv1d.weight"))?,
-                    gg.f32(&format!("{p}.ssm_a"))?,
-                    gg.f32(&format!("{p}.ssm_dt.bias"))?,
-                    gg.qmat(&format!("{p}.ssm_alpha.weight"))?,
-                    gg.qmat(&format!("{p}.ssm_beta.weight"))?,
-                    gg.f32(&format!("{p}.ssm_norm.weight"))?,
-                    gg.qmat(&format!("{p}.ssm_out.weight"))?,
-                    &cfg,
-                )),
-                LayerKind::Full => {
-                    let indexer = Indexer::new(
-                        gg.qmat(&format!("{p}.indexer.q_proj.weight"))?,
-                        gg.qmat(&format!("{p}.indexer.k_proj.weight"))?,
-                        RmsNorm::new(gg.f32(&format!("{p}.indexer.q_norm.weight"))?, cfg.norm_eps),
-                        RmsNorm::new(gg.f32(&format!("{p}.indexer.k_norm.weight"))?, cfg.norm_eps),
-                        &cfg,
-                    )?;
-                    Mixer::Full(
-                        QsaAttention::new(
-                            gg.qmat(&format!("{p}.attn_q.weight"))?,
-                            gg.qmat(&format!("{p}.attn_k.weight"))?,
-                            gg.qmat(&format!("{p}.attn_v.weight"))?,
-                            gg.qmat(&format!("{p}.attn_output.weight"))?,
-                            RmsNorm::new(gg.f32(&format!("{p}.attn_q_norm.weight"))?, cfg.norm_eps),
-                            RmsNorm::new(gg.f32(&format!("{p}.attn_k_norm.weight"))?, cfg.norm_eps),
-                            &cfg,
-                        )
-                        .with_indexer(indexer),
-                    )
-                }
-            };
-            let experts = Resident::new(
+            Ok(Resident::new(
                 gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_up_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_down_exps.weight"))?,
-            );
-            let sh_router = gg
-                .f32(&format!("{p}.ffn_gate_inp_shexp.weight"))?
-                .reshape((1, d))?;
-            let moe = MoeLayer::new(
-                gg.qmat(&format!("{p}.ffn_gate_inp.weight"))?,
-                experts,
-                gg.qmat(&format!("{p}.ffn_gate_shexp.weight"))?,
-                gg.qmat(&format!("{p}.ffn_up_shexp.weight"))?,
-                gg.qmat(&format!("{p}.ffn_down_shexp.weight"))?,
-                QMatMul::Tensor(sh_router),
-                &cfg,
-            );
-            layers.push(Layer::new(hc_attn, mixer, hc_ffn, moe));
-        }
+            ))
+        })
+    }
 
-        let mut model = Qwen4Exp::new(embed_tokens, layers, hc_head, lm_head, cfg.clone());
-        if let Some(dt) = opts.moe_act {
-            model.set_routed_act(dt);
-        }
-        if let (Some(hash), Some(shard), Some(&l)) =
-            (ple_hash, &opts.ple_shard, cfg.ple_layers.first())
-        {
+    /// Load from a sharded checkpoint, every expert resident.
+    pub fn from_gguf_shards(
+        paths: &[PathBuf],
+        device: &Device,
+        opts: &LoadOptions,
+    ) -> Result<Self> {
+        let (contents, mut files) = open_shards(paths)?;
+        let shards = contents
+            .into_iter()
+            .zip(files.iter_mut())
+            .zip(paths)
+            .map(|((content, reader), path)| Shard {
+                content,
+                reader,
+                path: Some(path.clone()),
+            })
+            .collect();
+        let mut gg = Gguf::new(shards, device)?;
+        build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
-            let block = PleLayer::new(
-                gg.qmat(&format!("{p}.ple_key.weight"))?,
-                gg.qmat(&format!("{p}.ple_value.weight"))?,
-                gg.f32(&format!("{p}.ple_norm_key.weight"))?,
-                gg.f32(&format!("{p}.ple_norm_query.weight"))?,
-                gg.f32(&format!("{p}.ple_norm_conv.weight"))?,
-                // ggml `[k, hc_dim]` → candle `[hc_dim, k]`.
-                gg.f32(&format!("{p}.ple_conv1d.weight"))?,
-                n,
-                d,
-                cfg.ple_ngram_size,
-                eps,
-            )?;
-            let table = MmapPleTable::open(shard)?;
-            if table.rows() < hash.total_rows() as usize {
-                lloom_tensor::bail!(
-                    "ple table has {} rows, the hash needs {}",
-                    table.rows(),
-                    hash.total_rows()
+            Ok(Resident::new(
+                gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,
+                gg.packed(&format!("{p}.ffn_up_exps.weight"))?,
+                gg.packed(&format!("{p}.ffn_down_exps.weight"))?,
+            ))
+        })
+    }
+}
+
+impl Qwen4Exp<Streamed> {
+    /// Load from a sharded checkpoint with the routed experts streamed from the
+    /// shards into a per-layer slot pool (`stream.slots` experts per
+    /// projection); everything else resident as on the `Resident` path.
+    pub fn from_gguf_streamed(
+        paths: &[PathBuf],
+        device: &Device,
+        opts: &LoadOptions,
+        stream: &StreamOptions,
+    ) -> Result<Self> {
+        let (contents, mut files) = open_shards(paths)?;
+        let shards = contents
+            .into_iter()
+            .zip(files.iter_mut())
+            .zip(paths)
+            .map(|((content, reader), path)| Shard {
+                content,
+                reader,
+                path: Some(path.clone()),
+            })
+            .collect();
+        let mut gg = Gguf::new(shards, device)?;
+        let arm = match stream.loader {
+            StreamLoader::Pread => LoaderArm::Pread,
+            StreamLoader::Io => {
+                #[cfg(feature = "metal")]
+                {
+                    match device {
+                        Device::Metal(d) => LoaderArm::Io(Arc::new(
+                            lloom_tensor::kernels::metal::io_queue::IoQueue::new(d.device())
+                                .map_err(lloom_tensor::Error::wrap)?,
+                        )),
+                        _ => lloom_tensor::bail!("the io loader arm needs a Metal device"),
+                    }
+                }
+                #[cfg(not(feature = "metal"))]
+                {
+                    lloom_tensor::bail!("the io loader arm needs the metal feature")
+                }
+            }
+        };
+        build(&mut gg, device, opts, |gg, l| {
+            let p = format!("blk.{l}");
+            let src = |gg: &Gguf<'_, File>, name: String| -> Result<ExpertSource> {
+                let (content, path) = gg.locate(&name)?;
+                ExpertSource::from_gguf(content, path, &name)
+            };
+            Streamed::new(
+                src(gg, format!("{p}.ffn_gate_exps.weight"))?,
+                src(gg, format!("{p}.ffn_up_exps.weight"))?,
+                src(gg, format!("{p}.ffn_down_exps.weight"))?,
+                stream.slots,
+                arm.clone(),
+                device,
+            )
+        })
+    }
+}
+
+/// The model from the opened shards, `experts(gg, l)` supplying layer `l`'s
+/// residency strategy.
+fn build<R: ExpertResidency, Rd: Read + Seek>(
+    gg: &mut Gguf<'_, Rd>,
+    _device: &Device,
+    opts: &LoadOptions,
+    mut experts: impl FnMut(&mut Gguf<'_, Rd>, usize) -> Result<R>,
+) -> Result<Qwen4Exp<R>> {
+    let mut cfg = Config::from_gguf_metadata(gg.metadata())?;
+    let ple_hash = match (opts.ple_shard.is_some() || opts.ple, cfg.ple_layers.first()) {
+        (true, Some(_)) => {
+            let md = gg.metadata();
+            Some(NgramHash::new(
+                md_int_array(md, "qwen4exp.ple.layer_multipliers")?,
+                md_int_array(md, "qwen4exp.ple.head_vocab_sizes")?,
+                md_int_array(md, "qwen4exp.ple.head_offsets")?,
+                cfg.ple_heads_per_ngram,
+                cfg.eos_token_id,
+            )?)
+        }
+        _ => None,
+    };
+
+    let embed_shape = gg.shape("token_embd.weight")?;
+    if embed_shape.len() != 2 || embed_shape[1] != cfg.hidden_size {
+        lloom_tensor::bail!(
+            "token_embd.weight has shape {embed_shape:?}, expected [vocab, {}]",
+            cfg.hidden_size
+        )
+    }
+    cfg.vocab_size = embed_shape[0];
+
+    let d = cfg.hidden_size;
+    let n = cfg.hc_count;
+    let eps = cfg.norm_eps as f32;
+
+    let embed_tokens = QMatMul::QTensor(gg.packed("token_embd.weight")?);
+    let lm_head = gg.qmat("output.weight")?;
+
+    // Per-layer brackets carry an inject predictor; the head mixer
+    // (`output_hc_*`) has none — its collapse goes straight to lm_head
+    // (the reference passes nullptr there).
+    let hc = |gg: &mut Gguf<'_, Rd>, p: &str, inject: bool| -> Result<HyperConnection> {
+        let inject = if inject {
+            Some(gg.qmat(&format!("{p}_inject.weight"))?)
+        } else {
+            None
+        };
+        HyperConnection::new(
+            gg.f32(&format!("{p}_norm.weight"))?,
+            gg.qmat(&format!("{p}_down.weight"))?,
+            gg.qmat(&format!("{p}_up.weight"))?,
+            inject,
+            n,
+            d,
+            eps,
+        )
+    };
+    let hc_head = hc(gg, "output_hc", false)?;
+
+    let mut layers = Vec::with_capacity(cfg.n_layers);
+    for l in 0..cfg.n_layers {
+        let p = format!("blk.{l}");
+        let hc_attn = hc(gg, &format!("{p}.hc_attn"), true)?;
+        let hc_ffn = hc(gg, &format!("{p}.hc_ffn"), true)?;
+        let mixer = match cfg.layer_types[l] {
+            LayerKind::Linear => Mixer::Linear(GatedDeltaNet::new(
+                gg.qmat(&format!("{p}.attn_qkv.weight"))?,
+                gg.qmat(&format!("{p}.attn_gate.weight"))?,
+                gg.f32(&format!("{p}.ssm_conv1d.weight"))?,
+                gg.f32(&format!("{p}.ssm_a"))?,
+                gg.f32(&format!("{p}.ssm_dt.bias"))?,
+                gg.qmat(&format!("{p}.ssm_alpha.weight"))?,
+                gg.qmat(&format!("{p}.ssm_beta.weight"))?,
+                gg.f32(&format!("{p}.ssm_norm.weight"))?,
+                gg.qmat(&format!("{p}.ssm_out.weight"))?,
+                &cfg,
+            )),
+            LayerKind::Full => {
+                let indexer = Indexer::new(
+                    gg.qmat(&format!("{p}.indexer.q_proj.weight"))?,
+                    gg.qmat(&format!("{p}.indexer.k_proj.weight"))?,
+                    RmsNorm::new(gg.f32(&format!("{p}.indexer.q_norm.weight"))?, cfg.norm_eps),
+                    RmsNorm::new(gg.f32(&format!("{p}.indexer.k_norm.weight"))?, cfg.norm_eps),
+                    &cfg,
+                )?;
+                Mixer::Full(
+                    QsaAttention::new(
+                        gg.qmat(&format!("{p}.attn_q.weight"))?,
+                        gg.qmat(&format!("{p}.attn_k.weight"))?,
+                        gg.qmat(&format!("{p}.attn_v.weight"))?,
+                        gg.qmat(&format!("{p}.attn_output.weight"))?,
+                        RmsNorm::new(gg.f32(&format!("{p}.attn_q_norm.weight"))?, cfg.norm_eps),
+                        RmsNorm::new(gg.f32(&format!("{p}.attn_k_norm.weight"))?, cfg.norm_eps),
+                        &cfg,
+                    )
+                    .with_indexer(indexer),
                 )
             }
-            model.set_ple(l, hash, PleTable::Mmap(table), block)?;
-        }
-        Ok(model)
+        };
+        let experts = experts(gg, l)?;
+        let sh_router = gg
+            .f32(&format!("{p}.ffn_gate_inp_shexp.weight"))?
+            .reshape((1, d))?;
+        let moe = MoeLayer::new(
+            gg.qmat(&format!("{p}.ffn_gate_inp.weight"))?,
+            experts,
+            gg.qmat(&format!("{p}.ffn_gate_shexp.weight"))?,
+            gg.qmat(&format!("{p}.ffn_up_shexp.weight"))?,
+            gg.qmat(&format!("{p}.ffn_down_shexp.weight"))?,
+            QMatMul::Tensor(sh_router),
+            &cfg,
+        );
+        layers.push(Layer::new(hc_attn, mixer, hc_ffn, moe));
     }
+
+    let mut model = Qwen4Exp::new(embed_tokens, layers, hc_head, lm_head, cfg.clone());
+    if let Some(dt) = opts.moe_act {
+        model.set_routed_act(dt);
+    }
+    if let (Some(hash), Some(&l)) = (ple_hash, cfg.ple_layers.first()) {
+        let p = format!("blk.{l}");
+        let block = PleLayer::new(
+            gg.qmat(&format!("{p}.ple_key.weight"))?,
+            gg.qmat(&format!("{p}.ple_value.weight"))?,
+            gg.f32(&format!("{p}.ple_norm_key.weight"))?,
+            gg.f32(&format!("{p}.ple_norm_query.weight"))?,
+            gg.f32(&format!("{p}.ple_norm_conv.weight"))?,
+            // ggml `[k, hc_dim]` → candle `[hc_dim, k]`.
+            gg.f32(&format!("{p}.ple_conv1d.weight"))?,
+            n,
+            d,
+            cfg.ple_ngram_size,
+            eps,
+        )?;
+        let table_path: PathBuf = match &opts.ple_shard {
+            Some(p) => p.clone(),
+            None => gg.locate("per_layer_token_embd.weight")?.1.to_path_buf(),
+        };
+        let table = MmapPleTable::open(&table_path)?;
+        if table.rows() < hash.total_rows() as usize {
+            lloom_tensor::bail!(
+                "ple table has {} rows, the hash needs {}",
+                table.rows(),
+                hash.total_rows()
+            )
+        }
+        let table = match opts.ple_cache_rows {
+            Some(rows) => PleTable::Cached(CachedPleTable::new(table, rows)?),
+            None => PleTable::Mmap(table),
+        };
+        model.set_ple(l, hash, table, block)?;
+    }
+    Ok(model)
 }

@@ -114,6 +114,29 @@ impl CommandBuffer {
         self.raw.waitUntilCompleted();
     }
 
+    /// Encode a signal of `event` to `value` once every command encoded so far
+    /// has completed. Metal's precondition — no open encoder on the buffer —
+    /// is the caller's (`Commands` ends its encoder first).
+    pub fn signal_event(
+        &self,
+        event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+        value: u64,
+    ) {
+        self.raw
+            .encodeSignalEvent_value(ProtocolObject::from_ref(event), value);
+    }
+
+    /// Encode a wait for `event` to reach `value` before any command encoded
+    /// after this one runs. Same precondition as [`Self::signal_event`].
+    pub fn wait_for_event(
+        &self,
+        event: &ProtocolObject<dyn objc2_metal::MTLSharedEvent>,
+        value: u64,
+    ) {
+        self.raw
+            .encodeWaitForEvent_value(ProtocolObject::from_ref(event), value);
+    }
+
     /// Run `f` once this command buffer has completed on the GPU.
     ///
     /// Must be called before `commit`: Metal rejects handlers added to a buffer

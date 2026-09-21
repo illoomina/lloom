@@ -198,7 +198,6 @@ pub struct VerifyRowRef<'a, C> {
     pub draft: &'a Draft,
 }
 
-
 /// The ids of one drafted block, where the family produced them.
 ///
 /// A drafter that samples on the device (DSpark's `sample_block` argmax
@@ -513,6 +512,28 @@ pub trait Probes<P: TargetProbe>: CausalLM {
         let _ = cache;
         0
     }
+}
+
+/// The greedy accept: the longest prefix of the window on which the target's
+/// own argmax agrees with the draft, plus the target's token at the first
+/// disagreement (the bonus), cut at the first EOS the target emits. `argmax`
+/// covers the `k + 1` positions `[last, proposed…]`; `proposed` the `k`
+/// drafted tokens. Exact rather than statistical — greedy needs no epsilon —
+/// which is what makes speculative decode byte-identical to greedy
+/// (`design/docs/speculation.md` §10.2n). Model-independent: LFM2 and the
+/// Qwen4-exp MTP verify share it.
+pub fn accept_prefix(argmax: &[u32], proposed: &[u32], eos_ids: &[u32]) -> Vec<u32> {
+    let k = proposed.len();
+    debug_assert_eq!(argmax.len(), k + 1, "argmax covers the k + 1 window");
+    let mut accepted = Vec::with_capacity(k + 1);
+    for i in 0..=k {
+        let target = argmax[i];
+        accepted.push(target);
+        if eos_ids.contains(&target) || (i < k && target != proposed[i]) {
+            break;
+        }
+    }
+    accepted
 }
 
 /// How [`Session::speculative_round`] brackets its phases.

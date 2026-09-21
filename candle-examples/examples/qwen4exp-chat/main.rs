@@ -3,20 +3,28 @@
 //! text pair on the real model (CONTRIBUTING §3.1a), run N times from a fresh
 //! cache so the digest also answers "is the build run-to-run identical".
 //!
+//! `--experts stream` runs the routed experts through the streamed tier
+//! (issue #749): a per-layer slot pool of `--slots` experts filled from the
+//! shards by `--loader pread|io`; the gate is that its digests equal the
+//! resident arm's. `--ple-cache-rows` puts a hot-row cache in front of the
+//! N-gram table. A sharded checkpoint is found from its first shard.
+//!
 //! No timing beyond the wall clock of load and decode (phase-0 is
 //! correctness-only); no perf harness. Exits non-zero when `--expect` is not a
 //! substring of the output, or when the runs' digests disagree.
 //!
 //! ```bash
 //! cargo run --release --features metal --example qwen4exp-chat -- --runs 3
+//! cargo run --release --features metal --example qwen4exp-chat -- --experts stream --slots 64 --runs 2
 //! ```
 
 use anyhow::{Context, Result};
 use candle::{Device, Tensor};
 use clap::Parser;
-use lloom::models::qwen4exp::loader::LoadOptions;
+use lloom::models::qwen4exp::loader::{LoadOptions, StreamLoader, StreamOptions};
 use lloom::models::qwen4exp::model::PrefillMode;
-use lloom::models::qwen4exp::{Cache, Qwen4Exp, Resident};
+use lloom::models::qwen4exp::{Cache, ExpertResidency, Qwen4Exp, Resident, Streamed};
+use lloom::nn::expert_stream::HasStreamStats;
 use lloom::nn::model::CausalLM;
 use lloom::nn::observer::{ForwardObserver, HookPoint};
 use std::path::PathBuf;
@@ -28,8 +36,8 @@ mod sha256;
 #[derive(Parser, Debug)]
 #[command(about = "Qwen3.8-Flash-Next real-model light gate: digest + text, greedy")]
 struct Args {
-    /// The first GGUF shard (the whole text model). Default: the HF cache's
-    /// ISTA-DASLab IQ3_XXS snapshot.
+    /// The first GGUF shard (`-00001-of-0000N`); the siblings are found next
+    /// to it. Default: the HF cache's ISTA-DASLab IQ3_XXS snapshot.
     #[arg(long)]
     gguf: Option<PathBuf>,
 
@@ -38,7 +46,7 @@ struct Args {
     tokenizer: Option<PathBuf>,
 
     /// The GGUF shard holding the N-gram PLE table (`per_layer_token_embd`).
-    /// Default: the `-00002-of-00002` sibling of `--gguf` when it exists.
+    /// Default: the shard among the discovered siblings that holds it.
     #[arg(long)]
     ple_shard: Option<PathBuf>,
 
@@ -46,6 +54,24 @@ struct Args {
     /// recorded on).
     #[arg(long)]
     no_ple: bool,
+
+    /// Rows of the PLE hot-row cache (0 = read the memory map every gather).
+    #[arg(long, default_value_t = 0)]
+    ple_cache_rows: usize,
+
+    /// How the routed experts are held: `resident` (every expert in RAM) or
+    /// `stream` (a per-layer slot pool filled from the shards).
+    #[arg(long, default_value = "resident")]
+    experts: String,
+
+    /// Streamed experts per layer per projection.
+    #[arg(long, default_value_t = 64)]
+    slots: usize,
+
+    /// The streaming loader primitive: `pread` (read + compute-encoder copy)
+    /// or `io` (`MTLIOCommandQueue`).
+    #[arg(long, default_value = "pread")]
+    loader: String,
 
     /// How the prompt is run: `chunk` (Kernel B + chunk attention, the
     /// reference prefill graph) or `replay` (the decode recurrence one position
@@ -179,16 +205,44 @@ fn hf_snapshot(repo_dir: &str) -> Option<PathBuf> {
         .map(|e| e.path())
 }
 
+/// `first` plus its `-0000k-of-0000N` siblings, in shard order.
+fn discover_shards(first: &PathBuf) -> Vec<PathBuf> {
+    let name = first
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let Some(pos) = name.find("-of-") else {
+        return vec![first.clone()];
+    };
+    // "...-00001-of-00003.gguf": the count follows "-of-".
+    let tail = &name[pos + 4..];
+    let count: usize = tail.trim_end_matches(".gguf").parse().unwrap_or(1);
+    let head = &name[..pos.saturating_sub(5)];
+    let mut out = Vec::with_capacity(count);
+    for k in 1..=count {
+        let sibling = first.with_file_name(format!("{head}{k:05}-of-{count:05}.gguf"));
+        if sibling.exists() {
+            out.push(sibling);
+        }
+    }
+    if out.is_empty() {
+        vec![first.clone()]
+    } else {
+        out
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let gguf = match args.gguf {
-        Some(p) => p,
+    let gguf = match &args.gguf {
+        Some(p) => p.clone(),
         None => hf_snapshot("models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
             .context("no HF snapshot for the GGUF; pass --gguf")?
             .join("IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"),
     };
-    let tokenizer = match args.tokenizer {
-        Some(p) => p,
+    let tokenizer = match &args.tokenizer {
+        Some(p) => p.clone(),
         None => hf_snapshot("models--Qwen--Qwen3.8-Flash-Next")
             .context("no HF snapshot for the tokenizer; pass --tokenizer")?
             .join("tokenizer.json"),
@@ -217,55 +271,33 @@ fn main() -> Result<()> {
     eos_ids.dedup();
 
     let t0 = std::time::Instant::now();
-    let mut file =
-        std::fs::File::open(&gguf).with_context(|| format!("open {}", gguf.display()))?;
-    let content = candle::quantized::gguf_file::Content::read(&mut file)?;
-    let n_tensors = content.tensor_infos.len();
-    let ple_shard = if args.no_ple {
-        None
-    } else {
-        match args.ple_shard {
-            Some(p) => Some(p),
-            None => {
-                let name = gguf
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                let sibling = gguf.with_file_name(name.replace("00001-of-00002", "00002-of-00002"));
-                (sibling != gguf && sibling.exists()).then_some(sibling)
-            }
+    let mut shards = discover_shards(&gguf);
+    if let Some(p) = &args.ple_shard {
+        if !shards.contains(p) {
+            shards.push(p.clone());
         }
-    };
+    }
     let moe_act = match args.moe_act.as_str() {
         "f32" => None,
         "f16" => Some(candle::DType::F16),
         other => anyhow::bail!("--moe-act {other}: f32 | f16"),
     };
-    let opts = LoadOptions { ple_shard, moe_act };
-    let mut model: Qwen4Exp<Resident> =
-        Qwen4Exp::from_gguf_with(content, &mut file, &device, &opts)?;
+    let opts = LoadOptions {
+        ple_shard: None,
+        ple: !args.no_ple,
+        moe_act,
+        ple_cache_rows: (args.ple_cache_rows > 0).then_some(args.ple_cache_rows),
+    };
     let prefill_mode = match args.prefill.as_str() {
         "chunk" => PrefillMode::Chunk,
         "replay" => PrefillMode::Replay,
         other => anyhow::bail!("--prefill {other}: chunk | replay"),
     };
-    model.set_prefill_mode(prefill_mode);
-    let cfg = model.config().clone();
-    let load_ms = t0.elapsed().as_millis();
-    println!(
-        "LOADED gguf={} tensors={n_tensors} layers={} hidden={} vocab={} experts={}x{} device={:?} ple={} prefill={:?} moe_act={} load_ms={load_ms}",
-        gguf.display(),
-        cfg.n_layers,
-        cfg.hidden_size,
-        cfg.vocab_size,
-        cfg.n_experts,
-        cfg.n_experts_per_tok,
-        device,
-        if model.has_ple() { "on" } else { "off" },
-        prefill_mode,
-        args.moe_act
-    );
-
+    let loader = match args.loader.as_str() {
+        "pread" => StreamLoader::Pread,
+        "io" => StreamLoader::Io,
+        other => anyhow::bail!("--loader {other}: pread | io"),
+    };
     let text = if args.raw {
         args.prompt.clone()
     } else {
@@ -282,24 +314,95 @@ fn main() -> Result<()> {
         .get_ids()
         .to_vec();
 
+    match args.experts.as_str() {
+        "resident" => {
+            let mut model: Qwen4Exp<Resident> =
+                Qwen4Exp::from_gguf_shards(&shards, &device, &opts)?;
+            model.set_prefill_mode(prefill_mode);
+            gate(
+                &model,
+                &args,
+                &shards,
+                &device,
+                &tokenizer,
+                &prompt_ids,
+                &eos_ids,
+                t0,
+            )
+        }
+        "stream" => {
+            let stream = StreamOptions {
+                slots: args.slots,
+                loader,
+            };
+            let mut model: Qwen4Exp<Streamed> =
+                Qwen4Exp::from_gguf_streamed(&shards, &device, &opts, &stream)?;
+            model.set_prefill_mode(prefill_mode);
+            gate(
+                &model,
+                &args,
+                &shards,
+                &device,
+                &tokenizer,
+                &prompt_ids,
+                &eos_ids,
+                t0,
+            )
+        }
+        other => anyhow::bail!("--experts {other}: resident | stream"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gate<R: ExpertResidency + HasStreamStats>(
+    model: &Qwen4Exp<R>,
+    args: &Args,
+    shards: &[PathBuf],
+    device: &Device,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    eos_ids: &[u32],
+    t0: std::time::Instant,
+) -> Result<()> {
+    let cfg = model.config().clone();
+    let load_ms = t0.elapsed().as_millis();
+    println!(
+        "LOADED gguf={} shards={} layers={} hidden={} vocab={} experts={}x{} device={:?} ple={} ple_cache_rows={} prefill={:?} moe_act={} experts_mode={} slots={} loader={} load_ms={load_ms}",
+        shards[0].display(),
+        shards.len(),
+        cfg.n_layers,
+        cfg.hidden_size,
+        cfg.vocab_size,
+        cfg.n_experts,
+        cfg.n_experts_per_tok,
+        device,
+        if model.has_ple() { "on" } else { "off" },
+        args.ple_cache_rows,
+        model.prefill_mode(),
+        args.moe_act,
+        args.experts,
+        args.slots,
+        args.loader,
+    );
+
     let mut digests = Vec::with_capacity(args.runs);
     let mut last_text = String::new();
     for run in 0..args.runs {
-        let mut cache: Cache = model.new_cache(&cfg, &device)?;
+        let mut cache: Cache = model.new_cache(&cfg, device)?;
         if args.probe && run == 0 {
-            let first = Tensor::from_vec(vec![prompt_ids[0]], (1, 1), &device)?;
+            let first = Tensor::from_vec(vec![prompt_ids[0]], (1, 1), device)?;
             let h = model.embed(&first)?;
             let (n, nonfinite, maxabs, meanabs) = stats(&h)?;
             println!("PROBE embed token={} n={n} nonfinite={nonfinite} maxabs={maxabs:.4e} meanabs={meanabs:.4e}", prompt_ids[0]);
             // Every prompt position, one at a time, with a per-step summary
             // (the first step verbose): where does the state-threaded forward
             // first go non-finite, and how does the carry's magnitude move.
-            let mut probe_cache: Cache = model.new_cache(&cfg, &device)?;
+            let mut probe_cache: Cache = model.new_cache(&cfg, device)?;
             let mut probe = Probe::new(true);
             for (t, &tok) in prompt_ids.iter().enumerate() {
                 probe.reset();
                 probe.verbose = t == 0;
-                let input = Tensor::from_vec(vec![tok], (1, 1), &device)?;
+                let input = Tensor::from_vec(vec![tok], (1, 1), device)?;
                 let h = model.embed(&input)?;
                 let (_, e_nonfinite, e_maxabs, _) = stats(&h)?;
                 probe_cache.set_pending_tokens(&[tok]);
@@ -327,7 +430,7 @@ fn main() -> Result<()> {
         splits.push(prompt_ids.len());
         for end in splits {
             let seg = &prompt_ids[fed..end];
-            let input = Tensor::from_vec(seg.to_vec(), (1, seg.len()), &device)?;
+            let input = Tensor::from_vec(seg.to_vec(), (1, seg.len()), device)?;
             logits = Some(model.forward(&input, cache.pos, &mut cache)?); // [1, vocab]
             fed = end;
             if args.state_digest && end < prompt_ids.len() {
@@ -363,13 +466,10 @@ fn main() -> Result<()> {
         };
         digest_logits(&logits, &mut lh)?;
         if args.state_digest {
-            let v = logits.flatten_all()?.to_vec1::<f32>()?;
-            let mut h = 0xcbf29ce484222325u64;
-            for x in &v {
-                h ^= x.to_bits() as u64;
-                h = h.wrapping_mul(0x100000001b3);
-            }
-            println!("STEP run={run} step={step_no} logits={h:016x}");
+            println!(
+                "STEP run={run} step={step_no} logits={:016x}",
+                fnv(&logits)?
+            );
         }
         for _ in 0..args.max_tokens {
             let next = argmax(&logits)?;
@@ -378,18 +478,15 @@ fn main() -> Result<()> {
                 break;
             }
             generated.push(next);
-            let input = Tensor::from_vec(vec![next], (1, 1), &device)?;
+            let input = Tensor::from_vec(vec![next], (1, 1), device)?;
             logits = model.forward(&input, cache.pos, &mut cache)?;
             digest_logits(&logits, &mut lh)?;
             step_no += 1;
             if args.state_digest {
-                let v = logits.flatten_all()?.to_vec1::<f32>()?;
-                let mut h = 0xcbf29ce484222325u64;
-                for x in &v {
-                    h ^= x.to_bits() as u64;
-                    h = h.wrapping_mul(0x100000001b3);
-                }
-                println!("STEP run={run} step={step_no} logits={h:016x}");
+                println!(
+                    "STEP run={run} step={step_no} logits={:016x}",
+                    fnv(&logits)?
+                );
             }
         }
         if args.state_digest {
@@ -424,6 +521,28 @@ fn main() -> Result<()> {
             generated.len(),
             args.max_tokens
         );
+        let s = model.stream_stats();
+        if args.experts == "stream" {
+            println!(
+                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4}",
+                args.loader,
+                args.slots,
+                s.plans,
+                s.groups,
+                s.hits,
+                s.misses,
+                s.evictions,
+                s.bytes_loaded,
+                s.hits as f64 / (s.hits + s.misses).max(1) as f64
+            );
+        }
+        if let Some((hits, misses)) = model.ple_cache_stats() {
+            println!(
+                "PLECACHE run={run} rows={} hits={hits} misses={misses} hit_rate={:.4}",
+                args.ple_cache_rows,
+                hits as f64 / (hits + misses).max(1) as f64
+            );
+        }
         digests.push(digest);
     }
     let identical = digests.windows(2).all(|w| w[0] == w[1]);
@@ -442,6 +561,17 @@ fn main() -> Result<()> {
         anyhow::bail!("gate FAILED (identical={identical})");
     }
     Ok(())
+}
+
+/// FNV over the f32 bit patterns of a logits row (the `STEP` line).
+fn fnv(logits: &Tensor) -> Result<u64> {
+    let v = logits.flatten_all()?.to_vec1::<f32>()?;
+    let mut h = 0xcbf29ce484222325u64;
+    for x in &v {
+        h ^= x.to_bits() as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    Ok(h)
 }
 
 fn argmax(logits: &Tensor) -> Result<u32> {

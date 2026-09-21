@@ -837,6 +837,12 @@ impl MetalDevice {
         Ok(command_encoder)
     }
 
+    /// The command stream, for a subsystem that orders its own queue against
+    /// it (`kernels::metal::io_queue`).
+    pub fn commands(&self) -> &Arc<Commands> {
+        &self.commands
+    }
+
     pub fn wait_until_completed(&self) -> Result<()> {
         self.commands
             .wait_until_completed()

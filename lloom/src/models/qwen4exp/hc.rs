@@ -33,8 +33,10 @@ pub struct HyperConnection {
     down: QMatMul,
     /// `hc_lowrank -> n*d` (up-projection; feeds the collapse gate).
     up: QMatMul,
-    /// `n*d -> n` (the per-stream injection weight predictor).
-    inject: QMatMul,
+    /// `n*d -> n` (the per-stream injection weight predictor). `None` on the
+    /// head mixer (`output_hc_*` has no inject: its collapse feeds `lm_head`
+    /// and nothing is scattered back).
+    inject: Option<QMatMul>,
     /// `n = hc_count`.
     n: usize,
     /// `d = hidden_size`.
@@ -48,13 +50,22 @@ impl HyperConnection {
         norm_w: Tensor,
         down: QMatMul,
         up: QMatMul,
-        inject: QMatMul,
+        inject: Option<QMatMul>,
         n: usize,
         d: usize,
         eps: f32,
     ) -> Result<Self> {
         let unit_d = Tensor::ones(d, norm_w.dtype(), norm_w.device())?;
-        Ok(Self { norm_w, unit_d, down, up, inject, n, d, eps })
+        Ok(Self {
+            norm_w,
+            unit_d,
+            down,
+            up,
+            inject,
+            n,
+            d,
+            eps,
+        })
     }
 
     /// Prologue: collapse the `n` streams of `h [b, seq, n*d]` to the sub-block's
@@ -85,7 +96,10 @@ impl HyperConnection {
         let mixed = gated.sum(2)?; // [b, seq, d]
         let mixed = (mixed * (1.0 / self.n as f64))?;
 
-        let inject = self.inject.forward(&xn)?; // [b, seq, n]
+        let inject = match &self.inject {
+            Some(inject) => inject.forward(&xn)?, // [b, seq, n]
+            None => Tensor::zeros((b, seq, self.n), xn.dtype(), xn.device())?,
+        };
         Ok((mixed, inject))
     }
 
@@ -135,7 +149,7 @@ mod tests {
             unit_d: Tensor::ones(d, DType::F32, &dev).unwrap(),
             down: qmm(1, 1, &dev),
             up: qmm(1, 1, &dev),
-            inject: qmm(1, 1, &dev),
+            inject: Some(qmm(1, 1, &dev)),
             n,
             d,
             eps: 1e-6,
@@ -160,9 +174,9 @@ mod tests {
         let hc = HyperConnection {
             norm_w: Tensor::ones(n * d, DType::F32, &dev).unwrap(),
             unit_d: Tensor::ones(d, DType::F32, &dev).unwrap(),
-            down: qmm(2, n * d, &dev),  // hc_lr=2, out zeros
+            down: qmm(2, n * d, &dev), // hc_lr=2, out zeros
             up: qmm(n * d, 2, &dev),
-            inject: qmm(n, n * d, &dev),
+            inject: Some(qmm(n, n * d, &dev)),
             n,
             d,
             eps: 1e-6,

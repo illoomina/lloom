@@ -224,7 +224,10 @@ fn routed_q2_0_top10_over_64_experts() -> Result<()> {
     let p0 = got.get(0)?.get(0)?;
     let p1 = got.get(0)?.get(1)?;
     let diff = (p0 - p1)?.abs()?.sum_all()?.to_scalar::<f32>()?;
-    assert!(diff > 1e-3, "expert planes are identical: stride is not reaching the experts");
+    assert!(
+        diff > 1e-3,
+        "expert planes are identical: stride is not reaching the experts"
+    );
     Ok(())
 }
 

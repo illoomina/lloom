@@ -39,7 +39,11 @@ fn md_f32(md: &HashMap<String, Value>, key: &str) -> Result<f64> {
 }
 fn md_i32_array(md: &HashMap<String, Value>, key: &str) -> Result<Vec<i64>> {
     match md.get(key) {
-        Some(v) => v.to_vec()?.iter().map(|x| x.to_i32().map(|x| x as i64)).collect(),
+        Some(v) => v
+            .to_vec()?
+            .iter()
+            .map(|x| x.to_i32().map(|x| x as i64))
+            .collect(),
         None => lloom_tensor::bail!("gguf metadata has no `{key}`"),
     }
 }
@@ -91,7 +95,10 @@ impl Config {
         let ple_layers = md
             .get("qwen4exp.ple.layers")
             .map(|v| -> Result<Vec<usize>> {
-                v.to_vec()?.iter().map(|x| Ok(x.to_i32()? as usize)).collect()
+                v.to_vec()?
+                    .iter()
+                    .map(|x| Ok(x.to_i32()? as usize))
+                    .collect()
             })
             .transpose()?
             .unwrap_or_default();
@@ -188,13 +195,24 @@ impl Qwen4Exp<Resident> {
     /// Load the model from an open GGUF shard (the first shard carries the whole
     /// text model; the second holds only the N-gram PLE table, which the decode
     /// path does not read).
-    pub fn from_gguf<R: Read + Seek>(content: Content, reader: &mut R, device: &Device) -> Result<Self> {
+    pub fn from_gguf<R: Read + Seek>(
+        content: Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
         let mut cfg = Config::from_gguf_metadata(&content.metadata)?;
-        let mut gg = Gguf { content, reader, device: device.clone() };
+        let mut gg = Gguf {
+            content,
+            reader,
+            device: device.clone(),
+        };
 
         let embed_shape = gg.shape("token_embd.weight")?;
         if embed_shape.len() != 2 || embed_shape[1] != cfg.hidden_size {
-            lloom_tensor::bail!("token_embd.weight has shape {embed_shape:?}, expected [vocab, {}]", cfg.hidden_size)
+            lloom_tensor::bail!(
+                "token_embd.weight has shape {embed_shape:?}, expected [vocab, {}]",
+                cfg.hidden_size
+            )
         }
         cfg.vocab_size = embed_shape[0];
 
@@ -205,24 +223,32 @@ impl Qwen4Exp<Resident> {
         let embed_tokens = QMatMul::QTensor(gg.packed("token_embd.weight")?);
         let lm_head = gg.qmat("output.weight")?;
 
-        let hc = |gg: &mut Gguf<'_, R>, p: &str| -> Result<HyperConnection> {
+        // Per-layer brackets carry an inject predictor; the head mixer
+        // (`output_hc_*`) has none — its collapse goes straight to lm_head
+        // (the reference passes nullptr there).
+        let hc = |gg: &mut Gguf<'_, R>, p: &str, inject: bool| -> Result<HyperConnection> {
+            let inject = if inject {
+                Some(gg.qmat(&format!("{p}_inject.weight"))?)
+            } else {
+                None
+            };
             HyperConnection::new(
                 gg.f32(&format!("{p}_norm.weight"))?,
                 gg.qmat(&format!("{p}_down.weight"))?,
                 gg.qmat(&format!("{p}_up.weight"))?,
-                gg.qmat(&format!("{p}_inject.weight"))?,
+                inject,
                 n,
                 d,
                 eps,
             )
         };
-        let hc_head = hc(&mut gg, "output_hc")?;
+        let hc_head = hc(&mut gg, "output_hc", false)?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for l in 0..cfg.n_layers {
             let p = format!("blk.{l}");
-            let hc_attn = hc(&mut gg, &format!("{p}.hc_attn"))?;
-            let hc_ffn = hc(&mut gg, &format!("{p}.hc_ffn"))?;
+            let hc_attn = hc(&mut gg, &format!("{p}.hc_attn"), true)?;
+            let hc_ffn = hc(&mut gg, &format!("{p}.hc_ffn"), true)?;
             let mixer = match cfg.layer_types[l] {
                 LayerKind::Linear => Mixer::Linear(GatedDeltaNet::new(
                     gg.qmat(&format!("{p}.attn_qkv.weight"))?,
@@ -254,7 +280,9 @@ impl Qwen4Exp<Resident> {
                 gg.packed(&format!("{p}.ffn_up_exps.weight"))?,
                 gg.packed(&format!("{p}.ffn_down_exps.weight"))?,
             );
-            let sh_router = gg.f32(&format!("{p}.ffn_gate_inp_shexp.weight"))?.reshape((1, d))?;
+            let sh_router = gg
+                .f32(&format!("{p}.ffn_gate_inp_shexp.weight"))?
+                .reshape((1, d))?;
             let moe = MoeLayer::new(
                 gg.qmat(&format!("{p}.ffn_gate_inp.weight"))?,
                 experts,

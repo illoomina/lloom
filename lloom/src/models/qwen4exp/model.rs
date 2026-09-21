@@ -12,9 +12,9 @@
 use super::config::Config;
 use super::deltanet_block::GatedDeltaNet;
 use super::hc::HyperConnection;
+use super::moe::Resident;
 use super::moe::{ExpertResidency, MoeLayer};
 use super::qsa::{KvCache, QsaAttention};
-use super::moe::Resident;
 use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
 use crate::nn::var_builder::VarBuilder;
@@ -39,8 +39,18 @@ pub struct Layer<R: ExpertResidency> {
 }
 
 impl<R: ExpertResidency> Layer<R> {
-    pub fn new(hc_attn: HyperConnection, mixer: Mixer, hc_ffn: HyperConnection, moe: MoeLayer<R>) -> Self {
-        Self { hc_attn, mixer, hc_ffn, moe }
+    pub fn new(
+        hc_attn: HyperConnection,
+        mixer: Mixer,
+        hc_ffn: HyperConnection,
+        moe: MoeLayer<R>,
+    ) -> Self {
+        Self {
+            hc_attn,
+            mixer,
+            hc_ffn,
+            moe,
+        }
     }
 }
 
@@ -101,7 +111,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         lm_head: QMatMul,
         cfg: Config,
     ) -> Self {
-        Self { embed_tokens, layers, hc_head, lm_head, cfg }
+        Self {
+            embed_tokens,
+            layers,
+            hc_head,
+            lm_head,
+            cfg,
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -138,7 +154,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     ) -> Result<Tensor> {
         let (b, seq, _) = embeds.dims3()?;
         if b != 1 || seq == 0 {
-            lloom_tensor::bail!("qwen4exp forward takes one sequence of >= 1 tokens, got {:?}", embeds.shape())
+            lloom_tensor::bail!(
+                "qwen4exp forward takes one sequence of >= 1 tokens, got {:?}",
+                embeds.shape()
+            )
         }
         let mut logits = None;
         for t in 0..seq {
@@ -160,7 +179,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 
         // broadcast the embedding into the n-stream HC carry `res_hc [1, 1, n*d]`.
         // The reference inits the streams from the embed broadcast across n.
-        let mut res_hc = h.broadcast_as((1, 1, n, d))?.reshape((1, 1, n * d))?.contiguous()?;
+        let mut res_hc = h
+            .broadcast_as((1, 1, n, d))?
+            .reshape((1, 1, n * d))?
+            .contiguous()?;
 
         for (l, layer) in self.layers.iter().enumerate() {
             // observe the n-stream carry entering the layer (HcState) — zero cost
@@ -172,7 +194,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             // HC prologue (attn bracket): collapse streams → mixer input.
             let (cur, inject) = layer.hc_attn.mix(&res_hc)?; // cur [1,1,d]
             let mixed = match &layer.mixer {
-                Mixer::Linear(dn) => dn.decode(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
+                Mixer::Linear(dn) => {
+                    dn.decode(&cur, l, &mut cache.s_state, &mut cache.conv_state)?
+                }
                 Mixer::Full(qsa) => qsa.decode(&cur, &mut cache.kv[l])?,
             };
             // HC epilogue: scatter the mixer output back across the streams.
@@ -194,7 +218,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let (collapsed, _) = self.hc_head.mix(&res_hc)?; // [1, 1, d]
         cache.pos += 1;
         let logits = self.lm_head.forward(&collapsed)?; // [1, 1, vocab]
-        logits.reshape((1, self.cfg.vocab_size))?.to_dtype(lloom_tensor::DType::F32)
+        logits
+            .reshape((1, self.cfg.vocab_size))?
+            .to_dtype(lloom_tensor::DType::F32)
     }
 
     /// Number of layers, for the caller.
@@ -230,7 +256,12 @@ impl CausalLM for Qwen4Exp<Resident> {
         Qwen4Exp::embed(self, tokens)
     }
 
-    fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
+    fn forward_embeds(
+        &self,
+        embeds: &Tensor,
+        pos: usize,
+        cache: &mut Self::Cache,
+    ) -> Result<Tensor> {
         if pos != cache.pos {
             lloom_tensor::bail!("qwen4exp: pos {pos} != cache position {}", cache.pos)
         }
@@ -250,12 +281,12 @@ impl CacheReset for Cache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::LayerKind;
     use super::super::deltanet_block::GatedDeltaNet;
     use super::super::hc::HyperConnection;
     use super::super::moe::{MoeLayer, Resident};
     use super::super::qsa::QsaAttention;
+    use super::*;
     use crate::nn::RmsNorm;
     use lloom_tensor::quantized::{GgmlDType, QTensor};
     use lloom_tensor::{DType, Device};
@@ -263,13 +294,17 @@ mod tests {
 
     /// A stacked `[e, out, inp]` expert weight as an F32-typed `QTensor`.
     fn stacked(e: usize, out: usize, inp: usize, seed: f32, dev: &Device) -> Arc<QTensor> {
-        let v: Vec<f32> = (0..e * out * inp).map(|i| ((i as f32 * 0.011 + seed).cos()) * 0.1).collect();
+        let v: Vec<f32> = (0..e * out * inp)
+            .map(|i| ((i as f32 * 0.011 + seed).cos()) * 0.1)
+            .collect();
         let t = Tensor::from_vec(v, (e, out, inp), dev).unwrap();
         Arc::new(QTensor::quantize(&t, GgmlDType::F32).unwrap())
     }
 
     fn lin(out: usize, inp: usize, seed: f32, dev: &Device) -> QMatMul {
-        let v: Vec<f32> = (0..out * inp).map(|i| ((i as f32 * 0.007 + seed).sin()) * 0.08).collect();
+        let v: Vec<f32> = (0..out * inp)
+            .map(|i| ((i as f32 * 0.007 + seed).sin()) * 0.08)
+            .collect();
         QMatMul::Tensor(Tensor::from_vec(v, (out, inp), dev).unwrap())
     }
     fn ones(n: usize, dev: &Device) -> Tensor {
@@ -278,7 +313,9 @@ mod tests {
     fn wt(shape: (usize, usize), seed: f32, dev: &Device) -> Tensor {
         let (r, c) = shape;
         Tensor::from_vec(
-            (0..r * c).map(|i| ((i as f32 * 0.009 + seed).cos()) * 0.05).collect::<Vec<f32>>(),
+            (0..r * c)
+                .map(|i| ((i as f32 * 0.009 + seed).cos()) * 0.05)
+                .collect::<Vec<f32>>(),
             (r, c),
             dev,
         )
@@ -288,10 +325,10 @@ mod tests {
     fn hc(cfg: &Config, seed: f32, dev: &Device) -> HyperConnection {
         let hc_dim = cfg.hc_dim();
         HyperConnection::new(
-            ones(hc_dim, dev),                          // norm_w
-            lin(cfg.hc_lowrank, hc_dim, seed, dev),     // down
-            lin(hc_dim, cfg.hc_lowrank, seed + 1.0, dev), // up
-            lin(cfg.hc_count, hc_dim, seed + 2.0, dev), // inject → n
+            ones(hc_dim, dev),                                // norm_w
+            lin(cfg.hc_lowrank, hc_dim, seed, dev),           // down
+            lin(hc_dim, cfg.hc_lowrank, seed + 1.0, dev),     // up
+            Some(lin(cfg.hc_count, hc_dim, seed + 2.0, dev)), // inject → n
             cfg.hc_count,
             cfg.hidden_size,
             cfg.norm_eps as f32,
@@ -361,7 +398,7 @@ mod tests {
     fn full_model_decodes_end_to_end() {
         let dev = Device::Cpu;
         let cfg = Config::tiny(); // [L, L, L, F]
-        // Non-zero embedding table (a zero table gives zero input → zero logits).
+                                  // Non-zero embedding table (a zero table gives zero input → zero logits).
         let embed = QMatMul::Tensor(wt((cfg.vocab_size, cfg.hidden_size), 0.5, &dev));
 
         let layers: Vec<Layer<Resident>> = (0..cfg.n_layers)
@@ -382,7 +419,7 @@ mod tests {
         let model = Qwen4Exp::new(
             embed,
             layers,
-            hc(&cfg, 999.0, &dev),                  // hc_head
+            hc(&cfg, 999.0, &dev),                           // hc_head
             lin(cfg.vocab_size, cfg.hidden_size, 7.0, &dev), // lm_head
             cfg.clone(),
         );
@@ -404,7 +441,11 @@ mod tests {
         assert_eq!(logits2.dims(), &[1, cfg.vocab_size]);
         assert_eq!(cache.pos, 2);
         // the QSA layer's KV grew to 2.
-        let full_layer = cfg.layer_types.iter().position(|k| *k == LayerKind::Full).unwrap();
+        let full_layer = cfg
+            .layer_types
+            .iter()
+            .position(|k| *k == LayerKind::Full)
+            .unwrap();
         assert_eq!(cache.kv[full_layer].len(), 2);
     }
 }

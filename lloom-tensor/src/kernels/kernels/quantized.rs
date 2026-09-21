@@ -155,7 +155,6 @@ impl GemvTriple {
     }
 }
 
-
 /// Threadgroup geometry of the matmul-vec kernels per weight dtype:
 /// `(threads.x, threads.y, rows per threadgroup)` — the same table the plain
 /// and the routed (`mul_mv_id`) dispatches use, since the routed kernel wraps
@@ -336,11 +335,9 @@ pub fn call_quantized_matmul_mv_t(
         GgmlDType::IQ4XS => Some("kernel_mul_mv_iq4_xs"),
         GgmlDType::Q2_0 => Some("kernel_mul_mv_q2_0"),
         // Dense and Q8-family weights: no genericized #750 core, f32 store only.
-        GgmlDType::Q8_1
-        | GgmlDType::Q8K
-        | GgmlDType::F16
-        | GgmlDType::BF16
-        | GgmlDType::F32 => None,
+        GgmlDType::Q8_1 | GgmlDType::Q8K | GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32 => {
+            None
+        }
     };
     // A `String` naming the kernel: the quantized rows are `stem_<triple suffix>`;
     // the dense/Q8 rows the triple does not reach keep their f32-store names.
@@ -409,7 +406,6 @@ pub fn call_quantized_matmul_mv_t(
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
 }
-
 
 /// The routed-expert matmul-vec (`kernel_mul_mv_id_<q>_f32`): for every
 /// `(token, slot)` pair, one GEMV of `src1`'s row against expert

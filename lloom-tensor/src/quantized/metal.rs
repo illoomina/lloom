@@ -509,7 +509,6 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
-
     /// Routed-expert matmul over a stacked quantized weight `[n_experts, n, k]`
     /// (the MoE seam `QTensor::indexed_moe_forward`, CUDA's contract): `input`
     /// `[batch, in_dim1, k]` f32 with `in_dim1 ∈ {1, topk}`, `ids` `[batch,

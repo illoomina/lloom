@@ -45,10 +45,7 @@ fn blocks_as_bytes(blocks: &[BlockQ2_0]) -> &[u8] {
     // SAFETY: BlockQ2_0 is #[repr(C)] with no padding (size 18 = 2 + 16, pinned
     // by a const assert in iq_quants); the byte view covers exactly the vector.
     unsafe {
-        std::slice::from_raw_parts(
-            blocks.as_ptr() as *const u8,
-            std::mem::size_of_val(blocks),
-        )
+        std::slice::from_raw_parts(blocks.as_ptr() as *const u8, std::mem::size_of_val(blocks))
     }
 }
 
@@ -177,10 +174,16 @@ fn q2_0_embedding_matches_cpu_dequant_reference() -> Result<()> {
     let want = w_ref
         .index_select(&ids.to_device(&Device::Cpu)?.flatten_all()?, 0)?
         .reshape((2, 2, hidden))?;
-    let got = got.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<f32>()?;
+    let got = got
+        .to_device(&Device::Cpu)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
     let want = want.flatten_all()?.to_vec1::<f32>()?;
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-        assert!((g - w).abs() < 1e-6, "row gather mismatch at {i}: {g} != {w}");
+        assert!(
+            (g - w).abs() < 1e-6,
+            "row gather mismatch at {i}: {g} != {w}"
+        );
     }
     Ok(())
 }

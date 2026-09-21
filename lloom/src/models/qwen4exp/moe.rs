@@ -142,8 +142,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
 
         // Shared expert: SwiGLU gated by sigmoid(sh_router·x), always on.
         let shared = swiglu(&x1, &self.sh_gate, &self.sh_up, &self.sh_down)?;
-        let sh_gate_v =
-            ops::sigmoid(&self.sh_router.forward(&x1)?.to_dtype(shared.dtype())?)?; // [1, 1]
+        let sh_gate_v = ops::sigmoid(&self.sh_router.forward(&x1)?.to_dtype(shared.dtype())?)?; // [1, 1]
         let shared = shared.broadcast_mul(&sh_gate_v)?;
 
         let out = (routed + shared)?;
@@ -166,15 +165,25 @@ mod tests {
 
     fn lin(out: usize, inp: usize, seed: f32, dev: &Device) -> QMatMul {
         let n = out * inp;
-        let v: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.013 + seed).sin()) * 0.1).collect();
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.013 + seed).sin()) * 0.1)
+            .collect();
         QMatMul::Tensor(Tensor::from_vec(v, (out, inp), dev).unwrap())
     }
 
     /// A stacked `[e, out, inp]` expert weight as an F32-typed `QTensor` (the
     /// routed path's storage; F32 blocks so the CPU arm is exact).
-    pub(crate) fn stacked(e: usize, out: usize, inp: usize, seed: f32, dev: &Device) -> Arc<QTensor> {
+    pub(crate) fn stacked(
+        e: usize,
+        out: usize,
+        inp: usize,
+        seed: f32,
+        dev: &Device,
+    ) -> Arc<QTensor> {
         let n = e * out * inp;
-        let v: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.011 + seed).cos()) * 0.1).collect();
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.011 + seed).cos()) * 0.1)
+            .collect();
         let t = Tensor::from_vec(v, (e, out, inp), dev).unwrap();
         Arc::new(QTensor::quantize(&t, GgmlDType::F32).unwrap())
     }
@@ -205,7 +214,9 @@ mod tests {
             &cfg,
         );
         let x = Tensor::from_vec(
-            (0..h).map(|i| ((i as f32) * 0.05).cos() * 0.3).collect::<Vec<f32>>(),
+            (0..h)
+                .map(|i| ((i as f32) * 0.05).cos() * 0.3)
+                .collect::<Vec<f32>>(),
             (1, 1, h),
             &dev,
         )
@@ -254,12 +265,20 @@ mod tests {
             &cfg,
         );
         let x = Tensor::from_vec(
-            (0..h).map(|i| ((i as f32) * 0.07).sin() * 0.4).collect::<Vec<f32>>(),
+            (0..h)
+                .map(|i| ((i as f32) * 0.07).sin() * 0.4)
+                .collect::<Vec<f32>>(),
             (1, 1, h),
             &dev,
         )
         .unwrap();
-        let got = moe.decode(&x).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let got = moe
+            .decode(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
 
         // reference
         let x1 = x.reshape((1, h)).unwrap();

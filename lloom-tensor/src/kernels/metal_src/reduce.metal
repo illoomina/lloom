@@ -534,14 +534,19 @@ struct block_reducer {
         if (BLOCKSIZE >= 64) {
             // Only store in threadgroup shared memory if needed.
             shared[tid] = value;
-            // Threadgroup barrier is needed to ensure that all threads have written to shared memory
-            threadgroup_barrier(mem_flags::mem_none);
+            // The barrier must FENCE threadgroup memory, not only align
+            // execution: with `mem_none` a lane may read its partner's slot
+            // before the partner's store has landed (undefined per the MSL
+            // spec; on hardware a timing-dependent stale read, seen on the
+            // Qwen4-exp 3749-token prompt as two runs of one process giving
+            // two logits digests -- lloom #748).
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
         #pragma clang loop unroll(full)
         for (ushort s = BLOCKSIZE / 2; s >= 64; s >>= 1) {
             if (tid < s) shared[tid] = operate(shared[tid], shared[tid + s]);
-            threadgroup_barrier(mem_flags::mem_none);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         if (tid < 32) {
             // Last shared memory reduce can be done without tid < s check.
@@ -1080,7 +1085,8 @@ METAL_FUNC void softmax(
     MD<T> md = reduce(md_partial, tid);
 
     if (tid == 0) md_total = md;
-    threadgroup_barrier(mem_flags::mem_none);
+    // Fences the `md_total` broadcast (see `block_reducer`; lloom #748).
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Finalize softmax
     const uint thread_id = tid + offset;

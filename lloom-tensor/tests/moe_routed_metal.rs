@@ -371,7 +371,11 @@ fn routed_f16_matches_reference(dtype: GgmlDType, in_dim1_is_topk: bool, n: usiz
     let mut worst_at = (0usize, 0f32, 0f32);
     for (i, (x, y)) in a.iter().zip(&b).enumerate() {
         let y16 = half::f16::from_f32(*y).to_f32();
-        let exp = if *y == 0.0 { -24 } else { y.abs().log2().floor() as i32 };
+        let exp = if *y == 0.0 {
+            -24
+        } else {
+            y.abs().log2().floor() as i32
+        };
         let ulp = 2f32.powi((exp - 10).max(-24));
         let d = (x - y16).abs() / ulp;
         if d > worst {

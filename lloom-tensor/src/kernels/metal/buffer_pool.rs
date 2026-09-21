@@ -146,7 +146,11 @@ fn trace_allocation(size: usize, why: &str) {
     let frames: Vec<&str> = bt
         .lines()
         .filter(|l| l.contains("lloom") && !l.contains("trace_allocation") && !l.contains(".rs:"))
-        .map(|l| l.trim().trim_start_matches(|c: char| c.is_ascii_digit() || c == ':').trim())
+        .map(|l| {
+            l.trim()
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c == ':')
+                .trim()
+        })
         .take(6)
         .collect();
     eprintln!("[pool alloc {size} B; {why}] {}", frames.join(" <- "));
@@ -324,6 +328,9 @@ impl Drop for PooledBuffer {
         let Some(buffer) = self.buffer.take() else {
             return;
         };
+        // `LLOOM_UPLOAD_SHADOW`: were this buffer's bytes still what the host
+        // uploaded? (A/B instrument, #748; a no-op when unarmed.)
+        super::upload_shadow::check_at_release(&buffer);
         // Pool gone: the buffer drops here and Metal frees it. Correct, and the
         // reason the back-reference is `Weak`.
         if let Some(pool) = self.pool.upgrade() {
@@ -1152,7 +1159,10 @@ impl PoolInner {
         let mut state = self.state.lock();
         let mut drained = 0u64;
         while let Some(front) = state.pending.front() {
-            if !self.clock.is_complete(front.epoch) {
+            // `LLOOM_POOL_QUARANTINE=K` (A/B instrument, #748): a released
+            // buffer waits K further command buffers past its own before it
+            // can be reused. K=0 ships.
+            if !self.clock.is_complete(front.epoch + pool_quarantine()) {
                 break;
             }
             let entry = state
@@ -1458,7 +1468,8 @@ impl BufferPool {
     /// means an allocation it still lists whose handle is gone
     /// (`DESIGN.md` §6.3c). Replaces any previous observer.
     pub fn set_eviction_observer(&self, observer: Arc<dyn BufferEvictionObserver>) {
-        { let mut slot = self.inner.on_evict.lock();
+        {
+            let mut slot = self.inner.on_evict.lock();
             *slot = Some(observer);
         }
     }
@@ -1494,7 +1505,8 @@ impl BufferPool {
     /// past the bound is still the right answer for a larger request, and
     /// `evict_over_budget` remains the only thing that destroys a free buffer.
     pub fn set_reuse_oversize_bound(&self, bound: Option<f64>) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.oversize_bound = bound;
         }
     }
@@ -1511,7 +1523,8 @@ impl BufferPool {
     /// is next exceeded, and changing it is not itself a budget event. A caller
     /// wanting both calls [`Self::set_free_budget`] after this.
     pub fn set_eviction_order(&self, order: EvictionOrder) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.eviction_order = order;
         }
     }
@@ -1556,7 +1569,8 @@ impl BufferPool {
     /// [`ResidualCap`]. It calls into Metal nowhere and it cannot fire if
     /// admission was honest.
     pub fn set_residual_cap(&self, limit: usize, planned: usize) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.residual = Some(ResidualCap { limit, planned });
         }
     }
@@ -1564,7 +1578,8 @@ impl BufferPool {
     /// Removes the residual cap, restoring the unbounded behaviour that
     /// shipped.
     pub fn clear_residual_cap(&self) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.residual = None;
         }
     }
@@ -1589,6 +1604,13 @@ impl BufferPool {
     /// `None` means the caller should allocate; it does **not** mean the pool
     /// holds nothing of that size, only that nothing of that size is free.
     pub fn acquire(&self, size: usize) -> Option<Arc<PooledBuffer>> {
+        if pool_no_reuse() {
+            // A/B instrument: every request misses, so no allocation is ever
+            // handed to a second tenant (the §2.3.8b "pool reuse disabled"
+            // arm, 0/30 there). Released buffers still park and drain into
+            // the free lists, where eviction bounds them.
+            return None;
+        }
         let mut state = self.inner.state.lock();
         state.counters.lookups += 1;
 
@@ -1803,7 +1825,8 @@ impl BufferPool {
             buffer.length(),
             buffer.base_offset(),
         );
-        let why = { let mut state = self.inner.state.lock();
+        let why = {
+            let mut state = self.inner.state.lock();
             state.counters.allocations += 1;
             state.counters.allocated_bytes += size as u64;
             state.live_buffers += 1;
@@ -1869,7 +1892,8 @@ impl BufferPool {
              and the overhang would underflow (DESIGN.md §9.2)."
         );
         let handle = self.adopt(buffer, allocated);
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.counters.requested_bytes += requested as u64;
             state.counters.served_bytes += allocated as u64;
             // The MISS half of the same split, banded on the same key as the
@@ -1898,7 +1922,8 @@ impl BufferPool {
         self.inner.drain_completed();
 
         let mut freed = Vec::new();
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             for (_, mut bucket) in std::mem::take(&mut state.free) {
                 // Destroyed rather than reused, as in `evict_over_budget`: the
                 // mark comes off before the allocation goes, or it outlives the
@@ -1956,7 +1981,8 @@ impl BufferPool {
     /// zeroed it while the buffers it counted were still parked. The live
     /// figures are [`Self::occupancy`]'s, and this does not touch them.
     pub fn reset_counters(&self) {
-        { let mut state = self.inner.state.lock();
+        {
+            let mut state = self.inner.state.lock();
             state.counters = PoolCounters::default();
         }
     }
@@ -3913,4 +3939,25 @@ mod tests {
             "the whole over-service is attributed to the asking band"
         );
     }
+}
+
+/// `LLOOM_POOL_NO_REUSE` (read once): the reuse-disabled A/B arm of
+/// `BufferPool::acquire`. Never the shipping path; a diagnostic for the
+/// class of corruption that no fence can observe (`DESIGN.md` §2.3.8b).
+fn pool_no_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LLOOM_POOL_NO_REUSE").is_some())
+}
+
+/// `LLOOM_POOL_QUARANTINE` (read once): extra completed command buffers a
+/// released buffer must outlive before reuse. Zero (the shipping value)
+/// unless set; an A/B arm for the second-tenant race (#748).
+fn pool_quarantine() -> u64 {
+    static K: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("LLOOM_POOL_QUARANTINE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
 }

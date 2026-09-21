@@ -116,6 +116,7 @@ pub mod session_region;
 #[cfg(test)]
 mod session_region_tests;
 pub mod trace;
+pub mod upload_shadow;
 
 pub use arena::*;
 pub use arena_cursor::*;

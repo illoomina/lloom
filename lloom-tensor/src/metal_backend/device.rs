@@ -7,10 +7,9 @@ use crate::kernels::{
     metal::{
         session_region::{RegionCounters, RegionPlan},
         Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout, ArenaOffsets, ArenaRecorder,
-        BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, MTLResourceOptions,
-        FreeSummary, PassKey, PassKind, PassPlanCounters, PoolCounters, PoolOccupancySnapshot,
-        PooledBuffer,
-        ResidencySet, SessionRegion, StepPlan,
+        BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, FreeSummary,
+        MTLResourceOptions, PassKey, PassKind, PassPlanCounters, PoolCounters,
+        PoolOccupancySnapshot, PooledBuffer, ResidencySet, SessionRegion, StepPlan,
     },
     Kernels,
 };
@@ -1145,6 +1144,26 @@ impl MetalDevice {
         self.commands.completion_already_complete()
     }
 
+    /// Write `byte` over every Shared-pool buffer the moment it becomes free,
+    /// or stop -- the #706 GPU-side poison, reachable from a harness.
+    /// A command buffer still reading a "free" buffer then reads the sentinel
+    /// instead of the bytes its last owner left, which turns a rare stale
+    /// read into a visible one. Inert (a note on stderr) without the
+    /// `fuzzing` feature.
+    pub fn set_free_poison(&self, byte: Option<u8>) {
+        #[cfg(feature = "fuzzing")]
+        {
+            // The Shared pool only: a Private buffer has no host mapping
+            // (`contents()` is null), and the poison is a host write.
+            self.buffers.set_free_poison(byte);
+        }
+        #[cfg(not(feature = "fuzzing"))]
+        {
+            let _ = byte;
+            eprintln!("candle: set_free_poison is inert without the `fuzzing` feature");
+        }
+    }
+
     /// The clock the buffer pools decide reuse against (`DESIGN.md` §6.3b).
     ///
     /// A page-pool caller quarantines released KV pages against
@@ -2234,7 +2253,16 @@ impl MetalDevice {
         self.constant_buffer(pod_bytes(v))
     }
 
+    /// A/B instrument (`LLOOM_UNPOOLED_UPLOADS`, read once): every host upload
+    /// takes the unpooled `newBufferWithBytes` path, so a host write can never
+    /// land in a recycled pool buffer. Never the shipping path.
+    fn unpooled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("LLOOM_UNPOOLED_UPLOADS").is_some())
+    }
+
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<PooledBuffer>> {
+        let unpooled_uploads = Self::unpooled;
         let size = core::mem::size_of_val(data);
         // A small upload is served from the buffer pool and filled on the host:
         // an acquired buffer has no GPU reader (reuse waits for completion,
@@ -2246,13 +2274,16 @@ impl MetalDevice {
         // where the crown's `setBytes` params make none; the pool's hit is a
         // lock and a hash (§3.3a). The large uploads below (weight staging,
         // whole prompts) keep the unpooled path for the reason it records.
-        if size > 0 && size <= SMALL_UPLOAD_BYTES {
+        if size > 0 && size <= SMALL_UPLOAD_BYTES && !unpooled_uploads() {
             let buffer = self.allocate_buffer(size)?;
             // SAFETY: the pool handed out a buffer at least `size` bytes long
             // whose last GPU reader has completed, and `data` is `size` bytes.
             unsafe {
                 std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), buffer.contents(), size);
             }
+            crate::kernels::metal::upload_shadow::record(buffer.contents() as usize, unsafe {
+                std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), size)
+            });
             return Ok(buffer);
         }
         let new_buffer = self

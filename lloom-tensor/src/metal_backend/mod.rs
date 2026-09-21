@@ -20,8 +20,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
-pub use device::{DeviceId, MetalDevice};
 use device::{ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver};
+pub use device::{DeviceId, MetalDevice};
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
 ///
@@ -2045,7 +2045,7 @@ impl BackendStorage for MetalStorage {
         }
         // Not the blit under a base (`MetalDevice::base_mode`): the copy
         // must sit in the compute encoder's barrier chain.
-        if src_s == d2 && dst_s == d2 && !self.device.base_mode() {
+        if src_s == d2 && dst_s == d2 && !self.device.base_mode() && !copy2d_no_blit() {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("copy2d_contiguous");
             let src_offset = src_o * self.dtype.size_in_bytes();
@@ -2136,6 +2136,11 @@ impl BackendStorage for MetalStorage {
     }
 
     fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
+        if src_l.is_contiguous() && self.dtype == dst.dtype() && copy2d_no_blit() {
+            // A/B instrument: the contiguous copy as one compute-kernel row.
+            let n = src_l.shape().elem_count();
+            return self.copy2d(dst, 1, n, n, n, src_l.start_offset(), dst_offset);
+        }
         if src_l.is_contiguous() && self.dtype == dst.dtype() {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("copy_contiguous");
@@ -4062,4 +4067,14 @@ mod write_host_slice_tests {
             "a dtype-mismatched write must return false"
         );
     }
+}
+
+/// A/B instrument (`LLOOM_COPY2D_NO_BLIT`, read once): route every `copy2d`
+/// through the compute copy kernel — the path the arena base already forces —
+/// instead of the blit encoder, so the copy sits in the compute encoder's
+/// barrier chain. Never the shipping path until the blit seam is shown to
+/// order it.
+fn copy2d_no_blit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LLOOM_COPY2D_NO_BLIT").is_some())
 }

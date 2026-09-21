@@ -83,7 +83,7 @@ echo "MUTATED C: $vc"
 restore; check_restore "$PLE"
 
 echo "=== [5/7] mutation D: indexer score without the ReLU ==="
-mutate "$QSA" 's/let score = k32\.matmul\(&q32\)\?\.relu\(\)\?\.sum\(1\)\?;/let score = k32.matmul(\&q32)?.sum(1)?;/' 'let score = k32.matmul(&q32)?.sum(1)?;' D
+mutate "$QSA" 's/k32\.matmul\(&q32\)\?\.relu\(\)\?\.sum\(1\)\? \/\/ \[visible\]/k32.matmul(\&q32)?.sum(1)? \/\/ [visible]/' 'k32.matmul(&q32)?.sum(1)? // [visible]' D
 vd=$(verdict "$(run_tests selection_matches_scalar_reference)")
 echo "MUTATED D: $vd"
 restore; check_restore "$QSA"

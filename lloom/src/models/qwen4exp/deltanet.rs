@@ -49,8 +49,9 @@ pub struct DeltaNetDims {
 ///
 /// Returns `(o [h_v, d_v], new_state)` where `new_state`'s layout is chosen by
 /// `STATE_HEAD_FIRST` (see below). All math in the state's dtype (fp32). Mirrors
-/// `build_delta_net_autoregressive` op for op:
-/// `g=exp(g); S=g·S; r=sum_k(S·k); d=β(v−r); S += k⊗d; o=sum_k(S·q)`.
+/// `build_delta_net_autoregressive` step for step —
+/// `g=exp(g); S=g·S; r=k̃ᵀS; d=β(v−r); S += k̃⊗d; o=q̃ᵀS` — with the two
+/// read-outs as batched matvecs and the outer product as a matmul.
 ///
 /// # Geometry (const-generic, flash_decoding style — compile-time, no branch)
 ///
@@ -98,22 +99,42 @@ pub fn decode_step<const STATE_HEAD_FIRST: bool>(
     let g_exp = g.exp()?.reshape((h_v, 1, 1))?; // [h_v,1,1]
     let s = s.broadcast_mul(&g_exp)?; // [h_v, d_k, d_v]
 
-    // r = Sᵀ k̃  (read-out): sum over d_k of S[.,dk,dv] * k[.,dk] -> [h_v, d_v].
     let k_col = k.reshape((h_v, d_k, 1))?; // [h_v, d_k, 1]
-    let r = s.broadcast_mul(&k_col)?.sum(1)?; // [h_v, d_v]
-
-    // delta d = β (v − r), broadcasting the per-head scalar β over d_v.
     let beta_b = beta.reshape((h_v, 1))?; // [h_v,1]
-    let d = (v - &r)?.broadcast_mul(&beta_b)?; // [h_v, d_v]
+    let (s, o) = if !delta_by_reduce() {
+        // The two read-outs as batched matvecs and the rank-1 update as an
+        // outer-product matmul — the model doc's "two matvecs + one rank-1
+        // update". This is the shipping form: the broadcast-and-reduce form
+        // below diverged run to run on the real model at long context (its
+        // strided middle-dim `sum(1)` is the implicated kernel), this one is
+        // bit-identical across runs.
+        let k_row = k.reshape((h_v, 1, d_k))?; // [h_v, 1, d_k]
+        let r = k_row.matmul(&s)?.reshape((h_v, d_v))?; // k̃ᵀ S -> [h_v, d_v]
+        let d = (v - &r)?.broadcast_mul(&beta_b)?; // [h_v, d_v]
+        let kd = k_col.matmul(&d.reshape((h_v, 1, d_v))?)?; // [h_v, d_k, d_v]
+        let s = (s + kd)?;
+        let q_row = q.reshape((h_v, 1, d_k))?;
+        let o = q_row.matmul(&s)?.reshape((h_v, d_v))?; // q̃ᵀ S
+        (s, o)
+    } else {
+        // The broadcast-and-reduce form, kept as the recorded A/B arm
+        // (`QWEN4EXP_DELTA_REDUCE=1`), never the default.
+        // r = Sᵀ k̃  (read-out): sum over d_k of S[.,dk,dv] * k[.,dk] -> [h_v, d_v].
+        let r = s.broadcast_mul(&k_col)?.sum(1)?; // [h_v, d_v]
 
-    // Rank-1 update: S <- S + k̃ ⊗ d  (outer over d_k × d_v).
-    let d_row = d.reshape((h_v, 1, d_v))?; // [h_v,1,d_v]
-    let kd = k_col.broadcast_mul(&d_row)?; // [h_v, d_k, d_v]
-    let s = (s + kd)?; // [h_v, d_k, d_v]
+        // delta d = β (v − r), broadcasting the per-head scalar β over d_v.
+        let d = (v - &r)?.broadcast_mul(&beta_b)?; // [h_v, d_v]
 
-    // o = Sᵀ q̃ : sum over d_k of S[.,dk,dv] * q[.,dk] -> [h_v, d_v].
-    let q_col = q.reshape((h_v, d_k, 1))?;
-    let o = s.broadcast_mul(&q_col)?.sum(1)?; // [h_v, d_v]
+        // Rank-1 update: S <- S + k̃ ⊗ d  (outer over d_k × d_v).
+        let d_row = d.reshape((h_v, 1, d_v))?; // [h_v,1,d_v]
+        let kd = k_col.broadcast_mul(&d_row)?; // [h_v, d_k, d_v]
+        let s = (s + kd)?; // [h_v, d_k, d_v]
+
+        // o = Sᵀ q̃ : sum over d_k of S[.,dk,dv] * q[.,dk] -> [h_v, d_v].
+        let q_col = q.reshape((h_v, d_k, 1))?;
+        let o = s.broadcast_mul(&q_col)?.sum(1)?; // [h_v, d_v]
+        (s, o)
+    };
 
     // Store `S` back in the chosen layout.
     let new_state = if STATE_HEAD_FIRST {
@@ -122,6 +143,16 @@ pub fn decode_step<const STATE_HEAD_FIRST: bool>(
         s.permute((1, 2, 0))?.contiguous()? // [d_k, d_v, h_v]
     };
     Ok((o, new_state))
+}
+
+/// Whether Kernel A's read-outs run as broadcast-multiply + strided reduce
+/// instead of batched matmuls (`QWEN4EXP_DELTA_REDUCE=1`, read once). The
+/// recorded A/B arm: on the real model's 3749-token prompt it diverged run to
+/// run (4 of 4 executions) where the matmul form was bit-identical; never the
+/// shipping path.
+fn delta_by_reduce() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_DELTA_REDUCE").is_some())
 }
 
 /// GQA head expansion `h_k -> h_v` before the recurrence, const-generic over the
@@ -407,7 +438,9 @@ pub fn unit_lower_inverse(a: &Tensor) -> Result<Tensor> {
             continue;
         }
         // T[i, :] = e_i + (−A)[i, :i] · T[:i, :]
-        let coeffs = neg_a.narrow(dims.len() - 2, i, 1)?.narrow(dims.len() - 1, 0, i)?; // [.., 1, i]
+        let coeffs = neg_a
+            .narrow(dims.len() - 2, i, 1)?
+            .narrow(dims.len() - 1, 0, i)?; // [.., 1, i]
         let prev = Tensor::cat(&rows, dims.len() - 2)?; // [.., i, n]
         let t_i = (e_i + coeffs.matmul(&prev)?)?; // [.., 1, n]
         rows.push(t_i);
@@ -831,7 +864,9 @@ mod tests {
         // keys: a unit vector plus a tiny per-position perturbation, renormalized.
         let mut kv_ = Vec::with_capacity(seq * d_k);
         for t in 0..seq {
-            let mut v: Vec<f32> = (0..d_k).map(|i| 1.0 + 0.01 * ((t * 7 + i) as f32 * 0.3).sin()).collect();
+            let mut v: Vec<f32> = (0..d_k)
+                .map(|i| 1.0 + 0.01 * ((t * 7 + i) as f32 * 0.3).sin())
+                .collect();
             let nrm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             for x in &mut v {
                 *x /= nrm;
@@ -839,8 +874,20 @@ mod tests {
             kv_.extend(v);
         }
         let k = Tensor::from_vec(kv_.clone(), (seq, h_v, d_k), &dev).unwrap();
-        let q = Tensor::from_vec(kv_.iter().map(|x| x * 0.9).collect::<Vec<_>>(), (seq, h_v, d_k), &dev).unwrap();
-        let v = Tensor::from_vec((0..seq * d_v).map(|i| (i as f32 * 0.11).cos()).collect::<Vec<_>>(), (seq, h_v, d_v), &dev).unwrap();
+        let q = Tensor::from_vec(
+            kv_.iter().map(|x| x * 0.9).collect::<Vec<_>>(),
+            (seq, h_v, d_k),
+            &dev,
+        )
+        .unwrap();
+        let v = Tensor::from_vec(
+            (0..seq * d_v)
+                .map(|i| (i as f32 * 0.11).cos())
+                .collect::<Vec<_>>(),
+            (seq, h_v, d_v),
+            &dev,
+        )
+        .unwrap();
         let g = Tensor::from_vec(vec![-0.001f32; seq * h_v], (seq, h_v), &dev).unwrap();
         let beta = Tensor::from_vec(vec![0.999f32; seq * h_v], (seq, h_v), &dev).unwrap();
         let mut s_ref: Option<Tensor> = None;
@@ -867,15 +914,34 @@ mod tests {
         );
         assert!(a.iter().all(|x| x.is_finite()), "non-finite output");
         let scale = b.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
-        let maxdiff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        assert!(maxdiff <= 1e-4 * scale, "outputs differ by {maxdiff} at scale {scale}");
+        let maxdiff = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            maxdiff <= 1e-4 * scale,
+            "outputs differ by {maxdiff} at scale {scale}"
+        );
         let (sa, sb) = (
             s.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            s_ref.unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            s_ref
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
         );
         let sscale = sb.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-3);
-        let smax = sa.iter().zip(&sb).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
-        assert!(smax <= 1e-4 * sscale, "states differ by {smax} at scale {sscale}");
+        let smax = sa
+            .iter()
+            .zip(&sb)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            smax <= 1e-4 * sscale,
+            "states differ by {smax} at scale {sscale}"
+        );
     }
 
     /// The chunk conv equals the per-position conv with the same carried
@@ -944,10 +1010,13 @@ mod tests {
         let dev = Device::Cpu;
         let n = 64usize;
         let dt = lloom_tensor::DType::F32;
-        let strict = (Tensor::tril2(n, dt, &dev).unwrap() - Tensor::eye(n, dt, &dev).unwrap()).unwrap();
+        let strict =
+            (Tensor::tril2(n, dt, &dev).unwrap() - Tensor::eye(n, dt, &dev).unwrap()).unwrap();
         // batched: [2, n, n] with the all-ones case and a random case
         let dense = Tensor::from_vec(
-            (0..n * n).map(|i| (i as f32 * 0.37).sin()).collect::<Vec<_>>(),
+            (0..n * n)
+                .map(|i| (i as f32 * 0.37).sin())
+                .collect::<Vec<_>>(),
             (n, n),
             &dev,
         )
@@ -960,11 +1029,24 @@ mod tests {
         let ones_t = t.get(0).unwrap().to_vec2::<f32>().unwrap();
         for i in 0..n {
             for j in 0..n {
-                let want = if i == j { 1.0 } else if j + 1 == i { -1.0 } else { 0.0 };
-                assert!((ones_t[i][j] - want).abs() < 1e-6, "all-ones inverse at ({i},{j}): {}", ones_t[i][j]);
+                let want = if i == j {
+                    1.0
+                } else if j + 1 == i {
+                    -1.0
+                } else {
+                    0.0
+                };
+                assert!(
+                    (ones_t[i][j] - want).abs() < 1e-6,
+                    "all-ones inverse at ({i},{j}): {}",
+                    ones_t[i][j]
+                );
             }
         }
-        let prod = (&eye + a.get(1).unwrap()).unwrap().matmul(&t.get(1).unwrap()).unwrap();
+        let prod = (&eye + a.get(1).unwrap())
+            .unwrap()
+            .matmul(&t.get(1).unwrap())
+            .unwrap();
         let p = prod.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let e = eye.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         for (x, y) in p.iter().zip(&e) {

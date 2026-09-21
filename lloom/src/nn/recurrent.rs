@@ -73,7 +73,9 @@ pub struct RecurrentState {
 fn state_write_by_copy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("QWEN4EXP_STATE_WRITE").map(|v| v == "copy").unwrap_or(false)
+        std::env::var("QWEN4EXP_STATE_WRITE")
+            .map(|v| v == "copy")
+            .unwrap_or(false)
     })
 }
 
@@ -267,7 +269,11 @@ mod tests {
         let id_first = rs.get(0).unwrap().id();
         // A second, third write must land in the same buffer.
         rs.write(0, t(2.0, &dev)).unwrap();
-        assert_eq!(rs.get(0).unwrap().id(), id_first, "write allocated a new buffer");
+        assert_eq!(
+            rs.get(0).unwrap().id(),
+            id_first,
+            "write allocated a new buffer"
+        );
         assert_eq!(rs.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0], 2.0);
         rs.write(0, t(3.0, &dev)).unwrap();
         assert_eq!(rs.get(0).unwrap().id(), id_first);
@@ -311,7 +317,10 @@ mod tests {
         rs.write(0, t(5.0, &dev)).unwrap(); // first write is inside the window
         assert!(rs.get(0).is_some());
         rs.rewind_to_window().unwrap();
-        assert!(rs.get(0).is_none(), "should return to the implicit zero state");
+        assert!(
+            rs.get(0).is_none(),
+            "should return to the implicit zero state"
+        );
     }
 
     #[test]

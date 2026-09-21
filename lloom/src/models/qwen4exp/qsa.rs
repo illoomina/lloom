@@ -147,7 +147,9 @@ impl Indexer {
     ) -> Result<Self> {
         let n_rot = (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize;
         if cfg.indexer_compress_ratio == 0
-            || !cfg.indexer_budget.is_multiple_of(cfg.indexer_compress_ratio)
+            || !cfg
+                .indexer_budget
+                .is_multiple_of(cfg.indexer_compress_ratio)
         {
             lloom_tensor::bail!(
                 "indexer budget {} / ratio {}",
@@ -262,8 +264,17 @@ impl Indexer {
         .reshape((self.n_heads, self.head_dim))?;
         // fp32 score per block: Σ_h relu(K_C · q_hᵀ).
         let k32 = k_c.to_dtype(DType::F32)?.contiguous()?;
-        let q32 = q.to_dtype(DType::F32)?.t()?.contiguous()?; // [head_dim, n_heads]
-        let score = k32.matmul(&q32)?.relu()?.sum(1)?; // [visible]
+        let score = if score_without_matmul() {
+            // A/B: the same dot as a broadcast product + last-dim sum.
+            let prod = k32.reshape((visible, 1, self.head_dim))?.broadcast_mul(
+                &q.to_dtype(DType::F32)?
+                    .reshape((1, self.n_heads, self.head_dim))?,
+            )?;
+            prod.sum(2)?.relu()?.sum(1)? // [visible]
+        } else {
+            let q32 = q.to_dtype(DType::F32)?.t()?.contiguous()?; // [head_dim, n_heads]
+            k32.matmul(&q32)?.relu()?.sum(1)? // [visible]
+        };
         let topk = self.block_topk().min(visible);
         // Descending by score = ascending by −score (the ascending sort is the
         // arm every width runs on Metal).
@@ -446,7 +457,13 @@ impl QsaAttention {
                         &ids[..ids.len().min(8)]
                     )
                 }
-                eprintln!("SEL pos={pos} n={} blocks={} first={:?} last={:?}", ids.len(), kv.n_blocks(), &ids[..4], &ids[ids.len() - 4..]);
+                eprintln!(
+                    "SEL pos={pos} n={} blocks={} first={:?} last={:?}",
+                    ids.len(),
+                    kv.n_blocks(),
+                    &ids[..4],
+                    &ids[ids.len() - 4..]
+                );
             }
         }
         let (k_all, v_all) = match &sel {
@@ -564,6 +581,14 @@ impl QsaAttention {
         let gated = (ctx * ops::sigmoid(&gate.reshape((seq, nh * hd))?)?)?;
         self.wo.forward(&gated)?.reshape((1, seq, hidden))
     }
+}
+
+/// A/B instrument (`QWEN4EXP_SCORE_NO_MATMUL`, read once): the block score
+/// as a broadcast product + reduce instead of the `[n_blocks, 128] × [128, 4]`
+/// matmul. Never the shipping path.
+fn score_without_matmul() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_SCORE_NO_MATMUL").is_some())
 }
 
 /// Read the selection back and check it every position (`QWEN4EXP_CHECK_SEL`,
@@ -1235,7 +1260,9 @@ mod tests {
         let h = cfg.hidden_size;
         let prefill_len = 2048usize;
         let steps = 620usize;
-        let flat: Vec<f32> = (0..prefill_len * h).map(|i| ((i as f32 * 0.013).sin()) * 0.4).collect();
+        let flat: Vec<f32> = (0..prefill_len * h)
+            .map(|i| ((i as f32 * 0.013).sin()) * 0.4)
+            .collect();
         let x_pre = Tensor::from_vec(flat, (1, prefill_len, h), &gpu).unwrap();
         let step_x: Vec<Tensor> = (0..steps)
             .map(|t| Tensor::from_vec(tok(h, 100.0 + t as f32), (1, 1, h), &gpu).unwrap())
@@ -1246,7 +1273,14 @@ mod tests {
             let mut outs = Vec::with_capacity(steps);
             for x in &step_x {
                 let o = attn.decode(x, &mut kv).unwrap();
-                outs.push(o.to_device(&Device::Cpu).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap());
+                outs.push(
+                    o.to_device(&Device::Cpu)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap(),
+                );
             }
             assert_eq!(kv.len(), prefill_len + steps);
             outs
@@ -1255,8 +1289,18 @@ mod tests {
         let b = run();
         for (t, (x, y)) in a.iter().zip(&b).enumerate() {
             assert!(x.iter().all(|v| v.is_finite()), "step {t}: non-finite");
-            let n_diff = x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
-            assert_eq!(n_diff, 0, "step {t} (pos {}): {n_diff} of {} values differ between two identical passes", prefill_len + t, x.len());
+            let n_diff = x
+                .iter()
+                .zip(y)
+                .filter(|(p, q)| p.to_bits() != q.to_bits())
+                .count();
+            assert_eq!(
+                n_diff,
+                0,
+                "step {t} (pos {}): {n_diff} of {} values differ between two identical passes",
+                prefill_len + t,
+                x.len()
+            );
         }
     }
 

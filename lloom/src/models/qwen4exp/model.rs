@@ -110,7 +110,10 @@ impl Cache {
     /// instrument, never on the decode path.
     pub fn checksums(&self) -> Result<Vec<(String, u64, usize)>> {
         fn fnv(t: &Tensor) -> Result<(u64, usize)> {
-            let v = t.flatten_all()?.to_dtype(lloom_tensor::DType::F32)?.to_vec1::<f32>()?;
+            let v = t
+                .flatten_all()?
+                .to_dtype(lloom_tensor::DType::F32)?
+                .to_vec1::<f32>()?;
             let mut h = 0xcbf2_9ce4_8422_2325u64;
             let mut nonfinite = 0usize;
             for x in v {
@@ -155,6 +158,24 @@ impl Cache {
         self.pending_tokens.clear();
         self.pending_tokens.extend(tokens.iter().copied());
     }
+}
+
+/// Whether every decode position checks each layer's mixer and MoE output for
+/// non-finite values and stops at the first (`QWEN4EXP_WATCH_NAN`, read once):
+/// one small reduce per sub-block and one readback per token — an instrument
+/// behind a gate (§3.3a), never the shipping path.
+fn watch_nan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_WATCH_NAN").is_some())
+}
+
+/// A `[1]` f32 that is finite iff every element of `t` is: `sum(x − x)`
+/// (`x − x` is 0 for finite `x` and NaN for an inf or NaN — the subtraction
+/// of a tensor from itself is the point).
+#[allow(clippy::eq_op)]
+fn nonfinite_probe(t: &Tensor) -> Result<Tensor> {
+    let f = t.to_dtype(lloom_tensor::DType::F32)?;
+    (&f - &f)?.sum_all()?.reshape(1)
 }
 
 /// How a multi-token pass (a prompt) is run.
@@ -432,6 +453,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             .reshape((1, 1, n * d))?
             .contiguous()?;
 
+        let watch = watch_nan();
+        let mut watched: Vec<Tensor> = Vec::new();
         for (l, layer) in self.layers.iter().enumerate() {
             // The N-gram PLE adds to the carry at the start of its layer.
             if let Some(ple) = &self.ple {
@@ -459,6 +482,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 Mixer::Full(qsa) => qsa.decode(&cur, &mut cache.kv[l])?,
             };
             trace("mixer", l, &mixed);
+            if watch {
+                watched.push(nonfinite_probe(&mixed)?);
+            }
             // HC epilogue: scatter the mixer output back across the streams.
             res_hc = layer.hc_attn.combine(&res_hc, &mixed, &inject)?;
             trace("attn.combine", l, &res_hc);
@@ -468,6 +494,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             trace("ffn.mix", l, &cur);
             let moe_out = layer.moe.decode(&cur)?;
             trace("moe", l, &moe_out);
+            if watch {
+                watched.push(nonfinite_probe(&moe_out)?);
+            }
             res_hc = layer.hc_ffn.combine(&res_hc, &moe_out, &inject)?;
             trace("ffn.combine", l, &res_hc);
 
@@ -475,6 +504,19 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             if obs.wants::<LayerOutputPoint>(l) {
                 let (collapsed, _) = layer.hc_ffn.mix(&res_hc)?;
                 obs.at::<LayerOutputPoint>(l, &collapsed)?;
+            }
+        }
+
+        if watch && !watched.is_empty() {
+            // One readback per token: the first non-finite (layer, sub-block).
+            let flags = Tensor::cat(&watched, 0)?.to_vec1::<f32>()?;
+            if let Some(i) = flags.iter().position(|f| !f.is_finite()) {
+                lloom_tensor::bail!(
+                    "NONFINITE pos={} layer={} block={}",
+                    cache.pos,
+                    i / 2,
+                    if i % 2 == 0 { "mixer" } else { "moe" }
+                )
             }
         }
 

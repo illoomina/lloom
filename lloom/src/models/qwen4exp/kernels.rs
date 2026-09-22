@@ -681,6 +681,97 @@ mod tests {
         assert!(scale > 1e-3, "{name}: degenerate");
     }
 
+    /// The DeltaNet step's three kernels at the real geometry, each timed
+    /// alone (ignored: a measurement, `--ignored --nocapture` under
+    /// `lloom-arb measure`).
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore]
+    fn gdn_kernels_timed_at_real_geometry() {
+        let dev = Device::new_metal(0).unwrap();
+        let (d, h_k, h_v, kk) = (128usize, 16usize, 48usize, 4usize);
+        let conv_ch = (2 * h_k + h_v) * d;
+        let f32 = lloom_tensor::DType::F32;
+        let qkv = Tensor::randn(0f32, 0.3, conv_ch, &dev).unwrap();
+        let conv_w = Tensor::randn(0f32, 0.2, (conv_ch, kk), &dev).unwrap();
+        let win = Tensor::zeros((conv_ch, kk), f32, &dev).unwrap();
+        let win_out = Tensor::zeros((conv_ch, kk), f32, &dev).unwrap();
+        let slab = Tensor::zeros((d, d, h_v), f32, &dev).unwrap();
+        let slab_out = Tensor::zeros((d, d, h_v), f32, &dev).unwrap();
+        let alpha = Tensor::randn(0f32, 0.3, h_v, &dev).unwrap();
+        let beta = Tensor::randn(0f32, 0.3, h_v, &dev).unwrap();
+        let dt_bias = Tensor::zeros(h_v, f32, &dev).unwrap();
+        let ssm_a = Tensor::full(-0.5f32, h_v, &dev).unwrap();
+        let gamma = Tensor::ones(d, f32, &dev).unwrap();
+        let z = Tensor::randn(0f32, 0.3, h_v * d, &dev).unwrap();
+        let heads = qkv
+            .apply_op1_no_bwd(&GdnPrologue {
+                d,
+                h_k,
+                h_v,
+                kk,
+                eps: 1e-6,
+                q_scale: 0.088,
+                conv_w: conv_w.clone(),
+                win: win.clone(),
+                win_out: win_out.clone(),
+            })
+            .unwrap();
+        let o = Tensor::zeros((h_v, d), f32, &dev).unwrap();
+        let time = |name: &str, f: &dyn Fn()| {
+            for _ in 0..5 {
+                f();
+            }
+            dev.synchronize().unwrap();
+            let n = 200;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                f();
+            }
+            dev.synchronize().unwrap();
+            println!(
+                "GDNTIME {name} {:.1} us",
+                t.elapsed().as_secs_f64() * 1e6 / n as f64
+            );
+        };
+        time("prologue", &|| {
+            let _ = qkv
+                .apply_op1_no_bwd(&GdnPrologue {
+                    d,
+                    h_k,
+                    h_v,
+                    kk,
+                    eps: 1e-6,
+                    q_scale: 0.088,
+                    conv_w: conv_w.clone(),
+                    win: win.clone(),
+                    win_out: win_out.clone(),
+                })
+                .unwrap();
+        });
+        time("step", &|| {
+            let _ = heads
+                .apply_op3_no_bwd(
+                    &alpha,
+                    &beta,
+                    &GdnStep {
+                        d,
+                        h_v,
+                        dt_bias: dt_bias.clone(),
+                        ssm_a: ssm_a.clone(),
+                        s: slab.clone(),
+                        s_out: slab_out.clone(),
+                    },
+                )
+                .unwrap();
+        });
+        time("gated_norm", &|| {
+            let _ = o
+                .apply_op3_no_bwd(&gamma, &z, &GdnGatedNorm { d, h_v, eps: 1e-6 })
+                .unwrap();
+        });
+    }
+
     /// The router's fused top-k picks the ids the composed sort picks and
     /// renormalises their weights the same way, at the real width (512
     /// experts, top 10) over several rows.

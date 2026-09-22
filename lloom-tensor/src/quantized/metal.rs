@@ -340,6 +340,10 @@ impl QMetalStorage {
         ))
     }
 
+    /// Rows up to which a quantized matmul runs the matmul-vec kernel once
+    /// per row instead of the mm kernel (see `fwd`).
+    const QMV_ROWS_MAX_: usize = 8;
+
     fn fwd_mv(
         &self,
         self_shape: &Shape,
@@ -409,22 +413,24 @@ impl QMetalStorage {
         let encoder = device.command_encoder()?;
         // In some cases it would be better to use the mm variant, though it has its drawbacks
         // around memory alignment.
-        for batch_id in 0..m {
-            crate::kernels::call_quantized_matmul_mv_t(
-                device.device(),
-                &encoder,
-                device.kernels(),
-                ggml_dtype,
-                triple,
-                (1, 1, n, k),
-                storage.buffer(),
-                (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
-                &self.buffer,
-                batch_id * n * store_dtype.size_in_bytes(),
-                &dst,
-            )
-            .map_err(MetalError::from)?;
-        }
+        // One launch over the `m` rows: the matmul-vec kernels take the
+        // activation rows on the grid's second axis (`ne11`, stepped by
+        // `nb11`), each row its own dot products — what a launch per row
+        // computes, without the launch per row (a decode batch's `B` rows).
+        crate::kernels::call_quantized_matmul_mv_t(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            ggml_dtype,
+            triple,
+            (1, m, n, k),
+            storage.buffer(),
+            layout.start_offset() * storage.dtype().size_in_bytes(),
+            &self.buffer,
+            0,
+            &dst,
+        )
+        .map_err(MetalError::from)?;
         let dst_storage =
             crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), store_dtype);
         Ok((dst_storage, dst_shape))
@@ -458,7 +464,14 @@ impl QMetalStorage {
             )
         }
 
-        if src_shape.dim(D::Minus2)? == 1 {
+        // A handful of rows go through the matmul-vec kernel once per row:
+        // the mm kernels tile the rows by 32 and dequantize whole tiles, so
+        // at a decode batch's `m` (a few rows, `[B, 1, k]` or `[1, B, k]`)
+        // they cost several times the per-row gemvs; and per-row gemvs make
+        // every row exactly what it computes alone (the batched decode's
+        // identity). Prefill widths keep the mm kernels.
+        let rows_total = src_shape.elem_count() / k.max(1);
+        if src_shape.dim(D::Minus2)? == 1 || rows_total <= Self::QMV_ROWS_MAX_ {
             return self.fwd_mv(self_shape, storage, layout);
         }
 

@@ -86,6 +86,10 @@ impl QMetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    pub fn persistent(_: &MetalDevice, _: usize, _: GgmlDType) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     pub fn indexed_moe_forward(
         &self,
         _: &crate::Shape,

@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use candle::{Device, Tensor};
 use clap::Parser;
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
-use lloom::models::qwen4exp::loader::{LoadOptions, StreamLoader, StreamOptions};
+use lloom::models::qwen4exp::loader::{LoadOptions, SlotBudget, StreamLoader, StreamOptions};
 use lloom::models::qwen4exp::model::PrefillMode;
 use lloom::models::qwen4exp::{Cache, ExpertResidency, MtpDrafter, Qwen4Exp, Resident, Streamed};
 use lloom::nn::expert_stream::HasStreamStats;
@@ -82,9 +82,16 @@ struct Args {
     #[arg(long, default_value = "resident")]
     experts: String,
 
-    /// Streamed experts per layer per projection.
-    #[arg(long, default_value_t = 64)]
-    slots: usize,
+    /// Streamed experts per layer per projection: a count, or `auto` (sized
+    /// from `recommendedMaxWorkingSetSize × --memory-fraction` minus the
+    /// resident tier; the `SLOTPLAN` line says what it resolved to).
+    #[arg(long, default_value = "64")]
+    slots: String,
+
+    /// The fraction of the device's recommended working set `--slots auto`
+    /// may plan for.
+    #[arg(long, default_value_t = 0.65)]
+    memory_fraction: f64,
 
     /// The streaming loader primitive: `pread` (read + compute-encoder copy)
     /// or `io` (`MTLIOCommandQueue`).
@@ -274,6 +281,7 @@ fn main() -> Result<()> {
     // (a `fuzzing`-feature build; inert otherwise). A bisection aid for the
     // long-context divergence: a still-reading command buffer sees the
     // sentinel instead of a plausible stale value.
+    #[cfg(feature = "metal")]
     if let (Ok(hex), Device::Metal(m)) = (std::env::var("QWEN4EXP_POOL_POISON"), &device) {
         let byte = u8::from_str_radix(hex.trim_start_matches("0x"), 16)
             .map_err(|e| anyhow::anyhow!("QWEN4EXP_POOL_POISON={hex}: {e}"))?;
@@ -353,10 +361,13 @@ fn main() -> Result<()> {
             )
         }
         "stream" => {
-            let stream = StreamOptions {
-                slots: args.slots,
-                loader,
+            let slots = match args.slots.as_str() {
+                "auto" => SlotBudget::Auto {
+                    fraction: args.memory_fraction,
+                },
+                n => SlotBudget::Fixed(n.parse().context("--slots: a count or `auto`")?),
             };
+            let stream = StreamOptions { slots, loader };
             let mut model: Qwen4Exp<Streamed> =
                 Qwen4Exp::from_gguf_streamed(&shards, &device, &opts, &stream)?;
             model.set_prefill_mode(prefill_mode);
@@ -555,10 +566,15 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         );
         let s = model.stream_stats();
         if args.experts == "stream" {
+            let st = model.staging_stats();
+            println!(
+                "STAGING run={run} buffers={} bytes={} allocations={} reuses={} overflows={}",
+                st.buffers, st.bytes, st.allocations, st.reuses, st.overflows
+            );
             println!(
                 "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4}",
                 args.loader,
-                args.slots,
+                model.slots_per_layer(),
                 s.plans,
                 s.groups,
                 s.hits,

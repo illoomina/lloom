@@ -984,6 +984,46 @@ impl QTensor {
         Self::new(storage, shape)
     }
 
+    /// [`Self::zeros`] in storage that is not a pool bucket — a persistent
+    /// Private allocation on Metal (`QMetalStorage::persistent`), the CPU
+    /// storage as it is. The slot pool of a streamed weight tier.
+    pub fn zeros_persistent<S: Into<Shape>>(
+        shape: S,
+        dtype: GgmlDType,
+        device: &Device,
+    ) -> Result<Self> {
+        let shape = shape.into();
+        check_shape(&shape, dtype.block_size())?;
+        let storage = match device {
+            Device::Metal(d) => {
+                QStorage::Metal(metal::QMetalStorage::persistent(d, shape.elem_count(), dtype)?)
+            }
+            other => other.qzeros(shape.elem_count(), dtype)?,
+        };
+        Self::new(storage, shape)
+    }
+
+    /// [`Self::write_with`] staged through a [`StagingRing`] on Metal (a
+    /// reused buffer instead of an allocation per call); the other backends
+    /// take the plain path.
+    #[cfg(feature = "metal")]
+    pub fn write_with_ring(
+        &mut self,
+        offset: usize,
+        len: usize,
+        ring: &mut crate::kernels::metal::staging::StagingRing,
+        fill: &mut dyn FnMut(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        let exact = self.shape.elem_count() / self.dtype().block_size() * self.dtype().type_size();
+        if offset + len > exact {
+            crate::bail!("write_with_ring: {offset}+{len} past the {exact}-byte tensor")
+        }
+        match &mut self.storage {
+            QStorage::Metal(s) => s.write_with_ring(offset, len, ring, fill),
+            _ => self.storage.write_with(offset, len, fill),
+        }
+    }
+
     /// Overwrite `len` packed bytes at byte `offset` with what `fill` writes
     /// into the slice it is handed. Bounds-checked against the exact packed
     /// size; the Metal arm goes through the compute encoder so the write is

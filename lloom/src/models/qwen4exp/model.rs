@@ -543,6 +543,43 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         s
     }
 
+    /// The staging rings' counters summed, a ring shared across layers
+    /// counted once (`Streamed` on Metal; zeros otherwise).
+    pub fn staging_stats(&self) -> crate::nn::expert_stream::StagingStats
+    where
+        R: crate::nn::expert_stream::HasStreamStats,
+    {
+        let mut t = crate::nn::expert_stream::StagingStats::default();
+        let mut seen = Vec::new();
+        for l in &self.layers {
+            let e = l.moe().experts();
+            if let Some(id) = e.staging_id() {
+                if seen.contains(&id) {
+                    continue;
+                }
+                seen.push(id);
+            }
+            let s = e.staging_stats();
+            t.buffers += s.buffers;
+            t.bytes += s.bytes;
+            t.allocations += s.allocations;
+            t.reuses += s.reuses;
+            t.overflows += s.overflows;
+        }
+        t
+    }
+
+    /// Slots per layer per projection (`Streamed`), 0 for `Resident`.
+    pub fn slots_per_layer(&self) -> usize
+    where
+        R: crate::nn::expert_stream::HasStreamStats,
+    {
+        self.layers
+            .first()
+            .map(|l| l.moe().experts().slots())
+            .unwrap_or(0)
+    }
+
     /// The PLE delta for the positions of `res_hc [1, seq, n·d]`: hash each
     /// position's token window, gather the rows, run the block against the
     /// carry. Consumes `seq` pending tokens and advances the window.

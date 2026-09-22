@@ -23,7 +23,7 @@ pub use config::{Config, LayerKind};
 pub use deltanet::{decode_step, DeltaNetDims};
 pub use deltanet_block::GatedDeltaNet;
 pub use hc::HyperConnection;
-pub use loader::{LoadOptions, StreamLoader, StreamOptions};
+pub use loader::{LoadOptions, SlotBudget, SlotPlan, StreamLoader, StreamOptions};
 pub use model::{Cache, Layer, Mixer, Qwen4Exp};
 pub use moe::{ExpertResidency, MoeLayer, Resident, Streamed};
 pub use mtp::{MtpDrafter, MtpHead};

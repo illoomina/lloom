@@ -25,6 +25,24 @@ impl QMetalStorage {
         })
     }
 
+    /// A persistent, zeroed storage for `elem_count` elements of `dtype`
+    /// outside every pool (`MetalDevice::new_persistent_private`): the slot
+    /// pool of a streamed weight tier.
+    pub fn persistent(device: &MetalDevice, elem_count: usize, dtype: GgmlDType) -> Result<Self> {
+        let size = elem_count * dtype.type_size() / dtype.block_size();
+        let buffer = device.new_persistent_private(size)?;
+        {
+            let mut blit = device.blit_command_encoder()?;
+            blit.set_label("qstorage_persistent_zero");
+            blit.fill_buffer(&buffer, (0, size), 0);
+        }
+        Ok(Self {
+            buffer,
+            device: device.clone(),
+            dtype,
+        })
+    }
+
     pub fn dtype(&self) -> GgmlDType {
         self.dtype
     }
@@ -608,13 +626,6 @@ impl QMetalStorage {
         len: usize,
         fill: &mut dyn FnMut(&mut [u8]) -> Result<()>,
     ) -> Result<()> {
-        use crate::MetalError;
-        if offset + len > self.buffer.length() {
-            crate::bail!(
-                "write_with: {offset}+{len} past the {}-byte buffer",
-                self.buffer.length()
-            )
-        }
         if len == 0 {
             return Ok(());
         }
@@ -623,6 +634,44 @@ impl QMetalStorage {
         } else {
             self.device.new_unpooled_shared(len)?
         };
+        self.write_via(offset, len, staging, fill, None)
+    }
+
+    /// [`Self::write_with`] staged through `ring` — a buffer reused once the
+    /// command buffer holding its last copy has completed, so a steady-state
+    /// stream allocates nothing per load.
+    pub fn write_with_ring(
+        &self,
+        offset: usize,
+        len: usize,
+        ring: &mut crate::kernels::metal::staging::StagingRing,
+        fill: &mut dyn FnMut(&mut [u8]) -> Result<()>,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let (entry, staging) = ring.acquire(&self.device, len)?;
+        self.write_via(offset, len, staging, fill, Some((ring, entry)))
+    }
+
+    fn write_via(
+        &self,
+        offset: usize,
+        len: usize,
+        staging: Arc<PooledBuffer>,
+        fill: &mut dyn FnMut(&mut [u8]) -> Result<()>,
+        ring: Option<(
+            &mut crate::kernels::metal::staging::StagingRing,
+            Option<usize>,
+        )>,
+    ) -> Result<()> {
+        use crate::MetalError;
+        if offset + len > self.buffer.length() {
+            crate::bail!(
+                "write_with: {offset}+{len} past the {}-byte buffer",
+                self.buffer.length()
+            )
+        }
         let ptr = std::hint::black_box(staging.contents());
         if ptr.is_null() {
             crate::bail!("write_with: the staging buffer has no CPU mapping (len={len})")
@@ -640,6 +689,11 @@ impl QMetalStorage {
         };
         let n = len / width;
         let encoder = self.device.command_encoder()?;
+        // The encoder guard holds the command stream: no cut can move the copy
+        // into a later command buffer than the epoch stamped here.
+        if let Some((ring, entry)) = ring {
+            ring.stamp(entry, &staging, ring.clock().current_epoch());
+        }
         crate::kernels::call_copy2d(
             self.device.device(),
             &encoder,

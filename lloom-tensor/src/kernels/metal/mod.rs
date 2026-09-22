@@ -98,6 +98,7 @@ pub mod residency_set;
 /// unconditionally and compiles to nothing when the feature is off.
 pub mod run_telemetry;
 pub mod scratch;
+pub mod staging;
 /// A stateful fuzzer over the scratch class's long-context state machine, on
 /// the `kv_len` axis the four existing harnesses do not carry (#575).
 #[cfg(any(test, feature = "fuzzing"))]

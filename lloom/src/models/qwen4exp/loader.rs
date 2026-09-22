@@ -283,12 +283,82 @@ pub enum StreamLoader {
     Io,
 }
 
+/// How many experts a layer keeps resident (the slot pool per projection).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SlotBudget {
+    /// A fixed count.
+    Fixed(usize),
+    /// Sized from the device: `fraction` of `recommendedMaxWorkingSetSize`,
+    /// minus the resident tier (every non-expert tensor, from the headers),
+    /// divided across the layers' three expert planes; clamped to
+    /// `[topk + 1, n_experts]`. ds4's byte-budget planner, without a policy
+    /// beyond "what fits" (§20.4a).
+    Auto { fraction: f64 },
+}
+
 /// How the routed experts are streamed.
 #[derive(Debug, Clone)]
 pub struct StreamOptions {
     /// Resident experts per layer per projection (the slot pool).
-    pub slots: usize,
+    pub slots: SlotBudget,
     pub loader: StreamLoader,
+}
+
+/// The slots `Auto` resolves to, and the terms it resolved them from.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotPlan {
+    pub slots: usize,
+    pub working_set: usize,
+    pub resident_bytes: usize,
+    pub expert_bytes_per_slot: usize,
+}
+
+/// Every tensor's packed size from the headers, split into the resident tier
+/// and one slot's worth of expert planes (summed over the layers).
+fn plan_slots<Rd: Read + Seek>(
+    gg: &Gguf<'_, Rd>,
+    cfg: &Config,
+    device: &Device,
+    fraction: f64,
+) -> Result<SlotPlan> {
+    let mut resident = 0usize;
+    let mut per_slot = 0usize;
+    for sh in &gg.shards {
+        for (name, info) in &sh.content.tensor_infos {
+            let bytes = info.shape.elem_count() / info.ggml_dtype.block_size()
+                * info.ggml_dtype.type_size();
+            if name == "per_layer_token_embd.weight" {
+                continue; // memory-mapped, not resident
+            }
+            if name.ends_with("_exps.weight") {
+                // [n_experts, n, k]: one plane per slot
+                let n_experts = info.shape.dims().first().copied().unwrap_or(1).max(1);
+                per_slot += bytes / n_experts;
+            } else {
+                resident += bytes;
+            }
+        }
+    }
+    #[cfg(feature = "metal")]
+    let working_set = match device {
+        Device::Metal(d) => d.device().recommended_max_working_set_size(),
+        _ => 0,
+    };
+    #[cfg(not(feature = "metal"))]
+    let working_set = {
+        let _ = device;
+        0usize
+    };
+    let budget = (working_set as f64 * fraction) as usize;
+    let for_experts = budget.saturating_sub(resident);
+    let raw = for_experts.checked_div(per_slot).unwrap_or(0);
+    let slots = raw.clamp(cfg.n_experts_per_tok + 1, cfg.n_experts);
+    Ok(SlotPlan {
+        slots,
+        working_set,
+        resident_bytes: resident,
+        expert_bytes_per_slot: per_slot,
+    })
 }
 
 /// What besides the first shard a load may take.
@@ -414,6 +484,23 @@ impl Qwen4Exp<Streamed> {
             })
             .collect();
         let mut gg = Gguf::new(shards, device)?;
+        let cfg0 = Config::from_gguf_metadata(gg.metadata())?;
+        let slots = match stream.slots {
+            SlotBudget::Fixed(n) => n,
+            SlotBudget::Auto { fraction } => {
+                let plan = plan_slots(&gg, &cfg0, device, fraction)?;
+                if plan.working_set == 0 {
+                    lloom_tensor::bail!(
+                        "SlotBudget::Auto needs a Metal device (recommendedMaxWorkingSetSize)"
+                    )
+                }
+                eprintln!(
+                    "SLOTPLAN working_set={} fraction={fraction} resident_bytes={} expert_bytes_per_slot={} slots={}",
+                    plan.working_set, plan.resident_bytes, plan.expert_bytes_per_slot, plan.slots
+                );
+                plan.slots
+            }
+        };
         let arm = match stream.loader {
             StreamLoader::Pread => LoaderArm::Pread,
             StreamLoader::Io => {
@@ -433,19 +520,30 @@ impl Qwen4Exp<Streamed> {
                 }
             }
         };
+        // One staging ring for the whole tier: one byte bound, one clock.
+        #[cfg(feature = "metal")]
+        let staging = match (device, &arm) {
+            (Device::Metal(d), LoaderArm::Pread) => Some(
+                lloom_tensor::kernels::metal::staging::StagingRing::shared(d),
+            ),
+            _ => None,
+        };
+        #[cfg(not(feature = "metal"))]
+        let staging = None::<()>;
         build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             let src = |gg: &Gguf<'_, File>, name: String| -> Result<ExpertSource> {
                 let (content, path) = gg.locate(&name)?;
                 ExpertSource::from_gguf(content, path, &name)
             };
-            Streamed::new(
+            Streamed::with_staging(
                 src(gg, format!("{p}.ffn_gate_exps.weight"))?,
                 src(gg, format!("{p}.ffn_up_exps.weight"))?,
                 src(gg, format!("{p}.ffn_down_exps.weight"))?,
-                stream.slots,
+                slots,
                 arm.clone(),
                 device,
+                staging.clone(),
             )
         })
     }

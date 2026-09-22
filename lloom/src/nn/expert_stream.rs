@@ -375,6 +375,20 @@ pub struct StreamCounters {
     pub bytes_loaded: AtomicU64,
 }
 
+/// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StagingStats {
+    /// Buffers the ring keeps.
+    pub buffers: usize,
+    /// Bytes those buffers hold.
+    pub bytes: usize,
+    pub allocations: u64,
+    /// Acquisitions served by reuse.
+    pub reuses: u64,
+    /// One-shots handed out past the cap (held until their epoch completes).
+    pub overflows: u64,
+}
+
 /// A snapshot of [`StreamCounters`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamStats {
@@ -414,6 +428,18 @@ impl std::ops::AddAssign for StreamStats {
 /// zeros so a harness can print one line for either.
 pub trait HasStreamStats {
     fn stream_stats(&self) -> StreamStats;
+    /// The staging ring's counters, if any.
+    fn staging_stats(&self) -> StagingStats {
+        StagingStats::default()
+    }
+    /// An identity for the staging ring, equal across the layers sharing it.
+    fn staging_id(&self) -> Option<usize> {
+        None
+    }
+    /// Slots per projection, 0 when nothing is streamed.
+    fn slots(&self) -> usize {
+        0
+    }
 }
 
 impl HasStreamStats for Resident {
@@ -425,6 +451,15 @@ impl HasStreamStats for Resident {
 impl HasStreamStats for Streamed {
     fn stream_stats(&self) -> StreamStats {
         self.stats()
+    }
+    fn staging_stats(&self) -> StagingStats {
+        Streamed::staging_stats(self)
+    }
+    fn staging_id(&self) -> Option<usize> {
+        Streamed::staging_id(self)
+    }
+    fn slots(&self) -> usize {
+        self.n_slots
     }
 }
 
@@ -440,6 +475,11 @@ struct Inner {
     map: ResidencyMap,
     loader: LoaderArm,
     device: Device,
+    /// The `pread` arm's staging ring on Metal (reused once its copy's
+    /// command buffer completes; never a pool bucket, never a wait) — one
+    /// ring shared by every layer of the tier when built by the loader.
+    #[cfg(feature = "metal")]
+    staging: Option<lloom_tensor::kernels::metal::staging::SharedStagingRing>,
 }
 
 /// The routed experts streamed from the checkpoint into a slot pool (§20.6).
@@ -473,6 +513,34 @@ impl Streamed {
         loader: LoaderArm,
         device: &Device,
     ) -> Result<Self> {
+        #[cfg(feature = "metal")]
+        let staging = match (device, &loader) {
+            (Device::Metal(d), LoaderArm::Pread) => Some(
+                lloom_tensor::kernels::metal::staging::StagingRing::shared(d),
+            ),
+            _ => None,
+        };
+        #[cfg(not(feature = "metal"))]
+        let staging = None::<()>;
+        Self::with_staging(gate, up, down, n_slots, loader, device, staging)
+    }
+
+    /// [`Self::new`] over a staging ring shared with other layers (the
+    /// `pread` arm on Metal; `None` elsewhere, and the arm stages one-shot).
+    pub fn with_staging(
+        gate: ExpertSource,
+        up: ExpertSource,
+        down: ExpertSource,
+        n_slots: usize,
+        loader: LoaderArm,
+        device: &Device,
+        #[cfg(feature = "metal")] staging: Option<
+            lloom_tensor::kernels::metal::staging::SharedStagingRing,
+        >,
+        #[cfg(not(feature = "metal"))] staging: Option<()>,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "metal"))]
+        let _ = staging;
         let n_experts = gate.n_experts();
         if up.n_experts() != n_experts || down.n_experts() != n_experts {
             lloom_tensor::bail!(
@@ -493,10 +561,11 @@ impl Streamed {
                 s.io = Some(q.open(&s.path).map_err(lloom_tensor::Error::wrap)?);
             }
         }
+        // Persistent storage of known geometry: never a pool bucket.
         let pool = |s: &ExpertSource| -> Result<SlotPool> {
             let (n, k) = s.dims();
             Ok(SlotPool {
-                qt: QTensor::zeros((n_slots, n, k), s.dtype(), device)?,
+                qt: QTensor::zeros_persistent((n_slots, n, k), s.dtype(), device)?,
                 plane_bytes: s.plane_bytes(),
             })
         };
@@ -508,6 +577,8 @@ impl Streamed {
                 map: ResidencyMap::new(n_experts, n_slots),
                 loader,
                 device: device.clone(),
+                #[cfg(feature = "metal")]
+                staging,
             }),
             counters: StreamCounters::default(),
             n_experts,
@@ -540,6 +611,42 @@ impl Streamed {
             .iter()
             .map(|p| p.qt.storage_size_in_bytes())
             .sum()
+    }
+
+    /// The staging ring's `(buffers, bytes, allocations, reuses, overflows)`
+    /// — zeros where there is no ring (the CPU, the io arm).
+    pub fn staging_stats(&self) -> StagingStats {
+        #[cfg(feature = "metal")]
+        {
+            let inner = self.inner.lock();
+            if let Some(r) = &inner.staging {
+                let r = r.lock();
+                let (a, u, o) = r.counters();
+                return StagingStats {
+                    buffers: r.len(),
+                    bytes: r.bytes(),
+                    allocations: a,
+                    reuses: u,
+                    overflows: o,
+                };
+            }
+        }
+        StagingStats::default()
+    }
+
+    /// An identity for the staging ring, shared rings equal — so a model
+    /// reports a ring once, not once per layer.
+    pub fn staging_id(&self) -> Option<usize> {
+        #[cfg(feature = "metal")]
+        {
+            let inner = self.inner.lock();
+            inner
+                .staging
+                .as_ref()
+                .map(|r| std::sync::Arc::as_ptr(r) as usize)
+        }
+        #[cfg(not(feature = "metal"))]
+        None
     }
 
     /// Load `experts` and pin them: they are never evicted until
@@ -616,10 +723,28 @@ impl Streamed {
         let mut bytes = 0u64;
         match inner.loader.clone() {
             LoaderArm::Pread => {
+                #[cfg(feature = "metal")]
+                let Inner {
+                    pools,
+                    sources,
+                    staging,
+                    ..
+                } = inner;
+                #[cfg(not(feature = "metal"))]
                 let Inner { pools, sources, .. } = inner;
                 for (pool, src) in pools.iter_mut().zip(sources.iter()) {
                     let plane = pool.plane_bytes;
                     for &(e, s) in misses {
+                        #[cfg(feature = "metal")]
+                        if let Some(ring) = staging.as_ref() {
+                            let mut ring = ring.lock();
+                            pool.qt
+                                .write_with_ring(s * plane, plane, &mut ring, &mut |dst| {
+                                    src.read_plane(e, dst)
+                                })?;
+                            bytes += plane as u64;
+                            continue;
+                        }
                         pool.qt
                             .write_with(s * plane, plane, &mut |dst| src.read_plane(e, dst))?;
                         bytes += plane as u64;

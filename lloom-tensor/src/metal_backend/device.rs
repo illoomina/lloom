@@ -2288,6 +2288,23 @@ impl MetalDevice {
         )))
     }
 
+    /// A Private buffer of `size` bytes that lives as long as its handle —
+    /// outside every pool, registered in the residency set and unregistered
+    /// when the handle drops. For a persistent structure of known geometry
+    /// (a streamed tier's slot pool) that must not be a pool bucket.
+    pub fn new_persistent_private(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+        let buffer = self
+            .device
+            .new_buffer(size.max(1), PRIVATE_RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&buffer);
+        Ok(Arc::new(PooledBuffer::unpooled_resident(
+            buffer,
+            size,
+            Arc::clone(&self.residency_set),
+        )))
+    }
+
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<PooledBuffer>> {
         let unpooled_uploads = Self::unpooled;
         let size = core::mem::size_of_val(data);

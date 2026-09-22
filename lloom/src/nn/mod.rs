@@ -66,7 +66,9 @@ pub use decode::{
     PassWidths, PrefillOut, RoundStats, StepPhases, FIRST_STEPS_TRACED,
 };
 pub use embedding::{embedding, Embedding};
-pub use expert_stream::{ExpertResidency, ExpertSource, LoaderArm, Resident, RoutedGroup, Streamed};
+pub use expert_stream::{
+    ExpertResidency, ExpertSource, LoaderArm, Resident, RoutedGroup, StagingStats, Streamed,
+};
 pub use func::{func, func_t, Func, FuncT};
 pub use group_norm::{group_norm, GroupNorm};
 pub use init::Init;

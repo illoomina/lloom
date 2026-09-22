@@ -188,6 +188,13 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     prompt_split: Vec<usize>,
 
+    /// Print, per generated step, the argmax, the runner-up and their logit
+    /// margin (`MARGIN` lines): the discriminator for a token digest that
+    /// moved between two arms — a flip at a near-tie is rounding, a flip at
+    /// a wide margin is a defect (§2.3.5a).
+    #[arg(long)]
+    margins: bool,
+
     /// Print per-layer activation statistics (finite count, max |x|, mean |x|)
     /// of the HC carry for the FIRST prompt token, through the observer seam,
     /// plus the final logits' statistics. A bisection aid, not a gate.
@@ -558,6 +565,25 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         }
         for _ in 0..args.max_tokens {
             let next = argmax(&logits)?;
+            if args.margins {
+                let v = logits.flatten_all()?.to_vec1::<f32>()?;
+                let (mut b1, mut i1, mut b2, mut i2) = (f32::MIN, 0usize, f32::MIN, 0usize);
+                for (i, &x) in v.iter().enumerate() {
+                    if x > b1 {
+                        b2 = b1;
+                        i2 = i1;
+                        b1 = x;
+                        i1 = i;
+                    } else if x > b2 {
+                        b2 = x;
+                        i2 = i;
+                    }
+                }
+                println!(
+                    "MARGIN run={run} step={step_no} argmax={i1} second={i2} margin={:.4} top={b1:.4}",
+                    b1 - b2
+                );
+            }
             if eos_ids.contains(&next) {
                 hit_eos = true;
                 break;

@@ -103,16 +103,23 @@ impl<R: ExpertResidency> MoeLayer<R> {
         let topk = self.n_experts_per_tok;
         let x1 = x.reshape((seq, hidden))?; // [seq, hidden]
 
-        // Router: softmax over all experts, then top-k select + renormalize.
+        // Router: softmax over all experts, then top-k select + renormalize —
+        // one launch on Metal (`kernels::MoeTopk`), the composed six elsewhere.
         let logits = self.router.forward(&x1)?.to_dtype(DType::F32)?; // [seq, n_experts]
         super::trace("moe.logits", usize::MAX, &logits);
-        let probs = ops::softmax_last_dim(&logits)?; // [seq, n_experts]
-        let ids = probs
-            .arg_sort_last_dim(false)?
-            .narrow(D::Minus1, 0, topk)?
-            .contiguous()?; // [seq, topk] u32
-        let w = probs.gather(&ids, D::Minus1)?; // [seq, topk]
-        let w = w.broadcast_div(&w.sum_keepdim(D::Minus1)?)?;
+        let (ids, w) = match super::kernels::moe_topk(&logits, topk) {
+            Some(r) => r?,
+            None => {
+                let probs = ops::softmax_last_dim(&logits)?; // [seq, n_experts]
+                let ids = probs
+                    .arg_sort_last_dim(false)?
+                    .narrow(D::Minus1, 0, topk)?
+                    .contiguous()?; // [seq, topk] u32
+                let w = probs.gather(&ids, D::Minus1)?; // [seq, topk]
+                let w = w.broadcast_div(&w.sum_keepdim(D::Minus1)?)?;
+                (ids, w)
+            }
+        };
         if super::trace_enabled() {
             eprintln!(
                 "TRACE moe.ids={:?} w={:?}",
@@ -138,7 +145,10 @@ impl<R: ExpertResidency> MoeLayer<R> {
             let (g, u) = self.experts.gate_up(&xg, &slot_ids)?; // [rows, topk, n_ff] each
             super::trace("moe.g", usize::MAX, &g);
             super::trace("moe.u", usize::MAX, &u);
-            let h = (ops::silu(&g)? * u)?;
+            let h = match super::kernels::silu_mul(&g, &u) {
+                Some(h) => h?,
+                None => (ops::silu(&g)? * u)?,
+            };
             ys.push(self.experts.down(&h, &slot_ids)?); // [rows, topk, hidden]
         }
         let y = if ys.len() == 1 {
@@ -147,27 +157,39 @@ impl<R: ExpertResidency> MoeLayer<R> {
             Tensor::cat(&ys, 0)?
         };
         super::trace("moe.y", usize::MAX, &y);
-        let routed = y
-            .to_dtype(DType::F32)?
-            .broadcast_mul(&w.reshape((seq, topk, 1))?)?
-            .sum(1)?
-            .to_dtype(x1.dtype())?; // [seq, hidden]
 
         // Shared expert: SwiGLU gated by sigmoid(sh_router·x), always on.
         let shared = swiglu(&x1, &self.sh_gate, &self.sh_up, &self.sh_down)?;
-        let sh_gate_v = ops::sigmoid(&self.sh_router.forward(&x1)?.to_dtype(shared.dtype())?)?; // [seq, 1]
-        let shared = shared.broadcast_mul(&sh_gate_v)?;
+        let sh_logit = self.sh_router.forward(&x1)?.to_dtype(shared.dtype())?; // [seq, 1]
 
-        let out = (routed + shared)?;
+        // The routed combine over the top-k plus the gated shared expert: one
+        // launch on Metal (`kernels::MoeCombine`), the composed five elsewhere.
+        let y32 = y.to_dtype(DType::F32)?;
+        let out = match super::kernels::moe_combine(&y32, &w, &shared, &sh_logit, topk, hidden) {
+            Some(o) => o?.to_dtype(x1.dtype())?,
+            None => {
+                let routed = y32
+                    .broadcast_mul(&w.reshape((seq, topk, 1))?)?
+                    .sum(1)?
+                    .to_dtype(x1.dtype())?; // [seq, hidden]
+                let sh_gate_v = ops::sigmoid(&sh_logit)?;
+                let shared = shared.broadcast_mul(&sh_gate_v)?;
+                (routed + shared)?
+            }
+        };
         out.reshape((1, seq, hidden))
     }
 }
 
 /// SwiGLU: `down( silu(gate(x)) * up(x) )`.
 fn swiglu(x: &Tensor, gate: &QMatMul, up: &QMatMul, down: &QMatMul) -> Result<Tensor> {
-    let g = ops::silu(&gate.forward(x)?)?;
+    let g = gate.forward(x)?;
     let u = up.forward(x)?;
-    down.forward(&(g * u)?)
+    let h = match super::kernels::silu_mul(&g, &u) {
+        Some(h) => h?,
+        None => (ops::silu(&g)? * u)?,
+    };
+    down.forward(&h)
 }
 
 #[cfg(test)]

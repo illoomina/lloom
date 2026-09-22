@@ -76,7 +76,8 @@ impl lloom_tensor::CustomOp1 for UnitLowerInverse {
 /// Whether the fused inverse serves `a`: Metal, f32, contiguous, square.
 pub(crate) fn unit_lower_inverse_applies(a: &Tensor) -> bool {
     let dims = a.dims();
-    a.device().is_metal()
+    !fused_off()
+        && a.device().is_metal()
         && a.dtype() == lloom_tensor::DType::F32
         && a.is_contiguous()
         && dims.len() >= 2
@@ -85,4 +86,658 @@ pub(crate) fn unit_lower_inverse_applies(a: &Tensor) -> bool {
 
 pub(crate) fn unit_lower_inverse(a: &Tensor) -> Result<Tensor> {
     a.apply_op1_no_bwd(&UnitLowerInverse)
+}
+
+// ---- HyperConnection brackets ---------------------------------------------------
+
+#[cfg(feature = "metal")]
+fn metal_bo<'a>(
+    st: &'a lloom_tensor::MetalStorage,
+    l: &Layout,
+) -> lloom_tensor::kernels::BufferOffset<'a> {
+    use lloom_tensor::backend::BackendStorage;
+    lloom_tensor::kernels::BufferOffset {
+        buffer: st.buffer(),
+        offset_in_bytes: l.start_offset() * st.dtype().size_in_bytes(),
+    }
+}
+
+/// `QWEN4EXP_FUSED_OFF=1` (read once): every fused op declines and the
+/// composed path runs — the A/B arm for the fused kernels, an instrument
+/// behind a gate (§3.3a), never the shipping path.
+pub(crate) fn fused_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("QWEN4EXP_FUSED_OFF").is_some())
+}
+
+/// A fused op serves a carry-shaped f32 tensor on Metal when it is
+/// contiguous; the composed path takes everything else.
+fn fused_applies(t: &Tensor) -> bool {
+    !fused_off()
+        && t.device().is_metal()
+        && t.dtype() == lloom_tensor::DType::F32
+        && t.is_contiguous()
+}
+
+/// The grouped RMS norm `x [.., n·d] · rsqrt(mean_d(x²) + eps) · γ[n·d]`.
+pub(crate) struct HcNorm {
+    pub n: usize,
+    pub d: usize,
+    pub eps: f32,
+}
+
+impl lloom_tensor::CustomOp2 for HcNorm {
+    fn name(&self) -> &'static str {
+        "qwen4exp-hc-norm"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("hc_norm: no cpu kernel; `hc::grouped_rms_norm` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let nd = self.n * self.d;
+        if l1.dims().last() != Some(&nd) || l2.shape().elem_count() != nd {
+            lloom_tensor::bail!(
+                "hc_norm: x {:?} / gamma {:?} vs n·d {nd}",
+                l1.shape(),
+                l2.shape()
+            )
+        }
+        if !l1.is_contiguous() || !l2.is_contiguous() {
+            lloom_tensor::bail!("hc_norm: contiguous inputs only")
+        }
+        let rows = l1.shape().elem_count() / nd;
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("hc_norm");
+        let elem_count = l1.shape().elem_count();
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("hc_norm")
+            .build()?;
+        lloom_tensor::kernels::call_hc_norm(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            self.n,
+            self.d,
+            self.eps,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            l1.shape().clone(),
+        ))
+    }
+}
+
+/// `mean_s(xn · gate)` over the `n` streams: `[.., n·d] → [.., d]`.
+pub(crate) struct HcCollapse {
+    pub n: usize,
+    pub d: usize,
+}
+
+impl lloom_tensor::CustomOp2 for HcCollapse {
+    fn name(&self) -> &'static str {
+        "qwen4exp-hc-collapse"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("hc_collapse: no cpu kernel; `HyperConnection::mix` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let nd = self.n * self.d;
+        if l1.dims().last() != Some(&nd) || l1.shape() != l2.shape() {
+            lloom_tensor::bail!(
+                "hc_collapse: xn {:?} / gate {:?} vs n·d {nd}",
+                l1.shape(),
+                l2.shape()
+            )
+        }
+        if !l1.is_contiguous() || !l2.is_contiguous() {
+            lloom_tensor::bail!("hc_collapse: contiguous inputs only")
+        }
+        let rows = l1.shape().elem_count() / nd;
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("hc_collapse");
+        let elem_count = rows * self.d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("hc_collapse")
+            .build()?;
+        lloom_tensor::kernels::call_hc_collapse(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            self.n,
+            self.d,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        let mut dims = l1.dims().to_vec();
+        *dims.last_mut().unwrap() = self.d;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from(dims),
+        ))
+    }
+}
+
+/// `h + bo ⊗ 2·sigmoid(inject / n)`: `[.., n·d]`, `[.., d]`, `[.., n]` → `[.., n·d]`.
+pub(crate) struct HcCombine {
+    pub n: usize,
+    pub d: usize,
+}
+
+impl lloom_tensor::CustomOp3 for HcCombine {
+    fn name(&self) -> &'static str {
+        "qwen4exp-hc-combine"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!(
+            "hc_combine: no cpu kernel; `HyperConnection::combine` composes it there"
+        )
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let nd = self.n * self.d;
+        if l1.dims().last() != Some(&nd)
+            || l2.dims().last() != Some(&self.d)
+            || l3.dims().last() != Some(&self.n)
+        {
+            lloom_tensor::bail!(
+                "hc_combine: h {:?} / bo {:?} / inject {:?} vs n {} d {}",
+                l1.shape(),
+                l2.shape(),
+                l3.shape(),
+                self.n,
+                self.d
+            )
+        }
+        if !l1.is_contiguous() || !l2.is_contiguous() || !l3.is_contiguous() {
+            lloom_tensor::bail!("hc_combine: contiguous inputs only")
+        }
+        let rows = l1.shape().elem_count() / nd;
+        if l2.shape().elem_count() != rows * self.d || l3.shape().elem_count() != rows * self.n {
+            lloom_tensor::bail!("hc_combine: row counts differ")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("hc_combine");
+        let elem_count = l1.shape().elem_count();
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("hc_combine")
+            .build()?;
+        lloom_tensor::kernels::call_hc_combine(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            self.n,
+            self.d,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            l1.shape().clone(),
+        ))
+    }
+}
+
+/// The fused grouped norm, or `None` where the composed path applies.
+pub(crate) fn hc_norm(
+    x: &Tensor,
+    gamma: &Tensor,
+    n: usize,
+    d: usize,
+    eps: f32,
+) -> Option<Result<Tensor>> {
+    (fused_applies(x) && gamma.is_contiguous() && gamma.dtype() == lloom_tensor::DType::F32)
+        .then(|| x.apply_op2_no_bwd(gamma, &HcNorm { n, d, eps }))
+}
+
+pub(crate) fn hc_collapse(
+    xn: &Tensor,
+    gate: &Tensor,
+    n: usize,
+    d: usize,
+) -> Option<Result<Tensor>> {
+    (fused_applies(xn) && fused_applies(gate))
+        .then(|| xn.apply_op2_no_bwd(gate, &HcCollapse { n, d }))
+}
+
+pub(crate) fn hc_combine(
+    h: &Tensor,
+    bo: &Tensor,
+    inject: &Tensor,
+    n: usize,
+    d: usize,
+) -> Option<Result<Tensor>> {
+    (fused_applies(h) && fused_applies(bo) && fused_applies(inject))
+        .then(|| h.apply_op3_no_bwd(bo, inject, &HcCombine { n, d }))
+}
+
+// ---- Mixture of experts ------------------------------------------------------------
+
+/// The router's top-`k`: from `logits [.., n_experts]` the ids `[.., k]` u32
+/// (the op's output) and their renormalised softmax weights, written into
+/// `w` (`[.., k]` f32, the caller's, allocated ahead).
+pub(crate) struct MoeTopk {
+    pub k: usize,
+    pub w: Tensor,
+}
+
+impl lloom_tensor::CustomOp1 for MoeTopk {
+    fn name(&self) -> &'static str {
+        "qwen4exp-moe-topk"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("moe_topk: no cpu kernel; `MoeLayer::forward` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let dims = l.dims();
+        let n_experts = *dims.last().unwrap_or(&0);
+        if !l.is_contiguous() || n_experts == 0 {
+            lloom_tensor::bail!("moe_topk: contiguous logits only")
+        }
+        let rows = l.shape().elem_count() / n_experts;
+        let (ws, wl) = self.w.storage_and_layout();
+        let ws = match &*ws {
+            lloom_tensor::Storage::Metal(m) => m,
+            _ => lloom_tensor::bail!("moe_topk: the weight output must be on the metal device"),
+        };
+        if wl.shape().elem_count() != rows * self.k || !wl.is_contiguous() || wl.start_offset() != 0
+        {
+            lloom_tensor::bail!("moe_topk: w must be a fresh contiguous [rows, k]")
+        }
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("moe_topk");
+        let elem_count = rows * self.k;
+        let ids = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::U32)
+            .with_label("moe_topk_ids")
+            .build()?;
+        lloom_tensor::kernels::call_moe_topk(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            n_experts,
+            self.k,
+            metal_bo(s, l),
+            &ids,
+            ws.buffer(),
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        let mut out_dims = dims.to_vec();
+        *out_dims.last_mut().unwrap() = self.k;
+        Ok((
+            lloom_tensor::MetalStorage::new(
+                ids,
+                device.clone(),
+                elem_count,
+                lloom_tensor::DType::U32,
+            ),
+            Shape::from(out_dims),
+        ))
+    }
+}
+
+/// `silu(g) · u`, elementwise.
+pub(crate) struct SiluMul;
+
+impl lloom_tensor::CustomOp2 for SiluMul {
+    fn name(&self) -> &'static str {
+        "qwen4exp-silu-mul"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("silu_mul: no cpu kernel; `silu(g) * u` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        if l1.shape() != l2.shape() || !l1.is_contiguous() || !l2.is_contiguous() {
+            lloom_tensor::bail!("silu_mul: same-shape contiguous inputs only")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("silu_mul");
+        let elem_count = l1.shape().elem_count();
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("silu_mul")
+            .build()?;
+        lloom_tensor::kernels::call_silu_mul(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            elem_count,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            l1.shape().clone(),
+        ))
+    }
+}
+
+/// `Σ_k w · y + shared · sigmoid(gate)`: `y [.., k, d]`, `w [.., k]`,
+/// `shared [.., d]`, `gate [.., 1]` (captured) → `[.., d]`.
+pub(crate) struct MoeCombine {
+    pub k: usize,
+    pub d: usize,
+    pub gate: Tensor,
+}
+
+impl lloom_tensor::CustomOp3 for MoeCombine {
+    fn name(&self) -> &'static str {
+        "qwen4exp-moe-combine"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("moe_combine: no cpu kernel; `MoeLayer::forward` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let rows = l3.shape().elem_count() / self.d;
+        if !l1.is_contiguous() || !l2.is_contiguous() || !l3.is_contiguous() {
+            lloom_tensor::bail!("moe_combine: contiguous inputs only")
+        }
+        if l1.shape().elem_count() != rows * self.k * self.d
+            || l2.shape().elem_count() != rows * self.k
+            || l3.shape().elem_count() != rows * self.d
+        {
+            lloom_tensor::bail!(
+                "moe_combine: y {:?} w {:?} shared {:?} vs k {} d {}",
+                l1.shape(),
+                l2.shape(),
+                l3.shape(),
+                self.k,
+                self.d
+            )
+        }
+        let (gs, gl) = self.gate.storage_and_layout();
+        let gs = match &*gs {
+            lloom_tensor::Storage::Metal(m) => m,
+            _ => lloom_tensor::bail!("moe_combine: the gate must be on the metal device"),
+        };
+        if gl.shape().elem_count() != rows || !gl.is_contiguous() {
+            lloom_tensor::bail!("moe_combine: gate must be a contiguous [rows]")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("moe_combine");
+        let elem_count = rows * self.d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("moe_combine")
+            .build()?;
+        lloom_tensor::kernels::call_moe_combine(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            self.k,
+            self.d,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            metal_bo(gs, &gl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            l3.shape().clone(),
+        ))
+    }
+}
+
+/// The fused router selection: `(ids [.., k] u32, w [.., k] f32)`, or `None`
+/// where the composed path applies.
+pub(crate) fn moe_topk(logits: &Tensor, k: usize) -> Option<Result<(Tensor, Tensor)>> {
+    if !fused_applies(logits) || logits.rank() < 1 {
+        return None;
+    }
+    let n_experts = logits.dim(logits.rank() - 1).ok()?;
+    if n_experts > 1024 || k == 0 || k > n_experts {
+        return None;
+    }
+    let mut dims = logits.dims().to_vec();
+    *dims.last_mut().unwrap() = k;
+    Some((|| {
+        let w = Tensor::zeros(dims.as_slice(), lloom_tensor::DType::F32, logits.device())?;
+        let ids = logits.apply_op1_no_bwd(&MoeTopk { k, w: w.clone() })?;
+        Ok((ids, w))
+    })())
+}
+
+pub(crate) fn silu_mul(g: &Tensor, u: &Tensor) -> Option<Result<Tensor>> {
+    (fused_applies(g) && fused_applies(u) && g.shape() == u.shape())
+        .then(|| g.apply_op2_no_bwd(u, &SiluMul))
+}
+
+pub(crate) fn moe_combine(
+    y: &Tensor,
+    w: &Tensor,
+    shared: &Tensor,
+    gate: &Tensor,
+    k: usize,
+    d: usize,
+) -> Option<Result<Tensor>> {
+    (fused_applies(y) && fused_applies(w) && fused_applies(shared) && fused_applies(gate)).then(
+        || {
+            y.apply_op3_no_bwd(
+                w,
+                shared,
+                &MoeCombine {
+                    k,
+                    d,
+                    gate: gate.clone(),
+                },
+            )
+        },
+    )
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod tests {
+    use super::*;
+    use crate::nn::ops;
+    use lloom_tensor::{Device, D};
+
+    fn vals(n: usize, seed: f32, scale: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((i as f32 * 0.0173 + seed).sin() * 7.1).cos() * scale)
+            .collect()
+    }
+
+    fn close(name: &str, a: &Tensor, b: &Tensor, tol: f32) {
+        let x: Vec<f32> = a
+            .flatten_all()
+            .unwrap()
+            .to_dtype(lloom_tensor::DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let y: Vec<f32> = b
+            .flatten_all()
+            .unwrap()
+            .to_dtype(lloom_tensor::DType::F32)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(x.len(), y.len(), "{name}: lengths");
+        let scale = y.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+        let diff = x
+            .iter()
+            .zip(&y)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            diff <= tol * scale,
+            "{name}: max diff {diff} at scale {scale}"
+        );
+        assert!(scale > 1e-3, "{name}: degenerate");
+    }
+
+    /// The router's fused top-k picks the ids the composed sort picks and
+    /// renormalises their weights the same way, at the real width (512
+    /// experts, top 10) over several rows.
+    #[test]
+    fn moe_topk_matches_the_composed_selection() {
+        let dev = Device::new_metal(0).unwrap();
+        let (rows, e, k) = (3usize, 512usize, 10usize);
+        let logits = Tensor::from_vec(vals(rows * e, 0.3, 3.0), (rows, e), &dev).unwrap();
+        let (ids, w) = moe_topk(&logits, k).expect("metal f32").unwrap();
+        let probs = ops::softmax_last_dim(&logits).unwrap();
+        let ids_ref = probs
+            .arg_sort_last_dim(false)
+            .unwrap()
+            .narrow(D::Minus1, 0, k)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        let w_ref = probs.gather(&ids_ref, D::Minus1).unwrap();
+        let w_ref = w_ref
+            .broadcast_div(&w_ref.sum_keepdim(D::Minus1).unwrap())
+            .unwrap();
+        let a: Vec<u32> = ids.flatten_all().unwrap().to_vec1().unwrap();
+        let b: Vec<u32> = ids_ref.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(a, b, "the selected experts differ");
+        close("weights", &w, &w_ref, 1e-5);
+        let ws: Vec<f32> = w.flatten_all().unwrap().to_vec1().unwrap();
+        for r in 0..rows {
+            let s: f32 = ws[r * k..(r + 1) * k].iter().sum();
+            assert!((s - 1.0).abs() < 1e-5, "row {r} weights sum {s}");
+        }
+    }
+
+    #[test]
+    fn silu_mul_and_combine_match_composed() {
+        let dev = Device::new_metal(0).unwrap();
+        let n = 3 * 10 * 640;
+        let g = Tensor::from_vec(vals(n, 1.0, 2.0), (3, 10, 640), &dev).unwrap();
+        let u = Tensor::from_vec(vals(n, 2.0, 1.5), (3, 10, 640), &dev).unwrap();
+        let fused = silu_mul(&g, &u).expect("metal f32").unwrap();
+        let composed = (ops::silu(&g).unwrap() * &u).unwrap();
+        close("silu_mul", &fused, &composed, 1e-6);
+
+        let (rows, k, d) = (3usize, 10usize, 2560usize);
+        let y = Tensor::from_vec(vals(rows * k * d, 3.0, 1.0), (rows, k, d), &dev).unwrap();
+        let w = Tensor::from_vec(vals(rows * k, 4.0, 0.3), (rows, k), &dev).unwrap();
+        let shared = Tensor::from_vec(vals(rows * d, 5.0, 0.8), (rows, d), &dev).unwrap();
+        let gate = Tensor::from_vec(vals(rows, 6.0, 2.0), (rows, 1), &dev).unwrap();
+        let fused = moe_combine(&y, &w, &shared, &gate, k, d)
+            .expect("metal f32")
+            .unwrap();
+        let routed = y
+            .broadcast_mul(&w.reshape((rows, k, 1)).unwrap())
+            .unwrap()
+            .sum(1)
+            .unwrap();
+        let composed =
+            (routed + shared.broadcast_mul(&ops::sigmoid(&gate).unwrap()).unwrap()).unwrap();
+        close("moe_combine", &fused, &composed, 1e-5);
+    }
 }

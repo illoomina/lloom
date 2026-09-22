@@ -96,7 +96,12 @@ impl HyperConnection {
     /// `inject = inject·xn`.
     pub fn mix(&self, h: &Tensor) -> Result<(Tensor, Tensor)> {
         let (b, seq, _) = h.dims3()?;
-        let xn = grouped_rms_norm(h, &self.unit_d, &self.norm_w, self.n, self.d, self.eps)?; // [b, seq, n*d]
+        // The grouped norm as one launch on Metal (`kernels::HcNorm`); the
+        // composed pair (`rms_norm` per stream, `broadcast_mul` γ) elsewhere.
+        let xn = match super::kernels::hc_norm(h, &self.norm_w, self.n, self.d, self.eps) {
+            Some(xn) => xn?,
+            None => grouped_rms_norm(h, &self.unit_d, &self.norm_w, self.n, self.d, self.eps)?,
+        }; // [b, seq, n*d]
 
         // Low-rank gate prediction on the normed carry. On Metal at decode
         // row counts the two projections take the mixed arm with the scale
@@ -112,11 +117,17 @@ impl HyperConnection {
             None => ops::sigmoid(&self.up.forward(&lo)?)?,
         }; // [b, seq, n*d]
 
-        // Gate the streams, then collapse them by their mean.
-        let gated = (xn.clone() * gate)?; // [b, seq, n*d]
-        let gated = gated.reshape((b, seq, self.n, self.d))?;
-        let mixed = gated.sum(2)?; // [b, seq, d]
-        let mixed = (mixed * (1.0 / self.n as f64))?;
+        // Gate the streams, then collapse them by their mean: one launch on
+        // Metal (`kernels::HcCollapse`), the composed three elsewhere.
+        let mixed = match super::kernels::hc_collapse(&xn, &gate, self.n, self.d) {
+            Some(m) => m?,
+            None => {
+                let gated = (xn.clone() * &gate)?; // [b, seq, n*d]
+                let gated = gated.reshape((b, seq, self.n, self.d))?;
+                let mixed = gated.sum(2)?; // [b, seq, d]
+                (mixed * (1.0 / self.n as f64))?
+            }
+        };
 
         let inject = match &self.inject {
             Some(inject) => inject.forward(&xn)?, // [b, seq, n]
@@ -132,6 +143,10 @@ impl HyperConnection {
     /// so a zero injection is a plain residual add); `H' = H + broadcast(block_out) · w`.
     pub fn combine(&self, h: &Tensor, block_out: &Tensor, inject: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = h.dims3()?;
+        // One launch on Metal (`kernels::HcCombine`); the composed five elsewhere.
+        if let Some(out) = super::kernels::hc_combine(h, block_out, inject, self.n, self.d) {
+            return out;
+        }
         // Per-stream scatter weight, centred on 1.
         let w = ops::sigmoid(&(inject * (1.0 / self.n as f64))?)?; // [b, seq, n]
         let w = (w * 2.0)?;
@@ -150,6 +165,104 @@ impl HyperConnection {
 mod tests {
     use super::*;
     use lloom_tensor::{DType, Device};
+
+    /// The three fused launches (`hc_norm`, `hc_collapse`, `hc_combine`)
+    /// equal the composed bracket, at the real geometry (n 4, d 2560) on a
+    /// decode row and a 5-row chunk, against the CPU path.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_bracket_matches_composed() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let (n, d, lr) = (4usize, 2560usize, 320usize);
+        let build = |dev: &Device| {
+            let lin = |out: usize, inp: usize, seed: f32| {
+                QMatMul::Tensor(
+                    Tensor::from_vec(
+                        (0..out * inp)
+                            .map(|i| ((i as f32 * 0.0117 + seed).sin()) * 0.03)
+                            .collect::<Vec<_>>(),
+                        (out, inp),
+                        dev,
+                    )
+                    .unwrap(),
+                )
+            };
+            let gamma = Tensor::from_vec(
+                (0..n * d)
+                    .map(|i| 1.0 + 0.1 * ((i as f32) * 0.3).sin())
+                    .collect::<Vec<f32>>(),
+                n * d,
+                dev,
+            )
+            .unwrap();
+            HyperConnection::new(
+                gamma,
+                lin(lr, n * d, 1.0),
+                lin(n * d, lr, 2.0),
+                Some(lin(n, n * d, 3.0)),
+                n,
+                d,
+                1e-6,
+            )
+            .unwrap()
+        };
+        let (hc_cpu, hc_gpu) = (build(&cpu), build(&gpu));
+        for &seq in &[1usize, 5] {
+            let h = Tensor::from_vec(
+                (0..seq * n * d)
+                    .map(|i| ((i as f32 * 0.021).cos()) * 0.8)
+                    .collect::<Vec<f32>>(),
+                (1, seq, n * d),
+                &cpu,
+            )
+            .unwrap();
+            let bo = Tensor::from_vec(
+                (0..seq * d)
+                    .map(|i| ((i as f32 * 0.031).sin()) * 0.5)
+                    .collect::<Vec<f32>>(),
+                (1, seq, d),
+                &cpu,
+            )
+            .unwrap();
+            let (m_cpu, i_cpu) = hc_cpu.mix(&h).unwrap();
+            let (m_gpu, i_gpu) = hc_gpu.mix(&h.to_device(&gpu).unwrap()).unwrap();
+            let c_cpu = hc_cpu.combine(&h, &bo, &i_cpu).unwrap();
+            let c_gpu = hc_gpu
+                .combine(
+                    &h.to_device(&gpu).unwrap(),
+                    &bo.to_device(&gpu).unwrap(),
+                    &i_gpu,
+                )
+                .unwrap();
+            for (name, a, b) in [
+                ("mixed", &m_cpu, &m_gpu),
+                ("inject", &i_cpu, &i_gpu),
+                ("combine", &c_cpu, &c_gpu),
+            ] {
+                let x: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
+                let y: Vec<f32> = b
+                    .to_device(&cpu)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                assert_eq!(x.len(), y.len(), "{name} seq {seq}");
+                let scale = x.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+                let diff = x
+                    .iter()
+                    .zip(&y)
+                    .map(|(p, q)| (p - q).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    diff <= 3e-5 * scale,
+                    "{name} seq {seq}: {diff} at scale {scale}"
+                );
+                assert!(scale > 1e-3, "{name} seq {seq}: degenerate");
+            }
+        }
+    }
 
     fn qmm(rows: usize, cols: usize, dev: &Device) -> QMatMul {
         // A dense (unquantized) weight, the shape a QMatMul::from would hold:

@@ -50,7 +50,10 @@ pub use mlx_gemm::{
     call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_epilogue, call_mlx_gemv_full, call_mlx_gemv_mixed,
     call_mlx_gemv_with, GemmDType, GemvEpilogue, GemvRmsNorm, MixedEpilogue, SKINNY_TILE_MAX_M,
 };
-pub use qwen4exp::call_unit_lower_inverse;
+pub use qwen4exp::{
+    call_gdn_gated_norm, call_gdn_prologue, call_gdn_step, call_hc_collapse, call_hc_combine,
+    call_hc_norm, call_moe_combine, call_moe_topk, call_silu_mul, call_unit_lower_inverse,
+};
 pub use scratch::{
     call_scratch_combine, call_scratch_partials, call_scratch_report, ScratchKernel, ScratchParams,
 };

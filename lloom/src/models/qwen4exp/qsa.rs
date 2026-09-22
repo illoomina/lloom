@@ -334,6 +334,10 @@ pub struct QsaAttention {
     /// The Lightning indexer; without it the layer is dense at every context
     /// (correct only within the dense range).
     indexer: Option<Indexer>,
+    /// The three input stems (`wq | wk | wv`) as one f16 matrix when the
+    /// loader could stack them (the parts above are row views of it): a
+    /// decode step runs one gemv and splits the row.
+    stem_cat: Option<QMatMul>,
 }
 
 impl QsaAttention {
@@ -360,7 +364,15 @@ impl QsaAttention {
             n_rot: (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize,
             rope_theta: cfg.rope_theta,
             indexer: None,
+            stem_cat: None,
         }
+    }
+
+    /// Attach the stacked input stems (`[n_heads·2·head_dim + 2·n_kv_heads·
+    /// head_dim, hidden]` f16, `q | k | v` rows) for the one-gemv decode.
+    pub fn with_stem_cat(mut self, cat: Tensor) -> Self {
+        self.stem_cat = Some(QMatMul::TensorF16(cat));
+        self
     }
 
     /// Attach the layer's Lightning indexer.
@@ -514,9 +526,23 @@ impl QsaAttention {
         }
         let f32 = lloom_tensor::DType::F32;
         let x1 = x.reshape((1, hidden))?;
-        let qg = self.wq.forward(&x1)?.to_dtype(f32)?.reshape((nh, 2 * hd))?;
-        let k = self.wk.forward(&x1)?.to_dtype(f32)?.reshape((nkv, hd))?;
-        let v = self.wv.forward(&x1)?.to_dtype(f32)?.reshape((nkv, 1, hd))?;
+        // One gemv over the stacked stems (the row split `q | k | v`) or three.
+        let (qg, k, v) = match &self.stem_cat {
+            Some(cat) => {
+                let all = cat.forward(&x1)?.to_dtype(f32)?.flatten_all()?;
+                let (nq, nk) = (nh * 2 * hd, nkv * hd);
+                (
+                    all.narrow(0, 0, nq)?.reshape((nh, 2 * hd))?,
+                    all.narrow(0, nq, nk)?.reshape((nkv, hd))?,
+                    all.narrow(0, nq + nk, nk)?.reshape((nkv, 1, hd))?,
+                )
+            }
+            None => (
+                self.wq.forward(&x1)?.to_dtype(f32)?.reshape((nh, 2 * hd))?,
+                self.wk.forward(&x1)?.to_dtype(f32)?.reshape((nkv, hd))?,
+                self.wv.forward(&x1)?.to_dtype(f32)?.reshape((nkv, 1, hd))?,
+            ),
+        };
         let pos = kv.len();
         let prep = qg.apply_op2_no_bwd(
             &k,
@@ -1047,6 +1073,121 @@ mod tests {
         }
         assert_eq!(kv_g.len(), 65);
         println!("qsa prefill fused vs composed worst relative diff: {worst:e}");
+    }
+
+    /// The stacked f16 stems (one gemv, the row split `q | k | v`) decode as
+    /// the three stems do — the same weights as row views of one matrix —
+    /// at the real head geometry over 12 steps.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn stacked_stems_decode_as_the_three_stems() {
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let d = cfg.hidden_size;
+        let (hd, nh, nkv) = (cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
+        let f16 = |out: usize, seed: f32| {
+            Tensor::from_vec(
+                (0..out * d)
+                    .map(|i| ((i as f32 * 0.011 + seed).sin()) * 0.05)
+                    .collect::<Vec<_>>(),
+                (out, d),
+                &gpu,
+            )
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+        };
+        let parts = [
+            f16(nh * hd * 2, 1.0),
+            f16(nkv * hd, 2.0),
+            f16(nkv * hd, 3.0),
+        ];
+        let cat = Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0).unwrap();
+        let mut off = 0;
+        let views: Vec<Tensor> = parts
+            .iter()
+            .map(|p| {
+                let v = cat.narrow(0, off, p.dim(0).unwrap()).unwrap();
+                off += p.dim(0).unwrap();
+                v
+            })
+            .collect();
+        let build = |stack: Option<Tensor>| {
+            let attn = QsaAttention::new(
+                QMatMul::TensorF16(views[0].clone()),
+                QMatMul::TensorF16(views[1].clone()),
+                QMatMul::TensorF16(views[2].clone()),
+                lin(d, nh * hd, 4.0, &gpu),
+                rms(hd, &gpu),
+                rms(hd, &gpu),
+                &cfg,
+            );
+            match stack {
+                Some(c) => attn.with_stem_cat(c),
+                None => attn,
+            }
+        };
+        let (three, one) = (build(None), build(Some(cat.clone())));
+        // Non-vacuity: a stack with the v rows zeroed must decode differently.
+        let zeroed = Tensor::cat(
+            &[
+                &parts[0],
+                &parts[1],
+                &Tensor::zeros(parts[2].shape(), DType::F16, &gpu).unwrap(),
+            ],
+            0,
+        )
+        .unwrap();
+        let bad = build(Some(zeroed));
+        let (mut kv3, mut kv1, mut kvb) =
+            (KvCache::default(), KvCache::default(), KvCache::default());
+        let mut worst = 0f32;
+        for t in 0..12 {
+            let x = Tensor::from_vec(
+                (0..d)
+                    .map(|i| ((i as f32 * 0.05 + t as f32).sin()) * 0.6)
+                    .collect::<Vec<f32>>(),
+                (1, 1, d),
+                &gpu,
+            )
+            .unwrap();
+            let a: Vec<f32> = three
+                .decode(&x, &mut kv3)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let b: Vec<f32> = one
+                .decode(&x, &mut kv1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let bad_out: Vec<f32> = bad
+                .decode(&x, &mut kvb)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_ne!(a, bad_out, "step {t}: the stacked path did not run");
+            assert!(b.iter().all(|v| v.is_finite()), "step {t}: non-finite");
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+            let diff = a
+                .iter()
+                .zip(&b)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(diff / scale);
+            assert!(
+                diff <= 1e-4 * scale,
+                "step {t}: stacked differs by {diff} at {scale}"
+            );
+        }
+        println!("stacked vs three stems worst relative diff: {worst:e}");
     }
 
     /// QSA decodes end to end and its KV grows: shapes thread, output finite, and

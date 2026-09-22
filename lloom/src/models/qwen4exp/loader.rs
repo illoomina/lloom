@@ -261,6 +261,45 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
             _ => QMatMul::from_arc(Arc::new(qt)),
         }
     }
+    /// The named matrices as ONE f16 matrix, rows concatenated in order,
+    /// when every one of them is an f16 stem (`TensorF16`) — the parts come
+    /// back as row VIEWS of it, so a decode step can run the whole stack as
+    /// one gemv and split the output (`GatedDeltaNet::with_stem_cat`,
+    /// `QsaAttention::with_stem_cat`) while every other path keeps its
+    /// part. `None` when any part is quantized (then the parts stand alone).
+    fn qmat_stack(&mut self, names: &[String]) -> Result<(Vec<QMatMul>, Option<Tensor>)> {
+        let parts: Vec<QMatMul> = names.iter().map(|n| self.qmat(n)).collect::<Result<_>>()?;
+        let f16: Vec<&Tensor> = parts
+            .iter()
+            .filter_map(|p| match p {
+                QMatMul::TensorF16(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        if std::env::var("QWEN4EXP_TRACE_LOAD").is_ok() {
+            let kinds: Vec<String> = parts
+                .iter()
+                .map(|p| match p {
+                    QMatMul::TensorF16(_) => "f16".to_string(),
+                    QMatMul::Tensor(_) => "f32".to_string(),
+                    QMatMul::QTensor(q) => format!("{:?}", q.dtype()),
+                })
+                .collect();
+            eprintln!("STACK {names:?} kinds={kinds:?}");
+        }
+        if f16.len() != parts.len() {
+            return Ok((parts, None));
+        }
+        let cat = Tensor::cat(&f16, 0)?;
+        let mut views = Vec::with_capacity(parts.len());
+        let mut off = 0;
+        for t in &f16 {
+            let rows = t.dim(0)?;
+            views.push(QMatMul::TensorF16(cat.narrow(0, off, rows)?));
+            off += rows;
+        }
+        Ok((views, Some(cat)))
+    }
     /// A quantized matrix kept packed whatever its type (the routed expert
     /// stacks and the embedding table, which must not be expanded).
     fn packed(&mut self, name: &str) -> Result<Arc<QTensor>> {
@@ -695,18 +734,52 @@ fn load_layer<R: ExpertResidency, Rd: Read + Seek>(
     let hc_attn = load_hc(gg, &format!("{p}.hc_attn"), true, cfg)?;
     let hc_ffn = load_hc(gg, &format!("{p}.hc_ffn"), true, cfg)?;
     let mixer = match kind {
-        LayerKind::Linear => Mixer::Linear(GatedDeltaNet::new(
-            gg.qmat(&format!("{p}.attn_qkv.weight"))?,
-            gg.qmat(&format!("{p}.attn_gate.weight"))?,
-            gg.f32(&format!("{p}.ssm_conv1d.weight"))?,
-            gg.f32(&format!("{p}.ssm_a"))?,
-            gg.f32(&format!("{p}.ssm_dt.bias"))?,
-            gg.qmat(&format!("{p}.ssm_alpha.weight"))?,
-            gg.qmat(&format!("{p}.ssm_beta.weight"))?,
-            gg.f32(&format!("{p}.ssm_norm.weight"))?,
-            gg.qmat(&format!("{p}.ssm_out.weight"))?,
-            cfg,
-        )),
+        LayerKind::Linear => {
+            let (mut stems, cat) = gg.qmat_stack(&[
+                format!("{p}.attn_qkv.weight"),
+                format!("{p}.attn_gate.weight"),
+                format!("{p}.ssm_alpha.weight"),
+                format!("{p}.ssm_beta.weight"),
+            ])?;
+            let mut ssm_beta = stems.pop().expect("four stems");
+            let mut ssm_alpha = stems.pop().expect("four stems");
+            let gate = stems.pop().expect("four stems");
+            let wqkv = stems.pop().expect("four stems");
+            // The projections are quantized per tensor in this checkpoint
+            // (`attn_qkv` / `attn_gate` IQ4_XS and friends, differing by
+            // layer), so the four rarely stack; the two gate stems (α, β —
+            // BF16 in the checkpoint, f16 here) always do.
+            let ab_cat = if cat.is_none() {
+                let (mut ab, ab_cat) = gg.qmat_stack(&[
+                    format!("{p}.ssm_alpha.weight"),
+                    format!("{p}.ssm_beta.weight"),
+                ])?;
+                if ab_cat.is_some() {
+                    ssm_beta = ab.pop().expect("two stems");
+                    ssm_alpha = ab.pop().expect("two stems");
+                }
+                ab_cat
+            } else {
+                None
+            };
+            let block = GatedDeltaNet::new(
+                wqkv,
+                gate,
+                gg.f32(&format!("{p}.ssm_conv1d.weight"))?,
+                gg.f32(&format!("{p}.ssm_a"))?,
+                gg.f32(&format!("{p}.ssm_dt.bias"))?,
+                ssm_alpha,
+                ssm_beta,
+                gg.f32(&format!("{p}.ssm_norm.weight"))?,
+                gg.qmat(&format!("{p}.ssm_out.weight"))?,
+                cfg,
+            );
+            Mixer::Linear(match (cat, ab_cat) {
+                (Some(cat), _) => block.with_stem_cat(cat),
+                (None, Some(ab)) => block.with_gate_stems_cat(ab),
+                (None, None) => block,
+            })
+        }
         LayerKind::Full => {
             let indexer = Indexer::new(
                 gg.qmat(&format!("{p}.indexer.q_proj.weight"))?,
@@ -715,18 +788,28 @@ fn load_layer<R: ExpertResidency, Rd: Read + Seek>(
                 RmsNorm::new(gg.f32(&format!("{p}.indexer.k_norm.weight"))?, cfg.norm_eps),
                 cfg,
             )?;
-            Mixer::Full(
-                QsaAttention::new(
-                    gg.qmat(&format!("{p}.attn_q.weight"))?,
-                    gg.qmat(&format!("{p}.attn_k.weight"))?,
-                    gg.qmat(&format!("{p}.attn_v.weight"))?,
-                    gg.qmat(&format!("{p}.attn_output.weight"))?,
-                    RmsNorm::new(gg.f32(&format!("{p}.attn_q_norm.weight"))?, cfg.norm_eps),
-                    RmsNorm::new(gg.f32(&format!("{p}.attn_k_norm.weight"))?, cfg.norm_eps),
-                    cfg,
-                )
-                .with_indexer(indexer),
+            let (mut stems, cat) = gg.qmat_stack(&[
+                format!("{p}.attn_q.weight"),
+                format!("{p}.attn_k.weight"),
+                format!("{p}.attn_v.weight"),
+            ])?;
+            let wv = stems.pop().expect("three stems");
+            let wk = stems.pop().expect("three stems");
+            let wq = stems.pop().expect("three stems");
+            let attn = QsaAttention::new(
+                wq,
+                wk,
+                wv,
+                gg.qmat(&format!("{p}.attn_output.weight"))?,
+                RmsNorm::new(gg.f32(&format!("{p}.attn_q_norm.weight"))?, cfg.norm_eps),
+                RmsNorm::new(gg.f32(&format!("{p}.attn_k_norm.weight"))?, cfg.norm_eps),
+                cfg,
             )
+            .with_indexer(indexer);
+            Mixer::Full(match cat {
+                Some(cat) => attn.with_stem_cat(cat),
+                None => attn,
+            })
         }
     };
     let sh_router = gg

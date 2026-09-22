@@ -582,7 +582,7 @@ impl lloom_tensor::CustomOp3 for MoeCombine {
             metal_bo(s1, l1),
             metal_bo(s2, l2),
             metal_bo(s3, l3),
-            metal_bo(gs, &gl),
+            metal_bo(gs, gl),
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
@@ -814,8 +814,8 @@ impl lloom_tensor::CustomOp1 for GdnPrologue {
             self.eps,
             self.q_scale,
             metal_bo(s, l),
-            metal_bo(ws, &wl),
-            metal_bo(ns, &nl),
+            metal_bo(ws, wl),
+            metal_bo(ns, nl),
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
@@ -915,9 +915,9 @@ impl lloom_tensor::CustomOp3 for GdnStep {
             metal_bo(s1, l1),
             metal_bo(s2, l2),
             metal_bo(s3, l3),
-            metal_bo(bs, &bl),
-            metal_bo(as_, &al),
-            metal_bo(ss, &sl),
+            metal_bo(bs, bl),
+            metal_bo(as_, al),
+            metal_bo(ss, sl),
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
@@ -1087,8 +1087,8 @@ impl lloom_tensor::CustomOp2 for QsaPrep {
             self.eps,
             metal_bo(s1, l1),
             metal_bo(s2, l2),
-            metal_bo(qs, &ql),
-            metal_bo(ks, &kl),
+            metal_bo(qs, ql),
+            metal_bo(ks, kl),
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
@@ -1159,4 +1159,646 @@ impl lloom_tensor::CustomOp2 for SigmoidMul {
 pub(crate) fn sigmoid_mul(a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
     (fused_applies(a) && fused_applies(b) && a.elem_count() == b.elem_count())
         .then(|| a.apply_op2_no_bwd(b, &SigmoidMul))
+}
+
+// ---- DeltaNet prefill (Kernel B) ---------------------------------------------------
+
+#[cfg(feature = "metal")]
+fn metal_pair<'a>(
+    a: &'a lloom_tensor::Storage,
+    b: &'a lloom_tensor::Storage,
+    what: &str,
+) -> Result<(
+    &'a lloom_tensor::MetalStorage,
+    &'a lloom_tensor::MetalStorage,
+)> {
+    match (a, b) {
+        (lloom_tensor::Storage::Metal(a), lloom_tensor::Storage::Metal(b)) => Ok((a, b)),
+        _ => lloom_tensor::bail!("{what}: the captured tensors must be on the metal device"),
+    }
+}
+
+/// `alpha`, `beta_raw` `[seq, h_v]` → `[2, h_v, nc, cs]` (g, β), zero past `seq`.
+pub(crate) struct GdnGate {
+    pub seq: usize,
+    pub h_v: usize,
+    pub nc: usize,
+    pub cs: usize,
+    pub dt_bias: Tensor,
+    pub ssm_a: Tensor,
+}
+
+impl lloom_tensor::CustomOp2 for GdnGate {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-gate"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_gate: no cpu kernel; `gate_and_beta` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let n = self.seq * self.h_v;
+        if l1.shape().elem_count() != n
+            || l2.shape().elem_count() != n
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_gate: alpha / beta must be contiguous [seq, h_v]")
+        }
+        let (ds, dl) = self.dt_bias.storage_and_layout();
+        let (as_, al) = self.ssm_a.storage_and_layout();
+        let (ds, as_) = metal_pair(&ds, &as_, "gdn_gate")?;
+        if dl.shape().elem_count() != self.h_v || al.shape().elem_count() != self.h_v {
+            lloom_tensor::bail!("gdn_gate: dt_bias / ssm_a must be [h_v]")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_gate");
+        let elem_count = 2 * self.h_v * self.nc * self.cs;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_gate")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_gate(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            self.seq,
+            self.h_v,
+            self.nc,
+            self.cs,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(ds, dl),
+            metal_bo(as_, al),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((2, self.h_v, self.nc, self.cs)),
+        ))
+    }
+}
+
+/// `qkv [seq, C]`, the window `[C, kk]`, the taps `[C, kk]` → `[3, h_v, nc, cs, d]`.
+pub(crate) struct GdnPrefillPrologue {
+    pub seq: usize,
+    pub d: usize,
+    pub h_k: usize,
+    pub h_v: usize,
+    pub kk: usize,
+    pub cs: usize,
+    pub nc: usize,
+    pub eps: f32,
+    pub q_scale: f32,
+}
+
+impl lloom_tensor::CustomOp3 for GdnPrefillPrologue {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-prefill-prologue"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!(
+            "gdn_prefill_prologue: no cpu kernel; `GatedDeltaNet::prefill` composes it there"
+        )
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let channels = (2 * self.h_k + self.h_v) * self.d;
+        if l1.shape().elem_count() != self.seq * channels
+            || l2.shape().elem_count() != channels * self.kk
+            || l3.shape().elem_count() != channels * self.kk
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "gdn_prefill_prologue: qkv {:?} / window {:?} / taps {:?} vs seq {} × {channels} channels, kk {}",
+                l1.shape(),
+                l2.shape(),
+                l3.shape(),
+                self.seq,
+                self.kk
+            )
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_prefill_prologue");
+        let elem_count = 3 * self.h_v * self.nc * self.cs * self.d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_prefill_qkv")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_prefill_prologue(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            self.seq,
+            self.d,
+            self.h_k,
+            self.h_v,
+            self.kk,
+            self.cs,
+            self.nc,
+            self.eps,
+            self.q_scale,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((3, self.h_v, self.nc, self.cs, self.d)),
+        ))
+    }
+}
+
+/// The window `[C, kk]` (applied to) and the chunk's `qkv [seq, C]` (captured)
+/// → the window after the chunk, a new `[C, kk]`.
+pub(crate) struct GdnConvWindow {
+    pub seq: usize,
+    pub channels: usize,
+    pub kk: usize,
+    pub qkv: Tensor,
+}
+
+impl lloom_tensor::CustomOp1 for GdnConvWindow {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-conv-window"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_conv_window: no cpu kernel; `conv_prefill` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let n = self.channels * self.kk;
+        if l.shape().elem_count() != n || !l.is_contiguous() {
+            lloom_tensor::bail!("gdn_conv_window: the window must be contiguous [C, kk]")
+        }
+        let (qs, ql) = self.qkv.storage_and_layout();
+        let qs = match &*qs {
+            lloom_tensor::Storage::Metal(m) => m,
+            _ => lloom_tensor::bail!("gdn_conv_window: qkv must be on the metal device"),
+        };
+        if ql.shape().elem_count() != self.seq * self.channels || !ql.is_contiguous() {
+            lloom_tensor::bail!("gdn_conv_window: qkv must be contiguous [seq, C]")
+        }
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_conv_window");
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(n, lloom_tensor::DType::F32)
+            .with_label("gdn_conv_window")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_conv_window(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            self.seq,
+            self.channels,
+            self.kk,
+            metal_bo(s, l),
+            metal_bo(qs, ql),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), n, s.dtype()),
+            l.shape().clone(),
+        ))
+    }
+}
+
+/// `g [h_v, nc, cs]` → the flat decay pack: `g_exp [h_v·nc·cs] | g_diff
+/// [h_v·nc·cs] | g_last [h_v·nc] | decay [h_v·nc·cs·cs] | decay_strict [same]`.
+pub(crate) struct GdnChunkDecay {
+    pub h_v: usize,
+    pub nc: usize,
+    pub cs: usize,
+}
+
+impl GdnChunkDecay {
+    /// Offsets into the flat pack: `(g_exp, g_diff, g_last, decay, decay_strict, len)`.
+    pub fn offsets(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let n = self.h_v * self.nc;
+        let (cs, sq) = (self.cs, self.cs * self.cs);
+        (
+            0,
+            n * cs,
+            2 * n * cs,
+            2 * n * cs + n,
+            2 * n * cs + n + n * sq,
+            2 * n * cs + n + 2 * n * sq,
+        )
+    }
+}
+
+impl lloom_tensor::CustomOp1 for GdnChunkDecay {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-chunk-decay"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_chunk_decay: no cpu kernel; `chunk_forward` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        if l.shape().elem_count() != self.h_v * self.nc * self.cs || !l.is_contiguous() {
+            lloom_tensor::bail!("gdn_chunk_decay: g must be contiguous [h_v, nc, cs]")
+        }
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_chunk_decay");
+        let elem_count = self.offsets().5;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_chunk_decay")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_chunk_decay(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            self.h_v,
+            self.nc,
+            self.cs,
+            metal_bo(s, l),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            Shape::from(elem_count),
+        ))
+    }
+}
+
+/// The chunked q/k/v `[3, n, d]`, the gate pack `[2, n]`, the decay pack →
+/// flat `[5, n, d]`: k_beta | w_in | q_g | kg | v_beta.
+pub(crate) struct GdnChunkScale {
+    pub n: usize,
+    pub d: usize,
+}
+
+impl lloom_tensor::CustomOp3 for GdnChunkScale {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-chunk-scale"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_chunk_scale: no cpu kernel; `chunk_forward` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (n, d) = (self.n, self.d);
+        if l1.shape().elem_count() != 3 * n * d
+            || l2.shape().elem_count() != 2 * n
+            || l3.shape().elem_count() < 2 * n
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_chunk_scale: operands vs n {n} d {d}")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_chunk_scale");
+        let elem_count = 5 * n * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_chunk_scale")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_chunk_scale(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            n,
+            d,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((5, n, d)),
+        ))
+    }
+}
+
+/// `o [h_v, padded, d]`, `z [seq, h_v·d]`, γ captured → `[seq, h_v·d]`.
+pub(crate) struct GdnChunkEpilogue {
+    pub seq: usize,
+    pub padded: usize,
+    pub d: usize,
+    pub h_v: usize,
+    pub eps: f32,
+    pub gamma: Tensor,
+}
+
+impl lloom_tensor::CustomOp2 for GdnChunkEpilogue {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-chunk-epilogue"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!(
+            "gdn_chunk_epilogue: no cpu kernel; `GatedDeltaNet::prefill` composes it there"
+        )
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (seq, padded, d, h_v) = (self.seq, self.padded, self.d, self.h_v);
+        if l1.shape().elem_count() != h_v * padded * d
+            || l2.shape().elem_count() != seq * h_v * d
+            || seq > padded
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "gdn_chunk_epilogue: o {:?} / z {:?} vs seq {seq} padded {padded} h_v {h_v} d {d}",
+                l1.shape(),
+                l2.shape()
+            )
+        }
+        let (gs, gl) = self.gamma.storage_and_layout();
+        let gs = match &*gs {
+            lloom_tensor::Storage::Metal(m) => m,
+            _ => lloom_tensor::bail!("gdn_chunk_epilogue: γ must be on the metal device"),
+        };
+        if gl.shape().elem_count() != d || !gl.is_contiguous() {
+            lloom_tensor::bail!("gdn_chunk_epilogue: γ must be contiguous [d]")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_chunk_epilogue");
+        let elem_count = seq * h_v * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_chunk_epilogue")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_chunk_epilogue(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            seq,
+            padded,
+            d,
+            h_v,
+            self.eps,
+            metal_bo(s1, l1),
+            metal_bo(gs, gl),
+            metal_bo(s2, l2),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((seq, h_v * d)),
+        ))
+    }
+}
+
+// ---- QSA prefill ----------------------------------------------------------------
+
+/// `qg [seq, nh, 2·hd]`, `k [seq, nkv, hd]`, `v [seq, nkv, hd]` → the flat
+/// pack: `q_h [nh, seq, hd] | gate [seq, nh·hd] | k_new [nkv, seq, hd] | v_new
+/// [nkv, seq, hd]`; γ_q / γ_k captured.
+pub(crate) struct QsaPrepRows {
+    pub hd: usize,
+    pub n_rot: usize,
+    pub nh: usize,
+    pub nkv: usize,
+    pub seq: usize,
+    pub pos0: usize,
+    pub theta: f32,
+    pub eps: f32,
+    pub q_gamma: Tensor,
+    pub k_gamma: Tensor,
+}
+
+impl lloom_tensor::CustomOp3 for QsaPrepRows {
+    fn name(&self) -> &'static str {
+        "qwen4exp-qsa-prep-rows"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!(
+            "qsa_prep_rows: no cpu kernel; `QsaAttention::prefill` composes it there"
+        )
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (hd, nh, nkv, seq) = (self.hd, self.nh, self.nkv, self.seq);
+        if l1.shape().elem_count() != seq * nh * 2 * hd
+            || l2.shape().elem_count() != seq * nkv * hd
+            || l3.shape().elem_count() != seq * nkv * hd
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "qsa_prep_rows: qg {:?} / k {:?} / v {:?} vs seq {seq} nh {nh} nkv {nkv} hd {hd}",
+                l1.shape(),
+                l2.shape(),
+                l3.shape()
+            )
+        }
+        let (qs, ql) = self.q_gamma.storage_and_layout();
+        let (ks, kl) = self.k_gamma.storage_and_layout();
+        let (qs, ks) = metal_pair(&qs, &ks, "qsa_prep_rows")?;
+        if ql.shape().elem_count() != hd
+            || kl.shape().elem_count() != hd
+            || !ql.is_contiguous()
+            || !kl.is_contiguous()
+        {
+            lloom_tensor::bail!("qsa_prep_rows: γ_q / γ_k must be contiguous [hd]")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("qsa_prep_rows");
+        let elem_count = (2 * nh + 2 * nkv) * seq * hd;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("qsa_prep_rows")
+            .build()?;
+        lloom_tensor::kernels::call_qsa_prep_rows(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            hd,
+            self.n_rot,
+            nh,
+            nkv,
+            seq,
+            self.pos0,
+            self.theta,
+            self.eps,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            metal_bo(qs, ql),
+            metal_bo(ks, kl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from(elem_count),
+        ))
+    }
+}
+
+/// `scores [rows, kv_len]` (rows `(kv head, rep, t)`) → the causal softmax
+/// of `scale · scores` over the keys `≤ past + t`, zero beyond.
+pub(crate) struct QsaCausalSoftmax {
+    pub seq: usize,
+    pub kv_len: usize,
+    pub past: usize,
+    pub scale: f32,
+}
+
+impl lloom_tensor::CustomOp1 for QsaCausalSoftmax {
+    fn name(&self) -> &'static str {
+        "qwen4exp-qsa-causal-softmax"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!(
+            "qsa_causal_softmax: no cpu kernel; `QsaAttention::prefill` composes it there"
+        )
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let n = l.shape().elem_count();
+        if self.kv_len == 0 || !n.is_multiple_of(self.kv_len) || !l.is_contiguous() {
+            lloom_tensor::bail!("qsa_causal_softmax: scores must be contiguous [rows, kv_len]")
+        }
+        let rows = n / self.kv_len;
+        if self.seq == 0 || !rows.is_multiple_of(self.seq) {
+            lloom_tensor::bail!("qsa_causal_softmax: {rows} rows vs seq {}", self.seq)
+        }
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("qsa_causal_softmax");
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(n, lloom_tensor::DType::F32)
+            .with_label("qsa_causal_softmax")
+            .build()?;
+        lloom_tensor::kernels::call_qsa_causal_softmax(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            self.seq,
+            self.kv_len,
+            self.past,
+            self.scale,
+            metal_bo(s, l),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), n, s.dtype()),
+            l.shape().clone(),
+        ))
+    }
 }

@@ -453,3 +453,349 @@ pub fn call_sigmoid_mul(
     dispatch_groups(encoder, n.div_ceil(width), width);
     Ok(())
 }
+
+fn dispatch_groups_2d(encoder: &ComputeCommandEncoder, gx: usize, gy: usize, width: usize) {
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: gx.max(1),
+            height: gy.max(1),
+            depth: 1,
+        },
+        MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn head_width(d: usize, pipeline: &crate::kernels::ComputePipeline) -> usize {
+    d.max(32)
+        .next_power_of_two()
+        .min(pipeline.max_total_threads_per_threadgroup())
+}
+
+/// `gdn_gate_f32`: `alpha`, `beta_raw` `[seq, h_v]` → `[2, h_v, nc, cs]` (g, β).
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_gate(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    seq: usize,
+    h_v: usize,
+    nc: usize,
+    cs: usize,
+    alpha: BufferOffset,
+    beta_raw: BufferOffset,
+    dt_bias: BufferOffset,
+    ssm_a: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_gate_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_gate seq={seq} h_v={h_v} nc={nc}");
+    set_params!(
+        encoder,
+        (
+            &alpha,
+            &beta_raw,
+            &dt_bias,
+            &ssm_a,
+            Output::new(out),
+            seq as u32,
+            h_v as u32,
+            nc as u32,
+            cs as u32
+        )
+    );
+    let n = h_v * nc * cs;
+    let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
+    dispatch_groups(encoder, n.div_ceil(width), width);
+    Ok(())
+}
+
+/// `gdn_prefill_prologue_f32`: `qkv [seq, C]`, the window, the taps →
+/// `[3, h_v, nc, cs, d]`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_prefill_prologue(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    seq: usize,
+    d: usize,
+    h_k: usize,
+    h_v: usize,
+    kk: usize,
+    cs: usize,
+    nc: usize,
+    eps: f32,
+    q_scale: f32,
+    qkv: BufferOffset,
+    win: BufferOffset,
+    conv_w: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_prefill_prologue_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "gdn_prefill_prologue seq={seq} d={d} h_k={h_k} h_v={h_v}"
+    );
+    set_params!(
+        encoder,
+        (
+            &qkv,
+            &win,
+            &conv_w,
+            Output::new(out),
+            seq as u32,
+            d as u32,
+            h_k as u32,
+            h_v as u32,
+            kk as u32,
+            cs as u32,
+            nc as u32,
+            eps,
+            q_scale
+        )
+    );
+    dispatch_groups_2d(encoder, 2 * h_k + h_v, nc * cs, head_width(d, &pipeline));
+    Ok(())
+}
+
+/// `gdn_conv_window_f32`: the window after the chunk → a new `[C, kk]`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_conv_window(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    seq: usize,
+    channels: usize,
+    kk: usize,
+    win: BufferOffset,
+    qkv: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_conv_window_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_conv_window seq={seq} C={channels} kk={kk}");
+    set_params!(
+        encoder,
+        (
+            &win,
+            &qkv,
+            Output::new(out),
+            seq as u32,
+            channels as u32,
+            kk as u32
+        )
+    );
+    let n = channels * kk;
+    let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
+    dispatch_groups(encoder, n.div_ceil(width), width);
+    Ok(())
+}
+
+/// `gdn_chunk_decay_f32`: `g [h_v, nc, cs]` → the flat decay pack (see the kernel).
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_chunk_decay(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    h_v: usize,
+    nc: usize,
+    cs: usize,
+    g: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if cs > 256 || cs == 0 {
+        return Err(MetalKernelError::LoadFunctionError(format!(
+            "gdn_chunk_decay: chunk {cs} (1..=256)"
+        )));
+    }
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_chunk_decay_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_chunk_decay h_v={h_v} nc={nc} cs={cs}");
+    set_params!(
+        encoder,
+        (&g, Output::new(out), h_v as u32, nc as u32, cs as u32)
+    );
+    dispatch_groups(encoder, h_v * nc, head_width(cs, &pipeline));
+    Ok(())
+}
+
+/// `gdn_chunk_scale_f32`: the chunked q/k/v `[3, n, d]`, the gate pack, the
+/// decay pack → the five scaled operands, flat `[5, n, d]`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_chunk_scale(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    n: usize,
+    d: usize,
+    qkv: BufferOffset,
+    gb: BufferOffset,
+    small: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_chunk_scale_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_chunk_scale n={n} d={d}");
+    set_params!(
+        encoder,
+        (&qkv, &gb, &small, Output::new(out), n as u32, d as u32)
+    );
+    let total = n * d;
+    let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
+    dispatch_groups(encoder, total.div_ceil(width), width);
+    Ok(())
+}
+
+/// `gdn_chunk_epilogue_f32`: `o [h_v, padded, d]`, γ, `z [seq, h_v·d]` →
+/// `[seq, h_v·d]`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_chunk_epilogue(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    seq: usize,
+    padded: usize,
+    d: usize,
+    h_v: usize,
+    eps: f32,
+    o: BufferOffset,
+    gamma: BufferOffset,
+    z: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_chunk_epilogue_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_chunk_epilogue seq={seq} d={d} h_v={h_v}");
+    set_params!(
+        encoder,
+        (
+            &o,
+            &gamma,
+            &z,
+            Output::new(out),
+            padded as u32,
+            d as u32,
+            h_v as u32,
+            eps
+        )
+    );
+    dispatch_groups_2d(encoder, h_v, seq, head_width(d, &pipeline));
+    Ok(())
+}
+
+/// `qsa_prep_rows_f32`: over a chunk from `pos0` → the flat pack (see the kernel).
+#[allow(clippy::too_many_arguments)]
+pub fn call_qsa_prep_rows(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    hd: usize,
+    n_rot: usize,
+    nh: usize,
+    nkv: usize,
+    seq: usize,
+    pos0: usize,
+    theta: f32,
+    eps: f32,
+    qg: BufferOffset,
+    k: BufferOffset,
+    v: BufferOffset,
+    q_gamma: BufferOffset,
+    k_gamma: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if hd > 1024 || n_rot > hd || !n_rot.is_multiple_of(2) {
+        return Err(MetalKernelError::LoadFunctionError(format!(
+            "qsa_prep_rows: head_dim {hd} (<= 1024), n_rot {n_rot} (even, <= head_dim)"
+        )));
+    }
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "qsa_prep_rows_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "qsa_prep_rows hd={hd} nh={nh} nkv={nkv} seq={seq} pos0={pos0}"
+    );
+    set_params!(
+        encoder,
+        (
+            &qg,
+            &k,
+            &v,
+            &q_gamma,
+            &k_gamma,
+            Output::new(out),
+            hd as u32,
+            n_rot as u32,
+            nh as u32,
+            nkv as u32,
+            seq as u32,
+            pos0 as u32,
+            theta,
+            eps
+        )
+    );
+    dispatch_groups_2d(encoder, nh + nkv, seq, head_width(hd, &pipeline));
+    Ok(())
+}
+
+/// `qsa_causal_softmax_f32`: `scores [rows, kv_len]` → the causal softmax
+/// (see the kernel).
+#[allow(clippy::too_many_arguments)]
+pub fn call_qsa_causal_softmax(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    seq: usize,
+    kv_len: usize,
+    past: usize,
+    scale: f32,
+    scores: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "qsa_causal_softmax_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "qsa_causal_softmax rows={rows} kv_len={kv_len} past={past}"
+    );
+    set_params!(
+        encoder,
+        (
+            &scores,
+            Output::new(out),
+            seq as u32,
+            kv_len as u32,
+            past as u32,
+            scale
+        )
+    );
+    let width = kv_len
+        .max(32)
+        .next_power_of_two()
+        .min(1024)
+        .min(pipeline.max_total_threads_per_threadgroup());
+    dispatch_groups(encoder, rows, width);
+    Ok(())
+}

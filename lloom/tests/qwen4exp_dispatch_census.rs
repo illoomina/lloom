@@ -173,6 +173,49 @@ fn decode_blocks_and_the_token() -> Result<()> {
         tok = (tok * 7 + 3) % cfg.vocab_size as u32;
         Ok(())
     })?;
+    // --- the prefill blocks over a 16-position chunk ---
+    let xs = Tensor::from_vec(
+        (0..16 * cfg.hidden_size)
+            .map(|i| ((i as f32 * 0.013).sin()) * 0.3)
+            .collect::<Vec<f32>>(),
+        (1, 16, cfg.hidden_size),
+        &dev,
+    )?;
+    let hs = Tensor::from_vec(
+        (0..16 * cfg.hc_dim())
+            .map(|i| ((i as f32 * 0.017).cos()) * 0.3)
+            .collect::<Vec<f32>>(),
+        (1, 16, cfg.hc_dim()),
+        &dev,
+    )?;
+    let (hc_mix16, _) = census("hc.mix16", || {
+        let _ = hc.mix(&hs)?;
+        Ok(())
+    })?;
+    let (mixed16, inject16) = hc.mix(&hs)?;
+    let (hc_combine16, _) = census("hc.combine16", || {
+        let _ = hc.combine(&hs, &mixed16, &inject16)?;
+        Ok(())
+    })?;
+    let (deltanet16, _) = census("deltanet.prefill16", || {
+        let mut s_state = RecurrentState::new(n_layers);
+        let mut conv_state = RecurrentState::new(n_layers);
+        let _ = dn.prefill(&xs, 0, &mut s_state, &mut conv_state)?;
+        Ok(())
+    })?;
+    let (qsa16, _) = census("qsa.prefill16", || {
+        let mut kv = lloom::models::qwen4exp::KvCache::default();
+        let _ = qsa.prefill(&xs, &mut kv)?;
+        Ok(())
+    })?;
+    let (moe16, _) = census("moe.forward16", || {
+        let _ = moe.forward(&xs)?;
+        Ok(())
+    })?;
+    println!(
+        "CENSUS prefill16 summary hc.mix={hc_mix16} hc.combine={hc_combine16} deltanet={deltanet16} qsa={qsa16} moe={moe16}"
+    );
+
     // --- a 16-position chunk prefill, per position ---
     let (chunk, chunk_by) = census("prefill.chunk16", || {
         let mut fresh = model.new_cache(&cfg, &dev)?;

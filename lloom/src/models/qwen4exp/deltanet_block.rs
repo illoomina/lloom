@@ -268,6 +268,9 @@ impl GatedDeltaNet {
         s_state: &mut RecurrentState,
         conv_state: &mut RecurrentState,
     ) -> Result<Tensor> {
+        if let Some(out) = self.prefill_fused(x, l, s_state, conv_state)? {
+            return Ok(out);
+        }
         let dims = self.dims;
         let (d_k, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
         let (b, seq, _) = x.dims3()?;
@@ -324,6 +327,181 @@ impl GatedDeltaNet {
 
     /// GatedRMSNorm over the value-head dim with the `ssm_norm` weight. `o` is
     /// `[1, 1, value_dim]`; normalize per value-head (over d_v) then scale.
+    /// [`Self::prefill`] as launches (Metal, f32, `d_k == d_v`): the four
+    /// projections; `kernels::GdnGate` (g, β chunked); `kernels::GdnPrefillPrologue`
+    /// (the conv against the window, SiLU, the split, the L2 norms, the GQA
+    /// tile, the scale — straight into the chunked head-first layout, no
+    /// transposes, no pads); `kernels::GdnConvWindow` (the window after the
+    /// chunk); `kernels::GdnChunkDecay` (the cumsum and both decay matrices);
+    /// `kernels::GdnChunkScale` (the five β / decay scalings); the WY matmuls
+    /// on transposed VIEWS (the gemm takes the stride); the fused inverse;
+    /// the chunk loop as `chunk_forward`'s; `kernels::GdnChunkEpilogue` (the
+    /// gated RMS norm read straight from the head-first output). `None` where
+    /// the composed path applies — which stays the reference.
+    fn prefill_fused(
+        &self,
+        x: &Tensor,
+        l: usize,
+        s_state: &mut RecurrentState,
+        conv_state: &mut RecurrentState,
+    ) -> Result<Option<Tensor>> {
+        use super::deltanet::{unit_lower_inverse, CHUNK_SIZE};
+        use super::kernels::{
+            fused_off, GdnChunkDecay, GdnChunkEpilogue, GdnChunkScale, GdnConvWindow, GdnGate,
+            GdnPrefillPrologue,
+        };
+        let dims = self.dims;
+        let (d, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
+        let (b, seq, _) = x.dims3()?;
+        if fused_off()
+            || !x.device().is_metal()
+            || x.dtype() != lloom_tensor::DType::F32
+            || dims.d_v != d
+            || b != 1
+            || seq == 0
+        {
+            return Ok(None);
+        }
+        let dev = x.device();
+        let f32 = lloom_tensor::DType::F32;
+        let cs = CHUNK_SIZE;
+        let nc = seq.div_ceil(cs);
+        let padded = nc * cs;
+        let n = h_v * nc * cs;
+        let conv_w = if self.conv_weight.dtype() == f32 {
+            self.conv_weight.clone()
+        } else {
+            self.conv_weight.to_dtype(f32)?
+        };
+        let win = match conv_state.get(l) {
+            Some(w) => w.to_dtype(f32)?.contiguous()?,
+            None => Tensor::zeros((self.conv_channels, self.conv_k), f32, dev)?,
+        };
+
+        // The projections.
+        let qkv = self
+            .wqkv
+            .forward(x)?
+            .to_dtype(f32)?
+            .reshape((seq, self.conv_channels))?; // [seq, C]
+        let z = self
+            .wqkv_gate
+            .forward(x)?
+            .to_dtype(f32)?
+            .reshape((seq, self.value_dim))?; // [seq, h_v·d]
+        let alpha = self
+            .ssm_alpha
+            .forward(x)?
+            .to_dtype(f32)?
+            .reshape((seq, h_v))?;
+        let beta = self
+            .ssm_beta
+            .forward(x)?
+            .to_dtype(f32)?
+            .reshape((seq, h_v))?;
+
+        // The chunked operands.
+        let gb = alpha.apply_op2_no_bwd(
+            &beta,
+            &GdnGate {
+                seq,
+                h_v,
+                nc,
+                cs,
+                dt_bias: self.ssm_dt.to_dtype(f32)?,
+                ssm_a: self.ssm_a.to_dtype(f32)?,
+            },
+        )?; // [2, h_v, nc, cs]
+        let g_ch = gb.narrow(0, 0, 1)?.reshape((h_v, nc, cs))?;
+        let pack = qkv.apply_op3_no_bwd(
+            &win,
+            &conv_w,
+            &GdnPrefillPrologue {
+                seq,
+                d,
+                h_k,
+                h_v,
+                kk: self.conv_k,
+                cs,
+                nc,
+                eps: self.norm_eps as f32,
+                q_scale: 1.0 / (d as f32).sqrt(),
+            },
+        )?; // [3, h_v, nc, cs, d]
+        let new_win = win.apply_op1_no_bwd(&GdnConvWindow {
+            seq,
+            channels: self.conv_channels,
+            kk: self.conv_k,
+            qkv: qkv.clone(),
+        })?;
+        conv_state.write(l, new_win)?;
+        let decay_op = GdnChunkDecay { h_v, nc, cs };
+        let small = g_ch.apply_op1_no_bwd(&decay_op)?; // flat
+        let (_, _, o_last, o_decay, o_strict, _) = decay_op.offsets();
+        let g_last_exp = small.narrow(0, o_last, h_v * nc)?.reshape((h_v, nc))?;
+        let decay = small
+            .narrow(0, o_decay, h_v * nc * cs * cs)?
+            .reshape((h_v, nc, cs, cs))?;
+        let decay_strict = small
+            .narrow(0, o_strict, h_v * nc * cs * cs)?
+            .reshape((h_v, nc, cs, cs))?;
+        let scaled = pack.apply_op3_no_bwd(&gb, &small, &GdnChunkScale { n, d })?; // [5, n, d]
+        let part =
+            |i: usize| -> Result<Tensor> { scaled.narrow(0, i, 1)?.reshape((h_v, nc, cs, d)) };
+        let (k_beta, w_in, q_g, kg, v_beta) = (part(0)?, part(1)?, part(2)?, part(3)?, part(4)?);
+        let q = pack.narrow(0, 0, 1)?.reshape((h_v, nc, cs, d))?;
+        let k = pack.narrow(0, 1, 1)?.reshape((h_v, nc, cs, d))?;
+        let k_t = k.transpose(2, 3)?; // a view; the gemm takes the stride
+
+        // The WY form (as `chunk_forward`).
+        let a = k_beta.matmul(&k_t)?.mul(&decay_strict)?; // [h_v, nc, cs, cs]
+        let t = unit_lower_inverse(&a)?;
+        let u = t.matmul(&v_beta)?; // [h_v, nc, cs, d]
+        let w = t.matmul(&w_in)?; // [h_v, nc, cs, d]
+        let kq = q.matmul(&k_t)?.mul(&decay)?; // [h_v, nc, cs, cs]
+        let kg_t = kg.transpose(2, 3)?; // [h_v, nc, d, cs] view
+
+        let mut s = match s_state.get(l) {
+            Some(s) => s.to_dtype(f32)?.permute((2, 0, 1))?.contiguous()?, // [h_v, d, d]
+            None => Tensor::zeros((h_v, d, d), f32, dev)?,
+        };
+        let mut outs = Vec::with_capacity(nc);
+        for c in 0..nc {
+            let w_c = w.narrow(1, c, 1)?.squeeze(1)?; // [h_v, cs, d]
+            let u_c = u.narrow(1, c, 1)?.squeeze(1)?;
+            let v_new = (u_c - w_c.matmul(&s)?)?; // [h_v, cs, d]
+            let q_g_c = q_g.narrow(1, c, 1)?.squeeze(1)?;
+            let kq_c = kq.narrow(1, c, 1)?.squeeze(1)?;
+            let o_c = (q_g_c.matmul(&s)? + kq_c.matmul(&v_new)?)?; // [h_v, cs, d]
+            outs.push(o_c);
+            let kg_c = kg_t.narrow(1, c, 1)?.squeeze(1)?; // [h_v, d, cs]
+            let gl = g_last_exp.narrow(1, c, 1)?.reshape((h_v, 1, 1))?;
+            s = (s.broadcast_mul(&gl)? + kg_c.matmul(&v_new)?)?;
+        }
+        let o = if nc == 1 {
+            outs.pop().expect("one chunk")
+        } else {
+            Tensor::cat(&outs, 1)?
+        }; // [h_v, padded, d]
+        let out = o.apply_op2_no_bwd(
+            &z,
+            &GdnChunkEpilogue {
+                seq,
+                padded,
+                d,
+                h_v,
+                eps: self.norm_eps as f32,
+                gamma: self.ssm_norm.to_dtype(f32)?,
+            },
+        )?; // [seq, h_v·d]
+        s_state.write(l, s.permute((1, 2, 0))?.contiguous()?)?;
+        Ok(Some(self.ssm_out.forward(&out.reshape((
+            1,
+            seq,
+            self.value_dim,
+        ))?)?))
+    }
+
     fn gated_rms_norm(&self, o: &Tensor) -> Result<Tensor> {
         let (b, seq, _) = o.dims3()?;
         let (h_v, d_v) = (self.dims.h_v, self.dims.d_v);
@@ -531,6 +709,111 @@ mod tests {
     /// The fused decode (three launches, the slabs in place) matches the
     /// composed path — the CPU's — at the real head geometry over 40 steps
     /// from a fresh state: every output and both state channels.
+    /// The fused prefill (Kernel B as launches) matches the composed path —
+    /// the CPU's — at the real head geometry over two chunks: a 70-position
+    /// chunk (two 64-chunks, the second padded) from a fresh state, then a
+    /// 30-position chunk against the carried window and `S`; the outputs and
+    /// both state channels within 2e-4 relative.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn prefill_fused_matches_composed_at_real_geometry() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let d = cfg.hidden_size;
+        let conv_ch = cfg.conv_channels();
+        let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
+        let h_v = cfg.ssm_dt_rank;
+        let d_v = cfg.ssm_state_size;
+        let build = |dev: &Device| {
+            let lin = |out: usize, inp: usize, seed: f32| {
+                QMatMul::Tensor(
+                    Tensor::from_vec(
+                        (0..out * inp)
+                            .map(|i| ((i as f32 * 0.017 + seed).sin()) * 0.05)
+                            .collect::<Vec<_>>(),
+                        (out, inp),
+                        dev,
+                    )
+                    .unwrap(),
+                )
+            };
+            let vecw = |n: usize, f: &dyn Fn(usize) -> f32| {
+                Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, dev).unwrap()
+            };
+            GatedDeltaNet::new(
+                lin(conv_ch, d, 1.0),
+                lin(value_dim, d, 2.0),
+                vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
+                    ((i as f32 * 0.03).cos()) * 0.2
+                })
+                .reshape((conv_ch, cfg.ssm_conv_kernel))
+                .unwrap(),
+                vecw(h_v, &|i| -0.5 - 0.01 * i as f32),
+                vecw(h_v, &|i| 0.1 * (i % 7) as f32),
+                lin(h_v, d, 4.0),
+                lin(h_v, d, 5.0),
+                vecw(d_v, &|i| 1.0 + 0.01 * (i % 5) as f32),
+                lin(d, value_dim, 6.0),
+                &cfg,
+            )
+        };
+        let (blk_cpu, blk_gpu) = (build(&cpu), build(&gpu));
+        let (mut s_c, mut c_c) = (RecurrentState::new(1), RecurrentState::new(1));
+        let (mut s_g, mut c_g) = (RecurrentState::new(1), RecurrentState::new(1));
+        let close = |name: &str, a: &Tensor, b: &Tensor| -> f32 {
+            let av: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
+            let bv: Vec<f32> = b
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(av.len(), bv.len(), "{name}: sizes");
+            assert!(bv.iter().all(|v| v.is_finite()), "{name}: non-finite fused");
+            let scale = av.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+            let diff = av
+                .iter()
+                .zip(&bv)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                diff <= 2e-4 * scale,
+                "{name}: fused differs by {diff} at scale {scale}"
+            );
+            diff / scale
+        };
+        let mut worst = 0f32;
+        for (round, seq) in [70usize, 30].into_iter().enumerate() {
+            let x = Tensor::from_vec(
+                (0..seq * d)
+                    .map(|i| ((i as f32 * 0.05 + round as f32).sin()) * 0.6)
+                    .collect::<Vec<f32>>(),
+                (1, seq, d),
+                &cpu,
+            )
+            .unwrap();
+            let a = blk_cpu.prefill(&x, 0, &mut s_c, &mut c_c).unwrap();
+            let b = blk_gpu
+                .prefill(&x.to_device(&gpu).unwrap(), 0, &mut s_g, &mut c_g)
+                .unwrap();
+            worst = worst.max(close(&format!("round {round} output"), &a, &b));
+            worst = worst.max(close(
+                &format!("round {round} S"),
+                s_c.get(0).unwrap(),
+                s_g.get(0).unwrap(),
+            ));
+            worst = worst.max(close(
+                &format!("round {round} window"),
+                c_c.get(0).unwrap(),
+                c_g.get(0).unwrap(),
+            ));
+        }
+        println!("prefill fused vs composed worst relative diff: {worst:e}");
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn decode_fused_matches_composed_at_real_geometry() {

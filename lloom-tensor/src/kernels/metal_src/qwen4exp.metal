@@ -522,3 +522,358 @@ kernel void sigmoid_mul_f32(
   if (idx >= n) return;
   out[idx] = b[idx] / (1.0f + metal::exp(-a[idx]));
 }
+
+// ---- DeltaNet prefill (Kernel B: `deltanet.rs::chunk_forward`, `deltanet_block.rs::prefill`) ----
+
+// The gate and the write strength over a chunk, laid out chunked
+// `[2, h_v, nc, cs]` (plane 0: g = ssm_a · softplus(alpha + dt_bias); plane 1:
+// β = sigmoid(beta)); positions ≥ `seq` are zero (no decay, no write).
+kernel void gdn_gate_f32(
+    const device float* alpha [[buffer(0)]],
+    const device float* beta_raw [[buffer(1)]],
+    const device float* dt_bias [[buffer(2)]],
+    const device float* ssm_a [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint& seq [[buffer(5)]],
+    constant uint& h_v [[buffer(6)]],
+    constant uint& nc [[buffer(7)]],
+    constant uint& cs [[buffer(8)]],
+    uint idx [[thread_position_in_grid]]) {
+  const uint total = h_v * nc * cs;
+  if (idx >= total) return;
+  const uint h = idx / (nc * cs);
+  const uint p = idx % (nc * cs);
+  float g = 0.0f;
+  float b = 0.0f;
+  if (p < seq) {
+    const float a = alpha[(size_t)p * h_v + h] + dt_bias[h];
+    const float sp = metal::max(a, 0.0f) + metal::log(metal::exp(-metal::abs(a)) + 1.0f);
+    g = ssm_a[h] * sp;
+    b = 1.0f / (1.0f + metal::exp(-beta_raw[(size_t)p * h_v + h]));
+  }
+  out[idx] = g;
+  out[total + idx] = b;
+}
+
+// The conv over the chunk against the carried window (read only), SiLU, the
+// q / k / v split, the L2 norms per key head, the GQA tile, the query scale —
+// written chunked head-first `[3, h_v, nc, cs, d]` (planes q, k, v), zero
+// past `seq`. One threadgroup per (plane-head, position), `d` threads.
+kernel void gdn_prefill_prologue_f32(
+    const device float* qkv [[buffer(0)]],
+    const device float* win [[buffer(1)]],
+    const device float* conv_w [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& seq [[buffer(4)]],
+    constant uint& d [[buffer(5)]],
+    constant uint& h_k [[buffer(6)]],
+    constant uint& h_v [[buffer(7)]],
+    constant uint& kk [[buffer(8)]],
+    constant uint& cs [[buffer(9)]],
+    constant uint& nc [[buffer(10)]],
+    constant float& eps [[buffer(11)]],
+    constant float& q_scale [[buffer(12)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tptg [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+  const uint i = tid.x;
+  const uint width = tptg.x;
+  threadgroup float partial[32];
+  const uint group = gid.x;
+  const uint p = gid.y;
+  const uint key_dim = h_k * d;
+  const uint C = 2 * key_dim + h_v * d;
+  uint plane, head, base;
+  if (group < h_k) {
+    plane = 0; head = group; base = head * d;
+  } else if (group < 2 * h_k) {
+    plane = 1; head = group - h_k; base = key_dim + head * d;
+  } else {
+    plane = 2; head = group - 2 * h_k; base = 2 * key_dim + head * d;
+  }
+  float y = 0.0f;
+  if (p < seq && i < d) {
+    const uint c = base + i;
+    const device float* cw = conv_w + (size_t)c * kk;
+    float folded = 0.0f;
+    for (uint j = 0; j < kk; j++) {
+      const int t = (int)p - (int)(kk - 1) + (int)j;
+      const float x = t < 0 ? win[(size_t)c * kk + (uint)((int)kk + t)] : qkv[(size_t)t * C + c];
+      folded += cw[j] * x;
+    }
+    y = gdn_silu(folded);
+  }
+  const uint pc = p / cs;
+  const uint pi = p % cs;
+  const size_t row = (size_t)pi * d;
+  if (plane == 2) {
+    if (i < d) out[(((size_t)(2 * h_v + head) * nc + pc) * cs) * d + row + i] = y;
+    return;
+  }
+  float ss = simd_sum(y * y);
+  if (simd_lane == 0) partial[simd_id] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n_simd = (width + 31) / 32;
+  float total = 0.0f;
+  for (uint s = 0; s < n_simd; s++) total += partial[s];
+  const float inv = 1.0f / metal::sqrt(total + eps);
+  float o = y * inv;
+  if (plane == 0) o *= q_scale;
+  if (i < d) {
+    const uint rep = h_v / h_k;
+    for (uint r = 0; r < rep; r++) {
+      const uint j = r * h_k + head; // TILE: v-head j reads k-head j % h_k
+      out[(((size_t)(plane * h_v + j) * nc + pc) * cs) * d + row + i] = o;
+    }
+  }
+}
+
+// The window after the chunk: the last `kk` inputs (from the chunk, or from
+// the old window when the chunk is shorter), newest last — a new `[C, kk]`.
+kernel void gdn_conv_window_f32(
+    const device float* win [[buffer(0)]],
+    const device float* qkv [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& seq [[buffer(3)]],
+    constant uint& C [[buffer(4)]],
+    constant uint& kk [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]) {
+  if (idx >= C * kk) return;
+  const uint c = idx / kk;
+  const uint j = idx % kk;
+  const int t = (int)seq - (int)kk + (int)j;
+  out[idx] = t < 0 ? win[(size_t)c * kk + (uint)((int)kk + t)] : qkv[(size_t)t * C + c];
+}
+
+// From the chunked gate `g [h_v, nc, cs]`, the intra-chunk decay, flat:
+//   g_exp [h_v, nc, cs] = exp(G)            (G = cumsum of g within the chunk)
+//   g_diff [h_v, nc, cs] = exp(G_last − G)
+//   g_last [h_v, nc] = exp(G_last)
+//   decay [h_v, nc, cs, cs][b][a] = exp(G[b] − G[a]) for a ≤ b, else 0
+//   decay_strict: the same with the diagonal zero.
+// One threadgroup per (head, chunk), `cs` threads; `cs` ≤ 256.
+kernel void gdn_chunk_decay_f32(
+    const device float* g [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& h_v [[buffer(2)]],
+    constant uint& nc [[buffer(3)]],
+    constant uint& cs [[buffer(4)]],
+    uint hc [[threadgroup_position_in_grid]],
+    uint i [[thread_position_in_threadgroup]]) {
+  threadgroup float gcs[256];
+  const device float* gg = g + (size_t)hc * cs;
+  if (i < cs) {
+    float s = 0.0f;
+    for (uint j = 0; j <= i; j++) s += gg[j];
+    gcs[i] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (i >= cs) return;
+  const uint n = h_v * nc;
+  const float gi = gcs[i];
+  const float gl = gcs[cs - 1];
+  out[(size_t)hc * cs + i] = metal::exp(gi);
+  out[(size_t)n * cs + (size_t)hc * cs + i] = metal::exp(gl - gi);
+  if (i == 0) out[(size_t)2 * n * cs + hc] = metal::exp(gl);
+  device float* dec = out + (size_t)2 * n * cs + n + ((size_t)hc * cs + i) * cs;
+  device float* decs = dec + (size_t)n * cs * cs;
+  for (uint a = 0; a < cs; a++) {
+    const float v = a <= i ? metal::exp(gi - gcs[a]) : 0.0f;
+    dec[a] = v;
+    decs[a] = a < i ? v : 0.0f;
+  }
+}
+
+// The per-position scalings of the chunked q / k / v (`[3, n, d]`, n = h_v·nc·cs)
+// by β and the decay terms, flat: k_beta = k·β | w_in = k·β·g_exp |
+// q_g = q·g_exp | kg = k·g_diff | v_beta = v·β, each `[n, d]`.
+kernel void gdn_chunk_scale_f32(
+    const device float* qkv [[buffer(0)]],
+    const device float* gb [[buffer(1)]],
+    const device float* small [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& n [[buffer(4)]],
+    constant uint& d [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]) {
+  const uint total = n * d;
+  if (idx >= total) return;
+  const uint r = idx / d;
+  const float q = qkv[idx];
+  const float k = qkv[total + idx];
+  const float v = qkv[(size_t)2 * total + idx];
+  const float b = gb[n + r];
+  const float ge = small[r];
+  const float gd = small[n + r];
+  const float kb = k * b;
+  out[idx] = kb;
+  out[total + idx] = kb * ge;
+  out[(size_t)2 * total + idx] = q * ge;
+  out[(size_t)3 * total + idx] = k * gd;
+  out[(size_t)4 * total + idx] = v * b;
+}
+
+// The chunks' outputs `o [h_v, padded, d]` (head-first) → the gated RMS norm
+// per (position, head) × γ × sigmoid(z) → `[seq, h_v·d]`. One threadgroup
+// per (head, position), `d` threads.
+kernel void gdn_chunk_epilogue_f32(
+    const device float* o [[buffer(0)]],
+    const device float* gamma [[buffer(1)]],
+    const device float* z [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant uint& padded [[buffer(4)]],
+    constant uint& d [[buffer(5)]],
+    constant uint& h_v [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tptg [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+  const uint i = tid.x;
+  const uint width = tptg.x;
+  threadgroup float partial[32];
+  const uint h = gid.x;
+  const uint p = gid.y;
+  const float x = (i < d) ? o[((size_t)h * padded + p) * d + i] : 0.0f;
+  float ss = simd_sum(x * x);
+  if (simd_lane == 0) partial[simd_id] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n_simd = (width + 31) / 32;
+  float total = 0.0f;
+  for (uint s = 0; s < n_simd; s++) total += partial[s];
+  if (i < d) {
+    const float scale = 1.0f / metal::sqrt(total / (float)d + eps);
+    const size_t oi = ((size_t)p * h_v + h) * d + i;
+    const float sg = 1.0f / (1.0f + metal::exp(-z[oi]));
+    out[oi] = x * scale * gamma[i] * sg;
+  }
+}
+
+// ---- QSA prefill (`qsa.rs::prefill`) ----------------------------------------------
+
+// Over a chunk of `seq` positions from `pos0`: `qg [seq, nh, 2·hd]`, `k [seq,
+// nkv, hd]`, `v [seq, nkv, hd]` → flat: q_h [nh, seq, hd] (normed, roped,
+// head-first for the attention kernel) | gate [seq, nh·hd] | k_new [nkv, seq,
+// hd] (normed, roped, head-first for the cache) | v_new [nkv, seq, hd]. One
+// threadgroup per (head, position), `hd` threads.
+kernel void qsa_prep_rows_f32(
+    const device float* qg [[buffer(0)]],
+    const device float* k [[buffer(1)]],
+    const device float* v [[buffer(2)]],
+    const device float* q_gamma [[buffer(3)]],
+    const device float* k_gamma [[buffer(4)]],
+    device float* out [[buffer(5)]],
+    constant uint& hd [[buffer(6)]],
+    constant uint& n_rot [[buffer(7)]],
+    constant uint& nh [[buffer(8)]],
+    constant uint& nkv [[buffer(9)]],
+    constant uint& seq [[buffer(10)]],
+    constant uint& pos0 [[buffer(11)]],
+    constant float& theta [[buffer(12)]],
+    constant float& eps [[buffer(13)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tptg [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+  const uint i = tid.x;
+  const uint width = tptg.x;
+  threadgroup float partial[32];
+  threadgroup float tmp[1024];
+  const uint g = gid.x;
+  const uint p = gid.y;
+  const bool is_q = g < nh;
+  const size_t q_len = (size_t)nh * seq * hd;
+  const size_t kv_len = (size_t)nkv * seq * hd;
+  float x = 0.0f;
+  const device float* gamma = is_q ? q_gamma : k_gamma;
+  device float* o;
+  if (is_q) {
+    o = out + ((size_t)g * seq + p) * hd;
+    if (i < hd) {
+      const size_t src = ((size_t)p * nh + g) * 2 * hd;
+      x = qg[src + i];
+      out[q_len + ((size_t)p * nh + g) * hd + i] = qg[src + hd + i]; // the gate
+    }
+  } else {
+    const uint kh = g - nh;
+    o = out + 2 * q_len + ((size_t)kh * seq + p) * hd;
+    if (i < hd) {
+      const size_t src = ((size_t)p * nkv + kh) * hd + i;
+      x = k[src];
+      out[2 * q_len + kv_len + ((size_t)kh * seq + p) * hd + i] = v[src];
+    }
+  }
+  float ss = simd_sum(x * x);
+  if (simd_lane == 0) partial[simd_id] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n_simd = (width + 31) / 32;
+  float total = 0.0f;
+  for (uint s = 0; s < n_simd; s++) total += partial[s];
+  const float scale = 1.0f / metal::sqrt(total / (float)hd + eps);
+  if (i < hd) tmp[i] = x * scale * gamma[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (i >= hd) return;
+  const uint rot_half = n_rot / 2;
+  const float pos = (float)(pos0 + p);
+  if (i < rot_half) {
+    const float inv = metal::precise::exp(-((2.0f * (float)i) / (float)n_rot) * metal::precise::log(theta));
+    const float f = inv * pos;
+    const float c = metal::precise::cos(f);
+    const float s = metal::precise::sin(f);
+    const float lo = tmp[i];
+    const float hi = tmp[i + rot_half];
+    o[i] = lo * c - hi * s;
+    o[i + rot_half] = lo * s + hi * c;
+  } else if (i >= n_rot) {
+    o[i] = tmp[i];
+  }
+}
+
+// The causal softmax over a chunk's scores `[rows, kv_len]` (rows ordered
+// `(kv head, rep, t)`, so row `r` is query `t = r % seq` at position
+// `past + t`): `softmax(scale · s[j])` over the keys `j ≤ past + t`, zero
+// beyond. One threadgroup per row.
+kernel void qsa_causal_softmax_f32(
+    const device float* scores [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant uint& seq [[buffer(2)]],
+    constant uint& kv_len [[buffer(3)]],
+    constant uint& past [[buffer(4)]],
+    constant float& scale [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint i [[thread_position_in_threadgroup]],
+    uint width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partial[32];
+  const uint t = row % seq;
+  const uint limit = metal::min(past + t + 1, kv_len);
+  const device float* s = scores + (size_t)row * kv_len;
+  device float* o = out + (size_t)row * kv_len;
+  const uint n_simd = (width + 31) / 32;
+  float m = -INFINITY;
+  for (uint j = i; j < limit; j += width) m = metal::max(m, s[j] * scale);
+  m = simd_max(m);
+  if (simd_lane == 0) partial[simd_id] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float mx = -INFINITY;
+  for (uint k = 0; k < n_simd; k++) mx = metal::max(mx, partial[k]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float sum = 0.0f;
+  for (uint j = i; j < limit; j += width) {
+    const float e = metal::exp(s[j] * scale - mx);
+    o[j] = e;
+    sum += e;
+  }
+  sum = simd_sum(sum);
+  if (simd_lane == 0) partial[simd_id] = sum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (uint k = 0; k < n_simd; k++) total += partial[k];
+  const float inv = 1.0f / total;
+  for (uint j = i; j < limit; j += width) o[j] *= inv;
+  for (uint j = limit + i; j < kv_len; j += width) o[j] = 0.0f;
+}

@@ -578,6 +578,9 @@ impl QsaAttention {
         if b != 1 {
             lloom_tensor::bail!("qsa prefill takes one sequence, got {:?}", x.shape())
         }
+        if let Some(out) = self.prefill_fused(x, kv)? {
+            return Ok(out);
+        }
         let dev = x.device();
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
         let x2 = x.reshape((seq, hidden))?;
@@ -650,6 +653,112 @@ impl QsaAttention {
             .to_dtype(x.dtype())?;
         let gated = (ctx * ops::sigmoid(&gate.reshape((seq, nh * hd))?)?)?;
         self.wo.forward(&gated)?.reshape((1, seq, hidden))
+    }
+}
+
+impl QsaAttention {
+    /// [`Self::prefill`] as launches: the projections, `kernels::QsaPrepRows`
+    /// (the q/gate split, both norms, the rope at each position, the head-first
+    /// layouts the attention kernel and the cache take — no transposes), the KV
+    /// append, the scores as one batched gemm per kv head over the cache as it
+    /// lies (no head expansion, no transposed copy), `kernels::QsaCausalSoftmax`
+    /// (the causal window against the cached prefix and the scale, in the
+    /// kernel — no mask upload), the values, `kernels::SigmoidMul`, the
+    /// out-proj. Metal, f32; `None` where the composed path applies. (The
+    /// steel full-attention kernel has no f32 arm at head 256 — its pipeline
+    /// does not build — so the attention stays two gemms and a softmax.)
+    fn prefill_fused(&self, x: &Tensor, kv: &mut KvCache) -> Result<Option<Tensor>> {
+        use super::kernels::{fused_off, sigmoid_mul, QsaCausalSoftmax, QsaPrepRows};
+        let (_, seq, hidden) = x.dims3()?;
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        if fused_off()
+            || !x.device().is_metal()
+            || x.dtype() != lloom_tensor::DType::F32
+            || !matches!(hd, 32 | 64 | 72 | 80 | 96 | 128 | 256)
+            || nh % nkv != 0
+            || seq == 0
+        {
+            return Ok(None);
+        }
+        let f32 = lloom_tensor::DType::F32;
+        let x2 = x.reshape((seq, hidden))?;
+        let qg = self
+            .wq
+            .forward(&x2)?
+            .to_dtype(f32)?
+            .reshape((seq, nh, 2 * hd))?;
+        let k = self
+            .wk
+            .forward(&x2)?
+            .to_dtype(f32)?
+            .reshape((seq, nkv, hd))?;
+        let v = self
+            .wv
+            .forward(&x2)?
+            .to_dtype(f32)?
+            .reshape((seq, nkv, hd))?;
+        let past = kv.len();
+        let flat = qg.apply_op3_no_bwd(
+            &k,
+            &v,
+            &QsaPrepRows {
+                hd,
+                n_rot: self.n_rot,
+                nh,
+                nkv,
+                seq,
+                pos0: past,
+                theta: self.rope_theta as f32,
+                eps: self.q_norm.eps() as f32,
+                q_gamma: self.q_norm.weight().to_dtype(f32)?,
+                k_gamma: self.k_norm.weight().to_dtype(f32)?,
+            },
+        )?;
+        let (q_len, kv_len_e) = (nh * seq * hd, nkv * seq * hd);
+        let q_h = flat.narrow(0, 0, q_len)?.reshape((1, nh, seq, hd))?;
+        let gate = flat.narrow(0, q_len, q_len)?.reshape((seq, nh * hd))?;
+        let k_new = flat
+            .narrow(0, 2 * q_len, kv_len_e)?
+            .reshape((nkv, seq, hd))?;
+        let v_new = flat
+            .narrow(0, 2 * q_len + kv_len_e, kv_len_e)?
+            .reshape((nkv, seq, hd))?;
+        let (k_all, v_all) = kv.append(&k_new, &v_new)?; // [nkv, kv_len, hd] slab views
+        let kv_len = k_all.dim(1)?;
+        if let Some(ix) = &self.indexer {
+            if kv_len > ix.dense_limit() {
+                lloom_tensor::bail!(
+                    "qsa prefill: {kv_len} cells exceed the dense range {}; decode past it",
+                    ix.dense_limit()
+                )
+            }
+            ix.observe(&x2, kv)?;
+        }
+        // The scores per kv head over its `rep` query heads at once (the
+        // heads of one kv head are adjacent in `q_h`, so the grouping is a
+        // view), against the cache as it lies (the gemm takes the transposed
+        // stride); the causal softmax with the scale folded in; the values.
+        let rep = nh / nkv;
+        let scale = 1.0 / (hd as f64).sqrt();
+        let q_g = q_h.reshape((nkv, rep * seq, hd))?;
+        let scores = q_g.matmul(&k_all.transpose(1, 2)?)?; // [nkv, rep·seq, kv_len]
+        let probs = scores.apply_op1_no_bwd(&QsaCausalSoftmax {
+            seq,
+            kv_len,
+            past,
+            scale: scale as f32,
+        })?;
+        let ctx = probs.matmul(&v_all)?; // [nkv, rep·seq, hd]
+        let ctx = ctx
+            .reshape((nh, seq, hd))?
+            .transpose(0, 1)?
+            .contiguous()?
+            .reshape((seq, nh * hd))?;
+        let gated = match sigmoid_mul(&gate, &ctx) {
+            Some(g) => g?,
+            None => (ctx * ops::sigmoid(&gate)?)?,
+        };
+        Ok(Some(self.wo.forward(&gated)?.reshape((1, seq, hidden))?))
     }
 }
 
@@ -859,6 +968,88 @@ mod tests {
         assert_eq!(kv_c.len(), kv_g.len());
         assert_eq!(kv_g.len(), 12);
         println!("qsa fused vs composed worst relative diff: {worst:e}");
+    }
+
+    /// The fused prefill over a CACHED PREFIX (the model's chunked prompt:
+    /// a 40-position chunk, then a 25-position chunk attending to it — the
+    /// causal window offset by the cache) matches the composed path, the
+    /// CPU's, at the real head geometry.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn prefill_fused_matches_composed_over_a_cached_prefix() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let d = cfg.hidden_size;
+        let (hd, nh, nkv) = (cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
+        let build = |dev: &Device| {
+            let gamma = |seed: f32| {
+                RmsNorm::new(
+                    Tensor::from_vec(
+                        (0..hd)
+                            .map(|i| 1.0 + 0.1 * ((i as f32 + seed) * 0.3).sin())
+                            .collect::<Vec<f32>>(),
+                        hd,
+                        dev,
+                    )
+                    .unwrap(),
+                    1e-6,
+                )
+            };
+            QsaAttention::new(
+                lin(nh * hd * 2, d, 1.0, dev),
+                lin(nkv * hd, d, 2.0, dev),
+                lin(nkv * hd, d, 3.0, dev),
+                lin(d, nh * hd, 4.0, dev),
+                gamma(0.0),
+                gamma(9.0),
+                &cfg,
+            )
+        };
+        let (a_cpu, a_gpu) = (build(&cpu), build(&gpu));
+        let (mut kv_c, mut kv_g) = (KvCache::default(), KvCache::default());
+        let mut worst = 0f32;
+        for (round, seq) in [40usize, 25].into_iter().enumerate() {
+            let x = Tensor::from_vec(
+                (0..seq * d)
+                    .map(|i| ((i as f32 * 0.05 + round as f32).sin()) * 0.6)
+                    .collect::<Vec<f32>>(),
+                (1, seq, d),
+                &cpu,
+            )
+            .unwrap();
+            let a = a_cpu.prefill(&x, &mut kv_c).unwrap();
+            let b = a_gpu
+                .prefill(&x.to_device(&gpu).unwrap(), &mut kv_g)
+                .unwrap();
+            let av: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
+            let bv: Vec<f32> = b
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert!(
+                bv.iter().all(|v| v.is_finite()),
+                "round {round}: non-finite fused output"
+            );
+            let scale = av.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+            let diff = av
+                .iter()
+                .zip(&bv)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(diff / scale);
+            assert!(
+                diff <= 2e-4 * scale,
+                "round {round}: fused differs by {diff} at scale {scale}"
+            );
+            assert_eq!(kv_c.len(), kv_g.len());
+        }
+        assert_eq!(kv_g.len(), 65);
+        println!("qsa prefill fused vs composed worst relative diff: {worst:e}");
     }
 
     /// QSA decodes end to end and its KV grows: shapes thread, output finite, and

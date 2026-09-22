@@ -69,6 +69,8 @@ pub struct LoadOptions {
     /// Rows the batch scheduler serves at once (`--batch N`); 1 is the
     /// single-sequence engine.
     pub batch: usize,
+    /// Tokens the MTP drafter proposes per round.
+    pub mtp_k: usize,
 }
 
 /// The model, shared with the batch thread.
@@ -98,6 +100,8 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     mem_sample: bool,
     /// The MTP head is loaded: requests decode through the speculative body.
     mtp: bool,
+    /// Tokens the MTP drafter proposes per round.
+    mtp_k: usize,
     /// The hotlist to write at shutdown (the usage since load merged in).
     hotlist: Option<PathBuf>,
     /// The tier's load-time description (`[loaded …]`, `/health`).
@@ -310,6 +314,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             prefill_tile: opts.prefill_tile,
             mem_sample: opts.mem_sample,
             mtp,
+            mtp_k: opts.mtp_k.max(1),
             hotlist: opts.hotlist.clone(),
             tier,
             single: Mutex::new(Single {
@@ -425,7 +430,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             self.core.model.lm_head(),
             self.core.model.config(),
             &self.device,
-        ))
+        )
+        .with_k(self.mtp_k))
     }
 
     /// The streamed tier's counters (zeros on the resident tier).

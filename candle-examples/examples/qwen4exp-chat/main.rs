@@ -114,6 +114,12 @@ struct Args {
     #[arg(long)]
     mtp: Option<PathBuf>,
 
+    /// Tokens the MTP drafter proposes per round (`--mtp`): 1 from the head
+    /// once, `K` by re-applying the one MTP layer on its own output. The
+    /// verify runs `K + 1` positions; byte-identical to greedy whatever `K`.
+    #[arg(long, default_value_t = 1)]
+    mtp_k: usize,
+
     /// Rollback probe: after the prompt, run N verify rounds whose draft is
     /// always wrong (each round rewinds and replays its anchor), then compare
     /// every state channel's checksum against a fresh cache that decoded the
@@ -817,7 +823,8 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         cache.want_nextn = true;
         let mut session = Session::new(model, cache);
         let mut drafter =
-            MtpDrafter::new(head, model.embed_tokens(), model.lm_head(), &cfg, device);
+            MtpDrafter::new(head, model.embed_tokens(), model.lm_head(), &cfg, device)
+                .with_k(args.mtp_k);
         let mut rb = Blocking::new(eos_ids, device)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let opts = DecodeOptions::new(args.max_tokens);

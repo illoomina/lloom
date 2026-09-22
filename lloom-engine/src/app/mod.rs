@@ -129,6 +129,11 @@ pub struct ModelArgs {
     #[arg(long)]
     pub mtp: Option<PathBuf>,
 
+    /// Qwen4-exp `--mtp`: tokens the drafter proposes per round (the one MTP
+    /// layer re-applied `K` times; the verify runs `K + 1` positions).
+    #[arg(long, default_value_t = 1)]
+    pub mtp_k: usize,
+
     /// Qwen4-exp `--experts stream`: the expert hotlist file — read at load
     /// to warm every layer's pool before the first request (§20.3 R2; a
     /// missing file warms nothing), written at shutdown with the usage
@@ -276,6 +281,7 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 mtp: model.mtp.clone(),
                 hotlist: model.hotlist.clone(),
                 batch: shape.batch,
+                mtp_k: model.mtp_k,
             })?;
             Ok((engine, first))
         }

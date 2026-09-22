@@ -128,6 +128,16 @@ pub struct MtpDrafter<'a, R: ExpertResidency> {
     prompt: Vec<u32>,
     seeded: bool,
     draft: Option<u32>,
+    /// Tokens proposed per round: the first from the target's carry at the
+    /// last accepted position, each further one from the MTP layer re-applied
+    /// on its own `multi` output with the previous draft's embedding (vLLM's
+    /// scheme for `mtp_num_hidden_layers` 1: the one layer, `k` times). The
+    /// re-applications run under a window on the layer's own cache and are
+    /// rewound: only observed rows key it.
+    k: usize,
+    /// The MTP layer's pre-collapse carry after the last observed row — the
+    /// state a second draft step continues from.
+    multi: Option<Tensor>,
     rows_seen: usize,
 }
 
@@ -148,8 +158,21 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
             prompt: Vec::new(),
             seeded: false,
             draft: None,
+            k: 1,
+            multi: None,
             rows_seen: 0,
         }
+    }
+
+    /// Propose `k` tokens a round (`k ≥ 1`; the target verifies `k + 1`
+    /// positions sequentially, byte-identical to greedy whatever `k`).
+    pub fn with_k(mut self, k: usize) -> Self {
+        self.k = k.max(1);
+        self
+    }
+
+    pub fn k(&self) -> usize {
+        self.k
     }
 
     /// Positions the MTP layer has been keyed with.
@@ -175,7 +198,7 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
     }
 
     fn max_draft(&self) -> usize {
-        1
+        self.k
     }
 
     fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
@@ -186,6 +209,7 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
         self.prompt = prompt.to_vec();
         self.seeded = false;
         self.draft = None;
+        self.multi = None;
         self.rows_seen = 0;
         Ok(())
     }
@@ -199,7 +223,44 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
         }
         // Before the first `observe` there is no carry to draft from; propose
         // id 0 — any proposal is corrected by the verify.
-        Ok(vec![Draft::host(vec![self.draft.unwrap_or(0)])])
+        let first = self.draft.unwrap_or(0);
+        let mut tokens = vec![first];
+        if self.k > 1 {
+            if let Some(multi0) = self.multi.clone() {
+                // The layer re-applied on its own carry with the previous
+                // draft's embedding, `k − 1` times, under a window rewound
+                // after: the layer's cache keeps only what `observe` keyed.
+                self.cache.open_window()?;
+                let mut multi = multi0;
+                let mut result = Ok(());
+                for _ in 1..self.k {
+                    let prev = *tokens.last().expect("one token");
+                    let toks = Tensor::from_vec(vec![prev], (1, 1), &self.device)?;
+                    let step = (|| -> Result<u32> {
+                        let emb = self.embed.embedding(&toks)?;
+                        let (sample, next_multi) =
+                            self.head.forward(&multi, &emb, &mut self.cache)?;
+                        let logits = self.lm_head.forward(&sample)?;
+                        let next = logits
+                            .flatten_all()?
+                            .argmax(D::Minus1)?
+                            .to_scalar::<u32>()?;
+                        multi = next_multi;
+                        Ok(next)
+                    })();
+                    match step {
+                        Ok(next) => tokens.push(next),
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                }
+                self.cache.rewind_window()?;
+                result?;
+            }
+        }
+        Ok(vec![Draft::host(tokens)])
     }
 
     /// `probe [1, a, n·d]` = the target's carries at the `a` positions the
@@ -230,7 +291,8 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
         }
         let toks = Tensor::from_vec(nexts, (1, a), &self.device)?;
         let emb = self.embed.embedding(&toks)?; // [1, a, d]
-        let (sample, _multi) = self.head.forward(probe, &emb, &mut self.cache)?;
+        let (sample, multi) = self.head.forward(probe, &emb, &mut self.cache)?;
+        self.multi = Some(multi.narrow(1, a - 1, 1)?);
         let last = sample.narrow(1, a - 1, 1)?;
         let logits = self.lm_head.forward(&last)?; // [1, 1, vocab]
         let next = logits

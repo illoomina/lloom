@@ -176,6 +176,27 @@ fn mtp_speculative_decode_is_byte_identical_to_greedy() -> Result<()> {
         ref_ids.len()
     );
 
+    // (a') K > 1: the layer re-applied on its own carry for the further
+    // drafts — the greedy stream still, and the drafter's cache keyed only
+    // with the observed rows (the re-applications are rewound).
+    for k in [2usize, 3] {
+        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let mut mtp = MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev)
+            .with_k(k);
+        let (ids, eos, accepted) = speculative(&model, &cfg, &mut mtp, &prompt, max)?;
+        assert_eq!(ids, ref_ids, "MTP drafter at k = {k}: not the greedy stream");
+        assert_eq!(eos, ref_eos);
+        assert!(
+            mtp.rows_seen() >= prompt.len() + ref_ids.len() - 1,
+            "k = {k}: the drafter was keyed with {} rows for {} prompt + {} generated",
+            mtp.rows_seen(),
+            prompt.len(),
+            ref_ids.len()
+        );
+        assert_eq!(mtp.cache().pos, mtp.rows_seen(), "k = {k}: the drafter's cache holds draft-time rows");
+        println!("MTPK k={k} accepted={accepted}");
+    }
+
     // (b) the oracle: every round fully accepted (the resolve path)
     let mut oracle = Oracle {
         stream: ref_ids.clone(),

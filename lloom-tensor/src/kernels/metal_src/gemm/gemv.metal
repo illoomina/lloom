@@ -198,6 +198,32 @@ struct EpilogueSilu {
   }
 };
 
+// The mixed-precision arms' epilogues (`gemv_mixed_*`, lloom's Qwen4-exp
+// dense projections): `silu(s · x)` and `sigmoid(s · x)` on the accumulator,
+// `s` the dispatch's `alpha` — the HyperConnection's `silu(down·x / n)` and
+// `sigmoid(up·lo)` as the store, where the composed path wrote the gemv's
+// output and read it back through `affine`/`silu`/`sigmoid` launches. At the
+// accumulator's precision on the unrounded sum, so a different (more
+// accurate) computation than the chain it replaces (§2.3.5a).
+template <typename T, typename AccT>
+struct EpilogueSiluScale {
+  AccT s;
+  METAL_FUNC EpilogueSiluScale(float s_) : s(static_cast<AccT>(s_)) {}
+  METAL_FUNC AccT operator()(AccT x, int) const {
+    return silu(s * x);
+  }
+};
+
+template <typename T, typename AccT>
+struct EpilogueSigmoidScale {
+  AccT s;
+  METAL_FUNC EpilogueSigmoidScale(float s_) : s(static_cast<AccT>(s_)) {}
+  METAL_FUNC AccT operator()(AccT x, int) const {
+    const AccT y = s * x;
+    return AccT(1) / (AccT(1) + metal::exp(-y));
+  }
+};
+
 // The residual add: `x + residual[out_row]` (issue #509, `DESIGN.md` §12.2e's
 // own recommended candidate, which that catalogue has no row for).
 //
@@ -295,11 +321,17 @@ template <
     const bool kDoAxpby,
     typename AccT = typename GemvDefaultAccT<T>::type,
     typename Prologue = PrologueNone<T, AccT>,
-    typename Epilogue = EpilogueNone<T, AccT>>
+    typename Epilogue = EpilogueNone<T, AccT>,
+    // The vector type: the input vector, the bias and the output. `T` for
+    // every classical arm; `float` against `half` weights on the mixed arms
+    // (`gemv_mixed_*`), which read an f32 activation and store an f32 result
+    // with no cast launch on either side. The matrix stays `T`.
+    typename VT = T>
 struct GEMVKernel {
   using acc_type = AccT;
   using prologue_type = Prologue;
   using epilogue_type = Epilogue;
+  using vec_type = VT;
 
   MLX_MTL_CONST int threadsM = BM * SM;
   MLX_MTL_CONST int threadsN = BN * SN;
@@ -320,6 +352,38 @@ struct GEMVKernel {
     MLX_MTL_PRAGMA_UNROLL
     for (int tn = 0; tn < TN; tn++) {
       dst[tn] = static_cast<U>(src[src_offset + tn]);
+    }
+  }
+
+  // The vector loads, typed on the vector's own element type (`VT`), cast
+  // to the accumulator as they land — the matrix loads above stay on `T`.
+  template <typename S, typename U>
+  static METAL_FUNC void load_vec_unsafe(
+      const device S* src, thread U dst[TN], const int src_offset = 0) {
+    MLX_MTL_PRAGMA_UNROLL
+    for (int tn = 0; tn < TN; tn++) {
+      dst[tn] = static_cast<U>(src[src_offset + tn]);
+    }
+  }
+
+  template <typename S, typename U>
+  static METAL_FUNC void load_vec_safe(
+      const device S* src,
+      thread U dst[TN],
+      const int src_offset = 0,
+      const int src_size = TN) {
+    if (src_offset + TN <= src_size) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tn = 0; tn < TN; tn++) {
+        dst[tn] = static_cast<U>(src[src_offset + tn]);
+      }
+    } else {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int tn = 0; tn < TN; tn++) {
+        dst[tn] = src_offset + tn < src_size
+            ? static_cast<U>(src[src_offset + tn])
+            : U(0);
+      }
     }
   }
 
@@ -346,9 +410,9 @@ struct GEMVKernel {
 
   static METAL_FUNC void run(
       const device T* mat,
-      const device T* in_vec,
-      const device T* bias,
-      device T* out_vec,
+      const device VT* in_vec,
+      const device VT* bias,
+      device VT* out_vec,
       const int in_vec_size,
       const int out_vec_size,
       const int matrix_ld,
@@ -394,7 +458,7 @@ struct GEMVKernel {
     const int leftover = in_size - last_iter;
 
     for (int i = 0; i < n_iter; ++i) {
-      load_unsafe<AccT>(in_vec, v_coeff, bn);
+      load_vec_unsafe<VT, AccT>(in_vec, v_coeff, bn);
 
       // The prologue transforms the input vector in registers, so a fused
       // producer's output is never written to memory (issue #266). Under
@@ -419,7 +483,7 @@ struct GEMVKernel {
     }
 
     if (leftover > 0) {
-      load_safe<AccT>(in_vec, v_coeff, bn, in_size);
+      load_vec_safe<VT, AccT>(in_vec, v_coeff, bn, in_size);
       // Guarded by `bn + tn < in_size`: `load_safe` zero-fills past the end,
       // and the prologue must not index its weight out of bounds there. A
       // zero times anything is zero, so skipping the transform on the padding
@@ -490,10 +554,10 @@ struct GEMVKernel {
         const AccT y = epilogue(result[tm], out_row + tm);
         if (kDoAxpby) {
           out_vec[out_row + tm] =
-              static_cast<T>(alpha) * static_cast<T>(y) +
-              static_cast<T>(beta) * bias[(out_row + tm) * bias_stride];
+              static_cast<VT>(alpha) * static_cast<VT>(y) +
+              static_cast<VT>(beta) * bias[(out_row + tm) * bias_stride];
         } else {
-          out_vec[out_row + tm] = static_cast<T>(y);
+          out_vec[out_row + tm] = static_cast<VT>(y);
         }
       }
     }
@@ -723,12 +787,13 @@ template <
     const bool kDoAxpby,
     typename Prologue,
     typename Epilogue,
+    typename VT,
     typename ShapeP, typename StrideP>
 METAL_FUNC void gemv_body(
     const device T* mat,
-    const device T* in_vec,
-    const device T* bias,
-    device T* out_vec,
+    const device VT* in_vec,
+    const device VT* bias,
+    device VT* out_vec,
     const int in_vec_size,
     const int out_vec_size,
     const int matrix_ld,
@@ -749,7 +814,7 @@ METAL_FUNC void gemv_body(
     uint simd_lid) {
   using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby,
                               typename GemvDefaultAccT<T>::type, Prologue,
-                              Epilogue>;
+                              Epilogue, VT>;
 
   if (kDoNCBatch) {
     in_vec += gemv_elem_to_loc<int64_t>(tid.z, batch_shape, vector_batch_stride, batch_ndim);
@@ -1955,6 +2020,96 @@ void gemv_t_packed(
   instantiate_gemv_nc_axpby(gemv_t, nm, itype, 1,  4,  8, 4, 4, 4)      \
   instantiate_gemv_nc_axpby(gemv_t, nm, itype, 1, 16,  8, 4, 4, 4)      \
   instantiate_gemv_nc_axpby(gemv_t, nm, itype, 1, 16,  4, 8, 4, 4)
+
+
+///////////////////////////////////////////////////////////////////////////////
+/// The mixed-precision arms: `half` weights, `float` vector in and out
+/// (lloom's Qwen4-exp dense projections — the HyperConnection low-rank pair,
+/// the routers, DeltaNet's α/β — are BF16 in the checkpoint and the model's
+/// activations are f32). The classical path cast the activation to half, ran
+/// `gemv_float16` and cast the result back: two launches around every one of
+/// ~375 gemvs a token. These read the f32 vector as it lies and store f32,
+/// accumulating in f32 as the half arm does. `alpha` is the epilogue's
+/// pre-scale on the `_silu`/`_sigmoid` arms (`kDoAxpby` is never set here).
+///////////////////////////////////////////////////////////////////////////////
+
+#define gemv_mixed_wrapper(func, EPI, EPI_CTOR)                                   \
+template <                                                                        \
+    typename T, typename VT,                                                      \
+    const int BM, const int BN,                                                   \
+    const int SM, const int SN,                                                   \
+    const int TM, const int TN,                                                   \
+    const bool kDoNCBatch,                                                        \
+    const bool kDoAxpby>                                                          \
+[[kernel, max_total_threads_per_threadgroup(BM * BN * 32)]]                       \
+void func(                                                                        \
+    const device T* mat [[buffer(0)]],                                            \
+    const device VT* in_vec [[buffer(1)]],                                        \
+    const device VT* bias [[buffer(2)]],                                          \
+    device VT* out_vec [[buffer(3)]],                                             \
+    const constant int& in_vec_size [[buffer(4)]],                                \
+    const constant int& out_vec_size [[buffer(5)]],                               \
+    const constant int& matrix_ld [[buffer(6)]],                                  \
+    const constant float& alpha [[buffer(7)]],                                    \
+    const constant float& beta [[buffer(8)]],                                     \
+    const constant int& batch_ndim [[buffer(9)]],                                 \
+    const constant int* batch_shape [[buffer(10)]],                               \
+    const constant int64_t* vector_batch_stride [[buffer(11)]],                   \
+    const constant int64_t* matrix_batch_stride [[buffer(12)]],                   \
+    const constant int64_t* bias_batch_stride [[buffer(13)]],                     \
+    const constant int& bias_stride [[buffer(14)]],                               \
+    uint3 tid [[threadgroup_position_in_grid]],                                   \
+    uint3 lid [[thread_position_in_threadgroup]],                                 \
+    uint simd_gid [[simdgroup_index_in_threadgroup]],                             \
+    uint simd_lid [[thread_index_in_simdgroup]],                                  \
+    EOS_GATE_ARG) {                                                               \
+    EOS_GATE_CHECK                                                                \
+  using acc_t = typename GemvDefaultAccT<T>::type;                                \
+  using prologue_t = PrologueNone<T, acc_t>;                                      \
+  using epilogue_t = EPI<T, acc_t>;                                               \
+  using kernel_t = GEMVKernel<T, BM, BN, SM, SN, TM, TN, kDoAxpby, acc_t,         \
+                              prologue_t, epilogue_t, VT>;                        \
+  gemv_tgp_memory(kernel_t);                                                      \
+  const prologue_t prologue(nullptr, nullptr);                                    \
+  gemv_body<T, BM, BN, SM, SN, TM, TN, kDoNCBatch, kDoAxpby, prologue_t,          \
+                 epilogue_t>(                                                     \
+      mat, in_vec, bias, out_vec,                                                 \
+      in_vec_size, out_vec_size, matrix_ld, alpha, beta,                          \
+      batch_ndim, batch_shape, vector_batch_stride, matrix_batch_stride,          \
+      bias_batch_stride, bias_stride,                                             \
+      kernel_t::tgp_mem_size == 0 ? nullptr : tgp_memory,                         \
+      prologue, EPI_CTOR,                                                         \
+      tid, lid, simd_gid, simd_lid);                                              \
+}
+
+gemv_mixed_wrapper(gemv_mixed, EpilogueNone, epilogue_t())
+gemv_mixed_wrapper(gemv_mixed_silu, EpilogueSiluScale, epilogue_t(alpha))
+gemv_mixed_wrapper(gemv_mixed_sigmoid, EpilogueSigmoidScale, epilogue_t(alpha))
+
+#define instantiate_gemv_mixed_helper(func, nm, wtype, vtype, bm, bn, sm, sn, tm, tn, suffix) \
+  template [[host_name(                                                                      \
+      "gemv_mixed_" #nm "_bm" #bm "_bn" #bn "_sm" #sm "_sn" #sn                              \
+            "_tm" #tm "_tn" #tn "_nc0_axpby0" suffix)]]                                      \
+  [[kernel]] decltype(func<wtype, vtype, bm, bn, sm, sn, tm, tn, false, false>)               \
+             func<wtype, vtype, bm, bn, sm, sn, tm, tn, false, false>;
+
+#define instantiate_gemv_mixed_tile(nm, wtype, vtype, bm, bn, sm, sn, tm, tn)                 \
+  instantiate_gemv_mixed_helper(gemv_mixed, nm, wtype, vtype, bm, bn, sm, sn, tm, tn, "")     \
+  instantiate_gemv_mixed_helper(gemv_mixed_silu, nm, wtype, vtype, bm, bn, sm, sn, tm, tn, "_silu") \
+  instantiate_gemv_mixed_helper(gemv_mixed_sigmoid, nm, wtype, vtype, bm, bn, sm, sn, tm, tn, "_sigmoid")
+
+// The seven `gemv` tiles `derive_gemv_tile` can select, at `tm` 4 and 1.
+#define instantiate_gemv_mixed_blocks(nm, wtype, vtype)                  \
+  instantiate_gemv_mixed_tile(nm, wtype, vtype, 1,  8, 1, 32, 4, 4)      \
+  instantiate_gemv_mixed_tile(nm, wtype, vtype, 1,  8, 1, 32, 1, 4)      \
+  instantiate_gemv_mixed_tile(nm, wtype, vtype, 1,  1, 8,  4, 4, 4)      \
+  instantiate_gemv_mixed_tile(nm, wtype, vtype, 1,  1, 8,  4, 1, 4)      \
+  instantiate_gemv_mixed_tile(nm, wtype, vtype, 4,  1, 1, 32, 1, 4)      \
+  instantiate_gemv_mixed_tile(nm, wtype, vtype, 4,  1, 1, 32, 4, 4)      \
+  instantiate_gemv_mixed_tile(nm, wtype, vtype, 8,  1, 1, 32, 4, 4)      \
+  instantiate_gemv_mixed_tile(nm, wtype, vtype, 8,  1, 1, 32, 1, 4)
+
+instantiate_gemv_mixed_blocks(f16w_f32, half, float)
 
 instantiate_gemv_blocks(float32, float)
 instantiate_gemv_blocks(float16, half)

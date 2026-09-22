@@ -14,6 +14,7 @@
 //! build_hc_combine); the math is mirrored, the layout is candle row-major.
 
 use crate::nn::ops;
+use lloom_tensor::quantized::gemv_mixed::MixedEpilogue;
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{Module, Result, Tensor};
 
@@ -97,10 +98,19 @@ impl HyperConnection {
         let (b, seq, _) = h.dims3()?;
         let xn = grouped_rms_norm(h, &self.unit_d, &self.norm_w, self.n, self.d, self.eps)?; // [b, seq, n*d]
 
-        // Low-rank gate prediction on the normed carry.
-        let lo = self.down.forward(&xn)?; // [b, seq, hc_lr]
-        let lo = ops::silu(&(lo * (1.0 / self.n as f64))?)?;
-        let gate = ops::sigmoid(&self.up.forward(&lo)?)?; // [b, seq, n*d]
+        // Low-rank gate prediction on the normed carry. On Metal at decode
+        // row counts the two projections take the mixed arm with the scale
+        // and the activation as the store's epilogue (`QMatMul::gemv_mixed`:
+        // one launch each, f32 in and out); elsewhere the composed chain.
+        let inv_n = 1.0 / self.n as f64;
+        let lo = match self.down.gemv_mixed(&xn, MixedEpilogue::Silu, inv_n as f32) {
+            Some(lo) => lo?,
+            None => ops::silu(&(self.down.forward(&xn)? * inv_n)?)?,
+        }; // [b, seq, hc_lr]
+        let gate = match self.up.gemv_mixed(&lo, MixedEpilogue::Sigmoid, 1.0) {
+            Some(g) => g?,
+            None => ops::sigmoid(&self.up.forward(&lo)?)?,
+        }; // [b, seq, n*d]
 
         // Gate the streams, then collapse them by their mean.
         let gated = (xn.clone() * gate)?; // [b, seq, n*d]

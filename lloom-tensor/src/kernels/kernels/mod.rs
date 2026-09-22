@@ -47,8 +47,8 @@ pub use flash_decoding::{
 pub use indexing::*;
 pub use indexing_names::IndexingKernel;
 pub use mlx_gemm::{
-    call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_epilogue, call_mlx_gemv_full, call_mlx_gemv_with,
-    GemmDType, GemvEpilogue, GemvRmsNorm, SKINNY_TILE_MAX_M,
+    call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_epilogue, call_mlx_gemv_full, call_mlx_gemv_mixed,
+    call_mlx_gemv_with, GemmDType, GemvEpilogue, GemvRmsNorm, MixedEpilogue, SKINNY_TILE_MAX_M,
 };
 pub use qwen4exp::call_unit_lower_inverse;
 pub use scratch::{

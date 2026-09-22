@@ -1136,6 +1136,105 @@ pub fn call_mlx_gemv_epilogue(
     Ok(())
 }
 
+/// The epilogue of a [`call_mlx_gemv_mixed`] dispatch (`gemv.metal`'s
+/// `EpilogueSiluScale` / `EpilogueSigmoidScale`): `silu(scale · y)` or
+/// `sigmoid(scale · y)` on the f32 accumulator at the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MixedEpilogue {
+    #[default]
+    None,
+    Silu,
+    Sigmoid,
+}
+
+impl MixedEpilogue {
+    pub fn name_suffix(self) -> &'static str {
+        match self {
+            MixedEpilogue::None => "",
+            MixedEpilogue::Silu => "_silu",
+            MixedEpilogue::Sigmoid => "_sigmoid",
+        }
+    }
+}
+
+/// `out[b, :] = epilogue(scale · mat · vec[b, :])` for `b` f32 vectors of `k`
+/// against ONE `[n_out, k]` row-major **f16** matrix, f32 out — the
+/// `gemv_mixed_f16w_f32_*` arms: the f32 activation read as it lies, the f32
+/// result stored, f32 accumulation, no cast launch on either side (the
+/// classical route cast to f16, ran `gemv_float16` and cast back — three
+/// launches for one). The tile is `derive_gemv_tile`'s, as the classical
+/// non-transposed path picks it; `ParamStyle::Split` only.
+///
+/// `vec` is `b` contiguous rows of `k` (`vec_batch_stride` elements apart);
+/// `mat` is shared across the batch.
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_gemv_mixed(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (b, n_out, k): (usize, usize, usize),
+    mat_buffer: &Buffer,
+    mat_offset: usize,
+    vec_buffer: &Buffer,
+    vec_offset: usize,
+    vec_batch_stride: usize,
+    output: &Buffer,
+    epilogue: MixedEpilogue,
+    scale: f32,
+) -> Result<(), MetalKernelError> {
+    let (bm, bn, sm, sn) = derive_gemv_tile(n_out, k);
+    let tm: usize = if n_out < 4 { 1 } else { 4 };
+    let tn: usize = 4;
+    let name = format!(
+        "gemv_mixed_f16w_f32_bm{bm}_bn{bn}_sm{sm}_sn{sn}_tm{tm}_tn{tn}_nc0_axpby0{}",
+        epilogue.name_suffix()
+    );
+    let pipeline = kernels.load_pipeline(device, Source::Gemv, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    let batch_shape = [b as i32];
+    let vec_batch_strides = [vec_batch_stride as i64];
+    let mat_batch_strides = [0i64];
+    let bias_batch_strides = [0i64];
+    set_params!(
+        encoder,
+        (
+            Input::with_offset(mat_buffer, mat_offset),
+            Input::with_offset(vec_buffer, vec_offset),
+            (), // bias
+            Output::new(output),
+            k as i32,
+            n_out as i32,
+            k as i32, // matrix_ld: row-major [n_out, k]
+            scale,    // alpha: the epilogue's pre-scale
+            0.0f32,   // beta
+            1i32,     // batch_ndim
+            &batch_shape[..],
+            &vec_batch_strides[..],
+            &mat_batch_strides[..],
+            &bias_batch_strides[..],
+            1i32 // bias_stride
+        )
+    );
+    let n_out_per_tgp = bm * sm * tm;
+    let n_tgp = n_out.div_ceil(n_out_per_tgp);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: n_tgp,
+            height: 1,
+            depth: b.max(1),
+        },
+        MTLSize {
+            width: 32,
+            height: bn,
+            depth: bm,
+        },
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn call_mlx_gemm(
     device: &Device,

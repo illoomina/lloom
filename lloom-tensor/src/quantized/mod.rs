@@ -8,6 +8,7 @@ use std::{borrow::Cow, sync::OnceLock};
 pub mod avx;
 mod dummy_cuda;
 mod dummy_metal;
+pub mod gemv_mixed;
 pub mod ggml_file;
 pub mod gguf_file;
 pub mod imatrix_file;
@@ -995,9 +996,11 @@ impl QTensor {
         let shape = shape.into();
         check_shape(&shape, dtype.block_size())?;
         let storage = match device {
-            Device::Metal(d) => {
-                QStorage::Metal(metal::QMetalStorage::persistent(d, shape.elem_count(), dtype)?)
-            }
+            Device::Metal(d) => QStorage::Metal(metal::QMetalStorage::persistent(
+                d,
+                shape.elem_count(),
+                dtype,
+            )?),
             other => other.qzeros(shape.elem_count(), dtype)?,
         };
         Self::new(storage, shape)
@@ -1393,6 +1396,13 @@ impl crate::Module for QMatMul {
                 xs.matmul(&w)
             }
             Self::TensorF16(w) => {
+                // A decode step's rows on Metal: the mixed arm, f32 in and
+                // out, no cast launches (`gemv_mixed`). Everything else — a
+                // prefill's rows, the CPU, a half activation — the classical
+                // route.
+                if let Some(out) = self.gemv_mixed(xs, gemv_mixed::MixedEpilogue::None, 1.0) {
+                    return out;
+                }
                 let in_dtype = xs.dtype();
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
@@ -1402,5 +1412,48 @@ impl crate::Module for QMatMul {
                 xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
             }
         }
+    }
+}
+
+impl QMatMul {
+    /// `epilogue(scale · xs · Wᵀ)` for f16 weights and an f32 `xs` of at most
+    /// [`gemv_mixed::GEMV_MIXED_MAX_ROWS`] rows, as ONE launch on Metal
+    /// (`gemv_mixed`), `None` where the arm does not apply — the CPU, another
+    /// weight kind, a half activation, a prefill's row count — so the caller
+    /// composes the classical route instead. Never a silent fallback to a
+    /// different arithmetic: the caller sees which arm ran.
+    pub fn gemv_mixed(
+        &self,
+        xs: &Tensor,
+        epilogue: gemv_mixed::MixedEpilogue,
+        scale: f32,
+    ) -> Option<Result<Tensor>> {
+        let w = match self {
+            Self::TensorF16(w) => w,
+            _ => return None,
+        };
+        if !xs.device().is_metal()
+            || xs.dtype() != DType::F32
+            || w.dtype() != DType::F16
+            || w.rank() != 2
+            || !w.is_contiguous()
+            || !xs.is_contiguous()
+            || xs.rank() < 1
+        {
+            return None;
+        }
+        let k = w.dim(1).ok()?;
+        if xs.dim(xs.rank() - 1).ok()? != k {
+            return None;
+        }
+        let rows = xs.elem_count() / k;
+        if rows == 0 || rows > gemv_mixed::GEMV_MIXED_MAX_ROWS {
+            return None;
+        }
+        Some(xs.apply_op1_no_bwd(&gemv_mixed::GemvMixed {
+            w: w.clone(),
+            epilogue,
+            scale,
+        }))
     }
 }

@@ -198,17 +198,21 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
             let align = 2;
             (nth0, nth1, align)
         }
+        // The dense-weight template (`kernel_mul_mv_impl`, f32 / f16): one
+        // simdgroup per OUTPUT ROW (`r0 = tgpig.x`), so the grid is one
+        // threadgroup per row — `align` 1. An `align` of 8 here dispatched
+        // n/8 threadgroups and left 7 rows in 8 of every output unwritten
+        // (the f32-expert test models decoded whatever the buffer held).
         GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K => {
-            // Original implem uses rows
             let nth0 = 32;
             let nth1 = 1;
-            let align = 8;
+            let align = 1;
             (nth0, nth1, align)
         }
         GgmlDType::F32 => {
             let nth0 = 32;
             let nth1 = 1;
-            let align = 8;
+            let align = 1;
             (nth0, nth1, align)
         }
         // IQ family: 64 threads = 2 simdgroups. Rows per threadgroup is the
@@ -279,18 +283,21 @@ pub fn call_quantized_matmul_mv_t(
     let ne02 = b as i64;
     let ne03 = 1i64;
 
-    let nb00 = 0i64;
-    let nb01 = 0i64;
-    let nb02 = 0i64;
+    // The strides in bytes (the f32 / f16 template steps rows and batches
+    // by them; the quantized impls address from the block geometry).
+    let row_bytes = ((k / dtype_block_size(dtype)) * dtype_type_size(dtype)) as i64;
+    let nb00 = dtype_type_size(dtype) as i64;
+    let nb01 = row_bytes;
+    let nb02 = n as i64 * row_bytes;
 
     let ne10 = k as i64;
     let ne11 = m as i64;
     let ne12 = b as i64;
     let ne13 = 1i64;
 
-    let nb10 = 0i64;
-    let nb11 = 0i64;
-    let nb12 = 0i64;
+    let nb10 = core::mem::size_of::<f32>() as i64;
+    let nb11 = k as i64 * nb10;
+    let nb12 = m as i64 * nb11;
 
     let ne0 = n as i64;
     let ne1 = m as i64;
@@ -510,9 +517,15 @@ pub fn call_quantized_matmul_mv_id_t(
     let ne00 = k as i64;
     let ne01 = n as i64;
     let ne02 = n_experts as i64;
-    let nb00 = 0u64;
-    let nb01 = 0u64;
-    let nb02 = (n * (k / dtype_block_size(dtype)) * dtype_type_size(dtype)) as u64;
+    // The weight strides in bytes. The quantized impls address rows from
+    // `ne00` and the block geometry, but the f32 / f16 template
+    // (`kernel_mul_mv_impl`) steps rows by `nb01` — a zero here made every
+    // output row read row 0 of the plane (every f32-expert test model on
+    // Metal decoded garbage, finitely).
+    let row_bytes = ((k / dtype_block_size(dtype)) * dtype_type_size(dtype)) as u64;
+    let nb00 = dtype_type_size(dtype) as u64;
+    let nb01 = row_bytes;
+    let nb02 = n as u64 * row_bytes;
     let ne10 = k as i64;
     let ne11 = in_dim1 as i64;
     let ne12 = batch as i64;

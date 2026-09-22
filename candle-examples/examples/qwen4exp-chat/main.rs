@@ -21,12 +21,15 @@
 use anyhow::{Context, Result};
 use candle::{Device, Tensor};
 use clap::Parser;
+use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::loader::{LoadOptions, StreamLoader, StreamOptions};
 use lloom::models::qwen4exp::model::PrefillMode;
-use lloom::models::qwen4exp::{Cache, ExpertResidency, Qwen4Exp, Resident, Streamed};
+use lloom::models::qwen4exp::{Cache, ExpertResidency, MtpDrafter, Qwen4Exp, Resident, Streamed};
 use lloom::nn::expert_stream::HasStreamStats;
 use lloom::nn::model::CausalLM;
 use lloom::nn::observer::{ForwardObserver, HookPoint};
+use lloom::nn::speculator::{Anchor, Draft, Probes};
+use lloom::nn::{DecodeOptions, Session};
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
 
@@ -58,6 +61,21 @@ struct Args {
     /// Rows of the PLE hot-row cache (0 = read the memory map every gather).
     #[arg(long, default_value_t = 0)]
     ple_cache_rows: usize,
+
+    /// The GGUF carrying the MTP head (`blk.{n_layers}.*` + `nextn.*`, ds4's
+    /// naming — `qwen4exp-mtp-quantize` writes one). After the greedy runs the
+    /// prompt is decoded once more through `Session::decode_speculative` with
+    /// the `MtpDrafter`; its stream must equal the greedy stream, and the
+    /// draft acceptance rate is printed (`MTP …`).
+    #[arg(long)]
+    mtp: Option<PathBuf>,
+
+    /// Rollback probe: after the prompt, run N verify rounds whose draft is
+    /// always wrong (each round rewinds and replays its anchor), then compare
+    /// every state channel's checksum against a fresh cache that decoded the
+    /// same tokens greedily. Prints the channels that differ. 0 = off.
+    #[arg(long, default_value_t = 0)]
+    rollback_probe: usize,
 
     /// How the routed experts are held: `resident` (every expert in RAM) or
     /// `stream` (a per-layer slot pool filled from the shards).
@@ -277,6 +295,9 @@ fn main() -> Result<()> {
             shards.push(p.clone());
         }
     }
+    if let Some(p) = &args.mtp {
+        shards.push(p.clone());
+    }
     let moe_act = match args.moe_act.as_str() {
         "f32" => None,
         "f16" => Some(candle::DType::F16),
@@ -287,6 +308,7 @@ fn main() -> Result<()> {
         ple: !args.no_ple,
         moe_act,
         ple_cache_rows: (args.ple_cache_rows > 0).then_some(args.ple_cache_rows),
+        mtp: args.mtp.is_some(),
     };
     let prefill_mode = match args.prefill.as_str() {
         "chunk" => PrefillMode::Chunk,
@@ -385,6 +407,16 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         args.loader,
     );
 
+    if args.rollback_probe > 0 {
+        rollback_probe(
+            model,
+            &cfg,
+            device,
+            prompt_ids,
+            eos_ids,
+            args.rollback_probe,
+        )?;
+    }
     let mut digests = Vec::with_capacity(args.runs);
     let mut last_text = String::new();
     for run in 0..args.runs {
@@ -552,6 +584,52 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         digests.first().cloned().unwrap_or_default()
     );
     let mut ok = identical;
+    if let Some(head) = model.mtp_head() {
+        // One speculative decode of the same prompt: the MTP drafter on the
+        // seam, verified by the target; must equal the greedy stream.
+        let mut cache: Cache = model.new_cache(&cfg, device)?;
+        cache.want_nextn = true;
+        let mut session = Session::new(model, cache);
+        let mut drafter =
+            MtpDrafter::new(head, model.embed_tokens(), model.lm_head(), &cfg, device);
+        let mut rb = Blocking::new(eos_ids, device)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let opts = DecodeOptions::new(args.max_tokens);
+        let t2 = std::time::Instant::now();
+        let out = session.decode_speculative(
+            &mut drafter,
+            &mut rb,
+            &mut sampler,
+            prompt_ids,
+            &opts,
+            eos_ids,
+            &mut |_| Ok(()),
+        )?;
+        let mtp_ms = t2.elapsed().as_millis();
+        let mut h = sha256::Sha256::new();
+        for t in &out.ids {
+            h.update(&t.to_le_bytes());
+        }
+        let mtp_digest = sha256::hex(&h.finalize());
+        let rounds = out.stats.rounds.len();
+        let accepted_drafts = out.stats.rounds.iter().filter(|r| r.accepted > 1).count();
+        let tokens: usize = out.stats.rounds.iter().map(|r| r.accepted).sum();
+        let same = digests.first().map(|d| d == &mtp_digest).unwrap_or(false);
+        println!(
+            "output(mtp): {}",
+            tokenizer
+                .decode(&out.ids, true)
+                .map_err(anyhow::Error::msg)?
+        );
+        println!(
+            "MTP tokens_sha256={mtp_digest} identical_to_greedy={same} generated={} rounds={rounds} accepted_drafts={accepted_drafts} draft_accept_rate={:.4} tokens_per_round={:.3} drafter_rows={} wall_ms={mtp_ms}",
+            out.ids.len(),
+            accepted_drafts as f64 / rounds.max(1) as f64,
+            tokens as f64 / rounds.max(1) as f64,
+            drafter.rows_seen()
+        );
+        ok &= same;
+    }
     if let Some(expect) = &args.expect {
         let found = last_text.to_lowercase().contains(&expect.to_lowercase());
         println!("TEXT expect={expect:?} found={found}");
@@ -561,6 +639,136 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         anyhow::bail!("gate FAILED (identical={identical})");
     }
     Ok(())
+}
+
+/// The rollback probe (see `--rollback-probe`).
+fn rollback_probe<R: ExpertResidency>(
+    model: &Qwen4Exp<R>,
+    cfg: &lloom::models::qwen4exp::Config,
+    device: &Device,
+    prompt_ids: &[u32],
+    eos_ids: &[u32],
+    rounds: usize,
+) -> Result<()> {
+    let wrong = cfg.vocab_size as u32 - 2;
+    let mode = std::env::var("QWEN4EXP_ROLLBACK_MODE").unwrap_or_else(|_| "rounds".into());
+    // subject: verify rounds with a wrong draft, each a partial accept
+    let mut sub: Cache = model.new_cache(cfg, device)?;
+    sub.want_nextn = true;
+    let input = Tensor::from_vec(prompt_ids.to_vec(), (1, prompt_ids.len()), device)?;
+    let logits = model.forward(&input, 0, &mut sub)?;
+    let _ = model.take_probe(&mut sub)?;
+    let mut anchor = argmax(&logits)?;
+    let mut consumed: Vec<u32> = Vec::new();
+    if mode == "roundtrip" {
+        // open + rewind with no forward in between: the snapshot/restore alone
+        let before = sub.checksums()?;
+        for _ in 0..rounds {
+            sub.open_window()?;
+            sub.rewind_window()?;
+        }
+        let after = sub.checksums()?;
+        let diff = before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| a.1 != b.1)
+            .count();
+        println!(
+            "ROLLBACK roundtrip x{rounds}: channels={} differing={diff}",
+            before.len()
+        );
+        // and open + one forward + rewind: the restore after a write
+        let before = sub.checksums()?;
+        sub.open_window()?;
+        let inp = Tensor::from_vec(vec![anchor], (1, 1), device)?;
+        model.forward(&inp, sub.pos, &mut sub)?;
+        sub.rewind_window()?;
+        let after = sub.checksums()?;
+        let diff = before
+            .iter()
+            .zip(&after)
+            .filter(|(a, b)| a.1 != b.1)
+            .count();
+        println!(
+            "ROLLBACK open+forward+rewind: channels={} differing={diff} pos={}",
+            before.len(),
+            sub.pos
+        );
+        return Ok(());
+    }
+    for r in 0..rounds {
+        let (acc, _probe) = model.verify_and_probe(
+            &[Draft::host(vec![wrong])],
+            &[Anchor {
+                last: anchor,
+                pos: sub.pos,
+            }],
+            &mut sub,
+            eos_ids,
+        )?;
+        let acc = &acc[0];
+        println!(
+            "ROLLBACK round={r} anchor={anchor} accepted={acc:?} pos_after={}",
+            sub.pos
+        );
+        consumed.push(anchor);
+        anchor = acc[0];
+        if acc.len() != 1 {
+            anyhow::bail!("the wrong draft was accepted");
+        }
+    }
+    // reference: the same tokens decoded greedily, one per forward
+    let mut refc: Cache = model.new_cache(cfg, device)?;
+    model.forward(&input, 0, &mut refc)?;
+    let mut ref_next = Vec::new();
+    for &t in &consumed {
+        let inp = Tensor::from_vec(vec![t], (1, 1), device)?;
+        let lg = model.forward(&inp, refc.pos, &mut refc)?;
+        ref_next.push(argmax(&lg)?);
+    }
+    println!("ROLLBACK consumed={consumed:?} reference_next={ref_next:?} subject_next={anchor} pos sub={} ref={}", sub.pos, refc.pos);
+    let a = sub.checksums()?;
+    let b = refc.checksums()?;
+    let mut diff = 0;
+    for ((n1, h1, _), (n2, h2, _)) in a.iter().zip(&b) {
+        if n1 != n2 || h1 != h2 {
+            diff += 1;
+            if diff <= 12 {
+                println!("ROLLBACK DIFF {n1}: subject={h1:016x} reference={h2:016x}");
+            }
+        }
+    }
+    println!("ROLLBACK channels={} differing={diff}", a.len());
+    // magnitudes on a few channels
+    for l in [0usize, 1, 2] {
+        if let (Some(x), Some(y)) = (sub.s_state.get(l), refc.s_state.get(l)) {
+            let (m, n) = maxdiff(x, y)?;
+            println!("ROLLBACK S[{l}] max|Δ|={m:.3e} max|ref|={n:.3e}");
+        }
+        if let (Some(x), Some(y)) = (sub.conv_state.get(l), refc.conv_state.get(l)) {
+            let (m, n) = maxdiff(x, y)?;
+            println!("ROLLBACK conv[{l}] max|Δ|={m:.3e} max|ref|={n:.3e}");
+        }
+    }
+    Ok(())
+}
+
+fn maxdiff(a: &Tensor, b: &Tensor) -> Result<(f32, f32)> {
+    let a = a
+        .flatten_all()?
+        .to_dtype(candle::DType::F32)?
+        .to_vec1::<f32>()?;
+    let b = b
+        .flatten_all()?
+        .to_dtype(candle::DType::F32)?
+        .to_vec1::<f32>()?;
+    let mut m = 0f32;
+    let mut n = 0f32;
+    for (x, y) in a.iter().zip(&b) {
+        m = m.max((x - y).abs());
+        n = n.max(y.abs());
+    }
+    Ok((m, n))
 }
 
 /// FNV over the f32 bit patterns of a logits row (the `STEP` line).

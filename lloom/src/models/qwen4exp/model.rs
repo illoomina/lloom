@@ -406,6 +406,9 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     lm_head: QMatMul,
     /// The N-gram PLE, when its table was loaded (`LoadOptions::ple_shard`).
     ple: Option<Ple>,
+    /// The MTP head, when loaded (`LoadOptions::mtp`); an `MtpDrafter`
+    /// borrows it beside `embed_tokens` and `lm_head`.
+    mtp: Option<super::mtp::MtpHead<R>>,
     prefill_mode: PrefillMode,
     cfg: Config,
 }
@@ -424,9 +427,19 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             hc_head,
             lm_head,
             ple: None,
+            mtp: None,
             prefill_mode: PrefillMode::default(),
             cfg,
         }
+    }
+
+    /// Attach the MTP head.
+    pub fn set_mtp(&mut self, head: super::mtp::MtpHead<R>) {
+        self.mtp = Some(head);
+    }
+
+    pub fn mtp_head(&self) -> Option<&super::mtp::MtpHead<R>> {
+        self.mtp.as_ref()
     }
 
     /// Select how multi-token passes run (see [`PrefillMode`]).
@@ -439,6 +452,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     pub fn set_routed_act(&mut self, dtype: lloom_tensor::DType) {
         for l in &mut self.layers {
             l.moe.set_routed_act(dtype);
+        }
+        if let Some(m) = &mut self.mtp {
+            m.layer_mut().moe_mut().set_routed_act(dtype);
         }
     }
 

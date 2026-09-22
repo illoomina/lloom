@@ -197,8 +197,7 @@ pub fn mtp_head<R: ExpertResidency>(cfg: &Config, dev: &Device, experts: R) -> M
     MtpHead::new(
         RmsNorm::new(ones(d, dev), cfg.norm_eps),
         RmsNorm::new(ones(nd, dev), cfg.norm_eps),
-        lin(d, d, 21.0, dev),
-        lin(d, d, 22.0, dev),
+        lin(d, 2 * d, 21.0, dev),
         layer,
         hc_with(cfg, 400.0, dev, false),
         cfg,

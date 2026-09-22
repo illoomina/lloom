@@ -9,8 +9,11 @@
 //! added to every stream (the layer's `prev_block_output` with no injection —
 //! a plain residual); one full-attention layer (HC-bracketed QSA + MoE, its
 //! own experts and KV) runs on the sum; the head mixer collapses the result
-//! for the SHARED `lm_head`. The MTP module of the HF checkpoint has exactly
-//! one such layer (`mtp.layers.0`), so a draft is one token per round.
+//! for the SHARED `lm_head`. The two projections are held as ONE matrix
+//! `eh_proj [d, 2d] = [fc_embedding | fc_hidden]` applied to `[e | h_stream]`
+//! — ds4's / llama.cpp's `nextn.eh_proj` tensor, the same sum as one dot.
+//! The MTP module of the HF checkpoint has exactly one such layer
+//! (`mtp.layers.0`), so a draft is one token per round.
 //!
 //! Verify is `K+1` sequential decode steps — greedy's own math, position by
 //! position — because the chunk prefill reorders fp32 (Kernel B, the chunk
@@ -36,10 +39,9 @@ pub struct MtpHead<R: ExpertResidency> {
     norm_e: RmsNorm,
     /// `pre_fc_norm_hidden` — RMS over `n·d` on the target's carry.
     norm_h: RmsNorm,
-    /// `fc_embedding [d, d]`.
-    fc_e: QMatMul,
-    /// `fc_hidden [d, d]`, applied per stream.
-    fc_h: QMatMul,
+    /// `eh_proj [d, 2d]` = `[fc_embedding | fc_hidden]`, applied per stream to
+    /// `[normed embedding | normed stream]`.
+    eh_proj: QMatMul,
     /// `layers.0` — a full-attention layer with its own MoE.
     layer: Layer<R>,
     /// `hyper_connection_mixer` — the head collapse (no injection).
@@ -52,8 +54,7 @@ impl<R: ExpertResidency> MtpHead<R> {
     pub fn new(
         norm_e: RmsNorm,
         norm_h: RmsNorm,
-        fc_e: QMatMul,
-        fc_h: QMatMul,
+        eh_proj: QMatMul,
         layer: Layer<R>,
         head_mix: HyperConnection,
         cfg: &Config,
@@ -61,8 +62,7 @@ impl<R: ExpertResidency> MtpHead<R> {
         Self {
             norm_e,
             norm_h,
-            fc_e,
-            fc_h,
+            eh_proj,
             layer,
             head_mix,
             n: cfg.hc_count,
@@ -91,15 +91,15 @@ impl<R: ExpertResidency> MtpHead<R> {
                 embeds.shape()
             )
         }
-        let e = self.fc_e.forward(&self.norm_e.forward(embeds)?)?; // [1, a, d]
-        let hn = self.norm_h.forward(hidden)?; // [1, a, n·d]
-        let hn = self
-            .fc_h
-            .forward(&hn.reshape((a * n, d))?)?
-            .reshape((1, a, n, d))?;
-        let h0 = hn
-            .broadcast_add(&e.reshape((1, a, 1, d))?)?
-            .reshape((1, a, n * d))?;
+        // [e_normed | h_normed_stream] per stream → eh_proj → the layer's carry.
+        let e = self
+            .norm_e
+            .forward(embeds)?
+            .reshape((1, a, 1, d))?
+            .broadcast_as((1, a, n, d))?; // [1, a, n, d]
+        let hn = self.norm_h.forward(hidden)?.reshape((1, a, n, d))?;
+        let eh = Tensor::cat(&[&e, &hn], D::Minus1)?.reshape((a * n, 2 * d))?;
+        let h0 = self.eh_proj.forward(&eh)?.reshape((1, a, n * d))?;
         let multi = self.layer.prefill(&h0, 0, cache)?;
         cache.pos += a;
         let (sample, _) = self.head_mix.mix(&multi)?;
@@ -108,6 +108,10 @@ impl<R: ExpertResidency> MtpHead<R> {
 
     pub fn layer(&self) -> &Layer<R> {
         &self.layer
+    }
+
+    pub fn layer_mut(&mut self) -> &mut Layer<R> {
+        &mut self.layer
     }
 }
 
@@ -239,6 +243,13 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
     }
 }
 
+/// `QWEN4EXP_MTP_TRACE` (read once): print every verify round's window,
+/// argmax and accepted prefix. An instrument, never the shipping path.
+fn mtp_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_MTP_TRACE").is_some())
+}
+
 /// A verify pass encoded and read back, awaiting the accept decision.
 #[derive(Debug)]
 pub struct MtpPending {
@@ -349,6 +360,15 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
         } = pending;
         let accepted = accept_prefix(&argmax, &tokens[1..], eos_ids);
         let a = accepted.len();
+        if mtp_trace() {
+            eprintln!(
+                "MTPTRACE pos={} window={:?} argmax={:?} accepted={:?}",
+                cache.pos - tokens.len(),
+                tokens,
+                argmax,
+                accepted
+            );
+        }
         let probe = if a == tokens.len() {
             cache.resolve_window()?;
             cache.take_nextn()?

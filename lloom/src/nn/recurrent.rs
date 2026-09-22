@@ -79,6 +79,16 @@ fn state_write_by_copy() -> bool {
     })
 }
 
+/// A copy of `t` in storage of its own. `Tensor::copy` is NOT that on Metal —
+/// `MetalStorage::try_clone` hands back the same buffer — so a snapshot taken
+/// with it aliases what it snapshots; the CPU backend copies. This allocates
+/// and copies on every backend.
+fn own_copy(t: &Tensor) -> Result<Tensor> {
+    let out = Tensor::zeros(t.shape(), t.dtype(), t.device())?;
+    out.slice_set(&t.contiguous()?, 0, 0)?;
+    Ok(out)
+}
+
 impl RecurrentState {
     /// A fresh channel for `n_layers`, every layer at its implicit zero state.
     /// No device buffers yet — the slab is allocated lazily on first write, at
@@ -116,7 +126,7 @@ impl RecurrentState {
                     // instead of writing it in place (the A/B for an in-place
                     // write hazard; `QWEN4EXP_STATE_WRITE=copy`, read once).
                     let _declared = lloom_tensor::EscapeGuard::new();
-                    self.slab[l] = Some(next.copy()?);
+                    self.slab[l] = Some(own_copy(&next)?);
                     return Ok(());
                 }
                 if buf.id() != next.id() {
@@ -135,11 +145,11 @@ impl RecurrentState {
             }
             // First write on this layer: take a persistent OWN-storage copy of
             // `next` (which is an arena transient the pass will recycle — adopting
-            // it directly would alias recycled memory). `copy` allocates the slab
-            // buffer once; every later write reuses it in place.
+            // it directly would alias recycled memory). The copy allocates the
+            // slab buffer once; every later write reuses it in place.
             None => {
                 let _declared = lloom_tensor::EscapeGuard::new();
-                self.slab[l] = Some(next.copy()?);
+                self.slab[l] = Some(own_copy(&next)?);
             }
         }
         Ok(())
@@ -179,10 +189,11 @@ impl RecurrentState {
                     Some(snap) if snap.dims() == cur.dims() => {
                         snap.slice_set(cur, 0, 0)?;
                     }
-                    // Allocate the snapshot once, as an OWN-storage copy (not
-                    // `contiguous`, which would alias the slab and make a later
-                    // in-place `slice_set` fail on shared storage).
-                    _ => self.snapshot[l] = Some(cur.copy()?),
+                    // Allocate the snapshot once, in storage of its own (neither
+                    // `contiguous` nor `copy` gives that on Metal — both alias
+                    // the slab, and a snapshot that aliases the slab restores
+                    // nothing).
+                    _ => self.snapshot[l] = Some(own_copy(cur)?),
                 },
                 None => self.snapshot[l] = None,
             }

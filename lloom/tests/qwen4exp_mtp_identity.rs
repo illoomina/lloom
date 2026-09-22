@@ -199,6 +199,57 @@ fn mtp_speculative_decode_is_byte_identical_to_greedy() -> Result<()> {
     Ok(())
 }
 
+/// The identity with the N-gram PLE attached — the real model's shape: the
+/// PLE's conv history, the n-gram window and the pending ids all roll back.
+#[test]
+fn mtp_identity_holds_with_the_ple_attached() -> Result<()> {
+    use lloom::models::qwen4exp::{NgramHash, PleLayer, PleTable};
+    let cfg = config();
+    let dev = Device::Cpu;
+    let mut model = testing::resident_model(&cfg, &dev);
+    let hash = NgramHash::new(
+        vec![1_000_003, 999_983, 7],
+        vec![13, 17, 19, 23],
+        vec![0, 13, 30, 49],
+        2,
+        cfg.eos_token_id,
+    )?;
+    let rows = hash.total_rows() as usize;
+    let table = PleTable::Dense(testing::wt((rows, cfg.ple_head_dim), 3.0, &dev));
+    let hc_dim = cfg.hc_dim();
+    let ple_dim = cfg.ple_head_dim * hash.n_heads();
+    let block = PleLayer::new(
+        testing::lin(hc_dim, ple_dim, 21.0, &dev),
+        testing::lin(cfg.hidden_size, ple_dim, 22.0, &dev),
+        testing::ones(hc_dim, &dev),
+        testing::ones(hc_dim, &dev),
+        testing::ones(hc_dim, &dev),
+        testing::wt((hc_dim, 4), 23.0, &dev),
+        cfg.hc_count,
+        cfg.hidden_size,
+        cfg.ple_ngram_size,
+        cfg.norm_eps as f32,
+    )?;
+    model.set_ple(1, hash, table, block)?;
+    let max = 24;
+    let (prompt, ref_ids, ref_eos) = long_prompt(&model, &cfg, max)?;
+    let token = (0..cfg.vocab_size as u32)
+        .find(|t| !ref_ids.contains(t) && *t != cfg.eos_token_id)
+        .expect("a never-emitted id");
+    let (ids, eos, accepted) = speculative(&model, &cfg, &mut Garbage { token }, &prompt, max)?;
+    assert_eq!(
+        ids, ref_ids,
+        "garbage drafter with PLE: not the greedy stream"
+    );
+    assert_eq!(eos, ref_eos);
+    assert_eq!(accepted, 0);
+    let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+    let mut mtp = MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev);
+    let (ids, _, _) = speculative(&model, &cfg, &mut mtp, &prompt, max)?;
+    assert_eq!(ids, ref_ids, "MTP drafter with PLE: not the greedy stream");
+    Ok(())
+}
+
 /// After a verify that accepts `a` of `k + 1` positions, every state channel
 /// equals a fresh cache's after decoding the prompt + the accepted tokens —
 /// an absolute reference from a different route (§3.1b), checked per channel

@@ -21,6 +21,7 @@ use super::deltanet_block::GatedDeltaNet;
 use super::hc::HyperConnection;
 use super::model::{Layer, Mixer, Qwen4Exp};
 use super::moe::{ExpertResidency, MoeLayer, Resident, Streamed};
+use super::mtp::MtpHead;
 use super::ple::{CachedPleTable, MmapPleTable, NgramHash, PleLayer, PleTable};
 use super::qsa::{Indexer, QsaAttention};
 use crate::nn::expert_stream::{ExpertSource, LoaderArm};
@@ -307,6 +308,10 @@ pub struct LoadOptions {
     /// Rows of the PLE hot-row cache (`PleTable::Cached`); `None` reads the
     /// memory map on every gather.
     pub ple_cache_rows: Option<usize>,
+    /// Load the MTP head from the shard that carries `blk.{n_layers}.nextn.*`
+    /// (ds4's naming; the in-tree sidecar `qwen4exp-mtp-quantize` writes).
+    /// Its routed experts take the same residency strategy as the model's.
+    pub mtp: bool,
 }
 
 /// Open every shard at `paths`, headers only.
@@ -485,86 +490,39 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
     let embed_tokens = QMatMul::QTensor(gg.packed("token_embd.weight")?);
     let lm_head = gg.qmat("output.weight")?;
 
-    // Per-layer brackets carry an inject predictor; the head mixer
-    // (`output_hc_*`) has none — its collapse goes straight to lm_head
-    // (the reference passes nullptr there).
-    let hc = |gg: &mut Gguf<'_, Rd>, p: &str, inject: bool| -> Result<HyperConnection> {
-        let inject = if inject {
-            Some(gg.qmat(&format!("{p}_inject.weight"))?)
-        } else {
-            None
-        };
-        HyperConnection::new(
-            gg.f32(&format!("{p}_norm.weight"))?,
-            gg.qmat(&format!("{p}_down.weight"))?,
-            gg.qmat(&format!("{p}_up.weight"))?,
-            inject,
-            n,
-            d,
-            eps,
-        )
-    };
-    let hc_head = hc(gg, "output_hc", false)?;
+    // The head mixer (`output_hc_*`) has no inject — its collapse goes
+    // straight to lm_head (the reference passes nullptr there).
+    let hc_head = load_hc(gg, "output_hc", false, &cfg)?;
 
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
-        let p = format!("blk.{l}");
-        let hc_attn = hc(gg, &format!("{p}.hc_attn"), true)?;
-        let hc_ffn = hc(gg, &format!("{p}.hc_ffn"), true)?;
-        let mixer = match cfg.layer_types[l] {
-            LayerKind::Linear => Mixer::Linear(GatedDeltaNet::new(
-                gg.qmat(&format!("{p}.attn_qkv.weight"))?,
-                gg.qmat(&format!("{p}.attn_gate.weight"))?,
-                gg.f32(&format!("{p}.ssm_conv1d.weight"))?,
-                gg.f32(&format!("{p}.ssm_a"))?,
-                gg.f32(&format!("{p}.ssm_dt.bias"))?,
-                gg.qmat(&format!("{p}.ssm_alpha.weight"))?,
-                gg.qmat(&format!("{p}.ssm_beta.weight"))?,
-                gg.f32(&format!("{p}.ssm_norm.weight"))?,
-                gg.qmat(&format!("{p}.ssm_out.weight"))?,
-                &cfg,
-            )),
-            LayerKind::Full => {
-                let indexer = Indexer::new(
-                    gg.qmat(&format!("{p}.indexer.q_proj.weight"))?,
-                    gg.qmat(&format!("{p}.indexer.k_proj.weight"))?,
-                    RmsNorm::new(gg.f32(&format!("{p}.indexer.q_norm.weight"))?, cfg.norm_eps),
-                    RmsNorm::new(gg.f32(&format!("{p}.indexer.k_norm.weight"))?, cfg.norm_eps),
-                    &cfg,
-                )?;
-                Mixer::Full(
-                    QsaAttention::new(
-                        gg.qmat(&format!("{p}.attn_q.weight"))?,
-                        gg.qmat(&format!("{p}.attn_k.weight"))?,
-                        gg.qmat(&format!("{p}.attn_v.weight"))?,
-                        gg.qmat(&format!("{p}.attn_output.weight"))?,
-                        RmsNorm::new(gg.f32(&format!("{p}.attn_q_norm.weight"))?, cfg.norm_eps),
-                        RmsNorm::new(gg.f32(&format!("{p}.attn_k_norm.weight"))?, cfg.norm_eps),
-                        &cfg,
-                    )
-                    .with_indexer(indexer),
-                )
-            }
-        };
         let experts = experts(gg, l)?;
-        let sh_router = gg
-            .f32(&format!("{p}.ffn_gate_inp_shexp.weight"))?
-            .reshape((1, d))?;
-        let moe = MoeLayer::new(
-            gg.qmat(&format!("{p}.ffn_gate_inp.weight"))?,
-            experts,
-            gg.qmat(&format!("{p}.ffn_gate_shexp.weight"))?,
-            gg.qmat(&format!("{p}.ffn_up_shexp.weight"))?,
-            gg.qmat(&format!("{p}.ffn_down_shexp.weight"))?,
-            QMatMul::Tensor(sh_router),
-            &cfg,
-        );
-        layers.push(Layer::new(hc_attn, mixer, hc_ffn, moe));
+        layers.push(load_layer(gg, l, cfg.layer_types[l], experts, &cfg)?);
     }
 
     let mut model = Qwen4Exp::new(embed_tokens, layers, hc_head, lm_head, cfg.clone());
     if let Some(dt) = opts.moe_act {
         model.set_routed_act(dt);
+    }
+    if opts.mtp {
+        // ds4's layout: the MTP layer is `blk.{n_layers}` (a full-attention
+        // layer in the main layers' names) plus `blk.{n_layers}.nextn.*`.
+        let l = cfg.n_layers;
+        let p = format!("blk.{l}");
+        let experts = experts(gg, l)?;
+        let layer = load_layer(gg, l, LayerKind::Full, experts, &cfg)?;
+        let head = MtpHead::new(
+            RmsNorm::new(gg.f32(&format!("{p}.nextn.enorm.weight"))?, cfg.norm_eps),
+            RmsNorm::new(gg.f32(&format!("{p}.nextn.hnorm.weight"))?, cfg.norm_eps),
+            gg.qmat(&format!("{p}.nextn.eh_proj.weight"))?,
+            layer,
+            load_hc(gg, &format!("{p}.nextn.hc_head"), false, &cfg)?,
+            &cfg,
+        );
+        model.set_mtp(head);
+        if let Some(dt) = opts.moe_act {
+            model.set_routed_act(dt); // the head's MoE follows the model's routed arm
+        }
     }
     if let (Some(hash), Some(&l)) = (ple_hash, cfg.ple_layers.first()) {
         let p = format!("blk.{l}");
@@ -600,4 +558,90 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
         model.set_ple(l, hash, table, block)?;
     }
     Ok(model)
+}
+
+/// One HyperConnection bracket `{p}_{norm,down,up[,inject]}`.
+fn load_hc<Rd: Read + Seek>(
+    gg: &mut Gguf<'_, Rd>,
+    p: &str,
+    inject: bool,
+    cfg: &Config,
+) -> Result<HyperConnection> {
+    let inject = if inject {
+        Some(gg.qmat(&format!("{p}_inject.weight"))?)
+    } else {
+        None
+    };
+    HyperConnection::new(
+        gg.f32(&format!("{p}_norm.weight"))?,
+        gg.qmat(&format!("{p}_down.weight"))?,
+        gg.qmat(&format!("{p}_up.weight"))?,
+        inject,
+        cfg.hc_count,
+        cfg.hidden_size,
+        cfg.norm_eps as f32,
+    )
+}
+
+/// Layer `blk.{l}` of `kind` around `experts` — the model's layers and the
+/// MTP layer (`blk.{n_layers}`) share this.
+fn load_layer<R: ExpertResidency, Rd: Read + Seek>(
+    gg: &mut Gguf<'_, Rd>,
+    l: usize,
+    kind: LayerKind,
+    experts: R,
+    cfg: &Config,
+) -> Result<Layer<R>> {
+    let p = format!("blk.{l}");
+    let d = cfg.hidden_size;
+    let hc_attn = load_hc(gg, &format!("{p}.hc_attn"), true, cfg)?;
+    let hc_ffn = load_hc(gg, &format!("{p}.hc_ffn"), true, cfg)?;
+    let mixer = match kind {
+        LayerKind::Linear => Mixer::Linear(GatedDeltaNet::new(
+            gg.qmat(&format!("{p}.attn_qkv.weight"))?,
+            gg.qmat(&format!("{p}.attn_gate.weight"))?,
+            gg.f32(&format!("{p}.ssm_conv1d.weight"))?,
+            gg.f32(&format!("{p}.ssm_a"))?,
+            gg.f32(&format!("{p}.ssm_dt.bias"))?,
+            gg.qmat(&format!("{p}.ssm_alpha.weight"))?,
+            gg.qmat(&format!("{p}.ssm_beta.weight"))?,
+            gg.f32(&format!("{p}.ssm_norm.weight"))?,
+            gg.qmat(&format!("{p}.ssm_out.weight"))?,
+            cfg,
+        )),
+        LayerKind::Full => {
+            let indexer = Indexer::new(
+                gg.qmat(&format!("{p}.indexer.q_proj.weight"))?,
+                gg.qmat(&format!("{p}.indexer.k_proj.weight"))?,
+                RmsNorm::new(gg.f32(&format!("{p}.indexer.q_norm.weight"))?, cfg.norm_eps),
+                RmsNorm::new(gg.f32(&format!("{p}.indexer.k_norm.weight"))?, cfg.norm_eps),
+                cfg,
+            )?;
+            Mixer::Full(
+                QsaAttention::new(
+                    gg.qmat(&format!("{p}.attn_q.weight"))?,
+                    gg.qmat(&format!("{p}.attn_k.weight"))?,
+                    gg.qmat(&format!("{p}.attn_v.weight"))?,
+                    gg.qmat(&format!("{p}.attn_output.weight"))?,
+                    RmsNorm::new(gg.f32(&format!("{p}.attn_q_norm.weight"))?, cfg.norm_eps),
+                    RmsNorm::new(gg.f32(&format!("{p}.attn_k_norm.weight"))?, cfg.norm_eps),
+                    cfg,
+                )
+                .with_indexer(indexer),
+            )
+        }
+    };
+    let sh_router = gg
+        .f32(&format!("{p}.ffn_gate_inp_shexp.weight"))?
+        .reshape((1, d))?;
+    let moe = MoeLayer::new(
+        gg.qmat(&format!("{p}.ffn_gate_inp.weight"))?,
+        experts,
+        gg.qmat(&format!("{p}.ffn_gate_shexp.weight"))?,
+        gg.qmat(&format!("{p}.ffn_up_shexp.weight"))?,
+        gg.qmat(&format!("{p}.ffn_down_shexp.weight"))?,
+        QMatMul::Tensor(sh_router),
+        cfg,
+    );
+    Ok(Layer::new(hc_attn, mixer, hc_ffn, moe))
 }

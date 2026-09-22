@@ -302,7 +302,7 @@ METAL_FUNC float gdn_silu(float x) {
 kernel void gdn_prologue_f32(
     const device float* qkv [[buffer(0)]],
     const device float* conv_w [[buffer(1)]],
-    device float* win [[buffer(2)]],
+    const device float* win [[buffer(2)]],
     device float* heads [[buffer(3)]],
     constant uint& d [[buffer(4)]],
     constant uint& h_k [[buffer(5)]],
@@ -310,6 +310,7 @@ kernel void gdn_prologue_f32(
     constant uint& kk [[buffer(7)]],
     constant float& eps [[buffer(8)]],
     constant float& q_scale [[buffer(9)]],
+    device float* win_out [[buffer(10)]],
     uint group [[threadgroup_position_in_grid]],
     uint i [[thread_position_in_threadgroup]],
     uint width [[threads_per_threadgroup]],
@@ -329,17 +330,19 @@ kernel void gdn_prologue_f32(
   float y = 0.0f;
   if (i < d) {
     const uint c = base + i;
-    // shift the window left by one, append the input, fold against the taps
+    // the window shifted left by one with the input appended — written to
+    // `win_out` (another buffer: the channel's spare), folded against the taps
     float folded = 0.0f;
-    device float* w = win + (size_t)c * kk;
+    const device float* w = win + (size_t)c * kk;
+    device float* wo = win_out + (size_t)c * kk;
     const device float* cw = conv_w + (size_t)c * kk;
     for (uint j = 0; j + 1 < kk; j++) {
       const float v = w[j + 1];
-      w[j] = v;
+      wo[j] = v;
       folded += cw[j] * v;
     }
     const float x = qkv[c];
-    w[kk - 1] = x;
+    wo[kk - 1] = x;
     folded += cw[kk - 1] * x;
     y = gdn_silu(folded);
   }
@@ -381,10 +384,11 @@ kernel void gdn_step_f32(
     const device float* beta [[buffer(2)]],
     const device float* dt_bias [[buffer(3)]],
     const device float* ssm_a [[buffer(4)]],
-    device float* s [[buffer(5)]],
+    const device float* s [[buffer(5)]],
     device float* o [[buffer(6)]],
     constant uint& d [[buffer(7)]],
     constant uint& h_v [[buffer(8)]],
+    device float* s_out [[buffer(9)]],
     uint dv [[threadgroup_position_in_grid]],
     uint h [[thread_position_in_threadgroup]]) {
   if (h >= h_v) return;
@@ -406,7 +410,7 @@ kernel void gdn_step_f32(
   for (uint dk = 0; dk < d; dk++) {
     const size_t idx = ((size_t)dk * d + dv) * h_v + h;
     const float sn = eg * s[idx] + k[dk] * delta;
-    s[idx] = sn;
+    s_out[idx] = sn;
     acc += q[dk] * sn;
   }
   o[(size_t)h * d + dv] = acc;

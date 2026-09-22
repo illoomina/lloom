@@ -778,34 +778,27 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             return self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l);
         }
         // A pass that computed on a missing expert at layer L was right up to
-        // L (its ids at L came from a correct carry), so the settle loads L's
-        // true experts; the replay is right through L and may first show
-        // layer L+1's true ids — each replay is exact one layer further, so
-        // the loop is bounded by the layer count (one more is a defect).
-        let mut attempts = 0usize;
-        loop {
-            cache.open_window()?;
-            let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
-            let mut redo = false;
-            for (l, rec) in &records {
-                if self.layers[*l].moe().experts().settle(rec)? {
-                    redo = true;
-                }
-            }
-            if !redo {
-                cache.resolve_window()?;
-                return Ok(logits);
-            }
-            cache.rewind_window()?;
-            cache.redos += 1;
-            attempts += 1;
-            if attempts > self.layers.len() {
-                lloom_tensor::bail!(
-                    "qwen4exp: a decode pass still missed an expert after {attempts} replays \
-                     (more than the layer count)"
-                )
+        // L only (its ids past L came from a wrong carry), so a device-planned
+        // replay could miss again one layer further, up to the layer count of
+        // replays on a cold pool. The replay is therefore the HOST plan — the
+        // per-layer readback loads each layer's true experts as it reaches
+        // them: one replay per missed token, and the experts it loaded are
+        // resident for the tokens after it.
+        cache.open_window()?;
+        let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
+        let mut redo = false;
+        for (l, rec) in &records {
+            if self.layers[*l].moe().experts().settle(rec)? {
+                redo = true;
             }
         }
+        if !redo {
+            cache.resolve_window()?;
+            return Ok(logits);
+        }
+        cache.rewind_window()?;
+        cache.redos += 1;
+        self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)
     }
 
     fn decode_embed_pass<O: ForwardObserver>(

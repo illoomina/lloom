@@ -755,6 +755,9 @@ impl Streamed {
         }
         if !misses.is_empty() {
             self.load(inner, &misses)?;
+            // The device mirror of the table no longer matches (whichever
+            // path installed: a host plan, a settle, a pin).
+            inner.table_stale = true;
         }
         Ok(slots)
     }
@@ -858,6 +861,13 @@ fn plan_rows(ids: &[u32], rows: usize, topk: usize, n_slots: usize) -> Vec<Range
     }
     groups.push(start..rows);
     groups
+}
+
+/// `QWEN4EXP_TRACE_SETTLE=1` (read once): print every settle's ids, flags
+/// and misses — a debugging instrument, never the shipping path.
+fn trace_settle() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN4EXP_TRACE_SETTLE").is_ok())
 }
 
 /// The device-side plan: `ids [n]` (applied to) through the residency
@@ -1012,6 +1022,18 @@ impl ExpertResidency for Streamed {
             }
         }
         let flagged = flags.iter().any(|&f| f != 0);
+        if trace_settle() {
+            let stale: Vec<u32> = ids
+                .iter()
+                .zip(flags)
+                .filter(|(&e, &f)| f != 0 && inner.map.slot_of(e as usize).is_some())
+                .map(|(&e, _)| e)
+                .collect();
+            eprintln!(
+                "SETTLE tick={tick} ids={ids:?} flags={flags:?} missing={missing:?} flagged_but_resident={stale:?} resident={}",
+                inner.map.resident().len()
+            );
+        }
         if missing.is_empty() {
             if flagged {
                 lloom_tensor::bail!(
@@ -1021,7 +1043,6 @@ impl ExpertResidency for Streamed {
             return Ok(false);
         }
         self.resolve(&mut inner, &missing, tick)?;
-        inner.table_stale = true;
         self.counters.settled_misses.fetch_add(1, Ordering::Relaxed);
         Ok(true)
     }

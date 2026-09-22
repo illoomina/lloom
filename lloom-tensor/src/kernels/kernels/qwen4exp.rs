@@ -281,6 +281,7 @@ pub fn call_gdn_prologue(
     conv_w: BufferOffset,
     win: BufferOffset,
     heads: &Buffer,
+    win_out: BufferOffset,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_prologue_f32")?;
     let encoder = ep.encoder();
@@ -292,14 +293,15 @@ pub fn call_gdn_prologue(
         (
             &qkv,
             &conv_w,
-            Output::from_buffer_offset(&win),
+            &win,
             Output::new(heads),
             d as u32,
             h_k as u32,
             h_v as u32,
             kk as u32,
             eps,
-            q_scale
+            q_scale,
+            Output::from_buffer_offset(&win_out)
         )
     );
     let width = d
@@ -325,6 +327,7 @@ pub fn call_gdn_step(
     ssm_a: BufferOffset,
     s: BufferOffset,
     o: &Buffer,
+    s_out: BufferOffset,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_step_f32")?;
     let encoder = ep.encoder();
@@ -339,10 +342,11 @@ pub fn call_gdn_step(
             &beta,
             &dt_bias,
             &ssm_a,
-            Output::from_buffer_offset(&s),
+            &s,
             Output::new(o),
             d as u32,
-            h_v as u32
+            h_v as u32,
+            Output::from_buffer_offset(&s_out)
         )
     );
     let width = h_v.min(pipeline.max_total_threads_per_threadgroup());

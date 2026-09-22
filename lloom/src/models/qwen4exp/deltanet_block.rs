@@ -40,6 +40,13 @@ pub struct GatedDeltaNet {
     ssm_norm: Tensor,
     /// out-proj `[value_dim → hidden]` (`ssm_out`).
     ssm_out: QMatMul,
+    /// The four input stems (`wqkv | wqkv_gate | ssm_alpha | ssm_beta`) as
+    /// one f16 matrix when the loader could stack them (the parts above are
+    /// row views of it): a decode step runs one gemv and splits the row.
+    stem_cat: Option<QMatMul>,
+    /// The two gate stems (`ssm_alpha | ssm_beta`) as one f16 matrix when
+    /// only those stack (the projections quantized): one gemv for the pair.
+    gate_stems_cat: Option<QMatMul>,
     dims: DeltaNetDims,
     conv_k: usize,
     conv_channels: usize,
@@ -74,6 +81,8 @@ impl GatedDeltaNet {
             ssm_beta,
             ssm_norm,
             ssm_out,
+            stem_cat: None,
+            gate_stems_cat: None,
             dims,
             conv_k: cfg.ssm_conv_kernel,
             conv_channels: cfg.conv_channels(),
@@ -206,17 +215,23 @@ impl GatedDeltaNet {
         {
             return Ok(None);
         }
+        // The kernels write the next window and the next `S` OUT OF PLACE,
+        // into the channels' spares (the buffers the last step retired — no
+        // allocation in the steady state), and the spares are swapped in:
+        // the buffers read are never written, so a speculative window's base
+        // stays intact with no snapshot copy.
+        let win_out = conv_state.take_spare(l)?;
+        let slab_out = s_state.take_spare(l)?;
         let conv_w = if self.conv_weight.dtype() == f32 {
             self.conv_weight.clone()
         } else {
             self.conv_weight.to_dtype(f32)?
         };
 
-        // The projections (the quantized stems and the mixed-precision f16 arms).
-        let qkv = self.wqkv.forward(x)?.flatten_all()?.to_dtype(f32)?; // [conv_channels]
-        let z = self.wqkv_gate.forward(x)?.flatten_all()?.to_dtype(f32)?; // [value_dim]
-        let alpha = self.ssm_alpha.forward(x)?.flatten_all()?.to_dtype(f32)?; // [h_v]
-        let beta = self.ssm_beta.forward(x)?.flatten_all()?.to_dtype(f32)?; // [h_v]
+        // The projections: one gemv over the stacked f16 stems (the row
+        // split into `[conv_channels] | [value_dim] | [h_v] | [h_v]`) or the
+        // four (the quantized stems and the mixed-precision f16 arms).
+        let (qkv, z, alpha, beta) = self.decode_stems(x, h_v)?;
         let heads = qkv.apply_op1_no_bwd(&GdnPrologue {
             d,
             h_k,
@@ -226,6 +241,7 @@ impl GatedDeltaNet {
             q_scale: 1.0 / (d as f32).sqrt(),
             conv_w,
             win: win.clone(),
+            win_out: win_out.clone(),
         })?; // [3, h_v, d]
         let o = heads.apply_op3_no_bwd(
             &alpha,
@@ -236,11 +252,11 @@ impl GatedDeltaNet {
                 dt_bias: self.ssm_dt.to_dtype(f32)?,
                 ssm_a: self.ssm_a.to_dtype(f32)?,
                 s: slab.clone(),
+                s_out: slab_out.clone(),
             },
         )?; // [h_v, d]
-            // The slabs were written in place: the writes are no-ops by identity.
-        conv_state.write(l, win)?;
-        s_state.write(l, slab)?;
+        conv_state.swap_in(l, win_out)?;
+        s_state.swap_in(l, slab_out)?;
         let gamma = self.ssm_norm.to_dtype(f32)?;
         let gated = o.apply_op3_no_bwd(
             &gamma,
@@ -519,6 +535,51 @@ impl GatedDeltaNet {
         self.value_dim
     }
 
+    /// Attach the stacked input stems (`[conv_channels + value_dim + 2·h_v,
+    /// hidden]` f16, the parts' rows in that order) for the one-gemv decode.
+    pub fn with_stem_cat(mut self, cat: Tensor) -> Self {
+        self.stem_cat = Some(QMatMul::TensorF16(cat));
+        self
+    }
+
+    /// Attach the stacked gate stems (`[2·h_v, hidden]` f16, `α | β` rows).
+    pub fn with_gate_stems_cat(mut self, cat: Tensor) -> Self {
+        self.gate_stems_cat = Some(QMatMul::TensorF16(cat));
+        self
+    }
+
+    /// The decode step's four projections of `x [1, 1, hidden]` as f32 rows
+    /// — one gemv over the stacked stems when they are stacked, four else
+    /// (three when only the gate stems are).
+    fn decode_stems(&self, x: &Tensor, h_v: usize) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let f32 = lloom_tensor::DType::F32;
+        if let Some(cat) = &self.stem_cat {
+            let all = cat.forward(x)?.to_dtype(f32)?.flatten_all()?;
+            let (c, v) = (self.conv_channels, self.value_dim);
+            return Ok((
+                all.narrow(0, 0, c)?,
+                all.narrow(0, c, v)?,
+                all.narrow(0, c + v, h_v)?,
+                all.narrow(0, c + v + h_v, h_v)?,
+            ));
+        }
+        if let Some(ab) = &self.gate_stems_cat {
+            let ab = ab.forward(x)?.to_dtype(f32)?.flatten_all()?;
+            return Ok((
+                self.wqkv.forward(x)?.flatten_all()?.to_dtype(f32)?,
+                self.wqkv_gate.forward(x)?.flatten_all()?.to_dtype(f32)?,
+                ab.narrow(0, 0, h_v)?,
+                ab.narrow(0, h_v, h_v)?,
+            ));
+        }
+        Ok((
+            self.wqkv.forward(x)?.flatten_all()?.to_dtype(f32)?,
+            self.wqkv_gate.forward(x)?.flatten_all()?.to_dtype(f32)?,
+            self.ssm_alpha.forward(x)?.flatten_all()?.to_dtype(f32)?,
+            self.ssm_beta.forward(x)?.flatten_all()?.to_dtype(f32)?,
+        ))
+    }
+
     /// Silence the unused-import lint for `D` until prefill (Kernel B) uses it.
     #[allow(dead_code)]
     fn _uses_d() -> D {
@@ -714,6 +775,169 @@ mod tests {
     /// chunk (two 64-chunks, the second padded) from a fresh state, then a
     /// 30-position chunk against the carried window and `S`; the outputs and
     /// both state channels within 2e-4 relative.
+    /// The stacked f16 stems (one gemv, the row split) decode as the four
+    /// stems do — the same weights as row views of one matrix — at the real
+    /// head geometry over 12 steps, within the mixed gemv's tile reorder.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn stacked_stems_decode_as_the_four_stems() {
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let d = cfg.hidden_size;
+        let conv_ch = cfg.conv_channels();
+        let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
+        let h_v = cfg.ssm_dt_rank;
+        let d_v = cfg.ssm_state_size;
+        let f16 = |out: usize, seed: f32| {
+            Tensor::from_vec(
+                (0..out * d)
+                    .map(|i| ((i as f32 * 0.017 + seed).sin()) * 0.05)
+                    .collect::<Vec<_>>(),
+                (out, d),
+                &gpu,
+            )
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+        };
+        let parts = [
+            f16(conv_ch, 1.0),
+            f16(value_dim, 2.0),
+            f16(h_v, 4.0),
+            f16(h_v, 5.0),
+        ];
+        let cat = Tensor::cat(&parts.iter().collect::<Vec<_>>(), 0).unwrap();
+        let mut off = 0;
+        let views: Vec<Tensor> = parts
+            .iter()
+            .map(|p| {
+                let v = cat.narrow(0, off, p.dim(0).unwrap()).unwrap();
+                off += p.dim(0).unwrap();
+                v
+            })
+            .collect();
+        let vecw = |n: usize, f: &dyn Fn(usize) -> f32| {
+            Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, &gpu).unwrap()
+        };
+        let build = |stack: Option<Tensor>| {
+            let blk = GatedDeltaNet::new(
+                QMatMul::TensorF16(views[0].clone()),
+                QMatMul::TensorF16(views[1].clone()),
+                vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
+                    ((i as f32 * 0.03).cos()) * 0.2
+                })
+                .reshape((conv_ch, cfg.ssm_conv_kernel))
+                .unwrap(),
+                vecw(h_v, &|i| -0.5 - 0.01 * i as f32),
+                vecw(h_v, &|i| 0.1 * (i % 7) as f32),
+                QMatMul::TensorF16(views[2].clone()),
+                QMatMul::TensorF16(views[3].clone()),
+                vecw(d_v, &|i| 1.0 + 0.01 * (i % 5) as f32),
+                QMatMul::TensorF16(
+                    Tensor::from_vec(
+                        (0..d * value_dim)
+                            .map(|i| ((i as f32 * 0.013 + 6.0).sin()) * 0.05)
+                            .collect::<Vec<_>>(),
+                        (d, value_dim),
+                        &gpu,
+                    )
+                    .unwrap()
+                    .to_dtype(DType::F16)
+                    .unwrap(),
+                ),
+                &cfg,
+            );
+            match stack {
+                Some(c) => blk.with_stem_cat(c),
+                None => blk,
+            }
+        };
+        let (four, one) = (build(None), build(Some(cat.clone())));
+        // The gate-stems-only stack (α | β), the checkpoint's case.
+        let ab = Tensor::cat(&[&parts[2], &parts[3]], 0).unwrap();
+        let two = build(None).with_gate_stems_cat(ab);
+        let (mut s2, mut c2) = (RecurrentState::new(1), RecurrentState::new(1));
+        // Non-vacuity: a stack with the gate rows zeroed must decode
+        // differently — the stacked path is the one that runs.
+        let zeroed = Tensor::cat(
+            &[
+                &parts[0],
+                &Tensor::zeros(parts[1].shape(), DType::F16, &gpu).unwrap(),
+                &parts[2],
+                &parts[3],
+            ],
+            0,
+        )
+        .unwrap();
+        let bad = build(Some(zeroed));
+        let (mut sb, mut cb) = (RecurrentState::new(1), RecurrentState::new(1));
+        let (mut s4, mut c4) = (RecurrentState::new(1), RecurrentState::new(1));
+        let (mut s1, mut c1) = (RecurrentState::new(1), RecurrentState::new(1));
+        let mut worst = 0f32;
+        for t in 0..12 {
+            let x = Tensor::from_vec(
+                (0..d)
+                    .map(|i| ((i as f32 * 0.05 + t as f32).sin()) * 0.6)
+                    .collect::<Vec<f32>>(),
+                (1, 1, d),
+                &gpu,
+            )
+            .unwrap();
+            let a: Vec<f32> = four
+                .decode(&x, 0, &mut s4, &mut c4)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let b: Vec<f32> = one
+                .decode(&x, 0, &mut s1, &mut c1)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let bad_out: Vec<f32> = bad
+                .decode(&x, 0, &mut sb, &mut cb)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_ne!(a, bad_out, "step {t}: the stacked path did not run");
+            assert!(b.iter().all(|v| v.is_finite()), "step {t}: non-finite");
+            let ab_out: Vec<f32> = two
+                .decode(&x, 0, &mut s2, &mut c2)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+            let diff = a
+                .iter()
+                .zip(&b)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            let diff_ab = a
+                .iter()
+                .zip(&ab_out)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(diff / scale).max(diff_ab / scale);
+            assert!(
+                diff <= 1e-4 * scale,
+                "step {t}: stacked differs by {diff} at {scale}"
+            );
+            assert!(
+                diff_ab <= 1e-4 * scale,
+                "step {t}: the gate-stems stack differs by {diff_ab} at {scale}"
+            );
+        }
+        println!("stacked vs four stems worst relative diff: {worst:e}");
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     fn prefill_fused_matches_composed_at_real_geometry() {

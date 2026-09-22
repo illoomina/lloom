@@ -42,8 +42,13 @@ use lloom_tensor::{Result, Tensor};
 /// - the per-layer state buffer is allocated ONCE (pool-backed) and written IN
 ///   PLACE via `slice_set` under an [`EscapeGuard`] — zero allocation per token
 ///   in steady state (§3.3a), never an `Option<Tensor>` replaced per step;
-/// - the speculative snapshot buffer is likewise preallocated and copied in
-///   place, so `open_window` allocates nothing;
+/// - the speculative window copies nothing: its base is the slab's own
+///   buffer (a shared handle); a write inside the window lands in the
+///   channel's spare buffer and is swapped in ([`Self::take_spare`] /
+///   [`Self::swap_in`] for a kernel writing out of place, copy-on-write in
+///   [`Self::write`] for a composed step), so a rewind is the base handle
+///   back and a resolve retires the base as the next spare — no allocation
+///   in the steady state, no snapshot copy per token;
 /// - no `std::sync`, no lock — the channel is `&mut self` owned by the sequence's
 ///   cache, so interior mutability is not needed at all.
 ///
@@ -57,10 +62,17 @@ pub struct RecurrentState {
     /// and reused in place thereafter. `None` before the first write (the block
     /// substitutes its implicit zero state).
     slab: Vec<Option<Tensor>>,
-    /// Per-layer speculative-window snapshot, allocated once alongside the slab
-    /// and copied in place by [`Self::open_window`]. Its presence per layer is
-    /// tracked by `window_open` rather than an `Option`, so no allocation churns.
-    snapshot: Vec<Option<Tensor>>,
+    /// The pre-window slab per layer while a window is open: a shared handle
+    /// on the buffer that WAS the slab at `open_window` — no copy. Every write
+    /// inside the window lands in another buffer ([`Self::write`] copies on
+    /// write when the slab is the base; a fused kernel writes the spare from
+    /// [`Self::take_spare`] and [`Self::swap_in`]s it), so the base stays
+    /// what it was and a rewind is a handle swap.
+    base: Vec<Option<Tensor>>,
+    /// A free buffer per layer, the slab's shape: the buffer the last swap
+    /// retired, or the base a resolved window released. Handed out by
+    /// [`Self::take_spare`], so steady-state decode allocates nothing.
+    spare: Vec<Option<Tensor>>,
     /// Whether a speculative window is currently open (guards double-open and
     /// resolve/rewind-without-open). A plain bool — the channel is single-owner.
     window_open: bool,
@@ -96,9 +108,68 @@ impl RecurrentState {
     pub fn new(n_layers: usize) -> Self {
         Self {
             slab: vec![None; n_layers],
-            snapshot: vec![None; n_layers],
+            base: vec![None; n_layers],
+            spare: vec![None; n_layers],
             window_open: false,
         }
+    }
+
+    /// Whether layer `l`'s slab is the open window's base (a write must not
+    /// land in it).
+    fn slab_is_base(&self, l: usize) -> bool {
+        match (&self.slab[l], &self.base[l]) {
+            (Some(s), Some(b)) => s.id() == b.id(),
+            _ => false,
+        }
+    }
+
+    /// A buffer of the slab's shape for layer `l` that is neither the slab
+    /// nor the window's base — for a kernel that writes the next state out
+    /// of place; hand it back with [`Self::swap_in`]. The retired buffer of
+    /// the last swap when there is one (no allocation), else a fresh one.
+    /// Layer `l` must have been written.
+    pub fn take_spare(&mut self, l: usize) -> Result<Tensor> {
+        if l >= self.slab.len() {
+            lloom_tensor::bail!("RecurrentState::take_spare: layer {l} out of range");
+        }
+        let cur = match &self.slab[l] {
+            Some(c) => c,
+            None => lloom_tensor::bail!("RecurrentState::take_spare: layer {l} unwritten"),
+        };
+        if let Some(sp) = self.spare[l].take() {
+            if sp.dims() == cur.dims() && sp.dtype() == cur.dtype() {
+                return Ok(sp);
+            }
+        }
+        let _declared = lloom_tensor::EscapeGuard::new();
+        Tensor::zeros(cur.shape(), cur.dtype(), cur.device())
+    }
+
+    /// Layer `l`'s next state IS `next` (a buffer of its own — the spare a
+    /// kernel wrote, from [`Self::take_spare`]): the slab becomes `next`, the
+    /// buffer it replaces is retired as the spare unless it is the open
+    /// window's base, which stays the base.
+    pub fn swap_in(&mut self, l: usize, next: Tensor) -> Result<()> {
+        if l >= self.slab.len() {
+            lloom_tensor::bail!("RecurrentState::swap_in: layer {l} out of range");
+        }
+        if let Some(cur) = &self.slab[l] {
+            if cur.dims() != next.dims() {
+                lloom_tensor::bail!(
+                    "RecurrentState::swap_in: layer {l} shape {:?} != slab {:?}",
+                    next.dims(),
+                    cur.dims()
+                );
+            }
+        }
+        let was_base = self.slab_is_base(l);
+        let old = self.slab[l].replace(next);
+        if let Some(old) = old {
+            if !was_base && old.id() != self.slab[l].as_ref().expect("set").id() {
+                self.spare[l] = Some(old);
+            }
+        }
+        Ok(())
     }
 
     /// The current state for layer `l`, or `None` if the sequence has not written
@@ -119,6 +190,23 @@ impl RecurrentState {
             lloom_tensor::bail!("RecurrentState::write: layer {l} out of range");
         }
         match &self.slab[l] {
+            // Under an open window the slab may be the base: copy on write
+            // into the spare and swap, the base untouched.
+            Some(buf) if self.window_open && self.slab_is_base(l) && buf.id() != next.id() => {
+                if buf.dims() != next.dims() {
+                    lloom_tensor::bail!(
+                        "RecurrentState::write: layer {l} shape {:?} != slab {:?}",
+                        next.dims(),
+                        buf.dims()
+                    );
+                }
+                let target = self.take_spare(l)?;
+                {
+                    let _declared = lloom_tensor::EscapeGuard::new();
+                    target.slice_set(&next.contiguous()?, 0, 0)?;
+                }
+                self.swap_in(l, target)?;
+            }
             // Steady state: copy into the existing buffer in place.
             Some(buf) => {
                 if state_write_by_copy() {
@@ -167,7 +255,7 @@ impl RecurrentState {
         for s in &mut self.slab {
             *s = None;
         }
-        for s in &mut self.snapshot {
+        for s in &mut self.base {
             *s = None;
         }
         self.window_open = false;
@@ -181,22 +269,10 @@ impl RecurrentState {
         if self.window_open {
             lloom_tensor::bail!("RecurrentState: a speculative window is already open");
         }
-        let _declared = lloom_tensor::EscapeGuard::new();
+        // The base is the slab's buffer itself (a shared handle, no copy):
+        // every write inside the window goes to another buffer.
         for l in 0..self.slab.len() {
-            match &self.slab[l] {
-                Some(cur) => match &self.snapshot[l] {
-                    // Reuse the snapshot buffer in place (distinct storage).
-                    Some(snap) if snap.dims() == cur.dims() => {
-                        snap.slice_set(cur, 0, 0)?;
-                    }
-                    // Allocate the snapshot once, in storage of its own (neither
-                    // `contiguous` nor `copy` gives that on Metal — both alias
-                    // the slab, and a snapshot that aliases the slab restores
-                    // nothing).
-                    _ => self.snapshot[l] = Some(own_copy(cur)?),
-                },
-                None => self.snapshot[l] = None,
-            }
+            self.base[l] = self.slab[l].clone();
         }
         self.window_open = true;
         Ok(())
@@ -208,6 +284,18 @@ impl RecurrentState {
     pub fn resolve_window(&mut self) -> Result<()> {
         if !self.window_open {
             lloom_tensor::bail!("RecurrentState: no speculative window is open");
+        }
+        // A base the window moved away from is a free buffer: the spare.
+        for l in 0..self.slab.len() {
+            if let Some(b) = self.base[l].take() {
+                let moved = self.slab[l]
+                    .as_ref()
+                    .map(|s| s.id() != b.id())
+                    .unwrap_or(true);
+                if moved && self.spare[l].is_none() {
+                    self.spare[l] = Some(b);
+                }
+            }
         }
         self.window_open = false;
         Ok(())
@@ -221,17 +309,19 @@ impl RecurrentState {
         if !self.window_open {
             lloom_tensor::bail!("RecurrentState: no speculative window is open");
         }
-        let _declared = lloom_tensor::EscapeGuard::new();
         for l in 0..self.slab.len() {
-            match (&self.slab[l], &self.snapshot[l]) {
-                (Some(buf), Some(snap)) => {
-                    buf.slice_set(&snap.contiguous()?, 0, 0)?;
+            let base = self.base[l].take();
+            let cur = self.slab[l].take();
+            // The buffer the window wrote is free (unless it IS the base).
+            if let Some(c) = &cur {
+                let is_base = base.as_ref().map(|b| b.id() == c.id()).unwrap_or(false);
+                if !is_base && self.spare[l].is_none() {
+                    self.spare[l] = cur.clone();
                 }
-                // A layer written only inside the window: its pre-window state
-                // was the zero state, so drop the buffer back to unwritten.
-                (Some(_), None) => self.slab[l] = None,
-                _ => {}
             }
+            // A layer written only inside the window: its pre-window state
+            // was the zero state, so it drops back to unwritten.
+            self.slab[l] = base;
         }
         self.window_open = false;
         Ok(())
@@ -332,6 +422,55 @@ mod tests {
             rs.get(0).is_none(),
             "should return to the implicit zero state"
         );
+    }
+
+    /// The window is zero-copy: opening it does not touch the slab, a write
+    /// inside it lands in ANOTHER buffer (the base is intact), a rewind is
+    /// the base handle back, and a resolve retires the base as the spare
+    /// the next swap reuses — no allocation in the steady state.
+    #[test]
+    fn window_is_zero_copy_over_swapped_slabs() {
+        let dev = Device::Cpu;
+        let mut rs = RecurrentState::new(1);
+        rs.write(0, t(1.0, &dev)).unwrap();
+        let base_id = rs.get(0).unwrap().id();
+        rs.open_window().unwrap();
+        assert_eq!(rs.get(0).unwrap().id(), base_id, "open copied the slab");
+        rs.write(0, t(9.0, &dev)).unwrap();
+        let moved_id = rs.get(0).unwrap().id();
+        assert_ne!(
+            moved_id, base_id,
+            "a write inside the window landed in the base"
+        );
+        assert_eq!(rs.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0], 9.0);
+        rs.rewind_to_window().unwrap();
+        assert_eq!(
+            rs.get(0).unwrap().id(),
+            base_id,
+            "the rewind is not the base handle"
+        );
+        assert_eq!(rs.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0], 1.0);
+        // The retired buffer is the spare: the next out-of-place step reuses it.
+        let sp = rs.take_spare(0).unwrap();
+        assert_eq!(
+            sp.id(),
+            moved_id,
+            "the retired buffer was not kept as the spare"
+        );
+        rs.swap_in(0, sp).unwrap();
+        assert_eq!(rs.get(0).unwrap().id(), moved_id);
+        // A resolved window releases its base as the spare.
+        rs.open_window().unwrap();
+        let sp = rs.take_spare(0).unwrap();
+        assert_eq!(
+            sp.id(),
+            base_id,
+            "the base handed out as a spare under its window"
+        );
+        rs.swap_in(0, sp).unwrap();
+        rs.resolve_window().unwrap();
+        assert_eq!(rs.get(0).unwrap().id(), base_id);
+        assert_eq!(rs.take_spare(0).unwrap().id(), moved_id);
     }
 
     #[test]

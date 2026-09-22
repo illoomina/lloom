@@ -754,7 +754,10 @@ pub(crate) struct GdnPrologue {
     pub eps: f32,
     pub q_scale: f32,
     pub conv_w: Tensor,
+    /// The window as it stands (read) and the window after this step
+    /// (written): two buffers of the channel, never the same one.
     pub win: Tensor,
+    pub win_out: Tensor,
 }
 
 impl lloom_tensor::CustomOp1 for GdnPrologue {
@@ -779,20 +782,30 @@ impl lloom_tensor::CustomOp1 for GdnPrologue {
         }
         let (ws, wl) = self.conv_w.storage_and_layout();
         let (ns, nl) = self.win.storage_and_layout();
-        let (ws, ns) = match (&*ws, &*ns) {
-            (lloom_tensor::Storage::Metal(a), lloom_tensor::Storage::Metal(b)) => (a, b),
+        let (os, ol) = self.win_out.storage_and_layout();
+        let (ws, ns, os) = match (&*ws, &*ns, &*os) {
+            (
+                lloom_tensor::Storage::Metal(a),
+                lloom_tensor::Storage::Metal(b),
+                lloom_tensor::Storage::Metal(c),
+            ) => (a, b, c),
             _ => lloom_tensor::bail!(
                 "gdn_prologue: conv weight / window must be on the metal device"
             ),
         };
         if wl.shape().elem_count() != conv_ch * self.kk
             || nl.shape().elem_count() != conv_ch * self.kk
+            || ol.shape().elem_count() != conv_ch * self.kk
             || !wl.is_contiguous()
             || !nl.is_contiguous()
+            || !ol.is_contiguous()
         {
             lloom_tensor::bail!(
                 "gdn_prologue: conv weight / window must be contiguous [conv_ch, kk]"
             )
+        }
+        if self.win.id() == self.win_out.id() {
+            lloom_tensor::bail!("gdn_prologue: the window in and out must be two buffers")
         }
         let device = s.device();
         let encoder = device.command_encoder()?;
@@ -817,6 +830,7 @@ impl lloom_tensor::CustomOp1 for GdnPrologue {
             metal_bo(ws, wl),
             metal_bo(ns, nl),
             &output,
+            metal_bo(os, ol),
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
@@ -827,13 +841,15 @@ impl lloom_tensor::CustomOp1 for GdnPrologue {
 }
 
 /// The recurrence: `heads`, the raw `alpha`/`beta` logits, the captured
-/// `dt_bias`/`ssm_a` and the `S` slab (in place) → `o [h_v, d]`.
+/// `dt_bias`/`ssm_a`, the `S` slab as it stands (`s`, read) and the slab
+/// after this step (`s_out`, written — the channel's spare) → `o [h_v, d]`.
 pub(crate) struct GdnStep {
     pub d: usize,
     pub h_v: usize,
     pub dt_bias: Tensor,
     pub ssm_a: Tensor,
     pub s: Tensor,
+    pub s_out: Tensor,
 }
 
 impl lloom_tensor::CustomOp3 for GdnStep {
@@ -880,22 +896,29 @@ impl lloom_tensor::CustomOp3 for GdnStep {
         let (bs, bl) = self.dt_bias.storage_and_layout();
         let (as_, al) = self.ssm_a.storage_and_layout();
         let (ss, sl) = self.s.storage_and_layout();
-        let (bs, as_, ss) = match (&*bs, &*as_, &*ss) {
+        let (os, ol) = self.s_out.storage_and_layout();
+        let (bs, as_, ss, os) = match (&*bs, &*as_, &*ss, &*os) {
             (
                 lloom_tensor::Storage::Metal(a),
                 lloom_tensor::Storage::Metal(b),
                 lloom_tensor::Storage::Metal(c),
-            ) => (a, b, c),
+                lloom_tensor::Storage::Metal(e),
+            ) => (a, b, c, e),
             _ => lloom_tensor::bail!("gdn_step: dt_bias / ssm_a / S must be on the metal device"),
         };
         if bl.shape().elem_count() != h_v
             || al.shape().elem_count() != h_v
             || sl.shape().elem_count() != d * d * h_v
+            || ol.shape().elem_count() != d * d * h_v
             || !bl.is_contiguous()
             || !al.is_contiguous()
             || !sl.is_contiguous()
+            || !ol.is_contiguous()
         {
             lloom_tensor::bail!("gdn_step: dt_bias / ssm_a [h_v], S [d, d, h_v], contiguous")
+        }
+        if self.s.id() == self.s_out.id() {
+            lloom_tensor::bail!("gdn_step: S in and out must be two buffers")
         }
         let device = s1.device();
         let encoder = device.command_encoder()?;
@@ -919,6 +942,7 @@ impl lloom_tensor::CustomOp3 for GdnStep {
             metal_bo(as_, al),
             metal_bo(ss, sl),
             &output,
+            metal_bo(os, ol),
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((

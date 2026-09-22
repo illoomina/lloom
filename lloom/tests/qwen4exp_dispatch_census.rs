@@ -90,6 +90,8 @@ fn decode_blocks_and_the_token() -> Result<()> {
     // Q8_0 expert stacks route through `mul_mv_id` as the real model does
     // (`moe_intermediate_size` a multiple of the block).
     cfg.moe_intermediate_size = 32;
+    // The fused QSA step needs a head the sdpa vector kernel is built for.
+    cfg.head_dim = 32;
     let n_layers = cfg.n_layers;
 
     // --- HC bracket: mix (prologue) and combine (epilogue) ---

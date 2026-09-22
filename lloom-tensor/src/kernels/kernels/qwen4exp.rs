@@ -377,3 +377,79 @@ pub fn call_gdn_gated_norm(
     dispatch_groups(encoder, h_v, width);
     Ok(())
 }
+
+/// `qsa_prep_f32`: the q/gate split, the per-head norms and the partial rope
+/// at `pos` → `out [2·nh + nkv, hd]`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_qsa_prep(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    hd: usize,
+    n_rot: usize,
+    nh: usize,
+    nkv: usize,
+    pos: usize,
+    theta: f32,
+    eps: f32,
+    qg: BufferOffset,
+    k: BufferOffset,
+    q_gamma: BufferOffset,
+    k_gamma: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if hd > 1024 || n_rot > hd || !n_rot.is_multiple_of(2) {
+        return Err(MetalKernelError::LoadFunctionError(format!(
+            "qsa_prep: head_dim {hd} (<= 1024), n_rot {n_rot} (even, <= head_dim)"
+        )));
+    }
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "qsa_prep_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qsa_prep hd={hd} nh={nh} nkv={nkv} pos={pos}");
+    set_params!(
+        encoder,
+        (
+            &qg,
+            &k,
+            &q_gamma,
+            &k_gamma,
+            Output::new(out),
+            hd as u32,
+            n_rot as u32,
+            nh as u32,
+            nkv as u32,
+            pos as u32,
+            theta,
+            eps
+        )
+    );
+    let width = hd
+        .max(32)
+        .next_power_of_two()
+        .min(pipeline.max_total_threads_per_threadgroup());
+    dispatch_groups(encoder, nh + nkv, width);
+    Ok(())
+}
+
+/// `sigmoid_mul_f32`: `out = sigmoid(a) · b` over `n` elements.
+pub fn call_sigmoid_mul(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    n: usize,
+    a: BufferOffset,
+    b: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "sigmoid_mul_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "sigmoid_mul n={n}");
+    set_params!(encoder, (&a, &b, Output::new(out), n as u32));
+    let width = 256usize.min(pipeline.max_total_threads_per_threadgroup());
+    dispatch_groups(encoder, n.div_ceil(width), width);
+    Ok(())
+}

@@ -416,6 +416,9 @@ impl QsaAttention {
     /// One decode step: `x [1, 1, hidden]` in, `[1, 1, hidden]` out, appending to
     /// this layer's `kv`. Dense QK-norm GQA attention (= QSA for ctx ≤ budget).
     pub fn decode(&self, x: &Tensor, kv: &mut KvCache) -> Result<Tensor> {
+        if let Some(out) = self.decode_fused(x, kv)? {
+            return Ok(out);
+        }
         let hidden = x.dim(D::Minus1)?;
         let dev = x.device();
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
@@ -455,27 +458,7 @@ impl QsaAttention {
             None => None,
         };
         if let Some(sel) = &sel {
-            if check_selection() {
-                let n_kv = pos + 1;
-                let ids = sel.to_vec1::<u32>()?;
-                let bad = ids.iter().filter(|&&c| c as usize >= n_kv).count();
-                let mut seen = std::collections::HashSet::new();
-                let dup = ids.iter().filter(|&&c| !seen.insert(c)).count();
-                if bad > 0 || dup > 0 {
-                    lloom_tensor::bail!(
-                        "qsa selection at pos {pos}: {bad} cells >= {n_kv}, {dup} duplicates, of {} (first {:?})",
-                        ids.len(),
-                        &ids[..ids.len().min(8)]
-                    )
-                }
-                eprintln!(
-                    "SEL pos={pos} n={} blocks={} first={:?} last={:?}",
-                    ids.len(),
-                    kv.n_blocks(),
-                    &ids[..4],
-                    &ids[ids.len() - 4..]
-                );
-            }
+            check_sel(sel, pos, kv)?;
         }
         let (k_all, v_all) = match &sel {
             Some(sel) => kv.gather(sel)?, // [nkv, n_sel, hd] each
@@ -508,6 +491,82 @@ impl QsaAttention {
         let gate_flat = gate.reshape((1, nh * hd))?;
         let gated = (ctx * ops::sigmoid(&gate_flat)?)?;
         self.wo.forward(&gated)?.reshape((1, 1, hidden))
+    }
+
+    /// [`Self::decode`] as launches: the projections, `kernels::QsaPrep` (the
+    /// q/gate split, both norms, the partial rope at `pos` — the angle on the
+    /// device, no per-token cos/sin upload), the KV append, `ops::sdpa`'s
+    /// vector kernel over the cache as it lies (GQA in the kernel, no head
+    /// expansion), `kernels::SigmoidMul` for the output gate, the out-proj.
+    /// Metal, f32; `None` where the composed path applies.
+    fn decode_fused(&self, x: &Tensor, kv: &mut KvCache) -> Result<Option<Tensor>> {
+        use super::kernels::{fused_off, sigmoid_mul, QsaPrep};
+        let hidden = x.dim(D::Minus1)?;
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        if fused_off()
+            || !x.device().is_metal()
+            || x.dtype() != lloom_tensor::DType::F32
+            || x.elem_count() != hidden
+            || !matches!(hd, 32 | 64 | 72 | 80 | 96 | 128 | 256 | 512)
+            || nh % nkv != 0
+        {
+            return Ok(None);
+        }
+        let f32 = lloom_tensor::DType::F32;
+        let x1 = x.reshape((1, hidden))?;
+        let qg = self.wq.forward(&x1)?.to_dtype(f32)?.reshape((nh, 2 * hd))?;
+        let k = self.wk.forward(&x1)?.to_dtype(f32)?.reshape((nkv, hd))?;
+        let v = self.wv.forward(&x1)?.to_dtype(f32)?.reshape((nkv, 1, hd))?;
+        let pos = kv.len();
+        let prep = qg.apply_op2_no_bwd(
+            &k,
+            &QsaPrep {
+                hd,
+                n_rot: self.n_rot,
+                nh,
+                nkv,
+                pos,
+                theta: self.rope_theta as f32,
+                eps: self.q_norm.eps() as f32,
+                q_gamma: self.q_norm.weight().to_dtype(f32)?,
+                k_gamma: self.k_norm.weight().to_dtype(f32)?,
+            },
+        )?; // [2nh + nkv, hd]
+        let q = prep.narrow(0, 0, nh)?; // [nh, hd]
+        let gate = prep.narrow(0, nh, nh)?; // [nh, hd]
+        let k_step = prep.narrow(0, 2 * nh, nkv)?.reshape((nkv, 1, hd))?;
+        let (k_all, v_all) = kv.append(&k_step, &v)?; // [nkv, seq, hd] slab views
+        let sel = match &self.indexer {
+            Some(ix) => {
+                ix.observe(&x1, kv)?;
+                ix.select(&x1, pos, kv)?
+            }
+            None => None,
+        };
+        if let Some(sel) = &sel {
+            check_sel(sel, pos, kv)?;
+        }
+        let (k_all, v_all) = match &sel {
+            Some(sel) => kv.gather(sel)?,
+            None => (k_all, v_all),
+        };
+        let scale = 1.0 / (hd as f64).sqrt();
+        let ctx = ops::sdpa(
+            &q.reshape((1, nh, 1, hd))?,
+            &k_all.unsqueeze(0)?,
+            &v_all.unsqueeze(0)?,
+            None,
+            false,
+            scale as f32,
+            1.0, // no softcapping (the kernel divides by it)
+        )?; // [1, nh, 1, hd]
+        let ctx = ctx.reshape((1, nh * hd))?;
+        let gate = gate.reshape((1, nh * hd))?;
+        let gated = match sigmoid_mul(&gate, &ctx) {
+            Some(g) => g?,
+            None => (ctx * ops::sigmoid(&gate)?)?,
+        };
+        Ok(Some(self.wo.forward(&gated)?.reshape((1, 1, hidden))?))
     }
 
     /// A whole chunk `x [1, seq, hidden]` → `[1, seq, hidden]`: the same dense
@@ -602,6 +661,33 @@ fn score_without_matmul() -> bool {
     *ON.get_or_init(|| std::env::var_os("QWEN4EXP_SCORE_NO_MATMUL").is_some())
 }
 
+/// The `QWEN4EXP_CHECK_SEL` instrument on one selection (a no-op unless set).
+fn check_sel(sel: &Tensor, pos: usize, kv: &KvCache) -> Result<()> {
+    if !check_selection() {
+        return Ok(());
+    }
+    let n_kv = pos + 1;
+    let ids = sel.to_vec1::<u32>()?;
+    let bad = ids.iter().filter(|&&c| c as usize >= n_kv).count();
+    let mut seen = std::collections::HashSet::new();
+    let dup = ids.iter().filter(|&&c| !seen.insert(c)).count();
+    if bad > 0 || dup > 0 {
+        lloom_tensor::bail!(
+            "qsa selection at pos {pos}: {bad} cells >= {n_kv}, {dup} duplicates, of {} (first {:?})",
+            ids.len(),
+            &ids[..ids.len().min(8)]
+        )
+    }
+    eprintln!(
+        "SEL pos={pos} n={} blocks={} first={:?} last={:?}",
+        ids.len(),
+        kv.n_blocks(),
+        &ids[..4],
+        &ids[ids.len() - 4..]
+    );
+    Ok(())
+}
+
 /// Read the selection back and check it every position (`QWEN4EXP_CHECK_SEL`,
 /// read once): a debugging instrument behind a gate (§3.3a) — a host sync per
 /// full layer per token, never on the shipping path.
@@ -691,6 +777,88 @@ mod tests {
     }
     fn rms(dim: usize, dev: &Device) -> RmsNorm {
         RmsNorm::new(Tensor::ones(dim, DType::F32, dev).unwrap(), 1e-6)
+    }
+
+    /// The fused decode (the prep kernel, the sdpa vector kernel over the
+    /// cache as it lies, the gate kernel) matches the composed path — the
+    /// CPU's — at the real head geometry (24 heads of 256 over 2 kv heads,
+    /// rope on 64 dims, non-trivial γ) over 12 steps from a fresh cache.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn decode_fused_matches_composed_at_real_geometry() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let d = cfg.hidden_size;
+        let (hd, nh, nkv) = (cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
+        let build = |dev: &Device| {
+            let gamma = |seed: f32| {
+                RmsNorm::new(
+                    Tensor::from_vec(
+                        (0..hd)
+                            .map(|i| 1.0 + 0.1 * ((i as f32 + seed) * 0.3).sin())
+                            .collect::<Vec<f32>>(),
+                        hd,
+                        dev,
+                    )
+                    .unwrap(),
+                    1e-6,
+                )
+            };
+            QsaAttention::new(
+                lin(nh * hd * 2, d, 1.0, dev),
+                lin(nkv * hd, d, 2.0, dev),
+                lin(nkv * hd, d, 3.0, dev),
+                lin(d, nh * hd, 4.0, dev),
+                gamma(0.0),
+                gamma(9.0),
+                &cfg,
+            )
+        };
+        let (a_cpu, a_gpu) = (build(&cpu), build(&gpu));
+        let (mut kv_c, mut kv_g) = (KvCache::default(), KvCache::default());
+        let mut worst = 0f32;
+        for t in 0..12 {
+            let x = Tensor::from_vec(
+                (0..d)
+                    .map(|i| ((i as f32 * 0.05 + t as f32).sin()) * 0.6)
+                    .collect::<Vec<f32>>(),
+                (1, 1, d),
+                &cpu,
+            )
+            .unwrap();
+            let a = a_cpu.decode(&x, &mut kv_c).unwrap();
+            let b = a_gpu
+                .decode(&x.to_device(&gpu).unwrap(), &mut kv_g)
+                .unwrap();
+            let av: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
+            let bv: Vec<f32> = b
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert!(
+                bv.iter().all(|v| v.is_finite()),
+                "step {t}: non-finite fused output"
+            );
+            let scale = av.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+            let diff = av
+                .iter()
+                .zip(&bv)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(diff / scale);
+            assert!(
+                diff <= 2e-4 * scale,
+                "step {t}: fused differs by {diff} at scale {scale}"
+            );
+        }
+        assert_eq!(kv_c.len(), kv_g.len());
+        assert_eq!(kv_g.len(), 12);
+        println!("qsa fused vs composed worst relative diff: {worst:e}");
     }
 
     /// QSA decodes end to end and its KV grows: shapes thread, output finite, and

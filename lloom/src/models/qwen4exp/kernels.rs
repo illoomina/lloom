@@ -1001,3 +1001,162 @@ impl lloom_tensor::CustomOp3 for GdnGatedNorm {
         ))
     }
 }
+
+// ---- QSA decode -------------------------------------------------------------------
+
+/// The decode prologue: `qg [nh, 2·hd]` and `k [nkv, hd]` → `[2·nh + nkv, hd]`
+/// (q normed + roped, the gate, k normed + roped); γ_q / γ_k captured.
+pub(crate) struct QsaPrep {
+    pub hd: usize,
+    pub n_rot: usize,
+    pub nh: usize,
+    pub nkv: usize,
+    pub pos: usize,
+    pub theta: f32,
+    pub eps: f32,
+    pub q_gamma: Tensor,
+    pub k_gamma: Tensor,
+}
+
+impl lloom_tensor::CustomOp2 for QsaPrep {
+    fn name(&self) -> &'static str {
+        "qwen4exp-qsa-prep"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("qsa_prep: no cpu kernel; `QsaAttention::decode` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (hd, nh, nkv) = (self.hd, self.nh, self.nkv);
+        if l1.shape().elem_count() != nh * 2 * hd
+            || l2.shape().elem_count() != nkv * hd
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "qsa_prep: qg {:?} / k {:?} vs nh {nh} nkv {nkv} hd {hd}",
+                l1.shape(),
+                l2.shape()
+            )
+        }
+        let (qs, ql) = self.q_gamma.storage_and_layout();
+        let (ks, kl) = self.k_gamma.storage_and_layout();
+        let (qs, ks) = match (&*qs, &*ks) {
+            (lloom_tensor::Storage::Metal(a), lloom_tensor::Storage::Metal(b)) => (a, b),
+            _ => lloom_tensor::bail!("qsa_prep: the norm weights must be on the metal device"),
+        };
+        if ql.shape().elem_count() != hd
+            || kl.shape().elem_count() != hd
+            || !ql.is_contiguous()
+            || !kl.is_contiguous()
+        {
+            lloom_tensor::bail!("qsa_prep: γ_q / γ_k must be contiguous [hd]")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("qsa_prep");
+        let elem_count = (2 * nh + nkv) * hd;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("qsa_prep")
+            .build()?;
+        lloom_tensor::kernels::call_qsa_prep(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            hd,
+            self.n_rot,
+            nh,
+            nkv,
+            self.pos,
+            self.theta,
+            self.eps,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(qs, &ql),
+            metal_bo(ks, &kl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((2 * nh + nkv, hd)),
+        ))
+    }
+}
+
+/// `sigmoid(a) · b`, elementwise.
+pub(crate) struct SigmoidMul;
+
+impl lloom_tensor::CustomOp2 for SigmoidMul {
+    fn name(&self) -> &'static str {
+        "qwen4exp-sigmoid-mul"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("sigmoid_mul: no cpu kernel; `b * sigmoid(a)` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        if l1.shape().elem_count() != l2.shape().elem_count()
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+        {
+            lloom_tensor::bail!("sigmoid_mul: same-size contiguous inputs only")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("sigmoid_mul");
+        let elem_count = l1.shape().elem_count();
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("sigmoid_mul")
+            .build()?;
+        lloom_tensor::kernels::call_sigmoid_mul(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            elem_count,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            l2.shape().clone(),
+        ))
+    }
+}
+
+pub(crate) fn sigmoid_mul(a: &Tensor, b: &Tensor) -> Option<Result<Tensor>> {
+    (fused_applies(a) && fused_applies(b) && a.elem_count() == b.elem_count())
+        .then(|| a.apply_op2_no_bwd(b, &SigmoidMul))
+}

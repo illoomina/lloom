@@ -31,12 +31,12 @@ pub use kernels::{
     call_binary_contiguous_with, call_binary_strided, call_binary_strided_with, call_eos_gate,
     call_eos_index, call_gdn_gated_norm, call_gdn_prologue, call_gdn_step, call_hc_collapse,
     call_hc_combine, call_hc_norm, call_mlx_gemm, call_mlx_gemv_epilogue, call_mlx_gemv_full,
-    call_mlx_gemv_mixed, call_mlx_gemv_with, call_moe_combine, call_moe_topk, call_silu_mul,
-    call_unit_lower_inverse, call_words_publish, cast::*, convolution::*, fill::*,
-    flash_decoding::*, indexing::*, quantized::*, random::*, reduce::*, scratch::*, sdpa::*,
-    sort::*, ternary::*, unary, unary::*, ConvKernel, GemmDType, GemvEpilogue, GemvRmsNorm,
-    GgmlDType, IndexingKernel, MixedEpilogue, ParamStyle, ReduceKernel, SdpaQuantParams,
-    SdpaQuantWriteParams, SKINNY_TILE_MAX_M,
+    call_mlx_gemv_mixed, call_mlx_gemv_with, call_moe_combine, call_moe_topk, call_qsa_prep,
+    call_sigmoid_mul, call_silu_mul, call_unit_lower_inverse, call_words_publish, cast::*,
+    convolution::*, fill::*, flash_decoding::*, indexing::*, quantized::*, random::*, reduce::*,
+    scratch::*, sdpa::*, sort::*, ternary::*, unary, unary::*, ConvKernel, GemmDType, GemvEpilogue,
+    GemvRmsNorm, GgmlDType, IndexingKernel, MixedEpilogue, ParamStyle, ReduceKernel,
+    SdpaQuantParams, SdpaQuantWriteParams, SKINNY_TILE_MAX_M,
 };
 // The binding-style default, so a harness can reach the packed entry points
 // without every `call_*` growing an argument (issue #115). Named rather than

@@ -442,3 +442,83 @@ kernel void gdn_gated_norm_f32(
     out[idx] = x * scale * gamma[i] * sg;
   }
 }
+
+// ---- QSA (full attention) decode (`qsa.rs`) ------------------------------------
+
+// The decode prologue: from `qg [nh, 2·hd]` (q | gate interleaved per head)
+// and `k [nkv, hd]`, the per-head RMS norm (γ_q / γ_k over `hd`) and the
+// partial NEOX rope at `pos` on the first `n_rot` dims — the angle computed
+// here in precise f32 as the host did (`rope_cs_at`) — into
+// `out [2·nh + nkv, hd]`: rows `0..nh` q (normed, roped), `nh..2nh` the gate
+// (as is), `2nh..` k (normed, roped). One threadgroup per head, `hd` threads.
+kernel void qsa_prep_f32(
+    const device float* qg [[buffer(0)]],
+    const device float* k [[buffer(1)]],
+    const device float* q_gamma [[buffer(2)]],
+    const device float* k_gamma [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint& hd [[buffer(5)]],
+    constant uint& n_rot [[buffer(6)]],
+    constant uint& nh [[buffer(7)]],
+    constant uint& nkv [[buffer(8)]],
+    constant uint& pos [[buffer(9)]],
+    constant float& theta [[buffer(10)]],
+    constant float& eps [[buffer(11)]],
+    uint g [[threadgroup_position_in_grid]],
+    uint i [[thread_position_in_threadgroup]],
+    uint width [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partial[32];
+  threadgroup float tmp[1024];
+  const bool is_q = g < nh;
+  float x = 0.0f;
+  const device float* gamma = is_q ? q_gamma : k_gamma;
+  uint out_row;
+  if (is_q) {
+    out_row = g;
+    if (i < hd) {
+      x = qg[(size_t)g * 2 * hd + i];
+      out[(size_t)(nh + g) * hd + i] = qg[(size_t)g * 2 * hd + hd + i]; // the gate
+    }
+  } else {
+    const uint kh = g - nh;
+    out_row = 2 * nh + kh;
+    if (i < hd) x = k[(size_t)kh * hd + i];
+  }
+  float ss = simd_sum(x * x);
+  if (simd_lane == 0) partial[simd_id] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n_simd = (width + 31) / 32;
+  float total = 0.0f;
+  for (uint s = 0; s < n_simd; s++) total += partial[s];
+  const float scale = 1.0f / metal::sqrt(total / (float)hd + eps);
+  if (i < hd) tmp[i] = x * scale * gamma[i];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (i >= hd) return;
+  const uint rot_half = n_rot / 2;
+  device float* o = out + (size_t)out_row * hd;
+  if (i < rot_half) {
+    const float inv = metal::precise::exp(-((2.0f * (float)i) / (float)n_rot) * metal::precise::log(theta));
+    const float f = inv * (float)pos;
+    const float c = metal::precise::cos(f);
+    const float s = metal::precise::sin(f);
+    const float lo = tmp[i];
+    const float hi = tmp[i + rot_half];
+    o[i] = lo * c - hi * s;
+    o[i + rot_half] = lo * s + hi * c;
+  } else if (i >= n_rot) {
+    o[i] = tmp[i];
+  }
+}
+
+// `out = sigmoid(a) · b`, elementwise (the attention's output gate).
+kernel void sigmoid_mul_f32(
+    const device float* a [[buffer(0)]],
+    const device float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]) {
+  if (idx >= n) return;
+  out[idx] = b[idx] / (1.0f + metal::exp(-a[idx]));
+}

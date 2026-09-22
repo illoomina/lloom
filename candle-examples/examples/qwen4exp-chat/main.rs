@@ -28,6 +28,47 @@ use lloom::models::qwen4exp::{Cache, ExpertResidency, MtpDrafter, Qwen4Exp, Resi
 use lloom::nn::expert_stream::HasStreamStats;
 use lloom::nn::model::CausalLM;
 use lloom::nn::observer::{ForwardObserver, HookPoint};
+
+/// `CANDLE_METAL_PROFILE=1`: one line per phase from the backend's profiler
+/// (§13.1a) — dispatches, command buffers, GPU-busy union against the wall,
+/// and the dispatch count per kernel label — then a reset for the next phase.
+/// Inert otherwise.
+fn profile_line(run: usize, phase: &str, tokens: usize, wall_ms: f64) {
+    #[cfg(feature = "metal")]
+    {
+        use candle::kernels::metal::profile;
+        if !profile::enabled() {
+            return;
+        }
+        let s = profile::snapshot();
+        let busy = 1e3 * s.gpu_busy_union_s;
+        println!(
+            "PROFILE run={run} phase={phase} tokens={tokens} wall_ms={wall_ms:.1} gpu_busy_ms={busy:.1} gpu_span_ms={:.1} busy_over_wall={:.3} dispatches={} per_token={:.0} encoders={} command_buffers={} commits={} commit_ms={:.1}",
+            1e3 * s.gpu_span_s,
+            busy / wall_ms.max(1e-9),
+            s.dispatches,
+            s.dispatches as f64 / tokens.max(1) as f64,
+            s.encoders,
+            s.command_buffers,
+            s.commits,
+            s.commit_ns as f64 / 1e6,
+        );
+        let mut by = s.by_label.clone();
+        by.sort_by(|a, b| b.1.cmp(&a.1));
+        let top: Vec<String> = by
+            .iter()
+            .take(24)
+            .map(|(l, n)| format!("{l}={:.1}", *n as f64 / tokens.max(1) as f64))
+            .collect();
+        println!(
+            "PROFILE run={run} phase={phase} labels_per_token {}",
+            top.join(" ")
+        );
+        profile::reset();
+    }
+    #[cfg(not(feature = "metal"))]
+    let _ = (run, phase, tokens, wall_ms);
+}
 use lloom::nn::speculator::{Anchor, Draft, Probes};
 use lloom::nn::{DecodeOptions, Session};
 use std::path::PathBuf;
@@ -486,6 +527,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         }
         let mut logits = logits.expect("a non-empty prompt");
         let prefill_ms = t1.elapsed().as_millis();
+        profile_line(run, "prefill", prompt_ids.len(), prefill_ms as f64);
         if args.state_digest {
             for (name, sum, nonfinite) in cache.checksums()? {
                 println!("STATE run={run} phase=prompt {name}={sum:016x} nonfinite={nonfinite}");
@@ -538,6 +580,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             }
         }
         let decode_ms = t1.elapsed().as_millis() - prefill_ms;
+        profile_line(run, "decode", generated.len(), decode_ms as f64);
         let logits_digest = sha256::hex(&lh.finalize());
         let mut h = sha256::Sha256::new();
         for t in &generated {

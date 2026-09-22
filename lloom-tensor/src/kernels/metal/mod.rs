@@ -69,11 +69,11 @@ pub mod hazard_audit;
 #[cfg(test)]
 mod hazard_audit_tests;
 pub mod icb;
-pub mod io_queue;
 #[cfg(test)]
 mod icb_executor_tests;
 #[cfg(test)]
 mod icb_tests;
+pub mod io_queue;
 /// The paged KV pool: allocation, free list, refcounts and the page table
 /// (`DESIGN.md` §10.3c–§10.3g, issue #148). Pure functions of a configuration
 /// and an allocation history — no device, no buffer, no dispatch — which is the
@@ -98,7 +98,6 @@ pub mod residency_set;
 /// unconditionally and compiles to nothing when the feature is off.
 pub mod run_telemetry;
 pub mod scratch;
-pub mod staging;
 /// A stateful fuzzer over the scratch class's long-context state machine, on
 /// the `kv_len` axis the four existing harnesses do not carry (#575).
 #[cfg(any(test, feature = "fuzzing"))]
@@ -117,6 +116,7 @@ mod scratch_tests;
 pub mod session_region;
 #[cfg(test)]
 mod session_region_tests;
+pub mod staging;
 pub mod trace;
 pub mod upload_shadow;
 

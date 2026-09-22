@@ -518,7 +518,10 @@ fn the_narrow_partial_matches_the_reference_and_is_bit_stable() {
         let narrow = run(8);
         let again = run(8);
         assert!(
-            narrow.iter().zip(again.iter()).all(|(a, b)| a.to_bits() == b.to_bits()),
+            narrow
+                .iter()
+                .zip(again.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
             "n_keys={n_keys}: the narrow partial is not bit-stable run to run"
         );
         let square = run(32);
@@ -1392,7 +1395,11 @@ fn ragged_rows_read_their_own_live_counts_bit_for_bit() {
         for h in 0..heads_per_seq {
             let head = b * heads_per_seq + h;
             for c in own_chunks..n_chunks {
-                assert_eq!(batched.sums[head * n_chunks + c], 0.0, "row {b} head {h} chunk {c}");
+                assert_eq!(
+                    batched.sums[head * n_chunks + c],
+                    0.0,
+                    "row {b} head {h} chunk {c}"
+                );
                 assert_eq!(
                     batched.maxs[head * n_chunks + c],
                     f32::NEG_INFINITY,
@@ -1471,8 +1478,8 @@ fn ragged_rows_on_the_single_chunk_path_read_their_own_live_counts() {
             &logical_k, &logical_v, n_kv_heads, n_keys, head_dim, page_size, pool_pages, table,
         );
         for h in 0..n_kv_heads {
-            let base = h * pool_pages * page_size * head_dim
-                + (table[0] as usize) * page_size * head_dim;
+            let base =
+                h * pool_pages * page_size * head_dim + (table[0] as usize) * page_size * head_dim;
             let n = n_keys * head_dim;
             pool_k[base..base + n].copy_from_slice(&pk[base..base + n]);
             pool_v[base..base + n].copy_from_slice(&pv[base..base + n]);
@@ -2441,7 +2448,9 @@ fn words_publish_stamp_is_visible_to_a_host_poll() {
     for gen in 1..=3u32 {
         let src = (src.clone() + 0.0).unwrap_or(src.clone());
         dev.words_publish(&src, 19, &out, &step, gen).unwrap();
-        let Device::Metal(m) = &dev else { unreachable!() };
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
         m.flush_and_prune().unwrap();
         let t = std::time::Instant::now();
         let mut spins = 0u64;
@@ -2451,10 +2460,15 @@ fn words_publish_stamp_is_visible_to_a_host_poll() {
                 break;
             }
             spins += 1;
-            assert!(t.elapsed().as_secs() < 5, "gen {gen}: stamp never seen (saw {seen}) after {spins} spins");
+            assert!(
+                t.elapsed().as_secs() < 5,
+                "gen {gen}: stamp never seen (saw {seen}) after {spins} spins"
+            );
             std::hint::spin_loop();
         }
-        let words: Vec<u32> = (0..19).map(|i| unsafe { std::ptr::read_volatile(out_ptr.add(i)) }).collect();
+        let words: Vec<u32> = (0..19)
+            .map(|i| unsafe { std::ptr::read_volatile(out_ptr.add(i)) })
+            .collect();
         assert_eq!(words, (1..=19u32).collect::<Vec<_>>(), "gen {gen}");
         println!("words_publish_stamp_is_visible_to_a_host_poll: gen {gen} seen after {spins} spins, {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
     }

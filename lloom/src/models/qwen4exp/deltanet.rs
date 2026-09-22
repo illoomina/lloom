@@ -414,6 +414,17 @@ pub fn chunk_forward(
 /// summing those terms in fp32 leaves garbage of ~1e11 that overflows the
 /// state two chunks later (measured: NaN at layer 0 on a 643-token prompt).
 pub fn unit_lower_inverse(a: &Tensor) -> Result<Tensor> {
+    // One launch on Metal (`kernels::UnitLowerInverse`, the same substitution
+    // row by row); the composed loop below is the CPU path and its reference.
+    if super::kernels::unit_lower_inverse_applies(a) {
+        return super::kernels::unit_lower_inverse(a);
+    }
+    unit_lower_inverse_composed(a)
+}
+
+/// [`unit_lower_inverse`] as tensor ops: an `n`-row host loop, each row a
+/// `narrow`/`cat`/`matmul` — the reference, and the CPU path.
+pub fn unit_lower_inverse_composed(a: &Tensor) -> Result<Tensor> {
     let dims = a.dims().to_vec();
     let n = dims[dims.len() - 1];
     if dims[dims.len() - 2] != n {
@@ -1005,6 +1016,52 @@ mod tests {
     /// at n = 64, whose inverse is bidiagonal (1 on the diagonal, −1 below)
     /// while its Neumann terms reach ~1e17. The nilpotent doubling product
     /// this replaced fails this fixture by ~1e11 (the NaN on the real model).
+    /// The fused inverse (one launch) equals the composed loop on the hard
+    /// case's shape — near-identical keys, β ≈ 1, decay ≈ 1, `A` close to the
+    /// all-ones strictly-lower matrix — at the chunk size, batched over heads.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn unit_lower_inverse_fused_matches_composed() {
+        let gpu = Device::new_metal(0).unwrap();
+        let (b, n) = (6usize, CHUNK_SIZE);
+        let mut v = vec![0f32; b * n * n];
+        for bi in 0..b {
+            for i in 0..n {
+                for j in 0..i {
+                    let x = ((i * 7 + j * 3 + bi) as f32 * 0.37).sin();
+                    v[bi * n * n + i * n + j] = 0.97 + 0.03 * x;
+                }
+            }
+        }
+        let a = Tensor::from_vec(v, (b, n, n), &gpu).unwrap();
+        let fused = unit_lower_inverse(&a).unwrap();
+        let composed = unit_lower_inverse_composed(&a).unwrap();
+        let (x, y) = (
+            fused.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            composed.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        let scale = y.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let maxdiff = x
+            .iter()
+            .zip(&y)
+            .map(|(p, q)| (p - q).abs())
+            .fold(0f32, f32::max);
+        // The inverse of a near-all-ones strictly-lower matrix is near
+        // bidiagonal ±1: the scale is ~1 and the off-diagonal is live.
+        assert!(scale >= 1.0, "a degenerate inverse: max |T| = {scale}");
+        let off: f32 = (1..n).map(|i| y[i * n + i - 1].abs()).sum();
+        assert!(
+            off > 0.5 * (n - 1) as f32,
+            "the sub-diagonal is dead: {off}"
+        );
+        assert!(
+            maxdiff <= 2e-5 * scale,
+            "fused differs from composed by {maxdiff} at scale {scale}"
+        );
+        // non-vacuity: the fused path ran (it refuses a non-f32 / cpu input)
+        assert!(super::super::kernels::unit_lower_inverse_applies(&a));
+    }
+
     #[test]
     fn unit_lower_inverse_is_stable_on_the_hard_case() {
         let dev = Device::Cpu;

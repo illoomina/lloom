@@ -27,14 +27,14 @@ pub use kernel::{merged_translation_unit, metal_compile_flags};
 // `kernels::params` when `conv.metal` followed (issue #42), so it is named
 // explicitly here; the spelling callers use is unchanged.
 pub use kernels::{
-    affine::*, arena_alloc::*, call_binary_contiguous, call_binary_contiguous_with,
-    call_argmax_publish, call_binary_strided, call_binary_strided_with, call_eos_gate,
-    call_words_publish,
-    call_eos_index, call_mlx_gemm, call_mlx_gemv_epilogue, call_mlx_gemv_full,
-    call_mlx_gemv_with, cast::*, convolution::*, fill::*, flash_decoding::*, indexing::*,
-    quantized::*, random::*, reduce::*, scratch::*, sdpa::*, sort::*, ternary::*, unary,
-    unary::*, ConvKernel, GemmDType, GemvEpilogue, GemvRmsNorm, GgmlDType, IndexingKernel,
-    ParamStyle, ReduceKernel, SdpaQuantParams, SdpaQuantWriteParams, SKINNY_TILE_MAX_M,
+    affine::*, arena_alloc::*, call_argmax_publish, call_binary_contiguous,
+    call_binary_contiguous_with, call_binary_strided, call_binary_strided_with, call_eos_gate,
+    call_eos_index, call_mlx_gemm, call_mlx_gemv_epilogue, call_mlx_gemv_full, call_mlx_gemv_with,
+    call_unit_lower_inverse, call_words_publish, cast::*, convolution::*, fill::*,
+    flash_decoding::*, indexing::*, quantized::*, random::*, reduce::*, scratch::*, sdpa::*,
+    sort::*, ternary::*, unary, unary::*, ConvKernel, GemmDType, GemvEpilogue, GemvRmsNorm,
+    GgmlDType, IndexingKernel, ParamStyle, ReduceKernel, SdpaQuantParams, SdpaQuantWriteParams,
+    SKINNY_TILE_MAX_M,
 };
 // The binding-style default, so a harness can reach the packed entry points
 // without every `call_*` growing an argument (issue #115). Named rather than
@@ -44,8 +44,8 @@ pub use kernels::{
 // sites.
 pub use kernels::params::{
     constants_pool, default_param_style, set_constants_pool_enabled, set_default_param_style,
-    ConstantsPool, ConstantsPoolCounters, FlashCombineParams, FlashPartialParams, FlashScatterParams, ShortconvRingParams,
-    ShortconvStepParams,
+    ConstantsPool, ConstantsPoolCounters, FlashCombineParams, FlashPartialParams,
+    FlashScatterParams, ShortconvRingParams, ShortconvStepParams,
 };
 // The SiLU variant axis (issue #599, `DESIGN.md` §12.2l). Named rather than
 // arriving through a glob for `set_default_param_style`'s reason: this is the

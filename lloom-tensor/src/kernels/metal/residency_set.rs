@@ -1,9 +1,9 @@
 use super::{Buffer, Device};
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_metal::{MTLAllocation, MTLDevice as _, MTLResidencySet, MTLResidencySetDescriptor};
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
 
 /// What the set has done, so the cost model can be checked rather than quoted.
 ///

@@ -66,6 +66,9 @@ pub const EOS_INDEX: &str = include_str!("metal_src/eos_index.metal");
 /// token (or the sticky flag is already up). Self-contained like `EOS_INDEX`.
 pub const EOS_GATE: &str = include_str!("metal_src/eos_gate.metal");
 pub const FILL: &str = include_str!("metal_src/fill.metal");
+/// The Qwen4-exp block kernels (`lloom::models::qwen4exp`): the decode and
+/// prefill pieces written as one launch each. Self-contained like `EOS_INDEX`.
+pub const QWEN4EXP: &str = include_str!("metal_src/qwen4exp.metal");
 pub const FLASH_DECODING: &str = include_str!("metal_src/attention/flash_decoding.metal");
 pub const INDEXING: &str = with_utils!(
     "#include <metal_stdlib>\nusing namespace metal;",
@@ -212,6 +215,8 @@ pub const MERGED_NON_MLX: &str = concat!(
     "\n",
     include_str!("metal_src/quantized.metal"),
     "\n",
+    include_str!("metal_src/qwen4exp.metal"),
+    "\n",
     include_str!("metal_src/random.metal"),
     "\n",
     include_str!("metal_src/reduce.metal"),
@@ -249,6 +254,7 @@ pub const MERGED_MEMBERS: &[Source] = &[
     Source::Gemv,
     Source::Indexing,
     Source::Quantized,
+    Source::Qwen4Exp,
     Source::Random,
     Source::Reduce,
     Source::Rope,
@@ -283,6 +289,8 @@ pub enum Source {
     Indexing,
     MlxSort,
     Quantized,
+    /// The Qwen4-exp block kernels (`lloom::models::qwen4exp::kernels`).
+    Qwen4Exp,
     Random,
     Reduce,
     /// RoPE: the three rotary-position-embedding entry points (rope, rope_i,

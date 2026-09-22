@@ -15,6 +15,7 @@ mod macros;
 pub mod mlx_gemm;
 pub mod params;
 pub mod quantized;
+pub mod qwen4exp;
 pub mod random;
 pub mod reduce;
 pub mod reduce_names;
@@ -49,6 +50,7 @@ pub use mlx_gemm::{
     call_mlx_gemm, call_mlx_gemv, call_mlx_gemv_epilogue, call_mlx_gemv_full, call_mlx_gemv_with,
     GemmDType, GemvEpilogue, GemvRmsNorm, SKINNY_TILE_MAX_M,
 };
+pub use qwen4exp::call_unit_lower_inverse;
 pub use scratch::{
     call_scratch_combine, call_scratch_partials, call_scratch_report, ScratchKernel, ScratchParams,
 };

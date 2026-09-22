@@ -1236,9 +1236,15 @@ fn a_replayed_long_command_with_the_previous_step_in_flight() {
                 .new_buffer_with_data(h.as_ptr() as *const std::ffi::c_void, h.len() * 2, shared)
                 .unwrap()
         };
-        let up: Vec<f32> = (0..n_out * k).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect();
-        let gate: Vec<f32> = (0..n_out * k).map(|i| ((i % 19) as f32 - 9.0) / 32.0).collect();
-        let w2: Vec<f32> = (0..n_out * k).map(|i| ((i % 23) as f32 - 11.0) / 256.0).collect();
+        let up: Vec<f32> = (0..n_out * k)
+            .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+            .collect();
+        let gate: Vec<f32> = (0..n_out * k)
+            .map(|i| ((i % 19) as f32 - 9.0) / 32.0)
+            .collect();
+        let w2: Vec<f32> = (0..n_out * k)
+            .map(|i| ((i % 23) as f32 - 11.0) / 256.0)
+            .collect();
         let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
         let res: Vec<f32> = (0..k).map(|i| ((i % 5) as f32 - 2.0) / 8.0).collect();
         let (up_buf, gate_buf, w2_buf) = (mk(&up), mk(&gate), mk(&w2));
@@ -1246,8 +1252,16 @@ fn a_replayed_long_command_with_the_previous_step_in_flight() {
         unsafe {
             let v: Vec<f16> = vec.iter().map(|x| f16::from_f32(*x)).collect();
             let r: Vec<f16> = res.iter().map(|x| f16::from_f32(*x)).collect();
-            std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, (staging.contents() as *mut u8).add(512000), k * 2);
-            std::ptr::copy_nonoverlapping(r.as_ptr() as *const u8, (staging.contents() as *mut u8).add(772096), k * 2);
+            std::ptr::copy_nonoverlapping(
+                v.as_ptr() as *const u8,
+                (staging.contents() as *mut u8).add(512000),
+                k * 2,
+            );
+            std::ptr::copy_nonoverlapping(
+                r.as_ptr() as *const u8,
+                (staging.contents() as *mut u8).add(772096),
+                k * 2,
+            );
         }
         let arena = device.new_buffer(1 << 20, private).unwrap();
         {
@@ -1259,24 +1273,54 @@ fn a_replayed_long_command_with_the_previous_step_in_flight() {
         let h = arena.view(0, 512000);
         let o = arena.view(512000, 256000);
         let residual = arena.view(772096, 4096);
-        let style = if executor.is_some() { ParamStyle::Packed } else { ParamStyle::Split };
+        let style = if executor.is_some() {
+            ParamStyle::Packed
+        } else {
+            ParamStyle::Split
+        };
         for _ in 0..steps {
             for _ in 0..reps {
                 {
                     let guard = cmds.command_encoder().unwrap();
                     call_mlx_gemv_epilogue(
-                        &device, &guard, &kernels, GemmDType::F16, (1, 1, n_out, k),
-                        &[k, k, 1], 0, &x, &[1, k], 0, &up_buf, &h, style, None,
-                        GemvEpilogue::Swiglu, Some((&gate_buf, 0)),
+                        &device,
+                        &guard,
+                        &kernels,
+                        GemmDType::F16,
+                        (1, 1, n_out, k),
+                        &[k, k, 1],
+                        0,
+                        &x,
+                        &[1, k],
+                        0,
+                        &up_buf,
+                        &h,
+                        style,
+                        None,
+                        GemvEpilogue::Swiglu,
+                        Some((&gate_buf, 0)),
                     )
                     .unwrap();
                 }
                 {
                     let guard = cmds.command_encoder().unwrap();
                     call_mlx_gemv_epilogue(
-                        &device, &guard, &kernels, GemmDType::F16, (1, 1, k, n_out),
-                        &[n_out, n_out, 1], 0, &h, &[1, n_out], 0, &w2_buf, &o, style, None,
-                        GemvEpilogue::Residual, Some((&residual, 0)),
+                        &device,
+                        &guard,
+                        &kernels,
+                        GemmDType::F16,
+                        (1, 1, k, n_out),
+                        &[n_out, n_out, 1],
+                        0,
+                        &h,
+                        &[1, n_out],
+                        0,
+                        &w2_buf,
+                        &o,
+                        style,
+                        None,
+                        GemvEpilogue::Residual,
+                        Some((&residual, 0)),
                     )
                     .unwrap();
                 }
@@ -1295,10 +1339,15 @@ fn a_replayed_long_command_with_the_previous_step_in_flight() {
             blit.copy_from_buffer(&arena, 0, &staging, 0, 1 << 20);
         }
         cmds.flush_and_wait().unwrap();
-        unsafe { std::slice::from_raw_parts((staging.contents() as *const u8).add(512000) as *const f16, k) }
-            .iter()
-            .map(|v| v.to_f32())
-            .collect()
+        unsafe {
+            std::slice::from_raw_parts(
+                (staging.contents() as *const u8).add(512000) as *const f16,
+                k,
+            )
+        }
+        .iter()
+        .map(|v| v.to_f32())
+        .collect()
     };
     set_hazard_key(HazardKey::Range);
     set_default_param_style(ParamStyle::Packed);
@@ -1310,9 +1359,25 @@ fn a_replayed_long_command_with_the_previous_step_in_flight() {
     let classical = run(None);
     set_hazard_key(HazardKey::Pointer);
     let cov = executor.coverage();
-    eprintln!("[F] wait_each_step={wait_each_step} covered={} quarantined={} stale={}", cov.covered, cov.quarantined, executor.stale_positions());
+    eprintln!(
+        "[F] wait_each_step={wait_each_step} covered={} quarantined={} stale={}",
+        cov.covered,
+        cov.quarantined,
+        executor.stale_positions()
+    );
     assert!(executor.is_replaying(), "never replayed");
-    let differing = replayed.iter().zip(&classical).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-    eprintln!("[F] o differs on {differing}/{k}; replayed[..3]={:?} classical[..3]={:?}", &replayed[..3], &classical[..3]);
-    assert_eq!(differing, 0, "the residual stream after 8 in-flight steps differs from classical");
+    let differing = replayed
+        .iter()
+        .zip(&classical)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    eprintln!(
+        "[F] o differs on {differing}/{k}; replayed[..3]={:?} classical[..3]={:?}",
+        &replayed[..3],
+        &classical[..3]
+    );
+    assert_eq!(
+        differing, 0,
+        "the residual stream after 8 in-flight steps differs from classical"
+    );
 }

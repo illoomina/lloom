@@ -518,394 +518,396 @@ fn compare(
 mod proptests {
     use super::*;
 
-// ---------------------------------------------------------------------------
-// The generator, and the properties.
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // The generator, and the properties.
+    // ---------------------------------------------------------------------------
 
-use proptest::prelude::*;
+    use proptest::prelude::*;
 
-/// Sizes drawn from a small set rather than uniformly over `usize`.
-///
-/// Uniform sizes would essentially never collide, so the free list would hold
-/// one buffer per bucket and `acquire`'s exact-match path -- the decode steady
-/// state, and the path the eviction ordering depends on -- would almost never
-/// fire. A handful of repeated sizes plus a growing one is the shape a real
-/// workload has (§6.3b: a KV cache asks for a slightly larger size each step).
-fn size_strategy() -> impl Strategy<Value = usize> {
-    prop_oneof![
-        // Repeated sizes: exercise exact-bucket hits and multi-buffer buckets.
-        8 => prop::sample::select(vec![512usize, 1024, 2048, 4096, 8192]),
-        // Nearby sizes: exercise the range probe and the smallest-fit rule.
-        3 => 1usize..16384,
-        // Large: exercise the free budget and eviction.
-        1 => 64usize * 1024..1024 * 1024,
-    ]
-}
-
-fn op_strategy() -> impl Strategy<Value = Op> {
-    prop_oneof![
-        6 => size_strategy().prop_map(|size| Op::Alloc { size }),
-        5 => any::<u16>().prop_map(|index| Op::DropLive { index: index as usize }),
-        3 => Just(Op::CommitEpoch),
-        3 => any::<u8>().prop_map(|back| Op::MarkCompleted { back: back as usize }),
-        3 => Just(Op::Drain),
-        1 => Just(Op::Trim),
-        1 => prop_oneof![
-            Just(0usize),
-            Just(4096usize),
-            Just(64 * 1024usize),
-            Just(1024 * 1024usize),
+    /// Sizes drawn from a small set rather than uniformly over `usize`.
+    ///
+    /// Uniform sizes would essentially never collide, so the free list would hold
+    /// one buffer per bucket and `acquire`'s exact-match path -- the decode steady
+    /// state, and the path the eviction ordering depends on -- would almost never
+    /// fire. A handful of repeated sizes plus a growing one is the shape a real
+    /// workload has (§6.3b: a KV cache asks for a slightly larger size each step).
+    fn size_strategy() -> impl Strategy<Value = usize> {
+        prop_oneof![
+            // Repeated sizes: exercise exact-bucket hits and multi-buffer buckets.
+            8 => prop::sample::select(vec![512usize, 1024, 2048, 4096, 8192]),
+            // Nearby sizes: exercise the range probe and the smallest-fit rule.
+            3 => 1usize..16384,
+            // Large: exercise the free budget and eviction.
+            1 => 64usize * 1024..1024 * 1024,
         ]
-        .prop_map(|bytes| Op::SetFreeBudget { bytes }),
-        1 => (0usize..4 * 1024 * 1024, 0usize..1024 * 1024)
-            .prop_map(|(limit, planned)| Op::SetResidualCap { limit, planned }),
-        1 => Just(Op::ClearResidualCap),
-        1 => size_strategy().prop_map(|size| Op::CheckResidual { size }),
-        1 => Just(Op::ResetCounters),
-    ]
-}
-
-/// ONE device per process, not one per case. `Device::system_default()` per
-/// proptest case logged "Context leak detected, CoreAnalytics returned false"
-/// once per case (lloom #706). Recorded beside it, because it is NOT fixed by
-/// this: in a DEBUG build the commands proptest at 4096 cases fails on the
-/// ~476th case with `flush_and_wait` returning `Internal Error (00000206)`,
-/// with or without this cache, while the same 4096 cases pass in `--release`
-/// and the release LibAFL harness runs 1 200 sequences in one process clean
-/// (`issue-706-raw/commands-proptest-4096*.log`). The 48-case default never
-/// reaches it; the debug-only exhaustion is open.
-fn device() -> Device {
-    static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
-    DEVICE
-        .get_or_init(|| Device::system_default().expect("no Metal device"))
-        .clone()
-}
-
-proptest! {
-    // 256 cases of up to 120 operations. Sized to land inside #494's "a minute
-    // per target" on this machine rather than to be as large as possible: the
-    // argument for proptest over a coverage-guided fuzzer is that SHRINKING
-    // matters more than throughput here, and a case count that makes the suite
-    // slow enough to skip is worth less than one that runs every time.
-    #![proptest_config(ProptestConfig {
-        cases: 256,
-        max_shrink_iters: 4096,
-        ..ProptestConfig::default()
-    })]
-
-    /// The pool's counters and occupancy agree with a model of its contract,
-    /// after every operation of an arbitrary sequence.
-    #[test]
-    fn pool_matches_its_model(ops in prop::collection::vec(op_strategy(), 1..120)) {
-        let dev = device();
-        if let Err(e) = run_sequence(&dev, &ops) {
-            return Err(TestCaseError::fail(e));
-        }
     }
-}
 
-/// The generator reaches the states the property is about.
-///
-/// Without this the suite above is #454's `to_cpu_fast=0` sweep and #69's
-/// vacuous determinism run: a green result that measured nothing. Asserted on
-/// the *counters*, so it fails if a future change to the strategy stops
-/// producing reuse, eviction, draining or trimming -- rather than on a coverage
-/// figure nobody reads.
-#[test]
-fn the_generator_actually_reaches_the_interesting_states() {
-    use proptest::strategy::{Strategy, ValueTree};
-    use proptest::test_runner::{Config, TestRunner};
+    fn op_strategy() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            6 => size_strategy().prop_map(|size| Op::Alloc { size }),
+            5 => any::<u16>().prop_map(|index| Op::DropLive { index: index as usize }),
+            3 => Just(Op::CommitEpoch),
+            3 => any::<u8>().prop_map(|back| Op::MarkCompleted { back: back as usize }),
+            3 => Just(Op::Drain),
+            1 => Just(Op::Trim),
+            1 => prop_oneof![
+                Just(0usize),
+                Just(4096usize),
+                Just(64 * 1024usize),
+                Just(1024 * 1024usize),
+            ]
+            .prop_map(|bytes| Op::SetFreeBudget { bytes }),
+            1 => (0usize..4 * 1024 * 1024, 0usize..1024 * 1024)
+                .prop_map(|(limit, planned)| Op::SetResidualCap { limit, planned }),
+            1 => Just(Op::ClearResidualCap),
+            1 => size_strategy().prop_map(|size| Op::CheckResidual { size }),
+            1 => Just(Op::ResetCounters),
+        ]
+    }
 
-    let dev = device();
-    let mut runner = TestRunner::new(Config {
-        cases: 256,
-        ..Config::default()
-    });
-    let strategy = prop::collection::vec(op_strategy(), 40..120);
+    /// ONE device per process, not one per case. `Device::system_default()` per
+    /// proptest case logged "Context leak detected, CoreAnalytics returned false"
+    /// once per case (lloom #706). Recorded beside it, because it is NOT fixed by
+    /// this: in a DEBUG build the commands proptest at 4096 cases fails on the
+    /// ~476th case with `flush_and_wait` returning `Internal Error (00000206)`,
+    /// with or without this cache, while the same 4096 cases pass in `--release`
+    /// and the release LibAFL harness runs 1 200 sequences in one process clean
+    /// (`issue-706-raw/commands-proptest-4096*.log`). The 48-case default never
+    /// reaches it; the debug-only exhaustion is open.
+    fn device() -> Device {
+        static DEVICE: std::sync::OnceLock<Device> = std::sync::OnceLock::new();
+        DEVICE
+            .get_or_init(|| Device::system_default().expect("no Metal device"))
+            .clone()
+    }
 
-    let (mut hits, mut evicted, mut drained, mut trims, mut refusals) =
-        (0u64, 0u64, 0u64, 0u64, 0u64);
-    for _ in 0..256 {
-        let ops = strategy
-            .new_tree(&mut runner)
-            .expect("strategy produces a value")
-            .current();
-        // Re-run the sequence against a fresh pool, counting what it reached.
-        let clock = Arc::new(GpuClock::new());
-        let pool = BufferPool::with_clock(Arc::clone(&clock));
-        let mut live: Vec<Arc<PooledBuffer>> = Vec::new();
-        let mut submitted = 0u64;
-        for op in &ops {
-            match op {
-                Op::Alloc { size } => {
-                    let size = (*size).max(1);
-                    let b = pool.acquire(size).unwrap_or_else(|| {
-                        let raw = dev
-                            .new_buffer(size, crate::kernels::RESOURCE_OPTIONS)
-                            .expect("allocation");
-                        pool.adopt(raw, size)
-                    });
-                    live.push(b);
-                }
-                Op::DropLive { index } => {
-                    if !live.is_empty() {
-                        let i = index % live.len();
-                        drop(live.remove(i));
-                    }
-                }
-                Op::CommitEpoch => {
-                    clock.commit_epoch();
-                    submitted += 1;
-                }
-                Op::MarkCompleted { back } => {
-                    if submitted > 0 {
-                        let newest = submitted - 1;
-                        clock.mark_completed(newest - (*back as u64 % (newest + 1)));
-                    }
-                }
-                Op::Drain => pool.drain_completed(),
-                Op::Trim => drop(pool.trim()),
-                Op::SetFreeBudget { bytes } => pool.set_free_budget(*bytes),
-                Op::SetResidualCap { limit, planned } => pool.set_residual_cap(*limit, *planned),
-                Op::ClearResidualCap => pool.clear_residual_cap(),
-                Op::CheckResidual { size } => {
-                    if pool.check_residual(*size).is_err() {
-                        refusals += 1;
-                    }
-                }
-                Op::ResetCounters => {}
+    proptest! {
+        // 256 cases of up to 120 operations. Sized to land inside #494's "a minute
+        // per target" on this machine rather than to be as large as possible: the
+        // argument for proptest over a coverage-guided fuzzer is that SHRINKING
+        // matters more than throughput here, and a case count that makes the suite
+        // slow enough to skip is worth less than one that runs every time.
+        #![proptest_config(ProptestConfig {
+            cases: 256,
+            max_shrink_iters: 4096,
+            ..ProptestConfig::default()
+        })]
+
+        /// The pool's counters and occupancy agree with a model of its contract,
+        /// after every operation of an arbitrary sequence.
+        #[test]
+        fn pool_matches_its_model(ops in prop::collection::vec(op_strategy(), 1..120)) {
+            let dev = device();
+            if let Err(e) = run_sequence(&dev, &ops) {
+                return Err(TestCaseError::fail(e));
             }
         }
-        let c = pool.counters();
-        hits += c.hits;
-        evicted += c.evicted;
-        drained += c.drained;
-        trims += c.trims;
     }
 
-    println!(
-        "FUZZ494 engagement hits={hits} evicted={evicted} drained={drained} \
+    /// The generator reaches the states the property is about.
+    ///
+    /// Without this the suite above is #454's `to_cpu_fast=0` sweep and #69's
+    /// vacuous determinism run: a green result that measured nothing. Asserted on
+    /// the *counters*, so it fails if a future change to the strategy stops
+    /// producing reuse, eviction, draining or trimming -- rather than on a coverage
+    /// figure nobody reads.
+    #[test]
+    fn the_generator_actually_reaches_the_interesting_states() {
+        use proptest::strategy::{Strategy, ValueTree};
+        use proptest::test_runner::{Config, TestRunner};
+
+        let dev = device();
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            ..Config::default()
+        });
+        let strategy = prop::collection::vec(op_strategy(), 40..120);
+
+        let (mut hits, mut evicted, mut drained, mut trims, mut refusals) =
+            (0u64, 0u64, 0u64, 0u64, 0u64);
+        for _ in 0..256 {
+            let ops = strategy
+                .new_tree(&mut runner)
+                .expect("strategy produces a value")
+                .current();
+            // Re-run the sequence against a fresh pool, counting what it reached.
+            let clock = Arc::new(GpuClock::new());
+            let pool = BufferPool::with_clock(Arc::clone(&clock));
+            let mut live: Vec<Arc<PooledBuffer>> = Vec::new();
+            let mut submitted = 0u64;
+            for op in &ops {
+                match op {
+                    Op::Alloc { size } => {
+                        let size = (*size).max(1);
+                        let b = pool.acquire(size).unwrap_or_else(|| {
+                            let raw = dev
+                                .new_buffer(size, crate::kernels::RESOURCE_OPTIONS)
+                                .expect("allocation");
+                            pool.adopt(raw, size)
+                        });
+                        live.push(b);
+                    }
+                    Op::DropLive { index } => {
+                        if !live.is_empty() {
+                            let i = index % live.len();
+                            drop(live.remove(i));
+                        }
+                    }
+                    Op::CommitEpoch => {
+                        clock.commit_epoch();
+                        submitted += 1;
+                    }
+                    Op::MarkCompleted { back } => {
+                        if submitted > 0 {
+                            let newest = submitted - 1;
+                            clock.mark_completed(newest - (*back as u64 % (newest + 1)));
+                        }
+                    }
+                    Op::Drain => pool.drain_completed(),
+                    Op::Trim => drop(pool.trim()),
+                    Op::SetFreeBudget { bytes } => pool.set_free_budget(*bytes),
+                    Op::SetResidualCap { limit, planned } => {
+                        pool.set_residual_cap(*limit, *planned)
+                    }
+                    Op::ClearResidualCap => pool.clear_residual_cap(),
+                    Op::CheckResidual { size } => {
+                        if pool.check_residual(*size).is_err() {
+                            refusals += 1;
+                        }
+                    }
+                    Op::ResetCounters => {}
+                }
+            }
+            let c = pool.counters();
+            hits += c.hits;
+            evicted += c.evicted;
+            drained += c.drained;
+            trims += c.trims;
+        }
+
+        println!(
+            "FUZZ494 engagement hits={hits} evicted={evicted} drained={drained} \
          trims={trims} residual_refusals={refusals}"
-    );
-    assert!(hits > 0, "the generator never produced a pool hit");
-    assert!(drained > 0, "the generator never drained a completed epoch");
-    assert!(
-        evicted > 0,
-        "the generator never evicted: the budget never bound"
-    );
-    assert!(trims > 0, "the generator never trimmed");
-    assert!(
-        refusals > 0,
-        "the residual cap never refused: check_residual was exercised only on its Ok arm, \
+        );
+        assert!(hits > 0, "the generator never produced a pool hit");
+        assert!(drained > 0, "the generator never drained a completed epoch");
+        assert!(
+            evicted > 0,
+            "the generator never evicted: the budget never bound"
+        );
+        assert!(trims > 0, "the generator never trimmed");
+        assert!(
+            refusals > 0,
+            "the residual cap never refused: check_residual was exercised only on its Ok arm, \
          which is CONTRIBUTING.md §1.1's both-bounds rule (a check that refuses nothing is \
          not a check)"
-    );
-}
+        );
+    }
 
-/// **`PoolCounters` holds accumulators only**, checked in source (#507).
-///
-/// This replaces `the_known_pending_defect_is_still_present`, which existed to
-/// stop the model's accommodation for #494 outliving the bug. The repair landed,
-/// the accommodation is gone, and what is worth keeping is the *class* being
-/// closed rather than the instance: `reset_counters` zeroes the whole struct, so
-/// **any** gauge added to it is silently zeroed while the state it describes is
-/// unchanged. That is what made #494's finding possible, and it is a property of
-/// the struct rather than of the field that happened to carry it.
-///
-/// **It has to read the source, because the defect is a WRITE SHAPE.** A runtime
-/// test can only catch a gauge that some sequence disturbs -- which is the test
-/// in `buffer_pool::tests` and is the right check for the field that existed.
-/// The generalisation is *"nothing here is assigned"*, and an assignment among
-/// the `+=` is visible in the text and invisible to any pool state. Same
-/// reasoning, and the same mechanism, as `Buffer`'s
-/// `load_bearing_contents_sites_keep_their_black_box`.
-///
-/// Mutation-tested: adding `state.counters.<field> = ...` to `buffer_pool.rs`
-/// makes this fail.
-#[test]
-fn pool_counters_holds_accumulators_only() {
-    let src = include_str!("buffer_pool.rs");
+    /// **`PoolCounters` holds accumulators only**, checked in source (#507).
+    ///
+    /// This replaces `the_known_pending_defect_is_still_present`, which existed to
+    /// stop the model's accommodation for #494 outliving the bug. The repair landed,
+    /// the accommodation is gone, and what is worth keeping is the *class* being
+    /// closed rather than the instance: `reset_counters` zeroes the whole struct, so
+    /// **any** gauge added to it is silently zeroed while the state it describes is
+    /// unchanged. That is what made #494's finding possible, and it is a property of
+    /// the struct rather than of the field that happened to carry it.
+    ///
+    /// **It has to read the source, because the defect is a WRITE SHAPE.** A runtime
+    /// test can only catch a gauge that some sequence disturbs -- which is the test
+    /// in `buffer_pool::tests` and is the right check for the field that existed.
+    /// The generalisation is *"nothing here is assigned"*, and an assignment among
+    /// the `+=` is visible in the text and invisible to any pool state. Same
+    /// reasoning, and the same mechanism, as `Buffer`'s
+    /// `load_bearing_contents_sites_keep_their_black_box`.
+    ///
+    /// Mutation-tested: adding `state.counters.<field> = ...` to `buffer_pool.rs`
+    /// makes this fail.
+    #[test]
+    fn pool_counters_holds_accumulators_only() {
+        let src = include_str!("buffer_pool.rs");
 
-    // Only the production half. This module's own doc comments quote the
-    // defective `counters.pending =` line, and a check that reads its own
-    // description reports on the wrong text -- §15.1a's vacuous class, in the
-    // guard written to prevent a regression.
-    let production = src
-        .split("#[cfg(test)]")
-        .next()
-        .expect("split always yields one element");
+        // Only the production half. This module's own doc comments quote the
+        // defective `counters.pending =` line, and a check that reads its own
+        // description reports on the wrong text -- §15.1a's vacuous class, in the
+        // guard written to prevent a regression.
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields one element");
 
-    let writes: Vec<&str> = production
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
-        .filter(|l| l.contains("counters."))
-        .filter(|l| l.contains('=') && !l.contains("+=") && !l.contains("=="))
-        .collect();
+        let writes: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+            .filter(|l| l.contains("counters."))
+            .filter(|l| l.contains('=') && !l.contains("+=") && !l.contains("=="))
+            .collect();
 
-    assert!(
-        production.contains("counters.releases += 1"),
-        "no counter increment found in buffer_pool.rs -- was the struct renamed? \
+        assert!(
+            production.contains("counters.releases += 1"),
+            "no counter increment found in buffer_pool.rs -- was the struct renamed? \
          A guard that finds nothing to check passes for the wrong reason."
-    );
+        );
 
-    assert!(
-        writes.is_empty(),
-        "a field of `PoolCounters` is ASSIGNED rather than incremented:\n    {}\n\
+        assert!(
+            writes.is_empty(),
+            "a field of `PoolCounters` is ASSIGNED rather than incremented:\n    {}\n\
          That makes it a GAUGE -- a figure describing the pool's state now -- and \
          `reset_counters` zeroes the whole struct, so it will be zeroed while the \
          state it describes is unchanged. That is lloom #494's defect, repaired in \
          #507 by moving `pending` into `PoolOccupancySnapshot`. Live figures belong \
          in `occupancy()`, derived from the state they describe; `PoolCounters` is \
          events since the last reset. DESIGN.md §6.7 L2.",
-        writes.join("\n    ")
-    );
-}
+            writes.join("\n    ")
+        );
+    }
 
-/// The hole the check above cannot see: a field borrowed mutably OUT of the
-/// struct, and written through the borrow.
-///
-/// `pool_counters_holds_accumulators_only` reads for `counters.<field> =` with
-/// no `+=`. **A `let x = &mut state.counters.<field>;` followed by a write
-/// through `x` defeats it**, because the write names `x` and never names
-/// `counters` -- so the gauge class it exists to close stays reachable through
-/// one extra line.
-///
-/// Found while adding §9.2u's bands (#47): the natural spelling for a per-band
-/// update *is* that borrow, and it made the first guard fail on code that was a
-/// pure accumulator. **The guard was right that the shape is dangerous and
-/// wrong about that instance** -- the two-sided form of `CONTRIBUTING.md`
-/// §3.1c's *"a pattern written to find a thing is a thing the pattern finds"*.
-/// The repair is not to loosen the needle but to name the escape route it
-/// cannot follow.
-///
-/// The rule is narrow on purpose: a mutable borrow of a `counters` field must
-/// not leave `impl PoolCounters`. Inside it the borrow is local to a method
-/// whose whole body a reader is already checking; outside it the write happens
-/// where the first guard has no line to read.
-#[test]
-fn no_counter_field_is_mutably_borrowed_out_of_the_struct() {
-    let src = include_str!("buffer_pool.rs");
+    /// The hole the check above cannot see: a field borrowed mutably OUT of the
+    /// struct, and written through the borrow.
+    ///
+    /// `pool_counters_holds_accumulators_only` reads for `counters.<field> =` with
+    /// no `+=`. **A `let x = &mut state.counters.<field>;` followed by a write
+    /// through `x` defeats it**, because the write names `x` and never names
+    /// `counters` -- so the gauge class it exists to close stays reachable through
+    /// one extra line.
+    ///
+    /// Found while adding §9.2u's bands (#47): the natural spelling for a per-band
+    /// update *is* that borrow, and it made the first guard fail on code that was a
+    /// pure accumulator. **The guard was right that the shape is dangerous and
+    /// wrong about that instance** -- the two-sided form of `CONTRIBUTING.md`
+    /// §3.1c's *"a pattern written to find a thing is a thing the pattern finds"*.
+    /// The repair is not to loosen the needle but to name the escape route it
+    /// cannot follow.
+    ///
+    /// The rule is narrow on purpose: a mutable borrow of a `counters` field must
+    /// not leave `impl PoolCounters`. Inside it the borrow is local to a method
+    /// whose whole body a reader is already checking; outside it the write happens
+    /// where the first guard has no line to read.
+    #[test]
+    fn no_counter_field_is_mutably_borrowed_out_of_the_struct() {
+        let src = include_str!("buffer_pool.rs");
 
-    let production = src
-        .split("#[cfg(test)]")
-        .next()
-        .expect("split always yields one element");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields one element");
 
-    let borrows: Vec<&str> = production
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
-        .filter(|l| l.contains("&mut") && l.contains("counters."))
-        .collect();
+        let borrows: Vec<&str> = production
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+            .filter(|l| l.contains("&mut") && l.contains("counters."))
+            .collect();
 
-    // Non-vacuity: the in-struct borrow must still be findable, or an empty
-    // result means the spelling moved rather than that the property holds
-    // (§3.1c -- a zero is not evidence without a nonzero from the same run).
-    assert!(
-        production.contains("&mut self.bands["),
-        "no in-struct mutable borrow found -- `record_band` was renamed or \
+        // Non-vacuity: the in-struct borrow must still be findable, or an empty
+        // result means the spelling moved rather than that the property holds
+        // (§3.1c -- a zero is not evidence without a nonzero from the same run).
+        assert!(
+            production.contains("&mut self.bands["),
+            "no in-struct mutable borrow found -- `record_band` was renamed or \
          removed, so this guard is matching against code that no longer exists \
          and its empty result means nothing."
-    );
+        );
 
-    assert!(
-        borrows.is_empty(),
-        "a `PoolCounters` field is mutably borrowed outside `impl PoolCounters`:\n    {}\n\
+        assert!(
+            borrows.is_empty(),
+            "a `PoolCounters` field is mutably borrowed outside `impl PoolCounters`:\n    {}\n\
          A write through that borrow never spells `counters.<field> =`, so \
          `pool_counters_holds_accumulators_only` cannot see it and the gauge class \
          it closes is reachable again. Put the update in a method on \
          `PoolCounters` -- `record_band` is the pattern -- so the borrow stays \
          where a reader checking the accumulator property is already looking.",
-        borrows.join("\n    ")
-    );
-}
+            borrows.join("\n    ")
+        );
+    }
 
-// ---------------------------------------------------------------------------
-// Target 4: `GpuClock` epoch ordering, in isolation.
-// ---------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------
+    // Target 4: `GpuClock` epoch ordering, in isolation.
+    // ---------------------------------------------------------------------------
 
-/// One symbol of the clock's alphabet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClockOp {
-    Commit,
-    /// `mark_completed(epoch)`, where `epoch` is chosen freely -- including
-    /// epochs that were never committed and epochs long past. Metal delivers
-    /// completion handlers on driver threads and makes no ordering promise
-    /// between them, so an arbitrary arrival order is the real contract.
-    MarkCompleted(u64),
-}
+    /// One symbol of the clock's alphabet.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ClockOp {
+        Commit,
+        /// `mark_completed(epoch)`, where `epoch` is chosen freely -- including
+        /// epochs that were never committed and epochs long past. Metal delivers
+        /// completion handlers on driver threads and makes no ordering promise
+        /// between them, so an arbitrary arrival order is the real contract.
+        MarkCompleted(u64),
+    }
 
-proptest! {
-    #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
 
-    /// The clock's two invariants, over arbitrary interleavings:
-    ///
-    /// 1. **`completed_count` never decreases.** It is a `fetch_max` precisely
-    ///    because a late handler for an older command buffer may arrive after a
-    ///    newer one. A store would move it backwards and free every buffer
-    ///    parked in between -- issue #19's corruption, by a different route.
-    /// 2. **Zero means "nothing has completed", not "epoch 0 has".** The
-    ///    `epoch + 1` encoding exists to keep those distinguishable, and an
-    ///    off-by-one here is `release_is_deferred_even_when_the_gpu_is_idle`'s
-    ///    unreachable branch becoming reachable.
-    #[test]
-    fn clock_is_monotone_and_zero_means_nothing_completed(
-        ops in prop::collection::vec(
-            prop_oneof![
-                2 => Just(ClockOp::Commit),
-                3 => (0u64..8).prop_map(ClockOp::MarkCompleted),
-            ],
-            1..64,
-        )
-    ) {
-        let clock = GpuClock::new();
-        prop_assert_eq!(clock.current_epoch(), 0);
-        prop_assert_eq!(clock.completed_count(), 0);
+        /// The clock's two invariants, over arbitrary interleavings:
+        ///
+        /// 1. **`completed_count` never decreases.** It is a `fetch_max` precisely
+        ///    because a late handler for an older command buffer may arrive after a
+        ///    newer one. A store would move it backwards and free every buffer
+        ///    parked in between -- issue #19's corruption, by a different route.
+        /// 2. **Zero means "nothing has completed", not "epoch 0 has".** The
+        ///    `epoch + 1` encoding exists to keep those distinguishable, and an
+        ///    off-by-one here is `release_is_deferred_even_when_the_gpu_is_idle`'s
+        ///    unreachable branch becoming reachable.
+        #[test]
+        fn clock_is_monotone_and_zero_means_nothing_completed(
+            ops in prop::collection::vec(
+                prop_oneof![
+                    2 => Just(ClockOp::Commit),
+                    3 => (0u64..8).prop_map(ClockOp::MarkCompleted),
+                ],
+                1..64,
+            )
+        ) {
+            let clock = GpuClock::new();
+            prop_assert_eq!(clock.current_epoch(), 0);
+            prop_assert_eq!(clock.completed_count(), 0);
 
-        let mut last_completed = 0u64;
-        let mut submitted = 0u64;
-        let mut highest_marked: Option<u64> = None;
+            let mut last_completed = 0u64;
+            let mut submitted = 0u64;
+            let mut highest_marked: Option<u64> = None;
 
-        for op in &ops {
-            match op {
-                ClockOp::Commit => {
-                    let closed = clock.commit_epoch();
-                    prop_assert_eq!(
-                        closed, submitted,
-                        "commit_epoch returned the wrong closed epoch"
-                    );
-                    submitted += 1;
-                    prop_assert_eq!(clock.current_epoch(), submitted);
+            for op in &ops {
+                match op {
+                    ClockOp::Commit => {
+                        let closed = clock.commit_epoch();
+                        prop_assert_eq!(
+                            closed, submitted,
+                            "commit_epoch returned the wrong closed epoch"
+                        );
+                        submitted += 1;
+                        prop_assert_eq!(clock.current_epoch(), submitted);
+                    }
+                    ClockOp::MarkCompleted(e) => {
+                        clock.mark_completed(*e);
+                        highest_marked = Some(highest_marked.map_or(*e, |h: u64| h.max(*e)));
+                    }
                 }
-                ClockOp::MarkCompleted(e) => {
-                    clock.mark_completed(*e);
-                    highest_marked = Some(highest_marked.map_or(*e, |h: u64| h.max(*e)));
+                let now = clock.completed_count();
+                prop_assert!(
+                    now >= last_completed,
+                    "completed_count went BACKWARDS ({last_completed} -> {now}): a late \
+                     handler moved the clock back, which frees every buffer parked in \
+                     between -- issue #19 by another route"
+                );
+                last_completed = now;
+                // The encoding: `completed_count` is `highest marked + 1`, so zero
+                // is reachable only while nothing has been marked at all.
+                match highest_marked {
+                    None => prop_assert_eq!(
+                        now, 0,
+                        "completed_count is nonzero before anything was marked"
+                    ),
+                    Some(h) => prop_assert_eq!(
+                        now,
+                        h + 1,
+                        "completed_count is not `highest marked + 1`; zero and \
+                         'epoch 0 completed' have become indistinguishable"
+                    ),
                 }
-            }
-            let now = clock.completed_count();
-            prop_assert!(
-                now >= last_completed,
-                "completed_count went BACKWARDS ({last_completed} -> {now}): a late \
-                 handler moved the clock back, which frees every buffer parked in \
-                 between -- issue #19 by another route"
-            );
-            last_completed = now;
-            // The encoding: `completed_count` is `highest marked + 1`, so zero
-            // is reachable only while nothing has been marked at all.
-            match highest_marked {
-                None => prop_assert_eq!(
-                    now, 0,
-                    "completed_count is nonzero before anything was marked"
-                ),
-                Some(h) => prop_assert_eq!(
-                    now,
-                    h + 1,
-                    "completed_count is not `highest marked + 1`; zero and \
-                     'epoch 0 completed' have become indistinguishable"
-                ),
             }
         }
     }
-}
 }

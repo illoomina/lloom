@@ -244,10 +244,10 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
             Ok((Box::new(engine), dir))
         }
         Family::Qwen4Exp(first) => {
-            if shape.batch > 1 {
+            if shape.batch > 1 && model.mtp.is_some() {
                 anyhow::bail!(
-                    "--batch {} on Qwen4-exp: the batched forward is not built for it yet (its MoE \
-                     takes one sequence); serve it at --batch 1",
+                    "--batch {} with --mtp on Qwen4-exp: the batched loop is the K = 1 driver; \
+                     the MTP head speculates at --batch 1",
                     shape.batch
                 );
             }
@@ -275,6 +275,7 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 moe_act: model.moe_act.clone(),
                 mtp: model.mtp.clone(),
                 hotlist: model.hotlist.clone(),
+                batch: shape.batch,
             })?;
             Ok((engine, first))
         }

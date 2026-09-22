@@ -18,9 +18,13 @@ use super::common::{
     PrefillTiming, Text, NEVER_EOS,
 };
 use super::served::Served;
-use crate::{DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool};
+use crate::{
+    spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRequest, DecodeParams,
+    DecodeSession, Decoded, Idle, ReadbackArm, RingPool, SlotPool, Stop, TextStream,
+};
 use anyhow::{Context, Result};
 use hf_chat_template::ChatTemplate;
+use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::loader::{
     LoadOptions as ModelLoad, SlotBudget, StreamLoader, StreamOptions,
 };
@@ -29,9 +33,12 @@ use lloom::models::qwen4exp::{Cache, ExpertResidency, MtpDrafter, Qwen4Exp, Resi
 use lloom::nn::expert_stream::HasStreamStats;
 use lloom::nn::model::CausalLM;
 use lloom::nn::Sequence;
+use lloom::nn::{DecodeOptions, Session};
 use lloom_tensor::{DType, Device, Tensor, D};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -59,6 +66,14 @@ pub struct LoadOptions {
     /// The expert hotlist file (streamed experts): warm at load, write at
     /// shutdown.
     pub hotlist: Option<PathBuf>,
+    /// Rows the batch scheduler serves at once (`--batch N`); 1 is the
+    /// single-sequence engine.
+    pub batch: usize,
+}
+
+/// The model, shared with the batch thread.
+pub struct QwenCore<R: ExpertResidency + HasStreamStats> {
+    pub model: Qwen4Exp<R>,
 }
 
 /// The one sequence every request drives, and the rings kept across
@@ -69,8 +84,10 @@ struct Single {
 }
 
 pub struct Engine<R: ExpertResidency + HasStreamStats> {
-    model: Qwen4Exp<R>,
+    core: Arc<QwenCore<R>>,
     device: Device,
+    /// Rows the scheduler serves at once; 1 = the single sequence.
+    batch: usize,
     text: Text,
     model_name: String,
     kv_capacity: usize,
@@ -86,6 +103,9 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     /// The tier's load-time description (`[loaded …]`, `/health`).
     tier: Value,
     single: Mutex<Single>,
+    /// `--batch N`: the scheduler and its thread.
+    sched: Option<BatchHandle<Qwen4Exp<R>, ()>>,
+    sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// `first` plus its `-0000k-of-0000N` siblings, in shard order.
@@ -272,8 +292,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         tier["ple_cache_rows"] = json!(opts.ple_cache_rows);
         tier["moe_act"] = json!(opts.moe_act);
         tier["first_shard"] = json!(opts.first_shard.display().to_string());
-        let engine = Engine {
-            model,
+        let mut engine = Engine {
+            core: Arc::new(QwenCore { model }),
             device,
             text: Text {
                 tokenizer,
@@ -296,7 +316,45 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
             }),
+            batch: opts.batch.max(1),
+            sched: None,
+            sched_thread: Mutex::new(None),
         };
+        if opts.batch > 1 {
+            // `--batch N`: N private caches in a slot pool and the continuous
+            // K = 1 scheduler over `forward_rows` (no prefix sharing: the
+            // recurrent channels have no page to share).
+            let cfg_model = engine.core.model.config().clone();
+            let mut caches: Vec<Cache> = (0..opts.batch)
+                .map(|_| engine.core.model.new_cache(&cfg_model, &engine.device))
+                .collect::<lloom_tensor::Result<_>>()?;
+            let pool = SlotPool::new(opts.batch, || caches.pop().expect("one cache per slot"));
+            let cfg = BatchConfig {
+                device: engine.device.clone(),
+                pool,
+                rings: RingPool::new(),
+                opts: DecodeOptions {
+                    lookahead: 0,
+                    prefill_tile: opts.prefill_tile,
+                    ..DecodeOptions::new(0)
+                },
+                max_rows: opts.batch,
+                reuse_prefix: opts.reuse_prefix,
+                share_prefix: false,
+                mode: BatchMode::Continuous,
+                extra: (),
+                on_counters: None,
+            };
+            let (handle, thread) =
+                spawn_batch(Arc::clone(&engine.core), |c: &QwenCore<R>| &c.model, cfg)
+                    .map_err(|e| anyhow::anyhow!("starting the batch scheduler: {e}"))?;
+            engine.sched = Some(handle);
+            *lock(&engine.sched_thread) = Some(thread);
+            eprintln!(
+                "[batch: scheduler up, {} rows per step (Qwen4-exp: the weights once over the rows, the state per row)]",
+                opts.batch
+            );
+        }
         if opts.warmup {
             let t = Instant::now();
             let (libs, pipes) = engine.with_single(|s| Ok(s.warmup()?))?;
@@ -320,7 +378,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             .take()
             .context("the sequence is checked out — a previous request panicked mid-decode")?;
         let rings = single.rings.take().unwrap_or_default();
-        let mut session = DecodeSession::from_parts(&self.model, seq, self.device.clone(), rings);
+        let mut session =
+            DecodeSession::from_parts(&self.core.model, seq, self.device.clone(), rings);
         let out = f(&mut session);
         let (seq, rings) = session.into_parts();
         single.seq = Some(seq);
@@ -353,25 +412,26 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
     /// `lm_head`, a one-layer cache of its own. Cheap to build per request.
     fn drafter(&self) -> Result<MtpDrafter<'_, R>> {
         let head = self
+            .core
             .model
             .mtp_head()
             .context("no MTP head loaded (start with --mtp <gguf>)")?;
         Ok(MtpDrafter::new(
             head,
-            self.model.embed_tokens(),
-            self.model.lm_head(),
-            self.model.config(),
+            self.core.model.embed_tokens(),
+            self.core.model.lm_head(),
+            self.core.model.config(),
             &self.device,
         ))
     }
 
     /// The streamed tier's counters (zeros on the resident tier).
     fn tier_stats(&self) -> Value {
-        let s = self.model.stream_stats();
-        let st = self.model.staging_stats();
-        let ple = self.model.ple_cache_stats();
+        let s = self.core.model.stream_stats();
+        let st = self.core.model.staging_stats();
+        let ple = self.core.model.ple_cache_stats();
         json!({
-            "slots_per_layer": self.model.slots_per_layer(),
+            "slots_per_layer": self.core.model.slots_per_layer(),
             "plans": s.plans, "groups": s.groups, "hits": s.hits, "misses": s.misses,
             "evictions": s.evictions, "bytes_loaded": s.bytes_loaded,
             "hit_rate": s.hits as f64 / (s.hits + s.misses).max(1) as f64,
@@ -379,6 +439,248 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
                           "reuses": st.reuses, "overflows": st.overflows },
             "ple_cache": ple.map(|(h, m)| json!({ "hits": h, "misses": m })),
         })
+    }
+}
+
+/// `n` sequences checked out of the pool for a closed job, reset, and the
+/// slots to return them to.
+struct TakenSessions<'m, R: ExpertResidency + HasStreamStats> {
+    sessions: Vec<Session<'m, Qwen4Exp<R>>>,
+    slots: Vec<usize>,
+}
+
+impl<'m, R: ExpertResidency + HasStreamStats> TakenSessions<'m, R> {
+    fn give_back(self, idle: &mut Idle<'_, 'm, Qwen4Exp<R>, ()>) {
+        for (slot, mut s) in self.slots.into_iter().zip(self.sessions) {
+            s.reset();
+            idle.pool.release(slot, s.into_sequence());
+        }
+    }
+}
+
+/// Run `f` over `n` sequences checked out of the pool and reset, and put
+/// them back — reset again — whatever `f` returned.
+fn with_sessions<'m, R: ExpertResidency + HasStreamStats, T>(
+    idle: &mut Idle<'_, 'm, Qwen4Exp<R>, ()>,
+    n: usize,
+    f: impl FnOnce(&mut Idle<'_, 'm, Qwen4Exp<R>, ()>, &mut Vec<Session<'m, Qwen4Exp<R>>>) -> Result<T>,
+) -> Result<T> {
+    let mut sessions = Vec::with_capacity(n);
+    let mut slots = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (routed, seq) = idle
+            .pool
+            .acquire(&[])
+            .context("a closed job found the pool empty")?;
+        let mut s = Session::from_sequence(idle.model, seq);
+        s.reset();
+        sessions.push(s);
+        slots.push(routed.slot);
+    }
+    let mut taken = TakenSessions { sessions, slots };
+    let out = f(idle, &mut taken.sessions);
+    if taken.sessions.len() != taken.slots.len() {
+        return Err(anyhow::anyhow!(
+            "a closed job returned {} of {} sessions; the pool has lost slots",
+            taken.sessions.len(),
+            taken.slots.len()
+        ));
+    }
+    taken.give_back(idle);
+    out
+}
+
+impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
+    /// Run a closed job on the scheduler's thread, the rows idle.
+    fn closed<T: Send + 'static>(
+        &self,
+        job: impl for<'a, 'm> FnOnce(&mut Idle<'a, 'm, Qwen4Exp<R>, ()>) -> T + Send + 'static,
+    ) -> Result<T> {
+        let sched = self
+            .sched
+            .as_ref()
+            .context("no batch scheduler (start lloom serve with --batch N)")?;
+        sched
+            .run_closed_blocking(job)
+            .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// A request through the batch scheduler: submitted, its tokens read off
+    /// the channel and streamed as text, its outcome the row's.
+    fn complete_batched(
+        &self,
+        sched: &BatchHandle<Qwen4Exp<R>, ()>,
+        prompt_ids: &[u32],
+        params: &DecodeParams,
+        mut on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = sched.submit(BatchRequest {
+            prompt_ids: prompt_ids.to_vec(),
+            params: params.clone(),
+            cancel: Arc::clone(&cancel),
+        });
+        let mut detok = self.detok();
+        let mut stream = TextStream::new(params.max_tokens);
+        let mut stopped_on_string = false;
+        let mut cancelled = false;
+        let done = loop {
+            match rx.recv() {
+                Ok(BatchEvent::Tokens(ids)) => {
+                    if cancel.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    if let Some(chunk) = stream.push(&ids, &mut detok)? {
+                        if !on_fragment(&chunk) {
+                            cancelled = true;
+                            cancel.store(true, Ordering::Release);
+                            continue;
+                        }
+                    }
+                    if stream.hit_stop(&params.stop_strings) {
+                        stopped_on_string = true;
+                        cancel.store(true, Ordering::Release);
+                    }
+                }
+                Ok(BatchEvent::Done(d)) => break *d,
+                Ok(BatchEvent::Error(e)) => anyhow::bail!("batch: {e}"),
+                Err(_) => anyhow::bail!("batch: the scheduler dropped the request"),
+            }
+        };
+        let stop = if cancelled || (done.cancelled && !stopped_on_string) {
+            Stop::Cancelled
+        } else if stopped_on_string {
+            Stop::StopString
+        } else if done.eos {
+            Stop::Eos
+        } else {
+            Stop::Length
+        };
+        let (text, _) = stream.finish(&params.stop_strings);
+        Ok(Decoded {
+            text,
+            tokens: done.tokens,
+            stop,
+            reuse: done.reuse,
+            reused: done.reused,
+            prefilled: done.prefilled,
+            readback: ReadbackArm::Batched {
+                rows: done.joined_beside,
+            },
+            stats: done.stats,
+        })
+    }
+
+    /// `batch` prompts of `n` seed tokens through the scheduler's rows, the
+    /// bracket closing when the device drains.
+    fn prefill_throughput_rows(&self, n: usize, batch: usize) -> Result<PrefillTiming> {
+        let prompts: Vec<Vec<u32>> = (0..batch).map(|r| self.seed_prompt_row(n, r)).collect();
+        let tile = self.prefill_tile;
+        let gauge = MemGauge::start(&self.device, self.mem_sample);
+        let (elapsed, forwards) =
+            self.closed(move |idle| -> Result<(std::time::Duration, usize)> {
+                with_sessions(idle, batch, |idle, sessions| {
+                    let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+                    let opts = DecodeOptions {
+                        lookahead: 0,
+                        prefill_tile: tile,
+                        ..DecodeOptions::new(0)
+                    };
+                    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+                    let t = Instant::now();
+                    let outs = Session::decode_batched(
+                        sessions,
+                        &mut sampler,
+                        &refs,
+                        &opts,
+                        &NEVER_EOS,
+                        idle.device,
+                        &mut |_, _| Ok(()),
+                    )?;
+                    idle.device.synchronize()?;
+                    let elapsed = t.elapsed();
+                    Ok((elapsed, outs.iter().map(|o| o.stats.prefill_units).sum()))
+                })
+            })??;
+        Ok(PrefillTiming {
+            prompt_tokens: n,
+            batch,
+            prefill_ms: ms(elapsed),
+            forwards,
+            mem: gauge.finish(&self.device),
+        })
+    }
+
+    /// Every row's context built outside the bracket, then `D` batched
+    /// steps timed together: `decode_ms` is the batch's.
+    fn decode_throughput_rows(
+        &self,
+        prompt_tokens: usize,
+        decode_tokens: usize,
+        batch: usize,
+    ) -> Result<DecodeTiming> {
+        let prompts: Vec<Vec<u32>> = (0..batch)
+            .map(|r| self.seed_prompt_row(prompt_tokens, r))
+            .collect();
+        let tile = self.prefill_tile;
+        let gauge = MemGauge::start(&self.device, self.mem_sample);
+        let mut timing = self.closed(move |idle| -> Result<DecodeTiming> {
+            with_sessions(idle, batch, |idle, sessions| {
+                let refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
+                let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+                // One run of `D` tokens per row (the blocking arm holds no
+                // logits to resume from between runs): the rows' prefills
+                // — each waited on by the driver — subtracted from the wall.
+                let opts = DecodeOptions {
+                    lookahead: 0,
+                    prefill_tile: tile,
+                    ..DecodeOptions::new(decode_tokens)
+                };
+                super::common::profile_reset();
+                let t = Instant::now();
+                let outs = Session::decode_batched(
+                    sessions,
+                    &mut sampler,
+                    &refs,
+                    &opts,
+                    &NEVER_EOS,
+                    idle.device,
+                    &mut |_, _| Ok(()),
+                )?;
+                idle.device.synchronize()?;
+                let wall = ms(t.elapsed());
+                let prof = super::common::profile_take();
+                let prefill_ms: f64 = outs.iter().map(|o| o.stats.prefill_ns as f64 / 1e6).sum();
+                for (i, o) in outs.iter().enumerate() {
+                    if o.ids.len() != decode_tokens {
+                        anyhow::bail!(
+                            "row {i}: the decode run produced {} tokens, expected {decode_tokens}",
+                            o.ids.len()
+                        );
+                    }
+                }
+                let decode_ms = (wall - prefill_ms).max(0.0);
+                Ok(DecodeTiming {
+                    prompt_tokens,
+                    decode_tokens,
+                    batch,
+                    prefill_ms,
+                    decode_ms,
+                    readback: ReadbackArm::Batched { rows: batch },
+                    bracket: "run wall minus the rows' prefills (each waited on): the batched steps alone",
+                    row_tokens: outs.iter().map(|o| o.ids.len()).collect(),
+                    row_rounds: Vec::new(),
+                    row_accepted: Vec::new(),
+                    row_draft_ms: Vec::new(),
+                    row_verify_ms: Vec::new(),
+                    row_observe_ms: Vec::new(),
+                    profile: prof,
+                    mem: MemReport::default(),
+                })
+            })
+        })??;
+        timing.mem = gauge.finish(&self.device);
+        Ok(timing)
     }
 }
 
@@ -399,7 +701,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
         self.prefill_tile
     }
     fn batch(&self) -> usize {
-        1
+        self.batch
     }
     fn eos_ids(&self) -> &[u32] {
         &self.text.eos_ids
@@ -410,7 +712,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
     fn health(&self) -> Value {
         json!({
             "family": "qwen4exp",
-            "batch": 1,
+            "batch": self.batch,
             "prefill_tile": self.prefill_tile,
             "kv_capacity": self.kv_capacity,
             "tier": self.tier,
@@ -419,7 +721,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
     }
     fn describe(&self) -> String {
         format!(
-            "family=qwen4exp experts={} slots={} loader={} mtp={} ple={} ple_cache_rows={} moe_act={} prefill_tile={} mem_sample={}",
+            "family=qwen4exp batch={} experts={} slots={} loader={} mtp={} ple={} ple_cache_rows={} moe_act={} prefill_tile={} mem_sample={}",
+            self.batch,
             self.tier["experts"].as_str().unwrap_or("?"),
             self.tier["slots_per_layer"].as_u64().unwrap_or(0),
             self.tier["loader"].as_str().unwrap_or("-"),
@@ -476,6 +779,9 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
         on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> Result<Decoded> {
         self.check_fits(prompt_ids.len(), params.max_tokens)?;
+        if let Some(sched) = &self.sched {
+            return self.complete_batched(sched, prompt_ids, params, |f| on_fragment(f));
+        }
         let reuse = self.reuse_prefix;
         let detok = self.detok();
         self.with_single(|s| {
@@ -497,6 +803,9 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
     fn prefill_throughput(&self, n: usize, batch: usize) -> Result<PrefillTiming> {
         self.check_batch(batch)?;
         self.check_fits(n, 1)?;
+        if batch > 1 || self.sched.is_some() {
+            return self.prefill_throughput_rows(n, batch.max(1));
+        }
         let ids = self.seed_prompt_row(n, 0);
         let device = self.device.clone();
         let tile = self.prefill_tile;
@@ -532,6 +841,9 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
     ) -> Result<DecodeTiming> {
         self.check_batch(batch)?;
         self.check_fits(prompt_tokens, decode_tokens + 1)?;
+        if batch > 1 || self.sched.is_some() {
+            return self.decode_throughput_rows(prompt_tokens, decode_tokens, batch.max(1));
+        }
         let prompt = self.seed_prompt_row(prompt_tokens, 0);
         let device = self.device.clone();
         let readback = self.readback;
@@ -705,15 +1017,24 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
         Ok((argmax, top))
     }
     fn check_batch(&self, batch: usize) -> Result<()> {
-        if batch != 1 {
+        if batch == 0 {
+            anyhow::bail!("batch must be positive");
+        }
+        if batch > self.batch {
             anyhow::bail!(
-                "batch {batch}: Qwen4-exp serves one sequence (the batched forward is not built \
-                 for it yet)"
+                "batch {batch} exceeds the server's --batch {} (start lloom serve with --batch >= {batch})",
+                self.batch
             );
         }
         Ok(())
     }
     fn shutdown(&self) {
+        if let Some(sc) = &self.sched {
+            sc.shutdown();
+        }
+        if let Some(t) = lock(&self.sched_thread).take() {
+            let _ = t.join();
+        }
         // The hotlist: the file's profile plus the usage since load.
         if let Some(path) = &self.hotlist {
             use lloom::models::qwen4exp::hotlist::Hotlist;
@@ -728,7 +1049,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
             } else {
                 Hotlist::default()
             };
-            hot.merge(&Hotlist::from_usage(&self.model.stream_usage()));
+            hot.merge(&Hotlist::from_usage(&self.core.model.stream_usage()));
             if let Err(e) = hot.write(path) {
                 eprintln!("hotlist {}: not written ({e})", path.display());
             }

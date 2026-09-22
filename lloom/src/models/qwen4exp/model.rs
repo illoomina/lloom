@@ -81,6 +81,21 @@ impl<R: ExpertResidency> Layer<R> {
         l: usize,
         cache: &mut Cache,
     ) -> Result<(Tensor, Tensor, Tensor)> {
+        let (a, b, c, _) = self.decode_parts_planned(res_hc, l, cache, false)?;
+        Ok((a, b, c))
+    }
+
+    /// [`Self::decode_parts`], the MoE's routed experts planned on the
+    /// device when `device_plan` (`MoeLayer::decode_planned`); the plan's
+    /// record, when one was made, is the caller's to settle at the end of
+    /// the pass.
+    pub fn decode_parts_planned(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        cache: &mut Cache,
+        device_plan: bool,
+    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
         // HC prologue (attn bracket): collapse streams → mixer input.
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // cur [1,1,d]
         trace("attn.mix", l, &cur);
@@ -97,11 +112,15 @@ impl<R: ExpertResidency> Layer<R> {
         // HC prologue (ffn bracket) → MoE → HC epilogue.
         let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
         trace("ffn.mix", l, &cur);
-        let moe_out = self.moe.decode(&cur)?;
+        let (moe_out, record) = if device_plan {
+            self.moe.decode_planned(&cur)?
+        } else {
+            (self.moe.decode(&cur)?, None)
+        };
         trace("moe", l, &moe_out);
         let res_hc = self.hc_ffn.combine(&res_hc, &moe_out, &inject)?;
         trace("ffn.combine", l, &res_hc);
-        Ok((res_hc, mixed, moe_out))
+        Ok((res_hc, mixed, moe_out, record))
     }
 
     /// One position through the layer ([`Self::decode_parts`]'s carry).
@@ -161,6 +180,10 @@ pub struct Cache {
     nextn_drops: u64,
     /// The open speculative window's pre-window bookkeeping, if any.
     window: Option<CacheWindow>,
+    /// Decode passes replayed because a device-planned routed expert was
+    /// not resident (`ExpertResidency::settle`) — the streamed tier's miss
+    /// cost under the device plan.
+    pub redos: u64,
 }
 
 /// What a speculative window must put back besides the recurrent channels'
@@ -195,6 +218,7 @@ impl Cache {
             nextn: Vec::new(),
             nextn_drops: 0,
             window: None,
+            redos: 0,
         }
     }
 
@@ -418,6 +442,9 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// borrows it beside `embed_tokens` and `lm_head`.
     mtp: Option<super::mtp::MtpHead<R>>,
     prefill_mode: PrefillMode,
+    /// Some layer's residency plans on the device (`Streamed`): a decode
+    /// pass runs under a window and settles at its end (`decode_embed`).
+    device_plan: bool,
     cfg: Config,
 }
 
@@ -429,6 +456,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         lm_head: QMatMul,
         cfg: Config,
     ) -> Self {
+        let device_plan = layers.iter().any(|l| l.moe().experts().plans_on_device());
         Self {
             embed_tokens,
             layers,
@@ -437,6 +465,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             ple: None,
             mtp: None,
             prefill_mode: PrefillMode::default(),
+            device_plan,
             cfg,
         }
     }
@@ -724,14 +753,71 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     }
 
     /// One position from its embedding `h [1, 1, hidden]` → logits `[1, vocab]`.
+    ///
+    /// Under the streamed tier's device plan (`QWEN4EXP_PLAN=device`, the
+    /// default; `host` is the per-layer readback): the pass runs with no
+    /// host sync at any layer, under a speculative window; at its end every
+    /// layer's plan is settled at once (the one readback) and, if any layer
+    /// computed on an expert that was not resident, the window is rewound
+    /// and the pass replayed — the experts are resident now, the replay is
+    /// the same math on the same bytes (`ExpertResidency::settle`). Off when
+    /// a window is already open (an MTP verify) or an observer taps a layer
+    /// (a replay would tap twice).
     pub fn decode_embed<O: ForwardObserver>(
         &self,
         h: &Tensor,
         cache: &mut Cache,
         obs: &mut O,
     ) -> Result<Tensor> {
+        let planned = self.device_plan
+            && plan_on_device()
+            && !cache.window_open()
+            && !(0..self.layers.len())
+                .any(|l| obs.wants::<HcStatePoint>(l) || obs.wants::<LayerOutputPoint>(l));
+        if !planned {
+            return self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l);
+        }
+        // A pass that computed on a missing expert at layer L was right up to
+        // L (its ids at L came from a correct carry), so the settle loads L's
+        // true experts; the replay is right through L and may first show
+        // layer L+1's true ids — each replay is exact one layer further, so
+        // the loop is bounded by the layer count (one more is a defect).
+        let mut attempts = 0usize;
+        loop {
+            cache.open_window()?;
+            let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
+            let mut redo = false;
+            for (l, rec) in &records {
+                if self.layers[*l].moe().experts().settle(rec)? {
+                    redo = true;
+                }
+            }
+            if !redo {
+                cache.resolve_window()?;
+                return Ok(logits);
+            }
+            cache.rewind_window()?;
+            cache.redos += 1;
+            attempts += 1;
+            if attempts > self.layers.len() {
+                lloom_tensor::bail!(
+                    "qwen4exp: a decode pass still missed an expert after {attempts} replays \
+                     (more than the layer count)"
+                )
+            }
+        }
+    }
+
+    fn decode_embed_pass<O: ForwardObserver>(
+        &self,
+        h: &Tensor,
+        cache: &mut Cache,
+        obs: &mut O,
+        device_plan: bool,
+    ) -> Result<(Tensor, Vec<(usize, Tensor)>)> {
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
+        let mut records: Vec<(usize, Tensor)> = Vec::new();
 
         // broadcast the embedding into the n-stream HC carry `res_hc [1, 1, n*d]`.
         // The reference inits the streams from the embed broadcast across n.
@@ -758,7 +844,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 obs.at::<HcStatePoint>(l, &res_hc)?;
             }
 
-            let (next, mixed, moe_out) = layer.decode_parts(&res_hc, l, cache)?;
+            let (next, mixed, moe_out, record) =
+                layer.decode_parts_planned(&res_hc, l, cache, device_plan)?;
+            if let Some(r) = record {
+                records.push((l, r));
+            }
             if watch {
                 watched.push(nonfinite_probe(&mixed)?);
                 watched.push(nonfinite_probe(&moe_out)?);
@@ -789,9 +879,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let (collapsed, _) = self.hc_head.mix(&res_hc)?; // [1, 1, d]
         cache.pos += 1;
         let logits = self.lm_head.forward(&collapsed)?; // [1, 1, vocab]
-        logits
+        let logits = logits
             .reshape((1, self.cfg.vocab_size))?
-            .to_dtype(lloom_tensor::DType::F32)
+            .to_dtype(lloom_tensor::DType::F32)?;
+        Ok((logits, records))
     }
 
     /// The context past which the full-attention layers are sparse (the
@@ -881,6 +972,18 @@ impl CacheReset for Cache {
     fn reset(&mut self) {
         Cache::reset(self)
     }
+}
+
+/// Whether the streamed tier's routed experts are planned on the device
+/// (`QWEN4EXP_PLAN`, read once: `device` — the default — or `host`, the
+/// per-layer readback; the A/B arm).
+fn plan_on_device() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("QWEN4EXP_PLAN")
+            .map(|v| v != "host")
+            .unwrap_or(true)
+    })
 }
 
 /// No rewindable arm yet: the recurrent channels roll back only through a

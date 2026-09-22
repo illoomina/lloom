@@ -71,6 +71,30 @@ pub trait ExpertResidency {
     /// `down` projection of `h [rows, topk, n_ff]` through `slot_ids`:
     /// `[rows, topk, hidden]`.
     fn down(&self, h: &Tensor, slot_ids: &Tensor) -> Result<Tensor>;
+
+    /// Whether [`Self::plan_device`] can answer: the strategy keeps a
+    /// residency table on the device. `Resident` never needs to.
+    fn plans_on_device(&self) -> bool {
+        false
+    }
+
+    /// The device-side plan of `ids [rows, topk]` (u32, on the device): the
+    /// slot ids the dispatch reads — NO host sync, an expert not resident
+    /// maps to slot 0 and is flagged — and the plan's record for
+    /// [`Self::settle`]. `None` where the strategy has no device plan (the
+    /// caller takes [`Self::plan`] / [`Self::ensure`]).
+    fn plan_device(&self, _ids: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+        Ok(None)
+    }
+
+    /// Read a device plan's record back (the one host sync, at the end of
+    /// the pass, for every layer at once), touch the residency of what the
+    /// pass used and load what it lacked. `true` when the pass computed on
+    /// a missing expert — its result is wrong and the pass is replayed; the
+    /// experts are resident now.
+    fn settle(&self, _record: &Tensor) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// All experts resident in RAM: the small-model / big-RAM case, zero streaming
@@ -373,6 +397,11 @@ pub struct StreamCounters {
     pub misses: AtomicU64,
     pub evictions: AtomicU64,
     pub bytes_loaded: AtomicU64,
+    /// Device-side plans (`plan_device`): no readback at the layer.
+    pub device_plans: AtomicU64,
+    /// Settles that found the pass computed on a missing expert (the pass
+    /// is replayed by the caller).
+    pub settled_misses: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -398,6 +427,8 @@ pub struct StreamStats {
     pub misses: u64,
     pub evictions: u64,
     pub bytes_loaded: u64,
+    pub device_plans: u64,
+    pub settled_misses: u64,
 }
 
 impl StreamCounters {
@@ -409,12 +440,16 @@ impl StreamCounters {
             misses: self.misses.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             bytes_loaded: self.bytes_loaded.load(Ordering::Relaxed),
+            device_plans: self.device_plans.load(Ordering::Relaxed),
+            settled_misses: self.settled_misses.load(Ordering::Relaxed),
         }
     }
 }
 
 impl std::ops::AddAssign for StreamStats {
     fn add_assign(&mut self, o: Self) {
+        self.device_plans += o.device_plans;
+        self.settled_misses += o.settled_misses;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -475,6 +510,10 @@ struct Inner {
     map: ResidencyMap,
     loader: LoaderArm,
     device: Device,
+    /// The residency table on the device (`slot_of`, `NONE` = absent), for
+    /// the device-side plan; rebuilt after a settle that loaded.
+    table: Option<Tensor>,
+    table_stale: bool,
     /// The `pread` arm's staging ring on Metal (reused once its copy's
     /// command buffer completes; never a pool bucket, never a wait) — one
     /// ring shared by every layer of the tier when built by the loader.
@@ -579,6 +618,8 @@ impl Streamed {
                 device: device.clone(),
                 #[cfg(feature = "metal")]
                 staging,
+                table: None,
+                table_stale: true,
             }),
             counters: StreamCounters::default(),
             n_experts,
@@ -819,7 +860,172 @@ fn plan_rows(ids: &[u32], rows: usize, topk: usize, n_slots: usize) -> Vec<Range
     groups
 }
 
+/// The device-side plan: `ids [n]` (applied to) through the residency
+/// `table [n_experts]` (captured; `NONE` = absent) → flat `[3·n]` u32: the
+/// slot ids (a miss reads slot 0) | the ids | a miss flag per id. The CPU
+/// path is the same lookup.
+struct SlotMap {
+    table: Tensor,
+    n_experts: usize,
+}
+
+impl lloom_tensor::CustomOp1 for SlotMap {
+    fn name(&self) -> &'static str {
+        "expert-stream-slot-map"
+    }
+    fn cpu_fwd(
+        &self,
+        s: &lloom_tensor::CpuStorage,
+        l: &lloom_tensor::Layout,
+    ) -> Result<(lloom_tensor::CpuStorage, lloom_tensor::Shape)> {
+        let ids = match s {
+            lloom_tensor::CpuStorage::U32(v) => v,
+            _ => lloom_tensor::bail!("slot_map: u32 ids only"),
+        };
+        if !l.is_contiguous() {
+            lloom_tensor::bail!("slot_map: contiguous ids only")
+        }
+        let n = l.shape().elem_count();
+        let ids = &ids[l.start_offset()..l.start_offset() + n];
+        let table: Vec<u32> = self.table.flatten_all()?.to_vec1()?;
+        let mut out = vec![0u32; 3 * n];
+        for (i, &e) in ids.iter().enumerate() {
+            let slot = table.get(e as usize).copied().unwrap_or(NONE);
+            let miss = slot == NONE;
+            out[i] = if miss { 0 } else { slot };
+            out[n + i] = e;
+            out[2 * n + i] = miss as u32;
+        }
+        Ok((
+            lloom_tensor::CpuStorage::U32(out),
+            lloom_tensor::Shape::from(3 * n),
+        ))
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &lloom_tensor::Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, lloom_tensor::Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        if s.dtype() != lloom_tensor::DType::U32 || !l.is_contiguous() {
+            lloom_tensor::bail!("slot_map: contiguous u32 ids only")
+        }
+        let n = l.shape().elem_count();
+        let (ts, tl) = self.table.storage_and_layout();
+        let ts = match &*ts {
+            lloom_tensor::Storage::Metal(m) => m,
+            _ => lloom_tensor::bail!("slot_map: the table must be on the metal device"),
+        };
+        if tl.shape().elem_count() != self.n_experts || !tl.is_contiguous() {
+            lloom_tensor::bail!("slot_map: the table must be contiguous [n_experts]")
+        }
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("moe_slot_map");
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(3 * n, lloom_tensor::DType::U32)
+            .with_label("moe_slot_map")
+            .build()?;
+        lloom_tensor::kernels::call_moe_slot_map(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            n,
+            self.n_experts,
+            lloom_tensor::kernels::BufferOffset {
+                buffer: s.buffer(),
+                offset_in_bytes: l.start_offset() * s.dtype().size_in_bytes(),
+            },
+            lloom_tensor::kernels::BufferOffset {
+                buffer: ts.buffer(),
+                offset_in_bytes: tl.start_offset() * ts.dtype().size_in_bytes(),
+            },
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), 3 * n, s.dtype()),
+            lloom_tensor::Shape::from(3 * n),
+        ))
+    }
+}
+
+impl Streamed {
+    /// The residency table on the device, rebuilt when a settle changed it.
+    fn device_table(&self, inner: &mut Inner) -> Result<Tensor> {
+        if inner.table_stale || inner.table.is_none() {
+            let t = Tensor::from_vec(inner.map.slot_of.clone(), self.n_experts, &inner.device)?;
+            inner.table = Some(t);
+            inner.table_stale = false;
+        }
+        Ok(inner.table.as_ref().expect("built above").clone())
+    }
+}
+
 impl ExpertResidency for Streamed {
+    fn plans_on_device(&self) -> bool {
+        true
+    }
+
+    fn plan_device(&self, ids: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+        let (rows, topk) = ids.dims2()?;
+        let n = rows * topk;
+        let ids = ids.flatten_all()?.contiguous()?;
+        let table = {
+            let mut inner = self.inner.lock();
+            self.device_table(&mut inner)?
+        };
+        self.counters.device_plans.fetch_add(1, Ordering::Relaxed);
+        let plan = ids.apply_op1_no_bwd(&SlotMap {
+            table,
+            n_experts: self.n_experts,
+        })?; // [3·n]
+        let slots = plan.narrow(0, 0, n)?.reshape((rows, topk))?;
+        Ok(Some((slots, plan)))
+    }
+
+    fn settle(&self, record: &Tensor) -> Result<bool> {
+        let v: Vec<u32> = record.flatten_all()?.to_vec1()?;
+        if !v.len().is_multiple_of(3) {
+            lloom_tensor::bail!("settle: a plan record is [3·n], got {}", v.len())
+        }
+        let n = v.len() / 3;
+        let ids = &v[n..2 * n];
+        let flags = &v[2 * n..];
+        let mut distinct: Vec<u32> = ids.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let mut inner = self.inner.lock();
+        let tick = inner.map.begin();
+        // What the pass used and found: touched first, so a load below never
+        // evicts an expert this pass needs.
+        let mut missing: Vec<u32> = Vec::new();
+        for &e in &distinct {
+            match inner.map.slot_of(e as usize) {
+                Some(s) => {
+                    inner.map.touch(s, tick);
+                    self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                }
+                None => missing.push(e),
+            }
+        }
+        let flagged = flags.iter().any(|&f| f != 0);
+        if missing.is_empty() {
+            if flagged {
+                lloom_tensor::bail!(
+                    "settle: the device plan flagged a miss the residency map does not show"
+                )
+            }
+            return Ok(false);
+        }
+        self.resolve(&mut inner, &missing, tick)?;
+        inner.table_stale = true;
+        self.counters.settled_misses.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
     fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>> {
         let (rows, topk) = ids.dims2()?;
         let host: Vec<u32> = ids.flatten_all()?.to_vec1::<u32>()?;
@@ -997,6 +1203,95 @@ mod tests {
             s.misses * plane as u64,
             "bytes loaded must be misses × the three planes"
         );
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The device plan against the host plan: the same slot ids once the
+    /// misses are settled, the misses flagged before, and the routed output
+    /// on the settled slots equal to `Resident`'s bit for bit. On a pool
+    /// smaller than the working set, so settles load and evict.
+    #[test]
+    fn device_plan_settles_to_the_host_plan() {
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let resident = Resident::new(Arc::new(gate), Arc::new(up), Arc::new(down));
+        let streamed = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            5,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert!(streamed.plans_on_device());
+        let mut settled_with_misses = 0;
+        for t in 0..8 {
+            let xs = x(1, d, t as f32);
+            let id = ids(1, topk, e, t % 3);
+            let (slots, record) = streamed.plan_device(&id).unwrap().expect("a device plan");
+            let rec: Vec<u32> = record.to_vec1().unwrap();
+            let n = topk;
+            assert_eq!(
+                &rec[n..2 * n],
+                &id.flatten_all().unwrap().to_vec1::<u32>().unwrap()[..]
+            );
+            let flagged = rec[2 * n..].iter().any(|&f| f != 0);
+            let missed = streamed.settle(&record).unwrap();
+            assert_eq!(
+                flagged, missed,
+                "token {t}: the flags and the settle disagree"
+            );
+            if missed {
+                settled_with_misses += 1;
+                // Replay: every expert is resident now, the plan is clean.
+                let (slots2, record2) = streamed.plan_device(&id).unwrap().unwrap();
+                assert!(
+                    !streamed.settle(&record2).unwrap(),
+                    "token {t}: a second miss"
+                );
+                let s2: Vec<u32> = slots2.flatten_all().unwrap().to_vec1().unwrap();
+                let host = streamed.ensure(&streamed.plan(&id).unwrap()[0]).unwrap();
+                let h: Vec<u32> = host.flatten_all().unwrap().to_vec1().unwrap();
+                assert_eq!(
+                    s2, h,
+                    "token {t}: the device plan's slots vs the host plan's"
+                );
+                let out = {
+                    let x3 = xs.reshape((1, 1, d)).unwrap();
+                    let (g, u) = streamed.gate_up(&x3, &slots2).unwrap();
+                    let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+                    streamed.down(&hh, &slots2).unwrap()
+                };
+                let want = {
+                    let x3 = xs.reshape((1, 1, d)).unwrap();
+                    let (g, u) = resident.gate_up(&x3, &id).unwrap();
+                    let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+                    resident.down(&hh, &id).unwrap()
+                };
+                assert_eq!(
+                    out.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+                    "token {t}: routed output"
+                );
+            } else {
+                let s1: Vec<u32> = slots.flatten_all().unwrap().to_vec1().unwrap();
+                let host = streamed.ensure(&streamed.plan(&id).unwrap()[0]).unwrap();
+                let h: Vec<u32> = host.flatten_all().unwrap().to_vec1().unwrap();
+                assert_eq!(s1, h, "token {t}: a clean device plan vs the host plan");
+            }
+        }
+        assert!(
+            settled_with_misses > 0,
+            "the pool never missed: the test is vacuous"
+        );
+        let st = streamed.stats();
+        assert_eq!(st.settled_misses, settled_with_misses);
+        assert!(st.device_plans >= 8);
         std::fs::remove_file(path).ok();
     }
 

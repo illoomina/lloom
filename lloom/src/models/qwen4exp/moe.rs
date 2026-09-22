@@ -96,6 +96,20 @@ impl<R: ExpertResidency> MoeLayer<R> {
     /// is a softmax over all experts, top-k, renormalize (reference
     /// `build_moe_ffn`).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(self.forward_inner(x, false)?.0)
+    }
+
+    /// [`Self::forward`] with the routed experts planned ON THE DEVICE when
+    /// the residency can (`ExpertResidency::plan_device`): no readback at
+    /// the layer; the plan's record comes back with the output and the
+    /// caller settles it at the end of the pass (`settle`), replaying the
+    /// pass if it computed on a missing expert. `None` record = the host
+    /// plan ran (nothing to settle).
+    pub fn decode_planned(&self, x: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
+        self.forward_inner(x, true)
+    }
+
+    fn forward_inner(&self, x: &Tensor, device_plan: bool) -> Result<(Tensor, Option<Tensor>)> {
         let (b, seq, hidden) = x.dims3()?;
         if b != 1 {
             lloom_tensor::bail!("moe takes one sequence, got {:?}", x.shape())
@@ -133,28 +147,48 @@ impl<R: ExpertResidency> MoeLayer<R> {
         // one group over the ids as they are; `Streamed` groups the rows to
         // its slot pool and resolves each group's ids to slots first.
         let x3 = x1.to_dtype(self.routed_act)?.reshape((seq, 1, hidden))?; // [seq, 1, hidden]
-        let groups = self.experts.plan(&ids)?;
-        let mut ys = Vec::with_capacity(groups.len());
-        for group in &groups {
-            let slot_ids = self.experts.ensure(group)?;
-            let xg = if groups.len() == 1 {
-                x3.clone()
-            } else {
-                x3.narrow(0, group.rows.start, group.rows.len())?
-            };
-            let (g, u) = self.experts.gate_up(&xg, &slot_ids)?; // [rows, topk, n_ff] each
-            super::trace("moe.g", usize::MAX, &g);
-            super::trace("moe.u", usize::MAX, &u);
-            let h = match super::kernels::silu_mul(&g, &u) {
-                Some(h) => h?,
-                None => (ops::silu(&g)? * u)?,
-            };
-            ys.push(self.experts.down(&h, &slot_ids)?); // [rows, topk, hidden]
-        }
-        let y = if ys.len() == 1 {
-            ys.pop().expect("one group")
+        let device_plan = if device_plan {
+            self.experts.plan_device(&ids)?
         } else {
-            Tensor::cat(&ys, 0)?
+            None
+        };
+        let mut record = None;
+        let y = match device_plan {
+            // One group over the slot ids the device resolved.
+            Some((slot_ids, rec)) => {
+                record = Some(rec);
+                let (g, u) = self.experts.gate_up(&x3, &slot_ids)?;
+                let h = match super::kernels::silu_mul(&g, &u) {
+                    Some(h) => h?,
+                    None => (ops::silu(&g)? * u)?,
+                };
+                self.experts.down(&h, &slot_ids)?
+            }
+            None => {
+                let groups = self.experts.plan(&ids)?;
+                let mut ys = Vec::with_capacity(groups.len());
+                for group in &groups {
+                    let slot_ids = self.experts.ensure(group)?;
+                    let xg = if groups.len() == 1 {
+                        x3.clone()
+                    } else {
+                        x3.narrow(0, group.rows.start, group.rows.len())?
+                    };
+                    let (g, u) = self.experts.gate_up(&xg, &slot_ids)?; // [rows, topk, n_ff] each
+                    super::trace("moe.g", usize::MAX, &g);
+                    super::trace("moe.u", usize::MAX, &u);
+                    let h = match super::kernels::silu_mul(&g, &u) {
+                        Some(h) => h?,
+                        None => (ops::silu(&g)? * u)?,
+                    };
+                    ys.push(self.experts.down(&h, &slot_ids)?); // [rows, topk, hidden]
+                }
+                if ys.len() == 1 {
+                    ys.pop().expect("one group")
+                } else {
+                    Tensor::cat(&ys, 0)?
+                }
+            }
         };
         super::trace("moe.y", usize::MAX, &y);
 
@@ -177,7 +211,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
                 (routed + shared)?
             }
         };
-        out.reshape((1, seq, hidden))
+        Ok((out.reshape((1, seq, hidden))?, record))
     }
 }
 

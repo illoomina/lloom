@@ -641,7 +641,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 st.buffers, st.bytes, st.allocations, st.reuses, st.overflows
             );
             println!(
-                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4}",
+                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} redos={}",
                 args.loader,
                 model.slots_per_layer(),
                 s.plans,
@@ -650,7 +650,10 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 s.misses,
                 s.evictions,
                 s.bytes_loaded,
-                s.hits as f64 / (s.hits + s.misses).max(1) as f64
+                s.hits as f64 / (s.hits + s.misses).max(1) as f64,
+                s.device_plans,
+                s.settled_misses,
+                cache.redos
             );
         }
         if let Some((hits, misses)) = model.ple_cache_stats() {

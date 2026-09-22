@@ -372,12 +372,18 @@ kernel void gdn_prologue_f32(
   }
 }
 
-// The recurrence on the layer's `S [d, d, h_v]` slab (head-last, as stored)
-// IN PLACE, from `heads [3, h_v, d]` and the raw gate logits:
+// The recurrence on the layer's `S [d, d, h_v]` slab (head-last, as stored),
+// read from `s` and written to `s_out`, from `heads [3, h_v, d]` and the raw
+// gate logits:
 //   g = ssm_a · softplus(alpha + dt_bias); β = sigmoid(beta)
 //   S ← e^g · S;  r = kᵀ S;  δ = β (v − r);  S ← S + k ⊗ δ;  o = qᵀ S
-// One threadgroup per `dv`, `h_v` threads (one head each): the head is the
-// innermost slab index, so every read across the group is contiguous.
+// One threadgroup per `dv`, `h_v × split` threads: thread (h, j) owns head
+// `h` over the `dk ≡ j (mod split)` slice — the head is the innermost slab
+// index, so a warp's reads are contiguous — the two reductions over `dk`
+// (the read-out `r`, the output `o`) closing across the slices through
+// threadgroup memory. `split` is the width over `h_v` (the host picks it;
+// 8 at the real geometry: 49k threads over the 786k-element slab instead
+// of 6k threads each walking 256 strided elements).
 kernel void gdn_step_f32(
     const device float* heads [[buffer(0)]],
     const device float* alpha [[buffer(1)]],
@@ -390,8 +396,13 @@ kernel void gdn_step_f32(
     constant uint& h_v [[buffer(8)]],
     device float* s_out [[buffer(9)]],
     uint dv [[threadgroup_position_in_grid]],
-    uint h [[thread_position_in_threadgroup]]) {
-  if (h >= h_v) return;
+    uint t [[thread_position_in_threadgroup]],
+    uint width [[threads_per_threadgroup]]) {
+  threadgroup float part[1024];
+  const uint split = width / h_v;
+  const uint h = t % h_v;
+  const uint j = t / h_v;
+  const bool live = j < split; // width is h_v · split; a stray thread only idles
   const device float* q = heads + (size_t)h * d;
   const device float* k = heads + (size_t)(h_v + h) * d;
   const device float* v = heads + (size_t)(2 * h_v + h) * d;
@@ -400,20 +411,35 @@ kernel void gdn_step_f32(
   const float sp = metal::max(a, 0.0f) + metal::log(1.0f + metal::exp(-metal::fabs(a)));
   const float eg = metal::exp(ssm_a[h] * sp);
   const float b = 1.0f / (1.0f + metal::exp(-beta[h]));
-  // r = Σ_dk k[dk] · (e^g S[dk, dv, h])
+  // r = Σ_dk k[dk] · (e^g S[dk, dv, h]), the slice's part then the slices
   float r = 0.0f;
-  for (uint dk = 0; dk < d; dk++) {
-    r += k[dk] * (eg * s[((size_t)dk * d + dv) * h_v + h]);
+  if (live) {
+    for (uint dk = j; dk < d; dk += split) {
+      r += k[dk] * (eg * s[((size_t)dk * d + dv) * h_v + h]);
+    }
+    part[t] = r;
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  r = 0.0f;
+  for (uint jj = 0; jj < split; jj++) r += part[jj * h_v + h];
   const float delta = b * (v[dv] - r);
   float acc = 0.0f;
-  for (uint dk = 0; dk < d; dk++) {
-    const size_t idx = ((size_t)dk * d + dv) * h_v + h;
-    const float sn = eg * s[idx] + k[dk] * delta;
-    s_out[idx] = sn;
-    acc += q[dk] * sn;
+  if (live) {
+    for (uint dk = j; dk < d; dk += split) {
+      const size_t idx = ((size_t)dk * d + dv) * h_v + h;
+      const float sn = eg * s[idx] + k[dk] * delta;
+      s_out[idx] = sn;
+      acc += q[dk] * sn;
+    }
   }
-  o[(size_t)h * d + dv] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (live) part[t] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (j == 0) {
+    float sum = 0.0f;
+    for (uint jj = 0; jj < split; jj++) sum += part[jj * h_v + h];
+    o[(size_t)h * d + dv] = sum;
+  }
 }
 
 // `out[h·d + i] = rmsnorm_d(o[h, ·])[i] · γ[i] · sigmoid(z[h·d + i])` — the

@@ -349,7 +349,12 @@ pub fn call_gdn_step(
             Output::from_buffer_offset(&s_out)
         )
     );
-    let width = h_v.min(pipeline.max_total_threads_per_threadgroup());
+    // `h_v × split` threads: `split` slices of `dk` per head, as many as the
+    // threadgroup takes up to 8 (the reductions close over `split` partials
+    // in threadgroup memory; `h_v × split` ≤ 1024).
+    let max = pipeline.max_total_threads_per_threadgroup().min(1024);
+    let split = (max / h_v.max(1)).clamp(1, 8);
+    let width = h_v * split;
     dispatch_groups(encoder, d, width);
     Ok(())
 }

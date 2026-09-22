@@ -741,3 +741,263 @@ mod tests {
         close("moe_combine", &fused, &composed, 1e-5);
     }
 }
+
+// ---- Gated DeltaNet decode ---------------------------------------------------------
+
+/// The decode prologue: `qkv [conv_ch]` against the layer's conv window
+/// (`win [conv_ch, kk]`, captured, written in place) → `heads [3, h_v, d]`.
+pub(crate) struct GdnPrologue {
+    pub d: usize,
+    pub h_k: usize,
+    pub h_v: usize,
+    pub kk: usize,
+    pub eps: f32,
+    pub q_scale: f32,
+    pub conv_w: Tensor,
+    pub win: Tensor,
+}
+
+impl lloom_tensor::CustomOp1 for GdnPrologue {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-prologue"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!(
+            "gdn_prologue: no cpu kernel; `GatedDeltaNet::decode` composes it there"
+        )
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let conv_ch = (2 * self.h_k + self.h_v) * self.d;
+        if l.shape().elem_count() != conv_ch || !l.is_contiguous() {
+            lloom_tensor::bail!("gdn_prologue: qkv {:?} vs {conv_ch} channels", l.shape())
+        }
+        let (ws, wl) = self.conv_w.storage_and_layout();
+        let (ns, nl) = self.win.storage_and_layout();
+        let (ws, ns) = match (&*ws, &*ns) {
+            (lloom_tensor::Storage::Metal(a), lloom_tensor::Storage::Metal(b)) => (a, b),
+            _ => lloom_tensor::bail!(
+                "gdn_prologue: conv weight / window must be on the metal device"
+            ),
+        };
+        if wl.shape().elem_count() != conv_ch * self.kk
+            || nl.shape().elem_count() != conv_ch * self.kk
+            || !wl.is_contiguous()
+            || !nl.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "gdn_prologue: conv weight / window must be contiguous [conv_ch, kk]"
+            )
+        }
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_prologue");
+        let elem_count = 3 * self.h_v * self.d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_heads")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_prologue(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            self.d,
+            self.h_k,
+            self.h_v,
+            self.kk,
+            self.eps,
+            self.q_scale,
+            metal_bo(s, l),
+            metal_bo(ws, &wl),
+            metal_bo(ns, &nl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            Shape::from((3, self.h_v, self.d)),
+        ))
+    }
+}
+
+/// The recurrence: `heads`, the raw `alpha`/`beta` logits, the captured
+/// `dt_bias`/`ssm_a` and the `S` slab (in place) → `o [h_v, d]`.
+pub(crate) struct GdnStep {
+    pub d: usize,
+    pub h_v: usize,
+    pub dt_bias: Tensor,
+    pub ssm_a: Tensor,
+    pub s: Tensor,
+}
+
+impl lloom_tensor::CustomOp3 for GdnStep {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-step"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_step: no cpu kernel; `deltanet::decode_step` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (d, h_v) = (self.d, self.h_v);
+        if l1.shape().elem_count() != 3 * h_v * d
+            || l2.shape().elem_count() != h_v
+            || l3.shape().elem_count() != h_v
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "gdn_step: heads {:?} / alpha {:?} / beta {:?} vs d {d} h_v {h_v}",
+                l1.shape(),
+                l2.shape(),
+                l3.shape()
+            )
+        }
+        let (bs, bl) = self.dt_bias.storage_and_layout();
+        let (as_, al) = self.ssm_a.storage_and_layout();
+        let (ss, sl) = self.s.storage_and_layout();
+        let (bs, as_, ss) = match (&*bs, &*as_, &*ss) {
+            (
+                lloom_tensor::Storage::Metal(a),
+                lloom_tensor::Storage::Metal(b),
+                lloom_tensor::Storage::Metal(c),
+            ) => (a, b, c),
+            _ => lloom_tensor::bail!("gdn_step: dt_bias / ssm_a / S must be on the metal device"),
+        };
+        if bl.shape().elem_count() != h_v
+            || al.shape().elem_count() != h_v
+            || sl.shape().elem_count() != d * d * h_v
+            || !bl.is_contiguous()
+            || !al.is_contiguous()
+            || !sl.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_step: dt_bias / ssm_a [h_v], S [d, d, h_v], contiguous")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_step");
+        let elem_count = h_v * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_o")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_step(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            d,
+            h_v,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            metal_bo(bs, &bl),
+            metal_bo(as_, &al),
+            metal_bo(ss, &sl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((h_v, d)),
+        ))
+    }
+}
+
+/// The gated norm: `o [h_v, d]`, `γ [d]`, `z [h_v·d]` → `[h_v·d]`.
+pub(crate) struct GdnGatedNorm {
+    pub d: usize,
+    pub h_v: usize,
+    pub eps: f32,
+}
+
+impl lloom_tensor::CustomOp3 for GdnGatedNorm {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-gated-norm"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!(
+            "gdn_gated_norm: no cpu kernel; `GatedDeltaNet::gated_rms_norm` composes it there"
+        )
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (d, h_v) = (self.d, self.h_v);
+        if l1.shape().elem_count() != h_v * d
+            || l2.shape().elem_count() != d
+            || l3.shape().elem_count() != h_v * d
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_gated_norm: o [h_v, d], γ [d], z [h_v·d], contiguous")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_gated_norm");
+        let elem_count = h_v * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_gated")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_gated_norm(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            d,
+            h_v,
+            self.eps,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from(h_v * d),
+        ))
+    }
+}

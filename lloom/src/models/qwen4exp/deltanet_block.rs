@@ -96,6 +96,9 @@ impl GatedDeltaNet {
         s_state: &mut RecurrentState,
         conv_state: &mut RecurrentState,
     ) -> Result<Tensor> {
+        if let Some(out) = self.decode_fused(x, l, s_state, conv_state)? {
+            return Ok(out);
+        }
         let dims = self.dims;
         let (d_k, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
 
@@ -155,6 +158,103 @@ impl GatedDeltaNet {
 
         // out-proj → [1,1,hidden].
         self.ssm_out.forward(&gated)
+    }
+
+    /// [`Self::decode`] as three launches between the projections (Metal,
+    /// f32, `d_k == d_v`; `kernels::{GdnPrologue, GdnStep, GdnGatedNorm}`):
+    /// the conv window and the `S` slab are written IN PLACE, so the state
+    /// channels see the buffers they already hold (`RecurrentState::write`
+    /// skips the copy). `None` where the composed path applies.
+    fn decode_fused(
+        &self,
+        x: &Tensor,
+        l: usize,
+        s_state: &mut RecurrentState,
+        conv_state: &mut RecurrentState,
+    ) -> Result<Option<Tensor>> {
+        use super::kernels::{fused_off, GdnGatedNorm, GdnPrologue, GdnStep};
+        let dims = self.dims;
+        let (d, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
+        if fused_off()
+            || !x.device().is_metal()
+            || x.dtype() != lloom_tensor::DType::F32
+            || dims.d_v != d
+            || x.elem_count() != x.dim(D::Minus1)?
+        {
+            return Ok(None);
+        }
+        let dev = x.device();
+        let f32 = lloom_tensor::DType::F32;
+        // The persistent buffers: allocate the zero state once (the first
+        // write takes an own-storage copy) so the kernels always have a slab
+        // to write in place.
+        if conv_state.get(l).is_none() {
+            conv_state.write(
+                l,
+                Tensor::zeros((self.conv_channels, self.conv_k), f32, dev)?,
+            )?;
+        }
+        if s_state.get(l).is_none() {
+            s_state.write(l, Tensor::zeros((d, d, h_v), f32, dev)?)?;
+        }
+        let win = conv_state.get(l).expect("written above").clone();
+        let slab = s_state.get(l).expect("written above").clone();
+        if win.dtype() != f32
+            || slab.dtype() != f32
+            || !win.is_contiguous()
+            || !slab.is_contiguous()
+        {
+            return Ok(None);
+        }
+        let conv_w = if self.conv_weight.dtype() == f32 {
+            self.conv_weight.clone()
+        } else {
+            self.conv_weight.to_dtype(f32)?
+        };
+
+        // The projections (the quantized stems and the mixed-precision f16 arms).
+        let qkv = self.wqkv.forward(x)?.flatten_all()?.to_dtype(f32)?; // [conv_channels]
+        let z = self.wqkv_gate.forward(x)?.flatten_all()?.to_dtype(f32)?; // [value_dim]
+        let alpha = self.ssm_alpha.forward(x)?.flatten_all()?.to_dtype(f32)?; // [h_v]
+        let beta = self.ssm_beta.forward(x)?.flatten_all()?.to_dtype(f32)?; // [h_v]
+        let heads = qkv.apply_op1_no_bwd(&GdnPrologue {
+            d,
+            h_k,
+            h_v,
+            kk: self.conv_k,
+            eps: self.norm_eps as f32,
+            q_scale: 1.0 / (d as f32).sqrt(),
+            conv_w,
+            win: win.clone(),
+        })?; // [3, h_v, d]
+        let o = heads.apply_op3_no_bwd(
+            &alpha,
+            &beta,
+            &GdnStep {
+                d,
+                h_v,
+                dt_bias: self.ssm_dt.to_dtype(f32)?,
+                ssm_a: self.ssm_a.to_dtype(f32)?,
+                s: slab.clone(),
+            },
+        )?; // [h_v, d]
+            // The slabs were written in place: the writes are no-ops by identity.
+        conv_state.write(l, win)?;
+        s_state.write(l, slab)?;
+        let gamma = self.ssm_norm.to_dtype(f32)?;
+        let gated = o.apply_op3_no_bwd(
+            &gamma,
+            &z,
+            &GdnGatedNorm {
+                d,
+                h_v,
+                eps: self.norm_eps as f32,
+            },
+        )?; // [value_dim]
+        let out = self
+            .ssm_out
+            .forward(&gated.reshape((1, 1, self.value_dim))?)?;
+        Ok(Some(out))
     }
 
     /// A whole chunk `x [1, seq, hidden]` → `[1, seq, hidden]` (Kernel B), the
@@ -428,6 +528,123 @@ mod tests {
         }
     }
 
+    /// The fused decode (three launches, the slabs in place) matches the
+    /// composed path — the CPU's — at the real head geometry over 40 steps
+    /// from a fresh state: every output and both state channels.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn decode_fused_matches_composed_at_real_geometry() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let d = cfg.hidden_size;
+        let conv_ch = cfg.conv_channels();
+        let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
+        let h_v = cfg.ssm_dt_rank;
+        let d_v = cfg.ssm_state_size;
+        let build = |dev: &Device| {
+            let lin = |out: usize, inp: usize, seed: f32| {
+                QMatMul::Tensor(
+                    Tensor::from_vec(
+                        (0..out * inp)
+                            .map(|i| ((i as f32 * 0.017 + seed).sin()) * 0.05)
+                            .collect::<Vec<_>>(),
+                        (out, inp),
+                        dev,
+                    )
+                    .unwrap(),
+                )
+            };
+            let vecw = |n: usize, f: &dyn Fn(usize) -> f32| {
+                Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, dev).unwrap()
+            };
+            GatedDeltaNet::new(
+                lin(conv_ch, d, 1.0),
+                lin(value_dim, d, 2.0),
+                vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
+                    ((i as f32 * 0.03).cos()) * 0.2
+                })
+                .reshape((conv_ch, cfg.ssm_conv_kernel))
+                .unwrap(),
+                vecw(h_v, &|i| -0.5 - 0.01 * i as f32),
+                vecw(h_v, &|i| 0.1 * (i % 7) as f32),
+                lin(h_v, d, 4.0),
+                lin(h_v, d, 5.0),
+                vecw(d_v, &|i| 1.0 + 0.01 * (i % 5) as f32),
+                lin(d, value_dim, 6.0),
+                &cfg,
+            )
+        };
+        let (blk_cpu, blk_gpu) = (build(&cpu), build(&gpu));
+        let (mut s_c, mut c_c) = (RecurrentState::new(1), RecurrentState::new(1));
+        let (mut s_g, mut c_g) = (RecurrentState::new(1), RecurrentState::new(1));
+        let steps = 40;
+        let mut worst = 0f32;
+        for t in 0..steps {
+            let x = Tensor::from_vec(
+                (0..d)
+                    .map(|i| ((i as f32 * 0.05 + t as f32).sin()) * 0.6)
+                    .collect::<Vec<f32>>(),
+                (1, 1, d),
+                &cpu,
+            )
+            .unwrap();
+            let a = blk_cpu.decode(&x, 0, &mut s_c, &mut c_c).unwrap();
+            let b = blk_gpu
+                .decode(&x.to_device(&gpu).unwrap(), 0, &mut s_g, &mut c_g)
+                .unwrap();
+            let av: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
+            let bv: Vec<f32> = b
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let scale = av.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+            let diff = av
+                .iter()
+                .zip(&bv)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            worst = worst.max(diff / scale);
+            assert!(
+                diff <= 2e-4 * scale,
+                "step {t}: fused differs by {diff} at scale {scale}"
+            );
+        }
+        for (name, ca, cg) in [("S", &s_c, &s_g), ("conv", &c_c, &c_g)] {
+            let va: Vec<f32> = ca.get(0).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            let vg: Vec<f32> = cg
+                .get(0)
+                .unwrap()
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(va.len(), vg.len(), "{name}: shapes");
+            let sc = va.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+            let md = va
+                .iter()
+                .zip(&vg)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                md <= 2e-4 * sc,
+                "{name} state differs by {md} at scale {sc}"
+            );
+        }
+        // the fused arm ran: the slab is the same buffer step after step
+        assert!(
+            worst > 0.0 || steps == 0,
+            "identical to the bit is suspicious for a reordered sum"
+        );
+        println!("fused vs composed worst relative diff over {steps} steps: {worst:e}");
+    }
+
     /// The Metal chunk path matches the CPU chunk path on the real head
     /// geometry (16 k-heads → 48 v-heads, d 128, conv 10240 channels) at a
     /// small hidden size: same weights on both devices, 70 positions (past one
@@ -539,20 +756,26 @@ mod tests {
         let lin = |out: usize, inp: usize, seed: f32| {
             QMatMul::Tensor(
                 Tensor::from_vec(
-                    (0..out * inp).map(|i| ((i as f32 * 0.017 + seed).sin()) * 0.05).collect::<Vec<_>>(),
+                    (0..out * inp)
+                        .map(|i| ((i as f32 * 0.017 + seed).sin()) * 0.05)
+                        .collect::<Vec<_>>(),
                     (out, inp),
                     &gpu,
                 )
                 .unwrap(),
             )
         };
-        let vecw = |n: usize, f: &dyn Fn(usize) -> f32| Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, &gpu).unwrap();
+        let vecw = |n: usize, f: &dyn Fn(usize) -> f32| {
+            Tensor::from_vec((0..n).map(f).collect::<Vec<f32>>(), n, &gpu).unwrap()
+        };
         let blk = GatedDeltaNet::new(
             lin(conv_ch, d, 1.0),
             lin(value_dim, d, 2.0),
-            vecw(conv_ch * cfg.ssm_conv_kernel, &|i| ((i as f32 * 0.03).cos()) * 0.2)
-                .reshape((conv_ch, cfg.ssm_conv_kernel))
-                .unwrap(),
+            vecw(conv_ch * cfg.ssm_conv_kernel, &|i| {
+                ((i as f32 * 0.03).cos()) * 0.2
+            })
+            .reshape((conv_ch, cfg.ssm_conv_kernel))
+            .unwrap(),
             vecw(h_v, &|i| -0.5 - 0.01 * i as f32),
             vecw(h_v, &|i| 0.1 * (i % 7) as f32),
             lin(h_v, d, 4.0),
@@ -565,7 +788,9 @@ mod tests {
         let xs: Vec<Tensor> = (0..steps)
             .map(|t| {
                 Tensor::from_vec(
-                    (0..d).map(|i| ((i as f32 * 0.05 + t as f32).sin()) * 0.6).collect::<Vec<f32>>(),
+                    (0..d)
+                        .map(|i| ((i as f32 * 0.05 + t as f32).sin()) * 0.6)
+                        .collect::<Vec<f32>>(),
                     (1, 1, d),
                     &gpu,
                 )
@@ -591,8 +816,17 @@ mod tests {
         let b = run();
         for (t, (x, y)) in a.iter().zip(&b).enumerate() {
             assert!(x.iter().all(|v| v.is_finite()), "step {t}: non-finite");
-            let n_diff = x.iter().zip(y).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
-            assert_eq!(n_diff, 0, "step {t}: {n_diff} of {} values differ between two identical passes", x.len());
+            let n_diff = x
+                .iter()
+                .zip(y)
+                .filter(|(p, q)| p.to_bits() != q.to_bits())
+                .count();
+            assert_eq!(
+                n_diff,
+                0,
+                "step {t}: {n_diff} of {} values differ between two identical passes",
+                x.len()
+            );
         }
     }
 

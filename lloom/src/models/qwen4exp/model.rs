@@ -96,13 +96,36 @@ impl<R: ExpertResidency> Layer<R> {
         cache: &mut Cache,
         device_plan: bool,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+        self.decode_parts_rows(res_hc, l, &mut [cache], device_plan)
+    }
+
+    /// [`Self::decode_parts_planned`] over `B` rows: `res_hc [B, 1, n·d]`,
+    /// row `r` against `caches[r]`. The HC brackets and the MoE take the
+    /// rows as one (`m = B`); the mixer runs its state per row
+    /// (`GatedDeltaNet::decode_rows`, `QsaAttention::decode_rows`).
+    pub fn decode_parts_rows(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        caches: &mut [&mut Cache],
+        device_plan: bool,
+    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
         // HC prologue (attn bracket): collapse streams → mixer input.
-        let (cur, inject) = self.hc_attn.mix(res_hc)?; // cur [1,1,d]
+        let (cur, inject) = self.hc_attn.mix(res_hc)?; // cur [B,1,d]
         trace("attn.mix", l, &cur);
         trace("attn.inject", l, &inject);
         let mixed = match &self.mixer {
-            Mixer::Linear(dn) => dn.decode(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
-            Mixer::Full(qsa) => qsa.decode(&cur, &mut cache.kv[l])?,
+            Mixer::Linear(dn) => {
+                let mut states: Vec<(&mut RecurrentState, &mut RecurrentState)> = caches
+                    .iter_mut()
+                    .map(|c| (&mut c.s_state, &mut c.conv_state))
+                    .collect();
+                dn.decode_rows(&cur, l, &mut states)?
+            }
+            Mixer::Full(qsa) => {
+                let mut kvs: Vec<&mut KvCache> = caches.iter_mut().map(|c| &mut c.kv[l]).collect();
+                qsa.decode_rows(&cur, &mut kvs)?
+            }
         };
         trace("mixer", l, &mixed);
         // HC epilogue: scatter the mixer output back across the streams.
@@ -1030,6 +1053,167 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
 impl CacheReset for Cache {
     fn reset(&mut self) {
         Cache::reset(self)
+    }
+}
+
+impl<R: ExpertResidency> Qwen4Exp<R> {
+    /// One decode step for `B` independent sequences (`BatchedCausalLM::
+    /// forward_rows`): `tokens [B, 1]`, row `r` fed to `rows[r]` at its
+    /// position, → `[B, vocab]`. The weight-bearing ops run once over all
+    /// rows (the HC brackets' gemvs, the mixers' stems and out-projs, the
+    /// MoE's routed and shared experts, the head); the state runs per row
+    /// against that row's cache through the kernels a row of one sees
+    /// (`Layer::decode_parts_rows`), so a row computes what `forward` of
+    /// that token against that cache computes. The streamed tier's device
+    /// plan runs when every row is armed for it: a window per row, one
+    /// settle for all, and a miss in any row replays the whole step as the
+    /// host plan (`decode_embed`'s discipline over the rows).
+    pub fn forward_rows(
+        &self,
+        tokens: &Tensor,
+        rows: &mut [crate::nn::model::Row<'_, Cache>],
+    ) -> Result<Tensor> {
+        let (b, seq) = tokens.dims2()?;
+        if seq != 1 {
+            lloom_tensor::bail!(
+                "qwen4exp forward_rows: one token per row, got seq_len {seq}; prefill each \
+                 sequence through `forward`"
+            )
+        }
+        if b != rows.len() || b == 0 {
+            lloom_tensor::bail!(
+                "qwen4exp forward_rows: {b} token rows for {} caches",
+                rows.len()
+            )
+        }
+        for (r, row) in rows.iter().enumerate() {
+            if row.pos != row.cache.pos {
+                lloom_tensor::bail!(
+                    "qwen4exp forward_rows: row {r} at pos {} but its cache is at {}",
+                    row.pos,
+                    row.cache.pos
+                )
+            }
+            if row.cache.window_open() {
+                lloom_tensor::bail!("qwen4exp forward_rows: row {r} has an open speculative window")
+            }
+        }
+        // The ids, for the PLE's hash per row (one readback; the driver's
+        // note covers only the single-sequence path).
+        let ids: Vec<u32> = tokens.flatten_all()?.to_vec1::<u32>()?;
+        for (row, &id) in rows.iter_mut().zip(&ids) {
+            row.cache.set_pending_tokens(&[id]);
+        }
+        let h = self.embed(tokens)?; // [B, 1, hidden]
+        let mut caches: Vec<&mut Cache> = rows.iter_mut().map(|r| &mut *r.cache).collect();
+        let planned =
+            self.device_plan && plan_on_device() && caches.iter().all(|c| c.device_plan_armed);
+        if !planned {
+            let before = self.stream_misses();
+            let logits = self.decode_rows_pass(&h, &mut caches, false)?.0;
+            let clean = self.stream_misses() == before;
+            for c in caches.iter_mut() {
+                c.host_plan_passes += 1;
+                if clean {
+                    c.device_plan_armed = true;
+                }
+            }
+            return Ok(logits);
+        }
+        for c in caches.iter_mut() {
+            c.open_window()?;
+        }
+        let (logits, records) = self.decode_rows_pass(&h, &mut caches, true)?;
+        let mut redo = false;
+        for (l, rec) in &records {
+            if self.layers[*l].moe().experts().settle(rec)? {
+                redo = true;
+            }
+        }
+        if !redo {
+            for c in caches.iter_mut() {
+                c.resolve_window()?;
+            }
+            return Ok(logits);
+        }
+        for c in caches.iter_mut() {
+            c.rewind_window()?;
+            c.redos += 1;
+            c.device_plan_armed = false;
+        }
+        Ok(self.decode_rows_pass(&h, &mut caches, false)?.0)
+    }
+
+    /// The layer stack over `B` rows from their embeddings `h [B, 1,
+    /// hidden]` → logits `[B, vocab]` and the device plans' records.
+    fn decode_rows_pass(
+        &self,
+        h: &Tensor,
+        caches: &mut [&mut Cache],
+        device_plan: bool,
+    ) -> Result<(Tensor, Vec<(usize, Tensor)>)> {
+        let n = self.cfg.hc_count;
+        let d = self.cfg.hidden_size;
+        let b = h.dim(0)?;
+        let mut records: Vec<(usize, Tensor)> = Vec::new();
+        let mut res_hc = h
+            .reshape((b, 1, 1, d))?
+            .broadcast_as((b, 1, n, d))?
+            .reshape((b, 1, n * d))?
+            .contiguous()?;
+        for (l, layer) in self.layers.iter().enumerate() {
+            if let Some(ple) = &self.ple {
+                if ple.layer == l {
+                    // The PLE per row: each row's own token window and history.
+                    let mut deltas = Vec::with_capacity(b);
+                    for (r, cache) in caches.iter_mut().enumerate() {
+                        deltas.push(self.ple_delta(ple, &res_hc.narrow(0, r, 1)?, cache)?);
+                    }
+                    let delta = if b == 1 {
+                        deltas.pop().expect("one row")
+                    } else {
+                        Tensor::cat(&deltas, 0)?
+                    };
+                    res_hc = (res_hc + delta)?;
+                }
+            }
+            let (next, _, _, record) = layer.decode_parts_rows(&res_hc, l, caches, device_plan)?;
+            if let Some(r) = record {
+                records.push((l, r));
+            }
+            res_hc = next;
+        }
+        for (r, cache) in caches.iter_mut().enumerate() {
+            cache.keep_nextn(&res_hc.narrow(0, r, 1)?);
+            cache.pos += 1;
+        }
+        let (collapsed, _) = self.hc_head.mix(&res_hc)?; // [B, 1, d]
+        let logits = self.lm_head.forward(&collapsed)?; // [B, 1, vocab]
+        let logits = logits
+            .reshape((b, self.cfg.vocab_size))?
+            .to_dtype(lloom_tensor::DType::F32)?;
+        Ok((logits, records))
+    }
+}
+
+impl<R: ExpertResidency> crate::nn::model::BatchedCausalLM for Qwen4Exp<R> {
+    fn forward_rows(
+        &self,
+        tokens: &Tensor,
+        rows: &mut [crate::nn::model::Row<'_, Self::Cache>],
+    ) -> Result<Tensor> {
+        Qwen4Exp::forward_rows(self, tokens, rows)
+    }
+}
+
+/// No prefix sharing between rows yet: every row prefills its own prompt
+/// (the recurrent channels have no page to share by reference).
+impl crate::nn::model::CacheShare for Cache {
+    fn share_prefix_from(&mut self, _src: &Self, _n_tokens: usize) -> Result<usize> {
+        Ok(0)
+    }
+    fn share_granularity(&self) -> usize {
+        0
     }
 }
 

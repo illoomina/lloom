@@ -110,10 +110,18 @@ impl<R: ExpertResidency> MoeLayer<R> {
     }
 
     fn forward_inner(&self, x: &Tensor, device_plan: bool) -> Result<(Tensor, Option<Tensor>)> {
-        let (b, seq, hidden) = x.dims3()?;
+        let (b0, seq0, hidden) = x.dims3()?;
+        // The MoE is position-wise: `B` rows of one token are `B` positions
+        // of one sequence to it (the batched decode's `[B, 1, hidden]`).
+        let (b, seq) = if b0 > 1 && seq0 == 1 {
+            (1, b0)
+        } else {
+            (b0, seq0)
+        };
         if b != 1 {
             lloom_tensor::bail!("moe takes one sequence, got {:?}", x.shape())
         }
+        let x = &x.reshape((1, seq, hidden))?;
         let topk = self.n_experts_per_tok;
         let x1 = x.reshape((seq, hidden))?; // [seq, hidden]
 
@@ -211,7 +219,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
                 (routed + shared)?
             }
         };
-        Ok((out.reshape((1, seq, hidden))?, record))
+        Ok((out.reshape((b0, seq0, hidden))?, record))
     }
 }
 

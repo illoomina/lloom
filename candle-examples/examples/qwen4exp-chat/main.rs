@@ -142,6 +142,18 @@ struct Args {
     #[arg(long, default_value = "pread")]
     loader: String,
 
+    /// Decode `N` sequences of the prompt as one batch (`Session::
+    /// decode_batched` over `BatchedCausalLM::forward_rows`: one weight
+    /// sweep per step for all rows, the state per row) and report the
+    /// aggregate rate. 1 = the single-sequence loop.
+    #[arg(long, default_value_t = 1)]
+    rows: usize,
+
+    /// Run even `--rows 1` through the batched driver (the batched arm's
+    /// own baseline).
+    #[arg(long)]
+    batched_driver: bool,
+
     /// The expert hotlist file (`--experts stream`): read at load to warm
     /// every layer's pool before the first token (§20.3 R2; a missing file
     /// warms nothing), written at exit with this run's usage merged in.
@@ -406,16 +418,20 @@ fn main() -> Result<()> {
             let mut model: Qwen4Exp<Resident> =
                 Qwen4Exp::from_gguf_shards(&shards, &device, &opts)?;
             model.set_prefill_mode(prefill_mode);
-            gate(
-                &model,
-                &args,
-                &shards,
-                &device,
-                &tokenizer,
-                &prompt_ids,
-                &eos_ids,
-                t0,
-            )
+            if args.rows > 1 || args.batched_driver {
+                rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
+            } else {
+                gate(
+                    &model,
+                    &args,
+                    &shards,
+                    &device,
+                    &tokenizer,
+                    &prompt_ids,
+                    &eos_ids,
+                    t0,
+                )
+            }
         }
         "stream" => {
             let slots = match args.slots.as_str() {
@@ -445,16 +461,20 @@ fn main() -> Result<()> {
                     println!("WARM hotlist={} absent: a cold pool", path.display());
                 }
             }
-            let out = gate(
-                &model,
-                &args,
-                &shards,
-                &device,
-                &tokenizer,
-                &prompt_ids,
-                &eos_ids,
-                t0,
-            );
+            let out = if args.rows > 1 || args.batched_driver {
+                rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
+            } else {
+                gate(
+                    &model,
+                    &args,
+                    &shards,
+                    &device,
+                    &tokenizer,
+                    &prompt_ids,
+                    &eos_ids,
+                    t0,
+                )
+            };
             if let Some(path) = &args.hotlist {
                 use lloom::models::qwen4exp::hotlist::Hotlist;
                 let mut hot = if path.exists() {
@@ -478,6 +498,66 @@ fn main() -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `--rows N`: the prompt decoded `N` times at once through the batched
+/// driver; `ROWS` lines with the per-run aggregate rate.
+#[allow(clippy::too_many_arguments)]
+fn rows_gate<R: ExpertResidency + HasStreamStats>(
+    model: &Qwen4Exp<R>,
+    args: &Args,
+    device: &Device,
+    prompt_ids: &[u32],
+    eos_ids: &[u32],
+) -> Result<()> {
+    use lloom::generation::{LogitsProcessor, Sampling};
+    use lloom::nn::{DecodeOptions, Session};
+    let cfg = model.config();
+    for run in 0..args.runs {
+        let mut sessions: Vec<Session<'_, Qwen4Exp<R>>> = (0..args.rows)
+            .map(|_| Ok(Session::new(model, model.new_cache(cfg, device)?)))
+            .collect::<Result<_>>()?;
+        let prompts: Vec<&[u32]> = (0..args.rows).map(|_| prompt_ids).collect();
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let opts = DecodeOptions::new(args.max_tokens);
+        #[cfg(feature = "metal")]
+        candle::kernels::metal::profile::reset();
+        let t = std::time::Instant::now();
+        let outs = Session::decode_batched(
+            &mut sessions,
+            &mut sampler,
+            &prompts,
+            &opts,
+            eos_ids,
+            device,
+            &mut |_row, _toks| Ok(()),
+        )?;
+        let wall = t.elapsed();
+        let generated: usize = outs.iter().map(|o| o.ids.len()).sum();
+        // The whole run: the rows' prefills and the batched steps (per
+        // token = per generated token over all rows).
+        profile_line(run, "rows", generated, wall.as_secs_f64() * 1e3);
+        let digests: Vec<String> = outs
+            .iter()
+            .map(|o| {
+                let mut h = sha256::Sha256::new();
+                for id in &o.ids {
+                    h.update(&id.to_le_bytes());
+                }
+                sha256::hex(&h.finalize())[..8].to_string()
+            })
+            .collect();
+        println!(
+            "ROWS run={run} rows={} prompt_tokens={} generated={generated} wall_ms={} tok_s={:.2} per_row_tok_s={:.2} digests={:?}",
+            args.rows,
+            prompt_ids.len(),
+            wall.as_millis(),
+            generated as f64 / wall.as_secs_f64(),
+            generated as f64 / wall.as_secs_f64() / args.rows as f64,
+            digests
+        );
+    }
+    Ok(())
+}
+
 fn gate<R: ExpertResidency + HasStreamStats>(
     model: &Qwen4Exp<R>,
     args: &Args,

@@ -97,7 +97,8 @@ impl GatedDeltaNet {
     ///
     /// Composes, per `build_layer_attn_linear`: qkvz → gate(α,g,β) → conv →
     /// silu → split q/k/v → l2norm(q,k) → GQA tile → decode_step → write S →
-    /// gated-norm(·sigmoid(z)) → out-proj.
+    /// One decode step: `x [1, 1, hidden]` → `[1, 1, hidden]` against the
+    /// layer's `S` and conv channels — [`Self::decode_rows`] over one row.
     pub fn decode(
         &self,
         x: &Tensor,
@@ -105,9 +106,52 @@ impl GatedDeltaNet {
         s_state: &mut RecurrentState,
         conv_state: &mut RecurrentState,
     ) -> Result<Tensor> {
-        if let Some(out) = self.decode_fused(x, l, s_state, conv_state)? {
+        self.decode_rows(x, l, &mut [(s_state, conv_state)])
+    }
+
+    /// One decode step for `B` independent sequences at once: `x [B, 1,
+    /// hidden]`, row `r` against `states[r]` (its `S` and conv channels), →
+    /// `[B, 1, hidden]`. The weight-bearing ops (the stems, the out-proj) run
+    /// once over all rows (`m = B`); the state ops run per row against that
+    /// row's own slabs through the kernels a row of one sees, so a row
+    /// computes exactly what `decode` of that row computes (`docs/
+    /// batched-decode-design.md` §10.2). A single row IS `decode`.
+    pub fn decode_rows(
+        &self,
+        x: &Tensor,
+        l: usize,
+        states: &mut [(&mut RecurrentState, &mut RecurrentState)],
+    ) -> Result<Tensor> {
+        let (b, seq, _) = x.dims3()?;
+        if seq != 1 || b != states.len() || b == 0 {
+            lloom_tensor::bail!(
+                "deltanet decode_rows: x {:?} for {} rows (one token per row)",
+                x.shape(),
+                states.len()
+            )
+        }
+        if let Some(out) = self.decode_rows_fused(x, l, states)? {
             return Ok(out);
         }
+        let mut outs = Vec::with_capacity(b);
+        for (r, (s_state, conv_state)) in states.iter_mut().enumerate() {
+            outs.push(self.decode_composed(&x.narrow(0, r, 1)?, l, s_state, conv_state)?);
+        }
+        if b == 1 {
+            Ok(outs.pop().expect("one row"))
+        } else {
+            Tensor::cat(&outs, 0)
+        }
+    }
+
+    /// The composed decode of one row: the CPU path and the reference.
+    fn decode_composed(
+        &self,
+        x: &Tensor,
+        l: usize,
+        s_state: &mut RecurrentState,
+        conv_state: &mut RecurrentState,
+    ) -> Result<Tensor> {
         let dims = self.dims;
         let (d_k, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
 
@@ -169,107 +213,111 @@ impl GatedDeltaNet {
         self.ssm_out.forward(&gated)
     }
 
-    /// [`Self::decode`] as three launches between the projections (Metal,
-    /// f32, `d_k == d_v`; `kernels::{GdnPrologue, GdnStep, GdnGatedNorm}`):
-    /// the conv window and the `S` slab are written IN PLACE, so the state
-    /// channels see the buffers they already hold (`RecurrentState::write`
-    /// skips the copy). `None` where the composed path applies.
-    fn decode_fused(
+    /// [`Self::decode_rows`] as launches (Metal, f32, `d_k == d_v`): the stems
+    /// once over all rows, then per row `kernels::{GdnPrologue, GdnStep,
+    /// GdnGatedNorm}` against the row's slabs (the next window and `S`
+    /// written out of place into the channels' spares and swapped in — no
+    /// copy, and a speculative window's base stays intact), the gated rows
+    /// gathered, the out-proj once. `None` where the composed path applies.
+    fn decode_rows_fused(
         &self,
         x: &Tensor,
         l: usize,
-        s_state: &mut RecurrentState,
-        conv_state: &mut RecurrentState,
+        states: &mut [(&mut RecurrentState, &mut RecurrentState)],
     ) -> Result<Option<Tensor>> {
         use super::kernels::{fused_off, GdnGatedNorm, GdnPrologue, GdnStep};
         let dims = self.dims;
         let (d, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
+        let b = x.dim(0)?;
         if fused_off()
             || !x.device().is_metal()
             || x.dtype() != lloom_tensor::DType::F32
             || dims.d_v != d
-            || x.elem_count() != x.dim(D::Minus1)?
         {
             return Ok(None);
         }
         let dev = x.device();
         let f32 = lloom_tensor::DType::F32;
-        // The persistent buffers: allocate the zero state once (the first
-        // write takes an own-storage copy) so the kernels always have a slab
-        // to write in place.
-        if conv_state.get(l).is_none() {
-            conv_state.write(
-                l,
-                Tensor::zeros((self.conv_channels, self.conv_k), f32, dev)?,
-            )?;
-        }
-        if s_state.get(l).is_none() {
-            s_state.write(l, Tensor::zeros((d, d, h_v), f32, dev)?)?;
-        }
-        let win = conv_state.get(l).expect("written above").clone();
-        let slab = s_state.get(l).expect("written above").clone();
-        if win.dtype() != f32
-            || slab.dtype() != f32
-            || !win.is_contiguous()
-            || !slab.is_contiguous()
-        {
-            return Ok(None);
-        }
-        // The kernels write the next window and the next `S` OUT OF PLACE,
-        // into the channels' spares (the buffers the last step retired — no
-        // allocation in the steady state), and the spares are swapped in:
-        // the buffers read are never written, so a speculative window's base
-        // stays intact with no snapshot copy.
-        let win_out = conv_state.take_spare(l)?;
-        let slab_out = s_state.take_spare(l)?;
         let conv_w = if self.conv_weight.dtype() == f32 {
             self.conv_weight.clone()
         } else {
             self.conv_weight.to_dtype(f32)?
         };
-
-        // The projections: one gemv over the stacked f16 stems (the row
-        // split into `[conv_channels] | [value_dim] | [h_v] | [h_v]`) or the
-        // four (the quantized stems and the mixed-precision f16 arms).
-        let (qkv, z, alpha, beta) = self.decode_stems(x, h_v)?;
-        let heads = qkv.apply_op1_no_bwd(&GdnPrologue {
-            d,
-            h_k,
-            h_v,
-            kk: self.conv_k,
-            eps: self.norm_eps as f32,
-            q_scale: 1.0 / (d as f32).sqrt(),
-            conv_w,
-            win: win.clone(),
-            win_out: win_out.clone(),
-        })?; // [3, h_v, d]
-        let o = heads.apply_op3_no_bwd(
-            &alpha,
-            &beta,
-            &GdnStep {
-                d,
-                h_v,
-                dt_bias: self.ssm_dt.to_dtype(f32)?,
-                ssm_a: self.ssm_a.to_dtype(f32)?,
-                s: slab.clone(),
-                s_out: slab_out.clone(),
-            },
-        )?; // [h_v, d]
-        conv_state.swap_in(l, win_out)?;
-        s_state.swap_in(l, slab_out)?;
+        let dt_bias = self.ssm_dt.to_dtype(f32)?;
+        let ssm_a = self.ssm_a.to_dtype(f32)?;
         let gamma = self.ssm_norm.to_dtype(f32)?;
-        let gated = o.apply_op3_no_bwd(
-            &gamma,
-            &z,
-            &GdnGatedNorm {
+        // The projections once over all rows: `[B, C] | [B, value_dim] | [B, h_v] | [B, h_v]`.
+        let (qkv, z, alpha, beta) = self.decode_stems(x, h_v)?;
+        let mut gated_rows = Vec::with_capacity(b);
+        for (r, (s_state, conv_state)) in states.iter_mut().enumerate() {
+            // The persistent buffers: allocate the zero state once (the first
+            // write takes an own-storage copy) so the kernels always have a
+            // slab to read and a spare to write.
+            if conv_state.get(l).is_none() {
+                conv_state.write(
+                    l,
+                    Tensor::zeros((self.conv_channels, self.conv_k), f32, dev)?,
+                )?;
+            }
+            if s_state.get(l).is_none() {
+                s_state.write(l, Tensor::zeros((d, d, h_v), f32, dev)?)?;
+            }
+            let win = conv_state.get(l).expect("written above").clone();
+            let slab = s_state.get(l).expect("written above").clone();
+            if win.dtype() != f32
+                || slab.dtype() != f32
+                || !win.is_contiguous()
+                || !slab.is_contiguous()
+            {
+                return Ok(None);
+            }
+            let win_out = conv_state.take_spare(l)?;
+            let slab_out = s_state.take_spare(l)?;
+            let row = |t: &Tensor| -> Result<Tensor> { t.narrow(0, r, 1)?.flatten_all() };
+            let heads = row(&qkv)?.apply_op1_no_bwd(&GdnPrologue {
                 d,
+                h_k,
                 h_v,
+                kk: self.conv_k,
                 eps: self.norm_eps as f32,
-            },
-        )?; // [value_dim]
+                q_scale: 1.0 / (d as f32).sqrt(),
+                conv_w: conv_w.clone(),
+                win: win.clone(),
+                win_out: win_out.clone(),
+            })?; // [3, h_v, d]
+            let o = heads.apply_op3_no_bwd(
+                &row(&alpha)?,
+                &row(&beta)?,
+                &GdnStep {
+                    d,
+                    h_v,
+                    dt_bias: dt_bias.clone(),
+                    ssm_a: ssm_a.clone(),
+                    s: slab.clone(),
+                    s_out: slab_out.clone(),
+                },
+            )?; // [h_v, d]
+            conv_state.swap_in(l, win_out)?;
+            s_state.swap_in(l, slab_out)?;
+            let gated = o.apply_op3_no_bwd(
+                &gamma,
+                &row(&z)?,
+                &GdnGatedNorm {
+                    d,
+                    h_v,
+                    eps: self.norm_eps as f32,
+                },
+            )?; // [value_dim]
+            gated_rows.push(gated.reshape((1, self.value_dim))?);
+        }
+        let gated = if b == 1 {
+            gated_rows.pop().expect("one row")
+        } else {
+            Tensor::cat(&gated_rows, 0)?
+        }; // [B, value_dim]
         let out = self
             .ssm_out
-            .forward(&gated.reshape((1, 1, self.value_dim))?)?;
+            .forward(&gated.reshape((b, 1, self.value_dim))?)?;
         Ok(Some(out))
     }
 
@@ -553,30 +601,32 @@ impl GatedDeltaNet {
     /// (three when only the gate stems are).
     fn decode_stems(&self, x: &Tensor, h_v: usize) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
         let f32 = lloom_tensor::DType::F32;
+        let b = x.dim(0)?;
+        let rows = |t: Tensor, n: usize| -> Result<Tensor> { t.to_dtype(f32)?.reshape((b, n)) };
         if let Some(cat) = &self.stem_cat {
-            let all = cat.forward(x)?.to_dtype(f32)?.flatten_all()?;
             let (c, v) = (self.conv_channels, self.value_dim);
+            let all = rows(cat.forward(x)?, c + v + 2 * h_v)?;
             return Ok((
-                all.narrow(0, 0, c)?,
-                all.narrow(0, c, v)?,
-                all.narrow(0, c + v, h_v)?,
-                all.narrow(0, c + v + h_v, h_v)?,
+                all.narrow(1, 0, c)?.contiguous()?,
+                all.narrow(1, c, v)?.contiguous()?,
+                all.narrow(1, c + v, h_v)?.contiguous()?,
+                all.narrow(1, c + v + h_v, h_v)?.contiguous()?,
             ));
         }
         if let Some(ab) = &self.gate_stems_cat {
-            let ab = ab.forward(x)?.to_dtype(f32)?.flatten_all()?;
+            let ab = rows(ab.forward(x)?, 2 * h_v)?;
             return Ok((
-                self.wqkv.forward(x)?.flatten_all()?.to_dtype(f32)?,
-                self.wqkv_gate.forward(x)?.flatten_all()?.to_dtype(f32)?,
-                ab.narrow(0, 0, h_v)?,
-                ab.narrow(0, h_v, h_v)?,
+                rows(self.wqkv.forward(x)?, self.conv_channels)?,
+                rows(self.wqkv_gate.forward(x)?, self.value_dim)?,
+                ab.narrow(1, 0, h_v)?.contiguous()?,
+                ab.narrow(1, h_v, h_v)?.contiguous()?,
             ));
         }
         Ok((
-            self.wqkv.forward(x)?.flatten_all()?.to_dtype(f32)?,
-            self.wqkv_gate.forward(x)?.flatten_all()?.to_dtype(f32)?,
-            self.ssm_alpha.forward(x)?.flatten_all()?.to_dtype(f32)?,
-            self.ssm_beta.forward(x)?.flatten_all()?.to_dtype(f32)?,
+            rows(self.wqkv.forward(x)?, self.conv_channels)?,
+            rows(self.wqkv_gate.forward(x)?, self.value_dim)?,
+            rows(self.ssm_alpha.forward(x)?, h_v)?,
+            rows(self.ssm_beta.forward(x)?, h_v)?,
         ))
     }
 

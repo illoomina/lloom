@@ -428,9 +428,40 @@ impl QsaAttention {
     /// One decode step: `x [1, 1, hidden]` in, `[1, 1, hidden]` out, appending to
     /// this layer's `kv`. Dense QK-norm GQA attention (= QSA for ctx ≤ budget).
     pub fn decode(&self, x: &Tensor, kv: &mut KvCache) -> Result<Tensor> {
-        if let Some(out) = self.decode_fused(x, kv)? {
+        self.decode_rows(x, &mut [kv])
+    }
+
+    /// One decode step for `B` independent sequences at once: `x [B, 1,
+    /// hidden]`, row `r` against `kvs[r]` (its own KV cache and position), →
+    /// `[B, 1, hidden]`. The projections and the out-proj run once over all
+    /// rows (`m = B`); the norms, the rope, the append and the attention run
+    /// per row against that row's cache through the kernels a row of one
+    /// sees, so a row computes exactly what `decode` of that row computes.
+    pub fn decode_rows(&self, x: &Tensor, kvs: &mut [&mut KvCache]) -> Result<Tensor> {
+        let (b, seq, _) = x.dims3()?;
+        if seq != 1 || b != kvs.len() || b == 0 {
+            lloom_tensor::bail!(
+                "qsa decode_rows: x {:?} for {} rows (one token per row)",
+                x.shape(),
+                kvs.len()
+            )
+        }
+        if let Some(out) = self.decode_rows_fused(x, kvs)? {
             return Ok(out);
         }
+        let mut outs = Vec::with_capacity(b);
+        for (r, kv) in kvs.iter_mut().enumerate() {
+            outs.push(self.decode_composed(&x.narrow(0, r, 1)?, kv)?);
+        }
+        if b == 1 {
+            Ok(outs.pop().expect("one row"))
+        } else {
+            Tensor::cat(&outs, 0)
+        }
+    }
+
+    /// The composed decode of one row: the CPU path and the reference.
+    fn decode_composed(&self, x: &Tensor, kv: &mut KvCache) -> Result<Tensor> {
         let hidden = x.dim(D::Minus1)?;
         let dev = x.device();
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
@@ -505,94 +536,109 @@ impl QsaAttention {
         self.wo.forward(&gated)?.reshape((1, 1, hidden))
     }
 
-    /// [`Self::decode`] as launches: the projections, `kernels::QsaPrep` (the
+    /// [`Self::decode_rows`] as launches: the projections once over all rows, then per row `kernels::QsaPrep` (the
     /// q/gate split, both norms, the partial rope at `pos` — the angle on the
     /// device, no per-token cos/sin upload), the KV append, `ops::sdpa`'s
     /// vector kernel over the cache as it lies (GQA in the kernel, no head
     /// expansion), `kernels::SigmoidMul` for the output gate, the out-proj.
     /// Metal, f32; `None` where the composed path applies.
-    fn decode_fused(&self, x: &Tensor, kv: &mut KvCache) -> Result<Option<Tensor>> {
+    fn decode_rows_fused(&self, x: &Tensor, kvs: &mut [&mut KvCache]) -> Result<Option<Tensor>> {
         use super::kernels::{fused_off, sigmoid_mul, QsaPrep};
-        let hidden = x.dim(D::Minus1)?;
+        let (b, _, hidden) = x.dims3()?;
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
         if fused_off()
             || !x.device().is_metal()
             || x.dtype() != lloom_tensor::DType::F32
-            || x.elem_count() != hidden
             || !matches!(hd, 32 | 64 | 72 | 80 | 96 | 128 | 256 | 512)
             || nh % nkv != 0
         {
             return Ok(None);
         }
         let f32 = lloom_tensor::DType::F32;
-        let x1 = x.reshape((1, hidden))?;
-        // One gemv over the stacked stems (the row split `q | k | v`) or three.
-        let (qg, k, v) = match &self.stem_cat {
+        let xb = x.reshape((b, hidden))?;
+        let (nq, nk) = (nh * 2 * hd, nkv * hd);
+        // The projections once over all rows (one gemv over the stacked stems
+        // when they are stacked): `[B, nq] | [B, nk] | [B, nk]`.
+        let (qg_all, k_all_rows, v_all_rows) = match &self.stem_cat {
             Some(cat) => {
-                let all = cat.forward(&x1)?.to_dtype(f32)?.flatten_all()?;
-                let (nq, nk) = (nh * 2 * hd, nkv * hd);
+                let all = cat.forward(&xb)?.to_dtype(f32)?.reshape((b, nq + 2 * nk))?;
                 (
-                    all.narrow(0, 0, nq)?.reshape((nh, 2 * hd))?,
-                    all.narrow(0, nq, nk)?.reshape((nkv, hd))?,
-                    all.narrow(0, nq + nk, nk)?.reshape((nkv, 1, hd))?,
+                    all.narrow(1, 0, nq)?.contiguous()?,
+                    all.narrow(1, nq, nk)?.contiguous()?,
+                    all.narrow(1, nq + nk, nk)?.contiguous()?,
                 )
             }
             None => (
-                self.wq.forward(&x1)?.to_dtype(f32)?.reshape((nh, 2 * hd))?,
-                self.wk.forward(&x1)?.to_dtype(f32)?.reshape((nkv, hd))?,
-                self.wv.forward(&x1)?.to_dtype(f32)?.reshape((nkv, 1, hd))?,
+                self.wq.forward(&xb)?.to_dtype(f32)?.reshape((b, nq))?,
+                self.wk.forward(&xb)?.to_dtype(f32)?.reshape((b, nk))?,
+                self.wv.forward(&xb)?.to_dtype(f32)?.reshape((b, nk))?,
             ),
         };
-        let pos = kv.len();
-        let prep = qg.apply_op2_no_bwd(
-            &k,
-            &QsaPrep {
-                hd,
-                n_rot: self.n_rot,
-                nh,
-                nkv,
-                pos,
-                theta: self.rope_theta as f32,
-                eps: self.q_norm.eps() as f32,
-                q_gamma: self.q_norm.weight().to_dtype(f32)?,
-                k_gamma: self.k_norm.weight().to_dtype(f32)?,
-            },
-        )?; // [2nh + nkv, hd]
-        let q = prep.narrow(0, 0, nh)?; // [nh, hd]
-        let gate = prep.narrow(0, nh, nh)?; // [nh, hd]
-        let k_step = prep.narrow(0, 2 * nh, nkv)?.reshape((nkv, 1, hd))?;
-        let (k_all, v_all) = kv.append(&k_step, &v)?; // [nkv, seq, hd] slab views
-        let sel = match &self.indexer {
-            Some(ix) => {
-                ix.observe(&x1, kv)?;
-                ix.select(&x1, pos, kv)?
-            }
-            None => None,
-        };
-        if let Some(sel) = &sel {
-            check_sel(sel, pos, kv)?;
-        }
-        let (k_all, v_all) = match &sel {
-            Some(sel) => kv.gather(sel)?,
-            None => (k_all, v_all),
-        };
+        let q_gamma = self.q_norm.weight().to_dtype(f32)?;
+        let k_gamma = self.k_norm.weight().to_dtype(f32)?;
         let scale = 1.0 / (hd as f64).sqrt();
-        let ctx = ops::sdpa(
-            &q.reshape((1, nh, 1, hd))?,
-            &k_all.unsqueeze(0)?,
-            &v_all.unsqueeze(0)?,
-            None,
-            false,
-            scale as f32,
-            1.0, // no softcapping (the kernel divides by it)
-        )?; // [1, nh, 1, hd]
-        let ctx = ctx.reshape((1, nh * hd))?;
-        let gate = gate.reshape((1, nh * hd))?;
-        let gated = match sigmoid_mul(&gate, &ctx) {
-            Some(g) => g?,
-            None => (ctx * ops::sigmoid(&gate)?)?,
-        };
-        Ok(Some(self.wo.forward(&gated)?.reshape((1, 1, hidden))?))
+        let mut gated_rows = Vec::with_capacity(b);
+        for (r, kv) in kvs.iter_mut().enumerate() {
+            let x1 = xb.narrow(0, r, 1)?; // [1, hidden]
+            let qg = qg_all.narrow(0, r, 1)?.reshape((nh, 2 * hd))?;
+            let k = k_all_rows.narrow(0, r, 1)?.reshape((nkv, hd))?;
+            let v = v_all_rows.narrow(0, r, 1)?.reshape((nkv, 1, hd))?;
+            let pos = kv.len();
+            let prep = qg.apply_op2_no_bwd(
+                &k,
+                &QsaPrep {
+                    hd,
+                    n_rot: self.n_rot,
+                    nh,
+                    nkv,
+                    pos,
+                    theta: self.rope_theta as f32,
+                    eps: self.q_norm.eps() as f32,
+                    q_gamma: q_gamma.clone(),
+                    k_gamma: k_gamma.clone(),
+                },
+            )?; // [2nh + nkv, hd]
+            let q = prep.narrow(0, 0, nh)?; // [nh, hd]
+            let gate = prep.narrow(0, nh, nh)?; // [nh, hd]
+            let k_step = prep.narrow(0, 2 * nh, nkv)?.reshape((nkv, 1, hd))?;
+            let (k_all, v_all) = kv.append(&k_step, &v)?; // [nkv, seq, hd] slab views
+            let sel = match &self.indexer {
+                Some(ix) => {
+                    ix.observe(&x1, kv)?;
+                    ix.select(&x1, pos, kv)?
+                }
+                None => None,
+            };
+            if let Some(sel) = &sel {
+                check_sel(sel, pos, kv)?;
+            }
+            let (k_all, v_all) = match &sel {
+                Some(sel) => kv.gather(sel)?,
+                None => (k_all, v_all),
+            };
+            let ctx = ops::sdpa(
+                &q.reshape((1, nh, 1, hd))?,
+                &k_all.unsqueeze(0)?,
+                &v_all.unsqueeze(0)?,
+                None,
+                false,
+                scale as f32,
+                1.0, // no softcapping (the kernel divides by it)
+            )?; // [1, nh, 1, hd]
+            let ctx = ctx.reshape((1, nh * hd))?;
+            let gate = gate.reshape((1, nh * hd))?;
+            let gated = match sigmoid_mul(&gate, &ctx) {
+                Some(g) => g?,
+                None => (ctx * ops::sigmoid(&gate)?)?,
+            };
+            gated_rows.push(gated);
+        }
+        let gated = if b == 1 {
+            gated_rows.pop().expect("one row")
+        } else {
+            Tensor::cat(&gated_rows, 0)?
+        }; // [B, nh·hd]
+        Ok(Some(self.wo.forward(&gated)?.reshape((b, 1, hidden))?))
     }
 
     /// A whole chunk `x [1, seq, hidden]` → `[1, seq, hidden]`: the same dense

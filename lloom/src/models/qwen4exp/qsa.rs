@@ -660,15 +660,13 @@ impl QsaAttention {
     /// [`Self::prefill`] as launches: the projections, `kernels::QsaPrepRows`
     /// (the q/gate split, both norms, the rope at each position, the head-first
     /// layouts the attention kernel and the cache take — no transposes), the KV
-    /// append, the scores as one batched gemm per kv head over the cache as it
-    /// lies (no head expansion, no transposed copy), `kernels::QsaCausalSoftmax`
-    /// (the causal window against the cached prefix and the scale, in the
-    /// kernel — no mask upload), the values, `kernels::SigmoidMul`, the
-    /// out-proj. Metal, f32; `None` where the composed path applies. (The
-    /// steel full-attention kernel has no f32 arm at head 256 — its pipeline
-    /// does not build — so the attention stays two gemms and a softmax.)
+    /// append, `ops::sdpa`'s steel full-attention kernel over the cache as it
+    /// lies (GQA and the causal window against the cached prefix in the
+    /// kernel — no mask upload, no head expansion; the f32 arm at head 256
+    /// on the reduced 8×8 tile), `kernels::SigmoidMul`, the out-proj. Metal,
+    /// f32; `None` where the composed path applies.
     fn prefill_fused(&self, x: &Tensor, kv: &mut KvCache) -> Result<Option<Tensor>> {
-        use super::kernels::{fused_off, sigmoid_mul, QsaCausalSoftmax, QsaPrepRows};
+        use super::kernels::{fused_off, sigmoid_mul, QsaPrepRows};
         let (_, seq, hidden) = x.dims3()?;
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
         if fused_off()
@@ -734,21 +732,20 @@ impl QsaAttention {
             }
             ix.observe(&x2, kv)?;
         }
-        // The scores per kv head over its `rep` query heads at once (the
-        // heads of one kv head are adjacent in `q_h`, so the grouping is a
-        // view), against the cache as it lies (the gemm takes the transposed
-        // stride); the causal softmax with the scale folded in; the values.
-        let rep = nh / nkv;
+        // The steel full-attention kernel over the cache as it lies: GQA and
+        // the causal window against the cached prefix in the kernel (query
+        // t at position past + t sees keys ≤ past + t: the kernel's window
+        // is offset by kv_len − seq), no mask tensor, no head expansion.
         let scale = 1.0 / (hd as f64).sqrt();
-        let q_g = q_h.reshape((nkv, rep * seq, hd))?;
-        let scores = q_g.matmul(&k_all.transpose(1, 2)?)?; // [nkv, rep·seq, kv_len]
-        let probs = scores.apply_op1_no_bwd(&QsaCausalSoftmax {
-            seq,
-            kv_len,
-            past,
-            scale: scale as f32,
-        })?;
-        let ctx = probs.matmul(&v_all)?; // [nkv, rep·seq, hd]
+        let ctx = ops::sdpa(
+            &q_h,
+            &k_all.unsqueeze(0)?,
+            &v_all.unsqueeze(0)?,
+            None,
+            true,
+            scale as f32,
+            1.0,
+        )?; // [1, nh, seq, hd]
         let ctx = ctx
             .reshape((nh, seq, hd))?
             .transpose(0, 1)?

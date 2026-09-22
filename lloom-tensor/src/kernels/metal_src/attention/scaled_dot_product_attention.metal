@@ -3081,6 +3081,11 @@ instantiate_attn(float16,  half,        8, 8, 512, 1, 1, float16,  half)
 instantiate_attn(float16,  half,        8, 8, 512, 1, 1, bool_,    bool)
 instantiate_attn(bfloat16, bfloat16_t,  8, 8, 512, 1, 1, bfloat16, bfloat16_t)
 instantiate_attn(bfloat16, bfloat16_t,  8, 8, 512, 1, 1, bool_,    bool)
+// BD=256 at f32: the 32x16 tile's Q block alone is 32KB (32 x 256 x 4), so the
+// pipeline does not build; the reduced tile (BQ=8, BK=8: 8 KB per operand)
+// fits, as it does at 512 for f16.
+instantiate_attn(float32,  float,       8, 8, 256, 1, 1, float32,  float)
+instantiate_attn(float32,  float,       8, 8, 256, 1, 1, bool_,    bool)
 
 // ---------------------------------------------------------------------------
 // The layout check (issue #103).

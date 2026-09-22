@@ -757,45 +757,29 @@ pub fn call_qsa_prep_rows(
     Ok(())
 }
 
-/// `qsa_causal_softmax_f32`: `scores [rows, kv_len]` → the causal softmax
-/// (see the kernel).
+/// `moe_slot_map_u32`: expert ids through the residency table → the flat
+/// `[3·n]` plan (slot ids | ids | miss flags).
 #[allow(clippy::too_many_arguments)]
-pub fn call_qsa_causal_softmax(
+pub fn call_moe_slot_map(
     device: &Device,
     ep: impl EncoderProvider,
     kernels: &Kernels,
-    rows: usize,
-    seq: usize,
-    kv_len: usize,
-    past: usize,
-    scale: f32,
-    scores: BufferOffset,
+    n: usize,
+    n_experts: usize,
+    ids: BufferOffset,
+    table: BufferOffset,
     out: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "qsa_causal_softmax_f32")?;
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "moe_slot_map_u32")?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
-    debug_group!(
-        encoder,
-        "qsa_causal_softmax rows={rows} kv_len={kv_len} past={past}"
-    );
+    debug_group!(encoder, "moe_slot_map n={n}");
     set_params!(
         encoder,
-        (
-            &scores,
-            Output::new(out),
-            seq as u32,
-            kv_len as u32,
-            past as u32,
-            scale
-        )
+        (&ids, &table, Output::new(out), n as u32, n_experts as u32)
     );
-    let width = kv_len
-        .max(32)
-        .next_power_of_two()
-        .min(1024)
-        .min(pipeline.max_total_threads_per_threadgroup());
-    dispatch_groups(encoder, rows, width);
+    let width = 64usize.min(pipeline.max_total_threads_per_threadgroup());
+    dispatch_groups(encoder, n.div_ceil(width), width);
     Ok(())
 }

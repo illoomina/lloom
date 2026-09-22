@@ -832,48 +832,24 @@ kernel void qsa_prep_rows_f32(
   }
 }
 
-// The causal softmax over a chunk's scores `[rows, kv_len]` (rows ordered
-// `(kv head, rep, t)`, so row `r` is query `t = r % seq` at position
-// `past + t`): `softmax(scale · s[j])` over the keys `j ≤ past + t`, zero
-// beyond. One threadgroup per row.
-kernel void qsa_causal_softmax_f32(
-    const device float* scores [[buffer(0)]],
-    device float* out [[buffer(1)]],
-    constant uint& seq [[buffer(2)]],
-    constant uint& kv_len [[buffer(3)]],
-    constant uint& past [[buffer(4)]],
-    constant float& scale [[buffer(5)]],
-    uint row [[threadgroup_position_in_grid]],
-    uint i [[thread_position_in_threadgroup]],
-    uint width [[threads_per_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_id [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float partial[32];
-  const uint t = row % seq;
-  const uint limit = metal::min(past + t + 1, kv_len);
-  const device float* s = scores + (size_t)row * kv_len;
-  device float* o = out + (size_t)row * kv_len;
-  const uint n_simd = (width + 31) / 32;
-  float m = -INFINITY;
-  for (uint j = i; j < limit; j += width) m = metal::max(m, s[j] * scale);
-  m = simd_max(m);
-  if (simd_lane == 0) partial[simd_id] = m;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float mx = -INFINITY;
-  for (uint k = 0; k < n_simd; k++) mx = metal::max(mx, partial[k]);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float sum = 0.0f;
-  for (uint j = i; j < limit; j += width) {
-    const float e = metal::exp(s[j] * scale - mx);
-    o[j] = e;
-    sum += e;
-  }
-  sum = simd_sum(sum);
-  if (simd_lane == 0) partial[simd_id] = sum;
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  float total = 0.0f;
-  for (uint k = 0; k < n_simd; k++) total += partial[k];
-  const float inv = 1.0f / total;
-  for (uint j = i; j < limit; j += width) o[j] *= inv;
-  for (uint j = limit + i; j < kv_len; j += width) o[j] = 0.0f;
+// ---- The streamed expert tier's device-side plan (`nn::expert_stream`) ---------
+
+// `ids [n]` (expert ids) through `table [n_experts]` (the slot holding each
+// expert, `0xFFFFFFFF` = not resident) → flat `[3·n]`: the slot ids the routed
+// kernel reads (a miss reads slot 0 — a valid slot, the token is replayed
+// after the host loads it) | the ids themselves | a miss flag per id.
+kernel void moe_slot_map_u32(
+    const device uint* ids [[buffer(0)]],
+    const device uint* table [[buffer(1)]],
+    device uint* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& n_experts [[buffer(4)]],
+    uint i [[thread_position_in_grid]]) {
+  if (i >= n) return;
+  const uint e = ids[i];
+  const uint s = e < n_experts ? table[e] : 0xFFFFFFFFu;
+  const bool miss = s == 0xFFFFFFFFu;
+  out[i] = miss ? 0u : s;
+  out[n + i] = e;
+  out[2 * n + i] = miss ? 1u : 0u;
 }

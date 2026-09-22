@@ -53,6 +53,9 @@ pub fn sdpa_full_tile(
             });
         }
         Ok((8, 8, 1, 1))
+    } else if head_dim == 256 && itype == SdpaDType::F32 {
+        // The 32x16 tile's f32 Q block alone is 32KB: the reduced tile.
+        Ok((8, 8, 1, 1))
     } else {
         let bk = if head_dim < 128 { 32 } else { 16 };
         Ok((32, bk, 4, 1))

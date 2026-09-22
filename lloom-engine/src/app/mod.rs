@@ -1,0 +1,310 @@
+//! `lloom` — the one binary over every served family: `serve` (the OpenAI
+//! endpoint + the pipette sidecar contract, the former `lloom-serve`) and
+//! `chat` (a streaming REPL on the same engine). The model is named once
+//! ([`ModelArgs`]) and its family is read from the path: a safetensors
+//! checkpoint directory is LFM2 (`lfm2.rs`, every arm the serving binary
+//! had), a GGUF is Qwen4-exp (`qwen4exp.rs`). `lloom-serve` stays as a
+//! binary name for the pipette runner and is `lloom serve` verbatim.
+
+pub mod chat;
+pub mod common;
+pub mod lfm2;
+pub mod qwen4exp;
+pub mod serve;
+pub mod served;
+
+use anyhow::{Context, Result};
+use clap::{Args, Parser, Subcommand};
+use served::Served;
+use std::path::{Path, PathBuf};
+
+/// Which model, and the family's own knobs. Shared by `serve` and `chat`.
+#[derive(Args, Clone, Debug)]
+pub struct ModelArgs {
+    /// The model: an LFM2 checkpoint directory (config.json, tokenizer.json,
+    /// *.safetensors, chat_template.jinja) or a Qwen4-exp GGUF (the first
+    /// shard, `-00001-of-0000N`; its siblings are found beside it, or a
+    /// directory holding them). Defaults to LFM2_MODEL_DIR, then the
+    /// LFM2.5-2.6B snapshot in the HF cache.
+    #[arg(long, alias = "model-dir")]
+    pub model: Option<PathBuf>,
+
+    /// The `model` id reported by `/v1/models` and accepted by requests.
+    /// Defaults to the checkpoint's Hub id when it is a HF-cache snapshot.
+    #[arg(long)]
+    pub model_name: Option<String>,
+
+    /// KV positions per request (prompt + generation). A request past it is
+    /// refused rather than reallocated. The standard pipette ladder tops out at
+    /// 8192 + 256.
+    #[arg(long, default_value_t = 8704)]
+    pub kv_capacity: usize,
+
+    /// Skip the pipeline warmup at load (the first prompt then compiles the
+    /// prefill pipelines inside its own TTFT).
+    #[arg(long)]
+    pub no_warmup: bool,
+
+    /// Force the CPU device.
+    #[arg(long)]
+    pub cpu: bool,
+
+    /// The TILE: the most prompt tokens one prefill forward takes (lloom
+    /// #728). Default 512 — the bound on a prefill's activation working set,
+    /// which otherwise grows with the prompt (~3.5 MB per token on the crown:
+    /// a 32k-token one-shot prefill is what panicked this machine, #148).
+    /// `0` is one forward over the whole prompt, admitted only if the memory
+    /// budget allows the KV ceiling's worth of activations.
+    #[arg(long)]
+    pub prefill_tile: Option<usize>,
+
+    /// The fraction of Metal's `recommendedMaxWorkingSetSize` this process
+    /// may claim: LFM2's `MemoryBudget` admission (§9.5d — the KV ceiling's
+    /// cache, the tile's activations and the weights predicted at load and
+    /// refused if they do not fit; a KV grow past it refused at the grow) and
+    /// the streamed expert tier's slot budget on Qwen4-exp (`--slots auto`).
+    /// `0` turns LFM2's admission off — the unguarded arm.
+    #[arg(long, default_value_t = 0.65)]
+    pub memory_fraction: f64,
+
+    /// LFM2: serve the speculative body (DSpark: a drafter proposes a block
+    /// per round, the target verifies it in one pass). Loads the newest
+    /// LFM2.5-2.6B-DSpark snapshot in the HF cache, or `--draft-dir`.
+    #[arg(long)]
+    pub dspark: bool,
+
+    /// LFM2: the drafter checkpoint directory for `--dspark`.
+    #[arg(long)]
+    pub draft_dir: Option<PathBuf>,
+
+    /// LFM2, under `--dspark`: propose this many positions per round instead
+    /// of the drafter's block width (9), clamped to it. The verify window is
+    /// `K + 1` positions per row; at wide batches a shorter window costs
+    /// less per row for nearly the same accepted prefix (lloom #148).
+    #[arg(long)]
+    pub dspark_k: Option<usize>,
+
+    /// Qwen4-exp: tokenizer.json (with chat_template.jinja beside it).
+    /// Default: the HF cache's Qwen/Qwen3.8-Flash-Next snapshot.
+    #[arg(long)]
+    pub tokenizer: Option<PathBuf>,
+
+    /// Qwen4-exp: how the routed experts are held — `stream` (a slot pool
+    /// per layer filled from the checkpoint on demand, the tier that fits
+    /// this machine; `expert-streaming.md` §20) or `resident` (every expert
+    /// in memory).
+    #[arg(long, default_value = "stream")]
+    pub experts: String,
+
+    /// Qwen4-exp, `--experts stream`: streamed experts per layer per
+    /// projection — a count, or `auto` (sized from the device's working set
+    /// at `--memory-fraction`).
+    #[arg(long, default_value = "auto")]
+    pub slots: String,
+
+    /// Qwen4-exp, `--experts stream`: the loader primitive, `pread` (read +
+    /// compute-encoder copy) or `io` (`MTLIOCommandQueue`).
+    #[arg(long, default_value = "pread")]
+    pub loader: String,
+
+    /// Qwen4-exp: rows of the N-gram PLE hot-row cache (0 = read the memory
+    /// map every gather).
+    #[arg(long, default_value_t = 0)]
+    pub ple_cache_rows: usize,
+
+    /// Qwen4-exp: load without the N-gram PLE (a measurement arm; the
+    /// digests belong to the PLE-on model).
+    #[arg(long)]
+    pub no_ple: bool,
+
+    /// Qwen4-exp: the routed experts' activation dtype, `f32` (the
+    /// byte-identical routed arm) or `f16`.
+    #[arg(long, default_value = "f32")]
+    pub moe_act: String,
+
+    /// Qwen4-exp: the GGUF carrying the MTP head (`blk.{n_layers}.*` +
+    /// `nextn.*`, the sidecar `qwen4exp-mtp-quantize write` produces).
+    /// Requests then decode through the speculative body: the head drafts
+    /// one token per round, the target verifies — byte-identical to greedy.
+    #[arg(long)]
+    pub mtp: Option<PathBuf>,
+}
+
+/// The serving shape the family builds for: `serve`'s width and cells, or
+/// `chat`'s one sequence with prefix reuse.
+pub struct Shape {
+    pub readback: crate::ReadbackArm,
+    pub reuse_prefix: bool,
+    pub seed_text: String,
+    pub batch: usize,
+    pub prefill_chunk: usize,
+    pub mem_sample: bool,
+    pub rows: String,
+    pub share_prefix: bool,
+}
+
+/// What `--model` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Family {
+    /// A safetensors checkpoint directory.
+    Lfm2(PathBuf),
+    /// A GGUF's first shard.
+    Qwen4Exp(PathBuf),
+}
+
+/// The family from the path: a `.gguf` file, or a directory holding GGUF
+/// shards, is Qwen4-exp; a directory with a `config.json` is LFM2 (its
+/// `model_type` is checked at load). No path: LFM2's default snapshot.
+pub fn detect_family(model: Option<&Path>) -> Result<Family> {
+    let path = match model {
+        Some(p) => p.to_path_buf(),
+        None => lfm2::default_model_dir()
+            .context("no --model given and the LFM2.5-2.6B snapshot was not in the HF cache")?,
+    };
+    if path.is_file() {
+        if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+            return Ok(Family::Qwen4Exp(path));
+        }
+        anyhow::bail!(
+            "{}: a model is a checkpoint directory (LFM2) or a GGUF shard (Qwen4-exp)",
+            path.display()
+        );
+    }
+    if !path.is_dir() {
+        anyhow::bail!("{}: no such model", path.display());
+    }
+    if path.join("config.json").is_file() {
+        return Ok(Family::Lfm2(path));
+    }
+    let mut ggufs: Vec<PathBuf> = std::fs::read_dir(&path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
+        .collect();
+    ggufs.sort();
+    // The first shard of a sharded checkpoint, else the only file.
+    if let Some(first) = ggufs
+        .iter()
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains("-00001-of-"))
+                .unwrap_or(false)
+        })
+        .or_else(|| (ggufs.len() == 1).then(|| &ggufs[0]))
+    {
+        return Ok(Family::Qwen4Exp(first.clone()));
+    }
+    anyhow::bail!(
+        "{}: neither a checkpoint directory (config.json) nor a GGUF shard directory",
+        path.display()
+    )
+}
+
+/// Load the engine `args` names for `shape`. Returns it with the path it
+/// was loaded from.
+pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+    let family = detect_family(model.model.as_deref())?;
+    let prefill_tile = model.prefill_tile.unwrap_or(512);
+    match family {
+        Family::Lfm2(dir) => {
+            let batched = shape.batch > 1;
+            let rows = lfm2::RowsArm::parse(&shape.rows, batched)?;
+            if model.mtp.is_some() {
+                anyhow::bail!("--mtp is Qwen4-exp's; an LFM2 checkpoint has no MTP head");
+            }
+            let engine = lfm2::Engine::load(lfm2::LoadOptions {
+                model_dir: dir.clone(),
+                cpu: model.cpu,
+                kv_capacity: model.kv_capacity,
+                readback: shape.readback,
+                reuse_prefix: shape.reuse_prefix,
+                warmup: !model.no_warmup,
+                seed_text: shape.seed_text,
+                model_name: model.model_name.clone(),
+                batch: shape.batch,
+                dspark: model
+                    .dspark
+                    .then(|| model.draft_dir.clone().unwrap_or_default()),
+                prefill_tile,
+                prefill_chunk: shape.prefill_chunk,
+                memory_fraction: model.memory_fraction,
+                mem_sample: shape.mem_sample,
+                rows,
+                share_prefix: shape.share_prefix,
+                dspark_k: model.dspark_k,
+            })?;
+            Ok((Box::new(engine), dir))
+        }
+        Family::Qwen4Exp(first) => {
+            if shape.batch > 1 {
+                anyhow::bail!(
+                    "--batch {} on Qwen4-exp: the batched forward is not built for it yet (its MoE \
+                     takes one sequence); serve it at --batch 1",
+                    shape.batch
+                );
+            }
+            if model.dspark {
+                anyhow::bail!("--dspark is LFM2's drafter; Qwen4-exp speculates with --mtp");
+            }
+            let engine = qwen4exp::Engine::load(qwen4exp::LoadOptions {
+                first_shard: first.clone(),
+                tokenizer: model.tokenizer.clone(),
+                cpu: model.cpu,
+                kv_capacity: model.kv_capacity,
+                readback: shape.readback,
+                reuse_prefix: shape.reuse_prefix,
+                warmup: !model.no_warmup,
+                seed_text: shape.seed_text,
+                model_name: model.model_name.clone(),
+                prefill_tile,
+                memory_fraction: model.memory_fraction,
+                mem_sample: shape.mem_sample,
+                experts: model.experts.clone(),
+                slots: model.slots.clone(),
+                loader: model.loader.clone(),
+                ple_cache_rows: model.ple_cache_rows,
+                ple: !model.no_ple,
+                moe_act: model.moe_act.clone(),
+                mtp: model.mtp.clone(),
+            })?;
+            Ok((engine, first))
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(
+    name = "lloom",
+    about = "lloom: serve or chat with an LFM2 or Qwen4-exp checkpoint on the same engine"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// The OpenAI-compatible endpoint and the pipette benchmark sidecar
+    /// contract on a loopback port.
+    Serve(serve::ServeArgs),
+    /// A streaming chat REPL on stdin/stdout.
+    Chat(chat::ChatArgs),
+}
+
+/// The `lloom` binary's entry.
+pub fn main(argv: Vec<String>) -> Result<()> {
+    let cli = Cli::parse_from(argv);
+    match cli.command {
+        Command::Serve(args) => serve::run(args),
+        Command::Chat(args) => chat::run(args),
+    }
+}
+
+/// The `lloom-serve` binary's entry: `lloom serve` with the same flags, so
+/// the pipette runner's spawn line (`lloom-serve --model <dir> --port <p>`)
+/// keeps working.
+pub fn main_serve_compat(mut argv: Vec<String>) -> Result<()> {
+    argv.insert(1.min(argv.len()), "serve".to_string());
+    main(argv)
+}

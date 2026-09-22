@@ -1387,6 +1387,13 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let sample_start = (timed || opts.sample_split).then(std::time::Instant::now);
 
             let feed = readback.sample_and_feed(sampler, &logits)?;
+            // An arm that holds the fed id host-side hands it to the model
+            // (`CausalLM::note_input_ids`): a no-op for every model whose
+            // forward reads nothing back, the readback it would otherwise
+            // pay for a model that hashes its input ids on the host.
+            if let Some(ids) = readback.fed_host_ids() {
+                self.model.note_input_ids(&mut self.seq.cache, ids)?;
+            }
             if opts.adaptive_commit && !readback.publishes_fused() {
                 // The reader drains on the stamp: the deferred arms write it
                 // only at commits, so under the adaptive commit it rides every
@@ -1907,6 +1914,8 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let _pool = lloom_tensor::AutoreleaseScope::new();
             let chunk = &prompt[off..off + w];
             let input = readback.stage_prompt_chunk(chunk)?;
+            // The prompt's ids are host-side on every arm.
+            self.model.note_input_ids(&mut self.seq.cache, chunk)?;
             if pace {
                 pacer.before_forward(&device)?;
             }

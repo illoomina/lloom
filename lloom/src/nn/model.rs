@@ -80,6 +80,19 @@ pub trait CausalLM: Model {
         Ok(())
     }
 
+    /// The token ids the next `forward` will consume, when the driver holds
+    /// them on the host anyway — the blocking readback arm's sampled id, a
+    /// prompt chunk. A model whose per-token path needs the ids on the host
+    /// (Qwen4-exp's N-gram PLE hashes them) records them here and skips the
+    /// readback its `forward` would otherwise pay to recover them from the
+    /// input tensor; every other model ignores the call. The next `forward`
+    /// over the same positions consumes the note; a note nothing consumed
+    /// is discarded by the next one, never applied to other positions. The
+    /// default is a no-op.
+    fn note_input_ids(&self, _cache: &mut Self::Cache, _ids: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
     fn vocab_size(&self) -> usize;
 }
 

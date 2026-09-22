@@ -20,6 +20,8 @@
 
 pub mod batch;
 pub mod decode;
+#[cfg(feature = "serve")]
+pub mod app;
 pub mod seam;
 pub mod slots;
 pub mod stream;

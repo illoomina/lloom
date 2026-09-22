@@ -35,16 +35,44 @@ let out = session.decode(&prompt_ids, detokenize, &params, |fragment| print!("{f
   (llama.cpp's `get_available_slot`); `Completer` is the `dyn`-safe per-request
   seam.
 
-## `lloom-serve`
+## `lloom serve` / `lloom chat` (and `lloom-serve`)
 
 ```sh
 cd candle
-cargo build --release --features metal,serve -p lloom-engine --bin lloom-serve
-./target/release/lloom-serve --port 8080          # prints {"kind":"ready","host":"127.0.0.1","port":8080} on stdout
+cargo build --release --features metal,serve -p lloom-engine --bins
+./target/release/lloom serve --port 8080                 # LFM2.5-2.6B from the HF cache
+./target/release/lloom serve --model ~/.cache/huggingface/hub/models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF/snapshots/<hash>/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
+./target/release/lloom chat --model <dir-or-gguf>        # a streaming REPL on the same engine
+./target/release/lloom-serve --port 8080                 # `lloom serve`, under the name the pipette runner spawns
 ```
 
-Loads the LFM2.5-2.6B snapshot from the HF cache (`--model-dir` /
-`LFM2_MODEL_DIR` to point elsewhere), warms the Metal pipelines, and serves one
+One binary over every served family (`src/app/`). `--model` names the
+checkpoint and its family is read from the path: a safetensors directory
+(`config.json`, `tokenizer.json`, `*.safetensors`, `chat_template.jinja`) is
+**LFM2** — every arm the serving binary had (the crown ring, `--dspark`,
+`--batch N`, the pool rows), byte for byte — and a GGUF shard (or a directory
+of shards) is **Qwen4-exp** (`lloom::models::qwen4exp`): one sequence over
+the **streamed** expert tier by default (`--experts stream --slots auto
+--loader pread`, `design/docs/expert-streaming.md` §20; `--experts resident`
+holds every expert in memory), the N-gram PLE on (`--ple-cache-rows N` for
+its hot-row cache), `--mtp <gguf>` for the MTP head on the speculative body
+(one drafted token per round, verified by the target, identical to greedy).
+The tokenizer and the chat template come from the HF cache's
+`Qwen/Qwen3.8-Flash-Next` snapshot (`--tokenizer` to point elsewhere).
+
+The request seam is `app::served::Served`, `dyn` per request (§15.2 #9); the
+per-token loop behind it is `DecodeSession`'s, generic over `CausalLM`. On
+Qwen4-exp `--readback auto` resolves to the **blocking** arm: the model's
+`forward` needs its input ids on the host (the PLE hashes them), which the
+blocking arm holds and hands over through `CausalLM::note_input_ids` — no
+readback in the model; a ring arm is honoured by name and reads the fed id
+back per step (correct, no faster). `lloom chat` runs LFM2 on the ring
+without the lookahead (`ring-la0`) so a turn's cache ends at its EOS and the
+next turn extends it (`Session::prepare` → `Extend`) instead of re-prefilling
+the conversation.
+
+Loads the LFM2.5-2.6B snapshot from the HF cache when no `--model` is given
+(`LFM2_MODEL_DIR` to point elsewhere), warms the Metal pipelines, and serves one
 request at a time on the crown decode configuration (`Sdpa × InPlace ×
 Shuffle`, the GEMV epilogue and conv fusions — `lfm2-chat --cache crown`'s
 arms, every one token-identical to the generic path).
@@ -81,7 +109,9 @@ What the benchmark endpoints bracket, stated so the numbers are readable
   server's `total_ms` is the same window one layer in.
 - `/v1/*` responses carry a `timings` block from the loop's own clocks:
   `prompt_submit_ms` (encode, not execution), `predicted_ms` (the sum of the
-  loop's steps), the readback arm, commits, poll fallbacks, overrun.
+  loop's steps), the readback arm, commits, poll fallbacks, overrun, and
+  `tokens` — the generated ids, so a gate compares a run against a recorded
+  token digest without a second path to the model.
 
 The throughput cells tile a seed passage into their prompts: `--prompt-seed-file`,
 else `PIPETTE_PROMPT_SEED_TEXT` / `PIPETTE_MLX_PROMPT_SEED_TEXT` (what the MLX

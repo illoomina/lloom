@@ -1,0 +1,177 @@
+//! `lloom chat` — a streaming REPL on the engine: the conversation is
+//! rendered through the checkpoint's own chat template each turn and the
+//! session reuses the prefix its cache already holds (`Session::prepare`),
+//! so turn N pays for its own tokens. One line on stderr per turn says what
+//! ran: tokens, the steady rate, the readback arm, what was reused.
+
+use super::common::{ms, NEVER_EOS};
+use super::{detect_family, load_engine, Family, ModelArgs, Shape};
+use crate::{DecodeParams, ReadbackArm};
+use anyhow::{Context, Result};
+use clap::Parser;
+use serde_json::{json, Value};
+use std::io::{BufRead, Write};
+use std::time::Instant;
+
+#[derive(Parser)]
+#[command(
+    name = "lloom chat",
+    about = "Chat with a checkpoint on the lloom engine"
+)]
+pub struct ChatArgs {
+    #[command(flatten)]
+    pub model: ModelArgs,
+
+    /// Readback arm (see `lloom serve --readback`). `auto` is the ring
+    /// WITHOUT the lookahead on LFM2 (`ring-la0`: the cache ends at the
+    /// EOS, so the next turn extends it rather than re-prefilling the
+    /// conversation) and the blocking arm on Qwen4-exp.
+    #[arg(long, default_value = "auto")]
+    pub readback: String,
+
+    /// New tokens per turn at most.
+    #[arg(long, short = 'n', default_value_t = 1024)]
+    pub max_tokens: usize,
+
+    /// Sampling temperature; 0 is greedy.
+    #[arg(long, short = 't', default_value_t = 0.0)]
+    pub temperature: f64,
+
+    #[arg(long)]
+    pub top_p: Option<f64>,
+
+    #[arg(long, default_value_t = 42)]
+    pub seed: u64,
+
+    /// A system message for the conversation.
+    #[arg(long)]
+    pub system: Option<String>,
+
+    /// Let the model think (`enable_thinking` on the template); off by
+    /// default so the reply is the answer.
+    #[arg(long)]
+    pub think: bool,
+
+    /// Re-prefill the whole conversation every turn instead of extending
+    /// the cache (a measurement arm).
+    #[arg(long)]
+    pub no_reuse: bool,
+
+    /// One turn from the command line instead of the REPL, then exit.
+    #[arg(long, short = 'p')]
+    pub prompt: Option<String>,
+}
+
+pub fn run(args: ChatArgs) -> Result<()> {
+    let family = detect_family(args.model.model.as_deref())?;
+    let readback = match (args.readback.as_str(), &family) {
+        ("auto", Family::Lfm2(_)) => ReadbackArm::Ring {
+            lookahead: 0,
+            commit_steps: 8,
+            adaptive: false,
+        },
+        (s, _) => super::serve::parse_readback(s)?,
+    };
+    let t = Instant::now();
+    let (engine, path) = load_engine(
+        &args.model,
+        Shape {
+            readback,
+            reuse_prefix: !args.no_reuse,
+            seed_text: "The loom threads warp and weft into cloth. ".to_string(),
+            batch: 1,
+            prefill_chunk: 0,
+            mem_sample: false,
+            rows: "auto".to_string(),
+            share_prefix: false,
+        },
+    )?;
+    eprintln!(
+        "[loaded {} from {} in {:.1}s on {:?}; readback={} reuse_prefix={} {}]",
+        engine.model_name(),
+        path.display(),
+        t.elapsed().as_secs_f64(),
+        engine.device(),
+        engine.readback().name(),
+        !args.no_reuse,
+        engine.describe()
+    );
+    let kwargs = json!({ "enable_thinking": args.think });
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(sys) = &args.system {
+        messages.push(json!({ "role": "system", "content": sys }));
+    }
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    let mut turn = 0usize;
+    loop {
+        let user = match &args.prompt {
+            Some(p) if turn == 0 => p.clone(),
+            Some(_) => break,
+            None => {
+                print!("> ");
+                std::io::stdout().flush()?;
+                match lines.next() {
+                    Some(l) => l?,
+                    None => break,
+                }
+            }
+        };
+        let user = user.trim().to_string();
+        if user.is_empty() {
+            continue;
+        }
+        if user == "/quit" || user == "/exit" {
+            break;
+        }
+        turn += 1;
+        messages.push(json!({ "role": "user", "content": user }));
+        let rendered = engine.render_chat(&json!(messages), Some(&kwargs))?;
+        let ids = engine.encode(&rendered, true)?;
+        let params = DecodeParams {
+            seed: args.seed,
+            temperature: (args.temperature > 0.0).then_some(args.temperature),
+            top_p: args.top_p,
+            max_tokens: args.max_tokens,
+            eos_ids: engine.eos_ids().to_vec(),
+            stop_strings: Vec::new(),
+            readback: engine.readback(),
+            prefill_tile: engine.prefill_tile(),
+        };
+        let started = Instant::now();
+        let mut first_at: Option<f64> = None;
+        let decoded = engine
+            .complete_until(&ids, &params, &mut |frag| {
+                if first_at.is_none() {
+                    first_at = Some(ms(started.elapsed()));
+                }
+                print!("{frag}");
+                let _ = std::io::stdout().flush();
+                true
+            })
+            .context("decoding the turn")?;
+        println!();
+        messages.push(json!({ "role": "assistant", "content": decoded.text }));
+        let st = &decoded.stats;
+        let wall = ms(started.elapsed());
+        let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
+        eprintln!(
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={}]",
+            ids.len(),
+            decoded.tokens.len(),
+            decoded.stop,
+            first_at.unwrap_or(wall),
+            wall,
+            decoded.tokens.len() as f64 / (decode_ms / 1e3),
+            decoded.readback.name(),
+            decoded.reuse,
+            decoded.reused,
+            decoded.prefilled,
+            st.commits,
+            st.overrun,
+        );
+        let _ = NEVER_EOS;
+    }
+    engine.shutdown();
+    Ok(())
+}

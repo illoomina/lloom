@@ -168,6 +168,15 @@ pub trait ReadbackStrategy {
         Ok(())
     }
 
+    /// The ids the last [`Self::sample_and_feed`] fed, if this arm holds them
+    /// on the host — the blocking arm's sampled id. `None` on the ring arms,
+    /// whose token never comes to the host. The loop hands them to
+    /// [`crate::nn::CausalLM::note_input_ids`] so a model that needs its
+    /// input ids host-side does not read them back from the device.
+    fn fed_host_ids(&self) -> Option<&[u32]> {
+        None
+    }
+
     /// Was the token fed by the last [`Self::sample_and_feed`] an EOS? Waits
     /// by this arm's own mechanism until it knows; a `true` retracts that
     /// token from the ids [`Self::take_ids`] will return.
@@ -311,6 +320,10 @@ impl ReadbackStrategy for Blocking {
         self.ids.push(id);
         self.last = Some(id);
         Tensor::new(&[id], &self.device)?.unsqueeze(0)
+    }
+
+    fn fed_host_ids(&self) -> Option<&[u32]> {
+        self.last.as_ref().map(std::slice::from_ref)
     }
 
     fn eos_of_last(&mut self) -> Result<bool> {

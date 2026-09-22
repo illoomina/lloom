@@ -146,6 +146,10 @@ pub struct Cache {
     /// first; set by [`CausalLM::forward`], empty when the caller only had
     /// embeddings (an image), in which case the hash uses the image stand-in.
     pub pending_tokens: std::collections::VecDeque<u32>,
+    /// `pending_tokens` was filled by the driver (`CausalLM::note_input_ids`)
+    /// for the NEXT forward, which consumes the note instead of reading its
+    /// input ids back from the device. Cleared by that forward.
+    pub pending_noted: bool,
     /// Decode position (number of tokens seen).
     pub pos: usize,
     /// Retain every forward's pre-final-mixer carry `[1, seq, n·d]` (the
@@ -185,6 +189,7 @@ impl Cache {
             ple_conv: RecurrentState::new(n_layers),
             ngram: NgramWindow::new(cfg.ple_ngram_size.saturating_sub(1)),
             pending_tokens: std::collections::VecDeque::new(),
+            pending_noted: false,
             pos: 0,
             want_nextn: false,
             nextn: Vec::new(),
@@ -202,6 +207,7 @@ impl Cache {
         self.ple_conv.reset();
         self.ngram.reset();
         self.pending_tokens.clear();
+        self.pending_noted = false;
         self.pos = 0;
         self.nextn.clear();
         self.window = None;
@@ -274,6 +280,7 @@ impl Cache {
         }
         self.ngram = w.ngram;
         self.pending_tokens = w.pending_tokens;
+        self.pending_noted = false;
         self.pos = w.pos;
         Ok(())
     }
@@ -346,6 +353,7 @@ impl Cache {
     pub fn set_pending_tokens(&mut self, tokens: &[u32]) {
         self.pending_tokens.clear();
         self.pending_tokens.extend(tokens.iter().copied());
+        self.pending_noted = false;
     }
 }
 
@@ -841,12 +849,27 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
     }
 
     /// Embed and run; the token ids are recorded first so the PLE hash reads
-    /// them (the trait default would run `forward_embeds` with no ids).
+    /// them (the trait default would run `forward_embeds` with no ids). The
+    /// ids come from the driver's note when it holds them on the host
+    /// ([`CausalLM::note_input_ids`] — the blocking arm, a prompt chunk) and
+    /// are read back from `tokens` otherwise (a ring arm's device-resident
+    /// token: correct, and a wait on the queue's tail per step).
     fn forward(&self, tokens: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
-        let ids: Vec<u32> = tokens.flatten_all()?.to_vec1::<u32>()?;
-        cache.set_pending_tokens(&ids);
+        let seq = tokens.elem_count();
+        if cache.pending_noted && cache.pending_tokens.len() == seq {
+            cache.pending_noted = false;
+        } else {
+            let ids: Vec<u32> = tokens.flatten_all()?.to_vec1::<u32>()?;
+            cache.set_pending_tokens(&ids);
+        }
         let embeds = self.embed(tokens)?;
         <Self as CausalLM>::forward_embeds(self, &embeds, pos, cache)
+    }
+
+    fn note_input_ids(&self, cache: &mut Self::Cache, ids: &[u32]) -> Result<()> {
+        cache.set_pending_tokens(ids);
+        cache.pending_noted = true;
+        Ok(())
     }
 
     fn vocab_size(&self) -> usize {
@@ -857,6 +880,26 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
 impl CacheReset for Cache {
     fn reset(&mut self) {
         Cache::reset(self)
+    }
+}
+
+/// No rewindable arm yet: the recurrent channels roll back only through a
+/// speculative window (`open_window`/`rewind_window`, the MTP verify's), so a
+/// driver that overran an EOS (a ring arm's lookahead) resets the sequence
+/// rather than rewinding it (`Session::prepare`), and a request that reuses
+/// a prefix extends an exactly-ending cache (the blocking arm's shape).
+impl crate::nn::model::CacheRewind for Cache {
+    fn rewind_horizon(&self) -> usize {
+        0
+    }
+
+    fn rewind(&mut self, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        lloom_tensor::bail!(
+            "qwen4exp cache: no rewindable arm (horizon 0); a rewind of {n} positions is refused"
+        )
     }
 }
 

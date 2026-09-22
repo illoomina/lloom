@@ -47,6 +47,12 @@ name = "decode-smoke"
 required-features = ["metal"]
 
 [[bin]]
+name = "lloom"
+path = "src/bin/lloom/main.rs"
+required-features = ["serve"]
+
+# `lloom serve` under the name the pipette runner spawns.
+[[bin]]
 name = "lloom-serve"
 path = "src/bin/lloom-serve/main.rs"
 required-features = ["serve"]

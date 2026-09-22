@@ -233,6 +233,17 @@ impl Cache {
         Self::with_layers(cfg, cfg.n_layers)
     }
 
+    /// A cache whose DeltaNet `S` and conv window live in `pools` (a batch's
+    /// shared, slot-indexed state — `StatePool`s from
+    /// [`Qwen4Exp::state_pools`]); a slot of each is leased here and freed
+    /// when the cache drops. The PLE history and the KV stay the cache's own.
+    pub fn in_pools(cfg: &Config, pools: &StatePools) -> Result<Self> {
+        let mut cache = Self::new(cfg);
+        cache.s_state = RecurrentState::in_pool(&pools.s)?;
+        cache.conv_state = RecurrentState::in_pool(&pools.conv)?;
+        Ok(cache)
+    }
+
     /// A cache for `n_layers` layers of `cfg`'s geometry (an MTP head's single
     /// layer shares the model's shapes, not its depth).
     pub fn with_layers(cfg: &Config, n_layers: usize) -> Self {
@@ -1193,6 +1204,39 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             .reshape((b, self.cfg.vocab_size))?
             .to_dtype(lloom_tensor::DType::F32)?;
         Ok((logits, records))
+    }
+}
+
+/// The pools a batch's rows keep their recurrent state in: the DeltaNet
+/// `S` (`[d_k, d_v, h_v]` a row) and the conv window (`[conv_channels,
+/// kernel]` a row), one slot per row over every layer.
+#[derive(Debug, Clone)]
+pub struct StatePools {
+    pub s: crate::nn::StatePool,
+    pub conv: crate::nn::StatePool,
+}
+
+impl<R: ExpertResidency> Qwen4Exp<R> {
+    /// The pools for `rows` rows on `dev` (f32, the fused kernels' dtype).
+    pub fn state_pools(&self, rows: usize, dev: &lloom_tensor::Device) -> StatePools {
+        let dims = self.cfg.deltanet_dims();
+        let f32 = lloom_tensor::DType::F32;
+        StatePools {
+            s: crate::nn::StatePool::new(
+                rows,
+                self.layers.len(),
+                &[dims.d_k, dims.d_v, dims.h_v],
+                f32,
+                dev,
+            ),
+            conv: crate::nn::StatePool::new(
+                rows,
+                self.layers.len(),
+                &[self.cfg.conv_channels(), self.cfg.ssm_conv_kernel],
+                f32,
+                dev,
+            ),
+        }
     }
 }
 

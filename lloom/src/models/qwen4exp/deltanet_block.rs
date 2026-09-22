@@ -144,6 +144,112 @@ impl GatedDeltaNet {
         }
     }
 
+    /// The rows as one launch per kernel over their shared pools
+    /// (`kernels::{GdnPrologueRows, GdnStepRows, GdnGatedNormRows}`): the
+    /// row tables `slots` / `phases` uploaded per layer, the pools' two
+    /// slabs bound, each row read at its phase and written at the other,
+    /// then flipped. `None` unless every row's `S` and window channels are
+    /// pooled — in one pool each — and written (a fresh row takes the
+    /// per-row path once, which zeroes and writes its slots).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_rows_pooled(
+        &self,
+        qkv: &Tensor,
+        z: &Tensor,
+        alpha: &Tensor,
+        beta: &Tensor,
+        l: usize,
+        states: &mut [(&mut RecurrentState, &mut RecurrentState)],
+        conv_w: &Tensor,
+        dt_bias: &Tensor,
+        ssm_a: &Tensor,
+        gamma: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        use super::kernels::{GdnGatedNormRows, GdnPrologueRows, GdnStepRows};
+        let dims = self.dims;
+        let (d, h_k, h_v) = (dims.d_k, dims.h_k, dims.h_v);
+        let b = states.len();
+        let dev = qkv.device();
+        let mut s_slots = Vec::with_capacity(b);
+        let mut s_phases = Vec::with_capacity(b);
+        let mut w_slots = Vec::with_capacity(b);
+        let mut w_phases = Vec::with_capacity(b);
+        let mut s_pool: Option<crate::nn::StatePool> = None;
+        let mut w_pool: Option<crate::nn::StatePool> = None;
+        for (s_state, conv_state) in states.iter() {
+            let (Some((sp, ss, sph, sw)), Some((wp, ws, wph, ww))) =
+                (s_state.pool_slot(l), conv_state.pool_slot(l))
+            else {
+                return Ok(None);
+            };
+            if !sw || !ww {
+                return Ok(None);
+            }
+            match &s_pool {
+                Some(p) if !p.same(sp) => return Ok(None),
+                Some(_) => {}
+                None => s_pool = Some(sp.clone()),
+            }
+            match &w_pool {
+                Some(p) if !p.same(wp) => return Ok(None),
+                Some(_) => {}
+                None => w_pool = Some(wp.clone()),
+            }
+            s_slots.push(ss as u32);
+            s_phases.push(sph as u32);
+            w_slots.push(ws as u32);
+            w_phases.push(wph as u32);
+        }
+        let (s_pool, w_pool) = (s_pool.expect("rows"), w_pool.expect("rows"));
+        let [s_a, s_b] = s_pool.slabs(l)?;
+        let [w_a, w_b] = w_pool.slabs(l)?;
+        let up = |v: &[u32]| Tensor::from_vec(v.to_vec(), v.len(), dev);
+        let heads = qkv.apply_op1_no_bwd(&GdnPrologueRows {
+            rows: b,
+            d,
+            h_k,
+            h_v,
+            kk: self.conv_k,
+            eps: self.norm_eps as f32,
+            q_scale: 1.0 / (d as f32).sqrt(),
+            conv_w: conv_w.clone(),
+            win_a: w_a,
+            win_b: w_b,
+            slots: up(&w_slots)?,
+            phases: up(&w_phases)?,
+        })?; // [B, 3, h_v, d]
+        let o = heads.apply_op3_no_bwd(
+            alpha,
+            beta,
+            &GdnStepRows {
+                rows: b,
+                d,
+                h_v,
+                dt_bias: dt_bias.clone(),
+                ssm_a: ssm_a.clone(),
+                s_a,
+                s_b,
+                slots: up(&s_slots)?,
+                phases: up(&s_phases)?,
+            },
+        )?; // [B, h_v, d]
+        for (s_state, conv_state) in states.iter_mut() {
+            conv_state.flip_phase(l)?;
+            s_state.flip_phase(l)?;
+        }
+        let gated = o.apply_op3_no_bwd(
+            gamma,
+            z,
+            &GdnGatedNormRows {
+                rows: b,
+                d,
+                h_v,
+                eps: self.norm_eps as f32,
+            },
+        )?; // [B, value_dim]
+        Ok(Some(gated))
+    }
+
     /// The composed decode of one row: the CPU path and the reference.
     fn decode_composed(
         &self,
@@ -248,6 +354,19 @@ impl GatedDeltaNet {
         let gamma = self.ssm_norm.to_dtype(f32)?;
         // The projections once over all rows: `[B, C] | [B, value_dim] | [B, h_v] | [B, h_v]`.
         let (qkv, z, alpha, beta) = self.decode_stems(x, h_v)?;
+        // The batched arm: every row a slot of ONE state pool (and written
+        // there) — the three kernels run once over the rows with the slot
+        // and phase tables, and every row flips its phase.
+        if b > 1 {
+            if let Some(gated) = self.decode_rows_pooled(
+                &qkv, &z, &alpha, &beta, l, states, &conv_w, &dt_bias, &ssm_a, &gamma,
+            )? {
+                let out = self
+                    .ssm_out
+                    .forward(&gated.reshape((b, 1, self.value_dim))?)?;
+                return Ok(Some(out));
+            }
+        }
         let mut gated_rows = Vec::with_capacity(b);
         for (r, (s_state, conv_state)) in states.iter_mut().enumerate() {
             // The persistent buffers: allocate the zero state once (the first

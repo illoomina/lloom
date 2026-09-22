@@ -26,7 +26,7 @@ pub use deltanet::{decode_step, DeltaNetDims};
 pub use deltanet_block::GatedDeltaNet;
 pub use hc::HyperConnection;
 pub use loader::{LoadOptions, SlotBudget, SlotPlan, StreamLoader, StreamOptions};
-pub use model::{Cache, Layer, Mixer, Qwen4Exp};
+pub use model::{Cache, Layer, Mixer, Qwen4Exp, StatePools};
 pub use moe::{ExpertResidency, MoeLayer, Resident, Streamed};
 pub use mtp::{MtpDrafter, MtpHead};
 pub use ple::{CachedPleTable, MmapPleTable, NgramHash, NgramWindow, PleLayer, PleTable};

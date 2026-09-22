@@ -154,6 +154,12 @@ struct Args {
     #[arg(long)]
     batched_driver: bool,
 
+    /// `--rows N`: the rows' recurrent state in one slot-indexed pool (the
+    /// DeltaNet step as one launch per kernel over the rows); off, every
+    /// row keeps its own slabs and the step launches per row.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    rows_pool: bool,
+
     /// The expert hotlist file (`--experts stream`): read at load to warm
     /// every layer's pool before the first token (§20.3 R2; a missing file
     /// warms nothing), written at exit with this run's usage merged in.
@@ -512,8 +518,15 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
     use lloom::nn::{DecodeOptions, Session};
     let cfg = model.config();
     for run in 0..args.runs {
+        let pools = args.rows_pool.then(|| model.state_pools(args.rows, device));
         let mut sessions: Vec<Session<'_, Qwen4Exp<R>>> = (0..args.rows)
-            .map(|_| Ok(Session::new(model, model.new_cache(cfg, device)?)))
+            .map(|_| {
+                let cache = match &pools {
+                    Some(p) => lloom::models::qwen4exp::Cache::in_pools(cfg, p)?,
+                    None => model.new_cache(cfg, device)?,
+                };
+                Ok(Session::new(model, cache))
+            })
             .collect::<Result<_>>()?;
         let prompts: Vec<&[u32]> = (0..args.rows).map(|_| prompt_ids).collect();
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -546,8 +559,9 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
             })
             .collect();
         println!(
-            "ROWS run={run} rows={} prompt_tokens={} generated={generated} wall_ms={} tok_s={:.2} per_row_tok_s={:.2} digests={:?}",
+            "ROWS run={run} rows={} pool={} prompt_tokens={} generated={generated} wall_ms={} tok_s={:.2} per_row_tok_s={:.2} digests={:?}",
             args.rows,
+            args.rows_pool,
             prompt_ids.len(),
             wall.as_millis(),
             generated as f64 / wall.as_secs_f64(),

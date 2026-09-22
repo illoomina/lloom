@@ -792,3 +792,136 @@ pub fn call_moe_slot_map(
     dispatch_groups(encoder, n.div_ceil(width), width);
     Ok(())
 }
+
+/// `gdn_prologue_rows_f32`: `B` rows of `qkv [B, C]` against the window
+/// pools (`slots` / `phases` per row) → `heads [B, 3, h_v, d]`, the windows
+/// after the step written to the other phase.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_prologue_rows(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    d: usize,
+    h_k: usize,
+    h_v: usize,
+    kk: usize,
+    eps: f32,
+    q_scale: f32,
+    qkv: BufferOffset,
+    conv_w: BufferOffset,
+    win_a: BufferOffset,
+    win_b: BufferOffset,
+    slots: BufferOffset,
+    phases: BufferOffset,
+    heads: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_prologue_rows_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "gdn_prologue_rows rows={rows} d={d} h_k={h_k} h_v={h_v}"
+    );
+    set_params!(
+        encoder,
+        (
+            &qkv,
+            &conv_w,
+            &win_a,
+            &win_b,
+            &slots,
+            &phases,
+            Output::new(heads),
+            d as u32,
+            h_k as u32,
+            h_v as u32,
+            kk as u32,
+            eps,
+            q_scale,
+            Output::from_buffer_offset(&win_a),
+            Output::from_buffer_offset(&win_b)
+        )
+    );
+    dispatch_groups_2d(encoder, 2 * h_k + h_v, rows, head_width(d, &pipeline));
+    Ok(())
+}
+
+/// `gdn_step_rows_f32`: `B` rows of the recurrence over the `S` pools.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_step_rows(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    d: usize,
+    h_v: usize,
+    heads: BufferOffset,
+    alpha: BufferOffset,
+    beta: BufferOffset,
+    dt_bias: BufferOffset,
+    ssm_a: BufferOffset,
+    s_a: BufferOffset,
+    s_b: BufferOffset,
+    slots: BufferOffset,
+    phases: BufferOffset,
+    o: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_step_rows_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_step_rows rows={rows} d={d} h_v={h_v}");
+    set_params!(
+        encoder,
+        (
+            &heads,
+            &alpha,
+            &beta,
+            &dt_bias,
+            &ssm_a,
+            &s_a,
+            &s_b,
+            &slots,
+            &phases,
+            Output::new(o),
+            d as u32,
+            h_v as u32,
+            Output::from_buffer_offset(&s_a),
+            Output::from_buffer_offset(&s_b)
+        )
+    );
+    let max = pipeline.max_total_threads_per_threadgroup().min(1024);
+    let split = (max / h_v.max(1)).clamp(1, 8);
+    dispatch_groups_2d(encoder, d, rows, h_v * split);
+    Ok(())
+}
+
+/// `gdn_gated_norm_rows_f32`: `B` rows of the gated norm.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_gated_norm_rows(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    d: usize,
+    h_v: usize,
+    eps: f32,
+    o: BufferOffset,
+    gamma: BufferOffset,
+    z: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_gated_norm_rows_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_gated_norm_rows rows={rows} d={d} h_v={h_v}");
+    set_params!(
+        encoder,
+        (&o, &gamma, &z, Output::new(out), d as u32, h_v as u32, eps)
+    );
+    dispatch_groups_2d(encoder, h_v, rows, head_width(d, &pipeline));
+    Ok(())
+}

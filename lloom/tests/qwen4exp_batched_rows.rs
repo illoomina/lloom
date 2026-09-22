@@ -69,13 +69,31 @@ fn batched<R: ExpertResidency>(
     prompts: &[Vec<u32>],
     steps: usize,
 ) -> Result<Batched> {
+    batched_on(model, cfg, dev, prompts, steps, false)
+}
+
+/// `pooled`: the rows' recurrent state in one `StatePools` (the batched
+/// kernels' arm on Metal; the pooled channels through the composed path on
+/// the CPU).
+fn batched_on<R: ExpertResidency>(
+    model: &Qwen4Exp<R>,
+    cfg: &Config,
+    dev: &Device,
+    prompts: &[Vec<u32>],
+    steps: usize,
+    pooled: bool,
+) -> Result<Batched> {
     let b = prompts.len();
+    let pools = pooled.then(|| model.state_pools(b, dev));
     let mut caches: Vec<Cache> = Vec::with_capacity(b);
     let mut next: Vec<u32> = Vec::with_capacity(b);
     let mut ids = vec![Vec::new(); b];
     let mut rows_logits = vec![Vec::new(); b];
     for p in prompts {
-        let mut cache = model.new_cache(cfg, dev)?;
+        let mut cache = match &pools {
+            Some(pools) => Cache::in_pools(cfg, pools)?,
+            None => model.new_cache(cfg, dev)?,
+        };
         let input = Tensor::from_vec(p.clone(), (1, p.len()), dev)?;
         let logits: Vec<f32> = model
             .forward(&input, 0, &mut cache)?
@@ -114,9 +132,29 @@ fn check_rows(
     dev: &Device,
     tol: f32,
 ) -> Result<()> {
+    check_rows_on(tag, model, cfg, dev, tol, false)?;
+    check_rows_on(&format!("{tag} pooled"), model, cfg, dev, tol, true)
+}
+
+fn check_rows_on(
+    tag: &str,
+    model: &Qwen4Exp<Resident>,
+    cfg: &Config,
+    dev: &Device,
+    tol: f32,
+    pooled: bool,
+) -> Result<()> {
     let prompts = prompts();
     let steps = 6;
-    let (ids_b, logits_b, caches) = batched(model, cfg, dev, &prompts, steps)?;
+    let (ids_b, logits_b, caches) = batched_on(model, cfg, dev, &prompts, steps, pooled)?;
+    if pooled {
+        for (r, c) in caches.iter().enumerate() {
+            assert!(
+                c.s_state.is_pooled() && c.conv_state.is_pooled(),
+                "{tag}: row {r} not pooled"
+            );
+        }
+    }
     let mut worst = 0f32;
     for (r, p) in prompts.iter().enumerate() {
         let (ids_s, logits_s) = solo(model, cfg, dev, p, steps)?;

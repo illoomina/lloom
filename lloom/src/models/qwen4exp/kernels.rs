@@ -1856,3 +1856,296 @@ impl lloom_tensor::CustomOp3 for QsaPrepRows {
         ))
     }
 }
+
+// ---- DeltaNet decode over the rows of one state pool -----------------------------
+
+/// The batched prologue: `qkv [B, C]` (applied to), the row tables `slots`
+/// / `phases` (`[B]` u32, captured), the window pool's two slabs (captured;
+/// the phase's read, the other written) → `heads [B, 3, h_v, d]`.
+pub(crate) struct GdnPrologueRows {
+    pub rows: usize,
+    pub d: usize,
+    pub h_k: usize,
+    pub h_v: usize,
+    pub kk: usize,
+    pub eps: f32,
+    pub q_scale: f32,
+    pub conv_w: Tensor,
+    pub win_a: Tensor,
+    pub win_b: Tensor,
+    pub slots: Tensor,
+    pub phases: Tensor,
+}
+
+impl lloom_tensor::CustomOp1 for GdnPrologueRows {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-prologue-rows"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_prologue_rows: no cpu kernel; the per-row path composes it")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (rows, d, h_k, h_v, kk) = (self.rows, self.d, self.h_k, self.h_v, self.kk);
+        let conv_ch = (2 * h_k + h_v) * d;
+        if l.shape().elem_count() != rows * conv_ch || !l.is_contiguous() {
+            lloom_tensor::bail!(
+                "gdn_prologue_rows: qkv {:?} vs [{rows}, {conv_ch}]",
+                l.shape()
+            )
+        }
+        let (ws, wl) = self.conv_w.storage_and_layout();
+        let (as_, al) = self.win_a.storage_and_layout();
+        let (bs, bl) = self.win_b.storage_and_layout();
+        let (ss, sl) = self.slots.storage_and_layout();
+        let (ps, pl) = self.phases.storage_and_layout();
+        let m = |st: &lloom_tensor::Storage| -> Result<lloom_tensor::MetalStorage> {
+            match st {
+                lloom_tensor::Storage::Metal(x) => Ok(x.clone()),
+                _ => lloom_tensor::bail!("gdn_prologue_rows: every operand on the metal device"),
+            }
+        };
+        let (ws, as_, bs, ss, ps) = (m(&ws)?, m(&as_)?, m(&bs)?, m(&ss)?, m(&ps)?);
+        let slot_rows = al.shape().elem_count() / (conv_ch * kk).max(1);
+        if wl.shape().elem_count() != conv_ch * kk
+            || al.shape().elem_count() != bl.shape().elem_count()
+            || al.shape().elem_count() != slot_rows * conv_ch * kk
+            || sl.shape().elem_count() != rows
+            || pl.shape().elem_count() != rows
+            || !wl.is_contiguous()
+            || !al.is_contiguous()
+            || !bl.is_contiguous()
+            || !sl.is_contiguous()
+            || !pl.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_prologue_rows: the taps / pools / tables' shapes")
+        }
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_prologue_rows");
+        let elem_count = rows * 3 * h_v * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_heads_rows")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_prologue_rows(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            d,
+            h_k,
+            h_v,
+            kk,
+            self.eps,
+            self.q_scale,
+            metal_bo(s, l),
+            metal_bo(&ws, wl),
+            metal_bo(&as_, al),
+            metal_bo(&bs, bl),
+            metal_bo(&ss, sl),
+            metal_bo(&ps, pl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            Shape::from((rows, 3, h_v, d)),
+        ))
+    }
+}
+
+/// The batched recurrence: `heads [B, 3, h_v, d]`, `alpha` / `beta` `[B,
+/// h_v]`, the `S` pool's two slabs and the row tables captured → `o [B,
+/// h_v, d]`; the next `S` of every row written to its other phase.
+pub(crate) struct GdnStepRows {
+    pub rows: usize,
+    pub d: usize,
+    pub h_v: usize,
+    pub dt_bias: Tensor,
+    pub ssm_a: Tensor,
+    pub s_a: Tensor,
+    pub s_b: Tensor,
+    pub slots: Tensor,
+    pub phases: Tensor,
+}
+
+impl lloom_tensor::CustomOp3 for GdnStepRows {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-step-rows"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_step_rows: no cpu kernel; the per-row path composes it")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (rows, d, h_v) = (self.rows, self.d, self.h_v);
+        if l1.shape().elem_count() != rows * 3 * h_v * d
+            || l2.shape().elem_count() != rows * h_v
+            || l3.shape().elem_count() != rows * h_v
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "gdn_step_rows: heads / alpha / beta vs rows {rows} d {d} h_v {h_v}"
+            )
+        }
+        let (bs, bl) = self.dt_bias.storage_and_layout();
+        let (as_, al) = self.ssm_a.storage_and_layout();
+        let (sa, sal) = self.s_a.storage_and_layout();
+        let (sb, sbl) = self.s_b.storage_and_layout();
+        let (ss, sl) = self.slots.storage_and_layout();
+        let (ps, pl) = self.phases.storage_and_layout();
+        let m = |st: &lloom_tensor::Storage| -> Result<lloom_tensor::MetalStorage> {
+            match st {
+                lloom_tensor::Storage::Metal(x) => Ok(x.clone()),
+                _ => lloom_tensor::bail!("gdn_step_rows: every operand on the metal device"),
+            }
+        };
+        let (bs, as_, sa, sb, ss, ps) = (m(&bs)?, m(&as_)?, m(&sa)?, m(&sb)?, m(&ss)?, m(&ps)?);
+        let slab = d * d * h_v;
+        if bl.shape().elem_count() != h_v
+            || al.shape().elem_count() != h_v
+            || sal.shape().elem_count() != sbl.shape().elem_count()
+            || sal.shape().elem_count() % slab != 0
+            || sl.shape().elem_count() != rows
+            || pl.shape().elem_count() != rows
+            || !sal.is_contiguous()
+            || !sbl.is_contiguous()
+            || !sl.is_contiguous()
+            || !pl.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_step_rows: the pools / tables' shapes")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_step_rows");
+        let elem_count = rows * h_v * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_o_rows")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_step_rows(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            d,
+            h_v,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            metal_bo(&bs, bl),
+            metal_bo(&as_, al),
+            metal_bo(&sa, sal),
+            metal_bo(&sb, sbl),
+            metal_bo(&ss, sl),
+            metal_bo(&ps, pl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((rows, h_v, d)),
+        ))
+    }
+}
+
+/// The batched gated norm: `o [B, h_v, d]`, γ, `z [B, h_v·d]` → `[B, h_v·d]`.
+pub(crate) struct GdnGatedNormRows {
+    pub rows: usize,
+    pub d: usize,
+    pub h_v: usize,
+    pub eps: f32,
+}
+
+impl lloom_tensor::CustomOp3 for GdnGatedNormRows {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-gated-norm-rows"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_gated_norm_rows: no cpu kernel")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (rows, d, h_v) = (self.rows, self.d, self.h_v);
+        if l1.shape().elem_count() != rows * h_v * d
+            || l2.shape().elem_count() != d
+            || l3.shape().elem_count() != rows * h_v * d
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_gated_norm_rows: o / γ / z vs rows {rows} d {d} h_v {h_v}")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_gated_norm_rows");
+        let elem_count = rows * h_v * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_gated_rows")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_gated_norm_rows(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            d,
+            h_v,
+            self.eps,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((rows, h_v * d)),
+        ))
+    }
+}

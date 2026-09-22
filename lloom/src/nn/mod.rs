@@ -84,7 +84,7 @@ pub use observer::{
     ForwardObserver, HcStatePoint, HookKind, HookPlan, HookPoint, LayerInputPoint,
     LayerOutputPoint, NextnHiddenPoint,
 };
-pub use recurrent::RecurrentState;
+pub use recurrent::{RecurrentState, StatePool};
 pub use ops::Dropout;
 pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};

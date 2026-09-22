@@ -76,6 +76,8 @@ pub struct RecurrentState {
     /// Whether a speculative window is currently open (guards double-open and
     /// resolve/rewind-without-open). A plain bool — the channel is single-owner.
     window_open: bool,
+    /// The pool lease when the state lives in a [`StatePool`].
+    pooled: Option<Pooled>,
 }
 
 /// Whether every state write replaces the slab with a fresh copy instead of
@@ -101,7 +103,204 @@ fn own_copy(t: &Tensor) -> Result<Tensor> {
     Ok(out)
 }
 
+/// The slot-indexed pool a batch's rows keep their recurrent state in
+/// (`docs/batched-decode-design.md` §12.2 applied to the recurrent
+/// channels): per layer two slabs of `[slots, ..shape]` — a row's state at
+/// layer `l` is row `slot` of the slab at the row's PHASE for that layer,
+/// and a step writes the other phase and flips it (the out-of-place write
+/// the fused kernels take, with no buffer per row: the window's base is
+/// the old phase, a rewind flips back). A batched kernel takes the two
+/// slabs and per-row `slots` / `phases` tables and runs the rows as one
+/// launch. Allocated per layer on first use.
+#[derive(Debug, Clone)]
+pub struct StatePool {
+    inner: std::sync::Arc<parking_lot::Mutex<PoolInner>>,
+}
+
+#[derive(Debug)]
+struct PoolInner {
+    slots: usize,
+    shape: Vec<usize>,
+    dtype: lloom_tensor::DType,
+    device: lloom_tensor::Device,
+    /// Per layer, the two phases' slabs `[slots, ..shape]`.
+    slabs: Vec<Option<[Tensor; 2]>>,
+    free: Vec<usize>,
+}
+
+impl StatePool {
+    /// A pool of `slots` rows over `n_layers` layers of `shape` per row.
+    pub fn new(
+        slots: usize,
+        n_layers: usize,
+        shape: &[usize],
+        dtype: lloom_tensor::DType,
+        device: &lloom_tensor::Device,
+    ) -> Self {
+        Self {
+            inner: std::sync::Arc::new(parking_lot::Mutex::new(PoolInner {
+                slots,
+                shape: shape.to_vec(),
+                dtype,
+                device: device.clone(),
+                slabs: vec![None; n_layers],
+                free: (0..slots).rev().collect(),
+            })),
+        }
+    }
+
+    /// Whether two handles are the same pool.
+    pub fn same(&self, other: &StatePool) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub fn slots(&self) -> usize {
+        self.inner.lock().slots
+    }
+
+    pub fn n_layers(&self) -> usize {
+        self.inner.lock().slabs.len()
+    }
+
+    fn lease(&self) -> Result<usize> {
+        self.inner
+            .lock()
+            .free
+            .pop()
+            .ok_or_else(|| lloom_tensor::Error::msg("StatePool: no free slot"))
+    }
+
+    fn release(&self, slot: usize) {
+        self.inner.lock().free.push(slot);
+    }
+
+    /// Layer `l`'s two slabs, allocated (zero) on first use.
+    pub fn slabs(&self, l: usize) -> Result<[Tensor; 2]> {
+        let mut g = self.inner.lock();
+        if l >= g.slabs.len() {
+            lloom_tensor::bail!("StatePool: layer {l} out of range");
+        }
+        if g.slabs[l].is_none() {
+            let mut dims = vec![g.slots];
+            dims.extend_from_slice(&g.shape);
+            let _declared = lloom_tensor::EscapeGuard::new();
+            let a = Tensor::zeros(dims.as_slice(), g.dtype, &g.device)?;
+            let b = Tensor::zeros(dims.as_slice(), g.dtype, &g.device)?;
+            g.slabs[l] = Some([a, b]);
+        }
+        Ok(g.slabs[l].as_ref().expect("allocated above").clone())
+    }
+}
+
+/// A channel's lease on a [`StatePool`] slot.
+#[derive(Debug)]
+struct Pooled {
+    pool: StatePool,
+    slot: usize,
+    /// Per layer, which of the two slabs holds the row's current state.
+    phase: Vec<u8>,
+    /// Per layer, whether the row has written the layer since its reset.
+    written: Vec<bool>,
+    /// The phases and written flags at the open window (a rewind restores
+    /// them; the slab at the old phase was never written inside the window).
+    base_phase: Vec<u8>,
+    base_written: Vec<bool>,
+}
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        self.pool.release(self.slot);
+    }
+}
+
+/// A clone leases a slot of its own and copies the written layers into it
+/// (a `Cache` clone is a sequence of its own). Panics when the pool has no
+/// free slot — a clone cannot fail, and a pool sized for its batch has one.
+impl Clone for Pooled {
+    fn clone(&self) -> Self {
+        let slot = self
+            .pool
+            .lease()
+            .expect("StatePool: no free slot for a cloned channel");
+        for (l, &w) in self.written.iter().enumerate() {
+            if !w {
+                continue;
+            }
+            let slabs = self.pool.slabs(l).expect("the layer's slabs");
+            let src = slabs[self.phase[l] as usize]
+                .narrow(0, self.slot, 1)
+                .expect("the source row");
+            // Through a buffer of its own: a slice into the slab it came from.
+            let copy = own_copy(&src).expect("the source row's copy");
+            let _declared = lloom_tensor::EscapeGuard::new();
+            slabs[self.phase[l] as usize]
+                .slice_set(&copy, 0, slot)
+                .expect("the clone's row");
+        }
+        Self {
+            pool: self.pool.clone(),
+            slot,
+            phase: self.phase.clone(),
+            written: self.written.clone(),
+            base_phase: self.base_phase.clone(),
+            base_written: self.base_written.clone(),
+        }
+    }
+}
+
 impl RecurrentState {
+    /// A channel whose state lives in `pool` (a slot leased here, released
+    /// when the channel is dropped): the same API, the slabs the pool's.
+    pub fn in_pool(pool: &StatePool) -> Result<Self> {
+        let n_layers = pool.n_layers();
+        let slot = pool.lease()?;
+        Ok(Self {
+            slab: vec![None; n_layers],
+            base: vec![None; n_layers],
+            spare: vec![None; n_layers],
+            window_open: false,
+            pooled: Some(Pooled {
+                pool: pool.clone(),
+                slot,
+                phase: vec![0; n_layers],
+                written: vec![false; n_layers],
+                base_phase: vec![0; n_layers],
+                base_written: vec![false; n_layers],
+            }),
+        })
+    }
+
+    /// The pool this channel's state lives in, its slot and its phase at
+    /// layer `l` — for a batched kernel over the rows of one pool.
+    pub fn pool_slot(&self, l: usize) -> Option<(&StatePool, usize, u8, bool)> {
+        self.pooled
+            .as_ref()
+            .map(|p| (&p.pool, p.slot, p.phase[l], p.written[l]))
+    }
+
+    /// Row `slot` of layer `l`'s slab at `phase`, a view.
+    fn pool_view(p: &Pooled, l: usize, phase: u8) -> Result<Tensor> {
+        let slabs = p.pool.slabs(l)?;
+        slabs[phase as usize].narrow(0, p.slot, 1)?.squeeze(0)
+    }
+
+    /// Whether the channel is pooled.
+    pub fn is_pooled(&self) -> bool {
+        self.pooled.is_some()
+    }
+
+    /// Flip layer `l` to the other phase (the batched kernel wrote it).
+    pub fn flip_phase(&mut self, l: usize) -> Result<()> {
+        let p = match &mut self.pooled {
+            Some(p) => p,
+            None => lloom_tensor::bail!("RecurrentState::flip_phase on an unpooled channel"),
+        };
+        p.phase[l] ^= 1;
+        p.written[l] = true;
+        self.slab[l] = Some(Self::pool_view(p, l, p.phase[l])?);
+        Ok(())
+    }
+
     /// A fresh channel for `n_layers`, every layer at its implicit zero state.
     /// No device buffers yet — the slab is allocated lazily on first write, at
     /// the shape the block chose (so the channel stays shape-agnostic).
@@ -111,6 +310,7 @@ impl RecurrentState {
             base: vec![None; n_layers],
             spare: vec![None; n_layers],
             window_open: false,
+            pooled: None,
         }
     }
 
@@ -132,6 +332,12 @@ impl RecurrentState {
         if l >= self.slab.len() {
             lloom_tensor::bail!("RecurrentState::take_spare: layer {l} out of range");
         }
+        if let Some(p) = &self.pooled {
+            if !p.written[l] {
+                lloom_tensor::bail!("RecurrentState::take_spare: layer {l} unwritten");
+            }
+            return Self::pool_view(p, l, p.phase[l] ^ 1);
+        }
         let cur = match &self.slab[l] {
             Some(c) => c,
             None => lloom_tensor::bail!("RecurrentState::take_spare: layer {l} unwritten"),
@@ -152,6 +358,19 @@ impl RecurrentState {
     pub fn swap_in(&mut self, l: usize, next: Tensor) -> Result<()> {
         if l >= self.slab.len() {
             lloom_tensor::bail!("RecurrentState::swap_in: layer {l} out of range");
+        }
+        if let Some(p) = &self.pooled {
+            // `next` is the other phase's view (from `take_spare`), written
+            // by a kernel: flip to it.
+            let other = Self::pool_view(p, l, p.phase[l] ^ 1)?;
+            if other.dims() != next.dims() {
+                lloom_tensor::bail!(
+                    "RecurrentState::swap_in: a pooled layer takes its own spare back ({:?} vs {:?})",
+                    next.dims(),
+                    other.dims()
+                );
+            }
+            return self.flip_phase(l);
         }
         if let Some(cur) = &self.slab[l] {
             if cur.dims() != next.dims() {
@@ -188,6 +407,24 @@ impl RecurrentState {
     pub fn write(&mut self, l: usize, next: Tensor) -> Result<()> {
         if l >= self.slab.len() {
             lloom_tensor::bail!("RecurrentState::write: layer {l} out of range");
+        }
+        if let Some(p) = &self.pooled {
+            // Into the other phase (the current one may be a window's base),
+            // then flip. (A kernel that wrote the spare hands it back through
+            // `swap_in`, never here.)
+            let other = Self::pool_view(p, l, p.phase[l] ^ 1)?;
+            if other.elem_count() != next.elem_count() {
+                lloom_tensor::bail!(
+                    "RecurrentState::write: layer {l} shape {:?} != the pool's {:?}",
+                    next.dims(),
+                    other.dims()
+                );
+            }
+            {
+                let _declared = lloom_tensor::EscapeGuard::new();
+                other.slice_set(&next.contiguous()?.reshape(other.shape())?, 0, 0)?;
+            }
+            return self.flip_phase(l);
         }
         match &self.slab[l] {
             // Under an open window the slab may be the base: copy on write
@@ -258,6 +495,11 @@ impl RecurrentState {
         for s in &mut self.base {
             *s = None;
         }
+        if let Some(p) = &mut self.pooled {
+            for w in &mut p.written {
+                *w = false;
+            }
+        }
         self.window_open = false;
     }
 
@@ -268,6 +510,12 @@ impl RecurrentState {
     pub fn open_window(&mut self) -> Result<()> {
         if self.window_open {
             lloom_tensor::bail!("RecurrentState: a speculative window is already open");
+        }
+        if let Some(p) = &mut self.pooled {
+            p.base_phase.clone_from(&p.phase);
+            p.base_written.clone_from(&p.written);
+            self.window_open = true;
+            return Ok(());
         }
         // The base is the slab's buffer itself (a shared handle, no copy):
         // every write inside the window goes to another buffer.
@@ -284,6 +532,10 @@ impl RecurrentState {
     pub fn resolve_window(&mut self) -> Result<()> {
         if !self.window_open {
             lloom_tensor::bail!("RecurrentState: no speculative window is open");
+        }
+        if self.pooled.is_some() {
+            self.window_open = false;
+            return Ok(());
         }
         // A base the window moved away from is a free buffer: the spare.
         for l in 0..self.slab.len() {
@@ -308,6 +560,20 @@ impl RecurrentState {
     pub fn rewind_to_window(&mut self) -> Result<()> {
         if !self.window_open {
             lloom_tensor::bail!("RecurrentState: no speculative window is open");
+        }
+        if let Some(p) = &mut self.pooled {
+            // The old phase was never written inside the window: flip back.
+            p.phase.clone_from(&p.base_phase);
+            p.written.clone_from(&p.base_written);
+            for l in 0..self.slab.len() {
+                self.slab[l] = if p.written[l] {
+                    Some(Self::pool_view(p, l, p.phase[l])?)
+                } else {
+                    None
+                };
+            }
+            self.window_open = false;
+            return Ok(());
         }
         for l in 0..self.slab.len() {
             let base = self.base[l].take();
@@ -471,6 +737,64 @@ mod tests {
         rs.resolve_window().unwrap();
         assert_eq!(rs.get(0).unwrap().id(), base_id);
         assert_eq!(rs.take_spare(0).unwrap().id(), moved_id);
+    }
+
+    /// A pooled channel: its state is a row of the pool at a phase; a write
+    /// lands in the other phase and flips; `take_spare` / `swap_in` flip
+    /// without a copy; a window rewinds by flipping back; a clone leases a
+    /// slot of its own with the state copied; a drop frees the slot.
+    #[test]
+    fn pooled_channel_flips_phases_and_rewinds() {
+        let dev = Device::Cpu;
+        let pool = StatePool::new(2, 1, &[2, 2], lloom_tensor::DType::F32, &dev);
+        let mut rs = RecurrentState::in_pool(&pool).unwrap();
+        assert!(rs.is_pooled());
+        assert!(rs.get(0).is_none());
+        rs.write(0, t(1.0, &dev)).unwrap();
+        let (_, slot, phase, written) = rs.pool_slot(0).unwrap();
+        assert!(written);
+        assert_eq!(phase, 1, "the first write flips to phase 1");
+        assert_eq!(rs.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0], 1.0);
+        // The pool's slab at the row: the value landed there.
+        let slabs = pool.slabs(0).unwrap();
+        assert_eq!(
+            slabs[1]
+                .narrow(0, slot, 1)
+                .unwrap()
+                .to_vec3::<f32>()
+                .unwrap()[0][0][0],
+            1.0
+        );
+        // A kernel's out-of-place step: the spare is the other phase's row.
+        let sp = rs.take_spare(0).unwrap();
+        sp.slice_set(&t(5.0, &dev), 0, 0).unwrap();
+        rs.swap_in(0, sp).unwrap();
+        assert_eq!(rs.pool_slot(0).unwrap().2, 0);
+        assert_eq!(rs.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0], 5.0);
+        // A window: the write inside flips; the rewind flips back.
+        rs.open_window().unwrap();
+        rs.write(0, t(9.0, &dev)).unwrap();
+        assert_eq!(rs.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0], 9.0);
+        rs.rewind_to_window().unwrap();
+        assert_eq!(rs.pool_slot(0).unwrap().2, 0);
+        assert_eq!(rs.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0], 5.0);
+        // A clone leases the other slot and carries the state.
+        let c = rs.clone();
+        assert_ne!(c.pool_slot(0).unwrap().1, slot);
+        assert_eq!(c.get(0).unwrap().to_vec2::<f32>().unwrap()[0][0], 5.0);
+        assert!(
+            RecurrentState::in_pool(&pool).is_err(),
+            "two slots, two leases"
+        );
+        drop(c);
+        assert!(
+            RecurrentState::in_pool(&pool).is_ok(),
+            "the clone's slot freed"
+        );
+        // A reset: unwritten again, the slot kept.
+        rs.reset();
+        assert!(rs.get(0).is_none());
+        assert!(rs.take_spare(0).is_err());
     }
 
     #[test]

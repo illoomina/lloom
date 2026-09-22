@@ -324,9 +324,12 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             // `--batch N`: N private caches in a slot pool and the continuous
             // K = 1 scheduler over `forward_rows` (no prefix sharing: the
             // recurrent channels have no page to share).
+            // The rows' recurrent state in one slot-indexed pool: the
+            // DeltaNet step runs as one launch per kernel over the rows.
             let cfg_model = engine.core.model.config().clone();
+            let pools = engine.core.model.state_pools(opts.batch, &engine.device);
             let mut caches: Vec<Cache> = (0..opts.batch)
-                .map(|_| engine.core.model.new_cache(&cfg_model, &engine.device))
+                .map(|_| Cache::in_pools(&cfg_model, &pools))
                 .collect::<lloom_tensor::Result<_>>()?;
             let pool = SlotPool::new(opts.batch, || caches.pop().expect("one cache per slot"));
             let cfg = BatchConfig {

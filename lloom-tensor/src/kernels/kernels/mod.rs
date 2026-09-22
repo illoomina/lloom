@@ -56,6 +56,7 @@ pub use qwen4exp::{
     call_gdn_step, call_hc_collapse, call_hc_combine, call_hc_norm, call_moe_combine,
     call_moe_slot_map, call_moe_topk, call_qsa_prep, call_qsa_prep_rows, call_sigmoid_mul,
     call_silu_mul, call_unit_lower_inverse,
+    call_gdn_gated_norm_rows, call_gdn_prologue_rows, call_gdn_step_rows,
 };
 pub use scratch::{
     call_scratch_combine, call_scratch_partials, call_scratch_report, ScratchKernel, ScratchParams,

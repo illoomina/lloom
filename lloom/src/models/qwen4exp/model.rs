@@ -184,6 +184,14 @@ pub struct Cache {
     /// not resident (`ExpertResidency::settle`) — the streamed tier's miss
     /// cost under the device plan.
     pub redos: u64,
+    /// Whether the next decode pass plans on the device: armed by a pass
+    /// that completed with every expert resident, disarmed by a pass that
+    /// missed (the cold phase runs the host plan — one token and its loads,
+    /// no replay — and the warm phase the device plan).
+    pub device_plan_armed: bool,
+    /// Decode passes that ran the host plan while the device plan was
+    /// disarmed (the cold phase's length, in tokens).
+    pub host_plan_passes: u64,
 }
 
 /// What a speculative window must put back besides the recurrent channels'
@@ -219,6 +227,8 @@ impl Cache {
             nextn_drops: 0,
             window: None,
             redos: 0,
+            device_plan_armed: false,
+            host_plan_passes: 0,
         }
     }
 
@@ -606,6 +616,38 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         t
     }
 
+    /// Every layer's expert usage counts (`Streamed`; empty rows for
+    /// `Resident`) — the profile a hotlist is made of.
+    pub fn stream_usage(&self) -> Vec<Vec<u32>>
+    where
+        R: crate::nn::expert_stream::HasStreamStats,
+    {
+        self.layers
+            .iter()
+            .map(|l| l.moe().experts().usage())
+            .collect()
+    }
+
+    /// Warm every streamed layer's pool from a hotlist — the head of each
+    /// layer's profile into its free slots (`Streamed::warm`; the MTP head's
+    /// layer too when it is streamed, from the profile's last row). Returns
+    /// the experts loaded.
+    pub fn warm_from_hotlist(&self, hot: &super::hotlist::Hotlist) -> Result<usize>
+    where
+        R: crate::nn::expert_stream::HasStreamStats,
+    {
+        let mut loaded = 0;
+        for (l, layer) in self.layers.iter().enumerate() {
+            let e = layer.moe().experts();
+            let n = e.slots();
+            if n == 0 {
+                continue;
+            }
+            loaded += e.warm(&hot.top(l, n))?;
+        }
+        Ok(loaded)
+    }
+
     /// Slots per layer per projection (`Streamed`), 0 for `Resident`.
     pub fn slots_per_layer(&self) -> usize
     where
@@ -777,6 +819,20 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if !planned {
             return self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l);
         }
+        // The cold phase: a pool that missed on the last pass runs the host
+        // plan — one token and its loads, no replay — until a pass completes
+        // with every expert resident; then the device plan, until it misses.
+        if !cache.device_plan_armed {
+            let before = self.stream_misses();
+            let logits = self
+                .decode_embed_pass(h, cache, obs, false)
+                .map(|(l, _)| l)?;
+            cache.host_plan_passes += 1;
+            if self.stream_misses() == before {
+                cache.device_plan_armed = true;
+            }
+            return Ok(logits);
+        }
         // A pass that computed on a missing expert at layer L was right up to
         // L only (its ids past L came from a wrong carry), so a device-planned
         // replay could miss again one layer further, up to the layer count of
@@ -798,7 +854,17 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
         cache.rewind_window()?;
         cache.redos += 1;
+        cache.device_plan_armed = false;
         self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)
+    }
+
+    /// The streamed tier's misses so far, summed over the layers (0 for
+    /// `Resident`): the cold-phase probe.
+    fn stream_misses(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|l| l.moe().experts().misses_so_far())
+            .sum()
     }
 
     fn decode_embed_pass<O: ForwardObserver>(

@@ -11,6 +11,7 @@ pub mod config;
 pub mod deltanet;
 pub mod deltanet_block;
 pub mod hc;
+pub mod hotlist;
 pub(crate) mod kernels;
 pub mod loader;
 pub mod model;

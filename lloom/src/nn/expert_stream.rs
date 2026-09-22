@@ -78,6 +78,12 @@ pub trait ExpertResidency {
         false
     }
 
+    /// Experts loaded so far (the miss counter), 0 when nothing streams —
+    /// a pass that leaves it unchanged found everything resident.
+    fn misses_so_far(&self) -> u64 {
+        0
+    }
+
     /// The device-side plan of `ids [rows, topk]` (u32, on the device): the
     /// slot ids the dispatch reads — NO host sync, an expert not resident
     /// maps to slot 0 and is flagged — and the plan's record for
@@ -299,6 +305,9 @@ impl LoaderArm {
 #[derive(Debug, Clone)]
 pub struct ResidencyMap {
     slot_of: Vec<u32>,
+    /// Uses per expert (a hit or a miss each time a pass needs it): the
+    /// frequency profile the hotlist is (§20.3 R2).
+    usage: Vec<u32>,
     expert_in: Vec<u32>,
     last_use: Vec<u64>,
     pinned: Vec<bool>,
@@ -311,6 +320,7 @@ impl ResidencyMap {
     pub fn new(n_experts: usize, n_slots: usize) -> Self {
         Self {
             slot_of: vec![NONE; n_experts],
+            usage: vec![0; n_experts],
             expert_in: vec![NONE; n_slots],
             last_use: vec![0; n_slots],
             pinned: vec![false; n_slots],
@@ -384,6 +394,11 @@ impl ResidencyMap {
 
     pub fn pinned_count(&self) -> usize {
         self.pinned.iter().filter(|&&p| p).count()
+    }
+
+    /// Slots holding no expert.
+    pub fn free_slots(&self) -> usize {
+        self.expert_in.iter().filter(|&&e| e == NONE).count()
     }
 }
 
@@ -475,6 +490,15 @@ pub trait HasStreamStats {
     fn slots(&self) -> usize {
         0
     }
+    /// Uses per expert (the frequency profile); empty when nothing is streamed.
+    fn usage(&self) -> Vec<u32> {
+        Vec::new()
+    }
+    /// Warm the pool with `experts` in order (see `Streamed::warm`); the
+    /// number loaded, 0 when nothing is streamed.
+    fn warm(&self, _experts: &[u32]) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 impl HasStreamStats for Resident {
@@ -495,6 +519,12 @@ impl HasStreamStats for Streamed {
     }
     fn slots(&self) -> usize {
         self.n_slots
+    }
+    fn usage(&self) -> Vec<u32> {
+        Streamed::usage(self)
+    }
+    fn warm(&self, experts: &[u32]) -> Result<usize> {
+        Streamed::warm(self, experts)
     }
 }
 
@@ -690,6 +720,51 @@ impl Streamed {
         None
     }
 
+    /// The resident experts, in slot order.
+    pub fn resident(&self) -> Vec<u32> {
+        self.inner.lock().map.resident()
+    }
+
+    /// Uses per expert since construction (the frequency profile: a hit or
+    /// a miss each time a pass needed the expert).
+    pub fn usage(&self) -> Vec<u32> {
+        self.inner.lock().map.usage.clone()
+    }
+
+    /// Warm the pool: load `experts` in order into the FREE slots — the
+    /// head of a frequency profile (§20.3 R2) before the first token —
+    /// evicting nothing and pinning nothing (the pool's policy runs as it
+    /// would over a pool that had seen them). Stops at the first expert
+    /// past the free slots; already-resident experts are skipped. Returns
+    /// the experts loaded.
+    pub fn warm(&self, experts: &[u32]) -> Result<usize> {
+        let mut inner = self.inner.lock();
+        let mut take: Vec<u32> = Vec::new();
+        let mut free = inner.map.free_slots();
+        for &e in experts {
+            if free == 0 {
+                break;
+            }
+            if e as usize >= self.n_experts {
+                lloom_tensor::bail!("warm: expert {e} out of {}", self.n_experts)
+            }
+            if inner.map.slot_of(e as usize).is_some() || take.contains(&e) {
+                continue;
+            }
+            take.push(e);
+            free -= 1;
+        }
+        if take.is_empty() {
+            return Ok(0);
+        }
+        let tick = inner.map.begin();
+        // Loaded as one group (one staging pass); a warm is not a use.
+        let before: Vec<u32> = inner.map.usage.clone();
+        self.resolve(&mut inner, &take, tick)?;
+        inner.map.usage = before;
+        Ok(take.len())
+    }
+
     /// Load `experts` and pin them: they are never evicted until
     /// [`Self::unpin_all`]. The static hot set (§20.3 R2).
     pub fn pin(&self, experts: &[u32]) -> Result<()> {
@@ -726,6 +801,7 @@ impl Streamed {
             if e >= self.n_experts {
                 lloom_tensor::bail!("expert {e} out of {}", self.n_experts)
             }
+            inner.map.usage[e] = inner.map.usage[e].saturating_add(1);
             let slot = match inner.map.slot_of(e) {
                 Some(s) => {
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
@@ -900,7 +976,11 @@ impl lloom_tensor::CustomOp1 for SlotMap {
         let table: Vec<u32> = self.table.flatten_all()?.to_vec1()?;
         let mut out = vec![0u32; 3 * n];
         for (i, &e) in ids.iter().enumerate() {
-            let slot = table.get(e as usize).copied().unwrap_or(NONE);
+            let slot = if (e as usize) < self.n_experts {
+                table.get(e as usize).copied().unwrap_or(NONE)
+            } else {
+                NONE
+            };
             let miss = slot == NONE;
             out[i] = if miss { 0 } else { slot };
             out[n + i] = e;
@@ -979,6 +1059,10 @@ impl ExpertResidency for Streamed {
         true
     }
 
+    fn misses_so_far(&self) -> u64 {
+        self.counters.misses.load(Ordering::Relaxed)
+    }
+
     fn plan_device(&self, ids: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
         let (rows, topk) = ids.dims2()?;
         let n = rows * topk;
@@ -1016,8 +1100,10 @@ impl ExpertResidency for Streamed {
             match inner.map.slot_of(e as usize) {
                 Some(s) => {
                     inner.map.touch(s, tick);
+                    inner.map.usage[e as usize] = inner.map.usage[e as usize].saturating_add(1);
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 }
+                // Counted by `resolve` below.
                 None => missing.push(e),
             }
         }
@@ -1313,6 +1399,58 @@ mod tests {
         let st = streamed.stats();
         assert_eq!(st.settled_misses, settled_with_misses);
         assert!(st.device_plans >= 8);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// `warm` loads the profile's head into the free slots — no eviction,
+    /// no pin, nothing counted as a use — and stops at the pool's edge; a
+    /// warmed pool then hits. `usage` counts every use through both plans.
+    #[test]
+    fn warm_fills_the_free_slots_and_counts_nothing() {
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let streamed = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            5,
+            LoaderArm::Pread,
+            &Device::Cpu,
+        )
+        .unwrap();
+        // Eight asked, five slots: the first five land, no eviction.
+        let loaded = streamed.warm(&[7, 3, 3, 9, 1, 0, 5, 6, 8]).unwrap();
+        assert_eq!(loaded, 5);
+        let st = streamed.stats();
+        assert_eq!((st.misses, st.evictions), (5, 0), "{st:?}");
+        assert!(
+            streamed.usage().iter().all(|&u| u == 0),
+            "a warm counted as a use"
+        );
+        let mut resident = streamed.resident();
+        resident.sort_unstable();
+        assert_eq!(resident, vec![0, 1, 3, 7, 9]);
+        // A second warm of the same finds no free slot: nothing loaded.
+        assert_eq!(streamed.warm(&[2, 4]).unwrap(), 0);
+        // A token over warmed experts: hits only, and the usage counts it.
+        let id = Tensor::from_vec(vec![7u32, 3, 9], (1, topk), &Device::Cpu).unwrap();
+        let (_, record) = streamed.plan_device(&id).unwrap().unwrap();
+        assert!(!streamed.settle(&record).unwrap());
+        let st = streamed.stats();
+        assert_eq!(st.misses, 5, "a warmed expert missed: {st:?}");
+        let u = streamed.usage();
+        assert_eq!((u[7], u[3], u[9], u[1]), (1, 1, 1, 0));
+        let groups = streamed.plan(&id).unwrap();
+        streamed.ensure(&groups[0]).unwrap();
+        assert_eq!(
+            streamed.usage()[7],
+            2,
+            "the host plan did not count the use"
+        );
         std::fs::remove_file(path).ok();
     }
 

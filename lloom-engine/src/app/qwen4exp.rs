@@ -56,6 +56,9 @@ pub struct LoadOptions {
     pub ple: bool,
     pub moe_act: String,
     pub mtp: Option<PathBuf>,
+    /// The expert hotlist file (streamed experts): warm at load, write at
+    /// shutdown.
+    pub hotlist: Option<PathBuf>,
 }
 
 /// The one sequence every request drives, and the rings kept across
@@ -78,6 +81,8 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     mem_sample: bool,
     /// The MTP head is loaded: requests decode through the speculative body.
     mtp: bool,
+    /// The hotlist to write at shutdown (the usage since load merged in).
+    hotlist: Option<PathBuf>,
     /// The tier's load-time description (`[loaded …]`, `/health`).
     tier: Value,
     single: Mutex<Single>,
@@ -164,12 +169,28 @@ impl Engine<Resident> {
                     Qwen4Exp::from_gguf_streamed(&shards, &device, &mload, &stream)
                         .context("loading Qwen4-exp (streamed experts)")?;
                 model.set_prefill_mode(PrefillMode::Chunk);
+                let mut warmed = json!(null);
+                if let Some(path) = &opts.hotlist {
+                    if path.exists() {
+                        let tw = std::time::Instant::now();
+                        let hot = lloom::models::qwen4exp::hotlist::Hotlist::read(path)
+                            .with_context(|| format!("reading the hotlist {}", path.display()))?;
+                        let loaded = model.warm_from_hotlist(&hot)?;
+                        warmed = json!({
+                            "path": path.display().to_string(),
+                            "loaded": loaded,
+                            "bytes": model.stream_stats().bytes_loaded,
+                            "ms": ms(tw.elapsed()),
+                        });
+                    }
+                }
                 let tier = json!({
                     "experts": "stream",
                     "slots_per_layer": model.slots_per_layer(),
                     "loader": opts.loader,
                     "shards": shards.len(),
                     "load_ms": ms(t.elapsed()),
+                    "warm": warmed,
                 });
                 Engine::<Streamed>::finish(model, device, opts, tier)
             }
@@ -269,6 +290,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             prefill_tile: opts.prefill_tile,
             mem_sample: opts.mem_sample,
             mtp,
+            hotlist: opts.hotlist.clone(),
             tier,
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
@@ -691,5 +713,25 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
         }
         Ok(())
     }
-    fn shutdown(&self) {}
+    fn shutdown(&self) {
+        // The hotlist: the file's profile plus the usage since load.
+        if let Some(path) = &self.hotlist {
+            use lloom::models::qwen4exp::hotlist::Hotlist;
+            let mut hot = if path.exists() {
+                match Hotlist::read(path) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("hotlist {}: not read ({e}); rewriting", path.display());
+                        Hotlist::default()
+                    }
+                }
+            } else {
+                Hotlist::default()
+            };
+            hot.merge(&Hotlist::from_usage(&self.model.stream_usage()));
+            if let Err(e) = hot.write(path) {
+                eprintln!("hotlist {}: not written ({e})", path.display());
+            }
+        }
+    }
 }

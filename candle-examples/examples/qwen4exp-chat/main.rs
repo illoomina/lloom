@@ -3,6 +3,9 @@
 //! text pair on the real model (CONTRIBUTING §3.1a), run N times from a fresh
 //! cache so the digest also answers "is the build run-to-run identical".
 //!
+//! `--hotlist <file>` (with `--experts stream`) warms every layer's pool
+//! from the expert frequency profile of earlier runs before the first token
+//! (§20.3 R2) and writes the profile back at exit with this run merged in.
 //! `--experts stream` runs the routed experts through the streamed tier
 //! (issue #749): a per-layer slot pool of `--slots` experts filled from the
 //! shards by `--loader pread|io`; the gate is that its digests equal the
@@ -138,6 +141,12 @@ struct Args {
     /// or `io` (`MTLIOCommandQueue`).
     #[arg(long, default_value = "pread")]
     loader: String,
+
+    /// The expert hotlist file (`--experts stream`): read at load to warm
+    /// every layer's pool before the first token (§20.3 R2; a missing file
+    /// warms nothing), written at exit with this run's usage merged in.
+    #[arg(long)]
+    hotlist: Option<PathBuf>,
 
     /// How the prompt is run: `chunk` (Kernel B + chunk attention, the
     /// reference prefill graph) or `replay` (the decode recurrence one position
@@ -419,7 +428,24 @@ fn main() -> Result<()> {
             let mut model: Qwen4Exp<Streamed> =
                 Qwen4Exp::from_gguf_streamed(&shards, &device, &opts, &stream)?;
             model.set_prefill_mode(prefill_mode);
-            gate(
+            if let Some(path) = &args.hotlist {
+                if path.exists() {
+                    let tw = std::time::Instant::now();
+                    let hot = lloom::models::qwen4exp::hotlist::Hotlist::read(path)?;
+                    let loaded = model.warm_from_hotlist(&hot)?;
+                    let s = model.stream_stats();
+                    println!(
+                        "WARM hotlist={} layers={} loaded={loaded} bytes={} ms={}",
+                        path.display(),
+                        hot.layers.len(),
+                        s.bytes_loaded,
+                        tw.elapsed().as_millis()
+                    );
+                } else {
+                    println!("WARM hotlist={} absent: a cold pool", path.display());
+                }
+            }
+            let out = gate(
                 &model,
                 &args,
                 &shards,
@@ -428,7 +454,24 @@ fn main() -> Result<()> {
                 &prompt_ids,
                 &eos_ids,
                 t0,
-            )
+            );
+            if let Some(path) = &args.hotlist {
+                use lloom::models::qwen4exp::hotlist::Hotlist;
+                let mut hot = if path.exists() {
+                    Hotlist::read(path)?
+                } else {
+                    Hotlist::default()
+                };
+                hot.merge(&Hotlist::from_usage(&model.stream_usage()));
+                hot.write(path)?;
+                println!(
+                    "HOTLIST written={} layers={} entries={}",
+                    path.display(),
+                    hot.layers.len(),
+                    hot.layers.iter().map(|l| l.len()).sum::<usize>()
+                );
+            }
+            out
         }
         other => anyhow::bail!("--experts {other}: resident | stream"),
     }
@@ -641,7 +684,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 st.buffers, st.bytes, st.allocations, st.reuses, st.overflows
             );
             println!(
-                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} redos={}",
+                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} redos={} host_plan_passes={}",
                 args.loader,
                 model.slots_per_layer(),
                 s.plans,
@@ -653,7 +696,8 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 s.hits as f64 / (s.hits + s.misses).max(1) as f64,
                 s.device_plans,
                 s.settled_misses,
-                cache.redos
+                cache.redos,
+                cache.host_plan_passes
             );
         }
         if let Some((hits, misses)) = model.ple_cache_stats() {

@@ -128,6 +128,13 @@ pub struct ModelArgs {
     /// one token per round, the target verifies — byte-identical to greedy.
     #[arg(long)]
     pub mtp: Option<PathBuf>,
+
+    /// Qwen4-exp `--experts stream`: the expert hotlist file — read at load
+    /// to warm every layer's pool before the first request (§20.3 R2; a
+    /// missing file warms nothing), written at shutdown with the usage
+    /// since load merged in.
+    #[arg(long)]
+    pub hotlist: Option<PathBuf>,
 }
 
 /// The serving shape the family builds for: `serve`'s width and cells, or
@@ -267,6 +274,7 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 ple: !model.no_ple,
                 moe_act: model.moe_act.clone(),
                 mtp: model.mtp.clone(),
+                hotlist: model.hotlist.clone(),
             })?;
             Ok((engine, first))
         }

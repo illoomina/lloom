@@ -189,6 +189,21 @@ impl<R: ExpertResidency> Layer<R> {
     /// A chunk through the layer: `res_hc [1, seq, n·d]` → the new carry
     /// (DeltaNet Kernel B / dense chunk attention, per-row MoE).
     pub fn prefill(&self, res_hc: &Tensor, l: usize, cache: &mut Cache) -> Result<Tensor> {
+        let (res_hc, cur, inject) = self.prefill_mix(res_hc, l, cache)?;
+        let moe_out = self.moe.forward(&cur)?;
+        self.prefill_finish(&res_hc, &moe_out, &inject, l)
+    }
+
+    /// The mixer half of [`Self::prefill`]: the carry after the mixer's
+    /// bracket, and the FFN bracket's `(cur, inject)` for the MoE. The
+    /// pipelined prefill (`Qwen4Exp::prefill_embeds_pair`) runs this, the
+    /// MoE's route, then its plan and execute, for two tiles interleaved.
+    pub fn prefill_mix(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        cache: &mut Cache,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // [1, seq, d]
         let mixed = match &self.mixer {
             Mixer::Linear(dn) => dn.prefill(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
@@ -197,9 +212,19 @@ impl<R: ExpertResidency> Layer<R> {
         trace("mixer", l, &mixed);
         let res_hc = self.hc_attn.combine(res_hc, &mixed, &inject)?;
         let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
-        let moe_out = self.moe.forward(&cur)?;
-        trace("moe", l, &moe_out);
-        self.hc_ffn.combine(&res_hc, &moe_out, &inject)
+        Ok((res_hc, cur, inject))
+    }
+
+    /// The other half: the FFN bracket's combine over the MoE's output.
+    pub fn prefill_finish(
+        &self,
+        res_hc: &Tensor,
+        moe_out: &Tensor,
+        inject: &Tensor,
+        l: usize,
+    ) -> Result<Tensor> {
+        trace("moe", l, moe_out);
+        self.hc_ffn.combine(res_hc, moe_out, inject)
     }
 }
 
@@ -572,6 +597,54 @@ pub enum PrefillMode {
 /// Positions per chunk on the [`PrefillMode::Chunk`] path.
 pub const PREFILL_CHUNK: usize = 512;
 
+static PREFILL_CHUNK_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The chunk in force: [`PREFILL_CHUNK`] unless `QWEN4EXP_PREFILL_CHUNK`
+/// (read once) or [`set_prefill_chunk`] (tests) says otherwise.
+pub fn prefill_chunk() -> usize {
+    let v = PREFILL_CHUNK_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let c = std::env::var("QWEN4EXP_PREFILL_CHUNK")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(PREFILL_CHUNK);
+    PREFILL_CHUNK_OVERRIDE.store(c, std::sync::atomic::Ordering::Relaxed);
+    c
+}
+
+pub fn set_prefill_chunk(chunk: usize) {
+    PREFILL_CHUNK_OVERRIDE.store(chunk.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+static PREFILL_PAIR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Whether a multi-chunk prefill runs its chunks two at a time, interleaved
+/// a layer apart on the one queue (`DESIGN.md` §11.5z-ix item 2;
+/// `QWEN4EXP_PREFILL_PAIR`, `0` = chunk after chunk, read once;
+/// [`set_prefill_pair`] for tests). Byte-identical either way: the same
+/// dispatches in the same order per tile.
+pub fn prefill_pair_on() -> bool {
+    let v = PREFILL_PAIR.load(std::sync::atomic::Ordering::Relaxed);
+    if v != u8::MAX {
+        return v != 0;
+    }
+    let on = std::env::var("QWEN4EXP_PREFILL_PAIR")
+        .map(|s| s != "0")
+        .unwrap_or(DEFAULT_PREFILL_PAIR);
+    PREFILL_PAIR.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+pub fn set_prefill_pair(on: bool) {
+    PREFILL_PAIR.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub const DEFAULT_PREFILL_PAIR: bool = true;
+
 /// The N-gram PLE at its one layer.
 #[derive(Debug)]
 pub struct Ple {
@@ -801,8 +874,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 kv_grow += cache.kv[l].grow_bytes_for(seq, nkv, hd, elem);
             }
         }
+        // The constant was measured as the peak over a 512-tile WITH a second
+        // tile in flight (P18); a pass runs at most two tiles at a time (the
+        // pair, or the pacer's depth), so past one chunk the transient does
+        // not grow with the pass.
         let transient = if seq > 1 {
-            PREFILL_TRANSIENT_BYTES_PER_TOKEN.saturating_mul(seq)
+            PREFILL_TRANSIENT_BYTES_PER_TOKEN.saturating_mul(seq.min(prefill_chunk()))
         } else {
             0
         };
@@ -1131,11 +1208,36 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 // stays within the indexer's dense range; positions past it
                 // run one at a time through the selection.
                 let dense_limit = self.dense_limit();
+                let chunk = prefill_chunk();
+                let chunk_len = |start: usize, pos: usize| -> usize {
+                    let mut len = (seq - start).min(chunk);
+                    if let Some(limit) = dense_limit {
+                        len = len.min(limit.saturating_sub(pos)).max(1);
+                    }
+                    len
+                };
+                let pair_ok = prefill_pair_on()
+                    && self.spec_ahead == 0
+                    && !(0..self.layers.len())
+                        .any(|l| obs.wants::<HcStatePoint>(l) || obs.wants::<LayerOutputPoint>(l));
                 let mut start = 0;
                 while start < seq {
-                    let mut len = (seq - start).min(PREFILL_CHUNK);
-                    if let Some(limit) = dense_limit {
-                        len = len.min(limit.saturating_sub(cache.pos)).max(1);
+                    let len = chunk_len(start, cache.pos);
+                    // Two multi-position chunks in a row: one pass, the two
+                    // tiles interleaved a layer apart (the second's layer l−1
+                    // runs while the first's layer l is read back).
+                    let len_b = if pair_ok && len > 1 && start + len < seq {
+                        chunk_len(start + len, cache.pos + len)
+                    } else {
+                        0
+                    };
+                    if len_b > 1 {
+                        let ha = embeds.narrow(1, start, len)?;
+                        let hb = embeds.narrow(1, start + len, len_b)?;
+                        self.prepare_pass_inner(cache, len + len_b)?;
+                        logits = Some(self.prefill_embeds_pair(&ha, &hb, cache)?);
+                        start += len + len_b;
+                        continue;
                     }
                     let h = embeds.narrow(1, start, len)?;
                     // Each chunk is a pass of its own: admitted here when the
@@ -1232,6 +1334,125 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let last = res_hc.narrow(1, seq - 1, 1)?;
         let (collapsed, _) = self.hc_head.mix(&last)?; // [1, 1, d]
         cache.pos += seq;
+        let logits = self.lm_head.forward(&collapsed)?;
+        logits
+            .reshape((1, self.cfg.vocab_size))?
+            .to_dtype(lloom_tensor::DType::F32)
+    }
+
+    /// Two consecutive chunks `ha [1, seq_a, hidden]`, `hb [1, seq_b,
+    /// hidden]` as ONE pass, interleaved a layer apart on the one queue
+    /// (`DESIGN.md` §11.5z-ix item 2): at every layer the host waits for a
+    /// tile's router readback while the GPU runs the OTHER tile's stage,
+    /// encoded before the wait —
+    ///
+    /// ```text
+    /// X(A,0)
+    /// for l:  X(B,l−1) · wait A · M(A,l) · X(A,l+1) · wait B · M(B,l−1)
+    /// X(B,L−1) · wait B · M(B,L−1)
+    /// ```
+    ///
+    /// with X = the mixer bracket and the router (encoded), M = the plan
+    /// (the readback) and the experts (encoded). B's layer l runs after A's
+    /// layer l in the stream, so B attends over A's keys and starts from A's
+    /// recurrent state as a chunk after a chunk does; the PLE pops A's
+    /// tokens before B's. The same dispatches in the same order per tile as
+    /// two `prefill_embeds`: byte-identical. The readback is staged at X
+    /// and waits its own marker at M (`metal_backend::stage_readback`), not
+    /// the queue's tail — a plain `to_cpu` after the other tile's work
+    /// would wait for that work too. Off Metal the two run one after the
+    /// other.
+    pub fn prefill_embeds_pair(
+        &self,
+        ha: &Tensor,
+        hb: &Tensor,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        let n = self.cfg.hc_count;
+        let d = self.cfg.hidden_size;
+        let (_, seq_a, _) = ha.dims3()?;
+        let (_, seq_b, _) = hb.dims3()?;
+        let carry = |h: &Tensor, seq: usize| -> Result<Tensor> {
+            h.reshape((1, seq, 1, d))?
+                .broadcast_as((1, seq, n, d))?
+                .reshape((1, seq, n * d))?
+                .contiguous()
+        };
+        let mut res_a = carry(ha, seq_a)?;
+        let mut res_b = carry(hb, seq_b)?;
+        let n_layers = self.layers.len();
+        let lead = prefetch_lead();
+        for l in 0..lead.min(n_layers) {
+            self.layers[l].moe().experts().prefetch_ahead()?;
+        }
+        // A tile's X stage at layer l: the PLE's delta if this is its layer,
+        // the mixer bracket, the router — and the ids' readback STAGED (a
+        // blit into a CPU-visible copy, its command buffer committed with a
+        // marker), so the M stage waits for that buffer alone.
+        struct Staged {
+            res: Tensor,
+            inject: Tensor,
+            routed: super::moe::PrefillRouted,
+            ids: Option<super::moe::StagedIds>,
+        }
+        let stage_x = |res: &mut Tensor, l: usize, cache: &mut Cache| -> Result<Staged> {
+            if let Some(ple) = &self.ple {
+                if ple.layer == l {
+                    let delta = self.ple_delta(ple, res, cache)?;
+                    trace("ple", l, &delta);
+                    *res = (&*res + delta)?;
+                }
+            }
+            let layer = &self.layers[l];
+            let (res_after, cur, inject) = layer.prefill_mix(res, l, cache)?;
+            let routed = layer.moe().prefill_route(&cur)?;
+            let ids = layer.moe().prefill_stage_ids(&routed)?;
+            Ok(Staged {
+                res: res_after,
+                inject,
+                routed,
+                ids,
+            })
+        };
+        // A tile's M stage: the plan from the staged copy (waits for its
+        // marker; the queue runs on), the experts, the FFN bracket's combine.
+        let stage_m = |st: Staged, l: usize| -> Result<Tensor> {
+            let layer = &self.layers[l];
+            let groups = layer.moe().prefill_plan_staged(&st.routed, st.ids)?;
+            let moe_out = layer.moe().prefill_execute(&st.routed, &groups)?;
+            layer.prefill_finish(&st.res, &moe_out, &st.inject, l)
+        };
+        let hint = |l: usize| -> Result<()> {
+            if let Some(ahead) = self.layers.get(l + lead) {
+                ahead.moe().experts().prefetch_ahead()?;
+            }
+            Ok(())
+        };
+
+        let mut st_a = Some(stage_x(&mut res_a, 0, cache)?);
+        let mut st_b: Option<Staged> = None;
+        for l in 0..n_layers {
+            hint(l)?;
+            if l > 0 {
+                st_b = Some(stage_x(&mut res_b, l - 1, cache)?);
+            }
+            res_a = stage_m(st_a.take().expect("A staged"), l)?;
+            if l + 1 < n_layers {
+                st_a = Some(stage_x(&mut res_a, l + 1, cache)?);
+            }
+            if let Some(st) = st_b.take() {
+                res_b = stage_m(st, l - 1)?;
+            }
+        }
+        let st = stage_x(&mut res_b, n_layers - 1, cache)?;
+        res_b = stage_m(st, n_layers - 1)?;
+
+        cache.keep_nextn(&res_a);
+        cache.keep_nextn(&res_b);
+        // Only the last position feeds the head.
+        let last = res_b.narrow(1, seq_b - 1, 1)?;
+        let (collapsed, _) = self.hc_head.mix(&last)?; // [1, 1, d]
+        cache.pos += seq_a + seq_b;
         let logits = self.lm_head.forward(&collapsed)?;
         logits
             .reshape((1, self.cfg.vocab_size))?

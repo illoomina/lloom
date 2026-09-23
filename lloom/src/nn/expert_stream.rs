@@ -78,6 +78,20 @@ pub trait ExpertResidency {
         false
     }
 
+    /// [`Self::plan`] over ids already on the host (`rows × topk`, row
+    /// major) — for a caller that read them back itself, staged
+    /// (`metal_backend::stage_readback`) so the wait was its own marker's.
+    /// `None` when the strategy plans on the device tensor (`Resident`):
+    /// the caller then uses `plan`, which reads nothing back there.
+    fn plan_host(
+        &self,
+        _ids: &[u32],
+        _rows: usize,
+        _topk: usize,
+    ) -> Result<Option<Vec<RoutedGroup>>> {
+        Ok(None)
+    }
+
     /// Experts loaded so far (the miss counter), 0 when nothing streams —
     /// a pass that leaves it unchanged found everything resident.
     fn misses_so_far(&self) -> u64 {
@@ -1406,6 +1420,28 @@ impl Streamed {
     }
 }
 
+impl Streamed {
+    /// The host plan over ids on the host: the greedy row grouping to the
+    /// pool, counted.
+    fn plan_rows_host(&self, host: &[u32], rows: usize, topk: usize) -> Vec<RoutedGroup> {
+        self.counters.plans.fetch_add(1, Ordering::Relaxed);
+        let groups = plan_rows(host, rows, topk, self.n_slots);
+        self.counters
+            .groups
+            .fetch_add(groups.len() as u64, Ordering::Relaxed);
+        groups
+            .into_iter()
+            .map(|r| RoutedGroup {
+                ids: GroupIds::Host {
+                    ids: host[r.start * topk..r.end * topk].to_vec(),
+                    topk,
+                },
+                rows: r,
+            })
+            .collect()
+    }
+}
+
 /// Greedy row grouping: consecutive rows whose distinct experts fit `n_slots`.
 fn plan_rows(ids: &[u32], rows: usize, topk: usize, n_slots: usize) -> Vec<Range<usize>> {
     let mut groups = Vec::new();
@@ -1726,21 +1762,14 @@ impl ExpertResidency for Streamed {
         self.counters
             .readback_ns
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        self.counters.plans.fetch_add(1, Ordering::Relaxed);
-        let groups = plan_rows(&host, rows, topk, self.n_slots);
-        self.counters
-            .groups
-            .fetch_add(groups.len() as u64, Ordering::Relaxed);
-        Ok(groups
-            .into_iter()
-            .map(|r| RoutedGroup {
-                ids: GroupIds::Host {
-                    ids: host[r.start * topk..r.end * topk].to_vec(),
-                    topk,
-                },
-                rows: r,
-            })
-            .collect())
+        Ok(self.plan_rows_host(&host, rows, topk))
+    }
+
+    fn plan_host(&self, ids: &[u32], rows: usize, topk: usize) -> Result<Option<Vec<RoutedGroup>>> {
+        if ids.len() != rows * topk {
+            lloom_tensor::bail!("plan_host: {} ids for {rows} rows × {topk}", ids.len())
+        }
+        Ok(Some(self.plan_rows_host(ids, rows, topk)))
     }
 
     fn ensure(&self, group: &RoutedGroup) -> Result<Tensor> {

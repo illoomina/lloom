@@ -160,6 +160,62 @@ impl StagedMetalRead {
     }
 }
 
+/// A readback in two halves (`DESIGN.md` §11.5z-ix item 2): `stage_readback`
+/// copies the storage into a CPU-visible buffer NOW — a blit on the current
+/// command buffer, which it commits with a marker — and `finish` waits for
+/// THAT buffer alone and reads. Between the two the host may encode and
+/// commit other work (the other tile's stage, in a pipelined prefill), and
+/// `finish` does not wait for it: an in-order queue runs the blit's buffer
+/// first. The plain `to_cpu` waits for the queue's tail, so a readback
+/// issued after the other tile's work would wait for that work too.
+pub struct StagedReadback {
+    buffer: Arc<PooledBuffer>,
+    marker: CommandMarker,
+    count: usize,
+    device: MetalDevice,
+}
+
+impl StagedReadback {
+    /// Wait for the blit's command buffer and read the copy.
+    pub fn finish<T: Clone>(self) -> Result<Vec<T>> {
+        self.device.wait_marker(&self.marker)?;
+        Ok(read_to_vec(&self.buffer, self.count))
+    }
+}
+
+/// Stage the readback of a contiguous Metal tensor (`StagedReadback`).
+pub fn stage_readback(t: &crate::Tensor) -> Result<StagedReadback> {
+    let (storage, layout) = t.storage_and_layout();
+    let m = match &*storage {
+        crate::Storage::Metal(m) => m,
+        _ => crate::bail!("stage_readback: a Metal tensor"),
+    };
+    if !layout.is_contiguous() {
+        crate::bail!("stage_readback: a contiguous tensor")
+    }
+    let count = layout.shape().elem_count();
+    let elem = m.dtype.size_in_bytes();
+    let size = count * elem;
+    let buffer = m
+        .device
+        .new_buffer_builder()
+        .with_size(size.max(1))
+        .with_label("staged_readback_dst")
+        .build()?;
+    {
+        let mut blit = m.device.blit_command_encoder()?;
+        blit.set_label("staged_readback");
+        blit.copy_from_buffer(&m.buffer, layout.start_offset() * elem, &buffer, 0, size);
+    }
+    let marker = m.device.flush_marker()?;
+    Ok(StagedReadback {
+        buffer,
+        marker,
+        count,
+        device: m.device.clone(),
+    })
+}
+
 pub fn to_cpu_force_blit() -> bool {
     static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCE.get_or_init(|| {

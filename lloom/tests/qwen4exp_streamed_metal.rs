@@ -4,7 +4,9 @@
 #![cfg(feature = "metal")]
 
 use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Config, Qwen4Exp, Streamed};
+use lloom::models::qwen4exp::{
+    set_prefill_chunk, set_prefill_pair, Config, Qwen4Exp, Streamed, PREFILL_CHUNK,
+};
 use lloom::nn::expert_stream::{ExpertSource, LoaderArm};
 use lloom::nn::model::CausalLM;
 use lloom_tensor::kernels::metal::io_queue::IoQueue;
@@ -86,8 +88,13 @@ fn run<R: lloom::nn::ExpertResidency>(
     Ok(rows)
 }
 
+/// The prefill knobs (`set_prefill_chunk`, `set_prefill_pair`) are process
+/// statics: the tests here take turns.
+static KNOBS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn both_loader_arms_match_the_resident_model_on_metal() -> Result<()> {
+    let _knobs = KNOBS.lock().unwrap_or_else(|e| e.into_inner());
     let dev = Device::new_metal(0)?;
     let mut cfg = Config::tiny();
     cfg.n_experts = 12;
@@ -191,6 +198,61 @@ fn both_loader_arms_match_the_resident_model_on_metal() -> Result<()> {
         hinted.io_inflight_landed
     );
     assert_eq!(hinted.bytes_loaded, bytes2, "bytes must be the queue's");
+    std::fs::remove_file(&path).ok();
+    Ok(())
+}
+
+/// The paired prefill (two chunks interleaved a layer apart, one pass)
+/// against chunk after chunk, on the pread arm with a pool smaller than a
+/// chunk's working set (loads at every layer of both tiles): the same
+/// logits bit for bit, for the prefill's last position and the decode
+/// steps after it (the KV, the recurrent state and the PLE window the pair
+/// left behind are what the single path leaves).
+#[test]
+fn paired_prefill_matches_chunk_after_chunk_on_metal() -> Result<()> {
+    let _knobs = KNOBS.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = Device::new_metal(0)?;
+    let mut cfg = Config::tiny();
+    cfg.n_experts = 12;
+    cfg.n_experts_per_tok = 3;
+    cfg.moe_intermediate_size = 32;
+    let path = std::env::temp_dir().join(format!("lloom-749-pair-{}.gguf", std::process::id()));
+    write_checkpoint(&cfg, &path)?;
+    // Chunks of 3 over an 8-token prompt: (3, 3) paired, then 2 alone.
+    set_prefill_chunk(3);
+    let run_with = |pair: bool| -> Result<Vec<Vec<f32>>> {
+        set_prefill_pair(pair);
+        let model = streamed(&cfg, &path, 5, LoaderArm::Pread, &dev)?;
+        let prompt: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9, 4];
+        let mut cache = model.new_cache(&cfg, &dev)?;
+        let mut rows = Vec::new();
+        let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), &dev)?;
+        let mut logits = model.forward(&input, 0, &mut cache)?;
+        rows.push(logits.flatten_all()?.to_vec1::<f32>()?);
+        assert_eq!(
+            cache.pos,
+            prompt.len(),
+            "the pass must advance the position"
+        );
+        for _ in 0..4 {
+            let next = logits.flatten_all()?.argmax(0)?.to_scalar::<u32>()?;
+            let input = Tensor::from_vec(vec![next], (1, 1), &dev)?;
+            logits = model.forward(&input, cache.pos, &mut cache)?;
+            rows.push(logits.flatten_all()?.to_vec1::<f32>()?);
+        }
+        Ok(rows)
+    };
+    let single = run_with(false)?;
+    let paired = run_with(true)?;
+    set_prefill_chunk(PREFILL_CHUNK);
+    set_prefill_pair(lloom::models::qwen4exp::DEFAULT_PREFILL_PAIR);
+    assert!(single[0].iter().any(|v| v.abs() > 1e-6));
+    for (i, (a, b)) in single.iter().zip(&paired).enumerate() {
+        assert!(
+            a == b,
+            "paired prefill: logits row {i} differs from chunk after chunk"
+        );
+    }
     std::fs::remove_file(&path).ok();
     Ok(())
 }

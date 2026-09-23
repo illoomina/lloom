@@ -393,6 +393,17 @@ fn prefill_tiled<R: ExpertResidency>(
     tile: usize,
     device: &Device,
 ) -> Result<Tensor> {
+    use lloom::models::qwen4exp::{prefill_chunk, prefill_pair_on};
+    // Under the paired prefill a tile is two chunks — the pass interleaves
+    // them a layer apart — and the pacer's depth is 1: the pair IS the two
+    // tiles in flight the transient constant was measured with.
+    let (tile, depth) = if tile != 0 && prefill_pair_on() && tile <= prefill_chunk() {
+        (2 * prefill_chunk(), 1)
+    } else if tile > prefill_chunk() {
+        (tile, 1)
+    } else {
+        (tile, 2)
+    };
     #[cfg(feature = "metal")]
     let mut markers: std::collections::VecDeque<candle::metal_backend::CommandMarker> =
         std::collections::VecDeque::new();
@@ -406,8 +417,8 @@ fn prefill_tiled<R: ExpertResidency>(
         model.prepare_pass(cache, w)?;
         #[cfg(feature = "metal")]
         if let Device::Metal(m) = device {
-            while markers.len() >= 2 {
-                let oldest = markers.pop_front().expect("len >= 2");
+            while markers.len() >= depth {
+                let oldest = markers.pop_front().expect("len >= depth");
                 m.wait_marker(&oldest)?;
             }
         }

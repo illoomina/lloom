@@ -133,6 +133,29 @@ impl<R: ExpertResidency> MoeLayer<R> {
     }
 
     fn forward_inner(&self, x: &Tensor, device_plan: bool) -> Result<(Tensor, Option<Tensor>)> {
+        let r = self.prefill_route(x)?;
+        let device_plan = if device_plan {
+            self.experts.plan_device(&r.ids)?
+        } else {
+            None
+        };
+        let (y, record) = match device_plan {
+            // One group over the slot ids the device resolved.
+            Some((slot_ids, rec)) => (self.routed_one_group(&r.x3, &slot_ids)?, Some(rec)),
+            None => {
+                let groups = self.experts.plan(&r.ids)?;
+                (self.routed_groups(&r.x3, &groups)?, None)
+            }
+        };
+        Ok((self.finish(&r, &y)?, record))
+    }
+
+    /// The routing of `x [1, seq, hidden]`, encoded and not read back:
+    /// the router, the top-k ids and weights, the routed arm's activations.
+    /// The first of the three stages a pipelined prefill drives separately
+    /// (`DESIGN.md` §11.5z-ix item 2): route (encode) → plan (the readback)
+    /// → execute (encode). `forward` is the three in a row.
+    pub fn prefill_route(&self, x: &Tensor) -> Result<PrefillRouted> {
         let (b0, seq0, hidden) = x.dims3()?;
         // The MoE is position-wise: `B` rows of one token are `B` positions
         // of one sequence to it (the batched decode's `[B, 1, hidden]`).
@@ -178,63 +201,121 @@ impl<R: ExpertResidency> MoeLayer<R> {
         // one group over the ids as they are; `Streamed` groups the rows to
         // its slot pool and resolves each group's ids to slots first.
         let x3 = x1.to_dtype(self.routed_act)?.reshape((seq, 1, hidden))?; // [seq, 1, hidden]
-        let device_plan = if device_plan {
-            self.experts.plan_device(&ids)?
+        Ok(PrefillRouted {
+            x1,
+            x3,
+            ids,
+            w,
+            b0,
+            seq0,
+            seq,
+            hidden,
+            topk,
+        })
+    }
+
+    /// The host plan of a routing: the ids read back and grouped to the
+    /// pool (`ExpertResidency::plan`) — the one host wait of a layer.
+    pub fn prefill_plan(&self, r: &PrefillRouted) -> Result<Vec<RoutedGroup>> {
+        self.experts.plan(&r.ids)
+    }
+
+    /// Stage the ids' readback now (a blit and a marker, Metal), so
+    /// [`Self::prefill_plan_staged`] waits for that alone later — the
+    /// pipelined prefill's split of the one host wait. `None` where the
+    /// residency plans on the device tensor (nothing to read back) or off
+    /// Metal.
+    pub fn prefill_stage_ids(&self, r: &PrefillRouted) -> Result<Option<StagedIds>> {
+        #[cfg(feature = "metal")]
+        if self.experts.plans_on_device() && r.ids.device().is_metal() {
+            return Ok(Some(lloom_tensor::metal_backend::stage_readback(&r.ids)?));
+        }
+        let _ = r;
+        Ok(None)
+    }
+
+    /// [`Self::prefill_plan`] from a staged readback: the ids from the
+    /// copy, the groups from them.
+    pub fn prefill_plan_staged(
+        &self,
+        r: &PrefillRouted,
+        staged: Option<StagedIds>,
+    ) -> Result<Vec<RoutedGroup>> {
+        #[cfg(feature = "metal")]
+        if let Some(st) = staged {
+            let ids: Vec<u32> = st.finish()?;
+            if let Some(groups) = self.experts.plan_host(&ids, r.seq, r.topk)? {
+                return Ok(groups);
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = staged;
+        self.prefill_plan(r)
+    }
+
+    /// The experts over the planned groups, the shared expert, the combine:
+    /// the layer's MoE output `[b, seq, hidden]`.
+    pub fn prefill_execute(&self, r: &PrefillRouted, groups: &[RoutedGroup]) -> Result<Tensor> {
+        let y = self.routed_groups(&r.x3, groups)?;
+        self.finish(r, &y)
+    }
+
+    /// The routed experts over one device-resolved group of slot ids.
+    fn routed_one_group(&self, x3: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
+        let (g, u) = self.experts.gate_up(x3, slot_ids)?;
+        let h = match super::kernels::silu_mul(&g, &u) {
+            Some(h) => h?,
+            None => (ops::silu(&g)? * u)?,
+        };
+        self.experts.down(&h, slot_ids)
+    }
+
+    /// The routed experts over the host plan's groups, each ensured (its
+    /// misses loaded) as the pass reaches it, the later groups' misses
+    /// prefetched while it runs.
+    fn routed_groups(&self, x3: &Tensor, groups: &[RoutedGroup]) -> Result<Tensor> {
+        let mut ys = Vec::with_capacity(groups.len());
+        for (gi, group) in groups.iter().enumerate() {
+            let slot_ids = self.experts.ensure(group)?;
+            // The later groups' misses read while this group runs.
+            if gi + 1 < groups.len() {
+                self.experts.prefetch_groups(&groups[gi + 1..])?;
+            }
+            let xg = if groups.len() == 1 {
+                x3.clone()
+            } else {
+                x3.narrow(0, group.rows.start, group.rows.len())?
+            };
+            let (g, u) = self.experts.gate_up(&xg, &slot_ids)?; // [rows, topk, n_ff] each
+            super::trace("moe.g", usize::MAX, &g);
+            super::trace("moe.u", usize::MAX, &u);
+            let h = match super::kernels::silu_mul(&g, &u) {
+                Some(h) => h?,
+                None => (ops::silu(&g)? * u)?,
+            };
+            ys.push(self.experts.down(&h, &slot_ids)?); // [rows, topk, hidden]
+        }
+        if ys.len() == 1 {
+            Ok(ys.pop().expect("one group"))
         } else {
-            None
-        };
-        let mut record = None;
-        let y = match device_plan {
-            // One group over the slot ids the device resolved.
-            Some((slot_ids, rec)) => {
-                record = Some(rec);
-                let (g, u) = self.experts.gate_up(&x3, &slot_ids)?;
-                let h = match super::kernels::silu_mul(&g, &u) {
-                    Some(h) => h?,
-                    None => (ops::silu(&g)? * u)?,
-                };
-                self.experts.down(&h, &slot_ids)?
-            }
-            None => {
-                let groups = self.experts.plan(&ids)?;
-                let mut ys = Vec::with_capacity(groups.len());
-                for (gi, group) in groups.iter().enumerate() {
-                    let slot_ids = self.experts.ensure(group)?;
-                    // The later groups' misses read while this group runs.
-                    if gi + 1 < groups.len() {
-                        self.experts.prefetch_groups(&groups[gi + 1..])?;
-                    }
-                    let xg = if groups.len() == 1 {
-                        x3.clone()
-                    } else {
-                        x3.narrow(0, group.rows.start, group.rows.len())?
-                    };
-                    let (g, u) = self.experts.gate_up(&xg, &slot_ids)?; // [rows, topk, n_ff] each
-                    super::trace("moe.g", usize::MAX, &g);
-                    super::trace("moe.u", usize::MAX, &u);
-                    let h = match super::kernels::silu_mul(&g, &u) {
-                        Some(h) => h?,
-                        None => (ops::silu(&g)? * u)?,
-                    };
-                    ys.push(self.experts.down(&h, &slot_ids)?); // [rows, topk, hidden]
-                }
-                if ys.len() == 1 {
-                    ys.pop().expect("one group")
-                } else {
-                    Tensor::cat(&ys, 0)?
-                }
-            }
-        };
-        super::trace("moe.y", usize::MAX, &y);
+            Tensor::cat(&ys, 0)
+        }
+    }
+
+    /// The shared expert and the combine over the routed output `y [seq,
+    /// topk, hidden]` → `[b, seq, hidden]`.
+    fn finish(&self, r: &PrefillRouted, y: &Tensor) -> Result<Tensor> {
+        let (x1, w, seq, hidden, topk) = (&r.x1, &r.w, r.seq, r.hidden, r.topk);
+        super::trace("moe.y", usize::MAX, y);
 
         // Shared expert: SwiGLU gated by sigmoid(sh_router·x), always on.
-        let shared = swiglu(&x1, &self.sh_gate, &self.sh_up, &self.sh_down)?;
-        let sh_logit = self.sh_router.forward(&x1)?.to_dtype(shared.dtype())?; // [seq, 1]
+        let shared = swiglu(x1, &self.sh_gate, &self.sh_up, &self.sh_down)?;
+        let sh_logit = self.sh_router.forward(x1)?.to_dtype(shared.dtype())?; // [seq, 1]
 
         // The routed combine over the top-k plus the gated shared expert: one
         // launch on Metal (`kernels::MoeCombine`), the composed five elsewhere.
         let y32 = y.to_dtype(DType::F32)?;
-        let out = match super::kernels::moe_combine(&y32, &w, &shared, &sh_logit, topk, hidden) {
+        let out = match super::kernels::moe_combine(&y32, w, &shared, &sh_logit, topk, hidden) {
             Some(o) => o?.to_dtype(x1.dtype())?,
             None => {
                 let routed = y32
@@ -246,8 +327,28 @@ impl<R: ExpertResidency> MoeLayer<R> {
                 (routed + shared)?
             }
         };
-        Ok((out.reshape((b0, seq0, hidden))?, record))
+        out.reshape((r.b0, r.seq0, hidden))
     }
+}
+
+/// A staged readback of a routing's ids (Metal); nothing elsewhere.
+#[cfg(feature = "metal")]
+pub type StagedIds = lloom_tensor::metal_backend::StagedReadback;
+#[cfg(not(feature = "metal"))]
+pub type StagedIds = ();
+
+/// A layer's routing, encoded (`MoeLayer::prefill_route`): what the plan
+/// reads back (`ids`) and what the execute needs after it.
+pub struct PrefillRouted {
+    x1: Tensor,
+    x3: Tensor,
+    ids: Tensor,
+    w: Tensor,
+    b0: usize,
+    seq0: usize,
+    seq: usize,
+    hidden: usize,
+    topk: usize,
 }
 
 /// SwiGLU: `down( silu(gate(x)) * up(x) )`.

@@ -75,6 +75,13 @@ struct Req {
     generation: u64,
     expert: u32,
     planes: [PlaneSource; 3],
+    /// A `load_now` request: the layer is waiting for it, so it is read
+    /// past the staged-bytes cap — the cap bounds what the HINTS hold, and
+    /// a hint's leftovers holding the cap against a needed read is a
+    /// deadlock the host cannot break (it is the one who would take them:
+    /// measured 125 s in one `load_now` under the paired prefill, #749
+    /// P26).
+    now: bool,
 }
 
 /// Relaxed atomics, read off the hot path.
@@ -234,6 +241,7 @@ impl Prefetcher {
                     generation: gen,
                     expert: e,
                     planes: planes.clone(),
+                    now: false,
                 });
             }
             left
@@ -284,6 +292,7 @@ impl Prefetcher {
                     generation: gen,
                     expert: e,
                     planes: planes.clone(),
+                    now: true,
                 });
             }
             gen
@@ -476,7 +485,10 @@ fn worker(w: Arc<Shared>) {
                 }
                 if let Some(front) = g.reqs.front() {
                     let need: usize = front.planes.iter().map(|p| p.plane_bytes).sum();
-                    if g.staged_bytes + need <= w.max_staged_bytes || g.staged_bytes == 0 {
+                    if front.now
+                        || g.staged_bytes + need <= w.max_staged_bytes
+                        || g.staged_bytes == 0
+                    {
                         break;
                     }
                     w.counters.parked.fetch_add(1, Ordering::Relaxed);

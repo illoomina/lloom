@@ -1251,6 +1251,7 @@ impl Commands {
         if let Some(enc) = state.current_encoder.take() {
             self.end_encoding(enc);
         }
+        let t_end_enc = timed.map(|t| t.elapsed());
 
         // Publish any allocations a pool MISS staged with `ResidencySet::add`
         // (`DESIGN.md` §6.3b) before committing this command buffer, so every
@@ -1258,6 +1259,7 @@ impl Commands {
         // them (§3.7). A load-and-branch when nothing was staged, which is every
         // commit that did not follow a miss — the whole steady-state.
         self.residency_set.commit_pending();
+        let t_residency = timed.map(|t| t.elapsed());
 
         // The signal goes here and it can go nowhere else. `encodeSignalEvent:
         // value:` is documented "may only be called if there is no current
@@ -1318,6 +1320,10 @@ impl Commands {
             _ => {
                 self.clock.mark_completed(epoch);
             }
+        }
+        let t_committed = timed.map(|t| t.elapsed());
+        if let (Some(a), Some(b), Some(c)) = (t_end_enc, t_residency, t_committed) {
+            crate::kernels::metal::profile::record_commit_parts(a, b - a, c - b);
         }
         let created = timed.map(|_| std::time::Instant::now());
         let new_cb = create_command_buffer(&self.command_queue)?;

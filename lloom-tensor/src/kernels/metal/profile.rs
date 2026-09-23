@@ -196,6 +196,26 @@ pub fn record_create_cb(elapsed: std::time::Duration) {
     CREATE_CB_NS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
 }
 
+static END_ENC_NS: AtomicU64 = AtomicU64::new(0);
+static RESIDENCY_NS: AtomicU64 = AtomicU64::new(0);
+static CB_COMMIT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// The three halves of a `commit_swap_locked` beside the creation: ending
+/// the encoder (the fence map), the residency set's commit, and the
+/// command buffer's own `commit` with its handlers — so a seam's cost is
+/// attributed, not summed (issue #749 P26: 0.45 ms a seam at prefill
+/// against 16 µs at decode).
+#[inline]
+pub fn record_commit_parts(
+    end_enc: std::time::Duration,
+    residency: std::time::Duration,
+    cb_commit: std::time::Duration,
+) {
+    END_ENC_NS.fetch_add(end_enc.as_nanos() as u64, Ordering::Relaxed);
+    RESIDENCY_NS.fetch_add(residency.as_nanos() as u64, Ordering::Relaxed);
+    CB_COMMIT_NS.fetch_add(cb_commit.as_nanos() as u64, Ordering::Relaxed);
+}
+
 /// Record one `flush_and_prune`, `elapsed` on the calling thread.
 #[inline]
 pub fn record_prune(elapsed: std::time::Duration) {
@@ -507,6 +527,11 @@ pub struct Snapshot {
     pub commit_ns: u64,
     /// The `commandBuffer()` creations inside those commits, encoding-thread time.
     pub create_cb_ns: u64,
+    /// Inside those commits: ending the encoder, the residency commit, the
+    /// command buffer's `commit` (see `record_commit_parts`).
+    pub end_enc_ns: u64,
+    pub residency_ns: u64,
+    pub cb_commit_ns: u64,
     /// `flush_and_prune` calls, and the encoding-thread time they took.
     pub prunes: u64,
     pub prune_ns: u64,
@@ -564,6 +589,9 @@ pub fn snapshot() -> Snapshot {
         commits: COMMITS.load(Ordering::Relaxed),
         commit_ns: COMMIT_NS.load(Ordering::Relaxed),
         create_cb_ns: CREATE_CB_NS.load(Ordering::Relaxed),
+        end_enc_ns: END_ENC_NS.load(Ordering::Relaxed),
+        residency_ns: RESIDENCY_NS.load(Ordering::Relaxed),
+        cb_commit_ns: CB_COMMIT_NS.load(Ordering::Relaxed),
         prunes: PRUNES.load(Ordering::Relaxed),
         prune_ns: PRUNE_NS.load(Ordering::Relaxed),
         fence_probes: FENCE_PROBES.load(Ordering::Relaxed),

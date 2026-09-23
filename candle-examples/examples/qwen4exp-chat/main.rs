@@ -49,7 +49,7 @@ fn profile_line(run: usize, phase: &str, tokens: usize, wall_ms: f64) {
         let s = profile::snapshot();
         let busy = 1e3 * s.gpu_busy_union_s;
         println!(
-            "PROFILE run={run} phase={phase} tokens={tokens} wall_ms={wall_ms:.1} gpu_busy_ms={busy:.1} gpu_span_ms={:.1} busy_over_wall={:.3} dispatches={} per_token={:.0} encoders={} command_buffers={} commits={} commit_ms={:.1}",
+            "PROFILE run={run} phase={phase} tokens={tokens} wall_ms={wall_ms:.1} gpu_busy_ms={busy:.1} gpu_span_ms={:.1} busy_over_wall={:.3} dispatches={} per_token={:.0} encoders={} command_buffers={} commits={} commit_ms={:.1} end_enc_ms={:.1} residency_ms={:.1} cb_commit_ms={:.1} create_cb_ms={:.1}",
             1e3 * s.gpu_span_s,
             busy / wall_ms.max(1e-9),
             s.dispatches,
@@ -58,6 +58,10 @@ fn profile_line(run: usize, phase: &str, tokens: usize, wall_ms: f64) {
             s.command_buffers,
             s.commits,
             s.commit_ns as f64 / 1e6,
+            s.end_enc_ns as f64 / 1e6,
+            s.residency_ns as f64 / 1e6,
+            s.cb_commit_ns as f64 / 1e6,
+            s.create_cb_ns as f64 / 1e6,
         );
         let mut by = s.by_label.clone();
         by.sort_by(|a, b| b.1.cmp(&a.1));
@@ -335,6 +339,20 @@ fn mem_line(run: usize, phase: &str, device: &Device, report: Option<MemReport>)
         gb(now.phys_footprint),
         gb(now.working_set),
     );
+    #[cfg(feature = "metal")]
+    if let Device::Metal(d) = device {
+        // The residency set's traffic (cumulative): how many `commit`s the
+        // command-buffer cuts and the pool's misses made, and the set's size
+        // — the seam's cost at prefill is this commit (issue #749 P26).
+        let c = d.residency_counters();
+        line.push_str(&format!(
+            " residency_allocations={} residency_commits={} residency_added={} residency_removed={}",
+            d.residency_set_len(),
+            c.commits,
+            c.added,
+            c.removed
+        ));
+    }
     if let Some(r) = report {
         if let Some(p) = r.peak {
             line.push_str(&format!(

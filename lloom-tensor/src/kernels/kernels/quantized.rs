@@ -633,6 +633,193 @@ pub fn call_quantized_matmul_mv_id_t(
     Ok(())
 }
 
+/// The routed GEMM's row block (`BLOCK_SIZE_N` of `kernel_mul_mm_id_impl`).
+pub const MM_ID_BLOCK_ROWS: usize = 32;
+
+/// Blocks a routed tile of `rows × topk` pairs over `n_experts` can need at
+/// most: one part-block per expert plus the full blocks — the grid's x and
+/// the map's capacity (`kernel_moe_rowmap`).
+pub fn mm_id_block_bound(rows: usize, topk: usize, n_experts: usize) -> usize {
+    (rows * topk).div_ceil(MM_ID_BLOCK_ROWS) + n_experts
+}
+
+/// `kernel_moe_rowmap`: the router's `ids [rows, topk]` (u32) → `rowids`
+/// (`rows·topk` ushort2), `blocks` (`3 · bound` u32), `meta` (1 u32, the
+/// block count). One threadgroup.
+#[allow(clippy::too_many_arguments)]
+pub fn call_moe_rowmap(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    topk: usize,
+    n_experts: usize,
+    ids: &Buffer,
+    ids_offset: usize,
+    rowids: &Buffer,
+    blocks: &Buffer,
+    meta: &Buffer,
+    bound: usize,
+) -> Result<(), MetalKernelError> {
+    if n_experts > 1024 {
+        return Err(MetalKernelError::LoadFunctionError(format!(
+            "moe_rowmap: n_experts {n_experts} > 1024"
+        )));
+    }
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, "kernel_moe_rowmap")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "moe_rowmap rows={rows} topk={topk} E={n_experts}");
+    set_params!(
+        encoder,
+        (
+            (ids, ids_offset),
+            Output::new(rowids),
+            Output::new(blocks),
+            Output::new(meta),
+            (rows * topk) as u32,
+            topk as u32,
+            n_experts as u32,
+            MM_ID_BLOCK_ROWS as u32,
+            bound as u32
+        )
+    );
+    let width = 1024usize.min(pipeline.max_total_threads_per_threadgroup());
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+/// The routed GEMM over the rows grouped by expert (`kernel_mul_mm_id_mapped`,
+/// lloom #749 P22): `src0` the stacked expert weights `[n_experts, n, k]`,
+/// `src1` the f32 activations `[batch, in_dim1, k]` (`in_dim1` 1 or `topk`),
+/// the map from [`call_moe_rowmap`], `dst [batch, topk, n]` f32 as the
+/// matmul-vec lays it. One expert's weight is read once per 32-row block of
+/// the rows routed to it, where the matmul-vec reads it once per row: the
+/// prefill tile's arm (`LLOOM_MOE_MM_FROM`). Not bit-identical to the
+/// matmul-vec: the weights dequantize to f16 for the simdgroup multiply.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm_id_mapped(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    (n_experts, n, k): (usize, usize, usize),
+    (batch, topk, in_dim1): (usize, usize, usize),
+    src0: &Buffer,
+    src1: &Buffer,
+    src1_offset: usize,
+    rowids: &Buffer,
+    blocks: &Buffer,
+    meta: &Buffer,
+    bound: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let stem = match dtype {
+        GgmlDType::F32 => "f32",
+        GgmlDType::F16 => "f16",
+        GgmlDType::Q4_0 => "q4_0",
+        GgmlDType::Q4_1 => "q4_1",
+        GgmlDType::Q5_0 => "q5_0",
+        GgmlDType::Q5_1 => "q5_1",
+        GgmlDType::Q8_0 => "q8_0",
+        GgmlDType::Q2_0 => "q2_0",
+        GgmlDType::Q2K => "q2_K",
+        GgmlDType::Q3K => "q3_K",
+        GgmlDType::Q4K => "q4_K",
+        GgmlDType::Q5K => "q5_K",
+        GgmlDType::Q6K => "q6_K",
+        GgmlDType::IQ2XXS => "iq2_xxs",
+        GgmlDType::IQ2XS => "iq2_xs",
+        GgmlDType::IQ2S => "iq2_s",
+        GgmlDType::IQ3XXS => "iq3_xxs",
+        GgmlDType::IQ3S => "iq3_s",
+        GgmlDType::IQ4NL => "iq4_nl",
+        GgmlDType::IQ4XS => "iq4_xs",
+        GgmlDType::Q8_1 | GgmlDType::Q8K | GgmlDType::BF16 => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "no kernel_mul_mm_id_mapped arm for this weight dtype",
+                "routed quantized matmul (rows grouped by expert)",
+            ))
+        }
+    };
+    if in_dim1 != 1 && in_dim1 != topk {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "routed matmul activation dim1 must be 1 or topk",
+            "routed quantized matmul (rows grouped by expert)",
+        ));
+    }
+    let name = format!("kernel_mul_mm_id_mapped_{stem}_f32");
+    let row_bytes = ((k / dtype_block_size(dtype)) * dtype_type_size(dtype)) as u64;
+    let act = core::mem::size_of::<f32>() as u64;
+    let ne00 = k as i64;
+    let ne02 = n_experts as i64;
+    let nb01 = row_bytes;
+    let nb02 = n as u64 * row_bytes;
+    let ne11 = in_dim1 as i64;
+    let ne12 = batch as i64;
+    let nb10 = act;
+    let nb11 = k as u64 * act;
+    let nb12 = (in_dim1 * k) as u64 * act;
+    let ne0 = n as i64;
+    let ne1 = topk as i64;
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name.clone())?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "qmm_mm_id {name} E={n_experts} B={batch} topk={topk} K={k} N={n}"
+    );
+    set_params!(
+        encoder,
+        (
+            src0,
+            (src1, src1_offset),
+            Output::new(dst),
+            rowids,
+            blocks,
+            meta,
+            ne00,
+            ne02,
+            nb01,
+            nb02,
+            ne11,
+            ne12,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1
+        )
+    );
+    encoder.set_threadgroup_memory_length(0, 8192 + MM_ID_BLOCK_ROWS * 4);
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: bound,
+            height: divide(n, 64),
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// Elements per block of a weight dtype (the ggml `blck_size`).
 fn dtype_block_size(dtype: GgmlDType) -> usize {
     match dtype {

@@ -7899,6 +7899,144 @@ kernel void kernel_mul_mm_id(
 
 #define QK_NL 16
 
+// ---- routed matmul with the rows grouped by expert (lloom #749 P22) ----
+//
+// `kernel_mul_mm_id` above scans every id per threadgroup to find its
+// expert's rows, which is quadratic in the tile; the pair below splits that
+// into ONE map pass and a GEMM whose grid is bounded by the block count.
+//
+// `kernel_moe_rowmap`: `ids [n = rows·topk]` (the router's u32 expert ids,
+// row-major) → per expert its `(slot, row)` pairs contiguous in `rowids`
+// (ushort2, the pair `kernel_mul_mm_id_impl` reads), and the 32-row blocks
+// the GEMM runs over: `blocks[3·b] = expert, [3·b+1] = first index into
+// rowids, [3·b+2] = count`, `meta[0]` = the block count (≤ `bound`; a tile
+// whose blocks exceed it is refused by the host before the dispatch). One
+// threadgroup: the histogram in threadgroup atomics, the scan and the
+// scatter by one thread so the order within an expert is the ids' order —
+// deterministic; the GEMM's bits do not depend on it either way (each
+// output row's K-loop is the same at every column).
+kernel void kernel_moe_rowmap(
+        device const int32_t * ids    [[buffer(0)]],
+        device       ushort2 * rowids [[buffer(1)]],
+        device       uint    * blocks [[buffer(2)]],
+        device       uint    * meta   [[buffer(3)]],
+        constant        uint & n      [[buffer(4)]],
+        constant        uint & topk   [[buffer(5)]],
+        constant        uint & n_experts [[buffer(6)]],
+        constant        uint & block_n [[buffer(7)]],
+        constant        uint & bound  [[buffer(8)]],
+        uint tid   [[thread_position_in_threadgroup]],
+        uint width [[threads_per_threadgroup]]) {
+    threadgroup atomic_uint hist[1024];
+    threadgroup uint offs[1024];
+    for (uint e = tid; e < n_experts; e += width) {
+        atomic_store_explicit(&hist[e], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < n; i += width) {
+        const int32_t e = ids[i];
+        if (e >= 0 && (uint)e < n_experts) {
+            atomic_fetch_add_explicit(&hist[e], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint acc = 0;
+        uint nb = 0;
+        for (uint e = 0; e < n_experts; e++) {
+            const uint c = atomic_load_explicit(&hist[e], memory_order_relaxed);
+            offs[e] = acc;
+            for (uint j = 0; j < c; j += block_n) {
+                if (nb < bound) {
+                    blocks[3 * nb]     = e;
+                    blocks[3 * nb + 1] = acc + j;
+                    blocks[3 * nb + 2] = min(block_n, c - j);
+                }
+                nb++;
+            }
+            acc += c;
+        }
+        meta[0] = nb;
+        for (uint i = 0; i < n; i++) {
+            const int32_t e = ids[i];
+            if (e < 0 || (uint)e >= n_experts) continue;
+            rowids[offs[e]++] = ushort2(i % topk, i / topk);
+        }
+    }
+}
+
+// The GEMM over one 32-row block of one expert per threadgroup column:
+// `blocks`/`rowids`/`meta` from `kernel_moe_rowmap`, the grid's x bounded by
+// the host (a threadgroup past `meta[0]` returns at once), y over the
+// output rows in 64s. `dst [rows, topk, ne0]` as `kernel_mul_mv_id` lays it.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_mul_mm_id_mapped(
+        device const   uchar * src0s,
+        device const   uchar * src1,
+        device         float * dst,
+        device const ushort2 * rowids,
+        device const    uint * blocks,
+        device const    uint * meta,
+        constant     int64_t & ne00,
+        constant     int64_t & ne02,
+        constant    uint64_t & nb01,
+        constant    uint64_t & nb02,
+        constant     int64_t & ne11,
+        constant     int64_t & ne12,
+        constant    uint64_t & nb10,
+        constant    uint64_t & nb11,
+        constant    uint64_t & nb12,
+        constant     int64_t & ne0,
+        constant     int64_t & ne1,
+        threadgroup    uchar * shared_memory [[threadgroup(0)]],
+        uint3                  tgpig[[threadgroup_position_in_grid]],
+        uint                   tiitg[[thread_index_in_threadgroup]],
+        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint b = tgpig.x;
+    if (b >= meta[0]) return;
+    const uint e     = blocks[3 * b];
+    const uint first = blocks[3 * b + 1];
+    const uint cnt   = blocks[3 * b + 2];
+    threadgroup ushort2 * rid = (threadgroup ushort2 *)(shared_memory + 8192);
+    if (tiitg < cnt) {
+        rid[tiitg] = rowids[first + tiitg];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const uchar * src0 = src0s + e * nb02;
+    const uint3 tg = uint3(0, tgpig.y, 0);
+    kernel_mul_mm_id_impl<block_q, nl, dequantize_func>(
+        src0, src1, rid, dst,
+        ne00, ne02, nb01, nb02, ne11, ne12, nb10, nb11, nb12,
+        ne0, (int64_t)cnt, ne0 * ne1,
+        shared_memory, tg, tiitg, sgitg);
+}
+
+typedef decltype(kernel_mul_mm_id_mapped<float4x4, 1, dequantize_f32>) mat_mm_id_mapped_t;
+
+template [[host_name("kernel_mul_mm_id_mapped_f32_f32")]]     kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<float4x4,      1,     dequantize_f32>;
+template [[host_name("kernel_mul_mm_id_mapped_f16_f32")]]     kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<half4x4,       1,     dequantize_f16>;
+template [[host_name("kernel_mul_mm_id_mapped_q4_0_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q4_0,    2,     dequantize_q4_0>;
+template [[host_name("kernel_mul_mm_id_mapped_q4_1_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q4_1,    2,     dequantize_q4_1>;
+template [[host_name("kernel_mul_mm_id_mapped_q5_0_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q5_0,    2,     dequantize_q5_0>;
+template [[host_name("kernel_mul_mm_id_mapped_q5_1_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q5_1,    2,     dequantize_q5_1>;
+template [[host_name("kernel_mul_mm_id_mapped_q8_0_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q8_0,    2,     dequantize_q8_0>;
+template [[host_name("kernel_mul_mm_id_mapped_q2_0_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q2_0,    4,     dequantize_q2_0>;
+template [[host_name("kernel_mul_mm_id_mapped_q2_K_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q2_K,    QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_mul_mm_id_mapped_q3_K_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q3_K,    QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_mul_mm_id_mapped_q4_K_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q4_K,    QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_mul_mm_id_mapped_q5_K_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q5_K,    QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_mul_mm_id_mapped_q6_K_f32")]]    kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_q6_K,    QK_NL, dequantize_q6_K>;
+template [[host_name("kernel_mul_mm_id_mapped_iq2_xxs_f32")]] kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+template [[host_name("kernel_mul_mm_id_mapped_iq2_xs_f32")]]  kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_iq2_xs,  QK_NL, dequantize_iq2_xs>;
+template [[host_name("kernel_mul_mm_id_mapped_iq3_xxs_f32")]] kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
+template [[host_name("kernel_mul_mm_id_mapped_iq3_s_f32")]]   kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_iq3_s,   QK_NL, dequantize_iq3_s>;
+template [[host_name("kernel_mul_mm_id_mapped_iq2_s_f32")]]   kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_iq2_s,   QK_NL, dequantize_iq2_s>;
+template [[host_name("kernel_mul_mm_id_mapped_iq1_s_f32")]]   kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_iq1_s,   QK_NL, dequantize_iq1_s>;
+template [[host_name("kernel_mul_mm_id_mapped_iq1_m_f32")]]   kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_iq1_m,   QK_NL, dequantize_iq1_m>;
+template [[host_name("kernel_mul_mm_id_mapped_iq4_nl_f32")]]  kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_iq4_nl,  2,     dequantize_iq4_nl>;
+template [[host_name("kernel_mul_mm_id_mapped_iq4_xs_f32")]]  kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
+
+
 //
 // get rows
 //

@@ -611,6 +611,65 @@ impl QMetalStorage {
             .with_size_for(dst_shape.elem_count(), store_dtype)
             .with_label("qmatmul_id")
             .build()?;
+        // The rows-grouped-by-expert GEMM for a tile (lloom #749 P22): from
+        // `moe_mm_from()` rows, f32 activations, every weight kind with a
+        // `kernel_mul_mm_id_mapped` arm. The matmul-vec keeps the decode
+        // rows byte-identical.
+        let from = moe_mm_from();
+        if from > 0 && batch >= from && triple == GemvTriple::F32F32F32 && mm_id_has_arm(ggml_dtype)
+        {
+            let bound = crate::kernels::mm_id_block_bound(batch, topk, n_experts);
+            let rowids = device
+                .new_buffer_builder()
+                .with_size_for(batch * topk, DType::U32)
+                .with_label("moe_rowids")
+                .build()?;
+            let blocks = device
+                .new_buffer_builder()
+                .with_size_for(3 * bound, DType::U32)
+                .with_label("moe_blocks")
+                .build()?;
+            let meta = device
+                .new_buffer_builder()
+                .with_size_for(1, DType::U32)
+                .with_label("moe_rowmap_meta")
+                .build()?;
+            let encoder = device.command_encoder()?;
+            crate::kernels::call_moe_rowmap(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                batch,
+                topk,
+                n_experts,
+                ids.buffer(),
+                ids_l.start_offset() * DType::U32.size_in_bytes(),
+                &rowids,
+                &blocks,
+                &meta,
+                bound,
+            )
+            .map_err(MetalError::from)?;
+            crate::kernels::call_quantized_matmul_mm_id_mapped(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                ggml_dtype,
+                (n_experts, n, k),
+                (batch, topk, in_dim1),
+                &self.buffer,
+                input.buffer(),
+                input_l.start_offset() * input.dtype().size_in_bytes(),
+                &rowids,
+                &blocks,
+                &meta,
+                bound,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+            let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), store_dtype);
+            return Ok((out, dst_shape));
+        }
         let encoder = device.command_encoder()?;
         crate::kernels::call_quantized_matmul_mv_id_t(
             device.device(),
@@ -878,4 +937,39 @@ impl From<GgmlDType> for crate::kernels::GgmlDType {
             GgmlDType::Q2_0 => crate::kernels::GgmlDType::Q2_0,
         }
     }
+}
+
+/// Rows from which `QMetalStorage::indexed_moe_forward` takes the GEMM with
+/// the rows grouped by expert (`kernel_mul_mm_id_mapped`) instead of the
+/// matmul-vec: `LLOOM_MOE_MM_FROM` (0 = never), read once; default 16 — a
+/// decode step (1 row, a batch of up to 8, an MTP verify of K+1) keeps the
+/// byte-identical matmul-vec, a prefill tile takes the GEMM. Settable for
+/// the tests and an A/B (`set_moe_mm_from`).
+pub fn moe_mm_from() -> usize {
+    let v = MOE_MM_FROM.load(std::sync::atomic::Ordering::Relaxed);
+    if v != usize::MAX {
+        return v;
+    }
+    let from = std::env::var("LLOOM_MOE_MM_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MOE_MM_FROM);
+    MOE_MM_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
+    from
+}
+
+pub const DEFAULT_MOE_MM_FROM: usize = 64;
+
+/// Override [`moe_mm_from`] for the rest of the process.
+pub fn set_moe_mm_from(from: usize) {
+    MOE_MM_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
+}
+
+static MOE_MM_FROM: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Whether a weight kind has a `kernel_mul_mm_id_mapped` arm.
+fn mm_id_has_arm(dtype: crate::kernels::GgmlDType) -> bool {
+    use crate::kernels::GgmlDType as G;
+    !matches!(dtype, G::Q8_1 | G::Q8K | G::BF16)
 }

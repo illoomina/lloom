@@ -70,6 +70,22 @@ fn profile_line(run: usize, phase: &str, tokens: usize, wall_ms: f64) {
             "PROFILE run={run} phase={phase} labels_per_token {}",
             top.join(" ")
         );
+        // GPU time by label: where the busy time goes (ms per token).
+        let mut gt = profile::gpu_time_by_label_detailed();
+        gt.sort_by(|a, b| {
+            b.total_s
+                .partial_cmp(&a.total_s)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let top: Vec<String> = gt
+            .iter()
+            .take(24)
+            .map(|k| format!("{}={:.3}", k.label, 1e3 * k.total_s / tokens.max(1) as f64))
+            .collect();
+        println!(
+            "PROFILE run={run} phase={phase} gpu_ms_per_token_by_label {}",
+            top.join(" ")
+        );
         profile::reset();
     }
     #[cfg(not(feature = "metal"))]

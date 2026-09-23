@@ -182,3 +182,183 @@ fn blocks_at_rows_1_and_4() {
         );
     }
 }
+
+/// A 512-position prefill tile through each block at the real geometry
+/// (64 Q8_0 experts stand in for 512: the routed cost is per (row, expert)
+/// pair, not per expert count): where the tile's GPU time goes, the MoE
+/// split into the router (`route_ids`: gemm + top-k) and the rest. The
+/// command-buffer-granular profile cannot see inside a layer (a buffer's
+/// label is its last dispatch); this can.
+#[test]
+#[ignore]
+fn blocks_at_seq_512() {
+    let dev = Device::new_metal(0).unwrap();
+    let mut cfg = Config::flash_next();
+    cfg.n_experts = 64;
+    let d = cfg.hidden_size;
+    let nd = cfg.hc_dim();
+    let cc = cfg.conv_channels();
+    let vd = cfg.ssm_state_size * cfg.ssm_dt_rank;
+    let hv = cfg.ssm_dt_rank;
+    let (hd, nh, nkv) = (cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
+    let hc = || {
+        HyperConnection::new(
+            ones(nd, &dev),
+            f16w(cfg.hc_lowrank, nd, &dev),
+            f16w(nd, cfg.hc_lowrank, &dev),
+            Some(f16w(cfg.hc_count, nd, &dev)),
+            cfg.hc_count,
+            d,
+            cfg.norm_eps as f32,
+        )
+        .unwrap()
+    };
+    let dn = GatedDeltaNet::new(
+        q4(cc, d, &dev),
+        q4(vd, d, &dev),
+        Tensor::randn(0f32, 0.2, (cc, cfg.ssm_conv_kernel), &dev).unwrap(),
+        Tensor::full(-0.5f32, hv, &dev).unwrap(),
+        Tensor::zeros(hv, DType::F32, &dev).unwrap(),
+        f16w(hv, d, &dev),
+        f16w(hv, d, &dev),
+        ones(cfg.ssm_state_size, &dev),
+        q4(d, vd, &dev),
+        &cfg,
+    );
+    let qsa = QsaAttention::new(
+        q4(nh * hd * 2, d, &dev),
+        q4(nkv * hd, d, &dev),
+        q4(nkv * hd, d, &dev),
+        q4(d, nh * hd, &dev),
+        RmsNorm::new(ones(hd, &dev), cfg.norm_eps),
+        RmsNorm::new(ones(hd, &dev), cfg.norm_eps),
+        &cfg,
+    );
+    let [g, u, dn_w] = testing::expert_stacks(&cfg, 0, &dev, GgmlDType::Q8_0);
+    let moe = MoeLayer::new(
+        q4(cfg.n_experts, d, &dev),
+        Resident::new(Arc::new(g), Arc::new(u), Arc::new(dn_w)),
+        q4(cfg.shared_expert_intermediate_size, d, &dev),
+        q4(cfg.shared_expert_intermediate_size, d, &dev),
+        q4(d, cfg.shared_expert_intermediate_size, &dev),
+        QMatMul::Tensor(Tensor::randn(0f32, 0.05, (1, d), &dev).unwrap()),
+        &cfg,
+    );
+    let hc_a = hc();
+    let steps = 10;
+    for seq in [512usize, 128] {
+        let h = Tensor::randn(0f32, 0.3, (1, seq, nd), &dev).unwrap();
+        let xin = Tensor::randn(0f32, 0.3, (1, seq, d), &dev).unwrap();
+        let t_hc = time(&dev, steps, || {
+            let (m, i) = hc_a.mix(&h).unwrap();
+            let _ = hc_a.combine(&h, &m, &i).unwrap();
+        });
+        let mut s = RecurrentState::new(1);
+        let mut c = RecurrentState::new(1);
+        let t_dn = time(&dev, steps, || {
+            let _ = dn.prefill(&xin, 0, &mut s, &mut c).unwrap();
+        });
+        let t_qsa = time(&dev, steps, || {
+            let mut kv = KvCache::default();
+            let _ = qsa.prefill(&xin, &mut kv).unwrap();
+        });
+        let t_route = time(&dev, steps, || {
+            let _ = moe.route_ids(&xin).unwrap();
+        });
+        let t_moe = time(&dev, steps, || {
+            let _ = moe.forward(&xin).unwrap();
+        });
+        println!(
+            "PREFILLTIME seq={seq} hc_bracket={t_hc:.2}ms deltanet_prefill={t_dn:.2}ms qsa_prefill={t_qsa:.2}ms moe_route={t_route:.2}ms moe_forward={t_moe:.2}ms  per_token_ms: hc={:.3} dn={:.3} qsa={:.3} route={:.3} moe={:.3}",
+            t_hc / seq as f64,
+            t_dn / seq as f64,
+            t_qsa / seq as f64,
+            t_route / seq as f64,
+            t_moe / seq as f64,
+        );
+    }
+}
+
+/// A `[e, out, inp]` expert stack of `dtype` from deterministic bytes (the
+/// IQ kinds and Q2_0 have no quantiser; any bytes decode to a finite-enough
+/// block for a timing), read through `TensorInfo::read` as the loader does.
+fn raw_stack(e: usize, out: usize, inp: usize, dtype: GgmlDType, dev: &Device) -> QTensor {
+    use lloom_tensor::quantized::gguf_file::TensorInfo;
+    let n = e * out * inp;
+    let bytes = n / dtype.block_size() * dtype.type_size();
+    let mut x: u32 = 0x9e37_79b9;
+    let data: Vec<u8> = (0..bytes)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            // scale bytes (f16) in a sane range: keep the exponent modest
+            (x & 0x3f) as u8 | 0x30
+        })
+        .collect();
+    let info = TensorInfo {
+        ggml_dtype: dtype,
+        shape: lloom_tensor::Shape::from((e, out, inp)),
+        offset: 0,
+    };
+    info.read(&mut std::io::Cursor::new(data), 0, dev).unwrap()
+}
+
+/// The MoE tile per weight kind of the checkpoint (IQ3_XXS gate/up, IQ4_XS
+/// and Q2_0 down, Q8_0 for reference): the routed GEMM with the rows
+/// grouped by expert (`kernel_mul_mm_id_mapped`) against the routed
+/// matmul-vec at 512 and 128 rows, 64 experts. The GEMM dequantises every
+/// weight of every expert once per 32-row block through the generic
+/// `dequantize_*`; the matmul-vec's IQ arms are hand-tuned — which wins is
+/// per kind (issue #749 P22).
+#[test]
+#[ignore]
+fn moe_tile_by_weight_kind() {
+    use lloom_tensor::quantized::metal::set_moe_mm_from;
+    let dev = Device::new_metal(0).unwrap();
+    let mut cfg = Config::flash_next();
+    cfg.n_experts = 64;
+    let d = cfg.hidden_size;
+    let ff = cfg.moe_intermediate_size;
+    let steps = 10;
+    // (gate/up kind over k = 2560, down kind over k = 640 — the 256-block
+    // kinds cannot pack a 640 row, which is why the checkpoint's down planes
+    // are Q2_0 / IQ4_NL).
+    for (dtype, down) in [
+        (GgmlDType::IQ3XXS, GgmlDType::IQ4NL),
+        (GgmlDType::IQ3S, GgmlDType::Q2_0),
+        (GgmlDType::IQ2S, GgmlDType::IQ4NL),
+        (GgmlDType::IQ4XS, GgmlDType::Q2_0),
+        (GgmlDType::Q8_0, GgmlDType::Q8_0),
+    ] {
+        let moe = MoeLayer::new(
+            q4(cfg.n_experts, d, &dev),
+            Resident::new(
+                Arc::new(raw_stack(cfg.n_experts, ff, d, dtype, &dev)),
+                Arc::new(raw_stack(cfg.n_experts, ff, d, dtype, &dev)),
+                Arc::new(raw_stack(cfg.n_experts, d, ff, down, &dev)),
+            ),
+            q4(cfg.shared_expert_intermediate_size, d, &dev),
+            q4(cfg.shared_expert_intermediate_size, d, &dev),
+            q4(d, cfg.shared_expert_intermediate_size, &dev),
+            QMatMul::Tensor(Tensor::randn(0f32, 0.05, (1, d), &dev).unwrap()),
+            &cfg,
+        );
+        for seq in [512usize, 128, 32] {
+            let xin = Tensor::randn(0f32, 0.3, (1, seq, d), &dev).unwrap();
+            set_moe_mm_from(0);
+            let t_mv = time(&dev, steps, || {
+                let _ = moe.forward(&xin).unwrap();
+            });
+            set_moe_mm_from(1);
+            let t_mm = time(&dev, steps, || {
+                let _ = moe.forward(&xin).unwrap();
+            });
+            println!(
+                "MOEKIND gate_up={dtype:?} down={down:?} seq={seq} moe_mv={t_mv:.2}ms moe_mm={t_mm:.2}ms ratio={:.2}",
+                t_mv / t_mm
+            );
+        }
+    }
+    set_moe_mm_from(lloom_tensor::quantized::metal::DEFAULT_MOE_MM_FROM);
+}

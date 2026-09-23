@@ -78,8 +78,9 @@ pub use params::{
     UpsampleNearest2dParams,
 };
 pub use quantized::{
-    call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_id_t,
-    call_quantized_matmul_mv_t, GemvFloat, GemvTriple, GgmlDType,
+    call_moe_rowmap, call_quantized_get_rows, call_quantized_matmul_mm_id_mapped,
+    call_quantized_matmul_mm_t, call_quantized_matmul_mv_id_t, call_quantized_matmul_mv_t,
+    mm_id_block_bound, GemvFloat, GemvTriple, GgmlDType, MM_ID_BLOCK_ROWS,
 };
 pub use random::*;
 pub use reduce::*;

@@ -618,6 +618,21 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     cfg: Config,
 }
 
+/// Layers the usage hint leads the running layer by on a prefill pass:
+/// `QWEN4EXP_PREFETCH_LEAD`, read once, default 2 — a layer's misses
+/// (~330 MB at 512 rows) take ~50 ms at the SSD's eight-thread rate against
+/// a layer-tile's ~46 ms of GPU, so one layer of lead stalls (P25).
+pub fn prefetch_lead() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QWEN4EXP_PREFETCH_LEAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n >= 1)
+            .unwrap_or(2)
+    })
+}
+
 /// `QWEN4EXP_SPEC_AHEAD`, read once: 0 | 1 | 2 (see `Qwen4Exp::set_spec_ahead`).
 fn spec_ahead_from_env() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -1155,6 +1170,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // the layer's routed dispatch.
         let n_layers = self.layers.len();
         let spec = self.spec_ahead > 0;
+        // The usage hint does not depend on the carry, so it can lead by
+        // any number of layers; the staged-bytes cap is what bounds the
+        // lead (`prefetch_lead`: a layer's misses are ~330 MB of a 1 GiB cap).
+        let lead = prefetch_lead();
         if spec {
             // Layers 0 and 1 from the embedding's carry, read back now: no
             // layer runs before them to hide the read behind.
@@ -1164,8 +1183,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             if n_layers > 1 {
                 self.hint_land(self.hint_encode(1, &res_hc)?)?;
             }
-        } else if let Some(first) = self.layers.first() {
-            first.moe().experts().prefetch_ahead()?;
+        } else {
+            for l in 0..lead.min(n_layers) {
+                self.layers[l].moe().experts().prefetch_ahead()?;
+            }
         }
         for (l, layer) in self.layers.iter().enumerate() {
             // Under speculation: layer l+2's router on the carry entering
@@ -1177,8 +1198,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 None
             };
             if !spec {
-                if let Some(next) = self.layers.get(l + 1) {
-                    next.moe().experts().prefetch_ahead()?;
+                if let Some(ahead) = self.layers.get(l + lead) {
+                    ahead.moe().experts().prefetch_ahead()?;
                 }
             }
             if let Some(ple) = &self.ple {

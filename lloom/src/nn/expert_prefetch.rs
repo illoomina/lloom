@@ -149,9 +149,11 @@ pub struct Prefetcher {
 }
 
 /// Reader threads by default: one `pread` of a 0.58 MB plane is latency-bound
-/// (one thread read ~0.7 GB/s on this machine, issue #749 P19); several in
-/// flight reach the SSD's bandwidth. `LLOOM_PREFETCH_THREADS` overrides.
-pub const DEFAULT_THREADS: usize = 4;
+/// (the SSD reads 2.2 GB/s at one in flight, 6.6 at four, 8.6 at eight, 9.9
+/// at thirty-two — `p25-ssd-random-0.58MB.txt`); eight took the warmed
+/// prefill from 6.2 to 5.6 s and the hotlist warm from 5.1 to 4.1, sixteen
+/// no further (P25). `LLOOM_PREFETCH_THREADS` overrides.
+pub const DEFAULT_THREADS: usize = 8;
 
 fn threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();

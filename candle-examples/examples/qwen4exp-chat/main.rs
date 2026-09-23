@@ -972,7 +972,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked
             );
             println!(
-                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={}",
+                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0}",
                 args.loader,
                 model.slots_per_layer(),
                 s.plans,
@@ -986,7 +986,11 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 s.settled_misses,
                 s.prefetch_now,
                 cache.redos,
-                cache.host_plan_passes
+                cache.host_plan_passes,
+                s.readback_ns as f64 / 1e6,
+                s.load_now_ns as f64 / 1e6,
+                s.land_ns as f64 / 1e6,
+                s.sync_load_ns as f64 / 1e6
             );
         }
         if let Some((hits, misses)) = model.ple_cache_stats() {

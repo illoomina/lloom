@@ -477,6 +477,13 @@ pub struct StreamCounters {
     /// Misses read through the prefetcher's threads at the layer
     /// (`Prefetcher::load_now`) rather than one by one on this thread.
     pub prefetch_now: AtomicU64,
+    /// Host nanoseconds: the ids readback in `plan` (the GPU drain), the
+    /// `load_now` waits, the staged landings' encode, the synchronous
+    /// loads — where a layer's wall goes beside its GPU time.
+    pub readback_ns: AtomicU64,
+    pub load_now_ns: AtomicU64,
+    pub land_ns: AtomicU64,
+    pub sync_load_ns: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -505,6 +512,10 @@ pub struct StreamStats {
     pub device_plans: u64,
     pub settled_misses: u64,
     pub prefetch_now: u64,
+    pub readback_ns: u64,
+    pub load_now_ns: u64,
+    pub land_ns: u64,
+    pub sync_load_ns: u64,
 }
 
 impl StreamCounters {
@@ -519,6 +530,10 @@ impl StreamCounters {
             device_plans: self.device_plans.load(Ordering::Relaxed),
             settled_misses: self.settled_misses.load(Ordering::Relaxed),
             prefetch_now: self.prefetch_now.load(Ordering::Relaxed),
+            readback_ns: self.readback_ns.load(Ordering::Relaxed),
+            load_now_ns: self.load_now_ns.load(Ordering::Relaxed),
+            land_ns: self.land_ns.load(Ordering::Relaxed),
+            sync_load_ns: self.sync_load_ns.load(Ordering::Relaxed),
         }
     }
 }
@@ -528,6 +543,10 @@ impl std::ops::AddAssign for StreamStats {
         self.device_plans += o.device_plans;
         self.settled_misses += o.settled_misses;
         self.prefetch_now += o.prefetch_now;
+        self.readback_ns += o.readback_ns;
+        self.load_now_ns += o.load_now_ns;
+        self.land_ns += o.land_ns;
+        self.sync_load_ns += o.sync_load_ns;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -963,6 +982,7 @@ impl Streamed {
                         inner.sources[1].plane_source(),
                         inner.sources[2].plane_source(),
                     ];
+                    let t0 = std::time::Instant::now();
                     let mut got: std::collections::HashMap<
                         u32,
                         crate::nn::expert_prefetch::Staged,
@@ -971,6 +991,9 @@ impl Streamed {
                         .into_iter()
                         .map(|s| (s.expert, s))
                         .collect();
+                    self.counters
+                        .load_now_ns
+                        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let mut rest = Vec::new();
                     for &(e, s) in &misses {
                         match got.remove(&(e as u32)) {
@@ -985,12 +1008,20 @@ impl Streamed {
                 }
             }
             if !landed.is_empty() {
+                let t0 = std::time::Instant::now();
                 self.land_staged(inner, landed)?;
+                self.counters
+                    .land_ns
+                    .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 inner.table_stale = true;
             }
         }
         if !misses.is_empty() {
+            let t0 = std::time::Instant::now();
             self.load(inner, &misses)?;
+            self.counters
+                .sync_load_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             // The device mirror of the table no longer matches (whichever
             // path installed: a host plan, a settle, a pin).
             inner.table_stale = true;
@@ -1426,7 +1457,11 @@ impl ExpertResidency for Streamed {
 
     fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>> {
         let (rows, topk) = ids.dims2()?;
+        let t0 = std::time::Instant::now();
         let host: Vec<u32> = ids.flatten_all()?.to_vec1::<u32>()?;
+        self.counters
+            .readback_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         self.counters.plans.fetch_add(1, Ordering::Relaxed);
         let groups = plan_rows(&host, rows, topk, self.n_slots);
         self.counters

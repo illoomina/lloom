@@ -854,12 +854,22 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 .decode(&out.ids, true)
                 .map_err(anyhow::Error::msg)?
         );
+        let sum = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| -> f64 {
+            out.stats.rounds.iter().map(|r| f(&r.timing)).sum::<u64>() as f64 / 1e6
+        };
+        let hist: Vec<usize> = (0..=drafter.k() + 1)
+            .map(|a| out.stats.rounds.iter().filter(|r| r.accepted == a).count())
+            .collect();
         println!(
-            "MTP tokens_sha256={mtp_digest} identical_to_greedy={same} generated={} rounds={rounds} accepted_drafts={accepted_drafts} draft_accept_rate={:.4} tokens_per_round={:.3} drafter_rows={} wall_ms={mtp_ms}",
+            "MTP tokens_sha256={mtp_digest} identical_to_greedy={same} generated={} rounds={rounds} accepted_drafts={accepted_drafts} draft_accept_rate={:.4} tokens_per_round={:.3} drafter_rows={} wall_ms={mtp_ms} k={} draft_ms={:.1} verify_ms={:.1} observe_ms={:.1} accepted_hist={hist:?}",
             out.ids.len(),
             accepted_drafts as f64 / rounds.max(1) as f64,
             tokens as f64 / rounds.max(1) as f64,
-            drafter.rows_seen()
+            drafter.rows_seen(),
+            drafter.k(),
+            sum(&|t| t.draft_ns),
+            sum(&|t| t.verify_ns),
+            sum(&|t| t.observe_ns),
         );
         ok &= same;
     }

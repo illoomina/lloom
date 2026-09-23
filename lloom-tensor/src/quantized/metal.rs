@@ -535,6 +535,7 @@ impl QMetalStorage {
             src0_l.dims(),
             &src0_stride,
             &self.buffer,
+            0,
             src1_l.dims(),
             &src1_l
                 .stride()
@@ -1013,4 +1014,94 @@ static MOE_MM_BN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 fn mm_id_has_arm(dtype: crate::kernels::GgmlDType) -> bool {
     use crate::kernels::GgmlDType as G;
     !matches!(dtype, G::Q8_1 | G::Q8K | G::BF16)
+}
+
+/// `xs [.., k]` (f32) · `w [n, k]`ᵀ (f16) → `[.., n]` f32 through the
+/// quantized GEMM's f16 arm (`kernel_mul_mm_f16_f32`: the weights read as
+/// half, the activations as float, the accumulate float) — no cast launch
+/// on either side, where the classical route casts the activations to
+/// half, multiplies, and casts the product back (three launches beside the
+/// GEMM, and the activations rounded to half first). `QMatMul::TensorF16`'s
+/// Metal route past the mixed gemv's rows (lloom #749 P23).
+pub fn matmul_f16_weight_f32(xs: &crate::Tensor, w: &crate::Tensor) -> Result<crate::Tensor> {
+    use crate::MetalError;
+    let (n, k) = w.dims2()?;
+    if w.dtype() != DType::F16 || xs.dtype() != DType::F32 {
+        crate::bail!(
+            "matmul_f16_weight_f32: w {:?}, xs {:?}",
+            w.dtype(),
+            xs.dtype()
+        )
+    }
+    let xs = xs.contiguous()?;
+    let w = w.contiguous()?;
+    let (ws, wl) = w.storage_and_layout();
+    let (xsto, xl) = xs.storage_and_layout();
+    let (wm, xm) = match (&*ws, &*xsto) {
+        (crate::Storage::Metal(a), crate::Storage::Metal(b)) => (a, b),
+        _ => crate::bail!("matmul_f16_weight_f32: Metal tensors only"),
+    };
+    let x_dims = xl.dims();
+    if x_dims.is_empty() || x_dims[x_dims.len() - 1] != k || x_dims.len() > 4 {
+        crate::bail!(
+            "matmul_f16_weight_f32: xs {:?} against w [{n}, {k}]",
+            x_dims
+        )
+    }
+    let device = xm.device().clone();
+    let mut out_dims = x_dims.to_vec();
+    *out_dims.last_mut().expect("rank >= 1") = n;
+    let dst_shape = Shape::from(out_dims.clone());
+    let dst = device
+        .new_buffer_builder()
+        .with_size_for(dst_shape.elem_count(), DType::F32)
+        .with_label("qmatmul_f16w")
+        .build()?;
+    let src0_l = crate::Layout::contiguous(vec![1, 1, n, k]);
+    let src0_stride: Vec<usize> = src0_l
+        .stride()
+        .iter()
+        .map(|x| x * DType::F16.size_in_bytes())
+        .collect();
+    let src1_l = crate::Layout::contiguous([vec![1; 4 - x_dims.len()], x_dims.to_vec()].concat());
+    let dst_l = crate::Layout::contiguous([vec![1; 4 - out_dims.len()], out_dims.clone()].concat());
+    let encoder = device.command_encoder()?;
+    crate::kernels::call_quantized_matmul_mm_t(
+        device.device(),
+        &encoder,
+        device.kernels(),
+        crate::kernels::GgmlDType::F16,
+        src0_l.dims(),
+        &src0_stride,
+        wm.buffer(),
+        wl.start_offset() * DType::F16.size_in_bytes(),
+        src1_l.dims(),
+        &src1_l
+            .stride()
+            .iter()
+            .map(|x| x * DType::F32.size_in_bytes())
+            .collect::<Vec<_>>(),
+        xm.buffer(),
+        xl.start_offset() * DType::F32.size_in_bytes(),
+        dst_l.dims(),
+        0,
+        &dst,
+    )
+    .map_err(MetalError::from)?;
+    drop(encoder);
+    let storage = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+    Ok(crate::tensor::from_storage(
+        crate::Storage::Metal(storage),
+        dst_shape,
+        crate::op::BackpropOp::none(),
+        false,
+    ))
+}
+
+/// Whether `QMatMul::TensorF16` takes [`matmul_f16_weight_f32`] on Metal
+/// past the mixed gemv's rows: `LLOOM_QMM_F16_MM` (0 = the classical
+/// cast-matmul-cast route), read once.
+pub fn f16_weight_mm_route() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LLOOM_QMM_F16_MM").ok().as_deref() != Some("0"))
 }

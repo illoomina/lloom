@@ -898,6 +898,7 @@ pub fn call_quantized_matmul_mm_t(
     src0_shape: &[usize],
     src0_stride: &[usize],
     src0: &Buffer,
+    src0_offset: usize,
     src1_shape: &[usize],
     src1_stride: &[usize],
     src1: &Buffer,
@@ -975,7 +976,7 @@ pub fn call_quantized_matmul_mm_t(
     set_params!(
         encoder,
         (
-            src0,
+            (src0, src0_offset),
             (src1, src1_offset),
             Output::with_offset(dst, dst_offset),
             ne00,

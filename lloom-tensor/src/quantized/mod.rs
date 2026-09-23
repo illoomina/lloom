@@ -1424,6 +1424,17 @@ impl crate::Module for QMatMul {
                 if let Some(out) = self.gemv_mixed(xs, gemv_mixed::MixedEpilogue::None, 1.0) {
                     return out;
                 }
+                #[cfg(feature = "metal")]
+                if xs.device().is_metal()
+                    && xs.dtype() == DType::F32
+                    && w.dims().len() == 2
+                    && metal::f16_weight_mm_route()
+                {
+                    // A prefill's rows: the quantized GEMM's f16 arm reads
+                    // the weights as half and the activations as float —
+                    // no cast launch on either side (lloom #749 P23).
+                    return metal::matmul_f16_weight_f32(xs, w);
+                }
                 let in_dtype = xs.dtype();
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,

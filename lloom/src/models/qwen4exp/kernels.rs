@@ -1857,11 +1857,28 @@ impl lloom_tensor::CustomOp3 for QsaPrepRows {
     }
 }
 
-// ---- DeltaNet decode over the rows of one state pool -----------------------------
+// ---- DeltaNet decode over the rows of one state pool, and over the positions of one row ----
+
+/// A state pool's layer as the kernels take it: the `[phases, slots, ‥]`
+/// tensor (captured; read at a phase, written at the next), its counts.
+pub(crate) struct PoolLayer {
+    pub tensor: Tensor,
+    pub n_slots: usize,
+    pub n_phases: usize,
+}
+
+#[cfg(feature = "metal")]
+fn metal_of(t: &Tensor, what: &str) -> Result<(lloom_tensor::MetalStorage, Layout)> {
+    let (st, l) = t.storage_and_layout();
+    match &*st {
+        lloom_tensor::Storage::Metal(m) => Ok((m.clone(), l.clone())),
+        _ => lloom_tensor::bail!("{what}: every operand on the metal device"),
+    }
+}
 
 /// The batched prologue: `qkv [B, C]` (applied to), the row tables `slots`
-/// / `phases` (`[B]` u32, captured), the window pool's two slabs (captured;
-/// the phase's read, the other written) → `heads [B, 3, h_v, d]`.
+/// / `phases` (`[B]` u32) and the window pool (captured) → `heads [B, 3,
+/// h_v, d]`; each row's window after the step at its next phase.
 pub(crate) struct GdnPrologueRows {
     pub rows: usize,
     pub d: usize,
@@ -1871,8 +1888,7 @@ pub(crate) struct GdnPrologueRows {
     pub eps: f32,
     pub q_scale: f32,
     pub conv_w: Tensor,
-    pub win_a: Tensor,
-    pub win_b: Tensor,
+    pub win: PoolLayer,
     pub slots: Tensor,
     pub phases: Tensor,
 }
@@ -1899,31 +1915,20 @@ impl lloom_tensor::CustomOp1 for GdnPrologueRows {
                 l.shape()
             )
         }
-        let (ws, wl) = self.conv_w.storage_and_layout();
-        let (as_, al) = self.win_a.storage_and_layout();
-        let (bs, bl) = self.win_b.storage_and_layout();
-        let (ss, sl) = self.slots.storage_and_layout();
-        let (ps, pl) = self.phases.storage_and_layout();
-        let m = |st: &lloom_tensor::Storage| -> Result<lloom_tensor::MetalStorage> {
-            match st {
-                lloom_tensor::Storage::Metal(x) => Ok(x.clone()),
-                _ => lloom_tensor::bail!("gdn_prologue_rows: every operand on the metal device"),
-            }
-        };
-        let (ws, as_, bs, ss, ps) = (m(&ws)?, m(&as_)?, m(&bs)?, m(&ss)?, m(&ps)?);
-        let slot_rows = al.shape().elem_count() / (conv_ch * kk).max(1);
+        let (ws, wl) = metal_of(&self.conv_w, "gdn_prologue_rows")?;
+        let (ps, pl) = metal_of(&self.win.tensor, "gdn_prologue_rows")?;
+        let (ss, sl) = metal_of(&self.slots, "gdn_prologue_rows")?;
+        let (hs, hl) = metal_of(&self.phases, "gdn_prologue_rows")?;
         if wl.shape().elem_count() != conv_ch * kk
-            || al.shape().elem_count() != bl.shape().elem_count()
-            || al.shape().elem_count() != slot_rows * conv_ch * kk
+            || pl.shape().elem_count() != self.win.n_phases * self.win.n_slots * conv_ch * kk
             || sl.shape().elem_count() != rows
-            || pl.shape().elem_count() != rows
+            || hl.shape().elem_count() != rows
             || !wl.is_contiguous()
-            || !al.is_contiguous()
-            || !bl.is_contiguous()
-            || !sl.is_contiguous()
             || !pl.is_contiguous()
+            || !sl.is_contiguous()
+            || !hl.is_contiguous()
         {
-            lloom_tensor::bail!("gdn_prologue_rows: the taps / pools / tables' shapes")
+            lloom_tensor::bail!("gdn_prologue_rows: the taps / pool / tables' shapes")
         }
         let device = s.device();
         let encoder = device.command_encoder()?;
@@ -1945,12 +1950,13 @@ impl lloom_tensor::CustomOp1 for GdnPrologueRows {
             kk,
             self.eps,
             self.q_scale,
+            self.win.n_slots,
+            self.win.n_phases,
             metal_bo(s, l),
-            metal_bo(&ws, wl),
-            metal_bo(&as_, al),
-            metal_bo(&bs, bl),
-            metal_bo(&ss, sl),
-            metal_bo(&ps, pl),
+            metal_bo(&ws, &wl),
+            metal_bo(&ps, &pl),
+            metal_bo(&ss, &sl),
+            metal_bo(&hs, &hl),
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
@@ -1961,17 +1967,107 @@ impl lloom_tensor::CustomOp1 for GdnPrologueRows {
     }
 }
 
+/// The multi-position prologue: `qkv [T, C]` (applied to) against row
+/// `slot` at `phase` of the window pool (captured) → `heads [T, 3, h_v,
+/// d]`; the window after position t at phase `phase + 1 + t`.
+pub(crate) struct GdnPrologueSeq {
+    pub steps: usize,
+    pub d: usize,
+    pub h_k: usize,
+    pub h_v: usize,
+    pub kk: usize,
+    pub eps: f32,
+    pub q_scale: f32,
+    pub conv_w: Tensor,
+    pub win: PoolLayer,
+    pub slot: usize,
+    pub phase: usize,
+}
+
+impl lloom_tensor::CustomOp1 for GdnPrologueSeq {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-prologue-seq"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_prologue_seq: no cpu kernel; the per-position path composes it")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (steps, d, h_k, h_v, kk) = (self.steps, self.d, self.h_k, self.h_v, self.kk);
+        let conv_ch = (2 * h_k + h_v) * d;
+        if l.shape().elem_count() != steps * conv_ch || !l.is_contiguous() {
+            lloom_tensor::bail!(
+                "gdn_prologue_seq: qkv {:?} vs [{steps}, {conv_ch}]",
+                l.shape()
+            )
+        }
+        if steps + 1 > self.win.n_phases {
+            lloom_tensor::bail!(
+                "gdn_prologue_seq: {steps} positions over {} phases",
+                self.win.n_phases
+            )
+        }
+        let (ws, wl) = metal_of(&self.conv_w, "gdn_prologue_seq")?;
+        let (ps, pl) = metal_of(&self.win.tensor, "gdn_prologue_seq")?;
+        if wl.shape().elem_count() != conv_ch * kk
+            || pl.shape().elem_count() != self.win.n_phases * self.win.n_slots * conv_ch * kk
+            || !wl.is_contiguous()
+            || !pl.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_prologue_seq: the taps / pool shapes")
+        }
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_prologue_seq");
+        let elem_count = steps * 3 * h_v * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_heads_seq")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_prologue_seq(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            steps,
+            d,
+            h_k,
+            h_v,
+            kk,
+            self.eps,
+            self.q_scale,
+            self.win.n_slots,
+            self.win.n_phases,
+            self.slot,
+            self.phase,
+            metal_bo(s, l),
+            metal_bo(&ws, &wl),
+            metal_bo(&ps, &pl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            Shape::from((steps, 3, h_v, d)),
+        ))
+    }
+}
+
 /// The batched recurrence: `heads [B, 3, h_v, d]`, `alpha` / `beta` `[B,
-/// h_v]`, the `S` pool's two slabs and the row tables captured → `o [B,
-/// h_v, d]`; the next `S` of every row written to its other phase.
+/// h_v]`, the `S` pool and the row tables captured → `o [B, h_v, d]`; every
+/// row's next `S` at its next phase.
 pub(crate) struct GdnStepRows {
     pub rows: usize,
     pub d: usize,
     pub h_v: usize,
     pub dt_bias: Tensor,
     pub ssm_a: Tensor,
-    pub s_a: Tensor,
-    pub s_b: Tensor,
+    pub s: PoolLayer,
     pub slots: Tensor,
     pub phases: Tensor,
 }
@@ -2014,32 +2110,22 @@ impl lloom_tensor::CustomOp3 for GdnStepRows {
                 "gdn_step_rows: heads / alpha / beta vs rows {rows} d {d} h_v {h_v}"
             )
         }
-        let (bs, bl) = self.dt_bias.storage_and_layout();
-        let (as_, al) = self.ssm_a.storage_and_layout();
-        let (sa, sal) = self.s_a.storage_and_layout();
-        let (sb, sbl) = self.s_b.storage_and_layout();
-        let (ss, sl) = self.slots.storage_and_layout();
-        let (ps, pl) = self.phases.storage_and_layout();
-        let m = |st: &lloom_tensor::Storage| -> Result<lloom_tensor::MetalStorage> {
-            match st {
-                lloom_tensor::Storage::Metal(x) => Ok(x.clone()),
-                _ => lloom_tensor::bail!("gdn_step_rows: every operand on the metal device"),
-            }
-        };
-        let (bs, as_, sa, sb, ss, ps) = (m(&bs)?, m(&as_)?, m(&sa)?, m(&sb)?, m(&ss)?, m(&ps)?);
+        let (bs, bl) = metal_of(&self.dt_bias, "gdn_step_rows")?;
+        let (as_, al) = metal_of(&self.ssm_a, "gdn_step_rows")?;
+        let (ps, pl) = metal_of(&self.s.tensor, "gdn_step_rows")?;
+        let (ss, sl) = metal_of(&self.slots, "gdn_step_rows")?;
+        let (hs, hl) = metal_of(&self.phases, "gdn_step_rows")?;
         let slab = d * d * h_v;
         if bl.shape().elem_count() != h_v
             || al.shape().elem_count() != h_v
-            || sal.shape().elem_count() != sbl.shape().elem_count()
-            || sal.shape().elem_count() % slab != 0
+            || pl.shape().elem_count() != self.s.n_phases * self.s.n_slots * slab
             || sl.shape().elem_count() != rows
-            || pl.shape().elem_count() != rows
-            || !sal.is_contiguous()
-            || !sbl.is_contiguous()
-            || !sl.is_contiguous()
+            || hl.shape().elem_count() != rows
             || !pl.is_contiguous()
+            || !sl.is_contiguous()
+            || !hl.is_contiguous()
         {
-            lloom_tensor::bail!("gdn_step_rows: the pools / tables' shapes")
+            lloom_tensor::bail!("gdn_step_rows: the pool / tables' shapes")
         }
         let device = s1.device();
         let encoder = device.command_encoder()?;
@@ -2057,21 +2143,127 @@ impl lloom_tensor::CustomOp3 for GdnStepRows {
             rows,
             d,
             h_v,
+            self.s.n_slots,
+            self.s.n_phases,
             metal_bo(s1, l1),
             metal_bo(s2, l2),
             metal_bo(s3, l3),
-            metal_bo(&bs, bl),
-            metal_bo(&as_, al),
-            metal_bo(&sa, sal),
-            metal_bo(&sb, sbl),
-            metal_bo(&ss, sl),
-            metal_bo(&ps, pl),
+            metal_bo(&bs, &bl),
+            metal_bo(&as_, &al),
+            metal_bo(&ps, &pl),
+            metal_bo(&ss, &sl),
+            metal_bo(&hs, &hl),
             &output,
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
             lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
             Shape::from((rows, h_v, d)),
+        ))
+    }
+}
+
+/// The multi-position recurrence: `heads [T, 3, h_v, d]`, `alpha` / `beta`
+/// `[T, h_v]`, row `slot` at `phase` of the `S` pool (captured) → `o [T,
+/// h_v, d]`; every intermediate `S` at phases `phase + 1 ..= phase + T`.
+pub(crate) struct GdnStepSeq {
+    pub steps: usize,
+    pub d: usize,
+    pub h_v: usize,
+    pub dt_bias: Tensor,
+    pub ssm_a: Tensor,
+    pub s: PoolLayer,
+    pub slot: usize,
+    pub phase: usize,
+}
+
+impl lloom_tensor::CustomOp3 for GdnStepSeq {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-step-seq"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_step_seq: no cpu kernel; the per-position path composes it")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (steps, d, h_v) = (self.steps, self.d, self.h_v);
+        if l1.shape().elem_count() != steps * 3 * h_v * d
+            || l2.shape().elem_count() != steps * h_v
+            || l3.shape().elem_count() != steps * h_v
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "gdn_step_seq: heads / alpha / beta vs steps {steps} d {d} h_v {h_v}"
+            )
+        }
+        if steps + 1 > self.s.n_phases {
+            lloom_tensor::bail!(
+                "gdn_step_seq: {steps} positions over {} phases",
+                self.s.n_phases
+            )
+        }
+        let (bs, bl) = metal_of(&self.dt_bias, "gdn_step_seq")?;
+        let (as_, al) = metal_of(&self.ssm_a, "gdn_step_seq")?;
+        let (ps, pl) = metal_of(&self.s.tensor, "gdn_step_seq")?;
+        let slab = d * d * h_v;
+        if bl.shape().elem_count() != h_v
+            || al.shape().elem_count() != h_v
+            || pl.shape().elem_count() != self.s.n_phases * self.s.n_slots * slab
+            || !pl.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_step_seq: the pool's shape")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_step_seq");
+        let elem_count = steps * h_v * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("gdn_o_seq")
+            .build()?;
+        lloom_tensor::kernels::call_gdn_step_seq(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            steps,
+            d,
+            h_v,
+            self.s.n_slots,
+            self.s.n_phases,
+            self.slot,
+            self.phase,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            metal_bo(&bs, &bl),
+            metal_bo(&as_, &al),
+            metal_bo(&ps, &pl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((steps, h_v, d)),
         ))
     }
 }

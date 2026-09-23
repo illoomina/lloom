@@ -460,6 +460,142 @@ impl QsaAttention {
         }
     }
 
+    /// `T` POSITIONS of one sequence at once (a speculative verify window):
+    /// `x [T, 1, hidden]` → `[T, 1, hidden]`, `kv` advanced `T` positions.
+    /// The projections and the out-proj run once over the `T` rows; the
+    /// norms, the rope, the append, the indexer and the attention run per
+    /// position against the growing cache — what `decode` computes `T`
+    /// times, launch for launch. Returns the cache's `(tokens, blocks)`
+    /// after every position, for a partial accept (`KvCache::truncate`).
+    pub fn decode_seq(
+        &self,
+        x: &Tensor,
+        kv: &mut KvCache,
+    ) -> Result<(Tensor, Vec<(usize, usize)>)> {
+        let (t, seq, _) = x.dims3()?;
+        if seq != 1 || t == 0 {
+            lloom_tensor::bail!("qsa decode_seq: x {:?} (positions on dim 0)", x.shape())
+        }
+        let mut lens = Vec::with_capacity(t);
+        if let Some(out) = self.decode_seq_fused(x, kv, &mut lens)? {
+            return Ok((out, lens));
+        }
+        let mut outs = Vec::with_capacity(t);
+        for p in 0..t {
+            outs.push(self.decode_composed(&x.narrow(0, p, 1)?, kv)?);
+            lens.push(kv.lens());
+        }
+        let out = if t == 1 {
+            outs.pop().expect("one position")
+        } else {
+            Tensor::cat(&outs, 0)?
+        };
+        Ok((out, lens))
+    }
+
+    fn decode_seq_fused(
+        &self,
+        x: &Tensor,
+        kv: &mut KvCache,
+        lens: &mut Vec<(usize, usize)>,
+    ) -> Result<Option<Tensor>> {
+        use super::kernels::{fused_off, sigmoid_mul, QsaPrep};
+        let (t, _, hidden) = x.dims3()?;
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        if fused_off()
+            || !x.device().is_metal()
+            || x.dtype() != lloom_tensor::DType::F32
+            || !matches!(hd, 32 | 64 | 72 | 80 | 96 | 128 | 256 | 512)
+            || nh % nkv != 0
+        {
+            return Ok(None);
+        }
+        let f32 = lloom_tensor::DType::F32;
+        let xb = x.reshape((t, hidden))?;
+        let (nq, nk) = (nh * 2 * hd, nkv * hd);
+        let (qg_all, k_all_rows, v_all_rows) = match &self.stem_cat {
+            Some(cat) => {
+                let all = cat.forward(&xb)?.to_dtype(f32)?.reshape((t, nq + 2 * nk))?;
+                (
+                    all.narrow(1, 0, nq)?.contiguous()?,
+                    all.narrow(1, nq, nk)?.contiguous()?,
+                    all.narrow(1, nq + nk, nk)?.contiguous()?,
+                )
+            }
+            None => (
+                self.wq.forward(&xb)?.to_dtype(f32)?.reshape((t, nq))?,
+                self.wk.forward(&xb)?.to_dtype(f32)?.reshape((t, nk))?,
+                self.wv.forward(&xb)?.to_dtype(f32)?.reshape((t, nk))?,
+            ),
+        };
+        let q_gamma = self.q_norm.weight().to_dtype(f32)?;
+        let k_gamma = self.k_norm.weight().to_dtype(f32)?;
+        let scale = 1.0 / (hd as f64).sqrt();
+        let mut gated_rows = Vec::with_capacity(t);
+        for r in 0..t {
+            let x1 = xb.narrow(0, r, 1)?;
+            let qg = qg_all.narrow(0, r, 1)?.reshape((nh, 2 * hd))?;
+            let k = k_all_rows.narrow(0, r, 1)?.reshape((nkv, hd))?;
+            let v = v_all_rows.narrow(0, r, 1)?.reshape((nkv, 1, hd))?;
+            let pos = kv.len();
+            let prep = qg.apply_op2_no_bwd(
+                &k,
+                &QsaPrep {
+                    hd,
+                    n_rot: self.n_rot,
+                    nh,
+                    nkv,
+                    pos,
+                    theta: self.rope_theta as f32,
+                    eps: self.q_norm.eps() as f32,
+                    q_gamma: q_gamma.clone(),
+                    k_gamma: k_gamma.clone(),
+                },
+            )?;
+            let q = prep.narrow(0, 0, nh)?;
+            let gate = prep.narrow(0, nh, nh)?;
+            let k_step = prep.narrow(0, 2 * nh, nkv)?.reshape((nkv, 1, hd))?;
+            let (k_all, v_all) = kv.append(&k_step, &v)?;
+            let sel = match &self.indexer {
+                Some(ix) => {
+                    ix.observe(&x1, kv)?;
+                    ix.select(&x1, pos, kv)?
+                }
+                None => None,
+            };
+            if let Some(sel) = &sel {
+                check_sel(sel, pos, kv)?;
+            }
+            let (k_all, v_all) = match &sel {
+                Some(sel) => kv.gather(sel)?,
+                None => (k_all, v_all),
+            };
+            let ctx = ops::sdpa(
+                &q.reshape((1, nh, 1, hd))?,
+                &k_all.unsqueeze(0)?,
+                &v_all.unsqueeze(0)?,
+                None,
+                false,
+                scale as f32,
+                1.0,
+            )?;
+            let ctx = ctx.reshape((1, nh * hd))?;
+            let gate = gate.reshape((1, nh * hd))?;
+            let gated = match sigmoid_mul(&gate, &ctx) {
+                Some(g) => g?,
+                None => (ctx * ops::sigmoid(&gate)?)?,
+            };
+            gated_rows.push(gated);
+            lens.push(kv.lens());
+        }
+        let gated = if t == 1 {
+            gated_rows.pop().expect("one position")
+        } else {
+            Tensor::cat(&gated_rows, 0)?
+        };
+        Ok(Some(self.wo.forward(&gated)?.reshape((t, 1, hidden))?))
+    }
+
     /// The composed decode of one row: the CPU path and the reference.
     fn decode_composed(&self, x: &Tensor, kv: &mut KvCache) -> Result<Tensor> {
         let hidden = x.dim(D::Minus1)?;

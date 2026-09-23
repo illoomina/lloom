@@ -289,7 +289,13 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         if mtp && model.mtp_head().is_none() {
             anyhow::bail!("--mtp was given but the loader found no MTP head in the shards");
         }
-        let mut cache = model.new_cache(model.config(), &device)?;
+        let mut cache = if mtp {
+            // The verify window's states in phase rings: an accept by phase.
+            let pools = model.spec_pools(1, opts.mtp_k.max(1), &device);
+            Cache::in_pools(model.config(), &pools)?
+        } else {
+            model.new_cache(model.config(), &device)?
+        };
         cache.want_nextn = mtp;
         tier["mtp"] = json!(mtp);
         tier["ple"] = json!(opts.ple);

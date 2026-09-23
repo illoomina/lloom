@@ -352,10 +352,8 @@ pub fn call_gdn_step(
     // `h_v × split` threads: `split` slices of `dk` per head, as many as the
     // threadgroup takes up to 8 (the reductions close over `split` partials
     // in threadgroup memory; `h_v × split` ≤ 1024).
-    let max = pipeline.max_total_threads_per_threadgroup().min(1024);
-    let split = (max / h_v.max(1)).clamp(1, 8);
-    let width = h_v * split;
-    dispatch_groups(encoder, d, width);
+    let split = gdn_split(h_v, &pipeline);
+    dispatch_groups(encoder, d, h_v * split);
     Ok(())
 }
 
@@ -794,8 +792,8 @@ pub fn call_moe_slot_map(
 }
 
 /// `gdn_prologue_rows_f32`: `B` rows of `qkv [B, C]` against the window
-/// pools (`slots` / `phases` per row) → `heads [B, 3, h_v, d]`, the windows
-/// after the step written to the other phase.
+/// pool (`slots` / `phases` per row) → `heads [B, 3, h_v, d]`, each row's
+/// window after the step written to its next phase.
 #[allow(clippy::too_many_arguments)]
 pub fn call_gdn_prologue_rows(
     device: &Device,
@@ -808,10 +806,11 @@ pub fn call_gdn_prologue_rows(
     kk: usize,
     eps: f32,
     q_scale: f32,
+    n_slots: usize,
+    n_phases: usize,
     qkv: BufferOffset,
     conv_w: BufferOffset,
-    win_a: BufferOffset,
-    win_b: BufferOffset,
+    win_pool: BufferOffset,
     slots: BufferOffset,
     phases: BufferOffset,
     heads: &Buffer,
@@ -829,8 +828,7 @@ pub fn call_gdn_prologue_rows(
         (
             &qkv,
             &conv_w,
-            &win_a,
-            &win_b,
+            &win_pool,
             &slots,
             &phases,
             Output::new(heads),
@@ -840,15 +838,77 @@ pub fn call_gdn_prologue_rows(
             kk as u32,
             eps,
             q_scale,
-            Output::from_buffer_offset(&win_a),
-            Output::from_buffer_offset(&win_b)
+            n_slots as u32,
+            n_phases as u32,
+            Output::from_buffer_offset(&win_pool)
         )
     );
     dispatch_groups_2d(encoder, 2 * h_k + h_v, rows, head_width(d, &pipeline));
     Ok(())
 }
 
-/// `gdn_step_rows_f32`: `B` rows of the recurrence over the `S` pools.
+/// `gdn_prologue_seq_f32`: `T` positions of one row (`slot` at `phase`) →
+/// `heads [T, 3, h_v, d]`, the window after each position at phase
+/// `phase + 1 + t`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_prologue_seq(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    steps: usize,
+    d: usize,
+    h_k: usize,
+    h_v: usize,
+    kk: usize,
+    eps: f32,
+    q_scale: f32,
+    n_slots: usize,
+    n_phases: usize,
+    slot: usize,
+    phase: usize,
+    qkv: BufferOffset,
+    conv_w: BufferOffset,
+    win_pool: BufferOffset,
+    heads: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_prologue_seq_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "gdn_prologue_seq steps={steps} d={d} h_k={h_k} h_v={h_v}"
+    );
+    set_params!(
+        encoder,
+        (
+            &qkv,
+            &conv_w,
+            &win_pool,
+            Output::new(heads),
+            d as u32,
+            h_k as u32,
+            h_v as u32,
+            kk as u32,
+            eps,
+            q_scale,
+            n_slots as u32,
+            n_phases as u32,
+            slot as u32,
+            phase as u32,
+            Output::from_buffer_offset(&win_pool)
+        )
+    );
+    dispatch_groups_2d(encoder, 2 * h_k + h_v, steps, head_width(d, &pipeline));
+    Ok(())
+}
+
+fn gdn_split(h_v: usize, pipeline: &crate::kernels::ComputePipeline) -> usize {
+    let max = pipeline.max_total_threads_per_threadgroup().min(1024);
+    (max / h_v.max(1)).clamp(1, 8)
+}
+
+/// `gdn_step_rows_f32`: `B` rows of the recurrence over the `S` pool.
 #[allow(clippy::too_many_arguments)]
 pub fn call_gdn_step_rows(
     device: &Device,
@@ -857,13 +917,14 @@ pub fn call_gdn_step_rows(
     rows: usize,
     d: usize,
     h_v: usize,
+    n_slots: usize,
+    n_phases: usize,
     heads: BufferOffset,
     alpha: BufferOffset,
     beta: BufferOffset,
     dt_bias: BufferOffset,
     ssm_a: BufferOffset,
-    s_a: BufferOffset,
-    s_b: BufferOffset,
+    s_pool: BufferOffset,
     slots: BufferOffset,
     phases: BufferOffset,
     o: &Buffer,
@@ -881,20 +942,71 @@ pub fn call_gdn_step_rows(
             &beta,
             &dt_bias,
             &ssm_a,
-            &s_a,
-            &s_b,
+            &s_pool,
             &slots,
             &phases,
             Output::new(o),
             d as u32,
             h_v as u32,
-            Output::from_buffer_offset(&s_a),
-            Output::from_buffer_offset(&s_b)
+            n_slots as u32,
+            n_phases as u32,
+            Output::from_buffer_offset(&s_pool)
         )
     );
-    let max = pipeline.max_total_threads_per_threadgroup().min(1024);
-    let split = (max / h_v.max(1)).clamp(1, 8);
+    let split = gdn_split(h_v, &pipeline);
     dispatch_groups_2d(encoder, d, rows, h_v * split);
+    Ok(())
+}
+
+/// `gdn_step_seq_f32`: `T` positions of one row's recurrence in one launch,
+/// every intermediate `S` kept at phases `phase + 1 ..= phase + T`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_step_seq(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    steps: usize,
+    d: usize,
+    h_v: usize,
+    n_slots: usize,
+    n_phases: usize,
+    slot: usize,
+    phase: usize,
+    heads: BufferOffset,
+    alpha: BufferOffset,
+    beta: BufferOffset,
+    dt_bias: BufferOffset,
+    ssm_a: BufferOffset,
+    s_pool: BufferOffset,
+    o: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_step_seq_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "gdn_step_seq steps={steps} d={d} h_v={h_v}");
+    set_params!(
+        encoder,
+        (
+            &heads,
+            &alpha,
+            &beta,
+            &dt_bias,
+            &ssm_a,
+            &s_pool,
+            Output::new(o),
+            d as u32,
+            h_v as u32,
+            n_slots as u32,
+            n_phases as u32,
+            slot as u32,
+            phase as u32,
+            steps as u32,
+            Output::from_buffer_offset(&s_pool)
+        )
+    );
+    let split = gdn_split(h_v, &pipeline);
+    dispatch_groups(encoder, d, h_v * split);
     Ok(())
 }
 

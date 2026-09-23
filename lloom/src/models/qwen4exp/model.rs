@@ -146,6 +146,41 @@ impl<R: ExpertResidency> Layer<R> {
         Ok((res_hc, mixed, moe_out, record))
     }
 
+    /// `T` positions of ONE sequence through the layer as one pass (a
+    /// verify window): the brackets and the MoE over the `T` rows, the
+    /// mixer's state advanced position by position into its phase ring
+    /// (`GatedDeltaNet::decode_seq`, `QsaAttention::decode_seq`). Returns
+    /// the carry, the MoE's plan record, and — on a full-attention layer —
+    /// the KV lengths after every position.
+    pub fn decode_parts_seq(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        cache: &mut Cache,
+        device_plan: bool,
+    ) -> Result<SeqParts> {
+        let (cur, inject) = self.hc_attn.mix(res_hc)?; // [T, 1, d]
+        let (mixed, lens) = match &self.mixer {
+            Mixer::Linear(dn) => (
+                dn.decode_seq(&cur, l, &mut cache.s_state, &mut cache.conv_state)?,
+                None,
+            ),
+            Mixer::Full(qsa) => {
+                let (m, lens) = qsa.decode_seq(&cur, &mut cache.kv[l])?;
+                (m, Some(lens))
+            }
+        };
+        let res_hc = self.hc_attn.combine(res_hc, &mixed, &inject)?;
+        let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
+        let (moe_out, record) = if device_plan {
+            self.moe.decode_planned(&cur)?
+        } else {
+            (self.moe.decode(&cur)?, None)
+        };
+        let res_hc = self.hc_ffn.combine(&res_hc, &moe_out, &inject)?;
+        Ok((res_hc, record, lens))
+    }
+
     /// One position through the layer ([`Self::decode_parts`]'s carry).
     pub fn decode(&self, res_hc: &Tensor, l: usize, cache: &mut Cache) -> Result<Tensor> {
         Ok(self.decode_parts(res_hc, l, cache)?.0)
@@ -167,6 +202,11 @@ impl<R: ExpertResidency> Layer<R> {
         self.hc_ffn.combine(&res_hc, &moe_out, &inject)
     }
 }
+
+/// What `Layer::decode_parts_seq` returns: the carry, the MoE's device-plan
+/// record, and — on a full-attention layer — the KV lengths after every
+/// position.
+pub type SeqParts = (Tensor, Option<Tensor>, Option<Vec<(usize, usize)>>);
 
 /// The per-sequence state the forward threads: DeltaNet `S`, the conv window,
 /// and per-QSA-layer growing KV. The recurrent channels carry the migrate/
@@ -226,6 +266,11 @@ struct CacheWindow {
     ngram: NgramWindow,
     pending_tokens: std::collections::VecDeque<u32>,
     pos: usize,
+    /// A verify window's bookkeeping per position: the tokens fed and every
+    /// layer's KV lengths after each position (`Qwen4Exp::verify_window`),
+    /// for an accept by position (`Cache::accept_window`).
+    tokens: Vec<u32>,
+    kv_after: Vec<Vec<(usize, usize)>>,
 }
 
 impl Cache {
@@ -241,7 +286,61 @@ impl Cache {
         let mut cache = Self::new(cfg);
         cache.s_state = RecurrentState::in_pool(&pools.s)?;
         cache.conv_state = RecurrentState::in_pool(&pools.conv)?;
+        if let Some(p) = &pools.ple {
+            cache.ple_conv = RecurrentState::in_pool(p)?;
+        }
         Ok(cache)
+    }
+
+    /// Whether a verify window of `steps` positions can be accepted by
+    /// position on this cache: every recurrent channel pooled with a ring of
+    /// `steps + 1` phases (`Qwen4Exp::spec_pools`).
+    pub fn ring_holds(&self, steps: usize, with_ple: bool) -> bool {
+        self.s_state.ring_holds(steps)
+            && self.conv_state.ring_holds(steps)
+            && (!with_ple || self.ple_conv.ring_holds(steps))
+    }
+
+    /// Accept the first `a` positions of the open verify window and close
+    /// it: every recurrent channel to phase `base + a`, every KV to its
+    /// length after position `a`, the n-gram window and the position as
+    /// after `a` tokens, the retained carries cut to `a`. `a = 0` is the
+    /// rewind. The verify's positions past `a` cost nothing.
+    pub fn accept_window(&mut self, a: usize) -> Result<()> {
+        let w = match self.window.take() {
+            Some(w) => w,
+            None => lloom_tensor::bail!("qwen4exp cache: no speculative window is open"),
+        };
+        if a > w.tokens.len() {
+            lloom_tensor::bail!(
+                "qwen4exp cache: accepting {a} of a {}-position window",
+                w.tokens.len()
+            )
+        }
+        self.s_state.accept_window(a)?;
+        self.conv_state.accept_window(a)?;
+        if self.ple_conv.is_pooled() {
+            self.ple_conv.accept_window(a)?;
+        } else if a == w.tokens.len() {
+            self.ple_conv.resolve_window()?;
+        } else {
+            self.ple_conv.rewind_to_window()?;
+        }
+        let lens: &[(usize, usize)] = if a == 0 { &w.kv } else { &w.kv_after[a - 1] };
+        for (k, &(tokens, blocks)) in self.kv.iter_mut().zip(lens) {
+            k.truncate(tokens, blocks);
+        }
+        self.ngram = w.ngram;
+        for &t in &w.tokens[..a] {
+            self.ngram.push(Some(t));
+        }
+        self.pending_tokens = w.pending_tokens;
+        self.pending_noted = false;
+        self.pos = w.pos + a;
+        if self.nextn.len() > a {
+            self.nextn.truncate(a);
+        }
+        Ok(())
     }
 
     /// A cache for `n_layers` layers of `cfg`'s geometry (an MTP head's single
@@ -326,6 +425,8 @@ impl Cache {
             ngram: self.ngram.clone(),
             pending_tokens: self.pending_tokens.clone(),
             pos: self.pos,
+            tokens: Vec::new(),
+            kv_after: Vec::new(),
         });
         Ok(())
     }
@@ -1214,29 +1315,217 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 pub struct StatePools {
     pub s: crate::nn::StatePool,
     pub conv: crate::nn::StatePool,
+    /// The PLE's dilated-conv history, when a PLE is attached.
+    pub ple: Option<crate::nn::StatePool>,
 }
 
 impl<R: ExpertResidency> Qwen4Exp<R> {
-    /// The pools for `rows` rows on `dev` (f32, the fused kernels' dtype).
+    /// The pools for `rows` rows on `dev` (f32, the fused kernels' dtype),
+    /// two phases (a decode's current and next).
     pub fn state_pools(&self, rows: usize, dev: &lloom_tensor::Device) -> StatePools {
+        self.state_pools_with(rows, 2, dev)
+    }
+
+    /// The pools for a speculative window of `k` drafts: `k + 2` phases, so
+    /// the `k + 1` verify positions' states are all held and an accept is
+    /// a phase.
+    pub fn spec_pools(&self, rows: usize, k: usize, dev: &lloom_tensor::Device) -> StatePools {
+        self.state_pools_with(rows, k + 2, dev)
+    }
+
+    pub fn state_pools_with(
+        &self,
+        rows: usize,
+        phases: usize,
+        dev: &lloom_tensor::Device,
+    ) -> StatePools {
         let dims = self.cfg.deltanet_dims();
         let f32 = lloom_tensor::DType::F32;
+        let n = self.layers.len();
         StatePools {
-            s: crate::nn::StatePool::new(
+            s: crate::nn::StatePool::with_phases(
                 rows,
-                self.layers.len(),
+                phases,
+                n,
                 &[dims.d_k, dims.d_v, dims.h_v],
                 f32,
                 dev,
             ),
-            conv: crate::nn::StatePool::new(
+            conv: crate::nn::StatePool::with_phases(
                 rows,
-                self.layers.len(),
+                phases,
+                n,
                 &[self.cfg.conv_channels(), self.cfg.ssm_conv_kernel],
                 f32,
                 dev,
             ),
+            ple: self.ple.as_ref().map(|p| {
+                crate::nn::StatePool::with_phases(
+                    rows,
+                    phases,
+                    n,
+                    &[self.cfg.hc_dim(), p.block.history_len()],
+                    f32,
+                    dev,
+                )
+            }),
         }
+    }
+
+    /// A speculative verify window: the `T` tokens `[anchor, proposed…]`
+    /// through the model as ONE pass — the weights swept once (the HC
+    /// brackets, the stems, the MoE's shared and routed experts, the head
+    /// over `T` rows), the state advanced position by position with every
+    /// intermediate kept in the channels' phase rings — under an open
+    /// window; returns each position's argmax. The caller accepts a prefix
+    /// with [`Cache::accept_window`] (no replay). Every step is the
+    /// arithmetic of a decode step (the row gemvs, the per-position state
+    /// kernels), so the argmaxes are the sequential decode's. Needs
+    /// `cache.ring_holds(T, ple)`.
+    pub fn verify_window(&self, tokens: &[u32], cache: &mut Cache) -> Result<Vec<u32>> {
+        let t = tokens.len();
+        if t == 0 {
+            lloom_tensor::bail!("qwen4exp verify_window: no tokens")
+        }
+        if !cache.ring_holds(t, self.ple.is_some()) {
+            lloom_tensor::bail!(
+                "qwen4exp verify_window: {t} positions need pooled channels with {} phases \
+                 (`Cache::in_pools` over `spec_pools`)",
+                t + 1
+            )
+        }
+        cache.open_window()?;
+        cache.set_pending_tokens(tokens);
+        if let Some(w) = &mut cache.window {
+            w.tokens = tokens.to_vec();
+        }
+        let dev = self.device();
+        if !dev.is_metal() {
+            // The reference path: the positions one by one through the
+            // decode step (the CPU's gemm sums in an order that depends on
+            // the row count, so a rows pass would not be the sequential
+            // math there); the ring channels take the writes phase by phase.
+            let mut argmax = Vec::with_capacity(t);
+            let base_lens: Vec<(usize, usize)> = cache.kv.iter().map(|k| k.lens()).collect();
+            let mut kv_after = Vec::with_capacity(t);
+            let _ = base_lens;
+            for &tok in tokens {
+                let input = Tensor::from_vec(vec![tok], (1, 1), &dev)?;
+                let logits = self
+                    .decode_embed_pass(&self.embed(&input)?, cache, &mut (), false)?
+                    .0;
+                argmax.push(
+                    logits
+                        .flatten_all()?
+                        .argmax(D::Minus1)?
+                        .to_scalar::<u32>()?,
+                );
+                kv_after.push(cache.kv.iter().map(|k| k.lens()).collect::<Vec<_>>());
+            }
+            if let Some(w) = &mut cache.window {
+                w.kv_after = kv_after;
+            }
+            return Ok(argmax);
+        }
+        let input = Tensor::from_vec(tokens.to_vec(), (t, 1), &dev)?;
+        let h = self.embed(&input)?; // [T, 1, hidden]
+        let planned = self.device_plan && plan_on_device() && cache.device_plan_armed;
+        let (logits, records) = self.verify_pass(&h, cache, planned)?;
+        let mut logits = logits;
+        if planned {
+            let mut redo = false;
+            for (l, rec) in &records {
+                if self.layers[*l].moe().experts().settle(rec)? {
+                    redo = true;
+                }
+            }
+            if redo {
+                // The host plan over the same window from the base.
+                let tokens_v = cache
+                    .window
+                    .as_ref()
+                    .map(|w| w.tokens.clone())
+                    .unwrap_or_default();
+                cache.accept_window(0)?;
+                cache.redos += 1;
+                cache.device_plan_armed = false;
+                cache.open_window()?;
+                cache.set_pending_tokens(&tokens_v);
+                if let Some(w) = &mut cache.window {
+                    w.tokens = tokens_v;
+                }
+                logits = self.verify_pass(&h, cache, false)?.0;
+            }
+        }
+        let argmax = logits.argmax(D::Minus1)?.to_vec1::<u32>()?; // [T]
+        Ok(argmax)
+    }
+
+    /// The layer stack over the window's `T` positions → logits `[T, vocab]`
+    /// and the device plans' records; the KV lengths after each position
+    /// recorded in the window.
+    fn verify_pass(
+        &self,
+        h: &Tensor,
+        cache: &mut Cache,
+        device_plan: bool,
+    ) -> Result<(Tensor, Vec<(usize, Tensor)>)> {
+        let n = self.cfg.hc_count;
+        let d = self.cfg.hidden_size;
+        let t = h.dim(0)?;
+        let n_layers = self.layers.len();
+        let mut records: Vec<(usize, Tensor)> = Vec::new();
+        let mut kv_after: Vec<Vec<(usize, usize)>> = (0..t)
+            .map(|_| cache.kv.iter().map(|k| k.lens()).collect())
+            .collect();
+        let mut res_hc = h
+            .reshape((t, 1, 1, d))?
+            .broadcast_as((t, 1, n, d))?
+            .reshape((t, 1, n * d))?
+            .contiguous()?;
+        for (l, layer) in self.layers.iter().enumerate() {
+            if let Some(ple) = &self.ple {
+                if ple.layer == l {
+                    // Per position: its own token window and history phase.
+                    let mut deltas = Vec::with_capacity(t);
+                    for p in 0..t {
+                        deltas.push(self.ple_delta(ple, &res_hc.narrow(0, p, 1)?, cache)?);
+                    }
+                    let delta = if t == 1 {
+                        deltas.pop().expect("one position")
+                    } else {
+                        Tensor::cat(&deltas, 0)?
+                    };
+                    res_hc = (res_hc + delta)?;
+                }
+            }
+            let (next, record, lens) = layer.decode_parts_seq(&res_hc, l, cache, device_plan)?;
+            if let Some(r) = record {
+                records.push((l, r));
+            }
+            if let Some(lens) = lens {
+                for (p, ln) in lens.into_iter().enumerate() {
+                    for row in kv_after.iter_mut().skip(p) {
+                        row[l] = ln;
+                    }
+                }
+                let _ = n_layers;
+            }
+            res_hc = next;
+        }
+        for p in 0..t {
+            cache.keep_nextn(&res_hc.narrow(0, p, 1)?);
+        }
+        cache.pos += t;
+        if let Some(w) = &mut cache.window {
+            w.kv_after = kv_after;
+        }
+        let (collapsed, _) = self.hc_head.mix(&res_hc)?; // [T, 1, d]
+        let logits = self.lm_head.forward(&collapsed)?; // [T, 1, vocab]
+        let logits = logits
+            .reshape((t, self.cfg.vocab_size))?
+            .to_dtype(lloom_tensor::DType::F32)?;
+        Ok((logits, records))
     }
 }
 

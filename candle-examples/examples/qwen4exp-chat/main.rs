@@ -819,7 +819,9 @@ fn gate<R: ExpertResidency + HasStreamStats>(
     if let Some(head) = model.mtp_head() {
         // One speculative decode of the same prompt: the MTP drafter on the
         // seam, verified by the target; must equal the greedy stream.
-        let mut cache: Cache = model.new_cache(&cfg, device)?;
+        // The verify window's states in phase rings: an accept by phase.
+        let pools = model.spec_pools(1, args.mtp_k, device);
+        let mut cache: Cache = Cache::in_pools(&cfg, &pools)?;
         cache.want_nextn = true;
         let mut session = Session::new(model, cache);
         let mut drafter =
@@ -828,6 +830,8 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         let mut rb = Blocking::new(eos_ids, device)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let opts = DecodeOptions::new(args.max_tokens);
+        #[cfg(feature = "metal")]
+        candle::kernels::metal::profile::reset();
         let t2 = std::time::Instant::now();
         let out = session.decode_speculative(
             &mut drafter,
@@ -839,6 +843,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             &mut |_| Ok(()),
         )?;
         let mtp_ms = t2.elapsed().as_millis();
+        profile_line(0, "mtp", out.ids.len(), mtp_ms as f64);
         let mut h = sha256::Sha256::new();
         for t in &out.ids {
             h.update(&t.to_le_bytes());

@@ -15,12 +15,29 @@ use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use lloom_tensor::{DType, Device, Result, Tensor};
 use std::sync::Arc;
 
+thread_local! {
+    static F16_STEMS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Build the dense matrices of this thread's models as `TensorF16` (the
+/// real checkpoint's dense-stem kind — the mixed gemv's row tiles) instead
+/// of f32 `Tensor` (which the Metal gemm re-orders at `m > 1`). A test that
+/// asserts bit-identity of a rows pass against single rows sets it.
+pub fn set_f16_stems(on: bool) {
+    F16_STEMS.with(|f| f.set(on));
+}
+
 /// A dense `[out, inp]` matrix from a seed.
 pub fn lin(out: usize, inp: usize, seed: f32, dev: &Device) -> QMatMul {
     let v: Vec<f32> = (0..out * inp)
         .map(|i| ((i as f32 * 0.007 + seed).sin()) * 0.08)
         .collect();
-    QMatMul::Tensor(Tensor::from_vec(v, (out, inp), dev).unwrap())
+    let t = Tensor::from_vec(v, (out, inp), dev).unwrap();
+    if F16_STEMS.with(|f| f.get()) {
+        QMatMul::TensorF16(t.to_dtype(DType::F16).unwrap())
+    } else {
+        QMatMul::Tensor(t)
+    }
 }
 
 pub fn ones(n: usize, dev: &Device) -> Tensor {

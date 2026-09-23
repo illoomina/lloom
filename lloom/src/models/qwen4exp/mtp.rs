@@ -320,6 +320,9 @@ pub struct MtpPending {
     /// The window's input tokens `[anchor, proposed…]`.
     tokens: Vec<u32>,
     want_was: bool,
+    /// The window ran as one pass over the phase rings (`verify_window`):
+    /// the accept is by phase.
+    by_phase: bool,
 }
 
 impl<R: ExpertResidency> Qwen4Exp<R> {
@@ -393,16 +396,25 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
         cache.drop_nextn();
         let want_was = cache.want_nextn;
         cache.want_nextn = true;
-        cache.open_window()?;
-        let mut argmaxes = Vec::with_capacity(tokens.len());
-        for &t in &tokens {
-            argmaxes.push(self.step_argmax(t, cache)?);
-        }
-        let argmax = Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?;
+        // The window as ONE pass with every position's state kept (the
+        // phase rings, `verify_window`) when the cache holds them; else the
+        // sequential steps with the replay on a partial accept.
+        let by_phase = cache.ring_holds(tokens.len(), self.has_ple());
+        let argmax = if by_phase {
+            self.verify_window(&tokens, cache)?
+        } else {
+            cache.open_window()?;
+            let mut argmaxes = Vec::with_capacity(tokens.len());
+            for &t in &tokens {
+                argmaxes.push(self.step_argmax(t, cache)?);
+            }
+            Tensor::cat(&argmaxes, 0)?.to_vec1::<u32>()?
+        };
         Ok(MtpPending {
             argmax,
             tokens,
             want_was,
+            by_phase,
         })
     }
 
@@ -419,6 +431,7 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
             argmax,
             tokens,
             want_was,
+            by_phase,
         } = pending;
         let accepted = accept_prefix(&argmax, &tokens[1..], eos_ids);
         let a = accepted.len();
@@ -431,7 +444,11 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
                 accepted
             );
         }
-        let probe = if a == tokens.len() {
+        let probe = if by_phase {
+            // The accepted prefix by phase: no replay.
+            cache.accept_window(a)?;
+            cache.take_nextn()?
+        } else if a == tokens.len() {
             cache.resolve_window()?;
             cache.take_nextn()?
         } else {

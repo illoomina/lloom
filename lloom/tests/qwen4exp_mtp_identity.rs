@@ -76,8 +76,24 @@ fn speculative<S: Speculator<Probe = NextnHidden>>(
     prompt: &[u32],
     max: usize,
 ) -> Result<(Vec<u32>, bool, usize)> {
+    speculative_on(model, cfg, spec, prompt, max, None)
+}
+
+/// `ring`: the cache over `spec_pools(1, k)` — the verify as one pass with
+/// the accept by phase (`verify_window`); `None`: the sequential verify.
+fn speculative_on<S: Speculator<Probe = NextnHidden>>(
+    model: &Qwen4Exp<Resident>,
+    cfg: &Config,
+    spec: &mut S,
+    prompt: &[u32],
+    max: usize,
+    ring: Option<usize>,
+) -> Result<(Vec<u32>, bool, usize)> {
     let dev = Device::Cpu;
-    let mut cache: Cache = model.new_cache(cfg, &dev)?;
+    let mut cache: Cache = match ring {
+        Some(k) => Cache::in_pools(cfg, &model.spec_pools(1, k, &dev))?,
+        None => model.new_cache(cfg, &dev)?,
+    };
     cache.want_nextn = true;
     let mut session = Session::new(model, cache);
     let eos = [cfg.eos_token_id];
@@ -181,10 +197,13 @@ fn mtp_speculative_decode_is_byte_identical_to_greedy() -> Result<()> {
     // with the observed rows (the re-applications are rewound).
     for k in [2usize, 3] {
         let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
-        let mut mtp = MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev)
-            .with_k(k);
+        let mut mtp =
+            MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
         let (ids, eos, accepted) = speculative(&model, &cfg, &mut mtp, &prompt, max)?;
-        assert_eq!(ids, ref_ids, "MTP drafter at k = {k}: not the greedy stream");
+        assert_eq!(
+            ids, ref_ids,
+            "MTP drafter at k = {k}: not the greedy stream"
+        );
         assert_eq!(eos, ref_eos);
         assert!(
             mtp.rows_seen() >= prompt.len() + ref_ids.len() - 1,
@@ -193,8 +212,36 @@ fn mtp_speculative_decode_is_byte_identical_to_greedy() -> Result<()> {
             prompt.len(),
             ref_ids.len()
         );
-        assert_eq!(mtp.cache().pos, mtp.rows_seen(), "k = {k}: the drafter's cache holds draft-time rows");
+        assert_eq!(
+            mtp.cache().pos,
+            mtp.rows_seen(),
+            "k = {k}: the drafter's cache holds draft-time rows"
+        );
         println!("MTPK k={k} accepted={accepted}");
+    }
+
+    // (a'') the verify as ONE pass over the phase rings with the accept by
+    // phase (no replay): the greedy stream at every K, the rounds' accepted
+    // counts equal to the sequential verify's.
+    for k in [1usize, 2, 3] {
+        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let mut seq =
+            MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
+        let (ids_s, eos_s, acc_s) = speculative_on(&model, &cfg, &mut seq, &prompt, max, None)?;
+        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let mut ring =
+            MtpDrafter::new(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev).with_k(k);
+        let (ids_r, eos_r, acc_r) = speculative_on(&model, &cfg, &mut ring, &prompt, max, Some(k))?;
+        assert_eq!(
+            ids_r, ref_ids,
+            "ring verify at k = {k}: not the greedy stream"
+        );
+        assert_eq!(
+            (ids_r, eos_r, acc_r),
+            (ids_s, eos_s, acc_s),
+            "ring vs sequential verify at k = {k}"
+        );
+        println!("MTPRING k={k} accepted={acc_r}");
     }
 
     // (b) the oracle: every round fully accepted (the resolve path)

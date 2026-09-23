@@ -40,6 +40,7 @@ pub use kernels::{
     ConvKernel, GemmDType, GemvEpilogue, GemvRmsNorm, GgmlDType, IndexingKernel, MixedEpilogue,
     ParamStyle, ReduceKernel, SdpaQuantParams, SdpaQuantWriteParams, SKINNY_TILE_MAX_M,
     call_gdn_gated_norm_rows, call_gdn_prologue_rows, call_gdn_step_rows,
+    call_gdn_prologue_seq, call_gdn_step_seq,
 };
 // The binding-style default, so a harness can reach the packed entry points
 // without every `call_*` growing an argument (issue #115). Named rather than

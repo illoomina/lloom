@@ -884,28 +884,31 @@ kernel void moe_slot_map_u32(
   out[2 * n + i] = miss ? 1u : 0u;
 }
 
-// ---- DeltaNet decode over the rows of one state pool -------------------------------
+// ---- DeltaNet decode over the rows of one state pool, and over the positions of one row ----
 
-// `gdn_prologue_f32` over `B` rows: `qkv [B, C]`, the windows in the two
-// pool slabs `[slots, C, kk]` (row `b` reads slab `phases[b]` at row
-// `slots[b]` and writes the other slab there), `heads [B, 3, h_v, d]`.
-// Grid: (2·h_k + h_v) × B threadgroups.
+// A state pool's layer is `[phases, slots, ..row]`; row `slot` at `phase` is
+// at `(phase * n_slots + slot) * row_elems`, and the next phase is
+// `(phase + 1) % n_phases`.
+
+// `gdn_prologue_f32` over `B` rows: `qkv [B, C]`, the window pool (row `b`
+// reads `phases[b]` at `slots[b]`, writes the next phase), `heads [B, 3,
+// h_v, d]`. Grid: (2·h_k + h_v) × B threadgroups.
 kernel void gdn_prologue_rows_f32(
     const device float* qkv [[buffer(0)]],
     const device float* conv_w [[buffer(1)]],
-    const device float* win_a [[buffer(2)]],
-    const device float* win_b [[buffer(3)]],
-    const device uint* slots [[buffer(4)]],
-    const device uint* phases [[buffer(5)]],
-    device float* heads [[buffer(6)]],
-    constant uint& d [[buffer(7)]],
-    constant uint& h_k [[buffer(8)]],
-    constant uint& h_v [[buffer(9)]],
-    constant uint& kk [[buffer(10)]],
-    constant float& eps [[buffer(11)]],
-    constant float& q_scale [[buffer(12)]],
-    device float* win_a_out [[buffer(13)]],
-    device float* win_b_out [[buffer(14)]],
+    const device float* win_pool [[buffer(2)]],
+    const device uint* slots [[buffer(3)]],
+    const device uint* phases [[buffer(4)]],
+    device float* heads [[buffer(5)]],
+    constant uint& d [[buffer(6)]],
+    constant uint& h_k [[buffer(7)]],
+    constant uint& h_v [[buffer(8)]],
+    constant uint& kk [[buffer(9)]],
+    constant float& eps [[buffer(10)]],
+    constant float& q_scale [[buffer(11)]],
+    constant uint& n_slots [[buffer(12)]],
+    constant uint& n_phases [[buffer(13)]],
+    device float* win_pool_out [[buffer(14)]],
     uint2 gid [[threadgroup_position_in_grid]],
     uint2 tid [[thread_position_in_threadgroup]],
     uint2 tptg [[threads_per_threadgroup]],
@@ -918,10 +921,11 @@ kernel void gdn_prologue_rows_f32(
   const uint b = gid.y;
   const uint key_dim = h_k * d;
   const uint C = 2 * key_dim + h_v * d;
+  const size_t row = (size_t)C * kk;
   const uint slot = slots[b];
   const uint phase = phases[b];
-  const device float* win = (phase == 0 ? win_a : win_b) + (size_t)slot * C * kk;
-  device float* wout = (phase == 0 ? win_b_out : win_a_out) + (size_t)slot * C * kk;
+  const device float* win = win_pool + ((size_t)phase * n_slots + slot) * row;
+  device float* wout = win_pool_out + ((size_t)((phase + 1) % n_phases) * n_slots + slot) * row;
   const device float* x_row = qkv + (size_t)b * C;
   device float* heads_row = heads + (size_t)b * 3 * h_v * d;
   uint plane, head, base;
@@ -971,50 +975,103 @@ kernel void gdn_prologue_rows_f32(
   }
 }
 
-// `gdn_step_f32` over `B` rows: `heads [B, 3, h_v, d]`, `alpha` / `beta`
-// `[B, h_v]`, the `S` slabs `[slots, d, d, h_v]` at the two phases (row `b`
-// reads `phases[b]` at `slots[b]`, writes the other), `o [B, h_v, d]`.
-// Grid: d × B threadgroups of `h_v × split` threads.
-kernel void gdn_step_rows_f32(
-    const device float* heads [[buffer(0)]],
-    const device float* alpha [[buffer(1)]],
-    const device float* beta [[buffer(2)]],
-    const device float* dt_bias [[buffer(3)]],
-    const device float* ssm_a [[buffer(4)]],
-    const device float* s_a [[buffer(5)]],
-    const device float* s_b [[buffer(6)]],
-    const device uint* slots [[buffer(7)]],
-    const device uint* phases [[buffer(8)]],
-    device float* o [[buffer(9)]],
-    constant uint& d [[buffer(10)]],
-    constant uint& h_v [[buffer(11)]],
-    device float* s_a_out [[buffer(12)]],
-    device float* s_b_out [[buffer(13)]],
+// `gdn_prologue_f32` over `T` POSITIONS of one row: `qkv [T, C]`, the
+// window at `phase` of `slot` is the state before position 0; position t's
+// conv reads the virtual sequence (the window's last kk−1 inputs, then the
+// rows), and the window after every position is written to phase
+// `(phase + 1 + t) % n_phases` — so an accept of `a` positions is phase
+// `phase + a`. `heads [T, 3, h_v, d]`. Grid: (2·h_k + h_v) × T.
+kernel void gdn_prologue_seq_f32(
+    const device float* qkv [[buffer(0)]],
+    const device float* conv_w [[buffer(1)]],
+    const device float* win_pool [[buffer(2)]],
+    device float* heads [[buffer(3)]],
+    constant uint& d [[buffer(4)]],
+    constant uint& h_k [[buffer(5)]],
+    constant uint& h_v [[buffer(6)]],
+    constant uint& kk [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    constant float& q_scale [[buffer(9)]],
+    constant uint& n_slots [[buffer(10)]],
+    constant uint& n_phases [[buffer(11)]],
+    constant uint& slot [[buffer(12)]],
+    constant uint& phase [[buffer(13)]],
+    device float* win_pool_out [[buffer(14)]],
     uint2 gid [[threadgroup_position_in_grid]],
     uint2 tid [[thread_position_in_threadgroup]],
-    uint2 tptg [[threads_per_threadgroup]]) {
-  threadgroup float part[1024];
-  const uint dv = gid.x;
-  const uint b = gid.y;
-  const uint t = tid.x;
+    uint2 tptg [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+  const uint i = tid.x;
   const uint width = tptg.x;
-  const uint split = width / h_v;
-  const uint h = t % h_v;
-  const uint j = t / h_v;
-  const bool live = j < split;
-  const size_t slab = (size_t)d * d * h_v;
-  const uint slot = slots[b];
-  const uint phase = phases[b];
-  const device float* s = (phase == 0 ? s_a : s_b) + (size_t)slot * slab;
-  device float* s_out = (phase == 0 ? s_b_out : s_a_out) + (size_t)slot * slab;
-  const device float* hrow = heads + (size_t)b * 3 * h_v * d;
-  const device float* q = hrow + (size_t)h * d;
-  const device float* k = hrow + (size_t)(h_v + h) * d;
-  const device float* v = hrow + (size_t)(2 * h_v + h) * d;
-  const float a = alpha[(size_t)b * h_v + h] + dt_bias[h];
-  const float sp = metal::max(a, 0.0f) + metal::log(1.0f + metal::exp(-metal::fabs(a)));
-  const float eg = metal::exp(ssm_a[h] * sp);
-  const float bt = 1.0f / (1.0f + metal::exp(-beta[(size_t)b * h_v + h]));
+  threadgroup float partial[32];
+  const uint group = gid.x;
+  const uint t = gid.y;
+  const uint key_dim = h_k * d;
+  const uint C = 2 * key_dim + h_v * d;
+  const size_t row = (size_t)C * kk;
+  const device float* win = win_pool + ((size_t)phase * n_slots + slot) * row;
+  device float* wout = win_pool_out + ((size_t)((phase + 1 + t) % n_phases) * n_slots + slot) * row;
+  device float* heads_row = heads + (size_t)t * 3 * h_v * d;
+  uint plane, head, base;
+  if (group < h_k) {
+    plane = 0; head = group; base = head * d;
+  } else if (group < 2 * h_k) {
+    plane = 1; head = group - h_k; base = key_dim + head * d;
+  } else {
+    plane = 2; head = group - 2 * h_k; base = 2 * key_dim + head * d;
+  }
+  float y = 0.0f;
+  if (i < d) {
+    const uint c = base + i;
+    const device float* cw = conv_w + (size_t)c * kk;
+    device float* wo = wout + (size_t)c * kk;
+    // the window after position t: the virtual sequence's last kk inputs
+    // (as `gdn_prologue_f32`: the shifted window, then the input)
+    float folded = 0.0f;
+    for (uint j = 0; j + 1 < kk; j++) {
+      const int tp = (int)t - (int)(kk - 1) + (int)j; // input index of window slot j
+      const float v = tp < 0 ? win[(size_t)c * kk + (uint)((int)kk + tp)] : qkv[(size_t)tp * C + c];
+      wo[j] = v;
+      folded += cw[j] * v;
+    }
+    const float x = qkv[(size_t)t * C + c];
+    wo[kk - 1] = x;
+    folded += cw[kk - 1] * x;
+    y = gdn_silu(folded);
+  }
+  if (plane == 2) {
+    if (i < d) heads_row[(size_t)(2 * h_v + head) * d + i] = y;
+    return;
+  }
+  float ss = simd_sum(y * y);
+  if (simd_lane == 0) partial[simd_id] = ss;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint n_simd = (width + 31) / 32;
+  float total = 0.0f;
+  for (uint s = 0; s < n_simd; s++) total += partial[s];
+  const float inv = 1.0f / metal::sqrt(total + eps);
+  float out = y * inv;
+  if (plane == 0) out *= q_scale;
+  if (i < d) {
+    const uint rep = h_v / h_k;
+    for (uint r = 0; r < rep; r++) {
+      const uint j = r * h_k + head;
+      heads_row[(size_t)(plane * h_v + j) * d + i] = out;
+    }
+  }
+}
+
+// One recurrence step of column `dv` for head `h` over the `dk` slice
+// `j, j+split, …` — the body `gdn_step_f32` runs; here shared by the rows
+// and the multi-step forms. `part` is the group's `[h_v · split]` scratch.
+static inline void gdn_step_column(
+    const device float* q, const device float* k, const device float* v,
+    const float eg, const float bt,
+    const device float* s, device float* s_out,
+    const uint d, const uint h_v, const uint dv, const uint h, const uint j,
+    const uint split, const bool live, const uint t,
+    threadgroup float* part, device float* o_out) {
   float r = 0.0f;
   if (live) {
     for (uint dk = j; dk < d; dk += split) {
@@ -1041,7 +1098,102 @@ kernel void gdn_step_rows_f32(
   if (j == 0) {
     float sum = 0.0f;
     for (uint jj = 0; jj < split; jj++) sum += part[jj * h_v + h];
-    o[((size_t)b * h_v + h) * d + dv] = sum;
+    o_out[(size_t)h * d + dv] = sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline float gdn_gate_eg(const float alpha, const float dt_bias, const float ssm_a) {
+  const float a = alpha + dt_bias;
+  const float sp = metal::max(a, 0.0f) + metal::log(1.0f + metal::exp(-metal::fabs(a)));
+  return metal::exp(ssm_a * sp);
+}
+
+// `gdn_step_f32` over `B` rows: `heads [B, 3, h_v, d]`, `alpha` / `beta`
+// `[B, h_v]`, the `S` pool (row `b` reads `phases[b]` at `slots[b]`, writes
+// the next phase), `o [B, h_v, d]`. Grid: d × B threadgroups of `h_v × split`.
+kernel void gdn_step_rows_f32(
+    const device float* heads [[buffer(0)]],
+    const device float* alpha [[buffer(1)]],
+    const device float* beta [[buffer(2)]],
+    const device float* dt_bias [[buffer(3)]],
+    const device float* ssm_a [[buffer(4)]],
+    const device float* s_pool [[buffer(5)]],
+    const device uint* slots [[buffer(6)]],
+    const device uint* phases [[buffer(7)]],
+    device float* o [[buffer(8)]],
+    constant uint& d [[buffer(9)]],
+    constant uint& h_v [[buffer(10)]],
+    constant uint& n_slots [[buffer(11)]],
+    constant uint& n_phases [[buffer(12)]],
+    device float* s_pool_out [[buffer(13)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tptg [[threads_per_threadgroup]]) {
+  threadgroup float part[1024];
+  const uint dv = gid.x;
+  const uint b = gid.y;
+  const uint t = tid.x;
+  const uint width = tptg.x;
+  const uint split = width / h_v;
+  const uint h = t % h_v;
+  const uint j = t / h_v;
+  const bool live = j < split;
+  const size_t slab = (size_t)d * d * h_v;
+  const uint slot = slots[b];
+  const uint phase = phases[b];
+  const device float* s = s_pool + ((size_t)phase * n_slots + slot) * slab;
+  device float* s_out = s_pool_out + ((size_t)((phase + 1) % n_phases) * n_slots + slot) * slab;
+  const device float* hrow = heads + (size_t)b * 3 * h_v * d;
+  const float eg = gdn_gate_eg(alpha[(size_t)b * h_v + h], dt_bias[h], ssm_a[h]);
+  const float bt = 1.0f / (1.0f + metal::exp(-beta[(size_t)b * h_v + h]));
+  gdn_step_column(hrow + (size_t)h * d, hrow + (size_t)(h_v + h) * d, hrow + (size_t)(2 * h_v + h) * d,
+                  eg, bt, s, s_out, d, h_v, dv, h, j, split, live, t, part,
+                  o + (size_t)b * h_v * d);
+}
+
+// `gdn_step_f32` over `T` POSITIONS of one row, in one launch: position t
+// reads `S` at phase `phase + t` and writes `phase + 1 + t` (mod
+// `n_phases`), so every intermediate state is kept and an accept of `a`
+// positions is phase `phase + a`. `heads [T, 3, h_v, d]`, `alpha` / `beta`
+// `[T, h_v]`, `o [T, h_v, d]`. A threadgroup owns column `dv` for every
+// head — the recurrence of a column depends on that column alone — so the
+// positions run in sequence inside the group, each step the arithmetic of
+// `gdn_step_f32`. Grid: d threadgroups of `h_v × split`.
+kernel void gdn_step_seq_f32(
+    const device float* heads [[buffer(0)]],
+    const device float* alpha [[buffer(1)]],
+    const device float* beta [[buffer(2)]],
+    const device float* dt_bias [[buffer(3)]],
+    const device float* ssm_a [[buffer(4)]],
+    const device float* s_pool [[buffer(5)]],
+    device float* o [[buffer(6)]],
+    constant uint& d [[buffer(7)]],
+    constant uint& h_v [[buffer(8)]],
+    constant uint& n_slots [[buffer(9)]],
+    constant uint& n_phases [[buffer(10)]],
+    constant uint& slot [[buffer(11)]],
+    constant uint& phase [[buffer(12)]],
+    constant uint& steps [[buffer(13)]],
+    device float* s_pool_out [[buffer(14)]],
+    uint dv [[threadgroup_position_in_grid]],
+    uint t [[thread_position_in_threadgroup]],
+    uint width [[threads_per_threadgroup]]) {
+  threadgroup float part[1024];
+  const uint split = width / h_v;
+  const uint h = t % h_v;
+  const uint j = t / h_v;
+  const bool live = j < split;
+  const size_t slab = (size_t)d * d * h_v;
+  for (uint p = 0; p < steps; p++) {
+    const device float* s = s_pool + ((size_t)((phase + p) % n_phases) * n_slots + slot) * slab;
+    device float* s_out = s_pool_out + ((size_t)((phase + p + 1) % n_phases) * n_slots + slot) * slab;
+    const device float* hrow = heads + (size_t)p * 3 * h_v * d;
+    const float eg = gdn_gate_eg(alpha[(size_t)p * h_v + h], dt_bias[h], ssm_a[h]);
+    const float bt = 1.0f / (1.0f + metal::exp(-beta[(size_t)p * h_v + h]));
+    gdn_step_column(hrow + (size_t)h * d, hrow + (size_t)(h_v + h) * d, hrow + (size_t)(2 * h_v + h) * d,
+                    eg, bt, s, s_out, d, h_v, dv, h, j, split, live, t, part,
+                    o + (size_t)p * h_v * d);
   }
 }
 

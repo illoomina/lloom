@@ -39,6 +39,10 @@ pub struct Buffer {
     /// `None` means "all of `raw`", which is every ordinary allocation. A view
     /// carries its slot size so `length()` cannot report the whole arena.
     length: Option<usize>,
+
+    /// Whether `contents()` addresses CPU-readable memory: false for Private
+    /// storage, decided once at construction (see `new`).
+    cpu_visible: bool,
 }
 
 unsafe impl Send for Buffer {}
@@ -46,10 +50,22 @@ unsafe impl Sync for Buffer {}
 
 impl Buffer {
     pub fn new(raw: Retained<ProtocolObject<dyn MTLBuffer>>) -> Buffer {
+        // A Private buffer has no CPU mapping. `contents()` says so with a
+        // null for a buffer of its own — and with a NON-null, invalid pointer
+        // for a buffer sub-allocated from a Private `MTLHeap` (measured: the
+        // readback's `contents().is_null()` fast path took it and faulted,
+        // lloom #749 P26). Decided once here from the storage mode, which is
+        // the property the question is about; `data()` returns null for it
+        // whatever Metal hands back.
+        let cpu_visible = {
+            use objc2_metal::MTLResource as _;
+            raw.storageMode() != objc2_metal::MTLStorageMode::Private
+        };
         Buffer {
             raw,
             base_offset: 0,
             length: None,
+            cpu_visible,
         }
     }
 
@@ -77,6 +93,7 @@ impl Buffer {
             raw: self.raw.clone(),
             base_offset: self.base_offset + base_offset,
             length: Some(length),
+            cpu_visible: self.cpu_visible,
         }
     }
 
@@ -153,6 +170,9 @@ impl Buffer {
         // `black_box` is load-bearing, not a micro-optimisation guard: it makes
         // the pointer opaque so the `is_null` below cannot be folded against
         // what the optimiser can prove about `contents()`.
+        if !self.cpu_visible {
+            return std::ptr::null_mut();
+        }
         let base = std::hint::black_box(self.as_ref().contents().as_ptr()) as *mut u8;
         if base.is_null() {
             return base;

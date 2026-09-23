@@ -214,6 +214,25 @@ impl ResidencySet {
         }
     }
 
+    /// Add an allocation that is not a buffer of ours — a heap chunk
+    /// (`heap.rs`) — keyed by `key`, and commit at once: a chunk is made a
+    /// few times a process and everything it will hold rides on this one
+    /// commit. Returns whether it was newly added.
+    pub fn insert_allocation(&self, alloc: &ProtocolObject<dyn MTLAllocation>, key: usize) -> bool {
+        let Some(set) = &self.raw else {
+            return false;
+        };
+        let mut members = self.members.lock();
+        if !members.insert(key) {
+            return false;
+        }
+        set.addAllocation(alloc);
+        set.commit();
+        self.added.fetch_add(1, Ordering::Relaxed);
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     /// Commit the residency set iff [`Self::add`] has staged an allocation since
     /// the last commit. Called at each command-buffer cut
     /// (`Commands::commit_swap_locked`), so staged allocations are published to

@@ -66,6 +66,7 @@ mod flash_decoding_tests;
 /// unconditionally and compiles to nothing when the feature is off --
 /// `run_telemetry`'s shape, for its reasons.
 pub mod hazard_audit;
+pub mod heap;
 #[cfg(test)]
 mod hazard_audit_tests;
 pub mod icb;
@@ -132,6 +133,7 @@ pub use encoder::*;
 pub use eos_gate::{DispatchGate, EosGateReport};
 pub use executor::*;
 pub use fence::*;
+pub use heap::*;
 pub use kv_pages::*;
 pub use library::*;
 pub use residency_set::*;

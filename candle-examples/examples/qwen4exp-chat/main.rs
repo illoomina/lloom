@@ -345,12 +345,16 @@ fn mem_line(run: usize, phase: &str, device: &Device, report: Option<MemReport>)
         // command-buffer cuts and the pool's misses made, and the set's size
         // — the seam's cost at prefill is this commit (issue #749 P26).
         let c = d.residency_counters();
+        let (hs, hp) = d.heap_stats();
         line.push_str(&format!(
-            " residency_allocations={} residency_commits={} residency_added={} residency_removed={}",
+            " residency_allocations={} residency_commits={} residency_added={} residency_removed={} heap_chunks={} heap_size_gb={:.2} heap_used_gb={:.2}",
             d.residency_set_len(),
             c.commits,
             c.added,
-            c.removed
+            c.removed,
+            hs.chunks + hp.chunks,
+            gb((hs.size + hp.size) as u64),
+            gb((hs.used + hp.used) as u64)
         ));
     }
     if let Some(r) = report {

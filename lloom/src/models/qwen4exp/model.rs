@@ -837,14 +837,22 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             let dev = m.device();
             let allocated = dev.current_allocated_size();
             let working_set = dev.recommended_max_working_set_size();
-            let fits = kv_grow_fits(allocated, working_set, self.memory_fraction, plan.bytes());
+            // The transients come from the heap chunks first (§6.3k), whose
+            // whole size `allocated` already counts: what the chunks have
+            // free is transient the pass will NOT allocate.
+            let (hs, hp) = m.heap_stats();
+            let heap_free = (hs.size + hp.size).saturating_sub(hs.used + hp.used);
+            let need = plan.kv_grow + plan.transient.saturating_sub(heap_free);
+            let fits = kv_grow_fits(allocated, working_set, self.memory_fraction, need);
             let gb = |b: usize| b as f64 / 1e9;
             let line = format!(
-                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB allocated={:.2} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
+                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB heap_free={:.3} GB need={:.3} GB allocated={:.2} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
                 plan.pos,
                 plan.seq,
                 gb(plan.kv_grow),
                 gb(plan.transient),
+                gb(heap_free),
+                gb(need),
                 gb(allocated),
                 gb(kv_grow_budget(working_set, self.memory_fraction)),
                 self.memory_fraction,

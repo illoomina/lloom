@@ -8,7 +8,10 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 // never used here — the contiguous const-set path uses a function-local
 // `use crate::kernels::unary::contiguous` instead. RESTRUCTURING §7.1.)
 use crate::kernels::{
-    metal::{Buffer, BufferPool, Commands, Device, PooledBuffer, ResidencySet},
+    metal::{
+        heap_chunk_bytes, Buffer, BufferPool, Commands, Device, HeapChunks, PooledBuffer,
+        ResidencySet,
+    },
     BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
 };
 use objc2_foundation::NSRange;
@@ -20,7 +23,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
-use device::{ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver};
+use device::{
+    ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
+};
 pub use device::{DeviceId, MetalDevice};
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
@@ -2754,6 +2759,20 @@ impl BackendDevice for MetalDevice {
         // the only thing that advances it.
         let buffers = BufferPool::with_clock(commands.clock());
         let private_buffers = BufferPool::with_clock(commands.clock());
+        let transient_heaps = Arc::new((
+            HeapChunks::new(
+                &device,
+                Arc::clone(&residency_set),
+                RESOURCE_OPTIONS,
+                heap_chunk_bytes(),
+            ),
+            HeapChunks::new(
+                &device,
+                Arc::clone(&residency_set),
+                PRIVATE_RESOURCE_OPTIONS,
+                heap_chunk_bytes(),
+            ),
+        ));
         {
             // Subscribed here, before any work is encoded, so no command buffer
             // completes without a subscriber to hear it.
@@ -2793,6 +2812,7 @@ impl BackendDevice for MetalDevice {
             commands,
             buffers,
             private_buffers,
+            transient_heaps,
             kernels,
             seed,
             seed_value: Arc::new(parking_lot::RwLock::new(299792458)),

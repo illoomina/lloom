@@ -6,10 +6,11 @@ use crate::kernels::metal::ComputePipeline;
 use crate::kernels::{
     metal::{
         session_region::{RegionCounters, RegionPlan},
-        Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout, ArenaOffsets, ArenaRecorder,
-        BlitCommandsGuard, Buffer, BufferPool, Commands, CommandsGuard, Device, FreeSummary,
-        MTLResourceOptions, PassKey, PassKind, PassPlanCounters, PoolCounters,
-        PoolOccupancySnapshot, PooledBuffer, ResidencySet, SessionRegion, StepPlan,
+        transient_heaps_on, Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout,
+        ArenaOffsets, ArenaRecorder, BlitCommandsGuard, Buffer, BufferPool, Commands,
+        CommandsGuard, Device, FreeSummary, HeapChunks, HeapStats, MTLResourceOptions, PassKey,
+        PassKind, PassPlanCounters, PoolCounters, PoolOccupancySnapshot, PooledBuffer,
+        ResidencySet, SessionRegion, StepPlan,
     },
     Kernels,
 };
@@ -279,6 +280,11 @@ pub struct MetalDevice {
     /// lifetime, so they are never in the free list and never looked at by a
     /// lookup. Reclaimability separates them, not pool identity.
     pub(crate) private_buffers: BufferPool,
+
+    /// Where a pool miss's bytes come from when `transient_heaps_on()`: heap
+    /// chunks in the residency set once (`DESIGN.md` §6.3k), one list per
+    /// storage mode (the Shared pool's, the Private pool's).
+    pub(crate) transient_heaps: Arc<(HeapChunks, HeapChunks)>,
 
     /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
     /// Heavily used by [`crate::kernels`]
@@ -761,6 +767,14 @@ impl MetalDevice {
     /// Live and free occupancy for both pools, shared first.
     pub fn pool_occupancy(&self) -> (PoolOccupancySnapshot, PoolOccupancySnapshot) {
         (self.buffers.occupancy(), self.private_buffers.occupancy())
+    }
+
+    /// The transient heap chunks' `(shared, private)` stats (§6.3k).
+    pub fn heap_stats(&self) -> (HeapStats, HeapStats) {
+        (
+            self.transient_heaps.0.stats(),
+            self.transient_heaps.1.stats(),
+        )
     }
 
     pub fn command_encoder<'a>(&'a self) -> Result<CommandsGuard<'a>> {
@@ -2130,19 +2144,29 @@ impl MetalDevice {
                 self.private_buffers
                     .check_residual(alloc)
                     .map_err(|e| MetalError::Message(e.to_string()))?;
-                let new_buffer = self
-                    .device
-                    .new_buffer(alloc, PRIVATE_RESOURCE_OPTIONS)
-                    .map_err(MetalError::from)?;
-                // `add`, not `insert`: stage the allocation (one `addAllocation`)
-                // and let the next command-buffer cut commit the residency set
-                // once, rather than committing per missed buffer. A cold-pool
-                // prefill misses ~a hundred buffers; §6.3b prices each residency
-                // commit at ~0.087 ms, so batching them to one commit is the
-                // whole of the first-forward residency cost (`commit_swap_locked`
-                // calls `commit_pending` before it commits, so the buffer is
-                // resident before any dispatch that binds it executes, §3.7).
-                self.residency_set.add(&new_buffer);
+                let new_buffer = if transient_heaps_on() {
+                    // From a heap chunk: resident with the chunk, no residency
+                    // call here and none at the cut (§6.3k).
+                    self.transient_heaps
+                        .1
+                        .alloc(alloc)
+                        .map_err(MetalError::from)?
+                } else {
+                    let b = self
+                        .device
+                        .new_buffer(alloc, PRIVATE_RESOURCE_OPTIONS)
+                        .map_err(MetalError::from)?;
+                    // `add`, not `insert`: stage the allocation (one `addAllocation`)
+                    // and let the next command-buffer cut commit the residency set
+                    // once, rather than committing per missed buffer. A cold-pool
+                    // prefill misses ~a hundred buffers; §6.3b prices each residency
+                    // commit at ~0.087 ms, so batching them to one commit is the
+                    // whole of the first-forward residency cost (`commit_swap_locked`
+                    // calls `commit_pending` before it commits, so the buffer is
+                    // resident before any dispatch that binds it executes, §3.7).
+                    self.residency_set.add(&b);
+                    b
+                };
                 // `size` is the pre-rounding request and `alloc` is what Metal
                 // was given; `adopt_requesting` counts both so §9.2's residual
                 // overhang is derivable. The rounding happened at `alloc`
@@ -2408,24 +2432,33 @@ impl MetalDevice {
         self.buffers
             .check_residual(size)
             .map_err(|e| MetalError::Message(e.to_string()))?;
-        let new_buffer = self
-            .device
-            .new_buffer(size, RESOURCE_OPTIONS)
-            .map_err(MetalError::from)?;
-        // `add`, not `insert`: the deferred-commit batching the private pool's
-        // miss already uses (§6.3b). Stage the allocation (one `addAllocation`)
-        // and let the next command-buffer cut commit the residency set once via
-        // `commit_pending`, rather than one `commit` per missed buffer. This is
-        // the Shared pool (`self.buffers`) that serves the KV reserve
-        // (`KvSlot::append` -> `Tensor::zeros` -> here); the earlier
-        // residency-batching fix converted only the private pool and left this
-        // path committing per miss, so a cold-pool prefill still paid a residency
-        // commit for every Shared miss (§6.3b prices each commit at ~0.087 ms and
-        // a cold prefill misses on the order of a hundred buffers).
-        // `commit_pending` (`Commands::commit_swap_locked`) publishes the staged
-        // buffers before any dispatch that binds them executes (§3.7), so the
-        // residency invariant holds and the result is byte-identical.
-        self.residency_set.add(&new_buffer);
+        let new_buffer = if transient_heaps_on() {
+            // From a heap chunk: resident with the chunk (§6.3k).
+            self.transient_heaps
+                .0
+                .alloc(size)
+                .map_err(MetalError::from)?
+        } else {
+            let b = self
+                .device
+                .new_buffer(size, RESOURCE_OPTIONS)
+                .map_err(MetalError::from)?;
+            // `add`, not `insert`: the deferred-commit batching the private pool's
+            // miss already uses (§6.3b). Stage the allocation (one `addAllocation`)
+            // and let the next command-buffer cut commit the residency set once via
+            // `commit_pending`, rather than one `commit` per missed buffer. This is
+            // the Shared pool (`self.buffers`) that serves the KV reserve
+            // (`KvSlot::append` -> `Tensor::zeros` -> here); the earlier
+            // residency-batching fix converted only the private pool and left this
+            // path committing per miss, so a cold-pool prefill still paid a residency
+            // commit for every Shared miss (§6.3b prices each commit at ~0.087 ms and
+            // a cold prefill misses on the order of a hundred buffers).
+            // `commit_pending` (`Commands::commit_swap_locked`) publishes the staged
+            // buffers before any dispatch that binds them executes (§3.7), so the
+            // residency invariant holds and the result is byte-identical.
+            self.residency_set.add(&b);
+            b
+        };
         Ok(self.buffers.adopt_requesting(new_buffer, requested, size))
     }
 

@@ -382,9 +382,10 @@ pub fn kv_bytes_per_token(cfg: &Config) -> usize {
 }
 
 /// What a streamed load keeps beside its weights: `rows` rows' KV to
-/// `kv_tokens` positions, two prefill tiles' transients in flight (the
-/// pacer's depth) at [`super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN`],
-/// and the pool's free list. The slot plan subtracts it from the budget so
+/// `kv_tokens` positions, the prefill's transient at
+/// [`super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN`] (measured with the
+/// pacer's two tiles in flight, so one factor of the tile), what a pass
+/// retains, and the pool's free list. The slot plan subtracts it from the budget so
 /// a pass has what it needs by construction, not by luck.
 pub fn session_reserve_bytes(
     cfg: &Config,
@@ -397,8 +398,12 @@ pub fn session_reserve_bytes(
     } else {
         prefill_tile
     };
+    // One tile's worth: `PREFILL_TRANSIENT_BYTES_PER_TOKEN` is the peak
+    // measured WITH the pacer's two tiles in flight (1.34 GB over a 512
+    // tile), so a second factor of two counted the same bytes twice — 1.5
+    // GB, ~18 slots, on this machine (P26).
     rows.max(1) * kv_tokens * kv_bytes_per_token(cfg)
-        + 2 * tile * super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
+        + tile * super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
         + POOL_FREE_RESERVE_BYTES
         + PASS_RETENTION_BYTES
 }
@@ -1202,7 +1207,7 @@ mod tests {
         assert_eq!(
             r1,
             4096 * per
-                + 2 * 512 * super::super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
+                + 512 * super::super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
                 + POOL_FREE_RESERVE_BYTES
                 + PASS_RETENTION_BYTES
         );

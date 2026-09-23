@@ -47,7 +47,7 @@ pub struct MtpHead<R: ExpertResidency> {
     /// `hyper_connection_mixer` — the head collapse (no injection).
     head_mix: HyperConnection,
     n: usize,
-    d: usize,
+    pub(crate) d: usize,
 }
 
 impl<R: ExpertResidency> MtpHead<R> {
@@ -82,6 +82,19 @@ impl<R: ExpertResidency> MtpHead<R> {
         embeds: &Tensor,
         cache: &mut Cache,
     ) -> Result<(Tensor, Tensor)> {
+        self.forward_with(hidden, embeds, cache, false)
+    }
+
+    /// [`Self::forward`] with `swap_eh`: the two halves of `eh_proj`'s input
+    /// exchanged (`[h_stream | e]` — an ablation for the probe below; the
+    /// shipping path passes `false`).
+    pub fn forward_with(
+        &self,
+        hidden: &Tensor,
+        embeds: &Tensor,
+        cache: &mut Cache,
+        swap_eh: bool,
+    ) -> Result<(Tensor, Tensor)> {
         let (b, a, nd) = hidden.dims3()?;
         let (n, d) = (self.n, self.d);
         if b != 1 || nd != n * d || embeds.dims3()? != (1, a, d) {
@@ -98,7 +111,12 @@ impl<R: ExpertResidency> MtpHead<R> {
             .reshape((1, a, 1, d))?
             .broadcast_as((1, a, n, d))?; // [1, a, n, d]
         let hn = self.norm_h.forward(hidden)?.reshape((1, a, n, d))?;
-        let eh = Tensor::cat(&[&e, &hn], D::Minus1)?.reshape((a * n, 2 * d))?;
+        let eh = if swap_eh {
+            Tensor::cat(&[&hn, &e], D::Minus1)?
+        } else {
+            Tensor::cat(&[&e, &hn], D::Minus1)?
+        }
+        .reshape((a * n, 2 * d))?;
         let h0 = self.eh_proj.forward(&eh)?.reshape((1, a, n * d))?;
         let multi = self.layer.prefill(&h0, 0, cache)?;
         cache.pos += a;
@@ -289,6 +307,9 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
                 accepted.len()
             )
         }
+        if mtp_probe() && self.rows_seen == 0 {
+            self.probe_prefill_rows(probe, &nexts)?;
+        }
         let toks = Tensor::from_vec(nexts, (1, a), &self.device)?;
         let emb = self.embed.embedding(&toks)?; // [1, a, d]
         let (sample, multi) = self.head.forward(probe, &emb, &mut self.cache)?;
@@ -303,6 +324,69 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
         self.rows_seen += a;
         Ok(())
     }
+}
+
+impl<R: ExpertResidency> MtpDrafter<'_, R> {
+    /// `QWEN4EXP_MTP_PROBE`: on the prompt rows, the head's teacher-forced
+    /// hit rate under the shipping dataflow and under four ablations of it,
+    /// each run under a window on the layer's cache and rewound (nothing is
+    /// keyed). `hit2` = the row's argmax equals the token that follows the
+    /// row's next token (what the head is trained to predict); `hit1` = it
+    /// equals the row's next token itself (the embedding it was given). The
+    /// discriminator for a wiring defect: the shipping dataflow must beat
+    /// every ablation on `hit2`, and an ablation that beats it names the
+    /// defect (`off-by-one`: the row's own token in place of its next;
+    /// `swap-eh`: the `eh_proj` halves exchanged; `zero-embed` /
+    /// `zero-hidden`: one input path silenced).
+    fn probe_prefill_rows(&mut self, probe: &Tensor, nexts: &[u32]) -> Result<()> {
+        let a = nexts.len();
+        if a < 3 || a > self.prompt.len() {
+            return Ok(());
+        }
+        let own: Vec<u32> = self.prompt[..a].to_vec(); // the rows' own tokens
+        let zeros_e = Tensor::zeros((1, a, self.head.d), probe.dtype(), &self.device)?;
+        let zeros_h = probe.zeros_like()?;
+        let emb_of = |toks: &[u32]| -> Result<Tensor> {
+            let t = Tensor::from_vec(toks.to_vec(), (1, a), &self.device)?;
+            self.embed.embedding(&t)
+        };
+        let variants: Vec<(&str, Tensor, Tensor, bool)> = vec![
+            ("shipping", probe.clone(), emb_of(nexts)?, false),
+            ("off-by-one", probe.clone(), emb_of(&own)?, false),
+            ("swap-eh", probe.clone(), emb_of(nexts)?, true),
+            ("zero-embed", probe.clone(), zeros_e, false),
+            ("zero-hidden", zeros_h, emb_of(nexts)?, false),
+        ];
+        for (name, hidden, emb, swap) in variants {
+            self.cache.open_window()?;
+            let run = (|| -> Result<Vec<u32>> {
+                let (sample, _) = self
+                    .head
+                    .forward_with(&hidden, &emb, &mut self.cache, swap)?;
+                let logits = self.lm_head.forward(&sample)?; // [1, a, vocab]
+                logits.squeeze(0)?.argmax(D::Minus1)?.to_vec1::<u32>()
+            })();
+            self.cache.rewind_window()?;
+            let arg = run?;
+            // Row i's target: the token after its next token = nexts[i + 1]
+            // (the last row has none).
+            let n = a - 1;
+            let hit2 = (0..n).filter(|&i| arg[i] == nexts[i + 1]).count();
+            let hit1 = (0..n).filter(|&i| arg[i] == nexts[i]).count();
+            eprintln!(
+                "MTPPROBE variant={name} rows={n} hit2={hit2} ({:.3}) hit1={hit1} ({:.3})",
+                hit2 as f64 / n as f64,
+                hit1 as f64 / n as f64
+            );
+        }
+        Ok(())
+    }
+}
+
+/// `QWEN4EXP_MTP_PROBE` (read once): the prompt-row ablation probe above.
+fn mtp_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_MTP_PROBE").is_some())
 }
 
 /// `QWEN4EXP_MTP_TRACE` (read once): print every verify round's window,

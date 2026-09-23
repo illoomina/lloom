@@ -175,8 +175,12 @@ impl<R: ExpertResidency> MoeLayer<R> {
             None => {
                 let groups = self.experts.plan(&ids)?;
                 let mut ys = Vec::with_capacity(groups.len());
-                for group in &groups {
+                for (gi, group) in groups.iter().enumerate() {
                     let slot_ids = self.experts.ensure(group)?;
+                    // The later groups' misses read while this group runs.
+                    if gi + 1 < groups.len() {
+                        self.experts.prefetch_groups(&groups[gi + 1..])?;
+                    }
                     let xg = if groups.len() == 1 {
                         x3.clone()
                     } else {

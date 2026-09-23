@@ -25,6 +25,8 @@ pub mod cpu_flash_attention;
 pub mod decode;
 pub mod embedding;
 pub mod encoding;
+#[cfg(feature = "metal")]
+pub mod expert_prefetch;
 pub mod expert_stream;
 pub mod func;
 pub mod fusion;

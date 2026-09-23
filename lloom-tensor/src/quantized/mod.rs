@@ -1027,6 +1027,27 @@ impl QTensor {
         }
     }
 
+    /// [`Self::write_with_ring`] for bytes a prefetch thread already put in
+    /// `staging` (`QMetalStorage::write_staged`): the copy alone. Metal only.
+    #[cfg(feature = "metal")]
+    pub fn write_staged(
+        &mut self,
+        offset: usize,
+        len: usize,
+        staging: std::sync::Arc<crate::kernels::metal::PooledBuffer>,
+        ring: &mut crate::kernels::metal::staging::StagingRing,
+        entry: Option<usize>,
+    ) -> Result<()> {
+        let exact = self.shape.elem_count() / self.dtype().block_size() * self.dtype().type_size();
+        if offset + len > exact {
+            crate::bail!("write_staged: {offset}+{len} past the {exact}-byte tensor")
+        }
+        match &mut self.storage {
+            QStorage::Metal(s) => s.write_staged(offset, len, staging, ring, entry),
+            _ => crate::bail!("write_staged: not a Metal quantized tensor"),
+        }
+    }
+
     /// Overwrite `len` packed bytes at byte `offset` with what `fill` writes
     /// into the slice it is handed. Bounds-checked against the exact packed
     /// size; the Metal arm goes through the compute encoder so the write is

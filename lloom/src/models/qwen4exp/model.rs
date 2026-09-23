@@ -965,6 +965,15 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         Ok(loaded)
     }
 
+    /// The streamed tier's prefetch counters (shared by its layers; zeros
+    /// for `Resident` or without a prefetcher).
+    pub fn prefetch_stats(&self) -> crate::nn::expert_stream::PrefetchStats {
+        self.layers
+            .first()
+            .map(|l| l.moe().experts().prefetch_stats())
+            .unwrap_or_default()
+    }
+
     /// Slots per layer per projection (`Streamed`), 0 for `Resident`.
     pub fn slots_per_layer(&self) -> usize
     where
@@ -1086,7 +1095,16 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             .reshape((1, seq, n * d))?
             .contiguous()?;
 
+        // The streamed tier's prefetch (§20.3 P1): layer 0's likely misses
+        // before the stack starts, every layer's the moment the layer
+        // before it is encoded — the reads overlap that layer's compute.
+        if let Some(first) = self.layers.first() {
+            first.moe().experts().prefetch_ahead()?;
+        }
         for (l, layer) in self.layers.iter().enumerate() {
+            if let Some(next) = self.layers.get(l + 1) {
+                next.moe().experts().prefetch_ahead()?;
+            }
             if let Some(ple) = &self.ple {
                 if ple.layer == l {
                     let delta = self.ple_delta(ple, &res_hc, cache)?;

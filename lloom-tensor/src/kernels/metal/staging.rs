@@ -73,6 +73,19 @@ impl StagingRing {
         Arc::new(parking_lot::Mutex::new(Self::new(device)))
     }
 
+    /// [`Self::shared`] at `cap_bytes` (a tier with a prefetcher wants room
+    /// for what its reader threads stage ahead, `nn::expert_prefetch`).
+    pub fn shared_with_cap(device: &MetalDevice, cap_bytes: usize) -> SharedStagingRing {
+        Arc::new(parking_lot::Mutex::new(Self::with_cap_bytes(
+            device, cap_bytes,
+        )))
+    }
+
+    /// The cap the ring was built with.
+    pub fn cap_bytes(&self) -> usize {
+        self.cap_bytes
+    }
+
     /// A Shared buffer of at least `len` bytes whose last copy has completed,
     /// or a fresh one, as `(entry, buffer)`. The entry is in use — never
     /// reusable — until [`Self::stamp`] records the epoch of the command
@@ -133,6 +146,16 @@ impl StagingRing {
                     e.epoch = epoch;
                 }
             }
+        }
+    }
+
+    /// Hand an acquired entry back UNUSED — no copy was encoded from it (a
+    /// prefetch the layer never needed). A ring entry is reusable at once
+    /// (epoch 0: nothing reads it); a one-shot is freed now.
+    pub fn release(&mut self, entry: Option<usize>, buf: &Arc<PooledBuffer>) {
+        match entry {
+            Some(i) => self.entries[i].epoch = 0,
+            None => self.overflow.retain(|e| !Arc::ptr_eq(&e.buf, buf)),
         }
     }
 

@@ -101,6 +101,45 @@ pub trait ExpertResidency {
     fn settle(&self, _record: &Tensor) -> Result<bool> {
         Ok(false)
     }
+
+    /// A hint that a multi-token pass is about to run this layer: stage the
+    /// experts it will most likely miss, off the encoding thread
+    /// (`nn::expert_prefetch`, §20.3 P1). Never changes what the layer
+    /// computes; `Resident` and a tier without a prefetcher ignore it.
+    fn prefetch_ahead(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// A pass whose expert union exceeds the pool resolves in several
+    /// groups (`plan`): once a group is resident, stage the LATER groups'
+    /// missing experts while this group's dispatch runs (§20.4, DS4's
+    /// overlap of the routed loads with the experts already in RAM). A
+    /// hint like `prefetch_ahead`; `Resident` ignores it.
+    fn prefetch_groups(&self, _later: &[RoutedGroup]) -> Result<()> {
+        Ok(())
+    }
+
+    /// The prefetcher's counters (shared by the tier's layers), zeros
+    /// without one.
+    fn prefetch_stats(&self) -> PrefetchStats {
+        PrefetchStats::default()
+    }
+}
+
+/// The prefetcher's counters; the real type on Metal, zeros elsewhere.
+#[cfg(feature = "metal")]
+pub use crate::nn::expert_prefetch::PrefetchStats;
+/// The prefetcher's counters (no prefetcher off Metal).
+#[cfg(not(feature = "metal"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefetchStats {
+    pub issued: u64,
+    pub staged: u64,
+    pub used: u64,
+    pub wasted: u64,
+    pub stale: u64,
+    pub bytes: u64,
+    pub parked: u64,
 }
 
 /// All experts resident in RAM: the small-model / big-RAM case, zero streaming
@@ -240,6 +279,16 @@ impl ExpertSource {
     /// The byte offset of expert `e`'s plane in the file.
     pub fn plane_offset(&self, e: usize) -> u64 {
         self.data_start + (e * self.plane_bytes) as u64
+    }
+
+    /// This source's addressing for the prefetch thread.
+    #[cfg(feature = "metal")]
+    pub fn plane_source(&self) -> crate::nn::expert_prefetch::PlaneSource {
+        crate::nn::expert_prefetch::PlaneSource {
+            file: Arc::clone(&self.file),
+            data_start: self.data_start,
+            plane_bytes: self.plane_bytes,
+        }
     }
 
     /// Read expert `e`'s plane into `dst` (exactly `plane_bytes`).
@@ -557,7 +606,16 @@ pub struct Streamed {
     counters: StreamCounters,
     n_experts: usize,
     n_slots: usize,
+    /// The tier's prefetcher, shared by its layers (`set_prefetcher`), and
+    /// this layer's key in it.
+    #[cfg(feature = "metal")]
+    prefetch: Option<Arc<crate::nn::expert_prefetch::Prefetcher>>,
+    key: usize,
 }
+
+/// Distinct per `Streamed` for the life of the process (the prefetcher's
+/// tier key).
+static NEXT_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl std::fmt::Debug for Streamed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -654,7 +712,22 @@ impl Streamed {
             counters: StreamCounters::default(),
             n_experts,
             n_slots,
+            #[cfg(feature = "metal")]
+            prefetch: None,
+            key: NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    /// Attach the tier's prefetcher (the `pread` arm on Metal; a loader
+    /// builds one per tier and hands every layer the same).
+    #[cfg(feature = "metal")]
+    pub fn set_prefetcher(&mut self, p: Arc<crate::nn::expert_prefetch::Prefetcher>) {
+        self.prefetch = Some(p);
+    }
+
+    /// The tier key the prefetcher files this layer's requests under.
+    pub fn prefetch_key(&self) -> usize {
+        self.key
     }
 
     pub fn n_slots(&self) -> usize {
@@ -796,6 +869,28 @@ impl Streamed {
     fn resolve(&self, inner: &mut Inner, experts: &[u32], tick: u64) -> Result<Vec<usize>> {
         let mut slots = Vec::with_capacity(experts.len());
         let mut misses: Vec<(usize, usize)> = Vec::new();
+        // What the prefetcher staged for this layer: a miss with a staged
+        // expert lands it (the copy alone) instead of reading it here.
+        #[cfg(feature = "metal")]
+        let mut staged: std::collections::HashMap<u32, crate::nn::expert_prefetch::Staged> =
+            match &self.prefetch {
+                Some(p) => {
+                    let needed: Vec<u32> = experts
+                        .iter()
+                        .copied()
+                        .filter(|&e| {
+                            (e as usize) < self.n_experts && inner.map.slot_of(e as usize).is_none()
+                        })
+                        .collect();
+                    p.take_needed(self.key, &needed)
+                        .into_iter()
+                        .map(|s| (s.expert, s))
+                        .collect()
+                }
+                None => Default::default(),
+            };
+        #[cfg(feature = "metal")]
+        let mut landed: Vec<(usize, usize, crate::nn::expert_prefetch::Staged)> = Vec::new();
         for &e in experts {
             let e = e as usize;
             if e >= self.n_experts {
@@ -822,12 +917,31 @@ impl Streamed {
                     if evicted {
                         self.counters.evictions.fetch_add(1, Ordering::Relaxed);
                     }
+                    #[cfg(feature = "metal")]
+                    if let Some(st) = staged.remove(&(e as u32)) {
+                        landed.push((e, s, st));
+                        inner.map.touch(s, tick);
+                        slots.push(s);
+                        continue;
+                    }
                     misses.push((e, s));
                     s
                 }
             };
             inner.map.touch(slot, tick);
             slots.push(slot);
+        }
+        #[cfg(feature = "metal")]
+        {
+            if !landed.is_empty() {
+                self.land_staged(inner, landed)?;
+                inner.table_stale = true;
+            }
+            if !staged.is_empty() {
+                if let Some(p) = &self.prefetch {
+                    p.release(staged.into_values().collect());
+                }
+            }
         }
         if !misses.is_empty() {
             self.load(inner, &misses)?;
@@ -836,6 +950,42 @@ impl Streamed {
             inner.table_stale = true;
         }
         Ok(slots)
+    }
+
+    /// Land staged experts `(expert, slot, staged)` in all three pools: the
+    /// copy from each ring buffer into its slot, encoded here on the compute
+    /// encoder (`QTensor::write_staged`), the ring entries stamped by it.
+    #[cfg(feature = "metal")]
+    fn land_staged(
+        &self,
+        inner: &mut Inner,
+        landed: Vec<(usize, usize, crate::nn::expert_prefetch::Staged)>,
+    ) -> Result<()> {
+        let Inner { pools, staging, .. } = inner;
+        let ring = match staging.as_ref() {
+            Some(r) => r,
+            None => lloom_tensor::bail!("land_staged: the tier has no staging ring"),
+        };
+        let mut ring = ring.lock();
+        let n = landed.len() as u64;
+        let mut bytes = 0u64;
+        for (_, s, st) in landed {
+            for (i, pool) in pools.iter_mut().enumerate() {
+                let plane = pool.plane_bytes;
+                let (entry, buf) = &st.planes[i];
+                pool.qt
+                    .write_staged(s * plane, plane, Arc::clone(buf), &mut ring, *entry)?;
+                bytes += plane as u64;
+            }
+        }
+        drop(ring);
+        self.counters
+            .bytes_loaded
+            .fetch_add(bytes, Ordering::Relaxed);
+        if let Some(p) = &self.prefetch {
+            p.used(n);
+        }
+        Ok(())
     }
 
     /// Land `(expert, slot)` pairs in all three pools.
@@ -1057,6 +1207,80 @@ impl Streamed {
 impl ExpertResidency for Streamed {
     fn plans_on_device(&self) -> bool {
         true
+    }
+
+    /// The experts this layer does not hold, most-used first (the usage
+    /// profile, §20.3 R2) — for a multi-token pass nearly all of them are
+    /// about to be needed — handed to the prefetcher. No pool state moves:
+    /// the victims are chosen when the pass reaches the layer.
+    #[cfg(feature = "metal")]
+    fn prefetch_ahead(&self) -> Result<()> {
+        let Some(p) = &self.prefetch else {
+            return Ok(());
+        };
+        let (missing, planes) = {
+            let inner = self.inner.lock();
+            let mut missing: Vec<u32> = (0..self.n_experts as u32)
+                .filter(|&e| inner.map.slot_of(e as usize).is_none())
+                .collect();
+            missing.sort_by_key(|&e| std::cmp::Reverse(inner.map.usage[e as usize]));
+            // No more than the pool can take: past its unpinned slots a
+            // staged expert can only land by evicting one landed in the same
+            // pass (measured on an empty pool: 512 asked, 327 slots, the
+            // rest read for nothing — issue #749 P19).
+            missing.truncate(self.n_slots.saturating_sub(inner.map.pinned_count()));
+            let planes = [
+                inner.sources[0].plane_source(),
+                inner.sources[1].plane_source(),
+                inner.sources[2].plane_source(),
+            ];
+            (missing, planes)
+        };
+        p.request(self.key, &missing, &planes);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    fn prefetch_groups(&self, later: &[RoutedGroup]) -> Result<()> {
+        let Some(p) = &self.prefetch else {
+            return Ok(());
+        };
+        let mut distinct: Vec<u32> = Vec::new();
+        for g in later {
+            if let GroupIds::Host { ids, .. } = &g.ids {
+                distinct.extend_from_slice(ids);
+            }
+        }
+        distinct.sort_unstable();
+        distinct.dedup();
+        let (missing, planes) = {
+            let inner = self.inner.lock();
+            let mut missing: Vec<u32> = distinct
+                .into_iter()
+                .filter(|&e| {
+                    (e as usize) < self.n_experts && inner.map.slot_of(e as usize).is_none()
+                })
+                .collect();
+            missing.truncate(self.n_slots.saturating_sub(inner.map.pinned_count()));
+            let planes = [
+                inner.sources[0].plane_source(),
+                inner.sources[1].plane_source(),
+                inner.sources[2].plane_source(),
+            ];
+            (missing, planes)
+        };
+        if !missing.is_empty() {
+            p.request(self.key, &missing, &planes);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    fn prefetch_stats(&self) -> PrefetchStats {
+        self.prefetch
+            .as_ref()
+            .map(|p| p.stats())
+            .unwrap_or_default()
     }
 
     fn misses_so_far(&self) -> u64 {
@@ -1530,5 +1754,91 @@ mod tests {
         assert_eq!(plan_rows(&ids, 4, 2, 4), vec![0..2, 2..4]);
         assert_eq!(plan_rows(&ids, 4, 2, 3), vec![0..2, 2..3, 3..4]);
         assert_eq!(plan_rows(&ids, 4, 2, 8), vec![0..4]);
+    }
+
+    /// Metal: the prefetcher stages a layer's missing experts off the
+    /// encoding thread and `ensure` lands them (the copy alone, on the
+    /// compute encoder); the routed output is the synchronous tier's bit for
+    /// bit, every landed expert was one the pass would have read, and what
+    /// was staged and not needed goes back to the ring. A second hint on the
+    /// warmed pool asks only for what is missing.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn prefetched_experts_land_bit_for_bit_and_leftovers_return() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let ring = StagingRing::shared(&m);
+        let tier = |prefetch: bool| -> Streamed {
+            let mut t = Streamed::with_staging(
+                open(&path, "gate"),
+                open(&path, "up"),
+                open(&path, "down"),
+                6,
+                LoaderArm::Pread,
+                &dev,
+                Some(Arc::clone(&ring)),
+            )
+            .unwrap();
+            if prefetch {
+                t.set_prefetcher(Arc::new(Prefetcher::new(&m, Arc::clone(&ring))));
+            }
+            t
+        };
+        let plain = tier(false);
+        let pre = tier(true);
+        let xs = x(4, d, 0.5).to_device(&dev).unwrap();
+        let id = ids(4, topk, e, 1).to_device(&dev).unwrap();
+        // The hint is bounded by the pool: 6 of the 12 missing experts.
+        let n = 6u64;
+        pre.prefetch_ahead().unwrap();
+        let t0 = std::time::Instant::now();
+        while pre.prefetch_stats().staged < n {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(20),
+                "the prefetcher staged {} of {n}",
+                pre.prefetch_stats().staged
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            run(&plain, &xs, &id),
+            run(&pre, &xs, &id),
+            "the hint changed the output"
+        );
+        let s = pre.stats();
+        let pf = pre.prefetch_stats();
+        assert_eq!(pf.issued, n);
+        assert_eq!(pf.staged, n);
+        assert!(
+            pf.used > 0 && pf.used <= s.misses,
+            "used {} misses {}",
+            pf.used,
+            s.misses
+        );
+        assert_eq!(
+            s.bytes_loaded,
+            plain.stats().bytes_loaded,
+            "a landed expert counts its bytes like a read one"
+        );
+        let resident = pre.resident().len() as u64;
+        // The next hint on the warmed pool asks only for what is missing
+        // (bounded by the pool), and releases what the pass left staged and
+        // unused.
+        pre.prefetch_ahead().unwrap();
+        let pf2 = pre.prefetch_stats();
+        assert_eq!(pf2.issued - pf.issued, (e as u64 - resident).min(n));
+        assert_eq!(pf2.used + pf2.wasted, n, "{pf2:?}");
+        std::fs::remove_file(path).ok();
     }
 }

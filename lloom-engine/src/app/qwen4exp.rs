@@ -193,7 +193,11 @@ impl Engine<Resident> {
                     "io" => StreamLoader::Io,
                     other => anyhow::bail!("--loader {other}: pread | io"),
                 };
-                let stream = StreamOptions { slots, loader };
+                let stream = StreamOptions {
+                    slots,
+                    loader,
+                    prefetch: true,
+                };
                 let mut model: Qwen4Exp<Streamed> =
                     Qwen4Exp::from_gguf_streamed(&shards, &device, &mload, &stream)
                         .context("loading Qwen4-exp (streamed experts)")?;

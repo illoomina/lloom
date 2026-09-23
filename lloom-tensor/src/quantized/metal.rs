@@ -681,6 +681,34 @@ impl QMetalStorage {
         self.write_via(offset, len, staging, fill, Some((ring, entry)))
     }
 
+    /// [`Self::write_with_ring`] for bytes ALREADY in `staging` — a prefetch
+    /// thread filled the ring buffer off the encoding thread
+    /// (`nn::expert_prefetch`); this is the copy alone, on the current
+    /// compute encoder, the entry stamped into `ring` after the encode as
+    /// `write_with_ring` stamps it. The write is ordered after every earlier
+    /// reader of the slot by the encoder's hazard chain exactly as the
+    /// synchronous path's is: the thread that filled the bytes never touched
+    /// the slot.
+    pub fn write_staged(
+        &self,
+        offset: usize,
+        len: usize,
+        staging: Arc<PooledBuffer>,
+        ring: &mut crate::kernels::metal::staging::StagingRing,
+        entry: Option<usize>,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if staging.size() < len {
+            crate::bail!(
+                "write_staged: a {}-byte staging buffer for {len} bytes",
+                staging.size()
+            )
+        }
+        self.write_via(offset, len, staging, &mut |_| Ok(()), Some((ring, entry)))
+    }
+
     fn write_via(
         &self,
         offset: usize,

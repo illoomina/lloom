@@ -402,12 +402,42 @@ pub fn session_reserve_bytes(
         + POOL_FREE_RESERVE_BYTES
 }
 
+/// The staging ring's cap on the `pread` arm: `staging::DEFAULT_CAP_BYTES`
+/// (1 GiB), or [`PREFETCH_RING_BYTES`] with a prefetcher — its reader
+/// threads hold up to [`PREFETCH_STAGED_BYTES`] staged ahead of the layers
+/// beside what the layers themselves stage, and a ring at its cap hands out
+/// one-shots (measured at 1 GiB with the prefetcher: 32 792 one-shots over
+/// a 937-token prompt, issue #749 P19).
+pub fn staging_ring_bytes(loader: &StreamLoader, prefetch: bool) -> usize {
+    match (loader, prefetch) {
+        (StreamLoader::Pread, true) => PREFETCH_RING_BYTES,
+        (StreamLoader::Pread, false) => 1 << 30,
+        (StreamLoader::Io, _) => 0,
+    }
+}
+
+/// The ring with a prefetcher, and what the prefetcher may hold of it.
+pub const PREFETCH_RING_BYTES: usize = 2 << 30;
+pub const PREFETCH_STAGED_BYTES: usize = 1 << 30;
+
+/// The streamed tier's own transient memory beside its slots — the staging
+/// ring's cap — left out of the slot plan like the session reserve;
+/// measured before it was: a prefetched second tile refused at 35.12 GB on
+/// a 36.18 GB budget (`p19-prefetch-on.txt`).
+pub fn staging_reserve_bytes(loader: &StreamLoader, prefetch: bool) -> usize {
+    staging_ring_bytes(loader, prefetch)
+}
+
 /// How the routed experts are streamed.
 #[derive(Debug, Clone)]
 pub struct StreamOptions {
     /// Resident experts per layer per projection (the slot pool).
     pub slots: SlotBudget,
     pub loader: StreamLoader,
+    /// The prefetch thread on the `pread` arm (Metal): a multi-token pass
+    /// stages each layer's likely misses while the layer before it runs
+    /// (`nn::expert_prefetch`). Off, every miss is read at the layer.
+    pub prefetch: bool,
 }
 
 /// The slots `Auto` resolves to, and the terms it resolved them from.
@@ -763,7 +793,8 @@ impl Qwen4Exp<Streamed> {
                 kv_tokens,
                 prefill_tile,
             } => {
-                let reserve = session_reserve_bytes(&cfg0, rows, kv_tokens, prefill_tile);
+                let reserve = session_reserve_bytes(&cfg0, rows, kv_tokens, prefill_tile)
+                    + staging_reserve_bytes(&stream.loader, stream.prefetch);
                 let plan = plan_slots(&gg, &cfg0, device, fraction, reserve)?;
                 if plan.working_set == 0 {
                     lloom_tensor::bail!(
@@ -804,19 +835,35 @@ impl Qwen4Exp<Streamed> {
         #[cfg(feature = "metal")]
         let staging = match (device, &arm) {
             (Device::Metal(d), LoaderArm::Pread) => Some(
-                lloom_tensor::kernels::metal::staging::StagingRing::shared(d),
+                lloom_tensor::kernels::metal::staging::StagingRing::shared_with_cap(
+                    d,
+                    staging_ring_bytes(&stream.loader, stream.prefetch),
+                ),
             ),
             _ => None,
         };
         #[cfg(not(feature = "metal"))]
         let staging = None::<()>;
+        // One prefetcher for the tier, over the same ring.
+        #[cfg(feature = "metal")]
+        let prefetcher = match (device, &staging, stream.prefetch) {
+            (Device::Metal(d), Some(ring), true) => {
+                Some(Arc::new(crate::nn::expert_prefetch::Prefetcher::with_cap(
+                    d,
+                    Arc::clone(ring),
+                    PREFETCH_STAGED_BYTES,
+                )))
+            }
+            _ => None,
+        };
         build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             let src = |gg: &Gguf<'_, File>, name: String| -> Result<ExpertSource> {
                 let (content, path) = gg.locate(&name)?;
                 ExpertSource::from_gguf(content, path, &name)
             };
-            Streamed::with_staging(
+            #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+            let mut tier = Streamed::with_staging(
                 src(gg, format!("{p}.ffn_gate_exps.weight"))?,
                 src(gg, format!("{p}.ffn_up_exps.weight"))?,
                 src(gg, format!("{p}.ffn_down_exps.weight"))?,
@@ -824,7 +871,12 @@ impl Qwen4Exp<Streamed> {
                 arm.clone(),
                 device,
                 staging.clone(),
-            )
+            )?;
+            #[cfg(feature = "metal")]
+            if let Some(p) = &prefetcher {
+                tier.set_prefetcher(Arc::clone(p));
+            }
+            Ok(tier)
         })
     }
 }

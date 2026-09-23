@@ -224,6 +224,12 @@ struct Args {
     #[arg(long, default_value_t = 512)]
     prefill_tile: usize,
 
+    /// The streamed tier's prefetch thread (the `pread` arm): a prefill
+    /// tile stages each layer's likely misses while the layer before it
+    /// runs. `--prefetch false` is the A/B arm (every miss read at the layer).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    prefetch: bool,
+
     /// KV positions per row `--slots auto` reserves beside the slot pool
     /// (with two prefill tiles' transients and the pool's free list): the
     /// session's share of the budget, so a pass fits by construction.
@@ -565,7 +571,11 @@ fn main() -> Result<()> {
                 },
                 n => SlotBudget::Fixed(n.parse().context("--slots: a count or `auto`")?),
             };
-            let stream = StreamOptions { slots, loader };
+            let stream = StreamOptions {
+                slots,
+                loader,
+                prefetch: args.prefetch,
+            };
             let mut model: Qwen4Exp<Streamed> =
                 Qwen4Exp::from_gguf_streamed(&shards, &device, &opts, &stream)?;
             model.set_prefill_mode(prefill_mode);
@@ -695,6 +705,23 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
             generated as f64 / wall.as_secs_f64() / args.rows as f64,
             digests
         );
+        let s = model.stream_stats();
+        let pf = model.prefetch_stats();
+        if s.plans + s.device_plans > 0 {
+            println!(
+                "STREAM run={run} slots={} plans={} hits={} misses={} bytes_loaded={} hit_rate={:.4}",
+                model.slots_per_layer(),
+                s.plans,
+                s.hits,
+                s.misses,
+                s.bytes_loaded,
+                s.hits as f64 / (s.hits + s.misses).max(1) as f64,
+            );
+            println!(
+                "PREFETCH run={run} on={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={}",
+                args.prefetch, pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked
+            );
+        }
     }
     Ok(())
 }
@@ -913,6 +940,11 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             println!(
                 "STAGING run={run} buffers={} bytes={} allocations={} reuses={} overflows={}",
                 st.buffers, st.bytes, st.allocations, st.reuses, st.overflows
+            );
+            let pf = model.prefetch_stats();
+            println!(
+                "PREFETCH run={run} on={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={}",
+                args.prefetch, pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked
             );
             println!(
                 "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} redos={} host_plan_passes={}",

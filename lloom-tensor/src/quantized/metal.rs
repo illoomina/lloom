@@ -618,7 +618,8 @@ impl QMetalStorage {
         let from = moe_mm_from();
         if from > 0 && batch >= from && triple == GemvTriple::F32F32F32 && mm_id_has_arm(ggml_dtype)
         {
-            let bound = crate::kernels::mm_id_block_bound(batch, topk, n_experts);
+            let bn = moe_mm_bn(batch * topk, n_experts);
+            let bound = crate::kernels::mm_id_block_bound(batch, topk, n_experts, bn);
             let rowids = device
                 .new_buffer_builder()
                 .with_size_for(batch * topk, DType::U32)
@@ -648,6 +649,7 @@ impl QMetalStorage {
                 &blocks,
                 &meta,
                 bound,
+                bn,
             )
             .map_err(MetalError::from)?;
             crate::kernels::call_quantized_matmul_mm_id_mapped(
@@ -664,6 +666,7 @@ impl QMetalStorage {
                 &blocks,
                 &meta,
                 bound,
+                bn,
                 &dst,
             )
             .map_err(MetalError::from)?;
@@ -967,6 +970,44 @@ pub fn set_moe_mm_from(from: usize) {
 
 static MOE_MM_FROM: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// The routed GEMM's row block for a tile of `pairs` over `n_experts`:
+/// 16 columns when the experts see few rows each (the 32-column tile ran
+/// 32 columns for ~10 real ones at 512 experts, P22), 32 otherwise.
+/// `LLOOM_MOE_MM_BN` = 16 | 32 pins it (0 = this rule); `set_moe_mm_bn`.
+pub fn moe_mm_bn(pairs: usize, n_experts: usize) -> usize {
+    let pinned = MOE_MM_BN.load(std::sync::atomic::Ordering::Relaxed);
+    let pinned = if pinned == usize::MAX {
+        let v = std::env::var("LLOOM_MOE_MM_BN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0usize);
+        MOE_MM_BN.store(v, std::sync::atomic::Ordering::Relaxed);
+        v
+    } else {
+        pinned
+    };
+    match pinned {
+        16 | 32 => pinned,
+        _ => {
+            if pairs <= MOE_MM_BN16_ROWS_PER_EXPERT * n_experts.max(1) {
+                16
+            } else {
+                32
+            }
+        }
+    }
+}
+
+/// Rows an expert sees on average at or under which the 16-column block runs.
+pub const MOE_MM_BN16_ROWS_PER_EXPERT: usize = 16;
+
+/// Pin [`moe_mm_bn`] (16 | 32; 0 = the rule) for the rest of the process.
+pub fn set_moe_mm_bn(bn: usize) {
+    MOE_MM_BN.store(bn, std::sync::atomic::Ordering::Relaxed);
+}
+
+static MOE_MM_BN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 /// Whether a weight kind has a `kernel_mul_mm_id_mapped` arm.
 fn mm_id_has_arm(dtype: crate::kernels::GgmlDType) -> bool {

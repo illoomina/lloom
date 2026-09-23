@@ -314,23 +314,43 @@ fn raw_stack(e: usize, out: usize, inp: usize, dtype: GgmlDType, dev: &Device) -
 #[test]
 #[ignore]
 fn moe_tile_by_weight_kind() {
-    use lloom_tensor::quantized::metal::set_moe_mm_from;
+    moe_tile_by_weight_kind_at(64);
+}
+
+/// The same at the checkpoint's 512 experts: ~10 rows an expert at a
+/// 512-row tile, the regime the real model runs the GEMM in.
+#[test]
+#[ignore]
+fn moe_tile_at_512_experts() {
+    moe_tile_by_weight_kind_at(512);
+}
+
+fn moe_tile_by_weight_kind_at(n_experts: usize) {
+    use lloom_tensor::quantized::metal::{set_moe_mm_bn, set_moe_mm_from};
     let dev = Device::new_metal(0).unwrap();
     let mut cfg = Config::flash_next();
-    cfg.n_experts = 64;
+    cfg.n_experts = n_experts;
     let d = cfg.hidden_size;
     let ff = cfg.moe_intermediate_size;
     let steps = 10;
     // (gate/up kind over k = 2560, down kind over k = 640 — the 256-block
     // kinds cannot pack a 640 row, which is why the checkpoint's down planes
     // are Q2_0 / IQ4_NL).
-    for (dtype, down) in [
-        (GgmlDType::IQ3XXS, GgmlDType::IQ4NL),
-        (GgmlDType::IQ3S, GgmlDType::Q2_0),
-        (GgmlDType::IQ2S, GgmlDType::IQ4NL),
-        (GgmlDType::IQ4XS, GgmlDType::Q2_0),
-        (GgmlDType::Q8_0, GgmlDType::Q8_0),
-    ] {
+    let kinds: Vec<(GgmlDType, GgmlDType)> = if n_experts > 64 {
+        vec![
+            (GgmlDType::IQ3XXS, GgmlDType::IQ4NL),
+            (GgmlDType::Q8_0, GgmlDType::Q8_0),
+        ]
+    } else {
+        vec![
+            (GgmlDType::IQ3XXS, GgmlDType::IQ4NL),
+            (GgmlDType::IQ3S, GgmlDType::Q2_0),
+            (GgmlDType::IQ2S, GgmlDType::IQ4NL),
+            (GgmlDType::IQ4XS, GgmlDType::Q2_0),
+            (GgmlDType::Q8_0, GgmlDType::Q8_0),
+        ]
+    };
+    for (dtype, down) in kinds {
         let moe = MoeLayer::new(
             q4(cfg.n_experts, d, &dev),
             Resident::new(
@@ -351,12 +371,19 @@ fn moe_tile_by_weight_kind() {
                 let _ = moe.forward(&xin).unwrap();
             });
             set_moe_mm_from(1);
+            set_moe_mm_bn(32);
             let t_mm = time(&dev, steps, || {
                 let _ = moe.forward(&xin).unwrap();
             });
+            set_moe_mm_bn(16);
+            let t_mm16 = time(&dev, steps, || {
+                let _ = moe.forward(&xin).unwrap();
+            });
+            set_moe_mm_bn(0);
             println!(
-                "MOEKIND gate_up={dtype:?} down={down:?} seq={seq} moe_mv={t_mv:.2}ms moe_mm={t_mm:.2}ms ratio={:.2}",
-                t_mv / t_mm
+                "MOEKIND experts={n_experts} gate_up={dtype:?} down={down:?} seq={seq} moe_mv={t_mv:.2}ms moe_mm32={t_mm:.2}ms moe_mm16={t_mm16:.2}ms ratio32={:.2} ratio16={:.2}",
+                t_mv / t_mm,
+                t_mv / t_mm16
             );
         }
     }

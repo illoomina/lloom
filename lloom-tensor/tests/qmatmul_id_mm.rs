@@ -5,7 +5,7 @@
 //! `[batch, topk, k]`), bit-stable across runs, and the matmul-vec untouched
 //! below the threshold.
 #![cfg(feature = "metal")]
-use lloom_tensor::quantized::metal::set_moe_mm_from;
+use lloom_tensor::quantized::metal::{set_moe_mm_bn, set_moe_mm_from};
 use lloom_tensor::quantized::{GgmlDType, QTensor};
 use lloom_tensor::{DType, Device, Tensor};
 
@@ -49,7 +49,15 @@ fn grouped_gemm_matches_the_matmul_vec_and_is_stable() {
         Ok(d) => d,
         Err(_) => return,
     };
-    for dtype in [GgmlDType::Q8_0, GgmlDType::Q4K, GgmlDType::F32] {
+    for (dtype, bn) in [
+        (GgmlDType::Q8_0, 32usize),
+        (GgmlDType::Q8_0, 16),
+        (GgmlDType::Q4K, 32),
+        (GgmlDType::Q4K, 16),
+        (GgmlDType::F32, 32),
+        (GgmlDType::F32, 16),
+    ] {
+        set_moe_mm_bn(bn);
         for in_dim1 in [1usize, 4] {
             let batch = 70; // 280 pairs over 8 experts: several 32-row blocks and a part block
             let mv = run(&dev, dtype, batch, in_dim1, 0);
@@ -68,7 +76,7 @@ fn grouped_gemm_matches_the_matmul_vec_and_is_stable() {
             }
             assert!(
                 worst <= 2e-3 * scale.max(1.0),
-                "{dtype:?} in_dim1={in_dim1}: worst |mv - mm| {worst} at scale {scale}"
+                "{dtype:?} bn={bn} in_dim1={in_dim1}: worst |mv - mm| {worst} at scale {scale}"
             );
             assert!(
                 worst > 0.0 || dtype == GgmlDType::F32,
@@ -81,4 +89,5 @@ fn grouped_gemm_matches_the_matmul_vec_and_is_stable() {
         }
     }
     set_moe_mm_from(lloom_tensor::quantized::metal::DEFAULT_MOE_MM_FROM);
+    set_moe_mm_bn(0);
 }

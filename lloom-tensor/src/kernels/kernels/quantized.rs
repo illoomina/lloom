@@ -636,11 +636,11 @@ pub fn call_quantized_matmul_mv_id_t(
 /// The routed GEMM's row block (`BLOCK_SIZE_N` of `kernel_mul_mm_id_impl`).
 pub const MM_ID_BLOCK_ROWS: usize = 32;
 
-/// Blocks a routed tile of `rows × topk` pairs over `n_experts` can need at
-/// most: one part-block per expert plus the full blocks — the grid's x and
-/// the map's capacity (`kernel_moe_rowmap`).
-pub fn mm_id_block_bound(rows: usize, topk: usize, n_experts: usize) -> usize {
-    (rows * topk).div_ceil(MM_ID_BLOCK_ROWS) + n_experts
+/// Blocks of `bn` rows a routed tile of `rows × topk` pairs over
+/// `n_experts` can need at most: one part-block per expert plus the full
+/// blocks — the grid's x and the map's capacity (`kernel_moe_rowmap`).
+pub fn mm_id_block_bound(rows: usize, topk: usize, n_experts: usize, bn: usize) -> usize {
+    (rows * topk).div_ceil(bn.max(1)) + n_experts
 }
 
 /// `kernel_moe_rowmap`: the router's `ids [rows, topk]` (u32) → `rowids`
@@ -660,6 +660,7 @@ pub fn call_moe_rowmap(
     blocks: &Buffer,
     meta: &Buffer,
     bound: usize,
+    block_n: usize,
 ) -> Result<(), MetalKernelError> {
     if n_experts > 1024 {
         return Err(MetalKernelError::LoadFunctionError(format!(
@@ -681,7 +682,7 @@ pub fn call_moe_rowmap(
             (rows * topk) as u32,
             topk as u32,
             n_experts as u32,
-            MM_ID_BLOCK_ROWS as u32,
+            block_n as u32,
             bound as u32
         )
     );
@@ -724,8 +725,15 @@ pub fn call_quantized_matmul_mm_id_mapped(
     blocks: &Buffer,
     meta: &Buffer,
     bound: usize,
+    bn: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    if bn != 16 && bn != MM_ID_BLOCK_ROWS {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "routed matmul row block must be 16 or 32",
+            "routed quantized matmul (rows grouped by expert)",
+        ));
+    }
     let stem = match dtype {
         GgmlDType::F32 => "f32",
         GgmlDType::F16 => "f16",
@@ -760,7 +768,11 @@ pub fn call_quantized_matmul_mm_id_mapped(
             "routed quantized matmul (rows grouped by expert)",
         ));
     }
-    let name = format!("kernel_mul_mm_id_mapped_{stem}_f32");
+    let name = if bn == 16 {
+        format!("kernel_mul_mm_id_mapped16_{stem}_f32")
+    } else {
+        format!("kernel_mul_mm_id_mapped_{stem}_f32")
+    };
     let row_bytes = ((k / dtype_block_size(dtype)) * dtype_type_size(dtype)) as u64;
     let act = core::mem::size_of::<f32>() as u64;
     let ne00 = k as i64;
@@ -780,7 +792,7 @@ pub fn call_quantized_matmul_mm_id_mapped(
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(
         encoder,
-        "qmm_mm_id {name} E={n_experts} B={batch} topk={topk} K={k} N={n}"
+        "qmm_mm_id {name} E={n_experts} B={batch} topk={topk} K={k} N={n} bn={bn}"
     );
     set_params!(
         encoder,
@@ -804,7 +816,7 @@ pub fn call_quantized_matmul_mm_id_mapped(
             ne1
         )
     );
-    encoder.set_threadgroup_memory_length(0, 8192 + MM_ID_BLOCK_ROWS * 4);
+    encoder.set_threadgroup_memory_length(0, 8192 + bn * 4);
     encoder.dispatch_thread_groups(
         MTLSize {
             width: bound,

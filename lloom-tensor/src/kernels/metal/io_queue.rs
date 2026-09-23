@@ -118,8 +118,32 @@ impl IoQueue {
         if loads.is_empty() {
             return Ok(());
         }
+        let value = self.issue(commands, loads)?;
+        self.await_value(commands, value)
+    }
+
+    /// The first half of [`Self::load_ordered`]: issue `loads` ordered after
+    /// everything `commands` has encoded so far, and return the `ev_io`
+    /// value the loads signal when landed — for [`Self::await_value`] at the
+    /// point of use, possibly layers later (the in-flight entry of a hint).
+    /// Nothing waits until then; the loads run under the compute between.
+    pub fn issue(
+        &self,
+        commands: &Commands,
+        loads: &[IoLoad<'_>],
+    ) -> Result<u64, MetalKernelError> {
         let value = self.next.fetch_add(1, Ordering::AcqRel) + 1;
+        if loads.is_empty() {
+            return Ok(value);
+        }
         commands.encode_signal_event(&self.ev_compute, value)?;
+        // Commit the compute buffer carrying the signal BEFORE the IO buffer
+        // is committed: the IO buffer waits for a signal that runs only once
+        // its buffer is committed, and the loads sit pending until then —
+        // with their bytes, which the IO queue holds on the device while
+        // they wait (measured: a 16 624-expert warm left 35 GB allocated at
+        // load beside the 33.75 GB of the pools, #749 P26).
+        commands.flush_marker()?;
         let cb = self.queue.commandBuffer();
         cb.waitForEvent_value(&self.ev_compute, value);
         let mut total = 0u64;
@@ -150,10 +174,37 @@ impl IoQueue {
         }
         cb.signalEvent_value(&self.ev_io, value);
         cb.commit();
-        commands.encode_wait_for_event(&self.ev_io, value)?;
         self.loads.fetch_add(loads.len() as u64, Ordering::Relaxed);
         self.bytes.fetch_add(total, Ordering::Relaxed);
-        Ok(())
+        Ok(value)
+    }
+
+    /// The value the most recent [`Self::issue`] returned (0 before any).
+    pub fn last_issued(&self) -> u64 {
+        self.next.load(Ordering::Acquire)
+    }
+
+    /// Block this thread until the loads issued with `value` have landed —
+    /// for the one-off paths (a pool warm) that bound what they leave
+    /// pending; never on a token's path.
+    pub fn wait_landed(&self, value: u64) {
+        while self.signaled() < value {
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    }
+
+    /// The second half: every command `commands` encodes from here on waits
+    /// for the loads [`Self::issue`] returned `value` for. The IO queue is
+    /// in order, so waiting for the largest value of a set covers the set.
+    pub fn await_value(&self, commands: &Commands, value: u64) -> Result<(), MetalKernelError> {
+        commands.encode_wait_for_event(&self.ev_io, value)
+    }
+
+    /// The largest `ev_io` value landed so far (a host read of the shared
+    /// event): loads issued with a value at or below it are complete, and
+    /// need no wait.
+    pub fn signaled(&self) -> u64 {
+        self.ev_io.signaledValue()
     }
 
     /// `(loads issued, bytes issued)` so far.

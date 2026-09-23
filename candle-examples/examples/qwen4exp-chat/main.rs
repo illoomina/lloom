@@ -246,6 +246,13 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     prefetch: bool,
 
+    /// The prefetch hints on the `io` arm: the hinted experts take the
+    /// pool's free slots at hint time and load on the IO queue, waited for
+    /// at the layer (the in-flight residency entry). Measured net-negative
+    /// on this pool (issue #749 P26); the A/B arm.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    io_hints: bool,
+
     /// The prefetch hint on a prefill pass (§20.3): 0 = the usage profile,
     /// 1 = residual speculation (layer l+2's router on the carry entering
     /// layer l, landed after l). Default: `QWEN4EXP_SPEC_AHEAD`, else 0.
@@ -597,6 +604,7 @@ fn main() -> Result<()> {
                 slots,
                 loader,
                 prefetch: args.prefetch,
+                io_hints: args.io_hints,
             };
             let mut model: Qwen4Exp<Streamed> =
                 Qwen4Exp::from_gguf_streamed(&shards, &device, &opts, &stream)?;
@@ -972,7 +980,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked
             );
             println!(
-                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0}",
+                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={}",
                 args.loader,
                 model.slots_per_layer(),
                 s.plans,
@@ -990,7 +998,11 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 s.readback_ns as f64 / 1e6,
                 s.load_now_ns as f64 / 1e6,
                 s.land_ns as f64 / 1e6,
-                s.sync_load_ns as f64 / 1e6
+                s.sync_load_ns as f64 / 1e6,
+                s.io_hints,
+                s.io_inflight_hits,
+                s.io_inflight_wasted,
+                s.io_inflight_landed
             );
         }
         if let Some((hits, misses)) = model.ple_cache_stats() {

@@ -368,6 +368,12 @@ pub struct ResidencyMap {
     expert_in: Vec<u32>,
     last_use: Vec<u64>,
     pinned: Vec<bool>,
+    /// Per slot, the `io` arm's event value its expert lands on — an
+    /// in-flight entry (a hint issued, the DMA not yet waited for); 0 when
+    /// the slot holds a landed expert or nothing (§20.4a, DS4's
+    /// `inflight_seq`). The victim search skips in-flight slots while any
+    /// other is available; `install` clears it.
+    inflight: Vec<u64>,
     tick: u64,
 }
 
@@ -381,6 +387,7 @@ impl ResidencyMap {
             expert_in: vec![NONE; n_slots],
             last_use: vec![0; n_slots],
             pinned: vec![false; n_slots],
+            inflight: vec![0; n_slots],
             tick: 0,
         }
     }
@@ -417,11 +424,23 @@ impl ResidencyMap {
     }
 
     /// The least-recently-used unpinned slot not used in epoch `tick`, and
-    /// whether it held an expert (an eviction).
+    /// whether it held an expert (an eviction). An in-flight slot is taken
+    /// only when no other is (the IO queue is in order, so the second load
+    /// lands after the first; the hint's bytes were read for nothing).
     fn victim(&self, tick: u64) -> Option<(usize, bool)> {
+        self.victim_in(tick, true)
+            .or_else(|| self.victim_in(tick, false))
+    }
+
+    /// [`Self::victim`] over the slots not in flight (`skip_inflight`) or
+    /// over all of them.
+    fn victim_in(&self, tick: u64, skip_inflight: bool) -> Option<(usize, bool)> {
         let mut best: Option<(usize, u64)> = None;
         for s in 0..self.expert_in.len() {
-            if self.pinned[s] || self.last_use[s] == tick {
+            if self.pinned[s]
+                || self.last_use[s] == tick
+                || (skip_inflight && self.inflight[s] != 0)
+            {
                 continue;
             }
             // An empty slot wins outright.
@@ -443,6 +462,26 @@ impl ResidencyMap {
         }
         self.expert_in[slot] = e as u32;
         self.slot_of[e] = slot as u32;
+        self.inflight[slot] = 0;
+    }
+
+    /// Slots whose expert is in flight (an `io` hint not yet waited for).
+    pub fn inflight_count(&self) -> usize {
+        self.inflight.iter().filter(|&&v| v != 0).count()
+    }
+
+    /// Forget the in-flight state of every slot whose loads landed (event
+    /// value ≤ `done`): a landed expert is a resident like any other.
+    /// Returns how many.
+    fn settle_inflight(&mut self, done: u64) -> u64 {
+        let mut n = 0;
+        for v in self.inflight.iter_mut() {
+            if *v != 0 && *v <= done {
+                *v = 0;
+                n += 1;
+            }
+        }
+        n
     }
 
     fn set_pinned(&mut self, slot: usize, pinned: bool) {
@@ -484,6 +523,15 @@ pub struct StreamCounters {
     pub load_now_ns: AtomicU64,
     pub land_ns: AtomicU64,
     pub sync_load_ns: AtomicU64,
+    /// The `io` arm's hints: experts issued to slots ahead of their layer.
+    pub io_hints: AtomicU64,
+    /// Uses that found their expert in flight (or landed) from a hint.
+    pub io_inflight_hits: AtomicU64,
+    /// In-flight entries overwritten before any use (read for nothing).
+    pub io_inflight_wasted: AtomicU64,
+    /// In-flight entries the host saw landed before any use waited for
+    /// them (residents from then on, their use a plain hit).
+    pub io_inflight_landed: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -516,6 +564,10 @@ pub struct StreamStats {
     pub load_now_ns: u64,
     pub land_ns: u64,
     pub sync_load_ns: u64,
+    pub io_hints: u64,
+    pub io_inflight_hits: u64,
+    pub io_inflight_wasted: u64,
+    pub io_inflight_landed: u64,
 }
 
 impl StreamCounters {
@@ -534,6 +586,10 @@ impl StreamCounters {
             load_now_ns: self.load_now_ns.load(Ordering::Relaxed),
             land_ns: self.land_ns.load(Ordering::Relaxed),
             sync_load_ns: self.sync_load_ns.load(Ordering::Relaxed),
+            io_hints: self.io_hints.load(Ordering::Relaxed),
+            io_inflight_hits: self.io_inflight_hits.load(Ordering::Relaxed),
+            io_inflight_wasted: self.io_inflight_wasted.load(Ordering::Relaxed),
+            io_inflight_landed: self.io_inflight_landed.load(Ordering::Relaxed),
         }
     }
 }
@@ -547,6 +603,10 @@ impl std::ops::AddAssign for StreamStats {
         self.load_now_ns += o.load_now_ns;
         self.land_ns += o.land_ns;
         self.sync_load_ns += o.sync_load_ns;
+        self.io_hints += o.io_hints;
+        self.io_inflight_hits += o.io_inflight_hits;
+        self.io_inflight_wasted += o.io_inflight_wasted;
+        self.io_inflight_landed += o.io_inflight_landed;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -631,6 +691,11 @@ struct Inner {
     /// ring shared by every layer of the tier when built by the loader.
     #[cfg(feature = "metal")]
     staging: Option<lloom_tensor::kernels::metal::staging::SharedStagingRing>,
+    /// The epoch of a group whose slot ids `ensure` handed out and whose
+    /// dispatches are not all encoded yet (`down` closes it): the `io` arm's
+    /// hint between the two must not give its slots away — the load is
+    /// ordered after what IS encoded, nothing orders it after what is not.
+    open_epoch: Option<u64>,
 }
 
 /// The routed experts streamed from the checkpoint into a slot pool (§20.6).
@@ -643,6 +708,11 @@ pub struct Streamed {
     /// this layer's key in it.
     #[cfg(feature = "metal")]
     prefetch: Option<Arc<crate::nn::expert_prefetch::Prefetcher>>,
+    /// The `io` arm's hints (`set_io_hints`): a prefetch hint chooses the
+    /// slots NOW and issues the loads on the IO queue, the residency map
+    /// carrying the entries in flight until the layer's use waits for them.
+    #[cfg(feature = "metal")]
+    io_hints: bool,
     key: usize,
 }
 
@@ -741,12 +811,15 @@ impl Streamed {
                 staging,
                 table: None,
                 table_stale: true,
+                open_epoch: None,
             }),
             counters: StreamCounters::default(),
             n_experts,
             n_slots,
             #[cfg(feature = "metal")]
             prefetch: None,
+            #[cfg(feature = "metal")]
+            io_hints: false,
             key: NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
@@ -756,6 +829,26 @@ impl Streamed {
     #[cfg(feature = "metal")]
     pub fn set_prefetcher(&mut self, p: Arc<crate::nn::expert_prefetch::Prefetcher>) {
         self.prefetch = Some(p);
+    }
+
+    /// Let the prefetch hints act on the `io` arm: the hinted experts are
+    /// given slots at hint time and their loads issued on the IO queue,
+    /// waited for on the compute stream only at the layer that uses them
+    /// (the in-flight residency entry, §20.4a). No effect on the `pread`
+    /// arm (its hints go to the prefetcher's ring).
+    #[cfg(feature = "metal")]
+    pub fn set_io_hints(&mut self, on: bool) {
+        self.io_hints = on;
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn io_hints(&self) -> bool {
+        self.io_hints
+    }
+
+    /// Slots in flight from `io` hints, not yet waited for.
+    pub fn inflight_count(&self) -> usize {
+        self.inner.lock().map.inflight_count()
     }
 
     /// The tier key the prefetcher files this layer's requests under.
@@ -868,6 +961,12 @@ impl Streamed {
         let before: Vec<u32> = inner.map.usage.clone();
         self.resolve(&mut inner, &take, tick)?;
         inner.map.usage = before;
+        // The `io` arm: no more than two layers' warms pending on the queue
+        // (their bytes are held on the device while they wait).
+        #[cfg(feature = "metal")]
+        if let LoaderArm::Io(q) = &inner.loader {
+            q.wait_landed(q.last_issued().saturating_sub(1));
+        }
         Ok(take.len())
     }
 
@@ -924,6 +1023,21 @@ impl Streamed {
             };
         #[cfg(feature = "metal")]
         let mut landed: Vec<(usize, usize, crate::nn::expert_prefetch::Staged)> = Vec::new();
+        // The `io` arm's in-flight entries this group uses: the loads
+        // already landed (the event past their value) need no wait; the
+        // rest are waited for once, below, before the group's dispatch.
+        #[cfg(feature = "metal")]
+        let mut wait_value = 0u64;
+        #[cfg(feature = "metal")]
+        if inner.map.inflight_count() > 0 {
+            if let LoaderArm::Io(q) = &inner.loader {
+                let done = q.signaled();
+                let n = inner.map.settle_inflight(done);
+                self.counters
+                    .io_inflight_landed
+                    .fetch_add(n, Ordering::Relaxed);
+            }
+        }
         for &e in experts {
             let e = e as usize;
             if e >= self.n_experts {
@@ -933,6 +1047,14 @@ impl Streamed {
             let slot = match inner.map.slot_of(e) {
                 Some(s) => {
                     self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "metal")]
+                    if inner.map.inflight[s] != 0 {
+                        wait_value = wait_value.max(inner.map.inflight[s]);
+                        inner.map.inflight[s] = 0;
+                        self.counters
+                            .io_inflight_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     s
                 }
                 None => {
@@ -945,6 +1067,11 @@ impl Streamed {
                             experts.len()
                         ),
                     };
+                    if inner.map.inflight[s] != 0 {
+                        self.counters
+                            .io_inflight_wasted
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     inner.map.install(s, e);
                     self.counters.misses.fetch_add(1, Ordering::Relaxed);
                     if evicted {
@@ -1015,6 +1142,9 @@ impl Streamed {
                     .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 inner.table_stale = true;
             }
+            if wait_value != 0 {
+                self.await_inflight(inner, wait_value)?;
+            }
         }
         if !misses.is_empty() {
             let t0 = std::time::Instant::now();
@@ -1027,6 +1157,144 @@ impl Streamed {
             inner.table_stale = true;
         }
         Ok(slots)
+    }
+
+    /// Make the compute stream wait for the `io` arm's loads up to `value`
+    /// (the in-flight entries a group uses), once per group.
+    #[cfg(feature = "metal")]
+    fn await_inflight(&self, inner: &mut Inner, value: u64) -> Result<()> {
+        let queue = match &inner.loader {
+            LoaderArm::Io(q) => q,
+            LoaderArm::Pread => {
+                lloom_tensor::bail!("an in-flight residency entry on the pread arm")
+            }
+        };
+        let commands = match &inner.device {
+            Device::Metal(d) => d.commands().clone(),
+            _ => lloom_tensor::bail!("the io loader arm needs a Metal device"),
+        };
+        queue
+            .await_value(&commands, value)
+            .map_err(lloom_tensor::Error::wrap)
+    }
+
+    /// The `io` arm's hint: give each of `experts` (missing, in the order
+    /// the hint ranks them) a slot NOW — the LRU victim among the slots not
+    /// in flight, stopping when none is left — and issue their loads as
+    /// one IO command buffer, ordered after everything encoded so far. The
+    /// slots are in flight until the layer's `resolve` waits for them (or
+    /// the host sees the event past their value). A hint is not a use:
+    /// usage is untouched, hits and misses are counted when the layer
+    /// comes.
+    #[cfg(feature = "metal")]
+    fn issue_hint(&self, inner: &mut Inner, experts: &[u32]) -> Result<()> {
+        use lloom_tensor::kernels::metal::io_queue::IoLoad;
+        let queue = match &inner.loader {
+            LoaderArm::Io(q) => Arc::clone(q),
+            LoaderArm::Pread => return Ok(()),
+        };
+        let commands = match &inner.device {
+            Device::Metal(d) => d.commands().clone(),
+            _ => lloom_tensor::bail!("the io loader arm needs a Metal device"),
+        };
+        let done = queue.signaled();
+        let n = inner.map.settle_inflight(done);
+        self.counters
+            .io_inflight_landed
+            .fetch_add(n, Ordering::Relaxed);
+        // NOT a new epoch, and the open one (a group whose slot ids are out
+        // and whose dispatch may not be encoded yet — the within-layer hint
+        // for the later groups runs between the two) is protected: its
+        // slots are never victims. Any other epoch's dispatches are encoded
+        // and the load is ordered after them.
+        let tick = inner.map.tick;
+        let protect = inner.open_epoch.unwrap_or(u64::MAX);
+        let mut chosen: Vec<(usize, usize)> = Vec::with_capacity(experts.len());
+        for &e in experts {
+            let e = e as usize;
+            if e >= self.n_experts || inner.map.slot_of(e).is_some() {
+                continue;
+            }
+            // FREE slots only, no eviction: a hint that evicts on a pool
+            // smaller than the tile's working set displaces what the tile
+            // needs now for what it may need next (measured: misses 23 802
+            // → 30 368 and the prefill 12.6 → 21–37 s on the 937-token
+            // prompt; 15 459 → 18 808 and 5.8 → 11.0 s on the 25-token one
+            // over a hotlist-warmed pool, `p26-io2-*.txt`). The `pread`
+            // arm's ring is the room its hints read into; the `io` arm's
+            // room is its empty slots.
+            let Some((s, false)) = inner.map.victim_in(protect, true) else {
+                break;
+            };
+            inner.map.install(s, e);
+            // In flight from here (the value below once issued), so the
+            // next pick of this loop skips it.
+            inner.map.inflight[s] = u64::MAX;
+            inner.map.touch(s, tick);
+            chosen.push((e, s));
+        }
+        if chosen.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = 0u64;
+        let value = {
+            let mut loads = Vec::with_capacity(chosen.len() * 3);
+            for (pool, src) in inner.pools.iter().zip(inner.sources.iter()) {
+                let dst = pool.qt.metal_buffer()?;
+                let file = match &src.io {
+                    Some(f) => f,
+                    None => lloom_tensor::bail!("io arm: {} was not opened", src.path.display()),
+                };
+                let plane = pool.plane_bytes;
+                for &(e, s) in &chosen {
+                    loads.push(IoLoad {
+                        dst,
+                        dst_offset: s * plane,
+                        file,
+                        src_offset: src.plane_offset(e),
+                        len: plane,
+                    });
+                    bytes += plane as u64;
+                }
+            }
+            queue
+                .issue(&commands, &loads)
+                .map_err(lloom_tensor::Error::wrap)?
+        };
+        for &(_, s) in &chosen {
+            inner.map.inflight[s] = value;
+        }
+        inner.table_stale = true;
+        self.counters
+            .io_hints
+            .fetch_add(chosen.len() as u64, Ordering::Relaxed);
+        self.counters
+            .bytes_loaded
+            .fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// A hint's missing experts to whichever mechanism the arm has: the
+    /// prefetcher's ring (`pread`), or slots chosen now on the IO queue
+    /// (`io`, `set_io_hints`).
+    #[cfg(feature = "metal")]
+    fn dispatch_hint(
+        &self,
+        missing: Vec<u32>,
+        planes: [crate::nn::expert_prefetch::PlaneSource; 3],
+    ) -> Result<()> {
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if let Some(p) = &self.prefetch {
+            p.request(self.key, &missing, &planes);
+            return Ok(());
+        }
+        if self.io_hints {
+            let mut inner = self.inner.lock();
+            self.issue_hint(&mut inner, &missing)?;
+        }
+        Ok(())
     }
 
     /// Land staged experts `(expert, slot, staged)` in all three pools: the
@@ -1292,9 +1560,9 @@ impl ExpertResidency for Streamed {
     /// the victims are chosen when the pass reaches the layer.
     #[cfg(feature = "metal")]
     fn prefetch_ahead(&self) -> Result<()> {
-        let Some(p) = &self.prefetch else {
+        if self.prefetch.is_none() && !self.io_hints {
             return Ok(());
-        };
+        }
         let (missing, planes) = {
             let inner = self.inner.lock();
             let mut missing: Vec<u32> = (0..self.n_experts as u32)
@@ -1313,8 +1581,7 @@ impl ExpertResidency for Streamed {
             ];
             (missing, planes)
         };
-        p.request(self.key, &missing, &planes);
-        Ok(())
+        self.dispatch_hint(missing, planes)
     }
 
     #[cfg(feature = "metal")]
@@ -1330,9 +1597,9 @@ impl ExpertResidency for Streamed {
 
     #[cfg(feature = "metal")]
     fn prefetch_ids(&self, ids: &[u32]) -> Result<()> {
-        let Some(p) = &self.prefetch else {
+        if self.prefetch.is_none() && !self.io_hints {
             return Ok(());
-        };
+        }
         let mut distinct: Vec<u32> = ids.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
@@ -1367,10 +1634,7 @@ impl ExpertResidency for Streamed {
             ];
             (missing, planes)
         };
-        if !missing.is_empty() {
-            p.request(self.key, &missing, &planes);
-        }
-        Ok(())
+        self.dispatch_hint(missing, planes)
     }
 
     #[cfg(feature = "metal")]
@@ -1490,6 +1754,7 @@ impl ExpertResidency for Streamed {
         let mut inner = self.inner.lock();
         let tick = inner.map.begin();
         let slots = self.resolve(&mut inner, &distinct, tick)?;
+        inner.open_epoch = Some(tick);
         let slot_ids: Vec<u32> = ids
             .iter()
             .map(|e| {
@@ -1509,8 +1774,11 @@ impl ExpertResidency for Streamed {
     }
 
     fn down(&self, h: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
-        let inner = self.inner.lock();
-        inner.pools[2].qt.indexed_moe_forward(h, slot_ids)
+        let mut inner = self.inner.lock();
+        let y = inner.pools[2].qt.indexed_moe_forward(h, slot_ids)?;
+        // The group's last dispatch is encoded: its slots may be given away.
+        inner.open_epoch = None;
+        Ok(y)
     }
 }
 

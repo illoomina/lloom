@@ -197,6 +197,7 @@ impl Engine<Resident> {
                     slots,
                     loader,
                     prefetch: true,
+                    io_hints: false,
                 };
                 let mut model: Qwen4Exp<Streamed> =
                     Qwen4Exp::from_gguf_streamed(&shards, &device, &mload, &stream)

@@ -433,12 +433,21 @@ pub fn staging_ring_bytes(loader: &StreamLoader, prefetch: bool) -> usize {
 pub const PREFETCH_RING_BYTES: usize = 2 << 30;
 pub const PREFETCH_STAGED_BYTES: usize = 1 << 30;
 
+/// The `io` arm's transient: the bytes of the loads pending on the IO queue,
+/// which it holds on the device until they run — a warm keeps two layers'
+/// pending, the hints a lead's worth of layers (~0.6 GB a layer at ~340
+/// slots), a layer's own misses one (issue #749 P26).
+pub const IO_INFLIGHT_RESERVE_BYTES: usize = 2 << 30;
+
 /// The streamed tier's own transient memory beside its slots — the staging
 /// ring's cap — left out of the slot plan like the session reserve;
 /// measured before it was: a prefetched second tile refused at 35.12 GB on
 /// a 36.18 GB budget (`p19-prefetch-on.txt`).
 pub fn staging_reserve_bytes(loader: &StreamLoader, prefetch: bool) -> usize {
-    staging_ring_bytes(loader, prefetch)
+    match loader {
+        StreamLoader::Pread => staging_ring_bytes(loader, prefetch),
+        StreamLoader::Io => IO_INFLIGHT_RESERVE_BYTES,
+    }
 }
 
 /// How the routed experts are streamed.
@@ -451,6 +460,13 @@ pub struct StreamOptions {
     /// stages each layer's likely misses while the layer before it runs
     /// (`nn::expert_prefetch`). Off, every miss is read at the layer.
     pub prefetch: bool,
+    /// The prefetch hints on the `io` arm (Metal): the hinted experts take
+    /// the pool's FREE slots at hint time and load on the IO queue, waited
+    /// for at the layer (the in-flight residency entry, §20.4a). Off by
+    /// default — measured net-negative on this pool (issue #749 P26): the
+    /// arm's DMA is already asynchronous, and a pool smaller than the
+    /// tile's working set has no room to read ahead into.
+    pub io_hints: bool,
 }
 
 /// The slots `Auto` resolves to, and the terms it resolved them from.
@@ -888,6 +904,12 @@ impl Qwen4Exp<Streamed> {
             #[cfg(feature = "metal")]
             if let Some(p) = &prefetcher {
                 tier.set_prefetcher(Arc::clone(p));
+            }
+            // The `io` arm's hints (`io_hints`): slots chosen now, the
+            // loads on the IO queue (the in-flight entry).
+            #[cfg(feature = "metal")]
+            if let LoaderArm::Io(_) = &arm {
+                tier.set_io_hints(stream.io_hints);
             }
             Ok(tier)
         })

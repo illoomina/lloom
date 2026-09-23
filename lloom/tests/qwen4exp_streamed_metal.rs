@@ -37,18 +37,32 @@ fn streamed(
     arm: LoaderArm,
     dev: &Device,
 ) -> Result<Qwen4Exp<Streamed>> {
+    streamed_with(cfg, path, slots, arm, dev, false)
+}
+
+/// [`streamed`], with the `io` arm's hints on (`io_hints`).
+fn streamed_with(
+    cfg: &Config,
+    path: &Path,
+    slots: usize,
+    arm: LoaderArm,
+    dev: &Device,
+    io_hints: bool,
+) -> Result<Qwen4Exp<Streamed>> {
     let mut f = File::open(path)?;
     let content = Content::read(&mut f)?;
     testing::model_with(cfg, dev, |l| {
         let src = |n: &str| ExpertSource::from_gguf(&content, path, &format!("blk.{l}.{n}"));
-        Streamed::new(
+        let mut t = Streamed::new(
             src("ffn_gate_exps.weight")?,
             src("ffn_up_exps.weight")?,
             src("ffn_down_exps.weight")?,
             slots,
             arm.clone(),
             dev,
-        )
+        )?;
+        t.set_io_hints(io_hints);
+        Ok(t)
     })
 }
 
@@ -131,6 +145,52 @@ fn both_loader_arms_match_the_resident_model_on_metal() -> Result<()> {
     }
     assert_eq!(stats.bytes_loaded, bytes);
     assert!(stats.evictions > 0);
+
+    // The io arm with its hints: the prefill's `prefetch_ahead` gives the
+    // hinted experts slots at hint time and loads them on the IO queue; the
+    // layer's use waits for them on the compute stream. Same logits, every
+    // hinted expert either used (an in-flight hit) or overwritten (wasted),
+    // no in-flight entry left dangling past a use, bytes as the queue's.
+    let queue2 = match &dev {
+        Device::Metal(d) => Arc::new(IoQueue::new(d.device()).map_err(lloom_tensor::Error::wrap)?),
+        _ => unreachable!(),
+    };
+    let io_hinted = streamed_with(&cfg, &path, 5, LoaderArm::Io(queue2.clone()), &dev, true)?;
+    let got = run(&io_hinted, &cfg, &dev)?;
+    for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+        assert!(
+            a == b,
+            "io arm with hints: logits row {i} differs from resident"
+        );
+    }
+    let (_, bytes2) = queue2.counters();
+    let mut hinted = lloom::nn::expert_stream::StreamStats::default();
+    let mut inflight = 0usize;
+    for l in io_hinted.layers() {
+        hinted += l.moe().experts().stats();
+        inflight += l.moe().experts().inflight_count();
+    }
+    assert!(hinted.io_hints > 0, "no hint was issued: {hinted:?}");
+    // Whether a use found its expert still in flight (and waited) or the
+    // host saw it landed first is the DMA's timing against a tiny model;
+    // either way the hint reached a slot.
+    assert!(
+        hinted.io_inflight_hits + hinted.io_inflight_landed > 0,
+        "no hinted expert landed: {hinted:?}"
+    );
+    assert!(
+        hinted.io_inflight_hits
+            + hinted.io_inflight_wasted
+            + hinted.io_inflight_landed
+            + inflight as u64
+            == hinted.io_hints,
+        "hints {} = in-flight hits {} + wasted {} + landed unwaited {} + still in flight {inflight}",
+        hinted.io_hints,
+        hinted.io_inflight_hits,
+        hinted.io_inflight_wasted,
+        hinted.io_inflight_landed
+    );
+    assert_eq!(hinted.bytes_loaded, bytes2, "bytes must be the queue's");
     std::fs::remove_file(&path).ok();
     Ok(())
 }

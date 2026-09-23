@@ -51,7 +51,8 @@ pub use mlx_gemm::{
     call_mlx_gemv_with, GemmDType, GemvEpilogue, GemvRmsNorm, MixedEpilogue, SKINNY_TILE_MAX_M,
 };
 pub use qwen4exp::{
-    call_gdn_chunk_decay, call_gdn_chunk_epilogue, call_gdn_chunk_scale, call_gdn_conv_window,
+    call_gdn_chunk_decay, call_gdn_chunk_epilogue, call_gdn_chunk_scale, call_gdn_chunk_scan_at,
+    call_gdn_conv_window,
     call_gdn_gate, call_gdn_gated_norm, call_gdn_prefill_prologue, call_gdn_prologue,
     call_gdn_step, call_hc_collapse, call_hc_combine, call_hc_norm, call_moe_combine,
     call_moe_slot_map, call_moe_topk, call_qsa_prep, call_qsa_prep_batch, call_qsa_prep_rows, call_sigmoid_mul,

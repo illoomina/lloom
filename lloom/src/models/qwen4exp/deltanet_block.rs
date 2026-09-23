@@ -800,8 +800,36 @@ impl GatedDeltaNet {
             Some(s) => s.to_dtype(f32)?.permute((2, 0, 1))?.contiguous()?, // [h_v, d, d]
             None => Tensor::zeros((h_v, d, d), f32, dev)?,
         };
+        // The inter-chunk recurrence as one launch (`kernels::GdnChunkScan`);
+        // the host loop below is its A/B arm and the CPU's.
+        let scanned =
+            if super::kernels::chunk_scan_on() && cs.is_multiple_of(8) && d.is_multiple_of(8) {
+                let flat = w.contiguous()?.apply_op3_no_bwd(
+                    &u.contiguous()?,
+                    &q_g.contiguous()?,
+                    &super::kernels::GdnChunkScan {
+                        h_v,
+                        nc,
+                        cs,
+                        d,
+                        kq: kq.contiguous()?,
+                        kg: kg.contiguous()?,
+                        g_last: g_last_exp.contiguous()?,
+                        s_in: s.clone(),
+                    },
+                )?;
+                let n_o = h_v * nc * cs * d;
+                let o = flat.narrow(0, 0, n_o)?.reshape((h_v, padded, d))?;
+                s = flat.narrow(0, n_o, h_v * d * d)?.reshape((h_v, d, d))?;
+                Some(o)
+            } else {
+                None
+            };
         let mut outs = Vec::with_capacity(nc);
         for c in 0..nc {
+            if scanned.is_some() {
+                break;
+            }
             let w_c = w.narrow(1, c, 1)?.squeeze(1)?; // [h_v, cs, d]
             let u_c = u.narrow(1, c, 1)?.squeeze(1)?;
             let v_new = (u_c - w_c.matmul(&s)?)?; // [h_v, cs, d]
@@ -813,10 +841,10 @@ impl GatedDeltaNet {
             let gl = g_last_exp.narrow(1, c, 1)?.reshape((h_v, 1, 1))?;
             s = (s.broadcast_mul(&gl)? + kg_c.matmul(&v_new)?)?;
         }
-        let o = if nc == 1 {
-            outs.pop().expect("one chunk")
-        } else {
-            Tensor::cat(&outs, 1)?
+        let o = match scanned {
+            Some(o) => o,
+            None if nc == 1 => outs.pop().expect("one chunk"),
+            None => Tensor::cat(&outs, 1)?,
         }; // [h_v, padded, d]
         let out = o.apply_op2_no_bwd(
             &z,
@@ -1357,6 +1385,47 @@ mod tests {
             ));
         }
         println!("prefill fused vs composed worst relative diff: {worst:e}");
+
+        // The chunk scan against the host loop it replaces (`GdnChunkScan`,
+        // `set_chunk_scan`): four chunks, within the same tolerance, and
+        // the scan bit-stable run to run.
+        let seq = 200usize;
+        let x = Tensor::from_vec(
+            (0..seq * d)
+                .map(|i| ((i as f32 * 0.021 + 3.0).sin()) * 0.6)
+                .collect::<Vec<f32>>(),
+            (1, seq, d),
+            &gpu,
+        )
+        .unwrap();
+        let run = |on: bool| -> (Vec<f32>, Vec<f32>) {
+            super::super::kernels::set_chunk_scan(on);
+            let (mut s, mut c) = (RecurrentState::new(1), RecurrentState::new(1));
+            let out = blk_gpu.prefill(&x, 0, &mut s, &mut c).unwrap();
+            let o: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+            let st: Vec<f32> = s.get(0).unwrap().flatten_all().unwrap().to_vec1().unwrap();
+            (o, st)
+        };
+        let (o_loop, s_loop) = run(false);
+        let (o_scan, s_scan) = run(true);
+        let (o_scan2, s_scan2) = run(true);
+        super::super::kernels::set_chunk_scan(true);
+        assert_eq!(o_scan, o_scan2, "the scan is not bit-stable (output)");
+        assert_eq!(s_scan, s_scan2, "the scan is not bit-stable (state)");
+        for (name, a, b) in [("output", &o_loop, &o_scan), ("state", &s_loop, &s_scan)] {
+            assert!(b.iter().all(|v| v.is_finite()), "{name}: non-finite scan");
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+            let diff = a
+                .iter()
+                .zip(b.iter())
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                diff <= 2e-4 * scale,
+                "{name}: the scan differs from the loop by {diff} at scale {scale}"
+            );
+            println!("chunk scan vs loop {name}: {:e}", diff / scale);
+        }
     }
 
     #[cfg(feature = "metal")]

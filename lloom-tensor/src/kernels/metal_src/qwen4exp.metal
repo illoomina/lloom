@@ -1306,3 +1306,134 @@ kernel void gdn_gated_norm_rows_f32(
     out[idx] = x * scale * gamma[i] * sg;
   }
 }
+
+// ---- Gated DeltaNet chunk scan: the inter-chunk recurrence as ONE launch ----
+//
+// `prefill_fused`'s host loop over the chunks ran ~8 launches a chunk of
+// `[h_v, 64, 128]`-shaped matmuls, adds and scales, each too small to fill
+// the machine and each waiting on the last (2 ms a chunk, 17 ms a
+// 512-position layer, P22). This kernel walks the chunks for one head per
+// threadgroup, the four simdgroups splitting each product into 8 × 8
+// tiles straight from device memory (`S` and `V` are L2-resident):
+//   V  = U_c − W_c · S                    [cs, d]
+//   O_c = Qg_c · S + KQ_c · V             [cs, d]
+//   S  = g_c · S + Kg_cᵀ · V              [d, d]   (in place; the tile a
+//                                          simdgroup writes is the one it read)
+// `d` and `cs` multiples of 8; `S` starts as `s_in` and ends in `s_out`.
+// Every product is column-separable in `d`, so a head is split over
+// `splits` threadgroups, each owning a slice of `S`'s / `V`'s / `O`'s
+// columns (48 heads alone leave most of the machine idle).
+kernel void gdn_chunk_scan_f32(
+    const device float* w [[buffer(0)]],
+    const device float* u [[buffer(1)]],
+    const device float* qg [[buffer(2)]],
+    const device float* kq [[buffer(3)]],
+    const device float* kg [[buffer(4)]],
+    const device float* gl [[buffer(5)]],
+    const device float* s_in [[buffer(6)]],
+    device float* o [[buffer(7)]],
+    device float* s_out [[buffer(8)]],
+    device float* vn [[buffer(9)]],
+    constant uint& nc [[buffer(10)]],
+    constant uint& cs [[buffer(11)]],
+    constant uint& d [[buffer(12)]],
+    constant uint& splits [[buffer(13)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint width [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint nsg [[simdgroups_per_threadgroup]]) {
+  threadgroup float diag[64];
+  const uint h = gid / splits;
+  const uint part = gid % splits;
+  device float* S = s_out + (size_t)h * d * d;
+  device float* V = vn + (size_t)h * cs * d;
+  const uint rt = cs / 8;
+  const uint dt = d / 8;
+  // this threadgroup's column tiles [c0, c1)
+  const uint c0 = (dt * part) / splits;
+  const uint c1 = (dt * (part + 1)) / splits;
+  const uint nct = c1 - c0;
+  for (uint i = tid; i < d * (c1 - c0) * 8; i += width) {
+    const uint row = i / ((c1 - c0) * 8);
+    const uint col = c0 * 8 + i % ((c1 - c0) * 8);
+    S[row * d + col] = s_in[(size_t)h * d * d + row * d + col];
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  for (uint c = 0; c < nc; c++) {
+    const size_t cd = ((size_t)h * nc + c) * cs * d;
+    const device float* Wc = w + cd;
+    const device float* Uc = u + cd;
+    const device float* Qc = qg + cd;
+    const device float* Kgc = kg + cd;
+    const device float* KQc = kq + ((size_t)h * nc + c) * cs * cs;
+    device float* Oc = o + ((size_t)h * nc + c) * cs * d;
+    const float g = gl[h * nc + c];
+    if (tid < 64) {
+      diag[tid] = (tid % 9 == 0) ? g : 0.0f;
+    }
+    // V = W_c · S   (this slice's columns; the K runs over all of S's rows,
+    // whose columns this threadgroup does not own — S's other columns are
+    // read, never written, by the K loops: only the owned slice is written)
+    for (uint t = sg; t < rt * nct; t += nsg) {
+      const uint r = t / nct;
+      const uint cc = c0 + t % nct;
+      simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+      for (uint k = 0; k < dt; k++) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, Wc + (size_t)r * 8 * d + k * 8, d);
+        simdgroup_load(b, S + (size_t)k * 8 * d + cc * 8, d);
+        simdgroup_multiply_accumulate(acc, a, b, acc);
+      }
+      simdgroup_store(acc, V + (size_t)r * 8 * d + cc * 8, d);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    // V = U_c − V (the owned columns)
+    for (uint i = tid; i < cs * nct * 8; i += width) {
+      const uint row = i / (nct * 8);
+      const uint col = c0 * 8 + i % (nct * 8);
+      V[row * d + col] = Uc[row * d + col] - V[row * d + col];
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    // O_c = Qg_c · S + KQ_c · V
+    for (uint t = sg; t < rt * nct; t += nsg) {
+      const uint r = t / nct;
+      const uint cc = c0 + t % nct;
+      simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+      for (uint k = 0; k < dt; k++) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, Qc + (size_t)r * 8 * d + k * 8, d);
+        simdgroup_load(b, S + (size_t)k * 8 * d + cc * 8, d);
+        simdgroup_multiply_accumulate(acc, a, b, acc);
+      }
+      for (uint k = 0; k < rt; k++) {
+        simdgroup_float8x8 a, b;
+        simdgroup_load(a, KQc + (size_t)r * 8 * cs + k * 8, cs);
+        simdgroup_load(b, V + (size_t)k * 8 * d + cc * 8, d);
+        simdgroup_multiply_accumulate(acc, a, b, acc);
+      }
+      simdgroup_store(acc, Oc + (size_t)r * 8 * d + cc * 8, d);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    // S = g · S + Kg_cᵀ · V
+    simdgroup_float8x8 G;
+    simdgroup_load(G, diag, 8);
+    for (uint t = sg; t < dt * nct; t += nsg) {
+      const uint r = t / nct;
+      const uint cc = c0 + t % nct;
+      simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+      for (uint k = 0; k < rt; k++) {
+        simdgroup_float8x8 a, b;
+        // Kg_cᵀ[r, k] = Kg_c[k, r]: the block at rows k·8.., columns r·8.., transposed.
+        simdgroup_load(a, Kgc + (size_t)k * 8 * d + r * 8, d, ulong2(0, 0), true);
+        simdgroup_load(b, V + (size_t)k * 8 * d + cc * 8, d);
+        simdgroup_multiply_accumulate(acc, a, b, acc);
+      }
+      simdgroup_float8x8 sold;
+      simdgroup_load(sold, S + (size_t)r * 8 * d + cc * 8, d);
+      simdgroup_multiply_accumulate(acc, sold, G, acc);
+      simdgroup_store(acc, S + (size_t)r * 8 * d + cc * 8, d);
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+  }
+}

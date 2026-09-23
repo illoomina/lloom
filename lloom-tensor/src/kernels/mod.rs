@@ -30,6 +30,7 @@ pub use kernels::{
     affine::*, arena_alloc::*, call_argmax_publish, call_binary_contiguous,
     call_binary_contiguous_with, call_binary_strided, call_binary_strided_with, call_eos_gate,
     call_eos_index, call_gdn_chunk_decay, call_gdn_chunk_epilogue, call_gdn_chunk_scale,
+    call_gdn_chunk_scan_at,
     call_gdn_conv_window, call_gdn_gate, call_gdn_gated_norm, call_gdn_prefill_prologue,
     call_gdn_prologue, call_gdn_step, call_hc_collapse, call_hc_combine, call_hc_norm,
     call_mlx_gemm, call_mlx_gemv_epilogue, call_mlx_gemv_full, call_mlx_gemv_mixed,

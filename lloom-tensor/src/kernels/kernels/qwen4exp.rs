@@ -726,6 +726,65 @@ pub fn call_gdn_chunk_scale(
     Ok(())
 }
 
+/// `gdn_chunk_scan_f32`: the inter-chunk recurrence of a DeltaNet prefill
+/// as one launch, a threadgroup per head (`w`, `u`, `qg`, `kg` `[h_v, nc,
+/// cs, d]`; `kq [h_v, nc, cs, cs]`; `gl [h_v, nc]`; `s_in [h_v, d, d]`) →
+/// `o [h_v, nc·cs, d]` and `s_out [h_v, d, d]`; `vn [h_v, cs, d]` scratch.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_chunk_scan_at(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    (h_v, nc, cs, d): (usize, usize, usize, usize),
+    splits: usize,
+    w: BufferOffset,
+    u: BufferOffset,
+    qg: BufferOffset,
+    kq: BufferOffset,
+    kg: BufferOffset,
+    gl: BufferOffset,
+    s_in: BufferOffset,
+    o: &Buffer,
+    s_out: BufferOffset,
+    vn: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let splits = splits.clamp(1, d / 8);
+    if !cs.is_multiple_of(8) || !d.is_multiple_of(8) || cs == 0 || d == 0 {
+        return Err(MetalKernelError::LoadFunctionError(format!(
+            "gdn_chunk_scan: cs {cs} and d {d} must be multiples of 8"
+        )));
+    }
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_chunk_scan_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "gdn_chunk_scan h={h_v} nc={nc} cs={cs} d={d} splits={splits}"
+    );
+    set_params!(
+        encoder,
+        (
+            &w,
+            &u,
+            &qg,
+            &kq,
+            &kg,
+            &gl,
+            &s_in,
+            Output::new(o),
+            Output::with_offset(s_out.buffer, s_out.offset_in_bytes),
+            Output::new(vn),
+            nc as u32,
+            cs as u32,
+            d as u32,
+            splits as u32
+        )
+    );
+    dispatch_groups(encoder, h_v * splits, 128);
+    Ok(())
+}
+
 /// `gdn_chunk_epilogue_f32`: `o [h_v, padded, d]`, γ, `z [seq, h_v·d]` →
 /// `[seq, h_v·d]`.
 #[allow(clippy::too_many_arguments)]

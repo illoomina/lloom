@@ -10,7 +10,7 @@ use lloom::models::qwen4exp::{
 };
 use lloom::nn::{RecurrentState, RmsNorm};
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
-use lloom_tensor::{DType, Device, Tensor};
+use lloom_tensor::{DType, Device, Module, Tensor};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -388,4 +388,67 @@ fn moe_tile_by_weight_kind_at(n_experts: usize) {
         }
     }
     set_moe_mm_from(lloom_tensor::quantized::metal::DEFAULT_MOE_MM_FROM);
+}
+
+/// The DeltaNet prefill's stages at the real geometry (h_v 48, d 128, 8
+/// chunks of 64 = a 512-position tile), each on its own tensors: the
+/// tri-solve, the three chunk products, and the block's whole `prefill` —
+/// where the 17 ms a layer-tile go (the chunk scan replaced the host loop
+/// and moved nothing, P24).
+#[test]
+#[ignore]
+fn deltanet_prefill_stages() {
+    use lloom::models::qwen4exp::deltanet::unit_lower_inverse;
+    let dev = Device::new_metal(0).unwrap();
+    let (h_v, nc, cs, d) = (48usize, 8usize, 64usize, 128usize);
+    let steps = 20;
+    let r =
+        |shape: &[usize], seed: f32| Tensor::randn(seed * 0.0 + 0f32, 0.3, shape, &dev).unwrap();
+    let a = r(&[h_v, nc, cs, cs], 1.0);
+    let k = r(&[h_v, nc, cs, d], 2.0);
+    let kb = r(&[h_v, nc, cs, d], 3.0);
+    let t = r(&[h_v, nc, cs, cs], 4.0);
+    let vb = r(&[h_v, nc, cs, d], 5.0);
+    let decay = r(&[h_v, nc, cs, cs], 6.0);
+    let k_t = k.transpose(2, 3).unwrap();
+    let t_inv = time(&dev, steps, || {
+        let _ = unit_lower_inverse(&a).unwrap();
+    });
+    let t_kkt = time(&dev, steps, || {
+        let _ = kb.matmul(&k_t).unwrap().mul(&decay).unwrap();
+    });
+    let t_tv = time(&dev, steps, || {
+        let _ = t.matmul(&vb).unwrap();
+    });
+    let t_qkt = time(&dev, steps, || {
+        let _ = kb.matmul(&k_t).unwrap();
+    });
+    println!(
+        "DNSTAGES tri_solve={t_inv:.2}ms k_beta_kt_decay={t_kkt:.2}ms t_v={t_tv:.2}ms (x2) q_kt={t_qkt:.2}ms"
+    );
+    // The stems at 512 rows: the quantized GEMM (Q4_K, the checkpoint's
+    // stem kind) against an f16 weight through the quantized GEMM's f16
+    // arm (P23's route) and through the steel f16 gemm (activations cast).
+    let (rows, dd, out_dim) = (512usize, 2560usize, 10240usize);
+    let x = Tensor::randn(0f32, 0.3, (1, rows, dd), &dev).unwrap();
+    let wq = q4(out_dim, dd, &dev);
+    let w16 = f16w(out_dim, dd, &dev);
+    let wf = match &w16 {
+        QMatMul::TensorF16(t) => t.clone(),
+        _ => unreachable!(),
+    };
+    let t_q4 = time(&dev, steps, || {
+        let _ = wq.forward(&x).unwrap();
+    });
+    let t_f16mm = time(&dev, steps, || {
+        let _ = w16.forward(&x).unwrap();
+    });
+    let x16 = x.to_dtype(DType::F16).unwrap();
+    let wt = wf.broadcast_left(1).unwrap().t().unwrap();
+    let t_steel = time(&dev, steps, || {
+        let _ = x16.matmul(&wt).unwrap();
+    });
+    println!(
+        "DNSTEMS rows={rows} [{out_dim}x{dd}]: q4k_mm={t_q4:.2}ms f16w_quant_mm={t_f16mm:.2}ms steel_f16_gemm={t_steel:.2}ms"
+    );
 }

@@ -2610,3 +2610,146 @@ impl lloom_tensor::CustomOp3 for GdnGatedNormRows {
         ))
     }
 }
+
+/// The DeltaNet prefill's inter-chunk recurrence as one launch
+/// (`gdn_chunk_scan_f32`): inputs `w`, `u`, `q_g` `[h_v, nc, cs, d]` (the op's
+/// three), `kq [h_v, nc, cs, cs]`, `kg [h_v, nc, cs, d]`, `g_last [h_v, nc]`,
+/// `s_in [h_v, d, d]` (fields); output flat `[o (h_v·nc·cs·d) | s_out
+/// (h_v·d·d)]`. Metal only; the composed loop is the CPU's and the A/B arm
+/// (`QWEN4EXP_CHUNK_SCAN=0`).
+pub struct GdnChunkScan {
+    pub h_v: usize,
+    pub nc: usize,
+    pub cs: usize,
+    pub d: usize,
+    pub kq: Tensor,
+    pub kg: Tensor,
+    pub g_last: Tensor,
+    pub s_in: Tensor,
+}
+
+/// `QWEN4EXP_CHUNK_SCAN=0` (read once) keeps the host loop; `set_chunk_scan`
+/// for the tests.
+pub fn chunk_scan_on() -> bool {
+    use std::sync::atomic::Ordering;
+    match CHUNK_SCAN.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var("QWEN4EXP_CHUNK_SCAN").ok().as_deref() != Some("0");
+            CHUNK_SCAN.store(on as u8, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Threadgroups a head's scan is split over (column slices of `S`): 48
+/// heads alone leave most of a 32-core GPU idle; 4 slices of 32 columns.
+pub const CHUNK_SCAN_SPLITS: usize = 4;
+
+pub fn set_chunk_scan(on: bool) {
+    CHUNK_SCAN.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+static CHUNK_SCAN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+impl lloom_tensor::CustomOp3 for GdnChunkScan {
+    fn name(&self) -> &'static str {
+        "qwen4exp-gdn-chunk-scan"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("gdn_chunk_scan: no cpu kernel; `prefill_fused` loops the chunks there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (h_v, nc, cs, d) = (self.h_v, self.nc, self.cs, self.d);
+        let n = h_v * nc * cs * d;
+        for (l, want, name) in [(l1, n, "w"), (l2, n, "u"), (l3, n, "q_g")] {
+            if l.shape().elem_count() != want || !l.is_contiguous() {
+                lloom_tensor::bail!("gdn_chunk_scan: {name} {:?} vs {want}", l.shape())
+            }
+        }
+        let (kqs, kql) = self.kq.storage_and_layout();
+        let (kgs, kgl) = self.kg.storage_and_layout();
+        let (gls, gll) = self.g_last.storage_and_layout();
+        let (sis, sil) = self.s_in.storage_and_layout();
+        let (kqm, kgm, glm, sim) = match (&*kqs, &*kgs, &*gls, &*sis) {
+            (
+                lloom_tensor::Storage::Metal(a),
+                lloom_tensor::Storage::Metal(b),
+                lloom_tensor::Storage::Metal(c),
+                lloom_tensor::Storage::Metal(e),
+            ) => (a, b, c, e),
+            _ => lloom_tensor::bail!("gdn_chunk_scan: every operand must be on the metal device"),
+        };
+        if kql.shape().elem_count() != h_v * nc * cs * cs
+            || kgl.shape().elem_count() != n
+            || gll.shape().elem_count() != h_v * nc
+            || sil.shape().elem_count() != h_v * d * d
+            || !kql.is_contiguous()
+            || !kgl.is_contiguous()
+            || !gll.is_contiguous()
+            || !sil.is_contiguous()
+        {
+            lloom_tensor::bail!("gdn_chunk_scan: field operands vs h_v {h_v} nc {nc} cs {cs} d {d}")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("gdn_chunk_scan");
+        let out_count = n + h_v * d * d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(out_count, lloom_tensor::DType::F32)
+            .with_label("gdn_chunk_scan")
+            .build()?;
+        let vn = device
+            .new_buffer_builder()
+            .with_size_for(h_v * cs * d, lloom_tensor::DType::F32)
+            .with_label("gdn_chunk_scan_vn")
+            .build()?;
+        // `s_out` is the tail of the output: one buffer, two regions.
+        let s_out_bo = lloom_tensor::kernels::BufferOffset {
+            buffer: &output,
+            offset_in_bytes: n * 4,
+        };
+        lloom_tensor::kernels::call_gdn_chunk_scan_at(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            (h_v, nc, cs, d),
+            CHUNK_SCAN_SPLITS,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            metal_bo(kqm, &kql),
+            metal_bo(kgm, &kgl),
+            metal_bo(glm, &gll),
+            metal_bo(sim, &sil),
+            &output,
+            s_out_bo,
+            &vn,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), out_count, s1.dtype()),
+            Shape::from(out_count),
+        ))
+    }
+}

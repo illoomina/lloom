@@ -400,7 +400,15 @@ pub fn session_reserve_bytes(
     rows.max(1) * kv_tokens * kv_bytes_per_token(cfg)
         + 2 * tile * super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
         + POOL_FREE_RESERVE_BYTES
+        + PASS_RETENTION_BYTES
 }
+
+/// What the device holds after a prefill tile beyond the KV and the free
+/// list — the pool's `pending` at the tile's end and the buckets it keeps:
+/// measured +1.0–1.1 GB over the load after one 512-tile (P18/P21). Without
+/// it the `io` arm (no staging ring in its reserve) was refused its second
+/// tile by 0.07 GB (`p21-io-cold.txt`).
+pub const PASS_RETENTION_BYTES: usize = 1 << 30;
 
 /// The staging ring's cap on the `pread` arm: `staging::DEFAULT_CAP_BYTES`
 /// (1 GiB), or [`PREFETCH_RING_BYTES`] with a prefetcher — its reader
@@ -1196,6 +1204,7 @@ mod tests {
             4096 * per
                 + 2 * 512 * super::super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
                 + POOL_FREE_RESERVE_BYTES
+                + PASS_RETENTION_BYTES
         );
         // A zero tile reserves one PREFILL_CHUNK's worth.
         assert_eq!(session_reserve_bytes(&cfg, 1, 4096, 0), r1);

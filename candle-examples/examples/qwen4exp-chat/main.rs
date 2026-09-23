@@ -27,8 +27,11 @@ use clap::Parser;
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::loader::{LoadOptions, SlotBudget, StreamLoader, StreamOptions};
 use lloom::models::qwen4exp::model::PrefillMode;
-use lloom::models::qwen4exp::{Cache, ExpertResidency, MtpDrafter, Qwen4Exp, Resident, Streamed};
+use lloom::models::qwen4exp::{
+    Cache, ExpertResidency, MemCheck, MtpDrafter, Qwen4Exp, Resident, Streamed,
+};
 use lloom::nn::expert_stream::HasStreamStats;
+use lloom::nn::memory::{MemGauge, MemReport, MemSnapshot};
 use lloom::nn::model::CausalLM;
 use lloom::nn::observer::{ForwardObserver, HookPoint};
 
@@ -213,6 +216,32 @@ struct Args {
     #[arg(long)]
     state_digest: bool,
 
+    /// The prompt's tile: every prefill forward is at most this many
+    /// positions, each admitted (`prepare_pass`) and paced at depth 2 so a
+    /// long prompt's activations are never all pending at once (DESIGN.md
+    /// §9.5m, the per-request guard). 0 = the whole prompt in one forward
+    /// (the model still chunks at 512 inside it, unpaced).
+    #[arg(long, default_value_t = 512)]
+    prefill_tile: usize,
+
+    /// KV positions per row `--slots auto` reserves beside the slot pool
+    /// (with two prefill tiles' transients and the pool's free list): the
+    /// session's share of the budget, so a pass fits by construction.
+    #[arg(long, default_value_t = 4096)]
+    kv_reserve_tokens: usize,
+
+    /// The memory gauge on the `MEM` lines: a 10 ms sampler holding the
+    /// peaks over each phase (device allocated, pool pending, footprint).
+    #[arg(long)]
+    mem_sample: bool,
+
+    /// What a pass the memory budget cannot take does: `report` (a
+    /// `MEMCHECK` line on stderr, the arm the transient term is measured
+    /// under), `refuse` (stop before anything is written), `off`. Default:
+    /// `QWEN4EXP_MEM`, else `refuse`.
+    #[arg(long)]
+    mem_check: Option<String>,
+
     /// Feed the prompt in segments ending at these positions (comma list, e.g.
     /// `512,2048`) and, with `--state-digest`, print a `STATE ... phase=at<N>`
     /// checksum after each — a bisection aid locating WHERE in the prompt two
@@ -256,6 +285,83 @@ impl Probe {
         self.first_nonfinite = None;
         self.max_abs = 0.0;
     }
+}
+
+/// One `MEM` line: the reading now (and the phase's peaks when a gauge ran).
+fn mem_line(run: usize, phase: &str, device: &Device, report: Option<MemReport>) {
+    let gb = |b: u64| b as f64 / 1e9;
+    let now = MemSnapshot::read(device);
+    let mut line = format!(
+        "MEM run={run} phase={phase} device_gb={:.2} pool_live_gb={:.2} pool_free_gb={:.2} pool_pending_gb={:.2} phys_gb={:.2} working_set_gb={:.2}",
+        gb(now.device_allocated),
+        gb(now.pool_live),
+        gb(now.pool_free),
+        gb(now.pool_pending),
+        gb(now.phys_footprint),
+        gb(now.working_set),
+    );
+    if let Some(r) = report {
+        if let Some(p) = r.peak {
+            line.push_str(&format!(
+                " peak_device_gb={:.2} peak_pending_gb={:.2} peak_phys_gb={:.2} samples={}",
+                gb(p.device_allocated),
+                gb(p.pool_pending),
+                gb(p.phys_footprint),
+                r.samples
+            ));
+        }
+    }
+    println!("{line}");
+}
+
+fn mem_check_arm(args: &Args) -> Result<MemCheck> {
+    Ok(match args.mem_check.as_deref() {
+        None => MemCheck::from_env(),
+        Some("off") => MemCheck::Off,
+        Some("report") => MemCheck::Report,
+        Some("refuse") => MemCheck::Refuse,
+        Some(other) => anyhow::bail!("--mem-check {other}: off | report | refuse"),
+    })
+}
+
+/// `ids` through `forward` in tiles of `tile` positions (0 = one forward),
+/// each prepared (`prepare_pass`: the KV grow and the pass admitted before
+/// it runs) and paced at depth 2 on Metal — the drivers' `StepPacer` shape,
+/// here for the harness's own prompt loop. Returns the last position's
+/// logits.
+fn prefill_tiled<R: ExpertResidency>(
+    model: &Qwen4Exp<R>,
+    cache: &mut Cache,
+    ids: &[u32],
+    tile: usize,
+    device: &Device,
+) -> Result<Tensor> {
+    #[cfg(feature = "metal")]
+    let mut markers: std::collections::VecDeque<candle::metal_backend::CommandMarker> =
+        std::collections::VecDeque::new();
+    let mut logits = None;
+    let mut off = 0usize;
+    while off < ids.len() {
+        let left = ids.len() - off;
+        let w = if tile == 0 { left } else { left.min(tile) };
+        let seg = &ids[off..off + w];
+        let input = Tensor::from_vec(seg.to_vec(), (1, w), device)?;
+        model.prepare_pass(cache, w)?;
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = device {
+            while markers.len() >= 2 {
+                let oldest = markers.pop_front().expect("len >= 2");
+                m.wait_marker(&oldest)?;
+            }
+        }
+        logits = Some(model.forward(&input, cache.pos, cache)?);
+        #[cfg(feature = "metal")]
+        if let Device::Metal(m) = device {
+            markers.push_back(m.flush_marker()?);
+        }
+        off += w;
+    }
+    Ok(logits.expect("a non-empty prompt"))
 }
 
 fn stats(t: &Tensor) -> Result<(usize, usize, f32, f32)> {
@@ -398,7 +504,9 @@ fn main() -> Result<()> {
         moe_act,
         ple_cache_rows: (args.ple_cache_rows > 0).then_some(args.ple_cache_rows),
         mtp: args.mtp.is_some(),
+        memory_fraction: Some(args.memory_fraction),
     };
+    let mem_check = mem_check_arm(&args)?;
     let prefill_mode = match args.prefill.as_str() {
         "chunk" => PrefillMode::Chunk,
         "replay" => PrefillMode::Replay,
@@ -430,6 +538,8 @@ fn main() -> Result<()> {
             let mut model: Qwen4Exp<Resident> =
                 Qwen4Exp::from_gguf_shards(&shards, &device, &opts)?;
             model.set_prefill_mode(prefill_mode);
+            model.set_memory_fraction(args.memory_fraction);
+            model.set_mem_check(mem_check);
             if args.rows > 1 || args.batched_driver {
                 rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
             } else {
@@ -449,6 +559,9 @@ fn main() -> Result<()> {
             let slots = match args.slots.as_str() {
                 "auto" => SlotBudget::Auto {
                     fraction: args.memory_fraction,
+                    rows: args.rows.max(1),
+                    kv_tokens: args.kv_reserve_tokens,
+                    prefill_tile: args.prefill_tile,
                 },
                 n => SlotBudget::Fixed(n.parse().context("--slots: a count or `auto`")?),
             };
@@ -456,6 +569,8 @@ fn main() -> Result<()> {
             let mut model: Qwen4Exp<Streamed> =
                 Qwen4Exp::from_gguf_streamed(&shards, &device, &opts, &stream)?;
             model.set_prefill_mode(prefill_mode);
+            model.set_memory_fraction(args.memory_fraction);
+            model.set_mem_check(mem_check);
             if let Some(path) = &args.hotlist {
                 if path.exists() {
                     let tw = std::time::Instant::now();
@@ -536,9 +651,13 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
             .collect::<Result<_>>()?;
         let prompts: Vec<&[u32]> = (0..args.rows).map(|_| prompt_ids).collect();
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
-        let opts = DecodeOptions::new(args.max_tokens);
+        let opts = DecodeOptions {
+            prefill_tile: args.prefill_tile,
+            ..DecodeOptions::new(args.max_tokens)
+        };
         #[cfg(feature = "metal")]
         candle::kernels::metal::profile::reset();
+        let gauge = MemGauge::start(device, args.mem_sample);
         let t = std::time::Instant::now();
         let outs = Session::decode_batched(
             &mut sessions,
@@ -550,10 +669,12 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
             &mut |_row, _toks| Ok(()),
         )?;
         let wall = t.elapsed();
+        let mem = gauge.finish(device);
         let generated: usize = outs.iter().map(|o| o.ids.len()).sum();
         // The whole run: the rows' prefills and the batched steps (per
         // token = per generated token over all rows).
         profile_line(run, "rows", generated, wall.as_secs_f64() * 1e3);
+        mem_line(run, "rows", device, Some(mem));
         let digests: Vec<String> = outs
             .iter()
             .map(|o| {
@@ -608,6 +729,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         args.slots,
         args.loader,
     );
+    mem_line(0, "loaded", device, None);
 
     if args.rollback_probe > 0 {
         rollback_probe(
@@ -662,10 +784,16 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         splits.sort_unstable();
         splits.dedup();
         splits.push(prompt_ids.len());
+        let gauge = MemGauge::start(device, args.mem_sample);
         for end in splits {
             let seg = &prompt_ids[fed..end];
-            let input = Tensor::from_vec(seg.to_vec(), (1, seg.len()), device)?;
-            logits = Some(model.forward(&input, cache.pos, &mut cache)?); // [1, vocab]
+            logits = Some(prefill_tiled(
+                model,
+                &mut cache,
+                seg,
+                args.prefill_tile,
+                device,
+            )?); // [1, vocab]
             fed = end;
             if args.state_digest && end < prompt_ids.len() {
                 for (name, sum, nonfinite) in cache.checksums()? {
@@ -678,6 +806,8 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         let mut logits = logits.expect("a non-empty prompt");
         let prefill_ms = t1.elapsed().as_millis();
         profile_line(run, "prefill", prompt_ids.len(), prefill_ms as f64);
+        mem_line(run, "prefill", device, Some(gauge.finish(device)));
+        let gauge = MemGauge::start(device, args.mem_sample);
         if args.state_digest {
             for (name, sum, nonfinite) in cache.checksums()? {
                 println!("STATE run={run} phase=prompt {name}={sum:016x} nonfinite={nonfinite}");
@@ -750,6 +880,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         }
         let decode_ms = t1.elapsed().as_millis() - prefill_ms;
         profile_line(run, "decode", generated.len(), decode_ms as f64);
+        mem_line(run, "decode", device, Some(gauge.finish(device)));
         let logits_digest = sha256::hex(&lh.finalize());
         let mut h = sha256::Sha256::new();
         for t in &generated {
@@ -829,9 +960,13 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 .with_k(args.mtp_k);
         let mut rb = Blocking::new(eos_ids, device)?;
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
-        let opts = DecodeOptions::new(args.max_tokens);
+        let opts = DecodeOptions {
+            prefill_tile: args.prefill_tile,
+            ..DecodeOptions::new(args.max_tokens)
+        };
         #[cfg(feature = "metal")]
         candle::kernels::metal::profile::reset();
+        let gauge = MemGauge::start(device, args.mem_sample);
         let t2 = std::time::Instant::now();
         let out = session.decode_speculative(
             &mut drafter,
@@ -844,6 +979,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         )?;
         let mtp_ms = t2.elapsed().as_millis();
         profile_line(0, "mtp", out.ids.len(), mtp_ms as f64);
+        mem_line(0, "mtp", device, Some(gauge.finish(device)));
         let mut h = sha256::Sha256::new();
         for t in &out.ids {
             h.update(&t.to_le_bytes());

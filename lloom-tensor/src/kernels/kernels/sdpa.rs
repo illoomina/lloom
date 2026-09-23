@@ -656,6 +656,224 @@ pub fn call_sdpa_vector_with(
     Ok(())
 }
 
+/// `sdpa_vector_paged`: [`call_sdpa_vector`] for `rows` sequences in ONE
+/// dispatch over a shared page pool — `q [rows · nh, D]`, `k` / `v` one
+/// layer's pool `[n_kv_heads, tokens, D]` (`k_stride` / `v_stride` the head
+/// stride in elements), `table` (`u32`, `rows × table_stride`: entry `r ·
+/// table_stride + p` is row `r`'s page `p`) and `n_keys` (`i32 [rows]`, the
+/// live count per row). Row `r`'s `nh` heads are threadgroups `r · nh ..`;
+/// its key `i` is pool token `table[r][i / page_size] · page_size + i %
+/// page_size`. Per row the arithmetic is `sdpa_vector`'s over that row's keys
+/// laid contiguously, bit for bit.
+#[allow(clippy::too_many_arguments)]
+pub fn call_sdpa_vector_paged(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    nh: usize,
+    gqa_factor: usize,
+    head_dim: usize,
+    q_offset: usize,
+    q_buffer: &Buffer,
+    k_offset: usize,
+    k_buffer: &Buffer,
+    k_stride: usize,
+    v_offset: usize,
+    v_buffer: &Buffer,
+    v_stride: usize,
+    table: &Buffer,
+    table_offset: usize,
+    table_stride: usize,
+    n_keys: &Buffer,
+    n_keys_offset: usize,
+    page_size: usize,
+    output: &Buffer,
+    alpha: f32,
+    itype: SdpaDType,
+    // The 2-pass arm (every row at `≥ TWO_PASS_K_THRESHOLD` keys, the
+    // per-row `ops::sdpa`'s choice there): the pass-1 scratch
+    // `(partials [rows·nh, 32, D] f32, sums [rows·nh, 32], maxs [rows·nh,
+    // 32])`, then `sdpa_vector_2pass_2` as the contiguous kernel runs it.
+    two_pass: Option<(&Buffer, &Buffer, &Buffer)>,
+) -> Result<(), MetalKernelError> {
+    if let Some((partials, sums, maxs)) = two_pass {
+        let name = match (head_dim, itype) {
+            (32, SdpaDType::F16) => "sdpa_vector_2pass_1_paged_float16_t_32",
+            (64, SdpaDType::F16) => "sdpa_vector_2pass_1_paged_float16_t_64",
+            (96, SdpaDType::F16) => "sdpa_vector_2pass_1_paged_float16_t_96",
+            (128, SdpaDType::F16) => "sdpa_vector_2pass_1_paged_float16_t_128",
+            (256, SdpaDType::F16) => "sdpa_vector_2pass_1_paged_float16_t_256",
+            (512, SdpaDType::F16) => "sdpa_vector_2pass_1_paged_float16_t_512",
+            (32, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_32",
+            (64, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_64",
+            (96, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_96",
+            (128, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_128",
+            (256, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_256",
+            (512, SdpaDType::F32) => "sdpa_vector_2pass_1_paged_float_512",
+            (other, _) => {
+                return Err(MetalKernelError::SdpaHeadSizeMismatch {
+                    variation: "vector_2pass_1_paged",
+                    got: other,
+                    expected: vec![32, 64, 96, 128, 256, 512],
+                })
+            }
+        };
+        let name2 = match (head_dim, itype) {
+            (32, SdpaDType::F16) => "sdpa_vector_2pass_2_float16_t_32",
+            (64, SdpaDType::F16) => "sdpa_vector_2pass_2_float16_t_64",
+            (96, SdpaDType::F16) => "sdpa_vector_2pass_2_float16_t_96",
+            (128, SdpaDType::F16) => "sdpa_vector_2pass_2_float16_t_128",
+            (256, SdpaDType::F16) => "sdpa_vector_2pass_2_float16_t_256",
+            (512, SdpaDType::F16) => "sdpa_vector_2pass_2_float16_t_512",
+            (32, SdpaDType::F32) => "sdpa_vector_2pass_2_float_32",
+            (64, SdpaDType::F32) => "sdpa_vector_2pass_2_float_64",
+            (96, SdpaDType::F32) => "sdpa_vector_2pass_2_float_96",
+            (128, SdpaDType::F32) => "sdpa_vector_2pass_2_float_128",
+            (256, SdpaDType::F32) => "sdpa_vector_2pass_2_float_256",
+            (512, SdpaDType::F32) => "sdpa_vector_2pass_2_float_512",
+            _ => unreachable!("the pass-1 match above covers the head sizes"),
+        };
+        if rows == 0 || nh == 0 || gqa_factor == 0 || page_size == 0 || table_stride == 0 {
+            return Err(MetalKernelError::LoadFunctionError(format!(
+                "sdpa_vector_paged: rows {rows} nh {nh} gqa {gqa_factor} page {page_size} stride {table_stride}"
+            )));
+        }
+        {
+            let pipeline = kernels.load_pipeline(device, Source::Sdpa, name)?;
+            let encoder = ep.encoder();
+            let encoder: &ComputeCommandEncoder = encoder.as_ref();
+            encoder.set_compute_pipeline_state(&pipeline);
+            debug_group!(
+                encoder,
+                "sdpa_vector_2pass_1_paged bk={head_dim} rows={rows} nh={nh}"
+            );
+            set_params!(
+                encoder,
+                (
+                    (q_buffer, q_offset),
+                    (k_buffer, k_offset),
+                    (v_buffer, v_offset),
+                    Output::new(partials),
+                    Output::new(sums),
+                    Output::new(maxs),
+                    (table, table_offset),
+                    (n_keys, n_keys_offset),
+                    gqa_factor as i32,
+                    nh as i32,
+                    table_stride as i32,
+                    page_size as i32,
+                    k_stride,
+                    v_stride,
+                    alpha,
+                    1.0f32
+                )
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: 1,
+                    height: rows * nh,
+                    depth: SDPA_2PASS_BLOCKS,
+                },
+                MTLSize {
+                    width: 8 * 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        {
+            let pipeline = kernels.load_pipeline(device, Source::Sdpa, name2)?;
+            let encoder = ep.encoder();
+            let encoder: &ComputeCommandEncoder = encoder.as_ref();
+            encoder.set_compute_pipeline_state(&pipeline);
+            debug_group!(
+                encoder,
+                "sdpa_vector_2pass_2 (paged rows) bk={head_dim} rows={rows}"
+            );
+            set_params!(encoder, (partials, sums, maxs, Output::new(output)));
+            encoder.dispatch_thread_groups(
+                MTLSize {
+                    width: 1,
+                    height: rows * nh,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        return Ok(());
+    }
+    let name = match (head_dim, itype) {
+        (32, SdpaDType::F16) => "sdpa_vector_paged_float16_t_32",
+        (64, SdpaDType::F16) => "sdpa_vector_paged_float16_t_64",
+        (96, SdpaDType::F16) => "sdpa_vector_paged_float16_t_96",
+        (128, SdpaDType::F16) => "sdpa_vector_paged_float16_t_128",
+        (256, SdpaDType::F16) => "sdpa_vector_paged_float16_t_256",
+        (512, SdpaDType::F16) => "sdpa_vector_paged_float16_t_512",
+        (32, SdpaDType::F32) => "sdpa_vector_paged_float_32",
+        (64, SdpaDType::F32) => "sdpa_vector_paged_float_64",
+        (96, SdpaDType::F32) => "sdpa_vector_paged_float_96",
+        (128, SdpaDType::F32) => "sdpa_vector_paged_float_128",
+        (256, SdpaDType::F32) => "sdpa_vector_paged_float_256",
+        (512, SdpaDType::F32) => "sdpa_vector_paged_float_512",
+        (other, _) => {
+            return Err(MetalKernelError::SdpaHeadSizeMismatch {
+                variation: "vector_paged",
+                got: other,
+                expected: vec![32, 64, 96, 128, 256, 512],
+            })
+        }
+    };
+    if rows == 0 || nh == 0 || gqa_factor == 0 || page_size == 0 || table_stride == 0 {
+        return Err(MetalKernelError::LoadFunctionError(format!(
+            "sdpa_vector_paged: rows {rows} nh {nh} gqa {gqa_factor} page {page_size} stride {table_stride}"
+        )));
+    }
+    let pipeline = kernels.load_pipeline(device, Source::Sdpa, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "sdpa_vector_paged bk={head_dim} rows={rows} nh={nh}"
+    );
+    set_params!(
+        encoder,
+        (
+            (q_buffer, q_offset),
+            (k_buffer, k_offset),
+            (v_buffer, v_offset),
+            Output::new(output),
+            (table, table_offset),
+            (n_keys, n_keys_offset),
+            gqa_factor as i32,
+            nh as i32,
+            table_stride as i32,
+            page_size as i32,
+            k_stride,
+            v_stride,
+            alpha,
+            1.0f32
+        )
+    );
+    let grid_dims = MTLSize {
+        width: 1,
+        height: rows * nh,
+        depth: 1,
+    };
+    let group_dims = MTLSize {
+        width: 1024,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(grid_dims, group_dims);
+    Ok(())
+}
+
 /// The bit width a quantized KV plane stores its codes at (issue #218).
 ///
 /// Two arms rather than a `bits: usize`, so an unsupported width is a compile

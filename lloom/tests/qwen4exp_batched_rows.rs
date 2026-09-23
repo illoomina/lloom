@@ -132,8 +132,23 @@ fn check_rows(
     dev: &Device,
     tol: f32,
 ) -> Result<()> {
-    check_rows_on(tag, model, cfg, dev, tol, false)?;
-    check_rows_on(&format!("{tag} pooled"), model, cfg, dev, tol, true)
+    check_rows_on(tag, model, cfg, dev, tol, false, 6)?;
+    check_rows_on(&format!("{tag} pooled"), model, cfg, dev, tol, true, 6)?;
+    // Past the indexer's dense range (`Config::tiny`: 19 cells) the pooled
+    // rows leave the one-launch arm for the per-row selection through
+    // their page tables, row by row as each crosses it.
+    let limit = cfg.indexer_budget + cfg.indexer_compress_ratio - 1;
+    let longest = prompts().iter().map(|p| p.len()).max().unwrap_or(0);
+    let steps = limit + 4 - longest.min(limit);
+    check_rows_on(
+        &format!("{tag} pooled long"),
+        model,
+        cfg,
+        dev,
+        tol,
+        true,
+        steps,
+    )
 }
 
 fn check_rows_on(
@@ -143,15 +158,19 @@ fn check_rows_on(
     dev: &Device,
     tol: f32,
     pooled: bool,
+    steps: usize,
 ) -> Result<()> {
     let prompts = prompts();
-    let steps = 6;
     let (ids_b, logits_b, caches) = batched_on(model, cfg, dev, &prompts, steps, pooled)?;
     if pooled {
         for (r, c) in caches.iter().enumerate() {
             assert!(
                 c.s_state.is_pooled() && c.conv_state.is_pooled(),
                 "{tag}: row {r} not pooled"
+            );
+            assert!(
+                c.kv.iter().all(|k| k.is_pooled()),
+                "{tag}: row {r}'s KV not pooled"
             );
         }
     }

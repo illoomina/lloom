@@ -165,6 +165,7 @@ impl Engine<Resident> {
             moe_act,
             ple_cache_rows: (opts.ple_cache_rows > 0).then_some(opts.ple_cache_rows),
             mtp: opts.mtp.is_some(),
+            memory_fraction: Some(opts.memory_fraction),
         };
         let t = Instant::now();
         match opts.experts.as_str() {
@@ -173,6 +174,7 @@ impl Engine<Resident> {
                     Qwen4Exp::from_gguf_shards(&shards, &device, &mload)
                         .context("loading Qwen4-exp (resident experts)")?;
                 model.set_prefill_mode(PrefillMode::Chunk);
+                model.set_memory_fraction(opts.memory_fraction);
                 let tier = json!({ "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()) });
                 Engine::<Resident>::finish(model, device, opts, tier)
             }
@@ -180,6 +182,9 @@ impl Engine<Resident> {
                 let slots = match opts.slots.as_str() {
                     "auto" => SlotBudget::Auto {
                         fraction: opts.memory_fraction,
+                        rows: opts.batch.max(1),
+                        kv_tokens: opts.kv_capacity.max(1),
+                        prefill_tile: opts.prefill_tile,
                     },
                     n => SlotBudget::Fixed(n.parse().context("--slots: a count or `auto`")?),
                 };
@@ -193,6 +198,7 @@ impl Engine<Resident> {
                     Qwen4Exp::from_gguf_streamed(&shards, &device, &mload, &stream)
                         .context("loading Qwen4-exp (streamed experts)")?;
                 model.set_prefill_mode(PrefillMode::Chunk);
+                model.set_memory_fraction(opts.memory_fraction);
                 let mut warmed = json!(null);
                 if let Some(path) = &opts.hotlist {
                     if path.exists() {

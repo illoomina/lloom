@@ -43,13 +43,84 @@ use lloom_tensor::{DType, Module, Result, Tensor, D};
 /// per token (§3.3). The paged/pooled KV is the perf path, deferred with caching.
 #[derive(Debug, Clone)]
 pub struct KvCache {
-    /// `[n_kv_heads, seq, head_dim]` for k and v, the sequence on dim 1.
-    inner: crate::nn::kv_cache::KvCache,
+    /// The k / v tokens: this row's own slab, or a slot of a batch's page
+    /// pool (`KvPool`, §12.2).
+    kv: KvBacking,
     /// The indexer's raw keys `[1, seq, idx_dim]`, one per token.
     raw_keys: crate::nn::kv_cache::Cache,
     /// The indexer's compressed keys `[1, n_blocks, idx_dim]`, one per
     /// COMPLETE block, normed and roped — the persistent incremental cache.
     blocks: crate::nn::kv_cache::Cache,
+}
+
+/// Where a [`KvCache`]'s k / v live.
+#[derive(Debug)]
+enum KvBacking {
+    /// `[n_kv_heads, seq, head_dim]` for k and v, the sequence on dim 1, in a
+    /// preallocated slab written in place (grown by a slab when full).
+    Slab(crate::nn::kv_cache::KvCache),
+    /// Slot `slot` of one layer of a [`KvPool`]: the tokens in the pool's
+    /// pages, the row's table on the host (and on the device, for a gather).
+    Pooled {
+        pool: KvPool,
+        slot: usize,
+        layer: usize,
+        /// The row's page table as last uploaded, and the page count it was
+        /// uploaded at (`None` until a gather needs it).
+        table_t: Option<(Tensor, usize)>,
+        /// The slot's lease, shared by the row's layers; the slot returns to
+        /// the pool when the last of them drops.
+        lease: std::sync::Arc<SlotLease>,
+    },
+}
+
+/// A row's lease on a [`KvPool`] slot.
+#[derive(Debug)]
+pub struct SlotLease {
+    pool: KvPool,
+    slot: usize,
+}
+
+impl SlotLease {
+    pub fn slot(&self) -> usize {
+        self.slot
+    }
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        self.pool.release(self.slot);
+    }
+}
+
+impl Clone for KvBacking {
+    /// A pooled row clones into its OWN SLAB (the same tokens, unpooled): a
+    /// clone is a probe's or a snapshot's, never a batch row's.
+    fn clone(&self) -> Self {
+        match self {
+            KvBacking::Slab(s) => KvBacking::Slab(s.clone()),
+            KvBacking::Pooled {
+                pool, slot, layer, ..
+            } => {
+                let mut slab = crate::nn::kv_cache::KvCache::new(1, KV_SLAB_TOKENS);
+                if let Ok(Some((k, v))) = pool.live(*layer, *slot) {
+                    let _ = slab.append(&k, &v);
+                }
+                KvBacking::Slab(slab)
+            }
+        }
+    }
+}
+
+impl Drop for KvBacking {
+    fn drop(&mut self) {
+        if let KvBacking::Pooled {
+            pool, slot, layer, ..
+        } = self
+        {
+            pool.clear(*layer, *slot);
+        }
+    }
 }
 
 impl Default for KvCache {
@@ -61,22 +132,97 @@ impl Default for KvCache {
 /// Tokens a KV slab holds before it grows by another slab.
 pub const KV_SLAB_TOKENS: usize = 1024;
 
+/// KV tokens per page of a [`KvPool`] (LFM2's `flash_page_size`).
+pub const KV_PAGE_TOKENS: usize = 256;
+
 impl KvCache {
     pub fn with_capacity(tokens: usize) -> Self {
         let tokens = tokens.max(1);
         Self {
-            inner: crate::nn::kv_cache::KvCache::new(1, tokens),
+            kv: KvBacking::Slab(crate::nn::kv_cache::KvCache::new(1, tokens)),
             raw_keys: crate::nn::kv_cache::Cache::new(1, tokens),
             blocks: crate::nn::kv_cache::Cache::new(1, tokens.div_ceil(4).max(1)),
         }
     }
+    /// A cache whose k / v are slot `slot` of layer `layer` of `pool`
+    /// (`Cache::in_pools`); the indexer's caches stay the row's own.
+    pub fn in_pool(pool: &KvPool, lease: &std::sync::Arc<SlotLease>, layer: usize) -> Self {
+        Self {
+            kv: KvBacking::Pooled {
+                pool: pool.clone(),
+                slot: lease.slot,
+                layer,
+                table_t: None,
+                lease: lease.clone(),
+            },
+            raw_keys: crate::nn::kv_cache::Cache::new(1, KV_SLAB_TOKENS),
+            blocks: crate::nn::kv_cache::Cache::new(1, KV_SLAB_TOKENS / 4),
+        }
+    }
+    /// The pool, slot and layer of a pooled cache.
+    pub fn pool_slot(&self) -> Option<(&KvPool, usize, usize)> {
+        match &self.kv {
+            KvBacking::Pooled {
+                pool, lease, layer, ..
+            } => Some((pool, lease.slot(), *layer)),
+            KvBacking::Slab(_) => None,
+        }
+    }
+    pub fn is_pooled(&self) -> bool {
+        matches!(self.kv, KvBacking::Pooled { .. })
+    }
     pub fn reset(&mut self) {
-        self.inner.reset();
+        match &mut self.kv {
+            KvBacking::Slab(s) => s.reset(),
+            KvBacking::Pooled {
+                pool,
+                slot,
+                layer,
+                table_t,
+                ..
+            } => {
+                pool.clear(*layer, *slot);
+                *table_t = None;
+            }
+        }
         self.raw_keys.reset();
         self.blocks.reset();
     }
+    /// Bytes appending `n` tokens would allocate for this row's k / v
+    /// (`[nkv, tokens, hd]` each, `elem` bytes an element): a slab widened by
+    /// `KV_SLAB_TOKENS` steps (the widening is a `cat`, so the old slab is
+    /// live beside the new one at the instant — counted), or the pool's
+    /// next page slab when its free list runs out. 0 when nothing grows.
+    /// Sized, not performed (`Qwen4Exp::plan_pass`).
+    pub fn grow_bytes_for(&self, n: usize, nkv: usize, hd: usize, elem: usize) -> usize {
+        let per_token = 2 * nkv * hd * elem;
+        match &self.kv {
+            KvBacking::Slab(s) => {
+                let (len, cap) = (s.current_seq_len(), s.k_cache().max_seq_len());
+                if len + n <= cap {
+                    // A first append allocates the slab itself.
+                    return if len == 0 && s.k_cache().all_data().is_none() {
+                        cap * per_token
+                    } else {
+                        0
+                    };
+                }
+                let steps = (len + n - cap).div_ceil(KV_SLAB_TOKENS);
+                (cap + steps * KV_SLAB_TOKENS) * per_token + cap * per_token
+            }
+            KvBacking::Pooled {
+                pool, slot, layer, ..
+            } => pool.grow_bytes_for(*layer, *slot, n, per_token),
+        }
+    }
+
     pub fn len(&self) -> usize {
-        self.inner.current_seq_len()
+        match &self.kv {
+            KvBacking::Slab(s) => s.current_seq_len(),
+            KvBacking::Pooled {
+                pool, slot, layer, ..
+            } => pool.len(*layer, *slot),
+        }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -92,38 +238,447 @@ impl KvCache {
     /// Keep the first `tokens` positions (k, v, raw indexer keys) and the
     /// first `blocks` compressed keys — a rejected speculative tail.
     pub fn truncate(&mut self, tokens: usize, blocks: usize) {
-        self.inner.truncate(tokens);
+        match &mut self.kv {
+            KvBacking::Slab(s) => s.truncate(tokens),
+            KvBacking::Pooled {
+                pool, slot, layer, ..
+            } => pool.truncate(*layer, *slot, tokens),
+        }
         self.raw_keys.truncate(tokens);
         self.blocks.truncate(blocks);
     }
     /// The live `(k, v, raw indexer keys, compressed keys)` views, for a
     /// state probe (`None` where nothing was written).
     pub fn state_views(&self) -> Result<[Option<Tensor>; 4]> {
+        let (k, v) = match &self.kv {
+            KvBacking::Slab(s) => (s.k()?, s.v()?),
+            KvBacking::Pooled {
+                pool, slot, layer, ..
+            } => match pool.live(*layer, *slot)? {
+                Some((k, v)) => (Some(k), Some(v)),
+                None => (None, None),
+            },
+        };
         Ok([
-            self.inner.k()?,
-            self.inner.v()?,
+            k,
+            v,
             self.raw_keys.current_data()?,
             self.blocks.current_data()?,
         ])
     }
     /// Append `k`, `v` `[n_kv_heads, n, head_dim]`; returns views of the whole
-    /// cache `[n_kv_heads, len, head_dim]`.
+    /// cache `[n_kv_heads, len, head_dim]` (a pooled row's: gathered from its
+    /// pages — the per-row paths; the pooled rows arm appends without them,
+    /// [`Self::append_pooled`]).
     fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        self.inner.append(k, v)
+        match &mut self.kv {
+            KvBacking::Slab(s) => s.append(k, v),
+            KvBacking::Pooled { .. } => {
+                self.append_pooled(k, v)?;
+                let (pool, slot, layer) = self.pool_slot().expect("pooled");
+                match pool.live(layer, slot)? {
+                    Some(kv) => Ok(kv),
+                    None => lloom_tensor::bail!("qsa: an empty pooled row after an append"),
+                }
+            }
+        }
+    }
+    /// Append one token to a pooled row without writing it: the pool token
+    /// slot the rows arm scatters it to.
+    fn append_slot(&mut self) -> Result<u32> {
+        match &mut self.kv {
+            KvBacking::Slab(_) => lloom_tensor::bail!("qsa: append_slot on a slab cache"),
+            KvBacking::Pooled {
+                pool,
+                slot,
+                layer,
+                table_t,
+                ..
+            } => {
+                let s = pool.append(*layer, *slot, 1)?[0];
+                if let Some((_, pages)) = table_t {
+                    if *pages != pool.pages(*layer, *slot).len() {
+                        *table_t = None;
+                    }
+                }
+                Ok(s)
+            }
+        }
+    }
+    /// Append `k`, `v` `[n_kv_heads, n, head_dim]` to a pooled row (the
+    /// pool's pages, one scatter), returning nothing.
+    fn append_pooled(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        match &mut self.kv {
+            KvBacking::Slab(_) => lloom_tensor::bail!("qsa: append_pooled on a slab cache"),
+            KvBacking::Pooled {
+                pool,
+                slot,
+                layer,
+                table_t,
+                ..
+            } => {
+                let n = k.dim(1)?;
+                let slots = pool.append(*layer, *slot, n)?;
+                pool.write(*layer, k, v, &slots)?;
+                if let Some((_, pages)) = table_t {
+                    if *pages != pool.pages(*layer, *slot).len() {
+                        *table_t = None;
+                    }
+                }
+                Ok(())
+            }
+        }
     }
     /// The rows `sel [n_sel]` (u32, all `< len`) of k and v:
     /// `[n_kv_heads, n_sel, head_dim]` each. Gathers from the slab itself
-    /// (contiguous), so the cost is the selection's size, not the context's.
-    fn gather(&self, sel: &Tensor) -> Result<(Tensor, Tensor)> {
-        let k = match self.inner.k_cache().all_data() {
-            Some(k) => k.index_select(sel, 1)?,
-            None => lloom_tensor::bail!("qsa gather on an empty cache"),
+    /// (contiguous), so the cost is the selection's size, not the context's;
+    /// a pooled row maps the cells through its page table first.
+    fn gather(&mut self, sel: &Tensor) -> Result<(Tensor, Tensor)> {
+        match &mut self.kv {
+            KvBacking::Slab(s) => {
+                let k = match s.k_cache().all_data() {
+                    Some(k) => k.index_select(sel, 1)?,
+                    None => lloom_tensor::bail!("qsa gather on an empty cache"),
+                };
+                let v = match s.v_cache().all_data() {
+                    Some(v) => v.index_select(sel, 1)?,
+                    None => lloom_tensor::bail!("qsa gather on an empty cache"),
+                };
+                Ok((k, v))
+            }
+            KvBacking::Pooled {
+                pool,
+                slot,
+                layer,
+                table_t,
+                ..
+            } => {
+                let pages = pool.pages(*layer, *slot);
+                let dev = sel.device();
+                let table = match table_t {
+                    Some((t, n)) if *n == pages.len() => t.clone(),
+                    _ => {
+                        let t = Tensor::from_vec(pages.clone(), pages.len(), dev)?;
+                        *table_t = Some((t.clone(), pages.len()));
+                        t
+                    }
+                };
+                let slots = pool.slots_of(&table, sel)?;
+                let (pk, pv) = match pool.tensors(*layer)? {
+                    Some(t) => t,
+                    None => lloom_tensor::bail!("qsa gather on an empty pooled row"),
+                };
+                Ok((pk.index_select(&slots, 1)?, pv.index_select(&slots, 1)?))
+            }
+        }
+    }
+}
+
+/// One page pool for the QSA layers of a batch of rows (`batched-decode
+/// -design.md` §12.2, the LFM2 `BatchPool`'s shape): per layer, k and v as
+/// `[n_kv_heads, tokens, head_dim]` allocated on first write and grown by a
+/// slab of pages when its free list empties; per (layer, slot) the row's
+/// page table on the host. A [`Cache::in_pools`] row holds slot `r` of every
+/// layer; the rows arm (`QsaAttention::decode_rows`) reads every row's keys
+/// through its table in ONE launch (`kernels::SdpaVectorPaged`), each row's
+/// arithmetic the single row's.
+#[derive(Debug, Clone)]
+pub struct KvPool {
+    inner: std::sync::Arc<parking_lot::Mutex<KvPoolInner>>,
+}
+
+#[derive(Debug)]
+struct KvPoolInner {
+    slots: usize,
+    /// Free row slots, popped from the back.
+    free_slots: Vec<usize>,
+    page_size: usize,
+    /// Pages the pool grows by (`slots × KV_SLAB_TOKENS` tokens).
+    grow_pages: usize,
+    nkv: usize,
+    hd: usize,
+    dtype: DType,
+    device: lloom_tensor::Device,
+    layers: Vec<LayerPool>,
+}
+
+#[derive(Debug, Default)]
+struct LayerPool {
+    /// `[nkv, tokens, hd]` each, `None` until the layer's first write.
+    kv: Option<(Tensor, Tensor)>,
+    /// Pages the tensors hold (`tokens = pages × page_size`).
+    pages: usize,
+    free: Vec<u32>,
+    /// Per slot: the row's pages in token order, and its live length.
+    rows: Vec<(Vec<u32>, usize)>,
+}
+
+impl KvPool {
+    /// A pool for `slots` rows over `n_layers` layers (only the full-attention
+    /// layers ever allocate), keys `[nkv, hd]`.
+    pub fn new(
+        slots: usize,
+        n_layers: usize,
+        nkv: usize,
+        hd: usize,
+        dtype: DType,
+        device: &lloom_tensor::Device,
+    ) -> Self {
+        let page_size = KV_PAGE_TOKENS;
+        let grow_pages = (slots.max(1) * KV_SLAB_TOKENS).div_ceil(page_size).max(1);
+        Self {
+            inner: std::sync::Arc::new(parking_lot::Mutex::new(KvPoolInner {
+                slots,
+                free_slots: (0..slots).rev().collect(),
+                page_size,
+                grow_pages,
+                nkv,
+                hd,
+                dtype,
+                device: device.clone(),
+                layers: (0..n_layers)
+                    .map(|_| LayerPool {
+                        rows: vec![(Vec::new(), 0); slots],
+                        ..Default::default()
+                    })
+                    .collect(),
+            })),
+        }
+    }
+
+    pub fn same(&self, other: &KvPool) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+    /// Lease a row slot (`Cache::in_pools`): every layer's [`KvCache`] of the
+    /// row shares it; it returns when the last of them drops.
+    pub fn lease(&self) -> Result<std::sync::Arc<SlotLease>> {
+        let slot = self
+            .inner
+            .lock()
+            .free_slots
+            .pop()
+            .ok_or_else(|| lloom_tensor::Error::msg("KvPool: no free slot"))?;
+        Ok(std::sync::Arc::new(SlotLease {
+            pool: self.clone(),
+            slot,
+        }))
+    }
+    fn release(&self, slot: usize) {
+        self.inner.lock().free_slots.push(slot);
+    }
+    pub fn slots(&self) -> usize {
+        self.inner.lock().slots
+    }
+    pub fn page_size(&self) -> usize {
+        self.inner.lock().page_size
+    }
+    /// Tokens the pool holds for `layer` (0 until its first write).
+    pub fn tokens(&self, layer: usize) -> usize {
+        let g = self.inner.lock();
+        g.layers[layer].pages * g.page_size
+    }
+    pub fn len(&self, layer: usize, slot: usize) -> usize {
+        self.inner.lock().layers[layer].rows[slot].1
+    }
+    pub fn pages(&self, layer: usize, slot: usize) -> Vec<u32> {
+        self.inner.lock().layers[layer].rows[slot].0.clone()
+    }
+    /// The layer's `(k, v)` pool tensors `[nkv, tokens, hd]`.
+    pub fn tensors(&self, layer: usize) -> Result<Option<(Tensor, Tensor)>> {
+        Ok(self.inner.lock().layers[layer].kv.clone())
+    }
+
+    /// Bytes appending `n` tokens to `(layer, slot)` would allocate: the
+    /// grows the layer's free list cannot cover, each `grow_pages` pages at
+    /// `per_token` bytes a token, plus the layer's current pool once (the
+    /// grow is a `cat`, old and new live together at the instant). 0 when
+    /// the free pages cover it. Sized, not performed.
+    pub fn grow_bytes_for(&self, layer: usize, slot: usize, n: usize, per_token: usize) -> usize {
+        let g = self.inner.lock();
+        let ps = g.page_size;
+        let lp = &g.layers[layer];
+        let (pages, len) = &lp.rows[slot];
+        let need_pages = (len + n).div_ceil(ps).saturating_sub(pages.len());
+        let short = need_pages.saturating_sub(lp.free.len());
+        if short == 0 {
+            return 0;
+        }
+        let grows = short.div_ceil(g.grow_pages);
+        (grows * g.grow_pages * ps + lp.pages * ps) * per_token
+    }
+
+    /// Append `n` tokens to `(layer, slot)`: the pool token slots they land
+    /// in, pages allocated (and the layer grown) as needed.
+    pub fn append(&self, layer: usize, slot: usize, n: usize) -> Result<Vec<u32>> {
+        let mut g = self.inner.lock();
+        let page_size = g.page_size;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let need_page = {
+                let (pages, len) = &g.layers[layer].rows[slot];
+                *len == pages.len() * page_size
+            };
+            if need_page {
+                if g.layers[layer].free.is_empty() {
+                    g.grow(layer)?;
+                }
+                let page = g.layers[layer].free.pop().expect("grown above");
+                g.layers[layer].rows[slot].0.push(page);
+            }
+            let (pages, len) = &mut g.layers[layer].rows[slot];
+            let t = *len;
+            out.push(pages[t / page_size] * page_size as u32 + (t % page_size) as u32);
+            *len += 1;
+        }
+        Ok(out)
+    }
+
+    /// Write `k`, `v` `[nkv, n, hd]` at the pool token `slots` of `layer`.
+    pub fn write(&self, layer: usize, k: &Tensor, v: &Tensor, slots: &[u32]) -> Result<()> {
+        let (nkv, n, hd) = k.dims3()?;
+        if n != slots.len() || v.dims3()? != (nkv, n, hd) {
+            lloom_tensor::bail!(
+                "KvPool: k {:?} / v {:?} for {} slots",
+                k.shape(),
+                v.shape(),
+                slots.len()
+            )
+        }
+        self.scatter(
+            layer,
+            &k.reshape((1, nkv, n, hd))?.contiguous()?,
+            &v.reshape((1, nkv, n, hd))?.contiguous()?,
+            slots,
+        )
+    }
+
+    /// Write `k`, `v` `[n, nkv, hd]` (row-major: a decode batch's tokens,
+    /// one per row) at the pool token `slots` of `layer` — the scatter's
+    /// `[n_seqs = n, nkv, 1, hd]` form, no re-layout.
+    pub fn write_rows(&self, layer: usize, k: &Tensor, v: &Tensor, slots: &[u32]) -> Result<()> {
+        let (n, nkv, hd) = k.dims3()?;
+        if n != slots.len() || v.dims3()? != (n, nkv, hd) {
+            lloom_tensor::bail!(
+                "KvPool: k {:?} / v {:?} for {} slots",
+                k.shape(),
+                v.shape(),
+                slots.len()
+            )
+        }
+        self.scatter(
+            layer,
+            &k.reshape((n, nkv, 1, hd))?.contiguous()?,
+            &v.reshape((n, nkv, 1, hd))?.contiguous()?,
+            slots,
+        )
+    }
+
+    /// The scatter of `k4`, `v4` `[n_seqs, nkv, seq, hd]` (`n_seqs · seq =
+    /// slots.len()`) into the layer's pool.
+    fn scatter(&self, layer: usize, k4: &Tensor, v4: &Tensor, slots: &[u32]) -> Result<()> {
+        let (pk, pv, tokens, hd, nkv) = {
+            let g = self.inner.lock();
+            let lp = &g.layers[layer];
+            match &lp.kv {
+                Some((pk, pv)) => (pk.clone(), pv.clone(), lp.pages * g.page_size, g.hd, g.nkv),
+                None => lloom_tensor::bail!("KvPool: writing layer {layer} before its pages exist"),
+            }
         };
-        let v = match self.inner.v_cache().all_data() {
-            Some(v) => v.index_select(sel, 1)?,
-            None => lloom_tensor::bail!("qsa gather on an empty cache"),
+        if k4.dim(1)? != nkv || k4.dim(3)? != hd {
+            lloom_tensor::bail!("KvPool: {:?} against a [{nkv}, _, {hd}] pool", k4.shape())
+        }
+        let max_slot = slots.iter().copied().max().unwrap_or(0) as usize;
+        let slots_t = Tensor::from_vec(slots.to_vec(), slots.len(), k4.device())?;
+        let pk4 = pk.reshape((1, nkv, tokens, hd))?;
+        let pv4 = pv.reshape((1, nkv, tokens, hd))?;
+        k4.kv_scatter_into(&pk4, &slots_t, max_slot, 0, tokens * hd, hd)?;
+        v4.kv_scatter_into(&pv4, &slots_t, max_slot, 0, tokens * hd, hd)?;
+        Ok(())
+    }
+
+    /// The live tokens of `(layer, slot)` gathered `[nkv, len, hd]` (k, v),
+    /// or `None` when empty — the per-row paths' view of a pooled row.
+    pub fn live(&self, layer: usize, slot: usize) -> Result<Option<(Tensor, Tensor)>> {
+        let (pk, pv, ids) = {
+            let g = self.inner.lock();
+            let lp = &g.layers[layer];
+            let (pages, len) = &lp.rows[slot];
+            if *len == 0 {
+                return Ok(None);
+            }
+            let (pk, pv) = match &lp.kv {
+                Some(t) => t.clone(),
+                None => return Ok(None),
+            };
+            let ps = g.page_size;
+            let ids: Vec<u32> = (0..*len)
+                .map(|t| pages[t / ps] * ps as u32 + (t % ps) as u32)
+                .collect();
+            (pk, pv, ids)
         };
-        Ok((k, v))
+        let n = ids.len();
+        let ids = Tensor::from_vec(ids, n, pk.device())?;
+        Ok(Some((pk.index_select(&ids, 1)?, pv.index_select(&ids, 1)?)))
+    }
+
+    /// Cells `sel [n]` (u32 token ordinals of a row) → the row's pool token
+    /// slots `[n]` (u32) through its page table `table [pages]` (u32, on the
+    /// device): `table[cell / page_size] · page_size + cell % page_size`, in
+    /// f32 (exact below 2²⁴ tokens).
+    pub fn slots_of(&self, table: &Tensor, sel: &Tensor) -> Result<Tensor> {
+        let ps = self.page_size() as f64;
+        let cell = sel.to_dtype(DType::F32)?;
+        let page = (&cell / ps)?.floor()?;
+        let pg = table
+            .index_select(&page.to_dtype(DType::U32)?, 0)?
+            .to_dtype(DType::F32)?;
+        let off = (cell - (&page * ps)?)?;
+        ((pg * ps)? + off)?.to_dtype(DType::U32)
+    }
+
+    /// Keep the first `tokens` of `(layer, slot)` (the pages stay).
+    pub fn truncate(&self, layer: usize, slot: usize, tokens: usize) {
+        let mut g = self.inner.lock();
+        let (_, len) = &mut g.layers[layer].rows[slot];
+        if tokens < *len {
+            *len = tokens;
+        }
+    }
+
+    /// Empty `(layer, slot)`, its pages back to the free list.
+    pub fn clear(&self, layer: usize, slot: usize) {
+        let mut g = self.inner.lock();
+        if layer >= g.layers.len() || slot >= g.slots {
+            return;
+        }
+        let (pages, len) = std::mem::take(&mut g.layers[layer].rows[slot]);
+        let _ = len;
+        g.layers[layer].free.extend(pages);
+    }
+}
+
+impl KvPoolInner {
+    /// Grow `layer` by `grow_pages` pages: the tensors extended (a copy of
+    /// the pool, once per `slots × KV_SLAB_TOKENS` tokens), the new pages
+    /// onto the free list.
+    fn grow(&mut self, layer: usize) -> Result<()> {
+        let (ps, gp, nkv, hd) = (self.page_size, self.grow_pages, self.nkv, self.hd);
+        let (dtype, dev) = (self.dtype, self.device.clone());
+        let lp = &mut self.layers[layer];
+        // Two allocations: a `clone` of a tensor shares its storage.
+        let fresh_k = Tensor::zeros((nkv, gp * ps, hd), dtype, &dev)?;
+        let fresh_v = Tensor::zeros((nkv, gp * ps, hd), dtype, &dev)?;
+        lp.kv = Some(match lp.kv.take() {
+            None => (fresh_k, fresh_v),
+            Some((k, v)) => (
+                Tensor::cat(&[&k, &fresh_k], 1)?,
+                Tensor::cat(&[&v, &fresh_v], 1)?,
+            ),
+        });
+        let first = lp.pages as u32;
+        lp.free.extend((first..first + gp as u32).rev());
+        lp.pages += gp;
+        Ok(())
     }
 }
 
@@ -201,8 +756,15 @@ impl Indexer {
     /// block's first position → the compressed cache. O(new blocks), never a
     /// rebuild.
     fn observe(&self, x2: &Tensor, kv: &mut KvCache) -> Result<()> {
-        let seq = x2.dim(0)?;
-        let k_raw = self.k_proj.forward(x2)?.reshape((1, seq, self.head_dim))?;
+        let k_raw = self.k_proj.forward(x2)?;
+        self.observe_keys(&k_raw, kv)
+    }
+
+    /// [`Self::observe`] from the projected raw keys `k_raw [seq, idx_dim]`
+    /// (the rows arm projects every row's at once).
+    fn observe_keys(&self, k_raw: &Tensor, kv: &mut KvCache) -> Result<()> {
+        let seq = k_raw.dim(0)?;
+        let k_raw = k_raw.reshape((1, seq, self.head_dim))?;
         kv.raw_keys.append(&k_raw)?;
         let n_tokens = kv.raw_keys.current_seq_len();
         let complete = n_tokens / self.ratio;
@@ -224,7 +786,7 @@ impl Indexer {
         let pooled = (members.sum(1)? * (1.0 / self.ratio as f64))?; // [n_new, head_dim]
         let normed = self.k_norm.forward(&pooled.contiguous()?)?;
         let positions: Vec<usize> = (0..n_new).map(|b| (have + b) * self.ratio).collect();
-        let (cos, sin) = rope_cs_at(self.n_rot, self.rope_theta, &positions, x2.device())?;
+        let (cos, sin) = rope_cs_at(self.n_rot, self.rope_theta, &positions, k_raw.device())?;
         let half = self.n_rot / 2;
         let roped = partial_rope_seq(
             &normed.reshape((n_new, 1, self.head_dim))?,
@@ -713,8 +1275,46 @@ impl QsaAttention {
         let q_gamma = self.q_norm.weight().to_dtype(f32)?;
         let k_gamma = self.k_norm.weight().to_dtype(f32)?;
         let scale = 1.0 / (hd as f64).sqrt();
-        let mut gated_rows = Vec::with_capacity(b);
+        // The pooled rows within the dense range: one launch per kernel over
+        // them (the prologue, the scatter, the paged attention, the gate).
+        let mut pooled: Vec<usize> = Vec::new();
+        let mut pool: Option<KvPool> = None;
+        for (r, kv) in kvs.iter().enumerate() {
+            if let Some((p, _, _)) = kv.pool_slot() {
+                let dense = match &self.indexer {
+                    Some(ix) => kv.len() < ix.dense_limit(),
+                    None => true,
+                };
+                if dense && pool.as_ref().is_none_or(|q| q.same(p)) {
+                    if pool.is_none() {
+                        pool = Some(p.clone());
+                    }
+                    pooled.push(r);
+                }
+            }
+        }
+        let mut gated_by_row: Vec<Option<Tensor>> = vec![None; b];
+        if let Some(pool) = &pool {
+            let g = self.decode_pooled_rows(
+                pool,
+                &pooled,
+                kvs,
+                &xb,
+                &qg_all,
+                &k_all_rows,
+                &v_all_rows,
+                &q_gamma,
+                &k_gamma,
+                scale as f32,
+            )?; // [nd, nh·hd]
+            for (j, &r) in pooled.iter().enumerate() {
+                gated_by_row[r] = Some(g.narrow(0, j, 1)?);
+            }
+        }
         for (r, kv) in kvs.iter_mut().enumerate() {
+            if gated_by_row[r].is_some() {
+                continue;
+            }
             let x1 = xb.narrow(0, r, 1)?; // [1, hidden]
             let qg = qg_all.narrow(0, r, 1)?.reshape((nh, 2 * hd))?;
             let k = k_all_rows.narrow(0, r, 1)?.reshape((nkv, hd))?;
@@ -767,14 +1367,192 @@ impl QsaAttention {
                 Some(g) => g?,
                 None => (ctx * ops::sigmoid(&gate)?)?,
             };
-            gated_rows.push(gated);
+            gated_by_row[r] = Some(gated);
         }
+        let gated_rows: Vec<Tensor> = gated_by_row
+            .into_iter()
+            .map(|g| g.expect("every row gated"))
+            .collect();
         let gated = if b == 1 {
-            gated_rows.pop().expect("one row")
+            gated_rows.into_iter().next().expect("one row")
         } else {
             Tensor::cat(&gated_rows, 0)?
         }; // [B, nh·hd]
         Ok(Some(self.wo.forward(&gated)?.reshape((b, 1, hidden))?))
+    }
+
+    /// The pooled rows arm of [`Self::decode_rows_fused`]: the rows `rows`
+    /// (each pooled in `pool`, within the dense range) through
+    /// `kernels::QsaPrepBatch` (every row at its own position), one scatter
+    /// of the step's k / v into the layer's pool, the indexer's observe per
+    /// row, `kernels::SdpaVectorPaged` (every row over its own page table,
+    /// one launch) and the output gate → `[rows, nh·hd]`. Row for row the
+    /// per-row path's arithmetic.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_pooled_rows(
+        &self,
+        pool: &KvPool,
+        rows: &[usize],
+        kvs: &mut [&mut KvCache],
+        xb: &Tensor,
+        qg_all: &Tensor,
+        k_rows: &Tensor,
+        v_rows: &Tensor,
+        q_gamma: &Tensor,
+        k_gamma: &Tensor,
+        scale: f32,
+    ) -> Result<Tensor> {
+        use super::kernels::{sigmoid_mul, QsaPrepBatch};
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        let nd = rows.len();
+        let dev = xb.device();
+        let all = nd == kvs.len();
+        let idx_t = if all {
+            None
+        } else {
+            let idx: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
+            Some(Tensor::from_vec(idx, nd, dev)?)
+        };
+        let pick = |t: &Tensor| -> Result<Tensor> {
+            match &idx_t {
+                None => Ok(t.clone()),
+                Some(i) => t.index_select(i, 0),
+            }
+        };
+        let qg = pick(qg_all)?.reshape((nd, nh, 2 * hd))?;
+        let k = pick(k_rows)?.reshape((nd, nkv, hd))?;
+        let v = pick(v_rows)?.reshape((nd, nkv, hd))?;
+        let pos: Vec<u32> = rows.iter().map(|&r| kvs[r].len() as u32).collect();
+        let pos_t = Tensor::from_vec(pos, nd, dev)?;
+        let prep = qg.apply_op3_no_bwd(
+            &k,
+            &pos_t,
+            &QsaPrepBatch {
+                hd,
+                n_rot: self.n_rot,
+                nh,
+                nkv,
+                theta: self.rope_theta as f32,
+                eps: self.q_norm.eps() as f32,
+                q_gamma: q_gamma.clone(),
+                k_gamma: k_gamma.clone(),
+            },
+        )?; // flat: q [nd, nh, hd] | gate [nd, nh, hd] | k [nd, nkv, hd]
+        let q = prep.narrow(0, 0, nd * nh * hd)?.reshape((nd, nh, hd))?;
+        let gate = prep
+            .narrow(0, nd * nh * hd, nd * nh * hd)?
+            .reshape((nd, nh * hd))?;
+        let k_step = prep
+            .narrow(0, 2 * nd * nh * hd, nd * nkv * hd)?
+            .reshape((nd, nkv, hd))?;
+        // The step's tokens appended (a slot each), written as one scatter.
+        let layer = kvs[rows[0]].pool_slot().expect("pooled").2;
+        let mut slots = Vec::with_capacity(nd);
+        for &r in rows {
+            slots.push(kvs[r].append_slot()?);
+        }
+        pool.write_rows(layer, &k_step, &v, &slots)?;
+        if let Some(ix) = &self.indexer {
+            // The indexer's key projection once over the rows; each row
+            // keeps its own raw keys and completes its own blocks.
+            let k_raw = ix.k_proj.forward(&pick(xb)?)?; // [nd, idx_dim]
+            for (j, &r) in rows.iter().enumerate() {
+                ix.observe_keys(&k_raw.narrow(0, j, 1)?, kvs[r])?;
+            }
+        }
+        // Every row's table and live count.
+        let tables: Vec<Vec<u32>> = rows
+            .iter()
+            .map(|&r| pool.pages(layer, kvs[r].pool_slot().expect("pooled").1))
+            .collect();
+        let n_keys: Vec<u32> = rows.iter().map(|&r| kvs[r].len() as u32).collect();
+        let (pk, pv) = match pool.tensors(layer)? {
+            Some(t) => t,
+            None => lloom_tensor::bail!("qsa pooled rows: the layer's pool was not written"),
+        };
+        let ctx = self.sdpa_paged_rows(&q, &pk, &pv, pool.page_size(), &tables, &n_keys, scale)?;
+        let ctx = ctx.reshape((nd, nh * hd))?;
+        match sigmoid_mul(&gate, &ctx) {
+            Some(g) => g,
+            None => ctx * ops::sigmoid(&gate)?,
+        }
+    }
+
+    /// The paged attention of `q [nd, nh, hd]` over the layer's pool for
+    /// `nd` rows (row `j`'s pages `tables[j]`, its live count `n_keys[j]`),
+    /// → `[nd, nh, hd]`. The rows split at `ops::SDPA_TWO_PASS_K_THRESHOLD`
+    /// keys — the single-pass rows in one launch, the 2-pass rows in one
+    /// pair — so every row runs the kernel the per-row `ops::sdpa` runs at
+    /// its length: bit-identical per row.
+    #[allow(clippy::too_many_arguments)]
+    fn sdpa_paged_rows(
+        &self,
+        q: &Tensor,
+        pk: &Tensor,
+        pv: &Tensor,
+        page_size: usize,
+        tables: &[Vec<u32>],
+        n_keys: &[u32],
+        scale: f32,
+    ) -> Result<Tensor> {
+        use super::kernels::SdpaVectorPaged;
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        let nd = n_keys.len();
+        let dev = q.device();
+        let long = |j: usize| n_keys[j] as usize >= ops::SDPA_TWO_PASS_K_THRESHOLD;
+        let groups: [Vec<usize>; 2] = [
+            (0..nd).filter(|&j| !long(j)).collect(),
+            (0..nd).filter(|&j| long(j)).collect(),
+        ];
+        let mut by_row: Vec<Option<Tensor>> = vec![None; nd];
+        for (two_pass, grp) in groups.iter().enumerate() {
+            if grp.is_empty() {
+                continue;
+            }
+            let ng = grp.len();
+            let q_g = if ng == nd {
+                q.clone()
+            } else {
+                let idx: Vec<u32> = grp.iter().map(|&j| j as u32).collect();
+                q.index_select(&Tensor::from_vec(idx, ng, dev)?, 0)?
+            };
+            let stride = grp
+                .iter()
+                .map(|&j| tables[j].len())
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let mut table = Vec::with_capacity(ng * stride);
+            let mut keys = Vec::with_capacity(ng);
+            for &j in grp {
+                table.extend_from_slice(&tables[j]);
+                table.extend(std::iter::repeat_n(0u32, stride - tables[j].len()));
+                keys.push(n_keys[j]);
+            }
+            let ctx = q_g.apply_op3_no_bwd(
+                pk,
+                pv,
+                &SdpaVectorPaged {
+                    nh,
+                    nkv,
+                    hd,
+                    page_size,
+                    table_stride: stride,
+                    scale,
+                    two_pass: two_pass == 1,
+                    table: Tensor::from_vec(table, ng * stride, dev)?,
+                    n_keys: Tensor::from_vec(keys, ng, dev)?,
+                },
+            )?; // [ng, nh, hd]
+            if ng == nd {
+                return Ok(ctx);
+            }
+            for (i, &j) in grp.iter().enumerate() {
+                by_row[j] = Some(ctx.narrow(0, i, 1)?);
+            }
+        }
+        let rows: Vec<Tensor> = by_row.into_iter().map(|t| t.expect("every row")).collect();
+        Tensor::cat(&rows, 0)
     }
 
     /// A whole chunk `x [1, seq, hidden]` → `[1, seq, hidden]`: the same dense
@@ -1091,6 +1869,199 @@ mod tests {
     }
     fn rms(dim: usize, dev: &Device) -> RmsNorm {
         RmsNorm::new(Tensor::ones(dim, DType::F32, dev).unwrap(), 1e-6)
+    }
+
+    /// `KvPool`: a row past the pool's first slab grows the layer (the pages
+    /// re-based), `live` gathers the tokens in order through the table,
+    /// `truncate` keeps a prefix, `clear` returns the pages; `slots_of` maps
+    /// cells as the host does. CPU (the scatter's reference arm).
+    #[test]
+    fn kv_pool_grows_gathers_and_maps() -> Result<()> {
+        let dev = Device::Cpu;
+        let (nkv, hd) = (2usize, 8usize);
+        let pool = KvPool::new(1, 1, nkv, hd, DType::F32, &dev);
+        let lease = pool.lease()?;
+        let mut kv = KvCache::in_pool(&pool, &lease, 0);
+        let tok = |t: usize| -> Tensor {
+            Tensor::from_vec(
+                (0..nkv * hd)
+                    .map(|i| (t * 100 + i) as f32)
+                    .collect::<Vec<f32>>(),
+                (nkv, 1, hd),
+                &dev,
+            )
+            .unwrap()
+        };
+        // One slab is KV_SLAB_TOKENS tokens; cross it (the second slab).
+        let n = KV_SLAB_TOKENS + 37;
+        for t in 0..n {
+            let (k_all, _) = kv.append(&tok(t), &(tok(t) + 0.5)?)?;
+            assert_eq!(k_all.dims(), &[nkv, t + 1, hd]);
+        }
+        assert_eq!(kv.len(), n);
+        assert_eq!(pool.tokens(0), 2 * KV_SLAB_TOKENS);
+        let [k, v, _, _] = kv.state_views()?;
+        let k = k.expect("live");
+        let v = v.expect("live");
+        for t in [0usize, 255, 256, 1023, 1024, n - 1] {
+            let row: Vec<f32> = k.narrow(1, t, 1)?.flatten_all()?.to_vec1()?;
+            let want: Vec<f32> = (0..nkv * hd).map(|i| (t * 100 + i) as f32).collect();
+            assert_eq!(row, want, "token {t}");
+            let row: Vec<f32> = v.narrow(1, t, 1)?.flatten_all()?.to_vec1()?;
+            let want_v: Vec<f32> = want.iter().map(|x| x + 0.5).collect();
+            assert_eq!(row, want_v, "token {t} (v)");
+        }
+        // The cell → slot map through the row's table.
+        let pages = pool.pages(0, 0);
+        let table = Tensor::from_vec(pages.clone(), pages.len(), &dev)?;
+        let cells: Vec<u32> = vec![0, 3, 255, 256, 700, (n - 1) as u32];
+        let sel = Tensor::from_vec(cells.clone(), cells.len(), &dev)?;
+        let got: Vec<u32> = pool.slots_of(&table, &sel)?.to_vec1()?;
+        let ps = KV_PAGE_TOKENS;
+        let want: Vec<u32> = cells
+            .iter()
+            .map(|&c| pages[c as usize / ps] * ps as u32 + c % ps as u32)
+            .collect();
+        assert_eq!(got, want);
+        let (gk, _) = kv.gather(&sel)?;
+        let row: Vec<f32> = gk.narrow(1, 4, 1)?.flatten_all()?.to_vec1()?;
+        let want: Vec<f32> = (0..nkv * hd).map(|i| (700 * 100 + i) as f32).collect();
+        assert_eq!(row, want);
+        kv.truncate(300, 0);
+        assert_eq!(kv.len(), 300);
+        let (k_all, _) = kv.append(&tok(300), &(tok(300) + 0.5)?)?;
+        assert_eq!(k_all.dims(), &[nkv, 301, hd]);
+        kv.reset();
+        assert_eq!(kv.len(), 0);
+        assert!(pool.pages(0, 0).is_empty());
+        Ok(())
+    }
+
+    /// The pooled rows arm's two kernels equal the per-row kernels bit for
+    /// bit: `QsaPrepBatch` over rows at their own positions = `QsaPrep` per
+    /// row; `SdpaVectorPaged` over a pool whose pages are scattered = the
+    /// vector `ops::sdpa` over each row's keys laid contiguously.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn pooled_rows_kernels_match_per_row_bit_for_bit() -> Result<()> {
+        use super::super::kernels::{QsaPrep, QsaPrepBatch};
+        let dev = Device::new_metal(0)?;
+        let cfg = Config::flash_next();
+        let (hd, nh, nkv) = (cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
+        let rows = 4usize;
+        let gamma = |seed: f32| {
+            Tensor::from_vec(
+                (0..hd)
+                    .map(|i| 1.0 + 0.1 * ((i as f32 + seed) * 0.3).sin())
+                    .collect::<Vec<f32>>(),
+                hd,
+                &dev,
+            )
+            .unwrap()
+        };
+        let (qg_w, kg_w) = (gamma(0.0), gamma(9.0));
+        let qg = Tensor::randn(0f32, 1.0, (rows, nh, 2 * hd), &dev)?;
+        let k = Tensor::randn(0f32, 1.0, (rows, nkv, hd), &dev)?;
+        let pos: Vec<u32> = vec![7, 300, 1500, 1100];
+        let pos_t = Tensor::from_vec(pos.clone(), rows, &dev)?;
+        let prep = qg.apply_op3_no_bwd(
+            &k,
+            &pos_t,
+            &QsaPrepBatch {
+                hd,
+                n_rot: (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize,
+                nh,
+                nkv,
+                theta: cfg.rope_theta as f32,
+                eps: 1e-6,
+                q_gamma: qg_w.clone(),
+                k_gamma: kg_w.clone(),
+            },
+        )?;
+        let q_reg = prep.narrow(0, 0, rows * nh * hd)?.reshape((rows, nh, hd))?;
+        let g_reg = prep
+            .narrow(0, rows * nh * hd, rows * nh * hd)?
+            .reshape((rows, nh, hd))?;
+        let k_reg = prep
+            .narrow(0, 2 * rows * nh * hd, rows * nkv * hd)?
+            .reshape((rows, nkv, hd))?;
+        for r in 0..rows {
+            let one = qg
+                .narrow(0, r, 1)?
+                .reshape((nh, 2 * hd))?
+                .apply_op2_no_bwd(
+                    &k.narrow(0, r, 1)?.reshape((nkv, hd))?,
+                    &QsaPrep {
+                        hd,
+                        n_rot: (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize,
+                        nh,
+                        nkv,
+                        pos: pos[r] as usize,
+                        theta: cfg.rope_theta as f32,
+                        eps: 1e-6,
+                        q_gamma: qg_w.clone(),
+                        k_gamma: kg_w.clone(),
+                    },
+                )?;
+            let a: Vec<f32> = Tensor::cat(
+                &[
+                    q_reg.narrow(0, r, 1)?.flatten_all()?,
+                    g_reg.narrow(0, r, 1)?.flatten_all()?,
+                    k_reg.narrow(0, r, 1)?.flatten_all()?,
+                ],
+                0,
+            )?
+            .to_vec1()?;
+            let b: Vec<f32> = one.flatten_all()?.to_vec1()?;
+            assert!(a.iter().all(|x| x.is_finite()));
+            assert_eq!(a, b, "prep row {r}");
+        }
+        // Three rows of different lengths in a pool whose pages are handed
+        // out from the back (so no row is contiguous), one launch.
+        let lens = [5usize, 600, 1300, 1030];
+        let page = KV_PAGE_TOKENS;
+        let pool_pages = 16;
+        let pk = Tensor::randn(0f32, 1.0, (nkv, pool_pages * page, hd), &dev)?;
+        let pv = Tensor::randn(0f32, 1.0, (nkv, pool_pages * page, hd), &dev)?;
+        let mut free: Vec<u32> = (0..pool_pages as u32).collect();
+        let mut tables: Vec<Vec<u32>> = Vec::new();
+        for &n in &lens {
+            let mut t = Vec::new();
+            for _ in 0..n.div_ceil(page) {
+                t.push(free.pop().expect("pages"));
+            }
+            tables.push(t);
+        }
+        let n_keys: Vec<u32> = lens.iter().map(|&n| n as u32).collect();
+        let q = Tensor::randn(0f32, 1.0, (rows, nh, hd), &dev)?;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let attn = QsaAttention::new(
+            lin(nh * hd * 2, 8, 1.0, &dev),
+            lin(nkv * hd, 8, 2.0, &dev),
+            lin(nkv * hd, 8, 3.0, &dev),
+            lin(8, nh * hd, 4.0, &dev),
+            rms(hd, &dev),
+            rms(hd, &dev),
+            &cfg,
+        );
+        // Rows 0 and 1 below the 2-pass threshold, rows 2 and 3 above: the
+        // two arms, each against the per-row kernel of that length.
+        let ctx = attn.sdpa_paged_rows(&q, &pk, &pv, page, &tables, &n_keys, scale)?; // [rows, nh, hd]
+        for r in 0..rows {
+            let ids: Vec<u32> = (0..lens[r])
+                .map(|t| tables[r][t / page] * page as u32 + (t % page) as u32)
+                .collect();
+            let ids = Tensor::from_vec(ids, lens[r], &dev)?;
+            let kr = pk.index_select(&ids, 1)?.unsqueeze(0)?; // [1, nkv, n, hd]
+            let vr = pv.index_select(&ids, 1)?.unsqueeze(0)?;
+            let qr = q.narrow(0, r, 1)?.reshape((1, nh, 1, hd))?;
+            let want = ops::sdpa(&qr, &kr, &vr, None, false, scale, 1.0)?;
+            let a: Vec<f32> = ctx.narrow(0, r, 1)?.flatten_all()?.to_vec1()?;
+            let b: Vec<f32> = want.flatten_all()?.to_vec1()?;
+            assert!(a.iter().all(|x| x.is_finite()));
+            assert_eq!(a, b, "attention row {r} ({} keys)", lens[r]);
+        }
+        Ok(())
     }
 
     /// The fused decode (the prep kernel, the sdpa vector kernel over the

@@ -329,10 +329,77 @@ pub enum SlotBudget {
     Fixed(usize),
     /// Sized from the device: `fraction` of `recommendedMaxWorkingSetSize`,
     /// minus the resident tier (every non-expert tensor, from the headers),
-    /// divided across the layers' three expert planes; clamped to
-    /// `[topk + 1, n_experts]`. ds4's byte-budget planner, without a policy
-    /// beyond "what fits" (§20.4a).
-    Auto { fraction: f64 },
+    /// minus the SESSION RESERVE ([`session_reserve_bytes`]: the KV of
+    /// `rows` rows to `kv_tokens`, two prefill tiles' transients, the pool's
+    /// free list), divided across the layers' three expert planes; clamped
+    /// to `[topk + 1, n_experts]`. ds4's byte-budget planner, without a
+    /// policy beyond "what fits" (§20.4a) — and the reserve is what keeps
+    /// "what fits" from being the whole budget: without it the pool sized
+    /// itself to `fraction × working_set` exactly and the first pass read
+    /// over budget (issue #749 P18, `p18-stream-short.txt`).
+    Auto {
+        fraction: f64,
+        /// Rows the session state is reserved for (1, or `--batch N`).
+        rows: usize,
+        /// KV positions per row the reserve covers (`--kv-capacity`).
+        kv_tokens: usize,
+        /// The prefill tile the transient is reserved for (0 = one tile of
+        /// `PREFILL_CHUNK`).
+        prefill_tile: usize,
+    },
+}
+
+impl SlotBudget {
+    /// `Auto` at `fraction` for one row at 4096 positions and the default
+    /// tile — the harness defaults.
+    pub fn auto(fraction: f64) -> Self {
+        SlotBudget::Auto {
+            fraction,
+            rows: 1,
+            kv_tokens: DEFAULT_KV_RESERVE_TOKENS,
+            prefill_tile: super::model::PREFILL_CHUNK,
+        }
+    }
+}
+
+/// KV positions per row `SlotBudget::auto` reserves for.
+pub const DEFAULT_KV_RESERVE_TOKENS: usize = 4096;
+
+/// Bytes of the pool's free list a streamed load reserves beside the KV and
+/// the transients (`buffer_pool`'s 256 MiB default free budget).
+pub const POOL_FREE_RESERVE_BYTES: usize = 256 * 1024 * 1024;
+
+/// One position's KV over every full-attention layer, f32 k and v
+/// `[n_kv_heads, head_dim]` each — plus the indexer's raw key per position.
+pub fn kv_bytes_per_token(cfg: &Config) -> usize {
+    let full = cfg
+        .layer_types
+        .iter()
+        .filter(|k| matches!(k, LayerKind::Full))
+        .count();
+    let f32 = std::mem::size_of::<f32>();
+    full * (2 * cfg.n_kv_heads * cfg.head_dim + cfg.indexer_head_dim) * f32
+}
+
+/// What a streamed load keeps beside its weights: `rows` rows' KV to
+/// `kv_tokens` positions, two prefill tiles' transients in flight (the
+/// pacer's depth) at [`super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN`],
+/// and the pool's free list. The slot plan subtracts it from the budget so
+/// a pass has what it needs by construction, not by luck.
+pub fn session_reserve_bytes(
+    cfg: &Config,
+    rows: usize,
+    kv_tokens: usize,
+    prefill_tile: usize,
+) -> usize {
+    let tile = if prefill_tile == 0 {
+        super::model::PREFILL_CHUNK
+    } else {
+        prefill_tile
+    };
+    rows.max(1) * kv_tokens * kv_bytes_per_token(cfg)
+        + 2 * tile * super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
+        + POOL_FREE_RESERVE_BYTES
 }
 
 /// How the routed experts are streamed.
@@ -350,18 +417,22 @@ pub struct SlotPlan {
     pub working_set: usize,
     pub resident_bytes: usize,
     pub expert_bytes_per_slot: usize,
+    /// The session reserve the plan left out of the pool.
+    pub reserve_bytes: usize,
 }
 
-/// Every tensor's packed size from the headers, split into the resident tier
-/// and one slot's worth of expert planes (summed over the layers).
-fn plan_slots<Rd: Read + Seek>(
+/// Every tensor's packed size from the headers: the resident tier, one
+/// slot's worth of expert planes (summed over the layers) and every expert
+/// plane, as a [`LoadPlan`] for `slots` (`None` = every expert resident).
+fn plan_load<Rd: Read + Seek>(
     gg: &Gguf<'_, Rd>,
-    cfg: &Config,
     device: &Device,
     fraction: f64,
-) -> Result<SlotPlan> {
+    slots: Option<usize>,
+) -> LoadPlan {
     let mut resident = 0usize;
     let mut per_slot = 0usize;
+    let mut total = 0usize;
     for sh in &gg.shards {
         for (name, info) in &sh.content.tensor_infos {
             let bytes = info.shape.elem_count() / info.ggml_dtype.block_size()
@@ -373,30 +444,56 @@ fn plan_slots<Rd: Read + Seek>(
                 // [n_experts, n, k]: one plane per slot
                 let n_experts = info.shape.dims().first().copied().unwrap_or(1).max(1);
                 per_slot += bytes / n_experts;
+                total += bytes;
             } else {
                 resident += bytes;
             }
         }
     }
-    #[cfg(feature = "metal")]
-    let working_set = match device {
-        Device::Metal(d) => d.device().recommended_max_working_set_size(),
-        _ => 0,
-    };
-    #[cfg(not(feature = "metal"))]
-    let working_set = {
-        let _ = device;
-        0usize
-    };
-    let budget = (working_set as f64 * fraction) as usize;
-    let for_experts = budget.saturating_sub(resident);
-    let raw = for_experts.checked_div(per_slot).unwrap_or(0);
-    let slots = raw.clamp(cfg.n_experts_per_tok + 1, cfg.n_experts);
-    Ok(SlotPlan {
-        slots,
-        working_set,
+    LoadPlan {
         resident_bytes: resident,
         expert_bytes_per_slot: per_slot,
+        expert_bytes_total: total,
+        slots,
+        working_set: working_set_of(device),
+        fraction,
+    }
+}
+
+/// `recommendedMaxWorkingSetSize` of a Metal device; 0 elsewhere.
+fn working_set_of(device: &Device) -> usize {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(d) = device {
+        return d.device().recommended_max_working_set_size();
+    }
+    let _ = device;
+    0
+}
+
+/// The slot pool `SlotBudget::Auto` resolves to: what the budget leaves
+/// after the resident tier, divided by a slot, clamped to `[topk + 1,
+/// n_experts]`.
+fn plan_slots<Rd: Read + Seek>(
+    gg: &Gguf<'_, Rd>,
+    cfg: &Config,
+    device: &Device,
+    fraction: f64,
+    reserve_bytes: usize,
+) -> Result<SlotPlan> {
+    let plan = plan_load(gg, device, fraction, None);
+    let slots = plan
+        .budget()
+        .saturating_sub(plan.resident_bytes)
+        .saturating_sub(reserve_bytes)
+        .checked_div(plan.expert_bytes_per_slot)
+        .unwrap_or(0)
+        .clamp(cfg.n_experts_per_tok + 1, cfg.n_experts);
+    Ok(SlotPlan {
+        slots,
+        working_set: plan.working_set,
+        resident_bytes: plan.resident_bytes,
+        expert_bytes_per_slot: plan.expert_bytes_per_slot,
+        reserve_bytes,
     })
 }
 
@@ -421,6 +518,138 @@ pub struct LoadOptions {
     /// (ds4's naming; the in-tree sidecar `qwen4exp-mtp-quantize` writes).
     /// Its routed experts take the same residency strategy as the model's.
     pub mtp: bool,
+    /// The fraction of `recommendedMaxWorkingSetSize` the load may hold —
+    /// `DESIGN.md` §9.5's admission at the one site this family allocates
+    /// its weight class (`admit_load`): the resident tier plus every expert
+    /// (`Resident`) or the slot pool (`Streamed`), summed from the headers,
+    /// refused before a byte is loaded when it exceeds the budget. `None` =
+    /// [`DEFAULT_MEMORY_FRACTION`]; `Some(0.0)` turns the check off. Nothing
+    /// on the device but Metal reads a working set; elsewhere the check is
+    /// inert. Read at load only, never per token.
+    pub memory_fraction: Option<f64>,
+}
+
+impl LoadOptions {
+    /// The admission fraction this load runs at.
+    pub fn fraction(&self) -> f64 {
+        self.memory_fraction.unwrap_or(DEFAULT_MEMORY_FRACTION)
+    }
+}
+
+/// §9.5k's fraction, `MemoryBudget::DEFAULT_FRACTION` (0.65) — asserted
+/// equal to it by `memory_fraction_matches_lfm2s`.
+pub const DEFAULT_MEMORY_FRACTION: f64 = 0.65;
+
+/// What a load would hold on the device, from the headers: the resident
+/// tier (every non-expert tensor; the PLE table is memory-mapped and not
+/// counted) and the routed experts — all of them under `Resident`, `slots`
+/// of them per layer under `Streamed`. The weight term of §9.5d for this
+/// family, and the whole of what the load itself allocates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadPlan {
+    /// Every non-expert tensor's packed bytes.
+    pub resident_bytes: usize,
+    /// One expert's planes over every layer (the three projections summed).
+    pub expert_bytes_per_slot: usize,
+    /// Every expert tensor's packed bytes (`Resident` holds all of it).
+    pub expert_bytes_total: usize,
+    /// The slot pool (`Streamed`), `None` for `Resident`.
+    pub slots: Option<usize>,
+    /// `recommendedMaxWorkingSetSize`; 0 off Metal.
+    pub working_set: usize,
+    pub fraction: f64,
+}
+
+impl LoadPlan {
+    /// Bytes the load holds on the device.
+    pub fn predicted(&self) -> usize {
+        let experts = match self.slots {
+            Some(n) => n * self.expert_bytes_per_slot,
+            None => self.expert_bytes_total,
+        };
+        self.resident_bytes + experts
+    }
+    /// `fraction × working_set`.
+    pub fn budget(&self) -> usize {
+        (self.working_set as f64 * self.fraction) as usize
+    }
+    /// Whether the load is admitted: exactly on the budget is; no working
+    /// set (not Metal) or a zero fraction never refuses.
+    pub fn fits(&self) -> bool {
+        self.working_set == 0 || self.fraction <= 0.0 || self.predicted() <= self.budget()
+    }
+    /// The slots a streamed pool could hold under this budget (at least
+    /// `topk + 1` is the pool's own floor, checked by the loader).
+    pub fn slots_that_fit(&self) -> usize {
+        self.budget()
+            .saturating_sub(self.resident_bytes)
+            .checked_div(self.expert_bytes_per_slot)
+            .unwrap_or(0)
+    }
+    /// The fraction this load needs.
+    pub fn fraction_needed(&self) -> f64 {
+        if self.working_set == 0 {
+            return 0.0;
+        }
+        self.predicted() as f64 / self.working_set as f64
+    }
+    /// §9.5g's report: the arithmetic and, on a refusal, the reductions
+    /// that would fit in the order of what they cost.
+    pub fn describe(&self) -> String {
+        let gb = |b: usize| b as f64 / 1e9;
+        let experts = match self.slots {
+            Some(n) => format!(
+                "{n} slots x {:.1} MB",
+                self.expert_bytes_per_slot as f64 / 1e6
+            ),
+            None => format!(
+                "every expert, {:.2} GB ({:.1} MB a slot)",
+                gb(self.expert_bytes_total),
+                self.expert_bytes_per_slot as f64 / 1e6
+            ),
+        };
+        let head = format!(
+            "predicted {:.2} GB = resident {:.2} GB + experts {experts}; budget {:.2} GB = {:.2} x recommendedMaxWorkingSetSize {:.2} GB",
+            gb(self.predicted()),
+            gb(self.resident_bytes),
+            gb(self.budget()),
+            self.fraction,
+            gb(self.working_set),
+        );
+        if self.fits() {
+            return format!(
+                "memory budget OK at load: {head}; residual {:.2} GB for the KV, the prefill passes and the pool",
+                gb(self.budget().saturating_sub(self.predicted()))
+            );
+        }
+        let mut s = format!(
+            "memory budget exceeded at load: {head}; over by {:.2} GB. Nothing was loaded (DESIGN.md 9.5g: refuse rather than silently reduce). What would fit:",
+            gb(self.predicted().saturating_sub(self.budget()))
+        );
+        if self.slots.is_none() {
+            s.push_str(&format!(
+                "\n  --experts stream (--slots auto: {} slots at this fraction)",
+                self.slots_that_fit()
+            ));
+        } else {
+            s.push_str(&format!("\n  --slots {}", self.slots_that_fit()));
+        }
+        s.push_str(&format!(
+            "\n  --memory-fraction {:.2} (this load's share of the working set; the machine then has {:.2} GB for everything else, the OS included)",
+            (self.fraction_needed() * 100.0).ceil() / 100.0,
+            gb(self.working_set.saturating_sub(self.predicted()))
+        ));
+        s
+    }
+}
+
+/// Refuse a load the budget cannot take, with the arithmetic (§9.5g).
+pub fn admit_load(plan: &LoadPlan) -> Result<()> {
+    if plan.fits() {
+        Ok(())
+    } else {
+        lloom_tensor::bail!("{}", plan.describe())
+    }
 }
 
 /// Open every shard at `paths`, headers only.
@@ -462,6 +691,7 @@ impl Qwen4Exp<Resident> {
             }],
             device,
         )?;
+        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
         build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             Ok(Resident::new(
@@ -490,6 +720,7 @@ impl Qwen4Exp<Resident> {
             })
             .collect();
         let mut gg = Gguf::new(shards, device)?;
+        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
         build(&mut gg, device, opts, |gg, l| {
             let p = format!("blk.{l}");
             Ok(Resident::new(
@@ -526,20 +757,30 @@ impl Qwen4Exp<Streamed> {
         let cfg0 = Config::from_gguf_metadata(gg.metadata())?;
         let slots = match stream.slots {
             SlotBudget::Fixed(n) => n,
-            SlotBudget::Auto { fraction } => {
-                let plan = plan_slots(&gg, &cfg0, device, fraction)?;
+            SlotBudget::Auto {
+                fraction,
+                rows,
+                kv_tokens,
+                prefill_tile,
+            } => {
+                let reserve = session_reserve_bytes(&cfg0, rows, kv_tokens, prefill_tile);
+                let plan = plan_slots(&gg, &cfg0, device, fraction, reserve)?;
                 if plan.working_set == 0 {
                     lloom_tensor::bail!(
                         "SlotBudget::Auto needs a Metal device (recommendedMaxWorkingSetSize)"
                     )
                 }
                 eprintln!(
-                    "SLOTPLAN working_set={} fraction={fraction} resident_bytes={} expert_bytes_per_slot={} slots={}",
-                    plan.working_set, plan.resident_bytes, plan.expert_bytes_per_slot, plan.slots
+                    "SLOTPLAN working_set={} fraction={fraction} resident_bytes={} expert_bytes_per_slot={} reserve_bytes={} rows={rows} kv_tokens={kv_tokens} prefill_tile={prefill_tile} slots={}",
+                    plan.working_set, plan.resident_bytes, plan.expert_bytes_per_slot, plan.reserve_bytes, plan.slots
                 );
                 plan.slots
             }
         };
+        // A fixed count is admitted like any load; `Auto` sized itself to
+        // the budget and passes by construction (or sits at the pool's
+        // `topk + 1` floor, which is then refused with the arithmetic).
+        admit_load(&plan_load(&gg, device, opts.fraction(), Some(slots)))?;
         let arm = match stream.loader {
             StreamLoader::Pread => LoaderArm::Pread,
             StreamLoader::Io => {
@@ -825,4 +1066,96 @@ fn load_layer<R: ExpertResidency, Rd: Read + Seek>(
         cfg,
     );
     Ok(Layer::new(hc_attn, mixer, hc_ffn, moe))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The numbers this machine's SLOTPLAN lines carry (issue #749 P18): a
+    /// 55.66 GB working set, a 4.12 GB resident tier, 83.8 MB a slot over
+    /// 512 experts.
+    fn this_machine(slots: Option<usize>, fraction: f64) -> LoadPlan {
+        LoadPlan {
+            resident_bytes: 4_115_863_040,
+            expert_bytes_per_slot: 83_814_400,
+            expert_bytes_total: 83_814_400 * 512,
+            slots,
+            working_set: 55_662_788_608,
+            fraction,
+        }
+    }
+
+    /// `--experts resident` is the run that panicked the machine: 47.0 GB
+    /// against a 36.2 GB budget at 0.65. Refused, with the reductions.
+    #[test]
+    fn the_resident_load_that_panicked_is_refused() {
+        let plan = this_machine(None, DEFAULT_MEMORY_FRACTION);
+        assert_eq!(plan.predicted(), 47_028_835_840);
+        assert!(!plan.fits());
+        let e = admit_load(&plan).unwrap_err().to_string();
+        assert!(e.contains("memory budget exceeded at load"), "{e}");
+        assert!(e.contains("--experts stream"), "{e}");
+        assert!(e.contains("--memory-fraction 0.85"), "{e}");
+        // What `Auto` sizes to at this fraction is admitted by construction.
+        let auto = this_machine(Some(plan.slots_that_fit()), DEFAULT_MEMORY_FRACTION);
+        assert_eq!(auto.slots, Some(382));
+        assert!(auto.fits() && admit_load(&auto).is_ok());
+        assert!(auto.describe().starts_with("memory budget OK at load"));
+    }
+
+    /// Exactly on the budget is admitted; one byte over is not; no working
+    /// set (not Metal) and a zero fraction never refuse.
+    #[test]
+    fn the_boundary_is_inclusive_and_the_check_is_metal_only() {
+        let mut plan = this_machine(None, 1.0);
+        plan.working_set = plan.predicted();
+        assert!(plan.fits());
+        plan.working_set -= 1;
+        assert!(!plan.fits());
+        plan.working_set = 0;
+        assert!(plan.fits());
+        let off = this_machine(None, 0.0);
+        assert!(off.fits());
+    }
+
+    /// The reserve at the harness defaults on this model's geometry: 12
+    /// full-attention layers, 2 kv heads × 256, indexer 128 → 50 176 B a
+    /// position; 4096 positions + two 512-tiles' transients + the pool's
+    /// free list. The slot plan leaves it out of the pool.
+    #[test]
+    fn the_auto_plan_leaves_the_session_reserve() {
+        let cfg = Config::tiny();
+        let per = kv_bytes_per_token(&cfg);
+        let full = cfg
+            .layer_types
+            .iter()
+            .filter(|k| matches!(k, LayerKind::Full))
+            .count();
+        assert_eq!(
+            per,
+            full * (2 * cfg.n_kv_heads * cfg.head_dim + cfg.indexer_head_dim) * 4
+        );
+        let r1 = session_reserve_bytes(&cfg, 1, 4096, 512);
+        let r4 = session_reserve_bytes(&cfg, 4, 4096, 512);
+        assert_eq!(r4 - r1, 3 * 4096 * per);
+        assert_eq!(
+            r1,
+            4096 * per
+                + 2 * 512 * super::super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
+                + POOL_FREE_RESERVE_BYTES
+        );
+        // A zero tile reserves one PREFILL_CHUNK's worth.
+        assert_eq!(session_reserve_bytes(&cfg, 1, 4096, 0), r1);
+    }
+
+    /// The default fraction is §9.5k's, the one LFM2's budget and the Metal
+    /// admission share.
+    #[test]
+    fn memory_fraction_matches_lfm2s() {
+        assert_eq!(
+            DEFAULT_MEMORY_FRACTION,
+            crate::models::lfm2::MemoryBudget::DEFAULT_FRACTION
+        );
+    }
 }

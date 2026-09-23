@@ -1214,6 +1214,275 @@ impl lloom_tensor::CustomOp2 for QsaPrep {
     }
 }
 
+/// The decode prologue over `B` rows at their own positions (the pooled rows
+/// arm): `qg [B, nh, 2·hd]`, `k [B, nkv, hd]`, `pos [B]` (u32) → the flat
+/// `[B · (2·nh + nkv) · hd]` of three row-major regions `q [B, nh, hd] |
+/// gate [B, nh, hd] | k [B, nkv, hd]`, row for row [`QsaPrep`]'s result.
+pub(crate) struct QsaPrepBatch {
+    pub hd: usize,
+    pub n_rot: usize,
+    pub nh: usize,
+    pub nkv: usize,
+    pub theta: f32,
+    pub eps: f32,
+    pub q_gamma: Tensor,
+    pub k_gamma: Tensor,
+}
+
+impl lloom_tensor::CustomOp3 for QsaPrepBatch {
+    fn name(&self) -> &'static str {
+        "qwen4exp-qsa-prep-batch"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("qsa_prep_batch: no cpu kernel; the rows compose it per row there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (hd, nh, nkv) = (self.hd, self.nh, self.nkv);
+        let rows = l3.shape().elem_count();
+        if rows == 0
+            || l1.shape().elem_count() != rows * nh * 2 * hd
+            || l2.shape().elem_count() != rows * nkv * hd
+            || s3.dtype() != lloom_tensor::DType::U32
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "qsa_prep_batch: qg {:?} / k {:?} / pos {:?} vs nh {nh} nkv {nkv} hd {hd}",
+                l1.shape(),
+                l2.shape(),
+                l3.shape()
+            )
+        }
+        let (qs, ql) = self.q_gamma.storage_and_layout();
+        let (ks, kl) = self.k_gamma.storage_and_layout();
+        let (qs, ks) = metal_pair(&qs, &ks, "qsa_prep_batch")?;
+        if ql.shape().elem_count() != hd
+            || kl.shape().elem_count() != hd
+            || !ql.is_contiguous()
+            || !kl.is_contiguous()
+        {
+            lloom_tensor::bail!("qsa_prep_batch: γ_q / γ_k must be contiguous [hd]")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("qsa_prep_batch");
+        let elem_count = rows * (2 * nh + nkv) * hd;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("qsa_prep_batch")
+            .build()?;
+        lloom_tensor::kernels::call_qsa_prep_batch(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            hd,
+            self.n_rot,
+            nh,
+            nkv,
+            self.theta,
+            self.eps,
+            metal_bo(s1, l1),
+            metal_bo(s2, l2),
+            metal_bo(s3, l3),
+            metal_bo(qs, ql),
+            metal_bo(ks, kl),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from(elem_count),
+        ))
+    }
+}
+
+/// `sdpa_vector` for `B` rows over one layer's page pool in ONE launch:
+/// `q [B, nh, hd]`, `k_pool` / `v_pool [nkv, tokens, hd]` → `[B, nh, hd]`;
+/// row `r` attends its `n_keys[r]` keys through its page table (`table[r ·
+/// table_stride ..]`), bit-identical to that row's own `ops::sdpa` over its
+/// keys laid contiguously (`kernels::sdpa_vector_paged`).
+pub(crate) struct SdpaVectorPaged {
+    pub nh: usize,
+    pub nkv: usize,
+    pub hd: usize,
+    pub page_size: usize,
+    pub table_stride: usize,
+    pub scale: f32,
+    /// The 2-pass kernel (the per-row arm's choice from
+    /// `ops::SDPA_TWO_PASS_K_THRESHOLD` keys; every row of the call takes it).
+    pub two_pass: bool,
+    /// `u32 [B · table_stride]`.
+    pub table: Tensor,
+    /// `u32 [B]` (bound as the kernel's `int` counts).
+    pub n_keys: Tensor,
+}
+
+impl lloom_tensor::CustomOp3 for SdpaVectorPaged {
+    fn name(&self) -> &'static str {
+        "qwen4exp-sdpa-vector-paged"
+    }
+    fn cpu_fwd(
+        &self,
+        _s1: &CpuStorage,
+        _l1: &Layout,
+        _s2: &CpuStorage,
+        _l2: &Layout,
+        _s3: &CpuStorage,
+        _l3: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("sdpa_vector_paged: no cpu kernel; the rows gather and compose there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s1: &lloom_tensor::MetalStorage,
+        l1: &Layout,
+        s2: &lloom_tensor::MetalStorage,
+        l2: &Layout,
+        s3: &lloom_tensor::MetalStorage,
+        l3: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let (nh, nkv, hd) = (self.nh, self.nkv, self.hd);
+        let rows = match l1.shape().dims() {
+            [b, h, d] if *h == nh && *d == hd => *b,
+            _ => lloom_tensor::bail!("sdpa_vector_paged: q {:?} vs nh {nh} hd {hd}", l1.shape()),
+        };
+        let tokens = match l2.shape().dims() {
+            [h, t, d] if *h == nkv && *d == hd => *t,
+            _ => lloom_tensor::bail!(
+                "sdpa_vector_paged: k pool {:?} vs nkv {nkv} hd {hd}",
+                l2.shape()
+            ),
+        };
+        if l3.shape().dims() != l2.shape().dims()
+            || !l1.is_contiguous()
+            || !l2.is_contiguous()
+            || !l3.is_contiguous()
+            || nh % nkv != 0
+            || rows == 0
+        {
+            lloom_tensor::bail!(
+                "sdpa_vector_paged: q {:?} / k {:?} / v {:?} (contiguous, nh {nh} a multiple of nkv {nkv})",
+                l1.shape(),
+                l2.shape(),
+                l3.shape()
+            )
+        }
+        let (ts, tl) = self.table.storage_and_layout();
+        let (ns, nl) = self.n_keys.storage_and_layout();
+        let (ts, ns) = metal_pair(&ts, &ns, "sdpa_vector_paged")?;
+        if ts.dtype() != lloom_tensor::DType::U32
+            || ns.dtype() != lloom_tensor::DType::U32
+            || tl.shape().elem_count() != rows * self.table_stride
+            || nl.shape().elem_count() != rows
+            || !tl.is_contiguous()
+            || !nl.is_contiguous()
+        {
+            lloom_tensor::bail!(
+                "sdpa_vector_paged: table {:?} (u32 [{rows} × {}]) / n_keys {:?} (u32 [{rows}])",
+                tl.shape(),
+                self.table_stride,
+                nl.shape()
+            )
+        }
+        // The host-side bound: every page a live key reaches lies in the pool.
+        let itype = match s1.dtype() {
+            lloom_tensor::DType::F32 => lloom_tensor::kernels::SdpaDType::F32,
+            lloom_tensor::DType::F16 => lloom_tensor::kernels::SdpaDType::F16,
+            other => lloom_tensor::bail!("sdpa_vector_paged: {other:?} (f32 | f16)"),
+        };
+        if s2.dtype() != s1.dtype() || s3.dtype() != s1.dtype() {
+            lloom_tensor::bail!("sdpa_vector_paged: q / k / v dtypes differ")
+        }
+        let device = s1.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("sdpa_vector_paged");
+        let elem_count = rows * nh * hd;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, s1.dtype())
+            .with_label("sdpa_vector_paged")
+            .build()?;
+        let esz = s1.dtype().size_in_bytes();
+        let scratch = if self.two_pass {
+            let blocks = lloom_tensor::kernels::SDPA_2PASS_BLOCKS;
+            let f32 = lloom_tensor::DType::F32;
+            let partials = device
+                .new_buffer_builder()
+                .with_size_for(rows * nh * blocks * hd, f32)
+                .with_label("sdpa_vector_paged_partials")
+                .build()?;
+            let sums = device
+                .new_buffer_builder()
+                .with_size_for(rows * nh * blocks, f32)
+                .with_label("sdpa_vector_paged_sums")
+                .build()?;
+            let maxs = device
+                .new_buffer_builder()
+                .with_size_for(rows * nh * blocks, f32)
+                .with_label("sdpa_vector_paged_maxs")
+                .build()?;
+            Some((partials, sums, maxs))
+        } else {
+            None
+        };
+        lloom_tensor::kernels::call_sdpa_vector_paged(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            nh,
+            nh / nkv,
+            hd,
+            l1.start_offset() * esz,
+            s1.buffer(),
+            l2.start_offset() * esz,
+            s2.buffer(),
+            tokens * hd,
+            l3.start_offset() * esz,
+            s3.buffer(),
+            tokens * hd,
+            ts.buffer(),
+            tl.start_offset() * 4,
+            self.table_stride,
+            ns.buffer(),
+            nl.start_offset() * 4,
+            self.page_size,
+            &output,
+            self.scale,
+            itype,
+            scratch.as_ref().map(|(p, s, m)| (&***p, &***s, &***m)),
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s1.dtype()),
+            Shape::from((rows, nh, hd)),
+        ))
+    }
+}
+
 /// `sigmoid(a) · b`, elementwise.
 pub(crate) struct SigmoidMul;
 

@@ -5,8 +5,8 @@
 //! measure`).
 #![cfg(feature = "metal")]
 use lloom::models::qwen4exp::{
-    testing, Cache, Config, GatedDeltaNet, HyperConnection, KvCache, Layer, Mixer, MoeLayer,
-    QsaAttention, Resident,
+    testing, Cache, Config, GatedDeltaNet, HyperConnection, KvCache, KvPool, Layer, Mixer,
+    MoeLayer, QsaAttention, Resident,
 };
 use lloom::nn::{RecurrentState, RmsNorm};
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
@@ -16,7 +16,7 @@ use std::time::Instant;
 
 fn q4(out: usize, inp: usize, dev: &Device) -> QMatMul {
     let w = Tensor::randn(0f32, 0.05, (out, inp), dev).unwrap();
-    let dt = if inp % 256 == 0 {
+    let dt = if inp.is_multiple_of(256) {
         GgmlDType::Q4K
     } else {
         GgmlDType::Q8_0
@@ -104,7 +104,7 @@ fn blocks_at_rows_1_and_4() {
     let layer = Layer::new(hc(), Mixer::Linear(dn), hc(), moe(0));
     let (hc_a, moe_a) = (hc(), moe(1));
     let steps = 20;
-    for rows in [1usize, 4] {
+    for rows in [1usize, 4, 8] {
         let h = Tensor::randn(0f32, 0.3, (rows, 1, nd), &dev).unwrap();
         let xin = Tensor::randn(0f32, 0.3, (rows, 1, d), &dev).unwrap();
         let t_hc = time(&dev, steps, || {
@@ -132,6 +132,38 @@ fn blocks_at_rows_1_and_4() {
             let mut refs: Vec<&mut KvCache> = kvs.iter_mut().collect();
             let _ = qsa.decode_rows(&xin, &mut refs).unwrap();
         });
+        // The same rows in one KV page pool (the one-launch arm).
+        let pool = KvPool::new(rows, 1, nkv, hd, DType::F32, &dev);
+        let leases: Vec<_> = (0..rows).map(|_| pool.lease().unwrap()).collect();
+        let mut pkvs: Vec<KvCache> = leases
+            .iter()
+            .map(|l| KvCache::in_pool(&pool, l, 0))
+            .collect();
+        for _ in 0..200 {
+            let mut refs: Vec<&mut KvCache> = pkvs.iter_mut().collect();
+            let _ = qsa.decode_rows(&xin, &mut refs).unwrap();
+        }
+        let t_qsa_pool = time(&dev, steps, || {
+            let mut refs: Vec<&mut KvCache> = pkvs.iter_mut().collect();
+            let _ = qsa.decode_rows(&xin, &mut refs).unwrap();
+        });
+        // The same at ~1800 keys (still within the dense range): the per-row
+        // vector kernel is `nh` threadgroups per launch; the pool's one
+        // launch is `rows · nh`.
+        for _ in 0..1600 {
+            let mut refs: Vec<&mut KvCache> = kvs.iter_mut().collect();
+            let _ = qsa.decode_rows(&xin, &mut refs).unwrap();
+            let mut refs: Vec<&mut KvCache> = pkvs.iter_mut().collect();
+            let _ = qsa.decode_rows(&xin, &mut refs).unwrap();
+        }
+        let t_qsa_long = time(&dev, steps, || {
+            let mut refs: Vec<&mut KvCache> = kvs.iter_mut().collect();
+            let _ = qsa.decode_rows(&xin, &mut refs).unwrap();
+        });
+        let t_qsa_pool_long = time(&dev, steps, || {
+            let mut refs: Vec<&mut KvCache> = pkvs.iter_mut().collect();
+            let _ = qsa.decode_rows(&xin, &mut refs).unwrap();
+        });
         let t_moe = time(&dev, steps, || {
             let _ = moe_a.decode(&xin).unwrap();
         });
@@ -141,7 +173,7 @@ fn blocks_at_rows_1_and_4() {
             let _ = layer.decode_parts_rows(&h, 0, &mut refs, false).unwrap();
         });
         println!(
-            "ROWTIME rows={rows} hc_bracket={t_hc:.3}ms deltanet={t_dn:.3}ms qsa={t_qsa:.3}ms moe={t_moe:.3}ms linear_layer={t_layer:.3}ms  per_row: hc={:.3} dn={:.3} qsa={:.3} moe={:.3} layer={:.3}",
+            "ROWTIME rows={rows} hc_bracket={t_hc:.3}ms deltanet={t_dn:.3}ms qsa={t_qsa:.3}ms qsa_pooled={t_qsa_pool:.3}ms qsa_1800={t_qsa_long:.3}ms qsa_pooled_1800={t_qsa_pool_long:.3}ms moe={t_moe:.3}ms linear_layer={t_layer:.3}ms  per_row: hc={:.3} dn={:.3} qsa={:.3} moe={:.3} layer={:.3}",
             t_hc / rows as f64,
             t_dn / rows as f64,
             t_qsa / rows as f64,

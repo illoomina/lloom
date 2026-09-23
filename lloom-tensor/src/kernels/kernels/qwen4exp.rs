@@ -440,6 +440,64 @@ pub fn call_qsa_prep(
     Ok(())
 }
 
+/// `qsa_prep_batch_f32`: [`call_qsa_prep`] over `rows` rows in one launch —
+/// `qg [rows, nh, 2·hd]`, `k [rows, nkv, hd]`, `pos [rows]` (u32) → `out`
+/// as three row-major regions `q [rows, nh, hd] | gate [rows, nh, hd] | k
+/// [rows, nkv, hd]`, row for row the single kernel's result.
+#[allow(clippy::too_many_arguments)]
+pub fn call_qsa_prep_batch(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    hd: usize,
+    n_rot: usize,
+    nh: usize,
+    nkv: usize,
+    theta: f32,
+    eps: f32,
+    qg: BufferOffset,
+    k: BufferOffset,
+    pos: BufferOffset,
+    q_gamma: BufferOffset,
+    k_gamma: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if hd > 1024 || n_rot > hd || !n_rot.is_multiple_of(2) {
+        return Err(MetalKernelError::LoadFunctionError(format!(
+            "qsa_prep_batch: head_dim {hd} (<= 1024), n_rot {n_rot} (even, <= head_dim)"
+        )));
+    }
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "qsa_prep_batch_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "qsa_prep_batch rows={rows} hd={hd} nh={nh} nkv={nkv}"
+    );
+    set_params!(
+        encoder,
+        (
+            &qg,
+            &k,
+            &pos,
+            &q_gamma,
+            &k_gamma,
+            Output::new(out),
+            hd as u32,
+            n_rot as u32,
+            nh as u32,
+            nkv as u32,
+            theta,
+            eps,
+            rows as u32
+        )
+    );
+    dispatch_groups_2d(encoder, nh + nkv, rows, head_width(hd, &pipeline));
+    Ok(())
+}
+
 /// `sigmoid_mul_f32`: `out = sigmoid(a) · b` over `n` elements.
 pub fn call_sigmoid_mul(
     device: &Device,

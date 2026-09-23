@@ -25,12 +25,18 @@ pub use config::{Config, LayerKind};
 pub use deltanet::{decode_step, DeltaNetDims};
 pub use deltanet_block::GatedDeltaNet;
 pub use hc::HyperConnection;
-pub use loader::{LoadOptions, SlotBudget, SlotPlan, StreamLoader, StreamOptions};
-pub use model::{Cache, Layer, Mixer, Qwen4Exp, StatePools};
+pub use loader::{
+    admit_load, LoadOptions, LoadPlan, SlotBudget, SlotPlan, StreamLoader, StreamOptions,
+    DEFAULT_MEMORY_FRACTION,
+};
+pub use model::{
+    Cache, Layer, MemCheck, Mixer, PassPlan, Qwen4Exp, StatePools,
+    PREFILL_TRANSIENT_BYTES_PER_TOKEN,
+};
 pub use moe::{ExpertResidency, MoeLayer, Resident, Streamed};
 pub use mtp::{MtpDrafter, MtpHead};
 pub use ple::{CachedPleTable, MmapPleTable, NgramHash, NgramWindow, PleLayer, PleTable};
-pub use qsa::{Indexer, KvCache, QsaAttention};
+pub use qsa::{Indexer, KvCache, KvPool, QsaAttention};
 
 /// Sub-block activation trace, for bisecting a non-finite forward on the real
 /// model. Off unless `QWEN4EXP_TRACE` is set (read once); when on, each

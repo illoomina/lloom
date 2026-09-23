@@ -34,12 +34,13 @@ pub mod kv_cache;
 pub mod layer_norm;
 pub mod linear;
 pub mod loss;
+pub mod memory;
 pub mod model;
 pub mod moe;
 pub mod observer;
 pub mod ops;
-pub mod recurrent;
 pub mod optim;
+pub mod recurrent;
 pub mod rnn;
 pub mod rotary_emb;
 pub mod sampling;
@@ -54,13 +55,13 @@ pub mod varlen_attention {
 
 pub use activation::{prelu, Activation, PReLU};
 pub use batch_norm::{batch_norm, BatchNorm, BatchNormConfig};
+pub use batched::{BatchDecoder, RowDriver, RowId, StepReport};
+pub use batched_spec::SpecBatchDecoder;
 pub use conv::{
     conv1d, conv1d_no_bias, conv2d, conv2d_no_bias, conv_transpose1d, conv_transpose1d_no_bias,
     conv_transpose2d, conv_transpose2d_no_bias, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig,
     ConvTranspose1d, ConvTranspose1dConfig, ConvTranspose2d, ConvTranspose2dConfig,
 };
-pub use batched::{BatchDecoder, RowDriver, RowId, StepReport};
-pub use batched_spec::SpecBatchDecoder;
 pub use decode::{
     ladder_width, ragged_layout, DecodeOptions, DecodeOut, DecodeStats, IdentityProposer,
     PassWidths, PrefillOut, RoundStats, StepPhases, FIRST_STEPS_TRACED,
@@ -77,23 +78,22 @@ pub use layer_norm::{
 };
 pub use linear::{linear, linear_b, linear_no_bias, Linear};
 pub use model::{
-    BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, Model, RaggedRow, Row, Speculative,
-    VisionEncoder,
+    BatchedCausalLM, CacheReset, CacheRewind, CacheShare, CausalLM, Model, RaggedRow, Row,
+    Speculative, VisionEncoder,
 };
 pub use observer::{
     ForwardObserver, HcStatePoint, HookKind, HookPlan, HookPoint, LayerInputPoint,
     LayerOutputPoint, NextnHiddenPoint,
 };
-pub use recurrent::{RecurrentState, StatePool};
 pub use ops::Dropout;
 pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
+pub use recurrent::{RecurrentState, StatePool};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
 pub use speculator::{
     Anchor, Draft, DraftTokens, KvSource, LayerTaps, NextnHidden, NoProbe, ObserveRow, PhaseCensus,
-    Prepared,
-    ProbeHooks, Probes, ReuseAction, RoundProbe, RoundTiming, SeqId, Sequence, Session, Speculator,
-    TapSide, TapSpec, TargetProbe, VerifyRowRef,
+    Prepared, ProbeHooks, Probes, ReuseAction, RoundProbe, RoundTiming, SeqId, Sequence, Session,
+    Speculator, TapSide, TapSpec, TargetProbe, VerifyRowRef,
 };
 pub use var_builder::VarBuilder;
 pub use var_map::VarMap;

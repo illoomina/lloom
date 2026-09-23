@@ -1999,8 +1999,7 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
         if supports_sdpa_vector {
             // Route to the 2 pass fused attention if the k seqlen is large.
             // https://github.com/ml-explore/mlx/pull/1597
-            const TWO_PASS_K_THRESHOLD: usize = 1024;
-            if k_seq >= TWO_PASS_K_THRESHOLD {
+            if k_seq >= SDPA_TWO_PASS_K_THRESHOLD {
                 let mut intermediate_shape = [
                     &out_dims[0..out_dims.len() - 2],
                     &[lloom_tensor::kernels::SDPA_2PASS_BLOCKS],
@@ -2207,6 +2206,12 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
     }
 }
 
+/// Keys from which the `q_seq == 1` Metal arm of [`sdpa`] takes the 2-pass
+/// vector kernel (`sdpa_vector_2pass_*`) instead of the single-pass one — a
+/// different reduction, so anything meant to be bit-identical to [`sdpa`]
+/// per row (`qwen4exp`'s paged rows) must split its rows at this count.
+pub const SDPA_TWO_PASS_K_THRESHOLD: usize = 1024;
+
 /// Scaled dot product attention with a fused kernel.
 ///
 /// Computes softmax(qk^T*scale)v.
@@ -2312,8 +2317,8 @@ pub fn sdpa_paged(
 #[cfg(feature = "metal")]
 fn flash_partial_width() -> usize {
     static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *WIDTH.get_or_init(|| {
-        match std::env::var("LLOOM_FLASH_PARTIAL_BN").ok().as_deref() {
+    *WIDTH.get_or_init(
+        || match std::env::var("LLOOM_FLASH_PARTIAL_BN").ok().as_deref() {
             Some("8") => 8,
             Some("32") | None => 32,
             Some(other) => {
@@ -2323,8 +2328,8 @@ fn flash_partial_width() -> usize {
                 );
                 32
             }
-        }
-    })
+        },
+    )
 }
 
 /// [`sdpa_paged`] over a RAGGED batch: row `b` of `q` (`[b, n_q_heads,
@@ -3383,7 +3388,9 @@ impl lloom_tensor::CustomOp3 for FlashDecoding<'_> {
             Some(p) => (std::borrow::Cow::Borrowed(p.entries), p.stride),
             // Every row reads the one identity table.
             None => (
-                std::borrow::Cow::Owned(ChunkTable::Contiguous.entries(n_chunks, self.pages_per_chunk)),
+                std::borrow::Cow::Owned(
+                    ChunkTable::Contiguous.entries(n_chunks, self.pages_per_chunk),
+                ),
                 0,
             ),
         };

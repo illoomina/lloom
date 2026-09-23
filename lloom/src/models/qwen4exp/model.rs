@@ -14,7 +14,7 @@ use super::deltanet_block::GatedDeltaNet;
 use super::hc::HyperConnection;
 use super::moe::{ExpertResidency, MoeLayer};
 use super::ple::{NgramHash, NgramWindow, PleLayer, PleTable};
-use super::qsa::{KvCache, QsaAttention};
+use super::qsa::{KvCache, KvPool, QsaAttention};
 use super::trace;
 use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
@@ -255,6 +255,10 @@ pub struct Cache {
     /// Decode passes that ran the host plan while the device plan was
     /// disarmed (the cold phase's length, in tokens).
     pub host_plan_passes: u64,
+    /// The `(pos, seq)` the last `prepare_pass` sized and admitted, so the
+    /// same pass prepared twice (driver, then `forward`'s chunk loop) reads
+    /// the device once.
+    prepared: Option<(usize, usize)>,
 }
 
 /// What a speculative window must put back besides the recurrent channels'
@@ -288,6 +292,12 @@ impl Cache {
         cache.conv_state = RecurrentState::in_pool(&pools.conv)?;
         if let Some(p) = &pools.ple {
             cache.ple_conv = RecurrentState::in_pool(p)?;
+        }
+        if let Some(p) = &pools.kv {
+            let lease = p.lease()?;
+            for (l, kv) in cache.kv.iter_mut().enumerate() {
+                *kv = KvCache::in_pool(p, &lease, l);
+            }
         }
         Ok(cache)
     }
@@ -362,10 +372,12 @@ impl Cache {
             redos: 0,
             device_plan_armed: false,
             host_plan_passes: 0,
+            prepared: None,
         }
     }
 
     pub fn reset(&mut self) {
+        self.prepared = None;
         self.s_state.reset();
         self.conv_state.reset();
         for k in &mut self.kv {
@@ -590,7 +602,77 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// Some layer's residency plans on the device (`Streamed`): a decode
     /// pass runs under a window and settles at its end (`decode_embed`).
     device_plan: bool,
+    /// The per-pass memory check (`prepare_pass`, §9.5p's shape): the
+    /// fraction of `recommendedMaxWorkingSetSize` a pass may take the
+    /// process to, and whether a pass over it is refused or reported.
+    memory_fraction: f64,
+    mem_check: MemCheck,
     cfg: Config,
+}
+
+/// What `prepare_pass` does with a pass the budget cannot take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemCheck {
+    /// No device read, no check (the pre-#749-P18 behaviour).
+    Off,
+    /// Read and report on stderr (`MEMCHECK` lines), never refuse — the arm
+    /// the transient term is measured under (`PREFILL_TRANSIENT_BYTES_PER_TOKEN`).
+    Report,
+    /// Refuse the pass with the arithmetic, before any state moves.
+    Refuse,
+}
+
+impl MemCheck {
+    /// `QWEN4EXP_MEM` = `off` | `report` | `refuse`, read once; `refuse`
+    /// by default — flipped from `report` with the transient term measured
+    /// (`PREFILL_TRANSIENT_BYTES_PER_TOKEN`, DESIGN §7.1a).
+    pub fn from_env() -> Self {
+        static ARM: std::sync::OnceLock<MemCheck> = std::sync::OnceLock::new();
+        *ARM.get_or_init(|| match std::env::var("QWEN4EXP_MEM").ok().as_deref() {
+            Some("off") => MemCheck::Off,
+            Some("report") => MemCheck::Report,
+            Some("refuse") | None => MemCheck::Refuse,
+            Some(other) => {
+                eprintln!("QWEN4EXP_MEM={other}: off | report | refuse; using refuse");
+                MemCheck::Refuse
+            }
+        })
+    }
+}
+
+/// Bytes one position of a multi-token pass adds to the process's Metal
+/// allocation while the pass is in flight — the activation class of §9.5n
+/// for this family, per token, over the whole layer stack (the class sums
+/// over layers because a buffer returns only when its command buffer
+/// completes, §6.3b).
+///
+/// **Measured 2026-09-23** (issue #749 P18, `qwen4exp-dispatches-raw/
+/// p18-stream-long1.txt`): a 937-token prompt in 512-token tiles paced at
+/// depth 2, `--experts stream`, the gauge sampling at 10 ms — the pool's
+/// `pending` peaks at **1.34 GB** and `device_allocated` at **+1.51 GB**
+/// over the load, with two tiles in flight: **~2.6 MB a position**. Rounded
+/// up to 3 MB. A pass is admitted against `PREFILL_TRANSIENT_BYTES_PER_TOKEN
+/// × seq` plus its KV grow. Re-measure when the prefill path's allocation
+/// shape moves (a fused chunk kernel, `--moe-act f16`, a wider tile).
+pub const PREFILL_TRANSIENT_BYTES_PER_TOKEN: usize = 3 * 1000 * 1000;
+
+/// What a pass of `seq` positions at `pos` would allocate before it runs:
+/// the KV grow (slab or pool) and the transient term. Sized, not performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassPlan {
+    pub pos: usize,
+    pub seq: usize,
+    /// Bytes the QSA layers' KV grows by for this pass (0 when every
+    /// layer's slab or pool already holds `pos + seq`).
+    pub kv_grow: usize,
+    /// `PREFILL_TRANSIENT_BYTES_PER_TOKEN × seq` for `seq > 1`, else 0.
+    pub transient: usize,
+}
+
+impl PassPlan {
+    pub fn bytes(&self) -> usize {
+        self.kv_grow + self.transient
+    }
 }
 
 impl<R: ExpertResidency> Qwen4Exp<R> {
@@ -611,8 +693,108 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             mtp: None,
             prefill_mode: PrefillMode::default(),
             device_plan,
+            memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
+            mem_check: MemCheck::from_env(),
             cfg,
         }
+    }
+
+    /// The fraction of `recommendedMaxWorkingSetSize` a pass may take the
+    /// process to (`prepare_pass`); the load's own (`LoadOptions::
+    /// memory_fraction`) by default. 0 turns the per-pass check off.
+    pub fn set_memory_fraction(&mut self, fraction: f64) {
+        self.memory_fraction = fraction.max(0.0);
+    }
+
+    pub fn memory_fraction(&self) -> f64 {
+        self.memory_fraction
+    }
+
+    /// What a pass the budget cannot take does (the env's arm by default).
+    pub fn set_mem_check(&mut self, arm: MemCheck) {
+        self.mem_check = arm;
+    }
+
+    pub fn mem_check(&self) -> MemCheck {
+        self.mem_check
+    }
+
+    /// Size the session allocations a pass of `seq` positions from
+    /// `cache.pos` would make: every full-attention layer's KV grow (a slab
+    /// widened, or the batch pool's next page slab) and the transient term.
+    /// No side effects.
+    pub fn plan_pass(&self, cache: &Cache, seq: usize) -> PassPlan {
+        let (nkv, hd) = (self.cfg.n_kv_heads, self.cfg.head_dim);
+        let elem = lloom_tensor::DType::F32.size_in_bytes();
+        let mut kv_grow = 0usize;
+        for (l, layer) in self.layers.iter().enumerate() {
+            if matches!(layer.mixer, Mixer::Full(_)) {
+                kv_grow += cache.kv[l].grow_bytes_for(seq, nkv, hd, elem);
+            }
+        }
+        let transient = if seq > 1 {
+            PREFILL_TRANSIENT_BYTES_PER_TOKEN.saturating_mul(seq)
+        } else {
+            0
+        };
+        PassPlan {
+            pos: cache.pos,
+            seq,
+            kv_grow,
+            transient,
+        }
+    }
+
+    /// `Model::prepare_pass` for this family (§9.5p's per-pass device
+    /// read): size the pass, and when it allocates — a KV grow, a
+    /// multi-token pass with a measured transient — read the device and
+    /// refuse (or report) BEFORE anything moves: `currentAllocatedSize +
+    /// bytes ≤ memory_fraction × recommendedMaxWorkingSetSize`. A decode
+    /// step inside its slab reads nothing (§9.5e: no per-token Metal call).
+    /// Idempotent per `(pos, seq)`: a driver prepares, then `forward`'s own
+    /// chunk loop prepares the same pass and finds it done.
+    pub fn prepare_pass_inner(&self, cache: &mut Cache, seq: usize) -> Result<()> {
+        if seq == 0 || cache.prepared == Some((cache.pos, seq)) {
+            return Ok(());
+        }
+        let plan = self.plan_pass(cache, seq);
+        cache.prepared = Some((cache.pos, seq));
+        if plan.bytes() == 0 || self.mem_check == MemCheck::Off || self.memory_fraction <= 0.0 {
+            return Ok(());
+        }
+        #[cfg(feature = "metal")]
+        if let Ok(m) = self.device().as_metal_device() {
+            use crate::models::lfm2::{kv_grow_budget, kv_grow_fits};
+            let dev = m.device();
+            let allocated = dev.current_allocated_size();
+            let working_set = dev.recommended_max_working_set_size();
+            let fits = kv_grow_fits(allocated, working_set, self.memory_fraction, plan.bytes());
+            let gb = |b: usize| b as f64 / 1e9;
+            let line = format!(
+                "pos={} seq={} kv_grow={:.3} GB transient={:.3} GB allocated={:.2} GB budget={:.2} GB ({:.2} x working_set {:.2} GB) fits={fits}",
+                plan.pos,
+                plan.seq,
+                gb(plan.kv_grow),
+                gb(plan.transient),
+                gb(allocated),
+                gb(kv_grow_budget(working_set, self.memory_fraction)),
+                self.memory_fraction,
+                gb(working_set),
+            );
+            match self.mem_check {
+                MemCheck::Report => eprintln!("MEMCHECK {line}"),
+                MemCheck::Refuse if !fits => {
+                    cache.prepared = None;
+                    lloom_tensor::bail!(
+                        "qwen4exp pass refused {line}: the pass stops here, before anything is \
+                         written, rather than risk the machine (DESIGN.md 9.5, 3.5): a smaller \
+                         prefill tile, `--memory-fraction`, free memory, or bound the run."
+                    )
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Attach the MTP head.
@@ -870,6 +1052,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                         len = len.min(limit.saturating_sub(cache.pos)).max(1);
                     }
                     let h = embeds.narrow(1, start, len)?;
+                    // Each chunk is a pass of its own: admitted here when the
+                    // driver handed the whole prompt over untiled.
+                    self.prepare_pass_inner(cache, len)?;
                     logits = Some(if len == 1 {
                         self.decode_embed(&h, cache, obs)?
                     } else {
@@ -1117,6 +1302,10 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
         Ok(Cache::new(cfg))
     }
 
+    fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
+        self.prepare_pass_inner(cache, seq_len)
+    }
+
     fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
         Qwen4Exp::embed(self, tokens)
     }
@@ -1317,6 +1506,9 @@ pub struct StatePools {
     pub conv: crate::nn::StatePool,
     /// The PLE's dilated-conv history, when a PLE is attached.
     pub ple: Option<crate::nn::StatePool>,
+    /// The QSA layers' KV in one page pool with per-row tables (§12.2), for
+    /// a batch of rows; `None` keeps every row's own slab (a single row).
+    pub kv: Option<KvPool>,
 }
 
 impl<R: ExpertResidency> Qwen4Exp<R> {
@@ -1369,6 +1561,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     dev,
                 )
             }),
+            kv: (rows > 1)
+                .then(|| KvPool::new(rows, n, self.cfg.n_kv_heads, self.cfg.head_dim, f32, dev)),
         }
     }
 

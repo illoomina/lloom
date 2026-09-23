@@ -574,6 +574,135 @@ template <typename T, int D>
       simd_lid);
 }
 
+
+// `sdpa_vector` over a PAGE POOL for B rows in one dispatch: row `r`'s
+// `nh` query heads are threadgroups `r·nh .. (r+1)·nh`; key `i` of row `r`
+// lives at pool token `table[r·table_stride + i / page_size]·page_size +
+// i % page_size` and the row attends its own `n_keys[r]` keys. The
+// arithmetic per key and the cross-simdgroup merge are `sdpa_vector_body`'s
+// line for line — only the ADDRESS of key `i` changes — so each row's
+// output is bit-identical to that row's own `sdpa_vector` over its keys laid
+// contiguously (`qwen4exp`'s pooled rows gate). `keys` / `values` are one
+// layer's pool `[n_kv_heads, tokens, D]` (`k_stride` = the head stride).
+template <typename T, int D>
+[[kernel]] void sdpa_vector_paged(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    const device uint* table [[buffer(4)]],
+    const device int* n_keys [[buffer(5)]],
+    const constant int& gqa_factor [[buffer(6)]],
+    const constant int& nh [[buffer(7)]],
+    const constant int& table_stride [[buffer(8)]],
+    const constant int& page_size [[buffer(9)]],
+    const constant size_t& k_stride [[buffer(10)]],
+    const constant size_t& v_stride [[buffer(11)]],
+    const constant float& scale [[buffer(12)]],
+    const constant float& softcapping [[buffer(13)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+
+  typedef float U;
+
+  threadgroup float outputs[BN * BD];
+  threadgroup float max_scores[BN];
+  threadgroup float sum_exp_scores[BN];
+
+  thread U q[elem_per_thread];
+  thread U k[elem_per_thread];
+  thread U o[elem_per_thread];
+
+  // Adjust positions
+  const int head_idx = tid.y;
+  const int row = head_idx / nh;
+  const int kv_head_idx = (head_idx % nh) / gqa_factor;
+  const int N = n_keys[row];
+  const device uint* tab = table + row * table_stride;
+  queries += head_idx * D + simd_lid * elem_per_thread;
+  keys += kv_head_idx * k_stride + simd_lid * elem_per_thread;
+  values += kv_head_idx * v_stride + simd_lid * elem_per_thread;
+  out += head_idx * D + simd_gid * elem_per_thread;
+
+  // Read the query and 0 the output accumulator
+  for (int i = 0; i < elem_per_thread; i++) {
+    q[i] = static_cast<U>(scale) * queries[i];
+  }
+  for (int i = 0; i < elem_per_thread; i++) {
+    o[i] = 0;
+  }
+
+  U max_score = -INFINITY;
+  U sum_exp_score = 0;
+
+  // For each key, at the pool token its page names
+  for (int i = simd_gid; i < N; i += BN) {
+    const size_t slot = (size_t)tab[i / page_size] * (size_t)page_size + (size_t)(i % page_size);
+    const device T* kp = keys + slot * D;
+    const device T* vp = values + slot * D;
+    // Read the key
+    for (int j = 0; j < elem_per_thread; j++) {
+      k[j] = kp[j];
+    }
+
+    // Compute the i-th score
+    U score = 0;
+    for (int j = 0; j < elem_per_thread; j++) {
+      score += q[j] * k[j];
+    }
+    score = simd_sum(score);
+    if (softcapping != 1.) {
+      score = precise::tanh(score);
+      score = score * softcapping;
+    }
+
+    // Update the accumulators
+    U new_max = max(max_score, score);
+    U factor = fast::exp(max_score - new_max);
+    U exp_score = fast::exp(score - new_max);
+
+    max_score = new_max;
+    sum_exp_score = sum_exp_score * factor + exp_score;
+
+    // Update the output accumulator
+    for (int j = 0; j < elem_per_thread; j++) {
+      o[j] = o[j] * factor + exp_score * vp[j];
+    }
+  }
+
+  // Each thread has a partial part of the output so we need to combine them.
+
+  // First let's communicate the max and sum_exp
+  if (simd_lid == 0) {
+    max_scores[simd_gid] = max_score;
+    sum_exp_scores[simd_gid] = sum_exp_score;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  max_score = max_scores[simd_lid];
+  U new_max = simd_max(max_score);
+  U factor = fast::exp(max_score - new_max);
+  sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+  // Now we need to aggregate all the outputs
+  for (int i = 0; i < elem_per_thread; i++) {
+    outputs[simd_lid * BD + simd_gid] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor) / sum_exp_score;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // And write the output
+  if (simd_lid == 0) {
+    for (int i = 0; i < elem_per_thread; i++) {
+      out[i] = static_cast<T>(o[i]);
+    }
+  }
+}
+
 template <typename T, int D>
 [[kernel]] void sdpa_vector_2pass_1(
     const device T* queries [[buffer(0)]],
@@ -676,6 +805,144 @@ template <typename T, int D>
     values += blocks * stride;
     if (sdpa_vector_has_mask) {
       mask += BN * blocks * mask_seq_stride;
+    }
+  }
+
+  // Each thread has a partial part of the output so we need to combine them.
+
+  // First let's communicate the max and sum_exp
+  if (simd_lid == 0) {
+    max_scores[simd_gid] = max_score;
+    sum_exp_scores[simd_gid] = sum_exp_score;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  max_score = (simd_lid < BN) ? max_scores[simd_lid] : -1e9;
+  U new_max = simd_max(max_score);
+  U factor = fast::exp(max_score - new_max);
+  sum_exp_score = (simd_lid < BN) ? sum_exp_scores[simd_lid] : 0;
+  sum_exp_score = simd_sum(sum_exp_score * factor);
+
+  // Write the sum and new max
+  if (simd_gid == 0) {
+    sums[0] = sum_exp_score;
+    maxs[0] = new_max;
+  }
+
+  // Now we need to aggregate all the outputs
+  for (int i = 0; i < elem_per_thread; i++) {
+    outputs[simd_lid * BN + simd_gid] =
+        o[i] * fast::exp(max_scores[simd_gid] - new_max);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // And write the output
+    if (simd_gid == 0) {
+      U output = outputs[simd_lid * BN];
+      for (int j = 1; j < BN; j++) {
+        output += outputs[simd_lid * BN + j];
+      }
+      out[i] = static_cast<T>(output);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+// `sdpa_vector_2pass_1` over a PAGE POOL for B rows (the paged rows arm past
+// the 2-pass threshold): the partials of row `r`'s heads, key `i` at the pool
+// token its page names — `sdpa_vector_paged`'s addressing on the 2-pass
+// kernel's arithmetic; `sdpa_vector_2pass_2` merges the partials unchanged.
+template <typename T, int D>
+[[kernel]] void sdpa_vector_2pass_1_paged(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const device uint* table [[buffer(6)]],
+    const device int* n_keys [[buffer(7)]],
+    const constant int& gqa_factor [[buffer(8)]],
+    const constant int& nh [[buffer(9)]],
+    const constant int& table_stride [[buffer(10)]],
+    const constant int& page_size [[buffer(11)]],
+    const constant size_t& k_stride [[buffer(12)]],
+    const constant size_t& v_stride [[buffer(13)]],
+    const constant float& scale [[buffer(14)]],
+    const constant float& softcapping [[buffer(15)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 8;
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+  constexpr int blocks = 32;
+
+  typedef float U;
+
+  thread U q[elem_per_thread];
+  thread U k[elem_per_thread];
+  thread U o[elem_per_thread];
+
+  threadgroup U outputs[BN * BD];
+  threadgroup U max_scores[BN];
+  threadgroup U sum_exp_scores[BN];
+
+  // Adjust positions
+  const int block_idx = tid.z;
+  const int head_idx = tid.y;
+  const int row = head_idx / nh;
+  const int kv_head_idx = (head_idx % nh) / gqa_factor;
+  const int N = n_keys[row];
+  const device uint* tab = table + row * table_stride;
+  queries += head_idx * D + simd_lid * elem_per_thread;
+  keys += kv_head_idx * k_stride + simd_lid * elem_per_thread;
+  values += kv_head_idx * v_stride + simd_lid * elem_per_thread;
+  out += head_idx * blocks * D + block_idx * D + simd_lid * elem_per_thread;
+  sums += head_idx * blocks + block_idx;
+  maxs += head_idx * blocks + block_idx;
+
+  // Read the query and 0 the output accumulator
+  for (int i = 0; i < elem_per_thread; i++) {
+    q[i] = static_cast<U>(scale) * queries[i];
+  }
+  for (int i = 0; i < elem_per_thread; i++) {
+    o[i] = 0;
+  }
+
+  U max_score = -1e9;
+  U sum_exp_score = 0;
+
+  // For each key, at the pool token its page names
+  for (int i = block_idx * BN + simd_gid; i < N; i += blocks * BN) {
+    const size_t slot = (size_t)tab[i / page_size] * (size_t)page_size + (size_t)(i % page_size);
+    const device T* kp = keys + slot * D;
+    const device T* vp = values + slot * D;
+    // Read the key
+    for (int j = 0; j < elem_per_thread; j++) {
+      k[j] = kp[j];
+    }
+
+    // Compute the i-th score
+    U score = 0;
+    for (int j = 0; j < elem_per_thread; j++) {
+      score += q[j] * k[j];
+    }
+    score = simd_sum(score);
+    if (softcapping != 1.) {
+      score = precise::tanh(score);
+      score = score * softcapping;
+    }
+
+    // Update the accumulators
+    U new_max = max(max_score, score);
+    U factor = fast::exp(max_score - new_max);
+    U exp_score = fast::exp(score - new_max);
+
+    max_score = new_max;
+    sum_exp_score = sum_exp_score * factor + exp_score;
+
+    // Update the output accumulator
+    for (int j = 0; j < elem_per_thread; j++) {
+      o[j] = o[j] * factor + exp_score * vp[j];
     }
   }
 
@@ -3251,4 +3518,65 @@ static_assert(alignof(SdpaQuantWriteParams) == 8, "SdpaQuantWriteParams alignmen
 instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)
 instantiate_sdpa_vector_heads(float16_t)
+
+#define instantiate_sdpa_vector_paged(type, head_dim)                         \
+  template [[host_name("sdpa_vector_paged_" #type "_" #head_dim)]]            \
+  [[kernel]] void sdpa_vector_paged<type, head_dim>(                          \
+      const device type* queries [[buffer(0)]],                               \
+      const device type* keys [[buffer(1)]],                                  \
+      const device type* values [[buffer(2)]],                                \
+      device type* out [[buffer(3)]],                                         \
+      const device uint* table [[buffer(4)]],                                 \
+      const device int* n_keys [[buffer(5)]],                                 \
+      const constant int& gqa_factor [[buffer(6)]],                           \
+      const constant int& nh [[buffer(7)]],                                   \
+      const constant int& table_stride [[buffer(8)]],                         \
+      const constant int& page_size [[buffer(9)]],                            \
+      const constant size_t& k_stride [[buffer(10)]],                         \
+      const constant size_t& v_stride [[buffer(11)]],                         \
+      const constant float& scale [[buffer(12)]],                             \
+      const constant float& softcapping [[buffer(13)]],                       \
+      uint3 tid [[threadgroup_position_in_grid]],                             \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_sdpa_vector_2pass_1_paged(type, head_dim)                 \
+  template [[host_name("sdpa_vector_2pass_1_paged_" #type "_" #head_dim)]]    \
+  [[kernel]] void sdpa_vector_2pass_1_paged<type, head_dim>(                  \
+      const device type* queries [[buffer(0)]],                               \
+      const device type* keys [[buffer(1)]],                                  \
+      const device type* values [[buffer(2)]],                                \
+      device float* out [[buffer(3)]],                                        \
+      device float* sums [[buffer(4)]],                                       \
+      device float* maxs [[buffer(5)]],                                       \
+      const device uint* table [[buffer(6)]],                                 \
+      const device int* n_keys [[buffer(7)]],                                 \
+      const constant int& gqa_factor [[buffer(8)]],                           \
+      const constant int& nh [[buffer(9)]],                                   \
+      const constant int& table_stride [[buffer(10)]],                        \
+      const constant int& page_size [[buffer(11)]],                           \
+      const constant size_t& k_stride [[buffer(12)]],                         \
+      const constant size_t& v_stride [[buffer(13)]],                         \
+      const constant float& scale [[buffer(14)]],                             \
+      const constant float& softcapping [[buffer(15)]],                       \
+      uint3 tid [[threadgroup_position_in_grid]],                             \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                       \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_sdpa_vector_paged_heads(type)  \
+  instantiate_sdpa_vector_paged(type, 32)          \
+  instantiate_sdpa_vector_paged(type, 64)          \
+  instantiate_sdpa_vector_paged(type, 96)          \
+  instantiate_sdpa_vector_paged(type, 128)         \
+  instantiate_sdpa_vector_paged(type, 256)         \
+  instantiate_sdpa_vector_paged(type, 512)         \
+  instantiate_sdpa_vector_2pass_1_paged(type, 32)  \
+  instantiate_sdpa_vector_2pass_1_paged(type, 64)  \
+  instantiate_sdpa_vector_2pass_1_paged(type, 96)  \
+  instantiate_sdpa_vector_2pass_1_paged(type, 128) \
+  instantiate_sdpa_vector_2pass_1_paged(type, 256) \
+  instantiate_sdpa_vector_2pass_1_paged(type, 512)
+
+instantiate_sdpa_vector_paged_heads(float)
+instantiate_sdpa_vector_paged_heads(float16_t)
     // clang-format on

@@ -8181,6 +8181,53 @@ kernel void kernel_mul_mm_id_mapped16(
         shared_memory, tg, tiitg, sgitg);
 }
 
+// Dequantise a whole `[rows, ne00]` quantized tensor to half — the
+// prefill's stems once per tile, then the f16 GEMM arm reads them as
+// plain loads instead of unpacking a block per tile (lloom #749 P26).
+// Threadgroups `(chunks of 16 / 128, rows)`.
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+kernel void kernel_dequant_rows_f16(
+        device const  void * src0,
+        device        half * dst,
+        constant   int64_t & ne00,
+        constant  uint64_t & nb01,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tiitg[[thread_index_in_threadgroup]],
+        uint3                tptg [[threads_per_threadgroup]]) {
+    const int64_t r = tgpig.y;
+    device const block_q * x = (device const block_q *)((device const char *) src0 + r * nb01);
+    device half4x4 * y = (device half4x4 *)(dst + r * ne00);
+    const int64_t chunks = ne00 / 16;
+    for (int64_t ind = tgpig.x * tptg.x + tiitg; ind < chunks; ind += tptg.x * 1024) {
+        half4x4 temp;
+        dequantize_func(x + ind / nl, ind % nl, temp);
+        y[ind] = temp;
+    }
+}
+
+typedef decltype(kernel_dequant_rows_f16<block_q4_0, 2, dequantize_q4_0>) dequant_rows_f16_t;
+
+template [[host_name("kernel_dequant_rows_f16_q4_0")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q4_0,    2,     dequantize_q4_0>;
+template [[host_name("kernel_dequant_rows_f16_q4_1")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q4_1,    2,     dequantize_q4_1>;
+template [[host_name("kernel_dequant_rows_f16_q5_0")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q5_0,    2,     dequantize_q5_0>;
+template [[host_name("kernel_dequant_rows_f16_q5_1")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q5_1,    2,     dequantize_q5_1>;
+template [[host_name("kernel_dequant_rows_f16_q8_0")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q8_0,    2,     dequantize_q8_0>;
+template [[host_name("kernel_dequant_rows_f16_q2_0")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q2_0,    4,     dequantize_q2_0>;
+template [[host_name("kernel_dequant_rows_f16_q2_K")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q2_K,    QK_NL, dequantize_q2_K>;
+template [[host_name("kernel_dequant_rows_f16_q3_K")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q3_K,    QK_NL, dequantize_q3_K>;
+template [[host_name("kernel_dequant_rows_f16_q4_K")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q4_K,    QK_NL, dequantize_q4_K>;
+template [[host_name("kernel_dequant_rows_f16_q5_K")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q5_K,    QK_NL, dequantize_q5_K>;
+template [[host_name("kernel_dequant_rows_f16_q6_K")]]    kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_q6_K,    QK_NL, dequantize_q6_K>;
+template [[host_name("kernel_dequant_rows_f16_iq2_xxs")]] kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
+template [[host_name("kernel_dequant_rows_f16_iq2_xs")]]  kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_iq2_xs,  QK_NL, dequantize_iq2_xs>;
+template [[host_name("kernel_dequant_rows_f16_iq3_xxs")]] kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_iq3_xxs, QK_NL, dequantize_iq3_xxs>;
+template [[host_name("kernel_dequant_rows_f16_iq3_s")]]   kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_iq3_s,   QK_NL, dequantize_iq3_s>;
+template [[host_name("kernel_dequant_rows_f16_iq2_s")]]   kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_iq2_s,   QK_NL, dequantize_iq2_s>;
+template [[host_name("kernel_dequant_rows_f16_iq1_s")]]   kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_iq1_s,   QK_NL, dequantize_iq1_s>;
+template [[host_name("kernel_dequant_rows_f16_iq1_m")]]   kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_iq1_m,   QK_NL, dequantize_iq1_m>;
+template [[host_name("kernel_dequant_rows_f16_iq4_nl")]]  kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_iq4_nl,  2,     dequantize_iq4_nl>;
+template [[host_name("kernel_dequant_rows_f16_iq4_xs")]]  kernel dequant_rows_f16_t kernel_dequant_rows_f16<block_iq4_xs,  QK_NL, dequantize_iq4_xs>;
+
 typedef decltype(kernel_mul_mm_id_mapped<float4x4, 1, dequantize_f32>) mat_mm_id_mapped_t;
 
 template [[host_name("kernel_mul_mm_id_mapped_f32_f32")]]     kernel mat_mm_id_mapped_t kernel_mul_mm_id_mapped<float4x4,      1,     dequantize_f32>;

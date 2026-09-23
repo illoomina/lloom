@@ -52,13 +52,12 @@ pub use mlx_gemm::{
 };
 pub use qwen4exp::{
     call_gdn_chunk_decay, call_gdn_chunk_epilogue, call_gdn_chunk_scale, call_gdn_chunk_scan_at,
-    call_gdn_conv_window,
-    call_gdn_gate, call_gdn_gated_norm, call_gdn_prefill_prologue, call_gdn_prologue,
-    call_gdn_step, call_hc_collapse, call_hc_combine, call_hc_norm, call_moe_combine,
-    call_moe_slot_map, call_moe_topk, call_qsa_prep, call_qsa_prep_batch, call_qsa_prep_rows, call_sigmoid_mul,
-    call_silu_mul, call_unit_lower_inverse,
-    call_gdn_gated_norm_rows, call_gdn_prologue_rows, call_gdn_step_rows,
-    call_gdn_prologue_seq, call_gdn_step_seq,
+    call_gdn_conv_window, call_gdn_gate, call_gdn_gated_norm, call_gdn_gated_norm_rows,
+    call_gdn_prefill_prologue, call_gdn_prologue, call_gdn_prologue_rows, call_gdn_prologue_seq,
+    call_gdn_step, call_gdn_step_rows, call_gdn_step_seq, call_hc_collapse, call_hc_combine,
+    call_hc_norm, call_moe_combine, call_moe_slot_map, call_moe_topk, call_qsa_prep,
+    call_qsa_prep_batch, call_qsa_prep_rows, call_sigmoid_mul, call_silu_mul,
+    call_unit_lower_inverse,
 };
 pub use scratch::{
     call_scratch_combine, call_scratch_partials, call_scratch_report, ScratchKernel, ScratchParams,
@@ -79,18 +78,18 @@ pub use params::{
     UpsampleNearest2dParams,
 };
 pub use quantized::{
-    call_moe_rowmap, call_quantized_get_rows, call_quantized_matmul_mm_id_mapped,
-    call_quantized_matmul_mm_t, call_quantized_matmul_mv_id_t, call_quantized_matmul_mv_t,
-    mm_id_block_bound, GemvFloat, GemvTriple, GgmlDType, MM_ID_BLOCK_ROWS,
+    call_moe_rowmap, call_quantized_dequant_rows_f16, call_quantized_get_rows,
+    call_quantized_matmul_mm_id_mapped, call_quantized_matmul_mm_t, call_quantized_matmul_mv_id_t,
+    call_quantized_matmul_mv_t, mm_id_block_bound, GemvFloat, GemvTriple, GgmlDType,
+    MM_ID_BLOCK_ROWS,
 };
 pub use random::*;
 pub use reduce::*;
 pub use reduce_names::ReduceKernel;
 pub use sdpa::{
     call_dequantize_kv, call_quantize_kv, call_sdpa_full, call_sdpa_full_with, call_sdpa_vector,
-    call_sdpa_vector_paged,
-    call_sdpa_vector_2pass, call_sdpa_vector_quant, quantize_group_reference, sdpa_full_tile,
-    KvQuantBits, SdpaDType, SdpaPageTable,
+    call_sdpa_vector_2pass, call_sdpa_vector_paged, call_sdpa_vector_quant,
+    quantize_group_reference, sdpa_full_tile, KvQuantBits, SdpaDType, SdpaPageTable,
 };
 pub use sort::{call_arg_sort, call_mlx_arg_sort};
 pub use ternary::call_where_cond;

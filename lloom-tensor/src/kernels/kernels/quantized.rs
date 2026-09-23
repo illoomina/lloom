@@ -832,6 +832,73 @@ pub fn call_quantized_matmul_mm_id_mapped(
     Ok(())
 }
 
+/// `kernel_dequant_rows_f16_*`: the quantized `[n, k]` `src` to half in
+/// `dst` (`n · k` halves). The prefill stems' dequantise-once (P26).
+pub fn call_quantized_dequant_rows_f16(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    (n, k): (usize, usize),
+    src: &Buffer,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let stem = match dtype {
+        GgmlDType::Q4_0 => "q4_0",
+        GgmlDType::Q4_1 => "q4_1",
+        GgmlDType::Q5_0 => "q5_0",
+        GgmlDType::Q5_1 => "q5_1",
+        GgmlDType::Q8_0 => "q8_0",
+        GgmlDType::Q2_0 => "q2_0",
+        GgmlDType::Q2K => "q2_K",
+        GgmlDType::Q3K => "q3_K",
+        GgmlDType::Q4K => "q4_K",
+        GgmlDType::Q5K => "q5_K",
+        GgmlDType::Q6K => "q6_K",
+        GgmlDType::IQ2XXS => "iq2_xxs",
+        GgmlDType::IQ2XS => "iq2_xs",
+        GgmlDType::IQ2S => "iq2_s",
+        GgmlDType::IQ3XXS => "iq3_xxs",
+        GgmlDType::IQ3S => "iq3_s",
+        GgmlDType::IQ4NL => "iq4_nl",
+        GgmlDType::IQ4XS => "iq4_xs",
+        _ => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "no kernel_dequant_rows_f16 arm for this weight dtype",
+                "dequantise rows to f16",
+            ))
+        }
+    };
+    if !k.is_multiple_of(16) {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "k must be a multiple of 16",
+            "dequantise rows to f16",
+        ));
+    }
+    let name = format!("kernel_dequant_rows_f16_{stem}");
+    let row_bytes = (k / dtype_block_size(dtype)) * dtype_type_size(dtype);
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "qdequant_rows_f16 {stem} n={n} k={k}");
+    set_params!(encoder, (src, Output::new(dst), k as i64, row_bytes as u64));
+    let chunks = k / 16;
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: chunks.div_ceil(128).min(1024),
+            height: n,
+            depth: 1,
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// Elements per block of a weight dtype (the ggml `blck_size`).
 fn dtype_block_size(dtype: GgmlDType) -> usize {
     match dtype {

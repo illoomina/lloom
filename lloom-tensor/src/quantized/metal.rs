@@ -501,12 +501,80 @@ impl QMetalStorage {
             .with_size_for(dst_shape.elem_count(), DType::F32)
             .with_label("qmatmul")
             .build()?;
+        // The dequantise-once scratch is taken BEFORE the encoder guard
+        // (`new_persistent_private` may open its own encoder; the commands
+        // lock is not reentrant).
+        let dequant_from = dequant_once_from();
+        let (n_rows_w, k_w) = (self_shape.dims()[self_shape.rank() - 2], k);
+        let dequant_scratch_buf = if dequant_from > 0
+            && rows_total >= dequant_from
+            && self_shape.rank() == 2
+            && k_w.is_multiple_of(16)
+            && dequant_once_kind(self.dtype.into())
+        {
+            Some(dequant_scratch(&device, n_rows_w * k_w * 2)?)
+        } else {
+            None
+        };
         let encoder = device.command_encoder()?;
 
         assert_eq!(storage.dtype(), DType::F32);
 
         if self_shape.rank() > 4 {
             crate::bail!("weight rank ({}) must be <= 4", self_shape.rank())
+        }
+        // The stems at a prefill's rows: dequantised to half ONCE into a
+        // persistent scratch, then the f16 GEMM arm reads plain halves —
+        // measured 4.3 → 3.2 ms on `[10240 × 2560]` Q4_K at 512 rows, the
+        // block unpack being the difference (P24/P26). The scratch is one
+        // Private buffer a device, sized to the largest stem seen; the
+        // encoder's hazard chain orders each stem's dequant after the
+        // previous stem's GEMM read of it.
+        if let Some(scratch) = dequant_scratch_buf {
+            crate::kernels::call_quantized_dequant_rows_f16(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                (n_rows_w, k_w),
+                &self.buffer,
+                &scratch,
+            )
+            .map_err(MetalError::from)?;
+            let src0_l = crate::Layout::contiguous(vec![1, 1, n_rows_w, k_w]);
+            let src0_stride: Vec<usize> = src0_l
+                .stride()
+                .iter()
+                .map(|x| x * DType::F16.size_in_bytes())
+                .collect();
+            let src1_l = crate::Layout::contiguous(
+                [vec![1; 4 - src_shape.rank()], src_shape.dims().to_vec()].concat(),
+            );
+            crate::kernels::call_quantized_matmul_mm_t(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                crate::kernels::GgmlDType::F16,
+                src0_l.dims(),
+                &src0_stride,
+                &scratch,
+                0,
+                src1_l.dims(),
+                &src1_l
+                    .stride()
+                    .iter()
+                    .map(|x| x * DType::F32.size_in_bytes())
+                    .collect::<Vec<_>>(),
+                storage.buffer(),
+                src1_l.start_offset() * storage.dtype().size_in_bytes(),
+                dst_shape.dims(),
+                0,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+            let dst_storage =
+                MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+            return Ok((dst_storage, dst_shape));
         }
         let src0_l = crate::Layout::contiguous(
             [vec![1; 4 - self_shape.rank()], self_shape.dims().to_vec()].concat(),
@@ -1104,4 +1172,59 @@ pub fn matmul_f16_weight_f32(xs: &crate::Tensor, w: &crate::Tensor) -> Result<cr
 pub fn f16_weight_mm_route() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("LLOOM_QMM_F16_MM").ok().as_deref() != Some("0"))
+}
+
+/// Rows from which a quantized stem's Metal GEMM dequantises the weight to
+/// half once and runs the f16 arm: `LLOOM_QMM_DEQUANT_FROM` (0 = never),
+/// read once; default 64 — the prefill tiles; a decode step and the gate
+/// prompts keep the in-kernel unpack. `set_dequant_once_from` for tests.
+pub fn dequant_once_from() -> usize {
+    let v = DEQUANT_ONCE_FROM.load(std::sync::atomic::Ordering::Relaxed);
+    if v != usize::MAX {
+        return v;
+    }
+    let from = std::env::var("LLOOM_QMM_DEQUANT_FROM")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_DEQUANT_ONCE_FROM);
+    DEQUANT_ONCE_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
+    from
+}
+
+pub const DEFAULT_DEQUANT_ONCE_FROM: usize = 64;
+
+pub fn set_dequant_once_from(from: usize) {
+    DEQUANT_ONCE_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
+}
+
+static DEQUANT_ONCE_FROM: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// The weight kinds with a `kernel_dequant_rows_f16` arm (every quantized
+/// kind; the float kinds have nothing to dequantise).
+fn dequant_once_kind(dtype: crate::kernels::GgmlDType) -> bool {
+    use crate::kernels::GgmlDType as G;
+    !matches!(dtype, G::F32 | G::F16 | G::BF16 | G::Q8_1 | G::Q8K)
+}
+
+/// One Private scratch a device for the dequantised stems, grown to the
+/// largest asked for (outside the pools: a tenant with a fixed identity,
+/// the hazard chain orders every stem's write after the last stem's read).
+fn dequant_scratch(device: &MetalDevice, bytes: usize) -> Result<Arc<PooledBuffer>> {
+    static SCRATCH: std::sync::OnceLock<
+        parking_lot::Mutex<
+            std::collections::HashMap<crate::metal_backend::DeviceId, Arc<PooledBuffer>>,
+        >,
+    > = std::sync::OnceLock::new();
+    let map = SCRATCH.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let key = device.id();
+    let mut g = map.lock();
+    if let Some(b) = g.get(&key) {
+        if b.size() >= bytes {
+            return Ok(Arc::clone(b));
+        }
+    }
+    let b = device.new_persistent_private(bytes)?;
+    g.insert(key, Arc::clone(&b));
+    Ok(b)
 }

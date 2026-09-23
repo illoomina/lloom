@@ -1250,6 +1250,44 @@ pub fn call_mlx_gemm(
     rhs_buffer: &Buffer,
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    call_mlx_gemm_out(
+        device,
+        ep,
+        kernels,
+        dtype,
+        dtype,
+        (b, m, n, k),
+        lhs_stride,
+        lhs_offset,
+        lhs_buffer,
+        rhs_stride,
+        rhs_offset,
+        rhs_buffer,
+        output,
+    )
+}
+
+/// [`call_mlx_gemm`] with the output in `out_dtype`: the operands `dtype`,
+/// the accumulation float, the store converted once per element (the steel
+/// kernel's `OutT`). Instantiated for `(F16, F32)` — half operands, a float
+/// result, the dequantise-once stems' route (issue #749 P26) — beside the
+/// same-type arms. A mixed pair never takes the gemv route.
+#[allow(clippy::too_many_arguments)]
+pub fn call_mlx_gemm_out(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GemmDType,
+    out_dtype: GemmDType,
+    (b, m, n, k): (usize, usize, usize, usize),
+    lhs_stride: &[usize],
+    lhs_offset: usize,
+    lhs_buffer: &Buffer,
+    rhs_stride: &[usize],
+    rhs_offset: usize,
+    rhs_buffer: &Buffer,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
     #[derive(Debug)]
     #[repr(C)]
     struct GemmParams {
@@ -1307,7 +1345,7 @@ pub fn call_mlx_gemm(
     // threshold, no config axis, and `select_tile_config` is never consulted.
     // `takes_gemv_route` is `m == 1 || n == 1` unless `LLOOM_386_FORCE_GEMM`
     // suppresses one half, which is the only way to build the other arm.
-    if takes_gemv_route(m, n) {
+    if out_dtype == dtype && takes_gemv_route(m, n) {
         return call_mlx_gemv(
             device,
             ep,
@@ -1397,11 +1435,13 @@ pub fn call_mlx_gemm(
 
     // Dynamically generate kernel name based on dtype, transpose mode, and tile config
     // Format: gemm_{trans}_{itype}_{otype}_{bm}_{bn}_{bk}_{wm}_{wn}
-    let dtype_str = match dtype {
+    let dtype_name = |d: GemmDType| match d {
         GemmDType::F32 => "f32",
         GemmDType::F16 => "f16",
         GemmDType::BF16 => "bf16",
     };
+    let dtype_str = dtype_name(dtype);
+    let out_str = dtype_name(out_dtype);
     let trans_str = match (a_trans, b_trans) {
         (false, false) => "nn",
         (true, false) => "tn",
@@ -1410,7 +1450,7 @@ pub fn call_mlx_gemm(
     };
     let name = format!(
         "gemm_{}_{}_{}_{}_{}_{}_{}_{}",
-        trans_str, dtype_str, dtype_str, bm, bn, bk, wm, wn
+        trans_str, dtype_str, out_str, bm, bn, bk, wm, wn
     );
 
     let pipeline =

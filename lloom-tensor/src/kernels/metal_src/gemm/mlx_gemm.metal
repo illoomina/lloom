@@ -1020,12 +1020,13 @@ template <
     int WN,
     bool transpose_a,
     bool transpose_b,
-    typename AccumType = float>
+    typename AccumType = float,
+    typename OutT = T>
 [[kernel, max_total_threads_per_threadgroup(WM* WN * 32)]] void gemm(
     const device T* A [[buffer(0)]],
     const device T* B [[buffer(1)]],
-    const device T* C [[buffer(2), function_constant(use_out_source)]],
-    device T* D [[buffer(3)]],
+    const device OutT* C [[buffer(2), function_constant(use_out_source)]],
+    device OutT* D [[buffer(3)]],
     const constant GEMMParams* params [[buffer(4)]],
     const constant GEMMAddMMParams* addmm_params [[buffer(5), function_constant(use_out_source)]],
     const constant int* batch_shape [[buffer(6), function_constant(has_batch)]],
@@ -1045,7 +1046,7 @@ template <
 
   using gemm_kernel = GEMMKernel<
       T,
-      T,
+      OutT,
       BM,
       BN,
       BK,
@@ -1407,11 +1408,11 @@ template <
 
 #define instantiate_gemm(tname, trans_a, trans_b, iname, itype, oname, otype, bm, bn, bk, wm, wn) \
   template [[host_name("gemm_" #tname "_"  #iname "_" #oname "_" #bm "_" #bn "_" #bk "_" #wm "_" #wn)]] \
-  [[kernel]] void gemm<itype, bm, bn, bk, wm, wn, trans_a, trans_b, float>( \
+  [[kernel]] void gemm<itype, bm, bn, bk, wm, wn, trans_a, trans_b, float, otype>( \
       const device itype *A [[buffer(0)]], \
       const device itype *B [[buffer(1)]], \
-      const device itype *C [[buffer(2), function_constant(use_out_source)]], \
-      device itype *D [[buffer(3)]], \
+      const device otype *C [[buffer(2), function_constant(use_out_source)]], \
+      device otype *D [[buffer(3)]], \
       const constant GEMMParams* params [[buffer(4)]], \
       const constant GEMMAddMMParams* addmm_params [[buffer(5), function_constant(use_out_source)]], \
       const constant int* batch_shape [[buffer(6)]], \
@@ -1438,6 +1439,7 @@ template <
 // ============================================================
 instantiate_gemm_transpose_helper(f32, float, f32, float, 32, 32, 16, 2, 2)
 instantiate_gemm_transpose_helper(f16, half, f16, half, 32, 32, 16, 2, 2)
+instantiate_gemm_transpose_helper(f16, half, f32, float, 32, 32, 16, 2, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 32, 32, 16, 2, 2)
 #endif
@@ -1448,6 +1450,7 @@ instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 32, 32, 16, 2, 2)
 // ============================================================
 instantiate_gemm_transpose_helper(f32, float, f32, float, 64, 64, 16, 2, 2)
 instantiate_gemm_transpose_helper(f16, half, f16, half, 64, 64, 16, 2, 2)
+instantiate_gemm_transpose_helper(f16, half, f32, float, 64, 64, 16, 2, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 64, 64, 16, 2, 2)
 #endif
@@ -1458,6 +1461,7 @@ instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 64, 64, 16, 2, 2)
 // ============================================================
 instantiate_gemm_transpose_helper(f32, float, f32, float, 64, 64, 16, 1, 2)
 instantiate_gemm_transpose_helper(f16, half, f16, half, 64, 64, 16, 1, 2)
+instantiate_gemm_transpose_helper(f16, half, f32, float, 64, 64, 16, 1, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 64, 64, 16, 1, 2)
 #endif
@@ -1468,6 +1472,7 @@ instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 64, 64, 16, 1, 2)
 // ============================================================
 instantiate_gemm_transpose_helper(f32, float, f32, float, 64, 32, 32, 2, 2)
 instantiate_gemm_transpose_helper(f16, half, f16, half, 64, 32, 32, 2, 2)
+instantiate_gemm_transpose_helper(f16, half, f32, float, 64, 32, 32, 2, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 64, 32, 32, 2, 2)
 #endif
@@ -1478,6 +1483,7 @@ instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 64, 32, 32, 2, 2)
 // ============================================================
 instantiate_gemm_transpose_helper(f32, float, f32, float, 32, 64, 16, 1, 2)
 instantiate_gemm_transpose_helper(f16, half, f16, half, 32, 64, 16, 1, 2)
+instantiate_gemm_transpose_helper(f16, half, f32, float, 32, 64, 16, 1, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 32, 64, 16, 1, 2)
 #endif
@@ -1511,18 +1517,21 @@ instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 32, 64, 16, 1, 2)
 // ============================================================
 instantiate_gemm_transpose_helper(f32, float, f32, float, 32, 16, 16, 2, 2)
 instantiate_gemm_transpose_helper(f16, half, f16, half, 32, 16, 16, 2, 2)
+instantiate_gemm_transpose_helper(f16, half, f32, float, 32, 16, 16, 2, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 32, 16, 16, 2, 2)
 #endif
 
 instantiate_gemm_transpose_helper(f32, float, f32, float, 16, 32, 16, 2, 2)
 instantiate_gemm_transpose_helper(f16, half, f16, half, 16, 32, 16, 2, 2)
+instantiate_gemm_transpose_helper(f16, half, f32, float, 16, 32, 16, 2, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 16, 32, 16, 2, 2)
 #endif
 
 instantiate_gemm_transpose_helper(f32, float, f32, float, 16, 16, 16, 2, 2)
 instantiate_gemm_transpose_helper(f16, half, f16, half, 16, 16, 16, 2, 2)
+instantiate_gemm_transpose_helper(f16, half, f32, float, 16, 16, 16, 2, 2)
 #if defined(__HAVE_BFLOAT__)
 instantiate_gemm_transpose_helper(bf16, bfloat, bf16, bfloat, 16, 16, 16, 2, 2)
 #endif

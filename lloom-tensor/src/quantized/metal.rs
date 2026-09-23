@@ -541,6 +541,55 @@ impl QMetalStorage {
                 &scratch,
             )
             .map_err(MetalError::from)?;
+            // The steel gemm over the scratch (`LLOOM_QMM_DEQUANT_GEMM=steel`,
+            // the A/B arm): the activations cast to half once (the quantized
+            // mm converts them to half per tile in its threadgroup load —
+            // the same operand precision), the result float from the kernel
+            // (`OutT`), no cast back. A different tile loop, so a different
+            // reduction order than the unpacking arm — and measured no faster
+            // than the quantized f16 arm below (P26), which is the default.
+            if dequant_gemm_steel() && layout.is_contiguous() {
+                let x16 = device
+                    .new_buffer_builder()
+                    .with_size_for(rows_total * k, DType::F16)
+                    .with_label("qmatmul_x16")
+                    .build()?;
+                crate::kernels::call_cast_contiguous(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    "cast_f32_f16",
+                    DType::F32.size_in_bytes(),
+                    rows_total * k,
+                    crate::kernels::BufferOffset {
+                        buffer: storage.buffer(),
+                        offset_in_bytes: layout.start_offset() * DType::F32.size_in_bytes(),
+                    },
+                    &x16,
+                )
+                .map_err(MetalError::from)?;
+                crate::kernels::call_mlx_gemm_out(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    crate::kernels::GemmDType::F16,
+                    crate::kernels::GemmDType::F32,
+                    (1, rows_total, n, k),
+                    &[k, 1],
+                    0,
+                    &x16,
+                    // The weight `[n, k]` read as `[k, n]`: transposed.
+                    &[1, k],
+                    0,
+                    &scratch,
+                    &dst,
+                )
+                .map_err(MetalError::from)?;
+                drop(encoder);
+                let dst_storage =
+                    MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+                return Ok((dst_storage, dst_shape));
+            }
             let src0_l = crate::Layout::contiguous(vec![1, 1, n_rows_w, k_w]);
             let src0_stride: Vec<usize> = src0_l
                 .stride()
@@ -1192,6 +1241,37 @@ pub fn dequant_once_from() -> usize {
 }
 
 pub const DEFAULT_DEQUANT_ONCE_FROM: usize = 64;
+
+static DEQUANT_GEMM_STEEL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
+/// Which GEMM reads the dequantised scratch: the quantized GEMM's f16 arm
+/// (`LLOOM_QMM_DEQUANT_GEMM=qmm`, the default — the same tile loop as the
+/// unpacking arm, so bit-identical to it) or the steel gemm with half
+/// operands and a float result (`=steel`). Measured the same to the
+/// millisecond on the stems (3.58 vs 3.58 ms on `[10240 × 2560]` at 512
+/// rows; GPU busy 4.22–4.25 s either way over the 937-token prompt, issue
+/// #749 P26): the steel kernel's 0.3 ms over the quantized arm on a
+/// pre-cast half input is spent on the cast and the float store. The A/B
+/// arm, kept. Read once; `set_dequant_gemm_steel` for tests.
+pub fn dequant_gemm_steel() -> bool {
+    let v = DEQUANT_GEMM_STEEL.load(std::sync::atomic::Ordering::Relaxed);
+    if v != u8::MAX {
+        return v != 0;
+    }
+    let steel = match std::env::var("LLOOM_QMM_DEQUANT_GEMM").as_deref() {
+        Ok("qmm") => false,
+        Ok("steel") => true,
+        _ => DEFAULT_DEQUANT_GEMM_STEEL,
+    };
+    DEQUANT_GEMM_STEEL.store(steel as u8, std::sync::atomic::Ordering::Relaxed);
+    steel
+}
+
+pub fn set_dequant_gemm_steel(on: bool) {
+    DEQUANT_GEMM_STEEL.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub const DEFAULT_DEQUANT_GEMM_STEEL: bool = false;
 
 pub fn set_dequant_once_from(from: usize) {
     DEQUANT_ONCE_FROM.store(from, std::sync::atomic::Ordering::Relaxed);

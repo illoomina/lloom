@@ -94,6 +94,8 @@ pub struct PrefetchCounters {
     pub bytes: AtomicU64,
     /// Times the thread parked on the staged-bytes cap.
     pub parked: AtomicU64,
+    /// Experts a layer read through the threads at the layer (`load_now`).
+    pub now: AtomicU64,
 }
 
 /// A snapshot of [`PrefetchCounters`].
@@ -106,6 +108,7 @@ pub struct PrefetchStats {
     pub stale: u64,
     pub bytes: u64,
     pub parked: u64,
+    pub now: u64,
 }
 
 struct State {
@@ -250,18 +253,85 @@ impl Prefetcher {
     /// pending are cancelled (`stale`): the threads move on to the next
     /// layer's.
     pub fn take_needed(&self, key: usize, needed: &[u32]) -> Vec<Staged> {
+        self.take_needed_with(key, needed, true)
+    }
+
+    /// Read `experts` of tier `key` NOW through the reader threads — the
+    /// misses a layer has to have before it dispatches, in parallel instead
+    /// of one `pread` after another on the encoding thread — and wait for
+    /// them. What was already staged for them is taken as is; the rest is
+    /// requested ahead of the queue (the layer is waiting) and waited for.
+    /// An expert whose read failed (reported by the thread) is left out and
+    /// the caller reads it itself.
+    pub fn load_now(&self, key: usize, experts: &[u32], planes: &[PlaneSource; 3]) -> Vec<Staged> {
+        let mut have = self.take_needed_with(key, experts, false);
+        let missing: Vec<u32> = experts
+            .iter()
+            .copied()
+            .filter(|e| !have.iter().any(|s| s.expert == *e))
+            .collect();
+        if missing.is_empty() {
+            return have;
+        }
+        let gen = {
+            let mut g = self.shared.state.lock();
+            let gen = *g.generation.entry(key).or_insert(0);
+            for &e in missing.iter().rev() {
+                g.reqs.push_front(Req {
+                    key,
+                    generation: gen,
+                    expert: e,
+                    planes: planes.clone(),
+                });
+            }
+            gen
+        };
+        self.shared
+            .counters
+            .issued
+            .fetch_add(missing.len() as u64, Ordering::Relaxed);
+        self.shared
+            .counters
+            .now
+            .fetch_add(missing.len() as u64, Ordering::Relaxed);
+        self.shared.cv.notify_all();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            have.extend(self.take_needed_with(key, &missing, false));
+            if missing.iter().all(|e| have.iter().any(|s| s.expert == *e)) {
+                return have;
+            }
+            let mut g = self.shared.state.lock();
+            let pending = g
+                .reqs
+                .iter()
+                .any(|r| r.key == key && r.generation == gen && missing.contains(&r.expert));
+            let in_flight = g.staged_bytes > 0;
+            let staged_here = g.done.get(&key).is_some_and(|v| !v.is_empty());
+            if (!pending && !in_flight && !staged_here) || std::time::Instant::now() > deadline {
+                return have;
+            }
+            self.shared
+                .cv
+                .wait_for(&mut g, std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn take_needed_with(&self, key: usize, needed: &[u32], cancel: bool) -> Vec<Staged> {
         let (out, expired) = {
             let mut g = self.shared.state.lock();
-            let before = g.reqs.len();
-            g.reqs.retain(|r| r.key != key);
-            let dropped = (before - g.reqs.len()) as u64;
-            if dropped > 0 {
-                self.shared
-                    .counters
-                    .stale
-                    .fetch_add(dropped, Ordering::Relaxed);
+            if cancel {
+                let before = g.reqs.len();
+                g.reqs.retain(|r| r.key != key);
+                let dropped = (before - g.reqs.len()) as u64;
+                if dropped > 0 {
+                    self.shared
+                        .counters
+                        .stale
+                        .fetch_add(dropped, Ordering::Relaxed);
+                }
+                *g.generation.entry(key).or_insert(0) += 1;
             }
-            *g.generation.entry(key).or_insert(0) += 1;
             // A different tier than the last take: the pass moved on; every
             // tier taken before the previous one is behind the pass now.
             let same_as_last = g.last_take.get(&key).copied() == Some(g.takes);
@@ -356,6 +426,7 @@ impl Prefetcher {
             stale: c.stale.load(Ordering::Relaxed),
             bytes: c.bytes.load(Ordering::Relaxed),
             parked: c.parked.load(Ordering::Relaxed),
+            now: c.now.load(Ordering::Relaxed),
         }
     }
 
@@ -429,6 +500,7 @@ fn worker(w: Arc<Shared>) {
                     drop(g);
                     w.counters.staged.fetch_add(1, Ordering::Relaxed);
                     w.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
+                    w.cv.notify_all();
                 } else {
                     // Superseded while reading: back to the ring, unbooked.
                     g.staged_bytes = g.staged_bytes.saturating_sub(staged.bytes());
@@ -451,6 +523,8 @@ fn worker(w: Arc<Shared>) {
                 g.staged_bytes = g
                     .staged_bytes
                     .saturating_sub(req.planes.iter().map(|p| p.plane_bytes).sum::<usize>());
+                drop(g);
+                w.cv.notify_all();
             }
         }
     }

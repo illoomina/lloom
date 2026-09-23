@@ -109,6 +109,29 @@ impl<R: ExpertResidency> MoeLayer<R> {
         self.forward_inner(x, true)
     }
 
+    /// The router alone: the top-k expert ids `[seq, topk]` (u32) of `x
+    /// [1, seq, hidden]` — the routing `forward` computes, without the
+    /// experts. For the streamed tier's residual speculation (§20.3 P2):
+    /// this layer's router on a carry from BEFORE this layer's mixer, whose
+    /// ids name the experts to stage ahead; a hint only, the real routing
+    /// still decides. Untraced (a traced run keeps its one `moe.logits`).
+    pub fn route_ids(&self, x: &Tensor) -> Result<Tensor> {
+        let (_, seq, hidden) = x.dims3()?;
+        let x1 = x.reshape((seq, hidden))?;
+        let topk = self.n_experts_per_tok;
+        let logits = self.router.forward(&x1)?.to_dtype(DType::F32)?;
+        match super::kernels::moe_topk(&logits, topk) {
+            Some(r) => Ok(r?.0),
+            None => {
+                let probs = ops::softmax_last_dim(&logits)?;
+                probs
+                    .arg_sort_last_dim(false)?
+                    .narrow(D::Minus1, 0, topk)?
+                    .contiguous()
+            }
+        }
+    }
+
     fn forward_inner(&self, x: &Tensor, device_plan: bool) -> Result<(Tensor, Option<Tensor>)> {
         let (b0, seq0, hidden) = x.dims3()?;
         // The MoE is position-wise: `B` rows of one token are `B` positions
@@ -466,5 +489,51 @@ mod tests {
         let x = Tensor::ones((1, 1, h), DType::F32, &dev).unwrap();
         let o = moe.decode(&x).unwrap();
         assert_eq!(o.dims(), &[1, 1, h]);
+    }
+
+    /// `route_ids` (the speculative hint's router) is the forward's routing:
+    /// the same top-k as the composed softmax + sort over the router's
+    /// logits, per position, over a chunk.
+    #[test]
+    fn route_ids_is_the_forwards_routing() {
+        let dev = Device::Cpu;
+        let mut cfg = Config::tiny();
+        cfg.n_experts = 8;
+        cfg.n_experts_per_tok = 3;
+        let (h, ff) = (cfg.hidden_size, cfg.moe_intermediate_size);
+        let zero =
+            |o: usize, i: usize| QMatMul::Tensor(Tensor::zeros((o, i), DType::F32, &dev).unwrap());
+        let router = lin(8, h, 0.7, &dev);
+        let moe = MoeLayer::new(
+            lin(8, h, 0.7, &dev),
+            resident(&cfg, &dev),
+            zero(ff, h),
+            zero(ff, h),
+            zero(h, ff),
+            zero(1, h),
+            &cfg,
+        );
+        let seq = 5;
+        let x = Tensor::randn(0f32, 1.0, (1, seq, h), &dev).unwrap();
+        let ids: Vec<u32> = moe
+            .route_ids(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let logits = router.forward(&x.reshape((seq, h)).unwrap()).unwrap();
+        let expect: Vec<u32> = ops::softmax_last_dim(&logits)
+            .unwrap()
+            .arg_sort_last_dim(false)
+            .unwrap()
+            .narrow(D::Minus1, 0, 3)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(ids, expect);
+        assert_eq!(ids.len(), seq * 3);
     }
 }

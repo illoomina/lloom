@@ -607,7 +607,27 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// process to, and whether a pass over it is refused or reported.
     memory_fraction: f64,
     mem_check: MemCheck,
+    /// How the streamed tier's prefetch hint is formed on a prefill pass
+    /// (§20.3): 0 = the layer's usage profile (what it does not hold, most
+    /// used first); 1 = residual speculation — layer `l+2`'s router on the
+    /// carry entering layer `l`, encoded before `l` runs and read back
+    /// after it, so the reads overlap layer `l+1` whole (a hint just before
+    /// the layer itself measured worse than no hint: the reads were
+    /// cancelled by the take, P20). `QWEN4EXP_SPEC_AHEAD` by default.
+    spec_ahead: usize,
     cfg: Config,
+}
+
+/// `QWEN4EXP_SPEC_AHEAD`, read once: 0 | 1 | 2 (see `Qwen4Exp::set_spec_ahead`).
+fn spec_ahead_from_env() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("QWEN4EXP_SPEC_AHEAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n <= 1)
+            .unwrap_or(0)
+    })
 }
 
 /// What `prepare_pass` does with a pass the budget cannot take.
@@ -695,8 +715,42 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             device_plan,
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
             mem_check: MemCheck::from_env(),
+            spec_ahead: spec_ahead_from_env(),
             cfg,
         }
+    }
+
+    /// Select the prefill prefetch hint (see the `spec_ahead` field).
+    pub fn set_spec_ahead(&mut self, ahead: usize) {
+        self.spec_ahead = ahead.min(1);
+    }
+
+    pub fn spec_ahead(&self) -> usize {
+        self.spec_ahead
+    }
+
+    /// The residual-speculation hint for `layer`: its router on `carry`
+    /// (the residual stream as it stands, before that layer's mixer) →
+    /// the predicted top-k ids on the device, encoded now and read back by
+    /// [`Self::hint_land`] after the layer between has run — the host plan
+    /// of that layer has synced past this router by then, so the read
+    /// waits for nothing. The real routing runs unchanged when the layer
+    /// does. `None` for a tier with no device plan (`Resident`).
+    fn hint_encode(&self, layer: usize, carry: &Tensor) -> Result<Option<(usize, Tensor)>> {
+        let l = &self.layers[layer];
+        if !l.moe().experts().plans_on_device() {
+            return Ok(None);
+        }
+        let cur = l.collapsed(carry)?; // [1, seq, d]
+        Ok(Some((layer, l.moe().route_ids(&cur)?)))
+    }
+
+    fn hint_land(&self, pending: Option<(usize, Tensor)>) -> Result<()> {
+        if let Some((layer, ids)) = pending {
+            let host: Vec<u32> = ids.flatten_all()?.to_vec1()?;
+            self.layers[layer].moe().experts().prefetch_ids(&host)?;
+        }
+        Ok(())
     }
 
     /// The fraction of `recommendedMaxWorkingSetSize` a pass may take the
@@ -1095,15 +1149,37 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             .reshape((1, seq, n * d))?
             .contiguous()?;
 
-        // The streamed tier's prefetch (§20.3 P1): layer 0's likely misses
-        // before the stack starts, every layer's the moment the layer
-        // before it is encoded — the reads overlap that layer's compute.
-        if let Some(first) = self.layers.first() {
+        // The streamed tier's prefetch (§20.3 P1 / P2): layer 0's likely
+        // misses before the stack starts, every layer's as early as the
+        // hint allows — the reads overlap the compute between the hint and
+        // the layer's routed dispatch.
+        let n_layers = self.layers.len();
+        let spec = self.spec_ahead > 0;
+        if spec {
+            // Layers 0 and 1 from the embedding's carry, read back now: no
+            // layer runs before them to hide the read behind.
+            if n_layers > 0 {
+                self.hint_land(self.hint_encode(0, &res_hc)?)?;
+            }
+            if n_layers > 1 {
+                self.hint_land(self.hint_encode(1, &res_hc)?)?;
+            }
+        } else if let Some(first) = self.layers.first() {
             first.moe().experts().prefetch_ahead()?;
         }
         for (l, layer) in self.layers.iter().enumerate() {
-            if let Some(next) = self.layers.get(l + 1) {
-                next.moe().experts().prefetch_ahead()?;
+            // Under speculation: layer l+2's router on the carry entering
+            // layer l, encoded before l runs and landed after it (its host
+            // plan synced past the router); its reads overlap l+1 whole.
+            let pending = if spec && l + 2 < n_layers {
+                self.hint_encode(l + 2, &res_hc)?
+            } else {
+                None
+            };
+            if !spec {
+                if let Some(next) = self.layers.get(l + 1) {
+                    next.moe().experts().prefetch_ahead()?;
+                }
             }
             if let Some(ple) = &self.ple {
                 if ple.layer == l {
@@ -1116,6 +1192,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 obs.at::<HcStatePoint>(l, &res_hc)?;
             }
             res_hc = layer.prefill(&res_hc, l, cache)?;
+            self.hint_land(pending)?;
             if obs.wants::<LayerOutputPoint>(l) {
                 obs.at::<LayerOutputPoint>(l, &layer.collapsed(&res_hc)?)?;
             }

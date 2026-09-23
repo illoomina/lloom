@@ -119,6 +119,13 @@ pub trait ExpertResidency {
         Ok(())
     }
 
+    /// A hint naming the experts a pass is predicted to route to (§20.3
+    /// P2, the layer's router on a carry from before its mixer): stage the
+    /// ones not held. A hint like `prefetch_ahead`; `Resident` ignores it.
+    fn prefetch_ids(&self, _ids: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
     /// The prefetcher's counters (shared by the tier's layers), zeros
     /// without one.
     fn prefetch_stats(&self) -> PrefetchStats {
@@ -140,6 +147,7 @@ pub struct PrefetchStats {
     pub stale: u64,
     pub bytes: u64,
     pub parked: u64,
+    pub now: u64,
 }
 
 /// All experts resident in RAM: the small-model / big-RAM case, zero streaming
@@ -466,6 +474,9 @@ pub struct StreamCounters {
     /// Settles that found the pass computed on a missing expert (the pass
     /// is replayed by the caller).
     pub settled_misses: AtomicU64,
+    /// Misses read through the prefetcher's threads at the layer
+    /// (`Prefetcher::load_now`) rather than one by one on this thread.
+    pub prefetch_now: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -493,6 +504,7 @@ pub struct StreamStats {
     pub bytes_loaded: u64,
     pub device_plans: u64,
     pub settled_misses: u64,
+    pub prefetch_now: u64,
 }
 
 impl StreamCounters {
@@ -506,6 +518,7 @@ impl StreamCounters {
             bytes_loaded: self.bytes_loaded.load(Ordering::Relaxed),
             device_plans: self.device_plans.load(Ordering::Relaxed),
             settled_misses: self.settled_misses.load(Ordering::Relaxed),
+            prefetch_now: self.prefetch_now.load(Ordering::Relaxed),
         }
     }
 }
@@ -514,6 +527,7 @@ impl std::ops::AddAssign for StreamStats {
     fn add_assign(&mut self, o: Self) {
         self.device_plans += o.device_plans;
         self.settled_misses += o.settled_misses;
+        self.prefetch_now += o.prefetch_now;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -933,14 +947,46 @@ impl Streamed {
         }
         #[cfg(feature = "metal")]
         {
-            if !landed.is_empty() {
-                self.land_staged(inner, landed)?;
-                inner.table_stale = true;
-            }
             if !staged.is_empty() {
                 if let Some(p) = &self.prefetch {
                     p.release(staged.into_values().collect());
                 }
+            }
+            // The misses nothing staged: read now, through the reader
+            // threads in parallel (one `pread` after another on this thread
+            // read ~1 GB/s; four threads ~2.5, P19), landed like the staged.
+            if !misses.is_empty() {
+                if let Some(p) = &self.prefetch {
+                    let want: Vec<u32> = misses.iter().map(|&(e, _)| e as u32).collect();
+                    let planes = [
+                        inner.sources[0].plane_source(),
+                        inner.sources[1].plane_source(),
+                        inner.sources[2].plane_source(),
+                    ];
+                    let mut got: std::collections::HashMap<
+                        u32,
+                        crate::nn::expert_prefetch::Staged,
+                    > = p
+                        .load_now(self.key, &want, &planes)
+                        .into_iter()
+                        .map(|s| (s.expert, s))
+                        .collect();
+                    let mut rest = Vec::new();
+                    for &(e, s) in &misses {
+                        match got.remove(&(e as u32)) {
+                            Some(st) => landed.push((e, s, st)),
+                            None => rest.push((e, s)),
+                        }
+                    }
+                    self.counters
+                        .prefetch_now
+                        .fetch_add((misses.len() - rest.len()) as u64, Ordering::Relaxed);
+                    misses = rest;
+                }
+            }
+            if !landed.is_empty() {
+                self.land_staged(inner, landed)?;
+                inner.table_stale = true;
             }
         }
         if !misses.is_empty() {
@@ -1242,26 +1288,47 @@ impl ExpertResidency for Streamed {
 
     #[cfg(feature = "metal")]
     fn prefetch_groups(&self, later: &[RoutedGroup]) -> Result<()> {
-        let Some(p) = &self.prefetch else {
-            return Ok(());
-        };
         let mut distinct: Vec<u32> = Vec::new();
         for g in later {
             if let GroupIds::Host { ids, .. } = &g.ids {
                 distinct.extend_from_slice(ids);
             }
         }
+        self.prefetch_ids(&distinct)
+    }
+
+    #[cfg(feature = "metal")]
+    fn prefetch_ids(&self, ids: &[u32]) -> Result<()> {
+        let Some(p) = &self.prefetch else {
+            return Ok(());
+        };
+        let mut distinct: Vec<u32> = ids.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
         let (missing, planes) = {
             let inner = self.inner.lock();
             let mut missing: Vec<u32> = distinct
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|&e| {
                     (e as usize) < self.n_experts && inner.map.slot_of(e as usize).is_none()
                 })
                 .collect();
-            missing.truncate(self.n_slots.saturating_sub(inner.map.pinned_count()));
+            // The named experts first; the usage profile fills what the
+            // pool could still take (a 512-token tile needs most of what
+            // the router did not name either, P20).
+            let bound = self.n_slots.saturating_sub(inner.map.pinned_count());
+            if missing.len() < bound {
+                let mut rest: Vec<u32> = (0..self.n_experts as u32)
+                    .filter(|&e| {
+                        inner.map.slot_of(e as usize).is_none()
+                            && distinct.binary_search(&e).is_err()
+                    })
+                    .collect();
+                rest.sort_by_key(|&e| std::cmp::Reverse(inner.map.usage[e as usize]));
+                missing.extend(rest);
+            }
+            missing.truncate(bound);
             let planes = [
                 inner.sources[0].plane_source(),
                 inner.sources[1].plane_source(),
@@ -1818,14 +1885,12 @@ mod tests {
         );
         let s = pre.stats();
         let pf = pre.prefetch_stats();
-        assert_eq!(pf.issued, n);
-        assert_eq!(pf.staged, n);
-        assert!(
-            pf.used > 0 && pf.used <= s.misses,
-            "used {} misses {}",
-            pf.used,
-            s.misses
-        );
+        assert!(pf.staged >= n, "{pf:?}");
+        // Every miss came through the threads: landed from the hint, or
+        // read at the layer by `load_now` (`now`) — never by this thread.
+        assert_eq!(pf.used, s.misses, "{pf:?} vs {s:?}");
+        assert!(pf.now > 0 && pf.used - pf.now <= n, "{pf:?}");
+        assert_eq!(s.prefetch_now, pf.now);
         assert_eq!(
             s.bytes_loaded,
             plain.stats().bytes_loaded,
@@ -1838,7 +1903,7 @@ mod tests {
         pre.prefetch_ahead().unwrap();
         let pf2 = pre.prefetch_stats();
         assert_eq!(pf2.issued - pf.issued, (e as u64 - resident).min(n));
-        assert_eq!(pf2.used + pf2.wasted, n, "{pf2:?}");
+        assert_eq!((pf2.used - pf2.now) + pf2.wasted, n, "{pf2:?}");
         std::fs::remove_file(path).ok();
     }
 }

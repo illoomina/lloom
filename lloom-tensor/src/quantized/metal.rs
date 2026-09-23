@@ -340,9 +340,23 @@ impl QMetalStorage {
         ))
     }
 
-    /// Rows up to which a quantized matmul runs the matmul-vec kernel once
-    /// per row instead of the mm kernel (see `fwd`).
-    const QMV_ROWS_MAX_: usize = 8;
+    /// Rows up to which a quantized matmul runs the matmul-vec kernel over
+    /// the rows instead of the mm kernel (see `fwd`); `LLOOM_QMV_MM_FROM=N`
+    /// (read once) lowers the mm kernel's threshold to `N` rows — the mm
+    /// kernel dequantizes a tile once for its rows (0.27 vs 0.36 ms on a
+    /// q6_K `[10240 × 2560]` at 4 rows) and is another accumulation order
+    /// than the row gemvs, so it is the measurement arm for a multi-row
+    /// pass that gives up bit-identity with the single row.
+    fn qmv_rows_max() -> usize {
+        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("LLOOM_QMV_MM_FROM")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|from| from.saturating_sub(1).max(1))
+                .unwrap_or(8)
+        })
+    }
 
     fn fwd_mv(
         &self,
@@ -471,7 +485,7 @@ impl QMetalStorage {
         // every row exactly what it computes alone (the batched decode's
         // identity). Prefill widths keep the mm kernels.
         let rows_total = src_shape.elem_count() / k.max(1);
-        if src_shape.dim(D::Minus2)? == 1 || rows_total <= Self::QMV_ROWS_MAX_ {
+        if src_shape.dim(D::Minus2)? == 1 || rows_total <= Self::qmv_rows_max() {
             return self.fwd_mv(self_shape, storage, layout);
         }
 

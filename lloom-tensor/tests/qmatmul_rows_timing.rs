@@ -1,15 +1,20 @@
 //! The quantized dense stems at `m = 1` against `m = 4` rows, timed: a
 //! batched decode step runs every stem once over its rows, and the question
 //! is whether the `m = 4` path (the mm kernel or the mv kernel over rows)
-//! costs less than four `m = 1` gemvs. Ignored: a measurement, run by hand
-//! with `--ignored --nocapture` under `lloom-arb measure`.
+//! costs less than four `m = 1` gemvs — and the gate that the default arm
+//! (one launch, the rows on the grid's second axis) is bit-identical to the
+//! single rows. The IQ types have no in-tree quantizer (`iq_quants.rs`), so
+//! the real model covers them. `LLOOM_QMV_ROWS=on` times the rows arm
+//! (`kernel_mul_mv_*_rows_impl`, NR1 rows per weight read; not identical
+//! under fast-math contraction and no faster here — the record in
+//! `measurements/qwen4exp-dispatches.md` P15); `QMM_STRICT=1` asserts the
+//! identity.
 #![cfg(feature = "metal")]
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use lloom_tensor::{Device, Module, Tensor};
 use std::time::Instant;
 
 #[test]
-#[ignore]
 fn quantized_stems_m1_vs_m4() {
     let dev = Device::new_metal(0).unwrap();
     let (n, k) = (10240usize, 2560usize); // attn_qkv's shape
@@ -80,5 +85,11 @@ fn quantized_stems_m1_vs_m4() {
             m4 / (4.0 * m1),
             m16 / (16.0 * m1)
         );
+        if std::env::var("QMM_STRICT").is_ok() {
+            assert_eq!(
+                worst, 0.0,
+                "{dtype:?}: the rows arm is not bit-identical to the single rows"
+            );
+        }
     }
 }

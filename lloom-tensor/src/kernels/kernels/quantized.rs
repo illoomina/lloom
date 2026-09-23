@@ -248,6 +248,22 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
     }
 }
 
+/// `LLOOM_QMV_ROWS=on` (read once): the small-batch rows arm — `NR1`
+/// activation rows per weight read (`kernel_mul_mv_*_rows_impl`). OFF by
+/// default: on this device it is 0–17 % faster than the per-row launches
+/// (the re-read rows are served from the on-chip cache; the register form
+/// spills at NR1 = 4 on q4_K) and, under Metal's fast-math contraction, not
+/// bit-identical to the one-row core (1.9e-7 relative) — the measurement
+/// arm, kept for the record (`qmatmul_rows_timing`).
+fn rows_arm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LLOOM_QMV_ROWS")
+            .map(|v| v == "on")
+            .unwrap_or(false)
+    })
+}
+
 /// Whether the dtype's matmul-vec core stages a codebook into threadgroup
 /// memory (`shared_values [[threadgroup(0)]]`, 8192 bytes per llama.cpp).
 fn needs_iq_shared(dtype: GgmlDType) -> bool {
@@ -380,6 +396,29 @@ pub fn call_quantized_matmul_mv_t(
             }
             .to_string()
         }
+    };
+
+    // The small-batch arm: `m` activation rows (2..=8) share the weight
+    // read (`kernel_mul_mv_*_rows_impl`, the f32 triple, the five stem
+    // types it is built for) — `NR1` rows per threadgroup, the grid's
+    // second axis over the row groups; each row bit-identical to the
+    // one-row kernel. Elsewhere the rows stay the grid's second axis, one
+    // weight read each.
+    let (name, rows_per_group) = match (triple, dtype, m) {
+        (
+            GemvTriple::F32F32F32,
+            GgmlDType::Q6K | GgmlDType::Q4K | GgmlDType::IQ4XS | GgmlDType::IQ3S | GgmlDType::IQ4NL,
+            2..=8,
+        ) if rows_arm_on() => {
+            let nr1 = if m <= 2 { 2 } else { 4 };
+            (format!("{name}_r{nr1}"), nr1)
+        }
+        _ => (name, 1),
+    };
+    let thread_groups_count = MTLSize {
+        width: thread_groups_count.width,
+        height: (ne11 as usize).div_ceil(rows_per_group),
+        depth: thread_groups_count.depth,
     };
 
     let iq_shared = needs_iq_shared(dtype);

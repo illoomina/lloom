@@ -145,6 +145,218 @@ kernel void hc_combine_f32(
 // f32. One threadgroup per row; `k` rounds of an argmax reduction over the
 // experts. The composed path: softmax, a full descending arg-sort, a narrow,
 // a gather, a sum and a divide — six launches.
+// ---------------------------------------------------------------------------
+// The HC bracket's prologue as two launches (#749 P29 (3)): the grouped norm,
+// the low-rank down projection with its SiLU, and the inject projection in
+// ONE kernel (`hc_mix_a`), then the up projection with its sigmoid and the
+// gated collapse over the streams in ONE (`hc_mix_b`). Composed, the same
+// bracket was five to six launches a bracket, ~11 a layer, 528 a token.
+//
+// `hc_mix_a`: threadgroup (x, row) — every threadgroup recomputes the row's
+// `n` stream scales (a 2 560-wide sum of squares each; the carry is 40 KB and
+// stays in cache), stages the normed carry `h · scale_s · γ` a chunk at a
+// time in threadgroup memory (threadgroup x == 0 also writes it out as `xn`
+// for `hc_mix_b`), and each simdgroup takes HC_MIX_OUT output rows of
+// `[w_down | w_inject]`: lane-strided `half4` dots (coalesced across the
+// simdgroup) accumulated over the chunks, `simd_sum`, then SiLU(scale · dot)
+// for a down row and the raw dot for an inject row. With no inject weight the
+// inject slots are written as zeros (the composed path's `Tensor::zeros`).
+// The first cut (one output a simdgroup, the normed value recomputed per
+// dot) read the carry three times per weight byte and ran at 254 GB/s.
+//
+// Output layout (flat): [rows · n·d] xn | [rows · lr] lo | [rows · n] inject —
+// three contiguous blocks, so each is a contiguous narrow of the one buffer.
+//
+// The dot's order — lane-strided partials then `simd_sum` — differs from the
+// mixed gemv's tiles, so the bracket's rounding moves at the last bits (the
+// logits digest moves, the tokens hold); the parity test bounds it.
+#define HC_MAX_N 8
+#define HC_MIX_SG 8
+#define HC_MIX_MAX_LR 1024
+#define HC_MIX_OUT 1
+#define HC_MIX_CHUNK 2048
+
+inline float hc_silu(float v) { return v / (1.0f + metal::exp(-v)); }
+inline float hc_sigmoid(float v) { return 1.0f / (1.0f + metal::exp(-v)); }
+
+kernel void hc_mix_a_f32(
+    const device float* h [[buffer(0)]],
+    const device float* gamma [[buffer(1)]],
+    const device half* w_down [[buffer(2)]],
+    const device half* w_inject [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant uint& n [[buffer(5)]],
+    constant uint& d [[buffer(6)]],
+    constant uint& lr [[buffer(7)]],
+    constant uint& n_inj [[buffer(8)]],
+    constant uint& rows [[buffer(9)]],
+    constant float& eps [[buffer(10)]],
+    constant float& scale [[buffer(11)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 tptg [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partial[32];
+  threadgroup float scales[HC_MAX_N];
+  // The normed carry, staged a chunk at a time (8 KB), read once per
+  // threadgroup instead of once per output: the weights are then the only
+  // stream the dots pull from device memory.
+  threadgroup float4 xn_s[HC_MIX_CHUNK / 4];
+  const uint tid = tid2.x;
+  const uint width = tptg.x;
+  const uint row = tg.y;
+  if (row >= rows) {
+    return;
+  }
+  const uint nd = n * d;
+  const device float* hr = h + (size_t)row * nd;
+  // The stream scales: one reduction per stream, every thread a strided slice.
+  const uint n_simd = (width + 31) / 32;
+  for (uint s = 0; s < n; s++) {
+    float acc = 0.0f;
+    const device float* hs = hr + (size_t)s * d;
+    for (uint i = tid; i < d; i += width) {
+      const float v = hs[i];
+      acc += v * v;
+    }
+    acc = simd_sum(acc);
+    if (simd_lane == 0) {
+      partial[simd_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+      float total = 0.0f;
+      for (uint k = 0; k < n_simd; k++) {
+        total += partial[k];
+      }
+      scales[s] = metal::rsqrt(total / (float)d + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  device float* xn_out = out;
+  device float* lo_out = out + (size_t)rows * nd;
+  device float* inj_out = lo_out + (size_t)rows * lr;
+  // This simdgroup's HC_MIX_OUT output rows of [w_down | w_inject].
+  const uint j0 = (tg.x * HC_MIX_SG + simd_id) * HC_MIX_OUT;
+  const device half4* wr4[HC_MIX_OUT];
+  bool live[HC_MIX_OUT];
+  float acc[HC_MIX_OUT];
+  for (uint o = 0; o < HC_MIX_OUT; o++) {
+    const uint j = j0 + o;
+    acc[o] = 0.0f;
+    if (j < lr) {
+      live[o] = true;
+      wr4[o] = (const device half4*)(w_down + (size_t)j * nd);
+    } else if (j < lr + n_inj) {
+      live[o] = true;
+      wr4[o] = (const device half4*)(w_inject + (size_t)(j - lr) * nd);
+    } else {
+      live[o] = false;
+      wr4[o] = (const device half4*)w_down;
+    }
+  }
+  const device float4* hr4 = (const device float4*)hr;
+  const device float4* g4 = (const device float4*)gamma;
+  const uint nd4 = nd / 4;
+  const uint d4 = d / 4;
+  device float4* xn_out4 = (device float4*)(xn_out + (size_t)row * nd);
+  for (uint c0 = 0; c0 < nd4; c0 += HC_MIX_CHUNK / 4) {
+    const uint c_len = min((uint)(HC_MIX_CHUNK / 4), nd4 - c0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i4 = tid; i4 < c_len; i4 += width) {
+      const uint g = c0 + i4;
+      const float4 xn = hr4[g] * scales[g / d4] * g4[g];
+      xn_s[i4] = xn;
+      if (tg.x == 0) {
+        xn_out4[g] = xn;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_id < HC_MIX_SG) {
+      for (uint i4 = simd_lane; i4 < c_len; i4 += 32) {
+        const float4 xn = xn_s[i4];
+        const uint g = c0 + i4;
+        for (uint o = 0; o < HC_MIX_OUT; o++) {
+          if (live[o]) {
+            acc[o] += dot(float4(wr4[o][g]), xn);
+          }
+        }
+      }
+    }
+  }
+  if (simd_id >= HC_MIX_SG) {
+    return;
+  }
+  for (uint o = 0; o < HC_MIX_OUT; o++) {
+    const float total = simd_sum(acc[o]);
+    const uint j = j0 + o;
+    if (simd_lane == 0 && j < lr + n) {
+      if (j < lr) {
+        lo_out[(size_t)row * lr + j] = hc_silu(scale * total);
+      } else {
+        // An inject row, or — with no inject weight — the composed path's zeros.
+        inj_out[(size_t)row * n + (j - lr)] = live[o] ? total : 0.0f;
+      }
+    }
+  }
+}
+
+// `hc_mix_b`: threadgroup (x, row); `lo` staged in threadgroup memory; each
+// simdgroup takes one output column i of the collapsed carry: for every stream
+// s the gate σ(w_up[s·d+i] · lo) (a lane-strided dot over lr, `simd_sum`),
+// then Σ_s xn[s·d+i] · gate_s scaled by 1/n — `hc_collapse`'s arithmetic with
+// the gate never stored.
+kernel void hc_mix_b_f32(
+    const device float* packed [[buffer(0)]],
+    const device half* w_up [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant uint& d [[buffer(4)]],
+    constant uint& lr [[buffer(5)]],
+    constant uint& rows [[buffer(6)]],
+    constant float& inv_n [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tid2 [[thread_position_in_threadgroup]],
+    uint2 tptg [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float lo_s[HC_MIX_MAX_LR];
+  const uint tid = tid2.x;
+  const uint width = tptg.x;
+  const uint row = tg.y;
+  if (row >= rows) {
+    return;
+  }
+  const uint nd = n * d;
+  const device float* xn = packed + (size_t)row * nd;
+  const device float* lo = packed + (size_t)rows * nd + (size_t)row * lr;
+  for (uint k = tid; k < lr; k += width) {
+    lo_s[k] = lo[k];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint i = tg.x * HC_MIX_SG + simd_id;
+  if (simd_id >= HC_MIX_SG || i >= d) {
+    return;
+  }
+  float acc = 0.0f;
+  const uint lr2 = lr / 2;
+  for (uint s = 0; s < n; s++) {
+    // lr is even: half2 loads, lane l at [2l, 2l+2) of every 64-wide chunk.
+    const device half2* wr2 = (const device half2*)(w_up + (size_t)(s * d + i) * lr);
+    float dotv = 0.0f;
+    for (uint k2 = simd_lane; k2 < lr2; k2 += 32) {
+      const float2 w = float2(wr2[k2]);
+      dotv += w.x * lo_s[2 * k2] + w.y * lo_s[2 * k2 + 1];
+    }
+    dotv = simd_sum(dotv);
+    acc += xn[(size_t)s * d + i] * hc_sigmoid(dotv);
+  }
+  if (simd_lane == 0) {
+    out[(size_t)row * d + i] = acc * inv_n;
+  }
+}
+
 kernel void moe_topk_f32(
     const device float* logits [[buffer(0)]],
     device uint* ids [[buffer(1)]],

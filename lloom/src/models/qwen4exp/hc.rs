@@ -96,6 +96,22 @@ impl HyperConnection {
     /// `inject = inject·xn`.
     pub fn mix(&self, h: &Tensor) -> Result<(Tensor, Tensor)> {
         let (b, seq, _) = h.dims3()?;
+        // The whole prologue as two launches on Metal at a decode's rows
+        // (`kernels::hc_mix_fused`: norm + down·SiLU + inject, then
+        // up·sigmoid + collapse), opt-in: measured slower than the five
+        // launches below, whose gemvs run at bandwidth (P29 (3)).
+        if let Some(out) = super::kernels::hc_mix_fused(
+            h,
+            &self.norm_w,
+            &self.down,
+            &self.up,
+            self.inject.as_ref(),
+            self.n,
+            self.d,
+            self.eps,
+        ) {
+            return out;
+        }
         // The grouped norm as one launch on Metal (`kernels::HcNorm`); the
         // composed pair (`rms_norm` per stream, `broadcast_mul` γ) elsewhere.
         let xn = match super::kernels::hc_norm(h, &self.norm_w, self.n, self.d, self.eps) {
@@ -261,6 +277,241 @@ mod tests {
                 );
                 assert!(scale > 1e-3, "{name} seq {seq}: degenerate");
             }
+        }
+    }
+
+    /// The fused two-launch prologue (`hc_mix_a` / `hc_mix_b`, f16 weights on
+    /// Metal) against the CPU's composed chain over the same f16-rounded
+    /// weights, with and without an inject weight, at 1 and 3 rows — and the
+    /// composed Metal chain (`QWEN4EXP_FUSED_OFF` is process-wide, so the
+    /// composed arm here is the CPU's).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_prologue_matches_composed_f16() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let (n, d, lr) = (4usize, 2560usize, 320usize);
+        let f16_rounded = |out: usize, inp: usize, seed: f32| -> Tensor {
+            Tensor::from_vec(
+                (0..out * inp)
+                    .map(|i| ((i as f32 * 0.0117 + seed).sin()) * 0.03)
+                    .collect::<Vec<_>>(),
+                (out, inp),
+                &cpu,
+            )
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+        };
+        let gamma = Tensor::from_vec(
+            (0..n * d)
+                .map(|i| 1.0 + 0.1 * ((i as f32) * 0.3).sin())
+                .collect::<Vec<f32>>(),
+            n * d,
+            &cpu,
+        )
+        .unwrap();
+        for with_inject in [true, false] {
+            let (wd, wu, wi) = (
+                f16_rounded(lr, n * d, 1.0),
+                f16_rounded(n * d, lr, 2.0),
+                f16_rounded(n, n * d, 3.0),
+            );
+            let hc_cpu = HyperConnection::new(
+                gamma.clone(),
+                QMatMul::Tensor(wd.to_dtype(DType::F32).unwrap()),
+                QMatMul::Tensor(wu.to_dtype(DType::F32).unwrap()),
+                with_inject.then(|| QMatMul::Tensor(wi.to_dtype(DType::F32).unwrap())),
+                n,
+                d,
+                1e-6,
+            )
+            .unwrap();
+            let hc_gpu = HyperConnection::new(
+                gamma.to_device(&gpu).unwrap(),
+                QMatMul::TensorF16(wd.to_device(&gpu).unwrap()),
+                QMatMul::TensorF16(wu.to_device(&gpu).unwrap()),
+                with_inject.then(|| QMatMul::TensorF16(wi.to_device(&gpu).unwrap())),
+                n,
+                d,
+                1e-6,
+            )
+            .unwrap();
+            for &seq in &[1usize, 3] {
+                let h = Tensor::from_vec(
+                    (0..seq * n * d)
+                        .map(|i| ((i as f32 * 0.021).cos()) * 0.8)
+                        .collect::<Vec<f32>>(),
+                    (1, seq, n * d),
+                    &cpu,
+                )
+                .unwrap();
+                let (m_cpu, i_cpu) = hc_cpu.mix(&h).unwrap();
+                let (m_gpu, i_gpu) = hc_gpu.mix(&h.to_device(&gpu).unwrap()).unwrap();
+                assert_eq!(m_gpu.dims(), &[1, seq, d]);
+                assert_eq!(i_gpu.dims(), &[1, seq, n]);
+                for (name, a, b, tol) in [
+                    ("mixed", &m_cpu, &m_gpu, 3e-5f32),
+                    ("inject", &i_cpu, &i_gpu, 3e-5f32),
+                ] {
+                    let x: Vec<f32> = a.flatten_all().unwrap().to_vec1().unwrap();
+                    let y: Vec<f32> = b
+                        .to_device(&cpu)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1()
+                        .unwrap();
+                    assert_eq!(x.len(), y.len(), "{name} seq {seq}");
+                    let scale = x.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+                    let diff = x
+                        .iter()
+                        .zip(&y)
+                        .map(|(p, q)| (p - q).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        diff <= tol * scale,
+                        "{name} inject={with_inject} seq {seq}: {diff} at scale {scale}"
+                    );
+                    if name == "inject" && !with_inject {
+                        assert!(y.iter().all(|v| *v == 0.0), "no-inject rows must be zero");
+                    } else {
+                        assert!(scale > 1e-3, "{name} seq {seq}: degenerate");
+                    }
+                }
+                // Determinism: the same launch twice, bit for bit.
+                let (m2, _) = hc_gpu.mix(&h.to_device(&gpu).unwrap()).unwrap();
+                let a: Vec<f32> = m_gpu.flatten_all().unwrap().to_vec1().unwrap();
+                let b2: Vec<f32> = m2.flatten_all().unwrap().to_vec1().unwrap();
+                assert_eq!(a, b2, "fused prologue not bit-stable at seq {seq}");
+            }
+        }
+    }
+
+    /// `cargo test -p lloom --release --features metal --lib hc::tests::prologue_bench -- --ignored --nocapture`
+    /// (under `lloom-arb measure`): µs per call of the composed Metal
+    /// prologue (norm, down·SiLU, up·sigmoid, collapse, inject — five
+    /// launches) against the fused pair, and each fused launch alone, at the
+    /// real geometry and a decode's rows.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore]
+    fn prologue_bench() {
+        use super::super::kernels::{HcMixA, HcMixB};
+        let gpu = Device::new_metal(0).unwrap();
+        let (n, d, lr) = (4usize, 2560usize, 320usize);
+        let w = |out: usize, inp: usize, seed: f32| -> Tensor {
+            Tensor::from_vec(
+                (0..out * inp)
+                    .map(|i| ((i as f32 * 0.0117 + seed).sin()) * 0.03)
+                    .collect::<Vec<_>>(),
+                (out, inp),
+                &gpu,
+            )
+            .unwrap()
+            .to_dtype(DType::F16)
+            .unwrap()
+        };
+        let gamma = Tensor::ones(n * d, DType::F32, &gpu).unwrap();
+        // SETS distinct brackets cycled in turn (SETS × 13 MB, past the
+        // system cache): the model streams every bracket's weights from
+        // memory once a token, and a bench over one bracket measures the
+        // cache instead (12.7 µs cached against ~40 in the model, P29).
+        const SETS: usize = 32;
+        let brackets: Vec<(Tensor, Tensor, Tensor, HyperConnection)> = (0..SETS)
+            .map(|k| {
+                let seed = k as f32 * 0.7;
+                let (wd, wu, wi) = (
+                    w(lr, n * d, 1.0 + seed),
+                    w(n * d, lr, 2.0 + seed),
+                    w(n, n * d, 3.0 + seed),
+                );
+                let hc = HyperConnection::new(
+                    gamma.clone(),
+                    QMatMul::TensorF16(wd.clone()),
+                    QMatMul::TensorF16(wu.clone()),
+                    Some(QMatMul::TensorF16(wi.clone())),
+                    n,
+                    d,
+                    1e-6,
+                )
+                .unwrap();
+                (wd, wu, wi, hc)
+            })
+            .collect();
+        for rows in [1usize, 4] {
+            let h = Tensor::randn(0f32, 0.8, (1, rows, n * d), &gpu).unwrap();
+            let composed = |k: usize| -> Tensor {
+                let hc = &brackets[k].3;
+                let xn = super::super::kernels::hc_norm(&h, &gamma, n, d, 1e-6).unwrap().unwrap();
+                let lo = hc.down.gemv_mixed(&xn, MixedEpilogue::Silu, 0.25).unwrap().unwrap();
+                let gate = hc.up.gemv_mixed(&lo, MixedEpilogue::Sigmoid, 1.0).unwrap().unwrap();
+                let mixed = super::super::kernels::hc_collapse(&xn, &gate, n, d).unwrap().unwrap();
+                let _inject = hc.inject.as_ref().unwrap().forward(&xn).unwrap();
+                mixed
+            };
+            let a_only = |k: usize| -> Tensor {
+                h.apply_op1_no_bwd(&HcMixA {
+                    gamma: gamma.clone(),
+                    w_down: brackets[k].0.clone(),
+                    w_inject: Some(brackets[k].2.clone()),
+                    n,
+                    d,
+                    eps: 1e-6,
+                    scale: 0.25,
+                })
+                .unwrap()
+            };
+            let packed = a_only(0);
+            let b_only = |k: usize| -> Tensor {
+                packed
+                    .apply_op1_no_bwd(&HcMixB {
+                        w_up: brackets[k].1.clone(),
+                        n,
+                        d,
+                        lr,
+                    })
+                    .unwrap()
+            };
+            let fused = |k: usize| -> Tensor { brackets[k].3.mix(&h).unwrap().0 };
+            // Under `CANDLE_METAL_PROFILE=1` the GPU-busy union over the timed
+            // loop is the kernels' own time (the wall of a one-launch loop is
+            // the host's encode); each loop runs one kind of launch.
+            let time = |name: &str, f: &dyn Fn(usize) -> Tensor| {
+                use lloom_tensor::kernels::metal::profile;
+                for k in 0..SETS {
+                    let _ = f(k);
+                }
+                gpu.synchronize().unwrap();
+                let iters = 8 * SETS;
+                profile::reset();
+                let t = std::time::Instant::now();
+                let mut last = None;
+                for i in 0..iters {
+                    last = Some(f(i % SETS));
+                }
+                gpu.synchronize().unwrap();
+                let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                let gpu_us = if profile::enabled() {
+                    profile::snapshot().gpu_busy_union_s * 1e6 / iters as f64
+                } else {
+                    f64::NAN
+                };
+                let _ = last;
+                println!("HCBENCH rows={rows} {name} wall {us:.1} us/call gpu {gpu_us:.1} us/call ({SETS} brackets cycled)");
+            };
+            let xn0 = super::super::kernels::hc_norm(&h, &gamma, n, d, 1e-6).unwrap().unwrap();
+            let lo0 = brackets[0].3.down.gemv_mixed(&xn0, MixedEpilogue::Silu, 0.25).unwrap().unwrap();
+            let gate0 = brackets[0].3.up.gemv_mixed(&lo0, MixedEpilogue::Sigmoid, 1.0).unwrap().unwrap();
+            time("composed(5 launches)", &composed);
+            time("  hc_norm", &|_k| super::super::kernels::hc_norm(&h, &gamma, n, d, 1e-6).unwrap().unwrap());
+            time("  down gemv+silu", &|k| brackets[k].3.down.gemv_mixed(&xn0, MixedEpilogue::Silu, 0.25).unwrap().unwrap());
+            time("  up gemv+sigmoid", &|k| brackets[k].3.up.gemv_mixed(&lo0, MixedEpilogue::Sigmoid, 1.0).unwrap().unwrap());
+            time("  hc_collapse", &|_k| super::super::kernels::hc_collapse(&xn0, &gate0, n, d).unwrap().unwrap());
+            time("  inject", &|k| brackets[k].3.inject.as_ref().unwrap().forward(&xn0).unwrap());
+            time("fused(2 launches)", &fused);
+            time("mix_a", &a_only);
+            time("mix_b", &b_only);
         }
     }
 

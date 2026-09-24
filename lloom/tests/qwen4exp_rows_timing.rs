@@ -452,3 +452,157 @@ fn deltanet_prefill_stages() {
         "DNSTEMS rows={rows} [{out_dim}x{dd}]: q4k_mm={t_q4:.2}ms f16w_quant_mm={t_f16mm:.2}ms steel_f16_gemm={t_steel:.2}ms"
     );
 }
+
+/// The checkpoint's own stems, one row, by weight kind: GB/s of the
+/// quantized matvec at N = 1 for every (stem, kind) the IQ3_XXS shard holds
+/// (up to 8 layers' tensors of a kind cycled, so the weights stream from
+/// memory), and the lm_head. GPU time is the profiler's busy union
+/// (`CANDLE_METAL_PROFILE=1`), the wall beside it. The census that decides
+/// where the decode token's GPU time goes (#749 P29 (3)).
+///
+/// `QWEN4EXP_GGUF=<shard 1>` names the shard (the ISTA IQ3_XXS by default).
+#[test]
+#[ignore]
+fn stem_mv_by_weight_kind() {
+    use lloom_tensor::kernels::metal::profile;
+    use lloom_tensor::quantized::gguf_file::Content;
+    let dev = Device::new_metal(0).unwrap();
+    let path = std::env::var("QWEN4EXP_GGUF").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/huggingface/hub/models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF/snapshots/2c4721899b4382bd07dfb61ae4fbad90c09caf7d/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+            std::env::var("HOME").unwrap()
+        )
+    });
+    let mut file = std::fs::File::open(&path).unwrap();
+    let content = Content::read(&mut file).unwrap();
+    let stems = ["attn_qkv", "attn_gate", "ssm_out", "attn_output", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "ffn_gate_inp"];
+    // (stem, kind) → tensor names, in layer order.
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<String>> = Default::default();
+    for (name, info) in &content.tensor_infos {
+        for stem in stems {
+            if name.starts_with("blk.") && name.ends_with(&format!(".{stem}.weight")) {
+                groups
+                    .entry((stem.to_string(), format!("{:?}", info.ggml_dtype)))
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+    }
+    groups.insert(("output".into(), "Q5K".into()), vec!["output.weight".into()]);
+    println!("STEMMV shard={path}");
+    for ((stem, kind), mut names) in groups {
+        names.sort();
+        names.truncate(8);
+        let mats: Vec<QMatMul> = names
+            .iter()
+            .map(|n| QMatMul::from_qtensor(content.tensor(&mut file, n, &dev).unwrap()).unwrap())
+            .collect();
+        let (out, inp) = match &mats[0] {
+            QMatMul::QTensor(q) => (q.shape().dims()[0], q.shape().dims()[1]),
+            QMatMul::TensorF16(t) | QMatMul::Tensor(t) => (t.dims()[0], t.dims()[1]),
+        };
+        let bytes: usize = match &mats[0] {
+            QMatMul::QTensor(q) => q.storage_size_in_bytes(),
+            QMatMul::TensorF16(t) => t.elem_count() * 2,
+            QMatMul::Tensor(t) => t.elem_count() * 4,
+        };
+        let x = Tensor::randn(0f32, 1.0, (1, 1, inp), &dev).unwrap();
+        let iters = 16 * mats.len();
+        for m in &mats {
+            let _ = m.forward(&x).unwrap();
+        }
+        dev.synchronize().unwrap();
+        profile::reset();
+        let t = Instant::now();
+        for i in 0..iters {
+            let _ = mats[i % mats.len()].forward(&x).unwrap();
+        }
+        dev.synchronize().unwrap();
+        let wall_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let gpu_us = if profile::enabled() {
+            profile::snapshot().gpu_busy_union_s * 1e6 / iters as f64
+        } else {
+            f64::NAN
+        };
+        println!(
+            "STEMMV stem={stem} kind={kind} shape=[{out}, {inp}] bytes={bytes} n={} wall_us={wall_us:.1} gpu_us={gpu_us:.1} gb_s={:.0}",
+            mats.len(),
+            bytes as f64 / gpu_us / 1e3
+        );
+    }
+}
+
+/// The routed experts' kernels on the checkpoint's own expert tensors, one
+/// token (10 experts of 512): `gate_up` and `down` through `Resident`
+/// (`indexed_moe_forward`, `kernel_mul_mv_id_*`), two layers' tensors
+/// cycled (~700 MB, past the system cache). GPU time from the profiler's
+/// busy union; GB/s over the ten experts' bytes actually read.
+#[test]
+#[ignore]
+fn routed_mv_id_census() {
+    use lloom::nn::expert_stream::{ExpertResidency, Resident};
+    use lloom_tensor::kernels::metal::profile;
+    use lloom_tensor::quantized::gguf_file::Content;
+    let dev = Device::new_metal(0).unwrap();
+    let path = std::env::var("QWEN4EXP_GGUF").unwrap_or_else(|_| {
+        format!(
+            "{}/.cache/huggingface/hub/models--ISTA-DASLab--Qwen3.8-Flash-Next-GSQ-RCO-GGUF/snapshots/2c4721899b4382bd07dfb61ae4fbad90c09caf7d/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+            std::env::var("HOME").unwrap()
+        )
+    });
+    let mut file = std::fs::File::open(&path).unwrap();
+    let content = Content::read(&mut file).unwrap();
+    let layers = [0usize, 1];
+    let tiers: Vec<(Resident, String, usize, usize, usize)> = layers
+        .iter()
+        .map(|l| {
+            let mut load = |n: &str| Arc::new(content.tensor(&mut file, &format!("blk.{l}.{n}.weight"), &dev).unwrap());
+            let (g, u, d) = (load("ffn_gate_exps"), load("ffn_up_exps"), load("ffn_down_exps"));
+            let kinds = format!("gate={:?} up={:?} down={:?}", g.dtype(), u.dtype(), d.dtype());
+            let n_experts = g.shape().dims()[0];
+            let per_expert = (g.storage_size_in_bytes() + u.storage_size_in_bytes() + d.storage_size_in_bytes()) / n_experts;
+            let gu_per_expert = (g.storage_size_in_bytes() + u.storage_size_in_bytes()) / n_experts;
+            (Resident::new(g, u, d), kinds, n_experts, per_expert, gu_per_expert)
+        })
+        .collect();
+    let hidden = 2560usize;
+    let inter = 640usize;
+    let topk = 10usize;
+    let x = Tensor::randn(0f32, 1.0, (1, 1, hidden), &dev).unwrap();
+    let h = Tensor::randn(0f32, 1.0, (1, topk, inter), &dev).unwrap();
+    let mut ids_v: Vec<u32> = (0..topk as u32).map(|i| (i * 47 + 3) % 512).collect();
+    ids_v.sort_unstable();
+    let ids = Tensor::from_vec(ids_v, (1, topk), &dev).unwrap();
+    println!("ROUTEDMV shard={path} kinds={} experts={} bytes/expert={}", tiers[0].1, tiers[0].2, tiers[0].3);
+    let time = |name: &str, bytes: usize, f: &dyn Fn(usize)| {
+        for k in 0..tiers.len() {
+            f(k);
+        }
+        dev.synchronize().unwrap();
+        let iters = 32 * tiers.len();
+        profile::reset();
+        let t = Instant::now();
+        for i in 0..iters {
+            f(i % tiers.len());
+        }
+        dev.synchronize().unwrap();
+        let wall_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let gpu_us = if profile::enabled() {
+            profile::snapshot().gpu_busy_union_s * 1e6 / iters as f64
+        } else {
+            f64::NAN
+        };
+        println!(
+            "ROUTEDMV {name} bytes_read={bytes} wall_us={wall_us:.1} gpu_us={gpu_us:.1} gb_s={:.0}",
+            bytes as f64 / gpu_us / 1e3
+        );
+    };
+    let gu_bytes = tiers[0].4 * topk;
+    let d_bytes = (tiers[0].3 - tiers[0].4) * topk;
+    time("gate_up(10 experts)", gu_bytes, &|k| {
+        let _ = tiers[k].0.gate_up(&x, &ids).unwrap();
+    });
+    time("down(10 experts)", d_bytes, &|k| {
+        let _ = tiers[k].0.down(&h, &ids).unwrap();
+    });
+}

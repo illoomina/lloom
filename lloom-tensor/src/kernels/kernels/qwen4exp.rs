@@ -91,6 +91,110 @@ pub fn call_hc_norm(
     Ok(())
 }
 
+/// `hc_mix_a_f32`: the HC prologue's first launch — the grouped norm, the
+/// down projection (SiLU, `scale`) and the inject projection of `rows`
+/// carries, into one flat buffer `[rows·n·d] xn | [rows·lr] lo | [rows·n]
+/// inject`. `n_inj` is `n` with an inject weight and 0 without (the inject
+/// block is then zeros; `w_inject` is unread). Threadgroups `(⌈(lr+n)/8⌉, rows)`
+/// of 256 threads, a simdgroup per output row.
+#[allow(clippy::too_many_arguments)]
+pub fn call_hc_mix_a(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    n: usize,
+    d: usize,
+    lr: usize,
+    n_inj: usize,
+    eps: f32,
+    scale: f32,
+    h: BufferOffset,
+    gamma: BufferOffset,
+    w_down: BufferOffset,
+    w_inject: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "hc_mix_a_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "hc_mix_a rows={rows} n={n} d={d} lr={lr}");
+    set_params!(
+        encoder,
+        (
+            &h,
+            &gamma,
+            &w_down,
+            &w_inject,
+            Output::new(out),
+            n as u32,
+            d as u32,
+            lr as u32,
+            n_inj as u32,
+            rows as u32,
+            eps,
+            scale
+        )
+    );
+    let gx = (lr + n).div_ceil(HC_MIX_SG * HC_MIX_OUT);
+    dispatch_groups_2d(encoder, gx, rows, HC_MIX_SG * 32);
+    Ok(())
+}
+
+/// `hc_mix_b_f32`: the HC prologue's second launch — the up projection
+/// (sigmoid) and the gated collapse over the streams, `out [rows, d]`, from
+/// `hc_mix_a`'s buffer. Threadgroups `(⌈d/8⌉, rows)`, a simdgroup per column.
+/// `lr` ≤ 1 024 (the threadgroup staging of `lo`).
+#[allow(clippy::too_many_arguments)]
+pub fn call_hc_mix_b(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    rows: usize,
+    n: usize,
+    d: usize,
+    lr: usize,
+    inv_n: f32,
+    packed: BufferOffset,
+    w_up: BufferOffset,
+    out: &Buffer,
+) -> Result<(), MetalKernelError> {
+    if lr > HC_MIX_MAX_LR {
+        return Err(MetalKernelError::LoadLibraryError(format!(
+            "hc_mix_b: lr {lr} above the threadgroup staging of {HC_MIX_MAX_LR}"
+        )));
+    }
+    let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "hc_mix_b_f32")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "hc_mix_b rows={rows} n={n} d={d} lr={lr}");
+    set_params!(
+        encoder,
+        (
+            &packed,
+            &w_up,
+            Output::new(out),
+            n as u32,
+            d as u32,
+            lr as u32,
+            rows as u32,
+            inv_n
+        )
+    );
+    let gx = d.div_ceil(HC_MIX_SG);
+    dispatch_groups_2d(encoder, gx, rows, HC_MIX_SG * 32);
+    Ok(())
+}
+
+/// Simdgroups per threadgroup of the `hc_mix_*` kernels (`HC_MIX_SG`).
+const HC_MIX_SG: usize = 8;
+/// Output rows per simdgroup in `hc_mix_a` (`HC_MIX_OUT`).
+const HC_MIX_OUT: usize = 1;
+/// The most `lr` `hc_mix_b` stages in threadgroup memory (`HC_MIX_MAX_LR`).
+const HC_MIX_MAX_LR: usize = 1024;
+
 /// `hc_collapse_f32`: `out [rows, d] = mean_s(xn · gate)` over the `n` streams.
 #[allow(clippy::too_many_arguments)]
 pub fn call_hc_collapse(

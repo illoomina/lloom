@@ -33,7 +33,7 @@ pub use kernels::{
     call_gdn_chunk_scan_at, call_gdn_conv_window, call_gdn_gate, call_gdn_gated_norm,
     call_gdn_gated_norm_rows, call_gdn_prefill_prologue, call_gdn_prologue, call_gdn_prologue_rows,
     call_gdn_prologue_seq, call_gdn_step, call_gdn_step_rows, call_gdn_step_seq, call_hc_collapse,
-    call_hc_combine, call_hc_norm, call_mlx_gemm, call_mlx_gemm_out, call_mlx_gemv_epilogue,
+    call_hc_combine, call_hc_mix_a, call_hc_mix_b, call_hc_norm, call_mlx_gemm, call_mlx_gemm_out, call_mlx_gemv_epilogue,
     call_mlx_gemv_full, call_mlx_gemv_mixed, call_mlx_gemv_with, call_moe_combine,
     call_moe_slot_map, call_moe_topk, call_qsa_prep, call_qsa_prep_batch, call_qsa_prep_rows,
     call_sigmoid_mul, call_silu_mul, call_unit_lower_inverse, call_words_publish, cast::*,

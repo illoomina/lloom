@@ -190,6 +190,308 @@ impl lloom_tensor::CustomOp2 for HcNorm {
 }
 
 /// `mean_s(xn · gate)` over the `n` streams: `[.., n·d] → [.., d]`.
+/// The HC prologue's first fused launch (`hc_mix_a_f32`): over the carry
+/// `h [rows, n·d]` — the grouped norm (γ), the down projection with SiLU and
+/// `scale`, the inject projection — into one flat buffer `[rows·n·d] xn |
+/// [rows·lr] lo | [rows·n] inject`. The weights ride in the op (as
+/// `GemvMixed` carries its weight): contiguous f16 `[lr, n·d]` and, when
+/// present, `[n, n·d]`.
+pub(crate) struct HcMixA {
+    pub gamma: Tensor,
+    pub w_down: Tensor,
+    pub w_inject: Option<Tensor>,
+    pub n: usize,
+    pub d: usize,
+    pub eps: f32,
+    pub scale: f32,
+}
+
+#[cfg(feature = "metal")]
+fn metal_weight<'a>(
+    w: &'a Tensor,
+    what: &str,
+) -> Result<(
+    parking_lot::RwLockReadGuard<'a, lloom_tensor::Storage>,
+    &'a Layout,
+)> {
+    use lloom_tensor::backend::BackendStorage;
+    let (ws, wl) = w.storage_and_layout();
+    match &*ws {
+        lloom_tensor::Storage::Metal(m) if m.dtype() == lloom_tensor::DType::F16 => {}
+        _ => lloom_tensor::bail!("{what}: the weight must be f16 on the metal device"),
+    }
+    if !wl.is_contiguous() {
+        lloom_tensor::bail!("{what}: the weight must be contiguous")
+    }
+    Ok((ws, wl))
+}
+
+#[cfg(feature = "metal")]
+fn metal_bo_of<'a>(
+    ws: &'a lloom_tensor::Storage,
+    wl: &Layout,
+) -> lloom_tensor::kernels::BufferOffset<'a> {
+    use lloom_tensor::backend::BackendStorage;
+    match ws {
+        lloom_tensor::Storage::Metal(m) => lloom_tensor::kernels::BufferOffset {
+            buffer: m.buffer(),
+            offset_in_bytes: wl.start_offset() * m.dtype().size_in_bytes(),
+        },
+        _ => unreachable!("checked by metal_weight"),
+    }
+}
+
+impl lloom_tensor::CustomOp1 for HcMixA {
+    fn name(&self) -> &'static str {
+        "qwen4exp-hc-mix-a"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("hc_mix_a: no cpu kernel; `HyperConnection::mix` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let nd = self.n * self.d;
+        if l.dims().last() != Some(&nd) || !l.is_contiguous() {
+            lloom_tensor::bail!("hc_mix_a: h {:?} vs n·d {nd}, contiguous", l.shape())
+        }
+        let rows = l.shape().elem_count() / nd;
+        let (lr, k) = self.w_down.dims2()?;
+        if k != nd {
+            lloom_tensor::bail!("hc_mix_a: w_down {:?} vs n·d {nd}", self.w_down.shape())
+        }
+        if let Some(w) = &self.w_inject {
+            if w.dims2()? != (self.n, nd) {
+                lloom_tensor::bail!("hc_mix_a: w_inject {:?} vs [{}, {nd}]", w.shape(), self.n)
+            }
+        }
+        let (gs, gl) = self.gamma.storage_and_layout();
+        let gs_m = match &*gs {
+            lloom_tensor::Storage::Metal(m)
+                if m.dtype() == lloom_tensor::DType::F32 && gl.is_contiguous() =>
+            {
+                m
+            }
+            _ => lloom_tensor::bail!("hc_mix_a: γ must be contiguous f32 on the metal device"),
+        };
+        if gl.shape().elem_count() != nd {
+            lloom_tensor::bail!("hc_mix_a: γ {:?} vs n·d {nd}", gl.shape())
+        }
+        let (ds, dl) = metal_weight(&self.w_down, "hc_mix_a")?;
+        let inj = match &self.w_inject {
+            Some(w) => Some(metal_weight(w, "hc_mix_a")?),
+            None => None,
+        };
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("hc_mix_a");
+        let elem_count = rows * (nd + lr + self.n);
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("hc_mix_a")
+            .build()?;
+        let w_down = metal_bo_of(&ds, dl);
+        // Unread when there is no inject weight: the down weight stands in.
+        let w_inject = match &inj {
+            Some((is_, il)) => metal_bo_of(is_, il),
+            None => metal_bo_of(&ds, dl),
+        };
+        lloom_tensor::kernels::call_hc_mix_a(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            self.n,
+            self.d,
+            lr,
+            if inj.is_some() { self.n } else { 0 },
+            self.eps,
+            self.scale,
+            metal_bo(s, l),
+            lloom_tensor::kernels::BufferOffset {
+                buffer: gs_m.buffer(),
+                offset_in_bytes: gl.start_offset() * 4,
+            },
+            w_down,
+            w_inject,
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            Shape::from(elem_count),
+        ))
+    }
+}
+
+/// The HC prologue's second fused launch (`hc_mix_b_f32`): from `HcMixA`'s
+/// buffer, the up projection (sigmoid) and the gated collapse over the
+/// streams → `[rows, d]`. `w_up` contiguous f16 `[n·d, lr]`.
+pub(crate) struct HcMixB {
+    pub w_up: Tensor,
+    pub n: usize,
+    pub d: usize,
+    pub lr: usize,
+}
+
+impl lloom_tensor::CustomOp1 for HcMixB {
+    fn name(&self) -> &'static str {
+        "qwen4exp-hc-mix-b"
+    }
+    fn cpu_fwd(&self, _s: &CpuStorage, _l: &Layout) -> Result<(CpuStorage, Shape)> {
+        lloom_tensor::bail!("hc_mix_b: no cpu kernel; `HyperConnection::mix` composes it there")
+    }
+    #[cfg(feature = "metal")]
+    fn metal_fwd(
+        &self,
+        s: &lloom_tensor::MetalStorage,
+        l: &Layout,
+    ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
+        use lloom_tensor::backend::BackendStorage;
+        let nd = self.n * self.d;
+        let per_row = nd + self.lr + self.n;
+        let total = l.shape().elem_count();
+        if !l.is_contiguous() || total % per_row != 0 {
+            lloom_tensor::bail!("hc_mix_b: packed {:?} vs rows × {per_row}", l.shape())
+        }
+        let rows = total / per_row;
+        if self.w_up.dims2()? != (nd, self.lr) {
+            lloom_tensor::bail!("hc_mix_b: w_up {:?} vs [{nd}, {}]", self.w_up.shape(), self.lr)
+        }
+        let (us, ul) = metal_weight(&self.w_up, "hc_mix_b")?;
+        let device = s.device();
+        let encoder = device.command_encoder()?;
+        encoder.set_label("hc_mix_b");
+        let elem_count = rows * self.d;
+        let output = device
+            .new_buffer_builder()
+            .with_size_for(elem_count, lloom_tensor::DType::F32)
+            .with_label("hc_mix_b")
+            .build()?;
+        lloom_tensor::kernels::call_hc_mix_b(
+            device.metal_device(),
+            &encoder,
+            device.kernels(),
+            rows,
+            self.n,
+            self.d,
+            self.lr,
+            1.0 / self.n as f32,
+            metal_bo(s, l),
+            metal_bo_of(&us, ul),
+            &output,
+        )
+        .map_err(lloom_tensor::Error::wrap)?;
+        Ok((
+            lloom_tensor::MetalStorage::new(output, device.clone(), elem_count, s.dtype()),
+            Shape::from((rows, self.d)),
+        ))
+    }
+}
+
+/// `QWEN4EXP_HC_MIX=1` (read once) takes the fused two-launch prologue;
+/// the default is the composed chain. Measured in situ (#749 P29 (3), a
+/// rotation on one binary): the pair removes three launches a bracket and
+/// costs +1.06 ms of GPU a token (+3.6 % on the decode) — the mixed gemv
+/// runs the bracket's 13 MB near bandwidth and the fused dots do not
+/// (306 / 340 GB/s against 520 in the bench). Kept as the arm the next
+/// kernel cut is measured against.
+fn hc_mix_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("QWEN4EXP_HC_MIX")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false)
+    })
+}
+
+/// The most rows the fused HC prologue takes: one — the kernels' grid is a
+/// threadgroup set per row, each streaming the weights again, where the
+/// mixed gemv's tile shares them across up to four rows (measured: 4 rows
+/// fused 133 µs against 82 composed, `prologue_bench`). A batch's rows and a
+/// prefill's take the composed chain.
+pub(crate) const HC_MIX_MAX_ROWS: usize = 1;
+
+/// The HC prologue as two launches (`HcMixA`, `HcMixB`) when the bracket's
+/// weights are f16 on Metal and the carry is a decode's rows: `(mixed
+/// [b, seq, d], inject [b, seq, n])`. `None` elsewhere (the composed chain).
+pub(crate) fn hc_mix_fused(
+    h: &Tensor,
+    gamma: &Tensor,
+    down: &lloom_tensor::quantized::QMatMul,
+    up: &lloom_tensor::quantized::QMatMul,
+    inject: Option<&lloom_tensor::quantized::QMatMul>,
+    n: usize,
+    d: usize,
+    eps: f32,
+) -> Option<Result<(Tensor, Tensor)>> {
+    use lloom_tensor::quantized::QMatMul;
+    if !fused_applies(h) || h.rank() != 3 || !hc_mix_on() {
+        return None;
+    }
+    let w_down = match down {
+        QMatMul::TensorF16(w) if w.rank() == 2 && w.is_contiguous() => w.clone(),
+        _ => return None,
+    };
+    let w_up = match up {
+        QMatMul::TensorF16(w) if w.rank() == 2 && w.is_contiguous() => w.clone(),
+        _ => return None,
+    };
+    let w_inject = match inject {
+        Some(QMatMul::TensorF16(w)) if w.rank() == 2 && w.is_contiguous() => Some(w.clone()),
+        Some(_) => return None,
+        None => None,
+    };
+    let (b, seq, nd) = h.dims3().ok()?;
+    let rows = b * seq;
+    if nd != n * d || rows == 0 || rows > HC_MIX_MAX_ROWS {
+        return None;
+    }
+    let lr = w_down.dim(0).ok()?;
+    if w_down.dim(1).ok()? != nd || w_up.dims2().ok()? != (nd, lr) || lr > 1024 {
+        return None;
+    }
+    // The kernels' vector loads: d a multiple of 4, lr even, every operand
+    // at a 16-byte-aligned start (whole tensors are; a narrow may not be).
+    let aligned = |t: &Tensor, elem: usize| (t.layout().start_offset() * elem) % 16 == 0;
+    if d % 4 != 0
+        || lr % 2 != 0
+        || !aligned(h, 4)
+        || !aligned(gamma, 4)
+        || !aligned(&w_down, 2)
+        || !aligned(&w_up, 2)
+        || !w_inject.as_ref().map_or(true, |w| aligned(w, 2))
+    {
+        return None;
+    }
+    if !gamma.is_contiguous() || gamma.elem_count() != nd || gamma.dtype() != lloom_tensor::DType::F32 {
+        return None;
+    }
+    Some((|| {
+        let packed = h.apply_op1_no_bwd(&HcMixA {
+            gamma: gamma.clone(),
+            w_down,
+            w_inject,
+            n,
+            d,
+            eps,
+            scale: 1.0 / n as f32,
+        })?; // flat
+        let mixed = packed
+            .apply_op1_no_bwd(&HcMixB { w_up, n, d, lr })?
+            .reshape((b, seq, d))?;
+        let inject = packed
+            .narrow(0, rows * (nd + lr), rows * n)?
+            .reshape((b, seq, n))?;
+        Ok((mixed, inject))
+    })())
+}
+
 pub(crate) struct HcCollapse {
     pub n: usize,
     pub d: usize,

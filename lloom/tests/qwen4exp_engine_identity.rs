@@ -201,3 +201,50 @@ fn a_note_is_consumed_by_the_next_forward_and_only_it() -> Result<()> {
     std::fs::remove_file(&path).ok();
     Ok(())
 }
+
+/// The standing window (P29 (7)): after a decode step the cache reports a
+/// horizon of one; `rewind(1)` undoes exactly that step — re-feeding the
+/// same token reproduces its logits bit for bit and the position — and the
+/// next forward settles the window (horizon back to one for the new step).
+/// A prefill leaves no horizon.
+#[test]
+fn a_decode_step_is_undone_by_the_standing_window() -> Result<()> {
+    use lloom::nn::CacheRewind;
+    let mut cfg = Config::tiny();
+    cfg.n_experts = 6;
+    cfg.n_experts_per_tok = 2;
+    let path = temp_gguf("rewind");
+    write_table(&cfg, 80, &path)?;
+    let dev = Device::Cpu;
+    let model = model_with_ple(&cfg, &path)?;
+    let mut cache = model.new_cache(&cfg, &dev)?;
+    let prompt: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9];
+    let input = Tensor::new(prompt.as_slice(), &dev)?.unsqueeze(0)?;
+    let _ = model.forward(&input, 0, &mut cache)?;
+    assert_eq!(cache.rewind_horizon(), 0, "a prefill leaves no horizon");
+    let pos = prompt.len();
+    let step = |cache: &mut lloom::models::qwen4exp::Cache, tok: u32, pos: usize| -> Result<Vec<f32>> {
+        let t = Tensor::new(&[tok], &dev)?.unsqueeze(0)?;
+        model.forward(&t, pos, cache)?.flatten_all()?.to_vec1::<f32>()
+    };
+    let a = step(&mut cache, 4, pos)?;
+    assert_eq!(cache.rewind_horizon(), 1, "a decode step leaves a horizon of one");
+    assert_eq!(cache.pos, pos + 1);
+    assert!(cache.rewind(2).is_err(), "past the horizon is refused");
+    cache.rewind(1)?;
+    assert_eq!(cache.pos, pos, "the step is undone");
+    assert_eq!(cache.rewind_horizon(), 0);
+    let a2 = step(&mut cache, 4, pos)?;
+    assert_eq!(a, a2, "the re-fed step must reproduce its logits exactly");
+    // A different token after the rewind: the step runs on the undone state.
+    cache.rewind(1)?;
+    let b = step(&mut cache, 7, pos)?;
+    assert_ne!(a, b, "a degenerate model cannot tell the tokens apart");
+    // The next forward settles the standing window; the new step has its own.
+    let c = step(&mut cache, 4, pos + 1)?;
+    assert_eq!(cache.rewind_horizon(), 1);
+    assert_eq!(cache.pos, pos + 2);
+    let _ = c;
+    std::fs::remove_file(&path).ok();
+    Ok(())
+}

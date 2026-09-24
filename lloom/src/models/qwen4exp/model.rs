@@ -268,6 +268,12 @@ pub struct Cache {
     nextn_drops: u64,
     /// The open speculative window's pre-window bookkeeping, if any.
     window: Option<CacheWindow>,
+    /// The open window is the STANDING one: the last decode step's, kept
+    /// open after the step so the step can be undone (`CacheRewind`, horizon
+    /// = the tokens fed since it opened — one). Settled (resolved) by the
+    /// next forward or by any `open_window`; invisible to `window_open()`,
+    /// which answers for a verify's window only.
+    standing: bool,
     /// Decode passes replayed because a device-planned routed expert was
     /// not resident (`ExpertResidency::settle`) — the streamed tier's miss
     /// cost under the device plan.
@@ -394,6 +400,7 @@ impl Cache {
             nextn: Vec::new(),
             nextn_drops: 0,
             window: None,
+            standing: false,
             redos: 0,
             device_plan_armed: false,
             host_plan_passes: 0,
@@ -415,6 +422,7 @@ impl Cache {
         self.pos = 0;
         self.nextn.clear();
         self.window = None;
+        self.standing = false;
     }
 
     /// The carries retained since the last take, concatenated along the
@@ -451,6 +459,7 @@ impl Cache {
     /// lengths a verify pass will advance, so a partially-accepted window can
     /// be put back (§10.2a). One window at a time.
     pub fn open_window(&mut self) -> Result<()> {
+        self.settle_standing()?;
         if self.window.is_some() {
             lloom_tensor::bail!("qwen4exp cache: a speculative window is already open")
         }
@@ -478,6 +487,7 @@ impl Cache {
             Some(w) => w,
             None => lloom_tensor::bail!("qwen4exp cache: no speculative window is open"),
         };
+        self.standing = false;
         self.s_state.rewind_to_window()?;
         self.conv_state.rewind_to_window()?;
         self.ple_conv.rewind_to_window()?;
@@ -496,14 +506,42 @@ impl Cache {
         if self.window.take().is_none() {
             lloom_tensor::bail!("qwen4exp cache: no speculative window is open")
         }
+        self.standing = false;
         self.s_state.resolve_window()?;
         self.conv_state.resolve_window()?;
         self.ple_conv.resolve_window()?;
         Ok(())
     }
 
+    /// Whether a verify's window is open (a standing one does not count).
     pub fn window_open(&self) -> bool {
-        self.window.is_some()
+        self.window.is_some() && !self.standing
+    }
+
+    /// Keep the open window as the standing one: the decode step just run
+    /// stays undoable until the next forward settles it (P29 (7), the
+    /// `CacheRewind` horizon the driver's ring arm and a multi-turn chat
+    /// reconcile through instead of resetting).
+    pub fn keep_standing(&mut self) {
+        if self.window.is_some() {
+            self.standing = true;
+        }
+    }
+
+    /// Resolve the standing window, if any: the last step is final.
+    pub fn settle_standing(&mut self) -> Result<()> {
+        if self.standing {
+            self.resolve_window()?;
+        }
+        Ok(())
+    }
+
+    /// The tokens the standing window would undo: 0 without one.
+    pub fn standing_horizon(&self) -> usize {
+        match (&self.window, self.standing) {
+            (Some(w), true) => self.pos.saturating_sub(w.pos),
+            _ => 0,
+        }
     }
 
     /// A checksum (FNV over the f32 bit patterns) and a non-finite count per
@@ -1333,6 +1371,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 embeds.shape()
             )
         }
+        // The last decode step is final once another forward begins.
+        cache.settle_standing()?;
         let mut logits = None;
         match self.prefill_mode {
             PrefillMode::Replay => {
@@ -1648,16 +1688,28 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             && !(0..self.layers.len())
                 .any(|l| obs.wants::<HcStatePoint>(l) || obs.wants::<LayerOutputPoint>(l));
         if !planned {
-            return self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l);
+            // Inside a verify's window the step is the verify's to undo;
+            // otherwise it gets a standing window of its own.
+            let own = !cache.window_open();
+            if own {
+                cache.open_window()?;
+            }
+            let logits = self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)?;
+            if own {
+                cache.keep_standing();
+            }
+            return Ok(logits);
         }
         // The cold phase: a pool that missed on the last pass runs the host
         // plan — one token and its loads, no replay — until a pass completes
         // with every expert resident; then the device plan, until it misses.
         if !cache.device_plan_armed {
             let before = self.stream_misses();
+            cache.open_window()?;
             let logits = self
                 .decode_embed_pass(h, cache, obs, false)
                 .map(|(l, _)| l)?;
+            cache.keep_standing();
             cache.host_plan_passes += 1;
             if self.stream_misses() == before {
                 cache.device_plan_armed = true;
@@ -1675,13 +1727,17 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
         let redo = self.settle_records(&records)?;
         if !redo {
-            cache.resolve_window()?;
+            // The step's window stays open as the standing one.
+            cache.keep_standing();
             return Ok(logits);
         }
         cache.rewind_window()?;
         cache.redos += 1;
         cache.device_plan_armed = false;
-        self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)
+        cache.open_window()?;
+        let logits = self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)?;
+        cache.keep_standing();
+        Ok(logits)
     }
 
     /// Settle a device-planned pass's records: every layer's `[3·n]` record
@@ -1993,7 +2049,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 rows.len()
             )
         }
-        for (r, row) in rows.iter().enumerate() {
+        for (r, row) in rows.iter_mut().enumerate() {
+            row.cache.settle_standing()?;
             if row.pos != row.cache.pos {
                 lloom_tensor::bail!(
                     "qwen4exp forward_rows: row {r} at pos {} but its cache is at {}",
@@ -2352,23 +2409,29 @@ fn plan_on_device() -> bool {
     })
 }
 
-/// No rewindable arm yet: the recurrent channels roll back only through a
-/// speculative window (`open_window`/`rewind_window`, the MTP verify's), so a
-/// driver that overran an EOS (a ring arm's lookahead) resets the sequence
-/// rather than rewinding it (`Session::prepare`), and a request that reuses
-/// a prefix extends an exactly-ending cache (the blocking arm's shape).
+/// The rewindable arm is the standing window (P29 (7)): every decode step
+/// leaves its window open until the next forward, so the driver can undo
+/// exactly that step — the ring arm's lookahead overrun, a one-token
+/// divergence of a reused prefix (`Session::prepare`). A prefill leaves no
+/// horizon (its tiles are not windowed), nor does a step run inside a
+/// verify's window; those reset, as before.
 impl crate::nn::model::CacheRewind for Cache {
     fn rewind_horizon(&self) -> usize {
-        0
+        self.standing_horizon()
     }
 
     fn rewind(&mut self, n: usize) -> Result<()> {
         if n == 0 {
             return Ok(());
         }
-        lloom_tensor::bail!(
-            "qwen4exp cache: no rewindable arm (horizon 0); a rewind of {n} positions is refused"
-        )
+        let horizon = self.standing_horizon();
+        if n != horizon {
+            lloom_tensor::bail!(
+                "qwen4exp cache: a rewind of {n} positions against a standing horizon of {horizon}: \
+                 only the whole last step can be undone"
+            )
+        }
+        self.rewind_window()
     }
 }
 

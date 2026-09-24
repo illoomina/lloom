@@ -183,13 +183,19 @@ struct Args {
     #[arg(long)]
     batched_driver: bool,
 
-    /// The single sequence through `Session::decode` on the blocking
-    /// readback arm (the driver `lloom serve` runs): the argmax on the
-    /// device and a 4-byte read, the fed id noted to the PLE, no logits
-    /// digest — against `gate`'s own loop (the full logits read back and
-    /// hashed a token). #749 P29 / `decode-driver-design.md` Stage 6.
+    /// Accepted for the recorded commands: the driver is the default
+    /// gate since P29 (7) (`Session::decode` on the blocking arm — the loop
+    /// `lloom serve` runs). See `--legacy-loop`.
     #[arg(long)]
     driver: bool,
+
+    /// The harness's own per-token loop (the full logits read back and
+    /// hashed a token: the logits digest, `--state-digest`, `--probe`,
+    /// `--margins`, `--prompt-split`, `--rollback-probe`, `--mtp-k`) —
+    /// the instrument arm, 40 % slower than the driver (P29). Off by
+    /// default since P29 (7): one loop, the driver's.
+    #[arg(long)]
+    legacy_loop: bool,
 
     /// `--rows N`: the rows' recurrent state in one slot-indexed pool (the
     /// DeltaNet step as one launch per kernel over the rows); off, every
@@ -674,7 +680,7 @@ fn main() -> Result<()> {
             model.set_mem_check(mem_check);
             if args.rows > 1 || args.batched_driver {
                 rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
-            } else if args.driver {
+            } else if !args.legacy_loop {
                 driver_gate(&model, &args, &shards, &device, &prompt_ids, &eos_ids, t0)
             } else {
                 gate(
@@ -742,7 +748,7 @@ fn main() -> Result<()> {
             }
             let out = if args.rows > 1 || args.batched_driver {
                 rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
-            } else if args.driver {
+            } else if !args.legacy_loop {
                 driver_gate(&model, &args, &shards, &device, &prompt_ids, &eos_ids, t0)
             } else {
                 gate(

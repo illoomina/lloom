@@ -183,6 +183,14 @@ struct Args {
     #[arg(long)]
     batched_driver: bool,
 
+    /// The single sequence through `Session::decode` on the blocking
+    /// readback arm (the driver `lloom serve` runs): the argmax on the
+    /// device and a 4-byte read, the fed id noted to the PLE, no logits
+    /// digest — against `gate`'s own loop (the full logits read back and
+    /// hashed a token). #749 P29 / `decode-driver-design.md` Stage 6.
+    #[arg(long)]
+    driver: bool,
+
     /// `--rows N`: the rows' recurrent state in one slot-indexed pool (the
     /// DeltaNet step as one launch per kernel over the rows); off, every
     /// row keeps its own slabs and the step launches per row.
@@ -666,6 +674,8 @@ fn main() -> Result<()> {
             model.set_mem_check(mem_check);
             if args.rows > 1 || args.batched_driver {
                 rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
+            } else if args.driver {
+                driver_gate(&model, &args, &shards, &device, &prompt_ids, &eos_ids, t0)
             } else {
                 gate(
                     &model,
@@ -732,6 +742,8 @@ fn main() -> Result<()> {
             }
             let out = if args.rows > 1 || args.batched_driver {
                 rows_gate(&model, &args, &device, &prompt_ids, &eos_ids)
+            } else if args.driver {
+                driver_gate(&model, &args, &shards, &device, &prompt_ids, &eos_ids, t0)
             } else {
                 gate(
                     &model,
@@ -860,17 +872,15 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
     Ok(())
 }
 
-fn gate<R: ExpertResidency + HasStreamStats>(
+/// The `LOADED` line and the post-load `MEM` line, shared by the gates.
+fn loaded_line<R: ExpertResidency + HasStreamStats>(
     model: &Qwen4Exp<R>,
     args: &Args,
     shards: &[PathBuf],
     device: &Device,
-    tokenizer: &Tokenizer,
-    prompt_ids: &[u32],
-    eos_ids: &[u32],
     t0: std::time::Instant,
-) -> Result<()> {
-    let cfg = model.config().clone();
+) {
+    let cfg = model.config();
     let load_ms = t0.elapsed().as_millis();
     println!(
         "LOADED gguf={} shards={} layers={} hidden={} vocab={} experts={}x{} device={:?} ple={} ple_cache_rows={} prefill={:?} moe_act={} experts_mode={} slots={} loader={} load_ms={load_ms}",
@@ -891,6 +901,121 @@ fn gate<R: ExpertResidency + HasStreamStats>(
         args.loader,
     );
     mem_line(0, "loaded", device, None);
+}
+
+/// `--driver`: the prompt through `Session::decode` on the blocking arm —
+/// the loop `lloom serve` runs (`decode-driver-design.md` Stage 5/6) —
+/// with the same `RESULT` / `PROFILE` / `MEM` / `STREAM` lines as `gate`,
+/// minus the logits digest (`logits_sha256=-`: the driver never reads the
+/// logits back; the tokens digest is the gate).
+#[allow(clippy::too_many_arguments)]
+fn driver_gate<R: ExpertResidency + HasStreamStats>(
+    model: &Qwen4Exp<R>,
+    args: &Args,
+    shards: &[PathBuf],
+    device: &Device,
+    prompt_ids: &[u32],
+    eos_ids: &[u32],
+    t0: std::time::Instant,
+) -> Result<()> {
+    use lloom::generation::{Blocking, LogitsProcessor, Sampling};
+    use lloom::models::qwen4exp::{prefill_chunk, prefill_pair_on, prefill_tiles};
+    use lloom::nn::{DecodeOptions, IdentityProposer, Session};
+    let cfg = model.config().clone();
+    loaded_line(model, args, shards, device, t0);
+    // The tile the harness's own loop feeds (`prefill_tiled`): the paired
+    // prefill wants both chunks in one forward.
+    let tile = if args.prefill_tile != 0
+        && prefill_pair_on()
+        && args.prefill_tile <= prefill_chunk()
+    {
+        prefill_tiles() * prefill_chunk()
+    } else {
+        args.prefill_tile
+    };
+    println!("DRIVER arm=blocking prefill_tile={tile} lookahead=0");
+    for run in 0..args.runs {
+        let cache: Cache = model.new_cache(&cfg, device)?;
+        let mut session = Session::new(model, cache);
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let mut rb = Blocking::new(eos_ids, device)?;
+        let mut spec = IdentityProposer;
+        let opts = DecodeOptions {
+            prefill_tile: tile,
+            ..DecodeOptions::new(args.max_tokens)
+        };
+        #[cfg(feature = "metal")]
+        candle::kernels::metal::profile::reset();
+        let gauge = MemGauge::start(device, args.mem_sample);
+        let t1 = std::time::Instant::now();
+        let out = session.decode(
+            &mut spec,
+            &mut rb,
+            &mut sampler,
+            prompt_ids,
+            &opts,
+            &mut |_toks| Ok(()),
+        )?;
+        let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
+        let prefill_ms = out.stats.prefill_ns as f64 / 1e6;
+        let decode_ms = (wall_ms - prefill_ms).max(0.0);
+        // One profile snapshot for the run: the driver's prefill and decode
+        // share the command stream and the snapshot is process-wide.
+        profile_line(run, "driver", prompt_ids.len() + out.ids.len(), wall_ms);
+        mem_line(run, "driver", device, Some(gauge.finish(device)));
+        let mut h = sha256::Sha256::new();
+        for t in &out.ids {
+            h.update(&t.to_le_bytes());
+        }
+        let digest = sha256::hex(&h.finalize());
+        println!(
+            "TOKENS {}",
+            out.ids
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        println!(
+            "RESULT run={run} tokens_sha256={digest} logits_sha256=- logits_max=- prompt_tokens={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} max_tokens={} driver=session-blocking steps={} commits={}",
+            prompt_ids.len(),
+            out.ids.len(),
+            out.eos,
+            args.max_tokens,
+            out.stats.steps,
+            out.stats.commits,
+        );
+        let s = model.stream_stats();
+        if s.plans + s.device_plans > 0 {
+            println!(
+                "STREAM run={run} loader={} slots={} plans={} hits={} misses={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={}",
+                args.loader,
+                model.slots_per_layer(),
+                s.plans,
+                s.hits,
+                s.misses,
+                s.bytes_loaded,
+                s.hits as f64 / (s.hits + s.misses).max(1) as f64,
+                s.device_plans,
+                s.settled_misses,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn gate<R: ExpertResidency + HasStreamStats>(
+    model: &Qwen4Exp<R>,
+    args: &Args,
+    shards: &[PathBuf],
+    device: &Device,
+    tokenizer: &Tokenizer,
+    prompt_ids: &[u32],
+    eos_ids: &[u32],
+    t0: std::time::Instant,
+) -> Result<()> {
+    let cfg = model.config().clone();
+    loaded_line(model, args, shards, device, t0);
 
     if args.rollback_probe > 0 {
         rollback_probe(

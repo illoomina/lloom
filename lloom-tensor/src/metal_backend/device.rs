@@ -2384,15 +2384,7 @@ impl MetalDevice {
         // says (measured: 28 GB of Shared slot pools un-wired and 7.5 GB
         // of them compressed mid-prefill, #749 P27); a Private buffer's are
         // not. Pin them.
-        let ptr = buffer.contents();
-        if !ptr.is_null() {
-            // SAFETY: `ptr..ptr+size` is the buffer's own mapping.
-            let rc = unsafe { libc::mlock(ptr as *const libc::c_void, size.max(1)) };
-            if rc != 0 {
-                let e = std::io::Error::last_os_error();
-                eprintln!("mlock of a {size}-byte Shared buffer failed: {e}");
-            }
-        }
+        wire_pages(buffer.contents(), size);
         Ok(Arc::new(PooledBuffer::unpooled_resident(
             buffer,
             size,
@@ -2411,6 +2403,14 @@ impl MetalDevice {
             size,
             Arc::clone(&self.residency_set),
         )))
+    }
+
+    /// Pin a Shared buffer's pages (`mlock`) so the kernel cannot compress
+    /// them under memory pressure. A no-op for a buffer the CPU cannot see
+    /// (Private storage: its pages are not the process's to compress).
+    pub fn wire_buffer(&self, buffer: &PooledBuffer) {
+        // `contents()` is null for a Private buffer (`Buffer::new`).
+        wire_pages(buffer.contents(), buffer.size());
     }
 
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<PooledBuffer>> {
@@ -2894,4 +2894,33 @@ mod tests {
         assert_eq!(MIN_BUFFER_ALIGNMENT, 16);
         assert_eq!(MIN_BUFFER_ALIGNMENT, std::mem::size_of::<f32>() * 4);
     }
+}
+
+/// `mlock` `size` bytes at `ptr` (a Shared buffer's own mapping); a failure
+/// is reported, not fatal — the buffer works unwired, only slower under
+/// pressure.
+fn wire_pages(ptr: *mut u8, size: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: `ptr..ptr+size` is the buffer's own mapping, alive for as
+    // long as the buffer; `munlock` is implicit at unmap.
+    let rc = unsafe { libc::mlock(ptr as *const libc::c_void, size.max(1)) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!("mlock of a {size}-byte Shared buffer failed: {e}");
+    }
+}
+
+/// Whether weight uploads are wired (`LLOOM_WIRE_WEIGHTS`, read once; `1`
+/// / `on` wires, the default does not — the A/B of #749 P29: the dense
+/// weights are Shared uploads, and the lm_head's 437 MB read at 5–35 ms a
+/// token with the machine at free ≈ 0.1 GB).
+pub fn wire_weights_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LLOOM_WIRE_WEIGHTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false)
+    })
 }

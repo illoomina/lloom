@@ -996,6 +996,12 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         .with_data(data)
         .with_label("qstorage_load_quantized")
         .build()?;
+    // A weight upload is a Shared buffer (`new_buffer_with_data`): its pages
+    // are the process's, compressible under pressure like the slot pools
+    // (#749 P27); wired on request (`LLOOM_WIRE_WEIGHTS`).
+    if crate::metal_backend::wire_weights_on() {
+        device.wire_buffer(&buffer);
+    }
     let device = device.clone();
     Ok(QStorage::Metal(QMetalStorage {
         dtype: T::DTYPE,

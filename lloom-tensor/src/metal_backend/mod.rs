@@ -26,7 +26,7 @@ mod device;
 use device::{
     ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
 };
-pub use device::{DeviceId, MetalDevice};
+pub use device::{wire_weights_on, DeviceId, MetalDevice};
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
 ///

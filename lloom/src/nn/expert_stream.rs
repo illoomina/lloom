@@ -116,6 +116,14 @@ pub trait ExpertResidency {
         Ok(false)
     }
 
+    /// [`Self::settle`] from a record already on the host: the caller read
+    /// every layer's record in ONE readback after the pass (a `cat` and one
+    /// wait — #749 P29: 48 readbacks a token were 47 seams the GPU idled
+    /// across) and hands each layer its `[3·n]` slice, in layer order.
+    fn settle_host(&self, _record: &[u32]) -> Result<bool> {
+        Ok(false)
+    }
+
     /// A hint that a multi-token pass is about to run this layer: stage the
     /// experts it will most likely miss, off the encoding thread
     /// (`nn::expert_prefetch`, §20.3 P1). Never changes what the layer
@@ -1978,6 +1986,11 @@ impl ExpertResidency for Streamed {
     fn settle(&self, record: &Tensor) -> Result<bool> {
         let _escape = escape_guard();
         let v: Vec<u32> = record.flatten_all()?.to_vec1()?;
+        self.settle_host(&v)
+    }
+
+    fn settle_host(&self, v: &[u32]) -> Result<bool> {
+        let _escape = escape_guard();
         if !v.len().is_multiple_of(3) {
             lloom_tensor::bail!("settle: a plan record is [3·n], got {}", v.len())
         }

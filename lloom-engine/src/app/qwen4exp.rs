@@ -9,9 +9,14 @@
 //! one drafted token per round, verified by the target, byte-identical to
 //! greedy (issue #749).
 //!
-//! Not built for this family yet: `--batch N` (the MoE forward takes one
-//! sequence), `--dspark` (LFM2's drafter), the rewindable cache (a ring
-//! arm's lookahead overrun resets the sequence rather than rewinding it).
+//! Not built for this family yet: `--dspark` (LFM2's drafter), the
+//! rewindable cache (a ring arm's lookahead overrun resets the sequence
+//! rather than rewinding it). `--batch N` runs the rows through the
+//! scheduler (the weights once over the rows, the state per row). A ring
+//! arm's lookahead has nothing to gain here by construction: the PLE
+//! hashes the token id into a host-mapped table before layer 1, so the
+//! host must know token `t` before it encodes forward `t+1`
+//! (`design/docs/decode-driver-design.md` Stage 6).
 
 use super::common::{
     lock, model_name_from_dir, ms, newest_snapshot, open_device, DecodeTiming, MemGauge, MemReport,

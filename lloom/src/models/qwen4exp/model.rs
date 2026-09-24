@@ -1673,12 +1673,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // resident for the tokens after it.
         cache.open_window()?;
         let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
-        let mut redo = false;
-        for (l, rec) in &records {
-            if self.layers[*l].moe().experts().settle(rec)? {
-                redo = true;
-            }
-        }
+        let redo = self.settle_records(&records)?;
         if !redo {
             cache.resolve_window()?;
             return Ok(logits);
@@ -1687,6 +1682,44 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         cache.redos += 1;
         cache.device_plan_armed = false;
         self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)
+    }
+
+    /// Settle a device-planned pass's records: every layer's `[3·n]` record
+    /// in ONE readback (a `cat` after the pass and one wait on its tail),
+    /// then each layer's slice settled in layer order. Reading them one by
+    /// one was 48 commits and waits a token on retired work (#749 P29).
+    /// `true` when any layer computed on a missing expert.
+    fn settle_records(&self, records: &[(usize, Tensor)]) -> Result<bool> {
+        if records.is_empty() {
+            return Ok(false);
+        }
+        let flat: Vec<Tensor> = records
+            .iter()
+            .map(|(_, r)| r.flatten_all())
+            .collect::<Result<_>>()?;
+        let all: Vec<u32> = if flat.len() == 1 {
+            flat[0].to_vec1()?
+        } else {
+            let refs: Vec<&Tensor> = flat.iter().collect();
+            Tensor::cat(&refs, 0)?.to_vec1()?
+        };
+        let mut redo = false;
+        let mut at = 0usize;
+        for ((l, _), f) in records.iter().zip(&flat) {
+            let n = f.elem_count();
+            let slice = all.get(at..at + n).ok_or_else(|| {
+                lloom_tensor::Error::Msg(format!(
+                    "settle: the records' cat is {} long, layer {l} needs {at}..{}",
+                    all.len(),
+                    at + n
+                ))
+            })?;
+            if self.layers[*l].moe().experts().settle_host(slice)? {
+                redo = true;
+            }
+            at += n;
+        }
+        Ok(redo)
     }
 
     /// The streamed tier's misses so far, summed over the layers (0 for
@@ -1998,12 +2031,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             c.open_window()?;
         }
         let (logits, records) = self.decode_rows_pass(&h, &mut caches, true)?;
-        let mut redo = false;
-        for (l, rec) in &records {
-            if self.layers[*l].moe().experts().settle(rec)? {
-                redo = true;
-            }
-        }
+        let redo = self.settle_records(&records)?;
         if !redo {
             for c in caches.iter_mut() {
                 c.resolve_window()?;
@@ -2200,12 +2228,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let (logits, records) = self.verify_pass(&h, cache, planned)?;
         let mut logits = logits;
         if planned {
-            let mut redo = false;
-            for (l, rec) in &records {
-                if self.layers[*l].moe().experts().settle(rec)? {
-                    redo = true;
-                }
-            }
+            let redo = self.settle_records(&records)?;
             if redo {
                 // The host plan over the same window from the base.
                 let tokens_v = cache

@@ -374,14 +374,16 @@ impl KvCache {
     }
 }
 
-/// One page pool for the QSA layers of a batch of rows (`batched-decode
-/// -design.md` §12.2, the LFM2 `BatchPool`'s shape): per layer, k and v as
-/// `[n_kv_heads, tokens, head_dim]` allocated on first write and grown by a
-/// slab of pages when its free list empties; per (layer, slot) the row's
-/// page table on the host. A [`Cache::in_pools`] row holds slot `r` of every
-/// layer; the rows arm (`QsaAttention::decode_rows`) reads every row's keys
-/// through its table in ONE launch (`kernels::SdpaVectorPaged`), each row's
-/// arithmetic the single row's.
+/// The rows' paged KV: one `[nkv, pages · page_size, hd]` (K, V) pair per
+/// layer, the pages of a slot the SAME for every layer — a slot's page
+/// table lives once, in the engine's allocator
+/// (`lloom_tensor::kv_pages::KvPagePool`: the free list, the refcounts, the
+/// per-slot tables, `append` / `rewind` / `release`), with a per-layer live
+/// length because the layers of one pass append in turn. Released pages
+/// wait in the engine's `PageQuarantine` until the GPU has passed the epoch
+/// that could still read them, then return to the free list (the discipline
+/// LFM2's `BatchPool` has; the pool's own bookkeeping recycled at once —
+/// #749 P29 (8), the merge).
 #[derive(Debug, Clone)]
 pub struct KvPool {
     inner: std::sync::Arc<parking_lot::Mutex<KvPoolInner>>,
@@ -390,32 +392,33 @@ pub struct KvPool {
 #[derive(Debug)]
 struct KvPoolInner {
     slots: usize,
-    /// Free row slots, popped from the back.
     free_slots: Vec<usize>,
     page_size: usize,
-    /// Pages the pool grows by (`slots × KV_SLAB_TOKENS` tokens).
     grow_pages: usize,
     nkv: usize,
     hd: usize,
     dtype: DType,
     device: lloom_tensor::Device,
-    layers: Vec<LayerPool>,
+    /// A page table per slot, shared by the layers.
+    pages: lloom_tensor::kv_pages::KvPagePool,
+    /// Pages released by a cleared slot, held until the GPU's epoch that
+    /// could read them has completed.
+    quarantine: lloom_tensor::kv_pages::PageQuarantine,
+    #[cfg(feature = "metal")]
+    clock: Option<std::sync::Arc<lloom_tensor::kernels::metal::GpuClock>>,
+    /// Pages every layer's storage holds (the layers grow together).
+    storage_pages: usize,
+    layers: Vec<LayerStore>,
 }
 
 #[derive(Debug, Default)]
-struct LayerPool {
-    /// `[nkv, tokens, hd]` each, `None` until the layer's first write.
+struct LayerStore {
     kv: Option<(Tensor, Tensor)>,
-    /// Pages the tensors hold (`tokens = pages × page_size`).
-    pages: usize,
-    free: Vec<u32>,
-    /// Per slot: the row's pages in token order, and its live length.
-    rows: Vec<(Vec<u32>, usize)>,
+    /// The layer's live length per slot.
+    lens: Vec<usize>,
 }
 
 impl KvPool {
-    /// A pool for `slots` rows over `n_layers` layers (only the full-attention
-    /// layers ever allocate), keys `[nkv, hd]`.
     pub fn new(
         slots: usize,
         n_layers: usize,
@@ -426,6 +429,11 @@ impl KvPool {
     ) -> Self {
         let page_size = KV_PAGE_TOKENS;
         let grow_pages = (slots.max(1) * KV_SLAB_TOKENS).div_ceil(page_size).max(1);
+        #[cfg(feature = "metal")]
+        let clock = match device {
+            lloom_tensor::Device::Metal(d) => Some(d.gpu_clock()),
+            _ => None,
+        };
         Self {
             inner: std::sync::Arc::new(parking_lot::Mutex::new(KvPoolInner {
                 slots,
@@ -436,10 +444,20 @@ impl KvPool {
                 hd,
                 dtype,
                 device: device.clone(),
+                pages: lloom_tensor::kv_pages::KvPagePool::new(
+                    page_size,
+                    0,
+                    slots,
+                    u32::MAX as usize,
+                ),
+                quarantine: lloom_tensor::kv_pages::PageQuarantine::new(),
+                #[cfg(feature = "metal")]
+                clock,
+                storage_pages: 0,
                 layers: (0..n_layers)
-                    .map(|_| LayerPool {
-                        rows: vec![(Vec::new(), 0); slots],
-                        ..Default::default()
+                    .map(|_| LayerStore {
+                        kv: None,
+                        lens: vec![0; slots],
                     })
                     .collect(),
             })),
@@ -449,8 +467,8 @@ impl KvPool {
     pub fn same(&self, other: &KvPool) -> bool {
         std::sync::Arc::ptr_eq(&self.inner, &other.inner)
     }
-    /// Lease a row slot (`Cache::in_pools`): every layer's [`KvCache`] of the
-    /// row shares it; it returns when the last of them drops.
+
+    /// Lease a free slot; dropped, the lease returns it.
     pub fn lease(&self) -> Result<std::sync::Arc<SlotLease>> {
         let slot = self
             .inner
@@ -463,77 +481,98 @@ impl KvPool {
             slot,
         }))
     }
+
     fn release(&self, slot: usize) {
-        self.inner.lock().free_slots.push(slot);
+        let mut g = self.inner.lock();
+        // Whatever the slot still holds goes back through the quarantine.
+        for l in 0..g.layers.len() {
+            g.layers[l].lens[slot] = 0;
+        }
+        g.release_pages(slot);
+        g.free_slots.push(slot);
     }
+
     pub fn slots(&self) -> usize {
         self.inner.lock().slots
     }
+
     pub fn page_size(&self) -> usize {
         self.inner.lock().page_size
     }
-    /// Tokens the pool holds for `layer` (0 until its first write).
+
+    /// Tokens the layer's storage holds (every layer's is the same).
     pub fn tokens(&self, layer: usize) -> usize {
         let g = self.inner.lock();
-        g.layers[layer].pages * g.page_size
+        let _ = layer;
+        g.storage_pages * g.page_size
     }
+
     pub fn len(&self, layer: usize, slot: usize) -> usize {
-        self.inner.lock().layers[layer].rows[slot].1
+        self.inner.lock().layers[layer].lens[slot]
     }
+
+    /// The slot's page table (the same for every layer).
     pub fn pages(&self, layer: usize, slot: usize) -> Vec<u32> {
-        self.inner.lock().layers[layer].rows[slot].0.clone()
+        let _ = layer;
+        self.inner
+            .lock()
+            .pages
+            .seq(slot)
+            .map(|s| s.pages().to_vec())
+            .unwrap_or_default()
     }
-    /// The layer's `(k, v)` pool tensors `[nkv, tokens, hd]`.
+
     pub fn tensors(&self, layer: usize) -> Result<Option<(Tensor, Tensor)>> {
         Ok(self.inner.lock().layers[layer].kv.clone())
     }
 
-    /// Bytes appending `n` tokens to `(layer, slot)` would allocate: the
-    /// grows the layer's free list cannot cover, each `grow_pages` pages at
-    /// `per_token` bytes a token, plus the layer's current pool once (the
-    /// grow is a `cat`, old and new live together at the instant). 0 when
-    /// the free pages cover it. Sized, not performed.
+    /// Bytes a `grow` for `n` more tokens of `slot` would allocate across
+    /// the layers (0 when the free pages cover it), for admission.
     pub fn grow_bytes_for(&self, layer: usize, slot: usize, n: usize, per_token: usize) -> usize {
         let g = self.inner.lock();
         let ps = g.page_size;
-        let lp = &g.layers[layer];
-        let (pages, len) = &lp.rows[slot];
-        let need_pages = (len + n).div_ceil(ps).saturating_sub(pages.len());
-        let short = need_pages.saturating_sub(lp.free.len());
+        let len = g.layers[layer].lens[slot];
+        let held = g.pages.seq(slot).map(|s| s.pages().len()).unwrap_or(0);
+        let need_pages = (len + n).div_ceil(ps).saturating_sub(held);
+        let short = need_pages.saturating_sub(g.pages.pages_free());
         if short == 0 {
             return 0;
         }
         let grows = short.div_ceil(g.grow_pages);
-        (grows * g.grow_pages * ps + lp.pages * ps) * per_token
+        (grows * g.grow_pages * ps + g.storage_pages * ps) * per_token
     }
 
-    /// Append `n` tokens to `(layer, slot)`: the pool token slots they land
-    /// in, pages allocated (and the layer grown) as needed.
+    /// Append `n` tokens to `slot` in `layer`: the cells they land in
+    /// (`page · page_size + offset`). The slot's table grows when the
+    /// layer's length runs past it (the first layer of a pass grows it,
+    /// the others reuse its pages).
     pub fn append(&self, layer: usize, slot: usize, n: usize) -> Result<Vec<u32>> {
         let mut g = self.inner.lock();
-        let page_size = g.page_size;
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            let need_page = {
-                let (pages, len) = &g.layers[layer].rows[slot];
-                *len == pages.len() * page_size
-            };
-            if need_page {
-                if g.layers[layer].free.is_empty() {
-                    g.grow(layer)?;
-                }
-                let page = g.layers[layer].free.pop().expect("grown above");
-                g.layers[layer].rows[slot].0.push(page);
+        let ps = g.page_size;
+        let start = g.layers[layer].lens[slot];
+        let need = start + n;
+        let seq_len = g.pages.seq(slot).map(|s| s.len()).unwrap_or(0);
+        if need > seq_len {
+            g.recycle_quarantined();
+            let held = g.pages.seq(slot).map(|s| s.pages().len()).unwrap_or(0);
+            let need_pages = need.div_ceil(ps).saturating_sub(held);
+            while g.pages.pages_free() < need_pages {
+                g.grow_all()?;
             }
-            let (pages, len) = &mut g.layers[layer].rows[slot];
-            let t = *len;
-            out.push(pages[t / page_size] * page_size as u32 + (t % page_size) as u32);
-            *len += 1;
+            g.pages
+                .append(slot, need - seq_len)
+                .map_err(lloom_tensor::Error::wrap)?;
         }
+        let out: Vec<u32> = {
+            let pages = g.pages.seq(slot).expect("a leased slot").pages();
+            (start..need)
+                .map(|t| pages[t / ps] * ps as u32 + (t % ps) as u32)
+                .collect()
+        };
+        g.layers[layer].lens[slot] = need;
         Ok(out)
     }
 
-    /// Write `k`, `v` `[nkv, n, hd]` at the pool token `slots` of `layer`.
     pub fn write(&self, layer: usize, k: &Tensor, v: &Tensor, slots: &[u32]) -> Result<()> {
         let (nkv, n, hd) = k.dims3()?;
         if n != slots.len() || v.dims3()? != (nkv, n, hd) {
@@ -552,9 +591,6 @@ impl KvPool {
         )
     }
 
-    /// Write `k`, `v` `[n, nkv, hd]` (row-major: a decode batch's tokens,
-    /// one per row) at the pool token `slots` of `layer` — the scatter's
-    /// `[n_seqs = n, nkv, 1, hd]` form, no re-layout.
     pub fn write_rows(&self, layer: usize, k: &Tensor, v: &Tensor, slots: &[u32]) -> Result<()> {
         let (n, nkv, hd) = k.dims3()?;
         if n != slots.len() || v.dims3()? != (n, nkv, hd) {
@@ -573,14 +609,17 @@ impl KvPool {
         )
     }
 
-    /// The scatter of `k4`, `v4` `[n_seqs, nkv, seq, hd]` (`n_seqs · seq =
-    /// slots.len()`) into the layer's pool.
     fn scatter(&self, layer: usize, k4: &Tensor, v4: &Tensor, slots: &[u32]) -> Result<()> {
         let (pk, pv, tokens, hd, nkv) = {
             let g = self.inner.lock();
-            let lp = &g.layers[layer];
-            match &lp.kv {
-                Some((pk, pv)) => (pk.clone(), pv.clone(), lp.pages * g.page_size, g.hd, g.nkv),
+            match &g.layers[layer].kv {
+                Some((pk, pv)) => (
+                    pk.clone(),
+                    pv.clone(),
+                    g.storage_pages * g.page_size,
+                    g.hd,
+                    g.nkv,
+                ),
                 None => lloom_tensor::bail!("KvPool: writing layer {layer} before its pages exist"),
             }
         };
@@ -596,22 +635,22 @@ impl KvPool {
         Ok(())
     }
 
-    /// The live tokens of `(layer, slot)` gathered `[nkv, len, hd]` (k, v),
-    /// or `None` when empty — the per-row paths' view of a pooled row.
+    /// The slot's live K and V in `layer`, gathered contiguous
+    /// (`[nkv, len, hd]` each); `None` while empty.
     pub fn live(&self, layer: usize, slot: usize) -> Result<Option<(Tensor, Tensor)>> {
         let (pk, pv, ids) = {
             let g = self.inner.lock();
-            let lp = &g.layers[layer];
-            let (pages, len) = &lp.rows[slot];
-            if *len == 0 {
+            let len = g.layers[layer].lens[slot];
+            if len == 0 {
                 return Ok(None);
             }
-            let (pk, pv) = match &lp.kv {
+            let (pk, pv) = match &g.layers[layer].kv {
                 Some(t) => t.clone(),
                 None => return Ok(None),
             };
             let ps = g.page_size;
-            let ids: Vec<u32> = (0..*len)
+            let pages = g.pages.seq(slot).expect("a leased slot").pages();
+            let ids: Vec<u32> = (0..len)
                 .map(|t| pages[t / ps] * ps as u32 + (t % ps) as u32)
                 .collect();
             (pk, pv, ids)
@@ -621,10 +660,7 @@ impl KvPool {
         Ok(Some((pk.index_select(&ids, 1)?, pv.index_select(&ids, 1)?)))
     }
 
-    /// Cells `sel [n]` (u32 token ordinals of a row) → the row's pool token
-    /// slots `[n]` (u32) through its page table `table [pages]` (u32, on the
-    /// device): `table[cell / page_size] · page_size + cell % page_size`, in
-    /// f32 (exact below 2²⁴ tokens).
+    /// Cells for `sel` (token positions of a slot) through its table.
     pub fn slots_of(&self, table: &Tensor, sel: &Tensor) -> Result<Tensor> {
         let ps = self.page_size() as f64;
         let cell = sel.to_dtype(DType::F32)?;
@@ -636,53 +672,102 @@ impl KvPool {
         ((pg * ps)? + off)?.to_dtype(DType::U32)
     }
 
-    /// Keep the first `tokens` of `(layer, slot)` (the pages stay).
+    /// Keep the first `tokens` of `slot` in `layer`; the slot's table is
+    /// rewound to the longest layer (its pages stay attached).
     pub fn truncate(&self, layer: usize, slot: usize, tokens: usize) {
         let mut g = self.inner.lock();
-        let (_, len) = &mut g.layers[layer].rows[slot];
-        if tokens < *len {
-            *len = tokens;
+        if tokens < g.layers[layer].lens[slot] {
+            g.layers[layer].lens[slot] = tokens;
         }
+        g.rewind_table(slot);
     }
 
-    /// Empty `(layer, slot)`, its pages back to the free list.
+    /// Empty `slot` in `layer`; once every layer has, the slot's pages are
+    /// released into the quarantine.
     pub fn clear(&self, layer: usize, slot: usize) {
         let mut g = self.inner.lock();
         if layer >= g.layers.len() || slot >= g.slots {
             return;
         }
-        let (pages, len) = std::mem::take(&mut g.layers[layer].rows[slot]);
-        let _ = len;
-        g.layers[layer].free.extend(pages);
+        g.layers[layer].lens[slot] = 0;
+        if g.layers.iter().all(|l| l.lens[slot] == 0) {
+            g.release_pages(slot);
+        } else {
+            g.rewind_table(slot);
+        }
     }
 }
 
 impl KvPoolInner {
-    /// Grow `layer` by `grow_pages` pages: the tensors extended (a copy of
-    /// the pool, once per `slots × KV_SLAB_TOKENS` tokens), the new pages
-    /// onto the free list.
-    fn grow(&mut self, layer: usize) -> Result<()> {
+    /// The GPU's current epoch (Metal), the epoch a released page waits for.
+    fn epoch(&self) -> u64 {
+        #[cfg(feature = "metal")]
+        {
+            self.clock.as_ref().map(|c| c.current_epoch()).unwrap_or(0)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            0
+        }
+    }
+
+    /// Epochs the GPU has completed (every one, without a clock).
+    fn completed(&self) -> u64 {
+        #[cfg(feature = "metal")]
+        {
+            self.clock.as_ref().map(|c| c.completed_count()).unwrap_or(u64::MAX)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            u64::MAX
+        }
+    }
+
+    fn recycle_quarantined(&mut self) {
+        let ready = self.quarantine.drain_completed(self.completed());
+        if !ready.is_empty() {
+            self.pages.recycle(&ready).expect("quarantined pages are unallocated");
+        }
+    }
+
+    fn release_pages(&mut self, slot: usize) {
+        let freed = self.pages.release(slot);
+        let epoch = self.epoch();
+        self.quarantine.quarantine(epoch, freed);
+    }
+
+    fn rewind_table(&mut self, slot: usize) {
+        let longest = self.layers.iter().map(|l| l.lens[slot]).max().unwrap_or(0);
+        let seq_len = self.pages.seq(slot).map(|s| s.len()).unwrap_or(0);
+        if longest < seq_len {
+            self.pages
+                .rewind(slot, seq_len - longest)
+                .expect("rewinding within the table");
+        }
+    }
+
+    /// Grow every layer's storage by `grow_pages` pages, and the allocator.
+    fn grow_all(&mut self) -> Result<()> {
         let (ps, gp, nkv, hd) = (self.page_size, self.grow_pages, self.nkv, self.hd);
         let (dtype, dev) = (self.dtype, self.device.clone());
-        let lp = &mut self.layers[layer];
-        // Two allocations: a `clone` of a tensor shares its storage.
-        let fresh_k = Tensor::zeros((nkv, gp * ps, hd), dtype, &dev)?;
-        let fresh_v = Tensor::zeros((nkv, gp * ps, hd), dtype, &dev)?;
-        lp.kv = Some(match lp.kv.take() {
-            None => (fresh_k, fresh_v),
-            Some((k, v)) => (
-                Tensor::cat(&[&k, &fresh_k], 1)?,
-                Tensor::cat(&[&v, &fresh_v], 1)?,
-            ),
-        });
-        let first = lp.pages as u32;
-        lp.free.extend((first..first + gp as u32).rev());
-        lp.pages += gp;
+        for lp in &mut self.layers {
+            // Two allocations: a `clone` of a tensor shares its storage.
+            let fresh_k = Tensor::zeros((nkv, gp * ps, hd), dtype, &dev)?;
+            let fresh_v = Tensor::zeros((nkv, gp * ps, hd), dtype, &dev)?;
+            lp.kv = Some(match lp.kv.take() {
+                None => (fresh_k, fresh_v),
+                Some((k, v)) => (
+                    Tensor::cat(&[&k, &fresh_k], 1)?,
+                    Tensor::cat(&[&v, &fresh_v], 1)?,
+                ),
+            });
+        }
+        self.storage_pages += gp;
+        self.pages.grow(gp);
         Ok(())
     }
 }
 
-/// The Lightning indexer of one full-attention layer (`indexer.*`).
 #[derive(Debug, Clone)]
 pub struct Indexer {
     /// `indexer.q_proj` `[n_heads·head_dim, hidden]`.

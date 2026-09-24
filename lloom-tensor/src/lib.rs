@@ -91,6 +91,12 @@ pub mod metal_backend;
 // `metal` feature exactly as its former crate dependency was.
 #[cfg(feature = "metal")]
 pub mod kernels;
+/// The paged-KV page allocator (§10.3c–h): pure host bookkeeping — a free
+/// list, per-page refcounts, per-sequence page tables, a quarantine keyed
+/// on GPU epochs — shared by every model's page pool on every backend
+/// (LFM2's `BatchPool`, Qwen4-exp's `KvPool`; #749 P29 (8)). Re-exported at
+/// `kernels::metal::kv_pages`, its former home, for the Metal callers.
+pub mod kv_pages;
 #[cfg(feature = "mkl")]
 mod mkl;
 pub mod nditer;

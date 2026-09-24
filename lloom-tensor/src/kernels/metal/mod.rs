@@ -79,7 +79,7 @@ pub mod io_queue;
 /// (`DESIGN.md` §10.3c–§10.3g, issue #148). Pure functions of a configuration
 /// and an allocation history — no device, no buffer, no dispatch — which is the
 /// half §10.3i says to build **before** the page-walking kernel.
-pub mod kv_pages;
+pub use crate::kv_pages;
 #[cfg(test)]
 mod kv_pages_tests;
 pub mod library;

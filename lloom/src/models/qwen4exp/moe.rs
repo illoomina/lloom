@@ -37,6 +37,8 @@ pub struct MoeLayer<R: ExpertResidency> {
     /// Shared-expert gate `hidden -> 1` (`ffn_gate_inp_shexp`).
     sh_router: QMatMul,
     n_experts_per_tok: usize,
+    /// The last routing's ids, under the hint-recall probe (see `probe_ids`).
+    probe_ids: std::sync::Arc<parking_lot::Mutex<Option<Tensor>>>,
     /// The activation dtype of the routed dispatch — its `(activation, f32,
     /// store)` triple (§15.2a): `F32` is the byte-identical `_f32` routed arm,
     /// `F16` the `(f16, f32, f16)` arm (issue #748). The combine over slots
@@ -64,7 +66,15 @@ impl<R: ExpertResidency> MoeLayer<R> {
             sh_router,
             n_experts_per_tok: cfg.n_experts_per_tok,
             routed_act: DType::F32,
+            probe_ids: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    /// The ids of the last routing this layer ran, kept only under the
+    /// hint-recall probe (`QWEN4EXP_HINT_RECALL=1`): what a hint predicted
+    /// is scored against them (`Qwen4Exp::hint_recall`).
+    pub fn probe_ids(&self) -> Option<Tensor> {
+        self.probe_ids.lock().clone()
     }
 
     /// Select the routed dispatch's activation dtype (`F32` or `F16`).
@@ -194,6 +204,9 @@ impl<R: ExpertResidency> MoeLayer<R> {
                 ids.flatten_all()?.to_vec1::<u32>()?,
                 w.flatten_all()?.to_vec1::<f32>()?
             );
+        }
+        if hint_recall_probe() {
+            *self.probe_ids.lock() = Some(ids.clone());
         }
 
         // The selected experts' SwiGLU, one routed dispatch per projection
@@ -329,6 +342,15 @@ impl<R: ExpertResidency> MoeLayer<R> {
         };
         out.reshape((r.b0, r.seq0, hidden))
     }
+}
+
+/// `QWEN4EXP_HINT_RECALL=1` (read once): score the residual-speculation
+/// hint at decode — layer l+k's router on the carry entering layer l
+/// against layer l+k's real routing (`Qwen4Exp::hint_recall`). An
+/// instrument: extra router runs and readbacks per pass.
+pub fn hint_recall_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN4EXP_HINT_RECALL").is_ok_and(|v| v == "1"))
 }
 
 /// A staged readback of a routing's ids (Metal); nothing elsewhere.

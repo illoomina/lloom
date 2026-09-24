@@ -29,8 +29,23 @@ impl QMetalStorage {
     /// outside every pool (`MetalDevice::new_persistent_private`): the slot
     /// pool of a streamed weight tier.
     pub fn persistent(device: &MetalDevice, elem_count: usize, dtype: GgmlDType) -> Result<Self> {
+        Self::persistent_with(device, elem_count, dtype, false)
+    }
+
+    /// [`Self::persistent`], Shared when `shared`: the CPU writes the bytes
+    /// in place (a streamed expert read straight into its slot).
+    pub fn persistent_with(
+        device: &MetalDevice,
+        elem_count: usize,
+        dtype: GgmlDType,
+        shared: bool,
+    ) -> Result<Self> {
         let size = elem_count * dtype.type_size() / dtype.block_size();
-        let buffer = device.new_persistent_private(size)?;
+        let buffer = if shared {
+            device.new_persistent_shared(size)?
+        } else {
+            device.new_persistent_private(size)?
+        };
         {
             let mut blit = device.blit_command_encoder()?;
             blit.set_label("qstorage_persistent_zero");

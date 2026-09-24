@@ -75,6 +75,9 @@ struct Req {
     generation: u64,
     expert: u32,
     planes: [PlaneSource; 3],
+    /// A direct read: into these slots, once `epoch` is complete; the
+    /// batch it belongs to (`direct_pending`) is told when it lands.
+    direct: Option<(u64, [DirectDst; 3], u64)>,
     /// A `load_now` request: the layer is waiting for it, so it is read
     /// past the staged-bytes cap — the cap bounds what the HINTS hold, and
     /// a hint's leftovers holding the cap against a needed read is a
@@ -87,6 +90,16 @@ struct Req {
 /// Relaxed atomics, read off the hot path.
 #[derive(Debug, Default)]
 pub struct PrefetchCounters {
+    /// Direct reads (into the slot, no ring), and the time their threads
+    /// waited for the slots' last readers' epochs (drained by `read_direct`).
+    pub direct: AtomicU64,
+    pub direct_wait_ns: AtomicU64,
+    /// Reader-thread time inside `pread`, and bytes, per arm: the ring's
+    /// staging reads and the direct reads.
+    pub stage_read_ns: AtomicU64,
+    pub stage_read_bytes: AtomicU64,
+    pub direct_read_ns: AtomicU64,
+    pub direct_read_bytes: AtomicU64,
     /// Experts requested by the tiers.
     pub issued: AtomicU64,
     /// Experts the thread read into the ring.
@@ -116,9 +129,16 @@ pub struct PrefetchStats {
     pub bytes: u64,
     pub parked: u64,
     pub now: u64,
+    pub stage_read_ns: u64,
+    pub stage_read_bytes: u64,
+    pub direct_read_ns: u64,
+    pub direct_read_bytes: u64,
 }
 
 struct State {
+    /// Direct-read batches issued, and the jobs still to land per batch.
+    direct_batches: u64,
+    direct_pending: HashMap<u64, usize>,
     reqs: VecDeque<Req>,
     done: HashMap<usize, Vec<Staged>>,
     generation: HashMap<usize, u64>,
@@ -141,6 +161,28 @@ struct Shared {
     counters: PrefetchCounters,
     max_staged_bytes: usize,
     stop: AtomicBool,
+    /// The GPU clock a direct read gates on: the slot's last reader's epoch
+    /// must be complete before the bytes land in place.
+    clock: Arc<lloom_tensor::kernels::metal::GpuClock>,
+}
+
+/// A slot's bytes, for a direct read: a raw pointer into a Shared slot
+/// pool. Distinct slots never overlap; the pool outlives the prefetcher's
+/// jobs (the tier waits for them).
+#[derive(Clone, Copy)]
+pub struct DirectDst(pub *mut u8);
+// SAFETY: a pointer into a Shared `MTLBuffer` the tier keeps alive; the
+// reader writes its own plane's range only.
+unsafe impl Send for DirectDst {}
+unsafe impl Sync for DirectDst {}
+
+/// One expert read straight into its slot's three planes (`read_direct`),
+/// once `epoch` — the slot's last GPU reader's command buffer — is complete.
+pub struct DirectJob {
+    pub expert: u32,
+    pub planes: [PlaneSource; 3],
+    pub dsts: [DirectDst; 3],
+    pub epoch: u64,
 }
 
 /// Bytes the prefetcher keeps staged at most: ~2 layers of a cold pool's
@@ -191,6 +233,8 @@ impl Prefetcher {
     ) -> Self {
         let shared = Arc::new(Shared {
             state: parking_lot::Mutex::new(State {
+                direct_batches: 0,
+                direct_pending: HashMap::new(),
                 reqs: VecDeque::new(),
                 done: HashMap::new(),
                 generation: HashMap::new(),
@@ -204,6 +248,7 @@ impl Prefetcher {
             counters: PrefetchCounters::default(),
             max_staged_bytes,
             stop: AtomicBool::new(false),
+            clock: device.gpu_clock(),
         });
         let workers = (0..threads())
             .map(|i| {
@@ -241,6 +286,7 @@ impl Prefetcher {
                     generation: gen,
                     expert: e,
                     planes: planes.clone(),
+                    direct: None,
                     now: false,
                 });
             }
@@ -262,6 +308,52 @@ impl Prefetcher {
     /// group took it. The pass has reached the tier, so its requests still
     /// pending are cancelled (`stale`): the threads move on to the next
     /// layer's.
+    /// Read `jobs` straight into their slots through the reader threads —
+    /// each once its slot's last reader's epoch is complete — and wait for
+    /// all of them. The point-of-use read of the `pread` arm without the
+    /// ring and the landing copy (`DESIGN.md` §20.4a, #749 P27). Returns
+    /// the time waited for the epochs, summed over the jobs.
+    pub fn read_direct(&self, key: usize, jobs: Vec<DirectJob>) -> std::time::Duration {
+        if jobs.is_empty() {
+            return std::time::Duration::ZERO;
+        }
+        let n = jobs.len();
+        let batch = {
+            let mut g = self.shared.state.lock();
+            g.direct_batches += 1;
+            let batch = g.direct_batches;
+            g.direct_pending.insert(batch, n);
+            let gen = *g.generation.entry(key).or_insert(0);
+            for j in jobs.into_iter().rev() {
+                g.reqs.push_front(Req {
+                    key,
+                    generation: gen,
+                    expert: j.expert,
+                    planes: j.planes,
+                    direct: Some((batch, j.dsts, j.epoch)),
+                    now: true,
+                });
+            }
+            batch
+        };
+        self.shared
+            .counters
+            .direct
+            .fetch_add(n as u64, Ordering::Relaxed);
+        self.shared.cv.notify_all();
+        let mut g = self.shared.state.lock();
+        while g.direct_pending.get(&batch).is_some_and(|&left| left > 0) {
+            self.shared.cv.wait(&mut g);
+        }
+        g.direct_pending.remove(&batch);
+        std::time::Duration::from_nanos(
+            self.shared
+                .counters
+                .direct_wait_ns
+                .swap(0, Ordering::Relaxed),
+        )
+    }
+
     pub fn take_needed(&self, key: usize, needed: &[u32]) -> Vec<Staged> {
         self.take_needed_with(key, needed, true)
     }
@@ -292,6 +384,7 @@ impl Prefetcher {
                     generation: gen,
                     expert: e,
                     planes: planes.clone(),
+                    direct: None,
                     now: true,
                 });
             }
@@ -438,6 +531,10 @@ impl Prefetcher {
             bytes: c.bytes.load(Ordering::Relaxed),
             parked: c.parked.load(Ordering::Relaxed),
             now: c.now.load(Ordering::Relaxed),
+            stage_read_ns: c.stage_read_ns.load(Ordering::Relaxed),
+            stage_read_bytes: c.stage_read_bytes.load(Ordering::Relaxed),
+            direct_read_ns: c.direct_read_ns.load(Ordering::Relaxed),
+            direct_read_bytes: c.direct_read_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -496,15 +593,58 @@ fn worker(w: Arc<Shared>) {
                 w.cv.wait(&mut g);
             }
             let req = g.reqs.pop_front().expect("front checked");
-            if g.generation.get(&req.key).copied().unwrap_or(0) != req.generation {
-                w.counters.stale.fetch_add(1, Ordering::Relaxed);
-                continue;
+            // A direct read is never stale (a take's cancel is for the
+            // hints) and takes no ring: it lands where it is told.
+            if req.direct.is_none() {
+                if g.generation.get(&req.key).copied().unwrap_or(0) != req.generation {
+                    w.counters.stale.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // Reserve the bytes now so a burst of requests cannot all pass
+                // the cap check before any of them lands.
+                g.staged_bytes += req.planes.iter().map(|p| p.plane_bytes).sum::<usize>();
             }
-            // Reserve the bytes now so a burst of requests cannot all pass
-            // the cap check before any of them lands.
-            g.staged_bytes += req.planes.iter().map(|p| p.plane_bytes).sum::<usize>();
             req
         };
+        if let Some((batch, dsts, epoch)) = req.direct {
+            // The slot's last reader must have run: the pool's clock says
+            // when its command buffer completed.
+            let t0 = std::time::Instant::now();
+            while !w.clock.is_complete(epoch) {
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+            w.counters
+                .direct_wait_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let mut bytes = 0u64;
+            let t_read = std::time::Instant::now();
+            for (src, dst) in req.planes.iter().zip(dsts.iter()) {
+                // SAFETY: `dst` addresses `plane_bytes` of a Shared slot the
+                // tier keeps alive, given to this job alone.
+                let slice = unsafe { std::slice::from_raw_parts_mut(dst.0, src.plane_bytes) };
+                if let Err(e) = src.read(req.expert, slice) {
+                    eprintln!(
+                        "expert-prefetch: direct read of expert {} of tier {}: {e}",
+                        req.expert, req.key
+                    );
+                }
+                bytes += src.plane_bytes as u64;
+            }
+            w.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
+            w.counters
+                .direct_read_ns
+                .fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            w.counters
+                .direct_read_bytes
+                .fetch_add(bytes, Ordering::Relaxed);
+            let mut g = w.state.lock();
+            if let Some(left) = g.direct_pending.get_mut(&batch) {
+                *left = left.saturating_sub(1);
+            }
+            drop(g);
+            w.cv.notify_all();
+            continue;
+        }
         match stage(&w, &req) {
             Ok(staged) => {
                 let bytes = staged.bytes() as u64;
@@ -568,7 +708,15 @@ fn stage(w: &Shared, req: &Req) -> Result<Staged> {
         // from the ring — its last copy complete, or fresh — mapped at
         // `ptr`; nothing else references it until it is staged.
         let dst = unsafe { std::slice::from_raw_parts_mut(ptr, src.plane_bytes) };
-        if let Err(e) = src.read(req.expert, dst) {
+        let t_read = std::time::Instant::now();
+        let r = src.read(req.expert, dst);
+        w.counters
+            .stage_read_ns
+            .fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        w.counters
+            .stage_read_bytes
+            .fetch_add(src.plane_bytes as u64, Ordering::Relaxed);
+        if let Err(e) = r {
             let mut ring = w.ring.lock();
             ring.release(entry, &buf);
             for (e, b) in &planes {

@@ -43,14 +43,38 @@ pub struct IoLoad<'a> {
 
 /// An IO queue plus the pair of shared events that order it against the
 /// compute stream.
+///
+/// A point-of-use batch (`load_ordered`) is split across `lanes` IO command
+/// buffers, each with its own event: one IO command buffer runs its loads
+/// in order at ~2.2 GB/s on this SSD (the one-in-flight figure of
+/// `p25-ssdbench`), eight concurrent ones at ~8.6 (issue #749 P27). The
+/// compute stream waits for every lane the batch used. The in-flight
+/// hints (`issue` / `await_value`) stay on lane 0.
 pub struct IoQueue {
     queue: Retained<ProtocolObject<dyn MTLIOCommandQueue>>,
     ev_compute: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     ev_io: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     next: AtomicU64,
+    /// The extra lanes (lane 0 is `ev_io` / `next`).
+    lanes: Vec<(Retained<ProtocolObject<dyn MTLSharedEvent>>, AtomicU64)>,
+    /// The compute event's counter: one monotone value per exchange.
+    compute_next: AtomicU64,
     device: Device,
     loads: AtomicU64,
     bytes: AtomicU64,
+}
+
+/// `LLOOM_IO_LANES` (default 8): IO command buffers a point-of-use batch is
+/// split across. Read once.
+pub fn io_lanes() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LLOOM_IO_LANES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(8)
+    })
 }
 
 // SAFETY: the queue and events are thread-safe Metal objects; the counters are
@@ -77,15 +101,85 @@ impl IoQueue {
                 ))
             })
         };
+        let mut lanes = Vec::new();
+        for _ in 1..io_lanes() {
+            lanes.push((event("io lane")?, AtomicU64::new(0)));
+        }
         Ok(Self {
             queue,
             ev_compute: event("compute")?,
             ev_io: event("io")?,
             next: AtomicU64::new(0),
+            lanes,
+            compute_next: AtomicU64::new(0),
             device: device.clone(),
             loads: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
         })
+    }
+
+    /// The lane events with their counters, lane 0 first.
+    fn lane(&self, i: usize) -> (&ProtocolObject<dyn MTLSharedEvent>, &AtomicU64) {
+        if i == 0 {
+            (&self.ev_io, &self.next)
+        } else {
+            let (e, n) = &self.lanes[i - 1];
+            (e, n)
+        }
+    }
+
+    /// One IO command buffer over `loads`: waits for the compute signal
+    /// `compute_value`, loads, signals lane `lane` with its next value
+    /// (returned), commits.
+    fn commit_lane(
+        &self,
+        lane: usize,
+        compute_value: u64,
+        loads: &[IoLoad<'_>],
+    ) -> Result<u64, MetalKernelError> {
+        let (ev, next) = self.lane(lane);
+        let value = next.fetch_add(1, Ordering::AcqRel) + 1;
+        let cb = self.queue.commandBuffer();
+        cb.waitForEvent_value(&self.ev_compute, compute_value);
+        let mut total = 0u64;
+        for l in loads {
+            if l.dst_offset + l.len > l.dst.length() {
+                return Err(MetalKernelError::FailedToCreateResource(format!(
+                    "io load: {}+{} past the {}-byte buffer",
+                    l.dst_offset,
+                    l.len,
+                    l.dst.length()
+                )));
+            }
+            // SAFETY: as in `issue`.
+            unsafe {
+                cb.loadBuffer_offset_size_sourceHandle_sourceHandleOffset(
+                    l.dst.as_ref(),
+                    l.dst.base_offset() + l.dst_offset,
+                    l.len,
+                    &l.file.handle,
+                    l.src_offset as usize,
+                );
+            }
+            total += l.len as u64;
+        }
+        cb.signalEvent_value(ev, value);
+        cb.commit();
+        self.loads.fetch_add(loads.len() as u64, Ordering::Relaxed);
+        self.bytes.fetch_add(total, Ordering::Relaxed);
+        Ok(value)
+    }
+
+    /// Block until every lane's latest batch but one has landed (a pool
+    /// warm's bound on what it leaves pending; never on a token's path).
+    pub fn wait_all_but_latest(&self) {
+        for i in 0..=self.lanes.len() {
+            let (ev, next) = self.lane(i);
+            let target = next.load(Ordering::Acquire).saturating_sub(1);
+            while ev.signaledValue() < target {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
     }
 
     /// Open `path` for loads.
@@ -118,8 +212,34 @@ impl IoQueue {
         if loads.is_empty() {
             return Ok(());
         }
-        let value = self.issue(commands, loads)?;
-        self.await_value(commands, value)
+        let n_lanes = (self.lanes.len() + 1).min(loads.len());
+        if n_lanes == 1 {
+            let value = self.issue(commands, loads)?;
+            return self.await_value(commands, value);
+        }
+        // The compute signal, committed before any IO buffer waits on it
+        // (see `issue`); then one IO buffer per lane, the loads dealt round
+        // robin; then a compute wait per lane.
+        let compute_value = self.next_compute();
+        commands.encode_signal_event(&self.ev_compute, compute_value)?;
+        commands.flush_marker()?;
+        let per_lane = loads.len().div_ceil(n_lanes);
+        let mut waits = Vec::with_capacity(n_lanes);
+        for (lane, chunk) in loads.chunks(per_lane).enumerate() {
+            let value = self.commit_lane(lane, compute_value, chunk)?;
+            waits.push((lane, value));
+        }
+        for (lane, value) in waits {
+            let (ev, _) = self.lane(lane);
+            commands.encode_wait_for_event(ev, value)?;
+        }
+        Ok(())
+    }
+
+    /// The next compute-signal value (the compute event is one monotone
+    /// counter whatever the lane).
+    fn next_compute(&self) -> u64 {
+        self.compute_next.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     /// The first half of [`Self::load_ordered`]: issue `loads` ordered after
@@ -136,7 +256,8 @@ impl IoQueue {
         if loads.is_empty() {
             return Ok(value);
         }
-        commands.encode_signal_event(&self.ev_compute, value)?;
+        let compute_value = self.next_compute();
+        commands.encode_signal_event(&self.ev_compute, compute_value)?;
         // Commit the compute buffer carrying the signal BEFORE the IO buffer
         // is committed: the IO buffer waits for a signal that runs only once
         // its buffer is committed, and the loads sit pending until then —
@@ -145,7 +266,7 @@ impl IoQueue {
         // load beside the 33.75 GB of the pools, #749 P26).
         commands.flush_marker()?;
         let cb = self.queue.commandBuffer();
-        cb.waitForEvent_value(&self.ev_compute, value);
+        cb.waitForEvent_value(&self.ev_compute, compute_value);
         let mut total = 0u64;
         for l in loads {
             if l.dst_offset + l.len > l.dst.length() {

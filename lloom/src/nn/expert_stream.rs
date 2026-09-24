@@ -388,6 +388,10 @@ pub struct ResidencyMap {
     /// `inflight_seq`). The victim search skips in-flight slots while any
     /// other is available; `install` clears it.
     inflight: Vec<u64>,
+    /// Per slot, the GPU epoch (the pool clock's) of the last command
+    /// buffer that read or wrote it: a direct read into the slot waits for
+    /// it to complete before the bytes land (`Prefetcher::read_direct`).
+    last_epoch: Vec<u64>,
     tick: u64,
 }
 
@@ -402,6 +406,7 @@ impl ResidencyMap {
             last_use: vec![0; n_slots],
             pinned: vec![false; n_slots],
             inflight: vec![0; n_slots],
+            last_epoch: vec![0; n_slots],
             tick: 0,
         }
     }
@@ -442,18 +447,33 @@ impl ResidencyMap {
     /// only when no other is (the IO queue is in order, so the second load
     /// lands after the first; the hint's bytes were read for nothing).
     fn victim(&self, tick: u64) -> Option<(usize, bool)> {
-        self.victim_in(tick, true)
-            .or_else(|| self.victim_in(tick, false))
+        self.victim_settled(tick, u64::MAX)
+    }
+
+    /// [`Self::victim`] preferring a slot whose last GPU reader's epoch is
+    /// below `settled_before` (the pool clock's completed count): a direct
+    /// read into it waits for nothing. Falls back to any slot.
+    fn victim_settled(&self, tick: u64, settled_before: u64) -> Option<(usize, bool)> {
+        self.victim_in(tick, true, settled_before)
+            .or_else(|| self.victim_in(tick, true, u64::MAX))
+            .or_else(|| self.victim_in(tick, false, u64::MAX))
     }
 
     /// [`Self::victim`] over the slots not in flight (`skip_inflight`) or
-    /// over all of them.
-    fn victim_in(&self, tick: u64, skip_inflight: bool) -> Option<(usize, bool)> {
+    /// over all of them, and with a last reader's epoch below
+    /// `settled_before`.
+    fn victim_in(
+        &self,
+        tick: u64,
+        skip_inflight: bool,
+        settled_before: u64,
+    ) -> Option<(usize, bool)> {
         let mut best: Option<(usize, u64)> = None;
         for s in 0..self.expert_in.len() {
             if self.pinned[s]
                 || self.last_use[s] == tick
                 || (skip_inflight && self.inflight[s] != 0)
+                || self.last_epoch[s] >= settled_before
             {
                 continue;
             }
@@ -546,6 +566,10 @@ pub struct StreamCounters {
     /// In-flight entries the host saw landed before any use waited for
     /// them (residents from then on, their use a plain hit).
     pub io_inflight_landed: AtomicU64,
+    /// Misses read straight into their slots (`pread_direct_on`), and the
+    /// reader threads' time waiting for the slots' last readers' epochs.
+    pub direct_loads: AtomicU64,
+    pub direct_wait_ns: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -582,6 +606,8 @@ pub struct StreamStats {
     pub io_inflight_hits: u64,
     pub io_inflight_wasted: u64,
     pub io_inflight_landed: u64,
+    pub direct_loads: u64,
+    pub direct_wait_ns: u64,
 }
 
 impl StreamCounters {
@@ -604,6 +630,8 @@ impl StreamCounters {
             io_inflight_hits: self.io_inflight_hits.load(Ordering::Relaxed),
             io_inflight_wasted: self.io_inflight_wasted.load(Ordering::Relaxed),
             io_inflight_landed: self.io_inflight_landed.load(Ordering::Relaxed),
+            direct_loads: self.direct_loads.load(Ordering::Relaxed),
+            direct_wait_ns: self.direct_wait_ns.load(Ordering::Relaxed),
         }
     }
 }
@@ -621,6 +649,8 @@ impl std::ops::AddAssign for StreamStats {
         self.io_inflight_hits += o.io_inflight_hits;
         self.io_inflight_wasted += o.io_inflight_wasted;
         self.io_inflight_landed += o.io_inflight_landed;
+        self.direct_loads += o.direct_loads;
+        self.direct_wait_ns += o.direct_wait_ns;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -655,6 +685,13 @@ pub trait HasStreamStats {
     fn warm(&self, _experts: &[u32]) -> Result<usize> {
         Ok(0)
     }
+
+    /// Load `experts` and pin them — never evicted until `unpin_all` (see
+    /// `Streamed::pin`: the static hot set, §20.3 R2); the number pinned, 0
+    /// when nothing is streamed.
+    fn pin(&self, _experts: &[u32]) -> Result<usize> {
+        Ok(0)
+    }
 }
 
 impl HasStreamStats for Resident {
@@ -681,6 +718,10 @@ impl HasStreamStats for Streamed {
     }
     fn warm(&self, experts: &[u32]) -> Result<usize> {
         Streamed::warm(self, experts)
+    }
+    fn pin(&self, experts: &[u32]) -> Result<usize> {
+        Streamed::pin(self, experts)?;
+        Ok(experts.len())
     }
 }
 
@@ -710,6 +751,15 @@ struct Inner {
     /// hint between the two must not give its slots away — the load is
     /// ordered after what IS encoded, nothing orders it after what is not.
     open_epoch: Option<u64>,
+    /// That group's slots: stamped with the GPU epoch at `down` (their last
+    /// reader's command buffer), for the direct read's wait.
+    open_slots: Vec<usize>,
+    /// The pool clock (Metal), for those stamps.
+    #[cfg(feature = "metal")]
+    clock: Option<Arc<lloom_tensor::kernels::metal::GpuClock>>,
+    /// The slot pools are Shared and a miss is read straight into its slot
+    /// (`pread_direct_on`, the `pread` arm on Metal).
+    direct: bool,
 }
 
 /// The routed experts streamed from the checkpoint into a slot pool (§20.6).
@@ -805,15 +855,27 @@ impl Streamed {
                 s.io = Some(q.open(&s.path).map_err(lloom_tensor::Error::wrap)?);
             }
         }
-        // Persistent storage of known geometry: never a pool bucket.
+        // Persistent storage of known geometry: never a pool bucket. Shared
+        // under the direct read (the CPU writes a miss into its slot).
+        #[cfg(feature = "metal")]
+        let direct = matches!(loader, LoaderArm::Pread)
+            && matches!(device, Device::Metal(_))
+            && pread_direct_on();
+        #[cfg(not(feature = "metal"))]
+        let direct = false;
         let pool = |s: &ExpertSource| -> Result<SlotPool> {
             let (n, k) = s.dims();
             Ok(SlotPool {
-                qt: QTensor::zeros_persistent((n_slots, n, k), s.dtype(), device)?,
+                qt: QTensor::zeros_persistent_with((n_slots, n, k), s.dtype(), device, direct)?,
                 plane_bytes: s.plane_bytes(),
             })
         };
         let pools = [pool(&sources[0])?, pool(&sources[1])?, pool(&sources[2])?];
+        #[cfg(feature = "metal")]
+        let clock = match device {
+            Device::Metal(d) => Some(d.gpu_clock()),
+            _ => None,
+        };
         Ok(Self {
             inner: parking_lot::Mutex::new(Inner {
                 pools,
@@ -826,6 +888,10 @@ impl Streamed {
                 table: None,
                 table_stale: true,
                 open_epoch: None,
+                open_slots: Vec::new(),
+                #[cfg(feature = "metal")]
+                clock,
+                direct,
             }),
             counters: StreamCounters::default(),
             n_experts,
@@ -979,7 +1045,7 @@ impl Streamed {
         // (their bytes are held on the device while they wait).
         #[cfg(feature = "metal")]
         if let LoaderArm::Io(q) = &inner.loader {
-            q.wait_landed(q.last_issued().saturating_sub(1));
+            q.wait_all_but_latest();
         }
         Ok(take.len())
     }
@@ -1042,6 +1108,9 @@ impl Streamed {
         // rest are waited for once, below, before the group's dispatch.
         #[cfg(feature = "metal")]
         let mut wait_value = 0u64;
+        // Under the direct read, a victim whose last reader has completed
+        // costs the reader thread no wait: prefer those.
+        let settled_before = inner.completed_epochs();
         #[cfg(feature = "metal")]
         if inner.map.inflight_count() > 0 {
             if let LoaderArm::Io(q) = &inner.loader {
@@ -1072,7 +1141,7 @@ impl Streamed {
                     s
                 }
                 None => {
-                    let (s, evicted) = match inner.map.victim(tick) {
+                    let (s, evicted) = match inner.map.victim_settled(tick, settled_before) {
                         Some(v) => v,
                         None => lloom_tensor::bail!(
                             "the slot pool ({} slots, {} pinned) cannot hold this group's {} experts",
@@ -1110,6 +1179,69 @@ impl Streamed {
             if !staged.is_empty() {
                 if let Some(p) = &self.prefetch {
                     p.release(staged.into_values().collect());
+                }
+            }
+            // The misses nothing staged, under the direct read: those whose
+            // slot's last reader has already completed go straight into
+            // their Shared slots through the reader threads — no ring, no
+            // landing copy (§20.4a); the rest (the GPU has not run their
+            // slot's last reader yet: the host is ahead of it, which is the
+            // pipelined prefill's whole point) take the ring and the copy,
+            // ordered behind that reader on the queue, so the host never
+            // waits for the GPU here.
+            if !misses.is_empty() && inner.direct {
+                if let Some(p) = &self.prefetch {
+                    let t0 = std::time::Instant::now();
+                    let settled = inner.completed_epochs();
+                    let (now, later): (Vec<(usize, usize)>, Vec<(usize, usize)>) = misses
+                        .iter()
+                        .copied()
+                        .partition(|&(_, s)| inner.map.last_epoch[s] < settled);
+                    misses = later;
+                    let mut jobs = Vec::with_capacity(now.len());
+                    let mut bytes = 0u64;
+                    for &(e, s) in &now {
+                        let mut dsts =
+                            [crate::nn::expert_prefetch::DirectDst(std::ptr::null_mut()); 3];
+                        for (i, pool) in inner.pools.iter().enumerate() {
+                            let base = pool.qt.metal_buffer()?.contents();
+                            if base.is_null() {
+                                lloom_tensor::bail!("direct read: the slot pool has no CPU mapping")
+                            }
+                            // SAFETY: `s * plane` is inside the pool (`s < n_slots`).
+                            dsts[i] = crate::nn::expert_prefetch::DirectDst(unsafe {
+                                base.add(s * pool.plane_bytes)
+                            });
+                            bytes += pool.plane_bytes as u64;
+                        }
+                        jobs.push(crate::nn::expert_prefetch::DirectJob {
+                            expert: e as u32,
+                            planes: [
+                                inner.sources[0].plane_source(),
+                                inner.sources[1].plane_source(),
+                                inner.sources[2].plane_source(),
+                            ],
+                            dsts,
+                            epoch: inner.map.last_epoch[s],
+                        });
+                    }
+                    let n_direct = jobs.len();
+                    let waited = p.read_direct(self.key, jobs);
+                    self.counters
+                        .direct_loads
+                        .fetch_add(n_direct as u64, Ordering::Relaxed);
+                    self.counters
+                        .direct_wait_ns
+                        .fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+                    self.counters
+                        .load_now_ns
+                        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    self.counters
+                        .bytes_loaded
+                        .fetch_add(bytes, Ordering::Relaxed);
+                    if n_direct > 0 {
+                        inner.table_stale = true;
+                    }
                 }
             }
             // The misses nothing staged: read now, through the reader
@@ -1237,7 +1369,7 @@ impl Streamed {
             // over a hotlist-warmed pool, `p26-io2-*.txt`). The `pread`
             // arm's ring is the room its hints read into; the `io` arm's
             // room is its empty slots.
-            let Some((s, false)) = inner.map.victim_in(protect, true) else {
+            let Some((s, false)) = inner.map.victim_in(protect, true, u64::MAX) else {
                 break;
             };
             inner.map.install(s, e);
@@ -1320,7 +1452,13 @@ impl Streamed {
         inner: &mut Inner,
         landed: Vec<(usize, usize, crate::nn::expert_prefetch::Staged)>,
     ) -> Result<()> {
-        let Inner { pools, staging, .. } = inner;
+        let Inner {
+            pools,
+            staging,
+            map,
+            clock,
+            ..
+        } = inner;
         let ring = match staging.as_ref() {
             Some(r) => r,
             None => lloom_tensor::bail!("land_staged: the tier has no staging ring"),
@@ -1328,6 +1466,7 @@ impl Streamed {
         let mut ring = ring.lock();
         let n = landed.len() as u64;
         let mut bytes = 0u64;
+        let epoch = clock.as_ref().map(|c| c.current_epoch()).unwrap_or(0);
         for (_, s, st) in landed {
             for (i, pool) in pools.iter_mut().enumerate() {
                 let plane = pool.plane_bytes;
@@ -1336,6 +1475,8 @@ impl Streamed {
                     .write_staged(s * plane, plane, Arc::clone(buf), &mut ring, *entry)?;
                 bytes += plane as u64;
             }
+            // The copy writes the slot in this command buffer.
+            map.last_epoch[s] = epoch;
         }
         drop(ring);
         self.counters
@@ -1350,6 +1491,12 @@ impl Streamed {
     /// Land `(expert, slot)` pairs in all three pools.
     fn load(&self, inner: &mut Inner, misses: &[(usize, usize)]) -> Result<()> {
         let mut bytes = 0u64;
+        // Whichever arm lands them, the slots are written in this command
+        // buffer (the copy, or the IO load ordered into it).
+        let epoch = inner.current_epoch();
+        for &(_, s) in misses {
+            inner.map.last_epoch[s] = epoch;
+        }
         match inner.loader.clone() {
             LoaderArm::Pread => {
                 #[cfg(feature = "metal")]
@@ -1425,7 +1572,16 @@ impl Streamed {
     /// pool, counted.
     fn plan_rows_host(&self, host: &[u32], rows: usize, topk: usize) -> Vec<RoutedGroup> {
         self.counters.plans.fetch_add(1, Ordering::Relaxed);
-        let groups = plan_rows(host, rows, topk, self.n_slots);
+        // The pinned experts are resident whatever the group: a row's
+        // pinned experts do not count against the unpinned capacity.
+        let (capacity, pinned) = {
+            let inner = self.inner.lock();
+            let pinned: Vec<bool> = (0..self.n_experts)
+                .map(|e| inner.map.slot_of(e).is_some_and(|s| inner.map.pinned[s]))
+                .collect();
+            (self.n_slots - inner.map.pinned_count(), pinned)
+        };
+        let groups = plan_rows_pinned(host, rows, topk, capacity, &pinned);
         self.counters
             .groups
             .fetch_add(groups.len() as u64, Ordering::Relaxed);
@@ -1442,24 +1598,89 @@ impl Streamed {
     }
 }
 
+/// `LLOOM_PREAD_DIRECT=1` (off by default): on the `pread` arm the slot
+/// pools are Shared and a miss whose slot's last GPU reader has completed
+/// (the pool clock) is read straight into its slot by the reader threads —
+/// no staging ring entry and no landing copy for it; the rest take the ring
+/// (§20.4a). Measured (#749 P27): the copies are ~13 % of the prefill's GPU
+/// time and this removes them (GPU busy 4.4 → 4.0 s), the decode after a
+/// long prompt −4–5 %, byte-identical — and the prefill wall +70 % (4.1 →
+/// 7.1 s; 5.2 → 8.4 without the pair): the reader threads' aggregate rate
+/// falls to the SSD's while the ring arm's reads hit the page cache more,
+/// for a reason not isolated (the write target is not it: a `pread` into a
+/// 4 GiB persistent Shared buffer runs at 40 GB/s like one into a `Vec`).
+/// Opt-in until it is. Read once.
+#[cfg(feature = "metal")]
+pub fn pread_direct_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("LLOOM_PREAD_DIRECT")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+impl Inner {
+    /// Epochs the pool clock shows complete (`u64::MAX` off Metal: nothing
+    /// to wait for).
+    fn completed_epochs(&self) -> u64 {
+        #[cfg(feature = "metal")]
+        {
+            self.clock
+                .as_ref()
+                .map(|c| c.completed_count())
+                .unwrap_or(u64::MAX)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            u64::MAX
+        }
+    }
+
+    /// The pool clock's current epoch (0 off Metal).
+    fn current_epoch(&self) -> u64 {
+        #[cfg(feature = "metal")]
+        {
+            self.clock.as_ref().map(|c| c.current_epoch()).unwrap_or(0)
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            0
+        }
+    }
+}
+
 /// Greedy row grouping: consecutive rows whose distinct experts fit `n_slots`.
 fn plan_rows(ids: &[u32], rows: usize, topk: usize, n_slots: usize) -> Vec<Range<usize>> {
+    plan_rows_pinned(ids, rows, topk, n_slots, &[])
+}
+
+/// [`plan_rows`] with `capacity` unpinned slots: a pinned expert (`pinned[e]`)
+/// is resident in every group and takes none of them.
+fn plan_rows_pinned(
+    ids: &[u32],
+    rows: usize,
+    topk: usize,
+    capacity: usize,
+    pinned: &[bool],
+) -> Vec<Range<usize>> {
+    let counts = |e: u32| !pinned.get(e as usize).copied().unwrap_or(false);
     let mut groups = Vec::new();
     let mut start = 0usize;
-    let mut distinct: Vec<u32> = Vec::with_capacity(n_slots);
+    let mut distinct: Vec<u32> = Vec::with_capacity(capacity);
     for r in 0..rows {
         let row = &ids[r * topk..(r + 1) * topk];
         let mut added: Vec<u32> = Vec::new();
         for &e in row {
-            if !distinct.contains(&e) && !added.contains(&e) {
+            if counts(e) && !distinct.contains(&e) && !added.contains(&e) {
                 added.push(e);
             }
         }
-        if distinct.len() + added.len() > n_slots && r > start {
+        if distinct.len() + added.len() > capacity && r > start {
             groups.push(start..r);
             start = r;
             distinct.clear();
-            distinct.extend(row.iter().copied());
+            distinct.extend(row.iter().copied().filter(|&e| counts(e)));
             distinct.sort_unstable();
             distinct.dedup();
         } else {
@@ -1691,6 +1912,12 @@ impl ExpertResidency for Streamed {
         let ids = ids.flatten_all()?.contiguous()?;
         let table = {
             let mut inner = self.inner.lock();
+            // The pass may read any resident slot: stamp them all with this
+            // epoch (a direct read into one waits for it).
+            let epoch = inner.current_epoch();
+            for e in inner.map.last_epoch.iter_mut() {
+                *e = epoch;
+            }
             self.device_table(&mut inner)?
         };
         self.counters.device_plans.fetch_add(1, Ordering::Relaxed);
@@ -1784,6 +2011,7 @@ impl ExpertResidency for Streamed {
         let tick = inner.map.begin();
         let slots = self.resolve(&mut inner, &distinct, tick)?;
         inner.open_epoch = Some(tick);
+        inner.open_slots = slots.clone();
         let slot_ids: Vec<u32> = ids
             .iter()
             .map(|e| {
@@ -1805,8 +2033,14 @@ impl ExpertResidency for Streamed {
     fn down(&self, h: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
         let mut inner = self.inner.lock();
         let y = inner.pools[2].qt.indexed_moe_forward(h, slot_ids)?;
-        // The group's last dispatch is encoded: its slots may be given away.
+        // The group's last dispatch is encoded: its slots may be given away
+        // — to a direct read once this command buffer has run.
         inner.open_epoch = None;
+        let epoch = inner.current_epoch();
+        let slots = std::mem::take(&mut inner.open_slots);
+        for s in slots {
+            inner.map.last_epoch[s] = epoch;
+        }
         Ok(y)
     }
 }
@@ -2153,6 +2387,11 @@ mod tests {
         assert_eq!(plan_rows(&ids, 4, 2, 4), vec![0..2, 2..4]);
         assert_eq!(plan_rows(&ids, 4, 2, 3), vec![0..2, 2..3, 3..4]);
         assert_eq!(plan_rows(&ids, 4, 2, 8), vec![0..4]);
+        // A pinned expert costs no capacity: with expert 1 pinned, {0,2,3,4}
+        // is 4 of 4 → the first three rows are one group where they were two.
+        let mut pinned = vec![false; 8];
+        pinned[1] = true;
+        assert_eq!(plan_rows_pinned(&ids, 4, 2, 4, &pinned), vec![0..3, 3..4]);
     }
 
     /// Metal: the prefetcher stages a layer's missing experts off the

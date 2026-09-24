@@ -195,6 +195,13 @@ struct Args {
     #[arg(long)]
     hotlist: Option<PathBuf>,
 
+    /// Pin the hotlist's head: this many of each layer's most-used experts
+    /// are never evicted (`--experts stream` with `--hotlist`), so a long
+    /// prompt's sweep cannot churn the decode's hot set out of the pool. 0
+    /// = warm only.
+    #[arg(long, default_value_t = 0)]
+    pin: usize,
+
     /// How the prompt is run: `chunk` (Kernel B + chunk attention, the
     /// reference prefill graph) or `replay` (the decode recurrence one position
     /// at a time, #747's path).
@@ -660,6 +667,10 @@ fn main() -> Result<()> {
                         s.bytes_loaded,
                         tw.elapsed().as_millis()
                     );
+                    if args.pin > 0 {
+                        let pinned = model.pin_from_hotlist(&hot, args.pin)?;
+                        println!("PIN per_layer={} pinned={pinned}", args.pin);
+                    }
                 } else {
                     println!("WARM hotlist={} absent: a cold pool", path.display());
                 }
@@ -784,8 +795,10 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
                 s.hits as f64 / (s.hits + s.misses).max(1) as f64,
             );
             println!(
-                "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={}",
-                args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked
+                "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={} stage_read_gb_s={:.2} direct_read_gb_s={:.2}",
+                args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked,
+                pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
+                pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
             );
         }
     }
@@ -1009,11 +1022,25 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             );
             let pf = model.prefetch_stats();
             println!(
-                "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={}",
-                args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked
+                "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={} stage_read_gb_s={:.2} direct_read_gb_s={:.2}",
+                args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked,
+                pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
+                pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
             );
+            let hr = model.hint_recall();
+            if hr.iter().any(|&(_, n)| n > 0) {
+                let r = |k: usize| hr[k].0 as f64 / hr[k].1.max(1) as f64;
+                println!(
+                    "HINTRECALL run={run} k0={:.3} k1={:.3} k2={:.3} k3={:.3} n={}",
+                    r(0),
+                    r(1),
+                    r(2),
+                    r(3),
+                    hr[0].1
+                );
+            }
             println!(
-                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={}",
+                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0}",
                 args.loader,
                 model.slots_per_layer(),
                 s.plans,
@@ -1035,7 +1062,9 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 s.io_hints,
                 s.io_inflight_hits,
                 s.io_inflight_wasted,
-                s.io_inflight_landed
+                s.io_inflight_landed,
+                s.direct_loads,
+                s.direct_wait_ns as f64 / 1e6
             );
         }
         if let Some((hits, misses)) = model.ple_cache_stats() {

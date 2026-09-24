@@ -2338,6 +2338,22 @@ impl MetalDevice {
     /// outside every pool, registered in the residency set and unregistered
     /// when the handle drops. For a persistent structure of known geometry
     /// (a streamed tier's slot pool) that must not be a pool bucket.
+    /// As [`Self::new_persistent_private`], Shared: a persistent buffer the
+    /// CPU writes into place (the streamed tier's slot pools under the
+    /// direct read, `DESIGN.md` §20.4a).
+    pub fn new_persistent_shared(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+        let buffer = self
+            .device
+            .new_buffer(size.max(1), RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        self.residency_set.insert(&buffer);
+        Ok(Arc::new(PooledBuffer::unpooled_resident(
+            buffer,
+            size,
+            Arc::clone(&self.residency_set),
+        )))
+    }
+
     pub fn new_persistent_private(&self, size: usize) -> Result<Arc<PooledBuffer>> {
         let buffer = self
             .device

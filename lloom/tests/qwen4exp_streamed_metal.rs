@@ -95,6 +95,9 @@ static KNOBS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[test]
 fn both_loader_arms_match_the_resident_model_on_metal() -> Result<()> {
     let _knobs = KNOBS.lock().unwrap_or_else(|e| e.into_inner());
+    // The direct read (opt-in) is what these exercise on the pread arm:
+    // pinned on before the first tier exists (read once a process).
+    std::env::set_var("LLOOM_PREAD_DIRECT", "1");
     let dev = Device::new_metal(0)?;
     let mut cfg = Config::tiny();
     cfg.n_experts = 12;
@@ -211,6 +214,9 @@ fn both_loader_arms_match_the_resident_model_on_metal() -> Result<()> {
 #[test]
 fn paired_prefill_matches_chunk_after_chunk_on_metal() -> Result<()> {
     let _knobs = KNOBS.lock().unwrap_or_else(|e| e.into_inner());
+    // The direct read (opt-in) is what these exercise on the pread arm:
+    // pinned on before the first tier exists (read once a process).
+    std::env::set_var("LLOOM_PREAD_DIRECT", "1");
     let dev = Device::new_metal(0)?;
     let mut cfg = Config::tiny();
     cfg.n_experts = 12;

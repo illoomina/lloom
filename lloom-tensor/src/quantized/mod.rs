@@ -993,13 +993,25 @@ impl QTensor {
         dtype: GgmlDType,
         device: &Device,
     ) -> Result<Self> {
+        Self::zeros_persistent_with(shape, dtype, device, false)
+    }
+
+    /// [`Self::zeros_persistent`], Shared storage on Metal when `shared` (the
+    /// CPU writes it in place); the same as `zeros_persistent` elsewhere.
+    pub fn zeros_persistent_with<S: Into<Shape>>(
+        shape: S,
+        dtype: GgmlDType,
+        device: &Device,
+        shared: bool,
+    ) -> Result<Self> {
         let shape = shape.into();
         check_shape(&shape, dtype.block_size())?;
         let storage = match device {
-            Device::Metal(d) => QStorage::Metal(metal::QMetalStorage::persistent(
+            Device::Metal(d) => QStorage::Metal(metal::QMetalStorage::persistent_with(
                 d,
                 shape.elem_count(),
                 dtype,
+                shared,
             )?),
             other => other.qzeros(shape.elem_count(), dtype)?,
         };

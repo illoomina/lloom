@@ -675,6 +675,9 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// Some layer's residency plans on the device (`Streamed`): a decode
     /// pass runs under a window and settles at its end (`decode_embed`).
     device_plan: bool,
+    /// The hint-recall probe's tallies per lead k = 0..3: `(predicted ∩
+    /// real, real)` over the decode passes (`hint_recall`).
+    hint_recall: parking_lot::Mutex<[(u64, u64); 4]>,
     /// The per-pass memory check (`prepare_pass`, §9.5p's shape): the
     /// fraction of `recommendedMaxWorkingSetSize` a pass may take the
     /// process to, and whether a pass over it is refused or reported.
@@ -801,6 +804,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             mtp: None,
             prefill_mode: PrefillMode::default(),
             device_plan,
+            hint_recall: parking_lot::Mutex::new([(0, 0); 4]),
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
             mem_check: MemCheck::from_env(),
             spec_ahead: spec_ahead_from_env(),
@@ -831,6 +835,22 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
         let cur = l.collapsed(carry)?; // [1, seq, d]
         Ok(Some((layer, l.moe().route_ids(&cur)?)))
+    }
+
+    /// [`Self::hint_encode`] for a layer that may be past the last.
+    fn hint_encode_at(&self, layer: usize, carry: &Tensor) -> Result<Option<(usize, Tensor)>> {
+        if layer >= self.layers.len() {
+            return Ok(None);
+        }
+        let l = &self.layers[layer];
+        let cur = l.collapsed(carry)?;
+        Ok(Some((layer, l.moe().route_ids(&cur)?)))
+    }
+
+    /// The hint-recall probe's tallies per lead k = 0..3: `(predicted ∩
+    /// real, real)` over the decode passes so far (`QWEN4EXP_HINT_RECALL=1`).
+    pub fn hint_recall(&self) -> [(u64, u64); 4] {
+        *self.hint_recall.lock()
     }
 
     fn hint_land(&self, pending: Option<(usize, Tensor)>) -> Result<()> {
@@ -1117,6 +1137,30 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             loaded += e.warm(&hot.top(l, n))?;
         }
         Ok(loaded)
+    }
+
+    /// Pin the head of each layer's profile — its `n` most-used experts
+    /// (fewer where the pool is smaller: a pin leaves at least a free
+    /// slot) — so no pass evicts them (`Streamed::pin`, §20.3 R2): the
+    /// decode's hot set survives a long prompt's sweep, which otherwise
+    /// churns the whole pool and leaves the decode on the per-layer host
+    /// plan (measured 123 ms a token after a 937-token prompt, #749 P26).
+    /// Returns the experts pinned.
+    pub fn pin_from_hotlist(&self, hot: &super::hotlist::Hotlist, n: usize) -> Result<usize>
+    where
+        R: crate::nn::expert_stream::HasStreamStats,
+    {
+        let mut pinned = 0;
+        for (l, layer) in self.layers.iter().enumerate() {
+            let e = layer.moe().experts();
+            let slots = e.slots();
+            if slots == 0 || n == 0 {
+                continue;
+            }
+            let take = n.min(slots.saturating_sub(1));
+            pinned += e.pin(&hot.top(l, take))?;
+        }
+        Ok(pinned)
     }
 
     /// The streamed tier's prefetch counters (shared by its layers; zeros
@@ -1552,7 +1596,19 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 
         let watch = watch_nan();
         let mut watched: Vec<Tensor> = Vec::new();
+        // The hint-recall probe: layer l+k's router on the carry entering
+        // layer l, k = 0..3, scored against layer l+k's real routing after
+        // the pass.
+        let probe = super::moe::hint_recall_probe();
+        let mut predicted: Vec<(usize, usize, Tensor)> = Vec::new(); // (k, layer, ids)
         for (l, layer) in self.layers.iter().enumerate() {
+            if probe {
+                for k in 0..4 {
+                    if let Some((target, ids)) = self.hint_encode_at(l + k, &res_hc)? {
+                        predicted.push((k, target, ids));
+                    }
+                }
+            }
             // The N-gram PLE adds to the carry at the start of its layer.
             if let Some(ple) = &self.ple {
                 if ple.layer == l {
@@ -1585,6 +1641,19 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
         }
         cache.keep_nextn(&res_hc);
+        if probe && !predicted.is_empty() {
+            let mut tally = self.hint_recall.lock();
+            for (k, target, pred) in predicted {
+                let Some(real) = self.layers[target].moe().probe_ids() else {
+                    continue;
+                };
+                let pred: Vec<u32> = pred.flatten_all()?.to_vec1()?;
+                let real: Vec<u32> = real.flatten_all()?.to_vec1()?;
+                let hit = real.iter().filter(|e| pred.contains(e)).count() as u64;
+                tally[k].0 += hit;
+                tally[k].1 += real.len() as u64;
+            }
+        }
 
         if watch && !watched.is_empty() {
             // One readback per token: the first non-finite (layer, sub-block).

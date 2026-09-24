@@ -9,7 +9,8 @@ use lloom_tensor::{DType, Device, Tensor};
 
 #[test]
 fn heap_chunks_serve_misses_without_residency_traffic() {
-    // The arm is opt-in (read once, before the device exists).
+    // On by default; pinned on here whatever the environment says (read
+    // once, before the device exists).
     std::env::set_var("LLOOM_TRANSIENT_HEAPS", "1");
     let dev = match Device::new_metal(0) {
         Ok(d) => d,
@@ -106,6 +107,14 @@ fn heap_chunks_serve_misses_without_residency_traffic() {
         hp2.chunks, hp.chunks,
         "a second round of the same sizes must reuse the chunks' freed ranges: {hp:?} → {hp2:?}"
     );
+    // Placed by us: what the chunks hold is what is live, to the rounding
+    // of a buffer's size (the pool's 300 MB requests rounded by Metal's
+    // size-and-align), and no more.
+    assert!(
+        hp2.used >= 5 * n * 4 && hp2.used <= 5 * n * 4 + 5 * (1 << 20),
+        "the chunks' used bytes must be the five live buffers': {hp2:?}"
+    );
+    assert!(hp2.live >= 5, "{hp2:?}");
     for (i, t) in again.iter().enumerate() {
         let s = t.narrow(0, 0, 1).unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(s[0], -(i as f32) - 1.0);

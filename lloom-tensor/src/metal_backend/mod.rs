@@ -2845,7 +2845,10 @@ impl BackendDevice for MetalDevice {
             // by destroying buffers (§6.3b), which is the second place a
             // buffer's existence ends and the one nothing was announcing
             // (`DESIGN.md` §6.3c).
-            let observer = Arc::new(ResidencyEvictionObserver::new(Arc::clone(&residency_set)));
+            let observer = Arc::new(ResidencyEvictionObserver::new(
+                Arc::clone(&residency_set),
+                Arc::clone(&transient_heaps),
+            ));
             buffers.set_eviction_observer(observer.clone());
             private_buffers.set_eviction_observer(observer);
         }

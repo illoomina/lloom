@@ -130,11 +130,20 @@ pub(crate) struct DeviceTeardown {
 /// +0.062, and the difference between them is the commit count.
 pub(crate) struct ResidencyEvictionObserver {
     residency_set: Arc<ResidencySet>,
+    /// The transient chunks (§6.3k): an evicted sub-buffer's range goes
+    /// back to its chunk instead of out of the residency set.
+    heaps: Arc<(HeapChunks, HeapChunks)>,
 }
 
 impl ResidencyEvictionObserver {
-    pub(crate) fn new(residency_set: Arc<ResidencySet>) -> Self {
-        Self { residency_set }
+    pub(crate) fn new(
+        residency_set: Arc<ResidencySet>,
+        heaps: Arc<(HeapChunks, HeapChunks)>,
+    ) -> Self {
+        Self {
+            residency_set,
+            heaps,
+        }
     }
 }
 
@@ -150,10 +159,19 @@ impl crate::kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver
         // the old behaviour back without a rebuild. The old arm's failure mode
         // is now documented rather than latent -- it is an unbounded retention,
         // not a safe deferral.
+        // A heap-backed buffer was never in the set: its range returns to
+        // its chunk, and only the rest go through the set.
+        let rest: Vec<&Buffer> = buffers
+            .iter()
+            .filter(|b| !(self.heaps.0.release(b) || self.heaps.1.release(b)))
+            .collect();
+        if rest.is_empty() {
+            return;
+        }
         if retain_evicted_allocations() {
-            self.residency_set.retire_batch(buffers.iter());
+            self.residency_set.retire_batch(rest.into_iter());
         } else {
-            self.residency_set.remove_batch(buffers.iter());
+            self.residency_set.remove_batch(rest.into_iter());
         }
     }
 }
@@ -732,10 +750,14 @@ impl MetalDevice {
     /// hand memory back under pressure. Nothing calls it on the hot path.
     pub fn trim_unused_buffers(&self) {
         for buffer in self.buffers.trim() {
-            self.residency_set.remove(&buffer);
+            if !self.transient_heaps.0.release(&buffer) {
+                self.residency_set.remove(&buffer);
+            }
         }
         for buffer in self.private_buffers.trim() {
-            self.residency_set.remove(&buffer);
+            if !self.transient_heaps.1.release(&buffer) {
+                self.residency_set.remove(&buffer);
+            }
         }
     }
 

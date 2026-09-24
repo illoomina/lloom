@@ -1070,6 +1070,15 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
             sum(&|t| t.verify_ns),
             sum(&|t| t.observe_ns),
         );
+        let s = model.stream_stats();
+        let (redos, host_passes, armed) = {
+            let c = session.cache_mut();
+            (c.redos, c.host_plan_passes, c.device_plan_armed)
+        };
+        println!(
+            "MTPSTREAM plans={} device_plans={} hits={} misses={} settled_misses={} redos={redos} host_plan_passes={host_passes} device_plan_armed={armed}",
+            s.plans, s.device_plans, s.hits, s.misses, s.settled_misses,
+        );
         if !same {
             anyhow::bail!("the MTP run's tokens differ from the greedy run's");
         }

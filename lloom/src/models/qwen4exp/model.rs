@@ -2282,8 +2282,20 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let input = Tensor::from_vec(tokens.to_vec(), (t, 1), &dev)?;
         let h = self.embed(&input)?; // [T, 1, hidden]
         let planned = self.device_plan && plan_on_device() && cache.device_plan_armed;
+        // The cold phase, as `decode_embed`'s: a host-planned window that
+        // completed with every expert resident arms the device plan for the
+        // rounds after it. Without this the speculative body — a prefill,
+        // then verify windows, never a decode step — planned every round on
+        // the host (P29 (9): 137 ms a round against the 40 ms step).
+        let misses_before = (!planned).then(|| self.stream_misses());
         let (logits, records) = self.verify_pass(&h, cache, planned)?;
         let mut logits = logits;
+        if let Some(before) = misses_before {
+            cache.host_plan_passes += 1;
+            if self.device_plan && plan_on_device() && self.stream_misses() == before {
+                cache.device_plan_armed = true;
+            }
+        }
         if planned {
             let redo = self.settle_records(&records)?;
             if redo {

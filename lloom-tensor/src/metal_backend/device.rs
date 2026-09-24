@@ -2347,6 +2347,20 @@ impl MetalDevice {
             .new_buffer(size.max(1), RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         self.residency_set.insert(&buffer);
+        // A Shared buffer's pages are the process's, and under memory
+        // pressure the kernel compresses them whatever the residency set
+        // says (measured: 28 GB of Shared slot pools un-wired and 7.5 GB
+        // of them compressed mid-prefill, #749 P27); a Private buffer's are
+        // not. Pin them.
+        let ptr = buffer.contents();
+        if !ptr.is_null() {
+            // SAFETY: `ptr..ptr+size` is the buffer's own mapping.
+            let rc = unsafe { libc::mlock(ptr as *const libc::c_void, size.max(1)) };
+            if rc != 0 {
+                let e = std::io::Error::last_os_error();
+                eprintln!("mlock of a {size}-byte Shared buffer failed: {e}");
+            }
+        }
         Ok(Arc::new(PooledBuffer::unpooled_resident(
             buffer,
             size,

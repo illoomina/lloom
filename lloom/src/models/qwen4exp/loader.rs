@@ -401,9 +401,18 @@ pub fn session_reserve_bytes(
     // One tile's worth: `PREFILL_TRANSIENT_BYTES_PER_TOKEN` is the peak
     // measured WITH the pacer's two tiles in flight (1.34 GB over a 512
     // tile), so a second factor of two counted the same bytes twice — 1.5
-    // GB, ~18 slots, on this machine (P26).
+    // GB, ~18 slots, on this machine (P26). A pipelined pass of more than
+    // two tiles holds each further tile's half of that on top (P27).
+    let tile_bytes = tile * super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN;
+    let tiles = if super::model::prefill_pair_on() {
+        super::model::prefill_tiles()
+    } else {
+        2
+    };
+    let further = tile_bytes.saturating_mul(tiles.saturating_sub(2)) / 2;
     rows.max(1) * kv_tokens * kv_bytes_per_token(cfg)
-        + tile * super::model::PREFILL_TRANSIENT_BYTES_PER_TOKEN
+        + tile_bytes
+        + further
         + POOL_FREE_RESERVE_BYTES
         + PASS_RETENTION_BYTES
 }

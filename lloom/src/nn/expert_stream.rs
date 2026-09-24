@@ -136,6 +136,12 @@ pub trait ExpertResidency {
     /// A hint naming the experts a pass is predicted to route to (§20.3
     /// P2, the layer's router on a carry from before its mixer): stage the
     /// ones not held. A hint like `prefetch_ahead`; `Resident` ignores it.
+    /// [`Self::prefetch_ids`] for the named experts ALONE — no fill from the
+    /// usage profile (a decode hint: ten experts a layer, not the pool).
+    fn prefetch_named(&self, _ids: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
     fn prefetch_ids(&self, _ids: &[u32]) -> Result<()> {
         Ok(())
     }
@@ -1850,6 +1856,33 @@ impl ExpertResidency for Streamed {
             }
         }
         self.prefetch_ids(&distinct)
+    }
+
+    #[cfg(feature = "metal")]
+    fn prefetch_named(&self, ids: &[u32]) -> Result<()> {
+        if self.prefetch.is_none() && !self.io_hints {
+            return Ok(());
+        }
+        let mut distinct: Vec<u32> = ids.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let (missing, planes) = {
+            let inner = self.inner.lock();
+            let missing: Vec<u32> = distinct
+                .iter()
+                .copied()
+                .filter(|&e| {
+                    (e as usize) < self.n_experts && inner.map.slot_of(e as usize).is_none()
+                })
+                .collect();
+            let planes = [
+                inner.sources[0].plane_source(),
+                inner.sources[1].plane_source(),
+                inner.sources[2].plane_source(),
+            ];
+            (missing, planes)
+        };
+        self.dispatch_hint(missing, planes)
     }
 
     #[cfg(feature = "metal")]

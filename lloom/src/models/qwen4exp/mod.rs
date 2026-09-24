@@ -30,8 +30,9 @@ pub use loader::{
     DEFAULT_MEMORY_FRACTION,
 };
 pub use model::{
-    prefill_chunk, prefill_pair_on, set_prefill_chunk, set_prefill_pair, Cache, Layer, MemCheck,
-    Mixer, PassPlan, Qwen4Exp, StatePools, DEFAULT_PREFILL_PAIR, PREFILL_CHUNK,
+    prefill_chunk, prefill_pair_on, prefill_tiles, set_prefill_chunk, set_prefill_pair,
+    set_prefill_tiles, Cache, Layer, MemCheck, Mixer, PassPlan, Qwen4Exp, StatePools,
+    DEFAULT_PREFILL_PAIR, DEFAULT_PREFILL_TILES, PREFILL_CHUNK,
     PREFILL_TRANSIENT_BYTES_PER_TOKEN,
 };
 pub use moe::{ExpertResidency, MoeLayer, Resident, Streamed};

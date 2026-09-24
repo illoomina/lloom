@@ -400,12 +400,12 @@ fn prefill_tiled<R: ExpertResidency>(
     tile: usize,
     device: &Device,
 ) -> Result<Tensor> {
-    use lloom::models::qwen4exp::{prefill_chunk, prefill_pair_on};
-    // Under the paired prefill a tile is two chunks — the pass interleaves
-    // them a layer apart — and the pacer's depth is 1: the pair IS the two
-    // tiles in flight the transient constant was measured with.
+    use lloom::models::qwen4exp::{prefill_chunk, prefill_pair_on, prefill_tiles};
+    // Under the pipelined prefill a tile is `prefill_tiles` chunks — the
+    // pass interleaves them a layer apart — and the pacer's depth is 1: the
+    // pass IS the tiles in flight the transient constant was measured with.
     let (tile, depth) = if tile != 0 && prefill_pair_on() && tile <= prefill_chunk() {
-        (2 * prefill_chunk(), 1)
+        (prefill_tiles() * prefill_chunk(), 1)
     } else if tile > prefill_chunk() {
         (tile, 1)
     } else {
@@ -1027,6 +1027,10 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
                 pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
             );
+            let dh = lloom::models::qwen4exp::Qwen4Exp::<lloom::models::qwen4exp::Streamed>::decode_hints();
+            if dh > 0 {
+                println!("DECODEHINT run={run} hints={dh}");
+            }
             let hr = model.hint_recall();
             if hr.iter().any(|&(_, n)| n > 0) {
                 let r = |k: usize| hr[k].0 as f64 / hr[k].1.max(1) as f64;

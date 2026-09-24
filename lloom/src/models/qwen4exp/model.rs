@@ -645,6 +645,42 @@ pub fn set_prefill_pair(on: bool) {
 
 pub const DEFAULT_PREFILL_PAIR: bool = true;
 
+static PREFILL_TILES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Chunks a pipelined pass interleaves (`QWEN4EXP_PREFILL_TILES`, default
+/// 2; read once; [`set_prefill_tiles`] for tests). Under
+/// [`prefill_pair_on`] only; a read's lead is `tiles − 1` stages.
+pub fn prefill_tiles() -> usize {
+    let v = PREFILL_TILES.load(std::sync::atomic::Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let t = std::env::var("QWEN4EXP_PREFILL_TILES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&t| t >= 2)
+        .unwrap_or(DEFAULT_PREFILL_TILES);
+    PREFILL_TILES.store(t, std::sync::atomic::Ordering::Relaxed);
+    t
+}
+
+pub fn set_prefill_tiles(tiles: usize) {
+    PREFILL_TILES.store(tiles.max(2), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub const DEFAULT_PREFILL_TILES: usize = 2;
+
+static DECODE_HINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `QWEN4EXP_DECODE_HINT=1` (read once; off by default): at decode under
+/// the host plan, layer l+2's router on the carry entering layer l names
+/// the experts to prefetch (recall 0.56, P27) — the loads at the layer,
+/// not the syncs, are what it can cut.
+pub fn decode_hint_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("QWEN4EXP_DECODE_HINT").is_ok_and(|v| v == "1"))
+}
+
 /// The N-gram PLE at its one layer.
 #[derive(Debug)]
 pub struct Ple {
@@ -837,6 +873,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         Ok(Some((layer, l.moe().route_ids(&cur)?)))
     }
 
+    /// Decode hints handed to the prefetchers so far (the process).
+    pub fn decode_hints() -> u64 {
+        DECODE_HINTS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// [`Self::hint_encode`] for a layer that may be past the last.
     fn hint_encode_at(&self, layer: usize, carry: &Tensor) -> Result<Option<(usize, Tensor)>> {
         if layer >= self.layers.len() {
@@ -895,11 +936,22 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
         }
         // The constant was measured as the peak over a 512-tile WITH a second
-        // tile in flight (P18); a pass runs at most two tiles at a time (the
-        // pair, or the pacer's depth), so past one chunk the transient does
-        // not grow with the pass.
+        // tile in flight (P18): two tiles' worth per chunk of positions. A
+        // pipelined pass holds `prefill_tiles` tiles at once — each beyond
+        // the pair another half of the constant per chunk — and past that
+        // the transient does not grow with the pass.
         let transient = if seq > 1 {
-            PREFILL_TRANSIENT_BYTES_PER_TOKEN.saturating_mul(seq.min(prefill_chunk()))
+            let chunk = prefill_chunk();
+            let tiles = if prefill_pair_on() {
+                prefill_tiles()
+            } else {
+                2
+            };
+            let in_flight = chunk.saturating_mul(tiles).max(chunk);
+            let base = PREFILL_TRANSIENT_BYTES_PER_TOKEN.saturating_mul(seq.min(chunk));
+            // Positions past the two tiles the constant already covers.
+            let further = seq.min(in_flight).saturating_sub(2 * chunk);
+            base + PREFILL_TRANSIENT_BYTES_PER_TOKEN.saturating_mul(further) / 2
         } else {
             0
         };
@@ -1267,20 +1319,31 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 let mut start = 0;
                 while start < seq {
                     let len = chunk_len(start, cache.pos);
-                    // Two multi-position chunks in a row: one pass, the two
-                    // tiles interleaved a layer apart (the second's layer l−1
-                    // runs while the first's layer l is read back).
-                    let len_b = if pair_ok && len > 1 && start + len < seq {
-                        chunk_len(start + len, cache.pos + len)
-                    } else {
-                        0
-                    };
-                    if len_b > 1 {
-                        let ha = embeds.narrow(1, start, len)?;
-                        let hb = embeds.narrow(1, start + len, len_b)?;
-                        self.prepare_pass_inner(cache, len + len_b)?;
-                        logits = Some(self.prefill_embeds_pair(&ha, &hb, cache)?);
-                        start += len + len_b;
+                    // Up to `prefill_tiles` multi-position chunks in a row:
+                    // one pass, the tiles interleaved a layer apart.
+                    let mut lens = vec![len];
+                    if pair_ok && len > 1 {
+                        let mut at = start + len;
+                        while lens.len() < prefill_tiles() && at < seq {
+                            let l = chunk_len(at, cache.pos + (at - start));
+                            if l <= 1 {
+                                break;
+                            }
+                            lens.push(l);
+                            at += l;
+                        }
+                    }
+                    if lens.len() > 1 {
+                        let mut tiles = Vec::with_capacity(lens.len());
+                        let mut at = start;
+                        for &l in &lens {
+                            tiles.push(embeds.narrow(1, at, l)?);
+                            at += l;
+                        }
+                        let total: usize = lens.iter().sum();
+                        self.prepare_pass_inner(cache, total)?;
+                        logits = Some(self.prefill_embeds_pipelined(&tiles, cache)?);
+                        start += total;
                         continue;
                     }
                     let h = embeds.narrow(1, start, len)?;
@@ -1384,46 +1447,57 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             .to_dtype(lloom_tensor::DType::F32)
     }
 
-    /// Two consecutive chunks `ha [1, seq_a, hidden]`, `hb [1, seq_b,
-    /// hidden]` as ONE pass, interleaved a layer apart on the one queue
-    /// (`DESIGN.md` §11.5z-ix item 2): at every layer the host waits for a
-    /// tile's router readback while the GPU runs the OTHER tile's stage,
-    /// encoded before the wait —
-    ///
-    /// ```text
-    /// X(A,0)
-    /// for l:  X(B,l−1) · wait A · M(A,l) · X(A,l+1) · wait B · M(B,l−1)
-    /// X(B,L−1) · wait B · M(B,L−1)
-    /// ```
-    ///
-    /// with X = the mixer bracket and the router (encoded), M = the plan
-    /// (the readback) and the experts (encoded). B's layer l runs after A's
-    /// layer l in the stream, so B attends over A's keys and starts from A's
-    /// recurrent state as a chunk after a chunk does; the PLE pops A's
-    /// tokens before B's. The same dispatches in the same order per tile as
-    /// two `prefill_embeds`: byte-identical. The readback is staged at X
-    /// and waits its own marker at M (`metal_backend::stage_readback`), not
-    /// the queue's tail — a plain `to_cpu` after the other tile's work
-    /// would wait for that work too. Off Metal the two run one after the
-    /// other.
+    /// Two consecutive chunks as one pass, interleaved a layer apart
+    /// (`prefill_embeds_pipelined` over two tiles).
     pub fn prefill_embeds_pair(
         &self,
         ha: &Tensor,
         hb: &Tensor,
         cache: &mut Cache,
     ) -> Result<Tensor> {
+        self.prefill_embeds_pipelined(&[ha.clone(), hb.clone()], cache)
+    }
+
+    /// `N` consecutive chunks `tiles[t] [1, seq_t, hidden]` as ONE pass,
+    /// interleaved a layer apart on the one queue (`DESIGN.md` §11.5z-ix
+    /// item 2): tile t runs layer l at step s = l + t, every step encoding
+    /// each tile's X stage (the mixer bracket and the router, its ids'
+    /// readback staged) and then each tile's M stage (the plan — the
+    /// readback's wait — and the experts), so at every wait the GPU has the
+    /// other tiles' stages queued:
+    ///
+    /// ```text
+    /// step s:  X(0,s) X(1,s−1) … X(N−1,s−N+1)   then   M(0,s) M(1,s−1) … M(N−1,s−N+1)
+    /// ```
+    ///
+    /// Tile t's layer l comes after tile t−1's layer l in the stream (its M
+    /// was the previous step's), so it attends over the earlier tile's keys
+    /// and starts from its recurrent state as a chunk after a chunk does;
+    /// the PLE pops the tiles' tokens in order. The same dispatches in the
+    /// same order per tile as `N` `prefill_embeds`: byte-identical. The
+    /// lead a miss's read gets is the other tiles' stages — `N − 1` of them
+    /// — which is what an arm whose loads the GPU waits for (the `io` arm's
+    /// DMA at the layer) needs to not stall. Off Metal the readback is a
+    /// plain one and the tiles still interleave.
+    pub fn prefill_embeds_pipelined(&self, tiles: &[Tensor], cache: &mut Cache) -> Result<Tensor> {
+        let n_tiles = tiles.len();
+        if n_tiles == 0 {
+            lloom_tensor::bail!("prefill_embeds_pipelined: no tiles")
+        }
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
-        let (_, seq_a, _) = ha.dims3()?;
-        let (_, seq_b, _) = hb.dims3()?;
-        let carry = |h: &Tensor, seq: usize| -> Result<Tensor> {
-            h.reshape((1, seq, 1, d))?
-                .broadcast_as((1, seq, n, d))?
-                .reshape((1, seq, n * d))?
-                .contiguous()
-        };
-        let mut res_a = carry(ha, seq_a)?;
-        let mut res_b = carry(hb, seq_b)?;
+        let mut seqs = Vec::with_capacity(n_tiles);
+        let mut res: Vec<Tensor> = Vec::with_capacity(n_tiles);
+        for h in tiles {
+            let (_, seq, _) = h.dims3()?;
+            seqs.push(seq);
+            res.push(
+                h.reshape((1, seq, 1, d))?
+                    .broadcast_as((1, seq, n, d))?
+                    .reshape((1, seq, n * d))?
+                    .contiguous()?,
+            );
+        }
         let n_layers = self.layers.len();
         let lead = prefetch_lead();
         for l in 0..lead.min(n_layers) {
@@ -1466,37 +1540,32 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             let moe_out = layer.moe().prefill_execute(&st.routed, &groups)?;
             layer.prefill_finish(&st.res, &moe_out, &st.inject, l)
         };
-        let hint = |l: usize| -> Result<()> {
-            if let Some(ahead) = self.layers.get(l + lead) {
+
+        let mut staged: Vec<Option<Staged>> = (0..n_tiles).map(|_| None).collect();
+        for step in 0..n_layers + n_tiles - 1 {
+            if let Some(ahead) = self.layers.get(step + lead) {
                 ahead.moe().experts().prefetch_ahead()?;
             }
-            Ok(())
-        };
-
-        let mut st_a = Some(stage_x(&mut res_a, 0, cache)?);
-        let mut st_b: Option<Staged> = None;
-        for l in 0..n_layers {
-            hint(l)?;
-            if l > 0 {
-                st_b = Some(stage_x(&mut res_b, l - 1, cache)?);
+            for t in 0..n_tiles {
+                if step >= t && step - t < n_layers {
+                    staged[t] = Some(stage_x(&mut res[t], step - t, cache)?);
+                }
             }
-            res_a = stage_m(st_a.take().expect("A staged"), l)?;
-            if l + 1 < n_layers {
-                st_a = Some(stage_x(&mut res_a, l + 1, cache)?);
-            }
-            if let Some(st) = st_b.take() {
-                res_b = stage_m(st, l - 1)?;
+            for t in 0..n_tiles {
+                if let Some(st) = staged[t].take() {
+                    res[t] = stage_m(st, step - t)?;
+                }
             }
         }
-        let st = stage_x(&mut res_b, n_layers - 1, cache)?;
-        res_b = stage_m(st, n_layers - 1)?;
 
-        cache.keep_nextn(&res_a);
-        cache.keep_nextn(&res_b);
+        for r in &res {
+            cache.keep_nextn(r);
+        }
         // Only the last position feeds the head.
-        let last = res_b.narrow(1, seq_b - 1, 1)?;
+        let last_seq = seqs[n_tiles - 1];
+        let last = res[n_tiles - 1].narrow(1, last_seq - 1, 1)?;
         let (collapsed, _) = self.hc_head.mix(&last)?; // [1, 1, d]
-        cache.pos += seq_a + seq_b;
+        cache.pos += seqs.iter().sum::<usize>();
         let logits = self.lm_head.forward(&collapsed)?;
         logits
             .reshape((1, self.cfg.vocab_size))?
@@ -1601,6 +1670,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // the pass.
         let probe = super::moe::hint_recall_probe();
         let mut predicted: Vec<(usize, usize, Tensor)> = Vec::new(); // (k, layer, ids)
+                                                                     // The decode hint (`decode_hint_on`, the host plan only): layer
+                                                                     // l+2's router on the carry entering layer l — 56 % of its experts
+                                                                     // (P27) — its ids' readback staged before this layer's own plan
+                                                                     // readback drains the queue, finished after it (the marker is past),
+                                                                     // and handed to layer l+2's prefetcher: its misses read during
+                                                                     // layers l+1 and l+2's mixer, landed at l+2's resolve.
+        let hint = decode_hint_on() && !device_plan;
         for (l, layer) in self.layers.iter().enumerate() {
             if probe {
                 for k in 0..4 {
@@ -1609,6 +1685,24 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     }
                 }
             }
+            #[cfg(feature = "metal")]
+            let staged_hint = if hint && l + 2 < self.layers.len() {
+                match self.hint_encode(l + 2, &res_hc)? {
+                    // Deferred: the layer's own plan readback drains the
+                    // queue past this blit, so no cut of its own (a cut is
+                    // a residency commit on the per-buffer arm, ~0.7 ms —
+                    // 46 a token undid the hint's gain, P27).
+                    Some((target, ids)) if ids.device().is_metal() => Some((
+                        target,
+                        lloom_tensor::metal_backend::stage_readback_deferred(&ids)?,
+                    )),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            #[cfg(not(feature = "metal"))]
+            let _ = hint;
             // The N-gram PLE adds to the carry at the start of its layer.
             if let Some(ple) = &self.ple {
                 if ple.layer == l {
@@ -1628,6 +1722,16 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 layer.decode_parts_planned(&res_hc, l, cache, device_plan)?;
             if let Some(r) = record {
                 records.push((l, r));
+            }
+            #[cfg(feature = "metal")]
+            if let Some((target, st)) = staged_hint {
+                let ids: Vec<u32> = st.finish()?;
+                // The named ten alone: the prefill hint's fill from the
+                // usage profile (up to the pool) is 300 reads a layer a
+                // token here — measured 167 000 wasted over 64 tokens and
+                // the decode 35 % slower (P27).
+                self.layers[target].moe().experts().prefetch_named(&ids)?;
+                DECODE_HINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if watch {
                 watched.push(nonfinite_probe(&mixed)?);

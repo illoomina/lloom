@@ -170,7 +170,11 @@ impl StagedMetalRead {
 /// issued after the other tile's work would wait for that work too.
 pub struct StagedReadback {
     buffer: Arc<PooledBuffer>,
-    marker: CommandMarker,
+    /// `None` for a deferred stage (`stage_readback_deferred`): the blit is
+    /// encoded and NOT committed; `finish` reads with no wait, on the
+    /// caller's word that a drain (`flush_and_wait_current`, a plain
+    /// readback) has run between.
+    marker: Option<CommandMarker>,
     count: usize,
     device: MetalDevice,
 }
@@ -178,13 +182,28 @@ pub struct StagedReadback {
 impl StagedReadback {
     /// Wait for the blit's command buffer and read the copy.
     pub fn finish<T: Clone>(self) -> Result<Vec<T>> {
-        self.device.wait_marker(&self.marker)?;
+        if let Some(marker) = &self.marker {
+            self.device.wait_marker(marker)?;
+        }
         Ok(read_to_vec(&self.buffer, self.count))
     }
 }
 
+/// [`stage_readback`] without the commit: the blit rides the open command
+/// buffer and `finish` waits for nothing — for a caller whose own later
+/// readback drains the queue anyway (the host plan's, at decode), so the
+/// stage costs no command-buffer cut. The caller's obligation: that drain
+/// runs before `finish`.
+pub fn stage_readback_deferred(t: &crate::Tensor) -> Result<StagedReadback> {
+    stage_readback_with(t, false)
+}
+
 /// Stage the readback of a contiguous Metal tensor (`StagedReadback`).
 pub fn stage_readback(t: &crate::Tensor) -> Result<StagedReadback> {
+    stage_readback_with(t, true)
+}
+
+fn stage_readback_with(t: &crate::Tensor, commit: bool) -> Result<StagedReadback> {
     let (storage, layout) = t.storage_and_layout();
     let m = match &*storage {
         crate::Storage::Metal(m) => m,
@@ -207,7 +226,11 @@ pub fn stage_readback(t: &crate::Tensor) -> Result<StagedReadback> {
         blit.set_label("staged_readback");
         blit.copy_from_buffer(&m.buffer, layout.start_offset() * elem, &buffer, 0, size);
     }
-    let marker = m.device.flush_marker()?;
+    let marker = if commit {
+        Some(m.device.flush_marker()?)
+    } else {
+        None
+    };
     Ok(StagedReadback {
         buffer,
         marker,

@@ -5,7 +5,8 @@
 
 use lloom::models::qwen4exp::testing;
 use lloom::models::qwen4exp::{
-    set_prefill_chunk, set_prefill_pair, Config, Qwen4Exp, Streamed, PREFILL_CHUNK,
+    set_prefill_chunk, set_prefill_pair, set_prefill_tiles, Config, Qwen4Exp, Streamed,
+    DEFAULT_PREFILL_TILES, PREFILL_CHUNK,
 };
 use lloom::nn::expert_stream::{ExpertSource, LoaderArm};
 use lloom::nn::model::CausalLM;
@@ -250,6 +251,12 @@ fn paired_prefill_matches_chunk_after_chunk_on_metal() -> Result<()> {
     };
     let single = run_with(false)?;
     let paired = run_with(true)?;
+    // Three tiles of 2 over the same 8 tokens: (2, 2, 2) pipelined, then 2.
+    set_prefill_chunk(2);
+    set_prefill_tiles(3);
+    let three = run_with(true)?;
+    set_prefill_tiles(DEFAULT_PREFILL_TILES);
+    let three_single = run_with(false)?;
     set_prefill_chunk(PREFILL_CHUNK);
     set_prefill_pair(lloom::models::qwen4exp::DEFAULT_PREFILL_PAIR);
     assert!(single[0].iter().any(|v| v.abs() > 1e-6));
@@ -257,6 +264,12 @@ fn paired_prefill_matches_chunk_after_chunk_on_metal() -> Result<()> {
         assert!(
             a == b,
             "paired prefill: logits row {i} differs from chunk after chunk"
+        );
+    }
+    for (i, (a, b)) in three_single.iter().zip(&three).enumerate() {
+        assert!(
+            a == b,
+            "three-tile prefill: logits row {i} differs from chunk after chunk"
         );
     }
     std::fs::remove_file(&path).ok();

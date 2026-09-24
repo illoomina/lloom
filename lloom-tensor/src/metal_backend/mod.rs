@@ -215,13 +215,48 @@ fn stage_readback_with(t: &crate::Tensor, commit: bool) -> Result<StagedReadback
     let count = layout.shape().elem_count();
     let elem = m.dtype.size_in_bytes();
     let size = count * elem;
-    let buffer = m
-        .device
-        .new_buffer_builder()
-        .with_size(size.max(1))
-        .with_label("staged_readback_dst")
-        .build()?;
-    {
+    // The copy's destination is read by the host, never by a later
+    // dispatch: outside any pass plan (§9.2aa).
+    let buffer = {
+        let _escape = EscapeGuard::new();
+        m.device
+            .new_buffer_builder()
+            .with_size(size.max(1))
+            .with_label("staged_readback_dst")
+            .build()?
+    };
+    if m.device.base_mode() {
+        // Under a pass plan a blit is outside the compute barrier chain
+        // (`pass-plan-design.md` §9): the copy is a compute kernel, ordered
+        // like any dispatch.
+        let kernel_name = match m.dtype {
+            DType::F32 => crate::kernels::copy2d::FLOAT,
+            DType::F16 => crate::kernels::copy2d::HALF,
+            DType::BF16 => crate::kernels::copy2d::BFLOAT,
+            DType::I64 => crate::kernels::copy2d::I64,
+            DType::I32 => crate::kernels::copy2d::I32,
+            DType::I16 => crate::kernels::copy2d::I16,
+            DType::U32 => crate::kernels::copy2d::U32,
+            DType::U8 => crate::kernels::copy2d::U8,
+            dtype => crate::bail!("stage_readback: Metal copy2d {dtype:?} not implemented"),
+        };
+        let encoder = m.device.command_encoder()?;
+        crate::kernels::call_copy2d(
+            &m.device.device,
+            &encoder,
+            &m.device.kernels,
+            kernel_name,
+            &m.buffer,
+            &buffer,
+            1,
+            count,
+            count,
+            count,
+            layout.start_offset() * elem,
+            0,
+        )
+        .map_err(MetalError::from)?;
+    } else {
         let mut blit = m.device.blit_command_encoder()?;
         blit.set_label("staged_readback");
         blit.copy_from_buffer(&m.buffer, layout.start_offset() * elem, &buffer, 0, size);
@@ -2772,13 +2807,47 @@ impl MetalStorage {
         }
         TO_CPU_BLIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        let buffer = self
-            .device
-            .new_buffer_builder()
-            .with_size(size)
-            .with_label("blit_to_cpu_dst")
-            .build()?;
-        {
+        // The copy's destination is the host's, never a later dispatch's:
+        // outside any pass plan.
+        let buffer = {
+            let _escape = EscapeGuard::new();
+            self.device
+                .new_buffer_builder()
+                .with_size(size)
+                .with_label("blit_to_cpu_dst")
+                .build()?
+        };
+        if self.device.base_mode() {
+            // Under a pass plan a blit is outside the compute barrier chain
+            // (`pass-plan-design.md` §9): the copy is a compute kernel.
+            let kernel_name = match self.dtype {
+                DType::F32 => crate::kernels::copy2d::FLOAT,
+                DType::F16 => crate::kernels::copy2d::HALF,
+                DType::BF16 => crate::kernels::copy2d::BFLOAT,
+                DType::I64 => crate::kernels::copy2d::I64,
+                DType::I32 => crate::kernels::copy2d::I32,
+                DType::I16 => crate::kernels::copy2d::I16,
+                DType::U32 => crate::kernels::copy2d::U32,
+                DType::U8 => crate::kernels::copy2d::U8,
+                dtype => crate::bail!("to_cpu: Metal copy2d {dtype:?} not implemented"),
+            };
+            let encoder = self.device.command_encoder()?;
+            crate::kernels::call_copy2d(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                kernel_name,
+                &self.buffer,
+                &buffer,
+                1,
+                self.count,
+                self.count,
+                self.count,
+                0,
+                0,
+            )
+            .map_err(MetalError::from)?;
+        } else {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
             blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, size);

@@ -873,6 +873,30 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         Ok(Some((layer, l.moe().route_ids(&cur)?)))
     }
 
+    /// Open a planned pass for `shape` (`DESIGN.md` §9.2aa: the pass's
+    /// activations served by ordinal from one base, no allocation on a
+    /// cached key) — when the device has pass plans enabled and no driver
+    /// holds a pass already. Returns whether this call opened it.
+    fn open_pass(&self, shape: crate::nn::decode::PassShape) -> Result<bool> {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = self.device().as_metal_device() {
+            if !m.pass_plans_enabled() || m.pass_open() {
+                return Ok(false);
+            }
+            crate::nn::decode::begin_pass(&self.device(), shape)?;
+            return Ok(true);
+        }
+        let _ = shape;
+        Ok(false)
+    }
+
+    fn close_pass(&self, opened: bool) -> Result<()> {
+        if opened {
+            crate::nn::decode::end_pass(&self.device())?;
+        }
+        Ok(())
+    }
+
     /// Decode hints handed to the prefetchers so far (the process).
     pub fn decode_hints() -> u64 {
         DECODE_HINTS.load(std::sync::atomic::Ordering::Relaxed)
@@ -975,8 +999,26 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if seq == 0 || cache.prepared == Some((cache.pos, seq)) {
             return Ok(());
         }
-        let plan = self.plan_pass(cache, seq);
+        let mut plan = self.plan_pass(cache, seq);
         cache.prepared = Some((cache.pos, seq));
+        // A pass a cached plan serves allocates its activations from the
+        // base, which is already allocated and counted: it owes no transient.
+        #[cfg(feature = "metal")]
+        if seq > 1 {
+            if let Ok(m) = self.device().as_metal_device() {
+                if m.pass_plans_enabled() {
+                    let key = lloom_tensor::metal_backend::PassKey::new(
+                        lloom_tensor::metal_backend::PassKind::Prefill {
+                            w: seq.min(u32::MAX as usize) as u32,
+                            fresh: cache.pos == 0,
+                        },
+                    );
+                    if m.pass_plan_cached(&key) {
+                        plan.transient = 0;
+                    }
+                }
+            }
+        }
         if plan.bytes() == 0 || self.mem_check == MemCheck::Off || self.memory_fraction <= 0.0 {
             return Ok(());
         }
@@ -1342,7 +1384,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                         }
                         let total: usize = lens.iter().sum();
                         self.prepare_pass_inner(cache, total)?;
+                        let bracket = self.open_pass(crate::nn::decode::PassShape::Prefill {
+                            w: total,
+                            fresh: cache.pos == 0,
+                        })?;
                         logits = Some(self.prefill_embeds_pipelined(&tiles, cache)?);
+                        self.close_pass(bracket)?;
                         start += total;
                         continue;
                     }
@@ -1353,7 +1400,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     logits = Some(if len == 1 {
                         self.decode_embed(&h, cache, obs)?
                     } else {
-                        self.prefill_embeds(&h, cache, obs)?
+                        let bracket = self.open_pass(crate::nn::decode::PassShape::Prefill {
+                            w: len,
+                            fresh: cache.pos == 0,
+                        })?;
+                        let l = self.prefill_embeds(&h, cache, obs)?;
+                        self.close_pass(bracket)?;
+                        l
                     });
                     start += len;
                 }
@@ -1655,6 +1708,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
         let mut records: Vec<(usize, Tensor)> = Vec::new();
+        let bracket = self.open_pass(crate::nn::decode::PassShape::Decode { b: 1 })?;
 
         // broadcast the embedding into the n-stream HC carry `res_hc [1, 1, n*d]`.
         // The reference inits the streams from the embed broadcast across n.
@@ -1745,6 +1799,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
         }
         cache.keep_nextn(&res_hc);
+        self.close_pass(bracket)?;
         if probe && !predicted.is_empty() {
             let mut tally = self.hint_recall.lock();
             for (k, target, pred) in predicted {

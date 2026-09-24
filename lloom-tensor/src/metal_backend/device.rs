@@ -533,7 +533,7 @@ impl std::ops::Deref for MetalDevice {
 /// allocated (`MetalDevice::new_buffer_with_data`): every per-step argument
 /// block, chunk table and slot list is well under it; a prompt of thousands of
 /// ids or a weight staging buffer is not.
-pub const SMALL_UPLOAD_BYTES: usize = 16 * 1024;
+pub const SMALL_UPLOAD_BYTES: usize = 32 * 1024;
 
 /// Device buffers keyed by their contents (`MetalDevice::constant_buffer`).
 ///
@@ -1669,6 +1669,16 @@ impl MetalDevice {
         self.pass_plans.lock().is_some()
     }
 
+    /// Whether a plan for `key` is cached: the pass will be served from the
+    /// base, allocating none of its activations (its admission owes no
+    /// transient).
+    pub fn pass_plan_cached(&self, key: &PassKey) -> bool {
+        self.pass_plans
+            .lock()
+            .as_ref()
+            .is_some_and(|pp| pp.plans.contains_key(key))
+    }
+
     /// How many `Ragged` plans the cache keeps (default 32); beyond it the
     /// oldest is dropped and counted (`PassPlanCounters::capped`). The other
     /// kinds are bounded by the configuration (one `Decode{B}` per B, one
@@ -1744,6 +1754,16 @@ impl MetalDevice {
     /// served from the base; on a key's first sight, and on the pass after
     /// it, the pass runs on the pool under the recorder. Falls back to
     /// [`Self::begin_decode_step`] when the cache is off.
+    /// Whether a planned pass is open (`begin_pass` without its
+    /// `finish_pass`): a model that brackets its own passes skips the
+    /// bracket when a driver already holds one.
+    pub fn pass_open(&self) -> bool {
+        self.pass_plans
+            .lock()
+            .as_ref()
+            .is_some_and(|pp| pp.current.is_some())
+    }
+
     pub fn begin_pass(&self, key: PassKey) -> Result<()> {
         let mut g = self.pass_plans.lock();
         let Some(pp) = g.as_mut() else {
@@ -1826,6 +1846,12 @@ impl MetalDevice {
         };
         self.pass_state
             .fetch_and(!0b10, std::sync::atomic::Ordering::Relaxed);
+        // A plan closed this pass: the recording pass's transients sit in
+        // the pool's free list while the base now holds the pass's shape —
+        // trimmed after the lock, or a budget that admitted one copy of the
+        // transient carries two (measured: the served second prefill
+        // refused at 36.62 GB against 36.18, #749 P28).
+        let mut closed_a_plan = false;
         match state {
             PassState::Served(key) => {
                 self.end_decode_step();
@@ -1843,6 +1869,7 @@ impl MetalDevice {
             PassState::Recording { key, closes } => {
                 if let Some(closes) = closes {
                     Self::close_pending(self, pp, closes)?;
+                    closed_a_plan = true;
                 }
                 if pp.plans.contains_key(&key) {
                     // The key it closed was its own (two sightings back to
@@ -1857,9 +1884,14 @@ impl MetalDevice {
             }
             PassState::Observing { closes } => {
                 Self::close_pending(self, pp, closes)?;
+                closed_a_plan = true;
                 pp.pending = None;
                 self.finish_arena_recording(pp.layout);
             }
+        }
+        drop(g);
+        if closed_a_plan {
+            self.trim_unused_buffers();
         }
         Ok(())
     }

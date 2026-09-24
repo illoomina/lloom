@@ -202,6 +202,13 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     pin: usize,
 
+    /// Planned passes (DESIGN.md §9.2aa): every prefill tile and decode
+    /// step keyed by shape, its activations served from one base after a
+    /// first recorded sight — the streamed tier's and the routed GEMMs'
+    /// allocations declared escapes. Prints `[pass plans: …]` at exit.
+    #[arg(long)]
+    pass_plans: bool,
+
     /// How the prompt is run: `chunk` (Kernel B + chunk attention, the
     /// reference prefill graph) or `replay` (the decode recurrence one position
     /// at a time, #747's path).
@@ -376,6 +383,48 @@ fn mem_line(run: usize, phase: &str, device: &Device, report: Option<MemReport>)
         }
     }
     println!("{line}");
+}
+
+/// The pass plans' report (lfm2-chat's line) and the pools' churn.
+fn report_pass_plans(device: &Device) {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(dev) = device {
+        let (shared, private) = dev.pool_counters();
+        println!(
+            "POOLS shared_lookups={} shared_hits={} private_lookups={} private_hits={}",
+            shared.lookups, shared.hits, private.lookups, private.hits
+        );
+        if let (Some(c), Some((keys, base))) = (dev.pass_plan_counters(), dev.pass_plan_report()) {
+            let keys: Vec<String> = keys
+                .iter()
+                .map(|(k, covered, total, escapes)| {
+                    if *escapes > 0 {
+                        format!(
+                            "{:?}={covered}/{total}(+{escapes} escaped {:?})",
+                            k.kind,
+                            dev.pass_plan_escapes(k)
+                        )
+                    } else {
+                        format!("{:?}={covered}/{total}", k.kind)
+                    }
+                })
+                .collect();
+            println!(
+                "PASSPLANS served={} recorded={} observed={} plans={} evicted={} escapes={} capped={} base_grows={} base_mib={:.1} keys=[{}]",
+                c.served,
+                c.recorded,
+                c.observed,
+                c.plans,
+                c.evicted,
+                c.escapes,
+                c.capped,
+                c.base_grows,
+                base as f64 / (1024.0 * 1024.0),
+                keys.join(" ")
+            );
+        }
+    }
+    let _ = device;
 }
 
 fn mem_check_arm(args: &Args) -> Result<MemCheck> {
@@ -631,6 +680,12 @@ fn main() -> Result<()> {
             }
         }
         "stream" => {
+            #[cfg(feature = "metal")]
+            if args.pass_plans {
+                if let Device::Metal(m) = &device {
+                    m.enable_pass_plans(candle::metal_backend::ArenaLayout::Packed);
+                }
+            }
             let slots = match args.slots.as_str() {
                 "auto" => SlotBudget::Auto {
                     fraction: args.memory_fraction,
@@ -1027,6 +1082,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
                 pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
             );
+            report_pass_plans(device);
             let dh = lloom::models::qwen4exp::Qwen4Exp::<lloom::models::qwen4exp::Streamed>::decode_hints();
             if dh > 0 {
                 println!("DECODEHINT run={run} hints={dh}");

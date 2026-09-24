@@ -187,6 +187,13 @@ impl Drop for EscapeGuard {
 /// Report that a dispatch was encoded, advancing the position intervals live in.
 #[inline]
 pub fn note_dispatch() {
+    // A dispatch under an escape guard is a declared outsider's (a streamed
+    // expert's landing copy, whose count is the pool's state, not the pass
+    // shape's): it takes no position, so a pass whose outsiders vary is
+    // not a drift (#749 P28).
+    if ESCAPING.load(Ordering::Relaxed) > 0 {
+        return;
+    }
     if DISPATCH_COUNTING.load(Ordering::Relaxed) {
         STEP_DISPATCH.fetch_add(1, Ordering::Relaxed);
     }

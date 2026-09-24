@@ -1023,6 +1023,7 @@ impl Streamed {
     /// past the free slots; already-resident experts are skipped. Returns
     /// the experts loaded.
     pub fn warm(&self, experts: &[u32]) -> Result<usize> {
+        let _escape = escape_guard();
         let mut inner = self.inner.lock();
         let mut take: Vec<u32> = Vec::new();
         let mut free = inner.map.free_slots();
@@ -1626,6 +1627,17 @@ pub fn pread_direct_on() -> bool {
     })
 }
 
+/// An escape guard while the streamed tier allocates (Metal): the pool
+/// serves it, no pass plan records or serves it. Nothing elsewhere.
+#[cfg(feature = "metal")]
+fn escape_guard() -> Option<lloom_tensor::metal_backend::EscapeGuard> {
+    Some(lloom_tensor::metal_backend::EscapeGuard::new())
+}
+#[cfg(not(feature = "metal"))]
+fn escape_guard() -> Option<()> {
+    None
+}
+
 impl Inner {
     /// Epochs the pool clock shows complete (`u64::MAX` off Metal: nothing
     /// to wait for).
@@ -1940,6 +1952,7 @@ impl ExpertResidency for Streamed {
     }
 
     fn plan_device(&self, ids: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+        let _escape = escape_guard();
         let (rows, topk) = ids.dims2()?;
         let n = rows * topk;
         let ids = ids.flatten_all()?.contiguous()?;
@@ -1963,6 +1976,7 @@ impl ExpertResidency for Streamed {
     }
 
     fn settle(&self, record: &Tensor) -> Result<bool> {
+        let _escape = escape_guard();
         let v: Vec<u32> = record.flatten_all()?.to_vec1()?;
         if !v.len().is_multiple_of(3) {
             lloom_tensor::bail!("settle: a plan record is [3·n], got {}", v.len())
@@ -2033,6 +2047,9 @@ impl ExpertResidency for Streamed {
     }
 
     fn ensure(&self, group: &RoutedGroup) -> Result<Tensor> {
+        // What the tier allocates depends on the pool's state, not the
+        // pass's shape: declared outside any pass plan (§9.2aa).
+        let _escape = escape_guard();
         let (ids, topk) = match &group.ids {
             GroupIds::Host { ids, topk } => (ids, *topk),
             GroupIds::Device(_) => lloom_tensor::bail!("Streamed::ensure: a device-planned group"),

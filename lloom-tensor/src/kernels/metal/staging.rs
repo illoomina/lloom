@@ -97,6 +97,8 @@ impl StagingRing {
         device: &MetalDevice,
         len: usize,
     ) -> Result<(Option<usize>, Arc<PooledBuffer>)> {
+        // A ring entry is the tier's, not a pass's: outside any pass plan.
+        let _escape = super::arena::EscapeGuard::new();
         self.overflow.retain(|e| !self.clock.is_complete(e.epoch));
         let n = self.entries.len();
         for i in 0..n {

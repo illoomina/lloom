@@ -275,6 +275,7 @@ impl<R: ExpertResidency> MoeLayer<R> {
 
     /// The routed experts over one device-resolved group of slot ids.
     fn routed_one_group(&self, x3: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
+        let _escape = escape_guard();
         let (g, u) = self.experts.gate_up(x3, slot_ids)?;
         let h = match super::kernels::silu_mul(&g, &u) {
             Some(h) => h?,
@@ -287,6 +288,10 @@ impl<R: ExpertResidency> MoeLayer<R> {
     /// misses loaded) as the pass reaches it, the later groups' misses
     /// prefetched while it runs.
     fn routed_groups(&self, x3: &Tensor, groups: &[RoutedGroup]) -> Result<Tensor> {
+        // The routed GEMMs' outputs are sized by the plan's groups, which
+        // the pool's state decides: not a pass-shape allocation, so
+        // declared outside the plan (§9.2aa) and served by the pool.
+        let _escape = escape_guard();
         let mut ys = Vec::with_capacity(groups.len());
         for (gi, group) in groups.iter().enumerate() {
             let slot_ids = self.experts.ensure(group)?;
@@ -342,6 +347,15 @@ impl<R: ExpertResidency> MoeLayer<R> {
         };
         out.reshape((r.b0, r.seq0, hidden))
     }
+}
+
+#[cfg(feature = "metal")]
+fn escape_guard() -> Option<lloom_tensor::metal_backend::EscapeGuard> {
+    Some(lloom_tensor::metal_backend::EscapeGuard::new())
+}
+#[cfg(not(feature = "metal"))]
+fn escape_guard() -> Option<()> {
+    None
 }
 
 /// `QWEN4EXP_HINT_RECALL=1` (read once): score the residual-speculation

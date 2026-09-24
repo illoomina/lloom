@@ -118,11 +118,28 @@ fn blocks_at_rows_1_and_4() {
         let mut s: Vec<(RecurrentState, RecurrentState)> = (0..rows)
             .map(|_| (RecurrentState::new(1), RecurrentState::new(1)))
             .collect();
+        // Under `CANDLE_METAL_PROFILE=1 CANDLE_METAL_NODES_PER_CB=1` every
+        // dispatch is its own command buffer, so the profiler's per-label
+        // GPU time is per kernel: the step's three kernels apart from the
+        // block's stems (P29 (6)).
+        lloom_tensor::kernels::metal::profile::reset();
         let t_dn = time(&dev, steps, || {
             let mut st: Vec<(&mut RecurrentState, &mut RecurrentState)> =
                 s.iter_mut().map(|(a, b)| (a, b)).collect();
             let _ = dn.decode_rows(&xin, 0, &mut st).unwrap();
         });
+        if lloom_tensor::kernels::metal::profile::enabled() {
+            for k in lloom_tensor::kernels::metal::profile::gpu_time_by_label_detailed() {
+                if k.label.contains("gdn") || k.label.contains("mul_mv") {
+                    println!(
+                        "DNKERNEL rows={rows} {} buffers={} us_per_step={:.1}",
+                        k.label,
+                        k.buffers,
+                        k.total_s * 1e6 / (steps + 3) as f64
+                    );
+                }
+            }
+        }
         let mut kvs: Vec<KvCache> = (0..rows).map(|_| KvCache::default()).collect();
         for _ in 0..200 {
             let mut refs: Vec<&mut KvCache> = kvs.iter_mut().collect();

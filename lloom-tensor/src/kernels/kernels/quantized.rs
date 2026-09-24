@@ -273,8 +273,11 @@ pub(crate) fn iq_nsg(dtype: GgmlDType) -> usize {
             .unwrap_or(default)
     };
     match dtype {
-        GgmlDType::IQ2XS => *IQ2XS.get_or_init(|| read("LLOOM_QMV_IQ2XS_NSG", 2)),
-        GgmlDType::IQ4NL => *IQ4NL.get_or_init(|| read("LLOOM_QMV_IQ4NL_NSG", 2)),
+        // 4 by default (P30 (3)): on the warm census the routed gate|up read
+        // 97.6 → 90.3 µs and the down 75.0 → 66.3 against 2 (8 the same as
+        // 4, 1 slower); every arm byte-identical (the row mapping alone).
+        GgmlDType::IQ2XS => *IQ2XS.get_or_init(|| read("LLOOM_QMV_IQ2XS_NSG", 4)),
+        GgmlDType::IQ4NL => *IQ4NL.get_or_init(|| read("LLOOM_QMV_IQ4NL_NSG", 4)),
         _ => 2,
     }
 }

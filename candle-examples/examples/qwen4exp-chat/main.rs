@@ -940,6 +940,7 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         args.prefill_tile
     };
     println!("DRIVER arm=blocking prefill_tile={tile} lookahead=0");
+    let mut greedy_digest: Option<String> = None;
     for run in 0..args.runs {
         let cache: Cache = model.new_cache(&cfg, device)?;
         let mut session = Session::new(model, cache);
@@ -1005,6 +1006,72 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
                 s.device_plans,
                 s.settled_misses,
             );
+        }
+        greedy_digest = Some(digest);
+    }
+    // `--mtp <sidecar>`: the same prompt once more through the driver's
+    // speculative body (`Session::decode_speculative`, the DSpark seams:
+    // `MtpDrafter: Speculator`, `Qwen4Exp: Probes<NextnHidden>`), its
+    // tokens against the greedy run's (byte-identical is the gate).
+    if let Some(head) = model.mtp_head() {
+        use lloom::models::qwen4exp::MtpDrafter;
+        let pools = model.spec_pools(1, args.mtp_k, device);
+        let mut cache: Cache = Cache::in_pools(&cfg, &pools)?;
+        cache.want_nextn = true;
+        let mut session = Session::new(model, cache);
+        let mut drafter =
+            MtpDrafter::new(head, model.embed_tokens(), model.lm_head(), &cfg, device)
+                .with_k(args.mtp_k);
+        let mut rb = Blocking::new(eos_ids, device)?;
+        let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+        let opts = DecodeOptions {
+            prefill_tile: tile,
+            ..DecodeOptions::new(args.max_tokens)
+        };
+        #[cfg(feature = "metal")]
+        candle::kernels::metal::profile::reset();
+        let gauge = MemGauge::start(device, args.mem_sample);
+        let t2 = std::time::Instant::now();
+        let out = session.decode_speculative(
+            &mut drafter,
+            &mut rb,
+            &mut sampler,
+            prompt_ids,
+            &opts,
+            eos_ids,
+            &mut |_| Ok(()),
+        )?;
+        let mtp_ms = t2.elapsed().as_millis();
+        profile_line(0, "mtp", out.ids.len(), mtp_ms as f64);
+        mem_line(0, "mtp", device, Some(gauge.finish(device)));
+        let mut h = sha256::Sha256::new();
+        for t in &out.ids {
+            h.update(&t.to_le_bytes());
+        }
+        let mtp_digest = sha256::hex(&h.finalize());
+        let rounds = out.stats.rounds.len();
+        let accepted_drafts = out.stats.rounds.iter().filter(|r| r.accepted > 1).count();
+        let tokens: usize = out.stats.rounds.iter().map(|r| r.accepted).sum();
+        let same = greedy_digest.as_deref() == Some(mtp_digest.as_str());
+        let sum = |f: &dyn Fn(&lloom::nn::RoundTiming) -> u64| -> f64 {
+            out.stats.rounds.iter().map(|r| f(&r.timing)).sum::<u64>() as f64 / 1e6
+        };
+        let hist: Vec<usize> = (0..=drafter.k() + 1)
+            .map(|a| out.stats.rounds.iter().filter(|r| r.accepted == a).count())
+            .collect();
+        println!(
+            "MTP tokens_sha256={mtp_digest} identical_to_greedy={same} generated={} rounds={rounds} accepted_drafts={accepted_drafts} draft_accept_rate={:.4} tokens_per_round={:.3} drafter_rows={} wall_ms={mtp_ms} k={} draft_ms={:.1} verify_ms={:.1} observe_ms={:.1} accepted_hist={hist:?} driver=session-speculative",
+            out.ids.len(),
+            accepted_drafts as f64 / rounds.max(1) as f64,
+            tokens as f64 / rounds.max(1) as f64,
+            drafter.rows_seen(),
+            drafter.k(),
+            sum(&|t| t.draft_ns),
+            sum(&|t| t.verify_ns),
+            sum(&|t| t.observe_ns),
+        );
+        if !same {
+            anyhow::bail!("the MTP run's tokens differ from the greedy run's");
         }
     }
     Ok(())

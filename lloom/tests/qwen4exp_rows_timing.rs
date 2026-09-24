@@ -524,27 +524,44 @@ fn stem_mv_by_weight_kind() {
             QMatMul::Tensor(t) => t.elem_count() * 4,
         };
         let x = Tensor::randn(0f32, 1.0, (1, 1, inp), &dev).unwrap();
-        let iters = 16 * mats.len();
-        for m in &mats {
-            let _ = m.forward(&x).unwrap();
-        }
-        dev.synchronize().unwrap();
-        profile::reset();
-        let t = Instant::now();
-        for i in 0..iters {
+        // Warm the GPU's clock (~0.5 s of the same work; P30 (2): a cold
+        // burst read 40 % low), then five batches, the median and the min.
+        let warm = Instant::now();
+        let mut i = 0usize;
+        while warm.elapsed().as_secs_f64() < 0.5 {
             let _ = mats[i % mats.len()].forward(&x).unwrap();
+            i += 1;
+            if i % 64 == 0 {
+                dev.synchronize().unwrap();
+            }
         }
         dev.synchronize().unwrap();
-        let wall_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        let gpu_us = if profile::enabled() {
-            profile::snapshot().gpu_busy_union_s * 1e6 / iters as f64
-        } else {
-            f64::NAN
-        };
+        let iters = 32 * mats.len();
+        let mut gpu: Vec<f64> = Vec::new();
+        let mut wall: Vec<f64> = Vec::new();
+        for _ in 0..5 {
+            profile::reset();
+            let t = Instant::now();
+            for i in 0..iters {
+                let _ = mats[i % mats.len()].forward(&x).unwrap();
+            }
+            dev.synchronize().unwrap();
+            wall.push(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+            gpu.push(if profile::enabled() {
+                profile::snapshot().gpu_busy_union_s * 1e6 / iters as f64
+            } else {
+                f64::NAN
+            });
+        }
+        gpu.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        wall.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (gpu_us, gpu_min) = (gpu[gpu.len() / 2], gpu[0]);
+        let wall_us = wall[wall.len() / 2];
         println!(
-            "STEMMV stem={stem} kind={kind} shape=[{out}, {inp}] bytes={bytes} n={} wall_us={wall_us:.1} gpu_us={gpu_us:.1} gb_s={:.0}",
+            "STEMMV stem={stem} kind={kind} shape=[{out}, {inp}] bytes={bytes} n={} wall_us={wall_us:.1} gpu_us={gpu_us:.1} gpu_min_us={gpu_min:.1} gb_s={:.0} gb_s_at_min={:.0}",
             mats.len(),
-            bytes as f64 / gpu_us / 1e3
+            bytes as f64 / gpu_us / 1e3,
+            bytes as f64 / gpu_min / 1e3
         );
     }
 }
@@ -591,27 +608,49 @@ fn routed_mv_id_census() {
     ids_v.sort_unstable();
     let ids = Tensor::from_vec(ids_v, (1, topk), &dev).unwrap();
     println!("ROUTEDMV shard={path} kinds={} experts={} bytes/expert={}", tiers[0].1, tiers[0].2, tiers[0].3);
+    // The GPU's clock ramps under load: a short burst reads at a low clock
+    // and the census varied ±40 % run to run on a quiet machine (P30 (2)).
+    // So: ~1 s of the same work first, then five timed batches, the
+    // median and the min reported (the min is the clock's ceiling).
     let time = |name: &str, bytes: usize, f: &dyn Fn(usize)| {
-        for k in 0..tiers.len() {
-            f(k);
-        }
-        dev.synchronize().unwrap();
-        let iters = 32 * tiers.len();
-        profile::reset();
-        let t = Instant::now();
-        for i in 0..iters {
+        let warm = Instant::now();
+        let mut i = 0usize;
+        while warm.elapsed().as_secs_f64() < 1.0 {
             f(i % tiers.len());
+            i += 1;
+            if i % 64 == 0 {
+                dev.synchronize().unwrap();
+            }
         }
         dev.synchronize().unwrap();
-        let wall_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        let gpu_us = if profile::enabled() {
-            profile::snapshot().gpu_busy_union_s * 1e6 / iters as f64
-        } else {
-            f64::NAN
+        let iters = 64 * tiers.len();
+        let mut gpu: Vec<f64> = Vec::new();
+        let mut wall: Vec<f64> = Vec::new();
+        for _ in 0..5 {
+            profile::reset();
+            let t = Instant::now();
+            for i in 0..iters {
+                f(i % tiers.len());
+            }
+            dev.synchronize().unwrap();
+            wall.push(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+            gpu.push(if profile::enabled() {
+                profile::snapshot().gpu_busy_union_s * 1e6 / iters as f64
+            } else {
+                f64::NAN
+            });
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
         };
+        let gpu_min = gpu.iter().cloned().fold(f64::INFINITY, f64::min);
+        let gpu_med = med(&mut gpu);
+        let wall_med = med(&mut wall);
         println!(
-            "ROUTEDMV {name} bytes_read={bytes} wall_us={wall_us:.1} gpu_us={gpu_us:.1} gb_s={:.0}",
-            bytes as f64 / gpu_us / 1e3
+            "ROUTEDMV {name} bytes_read={bytes} wall_us={wall_med:.1} gpu_us={gpu_med:.1} gpu_min_us={gpu_min:.1} gb_s={:.0} gb_s_at_min={:.0}",
+            bytes as f64 / gpu_med / 1e3,
+            bytes as f64 / gpu_min / 1e3
         );
     };
     let gu_bytes = tiers[0].4 * topk;

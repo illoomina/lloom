@@ -1,7 +1,7 @@
 use crate::kernels::utils::EncoderProvider;
 use crate::kernels::{
-    debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
-    Output, Source,
+    debug_group, set_params, Buffer, ComputeCommandEncoder, ConstantValues, Device, Kernels,
+    MetalKernelError, Output, Source, Value,
 };
 use objc2_metal::MTLSize;
 
@@ -221,17 +221,24 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
         // `align`) makes threadgroups whose rows are all past `ne01`; the cores
         // guard their stores, but the routed dispatch has `batch * topk` planes
         // and wasted threadgroups per plane are wasted per plane.
-        GgmlDType::IQ2XXS
-        | GgmlDType::IQ2XS
-        | GgmlDType::IQ2S
-        | GgmlDType::IQ3XXS
-        | GgmlDType::IQ3S => {
+        // IQ2_XS and IQ4_NL: 8 simdgroups a threadgroup (`NSG_IQ2XS`,
+        // `NSG_IQ4NL` in the kernel), 32 and 16 rows: the per-threadgroup
+        // table staging amortised over four times the rows (#749 P29 (5)).
+        GgmlDType::IQ2XS => {
+            let nsg = iq_nsg(dtype);
+            (4, 8 * nsg, 4 * nsg)
+        }
+        GgmlDType::IQ4NL => {
+            let nsg = iq_nsg(dtype);
+            (4, 8 * nsg, 2 * nsg)
+        }
+        GgmlDType::IQ2XXS | GgmlDType::IQ2S | GgmlDType::IQ3XXS | GgmlDType::IQ3S => {
             let nth0 = 4;
             let nth1 = 16;
             let align = 8;
             (nth0, nth1, align)
         }
-        GgmlDType::IQ4NL | GgmlDType::IQ4XS => {
+        GgmlDType::IQ4XS => {
             let nth0 = 4;
             let nth1 = 16;
             let align = 4;
@@ -245,6 +252,39 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
             let align = 16;
             (nth0, nth1, align)
         }
+    }
+}
+
+/// Simdgroups a threadgroup of the IQ2_XS / IQ4_NL matvec cores
+/// (`LLOOM_QMV_IQ2XS_NSG`, `LLOOM_QMV_IQ4NL_NSG`, read once; 1..16): the
+/// per-threadgroup table staging amortised over more rows against fewer
+/// threadgroups in flight (#749 P29 (5)). The kernel takes it as a function
+/// constant (`NSG_IQ2XS_FC` / `NSG_IQ4NL_FC`); the default is the
+/// incumbent 2.
+pub(crate) fn iq_nsg(dtype: GgmlDType) -> usize {
+    static IQ2XS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static IQ4NL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let read = |var: &str, default: usize| {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=16).contains(n))
+            .unwrap_or(default)
+    };
+    match dtype {
+        GgmlDType::IQ2XS => *IQ2XS.get_or_init(|| read("LLOOM_QMV_IQ2XS_NSG", 2)),
+        GgmlDType::IQ4NL => *IQ4NL.get_or_init(|| read("LLOOM_QMV_IQ4NL_NSG", 2)),
+        _ => 2,
+    }
+}
+
+/// The function constants a matvec pipeline of `dtype` is loaded with:
+/// the simdgroup count for the IQ2_XS / IQ4_NL cores, none elsewhere.
+fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
+    match dtype {
+        GgmlDType::IQ2XS => Some(ConstantValues::new(vec![(910, Value::USize(iq_nsg(dtype)))])),
+        GgmlDType::IQ4NL => Some(ConstantValues::new(vec![(911, Value::USize(iq_nsg(dtype)))])),
+        _ => None,
     }
 }
 
@@ -423,7 +463,7 @@ pub fn call_quantized_matmul_mv_t(
 
     let iq_shared = needs_iq_shared(dtype);
 
-    let pipeline = kernels.load_pipeline(device, Source::Quantized, name.clone())?;
+    let pipeline = kernels.load_pipeline_with_constants(device, Source::Quantized, name.clone(), mv_constants(dtype))?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -588,7 +628,7 @@ pub fn call_quantized_matmul_mv_id_t(
         depth: 1,
     };
 
-    let pipeline = kernels.load_pipeline(device, Source::Quantized, name.clone())?;
+    let pipeline = kernels.load_pipeline_with_constants(device, Source::Quantized, name.clone(), mv_constants(dtype))?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);

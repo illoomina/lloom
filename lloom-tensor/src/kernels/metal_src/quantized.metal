@@ -2366,6 +2366,17 @@ inline float block_q_n_dot_y(device const block_q2_0 * qb_curr, float sumy, thre
 
 // putting them in the kernel cause a significant performance penalty
 #define N_DST 4        // each SIMD group works on 4 rows
+// Simdgroups a threadgroup of the IQ2_XS and IQ4_NL matvec cores, a
+// function constant the host sets from `LLOOM_QMV_IQ2XS_NSG` /
+// `LLOOM_QMV_IQ4NL_NSG` (#749 P29 (5)); 2 — the incumbent — when the
+// pipeline is loaded without it. The host's threadgroup is 32·NSG threads
+// and its rows per threadgroup N_DST·NSG / 2·NSG.
+constant ulong NSG_IQ2XS_FC [[function_constant(910)]];
+constant ulong NSG_IQ4NL_FC [[function_constant(911)]];
+constant bool NSG_IQ2XS_SET = is_function_constant_defined(NSG_IQ2XS_FC);
+constant bool NSG_IQ4NL_SET = is_function_constant_defined(NSG_IQ4NL_FC);
+#define NSG_IQ2XS (NSG_IQ2XS_SET ? (int)NSG_IQ2XS_FC : 2)
+#define NSG_IQ4NL (NSG_IQ4NL_SET ? (int)NSG_IQ4NL_FC : 2)
 #define N_SIMDGROUP 2  // number of SIMD groups in a thread group
 //Note: This is a template, but strictly speaking it only applies to
 //      quantizations where the block size is 32. It also does not
@@ -5811,7 +5822,12 @@ void kernel_mul_mv_iq2_xs_impl(
     const int r1 = tgpig.y;
     const int im = tgpig.z;
 
-    const int first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST;
+    // NSG_IQ2XS simdgroups a threadgroup (the host dispatches 32·NSG_IQ2XS
+    // threads and N_DST·NSG_IQ2XS rows): the grid table staged below is
+    // copied once per threadgroup, and at K = 2560 (80 sub-blocks, 2–3 a
+    // lane) that copy and its barrier were a threadgroup's whole cost at 8
+    // rows (#749 P29 (5): the routed experts' gate|up at 58 GB/s).
+    const int first_row = (r0 * NSG_IQ2XS + sgitg) * N_DST;
     const int ib_row = first_row * nb;
 
     const uint i12 = im%ne12;
@@ -5830,12 +5846,11 @@ void kernel_mul_mv_iq2_xs_impl(
     threadgroup uint64_t * values = (threadgroup uint64_t *)shared_values;
     threadgroup uint8_t  * shared_signs = (threadgroup uint8_t *)(values + 512);
     {
-        int nval = 8;
-        int pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) values[pos + i] = iq2xs_grid[pos + i];
-        nval = 2;
-        pos  = (32*sgitg + tiisg)*nval;
-        for (int i = 0; i < nval; ++i) shared_signs[pos+i] = ksigns_iq2xs[pos+i];
+        // 512 grid entries and 128 signs over 32·NSG_IQ2XS threads.
+        const int tid = 32*sgitg + tiisg;
+        const int nthr = 32*NSG_IQ2XS;
+        for (int i = tid; i < 512; i += nthr) values[i] = iq2xs_grid[i];
+        for (int i = tid; i < 128; i += nthr) shared_signs[i] = ksigns_iq2xs[i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -6668,7 +6683,9 @@ void kernel_mul_mv_iq4_nl_impl(
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
-    const int first_row = (r0 * 2 + sgitg) * 2;
+    // NSG_IQ4NL simdgroups a threadgroup (the host dispatches 32·NSG_IQ4NL
+    // threads, 2·NSG_IQ4NL rows) — P29 (5), as the IQ2_XS core.
+    const int first_row = (r0 * NSG_IQ4NL + sgitg) * 2;
     const int ib_row = first_row * nb;
 
     const uint i12 = im%ne12;

@@ -193,9 +193,10 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
             (nth0, nth1, align)
         }
         GgmlDType::Q6K => {
+            // Two simdgroups a threadgroup, `q6k_nr0()` rows each (P29 (6)).
             let nth0 = 2;
             let nth1 = 32;
-            let align = 2;
+            let align = 2 * q6k_nr0();
             (nth0, nth1, align)
         }
         // The dense-weight template (`kernel_mul_mv_impl`, f32 / f16): one
@@ -278,12 +279,33 @@ pub(crate) fn iq_nsg(dtype: GgmlDType) -> usize {
     }
 }
 
+/// Rows a simdgroup of the Q6_K matvec core (`LLOOM_QMV_Q6K_NR0`, read
+/// once; 1..4): ggml master's core takes 2, the port took 1 (P29 (6)). The
+/// kernel takes it as a function constant (`NR0_Q6K_FC`). **The default is
+/// 2**: the checkpoint's Q6_K stems at K = 2560 read 200 → 116–141 µs and
+/// at K = 6144 90 → 50 (the census), the decode −1.3 % on a rotation;
+/// the contraction differs from the one-row core's at the last bits, so
+/// the logits digest moves (Paris `054a6ef1…` → `5f5ddb57…`, the tokens
+/// unmoved); `1` is the incumbent arm.
+pub(crate) fn q6k_nr0() -> usize {
+    static NR0: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *NR0.get_or_init(|| {
+        std::env::var("LLOOM_QMV_Q6K_NR0")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=4).contains(n))
+            .unwrap_or(2)
+    })
+}
+
 /// The function constants a matvec pipeline of `dtype` is loaded with:
-/// the simdgroup count for the IQ2_XS / IQ4_NL cores, none elsewhere.
+/// the simdgroup count for the IQ2_XS / IQ4_NL cores, the rows a simdgroup
+/// for Q6_K, none elsewhere.
 fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
     match dtype {
         GgmlDType::IQ2XS => Some(ConstantValues::new(vec![(910, Value::USize(iq_nsg(dtype)))])),
         GgmlDType::IQ4NL => Some(ConstantValues::new(vec![(911, Value::USize(iq_nsg(dtype)))])),
+        GgmlDType::Q6K => Some(ConstantValues::new(vec![(912, Value::USize(q6k_nr0()))])),
         _ => None,
     }
 }

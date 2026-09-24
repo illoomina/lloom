@@ -1126,7 +1126,22 @@ pub fn call_gdn_prologue_seq(
 
 fn gdn_split(h_v: usize, pipeline: &crate::kernels::ComputePipeline) -> usize {
     let max = pipeline.max_total_threads_per_threadgroup().min(1024);
-    (max / h_v.max(1)).clamp(1, 8)
+    (max / h_v.max(1)).clamp(1, gdn_split_cap())
+}
+
+/// The most `dk` slices a head's threads take in `gdn_step` (`LLOOM_GDN_SPLIT`,
+/// read once; 1..21 at `h_v` 48): more slices, more threads in flight per
+/// threadgroup against a longer cross-slice reduction — the arm P29 (6)
+/// measures; 8 is the incumbent.
+fn gdn_split_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("LLOOM_GDN_SPLIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=32).contains(n))
+            .unwrap_or(8)
+    })
 }
 
 /// `gdn_step_rows_f32`: `B` rows of the recurrence over the `S` pool.

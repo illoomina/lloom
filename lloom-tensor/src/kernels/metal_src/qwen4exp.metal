@@ -626,6 +626,9 @@ kernel void gdn_step_f32(
   // r = Σ_dk k[dk] · (e^g S[dk, dv, h]), the slice's part then the slices
   float r = 0.0f;
   if (live) {
+    // Unrolled so several of the 24 KB-strided loads are in flight per
+    // thread (P29 (6): the step read ~50 GB/s with one at a time).
+#pragma unroll 4
     for (uint dk = j; dk < d; dk += split) {
       r += k[dk] * (eg * s[((size_t)dk * d + dv) * h_v + h]);
     }
@@ -637,6 +640,7 @@ kernel void gdn_step_f32(
   const float delta = b * (v[dv] - r);
   float acc = 0.0f;
   if (live) {
+#pragma unroll 4
     for (uint dk = j; dk < d; dk += split) {
       const size_t idx = ((size_t)dk * d + dv) * h_v + h;
       const float sn = eg * s[idx] + k[dk] * delta;

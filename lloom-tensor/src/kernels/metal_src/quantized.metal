@@ -2377,6 +2377,12 @@ constant bool NSG_IQ2XS_SET = is_function_constant_defined(NSG_IQ2XS_FC);
 constant bool NSG_IQ4NL_SET = is_function_constant_defined(NSG_IQ4NL_FC);
 #define NSG_IQ2XS (NSG_IQ2XS_SET ? (int)NSG_IQ2XS_FC : 2)
 #define NSG_IQ4NL (NSG_IQ4NL_SET ? (int)NSG_IQ4NL_FC : 2)
+// Rows a simdgroup of the Q6_K matvec core (`LLOOM_QMV_Q6K_NR0`, 1..4; the
+// incumbent 1 without the constant; #749 P29 (6)).
+constant ulong NR0_Q6K_FC [[function_constant(912)]];
+constant bool NR0_Q6K_SET = is_function_constant_defined(NR0_Q6K_FC);
+#define NR0_Q6K (NR0_Q6K_SET ? (int)NR0_Q6K_FC : 1)
+#define NR0_Q6K_MAX 4
 #define N_SIMDGROUP 2  // number of SIMD groups in a thread group
 //Note: This is a template, but strictly speaking it only applies to
 //      quantizations where the block size is 32. It also does not
@@ -5543,17 +5549,24 @@ void kernel_mul_mv_q6_K_impl(
     const int64_t r1 = tgpig.y;
     const int     im = tgpig.z;
 
-    const int row = 2 * r0 + sgitg;
+    // NR0_Q6K rows a simdgroup (ggml master's `N_R0_Q6_K` = 2: the rows
+    // share the activation loads and the lane's index math; a function
+    // constant the host sets with the threadgroup's rows, 1 — the incumbent —
+    // when the pipeline is loaded without it; #749 P29 (6)). Two simdgroups a
+    // threadgroup as before. Per row the arithmetic and its order are the
+    // one-row core's, so every arm is byte-identical.
+    const int first_row = (r0 * 2 + sgitg) * NR0_Q6K;
 
     const uint i12 = im%ne12;
     const uint i13 = im/ne12;
 
     const uint offset0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
 
-    device const block_q6_K * x = (device const block_q6_K *) src0 + row * nb + offset0;
+    device const block_q6_K * x = (device const block_q6_K *) src0 + first_row * nb + offset0;
     device const ACT     * yy = (device const ACT      *) src1 + r1*ne10 + im*ne00*ne1;
 
-    float sumf = 0;
+    float sumf[NR0_Q6K_MAX] = {0.f, 0.f, 0.f, 0.f};
+    float yl[16];
 
     const int tid  = tiisg/2;
     const int ix   = tiisg%2;
@@ -5568,31 +5581,40 @@ void kernel_mul_mv_q6_K_impl(
     const int q_offset_h = 32*ip + l0;
 
     for (int i = ix; i < nb; i += 2) {
-
-        device const uint8_t * q1 = x[i].ql + q_offset_l;
-        device const uint8_t * q2 = q1 + 32;
-        device const uint8_t * qh = x[i].qh + q_offset_h;
-        device const int8_t  * sc = x[i].scales + is;
-
         device const ACT * y = yy + i * QK_K + y_offset;
-
-        const float dall = x[i].d;
-
-        float4 sums = {0.f, 0.f, 0.f, 0.f};
         for (int l = 0; l < n; ++l) {
-            sums[0] += y[l+ 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-            sums[1] += y[l+32] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-            sums[2] += y[l+64] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-            sums[3] += y[l+96] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            yl[4*l + 0] = y[l +  0];
+            yl[4*l + 1] = y[l + 32];
+            yl[4*l + 2] = y[l + 64];
+            yl[4*l + 3] = y[l + 96];
         }
 
-        sumf += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        for (int row = 0; row < NR0_Q6K; ++row) {
+            device const block_q6_K & xb = x[row * nb + i];
+            device const uint8_t * q1 = xb.ql + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = xb.qh + q_offset_h;
+            device const int8_t  * sc = xb.scales + is;
 
+            const float dall = xb.d;
+
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            for (int l = 0; l < n; ++l) {
+                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            }
+
+            sumf[row] += dall * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        }
     }
 
-    const float tot = simd_sum(sumf);
-    if (tiisg == 0 && row < ne01) {
-        dst[r1*ne0 + im*ne0*ne1 + row] = (STORE)(tot);
+    for (int row = 0; row < NR0_Q6K; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0 && first_row + row < ne01) {
+            dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(tot);
+        }
     }
 }
 

@@ -954,6 +954,14 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         #[cfg(feature = "metal")]
         candle::kernels::metal::profile::reset();
         let gauge = MemGauge::start(device, args.mem_sample);
+        // `CANDLE_METAL_TRACE=1`: the dispatch census of three armed decode
+        // steps (the 9th to the 11th token) — kernel, grid, threadgroup,
+        // barrier, encoder per dispatch, through the same recorder
+        // `lfm2-dispatch-trace` uses. The callback runs after a step's
+        // readback, so the dispatches between two callbacks are one step.
+        let trace_on = trace_requested();
+        let mut produced = 0usize;
+        let mut traced: Vec<(usize, TraceStep)> = Vec::new();
         let t1 = std::time::Instant::now();
         let out = session.decode(
             &mut spec,
@@ -961,9 +969,27 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
             &mut sampler,
             prompt_ids,
             &opts,
-            &mut |_toks| Ok(()),
+            &mut |toks| {
+                if trace_on {
+                    let before = produced;
+                    produced += toks.len();
+                    if before >= TRACE_FROM && before < TRACE_FROM + TRACE_STEPS {
+                        traced.push((before + 1, trace_take()));
+                    }
+                    if produced >= TRACE_FROM && produced < TRACE_FROM + TRACE_STEPS {
+                        trace_set(true, Some(format!("decode[{}]", produced + 1)));
+                    } else {
+                        trace_set(false, None);
+                        let _ = trace_take();
+                    }
+                }
+                Ok(())
+            },
         )?;
         let wall_ms = t1.elapsed().as_secs_f64() * 1e3;
+        for (step, dispatches) in &traced {
+            trace_census(run, *step, dispatches);
+        }
         let prefill_ms = out.stats.prefill_ns as f64 / 1e6;
         let decode_ms = (wall_ms - prefill_ms).max(0.0);
         // One profile snapshot for the run: the driver's prefill and decode
@@ -1579,3 +1605,118 @@ fn argmax(logits: &Tensor) -> Result<u32> {
     }
     Ok(best as u32)
 }
+
+/// The first token index the driver's dispatch trace records at, and how
+/// many steps it records (`CANDLE_METAL_TRACE=1`).
+const TRACE_FROM: usize = 8;
+const TRACE_STEPS: usize = 3;
+
+#[cfg(feature = "metal")]
+type TraceStep = Vec<candle::kernels::metal::trace::Dispatch>;
+#[cfg(not(feature = "metal"))]
+type TraceStep = Vec<()>;
+
+fn trace_requested() -> bool {
+    #[cfg(feature = "metal")]
+    {
+        candle::kernels::metal::trace::trace_requested()
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        false
+    }
+}
+
+fn trace_set(on: bool, region: Option<String>) {
+    #[cfg(feature = "metal")]
+    {
+        candle::kernels::metal::trace::set_region(region);
+        candle::kernels::metal::trace::set_recording(on);
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        let _ = (on, region);
+    }
+}
+
+fn trace_take() -> TraceStep {
+    #[cfg(feature = "metal")]
+    {
+        candle::kernels::metal::trace::take_dispatches()
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        Vec::new()
+    }
+}
+
+/// One decode step's census: the totals, then one line per kernel with its
+/// launches and the shapes it was launched at (threads a dispatch =
+/// grid × threadgroup when dispatched by threadgroups).
+#[cfg(feature = "metal")]
+fn trace_census(run: usize, step: usize, d: &TraceStep) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let barriers = d.iter().filter(|x| x.barrier).count();
+    let encoders: BTreeSet<u64> = d.iter().map(|x| x.encoder).collect();
+    println!(
+        "TRACE run={run} step={step} dispatches={} barriers={} encoders={}",
+        d.len(),
+        barriers,
+        encoders.len()
+    );
+    // Where the encoder sessions break: the kernel before and after each
+    // boundary (a blit, a cut or a readback ends the compute encoder; the
+    // trace sees only the compute dispatches either side of it).
+    let mut breaks: BTreeMap<String, usize> = BTreeMap::new();
+    for w in d.windows(2) {
+        if w[0].encoder != w[1].encoder {
+            *breaks
+                .entry(format!("after={} before={}", w[0].pipeline, w[1].pipeline))
+                .or_default() += 1;
+        }
+    }
+    let mut br: Vec<_> = breaks.into_iter().collect();
+    br.sort_by(|a, b| b.1.cmp(&a.1));
+    for (k, n) in br {
+        println!("TRACE run={run} step={step} break n={n} {k}");
+    }
+    // kernel -> (count, shape -> count)
+    let mut by: BTreeMap<&str, (usize, BTreeMap<String, usize>)> = BTreeMap::new();
+    for x in d {
+        let (gw, gh, gd) = x.grid;
+        let (tw, th, td) = x.threadgroup;
+        let tg = tw * th * td;
+        let threads = if x.by_threadgroups {
+            gw * gh * gd * tg
+        } else {
+            gw * gh * gd
+        };
+        let shape = format!(
+            "grid={}x{}x{}{} tg={} threads={}",
+            gw,
+            gh,
+            gd,
+            if x.by_threadgroups { "tg" } else { "" },
+            tg,
+            threads
+        );
+        let e = by.entry(x.pipeline.as_str()).or_default();
+        e.0 += 1;
+        *e.1.entry(shape).or_default() += 1;
+    }
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.0.cmp(b.0)));
+    for (name, (n, shapes)) in rows {
+        let mut sh: Vec<_> = shapes.into_iter().collect();
+        sh.sort_by(|a, b| b.1.cmp(&a.1));
+        let shapes = sh
+            .iter()
+            .map(|(s, c)| format!("{c}×[{s}]"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("TRACE run={run} step={step} kernel={name} n={n} {shapes}");
+    }
+}
+
+#[cfg(not(feature = "metal"))]
+fn trace_census(_run: usize, _step: usize, _d: &TraceStep) {}

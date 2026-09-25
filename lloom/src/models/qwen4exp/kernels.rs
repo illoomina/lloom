@@ -908,7 +908,15 @@ pub(crate) fn moe_topk(logits: &Tensor, k: usize) -> Option<Result<(Tensor, Tens
     let mut dims = logits.dims().to_vec();
     *dims.last_mut().unwrap() = k;
     Some((|| {
-        let w = Tensor::zeros(dims.as_slice(), lloom_tensor::DType::F32, logits.device())?;
+        // Unfilled on purpose: `moe_topk_f32` writes every `[row, k]` entry
+        // (one per round, then the renormalisation over all `k`), and a
+        // `Tensor::zeros` here was a blit `fill_buffer` on Metal — one
+        // encoder break, a full GPU drain, per MoE layer per token (48 of a
+        // step's 84 sessions, #749 P31 (1)).
+        // SAFETY: every element is written by the kernel before any read;
+        // the Metal arm refuses a `w` that is not a fresh contiguous
+        // `[rows, k]`, and the CPU arm never takes this path.
+        let w = unsafe { Tensor::empty(dims.as_slice(), lloom_tensor::DType::F32, logits.device())? };
         let ids = logits.apply_op1_no_bwd(&MoeTopk { k, w: w.clone() })?;
         Ok((ids, w))
     })())

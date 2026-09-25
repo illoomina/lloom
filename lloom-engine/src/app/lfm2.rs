@@ -120,6 +120,8 @@ pub struct Engine {
     pub model: crate::ModelConfig,
     /// The checkpoint's `generation_config.json`, when it carries one.
     pub generation: Option<lloom::hub::GenerationConfig>,
+    /// The executor arms installed at load.
+    pub executor: crate::ExecutorConfig,
     /// Reuse the cached prefix across requests (`Session::prepare`). Off by
     /// default: a benchmark cell measures a cold prefill, and a repeated prompt
     /// would otherwise resume from the previous request's state.
@@ -180,6 +182,10 @@ pub struct LoadOptions {
     /// `--dspark-k`: draft this many positions per round instead of the
     /// drafter's block (clamped to it).
     pub dspark_k: Option<usize>,
+    /// The executor arms, installed on the device before the model.
+    pub executor: crate::ExecutorConfig,
+    /// The memory budgets (the KV bucket and grow fraction, the free-list budget).
+    pub memory: crate::MemoryConfig,
 }
 
 /// How the rows of `--batch N` hold their KV and conv state, and how a step
@@ -301,11 +307,12 @@ impl Engine {
         // the 256 MiB ceiling that working set is evicted as it frees — ~10
         // allocations and a residency commit per round; at 1024, none.
         #[cfg(feature = "metal")]
-        if dspark_dir.is_some() {
+        if let Some(mb) = opts.memory.free_budget_mb.or(dspark_dir.is_some().then_some(1024)) {
             if let Device::Metal(m) = &device {
-                m.set_free_budget(1024 * 1024 * 1024);
+                m.set_free_budget(mb * 1024 * 1024);
             }
         }
+        super::common::install_executor(&device, &opts.executor, dspark_dir.is_some())?;
         // Measured on natural text (#148, record §8.3): the speculative loop
         // on the pool is +14 % at B=4 and a LOSS at B ≥ 8 (−7 % / −40 % at
         // 8 / 16, 2.1–2.4 accepted of 9 per round against a B × 10-position
@@ -410,8 +417,16 @@ impl Engine {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
         let model = Model::new(&config, vb).context("constructing LFM2")?;
         let make_cache = |device: &Device| {
-            Cache::new_with(true, dtype, &config, device, opts.kv_capacity)
-                .context("allocating the KV cache")
+            let mut cache = Cache::new_with(true, dtype, &config, device, opts.kv_capacity)
+                .context("allocating the KV cache")?
+                .with_kv_bucket(opts.memory.kv_bucket)
+                .context("memory.kv_bucket")?;
+            if let Some(fraction) = opts.memory.kv_grow_fraction {
+                cache = cache
+                    .with_kv_grow_fraction(fraction)
+                    .context("memory.kv_grow_fraction")?;
+            }
+            Ok::<_, anyhow::Error>(cache)
         };
         let cache = make_cache(&device)?;
 
@@ -466,6 +481,7 @@ impl Engine {
             axes_line,
             model: opts.model.clone(),
             generation: lloom::hub::read_generation_config(&model_dir).unwrap_or_default(),
+            executor: opts.executor.clone(),
             reuse_prefix: opts.reuse_prefix,
             batch: opts.batch,
             dspark_k: dcfg.as_ref().map(|d| {
@@ -1792,7 +1808,7 @@ impl super::served::Served for Engine {
     }
     fn describe(&self) -> String {
         format!(
-            "family=lfm2 batch={} dspark={} prefill_tile={} prefill_chunk={} memory_fraction={} mem_sample={} rows={} cache={} {}",
+            "family=lfm2 batch={} dspark={} prefill_tile={} prefill_chunk={} memory_fraction={} mem_sample={} rows={} cache={} {} {}",
             self.batch,
             self.dspark_k
                 .map(|k| format!("k={k}"))
@@ -1804,6 +1820,7 @@ impl super::served::Served for Engine {
             self.rows.name(),
             self.model.cache,
             self.axes_line,
+            self.executor.line(),
         )
     }
     fn generation_config(&self) -> Option<lloom::hub::GenerationConfig> {

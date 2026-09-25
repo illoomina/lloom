@@ -88,8 +88,10 @@ pub struct LoadOptions {
     pub pin: usize,
     /// KV tokens the slot budget reserves for (`--kv-reserve-tokens`; default `kv_capacity`).
     pub kv_reserve_tokens: Option<usize>,
-    /// The pass-keyed plan cache on the Qwen path (`--pass-plans`).
-    pub pass_plans: bool,
+    /// The executor arms, installed on the device before the model.
+    pub executor: crate::ExecutorConfig,
+    /// The memory budgets.
+    pub memory: crate::MemoryConfig,
 }
 
 /// The model, shared with the batch thread.
@@ -116,6 +118,8 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     kv_capacity: usize,
     /// The arm requests take, resolved at load: `Auto` → the blocking arm.
     readback: ReadbackArm,
+    /// The executor arms installed at load.
+    executor: crate::ExecutorConfig,
     reuse_prefix: bool,
     prefill_tile: usize,
     mem_sample: bool,
@@ -193,10 +197,11 @@ impl Engine<Resident> {
             "replay" => PrefillMode::Replay,
             other => anyhow::bail!("--prefill-mode {other}: chunk | replay"),
         };
+        super::common::install_executor(&device, &opts.executor, opts.mtp.is_some())?;
         #[cfg(feature = "metal")]
-        if opts.pass_plans {
+        if let Some(mb) = opts.memory.free_budget_mb {
             if let Device::Metal(m) = &device {
-                m.enable_pass_plans(lloom_tensor::metal_backend::ArenaLayout::Packed);
+                m.set_free_budget(mb * 1024 * 1024);
             }
         }
         let t = Instant::now();
@@ -264,7 +269,7 @@ impl Engine<Resident> {
                     "prefetch": opts.prefetch,
                     "io_hints": opts.io_hints,
                     "prefill_mode": opts.prefill_mode,
-                    "pass_plans": opts.pass_plans,
+                    "pass_plans": opts.executor.pass_plans,
                     "shards": shards.len(),
                     "load_ms": ms(t.elapsed()),
                     "warm": warmed,
@@ -369,6 +374,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             model_name,
             kv_capacity: opts.kv_capacity,
             readback,
+            executor: opts.executor.clone(),
             reuse_prefix: opts.reuse_prefix,
             prefill_tile: opts.prefill_tile,
             mem_sample: opts.mem_sample,
@@ -423,7 +429,20 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
                 opts.batch
             );
         }
-        if opts.warmup {
+        // Under the pass-plan cache the warmup pass corrupts the first real
+        // decode on this family (issue-329 step 5: `--pass-plans` with the
+        // warmup answered "The capital1 isTheThe…", without it "Paris"; the
+        // harness, which never warms up, is right under `--pass-plans`) —
+        // the plan a warmup-shaped pass records is served to a differently
+        // shaped one. The warmup is skipped under the cache, said once, until
+        // the plan/warmup interaction is bisected (owed).
+        if opts.warmup && opts.executor.pass_plans {
+            eprintln!(
+                "[warmup: skipped under executor.pass_plans on Qwen4-exp — the warmup pass's plan \
+                 corrupts the first decode (issue-329 step 5, owed); the first prompt compiles the \
+                 pipelines inside its own TTFT]"
+            );
+        } else if opts.warmup {
             let t = Instant::now();
             let (libs, pipes) = engine.with_single(|s| Ok(s.warmup()?))?;
             eprintln!(
@@ -791,7 +810,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
     }
     fn describe(&self) -> String {
         format!(
-            "family=qwen4exp batch={} experts={} slots={} loader={} mtp={} ple={} ple_cache_rows={} moe_act={} prefill_tile={} mem_sample={}",
+            "family=qwen4exp batch={} experts={} slots={} loader={} mtp={} ple={} ple_cache_rows={} moe_act={} prefill_tile={} mem_sample={} {}",
             self.batch,
             self.tier["experts"].as_str().unwrap_or("?"),
             self.tier["slots_per_layer"].as_u64().unwrap_or(0),
@@ -802,6 +821,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
             self.tier["moe_act"].as_str().unwrap_or("f32"),
             self.prefill_tile,
             self.mem_sample,
+            self.executor.line(),
         )
     }
     fn encode(&self, text: &str, _add_special: bool) -> Result<Vec<u32>> {

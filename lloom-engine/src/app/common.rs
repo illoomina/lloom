@@ -201,3 +201,78 @@ pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
+
+/// Install the executor arms on `device` (Metal; nothing elsewhere) before
+/// the model loads: the packed param style and the constants pool, the ICB
+/// replay executor, the arena's recording, the pass-plan cache — as
+/// `lfm2-chat` installs them. `speculative` refuses `replay` (a round's
+/// dispatch structure moves with the accepted length, §11.3x) and skips
+/// the arena (served by ordinal).
+pub fn install_executor(
+    device: &Device,
+    cfg: &crate::ExecutorConfig,
+    speculative: bool,
+) -> Result<()> {
+    if cfg.replay && speculative {
+        anyhow::bail!(
+            "executor.replay cannot be combined with a speculative body: the round's dispatch \
+             structure is not stable across rounds, so the executor would re-record every few \
+             rounds and replay nothing (DESIGN.md §11.3x)"
+        );
+    }
+    #[cfg(feature = "metal")]
+    {
+        use lloom_tensor::kernels::metal::ExecutorSlot;
+        use lloom_tensor::kernels::{
+            set_constants_pool_enabled, set_default_param_style, BarrierScope, IcbExecutor,
+            ParamStyle, ReplayBarriers,
+        };
+        use lloom_tensor::metal_backend::ArenaLayout;
+        let Device::Metal(dev) = device else {
+            return Ok(());
+        };
+        if cfg.packed || cfg.replay {
+            set_default_param_style(ParamStyle::Packed);
+            set_constants_pool_enabled(true);
+        }
+        if cfg.replay {
+            lloom_tensor::kernels::set_pipelines_support_icb(true)
+                .map_err(|e| anyhow::anyhow!("enabling supportIndirectCommandBuffers: {e}"))?;
+        }
+        let layout = match cfg.arena_layout.as_str() {
+            "non-aliasing" => ArenaLayout::NonAliasing,
+            _ => ArenaLayout::Packed,
+        };
+        // One step skipped (the first token after the prefill allocates a
+        // different set), two recorded, installed at the end of the second.
+        const ARENA_SKIP: usize = 1;
+        const ARENA_RECORD_STEPS: usize = 2;
+        let arena = (cfg.arena || cfg.replay) && !speculative;
+        if arena {
+            dev.arm_arena_recording(layout, ARENA_SKIP, ARENA_RECORD_STEPS);
+        }
+        if cfg.replay {
+            const ICB_RECORD_STEPS: usize = 3;
+            let scope = match cfg.replay_barrier_scope.as_str() {
+                "since-barrier" => BarrierScope::SinceBarrier,
+                _ => BarrierScope::RunStart,
+            };
+            let barriers = match cfg.replay_barriers.as_str() {
+                "always" => ReplayBarriers::Always,
+                _ => ReplayBarriers::SkipReplayed,
+            };
+            let exec = IcbExecutor::configured(ICB_RECORD_STEPS, scope, barriers);
+            if arena {
+                exec.set_warm_in(1 + ARENA_SKIP + ARENA_RECORD_STEPS + 1);
+                exec.set_rerecord_warm_in(ARENA_RECORD_STEPS + 1);
+            }
+            dev.set_executor(std::sync::Arc::new(ExecutorSlot::Custom(exec)));
+        }
+        if cfg.pass_plans {
+            dev.enable_pass_plans(ArenaLayout::Packed);
+        }
+    }
+    #[cfg(not(feature = "metal"))]
+    let _ = (device, cfg);
+    Ok(())
+}

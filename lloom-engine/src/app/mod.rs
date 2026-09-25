@@ -34,11 +34,6 @@ pub struct ModelArgs {
     #[arg(long)]
     pub model_name: Option<String>,
 
-    /// KV positions per request (prompt + generation). A request past it is
-    /// refused rather than reallocated. The standard pipette ladder tops out at
-    /// 8192 + 256.
-    #[arg(long, default_value_t = 8704)]
-    pub kv_capacity: usize,
 
     /// Skip the pipeline warmup at load (the first prompt then compiles the
     /// prefill pipelines inside its own TTFT).
@@ -49,14 +44,6 @@ pub struct ModelArgs {
     #[arg(long)]
     pub cpu: bool,
 
-    /// The fraction of Metal's `recommendedMaxWorkingSetSize` this process
-    /// may claim: LFM2's `MemoryBudget` admission (§9.5d — the KV ceiling's
-    /// cache, the tile's activations and the weights predicted at load and
-    /// refused if they do not fit; a KV grow past it refused at the grow) and
-    /// the streamed expert tier's slot budget on Qwen4-exp (`--slots auto`).
-    /// `0` turns LFM2's admission off — the unguarded arm.
-    #[arg(long, default_value_t = 0.65)]
-    pub memory_fraction: f64,
 
     /// Qwen4-exp: tokenizer.json (with chat_template.jinja beside it).
     /// Default: the HF cache's Qwen/Qwen3.8-Flash-Next snapshot.
@@ -70,11 +57,6 @@ pub struct ModelArgs {
     #[arg(long, default_value = "stream")]
     pub experts: String,
 
-    /// Qwen4-exp, `--experts stream`: streamed experts per layer per
-    /// projection — a count, or `auto` (sized from the device's working set
-    /// at `--memory-fraction`).
-    #[arg(long, default_value = "auto")]
-    pub slots: String,
 
     /// Qwen4-exp, `--experts stream`: the loader primitive, `pread` (read +
     /// compute-encoder copy) or `io` (`MTLIOCommandQueue`).
@@ -125,14 +107,7 @@ pub struct ModelArgs {
     #[arg(long, default_value_t = 0)]
     pub pin: usize,
 
-    /// Qwen4-exp `--slots auto`: KV tokens the slot budget reserves for
-    /// (default: `--kv-capacity`).
-    #[arg(long)]
-    pub kv_reserve_tokens: Option<usize>,
 
-    /// Qwen4-exp: the pass-keyed plan cache (DESIGN §9.2aa) on the Qwen path.
-    #[arg(long)]
-    pub pass_plans: bool,
 }
 
 /// The serving shape the family builds for: `serve`'s width and cells, or
@@ -144,6 +119,10 @@ pub struct Shape {
     pub model: crate::ModelConfig,
     /// The speculative body.
     pub speculative: crate::SpeculativeConfig,
+    /// The executor arms.
+    pub executor: crate::ExecutorConfig,
+    /// The memory budgets.
+    pub memory: crate::MemoryConfig,
     pub reuse_prefix: bool,
     pub seed_text: String,
     pub batch: usize,
@@ -228,7 +207,7 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
             let engine = lfm2::Engine::load(lfm2::LoadOptions {
                 model_dir: dir.clone(),
                 cpu: model.cpu,
-                kv_capacity: model.kv_capacity,
+                kv_capacity: shape.memory.kv_capacity,
                 readback,
                 decode: shape.decode.clone(),
                 model: shape.model.clone(),
@@ -240,11 +219,13 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 dspark: (spec.method == "dspark").then(|| spec.drafter.clone().unwrap_or_default()),
                 prefill_tile,
                 prefill_chunk,
-                memory_fraction: model.memory_fraction,
+                memory_fraction: shape.memory.memory_fraction,
                 mem_sample: shape.mem_sample,
                 rows,
                 share_prefix: shape.share_prefix,
                 dspark_k: spec.k,
+                executor: shape.executor.clone(),
+                memory: shape.memory.clone(),
             })?;
             Ok((Box::new(engine), dir))
         }
@@ -276,7 +257,7 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 first_shard: first.clone(),
                 tokenizer: model.tokenizer.clone(),
                 cpu: model.cpu,
-                kv_capacity: model.kv_capacity,
+                kv_capacity: shape.memory.kv_capacity,
                 readback,
                 decode: shape.decode.clone(),
                 reuse_prefix: shape.reuse_prefix,
@@ -284,10 +265,10 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 seed_text: shape.seed_text,
                 model_name: model.model_name.clone(),
                 prefill_tile,
-                memory_fraction: model.memory_fraction,
+                memory_fraction: shape.memory.memory_fraction,
                 mem_sample: shape.mem_sample,
                 experts: model.experts.clone(),
-                slots: model.slots.clone(),
+                slots: shape.memory.slots.clone(),
                 loader: model.loader.clone(),
                 ple_cache_rows: model.ple_cache_rows,
                 ple: !model.no_ple,
@@ -300,8 +281,9 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 io_hints: model.io_hints,
                 prefill_mode: model.prefill_mode.clone(),
                 pin: model.pin,
-                kv_reserve_tokens: model.kv_reserve_tokens,
-                pass_plans: model.pass_plans,
+                kv_reserve_tokens: shape.memory.kv_reserve_tokens,
+                executor: shape.executor.clone(),
+                memory: shape.memory.clone(),
             })?;
             Ok((engine, first))
         }
@@ -334,6 +316,14 @@ pub struct CommonArgs {
     /// The speculative group as JSON (`'{"method": "mtp", "k": 2, "drafter": "…gguf"}'`).
     #[arg(long, value_name = "JSON")]
     pub speculative_config: Option<String>,
+
+    /// The executor group as JSON (`'{"replay": true, "replay_barriers": "always"}'`).
+    #[arg(long, value_name = "JSON")]
+    pub executor_config: Option<String>,
+
+    /// The memory group as JSON (`'{"memory_fraction": 0.75, "kv_capacity": 4096, "slots": "200"}'`).
+    #[arg(long, value_name = "JSON")]
+    pub memory_config: Option<String>,
 
     /// The sampling group as JSON (`'{"temperature": 0.7, "top_p": 0.9, "max_tokens": 256}'`; vLLM's name).
     #[arg(long, value_name = "JSON")]
@@ -424,6 +414,20 @@ pub fn resolve_options_uninstalled(common: &CommonArgs) -> Result<crate::EngineO
         o.speculative
             .merge_json(&v)
             .map_err(|e| anyhow::anyhow!("--speculative-config: {e}"))?;
+    }
+    if let Some(json) = &common.executor_config {
+        let v: serde_json::Value =
+            serde_json::from_str(json).context("--executor-config: not JSON")?;
+        o.executor
+            .merge_json(&v)
+            .map_err(|e| anyhow::anyhow!("--executor-config: {e}"))?;
+    }
+    if let Some(json) = &common.memory_config {
+        let v: serde_json::Value =
+            serde_json::from_str(json).context("--memory-config: not JSON")?;
+        o.memory
+            .merge_json(&v)
+            .map_err(|e| anyhow::anyhow!("--memory-config: {e}"))?;
     }
     if let Some(json) = &common.generation_config {
         let v: serde_json::Value =
@@ -794,5 +798,65 @@ mod sampling_and_speculation_tests {
         assert!(err.contains("one speculative body"), "{err}");
         let err = resolve_options_uninstalled(&common(&["--spec-method", "ngram"])).unwrap_err().to_string();
         assert!(err.contains("not a speculation method"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod executor_and_memory_tests {
+    use super::*;
+
+    fn common(argv: &[&str]) -> CommonArgs {
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            common: CommonArgs,
+        }
+        let mut full = vec!["t"];
+        full.extend_from_slice(argv);
+        T::parse_from(full).common
+    }
+
+    #[test]
+    fn the_groups_take_lfm2_chats_flags() {
+        let o = resolve_options_uninstalled(&common(&[
+            "--replay",
+            "--arena-layout",
+            "non-aliasing",
+            "--replay-barriers",
+            "always",
+            "--pass-plans",
+            "--memory-fraction",
+            "0.7",
+            "--kv-capacity",
+            "4096",
+            "--kv-bucket",
+            "2048",
+            "--kv-grow-fraction",
+            "0.5",
+            "--free-budget-mb",
+            "512",
+            "--slots",
+            "200",
+            "--kv-reserve-tokens",
+            "1024",
+        ]))
+        .unwrap();
+        assert!(o.executor.replay && o.executor.pass_plans && !o.executor.arena);
+        assert_eq!(o.executor.arena_layout, "non-aliasing");
+        assert_eq!(o.executor.line(), "arena=non-aliasing packed=true replay=always/run-start pass_plans=true");
+        assert_eq!(o.memory.memory_fraction, 0.7);
+        assert_eq!(o.memory.kv_capacity, 4096);
+        assert_eq!(o.memory.kv_bucket, 2048);
+        assert_eq!(o.memory.kv_grow_fraction, Some(0.5));
+        assert_eq!(o.memory.free_budget_mb, Some(512));
+        assert_eq!(o.memory.slots, "200");
+        assert_eq!(o.memory.kv_reserve_tokens, Some(1024));
+        let err = resolve_options_uninstalled(&common(&["--arena-layout", "loose"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an arena layout"), "{err}");
+        let o = resolve_options_uninstalled(&common(&[])).unwrap();
+        assert_eq!(o.executor.line(), "arena=off packed=false replay=off pass_plans=false");
+        assert_eq!(o.memory.kv_capacity, 8704, "the serving default");
     }
 }

@@ -152,6 +152,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
             decode: options.decode.clone(),
             model: options.model.clone(),
             speculative: options.speculative.clone(),
+            executor: options.executor.clone(),
+            memory: options.memory.clone(),
             reuse_prefix: args.reuse_prefix,
             seed_text,
             batch: args.batch,

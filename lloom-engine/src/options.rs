@@ -888,6 +888,137 @@ impl Default for SpeculativeConfig {
     }
 }
 
+// ---- the executor ---------------------------------------------------------------
+
+fn parse_arena_layout(v: &str) -> Result<String, String> {
+    match v.trim() {
+        "packed" => Ok("packed".into()),
+        "non-aliasing" | "nonaliasing" | "reference" => Ok("non-aliasing".into()),
+        other => Err(format!("`{other}` is not an arena layout (packed, non-aliasing)")),
+    }
+}
+fn parse_replay_barriers(v: &str) -> Result<String, String> {
+    match v.trim() {
+        "always" => Ok("always".into()),
+        "skip-replayed" => Ok("skip-replayed".into()),
+        other => Err(format!("`{other}` is not a replay-barriers arm (always, skip-replayed)")),
+    }
+}
+fn parse_barrier_scope(v: &str) -> Result<String, String> {
+    match v.trim() {
+        "run-start" => Ok("run-start".into()),
+        "since-barrier" => Ok("since-barrier".into()),
+        other => Err(format!("`{other}` is not a barrier scope (run-start, since-barrier)")),
+    }
+}
+
+/// The Metal executor arms (`DESIGN.md` §9.2, §11.1–11.3; `lfm2-chat`'s
+/// `--arena --arena-layout --packed --replay --replay-barriers
+/// --replay-barrier-scope --pass-plans`): installed on the device at load,
+/// before the model. Instruments and A/B arms — none is the shipping path.
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct ExecutorConfig {
+    /// The activation arena (§9.2), recorded from the first decode steps (one skipped, two recorded); not under a speculative body.
+    #[opt(bool)]
+    pub arena: bool,
+    /// The arena's layout: `packed` (values with disjoint liveness share a slot) or `non-aliasing` (the reference layout).
+    #[opt(flag = "arena-layout", parser = "parse_arena_layout", variants = ["packed", "non-aliasing"])]
+    pub arena_layout: String,
+    /// Every decode dispatch through its `_packed` entry point with the constants pool (implied by `replay`).
+    #[opt(bool)]
+    pub packed: bool,
+    /// The ICB replay executor (#146/#169): the stable packed subset of a step recorded into an indirect command buffer and replayed; implies `packed` and the arena.
+    #[opt(bool)]
+    pub replay: bool,
+    /// Under `replay`: whether candle's own barrier still fires at a replayed position — `always` or `skip-replayed` (§11.3r).
+    #[opt(flag = "replay-barriers", parser = "parse_replay_barriers", variants = ["always", "skip-replayed"])]
+    pub replay_barriers: String,
+    /// Under `replay`: how far back an ICB command's barrier scan looks — `run-start` or `since-barrier`.
+    #[opt(flag = "replay-barrier-scope", parser = "parse_barrier_scope", variants = ["run-start", "since-barrier"])]
+    pub replay_barrier_scope: String,
+    /// The pass-keyed plan cache (§9.2aa): every forward pass served from one arena base by a plan cached per pass shape.
+    #[opt(flag = "pass-plans", bool)]
+    pub pass_plans: bool,
+}
+
+impl ExecutorConfig {
+    /// The arms for a report line, from the group that was installed.
+    pub fn line(&self) -> String {
+        format!(
+            "arena={} packed={} replay={} pass_plans={}",
+            if self.arena || self.replay { self.arena_layout.as_str() } else { "off" },
+            self.packed || self.replay,
+            if self.replay {
+                format!("{}/{}", self.replay_barriers, self.replay_barrier_scope)
+            } else {
+                "off".to_string()
+            },
+            self.pass_plans
+        )
+    }
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        ExecutorConfig {
+            arena: false,
+            arena_layout: "packed".into(),
+            packed: false,
+            replay: false,
+            replay_barriers: "skip-replayed".into(),
+            replay_barrier_scope: "run-start".into(),
+            pass_plans: false,
+        }
+    }
+}
+
+// ---- memory ---------------------------------------------------------------------
+
+/// The memory budgets: the device fraction the process may claim
+/// (`MemoryBudget` admission on LFM2, the streamed tier's slot budget on
+/// Qwen4-exp), the KV ceiling and how the LFM2 slab grows toward it, the
+/// pool's free-list budget, the Qwen tier's slots and reserve.
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// The fraction of Metal's `recommendedMaxWorkingSetSize` this process may claim (§9.5d); 0 turns LFM2's admission off.
+    #[opt(flag = "memory-fraction")]
+    pub memory_fraction: f64,
+    /// KV positions per request (prompt + generation); a request past it is refused.
+    #[opt(flag = "kv-capacity")]
+    pub kv_capacity: usize,
+    /// LFM2: positions the KV slab grows by when a pass would overrun it (a measurement knob; the stream is the same).
+    #[opt(flag = "kv-bucket")]
+    pub kv_bucket: usize,
+    /// LFM2: the fraction of the working set a KV grow may take the allocation to (§9.5c); none = the admission's.
+    #[opt(flag = "kv-grow-fraction")]
+    pub kv_grow_fraction: Option<f64>,
+    /// The buffer pool's free-list budget in MiB (256 ships; 1024 under a speculative body); none = the default.
+    #[opt(flag = "free-budget-mb")]
+    pub free_budget_mb: Option<usize>,
+    /// Qwen4-exp `--slots auto`: KV tokens the slot budget reserves for (none = `kv_capacity`).
+    #[opt(flag = "kv-reserve-tokens")]
+    pub kv_reserve_tokens: Option<usize>,
+    /// Qwen4-exp `--experts stream`: streamed experts per layer per projection — a count, or `auto` (from the working set at `memory_fraction`).
+    #[opt(flag = "slots", variants = ["auto", "<count>"])]
+    pub slots: String,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig {
+            memory_fraction: 0.65,
+            kv_capacity: 8704,
+            kv_bucket: lloom::models::lfm2::DEFAULT_KV_BUCKET,
+            kv_grow_fraction: None,
+            free_budget_mb: None,
+            kv_reserve_tokens: None,
+            slots: "auto".into(),
+        }
+    }
+}
+
 /// Every option group the engine reads, as one tree: the dotted keys are
 /// `<group>.<key>` (`decode.readback.eos`, `tuning.qmv.q6k_nr0`), the JSON
 /// is one object per group, and `lloom config` prints the resolved tree back
@@ -910,6 +1041,12 @@ pub struct EngineOptions {
     /// The speculative body.
     #[opt(nested)]
     pub speculative: SpeculativeConfig,
+    /// The Metal executor arms.
+    #[opt(nested)]
+    pub executor: ExecutorConfig,
+    /// The memory budgets.
+    #[opt(nested)]
+    pub memory: MemoryConfig,
 }
 
 impl EngineOptions {

@@ -36,8 +36,8 @@ pub use decode::{
     ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingArm, RingPool, Stop,
 };
 pub use options::{
-    DecodeConfig, EngineOptions, EosKind, ModelConfig, PrefillConfig, ReadbackConfig, ReadbackKind,
-    SamplingConfig, SpeculativeConfig, TuningOptions,
+    DecodeConfig, EngineOptions, EosKind, ExecutorConfig, MemoryConfig, ModelConfig, PrefillConfig,
+    ReadbackConfig, ReadbackKind, SamplingConfig, SpeculativeConfig, TuningOptions,
 };
 pub use seam::Completer;
 pub use slots::{Routed, SlotPool, DEFAULT_SIMILARITY};

@@ -78,6 +78,18 @@ pub struct LoadOptions {
     pub batch: usize,
     /// Tokens the MTP drafter proposes per round.
     pub mtp_k: usize,
+    /// The streamed tier's prefetcher (`--prefetch`).
+    pub prefetch: bool,
+    /// The `io` loader's in-flight residency hints (`--io-hints`).
+    pub io_hints: bool,
+    /// `chunk | replay` (`--prefill-mode`).
+    pub prefill_mode: String,
+    /// Experts pinned per layer from the hotlist (`--pin`).
+    pub pin: usize,
+    /// KV tokens the slot budget reserves for (`--kv-reserve-tokens`; default `kv_capacity`).
+    pub kv_reserve_tokens: Option<usize>,
+    /// The pass-keyed plan cache on the Qwen path (`--pass-plans`).
+    pub pass_plans: bool,
 }
 
 /// The model, shared with the batch thread.
@@ -176,15 +188,26 @@ impl Engine<Resident> {
             mtp: opts.mtp.is_some(),
             memory_fraction: Some(opts.memory_fraction),
         };
+        let prefill_mode = match opts.prefill_mode.as_str() {
+            "chunk" => PrefillMode::Chunk,
+            "replay" => PrefillMode::Replay,
+            other => anyhow::bail!("--prefill-mode {other}: chunk | replay"),
+        };
+        #[cfg(feature = "metal")]
+        if opts.pass_plans {
+            if let Device::Metal(m) = &device {
+                m.enable_pass_plans(lloom_tensor::metal_backend::ArenaLayout::Packed);
+            }
+        }
         let t = Instant::now();
         match opts.experts.as_str() {
             "resident" => {
                 let mut model: Qwen4Exp<Resident> =
                     Qwen4Exp::from_gguf_shards(&shards, &device, &mload)
                         .context("loading Qwen4-exp (resident experts)")?;
-                model.set_prefill_mode(PrefillMode::Chunk);
+                model.set_prefill_mode(prefill_mode);
                 model.set_memory_fraction(opts.memory_fraction);
-                let tier = json!({ "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()) });
+                let tier = json!({ "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()), "prefill_mode": opts.prefill_mode });
                 Engine::<Resident>::finish(model, device, opts, tier)
             }
             "stream" => {
@@ -192,7 +215,7 @@ impl Engine<Resident> {
                     "auto" => SlotBudget::Auto {
                         fraction: opts.memory_fraction,
                         rows: opts.batch.max(1),
-                        kv_tokens: opts.kv_capacity.max(1),
+                        kv_tokens: opts.kv_reserve_tokens.unwrap_or(opts.kv_capacity).max(1),
                         prefill_tile: opts.prefill_tile,
                     },
                     n => SlotBudget::Fixed(n.parse().context("--slots: a count or `auto`")?),
@@ -205,13 +228,13 @@ impl Engine<Resident> {
                 let stream = StreamOptions {
                     slots,
                     loader,
-                    prefetch: true,
-                    io_hints: false,
+                    prefetch: opts.prefetch,
+                    io_hints: opts.io_hints,
                 };
                 let mut model: Qwen4Exp<Streamed> =
                     Qwen4Exp::from_gguf_streamed(&shards, &device, &mload, &stream)
                         .context("loading Qwen4-exp (streamed experts)")?;
-                model.set_prefill_mode(PrefillMode::Chunk);
+                model.set_prefill_mode(prefill_mode);
                 model.set_memory_fraction(opts.memory_fraction);
                 let mut warmed = json!(null);
                 if let Some(path) = &opts.hotlist {
@@ -220,9 +243,15 @@ impl Engine<Resident> {
                         let hot = lloom::models::qwen4exp::hotlist::Hotlist::read(path)
                             .with_context(|| format!("reading the hotlist {}", path.display()))?;
                         let loaded = model.warm_from_hotlist(&hot)?;
+                        let pinned = if opts.pin > 0 {
+                            model.pin_from_hotlist(&hot, opts.pin)?
+                        } else {
+                            0
+                        };
                         warmed = json!({
                             "path": path.display().to_string(),
                             "loaded": loaded,
+                            "pinned": pinned,
                             "bytes": model.stream_stats().bytes_loaded,
                             "ms": ms(tw.elapsed()),
                         });
@@ -232,6 +261,10 @@ impl Engine<Resident> {
                     "experts": "stream",
                     "slots_per_layer": model.slots_per_layer(),
                     "loader": opts.loader,
+                    "prefetch": opts.prefetch,
+                    "io_hints": opts.io_hints,
+                    "prefill_mode": opts.prefill_mode,
+                    "pass_plans": opts.pass_plans,
                     "shards": shards.len(),
                     "load_ms": ms(t.elapsed()),
                     "warm": warmed,

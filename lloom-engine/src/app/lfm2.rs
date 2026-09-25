@@ -113,6 +113,11 @@ pub struct Engine {
     pub model_name: String,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
+    /// The resolved axes (`Name=Arm …`), read back from the config that
+    /// loaded — the report line's, never the flags' (§7.1a-i).
+    pub axes_line: String,
+    /// The model group as requested (the preset and the overrides).
+    pub model: crate::ModelConfig,
     /// Reuse the cached prefix across requests (`Session::prepare`). Off by
     /// default: a benchmark cell measures a cold prefill, and a repeated prompt
     /// would otherwise resume from the previous request's state.
@@ -146,6 +151,8 @@ pub struct LoadOptions {
     /// The decode loop's options (`DecodeConfig`): what `readback` and the
     /// prefill fields were resolved from, and the session's cadence.
     pub decode: crate::DecodeConfig,
+    /// The model's axes: the cache preset and the per-axis overrides.
+    pub model: crate::ModelConfig,
     pub reuse_prefix: bool,
     pub warmup: bool,
     pub seed_text: String,
@@ -331,17 +338,38 @@ impl Engine {
         if opts.share_prefix && !pooled {
             anyhow::bail!("--share-prefix needs `--batch N --rows pool` (the rows share one pool)");
         }
-        match &dcfg {
-            Some(dcfg) if pooled => pool_spec_config(&mut config, dcfg),
-            Some(dcfg) => rewindable_config(&mut config, dcfg),
-            None if pooled => pool_config(&mut config),
-            None => crown_config(&mut config),
+        // The preset: `auto` is the rule below; a named one is `lfm2-chat
+        // --cache`'s, refused where it needs the drafter's config it has not
+        // got. Then the per-axis overrides (`--attn`, `--kv-append`, … or
+        // `--set model.<axis>=<arm>`), applied over it in key order.
+        match opts.model.cache.as_str() {
+            "auto" => match &dcfg {
+                Some(dcfg) if pooled => pool_spec_config(&mut config, dcfg),
+                Some(dcfg) => rewindable_config(&mut config, dcfg),
+                None if pooled => pool_config(&mut config),
+                None => crown_config(&mut config),
+            },
+            "crown" => crown_config(&mut config),
+            "pool" => pool_config(&mut config),
+            "rewindable" => match &dcfg {
+                Some(dcfg) => rewindable_config(&mut config, dcfg),
+                None => anyhow::bail!("--cache rewindable needs --dspark (the ring is sized from the drafter's block)"),
+            },
+            "pool-spec" => match &dcfg {
+                Some(dcfg) => pool_spec_config(&mut config, dcfg),
+                None => anyhow::bail!("--cache pool-spec needs --dspark"),
+            },
+            other => anyhow::bail!("--cache {other}: auto | crown | rewindable | pool | pool-spec"),
         }
+        opts.model
+            .apply_axes(&mut config)
+            .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
         // A prefill fed in more than one forward — a tile, a chunk — needs
         // the conv's left-context carry, or the conv zero-pads each piece's
         // left edge and computes something one pass does not (§13.2f
         // defect 1). One forward is identical either way.
         config.conv_prefill_ctx = opts.prefill_tile > 0 || opts.prefill_chunk > 0;
+        let axes_line = config.axes_line();
         // Admission (§9.5d): predict the peak at the configured ceiling and
         // refuse at load rather than find the limit by dying. The activation
         // term is a function of the LONGEST forward this process will run
@@ -433,6 +461,8 @@ impl Engine {
             model_name,
             kv_capacity: opts.kv_capacity,
             readback: opts.readback,
+            axes_line,
+            model: opts.model.clone(),
             reuse_prefix: opts.reuse_prefix,
             batch: opts.batch,
             dspark_k: dcfg.as_ref().map(|d| {
@@ -1759,7 +1789,7 @@ impl super::served::Served for Engine {
     }
     fn describe(&self) -> String {
         format!(
-            "family=lfm2 batch={} dspark={} prefill_tile={} prefill_chunk={} memory_fraction={} mem_sample={} rows={}",
+            "family=lfm2 batch={} dspark={} prefill_tile={} prefill_chunk={} memory_fraction={} mem_sample={} rows={} cache={} {}",
             self.batch,
             self.dspark_k
                 .map(|k| format!("k={k}"))
@@ -1769,6 +1799,8 @@ impl super::served::Served for Engine {
             self.memory_fraction,
             self.mem_sample,
             self.rows.name(),
+            self.model.cache,
+            self.axes_line,
         )
     }
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {

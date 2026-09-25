@@ -208,11 +208,12 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
         let variants_help = attr.variants.join(", ");
         match &attr.kind {
             AxisKind::Bool => {
-                let doc = format!("Axis `{}`. Off unless set.", attr.name);
+                let doc = format!("Axis `{}`: `--{flag}` / `--{flag}=false`; absent keeps the preset's arm.", attr.name);
+                let id = format!("{}.{}", struct_ident, ident);
                 quote! {
                     #[doc = #doc]
-                    #[arg(long = #flag)]
-                    pub #ident: bool,
+                    #[arg(id = #id, long = #flag, num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::clap::value_parser!(bool), value_name = "BOOL")]
+                    pub #ident: Option<bool>,
                 }
             }
             AxisKind::Parsed(_) => {
@@ -224,9 +225,10 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
                 // Optional so "flag absent" means "keep the base config's value"
                 // rather than forcing a default the base already carries.
                 let _ = ty;
+                let id = format!("{}.{}", struct_ident, ident);
                 quote! {
                     #[doc = #doc]
-                    #[arg(long = #flag)]
+                    #[arg(id = #id, long = #flag)]
                     pub #ident: Option<String>,
                 }
             }
@@ -235,7 +237,9 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
 
     let apply_stmts = axes.iter().map(|(ident, _ty, attr)| match &attr.kind {
         AxisKind::Bool => quote! {
-            base.#ident = args.#ident;
+            if let Some(v) = args.#ident {
+                base.#ident = v;
+            }
         },
         AxisKind::Parsed(parser) => {
             let parse_fn: proc_macro2::TokenStream =
@@ -247,6 +251,67 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
                         .map_err(|e| format!("--{}: {}", #flag, e))?;
                 }
             }
+        }
+    });
+
+    // 3. The other front-ends, from the same tags: `set_axis(flag, value)`
+    //    (the dotted key and `--set`), `merge_axes_json` (a `{flag: value}`
+    //    object), `axes_line()` (the resolved arms for a report line, read
+    //    back from the fields — §7.1a-i), `AXES_META` (the knobs table), and
+    //    `ConfigArgs::overrides()` (the flags that were given, as pairs).
+    let set_arms = axes.iter().map(|(ident, _ty, attr)| {
+        let flag = &attr.flag;
+        match &attr.kind {
+            AxisKind::Bool => quote! {
+                #flag => {
+                    self.#ident = ::lloom_tensor::options::parse_bool(value)
+                        .map_err(|e| format!("--{}: {}", #flag, e))?;
+                    Ok(())
+                }
+            },
+            AxisKind::Parsed(parser) => {
+                let parse_fn: proc_macro2::TokenStream =
+                    parser.parse().unwrap_or_else(|_| quote!(parse));
+                quote! {
+                    #flag => {
+                        self.#ident = #parse_fn(value).map_err(|e| format!("--{}: {}", #flag, e))?;
+                        Ok(())
+                    }
+                }
+            }
+        }
+    });
+    let flag_list = axes.iter().map(|(_, _, a)| a.flag.clone()).collect::<Vec<_>>().join(", ");
+    let line_parts = axes.iter().map(|(ident, _ty, attr)| {
+        let name = &attr.name;
+        quote! { parts.push(format!("{}={:?}", #name, self.#ident)); }
+    });
+    let meta_items = axes.iter().map(|(ident, _ty, attr)| {
+        let flag = &attr.flag;
+        let name = &attr.name;
+        let variants = &attr.variants;
+        let default = &attr.default;
+        let doc = format!("Axis `{name}` (default {default}).");
+        let is_bool = attr.kind == AxisKind::Bool;
+        let ty = format!("{}", quote!(#ident)).replace(' ', "");
+        let _ = ty;
+        quote! {
+            ::lloom_tensor::options::KnobMeta {
+                key: #flag, flag: #flag, env: ::std::option::Option::None, doc: #doc,
+                variants: &[#(#variants),*], ty: #name, nested: ::std::option::Option::None,
+                is_bool: #is_bool,
+            }
+        }
+    });
+    let override_stmts = axes.iter().map(|(ident, _ty, attr)| {
+        let flag = &attr.flag;
+        match &attr.kind {
+            AxisKind::Bool => quote! {
+                if let Some(v) = self.#ident { out.push((#flag, v.to_string())); }
+            },
+            AxisKind::Parsed(_) => quote! {
+                if let Some(v) = &self.#ident { out.push((#flag, v.clone())); }
+            },
         }
     });
 
@@ -265,7 +330,7 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
         #(#axes_statics)*
 
         #[doc = #args_doc]
-        #[derive(::clap::Args, Debug, Clone)]
+        #[derive(::clap::Args, Debug, Clone, Default)]
         pub struct #args_ident {
             #(#arg_fields)*
         }
@@ -278,6 +343,53 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
                 let args = self;
                 #(#apply_stmts)*
                 Ok(())
+            }
+
+            /// The flags that were given, as `(flag, value)` pairs in the
+            /// flag spelling — what a dotted `--set` or a JSON group carries.
+            pub fn overrides(&self) -> ::std::vec::Vec<(&'static str, ::std::string::String)> {
+                let mut out = ::std::vec::Vec::new();
+                #(#override_stmts)*
+                out
+            }
+        }
+
+        impl #struct_ident {
+            /// The axes as knobs (flag, arms, default), for the knobs table.
+            pub const AXES_META: &'static [::lloom_tensor::options::KnobMeta] = &[#(#meta_items),*];
+
+            /// Set one axis by its flag name, the value in its flag spelling
+            /// (`set_axis("kv-append", "paged")`).
+            pub fn set_axis(&mut self, flag: &str, value: &str) -> ::std::result::Result<(), ::std::string::String> {
+                match flag {
+                    #(#set_arms)*
+                    other => Err(format!("unknown axis `{}` (axes: {})", other, #flag_list)),
+                }
+            }
+
+            /// Merge a `{flag: value}` object onto the axes; values are strings
+            /// in their flag spelling or bools.
+            pub fn merge_axes_json(&mut self, json: &::serde_json::Value) -> ::std::result::Result<(), ::std::string::String> {
+                let Some(map) = json.as_object() else {
+                    return Err("model axes: expected a JSON object of {flag: value}".to_string());
+                };
+                for (k, v) in map {
+                    let value = match v {
+                        ::serde_json::Value::String(s) => s.clone(),
+                        ::serde_json::Value::Bool(b) => b.to_string(),
+                        ::serde_json::Value::Number(n) => n.to_string(),
+                        other => return Err(format!("axis `{}`: expected a string, got {}", k, other)),
+                    };
+                    self.set_axis(k, &value)?;
+                }
+                Ok(())
+            }
+
+            /// The resolved arms, `Name=Arm …`, read back from the fields.
+            pub fn axes_line(&self) -> ::std::string::String {
+                let mut parts: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
+                #(#line_parts)*
+                parts.join(" ")
             }
         }
     };

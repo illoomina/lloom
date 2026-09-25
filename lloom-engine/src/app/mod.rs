@@ -131,6 +131,37 @@ pub struct ModelArgs {
     /// since load merged in.
     #[arg(long)]
     pub hotlist: Option<PathBuf>,
+
+    /// Qwen4-exp `--experts stream`: the expert prefetcher (the streamed
+    /// tier's reads off the encoding thread, ahead of the layer; §20.4).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub prefetch: bool,
+
+    /// Qwen4-exp `--experts stream --loader io`: the in-flight residency
+    /// hints into free slots (measured not to pay on a pool smaller than the
+    /// tile; off).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub io_hints: bool,
+
+    /// Qwen4-exp: how a prompt is prefilled — `chunk` (the chunked DeltaNet /
+    /// QSA passes) or `replay` (the decode recurrence replayed per token; a
+    /// reference arm).
+    #[arg(long, default_value = "chunk", value_name = "chunk|replay")]
+    pub prefill_mode: String,
+
+    /// Qwen4-exp `--experts stream --hotlist`: pin this many experts per
+    /// layer from the hotlist (never evicted); 0 = none.
+    #[arg(long, default_value_t = 0)]
+    pub pin: usize,
+
+    /// Qwen4-exp `--slots auto`: KV tokens the slot budget reserves for
+    /// (default: `--kv-capacity`).
+    #[arg(long)]
+    pub kv_reserve_tokens: Option<usize>,
+
+    /// Qwen4-exp: the pass-keyed plan cache (DESIGN §9.2aa) on the Qwen path.
+    #[arg(long)]
+    pub pass_plans: bool,
 }
 
 /// The serving shape the family builds for: `serve`'s width and cells, or
@@ -138,6 +169,8 @@ pub struct ModelArgs {
 pub struct Shape {
     /// The decode loop's options (`--readback`, the cadence, the prefill).
     pub decode: crate::DecodeConfig,
+    /// The model's axes: the cache preset and the per-axis overrides.
+    pub model: crate::ModelConfig,
     pub reuse_prefix: bool,
     pub seed_text: String,
     pub batch: usize,
@@ -224,6 +257,7 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 kv_capacity: model.kv_capacity,
                 readback,
                 decode: shape.decode.clone(),
+                model: shape.model.clone(),
                 reuse_prefix: shape.reuse_prefix,
                 warmup: !model.no_warmup,
                 seed_text: shape.seed_text,
@@ -243,6 +277,13 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
             Ok((Box::new(engine), dir))
         }
         Family::Qwen4Exp(first) => {
+            if !shape.model.axes.is_empty() || shape.model.cache != "auto" {
+                anyhow::bail!(
+                    "the model axes ({}{}) are LFM2's `Config`'s; Qwen4-exp's arms are `--experts`, `--slots`, `--loader`, `--moe-act`, `--prefill-mode`, `--prefetch`, `--io-hints` and the `tuning.qwen4exp.*` knobs",
+                    if shape.model.cache != "auto" { format!("cache={} ", shape.model.cache) } else { String::new() },
+                    shape.model.axes.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
             if shape.batch > 1 && model.mtp.is_some() {
                 anyhow::bail!(
                     "--batch {} with --mtp on Qwen4-exp: the batched loop is the K = 1 driver; \
@@ -277,6 +318,12 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 hotlist: model.hotlist.clone(),
                 batch: shape.batch,
                 mtp_k: model.mtp_k,
+                prefetch: model.prefetch,
+                io_hints: model.io_hints,
+                prefill_mode: model.prefill_mode.clone(),
+                pin: model.pin,
+                kv_reserve_tokens: model.kv_reserve_tokens,
+                pass_plans: model.pass_plans,
             })?;
             Ok((engine, first))
         }
@@ -301,6 +348,10 @@ pub struct CommonArgs {
     /// The tuning group as JSON (`'{"qmv": {"q6k_nr0": 4}, "metal": {"cut_policy": "node-aligned"}}'`).
     #[arg(long, value_name = "JSON")]
     pub tuning_config: Option<String>,
+
+    /// The model group as JSON (`'{"cache": "crown", "axes": {"attn": "flash", "kv-append": "paged"}}'`).
+    #[arg(long, value_name = "JSON")]
+    pub model_config: Option<String>,
 
     /// One knob by dotted key, repeatable (`--set decode.readback.eos=gpu-batched`).
     #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
@@ -348,6 +399,13 @@ pub fn resolve_options_uninstalled(common: &CommonArgs) -> Result<crate::EngineO
             .merge_json(&v)
             .map_err(|e| anyhow::anyhow!("--tuning-config: {e}"))?;
     }
+    if let Some(json) = &common.model_config {
+        let v: serde_json::Value =
+            serde_json::from_str(json).context("--model-config: not JSON")?;
+        o.model
+            .merge_json(&v)
+            .map_err(|e| anyhow::anyhow!("--model-config: {e}"))?;
+    }
     for kv in &common.set {
         let (k, v) = lloom_tensor::options::split_assignment(kv).map_err(|e| anyhow::anyhow!("--set {e}"))?;
         o.set(k, v).map_err(|e| anyhow::anyhow!("--set {kv}: {e}"))?;
@@ -374,7 +432,27 @@ pub struct ConfigArgs {
 pub fn print_knobs() -> Result<()> {
     let defaults = crate::EngineOptions::default();
     let value = serde_json::to_value(&defaults)?;
-    let rows = lloom_tensor::options::rows("", crate::EngineOptions::META, &value);
+    let mut rows = lloom_tensor::options::rows("", crate::EngineOptions::META, &value);
+    // The model axes come from `lfm2::Config`'s own derive: one row each,
+    // the default rendered from a default config.
+    let probe = lloom::models::lfm2::Config::default();
+    let line = probe.axes_line();
+    for m in lloom::models::lfm2::Config::AXES_META {
+        let value = line
+            .split(' ')
+            .find_map(|kv| kv.strip_prefix(&format!("{}=", m.ty)))
+            .unwrap_or("")
+            .to_string();
+        rows.push(lloom_tensor::options::KnobRow {
+            key: format!("model.axes.{}", m.key),
+            flag: format!("--{}", m.flag),
+            env: None,
+            ty: m.ty,
+            variants: m.variants,
+            doc: m.doc,
+            value,
+        });
+    }
     for r in rows {
         let env = r.env.map(|e| format!(" env={e}")).unwrap_or_default();
         let arms = if r.variants.is_empty() {
@@ -535,5 +613,71 @@ mod option_layer_tests {
         let o = resolve_options_uninstalled(&common(&["--readback", "ring-hostdrain", "--lookahead", "0"])).unwrap();
         assert_eq!(o.decode.readback.eos, EosKind::HostDrain);
         assert_eq!(o.decode.readback.lookahead, 0);
+    }
+}
+
+#[cfg(test)]
+mod model_group_tests {
+    use super::*;
+    use lloom::models::lfm2::{AttnImpl, Config, KvAppend};
+
+    fn common(argv: &[&str]) -> CommonArgs {
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            common: CommonArgs,
+        }
+        let mut full = vec!["t"];
+        full.extend_from_slice(argv);
+        T::parse_from(full).common
+    }
+
+    #[test]
+    fn the_axes_reach_the_config_by_flag_key_and_json() {
+        let o = resolve_options_uninstalled(&common(&[
+            "--cache",
+            "crown",
+            "--attn",
+            "flash",
+            "--gemv-silu=false",
+            "--set",
+            "model.kv-append=paged",
+            "--model-config",
+            r#"{"axes": {"qkv-layout": "fused"}}"#,
+        ]))
+        .unwrap();
+        assert_eq!(o.model.cache, "crown");
+        assert_eq!(o.model.axes.get("attn").map(String::as_str), Some("flash"));
+        assert_eq!(o.model.axes.get("gemv-silu").map(String::as_str), Some("false"));
+        assert_eq!(o.model.axes.get("kv-append").map(String::as_str), Some("paged"));
+        assert_eq!(o.model.axes.get("qkv-layout").map(String::as_str), Some("fused"));
+        let mut cfg = Config::default();
+        cfg.gemv_silu = true;
+        o.model.apply_axes(&mut cfg).unwrap();
+        assert_eq!(cfg.attn_impl, AttnImpl::FlashDecoding);
+        assert_eq!(cfg.kv_append, KvAppend::Paged);
+        assert!(!cfg.gemv_silu, "`--gemv-silu=false` forces the preset's arm off");
+        assert!(cfg.axes_line().contains("AttnImpl=FlashDecoding"), "{}", cfg.axes_line());
+        // The dump round-trips.
+        let v = serde_json::to_value(&o).unwrap();
+        let mut back = crate::EngineOptions::default();
+        back.merge_json(&v).unwrap();
+        assert_eq!(back, o);
+    }
+
+    #[test]
+    fn a_bad_axis_or_preset_is_refused_at_parse() {
+        let err = resolve_options_uninstalled(&common(&["--attn", "bogus"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--attn"), "{err}");
+        let err = resolve_options_uninstalled(&common(&["--cache", "shiny"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cache:"), "{err}");
+        let err = resolve_options_uninstalled(&common(&["--set", "model.nope=1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown axis `nope`"), "{err}");
     }
 }

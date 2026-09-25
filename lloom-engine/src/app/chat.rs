@@ -85,6 +85,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         &args.model,
         Shape {
             decode: options.decode.clone(),
+            model: options.model.clone(),
             reuse_prefix: !args.no_reuse,
             seed_text: "The loom threads warp and weft into cloth. ".to_string(),
             batch: 1,

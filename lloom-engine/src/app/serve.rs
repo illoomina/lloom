@@ -152,6 +152,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         &args.model,
         super::Shape {
             decode: options.decode.clone(),
+            model: options.model.clone(),
             reuse_prefix: args.reuse_prefix,
             seed_text,
             batch: args.batch,

@@ -526,6 +526,38 @@ pub fn call_quantized_matmul_mv_t(
     Ok(())
 }
 
+/// The `kernel_mul_mv_id_<stem>` / `kernel_mul_mv_id2_<stem>` stem of a weight kind.
+fn mv_id_stem(dtype: GgmlDType) -> Result<&'static str, MetalKernelError> {
+    Ok(match dtype {
+        GgmlDType::F32 => "f32",
+        GgmlDType::F16 => "f16",
+        GgmlDType::Q4_0 => "q4_0",
+        GgmlDType::Q4_1 => "q4_1",
+        GgmlDType::Q5_0 => "q5_0",
+        GgmlDType::Q5_1 => "q5_1",
+        GgmlDType::Q8_0 => "q8_0",
+        GgmlDType::Q2K => "q2_K",
+        GgmlDType::Q3K => "q3_K",
+        GgmlDType::Q4K => "q4_K",
+        GgmlDType::Q5K => "q5_K",
+        GgmlDType::Q6K => "q6_K",
+        GgmlDType::IQ2XXS => "iq2_xxs",
+        GgmlDType::IQ2XS => "iq2_xs",
+        GgmlDType::IQ2S => "iq2_s",
+        GgmlDType::IQ3XXS => "iq3_xxs",
+        GgmlDType::IQ3S => "iq3_s",
+        GgmlDType::IQ4NL => "iq4_nl",
+        GgmlDType::IQ4XS => "iq4_xs",
+        GgmlDType::Q2_0 => "q2_0",
+        GgmlDType::Q8_1 | GgmlDType::Q8K | GgmlDType::BF16 => {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "no kernel_mul_mv_id arm for this weight dtype",
+                "routed quantized matmul-vec",
+            ))
+        }
+    })
+}
+
 /// The routed-expert matmul-vec (`kernel_mul_mv_id_<q>_f32`): for every
 /// `(token, slot)` pair, one GEMV of `src1`'s row against expert
 /// `ids[token][slot]` of the stacked weight `[n_experts, n, k]`.
@@ -570,34 +602,7 @@ pub fn call_quantized_matmul_mv_id_t(
             "dense/Q8 routed quantized matmul-vec",
         ));
     }
-    let stem = match dtype {
-        GgmlDType::F32 => "f32",
-        GgmlDType::F16 => "f16",
-        GgmlDType::Q4_0 => "q4_0",
-        GgmlDType::Q4_1 => "q4_1",
-        GgmlDType::Q5_0 => "q5_0",
-        GgmlDType::Q5_1 => "q5_1",
-        GgmlDType::Q8_0 => "q8_0",
-        GgmlDType::Q2K => "q2_K",
-        GgmlDType::Q3K => "q3_K",
-        GgmlDType::Q4K => "q4_K",
-        GgmlDType::Q5K => "q5_K",
-        GgmlDType::Q6K => "q6_K",
-        GgmlDType::IQ2XXS => "iq2_xxs",
-        GgmlDType::IQ2XS => "iq2_xs",
-        GgmlDType::IQ2S => "iq2_s",
-        GgmlDType::IQ3XXS => "iq3_xxs",
-        GgmlDType::IQ3S => "iq3_s",
-        GgmlDType::IQ4NL => "iq4_nl",
-        GgmlDType::IQ4XS => "iq4_xs",
-        GgmlDType::Q2_0 => "q2_0",
-        GgmlDType::Q8_1 | GgmlDType::Q8K | GgmlDType::BF16 => {
-            return Err(MetalKernelError::UnsupportedDTypeForOp(
-                "no kernel_mul_mv_id arm for this weight dtype",
-                "routed quantized matmul-vec",
-            ))
-        }
-    };
+    let stem = mv_id_stem(dtype)?;
     let name = format!("kernel_mul_mv_id_{stem}_{}", triple.name_suffix());
     let act_size = match triple.activation() {
         GemvFloat::F32 => core::mem::size_of::<f32>(),
@@ -1218,4 +1223,115 @@ pub fn call_quantized_get_rows(
 
 fn divide(m: usize, b: usize) -> usize {
     m.div_ceil(b)
+}
+
+/// Gate and up of one routed layer in ONE launch (`kernel_mul_mv_id2_<q>_f32`,
+/// lloom #749 P31 (3)): `src0a` and `src0b` are two stacked weights of the
+/// same kind and `[n_experts, n, k]`; `dst` is `[2, batch, topk, n]` f32
+/// (plane set 0 from `src0a`, 1 from `src0b`). f32 activations only — the
+/// arm the decode step runs. Each plane computes exactly what
+/// [`call_quantized_matmul_mv_id_t`] computes for it.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_id2_t(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    (n_experts, n, k): (usize, usize, usize),
+    (batch, topk, in_dim1): (usize, usize, usize),
+    src0a: &Buffer,
+    src0b: &Buffer,
+    src1: &Buffer,
+    src1_offset: usize,
+    ids: &Buffer,
+    ids_offset: usize,
+    dst: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let stem = mv_id_stem(dtype)?;
+    let name = format!("kernel_mul_mv_id2_{stem}_f32");
+    let act_size = core::mem::size_of::<f32>() as u64;
+    let store_size = act_size;
+    if in_dim1 != 1 && in_dim1 != topk {
+        return Err(MetalKernelError::UnsupportedDTypeForOp(
+            "routed matmul-vec activation dim1 must be 1 or topk",
+            "routed quantized matmul-vec pair",
+        ));
+    }
+    let nei0 = topk as i64;
+    let nei1 = batch as i64;
+    let nbi1 = (topk * core::mem::size_of::<u32>()) as u64;
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let ne02 = n_experts as i64;
+    let row_bytes = ((k / dtype_block_size(dtype)) * dtype_type_size(dtype)) as u64;
+    let nb00 = dtype_type_size(dtype) as u64;
+    let nb01 = row_bytes;
+    let nb02 = n as u64 * row_bytes;
+    let ne10 = k as i64;
+    let ne11 = in_dim1 as i64;
+    let ne12 = batch as i64;
+    let ne13 = 1i64;
+    let nb10 = act_size;
+    let nb11 = k as u64 * act_size;
+    let nb12 = (in_dim1 * k) as u64 * act_size;
+    let ne0 = n as i64;
+    let ne1 = topk as i64;
+    let nb1 = n as u64 * store_size;
+
+    let (nth0, nth1, align) = mv_threadgroup(dtype);
+    let thread_groups_count = MTLSize {
+        width: divide(n, align),
+        height: 1,
+        depth: 2 * batch * topk,
+    };
+    let threads_per_threadgroup = MTLSize {
+        width: nth0,
+        height: nth1,
+        depth: 1,
+    };
+
+    let pipeline = kernels.load_pipeline_with_constants(device, Source::Quantized, name.clone(), mv_constants(dtype))?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    if needs_iq_shared(dtype) {
+        encoder.set_threadgroup_memory_length(0, 8192);
+    }
+    debug_group!(
+        encoder,
+        "qmm_mv_id2 {name} E={n_experts} B={batch} topk={topk} K={k} N={n}"
+    );
+
+    set_params!(
+        encoder,
+        (
+            src0a,
+            src0b,
+            (src1, src1_offset),
+            Output::new(dst),
+            (ids, ids_offset),
+            nei0,
+            nei1,
+            nbi1,
+            ne00,
+            ne01,
+            ne02,
+            nb00,
+            nb01,
+            nb02,
+            ne10,
+            ne11,
+            ne12,
+            ne13,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            nb1
+        )
+    );
+
+    encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
+    Ok(())
 }

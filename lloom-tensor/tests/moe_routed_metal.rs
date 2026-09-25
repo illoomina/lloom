@@ -96,9 +96,13 @@ fn stacked_weight(
             raw
         }
         _ => {
-            // Quantizable types: quantize a smooth f32 weight on the CPU.
+            // Quantizable types: quantize a smooth f32 weight on the CPU (the
+            // seed shifts the phase, so two seeds are two weights).
             let w = (0..e * n * k)
-                .map(|i| ((i as f32) * 0.0037).sin() * 0.5 + ((i as f32) * 0.011).cos() * 0.25)
+                .map(|i| {
+                    let i = i as f32 + seed as f32;
+                    (i * 0.0037).sin() * 0.5 + (i * 0.011).cos() * 0.25
+                })
                 .collect::<Vec<_>>();
             let w = Tensor::from_vec(w, (e, n, k), &Device::Cpu)?;
             let q = QTensor::quantize(&w, dtype)?;
@@ -522,4 +526,60 @@ fn diag_routed_iq2_xxs_planes() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn bits(t: &Tensor) -> Result<Vec<u32>> {
+    Ok(t.flatten_all()?
+        .to_device(&Device::Cpu)?
+        .to_vec1::<f32>()?
+        .iter()
+        .map(|v| v.to_bits())
+        .collect())
+}
+
+/// The gate|up pair launch (`kernel_mul_mv_id2`, lloom #749 P31 (3)): each
+/// half is its own `indexed_moe_forward` bit for bit, the halves are not
+/// interchangeable (the pair the other way round is the outputs swapped — the
+/// buffer select), and two launches agree bit for bit.
+fn routed_pair_is_the_two_launches(dtype: GgmlDType, in_dim1_is_topk: bool) -> Result<()> {
+    let dev = Device::new_metal(0)?;
+    let (e, n, k) = (6usize, 64usize, 256usize);
+    let (batch, topk) = (2usize, 3usize);
+    let in_dim1 = if in_dim1_is_topk { topk } else { 1 };
+    let (g, _) = stacked_weight(dtype, (e, n, k), 17, &dev)?;
+    let (u, _) = stacked_weight(dtype, (e, n, k), 23, &dev)?;
+    let x = activations((batch, in_dim1, k), 0.2)?.to_device(&dev)?;
+    let ids_t = Tensor::from_vec(vec![5u32, 0, 5, 2, 4, 5], (batch, topk), &dev)?;
+    let want_g = bits(&g.indexed_moe_forward(&x, &ids_t)?)?;
+    let want_u = bits(&u.indexed_moe_forward(&x, &ids_t)?)?;
+    assert_ne!(want_g, want_u, "the two weights must differ for the select to be testable");
+    let (got_g, got_u) = g.indexed_moe_forward_pair(&u, &x, &ids_t)?;
+    assert_eq!(got_g.dims(), &[batch, topk, n]);
+    assert_eq!(got_u.dims(), &[batch, topk, n]);
+    assert_eq!(bits(&got_g)?, want_g, "{dtype:?}: the pair's gate half is not the gate launch");
+    assert_eq!(bits(&got_u)?, want_u, "{dtype:?}: the pair's up half is not the up launch");
+    let (sw_u, sw_g) = u.indexed_moe_forward_pair(&g, &x, &ids_t)?;
+    assert_eq!(bits(&sw_u)?, want_u, "{dtype:?}: the pair the other way round: first half");
+    assert_eq!(bits(&sw_g)?, want_g, "{dtype:?}: the pair the other way round: second half");
+    let (g2, u2) = g.indexed_moe_forward_pair(&u, &x, &ids_t)?;
+    assert_eq!(bits(&g2)?, want_g, "{dtype:?}: the pair is not bit-stable (gate)");
+    assert_eq!(bits(&u2)?, want_u, "{dtype:?}: the pair is not bit-stable (up)");
+    Ok(())
+}
+
+#[test]
+fn routed_pair_q4_0_gate_shape() -> Result<()> {
+    routed_pair_is_the_two_launches(GgmlDType::Q4_0, false)
+}
+#[test]
+fn routed_pair_q4_0_down_shape() -> Result<()> {
+    routed_pair_is_the_two_launches(GgmlDType::Q4_0, true)
+}
+#[test]
+fn routed_pair_q2_0_gate_shape() -> Result<()> {
+    routed_pair_is_the_two_launches(GgmlDType::Q2_0, false)
+}
+#[test]
+fn routed_pair_iq4_nl_gate_shape() -> Result<()> {
+    routed_pair_is_the_two_launches(GgmlDType::IQ4NL, false)
 }

@@ -8624,6 +8624,119 @@ template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl>>;
 template [[host_name("kernel_mul_mv_id_q2_0_f32")]]    kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_q2_0_f32_impl>>;
 
+// ---- lloom #749 P31 (3): gate and up in ONE routed launch ----
+// `kernel_mul_mv_id`'s plane decode over TWO stacked weights of one kind and
+// geometry: planes `[0, nei0·nei1)` read `src0a` into `dst[0]`, planes
+// `[nei0·nei1, 2·nei0·nei1)` read `src0b` into `dst[1]` (`dst` is
+// `[2, batch, topk, ne0]`). Each plane's arithmetic is the single launch's,
+// so the pair is byte-identical to two launches; what changes is the grid —
+// twice the threadgroups in flight per launch, half the launches and their
+// barriers (the routed gate|up were 2 × 48 launches a decode step).
+template<mul_mv_impl_fn_t impl_fn>
+kernel void kernel_mul_mv_id2(
+        device const    char * src0a,
+        device const    char * src0b,
+        device const    char * src1,
+        device         float * dst,
+        device const    char * ids,
+        constant     int64_t & nei0,
+        constant     int64_t & nei1,
+        constant    uint64_t & nbi1,
+        constant     int64_t & ne00,
+        constant     int64_t & ne01,
+        constant     int64_t & ne02,
+        constant    uint64_t & nb00,
+        constant    uint64_t & nb01,
+        constant    uint64_t & nb02,
+        constant     int64_t & ne10,
+        constant     int64_t & ne11,
+        constant     int64_t & ne12,
+        constant     int64_t & ne13,
+        constant    uint64_t & nb10,
+        constant    uint64_t & nb11,
+        constant    uint64_t & nb12,
+        constant     int64_t & ne0,
+        constant     int64_t & ne1,
+        constant    uint64_t & nb1,
+        threadgroup int8_t   * shared_values [[threadgroup(0)]],
+        uint3                  tgpig[[threadgroup_position_in_grid]],
+        uint                   tiitg[[thread_index_in_threadgroup]],
+        uint                   tiisg[[thread_index_in_simdgroup]],
+        uint                   sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int planes = nei0 * nei1;
+    const int hf = tgpig.z / planes;          // 0: src0a -> dst[0]; 1: src0b -> dst[1]
+    const int z = tgpig.z - hf * planes;
+    const int iid1 = z/nei0;
+    const int idx = z%nei0;
+
+    tgpig.z = 0;
+
+    const int32_t i02 = ((device const int32_t *) (ids + iid1*nbi1))[idx];
+
+    const int64_t i11 = idx % ne11;
+    const int64_t i12 = iid1;
+
+    const int64_t i1 = idx;
+    const int64_t i2 = i12;
+
+    device const char * src0_cur = (hf ? src0b : src0a) + i02*nb02;
+    device const char * src1_cur = src1 + i11*nb11 + i12*nb12;
+    device      float * dst_cur  = dst + hf*nei1*ne1*ne0 + i1*ne0 + i2*ne1*ne0;
+
+    impl_fn(
+        /* src0 */ src0_cur,
+        /* src1 */ src1_cur,
+        /* dst  */ dst_cur,
+        /* ne00 */ ne00,
+        /* ne01 */ ne01,
+        /* ne02 */ 1,
+        /* nb00 */ nb00,
+        /* nb01 */ nb01,
+        /* nb02 */ nb02,
+        /* ne10 */ ne10,
+        /* ne11 */ 1,
+        /* ne12 */ 1,
+        /* ne13 */ 1,
+        /* nb10 */ nb10,
+        /* nb11 */ nb11,
+        /* nb12 */ nb12,
+        /* ne0  */ ne0,
+        /* ne1  */ 1,
+        /* nb1  */ nb1,
+        /* r2   */ 1,
+        /* r3   */ 1,
+        shared_values,
+        tgpig,
+        tiitg,
+        tiisg,
+        sgitg);
+}
+
+typedef decltype(kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_impl<float, float4, float, float4>>>) kernel_mul_mv_id2_t;
+
+template [[host_name("kernel_mul_mv_id2_f32_f32")]]     kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_impl<float, float4, float, float4>>>;
+template [[host_name("kernel_mul_mv_id2_f16_f32")]]     kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_impl<half, half4, float, float4>>>;
+template [[host_name("kernel_mul_mv_id2_q8_0_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_q8_0_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_q4_0_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<mul_vec_q_n_f32_impl<block_q4_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH>>>;
+template [[host_name("kernel_mul_mv_id2_q4_1_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<mul_vec_q_n_f32_impl<block_q4_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH>>>;
+template [[host_name("kernel_mul_mv_id2_q5_0_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<mul_vec_q_n_f32_impl<block_q5_0, N_DST, N_SIMDGROUP, N_SIMDWIDTH>>>;
+template [[host_name("kernel_mul_mv_id2_q5_1_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<mul_vec_q_n_f32_impl<block_q5_1, N_DST, N_SIMDGROUP, N_SIMDWIDTH>>>;
+template [[host_name("kernel_mul_mv_id2_q2_K_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_q2_K_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_q3_K_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_q3_K_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_q4_K_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_q4_K_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_q5_K_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_q5_K_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_q6_K_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_q6_K_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_iq1_s_f32")]]   kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_iq1_s_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_iq1_m_f32")]]   kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_iq1_m_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_iq2_xxs_f32")]] kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_iq2_xxs_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_iq2_xs_f32")]]  kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_iq2_xs_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_iq3_xxs_f32")]] kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_iq3_xxs_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_iq3_s_f32")]]   kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_iq3_s_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_iq2_s_f32")]]   kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_iq2_s_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_iq4_nl_f32")]]  kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_iq4_xs_f32")]]  kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl>>;
+template [[host_name("kernel_mul_mv_id2_q2_0_f32")]]    kernel kernel_mul_mv_id2_t kernel_mul_mv_id2<mmv_fn<kernel_mul_mv_q2_0_f32_impl>>;
+
 // ---- issue #748 (#750 item B): the (f16, f32, f16) ROUTED arm ----
 // The routed kernel over the genericized cores at `<half, half>`: f16
 // activations read, f32 accumulate inside every core, f16 store. The `_f32`

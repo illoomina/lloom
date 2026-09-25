@@ -1103,6 +1103,35 @@ impl QTensor {
         })
     }
 
+    /// Gate and up of one routed layer — two stacked weights of one kind and
+    /// shape — in ONE Metal launch (`kernel_mul_mv_id2`, lloom #749 P31 (3)):
+    /// `(self · x, up · x)` each `[batch, topk, n]`, each byte-identical to
+    /// its own [`Self::indexed_moe_forward`]. Two launches off Metal, with
+    /// f16 activations, when the pair's kinds or shapes differ, or under
+    /// `LLOOM_MOE_PAIR=off` (the A/B arm).
+    pub fn indexed_moe_forward_pair(&self, up: &QTensor, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        #[cfg(feature = "metal")]
+        if moe_pair_on() && self.dtype() == up.dtype() && self.shape() == up.shape() && x.dtype() == DType::F32 {
+            if let (QStorage::Metal(a), QStorage::Metal(b)) = (&self.storage, &up.storage) {
+                let (xs, is) = (x.storage(), ids.storage());
+                if let (Storage::Metal(xs), Storage::Metal(is)) = (&*xs, &*is) {
+                    let (storage, shape) =
+                        a.indexed_moe_forward_pair(b, self.shape(), xs, x.layout(), is, ids.layout())?;
+                    let both = crate::tensor::from_storage(
+                        Storage::Metal(storage),
+                        shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    );
+                    let g = both.narrow(0, 0, 1)?.squeeze(0)?;
+                    let u = both.narrow(0, 1, 1)?.squeeze(0)?;
+                    return Ok((g, u));
+                }
+            }
+        }
+        Ok((self.indexed_moe_forward(x, ids)?, up.indexed_moe_forward(x, ids)?))
+    }
+
     /// Routed-expert matmul over a stacked quantized weight `[n_experts, n, k]`:
     /// `x` `[batch, in_dim1, k]` with `in_dim1 ∈ {1, topk}`, `ids` `[batch, topk]`
     /// → `[batch, topk, n]`, where plane `(b, t)` is `x[b, t or 0] · Wᵀ[ids[b, t]]`.
@@ -1271,6 +1300,14 @@ impl QMatMul {
             _ => w.t()?,
         };
         xs.to_dtype(DType::F16)?.matmul(&w)?.to_dtype(in_dtype)
+    }
+
+    /// [`QTensor::indexed_moe_forward_pair`] on two quantized weights.
+    pub fn indexed_moe_forward_pair(&self, up: &QMatMul, x: &Tensor, ids: &Tensor) -> Result<(Tensor, Tensor)> {
+        match (self, up) {
+            (Self::QTensor(g), Self::QTensor(u)) => g.indexed_moe_forward_pair(u, x, ids),
+            _ => Ok((self.indexed_moe_forward(x, ids)?, up.indexed_moe_forward(x, ids)?)),
+        }
     }
 
     pub fn indexed_moe_forward(&self, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
@@ -1506,4 +1543,17 @@ impl QMatMul {
             scale,
         }))
     }
+}
+
+/// The routed gate|up pair launch (`LLOOM_MOE_PAIR`, read once): on unless
+/// `off` | `0` — the A/B arm of lloom #749 P31 (3).
+#[cfg(feature = "metal")]
+fn moe_pair_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("LLOOM_MOE_PAIR").ok().as_deref(),
+            Some("off") | Some("0")
+        )
+    })
 }

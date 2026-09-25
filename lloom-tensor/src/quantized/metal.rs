@@ -827,6 +827,79 @@ impl QMetalStorage {
         Ok((out, dst_shape))
     }
 
+    /// Gate and up of one routed layer in ONE launch (`kernel_mul_mv_id2`,
+    /// lloom #749 P31 (3)): `other` is the second stacked weight of the SAME
+    /// kind and shape; the result is `[2, batch, topk, n]` f32 — plane set 0
+    /// this weight's, plane set 1 `other`'s, each what
+    /// [`Self::indexed_moe_forward`] computes for it. f32 activations only.
+    pub fn indexed_moe_forward_pair(
+        &self,
+        other: &Self,
+        self_shape: &Shape,
+        input: &MetalStorage,
+        input_l: &Layout,
+        ids: &MetalStorage,
+        ids_l: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        use crate::MetalError;
+        let (n_experts, n, k) = self_shape.dims3()?;
+        if !input_l.is_contiguous() || !ids_l.is_contiguous() {
+            crate::bail!("indexed_moe_forward_pair needs contiguous input and ids")
+        }
+        if other.dtype != self.dtype || other.buffer.length() != self.buffer.length() {
+            crate::bail!(
+                "indexed_moe_forward_pair: the two weights differ ({:?}/{} vs {:?}/{})",
+                self.dtype,
+                self.buffer.length(),
+                other.dtype,
+                other.buffer.length()
+            )
+        }
+        if input.dtype() != DType::F32 {
+            crate::bail!("indexed_moe_forward_pair: f32 activations only, got {:?}", input.dtype())
+        }
+        if ids.dtype() != DType::U32 {
+            crate::bail!("indexed_moe_forward_pair ids must be u32, got {:?}", ids.dtype())
+        }
+        let ggml_dtype: crate::kernels::GgmlDType = self.dtype.into();
+        let (batch, in_dim1, k_in) = input_l.shape().dims3()?;
+        let (batch_ids, topk) = ids_l.shape().dims2()?;
+        if k_in != k || batch != batch_ids || (in_dim1 != 1 && in_dim1 != topk) {
+            crate::bail!(
+                "indexed_moe_forward_pair: input {:?} / ids {:?} do not fit weight {:?}",
+                input_l.shape(),
+                ids_l.shape(),
+                self_shape
+            )
+        }
+        let device = self.device.clone();
+        let dst_shape = Shape::from((2, batch, topk, n));
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_label("qmatmul_id2")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        crate::kernels::call_quantized_matmul_mv_id2_t(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            ggml_dtype,
+            (n_experts, n, k),
+            (batch, topk, in_dim1),
+            &self.buffer,
+            &other.buffer,
+            input.buffer(),
+            input_l.start_offset() * DType::F32.size_in_bytes(),
+            ids.buffer(),
+            ids_l.start_offset() * DType::U32.size_in_bytes(),
+            &dst,
+        )
+        .map_err(MetalError::from)?;
+        let out = MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+        Ok((out, dst_shape))
+    }
+
     /// Overwrite `len` bytes at `offset` with what `fill` writes: the bytes go
     /// into a Shared staging buffer on the host and are copied into this
     /// storage by a `copy2d` dispatch on the current compute encoder —

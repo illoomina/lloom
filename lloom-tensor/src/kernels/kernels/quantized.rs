@@ -233,7 +233,11 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
             let nsg = iq_nsg(dtype);
             (4, 8 * nsg, 2 * nsg)
         }
-        GgmlDType::IQ2XXS | GgmlDType::IQ2S | GgmlDType::IQ3XXS | GgmlDType::IQ3S => {
+        GgmlDType::IQ2S => {
+            let nsg = iq_nsg(dtype);
+            (4, 8 * nsg, 4 * nsg)
+        }
+        GgmlDType::IQ2XXS | GgmlDType::IQ3XXS | GgmlDType::IQ3S => {
             let nth0 = 4;
             let nth1 = 16;
             let align = 8;
@@ -265,6 +269,7 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
 pub(crate) fn iq_nsg(dtype: GgmlDType) -> usize {
     static IQ2XS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     static IQ4NL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static IQ2S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let read = |var: &str, default: usize| {
         std::env::var(var)
             .ok()
@@ -278,6 +283,9 @@ pub(crate) fn iq_nsg(dtype: GgmlDType) -> usize {
         // 4, 1 slower); every arm byte-identical (the row mapping alone).
         GgmlDType::IQ2XS => *IQ2XS.get_or_init(|| read("LLOOM_QMV_IQ2XS_NSG", 4)),
         GgmlDType::IQ4NL => *IQ4NL.get_or_init(|| read("LLOOM_QMV_IQ4NL_NSG", 4)),
+        // The IQ2_S core stages its 8 KB grid per threadgroup (P31 (4)); 4
+        // amortises the staging over 16 rows as the IQ2_XS core's does.
+        GgmlDType::IQ2S => *IQ2S.get_or_init(|| read("LLOOM_QMV_IQ2S_NSG", 4)),
         _ => 2,
     }
 }
@@ -309,6 +317,7 @@ fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
         GgmlDType::IQ2XS => Some(ConstantValues::new(vec![(910, Value::USize(iq_nsg(dtype)))])),
         GgmlDType::IQ4NL => Some(ConstantValues::new(vec![(911, Value::USize(iq_nsg(dtype)))])),
         GgmlDType::Q6K => Some(ConstantValues::new(vec![(912, Value::USize(q6k_nr0()))])),
+        GgmlDType::IQ2S => Some(ConstantValues::new(vec![(913, Value::USize(iq_nsg(dtype)))])),
         _ => None,
     }
 }

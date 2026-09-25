@@ -2377,6 +2377,13 @@ constant bool NSG_IQ2XS_SET = is_function_constant_defined(NSG_IQ2XS_FC);
 constant bool NSG_IQ4NL_SET = is_function_constant_defined(NSG_IQ4NL_FC);
 #define NSG_IQ2XS (NSG_IQ2XS_SET ? (int)NSG_IQ2XS_FC : 2)
 #define NSG_IQ4NL (NSG_IQ4NL_SET ? (int)NSG_IQ4NL_FC : 2)
+// The IQ2_S core's simdgroups a threadgroup (lloom #749 P31 (4)): its 8 KB
+// grid is staged into threadgroup memory once per threadgroup (the port and
+// ggml master read it from `constant` memory with divergent indices — the
+// routed gate|up at 32 GB/s where the staged IQ2_XS core reads 105).
+constant ulong NSG_IQ2S_FC [[function_constant(913)]];
+constant bool NSG_IQ2S_SET = is_function_constant_defined(NSG_IQ2S_FC);
+#define NSG_IQ2S (NSG_IQ2S_SET ? (int)NSG_IQ2S_FC : 2)
 // Rows a simdgroup of the Q6_K matvec core (`LLOOM_QMV_Q6K_NR0`, 1..4; the
 // incumbent 1 without the constant; #749 P29 (6)).
 constant ulong NR0_Q6K_FC [[function_constant(912)]];
@@ -6317,7 +6324,9 @@ void kernel_mul_mv_iq2_s_impl(
     const int r1 = tgpig.y;
     const int im = tgpig.z;
 
-    const int first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST;
+    // NSG_IQ2S simdgroups a threadgroup (the host dispatches 32·NSG_IQ2S
+    // threads and N_DST·NSG_IQ2S rows), the grid staged once per threadgroup.
+    const int first_row = (r0 * NSG_IQ2S + sgitg) * N_DST;
     const int ib_row = first_row * nb;
 
     const uint i12 = im%ne12;
@@ -6333,13 +6342,15 @@ void kernel_mul_mv_iq2_s_impl(
 
     const int nb32 = nb * (QK_K / 32);
 
-    //threadgroup uint64_t * values = (threadgroup uint64_t *)shared_values;
-    //{
-    //    int nval = 32;
-    //    int pos  = (32*sgitg + tiisg)*nval;
-    //    for (int i = 0; i < nval; ++i) values[pos + i] = iq2s_grid[pos + i];
-    //    threadgroup_barrier(mem_flags::mem_threadgroup);
-    //}
+    // The 1024-entry grid (8 KB) over 32·NSG_IQ2S threads, strided (P29 (5):
+    // a `tid < N` staging under a smaller threadgroup leaves entries unset).
+    threadgroup uint64_t * values = (threadgroup uint64_t *)shared_values;
+    {
+        const int tid = 32*sgitg + tiisg;
+        const int nthr = 32*NSG_IQ2S;
+        for (int i = tid; i < 1024; i += nthr) values[i] = iq2s_grid[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     const int ix = tiisg;
 
@@ -6369,10 +6380,8 @@ void kernel_mul_mv_iq2_s_impl(
 
             float2 sum = {0};
             for (int l = 0; l < 2; ++l) {
-                //const threadgroup uint8_t * grid1 = (const threadgroup uint8_t *)(values + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
-                //const threadgroup uint8_t * grid2 = (const threadgroup uint8_t *)(values + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
-                constant uint8_t * grid1 = (constant uint8_t *)(iq2s_grid + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
-                constant uint8_t * grid2 = (constant uint8_t *)(iq2s_grid + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
+                const threadgroup uint8_t * grid1 = (const threadgroup uint8_t *)(values + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
+                const threadgroup uint8_t * grid2 = (const threadgroup uint8_t *)(values + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
                 for (int j = 0; j < 8; ++j) {
                     sum[0] += yl[8*l + j +  0] * grid1[j] * select(1, -1, signs[l+0] & kmask_iq2xs[j]);
                     sum[1] += yl[8*l + j + 16] * grid2[j] * select(1, -1, signs[l+2] & kmask_iq2xs[j]);

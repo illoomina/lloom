@@ -586,19 +586,29 @@ fn routed_mv_id_census() {
     });
     let mut file = std::fs::File::open(&path).unwrap();
     let content = Content::read(&mut file).unwrap();
-    let layers = [0usize, 1];
-    let tiers: Vec<(Resident, String, usize, usize, usize)> = layers
-        .iter()
-        .map(|l| {
-            let mut load = |n: &str| Arc::new(content.tensor(&mut file, &format!("blk.{l}.{n}.weight"), &dev).unwrap());
-            let (g, u, d) = (load("ffn_gate_exps"), load("ffn_up_exps"), load("ffn_down_exps"));
-            let kinds = format!("gate={:?} up={:?} down={:?}", g.dtype(), u.dtype(), d.dtype());
-            let n_experts = g.shape().dims()[0];
-            let per_expert = (g.storage_size_in_bytes() + u.storage_size_in_bytes() + d.storage_size_in_bytes()) / n_experts;
-            let gu_per_expert = (g.storage_size_in_bytes() + u.storage_size_in_bytes()) / n_experts;
-            (Resident::new(g, u, d), kinds, n_experts, per_expert, gu_per_expert)
-        })
-        .collect();
+    // The routed kinds BY LAYER, from the header (P31 (1): seven kinds route
+    // at decode, where P29 (4)–P30 (3) benched layers 0–1 alone). Per kind,
+    // up to six layers' experts are cycled so the ten experts' bytes
+    // (18.7 MB a layer) stream from memory, not the SLC (P30 (2)'s census
+    // cycled two layers, 37 MB — under it).
+    let kind_of = |l: usize, n: &str| -> Option<String> {
+        content
+            .tensor_infos
+            .get(&format!("blk.{l}.{n}.weight"))
+            .map(|i| format!("{:?}", i.ggml_dtype))
+    };
+    let mut by_gate: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    let mut by_down: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
+    for l in 0..256 {
+        let Some(g) = kind_of(l, "ffn_gate_exps") else { break };
+        let d = kind_of(l, "ffn_down_exps").unwrap();
+        by_gate.entry(g).or_default().push(l);
+        by_down.entry(d).or_default().push(l);
+    }
+    let cycle = std::env::var("QWEN4EXP_CENSUS_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(6);
     let hidden = 2560usize;
     let inter = 640usize;
     let topk = 10usize;
@@ -607,30 +617,45 @@ fn routed_mv_id_census() {
     let mut ids_v: Vec<u32> = (0..topk as u32).map(|i| (i * 47 + 3) % 512).collect();
     ids_v.sort_unstable();
     let ids = Tensor::from_vec(ids_v, (1, topk), &dev).unwrap();
-    println!("ROUTEDMV shard={path} kinds={} experts={} bytes/expert={}", tiers[0].1, tiers[0].2, tiers[0].3);
-    // The GPU's clock ramps under load: a short burst reads at a low clock
-    // and the census varied ±40 % run to run on a quiet machine (P30 (2)).
-    // So: ~1 s of the same work first, then five timed batches, the
-    // median and the min reported (the min is the clock's ceiling).
-    let time = |name: &str, bytes: usize, f: &dyn Fn(usize)| {
+    println!(
+        "ROUTEDMV shard={path} gate_kinds={:?} down_kinds={:?} cycle={cycle}",
+        by_gate.iter().map(|(k, v)| (k.clone(), v.len())).collect::<Vec<_>>(),
+        by_down.iter().map(|(k, v)| (k.clone(), v.len())).collect::<Vec<_>>()
+    );
+    let mut load_tiers = |layers: &[usize]| -> Vec<(Resident, usize, usize)> {
+        layers
+            .iter()
+            .map(|l| {
+                let mut load = |n: &str| Arc::new(content.tensor(&mut file, &format!("blk.{l}.{n}.weight"), &dev).unwrap());
+                let (g, u, d) = (load("ffn_gate_exps"), load("ffn_up_exps"), load("ffn_down_exps"));
+                let n_experts = g.shape().dims()[0];
+                let gu_per_expert = (g.storage_size_in_bytes() + u.storage_size_in_bytes()) / n_experts;
+                let d_per_expert = d.storage_size_in_bytes() / n_experts;
+                (Resident::new(g, u, d), gu_per_expert, d_per_expert)
+            })
+            .collect()
+    };
+    // The GPU's clock ramps under load (P30 (2)): ~1 s of the same work
+    // first, then five timed batches, the median and the min reported.
+    let time = |name: &str, bytes: usize, n_tiers: usize, f: &dyn Fn(usize)| {
         let warm = Instant::now();
         let mut i = 0usize;
         while warm.elapsed().as_secs_f64() < 1.0 {
-            f(i % tiers.len());
+            f(i % n_tiers);
             i += 1;
             if i % 64 == 0 {
                 dev.synchronize().unwrap();
             }
         }
         dev.synchronize().unwrap();
-        let iters = 64 * tiers.len();
+        let iters = 64 * n_tiers;
         let mut gpu: Vec<f64> = Vec::new();
         let mut wall: Vec<f64> = Vec::new();
         for _ in 0..5 {
             profile::reset();
             let t = Instant::now();
             for i in 0..iters {
-                f(i % tiers.len());
+                f(i % n_tiers);
             }
             dev.synchronize().unwrap();
             wall.push(t.elapsed().as_secs_f64() * 1e6 / iters as f64);
@@ -653,12 +678,30 @@ fn routed_mv_id_census() {
             bytes as f64 / gpu_min / 1e3
         );
     };
-    let gu_bytes = tiers[0].4 * topk;
-    let d_bytes = (tiers[0].3 - tiers[0].4) * topk;
-    time("gate_up(10 experts)", gu_bytes, &|k| {
-        let _ = tiers[k].0.gate_up(&x, &ids).unwrap();
-    });
-    time("down(10 experts)", d_bytes, &|k| {
-        let _ = tiers[k].0.down(&h, &ids).unwrap();
-    });
+    for (kind, layers) in &by_gate {
+        let layers: Vec<usize> = layers.iter().cloned().take(cycle).collect();
+        let tiers = load_tiers(&layers);
+        let gu_bytes = tiers[0].1 * topk;
+        time(
+            &format!("gate_up kind={kind} layers={layers:?}"),
+            gu_bytes,
+            tiers.len(),
+            &|k| {
+                let _ = tiers[k].0.gate_up(&x, &ids).unwrap();
+            },
+        );
+    }
+    for (kind, layers) in &by_down {
+        let layers: Vec<usize> = layers.iter().cloned().take(cycle).collect();
+        let tiers = load_tiers(&layers);
+        let d_bytes = tiers[0].2 * topk;
+        time(
+            &format!("down kind={kind} layers={layers:?}"),
+            d_bytes,
+            tiers.len(),
+            &|k| {
+                let _ = tiers[k].0.down(&h, &ids).unwrap();
+            },
+        );
+    }
 }

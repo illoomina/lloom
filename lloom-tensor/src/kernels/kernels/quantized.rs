@@ -180,18 +180,20 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
             let align = 4;
             (nth0, nth1, align)
         }
-        GgmlDType::Q4K => {
-            let nth0 = 4;
-            let nth1 = 8;
-            let align = 4;
-            (nth0, nth1, align)
-        }
-        GgmlDType::Q3K | GgmlDType::Q5K => {
+        GgmlDType::Q4K => match q4k_nr0() {
+            // Two simdgroups of `nr0` rows (P31 (5)).
+            Some(nr0) => (4, 16, 2 * nr0),
+            // The incumbent: one simdgroup, four rows.
+            None => (4, 8, 4),
+        },
+        GgmlDType::Q3K => {
             let nth0 = 2;
             let nth1 = 32;
             let align = 4;
             (nth0, nth1, align)
         }
+        // Two simdgroups of `nr0` rows (2 the incumbent; P31 (5)).
+        GgmlDType::Q5K => (2, 32, 2 * q5k_nr0().unwrap_or(2)),
         GgmlDType::Q6K => {
             // Two simdgroups a threadgroup, `q6k_nr0()` rows each (P29 (6)).
             let nth0 = 2;
@@ -309,6 +311,32 @@ pub(crate) fn q6k_nr0() -> usize {
     })
 }
 
+/// Rows a simdgroup for the Q4_K core (`LLOOM_QMV_Q4K_NR0`, read once;
+/// 1..4): set, the core runs TWO simdgroups of that many rows (ggml
+/// master's 2 × 2) in a 64-thread threadgroup; unset, the incumbent one
+/// simdgroup of four rows in a 32-thread threadgroup (P31 (5)).
+pub(crate) fn q4k_nr0() -> Option<usize> {
+    static NR0: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *NR0.get_or_init(|| {
+        std::env::var("LLOOM_QMV_Q4K_NR0")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=4).contains(n))
+    })
+}
+
+/// Rows a simdgroup for the Q5_K core (`LLOOM_QMV_Q5K_NR0`, read once;
+/// 1..2): the incumbent is 2, ggml master's 1 (P31 (5)).
+pub(crate) fn q5k_nr0() -> Option<usize> {
+    static NR0: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *NR0.get_or_init(|| {
+        std::env::var("LLOOM_QMV_Q5K_NR0")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=2).contains(n))
+    })
+}
+
 /// The function constants a matvec pipeline of `dtype` is loaded with:
 /// the simdgroup count for the IQ2_XS / IQ4_NL cores, the rows a simdgroup
 /// for Q6_K, none elsewhere.
@@ -318,6 +346,10 @@ fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
         GgmlDType::IQ4NL => Some(ConstantValues::new(vec![(911, Value::USize(iq_nsg(dtype)))])),
         GgmlDType::Q6K => Some(ConstantValues::new(vec![(912, Value::USize(q6k_nr0()))])),
         GgmlDType::IQ2S => Some(ConstantValues::new(vec![(913, Value::USize(iq_nsg(dtype)))])),
+        // Always supplied (a function naming a constant must be specialised
+        // to build a pipeline); 0 selects the incumbent geometry.
+        GgmlDType::Q4K => Some(ConstantValues::new(vec![(914, Value::USize(q4k_nr0().unwrap_or(0)))])),
+        GgmlDType::Q5K => Some(ConstantValues::new(vec![(915, Value::USize(q5k_nr0().unwrap_or(0)))])),
         _ => None,
     }
 }
@@ -483,7 +515,11 @@ pub fn call_quantized_matmul_mv_t(
             GemvTriple::F32F32F32,
             GgmlDType::Q6K | GgmlDType::Q4K | GgmlDType::IQ4XS | GgmlDType::IQ3S | GgmlDType::IQ4NL,
             2..=8,
-        ) if rows_arm_on() => {
+        // The rows kernels keep the incumbent Q4_K geometry (one simdgroup of
+        // four rows); under the Q4_K rows-a-simdgroup arm (P31 (5)) they
+        // would be dispatched at the other shape, so the two arms do not
+        // compose — the per-row launches instead.
+        ) if rows_arm_on() && !(matches!(dtype, GgmlDType::Q4K) && q4k_nr0().is_some()) => {
             let nr1 = if m <= 2 { 2 } else { 4 };
             (format!("{name}_r{nr1}"), nr1)
         }

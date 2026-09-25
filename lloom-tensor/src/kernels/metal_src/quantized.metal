@@ -2384,6 +2384,19 @@ constant bool NSG_IQ4NL_SET = is_function_constant_defined(NSG_IQ4NL_FC);
 constant ulong NSG_IQ2S_FC [[function_constant(913)]];
 constant bool NSG_IQ2S_SET = is_function_constant_defined(NSG_IQ2S_FC);
 #define NSG_IQ2S (NSG_IQ2S_SET ? (int)NSG_IQ2S_FC : 2)
+// Rows a simdgroup for the Q4_K and Q5_K cores (lloom #749 P31 (5)): set,
+// the Q4_K core runs two simdgroups of NR0_Q4K rows (ggml master's 2 × 2)
+// instead of one simdgroup of N_DST rows; the Q5_K core NR0_Q5K rows a
+// simdgroup instead of its two (master's 1 × 2). Unset, both are the
+// incumbents, byte for byte.
+// Always supplied by the host (a function that names a function constant
+// must be specialised to build a pipeline); 0 is "the incumbent".
+constant ulong NR0_Q4K_FC [[function_constant(914)]];
+constant bool NR0_Q4K_SET = is_function_constant_defined(NR0_Q4K_FC) ? (NR0_Q4K_FC != 0) : false;
+#define NR0_Q4K (NR0_Q4K_SET ? (int)NR0_Q4K_FC : N_DST)
+constant ulong NR0_Q5K_FC [[function_constant(915)]];
+constant bool NR0_Q5K_SET = is_function_constant_defined(NR0_Q5K_FC) ? (NR0_Q5K_FC != 0) : false;
+#define NR0_Q5K (NR0_Q5K_SET ? (int)NR0_Q5K_FC : 2)
 // Rows a simdgroup of the Q6_K matvec core (`LLOOM_QMV_Q6K_NR0`, 1..4; the
 // incumbent 1 without the constant; #749 P29 (6)).
 constant ulong NR0_Q6K_FC [[function_constant(912)]];
@@ -5215,8 +5228,11 @@ void kernel_mul_mv_q4_K_impl(
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
-    //const int first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST;
-    const int first_row = r0 * N_DST;
+    // NR0_Q4K rows a simdgroup over two simdgroups when the constant is set
+    // (ggml master's 2 × 2; lloom #749 P31 (5)); unset, the incumbent one
+    // simdgroup of N_DST rows in a 32-thread threadgroup.
+    const int nr = NR0_Q4K_SET ? NR0_Q4K : N_DST;
+    const int first_row = NR0_Q4K_SET ? (r0 * N_SIMDGROUP + sgitg) * nr : r0 * N_DST;
     const int ib_row = first_row * nb;
 
     const uint i12 = im%ne12;
@@ -5252,7 +5268,7 @@ void kernel_mul_mv_q4_K_impl(
         device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
         device const half     * dh = &x[ib].d;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < nr; row++) {
 
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
@@ -5290,7 +5306,7 @@ void kernel_mul_mv_q4_K_impl(
         y4 += 4 * QK_K;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < nr; ++row) {
         all_sum = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(all_sum);
@@ -5372,7 +5388,9 @@ void kernel_mul_mv_q5_K_impl(
     const int64_t r1 = tgpig.y;
     const int im = tgpig.z;
 
-    const int first_row = (r0 * N_SIMDGROUP + sgitg) * 2;
+    // NR0_Q5K rows a simdgroup (2 the incumbent; 1 ggml master's; P31 (5)).
+    const int nr = NR0_Q5K;
+    const int first_row = (r0 * N_SIMDGROUP + sgitg) * nr;
 
     const uint i12 = im%ne12;
     const uint i13 = im/ne12;
@@ -5428,7 +5446,7 @@ void kernel_mul_mv_q5_K_impl(
             yh[l+8] = y2[l+32]; sumy[3] += yh[l+8];
         }
 
-        for (int row = 0; row < 2; ++row) {
+        for (int row = 0; row < nr; ++row) {
 
             device const uint8_t * q2 = q1 + 64;
 
@@ -5469,7 +5487,7 @@ void kernel_mul_mv_q5_K_impl(
 
     }
 
-    for (int row = 0; row < 2; ++row) {
+    for (int row = 0; row < nr; ++row) {
         const float tot = simd_sum(sumf[row]);
         if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = (STORE)(tot);

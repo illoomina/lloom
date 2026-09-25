@@ -68,13 +68,7 @@ pub struct IoQueue {
 /// split across. Read once.
 pub fn io_lanes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("LLOOM_IO_LANES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(8)
-    })
+    *N.get_or_init(|| crate::tuning::tuning().metal.io_lanes.max(1))
 }
 
 // SAFETY: the queue and events are thread-safe Metal objects; the counters are

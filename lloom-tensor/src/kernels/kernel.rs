@@ -362,23 +362,9 @@ impl Kernels {
 /// `__compute` section-size comparison between the built arms — see
 /// `measurements/probes/issue-434/`.
 fn additional_compiler_arguments() -> Option<&'static str> {
-    use std::sync::OnceLock;
-    static ARGS: OnceLock<Option<String>> = OnceLock::new();
-    ARGS.get_or_init(|| match std::env::var("LLOOM_434_METAL_CFLAGS") {
-        // An empty value is a mistake worth failing on rather than silently
-        // treating as unset: it is what an unset shell variable expands to, so
-        // accepting it would let `LLOOM_434_METAL_CFLAGS=$UNSET` run the
-        // baseline while the batch script believes it ran an arm.
-        Ok(v) if v.trim().is_empty() => panic!(
-            "LLOOM_434_METAL_CFLAGS is set but empty. Unset it to run the \
-             default arm; an empty value is almost always an unexpanded \
-             shell variable, which would silently run the baseline (§2.4)."
-        ),
-        Ok(v) => Some(v),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(e) => panic!("LLOOM_434_METAL_CFLAGS is not valid UTF-8: {e}"),
-    })
-    .as_deref()
+    // An empty value is refused by the parser (`tuning.rs`), as the variable
+    // was: it is what an unset shell variable expands to.
+    crate::tuning::tuning().metal.cflags.as_deref()
 }
 
 /// What [`additional_compiler_arguments`] resolved to, **for the record**.
@@ -475,23 +461,7 @@ pub fn metal_compile_flags() -> Option<&'static str> {
 /// toggle does not, which is why the helper is right for its callers and wrong
 /// for this one.
 pub fn merged_translation_unit() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| match std::env::var("LLOOM_477_MERGED_UNIT") {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(v) => match v.trim() {
-            "1" | "true" | "yes" | "on" => true,
-            "0" | "false" | "no" | "off" => false,
-            other => panic!(
-                "LLOOM_477_MERGED_UNIT={other:?} is not a value this arm \
-                 understands. Use 1/true/yes/on or 0/false/no/off, or unset it \
-                 for the default (per-source) arm. Accepting an unknown value \
-                 as `off` would let a batch script run the baseline while \
-                 believing it ran the merged arm (§2.4)."
-            ),
-        },
-        Err(e) => panic!("LLOOM_477_MERGED_UNIT is not valid UTF-8: {e}"),
-    })
+    crate::tuning::tuning().metal.merged_unit
 }
 
 /// Whether this process compiles its kernels under `MTLMathMode::Fast`

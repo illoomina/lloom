@@ -269,25 +269,15 @@ fn mv_threadgroup(dtype: GgmlDType) -> (usize, usize, usize) {
 /// constant (`NSG_IQ2XS_FC` / `NSG_IQ4NL_FC`); the default is the
 /// incumbent 2.
 pub(crate) fn iq_nsg(dtype: GgmlDType) -> usize {
-    static IQ2XS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    static IQ4NL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    static IQ2S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let read = |var: &str, default: usize| {
-        std::env::var(var)
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| (1..=16).contains(n))
-            .unwrap_or(default)
-    };
     match dtype {
         // 4 by default (P30 (3)): on the warm census the routed gate|up read
         // 97.6 → 90.3 µs and the down 75.0 → 66.3 against 2 (8 the same as
         // 4, 1 slower); every arm byte-identical (the row mapping alone).
-        GgmlDType::IQ2XS => *IQ2XS.get_or_init(|| read("LLOOM_QMV_IQ2XS_NSG", 4)),
-        GgmlDType::IQ4NL => *IQ4NL.get_or_init(|| read("LLOOM_QMV_IQ4NL_NSG", 4)),
+        GgmlDType::IQ2XS => crate::tuning::tuning().qmv.iq2xs_nsg,
+        GgmlDType::IQ4NL => crate::tuning::tuning().qmv.iq4nl_nsg,
         // The IQ2_S core stages its 8 KB grid per threadgroup (P31 (4)); 4
         // amortises the staging over 16 rows as the IQ2_XS core's does.
-        GgmlDType::IQ2S => *IQ2S.get_or_init(|| read("LLOOM_QMV_IQ2S_NSG", 4)),
+        GgmlDType::IQ2S => crate::tuning::tuning().qmv.iq2s_nsg,
         _ => 2,
     }
 }
@@ -301,14 +291,7 @@ pub(crate) fn iq_nsg(dtype: GgmlDType) -> usize {
 /// the logits digest moves (Paris `054a6ef1…` → `5f5ddb57…`, the tokens
 /// unmoved); `1` is the incumbent arm.
 pub(crate) fn q6k_nr0() -> usize {
-    static NR0: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *NR0.get_or_init(|| {
-        std::env::var("LLOOM_QMV_Q6K_NR0")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| (1..=4).contains(n))
-            .unwrap_or(2)
-    })
+    crate::tuning::tuning().qmv.q6k_nr0
 }
 
 /// Rows a simdgroup for the Q4_K core (`LLOOM_QMV_Q4K_NR0`, read once;
@@ -316,25 +299,13 @@ pub(crate) fn q6k_nr0() -> usize {
 /// master's 2 × 2) in a 64-thread threadgroup; unset, the incumbent one
 /// simdgroup of four rows in a 32-thread threadgroup (P31 (5)).
 pub(crate) fn q4k_nr0() -> Option<usize> {
-    static NR0: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *NR0.get_or_init(|| {
-        std::env::var("LLOOM_QMV_Q4K_NR0")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| (1..=4).contains(n))
-    })
+    crate::tuning::tuning().qmv.q4k_nr0
 }
 
 /// Rows a simdgroup for the Q5_K core (`LLOOM_QMV_Q5K_NR0`, read once;
 /// 1..2): the incumbent is 2, ggml master's 1 (P31 (5)).
 pub(crate) fn q5k_nr0() -> Option<usize> {
-    static NR0: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *NR0.get_or_init(|| {
-        std::env::var("LLOOM_QMV_Q5K_NR0")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| (1..=2).contains(n))
-    })
+    crate::tuning::tuning().qmv.q5k_nr0
 }
 
 /// The function constants a matvec pipeline of `dtype` is loaded with:
@@ -362,12 +333,7 @@ fn mv_constants(dtype: GgmlDType) -> Option<ConstantValues> {
 /// bit-identical to the one-row core (1.9e-7 relative) — the measurement
 /// arm, kept for the record (`qmatmul_rows_timing`).
 fn rows_arm_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("LLOOM_QMV_ROWS")
-            .map(|v| v == "on")
-            .unwrap_or(false)
-    })
+    crate::tuning::tuning().qmv.rows
 }
 
 /// Whether the dtype's matmul-vec core stages a codebook into threadgroup

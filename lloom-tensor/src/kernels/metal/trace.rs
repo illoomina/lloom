@@ -249,14 +249,7 @@ fn state() -> &'static Mutex<TraceState> {
 /// `DESIGN.md` §2.4 warns about.
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("CANDLE_METAL_TRACE")
-            .map(|v| {
-                let v = v.trim().to_ascii_lowercase();
-                v == "1" || v == "true" || v == "yes" || v == "on"
-            })
-            .unwrap_or(false)
-    })
+    *ENABLED.get_or_init(|| crate::tuning::tuning().instrument.trace)
 }
 
 /// Set independently of `enabled()` so recording can be gated to a region of

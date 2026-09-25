@@ -1240,25 +1240,11 @@ pub enum QMatMul {
 }
 
 thread_local! {
-    static DEQUANTIZE_ALL: bool = {
-        match std::env::var("CANDLE_DEQUANTIZE_ALL") {
-            Ok(s) => {
-                !s.is_empty() && s != "0"
-            },
-            Err(_) => false,
-        }
-    }
+    static DEQUANTIZE_ALL: bool = crate::tuning::tuning().qmm.dequantize_all;
 }
 
 thread_local! {
-    static DEQUANTIZE_ALL_F16: bool = {
-        match std::env::var("CANDLE_DEQUANTIZE_ALL_F16") {
-            Ok(s) => {
-                !s.is_empty() && s != "0"
-            },
-            Err(_) => false,
-        }
-    }
+    static DEQUANTIZE_ALL_F16: bool = crate::tuning::tuning().qmm.dequantize_all_f16;
 }
 
 impl QMatMul {
@@ -1550,10 +1536,5 @@ impl QMatMul {
 #[cfg(feature = "metal")]
 fn moe_pair_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("LLOOM_MOE_PAIR").ok().as_deref(),
-            Some("off") | Some("0")
-        )
-    })
+    *ON.get_or_init(|| crate::tuning::tuning().moe.pair)
 }

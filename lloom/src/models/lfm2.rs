@@ -2559,9 +2559,7 @@ impl BatchPool {
                     free: (0..slots).rev().collect(),
                     row_index: None,
                     snapshots: HashMap::new(),
-                    batched_arms: std::env::var("LLOOM_148_ROWS_ARM")
-                        .map(|v| v != "per-row")
-                        .unwrap_or(true),
+                    batched_arms: crate::tuning::tuning().lfm2.rows_arm != "per-row",
                     shared_calls: 0,
                 })),
             })
@@ -3112,7 +3110,7 @@ impl VerifyWords {
             // timeout elapses, never touches it.
             unsafe { poll.wait_on(step, seen) };
         }
-        if std::env::var_os("LLOOM_VERIFY_POLL_TRACE").is_some() {
+        if crate::tuning::tuning().lfm2.verify_poll_trace {
             eprintln!(
                 "[verify poll: gen {} first {} now {} spins {spins} {:.3} ms fallback={fell_back} n={}]",
                 p.generation,
@@ -3708,7 +3706,7 @@ impl Cache {
                 while n_pages > 0 && !g.snapshots.contains_key(&pages[n_pages - 1]) {
                     n_pages -= 1;
                 }
-                if std::env::var_os("LLOOM_148_SHARE_TRACE").is_some() {
+                if crate::tuning::tuning().lfm2.share_trace {
                     let have: Vec<usize> = (0..pages.len())
                         .filter(|&i| g.snapshots.contains_key(&pages[i]))
                         .collect();
@@ -6257,7 +6255,7 @@ struct ShortConv {
 fn conv_c_fusion_disabled() -> bool {
     use std::sync::OnceLock;
     static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| std::env::var("LLOOM_SKIP_CONV_C_FUSION").is_ok())
+    *DISABLED.get_or_init(|| crate::tuning::tuning().lfm2.skip_conv_c_fusion)
 }
 
 impl ShortConv {

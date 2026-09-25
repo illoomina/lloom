@@ -252,6 +252,9 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
     // ---- 1. the clap companion --------------------------------------------
     let arg_fields = items.iter().filter(|f| !f.attr.skip).map(|f| {
         let ident = &f.ident;
+        // clap's argument id defaults to the field name; two groups flattened
+        // into one command may share one (`no_reuse`), so the id is qualified.
+        let id = format!("{}.{}", struct_ident, ident);
         let flag = f
             .attr
             .flag
@@ -274,9 +277,10 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
                 let spelling = format_ident!("{}_spelling", ident);
                 let flag = f.attr.flag.clone().unwrap();
                 let doc = format!("{} (a shorthand for the group's keys)", f.doc);
+                let sid = format!("{id}.spelling");
                 quote! {
                     #[doc = #doc]
-                    #[arg(long = #flag, value_name = "SPELLING")]
+                    #[arg(id = #sid, long = #flag, value_name = "SPELLING")]
                     pub #spelling: Option<String>,
                 }
             } else {
@@ -290,14 +294,14 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
         } else if f.attr.is_bool {
             quote! {
                 #[doc = #doc]
-                #[arg(long = #flag, num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::clap::value_parser!(bool), value_name = "BOOL")]
+                #[arg(id = #id, long = #flag, num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::clap::value_parser!(bool), value_name = "BOOL")]
                 pub #ident: Option<bool>,
             }
         } else {
             let value_name = type_name(f.inner.as_ref().unwrap_or(&f.ty)).to_uppercase();
             quote! {
                 #[doc = #doc]
-                #[arg(long = #flag, value_name = #value_name)]
+                #[arg(id = #id, long = #flag, value_name = #value_name)]
                 pub #ident: Option<String>,
             }
         }

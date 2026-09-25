@@ -46,13 +46,7 @@ pub const DEFAULT_HEAP_CHUNK_BYTES: usize = 512 << 20;
 /// The chunk size in force (`LLOOM_HEAP_CHUNK_MB`, default 512), read once.
 pub fn heap_chunk_bytes() -> usize {
     static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| {
-        std::env::var("LLOOM_HEAP_CHUNK_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|mb| mb.max(16) << 20)
-            .unwrap_or(DEFAULT_HEAP_CHUNK_BYTES)
-    })
+    *BYTES.get_or_init(|| crate::tuning::tuning().metal.heap_chunk_mb.max(16) << 20)
 }
 
 /// Whether pool misses are served from heap chunks (`LLOOM_TRANSIENT_HEAPS=1`;
@@ -69,11 +63,7 @@ pub fn heap_chunk_bytes() -> usize {
 /// prefill), which these chunks are the place for. Read once.
 pub fn transient_heaps_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("LLOOM_TRANSIENT_HEAPS")
-            .map(|v| v != "0")
-            .unwrap_or(DEFAULT_TRANSIENT_HEAPS)
-    })
+    *ON.get_or_init(|| crate::tuning::tuning().metal.transient_heaps)
 }
 
 pub const DEFAULT_TRANSIENT_HEAPS: bool = false;

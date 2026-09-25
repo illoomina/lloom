@@ -2317,19 +2317,7 @@ pub fn sdpa_paged(
 #[cfg(feature = "metal")]
 fn flash_partial_width() -> usize {
     static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *WIDTH.get_or_init(
-        || match std::env::var("LLOOM_FLASH_PARTIAL_BN").ok().as_deref() {
-            Some("8") => 8,
-            Some("32") | None => 32,
-            Some(other) => {
-                eprintln!(
-                    "LLOOM_FLASH_PARTIAL_BN={other:?}: expected 8 or 32, using 32 (the kernel as \
-                     shipped)"
-                );
-                32
-            }
-        },
-    )
+    *WIDTH.get_or_init(|| crate::tuning::tuning().lfm2.flash_partial_bn)
 }
 
 /// [`sdpa_paged`] over a RAGGED batch: row `b` of `q` (`[b, n_q_heads,

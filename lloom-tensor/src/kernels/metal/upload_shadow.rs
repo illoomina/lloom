@@ -21,7 +21,7 @@ use super::Buffer;
 
 fn armed() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LLOOM_UPLOAD_SHADOW").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().instrument.upload_shadow)
 }
 
 fn map() -> &'static Mutex<HashMap<usize, Vec<u8>>> {

@@ -365,9 +365,8 @@ impl QMetalStorage {
     fn qmv_rows_max() -> usize {
         static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *N.get_or_init(|| {
-            std::env::var("LLOOM_QMV_MM_FROM")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
+            crate::tuning::tuning().qmv
+                .mm_from
                 .map(|from| from.saturating_sub(1).max(1))
                 .unwrap_or(8)
         })
@@ -1057,7 +1056,7 @@ impl QMetalStorage {
 /// A/B instrument for the pool's host-upload reuse gate (lloom #748); off.
 fn pooled_staging() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LLOOM_STREAM_POOLED_STAGING").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().pool.stream_pooled_staging)
 }
 
 pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
@@ -1165,10 +1164,7 @@ pub fn moe_mm_from() -> usize {
     if v != usize::MAX {
         return v;
     }
-    let from = std::env::var("LLOOM_MOE_MM_FROM")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_MOE_MM_FROM);
+    let from = crate::tuning::tuning().moe.mm_from;
     MOE_MM_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
     from
 }
@@ -1190,10 +1186,7 @@ static MOE_MM_FROM: std::sync::atomic::AtomicUsize =
 pub fn moe_mm_bn(pairs: usize, n_experts: usize) -> usize {
     let pinned = MOE_MM_BN.load(std::sync::atomic::Ordering::Relaxed);
     let pinned = if pinned == usize::MAX {
-        let v = std::env::var("LLOOM_MOE_MM_BN")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0usize);
+        let v = crate::tuning::tuning().moe.mm_bn;
         MOE_MM_BN.store(v, std::sync::atomic::Ordering::Relaxed);
         v
     } else {
@@ -1319,7 +1312,7 @@ pub fn matmul_f16_weight_f32(xs: &crate::Tensor, w: &crate::Tensor) -> Result<cr
 /// cast-matmul-cast route), read once.
 pub fn f16_weight_mm_route() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("LLOOM_QMM_F16_MM").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| crate::tuning::tuning().qmm.f16_mm)
 }
 
 /// Rows from which a quantized stem's Metal GEMM dequantises the weight to
@@ -1331,10 +1324,7 @@ pub fn dequant_once_from() -> usize {
     if v != usize::MAX {
         return v;
     }
-    let from = std::env::var("LLOOM_QMM_DEQUANT_FROM")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_DEQUANT_ONCE_FROM);
+    let from = crate::tuning::tuning().qmm.dequant_from;
     DEQUANT_ONCE_FROM.store(from, std::sync::atomic::Ordering::Relaxed);
     from
 }
@@ -1357,9 +1347,9 @@ pub fn dequant_gemm_steel() -> bool {
     if v != u8::MAX {
         return v != 0;
     }
-    let steel = match std::env::var("LLOOM_QMM_DEQUANT_GEMM").as_deref() {
-        Ok("qmm") => false,
-        Ok("steel") => true,
+    let steel = match crate::tuning::tuning().qmm.dequant_gemm.as_str() {
+        "qmm" => false,
+        "steel" => true,
         _ => DEFAULT_DEQUANT_GEMM_STEEL,
     };
     DEQUANT_GEMM_STEEL.store(steel as u8, std::sync::atomic::Ordering::Relaxed);

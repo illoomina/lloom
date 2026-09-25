@@ -227,11 +227,7 @@ type CompletionSubscribers = Arc<parking_lot::Mutex<Vec<Arc<dyn Fn() + Send + Sy
 /// (`BufferPool::set_free_poison`) and reads every copy back.
 pub fn cb_unretained() -> bool {
     static KIND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *KIND.get_or_init(|| {
-        std::env::var("LLOOM_CB_UNRETAINED")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+    *KIND.get_or_init(|| crate::tuning::tuning().metal.cb_unretained)
 }
 
 fn create_command_buffer(command_queue: &CommandQueue) -> Result<CommandBuffer, MetalKernelError> {
@@ -512,12 +508,8 @@ impl Commands {
         command_queue: CommandQueue,
         residency_set: Arc<ResidencySet>,
     ) -> Result<Self, MetalKernelError> {
-        let compute_per_buffer = match std::env::var("CANDLE_METAL_COMPUTE_PER_BUFFER") {
-            Ok(val) => val
-                .parse()
-                .unwrap_or(DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER),
-            _ => DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER,
-        };
+        let tuning = &crate::tuning::tuning().metal;
+        let compute_per_buffer = tuning.compute_per_buffer;
 
         // `DESIGN.md` §13.5m. Absent -- which is every run that does not opt in
         // -- leaves `DispatchCounter`, the path that ran before this existed.
@@ -527,21 +519,9 @@ impl Commands {
         // back silently". A run that meant to select the node-index arm and
         // silently got the counter would report a clean null for the wrong
         // reason -- #69's vacuous determinism run, in this axis.
-        let cut_policy = match std::env::var("CANDLE_METAL_NODES_PER_CB") {
-            Ok(val) => {
-                let n: usize = val.parse().unwrap_or_else(|_| {
-                    panic!("CANDLE_METAL_NODES_PER_CB must be a positive integer, got {val:?}")
-                });
-                assert!(
-                    n > 0,
-                    "CANDLE_METAL_NODES_PER_CB must be > 0, got {n} (unset it to use the counter)"
-                );
-                CutPolicy::NodeIndex { nodes_per_cb: n }
-            }
-            _ => match std::env::var("CANDLE_METAL_CUT_POLICY") {
-                Ok(val) => CutPolicy::from_env_str(&val).unwrap_or_else(|e| panic!("{e}")),
-                _ => CutPolicy::DispatchCounter,
-            },
+        let cut_policy = match tuning.nodes_per_cb {
+            n if n > 0 => CutPolicy::NodeIndex { nodes_per_cb: n },
+            _ => CutPolicy::from_env_str(&tuning.cut_policy).unwrap_or_else(|e| panic!("{e}")),
         };
 
         if let Some(raw) = residency_set.raw() {
@@ -628,12 +608,7 @@ impl Commands {
         };
 
         let pipelined_compute_per_buffer =
-            match std::env::var("CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER") {
-                Ok(val) => val
-                    .parse()
-                    .unwrap_or(DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER),
-                _ => DEFAULT_CANDLE_METAL_PIPELINED_COMPUTE_PER_BUFFER,
-            };
+            crate::tuning::tuning().metal.pipelined_compute_per_buffer;
         Ok(Self {
             state: CachePadded::new(parking_lot::Mutex::new(EntryState::new(cb))),
             compute_count: CachePadded::new(AtomicUsize::new(0)),

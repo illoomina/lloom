@@ -364,7 +364,7 @@ fn escape_guard() -> Option<()> {
 /// instrument: extra router runs and readbacks per pass.
 pub fn hint_recall_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_HINT_RECALL").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.hint_recall)
 }
 
 /// A staged readback of a routing's ids (Metal); nothing elsewhere.

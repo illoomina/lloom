@@ -31,12 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// Whether profiling was requested, read once from the environment.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("CANDLE_METAL_PROFILE").as_deref(),
-            Ok("1") | Ok("true") | Ok("yes")
-        )
-    })
+    *ENABLED.get_or_init(|| crate::tuning::tuning().instrument.profile)
 }
 
 /// One command buffer's GPU execution interval, in seconds.

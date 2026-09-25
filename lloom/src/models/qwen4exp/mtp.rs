@@ -386,14 +386,14 @@ impl<R: ExpertResidency> MtpDrafter<'_, R> {
 /// `QWEN4EXP_MTP_PROBE` (read once): the prompt-row ablation probe above.
 fn mtp_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_MTP_PROBE").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.mtp_probe)
 }
 
 /// `QWEN4EXP_MTP_TRACE` (read once): print every verify round's window,
 /// argmax and accepted prefix. An instrument, never the shipping path.
 fn mtp_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_MTP_TRACE").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.mtp_trace)
 }
 
 /// A verify pass encoded and read back, awaiting the accept decision.

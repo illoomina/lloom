@@ -507,15 +507,111 @@ impl DecodeConfig {
     }
 }
 
+/// Every tuning knob of the two library crates, as one group: the kernels,
+/// the command stream, the pool and the CPU side (`lloom_tensor::tuning`)
+/// beside the model ports, the streamed tier, the drafter and the ring
+/// (`lloom::tuning`). The dotted keys are `tuning.<sub>.<key>`; each leaf's
+/// env alias is the `LLOOM_*` / `CANDLE_*` / `QWEN4EXP_*` variable it
+/// replaces, so the scripts keep working. Installed into both crates before
+/// the model loads ([`TuningOptions::install`]).
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct TuningOptions {
+    /// The dense GEMM/GEMV tiles.
+    #[opt(nested)]
+    pub gemm: lloom_tensor::tuning::GemmTuning,
+    /// The quantized matvec cores.
+    #[opt(nested)]
+    pub qmv: lloom_tensor::tuning::QmvTuning,
+    /// The quantized GEMM at prefill.
+    #[opt(nested)]
+    pub qmm: lloom_tensor::tuning::QmmTuning,
+    /// The routed-expert GEMM.
+    #[opt(nested)]
+    pub moe: lloom_tensor::tuning::MoeTuning,
+    /// The DeltaNet step kernel.
+    #[opt(nested)]
+    pub gdn: lloom_tensor::tuning::GdnTuning,
+    /// The Metal command stream and the device.
+    #[opt(nested)]
+    pub metal: lloom_tensor::tuning::MetalTuning,
+    /// The buffer pool.
+    #[opt(nested)]
+    pub pool: lloom_tensor::tuning::PoolTuning,
+    /// The instruments.
+    #[opt(nested)]
+    pub instrument: lloom_tensor::tuning::InstrumentTuning,
+    /// The CPU side.
+    #[opt(nested)]
+    pub cpu: lloom_tensor::tuning::CpuTuning,
+    /// LFM2's runtime toggles.
+    #[opt(nested)]
+    pub lfm2: lloom::tuning::Lfm2Tuning,
+    /// The DSpark drafter.
+    #[opt(nested)]
+    pub dspark: lloom::tuning::DsparkTuning,
+    /// The streamed expert tier.
+    #[opt(nested)]
+    pub stream: lloom::tuning::StreamTuning,
+    /// Qwen4-exp's own arms.
+    #[opt(nested)]
+    pub qwen4exp: lloom::tuning::Qwen4ExpTuning,
+    /// The token ring and the decode thread.
+    #[opt(nested)]
+    pub ring: lloom::tuning::RingTuning,
+}
+
+impl TuningOptions {
+    /// The tensor crate's half.
+    pub fn tensor(&self) -> lloom_tensor::tuning::Tuning {
+        lloom_tensor::tuning::Tuning {
+            gemm: self.gemm.clone(),
+            qmv: self.qmv.clone(),
+            qmm: self.qmm.clone(),
+            moe: self.moe.clone(),
+            gdn: self.gdn.clone(),
+            metal: self.metal.clone(),
+            pool: self.pool.clone(),
+            instrument: self.instrument.clone(),
+            cpu: self.cpu.clone(),
+        }
+    }
+
+    /// The model crate's half.
+    pub fn lloom(&self) -> lloom::tuning::Tuning {
+        lloom::tuning::Tuning {
+            lfm2: self.lfm2.clone(),
+            dspark: self.dspark.clone(),
+            stream: self.stream.clone(),
+            qwen4exp: self.qwen4exp.clone(),
+            ring: self.ring.clone(),
+        }
+    }
+
+    /// Install both halves for the process. `Err` names the half that had
+    /// already been read (a knob a `OnceLock` site took is fixed; the report
+    /// line would otherwise lie about it).
+    pub fn install(&self) -> Result<(), String> {
+        lloom_tensor::tuning::install(self.tensor())
+            .map_err(|_| "tuning: the tensor crate's knobs were already read before install".to_string())?;
+        lloom::tuning::install(self.lloom())
+            .map_err(|_| "tuning: the model crate's knobs were already read before install".to_string())
+    }
+}
+
 /// Every option group the engine reads, as one tree: the dotted keys are
-/// `<group>.<key>` (`decode.readback.eos`), the JSON is one object per group,
-/// and `lloom config` prints the resolved tree back in this shape.
+/// `<group>.<key>` (`decode.readback.eos`, `tuning.qmv.q6k_nr0`), the JSON
+/// is one object per group, and `lloom config` prints the resolved tree back
+/// in this shape.
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct EngineOptions {
     /// The decode loop: the readback arm, the pacer, the prefill.
     #[opt(nested)]
     pub decode: DecodeConfig,
+    /// Every tuning knob of the kernels, the device, the pool, the model ports.
+    #[opt(nested)]
+    pub tuning: TuningOptions,
 }
 
 impl EngineOptions {

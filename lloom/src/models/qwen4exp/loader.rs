@@ -276,7 +276,7 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
                 _ => None,
             })
             .collect();
-        if std::env::var("QWEN4EXP_TRACE_LOAD").is_ok() {
+        if crate::tuning::tuning().qwen4exp.trace_load {
             let kinds: Vec<String> = parts
                 .iter()
                 .map(|p| match p {

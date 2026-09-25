@@ -495,17 +495,21 @@ impl MmapAdvice {
     /// Collapsing the two would make the default unreachable-by-omission the
     /// moment it changed.
     pub fn from_env() -> Result<Self> {
-        match std::env::var("CANDLE_MMAP_ADVICE") {
-            Err(_) => Ok(Self::default()),
-            Ok(v) => match v.to_ascii_lowercase().as_str() {
-                "" | "none" => Ok(Self::None),
-                "willneed" | "will_need" => Ok(Self::WillNeed),
-                "sequential" | "seq" => Ok(Self::Sequential),
-                other => crate::bail!(
-                    "unknown CANDLE_MMAP_ADVICE {other:?}, expected one of: none, willneed, sequential"
-                ),
-            },
-        }
+        // `tuning.cpu.mmap_advice` (`CANDLE_MMAP_ADVICE`): the parser refuses an
+        // unknown arm; `none` (and the empty string, what a shell supplies for
+        // `CANDLE_MMAP_ADVICE=`) is the explicit request to disable.
+        Ok(match crate::tuning::tuning().cpu.mmap_advice.as_deref() {
+            Some("willneed") | Some("will_need") => Self::WillNeed,
+            Some("sequential") | Some("seq") => Self::Sequential,
+            Some(_) => Self::None,
+            None => {
+                if std::env::var_os("CANDLE_MMAP_ADVICE").is_some() {
+                    Self::None
+                } else {
+                    Self::default()
+                }
+            }
+        })
     }
 
     pub fn as_str(&self) -> &'static str {

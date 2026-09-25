@@ -1835,7 +1835,7 @@ impl QsaAttention {
 /// matmul. Never the shipping path.
 fn score_without_matmul() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_SCORE_NO_MATMUL").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.score_no_matmul)
 }
 
 /// The `QWEN4EXP_CHECK_SEL` instrument on one selection (a no-op unless set).
@@ -1870,7 +1870,7 @@ fn check_sel(sel: &Tensor, pos: usize, kv: &KvCache) -> Result<()> {
 /// full layer per token, never on the shipping path.
 fn check_selection() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_CHECK_SEL").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.check_sel)
 }
 
 /// `(cos, sin)` `[positions.len(), n_rot/2]` for partial RoPE at `positions`.

@@ -7,6 +7,7 @@ pub mod nn;
 // The within-crate axis registry (RESTRUCTURING §1.6): the authoritative,
 // link-time-collected `AXES` slice every `#[derive(Config)]` contributes to.
 pub mod axes;
+pub mod tuning;
 
 pub mod fused_moe;
 pub mod generation;

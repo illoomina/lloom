@@ -607,7 +607,7 @@ impl Cache {
 /// behind a gate (§3.3a), never the shipping path.
 fn watch_nan() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_WATCH_NAN").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.watch_nan)
 }
 
 /// A `[1]` f32 that is finite iff every element of `t` is: `sum(x − x)`
@@ -645,11 +645,10 @@ pub fn prefill_chunk() -> usize {
     if v != 0 {
         return v;
     }
-    let c = std::env::var("QWEN4EXP_PREFILL_CHUNK")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&c| c > 0)
-        .unwrap_or(PREFILL_CHUNK);
+    let c = match crate::tuning::tuning().qwen4exp.prefill_chunk {
+        0 => PREFILL_CHUNK,
+        c => c,
+    };
     PREFILL_CHUNK_OVERRIDE.store(c, std::sync::atomic::Ordering::Relaxed);
     c
 }
@@ -670,9 +669,7 @@ pub fn prefill_pair_on() -> bool {
     if v != u8::MAX {
         return v != 0;
     }
-    let on = std::env::var("QWEN4EXP_PREFILL_PAIR")
-        .map(|s| s != "0")
-        .unwrap_or(DEFAULT_PREFILL_PAIR);
+    let on = crate::tuning::tuning().qwen4exp.prefill_pair;
     PREFILL_PAIR.store(on as u8, std::sync::atomic::Ordering::Relaxed);
     on
 }
@@ -693,11 +690,7 @@ pub fn prefill_tiles() -> usize {
     if v != 0 {
         return v;
     }
-    let t = std::env::var("QWEN4EXP_PREFILL_TILES")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&t| t >= 2)
-        .unwrap_or(DEFAULT_PREFILL_TILES);
+    let t = crate::tuning::tuning().qwen4exp.prefill_tiles.max(2);
     PREFILL_TILES.store(t, std::sync::atomic::Ordering::Relaxed);
     t
 }
@@ -716,7 +709,7 @@ static DECODE_HINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// not the syncs, are what it can cut.
 pub fn decode_hint_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_DECODE_HINT").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::tuning::tuning().stream.decode_hint)
 }
 
 /// The N-gram PLE at its one layer.
@@ -774,25 +767,13 @@ pub struct Qwen4Exp<R: ExpertResidency> {
 /// a layer-tile's ~46 ms of GPU, so one layer of lead stalls (P25).
 pub fn prefetch_lead() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("QWEN4EXP_PREFETCH_LEAD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &usize| n >= 1)
-            .unwrap_or(2)
-    })
+    *N.get_or_init(|| crate::tuning::tuning().stream.prefetch_lead.max(1))
 }
 
 /// `QWEN4EXP_SPEC_AHEAD`, read once: 0 | 1 | 2 (see `Qwen4Exp::set_spec_ahead`).
 fn spec_ahead_from_env() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("QWEN4EXP_SPEC_AHEAD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &usize| n <= 1)
-            .unwrap_or(0)
-    })
+    *N.get_or_init(|| crate::tuning::tuning().qwen4exp.spec_ahead.min(1))
 }
 
 /// What `prepare_pass` does with a pass the budget cannot take.
@@ -813,14 +794,11 @@ impl MemCheck {
     /// (`PREFILL_TRANSIENT_BYTES_PER_TOKEN`, DESIGN §7.1a).
     pub fn from_env() -> Self {
         static ARM: std::sync::OnceLock<MemCheck> = std::sync::OnceLock::new();
-        *ARM.get_or_init(|| match std::env::var("QWEN4EXP_MEM").ok().as_deref() {
-            Some("off") => MemCheck::Off,
-            Some("report") => MemCheck::Report,
-            Some("refuse") | None => MemCheck::Refuse,
-            Some(other) => {
-                eprintln!("QWEN4EXP_MEM={other}: off | report | refuse; using refuse");
-                MemCheck::Refuse
-            }
+        *ARM.get_or_init(|| match crate::tuning::tuning().qwen4exp.mem_check.as_str() {
+            "off" => MemCheck::Off,
+            "report" => MemCheck::Report,
+            // `refuse`; the parser (`tuning.rs`) refused anything else.
+            _ => MemCheck::Refuse,
         })
     }
 }
@@ -2414,11 +2392,7 @@ impl crate::nn::model::CacheShare for Cache {
 /// per-layer readback; the A/B arm).
 fn plan_on_device() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("QWEN4EXP_PLAN")
-            .map(|v| v != "host")
-            .unwrap_or(true)
-    })
+    *ON.get_or_init(|| crate::tuning::tuning().stream.plan != "host")
 }
 
 /// The rewindable arm is the standing window (P29 (7)): every decode step

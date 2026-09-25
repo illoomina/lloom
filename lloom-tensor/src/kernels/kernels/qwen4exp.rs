@@ -1134,14 +1134,7 @@ fn gdn_split(h_v: usize, pipeline: &crate::kernels::ComputePipeline) -> usize {
 /// threadgroup against a longer cross-slice reduction — the arm P29 (6)
 /// measures; 8 is the incumbent.
 fn gdn_split_cap() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("LLOOM_GDN_SPLIT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|n| (1..=32).contains(n))
-            .unwrap_or(8)
-    })
+    crate::tuning::tuning().gdn.split
 }
 
 /// `gdn_step_rows_f32`: `B` rows of the recurrence over the `S` pool.

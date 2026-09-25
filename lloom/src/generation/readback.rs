@@ -1395,10 +1395,7 @@ pub const RING_SLACK_BYTES_DEFAULT: usize = 32 * 1024 * 1024;
 /// number of `quantum`-slot tiles so the geometry stays uniform. `0` disables the
 /// slack (fall back to the tight `cap()`), for the A/B baseline.
 fn history_slack_slots(quantum: usize) -> usize {
-    let bytes = std::env::var("LLOOM_RING_SLACK_BYTES")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(RING_SLACK_BYTES_DEFAULT);
+    let bytes = crate::tuning::tuning().ring.slack_bytes;
     let slots = bytes / std::mem::size_of::<u32>();
     // Round down to a whole number of tiles (uniform geometry); 0 => no slack.
     let q = quantum.max(1);

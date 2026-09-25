@@ -107,7 +107,7 @@ fn metal_bo<'a>(
 /// behind a gate (§3.3a), never the shipping path.
 pub(crate) fn fused_off() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("QWEN4EXP_FUSED_OFF").is_some())
+    *OFF.get_or_init(|| crate::tuning::tuning().qwen4exp.fused_off)
 }
 
 /// A fused op serves a carry-shaped f32 tensor on Metal when it is
@@ -403,11 +403,7 @@ impl lloom_tensor::CustomOp1 for HcMixB {
 /// kernel cut is measured against.
 fn hc_mix_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("QWEN4EXP_HC_MIX")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("on"))
-            .unwrap_or(false)
-    })
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.hc_mix)
 }
 
 /// The most rows the fused HC prologue takes: one — the kernels' grid is a
@@ -2946,7 +2942,7 @@ pub fn chunk_scan_on() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let on = std::env::var("QWEN4EXP_CHUNK_SCAN").ok().as_deref() != Some("0");
+            let on = crate::tuning::tuning().qwen4exp.chunk_scan;
             CHUNK_SCAN.store(on as u8, Ordering::Relaxed);
             on
         }

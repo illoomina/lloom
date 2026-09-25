@@ -80,10 +80,9 @@ const TILE_16_16_16_2_2: TileConfig = TileConfig::new(16, 16, 16, 2, 2);
 /// `DESIGN.md` §2.4 — an arm that silently ran the baseline is #69's vacuous
 /// determinism run, and the whole point of this knob is to be A/B'd.
 fn forced_tile() -> Option<TileConfig> {
-    use std::sync::OnceLock;
-    static TILE: OnceLock<Option<TileConfig>> = OnceLock::new();
-    *TILE.get_or_init(|| match std::env::var("LLOOM_383_TILE") {
-        Ok(v) => Some(match v.as_str() {
+    static TILE: std::sync::OnceLock<Option<TileConfig>> = std::sync::OnceLock::new();
+    *TILE.get_or_init(|| match crate::tuning::tuning().gemm.tile.as_deref() {
+        Some(v) => Some(match v {
             "32x32" => TILE_32_32_16_2_2,
             "32x16" => TILE_32_16_16_2_2,
             "16x32" => TILE_16_32_16_2_2,
@@ -95,7 +94,7 @@ fn forced_tile() -> Option<TileConfig> {
                  32x32|32x16|16x32|16x16|64x32|64x64, got {other:?}"
             ),
         }),
-        Err(_) => None,
+        None => None,
     })
 }
 
@@ -134,19 +133,7 @@ fn forced_tile() -> Option<TileConfig> {
 /// is nonetheless proved from the **kernel name** rather than from the flag, per
 /// that same rule: the tile is in the `[[host_name]]` the census reports.
 fn forced_gemv_bm() -> Option<usize> {
-    use std::sync::OnceLock;
-    static BM: OnceLock<Option<usize>> = OnceLock::new();
-    *BM.get_or_init(|| match std::env::var("LLOOM_492_GEMV_BM") {
-        Ok(v) => Some(match v.as_str() {
-            "4" => 4usize,
-            "8" => 8usize,
-            other => panic!(
-                "LLOOM_492_GEMV_BM must be 4 or 8 (the two instantiated \
-                 decode tiles), got {other:?}"
-            ),
-        }),
-        Err(_) => None,
-    })
+    crate::tuning::tuning().gemm.gemv_bm
 }
 
 /// The non-transposed GEMV's tile, derived from the two vector lengths.
@@ -192,20 +179,7 @@ pub const SKINNY_TILE_MAX_M: usize = 32;
 /// silently"* — because an arm that silently ran the baseline is #69's vacuous
 /// determinism run, and the whole point of this knob is to be A/B'd.
 fn skinny_max() -> usize {
-    use std::sync::OnceLock;
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| match std::env::var("LLOOM_364_SKINNY_MAX") {
-        Ok(v) => v
-            .parse()
-            .unwrap_or_else(|_| panic!("LLOOM_364_SKINNY_MAX must be an integer, got {v:?}")),
-        // §13.5p's rule, re-affirmed by #694 at a real batched-decode `m`:
-        // the 16-row tile is the cheaper tile for a prefill at `m` in 33..48
-        // and the MORE expensive one for a batched decode step there (+30 % on
-        // the step at B = 40 and 48 against the 64-row tile, §13.5q), so the
-        // band ends where the prefill sweep resolved it and the canonical
-        // 34-token prefill keeps its recorded tile.
-        Err(_) => SKINNY_TILE_MAX_M + 1,
-    })
+    crate::tuning::tuning().gemm.skinny_max
 }
 
 /// Which side of the `m == 1 || n == 1` GEMV route to suppress, so the routing
@@ -241,17 +215,12 @@ enum ForceGemm {
 }
 
 fn forced_gemm() -> Option<ForceGemm> {
-    use std::sync::OnceLock;
-    static FORCE: OnceLock<Option<ForceGemm>> = OnceLock::new();
-    *FORCE.get_or_init(|| match std::env::var("LLOOM_386_FORCE_GEMM") {
-        Ok(v) => Some(match v.as_str() {
-            "m" => ForceGemm::M,
-            "n" => ForceGemm::N,
-            "both" => ForceGemm::Both,
-            other => panic!("LLOOM_386_FORCE_GEMM must be one of m|n|both, got {other:?}"),
-        }),
-        Err(_) => None,
-    })
+    match crate::tuning::tuning().gemm.force.as_deref() {
+        Some("m") => Some(ForceGemm::M),
+        Some("n") => Some(ForceGemm::N),
+        Some("both") => Some(ForceGemm::Both),
+        _ => None,
+    }
 }
 
 /// Whether the GEMV route should still be taken for this shape.

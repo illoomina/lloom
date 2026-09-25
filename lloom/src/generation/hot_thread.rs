@@ -97,9 +97,9 @@ impl HotThreadReport {
 /// The arm, read once from `LLOOM_HOT_THREAD`.
 pub fn arm() -> HotThreadArm {
     static ARM: std::sync::OnceLock<HotThreadArm> = std::sync::OnceLock::new();
-    *ARM.get_or_init(|| match std::env::var("LLOOM_HOT_THREAD").as_deref() {
-        Ok("off") | Ok("0") | Ok("none") => HotThreadArm::Off,
-        Ok("default") | Ok("demote") => HotThreadArm::Default,
+    *ARM.get_or_init(|| match crate::tuning::tuning().ring.hot_thread.as_str() {
+        "off" | "0" | "none" => HotThreadArm::Off,
+        "default" | "demote" => HotThreadArm::Default,
         _ => HotThreadArm::Interactive,
     })
 }

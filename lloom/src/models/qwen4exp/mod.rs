@@ -46,7 +46,7 @@ pub use qsa::{Indexer, KvCache, KvPool, QsaAttention};
 /// behind a gate (§3.3a), never on the shipping path.
 pub(crate) fn trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_TRACE").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.trace)
 }
 
 pub(crate) fn trace(tag: &str, l: usize, t: &lloom_tensor::Tensor) {

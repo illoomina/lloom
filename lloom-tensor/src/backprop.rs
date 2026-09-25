@@ -17,14 +17,7 @@ fn broadcast_back(arg: &Tensor, node: &Tensor, reduced_dims: &[usize]) -> Result
 }
 
 thread_local! {
-    static CANDLE_GRAD_DO_NOT_DETACH: bool = {
-        match std::env::var("CANDLE_GRAD_DO_NOT_DETACH") {
-            Ok(s) => {
-                !s.is_empty() && s != "0"
-            },
-            Err(_) => false,
-        }
-    }
+    static CANDLE_GRAD_DO_NOT_DETACH: bool = crate::tuning::tuning().cpu.grad_do_not_detach;
 }
 
 impl Tensor {

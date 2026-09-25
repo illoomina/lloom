@@ -103,6 +103,7 @@ pub mod nditer;
 pub mod npy;
 pub mod op;
 pub mod options;
+pub mod tuning;
 pub mod pickle;
 pub mod quantized;
 pub mod safetensors;

@@ -206,13 +206,7 @@ pub const DEFAULT_THREADS: usize = 8;
 
 fn threads() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("LLOOM_PREFETCH_THREADS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(DEFAULT_THREADS)
-    })
+    *N.get_or_init(|| crate::tuning::tuning().stream.prefetch_threads.max(1))
 }
 
 impl std::fmt::Debug for Prefetcher {

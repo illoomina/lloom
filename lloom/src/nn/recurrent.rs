@@ -86,11 +86,7 @@ pub struct RecurrentState {
 /// never the shipping path.
 fn state_write_by_copy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("QWEN4EXP_STATE_WRITE")
-            .map(|v| v == "copy")
-            .unwrap_or(false)
-    })
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.state_write == "copy")
 }
 
 /// A copy of `t` in storage of its own. `Tensor::copy` is NOT that on Metal —

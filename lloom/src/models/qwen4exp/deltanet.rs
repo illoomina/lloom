@@ -152,7 +152,7 @@ pub fn decode_step<const STATE_HEAD_FIRST: bool>(
 /// shipping path.
 fn delta_by_reduce() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("QWEN4EXP_DELTA_REDUCE").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().qwen4exp.delta_reduce)
 }
 
 /// GQA head expansion `h_k -> h_v` before the recurrence, const-generic over the

@@ -683,10 +683,7 @@ impl CtxKv {
     /// value that parses as neither is an error rather than a fallback, so an
     /// A/B arm cannot silently measure the other one (§2.4).
     pub fn from_env() -> Result<Self> {
-        match std::env::var("LLOOM_DSPARK_CTX_KV") {
-            Err(_) => Ok(Self::Contiguous),
-            Ok(v) => Self::parse(&v),
-        }
+        Self::parse(&crate::tuning::tuning().dspark.ctx_kv)
     }
 
     /// `contiguous` | `paged[:<page_size>][:shared]`.
@@ -1860,7 +1857,7 @@ impl DSparkMlp {
 fn dspark_eager_attn() -> bool {
     use std::sync::OnceLock;
     static EAGER: OnceLock<bool> = OnceLock::new();
-    *EAGER.get_or_init(|| std::env::var("LLOOM_DSPARK_EAGER_ATTN").is_ok())
+    *EAGER.get_or_init(|| crate::tuning::tuning().dspark.eager_attn)
 }
 
 #[derive(Debug)]

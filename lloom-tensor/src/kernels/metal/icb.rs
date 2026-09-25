@@ -307,8 +307,7 @@ pub enum Excluded {
 pub fn is_quarantined(name: &str) -> bool {
     // The reproducer's switch (`icb_executor_tests`): lift the quarantine so
     // the divergence can be exercised. Test-only by construction — read once.
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OFF.get_or_init(|| std::env::var("LLOOM_ICB_QUARANTINE_OFF").is_ok()) {
+    if crate::tuning::tuning().metal.icb_quarantine_off {
         return false;
     }
     name.contains("_swiglu_")
@@ -1472,8 +1471,8 @@ pub enum ResidencyArm {
 
 /// The arm in force, from `LLOOM_688_RESIDENCY`. Read at plan time, once.
 pub fn residency_arm() -> ResidencyArm {
-    match std::env::var("LLOOM_688_RESIDENCY").as_deref() {
-        Ok("plan-wide") => ResidencyArm::PlanWide,
+    match crate::tuning::tuning().metal.icb_residency.as_str() {
+        "plan-wide" => ResidencyArm::PlanWide,
         _ => ResidencyArm::PerRun,
     }
 }

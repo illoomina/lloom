@@ -474,10 +474,9 @@ impl CompletionWait {
     /// whole section exists to avoid.
     pub fn from_env() -> Self {
         static ARM: std::sync::OnceLock<CompletionWait> = std::sync::OnceLock::new();
-        *ARM.get_or_init(|| match std::env::var("CANDLE_METAL_COMPLETION_WAIT") {
-            Ok(v) => Self::from_str_arm(&v)
-                .unwrap_or_else(|e| panic!("CANDLE_METAL_COMPLETION_WAIT: {e}")),
-            Err(_) => Self::default(),
+        *ARM.get_or_init(|| {
+            Self::from_str_arm(&crate::tuning::tuning().metal.completion_wait)
+                .unwrap_or_else(|e| panic!("tuning.metal.completion_wait: {e}"))
         })
     }
 

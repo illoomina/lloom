@@ -276,11 +276,7 @@ fn stage_readback_with(t: &crate::Tensor, commit: bool) -> Result<StagedReadback
 
 pub fn to_cpu_force_blit() -> bool {
     static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FORCE.get_or_init(|| {
-        std::env::var("CANDLE_METAL_TO_CPU_BLIT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *FORCE.get_or_init(|| crate::tuning::tuning().metal.to_cpu_blit)
 }
 
 /// #366: readbacks whose buffer was null *after* the wait, and so took the blit.
@@ -4247,5 +4243,5 @@ mod write_host_slice_tests {
 /// order it.
 fn copy2d_no_blit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LLOOM_COPY2D_NO_BLIT").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().metal.copy2d_no_blit)
 }

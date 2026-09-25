@@ -123,7 +123,7 @@ fn trace_on() -> bool {
     static ON: AtomicU8 = AtomicU8::new(0);
     let on = match ON.load(Ordering::Relaxed) {
         0 => {
-            let v = if std::env::var_os("LLOOM_POOL_TRACE").is_some_and(|v| v == "1") {
+            let v = if crate::tuning::tuning().instrument.pool_trace {
                 2
             } else {
                 1
@@ -585,39 +585,7 @@ pub const SIZE_BAND_NAMES: [&str; SIZE_BAND_COUNT] = ["<4KB", "4KB-256KB", "256K
 /// of the process, which is what lets a harness report it back from the
 /// mechanism rather than from the flag (§7.1a-i).
 pub fn reuse_oversize_bound() -> Option<f64> {
-    static BOUND: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-    *BOUND.get_or_init(|| {
-        let Ok(raw) = std::env::var("LLOOM_47_REUSE_OVERSIZE_BOUND") else {
-            return None;
-        };
-        let raw = raw.trim();
-        // The explicit spelling of the shipped arm, so a sweep can name it
-        // rather than expressing it by unsetting the variable -- an arm you
-        // cannot write down is one a harness renders as absent, which is
-        // §7.1a-i's present-and-wrong case from the other side.
-        if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
-            return None;
-        }
-        let Ok(v) = raw.parse::<f64>() else {
-            panic!(
-                "LLOOM_47_REUSE_OVERSIZE_BOUND={raw:?} is not a number. \
-                 Give a multiple of the request >= 1.0, or `off` for the \
-                 unbounded behaviour that ships (DESIGN.md §9.2v)."
-            )
-        };
-        // Refused rather than clamped, and loudly -- a silently-corrected arm
-        // renders a bound the process did not take and compares equal to real
-        // runs of that arm (§9.2r's reasoning, same failure).
-        if !v.is_finite() || v < 1.0 {
-            panic!(
-                "LLOOM_47_REUSE_OVERSIZE_BOUND={v} is below 1.0. A bound under \
-                 1.0 would reject every candidate including an exact match, \
-                 which is not a reuse policy but a way to disable the pool \
-                 (DESIGN.md §9.2v)."
-            )
-        }
-        Some(v)
-    })
+    crate::tuning::tuning().pool.reuse_oversize_bound
 }
 
 /// The eviction order in force (`DESIGN.md` §9.2w, #47). `Age` is the shipped
@@ -670,24 +638,11 @@ pub fn reuse_oversize_bound() -> Option<f64> {
 /// runs inside the per-command-buffer completion handler (§6.3f) rather than on
 /// the encode path.
 pub fn eviction_order() -> EvictionOrder {
-    static ORDER: std::sync::OnceLock<EvictionOrder> = std::sync::OnceLock::new();
-    *ORDER.get_or_init(|| {
-        let Ok(raw) = std::env::var("LLOOM_47_EVICTION_ORDER") else {
-            return EvictionOrder::Age;
-        };
-        let raw = raw.trim();
-        match raw.to_ascii_lowercase().as_str() {
-            // The shipped arm spelled explicitly, so a sweep can name it rather
-            // than express it by unsetting the variable (§7.1a-i).
-            "age" | "oldest" | "off" => EvictionOrder::Age,
-            "size" | "largest" => EvictionOrder::Size,
-            _ => panic!(
-                "LLOOM_47_EVICTION_ORDER={raw:?} is not an eviction order. \
-                 Give `age` for the oldest-first behaviour that ships, or \
-                 `size` for largest-first (DESIGN.md §9.2w)."
-            ),
-        }
-    })
+    match crate::tuning::tuning().pool.eviction_order.as_str() {
+        "size" | "largest" => EvictionOrder::Size,
+        // `age` / `oldest` / `off`: the shipped arm (the parser refused the rest).
+        _ => EvictionOrder::Age,
+    }
 }
 
 /// Which free buffer `evict_over_budget` destroys first (`DESIGN.md` §9.2w).
@@ -3946,7 +3901,7 @@ mod tests {
 /// class of corruption that no fence can observe (`DESIGN.md` §2.3.8b).
 fn pool_no_reuse() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("LLOOM_POOL_NO_REUSE").is_some())
+    *ON.get_or_init(|| crate::tuning::tuning().pool.no_reuse)
 }
 
 /// `LLOOM_POOL_QUARANTINE` (read once): extra completed command buffers a
@@ -3954,10 +3909,5 @@ fn pool_no_reuse() -> bool {
 /// unless set; an A/B arm for the second-tenant race (#748).
 fn pool_quarantine() -> u64 {
     static K: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *K.get_or_init(|| {
-        std::env::var("LLOOM_POOL_QUARANTINE")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(0)
-    })
+    *K.get_or_init(|| crate::tuning::tuning().pool.quarantine)
 }

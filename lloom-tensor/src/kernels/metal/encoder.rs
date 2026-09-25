@@ -104,20 +104,14 @@ static HAZARD_KEY_EXPLICIT: AtomicBool = AtomicBool::new(false);
 /// select the mode cannot gate it.
 fn init_hazard_key_from_env() {
     HAZARD_KEY_FROM_ENV.get_or_init(|| {
-        if let Ok(v) = std::env::var("CANDLE_METAL_HAZARD_KEY") {
-            match v.as_str() {
-                "range" => {
-                    HAZARD_KEY.store(true, Ordering::Relaxed);
-                    HAZARD_KEY_EXPLICIT.store(true, Ordering::Relaxed);
-                }
-                "pointer" | "ptr" => HAZARD_KEY_EXPLICIT.store(true, Ordering::Relaxed),
-                "" => {}
-                other => {
-                    // Loudly, because the silent alternative is measuring the
-                    // default while believing the variable was honoured.
-                    panic!("CANDLE_METAL_HAZARD_KEY={other:?}; want range or pointer")
-                }
+        match crate::tuning::tuning().metal.hazard_key.as_deref() {
+            Some("range") => {
+                HAZARD_KEY.store(true, Ordering::Relaxed);
+                HAZARD_KEY_EXPLICIT.store(true, Ordering::Relaxed);
             }
+            Some("pointer") | Some("ptr") => HAZARD_KEY_EXPLICIT.store(true, Ordering::Relaxed),
+            // The parser (`tuning.rs`) refused anything else, loudly.
+            _ => {}
         }
     });
 }

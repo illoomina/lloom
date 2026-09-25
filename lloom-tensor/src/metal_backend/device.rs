@@ -199,9 +199,7 @@ fn retain_evicted_allocations() -> bool {
         if let Ok(v) = std::env::var("CANDLE_METAL_EAGER_RESIDENCY_RELEASE") {
             return !(v == "1" || v.eq_ignore_ascii_case("true"));
         }
-        std::env::var("CANDLE_METAL_RETAIN_EVICTED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+        crate::tuning::tuning().pool.retain_evicted
     })
 }
 
@@ -2342,7 +2340,7 @@ impl MetalDevice {
     /// land in a recycled pool buffer. Never the shipping path.
     fn unpooled() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("LLOOM_UNPOOLED_UPLOADS").is_some())
+        *ON.get_or_init(|| crate::tuning::tuning().pool.unpooled_uploads)
     }
 
     /// A Shared buffer of `size` bytes the host writes and the GPU reads once,
@@ -2624,37 +2622,9 @@ const MIN_BUFFER_ALIGNMENT: usize = 16;
 /// process, which is what lets the harness report it (§7.1a-i: read the arm
 /// back from the mechanism that decides it, never from the flag).
 fn buffer_alignment() -> usize {
-    static ALIGNMENT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *ALIGNMENT.get_or_init(|| {
-        let Ok(raw) = std::env::var("LLOOM_586_BUFFER_ALIGNMENT") else {
-            return BUFFER_ALIGNMENT;
-        };
-        let raw = raw.trim();
-        let Ok(v) = raw.parse::<usize>() else {
-            panic!(
-                "LLOOM_586_BUFFER_ALIGNMENT={raw:?} is not a number. \
-                 Give a power of two >= {MIN_BUFFER_ALIGNMENT} (DESIGN.md §9.2)."
-            )
-        };
-        // Refused rather than clamped, and loudly. A silently-corrected arm is
-        // #241's present-and-wrong case: the run would render an alignment it
-        // did not take, and compare equal to real runs of that arm.
-        if !v.is_power_of_two() {
-            panic!(
-                "LLOOM_586_BUFFER_ALIGNMENT={v} is not a power of two. \
-                 `next_multiple_of` would still round, but a non-power-of-two \
-                 granularity is not an alignment (DESIGN.md §9.2)."
-            )
-        }
-        if v < MIN_BUFFER_ALIGNMENT {
-            panic!(
-                "LLOOM_586_BUFFER_ALIGNMENT={v} is below {MIN_BUFFER_ALIGNMENT}, \
-                 the widest vector this backend loads (`float4`/`half4` are 16 B). \
-                 A lower value is a correctness bug and §3.5 makes it silent."
-            )
-        }
-        v
-    })
+    // A power of two >= `MIN_BUFFER_ALIGNMENT`, refused otherwise by the
+    // parser (`tuning.rs`); `BUFFER_ALIGNMENT` (128) is the default.
+    crate::tuning::tuning().pool.buffer_alignment.max(MIN_BUFFER_ALIGNMENT)
 }
 
 /// Size to allocate for a request of `size` bytes.
@@ -2918,9 +2888,5 @@ fn wire_pages(ptr: *mut u8, size: usize) {
 /// token with the machine at free ≈ 0.1 GB).
 pub fn wire_weights_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("LLOOM_WIRE_WEIGHTS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("on"))
-            .unwrap_or(false)
-    })
+    *ON.get_or_init(|| crate::tuning::tuning().metal.wire_weights)
 }

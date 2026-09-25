@@ -1626,11 +1626,7 @@ impl Streamed {
 #[cfg(feature = "metal")]
 pub fn pread_direct_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("LLOOM_PREAD_DIRECT")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+    *ON.get_or_init(|| crate::tuning::tuning().stream.pread_direct)
 }
 
 /// An escape guard while the streamed tier allocates (Metal): the pool
@@ -1719,7 +1715,7 @@ fn plan_rows_pinned(
 /// and misses — a debugging instrument, never the shipping path.
 fn trace_settle() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("QWEN4EXP_TRACE_SETTLE").is_ok())
+    *ON.get_or_init(|| crate::tuning::tuning().stream.trace_settle)
 }
 
 /// The device-side plan: `ids [n]` (applied to) through the residency

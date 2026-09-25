@@ -298,6 +298,10 @@ pub struct CommonArgs {
     #[arg(long, value_name = "JSON")]
     pub decode_config: Option<String>,
 
+    /// The tuning group as JSON (`'{"qmv": {"q6k_nr0": 4}, "metal": {"cut_policy": "node-aligned"}}'`).
+    #[arg(long, value_name = "JSON")]
+    pub tuning_config: Option<String>,
+
     /// One knob by dotted key, repeatable (`--set decode.readback.eos=gpu-batched`).
     #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
     pub set: Vec<String>,
@@ -308,8 +312,18 @@ pub struct CommonArgs {
 
 /// Resolve the option tree from `common`: defaults < env aliases <
 /// `--config` < `--<group>-config` < `--set` < flags; every group's refusals
-/// checked once at the end.
+/// checked once at the end. The tuning knobs are installed into both library
+/// crates here — before the device or the model exists, so every `OnceLock`
+/// read site takes them.
 pub fn resolve_options(common: &CommonArgs) -> Result<crate::EngineOptions> {
+    let o = resolve_options_uninstalled(common)?;
+    o.tuning.install().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(o)
+}
+
+/// [`resolve_options`] without installing the tuning knobs (`lloom config`,
+/// `lloom knobs`, the tests — nothing that goes on to load a model).
+pub fn resolve_options_uninstalled(common: &CommonArgs) -> Result<crate::EngineOptions> {
     let mut o = crate::EngineOptions::default();
     o.from_env().map_err(|e| anyhow::anyhow!("env: {e}"))?;
     if let Some(path) = &common.config {
@@ -326,6 +340,13 @@ pub fn resolve_options(common: &CommonArgs) -> Result<crate::EngineOptions> {
         o.decode
             .merge_json(&v)
             .map_err(|e| anyhow::anyhow!("--decode-config: {e}"))?;
+    }
+    if let Some(json) = &common.tuning_config {
+        let v: serde_json::Value =
+            serde_json::from_str(json).context("--tuning-config: not JSON")?;
+        o.tuning
+            .merge_json(&v)
+            .map_err(|e| anyhow::anyhow!("--tuning-config: {e}"))?;
     }
     for kv in &common.set {
         let (k, v) = lloom_tensor::options::split_assignment(kv).map_err(|e| anyhow::anyhow!("--set {e}"))?;
@@ -403,7 +424,7 @@ pub fn main(argv: Vec<String>) -> Result<()> {
         Command::Serve(args) => serve::run(args),
         Command::Chat(args) => chat::run(args),
         Command::Config(args) => {
-            let o = resolve_options(&args.common)?;
+            let o = resolve_options_uninstalled(&args.common)?;
             println!("{}", serde_json::to_string_pretty(&o)?);
             Ok(())
         }
@@ -423,6 +444,15 @@ pub fn main_serve_compat(mut argv: Vec<String>) -> Result<()> {
 mod option_layer_tests {
     use super::*;
     use crate::{EosKind, ReadbackKind};
+
+    /// Every flag of every group flattened into `serve` and `chat` is
+    /// distinct (clap's own check; a duplicate id or long name is a runtime
+    /// parse failure otherwise).
+    #[test]
+    fn the_command_line_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
 
     fn common(argv: &[&str]) -> CommonArgs {
         #[derive(Parser)]
@@ -447,7 +477,7 @@ mod option_layer_tests {
         .unwrap();
         let path = file.to_str().unwrap();
         // file < --decode-config < --set < flags
-        let o = resolve_options(&common(&[
+        let o = resolve_options_uninstalled(&common(&[
             "--config",
             path,
             "--decode-config",
@@ -468,7 +498,7 @@ mod option_layer_tests {
         // The dump is a valid --config that reproduces the tree.
         let dumped = dir.join("dump.json");
         std::fs::write(&dumped, serde_json::to_string_pretty(&o).unwrap()).unwrap();
-        let back = resolve_options(&common(&["--config", dumped.to_str().unwrap()])).unwrap();
+        let back = resolve_options_uninstalled(&common(&["--config", dumped.to_str().unwrap()])).unwrap();
         assert_eq!(back, o);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -476,17 +506,17 @@ mod option_layer_tests {
     #[test]
     fn a_refused_combination_names_itself() {
         // The blocking arm ignores the cadence knobs rather than refusing them.
-        let o = resolve_options(&common(&["--readback", "blocking", "--adaptive-commit"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--readback", "blocking", "--adaptive-commit"])).unwrap();
         assert_eq!(o.decode.readback.arm(), crate::ReadbackArm::Blocking);
-        let err = resolve_options(&common(&["--eos-gate", "--adaptive-commit=false"]))
+        let err = resolve_options_uninstalled(&common(&["--eos-gate", "--adaptive-commit=false"]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("eos_gate needs adaptive_commit"), "{err}");
-        let err = resolve_options(&common(&["--set", "decode.nope=1"]))
+        let err = resolve_options_uninstalled(&common(&["--set", "decode.nope=1"]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown key `nope`"), "{err}");
-        let err = resolve_options(&common(&["--set", "decode.readback"]))
+        let err = resolve_options_uninstalled(&common(&["--set", "decode.readback"]))
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected key=value"), "{err}");
@@ -494,15 +524,15 @@ mod option_layer_tests {
 
     #[test]
     fn the_shorthands_are_lfm2_chats() {
-        let o = resolve_options(&common(&["--readback", "ring-gpubatch-nonblocking"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--readback", "ring-gpubatch-nonblocking"])).unwrap();
         assert_eq!(o.decode.readback.kind, ReadbackKind::Ring);
         assert_eq!(o.decode.readback.eos, EosKind::GpuBatchedNonblocking);
-        let o = resolve_options(&common(&["--readback", "ring-la0"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--readback", "ring-la0"])).unwrap();
         assert_eq!(o.decode.readback.lookahead, 0);
         assert!(!o.decode.readback.adaptive_commit);
         // The compound and its keys compose in either order: the spelling
         // sets kind + eos, the key flags override field by field.
-        let o = resolve_options(&common(&["--readback", "ring-hostdrain", "--lookahead", "0"])).unwrap();
+        let o = resolve_options_uninstalled(&common(&["--readback", "ring-hostdrain", "--lookahead", "0"])).unwrap();
         assert_eq!(o.decode.readback.eos, EosKind::HostDrain);
         assert_eq!(o.decode.readback.lookahead, 0);
     }

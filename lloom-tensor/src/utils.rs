@@ -333,11 +333,10 @@ fn rayon_num_threads() -> usize {
 }
 
 fn candle_num_threads() -> usize {
-    std::env::var("CANDLE_NUM_THREADS")
-        .ok()
-        .and_then(|s| usize::from_str(&s).ok())
-        .filter(|nt| nt > &0)
-        .unwrap_or_else(default_num_threads)
+    match crate::tuning::tuning().cpu.num_threads {
+        0 => default_num_threads(),
+        n => n,
+    }
 }
 
 pub fn get_num_threads() -> usize {

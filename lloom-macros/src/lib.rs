@@ -21,6 +21,8 @@
 //! explicit attribute is the shape `.bench/configurations.md` §1 already uses
 //! (name, variants, default as prose) and keeps the macro one code path.
 
+mod options;
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
@@ -281,4 +283,13 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// `#[derive(Options)]` — an option group with every front-end generated from
+/// one field list: the clap companion `<Struct>Args` + `apply`, the dotted
+/// `set`, `merge_json`, `from_env` and the `META` table. See `options.rs`.
+#[proc_macro_derive(Options, attributes(opt, options))]
+pub fn derive_options(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    options::derive(input).into()
 }

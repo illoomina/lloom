@@ -33,6 +33,10 @@ once_cell = { workspace = true, optional = true }
 # no `unwrap`). A base dependency because `Storage` is on the CPU/CUDA path too;
 # it is pure-Rust and cross-platform, so those builds are unaffected.
 parking_lot = { workspace = true }
+# The option-group derive and its JSON/dotted front-ends (`options.rs`).
+lloom-macros = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true, optional = true }
 cudarc = { workspace = true, optional = true }
 gemm = { workspace = true }

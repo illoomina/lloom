@@ -117,6 +117,8 @@ pub mod qwen3;
 pub mod qwen3_moe;
 pub mod qwen3_vl;
 pub mod qwen4exp;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod qwen4exp_ir;
 pub mod recurrent_gemma;
 pub mod repvgg;
 pub mod resnet;

@@ -1413,3 +1413,241 @@ fn models_body(model_name: &str) -> Value {
         "data": [{ "id": model_name, "object": "model", "created": now(), "owned_by": "lloom" }],
     })
 }
+
+// ---- `lloom bench` ---------------------------------------------------------------
+
+/// `lloom bench`: the benchmark cells the pipette sidecar drives over HTTP
+/// (`/prefill_throughput`, `/decode_throughput`, `/end_to_end_latency`,
+/// `/max_memory_usage`), run in-process on the same engine and the same
+/// option groups — one `BENCH` line per cell per run, the resolved arms last.
+#[derive(Parser)]
+#[command(name = "lloom bench", about = "Run the benchmark cells in-process")]
+pub struct BenchArgs {
+    #[command(flatten)]
+    pub model: super::ModelArgs,
+
+    #[command(flatten)]
+    pub common: super::CommonArgs,
+
+    /// The cells, comma-separated: `prefill:P`, `decode:P:D`, `e2e:P:D`, `memory:P:D`
+    /// (P prompt tokens, D decode tokens).
+    #[arg(long, default_value = "prefill:512,decode:512:100,e2e:8:64,memory:512:100")]
+    pub cells: String,
+
+    /// Runs per cell (the first is the cold one).
+    #[arg(long, default_value_t = 2)]
+    pub runs: usize,
+
+    /// The batch width the engine is loaded for; the cells take `batch` up to it.
+    #[arg(long, default_value_t = 1)]
+    pub batch: usize,
+
+    /// How the rows of `--batch N` hold their state (`auto | pool | pool-per-row | private`).
+    #[arg(long, default_value = "auto")]
+    pub rows: String,
+
+    /// Reuse the cached prefix across cells.
+    #[arg(long)]
+    pub reuse_prefix: bool,
+
+    /// Sample the memory gauges around every cell (a gauge run).
+    #[arg(long)]
+    pub mem_sample: bool,
+
+    /// Share a prompt prefix between rows (the pool arms).
+    #[arg(long)]
+    pub share_prefix: bool,
+
+    /// A file whose text is tiled into the cells' prompts.
+    #[arg(long)]
+    pub prompt_seed_file: Option<PathBuf>,
+}
+
+/// One cell of `--cells`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cell {
+    Prefill { p: usize },
+    Decode { p: usize, d: usize },
+    EndToEnd { p: usize, d: usize },
+    Memory { p: usize, d: usize },
+}
+
+impl Cell {
+    pub fn parse_list(s: &str) -> Result<Vec<Cell>> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(Cell::parse)
+            .collect()
+    }
+
+    pub fn parse(s: &str) -> Result<Cell> {
+        let parts: Vec<&str> = s.split(':').collect();
+        let num = |i: usize| -> Result<usize> {
+            parts
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("cell `{s}`: missing a size"))?
+                .parse::<usize>()
+                .with_context(|| format!("cell `{s}`: not a size"))
+        };
+        Ok(match parts[0] {
+            "prefill" => Cell::Prefill { p: num(1)? },
+            "decode" => Cell::Decode { p: num(1)?, d: num(2)? },
+            "e2e" | "end_to_end" => Cell::EndToEnd { p: num(1)?, d: num(2)? },
+            "memory" | "max_memory" => Cell::Memory { p: num(1)?, d: num(2)? },
+            other => anyhow::bail!("cell `{other}`: prefill:P | decode:P:D | e2e:P:D | memory:P:D"),
+        })
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Cell::Prefill { p } => format!("prefill_throughput_{p}"),
+            Cell::Decode { p, d } => format!("decode_throughput_{p}_{d}"),
+            Cell::EndToEnd { p, d } => format!("end_to_end_latency_{p}_{d}"),
+            Cell::Memory { p, d } => format!("max_memory_usage_{p}_{d}"),
+        }
+    }
+}
+
+pub fn bench(args: BenchArgs) -> Result<()> {
+    let cells = Cell::parse_list(&args.cells)?;
+    if cells.is_empty() {
+        anyhow::bail!("--cells names no cell");
+    }
+    let mut options = super::resolve_options(&args.common)?;
+    let seed_text = match &args.prompt_seed_file {
+        Some(p) => std::fs::read_to_string(p)
+            .with_context(|| format!("reading the prompt seed {}", p.display()))?,
+        None => std::env::var("PIPETTE_PROMPT_SEED_TEXT")
+            .or_else(|_| std::env::var("PIPETTE_MLX_PROMPT_SEED_TEXT"))
+            .unwrap_or_else(|_| DEFAULT_SEED_TEXT.to_string()),
+    };
+    let batched = args.batch > 1;
+    if batched && options.decode.prefill.chunk == 0 {
+        options.decode.prefill.chunk = 512;
+    }
+    let load_start = Instant::now();
+    let (engine, model_path) = super::load_engine(
+        &args.model,
+        super::Shape {
+            decode: options.decode.clone(),
+            model: options.model.clone(),
+            speculative: options.speculative.clone(),
+            executor: options.executor.clone(),
+            memory: options.memory.clone(),
+            reuse_prefix: args.reuse_prefix,
+            seed_text: seed_text.clone(),
+            batch: args.batch,
+            mem_sample: args.mem_sample,
+            rows: args.rows.clone(),
+            share_prefix: args.share_prefix,
+        },
+    )?;
+    let model_name = engine.model_name().to_string();
+    let mut sampling = options.sampling.clone();
+    sampling.apply_checkpoint(engine.generation_config().as_ref());
+    eprintln!(
+        "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} {}]",
+        model_name,
+        model_path.display(),
+        load_start.elapsed().as_secs_f64(),
+        engine.device(),
+        engine.kv_capacity(),
+        engine.readback().name(),
+        engine.describe(),
+    );
+    eprintln!("[capabilities: {}]", engine.capabilities().line());
+    // The cells are the server's handlers; they read the engine through
+    // `Shared`, whose listener is unused here (a free loopback port).
+    let server = Server::http("127.0.0.1:0").map_err(|e| anyhow::anyhow!("binding: {e}"))?;
+    let shared = Shared {
+        engine,
+        aborts: Mutex::new(HashSet::new()),
+        server,
+        model_name: model_name.clone(),
+        sampling,
+    };
+    let batch = args.batch.max(1);
+    for run in 0..args.runs.max(1) {
+        for cell in &cells {
+            let started = Instant::now();
+            let out = match cell {
+                Cell::Prefill { p } => prefill_throughput(&shared, &json!({ "prompt_tokens": p, "batch": batch })),
+                Cell::Decode { p, d } => decode_throughput(
+                    &shared,
+                    &json!({ "prompt_tokens": p, "decode_tokens": d, "batch": batch }),
+                ),
+                Cell::Memory { p, d } => max_memory_usage(
+                    &shared,
+                    &json!({ "prompt_tokens": p, "decode_tokens": d, "batch": batch }),
+                ),
+                Cell::EndToEnd { p, d } => {
+                    // The seed tiled to `p` tokens, as text: what the sidecar
+                    // posts as `prompt`.
+                    let ids = shared.engine.seed_prompt_row(*p, 0);
+                    let prompt: String = ids.iter().map(|&t| shared.engine.token_str(t)).collect();
+                    end_to_end_latency(
+                        &shared,
+                        &json!({ "prompt": prompt, "decode_tokens": d, "batch": batch }),
+                    )
+                }
+            };
+            let value = match out {
+                Ok(v) => v,
+                Err(Failure::BadRequest(m)) | Err(Failure::NotFound(m)) => {
+                    anyhow::bail!("{}: {m}", cell.name())
+                }
+                Err(Failure::Internal(e)) => return Err(e.context(cell.name())),
+            };
+            let mut fields: Vec<String> = Vec::new();
+            if let Some(map) = value.as_object() {
+                for (k, v) in map {
+                    match v {
+                        Value::Number(n) => fields.push(format!("{k}={n}")),
+                        Value::String(s) => fields.push(format!("{k}={s}")),
+                        Value::Bool(b) => fields.push(format!("{k}={b}")),
+                        _ => {}
+                    }
+                }
+            }
+            println!(
+                "BENCH run={run} cell={} wall_ms={:.1} {}",
+                cell.name(),
+                ms(started.elapsed()),
+                fields.join(" ")
+            );
+        }
+    }
+    println!(
+        "BENCH arms model={} readback={} batch={} {} capabilities: {}",
+        model_name,
+        shared.engine.readback().name(),
+        batch,
+        shared.engine.describe(),
+        shared.engine.capabilities().line(),
+    );
+    shared.engine.shutdown();
+    Ok(())
+}
+
+#[cfg(test)]
+mod bench_cells_tests {
+    use super::Cell;
+
+    #[test]
+    fn the_cells_parse_and_name_themselves() {
+        let cells = Cell::parse_list("prefill:512, decode:512:100,e2e:8:64,memory:512:100").unwrap();
+        assert_eq!(
+            cells.iter().map(Cell::name).collect::<Vec<_>>(),
+            vec![
+                "prefill_throughput_512",
+                "decode_throughput_512_100",
+                "end_to_end_latency_8_64",
+                "max_memory_usage_512_100"
+            ]
+        );
+        assert!(Cell::parse("decode:512").is_err(), "a decode cell needs D");
+        assert!(Cell::parse("ttft:8").is_err());
+        assert!(Cell::parse("prefill:many").is_err());
+    }
+}

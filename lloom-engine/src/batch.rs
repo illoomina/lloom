@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 
-use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::generation::Sampling;
 use lloom::nn::{
     BatchDecoder, BatchedCausalLM, CacheReset, CacheRewind, CacheShare, DecodeOptions, DecodeOut,
     DecodeStats, ReuseAction, RowDriver, RowId, Session,
@@ -1273,7 +1273,7 @@ mod tests {
             Box::new(move |idle, sessions, prompts, specs, on_tokens| {
                 seen.fetch_add(1, Ordering::AcqRel);
                 assert_eq!(sessions.len(), prompts.len());
-                let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+                let mut sampler = lloom::generation::LogitsProcessor::from_sampling(0, Sampling::ArgMax);
                 let opts = DecodeOptions {
                     lookahead: 1,
                     ..DecodeOptions::new(specs.iter().map(|s| s.max_tokens).max().unwrap())

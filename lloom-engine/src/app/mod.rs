@@ -413,6 +413,8 @@ pub enum Command {
     Serve(serve::ServeArgs),
     /// A streaming chat REPL on stdin/stdout.
     Chat(chat::ChatArgs),
+    /// The benchmark cells (the pipette sidecar's) in-process, both families.
+    Bench(serve::BenchArgs),
     /// Print the resolved option tree (the layers applied) as JSON.
     Config(ConfigArgs),
     /// List every knob: key, flag, env alias, default, arms, doc.
@@ -425,6 +427,7 @@ pub fn main(argv: Vec<String>) -> Result<()> {
     match cli.command {
         Command::Serve(args) => serve::run(args),
         Command::Chat(args) => chat::run(args),
+        Command::Bench(args) => serve::bench(args),
         Command::Config(args) => {
             let o = resolve_options_uninstalled(&args.common)?;
             println!("{}", serde_json::to_string_pretty(&o)?);

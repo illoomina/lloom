@@ -8,6 +8,7 @@
 
 pub mod chat;
 pub mod common;
+pub mod family;
 pub mod lfm2;
 pub mod qwen4exp;
 pub mod serve;
@@ -149,145 +150,17 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
         None => lfm2::default_model_dir()
             .context("no --model given and the LFM2.5-2.6B snapshot was not in the HF cache")?,
     };
-    if path.is_file() {
-        if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-            return Ok(Family::Qwen4Exp(path));
-        }
-        anyhow::bail!(
-            "{}: a model is a checkpoint directory (LFM2) or a GGUF shard (Qwen4-exp)",
-            path.display()
-        );
-    }
-    if !path.is_dir() {
-        anyhow::bail!("{}: no such model", path.display());
-    }
-    if path.join("config.json").is_file() {
-        return Ok(Family::Lfm2(path));
-    }
-    let mut ggufs: Vec<PathBuf> = std::fs::read_dir(&path)
-        .with_context(|| format!("reading {}", path.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("gguf"))
-        .collect();
-    ggufs.sort();
-    // The first shard of a sharded checkpoint, else the only file.
-    if let Some(first) = ggufs
-        .iter()
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.contains("-00001-of-"))
-                .unwrap_or(false)
-        })
-        .or_else(|| (ggufs.len() == 1).then(|| &ggufs[0]))
-    {
-        return Ok(Family::Qwen4Exp(first.clone()));
-    }
-    anyhow::bail!(
-        "{}: neither a checkpoint directory (config.json) nor a GGUF shard directory",
-        path.display()
-    )
+    let (f, checkpoint) = family::detect(&path)?;
+    Ok(match f.name() {
+        "lfm2" => Family::Lfm2(checkpoint),
+        _ => Family::Qwen4Exp(checkpoint),
+    })
 }
 
 /// Load the engine `args` names for `shape`. Returns it with the path it
 /// was loaded from.
 pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
-    let family = detect_family(model.model.as_deref())?;
-    let prefill_tile = shape.decode.prefill.tile;
-    let prefill_chunk = shape.decode.prefill.chunk;
-    let readback = shape.decode.readback.arm();
-    match family {
-        Family::Lfm2(dir) => {
-            let batched = shape.batch > 1;
-            let rows = lfm2::RowsArm::parse(&shape.rows, batched)?;
-            let spec = &shape.speculative;
-            if spec.method == "mtp" {
-                anyhow::bail!("speculative.method = mtp (`--mtp`) is Qwen4-exp's; an LFM2 checkpoint has no MTP head — LFM2 speculates with `--dspark`");
-            }
-            let engine = lfm2::Engine::load(lfm2::LoadOptions {
-                model_dir: dir.clone(),
-                cpu: model.cpu,
-                kv_capacity: shape.memory.kv_capacity,
-                readback,
-                decode: shape.decode.clone(),
-                model: shape.model.clone(),
-                reuse_prefix: shape.reuse_prefix,
-                warmup: !model.no_warmup,
-                seed_text: shape.seed_text,
-                model_name: model.model_name.clone(),
-                batch: shape.batch,
-                dspark: (spec.method == "dspark").then(|| spec.drafter.clone().unwrap_or_default()),
-                prefill_tile,
-                prefill_chunk,
-                memory_fraction: shape.memory.memory_fraction,
-                mem_sample: shape.mem_sample,
-                rows,
-                share_prefix: shape.share_prefix,
-                dspark_k: spec.k,
-                executor: shape.executor.clone(),
-                memory: shape.memory.clone(),
-            })?;
-            Ok((Box::new(engine), dir))
-        }
-        Family::Qwen4Exp(first) => {
-            if !shape.model.axes.is_empty() || shape.model.cache != "auto" {
-                anyhow::bail!(
-                    "the model axes ({}{}) are LFM2's `Config`'s; Qwen4-exp's arms are `--experts`, `--slots`, `--loader`, `--moe-act`, `--prefill-mode`, `--prefetch`, `--io-hints` and the `tuning.qwen4exp.*` knobs",
-                    if shape.model.cache != "auto" { format!("cache={} ", shape.model.cache) } else { String::new() },
-                    shape.model.axes.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
-            }
-            let spec = &shape.speculative;
-            let mtp = match spec.method.as_str() {
-                "mtp" => match &spec.drafter {
-                    Some(path) => Some(path.clone()),
-                    None => anyhow::bail!("speculative.method = mtp needs the MTP sidecar GGUF (`--mtp <path>` / `speculative.drafter`)"),
-                },
-                "dspark" => anyhow::bail!("speculative.method = dspark (`--dspark`) is LFM2's drafter; Qwen4-exp speculates with `--mtp`"),
-                _ => None,
-            };
-            if shape.batch > 1 && mtp.is_some() {
-                anyhow::bail!(
-                    "--batch {} with --mtp on Qwen4-exp: the batched loop is the K = 1 driver; \
-                     the MTP head speculates at --batch 1",
-                    shape.batch
-                );
-            }
-            let engine = qwen4exp::Engine::load(qwen4exp::LoadOptions {
-                first_shard: first.clone(),
-                tokenizer: model.tokenizer.clone(),
-                cpu: model.cpu,
-                kv_capacity: shape.memory.kv_capacity,
-                readback,
-                decode: shape.decode.clone(),
-                reuse_prefix: shape.reuse_prefix,
-                warmup: !model.no_warmup,
-                seed_text: shape.seed_text,
-                model_name: model.model_name.clone(),
-                prefill_tile,
-                memory_fraction: shape.memory.memory_fraction,
-                mem_sample: shape.mem_sample,
-                experts: model.experts.clone(),
-                slots: shape.memory.slots.clone(),
-                loader: model.loader.clone(),
-                ple_cache_rows: model.ple_cache_rows,
-                ple: !model.no_ple,
-                moe_act: model.moe_act.clone(),
-                mtp,
-                hotlist: model.hotlist.clone(),
-                batch: shape.batch,
-                mtp_k: spec.k.unwrap_or(1),
-                prefetch: model.prefetch,
-                io_hints: model.io_hints,
-                prefill_mode: model.prefill_mode.clone(),
-                pin: model.pin,
-                kv_reserve_tokens: shape.memory.kv_reserve_tokens,
-                executor: shape.executor.clone(),
-                memory: shape.memory.clone(),
-            })?;
-            Ok((engine, first))
-        }
-    }
+    family::load(model, shape)
 }
 
 /// The option layers every subcommand takes (`lloom_engine::options`):

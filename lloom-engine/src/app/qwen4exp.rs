@@ -824,6 +824,9 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
             self.executor.line(),
         )
     }
+    fn capabilities(&self) -> super::family::Capabilities {
+        super::family::QWEN4EXP_CAPABILITIES
+    }
     fn encode(&self, text: &str, _add_special: bool) -> Result<Vec<u32>> {
         // No BOS on this checkpoint: the template starts with the turn tag.
         Ok(self

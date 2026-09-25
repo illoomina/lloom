@@ -18,7 +18,7 @@
 
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::readback::RING_HISTORY_SLOTS;
-use lloom::generation::{Blocking, CommitBudget, EosRead, LogitsProcessor, Ring, Sampling};
+use lloom::generation::{Blocking, EosRead, LogitsProcessor, Ring, Sampling};
 use lloom::nn::{
     CacheReset, CacheRewind, CausalLM, DecodeOptions, DecodeOut, DecodeStats, IdentityProposer,
     ReuseAction, Sequence, Session,

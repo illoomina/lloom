@@ -102,6 +102,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         !args.no_reuse,
         engine.describe()
     );
+    eprintln!("[capabilities: {}]", engine.capabilities().line());
     sampling.apply_checkpoint(engine.generation_config().as_ref());
     let kwargs = json!({ "enable_thinking": args.think });
     let mut messages: Vec<Value> = Vec::new();

@@ -38,6 +38,8 @@ pub trait Served: Send + Sync {
     fn health(&self) -> Value;
     /// The family-specific tail of the `[loaded …]` line.
     fn describe(&self) -> String;
+    /// What the family can do (`family.rs`): the loaded line and `/health` say it.
+    fn capabilities(&self) -> super::family::Capabilities;
     /// The checkpoint's `generation_config.json`, when it carries one (the
     /// sampling defaults under `--sampling-defaults checkpoint`).
     fn generation_config(&self) -> Option<lloom::hub::GenerationConfig> {

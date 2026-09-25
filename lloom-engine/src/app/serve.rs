@@ -29,7 +29,7 @@
 
 use super::common::{ms, MemSnapshot, NEVER_EOS};
 use super::served::Served;
-use crate::{DecodeParams, Decoded, ReadbackArm, Stop};
+use crate::{DecodeParams, Decoded, Stop};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
@@ -176,6 +176,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         args.reuse_prefix,
         engine.describe(),
     );
+    eprintln!("[capabilities: {}]", engine.capabilities().line());
     eprintln!("[{}]", MemSnapshot::read(engine.device()).json());
 
     let server = Server::http((args.host.as_str(), args.port))
@@ -215,6 +216,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 // beside the family's own state.
                 let mut body = shared.engine.health();
                 body["mem"] = MemSnapshot::read(shared.engine.device()).json();
+                body["capabilities"] = shared.engine.capabilities().json();
                 let _ = respond_json(request, 200, &body);
             }
             (Method::Get, "/v1/models") => {

@@ -1826,6 +1826,9 @@ impl super::served::Served for Engine {
     fn generation_config(&self) -> Option<lloom::hub::GenerationConfig> {
         self.generation.clone()
     }
+    fn capabilities(&self) -> super::family::Capabilities {
+        super::family::LFM2_CAPABILITIES
+    }
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {
         Engine::encode(self, text, add_special)
     }

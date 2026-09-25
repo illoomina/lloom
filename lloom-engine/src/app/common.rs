@@ -10,8 +10,7 @@ use hf_chat_template::ChatTemplate;
 use lloom_tensor::Device;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 use tokenizers::Tokenizer;
 

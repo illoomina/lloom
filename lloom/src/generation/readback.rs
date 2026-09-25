@@ -1547,8 +1547,13 @@ impl Ring {
     /// every N-commits' worth of tokens so the core can go dormant between waits.
     /// Floored at 1. The TTFT ramp still forces the early commits live.
     pub fn with_wake_cadence(mut self, commits: usize) -> Self {
-        self.live_every = commits.max(1);
+        self.set_wake_cadence(commits);
         self
+    }
+
+    /// [`Self::with_wake_cadence`] on a ring a pool already holds.
+    pub fn set_wake_cadence(&mut self, commits: usize) {
+        self.live_every = commits.max(1);
     }
 
     /// The ring itself, for a caller that wants to observe its counters.
@@ -2130,6 +2135,14 @@ impl Ring {
 pub struct CommitBudget {
     steps: usize,
 }
+
+impl std::fmt::Display for CommitBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.arm())
+    }
+}
+
+lloom_tensor::serde_via_str!(CommitBudget);
 
 impl CommitBudget {
     /// Commit and prune every step — the incumbent ring arm.

@@ -20,6 +20,7 @@
 
 pub mod batch;
 pub mod decode;
+pub mod options;
 #[cfg(feature = "serve")]
 pub mod app;
 pub mod seam;
@@ -32,8 +33,9 @@ pub use batch::{
     StaticBody, drive_closed_rows,
 };
 pub use decode::{
-    ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingPool, Stop,
+    ring_eos_read, DecodeParams, DecodeSession, Decoded, ReadbackArm, RingArm, RingPool, Stop,
 };
+pub use options::{DecodeConfig, EngineOptions, EosKind, PrefillConfig, ReadbackConfig, ReadbackKind};
 pub use seam::Completer;
 pub use slots::{Routed, SlotPool, DEFAULT_SIMILARITY};
 pub use stream::TextStream;

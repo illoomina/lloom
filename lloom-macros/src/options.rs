@@ -31,6 +31,8 @@
 //! #[opt(variants = ["a", "b"])]              the arms, for help and the table
 //! #[opt(parser = "parse_spark")]             `fn(&str) -> Result<T, String>` instead of FromStr
 //! #[opt(nested)]                             a sub-group: its own derive, flattened
+//! #[opt(nested, flag = "readback", parser = "f")]  …plus a compound shorthand:
+//!                                            `f(&mut Sub, &str) -> Result<(), String>`
 //! #[opt(skip)]                               not on any front-end (a computed field)
 //! ```
 //!
@@ -264,7 +266,24 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
         }
         if f.attr.nested {
             let sub_args = nested_args_ty(&f.ty);
+            // A nested group may also carry a compound shorthand
+            // (`--readback ring-nonblocking` for `readback.{kind,eos}`): the
+            // `parser` applies the spelling onto the group, then the group's
+            // own flags override field by field.
+            let compound = if f.attr.flag.is_some() && f.attr.parser.is_some() {
+                let spelling = format_ident!("{}_spelling", ident);
+                let flag = f.attr.flag.clone().unwrap();
+                let doc = format!("{} (a shorthand for the group's keys)", f.doc);
+                quote! {
+                    #[doc = #doc]
+                    #[arg(long = #flag, value_name = "SPELLING")]
+                    pub #spelling: Option<String>,
+                }
+            } else {
+                quote! {}
+            };
             quote! {
+                #compound
                 #[command(flatten)]
                 pub #ident: #sub_args,
             }
@@ -288,7 +307,17 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
         let ident = &f.ident;
         let key = ident.to_string();
         if f.attr.nested {
-            quote! { self.#ident.apply(&mut base.#ident)?; }
+            if f.attr.flag.is_some() && f.attr.parser.is_some() {
+                let spelling = format_ident!("{}_spelling", ident);
+                quote! {
+                    if let Some(raw) = &self.#spelling {
+                        base.set(#key, raw)?;
+                    }
+                    self.#ident.apply(&mut base.#ident)?;
+                }
+            } else {
+                quote! { self.#ident.apply(&mut base.#ident)?; }
+            }
         } else if f.attr.is_bool {
             quote! { if let Some(v) = self.#ident { base.#ident = v; } }
         } else {
@@ -305,11 +334,18 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
         let ident = &f.ident;
         let key = ident.to_string();
         if f.attr.nested {
+            let whole = match &f.attr.parser {
+                Some(parser) => {
+                    let parse_fn: TokenStream = parser.parse().unwrap_or_else(|_| quote!(parse));
+                    quote! { return #parse_fn(&mut self.#ident, value).map_err(|e| format!("{}: {}", #key, e)); }
+                }
+                None => quote! {
+                    return Err(format!("`{}` is a group; name one of its keys (`{}.<key>`)", #key, #key));
+                },
+            };
             quote! {
                 #key => {
-                    let Some(rest) = rest else {
-                        return Err(format!("`{}` is a group; name one of its keys (`{}.<key>`)", #key, #key));
-                    };
+                    let Some(rest) = rest else { #whole };
                     self.#ident.set(rest, value)
                 }
             }
@@ -349,7 +385,20 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             // or untagged): a dump read back must not trip on it.
             quote! { #key => {} }
         } else if f.attr.nested {
-            quote! { #key => self.#ident.merge_json(v)?, }
+            // A string where the group is expected is its shorthand spelling.
+            let by_string = match &f.attr.parser {
+                Some(parser) => {
+                    let parse_fn: TokenStream = parser.parse().unwrap_or_else(|_| quote!(parse));
+                    quote! {
+                        if let Some(s) = v.as_str() {
+                            #parse_fn(&mut self.#ident, s).map_err(|e| format!("{}: {}", #key, e))?;
+                            continue;
+                        }
+                    }
+                }
+                None => quote! {},
+            };
+            quote! { #key => { #by_string self.#ident.merge_json(v)?; } }
         } else {
             quote! {
                 #key => {

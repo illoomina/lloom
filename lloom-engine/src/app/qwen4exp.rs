@@ -54,6 +54,8 @@ pub struct LoadOptions {
     pub cpu: bool,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
+    /// The decode loop's options (`DecodeConfig`).
+    pub decode: crate::DecodeConfig,
     pub reuse_prefix: bool,
     pub warmup: bool,
     pub seed_text: String,
@@ -88,6 +90,8 @@ pub struct QwenCore<R: ExpertResidency + HasStreamStats> {
 struct Single {
     seq: Option<Sequence<Cache>>,
     rings: Option<RingPool>,
+    /// The loop's options, handed to every request's session.
+    decode: crate::DecodeConfig,
 }
 
 pub struct Engine<R: ExpertResidency + HasStreamStats> {
@@ -342,6 +346,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
+                decode: opts.decode.clone(),
             }),
             batch: opts.batch.max(1),
             sched: None,
@@ -409,7 +414,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             .context("the sequence is checked out — a previous request panicked mid-decode")?;
         let rings = single.rings.take().unwrap_or_default();
         let mut session =
-            DecodeSession::from_parts(&self.core.model, seq, self.device.clone(), rings);
+            DecodeSession::from_parts(&self.core.model, seq, self.device.clone(), rings)
+                .with_config(single.decode.clone());
         let out = f(&mut session);
         let (seq, rings) = session.into_parts();
         single.seq = Some(seq);

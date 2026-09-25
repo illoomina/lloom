@@ -6,7 +6,7 @@
 
 use super::common::{ms, NEVER_EOS};
 use super::{detect_family, load_engine, Family, ModelArgs, Shape};
-use crate::{DecodeParams, ReadbackArm};
+use crate::DecodeParams;
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
@@ -22,12 +22,13 @@ pub struct ChatArgs {
     #[command(flatten)]
     pub model: ModelArgs,
 
-    /// Readback arm (see `lloom serve --readback`). `auto` is the ring
-    /// WITHOUT the lookahead on LFM2 (`ring-la0`: the cache ends at the
-    /// EOS, so the next turn extends it rather than re-prefilling the
-    /// conversation) and the blocking arm on Qwen4-exp.
-    #[arg(long, default_value = "auto")]
-    pub readback: String,
+    /// The option layers: `--config`, `--decode-config`, `--set`, and the
+    /// generated flags (`--readback`, `--lookahead`, `--commit-budget`, …).
+    /// `--readback auto` is the ring WITHOUT the lookahead on LFM2 (the
+    /// cache ends at the EOS, so the next turn extends it rather than
+    /// re-prefilling the conversation) and the blocking arm on Qwen4-exp.
+    #[command(flatten)]
+    pub common: super::CommonArgs,
 
     /// New tokens per turn at most.
     #[arg(long, short = 'n', default_value_t = 1024)]
@@ -60,27 +61,33 @@ pub struct ChatArgs {
     /// One turn from the command line instead of the REPL, then exit.
     #[arg(long, short = 'p')]
     pub prompt: Option<String>,
+
+    /// The prompt is already rendered: no chat template, the text encoded as
+    /// given with the checkpoint's BOS — what `lfm2-chat` and a benchmark
+    /// runner feed, so a reply can be compared token for token.
+    #[arg(long)]
+    pub raw: bool,
 }
 
 pub fn run(args: ChatArgs) -> Result<()> {
     let family = detect_family(args.model.model.as_deref())?;
-    let readback = match (args.readback.as_str(), &family) {
-        ("auto", Family::Lfm2(_)) => ReadbackArm::Ring {
-            lookahead: 0,
-            commit_steps: 8,
-            adaptive: false,
-        },
-        (s, _) => super::serve::parse_readback(s)?,
-    };
+    let mut options = super::resolve_options(&args.common)?;
+    if options.decode.readback.kind == crate::ReadbackKind::Auto {
+        if let Family::Lfm2(_) = &family {
+            // The chat's `auto` on LFM2: the ring without the lookahead, so
+            // the cache ends at the EOS and the next turn extends it.
+            crate::ReadbackConfig::apply_spelling(&mut options.decode.readback, "ring-la0")
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
+    }
     let t = Instant::now();
     let (engine, path) = load_engine(
         &args.model,
         Shape {
-            readback,
+            decode: options.decode.clone(),
             reuse_prefix: !args.no_reuse,
             seed_text: "The loom threads warp and weft into cloth. ".to_string(),
             batch: 1,
-            prefill_chunk: 0,
             mem_sample: false,
             rows: "auto".to_string(),
             share_prefix: false,
@@ -117,8 +124,14 @@ pub fn run(args: ChatArgs) -> Result<()> {
                 }
             }
         };
-        let user = user.trim().to_string();
-        if user.is_empty() {
+        // A raw prompt is bytes to encode as given (its trailing newline is
+        // the template's); a typed line is trimmed.
+        let user = if args.raw {
+            user
+        } else {
+            user.trim().to_string()
+        };
+        if user.trim().is_empty() {
             continue;
         }
         if user == "/quit" || user == "/exit" {
@@ -126,7 +139,11 @@ pub fn run(args: ChatArgs) -> Result<()> {
         }
         turn += 1;
         messages.push(json!({ "role": "user", "content": user }));
-        let rendered = engine.render_chat(&json!(messages), Some(&kwargs))?;
+        let rendered = if args.raw {
+            user.clone()
+        } else {
+            engine.render_chat(&json!(messages), Some(&kwargs))?
+        };
         let ids = engine.encode(&rendered, true)?;
         let params = DecodeParams {
             seed: args.seed,

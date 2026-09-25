@@ -38,6 +38,69 @@ pub enum Stop {
     Cancelled,
 }
 
+/// A ring arm's parameters: what `lfm2-chat`'s six `--readback` spellings,
+/// `--lookahead`, `--commit-budget`, `--adaptive-commit` and `--wake-cadence`
+/// select, as one value (`crate::options::ReadbackConfig` builds it).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RingArm {
+    /// Forward passes the host enqueues before it has learned the previous
+    /// step's EOS: `0` or `1`. `1` is the crown arm and leaves the cache one
+    /// position past an EOS, which [`Session::prepare`] reconciles or resets
+    /// on the next request.
+    pub lookahead: usize,
+    /// Steps between commits of the in-flight queue; `1` is per-token.
+    pub commit_steps: usize,
+    /// The adaptive commit (`lfm2-chat --adaptive-commit --stream-reader`):
+    /// a buffer is closed when the GPU starts the previous one rather than
+    /// every `commit_steps`, and the token drain is a reader thread's, off
+    /// the loop's path. Measured +0.5 tok/s on the B=1 crown (#148, record
+    /// §8.1). Needs a CPU-mapped ring and lookahead 1; falls back to the
+    /// fixed cadence where the ring has no reader.
+    pub adaptive: bool,
+    /// How the ring learns EOS (`ring` = a blocking flag read, `ring-nonblocking`
+    /// = the poll, `ring-hostdrain`, `ring-gpubatch[-nonblocking]`).
+    pub eos: EosRead,
+    /// Commits between live completion-marker writes on the deferred-marker
+    /// arms (`--wake-cadence`).
+    pub wake: usize,
+}
+
+impl RingArm {
+    /// The crown: the poll, one forward of lookahead, a commit every eight
+    /// steps, the adaptive commit (#702).
+    pub const CROWN: RingArm = RingArm {
+        lookahead: 1,
+        commit_steps: 8,
+        adaptive: true,
+        eos: EosRead::Poll(PollMechanism::DEFAULT),
+        wake: lloom::generation::WAKE_LIVE_EVERY_DEFAULT,
+    };
+
+    /// The crown before the adaptive commit — the A/B control.
+    pub const FIXED: RingArm = RingArm {
+        adaptive: false,
+        ..Self::CROWN
+    };
+
+    /// The report-line rendering: the `--readback` spelling this arm is, its
+    /// lookahead and cadence, from the value that ran (§7.1a-i).
+    pub fn name(&self) -> String {
+        let spelling = match self.eos {
+            EosRead::Blocking => "ring",
+            EosRead::Poll(_) => "ring-nonblocking",
+            EosRead::HostOnDrain => "ring-hostdrain",
+            EosRead::GpuBatched => "ring-gpubatch",
+            EosRead::GpuBatchedNonblocking => "ring-gpubatch-nonblocking",
+        };
+        format!(
+            "{spelling} lookahead={} commit_steps={}{}",
+            self.lookahead,
+            self.commit_steps,
+            if self.adaptive { " adaptive" } else { "" }
+        )
+    }
+}
+
 /// Which readback strategy a run takes — where the per-token round trip sits
 /// (`design/docs/decode-driver-design.md`, seam A; `readback.rs`).
 ///
@@ -47,7 +110,7 @@ pub enum Stop {
 /// lookahead (§11.5g, §11.2b), which `lfm2-chat` selects by hand; this enum is
 /// how a consumer selects it through the seam instead of re-writing that
 /// selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ReadbackArm {
     /// The ring when the sampler can ride it (argmax or plain temperature),
     /// the blocking arm otherwise — the choice [`Ring::check_sampler`]
@@ -55,23 +118,10 @@ pub enum ReadbackArm {
     Auto,
     /// The host reads every token back; any sampler, no lookahead.
     Blocking,
-    /// The device-resident token ring with the EOS flag polled.
-    Ring {
-        /// Forward passes the host enqueues before it has learned the
-        /// previous step's EOS: `0` or `1`. `1` is the crown arm and leaves
-        /// the cache one position past an EOS, which [`Session::prepare`]
-        /// reconciles or resets on the next request.
-        lookahead: usize,
-        /// Steps between commits of the in-flight queue; `1` is per-token.
-        commit_steps: usize,
-        /// The adaptive commit (`lfm2-chat --adaptive-commit --stream-reader`):
-        /// a buffer is closed when the GPU starts the previous one rather than
-        /// every `commit_steps`, and the token drain is a reader thread's, off
-        /// the loop's path. Measured +0.5 tok/s on the B=1 crown (#148, record
-        /// §8.1). Needs a CPU-mapped ring and lookahead 1; falls back to the
-        /// fixed cadence where the ring has no reader.
-        adaptive: bool,
-    },
+    /// The device-resident token ring: the token stays on the device, EOS is
+    /// learned per [`RingArm::eos`], the loop paced per the arm's lookahead
+    /// and commit cadence.
+    Ring(RingArm),
     /// The speculative body ([`Session::decode_speculative`]): a DSpark
     /// drafter proposes `k` tokens a round and the target verifies them in
     /// one pass; the round's one readback is the verify's. Reported, never
@@ -93,19 +143,11 @@ pub enum ReadbackArm {
 impl ReadbackArm {
     /// The crown selection: ring, one forward of lookahead, commit every 8
     /// steps (`lfm2-chat`'s defaults, #520's flat queue bound).
-    pub const CROWN: ReadbackArm = ReadbackArm::Ring {
-        lookahead: 1,
-        commit_steps: 8,
-        adaptive: true,
-    };
+    pub const CROWN: ReadbackArm = ReadbackArm::Ring(RingArm::CROWN);
 
     /// The ring arm at the fixed cadence — the crown before the adaptive
     /// commit (`--readback ring-fixed`): the A/B control, not a default.
-    pub const RING_FIXED: ReadbackArm = ReadbackArm::Ring {
-        lookahead: 1,
-        commit_steps: 8,
-        adaptive: false,
-    };
+    pub const RING_FIXED: ReadbackArm = ReadbackArm::Ring(RingArm::FIXED);
 
     /// Whether the ring arm can serve `sampling` without a host round trip
     /// it would not report (`Ring::check_sampler`).
@@ -116,11 +158,13 @@ impl ReadbackArm {
         )
     }
 
-    /// The arm that runs for `sampling`: `Auto` resolves here, the explicit
-    /// arms pass through.
-    fn resolve(self, sampling: &Sampling) -> ReadbackArm {
+    /// The arm that runs for `sampling`: `Auto` resolves here — to
+    /// `auto_ring` (the engine's configured ring, `DecodeConfig`) where the
+    /// sampler admits a ring, the blocking arm otherwise; the explicit arms
+    /// pass through.
+    pub fn resolve(self, sampling: &Sampling, auto_ring: RingArm) -> ReadbackArm {
         match self {
-            ReadbackArm::Auto if Self::ring_admits(sampling) => ReadbackArm::CROWN,
+            ReadbackArm::Auto if Self::ring_admits(sampling) => ReadbackArm::Ring(auto_ring),
             ReadbackArm::Auto => ReadbackArm::Blocking,
             other => other,
         }
@@ -133,14 +177,7 @@ impl ReadbackArm {
         match self {
             ReadbackArm::Auto => "auto".to_string(),
             ReadbackArm::Blocking => "blocking".to_string(),
-            ReadbackArm::Ring {
-                lookahead,
-                commit_steps,
-                adaptive,
-            } => format!(
-                "ring-nonblocking lookahead={lookahead} commit_steps={commit_steps}{}",
-                if adaptive { " adaptive" } else { "" }
-            ),
+            ReadbackArm::Ring(r) => r.name(),
             ReadbackArm::Speculative { k } => format!("dspark k={k}"),
             ReadbackArm::Batched { rows } => format!("batched rows={rows}"),
         }
@@ -306,6 +343,10 @@ pub struct DecodeSession<'m, M: CausalLM> {
     session: Session<'m, M>,
     device: Device,
     rings: RingPool,
+    /// The loop's options (`--readback`, the cadence, the pacer, the
+    /// prefill): the engine's, set once at load, resolved per request into
+    /// `DecodeOptions`.
+    config: crate::options::DecodeConfig,
 }
 
 impl<'m, M: CausalLM> DecodeSession<'m, M> {
@@ -318,6 +359,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             session: Session::with_pos(model, cache, pos),
             device,
             rings: RingPool::new(),
+            config: Default::default(),
         }
     }
 
@@ -338,7 +380,22 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             session: Session::from_sequence(model, seq),
             device,
             rings,
+            config: Default::default(),
         }
+    }
+
+    /// The loop's options for every run of this session (`DecodeConfig`).
+    pub fn with_config(mut self, config: crate::options::DecodeConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn set_config(&mut self, config: crate::options::DecodeConfig) {
+        self.config = config;
+    }
+
+    pub fn config(&self) -> &crate::options::DecodeConfig {
+        &self.config
     }
 
     /// The sequence and the rings, to hand to the next session.
@@ -422,10 +479,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             lloom_tensor::bail!("DecodeSession::prefill: eos_ids is empty; a run needs an EOS set");
         }
         let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
-        let opts = DecodeOptions {
-            prefill_tile: params.prefill_tile,
-            ..DecodeOptions::new(params.max_tokens.max(1))
-        };
+        let opts = self
+            .config
+            .options(params.max_tokens.max(1), ReadbackArm::Blocking, params.prefill_tile);
         self.session.prefill(&mut readback, prompt_ids, &opts)
     }
 
@@ -485,7 +541,12 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let prepared = self.session.prepare(prompt_ids)?;
 
         let mut sampler = LogitsProcessor::new(params.seed, params.temperature, params.top_p);
-        let arm = params.readback.resolve(sampler.sampling());
+        let arm = params
+            .readback
+            .resolve(sampler.sampling(), self.config.readback.ring_arm());
+        if let Err(e) = self.config.check() {
+            lloom_tensor::bail!("DecodeSession::decode: {e}");
+        }
         let mut spec = IdentityProposer;
 
         let mut stream = crate::stream::TextStream::new(params.max_tokens);
@@ -512,10 +573,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let out: DecodeOut = match arm {
             ReadbackArm::Blocking => {
                 let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
-                let opts = DecodeOptions {
-                    prefill_tile: params.prefill_tile,
-                    ..DecodeOptions::new(params.max_tokens)
-                };
+                let opts = self
+                    .config
+                    .options(params.max_tokens, ReadbackArm::Blocking, params.prefill_tile);
                 self.session.decode_until(
                     &mut spec,
                     &mut readback,
@@ -525,51 +585,37 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     &mut on_tokens,
                 )?
             }
-            ReadbackArm::Ring {
-                lookahead,
-                commit_steps,
-                adaptive,
-            } => {
-                // The pool's ring for this EOS set: built once per process (or
-                // at load, `RingPool::prepare`) and reused by every run.
-                let readback = self
-                    .rings
-                    .ring(&params.eos_ids, &self.device, ring_eos_read())?;
+            ReadbackArm::Ring(ring) => {
+                let RingArm {
+                    lookahead,
+                    adaptive,
+                    eos,
+                    wake,
+                    ..
+                } = ring;
+                // The pool's ring for this EOS set and EOS read: built once
+                // per process (or at load, `RingPool::prepare`) and reused by
+                // every run.
+                let readback = self.rings.ring(&params.eos_ids, &self.device, eos)?;
+                readback.set_wake_cadence(wake);
                 // The adaptive arm needs the ring's reader (a CPU-mapped ring)
                 // and lookahead 1 (`Session::decode`'s own check); without a
-                // reader it is the fixed cadence, reported as such.
-                let reader = if adaptive && lookahead == 1 {
+                // reader it is the fixed cadence, reported as such. The
+                // reader alone (`--stream-reader`) streams per token on the
+                // fixed cadence.
+                let adaptive = adaptive && lookahead == 1;
+                let reader = if adaptive || self.config.readback.stream_reader {
                     readback.reader()
                 } else {
                     None
                 };
                 let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let opts = DecodeOptions {
-                    max_tokens: params.max_tokens,
-                    budget: if commit_steps <= 1 {
-                        CommitBudget::per_token()
-                    } else {
-                        CommitBudget::steps(commit_steps)?
-                    },
-                    lookahead,
-                    sample_split: false,
-                    // 0 = the pacer's floor (no warmup ran here) and the one-shot
-                    // prefill: the incumbent behaviour on both dials.
-                    in_flight_depth: 0,
-                    prefill_ubatch: 0,
-                    prefill_schedule: None,
-                    prefill_bulk: 0,
-                    prefill_pacer_depth: 0,
-                    pass_widths: lloom::nn::PassWidths::Lru,
-                    stream_via_reader: reader.is_some(),
-                    adaptive_commit: reader.is_some(),
-                    run_ahead: 0,
-                    stop: reader.is_some().then(|| std::sync::Arc::clone(&stop_flag)),
-                    eos_gate: false,
-                    fused_publish: true,
-                    prefill_tile: params.prefill_tile,
-                    prefill_chunk: 0,
-                };
+                let mut opts = self
+                    .config
+                    .options(params.max_tokens, arm, params.prefill_tile);
+                opts.stream_via_reader = reader.is_some();
+                opts.adaptive_commit = reader.is_some() && adaptive;
+                opts.stop = reader.is_some().then(|| std::sync::Arc::clone(&stop_flag));
                 match reader {
                     None => self.session.decode_until(
                         &mut spec,
@@ -825,19 +871,21 @@ mod tests {
             p: 0.9,
             temperature: 0.6,
         };
-        assert_eq!(ReadbackArm::Auto.resolve(&argmax), ReadbackArm::CROWN);
-        assert_eq!(ReadbackArm::Auto.resolve(&temp), ReadbackArm::CROWN);
-        assert_eq!(ReadbackArm::Auto.resolve(&top_p), ReadbackArm::Blocking);
+        let crown = RingArm::CROWN;
+        assert_eq!(ReadbackArm::Auto.resolve(&argmax, crown), ReadbackArm::CROWN);
+        assert_eq!(ReadbackArm::Auto.resolve(&temp, crown), ReadbackArm::CROWN);
+        assert_eq!(ReadbackArm::Auto.resolve(&top_p, crown), ReadbackArm::Blocking);
         assert_eq!(
-            ReadbackArm::Blocking.resolve(&argmax),
+            ReadbackArm::Blocking.resolve(&argmax, crown),
             ReadbackArm::Blocking
         );
-        let ring = ReadbackArm::Ring {
+        let ring = ReadbackArm::Ring(RingArm {
             lookahead: 0,
             commit_steps: 1,
             adaptive: false,
-        };
-        assert_eq!(ring.resolve(&top_p), ring);
+            ..RingArm::CROWN
+        });
+        assert_eq!(ring.resolve(&top_p, crown), ring);
         assert_ne!(ReadbackArm::CROWN.name(), ReadbackArm::Blocking.name());
         assert!(ReadbackArm::CROWN.name().contains("lookahead=1"));
     }

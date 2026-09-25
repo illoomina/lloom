@@ -25,9 +25,13 @@ thiserror = { workspace = true }
 # tokenizer, an HTTP stack and a template engine. A consumer that links the
 # library pays for none of these.
 anyhow = { workspace = true, optional = true }
-clap = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+# The option groups (`options.rs`, `#[derive(Options)]`): the flags, the
+# dotted keys and the JSON of every mechanism the engine drives are generated
+# from one struct per group, so the library carries the derive's deps.
+lloom-macros = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokenizers = { workspace = true, features = ["onig"], optional = true }
 tiny_http = { version = "0.12", optional = true }
 hf-chat-template = { version = "1.0", optional = true }
@@ -71,9 +75,6 @@ mkl = ["lloom/mkl"]
 # pair with `metal` on Apple silicon.
 serve = [
     "dep:anyhow",
-    "dep:clap",
-    "dep:serde",
-    "dep:serde_json",
     "dep:tokenizers",
     "dep:tiny_http",
     "dep:hf-chat-template",

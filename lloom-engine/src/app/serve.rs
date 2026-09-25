@@ -68,14 +68,11 @@ pub struct ServeArgs {
     #[arg(long, default_value_t = 0)]
     port: u16,
 
-    /// Readback arm: `auto` (the device-resident ring with one forward of
-    /// lookahead where the sampler admits it, the blocking arm otherwise;
-    /// on Qwen4-exp the blocking arm — its forward needs the input ids on
-    /// the host), `ring`, `ring-fixed`, `ring-la0` (the ring without the
-    /// lookahead: no forward past an EOS, so a reused prefix extends) or
-    /// `blocking`.
-    #[arg(long, default_value = "auto")]
-    readback: String,
+    /// The option layers: `--config`, `--decode-config`, `--set`, and the
+    /// generated flags (`--readback`, `--lookahead`, `--commit-budget`,
+    /// `--prefill-tile`, `--prefill-chunk`, …).
+    #[command(flatten)]
+    pub common: super::CommonArgs,
 
     /// Reuse the cached prefix across requests (`Session::prepare`). Off by
     /// default: a benchmark measures a cold prefill per request.
@@ -98,12 +95,6 @@ pub struct ServeArgs {
     /// sequences and lets the benchmark cells take `batch` up to `N`.
     #[arg(long, default_value_t = 1)]
     batch: usize,
-
-    /// The CHUNK: the most prompt tokens fed per batched step for the rows
-    /// still prefilling, as extra ragged rows of the live rows' forward
-    /// (`0` = a whole prompt at its arrival). Default 512 at `N > 1`.
-    #[arg(long)]
-    prefill_chunk: Option<usize>,
 
     /// Sample the memory gauges at 10 ms around every benchmark cell and
     /// report the peaks (`mem` on the response). A gauge run — it perturbs
@@ -140,26 +131,8 @@ struct Shared {
     max_tokens_default: usize,
 }
 
-/// `--readback`'s spellings, shared with `lloom chat`.
-pub fn parse_readback(s: &str) -> Result<ReadbackArm> {
-    Ok(match s {
-        "auto" => ReadbackArm::Auto,
-        "ring" | "ring-nonblocking" => ReadbackArm::CROWN,
-        "ring-fixed" => ReadbackArm::RING_FIXED,
-        "ring-la0" => ReadbackArm::Ring {
-            lookahead: 0,
-            commit_steps: 8,
-            adaptive: false,
-        },
-        "blocking" => ReadbackArm::Blocking,
-        other => anyhow::bail!(
-            "--readback must be auto, ring, ring-fixed, ring-la0 or blocking, got {other:?}"
-        ),
-    })
-}
-
 pub fn run(args: ServeArgs) -> Result<()> {
-    let readback = parse_readback(&args.readback)?;
+    let mut options = super::resolve_options(&args.common)?;
     let seed_text = match &args.prompt_seed_file {
         Some(p) => std::fs::read_to_string(p)
             .with_context(|| format!("reading the prompt seed {}", p.display()))?,
@@ -169,15 +142,19 @@ pub fn run(args: ServeArgs) -> Result<()> {
     };
 
     let batched = args.batch > 1;
+    // The CHUNK defaults to 512 at `N > 1` (the interleaved prefill), whole
+    // prompts at `N = 1`.
+    if batched && options.decode.prefill.chunk == 0 {
+        options.decode.prefill.chunk = 512;
+    }
     let load_start = Instant::now();
     let (engine, model_path) = super::load_engine(
         &args.model,
         super::Shape {
-            readback,
+            decode: options.decode.clone(),
             reuse_prefix: args.reuse_prefix,
             seed_text,
             batch: args.batch,
-            prefill_chunk: args.prefill_chunk.unwrap_or(if batched { 512 } else { 0 }),
             mem_sample: args.mem_sample,
             rows: args.rows.clone(),
             share_prefix: args.share_prefix,

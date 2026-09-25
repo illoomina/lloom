@@ -59,6 +59,8 @@ struct Single {
     seq: Option<Sequence<Cache>>,
     rings: Option<RingPool>,
     spec: Option<DSparkSpeculator>,
+    /// The loop's options, handed to every request's session.
+    decode: crate::DecodeConfig,
 }
 
 /// The batch thread's ONE drafter (`--dspark --batch N`). On the pool arms
@@ -141,6 +143,9 @@ pub struct LoadOptions {
     pub cpu: bool,
     pub kv_capacity: usize,
     pub readback: ReadbackArm,
+    /// The decode loop's options (`DecodeConfig`): what `readback` and the
+    /// prefill fields were resolved from, and the session's cadence.
+    pub decode: crate::DecodeConfig,
     pub reuse_prefix: bool,
     pub warmup: bool,
     pub seed_text: String,
@@ -234,7 +239,8 @@ impl Single {
             .take()
             .context("the sequence is checked out — a previous request panicked mid-decode")?;
         let rings = self.rings.take().unwrap_or_default();
-        let mut session = DecodeSession::from_parts(&core.model, seq, core.device.clone(), rings);
+        let mut session = DecodeSession::from_parts(&core.model, seq, core.device.clone(), rings)
+            .with_config(self.decode.clone());
         let out = f(&mut session, &mut self.spec);
         let (seq, rings) = session.into_parts();
         self.seq = Some(seq);
@@ -453,6 +459,7 @@ impl Engine {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
                 spec: None,
+                decode: opts.decode.clone(),
             }),
             sched: None,
             sched_thread: Mutex::new(None),

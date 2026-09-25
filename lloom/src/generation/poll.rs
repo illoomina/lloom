@@ -123,6 +123,15 @@ pub enum PollMechanism {
     Sleep(std::time::Duration),
 }
 
+impl PollMechanism {
+    /// [`Default::default`] as a constant: `Wfe` on aarch64, `SpinHint`
+    /// elsewhere (the reasoning is on the `Default` impl).
+    #[cfg(target_arch = "aarch64")]
+    pub const DEFAULT: PollMechanism = PollMechanism::Wfe;
+    #[cfg(not(target_arch = "aarch64"))]
+    pub const DEFAULT: PollMechanism = PollMechanism::SpinHint;
+}
+
 impl Default for PollMechanism {
     /// [`PollMechanism::Wfe`] on aarch64, [`PollMechanism::SpinHint`] elsewhere.
     ///
@@ -271,6 +280,19 @@ impl PollMechanism {
         }
     }
 }
+
+impl std::fmt::Display for PollMechanism {
+    /// The spelling [`FromStr`](std::str::FromStr) reads back (`sleep:<µs>`
+    /// keeps its duration, where [`Self::name`] renders the arm alone).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sleep(d) => write!(f, "sleep:{}", d.as_micros()),
+            other => f.write_str(other.name()),
+        }
+    }
+}
+
+lloom_tensor::serde_via_str!(PollMechanism);
 
 impl std::str::FromStr for PollMechanism {
     type Err = String;

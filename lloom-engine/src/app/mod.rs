@@ -49,15 +49,6 @@ pub struct ModelArgs {
     #[arg(long)]
     pub cpu: bool,
 
-    /// The TILE: the most prompt tokens one prefill forward takes (lloom
-    /// #728). Default 512 — the bound on a prefill's activation working set,
-    /// which otherwise grows with the prompt (~3.5 MB per token on the crown:
-    /// a 32k-token one-shot prefill is what panicked this machine, #148).
-    /// `0` is one forward over the whole prompt, admitted only if the memory
-    /// budget allows the KV ceiling's worth of activations.
-    #[arg(long)]
-    pub prefill_tile: Option<usize>,
-
     /// The fraction of Metal's `recommendedMaxWorkingSetSize` this process
     /// may claim: LFM2's `MemoryBudget` admission (§9.5d — the KV ceiling's
     /// cache, the tile's activations and the weights predicted at load and
@@ -145,11 +136,11 @@ pub struct ModelArgs {
 /// The serving shape the family builds for: `serve`'s width and cells, or
 /// `chat`'s one sequence with prefix reuse.
 pub struct Shape {
-    pub readback: crate::ReadbackArm,
+    /// The decode loop's options (`--readback`, the cadence, the prefill).
+    pub decode: crate::DecodeConfig,
     pub reuse_prefix: bool,
     pub seed_text: String,
     pub batch: usize,
-    pub prefill_chunk: usize,
     pub mem_sample: bool,
     pub rows: String,
     pub share_prefix: bool,
@@ -217,7 +208,9 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
 /// was loaded from.
 pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
     let family = detect_family(model.model.as_deref())?;
-    let prefill_tile = model.prefill_tile.unwrap_or(512);
+    let prefill_tile = shape.decode.prefill.tile;
+    let prefill_chunk = shape.decode.prefill.chunk;
+    let readback = shape.decode.readback.arm();
     match family {
         Family::Lfm2(dir) => {
             let batched = shape.batch > 1;
@@ -229,7 +222,8 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 model_dir: dir.clone(),
                 cpu: model.cpu,
                 kv_capacity: model.kv_capacity,
-                readback: shape.readback,
+                readback,
+                decode: shape.decode.clone(),
                 reuse_prefix: shape.reuse_prefix,
                 warmup: !model.no_warmup,
                 seed_text: shape.seed_text,
@@ -239,7 +233,7 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                     .dspark
                     .then(|| model.draft_dir.clone().unwrap_or_default()),
                 prefill_tile,
-                prefill_chunk: shape.prefill_chunk,
+                prefill_chunk,
                 memory_fraction: model.memory_fraction,
                 mem_sample: shape.mem_sample,
                 rows,
@@ -264,7 +258,8 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 tokenizer: model.tokenizer.clone(),
                 cpu: model.cpu,
                 kv_capacity: model.kv_capacity,
-                readback: shape.readback,
+                readback,
+                decode: shape.decode.clone(),
                 reuse_prefix: shape.reuse_prefix,
                 warmup: !model.no_warmup,
                 seed_text: shape.seed_text,
@@ -288,6 +283,96 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
     }
 }
 
+/// The option layers every subcommand takes (`lloom_engine::options`):
+/// a config file, the JSON groups, the dotted overrides, and the shorthand
+/// flags generated from the groups — applied in that order onto the
+/// defaults and the env aliases.
+#[derive(Args, Clone, Debug, Default)]
+pub struct CommonArgs {
+    /// A JSON file of option groups (`{"decode": {...}}`) — what `lloom config`
+    /// prints, read back. Applied over the defaults and the env aliases.
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// The decode group as JSON (`'{"readback": "ring-hostdrain", "in_flight": 2}'`).
+    #[arg(long, value_name = "JSON")]
+    pub decode_config: Option<String>,
+
+    /// One knob by dotted key, repeatable (`--set decode.readback.eos=gpu-batched`).
+    #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+    pub set: Vec<String>,
+
+    #[command(flatten)]
+    pub options: crate::options::EngineOptionsArgs,
+}
+
+/// Resolve the option tree from `common`: defaults < env aliases <
+/// `--config` < `--<group>-config` < `--set` < flags; every group's refusals
+/// checked once at the end.
+pub fn resolve_options(common: &CommonArgs) -> Result<crate::EngineOptions> {
+    let mut o = crate::EngineOptions::default();
+    o.from_env().map_err(|e| anyhow::anyhow!("env: {e}"))?;
+    if let Some(path) = &common.config {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --config {}", path.display()))?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("--config {}: not JSON", path.display()))?;
+        o.merge_json(&v)
+            .map_err(|e| anyhow::anyhow!("--config {}: {e}", path.display()))?;
+    }
+    if let Some(json) = &common.decode_config {
+        let v: serde_json::Value =
+            serde_json::from_str(json).context("--decode-config: not JSON")?;
+        o.decode
+            .merge_json(&v)
+            .map_err(|e| anyhow::anyhow!("--decode-config: {e}"))?;
+    }
+    for kv in &common.set {
+        let (k, v) = lloom_tensor::options::split_assignment(kv).map_err(|e| anyhow::anyhow!("--set {e}"))?;
+        o.set(k, v).map_err(|e| anyhow::anyhow!("--set {kv}: {e}"))?;
+    }
+    common
+        .options
+        .apply(&mut o)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    o.check().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(o)
+}
+
+/// `lloom config`: the resolved option tree as JSON — every knob with the
+/// value this invocation would run, in the shape `--config` reads back.
+#[derive(Parser)]
+#[command(name = "lloom config", about = "Print the resolved option tree as JSON")]
+pub struct ConfigArgs {
+    #[command(flatten)]
+    pub common: CommonArgs,
+}
+
+/// `lloom knobs`: every knob of every group — key, flag, env alias, type,
+/// arms, the default, the doc — one line each.
+pub fn print_knobs() -> Result<()> {
+    let defaults = crate::EngineOptions::default();
+    let value = serde_json::to_value(&defaults)?;
+    let rows = lloom_tensor::options::rows("", crate::EngineOptions::META, &value);
+    for r in rows {
+        let env = r.env.map(|e| format!(" env={e}")).unwrap_or_default();
+        let arms = if r.variants.is_empty() {
+            String::new()
+        } else {
+            format!(" arms=[{}]", r.variants.join(", "))
+        };
+        println!(
+            "{key}  {flag} ({ty}) default={value}{env}{arms}\n    {doc}",
+            key = r.key,
+            flag = r.flag,
+            ty = r.ty,
+            value = r.value,
+            doc = r.doc,
+        );
+    }
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(
     name = "lloom",
@@ -305,6 +390,10 @@ pub enum Command {
     Serve(serve::ServeArgs),
     /// A streaming chat REPL on stdin/stdout.
     Chat(chat::ChatArgs),
+    /// Print the resolved option tree (the layers applied) as JSON.
+    Config(ConfigArgs),
+    /// List every knob: key, flag, env alias, default, arms, doc.
+    Knobs,
 }
 
 /// The `lloom` binary's entry.
@@ -313,6 +402,12 @@ pub fn main(argv: Vec<String>) -> Result<()> {
     match cli.command {
         Command::Serve(args) => serve::run(args),
         Command::Chat(args) => chat::run(args),
+        Command::Config(args) => {
+            let o = resolve_options(&args.common)?;
+            println!("{}", serde_json::to_string_pretty(&o)?);
+            Ok(())
+        }
+        Command::Knobs => print_knobs(),
     }
 }
 
@@ -322,4 +417,93 @@ pub fn main(argv: Vec<String>) -> Result<()> {
 pub fn main_serve_compat(mut argv: Vec<String>) -> Result<()> {
     argv.insert(1.min(argv.len()), "serve".to_string());
     main(argv)
+}
+
+#[cfg(test)]
+mod option_layer_tests {
+    use super::*;
+    use crate::{EosKind, ReadbackKind};
+
+    fn common(argv: &[&str]) -> CommonArgs {
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            common: CommonArgs,
+        }
+        let mut full = vec!["t"];
+        full.extend_from_slice(argv);
+        T::parse_from(full).common
+    }
+
+    #[test]
+    fn the_layers_apply_in_order() {
+        let dir = std::env::temp_dir().join(format!("lloom-options-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("c.json");
+        std::fs::write(
+            &file,
+            r#"{"decode": {"readback": {"eos": "host-drain", "lookahead": 0}, "in_flight": 4}}"#,
+        )
+        .unwrap();
+        let path = file.to_str().unwrap();
+        // file < --decode-config < --set < flags
+        let o = resolve_options(&common(&[
+            "--config",
+            path,
+            "--decode-config",
+            r#"{"in_flight": 5, "readback": {"wake_cadence": 2}}"#,
+            "--set",
+            "decode.in_flight=6",
+            "--set",
+            "decode.readback.kind=ring",
+            "--in-flight",
+            "7",
+        ]))
+        .unwrap();
+        assert_eq!(o.decode.readback.eos, EosKind::HostDrain, "from the file");
+        assert_eq!(o.decode.readback.lookahead, 0, "from the file");
+        assert_eq!(o.decode.readback.wake_cadence, 2, "from --decode-config");
+        assert_eq!(o.decode.readback.kind, ReadbackKind::Ring, "from --set");
+        assert_eq!(o.decode.in_flight, 7, "the flag wins over --set over the json over the file");
+        // The dump is a valid --config that reproduces the tree.
+        let dumped = dir.join("dump.json");
+        std::fs::write(&dumped, serde_json::to_string_pretty(&o).unwrap()).unwrap();
+        let back = resolve_options(&common(&["--config", dumped.to_str().unwrap()])).unwrap();
+        assert_eq!(back, o);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_refused_combination_names_itself() {
+        // The blocking arm ignores the cadence knobs rather than refusing them.
+        let o = resolve_options(&common(&["--readback", "blocking", "--adaptive-commit"])).unwrap();
+        assert_eq!(o.decode.readback.arm(), crate::ReadbackArm::Blocking);
+        let err = resolve_options(&common(&["--eos-gate", "--adaptive-commit=false"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("eos_gate needs adaptive_commit"), "{err}");
+        let err = resolve_options(&common(&["--set", "decode.nope=1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown key `nope`"), "{err}");
+        let err = resolve_options(&common(&["--set", "decode.readback"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected key=value"), "{err}");
+    }
+
+    #[test]
+    fn the_shorthands_are_lfm2_chats() {
+        let o = resolve_options(&common(&["--readback", "ring-gpubatch-nonblocking"])).unwrap();
+        assert_eq!(o.decode.readback.kind, ReadbackKind::Ring);
+        assert_eq!(o.decode.readback.eos, EosKind::GpuBatchedNonblocking);
+        let o = resolve_options(&common(&["--readback", "ring-la0"])).unwrap();
+        assert_eq!(o.decode.readback.lookahead, 0);
+        assert!(!o.decode.readback.adaptive_commit);
+        // The compound and its keys compose in either order: the spelling
+        // sets kind + eos, the key flags override field by field.
+        let o = resolve_options(&common(&["--readback", "ring-hostdrain", "--lookahead", "0"])).unwrap();
+        assert_eq!(o.decode.readback.eos, EosKind::HostDrain);
+        assert_eq!(o.decode.readback.lookahead, 0);
+    }
 }

@@ -110,3 +110,22 @@ pub fn split_assignment(s: &str) -> Result<(&str, &str), String> {
         .map(|(k, v)| (k.trim(), v.trim()))
         .ok_or_else(|| format!("`{s}`: expected key=value"))
 }
+
+/// `Serialize`/`Deserialize` for a knob type through its `Display` and
+/// `FromStr` — the flag spelling is the JSON spelling, one parser for both.
+#[macro_export]
+macro_rules! serde_via_str {
+    ($ty:ty) => {
+        impl ::serde::Serialize for $ty {
+            fn serialize<S: ::serde::Serializer>(&self, s: S) -> ::std::result::Result<S::Ok, S::Error> {
+                s.serialize_str(&self.to_string())
+            }
+        }
+        impl<'de> ::serde::Deserialize<'de> for $ty {
+            fn deserialize<D: ::serde::Deserializer<'de>>(d: D) -> ::std::result::Result<Self, D::Error> {
+                let s = <::std::string::String as ::serde::Deserialize>::deserialize(d)?;
+                <$ty as ::std::str::FromStr>::from_str(&s).map_err(::serde::de::Error::custom)
+            }
+        }
+    };
+}

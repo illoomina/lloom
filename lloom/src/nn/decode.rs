@@ -283,6 +283,21 @@ pub enum PassWidths {
     Ladder,
 }
 
+impl std::str::FromStr for PassWidths {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, String> {
+        Self::parse(s)
+    }
+}
+
+impl std::fmt::Display for PassWidths {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+lloom_tensor::serde_via_str!(PassWidths);
+
 impl PassWidths {
     pub fn parse(s: &str) -> std::result::Result<Self, String> {
         match s {

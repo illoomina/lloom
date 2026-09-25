@@ -14,7 +14,7 @@
 //! spellings are `lfm2-chat`'s, so a measurement written against it runs
 //! unchanged through `lloom chat`.
 
-use crate::decode::{ReadbackArm, RingArm};
+use crate::decode::{DecodeParams, ReadbackArm, RingArm};
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::{CommitBudget, EosRead, WAKE_LIVE_EVERY_DEFAULT};
 use lloom::nn::{DecodeOptions, PassWidths};
@@ -731,6 +731,163 @@ impl ModelConfigArgs {
     }
 }
 
+// ---- sampling -------------------------------------------------------------------
+
+fn parse_stop(v: &str) -> Result<Vec<String>, String> {
+    Ok(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+}
+fn parse_defaults(v: &str) -> Result<String, String> {
+    match v.trim() {
+        "greedy" => Ok("greedy".into()),
+        "checkpoint" => Ok("checkpoint".into()),
+        other => Err(format!("`{other}` is not `greedy` or `checkpoint`")),
+    }
+}
+
+/// The sampling defaults a run (a chat turn, a request that names none) is
+/// decoded with — transformers' `GenerationConfig` subset the sampler
+/// implements (`Sampling`: argmax, temperature, top-p, top-k, top-k-then-p,
+/// gumbel-max). `none` on a field means the default source's value: greedy
+/// (`defaults = greedy`), or the checkpoint's `generation_config.json`
+/// (`defaults = checkpoint`, vLLM's `--generation-config`). A request's own
+/// fields override per request.
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct SamplingConfig {
+    /// Where an unset field's value comes from: `greedy` (argmax; every recorded digest) or `checkpoint` (its `generation_config.json`).
+    #[opt(flag = "sampling-defaults", parser = "parse_defaults", variants = ["greedy", "checkpoint"])]
+    pub defaults: String,
+    /// The temperature; 0 (or none under `greedy`) is argmax.
+    #[opt(flag = "temperature", short = 't')]
+    pub temperature: Option<f64>,
+    /// Nucleus sampling's p (top-p); needs a temperature.
+    #[opt(flag = "top-p")]
+    pub top_p: Option<f64>,
+    /// Top-k sampling's k; with top-p, top-k then top-p. Host-side: the ring arm is refused, the blocking arm runs.
+    #[opt(flag = "top-k")]
+    pub top_k: Option<usize>,
+    /// Device gumbel-max sampling at the temperature (rides the ring).
+    #[opt(bool)]
+    pub gumbel: bool,
+    /// The seed; none draws a fresh one per run (repeats explore), a value reproduces.
+    #[opt(flag = "seed")]
+    pub seed: Option<u64>,
+    /// New tokens per run at most (a request's own `max_tokens` overrides).
+    #[opt(flag = "max-tokens", short = 'n', alias = "max-tokens-default")]
+    pub max_tokens: usize,
+    /// Never stop on EOS: exactly `max_tokens` tokens (the EOS mechanism runs and never fires).
+    #[opt(flag = "ignore-eos", bool)]
+    pub ignore_eos: bool,
+    /// Stop strings, comma-separated (a request's own `stop` overrides).
+    #[opt(flag = "stop", parser = "parse_stop")]
+    pub stop: Vec<String>,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        SamplingConfig {
+            defaults: "greedy".into(),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            gumbel: false,
+            seed: None,
+            max_tokens: 512,
+            ignore_eos: false,
+            stop: Vec::new(),
+        }
+    }
+}
+
+impl SamplingConfig {
+    /// Fill the unset fields from a checkpoint's `generation_config.json`
+    /// when `defaults = checkpoint`; a no-op under `greedy`.
+    pub fn apply_checkpoint(&mut self, gc: Option<&lloom::hub::GenerationConfig>) {
+        if self.defaults != "checkpoint" {
+            return;
+        }
+        let Some(gc) = gc else { return };
+        if self.temperature.is_none() {
+            self.temperature = gc.temperature;
+        }
+        if self.top_p.is_none() {
+            self.top_p = gc.top_p;
+        }
+        if self.top_k.is_none() {
+            self.top_k = gc.top_k;
+        }
+    }
+
+    /// The seed for one run.
+    pub fn seed_or_random(&self) -> u64 {
+        self.seed.unwrap_or_else(rand::random::<u64>)
+    }
+
+    /// The sampler arm these fields name (`LogitsProcessor`'s vocabulary).
+    pub fn sampling(&self) -> lloom::generation::Sampling {
+        DecodeParams::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
+    }
+
+    /// The per-run parameters for `eos_ids` on `readback`, the prefill tile.
+    pub fn params(&self, eos_ids: &[u32], readback: ReadbackArm, prefill_tile: usize) -> DecodeParams {
+        DecodeParams {
+            seed: self.seed_or_random(),
+            temperature: self.temperature,
+            top_p: self.top_p,
+            top_k: self.top_k,
+            gumbel: self.gumbel,
+            max_tokens: self.max_tokens,
+            eos_ids: if self.ignore_eos { vec![u32::MAX] } else { eos_ids.to_vec() },
+            stop_strings: self.stop.clone(),
+            readback,
+            prefill_tile,
+        }
+    }
+}
+
+// ---- speculation ----------------------------------------------------------------
+
+fn parse_method(v: &str) -> Result<String, String> {
+    match v.trim() {
+        "none" | "off" => Ok("none".into()),
+        "dspark" => Ok("dspark".into()),
+        "mtp" => Ok("mtp".into()),
+        other => Err(format!("`{other}` is not a speculation method (none, dspark, mtp)")),
+    }
+}
+
+/// The speculative body: which drafter, how many tokens a round, where its
+/// weights are — vLLM's `--speculative-config` shape. `dspark` is LFM2's
+/// (a DSpark checkpoint drafts a block, the target verifies it in one pass;
+/// `k` clamps the proposal, the drafter's block is 9); `mtp` is Qwen4-exp's
+/// (the checkpoint's MTP head re-applied `k` times; `drafter` is the sidecar
+/// GGUF `qwen4exp-mtp-quantize write` produces). Both byte-identical to
+/// greedy. The drafter's context KV is `tuning.dspark.ctx_kv`; the phase
+/// drain is `decode.phase_sync`.
+#[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
+pub struct SpeculativeConfig {
+    /// `none`, `dspark` (LFM2) or `mtp` (Qwen4-exp).
+    #[opt(flag = "spec-method", parser = "parse_method", variants = ["none", "dspark", "mtp"])]
+    pub method: String,
+    /// Tokens the drafter proposes per round (none = the drafter's own: DSpark's block of 9, MTP 1).
+    #[opt(flag = "spec-k")]
+    pub k: Option<usize>,
+    /// The drafter's weights: a DSpark checkpoint directory (none = the newest LFM2.5-2.6B-DSpark snapshot in the HF cache) or the MTP sidecar GGUF (required).
+    #[opt(flag = "drafter")]
+    pub drafter: Option<std::path::PathBuf>,
+}
+
+impl Default for SpeculativeConfig {
+    fn default() -> Self {
+        SpeculativeConfig {
+            method: "none".into(),
+            k: None,
+            drafter: None,
+        }
+    }
+}
+
 /// Every option group the engine reads, as one tree: the dotted keys are
 /// `<group>.<key>` (`decode.readback.eos`, `tuning.qmv.q6k_nr0`), the JSON
 /// is one object per group, and `lloom config` prints the resolved tree back
@@ -747,6 +904,12 @@ pub struct EngineOptions {
     /// The model's axes: a cache preset and per-axis overrides.
     #[opt(nested)]
     pub model: ModelConfig,
+    /// The sampling defaults.
+    #[opt(nested)]
+    pub sampling: SamplingConfig,
+    /// The speculative body.
+    #[opt(nested)]
+    pub speculative: SpeculativeConfig,
 }
 
 impl EngineOptions {

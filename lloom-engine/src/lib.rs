@@ -37,7 +37,7 @@ pub use decode::{
 };
 pub use options::{
     DecodeConfig, EngineOptions, EosKind, ModelConfig, PrefillConfig, ReadbackConfig, ReadbackKind,
-    TuningOptions,
+    SamplingConfig, SpeculativeConfig, TuningOptions,
 };
 pub use seam::Completer;
 pub use slots::{Routed, SlotPool, DEFAULT_SIMILARITY};

@@ -118,6 +118,8 @@ pub struct Engine {
     pub axes_line: String,
     /// The model group as requested (the preset and the overrides).
     pub model: crate::ModelConfig,
+    /// The checkpoint's `generation_config.json`, when it carries one.
+    pub generation: Option<lloom::hub::GenerationConfig>,
     /// Reuse the cached prefix across requests (`Session::prepare`). Off by
     /// default: a benchmark cell measures a cold prefill, and a repeated prompt
     /// would otherwise resume from the previous request's state.
@@ -463,6 +465,7 @@ impl Engine {
             readback: opts.readback,
             axes_line,
             model: opts.model.clone(),
+            generation: lloom::hub::read_generation_config(&model_dir).unwrap_or_default(),
             reuse_prefix: opts.reuse_prefix,
             batch: opts.batch,
             dspark_k: dcfg.as_ref().map(|d| {
@@ -1802,6 +1805,9 @@ impl super::served::Served for Engine {
             self.model.cache,
             self.axes_line,
         )
+    }
+    fn generation_config(&self) -> Option<lloom::hub::GenerationConfig> {
+        self.generation.clone()
     }
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {
         Engine::encode(self, text, add_special)

@@ -58,23 +58,6 @@ pub struct ModelArgs {
     #[arg(long, default_value_t = 0.65)]
     pub memory_fraction: f64,
 
-    /// LFM2: serve the speculative body (DSpark: a drafter proposes a block
-    /// per round, the target verifies it in one pass). Loads the newest
-    /// LFM2.5-2.6B-DSpark snapshot in the HF cache, or `--draft-dir`.
-    #[arg(long)]
-    pub dspark: bool,
-
-    /// LFM2: the drafter checkpoint directory for `--dspark`.
-    #[arg(long)]
-    pub draft_dir: Option<PathBuf>,
-
-    /// LFM2, under `--dspark`: propose this many positions per round instead
-    /// of the drafter's block width (9), clamped to it. The verify window is
-    /// `K + 1` positions per row; at wide batches a shorter window costs
-    /// less per row for nearly the same accepted prefix (lloom #148).
-    #[arg(long)]
-    pub dspark_k: Option<usize>,
-
     /// Qwen4-exp: tokenizer.json (with chat_template.jinja beside it).
     /// Default: the HF cache's Qwen/Qwen3.8-Flash-Next snapshot.
     #[arg(long)]
@@ -112,18 +95,6 @@ pub struct ModelArgs {
     /// byte-identical routed arm) or `f16`.
     #[arg(long, default_value = "f32")]
     pub moe_act: String,
-
-    /// Qwen4-exp: the GGUF carrying the MTP head (`blk.{n_layers}.*` +
-    /// `nextn.*`, the sidecar `qwen4exp-mtp-quantize write` produces).
-    /// Requests then decode through the speculative body: the head drafts
-    /// one token per round, the target verifies — byte-identical to greedy.
-    #[arg(long)]
-    pub mtp: Option<PathBuf>,
-
-    /// Qwen4-exp `--mtp`: tokens the drafter proposes per round (the one MTP
-    /// layer re-applied `K` times; the verify runs `K + 1` positions).
-    #[arg(long, default_value_t = 1)]
-    pub mtp_k: usize,
 
     /// Qwen4-exp `--experts stream`: the expert hotlist file — read at load
     /// to warm every layer's pool before the first request (§20.3 R2; a
@@ -171,6 +142,8 @@ pub struct Shape {
     pub decode: crate::DecodeConfig,
     /// The model's axes: the cache preset and the per-axis overrides.
     pub model: crate::ModelConfig,
+    /// The speculative body.
+    pub speculative: crate::SpeculativeConfig,
     pub reuse_prefix: bool,
     pub seed_text: String,
     pub batch: usize,
@@ -248,8 +221,9 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
         Family::Lfm2(dir) => {
             let batched = shape.batch > 1;
             let rows = lfm2::RowsArm::parse(&shape.rows, batched)?;
-            if model.mtp.is_some() {
-                anyhow::bail!("--mtp is Qwen4-exp's; an LFM2 checkpoint has no MTP head");
+            let spec = &shape.speculative;
+            if spec.method == "mtp" {
+                anyhow::bail!("speculative.method = mtp (`--mtp`) is Qwen4-exp's; an LFM2 checkpoint has no MTP head — LFM2 speculates with `--dspark`");
             }
             let engine = lfm2::Engine::load(lfm2::LoadOptions {
                 model_dir: dir.clone(),
@@ -263,16 +237,14 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 seed_text: shape.seed_text,
                 model_name: model.model_name.clone(),
                 batch: shape.batch,
-                dspark: model
-                    .dspark
-                    .then(|| model.draft_dir.clone().unwrap_or_default()),
+                dspark: (spec.method == "dspark").then(|| spec.drafter.clone().unwrap_or_default()),
                 prefill_tile,
                 prefill_chunk,
                 memory_fraction: model.memory_fraction,
                 mem_sample: shape.mem_sample,
                 rows,
                 share_prefix: shape.share_prefix,
-                dspark_k: model.dspark_k,
+                dspark_k: spec.k,
             })?;
             Ok((Box::new(engine), dir))
         }
@@ -284,15 +256,21 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                     shape.model.axes.keys().cloned().collect::<Vec<_>>().join(", ")
                 );
             }
-            if shape.batch > 1 && model.mtp.is_some() {
+            let spec = &shape.speculative;
+            let mtp = match spec.method.as_str() {
+                "mtp" => match &spec.drafter {
+                    Some(path) => Some(path.clone()),
+                    None => anyhow::bail!("speculative.method = mtp needs the MTP sidecar GGUF (`--mtp <path>` / `speculative.drafter`)"),
+                },
+                "dspark" => anyhow::bail!("speculative.method = dspark (`--dspark`) is LFM2's drafter; Qwen4-exp speculates with `--mtp`"),
+                _ => None,
+            };
+            if shape.batch > 1 && mtp.is_some() {
                 anyhow::bail!(
                     "--batch {} with --mtp on Qwen4-exp: the batched loop is the K = 1 driver; \
                      the MTP head speculates at --batch 1",
                     shape.batch
                 );
-            }
-            if model.dspark {
-                anyhow::bail!("--dspark is LFM2's drafter; Qwen4-exp speculates with --mtp");
             }
             let engine = qwen4exp::Engine::load(qwen4exp::LoadOptions {
                 first_shard: first.clone(),
@@ -314,10 +292,10 @@ pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, 
                 ple_cache_rows: model.ple_cache_rows,
                 ple: !model.no_ple,
                 moe_act: model.moe_act.clone(),
-                mtp: model.mtp.clone(),
+                mtp,
                 hotlist: model.hotlist.clone(),
                 batch: shape.batch,
-                mtp_k: model.mtp_k,
+                mtp_k: spec.k.unwrap_or(1),
                 prefetch: model.prefetch,
                 io_hints: model.io_hints,
                 prefill_mode: model.prefill_mode.clone(),
@@ -352,6 +330,40 @@ pub struct CommonArgs {
     /// The model group as JSON (`'{"cache": "crown", "axes": {"attn": "flash", "kv-append": "paged"}}'`).
     #[arg(long, value_name = "JSON")]
     pub model_config: Option<String>,
+
+    /// The speculative group as JSON (`'{"method": "mtp", "k": 2, "drafter": "…gguf"}'`).
+    #[arg(long, value_name = "JSON")]
+    pub speculative_config: Option<String>,
+
+    /// The sampling group as JSON (`'{"temperature": 0.7, "top_p": 0.9, "max_tokens": 256}'`; vLLM's name).
+    #[arg(long, value_name = "JSON")]
+    pub generation_config: Option<String>,
+
+    /// LFM2: the speculative body (`speculative.method = dspark`): a DSpark
+    /// drafter proposes a block per round, the target verifies it in one
+    /// pass. Loads the newest LFM2.5-2.6B-DSpark snapshot in the HF cache,
+    /// or `--draft-dir`.
+    #[arg(long)]
+    pub dspark: bool,
+
+    /// LFM2, under `--dspark`: the drafter checkpoint directory (`speculative.drafter`).
+    #[arg(long, value_name = "DIR")]
+    pub draft_dir: Option<PathBuf>,
+
+    /// LFM2, under `--dspark`: propose this many positions per round instead
+    /// of the drafter's block width (9), clamped to it (`speculative.k`).
+    #[arg(long)]
+    pub dspark_k: Option<usize>,
+
+    /// Qwen4-exp: the GGUF carrying the MTP head (`blk.{n_layers}.*` +
+    /// `nextn.*`, the sidecar `qwen4exp-mtp-quantize write` produces);
+    /// `speculative.method = mtp`, `speculative.drafter`.
+    #[arg(long, value_name = "GGUF")]
+    pub mtp: Option<PathBuf>,
+
+    /// Qwen4-exp `--mtp`: tokens the drafter proposes per round (`speculative.k`).
+    #[arg(long)]
+    pub mtp_k: Option<usize>,
 
     /// One knob by dotted key, repeatable (`--set decode.readback.eos=gpu-batched`).
     #[arg(long, value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
@@ -406,6 +418,20 @@ pub fn resolve_options_uninstalled(common: &CommonArgs) -> Result<crate::EngineO
             .merge_json(&v)
             .map_err(|e| anyhow::anyhow!("--model-config: {e}"))?;
     }
+    if let Some(json) = &common.speculative_config {
+        let v: serde_json::Value =
+            serde_json::from_str(json).context("--speculative-config: not JSON")?;
+        o.speculative
+            .merge_json(&v)
+            .map_err(|e| anyhow::anyhow!("--speculative-config: {e}"))?;
+    }
+    if let Some(json) = &common.generation_config {
+        let v: serde_json::Value =
+            serde_json::from_str(json).context("--generation-config: not JSON")?;
+        o.sampling
+            .merge_json(&v)
+            .map_err(|e| anyhow::anyhow!("--generation-config: {e}"))?;
+    }
     for kv in &common.set {
         let (k, v) = lloom_tensor::options::split_assignment(kv).map_err(|e| anyhow::anyhow!("--set {e}"))?;
         o.set(k, v).map_err(|e| anyhow::anyhow!("--set {kv}: {e}"))?;
@@ -414,6 +440,27 @@ pub fn resolve_options_uninstalled(common: &CommonArgs) -> Result<crate::EngineO
         .options
         .apply(&mut o)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // The speculation shorthands (`lfm2-chat` / `qwen4exp-chat` spellings),
+    // over the group.
+    if common.dspark && common.mtp.is_some() {
+        anyhow::bail!("--dspark is LFM2's drafter and --mtp Qwen4-exp's; one speculative body per run");
+    }
+    if common.dspark {
+        o.speculative.method = "dspark".into();
+    }
+    if let Some(dir) = &common.draft_dir {
+        o.speculative.drafter = Some(dir.clone());
+    }
+    if let Some(k) = common.dspark_k {
+        o.speculative.k = Some(k);
+    }
+    if let Some(path) = &common.mtp {
+        o.speculative.method = "mtp".into();
+        o.speculative.drafter = Some(path.clone());
+    }
+    if let Some(k) = common.mtp_k {
+        o.speculative.k = Some(k);
+    }
     o.check().map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(o)
 }
@@ -679,5 +726,73 @@ mod model_group_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown axis `nope`"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod sampling_and_speculation_tests {
+    use super::*;
+    use lloom::generation::Sampling;
+
+    fn common(argv: &[&str]) -> CommonArgs {
+        #[derive(Parser)]
+        struct T {
+            #[command(flatten)]
+            common: CommonArgs,
+        }
+        let mut full = vec!["t"];
+        full.extend_from_slice(argv);
+        T::parse_from(full).common
+    }
+
+    #[test]
+    fn the_sampler_arms_follow_the_fields() {
+        let o = resolve_options_uninstalled(&common(&[])).unwrap();
+        assert_eq!(o.sampling.sampling(), Sampling::ArgMax, "greedy by default");
+        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--top-p", "0.9", "-n", "64", "--seed", "7"])).unwrap();
+        assert_eq!(o.sampling.sampling(), Sampling::TopP { p: 0.9, temperature: 0.7 });
+        assert_eq!(o.sampling.max_tokens, 64);
+        assert_eq!(o.sampling.seed, Some(7));
+        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--top-k", "40", "--top-p", "0.9"])).unwrap();
+        assert_eq!(o.sampling.sampling(), Sampling::TopKThenTopP { k: 40, p: 0.9, temperature: 0.7 });
+        let o = resolve_options_uninstalled(&common(&["-t", "0.7", "--gumbel"])).unwrap();
+        assert_eq!(o.sampling.sampling(), Sampling::GumbelSoftmax { temperature: 0.7 });
+        let o = resolve_options_uninstalled(&common(&["--generation-config", r#"{"temperature": 0.3, "stop": ["<|im_end|>", "\n\n"], "ignore_eos": true}"#])).unwrap();
+        assert_eq!(o.sampling.sampling(), Sampling::All { temperature: 0.3 });
+        assert_eq!(o.sampling.stop, vec!["<|im_end|>", "\n\n"]);
+        let p = o.sampling.params(&[7], crate::ReadbackArm::Blocking, 0);
+        assert_eq!(p.eos_ids, vec![u32::MAX], "ignore_eos replaces the EOS set with an id no tokenizer emits");
+        assert_eq!(p.max_tokens, 512);
+        // The checkpoint's defaults fill only unset fields, only when asked.
+        let gc = lloom::hub::GenerationConfig {
+            temperature: Some(0.6),
+            top_p: Some(0.95),
+            ..Default::default()
+        };
+        let mut s = o.sampling.clone();
+        s.apply_checkpoint(Some(&gc));
+        assert_eq!(s.temperature, Some(0.3), "greedy mode ignores the checkpoint");
+        s.defaults = "checkpoint".into();
+        s.apply_checkpoint(Some(&gc));
+        assert_eq!(s.temperature, Some(0.3), "a set field stays");
+        assert_eq!(s.top_p, Some(0.95), "an unset one takes the checkpoint's");
+    }
+
+    #[test]
+    fn the_speculation_shorthands_fill_the_group() {
+        let o = resolve_options_uninstalled(&common(&["--dspark", "--dspark-k", "3"])).unwrap();
+        assert_eq!(o.speculative.method, "dspark");
+        assert_eq!(o.speculative.k, Some(3));
+        assert_eq!(o.speculative.drafter, None);
+        let o = resolve_options_uninstalled(&common(&["--mtp", "/tmp/mtp.gguf", "--mtp-k", "2"])).unwrap();
+        assert_eq!(o.speculative.method, "mtp");
+        assert_eq!(o.speculative.k, Some(2));
+        assert_eq!(o.speculative.drafter.as_deref(), Some(std::path::Path::new("/tmp/mtp.gguf")));
+        let o = resolve_options_uninstalled(&common(&["--speculative-config", r#"{"method": "dspark", "k": 4, "drafter": "/d"}"#])).unwrap();
+        assert_eq!((o.speculative.method.as_str(), o.speculative.k), ("dspark", Some(4)));
+        let err = resolve_options_uninstalled(&common(&["--dspark", "--mtp", "/x"])).unwrap_err().to_string();
+        assert!(err.contains("one speculative body"), "{err}");
+        let err = resolve_options_uninstalled(&common(&["--spec-method", "ngram"])).unwrap_err().to_string();
+        assert!(err.contains("not a speculation method"), "{err}");
     }
 }

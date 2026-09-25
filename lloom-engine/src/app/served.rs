@@ -38,6 +38,11 @@ pub trait Served: Send + Sync {
     fn health(&self) -> Value;
     /// The family-specific tail of the `[loaded …]` line.
     fn describe(&self) -> String;
+    /// The checkpoint's `generation_config.json`, when it carries one (the
+    /// sampling defaults under `--sampling-defaults checkpoint`).
+    fn generation_config(&self) -> Option<lloom::hub::GenerationConfig> {
+        None
+    }
 
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>>;
     fn token_str(&self, id: u32) -> String;

@@ -178,7 +178,8 @@ impl ReadbackArm {
             ReadbackArm::Auto => "auto".to_string(),
             ReadbackArm::Blocking => "blocking".to_string(),
             ReadbackArm::Ring(r) => r.name(),
-            ReadbackArm::Speculative { k } => format!("dspark k={k}"),
+            // The drafter is the family's (`speculative.method`); the loop is one.
+            ReadbackArm::Speculative { k } => format!("speculative k={k}"),
             ReadbackArm::Batched { rows } => format!("batched rows={rows}"),
         }
     }
@@ -193,6 +194,10 @@ pub struct DecodeParams {
     /// `t`, with `top_p` when set. Matches [`LogitsProcessor::new`].
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    /// Top-k, with `top_p` top-k-then-top-p (`Sampling::TopK` / `TopKThenTopP`).
+    pub top_k: Option<usize>,
+    /// Device gumbel-max at the temperature (`Sampling::GumbelSoftmax`).
+    pub gumbel: bool,
     pub max_tokens: usize,
     /// End-of-sequence ids; the first one sampled stops the run.
     pub eos_ids: Vec<u32>,
@@ -209,12 +214,50 @@ pub struct DecodeParams {
     pub prefill_tile: usize,
 }
 
+impl DecodeParams {
+    /// The sampler arm for these fields: argmax below 1e-7 of temperature,
+    /// else gumbel-max, top-k-then-top-p, top-k, top-p, or plain temperature
+    /// (`LogitsProcessor::new`'s rule, extended to the arms the sampler has).
+    pub fn sampling_of(
+        temperature: Option<f64>,
+        top_p: Option<f64>,
+        top_k: Option<usize>,
+        gumbel: bool,
+    ) -> Sampling {
+        let temperature = match temperature {
+            Some(t) if t >= 1e-7 => t,
+            _ => return Sampling::ArgMax,
+        };
+        if gumbel {
+            return Sampling::GumbelSoftmax { temperature };
+        }
+        match (top_k, top_p) {
+            (Some(k), Some(p)) => Sampling::TopKThenTopP { k, p, temperature },
+            (Some(k), None) => Sampling::TopK { k, temperature },
+            (None, Some(p)) => Sampling::TopP { p, temperature },
+            (None, None) => Sampling::All { temperature },
+        }
+    }
+
+    /// The sampler arm of this request.
+    pub fn sampling(&self) -> Sampling {
+        Self::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
+    }
+
+    /// The sampler of this request, seeded.
+    pub fn sampler(&self) -> LogitsProcessor {
+        LogitsProcessor::from_sampling(self.seed, self.sampling())
+    }
+}
+
 impl Default for DecodeParams {
     fn default() -> Self {
         DecodeParams {
             seed: 42,
             temperature: None,
             top_p: None,
+            top_k: None,
+            gumbel: false,
             max_tokens: 512,
             eos_ids: Vec::new(),
             stop_strings: Vec::new(),
@@ -540,7 +583,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         }
         let prepared = self.session.prepare(prompt_ids)?;
 
-        let mut sampler = LogitsProcessor::new(params.seed, params.temperature, params.top_p);
+        let mut sampler = params.sampler();
         let arm = params
             .readback
             .resolve(sampler.sampling(), self.config.readback.ring_arm());
@@ -753,7 +796,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if params.eos_ids.is_empty() {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
-        let mut sampler = LogitsProcessor::new(params.seed, params.temperature, params.top_p);
+        let mut sampler = params.sampler();
         if sampler.sampling() != &Sampling::ArgMax {
             lloom_tensor::bail!(
                 "DecodeSession::decode_speculative: the speculative body decodes greedily (the \

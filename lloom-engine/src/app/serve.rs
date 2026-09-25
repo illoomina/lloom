@@ -85,10 +85,6 @@ pub struct ServeArgs {
     #[arg(long)]
     prompt_seed_file: Option<PathBuf>,
 
-    /// Default `max_tokens` for a request that names none.
-    #[arg(long, default_value_t = 512)]
-    max_tokens_default: usize,
-
     /// The batch width: how many requests decode together, one weight sweep
     /// per step for all of them (issue #148). `1` is the single-sequence
     /// crown loop; `N > 1` starts the continuous-batching scheduler with `N`
@@ -128,7 +124,9 @@ struct Shared {
     aborts: Mutex<HashSet<String>>,
     server: Server,
     model_name: String,
-    max_tokens_default: usize,
+    /// The sampling defaults a request that names none decodes with (the
+    /// `sampling` group; `--generation-config`).
+    sampling: crate::SamplingConfig,
 }
 
 pub fn run(args: ServeArgs) -> Result<()> {
@@ -153,6 +151,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         super::Shape {
             decode: options.decode.clone(),
             model: options.model.clone(),
+            speculative: options.speculative.clone(),
             reuse_prefix: args.reuse_prefix,
             seed_text,
             batch: args.batch,
@@ -162,6 +161,8 @@ pub fn run(args: ServeArgs) -> Result<()> {
         },
     )?;
     let model_name = engine.model_name().to_string();
+    let mut sampling = options.sampling.clone();
+    sampling.apply_checkpoint(engine.generation_config().as_ref());
     eprintln!(
         "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} {}]",
         model_name,
@@ -187,7 +188,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
         aborts: Mutex::new(HashSet::new()),
         server,
         model_name,
-        max_tokens_default: args.max_tokens_default,
+        sampling,
     });
 
     // The ready marker the sidecar runner waits for, on stdout and nothing
@@ -540,19 +541,30 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         .or_else(|| v.get("max_tokens"))
         .and_then(Value::as_u64)
         .map(|n| n as usize)
-        .unwrap_or(shared.max_tokens_default);
+        .unwrap_or(shared.sampling.max_tokens);
     if max_tokens == 0 {
         return Err(bad("max_tokens must be positive"));
     }
     let temperature = match v.get("temperature") {
-        None | Some(Value::Null) => None,
+        None | Some(Value::Null) => shared.sampling.temperature,
         Some(t) => Some(
             t.as_f64()
                 .ok_or_else(|| bad("field 'temperature' must be a number"))?,
         ),
     };
+    let top_k = match v.get("top_k") {
+        None | Some(Value::Null) => shared.sampling.top_k,
+        Some(k) => Some(
+            k.as_u64()
+                .ok_or_else(|| bad("field 'top_k' must be a positive integer"))? as usize,
+        ),
+    };
+    let gumbel = v
+        .get("gumbel")
+        .and_then(Value::as_bool)
+        .unwrap_or(shared.sampling.gumbel);
     let top_p = match v.get("top_p") {
-        None | Some(Value::Null) => None,
+        None | Some(Value::Null) => shared.sampling.top_p,
         Some(p) => {
             let p = p
                 .as_f64()
@@ -566,13 +578,13 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
     let seed = v
         .get("seed")
         .and_then(Value::as_u64)
-        .unwrap_or_else(rand::random::<u64>);
+        .unwrap_or_else(|| shared.sampling.seed_or_random());
     let ignore_eos = v
         .get("ignore_eos")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(shared.sampling.ignore_eos);
     let stop_strings: Vec<String> = match v.get("stop") {
-        None | Some(Value::Null) => Vec::new(),
+        None | Some(Value::Null) => shared.sampling.stop.clone(),
         Some(Value::String(s)) => vec![s.clone()],
         Some(Value::Array(items)) => items
             .iter()
@@ -594,6 +606,8 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         seed,
         temperature,
         top_p,
+        top_k,
+        gumbel,
         max_tokens,
         eos_ids,
         stop_strings,
@@ -1043,6 +1057,8 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             seed: rand::random::<u64>(),
                             temperature: (temperature > 0.0).then_some(temperature),
                             top_p: None,
+                            top_k: None,
+                            gumbel: false,
                             max_tokens,
                             eos_ids: engine.eos_ids().to_vec(),
                             stop_strings: Vec::new(),

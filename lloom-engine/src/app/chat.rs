@@ -6,7 +6,6 @@
 
 use super::common::{ms, NEVER_EOS};
 use super::{detect_family, load_engine, Family, ModelArgs, Shape};
-use crate::DecodeParams;
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
@@ -29,20 +28,6 @@ pub struct ChatArgs {
     /// re-prefilling the conversation) and the blocking arm on Qwen4-exp.
     #[command(flatten)]
     pub common: super::CommonArgs,
-
-    /// New tokens per turn at most.
-    #[arg(long, short = 'n', default_value_t = 1024)]
-    pub max_tokens: usize,
-
-    /// Sampling temperature; 0 is greedy.
-    #[arg(long, short = 't', default_value_t = 0.0)]
-    pub temperature: f64,
-
-    #[arg(long)]
-    pub top_p: Option<f64>,
-
-    #[arg(long, default_value_t = 42)]
-    pub seed: u64,
 
     /// A system message for the conversation.
     #[arg(long)]
@@ -75,10 +60,20 @@ pub fn run(args: ChatArgs) -> Result<()> {
     if options.decode.readback.kind == crate::ReadbackKind::Auto {
         if let Family::Lfm2(_) = &family {
             // The chat's `auto` on LFM2: the ring without the lookahead, so
-            // the cache ends at the EOS and the next turn extends it.
-            crate::ReadbackConfig::apply_spelling(&mut options.decode.readback, "ring-la0")
-                .map_err(|e| anyhow::anyhow!(e))?;
+            // the cache ends at the EOS and the next turn extends it — as
+            // the ring `auto` resolves to, so a host-side sampler (top-p,
+            // top-k) still falls back to the blocking arm per request.
+            options.decode.readback.lookahead = 0;
+            options.decode.readback.adaptive_commit = false;
         }
+    }
+    // The chat's own default is a long turn; the group's 512 is the server's.
+    let mut sampling = options.sampling.clone();
+    if args.common.options.sampling.max_tokens.is_none()
+        && !args.common.set.iter().any(|s| s.starts_with("sampling.max_tokens"))
+        && sampling.max_tokens == 512
+    {
+        sampling.max_tokens = 1024;
     }
     let t = Instant::now();
     let (engine, path) = load_engine(
@@ -86,6 +81,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         Shape {
             decode: options.decode.clone(),
             model: options.model.clone(),
+            speculative: options.speculative.clone(),
             reuse_prefix: !args.no_reuse,
             seed_text: "The loom threads warp and weft into cloth. ".to_string(),
             batch: 1,
@@ -104,6 +100,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         !args.no_reuse,
         engine.describe()
     );
+    sampling.apply_checkpoint(engine.generation_config().as_ref());
     let kwargs = json!({ "enable_thinking": args.think });
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = &args.system {
@@ -146,16 +143,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             engine.render_chat(&json!(messages), Some(&kwargs))?
         };
         let ids = engine.encode(&rendered, true)?;
-        let params = DecodeParams {
-            seed: args.seed,
-            temperature: (args.temperature > 0.0).then_some(args.temperature),
-            top_p: args.top_p,
-            max_tokens: args.max_tokens,
-            eos_ids: engine.eos_ids().to_vec(),
-            stop_strings: Vec::new(),
-            readback: engine.readback(),
-            prefill_tile: engine.prefill_tile(),
-        };
+        let params = sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
         let started = Instant::now();
         let mut first_at: Option<f64> = None;
         let decoded = engine

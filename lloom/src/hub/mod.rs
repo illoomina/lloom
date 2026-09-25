@@ -430,7 +430,9 @@ fn read_chat_template(dir: &Path) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn read_generation_config(dir: &Path) -> Result<Option<GenerationConfig>> {
+/// `generation_config.json` in `dir`, when present (the sampling defaults a
+/// serving binary may take under `--sampling-defaults checkpoint`).
+pub fn read_generation_config(dir: &Path) -> Result<Option<GenerationConfig>> {
     let path = dir.join("generation_config.json");
     if !path.exists() {
         return Ok(None);

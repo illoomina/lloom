@@ -650,9 +650,7 @@ where
     }
 
     fn sampling_of(params: &DecodeParams) -> Sampling {
-        LogitsProcessor::new(params.seed, params.temperature, params.top_p)
-            .sampling()
-            .clone()
+        params.sampling()
     }
 
     /// Admit waiting rows into the continuous decoder while the width allows.

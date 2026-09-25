@@ -26,6 +26,7 @@
 //! ```text
 //! #[opt]                                     a value field: FromStr + serde
 //! #[opt(flag = "kv-append")]                 the long flag (default: the field name, kebab-case)
+//! #[opt(short = 't', alias = "temp")]         a short flag, an alias for the long one
 //! #[opt(bool)]                               a switch: `--x` / `--x=false`
 //! #[opt(env = "LLOOM_X")]                    an env alias read by `from_env`
 //! #[opt(variants = ["a", "b"])]              the arms, for help and the table
@@ -51,6 +52,8 @@ use syn::{
 #[derive(Default)]
 struct OptAttr {
     flag: Option<String>,
+    short: Option<char>,
+    alias: Option<String>,
     env: Option<String>,
     variants: Vec<String>,
     parser: Option<String>,
@@ -71,6 +74,14 @@ impl Parse for OptAttr {
                 "flag" => {
                     input.parse::<Token![=]>()?;
                     a.flag = Some(input.parse::<LitStr>()?.value());
+                }
+                "short" => {
+                    input.parse::<Token![=]>()?;
+                    a.short = Some(input.parse::<syn::LitChar>()?.value());
+                }
+                "alias" => {
+                    input.parse::<Token![=]>()?;
+                    a.alias = Some(input.parse::<LitStr>()?.value());
                 }
                 "env" => {
                     input.parse::<Token![=]>()?;
@@ -267,6 +278,14 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
         if let Some(env) = &f.attr.env {
             doc.push_str(&format!(" [env: {env}]"));
         }
+        let short = match f.attr.short {
+            Some(c) => quote! { short = #c, },
+            None => quote! {},
+        };
+        let alias = match &f.attr.alias {
+            Some(a) => quote! { alias = #a, },
+            None => quote! {},
+        };
         if f.attr.nested {
             let sub_args = nested_args_ty(&f.ty);
             // A nested group may also carry a compound shorthand
@@ -294,14 +313,14 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
         } else if f.attr.is_bool {
             quote! {
                 #[doc = #doc]
-                #[arg(id = #id, long = #flag, num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::clap::value_parser!(bool), value_name = "BOOL")]
+                #[arg(id = #id, long = #flag, #short #alias num_args = 0..=1, default_missing_value = "true", action = ::clap::ArgAction::Set, value_parser = ::clap::value_parser!(bool), value_name = "BOOL")]
                 pub #ident: Option<bool>,
             }
         } else {
             let value_name = type_name(f.inner.as_ref().unwrap_or(&f.ty)).to_uppercase();
             quote! {
                 #[doc = #doc]
-                #[arg(id = #id, long = #flag, value_name = #value_name)]
+                #[arg(id = #id, long = #flag, #short #alias value_name = #value_name)]
                 pub #ident: Option<String>,
             }
         }

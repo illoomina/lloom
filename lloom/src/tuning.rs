@@ -175,7 +175,8 @@ impl Default for StreamTuning {
     fn default() -> Self {
         StreamTuning {
             pread_direct: false,
-            prefetch_threads: crate::nn::expert_prefetch::DEFAULT_THREADS,
+            // `nn::expert_prefetch::DEFAULT_THREADS` (metal-only module): 8.
+            prefetch_threads: 8,
             prefetch_lead: 2,
             plan: "device".into(),
             decode_hint: false,

@@ -12,6 +12,7 @@ use super::{lfm2, qwen4exp, ModelArgs, Served, Shape};
 use anyhow::{Context, Result};
 #[allow(unused_imports)]
 use anyhow::Context as _;
+use lloom::nn::ops::KvQuant;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -36,6 +37,15 @@ pub struct Capabilities {
     pub rewind: &'static str,
     /// The executor arms (`arena`, `packed`, `replay`) are measured on this family.
     pub executor_arms: bool,
+    /// The KV-cache precision arms (`model.axes.kv-quant`) this family
+    /// serves. Read whatever `model_axes` says: KV precision is a mechanism
+    /// of every family, not one family's `Config` field
+    /// (`sequence-state.md` §10.7).
+    pub kv_quant: &'static [KvQuant],
+    /// What `KvQuant::Off` stores on this family.
+    pub kv_dtype: &'static str,
+    /// Why the arms missing from `kv_quant` are refused.
+    pub kv_quant_missing: &'static str,
 }
 
 impl Capabilities {
@@ -50,22 +60,37 @@ impl Capabilities {
             "model_axes": self.model_axes,
             "rewind": self.rewind,
             "executor_arms": self.executor_arms,
+            "kv_quant": self.kv_quant_names(),
+            "kv_dtype": self.kv_dtype,
         })
     }
 
     pub fn line(&self) -> String {
         format!(
-            "lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} rewind={:?}",
+            "lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} rewind={:?}",
             self.lookahead_max,
             self.ring,
             self.batch,
             self.prefix_share,
             self.speculation.join(","),
             self.model_axes,
+            self.kv_quant_names().join(","),
+            self.kv_dtype,
             self.rewind,
         )
     }
+
+    fn kv_quant_names(&self) -> Vec<String> {
+        self.kv_quant
+            .iter()
+            .map(|q| q.name().to_ascii_lowercase())
+            .collect()
+    }
 }
+
+/// The `model.axes` key of the KV precision axis (`lfm2::Config`'s `#[axis]`
+/// flag, which `ModelConfig::set` keys the map by).
+const KV_QUANT_AXIS: &str = "kv-quant";
 
 /// What a run asked for: the family's own load flags and the option groups.
 pub struct Requested<'a> {
@@ -99,6 +124,9 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     model_axes: true,
     rewind: "the rotating ring's K on the rewindable arms; none on the crown (Shuffle)",
     executor_arms: true,
+    kv_quant: &[KvQuant::Off, KvQuant::Int8, KvQuant::Int4],
+    kv_dtype: "f16",
+    kv_quant_missing: "",
 };
 
 pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
@@ -111,6 +139,10 @@ pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     model_axes: false,
     rewind: "one decode step (the standing window)",
     executor_arms: false,
+    kv_quant: &[KvQuant::Off],
+    kv_dtype: "f32",
+    kv_quant_missing: "its attention KV is stored at f32 and no quantized arm is built for it \
+                       (head_dim 256 and QSA's selected-block read; sequence-state.md §10.7)",
 };
 
 /// Every family, in detection order.
@@ -132,6 +164,37 @@ pub fn detect(path: &Path) -> Result<(&'static dyn Family, PathBuf)> {
     )
 }
 
+/// The KV precision arm requested, refused unless `cap` serves it. `f16` is
+/// `Off`'s spelling where `Off` is an f16 store, and refused where it is not,
+/// so a name never selects a store it does not describe.
+fn resolve_kv_quant(
+    cap: &Capabilities,
+    axes: &std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    let Some(value) = axes.get(KV_QUANT_AXIS) else {
+        return Ok(());
+    };
+    let arm =
+        KvQuant::parse(value).map_err(|e| anyhow::anyhow!("model.axes.{KV_QUANT_AXIS}: {e}"))?;
+    let arms = cap.kv_quant_names().join(", ");
+    if !cap.kv_quant.contains(&arm) {
+        anyhow::bail!(
+            "kv-quant = {value} is not {}'s (its KV arms: [{arms}]): {}",
+            cap.family,
+            cap.kv_quant_missing
+        );
+    }
+    if value == "f16" && cap.kv_dtype != "f16" {
+        anyhow::bail!(
+            "kv-quant = f16 names an f16 KV store; {}'s `off` stores {} (its KV arms: [{arms}]): {}",
+            cap.family,
+            cap.kv_dtype,
+            cap.kv_quant_missing
+        );
+    }
+    Ok(())
+}
+
 /// The refusals every family shares.
 fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
     let s = &req.shape;
@@ -143,11 +206,19 @@ fn resolve_common(cap: &Capabilities, req: &Requested<'_>) -> Result<()> {
             cap.speculation.join(", ")
         );
     }
-    if !cap.model_axes && (!s.model.axes.is_empty() || s.model.cache != "auto") {
+    resolve_kv_quant(cap, &s.model.axes)?;
+    let config_axes: Vec<&str> = s
+        .model
+        .axes
+        .keys()
+        .map(String::as_str)
+        .filter(|k| *k != KV_QUANT_AXIS)
+        .collect();
+    if !cap.model_axes && (!config_axes.is_empty() || s.model.cache != "auto") {
         anyhow::bail!(
             "the model axes ({}{}) are LFM2's `Config`'s; {}'s arms are its load flags and the `tuning.{}.*` knobs",
             if s.model.cache != "auto" { format!("cache={} ", s.model.cache) } else { String::new() },
-            s.model.axes.keys().cloned().collect::<Vec<_>>().join(", "),
+            config_axes.join(", "),
             cap.family,
             cap.family,
         );
@@ -395,6 +466,74 @@ mod tests {
         s.speculative.method = "mtp".into();
         s.speculative.drafter = Some("/x.gguf".into());
         Qwen4ExpFamily.resolve(&Requested { model: &m, shape: s }).unwrap();
+    }
+
+    fn with_kv_quant(value: &str) -> Shape {
+        let mut s = shape();
+        s.model.set(KV_QUANT_AXIS, value).unwrap();
+        s
+    }
+
+    #[test]
+    fn each_family_serves_its_own_kv_arms_and_refuses_the_rest_by_name() {
+        let m = model_args(&[]);
+        for v in ["int8", "8", "int4", "4"] {
+            let err = Qwen4ExpFamily
+                .resolve(&Requested {
+                    model: &m,
+                    shape: with_kv_quant(v),
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("kv-quant = {v} is not qwen4exp's")),
+                "{err}"
+            );
+            assert!(err.contains("its KV arms: [off]"), "{err}");
+            assert!(err.contains("stored at f32"), "{err}");
+        }
+        let err = Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: with_kv_quant("f16"),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`off` stores f32"),
+            "f16 must not name Qwen4-exp's f32 store: {err}"
+        );
+        Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: with_kv_quant("off"),
+            })
+            .expect("off is Qwen4-exp's own KV arm");
+        // The other axes are still refused, and kv-quant is not blamed for them.
+        let mut s = with_kv_quant("off");
+        s.model.set("attn", "sdpa").unwrap();
+        let err = Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the model axes (attn)"), "{err}");
+        for v in ["off", "f16", "int8", "8", "int4", "4"] {
+            Lfm2Family
+                .resolve(&Requested {
+                    model: &m,
+                    shape: with_kv_quant(v),
+                })
+                .unwrap_or_else(|e| panic!("lfm2 serves kv-quant = {v}: {e}"));
+        }
+        assert!(LFM2_CAPABILITIES
+            .line()
+            .contains("kv_quant=[off,int8,int4] kv_dtype=f16"));
+        assert!(QWEN4EXP_CAPABILITIES
+            .line()
+            .contains("kv_quant=[off] kv_dtype=f32"));
     }
 
     #[test]

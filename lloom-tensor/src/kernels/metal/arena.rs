@@ -136,6 +136,29 @@ pub fn note_bind(addr: usize) {
     }
 }
 
+/// Report that a new `MTLBuffer` object exists at `addr`.
+///
+/// The recorder names values by the address of the buffer object serving
+/// them, and an address outlives its object: once the pool destroys a buffer
+/// (eviction, a trim), the allocator is free to hand the same address to the
+/// next object created on any path. Most of those paths never tell the
+/// recorder about their allocation (the Shared pool, host uploads, heap
+/// placements), so without this the new object's binds are charged to
+/// whatever value the old one held — a phantom escape when that value was
+/// the previous pass's, a stretched interval when it was this pass's. Called
+/// from `Buffer::new`, the one constructor of an object of our own; one
+/// relaxed load when nothing records (`DESIGN.md` §9.2aa).
+#[inline]
+pub fn note_new_buffer(addr: usize) {
+    if !observing_binds() {
+        return;
+    }
+    let slot = observer_slot().lock();
+    if let Some(rec) = slot.as_ref() {
+        rec.lock().forget_addr(addr);
+    }
+}
+
 /// Dispatches encoded since the installed arena's step began -- the clock the
 /// plan's allocation positions are checked against (`Arena::acquire_attributed`).
 static STEP_DISPATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1676,16 +1699,10 @@ impl ArenaRecorder {
         // address into a value the recorder has not reached yet, and a bind
         // of that value BEFORE its `record_alloc` runs falls through to
         // `previous_by_addr` and is charged to the previous step's ordinal as
-        // an escape that never happened. That is the phantom this removes.
-        //
-        // The old comment here said a `remove` would be "a line no test can
-        // fail". It was wrong, and
-        // `a_recycled_address_stops_naming_the_previous_steps_value` is the
-        // test: measured on the real model, the phantom count MOVED BETWEEN
-        // IDENTICAL RUNS (8 escapes then 7, different ordinals) — the
-        // signature of address reuse rather than of a value outliving its
-        // pass, since a real escape is the same ordinal every run (lloom
-        // #727, measurements §8.4 and §24).
+        // an escape that never happened
+        // (`a_recycled_address_stops_naming_the_previous_steps_value`). An
+        // address reused by a new object that never reaches `record_alloc`
+        // is the same phantom by another path; `note_new_buffer` covers it.
         self.previous_by_addr.remove(&addr);
         self.by_addr.insert(addr, ordinal);
     }
@@ -1710,16 +1727,15 @@ impl ArenaRecorder {
         }
     }
 
-    /// Forget the value at `addr`: an allocation was served there that is
-    /// NOT part of the recorded sequence (under the pass cache, one made
-    /// between two passes — a sampler's ids, a staged input, a cat of the
-    /// step's rows). It takes no ordinal, and the address must stop naming
-    /// whatever held it, or a bind of the NEW value is read as a bind of the
-    /// old one and the old one is reported as escaping its pass — a phantom
-    /// escape, and a hole punched in the plan for a value that never
-    /// outlived anything. Measured: exactly one per batched step before this
-    /// (the pool handing a between-pass allocation the address the step's
-    /// logits had just left).
+    /// Forget the value at `addr`: something that is NOT part of the recorded
+    /// sequence now occupies it — an allocation made between two passes (a
+    /// sampler's ids, a staged input, a cat of the step's rows), or a new
+    /// buffer object created at an address a destroyed one had
+    /// ([`note_new_buffer`]). It takes no ordinal, and the address must stop
+    /// naming whatever held it, or a bind of the NEW occupant is read as a
+    /// bind of the old value — reported as escaping its pass when the value
+    /// was the previous pass's: a phantom escape, and a hole punched in the
+    /// plan for a value that never outlived anything.
     pub fn forget_addr(&mut self, addr: usize) {
         self.by_addr.remove(&addr);
         self.previous_by_addr.remove(&addr);

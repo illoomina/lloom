@@ -343,10 +343,12 @@ pub fn resolve_options_uninstalled(common: &CommonArgs) -> Result<crate::EngineO
 }
 
 /// `lloom config`: the resolved option tree as JSON — every knob with the
-/// value this invocation would run, in the shape `--config` reads back.
+/// value this invocation would run, in the shape `--config` reads back. Not
+/// `ConfigArgs`: clap names an argument group after its struct, and the
+/// model group flattens `lfm2::ConfigArgs` into this one.
 #[derive(Parser)]
 #[command(name = "lloom config", about = "Print the resolved option tree as JSON")]
-pub struct ConfigArgs {
+pub struct ConfigCmdArgs {
     #[command(flatten)]
     pub common: CommonArgs,
 }
@@ -416,7 +418,7 @@ pub enum Command {
     /// The benchmark cells (the pipette sidecar's) in-process, both families.
     Bench(serve::BenchArgs),
     /// Print the resolved option tree (the layers applied) as JSON.
-    Config(ConfigArgs),
+    Config(ConfigCmdArgs),
     /// List every knob: key, flag, env alias, default, arms, doc.
     Knobs,
 }
@@ -590,6 +592,38 @@ mod model_group_tests {
         let mut back = crate::EngineOptions::default();
         back.merge_json(&v).unwrap();
         assert_eq!(back, o);
+    }
+
+    /// `--kv-quant` is the model group's, from `lfm2::Config`'s own derive:
+    /// every front-end reaches the field the cache is built from, and the
+    /// loaded line renders the arm from that field.
+    #[test]
+    fn kv_quant_reaches_the_config_from_every_front_end() {
+        use lloom::nn::ops::KvQuant;
+        for (argv, want) in [
+            (vec!["--kv-quant", "int8"], KvQuant::Int8),
+            (vec!["--set", "model.kv-quant=int4"], KvQuant::Int4),
+            (
+                vec!["--model-config", r#"{"axes": {"kv-quant": "8"}}"#],
+                KvQuant::Int8,
+            ),
+            (vec!["--kv-quant", "off"], KvQuant::Off),
+        ] {
+            let o = resolve_options_uninstalled(&common(&argv)).unwrap();
+            let mut cfg = Config::default();
+            o.model.apply_axes(&mut cfg).unwrap();
+            assert_eq!(cfg.kv_quant, want, "{argv:?}");
+            assert!(
+                cfg.axes_line()
+                    .contains(&format!("KvQuant={}", want.name())),
+                "{argv:?}: {}",
+                cfg.axes_line()
+            );
+        }
+        let err = resolve_options_uninstalled(&common(&["--kv-quant", "int9"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--kv-quant"), "{err}");
     }
 
     #[test]

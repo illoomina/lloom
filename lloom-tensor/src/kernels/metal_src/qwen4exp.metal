@@ -656,6 +656,79 @@ kernel void gdn_step_f32(
   }
 }
 
+// `gdn_step_f32` with each thread's values of `S` (at most `R`) held in
+// registers between the read-out and the update, so the slab is read once
+// rather than twice: 6 MB a layer at the real geometry where the loop form
+// moves 9. The loops are the loop form's; the rounding is the compiler's for
+// this shape (fast math), so the result is not the loop form's bit for bit
+// (§2.3.5a). The host dispatches it only when `ceil(d / split) ≤ R`.
+template <uint R>
+static inline void gdn_step_reg_body(
+    const device float* heads, const device float* alpha, const device float* beta,
+    const device float* dt_bias, const device float* ssm_a, const device float* s,
+    device float* o, uint d, uint h_v, device float* s_out, uint dv, uint t, uint width,
+    threadgroup float* part) {
+  const uint split = width / h_v;
+  const uint h = t % h_v;
+  const uint j = t / h_v;
+  const bool live = j < split;
+  const device float* q = heads + (size_t)h * d;
+  const device float* k = heads + (size_t)(h_v + h) * d;
+  const device float* v = heads + (size_t)(2 * h_v + h) * d;
+  const float a = alpha[h] + dt_bias[h];
+  const float sp = metal::max(a, 0.0f) + metal::log(1.0f + metal::exp(-metal::fabs(a)));
+  const float eg = metal::exp(ssm_a[h] * sp);
+  const float b = 1.0f / (1.0f + metal::exp(-beta[h]));
+  float sv[R];
+  float r = 0.0f;
+  if (live) {
+    uint u = 0;
+    for (uint dk = j; dk < d; dk += split) {
+      const float x = s[((size_t)dk * d + dv) * h_v + h];
+      sv[u++] = x;
+      r += k[dk] * (eg * x);
+    }
+    part[t] = r;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  r = 0.0f;
+  for (uint jj = 0; jj < split; jj++) r += part[jj * h_v + h];
+  const float delta = b * (v[dv] - r);
+  float acc = 0.0f;
+  if (live) {
+    uint u = 0;
+    for (uint dk = j; dk < d; dk += split) {
+      const float sn = eg * sv[u++] + k[dk] * delta;
+      s_out[((size_t)dk * d + dv) * h_v + h] = sn;
+      acc += q[dk] * sn;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (live) part[t] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (j == 0) {
+    float sum = 0.0f;
+    for (uint jj = 0; jj < split; jj++) sum += part[jj * h_v + h];
+    o[(size_t)h * d + dv] = sum;
+  }
+}
+
+#define GDN_STEP_REG(R)                                                                     \
+  kernel void gdn_step_r##R##_f32(                                                          \
+      const device float* heads [[buffer(0)]], const device float* alpha [[buffer(1)]],     \
+      const device float* beta [[buffer(2)]], const device float* dt_bias [[buffer(3)]],    \
+      const device float* ssm_a [[buffer(4)]], const device float* s [[buffer(5)]],         \
+      device float* o [[buffer(6)]], constant uint& d [[buffer(7)]],                        \
+      constant uint& h_v [[buffer(8)]], device float* s_out [[buffer(9)]],                  \
+      uint dv [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]], \
+      uint width [[threads_per_threadgroup]]) {                                             \
+    threadgroup float part[1024];                                                           \
+    gdn_step_reg_body<R>(heads, alpha, beta, dt_bias, ssm_a, s, o, d, h_v, s_out, dv, t,    \
+                         width, part);                                                      \
+  }
+GDN_STEP_REG(16)
+GDN_STEP_REG(32)
+
 // `out[h·d + i] = rmsnorm_d(o[h, ·])[i] · γ[i] · sigmoid(z[h·d + i])` — the
 // gated RMS norm over each value head, scaled by the output gate. One
 // threadgroup per head, `d` threads.

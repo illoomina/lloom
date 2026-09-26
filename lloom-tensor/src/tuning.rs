@@ -324,11 +324,17 @@ pub struct GdnTuning {
     /// The most `dk` slices a head's threads take in `gdn_step` (1..32; more slices, longer cross-slice reduction).
     #[opt(flag = "gdn-split", env = "LLOOM_GDN_SPLIT", parser = "parse_gdn_split")]
     pub split: usize,
+    /// `gdn_step` holds each thread's slice of `S` in registers (the slab read once, not twice); off = the loop form.
+    #[opt(flag = "gdn-step-reg", env = "LLOOM_GDN_STEP_REG", bool)]
+    pub step_reg: bool,
 }
 
 impl Default for GdnTuning {
     fn default() -> Self {
-        GdnTuning { split: 8 }
+        GdnTuning {
+            split: 8,
+            step_reg: false,
+        }
     }
 }
 

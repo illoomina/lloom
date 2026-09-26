@@ -668,30 +668,44 @@ impl QCudaStorage {
         if fast_kernel {
             return dequantize_f32(&self.data, self.dtype, elem_count, self.device());
         }
-        // Run the dequantization on cpu.
+        // Run the dequantization on cpu. The IQ family and Q2_0 have no CUDA
+        // kernel and no tested host route, so they are refused by name before
+        // any copy (§15.2a). No wildcard: a new dtype must choose here.
+        let host_deq: fn(&[u8], usize, &mut [f32]) = match self.dtype {
+            GgmlDType::F32 => deq::<f32>,
+            GgmlDType::F16 => deq::<half::f16>,
+            GgmlDType::BF16 => deq::<half::bf16>,
+            GgmlDType::Q4_0 => deq::<crate::quantized::BlockQ4_0>,
+            GgmlDType::Q4_1 => deq::<crate::quantized::BlockQ4_1>,
+            GgmlDType::Q5_0 => deq::<crate::quantized::BlockQ5_0>,
+            GgmlDType::Q5_1 => deq::<crate::quantized::BlockQ5_1>,
+            GgmlDType::Q8_0 => deq::<crate::quantized::BlockQ8_0>,
+            GgmlDType::Q8_1 => deq::<crate::quantized::BlockQ8_1>,
+            GgmlDType::Q2K => deq::<crate::quantized::BlockQ2K>,
+            GgmlDType::Q3K => deq::<crate::quantized::BlockQ3K>,
+            GgmlDType::Q4K => deq::<crate::quantized::BlockQ4K>,
+            GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>,
+            GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>,
+            GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>,
+            GgmlDType::IQ2XXS
+            | GgmlDType::IQ2XS
+            | GgmlDType::IQ2S
+            | GgmlDType::IQ3XXS
+            | GgmlDType::IQ3S
+            | GgmlDType::IQ4NL
+            | GgmlDType::IQ4XS
+            | GgmlDType::Q2_0 => crate::bail!(
+                "{:?} is not supported on the CUDA quantized path: no dequantize",
+                self.dtype
+            ),
+        };
 
         let buffer = self
             .device
             .clone_dtoh(&self.data.inner.slice(..self.data.len))?;
         let mut out = vec![0.0; elem_count];
         let block_len = elem_count / self.dtype.block_size();
-        match self.dtype {
-            GgmlDType::F32 => deq::<f32>(&buffer, block_len, &mut out),
-            GgmlDType::F16 => deq::<half::f16>(&buffer, block_len, &mut out),
-            GgmlDType::BF16 => deq::<half::bf16>(&buffer, block_len, &mut out),
-            GgmlDType::Q4_0 => deq::<crate::quantized::BlockQ4_0>(&buffer, block_len, &mut out),
-            GgmlDType::Q4_1 => deq::<crate::quantized::BlockQ4_1>(&buffer, block_len, &mut out),
-            GgmlDType::Q5_0 => deq::<crate::quantized::BlockQ5_0>(&buffer, block_len, &mut out),
-            GgmlDType::Q5_1 => deq::<crate::quantized::BlockQ5_1>(&buffer, block_len, &mut out),
-            GgmlDType::Q8_0 => deq::<crate::quantized::BlockQ8_0>(&buffer, block_len, &mut out),
-            GgmlDType::Q8_1 => deq::<crate::quantized::BlockQ8_1>(&buffer, block_len, &mut out),
-            GgmlDType::Q2K => deq::<crate::quantized::BlockQ2K>(&buffer, block_len, &mut out),
-            GgmlDType::Q3K => deq::<crate::quantized::BlockQ3K>(&buffer, block_len, &mut out),
-            GgmlDType::Q4K => deq::<crate::quantized::BlockQ4K>(&buffer, block_len, &mut out),
-            GgmlDType::Q5K => deq::<crate::quantized::BlockQ5K>(&buffer, block_len, &mut out),
-            GgmlDType::Q6K => deq::<crate::quantized::BlockQ6K>(&buffer, block_len, &mut out),
-            GgmlDType::Q8K => deq::<crate::quantized::BlockQ8K>(&buffer, block_len, &mut out),
-        }
+        host_deq(&buffer, block_len, &mut out);
 
         self.device
             .storage_from_cpu_storage(&crate::CpuStorage::F32(out))

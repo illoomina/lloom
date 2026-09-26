@@ -1866,21 +1866,20 @@ fn the_eos_gate_reconciles_to_the_blocking_arms_cache_on_the_crown_shuffle() -> 
     Ok(())
 }
 
-/// `Shuffle` WITHOUT the fused step — **a known defect, pinned**
-/// (`docs/dispatch.md` §11.5z-x). The unfused step builds the next state as a
-/// `cat` into a fresh tensor (`lfm2.rs` `convolve_bcx`) that the model swaps
-/// into the cache; the gated copy kernels skip the writes and the swap still
-/// happens, so the cache ends holding a tensor nothing wrote. No kernel
-/// epilogue can carry a state through a `cat`; the repair is the model's
-/// (write the state in place, or refuse `rewind_unwritten` on this arm), in a
-/// file of the LFM2-kernels lane. The second turns are no discriminator on
+/// `Shuffle` WITHOUT the fused step, under the gate: the reconcile is counters
+/// only (horizon 0), so the cache matches the reference only if no write past
+/// the EOS reached the state. The unfused step shifts the state in place, in
+/// the cache's own storage, with gated strided copies (`lfm2.rs`
+/// `convolve_bcx`); a step that built the next state in a fresh tensor and
+/// swapped it in would leave the cache holding a tensor no kernel wrote
+/// (`docs/dispatch.md` §11.5z-x). The second turns are no discriminator on
 /// this fixture — its greedy ids came out equal with the state wrong — and a
 /// prefilled turn rebuilds the state from its own activations whatever it was,
 /// which is why a multi-turn digest cannot see this: the conv state is the
-/// assertion. Run it with `--ignored`.
+/// assertion. The ungated control is the level: its reconcile is refused and
+/// its state has moved.
 #[cfg(feature = "metal")]
 #[test]
-#[ignore = "defect: the unfused Shuffle step swaps in a conv state the gate kept it from writing (lfm2.rs, §11.5z-x)"]
 fn the_eos_gate_reconciles_to_the_blocking_arms_cache_on_the_unfused_shuffle() -> Result<()> {
     let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
     let c = gate_cache_case(lloom::models::lfm2::ConvState::Shuffle, false)?;

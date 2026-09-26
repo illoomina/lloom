@@ -59,14 +59,27 @@ struct Chain {
     table: Tensor,
     /// `[VOCAB, VOCAB]` f32 identity: row `t` is the one-hot logits for `t`.
     eye: Tensor,
+    /// A square f32 matrix every forward multiplies by itself and drops: GPU
+    /// time no output depends on, so a loop that nothing paces runs ahead of
+    /// the device. `None` on the plain fixture.
+    ballast: Option<Tensor>,
 }
 
 impl Chain {
     fn new(device: &Device) -> Result<Self> {
+        Self::with_ballast(device, 0)
+    }
+
+    /// The fixture with a `[n, n]` matmul of ballast per forward (`n = 0`: none).
+    fn with_ballast(device: &Device, n: usize) -> Result<Self> {
         let table: Vec<f32> = (0..VOCAB as u32).map(|t| next_of(t) as f32).collect();
+        let ballast = (n > 0)
+            .then(|| Tensor::ones((n, n), DType::F32, device))
+            .transpose()?;
         Ok(Self {
             table: Tensor::from_vec(table, VOCAB, device)?,
             eye: Tensor::eye(VOCAB, DType::F32, device)?,
+            ballast,
         })
     }
 }
@@ -97,6 +110,9 @@ impl CausalLM for Chain {
             "forward at pos {pos} against a cache of {cache}"
         );
         *cache += seq;
+        if let Some(b) = &self.ballast {
+            b.matmul(b)?;
+        }
         // The last position's token, `[1]` U32, then its successor, then the
         // one-hot row: all on the device.
         let last = embeds.narrow(1, seq - 1, 1)?.flatten_all()?;
@@ -109,12 +125,13 @@ impl CausalLM for Chain {
     }
 }
 
+/// The CPU, and under `metal` the Metal device. A Metal device that fails to
+/// open is a failure, not a skip: every Metal-only assertion in this file
+/// would otherwise vanish and the file would still read green.
 fn devices() -> Vec<Device> {
     let mut v = vec![Device::Cpu];
     #[cfg(feature = "metal")]
-    if let Ok(m) = Device::new_metal(0) {
-        v.push(m);
-    }
+    v.push(Device::new_metal(0).expect("the `metal` feature is on and no Metal device opened"));
     v
 }
 
@@ -844,63 +861,87 @@ fn the_ring_feeds_the_same_slot_every_step() -> Result<()> {
     Ok(())
 }
 
+/// Side of the drain-arm fixture's per-forward ballast matmul: large enough
+/// that one forward's GPU time exceeds the host's encode of the next, so a
+/// host that nothing paces runs ahead of the device.
+const PACER_BALLAST: usize = 2048;
+
 /// The host's lead over the GPU is bounded by the step pacer on the arms
 /// whose commits the loop owns, and the bound engages only where the
-/// per-token wait does not already hold it.
+/// per-token wait does not already hold it (`docs/dispatch.md` §11.5x).
 ///
-/// `Session::decode` takes one marker per forward and waits on the marker
-/// `IN_FLIGHT_STEPS` back before encoding the next. On the poll arm the
+/// `Session::decode` commits each forward at its end and, before encoding the
+/// next, waits on the marker `pacer_depth` forwards back. On the poll arm the
 /// per-token EOS wait retires that forward first, so the pacer finds every
-/// marker complete and waits on none; on the drain arm nothing else paces the
-/// host, so the pacer is what bounds it, and the queue `flush_and_prune`
-/// observes stays within the depth plus the commit the loop itself makes.
+/// marker complete and waits on none. On the drain arm nothing else paces the
+/// host, so the pacer is the bound, and a bound is visible only where the
+/// host could exceed it: the drain arm runs on a fixture whose forward
+/// carries GPU ballast, so the pacer must wait, and without it the host would
+/// queue the whole run.
+///
+/// The bound in the unit `max_in_flight` counts — command buffers not yet
+/// complete at a loop commit, not forwards. The queue is FIFO, so once the
+/// marker `d` forwards back has completed every buffer before it has too;
+/// after it come at most the commit that followed it and two buffers for each
+/// of the `d` forwards since (the forward's own marker, and the loop commit
+/// carrying the drain marker): `2d + 1`. It holds at the default pipelined
+/// cut period, where the fixture's forward never cuts inside a step.
 #[test]
 fn the_pacer_bounds_the_drain_arm_and_is_a_null_on_the_poll_arm() -> Result<()> {
     let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
     for device in devices() {
+        let metal = matches!(device, Device::Metal(_));
         let opts = DecodeOptions {
             lookahead: 1,
             budget: CommitBudget::steps(8)?,
             ..DecodeOptions::new(24)
         };
-        let (out, _) = run(&device, &Arm::RingHostDrain, &[0], &opts)?;
-        // Markers are command buffers, so only a device with a queue takes
-        // them; the CPU reports none rather than a count it did not observe.
-        // One per forward: the prompt's one unit (`prefill_ubatch = 0`) and a
-        // step's, since the prefill rides the same pacer as the decode.
-        let want_markers = if matches!(device, Device::Metal(_)) {
-            out.stats.steps + 1
-        } else {
-            0
-        };
+        let depth = opts.pacer_depth();
+        // Ballast on Metal only: markers are command buffers, so the pacer is
+        // Metal's, and a CPU matmul of this size would only slow the CPU arm.
+        let model = Chain::with_ballast(&device, if metal { PACER_BALLAST } else { 0 })?;
+        let mut session = Session::new(&model, 0usize);
+        let mut rb = strategy(&Arm::RingHostDrain, &device, opts.max_tokens + 4)?;
+        let out = session.decode(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut greedy(),
+            &[0],
+            &opts,
+            &mut sink,
+        )?;
+        assert_eq!(
+            out.ids,
+            chain(0, 24).0,
+            "{device:?}: the ballast moves no id"
+        );
+        // One marker per forward: the prompt's one unit (`prefill_ubatch = 0`)
+        // and a step's, since the prefill rides the same pacer as the decode.
+        // The CPU reports none rather than a count it did not observe.
+        let want_markers = if metal { out.stats.steps + 1 } else { 0 };
         assert_eq!(
             out.stats.step_markers, want_markers,
             "{device:?}: one marker per forward"
         );
-        if matches!(device, Device::Metal(_)) {
-            // **`max_in_flight` counts COMMAND BUFFERS, not forwards.** It is
-            // `flush_and_prune`'s return, and a single forward commits several
-            // buffers — the pacer's own marker, plus a `CutPolicy` cut every
-            // `compute_per_buffer` dispatches, plus the commit budget's. So it
-            // is NOT the pacer's depth and must not be compared against
-            // `IN_FLIGHT_STEPS`: that comparison held only because this
-            // fixture's steps are tiny, and it failed under machine load
-            // whenever the driver retired buffers more slowly (lloom #727,
-            // measurements §12 — a real run shows `max_in_flight=13` at
-            // `depth 2`).
-            //
-            // What the pacer actually bounds is FORWARDS in flight, and
-            // `step_markers` / `step_waits` above already pin that. What is
-            // asserted here is the property this arm exists to have: the
-            // count is BOUNDED — it does not grow with the run — which is
-            // what distinguishes the pacer from the unbounded drain it
-            // replaced. A generous ceiling, because the number of buffers per
-            // forward is a function of the cut period, not of the pacer.
+        if metal {
+            eprintln!(
+                "drain arm, ballast {PACER_BALLAST}: depth {depth}, step_waits {}, \
+                 max_in_flight {}, commits {}, steps {}",
+                out.stats.step_waits, out.stats.max_in_flight, out.stats.commits, out.stats.steps
+            );
             assert!(
-                out.stats.max_in_flight <= 64,
-                "{device:?}: {} command buffers in flight on the drain arm — unbounded growth \
-                 is what the pacer exists to prevent (the bound is on FORWARDS; see step_waits)",
+                out.stats.max_in_flight <= 2 * depth + 1,
+                "{device:?}: {} command buffers in flight on the drain arm, bound 2 x depth {depth} \
+                 + 1 — the host ran past the marker it should have waited on",
                 out.stats.max_in_flight,
+            );
+            // The precondition, not the property: a host that never had to
+            // wait never tested the bound above.
+            assert!(
+                out.stats.step_waits > 0,
+                "{device:?}: the pacer never waited on the drain arm — either it does not wait, \
+                 or the ballast did not outrun the host and the bound was not exercised (raise \
+                 PACER_BALLAST)"
             );
         }
         let (out, _) = run(&device, &Arm::RingPoll, &[0], &opts)?;

@@ -1562,6 +1562,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
                         stats.max_steps_per_buffer = stats.max_steps_per_buffer.max(steps_open);
                         pacer.push(m, steps_open);
                         steps_open = 0;
+                        // The reader streams; the ids the sequence keeps are
+                        // taken off the ring here, so a run longer than the
+                        // ring does not lap it. Never waits (§11.5z-x).
+                        readback.take_ids_into(&mut all_ids)?;
                     }
                 } else if pace {
                     pacer.after_forward(&device)?;
@@ -1653,6 +1657,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
             // (its ids are host-side per step; nothing to defer). `reader_owned`
             // is hoisted above the loop.
             let stream_now = !reader_owned && if loop_commits { committed_now } else { true };
+            if reader_owned && committed_now {
+                readback.take_ids_into(&mut all_ids)?;
+            }
             if stream_now {
                 let batch = readback.take_ids()?;
                 if !batch.is_empty() {
@@ -1722,29 +1729,26 @@ impl<'m, M: CausalLM> Session<'m, M> {
         // whole as before.
         let tail_start = std::time::Instant::now();
         if reader_owned {
-            // The reader streamed every token off the device ring already, and
-            // the loop drained nothing, so `all_ids` is empty. Materialise the
-            // host id vec ONCE here: `drain_all` synchronises and reads the whole
-            // published range — `produced` good ids plus, on the poll arm, the
-            // trailing EOS token (published before the loop broke) and, on a
-            // deferred arm, any overrun. `produced` is the per-step count with
-            // EOS already excluded, so the first `produced` ids are exactly the
-            // good sequence, in order — trim to it. No `on_tokens` (the reader is
-            // the stream). The count/EOS are authoritative from the loop.
-            all_ids = readback.drain_all()?;
+            // The reader streamed every token off the device ring already; the
+            // loop kept the ids at each buffer it closed. The rest come here,
+            // once: `drain_all` synchronises and reads the remaining published
+            // range — on the poll arm the trailing EOS token (published before
+            // the loop broke), on a deferred arm any overrun. `produced` is the
+            // per-step count with a retracted EOS excluded, so the first
+            // `produced` ids are the sequence, in order. No `on_tokens`: the
+            // reader is the stream.
+            all_ids.extend(readback.drain_all()?);
             all_ids.truncate(produced);
-            // The reader stopped the run at an EOS it saw — or `max_tokens`
-            // arrived first, with the EOS inside the last window: the ids past
-            // it are the overrun (forwards already queued), reconciled below
-            // from the cache position as on every deferred arm. Scanned on
-            // every adaptive run, not only the flag-stopped ones.
-            if opts.adaptive_commit {
-                if let Some(k) = readback.eos_in_drained(&all_ids) {
-                    readback.note_eos_truncation(all_ids.len() - k - 1);
-                    all_ids.truncate(k);
-                    produced = all_ids.len();
-                    eos = true;
-                }
+            // An arm that learns EOS late has it in the ids: the reader stopped
+            // the run at an EOS it saw, or `max_tokens` arrived first with the
+            // EOS inside the last window. The ids past it are the overrun,
+            // reconciled below from the cache position. Scanned on every
+            // reader-owned run; the arms that retract per step find none.
+            if let Some(k) = readback.eos_in_drained(&all_ids) {
+                readback.note_eos_truncation(all_ids.len() - k - 1);
+                all_ids.truncate(k);
+                produced = all_ids.len();
+                eos = true;
             }
         } else {
             // After the clock: EVERY id not yet drained — `drain_all`, not the

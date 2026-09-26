@@ -190,6 +190,15 @@ pub trait ReadbackStrategy {
     /// blocking arm every fed id is already visible, so it returns them all.
     fn take_ids(&mut self) -> Result<Vec<u32>>;
 
+    /// [`Self::take_ids`], appended to `out` — for a loop keeping the ids a
+    /// sequence owns while a reader streams them, at no allocation a step. The
+    /// default goes through `take_ids`; the ring reads through its mapped
+    /// window into a buffer it keeps.
+    fn take_ids_into(&mut self, out: &mut Vec<u32>) -> Result<()> {
+        out.extend(self.take_ids()?);
+        Ok(())
+    }
+
     /// EVERY id not yet drained, waiting for the GPU if it must — the final drain
     /// after the loop, where the contract is completeness rather than
     /// non-blocking. On the ring arms this synchronises up to the last fed slot
@@ -1341,6 +1350,8 @@ pub struct Ring {
     eos_index_hits: std::cell::Cell<u64>,
     eos_index_late: std::cell::Cell<u64>,
     counters: ReadbackCounters,
+    /// [`ReadbackStrategy::take_ids_into`]'s window, reused across calls.
+    scratch: Vec<u32>,
 }
 
 /// Iterations before the non-blocking poll takes the blocking read instead.
@@ -1528,6 +1539,7 @@ impl Ring {
             live_every: WAKE_LIVE_EVERY_DEFAULT,
             commits_since_live: std::cell::Cell::new(0),
             counters: ReadbackCounters::default(),
+            scratch: Vec::new(),
         })
     }
 
@@ -1906,59 +1918,17 @@ impl ReadbackStrategy for Ring {
     }
 
     fn take_ids(&mut self) -> Result<Vec<u32>> {
-        if self.history.undrained() == 0 {
-            return Ok(Vec::new());
-        }
-
-        // How far it is SAFE to drain (real-token index). On the stamped (poll)
-        // arm the loop may be ahead of the GPU (the lookahead), so `fed` counts
-        // slots the host *enqueued* — not all written yet. The published
-        // generation is the visibility signal (`sample_and_feed` writes the slot
-        // BEFORE the stamp): `g` means real tokens `[0..g]` are written, so
-        // draining past it reads an unwritten slot (§3.5). Clamp to it. The
-        // blocking arm's own per-step `to_vec1` already synchronised up to `fed`.
-        let fed = self.history.generation();
-        self.drain_start = self.history.drained;
-        let end = match self.eos {
-            EosRead::Poll(_)
-            | EosRead::HostOnDrain
-            | EosRead::GpuBatched
-            | EosRead::GpuBatchedNonblocking => {
-                match self.ring.published_generation() {
-                    Some(g) => fed.min(g as usize),
-                    // No visibility signal (the counter is not CPU-mapped): wait
-                    // for the GPU, after which everything fed is written and the
-                    // window can be read to `fed`. The honest degradation — a
-                    // drain that could not otherwise ever see the EOS.
-                    None => {
-                        self.ring.input_device().device().synchronize()?;
-                        fed
-                    }
-                }
-            }
-            EosRead::Blocking => fed,
-        };
-
-        // One sized allocation for the output (old-path parity — the flat ring
-        // alloc'd a `Vec` per call too); the per-commit `bases` `Vec` the first
-        // cut allocated is GONE (the mapped read memoizes the base pointers). So
-        // the hot drain is lock-free (`peek_scalar_ptr` does not lock, resolved
-        // once) with a single sized alloc, no growth-reallocs.
         let mut out = Vec::with_capacity(self.history.undrained());
-
-        // Fast path: read straight from the segments' memoized mapped pointers —
-        // no copy, no blit, no `waitUntilCompleted` (§15.2 #12), no lock. Returns
-        // false only if a segment is unmapped, then the copy fallback runs.
-        #[cfg(feature = "metal")]
-        if self.history.drain_mapped(end, &mut out) {
-            return Ok(out);
-        }
-        #[cfg(not(feature = "metal"))]
-        let _ = end;
-
-        // Copy fallback (unmapped): drains to `fed`, synchronising.
-        self.history.drain_copy(fed, &mut out)?;
+        self.drain_window(&mut out)?;
         Ok(out)
+    }
+
+    fn take_ids_into(&mut self, out: &mut Vec<u32>) -> Result<()> {
+        let mut window = std::mem::take(&mut self.scratch);
+        self.drain_window(&mut window)?;
+        out.extend_from_slice(&window);
+        self.scratch = window;
+        Ok(())
     }
 
     fn drain_all(&mut self) -> Result<Vec<u32>> {
@@ -2093,6 +2063,43 @@ impl ReadbackStrategy for Ring {
 }
 
 impl Ring {
+    /// The published window `[drained, min(fed, published))` into `out`
+    /// (cleared first), advancing the drain — the non-blocking incremental
+    /// drain behind [`ReadbackStrategy::take_ids`]. On the stamped arms the
+    /// loop may be ahead of the GPU, so the window is clamped to the generation
+    /// the GPU has published: the slot is written before the stamp, and a read
+    /// past it would read a slot not yet written (§3.5). With no mapped
+    /// counter to clamp to it waits for the GPU instead. The mapped window read
+    /// takes no lock and makes no copy; the copy fallback synchronises.
+    fn drain_window(&mut self, out: &mut Vec<u32>) -> Result<()> {
+        out.clear();
+        if self.history.undrained() == 0 {
+            return Ok(());
+        }
+        let fed = self.history.generation();
+        self.drain_start = self.history.drained;
+        let end = match self.eos {
+            EosRead::Poll(_)
+            | EosRead::HostOnDrain
+            | EosRead::GpuBatched
+            | EosRead::GpuBatchedNonblocking => match self.ring.published_generation() {
+                Some(g) => fed.min(g as usize),
+                None => {
+                    self.ring.input_device().device().synchronize()?;
+                    fed
+                }
+            },
+            EosRead::Blocking => fed,
+        };
+        #[cfg(feature = "metal")]
+        if self.history.drain_mapped(end, out) {
+            return Ok(());
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = end;
+        self.history.drain_copy(fed, out)
+    }
+
     /// [`EosRead::GpuBatchedNonblocking`]: enqueue the `eos_index` over the
     /// undrained window and stage its `[1]` result behind the window's own
     /// command buffer; keep it beside the previous window's. Nothing to stage

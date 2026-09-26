@@ -9626,7 +9626,9 @@ fn eos_index_mutation_a_broken_min_would_fail() {
 // RMSNorm over a strided source, RMSNorm + RoPE in one dispatch, and the
 // strided-to-strided copy (`DESIGN.md` §12.2p). Each is checked against the
 // kernels it replaces, bit for bit, and each carries a control that proves
-// the new binding is read (`CONTRIBUTING.md` §3.1a, §3.1b).
+// the new binding is read (`CONTRIBUTING.md` §3.1a, §3.1b). The norms also
+// meet an f64 reference, because the kernels they replace share their
+// reduction and cannot see a defect in it.
 ///////////////////////////////////////////////////////////////////////////////
 
 /// A `[b, t, h, d]` contiguous buffer, and the `[b, h, t, d]` view of it a
@@ -9723,6 +9725,89 @@ fn count_bits_differ<T: BitEq>(a: &[T], b: &[T]) -> usize {
         .count()
 }
 
+/// A kernel dtype read back as f64, with the relative error one store in it
+/// may carry: two units of roundoff at f16, and at f32 enough headroom for
+/// the f32 reduction and `rsqrt` ahead of the store.
+trait ToF64: Copy {
+    const TOL: f64;
+    fn to_f64(self) -> f64;
+}
+impl ToF64 for f16 {
+    const TOL: f64 = 1.0 / 1024.0;
+    fn to_f64(self) -> f64 {
+        f16::to_f64(self)
+    }
+}
+impl ToF64 for f32 {
+    const TOL: f64 = 1.0 / 262_144.0;
+    fn to_f64(self) -> f64 {
+        self as f64
+    }
+}
+
+/// RMSNorm of each `d`-wide row of `rows`, in f64.
+fn host_rms_norm<T: ToF64>(rows: &[T], alpha: &[T], d: usize, eps: f64) -> Vec<f64> {
+    rows.chunks(d)
+        .flat_map(|row| {
+            let ms = row.iter().map(|v| v.to_f64().powi(2)).sum::<f64>() / d as f64;
+            let total = 1.0 / (ms + eps).sqrt();
+            row.iter()
+                .zip(alpha)
+                .map(move |(v, a)| v.to_f64() * total * a.to_f64())
+        })
+        .collect()
+}
+
+/// `rope`'s rotation of `[rows, d]` normalised values, in f64: row `r` sits
+/// at position `r % t` and pairs `(i, i + d/2)` against `[t, d/2]` tables.
+/// Returns the rotated values and, per element, `|a·c| + |b·s|` -- the
+/// magnitude the rotation's roundings scale with.
+fn host_rope<T: ToF64>(
+    normed: &[f64],
+    cos: &[T],
+    sin: &[T],
+    t: usize,
+    d: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let half = d / 2;
+    let mut out = vec![0.0; normed.len()];
+    let mut scale = vec![0.0; normed.len()];
+    for (r, row) in normed.chunks(d).enumerate() {
+        for i in 0..half {
+            let cs = (r % t) * half + i;
+            let (c, s) = (cos[cs].to_f64(), sin[cs].to_f64());
+            let (a, b) = (row[i], row[i + half]);
+            out[r * d + i] = a * c - b * s;
+            out[r * d + i + half] = a * s + b * c;
+            scale[r * d + i] = (a * c).abs() + (b * s).abs();
+            scale[r * d + i + half] = (a * s).abs() + (b * c).abs();
+        }
+    }
+    (out, scale)
+}
+
+/// `got` within `k * T::TOL * scale[i]` of the f64 `want`, element by element.
+fn assert_near_host<T: ToF64>(what: &str, got: &[T], want: &[f64], scale: &[f64], k: f64) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let bound = |i: usize| k * T::TOL * scale[i] + 1e-6;
+    let worst = (0..got.len())
+        .map(|i| (got[i].to_f64() - want[i]).abs() / bound(i))
+        .fold(0.0, f64::max);
+    eprintln!("{what}: worst error / bound = {worst:.3}");
+    let over: Vec<usize> = (0..got.len())
+        .filter(|&i| (got[i].to_f64() - want[i]).abs() > bound(i))
+        .collect();
+    assert!(
+        over.is_empty(),
+        "{what}: {} of {} elements off the f64 reference by more than {k} x {:e} relative; \
+         first (index, got, want) {:?}",
+        over.len(),
+        got.len(),
+        T::TOL,
+        over.first().map(|&i| (i, got[i].to_f64(), want[i])),
+    );
+}
+
 fn bo(b: &Buffer) -> BufferOffset<'_> {
     BufferOffset {
         buffer: b,
@@ -9807,7 +9892,9 @@ fn rmsnorm_strided<T: Copy>(
     read_to_vec::<T>(&output, bthd.len())
 }
 
-fn rmsnorm_strided_matches_contiguous_over_a_copy_at<T: FromF32 + BitEq + std::fmt::Debug>(
+fn rmsnorm_strided_matches_contiguous_over_a_copy_at<
+    T: FromF32 + BitEq + ToF64 + std::fmt::Debug,
+>(
     contiguous: &'static str,
     strided: &'static str,
 ) {
@@ -9842,6 +9929,13 @@ fn rmsnorm_strided_matches_contiguous_over_a_copy_at<T: FromF32 + BitEq + std::f
         ParamStyle::Split,
     );
     assert_bits_equal(strided, &got, &want);
+
+    // Level: `want` runs the same `rms_norm` body as `got`, so a defect in the
+    // shared reduction moves both and the match above still holds. The f64
+    // norm does not move with them.
+    let host = host_rms_norm(&g.transpose_host(&bthd), &alpha, g.d, 1e-5);
+    let scale: Vec<f64> = host.iter().map(|v| v.abs()).collect();
+    assert_near_host(strided, &got, &host, &scale, 1.0);
 
     // Control: the strides are read. Swapping the `h` and `t` strides presents
     // the untransposed rows, which normalise to different values.
@@ -9992,7 +10086,7 @@ fn rmsnorm_rope<T: Copy>(
     read_to_vec::<T>(&output, src.len())
 }
 
-fn rmsnorm_rope_matches_the_pair_at<T: FromF32 + BitEq + std::fmt::Debug>(
+fn rmsnorm_rope_matches_the_pair_at<T: FromF32 + BitEq + ToF64 + std::fmt::Debug>(
     norm: &'static str,
     rope: &'static str,
     fused: &'static str,
@@ -10046,6 +10140,14 @@ fn rmsnorm_rope_matches_the_pair_at<T: FromF32 + BitEq + std::fmt::Debug>(
         ParamStyle::Split,
     );
     assert_bits_equal(fused_strided, &got_strided, &want);
+
+    // Level: the pair shares the fused kernel's reduction, so the matches
+    // above cannot see a defect in it; the f64 norm + rotation can. Each
+    // element carries the roundings of its two normalised inputs, the
+    // product with `s` and the store.
+    let normed = host_rms_norm(&bhtd, &alpha, g.d, 1e-5);
+    let (host, scale) = host_rope(&normed, &cos, &sin, g.t, g.d);
+    assert_near_host(fused, &got_contig, &host, &scale, 2.0);
 
     // Controls: the rotation is applied (the fused output is not the bare
     // norm), and the position is read (a table shifted by one row moves it).
@@ -10179,7 +10281,8 @@ fn packed_matches_split_for_rmsnorm_rope_f16() {
 
 /// `copy_nd`: a `[b, h, t, d]` transposed view written into a `[b, h, T, d]`
 /// slab at rows `off..off + t` -- the KV append from the projection's own
-/// layout -- against the same write computed on the host.
+/// layout -- against the same write computed on the host, in both binding
+/// styles.
 #[test]
 fn copy_nd_writes_a_transposed_view_into_a_strided_window() {
     let device = device();
@@ -10214,42 +10317,47 @@ fn copy_nd_writes_a_transposed_view_into_a_strided_window() {
         }
     }
 
-    let commands = commands(&device);
-    let encoder = commands.command_encoder().unwrap();
-    let input = new_buffer(&device, &src);
-    let output = new_buffer(&device, &fill);
-    call_copy_nd(
-        &device,
-        &encoder,
-        &kernels,
-        copy_nd::HALF,
-        &shape,
-        BufferOffset {
-            buffer: &input,
-            offset_in_bytes: 0,
-        },
-        &src_strides,
-        BufferOffset {
-            buffer: &output,
-            offset_in_bytes: off * g.d * 2,
-        },
-        &dst_strides,
-    )
-    .unwrap();
-    drop(encoder);
-    commands.wait_until_completed().unwrap();
-    let got = read_to_vec::<f16>(&output, slab_len);
-    assert_bits_equal("copy_nd_f16", &got, &want);
-    // The window is what moved: exactly `numel` slab elements left the fill.
-    let written = got
-        .iter()
-        .filter(|v| v.to_bits() != f16::from_f32(-9.0).to_bits())
-        .count();
-    assert_eq!(
-        written,
-        g.numel(),
-        "copy_nd wrote outside its window or missed part of it"
-    );
+    // Both binding styles against the host write: the packed form has its own
+    // entry point, and nothing else in the tree dispatches it under test.
+    for style in [ParamStyle::Split, ParamStyle::Packed] {
+        let commands = commands(&device);
+        let encoder = commands.command_encoder().unwrap();
+        let input = new_buffer(&device, &src);
+        let output = new_buffer(&device, &fill);
+        call_copy_nd_with(
+            &device,
+            &encoder,
+            &kernels,
+            copy_nd::HALF,
+            &shape,
+            BufferOffset {
+                buffer: &input,
+                offset_in_bytes: 0,
+            },
+            &src_strides,
+            BufferOffset {
+                buffer: &output,
+                offset_in_bytes: off * g.d * 2,
+            },
+            &dst_strides,
+            style,
+        )
+        .unwrap();
+        drop(encoder);
+        commands.wait_until_completed().unwrap();
+        let got = read_to_vec::<f16>(&output, slab_len);
+        assert_bits_equal(&format!("copy_nd_f16 {style:?}"), &got, &want);
+        // The window is what moved: exactly `numel` slab elements left the fill.
+        let written = got
+            .iter()
+            .filter(|v| v.to_bits() != f16::from_f32(-9.0).to_bits())
+            .count();
+        assert_eq!(
+            written,
+            g.numel(),
+            "copy_nd_f16 {style:?} wrote outside its window or missed part of it"
+        );
+    }
 }
 
 /// The host oracle that fixed the fused rotation's rounding (`DESIGN.md`

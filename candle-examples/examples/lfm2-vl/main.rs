@@ -2,11 +2,11 @@
 //!
 //! Harness for lloom issue #597. Two modes, and they answer different questions:
 //!
-//! - **`--gate`** — encode a fixed synthetic input through the vision tower and
-//!   the projector and compare against a committed golden produced by
-//!   `transformers`' own `Lfm2VlModel`. This is the **numeric** check: it needs
-//!   no image file, no resampler and no language model, so a failure is the
-//!   tower or the projector and nothing else.
+//! - **`--gate`** — compare the host preprocessing (from the committed PNGs),
+//!   the patch embedding, the position-resampled embeddings, the tower and the
+//!   projector, stage by stage, against a committed golden produced by
+//!   `transformers`' own `Lfm2VlModel`. This is the **numeric** check. It loads
+//!   no language model, so a failure is the vision path and nothing else.
 //! - **default** — run a real image plus a prompt through the whole path and
 //!   print what the model says. This is the **product** check, and on its own it
 //!   proves nothing (see below).
@@ -32,18 +32,35 @@
 //! embeddings before the prefill. Every subsequent decode step attends to those
 //! positions for free because they are in the KV cache, exactly like text.
 //! There is no per-token re-encode and there is no vision dispatch in the decode
-//! loop — `--census` prints the tower's invocation count to show it.
+//! loop.
+//!
+//! `--census` checks both halves of that from the backend rather than from this
+//! file's own bookkeeping:
+//!
+//! - **the load census** wraps the checkpoint in a recording backend and names
+//!   the tensors each constructor actually loads. The language model must load
+//!   exactly the header's `model.language_model.*` set and the vision encoder
+//!   exactly `model.vision_tower.*` + `model.multi_modal_projector.*`, with no
+//!   overlap — so a text-only process holds none of the tower (`DESIGN.md`
+//!   §5.5a). The pool gauge is read after each constructor as the reading from
+//!   outside the allocator.
+//! - **the dispatch census** reads the Metal recorder (`CANDLE_METAL_PROFILE`)
+//!   over three windows per request: the image encode, the prefill, and the
+//!   decode steps. The kernels the encode dispatches and the prefill does not
+//!   are the tower's signature; the decode window must contain none of them.
 
 use anyhow::{Context, Result};
 use candle::{DType, Device, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use lloom::nn::VarBuilder;
+use clap::Parser;
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::lfm2::{Cache, Model};
-use lloom::models::lfm2_vl::{
-    merge_image_features, ImageProcessor, Lfm2VlConfig, VisionEncoder,
-};
-use clap::Parser;
+use lloom::models::lfm2_vl::{merge_image_features, ImageProcessor, Lfm2VlConfig, VisionEncoder};
+use lloom::nn::var_builder::SimpleBackend;
+use lloom::nn::VarBuilder;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(about = "LFM2-VL image input, and the pelican test (lloom #597)")]
@@ -87,9 +104,257 @@ struct Args {
     #[arg(long)]
     dtype: Option<String>,
 
-    /// Print how many times the vision tower ran, against the token count.
+    /// Take the load census and the dispatch census (module docs) and fail if
+    /// the language model loads any vision tensor or a decode step dispatches
+    /// any of the tower's kernels. Metal only.
     #[arg(long)]
     census: bool,
+}
+
+/// The Metal dispatch recorder, with a stand-in off Metal so the call sites
+/// stay unconditional.
+#[cfg(feature = "metal")]
+mod profile {
+    pub use candle::metal_backend::profile::{enabled, reset, snapshot};
+}
+
+#[cfg(not(feature = "metal"))]
+mod profile {
+    #[derive(Clone, Debug, Default)]
+    pub struct Snapshot {
+        pub dispatches: u64,
+        pub by_label: Vec<(String, u64)>,
+    }
+    pub fn enabled() -> bool {
+        false
+    }
+    pub fn reset() {}
+    pub fn snapshot() -> Snapshot {
+        Snapshot::default()
+    }
+}
+
+/// Dispatches recorded over one window, per pipeline label.
+#[derive(Debug, Default, Clone)]
+struct Window {
+    dispatches: u64,
+    labels: BTreeMap<String, u64>,
+}
+
+/// Close the current recorder window and open the next one. Synchronizes
+/// first, as `profile::reset` requires.
+fn take_window(device: &Device) -> Result<Window> {
+    device.synchronize()?;
+    let s = profile::snapshot();
+    profile::reset();
+    Ok(Window {
+        dispatches: s.dispatches,
+        labels: s.by_label.into_iter().collect(),
+    })
+}
+
+/// The three windows of one image request.
+#[derive(Debug, Clone)]
+struct DispatchCensus {
+    encode: Window,
+    prefill: Window,
+    decode: Window,
+}
+
+impl DispatchCensus {
+    /// Labels the encode dispatched and the prefill did not: the kernels only
+    /// the vision path uses.
+    fn tower_signature(&self) -> BTreeMap<String, u64> {
+        self.encode
+            .labels
+            .iter()
+            .filter(|(l, _)| !self.prefill.labels.contains_key(*l))
+            .map(|(l, n)| (l.clone(), *n))
+            .collect()
+    }
+}
+
+/// A checkpoint backend that records which tensors are loaded through it.
+///
+/// Loading is a lookup by name (`DESIGN.md` §5.5a), so the set of names a
+/// constructor asks for is exactly the set of tensors that become device
+/// buffers. One flag per header entry, set on load; no lock on the path.
+struct Recording {
+    inner: candle::safetensors::MmapedSafetensors,
+    index: HashMap<String, usize>,
+    loaded: Arc<[AtomicBool]>,
+}
+
+impl Recording {
+    /// The backend, and the flags it sets — kept by the caller, since the
+    /// backend itself moves into the `VarBuilder`.
+    fn new(files: &[std::path::PathBuf], names: &[String]) -> Result<(Self, Arc<[AtomicBool]>)> {
+        // SAFETY: the checkpoint files are not modified while mapped; this is
+        // the same contract `VarBuilder::from_mmaped_safetensors` relies on.
+        let inner = unsafe { candle::safetensors::MmapedSafetensors::multi(files)? };
+        let index = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        let loaded: Arc<[AtomicBool]> = names.iter().map(|_| AtomicBool::new(false)).collect();
+        let flags = Arc::clone(&loaded);
+        Ok((
+            Self {
+                inner,
+                index,
+                loaded,
+            },
+            flags,
+        ))
+    }
+
+    fn mark(&self, name: &str) {
+        if let Some(&i) = self.index.get(name) {
+            self.loaded[i].store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+fn loaded_names(names: &[String], flags: &[AtomicBool]) -> BTreeSet<String> {
+    names
+        .iter()
+        .zip(flags.iter())
+        .filter(|(_, f)| f.load(Ordering::Relaxed))
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+impl SimpleBackend for Recording {
+    fn get(
+        &self,
+        s: candle::Shape,
+        name: &str,
+        h: lloom::nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle::Result<Tensor> {
+        self.mark(name);
+        SimpleBackend::get(&self.inner, s, name, h, dtype, dev)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle::Result<Tensor> {
+        self.mark(name);
+        SimpleBackend::get_unchecked(&self.inner, name, dtype, dev)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        SimpleBackend::contains_tensor(&self.inner, name)
+    }
+}
+
+/// Every tensor in the header, with its size in bytes on disk.
+fn header_sizes(files: &[std::path::PathBuf]) -> Result<BTreeMap<String, usize>> {
+    // SAFETY: as in `Recording::new`.
+    let st = unsafe { candle::safetensors::MmapedSafetensors::multi(files)? };
+    Ok(st
+        .tensors()
+        .into_iter()
+        .map(|(n, v)| (n, v.data().len()))
+        .collect())
+}
+
+/// Which tensors each constructor loaded, checked against the header's own
+/// prefix groups: the absolute reference, not a count carried over from a
+/// document.
+fn load_census(
+    header: &BTreeMap<String, usize>,
+    language: &BTreeSet<String>,
+    vision: &BTreeSet<String>,
+) -> Result<()> {
+    let bytes = |set: &BTreeSet<String>| -> usize { set.iter().map(|n| header[n]).sum() };
+    let want_language: BTreeSet<String> = header
+        .keys()
+        .filter(|n| n.starts_with("model.language_model."))
+        .cloned()
+        .collect();
+    let want_vision: BTreeSet<String> = header
+        .keys()
+        .filter(|n| {
+            n.starts_with("model.vision_tower.") || n.starts_with("model.multi_modal_projector.")
+        })
+        .cloned()
+        .collect();
+    let overlap = language.intersection(vision).count();
+    let union = language.union(vision).count();
+    println!(
+        "load census: header {} tensors, {} B",
+        header.len(),
+        header.values().sum::<usize>()
+    );
+    println!(
+        "  language model   loaded {:>4} tensors {:>13} B   header model.language_model.* {:>4}",
+        language.len(),
+        bytes(language),
+        want_language.len()
+    );
+    println!(
+        "  vision encoder   loaded {:>4} tensors {:>13} B   header vision_tower.* + multi_modal_projector.* {:>4}",
+        vision.len(),
+        bytes(vision),
+        want_vision.len()
+    );
+    for prefix in ["model.vision_tower.", "model.multi_modal_projector."] {
+        let part: BTreeSet<String> = vision
+            .iter()
+            .filter(|n| n.starts_with(prefix))
+            .cloned()
+            .collect();
+        println!(
+            "    of which {prefix:<30} {:>4} tensors {:>13} B",
+            part.len(),
+            bytes(&part)
+        );
+    }
+    println!("  overlap {overlap}, union {union} of {}", header.len());
+    anyhow::ensure!(
+        *language == want_language,
+        "the language model loaded {} tensors, the header's language group has {}: \
+         missing {:?}, extra {:?}",
+        language.len(),
+        want_language.len(),
+        want_language
+            .difference(language)
+            .take(5)
+            .collect::<Vec<_>>(),
+        language
+            .difference(&want_language)
+            .take(5)
+            .collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        *vision == want_vision,
+        "the vision encoder loaded {} tensors, the header's vision group has {}: \
+         missing {:?}, extra {:?}",
+        vision.len(),
+        want_vision.len(),
+        want_vision.difference(vision).take(5).collect::<Vec<_>>(),
+        vision.difference(&want_vision).take(5).collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        overlap == 0,
+        "{overlap} tensors are loaded by both constructors"
+    );
+    anyhow::ensure!(
+        union == header.len(),
+        "{} header tensors are loaded by neither constructor",
+        header.len() - union
+    );
+    println!(
+        "load census: PASS (text-only loads no vision tensor; the two sets partition the header)"
+    );
+    Ok(())
+}
+
+/// The pool's live bytes, synchronized so released temporaries have settled.
+fn pool_live(device: &Device) -> Result<u64> {
+    device.synchronize()?;
+    Ok(lloom::nn::memory::MemSnapshot::read(device).pool_live)
 }
 
 /// Load one f32 tensor written by `make_golden.py`.
@@ -480,6 +745,7 @@ struct Run {
     text: String,
     tokens: usize,
     hit_eos: bool,
+    census: Option<DispatchCensus>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -501,6 +767,13 @@ fn generate_with_image(
     let (rgb, rows, cols) = load_and_resize(image_path, &proc)?;
     let processed = proc.patchify_rgb8(&rgb, rows, cols, device, dtype)?;
 
+    // The dispatch census's first window starts here: everything recorded
+    // before it (weight loads, the previous request) is discarded.
+    let census = profile::enabled();
+    if census {
+        take_window(device)?;
+    }
+
     // ONE call, before the prefill. Everything after this attends to the result
     // through the KV cache.
     let features = encoder
@@ -508,6 +781,11 @@ fn generate_with_image(
         .context("encoding the image")?;
     *vision_runs += 1;
     let n_image_tokens = features.dim(0)?;
+    let encode_window = if census {
+        Some(take_window(device)?)
+    } else {
+        None
+    };
 
     // The prompt reserves exactly as many `image_token_id` positions as the
     // encoder produced rows. `merge_image_features` refuses if they disagree,
@@ -556,6 +834,11 @@ fn generate_with_image(
         .context("prefill")?
         .squeeze(0)?;
     kv_len += ids.len();
+    let prefill_window = if census {
+        Some(take_window(device)?)
+    } else {
+        None
+    };
 
     let mut generated: Vec<u32> = Vec::with_capacity(args.max_tokens);
     let mut hit_eos = false;
@@ -575,6 +858,14 @@ fn generate_with_image(
             .squeeze(0)?;
         kv_len += 1;
     }
+    let census = match (encode_window, prefill_window) {
+        (Some(encode), Some(prefill)) => Some(DispatchCensus {
+            encode,
+            prefill,
+            decode: take_window(device)?,
+        }),
+        _ => None,
+    };
 
     let text = tokenizer
         .decode(&generated, true)
@@ -586,7 +877,68 @@ fn generate_with_image(
         text,
         tokens: generated.len(),
         hit_eos,
+        census,
     })
+}
+
+/// The dispatch-census verdict for one request (module docs).
+fn check_dispatch_census(run: &Run) -> Result<()> {
+    let c = run
+        .census
+        .as_ref()
+        .context("no dispatch census was recorded — is CANDLE_METAL_PROFILE on a Metal build?")?;
+    let signature = c.tower_signature();
+    let leaked: BTreeMap<&String, &u64> = c
+        .decode
+        .labels
+        .iter()
+        .filter(|(l, _)| signature.contains_key(*l))
+        .collect();
+    let fmt = |m: &BTreeMap<String, u64>| -> String {
+        m.iter()
+            .map(|(l, n)| format!("{l}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    println!(
+        "dispatch census [{}]: encode {} dispatches ({} labels), prefill {} ({} labels), \
+         decode {} over {} steps ({} labels)",
+        run.label,
+        c.encode.dispatches,
+        c.encode.labels.len(),
+        c.prefill.dispatches,
+        c.prefill.labels.len(),
+        c.decode.dispatches,
+        run.tokens,
+        c.decode.labels.len()
+    );
+    println!(
+        "  tower signature (in encode, not in prefill): {} labels, {} dispatches: {}",
+        signature.len(),
+        signature.values().sum::<u64>(),
+        fmt(&signature)
+    );
+    println!("  decode labels: {}", fmt(&c.decode.labels));
+    // Positive control: a signature that is empty would make the check below
+    // pass on anything.
+    anyhow::ensure!(
+        !signature.is_empty(),
+        "[{}] the encode dispatched no kernel the prefill did not, so this census \
+         cannot tell the tower from the language model",
+        run.label
+    );
+    anyhow::ensure!(
+        leaked.is_empty(),
+        "[{}] the decode window dispatched tower kernels {:?} — the image is being \
+         re-encoded per token",
+        run.label,
+        leaked
+    );
+    println!(
+        "  decode window carries none of the tower signature: encode-once holds [{}]",
+        run.label
+    );
+    Ok(())
 }
 
 /// Pull the first `<svg>…</svg>` out of a response, if there is one.
@@ -598,6 +950,12 @@ fn extract_svg(text: &str) -> Option<String> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // The recorder reads its switch once, on first use, so it is set before
+    // the device exists.
+    if args.census {
+        std::env::set_var("CANDLE_METAL_PROFILE", "1");
+    }
 
     let device = if args.cpu {
         Device::Cpu
@@ -647,21 +1005,65 @@ fn main() -> Result<()> {
         "this checkpoint is not a VL checkpoint — no `model.language_model.*` tensors"
     );
 
-    let vb_raw = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
-    // Two views of one mmap. The language model wants `model.*` rewritten to
-    // `model.language_model.*`; the vision tower wants the checkpoint's names
-    // untouched, because `model.vision_tower.*` would otherwise be rewritten to
-    // `model.language_model.vision_tower.*` and fail to load.
-    let vb_lang = vb_raw
+    // Under `--census` each constructor gets its own recording backend, so the
+    // two load sets are observed separately rather than inferred.
+    let header = header_sizes(&files)?;
+    let header_names: Vec<String> = header.keys().cloned().collect();
+    let (vb_raw_lang, vb_raw_vision, flags) = if args.census {
+        anyhow::ensure!(
+            matches!(device, Device::Metal(_)),
+            "--census reads the Metal recorder and the Metal pool; run it on Metal"
+        );
+        let (lang, lang_flags) = Recording::new(&files, &header_names)?;
+        let (vision, vision_flags) = Recording::new(&files, &header_names)?;
+        (
+            VarBuilder::from_backend(Box::new(lang), dtype, device.clone()),
+            VarBuilder::from_backend(Box::new(vision), dtype, device.clone()),
+            Some((lang_flags, vision_flags)),
+        )
+    } else {
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
+        (vb.clone(), vb, None)
+    };
+    // Two views of the checkpoint. The language model wants `model.*`
+    // rewritten to `model.language_model.*`; the vision tower wants the
+    // checkpoint's names untouched, because `model.vision_tower.*` would
+    // otherwise be rewritten to `model.language_model.vision_tower.*` and fail
+    // to load.
+    let vb_lang = vb_raw_lang
         .clone()
         .rename_f(|name: &str| match name.strip_prefix("model.") {
             Some(rest) => format!("model.language_model.{rest}"),
             None => name.to_string(),
         });
 
+    let live_before = pool_live(&device)?;
     let model = Model::new(&config, vb_lang).context("constructing the LFM2 language model")?;
-    let encoder = VisionEncoder::new(&vl_cfg, config.hidden_size, vb_raw)
+    let live_text = pool_live(&device)?;
+    let encoder = VisionEncoder::new(&vl_cfg, config.hidden_size, vb_raw_vision)
         .context("constructing the vision tower + projector")?;
+    let live_vision = pool_live(&device)?;
+
+    if let Some((lang_flags, vision_flags)) = &flags {
+        let language = loaded_names(&header_names, lang_flags);
+        let vision = loaded_names(&header_names, vision_flags);
+        load_census(&header, &language, &vision)?;
+        let gb = |b: u64| b as f64 / 1e9;
+        let language_bytes: usize = language.iter().map(|n| header[n]).sum();
+        let vision_bytes: usize = vision.iter().map(|n| header[n]).sum();
+        println!(
+            "pool_live: before load {:.4} GB, after the language model {:.4} GB \
+             (+{:.4}; its tensors are {:.4} GB), after the vision encoder {:.4} GB \
+             (+{:.4}; its tensors are {:.4} GB)",
+            gb(live_before),
+            gb(live_text),
+            gb(live_text.saturating_sub(live_before)),
+            language_bytes as f64 / 1e9,
+            gb(live_vision),
+            gb(live_vision.saturating_sub(live_text)),
+            vision_bytes as f64 / 1e9,
+        );
+    }
 
     let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
     if let Some(im_end) = tokenizer.token_to_id("<|im_end|>") {
@@ -674,6 +1076,8 @@ fn main() -> Result<()> {
 
     let out_dir = std::path::PathBuf::from(&args.out_dir);
     std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    // The exact prompt, beside the responses it produced.
+    std::fs::write(out_dir.join("prompt.txt"), &args.prompt)?;
 
     let mut vision_runs = 0usize;
     let mut runs = Vec::new();
@@ -735,18 +1139,16 @@ fn main() -> Result<()> {
 
     if args.census {
         let total_tokens: usize = runs.iter().map(|r| r.tokens).sum();
+        // This count is kept beside the call it counts, so it can only report
+        // what this file believes; the dispatch census below is the check.
         println!(
-            "census: vision tower ran {vision_runs} time(s) for {} request(s) and \
-             {total_tokens} decoded token(s)",
+            "census: this harness called the encoder {vision_runs} time(s) for {} \
+             request(s) and {total_tokens} decoded token(s)",
             runs.len()
         );
-        anyhow::ensure!(
-            vision_runs == runs.len(),
-            "the vision tower ran {vision_runs} times for {} requests — it must run \
-             ONCE per request, not once per token",
-            runs.len()
-        );
-        println!("census: encode-once holds (one tower invocation per request)");
+        for run in &runs {
+            check_dispatch_census(run)?;
+        }
     }
 
     // The verdict, and it is the whole reason the control exists. §2.4e measures

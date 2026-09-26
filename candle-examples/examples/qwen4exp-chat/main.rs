@@ -881,6 +881,54 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
                 pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
             );
         }
+        // `--mtp` with `--rows N`: the same prompts through the speculative
+        // batched loop (`Session::decode_spec_batched`: the MTP drafter per
+        // row, the rows' verifies `Probes::verify_rows_enqueue`). Every row's
+        // stream must be its greedy row's; the rate beside the greedy one.
+        if let Some(head) = model.mtp_head() {
+            use lloom::models::qwen4exp::MtpDrafter;
+            let pools = model.spec_pools(args.rows, args.mtp_k, device);
+            let mut sessions: Vec<Session<'_, Qwen4Exp<R>>> = (0..args.rows)
+                .map(|_| {
+                    let mut cache = lloom::models::qwen4exp::Cache::in_pools(cfg, &pools)?;
+                    cache.want_nextn = true;
+                    Ok(Session::new(model, cache))
+                })
+                .collect::<Result<_>>()?;
+            let mut drafter = MtpDrafter::with_seqs(
+                head,
+                model.embed_tokens(),
+                model.lm_head(),
+                cfg,
+                device,
+                args.rows,
+            )
+            .with_k(args.mtp_k);
+            let t = std::time::Instant::now();
+            let spec = Session::decode_spec_batched(
+                &mut sessions,
+                &mut drafter,
+                &prompts,
+                &opts,
+                eos_ids,
+                device,
+                &mut |_row, _toks| Ok(()),
+            )?;
+            let spec_wall = t.elapsed();
+            let spec_generated: usize = spec.iter().map(|o| o.ids.len()).sum();
+            let same: Vec<bool> = spec.iter().zip(&outs).map(|(a, b)| a.ids == b.ids).collect();
+            let rounds: usize = spec.iter().map(|o| o.stats.rounds.len()).sum();
+            println!(
+                "MTPROWS run={run} rows={} k={} identical_to_greedy={:?} generated={spec_generated} rounds={rounds} tokens_per_round={:.3} wall_ms={} tok_s={:.2} greedy_tok_s={:.2}",
+                args.rows,
+                drafter.k(),
+                same,
+                spec_generated as f64 / rounds.max(1) as f64,
+                spec_wall.as_millis(),
+                spec_generated as f64 / spec_wall.as_secs_f64(),
+                generated as f64 / wall.as_secs_f64(),
+            );
+        }
     }
     Ok(())
 }

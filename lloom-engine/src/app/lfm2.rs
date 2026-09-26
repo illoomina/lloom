@@ -373,6 +373,7 @@ impl Engine {
         opts.model
             .apply_axes(&mut config)
             .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
+        refuse_kv_quant_shape(&config, &device, opts.batch)?;
         // A prefill fed in more than one forward — a tile, a chunk — needs
         // the conv's left-context carry, or the conv zero-pads each piece's
         // left edge and computes something one pass does not (§13.2f
@@ -1689,6 +1690,36 @@ fn pool_spec_config(config: &mut Config, dcfg: &DSparkConfig) {
     config.tap_layers = dcfg.tap_layers();
 }
 
+/// The shapes the quantized KV arms have no path on, refused by the flags that
+/// select them, from the config the preset and the overrides resolved to: the
+/// paged pool (the model's `Cache` has no quantized arm for it) and a device
+/// other than Metal (`quantize_kv_into` and `sdpa_quant` are Metal
+/// kernels).
+fn refuse_kv_quant_shape(config: &Config, device: &Device, batch: usize) -> Result<()> {
+    if !config.kv_quant.is_on() {
+        return Ok(());
+    }
+    let arm = config.kv_quant.name().to_ascii_lowercase();
+    if config.kv_append == KvAppend::Paged {
+        anyhow::bail!(
+            "kv-quant = {arm} has no arm on the paged KV pool, which this shape selects ({}): \
+             use `--rows private` at `--batch N`, or the crown",
+            if batch > 1 {
+                "`--batch N` serves the pool rows by default"
+            } else {
+                "`--cache pool|pool-spec` or `--kv-append paged`"
+            }
+        );
+    }
+    if !device.is_metal() {
+        anyhow::bail!(
+            "kv-quant = {arm} is Metal-only (the quantized append and read are Metal kernels): \
+             drop `--cpu`, or build with the `metal` feature"
+        );
+    }
+    Ok(())
+}
+
 fn crown_config(config: &mut Config) {
     // The fused q/k/v layout (`lfm2-chat --qkv-layout=fused`): no `.contiguous()`
     // copies of the three views at decode — the norms read the transposed view
@@ -1868,5 +1899,45 @@ impl super::served::Served for Engine {
     }
     fn shutdown(&self) {
         Engine::shutdown(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lloom::nn::ops::KvQuant;
+
+    fn config(quant: KvQuant, append: KvAppend) -> Config {
+        let mut c = Config::default();
+        c.kv_quant = quant;
+        c.kv_append = append;
+        c
+    }
+
+    #[test]
+    fn the_quantized_arms_are_refused_where_they_have_no_path() {
+        let err = refuse_kv_quant_shape(&config(KvQuant::Int8, KvAppend::Paged), &Device::Cpu, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("kv-quant = int8 has no arm on the paged KV pool"),
+            "{err}"
+        );
+        assert!(err.contains("`--rows private`"), "{err}");
+        let err = refuse_kv_quant_shape(&config(KvQuant::Int4, KvAppend::Paged), &Device::Cpu, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`--cache pool|pool-spec` or `--kv-append paged`"),
+            "{err}"
+        );
+        let err = refuse_kv_quant_shape(&config(KvQuant::Int8, KvAppend::InPlace), &Device::Cpu, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("kv-quant = int8 is Metal-only"), "{err}");
+        // The Off arm is every shape's.
+        for append in [KvAppend::Cat, KvAppend::InPlace, KvAppend::Paged] {
+            refuse_kv_quant_shape(&config(KvQuant::Off, append), &Device::Cpu, 4).unwrap();
+        }
     }
 }

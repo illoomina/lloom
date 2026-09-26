@@ -111,8 +111,9 @@ pub struct TokenRing {
     /// The per-tile token capacity (`= inputs.quantum()`). A stage wider than this
     /// is refused rather than silently truncated.
     max_width: usize,
-    /// Pre-allocated CYCLED SOURCE ring for the generation stamp — the whole of
-    /// why [`Self::publish_marker`] does no hot-path allocation.
+    /// Pre-allocated CYCLED SOURCE ring for the generation stamp off Metal — the
+    /// whole of why [`Self::publish_marker`] does no hot-path allocation there.
+    /// On Metal the stamp is a kernel writing a constant and this is not read.
     ///
     /// Writing the stamp is `step.slice_set(src)`, and `slice_set` reads `src` at
     /// GPU-EXECUTE time (not encode time). A single reused source would tear: the
@@ -364,13 +365,25 @@ impl TokenRing {
     /// a change in a number it read.
     ///
     /// **The stamp is written last, and that ordering is the protocol.** The
-    /// input slot, then the EOS flag, then the counter. A host that observes the
-    /// counter has, in source order, a written flag behind it. §9.3 records that
-    /// MSL gives no ordering guarantee for plain stores, so this rests on a
-    /// measured bound rather than on a documented one -- #535 observed 0 of 200
+    /// input slot, then the EOS flag, then the counter, which certifies the
+    /// flag ([`Self::publish_marker`]): the GPU writes the counter after the
+    /// flag. Whether the host then sees the two stores in that order is a
+    /// measured bound rather than a documented one -- §9.3, #535's 0 of 200
     /// tears with a device barrier -- and [`Self::poll_eos`] states what a
     /// caller is accepting.
     pub fn publish_step(&self, token: &Tensor, generation: Option<u32>) -> Result<()> {
+        self.publish_step_certifying(token, generation, None)
+    }
+
+    /// [`Self::publish_step`], with the stamp also certifying `slot` — a
+    /// buffer the caller wrote for this step before calling (the history slot
+    /// a drain reads up to the stamp). See [`Self::publish_marker`].
+    pub fn publish_step_certifying(
+        &self,
+        token: &Tensor,
+        generation: Option<u32>,
+        slot: Option<&Tensor>,
+    ) -> Result<()> {
         if token.dtype() != DType::U32 {
             lloom_tensor::bail!(
                 "TokenRing::publish expects the U32 argmax output, got {:?}",
@@ -411,34 +424,44 @@ impl TokenRing {
         // stamps once per commit window via [`Self::publish_marker`] instead, so
         // the per-step path writes no stamp at all.
         if let Some(g) = generation {
-            self.publish_marker(g)?;
+            match slot {
+                Some(slot) => self.publish_marker(g, &[&self.eos, slot])?,
+                None => self.publish_marker(g, &[&self.eos])?,
+            }
         }
         Ok(())
     }
 
-    /// Stamp the generation counter, LAST in queue order and WITHOUT a per-call
-    /// allocation — the completion marker the host WFE-waits on and the drain
-    /// clamps to ([`Self::published_generation`]).
+    /// Stamp the generation counter after the writes it certifies, WITHOUT a
+    /// per-call allocation — the completion marker the host WFE-waits on and
+    /// the drain clamps to ([`Self::published_generation`]).
     ///
-    /// This is the write the per-step `from_vec(vec![g])` used to fabricate a
-    /// fresh source buffer for every token. Here the source is pre-allocated: the
-    /// value stages into the current [`Self::marker_src`] tile through its mapped
-    /// pointer ([`Tensor::write_host_slice`], no alloc), and one queue-ordered
-    /// `slice_set` copies it to `step`. Cycling `depth + 1` source tiles is what
-    /// makes the host stage safe against the still-pending `slice_set` of a prior
-    /// stamp (the pacer bounds in-flight writes to `depth`) — the input ring's own
-    /// don't-overwrite-what-is-in-flight discipline (§10.3e), applied to the stamp.
+    /// `certified` (one or two tensors) are the buffers whose writes a host
+    /// that observes the counter at `>= generation` will read: the history
+    /// segment the slots went to, the EOS flag. Encoding the stamp after them
+    /// is not enough on Metal. The compute encoder is concurrent and the
+    /// command stream orders a dispatch only after the last writers of the
+    /// buffers it binds (`DESIGN.md` §6.4), so a stamp that binds only `step`
+    /// can run before the slots whenever they are written by compute kernels
+    /// (`copy2d` under a pass-plan base). There the stamp is `ring_stamp`,
+    /// which binds `certified` and writes a constant. Off Metal the queue is
+    /// in order, and the value stages into the current [`Self::marker_src`]
+    /// tile through its mapped pointer and one `slice_set` copies it to
+    /// `step`; cycling `depth + 1` tiles keeps the host stage off a source a
+    /// pending copy still reads (§10.3e).
     ///
     /// Called either per step (the marker-coincides-with-EOS arm) or once per
-    /// commit window (the batched arm), so `generation` is whatever the host holds
-    /// as `fed` at that point. Ordering is the protocol: encoded after the input
-    /// slot and (on the per-step arm) the EOS flag, so a host that observes the
-    /// counter at `>= N` has those writes behind it in queue order (§9.3).
-    pub fn publish_marker(&self, generation: u32) -> Result<()> {
+    /// commit window (the batched arm), so `generation` is whatever the host
+    /// holds as `fed` at that point.
+    pub fn publish_marker(&self, generation: u32, certified: &[&Tensor]) -> Result<()> {
         if generation == 0 {
             lloom_tensor::bail!(
                 "TokenRing: generation 0 is the unpublished sentinel, ordinals start at 1"
             );
+        }
+        let device = self.step.device();
+        if device.is_metal() {
+            return device.ring_stamp(&self.step, generation, certified);
         }
         // Cycle to a fresh source tile so the stage does not race an in-flight
         // `slice_set` reading the previous one.
@@ -574,10 +597,10 @@ impl TokenRing {
     /// the mapped counter — or `None` if the counter is not CPU-mapped.
     ///
     /// This is the visibility signal a streaming consumer of a *second* buffer
-    /// needs: `publish_step` writes the history/input slot, then the EOS flag,
-    /// then this counter **last**, in queue order, so an observed value `>= N`
-    /// means every write of steps `1..=N` — including the history slot — is
-    /// visible (§9.3). A consumer draining a device-side history therefore reads
+    /// needs: the history slot and the EOS flag are written, then this counter
+    /// **last**, by a stamp that certifies them ([`Self::publish_marker`]), so
+    /// an observed value `>= N` means every write of steps `1..=N` — including
+    /// the history slot — has landed (§9.3). A consumer draining a device-side history therefore reads
     /// only up to this ordinal, never a slot the GPU has not yet written. Only
     /// meaningful on the stamped (`publish_step`) arm; the blocking arm's own
     /// per-step readback already synced, so it does not need this.

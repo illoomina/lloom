@@ -612,14 +612,6 @@ impl Device {
         }
     }
 
-    /// The fused publish (lloom #735 step 5): one dispatch that takes the
-    /// argmax of `logits` (F16 or F32, contiguous), writes the token to
-    /// `token_slot` and `history_slot` (U32 views of one element), raises the
-    /// EOS gate's flag if the token is in `eos_ids` (U32; only while the gate
-    /// is armed), fences, and stamps `generation` into `step` (U32, one
-    /// element) — the chain of `cast`, `argmax`, three blits and the gate
-    /// kernel as one launch. The argmax follows `reduce.metal`'s rule (the
-    /// greatest value, the lowest index on ties). Metal only.
     /// `words_publish` (Metal): `n` U32 words of `src` copied into the
     /// CPU-mapped `out`, then `generation` stamped into `step` behind a
     /// device barrier — the fused publish's data-then-stamp order, for a
@@ -670,6 +662,67 @@ impl Device {
         }
     }
 
+    /// A token ring's generation stamp that certifies slots other dispatches
+    /// wrote: `generation` into `step` (U32, one element), ordered after the
+    /// last writer of every tensor in `certified` (one or two, any dtype). The
+    /// certified tensors are bound and not read; the command stream orders a
+    /// dispatch only through what it binds (`DESIGN.md` §6.4), and a stamp
+    /// bound to nothing but `step` may run before the slots it vouches for when
+    /// the slots are written by compute kernels. Metal only.
+    pub fn ring_stamp(
+        &self,
+        step: &crate::Tensor,
+        generation: u32,
+        certified: &[&crate::Tensor],
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Metal(d) => {
+                if step.dtype() != DType::U32 || step.elem_count() != 1 {
+                    crate::bail!(
+                        "ring_stamp: step must be one U32, got {:?} {:?}",
+                        step.dtype(),
+                        step.shape()
+                    );
+                }
+                let (a, b) = match certified {
+                    [a] => (*a, *a),
+                    [a, b] => (*a, *b),
+                    _ => crate::bail!(
+                        "ring_stamp: one or two certified tensors, got {}",
+                        certified.len()
+                    ),
+                };
+                let (ss, sl) = step.storage_and_layout();
+                let (as_, al) = a.storage_and_layout();
+                let (bs, bl) = b.storage_and_layout();
+                match (&*ss, &*as_, &*bs) {
+                    (Storage::Metal(s), Storage::Metal(sa), Storage::Metal(sb)) => d.ring_stamp(
+                        (s, sl.start_offset() * DType::U32.size_in_bytes()),
+                        generation,
+                        [
+                            (sa, al.start_offset() * a.dtype().size_in_bytes()),
+                            (sb, bl.start_offset() * b.dtype().size_in_bytes()),
+                        ],
+                    ),
+                    _ => crate::bail!("ring_stamp: every tensor must live on the Metal device"),
+                }
+            }
+            _ => {
+                let _ = (step, generation, certified);
+                crate::bail!("ring_stamp: not a Metal device")
+            }
+        }
+    }
+
+    /// The fused publish (lloom #735 step 5): one dispatch that takes the
+    /// argmax of `logits` (F16 or F32, contiguous), writes the token to
+    /// `token_slot` and `history_slot` (U32 views of one element), raises the
+    /// EOS gate's flag if the token is in `eos_ids` (U32; only while the gate
+    /// is armed), fences, and stamps `generation` into `step` (U32, one
+    /// element) — the chain of `cast`, `argmax`, three blits and the gate
+    /// kernel as one launch. The argmax follows `reduce.metal`'s rule (the
+    /// greatest value, the lowest index on ties). Metal only.
     pub fn argmax_publish(
         &self,
         logits: &crate::Tensor,

@@ -119,6 +119,25 @@ kernel void NAME(                                                               
 ARGMAX_PUBLISH(argmax_publish_f16, half)
 ARGMAX_PUBLISH(argmax_publish_f32, float)
 
+// The token ring's generation stamp, for a publish whose slots were written by
+// other dispatches (the unfused chain). `certified_a` and `certified_b` are
+// never read: they are bound so the command stream's hazard tracker orders
+// this dispatch after their last writers — a barrier inside an encoder, a
+// fence wait across encoders — which is what lets a host that observes the
+// stamp read the slots behind it. Nothing else orders it: the stamp's value is
+// a constant and its only output is `step`. One buffer may be bound twice.
+kernel void ring_stamp(
+    device uint        *step        [[buffer(0)]],
+    constant uint      &generation  [[buffer(1)]],
+    device const uchar *certified_a [[buffer(2)]],
+    device const uchar *certified_b [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid == 0) {
+        step[0] = generation;
+    }
+}
+
 // The speculative round's readback as a publish (lloom #148): the verify's
 // `[argmax, proposed]` words copied into a CPU-mapped buffer the host keeps,
 // a device-scope barrier, then the generation stamp by thread 0 — the same

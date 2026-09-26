@@ -91,7 +91,35 @@ pub fn call_words_publish(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `ring_stamp`: `generation` into `step`, ordered after the last writers of
+/// `certified` (bound, never read). The ordering is the command stream's: the
+/// binds are what make the hazard tracker emit the barrier or the fence wait.
+pub fn call_ring_stamp(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    step: BufferOffset,
+    generation: u32,
+    certified: [BufferOffset; 2],
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::EosGate, "ring_stamp")?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "ring_stamp gen={generation}");
+    let [a, b] = certified;
+    set_params!(
+        encoder,
+        (Output::from_buffer_offset(&step), generation, &a, &b)
+    );
+    let one = MTLSize {
+        width: 1,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(one, one);
+    Ok(())
+}
 
 /// The fused publish (lloom #735 step 5): see `argmax_publish_body` in
 /// `metal_src/eos_gate.metal`. `kernel` is `argmax_publish_f16` or

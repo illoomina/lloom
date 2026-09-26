@@ -425,3 +425,59 @@ fn a_gated_shortconv_step_carries_its_state_through_an_eos() {
         "gate raised: the output is not written"
     );
 }
+
+/// The ring's stamp (`call_ring_stamp`) writes the generation at the step's
+/// offset and nothing else: the words around it and the buffers it certifies
+/// (bound, never read) are unchanged, and it lands the same on every repeat.
+/// What it orders is `lloom`'s `ring_publish_order` / `ring_publish_binds`.
+#[test]
+fn the_ring_stamp_writes_the_generation_and_nothing_else() {
+    use crate::kernels::call_ring_stamp;
+    let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue().unwrap();
+    let residency_set = Arc::new(ResidencySet::new(&device));
+    let cmds =
+        Commands::new_with_completion_wait(queue, residency_set, CompletionWait::Synchronize)
+            .unwrap();
+    let kernels = Kernels::new();
+    let step = device.new_buffer(32, SHARED).unwrap();
+    zero(&step, 32);
+    let certified: Vec<u32> = (0..8).map(|i| 1000 + i).collect();
+    let cert = device
+        .new_buffer_with_data(certified.as_ptr() as *const std::ffi::c_void, 32, SHARED)
+        .unwrap();
+    for generation in [1u32, 77, u32::MAX, 77] {
+        {
+            let enc = cmds.command_encoder().unwrap();
+            call_ring_stamp(
+                &device,
+                &enc,
+                &kernels,
+                BufferOffset {
+                    buffer: &step,
+                    offset_in_bytes: 12,
+                },
+                generation,
+                [
+                    BufferOffset::zero_offset(&cert),
+                    BufferOffset {
+                        buffer: &cert,
+                        offset_in_bytes: 16,
+                    },
+                ],
+            )
+            .unwrap();
+        }
+        cmds.flush_and_wait_current().unwrap();
+        let out = unsafe { std::slice::from_raw_parts(step.contents() as *const u32, 8) };
+        let mut want = [0u32; 8];
+        want[3] = generation;
+        assert_eq!(out, want, "the stamp at word 3, every other word untouched");
+        let cert_now = unsafe { std::slice::from_raw_parts(cert.contents() as *const u32, 8) };
+        assert_eq!(
+            cert_now,
+            certified.as_slice(),
+            "the certified buffer is not written"
+        );
+    }
+}

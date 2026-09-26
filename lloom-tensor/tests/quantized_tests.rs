@@ -184,14 +184,29 @@ fn quantized_matmul_neg(device: &Device) -> Result<()> {
     let matmul = quantized::QMatMul::from_qtensor(qtensor)?;
     let res = matmul.forward(&lhs)?;
     match device {
-        Device::Metal(_) => assert_eq!(
-            to_vec2_round(&res, 0)?,
-            &[
-                [243659.0, -19716.0, -285444.0, -550439.0],
-                [23779.0, 21653.0, 19404.0, 18349.0],
-                [-196101.0, 63021.0, 324252.0, 587137.0]
-            ]
-        ),
+        // Three rows take the matmul-vec kernel (up to 8 rows do); the mm
+        // kernel's values for the same rows are pinned past 8 rows, where it
+        // serves them.
+        Device::Metal(_) => {
+            assert_eq!(
+                to_vec2_round(&res, 0)?,
+                &[
+                    [243666.0, -19714.0, -285433.0, -550453.0],
+                    [23782.0, 21654.0, 19400.0, 18369.0],
+                    [-196102.0, 63022.0, 324233.0, 587191.0]
+                ]
+            );
+            let lhs9 = Tensor::cat(&[&lhs, &lhs, &lhs], 0)?;
+            let res9 = matmul.forward(&lhs9)?.narrow(0, 0, 3)?;
+            assert_eq!(
+                to_vec2_round(&res9, 0)?,
+                &[
+                    [243659.0, -19716.0, -285444.0, -550439.0],
+                    [23779.0, 21653.0, 19404.0, 18349.0],
+                    [-196101.0, 63021.0, 324252.0, 587137.0]
+                ]
+            )
+        }
         Device::Cuda(_) => assert_eq!(
             to_vec2_round(&res, 0)?,
             &[
@@ -243,9 +258,10 @@ fn qmm_batch(dev: &Device) -> Result<()> {
     let mm4 = rhs.forward(&lhs4)?;
     assert_eq!(mm4.shape().dims(), [12, 6]);
     let diff4 = (mm4.i(..6)? - &mm3)?.abs()?.sum_all()?.to_vec0::<f32>()?;
-    if dev.is_cuda() {
+    if dev.is_cuda() || dev.is_metal() {
         // We use different fused kernels (MMVQ for batch<=8, MMQ for batch>8) on CUDA which accumulate differently than dequantize-then-matmul.
         // This can lead to small numerical differences especially for low-bit quants.
+        // Metal likewise: matmul-vec for up to 8 rows, the mm kernel past them.
         assert!(0. < diff4 && diff4 < 0.5)
     } else {
         assert_eq!(diff4, 0.0)

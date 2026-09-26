@@ -300,9 +300,11 @@ mod tests {
         // bos == eos == 248044 (the checkpoint has no distinct pad).
         assert_eq!(cfg.bos_token_id, cfg.eos_token_id);
         assert_eq!(cfg.eos_token_id, 248044);
-        // The DeltaNet gate is SIGMOID (not silu) and S is fp32 — enforced in the
-        // block code (build_norm_gated sigmoid, decode_step f32); pinned there by
-        // the deltanet tests. Recorded here as the trap origin.
+        // The DeltaNet gate is SIGMOID (not silu) and S is fp32 — shape-blind
+        // both (no parity against a composed chain sees them: the chain carries
+        // the same choice). Pinned at the kernels, against hand-computed values
+        // and at the boundary: `kernels::tests::the_gated_norm_gate_is_sigmoid`,
+        // `the_step_refuses_a_state_that_is_not_f32` (#749 P33).
     }
 
     /// Derived dims reconcile with the GGUF tensor shapes (conv_channels must

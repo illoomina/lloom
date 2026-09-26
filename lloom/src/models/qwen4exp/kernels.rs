@@ -1137,6 +1137,74 @@ mod tests {
             (routed + shared.broadcast_mul(&ops::sigmoid(&gate).unwrap()).unwrap()).unwrap();
         close("moe_combine", &fused, &composed, 1e-5);
     }
+
+    /// The Step-0 trap "the DeltaNet output gate is SIGMOID, not silu", pinned
+    /// on the shipping kernel against a hand-computed value: at `z = 0` a
+    /// sigmoid gate is 0.5 and a silu gate 0, so the output is half the normed
+    /// value, not zero. `o` is one head of ones, so its RMS norm is 1 and the
+    /// expected output is exactly `γ · 0.5`.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_gated_norm_gate_is_sigmoid() {
+        let dev = Device::new_metal(0).unwrap();
+        let (d, h_v) = (128usize, 2usize);
+        let f32 = lloom_tensor::DType::F32;
+        let o = Tensor::ones((h_v, d), f32, &dev).unwrap();
+        let gamma = Tensor::full(3.0f32, d, &dev).unwrap();
+        let z = Tensor::zeros(h_v * d, f32, &dev).unwrap();
+        let out = o
+            .apply_op3_no_bwd(&gamma, &z, &GdnGatedNorm { d, h_v, eps: 0.0 })
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (i, v) in out.iter().enumerate() {
+            assert_eq!(
+                *v, 1.5,
+                "element {i}: γ·σ(0) = 3·0.5, got {v} (silu would give 0)"
+            );
+        }
+    }
+
+    /// The Step-0 trap `mamba_ssm_dtype: float32`, enforced: the step refuses
+    /// a state, and an input, that is not f32 rather than read its bytes as
+    /// float.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_step_refuses_a_state_that_is_not_f32() {
+        let dev = Device::new_metal(0).unwrap();
+        let (d, h_v) = (16usize, 4usize);
+        let (f32, f16) = (lloom_tensor::DType::F32, lloom_tensor::DType::F16);
+        let ab = Tensor::zeros(h_v, f32, &dev).unwrap();
+        let step = |heads_dtype: lloom_tensor::DType, s_dtype: lloom_tensor::DType| {
+            Tensor::zeros(3 * h_v * d, heads_dtype, &dev)
+                .unwrap()
+                .apply_op3_no_bwd(
+                    &ab,
+                    &ab,
+                    &GdnStep {
+                        d,
+                        h_v,
+                        dt_bias: ab.clone(),
+                        ssm_a: ab.clone(),
+                        s: Tensor::zeros((d, d, h_v), s_dtype, &dev).unwrap(),
+                        s_out: Tensor::zeros((d, d, h_v), s_dtype, &dev).unwrap(),
+                    },
+                )
+        };
+        assert!(step(f32, f32).is_ok(), "f32 inputs and state must run");
+        let err = step(f32, f16).unwrap_err().to_string();
+        assert!(
+            err.contains("must be f32"),
+            "an f16 state was not refused: {err}"
+        );
+        let err = step(f16, f32).unwrap_err().to_string();
+        assert!(
+            err.contains("must be f32"),
+            "an f16 input was not refused: {err}"
+        );
+    }
 }
 
 // ---- Gated DeltaNet decode ---------------------------------------------------------

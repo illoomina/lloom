@@ -1197,12 +1197,11 @@ const MLP_STEPS: usize = 40;
 /// `consumer` is how `w2` runs under the executor; see [`Consumer`]. Without
 /// an executor both kernels bind inline (`Split`): the reference.
 ///
-/// Each step is committed without a host wait unless `wait_each_step`, so the
-/// next step is encoded while this one runs, as the decode loop does.
+/// `pacing` says when the host waits for the GPU; see [`Pacing`].
 fn run_mlp_steps(
     executor: Option<&Arc<IcbExecutor>>,
     consumer: Consumer,
-    wait_each_step: bool,
+    pacing: Pacing,
 ) -> Vec<f32> {
     use crate::kernels::kernels::mlx_gemm::{call_mlx_gemv_epilogue, GemmDType, GemvEpilogue};
     use crate::kernels::kernels::unary::{call_copy2d_with, copy2d};
@@ -1343,7 +1342,12 @@ fn run_mlp_steps(
             }
         }
         copy(&o, &results, step * k * 2);
-        if wait_each_step {
+        let wait = match pacing {
+            Pacing::Waited => true,
+            Pacing::Bounded(depth) => (step + 1) % depth == 0,
+            Pacing::Unbounded => false,
+        };
+        if wait {
             cmds.flush_and_wait().unwrap();
         } else {
             cmds.flush().unwrap();
@@ -1358,6 +1362,21 @@ fn run_mlp_steps(
         .iter()
         .map(|v| v.to_f32())
         .collect()
+}
+
+/// When the host waits for the GPU between steps.
+#[derive(Clone, Copy, Debug)]
+enum Pacing {
+    /// After every step: each generation's last use has completed by the next
+    /// step, so the executor reuses one after setting its pipelines again.
+    Waited,
+    /// Every `n` steps, as the decode loop's pacer bounds the steps in
+    /// flight: the executor encodes new generations while earlier ones run and
+    /// reuses them once they complete.
+    Bounded(usize),
+    /// Never: the host encodes every step before the GPU finishes the first,
+    /// so the generations reach their cap and later steps run classically.
+    Unbounded,
 }
 
 /// How `w2`, the swiglu's consumer, runs while the swiglu is replayed.
@@ -1395,17 +1414,17 @@ fn differing_steps(run: &[f32], reference: &[f32], k: usize) -> Vec<usize> {
 /// and 26th execution (steps 8, 14, 21, 27 here): the trailing simdgroups of
 /// each threadgroup never ran. The step count is what reaches it; eight steps,
 /// which this harness ran first, stop one execution short.
-fn assert_mlp_replays_like_classical(consumer: Consumer, wait_each_step: bool, what: &str) {
+fn assert_mlp_replays_like_classical(consumer: Consumer, pacing: Pacing, what: &str) {
     use crate::kernels::metal::encoder::{set_hazard_key, HazardKey};
     let k = 2048;
     set_hazard_key(HazardKey::Range);
     set_default_param_style(ParamStyle::Packed);
     set_constants_pool_enabled(true);
     let executor = IcbExecutor::new(2);
-    let replayed = run_mlp_steps(Some(&executor), consumer, wait_each_step);
+    let replayed = run_mlp_steps(Some(&executor), consumer, pacing);
     set_default_param_style(ParamStyle::Split);
     set_constants_pool_enabled(false);
-    let classical = run_mlp_steps(None, consumer, wait_each_step);
+    let classical = run_mlp_steps(None, consumer, pacing);
     set_hazard_key(HazardKey::Pointer);
     let cov = executor.coverage();
     eprintln!(
@@ -1435,23 +1454,32 @@ fn assert_mlp_replays_like_classical(consumer: Consumer, wait_each_step: bool, w
         "{what}: the classical steps disagree with each other"
     );
     assert!(distinct(&replayed) > 2, "{what}: vacuous replayed output");
-    // Replay must actually have run on most steps, or a pass reads nothing.
-    assert!(
-        executor.skipped_steps() < MLP_STEPS / 4,
-        "{what}: {} of {MLP_STEPS} steps fell back to classical",
-        executor.skipped_steps()
-    );
-    // The rotation engaged: a waited step always finds its last generation
-    // complete and refreshes it; an unwaited one builds or refreshes.
-    if wait_each_step {
+    // Each pacing must engage the path it exists for, or its pass reads
+    // nothing: a bounded run never falls back and both builds and reuses; an
+    // unbounded one reaches the cap.
+    match pacing {
+        Pacing::Waited | Pacing::Bounded(_) => {
+            assert_eq!(
+                executor.skipped_steps(),
+                0,
+                "{what}: a paced step fell back"
+            );
+            assert!(
+                executor.pipeline_refreshes() > 0,
+                "{what}: no generation reused"
+            );
+        }
+        Pacing::Unbounded => {
+            assert!(
+                executor.skipped_steps() > 0,
+                "{what}: the cap was never reached"
+            );
+        }
+    }
+    if let Pacing::Bounded(_) = pacing {
         assert!(
-            executor.pipeline_refreshes() > 0 && executor.skipped_steps() == 0,
-            "{what}: a waited run must reuse generations and never fall back"
-        );
-    } else {
-        assert!(
-            executor.generations_built() + executor.pipeline_refreshes() > 0,
-            "{what}: no generation was built or refreshed"
+            executor.generations_built() > 0,
+            "{what}: no generation built"
         );
     }
     let bad = differing_steps(&replayed, &classical, k);
@@ -1464,18 +1492,18 @@ fn assert_mlp_replays_like_classical(consumer: Consumer, wait_each_step: bool, w
     );
 }
 
-/// The swiglu and `w2` both replayed, each step committed without waiting.
+/// The swiglu and `w2` both replayed, four steps in flight at a time.
 #[test]
 fn a_replayed_long_command_with_the_previous_step_in_flight() {
     require_icb_support!("a_replayed_long_command_with_the_previous_step_in_flight");
-    assert_mlp_replays_like_classical(Consumer::Replayed, false, "replayed consumer");
+    assert_mlp_replays_like_classical(Consumer::Replayed, Pacing::Bounded(4), "replayed consumer");
 }
 
 /// The swiglu replayed and `w2` classical (bound inline).
 #[test]
 fn a_classical_consumer_of_a_replayed_long_command() {
     require_icb_support!("a_classical_consumer_of_a_replayed_long_command");
-    assert_mlp_replays_like_classical(Consumer::Inline, false, "inline consumer");
+    assert_mlp_replays_like_classical(Consumer::Inline, Pacing::Bounded(4), "inline consumer");
 }
 
 /// The swiglu replayed and `w2` the packed kernel run classically -- the
@@ -1483,7 +1511,11 @@ fn a_classical_consumer_of_a_replayed_long_command() {
 #[test]
 fn a_classical_packed_consumer_of_a_replayed_long_command() {
     require_icb_support!("a_classical_packed_consumer_of_a_replayed_long_command");
-    assert_mlp_replays_like_classical(Consumer::PackedMoving, false, "packed classical consumer");
+    assert_mlp_replays_like_classical(
+        Consumer::PackedMoving,
+        Pacing::Bounded(4),
+        "packed classical consumer",
+    );
 }
 
 /// Every step waited for: each generation's last use has completed by the
@@ -1492,5 +1524,14 @@ fn a_classical_packed_consumer_of_a_replayed_long_command() {
 #[test]
 fn a_command_replayed_every_step_matches_classical_on_every_step() {
     require_icb_support!("a_command_replayed_every_step_matches_classical_on_every_step");
-    assert_mlp_replays_like_classical(Consumer::Inline, true, "waited steps");
+    assert_mlp_replays_like_classical(Consumer::Inline, Pacing::Waited, "waited steps");
+}
+
+/// No host wait at all: the generations reach their cap while every one is
+/// still in flight, and the steps after run classically rather than execute a
+/// command a second time without its pipeline set again.
+#[test]
+fn a_run_ahead_past_the_generation_cap_falls_back_to_classical() {
+    require_icb_support!("a_run_ahead_past_the_generation_cap_falls_back_to_classical");
+    assert_mlp_replays_like_classical(Consumer::Inline, Pacing::Unbounded, "unbounded run-ahead");
 }

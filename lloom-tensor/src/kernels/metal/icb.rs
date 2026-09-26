@@ -38,6 +38,7 @@
 //! a stale command, because under `HazardTrackingModeUntracked` a wrong buffer
 //! is silent corruption rather than an error (§3.5).
 use crate::kernels::metal::{Buffer, Commands, ComputePipeline};
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLComputePipelineState, MTLDevice, MTLIndirectCommandBuffer,
@@ -286,31 +287,23 @@ pub enum Excluded {
     /// The kernel binds its constants inline, so no ICB command can hold it
     /// (§3.7c). Observed as a name without the `_packed` suffix.
     InlineConstants,
-    /// The kernel is on the quarantine list ([`is_quarantined`]): replayed
-    /// from an ICB on the model its output diverges from the classical
-    /// dispatch, and the cause is open (lloom #732, `measurements/
-    /// issue-732-replay-on-the-loop.md` §5). It runs classically until then.
+    /// The kernel is on the quarantine list ([`is_quarantined`]) and runs
+    /// classically.
     Quarantined,
 }
 
-/// Kernels the plan refuses to replay because a replayed instance was
-/// measured computing something other than its classical dispatch on the
-/// real model — while the same kernel replays correctly in isolation
-/// (`icb_executor_tests::replayed_fused_gemv_epilogues_match_the_classical_ones`
-/// and `a_classical_consumer_of_a_replayed_long_command`). lloom #732 found
-/// this with the two-weight SwiGLU GEMV (`_swiglu_packed`: the crown's reply
-/// diverges from token ~12 with the swiglu positions replayed and is
-/// byte-identical with them excluded), reproduced it with a plain `gemv_mul`
-/// made three times slower, and could not reproduce it outside the model.
-/// Until the ordering hole is found, the positions run classically and the
-/// exclusion table says so.
+/// Kernel-name fragments the plan refuses to replay, with the reason
+/// reported as `quarantined`. Empty: the one entry it held
+/// (`_swiglu_`) was a command executed repeatedly without its pipeline being
+/// set again, which [`Generation`] now rules out.
+const QUARANTINED: &[&str] = &[];
+
+/// Whether the plan refuses to replay a kernel by name ([`QUARANTINED`]).
 pub fn is_quarantined(name: &str) -> bool {
-    // The reproducer's switch (`icb_executor_tests`): lift the quarantine so
-    // the divergence can be exercised. Test-only by construction — read once.
     if crate::tuning::tuning().metal.icb_quarantine_off {
         return false;
     }
-    name.contains("_swiglu_")
+    QUARANTINED.iter().any(|q| name.contains(q))
 }
 
 /// What one recording pass learned about the decode step.
@@ -420,6 +413,16 @@ struct Inner {
     /// Whether candle's own barrier is suppressed at replayed positions.
     /// See [`ReplayBarriers`].
     replay_barriers: ReplayBarriers,
+    /// A range was executed from the current generation during this step.
+    executed_this_step: bool,
+    /// No generation could be executed safely this step, so every position
+    /// runs classically (see [`Generation`]).
+    skip_step: bool,
+    /// Generations encoded beyond the first, pipeline refreshes of a reused
+    /// generation, and steps run classically because none was available.
+    generations_built: usize,
+    pipeline_refreshes: usize,
+    skipped_steps: usize,
 }
 
 /// Stale positions, attributed rather than counted.
@@ -556,19 +559,86 @@ struct Run {
     range: Arc<IcbRange>,
 }
 
-/// The encoded ICB (held by each run's range) and the map from dispatch
-/// position to command index.
+/// What every generation of a plan encodes: the recording each command was
+/// encoded from, whether it carries a barrier, and the run layout with each
+/// run's residency. Fixed once the plan is built and shared, so a new
+/// generation can be encoded with the executor's lock released.
+struct Layout {
+    /// The recording each covered position was encoded from, kept so a live
+    /// dispatch can be checked against it before its command is trusted.
+    reference: Vec<StepDispatch>,
+    /// Whether command `i` carries a `setBarrier` (see `encode_plan`).
+    barrier: Vec<bool>,
+    /// `maxKernelBufferBindCount` every generation is created with.
+    max_bind: usize,
+    /// The covered positions grouped into maximal consecutive runs, in order.
+    /// Each run's `range` is the first generation's, and carries the run's
+    /// residency for every generation.
+    runs: Vec<Run>,
+}
+
+/// One encoding of the plan into its own `MTLIndirectCommandBuffer`.
+///
+/// # Why a plan has more than one
+///
+/// A command must not be executed a second time without its pipeline being
+/// set again in between. Measured (`measurements/issue-740-icb-reexecution.md`):
+/// a `gemv_swiglu_packed` command executed on every step launches only the
+/// leading simdgroups of each threadgroup on its 7th, 13th, 20th and 26th
+/// execution, period 32, counted from the last `setComputePipelineState` on
+/// it; the trailing simdgroups never run and their rows keep whatever the
+/// buffer held. Re-setting the pipeline restarts the count; re-issuing the
+/// dispatch or the bindings does not. Other gemv variants have not been
+/// observed to do it, and the rule is applied to every command because
+/// nothing identifies which pipelines are susceptible.
+///
+/// Setting a pipeline writes the command, and a command the GPU may still be
+/// executing must not be written. So a generation is reused only once the
+/// step that last executed it has completed, with its pipelines set again
+/// first; otherwise a fresh generation is encoded, up to
+/// [`GENERATION_CAP`]. Every executed command has therefore run at most once
+/// since its pipeline was set.
+struct Generation {
+    icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
+    /// The ranges each run executes from, in run order.
+    ranges: Vec<Arc<IcbRange>>,
+    /// A command from this generation was executed since its pipelines were
+    /// last set.
+    used: bool,
+    /// `(clock id, epoch)` of the last step that executed from it.
+    last_use: Option<(u64, u64)>,
+}
+
+/// Generations a plan may hold. Beyond it a step whose generations are all
+/// still in flight runs classically rather than waiting.
+const GENERATION_CAP: usize = 16;
+
+/// What `end_step` does about the next step's generation.
+enum Rotation {
+    /// Keep the current generation: it was not executed this step.
+    Keep,
+    /// Reuse generation `index`, whose last use has completed, after setting
+    /// its pipelines again.
+    Refresh {
+        index: usize,
+        icb: Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>,
+        layout: Arc<Layout>,
+    },
+    /// Encode a new generation.
+    Build(Arc<Layout>),
+}
+
+/// The generations and the map from dispatch position to command index.
 struct Plan {
     /// `command_of[pos]` is the ICB command index for that dispatch position, or
     /// `None` when the position is not covered.
     command_of: Vec<Option<usize>>,
-    /// The covered positions grouped into maximal consecutive runs, in order.
-    runs: Vec<Run>,
     /// `run_at[pos]` is the run starting at that position, if one does.
     run_at: Vec<Option<usize>>,
-    /// The recording each covered position was encoded from, kept so a live
-    /// dispatch can be checked against it before its command is trusted.
-    reference: Vec<StepDispatch>,
+    layout: Arc<Layout>,
+    /// Never empty; `current` is the one the next step executes from.
+    generations: Vec<Generation>,
+    current: usize,
     /// Distinct buffers bound across the whole plan. Reported, not declared: the
     /// residency a step declares is the sum over runs of each run's own set.
     plan_resident: usize,
@@ -644,6 +714,11 @@ impl IcbExecutor {
                 position: 0,
                 barrier_scope,
                 replay_barriers,
+                executed_this_step: false,
+                skip_step: false,
+                generations_built: 0,
+                pipeline_refreshes: 0,
+                skipped_steps: 0,
             }),
         })
     }
@@ -709,7 +784,9 @@ impl IcbExecutor {
             encoder
                 .as_ref()
                 .execute_icb_range(&p.range, p.command, p.validated);
-            self.inner.lock().prefix_flushes += 1;
+            let mut inner = self.inner.lock();
+            inner.prefix_flushes += 1;
+            inner.executed_this_step = true;
         }
         // The constants pool hands position N the same buffer every step, which
         // is what makes a packed dispatch's identity stable enough to encode
@@ -723,6 +800,7 @@ impl IcbExecutor {
         // the window is complete, so the device work in `build_plan`
         // (`encode_plan`) runs with `inner` released. `None` unless this step
         // completes the recording.
+        let mut rotation = Rotation::Keep;
         let to_build: Option<(Vec<Vec<StepDispatch>>, BarrierScope)> = {
             let mut inner = self.inner.lock();
             inner.position = 0;
@@ -741,6 +819,9 @@ impl IcbExecutor {
                 inner.stale_runs.clear();
                 inner.warm_in = inner.rerecord_warm_in;
                 inner.rerecordings += 1;
+            }
+            if inner.phase == Phase::Replaying {
+                rotation = Self::choose_generation(&mut inner, &commands.clock());
             }
             match inner.phase {
                 Phase::Recording => {
@@ -761,6 +842,8 @@ impl IcbExecutor {
             }
         };
 
+        self.apply_rotation(device, rotation)?;
+
         // Device work with `inner` released; re-lock only to store the result.
         if let Some((steps, scope)) = to_build {
             let (coverage, plan) = Inner::build_plan(device, &steps, scope)?;
@@ -768,6 +851,83 @@ impl IcbExecutor {
             inner.coverage = coverage;
             inner.plan = plan;
             inner.phase = Phase::Replaying;
+        }
+        Ok(())
+    }
+
+    /// Choose the generation the next step executes from (see [`Generation`]).
+    ///
+    /// Runs under the `inner` lock at the step boundary and does no device
+    /// work: a reuse or a new encoding is returned for [`Self::apply_rotation`]
+    /// to carry out with the lock released. When every generation is still in
+    /// flight and the cap is reached, the next step runs classically.
+    fn choose_generation(inner: &mut Inner, clock: &crate::kernels::metal::GpuClock) -> Rotation {
+        let executed = std::mem::take(&mut inner.executed_this_step);
+        inner.skip_step = false;
+        let Some(plan) = inner.plan.as_mut() else {
+            return Rotation::Keep;
+        };
+        if executed {
+            let g = &mut plan.generations[plan.current];
+            g.used = true;
+            g.last_use = Some((clock.id(), clock.current_epoch()));
+        }
+        if !plan.generations[plan.current].used {
+            return Rotation::Keep;
+        }
+        if let Some(index) = plan.generations.iter().position(|g| !g.used) {
+            plan.current = index;
+            return Rotation::Keep;
+        }
+        let complete = plan.generations.iter().position(|g| {
+            matches!(g.last_use, Some((id, epoch)) if id == clock.id() && clock.is_complete(epoch))
+        });
+        if let Some(index) = complete {
+            return Rotation::Refresh {
+                index,
+                icb: plan.generations[index].icb.clone(),
+                layout: Arc::clone(&plan.layout),
+            };
+        }
+        if plan.generations.len() < GENERATION_CAP {
+            return Rotation::Build(Arc::clone(&plan.layout));
+        }
+        inner.skip_step = true;
+        inner.skipped_steps += 1;
+        Rotation::Keep
+    }
+
+    /// Carry out `rotation` with the `inner` lock released, then install the
+    /// result.
+    fn apply_rotation(
+        &self,
+        device: &crate::kernels::metal::Device,
+        rotation: Rotation,
+    ) -> Result<(), crate::kernels::MetalKernelError> {
+        match rotation {
+            Rotation::Keep => {}
+            Rotation::Refresh { index, icb, layout } => {
+                refresh_pipelines(&icb, &layout);
+                let mut inner = self.inner.lock();
+                inner.pipeline_refreshes += 1;
+                if let Some(plan) = inner.plan.as_mut() {
+                    if Arc::ptr_eq(&plan.layout, &layout) {
+                        plan.generations[index].used = false;
+                        plan.current = index;
+                    }
+                }
+            }
+            Rotation::Build(layout) => {
+                let generation = build_generation(device, &layout)?;
+                let mut inner = self.inner.lock();
+                inner.generations_built += 1;
+                if let Some(plan) = inner.plan.as_mut() {
+                    if Arc::ptr_eq(&plan.layout, &layout) {
+                        plan.generations.push(generation);
+                        plan.current = plan.generations.len() - 1;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -875,7 +1035,11 @@ impl IcbExecutor {
     /// replay is a single computed jump or many. Measured at 31 on
     /// `Sdpa × arena`; see `Run`.
     pub fn runs(&self) -> usize {
-        self.inner.lock().plan.as_ref().map_or(0, |p| p.runs.len())
+        self.inner
+            .lock()
+            .plan
+            .as_ref()
+            .map_or(0, |p| p.layout.runs.len())
     }
 
     /// Distinct runs that went stale at least once under the current plan.
@@ -898,11 +1062,9 @@ impl IcbExecutor {
     /// each run's own residency set (`DESIGN.md` §11.3w's `runs x |resident|`,
     /// with `|resident|` per run rather than plan-wide).
     pub fn residency_per_step(&self) -> usize {
-        self.inner
-            .lock()
-            .plan
-            .as_ref()
-            .map_or(0, |p| p.runs.iter().map(|r| r.range.resident.len()).sum())
+        self.inner.lock().plan.as_ref().map_or(0, |p| {
+            p.layout.runs.iter().map(|r| r.range.resident.len()).sum()
+        })
     }
 
     /// Distinct buffers bound across the whole plan -- what every run declared
@@ -918,7 +1080,8 @@ impl IcbExecutor {
     /// Each run's residency set, as buffer addresses, in run order.
     pub fn run_residency(&self) -> Vec<Vec<usize>> {
         self.inner.lock().plan.as_ref().map_or(Vec::new(), |p| {
-            p.runs
+            p.layout
+                .runs
                 .iter()
                 .map(|r| r.range.resident.iter().map(Buffer::raw_addr).collect())
                 .collect()
@@ -946,6 +1109,22 @@ impl IcbExecutor {
     pub fn discarded_windows(&self) -> usize {
         self.inner.lock().recording.discarded
     }
+
+    /// Generations encoded after the plan's first (see [`Generation`]).
+    pub fn generations_built(&self) -> usize {
+        self.inner.lock().generations_built
+    }
+
+    /// Times a completed generation had its pipelines set again for reuse.
+    pub fn pipeline_refreshes(&self) -> usize {
+        self.inner.lock().pipeline_refreshes
+    }
+
+    /// Steps run classically because every generation was still in flight
+    /// and the cap on generations had been reached.
+    pub fn skipped_steps(&self) -> usize {
+        self.inner.lock().skipped_steps
+    }
 }
 
 impl IcbExecutor {
@@ -964,6 +1143,9 @@ impl IcbExecutor {
     /// member's command is exactly the one in the prefix.
     fn replay_action(inner: &mut Inner, pos: usize, live: &StepDispatch) -> DispatchAction {
         let step = inner.step;
+        if inner.skip_step {
+            return DispatchAction::Encode;
+        }
         let Some(plan) = inner.plan.as_ref() else {
             return DispatchAction::Encode;
         };
@@ -972,10 +1154,11 @@ impl IcbExecutor {
         // tail will issue, provided it still matches.
         if let Some(p) = inner.pending.as_mut() {
             let cmd = p.command + (pos - p.start);
-            if plan.reference[cmd].replay_compatible(live) {
+            if plan.layout.reference[cmd].replay_compatible(live) {
                 p.validated += 1;
                 if pos + 1 == p.start + p.len {
                     let p = inner.pending.take().expect("pending was Some");
+                    inner.executed_this_step = true;
                     return DispatchAction::ExecuteIcb {
                         icb: p.range,
                         location: p.command,
@@ -988,9 +1171,10 @@ impl IcbExecutor {
             // dispatch -- whose bindings are on the encoder right now -- run as
             // itself. The rest of the run is offered position by position and
             // encodes classically: no pending run, no `run_at` entry.
-            let axis = stale_axis(&plan.reference[cmd], live);
+            let axis = stale_axis(&plan.layout.reference[cmd], live);
             let kernel = live.kernel.as_deref().unwrap_or("<unnamed>").to_string();
             let p = inner.pending.take().expect("pending was Some");
+            inner.executed_this_step = true;
             inner.stale.note(step, pos, kernel, axis, false);
             inner.stale_positions += 1;
             inner.stale_this_step += 1;
@@ -1013,8 +1197,8 @@ impl IcbExecutor {
             // its run closed early at a member that moved. Encode it.
             return DispatchAction::Encode;
         };
-        if !plan.reference[cmd].replay_compatible(live) {
-            let axis = stale_axis(&plan.reference[cmd], live);
+        if !plan.layout.reference[cmd].replay_compatible(live) {
+            let axis = stale_axis(&plan.layout.reference[cmd], live);
             let kernel = live.kernel.as_deref().unwrap_or("<unnamed>").to_string();
             inner.stale.note(step, pos, kernel, axis, true);
             inner.stale_positions += 1;
@@ -1022,11 +1206,12 @@ impl IcbExecutor {
             inner.stale_runs.insert(run_index);
             return DispatchAction::Encode;
         }
-        let run = &plan.runs[run_index];
+        let run = &plan.layout.runs[run_index];
         let (start, command, len) = (run.start, run.command, run.len);
-        let range = Arc::clone(&run.range);
+        let range = Arc::clone(&plan.generations[plan.current].ranges[run_index]);
         if len == 1 {
             // A run of one is validated in full at its head.
+            inner.executed_this_step = true;
             return DispatchAction::ExecuteIcb {
                 icb: range,
                 location: command,
@@ -1178,40 +1363,13 @@ fn encode_plan(
         .max()
         .unwrap_or(1);
 
-    let desc = MTLIndirectCommandBufferDescriptor::new();
-    // Dispatch cannot be mixed with any other command type in one descriptor
-    // (`MTLIndirectCommandBuffer.h`), so this is the only type set.
-    desc.setCommandTypes(MTLIndirectCommandType::ConcurrentDispatch);
-    // Every command carries its own pipeline and its own bindings.
-    // `inheritBuffers` would make them all inherit the parent encoder's
-    // identically, which cannot express per-dispatch bindings -- the only reason
-    // to want them (§3.7c).
-    desc.setInheritBuffers(false);
-    desc.setInheritPipelineState(false);
-    desc.setMaxKernelBufferBindCount(max_bind);
-
-    // SAFETY: the descriptor is fully initialised above and the count is the
-    // number of commands about to be encoded.
-    let icb = unsafe {
-        device
-            .as_ref()
-            .newIndirectCommandBufferWithDescriptor_maxCommandCount_options(
-                &desc,
-                covered.len(),
-                MTLResourceOptions::empty(),
-            )
-    }
-    .ok_or_else(|| {
-        crate::kernels::MetalKernelError::FailedToCreateResource(format!(
-            "MTLIndirectCommandBuffer of {} commands",
-            covered.len()
-        ))
-    })?;
+    let icb = new_icb(device, max_bind, covered.len())?;
 
     let mut command_of = vec![None; positions];
     let mut run_at = vec![None; positions];
     let mut runs: Vec<RunBuild> = Vec::new();
     let mut reference = Vec::with_capacity(covered.len());
+    let mut barrier = Vec::with_capacity(covered.len());
     let mut plan_resident = std::collections::HashSet::new();
     // Barriers encoded on commands, reported so the count is observed rather
     // than inferred -- §9.2f's rule, applied to the quantity this file adds.
@@ -1244,11 +1402,6 @@ fn encode_plan(
         // SAFETY: `cmd_index < covered.len()`, the count the ICB was created
         // with -- the loop is over exactly that slice.
         let cmd = unsafe { icb.indirectComputeCommandAtIndex(cmd_index) };
-        let pipeline = d
-            .pipeline
-            .as_ref()
-            .expect("covered positions have a pipeline; checked in build_plan");
-        cmd.setComputePipelineState(pipeline_raw(pipeline));
 
         // Re-express the ordering candle's `auto_barrier` emits classically.
         //
@@ -1326,49 +1479,17 @@ fn encode_plan(
             .iter()
             .any(|&earlier| d.conflicts_with(&step[earlier]));
         if needs_barrier {
-            cmd.setBarrier();
             barriers += 1;
             last_barrier_cmd = Some(cmd_index);
         }
+        barrier.push(needs_barrier);
+        encode_command(&cmd, d, needs_barrier);
 
         for (b, buf) in d.bindings.iter().zip(d.retained.iter()) {
-            // SAFETY: the buffer outlives the ICB -- it is retained in the run's
-            // residency set below and the plan owns both -- and the index is
-            // under `maxKernelBufferBindCount`, which was computed as the
-            // maximum over exactly these bindings.
-            unsafe { cmd.setKernelBuffer_offset_atIndex(buf.as_ref(), b.offset, b.index) };
-            // The run's residency set is derived from the very binding just
+            // The run's residency set is derived from the very bindings just
             // encoded, so it cannot fall behind the command.
             run.bind(buf, b.is_output);
             plan_resident.insert(buf.raw_addr());
-        }
-        let tg = MTLSize {
-            width: d.threads_per_threadgroup.width,
-            height: d.threads_per_threadgroup.height,
-            depth: d.threads_per_threadgroup.depth,
-        };
-        // The two forms are kept distinct rather than normalised. §11.1c: the
-        // conversion is lossy, because `dispatchThreads` lets Metal size the
-        // final partial threadgroup and a rounded replay would run more threads
-        // and report a different `threads_per_threadgroup` inside the kernel.
-        // Any threadgroup-wide reduction would then compute a different answer.
-        match d.grid {
-            Grid::Threadgroups(g) => cmd.concurrentDispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: g.width,
-                    height: g.height,
-                    depth: g.depth,
-                },
-                tg,
-            ),
-            Grid::Threads(g) => cmd.concurrentDispatchThreads_threadsPerThreadgroup(
-                MTLSize {
-                    width: g.width,
-                    height: g.height,
-                    depth: g.depth,
-                },
-                tg,
-            ),
         }
         command_of[pos] = Some(cmd_index);
         reference.push(d.clone());
@@ -1411,7 +1532,7 @@ fn encode_plan(
     } else {
         Vec::new()
     };
-    let runs = runs
+    let runs: Vec<Run> = runs
         .into_iter()
         .map(|r| {
             let resident = if plan_wide {
@@ -1449,14 +1570,164 @@ fn encode_plan(
         })
         .collect();
 
+    let ranges = runs.iter().map(|r| Arc::clone(&r.range)).collect();
     Ok(Plan {
         command_of,
-        runs,
         run_at,
-        reference,
+        layout: Arc::new(Layout {
+            reference,
+            barrier,
+            max_bind,
+            runs,
+        }),
+        generations: vec![Generation {
+            icb,
+            ranges,
+            used: false,
+            last_use: None,
+        }],
+        current: 0,
         plan_resident: plan_resident.len(),
         barriers,
     })
+}
+
+/// A `ConcurrentDispatch` ICB of `count` commands binding up to `max_bind`
+/// buffers each.
+fn new_icb(
+    device: &crate::kernels::metal::Device,
+    max_bind: usize,
+    count: usize,
+) -> Result<Retained<ProtocolObject<dyn MTLIndirectCommandBuffer>>, crate::kernels::MetalKernelError>
+{
+    let desc = MTLIndirectCommandBufferDescriptor::new();
+    // Dispatch cannot be mixed with any other command type in one descriptor
+    // (`MTLIndirectCommandBuffer.h`), so this is the only type set.
+    desc.setCommandTypes(MTLIndirectCommandType::ConcurrentDispatch);
+    // Every command carries its own pipeline and its own bindings.
+    // `inheritBuffers` would make them all inherit the parent encoder's
+    // identically, which cannot express per-dispatch bindings -- the only reason
+    // to want them (§3.7c).
+    desc.setInheritBuffers(false);
+    desc.setInheritPipelineState(false);
+    desc.setMaxKernelBufferBindCount(max_bind);
+
+    // SAFETY: the descriptor is fully initialised above and the count is the
+    // number of commands about to be encoded.
+    let icb = unsafe {
+        device
+            .as_ref()
+            .newIndirectCommandBufferWithDescriptor_maxCommandCount_options(
+                &desc,
+                count,
+                MTLResourceOptions::empty(),
+            )
+    }
+    .ok_or_else(|| {
+        crate::kernels::MetalKernelError::FailedToCreateResource(format!(
+            "MTLIndirectCommandBuffer of {} commands",
+            count
+        ))
+    })?;
+
+    Ok(icb)
+}
+
+/// Encode one covered position into `cmd`: its pipeline, its barrier, its
+/// bindings and its grid, exactly as recorded.
+fn encode_command(
+    cmd: &ProtocolObject<dyn MTLIndirectComputeCommand>,
+    d: &StepDispatch,
+    barrier: bool,
+) {
+    let pipeline = d
+        .pipeline
+        .as_ref()
+        .expect("covered positions have a pipeline; checked in build_plan");
+    cmd.setComputePipelineState(pipeline_raw(pipeline));
+    if barrier {
+        cmd.setBarrier();
+    }
+    for (b, buf) in d.bindings.iter().zip(d.retained.iter()) {
+        // SAFETY: the buffer outlives the ICB -- it is retained in the run's
+        // residency set and the plan owns both -- and the index is under
+        // `maxKernelBufferBindCount`, the maximum over exactly these bindings.
+        unsafe { cmd.setKernelBuffer_offset_atIndex(buf.as_ref(), b.offset, b.index) };
+    }
+    let tg = MTLSize {
+        width: d.threads_per_threadgroup.width,
+        height: d.threads_per_threadgroup.height,
+        depth: d.threads_per_threadgroup.depth,
+    };
+    // The two forms are kept distinct rather than normalised. §11.1c: the
+    // conversion is lossy, because `dispatchThreads` lets Metal size the
+    // final partial threadgroup and a rounded replay would run more threads
+    // and report a different `threads_per_threadgroup` inside the kernel.
+    // Any threadgroup-wide reduction would then compute a different answer.
+    match d.grid {
+        Grid::Threadgroups(g) => cmd.concurrentDispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: g.width,
+                height: g.height,
+                depth: g.depth,
+            },
+            tg,
+        ),
+        Grid::Threads(g) => cmd.concurrentDispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: g.width,
+                height: g.height,
+                depth: g.depth,
+            },
+            tg,
+        ),
+    }
+}
+
+/// Encode a new generation of `layout` into a fresh ICB, sharing each run's
+/// residency with the first generation.
+fn build_generation(
+    device: &crate::kernels::metal::Device,
+    layout: &Layout,
+) -> Result<Generation, crate::kernels::MetalKernelError> {
+    let icb = new_icb(device, layout.max_bind, layout.reference.len())?;
+    for (i, d) in layout.reference.iter().enumerate() {
+        // SAFETY: `i` < `reference.len()`, the count the ICB was created with.
+        let cmd = unsafe { icb.indirectComputeCommandAtIndex(i) };
+        encode_command(&cmd, d, layout.barrier[i]);
+    }
+    let ranges = layout
+        .runs
+        .iter()
+        .map(|r| {
+            Arc::new(IcbRange {
+                icb: icb.clone(),
+                resident: r.range.resident.clone(),
+                resident_ptrs: r.range.resident_ptrs.clone(),
+                written: r.range.written.clone(),
+            })
+        })
+        .collect();
+    Ok(Generation {
+        icb,
+        ranges,
+        used: false,
+        last_use: None,
+    })
+}
+
+/// Set every command's pipeline in `icb` again, restarting the count
+/// [`Generation`] describes. Only for an ICB no command buffer in flight uses.
+fn refresh_pipelines(icb: &ProtocolObject<dyn MTLIndirectCommandBuffer>, layout: &Layout) {
+    for (i, d) in layout.reference.iter().enumerate() {
+        // SAFETY: `i` < `reference.len()`, the count the ICB was created with.
+        let cmd = unsafe { icb.indirectComputeCommandAtIndex(i) };
+        let pipeline = d
+            .pipeline
+            .as_ref()
+            .expect("covered positions have a pipeline");
+        cmd.setComputePipelineState(pipeline_raw(pipeline));
+    }
 }
 
 /// Which residency set each run declares at its `executeCommandsInBuffer`.

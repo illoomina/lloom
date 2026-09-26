@@ -1103,12 +1103,9 @@ fn run_gemv_epilogue_steps(
 /// for bit — every operand-carrying epilogue, both dtypes, both
 /// orientations, at the model's tiles including its FFN shape (lloom #732).
 ///
-/// This is the kernel-level gate row 5 was missing; it passes, and that is
-/// the finding beside it: on the model the replayed `_swiglu_packed` output
-/// diverges from the classical dispatch (`measurements/
-/// issue-732-replay-on-the-loop.md` §5), so the kernel replays correctly in
-/// isolation and wrongly in the chain — the quarantine (`is_quarantined`)
-/// stands on the model-level digest, not on this test.
+/// Six steps, so each command runs at most four times: this pins what one
+/// replay computes. What a command does over many executions is
+/// `a_command_replayed_every_step_matches_classical_on_every_step`.
 #[test]
 fn replayed_fused_gemv_epilogues_match_the_classical_ones() {
     use crate::kernels::kernels::mlx_gemm::{GemmDType, GemvEpilogue};
@@ -1135,18 +1132,6 @@ fn replayed_fused_gemv_epilogues_match_the_classical_ones() {
                         "{label} {dtype:?} {shape:?}: never replayed"
                     );
                     let coverage = executor.coverage();
-                    // The swiglu is quarantined on the model (`is_quarantined`), so
-                    // under the executor its position is excluded and this arm
-                    // compares classical against classical — stated rather than
-                    // silently vacuous: the row still checks the exclusion engages.
-                    if matches!(epilogue, GemvEpilogue::Swiglu) {
-                        assert_eq!(
-                            coverage.quarantined, 1,
-                            "{label}: the quarantine did not engage"
-                        );
-                        assert_eq!(coverage.covered, 0);
-                        continue;
-                    }
                     assert!(
                         coverage.covered > 0,
                         "{label} {dtype:?} {shape:?}: nothing covered: {coverage:?}"
@@ -1176,14 +1161,13 @@ fn replayed_fused_gemv_epilogues_match_the_classical_ones() {
     }
 }
 
-/// The quarantine list engages on the packed swiglu name and nothing else
-/// (lloom #732): a mutation that empties it is what the model-level digest
-/// gate (`lfm2-smoke --replay --gemv-gate swiglu`) catches; this pins the
-/// predicate itself.
+/// The quarantine list is empty: the swiglu it held is replayed, and the
+/// model-level digest gate (`replay-adaptive/gate.sh`) is what shows that is
+/// right.
 #[test]
-fn the_quarantine_names_the_swiglu_and_only_the_swiglu() {
+fn the_quarantine_list_is_empty() {
     use crate::kernels::metal::icb::is_quarantined;
-    assert!(is_quarantined(
+    assert!(!is_quarantined(
         "gemv_float16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0_swiglu_packed"
     ));
     assert!(!is_quarantined(
@@ -1198,186 +1182,315 @@ fn the_quarantine_names_the_swiglu_and_only_the_swiglu() {
     assert!(!is_quarantined("rmsnorm_f16_packed"));
 }
 
-/// The model's MLP under replay WITH THE PREVIOUS STEP IN FLIGHT (lloom
-/// #732): every ingredient the crown has — f16, a `StorageModePrivate`
-/// arena, the swiglu reading x at +512000 and writing h at +0, the packed
-/// `w2` consumer reading h and writing its output INTO x's slot, thirty
-/// pairs a step — and, unlike every other test here, the step is committed
-/// without waiting: the next step is encoded while this one runs, as the
-/// loop does. `--readback blocking` (a wait every step) was the one arm on
-/// which the model's divergence vanished, so the in-flight predecessor is
-/// the ingredient the earlier harness lacked.
+/// How many steps [`run_mlp_steps`] runs: enough that each replayed command
+/// is executed well past the 7th time, the first execution
+/// `icb::Generation` guards against (lloom #740).
+const MLP_STEPS: usize = 40;
+
+/// The model's MLP, thirty `swiglu -> w2` pairs a step, [`MLP_STEPS`] steps:
+/// f16, a `StorageModePrivate` arena, the swiglu reading x at +512000 and
+/// writing h at +0, `w2` reading h and writing its output (plus a residual)
+/// INTO x's slot. Every step starts from the same x (a classical copy) and
+/// ends by copying its output into its own row of the result, so every step
+/// computes the same thing and a wrong step is found by index.
 ///
-/// `LLOOM_ICB_QUARANTINE_OFF=1` lifts the quarantine for the run so the
-/// swiglu is actually replayed (it is quarantined by name on the tree).
-#[test]
-fn a_replayed_long_command_with_the_previous_step_in_flight() {
+/// `consumer` is how `w2` runs under the executor; see [`Consumer`]. Without
+/// an executor both kernels bind inline (`Split`): the reference.
+///
+/// Each step is committed without a host wait unless `wait_each_step`, so the
+/// next step is encoded while this one runs, as the decode loop does.
+fn run_mlp_steps(
+    executor: Option<&Arc<IcbExecutor>>,
+    consumer: Consumer,
+    wait_each_step: bool,
+) -> Vec<f32> {
     use crate::kernels::kernels::mlx_gemm::{call_mlx_gemv_epilogue, GemmDType, GemvEpilogue};
-    use crate::kernels::metal::encoder::{set_hazard_key, HazardKey};
+    use crate::kernels::kernels::unary::{call_copy2d_with, copy2d};
     use half::f16;
-    require_icb_support!("a_replayed_long_command_with_the_previous_step_in_flight");
-    let (k, n_out, reps, steps) = (2048usize, 10752usize, 30usize, 8usize);
-    let wait_each_step = std::env::var("LLOOM_ICB_WAIT").is_ok();
-    let run = |executor: Option<&Arc<IcbExecutor>>| -> Vec<f32> {
-        let device = device();
-        let kernels = Kernels::new();
-        let cmds = commands(&device);
-        if let Some(e) = executor {
-            cmds.set_executor(Arc::new(ExecutorSlot::Custom(e.clone())));
-        }
-        let shared = crate::kernels::RESOURCE_OPTIONS;
-        let private = objc2_metal::MTLResourceOptions(
-            objc2_metal::MTLResourceOptions::StorageModePrivate.0
-                | objc2_metal::MTLResourceOptions::HazardTrackingModeUntracked.0,
-        );
-        let mk = |v: &[f32]| -> crate::kernels::metal::Buffer {
-            let h: Vec<f16> = v.iter().map(|x| f16::from_f32(*x)).collect();
-            device
-                .new_buffer_with_data(h.as_ptr() as *const std::ffi::c_void, h.len() * 2, shared)
-                .unwrap()
-        };
-        let up: Vec<f32> = (0..n_out * k)
-            .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
-            .collect();
-        let gate: Vec<f32> = (0..n_out * k)
-            .map(|i| ((i % 19) as f32 - 9.0) / 32.0)
-            .collect();
-        let w2: Vec<f32> = (0..n_out * k)
-            .map(|i| ((i % 23) as f32 - 11.0) / 256.0)
-            .collect();
-        let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
-        let res: Vec<f32> = (0..k).map(|i| ((i % 5) as f32 - 2.0) / 8.0).collect();
-        let (up_buf, gate_buf, w2_buf) = (mk(&up), mk(&gate), mk(&w2));
-        let staging = device.new_buffer(1 << 20, shared).unwrap();
-        unsafe {
-            let v: Vec<f16> = vec.iter().map(|x| f16::from_f32(*x)).collect();
-            let r: Vec<f16> = res.iter().map(|x| f16::from_f32(*x)).collect();
-            std::ptr::copy_nonoverlapping(
-                v.as_ptr() as *const u8,
-                (staging.contents() as *mut u8).add(512000),
-                k * 2,
-            );
+    let (k, n_out, reps, steps) = (2048usize, 10752usize, 30usize, MLP_STEPS);
+    let device = device();
+    let kernels = Kernels::new();
+    let cmds = commands(&device);
+    if let Some(e) = executor {
+        cmds.set_executor(Arc::new(ExecutorSlot::Custom(e.clone())));
+    }
+    let shared = crate::kernels::RESOURCE_OPTIONS;
+    let private = objc2_metal::MTLResourceOptions(
+        objc2_metal::MTLResourceOptions::StorageModePrivate.0
+            | objc2_metal::MTLResourceOptions::HazardTrackingModeUntracked.0,
+    );
+    let mk = |v: &[f32]| -> crate::kernels::metal::Buffer {
+        let h: Vec<f16> = v.iter().map(|x| f16::from_f32(*x)).collect();
+        device
+            .new_buffer_with_data(h.as_ptr() as *const std::ffi::c_void, h.len() * 2, shared)
+            .unwrap()
+    };
+    let up: Vec<f32> = (0..n_out * k)
+        .map(|i| ((i % 17) as f32 - 8.0) / 32.0)
+        .collect();
+    let gate: Vec<f32> = (0..n_out * k)
+        .map(|i| ((i % 19) as f32 - 9.0) / 32.0)
+        .collect();
+    let w2: Vec<f32> = (0..n_out * k)
+        .map(|i| ((i % 23) as f32 - 11.0) / 256.0)
+        .collect();
+    let vec: Vec<f32> = (0..k).map(|i| ((i % 13) as f32 - 6.0) / 16.0).collect();
+    let res: Vec<f32> = (0..k).map(|i| ((i % 5) as f32 - 2.0) / 8.0).collect();
+    let (up_buf, gate_buf, w2_buf, x0) = (mk(&up), mk(&gate), mk(&w2), mk(&vec));
+    let staging = device.new_buffer(1 << 20, shared).unwrap();
+    // SAFETY: shared storage of 1 MiB, nothing in flight; both copies are
+    // `k` f16 values inside it.
+    unsafe {
+        let r: Vec<f16> = res.iter().map(|x| f16::from_f32(*x)).collect();
+        for at in [772096, 776192] {
             std::ptr::copy_nonoverlapping(
                 r.as_ptr() as *const u8,
-                (staging.contents() as *mut u8).add(772096),
+                (staging.contents() as *mut u8).add(at),
                 k * 2,
             );
         }
-        let arena = device.new_buffer(1 << 20, private).unwrap();
-        {
-            let mut blit = cmds.blit_command_encoder().unwrap();
-            blit.copy_from_buffer(&staging, 0, &arena, 0, 1 << 20);
+    }
+    let arena = device.new_buffer(1 << 20, private).unwrap();
+    {
+        let mut blit = cmds.blit_command_encoder().unwrap();
+        blit.copy_from_buffer(&staging, 0, &arena, 0, 1 << 20);
+    }
+    cmds.flush_and_wait().unwrap();
+    let x = arena.view(512000, 256000);
+    let h = arena.view(0, 512000);
+    let o = arena.view(512000, 256000);
+    // Two identical copies: a consumer that alternates between them computes
+    // the same thing and moves its binding offset every step.
+    let residuals = [arena.view(772096, 4096), arena.view(776192, 4096)];
+    let results = device.new_buffer(steps * k * 2, shared).unwrap();
+    let (producer_style, consumer_style) = match (executor.is_some(), consumer) {
+        (false, _) => (ParamStyle::Split, ParamStyle::Split),
+        (true, Consumer::Replayed | Consumer::PackedMoving) => {
+            (ParamStyle::Packed, ParamStyle::Packed)
         }
-        cmds.flush_and_wait().unwrap();
-        let x = arena.view(512000, 256000);
-        let h = arena.view(0, 512000);
-        let o = arena.view(512000, 256000);
-        let residual = arena.view(772096, 4096);
-        let style = if executor.is_some() {
-            ParamStyle::Packed
-        } else {
-            ParamStyle::Split
-        };
-        for _ in 0..steps {
-            for _ in 0..reps {
-                {
-                    let guard = cmds.command_encoder().unwrap();
-                    call_mlx_gemv_epilogue(
-                        &device,
-                        &guard,
-                        &kernels,
-                        GemmDType::F16,
-                        (1, 1, n_out, k),
-                        &[k, k, 1],
-                        0,
-                        &x,
-                        &[1, k],
-                        0,
-                        &up_buf,
-                        &h,
-                        style,
-                        None,
-                        GemvEpilogue::Swiglu,
-                        Some((&gate_buf, 0)),
-                    )
-                    .unwrap();
-                }
-                {
-                    let guard = cmds.command_encoder().unwrap();
-                    call_mlx_gemv_epilogue(
-                        &device,
-                        &guard,
-                        &kernels,
-                        GemmDType::F16,
-                        (1, 1, k, n_out),
-                        &[n_out, n_out, 1],
-                        0,
-                        &h,
-                        &[1, n_out],
-                        0,
-                        &w2_buf,
-                        &o,
-                        style,
-                        None,
-                        GemvEpilogue::Residual,
-                        Some((&residual, 0)),
-                    )
-                    .unwrap();
-                }
-            }
-            if wait_each_step {
-                cmds.flush_and_wait().unwrap();
-            } else {
-                cmds.flush().unwrap();
-            }
-            if let Some(e) = executor {
-                e.end_step(&device, &cmds).unwrap();
-            }
-        }
-        {
-            let mut blit = cmds.blit_command_encoder().unwrap();
-            blit.copy_from_buffer(&arena, 0, &staging, 0, 1 << 20);
-        }
-        cmds.flush_and_wait().unwrap();
-        unsafe {
-            std::slice::from_raw_parts(
-                (staging.contents() as *const u8).add(512000) as *const f16,
+        (true, Consumer::Inline) => (ParamStyle::Packed, ParamStyle::Split),
+    };
+    let copy =
+        |src: &crate::kernels::metal::Buffer, dst: &crate::kernels::metal::Buffer, dst_off| {
+            let guard = cmds.command_encoder().unwrap();
+            call_copy2d_with(
+                &device,
+                &guard,
+                &kernels,
+                copy2d::HALF,
+                src,
+                dst,
+                1,
                 k,
+                k,
+                k,
+                0,
+                dst_off,
+                ParamStyle::Split,
             )
+            .unwrap();
+        };
+    for step in 0..steps {
+        let residual = match consumer {
+            Consumer::PackedMoving => &residuals[step % 2],
+            _ => &residuals[0],
+        };
+        copy(&x0, &x, 0);
+        for _ in 0..reps {
+            {
+                let guard = cmds.command_encoder().unwrap();
+                call_mlx_gemv_epilogue(
+                    &device,
+                    &guard,
+                    &kernels,
+                    GemmDType::F16,
+                    (1, 1, n_out, k),
+                    &[k, k, 1],
+                    0,
+                    &x,
+                    &[1, k],
+                    0,
+                    &up_buf,
+                    &h,
+                    producer_style,
+                    None,
+                    GemvEpilogue::Swiglu,
+                    Some((&gate_buf, 0)),
+                )
+                .unwrap();
+            }
+            {
+                let guard = cmds.command_encoder().unwrap();
+                call_mlx_gemv_epilogue(
+                    &device,
+                    &guard,
+                    &kernels,
+                    GemmDType::F16,
+                    (1, 1, k, n_out),
+                    &[n_out, n_out, 1],
+                    0,
+                    &h,
+                    &[1, n_out],
+                    0,
+                    &w2_buf,
+                    &o,
+                    consumer_style,
+                    None,
+                    GemvEpilogue::Residual,
+                    Some((residual, 0)),
+                )
+                .unwrap();
+            }
         }
+        copy(&o, &results, step * k * 2);
+        if wait_each_step {
+            cmds.flush_and_wait().unwrap();
+        } else {
+            cmds.flush().unwrap();
+        }
+        if let Some(e) = executor {
+            e.end_step(&device, &cmds).unwrap();
+        }
+    }
+    cmds.flush_and_wait().unwrap();
+    // SAFETY: completed, shared storage; `steps * k` f16 values.
+    unsafe { std::slice::from_raw_parts(results.contents() as *const f16, steps * k) }
         .iter()
         .map(|v| v.to_f32())
         .collect()
-    };
+}
+
+/// How `w2`, the swiglu's consumer, runs while the swiglu is replayed.
+#[derive(Clone, Copy, Debug)]
+enum Consumer {
+    /// Packed and stable, so replayed: each pair is one ICB run and `w2` is
+    /// ordered after the swiglu by its command's `setBarrier`.
+    Replayed,
+    /// Bound inline, which the plan excludes (`Excluded::InlineConstants`):
+    /// the swiglu is a run of one and `w2` a classical dispatch ordered after
+    /// the range by the encoder's memory barrier.
+    Inline,
+    /// The packed kernel, excluded because its residual binding moves every
+    /// step (`Excluded::Varies`): a classical dispatch of the kernel the model
+    /// runs, reading its constants from the pool.
+    PackedMoving,
+}
+
+/// Steps of `run`, `k` values each, whose output differs from `reference`'s.
+fn differing_steps(run: &[f32], reference: &[f32], k: usize) -> Vec<usize> {
+    (0..reference.len() / k)
+        .filter(|s| {
+            run[s * k..(s + 1) * k]
+                .iter()
+                .zip(&reference[s * k..(s + 1) * k])
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+        })
+        .collect()
+}
+
+/// Replay the MLP with `w2` as `consumer` against the classical reference and
+/// require every step to agree bit for bit.
+///
+/// Before lloom #740 the swiglu's command went wrong on its 7th, 13th, 20th
+/// and 26th execution (steps 8, 14, 21, 27 here): the trailing simdgroups of
+/// each threadgroup never ran. The step count is what reaches it; eight steps,
+/// which this harness ran first, stop one execution short.
+fn assert_mlp_replays_like_classical(consumer: Consumer, wait_each_step: bool, what: &str) {
+    use crate::kernels::metal::encoder::{set_hazard_key, HazardKey};
+    let k = 2048;
     set_hazard_key(HazardKey::Range);
     set_default_param_style(ParamStyle::Packed);
     set_constants_pool_enabled(true);
     let executor = IcbExecutor::new(2);
-    let replayed = run(Some(&executor));
+    let replayed = run_mlp_steps(Some(&executor), consumer, wait_each_step);
     set_default_param_style(ParamStyle::Split);
     set_constants_pool_enabled(false);
-    let classical = run(None);
+    let classical = run_mlp_steps(None, consumer, wait_each_step);
     set_hazard_key(HazardKey::Pointer);
     let cov = executor.coverage();
     eprintln!(
-        "[F] wait_each_step={wait_each_step} covered={} quarantined={} stale={}",
+        "[{what}] covered={} inline={} varies={} runs={} barriers={} stale={} \
+         generations_built={} pipeline_refreshes={} skipped_steps={}",
         cov.covered,
-        cov.quarantined,
-        executor.stale_positions()
+        cov.inline_constants,
+        cov.varies,
+        executor.runs(),
+        executor.encoded_barriers(),
+        executor.stale_positions(),
+        executor.generations_built(),
+        executor.pipeline_refreshes(),
+        executor.skipped_steps(),
     );
-    assert!(executor.is_replaying(), "never replayed");
-    let differing = replayed
-        .iter()
-        .zip(&classical)
-        .filter(|(a, b)| a.to_bits() != b.to_bits())
-        .count();
-    eprintln!(
-        "[F] o differs on {differing}/{k}; replayed[..3]={:?} classical[..3]={:?}",
-        &replayed[..3],
-        &classical[..3]
+    assert!(executor.is_replaying(), "{what}: never replayed");
+    assert_eq!(cov.quarantined, 0, "{what}: the swiglu was quarantined");
+    assert!(
+        cov.covered >= 30,
+        "{what}: the swiglu was not covered: {cov:?}"
     );
-    assert_eq!(
-        differing, 0,
-        "the residual stream after 8 in-flight steps differs from classical"
+    // The reference must be a reference: every classical step computes the
+    // same thing, so every one equals the first.
+    let classical_first = classical[..k].repeat(MLP_STEPS);
+    assert!(
+        differing_steps(&classical, &classical_first, k).is_empty(),
+        "{what}: the classical steps disagree with each other"
     );
+    assert!(distinct(&replayed) > 2, "{what}: vacuous replayed output");
+    // Replay must actually have run on most steps, or a pass reads nothing.
+    assert!(
+        executor.skipped_steps() < MLP_STEPS / 4,
+        "{what}: {} of {MLP_STEPS} steps fell back to classical",
+        executor.skipped_steps()
+    );
+    // The rotation engaged: a waited step always finds its last generation
+    // complete and refreshes it; an unwaited one builds or refreshes.
+    if wait_each_step {
+        assert!(
+            executor.pipeline_refreshes() > 0 && executor.skipped_steps() == 0,
+            "{what}: a waited run must reuse generations and never fall back"
+        );
+    } else {
+        assert!(
+            executor.generations_built() + executor.pipeline_refreshes() > 0,
+            "{what}: no generation was built or refreshed"
+        );
+    }
+    let bad = differing_steps(&replayed, &classical, k);
+    eprintln!("[{what}] steps whose output differs from classical: {bad:?}");
+    assert!(
+        bad.is_empty(),
+        "{what}: {} replayed steps differ from classical, first {:?}",
+        bad.len(),
+        &bad[..bad.len().min(8)]
+    );
+}
+
+/// The swiglu and `w2` both replayed, each step committed without waiting.
+#[test]
+fn a_replayed_long_command_with_the_previous_step_in_flight() {
+    require_icb_support!("a_replayed_long_command_with_the_previous_step_in_flight");
+    assert_mlp_replays_like_classical(Consumer::Replayed, false, "replayed consumer");
+}
+
+/// The swiglu replayed and `w2` classical (bound inline).
+#[test]
+fn a_classical_consumer_of_a_replayed_long_command() {
+    require_icb_support!("a_classical_consumer_of_a_replayed_long_command");
+    assert_mlp_replays_like_classical(Consumer::Inline, false, "inline consumer");
+}
+
+/// The swiglu replayed and `w2` the packed kernel run classically -- the
+/// model's shape when the swiglu is the only replayed position.
+#[test]
+fn a_classical_packed_consumer_of_a_replayed_long_command() {
+    require_icb_support!("a_classical_packed_consumer_of_a_replayed_long_command");
+    assert_mlp_replays_like_classical(Consumer::PackedMoving, false, "packed classical consumer");
+}
+
+/// Every step waited for: each generation's last use has completed by the
+/// next step, so the executor reuses one and sets its pipelines again rather
+/// than encoding new ones -- the path a quiet GPU takes.
+#[test]
+fn a_command_replayed_every_step_matches_classical_on_every_step() {
+    require_icb_support!("a_command_replayed_every_step_matches_classical_on_every_step");
+    assert_mlp_replays_like_classical(Consumer::Inline, true, "waited steps");
 }

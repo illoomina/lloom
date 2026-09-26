@@ -1276,6 +1276,26 @@ impl lloom_tensor::CustomOp3 for GdnStep {
     ) -> Result<(lloom_tensor::MetalStorage, Shape)> {
         use lloom_tensor::backend::BackendStorage;
         let (d, h_v) = (self.d, self.h_v);
+        // Every term that reaches `S` enters at f32 (the model doc's "Gated
+        // DeltaNet"): the kernel reads these buffers as float, so a narrower
+        // input is refused here rather than misread.
+        let f32 = lloom_tensor::DType::F32;
+        if [s1.dtype(), s2.dtype(), s3.dtype()] != [f32; 3]
+            || self.dt_bias.dtype() != f32
+            || self.ssm_a.dtype() != f32
+            || self.s.dtype() != f32
+            || self.s_out.dtype() != f32
+        {
+            lloom_tensor::bail!(
+                "gdn_step: heads / alpha / beta / dt_bias / ssm_a / S must be f32, got {:?} / {:?} / {:?} / {:?} / {:?} / {:?}",
+                s1.dtype(),
+                s2.dtype(),
+                s3.dtype(),
+                self.dt_bias.dtype(),
+                self.ssm_a.dtype(),
+                self.s.dtype()
+            )
+        }
         if l1.shape().elem_count() != 3 * h_v * d
             || l2.shape().elem_count() != h_v
             || l3.shape().elem_count() != h_v

@@ -1129,45 +1129,18 @@ test_device!(
     conv1d_small_gpu,
     conv1d_small_metal
 );
-// Written out rather than through `test_device!` so the Metal arms can carry
-// their known failure: `MetalStorage::conv1d` still multiplies by the
-// uncopied kernel for a non-contiguous layout (docs/architecture.md §2.3.8a).
-// `--ignored` runs them.
-#[test]
-fn conv1d_noncontiguous_kernel_cpu() -> Result<()> {
-    conv1d_noncontiguous_kernel(&Device::Cpu)
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn conv1d_noncontiguous_kernel_gpu() -> Result<()> {
-    conv1d_noncontiguous_kernel(&Device::new_cuda(0)?)
-}
-
-#[cfg(feature = "metal")]
-#[test]
-#[ignore = "Metal conv1d multiplies by the uncopied non-contiguous kernel"]
-fn conv1d_noncontiguous_kernel_metal() -> Result<()> {
-    conv1d_noncontiguous_kernel(&Device::new_metal(0)?)
-}
-
-#[test]
-fn conv1d_grad_batched_cpu() -> Result<()> {
-    conv1d_grad_batched(&Device::Cpu)
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn conv1d_grad_batched_gpu() -> Result<()> {
-    conv1d_grad_batched(&Device::new_cuda(0)?)
-}
-
-#[cfg(feature = "metal")]
-#[test]
-#[ignore = "Metal conv1d multiplies by the uncopied non-contiguous kernel"]
-fn conv1d_grad_batched_metal() -> Result<()> {
-    conv1d_grad_batched(&Device::new_metal(0)?)
-}
+test_device!(
+    conv1d_noncontiguous_kernel,
+    conv1d_noncontiguous_kernel_cpu,
+    conv1d_noncontiguous_kernel_gpu,
+    conv1d_noncontiguous_kernel_metal
+);
+test_device!(
+    conv1d_grad_batched,
+    conv1d_grad_batched_cpu,
+    conv1d_grad_batched_gpu,
+    conv1d_grad_batched_metal
+);
 test_device!(conv2d, conv2d_cpu, conv2d_gpu, conv2d_metal);
 test_device!(
     conv2d_non_square,

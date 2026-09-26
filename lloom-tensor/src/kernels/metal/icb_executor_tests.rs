@@ -1244,7 +1244,7 @@ fn run_mlp_steps(
         for at in [772096, 776192] {
             std::ptr::copy_nonoverlapping(
                 r.as_ptr() as *const u8,
-                (staging.contents() as *mut u8).add(at),
+                staging.contents().add(at),
                 k * 2,
             );
         }

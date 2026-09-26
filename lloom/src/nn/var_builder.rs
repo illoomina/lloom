@@ -913,3 +913,124 @@ impl Renamer for Box<dyn Fn(&str) -> String + Sync + Send> {
         std::borrow::Cow::Owned(self(v))
     }
 }
+
+/// Which tensors of a checkpoint were loaded through a [`RecordingBackend`],
+/// with each tensor's size on disk. Cheap to clone; readable while the
+/// `VarBuilder` that owns the backend is alive or after it is dropped.
+#[derive(Clone)]
+pub struct LoadRecord {
+    names: Arc<[String]>,
+    bytes: Arc<[usize]>,
+    loaded: Arc<[std::sync::atomic::AtomicBool]>,
+}
+
+impl LoadRecord {
+    /// The names loaded so far, sorted.
+    pub fn loaded(&self) -> std::collections::BTreeSet<String> {
+        self.names
+            .iter()
+            .zip(self.loaded.iter())
+            .filter(|(_, f)| f.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    /// How many distinct tensors, and how many bytes on disk, were loaded.
+    pub fn totals(&self) -> (usize, usize) {
+        self.bytes
+            .iter()
+            .zip(self.loaded.iter())
+            .filter(|(_, f)| f.load(std::sync::atomic::Ordering::Relaxed))
+            .fold((0, 0), |(n, b), (sz, _)| (n + 1, b + sz))
+    }
+
+    /// Every tensor the checkpoint's headers name, with its size on disk.
+    pub fn header(&self) -> impl Iterator<Item = (&str, usize)> {
+        self.names
+            .iter()
+            .map(String::as_str)
+            .zip(self.bytes.iter().copied())
+    }
+}
+
+/// A checkpoint backend that records which tensors are loaded through it.
+///
+/// Loading is a lookup by name, so the names a constructor asks for are exactly
+/// the tensors that become device buffers (`DESIGN.md` §5.5a). One flag per
+/// header entry, set on load: no lock, and nothing on any path after load.
+/// Otherwise it is the safetensors backend it wraps, method for method.
+pub struct RecordingBackend {
+    inner: lloom_tensor::safetensors::MmapedSafetensors,
+    index: HashMap<String, usize>,
+    record: LoadRecord,
+}
+
+impl RecordingBackend {
+    /// Map `paths` and record loads against every tensor their headers name.
+    ///
+    /// # Safety
+    ///
+    /// As [`VarBuilderArgs::from_mmaped_safetensors`]: the files must not be
+    /// modified while mapped.
+    pub unsafe fn over_safetensors<P: AsRef<std::path::Path>>(
+        paths: &[P],
+    ) -> Result<(Self, LoadRecord)> {
+        let inner = lloom_tensor::safetensors::MmapedSafetensors::multi(paths)?;
+        let mut entries: Vec<(String, usize)> = inner
+            .tensors()
+            .into_iter()
+            .map(|(n, v)| (n, v.data().len()))
+            .collect();
+        entries.sort();
+        let index = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.clone(), i))
+            .collect();
+        let record = LoadRecord {
+            names: entries.iter().map(|(n, _)| n.clone()).collect(),
+            bytes: entries.iter().map(|(_, b)| *b).collect(),
+            loaded: entries
+                .iter()
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+        };
+        Ok((
+            Self {
+                inner,
+                index,
+                record: record.clone(),
+            },
+            record,
+        ))
+    }
+
+    fn mark(&self, name: &str) {
+        if let Some(&i) = self.index.get(name) {
+            self.record.loaded[i].store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl SimpleBackend for RecordingBackend {
+    fn get(
+        &self,
+        s: Shape,
+        name: &str,
+        h: crate::nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Tensor> {
+        self.mark(name);
+        SimpleBackend::get(&self.inner, s, name, h, dtype, dev)
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> Result<Tensor> {
+        self.mark(name);
+        SimpleBackend::get_unchecked(&self.inner, name, dtype, dev)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        SimpleBackend::contains_tensor(&self.inner, name)
+    }
+}

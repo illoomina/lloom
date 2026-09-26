@@ -6,11 +6,54 @@ use lloom_tensor::{DType, Device, Result, Tensor};
 /// applied to the run of source samples starting there.
 type Taps = Vec<(usize, Vec<f32>)>;
 
-/// Separable antialiased-bilinear taps for one axis, `src_n -> dst_n`.
+/// The kernel an antialiased separable resample convolves with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AaFilter {
+    /// The triangle filter, support 1: `mode="bilinear"`.
+    Bilinear,
+    /// Keys' cubic with `a = -0.5`, support 2: the antialiased `mode="bicubic"`
+    /// of torch and Pillow. torch's non-antialiased bicubic uses `a = -0.75`;
+    /// the two are different filters, not one filter at two settings.
+    Bicubic,
+}
+
+impl AaFilter {
+    fn support(self) -> f64 {
+        match self {
+            Self::Bilinear => 1.0,
+            Self::Bicubic => 2.0,
+        }
+    }
+
+    fn weight(self, t: f64) -> f64 {
+        let t = t.abs();
+        match self {
+            Self::Bilinear => {
+                if t < 1.0 {
+                    1.0 - t
+                } else {
+                    0.0
+                }
+            }
+            Self::Bicubic => {
+                const A: f64 = -0.5;
+                if t < 1.0 {
+                    ((A + 2.0) * t - (A + 3.0)) * t * t + 1.0
+                } else if t < 2.0 {
+                    ((A * t - 5.0 * A) * t + 8.0 * A) * t - 4.0 * A
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
+
+/// Separable antialiased taps for one axis, `src_n -> dst_n`, as `f64`.
 ///
-/// Matches `torch.nn.functional.interpolate(mode="bilinear", align_corners=False,
+/// Matches `torch.nn.functional.interpolate(mode=<filter>, align_corners=False,
 /// antialias=True)` along a single axis. Separability is what makes that legal:
-/// a 2-D triangle filter is the outer product of two 1-D ones, so resampling
+/// a 2-D kernel of this kind is the outer product of two 1-D ones, so resampling
 /// rows then columns is the same operation as one 2-D pass, at `O(n)` taps
 /// instead of `O(n^2)`.
 ///
@@ -19,17 +62,16 @@ type Taps = Vec<(usize, Vec<f32>)>;
 /// `scale < 1` is a **downsample**, and torch widens the filter support by
 /// `1/scale` in exactly that case. That widening *is* the antialiasing: it makes
 /// each output sample average over every source sample that maps onto it, rather
-/// than over the two nearest. Without it a downsample aliases by construction —
-/// source samples between the two taps are simply never read.
+/// than over the nearest few. Without it a downsample aliases by construction —
+/// source samples between the taps are simply never read.
 ///
 /// On an **upsample** (`scale >= 1`) `filter_scale` is 1.0 and this reduces to
-/// ordinary bilinear, which is why `antialias` is a no-op there and why a test
+/// the plain filter, which is why `antialias` is a no-op there and why a test
 /// suite built on upsamples cannot see the difference (lloom #609).
-fn antialias_bilinear_taps(src_n: usize, dst_n: usize) -> Taps {
+pub fn antialias_taps(src_n: usize, dst_n: usize, filter: AaFilter) -> Vec<(usize, Vec<f64>)> {
     let scale = dst_n as f64 / src_n as f64;
     let filter_scale = if scale < 1.0 { 1.0 / scale } else { 1.0 };
-    // A bilinear (triangle) filter has support 1.0, widened on a downsample.
-    let support = filter_scale;
+    let support = filter.support() * filter_scale;
     (0..dst_n)
         .map(|i| {
             // `align_corners=false`: sample at pixel centres.
@@ -39,9 +81,7 @@ fn antialias_bilinear_taps(src_n: usize, dst_n: usize) -> Taps {
             let mut weights = Vec::with_capacity(right.saturating_sub(left));
             let mut total = 0.0f64;
             for j in left..right {
-                // Triangle filter evaluated in source space, scaled.
-                let t = ((j as f64 + 0.5) - centre).abs() / filter_scale;
-                let w = if t < 1.0 { 1.0 - t } else { 0.0 };
+                let w = filter.weight(((j as f64 + 0.5) - centre) / filter_scale);
                 weights.push(w);
                 total += w;
             }
@@ -53,9 +93,161 @@ fn antialias_bilinear_taps(src_n: usize, dst_n: usize) -> Taps {
                     *w /= total;
                 }
             }
-            (left, weights.into_iter().map(|w| w as f32).collect())
+            (left, weights)
         })
         .collect()
+}
+
+/// [`antialias_taps`] for the triangle filter, narrowed to `f32`.
+fn antialias_bilinear_taps(src_n: usize, dst_n: usize) -> Taps {
+    antialias_taps(src_n, dst_n, AaFilter::Bilinear)
+        .into_iter()
+        .map(|(left, w)| (left, w.into_iter().map(|w| w as f32).collect()))
+        .collect()
+}
+
+/// One axis of [`resize_rgb8_antialias`]: the taps in 16-bit fixed point, and
+/// the fraction bits they carry.
+///
+/// The precision is the largest that keeps the largest weight's doubling below
+/// `2^15`, capped at 22 bits, and each weight is rounded half away from zero —
+/// torch's `_compute_index_ranges_int16_weights`, which is what makes a uint8
+/// resize reproduce torch's to the byte.
+fn fixed_point_taps(taps: Vec<(usize, Vec<f64>)>) -> (Vec<(usize, Vec<i16>)>, u32) {
+    let w_max = taps
+        .iter()
+        .flat_map(|(_, w)| w.iter().copied())
+        .fold(0.0f64, f64::max);
+    let mut bits = 0u32;
+    while bits < 22 {
+        let next = (0.5 + w_max * (1u64 << (bits + 1)) as f64) as i64;
+        if next >= 1 << 15 {
+            break;
+        }
+        bits += 1;
+    }
+    let one = (1u64 << bits) as f64;
+    let taps = taps
+        .into_iter()
+        .map(|(left, w)| {
+            let q = w
+                .into_iter()
+                .map(|w| {
+                    let v = w * one;
+                    (if v < 0.0 { v - 0.5 } else { v + 0.5 }) as i16
+                })
+                .collect();
+            (left, q)
+        })
+        .collect();
+    (taps, bits.max(1))
+}
+
+/// One fixed-point pass over axis `stride`-separated samples: `src` holds
+/// `outer` lines of `src_n` samples of `channels` bytes, `dst` receives `outer`
+/// lines of `taps.len()` samples. `line` / `step` are the element distances
+/// between consecutive lines and consecutive samples on the resampled axis.
+#[allow(clippy::too_many_arguments)]
+fn fixed_point_pass(
+    src: &[u8],
+    dst: &mut [u8],
+    taps: &[(usize, Vec<i16>)],
+    bits: u32,
+    outer: usize,
+    src_line: usize,
+    src_step: usize,
+    dst_line: usize,
+    dst_step: usize,
+    channels: usize,
+) {
+    let round = 1i32 << (bits - 1);
+    for o in 0..outer {
+        for (i, (left, w)) in taps.iter().enumerate() {
+            for c in 0..channels {
+                let mut acc = round;
+                for (k, &wk) in w.iter().enumerate() {
+                    let s = src[o * src_line + (left + k) * src_step + c] as i32;
+                    acc += s * wk as i32;
+                }
+                dst[o * dst_line + i * dst_step + c] = (acc >> bits).clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// Resize an interleaved 8-bit image `[height, width, channels]` to
+/// `[new_height, new_width, channels]`, antialiased, in fixed point.
+///
+/// Reproduces `torchvision.transforms.v2.functional.resize` on a CPU `uint8`
+/// tensor (`antialias=True`, `align_corners=False`) **byte for byte**: torch
+/// resizes `uint8` natively for bilinear and bicubic, with 16-bit fixed-point
+/// weights ([`fixed_point_taps`]), the horizontal pass first, and the
+/// intermediate rounded to `uint8` between the passes. A float resample
+/// rounded once at the end differs from it by one level on a fraction of the
+/// pixels, which a patch-level comparison against the reference sees as a
+/// preprocessing defect. An axis whose size does not change is not resampled,
+/// and a resize to the same size returns the input.
+pub fn resize_rgb8_antialias(
+    src: &[u8],
+    height: usize,
+    width: usize,
+    channels: usize,
+    new_height: usize,
+    new_width: usize,
+    filter: AaFilter,
+) -> Result<Vec<u8>> {
+    if src.len() != height * width * channels {
+        lloom_tensor::bail!(
+            "resize: {} bytes for a {height}x{width}x{channels} image",
+            src.len()
+        );
+    }
+    if new_height == 0 || new_width == 0 || height == 0 || width == 0 {
+        lloom_tensor::bail!(
+            "resize: {height}x{width} -> {new_height}x{new_width} has an empty side"
+        );
+    }
+    let mut cur = src.to_vec();
+    let mut w_now = width;
+    if new_width != width {
+        let (taps, bits) = fixed_point_taps(antialias_taps(width, new_width, filter));
+        let mut out = vec![0u8; height * new_width * channels];
+        fixed_point_pass(
+            &cur,
+            &mut out,
+            &taps,
+            bits,
+            height,
+            width * channels,
+            channels,
+            new_width * channels,
+            channels,
+            channels,
+        );
+        cur = out;
+        w_now = new_width;
+    }
+    if new_height != height {
+        let (taps, bits) = fixed_point_taps(antialias_taps(height, new_height, filter));
+        let mut out = vec![0u8; new_height * w_now * channels];
+        // Each column is a line; consecutive samples are a row apart.
+        for x in 0..w_now {
+            fixed_point_pass(
+                &cur[x * channels..],
+                &mut out[x * channels..],
+                &taps,
+                bits,
+                1,
+                0,
+                w_now * channels,
+                0,
+                w_now * channels,
+                channels,
+            );
+        }
+        cur = out;
+    }
+    Ok(cur)
 }
 
 /// Antialiased bilinear resample of a **host-side** `[side, side, dim]` position
@@ -277,6 +469,122 @@ mod tests {
     use super::*;
 
     // Regression test for https://github.com/huggingface/candle/issues/3582
+    /// A 7x5 RGB image whose bytes are `(i * 53 + 17) % 256`.
+    fn probe_image() -> Vec<u8> {
+        (0..7 * 5 * 3)
+            .map(|i| ((i * 53 + 17) % 256) as u8)
+            .collect()
+    }
+
+    /// `torchvision.transforms.v2.functional.resize` on the probe image as a
+    /// CPU uint8 tensor, `antialias=True` (torch 2.14.0, torchvision 0.29.0),
+    /// pinned byte for byte: a downscale, an upscale, and one axis alone.
+    #[test]
+    fn the_uint8_resize_is_torchvisions_byte_for_byte() {
+        let src = probe_image();
+        let cases: &[(usize, usize, AaFilter, &[u8])] = &[
+            (
+                4,
+                3,
+                AaFilter::Bicubic,
+                &[
+                    100, 102, 92, 127, 114, 143, 142, 142, 126, 114, 80, 141, 115, 129, 146, 127,
+                    145, 84, 76, 134, 162, 121, 159, 84, 158, 80, 139, 126, 179, 81, 176, 80, 143,
+                    77, 131, 184,
+                ],
+            ),
+            (
+                4,
+                3,
+                AaFilter::Bilinear,
+                &[
+                    99, 100, 95, 123, 119, 142, 145, 140, 124, 110, 84, 137, 119, 131, 144, 129,
+                    141, 89, 81, 134, 158, 128, 152, 92, 150, 86, 139, 123, 176, 90, 170, 88, 134,
+                    82, 128, 181,
+                ],
+            ),
+            (
+                11,
+                9,
+                AaFilter::Bicubic,
+                &[
+                    2, 54, 129, 62, 121, 89, 166, 236, 25, 133, 213, 91, 77, 130, 183, 181, 58,
+                    125, 252, 41, 96, 177, 145, 211, 130, 205, 255, 14, 75, 141, 74, 94, 101, 178,
+                    128, 37, 152, 145, 103, 89, 142, 195, 113, 77, 145, 144, 53, 97, 150, 157, 133,
+                    151, 217, 152, 33, 108, 160, 94, 64, 120, 198, 0, 56, 181, 63, 123, 108, 161,
+                    215, 31, 105, 176, 10, 73, 105, 120, 177, 36, 184, 237, 2, 49, 125, 178, 116,
+                    82, 137, 232, 14, 73, 209, 82, 149, 126, 179, 250, 49, 121, 201, 30, 91, 121,
+                    138, 207, 55, 201, 255, 22, 75, 142, 195, 102, 102, 158, 150, 38, 94, 160, 104,
+                    116, 143, 196, 164, 76, 144, 168, 54, 100, 143, 158, 149, 81, 218, 174, 47,
+                    106, 159, 212, 66, 119, 181, 2, 55, 119, 68, 121, 50, 160, 213, 10, 103, 173,
+                    102, 71, 104, 168, 175, 42, 104, 235, 11, 64, 124, 176, 249, 80, 136, 212, 9,
+                    71, 138, 78, 147, 61, 177, 249, 16, 120, 200, 114, 90, 120, 186, 206, 51, 122,
+                    255, 17, 81, 140, 193, 186, 100, 155, 173, 36, 92, 149, 102, 127, 88, 194, 189,
+                    44, 141, 179, 136, 101, 141, 202, 167, 78, 138, 200, 45, 98, 158, 211, 13, 118,
+                    179, 57, 54, 117, 152, 120, 56, 118, 212, 23, 62, 171, 108, 154, 104, 166, 220,
+                    51, 102, 156, 25, 63, 116, 177, 230, 0, 137, 200, 56, 73, 138, 169, 139, 62,
+                    139, 231, 15, 81, 192, 114, 173, 121, 187, 239, 50, 123, 175, 15, 82, 135, 189,
+                    242, 17, 149, 211, 78, 85, 149, 182, 151, 80, 150, 243, 40, 93, 203, 132, 185,
+                    134, 198, 251, 72, 134, 187, 41, 94, 147,
+                ],
+            ),
+            (
+                11,
+                9,
+                AaFilter::Bilinear,
+                &[
+                    17, 70, 123, 70, 123, 91, 158, 211, 37, 133, 186, 97, 79, 132, 185, 167, 78,
+                    131, 227, 53, 106, 173, 141, 194, 141, 194, 247, 29, 82, 135, 82, 97, 103, 170,
+                    120, 49, 145, 134, 109, 91, 144, 197, 115, 90, 143, 136, 65, 105, 147, 153,
+                    129, 153, 206, 143, 46, 99, 152, 99, 67, 120, 187, 13, 66, 162, 73, 126, 108,
+                    161, 214, 54, 107, 160, 29, 82, 106, 117, 170, 52, 170, 223, 20, 64, 117, 170,
+                    117, 85, 138, 205, 31, 84, 180, 91, 144, 126, 179, 232, 72, 125, 178, 47, 100,
+                    124, 135, 188, 70, 188, 241, 38, 81, 134, 187, 103, 102, 155, 139, 48, 101,
+                    145, 108, 119, 143, 196, 156, 89, 142, 153, 64, 106, 141, 152, 143, 87, 205,
+                    165, 55, 98, 151, 204, 66, 119, 172, 12, 65, 118, 72, 125, 64, 160, 213, 10,
+                    106, 159, 98, 81, 105, 158, 169, 51, 104, 222, 19, 72, 115, 168, 221, 83, 136,
+                    189, 29, 82, 135, 89, 142, 81, 177, 230, 27, 123, 176, 115, 98, 122, 175, 186,
+                    68, 121, 239, 36, 89, 132, 185, 169, 100, 153, 160, 46, 99, 144, 106, 128, 98,
+                    194, 178, 44, 140, 162, 132, 107, 139, 192, 157, 85, 138, 187, 53, 106, 150,
+                    203, 23, 118, 171, 68, 64, 117, 143, 124, 73, 116, 212, 32, 62, 158, 107, 150,
+                    106, 157, 210, 65, 103, 156, 41, 71, 124, 167, 220, 17, 135, 188, 70, 81, 134,
+                    158, 141, 80, 133, 229, 26, 79, 175, 114, 167, 121, 174, 227, 67, 120, 173, 35,
+                    88, 141, 179, 232, 29, 147, 200, 82, 93, 146, 170, 153, 92, 145, 241, 38, 91,
+                    187, 126, 179, 133, 186, 239, 79, 132, 185, 47, 100, 153,
+                ],
+            ),
+            (
+                7,
+                2,
+                AaFilter::Bicubic,
+                &[
+                    100, 146, 93, 171, 118, 164, 120, 67, 128, 92, 138, 102, 147, 94, 155, 119,
+                    165, 129, 68, 129, 120, 139, 103, 94, 95, 156, 147, 166, 130, 121, 130, 121,
+                    85, 104, 95, 156, 157, 148, 112, 131, 122, 183,
+                ],
+            ),
+            (
+                7,
+                2,
+                AaFilter::Bilinear,
+                &[
+                    106, 148, 96, 168, 116, 158, 122, 70, 123, 90, 132, 103, 149, 97, 150, 117,
+                    159, 130, 71, 124, 119, 133, 104, 99, 98, 151, 146, 160, 131, 126, 125, 120,
+                    91, 105, 100, 153, 152, 147, 118, 132, 127, 180,
+                ],
+            ),
+        ];
+        for &(nh, nw, filter, want) in cases {
+            let got = resize_rgb8_antialias(&src, 7, 5, 3, nh, nw, filter).unwrap();
+            assert_eq!(got, want, "{filter:?} 7x5 -> {nh}x{nw}");
+        }
+        // A resize to the same size is the input, as torchvision returns it.
+        assert_eq!(
+            resize_rgb8_antialias(&src, 7, 5, 3, 7, 5, AaFilter::Bicubic).unwrap(),
+            src
+        );
+    }
+
     #[test]
     fn additive_causal_mask_is_batch_independent_and_broadcasts() {
         let device = Device::Cpu;

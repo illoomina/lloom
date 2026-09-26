@@ -10,6 +10,7 @@
 //! shape refuses it with the reason (`check_batch`), never serves it wrong.
 
 use super::common::{DecodeTiming, PrefillTiming};
+use super::vision::DecodedImage;
 use crate::{DecodeParams, Decoded, ReadbackArm};
 use anyhow::Result;
 use lloom_tensor::Device;
@@ -73,6 +74,43 @@ pub trait Served: Send + Sync {
         })
     }
 
+    /// The text one attached image's `<image>` expands to (its delimiters, its
+    /// tiles' token runs). A family or checkpoint without vision refuses.
+    fn image_placeholder(&self, image: &DecodedImage) -> Result<String> {
+        let _ = image;
+        Err(self.no_vision())
+    }
+
+    /// [`Self::complete_until`] for a prompt whose image positions take the
+    /// `images`' rows, in order. The same refusal as `image_placeholder`.
+    fn complete_images_until(
+        &self,
+        prompt_ids: &[u32],
+        images: &[DecodedImage],
+        params: &DecodeParams,
+        on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+    ) -> Result<Decoded> {
+        let _ = (prompt_ids, images, params, on_fragment);
+        Err(self.no_vision())
+    }
+
+    /// What the last request loaded and encoded: the model's tensors, whether
+    /// the vision tower is resident, the image census. `Null` for a family
+    /// without vision.
+    fn vision_report(&self) -> Value {
+        Value::Null
+    }
+
+    /// The refusal a family without vision gives, by the family's own reason.
+    fn no_vision(&self) -> anyhow::Error {
+        let c = self.capabilities();
+        anyhow::anyhow!(
+            "{} does not take image input: {}",
+            c.family,
+            c.vision_missing
+        )
+    }
+
     fn prefill_throughput(&self, n: usize, batch: usize) -> Result<PrefillTiming>;
     fn decode_throughput(
         &self,
@@ -85,4 +123,100 @@ pub trait Served: Send + Sync {
     fn check_batch(&self, batch: usize) -> Result<()>;
     /// Stop whatever the engine runs on its own threads.
     fn shutdown(&self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::family::QWEN4EXP_CAPABILITIES;
+
+    /// A family with no vision, reached only through the seam: every method
+    /// the image path could call past the refusal panics.
+    struct NoVision(Device);
+
+    impl Served for NoVision {
+        fn device(&self) -> &Device {
+            &self.0
+        }
+        fn model_name(&self) -> &str {
+            "stub"
+        }
+        fn kv_capacity(&self) -> usize {
+            0
+        }
+        fn readback(&self) -> ReadbackArm {
+            ReadbackArm::Blocking
+        }
+        fn prefill_tile(&self) -> usize {
+            0
+        }
+        fn batch(&self) -> usize {
+            1
+        }
+        fn eos_ids(&self) -> &[u32] {
+            &[]
+        }
+        fn bos_id(&self) -> Option<u32> {
+            None
+        }
+        fn health(&self) -> Value {
+            Value::Null
+        }
+        fn describe(&self) -> String {
+            String::new()
+        }
+        fn capabilities(&self) -> super::super::family::Capabilities {
+            QWEN4EXP_CAPABILITIES
+        }
+        fn encode(&self, _: &str, _: bool) -> Result<Vec<u32>> {
+            unreachable!("the refusal comes first")
+        }
+        fn token_str(&self, _: u32) -> String {
+            unreachable!()
+        }
+        fn render_chat(&self, _: &Value, _: Option<&Value>) -> Result<String> {
+            unreachable!()
+        }
+        fn seed_prompt_row(&self, _: usize, _: usize) -> Vec<u32> {
+            unreachable!()
+        }
+        fn complete_until(
+            &self,
+            _: &[u32],
+            _: &DecodeParams,
+            _: &mut (dyn FnMut(&str) -> bool + Send),
+        ) -> Result<Decoded> {
+            unreachable!("an image request must not reach the text path")
+        }
+        fn prefill_throughput(&self, _: usize, _: usize) -> Result<PrefillTiming> {
+            unreachable!()
+        }
+        fn decode_throughput(&self, _: usize, _: usize, _: usize) -> Result<DecodeTiming> {
+            unreachable!()
+        }
+        fn next_token_logprobs(&self, _: &[u32], _: usize) -> Result<(u32, Vec<(u32, f32)>)> {
+            unreachable!()
+        }
+        fn check_batch(&self, _: usize) -> Result<()> {
+            unreachable!()
+        }
+        fn shutdown(&self) {}
+    }
+
+    /// A family without vision refuses an image at the seam, by its own
+    /// reason, before anything is rendered or decoded.
+    #[test]
+    fn a_family_without_vision_refuses_an_image_by_name() {
+        let engine = NoVision(Device::Cpu);
+        let image = DecodedImage::from_rgb8(1, 1, vec![0, 0, 0]);
+        let want = "qwen4exp does not take image input: no vision tower is built for Qwen4-exp";
+        let err = engine.image_placeholder(&image).unwrap_err().to_string();
+        assert!(err.starts_with(want), "{err}");
+        let err = engine
+            .complete_images_until(&[1, 2], &[image], &DecodeParams::default(), &mut |_| true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with(want), "{err}");
+        assert!(engine.vision_report().is_null());
+    }
 }

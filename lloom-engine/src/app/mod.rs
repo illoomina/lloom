@@ -13,6 +13,7 @@ pub mod lfm2;
 pub mod qwen4exp;
 pub mod serve;
 pub mod served;
+pub mod vision;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};

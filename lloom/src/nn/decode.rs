@@ -1414,7 +1414,7 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // only at commits, so under the adaptive commit it rides every
                 // step — HERE, before the next forward is encoded, so token g
                 // is readable as soon as its argmax has run, not after
-                // forward g+1 (one blit, as the poll arm's stamp is).
+                // forward g+1 (one dispatch, as the poll arm's stamp is).
                 readback.publish_marker(true)?;
                 if opts.eos_gate {
                     // The gate on the token this forward consumes, then the
@@ -1464,10 +1464,10 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 // Structural on this arm, not a budget choice, and counted.
                 if loop_commits {
                     // The completion marker for the window closing at this commit,
-                    // encoded BEFORE the commit so its `slice_set` rides the
-                    // committing buffer AFTER this step's input slot — the ordering
-                    // the drain's clamp rests on (§3.5). A no-op on the arms that
-                    // stamp per step or read back per step. `force_live` during the
+                    // encoded BEFORE the commit so it rides the committing buffer;
+                    // it certifies the window's slots, the ordering the drain's
+                    // clamp rests on (§3.5). A no-op on the arms that stamp per
+                    // step or read back per step. `force_live` during the
                     // TTFT ramp so token 0 never waits `live_every` commits.
                     readback.publish_marker(produced <= opts.budget.period())?;
                     self.commit(&device, &mut stats)?;
@@ -1624,8 +1624,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
                 since_commit += 1;
                 if in_ttft_ramp || opts.budget.due(since_commit) {
                     // The completion marker for the window closing here, encoded
-                    // before the commit so it rides the committing buffer after the
-                    // window's slots (§3.5). No-op on the per-step arms.
+                    // before the commit so it rides the committing buffer; it
+                    // certifies the window's slots (§3.5). No-op on the per-step
+                    // arms.
                     // `force_live` during the TTFT ramp so early tokens stream at
                     // once regardless of the wake cadence.
                     readback.publish_marker(in_ttft_ramp)?;

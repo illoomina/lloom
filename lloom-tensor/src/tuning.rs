@@ -75,12 +75,6 @@ fn parse_opt_nr0_4(v: &str) -> Result<Option<usize>, String> {
     }
     ranged(v, "rows a simdgroup", 1, 4).map(Some)
 }
-fn parse_opt_nr0_2(v: &str) -> Result<Option<usize>, String> {
-    if v.is_empty() || v.eq_ignore_ascii_case("none") || v == "0" {
-        return Ok(None);
-    }
-    ranged(v, "rows a simdgroup", 1, 2).map(Some)
-}
 fn parse_gdn_split(v: &str) -> Result<usize, String> {
     ranged(v, "gdn split", 1, 32)
 }
@@ -227,7 +221,7 @@ pub struct QmvTuning {
     #[opt(flag = "qmv-q4k-nr0", env = "LLOOM_QMV_Q4K_NR0", parser = "parse_opt_nr0_4", variants = ["none", "1", "2", "3", "4"])]
     pub q4k_nr0: Option<usize>,
     /// Rows a simdgroup on the Q5_K core: 1 (ggml master's) or 2; none = the incumbent 2 (P31 (5)).
-    #[opt(flag = "qmv-q5k-nr0", env = "LLOOM_QMV_Q5K_NR0", parser = "parse_opt_nr0_2", variants = ["none", "1", "2"])]
+    #[opt(flag = "qmv-q5k-nr0", env = "LLOOM_QMV_Q5K_NR0", parser = "parse_opt_nr0_4", variants = ["none", "1", "2", "4"])]
     pub q5k_nr0: Option<usize>,
     /// Rows a simdgroup on the Q6_K core (a function constant; 1..4; 2 = ggml master's).
     #[opt(flag = "qmv-q6k-nr0", env = "LLOOM_QMV_Q6K_NR0", parser = "parse_nr0")]

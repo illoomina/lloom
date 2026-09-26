@@ -1454,6 +1454,14 @@ fn assert_mlp_replays_like_classical(consumer: Consumer, pacing: Pacing, what: &
         "{what}: the classical steps disagree with each other"
     );
     assert!(distinct(&replayed) > 2, "{what}: vacuous replayed output");
+    let bad = differing_steps(&replayed, &classical, k);
+    eprintln!("[{what}] steps whose output differs from classical: {bad:?}");
+    assert!(
+        bad.is_empty(),
+        "{what}: {} replayed steps differ from classical, first {:?}",
+        bad.len(),
+        &bad[..bad.len().min(8)]
+    );
     // Each pacing must engage the path it exists for, or its pass reads
     // nothing: a bounded run never falls back and both builds and reuses; an
     // unbounded one reaches the cap.
@@ -1482,14 +1490,6 @@ fn assert_mlp_replays_like_classical(consumer: Consumer, pacing: Pacing, what: &
             "{what}: no generation built"
         );
     }
-    let bad = differing_steps(&replayed, &classical, k);
-    eprintln!("[{what}] steps whose output differs from classical: {bad:?}");
-    assert!(
-        bad.is_empty(),
-        "{what}: {} replayed steps differ from classical, first {:?}",
-        bad.len(),
-        &bad[..bad.len().min(8)]
-    );
 }
 
 /// The swiglu and `w2` both replayed, four steps in flight at a time.

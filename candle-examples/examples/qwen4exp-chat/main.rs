@@ -408,6 +408,13 @@ fn report_pass_plans(device: &Device) {
             "POOLS shared_lookups={} shared_hits={} private_lookups={} private_hits={}",
             shared.lookups, shared.hits, private.lookups, private.hits
         );
+        let lb = candle::kernels::metal::late_bind::report();
+        if lb.armed {
+            println!(
+                "LATEBIND releases={} binds={} late={} late_writes={}",
+                lb.releases, lb.binds, lb.late, lb.late_writes
+            );
+        }
         if let (Some(c), Some((keys, base))) = (dev.pass_plan_counters(), dev.pass_plan_report()) {
             let keys: Vec<String> = keys
                 .iter()

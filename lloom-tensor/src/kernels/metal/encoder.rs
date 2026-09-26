@@ -1,7 +1,7 @@
 use crate::kernels::metal::{
     arena,
     executor::{DispatchAction, DispatchRecord, ExecutorSlot, Grid},
-    trace, Buffer, ComputePipeline, Fence,
+    late_bind, trace, Buffer, ComputePipeline, Fence,
 };
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSRange, NSString};
@@ -1064,6 +1064,7 @@ impl ComputeCommandEncoder {
             arena::note_bind(ptr);
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock();
+            late_bind::on_bind(ptr, false, s.current_pipeline.as_deref().unwrap_or("?"));
             // Read-after-write against an earlier encoder: order against that
             // buffer's last writer only, under the lock this bind holds anyway.
             self.wait_for_buffer(&mut s, ptr);
@@ -1099,6 +1100,7 @@ impl ComputeCommandEncoder {
             arena::note_bind(ptr);
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock();
+            late_bind::on_bind(ptr, true, s.current_pipeline.as_deref().unwrap_or("?"));
             // Write-after-write or write-after-read against an earlier encoder.
             self.wait_for_buffer(&mut s, ptr);
             let key = s.hazard_key;
@@ -1199,6 +1201,7 @@ impl ComputeCommandEncoder {
         {
             let range = Self::bound_range(&buffer, 0);
             let mut s = self.state.lock();
+            late_bind::on_bind(ptr, false, s.current_pipeline.as_deref().unwrap_or("?"));
             self.wait_for_buffer(&mut s, ptr);
             let key = s.hazard_key;
             s.next_inputs.insert(key, range);
@@ -1285,7 +1288,7 @@ impl ComputeCommandEncoder {
         if has_executor {
             self.executor.will_set_pipeline(pipeline);
         }
-        if !has_executor && !crate::kernels::metal::profile::enabled() {
+        if !has_executor && !crate::kernels::metal::profile::enabled() && !late_bind::armed() {
             return;
         }
         // `name_handle` clones the `Arc<str>` the pipeline already holds. The
@@ -1488,6 +1491,8 @@ impl BlitCommandEncoder {
         // the copy still reads it (`DESIGN.md` §9.2aa).
         arena::note_bind(src_ptr);
         arena::note_bind(dst_ptr);
+        late_bind::on_bind(src_ptr, false, "blit copy");
+        late_bind::on_bind(dst_ptr, true, "blit copy");
         self.wait_for_last_writers(&[src_ptr, dst_ptr]);
 
         self.tracked_outputs.push(dst_ptr);
@@ -1507,6 +1512,7 @@ impl BlitCommandEncoder {
     pub fn fill_buffer(&mut self, buffer: &Buffer, range: (usize, usize), value: u8) {
         let ptr = buffer.raw_ptr() as usize;
         arena::note_bind(ptr);
+        late_bind::on_bind(ptr, true, "blit fill");
         self.wait_for_last_writers(&[ptr]);
         self.tracked_outputs.push(ptr);
 

@@ -10,6 +10,36 @@ use lloom_macros::Options;
 use lloom_tensor::options::{env_aliases, rows};
 use serde::{Deserialize, Serialize};
 
+/// The env aliases are process-global and the harness runs tests in
+/// parallel, so every test that sets or reads them holds this lock, and each
+/// starts and ends with every alias of `Group` unset — also when the test
+/// before it panicked.
+static ENV: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+struct EnvLock {
+    _guard: parking_lot::MutexGuard<'static, ()>,
+}
+
+impl EnvLock {
+    fn take() -> Self {
+        let guard = ENV.lock();
+        clear_aliases();
+        EnvLock { _guard: guard }
+    }
+}
+
+impl Drop for EnvLock {
+    fn drop(&mut self) {
+        clear_aliases();
+    }
+}
+
+fn clear_aliases() {
+    for var in env_aliases(Group::META) {
+        std::env::remove_var(var);
+    }
+}
+
 fn parse_list(s: &str) -> Result<Vec<usize>, String> {
     s.split(',')
         .filter(|p| !p.trim().is_empty())
@@ -84,7 +114,16 @@ struct Cli {
 
 #[test]
 fn flags_write_only_what_was_given() {
-    let cli = Cli::parse_from(["t", "--look", "0", "--adaptive", "--arm", "b", "--schedule", "1,16,32"]);
+    let cli = Cli::parse_from([
+        "t",
+        "--look",
+        "0",
+        "--adaptive",
+        "--arm",
+        "b",
+        "--schedule",
+        "1,16,32",
+    ]);
     let mut g = Group::default();
     cli.group.apply(&mut g).unwrap();
     assert_eq!(g.lookahead, 0);
@@ -92,7 +131,10 @@ fn flags_write_only_what_was_given() {
     assert_eq!(g.fraction, None, "an absent flag keeps the base's value");
     assert_eq!(g.schedule, vec![1, 16, 32]);
     assert_eq!(g.inner.arm, "b");
-    assert_eq!(g.inner.depth, 2, "an absent nested flag keeps the base's value");
+    assert_eq!(
+        g.inner.depth, 2,
+        "an absent nested flag keeps the base's value"
+    );
     assert_eq!(g.computed, 7);
 
     let cli = Cli::parse_from(["t", "--adaptive=false", "--fraction", "0.5", "--depth", "4"]);
@@ -140,9 +182,15 @@ fn the_dotted_setter_reaches_every_leaf() {
     let err = g.set("inner", "x").unwrap_err();
     assert!(err.contains("is a group"), "{err}");
     let err = g.set("nope", "x").unwrap_err();
-    assert!(err.contains("unknown key `nope`") && err.contains("lookahead"), "{err}");
+    assert!(
+        err.contains("unknown key `nope`") && err.contains("lookahead"),
+        "{err}"
+    );
     let err = g.set("computed", "1").unwrap_err();
-    assert!(err.contains("unknown key"), "a skipped field is not settable: {err}");
+    assert!(
+        err.contains("unknown key"),
+        "a skipped field is not settable: {err}"
+    );
     let err = g.set("lookahead.x", "1").unwrap_err();
     assert!(err.contains("takes no sub-key"), "{err}");
 }
@@ -154,7 +202,10 @@ fn json_merges_field_by_field() {
         .unwrap();
     assert_eq!(g.lookahead, 0);
     assert_eq!(g.inner.depth, 5);
-    assert_eq!(g.inner.arm, "a", "a nested key the object does not name is kept");
+    assert_eq!(
+        g.inner.arm, "a",
+        "a nested key the object does not name is kept"
+    );
     assert_eq!(g.fraction, Some(0.1));
     let err = g.merge_json(&serde_json::json!({"nope": 1})).unwrap_err();
     assert!(err.contains("unknown key `nope`"), "{err}");
@@ -169,6 +220,7 @@ fn json_merges_field_by_field() {
 
 #[test]
 fn env_aliases_are_a_layer() {
+    let _env = EnvLock::take();
     std::env::set_var("LLOOM_TEST_LOOK", "0");
     std::env::set_var("LLOOM_TEST_INNER_ARM", "b");
     std::env::remove_var("LLOOM_TEST_INNER_DEPTH");
@@ -185,7 +237,11 @@ fn env_aliases_are_a_layer() {
     std::env::remove_var("LLOOM_TEST_INNER_DEPTH");
     assert_eq!(
         env_aliases(Group::META),
-        vec!["LLOOM_TEST_LOOK", "LLOOM_TEST_INNER_ARM", "LLOOM_TEST_INNER_DEPTH"]
+        vec![
+            "LLOOM_TEST_LOOK",
+            "LLOOM_TEST_INNER_ARM",
+            "LLOOM_TEST_INNER_DEPTH"
+        ]
     );
 }
 
@@ -220,6 +276,7 @@ fn the_table_lists_every_leaf_with_its_value() {
 
 #[test]
 fn precedence_is_env_then_json_then_set_then_flags() {
+    let _env = EnvLock::take();
     std::env::set_var("LLOOM_TEST_LOOK", "5");
     let mut g = Group::default();
     g.from_env().unwrap();
@@ -228,7 +285,10 @@ fn precedence_is_env_then_json_then_set_then_flags() {
     assert_eq!(g.lookahead, 4);
     g.set("lookahead", "3").unwrap();
     assert_eq!(g.lookahead, 3);
-    Cli::parse_from(["t", "--look", "2"]).group.apply(&mut g).unwrap();
+    Cli::parse_from(["t", "--look", "2"])
+        .group
+        .apply(&mut g)
+        .unwrap();
     assert_eq!(g.lookahead, 2);
     std::env::remove_var("LLOOM_TEST_LOOK");
 }

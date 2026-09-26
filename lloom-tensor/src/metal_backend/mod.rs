@@ -1323,13 +1323,14 @@ impl BackendStorage for MetalStorage {
                 .broadcast_as((b, k, n))?;
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         } else {
-            // Make the kernel contiguous if not already the case.
+            // The matmul reads the contiguous copy, which starts at index 0,
+            // not the strided kernel at its own offset.
             let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+            let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
                 .transpose(1, 2)?
                 .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+            col.matmul(&kernel_c, (b, m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
         // `copy_strided_src` below writes every element of the destination, so
@@ -1605,13 +1606,14 @@ impl BackendStorage for MetalStorage {
                 .broadcast_as((b, k, n))?;
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         } else {
-            // Make the kernel contiguous if not already the case.
+            // The matmul reads the contiguous copy, which starts at index 0,
+            // not the strided kernel at its own offset.
             let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+            let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
                 .transpose(1, 2)?
                 .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+            col.matmul(&kernel_c, (b, m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, h_out, w_out, n))
             .transpose(1, 2)?

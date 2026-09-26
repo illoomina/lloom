@@ -1510,12 +1510,17 @@ impl Map2 for MatMul {
             Parallelism::None
         };
         let (b, m, n, k) = if b_skip == 0 && a_skip == m * k {
+            // A batch-invariant rhs lets the batches of lhs stack into the rows of a single
+            // (b * m, k) matrix, which the destination already matches row for row.
             // a_skip and c_skip should be updated but step is always 0 so
             // it wouldn't matter.
             (1, b * m, n, k)
-        } else if a_skip == 0 && b_skip == n * k {
-            (1, m, b * n, k)
         } else {
+            // There is deliberately no mirrored fold for a batch-invariant lhs. Stacking the
+            // batches of rhs into the columns of a (k, b * n) matrix would need those columns
+            // to be adjacent, but rhs is batch-major, and the destination rows would still be
+            // n apart while each merged row is b * n wide. Both make the merged gemm write
+            // over itself, so a stride-zero batch on lhs goes through the loop below.
             (b, m, n, k)
         };
         for step in 0..b {
@@ -2911,16 +2916,17 @@ impl BackendStorage for CpuStorage {
                 .broadcast_as((b, k, n))?;
             col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
         } else {
-            // Make the kernel contiguous if not already the case.
+            // The matmul reads the contiguous copy, which starts at index 0,
+            // not the strided kernel at its own offset.
             let mut kernel_c = unsafe {
                 self.device()
                     .alloc_uninit(kernel_l.shape(), kernel.dtype())?
             };
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
+            let kernel_l = Layout::contiguous_with_offset((1, n, k), 0)
                 .transpose(1, 2)?
                 .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+            col.matmul(&kernel_c, (b, m, n, k), &col_l, &kernel_l)?
         };
         let res_l = Layout::contiguous((b, l_out, params.c_out)).transpose(1, 2)?;
         let mut res_t = unsafe { self.device().alloc_uninit(res_l.shape(), res.dtype())? };

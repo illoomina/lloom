@@ -54,6 +54,18 @@ pub struct ChatArgs {
     pub raw: bool,
 }
 
+/// The reply's token digest in `lfm2-determinism`'s definition: SHA-256 over
+/// the generated ids as little-endian `u32`, EOS excluded — so a turn is
+/// comparable to the harness's `tokens_sha256` on the same prompt and arm.
+fn tokens_sha256(ids: &[u32]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for id in ids {
+        h.update(id.to_le_bytes());
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 pub fn run(args: ChatArgs) -> Result<()> {
     let family = detect_family(args.model.model.as_deref())?;
     let mut options = super::resolve_options(&args.common)?;
@@ -165,7 +177,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(started.elapsed());
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -178,9 +190,29 @@ pub fn run(args: ChatArgs) -> Result<()> {
             decoded.prefilled,
             st.commits,
             st.overrun,
+            tokens_sha256(&decoded.tokens),
         );
         let _ = NEVER_EOS;
     }
     engine.shutdown();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tokens_sha256;
+
+    /// Pinned to vectors computed outside the crate (`hashlib.sha256` over
+    /// `struct.pack('<3I', …)`), not to a second call of the same function.
+    #[test]
+    fn the_digest_is_the_harness_definition() {
+        assert_eq!(
+            tokens_sha256(&[]),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            tokens_sha256(&[1, 2, 0xdead_beef]),
+            "901863406394c0791303fda1bae0e78733375a7c7dbe7db1ea450c6145a0f8d7"
+        );
+    }
 }

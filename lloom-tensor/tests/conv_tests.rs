@@ -113,6 +113,153 @@ fn conv1d_small(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+/// Integer values in [-3, 3], so every product and partial sum of the
+/// convolutions below is exact in f32 and a comparison against the host loop
+/// is equality, whatever order the backend sums in.
+fn small_ints(n: usize, salt: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| ((i * 37 + salt * 11 + 5) % 7) as f32 - 3.0)
+        .collect()
+}
+
+/// Direct 1D convolution over logical (row-major) values: `x` is
+/// `(b, c_in, l_in)`, `w` is `(c_out, c_in / groups, k)`.
+#[allow(clippy::too_many_arguments)]
+fn host_conv1d(
+    x: &[f32],
+    (b, c_in, l_in): (usize, usize, usize),
+    w: &[f32],
+    (c_out, c_in_k, k): (usize, usize, usize),
+    padding: usize,
+    stride: usize,
+    dilation: usize,
+    groups: usize,
+) -> Vec<f32> {
+    assert_eq!(c_in, c_in_k * groups);
+    let l_out = (l_in + 2 * padding - dilation * (k - 1) - 1) / stride + 1;
+    let mut out = vec![0f32; b * c_out * l_out];
+    for bi in 0..b {
+        for o in 0..c_out {
+            let g = o / (c_out / groups);
+            for t in 0..l_out {
+                let mut acc = 0f32;
+                for i in 0..c_in_k {
+                    for j in 0..k {
+                        let p = (t * stride + j * dilation) as isize - padding as isize;
+                        if p < 0 || p >= l_in as isize {
+                            continue;
+                        }
+                        let xv = x[(bi * c_in + g * c_in_k + i) * l_in + p as usize];
+                        acc += w[(o * c_in_k + i) * k + j] * xv;
+                    }
+                }
+                out[(bi * c_out + o) * l_out + t] = acc;
+            }
+        }
+    }
+    out
+}
+
+fn assert_conv1d_matches_host(
+    x: &Tensor,
+    w: &Tensor,
+    (padding, stride, dilation, groups): (usize, usize, usize, usize),
+    what: &str,
+) -> Result<()> {
+    let got = x
+        .conv1d(w, padding, stride, dilation, groups)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let want = host_conv1d(
+        &x.flatten_all()?.to_vec1::<f32>()?,
+        x.dims3()?,
+        &w.flatten_all()?.to_vec1::<f32>()?,
+        w.dims3()?,
+        padding,
+        stride,
+        dilation,
+        groups,
+    );
+    assert_eq!(got, want, "{what}: kernel layout {:?}", w.layout());
+    Ok(())
+}
+
+/// A non-contiguous kernel must give the host loop's answer, exactly. The
+/// im2col path materializes such a kernel into a fresh buffer; the three
+/// fixtures pin both halves of using that buffer: the buffer itself
+/// (transposed, offset 0) and its offset (a narrowed kernel, and a transposed
+/// one split by `groups`, whose chunks start past 0). The contiguous arm
+/// checks the host loop against the path that never copies.
+fn conv1d_noncontiguous_kernel(dev: &Device) -> Result<()> {
+    let x = Tensor::from_vec(small_ints(2 * 4 * 9, 0), (2, 4, 9), dev)?;
+
+    let w_t = Tensor::from_vec(small_ints(4 * 3 * 3, 1), (4, 3, 3), dev)?.transpose(0, 1)?;
+    assert!(!w_t.is_contiguous() && w_t.layout().start_offset() == 0);
+    let w_n = Tensor::from_vec(small_ints(3 * 6 * 3, 2), (3, 6, 3), dev)?.narrow(1, 1, 4)?;
+    assert!(!w_n.is_contiguous() && w_n.layout().start_offset() == 3);
+    let w_g = Tensor::from_vec(small_ints(2 * 4 * 3, 3), (2, 4, 3), dev)?.transpose(0, 1)?;
+    let chunks = w_g.chunk(2, 0)?;
+    assert!(!chunks[1].is_contiguous() && chunks[1].layout().start_offset() > 0);
+
+    let fixtures = [
+        (&w_t, 1, "transposed"),
+        (&w_n, 1, "narrowed"),
+        (&w_g, 2, "grouped"),
+    ];
+    for (p, s, d) in [(0, 1, 1), (1, 2, 2)] {
+        for (w, groups, what) in fixtures {
+            assert_conv1d_matches_host(&x, w, (p, s, d, groups), what)?;
+            assert_conv1d_matches_host(&x, &w.contiguous()?, (p, s, d, groups), "contiguous")?;
+        }
+    }
+    Ok(())
+}
+
+/// The kernel gradient of a batched conv1d is itself a conv1d whose kernel is
+/// the output gradient transposed (non-contiguous for `b > 1`), so it takes
+/// the same path. Checked against the host formula
+/// `dW[o,i,j] = sum_{b,t} dY[b,o,t] * x[b, i, t*stride + j*dilation - padding]`.
+fn conv1d_grad_batched(dev: &Device) -> Result<()> {
+    use lloom_tensor::Var;
+    let (b, c_in, l_in, c_out, k) = (2, 3, 8, 2, 3);
+    for (padding, stride, dilation) in [(0, 1, 1), (1, 1, 1), (1, 2, 2)] {
+        let x = Var::from_vec(small_ints(b * c_in * l_in, 4), (b, c_in, l_in), dev)?;
+        let w = Var::from_vec(small_ints(c_out * c_in * k, 5), (c_out, c_in, k), dev)?;
+        let y = x.conv1d(&w, padding, stride, dilation, 1)?;
+        let l_out = y.dim(2)?;
+        let dy_v = small_ints(b * c_out * l_out, 6);
+        let dy = Tensor::from_vec(dy_v.clone(), (b, c_out, l_out), dev)?;
+        let grads = (y * &dy)?.sum_all()?.backward()?;
+        let got = grads.get(&w).unwrap().flatten_all()?.to_vec1::<f32>()?;
+
+        let xv = x.flatten_all()?.to_vec1::<f32>()?;
+        let mut want = vec![0f32; c_out * c_in * k];
+        for o in 0..c_out {
+            for i in 0..c_in {
+                for j in 0..k {
+                    let mut acc = 0f32;
+                    for bi in 0..b {
+                        for t in 0..l_out {
+                            let p = (t * stride + j * dilation) as isize - padding as isize;
+                            if p < 0 || p >= l_in as isize {
+                                continue;
+                            }
+                            acc += dy_v[(bi * c_out + o) * l_out + t]
+                                * xv[(bi * c_in + i) * l_in + p as usize];
+                        }
+                    }
+                    want[(o * c_in + i) * k + j] = acc;
+                }
+            }
+        }
+        assert_eq!(
+            got, want,
+            "dW, padding {padding} stride {stride} dilation {dilation}"
+        );
+    }
+    Ok(())
+}
+
 /* This test is based on the following script.
 import torch
 torch.manual_seed(4242)
@@ -981,6 +1128,18 @@ test_device!(
     conv1d_small_cpu,
     conv1d_small_gpu,
     conv1d_small_metal
+);
+test_device!(
+    conv1d_noncontiguous_kernel,
+    conv1d_noncontiguous_kernel_cpu,
+    conv1d_noncontiguous_kernel_gpu,
+    conv1d_noncontiguous_kernel_metal
+);
+test_device!(
+    conv1d_grad_batched,
+    conv1d_grad_batched_cpu,
+    conv1d_grad_batched_gpu,
+    conv1d_grad_batched_metal
 );
 test_device!(conv2d, conv2d_cpu, conv2d_gpu, conv2d_metal);
 test_device!(

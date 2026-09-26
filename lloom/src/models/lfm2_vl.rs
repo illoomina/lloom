@@ -831,6 +831,87 @@ mod tests {
         }
     }
 
+    /// Row `r` of a `[1, seq, hidden]` embedding filled with `base + r*hidden + j`,
+    /// so every element names its own row and column.
+    fn numbered(seq: usize, hidden: usize, base: f32) -> Tensor {
+        let v: Vec<f32> = (0..seq * hidden).map(|i| base + i as f32).collect();
+        Tensor::from_vec(v, (1, seq, hidden), &Device::Cpu).unwrap()
+    }
+
+    fn rows(t: &Tensor) -> Vec<Vec<f32>> {
+        let (_, seq, hidden) = t.dims3().unwrap();
+        t.reshape((seq, hidden)).unwrap().to_vec2::<f32>().unwrap()
+    }
+
+    /// The splice puts feature row `k` at the `k`-th image position, in order,
+    /// and leaves every text row bit-identical. The positions are deliberately
+    /// non-contiguous and include the first and last slots, so an off-by-one in
+    /// the run bookkeeping or a feature index that does not advance moves a
+    /// value this compares against an absolute expectation.
+    #[test]
+    fn merge_places_feature_k_at_the_kth_image_position_and_nothing_else() {
+        const IMG: u32 = 124907;
+        let (seq, hidden) = (7usize, 3usize);
+        let ids = [IMG, 5, IMG, IMG, 9, 11, IMG];
+        let embeds = numbered(seq, hidden, 0.0);
+        let features = numbered(4, hidden, 1000.0).squeeze(0).unwrap();
+
+        let merged = merge_image_features(&embeds, &ids, &features, IMG).unwrap();
+        assert_eq!(merged.dims(), &[1, seq, hidden]);
+
+        let got = rows(&merged);
+        let text = rows(&embeds);
+        let feat = features.to_vec2::<f32>().unwrap();
+        let mut k = 0;
+        for (i, &t) in ids.iter().enumerate() {
+            let want = if t == IMG {
+                k += 1;
+                &feat[k - 1]
+            } else {
+                &text[i]
+            };
+            assert_eq!(
+                got[i].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "row {i} (token {t}): got {:?}, want {:?}",
+                got[i],
+                want
+            );
+        }
+        assert_eq!(k, 4);
+    }
+
+    /// A prompt that reserved a different number of image positions than the
+    /// tower produced rows must be refused, in both directions: filling a
+    /// prefix would leave `<image>`'s own embedding in the tail and the model
+    /// would describe the wrong thing fluently.
+    #[test]
+    fn merge_refuses_a_count_mismatch_in_either_direction() {
+        const IMG: u32 = 7;
+        let embeds = numbered(4, 2, 0.0);
+        let three = numbered(3, 2, 100.0).squeeze(0).unwrap();
+        let one = numbered(1, 2, 100.0).squeeze(0).unwrap();
+        assert!(merge_image_features(&embeds, &[IMG, IMG, 1, 2], &three, IMG).is_err());
+        assert!(merge_image_features(&embeds, &[IMG, IMG, 1, 2], &one, IMG).is_err());
+        assert!(merge_image_features(
+            &embeds,
+            &[IMG, IMG, 1, 2],
+            &numbered(2, 2, 9.0).squeeze(0).unwrap(),
+            IMG
+        )
+        .is_ok());
+    }
+
+    /// The merge is B=1; a batch must be refused rather than flattened, which
+    /// would splice every sequence's features into the first one.
+    #[test]
+    fn merge_refuses_a_batch() {
+        const IMG: u32 = 7;
+        let embeds = Tensor::zeros((2, 3, 2), DType::F32, &Device::Cpu).unwrap();
+        let feats = numbered(1, 2, 1.0).squeeze(0).unwrap();
+        assert!(merge_image_features(&embeds, &[IMG, 1, 2], &feats, IMG).is_err());
+    }
+
     /// The trait impls are reachable through their bounds. Like `lfm2.rs`'s
     /// keystone test (§3.1c), this proves the callable-through-the-trait property
     /// without a forward pass: the function only compiles if `VisionEncoder`

@@ -6,7 +6,9 @@
 use crate::kernels::kernels::unary::copy2d;
 use crate::kernels::metal::completion::CompletionWait;
 use crate::kernels::metal::{Commands, ResidencySet};
-use crate::kernels::{call_affine, call_copy2d, BufferOffset, Device, Kernels};
+use crate::kernels::{
+    call_affine, call_copy2d, call_shortconv_step, BufferOffset, Device, Kernels,
+};
 use objc2_metal::MTLResourceOptions;
 use std::sync::Arc;
 
@@ -336,4 +338,90 @@ fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
             }
         }
     }
+}
+
+/// The fused Shuffle conv step writes the next state into a buffer its caller
+/// swaps into the cache every step, so past an EOS its gated variant carries
+/// the state through instead of returning bare: `state_out` is `state_in` bit
+/// for bit, and the output is not written. With the flag clear the gated
+/// variant is the plain kernel. A bare return here leaves the cache a buffer
+/// no kernel wrote (`docs/dispatch.md` §11.5z-x).
+#[test]
+fn a_gated_shortconv_step_carries_its_state_through_an_eos() {
+    const HIDDEN: usize = 16;
+    const K: usize = 3;
+    let rig = Rig::new();
+    let f = |v: &[f32]| {
+        rig.device
+            .new_buffer_with_data(v.as_ptr() as *const std::ffi::c_void, v.len() * 4, SHARED)
+            .unwrap()
+    };
+    let proj: Vec<f32> = (0..HIDDEN).map(|i| 0.25 + i as f32 / 8.0).collect();
+    let (b_in, x_in, c_in) = (f(&proj), f(&proj), f(&proj));
+    let state: Vec<f32> = (0..HIDDEN * K).map(|i| 1.0 + i as f32).collect();
+    let weight: Vec<f32> = (0..HIDDEN * K).map(|i| 0.5 - i as f32 / 64.0).collect();
+    let (state_in, weight) = (f(&state), f(&weight));
+    let run = |gate_token: Option<u32>| -> (Vec<f32>, Vec<f32>) {
+        let state_out = rig.device.new_buffer(HIDDEN * K * 4, SHARED).unwrap();
+        let dst = rig.device.new_buffer(HIDDEN * 4, SHARED).unwrap();
+        // A poison the kernel must overwrite (or, gated, leave).
+        unsafe {
+            std::ptr::write_bytes(state_out.contents(), 0xff, HIDDEN * K * 4);
+            std::ptr::write_bytes(dst.contents(), 0xff, HIDDEN * 4);
+        }
+        {
+            let enc = rig.cmds.command_encoder().unwrap();
+            if let Some(t) = gate_token {
+                rig.gate_step(t, &enc);
+            }
+            call_shortconv_step(
+                &rig.device,
+                &enc,
+                &rig.kernels,
+                "shortconv_step_f32_k3",
+                (HIDDEN, HIDDEN, 0, 1),
+                BufferOffset::zero_offset(&b_in),
+                BufferOffset::zero_offset(&x_in),
+                BufferOffset::zero_offset(&c_in),
+                BufferOffset::zero_offset(&state_in),
+                BufferOffset::zero_offset(&weight),
+                &state_out,
+                &dst,
+            )
+            .unwrap();
+        }
+        rig.cmds.flush_and_wait_current().unwrap();
+        (read_f32(&state_out, HIDDEN * K), read_f32(&dst, HIDDEN))
+    };
+    let (plain_state, plain_out) = run(None);
+    let shifted: Vec<f32> = (0..HIDDEN)
+        .flat_map(|c| [state[c * K + 1], state[c * K + 2], proj[c] * proj[c]])
+        .collect();
+    assert_eq!(plain_state, shifted, "the plain step shifts the window");
+
+    rig.begin();
+    let (clear_state, clear_out) = run(Some(7));
+    let (fired_state, fired_out) = run(Some(EOS[0]));
+    let report = rig.end();
+    assert!(report.fired);
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(&clear_state),
+        bits(&plain_state),
+        "gate clear: the plain step"
+    );
+    assert_eq!(
+        bits(&clear_out),
+        bits(&plain_out),
+        "gate clear: the plain output"
+    );
+    assert_eq!(
+        bits(&fired_state),
+        bits(&state),
+        "gate raised: the state carries through"
+    );
+    assert!(
+        fired_out.iter().all(|x| x.to_bits() == u32::MAX),
+        "gate raised: the output is not written"
+    );
 }

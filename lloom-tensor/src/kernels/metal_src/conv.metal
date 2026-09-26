@@ -1299,6 +1299,27 @@ template <typename T, typename A, ushort K_SIZE>
       p, src_dims, src, weight, scale, dst, tid);
 }
 
+// The step's EOS-gated epilogue: past an EOS the state carries through
+// unchanged. The caller swaps `state_out` into the cache every step, so a
+// gated step that returned without writing it would leave the cache holding a
+// buffer no kernel wrote (docs/dispatch.md §11.5z-x).
+template <typename T, ushort K_SIZE>
+METAL_FUNC void shortconv_state_carry(
+    thread const ShortconvStepParams &p,
+    device const T *state_in,
+    device T *state_out,
+    uint tid
+) {
+  if (tid >= p.dst_numel) {
+    return;
+  }
+  const size_t st_base = size_t(tid) * K_SIZE;
+#pragma clang loop unroll(full)
+  for (ushort j = 0; j < K_SIZE; ++j) {
+    state_out[st_base + j] = state_in[st_base + j];
+  }
+}
+
 // The fused decode shortconv step (§12.2 row 1). One thread per output channel.
 template <typename T, typename A, ushort K_SIZE>
 METAL_FUNC void shortconv_step_body(
@@ -1374,8 +1395,11 @@ template <typename T, typename A, ushort K_SIZE>
     uint tid [[ thread_position_in_grid ]],
     EOS_GATE_ARG
 ) {
-    EOS_GATE_CHECK
   ShortconvStepParams p { dst_numel, hidden, proj_stride_b, proj_stride_c };
+  if (eos_gated && eos_gate_flag[0] != 0) {
+    shortconv_state_carry<T, K_SIZE>(p, state_in, state_out, tid);
+    return;
+  }
   shortconv_step_body<T, A, K_SIZE>(
       p, b_in, x_in, c_in, state_in, weight, state_out, dst, tid);
 }
@@ -1393,8 +1417,11 @@ template <typename T, typename A, ushort K_SIZE>
     uint tid [[ thread_position_in_grid ]],
     EOS_GATE_ARG
 ) {
-    EOS_GATE_CHECK
   ShortconvStepParams p = *pp;
+  if (eos_gated && eos_gate_flag[0] != 0) {
+    shortconv_state_carry<T, K_SIZE>(p, state_in, state_out, tid);
+    return;
+  }
   shortconv_step_body<T, A, K_SIZE>(
       p, b_in, x_in, c_in, state_in, weight, state_out, dst, tid);
 }

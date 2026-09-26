@@ -13,7 +13,10 @@
 //! write (`gemv*`, `rmsnorm`, `bmul`, `shortconv_step`, `copy2d` — 314 of a
 //! crown step's 341 dispatches) have a variant, selected by function constant
 //! 777 (`Kernels::set_eos_gated`), that takes the gate's flag word at buffer
-//! index 30 and returns before doing anything when it is set. One tiny kernel
+//! index 30 and returns before doing anything when it is set — except the fused
+//! `Shuffle` conv step, whose output state its caller swaps into the cache
+//! every step, and which therefore carries the state through unchanged
+//! instead (`docs/dispatch.md` §11.5z-x). One tiny kernel
 //! ([`crate::kernels::call_eos_gate`]) runs at the head of every forward,
 //! after the previous step's argmax, and raises the flag if the sampled token
 //! is a stop token. The flag is bound once per encoder (`Commands`) while the

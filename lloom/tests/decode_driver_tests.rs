@@ -1492,11 +1492,11 @@ fn the_adaptive_overrun_is_exact_at_every_depth() -> Result<()> {
 /// block, so both kinds of persistent state a forward writes are present.
 #[cfg(feature = "metal")]
 mod tiny_lfm2 {
-    use lloom::models::lfm2::{Config, KvAppend, LayerType, Model};
+    use lloom::models::lfm2::{Config, ConvState, KvAppend, LayerType, Model};
     use lloom::nn::VarBuilder;
     use lloom_tensor::{DType, Device, Result, Tensor};
 
-    pub fn config() -> Config {
+    pub fn config(conv_state: ConvState, conv_fused: bool) -> Config {
         Config {
             vocab_size: 64,
             hidden_size: 512,
@@ -1512,6 +1512,8 @@ mod tiny_lfm2 {
             layer_types: vec![LayerType::Conv, LayerType::FullAttention],
             tie_embedding: true,
             kv_append: KvAppend::InPlace,
+            conv_state,
+            conv_fused,
             ..Default::default()
         }
     }
@@ -1572,179 +1574,318 @@ mod tiny_lfm2 {
         Model::new(cfg, vb)
     }
 
-    /// Every conv block's state, as f32 bits.
-    pub fn conv_states(
-        cache: &lloom::models::lfm2::Cache,
-        n_layers: usize,
-    ) -> Result<Vec<Vec<u32>>> {
+    /// Every conv block's live window — the `l_cache` columns the next decode
+    /// step reads — as f32 bits. The whole state on `Shuffle`; on a rotating
+    /// ring the slots ending at the phase, since the ring's other slots hold
+    /// history a rewind has already stepped back over.
+    pub fn conv_windows(cache: &lloom::models::lfm2::Cache, cfg: &Config) -> Result<Vec<Vec<u32>>> {
+        let l = cfg.conv_l_cache;
         let mut out = Vec::new();
-        for b in 0..n_layers {
-            if let Some(t) = cache.conv_state_for_test(b) {
-                let v = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-                out.push(v.into_iter().map(f32::to_bits).collect());
-            }
+        for b in 0..cfg.num_hidden_layers {
+            let Some(t) = cache.conv_state_for_test(b) else {
+                continue;
+            };
+            let window = match cfg.conv_state {
+                ConvState::RotatingRing { k } => {
+                    let width = l + k;
+                    let phase = cache.conv_phase();
+                    let cols = (0..l)
+                        .rev()
+                        .map(|back| t.narrow(2, (phase + width - back) % width, 1))
+                        .collect::<Result<Vec<_>>>()?;
+                    Tensor::cat(&cols, 2)?
+                }
+                _ => t,
+            };
+            let v = window
+                .flatten_all()?
+                .to_dtype(DType::F32)?
+                .to_vec1::<f32>()?;
+            out.push(v.into_iter().map(f32::to_bits).collect());
         }
         Ok(out)
     }
 }
 
-/// The EOS gate on the real decode kernels (lloom #735 step 4's definition of
-/// done): a run that hits EOS with forwards queued behind it advances no cache
-/// state past the EOS position. The reference is the blocking arm, which never
-/// feeds the EOS token; the subject is the crown's flow — the ring polled, the
-/// adaptive commit, the fused publish, the gate — made to run `EXTRA` forwards
-/// past the EOS (the cap is reached before any stop flag: no reader). After
-/// `Session::reconcile` the subject's cache must be the reference's: the same
-/// KV length, every conv block's state bit for bit, and the same greedy
-/// continuation from a second turn.
-///
-/// The crown's cache has rewind horizon 0 (`Shuffle`), so the reconcile can
-/// only succeed through the gate's "unwritten" bookkeeping, and the conv state
-/// can only match if the gated kernels wrote nothing. The control arm is the
-/// same run without the gate: its reconcile is refused and its conv state
-/// differs from the reference — what the comparison would see if the gate
-/// leaked (§3.1b rule 2: a second arm that pins the level).
+/// What one conv-state arm of the EOS-gate cache test observed; see
+/// [`gate_cache_case`].
 #[cfg(feature = "metal")]
-#[test]
-fn the_eos_gate_leaves_the_crown_cache_where_the_blocking_arm_leaves_it() -> Result<()> {
+struct GateCase {
+    /// The gate armed, the cap reached before the EOS is sampled: it never
+    /// fires. The conv state against the reference's.
+    armed_unfired_matches: bool,
+    /// The gate fired with `EXTRA + 1` forwards queued past the EOS; after
+    /// the reconcile: the position, the KV length, the conv state, and a
+    /// one-token second turn — the turn that reads the conv state (a
+    /// multi-token prefill rebuilds it from its own activations).
+    fired_reconciled: std::result::Result<(), String>,
+    pos_matches: bool,
+    kv_len_matches: bool,
+    conv_matches: bool,
+    turn2_one_token_matches: bool,
+    turn2_prefill_matches: bool,
+    /// The same run without the gate: the reconcile's outcome (a rewind, which
+    /// only a ring can do) and whether the conv state then matched.
+    ungated_reconciled: std::result::Result<usize, String>,
+    ungated_conv_matches: bool,
+}
+
+/// One run of the crown's flow on `model` from `cache`: the ring polled, the
+/// adaptive commit, the fused publish, the gate as asked.
+#[cfg(feature = "metal")]
+fn gated_flow<'m>(
+    model: &'m lloom::models::lfm2::Model,
+    cache: Result<lloom::models::lfm2::Cache>,
+    eos: u32,
+    dev: &Device,
+    gate: bool,
+    max_tokens: usize,
+) -> Result<(
+    Session<'m, lloom::models::lfm2::Model>,
+    lloom::nn::DecodeOut,
+)> {
+    let mut s = Session::new(model, cache?);
+    let mut rb = adaptive_ring_for(&[eos], dev, EosRead::Poll(PollMechanism::default()))?;
+    let out = s.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut greedy(),
+        &[1, 2, 3, 4, 5],
+        &adaptive_opts(max_tokens, 8, gate),
+        &mut sink,
+    )?;
+    assert!(
+        out.stats.readback.fused_publishes > 0,
+        "the crown's fused publish ran"
+    );
+    Ok((s, out))
+}
+
+/// The EOS gate on the real decode kernels (lloom #735 step 4's definition of
+/// done), on a two-layer LFM2 with in-place KV and the given conv arm. The
+/// reference is the blocking arm, which never feeds the EOS token. The subject
+/// is the crown's flow — the ring polled, the adaptive commit, the fused
+/// publish, the gate — made to run `EXTRA` forwards past the EOS (the cap is
+/// reached before any stop flag: there is no reader). After
+/// `Session::reconcile` the subject's cache should be the reference's.
+#[cfg(feature = "metal")]
+fn gate_cache_case(
+    conv_state: lloom::models::lfm2::ConvState,
+    conv_fused: bool,
+) -> Result<GateCase> {
     use lloom::models::lfm2::Cache;
     const EXTRA: usize = 12;
-    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
     let dev = Device::new_metal(0).expect("metal");
-    let cfg = tiny_lfm2::config();
+    let cfg = tiny_lfm2::config(conv_state, conv_fused);
     let model = tiny_lfm2::build(&cfg, &dev)?;
-    let n_layers = cfg.num_hidden_layers;
     let prompt = [1u32, 2, 3, 4, 5];
     let fresh = || Cache::new(true, DType::F16, &cfg, &dev);
-
-    // The stream with no stop token; the EOS is the first token of it not
-    // seen earlier, at least four tokens in.
     let never = [u32::MAX];
-    let mut probe = Session::new(&model, fresh()?);
-    let stream = probe
-        .decode(
+    let greedy_blocking = |s: &mut Session<'_, lloom::models::lfm2::Model>,
+                           eos: &[u32],
+                           p: &[u32],
+                           n: usize|
+     -> Result<Vec<u32>> {
+        Ok(s.decode(
             &mut IdentityProposer,
-            &mut Blocking::new(&never, &dev)?,
+            &mut Blocking::new(eos, &dev)?,
             &mut greedy(),
-            &prompt,
-            &DecodeOptions::new(32),
+            p,
+            &DecodeOptions::new(n),
             &mut sink,
         )?
-        .ids;
+        .ids)
+    };
+
+    // The stream with no stop token; the EOS is its first token not seen
+    // earlier, at least four in.
+    let stream = greedy_blocking(&mut Session::new(&model, fresh()?), &never, &prompt, 32)?;
     let k = (4..stream.len())
         .find(|&k| !stream[..k].contains(&stream[k]))
         .unwrap_or_else(|| panic!("no fresh token in the stream to stop on: {stream:?}"));
     let eos = stream[k];
     let want = &stream[..k];
-    let turn2 = [9u32, 3];
 
-    // The reference: the blocking arm stops at the EOS, feeding nothing past it.
+    // The reference stops at the EOS, feeding nothing past it.
     let mut reference = Session::new(&model, fresh()?);
-    let r = reference.decode(
-        &mut IdentityProposer,
-        &mut Blocking::new(&[eos], &dev)?,
-        &mut greedy(),
-        &prompt,
-        &DecodeOptions::new(64),
-        &mut sink,
-    )?;
-    assert_eq!(r.ids, want);
-    assert!(r.eos && r.stats.overrun == 0);
+    assert_eq!(greedy_blocking(&mut reference, &[eos], &prompt, 64)?, want);
     let ref_pos = reference.pos();
     let ref_kv = reference.sequence().cache().kv_len();
-    let ref_conv = tiny_lfm2::conv_states(reference.sequence().cache(), n_layers)?;
+    let ref_conv = tiny_lfm2::conv_windows(reference.sequence().cache(), &cfg)?;
     assert!(!ref_conv.is_empty(), "the fixture has a conv block");
-    let ref_turn2 = reference
-        .decode(
-            &mut IdentityProposer,
-            &mut Blocking::new(&never, &dev)?,
-            &mut greedy(),
-            &turn2,
-            &DecodeOptions::new(16),
-            &mut sink,
-        )?
-        .ids;
+    // Two second turns, each from the reference's state: one token (the
+    // decode path, which reads the conv state) and a prefill.
+    let ref_turn2_one = {
+        let mut r = Session::new(&model, fresh()?);
+        greedy_blocking(&mut r, &[eos], &prompt, 64)?;
+        greedy_blocking(&mut r, &never, &[9], 12)?
+    };
+    let ref_turn2_prefill = greedy_blocking(&mut reference, &never, &[9, 3], 12)?;
 
-    for gate in [true, false] {
-        let mut subject = Session::new(&model, fresh()?);
-        let mut rb = adaptive_ring_for(&[eos], &dev, EosRead::Poll(PollMechanism::default()))?;
-        let opts = adaptive_opts(k + 1 + EXTRA, 8, gate);
-        let out = subject.decode(
-            &mut IdentityProposer,
-            &mut rb,
-            &mut greedy(),
-            &prompt,
-            &opts,
-            &mut sink,
-        )?;
-        assert_eq!(out.ids, want, "gate {gate}: the ids end at the EOS");
-        assert!(out.eos, "gate {gate}");
-        assert_eq!(
-            out.stats.overrun,
-            1 + EXTRA,
-            "gate {gate}: the forced overrun"
+    let flow =
+        |gate: bool, max_tokens: usize| gated_flow(&model, fresh(), eos, &dev, gate, max_tokens);
+
+    // Armed, not fired: `k` steps feed `want` and never sample the EOS.
+    let (armed, out) = flow(true, k)?;
+    assert_eq!(out.ids, want);
+    assert!(!out.eos && out.stats.overrun == 0);
+    assert!(!out.stats.eos_gate.expect("armed").fired);
+    let armed_unfired_matches = armed.pos() == ref_pos
+        && tiny_lfm2::conv_windows(armed.sequence().cache(), &cfg)? == ref_conv;
+
+    // Fired: `EXTRA + 1` forwards queued past the EOS, the EOS's own first.
+    let (mut fired, out) = flow(true, k + 1 + EXTRA)?;
+    assert_eq!(out.ids, want, "the ids end at the EOS");
+    assert!(out.eos);
+    assert_eq!(out.stats.overrun, 1 + EXTRA, "the forced overrun");
+    assert!(
+        out.stats.eos_gate.expect("armed").fired,
+        "the gate saw the EOS"
+    );
+    assert!(
+        out.stats.overrun_unwritten,
+        "every forward past the EOS is unwritten"
+    );
+    let fired_reconciled = fired.reconcile().map(|_| ()).map_err(|e| e.to_string());
+    let pos_matches = fired.pos() == ref_pos;
+    let kv_len_matches = fired.sequence().cache().kv_len() == ref_kv;
+    let conv_matches = tiny_lfm2::conv_windows(fired.sequence().cache(), &cfg)? == ref_conv;
+    let (turn2_one_token_matches, turn2_prefill_matches) = if fired_reconciled.is_ok() {
+        let one = greedy_blocking(&mut fired, &never, &[9], 12)? == ref_turn2_one;
+        let (mut again, _) = flow(true, k + 1 + EXTRA)?;
+        again.reconcile()?;
+        let prefill = greedy_blocking(&mut again, &never, &[9, 3], 12)? == ref_turn2_prefill;
+        (one, prefill)
+    } else {
+        (false, false)
+    };
+
+    // The control: the same run, no gate. The overrun wrote the cache.
+    let (mut ungated, out) = flow(false, k + 1 + EXTRA)?;
+    assert!(!out.stats.overrun_unwritten && out.stats.overrun == 1 + EXTRA);
+    let ungated_reconciled = ungated.reconcile().map_err(|e| e.to_string());
+    let ungated_conv_matches =
+        tiny_lfm2::conv_windows(ungated.sequence().cache(), &cfg)? == ref_conv;
+
+    Ok(GateCase {
+        armed_unfired_matches,
+        fired_reconciled,
+        pos_matches,
+        kv_len_matches,
+        conv_matches,
+        turn2_one_token_matches,
+        turn2_prefill_matches,
+        ungated_reconciled,
+        ungated_conv_matches,
+    })
+}
+
+/// On a rotating conv ring the gate's overrun reconciles to the reference's
+/// cache exactly: position, KV length, conv state and both second turns. The
+/// armed-but-unfired arm pins that the gated kernel variants are the plain
+/// ones while the flag is clear; the ungated control reconciles too, through
+/// the ring's own history (a rewind), which is what `RotatingRing` is for.
+#[cfg(feature = "metal")]
+#[test]
+fn the_eos_gate_reconciles_to_the_blocking_arms_cache_on_a_conv_ring() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    let c = gate_cache_case(
+        lloom::models::lfm2::ConvState::RotatingRing { k: 32 },
+        false,
+    )?;
+    report_gate_case("rotating:32", &c);
+    assert_gate_case(&c, false);
+    assert!(c.ungated_reconciled.is_ok(), "ungated: the ring rewinds");
+    assert!(
+        c.ungated_conv_matches,
+        "ungated: rewound to the reference's state"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn assert_gate_case(c: &GateCase, horizon_zero: bool) {
+    assert!(
+        c.armed_unfired_matches,
+        "armed, unfired: the reference's state"
+    );
+    assert_eq!(c.fired_reconciled, Ok(()), "fired: the reconcile");
+    assert!(
+        c.pos_matches && c.kv_len_matches,
+        "fired: position and KV length"
+    );
+    assert!(
+        c.conv_matches,
+        "fired: every conv block's live window, bit for bit"
+    );
+    assert!(c.turn2_one_token_matches, "fired: a one-token second turn");
+    assert!(c.turn2_prefill_matches, "fired: a prefilled second turn");
+    if horizon_zero {
+        assert!(
+            c.ungated_reconciled.is_err(),
+            "ungated: a horizon-0 cache cannot rewind"
         );
         assert!(
-            out.stats.readback.fused_publishes > 0,
-            "gate {gate}: the crown's fused publish ran"
-        );
-        assert_eq!(
-            subject.pos(),
-            ref_pos + 1 + EXTRA,
-            "gate {gate}: before the reconcile"
-        );
-        if !gate {
-            // The control: the overrun wrote the cache, which cannot rewind.
-            assert!(!out.stats.overrun_unwritten);
-            let err = subject
-                .reconcile()
-                .expect_err("a written overrun on a horizon-0 cache");
-            eprintln!("control arm, no gate: reconcile refused: {err}");
-            let conv = tiny_lfm2::conv_states(subject.sequence().cache(), n_layers)?;
-            assert_ne!(
-                conv, ref_conv,
-                "the ungated overrun left the conv state where the reference did — the \
-                 comparison below would not see a leaking gate"
-            );
-            continue;
-        }
-        let g = out.stats.eos_gate.expect("the gate ran");
-        assert!(g.fired, "the gate saw the EOS: {g:?}");
-        assert!(
-            out.stats.overrun_unwritten,
-            "every forward past the EOS is unwritten"
-        );
-        assert_eq!(subject.reconcile()?, 1 + EXTRA, "counters only, no horizon");
-        assert_eq!(subject.pos(), ref_pos, "the position after the reconcile");
-        assert_eq!(
-            subject.tokens(),
-            reference.tokens()[..ref_pos].to_vec().as_slice()
-        );
-        assert_eq!(
-            subject.sequence().cache().kv_len(),
-            ref_kv,
-            "the KV length the reference's"
-        );
-        assert_eq!(
-            tiny_lfm2::conv_states(subject.sequence().cache(), n_layers)?,
-            ref_conv,
-            "every conv block's state, bit for bit, is the reference's"
-        );
-        let turn2_ids = subject
-            .decode(
-                &mut IdentityProposer,
-                &mut Blocking::new(&never, &dev)?,
-                &mut greedy(),
-                &turn2,
-                &DecodeOptions::new(16),
-                &mut sink,
-            )?
-            .ids;
-        assert_eq!(
-            turn2_ids, ref_turn2,
-            "the second turn continues the reference's cache"
+            !c.ungated_conv_matches,
+            "ungated: the overrun moved the state"
         );
     }
+}
+
+#[cfg(feature = "metal")]
+fn report_gate_case(name: &str, c: &GateCase) {
+    eprintln!(
+        "{name}: armed-unfired {} | fired: reconcile {:?} pos {} kv {} conv {} turn2(1 token) {} \
+         turn2(prefill) {} | ungated: reconcile {:?} conv {}",
+        c.armed_unfired_matches,
+        c.fired_reconciled,
+        c.pos_matches,
+        c.kv_len_matches,
+        c.conv_matches,
+        c.turn2_one_token_matches,
+        c.turn2_prefill_matches,
+        c.ungated_reconciled,
+        c.ungated_conv_matches
+    );
+}
+
+/// The crown's conv arm — `Shuffle` with the fused step (`conv_fused`) — under
+/// the gate: the reconcile is counters only (horizon 0), so the cache can
+/// match the reference only if nothing past the EOS reached it. The fused step
+/// writes the next state into a buffer the model swaps into the cache every
+/// step, which is why its gated variant carries the state through rather than
+/// returning bare (`conv.metal` `shortconv_state_carry`). The ungated control
+/// is the level: its reconcile is refused and its state has moved.
+#[cfg(feature = "metal")]
+#[test]
+fn the_eos_gate_reconciles_to_the_blocking_arms_cache_on_the_crown_shuffle() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    let c = gate_cache_case(lloom::models::lfm2::ConvState::Shuffle, true)?;
+    report_gate_case("shuffle, fused step", &c);
+    assert_gate_case(&c, true);
+    Ok(())
+}
+
+/// `Shuffle` WITHOUT the fused step — **a known defect, pinned**
+/// (`docs/dispatch.md` §11.5z-x). The unfused step builds the next state as a
+/// `cat` into a fresh tensor (`lfm2.rs` `convolve_bcx`) that the model swaps
+/// into the cache; the gated copy kernels skip the writes and the swap still
+/// happens, so the cache ends holding a tensor nothing wrote. No kernel
+/// epilogue can carry a state through a `cat`; the repair is the model's
+/// (write the state in place, or refuse `rewind_unwritten` on this arm), in a
+/// file of the LFM2-kernels lane. The second turns are no discriminator on
+/// this fixture — its greedy ids came out equal with the state wrong — and a
+/// prefilled turn rebuilds the state from its own activations whatever it was,
+/// which is why a multi-turn digest cannot see this: the conv state is the
+/// assertion. Run it with `--ignored`.
+#[cfg(feature = "metal")]
+#[test]
+#[ignore = "defect: the unfused Shuffle step swaps in a conv state the gate kept it from writing (lfm2.rs, §11.5z-x)"]
+fn the_eos_gate_reconciles_to_the_blocking_arms_cache_on_the_unfused_shuffle() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    let c = gate_cache_case(lloom::models::lfm2::ConvState::Shuffle, false)?;
+    report_gate_case("shuffle, unfused step", &c);
+    assert_gate_case(&c, true);
     Ok(())
 }
 

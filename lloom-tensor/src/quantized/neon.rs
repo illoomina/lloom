@@ -1,8 +1,10 @@
 #[cfg(target_feature = "dotprod")]
 use super::k_quants::BlockQ4Kx8;
+use super::k_quants::GgmlType;
 use super::k_quants::{
     BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ5K, BlockQ6K, BlockQ8K, BlockQ8_0, QK8_0, QK_K,
 };
+use crate::cpu::arms::{self, Feature};
 use byteorder::{ByteOrder, LittleEndian};
 
 #[allow(unused_imports)]
@@ -13,57 +15,197 @@ use core::arch::arm::*;
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
 
+// The int8 dot-product kernels come in one native arm, built on `sdot`
+// (`FEAT_DotProd`). Each entry point below takes it when this process executes
+// `sdot` and the block type's reference kernel otherwise; the instruction is
+// never emulated. A build that compiles `dotprod` in folds the check away and
+// inlines the arm exactly as before; any other build detects it at run time.
+// (§15.2a)
+
+/// Whether the entry points take the `sdot` arm.
 #[inline(always)]
-unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
-    #[cfg(target_feature = "dotprod")]
-    {
-        let mut acc: int32x4_t = vdupq_n_s32(0);
-        core::arch::asm!(
-            "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
-            acc = inout(vreg) acc,
-            a = in(vreg) a,
-            b = in(vreg) b,
-            options(nostack, nomem),
-        );
-        acc
-    }
-    #[cfg(not(target_feature = "dotprod"))]
-    {
-        let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
-        let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
-        vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
+fn sdot_is_native() -> bool {
+    arms::native(Feature::DotProd)
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) -> f32 {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_q4_0_q8_0_sdot(n, xs, ys) }
+    } else {
+        BlockQ4_0::vec_dot_unopt(n, xs, ys)
     }
 }
 
-/// Two SDOT ops into one accumulator
 #[inline(always)]
-unsafe fn vdotq_s32_pair(a0: int8x16_t, b0: int8x16_t, a1: int8x16_t, b1: int8x16_t) -> int32x4_t {
-    #[cfg(target_feature = "dotprod")]
-    {
-        let mut acc: int32x4_t = vdupq_n_s32(0);
-        core::arch::asm!(
-            "sdot {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
-            "sdot {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
-            acc = inout(vreg) acc,
-            a0 = in(vreg) a0,
-            b0 = in(vreg) b0,
-            a1 = in(vreg) a1,
-            b1 = in(vreg) b1,
-            options(nostack, nomem),
-        );
-        acc
+pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) -> f32 {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_q8_0_q8_0_sdot(n, xs, ys) }
+    } else {
+        BlockQ8_0::vec_dot_unopt(n, xs, ys)
     }
-    #[cfg(not(target_feature = "dotprod"))]
-    {
-        let p0 = vmull_s8(vget_low_s8(a0), vget_low_s8(b0));
-        let p1 = vmull_s8(vget_high_s8(a0), vget_high_s8(b0));
-        let p2 = vmull_s8(vget_low_s8(a1), vget_low_s8(b1));
-        let p3 = vmull_s8(vget_high_s8(a1), vget_high_s8(b1));
-        vaddq_s32(
-            vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
-            vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)),
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_4_q8_0_q8_0(
+    n: usize,
+    xs0: &[BlockQ8_0],
+    xs1: &[BlockQ8_0],
+    xs2: &[BlockQ8_0],
+    xs3: &[BlockQ8_0],
+    ys: &[BlockQ8_0],
+) -> (f32, f32, f32, f32) {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_4_q8_0_q8_0_sdot(n, xs0, xs1, xs2, xs3, ys) }
+    } else {
+        (
+            BlockQ8_0::vec_dot_unopt(n, xs0, ys),
+            BlockQ8_0::vec_dot_unopt(n, xs1, ys),
+            BlockQ8_0::vec_dot_unopt(n, xs2, ys),
+            BlockQ8_0::vec_dot_unopt(n, xs3, ys),
         )
     }
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32 {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_q8k_q8k_sdot(n, xs, ys) }
+    } else {
+        BlockQ8K::vec_dot_unopt(n, xs, ys)
+    }
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_q6k_q8k_sdot(n, xs, ys) }
+    } else {
+        BlockQ6K::vec_dot_unopt(n, xs, ys)
+    }
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_4_q6k_q8k(
+    n: usize,
+    xs0: &[BlockQ6K],
+    xs1: &[BlockQ6K],
+    xs2: &[BlockQ6K],
+    xs3: &[BlockQ6K],
+    ys: &[BlockQ8K],
+) -> (f32, f32, f32, f32) {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_4_q6k_q8k_sdot(n, xs0, xs1, xs2, xs3, ys) }
+    } else {
+        (
+            BlockQ6K::vec_dot_unopt(n, xs0, ys),
+            BlockQ6K::vec_dot_unopt(n, xs1, ys),
+            BlockQ6K::vec_dot_unopt(n, xs2, ys),
+            BlockQ6K::vec_dot_unopt(n, xs3, ys),
+        )
+    }
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_q5k_q8k_sdot(n, xs, ys) }
+    } else {
+        BlockQ5K::vec_dot_unopt(n, xs, ys)
+    }
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_q4k_q8k_sdot(n, xs, ys) }
+    } else {
+        BlockQ4K::vec_dot_unopt(n, xs, ys)
+    }
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_4_q4k_q8k(
+    n: usize,
+    xs0: &[BlockQ4K],
+    xs1: &[BlockQ4K],
+    xs2: &[BlockQ4K],
+    xs3: &[BlockQ4K],
+    ys: &[BlockQ8K],
+) -> (f32, f32, f32, f32) {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_4_q4k_q8k_sdot(n, xs0, xs1, xs2, xs3, ys) }
+    } else {
+        (
+            BlockQ4K::vec_dot_unopt(n, xs0, ys),
+            BlockQ4K::vec_dot_unopt(n, xs1, ys),
+            BlockQ4K::vec_dot_unopt(n, xs2, ys),
+            BlockQ4K::vec_dot_unopt(n, xs3, ys),
+        )
+    }
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_q3k_q8k_sdot(n, xs, ys) }
+    } else {
+        BlockQ3K::vec_dot_unopt(n, xs, ys)
+    }
+}
+
+#[inline(always)]
+pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
+    if sdot_is_native() {
+        // SAFETY: this process executes `sdot`.
+        unsafe { vec_dot_q2k_q8k_sdot(n, xs, ys) }
+    } else {
+        BlockQ2K::vec_dot_unopt(n, xs, ys)
+    }
+}
+
+/// One `sdot`: four int32 lanes, each the dot product of four int8 pairs.
+///
+/// Every caller is an `_sdot` kernel below, compiled with `dotprod` enabled and
+/// reached only through an entry point that has checked the CPU executes it.
+#[inline(always)]
+unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    let mut acc: int32x4_t = vdupq_n_s32(0);
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+        acc = inout(vreg) acc,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(nostack, nomem),
+    );
+    acc
+}
+
+/// Two `sdot`s into one accumulator. Same contract as [`vdotq_s32`].
+#[inline(always)]
+unsafe fn vdotq_s32_pair(a0: int8x16_t, b0: int8x16_t, a1: int8x16_t, b1: int8x16_t) -> int32x4_t {
+    let mut acc: int32x4_t = vdupq_n_s32(0);
+    core::arch::asm!(
+        "sdot {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+        "sdot {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+        acc = inout(vreg) acc,
+        a0 = in(vreg) a0,
+        b0 = in(vreg) b0,
+        a1 = in(vreg) a1,
+        b1 = in(vreg) b1,
+        options(nostack, nomem),
+    );
+    acc
 }
 
 /// Accumulating SDOT: acc += dot4(a, b) for each lane.
@@ -121,8 +263,9 @@ unsafe fn merge_signed_max(
     )
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) -> f32 {
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_q4_0_q8_0_sdot(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK8_0),
         "vec_dot_q4_0_q8_0: {n} is not divisible by {QK8_0}"
@@ -163,8 +306,9 @@ pub(crate) fn vec_dot_q4_0_q8_0(n: usize, xs: &[BlockQ4_0], ys: &[BlockQ8_0]) ->
     }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) -> f32 {
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_q8_0_q8_0_sdot(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK8_0),
         "vec_dot_q8_0_q8_0: {n} is not divisible by {QK8_0}"
@@ -196,8 +340,9 @@ pub(crate) fn vec_dot_q8_0_q8_0(n: usize, xs: &[BlockQ8_0], ys: &[BlockQ8_0]) ->
     }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_4_q8_0_q8_0(
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_4_q8_0_q8_0_sdot(
     n: usize,
     xs0: &[BlockQ8_0],
     xs1: &[BlockQ8_0],
@@ -264,8 +409,9 @@ pub(crate) fn vec_dot_4_q8_0_q8_0(
     }
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32 {
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_q8k_q8k_sdot(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q8k_q8k: {n} is not divisible by {QK_K}"
@@ -289,8 +435,9 @@ pub(crate) fn vec_dot_q8k_q8k(n: usize, xs: &[BlockQ8K], ys: &[BlockQ8K]) -> f32
     sumf
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_q6k_q8k_sdot(n: usize, xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q6k_q8k: {n} is not divisible by {QK_K}"
@@ -399,8 +546,9 @@ pub(crate) fn vec_dot_q6k_q8k(n: usize, xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32
 }
 
 /// Four Q6K dot products sharing one Q8K load.
-#[inline(always)]
-pub(crate) fn vec_dot_4_q6k_q8k(
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_4_q6k_q8k_sdot(
     n: usize,
     xs0: &[BlockQ6K],
     xs1: &[BlockQ6K],
@@ -560,8 +708,9 @@ pub(crate) fn vec_dot_4_q6k_q8k(
     (sum0, sum1, sum2, sum3)
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_q5k_q8k_sdot(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q5k_q8k: {n} is not divisible by {QK_K}"
@@ -645,8 +794,9 @@ pub(crate) fn vec_dot_q5k_q8k(n: usize, xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32
     sumf
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_q4k_q8k_sdot(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q4k_q8k: {n} is not divisible by {QK_K}"
@@ -727,8 +877,9 @@ pub(crate) fn vec_dot_q4k_q8k(n: usize, xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32
 }
 
 /// Four Q4K dot products sharing one Q8K load.
-#[inline(always)]
-pub(crate) fn vec_dot_4_q4k_q8k(
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_4_q4k_q8k_sdot(
     n: usize,
     xs0: &[BlockQ4K],
     xs1: &[BlockQ4K],
@@ -883,8 +1034,9 @@ pub(crate) fn vec_dot_4_q4k_q8k(
     (sum0, sum1, sum2, sum3)
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_q3k_q8k_sdot(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q3k_q8k: {n} is not divisible by {QK_K}"
@@ -1007,8 +1159,9 @@ pub(crate) fn vec_dot_q3k_q8k(n: usize, xs: &[BlockQ3K], ys: &[BlockQ8K]) -> f32
     sumf
 }
 
-#[inline(always)]
-pub(crate) fn vec_dot_q2k_q8k(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
+#[cfg_attr(target_feature = "dotprod", inline(always))]
+#[cfg_attr(not(target_feature = "dotprod"), target_feature(enable = "dotprod"))]
+unsafe fn vec_dot_q2k_q8k_sdot(n: usize, xs: &[BlockQ2K], ys: &[BlockQ8K]) -> f32 {
     debug_assert!(
         n.is_multiple_of(QK_K),
         "vec_dot_q2k_q8k: {n} is not divisible by {QK_K}"
@@ -1324,4 +1477,110 @@ pub(crate) fn vec_dot_8_q4k_q8k(n: usize, xs: &[BlockQ4Kx8], ys: &[BlockQ8K]) ->
         vst1q_f32(out.as_mut_ptr().add(4), vacc_1);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A row length every block type here divides.
+    const N: usize = 4 * QK_K;
+
+    /// Deterministic values in [-1, 1), distinct per seed.
+    fn values(seed: u32) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        (0..N)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn quantize<T: GgmlType>(seed: u32) -> Vec<T> {
+        let mut out = vec![T::zeros(); N / T::BLCK_SIZE];
+        T::from_float(&values(seed), &mut out);
+        out
+    }
+
+    /// The bound the ggml matmul test holds the optimized kernels to against
+    /// the reference: `|a - b| / n <= 1e-6`.
+    fn assert_close(got: f32, reference: f32, what: &str) {
+        assert!(
+            got.is_finite() && (got - reference).abs() <= 1e-6 * N as f32,
+            "{what}: entry point {got} vs reference {reference}"
+        );
+    }
+
+    fn check_one<T: GgmlType>(f: fn(usize, &[T], &[T::VecDotType]) -> f32, what: &str) {
+        let xs = quantize::<T>(1);
+        let ys = quantize::<T::VecDotType>(2);
+        assert_close(f(N, &xs, &ys), T::vec_dot_unopt(N, &xs, &ys), what);
+    }
+
+    type Dot4<T, Y> = fn(usize, &[T], &[T], &[T], &[T], &[Y]) -> (f32, f32, f32, f32);
+
+    fn check_four<T: GgmlType>(f: Dot4<T, T::VecDotType>, what: &str) {
+        let xs: Vec<Vec<T>> = (3..7).map(quantize::<T>).collect();
+        let ys = quantize::<T::VecDotType>(2);
+        let (d0, d1, d2, d3) = f(N, &xs[0], &xs[1], &xs[2], &xs[3], &ys);
+        for (lane, got) in [d0, d1, d2, d3].into_iter().enumerate() {
+            let reference = T::vec_dot_unopt(N, &xs[lane], &ys);
+            assert_close(got, reference, &format!("{what} lane {lane}"));
+        }
+    }
+
+    /// Every entry point against its block type's reference kernel, on the
+    /// arm this process takes (`sdot` unless `dotprod` is absent or disabled).
+    #[test]
+    fn every_entry_point_matches_the_reference_kernel() {
+        check_one::<BlockQ4_0>(vec_dot_q4_0_q8_0, "q4_0");
+        check_one::<BlockQ8_0>(vec_dot_q8_0_q8_0, "q8_0");
+        check_one::<BlockQ8K>(vec_dot_q8k_q8k, "q8k");
+        check_one::<BlockQ6K>(vec_dot_q6k_q8k, "q6k");
+        check_one::<BlockQ5K>(vec_dot_q5k_q8k, "q5k");
+        check_one::<BlockQ4K>(vec_dot_q4k_q8k, "q4k");
+        check_one::<BlockQ3K>(vec_dot_q3k_q8k, "q3k");
+        check_one::<BlockQ2K>(vec_dot_q2k_q8k, "q2k");
+        check_four::<BlockQ8_0>(vec_dot_4_q8_0_q8_0, "4 x q8_0");
+        check_four::<BlockQ6K>(vec_dot_4_q6k_q8k, "4 x q6k");
+        check_four::<BlockQ4K>(vec_dot_4_q4k_q8k, "4 x q4k");
+    }
+
+    /// The entry point runs the arm the registry names. The two arms sum in
+    /// different orders, so on this input their results differ in the last
+    /// bits, and the bits of the entry point's result say which one ran.
+    #[test]
+    fn the_entry_point_takes_the_arm_the_registry_names() {
+        let xs = quantize::<BlockQ8_0>(1);
+        let ys = quantize::<BlockQ8_0>(2);
+        let reference = BlockQ8_0::vec_dot_unopt(N, &xs, &ys);
+        let taken = vec_dot_q8_0_q8_0(N, &xs, &ys);
+        eprintln!(
+            "dotprod native: {} (compiled in: {})",
+            sdot_is_native(),
+            Feature::DotProd.compiled_in()
+        );
+        // Running `sdot` needs the hardware, not the registry's permission.
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            assert!(!sdot_is_native());
+            assert_eq!(taken.to_bits(), reference.to_bits());
+            return;
+        }
+        // SAFETY: the hardware executes `sdot` (checked above).
+        let sdot = unsafe { vec_dot_q8_0_q8_0_sdot(N, &xs, &ys) };
+        assert_ne!(
+            sdot.to_bits(),
+            reference.to_bits(),
+            "precondition: the arms must round differently on this input"
+        );
+        let expected = if sdot_is_native() { sdot } else { reference };
+        assert_eq!(
+            taken.to_bits(),
+            expected.to_bits(),
+            "entry point took the wrong arm: got {taken}, sdot {sdot}, reference {reference}"
+        );
+    }
 }

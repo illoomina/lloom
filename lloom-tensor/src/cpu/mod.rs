@@ -1,5 +1,6 @@
 //! Traits and methods for CPU-backed Tensors
 #![allow(clippy::needless_range_loop)]
+pub mod arms;
 pub mod erf;
 pub mod kernels;
 

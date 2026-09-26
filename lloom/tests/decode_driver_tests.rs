@@ -1229,6 +1229,10 @@ fn adaptive_gated_run(
 }
 
 fn adaptive_ring(device: &Device, arm: EosRead) -> Result<Ring> {
+    adaptive_ring_for(&[EOS], device, arm)
+}
+
+fn adaptive_ring_for(eos: &[u32], device: &Device, arm: EosRead) -> Result<Ring> {
     let geometry = lloom::generation::Geometry {
         batch: 1,
         max_draft: 0,
@@ -1237,7 +1241,7 @@ fn adaptive_ring(device: &Device, arm: EosRead) -> Result<Ring> {
         max_input_width: 1,
         in_flight_depth: 4 + 3 * 8,
     };
-    Ring::with_geometry(&[EOS], device, geometry, arm)
+    Ring::with_geometry(eos, device, geometry, arm)
 }
 
 /// A reader taken for a LATER run on the same ring resumes at the current
@@ -1331,6 +1335,467 @@ fn the_adaptive_commit_with_the_eos_gate_stops_on_the_readers_flag() -> Result<(
                 session.pos(),
                 1 + want.len() + out.stats.overrun,
                 "{arm:?}: the position is the prompt, the ids and the overrun"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The adaptive commit's options for a run the test stops itself: no reader
+/// thread (the loop's drain is not the reader's, so the test reads the ids off
+/// the returned run), `run_ahead` steps a buffer at most, the gate as asked.
+fn adaptive_opts(n: usize, run_ahead: usize, eos_gate: bool) -> DecodeOptions {
+    DecodeOptions {
+        lookahead: 1,
+        stream_via_reader: true,
+        adaptive_commit: true,
+        run_ahead,
+        eos_gate,
+        ..DecodeOptions::new(n)
+    }
+}
+
+/// An adaptive run longer than the ring's history must not lap it. Under the
+/// adaptive commit (and under `stream_via_reader` on the fixed cadence) the loop
+/// does not drain the history per commit — the reader streams — so nothing
+/// advances the history's drain cursor until the run ends, and a run of more
+/// steps than the ring has tiles meets the lap guard. `Ring::new` is what the
+/// serving binary builds (`RingPool`, `RING_HISTORY_SLOTS` tiles, no consumer
+/// slack), so the length that meets it is 4092 tokens.
+#[test]
+fn a_reader_owned_run_longer_than_the_ring_does_not_lap_it() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        if matches!(device, Device::Cpu) {
+            continue; // the adaptive commit and the reader are Metal
+        }
+        let floor = lloom::generation::readback::RING_HISTORY_SLOTS;
+        let n = floor + 900;
+        let (want, hit) = chain(0, n);
+        assert!(!hit, "the chain from 0 never reaches EOS");
+        for (name, opts) in [
+            ("adaptive", adaptive_opts(n, 8, false)),
+            (
+                "fixed cadence, reader-owned",
+                DecodeOptions {
+                    lookahead: 1,
+                    budget: CommitBudget::steps(8)?,
+                    stream_via_reader: true,
+                    ..DecodeOptions::new(n)
+                },
+            ),
+        ] {
+            let model = Chain::new(&device)?;
+            let mut session = Session::new(&model, 0usize);
+            let mut rb = Ring::new(&[EOS], &device, 8, EosRead::Poll(PollMechanism::default()))?
+                .with_poll_budget(20_000);
+            let out = session
+                .decode(
+                    &mut IdentityProposer,
+                    &mut rb,
+                    &mut greedy(),
+                    &[0],
+                    &opts,
+                    &mut sink,
+                )
+                .map_err(|e| lloom_tensor::Error::Msg(format!("{name}: {e}")))?;
+            assert_eq!(out.ids.len(), n, "{name}: every token comes back");
+            assert_eq!(out.ids, want, "{name}: the ids are the chain's");
+            assert_eq!(session.pos(), 1 + n, "{name}: the position");
+        }
+    }
+    Ok(())
+}
+
+/// The overrun past an EOS is reconciled for any depth (lloom #735): the loop
+/// derives it from the cache position, so however many forwards the host had
+/// queued behind the EOS, the ids end at the EOS, the position is the prompt,
+/// the ids and the overrun, and the publishes reconcile. The overrun is forced
+/// here rather than raced: no reader thread raises the stop flag, so the run
+/// takes exactly `max_tokens` steps and the EOS is found in the drained ids at
+/// the end, `extra` forwards before the cap. With the gate on, every one of
+/// those forwards is marked unwritten.
+///
+/// Also pins what the ring's input side holds at that depth: one tile per
+/// step the host may lead by, so no input write lands on a tile a queued
+/// forward still reads (`TokenRing::input_slot_count`).
+#[test]
+fn the_adaptive_overrun_is_exact_at_every_depth() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        if matches!(device, Device::Cpu) {
+            continue; // the adaptive commit and the gate are Metal
+        }
+        let (want, hit) = chain(1, 64);
+        assert!(hit);
+        for run_ahead in [1usize, 2, 4, 8, 16] {
+            for extra in [0usize, 1, 5, 23] {
+                for gate in [false, true] {
+                    let max_tokens = want.len() + 1 + extra;
+                    let opts = adaptive_opts(max_tokens, run_ahead, gate);
+                    let model = Chain::with_ballast(&device, 256)?;
+                    let mut session = Session::new(&model, 0usize);
+                    let mut rb = adaptive_ring(&device, EosRead::Poll(PollMechanism::default()))?;
+                    assert!(
+                        rb.token_ring().input_slot_count() > opts.adaptive_lead(),
+                        "{} input tiles for a lead of {} steps",
+                        rb.token_ring().input_slot_count(),
+                        opts.adaptive_lead()
+                    );
+                    let out = session.decode(
+                        &mut IdentityProposer,
+                        &mut rb,
+                        &mut greedy(),
+                        &[1],
+                        &opts,
+                        &mut sink,
+                    )?;
+                    let tag = format!("run_ahead {run_ahead} extra {extra} gate {gate}");
+                    assert_eq!(out.ids, want, "{tag}: the ids end at the EOS");
+                    assert!(out.eos, "{tag}: EOS found in the drained ids");
+                    assert_eq!(out.stats.steps as usize, max_tokens, "{tag}: steps");
+                    assert_eq!(
+                        out.stats.overrun,
+                        1 + extra,
+                        "{tag}: the EOS's own forward and every one after it"
+                    );
+                    assert_eq!(session.pos(), 1 + want.len() + 1 + extra, "{tag}: position");
+                    assert_eq!(session.overrun(), 1 + extra, "{tag}");
+                    assert_eq!(
+                        out.stats.overrun_unwritten, gate,
+                        "{tag}: unwritten iff gated"
+                    );
+                    if gate {
+                        let g = out.stats.eos_gate.expect("the gate ran");
+                        assert!(g.fired, "{tag}: the gate saw the EOS");
+                    }
+                    let c = out.stats.readback;
+                    assert_eq!(
+                        c.ring_publishes,
+                        out.ids.len() as u64 + c.ring_eos_publishes + c.ring_discarded,
+                        "{tag}: publishes reconcile: {c:?}"
+                    );
+                    assert!(
+                        out.stats.max_steps_per_buffer <= run_ahead,
+                        "{tag}: {} steps in one buffer",
+                        out.stats.max_steps_per_buffer
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A two-layer LFM2 on the crown's cache (`Shuffle` conv state, in-place KV —
+/// rewind horizon 0), deterministic weights: one conv block and one attention
+/// block, so both kinds of persistent state a forward writes are present.
+#[cfg(feature = "metal")]
+mod tiny_lfm2 {
+    use lloom::models::lfm2::{Config, KvAppend, LayerType, Model};
+    use lloom::nn::VarBuilder;
+    use lloom_tensor::{DType, Device, Result, Tensor};
+
+    pub fn config() -> Config {
+        Config {
+            vocab_size: 64,
+            hidden_size: 512,
+            intermediate_size: 512,
+            num_hidden_layers: 2,
+            num_attention_heads: 8,
+            num_key_value_heads: 4,
+            norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_position_embeddings: 128,
+            conv_l_cache: 3,
+            conv_bias: false,
+            layer_types: vec![LayerType::Conv, LayerType::FullAttention],
+            tie_embedding: true,
+            kv_append: KvAppend::InPlace,
+            ..Default::default()
+        }
+    }
+
+    pub fn build(cfg: &Config, dev: &Device) -> Result<Model> {
+        let mut tensors = std::collections::HashMap::new();
+        let mut fill = |name: &str, shape: Vec<usize>, salt: usize| -> Result<()> {
+            let n: usize = shape.iter().product();
+            let v: Vec<f32> = (0..n)
+                .map(|i| (((i * 7 + salt * 13) % 23) as f32 - 11.0) / 48.0)
+                .collect();
+            tensors.insert(name.to_string(), Tensor::from_vec(v, shape, dev)?);
+            Ok(())
+        };
+        let h = cfg.hidden_size;
+        let i = cfg.intermediate_size;
+        let kv = cfg.num_key_value_heads * cfg.head_dim();
+        fill("model.embed_tokens.weight", vec![cfg.vocab_size, h], 1)?;
+        fill("model.embedding_norm.weight", vec![h], 2)?;
+        for l in 0..cfg.num_hidden_layers {
+            let p = format!("model.layers.{l}");
+            let s = 10 * (l + 1);
+            fill(&format!("{p}.operator_norm.weight"), vec![h], s)?;
+            fill(&format!("{p}.ffn_norm.weight"), vec![h], s + 1)?;
+            fill(&format!("{p}.feed_forward.w1.weight"), vec![i, h], s + 2)?;
+            fill(&format!("{p}.feed_forward.w3.weight"), vec![i, h], s + 3)?;
+            fill(&format!("{p}.feed_forward.w2.weight"), vec![h, i], s + 4)?;
+            match cfg.layer_types[l] {
+                LayerType::Conv => {
+                    fill(&format!("{p}.conv.in_proj.weight"), vec![3 * h, h], s + 5)?;
+                    fill(
+                        &format!("{p}.conv.conv.weight"),
+                        vec![h, 1, cfg.conv_l_cache],
+                        s + 6,
+                    )?;
+                    fill(&format!("{p}.conv.out_proj.weight"), vec![h, h], s + 7)?;
+                }
+                LayerType::FullAttention => {
+                    fill(&format!("{p}.self_attn.q_proj.weight"), vec![h, h], s + 5)?;
+                    fill(&format!("{p}.self_attn.k_proj.weight"), vec![kv, h], s + 6)?;
+                    fill(&format!("{p}.self_attn.v_proj.weight"), vec![kv, h], s + 7)?;
+                    fill(&format!("{p}.self_attn.out_proj.weight"), vec![h, h], s + 8)?;
+                    let hd = cfg.head_dim();
+                    fill(
+                        &format!("{p}.self_attn.q_layernorm.weight"),
+                        vec![hd],
+                        s + 9,
+                    )?;
+                    fill(
+                        &format!("{p}.self_attn.k_layernorm.weight"),
+                        vec![hd],
+                        s + 10,
+                    )?;
+                }
+            }
+        }
+        let vb = VarBuilder::from_tensors(tensors, DType::F16, dev);
+        Model::new(cfg, vb)
+    }
+
+    /// Every conv block's state, as f32 bits.
+    pub fn conv_states(
+        cache: &lloom::models::lfm2::Cache,
+        n_layers: usize,
+    ) -> Result<Vec<Vec<u32>>> {
+        let mut out = Vec::new();
+        for b in 0..n_layers {
+            if let Some(t) = cache.conv_state_for_test(b) {
+                let v = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+                out.push(v.into_iter().map(f32::to_bits).collect());
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The EOS gate on the real decode kernels (lloom #735 step 4's definition of
+/// done): a run that hits EOS with forwards queued behind it advances no cache
+/// state past the EOS position. The reference is the blocking arm, which never
+/// feeds the EOS token; the subject is the crown's flow — the ring polled, the
+/// adaptive commit, the fused publish, the gate — made to run `EXTRA` forwards
+/// past the EOS (the cap is reached before any stop flag: no reader). After
+/// `Session::reconcile` the subject's cache must be the reference's: the same
+/// KV length, every conv block's state bit for bit, and the same greedy
+/// continuation from a second turn.
+///
+/// The crown's cache has rewind horizon 0 (`Shuffle`), so the reconcile can
+/// only succeed through the gate's "unwritten" bookkeeping, and the conv state
+/// can only match if the gated kernels wrote nothing. The control arm is the
+/// same run without the gate: its reconcile is refused and its conv state
+/// differs from the reference — what the comparison would see if the gate
+/// leaked (§3.1b rule 2: a second arm that pins the level).
+#[cfg(feature = "metal")]
+#[test]
+fn the_eos_gate_leaves_the_crown_cache_where_the_blocking_arm_leaves_it() -> Result<()> {
+    use lloom::models::lfm2::Cache;
+    const EXTRA: usize = 12;
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = Device::new_metal(0).expect("metal");
+    let cfg = tiny_lfm2::config();
+    let model = tiny_lfm2::build(&cfg, &dev)?;
+    let n_layers = cfg.num_hidden_layers;
+    let prompt = [1u32, 2, 3, 4, 5];
+    let fresh = || Cache::new(true, DType::F16, &cfg, &dev);
+
+    // The stream with no stop token; the EOS is the first token of it not
+    // seen earlier, at least four tokens in.
+    let never = [u32::MAX];
+    let mut probe = Session::new(&model, fresh()?);
+    let stream = probe
+        .decode(
+            &mut IdentityProposer,
+            &mut Blocking::new(&never, &dev)?,
+            &mut greedy(),
+            &prompt,
+            &DecodeOptions::new(32),
+            &mut sink,
+        )?
+        .ids;
+    let k = (4..stream.len())
+        .find(|&k| !stream[..k].contains(&stream[k]))
+        .unwrap_or_else(|| panic!("no fresh token in the stream to stop on: {stream:?}"));
+    let eos = stream[k];
+    let want = &stream[..k];
+    let turn2 = [9u32, 3];
+
+    // The reference: the blocking arm stops at the EOS, feeding nothing past it.
+    let mut reference = Session::new(&model, fresh()?);
+    let r = reference.decode(
+        &mut IdentityProposer,
+        &mut Blocking::new(&[eos], &dev)?,
+        &mut greedy(),
+        &prompt,
+        &DecodeOptions::new(64),
+        &mut sink,
+    )?;
+    assert_eq!(r.ids, want);
+    assert!(r.eos && r.stats.overrun == 0);
+    let ref_pos = reference.pos();
+    let ref_kv = reference.sequence().cache().kv_len();
+    let ref_conv = tiny_lfm2::conv_states(reference.sequence().cache(), n_layers)?;
+    assert!(!ref_conv.is_empty(), "the fixture has a conv block");
+    let ref_turn2 = reference
+        .decode(
+            &mut IdentityProposer,
+            &mut Blocking::new(&never, &dev)?,
+            &mut greedy(),
+            &turn2,
+            &DecodeOptions::new(16),
+            &mut sink,
+        )?
+        .ids;
+
+    for gate in [true, false] {
+        let mut subject = Session::new(&model, fresh()?);
+        let mut rb = adaptive_ring_for(&[eos], &dev, EosRead::Poll(PollMechanism::default()))?;
+        let opts = adaptive_opts(k + 1 + EXTRA, 8, gate);
+        let out = subject.decode(
+            &mut IdentityProposer,
+            &mut rb,
+            &mut greedy(),
+            &prompt,
+            &opts,
+            &mut sink,
+        )?;
+        assert_eq!(out.ids, want, "gate {gate}: the ids end at the EOS");
+        assert!(out.eos, "gate {gate}");
+        assert_eq!(
+            out.stats.overrun,
+            1 + EXTRA,
+            "gate {gate}: the forced overrun"
+        );
+        assert!(
+            out.stats.readback.fused_publishes > 0,
+            "gate {gate}: the crown's fused publish ran"
+        );
+        assert_eq!(
+            subject.pos(),
+            ref_pos + 1 + EXTRA,
+            "gate {gate}: before the reconcile"
+        );
+        if !gate {
+            // The control: the overrun wrote the cache, which cannot rewind.
+            assert!(!out.stats.overrun_unwritten);
+            let err = subject
+                .reconcile()
+                .expect_err("a written overrun on a horizon-0 cache");
+            eprintln!("control arm, no gate: reconcile refused: {err}");
+            let conv = tiny_lfm2::conv_states(subject.sequence().cache(), n_layers)?;
+            assert_ne!(
+                conv, ref_conv,
+                "the ungated overrun left the conv state where the reference did — the \
+                 comparison below would not see a leaking gate"
+            );
+            continue;
+        }
+        let g = out.stats.eos_gate.expect("the gate ran");
+        assert!(g.fired, "the gate saw the EOS: {g:?}");
+        assert!(
+            out.stats.overrun_unwritten,
+            "every forward past the EOS is unwritten"
+        );
+        assert_eq!(subject.reconcile()?, 1 + EXTRA, "counters only, no horizon");
+        assert_eq!(subject.pos(), ref_pos, "the position after the reconcile");
+        assert_eq!(
+            subject.tokens(),
+            reference.tokens()[..ref_pos].to_vec().as_slice()
+        );
+        assert_eq!(
+            subject.sequence().cache().kv_len(),
+            ref_kv,
+            "the KV length the reference's"
+        );
+        assert_eq!(
+            tiny_lfm2::conv_states(subject.sequence().cache(), n_layers)?,
+            ref_conv,
+            "every conv block's state, bit for bit, is the reference's"
+        );
+        let turn2_ids = subject
+            .decode(
+                &mut IdentityProposer,
+                &mut Blocking::new(&never, &dev)?,
+                &mut greedy(),
+                &turn2,
+                &DecodeOptions::new(16),
+                &mut sink,
+            )?
+            .ids;
+        assert_eq!(
+            turn2_ids, ref_turn2,
+            "the second turn continues the reference's cache"
+        );
+    }
+    Ok(())
+}
+
+/// A reader-owned run on an arm that learns EOS late — the drain arms, the
+/// adaptive commit's arms — ends its ids at the EOS whatever stopped it: the
+/// loop does not stream (the reader does), so the EOS and the forwards past it
+/// are in the ring's ids when the run ends, and the loop finds it there. Here
+/// nothing raises the stop flag, so the cap stops the run `EXTRA` steps past
+/// the EOS, on the fixed cadence and on the adaptive commit alike.
+#[test]
+fn a_reader_owned_run_ends_its_ids_at_the_eos_on_every_cadence() -> Result<()> {
+    const EXTRA: usize = 6;
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        let metal = matches!(device, Device::Metal(_));
+        let (want, hit) = chain(1, 64);
+        assert!(hit);
+        let n = want.len() + 1 + EXTRA;
+        let mut arms = vec![(
+            "fixed cadence, host drain",
+            Arm::RingHostDrain,
+            DecodeOptions {
+                lookahead: 1,
+                budget: CommitBudget::steps(4)?,
+                stream_via_reader: true,
+                ..DecodeOptions::new(n)
+            },
+        )];
+        if metal {
+            arms.push((
+                "adaptive, host drain",
+                Arm::RingHostDrain,
+                adaptive_opts(n, 4, false),
+            ));
+            arms.push(("adaptive, poll", Arm::RingPoll, adaptive_opts(n, 4, false)));
+        }
+        for (name, arm, opts) in arms {
+            let (out, pos) = run(&device, &arm, &[1], &opts)?;
+            assert_eq!(out.ids, want, "{device:?} {name}: the ids end at the EOS");
+            assert!(out.eos, "{device:?} {name}: EOS reported");
+            assert_eq!(
+                out.stats.overrun,
+                1 + EXTRA,
+                "{device:?} {name}: the overrun"
+            );
+            assert_eq!(pos, 1 + n, "{device:?} {name}: every step ran a forward");
+            let c = out.stats.readback;
+            assert_eq!(
+                c.ring_publishes,
+                out.ids.len() as u64 + c.ring_eos_publishes + c.ring_discarded,
+                "{device:?} {name}: publishes reconcile: {c:?}"
             );
         }
     }

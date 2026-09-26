@@ -796,3 +796,165 @@ fn a_ring_conv_arm_has_no_escapes_fused_or_not() -> Result<()> {
     );
     Ok(())
 }
+
+/// A buffer object created at the address a destroyed one had is a new
+/// occupant, and its binds are not charged to the value the old object held.
+///
+/// The recorder names a value by the address of the buffer object serving
+/// it, and the address outlives the object: once the pool destroys a buffer
+/// (eviction, a trim) the next object created on ANY path may land there —
+/// the Shared pool, a host upload, a heap placement, none of which reports an
+/// allocation to the recorder. Before `Buffer::new` told the recorder
+/// (`arena::note_new_buffer`), such an object's first bind in the pass after
+/// was read as the previous pass's value still being read: a phantom escape,
+/// counted in a number that moved run to run with which buffers the
+/// completion handler had evicted by then (`DESIGN.md` §9.2aa).
+///
+/// The control arm pins the detector itself: a value whose object is still
+/// alive and bound in the next pass IS an escape, so the fixed arm's zero is
+/// not a detector that stopped seeing anything.
+#[test]
+fn a_new_buffer_at_a_destroyed_buffers_address_is_not_the_old_value() -> Result<()> {
+    use lloom_tensor::kernels::metal::arena::{set_bind_observer, ArenaRecorder};
+    use lloom_tensor::kernels::metal::buffer::MTLResourceOptions;
+    use lloom_tensor::kernels::metal::device::Device as RawDevice;
+    use std::sync::Arc;
+    let _serial = SERIAL.lock();
+    let raw = RawDevice::system_default().expect("a Metal device");
+    let new_buffer = || {
+        raw.new_buffer(4096, MTLResourceOptions::empty())
+            .expect("a 4 KiB buffer")
+    };
+    let rec = Arc::new(parking_lot::Mutex::new(ArenaRecorder::new()));
+    set_bind_observer(Some(Arc::clone(&rec)));
+
+    // Pass 1: two values, one whose object then dies and one that lives on.
+    let dying = new_buffer();
+    let living = new_buffer();
+    let dead_addr = dying.raw_addr();
+    {
+        let mut r = rec.lock();
+        r.record_alloc(dead_addr, 4096);
+        r.record_alloc(living.raw_addr(), 4096);
+    }
+    drop(dying);
+    rec.lock().next_step();
+
+    // Pass 2: objects are created, none reported as an allocation, until one
+    // lands on the dead object's address. Each is kept alive so no attempt
+    // can hand back an address an earlier attempt freed.
+    let mut attempts = Vec::new();
+    let reused = loop {
+        let b = new_buffer();
+        let hit = b.raw_addr() == dead_addr;
+        attempts.push(b);
+        if hit || attempts.len() == 4096 {
+            break hit;
+        }
+    };
+    {
+        let mut r = rec.lock();
+        r.record_bind(dead_addr);
+        r.record_bind(living.raw_addr());
+    }
+    set_bind_observer(None);
+    assert!(
+        reused,
+        "no new buffer object took the destroyed one's address in {} attempts: \
+         the fixture cannot exercise the path it exists for",
+        attempts.len()
+    );
+    eprintln!(
+        "the destroyed object's address came back on attempt {}",
+        attempts.len()
+    );
+    let escaped: Vec<usize> = rec
+        .lock()
+        .previous_undeclared_ordinals()
+        .iter()
+        .map(|&(ordinal, ..)| ordinal)
+        .collect();
+    assert_eq!(
+        escaped,
+        vec![1],
+        "ordinal 0's object was destroyed and a new object bound at its address; ordinal 1's \
+         object lived and was bound: only 1 escaped its pass"
+    );
+    Ok(())
+}
+
+/// A ramped prefill and its decode have no escapes on either attention arm
+/// while the pool destroys every buffer it frees — the regime in which the
+/// addresses of one pass's values are handed to the next pass's new objects.
+///
+/// The count this pins used to be nonzero and different in every run of one
+/// configuration (flash and sdpa alike, once eviction ran), from the phantom
+/// `a_new_buffer_at_a_destroyed_buffers_address_is_not_the_old_value`
+/// isolates. The eviction count is asserted nonzero so the regime is known to
+/// have been entered, and the flash arm's decode plan is asserted to hold more
+/// ordinals than sdpa's — FlashDecoding's per-layer scratch — so its own
+/// kernels ran rather than a fallback (the config line cannot say, §7.1a-i).
+#[test]
+fn a_ramped_prefill_has_no_escapes_under_eviction_on_either_attention_arm() -> Result<()> {
+    let _serial = SERIAL.lock();
+    let prompt: Vec<u32> = (1..=10).collect();
+    let mut decode_ordinals = Vec::new();
+    for attn in [AttnImpl::FlashDecoding, AttnImpl::Sdpa] {
+        let dev = Device::new_metal(0)?;
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+        let mut cfg = tiny_config(ConvState::RotatingRing { k: 4 });
+        cfg.conv_prefill_ctx = true;
+        cfg.attn_impl = attn;
+        let model = build(&cfg, &dev)?;
+        let want = run_prompt(&model, &cfg, &dev, &prompt, 4, 6)?;
+        m.set_free_budget(0);
+        m.enable_pass_plans(ArenaLayout::Packed);
+        let evicted = || {
+            let (shared, private) = m.pool_counters();
+            shared.evicted + private.evicted
+        };
+        let evicted_before = evicted();
+        for round in 0..3 {
+            let got = run_prompt(&model, &cfg, &dev, &prompt, 4, 6)?;
+            assert_eq!(
+                got, want,
+                "{attn:?} round {round}: ids differ from the pool path"
+            );
+        }
+        let c = m.pass_plan_counters().unwrap();
+        let keys = m
+            .pass_plan_report()
+            .map(|(keys, _)| keys)
+            .unwrap_or_default();
+        decode_ordinals.push(
+            keys.iter()
+                .find(|(k, ..)| k.kind == PassKind::Decode { b: 1 })
+                .map(|&(_, _, total, _)| total)
+                .expect("a Decode{1} plan"),
+        );
+        let escapes: Vec<_> = keys
+            .iter()
+            .map(|(k, ..)| (k.kind, m.pass_plan_escapes(k)))
+            .filter(|(_, e)| !e.is_empty())
+            .collect();
+        let evicted = evicted() - evicted_before;
+        eprintln!("[{attn:?}] evicted={evicted} {c:?} escapes={escapes:?}");
+        assert!(
+            evicted > 0,
+            "{attn:?}: the pool evicted nothing, so no destroyed buffer's address could come back"
+        );
+        assert!(c.plans >= 4, "{attn:?}: {c:?}");
+        assert_eq!(
+            c.escapes, 0,
+            "{attn:?}: values reported as outliving their pass: {escapes:?}"
+        );
+    }
+    assert!(
+        decode_ordinals[0] > decode_ordinals[1],
+        "the flash arm's decode step allocated no more than sdpa's ({decode_ordinals:?}): \
+         FlashDecoding did not run"
+    );
+    Ok(())
+}

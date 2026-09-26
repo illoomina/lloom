@@ -119,6 +119,7 @@ pub mod session_region;
 mod session_region_tests;
 pub mod staging;
 pub mod trace;
+pub mod late_bind;
 pub mod upload_shadow;
 
 pub use arena::*;

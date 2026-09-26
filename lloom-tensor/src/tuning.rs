@@ -478,6 +478,9 @@ pub struct InstrumentTuning {
     /// Shadow every host upload and check it back (the #748 corruption instrument).
     #[opt(flag = "upload-shadow", env = "LLOOM_UPLOAD_SHADOW", bool)]
     pub upload_shadow: bool,
+    /// Count binds of a pooled buffer after its release (`late_bind.rs`, §15.1m).
+    #[opt(flag = "late-bind", env = "LLOOM_LATE_BIND", bool)]
+    pub late_bind: bool,
 }
 
 /// The CPU side (`utils.rs`, `safetensors.rs`, `backprop.rs`).

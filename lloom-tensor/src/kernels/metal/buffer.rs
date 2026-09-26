@@ -61,6 +61,7 @@ impl Buffer {
             use objc2_metal::MTLResource as _;
             raw.storageMode() != objc2_metal::MTLStorageMode::Private
         };
+        super::arena::note_new_buffer(Retained::as_ptr(&raw) as usize);
         Buffer {
             raw,
             base_offset: 0,

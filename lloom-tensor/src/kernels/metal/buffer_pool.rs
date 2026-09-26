@@ -69,10 +69,13 @@ use std::sync::{Arc, Weak};
 
 /// Tracks how far the GPU has got through the command buffers submitted to it.
 ///
-/// Command buffers on one queue complete **in order**, so a single monotone
+/// Command buffers on one queue **retire** in order, so a single monotone
 /// counter is enough: if buffer N has completed, every buffer before it has
 /// too. `Commands` already relies on this to wait only on the last in-flight
-/// buffer.
+/// buffer. Their GPU *execution* is not ordered — a later buffer that shares
+/// nothing with an earlier one runs beside it and can finish its work first —
+/// but it is not reported `Completed`, nor its handler run, until the earlier
+/// one has been (pinned by `tests/metal_retire_order_tests.rs`).
 ///
 /// Two counters:
 ///
@@ -1091,6 +1094,7 @@ impl PoolInner {
         // `VecDeque` push here against a `BTreeMap` entry push there, so the
         // branch would not have bought anything measurable either.
         state.counters.deferred += 1;
+        super::late_bind::on_release(&buffer, epoch);
         state.pending.push_back(PendingBuffer {
             buffer,
             size,
@@ -1185,6 +1189,9 @@ impl PoolInner {
     /// `IOGPUGroupMemory::remove_memory_object()` aborts the machine over, so
     /// the order here is the point rather than a detail.
     fn notify_evicted(&self, evicted: &[Buffer]) {
+        for b in evicted {
+            super::late_bind::on_leave(b);
+        }
         if evicted.is_empty() {
             return;
         }
@@ -1649,6 +1656,7 @@ impl BufferPool {
         // SAFETY: the buffer has just left the free list under the pool lock,
         // so no other handle to it exists. Inert without `asan-poison`.
         unsafe { super::poison::unpoison_buffer(&buffer) };
+        super::late_bind::on_leave(&buffer);
 
         state.counters.hits += 1;
         // The overhang's HIT source (§9.2). `bucket_size` is what the range
@@ -1889,6 +1897,7 @@ impl BufferPool {
                 // `asan-poison`.
                 for buffer in &bucket {
                     unsafe { super::poison::unpoison_buffer(buffer) };
+                    super::late_bind::on_leave(buffer);
                 }
                 freed.append(&mut bucket);
             }

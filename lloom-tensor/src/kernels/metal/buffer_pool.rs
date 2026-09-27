@@ -992,8 +992,9 @@ pub trait BufferEvictionObserver: Send + Sync {
     /// pays one. Per-buffer measured **+0.087 ms/token of non-GPU time — 9 % of
     /// §11.2's 6.1 % budget**; batched is inside the noise.
     ///
-    /// Called on the host thread that drained -- the encoding thread, from
-    /// `acquire` (§6.4e) -- with the pool's lock **released**, and before the
+    /// Called on the host thread that drained -- from `acquire` or from the
+    /// last handle's drop, usually the encoding thread (§6.4e) -- with the
+    /// pool's lock **released**, and before the
     /// buffers are dropped, so the observer may take its own locks and is
     /// looking at allocations that still exist. It runs on the hot path: no
     /// driver round-trip per call.
@@ -1106,6 +1107,14 @@ impl PoolInner {
         // No gauge to update: how many buffers are parked is `state.pending`
         // itself, which `occupancy()` reports (issue #507). Mirroring it into
         // `PoolCounters` is what let `reset_counters` zero it.
+
+        // Drained here as at `acquire`, under the lock this already holds, so
+        // the free list is current at every host touch and a stretch of
+        // releases with no allocation does not hold completed buffers as
+        // pending (`DESIGN.md` §6.4e).
+        let evicted = self.drain_locked(&mut state);
+        drop(state);
+        self.notify_evicted(&evicted);
     }
 
     /// Moves everything whose epoch has completed into the free lists, then
@@ -1113,7 +1122,7 @@ impl PoolInner {
     /// hand to [`Self::notify_evicted`] once the lock is dropped.
     ///
     /// Runs on the host under a lock the caller already holds -- at every
-    /// `acquire`, and from the explicit drains. No completion handler calls
+    /// `acquire` and `release`, and from the explicit drains. No completion handler calls
     /// it: the handler only advances the clock this reads, so the encoding
     /// thread never waits on a completion thread descheduled while holding
     /// the pool (`DESIGN.md` §6.4e).

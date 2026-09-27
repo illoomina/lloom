@@ -303,6 +303,8 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<(), String> {
                 })?;
                 model.live.remove(m);
                 model.release(size);
+                // `release` drains too (§6.4e).
+                model.drain();
             }
             Op::CommitEpoch => {
                 let closed = clock.commit_epoch();

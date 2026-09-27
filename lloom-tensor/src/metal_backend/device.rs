@@ -71,8 +71,9 @@ pub(crate) struct DeviceTeardown {
 /// evicted buffer left in it is a retention that reached 48 GB at long context
 /// (`DESIGN.md` §6.3e, §6.3f).
 ///
-/// Called on the host, from the pool's drain -- inside `acquire` on the
-/// encoding thread, or an explicit drain (§6.4e) -- once per eviction round
+/// Called on the host, from the pool's drain -- inside `acquire` or a
+/// release, usually on the encoding thread, or an explicit drain (§6.4e) --
+/// once per eviction round
 /// with every buffer the round destroys. It
 /// `removeAllocation`s them and leaves the commit to the next command-buffer
 /// cut's `commit_pending`, which publishes the round with the cut's own

@@ -9,6 +9,16 @@
 //! | [`Ring`] with [`EosRead::Blocking`] | never — device-resident slot | one 1-byte readback per step | `waitUntilCompleted`, inside the flag read |
 //! | [`Ring`] with [`EosRead::Poll`] | never | polling the kernel-written counter | a poll, no Mach trap (§11.5n) |
 //!
+//! # What a [`RingReader`] streams
+//!
+//! The ring's stamp, and each arm stamps on a stated grain: the per-step reads
+//! (the flag and the poll) stamp every token; the deferred reads stamp once
+//! per commit window on the fixed cadence, every token under the adaptive
+//! commit (the fused kernel's stamp, or the loop's `publish_marker` after an
+//! unfused step), and their last window at `drain_all`. A reader on a
+//! deferred read on the fixed cadence therefore streams in windows, and sees
+//! the whole run once the run has returned.
+//!
 //! The loop ([`crate::nn::Session::decode`]) names the trait and never a
 //! concrete arm, so the harness's `RESULT` line renders the strategy that ran
 //! from [`ReadbackStrategy::arms`] rather than echoing a flag (§7.1a-i).
@@ -211,7 +221,10 @@ pub trait ReadbackStrategy {
     /// The index of the first EOS id in a drained `batch`, for the arm that
     /// learns EOS host-side ([`EosRead::HostOnDrain`]) rather than from a
     /// per-token device flag. The loop calls this on each streamed batch and, on
-    /// `Some(i)`, streams `batch[..i]` and stops.
+    /// `Some(i)`, streams `batch[..i]` and stops, and once at the end of a run
+    /// on the tail or on the run's whole ids. A strategy that answers from a
+    /// device index answers only for the batch its last [`Self::take_ids`]
+    /// returned, whose frame the index is in, and scans any other.
     ///
     /// **The default is `None`** — every arm that learns EOS per token
     /// ([`Self::eos_of_last`]) has already excluded the EOS token before it
@@ -257,13 +270,16 @@ pub trait ReadbackStrategy {
 
     /// Under the adaptive commit: publish each step with the fused
     /// argmax·eos·stamp kernel (`Device::argmax_publish`) where the strategy
-    /// can — the ring with an argmax sampler on Metal. While
-    /// [`Self::publishes_fused`], the loop skips its own stamp and gate step:
-    /// the kernel did both.
+    /// can — the ring with an argmax sampler on Metal. After a step for which
+    /// [`Self::publishes_fused`] holds, the loop skips its own stamp and gate
+    /// step: the kernel did both.
     fn set_fused_publish(&mut self, on: bool) {
         let _ = on;
     }
 
+    /// Whether the last [`Self::sample_and_feed`] published through the fused
+    /// kernel. Per step, not per run: a sampler the kernel does not serve
+    /// takes the unfused chain, whose stamp and gate are the loop's.
     fn publishes_fused(&self) -> bool {
         false
     }
@@ -1341,6 +1357,11 @@ pub struct Ring {
     /// `set_fused_publish`: the loop asked for the fused publish; taken on a
     /// mapped ring when the sampler is argmax (`sample_and_feed`).
     fused_publish: bool,
+    /// Whether the last `sample_and_feed` published through the fused kernel,
+    /// which stamped (and gated) that step. The run's `fused_publish` is a
+    /// request; a sampler other than argmax takes the unfused chain, whose
+    /// stamp is the loop's to ask for (`publish_marker`).
+    fused_step: bool,
     /// The EOS id set, host-side, for the [`EosRead::HostOnDrain`] (and the
     /// `GpuBatched` fallback) compare. Read back from the device ring once at
     /// construction (a loop invariant), so the per-token path never touches it.
@@ -1354,10 +1375,15 @@ pub struct Ring {
     /// other arm.
     pending_eos_index: std::cell::RefCell<Option<(Tensor, usize)>>,
     /// [`EosRead::GpuBatchedNonblocking`]: the staged indices of the last two
-    /// closed windows, newest last; `drain_start` is the history's drained
-    /// count at the last `take_ids`, the batch's absolute start.
+    /// closed windows, newest last.
     staged_eos: std::cell::RefCell<Vec<StagedWindow>>,
+    /// The history's drained count before the last `take_ids`: the absolute
+    /// start of the batch it returned.
     drain_start: usize,
+    /// The length of that batch, the one frame a device EOS index answers
+    /// for; `None` after `drain_all`, whose tail and a reader-owned run's
+    /// whole ids are scanned on the host.
+    taken: Option<usize>,
     eos_index_hits: std::cell::Cell<u64>,
     eos_index_late: std::cell::Cell<u64>,
     counters: ReadbackCounters,
@@ -1541,10 +1567,12 @@ impl Ring {
             generation: 0,
             unstamped: Vec::with_capacity(2),
             fused_publish: false,
+            fused_step: false,
             eos_ids_host,
             pending_eos_index: std::cell::RefCell::new(None),
             staged_eos: std::cell::RefCell::new(Vec::with_capacity(2)),
             drain_start: 0,
+            taken: None,
             eos_index_hits: std::cell::Cell::new(0),
             eos_index_late: std::cell::Cell::new(0),
             poll_budget: POLL_BUDGET,
@@ -1720,6 +1748,7 @@ impl ReadbackStrategy for Ring {
             } else {
                 logits.flatten_all()?
             };
+            self.fused_step = true;
             self.counters.ring_publishes += 1;
             self.counters.fused_publishes += 1;
             // A pooled ring whose previous run was unfused may still owe a window
@@ -1740,6 +1769,7 @@ impl ReadbackStrategy for Ring {
             self.history.wrote_one();
             return self.ring.input_for(1);
         }
+        self.fused_step = false;
         let sampled = sampler.sample_argmax_on_device(logits)?;
         self.counters.ring_publishes += 1;
         // Begin this step's tile (one token per step on this arm → quantum=1 →
@@ -1765,11 +1795,13 @@ impl ReadbackStrategy for Ring {
         let segment = &self.history.ring.segments[seg];
         segment.slice_set(&sampled.reshape(1)?, 0, offset)?;
         match self.eos {
-            EosRead::Poll(_) => {
+            // Both per-step reads stamp every token: the stamp is what a
+            // `RingReader` streams. The flag read waits on its flag anyway;
+            // the stamp is one dispatch beside that round trip.
+            EosRead::Poll(_) | EosRead::Blocking => {
                 self.ring
                     .publish_step_certifying(&sampled, Some(self.generation), Some(segment))?
             }
-            EosRead::Blocking => self.ring.publish(&sampled)?,
             // Both deferred-EOS arms write only the input slot per step (the ~5 EOS
             // dispatches AND the per-token stamp both skipped); they learn EOS at
             // the commit window (host scan for `HostOnDrain`, the batched
@@ -1801,12 +1833,11 @@ impl ReadbackStrategy for Ring {
 
     fn publish_marker(&mut self, force_live: bool) -> Result<()> {
         // The fused publish stamped inside `sample_and_feed`.
-        if self.fused_publish {
+        if self.fused_step {
             return Ok(());
         }
         // Only the deferred-EOS arms write their marker at the commit window; the
-        // poll arm stamped per step inside `sample_and_feed` (marker ≡ EOS flag),
-        // and the blocking arm has its own readback.
+        // per-step reads (poll, flag) stamped inside `sample_and_feed`.
         if !matches!(
             self.eos,
             EosRead::HostOnDrain | EosRead::GpuBatched | EosRead::GpuBatchedNonblocking
@@ -1964,6 +1995,12 @@ impl ReadbackStrategy for Ring {
     }
 
     fn drain_all(&mut self) -> Result<Vec<u32>> {
+        // The deferred reads' last window may not be stamped yet (the wake
+        // cadence skips commits, and the run can end between commits): stamp
+        // it, so a reader's last read after the run sees every token. Its
+        // tokens are undrained, so the wait below retires the stamp too.
+        self.stamp_unstamped()?;
+        self.taken = None;
         if self.history.undrained() == 0 {
             return Ok(Vec::new());
         }
@@ -1997,6 +2034,16 @@ impl ReadbackStrategy for Ring {
     fn eos_in_drained(&self, batch: &[u32]) -> Option<usize> {
         if self.eos_ids_host.is_empty() {
             return None;
+        }
+        // A device index is in the frame of the window it scanned, which is
+        // the batch the last `take_ids` returned; any other batch (the tail
+        // `drain_all` returned, a reader-owned run's whole ids) is scanned
+        // here.
+        if self.taken != Some(batch.len()) {
+            if matches!(self.eos, EosRead::GpuBatchedNonblocking) {
+                self.eos_index_late.set(self.eos_index_late.get() + 1);
+            }
+            return batch.iter().position(|id| self.eos_ids_host.contains(id));
         }
         if matches!(self.eos, EosRead::GpuBatchedNonblocking) {
             // Newest window first: it is the widest. A window answers only if it
@@ -2059,10 +2106,11 @@ impl ReadbackStrategy for Ring {
 
     fn set_fused_publish(&mut self, on: bool) {
         self.fused_publish = on && self.ring.poll_is_mapped();
+        self.fused_step = false;
     }
 
     fn publishes_fused(&self) -> bool {
-        self.fused_publish
+        self.fused_step
     }
 
     fn eos_read_arm(&self) -> &'static str {
@@ -2132,11 +2180,12 @@ impl Ring {
     /// the copy fallback synchronises.
     fn drain_window(&mut self, out: &mut Vec<u32>) -> Result<()> {
         out.clear();
+        self.drain_start = self.history.drained;
+        self.taken = Some(0);
         if self.history.undrained() == 0 {
             return Ok(());
         }
         let fed = self.history.generation();
-        self.drain_start = self.history.drained;
         let end = match self.eos {
             EosRead::Poll(_)
             | EosRead::HostOnDrain
@@ -2151,12 +2200,17 @@ impl Ring {
             EosRead::Blocking => fed,
         };
         #[cfg(feature = "metal")]
-        if self.history.drain_mapped(end, out) {
-            return Ok(());
-        }
+        let mapped = self.history.drain_mapped(end, out);
         #[cfg(not(feature = "metal"))]
-        let _ = end;
-        self.history.drain_copy(fed, out)
+        let mapped = {
+            let _ = end;
+            false
+        };
+        if !mapped {
+            self.history.drain_copy(fed, out)?;
+        }
+        self.taken = Some(out.len());
+        Ok(())
     }
 
     /// [`EosRead::GpuBatchedNonblocking`]: enqueue the `eos_index` over the

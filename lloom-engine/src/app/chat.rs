@@ -10,9 +10,9 @@
 //! says what the process holds — the model's tensors, whether the tower is
 //! loaded — and, under `CANDLE_METAL_PROFILE=1`, the image's dispatch census.
 
-use super::common::{ms, NEVER_EOS};
+use super::common::{eos_gate_name, ms, NEVER_EOS};
 use super::vision::{expand_image_tokens, DecodedImage};
-use super::{detect_family, load_engine, Family, ModelArgs, Shape};
+use super::{load_engine, ModelArgs, Shape};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde_json::{json, Value};
@@ -30,9 +30,11 @@ pub struct ChatArgs {
 
     /// The option layers: `--config`, `--decode-config`, `--set`, and the
     /// generated flags (`--readback`, `--lookahead`, `--commit-budget`, …).
-    /// `--readback auto` is the ring WITHOUT the lookahead on LFM2 (the
-    /// cache ends at the EOS, so the next turn extends it rather than
-    /// re-prefilling the conversation) and the blocking arm on Qwen4-exp.
+    /// `--readback auto` is `lloom serve`'s on both families: the flow on
+    /// LFM2 (the adaptive commit, the reader, the EOS gate — the forwards
+    /// past a turn's EOS write nothing, so the next turn extends the cache)
+    /// and the blocking arm on Qwen4-exp. `--readback ring-la0` is the ring
+    /// without the lookahead, whose cache also ends at the EOS.
     #[command(flatten)]
     pub common: super::CommonArgs,
 
@@ -80,18 +82,7 @@ fn tokens_sha256(ids: &[u32]) -> String {
 }
 
 pub fn run(args: ChatArgs) -> Result<()> {
-    let family = detect_family(args.model.model.as_deref())?;
-    let mut options = super::resolve_options(&args.common)?;
-    if options.decode.readback.kind == crate::ReadbackKind::Auto {
-        if let Family::Lfm2(_) = &family {
-            // The chat's `auto` on LFM2: the ring without the lookahead, so
-            // the cache ends at the EOS and the next turn extends it — as
-            // the ring `auto` resolves to, so a host-side sampler (top-p,
-            // top-k) still falls back to the blocking arm per request.
-            options.decode.readback.lookahead = 0;
-            options.decode.readback.adaptive_commit = false;
-        }
-    }
+    let options = super::resolve_options(&args.common)?;
     // The chat's own default is a long turn; the group's 512 is the server's.
     let mut sampling = options.sampling.clone();
     if args.common.options.sampling.max_tokens.is_none()
@@ -244,7 +235,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(started.elapsed());
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -259,6 +250,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             st.overrun,
             tokens_sha256(&decoded.tokens),
             tokens_sha256(&ids),
+            eos_gate_name(st.eos_gate),
         );
         let report = engine.vision_report();
         if !report.is_null() {

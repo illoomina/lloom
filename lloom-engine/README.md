@@ -66,10 +66,15 @@ Qwen4-exp `--readback auto` resolves to the **blocking** arm: the model's
 `forward` needs its input ids on the host (the PLE hashes them), which the
 blocking arm holds and hands over through `CausalLM::note_input_ids` — no
 readback in the model; a ring arm is honoured by name and reads the fed id
-back per step (correct, no faster). `lloom chat` runs LFM2 on the ring
-without the lookahead (`ring-la0`) so a turn's cache ends at its EOS and the
-next turn extends it (`Session::prepare` → `Extend`) instead of re-prefilling
-the conversation.
+back per step (correct, no faster). `lloom chat` and `lloom serve` run LFM2
+on the same default, the flow: the adaptive commit, the ring reader, and the
+EOS gate, whose forwards past a turn's EOS write nothing, so the turn's cache
+ends at its EOS and the next turn extends it (`Session::prepare` → `Extend`)
+instead of re-prefilling the conversation (`design/docs/dispatch.md`
+§11.5z-xiv). `--readback ring-la0` (the ring without the lookahead, `lloom
+chat`'s default before), `--readback ring-fixed` and `--eos-gate=false` stay
+selectable; the gate is off, named at load, wherever the adaptive commit does
+not run and under `--replay`.
 
 Loads the LFM2.5-2.6B snapshot from the HF cache when no `--model` is given
 (`LFM2_MODEL_DIR` to point elsewhere), warms the Metal pipelines, and serves one

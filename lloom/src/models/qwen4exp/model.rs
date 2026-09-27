@@ -712,6 +712,15 @@ pub fn decode_hint_on() -> bool {
     *ON.get_or_init(|| crate::tuning::tuning().stream.decode_hint)
 }
 
+/// The PLE-window instrument's host stamps: a decode step's entry and the
+/// cut at its PLE layer, in the clock of the Metal profile's command-buffer
+/// records (`lloom_tensor::kernels::metal::profile::now_s`).
+#[derive(Debug, Default)]
+struct PleWindowMarks {
+    entry: Option<f64>,
+    marks: Vec<(f64, f64)>,
+}
+
 /// The N-gram PLE at its one layer.
 #[derive(Debug)]
 pub struct Ple {
@@ -735,6 +744,8 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     lm_head: QMatMul,
     /// The N-gram PLE, when its table was loaded (`LoadOptions::ple_shard`).
     ple: Option<Ple>,
+    /// The PLE-window instrument, when armed (`arm_ple_window`).
+    ple_window: Option<parking_lot::Mutex<PleWindowMarks>>,
     /// The MTP head, when loaded (`LoadOptions::mtp`); an `MtpDrafter`
     /// borrows it beside `embed_tokens` and `lm_head`.
     mtp: Option<super::mtp::MtpHead<R>>,
@@ -853,6 +864,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             hc_head,
             lm_head,
             ple: None,
+            ple_window: None,
             mtp: None,
             prefill_mode: PrefillMode::default(),
             device_plan,
@@ -1163,6 +1175,51 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         Ok(())
     }
 
+    /// Arm the PLE-window instrument (`design/docs/expert-streaming.md`
+    /// §20.13, the overlap window): every single-position forward stamps its
+    /// entry and cuts its command buffer at the PLE layer, so a profile's
+    /// command-buffer records (`CANDLE_METAL_PROFILE=1`) split into the work
+    /// before the PLE (embedding + the layers under it) and the rest. The cut
+    /// is one commit a token; nothing it computes changes. Metal only.
+    pub fn arm_ple_window(&mut self) {
+        self.ple_window = Some(parking_lot::Mutex::new(PleWindowMarks::default()));
+    }
+
+    /// `(entry, cut)` per decode step since `arm_ple_window` or the last
+    /// take, drained.
+    pub fn take_ple_window_marks(&self) -> Vec<(f64, f64)> {
+        self.ple_window
+            .as_ref()
+            .map(|w| std::mem::take(&mut w.lock().marks))
+            .unwrap_or_default()
+    }
+
+    fn ple_window_entry(&self, seq: usize) {
+        #[cfg(feature = "metal")]
+        if let (Some(w), 1) = (&self.ple_window, seq) {
+            w.lock().entry = Some(lloom_tensor::kernels::metal::profile::now_s());
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = seq;
+    }
+
+    fn ple_window_cut(&self, res_hc: &Tensor) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if let (Some(w), lloom_tensor::Device::Metal(m)) = (&self.ple_window, res_hc.device()) {
+            if res_hc.dim(1)? == 1 {
+                m.flush_marker()?;
+                let cut = lloom_tensor::kernels::metal::profile::now_s();
+                let mut w = w.lock();
+                if let Some(entry) = w.entry.take() {
+                    w.marks.push((entry, cut));
+                }
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = res_hc;
+        Ok(())
+    }
+
     /// Whether the N-gram PLE is attached.
     pub fn has_ple(&self) -> bool {
         self.ple.is_some()
@@ -1297,6 +1354,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// position's token window, gather the rows, run the block against the
     /// carry. Consumes `seq` pending tokens and advances the window.
     fn ple_delta(&self, ple: &Ple, res_hc: &Tensor, cache: &mut Cache) -> Result<Tensor> {
+        self.ple_window_cut(res_hc)?;
         let seq = res_hc.dim(1)?;
         let n_heads = ple.hash.n_heads();
         let mut ids = vec![0i64; seq * n_heads];
@@ -1970,6 +2028,7 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
     /// token: correct, and a wait on the queue's tail per step).
     fn forward(&self, tokens: &Tensor, pos: usize, cache: &mut Self::Cache) -> Result<Tensor> {
         let seq = tokens.elem_count();
+        self.ple_window_entry(seq);
         if cache.pending_noted && cache.pending_tokens.len() == seq {
             cache.pending_noted = false;
         } else {

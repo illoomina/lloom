@@ -292,6 +292,18 @@ impl PleTable {
         }
     }
 
+    /// The rows of `ids` dequantized into `out` (`ids.len() · head_dim`
+    /// floats) on the host — the fill a host-produced staging slot takes, with
+    /// no tensor and no upload. `Dense` is the tests' table and has no host
+    /// form here.
+    pub fn gather_into(&self, ids: &[i64], out: &mut [f32]) -> Result<()> {
+        match self {
+            PleTable::Mmap(m) => m.gather_into(ids, out),
+            PleTable::Cached(c) => c.gather_into(ids, out),
+            PleTable::Dense(_) => lloom_tensor::bail!("ple: gather_into on a dense table"),
+        }
+    }
+
     pub fn head_dim(&self) -> Result<usize> {
         match self {
             PleTable::Mmap(m) => Ok(m.head_dim),
@@ -440,9 +452,15 @@ impl CachedPleTable {
     }
 
     pub fn gather(&self, ids: &[i64], dev: &Device) -> Result<Tensor> {
+        let mut out = vec![0f32; ids.len() * self.inner.head_dim];
+        self.gather_into(ids, &mut out)?;
+        Tensor::from_vec(out, ids.len() * self.inner.head_dim, dev)
+    }
+
+    pub fn gather_into(&self, ids: &[i64], out: &mut [f32]) -> Result<()> {
         use std::sync::atomic::Ordering::Relaxed;
         let hd = self.inner.head_dim;
-        let mut out = vec![0f32; ids.len() * hd];
+        check_out(ids, hd, out)?;
         let mut lru = self.lru.lock();
         for (i, &id) in ids.iter().enumerate() {
             let dst = &mut out[i * hd..(i + 1) * hd];
@@ -456,9 +474,19 @@ impl CachedPleTable {
             dequant_row(self.inner.dtype, row, dst)?;
             lru.insert(id, row);
         }
-        drop(lru);
-        Tensor::from_vec(out, ids.len() * hd, dev)
+        Ok(())
     }
+}
+
+fn check_out(ids: &[i64], head_dim: usize, out: &[f32]) -> Result<()> {
+    if out.len() != ids.len() * head_dim {
+        lloom_tensor::bail!(
+            "ple gather_into: {} floats for {} rows of {head_dim}",
+            out.len(),
+            ids.len()
+        )
+    }
+    Ok(())
 }
 
 /// Dequantize one packed row of `dtype` into `out`.
@@ -574,10 +602,53 @@ impl MmapPleTable {
 
     pub fn gather(&self, ids: &[i64], dev: &Device) -> Result<Tensor> {
         let mut out = vec![0f32; ids.len() * self.head_dim];
+        self.gather_into(ids, &mut out)?;
+        Tensor::from_vec(out, ids.len() * self.head_dim, dev)
+    }
+
+    pub fn gather_into(&self, ids: &[i64], out: &mut [f32]) -> Result<()> {
+        check_out(ids, self.head_dim, out)?;
         for (i, &id) in ids.iter().enumerate() {
             self.row(id, &mut out[i * self.head_dim..(i + 1) * self.head_dim])?;
         }
-        Tensor::from_vec(out, ids.len() * self.head_dim, dev)
+        Ok(())
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    pub fn dtype(&self) -> GgmlDType {
+        self.dtype
+    }
+
+    /// Packed bytes a row takes in the file.
+    pub fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    /// Byte offset of row `id` in the shard file: where a `pread` of the row
+    /// starts.
+    pub fn row_file_offset(&self, id: i64) -> Result<u64> {
+        if id < 0 || id as usize >= self.rows {
+            lloom_tensor::bail!("ple row {id} out of {}", self.rows)
+        }
+        Ok((self.data_start + id as usize * self.row_bytes) as u64)
+    }
+
+    /// Dequantize one packed row read by the caller (a `pread` of
+    /// `row_bytes()` at `row_file_offset(id)`) into `out`.
+    pub fn dequant_packed(&self, bytes: &[u8], out: &mut [f32]) -> Result<()> {
+        if bytes.len() != self.row_bytes || out.len() != self.head_dim {
+            lloom_tensor::bail!(
+                "ple dequant: {} bytes / {} floats for a {}-byte row of {}",
+                bytes.len(),
+                out.len(),
+                self.row_bytes,
+                self.head_dim
+            )
+        }
+        dequant_row(self.dtype, bytes, out)
     }
 }
 

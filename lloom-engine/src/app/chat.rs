@@ -90,6 +90,9 @@ pub fn run(args: ChatArgs) -> Result<()> {
             // top-k) still falls back to the blocking arm per request.
             options.decode.readback.lookahead = 0;
             options.decode.readback.adaptive_commit = false;
+            // Refused here, not by the first turn, if a knob given with
+            // it needs what this `auto` turns off.
+            options.decode.check().map_err(|e| anyhow::anyhow!("{e}"))?;
         }
     }
     // The chat's own default is a long turn; the group's 512 is the server's.

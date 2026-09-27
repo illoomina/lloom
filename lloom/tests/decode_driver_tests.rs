@@ -2338,7 +2338,7 @@ fn reader_stale_slot_rate_after_an_eos_on_a_pooled_ring() -> Result<()> {
 /// The stamp after the fused publish never runs ahead of the slot it
 /// certifies, as seen by a host reader: under the adaptive commit at a
 /// one-step run-ahead — where the kernel's own in-dispatch stamp let a reader
-/// read the slot's previous content in about 0.8 % of runs (§11.5z-xiv) — a
+/// read the slot's previous content in about 0.8 % of runs (§11.5z-xvi) — a
 /// resumed reader streams exactly the ids, and the ids are the chain, for
 /// every run of 1 000 EOS-then-length pairs on each deferred and per-step
 /// read. A race, so a red here is a defect and a green is a bound.

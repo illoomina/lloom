@@ -1747,7 +1747,7 @@ impl ReadbackStrategy for Ring {
             // slot, the input slot and the EOS test in one dispatch, then the
             // stamp as its own dispatch certifying the history segment. The
             // kernel's in-dispatch fence orders its stores for the GPU only;
-            // a host can see its stamp before its slot (§11.5z-xiv), and the
+            // a host can see its stamp before its slot (§11.5z-xvi), and the
             // command stream's barrier before a dispatch that binds the
             // segment is what a reader of the stamp relies on.
             let logits = if logits.rank() == 1 {

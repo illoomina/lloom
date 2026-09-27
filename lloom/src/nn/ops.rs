@@ -2485,7 +2485,9 @@ impl KvPrecision {
     /// A quantized arm. `Off` is [`Self::dense`]'s, and is refused here.
     pub fn quantized(quant: KvQuant) -> Result<Self> {
         if !quant.is_on() {
-            lloom_tensor::bail!("KvPrecision::quantized(Off): the Off arm names its dtype (`dense`)")
+            lloom_tensor::bail!(
+                "KvPrecision::quantized(Off): the Off arm names its dtype (`dense`)"
+            )
         }
         Ok(Self {
             quant,

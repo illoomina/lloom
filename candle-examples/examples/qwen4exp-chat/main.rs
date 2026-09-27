@@ -353,12 +353,16 @@ struct Args {
 /// Token ids from a `--force-tokens` file: whitespace / comma separated, `#`
 /// comments.
 fn read_forced_tokens(path: &std::path::Path) -> Result<Vec<u32>> {
-    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut out = Vec::new();
     for line in raw.lines() {
         let line = line.split('#').next().unwrap_or("");
         for f in line.split([',', ' ', '\t']).filter(|f| !f.is_empty()) {
-            out.push(f.parse().with_context(|| format!("{f:?} is not a token id"))?);
+            out.push(
+                f.parse()
+                    .with_context(|| format!("{f:?} is not a token id"))?,
+            );
         }
     }
     anyhow::ensure!(!out.is_empty(), "{}: no token ids", path.display());
@@ -366,7 +370,11 @@ fn read_forced_tokens(path: &std::path::Path) -> Result<Vec<u32>> {
 }
 
 /// One `--dump-logits` row.
-fn dump_row(sink: &mut Option<std::io::BufWriter<std::fs::File>>, step: usize, t: &Tensor) -> Result<()> {
+fn dump_row(
+    sink: &mut Option<std::io::BufWriter<std::fs::File>>,
+    step: usize,
+    t: &Tensor,
+) -> Result<()> {
     use std::io::Write;
     let Some(sink) = sink.as_mut() else {
         return Ok(());
@@ -973,7 +981,11 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
             )?;
             let spec_wall = t.elapsed();
             let spec_generated: usize = spec.iter().map(|o| o.ids.len()).sum();
-            let same: Vec<bool> = spec.iter().zip(&outs).map(|(a, b)| a.ids == b.ids).collect();
+            let same: Vec<bool> = spec
+                .iter()
+                .zip(&outs)
+                .map(|(a, b)| a.ids == b.ids)
+                .collect();
             let rounds: usize = spec.iter().map(|o| o.stats.rounds.len()).sum();
             println!(
                 "MTPROWS run={run} rows={} k={} identical_to_greedy={:?} generated={spec_generated} rounds={rounds} tokens_per_round={:.3} wall_ms={} tok_s={:.2} greedy_tok_s={:.2}",
@@ -1044,14 +1056,12 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
     loaded_line(model, args, shards, device, t0);
     // The tile the harness's own loop feeds (`prefill_tiled`): the paired
     // prefill wants both chunks in one forward.
-    let tile = if args.prefill_tile != 0
-        && prefill_pair_on()
-        && args.prefill_tile <= prefill_chunk()
-    {
-        prefill_tiles() * prefill_chunk()
-    } else {
-        args.prefill_tile
-    };
+    let tile =
+        if args.prefill_tile != 0 && prefill_pair_on() && args.prefill_tile <= prefill_chunk() {
+            prefill_tiles() * prefill_chunk()
+        } else {
+            args.prefill_tile
+        };
     println!("DRIVER arm=blocking prefill_tile={tile} lookahead=0");
     let mut greedy_digest: Option<String> = None;
     for run in 0..args.runs {
@@ -1251,7 +1261,11 @@ fn gate<R: ExpertResidency + HasStreamStats>(
     }
     let mut digests = Vec::with_capacity(args.runs);
     let mut last_text = String::new();
-    let forced: Option<Vec<u32>> = args.force_tokens.as_deref().map(read_forced_tokens).transpose()?;
+    let forced: Option<Vec<u32>> = args
+        .force_tokens
+        .as_deref()
+        .map(read_forced_tokens)
+        .transpose()?;
     for run in 0..args.runs {
         // The dump is the first run's (a determinism repeat writes nothing).
         let mut sink = match (&args.dump_logits, run) {

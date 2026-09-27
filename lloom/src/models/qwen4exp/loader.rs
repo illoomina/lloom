@@ -382,11 +382,9 @@ pub fn kv_bytes_per_token(cfg: &Config) -> usize {
         .filter(|k| matches!(k, LayerKind::Full))
         .count();
     let f32 = std::mem::size_of::<f32>();
-    let kv = cfg.kv_precision.bytes_per_token(
-        cfg.n_kv_heads,
-        cfg.head_dim,
-        lloom_tensor::DType::F32,
-    );
+    let kv =
+        cfg.kv_precision
+            .bytes_per_token(cfg.n_kv_heads, cfg.head_dim, lloom_tensor::DType::F32);
     let indexer = cfg.indexer_head_dim * f32;
     let blocks = (indexer).div_ceil(cfg.indexer_compress_ratio.max(1));
     full * (kv + indexer + blocks)

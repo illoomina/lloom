@@ -2470,13 +2470,24 @@ mod tests {
         let int8 = KvPrecision::quantized(KvQuant::Int8).unwrap();
         let err = model.set_kv_precision(int8).unwrap_err().to_string();
         assert!(err.contains("Metal-only"), "{err}");
-        assert_eq!(model.config().kv_precision, super::super::config::DEFAULT_KV_PRECISION);
-        model.set_kv_precision(KvPrecision::dense(DType::F16)).unwrap();
+        assert_eq!(
+            model.config().kv_precision,
+            super::super::config::DEFAULT_KV_PRECISION
+        );
+        model
+            .set_kv_precision(KvPrecision::dense(DType::F16))
+            .unwrap();
         let cache = Cache::new(model.config());
-        let full = cfg.layer_types.iter().position(|k| *k == LayerKind::Full).unwrap();
+        let full = cfg
+            .layer_types
+            .iter()
+            .position(|k| *k == LayerKind::Full)
+            .unwrap();
         assert_eq!(cache.kv[full].precision(), KvPrecision::dense(DType::F16));
         let pools = model.state_pools(2, &dev);
-        let err = Cache::in_pools(model.config(), &pools).unwrap_err().to_string();
+        let err = Cache::in_pools(model.config(), &pools)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("paged KV pool"), "{err}");
         let mut f32_cfg = model.config().clone();
         f32_cfg.kv_precision = super::super::config::DEFAULT_KV_PRECISION;

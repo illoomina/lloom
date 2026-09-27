@@ -9257,7 +9257,15 @@ fn run_quantize_kv_f32(
 }
 
 /// The code of element `j` of token `t` of `head` in a packed plane.
-fn plane_code(plane: &[u8], bits: KvQuantBits, head: usize, t: usize, j: usize, capacity: usize, head_dim: usize) -> u8 {
+fn plane_code(
+    plane: &[u8],
+    bits: KvQuantBits,
+    head: usize,
+    t: usize,
+    j: usize,
+    capacity: usize,
+    head_dim: usize,
+) -> u8 {
     let idx = t * head_dim + j;
     let base = bits.code_bytes(head * capacity * head_dim);
     match bits {
@@ -9301,7 +9309,8 @@ fn qwen_kv_fixture(n_heads: usize, len: usize, head_dim: usize, salt: usize) -> 
 fn quantize_kv_at_head_dim_256_f32_matches_the_scalar_reference() {
     let device = device();
     let kernels = Kernels::new();
-    let (n_heads, head_dim, seq_len, capacity, dst_offset) = (2usize, 256usize, 5usize, 12usize, 4usize);
+    let (n_heads, head_dim, seq_len, capacity, dst_offset) =
+        (2usize, 256usize, 5usize, 12usize, 4usize);
     let src = qwen_kv_fixture(n_heads, seq_len, head_dim, 0);
     for bits in KvQuantBits::ALL {
         let (codes, scales, biases) = run_quantize_kv_f32(
@@ -9313,7 +9322,8 @@ fn quantize_kv_at_head_dim_256_f32_matches_the_scalar_reference() {
                 let group = &src[(h * seq_len + t) * head_dim..(h * seq_len + t + 1) * head_dim];
                 let (_, want_scale, want_bias) = quantize_group_reference(group, bits, |x| x);
                 let dst = dst_offset + t;
-                let (got_scale, got_bias) = (scales[h * capacity + dst], biases[h * capacity + dst]);
+                let (got_scale, got_bias) =
+                    (scales[h * capacity + dst], biases[h * capacity + dst]);
                 let ulp = f32::from_bits(want_scale.to_bits() + 1) - want_scale;
                 assert!(
                     (got_scale - want_scale).abs() <= ulp,
@@ -9338,14 +9348,28 @@ fn quantize_kv_at_head_dim_256_f32_matches_the_scalar_reference() {
             }
             // Outside the append nothing was written.
             for t in (0..capacity).filter(|t| !(dst_offset..dst_offset + seq_len).contains(t)) {
-                assert_eq!(scales[h * capacity + t], 0.0, "h{h} t{t} outside the append");
+                assert_eq!(
+                    scales[h * capacity + t],
+                    0.0,
+                    "h{h} t{t} outside the append"
+                );
             }
         }
         assert_eq!(checked, n_heads * seq_len * head_dim);
-        eprintln!("int{} quantize_kv hd256 f32: {checked} codes, {ties} at a half-step tie", bits.bits());
-        assert!(ties * 100 < checked, "{ties} of {checked} codes off the rounded value: not ties");
+        eprintln!(
+            "int{} quantize_kv hd256 f32: {checked} codes, {ties} at a half-step tie",
+            bits.bits()
+        );
+        assert!(
+            ties * 100 < checked,
+            "{ties} of {checked} codes off the rounded value: not ties"
+        );
         let distinct = codes.iter().collect::<std::collections::HashSet<_>>().len();
-        assert!(distinct >= 8, "only {distinct} distinct code bytes at int{}", bits.bits());
+        assert!(
+            distinct >= 8,
+            "only {distinct} distinct code bytes at int{}",
+            bits.bits()
+        );
     }
 }
 
@@ -9363,9 +9387,31 @@ fn qwen_quant_attention_case(
 ) -> (Vec<f32>, Vec<f32>) {
     let (n_q, n_kv, hd, kv_len, capacity) = (24usize, 2usize, 256usize, 70usize, 96usize);
     let scale = 1.0f32 / (hd as f32).sqrt();
-    let q: Vec<f32> = (0..n_q * hd).map(|i| ((i * 37 % 71) as f32 - 35.0) / 64.0).collect();
-    let (kc, ks, kb) = run_quantize_kv_f32(device, kernels, &qwen_kv_fixture(n_kv, kv_len, hd, 0), n_kv, kv_len, hd, capacity, 0, bits);
-    let (vc, vs, vbi) = run_quantize_kv_f32(device, kernels, &qwen_kv_fixture(n_kv, kv_len, hd, 3), n_kv, kv_len, hd, capacity, 0, bits);
+    let q: Vec<f32> = (0..n_q * hd)
+        .map(|i| ((i * 37 % 71) as f32 - 35.0) / 64.0)
+        .collect();
+    let (kc, ks, kb) = run_quantize_kv_f32(
+        device,
+        kernels,
+        &qwen_kv_fixture(n_kv, kv_len, hd, 0),
+        n_kv,
+        kv_len,
+        hd,
+        capacity,
+        0,
+        bits,
+    );
+    let (vc, vs, vbi) = run_quantize_kv_f32(
+        device,
+        kernels,
+        &qwen_kv_fixture(n_kv, kv_len, hd, 3),
+        n_kv,
+        kv_len,
+        hd,
+        capacity,
+        0,
+        bits,
+    );
     let n = sel.map(|s| s.len()).unwrap_or(kv_len);
     let commands = commands(device);
     let encoder = commands.command_encoder().unwrap();
@@ -9384,8 +9430,22 @@ fn qwen_quant_attention_case(
     );
     match sel {
         None => call_sdpa_vector_quant(
-            device, &encoder, kernels, 0, &[1, n_q, 1, hd], &qb, &kcb, &ksb, &kbb, &vcb, &vsb,
-            &vbb, &output, &params, bits, SdpaDType::F32,
+            device,
+            &encoder,
+            kernels,
+            0,
+            &[1, n_q, 1, hd],
+            &qb,
+            &kcb,
+            &ksb,
+            &kbb,
+            &vcb,
+            &vsb,
+            &vbb,
+            &output,
+            &params,
+            bits,
+            SdpaDType::F32,
         )
         .unwrap(),
         Some(cells) => {
@@ -9394,8 +9454,23 @@ fn qwen_quant_attention_case(
             padded.extend_from_slice(cells);
             let sb = new_buffer(device, &padded);
             call_sdpa_vector_quant_sel(
-                device, &encoder, kernels, 0, &[1, n_q, 1, hd], &qb, &kcb, &ksb, &kbb, &vcb,
-                &vsb, &vbb, &output, &params, (&sb, 4), bits, SdpaDType::F32,
+                device,
+                &encoder,
+                kernels,
+                0,
+                &[1, n_q, 1, hd],
+                &qb,
+                &kcb,
+                &ksb,
+                &kbb,
+                &vcb,
+                &vsb,
+                &vbb,
+                &output,
+                &params,
+                (&sb, 4),
+                bits,
+                SdpaDType::F32,
             )
             .unwrap()
         }
@@ -9414,13 +9489,23 @@ fn qwen_quant_attention_case(
 }
 
 fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) -> f32 {
-    let distinct = got.iter().map(|x| x.to_bits()).collect::<std::collections::HashSet<_>>().len();
-    assert!(distinct >= 16, "{what}: {distinct} distinct outputs — vacuous");
+    let distinct = got
+        .iter()
+        .map(|x| x.to_bits())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct >= 16,
+        "{what}: {distinct} distinct outputs — vacuous"
+    );
     let mut worst = 0f32;
     for (i, (g, w)) in got.iter().zip(want).enumerate() {
         let d = (g - w).abs();
         worst = worst.max(d);
-        assert!(d < tol, "{what}: disagrees at {i}: got {g} want {w} (delta {d})");
+        assert!(
+            d < tol,
+            "{what}: disagrees at {i}: got {g} want {w} (delta {d})"
+        );
     }
     worst
 }
@@ -9432,7 +9517,10 @@ fn sdpa_vector_quant_at_head_dim_256_f32_matches_the_scalar_reference() {
     for bits in KvQuantBits::ALL {
         let (got, want) = qwen_quant_attention_case(&device, &kernels, bits, None);
         let worst = assert_close(&got, &want, 1e-4, &format!("int{} hd256 f32", bits.bits()));
-        eprintln!("int{} sdpa_vector_quant hd256 f32 vs scalar reference: worst |delta| = {worst:.3e}", bits.bits());
+        eprintln!(
+            "int{} sdpa_vector_quant hd256 f32 vs scalar reference: worst |delta| = {worst:.3e}",
+            bits.bits()
+        );
     }
 }
 
@@ -9457,7 +9545,12 @@ fn sdpa_vector_quant_sel_reads_the_selected_cells() {
         eprintln!("int{} sdpa_vector_quant_sel vs scalar reference over {} cells: worst |delta| = {worst:.3e}", bits.bits(), cells.len());
         // The selection is not the dense answer (it must not read [0, n)).
         let (dense_n, _) = qwen_quant_attention_case(&device, &kernels, bits, None);
-        assert_ne!(got, dense_n, "int{}: the selected read equals the dense one", bits.bits());
+        assert_ne!(
+            got,
+            dense_n,
+            "int{}: the selected read equals the dense one",
+            bits.bits()
+        );
         let identity: Vec<u32> = (0..70).collect();
         let (id_out, _) = qwen_quant_attention_case(&device, &kernels, bits, Some(&identity));
         assert_eq!(

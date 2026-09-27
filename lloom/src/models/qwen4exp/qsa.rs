@@ -356,7 +356,15 @@ impl KvCache {
         }
         let (k, v) = self.dense(sel)?;
         let (k, v) = (k.to_dtype(q.dtype())?, v.to_dtype(q.dtype())?);
-        ops::sdpa(q, &k.unsqueeze(0)?, &v.unsqueeze(0)?, None, false, scale, 1.0)
+        ops::sdpa(
+            q,
+            &k.unsqueeze(0)?,
+            &v.unsqueeze(0)?,
+            None,
+            false,
+            scale,
+            1.0,
+        )
     }
     /// Append one token to a pooled row without writing it: the pool token
     /// slot the rows arm scatters it to.
@@ -3196,7 +3204,10 @@ mod tests {
 
     #[cfg(feature = "metal")]
     fn max_abs(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
     }
 
     #[cfg(feature = "metal")]
@@ -3273,7 +3284,10 @@ mod tests {
             .map(|p| max_abs(&all_out[p], &f32_out[p]))
             .fold(0f32, f32::max)
             / run_scale;
-        assert!(d_sel > 1e-2, "the selection barely moves the output ({d_sel}): the control is blind");
+        assert!(
+            d_sel > 1e-2,
+            "the selection barely moves the output ({d_sel}): the control is blind"
+        );
         let arms = [
             ("f16", KvPrecision::dense(DType::F16)),
             ("int8", KvPrecision::quantized(KvQuant::Int8).unwrap()),
@@ -3289,22 +3303,52 @@ mod tests {
                     assert_eq!(k.unwrap().dtype(), dt, "{name}: k is not stored at {dt:?}");
                     assert_eq!(v.unwrap().dtype(), dt, "{name}: v is not stored at {dt:?}");
                 }
-                None => assert!(matches!(kv.kv, KvBacking::Quant(_)), "{name}: not a quantized store"),
+                None => assert!(
+                    matches!(kv.kv, KvBacking::Quant(_)),
+                    "{name}: not a quantized store"
+                ),
             }
-            let dense_err = (0..limit).map(|p| max_abs(&out[p], &f32_out[p])).fold(0f32, f32::max) / run_scale;
-            let sel_err = (limit..steps).map(|p| max_abs(&out[p], &f32_out[p])).fold(0f32, f32::max) / run_scale;
+            let dense_err = (0..limit)
+                .map(|p| max_abs(&out[p], &f32_out[p]))
+                .fold(0f32, f32::max)
+                / run_scale;
+            let sel_err = (limit..steps)
+                .map(|p| max_abs(&out[p], &f32_out[p]))
+                .fold(0f32, f32::max)
+                / run_scale;
             eprintln!("KVARM {name}: max err / run scale: dense range {dense_err:.3e}, selected range {sel_err:.3e}; the selection's own effect {d_sel:.3e}");
-            assert!(out.iter().flatten().all(|x| x.is_finite()), "{name}: non-finite");
-            assert!(dense_err > 0.0, "{name}: bit-identical to f32 — the store was not engaged");
+            assert!(
+                out.iter().flatten().all(|x| x.is_finite()),
+                "{name}: non-finite"
+            );
+            assert!(
+                dense_err > 0.0,
+                "{name}: bit-identical to f32 — the store was not engaged"
+            );
             assert!(sel_err < d_sel / 4.0, "{name}: selected-range error {sel_err} is not well under the selection's own effect {d_sel}");
             errs.push((dense_err.max(sel_err), name));
         }
-        assert!(errs[0].0 < errs[1].0 && errs[1].0 < errs[2].0, "errors not ordered f16 < int8 < int4: {errs:?}");
+        assert!(
+            errs[0].0 < errs[1].0 && errs[1].0 < errs[2].0,
+            "errors not ordered f16 < int8 < int4: {errs:?}"
+        );
         // Measured 9.5e-5 / 2.2e-3 / 1.7e-2 of the run's scale; the bounds
         // are a decade above, and each a decade under the next rung.
-        assert!(errs[0].0 < 1e-3, "f16 error {} is above what rounding K/V to f16 explains", errs[0].0);
-        assert!(errs[1].0 < 1e-2, "int8 error {} is above what 8-bit codes explain", errs[1].0);
-        assert!(errs[2].0 < 1e-1, "int4 error {} is above what 4-bit codes explain", errs[2].0);
+        assert!(
+            errs[0].0 < 1e-3,
+            "f16 error {} is above what rounding K/V to f16 explains",
+            errs[0].0
+        );
+        assert!(
+            errs[1].0 < 1e-2,
+            "int8 error {} is above what 8-bit codes explain",
+            errs[1].0
+        );
+        assert!(
+            errs[2].0 < 1e-1,
+            "int4 error {} is above what 4-bit codes explain",
+            errs[2].0
+        );
     }
 
     /// The quantized block's reads against dense attention over its own
@@ -3319,10 +3363,15 @@ mod tests {
         let gpu = Device::new_metal(0).unwrap();
         let (nh, nkv, hd, n) = (24usize, 2usize, 256usize, 41usize);
         for q_arm in [KvQuant::Int8, KvQuant::Int4] {
-            let mut kv = KvCache::with_precision(16, KvPrecision::quantized(q_arm).unwrap()).unwrap();
+            let mut kv =
+                KvCache::with_precision(16, KvPrecision::quantized(q_arm).unwrap()).unwrap();
             for t in 0..n {
-                let k: Vec<f32> = (0..nkv * hd).map(|i| ((i as f32 * 0.021 + t as f32 * 0.7).sin()) * (1.0 + t as f32 * 0.03)).collect();
-                let v: Vec<f32> = (0..nkv * hd).map(|i| ((i as f32 * 0.017 - t as f32 * 0.4).cos()) * 0.8 - 0.1 * t as f32).collect();
+                let k: Vec<f32> = (0..nkv * hd)
+                    .map(|i| ((i as f32 * 0.021 + t as f32 * 0.7).sin()) * (1.0 + t as f32 * 0.03))
+                    .collect();
+                let v: Vec<f32> = (0..nkv * hd)
+                    .map(|i| ((i as f32 * 0.017 - t as f32 * 0.4).cos()) * 0.8 - 0.1 * t as f32)
+                    .collect();
                 kv.append(
                     &Tensor::from_vec(k, (nkv, 1, hd), &gpu).unwrap(),
                     &Tensor::from_vec(v, (nkv, 1, hd), &gpu).unwrap(),
@@ -3330,7 +3379,9 @@ mod tests {
                 .unwrap();
             }
             let q = Tensor::from_vec(
-                (0..nh * hd).map(|i| ((i as f32 * 0.013).sin()) * 0.5).collect::<Vec<f32>>(),
+                (0..nh * hd)
+                    .map(|i| ((i as f32 * 0.013).sin()) * 0.5)
+                    .collect::<Vec<f32>>(),
                 (1, nh, 1, hd),
                 &gpu,
             )
@@ -3339,21 +3390,54 @@ mod tests {
             let cells: Vec<u32> = [8u32, 9, 10, 11, 0, 1, 2, 3, 28, 29, 30, 31, 40].to_vec();
             let sel = Tensor::from_vec(cells.clone(), cells.len(), &gpu).unwrap();
             for s in [None, Some(&sel)] {
-                let got = kv.attend(&q, s, scale).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                let (k, v) = kv.dense(s).unwrap();
-                let want = ops::sdpa(&q, &k.unsqueeze(0).unwrap(), &v.unsqueeze(0).unwrap(), None, false, scale, 1.0)
+                let got = kv
+                    .attend(&q, s, scale)
                     .unwrap()
                     .flatten_all()
                     .unwrap()
                     .to_vec1::<f32>()
                     .unwrap();
+                let (k, v) = kv.dense(s).unwrap();
+                let want = ops::sdpa(
+                    &q,
+                    &k.unsqueeze(0).unwrap(),
+                    &v.unsqueeze(0).unwrap(),
+                    None,
+                    false,
+                    scale,
+                    1.0,
+                )
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
                 let e = max_rel(&got, &want);
                 eprintln!("QREAD {q_arm:?} sel={} max rel {e:.3e}", s.is_some());
-                assert!(e < 1e-5, "{q_arm:?} sel={}: codes read {e} off the dequantized dense attention", s.is_some());
+                assert!(
+                    e < 1e-5,
+                    "{q_arm:?} sel={}: codes read {e} off the dequantized dense attention",
+                    s.is_some()
+                );
             }
-            let all = kv.attend(&q, None, scale).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let some = kv.attend(&q, Some(&sel), scale).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            assert!(max_rel(&some, &all) > 1e-3, "{q_arm:?}: the selection did not change the read");
+            let all = kv
+                .attend(&q, None, scale)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let some = kv
+                .attend(&q, Some(&sel), scale)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(
+                max_rel(&some, &all) > 1e-3,
+                "{q_arm:?}: the selection did not change the read"
+            );
         }
     }
 
@@ -3377,7 +3461,15 @@ mod tests {
             let lens = kv.lens();
             let step = |kv: &mut KvCache, t: usize| -> Vec<u32> {
                 let x = Tensor::from_vec(tok(128, 50.0 + t as f32), (1, 1, 128), &gpu).unwrap();
-                attn.decode(&x, kv).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().map(|v| v.to_bits()).collect()
+                attn.decode(&x, kv)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect()
             };
             let first: Vec<Vec<u32>> = (0..5).map(|t| step(&mut kv, t)).collect();
             kv.truncate(lens.0, lens.1);
@@ -3414,11 +3506,15 @@ mod tests {
         .unwrap();
         let (nkv, hd, idx) = (cfg.n_kv_heads, cfg.head_dim, cfg.indexer_head_dim);
         let chunk = 512usize;
-        let k: Vec<f32> = (0..nkv * chunk * hd).map(|i| ((i as f32) * 0.003).sin()).collect();
+        let k: Vec<f32> = (0..nkv * chunk * hd)
+            .map(|i| ((i as f32) * 0.003).sin())
+            .collect();
         let k = Tensor::from_vec(k, (nkv, chunk, hd), &gpu).unwrap();
         let v = (&k * 0.5).unwrap();
         let raw = Tensor::from_vec(
-            (0..chunk * idx).map(|i| ((i as f32) * 0.007).cos()).collect::<Vec<f32>>(),
+            (0..chunk * idx)
+                .map(|i| ((i as f32) * 0.007).cos())
+                .collect::<Vec<f32>>(),
             (chunk, idx),
             &gpu,
         )
@@ -3474,7 +3570,10 @@ mod tests {
                     d(after.pool_live, before.pool_live),
                     d(after.phys_footprint, before.phys_footprint),
                 );
-                assert_eq!(planes, want, "{p:?} at {tokens}: the planes are not the admission's arithmetic");
+                assert_eq!(
+                    planes, want,
+                    "{p:?} at {tokens}: the planes are not the admission's arithmetic"
+                );
                 drop(caches);
                 gpu.synchronize().unwrap();
             }

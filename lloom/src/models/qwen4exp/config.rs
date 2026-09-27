@@ -372,9 +372,15 @@ mod tests {
         let mut cfg = Config::tiny();
         cfg.set_axis("kv-quant", "int8").unwrap();
         assert_eq!(cfg.axes_line(), "KvQuant=Int8");
-        let meta: Vec<_> = crate::axes::AXES.iter().filter(|a| a.name == "KvQuant").collect();
+        let meta: Vec<_> = crate::axes::AXES
+            .iter()
+            .filter(|a| a.name == "KvQuant")
+            .collect();
         assert!(meta.len() >= 2, "both families register KvQuant");
-        assert!(meta.windows(2).all(|w| w[0] == w[1]), "the two KvQuant registrations differ: {meta:?}");
+        assert!(
+            meta.windows(2).all(|w| w[0] == w[1]),
+            "the two KvQuant registrations differ: {meta:?}"
+        );
     }
 
     /// Derived dims reconcile with the GGUF tensor shapes (conv_channels must

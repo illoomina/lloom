@@ -147,7 +147,13 @@ impl QuantKvSlab {
     }
 
     /// Allocate the planes for `n_heads × head_dim` at `dtype`.
-    fn ensure(&mut self, n_heads: usize, head_dim: usize, dtype: DType, dev: &lloom_tensor::Device) -> Result<()> {
+    fn ensure(
+        &mut self,
+        n_heads: usize,
+        head_dim: usize,
+        dtype: DType,
+        dev: &lloom_tensor::Device,
+    ) -> Result<()> {
         if self.k_codes.is_some() {
             if (n_heads, head_dim, dtype) != (self.n_heads, self.head_dim, self.dtype) {
                 lloom_tensor::bail!(
@@ -258,15 +264,42 @@ impl QuantKvSlab {
         let [kc, ks, kb, vc, vs, vb] = self.planes_or_bail()?;
         let n_q = q.dim(1)?;
         if self.n_heads == 0 || n_q % self.n_heads != 0 {
-            lloom_tensor::bail!("QuantKvSlab::attend: {n_q} query heads over {} KV heads", self.n_heads)
+            lloom_tensor::bail!(
+                "QuantKvSlab::attend: {n_q} query heads over {} KV heads",
+                self.n_heads
+            )
         }
         let gqa = n_q / self.n_heads;
         match sel {
             None => ops::sdpa_quant(
-                q, kc, ks, kb, vc, vs, vb, gqa, self.len, self.capacity, scale, 1.0, self.quant,
+                q,
+                kc,
+                ks,
+                kb,
+                vc,
+                vs,
+                vb,
+                gqa,
+                self.len,
+                self.capacity,
+                scale,
+                1.0,
+                self.quant,
             ),
             Some(sel) => ops::sdpa_quant_selected(
-                q, kc, ks, kb, vc, vs, vb, sel, gqa, self.capacity, scale, 1.0, self.quant,
+                q,
+                kc,
+                ks,
+                kb,
+                vc,
+                vs,
+                vb,
+                sel,
+                gqa,
+                self.capacity,
+                scale,
+                1.0,
+                self.quant,
             ),
         }
     }

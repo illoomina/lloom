@@ -37,9 +37,11 @@ kernel void eos_gate_u32(
 // The argmax is `reduce.metal`'s `indexed<T>` rule exactly: the greatest value,
 // the lowest index on ties, each partial starting at {0, lowest()}, values
 // compared as float (which is what `cast_f16_f32 → fast_argmax_f32` compared).
-// The stamp is written by thread 0 after a device-scope barrier, so a reader
-// that observes the stamp observes the slots behind it — the ordering the
-// three queue-ordered blits gave.
+// The stamp is written by thread 0 after a device-scope barrier, which orders
+// it after the slots for the GPU's threads and NOT for a host reading the
+// mapped words: two stores of one dispatch reach the host in either order.
+// A caller whose stamp a host reads passes `generation` 0, which writes no
+// stamp, and stamps with `ring_stamp` bound to the slots' buffer.
 template <typename T>
 METAL_FUNC void argmax_publish_body(
     device const T *logits,
@@ -91,7 +93,7 @@ METAL_FUNC void argmax_publish_body(
         }
     }
     threadgroup_barrier(mem_flags::mem_device);
-    if (tid == 0) {
+    if (tid == 0 && generation != 0) {
         step[0] = generation;
     }
 }

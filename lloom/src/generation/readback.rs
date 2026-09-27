@@ -14,8 +14,12 @@
 //! The ring's stamp, and each arm stamps on a stated grain: the per-step reads
 //! (the flag and the poll) stamp every token; the deferred reads stamp once
 //! per commit window on the fixed cadence, every token under the adaptive
-//! commit (the fused kernel's stamp, or the loop's `publish_marker` after an
-//! unfused step), and their last window at `drain_all`. A reader on a
+//! commit (the stamp after the fused kernel, or the loop's `publish_marker`
+//! after an unfused step), and their last window at `drain_all`. Every stamp
+//! is a dispatch of its own bound to the slots it certifies: the host sees a
+//! store of one dispatch and a store of another in the order the command
+//! stream's barrier between them gives, and two stores of one dispatch in
+//! either order. A reader on a
 //! deferred read on the fixed cadence therefore streams in windows, and sees
 //! the whole run once the run has returned.
 //!
@@ -60,9 +64,10 @@ pub struct ReadbackArms {
 pub struct ReadbackCounters {
     /// Tokens published into the ring's input slot.
     pub ring_publishes: u64,
-    /// Of those, the ones the fused argmax·eos·stamp kernel published
-    /// (`Device::argmax_publish`, lloom #735 step 5): one dispatch in place of
-    /// the cast, the argmax, three blits and the gate kernel.
+    /// Of those, the ones the fused argmax·eos kernel published
+    /// (`Device::argmax_publish`, lloom #735 step 5) and a `ring_stamp`
+    /// stamped: two dispatches in place of the cast, the argmax, three blits,
+    /// the gate kernel and the stamp.
     pub fused_publishes: u64,
     /// Publishes that turned out to be EOS and were retracted from the history.
     pub ring_eos_publishes: u64,
@@ -272,7 +277,7 @@ pub trait ReadbackStrategy {
     /// argmax·eos·stamp kernel (`Device::argmax_publish`) where the strategy
     /// can — the ring with an argmax sampler on Metal. After a step for which
     /// [`Self::publishes_fused`] holds, the loop skips its own stamp and gate
-    /// step: the kernel did both.
+    /// step: the strategy stamped, and the kernel raised the gate's flag.
     fn set_fused_publish(&mut self, on: bool) {
         let _ = on;
     }
@@ -1739,10 +1744,12 @@ impl ReadbackStrategy for Ring {
     ) -> Result<Tensor> {
         if self.fused_publish && matches!(sampler.sampling(), Sampling::ArgMax) {
             // The fused publish (lloom #735 step 5): the argmax, the history
-            // slot, the input slot, the EOS test and the stamp in one
-            // dispatch. Same order of effects as below — the slots land, a
-            // device fence, then the stamp — so a reader that sees the stamp
-            // sees the token.
+            // slot, the input slot and the EOS test in one dispatch, then the
+            // stamp as its own dispatch certifying the history segment. The
+            // kernel's in-dispatch fence orders its stores for the GPU only;
+            // a host can see its stamp before its slot (§11.5z-xiv), and the
+            // command stream's barrier before a dispatch that binds the
+            // segment is what a reader of the stamp relies on.
             let logits = if logits.rank() == 1 {
                 logits.clone()
             } else {
@@ -1764,8 +1771,10 @@ impl ReadbackStrategy for Ring {
                 &history_slot,
                 self.ring.eos_ids_tensor(),
                 self.ring.step_counter(),
-                self.generation,
+                0,
             )?;
+            self.ring
+                .publish_marker(self.generation, &[&self.history.ring.segments[seg]])?;
             self.history.wrote_one();
             return self.ring.input_for(1);
         }

@@ -16,8 +16,8 @@ publish = false
 description = "LibAFL harnesses over lloom's stateful fuzz models"
 
 [dependencies]
-lloom = { path = "../lloom", features = ["fuzzing"] }
-lloom-tensor = { path = "../lloom-tensor", features = ["fuzzing"] }
+lloom = { path = "../lloom", features = ["fuzzing", "shape-probe"] }
+lloom-tensor = { path = "../lloom-tensor", features = ["fuzzing", "shape-probe"] }
 libafl = "0.16.1"
 libafl_bolts = "0.16.1"
 libafl_targets = { version = "0.16.1", features = ["sancov_pcguard_hitcounts"] }
@@ -53,6 +53,14 @@ panic = "abort"
 [profile.fuzz-fat]
 inherits = "fuzz-thin"
 lto = "fat"
+
+# `fuzz_geometry`'s arm: the fuzz-thin codegen, but a panic unwinds, because
+# the harness classifies one (`geometry::quietly`): a panic in the CPU
+# reference is a geometry outside the family's domain, a panic on Metal after
+# the CPU ran clean is a defect. Under `abort` both would be the same crash.
+[profile.fuzz-geometry]
+inherits = "fuzz-thin"
+panic = "unwind"
 
 # The ASan arm: the sanitizer on the ENGINE crates and the harness only, put
 # there by `sancov-wrapper.sh` under `LLOOM_FUZZ_ASAN=1` (nightly rustc), and
@@ -104,6 +112,13 @@ required-features = ["metal"]
 [[bin]]
 name = "fuzz_cb_liveness"
 path = "src/bin/fuzz_cb_liveness.rs"
+required-features = ["metal"]
+
+# The shape campaign over the tiny Qwen4-exp model (`docs/porting-models.md`
+# §21.8). Build with `--profile fuzz-geometry`.
+[[bin]]
+name = "fuzz_geometry"
+path = "src/bin/fuzz_geometry.rs"
 required-features = ["metal"]
 
 # The persistent record's validation target: a planted state-carryover

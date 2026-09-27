@@ -8,7 +8,7 @@
 //! `[1, 1, 2560]` elementwise kernels (`design/.dev/serving-catalogue.md`
 //! §0). Each op here takes one block's chain of launches down to one.
 
-use lloom_tensor::{CpuStorage, Layout, Result, Shape, Tensor};
+use lloom_tensor::{shape_req, CpuStorage, Layout, Result, Shape, Tensor};
 
 /// `(I + A)⁻¹` for strictly-lower `A [.., n, n]` (f32, contiguous) as one
 /// launch — `deltanet::unit_lower_inverse`'s forward substitution.
@@ -466,23 +466,29 @@ pub(crate) fn hc_mix_pair(
     };
     let (b, seq, nd) = h.dims3().ok()?;
     let rows = b * seq;
-    if nd != n * d || rows == 0 || rows > HC_MIX_MAX_ROWS {
+    if nd != n * d || rows == 0 || !shape_req!(hc_mix_fused, rows <= HC_MIX_MAX_ROWS; rows) {
         return None;
     }
     let lr = w_down.dim(0).ok()?;
-    if w_down.dim(1).ok()? != nd || w_up.dims2().ok()? != (nd, lr) || lr > 1024 {
+    if w_down.dim(1).ok()? != nd
+        || w_up.dims2().ok()? != (nd, lr)
+        || !shape_req!(hc_mix_fused, lr <= 1024; lr)
+    {
         return None;
     }
     // The kernels' vector loads: d a multiple of 4, lr even, every operand
     // at a 16-byte-aligned start (whole tensors are; a narrow may not be).
     let aligned = |t: &Tensor, elem: usize| (t.layout().start_offset() * elem) % 16 == 0;
-    if d % 4 != 0
-        || lr % 2 != 0
-        || !aligned(h, 4)
-        || !aligned(gamma, 4)
-        || !aligned(&w_down, 2)
-        || !aligned(&w_up, 2)
-        || !w_inject.as_ref().map_or(true, |w| aligned(w, 2))
+    if !shape_req!(hc_mix_fused, d % 4 == 0; d)
+        || !shape_req!(hc_mix_fused, lr % 2 == 0; lr)
+        || !shape_req!(hc_mix_fused, aligned(h, 4); offset = h.layout().start_offset())
+        || !shape_req!(hc_mix_fused, aligned(gamma, 4); offset = gamma.layout().start_offset())
+        || !shape_req!(hc_mix_fused, aligned(&w_down, 2); offset = w_down.layout().start_offset())
+        || !shape_req!(hc_mix_fused, aligned(&w_up, 2); offset = w_up.layout().start_offset())
+        || !w_inject.as_ref().map_or(
+            true,
+            |w| shape_req!(hc_mix_fused, aligned(w, 2); offset = w.layout().start_offset()),
+        )
     {
         return None;
     }

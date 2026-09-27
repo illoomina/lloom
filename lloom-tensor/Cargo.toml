@@ -86,6 +86,12 @@ default = []
 # (`measurements/issue-706-libafl-port.md`). The proptest generators and the
 # tests stay `#[cfg(test)]` -- proptest is a dev-dependency.
 fuzzing = []
+# The shape checks' probes (`shape_probe`, `docs/porting-models.md` §21.8):
+# `shape_req!` / `shape_ensure!` also log each evaluation for the shape
+# campaign in `lloom-fuzz/`. Off by default, and enabled only from that
+# workspace and from test dev-dependencies; with it off the macros expand to
+# the bare check.
+shape-probe = []
 cuda = ["cudarc", "dep:candle-kernels", "candle-ug?/cuda"]
 cudnn = ["cuda", "cudarc/cudnn"]
 nccl = ["cuda", "cudarc/nccl"]

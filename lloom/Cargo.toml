@@ -62,9 +62,10 @@ egglog = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-# The integration tests drive the fuzz models that live behind `fuzzing`; a
-# self dev-dependency is how cargo turns a feature on for a crate's own tests.
-lloom = { path = ".", features = ["fuzzing"] }
+# The integration tests drive the fuzz models that live behind `fuzzing`, and
+# read the shape probes (`shape-probe`); a self dev-dependency is how cargo
+# turns a feature on for a crate's own tests.
+lloom = { path = ".", features = ["fuzzing", "shape-probe"] }
 # The stateful sequence fuzzer over `TokenRing` (lloom #508). A dev-dependency,
 # so nothing shipping and no downstream consumer acquires it -- which is what
 # keeps `CONTRIBUTING.md` §4.1's "must not break CPU or CUDA backends" a
@@ -98,6 +99,11 @@ profile = []
 # and see the same sentinels the proptests do. Off by default; byte-identical
 # release binary with it off (`measurements/issue-706-libafl-port.md`).
 fuzzing = ["lloom-tensor/fuzzing"]
+# The shape checks' probes (`lloom_tensor::shape_probe`, `docs/porting-models.md`
+# §21.8), for the shape campaign in `lloom-fuzz/` and for tests that assert
+# which arm a geometry reached. Enabled only from that workspace and from the
+# self dev-dependency below; off, the annotated checks compile to the bare check.
+shape-probe = ["lloom-tensor/shape-probe"]
 accelerate = ["dep:accelerate-src", "lloom-tensor/accelerate"]
 cuda = ["lloom-tensor/cuda"]
 cudnn = ["lloom-tensor/cudnn"]

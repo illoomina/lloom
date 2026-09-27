@@ -23,93 +23,132 @@ pub enum LayerKind {
 /// The verified geometry — every field carries its GGUF key in a comment —
 /// and the runtime axes (`#[axis]`, not from the checkpoint): each registers
 /// in `lloom::axes::AXES` and becomes a `ConfigArgs` flag, as on LFM2's
-/// `Config` (RESTRUCTURING §1.6).
+/// `Config` (RESTRUCTURING §1.6). `#[tiny]` marks what the shape campaign
+/// may search from [`Config::tiny`] (`docs/porting-models.md` §21.8).
 #[derive(Debug, Clone, ConfigDerive)]
 pub struct Config {
     // ---- top-level ----
     /// `qwen4exp.block_count` = 48.
+    #[tiny(axis, max = 8)]
     pub n_layers: usize,
     /// `qwen4exp.embedding_length` = 2560.
+    #[tiny(axis)]
     pub hidden_size: usize,
     /// `vocab_size` = 248320.
+    #[tiny(axis)]
     pub vocab_size: usize,
     /// `qwen4exp.attention.layer_norm_rms_epsilon` = 1e-6.
+    #[tiny(fixed)]
     pub norm_eps: f64,
     /// `qwen4exp.full_attention_interval` = 4 (every 4th layer is full/QSA).
+    #[tiny(axis, max = 8)]
     pub full_attention_interval: usize,
     /// Per-layer kind, resolved from `layer_types` / the interval (never hardcoded).
+    #[tiny(
+        derived = "Self::resolve_layer_types(n_layers, full_attention_interval)",
+        cover
+    )]
     pub layer_types: Vec<LayerKind>,
 
     // ---- HyperConnection (Gated Residual) ----
     /// `hc_count` = 4 (n parallel streams).
+    #[tiny(axis)]
     pub hc_count: usize,
     /// `qwen4exp` HC low-rank = 320.
+    #[tiny(axis)]
     pub hc_lowrank: usize,
 
     // ---- attention (QSA / full) ----
     /// `qwen4exp.attention.head_count` = 24.
+    #[tiny(axis)]
     pub n_heads: usize,
     /// `qwen4exp.attention.head_count_kv` = 2 (GQA).
+    #[tiny(axis)]
     pub n_kv_heads: usize,
     /// `qwen4exp.attention.key_length` = `value_length` = 256.
+    #[tiny(axis)]
     pub head_dim: usize,
     /// `partial_rotary_factor` = 0.25 (64 of 256 dims get RoPE).
+    #[tiny(fixed)]
     pub partial_rotary_factor: f64,
     /// `qwen4exp.rope.freq_base` = 1e7.
+    #[tiny(fixed)]
     pub rope_theta: f64,
     /// `qwen4exp.rope.dimension_sections` = [11,11,10,0] (mRoPE).
+    #[tiny(fixed)]
     pub mrope_section: [usize; 4],
     /// `qwen4exp.attention.indexer.head_count` = 4.
+    #[tiny(axis)]
     pub indexer_n_heads: usize,
     /// `qwen4exp.attention.indexer.key_length` = 128.
+    #[tiny(axis)]
     pub indexer_head_dim: usize,
     /// `qwen4exp.attention.indexer.top_k` = 2048.
+    #[tiny(axis)]
     pub indexer_budget: usize,
     /// `qwen4exp.attention.compress_ratios` — the indexer compression per layer
     /// (0 on linear layers, 4 on full). Reduces to a scalar 4 here.
+    #[tiny(fixed)]
     pub indexer_compress_ratio: usize,
 
     // ---- DeltaNet (SSM) ----
     /// `qwen4exp.ssm.state_size` = 128 (= d_k = d_v).
+    #[tiny(axis)]
     pub ssm_state_size: usize,
     /// `qwen4exp.ssm.group_count` = 16 (= n key/query heads).
+    #[tiny(axis)]
     pub ssm_n_group: usize,
     /// `qwen4exp.ssm.time_step_rank` = 48 (= n value heads; the state carries these).
+    #[tiny(axis)]
     pub ssm_dt_rank: usize,
     /// `qwen4exp.ssm.conv_kernel` = 4.
+    #[tiny(fixed)]
     pub ssm_conv_kernel: usize,
     /// `qwen4exp.ssm.inner_size` = 6144 (= value_dim).
+    #[tiny(derived = "ssm_state_size * ssm_dt_rank")]
     pub ssm_inner_size: usize,
 
     // ---- MoE ----
     /// `qwen4exp.expert_count` = 512.
+    #[tiny(axis)]
     pub n_experts: usize,
     /// `qwen4exp.expert_used_count` = 10.
+    #[tiny(axis)]
     pub n_experts_per_tok: usize,
     /// `qwen4exp.expert_feed_forward_length` = 640.
+    #[tiny(axis)]
     pub moe_intermediate_size: usize,
     /// `qwen4exp.expert_shared_feed_forward_length` = 640.
+    #[tiny(axis)]
     pub shared_expert_intermediate_size: usize,
 
     // ---- N-gram PLE ----
     /// `qwen4exp.ple.layers` — the single PLE layer (blk.1 in the GGUF; the i±1
     /// layer-offset the doc flags). Empty if the model has no PLE.
+    #[tiny(fixed)]
     pub ple_layers: Vec<usize>,
     /// `qwen4exp.ple.ngram_size` = 3.
+    #[tiny(fixed)]
     pub ple_ngram_size: usize,
     /// `qwen4exp.ple.heads_per_ngram` = 8.
+    #[tiny(fixed)]
     pub ple_heads_per_ngram: usize,
     /// `qwen4exp.ple.conv_kernel` = 4.
+    #[tiny(fixed)]
     pub ple_conv_kernel: usize,
     /// `qwen4exp.embedding_length_per_layer_input` = 160 (the table's row width).
+    #[tiny(fixed)]
     pub ple_head_dim: usize,
     /// `qwen4exp.ple.image_token_id` — the id hashed for a position that
     /// carries an embedding but no token (an image); EOS when absent.
+    #[tiny(fixed)]
     pub ple_image_token_id: Option<u32>,
 
     // ---- tokens ----
     /// `bos = eos` = 248044.
+    #[tiny(fixed)]
     pub bos_token_id: u32,
+    #[tiny(fixed)]
     pub eos_token_id: u32,
 
     // ---- runtime axes ----
@@ -380,6 +419,45 @@ mod tests {
         assert!(
             meta.windows(2).all(|w| w[0] == w[1]),
             "the two KvQuant registrations differ: {meta:?}"
+        );
+    }
+
+    /// The `#[tiny]` surface: every geometry field is tagged, the searched
+    /// axes are read and set by name, and `tiny_derive` recomputes the
+    /// derived fields from the axes — the layer pattern from the layer count
+    /// and the interval, the DeltaNet value width from state × heads.
+    #[test]
+    fn the_tiny_surface_derives_the_dependent_fields() {
+        use crate::testing::tiny::TinyRole;
+        let axes: Vec<&str> = Config::TINY
+            .iter()
+            .filter(|f| f.role == TinyRole::Axis)
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(axes.len(), 19, "{axes:?}");
+        assert!(Config::TINY
+            .iter()
+            .any(|f| f.name == "layer_types" && f.cover));
+        let mut cfg = Config::tiny();
+        assert_eq!(cfg.tiny_axis("n_layers"), Some(4));
+        assert_eq!(
+            cfg.tiny_axis("norm_eps"),
+            None,
+            "a fixed field is not an axis"
+        );
+        assert!(cfg.set_tiny_axis("n_layers", 8));
+        assert!(cfg.set_tiny_axis("ssm_dt_rank", 6));
+        assert!(!cfg.set_tiny_axis("vocab", 1));
+        assert_eq!(cfg.layer_types.len(), 4, "stale until derived");
+        cfg.tiny_derive();
+        assert_eq!(cfg.layer_types, Config::resolve_layer_types(8, 4));
+        assert_eq!(cfg.ssm_inner_size, 8 * 6);
+        let mut same = Config::tiny();
+        same.tiny_derive();
+        assert_eq!(
+            format!("{same:?}"),
+            format!("{:?}", Config::tiny()),
+            "tiny() is already derived"
         );
     }
 

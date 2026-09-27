@@ -1237,11 +1237,10 @@ pub fn matmul_f16_weight_f32(xs: &crate::Tensor, w: &crate::Tensor) -> Result<cr
             xs.dtype()
         )
     }
-    if k % 32 != 0 {
-        // The GEMM's f16 arm reads K in 32-wide blocks; a K off the block
-        // reads past the row (#749 P30 (1)).
-        crate::bail!("matmul_f16_weight_f32: K {k} is not a multiple of the 32-wide block")
-    }
+    // The GEMM's f16 arm reads K in 32-wide blocks; a K off the block
+    // reads past the row (#749 P30 (1)).
+    crate::shape_ensure!(f16_weight_gemm, k % 32 == 0; k =>
+        "matmul_f16_weight_f32: K {k} is not a multiple of the 32-wide block");
     let xs = xs.contiguous()?;
     let w = w.contiguous()?;
     let (ws, wl) = w.storage_and_layout();

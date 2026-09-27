@@ -12,7 +12,7 @@ use super::{lfm2, qwen4exp, ModelArgs, Served, Shape};
 use anyhow::{Context, Result};
 #[allow(unused_imports)]
 use anyhow::Context as _;
-use lloom::nn::ops::KvQuant;
+use lloom::nn::ops::{KvPrecision, KvQuant};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -44,6 +44,9 @@ pub struct Capabilities {
     pub kv_quant: &'static [KvQuant],
     /// What `KvQuant::Off` stores on this family.
     pub kv_dtype: &'static str,
+    /// The dense stores this family builds, `kv_dtype` among them: a dtype
+    /// name (`f16`) selects one of these, never a store it does not name.
+    pub kv_dense: &'static [&'static str],
     /// Why the arms missing from `kv_quant` are refused.
     pub kv_quant_missing: &'static str,
     /// Image input (OpenAI `image_url` parts, `lloom chat --image`). A
@@ -88,11 +91,22 @@ impl Capabilities {
         )
     }
 
+    /// The KV arms by the names `--kv-quant` takes: `off` (the `kv_dtype`
+    /// store), each other dense store by its dtype, then the quantized arms.
     fn kv_quant_names(&self) -> Vec<String> {
-        self.kv_quant
-            .iter()
-            .map(|q| q.name().to_ascii_lowercase())
-            .collect()
+        let mut names = Vec::new();
+        for q in self.kv_quant {
+            names.push(q.name().to_ascii_lowercase());
+            if *q == KvQuant::Off {
+                names.extend(
+                    self.kv_dense
+                        .iter()
+                        .filter(|d| **d != self.kv_dtype)
+                        .map(|d| d.to_string()),
+                );
+            }
+        }
+        names
     }
 }
 
@@ -134,6 +148,7 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     executor_arms: true,
     kv_quant: &[KvQuant::Off, KvQuant::Int8, KvQuant::Int4],
     kv_dtype: "f16",
+    kv_dense: &["f16"],
     kv_quant_missing: "",
     vision: true,
     vision_missing: "",
@@ -149,10 +164,10 @@ pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     model_axes: false,
     rewind: "one decode step (the standing window)",
     executor_arms: false,
-    kv_quant: &[KvQuant::Off],
+    kv_quant: &[KvQuant::Off, KvQuant::Int8, KvQuant::Int4],
     kv_dtype: "f32",
-    kv_quant_missing: "its attention KV is stored at f32 and no quantized arm is built for it \
-                       (head_dim 256 and QSA's selected-block read; sequence-state.md §10.7)",
+    kv_dense: &["f32", "f16"],
+    kv_quant_missing: "",
     vision: false,
     vision_missing: "no vision tower is built for Qwen4-exp (its image input is #765)",
 };
@@ -176,9 +191,10 @@ pub fn detect(path: &Path) -> Result<(&'static dyn Family, PathBuf)> {
     )
 }
 
-/// The KV precision arm requested, refused unless `cap` serves it. `f16` is
-/// `Off`'s spelling where `Off` is an f16 store, and refused where it is not,
-/// so a name never selects a store it does not describe.
+/// The KV precision arm requested, refused unless `cap` serves it. `f16`
+/// names the f16 dense store, served where the family builds one (`Off`
+/// itself on LFM2, a second dense store on Qwen4-exp) and refused where it
+/// does not, so a name never selects a store it does not describe.
 fn resolve_kv_quant(
     cap: &Capabilities,
     axes: &std::collections::BTreeMap<String, String>,
@@ -191,20 +207,39 @@ fn resolve_kv_quant(
     let arms = cap.kv_quant_names().join(", ");
     if !cap.kv_quant.contains(&arm) {
         anyhow::bail!(
-            "kv-quant = {value} is not {}'s (its KV arms: [{arms}]): {}",
+            "kv-quant = {value} is not {}'s (its KV arms: [{arms}]){}{}",
             cap.family,
+            if cap.kv_quant_missing.is_empty() {
+                ""
+            } else {
+                ": "
+            },
             cap.kv_quant_missing
         );
     }
-    if value == "f16" && cap.kv_dtype != "f16" {
+    if value == "f16" && !cap.kv_dense.contains(&"f16") {
         anyhow::bail!(
-            "kv-quant = f16 names an f16 KV store; {}'s `off` stores {} (its KV arms: [{arms}]): {}",
+            "kv-quant = f16 names an f16 KV store; {} builds none (its `off` stores {}; its KV arms: [{arms}])",
             cap.family,
             cap.kv_dtype,
-            cap.kv_quant_missing
         );
     }
     Ok(())
+}
+
+/// Qwen4-exp's KV store for the requested `kv-quant`, `None` when the axis
+/// is not set (the checkpoint's f32). The value is the family's own parse
+/// (`qwen4exp::config::parse_kv_precision`): `off` is f32, `f16` the f16
+/// dense store, `int8` / `int4` the codes.
+fn qwen_kv_precision(
+    axes: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<KvPrecision>> {
+    axes.get(KV_QUANT_AXIS)
+        .map(|v| {
+            lloom::models::qwen4exp::config::parse_kv_precision(v)
+                .map_err(|e| anyhow::anyhow!("model.axes.{KV_QUANT_AXIS}: {e}"))
+        })
+        .transpose()
 }
 
 /// The refusals every family shares.
@@ -354,6 +389,20 @@ impl Family for Qwen4ExpFamily {
             "chunk" | "replay" => {}
             other => anyhow::bail!("--prefill-mode {other}: chunk | replay"),
         }
+        if let Some(p) = qwen_kv_precision(&s.model.axes)? {
+            if p != lloom::models::qwen4exp::config::DEFAULT_KV_PRECISION && s.batch > 1 {
+                anyhow::bail!(
+                    "kv-quant = {p:?} with --batch {}: the rows' paged KV pool is f32 (its read is \
+                     the f32 SdpaVectorPaged); the reduced stores are the single sequence's",
+                    s.batch
+                );
+            }
+            if p.quant().is_on() && req.model.cpu {
+                anyhow::bail!(
+                    "kv-quant = {p:?} is Metal-only (the quantized append and reads are Metal kernels)"
+                );
+            }
+        }
         Ok(())
     }
     fn load(&self, first: PathBuf, req: Requested<'_>) -> Result<Box<dyn Served>> {
@@ -390,6 +439,7 @@ impl Family for Qwen4ExpFamily {
             kv_reserve_tokens: shape.memory.kv_reserve_tokens,
             executor: shape.executor.clone(),
             memory: shape.memory.clone(),
+            kv_precision: qwen_kv_precision(&shape.model.axes)?,
         })
     }
 }
@@ -489,63 +539,108 @@ mod tests {
     #[test]
     fn each_family_serves_its_own_kv_arms_and_refuses_the_rest_by_name() {
         let m = model_args(&[]);
-        for v in ["int8", "8", "int4", "4"] {
+        let serves = |f: &'static dyn Family, s: Shape| {
+            f.resolve(&Requested {
+                model: &m,
+                shape: s,
+            })
+        };
+        let (qwen, lfm2): (&'static dyn Family, &'static dyn Family) =
+            (&Qwen4ExpFamily, &Lfm2Family);
+        for v in ["off", "f16", "int8", "8", "int4", "4"] {
+            serves(qwen, with_kv_quant(v))
+                .unwrap_or_else(|e| panic!("qwen4exp serves kv-quant = {v}: {e}"));
+            serves(lfm2, with_kv_quant(v))
+                .unwrap_or_else(|e| panic!("lfm2 serves kv-quant = {v}: {e}"));
+        }
+        // The rows' paged pool has only the f32 store: the reduced stores
+        // are refused at --batch N by name, the shipped one is not.
+        for v in ["f16", "int8", "int4"] {
+            let mut s = with_kv_quant(v);
+            s.batch = 2;
+            let err = serves(qwen, s).unwrap_err().to_string();
+            assert!(err.contains("paged KV pool is f32"), "{v}: {err}");
+        }
+        let mut s = with_kv_quant("off");
+        s.batch = 2;
+        serves(qwen, s).expect("off is the pool's own store");
+        // The codes are Metal kernels; the f16 dense store is not.
+        let cpu = model_args(&["--cpu"]);
+        for v in ["int8", "int4"] {
             let err = Qwen4ExpFamily
                 .resolve(&Requested {
-                    model: &m,
+                    model: &cpu,
                     shape: with_kv_quant(v),
                 })
                 .unwrap_err()
                 .to_string();
-            assert!(
-                err.contains(&format!("kv-quant = {v} is not qwen4exp's")),
-                "{err}"
-            );
-            assert!(err.contains("its KV arms: [off]"), "{err}");
-            assert!(err.contains("stored at f32"), "{err}");
+            assert!(err.contains("Metal-only"), "{v}: {err}");
         }
-        let err = Qwen4ExpFamily
+        Qwen4ExpFamily
             .resolve(&Requested {
-                model: &m,
+                model: &cpu,
                 shape: with_kv_quant("f16"),
             })
+            .expect("the f16 dense store needs no Metal kernel");
+        // A family without an f16 store refuses the name rather than
+        // serving another store under it.
+        let no_f16 = Capabilities {
+            kv_dense: &["f32"],
+            ..QWEN4EXP_CAPABILITIES
+        };
+        let err = resolve_kv_quant(&no_f16, &with_kv_quant("f16").model.axes)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("builds none (its `off` stores f32"), "{err}");
+        let int_only = Capabilities {
+            kv_quant: &[KvQuant::Off],
+            ..QWEN4EXP_CAPABILITIES
+        };
+        let err = resolve_kv_quant(&int_only, &with_kv_quant("int8").model.axes)
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("`off` stores f32"),
-            "f16 must not name Qwen4-exp's f32 store: {err}"
+            err.contains("kv-quant = int8 is not qwen4exp's (its KV arms: [off, f16])"),
+            "{err}"
         );
-        Qwen4ExpFamily
-            .resolve(&Requested {
-                model: &m,
-                shape: with_kv_quant("off"),
-            })
-            .expect("off is Qwen4-exp's own KV arm");
         // The other axes are still refused, and kv-quant is not blamed for them.
         let mut s = with_kv_quant("off");
         s.model.set("attn", "sdpa").unwrap();
-        let err = Qwen4ExpFamily
-            .resolve(&Requested {
-                model: &m,
-                shape: s,
-            })
-            .unwrap_err()
-            .to_string();
+        let err = serves(qwen, s).unwrap_err().to_string();
         assert!(err.contains("the model axes (attn)"), "{err}");
-        for v in ["off", "f16", "int8", "8", "int4", "4"] {
-            Lfm2Family
-                .resolve(&Requested {
-                    model: &m,
-                    shape: with_kv_quant(v),
-                })
-                .unwrap_or_else(|e| panic!("lfm2 serves kv-quant = {v}: {e}"));
-        }
         assert!(LFM2_CAPABILITIES
             .line()
             .contains("kv_quant=[off,int8,int4] kv_dtype=f16"));
         assert!(QWEN4EXP_CAPABILITIES
             .line()
-            .contains("kv_quant=[off] kv_dtype=f32"));
+            .contains("kv_quant=[off,f16,int8,int4] kv_dtype=f32"));
+    }
+
+    /// What the load is handed for each spelling: the store the name
+    /// describes, never the f32 store under another label.
+    #[test]
+    fn the_qwen_load_takes_the_store_the_name_describes() {
+        use lloom_tensor::DType;
+        let arm = |v: &str| qwen_kv_precision(&with_kv_quant(v).model.axes).unwrap();
+        assert_eq!(qwen_kv_precision(&shape().model.axes).unwrap(), None);
+        assert_eq!(arm("off"), Some(KvPrecision::dense(DType::F32)));
+        assert_eq!(arm("f16"), Some(KvPrecision::dense(DType::F16)));
+        assert_eq!(
+            arm("int8"),
+            Some(KvPrecision::quantized(KvQuant::Int8).unwrap())
+        );
+        assert_eq!(
+            arm("8"),
+            Some(KvPrecision::quantized(KvQuant::Int8).unwrap())
+        );
+        assert_eq!(
+            arm("int4"),
+            Some(KvPrecision::quantized(KvQuant::Int4).unwrap())
+        );
+        assert_eq!(
+            arm("4"),
+            Some(KvPrecision::quantized(KvQuant::Int4).unwrap())
+        );
     }
 
     #[test]

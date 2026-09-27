@@ -54,8 +54,9 @@ pub struct RingArm {
     /// a buffer is closed when the GPU starts the previous one rather than
     /// every `commit_steps`, and the token drain is a reader thread's, off
     /// the loop's path. Measured +0.5 tok/s on the B=1 crown (#148, record
-    /// §8.1). Needs a CPU-mapped ring and lookahead 1; falls back to the
-    /// fixed cadence where the ring has no reader.
+    /// §8.1). Needs a CPU-mapped ring, lookahead 1, an EOS read other than
+    /// the flag and a per-token stamp; the fixed cadence where it has not
+    /// ([`RingArm::resolved`]).
     pub adaptive: bool,
     /// How the ring learns EOS (`ring` = a blocking flag read, `ring-nonblocking`
     /// = the poll, `ring-hostdrain`, `ring-gpubatch[-nonblocking]`).
@@ -81,6 +82,52 @@ impl RingArm {
         adaptive: false,
         ..Self::CROWN
     };
+
+    /// Why this arm cannot run the adaptive commit, or `None` if it can. The
+    /// commit encodes the next forward before anything is read back and its
+    /// reader streams the ring's per-token stamp, so it needs one forward of
+    /// lookahead, an EOS read that does not read each token back (every ring
+    /// read but the flag, `Session::decode`'s refusals), and a stamp per
+    /// token: the poll read's, or the fused argmax·eos·stamp publish, which
+    /// runs for the argmax sampler with `fused_publish` on (`fused`).
+    pub fn why_not_adaptive(&self, fused: bool) -> Option<&'static str> {
+        if self.lookahead != 1 {
+            Some("the adaptive commit needs lookahead 1")
+        } else if matches!(self.eos, EosRead::Blocking) {
+            Some("the `ring` EOS read (the flag) reads each token back per step")
+        } else {
+            self.why_not_stream_reader(fused)
+        }
+    }
+
+    /// Why a ring reader cannot stream this arm, or `None` if it can: the
+    /// reader streams what a per-token stamp certifies. The poll read stamps
+    /// every token on any cadence; the other reads do only through the
+    /// adaptive commit's fused publish (see [`Self::why_not_adaptive`]) —
+    /// otherwise the flag read stamps nothing and the deferred reads stamp
+    /// once per commit window.
+    pub fn why_not_stream_reader(&self, fused: bool) -> Option<&'static str> {
+        match self.eos {
+            EosRead::Poll(_) => None,
+            _ if self.adaptive && fused => None,
+            EosRead::Blocking => {
+                Some("the `ring` EOS read (the flag) stamps no token for a reader")
+            }
+            _ => Some(
+                "a deferred EOS read stamps once per commit window, not per token, outside the \
+                 fused publish (the argmax sampler, `fused_publish` on)",
+            ),
+        }
+    }
+
+    /// The arm that runs: this one, on the fixed cadence where it cannot
+    /// carry the adaptive commit.
+    pub fn resolved(self, fused: bool) -> RingArm {
+        RingArm {
+            adaptive: self.adaptive && self.why_not_adaptive(fused).is_none(),
+            ..self
+        }
+    }
 
     /// The report-line rendering: the `--readback` spelling this arm is, its
     /// lookahead and cadence, from the value that ran (§7.1a-i).
@@ -281,7 +328,8 @@ pub struct Decoded {
     /// Prompt tokens actually prefilled — the request's length minus `reused`,
     /// except under [`ReuseAction::Resume`] where nothing is.
     pub prefilled: usize,
-    /// The readback arm that ran, resolved (never [`ReadbackArm::Auto`]).
+    /// The readback arm that ran: resolved (never [`ReadbackArm::Auto`]), and
+    /// on the fixed cadence wherever the adaptive commit did not run.
     pub readback: ReadbackArm,
     /// The loop's own counters — prefill submit time, per-step host time,
     /// commits, ring engagement — so a consumer that reports throughput reads
@@ -613,24 +661,29 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             Ok(true)
         };
 
-        let out: DecodeOut = match arm {
+        let (out, ran): (DecodeOut, ReadbackArm) = match arm {
             ReadbackArm::Blocking => {
                 let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
                 let opts = self
                     .config
                     .options(params.max_tokens, ReadbackArm::Blocking, params.prefill_tile);
-                self.session.decode_until(
+                let out = self.session.decode_until(
                     &mut spec,
                     &mut readback,
                     &mut sampler,
                     &prepared.suffix,
                     &opts,
                     &mut on_tokens,
-                )?
+                )?;
+                (out, ReadbackArm::Blocking)
             }
             ReadbackArm::Ring(ring) => {
+                // The fused publish, which lets a non-poll read stamp per
+                // token, runs for the argmax sampler only.
+                let fused = self.config.readback.fused_publish
+                    && matches!(sampler.sampling(), Sampling::ArgMax);
+                let ring = ring.resolved(fused);
                 let RingArm {
-                    lookahead,
                     adaptive,
                     eos,
                     wake,
@@ -641,15 +694,19 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 // every run.
                 let readback = self.rings.ring(&params.eos_ids, &self.device, eos)?;
                 readback.set_wake_cadence(wake);
-                // The adaptive arm needs the ring's reader (a CPU-mapped ring)
-                // and lookahead 1 (`Session::decode`'s own check); without a
-                // reader it is the fixed cadence, reported as such. The
+                // The adaptive arm needs the ring's reader (a CPU-mapped ring);
+                // without one it is the fixed cadence, reported as such. The
                 // reader alone (`--stream-reader`) streams per token on the
-                // fixed cadence. The pool's ring served earlier runs and its
+                // fixed cadence where the ring stamps per token, and a
+                // request whose sampler rules out the fused publish takes no
+                // reader (`RingArm::why_not_stream_reader`; the options refuse
+                // at startup what no request could stream). The pool's ring
+                // served earlier runs and its
                 // stamp runs across them, so the reader starts at this run's
                 // first token.
-                let adaptive = adaptive && lookahead == 1;
-                let reader = if adaptive || self.config.readback.stream_reader {
+                let reader = if (adaptive || self.config.readback.stream_reader)
+                    && ring.why_not_stream_reader(fused).is_none()
+                {
                     readback.reader().map(|mut r| {
                         r.resume_at_published();
                         r
@@ -658,13 +715,20 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     None
                 };
                 let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let mut opts = self
-                    .config
-                    .options(params.max_tokens, arm, params.prefill_tile);
+                let mut opts = self.config.options(
+                    params.max_tokens,
+                    ReadbackArm::Ring(ring),
+                    params.prefill_tile,
+                );
                 opts.stream_via_reader = reader.is_some();
                 opts.adaptive_commit = reader.is_some() && adaptive;
+                opts.eos_gate = self.config.readback.eos_gate && opts.adaptive_commit;
                 opts.stop = reader.is_some().then(|| std::sync::Arc::clone(&stop_flag));
-                match reader {
+                let ran = ReadbackArm::Ring(RingArm {
+                    adaptive: opts.adaptive_commit,
+                    ..ring
+                });
+                let out = match reader {
                     None => self.session.decode_until(
                         &mut spec,
                         readback,
@@ -738,7 +802,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                         drained??;
                         out?
                     }
-                }
+                };
+                (out, ran)
             }
             ReadbackArm::Auto => unreachable!("resolved above"),
             ReadbackArm::Speculative { .. } | ReadbackArm::Batched { .. } => {
@@ -768,7 +833,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reuse: prepared.action,
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
-            readback: arm,
+            readback: ran,
             stats: out.stats,
         })
     }
@@ -1105,10 +1170,11 @@ mod tests {
         /// same references.
         #[test]
         fn each_request_on_a_pooled_ring_streams_only_its_own_run() -> Result<()> {
-            let arms: [(&str, Option<&str>, bool); 4] = [
+            let arms: [(&str, Option<&str>, bool); 5] = [
                 ("default", None, false),
                 ("ring-la0 --stream-reader", Some("ring-la0"), true),
                 ("ring-fixed --stream-reader", Some("ring-fixed"), true),
+                ("ring", Some("ring"), false),
                 ("blocking", Some("blocking"), false),
             ];
             // (prompt, max_tokens): ends on EOS, on length, EOS twice in a
@@ -1155,6 +1221,249 @@ mod tests {
                     }
                 }
             }
+            Ok(())
+        }
+
+        /// One request on a fresh session at `temperature` (and `top_p`), on
+        /// the arm the options select: the reply, whatever the sampler drew,
+        /// and the text its fragments streamed.
+        fn sampled(
+            model: &Chain,
+            device: &Device,
+            config: &DecodeConfig,
+            temperature: f64,
+            top_p: Option<f64>,
+        ) -> Result<(Decoded, String)> {
+            let mut session =
+                DecodeSession::new(model, Pos(0), device.clone(), 0).with_config(config.clone());
+            let params = DecodeParams {
+                max_tokens: 24,
+                temperature: Some(temperature),
+                top_p,
+                eos_ids: vec![EOS],
+                readback: config.readback.arm(),
+                ..DecodeParams::default()
+            };
+            let mut streamed = String::new();
+            let reply = session.decode(
+                &[3],
+                |ids: &[u32]| Ok(text_of(ids)),
+                &params,
+                |frag: &str| streamed.push_str(frag),
+            )?;
+            Ok((reply, streamed))
+        }
+
+        /// Every `--readback` spelling (and none) × the adaptive commit (unset,
+        /// on, off) × the lookahead (unset, 0, 1) × the commit budget (unset,
+        /// per-token) × the EOS gate × the stream reader × the fused publish
+        /// (on, off), resolved through `lloom serve`'s option path and served
+        /// the way it serves them: the options are refused at startup naming
+        /// the knob the arm cannot carry
+        /// (the EOS gate, the stream reader), or every request is answered and
+        /// streams what it returns. A request is never where a combination is
+        /// refused.
+        ///
+        /// Each reply reports the arm that ran: it names the adaptive commit
+        /// iff the loop closed a buffer adaptively (the length request runs
+        /// past `run_ahead`, so an adaptive run closes at least one). Where the
+        /// device carries a reader, that is also the arm the options resolve
+        /// to, which is what the load line renders.
+        #[cfg(feature = "serve")]
+        #[test]
+        fn every_readback_spelling_and_commit_arm_serves_or_is_refused_at_startup() -> Result<()> {
+            use clap::Parser;
+            #[derive(Parser)]
+            struct Cli {
+                #[command(flatten)]
+                common: crate::app::CommonArgs,
+            }
+            let mut combos: Vec<Vec<String>> = Vec::new();
+            let spellings = std::iter::once(None).chain(ReadbackConfig::SPELLINGS.iter().map(Some));
+            for spelling in spellings {
+                for adaptive in [None, Some("true"), Some("false")] {
+                    for lookahead in [None, Some("0"), Some("1")] {
+                        for commit in [None, Some("per-token")] {
+                            for gate in [false, true] {
+                                for reader in [false, true] {
+                                    let mut a: Vec<String> = Vec::new();
+                                    if let Some(s) = spelling {
+                                        a.extend(["--readback".into(), s.to_string()]);
+                                    }
+                                    if let Some(v) = adaptive {
+                                        a.push(format!("--adaptive-commit={v}"));
+                                    }
+                                    if let Some(v) = lookahead {
+                                        a.extend(["--lookahead".into(), v.to_string()]);
+                                    }
+                                    if let Some(v) = commit {
+                                        a.extend(["--commit-budget".into(), v.to_string()]);
+                                    }
+                                    if gate {
+                                        a.push("--eos-gate".into());
+                                    }
+                                    if reader {
+                                        a.push("--stream-reader".into());
+                                    }
+                                    combos.push(a.clone());
+                                    a.push("--fused-publish=false".into());
+                                    combos.push(a);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(combos.len(), 10 * 3 * 3 * 2 * 2 * 2 * 2);
+            let mut failures: Vec<String> = Vec::new();
+            let mut vacuous: Vec<String> = Vec::new();
+            let mut refusals = std::collections::BTreeMap::new();
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                // (refused at startup, served, replies that ran adaptive,
+                // served combinations whose flags asked for it and did not)
+                let (mut refused, mut served, mut adaptive_ran, mut clamped) = (0, 0, 0, 0);
+                let failed_before = failures.len();
+                for argv in &combos {
+                    let label = format!("{device:?} [{}]", argv.join(" "));
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> Result<std::result::Result<(bool, bool), String>> {
+                            let cli = Cli::parse_from(
+                                std::iter::once("t".to_string()).chain(argv.iter().cloned()),
+                            );
+                            let config = match crate::app::resolve_options_uninstalled(&cli.common)
+                            {
+                                Err(e) => {
+                                    // Only an explicit knob the arm cannot carry is
+                                    // refused, and the refusal names it.
+                                    let e = e.to_string();
+                                    let names = |flag: &str, key: &str| {
+                                        argv.iter().any(|a| a == flag) && e.contains(key)
+                                    };
+                                    assert!(
+                                        names("--eos-gate", "eos_gate")
+                                            || names("--stream-reader", "stream_reader"),
+                                        "{label}: refused without naming a knob it set: {e}"
+                                    );
+                                    return Ok(Err(e));
+                                }
+                                Ok(o) => o.decode,
+                            };
+                            let (mut ran_adaptive, mut was_clamped) = (false, false);
+                            let mut held = None;
+                            for (prompt, max) in [(&[5u32, 1][..], 64), (&[0u32][..], 24)] {
+                                let (want, hit) = chain(*prompt.last().expect("a prompt"), max);
+                                let (got, streamed, parts) =
+                                    request(&model, &device, &config, held.take(), prompt, max)
+                                        .unwrap_or_else(|e| {
+                                            panic!("{label}: a greedy request was refused: {e}")
+                                        });
+                                held = Some(parts);
+                                let at = format!("{label} ({}) max {max}", got.readback.name());
+                                assert_eq!(got.tokens, want, "{at}: the ids");
+                                assert_eq!(streamed, text_of(&want), "{at}: the streamed text");
+                                assert_eq!(
+                                    got.stop,
+                                    if hit { Stop::Eos } else { Stop::Length },
+                                    "{at}: why it stopped"
+                                );
+                                let ran =
+                                    got.stats.adaptive_commits + got.stats.run_ahead_closes > 0;
+                                let says =
+                                    matches!(got.readback, ReadbackArm::Ring(r) if r.adaptive);
+                                assert!(
+                                    !ran || says,
+                                    "{at}: ran the adaptive commit and does not say so"
+                                );
+                                if !hit {
+                                    assert_eq!(says, ran, "{at}: the name says adaptive={says}, the loop ran adaptive={ran}");
+                                    ran_adaptive = ran;
+                                    let asked = config.readback.adaptive_commit;
+                                    was_clamped = asked
+                                        && !ran
+                                        && matches!(got.readback, ReadbackArm::Ring(_));
+                                }
+                                if device.is_metal() {
+                                    let resolved = config
+                                        .readback
+                                        .arm()
+                                        .resolve(&Sampling::ArgMax, config.readback.ring_arm());
+                                    assert_eq!(got.readback, resolved, "{at}: the reply reports another arm than the options resolve to");
+                                }
+                            }
+                            let host_sampler =
+                                !matches!(config.readback.arm(), ReadbackArm::Ring(_));
+                            for (t, p) in [(0.6, None), (0.6, Some(0.9))] {
+                                if p.is_some() && !host_sampler {
+                                    continue;
+                                }
+                                let (got, streamed) = sampled(&model, &device, &config, t, p)
+                                    .unwrap_or_else(|e| {
+                                        panic!("{label}: a request at temperature {t} top_p {p:?} was refused: {e}")
+                                    });
+                                let at = format!(
+                                    "{label} ({}) temperature {t} top_p {p:?}",
+                                    got.readback.name()
+                                );
+                                assert!(
+                                    got.tokens.len() <= 24,
+                                    "{at}: {} tokens past max_tokens 24",
+                                    got.tokens.len()
+                                );
+                                assert_eq!(
+                                    streamed,
+                                    text_of(&got.tokens),
+                                    "{at}: the streamed text"
+                                );
+                                assert_eq!(got.text, streamed, "{at}: the reply's text");
+                            }
+                            Ok(Ok((ran_adaptive, was_clamped)))
+                        },
+                    ));
+                    match outcome {
+                        Ok(Ok(Err(e))) => {
+                            refused += 1;
+                            *refusals.entry(e).or_insert(0usize) += 1;
+                        }
+                        Ok(Ok(Ok((r, c)))) => {
+                            served += 1;
+                            adaptive_ran += r as usize;
+                            clamped += c as usize;
+                        }
+                        Ok(Err(e)) => failures.push(format!("{label}: {e}")),
+                        Err(p) => failures.push(
+                            p.downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| p.downcast_ref::<&str>().map(|m| m.to_string()))
+                                .unwrap_or_default(),
+                        ),
+                    }
+                }
+                eprintln!("{device:?}: {served} served, {refused} refused at startup, {adaptive_ran} ran adaptive, {clamped} asked for it and ran the fixed cadence");
+                let failed = failures.len() - failed_before;
+                eprintln!("{device:?}: {failed} failed");
+                for f in &failures[failed_before..] {
+                    eprintln!("FAIL {f}");
+                }
+                assert_eq!(served + refused + failed, combos.len());
+                if served == 0 || refused == 0 {
+                    vacuous.push(format!("{device:?}: one side of the matrix is empty"));
+                }
+                if device.is_metal() && (adaptive_ran == 0 || clamped == 0) {
+                    vacuous.push(format!(
+                        "{device:?}: the attribution check saw one arm only"
+                    ));
+                }
+            }
+            for (e, n) in &refusals {
+                eprintln!("REFUSED x{n}: {e}");
+            }
+            assert!(
+                failures.is_empty(),
+                "{} combination runs failed (listed above)",
+                failures.len()
+            );
+            assert!(vacuous.is_empty(), "{vacuous:?}");
             Ok(())
         }
     }

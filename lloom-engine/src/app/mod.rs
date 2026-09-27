@@ -159,8 +159,12 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
 }
 
 /// Load the engine `args` names for `shape`. Returns it with the path it
-/// was loaded from.
+/// was loaded from. An adaptive commit the readback arm cannot carry is
+/// named here with its reason, beside the arm the loaded line renders.
 pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+    if let Some(note) = shape.decode.readback.adaptive_clamp() {
+        eprintln!("[readback: {note}]");
+    }
     family::load(model, shape)
 }
 
@@ -520,6 +524,15 @@ mod option_layer_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("eos_gate needs adaptive_commit"), "{err}");
+        // `ring` (the flag EOS read) resolves to the fixed cadence, and the
+        // EOS gate it cannot carry is refused here, not by a request.
+        let o = resolve_options_uninstalled(&common(&["--readback", "ring"])).unwrap();
+        assert!(o.decode.readback.adaptive_clamp().is_some());
+        assert!(matches!(o.decode.readback.arm(), crate::ReadbackArm::Ring(r) if !r.adaptive));
+        let err = resolve_options_uninstalled(&common(&["--readback", "ring", "--eos-gate"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("eos_gate") && err.contains("flag"), "{err}");
         let err = resolve_options_uninstalled(&common(&["--set", "decode.nope=1"]))
             .unwrap_err()
             .to_string();

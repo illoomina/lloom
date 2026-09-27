@@ -1245,7 +1245,7 @@ impl QsaAttention {
         if fused_off()
             || !x.device().is_metal()
             || x.dtype() != lloom_tensor::DType::F32
-            || !lloom_tensor::shape_req!(sdpa_head_dim, matches!(hd, 32 | 64 | 72 | 80 | 96 | 128 | 256 | 512); hd)
+            || !lloom_tensor::shape_req!(sdpa_head_dim, matches!(hd, 32 | 64 | 96 | 128 | 256); hd)
             || nh % nkv != 0
         {
             return Ok(None);
@@ -1410,7 +1410,7 @@ impl QsaAttention {
         if fused_off()
             || !x.device().is_metal()
             || x.dtype() != lloom_tensor::DType::F32
-            || !lloom_tensor::shape_req!(sdpa_head_dim, matches!(hd, 32 | 64 | 72 | 80 | 96 | 128 | 256 | 512); hd)
+            || !lloom_tensor::shape_req!(sdpa_head_dim, matches!(hd, 32 | 64 | 96 | 128 | 256); hd)
             || nh % nkv != 0
         {
             return Ok(None);

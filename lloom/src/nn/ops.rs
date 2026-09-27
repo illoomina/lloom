@@ -1887,16 +1887,19 @@ impl lloom_tensor::CustomOp3 for Sdpa<'_> {
         );
 
         let supports_sdpa_full_mask = self.mask.is_none() || q_seq <= k_seq;
-        // F32 full attention at head_dim=512 exceeds 32KB Metal threadgroup memory
-        let supports_sdpa_full_dtype = lloom_tensor::shape_req!(
+        // F32 at head_dim=512: the full kernel's tile exceeds 32KB of Metal
+        // threadgroup memory, and the vector kernel returns something that
+        // is not the attention (`sdpa_vector_head_dims`). Both refuse.
+        let supports_sdpa_dtype = lloom_tensor::shape_req!(
             sdpa_head_dim,
             !(q_head == 512 && q.dtype() == DType::F32);
             q_head,
             is_f32 = q.dtype() == DType::F32
         );
         let supports_sdpa_full =
-            q_seq > 1 && supported_head_dim && supports_sdpa_full_mask && supports_sdpa_full_dtype;
-        let supports_sdpa_vector = q_seq == 1 && supported_head_dim && q_seq <= k_seq;
+            q_seq > 1 && supported_head_dim && supports_sdpa_full_mask && supports_sdpa_dtype;
+        let supports_sdpa_vector =
+            q_seq == 1 && supported_head_dim && supports_sdpa_dtype && q_seq <= k_seq;
 
         implementation_supports_use_case &= supports_sdpa_full || supports_sdpa_vector;
 

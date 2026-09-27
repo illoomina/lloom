@@ -9331,8 +9331,8 @@ fn quantize_kv_at_head_dim_256_f32_matches_the_scalar_reference() {
                     bits.bits()
                 );
                 assert_eq!(got_bias, want_bias, "bias h{h} t{dst} int{}", bits.bits());
-                for j in 0..head_dim {
-                    let exact = ((group[j] as f64 - got_bias as f64) / got_scale as f64)
+                for (j, &x) in group.iter().enumerate() {
+                    let exact = ((x as f64 - got_bias as f64) / got_scale as f64)
                         .clamp(0.0, bits.levels() as f64);
                     let code = plane_code(&codes, bits, h, dst, j, capacity, head_dim) as f64;
                     assert!(

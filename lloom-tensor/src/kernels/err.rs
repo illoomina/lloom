@@ -10,6 +10,9 @@ pub enum MetalKernelError {
     LoadLibraryError(String),
     #[error("Error while loading function: {0}")]
     LoadFunctionError(String),
+    /// An arm this device does not execute, refused by name (§15.2a).
+    #[error("{0}")]
+    ArmRefused(String),
     #[error("Unsupported dtype {0} for operation {1}")]
     UnsupportedDTypeForOp(&'static str, &'static str),
     #[error("Failed to create compute function")]

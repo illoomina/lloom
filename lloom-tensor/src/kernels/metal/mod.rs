@@ -5,6 +5,9 @@
 /// rather than acquire them from a `metal::*`.
 pub mod admission;
 pub mod arena;
+/// The native-arm registry (§15.2a). Not in the glob re-export below:
+/// `Feature` and `Features` are general names, and `cpu::arms` has its own.
+pub mod arms;
 pub mod arena_cursor;
 #[cfg(test)]
 mod arena_gpu_tests;

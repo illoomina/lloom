@@ -697,13 +697,12 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 // The adaptive arm needs the ring's reader (a CPU-mapped ring);
                 // without one it is the fixed cadence, reported as such. The
                 // reader alone (`--stream-reader`) streams per token on the
-                // fixed cadence where the ring stamps per token, and a
-                // request whose sampler rules out the fused publish takes no
-                // reader (`RingArm::why_not_stream_reader`; the options refuse
-                // at startup what no request could stream). The pool's ring
-                // served earlier runs and its
-                // stamp runs across them, so the reader starts at this run's
-                // first token.
+                // fixed cadence where the ring stamps per token, and a request
+                // whose sampler rules out the fused publish takes no reader
+                // (`RingArm::why_not_stream_reader`; the options refuse at
+                // startup what no request could stream). The pool's ring
+                // served earlier runs and its stamp runs across them, so the
+                // reader starts at this run's first token.
                 let reader = if (adaptive || self.config.readback.stream_reader)
                     && ring.why_not_stream_reader(fused).is_none()
                 {

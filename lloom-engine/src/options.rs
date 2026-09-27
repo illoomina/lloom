@@ -510,8 +510,9 @@ impl DecodeConfig {
     /// The `DecodeOptions` for one run of `max_tokens` tokens on `arm`. The
     /// blocking arm has no lookahead and commits per token (the host holds
     /// every token); `stream_via_reader`, `adaptive_commit` and the EOS gate
-    /// that rides it are set by the loop once it holds a reader, never here. `tile` overrides the group's
-    /// prefill tile when non-zero (a request's own).
+    /// that rides it are set by the loop once it holds a reader, never here.
+    /// `tile` overrides the group's prefill tile when non-zero (a request's
+    /// own).
     pub fn options(&self, max_tokens: usize, arm: ReadbackArm, tile: usize) -> DecodeOptions {
         let (schedule, bulk) = match self.prefill.schedule() {
             Some((s, b)) => (Some(s), b),

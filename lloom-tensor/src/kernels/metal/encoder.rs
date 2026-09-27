@@ -1,5 +1,6 @@
 use crate::kernels::metal::{
     arena,
+    contention::{Censused, Side},
     executor::{DispatchAction, DispatchRecord, ExecutorSlot, Grid},
     late_bind, trace, Buffer, ComputePipeline, Fence,
 };
@@ -21,24 +22,15 @@ use std::{
 
 /// Shared cross-encoder output map: maps buffer pointer -> fence of the last encoder that wrote it.
 /// Used by subsequent encoders to call waitForFence before reading those buffers.
-// A `parking_lot::RwLock`, not a `Mutex` and not std's `RwLock` (issue: H2
-// contention hygiene). This map is read on the **per-bind** path --
-// `wait_for_buffer` does a `get` for every buffer every dispatch, ~2000 times per
-// decode token -- and written far less often: once per encoder close
-// (`end_encoding` registers its outputs) and once per command-buffer
-// **completion**, the latter on a Metal driver thread. So the frequent access is
-// a read and the contending writer is cross-thread. A `Mutex` serialises the
-// reads against each other (a cost at B>1, where several encode threads share one
-// `Commands`) and blocks every read for the whole of any completion write; an
-// `RwLock` lets the reads run concurrently and shortens the blocked window to the
-// write itself. `parking_lot`'s is word-sized, allocation-free and adaptively
-// spinning, where std's on macOS is `pthread_rwlock_t` (allocates, no spin) --
-// the wrong primitive for a hot path this codebase otherwise builds from atomics
-// and WFE. Semantics are unchanged: the map is still the single cross-encoder
-// ordering source (`DESIGN.md` §3.5 -- a missed fence is silent corruption, so
-// the set of entries and when they are inserted or removed is byte-for-byte what
-// it was; only the lock implementation changed).
-pub type PrevCeOutputs = Arc<parking_lot::RwLock<HashMap<usize, Arc<Fence>>>>;
+///
+/// Read by the encoding thread once per buffer per encoder session and written
+/// at each encoder close, where the entries of sessions whose command buffers
+/// have completed are also removed. No Metal completion thread takes this
+/// lock (`Commands`' `FenceBook`), so a bind never waits on one descheduled
+/// while holding it. A `parking_lot::RwLock` so that reads never serialise
+/// against each other; wrapped in [`Censused`] so that any acquisition that
+/// does wait is counted (`DESIGN.md` §6.4d).
+pub type PrevCeOutputs = Arc<Censused<parking_lot::RwLock<HashMap<usize, Arc<Fence>>>>>;
 
 fn size_tuple(size: MTLSize) -> (usize, usize, usize) {
     (size.width, size.height, size.depth)
@@ -519,10 +511,10 @@ pub struct EncoderState {
     ///
     /// The second bind of a buffer in one session cannot find a different
     /// writer than the first: sessions on one `Commands` are sequential (the
-    /// guard holds the outer lock for the whole dispatch, and an encoder is
-    /// registered into the map only when it ends), so the only concurrent
-    /// writer to the map is the completion thread *removing* entries -- which
-    /// turns a hit into a miss, never a miss into a hit. Counted on a real
+    /// guard holds the outer lock for the whole dispatch), and the map changes
+    /// only at an encoder close -- registering the closing session's outputs,
+    /// removing completed ones -- so it does not change while a session is
+    /// open. Counted on a real
     /// decode step before this set existed: 1101 map reads, 46 that could
     /// matter (lloom #727 §27; #732 measured the change).
     pub probed: HashSet<usize>,
@@ -710,10 +702,14 @@ impl ComputeCommandEncoder {
         let fence = {
             // Per-buffer-per-session read: the frequent access, and why the map
             // is an `RwLock`. `parking_lot` guards are infallible -- no `unwrap`.
-            let map = self.prev_ce_outputs.read();
+            let map = self.prev_ce_outputs.read(Side::Host);
             map.get(&ptr).cloned()
         };
-        let Some(fence) = fence else { return };
+        // A completed writer is ordered already; its entry awaits the next
+        // encoder close to be removed (`Commands`' `FenceBook`).
+        let Some(fence) = fence.filter(|f| !f.is_completed()) else {
+            return;
+        };
         s.fence_hits += 1;
         if s.waited_fences.insert(Arc::as_ptr(&fence) as usize) {
             s.fence_waits += 1;
@@ -1410,7 +1406,7 @@ impl BlitCommandEncoder {
         // Register outputs so subsequent encoders can wait. A write, taken once
         // per encoder close -- rare against the per-bind reads above.
         {
-            let mut map = self.prev_ce_outputs.write();
+            let mut map = self.prev_ce_outputs.write(Side::Host);
             for &out in &self.tracked_outputs {
                 map.insert(out, Arc::clone(&self.fence));
             }
@@ -1441,10 +1437,10 @@ impl BlitCommandEncoder {
 
         let fences: Vec<Arc<Fence>> = {
             // A read of the ordering map (blit-after-blit); see `PrevCeOutputs`.
-            let map = self.prev_ce_outputs.read();
+            let map = self.prev_ce_outputs.read(Side::Host);
             let mut out: Vec<Arc<Fence>> = Vec::new();
             for ptr in ptrs {
-                if let Some(f) = map.get(ptr) {
+                if let Some(f) = map.get(ptr).filter(|f| !f.is_completed()) {
                     if !out.iter().any(|seen| Arc::ptr_eq(seen, f)) {
                         out.push(Arc::clone(f));
                     }

@@ -8,6 +8,7 @@ use rand::{distr::Distribution, SeedableRng};
 
 pub mod hot_thread;
 pub mod poll;
+pub mod processors;
 pub mod readback;
 pub mod token_ring;
 /// The token ring's stateful fuzz model and driver (#508), outside `#[cfg(test)]`
@@ -16,6 +17,7 @@ pub mod token_ring;
 pub mod token_ring_fuzz;
 
 pub use hot_thread::{HotThread, HotThreadArm, HotThreadReport, QosClass};
+pub use processors::Processors;
 pub use readback::{
     Blocking, CommitBudget, EosRead, Geometry, ReadbackArms, ReadbackCounters, ReadbackStrategy,
     Ring, RingLap, RingReader, WAKE_LIVE_EVERY_DEFAULT,
@@ -24,23 +26,81 @@ pub use readback::{
 #[derive(Clone, PartialEq, Debug)]
 pub enum Sampling {
     ArgMax,
-    All { temperature: f64 },
-    TopK { k: usize, temperature: f64 },
-    TopP { p: f64, temperature: f64 },
-    TopKThenTopP { k: usize, p: f64, temperature: f64 },
-    // Note that the rng is not used for the Gumbel-Softmax sampling.
-    GumbelSoftmax { temperature: f64 },
+    All {
+        temperature: f64,
+    },
+    TopK {
+        k: usize,
+        temperature: f64,
+    },
+    TopP {
+        p: f64,
+        temperature: f64,
+    },
+    TopKThenTopP {
+        k: usize,
+        p: f64,
+        temperature: f64,
+    },
+    /// Gumbel-max at the temperature, its noise from the processor's seeded rng.
+    GumbelSoftmax {
+        temperature: f64,
+    },
 }
 
 pub struct LogitsProcessor {
     rng: rand::rngs::StdRng,
     sampling: Sampling,
+    /// The processors between the logits and the draw; `None` when every one
+    /// is neutral, so the sampler's path is exactly the one it has without them.
+    stage: Option<processors::Stage>,
 }
 
 impl LogitsProcessor {
     pub fn from_sampling(seed: u64, sampling: Sampling) -> Self {
         let rng = rand::rngs::StdRng::seed_from_u64(seed);
-        Self { rng, sampling }
+        Self {
+            rng,
+            sampling,
+            stage: None,
+        }
+    }
+
+    /// Run `processors` before every draw (bias, penalties, min-p;
+    /// [`processors`]). Neutral settings install nothing.
+    pub fn with_processors(mut self, processors: Processors) -> Self {
+        self.stage = processors
+            .is_active()
+            .then(|| processors::Stage::new(processors));
+        self
+    }
+
+    /// The processors this sampler runs, when any is active. A caller whose
+    /// path draws without this sampler (the ring's fused argmax publish, a
+    /// verify that accepts the target's argmax) must not take it when this
+    /// is `Some`.
+    pub fn processors(&self) -> Option<&Processors> {
+        self.stage.as_ref().map(|s| s.config())
+    }
+
+    /// The prompt the repetition penalty covers — the whole sequence the run
+    /// continues. Restarts the output history.
+    pub fn observe_prompt(&mut self, prompt: &[u32]) {
+        if let Some(stage) = &mut self.stage {
+            stage.observe_prompt(prompt);
+        }
+    }
+
+    /// The draw's temperature, `None` for argmax (min-p's input).
+    fn temperature(&self) -> Option<f64> {
+        match self.sampling {
+            Sampling::ArgMax => None,
+            Sampling::All { temperature }
+            | Sampling::TopK { temperature, .. }
+            | Sampling::TopP { temperature, .. }
+            | Sampling::TopKThenTopP { temperature, .. }
+            | Sampling::GumbelSoftmax { temperature } => Some(temperature),
+        }
     }
 
     /// The sampling arm this processor runs, so a caller that must refuse a
@@ -66,43 +126,33 @@ impl LogitsProcessor {
     }
 
     fn sample_argmax(&mut self, logits: Tensor) -> Result<u32> {
-        self.sample_argmax_on_device(&logits)?.to_scalar::<u32>()
+        self.draw_on_device(&logits)?.to_scalar::<u32>()
     }
 
-    /// Argmax without forcing the result host-side.
+    /// The draw as a `U32` **device** tensor, never read back: the ring
+    /// writes it into the next step's input and its history slot, so nothing
+    /// comes down and nothing goes up again (§11.5g).
     ///
-    /// Returns the sampled token as a rank-0 `U32` **device** tensor. This is
-    /// the whole of what [`Self::sample_argmax`] does minus its `to_scalar`,
-    /// and separating them is what `DESIGN.md` §11.5g's non-blocking token path
-    /// is built on: `argmax` already dispatches on the GPU (`fast_argmax_*`,
-    /// one per token) and `reduce_op` gives its output `DType::U32`
-    /// (`candle-core/src/metal_backend/mod.rs`), so the `u32` the next step
-    /// wants is **already in device memory** in the dtype the next step wants
-    /// it in. `to_scalar` is the only thing that forces it back.
-    ///
-    /// So a caller that can consume a device tensor -- writing it into a
-    /// persistent input buffer with `slice_set`, comparing it against a
-    /// device-resident EOS constant -- never pays the round trip, and the
-    /// write leg §11.5f found (the token *goes out again* as the next step's
-    /// input) is **deleted rather than relocated**: there is nothing to upload
-    /// because nothing came down.
-    ///
-    /// Temperature > 0 stays on the device too, via gumbel-max. Sampling from
-    /// `softmax(logits/T)` is `argmax(logits/T + G)` with `G` an i.i.d. Gumbel
-    /// per logit (`-log(-log u)`) -- an argmax over a perturbed logit vector, so
-    /// the token is produced by the same device `argmax` the t=0 arm uses and
-    /// **nothing comes down**. §11.2c's original blocker (a tier-3 distributional
-    /// failure at χ² 36 440) is DISCHARGED: the two root causes -- `rand_uniform`'s
-    /// seed advance collapsing onto a period-257 orbit, and `gumbel_softmax`'s
-    /// `(1e-7, 0.999)` clamp truncating one Gumbel variate in a thousand -- were
-    /// fixed, and the check now passes at χ² 216/280 against a critical 331
-    /// (`nn::sampling::gumbel_softmax`, which this delegates to and which returns
-    /// a device tensor). So temperature is no longer `--temperature 0` only: the
-    /// ring's `to_cpu_blit` stays at 0 at t > 0, where the host path took a
-    /// 512 KB whole-vocab readback per token (§11.5f) plus a 74 %-of-arm host
-    /// `sort_by` (§11.2c). ArgMax and the two top-{k,p} arms that need a host
-    /// sort still round-trip; plain temperature and gumbel-softmax do not.
+    /// Argmax is the device `argmax`; plain temperature and gumbel are
+    /// gumbel-max, `argmax(z + T·G)` with the Gumbel noise from the seeded host
+    /// rng uploaded as an input (§11.2e). The top-{k,p} arms need a host sort
+    /// and fall back to the argmax here; the ring refuses them (§11.2c).
+    /// Processors, when installed, run first and advance their history from
+    /// the drawn tensor.
     pub fn sample_argmax_on_device(&mut self, logits: &Tensor) -> Result<Tensor> {
+        let temperature = self.temperature();
+        let Some(stage) = self.stage.as_mut() else {
+            return self.draw_on_device(logits);
+        };
+        let processed = stage.apply(logits, temperature)?;
+        let token = self.draw_on_device(&processed)?;
+        if let Some(stage) = self.stage.as_mut() {
+            stage.record(&token)?;
+        }
+        Ok(token)
+    }
+
+    fn draw_on_device(&mut self, logits: &Tensor) -> Result<Tensor> {
         match self.sampling {
             // t = 0 -- a bare device argmax, the original mechanism.
             Sampling::ArgMax => logits.argmax(lloom_tensor::D::Minus1),
@@ -152,12 +202,6 @@ impl LogitsProcessor {
         // argmax(z + T·G): scaling G by T is the temperature, and the shared
         // 1/T on z is monotone so it drops out of the argmax.
         (logits + noise.affine(temperature, 0.0)?)?.argmax(lloom_tensor::D::Minus1)
-    }
-
-    fn sample_gumbel_softmax(&mut self, logits: &Tensor, temperature: f64) -> Result<u32> {
-        let sampled =
-            crate::nn::sampling::gumbel_softmax(logits, temperature, lloom_tensor::D::Minus1)?;
-        sampled.to_scalar::<u32>()
     }
 
     fn sample_multinomial(&mut self, prs: &Vec<f32>) -> Result<u32> {
@@ -227,6 +271,19 @@ impl LogitsProcessor {
     }
 
     pub fn sample_f(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
+        let temperature = self.temperature();
+        let Some(stage) = self.stage.as_mut() else {
+            return self.draw(logits, f);
+        };
+        let processed = stage.apply(logits, temperature)?;
+        let id = self.draw(&processed, f)?;
+        if let Some(stage) = self.stage.as_mut() {
+            stage.record_id(id)?;
+        }
+        Ok(id)
+    }
+
+    fn draw(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
         // The `ArgMax` arm takes its own path over the UNCAST logits.
         //
         // `to_dtype(F32)` below is one `cast_f16_f32` dispatch over the whole
@@ -262,9 +319,11 @@ impl LogitsProcessor {
             // Handled above, over the uncast logits, so the `ArgMax` arm does
             // not pay the whole-vocabulary cast it never reads.
             Sampling::ArgMax => self.sample_argmax(logits)?,
-            Sampling::GumbelSoftmax { temperature } => {
-                self.sample_gumbel_softmax(&logits, *temperature)?
-            }
+            // The device draw's gumbel-max, from the processor's seeded host
+            // noise, so `--seed` reproduces on this path as on the ring.
+            Sampling::GumbelSoftmax { temperature } => self
+                .gumbel_max_host_noise(&logits, *temperature)?
+                .to_scalar::<u32>()?,
             Sampling::All { temperature } => {
                 let prs = prs(*temperature)?;
                 self.sample_multinomial(&prs)?

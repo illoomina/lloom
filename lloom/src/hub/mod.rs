@@ -85,6 +85,10 @@ pub struct GenerationConfig {
     pub top_p: Option<f64>,
     #[serde(default)]
     pub top_k: Option<usize>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f64>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
 }
 
 fn de_u32_or_vec<'de, D>(de: D) -> std::result::Result<Vec<u32>, D::Error>

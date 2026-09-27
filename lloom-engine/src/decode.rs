@@ -18,7 +18,7 @@
 
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::readback::RING_HISTORY_SLOTS;
-use lloom::generation::{Blocking, EosRead, LogitsProcessor, Ring, Sampling};
+use lloom::generation::{Blocking, EosRead, LogitsProcessor, Processors, Ring, Sampling};
 use lloom::nn::{
     CacheReset, CacheRewind, CausalLM, DecodeOptions, DecodeOut, DecodeStats, IdentityProposer,
     ReuseAction, Sequence, Session,
@@ -245,6 +245,10 @@ pub struct DecodeParams {
     pub top_k: Option<usize>,
     /// Device gumbel-max at the temperature (`Sampling::GumbelSoftmax`).
     pub gumbel: bool,
+    /// Logit bias, the repetition / presence / frequency penalties and
+    /// min-p, run before the draw (`lloom::generation::processors`); the
+    /// default is neutral.
+    pub processors: Processors,
     pub max_tokens: usize,
     /// End-of-sequence ids; the first one sampled stops the run.
     pub eos_ids: Vec<u32>,
@@ -291,9 +295,23 @@ impl DecodeParams {
         Self::sampling_of(self.temperature, self.top_p, self.top_k, self.gumbel)
     }
 
-    /// The sampler of this request, seeded.
+    /// The sampler of this request, seeded, with its processors.
     pub fn sampler(&self) -> LogitsProcessor {
         LogitsProcessor::from_sampling(self.seed, self.sampling())
+            .with_processors(self.processors.clone())
+    }
+
+    /// Refuse the processors on a path that draws without this request's
+    /// sampler — `path` names it and `why` says what it draws with.
+    pub fn refuse_processors(&self, path: &str, why: &str) -> Result<()> {
+        if self.processors.is_active() {
+            lloom_tensor::bail!(
+                "{path} does not run logits processors (logit_bias, repetition/presence/\
+                 frequency penalties, min_p): {why}; got {:?}",
+                self.processors
+            );
+        }
+        Ok(())
     }
 }
 
@@ -305,6 +323,7 @@ impl Default for DecodeParams {
             top_p: None,
             top_k: None,
             gumbel: false,
+            processors: Processors::default(),
             max_tokens: 512,
             eos_ids: Vec::new(),
             stop_strings: Vec::new(),
@@ -645,6 +664,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let prepared = self.session.prepare(prompt_ids)?;
 
         let mut sampler = params.sampler();
+        sampler.observe_prompt(prompt_ids);
         let arm = params
             .readback
             .resolve(sampler.sampling(), self.config.readback.ring_arm());
@@ -692,9 +712,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             }
             ReadbackArm::Ring(ring) => {
                 // The fused publish, which lets a non-poll read stamp per
-                // token, runs for the argmax sampler only.
+                // token, runs for the argmax sampler only, and never under
+                // processors: its kernel draws the argmax itself, past them.
                 let fused = self.config.readback.fused_publish
-                    && matches!(sampler.sampling(), Sampling::ArgMax);
+                    && matches!(sampler.sampling(), Sampling::ArgMax)
+                    && sampler.processors().is_none();
                 let ring = ring.resolved(fused);
                 let RingArm {
                     adaptive,
@@ -732,6 +754,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                     ReadbackArm::Ring(ring),
                     params.prefill_tile,
                 );
+                opts.fused_publish = fused;
                 opts.stream_via_reader = reader.is_some();
                 opts.adaptive_commit = reader.is_some() && adaptive;
                 opts.eos_gate = self.config.readback.eos_gate && opts.adaptive_commit;
@@ -878,6 +901,10 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         if params.eos_ids.is_empty() {
             lloom_tensor::bail!("DecodeSession::decode: eos_ids is empty; a run needs an EOS set");
         }
+        params.refuse_processors(
+            "DecodeSession::decode_speculative",
+            "the verify accepts the target's raw argmax",
+        )?;
         let mut sampler = params.sampler();
         if sampler.sampling() != &Sampling::ArgMax {
             lloom_tensor::bail!(
@@ -1274,6 +1301,150 @@ mod tests {
                 assert_eq!(next.reused, kept, "{device:?}");
             }
             Ok(())
+        }
+
+        /// The ids a greedy request from `prompt` returns under `p`: the
+        /// chain's one-hot logits through vLLM's bias and penalties, over the
+        /// prompt and the history so far, then the lowest-index argmax.
+        fn penalized_chain(prompt: &[u32], p: &Processors, max: usize) -> (Vec<u32>, bool) {
+            let mut ids: Vec<u32> = Vec::new();
+            let mut last = *prompt.last().expect("a prompt");
+            while ids.len() < max {
+                let mut x = vec![0f32; VOCAB];
+                x[next_of(last) as usize] = 1.0;
+                for &(id, b) in &p.logit_bias {
+                    x[id as usize] += b;
+                }
+                for (i, xi) in x.iter_mut().enumerate() {
+                    let n = ids.iter().filter(|&&t| t as usize == i).count() as f32;
+                    let r = p.repetition_penalty;
+                    if r != 1.0 && (n > 0.0 || prompt.contains(&(i as u32))) {
+                        *xi *= if *xi > 0.0 {
+                            (1.0 / r) as f32
+                        } else {
+                            r as f32
+                        };
+                    }
+                    *xi -= n * p.frequency_penalty as f32;
+                    if n > 0.0 {
+                        *xi -= p.presence_penalty as f32;
+                    }
+                }
+                let mut tok = 0;
+                for i in 1..VOCAB {
+                    if x[i] > x[tok] {
+                        tok = i;
+                    }
+                }
+                let tok = tok as u32;
+                if tok == EOS {
+                    return (ids, true);
+                }
+                ids.push(tok);
+                last = tok;
+            }
+            (ids, false)
+        }
+
+        /// Greedy with processors on every readback arm, the default flow
+        /// with and without the fused publish among them: the ids equal the
+        /// penalized reference and the stream equals the ids. The fused
+        /// publish draws the raw argmax in its own kernel, so a request with
+        /// processors must not take it — on Metal's default arm it would
+        /// return the plain chain.
+        #[test]
+        fn penalties_reach_every_readback_arm() -> Result<()> {
+            let p = Processors {
+                repetition_penalty: 1.25,
+                presence_penalty: 1.5,
+                frequency_penalty: 0.25,
+                min_p: 0.0,
+                logit_bias: vec![(EOS, -2.0), (11, 0.125)],
+            };
+            let prompt: &[u32] = &[5, 1];
+            const MAX: usize = 96;
+            let (want, hit) = penalized_chain(prompt, &p, MAX);
+            assert_ne!(
+                (want.clone(), hit),
+                chain(1, MAX),
+                "the processors changed nothing on this fixture"
+            );
+            // Past the chain's cycle the history penalties pick the tokens, not
+            // the bias alone: a run that never advanced its history differs.
+            let bias_only = Processors {
+                logit_bias: p.logit_bias.clone(),
+                ..Processors::default()
+            };
+            assert_ne!(
+                want,
+                penalized_chain(prompt, &bias_only, MAX).0,
+                "the history penalties changed nothing on this fixture"
+            );
+            let mut arms: Vec<(String, DecodeConfig)> =
+                vec![("default".into(), DecodeConfig::default())];
+            let mut unfused = DecodeConfig::default();
+            unfused.readback.fused_publish = false;
+            arms.push(("default --fused-publish=false".into(), unfused));
+            for s in ReadbackConfig::SPELLINGS {
+                let mut c = DecodeConfig::default();
+                ReadbackConfig::apply_spelling(&mut c.readback, s)
+                    .map_err(lloom_tensor::Error::msg)?;
+                arms.push((s.to_string(), c));
+            }
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                for (arm, config) in &arms {
+                    let mut session = DecodeSession::new(&model, Pos(0), device.clone(), 0)
+                        .with_config(config.clone());
+                    let params = DecodeParams {
+                        max_tokens: MAX,
+                        eos_ids: vec![EOS],
+                        readback: config.readback.arm(),
+                        processors: p.clone(),
+                        ..DecodeParams::default()
+                    };
+                    let mut streamed = String::new();
+                    let got = session.decode(
+                        prompt,
+                        |ids: &[u32]| Ok(text_of(ids)),
+                        &params,
+                        |frag: &str| streamed.push_str(frag),
+                    )?;
+                    let at = format!("{device:?} {arm} ({})", got.readback.name());
+                    assert_eq!(got.tokens, want, "{at}: the ids");
+                    assert_eq!(streamed, text_of(&want), "{at}: the streamed text");
+                    assert_eq!(got.stop, if hit { Stop::Eos } else { Stop::Length }, "{at}");
+                    if device.is_metal() && arm == "default" {
+                        assert!(
+                            matches!(got.readback, ReadbackArm::Ring(_)),
+                            "{at}: processors took the request off the ring"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// The refusal a path that draws without the request's sampler gives
+        /// (`decode_speculative_until`'s first check): it names the path, and
+        /// neutral processors pass. The call site itself is not driven here —
+        /// that needs a `Speculator` + `Probes` fixture.
+        #[test]
+        fn the_processor_refusal_names_the_path() {
+            let mut params = DecodeParams::default();
+            params.processors.min_p = 0.1;
+            let e = params
+                .refuse_processors(
+                    "DecodeSession::decode_speculative",
+                    "the verify accepts the target's raw argmax",
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.starts_with("DecodeSession::decode_speculative does not run logits processors"),
+                "{e}"
+            );
+            assert!(DecodeParams::default().refuse_processors("x", "y").is_ok());
         }
 
         /// One request on a fresh session at `temperature` (and `top_p`), on

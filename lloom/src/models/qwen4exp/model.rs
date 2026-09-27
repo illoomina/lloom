@@ -716,6 +716,7 @@ pub fn decode_hint_on() -> bool {
 /// cut at its PLE layer, in the clock of the Metal profile's command-buffer
 /// records (`lloom_tensor::kernels::metal::profile::now_s`).
 #[derive(Debug, Default)]
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 struct PleWindowMarks {
     entry: Option<f64>,
     marks: Vec<(f64, f64)>,

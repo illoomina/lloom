@@ -2458,6 +2458,95 @@ impl KvQuant {
     }
 }
 
+/// An attention layer's KV store: the [`KvQuant`] arm, and on `Off` the
+/// element dtype the dense cache holds (`DESIGN.md` §10.7).
+///
+/// `Off`'s dtype is a parameter of the `Off` arm rather than a second axis:
+/// LFM2's `Off` stores f16, Qwen4-exp's stores f32, and Qwen4-exp's f16 arm is
+/// `Off` at f16. So the registered axis stays `KvQuant` with its three arms,
+/// and a run line renders the store as `Off:f32` / `Off:f16` — a
+/// parameterised arm that matches on its stem, like `sleep:50`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct KvPrecision {
+    quant: KvQuant,
+    /// The dense store's dtype; meaningful on `Off` only.
+    dense: DType,
+}
+
+impl KvPrecision {
+    /// The dense cache at `dtype` (`KvQuant::Off`).
+    pub const fn dense(dtype: DType) -> Self {
+        Self {
+            quant: KvQuant::Off,
+            dense: dtype,
+        }
+    }
+
+    /// A quantized arm. `Off` is [`Self::dense`]'s, and is refused here.
+    pub fn quantized(quant: KvQuant) -> Result<Self> {
+        if !quant.is_on() {
+            lloom_tensor::bail!(
+                "KvPrecision::quantized(Off): the Off arm names its dtype (`dense`)"
+            )
+        }
+        Ok(Self {
+            quant,
+            dense: DType::F32,
+        })
+    }
+
+    pub fn quant(self) -> KvQuant {
+        self.quant
+    }
+
+    /// The dense store's dtype, or `None` on a quantized arm.
+    pub fn dense_dtype(self) -> Option<DType> {
+        (!self.quant.is_on()).then_some(self.dense)
+    }
+
+    /// Parse a `--kv-quant` value for a family whose `Off` stores `off`:
+    /// `off` is that store, `f32` / `f16` name a dense store explicitly,
+    /// `int8` / `int4` (or `8` / `4`) the quantized arms.
+    pub fn parse(s: &str, off: DType) -> Result<Self> {
+        match s {
+            "off" => Ok(Self::dense(off)),
+            "f32" => Ok(Self::dense(DType::F32)),
+            "f16" => Ok(Self::dense(DType::F16)),
+            other => match KvQuant::parse(other) {
+                Ok(q) if q.is_on() => Self::quantized(q),
+                _ => lloom_tensor::bail!(
+                    "unknown kv-quant {other:?}; expected off, f32, f16, int8 or int4"
+                ),
+            },
+        }
+    }
+
+    /// The arm as a run line renders it: `Off:f32`, `Off:f16`, `Int8`, `Int4`.
+    pub fn name(self) -> String {
+        match self.dense_dtype() {
+            Some(d) => format!("Off:{}", d.as_str()),
+            None => self.quant.name().to_string(),
+        }
+    }
+
+    /// Bytes one token's K and V take in one layer of `n_kv_heads` heads of
+    /// `head_dim`: the dense elements, or the codes plus one (scale, bias)
+    /// pair per head vector at `scale_dtype` — the term that makes int8 more
+    /// than half of a 16-bit store (§10.7a).
+    pub fn bytes_per_token(self, n_kv_heads: usize, head_dim: usize, scale_dtype: DType) -> usize {
+        match self.quant.code_bytes(head_dim) {
+            None => 2 * n_kv_heads * head_dim * self.dense.size_in_bytes(),
+            Some(codes) => 2 * n_kv_heads * (codes + 2 * scale_dtype.size_in_bytes()),
+        }
+    }
+}
+
+impl std::fmt::Debug for KvPrecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name())
+    }
+}
+
 /// Quantize `src` into a caller-owned code plane and scale/bias planes
 /// (issue #218).
 ///
@@ -2471,7 +2560,7 @@ impl KvQuant {
 /// which is what preserves §6.2b's stable buffer identity -- returning fresh
 /// tensors per token would put back the reallocation that section removed.
 ///
-/// Metal only, `head_dim` 64 or 128, f16 or f32. Every other case is an
+/// Metal only, `head_dim` 64, 128 or 256, f16 or f32. Every other case is an
 /// **error rather than a fallback**, per `flash_decoding`'s rule: a silent
 /// fallback is what makes an A/B arm measure the wrong thing (§2.4).
 pub fn quantize_kv_into(
@@ -2726,6 +2815,8 @@ struct SdpaQuant {
     scale: f32,
     softcapping: f32,
     quant: KvQuant,
+    /// The cells to attend over (`u32 [n]`), or `None` for `[0, n)`.
+    sel: Option<Tensor>,
 }
 
 impl lloom_tensor::CustomOp1 for SdpaQuant {
@@ -2813,27 +2904,66 @@ impl lloom_tensor::CustomOp1 for SdpaQuant {
         );
         let params_buf = device.new_buffer_with_data(&[sp])?;
 
+        let sel_guard = match &self.sel {
+            Some(sel) => {
+                if sel.dtype() != DType::U32 || !sel.is_contiguous() || sel.elem_count() != self.n {
+                    lloom_tensor::bail!(
+                        "sdpa_quant: the selection must be {} contiguous u32 cells, got {:?} {:?}",
+                        self.n,
+                        sel.dtype(),
+                        sel.shape()
+                    )
+                }
+                Some((sel.storage_and_layout(), sel.layout().start_offset()))
+            }
+            None => None,
+        };
+
         let encoder = device.command_encoder()?;
         encoder.set_label("sdpa_quant");
 
-        lloom_tensor::kernels::call_sdpa_vector_quant(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            q_l.start_offset() * q.dtype().size_in_bytes(),
-            q_l.dims(),
-            q.buffer(),
-            kc.buffer(),
-            ks.buffer(),
-            kb.buffer(),
-            vc.buffer(),
-            vs.buffer(),
-            vb.buffer(),
-            &output,
-            &params_buf,
-            bits,
-            itype,
-        )
+        match &sel_guard {
+            None => lloom_tensor::kernels::call_sdpa_vector_quant(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                q_l.start_offset() * q.dtype().size_in_bytes(),
+                q_l.dims(),
+                q.buffer(),
+                kc.buffer(),
+                ks.buffer(),
+                kb.buffer(),
+                vc.buffer(),
+                vs.buffer(),
+                vb.buffer(),
+                &output,
+                &params_buf,
+                bits,
+                itype,
+            ),
+            Some(((sel_s, _), sel_offset)) => {
+                let sel_m = metal_buf(sel_s, "sel")?;
+                lloom_tensor::kernels::call_sdpa_vector_quant_sel(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    q_l.start_offset() * q.dtype().size_in_bytes(),
+                    q_l.dims(),
+                    q.buffer(),
+                    kc.buffer(),
+                    ks.buffer(),
+                    kb.buffer(),
+                    vc.buffer(),
+                    vs.buffer(),
+                    vb.buffer(),
+                    &output,
+                    &params_buf,
+                    (sel_m.buffer(), sel_offset * DType::U32.size_in_bytes()),
+                    bits,
+                    itype,
+                )
+            }
+        }
         .map_err(lloom_tensor::Error::wrap)?;
 
         let newstorage =
@@ -2875,6 +3005,44 @@ pub fn sdpa_quant(
         scale,
         softcapping,
         quant,
+        sel: None,
+    })
+}
+
+/// [`sdpa_quant`] over the cells `sel` (`u32 [n_sel]`, each live) instead of
+/// `[0, n)`: attention over a selection of the cache read straight from the
+/// planes (QSA's indexer cells, `DESIGN.md` §10.7). Key `i` is cell `sel[i]`;
+/// the arithmetic per key and the reduction are `sdpa_quant`'s.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_quant_selected(
+    q: &Tensor,
+    k_codes: &Tensor,
+    k_scales: &Tensor,
+    k_biases: &Tensor,
+    v_codes: &Tensor,
+    v_scales: &Tensor,
+    v_biases: &Tensor,
+    sel: &Tensor,
+    gqa_factor: usize,
+    capacity: usize,
+    scale: f32,
+    softcapping: f32,
+    quant: KvQuant,
+) -> Result<Tensor> {
+    q.apply_op1_no_bwd(&SdpaQuant {
+        k_codes: k_codes.clone(),
+        k_scales: k_scales.clone(),
+        k_biases: k_biases.clone(),
+        v_codes: v_codes.clone(),
+        v_scales: v_scales.clone(),
+        v_biases: v_biases.clone(),
+        gqa_factor,
+        n: sel.elem_count(),
+        capacity,
+        scale,
+        softcapping,
+        quant,
+        sel: Some(sel.contiguous()?),
     })
 }
 

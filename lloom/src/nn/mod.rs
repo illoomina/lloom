@@ -33,6 +33,7 @@ pub mod fusion;
 pub mod group_norm;
 pub mod init;
 pub mod kv_cache;
+pub mod kv_quant;
 pub mod layer_norm;
 pub mod linear;
 pub mod loss;

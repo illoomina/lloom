@@ -3,8 +3,15 @@
 //! session reuses the prefix its cache already holds (`Session::prepare`),
 //! so turn N pays for its own tokens. One line on stderr per turn says what
 //! ran: tokens, the steady rate, the readback arm, what was reused.
+//!
+//! Images (`--image`, or `/image PATH` for the next message) ride in the
+//! message as the template's image parts; each `<image>` the template renders
+//! expands to the image's tiles (`vision.rs`). A `[vision: …]` line per turn
+//! says what the process holds — the model's tensors, whether the tower is
+//! loaded — and, under `CANDLE_METAL_PROFILE=1`, the image's dispatch census.
 
 use super::common::{ms, NEVER_EOS};
+use super::vision::{expand_image_tokens, DecodedImage};
 use super::{detect_family, load_engine, Family, ModelArgs, Shape};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -52,6 +59,12 @@ pub struct ChatArgs {
     /// runner feed, so a reply can be compared token for token.
     #[arg(long)]
     pub raw: bool,
+
+    /// An image for the first message (PNG or JPEG), repeatable; in the REPL,
+    /// `/image PATH` attaches one to the next message. A family or
+    /// checkpoint without a vision tower refuses it by name.
+    #[arg(long, value_name = "PATH")]
+    pub image: Vec<std::path::PathBuf>,
 }
 
 /// The reply's token digest in `lfm2-determinism`'s definition: SHA-256 over
@@ -77,6 +90,9 @@ pub fn run(args: ChatArgs) -> Result<()> {
             // top-k) still falls back to the blocking arm per request.
             options.decode.readback.lookahead = 0;
             options.decode.readback.adaptive_commit = false;
+            // Refused here, not by the first turn, if a knob given with
+            // it needs what this `auto` turns off.
+            options.decode.check().map_err(|e| anyhow::anyhow!("{e}"))?;
         }
     }
     // The chat's own default is a long turn; the group's 512 is the server's.
@@ -121,6 +137,18 @@ pub fn run(args: ChatArgs) -> Result<()> {
     if let Some(sys) = &args.system {
         messages.push(json!({ "role": "system", "content": sys }));
     }
+    if args.raw && !args.image.is_empty() {
+        anyhow::bail!("--raw takes a rendered prompt; an image goes through the chat template");
+    }
+    // Every image of the conversation, in order, and those waiting for the
+    // next message.
+    let mut images: Vec<DecodedImage> = Vec::new();
+    let mut pending: Vec<DecodedImage> = Vec::new();
+    for path in &args.image {
+        let img = DecodedImage::open(path)?;
+        engine.image_placeholder(&img)?;
+        pending.push(img);
+    }
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let mut turn = 0usize;
@@ -150,34 +178,76 @@ pub fn run(args: ChatArgs) -> Result<()> {
         if user == "/quit" || user == "/exit" {
             break;
         }
+        if let Some(path) = user.strip_prefix("/image ") {
+            if args.raw {
+                eprintln!(
+                    "[--raw takes a rendered prompt; an image goes through the chat template]"
+                );
+                continue;
+            }
+            match DecodedImage::open(std::path::Path::new(path.trim()))
+                .and_then(|img| engine.image_placeholder(&img).map(|_| img))
+            {
+                Ok(img) => {
+                    eprintln!(
+                        "[image {}x{} attached to your next message]",
+                        img.width, img.height
+                    );
+                    pending.push(img);
+                }
+                Err(e) => eprintln!("[image refused: {e:#}]"),
+            }
+            continue;
+        }
         turn += 1;
-        messages.push(json!({ "role": "user", "content": user }));
+        if pending.is_empty() {
+            messages.push(json!({ "role": "user", "content": user }));
+        } else {
+            let mut parts: Vec<Value> =
+                pending.iter().map(|_| json!({ "type": "image" })).collect();
+            parts.push(json!({ "type": "text", "text": user }));
+            messages.push(json!({ "role": "user", "content": parts }));
+            images.append(&mut pending);
+        }
         let rendered = if args.raw {
             user.clone()
         } else {
             engine.render_chat(&json!(messages), Some(&kwargs))?
         };
+        let rendered = if images.is_empty() {
+            rendered
+        } else {
+            let expansions = images
+                .iter()
+                .map(|img| engine.image_placeholder(img))
+                .collect::<Result<Vec<_>>>()?;
+            expand_image_tokens(&rendered, &expansions)?
+        };
         let ids = engine.encode(&rendered, true)?;
         let params = sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
         let started = Instant::now();
         let mut first_at: Option<f64> = None;
-        let decoded = engine
-            .complete_until(&ids, &params, &mut |frag| {
-                if first_at.is_none() {
-                    first_at = Some(ms(started.elapsed()));
-                }
-                print!("{frag}");
-                let _ = std::io::stdout().flush();
-                true
-            })
-            .context("decoding the turn")?;
+        let mut on_fragment = |frag: &str| {
+            if first_at.is_none() {
+                first_at = Some(ms(started.elapsed()));
+            }
+            print!("{frag}");
+            let _ = std::io::stdout().flush();
+            true
+        };
+        let decoded = if images.is_empty() {
+            engine.complete_until(&ids, &params, &mut on_fragment)
+        } else {
+            engine.complete_images_until(&ids, &images, &params, &mut on_fragment)
+        }
+        .context("decoding the turn")?;
         println!();
         messages.push(json!({ "role": "assistant", "content": decoded.text }));
         let st = &decoded.stats;
         let wall = ms(started.elapsed());
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -191,7 +261,12 @@ pub fn run(args: ChatArgs) -> Result<()> {
             st.commits,
             st.overrun,
             tokens_sha256(&decoded.tokens),
+            tokens_sha256(&ids),
         );
+        let report = engine.vision_report();
+        if !report.is_null() {
+            eprintln!("[vision: {report}]");
+        }
         let _ = NEVER_EOS;
     }
     engine.shutdown();

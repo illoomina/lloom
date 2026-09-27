@@ -27,6 +27,7 @@ use super::model::{Cache, Layer, Qwen4Exp};
 use super::moe::ExpertResidency;
 use crate::nn::speculator::{
     accept_prefix, Anchor, Draft, DraftTokens, KvSource, NextnHidden, Probes, SeqId, Speculator,
+    VerifyRowRef,
 };
 use crate::nn::{CausalLM, RmsNorm};
 use lloom_tensor::quantized::QMatMul;
@@ -134,18 +135,15 @@ impl<R: ExpertResidency> MtpHead<R> {
 }
 
 /// The MTP drafter: one token per round from the target's carry at the last
-/// accepted position, re-keyed from every accepted row.
+/// accepted position, re-keyed from every accepted row. One [`MtpLane`] per
+/// sequence it drafts for.
 pub struct MtpDrafter<'a, R: ExpertResidency> {
     head: &'a MtpHead<R>,
     /// The target's `token_embd` (shared, `mtp_use_dedicated_embeddings false`).
     embed: &'a QMatMul,
     /// The target's `lm_head` (shared).
     lm_head: &'a QMatMul,
-    cache: Cache,
     device: Device,
-    prompt: Vec<u32>,
-    seeded: bool,
-    draft: Option<u32>,
     /// Tokens proposed per round: the first from the target's carry at the
     /// last accepted position, each further one from the MTP layer re-applied
     /// on its own `multi` output with the previous draft's embedding (vLLM's
@@ -153,13 +151,37 @@ pub struct MtpDrafter<'a, R: ExpertResidency> {
     /// re-applications run under a window on the layer's own cache and are
     /// rewound: only observed rows key it.
     k: usize,
+    lanes: Vec<MtpLane>,
+}
+
+/// What the drafter keeps for one sequence: the MTP layer's cache and where
+/// the sequence's drafting stands.
+struct MtpLane {
+    cache: Cache,
+    prompt: Vec<u32>,
+    seeded: bool,
+    draft: Option<u32>,
     /// The MTP layer's pre-collapse carry after the last observed row — the
     /// state a second draft step continues from.
     multi: Option<Tensor>,
     rows_seen: usize,
 }
 
+impl MtpLane {
+    fn new(cfg: &Config) -> Self {
+        Self {
+            cache: Cache::with_layers(cfg, 1),
+            prompt: Vec::new(),
+            seeded: false,
+            draft: None,
+            multi: None,
+            rows_seen: 0,
+        }
+    }
+}
+
 impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
+    /// A drafter for one sequence (`SeqId(0)`).
     pub fn new(
         head: &'a MtpHead<R>,
         embed: &'a QMatMul,
@@ -167,18 +189,26 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
         cfg: &Config,
         device: &Device,
     ) -> Self {
+        Self::with_seqs(head, embed, lm_head, cfg, device, 1)
+    }
+
+    /// A drafter for `n` sequences, `SeqId(0..n)`, each with its own MTP
+    /// cache — the batched speculative loop's drafter (`decode_spec_batched`).
+    pub fn with_seqs(
+        head: &'a MtpHead<R>,
+        embed: &'a QMatMul,
+        lm_head: &'a QMatMul,
+        cfg: &Config,
+        device: &Device,
+        n: usize,
+    ) -> Self {
         Self {
             head,
             embed,
             lm_head,
-            cache: Cache::with_layers(cfg, 1),
             device: device.clone(),
-            prompt: Vec::new(),
-            seeded: false,
-            draft: None,
             k: 1,
-            multi: None,
-            rows_seen: 0,
+            lanes: (0..n.max(1)).map(|_| MtpLane::new(cfg)).collect(),
         }
     }
 
@@ -193,72 +223,54 @@ impl<'a, R: ExpertResidency> MtpDrafter<'a, R> {
         self.k
     }
 
-    /// Positions the MTP layer has been keyed with.
+    /// Positions the MTP layer has been keyed with, over every sequence.
     pub fn rows_seen(&self) -> usize {
-        self.rows_seen
+        self.lanes.iter().map(|l| l.rows_seen).sum()
     }
 
-    /// The MTP layer's cache (its KV), for a probe.
+    /// Positions sequence `seq`'s MTP cache has been keyed with.
+    pub fn seq_rows_seen(&self, seq: SeqId) -> usize {
+        self.lanes.get(seq.0).map_or(0, |l| l.rows_seen)
+    }
+
+    /// Sequence 0's MTP-layer cache (its KV), for a probe.
     pub fn cache(&self) -> &Cache {
-        &self.cache
-    }
-}
-
-impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
-    type Probe = NextnHidden;
-
-    fn n_seq(&self) -> usize {
-        1
+        &self.lanes[0].cache
     }
 
-    fn kv_source(&self) -> KvSource {
-        KvSource::Own
+    fn lane(&mut self, seq: SeqId) -> Result<&mut MtpLane> {
+        let n = self.lanes.len();
+        self.lanes.get_mut(seq.0).ok_or_else(|| {
+            lloom_tensor::Error::msg(format!(
+                "MtpDrafter serves {n} sequence(s), got {seq:?}"
+            ))
+        })
     }
 
-    fn max_draft(&self) -> usize {
-        self.k
-    }
-
-    fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
-        if seq.0 != 0 {
-            lloom_tensor::bail!("MtpDrafter serves one sequence (SeqId(0)), got {:?}", seq)
-        }
-        self.cache.reset();
-        self.prompt = prompt.to_vec();
-        self.seeded = false;
-        self.draft = None;
-        self.multi = None;
-        self.rows_seen = 0;
-        Ok(())
-    }
-
-    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
-        if active.len() != 1 {
-            lloom_tensor::bail!(
-                "MtpDrafter drafts for one sequence, asked for {}",
-                active.len()
-            )
-        }
+    /// One sequence's draft: the carry's token, then `k − 1` re-applications.
+    fn draft_one(&mut self, seq: SeqId) -> Result<Vec<u32>> {
+        let (head, embed, lm_head, k) = (self.head, self.embed, self.lm_head, self.k);
+        let device = self.device.clone();
+        let lane = self.lane(seq)?;
         // Before the first `observe` there is no carry to draft from; propose
         // id 0 — any proposal is corrected by the verify.
-        let first = self.draft.unwrap_or(0);
+        let first = lane.draft.unwrap_or(0);
         let mut tokens = vec![first];
-        if self.k > 1 {
-            if let Some(multi0) = self.multi.clone() {
+        if k > 1 {
+            if let Some(multi0) = lane.multi.clone() {
                 // The layer re-applied on its own carry with the previous
                 // draft's embedding, `k − 1` times, under a window rewound
                 // after: the layer's cache keeps only what `observe` keyed.
-                self.cache.open_window()?;
+                lane.cache.open_window()?;
                 let mut multi = multi0;
                 let mut result = Ok(());
-                for _ in 1..self.k {
+                for _ in 1..k {
                     let prev = *tokens.last().expect("one token");
-                    let toks = Tensor::from_vec(vec![prev], (1, 1), &self.device)?;
+                    let toks = Tensor::from_vec(vec![prev], (1, 1), &device)?;
                     let step = (|| -> Result<u32> {
-                        let emb = self.embed.embedding(&toks)?;
-                        let (sample, next_multi) =
-                            self.head.forward(&multi, &emb, &mut self.cache)?;
-                        let logits = self.lm_head.forward(&sample)?;
+                        let emb = embed.embedding(&toks)?;
+                        let (sample, next_multi) = head.forward(&multi, &emb, &mut lane.cache)?;
+                        let logits = lm_head.forward(&sample)?;
                         let next = logits
                             .flatten_all()?
                             .argmax(D::Minus1)?
@@ -274,11 +286,45 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
                         }
                     }
                 }
-                self.cache.rewind_window()?;
+                lane.cache.rewind_window()?;
                 result?;
             }
         }
-        Ok(vec![Draft::host(tokens)])
+        Ok(tokens)
+    }
+}
+
+impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
+    type Probe = NextnHidden;
+
+    fn n_seq(&self) -> usize {
+        self.lanes.len()
+    }
+
+    fn kv_source(&self) -> KvSource {
+        KvSource::Own
+    }
+
+    fn max_draft(&self) -> usize {
+        self.k
+    }
+
+    fn begin(&mut self, seq: SeqId, prompt: &[u32]) -> Result<()> {
+        let lane = self.lane(seq)?;
+        lane.cache.reset();
+        lane.prompt = prompt.to_vec();
+        lane.seeded = false;
+        lane.draft = None;
+        lane.multi = None;
+        lane.rows_seen = 0;
+        Ok(())
+    }
+
+    fn draft(&mut self, active: &[SeqId]) -> Result<Vec<Draft>> {
+        active
+            .iter()
+            .map(|&seq| Ok(Draft::host(self.draft_one(seq)?)))
+            .collect()
     }
 
     /// `probe [1, a, n·d]` = the target's carries at the `a` positions the
@@ -286,14 +332,17 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
     /// (the token that follows each). Row `i` pairs with the token that follows
     /// it: after the prefill that is the prompt's next token for all but the
     /// last row, and the accepted anchor for the last.
-    fn observe(&mut self, _seq: SeqId, probe: &Tensor, accepted: &[u32]) -> Result<()> {
+    fn observe(&mut self, seq: SeqId, probe: &Tensor, accepted: &[u32]) -> Result<()> {
         let a = probe.dim(1)?;
         if a == 0 {
             return Ok(());
         }
-        let nexts: Vec<u32> = if !self.seeded {
-            self.seeded = true;
-            let mut v: Vec<u32> = self.prompt.iter().skip(1).copied().collect();
+        let (head, embed, lm_head) = (self.head, self.embed, self.lm_head);
+        let device = self.device.clone();
+        let lane = self.lane(seq)?;
+        let nexts: Vec<u32> = if !lane.seeded {
+            lane.seeded = true;
+            let mut v: Vec<u32> = lane.prompt.iter().skip(1).copied().collect();
             v.extend_from_slice(accepted);
             v
         } else {
@@ -303,25 +352,26 @@ impl<R: ExpertResidency> Speculator for MtpDrafter<'_, R> {
             lloom_tensor::bail!(
                 "MtpDrafter::observe: {a} probe rows but {} next tokens (prompt {}, accepted {})",
                 nexts.len(),
-                self.prompt.len(),
+                lane.prompt.len(),
                 accepted.len()
             )
         }
-        if mtp_probe() && self.rows_seen == 0 {
-            self.probe_prefill_rows(probe, &nexts)?;
+        if mtp_probe() && lane.rows_seen == 0 {
+            self.probe_prefill_rows(seq, probe, &nexts)?;
         }
-        let toks = Tensor::from_vec(nexts, (1, a), &self.device)?;
-        let emb = self.embed.embedding(&toks)?; // [1, a, d]
-        let (sample, multi) = self.head.forward(probe, &emb, &mut self.cache)?;
-        self.multi = Some(multi.narrow(1, a - 1, 1)?);
+        let lane = self.lane(seq)?;
+        let toks = Tensor::from_vec(nexts, (1, a), &device)?;
+        let emb = embed.embedding(&toks)?; // [1, a, d]
+        let (sample, multi) = head.forward(probe, &emb, &mut lane.cache)?;
+        lane.multi = Some(multi.narrow(1, a - 1, 1)?);
         let last = sample.narrow(1, a - 1, 1)?;
-        let logits = self.lm_head.forward(&last)?; // [1, 1, vocab]
+        let logits = lm_head.forward(&last)?; // [1, 1, vocab]
         let next = logits
             .flatten_all()?
             .argmax(D::Minus1)?
             .to_scalar::<u32>()?;
-        self.draft = Some(next);
-        self.rows_seen += a;
+        lane.draft = Some(next);
+        lane.rows_seen += a;
         Ok(())
     }
 }
@@ -338,12 +388,13 @@ impl<R: ExpertResidency> MtpDrafter<'_, R> {
     /// defect (`off-by-one`: the row's own token in place of its next;
     /// `swap-eh`: the `eh_proj` halves exchanged; `zero-embed` /
     /// `zero-hidden`: one input path silenced).
-    fn probe_prefill_rows(&mut self, probe: &Tensor, nexts: &[u32]) -> Result<()> {
+    fn probe_prefill_rows(&mut self, seq: SeqId, probe: &Tensor, nexts: &[u32]) -> Result<()> {
         let a = nexts.len();
-        if a < 3 || a > self.prompt.len() {
+        let prompt = self.lane(seq)?.prompt.clone();
+        if a < 3 || a > prompt.len() {
             return Ok(());
         }
-        let own: Vec<u32> = self.prompt[..a].to_vec(); // the rows' own tokens
+        let own: Vec<u32> = prompt[..a].to_vec(); // the rows' own tokens
         let zeros_e = Tensor::zeros((1, a, self.head.d), probe.dtype(), &self.device)?;
         let zeros_h = probe.zeros_like()?;
         let emb_of = |toks: &[u32]| -> Result<Tensor> {
@@ -357,16 +408,16 @@ impl<R: ExpertResidency> MtpDrafter<'_, R> {
             ("zero-embed", probe.clone(), zeros_e, false),
             ("zero-hidden", zeros_h, emb_of(nexts)?, false),
         ];
+        let (head, lm_head) = (self.head, self.lm_head);
         for (name, hidden, emb, swap) in variants {
-            self.cache.open_window()?;
+            let lane = self.lane(seq)?;
+            lane.cache.open_window()?;
             let run = (|| -> Result<Vec<u32>> {
-                let (sample, _) = self
-                    .head
-                    .forward_with(&hidden, &emb, &mut self.cache, swap)?;
-                let logits = self.lm_head.forward(&sample)?; // [1, a, vocab]
+                let (sample, _) = head.forward_with(&hidden, &emb, &mut lane.cache, swap)?;
+                let logits = lm_head.forward(&sample)?; // [1, a, vocab]
                 logits.squeeze(0)?.argmax(D::Minus1)?.to_vec1::<u32>()
             })();
-            self.cache.rewind_window()?;
+            lane.cache.rewind_window()?;
             let arg = run?;
             // Row i's target: the token after its next token = nexts[i + 1]
             // (the last row has none).
@@ -449,8 +500,47 @@ impl<R: ExpertResidency> Probes<NextnHidden> for Qwen4Exp<R> {
     }
 
     type Pending = MtpPending;
-    /// No batched verify (B=1 here); the trait's default refuses.
-    type PendingRows = ();
+    /// One [`MtpPending`] per row, in row order.
+    type PendingRows = Vec<MtpPending>;
+
+    /// Every row's window through [`Self::verify_enqueue`] against its own
+    /// cache, one after another: a row verifies exactly as it would alone, so
+    /// each row's stream is its greedy stream. Not one weight sweep for the
+    /// rows — the windows are separate passes (`batched-decode-design.md`
+    /// §12.4 describes the ragged pass this is not).
+    fn verify_rows_enqueue(
+        &self,
+        rows: &mut [VerifyRowRef<'_, Self::Cache>],
+    ) -> Result<Vec<MtpPending>> {
+        if rows.is_empty() {
+            lloom_tensor::bail!("qwen4exp verify_rows_enqueue: no rows")
+        }
+        rows.iter_mut()
+            .map(|r| self.verify_enqueue(r.draft, &r.anchor, r.cache))
+            .collect()
+    }
+
+    fn verify_rows_complete(
+        &self,
+        pending: Vec<MtpPending>,
+        caches: &mut [&mut Self::Cache],
+        eos_sets: &[&[u32]],
+    ) -> Result<Vec<(Vec<u32>, Tensor)>> {
+        if pending.len() != caches.len() || pending.len() != eos_sets.len() {
+            lloom_tensor::bail!(
+                "qwen4exp verify_rows_complete: {} pending, {} caches, {} EOS sets",
+                pending.len(),
+                caches.len(),
+                eos_sets.len()
+            )
+        }
+        pending
+            .into_iter()
+            .zip(caches.iter_mut())
+            .zip(eos_sets)
+            .map(|((p, c), eos)| self.verify_complete(p, c, eos))
+            .collect()
+    }
 
     /// The window `[anchor, proposed…]` as `k + 1` sequential decode steps
     /// inside an open cache window, the per-position argmax read back once.

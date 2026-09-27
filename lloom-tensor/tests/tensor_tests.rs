@@ -2201,9 +2201,10 @@ fn transfers_cuda_to_device() -> Result<()> {
 #[cfg(feature = "cuda")]
 #[test]
 fn allocates_twice_when_transferring_to_same_device() -> Result<()> {
-    use std::{ops::Deref, sync::RwLockReadGuard};
+    use std::ops::Deref;
 
     use lloom_tensor::Storage;
+    use parking_lot::RwLockReadGuard;
     use rand::seq::SliceRandom;
 
     let first = Device::new_cuda(0)?;

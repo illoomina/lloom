@@ -21,8 +21,9 @@
 
 use super::common::{
     lock, model_name_from_dir, ms, newest_snapshot, open_device, profile_reset, profile_take,
-    DecodeTiming, MemGauge, MemReport, PrefillTiming, Text, NEVER_EOS,
+    DecodeTiming, MemGauge, MemReport, MemSnapshot, PrefillTiming, Text, NEVER_EOS,
 };
+use super::vision::{take_window, DecodedImage, ImageCensus, ImageRows};
 use crate::{
     ring_eos_read, spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRequest,
     DecodeParams, DecodeSession, Decoded, Idle, ReadbackArm, RingPool, RowSpec, SlotPool, Stop,
@@ -36,7 +37,9 @@ use lloom::models::lfm2::{
     QkvLayout,
 };
 use lloom::models::lfm2_dspark::{CtxKv, DSparkConfig, DSparkDrafter, DSparkSpeculator};
-use lloom::nn::{DecodeOptions, DecodeOut, Sequence, Session, VarBuilder};
+use lloom::models::lfm2_vl::{ImageProcessor, Lfm2VlConfig, VisionEncoder};
+use lloom::nn::var_builder::{LoadRecord, RecordingBackend};
+use lloom::nn::{DecodeOptions, DecodeOut, ReuseAction, Sequence, Session, VarBuilder};
 use lloom_tensor::{DType, Device, Tensor, D};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -61,6 +64,95 @@ struct Single {
     spec: Option<DSparkSpeculator>,
     /// The loop's options, handed to every request's session.
     decode: crate::DecodeConfig,
+    /// The images whose rows the held sequence's image positions carry, in
+    /// order. A cached prefix is reused only across the same images: the
+    /// `<image>` ids of two different images are identical.
+    image_keys: Vec<[u8; 32]>,
+}
+
+/// The vision half of an LFM2-VL checkpoint: its config and preprocessing
+/// from load, the tower and projector only once an image arrives, so a
+/// process that never sees one holds the language model's tensors alone
+/// (`DESIGN.md` §5.5a).
+pub struct Vision {
+    config: Lfm2VlConfig,
+    processor: ImageProcessor,
+    files: Vec<PathBuf>,
+    dtype: DType,
+    text_hidden: usize,
+    tower: Mutex<Option<Tower>>,
+}
+
+/// The tower and projector once loaded, and what loading them cost.
+struct Tower {
+    encoder: Arc<VisionEncoder>,
+    record: LoadRecord,
+    load_ms: f64,
+    pool_delta: i64,
+}
+
+impl Vision {
+    /// The encoder, loading it on first use.
+    fn encoder(&self, device: &Device) -> Result<Arc<VisionEncoder>> {
+        let mut tower = lock(&self.tower);
+        if let Some(t) = tower.as_ref() {
+            return Ok(Arc::clone(&t.encoder));
+        }
+        device.synchronize()?;
+        let before = MemSnapshot::read(device).pool_live as i64;
+        let start = Instant::now();
+        // SAFETY: the checkpoint is not modified while mapped, the contract
+        // the language model's own load relies on.
+        let (backend, record) = unsafe { RecordingBackend::over_safetensors(&self.files)? };
+        let vb = VarBuilder::from_backend(Box::new(backend), self.dtype, device.clone());
+        let encoder = VisionEncoder::new(&self.config, self.text_hidden, vb)
+            .context("loading the vision tower and projector")?;
+        device.synchronize()?;
+        let t = Tower {
+            encoder: Arc::new(encoder),
+            record,
+            load_ms: ms(start.elapsed()),
+            pool_delta: MemSnapshot::read(device).pool_live as i64 - before,
+        };
+        let encoder = Arc::clone(&t.encoder);
+        *tower = Some(t);
+        Ok(encoder)
+    }
+
+    fn tower_json(&self) -> Value {
+        match lock(&self.tower).as_ref() {
+            None => json!({ "loaded": false }),
+            Some(t) => {
+                let (n, bytes) = t.record.totals();
+                json!({
+                    "loaded": true,
+                    "tensors": n,
+                    "bytes": bytes,
+                    "load_ms": t.load_ms,
+                    "pool_delta_bytes": t.pool_delta,
+                })
+            }
+        }
+    }
+}
+
+/// The two ways a VL checkpoint differs from a text one on disk: the language
+/// config nests under `text_config` (with the token ids beside it at the top
+/// level), and the language tensors under `model.language_model.`.
+fn text_config_of(root: &Value) -> Result<Lfm2Config> {
+    let mut text = root
+        .get("text_config")
+        .and_then(Value::as_object)
+        .context("config.json: a vision_config without a text_config")?
+        .clone();
+    for key in ["bos_token_id", "eos_token_id"] {
+        if !text.contains_key(key) {
+            if let Some(v) = root.get(key) {
+                text.insert(key.into(), v.clone());
+            }
+        }
+    }
+    serde_json::from_value(Value::Object(text)).context("parsing config.json's text_config")
 }
 
 /// The batch thread's ONE drafter (`--dspark --batch N`). On the pool arms
@@ -142,6 +234,12 @@ pub struct Engine {
     pub pool: Option<BatchPool>,
     /// `--share-prefix`.
     pub share_prefix: bool,
+    /// The language model's load: which of the checkpoint's tensors it named.
+    pub lm_record: LoadRecord,
+    /// The vision half, on a VL checkpoint.
+    pub vision: Option<Vision>,
+    /// What the last request loaded and encoded (`Served::vision_report`).
+    last_vision: Mutex<Value>,
     single: Mutex<Single>,
     sched: Option<BatchHandle<Model, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -283,9 +381,14 @@ impl Engine {
 
         let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
-        let config: Lfm2Config =
-            serde_json::from_slice(&std::fs::read(model_dir.join("config.json"))?)
-                .context("parsing config.json")?;
+        let config_bytes = std::fs::read(model_dir.join("config.json"))?;
+        let root: Value = serde_json::from_slice(&config_bytes).context("parsing config.json")?;
+        let vl = root.get("vision_config").is_some();
+        let config: Lfm2Config = if vl {
+            text_config_of(&root)?
+        } else {
+            serde_json::from_slice(&config_bytes).context("parsing config.json")?
+        };
         let mut config = config.into_config(false);
 
         // The drafter's config first: the target's cache arms depend on it
@@ -415,8 +518,35 @@ impl Engine {
         }
 
         let files = weight_files(&model_dir)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
+        // SAFETY: the checkpoint is not modified while mapped
+        // (`VarBuilder::from_mmaped_safetensors`'s contract; this is that
+        // backend with a flag per tensor set on load).
+        let (backend, lm_record) = unsafe { RecordingBackend::over_safetensors(&files)? };
+        let vb = VarBuilder::from_backend(Box::new(backend), dtype, device.clone());
+        let vb = if vl {
+            vb.rename_f(|name: &str| match name.strip_prefix("model.") {
+                Some(rest) => format!("model.language_model.{rest}"),
+                None => name.to_string(),
+            })
+        } else {
+            vb
+        };
         let model = Model::new(&config, vb).context("constructing LFM2")?;
+        let vision = if vl {
+            let vl_config: Lfm2VlConfig = serde_json::from_value(root.clone())
+                .context("parsing config.json's vision half")?;
+            Some(Vision {
+                processor: ImageProcessor::from_checkpoint(&model_dir)
+                    .map_err(|e| anyhow::anyhow!("the image preprocessing: {e}"))?,
+                config: vl_config,
+                files: files.clone(),
+                dtype,
+                text_hidden: config.hidden_size,
+                tower: Mutex::new(None),
+            })
+        } else {
+            None
+        };
         let make_cache = |device: &Device| {
             let mut cache = Cache::new_with(true, dtype, &config, device, opts.kv_capacity)
                 .context("allocating the KV cache")?
@@ -505,11 +635,15 @@ impl Engine {
             },
             pool: None,
             share_prefix: opts.share_prefix && opts.batch > 1 && opts.rows.pooled(),
+            lm_record,
+            vision,
+            last_vision: Mutex::new(Value::Null),
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
                 spec: None,
                 decode: opts.decode.clone(),
+                image_keys: Vec::new(),
             }),
             sched: None,
             sched_thread: Mutex::new(None),
@@ -904,12 +1038,28 @@ impl Engine {
         on_fragment: impl FnMut(&str) -> bool + Send,
     ) -> Result<Decoded> {
         self.check_fits(prompt_ids.len(), params.max_tokens)?;
+        if let Some(v) = &self.vision {
+            let n = prompt_ids
+                .iter()
+                .filter(|&&t| t == v.config.image_token_id)
+                .count();
+            if n > 0 {
+                anyhow::bail!(
+                    "the prompt holds {n} image position(s) (`<image>`) and no image is attached"
+                );
+            }
+        }
+        *lock(&self.last_vision) = self.load_json(0);
         if let Some(sched) = &self.sched {
             return self.complete_batched(sched, prompt_ids, params, on_fragment);
         }
         let reuse = self.reuse_prefix;
         let detok = self.detok();
-        self.with_single(|s, spec| {
+        let mut single = lock(&self.single);
+        // A text prompt holds no image position, so neither does what it
+        // leaves in the cache.
+        single.image_keys.clear();
+        single.with_session(&self.core, |s, spec| {
             if !reuse {
                 s.reset();
             }
@@ -922,6 +1072,244 @@ impl Engine {
                     .map_err(anyhow::Error::from),
             }
         })
+    }
+
+    /// What this process has loaded, for the per-request report: the language
+    /// model's tensors (266 on LFM2.5-VL-3B, whatever the request) and whether
+    /// the vision tower is resident.
+    fn load_json(&self, images: usize) -> Value {
+        let (tensors, bytes) = self.lm_record.totals();
+        json!({
+            "family": "lfm2",
+            "model_tensors": tensors,
+            "model_bytes": bytes,
+            "tower": match &self.vision {
+                Some(v) => v.tower_json(),
+                None => json!("none: the checkpoint has no vision_config"),
+            },
+            "images": images,
+        })
+    }
+
+    /// The refusal for an image on a checkpoint without a tower.
+    fn no_tower(&self) -> anyhow::Error {
+        anyhow::anyhow!(
+            "{} has no vision tower: its config.json names no vision_config (an LFM2-VL \
+             checkpoint such as LiquidAI/LFM2.5-VL-3B carries one)",
+            self.model_name
+        )
+    }
+
+    /// The expansion of one image's `<image>`: its layout's delimiters and
+    /// token runs (`Lfm2VlProcessor`).
+    pub fn image_placeholder(&self, image: &DecodedImage) -> Result<String> {
+        let v = self.vision.as_ref().ok_or_else(|| self.no_tower())?;
+        let layout = v.processor.layout(image.height, image.width);
+        Ok(v.processor
+            .placeholder(&layout, v.config.use_image_special_tokens))
+    }
+
+    /// A request whose image positions take `images`' rows, in order.
+    ///
+    /// The tower loads on the first image (before the census windows open,
+    /// so its weight uploads are not counted as encode dispatches). Then, on
+    /// the one held sequence: keep the cached prefix when this request extends
+    /// it with the same images (`Single::image_keys`), encode only the images
+    /// whose rows are not in it, prefill the rest through [`ImageRows`], and
+    /// decode from the logits the prefill held. Three recorder windows —
+    /// encode, prefill, decode — make the dispatch census under
+    /// `CANDLE_METAL_PROFILE=1` (`lfm2-vl --census`'s check, on this path).
+    ///
+    /// `--batch N` and `--dspark` are refused: their prefills feed token ids
+    /// to the model directly, and neither has an image seam (#784 scope).
+    pub fn complete_images_until(
+        &self,
+        prompt_ids: &[u32],
+        images: &[DecodedImage],
+        params: &DecodeParams,
+        on_fragment: impl FnMut(&str) -> bool + Send,
+    ) -> Result<Decoded> {
+        let v = self.vision.as_ref().ok_or_else(|| self.no_tower())?;
+        if images.is_empty() {
+            return self.complete_until(prompt_ids, params, on_fragment);
+        }
+        if self.sched.is_some() {
+            anyhow::bail!(
+                "image input at --batch {} is not built: the scheduler's rows prefill token ids \
+                 (serve images at --batch 1)",
+                self.batch
+            );
+        }
+        if self.dspark_k.is_some() {
+            anyhow::bail!(
+                "image input under --dspark is not built: the speculative prefill feeds token ids"
+            );
+        }
+        self.check_fits(prompt_ids.len(), params.max_tokens)?;
+        let image_token = v.config.image_token_id;
+        let rows_of: Vec<usize> = images
+            .iter()
+            .map(|im| {
+                v.processor
+                    .image_tokens(&v.processor.layout(im.height, im.width))
+            })
+            .collect();
+        let total: usize = rows_of.iter().sum();
+        let reserved = prompt_ids.iter().filter(|&&t| t == image_token).count();
+        if reserved != total {
+            anyhow::bail!(
+                "the prompt reserves {reserved} image position(s) and its {} image(s) take {total}",
+                images.len()
+            );
+        }
+        let keys: Vec<[u8; 32]> = images.iter().map(|im| im.key).collect();
+        let device = self.core.device.clone();
+        let encoder = v.encoder(&device)?;
+
+        let mut single = lock(&self.single);
+        let start = {
+            let seq = single
+                .seq
+                .as_ref()
+                .context("the sequence is checked out — a previous request panicked mid-decode")?;
+            let cached = seq.tokens();
+            let extends = self.reuse_prefix
+                && seq.pos() == cached.len()
+                && cached.len() < prompt_ids.len()
+                && prompt_ids.starts_with(cached);
+            // The images whose rows the kept prefix already holds must be
+            // these images, in this order.
+            let held_rows = cached.iter().filter(|&&t| t == image_token).count();
+            let (mut k, mut rows) = (0, 0);
+            while k < rows_of.len() && rows < held_rows {
+                rows += rows_of[k];
+                k += 1;
+            }
+            let same_images = single.image_keys.len() >= k && single.image_keys[..k] == keys[..k];
+            if extends && same_images {
+                cached.len()
+            } else {
+                0
+            }
+        };
+        // Encode every image with a row at or past `start`.
+        let rows_kept = prompt_ids[..start]
+            .iter()
+            .filter(|&&t| t == image_token)
+            .count();
+        let (mut first, mut first_rank) = (0, 0);
+        while first < rows_of.len() && first_rank + rows_of[first] <= rows_kept {
+            first_rank += rows_of[first];
+            first += 1;
+        }
+        let prepared = images[first..]
+            .iter()
+            .map(|im| {
+                v.processor
+                    .prepare_rgb8(&im.rgb, im.height, im.width, &device, v.dtype)
+                    .map_err(|e| {
+                        anyhow::anyhow!("preparing a {}x{} image: {e}", im.height, im.width)
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let tiles: usize = prepared.iter().map(|p| p.tiles.len()).sum();
+        // The encode window holds the tower and the projector only: the
+        // patches' upload and cast are the preprocessing's, as in `lfm2-vl
+        // --census`.
+        take_window(&device)?;
+        let mut parts = Vec::with_capacity(prepared.len());
+        for p in &prepared {
+            parts.push(encoder.encode_image(p).context("encoding the image")?);
+        }
+        let encode_w = take_window(&device)?;
+
+        let detok = self.detok();
+        let features = match parts.len() {
+            0 => None,
+            1 => parts.pop(),
+            _ => Some(Tensor::cat(&parts, 0)?),
+        };
+        let mut rows_placed = 0;
+        let run = match features {
+            Some(features) => {
+                let lm = ImageRows::new(
+                    &self.core.model,
+                    prompt_ids.to_vec(),
+                    image_token,
+                    features,
+                    first_rank,
+                );
+                let seq = single.seq.take().context("the sequence is checked out")?;
+                let rings = single.rings.take().unwrap_or_default();
+                let mut s = DecodeSession::from_parts(&lm, seq, device.clone(), rings)
+                    .with_config(single.decode.clone());
+                if start == 0 {
+                    s.reset();
+                }
+                let run = (|| -> Result<_> {
+                    let pre = s.prefill(&prompt_ids[start..], params)?;
+                    let prefill_w = take_window(&device)?;
+                    let d = s.decode_until(prompt_ids, detok, params, on_fragment)?;
+                    let decode_w = take_window(&device)?;
+                    Ok((d, pre, prefill_w, decode_w))
+                })();
+                let (seq, rings) = s.into_parts();
+                single.seq = Some(seq);
+                single.rings = Some(rings);
+                rows_placed = lm.spliced();
+                run
+            }
+            // Every image row is in the kept prefix: the rest is text.
+            None => single.with_session(&self.core, |s, _| {
+                let pre = s.prefill(&prompt_ids[start..], params)?;
+                let prefill_w = take_window(&device)?;
+                let d = s.decode_until(prompt_ids, detok, params, on_fragment)?;
+                let decode_w = take_window(&device)?;
+                Ok((d, pre, prefill_w, decode_w))
+            }),
+        };
+        let (mut decoded, pre, prefill_w, decode_w) = match run {
+            Ok(r) => r,
+            Err(e) => {
+                single.image_keys.clear();
+                return Err(e);
+            }
+        };
+        single.image_keys = keys;
+        drop(single);
+        if rows_placed != total - rows_kept {
+            anyhow::bail!(
+                "image prefill placed {rows_placed} image rows; the uncached prompt holds {}",
+                total - rows_kept
+            );
+        }
+        decoded.reuse = if start > 0 {
+            ReuseAction::Extend
+        } else {
+            ReuseAction::Fresh
+        };
+        decoded.reused = start;
+        decoded.prefilled = prompt_ids.len() - start;
+        decoded.stats.prefill_ns = pre.prefill_ns;
+        decoded.stats.prefill_units = pre.units;
+        let census = match (encode_w, prefill_w, decode_w) {
+            (Some(encode), Some(prefill), Some(decode)) => Some(ImageCensus {
+                encode,
+                prefill,
+                decode,
+                decode_steps: decoded.tokens.len(),
+            }),
+            _ => None,
+        };
+        let mut report = self.load_json(images.len());
+        report["encoded_images"] = json!(images.len() - first);
+        report["tiles"] = json!(tiles);
+        report["image_rows"] = json!(total);
+        report["image_rows_cached"] = json!(rows_kept);
+        report["image_rows_placed"] = json!(rows_placed);
+        report["census"] = census.map(|c| c.json()).unwrap_or(Value::Null);
+        *lock(&self.last_vision) = report;
+        Ok(decoded)
     }
 
     /// A request through the batch scheduler: submitted, its tokens read off
@@ -1879,6 +2267,21 @@ impl super::served::Served for Engine {
         on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
     ) -> Result<Decoded> {
         Engine::complete_until(self, prompt_ids, params, |frag| on_fragment(frag))
+    }
+    fn image_placeholder(&self, image: &DecodedImage) -> Result<String> {
+        Engine::image_placeholder(self, image)
+    }
+    fn complete_images_until(
+        &self,
+        prompt_ids: &[u32],
+        images: &[DecodedImage],
+        params: &DecodeParams,
+        on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+    ) -> Result<Decoded> {
+        Engine::complete_images_until(self, prompt_ids, images, params, |frag| on_fragment(frag))
+    }
+    fn vision_report(&self) -> Value {
+        lock(&self.last_vision).clone()
     }
     fn prefill_throughput(&self, n: usize, batch: usize) -> Result<PrefillTiming> {
         Engine::prefill_throughput(self, n, batch)

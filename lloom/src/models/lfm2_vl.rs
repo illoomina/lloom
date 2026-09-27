@@ -120,6 +120,10 @@ pub struct Lfm2VlConfig {
     pub encoder_patch_size: usize,
     #[serde(default = "default_tile_size")]
     pub tile_size: usize,
+    /// Wrap each image in `<|image_start|>` / `<|image_end|>` and mark its
+    /// tiles (`Lfm2VlProcessor`'s `use_image_special_tokens`).
+    #[serde(default = "default_true")]
+    pub use_image_special_tokens: bool,
 }
 
 fn default_downsample_factor() -> usize {
@@ -163,6 +167,7 @@ impl Lfm2VlConfig {
             projector_hidden_act: crate::nn::Activation::Gelu,
             encoder_patch_size: 16,
             tile_size: 512,
+            use_image_special_tokens: true,
         }
     }
 }
@@ -489,7 +494,7 @@ impl VisionEncoder {
         self.tower.embeddings_only(patches, rows, cols)
     }
 
-    /// Encode one image. `patches` is `[1, rows*cols, C*P*P]`; the result is
+    /// Encode one tile. `patches` is `[1, rows*cols, C*P*P]`; the result is
     /// `[num_tokens(rows, cols), text_hidden_size]`.
     pub fn forward(&self, patches: &Tensor, rows: usize, cols: usize) -> Result<Tensor> {
         let feats = self.tower.forward(patches, rows, cols)?;
@@ -497,6 +502,27 @@ impl VisionEncoder {
         // Back to the 2-D patch layout the projector's unshuffle expects.
         let feats = feats.reshape((1, rows, cols, hidden))?;
         self.projector.forward(&feats)
+    }
+
+    /// Encode a prepared image: every tile, in order, concatenated to
+    /// `[image_tokens, text_hidden_size]` — the rows the placeholder reserves,
+    /// in the order it reserves them.
+    ///
+    /// Each tile is a separate unpadded pass. The reference batches the tiles
+    /// through the tower padded to `max_num_patches` under an attention mask;
+    /// the mask removes the padding from every real row's attention, so the
+    /// two differ only in accumulation order (`DESIGN.md` §5.12b).
+    pub fn encode_image(&self, image: &PreparedImage) -> Result<Tensor> {
+        let parts = image
+            .tiles
+            .iter()
+            .map(|t| self.forward(&t.patches, t.rows, t.cols))
+            .collect::<Result<Vec<_>>>()?;
+        match parts.len() {
+            0 => lloom_tensor::bail!("an image with no tiles"),
+            1 => Ok(parts.into_iter().next().expect("one part")),
+            _ => Tensor::cat(&parts, 0),
+        }
     }
 }
 
@@ -522,13 +548,12 @@ impl crate::nn::Model for VisionEncoder {
 }
 
 impl crate::nn::VisionEncoder for VisionEncoder {
-    type Input = ProcessedImage;
+    type Input = PreparedImage;
 
-    /// Wires to the inherent `forward`; the host stage `ProcessedImage` carries
-    /// the `(patches, rows, cols)` the tower reads. No computation is added — the
-    /// §5.12 staged-reference gate belongs to `forward` and is unmoved by this.
+    /// Wires to [`VisionEncoder::encode_image`]: one image, every tile. A
+    /// single-tile image is one `forward`, so the §5.12 staged gate is unmoved.
     fn encode(&self, input: &Self::Input) -> Result<Tensor> {
-        self.forward(&input.patches, input.rows, input.cols)
+        self.encode_image(input)
     }
 }
 
@@ -536,7 +561,7 @@ impl crate::nn::VisionEncoder for VisionEncoder {
 // Host-side preprocessing.
 // ---------------------------------------------------------------------------
 
-/// One image, resized and cut into patches, ready for the tower.
+/// One tile, resized and cut into patches, ready for the tower.
 #[derive(Debug, Clone)]
 pub struct ProcessedImage {
     /// `[1, rows*cols, C*P*P]`
@@ -551,70 +576,463 @@ impl ProcessedImage {
     }
 }
 
-/// The image preprocessing this path implements, mirroring
-/// `Lfm2VlImageProcessorFast` for the single-tile case.
-///
-/// # What this covers, and what it deliberately does not
-///
-/// The reference processor can *tile* a large image (`do_image_splitting`, up to
-/// `max_tiles`) and append a thumbnail. This implements the **single-tile**
-/// branch only: the image is resized so its patch grid fits `max_num_patches`,
-/// then cut. That branch is exact rather than approximate — it is the same code
-/// path the reference takes when an image needs no splitting — and it is chosen
-/// over a partial tiling implementation because a wrong tile layout produces a
-/// plausible-looking embedding at the right shape, which no shape check catches.
+/// How the reference processor lays one image out: a single resized tile, or a
+/// grid of `tile_size` tiles followed by a thumbnail of the whole image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TileLayout {
+    /// Tile rows and columns. `1 x 1` is the single-tile path.
+    pub rows: usize,
+    pub cols: usize,
+    /// `(height, width)` of the single tile, or of the thumbnail.
+    pub resized: (usize, usize),
+    /// Whether a thumbnail follows the grid tiles.
+    pub thumbnail: bool,
+}
+
+impl TileLayout {
+    /// The reference's `is_multi_tile`: the placeholder takes row/column
+    /// markers and per-tile token runs.
+    pub fn is_grid(&self) -> bool {
+        self.rows > 1 || self.cols > 1
+    }
+
+    /// Tiles the tower encodes, in order: the grid, then the thumbnail.
+    pub fn num_tiles(&self) -> usize {
+        if self.is_grid() {
+            self.rows * self.cols + usize::from(self.thumbnail)
+        } else {
+            1
+        }
+    }
+}
+
+/// One tile of an image as 8-bit interleaved RGB, before normalisation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RgbTile {
+    pub height: usize,
+    pub width: usize,
+    pub rgb: Vec<u8>,
+}
+
+/// An image ready for the tower: its layout and every tile's patches, in the
+/// order the placeholder reserves their tokens.
 #[derive(Debug, Clone)]
+pub struct PreparedImage {
+    pub layout: TileLayout,
+    pub tiles: Vec<ProcessedImage>,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_min_tiles() -> usize {
+    2
+}
+fn default_max_tiles() -> usize {
+    10
+}
+fn default_min_image_tokens() -> usize {
+    64
+}
+fn default_max_image_tokens() -> usize {
+    256
+}
+fn default_patch() -> usize {
+    16
+}
+fn default_pixels_tolerance() -> f64 {
+    2.0
+}
+fn default_resample() -> u32 {
+    // `PILImageResampling.BILINEAR`, the reference class's own default; a
+    // checkpoint's `processor_config.json` overrides it (LFM2.5-VL-3B: 3).
+    2
+}
+fn default_half() -> [f32; 3] {
+    [0.5; 3]
+}
+
+/// The image preprocessing of `Lfm2VlImageProcessor` (transformers 5.16), from
+/// the checkpoint's `processor_config.json`.
+///
+/// An image whose rounded area exceeds `max_pixels_tolerance` times the
+/// single-tile budget is split into a grid of `tile_size` tiles chosen to match
+/// its aspect ratio, and a thumbnail of the whole image follows the grid; any
+/// other image is resized to one tile. Every size, the grid choice and the
+/// resize itself reproduce the reference's, because a wrong layout produces a
+/// plausible embedding at the right shape that no shape check catches. The
+/// gate is `lfm2-vl --gate-tiles` (`DESIGN.md` §5.12b).
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct ImageProcessor {
+    #[serde(default = "default_true")]
+    pub do_image_splitting: bool,
+    #[serde(default = "default_min_tiles")]
+    pub min_tiles: usize,
+    #[serde(default = "default_max_tiles")]
+    pub max_tiles: usize,
+    #[serde(default = "default_true")]
+    pub use_thumbnail: bool,
+    #[serde(default = "default_min_image_tokens")]
+    pub min_image_tokens: usize,
+    #[serde(default = "default_max_image_tokens")]
+    pub max_image_tokens: usize,
+    #[serde(rename = "encoder_patch_size", default = "default_patch")]
     pub patch_size: usize,
-    pub max_num_patches: usize,
+    #[serde(default = "default_downsample_factor")]
+    pub downsample_factor: usize,
+    #[serde(default = "default_tile_size")]
+    pub tile_size: usize,
+    #[serde(default = "default_pixels_tolerance")]
+    pub max_pixels_tolerance: f64,
+    /// `PILImageResampling`: 2 bilinear, 3 bicubic.
+    #[serde(default = "default_resample")]
+    pub resample: u32,
+    #[serde(default = "default_half")]
+    pub image_mean: [f32; 3],
+    #[serde(default = "default_half")]
+    pub image_std: [f32; 3],
+    #[serde(skip, default = "default_num_channels")]
     pub num_channels: usize,
-    /// Per-channel mean, matching `processor_config.json`'s `image_mean`.
-    pub image_mean: f32,
-    pub image_std: f32,
 }
 
 impl Default for ImageProcessor {
     fn default() -> Self {
-        Self {
-            patch_size: 16,
-            max_num_patches: 1024,
-            num_channels: 3,
-            image_mean: 0.5,
-            image_std: 0.5,
-        }
+        Self::lfm2_vl_3b()
     }
 }
 
+/// Python's `round(number / factor) * factor`: round half to EVEN, so 80 at a
+/// factor of 32 is 64, not 96.
+fn round_by_factor(number: usize, factor: usize) -> usize {
+    (number as f64 / factor as f64).round_ties_even() as usize * factor
+}
+
 impl ImageProcessor {
-    /// The patch grid this processor would choose for an image of `(h, w)`.
+    /// `LiquidAI/LFM2.5-VL-3B`'s `processor_config.json`.
+    pub fn lfm2_vl_3b() -> Self {
+        Self {
+            do_image_splitting: true,
+            min_tiles: 2,
+            max_tiles: 10,
+            use_thumbnail: true,
+            min_image_tokens: 64,
+            max_image_tokens: 256,
+            patch_size: 16,
+            downsample_factor: 2,
+            tile_size: 512,
+            max_pixels_tolerance: 2.0,
+            resample: 3,
+            image_mean: [0.5; 3],
+            image_std: [0.5; 3],
+            num_channels: 3,
+        }
+    }
+
+    /// The processor a checkpoint directory declares: `processor_config.json`'s
+    /// `image_processor` block, or a flat `preprocessor_config.json`.
     ///
-    /// Both sides are rounded to a whole number of patches and the total is held
-    /// at or under `max_num_patches` while preserving aspect ratio as closely as
-    /// a patch grid can.
-    pub fn target_grid(&self, h: usize, w: usize) -> (usize, usize) {
-        let p = self.patch_size;
-        let (h, w) = (h.max(p), w.max(p));
-        // Largest scale s with ceil-to-patch dimensions whose product fits.
-        let mut best = (1usize, 1usize);
-        let aspect = w as f64 / h as f64;
-        for rows in 1..=self.max_num_patches {
-            let cols = ((rows as f64 * aspect).round() as usize).max(1);
-            if rows * cols > self.max_num_patches {
-                break;
+    /// `config.json` carries tiling keys too, and they disagree with the
+    /// processor's (`min_tiles` 1 against 2 on LFM2.5-VL-3B); the reference
+    /// processor reads only the processor file, so that is the one read here.
+    pub fn from_checkpoint(dir: &std::path::Path) -> Result<Self> {
+        let nested = dir.join("processor_config.json");
+        let flat = dir.join("preprocessor_config.json");
+        let value: serde_json::Value = if nested.is_file() {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&nested).map_err(lloom_tensor::Error::wrap)?)
+                    .map_err(lloom_tensor::Error::wrap)?;
+            match v.get("image_processor") {
+                Some(ip) => ip.clone(),
+                None => v,
             }
-            best = (rows, cols);
+        } else if flat.is_file() {
+            serde_json::from_slice(&std::fs::read(&flat).map_err(lloom_tensor::Error::wrap)?)
+                .map_err(lloom_tensor::Error::wrap)?
+        } else {
+            lloom_tensor::bail!(
+                "{}: no processor_config.json or preprocessor_config.json; the image \
+                 preprocessing is the checkpoint's, not a default",
+                dir.display()
+            )
+        };
+        let p: Self = serde_json::from_value(value).map_err(lloom_tensor::Error::wrap)?;
+        p.filter()?;
+        if p.splitting() && p.min_tiles > p.max_tiles {
+            lloom_tensor::bail!("min_tiles {} > max_tiles {}", p.min_tiles, p.max_tiles);
+        }
+        Ok(p)
+    }
+
+    /// The resample filter `resample` names.
+    pub fn filter(&self) -> Result<crate::utils::AaFilter> {
+        Ok(match self.resample {
+            2 => crate::utils::AaFilter::Bilinear,
+            3 => crate::utils::AaFilter::Bicubic,
+            r => lloom_tensor::bail!(
+                "resample = {r}: only 2 (bilinear) and 3 (bicubic) are reproduced"
+            ),
+        })
+    }
+
+    fn splitting(&self) -> bool {
+        self.do_image_splitting && !(self.min_tiles == 1 && self.max_tiles == 1)
+    }
+
+    fn total_factor(&self) -> usize {
+        self.patch_size * self.downsample_factor
+    }
+
+    fn pixels_per_token(&self) -> usize {
+        self.patch_size * self.patch_size * self.downsample_factor * self.downsample_factor
+    }
+
+    /// The patches one tower pass may take: a full tile, or the largest single
+    /// image.
+    pub fn max_num_patches(&self) -> usize {
+        let thumbnail = self.max_image_tokens * self.downsample_factor * self.downsample_factor;
+        let tile = if self.do_image_splitting {
+            (self.tile_size / self.patch_size).pow(2)
+        } else {
+            0
+        };
+        thumbnail.max(tile)
+    }
+
+    /// `smart_resize`: `(height, width)` for a single tile or a thumbnail. Both
+    /// sides are multiples of `patch_size * downsample_factor` and the area is
+    /// brought inside `[min_image_tokens, max_image_tokens]` tokens.
+    pub fn smart_resize(&self, height: usize, width: usize) -> (usize, usize) {
+        let f = self.total_factor();
+        let min_px = self.min_image_tokens * self.pixels_per_token();
+        let max_px = self.max_image_tokens * self.pixels_per_token();
+        let mut h_bar = f.max(round_by_factor(height, f));
+        let mut w_bar = f.max(round_by_factor(width, f));
+        let (h, w, ff) = (height as f64, width as f64, f as f64);
+        if h_bar * w_bar > max_px {
+            let beta = ((height * width) as f64 / max_px as f64).sqrt();
+            h_bar = f.max((h / beta / ff).floor() as usize * f);
+            w_bar = f.max((w / beta / ff).floor() as usize * f);
+        } else if h_bar * w_bar < min_px {
+            let beta = (min_px as f64 / (height * width) as f64).sqrt();
+            h_bar = (h * beta / ff).ceil() as usize * f;
+            w_bar = (w * beta / ff).ceil() as usize * f;
+        }
+        (h_bar, w_bar)
+    }
+
+    /// `_is_image_too_large`: whether the image is tiled rather than resized.
+    pub fn is_too_large(&self, height: usize, width: usize) -> bool {
+        let f = self.total_factor();
+        let h_bar = self.patch_size.max(round_by_factor(height, f));
+        let w_bar = self.patch_size.max(round_by_factor(width, f));
+        (h_bar * w_bar) as f64
+            > (self.max_image_tokens * self.pixels_per_token()) as f64 * self.max_pixels_tolerance
+    }
+
+    /// `_get_grid_layout`: the `(columns, rows)` grid whose aspect is closest to
+    /// the image's, among grids of `min_tiles..=max_tiles` tiles. On a tie the
+    /// later (larger) grid wins when the image covers more than half of it.
+    ///
+    /// The reference sorts a Python `set` by area, so its order WITHIN an area
+    /// is hash order; this enumerates in first-occurrence order. The two choose
+    /// identically on every size up to 2000 x 2000 at `min_tiles` 1 and 2
+    /// (`measurements/issue-784-raw/ratio_order_check.py`), because a tie that
+    /// decides the choice never falls between two grids of the same area.
+    fn grid(&self, height: usize, width: usize) -> (usize, usize) {
+        let mut ratios: Vec<(usize, usize)> = Vec::new();
+        for n in self.min_tiles..=self.max_tiles {
+            for w in 1..=n {
+                for h in 1..=n {
+                    let a = w * h;
+                    if (self.min_tiles..=self.max_tiles).contains(&a) && !ratios.contains(&(w, h)) {
+                        ratios.push((w, h));
+                    }
+                }
+            }
+        }
+        ratios.sort_by_key(|&(w, h)| w * h);
+        let aspect = width as f64 / height as f64;
+        let area = (width * height) as f64;
+        let mut best = (1usize, 1usize);
+        let mut best_diff = f64::INFINITY;
+        for (w, h) in ratios {
+            let diff = (aspect - w as f64 / h as f64).abs();
+            if diff < best_diff {
+                best_diff = diff;
+                best = (w, h);
+            } else if diff == best_diff {
+                let target_area = (self.tile_size * self.tile_size * w * h) as f64;
+                if area > 0.5 * target_area {
+                    best = (w, h);
+                }
+            }
         }
         best
     }
 
-    /// Normalise an already-resized RGB8 buffer and cut it into patches.
+    /// `resize_and_split`'s layout for an image of `(height, width)`.
+    ///
+    /// One case is not the reference's. A 1 x 1 grid, reachable only at
+    /// `min_tiles` 1, makes the reference resize to a full `tile_size` tile
+    /// while its placeholder counts tokens from the `smart_resize` size, so its
+    /// feature and token counts disagree and its model refuses the pair
+    /// (688 x 752: 256 against 240, `measurements/issue-784-raw/min_tiles_check.txt`).
+    /// That case takes the single-tile path here, whose counts agree.
+    pub fn layout(&self, height: usize, width: usize) -> TileLayout {
+        let resized = self.smart_resize(height, width);
+        let grid = (self.splitting() && self.is_too_large(height, width))
+            .then(|| self.grid(height, width))
+            .filter(|&(cols, rows)| cols * rows > 1);
+        if let Some((cols, rows)) = grid {
+            TileLayout {
+                rows,
+                cols,
+                resized,
+                thumbnail: self.use_thumbnail && rows * cols != 1,
+            }
+        } else {
+            TileLayout {
+                rows: 1,
+                cols: 1,
+                resized,
+                thumbnail: false,
+            }
+        }
+    }
+
+    /// Image tokens per grid tile.
+    pub fn tokens_per_tile(&self) -> usize {
+        let side = (self.tile_size / self.patch_size).div_ceil(self.downsample_factor);
+        side * side
+    }
+
+    /// Image tokens for a single tile or a thumbnail of `(height, width)`.
+    pub fn tokens_for(&self, (height, width): (usize, usize)) -> usize {
+        (height / self.patch_size).div_ceil(self.downsample_factor)
+            * (width / self.patch_size).div_ceil(self.downsample_factor)
+    }
+
+    /// Every image token `layout` reserves.
+    pub fn image_tokens(&self, layout: &TileLayout) -> usize {
+        if layout.is_grid() {
+            layout.rows * layout.cols * self.tokens_per_tile()
+                + if self.use_thumbnail {
+                    self.tokens_for(layout.resized)
+                } else {
+                    0
+                }
+        } else {
+            self.tokens_for(layout.resized)
+        }
+    }
+
+    /// The text one `<image>` expands to (`Lfm2VlProcessor._build_image_tokens`):
+    /// `<|image_start|>`, per tile `<|img_row_R_col_C|>` and its run of
+    /// `<image>`, then `<|img_thumbnail|>` and the thumbnail's run, then
+    /// `<|image_end|>`. The delimiters are ordinary tokens with their own
+    /// embeddings; only `<image>` positions take features.
+    pub fn placeholder(&self, layout: &TileLayout, special_tokens: bool) -> String {
+        let mut s = String::new();
+        if special_tokens {
+            s.push_str("<|image_start|>");
+        }
+        if layout.is_grid() {
+            for r in 0..layout.rows {
+                for c in 0..layout.cols {
+                    if special_tokens {
+                        s.push_str(&format!("<|img_row_{}_col_{}|>", r + 1, c + 1));
+                    }
+                    s.push_str(&"<image>".repeat(self.tokens_per_tile()));
+                }
+            }
+            if self.use_thumbnail {
+                if special_tokens {
+                    s.push_str("<|img_thumbnail|>");
+                }
+                s.push_str(&"<image>".repeat(self.tokens_for(layout.resized)));
+            }
+        } else {
+            s.push_str(&"<image>".repeat(self.tokens_for(layout.resized)));
+        }
+        if special_tokens {
+            s.push_str("<|image_end|>");
+        }
+        s
+    }
+
+    /// Resize and split an interleaved RGB8 image of `(height, width)` into the
+    /// tiles the tower encodes, in the reference's order: the grid row-major
+    /// (`split_to_tiles`), then the thumbnail. Every tile is byte-identical to
+    /// the reference's `uint8` tile (`utils::resize_rgb8_antialias`).
+    pub fn tiles_rgb8(
+        &self,
+        rgb: &[u8],
+        height: usize,
+        width: usize,
+    ) -> Result<(TileLayout, Vec<RgbTile>)> {
+        let c = self.num_channels;
+        let filter = self.filter()?;
+        let layout = self.layout(height, width);
+        let resize = |nh: usize, nw: usize| -> Result<RgbTile> {
+            Ok(RgbTile {
+                height: nh,
+                width: nw,
+                rgb: crate::utils::resize_rgb8_antialias(rgb, height, width, c, nh, nw, filter)?,
+            })
+        };
+        let mut tiles = Vec::with_capacity(layout.num_tiles());
+        if layout.is_grid() {
+            let t = self.tile_size;
+            let grid = resize(layout.rows * t, layout.cols * t)?;
+            let row_bytes = grid.width * c;
+            for r in 0..layout.rows {
+                for col in 0..layout.cols {
+                    let mut tile = Vec::with_capacity(t * t * c);
+                    for y in 0..t {
+                        let start = (r * t + y) * row_bytes + col * t * c;
+                        tile.extend_from_slice(&grid.rgb[start..start + t * c]);
+                    }
+                    tiles.push(RgbTile {
+                        height: t,
+                        width: t,
+                        rgb: tile,
+                    });
+                }
+            }
+            if layout.thumbnail {
+                tiles.push(resize(layout.resized.0, layout.resized.1)?);
+            }
+        } else {
+            tiles.push(resize(layout.resized.0, layout.resized.1)?);
+        }
+        Ok((layout, tiles))
+    }
+
+    /// [`Self::tiles_rgb8`], then every tile normalised and cut into patches.
+    pub fn prepare_rgb8(
+        &self,
+        rgb: &[u8],
+        height: usize,
+        width: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<PreparedImage> {
+        let (layout, tiles) = self.tiles_rgb8(rgb, height, width)?;
+        let p = self.patch_size;
+        let tiles = tiles
+            .iter()
+            .map(|t| self.patchify_rgb8(&t.rgb, t.height / p, t.width / p, device, dtype))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PreparedImage { layout, tiles })
+    }
+
+    /// Normalise an already-resized RGB8 tile and cut it into patches.
     ///
     /// `rgb` is `rows*patch_size` by `cols*patch_size`, interleaved RGB, one
     /// byte per channel — i.e. exactly what `image`'s `to_rgb8()` hands over,
-    /// without this crate having to depend on `image`. Decoding and resizing
-    /// belong to the caller (`candle-examples` owns the codec dependency); the
-    /// arithmetic that has to match the reference lives here, where it can be
-    /// unit-tested without a file on disk.
+    /// without this crate having to depend on `image`. Decoding belongs to the
+    /// caller; the arithmetic that has to match the reference lives here, where
+    /// it can be unit-tested without a file on disk.
     ///
     /// Returns patches in **row-major patch order**, each patch flattened as
     /// `P,P,C` — row-major pixels with the three channels **interleaved**, not
@@ -633,12 +1051,9 @@ impl ImageProcessor {
     /// | `C,P,P` channels-first | 1.80e0 |
     /// | **`P,P,C` interleaved** | **5.22e-8** |
     ///
-    /// The first version of this function used `C,P,P`, and nothing but that
-    /// comparison could have said so: a permutation leaves the shape, the
-    /// dtype and the token count identical, so the model consumes the wrong
-    /// pixels and emits fluent text about them. `DESIGN.md` §10.2n records the
-    /// same class in the DSpark tap, where a permuted concatenation was
-    /// invisible to every gate in the tree.
+    /// A permutation leaves the shape, the dtype and the token count
+    /// identical, so the model consumes the wrong pixels and emits fluent text
+    /// about them. `DESIGN.md` §10.2n records the same class in the DSpark tap.
     pub fn patchify_rgb8(
         &self,
         rgb: &[u8],
@@ -670,7 +1085,7 @@ impl ImageProcessor {
                         let dst = base + (y * p + x) * c;
                         for ch in 0..c {
                             let v = rgb[src + ch] as f32 / 255.0;
-                            data[dst + ch] = (v - self.image_mean) / self.image_std;
+                            data[dst + ch] = (v - self.image_mean[ch]) / self.image_std[ch];
                         }
                     }
                 }
@@ -802,33 +1217,130 @@ mod tests {
         }
     }
 
+    /// `(height, width, rows, cols, resized_h, resized_w, thumbnail,
+    /// image_tokens, ids_len)`, emitted by the reference processor
+    /// (transformers 5.16.1, `measurements/issue-784-raw/make_golden_tiles.py`,
+    /// `golden_tiles.json`'s `layout`). `ids_len` is the token count of one
+    /// expanded `<image>`: image tokens plus the start/end, per-tile and
+    /// thumbnail markers.
+    const REFERENCE_LAYOUTS: &[(usize, usize, usize, usize, usize, usize, bool, usize, usize)] = &[
+        (64, 64, 1, 1, 256, 256, false, 64, 66),
+        (100, 300, 1, 1, 160, 448, false, 70, 72),
+        (300, 200, 1, 1, 320, 224, false, 70, 72),
+        (384, 512, 1, 1, 384, 512, false, 192, 194),
+        (511, 333, 1, 1, 512, 320, false, 160, 162),
+        (512, 512, 1, 1, 512, 512, false, 256, 258),
+        (600, 800, 1, 1, 416, 576, false, 234, 236),
+        (512, 1024, 1, 1, 352, 704, false, 242, 244),
+        (544, 1024, 1, 2, 352, 672, true, 743, 748),
+        (768, 768, 2, 2, 512, 512, true, 1280, 1287),
+        (1024, 1024, 2, 2, 512, 512, true, 1280, 1287),
+        (768, 1536, 2, 4, 352, 704, true, 2290, 2301),
+        (641, 853, 2, 3, 416, 576, true, 1770, 1779),
+        (900, 2000, 2, 4, 320, 736, true, 2278, 2289),
+        (1366, 768, 4, 2, 672, 352, true, 2279, 2290),
+        (3000, 4000, 2, 3, 416, 576, true, 1770, 1779),
+        (100, 4000, 1, 1, 64, 3232, false, 202, 204),
+        (4000, 100, 1, 1, 3232, 64, false, 202, 204),
+        (2048, 512, 4, 1, 1024, 256, true, 1280, 1287),
+        (1080, 1920, 2, 4, 384, 672, true, 2300, 2311),
+        (720, 720, 1, 1, 512, 512, false, 256, 258),
+        (80, 112, 1, 1, 224, 320, false, 70, 72),
+        (688, 752, 2, 2, 480, 512, true, 1264, 1271),
+    ];
+
+    /// Every size in the reference table lays out as the reference laid it
+    /// out: the grid, the single/thumbnail size, whether a thumbnail follows,
+    /// and the image-token count. `720 x 720` is the round-half-to-even case —
+    /// half-up rounding tiles it 2 x 2.
     #[test]
-    fn a_512_square_image_is_exactly_1024_patches_and_256_tokens() {
-        let p = ImageProcessor::default();
-        let (rows, cols) = p.target_grid(512, 512);
-        assert_eq!(rows * cols, 1024, "grid was {rows}x{cols}");
-        assert_eq!(rows.div_ceil(2) * cols.div_ceil(2), 256);
+    fn the_layout_is_the_reference_processors_on_every_tabled_size() {
+        let p = ImageProcessor::lfm2_vl_3b();
+        for &(h, w, rows, cols, rh, rw, thumb, tokens, _) in REFERENCE_LAYOUTS {
+            let l = p.layout(h, w);
+            assert_eq!(
+                (l.rows, l.cols, l.resized, l.thumbnail),
+                (rows, cols, (rh, rw), thumb),
+                "{h}x{w}"
+            );
+            assert_eq!(p.image_tokens(&l), tokens, "{h}x{w} image tokens");
+        }
     }
 
+    /// The expanded placeholder has exactly the reference's token count: its
+    /// `<image>` runs plus one token per delimiter and marker. Counted from
+    /// the string, so a missing marker or a wrong run length moves it.
     #[test]
-    fn the_chosen_grid_never_exceeds_max_num_patches() {
-        let p = ImageProcessor::default();
-        for (h, w) in [
-            (64, 64),
-            (512, 512),
-            (1024, 768),
-            (4000, 3000),
-            (100, 4000),
-            (4000, 100),
-        ] {
-            let (rows, cols) = p.target_grid(h, w);
-            assert!(
-                rows * cols <= p.max_num_patches,
-                "{h}x{w} -> {rows}x{cols} = {} patches",
-                rows * cols
-            );
-            assert!(rows >= 1 && cols >= 1);
+    fn the_placeholder_has_the_reference_token_count() {
+        let p = ImageProcessor::lfm2_vl_3b();
+        for &(h, w, _, _, _, _, _, tokens, ids_len) in REFERENCE_LAYOUTS {
+            let l = p.layout(h, w);
+            let s = p.placeholder(&l, true);
+            let images = s.matches("<image>").count();
+            let markers = s.matches("<|").count();
+            assert_eq!(images, tokens, "{h}x{w}");
+            assert_eq!(images + markers, ids_len, "{h}x{w}: {markers} markers");
         }
+    }
+
+    /// `min_tiles` comes from the processor file (2), not from `config.json`
+    /// (1). The two lay out differently only in a band just past the tiling
+    /// threshold (140 of 10 000 sizes in 680..779 squared, none elsewhere,
+    /// `measurements/issue-784-raw/min_tiles_check.py`); 688 x 752 is in it and
+    /// is tabled above, so a processor reading 1 fails the layout test.
+    #[test]
+    fn the_checkpoints_processor_file_is_what_sets_min_tiles() {
+        let dir = std::env::temp_dir().join(format!("lloom-784-proc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("processor_config.json"),
+            r#"{"image_processor": {"min_tiles": 2, "max_tiles": 10, "resample": 3,
+                "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
+                "encoder_patch_size": 16, "tile_size": 512}, "processor_class": "Lfm2VlProcessor"}"#,
+        )
+        .unwrap();
+        let p = ImageProcessor::from_checkpoint(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!((p.min_tiles, p.max_tiles, p.resample), (2, 10, 3));
+        assert_eq!(p.filter().unwrap(), crate::utils::AaFilter::Bicubic);
+        let l = p.layout(688, 752);
+        assert_eq!((l.rows, l.cols, l.thumbnail), (2, 2, true));
+        let one = ImageProcessor { min_tiles: 1, ..p };
+        let l = one.layout(688, 752);
+        assert_eq!(
+            (l.rows, l.cols, l.thumbnail),
+            (1, 1, false),
+            "the band min_tiles decides"
+        );
+    }
+
+    /// The tiles come out row-major, then the thumbnail: each grid tile of an
+    /// image whose pixels encode their own tile index carries that index.
+    #[test]
+    fn tiles_are_row_major_then_the_thumbnail() {
+        let p = ImageProcessor::lfm2_vl_3b();
+        // 1024 x 1536 is a 2 x 3 grid at exactly the tile size: no resample,
+        // so every tile's bytes are its source region's.
+        let (h, w) = (1024usize, 1536usize);
+        let mut rgb = vec![0u8; h * w * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let k = ((y / 512) * 3 + x / 512) as u8;
+                rgb[(y * w + x) * 3..(y * w + x) * 3 + 3].copy_from_slice(&[k, 10 * k, 255 - k]);
+            }
+        }
+        let (layout, tiles) = p.tiles_rgb8(&rgb, h, w).unwrap();
+        assert_eq!((layout.rows, layout.cols, layout.thumbnail), (2, 3, true));
+        assert_eq!(tiles.len(), 7);
+        for (k, t) in tiles.iter().take(6).enumerate() {
+            assert_eq!((t.height, t.width), (512, 512));
+            let k = k as u8;
+            assert!(
+                t.rgb.chunks(3).all(|px| px == [k, 10 * k, 255 - k]),
+                "tile {k} is not region {k}"
+            );
+        }
+        assert_eq!((tiles[6].height, tiles[6].width), layout.resized);
     }
 
     /// Row `r` of a `[1, seq, hidden]` embedding filled with `base + r*hidden + j`,
@@ -921,7 +1433,7 @@ mod tests {
     #[allow(dead_code)]
     fn trait_bounds_hold<E>()
     where
-        E: crate::nn::VisionEncoder<Config = VisionEncoderConfig, Input = ProcessedImage>,
+        E: crate::nn::VisionEncoder<Config = VisionEncoderConfig, Input = PreparedImage>,
     {
     }
 

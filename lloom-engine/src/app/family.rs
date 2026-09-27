@@ -46,6 +46,12 @@ pub struct Capabilities {
     pub kv_dtype: &'static str,
     /// Why the arms missing from `kv_quant` are refused.
     pub kv_quant_missing: &'static str,
+    /// Image input (OpenAI `image_url` parts, `lloom chat --image`). A
+    /// checkpoint of the family can still lack a tower; the engine refuses
+    /// that one by its own reason.
+    pub vision: bool,
+    /// Why a family without vision refuses an image.
+    pub vision_missing: &'static str,
 }
 
 impl Capabilities {
@@ -62,12 +68,13 @@ impl Capabilities {
             "executor_arms": self.executor_arms,
             "kv_quant": self.kv_quant_names(),
             "kv_dtype": self.kv_dtype,
+            "vision": self.vision,
         })
     }
 
     pub fn line(&self) -> String {
         format!(
-            "lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} rewind={:?}",
+            "lookahead_max={} ring={} batch={} prefix_share={} speculation=[{}] model_axes={} kv_quant=[{}] kv_dtype={} vision={} rewind={:?}",
             self.lookahead_max,
             self.ring,
             self.batch,
@@ -76,6 +83,7 @@ impl Capabilities {
             self.model_axes,
             self.kv_quant_names().join(","),
             self.kv_dtype,
+            self.vision,
             self.rewind,
         )
     }
@@ -127,6 +135,8 @@ pub const LFM2_CAPABILITIES: Capabilities = Capabilities {
     kv_quant: &[KvQuant::Off, KvQuant::Int8, KvQuant::Int4],
     kv_dtype: "f16",
     kv_quant_missing: "",
+    vision: true,
+    vision_missing: "",
 };
 
 pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
@@ -143,6 +153,8 @@ pub const QWEN4EXP_CAPABILITIES: Capabilities = Capabilities {
     kv_dtype: "f32",
     kv_quant_missing: "its attention KV is stored at f32 and no quantized arm is built for it \
                        (head_dim 256 and QSA's selected-block read; sequence-state.md §10.7)",
+    vision: false,
+    vision_missing: "no vision tower is built for Qwen4-exp (its image input is #765)",
 };
 
 /// Every family, in detection order.
@@ -555,5 +567,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(LFM2_CAPABILITIES.speculation, &["dspark"]);
         assert!(QWEN4EXP_CAPABILITIES.line().contains("lookahead_max=0"));
+    }
+
+    #[test]
+    fn vision_is_a_capability_and_its_absence_has_a_reason() {
+        assert!(LFM2_CAPABILITIES.vision);
+        assert!(!QWEN4EXP_CAPABILITIES.vision);
+        assert!(QWEN4EXP_CAPABILITIES
+            .vision_missing
+            .contains("no vision tower"));
+        assert!(LFM2_CAPABILITIES.line().contains("vision=true"));
+        assert_eq!(
+            QWEN4EXP_CAPABILITIES.json()["vision"],
+            serde_json::json!(false)
+        );
     }
 }

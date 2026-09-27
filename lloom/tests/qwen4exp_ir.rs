@@ -92,3 +92,25 @@ fn the_derivation_reports_the_seams_and_fuses_nothing() {
         "the catalogue's fragments bind to the f16 gemv; this step has none unfused"
     );
 }
+
+/// E2 of #749's closing plan: the step's dependency depth `D` — the longest
+/// chain of data-dependent dispatches, the serial boundaries no reordering
+/// removes — and its width. Every dispatch sits at exactly one depth, so the
+/// widths sum to the census's 1 628.
+#[test]
+fn the_step_depth_and_width() {
+    let cfg = Config::flash_next();
+    let g = decode_step(&cfg);
+    let p = g.depth_profile();
+    eprintln!(
+        "DEPTH qwen4exp decode_step D={} max_width={} dispatches={} widths={:?}",
+        p.depth(),
+        p.max_width(),
+        g.dispatches(),
+        p.widths
+    );
+    assert_eq!(p.widths.iter().map(|&w| w as u64).sum::<u64>(), 1628);
+    // The values #749 P33 E2 recorded: an emitter change that moves them owes
+    // the ledger a new E2.
+    assert_eq!((p.depth(), p.max_width()), (1157, 4));
+}

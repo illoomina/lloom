@@ -1,15 +1,23 @@
 //! LFM2-VL: an image in, a response out — and the gate that says the image mattered.
 //!
-//! Harness for lloom issue #597. Two modes, and they answer different questions:
+//! Harness for lloom issues #597 and #784. Three modes, and they answer
+//! different questions:
 //!
 //! - **`--gate`** — compare the host preprocessing (from the committed PNGs),
 //!   the patch embedding, the position-resampled embeddings, the tower and the
 //!   projector, stage by stage, against a committed golden produced by
 //!   `transformers`' own `Lfm2VlModel`. This is the **numeric** check. It loads
 //!   no language model, so a failure is the vision path and nothing else.
+//! - **`--gate-tiles`** — the multi-tile path against `transformers`' own
+//!   processor and `get_image_features` (`issue-784-raw/golden_tiles.json`):
+//!   the layout of every tabled size and its placeholder's token ids, every
+//!   tile's uint8 bytes (exact), the whole prompt's ids, and the tiled network
+//!   output through a fixed random projection.
 //! - **default** — run a real image plus a prompt through the whole path and
 //!   print what the model says. This is the **product** check, and on its own it
-//!   proves nothing (see below).
+//!   proves nothing (see below). The prompt is the reference processor's: the
+//!   checkpoint's BOS, the chat template's user turn, and `<image>` expanded to
+//!   the image's tiles — so `lloom chat --image` feeds the same ids.
 //!
 //! # Why the eyeball is not the gate, and why the control is not optional
 //!
@@ -56,11 +64,14 @@ use clap::Parser;
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::lfm2::{Cache, Model};
 use lloom::models::lfm2_vl::{merge_image_features, ImageProcessor, Lfm2VlConfig, VisionEncoder};
-use lloom::nn::var_builder::SimpleBackend;
+use lloom::nn::var_builder::RecordingBackend;
 use lloom::nn::VarBuilder;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// `lfm2-determinism`'s dependency-free SHA-256, shared rather than copied.
+#[path = "../lfm2-determinism/sha256.rs"]
+#[allow(dead_code)]
+mod sha256;
 
 #[derive(Parser, Debug)]
 #[command(about = "LFM2-VL image input, and the pelican test (lloom #597)")]
@@ -68,6 +79,17 @@ struct Args {
     /// Run the numeric gate against the committed golden and exit.
     #[arg(long)]
     gate: bool,
+
+    /// Run the multi-tile gate against `golden_tiles.json` in `--golden-dir`
+    /// and exit.
+    #[arg(long)]
+    gate_tiles: bool,
+
+    /// With `--gate-tiles`: write each image's features (`<name>_features.bin`,
+    /// f32, `[image_tokens, hidden]`) here, for a per-row comparison against
+    /// the reference's full output.
+    #[arg(long)]
+    dump_dir: Option<String>,
 
     /// Directory holding the golden produced by `make_golden.py`.
     #[arg(long)]
@@ -174,91 +196,6 @@ impl DispatchCensus {
     }
 }
 
-/// A checkpoint backend that records which tensors are loaded through it.
-///
-/// Loading is a lookup by name (`DESIGN.md` §5.5a), so the set of names a
-/// constructor asks for is exactly the set of tensors that become device
-/// buffers. One flag per header entry, set on load; no lock on the path.
-struct Recording {
-    inner: candle::safetensors::MmapedSafetensors,
-    index: HashMap<String, usize>,
-    loaded: Arc<[AtomicBool]>,
-}
-
-impl Recording {
-    /// The backend, and the flags it sets — kept by the caller, since the
-    /// backend itself moves into the `VarBuilder`.
-    fn new(files: &[std::path::PathBuf], names: &[String]) -> Result<(Self, Arc<[AtomicBool]>)> {
-        // SAFETY: the checkpoint files are not modified while mapped; this is
-        // the same contract `VarBuilder::from_mmaped_safetensors` relies on.
-        let inner = unsafe { candle::safetensors::MmapedSafetensors::multi(files)? };
-        let index = names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.clone(), i))
-            .collect();
-        let loaded: Arc<[AtomicBool]> = names.iter().map(|_| AtomicBool::new(false)).collect();
-        let flags = Arc::clone(&loaded);
-        Ok((
-            Self {
-                inner,
-                index,
-                loaded,
-            },
-            flags,
-        ))
-    }
-
-    fn mark(&self, name: &str) {
-        if let Some(&i) = self.index.get(name) {
-            self.loaded[i].store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-fn loaded_names(names: &[String], flags: &[AtomicBool]) -> BTreeSet<String> {
-    names
-        .iter()
-        .zip(flags.iter())
-        .filter(|(_, f)| f.load(Ordering::Relaxed))
-        .map(|(n, _)| n.clone())
-        .collect()
-}
-
-impl SimpleBackend for Recording {
-    fn get(
-        &self,
-        s: candle::Shape,
-        name: &str,
-        h: lloom::nn::Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> candle::Result<Tensor> {
-        self.mark(name);
-        SimpleBackend::get(&self.inner, s, name, h, dtype, dev)
-    }
-
-    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle::Result<Tensor> {
-        self.mark(name);
-        SimpleBackend::get_unchecked(&self.inner, name, dtype, dev)
-    }
-
-    fn contains_tensor(&self, name: &str) -> bool {
-        SimpleBackend::contains_tensor(&self.inner, name)
-    }
-}
-
-/// Every tensor in the header, with its size in bytes on disk.
-fn header_sizes(files: &[std::path::PathBuf]) -> Result<BTreeMap<String, usize>> {
-    // SAFETY: as in `Recording::new`.
-    let st = unsafe { candle::safetensors::MmapedSafetensors::multi(files)? };
-    Ok(st
-        .tensors()
-        .into_iter()
-        .map(|(n, v)| (n, v.data().len()))
-        .collect())
-}
-
 /// Which tensors each constructor loaded, checked against the header's own
 /// prefix groups: the absolute reference, not a count carried over from a
 /// document.
@@ -267,6 +204,8 @@ fn load_census(
     language: &BTreeSet<String>,
     vision: &BTreeSet<String>,
 ) -> Result<()> {
+    // `header` is the checkpoint's own listing (`LoadRecord::header`), the
+    // absolute reference both loaded sets are checked against.
     let bytes = |set: &BTreeSet<String>| -> usize { set.iter().map(|n| header[n]).sum() };
     let want_language: BTreeSet<String> = header
         .keys()
@@ -562,26 +501,16 @@ fn run_gate(args: &Args, device: &Device) -> Result<()> {
                 })?
             }
         };
-        let img = image::ImageReader::open(&image_path)
-            .with_context(|| format!("opening {}", image_path.display()))?
-            .decode()?;
-        let proc = ImageProcessor::default();
-        let (rgb, r, c) = {
-            use image::GenericImageView;
-            let (w0, h0) = img.dimensions();
-            let (r, c) = proc.target_grid(h0 as usize, w0 as usize);
-            let (th, tw) = (r * proc.patch_size, c * proc.patch_size);
-            let resized = if (tw as u32, th as u32) == img.dimensions() {
-                img.clone()
-            } else {
-                img.resize_exact(
-                    tw as u32,
-                    th as u32,
-                    image::imageops::FilterType::CatmullRom,
-                )
-            };
-            (resized.to_rgb8().into_raw(), r, c)
-        };
+        let (rgb, h0, w0) = decode_rgb8(&image_path.display().to_string())?;
+        let proc = ImageProcessor::from_checkpoint(&model_dir)?;
+        let (layout, tiles) = proc.tiles_rgb8(&rgb, h0, w0)?;
+        anyhow::ensure!(
+            !layout.is_grid() && tiles.len() == 1,
+            "{name}: the reference processed this image as one tile, ours as {} tile(s)",
+            tiles.len()
+        );
+        let tile = &tiles[0];
+        let (r, c) = (tile.height / proc.patch_size, tile.width / proc.patch_size);
         anyhow::ensure!(
             (r, c) == (entry.rows, entry.cols),
             "{name}: our grid is {r}x{c}, the reference chose {}x{}",
@@ -589,7 +518,7 @@ fn run_gate(args: &Args, device: &Device) -> Result<()> {
             entry.cols
         );
         let got = proc
-            .patchify_rgb8(&rgb, r, c, device, DType::F32)?
+            .patchify_rgb8(&tile.rgb, r, c, device, DType::F32)?
             .patches
             .squeeze(0)?;
         let d = max_diff(&got, &want)?;
@@ -701,6 +630,310 @@ fn run_gate(args: &Args, device: &Device) -> Result<()> {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct BinEntry {
+    file: String,
+    shape: Vec<usize>,
+}
+
+#[derive(serde::Deserialize)]
+struct LayoutEntry {
+    height: usize,
+    width: usize,
+    rows: usize,
+    cols: usize,
+    resized: [usize; 2],
+    tiles: Vec<[usize; 2]>,
+    image_tokens: usize,
+    ids_rle: Vec<[u32; 2]>,
+}
+
+#[derive(serde::Deserialize)]
+struct TileEntry {
+    height: usize,
+    width: usize,
+    u8_sha256: String,
+}
+
+#[derive(serde::Deserialize)]
+struct TiledImageEntry {
+    name: String,
+    image: String,
+    rows: usize,
+    cols: usize,
+    tiles: Vec<TileEntry>,
+    segments: Vec<usize>,
+    segment_starts: Vec<usize>,
+    input_ids_sha256: String,
+    input_ids_rle: Vec<[u32; 2]>,
+    features_shape: [usize; 2],
+    truth_signature: BinEntry,
+    truth_row_norms: BinEntry,
+    truth_anchor_rows: BinEntry,
+    /// How far `transformers`' own f32 output sits from the float64 truth on
+    /// each statistic: the scale the bound below is a multiple of.
+    reference_f32_distance: BTreeMap<String, f64>,
+}
+
+#[derive(serde::Deserialize)]
+struct TilesGolden {
+    transformers_version: String,
+    prompt: String,
+    layout: Vec<LayoutEntry>,
+    images: Vec<TiledImageEntry>,
+    projection: BinEntry,
+}
+
+fn unrle(rle: &[[u32; 2]]) -> Vec<u32> {
+    rle.iter()
+        .flat_map(|&[t, n]| std::iter::repeat_n(t, n as usize))
+        .collect()
+}
+
+/// A golden `.bin.gz`, read from its `gunzip -k`'d `.bin` beside it.
+fn read_golden_gz(dir: &std::path::Path, e: &BinEntry, device: &Device) -> Result<Tensor> {
+    let bin = e.file.strip_suffix(".gz").unwrap_or(&e.file);
+    read_golden_bin(&dir.join(bin), &e.shape, device)
+}
+
+/// The multi-tile gate (module docs). Every stage reads the reference's own
+/// output from `golden_tiles.json`. Returns non-zero on failure.
+///
+/// The network stage is measured against the reference's code run in
+/// float64, not against its f32 output. On a full 1024-patch tile the f32
+/// reference is itself up to ~2e-4 (rel-to-scale) from that truth, so two
+/// f32 implementations differ by the noise of two accumulation orders and
+/// `--gate`'s 1e-4 against the f32 output is a coin flip per backend and
+/// image (`DESIGN.md` §5.12b). The bound is `NOISE_MULTIPLE` times the f32
+/// reference's own distance from the truth, per statistic.
+fn run_gate_tiles(args: &Args, device: &Device) -> Result<()> {
+    let golden_dir = std::path::PathBuf::from(
+        args.golden_dir
+            .clone()
+            .context("--gate-tiles needs --golden-dir (design/measurements/issue-784-raw)")?,
+    );
+    let meta: TilesGolden = serde_json::from_str(
+        &std::fs::read_to_string(golden_dir.join("golden_tiles.json")).with_context(|| {
+            format!("reading {}", golden_dir.join("golden_tiles.json").display())
+        })?,
+    )?;
+    let model_dir = model_dir(args)?;
+    let cfg = vl_config(&model_dir)?;
+    let config = parse_config(&std::fs::read_to_string(model_dir.join("config.json"))?)?;
+    let proc = ImageProcessor::from_checkpoint(&model_dir)?;
+    let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
+    println!(
+        "golden: transformers {}, {} layouts, {} images",
+        meta.transformers_version,
+        meta.layout.len(),
+        meta.images.len()
+    );
+    let mut ok = true;
+
+    // Stage 1: every tabled size lays out as the reference laid it out, and
+    // its expanded placeholder tokenizes to the reference's ids exactly.
+    let mut layout_bad = 0;
+    for e in &meta.layout {
+        let l = proc.layout(e.height, e.width);
+        let tiles: Vec<[usize; 2]> = if l.is_grid() {
+            let mut t = vec![[proc.tile_size, proc.tile_size]; l.rows * l.cols];
+            if l.thumbnail {
+                t.push([l.resized.0, l.resized.1]);
+            }
+            t
+        } else {
+            vec![[l.resized.0, l.resized.1]]
+        };
+        let ids = tokenizer
+            .encode(proc.placeholder(&l, cfg.use_image_special_tokens), false)
+            .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
+            .get_ids()
+            .to_vec();
+        let same = (l.rows, l.cols) == (e.rows, e.cols)
+            && [l.resized.0, l.resized.1] == e.resized
+            && tiles == e.tiles
+            && proc.image_tokens(&l) == e.image_tokens
+            && ids == unrle(&e.ids_rle);
+        if !same {
+            layout_bad += 1;
+            println!(
+                "layout  {}x{}: ours grid {}x{} resized {:?} {} tiles {} ids; reference grid {}x{} \
+                 resized {:?} {} tiles {} ids",
+                e.height,
+                e.width,
+                l.rows,
+                l.cols,
+                l.resized,
+                tiles.len(),
+                ids.len(),
+                e.rows,
+                e.cols,
+                e.resized,
+                e.tiles.len(),
+                unrle(&e.ids_rle).len()
+            );
+        }
+    }
+    println!(
+        "layout  {} of {} sizes match the reference (grid, sizes, tiles, placeholder ids)",
+        meta.layout.len() - layout_bad,
+        meta.layout.len()
+    );
+    ok &= layout_bad == 0;
+
+    let files = weight_files(&model_dir)?;
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F32, device)? };
+    let encoder =
+        VisionEncoder::new(&cfg, config.hidden_size, vb).context("building the vision encoder")?;
+    let r = read_golden_gz(&golden_dir, &meta.projection, device)?;
+    const NOISE_MULTIPLE: f64 = 4.0;
+
+    for img in &meta.images {
+        let path = golden_dir.join(&img.image);
+        let (rgb, h, w) = decode_rgb8(&path.display().to_string())?;
+        let (layout, tiles) = proc.tiles_rgb8(&rgb, h, w)?;
+        // Stage 2: the tiles, byte for byte.
+        let mut tiles_ok =
+            tiles.len() == img.tiles.len() && (layout.rows, layout.cols) == (img.rows, img.cols);
+        for (k, (ours, want)) in tiles.iter().zip(&img.tiles).enumerate() {
+            let sha = sha256::digest_hex(&ours.rgb);
+            let same =
+                (ours.height, ours.width) == (want.height, want.width) && sha == want.u8_sha256;
+            tiles_ok &= same;
+            if !same {
+                println!(
+                    "{}  tile {k}: ours {}x{} {}..., reference {}x{} {}...",
+                    img.name,
+                    ours.height,
+                    ours.width,
+                    &sha[..16],
+                    want.height,
+                    want.width,
+                    &want.u8_sha256[..16]
+                );
+            }
+        }
+        println!(
+            "{:<8} grid {}x{}, {} tiles: uint8 tiles {}",
+            img.name,
+            layout.rows,
+            layout.cols,
+            tiles.len(),
+            if tiles_ok {
+                "byte-identical to the reference"
+            } else {
+                "DIFFER"
+            }
+        );
+        ok &= tiles_ok;
+
+        // Stage 3: the prompt's ids, as the reference processor built them.
+        let prepared = proc.prepare_rgb8(&rgb, h, w, device, DType::F32)?;
+        let placeholder = proc.placeholder(&prepared.layout, cfg.use_image_special_tokens);
+        let ids = reference_prompt(&tokenizer, config.bos_token_id, &placeholder, &meta.prompt)?;
+        let ids_ok = ids_sha256(&ids) == img.input_ids_sha256 && ids == unrle(&img.input_ids_rle);
+        println!(
+            "{:<8} prompt {} ids, sha256 {}: {}",
+            img.name,
+            ids.len(),
+            &ids_sha256(&ids)[..16],
+            if ids_ok {
+                "the reference's"
+            } else {
+                "DIFFERS from the reference"
+            }
+        );
+        ok &= ids_ok;
+
+        // Stage 4: the tiled network output, per tile then concatenated.
+        let feats = encoder.encode_image(&prepared)?.to_dtype(DType::F32)?;
+        if let Some(dir) = &args.dump_dir {
+            let v: Vec<f32> = feats.flatten_all()?.to_vec1()?;
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(
+                std::path::Path::new(dir).join(format!("{}_features.bin", img.name)),
+                bytes,
+            )?;
+        }
+        let shape_ok = feats.dims() == img.features_shape
+            && prepared
+                .tiles
+                .iter()
+                .map(|t| encoder.num_tokens(t.rows, t.cols))
+                .collect::<Vec<_>>()
+                == img.segments;
+        let sig = feats.matmul(&r)?;
+        let norms = feats.sqr()?.sum(1)?.sqrt()?;
+        let starts = Tensor::new(
+            img.segment_starts
+                .iter()
+                .map(|&s| s as u32)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            device,
+        )?;
+        let anchors = feats.index_select(&starts, 0)?;
+        let mut net_ok = shape_ok;
+        for (stage, got, want) in [
+            (
+                "signature",
+                &sig,
+                read_golden_gz(&golden_dir, &img.truth_signature, device)?,
+            ),
+            (
+                "row_norms",
+                &norms,
+                read_golden_gz(&golden_dir, &img.truth_row_norms, device)?,
+            ),
+            (
+                "anchor_rows",
+                &anchors,
+                read_golden_gz(&golden_dir, &img.truth_anchor_rows, device)?,
+            ),
+        ] {
+            let d = max_diff(got, &want)?;
+            let reference = *img
+                .reference_f32_distance
+                .get(stage)
+                .with_context(|| format!("golden has no reference_f32_distance.{stage}"))?;
+            let pass = d.rel_to_scale <= NOISE_MULTIPLE * reference;
+            println!(
+                "{:<8} {stage:<12} to the f64 truth: ours {:.3e}, transformers f32 {:.3e} \
+                 ({:.2}x){}",
+                img.name,
+                d.rel_to_scale,
+                reference,
+                d.rel_to_scale / reference,
+                if pass { "" } else { "  OVER" }
+            );
+            net_ok &= pass;
+        }
+        println!(
+            "{:<8} features {:?} (want {:?}), segments {}",
+            img.name,
+            feats.dims(),
+            img.features_shape,
+            if shape_ok { "match" } else { "DIFFER" }
+        );
+        ok &= net_ok;
+    }
+
+    println!();
+    let bound = format!(
+        "network within {NOISE_MULTIPLE}x the f32 reference's own distance from the f64 truth; \
+         tiles and ids exact"
+    );
+    if ok {
+        println!("GATE-TILES PASS  ({bound})");
+        Ok(())
+    } else {
+        println!("GATE-TILES FAIL  ({bound})");
+        std::process::exit(1);
+    }
+}
+
 fn model_dir(args: &Args) -> Result<std::path::PathBuf> {
     args.model_dir
         .clone()
@@ -715,28 +948,52 @@ fn vl_config(model_dir: &std::path::Path) -> Result<Lfm2VlConfig> {
     serde_json::from_str(&raw).context("parsing the VL half of config.json")
 }
 
-/// Decode an image file and resize it to the patch grid the processor chooses.
-fn load_and_resize(path: &str, proc: &ImageProcessor) -> Result<(Vec<u8>, usize, usize)> {
+/// Decode an image file to interleaved RGB8, `(rgb, height, width)`. The
+/// resize is the processor's (`ImageProcessor::tiles_rgb8`), byte for byte the
+/// reference's; decoding is the `image` crate's, which for PNG is lossless and
+/// so exact.
+fn decode_rgb8(path: &str) -> Result<(Vec<u8>, usize, usize)> {
     let img = image::ImageReader::open(path)
         .with_context(|| format!("opening {path}"))?
         .decode()
-        .with_context(|| format!("decoding {path}"))?;
-    let (w0, h0) = {
-        use image::GenericImageView;
-        img.dimensions()
-    };
-    let (rows, cols) = proc.target_grid(h0 as usize, w0 as usize);
-    let (th, tw) = (rows * proc.patch_size, cols * proc.patch_size);
-    // CatmullRom is a bicubic; `processor_config.json` asks for `resample: 3`.
-    // This is an approximation to the reference's antialiased path and is
-    // recorded as one — it is why the numeric gate uses synthetic patches
-    // rather than a decoded file.
-    let resized = img.resize_exact(
-        tw as u32,
-        th as u32,
-        image::imageops::FilterType::CatmullRom,
-    );
-    Ok((resized.to_rgb8().into_raw(), rows, cols))
+        .with_context(|| format!("decoding {path}"))?
+        .to_rgb8();
+    let (w, h) = img.dimensions();
+    Ok((img.into_raw(), h as usize, w as usize))
+}
+
+/// SHA-256 over ids as little-endian `u32`: `lfm2-determinism`'s token digest
+/// and `lloom chat`'s `tokens_sha256` / `prompt_ids_sha256`.
+fn ids_sha256(ids: &[u32]) -> String {
+    let mut h = sha256::Sha256::new();
+    for id in ids {
+        h.update(&id.to_le_bytes());
+    }
+    sha256::hex(&h.finalize())
+}
+
+/// The prompt the reference processor builds for one user turn holding an
+/// image then `prompt`: the checkpoint template's BOS and user turn
+/// (`chat_template.jinja` renders an image part as `<image>`), and `<image>`
+/// expanded to the image's delimiters and tile runs (`Lfm2VlProcessor`).
+fn reference_prompt(
+    tokenizer: &tokenizers::Tokenizer,
+    bos_token_id: Option<u32>,
+    placeholder: &str,
+    prompt: &str,
+) -> Result<Vec<u32>> {
+    let bos = bos_token_id
+        .and_then(|id| tokenizer.id_to_token(id))
+        .unwrap_or_default();
+    let templated =
+        format!("{bos}<|im_start|>user\n{placeholder}{prompt}<|im_end|>\n<|im_start|>assistant\n");
+    // The template carries the BOS; the processor tokenizes with
+    // `add_special_tokens=False`, as this does.
+    Ok(tokenizer
+        .encode(templated.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
+        .get_ids()
+        .to_vec())
 }
 
 struct Run {
@@ -744,6 +1001,10 @@ struct Run {
     image: String,
     text: String,
     tokens: usize,
+    tokens_sha256: String,
+    prompt_ids: usize,
+    prompt_sha256: String,
+    tiles: usize,
     hit_eos: bool,
     census: Option<DispatchCensus>,
 }
@@ -758,14 +1019,14 @@ fn generate_with_image(
     model: &Model,
     encoder: &VisionEncoder,
     cfg: &Lfm2VlConfig,
+    proc: &ImageProcessor,
     config: &lloom::models::lfm2::Config,
     tokenizer: &tokenizers::Tokenizer,
     eos_ids: &[u32],
     vision_runs: &mut usize,
 ) -> Result<Run> {
-    let proc = ImageProcessor::default();
-    let (rgb, rows, cols) = load_and_resize(image_path, &proc)?;
-    let processed = proc.patchify_rgb8(&rgb, rows, cols, device, dtype)?;
+    let (rgb, height, width) = decode_rgb8(image_path)?;
+    let prepared = proc.prepare_rgb8(&rgb, height, width, device, dtype)?;
 
     // The dispatch census's first window starts here: everything recorded
     // before it (weight loads, the previous request) is discarded.
@@ -777,7 +1038,7 @@ fn generate_with_image(
     // ONE call, before the prefill. Everything after this attends to the result
     // through the KV cache.
     let features = encoder
-        .forward(&processed.patches, processed.rows, processed.cols)
+        .encode_image(&prepared)
         .context("encoding the image")?;
     *vision_runs += 1;
     let n_image_tokens = features.dim(0)?;
@@ -791,25 +1052,11 @@ fn generate_with_image(
     // encoder produced rows. `merge_image_features` refuses if they disagree,
     // which is what keeps a miscount loud.
     //
-    // The `<|image_start|>` / `<|image_end|>` delimiters are the reference
-    // processor's `use_image_special_tokens`, which this checkpoint's config
-    // sets to `true`. They are ORDINARY tokens with their own embeddings
-    // (125009 and 125010) — they are not image positions and take no features.
-    // Omitting them would put the image tokens somewhere the model was never
-    // trained to find them, and nothing downstream would say so.
-    let image_placeholder = format!(
-        "<|image_start|>{}<|image_end|>",
-        "<image>".repeat(n_image_tokens)
-    );
-    let templated = format!(
-        "<|im_start|>user\n{image_placeholder}{}<|im_end|>\n<|im_start|>assistant\n",
-        args.prompt
-    );
-    let ids = tokenizer
-        .encode(templated.as_str(), true)
-        .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
-        .get_ids()
-        .to_vec();
+    // The delimiters (`<|image_start|>`, `<|img_row_R_col_C|>`,
+    // `<|img_thumbnail|>`, `<|image_end|>`) are ORDINARY tokens with their own
+    // embeddings; they are not image positions and take no features.
+    let placeholder = proc.placeholder(&prepared.layout, cfg.use_image_special_tokens);
+    let ids = reference_prompt(tokenizer, config.bos_token_id, &placeholder, &args.prompt)?;
     anyhow::ensure!(!ids.is_empty(), "prompt tokenized to nothing");
 
     let n_placeholders = ids.iter().filter(|&&t| t == cfg.image_token_id).count();
@@ -876,6 +1123,10 @@ fn generate_with_image(
         image: image_path.to_string(),
         text,
         tokens: generated.len(),
+        tokens_sha256: ids_sha256(&generated),
+        prompt_ids: ids.len(),
+        prompt_sha256: ids_sha256(&ids),
+        tiles: prepared.tiles.len(),
         hit_eos,
         census,
     })
@@ -966,6 +1217,9 @@ fn main() -> Result<()> {
     if args.gate {
         return run_gate(&args, &device);
     }
+    if args.gate_tiles {
+        return run_gate_tiles(&args, &device);
+    }
 
     let image = args
         .image
@@ -992,6 +1246,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("reading {}", model_dir.join("config.json").display()))?;
     let config = parse_config(&config_raw)?;
     let vl_cfg = vl_config(&model_dir)?;
+    let proc = ImageProcessor::from_checkpoint(&model_dir)?;
 
     let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
         .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
@@ -1007,19 +1262,18 @@ fn main() -> Result<()> {
 
     // Under `--census` each constructor gets its own recording backend, so the
     // two load sets are observed separately rather than inferred.
-    let header = header_sizes(&files)?;
-    let header_names: Vec<String> = header.keys().cloned().collect();
-    let (vb_raw_lang, vb_raw_vision, flags) = if args.census {
+    let (vb_raw_lang, vb_raw_vision, records) = if args.census {
         anyhow::ensure!(
             matches!(device, Device::Metal(_)),
             "--census reads the Metal recorder and the Metal pool; run it on Metal"
         );
-        let (lang, lang_flags) = Recording::new(&files, &header_names)?;
-        let (vision, vision_flags) = Recording::new(&files, &header_names)?;
+        // SAFETY: the checkpoint is not modified while mapped.
+        let (lang, lang_rec) = unsafe { RecordingBackend::over_safetensors(&files)? };
+        let (vision, vision_rec) = unsafe { RecordingBackend::over_safetensors(&files)? };
         (
             VarBuilder::from_backend(Box::new(lang), dtype, device.clone()),
             VarBuilder::from_backend(Box::new(vision), dtype, device.clone()),
-            Some((lang_flags, vision_flags)),
+            Some((lang_rec, vision_rec)),
         )
     } else {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
@@ -1044,9 +1298,11 @@ fn main() -> Result<()> {
         .context("constructing the vision tower + projector")?;
     let live_vision = pool_live(&device)?;
 
-    if let Some((lang_flags, vision_flags)) = &flags {
-        let language = loaded_names(&header_names, lang_flags);
-        let vision = loaded_names(&header_names, vision_flags);
+    if let Some((lang_rec, vision_rec)) = &records {
+        let header: BTreeMap<String, usize> =
+            lang_rec.header().map(|(n, b)| (n.to_string(), b)).collect();
+        let (language, vision): (BTreeSet<String>, BTreeSet<String>) =
+            (lang_rec.loaded(), vision_rec.loaded());
         load_census(&header, &language, &vision)?;
         let gb = |b: u64| b as f64 / 1e9;
         let language_bytes: usize = language.iter().map(|n| header[n]).sum();
@@ -1091,6 +1347,7 @@ fn main() -> Result<()> {
         &model,
         &encoder,
         &vl_cfg,
+        &proc,
         &config,
         &tokenizer,
         &eos_ids,
@@ -1107,6 +1364,7 @@ fn main() -> Result<()> {
             &model,
             &encoder,
             &vl_cfg,
+            &proc,
             &config,
             &tokenizer,
             &eos_ids,
@@ -1126,6 +1384,10 @@ fn main() -> Result<()> {
             } else {
                 "hit --max-tokens"
             }
+        );
+        println!(
+            "  tiles={} prompt_ids={} prompt_ids_sha256={} tokens_sha256={}",
+            run.tiles, run.prompt_ids, run.prompt_sha256, run.tokens_sha256
         );
         println!();
 

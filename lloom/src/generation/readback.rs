@@ -513,7 +513,11 @@ impl Geometry {
 ///
 /// * **EOS**: the loop retracts an EOS token from its history and reuses the
 ///   slot, but the stamp counted it; the reader stops at the first stop id it
-///   sees and reports `ended()` — after that it reads nothing more.
+///   sees and reports `ended()` — after that it reads nothing more. Every such
+///   retraction leaves the stamp one further ahead of the history's slots for
+///   the rest of the ring's life, so the reader maps a stamp to its slot
+///   through the shift the ring had when the reader was taken (`slot_shift`),
+///   which holds for every token of the run it was taken for.
 /// * **Laps**: the loop's lap guard protects the loop's own drain, not this
 ///   reader. If the reader falls more than `capacity` tokens behind the writer,
 ///   `read_new` returns [`RingLap`] rather than stale slots; how far behind a
@@ -535,7 +539,14 @@ pub struct RingReader {
     tiles_per_seg: usize,
     total_tiles: usize,
     eos_ids: Vec<u32>,
+    /// The last stamp this reader has consumed.
     cursor: usize,
+    /// The ring's generation when the reader was taken: the stamp before the
+    /// first token of the run the reader was taken for.
+    head: usize,
+    /// Added to a stamp ordinal, modulo `total_tiles`, to give its slot: the
+    /// history slots run behind the stamps by one per EOS retracted so far.
+    slot_shift: usize,
     ended: bool,
 }
 
@@ -576,7 +587,7 @@ impl RingReader {
         None
     }
 
-    /// Tokens consumed so far (EOS excluded), the reader's own position.
+    /// The last stamp consumed, EOS included — the reader's own position.
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -586,21 +597,15 @@ impl RingReader {
         self.ended
     }
 
-    /// Skip everything published so far: a reader taken for a LATER run on the
-    /// same ring (a follow-up turn) starts at the current stamp instead of at
-    /// zero, where it would re-read the earlier runs' tokens — and their EOS,
-    /// which would end it at once. The stamp counter runs across runs; the
-    /// previous run's tail synchronised, so the word read here is final.
-    ///
-    /// Valid when every earlier run stamped once per token it wrote — the
-    /// adaptive commit's arms (`publish_marker` per step, no retraction). A
-    /// per-step poll run that ended on an EOS retracted that token's tile
-    /// (`eos_of_last`) but not its stamp, so after it the stamp is one ahead
-    /// of the tiles and a reader resumed here would start one token late.
+    /// Skip everything the ring had published when this reader was taken: a
+    /// reader for a LATER run on the same ring (a follow-up turn, the next
+    /// request on a pooled ring) starts at that run's first token instead of
+    /// at zero, where it would re-read the earlier runs' tokens — and their
+    /// EOS, which would end it at once. The position is the ring's own count
+    /// of the stamps it issued ([`Ring::reader`]), not a load of the device
+    /// word, so it is exact whether or not the earlier run's tail has landed.
     pub fn resume_at_published(&mut self) {
-        if let Some(p) = self.published() {
-            self.cursor = p as usize;
-        }
+        self.cursor = self.head;
     }
 
     /// The tokens published since the last call, appended to `out`; stops at
@@ -634,7 +639,7 @@ impl RingReader {
         {
             let mut n = 0usize;
             while self.cursor < published {
-                let t = self.cursor % self.total_tiles;
+                let t = (self.cursor + self.slot_shift) % self.total_tiles;
                 let seg = t / self.tiles_per_seg;
                 let off = t % self.tiles_per_seg;
                 // SAFETY: a mapped pointer into a buffer `_segments` keeps alive,
@@ -1056,8 +1061,8 @@ impl History {
         Ok(())
     }
 
-    /// The generation ordinal = `fed` (one per published real token,
-    /// EOS-retracted). Matches the device stamp the drain clamps to.
+    /// The real tokens written, EOS-retracted: `fed`. The device stamp counts
+    /// the retracted EOS too, and runs ahead of this by [`Ring::stamps_ahead`].
     fn generation(&self) -> usize {
         self.fed
     }
@@ -1591,6 +1596,13 @@ impl Ring {
     /// off Metal, when the ring's words are not CPU-mapped, or on a
     /// `quantum > 1` layout (no slot-per-token indexing). Take it before the
     /// run; it costs the loop nothing afterwards.
+    ///
+    /// The reader starts at stamp zero; on a ring an earlier run used,
+    /// [`RingReader::resume_at_published`] starts it at this run's first
+    /// token. Its stamp-to-slot mapping is exact from there on: every
+    /// publish stamps the next generation and writes the next history slot,
+    /// and the two drift apart only when `eos_of_last` retracts an EOS, which
+    /// ends the run.
     pub fn reader(&self) -> Option<RingReader> {
         if self.history.ring.quantum != 1 || !self.ring.poll_is_mapped() {
             return None;
@@ -1611,15 +1623,21 @@ impl Ring {
                 .map(|s| unsafe { s.peek_scalar_ptr::<u32>(0) })
                 .collect::<Option<Vec<_>>>()?;
             let eos_ids = self.ring.eos_ids().ok()?;
+            let total_tiles = self.history.ring.total_tiles;
+            // At quantum 1 the next publish stamps `generation + 1` and
+            // writes slot `fed`.
+            let behind = self.stamps_ahead() % total_tiles;
             Some(RingReader {
                 _segments: segments,
                 _step: step,
                 seg_bases,
                 step_ptr,
                 tiles_per_seg: self.history.ring.tiles_per_seg,
-                total_tiles: self.history.ring.total_tiles,
+                total_tiles,
                 eos_ids,
                 cursor: 0,
+                head: self.generation as usize,
+                slot_shift: (total_tiles - behind) % total_tiles,
                 ended: false,
             })
         }
@@ -2077,6 +2095,20 @@ impl ReadbackStrategy for Ring {
 }
 
 impl Ring {
+    /// Stamps issued beyond the history's real tokens: one for every EOS a
+    /// per-step arm stamped and then retracted (`eos_of_last`), whose slot the
+    /// next write reuses. Changes only at such a retraction, which ends its
+    /// run, so it is fixed for the whole of any later run: stamp `g` of that
+    /// run certifies the history's first `g − stamps_ahead` tokens.
+    fn stamps_ahead(&self) -> usize {
+        let issued = self.generation as usize;
+        debug_assert!(
+            issued >= self.history.fed,
+            "a history token without a stamp"
+        );
+        issued.saturating_sub(self.history.fed)
+    }
+
     /// Stamp every history segment written since the last stamp, oldest first,
     /// each with the generation of its own last slot: every stamp certifies
     /// only slots behind it, and the last carries `fed`.
@@ -2092,11 +2124,12 @@ impl Ring {
     /// The published window `[drained, min(fed, published))` into `out`
     /// (cleared first), advancing the drain — the non-blocking incremental
     /// drain behind [`ReadbackStrategy::take_ids`]. On the stamped arms the
-    /// loop may be ahead of the GPU, so the window is clamped to the generation
-    /// the GPU has published: the slot is written before the stamp, and a read
-    /// past it would read a slot not yet written (§3.5). With no mapped
-    /// counter to clamp to it waits for the GPU instead. The mapped window read
-    /// takes no lock and makes no copy; the copy fallback synchronises.
+    /// loop may be ahead of the GPU, so the window is clamped to the tokens
+    /// the GPU's published stamp certifies ([`Self::stamps_ahead`]): the slot
+    /// is written before the stamp, and a read past it would read a slot not
+    /// yet written (§3.5). With no mapped counter to clamp to it waits for the
+    /// GPU instead. The mapped window read takes no lock and makes no copy;
+    /// the copy fallback synchronises.
     fn drain_window(&mut self, out: &mut Vec<u32>) -> Result<()> {
         out.clear();
         if self.history.undrained() == 0 {
@@ -2109,7 +2142,7 @@ impl Ring {
             | EosRead::HostOnDrain
             | EosRead::GpuBatched
             | EosRead::GpuBatchedNonblocking => match self.ring.published_generation() {
-                Some(g) => fed.min(g as usize),
+                Some(g) => fed.min((g as usize).saturating_sub(self.stamps_ahead())),
                 None => {
                     self.ring.input_device().device().synchronize()?;
                     fed

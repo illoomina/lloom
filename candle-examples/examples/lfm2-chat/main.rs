@@ -3407,7 +3407,13 @@ fn report_replay(exec: &candle::kernels::IcbExecutor, steps: u64) {
         cov.no_pipeline,
         cov.quarantined,
     );
-    eprintln!("[replay: warm_in_skipped={}]", exec.warm_in_skipped());
+    eprintln!(
+        "[replay: warm_in_skipped={} generations_built={} pipeline_refreshes={} skipped_steps={}]",
+        exec.warm_in_skipped(),
+        exec.generations_built(),
+        exec.pipeline_refreshes(),
+        exec.skipped_steps()
+    );
     let ranges = trace::execute_range_count();
     let use_resource = trace::use_resource_count();
     let steps = steps.max(1) as f64;

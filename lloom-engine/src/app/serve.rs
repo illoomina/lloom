@@ -29,6 +29,7 @@
 
 use super::common::{ms, MemSnapshot, NEVER_EOS};
 use super::served::Served;
+use super::vision::{expand_image_tokens, split_image_parts, DecodedImage};
 use crate::{DecodeParams, Decoded, Stop};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -288,7 +289,7 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
     };
     match result {
         Ok(Reply::Json(v)) => respond_json(request, 200, &v),
-        Ok(Reply::Stream(stream)) => stream_response(shared, request, stream),
+        Ok(Reply::Stream(stream)) => stream_response(shared, request, *stream),
         Ok(Reply::Eval(v)) => eval(shared, request, &v),
         Err(Failure::BadRequest(m)) => respond_error(request, 400, &m),
         Err(Failure::NotFound(m)) => respond_error(request, 404, &m),
@@ -298,7 +299,7 @@ fn handle_model_request(shared: &Shared, path: &str, mut request: Request) -> Re
 
 enum Reply {
     Json(Value),
-    Stream(StreamingRun),
+    Stream(Box<StreamingRun>),
     Eval(Value),
 }
 
@@ -306,9 +307,27 @@ enum Reply {
 struct StreamingRun {
     kind: StreamKind,
     prompt_ids: Vec<u32>,
+    /// The chat's images, in the order their `<image>` positions appear.
+    images: Vec<DecodedImage>,
     params: DecodeParams,
     id: String,
     model: String,
+}
+
+/// One decode of `prompt_ids`, through the image path when the request
+/// carries images.
+fn run_decode(
+    engine: &dyn Served,
+    prompt_ids: &[u32],
+    images: &[DecodedImage],
+    params: &DecodeParams,
+    on_fragment: &mut (dyn FnMut(&str) -> bool + Send),
+) -> Result<Decoded> {
+    if images.is_empty() {
+        engine.complete_until(prompt_ids, params, on_fragment)
+    } else {
+        engine.complete_images_until(prompt_ids, images, params, on_fragment)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -391,13 +410,14 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
     }
     let id = format!("cmpl-{}", short_id());
     if stream {
-        return Ok(Reply::Stream(StreamingRun {
+        return Ok(Reply::Stream(Box::new(StreamingRun {
             kind: StreamKind::Completion,
             prompt_ids,
+            images: Vec::new(),
             params,
             id,
             model,
-        }));
+        })));
     }
     let started = Instant::now();
     let decoded = shared.engine.complete(&prompt_ids, &params, &mut |_| {})?;
@@ -440,9 +460,22 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     let want_logprobs = v.get("logprobs").and_then(Value::as_bool).unwrap_or(false);
     let kwargs = v.get("chat_template_kwargs");
 
+    // OpenAI `image_url` parts become the template's `{"type": "image"}`;
+    // string content passes through untouched.
+    let (messages, images) = split_image_parts(messages).map_err(|e| bad(format!("{e:#}")))?;
     let prompt_ids = {
         let engine = shared.engine.as_ref();
-        let rendered = engine.render_chat(messages, kwargs)?;
+        let rendered = engine.render_chat(&messages, kwargs)?;
+        let rendered = if images.is_empty() {
+            rendered
+        } else {
+            let expansions = images
+                .iter()
+                .map(|img| engine.image_placeholder(img))
+                .collect::<Result<Vec<_>>>()
+                .map_err(|e| bad(format!("{e:#}")))?;
+            expand_image_tokens(&rendered, &expansions).map_err(|e| bad(format!("{e:#}")))?
+        };
         let ids = engine.encode(&rendered, true)?;
         if let Some(bos) = engine.bos_id() {
             if ids.iter().filter(|&&t| t == bos).count() > 1 {
@@ -456,6 +489,9 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     if want_logprobs {
         if stream {
             return Err(bad("logprobs with stream is not supported"));
+        }
+        if !images.is_empty() {
+            return Err(bad("logprobs with an image is not supported"));
         }
         let top_k = v
             .get("top_logprobs")
@@ -505,16 +541,23 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     }
 
     if stream {
-        return Ok(Reply::Stream(StreamingRun {
+        return Ok(Reply::Stream(Box::new(StreamingRun {
             kind: StreamKind::Chat,
             prompt_ids,
+            images,
             params,
             id,
             model,
-        }));
+        })));
     }
     let started = Instant::now();
-    let decoded = shared.engine.complete(&prompt_ids, &params, &mut |_| {})?;
+    let decoded = run_decode(
+        shared.engine.as_ref(),
+        &prompt_ids,
+        &images,
+        &params,
+        &mut |_| true,
+    )?;
     let elapsed = started.elapsed();
     report(
         "/v1/chat/completions",
@@ -522,7 +565,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         &decoded,
         ms(elapsed),
     );
-    Ok(Reply::Json(json!({
+    let mut body = json!({
         "id": id,
         "object": "chat.completion",
         "created": now(),
@@ -535,7 +578,9 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         }],
         "usage": usage(prompt_ids.len(), decoded.tokens.len()),
         "timings": timings(prompt_ids.len(), &decoded, elapsed),
-    })))
+    });
+    attach_vision(shared, &mut body);
+    Ok(Reply::Json(body))
 }
 
 /// The sampling knobs both OpenAI endpoints share.
@@ -646,23 +691,29 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         // The callback runs on the decode thread: it serialises the chunk and
         // queues it; the socket write happens on the writer thread. A client
         // that went away stops the run at the next drained batch.
-        engine.complete_until(&run.prompt_ids, &run.params, &mut |frag| {
-            if sw.client_gone() {
-                return false;
-            }
-            let chunk = match kind {
-                StreamKind::Completion => json!({
-                    "id": id, "object": "text_completion", "created": created, "model": model,
-                    "choices": [{ "index": 0, "text": frag, "logprobs": null, "finish_reason": null }],
-                }),
-                StreamKind::Chat => json!({
-                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                    "choices": [{ "index": 0, "delta": { "content": frag }, "finish_reason": null }],
-                }),
-            };
-            sw.event(&chunk);
-            true
-        })
+        run_decode(
+            engine,
+            &run.prompt_ids,
+            &run.images,
+            &run.params,
+            &mut |frag| {
+                if sw.client_gone() {
+                    return false;
+                }
+                let chunk = match kind {
+                    StreamKind::Completion => json!({
+                        "id": id, "object": "text_completion", "created": created, "model": model,
+                        "choices": [{ "index": 0, "text": frag, "logprobs": null, "finish_reason": null }],
+                    }),
+                    StreamKind::Chat => json!({
+                        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [{ "index": 0, "delta": { "content": frag }, "finish_reason": null }],
+                    }),
+                };
+                sw.event(&chunk);
+                true
+            },
+        )
     };
     let (mut w, write_err) = sw.finish()?;
     let decoded = decoded?;
@@ -687,6 +738,10 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             "timings": timings(run.prompt_ids.len(), &decoded, elapsed),
         }),
     };
+    let mut last = last;
+    if let StreamKind::Chat = run.kind {
+        attach_vision(shared, &mut last);
+    }
     w.event(&last)?;
     w.raw("data: [DONE]\n\n")?;
     w.finish()
@@ -1331,6 +1386,17 @@ fn now() -> u64 {
 
 fn short_id() -> String {
     format!("{:016x}", rand::random::<u64>())
+}
+
+/// The per-request vision report (`Served::vision_report`: the model's
+/// tensors, whether the tower is loaded, the image census) as a `vision`
+/// field beside `timings`, and on stderr. Nothing for a family without vision.
+fn attach_vision(shared: &Shared, body: &mut Value) {
+    let report = shared.engine.vision_report();
+    if !report.is_null() {
+        eprintln!("[vision: {report}]");
+        body["vision"] = report;
+    }
 }
 
 fn finish_reason(stop: Stop) -> &'static str {

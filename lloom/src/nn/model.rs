@@ -272,11 +272,13 @@ pub trait Speculative: CausalLM {
 /// merges the encoded rows into the residual stream at the image-token positions
 /// before the prefill, so nothing here runs on the per-token path.
 ///
-/// `Input` is the host stage, not raw pixels: patchification, resizing and
-/// normalisation happen on the CPU (`ProcessedImage`), so `encode` takes an
-/// already-patchified `[1, n_patches, C*P*P]` sequence with its `(rows, cols)`.
-/// The result is `[n_image_tokens, text_hidden]` — one row per image token, in
-/// the text model's hidden size, ready for the host-side merge.
+/// `Input` is the host stage, not raw pixels: resizing, tiling, patchification
+/// and normalisation happen on the CPU, so `encode` takes one image's tiles,
+/// each an already-patchified `[1, n_patches, C*P*P]` sequence with its
+/// `(rows, cols)` (`lfm2_vl::PreparedImage`). The result is
+/// `[n_image_tokens, text_hidden]` — one row per image token over every tile, in
+/// the order the prompt reserves them, in the text model's hidden size, ready
+/// for the host-side merge.
 ///
 /// The trait shares its name with `lfm2_vl::VisionEncoder`, the concrete tower
 /// it is first implemented for; §5 names both, and they sit in different modules.

@@ -428,6 +428,25 @@ pub struct PassPlans {
     admit_fraction: f64,
 }
 
+/// The pass-plan cache set aside by [`MetalDevice::pause_pass_plans`];
+/// dropping it puts the cache back.
+#[must_use = "the cache is back as soon as the guard drops"]
+pub struct PassPlansPaused<'a> {
+    device: &'a MetalDevice,
+    saved: Option<PassPlans>,
+}
+
+impl Drop for PassPlansPaused<'_> {
+    fn drop(&mut self) {
+        if let Some(pp) = self.saved.take() {
+            *self.device.pass_plans.lock() = Some(pp);
+            self.device
+                .pass_state
+                .fetch_or(0b01, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// One cached plan as the harness reports it: `(key, ordinals served,
 /// ordinals recorded, undeclared escapes)`.
 pub type PassPlanEntry = (PassKey, usize, usize, usize);
@@ -1691,6 +1710,41 @@ impl MetalDevice {
 
     pub fn pass_plans_enabled(&self) -> bool {
         self.pass_plans.lock().is_some()
+    }
+
+    /// Set the pass-plan cache aside until the returned guard drops, for
+    /// passes that belong to no sequence (a load warmup): they run on the
+    /// pool, record nothing and are served nothing, and the cache comes back
+    /// exactly as it was.
+    ///
+    /// A plan is valid only for the allocation sequence its key was recorded
+    /// under, and such passes need not share it: a model that brackets its
+    /// own passes opens them after its embedding, a driver before, so one key
+    /// names two sequences one allocation apart — which size and position
+    /// coincide across (§9.2aa). A key left pending would have the paused
+    /// passes recorded into it; its recording is dropped and it records
+    /// again on its next sight. Refused while a pass is open.
+    pub fn pause_pass_plans(&self) -> Result<PassPlansPaused<'_>> {
+        let mut g = self.pass_plans.lock();
+        if g.as_ref().is_some_and(|pp| pp.current.is_some()) {
+            return Err(MetalError::Message(
+                "pause_pass_plans: a pass is open (finish_pass was not called)".to_string(),
+            )
+            .into());
+        }
+        let mut saved = g.take();
+        drop(g);
+        if let Some(pp) = saved.as_mut() {
+            if pp.pending.take().is_some() {
+                let _ = self.finish_arena_recording(pp.layout);
+            }
+            self.pass_state
+                .fetch_and(!0b01, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(PassPlansPaused {
+            device: self,
+            saved,
+        })
     }
 
     /// Whether a plan for `key` is cached: the pass will be served from the

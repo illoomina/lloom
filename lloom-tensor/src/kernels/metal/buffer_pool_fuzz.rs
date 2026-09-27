@@ -132,8 +132,9 @@ impl Model {
         self.free.values().filter(|c| **c > 0).count()
     }
 
-    /// The contract of `acquire`: exact bucket first, then the smallest bucket
-    /// strictly larger. Returns the bucket size served, if any.
+    /// The lookup half of `acquire`'s contract: exact bucket first, then the
+    /// smallest bucket strictly larger. Returns the bucket size served, if any.
+    /// `acquire` drains first; the caller runs [`Self::drain`] before this.
     fn acquire(&mut self, size: usize) -> Option<usize> {
         self.lookups += 1;
         let bucket = if self.free.get(&size).is_some_and(|c| *c > 0) {
@@ -256,6 +257,9 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<(), String> {
         match op {
             Op::Alloc { size } => {
                 let size = (*size).max(1);
+                // `acquire` drains what the clock says completed before it
+                // looks: completion only advances the clock (§6.4e).
+                model.drain();
                 match pool.acquire(size) {
                     Some(b) => {
                         let served = model

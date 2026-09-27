@@ -345,6 +345,31 @@ impl ResidencySet {
         self.remove_batch(std::iter::once(buf))
     }
 
+    /// [`Self::remove_batch`] without the commit: each buffer the set holds is
+    /// `removeAllocation`'d and the set goes dirty, so the next command-buffer
+    /// cut's [`Self::commit_pending`] publishes the round with whatever it
+    /// commits anyway. For an eviction round on the encoding thread, where a
+    /// commit per round would be a driver round-trip on the hot path.
+    pub fn remove_batch_deferred<'a>(&self, bufs: impl IntoIterator<Item = &'a Buffer>) -> usize {
+        let Some(set) = &self.raw else {
+            return 0;
+        };
+        self.remove_batches.fetch_add(1, Ordering::Relaxed);
+        let mut members = self.members.lock();
+        let mut removed = 0usize;
+        for buf in bufs {
+            if members.remove(&allocation_key(buf)) {
+                set.removeAllocation(as_allocation(buf));
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.removed.fetch_add(removed as u64, Ordering::Relaxed);
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+        removed
+    }
+
     /// `removeAllocation` without the commit: the set goes dirty and the next
     /// command-buffer cut's [`Self::commit_pending`] publishes it — the mirror
     /// of [`Self::add`]. For a handle dropped on a hot path (an unpooled

@@ -2919,15 +2919,11 @@ impl BackendDevice for MetalDevice {
                 heap_chunk_bytes(),
             ),
         ));
-        {
-            // Subscribed here, before any work is encoded, so no command buffer
-            // completes without a subscriber to hear it.
-            let (shared, private) = (buffers.clone(), private_buffers.clone());
-            commands.on_command_buffer_complete(move || {
-                shared.drain_completed_on_completion();
-                private.drain_completed_on_completion();
-            });
-        }
+        // The pools do not subscribe to command-buffer completion. The handler
+        // advances the clock, and each pool drains what it made reusable at
+        // its next `acquire`, on the host: a handler that took the pool's lock
+        // could be descheduled holding it and stall the encoding thread
+        // (`DESIGN.md` §6.4e).
 
         {
             // Installed before any allocation, so no buffer is evicted without

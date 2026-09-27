@@ -67,67 +67,17 @@ pub(crate) struct DeviceTeardown {
 }
 
 /// Unregisters an evicted buffer from the residency set, so Metal releases the
-/// allocation the pool has just destroyed (`DESIGN.md` §6.3c, §6.3e).
+/// allocation the pool has just destroyed. A set retains what it holds, so an
+/// evicted buffer left in it is a retention that reached 48 GB at long context
+/// (`DESIGN.md` §6.3e, §6.3f).
 ///
-/// The pool bounds its free list by **destroying** buffers whose size will not
-/// be asked for again (§6.3b), which is a second place a buffer's existence
-/// ends -- and unlike a trim, nothing was telling the residency set about it.
-///
-/// # Why this calls `removeAllocation` as of #210, having retired the key before
-///
-/// #166 retired the membership key **without** the Metal call, on a measurement:
-/// eager unregistration cost **+0.062 ms/token even batched** against §11.2's
-/// whole 6.1 % non-GPU budget, and the residual was named *"a retention, not a
-/// dangling reference"*. Both halves were right. **What was never asked is what
-/// the retention weighs**, and the answer is **48 GB** (§6.3e, #206): the
-/// pricing was taken at §6.3b's **11.6 evictions per token**, and under
-/// `KvAppend=Cat` at long context the rate is **~220 per token**, at which the
-/// shipping default exhausts a 64 GB device at 97 % of
-/// `recommendedMaxWorkingSetSize`.
-///
-/// **The structural fact that decides the shape, and it is read from this file
-/// rather than argued.** §6.3e offers three: eager always, eager above a
-/// retention threshold, or a sweep folded into the per-command-buffer
-/// completion handler. **The first and the third are the same code.**
-/// `on_evict` is reached only from `PoolInner::drain_completed`, which is
-/// subscribed to `Commands::on_command_buffer_complete` -- so every
-/// steady-state eviction **already runs inside** that handler, once per command
-/// buffer, batched over everything it freed. There is no third site to fold
-/// anything into and no sweep to add; `evict_over_budget`'s only other caller is
-/// `set_free_budget`, which is setup-time.
-///
-/// **And the commit is not additional in the sense the cost argument assumed.**
-/// `ResidencySet::insert` is one buffer and one `commit()`, called from every
-/// pool miss -- so a residency commit is *already* on the per-token path at the
-/// allocation rate, and what a batched eager release adds is **one more per
-/// eviction round**, not one per evicted buffer. §6.3e's *"the `commit()` may
-/// not be additional"* is right about the mechanism and located it in the wrong
-/// place: it is the *allocation* commit that was already there.
-///
-/// **The threshold shape is rejected on evidence rather than on taste.** It
-/// needs a retention figure nobody has measured a threshold against, and §9.1a
-/// is the worked case of what that costs -- three policies, all built, none
-/// chosen, because the separating axis was never exercised. A threshold here
-/// would also be a knob whose wrong setting reproduces exactly this defect
-/// silently, where the unconditional form has no setting to get wrong.
-///
-/// # The measurement that put it here
-///
-/// #166's figures, which stand and are the bar this had to beat:
-///
-/// ```text
-///   baseline                                        0.928  0.936  0.932
-///   unregister eagerly, one call per buffer         1.009  1.016  1.050   +0.087
-///   unregister eagerly, one call per batch          0.993  0.998  0.993   +0.062
-///   retire the key, remove at teardown              0.941  0.928  0.945    +0.00
-/// ```
-///
-/// **A per-allocation Metal call is forbidden and this is not one** (§9.5e's
-/// premise, from #167's own ablation: *accounting is cheap, calling into Metal
-/// is not*). The call is per eviction **round**, batched by
-/// `BufferEvictionObserver::on_evict`'s contract, which exists for exactly this
-/// reason -- #166 measured the per-buffer form at +0.087 and the batched form at
-/// +0.062, and the difference between them is the commit count.
+/// Called on the host, from the pool's drain -- inside `acquire` on the
+/// encoding thread, or an explicit drain (§6.4e) -- once per eviction round
+/// with every buffer the round destroys. It
+/// `removeAllocation`s them and leaves the commit to the next command-buffer
+/// cut's `commit_pending`, which publishes the round with the cut's own
+/// staged allocations: a commit per round there would be a driver
+/// round-trip on the hot path (§6.3h's rule for a host-side removal).
 pub(crate) struct ResidencyEvictionObserver {
     residency_set: Arc<ResidencySet>,
     /// The transient chunks (§6.3k): an evicted sub-buffer's range goes
@@ -149,9 +99,8 @@ impl ResidencyEvictionObserver {
 
 impl crate::kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver {
     fn on_evict(&self, buffers: &[Buffer]) {
-        // One Metal call per eviction ROUND, never per buffer: `on_evict` is
-        // handed everything one round destroys, and `remove_batch` issues one
-        // `commit()` for the lot.
+        // One membership update per eviction ROUND, never per buffer:
+        // `on_evict` is handed everything one round destroys.
         //
         // Both arms stay selectable (§12.3, §7.1a): `retire_batch` is the arm
         // #166's +0.062 ms was measured on, so a re-measurement has something to
@@ -171,7 +120,10 @@ impl crate::kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver
         if retain_evicted_allocations() {
             self.residency_set.retire_batch(rest.into_iter());
         } else {
-            self.residency_set.remove_batch(rest.into_iter());
+            // Removed now, committed at the next cut: eviction runs on the
+            // encoding thread, inside `acquire` (§6.4e), where a commit per
+            // round would be a driver round-trip on the hot path.
+            self.residency_set.remove_batch_deferred(rest.into_iter());
         }
     }
 }

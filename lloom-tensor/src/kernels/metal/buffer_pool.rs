@@ -637,10 +637,9 @@ pub fn reuse_oversize_bound() -> Option<f64> {
 /// never who releases a buffer or when. No caller is asked to free anything,
 /// and every buffer evicted under either arm was already free.
 ///
-/// **`acquire` is untouched**, which is what keeps this off §3.3's no-O(N)
-/// list from the other side: the cost moves to the eviction path, which already
-/// runs inside the per-command-buffer completion handler (§6.3f) rather than on
-/// the encode path.
+/// **`acquire`'s lookup is untouched**, and neither arm scans: the cost is on
+/// the eviction path, `O(log n)` per evicted buffer under `Size`, paid at the
+/// drain that pushed the free list over budget (§6.4e).
 pub fn eviction_order() -> EvictionOrder {
     match crate::tuning::tuning().pool.eviction_order.as_str() {
         "size" | "largest" => EvictionOrder::Size,
@@ -993,9 +992,11 @@ pub trait BufferEvictionObserver: Send + Sync {
     /// pays one. Per-buffer measured **+0.087 ms/token of non-GPU time — 9 % of
     /// §11.2's 6.1 % budget**; batched is inside the noise.
     ///
-    /// Called with the pool's lock **released**, and before the buffers are
-    /// dropped, so the observer may take its own locks and is looking at
-    /// allocations that still exist.
+    /// Called on the host thread that drained -- the encoding thread, from
+    /// `acquire` (§6.4e) -- with the pool's lock **released**, and before the
+    /// buffers are dropped, so the observer may take its own locks and is
+    /// looking at allocations that still exist. It runs on the hot path: no
+    /// driver round-trip per call.
     fn on_evict(&self, buffers: &[Buffer]);
 }
 
@@ -1107,17 +1108,21 @@ impl PoolInner {
         // `PoolCounters` is what let `reset_counters` zero it.
     }
 
-    /// Moves everything whose epoch has completed into the free lists.
+    /// Moves everything whose epoch has completed into the free lists, then
+    /// evicts past the budget. Returns what eviction took, for the caller to
+    /// hand to [`Self::notify_evicted`] once the lock is dropped.
     ///
-    /// Called from a command buffer's completion handler -- **once per command
-    /// buffer, not once per buffer**. A handler per pooled buffer would put
-    /// thousands of block allocations on the decode path; this puts one, and it
-    /// releases every buffer that command buffer was holding up.
+    /// Runs on the host under a lock the caller already holds -- at every
+    /// `acquire`, and from the explicit drains. No completion handler calls
+    /// it: the handler only advances the clock this reads, so the encoding
+    /// thread never waits on a completion thread descheduled while holding
+    /// the pool (`DESIGN.md` §6.4e).
     ///
     /// `pending` is ordered by epoch, so this stops at the first entry still
-    /// outstanding rather than walking the rest.
-    fn drain_completed(&self, side: Side) {
-        let mut state = self.state.lock(side);
+    /// outstanding rather than walking the rest; with nothing ready it is one
+    /// load of the clock.
+    #[must_use]
+    fn drain_locked(&self, state: &mut PoolState) -> Vec<Buffer> {
         let mut drained = 0u64;
         while let Some(front) = state.pending.front() {
             // `LLOOM_POOL_QUARANTINE=K` (A/B instrument, #748): a released
@@ -1168,16 +1173,23 @@ impl PoolInner {
             state.free.entry(entry.size).or_default().push(entry.buffer);
             drained += 1;
         }
-        if drained > 0 {
-            state.counters.drained += drained;
-            let evicted = state.evict_over_budget();
-            // Drop the lock before telling the observer, and tell it before the
-            // buffers are destroyed: `evicted` still owns them here, so the
-            // residency set is removing an allocation that provably still
-            // exists (`DESIGN.md` §6.3c).
-            drop(state);
-            self.notify_evicted(&evicted);
+        if drained == 0 {
+            return Vec::new();
         }
+        state.counters.drained += drained;
+        state.evict_over_budget()
+    }
+
+    /// [`Self::drain_locked`] under its own acquisition of the lock.
+    fn drain_completed(&self) {
+        let evicted = {
+            let mut state = self.state.lock(Side::Host);
+            self.drain_locked(&mut state)
+        };
+        // Outside the lock, and before `evicted` drops: the residency set is
+        // removing an allocation that provably still exists (`DESIGN.md`
+        // §6.3c).
+        self.notify_evicted(&evicted);
     }
 
     /// Tells the eviction observer about buffers the pool is destroying.
@@ -1244,6 +1256,112 @@ impl Drop for PoolInner {
 }
 
 impl PoolState {
+    /// The lookup half of [`BufferPool::acquire`]: a buffer of at least
+    /// `size` bytes out of the free list, with the counters for it, or `None`.
+    fn take(&mut self, size: usize) -> Option<(Buffer, usize)> {
+        self.counters.lookups += 1;
+
+        // Exact hit. Checked separately from the range query below because it
+        // is the common case in decode -- every token asks for the same shapes
+        // -- and because an exact match is optimal, so there is nothing to gain
+        // by looking further.
+        self.counters.buckets_probed += 1;
+        let found = if let Some(bucket) = self.free.get_mut(&size) {
+            bucket.pop().map(|b| (b, size))
+        } else {
+            None
+        };
+
+        // Otherwise the smallest bucket that can satisfy the request. One
+        // ordered probe: `range` starts at the first key > size and stops.
+        let found = match found {
+            Some(hit) => Some(hit),
+            None => {
+                self.counters.buckets_probed += 1;
+                // The reuse-oversize bound (§9.2v, #47), applied to the
+                // candidate *before* it is popped. `range` yields the smallest
+                // key above the request, so if that one is past the bound then
+                // every other candidate is further past it -- the ordering is
+                // what makes one comparison sufficient and keeps this off
+                // §3.3's no-O(N) list.
+                //
+                // Declining leaves the buffer in the free list rather than
+                // destroying it: it is still the right answer for a larger
+                // request, and evicting on this path would make a lookup
+                // policy into a retention policy. `evict_over_budget` remains
+                // the only thing that removes a free buffer.
+                let bound = self.oversize_bound;
+                let next = self
+                    .free
+                    .range_mut((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
+                    .next()
+                    .filter(|(k, _)| bucket_admissible(size, **k, bound))
+                    .and_then(|(k, v)| v.pop().map(|b| (b, *k)));
+                if next.is_none() && bound.is_some() {
+                    // Only when a candidate existed and the bound is what
+                    // rejected it. An empty range yields `None` too, and
+                    // counting that would make this a miss counter rather than
+                    // the arm's engagement proof (#500).
+                    let had_candidate = self
+                        .free
+                        .range((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
+                        .next()
+                        .is_some();
+                    if had_candidate {
+                        self.counters.oversize_declined += 1;
+                    }
+                }
+                next
+            }
+        };
+
+        let (buffer, bucket_size) = found?;
+
+        // The buffer has left the free list. Its `free_order` entry is left
+        // behind and skipped when eviction reaches it -- removing it here would
+        // mean a linear search, which is exactly what must not be on this path.
+        self.free_bytes = self.free_bytes.saturating_sub(bucket_size);
+
+        // Drop the key when its bucket empties. This is what stops the map
+        // from becoming a graveyard: the old pool's `retain` cleared a bucket's
+        // Vec but left the key, so emptied keys accumulated at ~3.2 per decode
+        // token and were walked forever.
+        if self
+            .free
+            .get(&bucket_size)
+            .is_some_and(|bucket| bucket.is_empty())
+        {
+            self.free.remove(&bucket_size);
+        }
+
+        // Handed to a caller, so it is theirs to touch again. This must happen
+        // before the handle can be observed, or the caller's first legitimate
+        // access is what gets reported (#475).
+        //
+        // SAFETY: the buffer has just left the free list under the pool lock,
+        // so no other handle to it exists. Inert without `asan-poison`.
+        unsafe { super::poison::unpoison_buffer(&buffer) };
+        super::late_bind::on_leave(&buffer);
+
+        self.counters.hits += 1;
+        // The overhang's HIT source (§9.2). `bucket_size` is what the range
+        // query found and `size` is what was asked for; when the exact probe
+        // above missed, the second probe deliberately returns a *larger*
+        // bucket, and the difference is bytes this caller holds and does not
+        // want. Recorded here rather than at `adopt` because on a hit no
+        // allocation happens and `adopt` is never reached.
+        self.counters.requested_bytes += size as u64;
+        self.counters.served_bytes += bucket_size as u64;
+        // Banded by the REQUEST (§9.2u). Keying on `bucket_size` would file
+        // every over-served acquisition under the band of the bucket that
+        // answered it -- which is the band the overhang would then appear to
+        // belong to, true by construction and therefore evidence of nothing.
+        self.counters.record_band(size, bucket_size);
+        self.live_buffers += 1;
+        self.live_bytes += bucket_size;
+        Some((buffer, bucket_size))
+    }
+
     /// Bytes this pool holds that no planner owns (`DESIGN.md` §9.5k).
     ///
     /// `live + free + pending − planned`. All three terms are bytes the process
@@ -1350,8 +1468,8 @@ impl PoolState {
     /// `Age` pops `free_order`'s front and skips stale entries, as it always
     /// has. `Size` reads `free`'s **last key** — a `BTreeMap`, so the largest
     /// bucket is `O(log n)` and there is no walk. Both stay off §3.3's
-    /// no-O(N)-on-the-per-token-path list, and this runs in the completion
-    /// handler rather than on the encode path either way (§6.3f).
+    /// no-O(N)-on-the-per-token-path list; this runs at the host's drain,
+    /// inside `acquire`, on either arm (§6.4e).
     fn take_eviction_victim(&mut self) -> Option<(usize, Buffer)> {
         match self.eviction_order {
             EvictionOrder::Age => loop {
@@ -1440,15 +1558,12 @@ impl BufferPool {
 
     /// Returns every buffer whose epoch has completed to its free list.
     ///
-    /// Call from a command buffer completion handler, once per command buffer.
+    /// `acquire` already does this, so a caller needs it only to see the free
+    /// list current without allocating: after a synchronize, or in a test.
+    /// Never from a completion handler: it takes the lock the encoding thread
+    /// takes (`DESIGN.md` §6.4e).
     pub fn drain_completed(&self) {
-        self.inner.drain_completed(Side::Host);
-    }
-
-    /// [`Self::drain_completed`], from a Metal completion handler: the same
-    /// drain, its lock waits counted on the driver side.
-    pub fn drain_completed_on_completion(&self) {
-        self.inner.drain_completed(Side::Driver);
+        self.inner.drain_completed();
     }
 
     /// Waits on this pool's state lock since construction, `(host, driver)`
@@ -1460,13 +1575,6 @@ impl BufferPool {
         )
     }
 
-    /// Hold the state lock on the calling thread while `f` runs, so a test
-    /// can make another thread wait on it.
-    #[cfg(test)]
-    pub(crate) fn while_state_held<R>(&self, f: impl FnOnce() -> R) -> R {
-        let _g = self.inner.state.lock(Side::Host);
-        f()
-    }
 
     /// Write `byte` over every buffer the moment it becomes free (#706), or
     /// stop. Fuzz builds only -- see `PoolInner::free_poison`.
@@ -1591,114 +1699,26 @@ impl BufferPool {
     /// `None` means the caller should allocate; it does **not** mean the pool
     /// holds nothing of that size, only that nothing of that size is free.
     pub fn acquire(&self, size: usize) -> Option<Arc<PooledBuffer>> {
-        if pool_no_reuse() {
-            // A/B instrument: every request misses, so no allocation is ever
-            // handed to a second tenant (the §2.3.8b "pool reuse disabled"
-            // arm, 0/30 there). Released buffers still park and drain into
-            // the free lists, where eviction bounds them.
-            return None;
-        }
-        let mut state = self.inner.state.lock(Side::Host);
-        state.counters.lookups += 1;
-
-        // Exact hit. Checked separately from the range query below because it
-        // is the common case in decode -- every token asks for the same shapes
-        // -- and because an exact match is optimal, so there is nothing to gain
-        // by looking further.
-        state.counters.buckets_probed += 1;
-        let found = if let Some(bucket) = state.free.get_mut(&size) {
-            bucket.pop().map(|b| (b, size))
-        } else {
-            None
+        let (found, evicted) = {
+            let mut state = self.inner.state.lock(Side::Host);
+            // A completion handler only advances the clock; what it made
+            // reusable enters the free list here, under the lock this call
+            // takes anyway (`DESIGN.md` §6.4e).
+            let evicted = self.inner.drain_locked(&mut state);
+            // `pool_no_reuse`, an A/B instrument: every request misses, so no
+            // allocation is ever handed to a second tenant (the §2.3.8b "pool
+            // reuse disabled" arm, 0/30 there). Released buffers still park
+            // and drain into the free lists, where eviction bounds them.
+            let found = if pool_no_reuse() {
+                None
+            } else {
+                state.take(size)
+            };
+            (found, evicted)
         };
-
-        // Otherwise the smallest bucket that can satisfy the request. One
-        // ordered probe: `range` starts at the first key > size and stops.
-        let found = match found {
-            Some(hit) => Some(hit),
-            None => {
-                state.counters.buckets_probed += 1;
-                // The reuse-oversize bound (§9.2v, #47), applied to the
-                // candidate *before* it is popped. `range` yields the smallest
-                // key above the request, so if that one is past the bound then
-                // every other candidate is further past it -- the ordering is
-                // what makes one comparison sufficient and keeps this off
-                // §3.3's no-O(N) list.
-                //
-                // Declining leaves the buffer in the free list rather than
-                // destroying it: it is still the right answer for a larger
-                // request, and evicting on this path would make a lookup
-                // policy into a retention policy. `evict_over_budget` remains
-                // the only thing that removes a free buffer.
-                let bound = state.oversize_bound;
-                let next = state
-                    .free
-                    .range_mut((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
-                    .next()
-                    .filter(|(k, _)| bucket_admissible(size, **k, bound))
-                    .and_then(|(k, v)| v.pop().map(|b| (b, *k)));
-                if next.is_none() && bound.is_some() {
-                    // Only when a candidate existed and the bound is what
-                    // rejected it. An empty range yields `None` too, and
-                    // counting that would make this a miss counter rather than
-                    // the arm's engagement proof (#500).
-                    let had_candidate = state
-                        .free
-                        .range((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
-                        .next()
-                        .is_some();
-                    if had_candidate {
-                        state.counters.oversize_declined += 1;
-                    }
-                }
-                next
-            }
-        };
-
+        // Outside the lock, before `evicted` drops (`DESIGN.md` §6.3c).
+        self.inner.notify_evicted(&evicted);
         let (buffer, bucket_size) = found?;
-
-        // The buffer has left the free list. Its `free_order` entry is left
-        // behind and skipped when eviction reaches it -- removing it here would
-        // mean a linear search, which is exactly what must not be on this path.
-        state.free_bytes = state.free_bytes.saturating_sub(bucket_size);
-
-        // Drop the key when its bucket empties. This is what stops the map
-        // from becoming a graveyard: the old pool's `retain` cleared a bucket's
-        // Vec but left the key, so emptied keys accumulated at ~3.2 per decode
-        // token and were walked forever.
-        if state
-            .free
-            .get(&bucket_size)
-            .is_some_and(|bucket| bucket.is_empty())
-        {
-            state.free.remove(&bucket_size);
-        }
-
-        // Handed to a caller, so it is theirs to touch again. This must happen
-        // before the handle can be observed, or the caller's first legitimate
-        // access is what gets reported (#475).
-        //
-        // SAFETY: the buffer has just left the free list under the pool lock,
-        // so no other handle to it exists. Inert without `asan-poison`.
-        unsafe { super::poison::unpoison_buffer(&buffer) };
-        super::late_bind::on_leave(&buffer);
-
-        state.counters.hits += 1;
-        // The overhang's HIT source (§9.2). `bucket_size` is what the range
-        // query found and `size` is what was asked for; when the exact probe
-        // above missed, the second probe deliberately returns a *larger*
-        // bucket, and the difference is bytes this caller holds and does not
-        // want. Recorded here rather than at `adopt` because on a hit no
-        // allocation happens and `adopt` is never reached.
-        state.counters.requested_bytes += size as u64;
-        state.counters.served_bytes += bucket_size as u64;
-        // Banded by the REQUEST (§9.2u). Keying on `bucket_size` would file
-        // every over-served acquisition under the band of the bucket that
-        // answered it -- which is the band the overhang would then appear to
-        // belong to, true by construction and therefore evidence of nothing.
-        state.counters.record_band(size, bucket_size);
-        state.live_buffers += 1;
-        state.live_bytes += bucket_size;
         Some(Arc::new(PooledBuffer {
             buffer: Some(buffer),
             size: bucket_size,
@@ -1907,7 +1927,7 @@ impl BufferPool {
     pub fn trim(&self) -> Vec<Buffer> {
         // Sweep in anything the GPU has since finished, so a trim after a
         // synchronize reclaims what that synchronize made safe.
-        self.inner.drain_completed(Side::Host);
+        self.inner.drain_completed();
 
         let mut freed = Vec::new();
         {
@@ -3974,13 +3994,19 @@ mod contention_tests {
         })
     }
 
+    /// Hold `pool`'s state lock on the calling thread while `f` runs.
+    pub(super) fn while_state_held<R>(pool: &BufferPool, f: impl FnOnce() -> R) -> R {
+        let _g = pool.inner.state.lock(Side::Host);
+        f()
+    }
+
     /// Hold the pool's lock on another thread for `HOLD`, run `f` here, and
     /// return how long `f` took.
     fn behind_a_holder(pool: &BufferPool, f: impl FnOnce()) -> Duration {
         let holder_pool = pool.clone();
         let (held, is_held) = mpsc::channel();
         let holder = std::thread::spawn(move || {
-            holder_pool.while_state_held(|| {
+            while_state_held(&holder_pool, || {
                 held.send(()).unwrap();
                 std::thread::sleep(HOLD);
             })
@@ -4027,13 +4053,123 @@ mod contention_tests {
         assert_eq!(driver, Contention::default(), "charged to the wrong side");
     }
 
+    /// Completion only advances the clock; the next `acquire` finds the
+    /// buffer with no drain called, and only once its epoch has completed.
     #[test]
-    fn a_completion_drain_behind_a_holder_is_one_driver_wait() {
-        let (pool, _clock) = pool_with_clock();
-        behind_a_holder(&pool, || pool.drain_completed_on_completion());
-        let (host, driver) = pool.lock_contention();
-        assert_eq!(driver.waits, 1, "{driver:?}");
-        assert!(driver.blocked_ns > 0);
-        assert_eq!(host, Contention::default(), "charged to the wrong side");
+    fn acquire_reuses_a_completed_release_without_a_drain() {
+        let dev = Device::system_default().expect("no Metal device");
+        let (pool, clock) = pool_with_clock();
+        drop(alloc(&pool, &dev, 4096));
+
+        // Released in the open epoch, which has not completed: parked.
+        assert!(pool.acquire(4096).is_none(), "reused before the GPU finished");
+        let c = pool.counters();
+        assert_eq!((c.hits, c.drained), (0, 0));
+        assert_eq!(pool.occupancy().pending_buffers, 1);
+
+        let e = clock.commit_epoch();
+        clock.mark_completed(e);
+        let b = pool.acquire(4096).expect("a completed release must be reused");
+        let c = pool.counters();
+        assert_eq!((c.hits, c.drained), (1, 1), "{c:?}");
+        assert_eq!(pool.occupancy().pending_buffers, 0);
+        drop(b);
+    }
+
+    #[derive(Default)]
+    struct Told {
+        calls: parking_lot::Mutex<Vec<(std::thread::ThreadId, usize)>>,
+    }
+
+    impl BufferEvictionObserver for Told {
+        fn on_evict(&self, buffers: &[Buffer]) {
+            self.calls
+                .lock()
+                .push((std::thread::current().id(), buffers.len()));
+        }
+    }
+
+    /// Eviction runs where the drain runs: in the acquiring thread's call,
+    /// which tells the observer, once, with every buffer the round destroys.
+    #[test]
+    fn an_acquire_that_drains_past_the_budget_evicts_and_tells_the_observer() {
+        let dev = Device::system_default().expect("no Metal device");
+        let (pool, clock) = pool_with_clock();
+        let told = Arc::new(Told::default());
+        pool.set_eviction_observer(told.clone());
+        pool.set_free_budget(4096);
+        let held: Vec<_> = (0..3).map(|i| alloc(&pool, &dev, 4096 + 128 * i)).collect();
+        drop(held);
+        let e = clock.commit_epoch();
+        clock.mark_completed(e);
+        assert!(told.calls.lock().is_empty(), "nothing evicts before a drain");
+
+        // A size none of them answers: the drain frees 12672 B against a
+        // 4096 B budget, and oldest-first eviction takes all three.
+        assert!(pool.acquire(1 << 20).is_none());
+        let c = pool.counters();
+        assert_eq!((c.drained, c.evicted), (3, 3), "{c:?}");
+        assert_eq!(
+            *told.calls.lock(),
+            vec![(std::thread::current().id(), 3)],
+            "one round, on the acquiring thread"
+        );
+    }
+
+    /// The production wiring: a command buffer completes while the host holds
+    /// the Shared pool's lock, and every completion handler finishes under it.
+    /// The released buffer stays parked until the host's next allocation of
+    /// its size, which reuses it.
+    #[test]
+    fn a_completion_takes_no_pool_lock() {
+        use crate::backend::BackendDevice;
+        use crate::kernels::metal::contention::PoolContention;
+
+        let dev = crate::MetalDevice::new(0).expect("a Metal device");
+        // After the device's own subscribers, so it runs after them.
+        let (done, is_done) = mpsc::channel::<()>();
+        dev.commands().on_command_buffer_complete(move || {
+            let _ = done.send(());
+        });
+
+        let b = dev.allocate_buffer(4096).expect("allocation");
+        {
+            let mut blit = dev.blit_command_encoder().expect("encoder");
+            blit.fill_buffer(&b, (0, 4096), 0);
+        }
+        drop(b);
+        let census = dev.pool_contention();
+        let before = dev.buffers.counters();
+
+        let completed = while_state_held(&dev.buffers, || {
+            dev.commands().flush().expect("flush");
+            is_done.recv_timeout(Duration::from_secs(10)).is_ok()
+        });
+        assert!(
+            completed,
+            "the command buffer's completion handlers did not finish while the \
+             host held the pool lock: a handler waits on it"
+        );
+        assert_eq!(
+            dev.pool_contention().since(&census),
+            PoolContention::default()
+        );
+        let after = dev.buffers.counters();
+        assert_eq!(
+            after.drained - before.drained,
+            0,
+            "a completion thread drained the pool"
+        );
+        assert_eq!(dev.buffers.occupancy().pending_buffers, 1);
+
+        let again = dev.allocate_buffer(4096).expect("allocation");
+        let reused = dev.buffers.counters();
+        assert_eq!(
+            (reused.hits - after.hits, reused.drained - after.drained),
+            (1, 1),
+            "the host's next allocation drains and reuses the buffer"
+        );
+        assert_eq!(dev.buffers.occupancy().pending_buffers, 0);
+        drop(again);
     }
 }

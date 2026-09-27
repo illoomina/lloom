@@ -826,13 +826,26 @@ fn evicting_a_free_buffer_releases_the_allocation_to_metal() -> Result<()> {
     // and the per-batch form at +0.062, and the difference between them IS the
     // commit count. A regression to one commit per buffer would be invisible to
     // every assertion above.
-    let commits = after.commits - before.commits;
-    assert!(
-        commits <= 2,
-        "one eviction round must cost at most one commit per pool, got \
-         {commits} for {evicted} buffers -- a per-buffer commit is the +0.087 \
-         ms/token form (§6.3d)"
+    // **And it is batched, at the next cut.** Eviction runs on the host
+    // (§6.4e), so it stages the removals and the next command-buffer cut
+    // publishes them with one commit, beside whatever that cut commits anyway.
+    // A per-buffer commit is the +0.087 ms/token form (§6.3d); a commit per
+    // round on the encoding thread is a driver round-trip on the hot path.
+    assert_eq!(
+        after.commits - before.commits,
+        0,
+        "the eviction round committed on the spot"
     );
+    let x = Tensor::ones((4, 4), DType::F32, &device)?;
+    let y = (&x * 2.0)?;
+    metal.wait_until_completed()?;
+    let published = metal.residency_counters();
+    assert_eq!(
+        published.commits - after.commits,
+        1,
+        "the next cut must publish the round with one commit"
+    );
+    drop((x, y));
     Ok(())
 }
 

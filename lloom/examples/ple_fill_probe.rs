@@ -351,6 +351,57 @@ fn main() -> Result<()> {
                         "mmap" => table.gather_into(&ids, &mut slot)?,
                         "pread" => pread_fill(&table, &file, &ids, &mut slot, None)?,
                         "pread-par" => pread_fill(&table, &file, &ids, &mut slot, Some(&pool))?,
+                        "mmap-par" => pool.install(|| {
+                            ids.par_iter()
+                                .zip(slot.par_chunks_mut(hd))
+                                .try_for_each(|(&id, dst)| table.gather_into(&[id], dst))
+                        })?,
+                        "adaptive" => {
+                            // Resident rows through the map on this thread, the
+                            // rest by `pread` on the pool: `mincore` decides.
+                            let cold: Vec<usize> = (0..ids.len())
+                                .filter(|&i| {
+                                    pages
+                                        .span(
+                                            table.row_file_offset(ids[i]).unwrap(),
+                                            table.row_bytes(),
+                                        )
+                                        .any(|p| !pages.resident(p))
+                                })
+                                .collect();
+                            if cold.len() < 2 {
+                                table.gather_into(&ids, &mut slot)?;
+                            } else {
+                                let mut is_cold = [false; 64];
+                                for &i in &cold {
+                                    is_cold[i] = true;
+                                }
+                                for (i, &id) in ids.iter().enumerate() {
+                                    if !is_cold[i] {
+                                        table
+                                            .gather_into(&[id], &mut slot[i * hd..(i + 1) * hd])?;
+                                    }
+                                }
+                                pool.install(|| {
+                                    slot.par_chunks_mut(hd)
+                                        .enumerate()
+                                        .filter(|(i, _)| is_cold[*i])
+                                        .try_for_each(|(i, dst)| {
+                                            pread_fill(&table, &file, &ids[i..i + 1], dst, None)
+                                        })
+                                })?;
+                            }
+                        }
+                        "mincore-only" => {
+                            let mut n = 0usize;
+                            for &id in &ids {
+                                n += pages
+                                    .span(table.row_file_offset(id).unwrap(), table.row_bytes())
+                                    .filter(|&p| pages.resident(p))
+                                    .count();
+                            }
+                            std::hint::black_box(n);
+                        }
                         other => bail!("unknown arm {other}"),
                     }
                     let us = s.elapsed().as_secs_f64() * 1e6;

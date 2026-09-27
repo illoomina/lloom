@@ -1220,6 +1220,16 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         Ok(())
     }
 
+    /// The N-gram PLE's table, if attached (its read policy and counters).
+    pub fn ple_table(&self) -> Option<&PleTable> {
+        self.ple.as_ref().map(|p| &p.table)
+    }
+
+    /// The N-gram PLE's hash, if attached.
+    pub fn ple_hash(&self) -> Option<&NgramHash> {
+        self.ple.as_ref().map(|p| &p.hash)
+    }
+
     /// Whether the N-gram PLE is attached.
     pub fn has_ple(&self) -> bool {
         self.ple.is_some()

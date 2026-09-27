@@ -32,6 +32,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use lloom::models::qwen4exp::{CachedPleTable, MmapPleTable, NgramHash, NgramWindow, PleTable};
+use lloom::nn::ngram_memory::ReadPolicy;
 use rayon::prelude::*;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -66,6 +67,10 @@ struct Args {
     /// Latency arms.
     #[arg(long, value_delimiter = ',', default_values_t = ["mmap".to_string(), "pread".to_string(), "pread-par".to_string()])]
     arms: Vec<String>,
+    /// Write every timed token as a CSV row (`label,arm,pass,token,cold_rows,us`)
+    /// to this file — the raw series behind the `FILL` lines.
+    #[arg(long)]
+    dump: Option<PathBuf>,
     /// Threads of the `pread-par` pool.
     #[arg(long, default_value_t = 16)]
     par_threads: usize,
@@ -252,6 +257,15 @@ fn main() -> Result<()> {
         table.dtype(),
         pages.page
     );
+    let mut dump = match &args.dump {
+        Some(p) => {
+            use std::io::Write;
+            let mut f = std::io::BufWriter::new(std::fs::File::create(p)?);
+            writeln!(f, "label,arm,pass,token,cold_rows,us")?;
+            Some(f)
+        }
+        None => None,
+    };
     let history = match &args.history {
         Some(p) => Some(row_ids(&hash, &encode(p)?)),
         None => None,
@@ -326,6 +340,21 @@ fn main() -> Result<()> {
                 "EVICT label={label} arm={arm} pages={} msync_rc_sum={evict_rc} resident_after={still}",
                 pages_of_stream.len()
             );
+            // `mmap` is the serial map read the production table used before
+            // #758; `production` is the table as it ships (its default
+            // policy); `cached:N` is the hot-row cache of N rows over it,
+            // empty at the cold pass and holding the stream at the warm one.
+            table.set_read_policy(match arm.as_str() {
+                "production" => ReadPolicy::Adaptive,
+                _ => ReadPolicy::Serial,
+            });
+            let cached = match arm.strip_prefix("cached:") {
+                Some(n) => Some(PleTable::Cached(CachedPleTable::new(
+                    MmapPleTable::open(&args.shard)?,
+                    n.parse().context("cached:<rows>")?,
+                )?)),
+                None => None,
+            };
             for pass in ["cold", "warm"] {
                 let mut all = Vec::new();
                 let mut by_cold: [Vec<f64>; 4] = Default::default();
@@ -348,7 +377,10 @@ fn main() -> Result<()> {
                     let s = Instant::now();
                     hash.row_ids(&window, &mut ids);
                     match arm.as_str() {
-                        "mmap" => table.gather_into(&ids, &mut slot)?,
+                        "mmap" | "production" => table.gather_into(&ids, &mut slot)?,
+                        a if a.starts_with("cached:") => {
+                            cached.as_ref().unwrap().gather_into(&ids, &mut slot)?
+                        }
                         "pread" => pread_fill(&table, &file, &ids, &mut slot, None)?,
                         "pread-par" => pread_fill(&table, &file, &ids, &mut slot, Some(&pool))?,
                         "mmap-par" => pool.install(|| {
@@ -406,6 +438,10 @@ fn main() -> Result<()> {
                     }
                     let us = s.elapsed().as_secs_f64() * 1e6;
                     w.push(Some(t));
+                    if let Some(f) = dump.as_mut() {
+                        use std::io::Write;
+                        writeln!(f, "{label},{arm},{pass},{},{cold},{us:.3}", all.len())?;
+                    }
                     all.push(us);
                     let b = match cold {
                         0 => 0,

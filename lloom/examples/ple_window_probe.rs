@@ -20,8 +20,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use lloom::generation::{Blocking, LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::loader::{LoadOptions, SlotBudget, StreamLoader, StreamOptions};
+use lloom::models::qwen4exp::NgramWindow;
 use lloom::models::qwen4exp::{prefill_chunk, prefill_pair_on, prefill_tiles, Qwen4Exp, Streamed};
 use lloom::nn::model::CausalLM as _;
+use lloom::nn::ngram_memory::ReadPolicy;
 use lloom::nn::{DecodeOptions, IdentityProposer, Session};
 use lloom_tensor::kernels::metal::profile;
 use lloom_tensor::Device;
@@ -65,6 +67,16 @@ struct Args {
     /// gates ran them).
     #[arg(long, default_value_t = 2)]
     runs: usize,
+    /// How the PLE table reads a token's rows: `serial`, `adaptive` (the
+    /// default) or `concurrent` (`nn::ngram_memory::ReadPolicy`).
+    #[arg(long, default_value = "adaptive")]
+    ple_read: String,
+    /// Before every run after the first, drop the page-cache pages of every
+    /// PLE row the previous run's stream read (`msync(MS_INVALIDATE)` on a
+    /// map of the table's shard): the runs then decode the same tokens with
+    /// a warm expert pool and a cold PLE.
+    #[arg(long)]
+    evict_ple: bool,
     /// Print one `STEP` line per decode step.
     #[arg(long)]
     per_step: bool,
@@ -104,6 +116,71 @@ fn shards(first: &Path) -> Vec<PathBuf> {
         vec![first.to_path_buf()]
     } else {
         v
+    }
+}
+
+/// A read-only map of the shards, to drop PLE rows' pages from the page
+/// cache between runs.
+struct Evictor {
+    map: memmap2::Mmap,
+    _file: std::fs::File,
+}
+
+impl Evictor {
+    /// The shard whose header holds the PLE table, mapped read-only.
+    fn new(shards: &[PathBuf]) -> Result<Self> {
+        use lloom_tensor::quantized::gguf_file::Content;
+        for p in shards {
+            let mut f = std::fs::File::open(p)?;
+            let c = Content::read(&mut f)?;
+            if c.tensor_infos
+                .contains_key(lloom::nn::ngram_memory::PER_LAYER_TOKEN_EMBD)
+            {
+                // SAFETY: read-only map of a file this process keeps open.
+                let map = unsafe { memmap2::Mmap::map(&f)? };
+                return Ok(Self { map, _file: f });
+            }
+        }
+        anyhow::bail!("no shard holds the PLE table")
+    }
+
+    /// Drop the pages of every row `stream`'s tokens hash to (in the model's
+    /// order: the window starts empty and advances past each token). Returns
+    /// (pages, still resident).
+    fn evict_stream(
+        &self,
+        hash: &lloom::models::qwen4exp::NgramHash,
+        table: &lloom::nn::ngram_memory::MmapRows,
+        stream: &[u32],
+    ) -> Result<(usize, usize)> {
+        let map = &self.map;
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let mut pages = std::collections::BTreeSet::new();
+        let mut w = NgramWindow::new(hash.context_len());
+        let mut ids = vec![0i64; hash.n_heads()];
+        for &t in stream {
+            hash.row_ids(&w.window(Some(t)), &mut ids);
+            w.push(Some(t));
+            for &id in &ids {
+                let off = table.row_file_offset(id)? as usize;
+                pages.insert(off / page);
+                pages.insert((off + table.row_bytes() - 1) / page);
+            }
+        }
+        let base = map.as_ptr() as *mut libc::c_void;
+        let mut still = 0;
+        for &p in &pages {
+            // SAFETY: one page inside the map.
+            unsafe {
+                let a = (base as *mut u8).add(p * page) as *mut libc::c_void;
+                libc::msync(a, page, libc::MS_INVALIDATE);
+                let mut v = 0u8;
+                libc::mincore(a, page, &mut v as *mut u8 as *mut libc::c_char);
+                still += (v & 1) as usize;
+            }
+        }
+        Ok((pages.len(), still))
     }
 }
 
@@ -193,12 +270,29 @@ fn main() -> Result<()> {
         model.arm_ple_window();
     }
     let cfg = model.config().clone();
+    let policy = match args.ple_read.as_str() {
+        "serial" => ReadPolicy::Serial,
+        "adaptive" => ReadPolicy::Adaptive,
+        "concurrent" => ReadPolicy::Concurrent,
+        other => anyhow::bail!("--ple-read {other}: serial | adaptive | concurrent"),
+    };
+    let table = model
+        .ple_table()
+        .and_then(|t| t.mmap())
+        .context("the PLE table is not memory-mapped")?;
+    table.set_read_policy(policy);
+    let evictor = if args.evict_ple {
+        Some(Evictor::new(&shards(&gguf))?)
+    } else {
+        None
+    };
     println!(
-        "LOADED slots={} ple={} armed={} prompt_tokens={}",
+        "LOADED slots={} ple={} armed={} prompt_tokens={} ple_read={policy:?} evict_ple={}",
         model.slots_per_layer(),
         model.has_ple(),
         !args.unarmed,
-        prompt_ids.len()
+        prompt_ids.len(),
+        args.evict_ple
     );
 
     // The harness's tile rule (`qwen4exp-chat` `driver_gate`).
@@ -207,7 +301,14 @@ fn main() -> Result<()> {
     } else {
         512
     };
+    let mut last_stream: Vec<u32> = Vec::new();
     for run in 0..args.runs {
+        if let (Some(ev), false) = (&evictor, last_stream.is_empty()) {
+            let hash = model.ple_hash().context("no PLE hash")?;
+            let (pages, still) = ev.evict_stream(hash, table, &last_stream)?;
+            println!("EVICT run={run} pages={pages} resident_after={still}");
+        }
+        let (mapped0, pooled0) = table.read_counters();
         let cache = model.new_cache(&cfg, &device)?;
         let mut session = Session::new(&model, cache);
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
@@ -242,13 +343,17 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(",")
         );
+        let decode_ms = (wall_ms - prefill_ms).max(0.0);
+        let (mapped1, pooled1) = table.read_counters();
         println!(
-        "RESULT run={run} tokens_sha256={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={:.0}",
-        digest,
-        out.ids.len(),
-        out.eos,
-        (wall_ms - prefill_ms).max(0.0)
-    );
+            "RESULT run={run} tokens_sha256={digest} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} ms_per_token={:.3} ple_rows_mapped={} ple_rows_pooled={}",
+            out.ids.len(),
+            out.eos,
+            decode_ms / out.ids.len().max(1) as f64,
+            mapped1 - mapped0,
+            pooled1 - pooled0,
+        );
+        last_stream = prompt_ids.iter().chain(&out.ids).copied().collect();
         if args.unarmed {
             continue;
         }

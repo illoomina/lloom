@@ -1659,3 +1659,74 @@ fn m5_native_int_arm_is_declared_but_unimplemented() {
     assert!(GemvTriple::F32F32F32.is_implemented());
     assert!(GemvTriple::F16F32F16.is_implemented());
 }
+
+/// The block types lloom reads and cannot produce: only their dequant is ported.
+const READ_ONLY: [GgmlDType; 8] = [
+    GgmlDType::IQ2XXS,
+    GgmlDType::IQ2XS,
+    GgmlDType::IQ2S,
+    GgmlDType::IQ3XXS,
+    GgmlDType::IQ3S,
+    GgmlDType::IQ4NL,
+    GgmlDType::IQ4XS,
+    GgmlDType::Q2_0,
+];
+
+/// Quantizing into a read-only block type is an error naming the type, not a
+/// panic (§15.2a). Q4_K beside it is the positive control: the same call, one
+/// dtype different, succeeds.
+fn quantize_refuses_read_only(device: &Device) -> Result<()> {
+    let t = Tensor::zeros((4, 256), DType::F32, device)?;
+    let imatrix = vec![1f32; 256];
+    assert!(quantized::QTensor::quantize(&t, GgmlDType::Q4K).is_ok());
+    assert!(!GgmlDType::Q4K.is_read_only());
+    for dtype in READ_ONLY {
+        assert!(dtype.is_read_only(), "{dtype:?}");
+        let want = format!("quantizing to {dtype:?} is refused");
+        let err = quantized::QTensor::quantize(&t, dtype)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&want), "{err}");
+        eprintln!("{:?}: {err}", device.location());
+        let err = quantized::QTensor::quantize_imatrix(&t, &imatrix, dtype)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&want), "{err}");
+        let cpu = t.to_device(&Device::Cpu)?;
+        let err = quantized::QTensor::quantize_onto(&cpu, dtype, device)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&want), "{err}");
+    }
+    Ok(())
+}
+
+test_device!(
+    quantize_refuses_read_only,
+    quantize_refuses_read_only_cpu,
+    quantize_refuses_read_only_cuda,
+    quantize_refuses_read_only_metal
+);
+
+/// The CPU matmul by a read-only block type is an error naming the type, not
+/// the `vec_dot` panic; Q4_K through the same path is the positive control.
+#[test]
+fn the_cpu_matmul_of_a_read_only_type_is_refused_by_name() -> Result<()> {
+    let (n, k) = (4usize, 256usize);
+    let x = Tensor::zeros((1, k), DType::F32, &Device::Cpu)?;
+    let w = Tensor::zeros((n, k), DType::F32, &Device::Cpu)?;
+    let q4k = quantized::QMatMul::from_qtensor(quantized::QTensor::quantize(&w, GgmlDType::Q4K)?)?;
+    assert_eq!(q4k.forward(&x)?.dims(), [1, n]);
+    for dtype in READ_ONLY {
+        let bytes = vec![0u8; n * k / dtype.block_size() * dtype.type_size()];
+        let storage = quantized::QStorage::from_data(Cow::Owned(bytes), &Device::Cpu, dtype)?;
+        let mm = quantized::QMatMul::from_qtensor(quantized::QTensor::new(storage, (n, k))?)?;
+        let err = mm.forward(&x).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("the CPU matmul of {dtype:?} is refused")),
+            "{dtype:?}: {err}"
+        );
+        eprintln!("{err}");
+    }
+    Ok(())
+}

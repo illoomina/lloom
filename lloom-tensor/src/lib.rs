@@ -49,6 +49,7 @@
 
 #[cfg(feature = "accelerate")]
 mod accelerate;
+pub mod arms;
 pub mod autorelease;
 pub mod backend;
 pub mod backprop;

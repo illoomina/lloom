@@ -31,7 +31,7 @@ use lloom_tensor::Result;
 pub use cost::{CostModel, Marginal, StepCost};
 pub use exclusions::{ExclusionSet, Lookup, Verdict};
 pub use fragments::{catalogue, Fragment};
-pub use ir::{Census, Dim, Graph, Node, NodeId, Op, Shape};
+pub use ir::{Census, DepthProfile, Dim, Graph, Node, NodeId, Op, Shape};
 pub use numeric::{NumericClass, Region, RegionKind, TargetFpModel};
 pub use plan::{FusionPlan, Regions, Seam, Sites, StatefulSite};
 

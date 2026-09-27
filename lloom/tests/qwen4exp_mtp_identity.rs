@@ -399,3 +399,61 @@ fn partial_accept_rolls_every_state_back_to_the_accepted_length() -> Result<()> 
     }
     Ok(())
 }
+
+/// MTP at B > 1: two sequences with different prompts through the batched
+/// speculative loop (`Session::decode_spec_batched`: one drafter holding a
+/// lane per sequence, the rows' verifies through `Probes::verify_rows_*`).
+/// Each row's stream must be its own greedy stream, at every K, and each
+/// sequence's drafter lane keyed with its own prompt and accepted rows — a
+/// lane crossed with another's keys the wrong rows while the verify still
+/// corrects every draft, so identity alone would not see it.
+#[test]
+fn mtp_rows_are_each_their_greedy_stream() -> Result<()> {
+    let cfg = config();
+    let dev = Device::Cpu;
+    let model = testing::resident_model(&cfg, &dev);
+    let max = 16;
+    let (p0, r0, _) = long_prompt(&model, &cfg, max)?;
+    let p1: Vec<u32> = p0.iter().map(|t| (t + 13) % 120).collect();
+    let (r1, _) = greedy(&model, &cfg, &p1, max)?;
+    assert_ne!(r0, r1, "the two prompts must give two streams");
+    for k in [1usize, 2] {
+        let head = testing::mtp_head(&cfg, &dev, testing::resident_experts(&cfg, 7, &dev));
+        let mut mtp =
+            MtpDrafter::with_seqs(&head, model.embed_tokens(), model.lm_head(), &cfg, &dev, 2)
+                .with_k(k);
+        let mut sessions: Vec<Session<'_, Qwen4Exp<Resident>>> = (0..2)
+            .map(|_| {
+                let mut cache = model.new_cache(&cfg, &dev)?;
+                cache.want_nextn = true;
+                Ok(Session::new(&model, cache))
+            })
+            .collect::<Result<_>>()?;
+        let prompts: Vec<&[u32]> = vec![&p0, &p1];
+        let outs = Session::decode_spec_batched(
+            &mut sessions,
+            &mut mtp,
+            &prompts,
+            &DecodeOptions::new(max),
+            &[cfg.eos_token_id],
+            &dev,
+            &mut |_, _| Ok(()),
+        )?;
+        assert_eq!(outs[0].ids, r0, "k = {k}: row 0 is not its greedy stream");
+        assert_eq!(outs[1].ids, r1, "k = {k}: row 1 is not its greedy stream");
+        for (seq, (p, r)) in [(&p0, &r0), (&p1, &r1)].into_iter().enumerate() {
+            assert!(
+                mtp.seq_rows_seen(SeqId(seq)) >= p.len() + r.len() - 1,
+                "k = {k}: sequence {seq}'s lane keyed with {} rows for {} prompt + {} generated",
+                mtp.seq_rows_seen(SeqId(seq)),
+                p.len(),
+                r.len()
+            );
+        }
+        println!(
+            "MTPROWS k={k} rows_seen={:?}",
+            (mtp.seq_rows_seen(SeqId(0)), mtp.seq_rows_seen(SeqId(1)))
+        );
+    }
+    Ok(())
+}

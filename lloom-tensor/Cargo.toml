@@ -162,6 +162,14 @@ name = "dispatch_cost"
 required-features = ["metal"]
 
 [[example]]
+name = "serial_boundary_cost"
+required-features = ["metal"]
+
+[[example]]
+name = "gdn_step_bench"
+required-features = ["metal"]
+
+[[example]]
 name = "gemv_epilogue_ab"
 required-features = ["metal"]
 

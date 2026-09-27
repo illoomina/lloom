@@ -1,8 +1,10 @@
-//! Contended acquisitions of the command-submission locks, counted per lock.
+//! Contended acquisitions of the command-submission locks and the buffer
+//! pools' state locks, counted per lock.
 //!
 //! The cross-encoder fence map is read by the encoding thread once per buffer
 //! per session; the map, the fence book beside it and the encoder-state lock
-//! are written at encoder closes and per dispatch. Whether any acquisition
+//! are written at encoder closes and per dispatch; a pool's state lock is
+//! taken on every pooled allocation and release. Whether any acquisition
 //! waits is a measurement, not an assumption (`DESIGN.md` §6.4d): under CPU
 //! oversubscription a completion thread descheduled while holding the map made
 //! the encoding thread wait milliseconds, which is why completion threads no
@@ -191,6 +193,58 @@ impl SubmissionContention {
             ("map_host_write", self.map_host_write),
             ("live_fences_host", self.live_fences_host),
             ("state_host", self.state_host),
+        ]
+    }
+}
+
+/// The buffer pools' state locks for one device
+/// ([`crate::MetalDevice::pool_contention`]): the Shared and Private pools,
+/// each from the encoding side and from a completion thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolContention {
+    pub shared_host: Contention,
+    pub shared_driver: Contention,
+    pub private_host: Contention,
+    pub private_driver: Contention,
+}
+
+impl PoolContention {
+    /// Per-field change from `earlier` to `self`.
+    pub fn since(&self, earlier: &PoolContention) -> PoolContention {
+        PoolContention {
+            shared_host: self.shared_host.since(earlier.shared_host),
+            shared_driver: self.shared_driver.since(earlier.shared_driver),
+            private_host: self.private_host.since(earlier.private_host),
+            private_driver: self.private_driver.since(earlier.private_driver),
+        }
+    }
+
+    /// Waits summed over both pools and both sides.
+    pub fn total_waits(&self) -> u64 {
+        self.fields().iter().map(|(_, c)| c.waits).sum()
+    }
+
+    /// Time the host sides spent blocked: the encoding thread's cost. A
+    /// driver-side wait delays a completion handler, not the token.
+    pub fn host_blocked_ns(&self) -> u64 {
+        self.shared_host.blocked_ns + self.private_host.blocked_ns
+    }
+
+    /// `name=waits/blocked_us` for each field, space-separated.
+    pub fn render(&self) -> String {
+        self.fields()
+            .iter()
+            .map(|(name, c)| format!("{name}={}/{:.1}us", c.waits, c.blocked_ns as f64 / 1e3))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn fields(&self) -> [(&'static str, Contention); 4] {
+        [
+            ("shared_host", self.shared_host),
+            ("shared_driver", self.shared_driver),
+            ("private_host", self.private_host),
+            ("private_driver", self.private_driver),
         ]
     }
 }

@@ -2924,8 +2924,8 @@ impl BackendDevice for MetalDevice {
             // completes without a subscriber to hear it.
             let (shared, private) = (buffers.clone(), private_buffers.clone());
             commands.on_command_buffer_complete(move || {
-                shared.drain_completed();
-                private.drain_completed();
+                shared.drain_completed_on_completion();
+                private.drain_completed_on_completion();
             });
         }
 

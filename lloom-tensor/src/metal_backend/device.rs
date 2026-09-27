@@ -784,6 +784,19 @@ impl MetalDevice {
         self.private_buffers.reset_counters();
     }
 
+    /// Waits on both pools' state locks since construction, per side
+    /// (`DESIGN.md` §6.4d). Difference two reads for a window.
+    pub fn pool_contention(&self) -> crate::kernels::metal::contention::PoolContention {
+        let (shared_host, shared_driver) = self.buffers.lock_contention();
+        let (private_host, private_driver) = self.private_buffers.lock_contention();
+        crate::kernels::metal::contention::PoolContention {
+            shared_host,
+            shared_driver,
+            private_host,
+            private_driver,
+        }
+    }
+
     /// Live and free occupancy for both pools, shared first.
     pub fn pool_occupancy(&self) -> (PoolOccupancySnapshot, PoolOccupancySnapshot) {
         (self.buffers.occupancy(), self.private_buffers.occupancy())

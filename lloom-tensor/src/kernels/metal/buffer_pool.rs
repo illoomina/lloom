@@ -62,6 +62,7 @@
 //! CPU user. One clock decides reuse. See [`GpuClock`] and `PoolInner::release`.
 
 use super::cache_pad::CachePadded;
+use super::contention::{Access, Censused, Contention, Side};
 use super::Buffer;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -999,7 +1000,8 @@ pub trait BufferEvictionObserver: Send + Sync {
 }
 
 pub struct PoolInner {
-    state: parking_lot::Mutex<PoolState>,
+    /// Censused (`DESIGN.md` §6.4d): a wait on it is counted per side.
+    state: Censused<parking_lot::Mutex<PoolState>>,
     /// How far the GPU has got. Shared with `Commands`, which advances it.
     clock: Arc<GpuClock>,
     /// Told when a free buffer is destroyed. See [`BufferEvictionObserver`].
@@ -1036,7 +1038,7 @@ const DEFAULT_FREE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 impl PoolInner {
     fn new(clock: Arc<GpuClock>) -> Self {
         Self {
-            state: parking_lot::Mutex::new(PoolState {
+            state: Censused::new(parking_lot::Mutex::new(PoolState {
                 free: BTreeMap::new(),
                 live_buffers: 0,
                 live_bytes: 0,
@@ -1053,7 +1055,7 @@ impl PoolInner {
                 // one; a process that never runs admission is unchanged.
                 residual: None,
                 counters: PoolCounters::default(),
-            }),
+            })),
             clock,
             on_evict: parking_lot::Mutex::new(None),
             #[cfg(feature = "fuzzing")]
@@ -1081,7 +1083,7 @@ impl PoolInner {
     fn release(&self, buffer: Buffer, size: usize) {
         let epoch = self.clock.current_epoch();
 
-        let mut state = self.state.lock();
+        let mut state = self.state.lock(Side::Host);
         state.counters.releases += 1;
         state.live_buffers = state.live_buffers.saturating_sub(1);
         state.live_bytes = state.live_bytes.saturating_sub(size);
@@ -1114,8 +1116,8 @@ impl PoolInner {
     ///
     /// `pending` is ordered by epoch, so this stops at the first entry still
     /// outstanding rather than walking the rest.
-    fn drain_completed(&self) {
-        let mut state = self.state.lock();
+    fn drain_completed(&self, side: Side) {
+        let mut state = self.state.lock(side);
         let mut drained = 0u64;
         while let Some(front) = state.pending.front() {
             // `LLOOM_POOL_QUARANTINE=K` (A/B instrument, #748): a released
@@ -1224,7 +1226,7 @@ impl Drop for PoolInner {
         if !super::poison::ENABLED {
             return;
         }
-        let state = self.state.lock();
+        let state = self.state.lock(Side::Host);
         for bucket in state.free.values() {
             for buffer in bucket {
                 // SAFETY: the pool is being destroyed, so nothing can acquire
@@ -1440,7 +1442,30 @@ impl BufferPool {
     ///
     /// Call from a command buffer completion handler, once per command buffer.
     pub fn drain_completed(&self) {
-        self.inner.drain_completed();
+        self.inner.drain_completed(Side::Host);
+    }
+
+    /// [`Self::drain_completed`], from a Metal completion handler: the same
+    /// drain, its lock waits counted on the driver side.
+    pub fn drain_completed_on_completion(&self) {
+        self.inner.drain_completed(Side::Driver);
+    }
+
+    /// Waits on this pool's state lock since construction, `(host, driver)`
+    /// (`DESIGN.md` §6.4d). Difference two reads for a window.
+    pub fn lock_contention(&self) -> (Contention, Contention) {
+        (
+            self.inner.state.contention(Side::Host, Access::Exclusive),
+            self.inner.state.contention(Side::Driver, Access::Exclusive),
+        )
+    }
+
+    /// Hold the state lock on the calling thread while `f` runs, so a test
+    /// can make another thread wait on it.
+    #[cfg(test)]
+    pub(crate) fn while_state_held<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _g = self.inner.state.lock(Side::Host);
+        f()
     }
 
     /// Write `byte` over every buffer the moment it becomes free (#706), or
@@ -1468,7 +1493,7 @@ impl BufferPool {
     /// `evict_over_budget` remains the only thing that destroys a free buffer.
     pub fn set_reuse_oversize_bound(&self, bound: Option<f64>) {
         {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock(Side::Host);
             state.oversize_bound = bound;
         }
     }
@@ -1486,7 +1511,7 @@ impl BufferPool {
     /// wanting both calls [`Self::set_free_budget`] after this.
     pub fn set_eviction_order(&self, order: EvictionOrder) {
         {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock(Side::Host);
             state.eviction_order = order;
         }
     }
@@ -1496,14 +1521,14 @@ impl BufferPool {
     /// Read from the state the eviction path consults, never from the flag, so
     /// a harness reports the arm the process **took** (§7.1a-i).
     pub fn eviction_order(&self) -> EvictionOrder {
-        self.inner.state.lock().eviction_order
+        self.inner.state.lock(Side::Host).eviction_order
     }
 
     /// Sets the cap on bytes retained in the free list, evicting immediately if
     /// the new cap is already exceeded. See `DEFAULT_FREE_BUDGET_BYTES`.
     pub fn set_free_budget(&self, bytes: usize) {
         let evicted = {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock(Side::Host);
             state.free_budget = bytes;
             state.evict_over_budget()
         };
@@ -1532,7 +1557,7 @@ impl BufferPool {
     /// admission was honest.
     pub fn set_residual_cap(&self, limit: usize, planned: usize) {
         {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock(Side::Host);
             state.residual = Some(ResidualCap { limit, planned });
         }
     }
@@ -1541,7 +1566,7 @@ impl BufferPool {
     /// shipped.
     pub fn clear_residual_cap(&self) {
         {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock(Side::Host);
             state.residual = None;
         }
     }
@@ -1552,7 +1577,7 @@ impl BufferPool {
     /// `live + free + pending − planned`. See [`ResidualCap::planned`] for why
     /// the subtraction is there and what comparing `live_bytes` alone would do.
     pub fn unplanned_bytes(&self) -> Option<usize> {
-        let state = self.inner.state.lock();
+        let state = self.inner.state.lock(Side::Host);
         let cap = state.residual?;
         Some(state.unplanned_bytes(cap))
     }
@@ -1573,7 +1598,7 @@ impl BufferPool {
             // the free lists, where eviction bounds them.
             return None;
         }
-        let mut state = self.inner.state.lock();
+        let mut state = self.inner.state.lock(Side::Host);
         state.counters.lookups += 1;
 
         // Exact hit. Checked separately from the range query below because it
@@ -1710,7 +1735,7 @@ impl BufferPool {
     /// +0.093 ms/token and the same bookkeeping with the Metal call skipped
     /// read baseline.
     pub fn check_residual(&self, size: usize) -> Result<(), ResidualExceeded> {
-        let state = self.inner.state.lock();
+        let state = self.inner.state.lock(Side::Host);
         let Some(cap) = state.residual else {
             return Ok(());
         };
@@ -1789,7 +1814,7 @@ impl BufferPool {
             buffer.base_offset(),
         );
         let why = {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock(Side::Host);
             state.counters.allocations += 1;
             state.counters.allocated_bytes += size as u64;
             state.live_buffers += 1;
@@ -1856,7 +1881,7 @@ impl BufferPool {
         );
         let handle = self.adopt(buffer, allocated);
         {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock(Side::Host);
             state.counters.requested_bytes += requested as u64;
             state.counters.served_bytes += allocated as u64;
             // The MISS half of the same split, banded on the same key as the
@@ -1882,11 +1907,11 @@ impl BufferPool {
     pub fn trim(&self) -> Vec<Buffer> {
         // Sweep in anything the GPU has since finished, so a trim after a
         // synchronize reclaims what that synchronize made safe.
-        self.inner.drain_completed();
+        self.inner.drain_completed(Side::Host);
 
         let mut freed = Vec::new();
         {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock(Side::Host);
             for (_, mut bucket) in std::mem::take(&mut state.free) {
                 // Destroyed rather than reused, as in `evict_over_budget`: the
                 // mark comes off before the allocation goes, or it outlives the
@@ -1910,7 +1935,7 @@ impl BufferPool {
     }
 
     pub fn counters(&self) -> PoolCounters {
-        self.inner.state.lock().counters
+        self.inner.state.lock(Side::Host).counters
     }
 
     /// What the free list holds right now: total bytes and buffers, and the
@@ -1920,7 +1945,7 @@ impl BufferPool {
     /// FILLING the budget (`DEFAULT_FREE_BUDGET_BYTES`) so those evictions
     /// happen — the sizes that sit free and are never asked for again.
     pub fn free_summary(&self, top: usize) -> FreeSummary {
-        let state = self.inner.state.lock();
+        let state = self.inner.state.lock(Side::Host);
         let mut classes: Vec<(usize, usize)> = state
             .free
             .iter()
@@ -1946,7 +1971,7 @@ impl BufferPool {
     /// figures are [`Self::occupancy`]'s, and this does not touch them.
     pub fn reset_counters(&self) {
         {
-            let mut state = self.inner.state.lock();
+            let mut state = self.inner.state.lock(Side::Host);
             state.counters = PoolCounters::default();
         }
     }
@@ -1956,7 +1981,7 @@ impl BufferPool {
     /// "live" counts handles still held by a caller; "free" counts buffers
     /// sitting in the free list ready to be handed out.
     pub fn occupancy(&self) -> PoolOccupancySnapshot {
-        let state = self.inner.state.lock();
+        let state = self.inner.state.lock(Side::Host);
         let free_buffers = state.free.values().map(|b| b.len()).sum();
         PoolOccupancySnapshot {
             live_buffers: state.live_buffers,
@@ -3919,4 +3944,96 @@ fn pool_no_reuse() -> bool {
 fn pool_quarantine() -> u64 {
     static K: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *K.get_or_init(|| crate::tuning::tuning().pool.quarantine)
+}
+
+/// The pool's state lock through the census (`DESIGN.md` §6.4d): the
+/// uncontended path records nothing, and an acquisition that meets a holder
+/// on another thread is one wait on its own side.
+#[cfg(test)]
+mod contention_tests {
+    use super::*;
+    use crate::kernels::metal::Device;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// Long enough that the blocked side arrives while the holder has the
+    /// lock, on a loaded machine.
+    const HOLD: Duration = Duration::from_millis(200);
+
+    fn pool_with_clock() -> (BufferPool, Arc<GpuClock>) {
+        let clock = Arc::new(GpuClock::new());
+        (BufferPool::with_clock(Arc::clone(&clock)), clock)
+    }
+
+    fn alloc(pool: &BufferPool, dev: &Device, size: usize) -> Arc<PooledBuffer> {
+        pool.acquire(size).unwrap_or_else(|| {
+            let raw = dev
+                .new_buffer(size, crate::kernels::RESOURCE_OPTIONS)
+                .expect("buffer allocation");
+            pool.adopt(raw, size)
+        })
+    }
+
+    /// Hold the pool's lock on another thread for `HOLD`, run `f` here, and
+    /// return how long `f` took.
+    fn behind_a_holder(pool: &BufferPool, f: impl FnOnce()) -> Duration {
+        let holder_pool = pool.clone();
+        let (held, is_held) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            holder_pool.while_state_held(|| {
+                held.send(()).unwrap();
+                std::thread::sleep(HOLD);
+            })
+        });
+        is_held.recv().unwrap();
+        let t = Instant::now();
+        f();
+        let waited = t.elapsed();
+        holder.join().unwrap();
+        waited
+    }
+
+    #[test]
+    fn an_uncontended_pool_records_nothing() {
+        let dev = Device::system_default().expect("no Metal device");
+        let (pool, clock) = pool_with_clock();
+        for _ in 0..16 {
+            let b = alloc(&pool, &dev, 4096);
+            drop(b);
+            let e = clock.commit_epoch();
+            clock.mark_completed(e);
+            pool.drain_completed();
+        }
+        let c = pool.counters();
+        assert_eq!(c.lookups, 16, "the lock was taken: sixteen lookups ran");
+        assert_eq!(c.hits, 15, "and fifteen of them reused the one buffer");
+        assert_eq!(
+            pool.lock_contention(),
+            (Contention::default(), Contention::default()),
+            "an uncontended acquisition is not a wait"
+        );
+    }
+
+    #[test]
+    fn an_acquire_behind_a_holder_is_one_host_wait() {
+        let (pool, _clock) = pool_with_clock();
+        let waited = behind_a_holder(&pool, || {
+            assert!(pool.acquire(4096).is_none());
+        });
+        assert!(waited >= HOLD / 4, "the acquire returned after {waited:?}");
+        let (host, driver) = pool.lock_contention();
+        assert_eq!(host.waits, 1, "{host:?}");
+        assert!(host.blocked_ns > 0);
+        assert_eq!(driver, Contention::default(), "charged to the wrong side");
+    }
+
+    #[test]
+    fn a_completion_drain_behind_a_holder_is_one_driver_wait() {
+        let (pool, _clock) = pool_with_clock();
+        behind_a_holder(&pool, || pool.drain_completed_on_completion());
+        let (host, driver) = pool.lock_contention();
+        assert_eq!(driver.waits, 1, "{driver:?}");
+        assert!(driver.blocked_ns > 0);
+        assert_eq!(host, Contention::default(), "charged to the wrong side");
+    }
 }

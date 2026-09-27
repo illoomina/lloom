@@ -2186,6 +2186,11 @@ fn main() -> Result<()> {
         Device::Metal(m) => Some(m.commands().submission_contention()),
         _ => None,
     };
+    #[cfg(feature = "metal")]
+    let pool_contention_before = match &device {
+        Device::Metal(m) => Some(m.pool_contention()),
+        _ => None,
+    };
     let mem_sampler = args
         .mem_sample
         .then(|| MemSampler::start(&device))
@@ -2681,6 +2686,17 @@ fn main() -> Result<()> {
         let d = m.commands().submission_contention().since(before);
         diag!(
             "[lock contention over the run: waits={} host_blocked={:.1} us over {} steps | {}]",
+            d.total_waits(),
+            d.host_blocked_ns() as f64 / 1e3,
+            st.steps,
+            d.render(),
+        );
+    }
+    #[cfg(feature = "metal")]
+    if let (Device::Metal(m), Some(before)) = (&device, pool_contention_before.as_ref()) {
+        let d = m.pool_contention().since(before);
+        diag!(
+            "[pool lock contention over the run: waits={} host_blocked={:.1} us over {} steps | {}]",
             d.total_waits(),
             d.host_blocked_ns() as f64 / 1e3,
             st.steps,

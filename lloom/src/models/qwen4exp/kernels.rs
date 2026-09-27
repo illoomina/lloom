@@ -426,8 +426,28 @@ pub(crate) fn hc_mix_fused(
     d: usize,
     eps: f32,
 ) -> Option<Result<(Tensor, Tensor)>> {
+    if !hc_mix_on() {
+        return None;
+    }
+    hc_mix_pair(h, gamma, down, up, inject, n, d, eps)
+}
+
+/// [`hc_mix_fused`] without the arm's switch: the pair wherever it applies.
+/// The parity test calls this — through [`hc_mix_fused`] it would test the
+/// composed chain, the arm being off by default (#749 P33 (6b): the pair's
+/// kernels survived a mutation because no test reached them).
+pub(crate) fn hc_mix_pair(
+    h: &Tensor,
+    gamma: &Tensor,
+    down: &lloom_tensor::quantized::QMatMul,
+    up: &lloom_tensor::quantized::QMatMul,
+    inject: Option<&lloom_tensor::quantized::QMatMul>,
+    n: usize,
+    d: usize,
+    eps: f32,
+) -> Option<Result<(Tensor, Tensor)>> {
     use lloom_tensor::quantized::QMatMul;
-    if !fused_applies(h) || h.rank() != 3 || !hc_mix_on() {
+    if !fused_applies(h) || h.rank() != 3 {
         return None;
     }
     let w_down = match down {

@@ -436,6 +436,7 @@ pub(crate) fn hc_mix_fused(
 /// The parity test calls this — through [`hc_mix_fused`] it would test the
 /// composed chain, the arm being off by default (#749 P33 (6b): the pair's
 /// kernels survived a mutation because no test reached them).
+#[allow(clippy::too_many_arguments)] // `hc_mix_fused`'s signature, which it serves
 pub(crate) fn hc_mix_pair(
     h: &Tensor,
     gamma: &Tensor,

@@ -54,8 +54,9 @@ pub struct RingArm {
     /// a buffer is closed when the GPU starts the previous one rather than
     /// every `commit_steps`, and the token drain is a reader thread's, off
     /// the loop's path. Measured +0.5 tok/s on the B=1 crown (#148, record
-    /// §8.1). Needs a CPU-mapped ring and lookahead 1; falls back to the
-    /// fixed cadence where the ring has no reader.
+    /// §8.1). Needs a CPU-mapped ring, lookahead 1, an EOS read other than
+    /// the flag and a per-token stamp; the fixed cadence where it has not
+    /// ([`RingArm::resolved`]).
     pub adaptive: bool,
     /// How the ring learns EOS (`ring` = a blocking flag read, `ring-nonblocking`
     /// = the poll, `ring-hostdrain`, `ring-gpubatch[-nonblocking]`).
@@ -81,6 +82,52 @@ impl RingArm {
         adaptive: false,
         ..Self::CROWN
     };
+
+    /// Why this arm cannot run the adaptive commit, or `None` if it can. The
+    /// commit encodes the next forward before anything is read back and its
+    /// reader streams the ring's per-token stamp, so it needs one forward of
+    /// lookahead, an EOS read that does not read each token back (every ring
+    /// read but the flag, `Session::decode`'s refusals), and a stamp per
+    /// token: the poll read's, or the fused argmax·eos·stamp publish, which
+    /// runs for the argmax sampler with `fused_publish` on (`fused`).
+    pub fn why_not_adaptive(&self, fused: bool) -> Option<&'static str> {
+        if self.lookahead != 1 {
+            Some("the adaptive commit needs lookahead 1")
+        } else if matches!(self.eos, EosRead::Blocking) {
+            Some("the `ring` EOS read (the flag) reads each token back per step")
+        } else {
+            self.why_not_stream_reader(fused)
+        }
+    }
+
+    /// Why a ring reader cannot stream this arm, or `None` if it can: the
+    /// reader streams what a per-token stamp certifies. The poll read stamps
+    /// every token on any cadence; the other reads do only through the
+    /// adaptive commit's fused publish (see [`Self::why_not_adaptive`]) —
+    /// otherwise the flag read stamps nothing and the deferred reads stamp
+    /// once per commit window.
+    pub fn why_not_stream_reader(&self, fused: bool) -> Option<&'static str> {
+        match self.eos {
+            EosRead::Poll(_) => None,
+            _ if self.adaptive && fused => None,
+            EosRead::Blocking => {
+                Some("the `ring` EOS read (the flag) stamps no token for a reader")
+            }
+            _ => Some(
+                "a deferred EOS read stamps once per commit window, not per token, outside the \
+                 fused publish (the argmax sampler, `fused_publish` on)",
+            ),
+        }
+    }
+
+    /// The arm that runs: this one, on the fixed cadence where it cannot
+    /// carry the adaptive commit.
+    pub fn resolved(self, fused: bool) -> RingArm {
+        RingArm {
+            adaptive: self.adaptive && self.why_not_adaptive(fused).is_none(),
+            ..self
+        }
+    }
 
     /// The report-line rendering: the `--readback` spelling this arm is, its
     /// lookahead and cadence, from the value that ran (§7.1a-i).
@@ -281,7 +328,8 @@ pub struct Decoded {
     /// Prompt tokens actually prefilled — the request's length minus `reused`,
     /// except under [`ReuseAction::Resume`] where nothing is.
     pub prefilled: usize,
-    /// The readback arm that ran, resolved (never [`ReadbackArm::Auto`]).
+    /// The readback arm that ran: resolved (never [`ReadbackArm::Auto`]), and
+    /// on the fixed cadence wherever the adaptive commit did not run.
     pub readback: ReadbackArm,
     /// The loop's own counters — prefill submit time, per-step host time,
     /// commits, ring engagement — so a consumer that reports throughput reads
@@ -460,9 +508,22 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         self.session.cache_mut()
     }
 
-    /// Positions currently in the cache.
+    /// Positions currently in the cache, a previous run's overrun included.
     pub fn pos(&self) -> usize {
         self.session.pos()
+    }
+
+    /// Discard a previous run's overrun so the cache ends at the token log's
+    /// last id, or reset the sequence where the cache cannot take it back —
+    /// what [`Session::prepare`] does first. For a caller that reads the
+    /// position or prefills before [`Self::decode_until`] prepares the run.
+    pub fn reconcile(&mut self)
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+        if self.session.overrun() > 0 && self.session.reconcile().is_err() {
+            self.session.reset();
+        }
     }
 
     /// Return the sequence to empty: cache reset, token log cleared. A serving
@@ -613,24 +674,29 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             Ok(true)
         };
 
-        let out: DecodeOut = match arm {
+        let (out, ran): (DecodeOut, ReadbackArm) = match arm {
             ReadbackArm::Blocking => {
                 let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
                 let opts = self
                     .config
                     .options(params.max_tokens, ReadbackArm::Blocking, params.prefill_tile);
-                self.session.decode_until(
+                let out = self.session.decode_until(
                     &mut spec,
                     &mut readback,
                     &mut sampler,
                     &prepared.suffix,
                     &opts,
                     &mut on_tokens,
-                )?
+                )?;
+                (out, ReadbackArm::Blocking)
             }
             ReadbackArm::Ring(ring) => {
+                // The fused publish, which lets a non-poll read stamp per
+                // token, runs for the argmax sampler only.
+                let fused = self.config.readback.fused_publish
+                    && matches!(sampler.sampling(), Sampling::ArgMax);
+                let ring = ring.resolved(fused);
                 let RingArm {
-                    lookahead,
                     adaptive,
                     eos,
                     wake,
@@ -641,25 +707,40 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 // every run.
                 let readback = self.rings.ring(&params.eos_ids, &self.device, eos)?;
                 readback.set_wake_cadence(wake);
-                // The adaptive arm needs the ring's reader (a CPU-mapped ring)
-                // and lookahead 1 (`Session::decode`'s own check); without a
-                // reader it is the fixed cadence, reported as such. The
+                // The adaptive arm needs the ring's reader (a CPU-mapped ring);
+                // without one it is the fixed cadence, reported as such. The
                 // reader alone (`--stream-reader`) streams per token on the
-                // fixed cadence.
-                let adaptive = adaptive && lookahead == 1;
-                let reader = if adaptive || self.config.readback.stream_reader {
-                    readback.reader()
+                // fixed cadence where the ring stamps per token, and a request
+                // whose sampler rules out the fused publish takes no reader
+                // (`RingArm::why_not_stream_reader`; the options refuse at
+                // startup what no request could stream). The pool's ring
+                // served earlier runs and its stamp runs across them, so the
+                // reader starts at this run's first token.
+                let reader = if (adaptive || self.config.readback.stream_reader)
+                    && ring.why_not_stream_reader(fused).is_none()
+                {
+                    readback.reader().map(|mut r| {
+                        r.resume_at_published();
+                        r
+                    })
                 } else {
                     None
                 };
                 let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let mut opts = self
-                    .config
-                    .options(params.max_tokens, arm, params.prefill_tile);
+                let mut opts = self.config.options(
+                    params.max_tokens,
+                    ReadbackArm::Ring(ring),
+                    params.prefill_tile,
+                );
                 opts.stream_via_reader = reader.is_some();
                 opts.adaptive_commit = reader.is_some() && adaptive;
+                opts.eos_gate = self.config.readback.eos_gate && opts.adaptive_commit;
                 opts.stop = reader.is_some().then(|| std::sync::Arc::clone(&stop_flag));
-                match reader {
+                let ran = ReadbackArm::Ring(RingArm {
+                    adaptive: opts.adaptive_commit,
+                    ..ring
+                });
+                let out = match reader {
                     None => self.session.decode_until(
                         &mut spec,
                         readback,
@@ -733,7 +814,8 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                         drained??;
                         out?
                     }
-                }
+                };
+                (out, ran)
             }
             ReadbackArm::Auto => unreachable!("resolved above"),
             ReadbackArm::Speculative { .. } | ReadbackArm::Batched { .. } => {
@@ -763,7 +845,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             reuse: prepared.action,
             reused: prepared.reused,
             prefilled: prepared.suffix.len(),
-            readback: arm,
+            readback: ran,
             stats: out.stats,
         })
     }
@@ -940,5 +1022,528 @@ mod tests {
         assert_ne!(Stop::StopString, Stop::Length);
         assert_ne!(Stop::Eos, Stop::StopString);
         assert_ne!(Stop::Cancelled, Stop::StopString);
+    }
+
+    /// Requests in a row through one sequence and one ring pool, as `lloom
+    /// serve` carries them (`from_parts` / `into_parts`, `app::lfm2`).
+    mod served {
+        use super::*;
+        use crate::options::{DecodeConfig, ReadbackConfig};
+        use lloom::nn::{Model, VarBuilder};
+        use lloom_tensor::{DType, Tensor};
+
+        const VOCAB: usize = 64;
+        const EOS: u32 = 42;
+
+        fn next_of(tok: u32) -> u32 {
+            (tok * 7 + 3) % VOCAB as u32
+        }
+
+        /// The ids a request from `start` returns, and whether it ends on EOS.
+        fn chain(start: u32, max: usize) -> (Vec<u32>, bool) {
+            let mut ids = Vec::new();
+            let mut tok = start;
+            while ids.len() < max {
+                tok = next_of(tok);
+                if tok == EOS {
+                    return (ids, true);
+                }
+                ids.push(tok);
+            }
+            (ids, false)
+        }
+
+        fn text_of(ids: &[u32]) -> String {
+            ids.iter().map(|t| format!("{t} ")).collect()
+        }
+
+        /// A position counter as the cache.
+        struct Pos(usize);
+
+        impl CacheReset for Pos {
+            fn reset(&mut self) {
+                self.0 = 0;
+            }
+        }
+
+        impl CacheRewind for Pos {
+            fn rewind_horizon(&self) -> usize {
+                self.0
+            }
+            fn rewind(&mut self, n: usize) -> Result<()> {
+                self.0 -= n;
+                Ok(())
+            }
+        }
+
+        /// A decoder whose logits peak at `next_of(last token)`, device-side.
+        struct Chain {
+            table: Tensor,
+            eye: Tensor,
+        }
+
+        impl Chain {
+            fn new(device: &Device) -> Result<Self> {
+                let table: Vec<f32> = (0..VOCAB as u32).map(|t| next_of(t) as f32).collect();
+                Ok(Self {
+                    table: Tensor::from_vec(table, VOCAB, device)?,
+                    eye: Tensor::eye(VOCAB, DType::F32, device)?,
+                })
+            }
+        }
+
+        impl Model for Chain {
+            type Config = ();
+            fn from_weights(_vb: VarBuilder, _cfg: &()) -> Result<Self> {
+                lloom_tensor::bail!("Chain has no weights")
+            }
+        }
+
+        impl CausalLM for Chain {
+            type Cache = Pos;
+            fn new_cache(&self, _cfg: &(), _dev: &Device) -> Result<Pos> {
+                Ok(Pos(0))
+            }
+            fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+                Ok(tokens.clone())
+            }
+            fn forward_embeds(
+                &self,
+                embeds: &Tensor,
+                pos: usize,
+                cache: &mut Pos,
+            ) -> Result<Tensor> {
+                assert_eq!(
+                    cache.0, pos,
+                    "forward at {pos} against a cache of {}",
+                    cache.0
+                );
+                let (_b, seq) = embeds.dims2()?;
+                cache.0 += seq;
+                let last = embeds.narrow(1, seq - 1, 1)?.flatten_all()?;
+                let next = self.table.index_select(&last, 0)?.to_dtype(DType::U32)?;
+                self.eye.index_select(&next, 0)
+            }
+            fn vocab_size(&self) -> usize {
+                VOCAB
+            }
+        }
+
+        fn devices() -> Vec<Device> {
+            let mut v = vec![Device::Cpu];
+            #[cfg(feature = "metal")]
+            v.push(
+                Device::new_metal(0).expect("the `metal` feature is on and no Metal device opened"),
+            );
+            v
+        }
+
+        /// One request: on the sequence and pool `held` carries over from the
+        /// previous request, or on a fresh session. Returns the reply, the
+        /// text its fragments streamed, and the parts for the next request.
+        fn request(
+            model: &Chain,
+            device: &Device,
+            config: &DecodeConfig,
+            held: Option<(Sequence<Pos>, RingPool)>,
+            prompt: &[u32],
+            max_tokens: usize,
+        ) -> Result<(Decoded, String, (Sequence<Pos>, RingPool))> {
+            let session = match held {
+                Some((seq, rings)) => DecodeSession::from_parts(model, seq, device.clone(), rings),
+                None => DecodeSession::new(model, Pos(0), device.clone(), 0),
+            };
+            let mut session = session.with_config(config.clone());
+            let params = DecodeParams {
+                max_tokens,
+                eos_ids: vec![EOS],
+                readback: config.readback.arm(),
+                ..DecodeParams::default()
+            };
+            let mut streamed = String::new();
+            let reply = session.decode(
+                prompt,
+                |ids: &[u32]| Ok(text_of(ids)),
+                &params,
+                |frag: &str| streamed.push_str(frag),
+            )?;
+            Ok((reply, streamed, session.into_parts()))
+        }
+
+        /// Each request on a pooled ring streams its own run, and nothing of
+        /// the earlier requests': the text its fragments carried equals the
+        /// text of its ids, which equal the chain from its prompt — what the
+        /// same request reads on a fresh session. On `lloom serve`'s default
+        /// arm (the adaptive commit, whose reader streams, and the EOS gate)
+        /// and the same arm ungated, on the reader-owned fixed-cadence arms
+        /// (whose loop retracts every EOS), and on the blocking arm, after
+        /// requests that ended on EOS and requests that did not. The reader
+        /// is Metal's; on the CPU the ring arms drain on the loop's cadence
+        /// and the test holds them to the same references.
+        #[test]
+        fn each_request_on_a_pooled_ring_streams_only_its_own_run() -> Result<()> {
+            // (name, spelling, stream reader, EOS gate)
+            let arms: [(&str, Option<&str>, bool, bool); 6] = [
+                ("default", None, false, true),
+                ("default --eos-gate=false", None, false, false),
+                ("ring-la0 --stream-reader", Some("ring-la0"), true, true),
+                ("ring-fixed --stream-reader", Some("ring-fixed"), true, true),
+                ("ring", Some("ring"), false, true),
+                ("blocking", Some("blocking"), false, true),
+            ];
+            // (prompt, max_tokens): ends on EOS, on length, EOS twice in a
+            // row, then length after an EOS.
+            let requests: [(&[u32], usize); 5] = [
+                (&[5, 1], 64),
+                (&[5, 0], 24),
+                (&[9, 1], 64),
+                (&[1], 64),
+                (&[0], 24),
+            ];
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                for (arm, spelling, reader, gate) in arms {
+                    let mut config = DecodeConfig::default();
+                    if let Some(s) = spelling {
+                        ReadbackConfig::apply_spelling(&mut config.readback, s)
+                            .map_err(lloom_tensor::Error::msg)?;
+                    }
+                    config.readback.stream_reader = reader;
+                    config.readback.eos_gate = gate;
+                    let mut held = None;
+                    for (i, (prompt, max)) in requests.into_iter().enumerate() {
+                        let (want, hit) = chain(*prompt.last().expect("a prompt"), max);
+                        let (fresh, fresh_streamed, _) =
+                            request(&model, &device, &config, None, prompt, max)?;
+                        let (got, streamed, parts) =
+                            request(&model, &device, &config, held.take(), prompt, max)?;
+                        held = Some(parts);
+                        let at = format!("{device:?} {arm} request {i} ({})", got.readback.name());
+                        assert_eq!(fresh.tokens, want, "{at}: the fresh session's ids");
+                        assert_eq!(
+                            fresh_streamed,
+                            text_of(&want),
+                            "{at}: the fresh session's text"
+                        );
+                        assert_eq!(got.tokens, want, "{at}: the ids");
+                        assert_eq!(streamed, text_of(&want), "{at}: the streamed text");
+                        assert_eq!(got.text, streamed, "{at}: the reply's text");
+                        assert_eq!(
+                            got.stop,
+                            if hit { Stop::Eos } else { Stop::Length },
+                            "{at}: why it stopped"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// `DecodeSession::reconcile` takes a run's overrun back before the
+        /// next request reads the position — the image path's reuse check
+        /// (`app::lfm2::Engine::complete_images_until`) compares it with the
+        /// token log. After a request that ended on EOS with forwards queued
+        /// past it (the gated flow's up to two windows on Metal, the
+        /// lookahead's one on the CPU), the position equals the token log,
+        /// the cache kept: the next request extends it.
+        #[test]
+        fn reconcile_brings_the_position_back_to_the_token_log() -> Result<()> {
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                let config = DecodeConfig::default();
+                let (reply, _, (seq, rings)) =
+                    request(&model, &device, &config, None, &[5, 1], 64)?;
+                assert_eq!(reply.stop, Stop::Eos, "{device:?}");
+                let mut s = DecodeSession::from_parts(&model, seq, device.clone(), rings)
+                    .with_config(config.clone());
+                let (pos, kept) = (s.pos(), s.tokens().len());
+                assert!(
+                    pos > kept,
+                    "{device:?}: no overrun to reconcile ({pos} vs {kept})"
+                );
+                s.reconcile();
+                assert_eq!((s.pos(), s.tokens().len()), (kept, kept), "{device:?}");
+                s.reconcile();
+                assert_eq!(s.pos(), kept, "{device:?}: a second call moved it");
+                let mut prompt = vec![5, 1];
+                prompt.extend_from_slice(&reply.tokens);
+                prompt.push(2);
+                let (next, _, _) =
+                    request(&model, &device, &config, Some(s.into_parts()), &prompt, 8)?;
+                assert_eq!(next.reuse, ReuseAction::Extend, "{device:?}");
+                assert_eq!(next.reused, kept, "{device:?}");
+            }
+            Ok(())
+        }
+
+        /// One request on a fresh session at `temperature` (and `top_p`), on
+        /// the arm the options select: the reply, whatever the sampler drew,
+        /// and the text its fragments streamed.
+        fn sampled(
+            model: &Chain,
+            device: &Device,
+            config: &DecodeConfig,
+            temperature: f64,
+            top_p: Option<f64>,
+        ) -> Result<(Decoded, String)> {
+            let mut session =
+                DecodeSession::new(model, Pos(0), device.clone(), 0).with_config(config.clone());
+            let params = DecodeParams {
+                max_tokens: 24,
+                temperature: Some(temperature),
+                top_p,
+                eos_ids: vec![EOS],
+                readback: config.readback.arm(),
+                ..DecodeParams::default()
+            };
+            let mut streamed = String::new();
+            let reply = session.decode(
+                &[3],
+                |ids: &[u32]| Ok(text_of(ids)),
+                &params,
+                |frag: &str| streamed.push_str(frag),
+            )?;
+            Ok((reply, streamed))
+        }
+
+        /// Every `--readback` spelling (and none) × the adaptive commit (unset,
+        /// on, off) × the lookahead (unset, 0, 1) × the commit budget (unset,
+        /// per-token) × the EOS gate (unset, on, off) × the stream reader ×
+        /// the fused publish (on, off), resolved through `lloom serve`'s
+        /// option path and served the way it serves them: the options are
+        /// refused at startup naming the stream reader where no request could
+        /// stream, or every request is answered and streams what it returns.
+        /// A request is never where a combination is refused, and a knob that
+        /// defaults on (the adaptive commit, the EOS gate) is never refused.
+        ///
+        /// Each reply reports the arm that ran: it names the adaptive commit
+        /// iff the loop closed a buffer adaptively (the length request runs
+        /// past `run_ahead`, so an adaptive run closes at least one), and the
+        /// EOS gate armed iff the run was adaptive and the gate is on, fired
+        /// iff the run ended on EOS. Where the device carries a reader, that
+        /// is also the arm the options resolve to, which is what the load
+        /// line renders.
+        #[cfg(feature = "serve")]
+        #[test]
+        fn every_readback_spelling_and_commit_arm_serves_or_is_refused_at_startup() -> Result<()> {
+            use clap::Parser;
+            #[derive(Parser)]
+            struct Cli {
+                #[command(flatten)]
+                common: crate::app::CommonArgs,
+            }
+            let mut combos: Vec<Vec<String>> = Vec::new();
+            let spellings = std::iter::once(None).chain(ReadbackConfig::SPELLINGS.iter().map(Some));
+            for spelling in spellings {
+                for adaptive in [None, Some("true"), Some("false")] {
+                    for lookahead in [None, Some("0"), Some("1")] {
+                        for commit in [None, Some("per-token")] {
+                            for gate in [None, Some("true"), Some("false")] {
+                                for reader in [false, true] {
+                                    let mut a: Vec<String> = Vec::new();
+                                    if let Some(s) = spelling {
+                                        a.extend(["--readback".into(), s.to_string()]);
+                                    }
+                                    if let Some(v) = adaptive {
+                                        a.push(format!("--adaptive-commit={v}"));
+                                    }
+                                    if let Some(v) = lookahead {
+                                        a.extend(["--lookahead".into(), v.to_string()]);
+                                    }
+                                    if let Some(v) = commit {
+                                        a.extend(["--commit-budget".into(), v.to_string()]);
+                                    }
+                                    if let Some(v) = gate {
+                                        a.push(format!("--eos-gate={v}"));
+                                    }
+                                    if reader {
+                                        a.push("--stream-reader".into());
+                                    }
+                                    combos.push(a.clone());
+                                    a.push("--fused-publish=false".into());
+                                    combos.push(a);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(combos.len(), 10 * 3 * 3 * 2 * 3 * 2 * 2);
+            let mut failures: Vec<String> = Vec::new();
+            let mut vacuous: Vec<String> = Vec::new();
+            let mut refusals = std::collections::BTreeMap::new();
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                // (refused at startup, served, replies that ran adaptive,
+                // served combinations whose flags asked for it and did not,
+                // greedy replies the EOS gate armed / fired on)
+                let (mut refused, mut served, mut adaptive_ran, mut clamped) = (0, 0, 0, 0);
+                let (mut gated, mut gate_fired) = (0, 0);
+                let failed_before = failures.len();
+                for argv in &combos {
+                    let label = format!("{device:?} [{}]", argv.join(" "));
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        || -> Result<std::result::Result<(bool, bool, usize, usize), String>> {
+                            let cli = Cli::parse_from(
+                                std::iter::once("t".to_string()).chain(argv.iter().cloned()),
+                            );
+                            let config = match crate::app::resolve_options_uninstalled(&cli.common)
+                            {
+                                Err(e) => {
+                                    // Only an explicit knob that defaults off and the
+                                    // arm cannot carry is refused, and the refusal
+                                    // names it.
+                                    let e = e.to_string();
+                                    assert!(
+                                        argv.iter().any(|a| a == "--stream-reader")
+                                            && e.contains("stream_reader"),
+                                        "{label}: refused without naming a knob it set: {e}"
+                                    );
+                                    return Ok(Err(e));
+                                }
+                                Ok(o) => o.decode,
+                            };
+                            let (mut ran_adaptive, mut was_clamped) = (false, false);
+                            let (mut armed, mut fired) = (0usize, 0usize);
+                            let mut held = None;
+                            for (prompt, max) in [(&[5u32, 1][..], 64), (&[0u32][..], 24)] {
+                                let (want, hit) = chain(*prompt.last().expect("a prompt"), max);
+                                let (got, streamed, parts) =
+                                    request(&model, &device, &config, held.take(), prompt, max)
+                                        .unwrap_or_else(|e| {
+                                            panic!("{label}: a greedy request was refused: {e}")
+                                        });
+                                held = Some(parts);
+                                let at = format!("{label} ({}) max {max}", got.readback.name());
+                                assert_eq!(got.tokens, want, "{at}: the ids");
+                                assert_eq!(streamed, text_of(&want), "{at}: the streamed text");
+                                assert_eq!(
+                                    got.stop,
+                                    if hit { Stop::Eos } else { Stop::Length },
+                                    "{at}: why it stopped"
+                                );
+                                let ran =
+                                    got.stats.adaptive_commits + got.stats.run_ahead_closes > 0;
+                                let says =
+                                    matches!(got.readback, ReadbackArm::Ring(r) if r.adaptive);
+                                assert!(
+                                    !ran || says,
+                                    "{at}: ran the adaptive commit and does not say so"
+                                );
+                                let gate_on = says && config.readback.eos_gate;
+                                assert_eq!(
+                                    got.stats.eos_gate.is_some(),
+                                    gate_on,
+                                    "{at}: the EOS gate armed={}, adaptive={says} eos_gate={}",
+                                    got.stats.eos_gate.is_some(),
+                                    config.readback.eos_gate
+                                );
+                                if let Some(report) = got.stats.eos_gate {
+                                    assert_eq!(
+                                        report.fired, hit,
+                                        "{at}: the gate fired={}",
+                                        report.fired
+                                    );
+                                    armed += 1;
+                                    fired += report.fired as usize;
+                                }
+                                if !hit {
+                                    assert_eq!(says, ran, "{at}: the name says adaptive={says}, the loop ran adaptive={ran}");
+                                    ran_adaptive = ran;
+                                    let asked = config.readback.adaptive_commit;
+                                    was_clamped = asked
+                                        && !ran
+                                        && matches!(got.readback, ReadbackArm::Ring(_));
+                                }
+                                if device.is_metal() {
+                                    let resolved = config
+                                        .readback
+                                        .arm()
+                                        .resolve(&Sampling::ArgMax, config.readback.ring_arm());
+                                    assert_eq!(got.readback, resolved, "{at}: the reply reports another arm than the options resolve to");
+                                }
+                            }
+                            let host_sampler =
+                                !matches!(config.readback.arm(), ReadbackArm::Ring(_));
+                            for (t, p) in [(0.6, None), (0.6, Some(0.9))] {
+                                if p.is_some() && !host_sampler {
+                                    continue;
+                                }
+                                let (got, streamed) = sampled(&model, &device, &config, t, p)
+                                    .unwrap_or_else(|e| {
+                                        panic!("{label}: a request at temperature {t} top_p {p:?} was refused: {e}")
+                                    });
+                                let at = format!(
+                                    "{label} ({}) temperature {t} top_p {p:?}",
+                                    got.readback.name()
+                                );
+                                assert!(
+                                    got.tokens.len() <= 24,
+                                    "{at}: {} tokens past max_tokens 24",
+                                    got.tokens.len()
+                                );
+                                assert_eq!(
+                                    streamed,
+                                    text_of(&got.tokens),
+                                    "{at}: the streamed text"
+                                );
+                                assert_eq!(got.text, streamed, "{at}: the reply's text");
+                            }
+                            Ok(Ok((ran_adaptive, was_clamped, armed, fired)))
+                        },
+                    ));
+                    match outcome {
+                        Ok(Ok(Err(e))) => {
+                            refused += 1;
+                            *refusals.entry(e).or_insert(0usize) += 1;
+                        }
+                        Ok(Ok(Ok((r, c, g, f)))) => {
+                            served += 1;
+                            adaptive_ran += r as usize;
+                            clamped += c as usize;
+                            gated += g;
+                            gate_fired += f;
+                        }
+                        Ok(Err(e)) => failures.push(format!("{label}: {e}")),
+                        Err(p) => failures.push(
+                            p.downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| p.downcast_ref::<&str>().map(|m| m.to_string()))
+                                .unwrap_or_default(),
+                        ),
+                    }
+                }
+                eprintln!("{device:?}: {served} served, {refused} refused at startup, {adaptive_ran} ran adaptive, {clamped} asked for it and ran the fixed cadence, {gated} greedy replies gated, {gate_fired} fired");
+                let failed = failures.len() - failed_before;
+                eprintln!("{device:?}: {failed} failed");
+                for f in &failures[failed_before..] {
+                    eprintln!("FAIL {f}");
+                }
+                assert_eq!(served + refused + failed, combos.len());
+                if served == 0 || refused == 0 {
+                    vacuous.push(format!("{device:?}: one side of the matrix is empty"));
+                }
+                if device.is_metal() && (adaptive_ran == 0 || clamped == 0) {
+                    vacuous.push(format!(
+                        "{device:?}: the attribution check saw one arm only"
+                    ));
+                }
+                if device.is_metal() && (gated == 0 || gate_fired == 0 || gated == gate_fired) {
+                    vacuous.push(format!(
+                        "{device:?}: the gate check saw {gated} gated replies, {gate_fired} fired"
+                    ));
+                }
+            }
+            for (e, n) in &refusals {
+                eprintln!("REFUSED x{n}: {e}");
+            }
+            assert!(
+                failures.is_empty(),
+                "{} combination runs failed (listed above)",
+                failures.len()
+            );
+            assert!(vacuous.is_empty(), "{vacuous:?}");
+            Ok(())
+        }
     }
 }

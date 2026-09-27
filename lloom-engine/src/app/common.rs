@@ -197,6 +197,17 @@ pub fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// What the EOS gate did on a run, for a report line: `fired` (an EOS was
+/// seen and the forwards queued past it wrote nothing), `armed` (it rode the
+/// run, no EOS), `off` (the run was not adaptive, or the gate is off).
+pub fn eos_gate_name(report: Option<lloom_tensor::EosGateReport>) -> &'static str {
+    match report {
+        Some(g) if g.fired => "fired",
+        Some(_) => "armed",
+        None => "off",
+    }
+}
+
 pub fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }

@@ -1179,6 +1179,29 @@ fn adaptive_gated_run(
     n: usize,
     resume: bool,
 ) -> Result<(lloom::nn::DecodeOut, Vec<u32>)> {
+    let opts = DecodeOptions {
+        lookahead: 1,
+        stream_via_reader: true,
+        adaptive_commit: true,
+        run_ahead: 8,
+        eos_gate: true,
+        ..DecodeOptions::new(n)
+    };
+    reader_run(session, rb, prompt, opts, resume)
+}
+
+/// One reader-owned run under `opts` (`stream_via_reader` on): a reader
+/// thread streams off the ring and raises the loop's stop flag on the EOS it
+/// reads, as `DecodeSession::decode_until` does for `lloom serve`, and takes
+/// one last read once the loop has returned. Returns the run and what the
+/// reader saw.
+fn reader_run(
+    session: &mut Session<'_, Chain>,
+    rb: &mut Ring,
+    prompt: &[u32],
+    mut opts: DecodeOptions,
+    resume: bool,
+) -> Result<(lloom::nn::DecodeOut, Vec<u32>)> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     let mut reader = rb.reader().expect("mapped ring");
@@ -1187,15 +1210,7 @@ fn adaptive_gated_run(
     }
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
-    let opts = DecodeOptions {
-        lookahead: 1,
-        stream_via_reader: true,
-        adaptive_commit: true,
-        run_ahead: 8,
-        eos_gate: true,
-        stop: Some(Arc::clone(&stop)),
-        ..DecodeOptions::new(n)
-    };
+    opts.stop = Some(Arc::clone(&stop));
     let watcher = {
         let stop = Arc::clone(&stop);
         let done = Arc::clone(&done);
@@ -1203,6 +1218,7 @@ fn adaptive_gated_run(
             let mut buf = Vec::new();
             let mut seen = Vec::new();
             loop {
+                let last = done.load(Ordering::Acquire);
                 buf.clear();
                 if reader.read_new(&mut buf).is_err() {
                     break;
@@ -1212,7 +1228,7 @@ fn adaptive_gated_run(
                     stop.store(true, Ordering::Release);
                     break;
                 }
-                if done.load(Ordering::Acquire) {
+                if last {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_micros(100));
@@ -1281,6 +1297,81 @@ fn a_resumed_reader_sees_only_the_later_run() -> Result<()> {
         stale.read_new(&mut seen).expect("no lap");
         assert_eq!(seen, want1, "{device:?}: the stale reader reads run 1");
         assert!(stale.ended());
+    }
+    Ok(())
+}
+
+/// A reader-owned run on the fixed cadence learns EOS per step and retracts
+/// the EOS token from the history, whose slot the next write reuses, but not
+/// from the stamp — so after every such run the ring's stamps run one further
+/// ahead of its slots. A reader taken for a later run and resumed
+/// (`RingReader::resume_at_published`) must read that run exactly anyway, on
+/// the same arm and on the adaptive one: the shape of `lloom serve --readback
+/// ring-la0 | ring-fixed --stream-reader` and of its default arm, request after
+/// request on the pool's ring (`Ring::new` at `RING_HISTORY_SLOTS`, as
+/// `RingPool` builds it). A reader indexing the slots by the stamp alone reads,
+/// from the second run on, the slot after each token's.
+#[test]
+fn a_resumed_reader_reads_each_later_run_after_retracted_eos() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        if matches!(device, Device::Cpu) {
+            continue; // the reader is Metal
+        }
+        let model = Chain::new(&device)?;
+        let mut rb = Ring::new(
+            &[EOS],
+            &device,
+            lloom::generation::readback::RING_HISTORY_SLOTS,
+            EosRead::Poll(PollMechanism::default()),
+        )?;
+        let fixed = |lookahead: usize, n: usize| DecodeOptions {
+            lookahead,
+            stream_via_reader: true,
+            budget: CommitBudget::steps(8).expect("8 > 0"),
+            ..DecodeOptions::new(n)
+        };
+        let adaptive = |n: usize| DecodeOptions {
+            lookahead: 1,
+            stream_via_reader: true,
+            adaptive_commit: true,
+            run_ahead: 8,
+            ..DecodeOptions::new(n)
+        };
+        // (label, opts, start, max, whether the loop retracts the EOS)
+        let runs = [
+            ("la0 eos", fixed(0, 64), 1u32, 64usize, true),
+            ("la0 length", fixed(0, 24), 0, 24, false),
+            ("fixed eos", fixed(1, 64), 1, 64, true),
+            ("fixed length", fixed(1, 24), 0, 24, false),
+            ("adaptive eos", adaptive(64), 1, 64, false),
+            ("adaptive length", adaptive(24), 0, 24, false),
+        ];
+        let mut retracted = 0usize;
+        for (label, opts, start, max, retracts) in runs {
+            let (want, hit) = chain(start, max);
+            let before = rb.generation() as usize;
+            let mut session = Session::new(&model, 0usize);
+            let (out, seen) = reader_run(&mut session, &mut rb, &[start], opts, true)?;
+            assert_eq!(out.ids, want, "{device:?} {label}: the loop's ids");
+            assert_eq!(out.eos, hit, "{device:?} {label}: EOS");
+            assert_eq!(
+                seen, want,
+                "{device:?} {label}: the resumed reader's stream, after {retracted} retracted EOS"
+            );
+            if retracts {
+                // The shift the next reader absorbs: the EOS was stamped and
+                // its slot was retracted, so the run stamped one more
+                // generation than the ids it kept.
+                assert_eq!(
+                    rb.generation() as usize - before,
+                    want.len() + 1,
+                    "{device:?} {label}: the retracted EOS was stamped"
+                );
+                retracted += 1;
+            }
+        }
+        assert_eq!(retracted, 2);
     }
     Ok(())
 }

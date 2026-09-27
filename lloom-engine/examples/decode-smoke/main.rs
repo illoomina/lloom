@@ -108,6 +108,7 @@ fn main() -> Result<()> {
             readback: ReadbackArm::Blocking,
             // One forward per turn, as the gate takes it.
             prefill_tile: 0,
+            ..DecodeParams::default()
         };
 
         let tk = &tokenizer;

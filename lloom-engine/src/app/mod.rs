@@ -743,6 +743,97 @@ mod sampling_and_speculation_tests {
         T::parse_from(full).common
     }
 
+    /// Every layer reaches the processors — flags, `--set`, the JSON — and
+    /// every one of them is refused by name out of range, the JSON included
+    /// (it deserializes past the flag parsers). The checkpoint's
+    /// `repetition_penalty` and `min_p` fill the unset fields under
+    /// `--sampling-defaults checkpoint` only.
+    #[test]
+    fn the_processor_fields_reach_the_params_from_every_layer() {
+        let o = resolve_options_uninstalled(&common(&[
+            "--repetition-penalty",
+            "1.1",
+            "--presence-penalty",
+            "0.5",
+            "--frequency-penalty",
+            "-0.5",
+            "--min-p",
+            "0.05",
+            "--logit-bias",
+            "42:-100, 7:2.5",
+        ]))
+        .unwrap();
+        let p = o
+            .sampling
+            .params(&[1], crate::ReadbackArm::Blocking, 0)
+            .processors;
+        assert_eq!(
+            p,
+            lloom::generation::Processors {
+                repetition_penalty: 1.1,
+                presence_penalty: 0.5,
+                frequency_penalty: -0.5,
+                min_p: 0.05,
+                logit_bias: vec![(7, 2.5), (42, -100.0)],
+            }
+        );
+        let o = resolve_options_uninstalled(&common(&[
+            "--generation-config",
+            r#"{"presence_penalty": 1.0, "logit_bias": {"3": -5}}"#,
+            "--set",
+            "sampling.min_p=0.2",
+        ]))
+        .unwrap();
+        let p = o.sampling.processors();
+        assert_eq!(
+            (p.presence_penalty, p.min_p, p.logit_bias.clone()),
+            (1.0, 0.2, vec![(3, -5.0)])
+        );
+        assert!(!resolve_options_uninstalled(&common(&[]))
+            .unwrap()
+            .sampling
+            .processors()
+            .is_active());
+        for (argv, name) in [
+            (vec!["--presence-penalty", "2.5"], "presence_penalty"),
+            (
+                vec!["--set", "sampling.repetition_penalty=0"],
+                "repetition_penalty",
+            ),
+            (vec!["--generation-config", r#"{"min_p": 2}"#], "min_p"),
+            (
+                vec!["--generation-config", r#"{"logit_bias": {"3": 101}}"#],
+                "logit_bias",
+            ),
+            (vec!["--logit-bias", "x:1"], "not a token id"),
+        ] {
+            let e = resolve_options_uninstalled(&common(&argv))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(name), "{argv:?}: {e}");
+        }
+        let gc = lloom::hub::GenerationConfig {
+            repetition_penalty: Some(1.1),
+            min_p: Some(0.1),
+            ..Default::default()
+        };
+        let mut s = resolve_options_uninstalled(&common(&["--min-p", "0.3"]))
+            .unwrap()
+            .sampling;
+        s.apply_checkpoint(Some(&gc));
+        assert_eq!(
+            s.repetition_penalty, None,
+            "greedy defaults ignore the checkpoint"
+        );
+        s.defaults = "checkpoint".into();
+        s.apply_checkpoint(Some(&gc));
+        assert_eq!(
+            (s.repetition_penalty, s.min_p),
+            (Some(1.1), Some(0.3)),
+            "unset fields only"
+        );
+    }
+
     #[test]
     fn the_sampler_arms_follow_the_fields() {
         let o = resolve_options_uninstalled(&common(&[])).unwrap();

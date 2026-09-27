@@ -5400,7 +5400,7 @@ void kernel_mul_mv_q5_K_impl(
     device const block_q5_K * x = (device const block_q5_K *) src0 + first_row*nb + offset0;
     device const ACT     * yy = (device const ACT      *) src1 + r1*ne10 + im*ne00*ne1;
 
-    float sumf[2]={0.f};
+    float sumf[4]={0.f, 0.f, 0.f, 0.f};
 
     const int step = sizeof(block_q5_K) * nb;
 

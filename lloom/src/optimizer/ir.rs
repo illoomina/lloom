@@ -160,6 +160,24 @@ pub fn family(node: &Node) -> Option<String> {
 /// A per-family dispatch count.
 pub type Census = BTreeMap<String, u64>;
 
+/// [`Graph::depth_profile`]: dispatches per depth, depth 1 first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthProfile {
+    pub widths: Vec<u32>,
+}
+
+impl DepthProfile {
+    /// The longest chain of dependent dispatches.
+    pub fn depth(&self) -> u32 {
+        self.widths.len() as u32
+    }
+
+    /// The most dispatches at one depth.
+    pub fn max_width(&self) -> u32 {
+        self.widths.iter().copied().max().unwrap_or(0)
+    }
+}
+
 /// The IR of one pass: nodes in an arena, roots named.
 #[derive(Debug, Clone, Default)]
 pub struct Graph {
@@ -426,6 +444,32 @@ impl Graph {
         self.nodes.iter().filter(|n| n.op.dispatches()).count() as u64
     }
 
+    /// The dispatch DAG's shape: the longest chain of data-dependent
+    /// dispatches (the serial boundaries the pass cannot remove by
+    /// reordering) and how many dispatches sit at each depth.
+    ///
+    /// A dispatch's level is one past its deepest input's; a view, an input
+    /// or a weight adds nothing. The arena is in push order and a node's
+    /// inputs are pushed before it, so one forward pass is the longest path.
+    pub fn depth_profile(&self) -> DepthProfile {
+        let mut level = vec![0u32; self.nodes.len()];
+        let mut widths: Vec<u32> = Vec::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            let deepest = node.inputs.iter().map(|&j| level[j]).max().unwrap_or(0);
+            if node.op.dispatches() {
+                level[i] = deepest + 1;
+                let at = level[i] as usize - 1;
+                if widths.len() <= at {
+                    widths.resize(at + 1, 0);
+                }
+                widths[at] += 1;
+            } else {
+                level[i] = deepest;
+            }
+        }
+        DepthProfile { widths }
+    }
+
     /// The weakest numerical class any root lands in.
     pub fn numeric(&self) -> NumericClass {
         self.roots.iter().fold(NumericClass::BitExact, |c, &r| {
@@ -437,6 +481,28 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two independent chains feeding one add: `gemv → silu` beside
+    /// `gemv → gemv`, joined. Depth 3 (either chain, then the add), widths
+    /// `[2, 2, 1]`; the views and weights add no level.
+    #[test]
+    fn the_depth_is_the_longest_dispatch_chain_and_views_add_nothing() {
+        let mut g = Graph::new();
+        let x = g.input("x", Shape::of(&[1, 1, 8]), DType::F32);
+        let w1 = g.weight("w1", Shape::of(&[8, 8]), DType::F32);
+        let w2 = g.weight("w2", Shape::of(&[8, 8]), DType::F32);
+        let a = g.gemv(w1, x);
+        let a = g.silu(a);
+        let b = g.gemv(w2, x);
+        let b = g.view("reshape", b, Shape::of(&[1, 1, 8]));
+        let b = g.gemv(w1, b);
+        let y = g.add(a, b);
+        g.mark_root(y);
+        let p = g.depth_profile();
+        assert_eq!(p.widths, vec![2, 2, 1]);
+        assert_eq!((p.depth(), p.max_width()), (3, 2));
+        assert_eq!(p.widths.iter().map(|&w| w as u64).sum::<u64>(), g.dispatches());
+    }
 
     #[test]
     fn shapes_dtypes_and_uses_follow_the_ops() {

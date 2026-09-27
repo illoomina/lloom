@@ -284,7 +284,11 @@ mod tests {
     /// Metal) against the CPU's composed chain over the same f16-rounded
     /// weights, with and without an inject weight, at 1 and 3 rows — and the
     /// composed Metal chain (`QWEN4EXP_FUSED_OFF` is process-wide, so the
-    /// composed arm here is the CPU's).
+    /// composed arm here is the CPU's). The pair is an arm, off by default:
+    /// at one row it is called through `kernels::hc_mix_pair` so the test
+    /// reaches it (through `mix` it read the composed chain and a mutation of
+    /// either kernel survived, #749 P33 (6b)); at three rows the pair
+    /// declines (`HC_MIX_MAX_ROWS`) and `mix` is the composed Metal chain.
     #[cfg(feature = "metal")]
     #[test]
     fn fused_prologue_matches_composed_f16() {
@@ -347,7 +351,29 @@ mod tests {
                 )
                 .unwrap();
                 let (m_cpu, i_cpu) = hc_cpu.mix(&h).unwrap();
-                let (m_gpu, i_gpu) = hc_gpu.mix(&h.to_device(&gpu).unwrap()).unwrap();
+                let h_gpu = h.to_device(&gpu).unwrap();
+                let pair = || {
+                    super::super::kernels::hc_mix_pair(
+                        &h_gpu,
+                        &hc_gpu.norm_w,
+                        &hc_gpu.down,
+                        &hc_gpu.up,
+                        hc_gpu.inject.as_ref(),
+                        n,
+                        d,
+                        1e-6,
+                    )
+                };
+                let fused = pair();
+                assert_eq!(
+                    fused.is_some(),
+                    seq <= super::super::kernels::HC_MIX_MAX_ROWS,
+                    "seq {seq}: the pair must take a decode row and decline more"
+                );
+                let (m_gpu, i_gpu) = match fused {
+                    Some(r) => r.unwrap(),
+                    None => hc_gpu.mix(&h_gpu).unwrap(),
+                };
                 assert_eq!(m_gpu.dims(), &[1, seq, d]);
                 assert_eq!(i_gpu.dims(), &[1, seq, n]);
                 for (name, a, b, tol) in [
@@ -380,7 +406,10 @@ mod tests {
                     }
                 }
                 // Determinism: the same launch twice, bit for bit.
-                let (m2, _) = hc_gpu.mix(&h.to_device(&gpu).unwrap()).unwrap();
+                let (m2, _) = match pair() {
+                    Some(r) => r.unwrap(),
+                    None => hc_gpu.mix(&h_gpu).unwrap(),
+                };
                 let a: Vec<f32> = m_gpu.flatten_all().unwrap().to_vec1().unwrap();
                 let b2: Vec<f32> = m2.flatten_all().unwrap().to_vec1().unwrap();
                 assert_eq!(a, b2, "fused prologue not bit-stable at seq {seq}");

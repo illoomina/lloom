@@ -416,7 +416,8 @@ pub fn call_gdn_prologue(
     Ok(())
 }
 
-/// `gdn_step_f32`: the recurrence on `s [d, d, h_v]` in place → `o [h_v, d]`.
+/// `gdn_step_f32`: the recurrence on `s [d, d, h_v]` in place → `o [h_v, d]`,
+/// in the form `tuning.gdn.step_reg` selects.
 #[allow(clippy::too_many_arguments)]
 pub fn call_gdn_step(
     device: &Device,
@@ -433,7 +434,49 @@ pub fn call_gdn_step(
     o: &Buffer,
     s_out: BufferOffset,
 ) -> Result<(), MetalKernelError> {
+    static REG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let reg = *REG.get_or_init(|| crate::tuning::tuning().gdn.step_reg);
+    call_gdn_step_with(
+        device, ep, kernels, d, h_v, heads, alpha, beta, dt_bias, ssm_a, s, o, s_out, reg,
+    )
+}
+
+/// [`call_gdn_step`] with the form named: `reg` holds each thread's values of
+/// `S` in registers (the slab read once) where an instantiated array bound
+/// covers `ceil(d / split)`; otherwise, and when `reg` is false, the loop form.
+#[allow(clippy::too_many_arguments)]
+pub fn call_gdn_step_with(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    d: usize,
+    h_v: usize,
+    heads: BufferOffset,
+    alpha: BufferOffset,
+    beta: BufferOffset,
+    dt_bias: BufferOffset,
+    ssm_a: BufferOffset,
+    s: BufferOffset,
+    o: &Buffer,
+    s_out: BufferOffset,
+    reg: bool,
+) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "gdn_step_f32")?;
+    // `h_v × split` threads: `split` slices of `dk` per head, as many as the
+    // threadgroup takes up to 8 (the reductions close over `split` partials
+    // in threadgroup memory; `h_v × split` ≤ 1024).
+    let split = gdn_split(h_v, &pipeline);
+    let pipeline = match gdn_step_reg_name(d, split).filter(|_| reg) {
+        Some(name) => {
+            let reg = kernels.load_pipeline(device, Source::Qwen4Exp, name)?;
+            if reg.max_total_threads_per_threadgroup() >= h_v * split {
+                reg
+            } else {
+                pipeline
+            }
+        }
+        None => pipeline,
+    };
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -453,12 +496,21 @@ pub fn call_gdn_step(
             Output::from_buffer_offset(&s_out)
         )
     );
-    // `h_v × split` threads: `split` slices of `dk` per head, as many as the
-    // threadgroup takes up to 8 (the reductions close over `split` partials
-    // in threadgroup memory; `h_v × split` ≤ 1024).
-    let split = gdn_split(h_v, &pipeline);
     dispatch_groups(encoder, d, h_v * split);
     Ok(())
+}
+
+/// The register form of `gdn_step` whose array holds a thread's
+/// `ceil(d / split)` values of `S`, if one is instantiated.
+fn gdn_step_reg_name(d: usize, split: usize) -> Option<&'static str> {
+    if split == 0 {
+        return None;
+    }
+    match d.div_ceil(split) {
+        0..=16 => Some("gdn_step_r16_f32"),
+        17..=32 => Some("gdn_step_r32_f32"),
+        _ => None,
+    }
 }
 
 /// `gdn_gated_norm_f32`: per-head RMS norm of `o [h_v, d]` × γ × sigmoid(z).

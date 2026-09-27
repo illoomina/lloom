@@ -119,12 +119,12 @@ impl crate::kernels::metal::BufferEvictionObserver for ResidencyEvictionObserver
             return;
         }
         if retain_evicted_allocations() {
-            self.residency_set.retire_batch(rest.into_iter());
+            self.residency_set.retire_batch(rest);
         } else {
-            // Removed now, committed at the next cut: eviction runs on the
-            // encoding thread, inside `acquire` (§6.4e), where a commit per
-            // round would be a driver round-trip on the hot path.
-            self.residency_set.remove_batch_deferred(rest.into_iter());
+            // Removed now, committed at the next cut: eviction runs at the
+            // pool's drain on the host (§6.4e), where a commit per round
+            // would be a driver round-trip on the hot path.
+            self.residency_set.remove_batch_deferred(rest);
         }
     }
 }

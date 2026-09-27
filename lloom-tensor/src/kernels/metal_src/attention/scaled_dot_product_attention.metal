@@ -1142,9 +1142,14 @@ METAL_FUNC int sdpa_code_bytes(int n) {
   return (BITS == 8) ? n : (n >> 1);
 }
 
-template <typename T, int D, int BITS>
+// `SEL` reads key `i` at cell `sel[i]` instead of at `i`: attention over a
+// selection of the cache (QSA's indexer cells, §10.7) without gathering the
+// planes first. The per-key arithmetic and the reduction are unchanged; with
+// `SEL` false the pointer walk is the contiguous one, line for line.
+template <typename T, int D, int BITS, bool SEL>
 METAL_FUNC void sdpa_vector_quant_body(
     thread const SdpaQuantParams& p,
+    const device uint* sel,
     const device T* queries,
     const device uchar* k_codes,
     const device T* k_scales,
@@ -1184,16 +1189,20 @@ METAL_FUNC void sdpa_vector_quant_body(
   // int4 plane advances half as far per token as an int8 one and the arithmetic
   // says so in one place.
   const int lane_first_code = simd_lid * elem_per_thread;
-  const device uchar* k_code_base =
-      k_codes + kv_head_idx * p.k_code_stride + sdpa_code_bytes<BITS>(simd_gid * D);
-  const device uchar* v_code_base =
-      v_codes + kv_head_idx * p.v_code_stride + sdpa_code_bytes<BITS>(simd_gid * D);
+  const device uchar* k_code_head = k_codes + kv_head_idx * p.k_code_stride;
+  const device uchar* v_code_head = v_codes + kv_head_idx * p.v_code_stride;
+  const device uchar* k_code_base = k_code_head + sdpa_code_bytes<BITS>(simd_gid * D);
+  const device uchar* v_code_base = v_code_head + sdpa_code_bytes<BITS>(simd_gid * D);
 
   // One (scale, bias) per (head, token): the group IS the head vector.
-  const device T* k_scale_p = k_scales + kv_head_idx * p.k_scale_stride + simd_gid;
-  const device T* k_bias_p = k_biases + kv_head_idx * p.k_scale_stride + simd_gid;
-  const device T* v_scale_p = v_scales + kv_head_idx * p.v_scale_stride + simd_gid;
-  const device T* v_bias_p = v_biases + kv_head_idx * p.v_scale_stride + simd_gid;
+  const device T* k_scale_head = k_scales + kv_head_idx * p.k_scale_stride;
+  const device T* k_bias_head = k_biases + kv_head_idx * p.k_scale_stride;
+  const device T* v_scale_head = v_scales + kv_head_idx * p.v_scale_stride;
+  const device T* v_bias_head = v_biases + kv_head_idx * p.v_scale_stride;
+  const device T* k_scale_p = k_scale_head + simd_gid;
+  const device T* k_bias_p = k_bias_head + simd_gid;
+  const device T* v_scale_p = v_scale_head + simd_gid;
+  const device T* v_bias_p = v_bias_head + simd_gid;
 
   for (int i = 0; i < elem_per_thread; i++) {
     q[i] = static_cast<U>(scale) * queries[i];
@@ -1209,6 +1218,15 @@ METAL_FUNC void sdpa_vector_quant_body(
   const int code_step = sdpa_code_bytes<BITS>(BN * D);
 
   for (int i = simd_gid; i < N; i += BN) {
+    if (SEL) {
+      const int c = int(sel[i]);
+      k_code_base = k_code_head + sdpa_code_bytes<BITS>(c * D);
+      v_code_base = v_code_head + sdpa_code_bytes<BITS>(c * D);
+      k_scale_p = k_scale_head + c;
+      k_bias_p = k_bias_head + c;
+      v_scale_p = v_scale_head + c;
+      v_bias_p = v_bias_head + c;
+    }
     const U k_scale = static_cast<U>(*k_scale_p);
     const U k_bias = static_cast<U>(*k_bias_p);
     const U v_scale = static_cast<U>(*v_scale_p);
@@ -1242,12 +1260,14 @@ METAL_FUNC void sdpa_vector_quant_body(
       o[j] = o[j] * factor + exp_score * value;
     }
 
-    k_code_base += code_step;
-    v_code_base += code_step;
-    k_scale_p += BN;
-    k_bias_p += BN;
-    v_scale_p += BN;
-    v_bias_p += BN;
+    if (!SEL) {
+      k_code_base += code_step;
+      v_code_base += code_step;
+      k_scale_p += BN;
+      k_bias_p += BN;
+      v_scale_p += BN;
+      v_bias_p += BN;
+    }
   }
 
   // The combine is `sdpa_vector_body`'s, unchanged. Quantization touches the
@@ -1303,8 +1323,9 @@ template <typename T, int D, int BITS>
   // `setBytes` in any form). §11.3h's whole programme is that debt paid
   // retroactively for seven families; there is no reason to incur it again.
   SdpaQuantParams p = *pp;
-  sdpa_vector_quant_body<T, D, BITS>(
+  sdpa_vector_quant_body<T, D, BITS, false>(
       p,
+      nullptr,
       queries,
       k_codes,
       k_scales,
@@ -1320,6 +1341,68 @@ template <typename T, int D, int BITS>
       simd_gid,
       simd_lid);
 }
+
+// `sdpa_vector_quant` over the cells `sel[0..N)` of the planes (`N` in the
+// params is the selection's length). `sel` is ascending or not; each cell must
+// be below the planes' capacity and live.
+template <typename T, int D, int BITS>
+[[kernel]] void sdpa_vector_quant_sel(
+    const device T* queries [[buffer(0)]],
+    const device uchar* k_codes [[buffer(1)]],
+    const device T* k_scales [[buffer(2)]],
+    const device T* k_biases [[buffer(3)]],
+    const device uchar* v_codes [[buffer(4)]],
+    const device T* v_scales [[buffer(5)]],
+    const device T* v_biases [[buffer(6)]],
+    device T* out [[buffer(7)]],
+    const device SdpaQuantParams* pp [[buffer(8)]],
+    const device uint* sel [[buffer(9)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+
+  threadgroup float outputs[BN * BD];
+  threadgroup float max_scores[BN];
+  threadgroup float sum_exp_scores[BN];
+
+  SdpaQuantParams p = *pp;
+  sdpa_vector_quant_body<T, D, BITS, true>(
+      p,
+      sel,
+      queries,
+      k_codes,
+      k_scales,
+      k_biases,
+      v_codes,
+      v_scales,
+      v_biases,
+      out,
+      outputs,
+      max_scores,
+      sum_exp_scores,
+      tid,
+      simd_gid,
+      simd_lid);
+}
+
+#define instantiate_sdpa_vector_quant_sel(name, type, d, bits)            \
+  template [[host_name("sdpa_vector_quant_sel_" #name "_" #d "_" #bits)]] \
+  [[kernel]] void sdpa_vector_quant_sel<type, d, bits>(                   \
+      const device type* queries [[buffer(0)]],                           \
+      const device uchar* k_codes [[buffer(1)]],                          \
+      const device type* k_scales [[buffer(2)]],                          \
+      const device type* k_biases [[buffer(3)]],                          \
+      const device uchar* v_codes [[buffer(4)]],                          \
+      const device type* v_scales [[buffer(5)]],                          \
+      const device type* v_biases [[buffer(6)]],                          \
+      device type* out [[buffer(7)]],                                     \
+      const device SdpaQuantParams* pp [[buffer(8)]],                     \
+      const device uint* sel [[buffer(9)]],                               \
+      uint3 tid [[threadgroup_position_in_grid]],                         \
+      uint simd_gid [[simdgroup_index_in_threadgroup]],                   \
+      uint simd_lid [[thread_index_in_simdgroup]]);
 
 #define instantiate_sdpa_vector_quant(name, type, d, bits)              \
   template [[host_name("sdpa_vector_quant_" #name "_" #d "_" #bits)]]   \
@@ -1350,6 +1433,23 @@ instantiate_sdpa_vector_quant(float, float, 64, 8)
 instantiate_sdpa_vector_quant(float, float, 64, 4)
 instantiate_sdpa_vector_quant(float, float, 128, 8)
 instantiate_sdpa_vector_quant(float, float, 128, 4)
+// Qwen4-exp's attention: head_dim 256, f32 activations (§10.7).
+instantiate_sdpa_vector_quant(float16_t, half, 256, 8)
+instantiate_sdpa_vector_quant(float16_t, half, 256, 4)
+instantiate_sdpa_vector_quant(float, float, 256, 8)
+instantiate_sdpa_vector_quant(float, float, 256, 4)
+instantiate_sdpa_vector_quant_sel(float16_t, half, 64, 8)
+instantiate_sdpa_vector_quant_sel(float16_t, half, 64, 4)
+instantiate_sdpa_vector_quant_sel(float16_t, half, 128, 8)
+instantiate_sdpa_vector_quant_sel(float16_t, half, 128, 4)
+instantiate_sdpa_vector_quant_sel(float16_t, half, 256, 8)
+instantiate_sdpa_vector_quant_sel(float16_t, half, 256, 4)
+instantiate_sdpa_vector_quant_sel(float, float, 64, 8)
+instantiate_sdpa_vector_quant_sel(float, float, 64, 4)
+instantiate_sdpa_vector_quant_sel(float, float, 128, 8)
+instantiate_sdpa_vector_quant_sel(float, float, 128, 4)
+instantiate_sdpa_vector_quant_sel(float, float, 256, 8)
+instantiate_sdpa_vector_quant_sel(float, float, 256, 4)
 
 // ---- the write side: quantize one token's head vectors into the planes ----
 
@@ -1466,7 +1566,7 @@ template <typename T, int D, int BITS>
     } else {
       // Two codes share a byte and two *different lanes* may own them, so the
       // write must not be a read-modify-write race. `elem_per_thread` is
-      // D/32 = 2 at D=64 and 4 at D=128 — even in both cases — so a lane owns
+      // D/32 = 2, 4 and 8 at D = 64, 128 and 256 — even in every case — so a lane owns
       // a whole number of bytes and packs them itself. Asserted rather than
       // assumed, because it is the property that makes this branch safe.
       if ((idx & 1) == 0) {
@@ -1548,6 +1648,10 @@ instantiate_dequantize_kv(float, float, 64, 8)
 instantiate_dequantize_kv(float, float, 64, 4)
 instantiate_dequantize_kv(float, float, 128, 8)
 instantiate_dequantize_kv(float, float, 128, 4)
+instantiate_dequantize_kv(float16_t, half, 256, 8)
+instantiate_dequantize_kv(float16_t, half, 256, 4)
+instantiate_dequantize_kv(float, float, 256, 8)
+instantiate_dequantize_kv(float, float, 256, 4)
 
 #define instantiate_quantize_kv(name, type, d, bits)              \
   template [[host_name("quantize_kv_" #name "_" #d "_" #bits)]]   \
@@ -1568,6 +1672,10 @@ instantiate_quantize_kv(float, float, 64, 8)
 instantiate_quantize_kv(float, float, 64, 4)
 instantiate_quantize_kv(float, float, 128, 8)
 instantiate_quantize_kv(float, float, 128, 4)
+instantiate_quantize_kv(float16_t, half, 256, 8)
+instantiate_quantize_kv(float16_t, half, 256, 4)
+instantiate_quantize_kv(float, float, 256, 8)
+instantiate_quantize_kv(float, float, 256, 4)
 
 // ============ "mlx/backend/metal/kernels/utils.h"
 

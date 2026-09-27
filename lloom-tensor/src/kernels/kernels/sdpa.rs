@@ -874,6 +874,10 @@ pub fn call_sdpa_vector_paged(
     Ok(())
 }
 
+/// The `head_dim`s the quantized-KV kernels are instantiated at: LFM2's 64,
+/// 128, and Qwen4-exp's 256 (`DESIGN.md` §10.7).
+pub const KV_QUANT_HEAD_DIMS: [usize; 3] = [64, 128, 256];
+
 /// The bit width a quantized KV plane stores its codes at (issue #218).
 ///
 /// Two arms rather than a `bits: usize`, so an unsupported width is a compile
@@ -920,7 +924,7 @@ impl KvQuantBits {
         match self {
             KvQuantBits::Eight => n,
             // Callers pass whole head vectors, so `n` is a multiple of
-            // `head_dim` (64 or 128) and this division is exact. Asserted
+            // `head_dim` (64, 128 or 256) and this division is exact. Asserted
             // rather than assumed because a half-byte tail would silently
             // truncate the last code.
             KvQuantBits::Four => {
@@ -1037,15 +1041,15 @@ pub fn call_quantize_kv(
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
                 variation: "quantize_kv (bf16 not instantiated)",
                 got: head_dim,
-                expected: vec![64, 128],
+                expected: KV_QUANT_HEAD_DIMS.to_vec(),
             })
         }
     };
-    if head_dim != 64 && head_dim != 128 {
+    if !KV_QUANT_HEAD_DIMS.contains(&head_dim) {
         return Err(MetalKernelError::SdpaHeadSizeMismatch {
             variation: "quantize_kv",
             got: head_dim,
-            expected: vec![64, 128],
+            expected: KV_QUANT_HEAD_DIMS.to_vec(),
         });
     }
     let name = format!("quantize_kv_{itype_repr}_{head_dim}_{}", bits.name());
@@ -1121,15 +1125,15 @@ pub fn call_dequantize_kv(
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
                 variation: "dequantize_kv (bf16 not instantiated)",
                 got: head_dim,
-                expected: vec![64, 128],
+                expected: KV_QUANT_HEAD_DIMS.to_vec(),
             })
         }
     };
-    if head_dim != 64 && head_dim != 128 {
+    if !KV_QUANT_HEAD_DIMS.contains(&head_dim) {
         return Err(MetalKernelError::SdpaHeadSizeMismatch {
             variation: "dequantize_kv",
             got: head_dim,
-            expected: vec![64, 128],
+            expected: KV_QUANT_HEAD_DIMS.to_vec(),
         });
     }
     let name = format!("dequantize_kv_{itype_repr}_{head_dim}_{}", bits.name());
@@ -1188,6 +1192,77 @@ pub fn call_sdpa_vector_quant(
     bits: KvQuantBits,
     itype: SdpaDType,
 ) -> Result<(), MetalKernelError> {
+    encode_sdpa_vector_quant(
+        device, ep, kernels, q_offset, q_shape, q_buffer, k_codes, k_scales, k_biases, v_codes,
+        v_scales, v_biases, output, params, None, bits, itype,
+    )
+}
+
+/// [`call_sdpa_vector_quant`] over a selection of the cache: key `i` is read
+/// at cell `sel[i]` (`u32`, at byte offset `sel_offset`), and the params' `N`
+/// is the selection's length. QSA's indexer cells, read from the planes
+/// without gathering them first (`DESIGN.md` §10.7).
+#[allow(clippy::too_many_arguments)]
+pub fn call_sdpa_vector_quant_sel(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    q_offset: usize,
+    q_shape: &[usize],
+    q_buffer: &Buffer,
+    k_codes: &Buffer,
+    k_scales: &Buffer,
+    k_biases: &Buffer,
+    v_codes: &Buffer,
+    v_scales: &Buffer,
+    v_biases: &Buffer,
+    output: &Buffer,
+    params: &Buffer,
+    sel: (&Buffer, usize),
+    bits: KvQuantBits,
+    itype: SdpaDType,
+) -> Result<(), MetalKernelError> {
+    encode_sdpa_vector_quant(
+        device,
+        ep,
+        kernels,
+        q_offset,
+        q_shape,
+        q_buffer,
+        k_codes,
+        k_scales,
+        k_biases,
+        v_codes,
+        v_scales,
+        v_biases,
+        output,
+        params,
+        Some(sel),
+        bits,
+        itype,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_sdpa_vector_quant(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    q_offset: usize,
+    q_shape: &[usize],
+    q_buffer: &Buffer,
+    k_codes: &Buffer,
+    k_scales: &Buffer,
+    k_biases: &Buffer,
+    v_codes: &Buffer,
+    v_scales: &Buffer,
+    v_biases: &Buffer,
+    output: &Buffer,
+    params: &Buffer,
+    sel: Option<(&Buffer, usize)>,
+    bits: KvQuantBits,
+    itype: SdpaDType,
+) -> Result<(), MetalKernelError> {
     let head_dim = *q_shape.last().unwrap();
     let itype_repr = match itype {
         SdpaDType::F16 => "float16_t",
@@ -1196,44 +1271,66 @@ pub fn call_sdpa_vector_quant(
             return Err(MetalKernelError::SdpaHeadSizeMismatch {
                 variation: "sdpa_vector_quant (bf16 not instantiated)",
                 got: head_dim,
-                expected: vec![64, 128],
+                expected: KV_QUANT_HEAD_DIMS.to_vec(),
             })
         }
     };
-    if head_dim != 64 && head_dim != 128 {
+    if !KV_QUANT_HEAD_DIMS.contains(&head_dim) {
         return Err(MetalKernelError::SdpaHeadSizeMismatch {
             variation: "sdpa_vector_quant",
             got: head_dim,
-            expected: vec![64, 128],
+            expected: KV_QUANT_HEAD_DIMS.to_vec(),
         });
     }
-    let name = format!("sdpa_vector_quant_{itype_repr}_{head_dim}_{}", bits.name());
+    let family = if sel.is_some() {
+        "sdpa_vector_quant_sel"
+    } else {
+        "sdpa_vector_quant"
+    };
+    let name = format!("{family}_{itype_repr}_{head_dim}_{}", bits.name());
 
     let b = q_shape[0] * q_shape[1];
     let pipeline = kernels.load_pipeline(device, Source::Sdpa, name)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
-    debug_group!(
-        encoder,
-        "sdpa_vector_quant hd={head_dim} bits={} B={b}",
-        bits.name()
-    );
+    debug_group!(encoder, "{family} hd={head_dim} bits={} B={b}", bits.name());
 
-    set_params!(
-        encoder,
-        (
-            (q_buffer, q_offset),
-            k_codes,
-            k_scales,
-            k_biases,
-            v_codes,
-            v_scales,
-            v_biases,
-            Output::new(output),
-            params
-        )
-    );
+    match sel {
+        None => {
+            set_params!(
+                encoder,
+                (
+                    (q_buffer, q_offset),
+                    k_codes,
+                    k_scales,
+                    k_biases,
+                    v_codes,
+                    v_scales,
+                    v_biases,
+                    Output::new(output),
+                    params
+                )
+            );
+        }
+        Some(sel) => {
+            set_params!(
+                encoder,
+                (
+                    (q_buffer, q_offset),
+                    k_codes,
+                    k_scales,
+                    k_biases,
+                    v_codes,
+                    v_scales,
+                    v_biases,
+                    Output::new(output),
+                    params,
+                    sel
+                )
+            );
+        }
+    }
 
     let grid_dims = MTLSize {
         width: 1,

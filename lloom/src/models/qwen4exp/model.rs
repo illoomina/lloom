@@ -318,6 +318,13 @@ impl Cache {
     /// [`Qwen4Exp::state_pools`]); a slot of each is leased here and freed
     /// when the cache drops. The PLE history and the KV stay the cache's own.
     pub fn in_pools(cfg: &Config, pools: &StatePools) -> Result<Self> {
+        if pools.kv.is_some() && cfg.kv_precision != super::config::DEFAULT_KV_PRECISION {
+            lloom_tensor::bail!(
+                "qwen4exp: kv-quant = {:?} has no arm on the rows' paged KV pool (f32): \
+                 give every row its own cache (the unpooled rows) or keep kv-quant off",
+                cfg.kv_precision
+            )
+        }
         let mut cache = Self::new(cfg);
         cache.s_state = RecurrentState::in_pool(&pools.s)?;
         cache.conv_state = RecurrentState::in_pool(&pools.conv)?;
@@ -390,7 +397,12 @@ impl Cache {
         Self {
             s_state: RecurrentState::new(n_layers),
             conv_state: RecurrentState::new(n_layers),
-            kv: vec![KvCache::default(); n_layers],
+            kv: (0..n_layers)
+                .map(|_| {
+                    KvCache::with_precision(super::qsa::KV_SLAB_TOKENS, cfg.kv_precision)
+                        .expect("a KvPrecision's quantized arm is never Off")
+                })
+                .collect(),
             ple_conv: RecurrentState::new(n_layers),
             ngram: NgramWindow::new(cfg.ple_ngram_size.saturating_sub(1)),
             pending_tokens: std::collections::VecDeque::new(),
@@ -968,11 +980,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// No side effects.
     pub fn plan_pass(&self, cache: &Cache, seq: usize) -> PassPlan {
         let (nkv, hd) = (self.cfg.n_kv_heads, self.cfg.head_dim);
-        let elem = lloom_tensor::DType::F32.size_in_bytes();
         let mut kv_grow = 0usize;
         for (l, layer) in self.layers.iter().enumerate() {
             if matches!(layer.mixer, Mixer::Full(_)) {
-                kv_grow += cache.kv[l].grow_bytes_for(seq, nkv, hd, elem);
+                kv_grow += cache.kv[l].grow_bytes_for(seq, nkv, hd);
             }
         }
         // The constant was measured as the peak over a 512-tile WITH a second
@@ -1112,6 +1123,28 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Apply the runtime axes (`--kv-quant`, …) to the model's config: every
+    /// `Cache` built from `config()` afterwards takes them. Refused on a
+    /// device the arm has no kernels on (the quantized KV is Metal only).
+    pub fn apply_axes(&mut self, args: &super::config::ConfigArgs) -> Result<()> {
+        let mut cfg = self.cfg.clone();
+        args.apply(&mut cfg).map_err(lloom_tensor::Error::msg)?;
+        self.set_kv_precision(cfg.kv_precision)
+    }
+
+    /// Set the KV store every `Cache` built from `config()` afterwards uses
+    /// (`DESIGN.md` §10.7).
+    pub fn set_kv_precision(&mut self, p: crate::nn::ops::KvPrecision) -> Result<()> {
+        if p.quant().is_on() && !self.device().is_metal() {
+            lloom_tensor::bail!(
+                "qwen4exp: kv-quant = {p:?} is Metal-only (the quantized append and reads are \
+                 Metal kernels)"
+            )
+        }
+        self.cfg.kv_precision = p;
+        Ok(())
     }
 
     /// The device the weights live on.
@@ -2423,6 +2456,38 @@ impl crate::nn::model::CacheRewind for Cache {
 
 #[cfg(test)]
 mod tests {
+    /// The KV store reaches the caches built from the config, and the
+    /// shapes it has no arm on are refused by name: a quantized store on a
+    /// device without the kernels (CPU), and any non-default store on the
+    /// rows' paged pool (f32 only). f16 is served on the CPU — it is a dtype.
+    #[test]
+    fn the_kv_store_reaches_the_cache_and_its_missing_arms_are_refused() {
+        use crate::nn::ops::{KvPrecision, KvQuant};
+        use lloom_tensor::DType;
+        let dev = lloom_tensor::Device::Cpu;
+        let cfg = Config::tiny();
+        let mut model = super::super::testing::resident_model(&cfg, &dev);
+        let int8 = KvPrecision::quantized(KvQuant::Int8).unwrap();
+        let err = model.set_kv_precision(int8).unwrap_err().to_string();
+        assert!(err.contains("Metal-only"), "{err}");
+        assert_eq!(model.config().kv_precision, super::super::config::DEFAULT_KV_PRECISION);
+        model.set_kv_precision(KvPrecision::dense(DType::F16)).unwrap();
+        let cache = Cache::new(model.config());
+        let full = cfg.layer_types.iter().position(|k| *k == LayerKind::Full).unwrap();
+        assert_eq!(cache.kv[full].precision(), KvPrecision::dense(DType::F16));
+        let pools = model.state_pools(2, &dev);
+        let err = Cache::in_pools(model.config(), &pools).unwrap_err().to_string();
+        assert!(err.contains("paged KV pool"), "{err}");
+        let mut f32_cfg = model.config().clone();
+        f32_cfg.kv_precision = super::super::config::DEFAULT_KV_PRECISION;
+        Cache::in_pools(&f32_cfg, &pools).unwrap();
+        // One row keeps its own caches: every store is served there.
+        let one = model.state_pools(1, &dev);
+        let mut q_cfg = f32_cfg.clone();
+        q_cfg.kv_precision = int8;
+        Cache::in_pools(&q_cfg, &one).unwrap();
+    }
+
     use super::super::config::LayerKind;
     use super::super::moe::Resident;
     use super::super::testing::{deltanet, hc, lin, moe, ones, qsa, wt};

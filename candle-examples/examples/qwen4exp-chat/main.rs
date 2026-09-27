@@ -329,6 +329,57 @@ struct Args {
     /// plus the final logits' statistics. A bisection aid, not a gate.
     #[arg(long)]
     probe: bool,
+
+    /// Decode this token sequence instead of the greedy one (`--legacy-loop`):
+    /// every arm walks the same positions, so two `--dump-logits` files
+    /// subtract position by position (`tools/logit-delta`). The argmax is still
+    /// taken and counted against the forced id (`overrides`). One id per line
+    /// or a comma / space list — the `TOKENS` line feeds back in.
+    #[arg(long)]
+    force_tokens: Option<PathBuf>,
+
+    /// Write every logits row the legacy loop digests (the prompt's last
+    /// position, then each step) as `step <i> <f32 bits hex>…` — the format
+    /// `tools/logit-delta` reads.
+    #[arg(long)]
+    dump_logits: Option<PathBuf>,
+
+    /// The model's runtime axes (`--kv-quant off|f16|int8|int4`, …): the
+    /// `#[derive(Config)]` flags of `qwen4exp::Config`.
+    #[command(flatten)]
+    axes: lloom::models::qwen4exp::ConfigArgs,
+}
+
+/// Token ids from a `--force-tokens` file: whitespace / comma separated, `#`
+/// comments.
+fn read_forced_tokens(path: &std::path::Path) -> Result<Vec<u32>> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        for f in line.split([',', ' ', '\t']).filter(|f| !f.is_empty()) {
+            out.push(f.parse().with_context(|| format!("{f:?} is not a token id"))?);
+        }
+    }
+    anyhow::ensure!(!out.is_empty(), "{}: no token ids", path.display());
+    Ok(out)
+}
+
+/// One `--dump-logits` row.
+fn dump_row(sink: &mut Option<std::io::BufWriter<std::fs::File>>, step: usize, t: &Tensor) -> Result<()> {
+    use std::io::Write;
+    let Some(sink) = sink.as_mut() else {
+        return Ok(());
+    };
+    let v = t.flatten_all()?.to_vec1::<f32>()?;
+    let mut line = String::with_capacity(v.len() * 9 + 16);
+    line.push_str(&format!("step {step}"));
+    for x in v {
+        line.push_str(&format!(" {:08x}", x.to_bits()));
+    }
+    line.push('\n');
+    sink.write_all(line.as_bytes())?;
+    Ok(())
 }
 
 /// Activation statistics through the `ForwardObserver` seam: verbose prints
@@ -682,6 +733,7 @@ fn main() -> Result<()> {
         "resident" => {
             let mut model: Qwen4Exp<Resident> =
                 Qwen4Exp::from_gguf_shards(&shards, &device, &opts)?;
+            model.apply_axes(&args.axes)?;
             model.set_prefill_mode(prefill_mode);
             model.set_memory_fraction(args.memory_fraction);
             model.set_mem_check(mem_check);
@@ -726,6 +778,7 @@ fn main() -> Result<()> {
             };
             let mut model: Qwen4Exp<Streamed> =
                 Qwen4Exp::from_gguf_streamed(&shards, &device, &opts, &stream)?;
+            model.apply_axes(&args.axes)?;
             model.set_prefill_mode(prefill_mode);
             model.set_memory_fraction(args.memory_fraction);
             model.set_mem_check(mem_check);
@@ -948,7 +1001,7 @@ fn loaded_line<R: ExpertResidency + HasStreamStats>(
     let cfg = model.config();
     let load_ms = t0.elapsed().as_millis();
     println!(
-        "LOADED gguf={} shards={} layers={} hidden={} vocab={} experts={}x{} device={:?} ple={} ple_cache_rows={} prefill={:?} moe_act={} experts_mode={} slots={} loader={} load_ms={load_ms}",
+        "LOADED gguf={} shards={} layers={} hidden={} vocab={} experts={}x{} device={:?} ple={} ple_cache_rows={} prefill={:?} moe_act={} experts_mode={} slots={} loader={} config=[{}] load_ms={load_ms}",
         shards[0].display(),
         shards.len(),
         cfg.n_layers,
@@ -964,6 +1017,7 @@ fn loaded_line<R: ExpertResidency + HasStreamStats>(
         args.experts,
         args.slots,
         args.loader,
+        cfg.axes_line(),
     );
     mem_line(0, "loaded", device, None);
 }
@@ -1069,13 +1123,14 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
                 .join(",")
         );
         println!(
-            "RESULT run={run} tokens_sha256={digest} logits_sha256=- logits_max=- prompt_tokens={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} max_tokens={} driver=session-blocking steps={} commits={}",
+            "RESULT run={run} tokens_sha256={digest} logits_sha256=- logits_max=- prompt_tokens={} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} max_tokens={} driver=session-blocking steps={} commits={} config=[{}]",
             prompt_ids.len(),
             out.ids.len(),
             out.eos,
             args.max_tokens,
             out.stats.steps,
             out.stats.commits,
+            model.config().axes_line(),
         );
         let s = model.stream_stats();
         if s.plans + s.device_plans > 0 {
@@ -1196,7 +1251,16 @@ fn gate<R: ExpertResidency + HasStreamStats>(
     }
     let mut digests = Vec::with_capacity(args.runs);
     let mut last_text = String::new();
+    let forced: Option<Vec<u32>> = args.force_tokens.as_deref().map(read_forced_tokens).transpose()?;
     for run in 0..args.runs {
+        // The dump is the first run's (a determinism repeat writes nothing).
+        let mut sink = match (&args.dump_logits, run) {
+            (Some(p), 0) => Some(std::io::BufWriter::new(
+                std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
+            )),
+            _ => None,
+        };
+        let (mut forced_steps, mut overrides) = (0usize, 0usize);
         let mut cache: Cache = model.new_cache(&cfg, device)?;
         if args.probe && run == 0 {
             let first = Tensor::from_vec(vec![prompt_ids[0]], (1, 1), device)?;
@@ -1283,6 +1347,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             Ok(())
         };
         digest_logits(&logits, &mut lh)?;
+        dump_row(&mut sink, step_no, &logits)?;
         if args.state_digest {
             println!(
                 "STEP run={run} step={step_no} logits={:016x}",
@@ -1290,7 +1355,18 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             );
         }
         for _ in 0..args.max_tokens {
-            let next = argmax(&logits)?;
+            let sampled = argmax(&logits)?;
+            let next = match &forced {
+                None => sampled,
+                Some(ids) => match ids.get(step_no) {
+                    Some(&id) => {
+                        forced_steps += 1;
+                        overrides += usize::from(id != sampled);
+                        id
+                    }
+                    None => break,
+                },
+            };
             if args.margins {
                 let v = logits.flatten_all()?.to_vec1::<f32>()?;
                 let (mut b1, mut i1, mut b2, mut i2) = (f32::MIN, 0usize, f32::MIN, 0usize);
@@ -1310,7 +1386,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                     b1 - b2
                 );
             }
-            if eos_ids.contains(&next) {
+            if forced.is_none() && eos_ids.contains(&next) {
                 hit_eos = true;
                 break;
             }
@@ -1319,6 +1395,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             logits = model.forward(&input, cache.pos, &mut cache)?;
             digest_logits(&logits, &mut lh)?;
             step_no += 1;
+            dump_row(&mut sink, step_no, &logits)?;
             if args.state_digest {
                 println!(
                     "STEP run={run} step={step_no} logits={:016x}",
@@ -1354,11 +1431,19 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                 .collect::<Vec<_>>()
                 .join(",")
         );
+        if let Some(ids) = &forced {
+            anyhow::ensure!(forced_steps > 0, "--force-tokens: no step took a forced id");
+            println!(
+                "FORCED run={run} requested={} forced={forced_steps} overrides={overrides}",
+                ids.len()
+            );
+        }
         println!(
-            "RESULT run={run} tokens_sha256={digest} logits_sha256={logits_digest} logits_max={logits_max:.4} prompt_tokens={} generated={} hit_eos={hit_eos} prefill_ms={prefill_ms} decode_ms={decode_ms} max_tokens={}",
+            "RESULT run={run} tokens_sha256={digest} logits_sha256={logits_digest} logits_max={logits_max:.4} prompt_tokens={} generated={} hit_eos={hit_eos} prefill_ms={prefill_ms} decode_ms={decode_ms} max_tokens={} forced={forced_steps} overrides={overrides} config=[{}]",
             prompt_ids.len(),
             generated.len(),
-            args.max_tokens
+            args.max_tokens,
+            cfg.axes_line()
         );
         let s = model.stream_stats();
         if args.experts == "stream" {

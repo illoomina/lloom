@@ -31,7 +31,9 @@
 //! projections, `rms_norm`, `arg_sort`, `index_select`, softmax + matmul.
 //! The score is fp32 by construction (§15.2a: precision-mandatory).
 
-use super::config::Config;
+use super::config::{Config, DEFAULT_KV_PRECISION};
+use crate::nn::kv_quant::QuantKvSlab;
+use crate::nn::ops::KvPrecision;
 use crate::nn::{ops, RmsNorm};
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Module, Result, Tensor, D};
@@ -41,11 +43,18 @@ use lloom_tensor::{DType, Module, Result, Tensor, D};
 /// preallocated slab written in place (`nn::kv_cache`, grown by a slab when
 /// full), so a decode step appends without copying the cache — no O(context)
 /// per token (§3.3). The paged/pooled KV is the perf path, deferred with caching.
+///
+/// The k / v store is `precision` (`Config::kv_precision`, §10.7): the dense
+/// slab at f32 or f16 (appended at the store's dtype, read back up to the
+/// activation dtype), or the quantized slab (codes + a (scale, bias) pair per
+/// head vector), attended straight from its codes. Every read a layer makes
+/// is bounded by the indexer's budget, dense range or selection alike.
 #[derive(Debug, Clone)]
 pub struct KvCache {
-    /// The k / v tokens: this row's own slab, or a slot of a batch's page
-    /// pool (`KvPool`, §12.2).
+    /// The k / v tokens: this row's own slab (dense or quantized), or a slot
+    /// of a batch's page pool (`KvPool`, §12.2, dense f32 only).
     kv: KvBacking,
+    precision: KvPrecision,
     /// The indexer's raw keys `[1, seq, idx_dim]`, one per token.
     raw_keys: crate::nn::kv_cache::Cache,
     /// The indexer's compressed keys `[1, n_blocks, idx_dim]`, one per
@@ -59,6 +68,8 @@ enum KvBacking {
     /// `[n_kv_heads, seq, head_dim]` for k and v, the sequence on dim 1, in a
     /// preallocated slab written in place (grown by a slab when full).
     Slab(crate::nn::kv_cache::KvCache),
+    /// The quantized arm: codes and (scale, bias) planes, grown likewise.
+    Quant(QuantKvSlab),
     /// Slot `slot` of one layer of a [`KvPool`]: the tokens in the pool's
     /// pages, the row's table on the host (and on the device, for a gather).
     Pooled {
@@ -99,6 +110,7 @@ impl Clone for KvBacking {
     fn clone(&self) -> Self {
         match self {
             KvBacking::Slab(s) => KvBacking::Slab(s.clone()),
+            KvBacking::Quant(s) => KvBacking::Quant(s.clone()),
             KvBacking::Pooled {
                 pool, slot, layer, ..
             } => {
@@ -137,12 +149,28 @@ pub const KV_PAGE_TOKENS: usize = 256;
 
 impl KvCache {
     pub fn with_capacity(tokens: usize) -> Self {
+        Self::with_precision(tokens, DEFAULT_KV_PRECISION)
+            .expect("the dense store needs no quantized slab")
+    }
+
+    /// A cache of `tokens` initial capacity storing its k / v at `precision`.
+    pub fn with_precision(tokens: usize, precision: KvPrecision) -> Result<Self> {
         let tokens = tokens.max(1);
-        Self {
-            kv: KvBacking::Slab(crate::nn::kv_cache::KvCache::new(1, tokens)),
+        let kv = match precision.dense_dtype() {
+            Some(_) => KvBacking::Slab(crate::nn::kv_cache::KvCache::new(1, tokens)),
+            None => KvBacking::Quant(QuantKvSlab::new(precision.quant(), tokens, tokens)?),
+        };
+        Ok(Self {
+            kv,
+            precision,
             raw_keys: crate::nn::kv_cache::Cache::new(1, tokens),
             blocks: crate::nn::kv_cache::Cache::new(1, tokens.div_ceil(4).max(1)),
-        }
+        })
+    }
+
+    /// The k / v store.
+    pub fn precision(&self) -> KvPrecision {
+        self.precision
     }
     /// A cache whose k / v are slot `slot` of layer `layer` of `pool`
     /// (`Cache::in_pools`); the indexer's caches stay the row's own.
@@ -155,6 +183,7 @@ impl KvCache {
                 table_t: None,
                 lease: lease.clone(),
             },
+            precision: DEFAULT_KV_PRECISION,
             raw_keys: crate::nn::kv_cache::Cache::new(1, KV_SLAB_TOKENS),
             blocks: crate::nn::kv_cache::Cache::new(1, KV_SLAB_TOKENS / 4),
         }
@@ -165,7 +194,7 @@ impl KvCache {
             KvBacking::Pooled {
                 pool, lease, layer, ..
             } => Some((pool, lease.slot(), *layer)),
-            KvBacking::Slab(_) => None,
+            KvBacking::Slab(_) | KvBacking::Quant(_) => None,
         }
     }
     pub fn is_pooled(&self) -> bool {
@@ -174,6 +203,7 @@ impl KvCache {
     pub fn reset(&mut self) {
         match &mut self.kv {
             KvBacking::Slab(s) => s.reset(),
+            KvBacking::Quant(s) => s.reset(),
             KvBacking::Pooled {
                 pool,
                 slot,
@@ -189,14 +219,16 @@ impl KvCache {
         self.blocks.reset();
     }
     /// Bytes appending `n` tokens would allocate for this row's k / v
-    /// (`[nkv, tokens, hd]` each, `elem` bytes an element): a slab widened by
-    /// `KV_SLAB_TOKENS` steps (the widening is a `cat`, so the old slab is
-    /// live beside the new one at the instant — counted), or the pool's
-    /// next page slab when its free list runs out. 0 when nothing grows.
-    /// Sized, not performed (`Qwen4Exp::plan_pass`).
-    pub fn grow_bytes_for(&self, n: usize, nkv: usize, hd: usize, elem: usize) -> usize {
-        let per_token = 2 * nkv * hd * elem;
+    /// (`nkv` heads of `hd`, at the store's bytes a token —
+    /// `KvPrecision::bytes_per_token`, the scale planes counted): a slab
+    /// widened by `KV_SLAB_TOKENS` steps (the widening is a `cat`, so the
+    /// old slab is live beside the new one at the instant — counted), or the
+    /// pool's next page slab when its free list runs out. 0 when nothing
+    /// grows. Sized, not performed (`Qwen4Exp::plan_pass`).
+    pub fn grow_bytes_for(&self, n: usize, nkv: usize, hd: usize) -> usize {
+        let per_token = self.precision.bytes_per_token(nkv, hd, DType::F32);
         match &self.kv {
+            KvBacking::Quant(s) => s.grow_bytes_for(n, per_token),
             KvBacking::Slab(s) => {
                 let (len, cap) = (s.current_seq_len(), s.k_cache().max_seq_len());
                 if len + n <= cap {
@@ -219,6 +251,7 @@ impl KvCache {
     pub fn len(&self) -> usize {
         match &self.kv {
             KvBacking::Slab(s) => s.current_seq_len(),
+            KvBacking::Quant(s) => s.len(),
             KvBacking::Pooled {
                 pool, slot, layer, ..
             } => pool.len(*layer, *slot),
@@ -240,6 +273,7 @@ impl KvCache {
     pub fn truncate(&mut self, tokens: usize, blocks: usize) {
         match &mut self.kv {
             KvBacking::Slab(s) => s.truncate(tokens),
+            KvBacking::Quant(s) => s.truncate(tokens),
             KvBacking::Pooled {
                 pool, slot, layer, ..
             } => pool.truncate(*layer, *slot, tokens),
@@ -248,10 +282,16 @@ impl KvCache {
         self.blocks.truncate(blocks);
     }
     /// The live `(k, v, raw indexer keys, compressed keys)` views, for a
-    /// state probe (`None` where nothing was written).
+    /// state probe (`None` where nothing was written; a quantized store's
+    /// k / v dequantized).
     pub fn state_views(&self) -> Result<[Option<Tensor>; 4]> {
         let (k, v) = match &self.kv {
             KvBacking::Slab(s) => (s.k()?, s.v()?),
+            KvBacking::Quant(s) if s.is_empty() => (None, None),
+            KvBacking::Quant(s) => {
+                let (k, v) = s.dequantize()?;
+                (Some(k), Some(v))
+            }
             KvBacking::Pooled {
                 pool, slot, layer, ..
             } => match pool.live(*layer, *slot)? {
@@ -266,28 +306,65 @@ impl KvCache {
             self.blocks.current_data()?,
         ])
     }
-    /// Append `k`, `v` `[n_kv_heads, n, head_dim]`; returns views of the whole
-    /// cache `[n_kv_heads, len, head_dim]` (a pooled row's: gathered from its
-    /// pages — the per-row paths; the pooled rows arm appends without them,
-    /// [`Self::append_pooled`]).
-    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+    /// Append `k`, `v` `[n_kv_heads, n, head_dim]` at the store's precision
+    /// (a dense f16 store rounds them to f16; a quantized one encodes them).
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         match &mut self.kv {
-            KvBacking::Slab(s) => s.append(k, v),
-            KvBacking::Pooled { .. } => {
-                self.append_pooled(k, v)?;
-                let (pool, slot, layer) = self.pool_slot().expect("pooled");
-                match pool.live(layer, slot)? {
-                    Some(kv) => Ok(kv),
-                    None => lloom_tensor::bail!("qsa: an empty pooled row after an append"),
-                }
+            KvBacking::Slab(s) => {
+                let dt = self.precision.dense_dtype().unwrap_or(k.dtype());
+                s.append(&k.to_dtype(dt)?, &v.to_dtype(dt)?)?;
+                Ok(())
             }
+            KvBacking::Quant(s) => s.append(k, v),
+            KvBacking::Pooled { .. } => self.append_pooled(k, v),
         }
+    }
+
+    /// The live k and v `[n_kv_heads, len, head_dim]`, or the cells `sel`
+    /// of them (`[n_kv_heads, n_sel, head_dim]`): the dense store's views at
+    /// its dtype (a pooled row's gathered from its pages), a quantized
+    /// store's dequantized — the read a multi-token pass and the composed
+    /// path attend through.
+    fn dense(&mut self, sel: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+        if let Some(sel) = sel {
+            return self.gather(sel);
+        }
+        match &self.kv {
+            KvBacking::Slab(s) => match (s.k()?, s.v()?) {
+                (Some(k), Some(v)) => Ok((k, v)),
+                _ => lloom_tensor::bail!("qsa: a read of an empty cache"),
+            },
+            KvBacking::Quant(s) => s.dequantize(),
+            KvBacking::Pooled {
+                pool, slot, layer, ..
+            } => match pool.live(*layer, *slot)? {
+                Some(kv) => Ok(kv),
+                None => lloom_tensor::bail!("qsa: an empty pooled row after an append"),
+            },
+        }
+    }
+
+    /// One decode query's attention: `q [1, nh, 1, hd]` over the live cache,
+    /// or over the cells `sel` past the indexer's dense range, →
+    /// `[1, nh, 1, hd]`. The quantized store reads its codes (the dense or
+    /// the selected kernel); the dense store runs `ops::sdpa` over its views
+    /// (the selection gathered first), a 16-bit store's read up to `q`'s
+    /// dtype — at most `dense_limit` rows either way.
+    fn attend(&mut self, q: &Tensor, sel: Option<&Tensor>, scale: f32) -> Result<Tensor> {
+        if let KvBacking::Quant(s) = &self.kv {
+            return s.attend(q, sel, scale);
+        }
+        let (k, v) = self.dense(sel)?;
+        let (k, v) = (k.to_dtype(q.dtype())?, v.to_dtype(q.dtype())?);
+        ops::sdpa(q, &k.unsqueeze(0)?, &v.unsqueeze(0)?, None, false, scale, 1.0)
     }
     /// Append one token to a pooled row without writing it: the pool token
     /// slot the rows arm scatters it to.
     fn append_slot(&mut self) -> Result<u32> {
         match &mut self.kv {
-            KvBacking::Slab(_) => lloom_tensor::bail!("qsa: append_slot on a slab cache"),
+            KvBacking::Slab(_) | KvBacking::Quant(_) => {
+                lloom_tensor::bail!("qsa: append_slot on a slab cache")
+            }
             KvBacking::Pooled {
                 pool,
                 slot,
@@ -309,7 +386,9 @@ impl KvCache {
     /// pool's pages, one scatter), returning nothing.
     fn append_pooled(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         match &mut self.kv {
-            KvBacking::Slab(_) => lloom_tensor::bail!("qsa: append_pooled on a slab cache"),
+            KvBacking::Slab(_) | KvBacking::Quant(_) => {
+                lloom_tensor::bail!("qsa: append_pooled on a slab cache")
+            }
             KvBacking::Pooled {
                 pool,
                 slot,
@@ -332,9 +411,15 @@ impl KvCache {
     /// The rows `sel [n_sel]` (u32, all `< len`) of k and v:
     /// `[n_kv_heads, n_sel, head_dim]` each. Gathers from the slab itself
     /// (contiguous), so the cost is the selection's size, not the context's;
-    /// a pooled row maps the cells through its page table first.
+    /// a pooled row maps the cells through its page table first. A quantized
+    /// store dequantizes and gathers — the composed reference's read; its
+    /// decode reads the selection from the codes ([`Self::attend`]).
     fn gather(&mut self, sel: &Tensor) -> Result<(Tensor, Tensor)> {
         match &mut self.kv {
+            KvBacking::Quant(s) => {
+                let (k, v) = s.dequantize()?;
+                Ok((k.index_select(sel, 1)?, v.index_select(sel, 1)?))
+            }
             KvBacking::Slab(s) => {
                 let k = match s.k_cache().all_data() {
                     Some(k) => k.index_select(sel, 1)?,
@@ -1202,7 +1287,7 @@ impl QsaAttention {
             let q = prep.narrow(0, 0, nh)?;
             let gate = prep.narrow(0, nh, nh)?;
             let k_step = prep.narrow(0, 2 * nh, nkv)?.reshape((nkv, 1, hd))?;
-            let (k_all, v_all) = kv.append(&k_step, &v)?;
+            kv.append(&k_step, &v)?;
             let sel = match &self.indexer {
                 Some(ix) => {
                     ix.observe(&x1, kv)?;
@@ -1213,19 +1298,7 @@ impl QsaAttention {
             if let Some(sel) = &sel {
                 check_sel(sel, pos, kv)?;
             }
-            let (k_all, v_all) = match &sel {
-                Some(sel) => kv.gather(sel)?,
-                None => (k_all, v_all),
-            };
-            let ctx = ops::sdpa(
-                &q.reshape((1, nh, 1, hd))?,
-                &k_all.unsqueeze(0)?,
-                &v_all.unsqueeze(0)?,
-                None,
-                false,
-                scale as f32,
-                1.0,
-            )?;
+            let ctx = kv.attend(&q.reshape((1, nh, 1, hd))?, sel.as_ref(), scale as f32)?;
             let ctx = ctx.reshape((1, nh * hd))?;
             let gate = gate.reshape((1, nh * hd))?;
             let gated = match sigmoid_mul(&gate, &ctx) {
@@ -1272,7 +1345,7 @@ impl QsaAttention {
         // Append k, v to the cache: [nkv, seq, hd].
         let k_step = k.reshape((nkv, 1, hd))?;
         let v_step = v.reshape((nkv, 1, hd))?;
-        let (k_all, v_all) = kv.append(&k_step, &v_step)?;
+        kv.append(&k_step, &v_step)?;
 
         // The indexer sees this token, completes its block if it does, and —
         // past the dense range — names the cells to attend to.
@@ -1286,10 +1359,7 @@ impl QsaAttention {
         if let Some(sel) = &sel {
             check_sel(sel, pos, kv)?;
         }
-        let (k_all, v_all) = match &sel {
-            Some(sel) => kv.gather(sel)?, // [nkv, n_sel, hd] each
-            None => (k_all, v_all),
-        };
+        let (k_all, v_all) = kv.dense(sel.as_ref())?; // [nkv, n_sel | len, hd] each
         let seq = k_all.dim(1)?;
 
         // GQA expand kv heads nkv → nh (tile, the reference repeat), then dense
@@ -1422,7 +1492,7 @@ impl QsaAttention {
             let q = prep.narrow(0, 0, nh)?; // [nh, hd]
             let gate = prep.narrow(0, nh, nh)?; // [nh, hd]
             let k_step = prep.narrow(0, 2 * nh, nkv)?.reshape((nkv, 1, hd))?;
-            let (k_all, v_all) = kv.append(&k_step, &v)?; // [nkv, seq, hd] slab views
+            kv.append(&k_step, &v)?;
             let sel = match &self.indexer {
                 Some(ix) => {
                     ix.observe(&x1, kv)?;
@@ -1433,19 +1503,7 @@ impl QsaAttention {
             if let Some(sel) = &sel {
                 check_sel(sel, pos, kv)?;
             }
-            let (k_all, v_all) = match &sel {
-                Some(sel) => kv.gather(sel)?,
-                None => (k_all, v_all),
-            };
-            let ctx = ops::sdpa(
-                &q.reshape((1, nh, 1, hd))?,
-                &k_all.unsqueeze(0)?,
-                &v_all.unsqueeze(0)?,
-                None,
-                false,
-                scale as f32,
-                1.0, // no softcapping (the kernel divides by it)
-            )?; // [1, nh, 1, hd]
+            let ctx = kv.attend(&q.reshape((1, nh, 1, hd))?, sel.as_ref(), scale as f32)?; // [1, nh, 1, hd]
             let ctx = ctx.reshape((1, nh * hd))?;
             let gate = gate.reshape((1, nh * hd))?;
             let gated = match sigmoid_mul(&gate, &ctx) {
@@ -1675,7 +1733,8 @@ impl QsaAttention {
 
         let k_new = k.transpose(0, 1)?.contiguous()?; // [nkv, seq, hd]
         let v_new = v.transpose(0, 1)?.contiguous()?;
-        let (k_all, v_all) = kv.append(&k_new, &v_new)?;
+        kv.append(&k_new, &v_new)?;
+        let (k_all, v_all) = kv.dense(None)?;
         let kv_len = k_all.dim(1)?;
         if let Some(ix) = &self.indexer {
             // Every position of a chunk attends densely, so the chunk must
@@ -1792,7 +1851,12 @@ impl QsaAttention {
         let v_new = flat
             .narrow(0, 2 * q_len + kv_len_e, kv_len_e)?
             .reshape((nkv, seq, hd))?;
-        let (k_all, v_all) = kv.append(&k_new, &v_new)?; // [nkv, kv_len, hd] slab views
+        kv.append(&k_new, &v_new)?;
+        // [nkv, kv_len, hd]: the dense store's views (a 16-bit store read up
+        // to f32), a quantized store's dequantized — at most `dense_limit`
+        // rows, which the check below holds.
+        let (k_all, v_all) = kv.dense(None)?;
+        let (k_all, v_all) = (k_all.to_dtype(f32)?, v_all.to_dtype(f32)?);
         let kv_len = k_all.dim(1)?;
         if let Some(ix) = &self.indexer {
             if kv_len > ix.dense_limit() {
@@ -1980,7 +2044,8 @@ mod tests {
         // One slab is KV_SLAB_TOKENS tokens; cross it (the second slab).
         let n = KV_SLAB_TOKENS + 37;
         for t in 0..n {
-            let (k_all, _) = kv.append(&tok(t), &(tok(t) + 0.5)?)?;
+            kv.append(&tok(t), &(tok(t) + 0.5)?)?;
+            let (k_all, _) = kv.dense(None)?;
             assert_eq!(k_all.dims(), &[nkv, t + 1, hd]);
         }
         assert_eq!(kv.len(), n);
@@ -2014,7 +2079,8 @@ mod tests {
         assert_eq!(row, want);
         kv.truncate(300, 0);
         assert_eq!(kv.len(), 300);
-        let (k_all, _) = kv.append(&tok(300), &(tok(300) + 0.5)?)?;
+        kv.append(&tok(300), &(tok(300) + 0.5)?)?;
+        let (k_all, _) = kv.dense(None)?;
         assert_eq!(k_all.dims(), &[nkv, 301, hd]);
         kv.reset();
         assert_eq!(kv.len(), 0);
@@ -3114,6 +3180,304 @@ mod tests {
                 maxdiff <= 1e-3 * scale.max(1e-3),
                 "step {step}: Metal/CPU max diff {maxdiff} at scale {scale}"
             );
+        }
+    }
+
+    /// The real attention geometry (24 / 2 heads × 256, indexer 4 × 128) at a
+    /// narrow hidden size, with a budget-16 indexer: every position past 19
+    /// cells reads a selection.
+    #[cfg(feature = "metal")]
+    fn kv_arm_cfg() -> Config {
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        cfg.indexer_budget = 16;
+        cfg
+    }
+
+    #[cfg(feature = "metal")]
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+    }
+
+    #[cfg(feature = "metal")]
+    fn max_rel(a: &[f32], b: &[f32]) -> f32 {
+        let scale = b.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-6);
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+            / scale
+    }
+
+    /// Decode `steps` positions through `attn` into a cache at `precision`
+    /// (initial capacity 16, so the store grows twice), every output read back.
+    #[cfg(feature = "metal")]
+    fn decode_arm(
+        attn: &QsaAttention,
+        precision: KvPrecision,
+        dev: &Device,
+        steps: usize,
+    ) -> (Vec<Vec<f32>>, KvCache) {
+        let mut kv = KvCache::with_precision(16, precision).unwrap();
+        let outs = (0..steps)
+            .map(|pos| {
+                let x = Tensor::from_vec(tok(128, pos as f32 * 0.37), (1, 1, 128), dev).unwrap();
+                attn.decode(&x, &mut kv)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            })
+            .collect();
+        (outs, kv)
+    }
+
+    /// Each KV store decodes within its own error of the f32 store, on the
+    /// dense range AND past it, where the selection is read (the f16 store
+    /// rounds, int8 / int4 read their codes on the dense and the selected
+    /// kernel). The control that pins the level: past the dense range the
+    /// f32 selection differs from the f32 dense-over-everything by `d_sel`,
+    /// and a store that attended every cell instead of the selection would be
+    /// that far off — so each arm's error is asserted well under it.
+    /// And the stores are what they say: f16 elements, quantized planes.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn each_kv_store_decodes_within_its_error_on_the_dense_and_the_selected_path() {
+        use crate::nn::ops::KvQuant;
+        let gpu = Device::new_metal(0).unwrap();
+        let cfg = kv_arm_cfg();
+        let attn = indexed_attn(&cfg, &gpu);
+        let dense_twin = {
+            let (h, hd, nh, nkv) = (cfg.hidden_size, cfg.head_dim, cfg.n_heads, cfg.n_kv_heads);
+            QsaAttention::new(
+                lin(nh * hd * 2, h, 1.0, &gpu),
+                lin(nkv * hd, h, 2.0, &gpu),
+                lin(nkv * hd, h, 3.0, &gpu),
+                lin(h, nh * hd, 4.0, &gpu),
+                rms(hd, &gpu),
+                rms(hd, &gpu),
+                &cfg,
+            )
+        };
+        let steps = 48;
+        let limit = attn.dense_limit().unwrap();
+        let (f32_out, _) = decode_arm(&attn, DEFAULT_KV_PRECISION, &gpu, steps);
+        let (all_out, _) = decode_arm(&dense_twin, DEFAULT_KV_PRECISION, &gpu, steps);
+        // Errors are taken against the RUN's output scale: this synthetic
+        // layer's output nearly cancels at some positions (max |out| 0.02
+        // against ~1 elsewhere), where a per-position ratio reads a small
+        // absolute error as tens of percent.
+        let run_scale = f32_out.iter().flatten().fold(0f32, |m, x| m.max(x.abs()));
+        let d_sel = (limit..steps)
+            .map(|p| max_abs(&all_out[p], &f32_out[p]))
+            .fold(0f32, f32::max)
+            / run_scale;
+        assert!(d_sel > 1e-2, "the selection barely moves the output ({d_sel}): the control is blind");
+        let arms = [
+            ("f16", KvPrecision::dense(DType::F16)),
+            ("int8", KvPrecision::quantized(KvQuant::Int8).unwrap()),
+            ("int4", KvPrecision::quantized(KvQuant::Int4).unwrap()),
+        ];
+        let mut errs = Vec::new();
+        for (name, p) in arms {
+            let (out, kv) = decode_arm(&attn, p, &gpu, steps);
+            assert_eq!(kv.len(), steps);
+            match p.dense_dtype() {
+                Some(dt) => {
+                    let [k, v, _, _] = kv.state_views().unwrap();
+                    assert_eq!(k.unwrap().dtype(), dt, "{name}: k is not stored at {dt:?}");
+                    assert_eq!(v.unwrap().dtype(), dt, "{name}: v is not stored at {dt:?}");
+                }
+                None => assert!(matches!(kv.kv, KvBacking::Quant(_)), "{name}: not a quantized store"),
+            }
+            let dense_err = (0..limit).map(|p| max_abs(&out[p], &f32_out[p])).fold(0f32, f32::max) / run_scale;
+            let sel_err = (limit..steps).map(|p| max_abs(&out[p], &f32_out[p])).fold(0f32, f32::max) / run_scale;
+            eprintln!("KVARM {name}: max err / run scale: dense range {dense_err:.3e}, selected range {sel_err:.3e}; the selection's own effect {d_sel:.3e}");
+            assert!(out.iter().flatten().all(|x| x.is_finite()), "{name}: non-finite");
+            assert!(dense_err > 0.0, "{name}: bit-identical to f32 — the store was not engaged");
+            assert!(sel_err < d_sel / 4.0, "{name}: selected-range error {sel_err} is not well under the selection's own effect {d_sel}");
+            errs.push((dense_err.max(sel_err), name));
+        }
+        assert!(errs[0].0 < errs[1].0 && errs[1].0 < errs[2].0, "errors not ordered f16 < int8 < int4: {errs:?}");
+        // Measured 9.5e-5 / 2.2e-3 / 1.7e-2 of the run's scale; the bounds
+        // are a decade above, and each a decade under the next rung.
+        assert!(errs[0].0 < 1e-3, "f16 error {} is above what rounding K/V to f16 explains", errs[0].0);
+        assert!(errs[1].0 < 1e-2, "int8 error {} is above what 8-bit codes explain", errs[1].0);
+        assert!(errs[2].0 < 1e-1, "int4 error {} is above what 4-bit codes explain", errs[2].0);
+    }
+
+    /// The quantized block's reads against dense attention over its own
+    /// dequantized planes — same codes, so quantization cancels and only the
+    /// kernels differ: over every live cell, and over a scattered selection
+    /// (blocks out of order and a tail). The planes have grown twice from a
+    /// 16-token start, so the widened head strides are what is read.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_quantized_block_reads_its_cells_as_dense_attention_over_them() {
+        use crate::nn::ops::KvQuant;
+        let gpu = Device::new_metal(0).unwrap();
+        let (nh, nkv, hd, n) = (24usize, 2usize, 256usize, 41usize);
+        for q_arm in [KvQuant::Int8, KvQuant::Int4] {
+            let mut kv = KvCache::with_precision(16, KvPrecision::quantized(q_arm).unwrap()).unwrap();
+            for t in 0..n {
+                let k: Vec<f32> = (0..nkv * hd).map(|i| ((i as f32 * 0.021 + t as f32 * 0.7).sin()) * (1.0 + t as f32 * 0.03)).collect();
+                let v: Vec<f32> = (0..nkv * hd).map(|i| ((i as f32 * 0.017 - t as f32 * 0.4).cos()) * 0.8 - 0.1 * t as f32).collect();
+                kv.append(
+                    &Tensor::from_vec(k, (nkv, 1, hd), &gpu).unwrap(),
+                    &Tensor::from_vec(v, (nkv, 1, hd), &gpu).unwrap(),
+                )
+                .unwrap();
+            }
+            let q = Tensor::from_vec(
+                (0..nh * hd).map(|i| ((i as f32 * 0.013).sin()) * 0.5).collect::<Vec<f32>>(),
+                (1, nh, 1, hd),
+                &gpu,
+            )
+            .unwrap();
+            let scale = 1.0 / (hd as f32).sqrt();
+            let cells: Vec<u32> = [8u32, 9, 10, 11, 0, 1, 2, 3, 28, 29, 30, 31, 40].to_vec();
+            let sel = Tensor::from_vec(cells.clone(), cells.len(), &gpu).unwrap();
+            for s in [None, Some(&sel)] {
+                let got = kv.attend(&q, s, scale).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let (k, v) = kv.dense(s).unwrap();
+                let want = ops::sdpa(&q, &k.unsqueeze(0).unwrap(), &v.unsqueeze(0).unwrap(), None, false, scale, 1.0)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let e = max_rel(&got, &want);
+                eprintln!("QREAD {q_arm:?} sel={} max rel {e:.3e}", s.is_some());
+                assert!(e < 1e-5, "{q_arm:?} sel={}: codes read {e} off the dequantized dense attention", s.is_some());
+            }
+            let all = kv.attend(&q, None, scale).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let some = kv.attend(&q, Some(&sel), scale).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(max_rel(&some, &all) > 1e-3, "{q_arm:?}: the selection did not change the read");
+        }
+    }
+
+    /// A speculative rewind on each store: decode, keep the lengths, decode
+    /// five more, truncate back, decode the same five again — bit for bit the
+    /// first five (the codes above the length are unreachable, the planes
+    /// are rewritten in place).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn each_kv_store_rewinds_to_a_bit_identical_replay() {
+        use crate::nn::ops::KvQuant;
+        let gpu = Device::new_metal(0).unwrap();
+        let cfg = kv_arm_cfg();
+        let attn = indexed_attn(&cfg, &gpu);
+        for p in [
+            KvPrecision::dense(DType::F16),
+            KvPrecision::quantized(KvQuant::Int8).unwrap(),
+            KvPrecision::quantized(KvQuant::Int4).unwrap(),
+        ] {
+            let (_, mut kv) = decode_arm(&attn, p, &gpu, 30);
+            let lens = kv.lens();
+            let step = |kv: &mut KvCache, t: usize| -> Vec<u32> {
+                let x = Tensor::from_vec(tok(128, 50.0 + t as f32), (1, 1, 128), &gpu).unwrap();
+                attn.decode(&x, kv).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().map(|v| v.to_bits()).collect()
+            };
+            let first: Vec<Vec<u32>> = (0..5).map(|t| step(&mut kv, t)).collect();
+            kv.truncate(lens.0, lens.1);
+            assert_eq!(kv.lens(), lens);
+            let again: Vec<Vec<u32>> = (0..5).map(|t| step(&mut kv, t)).collect();
+            assert_eq!(first, again, "{p:?}: the replay after a rewind differs");
+        }
+    }
+
+    /// The KV class's memory per store at 4k and 32k positions, measured: 12
+    /// full-attention layers at the real geometry (2 heads × 256, the
+    /// indexer's 128-wide raw and compressed keys), filled through the real
+    /// append path in 512-position chunks. Prints the planes' bytes (exact) and
+    /// the device / footprint deltas (the buffer pool's view), and asserts
+    /// the planes equal `loader::kv_bytes_per_token` at the store — the
+    /// admission's arithmetic, checked against what was allocated.
+    /// `cargo test … kv_class_bytes -- --ignored --nocapture`.
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "a measurement: 12 layers × 32k positions per arm"]
+    fn kv_class_bytes_per_store_at_4k_and_32k() {
+        use crate::nn::memory::MemSnapshot;
+        use crate::nn::ops::KvQuant;
+        let gpu = Device::new_metal(0).unwrap();
+        let mut cfg = Config::flash_next();
+        cfg.hidden_size = 128;
+        let ix = Indexer::new(
+            lin(cfg.indexer_n_heads * cfg.indexer_head_dim, 128, 5.0, &gpu),
+            lin(cfg.indexer_head_dim, 128, 6.0, &gpu),
+            rms(cfg.indexer_head_dim, &gpu),
+            rms(cfg.indexer_head_dim, &gpu),
+            &cfg,
+        )
+        .unwrap();
+        let (nkv, hd, idx) = (cfg.n_kv_heads, cfg.head_dim, cfg.indexer_head_dim);
+        let chunk = 512usize;
+        let k: Vec<f32> = (0..nkv * chunk * hd).map(|i| ((i as f32) * 0.003).sin()).collect();
+        let k = Tensor::from_vec(k, (nkv, chunk, hd), &gpu).unwrap();
+        let v = (&k * 0.5).unwrap();
+        let raw = Tensor::from_vec(
+            (0..chunk * idx).map(|i| ((i as f32) * 0.007).cos()).collect::<Vec<f32>>(),
+            (chunk, idx),
+            &gpu,
+        )
+        .unwrap();
+        for tokens in [4096usize, 32768] {
+            for p in [
+                DEFAULT_KV_PRECISION,
+                KvPrecision::dense(DType::F16),
+                KvPrecision::quantized(KvQuant::Int8).unwrap(),
+                KvPrecision::quantized(KvQuant::Int4).unwrap(),
+            ] {
+                cfg.kv_precision = p;
+                gpu.synchronize().unwrap();
+                let before = MemSnapshot::read(&gpu);
+                let mut caches: Vec<KvCache> = (0..12)
+                    .map(|_| KvCache::with_precision(KV_SLAB_TOKENS, p).unwrap())
+                    .collect();
+                for c in caches.iter_mut() {
+                    for _ in 0..tokens / chunk {
+                        c.append(&k, &v).unwrap();
+                        ix.observe_keys(&raw, c).unwrap();
+                    }
+                }
+                gpu.synchronize().unwrap();
+                let after = MemSnapshot::read(&gpu);
+                let planes: usize = caches
+                    .iter()
+                    .map(|c| {
+                        let kv = match &c.kv {
+                            KvBacking::Slab(s) => [s.k_cache().all_data(), s.v_cache().all_data()]
+                                .into_iter()
+                                .flatten()
+                                .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+                                .sum(),
+                            KvBacking::Quant(s) => s.bytes(),
+                            KvBacking::Pooled { .. } => unreachable!(),
+                        };
+                        let ixb: usize = [c.raw_keys.all_data(), c.blocks.all_data()]
+                            .into_iter()
+                            .flatten()
+                            .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+                            .sum();
+                        kv + ixb
+                    })
+                    .sum();
+                let want = tokens * super::super::loader::kv_bytes_per_token(&cfg);
+                let d = |a: u64, b: u64| a as f64 / 1e9 - b as f64 / 1e9;
+                println!(
+                    "KVBYTES store={p:?} tokens={tokens} planes_bytes={planes} planes_gb={:.4} per_token={} device_delta_gb={:.4} pool_live_delta_gb={:.4} phys_delta_gb={:.4}",
+                    planes as f64 / 1e9,
+                    planes / tokens,
+                    d(after.device_allocated, before.device_allocated),
+                    d(after.pool_live, before.pool_live),
+                    d(after.phys_footprint, before.phys_footprint),
+                );
+                assert_eq!(planes, want, "{p:?} at {tokens}: the planes are not the admission's arithmetic");
+                drop(caches);
+                gpu.synchronize().unwrap();
+            }
         }
     }
 }

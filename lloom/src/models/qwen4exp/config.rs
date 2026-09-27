@@ -7,6 +7,9 @@
 //! precedent: the checkpoint layer deserializes, this is what the blocks see).
 
 use super::deltanet::DeltaNetDims;
+use crate::nn::ops::KvPrecision;
+use lloom_macros::Config as ConfigDerive;
+use lloom_tensor::DType;
 
 /// Which token-mixer a layer runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,8 +20,11 @@ pub enum LayerKind {
     Full,
 }
 
-/// The verified geometry. Every field carries its GGUF key in a comment.
-#[derive(Debug, Clone)]
+/// The verified geometry — every field carries its GGUF key in a comment —
+/// and the runtime axes (`#[axis]`, not from the checkpoint): each registers
+/// in `lloom::axes::AXES` and becomes a `ConfigArgs` flag, as on LFM2's
+/// `Config` (RESTRUCTURING §1.6).
+#[derive(Debug, Clone, ConfigDerive)]
 pub struct Config {
     // ---- top-level ----
     /// `qwen4exp.block_count` = 48.
@@ -105,6 +111,30 @@ pub struct Config {
     /// `bos = eos` = 248044.
     pub bos_token_id: u32,
     pub eos_token_id: u32,
+
+    // ---- runtime axes ----
+    /// The full-attention layers' KV store (`DESIGN.md` §10.7). `Off` is the
+    /// f32 cache that ships; `f16` is `Off` at f16; `int8` / `int4` are the
+    /// `KvQuant` codes, read by the quantized kernels on the dense and the
+    /// selected path. The registered axis is `KvQuant` (LFM2's, same arms):
+    /// `Off`'s dtype is a parameter of that arm (`KvPrecision`). Read when a
+    /// `Cache` is built; the DeltaNet state is not KV and stays f32.
+    #[axis(
+        name = "KvQuant",
+        flag = "kv-quant",
+        variants = ["Off", "Int8", "Int4"],
+        default = "Off",
+        parser = "parse_kv_precision"
+    )]
+    pub kv_precision: KvPrecision,
+}
+
+/// The KV store this family ships: `Off` at f32.
+pub const DEFAULT_KV_PRECISION: KvPrecision = KvPrecision::dense(DType::F32);
+
+/// `--kv-quant` for this family: `off` is the f32 store.
+pub fn parse_kv_precision(s: &str) -> std::result::Result<KvPrecision, String> {
+    KvPrecision::parse(s, DType::F32).map_err(|e| e.to_string())
 }
 
 impl Config {
@@ -193,6 +223,7 @@ impl Config {
             ple_image_token_id: Some(248056),
             bos_token_id: 248044,
             eos_token_id: 248044,
+            kv_precision: DEFAULT_KV_PRECISION,
         }
     }
 
@@ -238,6 +269,7 @@ impl Config {
             ple_image_token_id: None,
             bos_token_id: 1,
             eos_token_id: 2,
+            kv_precision: DEFAULT_KV_PRECISION,
         }
     }
 }
@@ -305,6 +337,44 @@ mod tests {
         // the same choice). Pinned at the kernels, against hand-computed values
         // and at the boundary: `kernels::tests::the_gated_norm_gate_is_sigmoid`,
         // `the_step_refuses_a_state_that_is_not_f32` (#749 P33).
+    }
+
+    /// `--kv-quant` on this family: `off` is the f32 store, `f16` / `f32`
+    /// name a dense store, `int8` / `int4` the codes; an unknown arm is an
+    /// error, not a default. The flag is the derive's (`ConfigArgs`), and the
+    /// axis it registers is LFM2's `KvQuant` with the same arms, so the
+    /// registry does not grow.
+    #[test]
+    fn the_kv_axis_parses_this_familys_stores() {
+        use crate::nn::ops::{KvPrecision, KvQuant};
+        use clap::Parser;
+        #[derive(Parser)]
+        struct H {
+            #[command(flatten)]
+            axes: ConfigArgs,
+        }
+        let arm = |v: &str| -> Result<KvPrecision, String> {
+            let mut cfg = Config::tiny();
+            H::try_parse_from(["t", "--kv-quant", v])
+                .map_err(|e| e.to_string())?
+                .axes
+                .apply(&mut cfg)?;
+            Ok(cfg.kv_precision)
+        };
+        assert_eq!(Config::tiny().kv_precision, KvPrecision::dense(DType::F32));
+        assert_eq!(arm("off").unwrap(), KvPrecision::dense(DType::F32));
+        assert_eq!(arm("f32").unwrap(), KvPrecision::dense(DType::F32));
+        assert_eq!(arm("f16").unwrap(), KvPrecision::dense(DType::F16));
+        assert_eq!(arm("int8").unwrap().quant(), KvQuant::Int8);
+        assert_eq!(arm("4").unwrap().quant(), KvQuant::Int4);
+        assert!(arm("int9").is_err());
+        assert_eq!(format!("{:?}", arm("f16").unwrap()), "Off:f16");
+        let mut cfg = Config::tiny();
+        cfg.set_axis("kv-quant", "int8").unwrap();
+        assert_eq!(cfg.axes_line(), "KvQuant=Int8");
+        let meta: Vec<_> = crate::axes::AXES.iter().filter(|a| a.name == "KvQuant").collect();
+        assert!(meta.len() >= 2, "both families register KvQuant");
+        assert!(meta.windows(2).all(|w| w[0] == w[1]), "the two KvQuant registrations differ: {meta:?}");
     }
 
     /// Derived dims reconcile with the GGUF tensor shapes (conv_channels must

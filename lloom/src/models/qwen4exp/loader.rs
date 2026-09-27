@@ -179,6 +179,7 @@ impl Config {
                 .filter(|&id| id != 0),
             bos_token_id: eos,
             eos_token_id: eos,
+            kv_precision: super::config::DEFAULT_KV_PRECISION,
         })
     }
 }
@@ -369,8 +370,11 @@ pub const DEFAULT_KV_RESERVE_TOKENS: usize = 4096;
 /// the transients (`buffer_pool`'s 256 MiB default free budget).
 pub const POOL_FREE_RESERVE_BYTES: usize = 256 * 1024 * 1024;
 
-/// One position's KV over every full-attention layer, f32 k and v
-/// `[n_kv_heads, head_dim]` each — plus the indexer's raw key per position.
+/// One position's KV over every full-attention layer at the config's store
+/// (`Config::kv_precision`: f32 or f16 elements, or the codes with their
+/// (scale, bias) planes counted — §10.7a's 0.531× argument, at this
+/// geometry), plus the indexer's two f32 caches: the raw key per position
+/// and the compressed key per `indexer_compress_ratio` positions.
 pub fn kv_bytes_per_token(cfg: &Config) -> usize {
     let full = cfg
         .layer_types
@@ -378,7 +382,14 @@ pub fn kv_bytes_per_token(cfg: &Config) -> usize {
         .filter(|k| matches!(k, LayerKind::Full))
         .count();
     let f32 = std::mem::size_of::<f32>();
-    full * (2 * cfg.n_kv_heads * cfg.head_dim + cfg.indexer_head_dim) * f32
+    let kv = cfg.kv_precision.bytes_per_token(
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        lloom_tensor::DType::F32,
+    );
+    let indexer = cfg.indexer_head_dim * f32;
+    let blocks = (indexer).div_ceil(cfg.indexer_compress_ratio.max(1));
+    full * (kv + indexer + blocks)
 }
 
 /// What a streamed load keeps beside its weights: `rows` rows' KV to
@@ -1215,10 +1226,9 @@ mod tests {
         assert!(off.fits());
     }
 
-    /// The reserve at the harness defaults on this model's geometry: 12
-    /// full-attention layers, 2 kv heads × 256, indexer 128 → 50 176 B a
-    /// position; 4096 positions + two 512-tiles' transients + the pool's
-    /// free list. The slot plan leaves it out of the pool.
+    /// The reserve at the harness defaults: 4096 positions of KV + two
+    /// 512-tiles' transients + the pool's free list. The slot plan leaves it
+    /// out of the pool.
     #[test]
     fn the_auto_plan_leaves_the_session_reserve() {
         let cfg = Config::tiny();
@@ -1230,7 +1240,8 @@ mod tests {
             .count();
         assert_eq!(
             per,
-            full * (2 * cfg.n_kv_heads * cfg.head_dim + cfg.indexer_head_dim) * 4
+            full * ((2 * cfg.n_kv_heads * cfg.head_dim + cfg.indexer_head_dim) * 4
+                + cfg.indexer_head_dim)
         );
         let r1 = session_reserve_bytes(&cfg, 1, 4096, 512);
         let r4 = session_reserve_bytes(&cfg, 4, 4096, 512);
@@ -1244,6 +1255,27 @@ mod tests {
         );
         // A zero tile reserves one PREFILL_CHUNK's worth.
         assert_eq!(session_reserve_bytes(&cfg, 1, 4096, 0), r1);
+    }
+
+    /// A position's bytes on this model's geometry, per KV store, against
+    /// the arithmetic written out: 12 full-attention layers × (K and V of 2
+    /// heads × 256, plus the indexer's 128-wide raw key and a quarter of a
+    /// compressed key, f32). The int8 / int4 arms carry one f32 (scale, bias)
+    /// pair per head vector — the term a 0.5× / 0.25× estimate leaves out.
+    #[test]
+    fn the_kv_bytes_follow_the_store_with_the_scales_counted() {
+        use crate::nn::ops::{KvPrecision, KvQuant};
+        use lloom_tensor::DType;
+        let mut cfg = Config::flash_next();
+        let indexer = 128 * 4 + 128;
+        let per = |cfg: &Config| kv_bytes_per_token(cfg);
+        assert_eq!(per(&cfg), 12 * (2 * 2 * 256 * 4 + indexer));
+        cfg.kv_precision = KvPrecision::dense(DType::F16);
+        assert_eq!(per(&cfg), 12 * (2 * 2 * 256 * 2 + indexer));
+        cfg.kv_precision = KvPrecision::quantized(KvQuant::Int8).unwrap();
+        assert_eq!(per(&cfg), 12 * (2 * 2 * (256 + 8) + indexer));
+        cfg.kv_precision = KvPrecision::quantized(KvQuant::Int4).unwrap();
+        assert_eq!(per(&cfg), 12 * (2 * 2 * (128 + 8) + indexer));
     }
 
     /// The default fraction is §9.5k's, the one LFM2's budget and the Metal

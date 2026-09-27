@@ -4085,6 +4085,25 @@ mod contention_tests {
         drop(b);
     }
 
+    /// A release drains too: with no allocation after the GPU finished, the
+    /// next drop still moves the completed buffer into the free list.
+    #[test]
+    fn a_release_drains_what_completed() {
+        let dev = Device::system_default().expect("no Metal device");
+        let (pool, clock) = pool_with_clock();
+        let first = alloc(&pool, &dev, 4096);
+        let second = alloc(&pool, &dev, 8192);
+        drop(first);
+        let e = clock.commit_epoch();
+        clock.mark_completed(e);
+        assert_eq!(pool.counters().drained, 0, "nothing has touched the pool");
+
+        drop(second);
+        let occ = pool.occupancy();
+        assert_eq!(pool.counters().drained, 1, "the drop drained the first");
+        assert_eq!((occ.free_buffers, occ.pending_buffers), (1, 1), "{occ:?}");
+    }
+
     #[derive(Default)]
     struct Told {
         calls: parking_lot::Mutex<Vec<(std::thread::ThreadId, usize)>>,

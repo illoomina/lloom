@@ -209,7 +209,7 @@ impl QStorage {
     fn quantize(&mut self, src: &Storage) -> Result<()> {
         match (self, src) {
             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
-                storage.from_float(src.as_slice::<f32>()?);
+                storage.from_float(src.as_slice::<f32>()?)?;
             }
             (QStorage::Metal(storage), Storage::Metal(src)) => storage.quantize(src)?,
             (QStorage::Cuda(storage), Storage::Cuda(src)) => storage.quantize(src)?,
@@ -226,7 +226,7 @@ impl QStorage {
     ) -> Result<()> {
         match (self, src) {
             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
-                storage.from_float_imatrix(src.as_slice::<f32>()?, imatrix_weights, n_per_row);
+                storage.from_float_imatrix(src.as_slice::<f32>()?, imatrix_weights, n_per_row)?;
             }
             (QStorage::Metal(storage), Storage::Metal(src)) => {
                 storage.quantize_imatrix(src, imatrix_weights, n_per_row)?
@@ -242,7 +242,7 @@ impl QStorage {
     fn quantize_onto(&mut self, src: &Storage) -> Result<()> {
         match (self, src) {
             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
-                storage.from_float(src.as_slice::<f32>()?);
+                storage.from_float(src.as_slice::<f32>()?)?;
             }
             (QStorage::Metal(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
             (QStorage::Cuda(storage), Storage::Cpu(src)) => storage.quantize_onto(src)?,
@@ -259,7 +259,7 @@ impl QStorage {
     ) -> Result<()> {
         match (self, src) {
             (QStorage::Cpu(storage), Storage::Cpu(src)) => {
-                storage.from_float_imatrix(src.as_slice::<f32>()?, imatrix_weights, n_per_row);
+                storage.from_float_imatrix(src.as_slice::<f32>()?, imatrix_weights, n_per_row)?;
             }
             (QStorage::Metal(storage), Storage::Cpu(src)) => {
                 storage.quantize_imatrix_onto(src, imatrix_weights, n_per_row)?
@@ -384,6 +384,34 @@ pub enum GgmlDType {
 }
 
 impl GgmlDType {
+    /// Whether lloom only reads blocks of this type. For the IQ family and
+    /// Q2_0 only the dequant is ported: there is no quantizer to produce them
+    /// and no CPU dot product to multiply by them, so both are refused by name
+    /// (§15.2a); their matmul runs on Metal.
+    pub fn is_read_only(self) -> bool {
+        matches!(
+            self,
+            Self::IQ2XXS
+                | Self::IQ2XS
+                | Self::IQ2S
+                | Self::IQ3XXS
+                | Self::IQ3S
+                | Self::IQ4NL
+                | Self::IQ4XS
+                | Self::Q2_0
+        )
+    }
+
+    fn refuse_read_only(self, op: &str) -> Result<()> {
+        if self.is_read_only() {
+            crate::bail!(
+                "{op} {self:?} is refused: lloom reads {self:?} blocks but ports only \
+                 their dequant, not a quantizer or a CPU dot product"
+            )
+        }
+        Ok(())
+    }
+
     pub(crate) fn from_u32(u: u32) -> Result<Self> {
         let dtype = match u {
             0 => Self::F32,
@@ -606,17 +634,24 @@ pub trait QuantizedType: Send + Sync {
     fn as_mut_ptr(&mut self) -> *mut u8;
     fn block_size(&self) -> usize;
     #[allow(clippy::wrong_self_convention)]
-    fn from_float(&mut self, xs: &[f32]);
+    fn from_float(&mut self, xs: &[f32]) -> Result<()>;
     #[allow(clippy::wrong_self_convention)]
-    fn from_float_imatrix(&mut self, xs: &[f32], imatrix_weights: &[f32], n_per_row: usize);
+    fn from_float_imatrix(
+        &mut self,
+        xs: &[f32],
+        imatrix_weights: &[f32],
+        n_per_row: usize,
+    ) -> Result<()>;
     fn size(&self) -> usize;
 }
 
 impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
     fn matmul_t(&self, mkn: (usize, usize, usize), lhs: &[f32], dst: &mut [f32]) -> Result<()> {
+        T::DTYPE.refuse_read_only("the CPU matmul of")?;
         k_quants::matmul(mkn, lhs, self.as_slice(), dst)
     }
     fn matmul_t_f16(&self, mkn: (usize, usize, usize), lhs: &[f16], dst: &mut [f16]) -> Result<()> {
+        T::DTYPE.refuse_read_only("the CPU matmul of")?;
         k_quants::matmul_f16(mkn, lhs, self.as_slice(), dst)
     }
 
@@ -698,12 +733,21 @@ impl<T: k_quants::GgmlType + Send + Sync> QuantizedType for Vec<T> {
         self.len() * core::mem::size_of::<T>()
     }
 
-    fn from_float(&mut self, xs: &[f32]) {
-        T::from_float(xs, self)
+    fn from_float(&mut self, xs: &[f32]) -> Result<()> {
+        T::DTYPE.refuse_read_only("quantizing to")?;
+        T::from_float(xs, self);
+        Ok(())
     }
 
-    fn from_float_imatrix(&mut self, xs: &[f32], imatrix_weights: &[f32], n_per_row: usize) {
-        T::from_float_imatrix(xs, self, imatrix_weights, n_per_row)
+    fn from_float_imatrix(
+        &mut self,
+        xs: &[f32],
+        imatrix_weights: &[f32],
+        n_per_row: usize,
+    ) -> Result<()> {
+        T::DTYPE.refuse_read_only("quantizing to")?;
+        T::from_float_imatrix(xs, self, imatrix_weights, n_per_row);
+        Ok(())
     }
 
     fn dtype(&self) -> GgmlDType {

@@ -11,7 +11,8 @@
 # suite ran no test.
 #
 # Each cargo call takes its own `lloom-arb share` lease, so a queued measurement
-# waits for one build rather than for the whole harness.
+# waits for one build rather than for the whole harness -- unless
+# MUTATE_IN_LEASE=1 says the whole harness already runs inside one.
 #
 # Builds: A = default (`dotprod` compiled in); B = `-C target-feature=-dotprod`
 # (the arm detected at run time); C = B with LLOOM_CPU_DISABLE=dotprod.
@@ -54,7 +55,8 @@ run() {
   local cfg=$1; shift
   local out verdict=GREEN s
   for s in $@; do
-    out=$(lloom-arb share -- env CARGO_TARGET_DIR=${TD[$cfg]} ${=ENV[$cfg]} cargo test --release -p lloom-tensor ${=SUITE[$s]} 2>&1)
+    local arb=(lloom-arb share --); [[ -n ${MUTATE_IN_LEASE-} ]] && arb=()
+    out=$($arb env CARGO_TARGET_DIR=${TD[$cfg]} ${=ENV[$cfg]} cargo test --release -p lloom-tensor ${=SUITE[$s]} 2>&1)
     local results=$(print -r -- "$out" | grep -E '^test result:')
     if print -r -- "$results" | grep -q FAILED; then
       verdict=RED
@@ -133,7 +135,7 @@ run A quant; echo "      (reported: quantized_tests compares vec_dot to vec_dot_
 restore_all
 
 echo "=== M8  the host set ignores LLOOM_CPU_DISABLE (build C)"
-mutate $SRC/cpu/arms.rs 's/Features::detect\(\)\.0 & !disabled\.0/Features::detect().0 \& !(disabled.0 \& 0)/' M8
+mutate $SRC/cpu/arms.rs 's/Features::detect\(\)\.minus\(Features::from_env\("LLOOM_CPU_DISABLE"\)\)/Features::detect().minus(Features::empty())/' M8
 run C neon; expect RED "the disabled feature stays native"
 restore_all
 

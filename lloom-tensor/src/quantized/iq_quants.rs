@@ -5,8 +5,11 @@
 //! These are the storage types a non-uniform GSQ-RCO GGUF assigns per tensor
 //! (IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, and the fork's own Q2_0, type code 42).
 //! Only `to_float` (dequant) is implemented — lloom reads these checkpoints, it
-//! does not quantize them, so `from_float`/`vec_dot` on the CPU path bail. The
-//! Metal decode path runs the matmul through the existing `kernel_mul_mv_iq*`
+//! does not quantize them. Quantizing into one of these types, and the CPU
+//! matmul by one, are refused by name at the fallible `QuantizedType` layer
+//! (`GgmlDType::is_read_only`), before `from_float`/`vec_dot` could be reached;
+//! the `GgmlType` methods below cannot return an error, so a direct call panics.
+//! The Metal decode path runs the matmul through the existing `kernel_mul_mv_iq*`
 //! kernels with the weights in their native block layout (dequant-on-the-fly);
 //! the CPU `to_float` here is the reference dequant for the no-metal build and
 //! the parity tests.
@@ -58,6 +61,7 @@ fn sign_mul(val: f32, signs: u8, j: usize) -> f32 {
     }
 }
 
+// Reached only by a direct `GgmlType` call: `QuantizedType` refuses first.
 fn unimpl_from_float(dtype: GgmlDType) -> ! {
     panic!("from_float is not implemented for read-only quant type {dtype:?}")
 }

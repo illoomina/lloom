@@ -378,7 +378,10 @@ pub struct StepPlan {
     /// that gained or lost a dispatch before ordinal N can hand N a request of
     /// the planned size for a *different* value, with a different lifetime,
     /// and the packed layout would alias it (§9.3). The position it was
-    /// allocated at cannot coincide across such a shift.
+    /// allocated at cannot coincide across such a shift. It can across a
+    /// shift of whole allocate-and-dispatch operations — one allocation and
+    /// one dispatch move the ordinal and the position together — so two
+    /// sequences that differ that way must not share a key (§9.2aa).
     alloc_at: Vec<usize>,
 }
 
@@ -1235,9 +1238,10 @@ impl Arena {
         // sequence -- the hidden size is most of a step's allocations -- and a
         // request served at the planned slot for a *different* value has a
         // lifetime the packing never modelled, which is §9.3's aliasing with
-        // no safety net. The dispatch position cannot coincide across a shift,
-        // so a mismatch here is the sequence having moved: this step is served
-        // no further, and the loop re-records.
+        // no safety net. A mismatch here is the sequence having moved: this
+        // step is served no further, and the loop re-records. A shift of whole
+        // allocate-and-dispatch operations moves the ordinal and the position
+        // together and passes (`StepPlan::alloc_at`).
         if let Some(at) = plan_state.plan.alloc_position(ordinal) {
             let now = STEP_DISPATCH.load(Ordering::Relaxed);
             if at != now {

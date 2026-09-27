@@ -40,6 +40,7 @@ pub mod loss;
 pub mod memory;
 pub mod model;
 pub mod moe;
+pub mod ngram_memory;
 pub mod observer;
 pub mod ops;
 pub mod optim;

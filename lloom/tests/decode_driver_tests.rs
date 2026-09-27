@@ -292,6 +292,42 @@ impl ReadbackStrategy for AnyArm {
             AnyArm::Ring(r) => r.eos_read_arm(),
         }
     }
+    fn fed_host_ids(&self) -> Option<&[u32]> {
+        match self {
+            AnyArm::Blocking(b) => b.fed_host_ids(),
+            AnyArm::Ring(r) => r.fed_host_ids(),
+        }
+    }
+    fn take_ids_into(&mut self, out: &mut Vec<u32>) -> Result<()> {
+        match self {
+            AnyArm::Blocking(b) => b.take_ids_into(out),
+            AnyArm::Ring(r) => r.take_ids_into(out),
+        }
+    }
+    fn eos_ids_tensor(&self) -> Option<&Tensor> {
+        match self {
+            AnyArm::Blocking(b) => b.eos_ids_tensor(),
+            AnyArm::Ring(r) => r.eos_ids_tensor(),
+        }
+    }
+    fn reader(&self) -> Option<lloom::generation::readback::RingReader> {
+        match self {
+            AnyArm::Blocking(b) => b.reader(),
+            AnyArm::Ring(r) => ReadbackStrategy::reader(r),
+        }
+    }
+    fn set_fused_publish(&mut self, on: bool) {
+        match self {
+            AnyArm::Blocking(b) => b.set_fused_publish(on),
+            AnyArm::Ring(r) => r.set_fused_publish(on),
+        }
+    }
+    fn publishes_fused(&self) -> bool {
+        match self {
+            AnyArm::Blocking(b) => b.publishes_fused(),
+            AnyArm::Ring(r) => r.publishes_fused(),
+        }
+    }
     fn counters(&self) -> lloom::generation::ReadbackCounters {
         match self {
             AnyArm::Blocking(b) => b.counters(),
@@ -304,6 +340,29 @@ impl ReadbackStrategy for AnyArm {
 /// each confirmed batch, and the returned `ids` carry the whole run either way.
 fn sink(_batch: &[u32]) -> Result<()> {
     Ok(())
+}
+
+/// Whether this build records `DecodeStats::step_ns`: the per-step clock is
+/// compiled in under `debug_assertions` or `lloom/profile` and out of a plain
+/// `--release` build, the build that ships.
+const STEP_CLOCK: bool = cfg!(any(debug_assertions, feature = "profile"));
+
+/// `DecodeStats::step_ns` holds one entry per returned token where the clock
+/// is compiled in and none where it is not. Asserted both ways, so a release
+/// run checks the clock stays off the hot path rather than skipping the check,
+/// and every arm after the first still runs.
+fn assert_step_clock(stats: &lloom::nn::DecodeStats, tokens: usize, what: &str) {
+    let want = if STEP_CLOCK { tokens } else { 0 };
+    assert_eq!(
+        stats.step_ns.len(),
+        want,
+        "{what}: step_ns entries (step clock {})",
+        if STEP_CLOCK {
+            "compiled in"
+        } else {
+            "compiled out"
+        }
+    );
 }
 
 fn run(
@@ -362,7 +421,11 @@ fn every_arm_produces_the_same_ids_as_the_host_chain() -> Result<()> {
             // Prompt of 1, then one forward per token (the last one's logits
             // go unused, as in every harness loop).
             assert_eq!(pos, 1 + 24, "{device:?} lookahead {lookahead}");
-            assert_eq!(out.stats.step_ns.len(), 24);
+            assert_step_clock(
+                &out.stats,
+                24,
+                &format!("{device:?} {arm:?} lookahead {lookahead}"),
+            );
             assert_eq!(out.stats.overrun, 0);
         }
     }
@@ -477,7 +540,11 @@ fn eos_ends_the_run_at_the_right_token_and_is_not_in_the_ids() -> Result<()> {
                 "{device:?} lookahead {lookahead}"
             );
             // EOS ends the step without a timing entry, as the harness loop does.
-            assert_eq!(out.stats.step_ns.len(), want.len());
+            assert_step_clock(
+                &out.stats,
+                want.len(),
+                &format!("{device:?} {arm:?} lookahead {lookahead}"),
+            );
             assert_eq!(out.stats.steps as usize, want.len() + 1);
         }
     }
@@ -1195,8 +1262,8 @@ fn adaptive_gated_run(
 /// reads, as `DecodeSession::decode_until` does for `lloom serve`, and takes
 /// one last read once the loop has returned. Returns the run and what the
 /// reader saw.
-fn reader_run(
-    session: &mut Session<'_, Chain>,
+fn reader_run<M: CausalLM>(
+    session: &mut Session<'_, M>,
     rb: &mut Ring,
     prompt: &[u32],
     opts: DecodeOptions,
@@ -1206,8 +1273,8 @@ fn reader_run(
 }
 
 /// [`reader_run`] with the caller's sampler.
-fn reader_run_sampled(
-    session: &mut Session<'_, Chain>,
+fn reader_run_sampled<M: CausalLM>(
+    session: &mut Session<'_, M>,
     rb: &mut Ring,
     prompt: &[u32],
     mut opts: DecodeOptions,
@@ -2041,6 +2108,390 @@ fn a_reader_owned_run_ends_its_ids_at_the_eos_on_every_cadence() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// What one run handed its consumer.
+struct Delivered {
+    out: lloom::nn::DecodeOut,
+    /// The consumer's stream: the reader's reads on a reader-owned run,
+    /// `on_tokens`' batches concatenated on a run the loop drains.
+    stream: Vec<u32>,
+    /// `on_tokens`' batch sizes, in order; empty on a reader-owned run.
+    batches: Vec<usize>,
+}
+
+/// One run of `arm` under `opts` on the chain fixture, streamed the way the
+/// options say: through a reader thread when `stream_via_reader` is on, else
+/// through `on_tokens`.
+fn deliver(device: &Device, arm: &Arm, prompt: &[u32], opts: DecodeOptions) -> Result<Delivered> {
+    let model = Chain::new(device)?;
+    let mut session = Session::new(&model, 0usize);
+    let mut rb = strategy(arm, device, opts.max_tokens + 4)?;
+    if opts.stream_via_reader {
+        let AnyArm::Ring(ring) = &mut rb else {
+            panic!("a reader-owned run needs a ring, not {arm:?}");
+        };
+        let (out, stream) = reader_run(&mut session, ring, prompt, opts, false)?;
+        return Ok(Delivered {
+            out,
+            stream,
+            batches: Vec::new(),
+        });
+    }
+    let mut stream = Vec::new();
+    let mut batches = Vec::new();
+    let out = session.decode(
+        &mut IdentityProposer,
+        &mut rb,
+        &mut greedy(),
+        prompt,
+        &opts,
+        &mut |batch: &[u32]| {
+            stream.extend_from_slice(batch);
+            batches.push(batch.len());
+            Ok(())
+        },
+    )?;
+    Ok(Delivered {
+        out,
+        stream,
+        batches,
+    })
+}
+
+/// The fixed cadence at `lookahead`, `steps:8`: the `ring-la0` / `ring-fixed`
+/// presets' loop options (`lloom-engine` `ReadbackConfig::apply_spelling`).
+fn fixed_cadence(n: usize, lookahead: usize) -> DecodeOptions {
+    DecodeOptions {
+        lookahead,
+        budget: CommitBudget::steps(8).expect("8 > 0"),
+        ..DecodeOptions::new(n)
+    }
+}
+
+/// Every arm the loop keeps, named as `lloom --readback` spells it: the
+/// blocking reference, the fixed cadence on each EOS read, and — where there
+/// is a reader, Metal — the fixed cadence streamed by a reader and the flow.
+fn cadence_arms(n: usize, metal: bool) -> Vec<(&'static str, Arm, DecodeOptions)> {
+    let mut arms = vec![
+        ("blocking", Arm::Blocking, DecodeOptions::new(n)),
+        ("ring-la0", Arm::RingPoll, fixed_cadence(n, 0)),
+        ("ring-fixed", Arm::RingPoll, fixed_cadence(n, 1)),
+        (
+            "ring (the flag read)",
+            Arm::RingBlocking,
+            fixed_cadence(n, 1),
+        ),
+        (
+            "ring-hostdrain, fixed",
+            Arm::RingHostDrain,
+            fixed_cadence(n, 1),
+        ),
+        (
+            "ring-gpubatch, fixed",
+            Arm::RingGpuBatch,
+            fixed_cadence(n, 1),
+        ),
+        (
+            "ring-gpubatch-nonblocking, fixed",
+            Arm::RingGpuBatchNonblocking,
+            fixed_cadence(n, 1),
+        ),
+    ];
+    if metal {
+        let reader = |opts: DecodeOptions| DecodeOptions {
+            stream_via_reader: true,
+            ..opts
+        };
+        arms.extend([
+            (
+                "ring-la0 --stream-reader",
+                Arm::RingPoll,
+                reader(fixed_cadence(n, 0)),
+            ),
+            (
+                "ring-fixed --stream-reader",
+                Arm::RingPoll,
+                reader(fixed_cadence(n, 1)),
+            ),
+            ("the flow", Arm::RingPoll, adaptive_opts(n, 8, true)),
+            (
+                "the flow, --eos-gate=false",
+                Arm::RingPoll,
+                adaptive_opts(n, 8, false),
+            ),
+            (
+                "the flow, --no-fused-publish",
+                Arm::RingPoll,
+                DecodeOptions {
+                    fused_publish: false,
+                    ..adaptive_opts(n, 8, true)
+                },
+            ),
+            (
+                "the flow on ring-hostdrain",
+                Arm::RingHostDrain,
+                adaptive_opts(n, 8, true),
+            ),
+        ]);
+    }
+    arms
+}
+
+/// The flow and the fixed cadence deliver one stream (`docs/dispatch.md`
+/// §11.5z-xv). The fixed cadence stays as a selectable arm beside the flow,
+/// and neither is allowed to rot: every arm the loop keeps must hand its
+/// consumer the host chain's ids — through `on_tokens` where the loop drains,
+/// through the reader where it does not — on an EOS-ended run and on a
+/// length-capped one that crosses the TTFT ramp and several commit windows.
+///
+/// Each arm must also run the mechanism its name promises, or two arms that
+/// silently became one would pass: the fixed cadence makes cadence commits and
+/// no adaptive close, and `ring-la0` one commit every step; `ring-fixed`'s
+/// consumer receives the first eight tokens one commit each (the TTFT ramp)
+/// and then eight a commit; the flow makes no cadence commit and closes its
+/// buffers adaptively, and its gate fires exactly when the run met its EOS.
+/// Off Metal there is no reader, so the CPU runs the fixed-cadence arms only.
+#[test]
+fn the_flow_and_the_fixed_cadence_deliver_one_stream() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        let metal = matches!(device, Device::Metal(_));
+        for (start, n) in [(1u32, 200usize), (0, 40)] {
+            let (want, hit) = chain(start, n);
+            let mut flows = 0usize;
+            for (name, arm, opts) in cadence_arms(n, metal) {
+                let tag = format!("{device:?} from {start}: {name}");
+                let (flow, gated, lookahead) =
+                    (opts.adaptive_commit, opts.eos_gate, opts.lookahead);
+                let d = deliver(&device, &arm, &[start], opts)?;
+                assert_eq!(d.out.ids, want, "{tag}: the ids");
+                assert_eq!(d.out.eos, hit, "{tag}: EOS");
+                assert_eq!(d.stream, want, "{tag}: the stream its consumer saw");
+
+                let s = &d.out.stats;
+                let closes = s.adaptive_commits + s.run_ahead_closes;
+                if flow {
+                    flows += 1;
+                    assert_eq!(s.commits, 0, "{tag}: a cadence commit on the flow");
+                    assert!(closes > 0, "{tag}: the flow closed no buffer");
+                } else {
+                    assert_eq!(closes, 0, "{tag}: an adaptive close on the fixed cadence");
+                    if !matches!(arm, Arm::Blocking) {
+                        assert!(s.commits > 0, "{tag}: the fixed cadence made no commit");
+                    }
+                }
+                if lookahead == 0 && !matches!(arm, Arm::Blocking) {
+                    assert_eq!(s.commits, s.steps, "{tag}: a commit every step");
+                }
+                if name == "ring-fixed" && !hit {
+                    let ramp_then_cadence = [vec![1usize; 8], vec![8; (n - 8) / 8]].concat();
+                    assert_eq!(
+                        d.batches, ramp_then_cadence,
+                        "{tag}: the TTFT ramp, then one batch a period"
+                    );
+                }
+                match (&s.eos_gate, gated) {
+                    (Some(g), true) => assert_eq!(g.fired, hit, "{tag}: the gate fired"),
+                    (None, false) => {}
+                    (g, _) => panic!("{tag}: the gate report {g:?} with the gate {gated}"),
+                }
+            }
+            assert_eq!(
+                flows,
+                if metal { 4 } else { 0 },
+                "{device:?}: flow arms run"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Two turns of one conversation on one arm, continued through
+/// `Session::prepare` as the engine continues a chat: turn one from `prompt`,
+/// then the whole conversation — the prompt, turn one's ids, the EOS that
+/// ended it, `user2` — prepared against what the cache holds and the suffix
+/// decoded. The ring is kept across the turns, as the engine's pool keeps it.
+#[cfg(feature = "metal")]
+struct Conversation {
+    turn1: Vec<u32>,
+    action: lloom::nn::ReuseAction,
+    turn2: Vec<u32>,
+}
+
+#[cfg(feature = "metal")]
+fn converse(
+    model: &lloom::models::lfm2::Model,
+    cache: lloom::models::lfm2::Cache,
+    rb: &mut AnyArm,
+    opts: &dyn Fn(usize) -> DecodeOptions,
+    prompt: &[u32],
+    eos: u32,
+    user2: &[u32],
+) -> Result<Conversation> {
+    fn turn(
+        s: &mut Session<'_, lloom::models::lfm2::Model>,
+        rb: &mut AnyArm,
+        prompt: &[u32],
+        opts: DecodeOptions,
+        resume: bool,
+    ) -> Result<Vec<u32>> {
+        if opts.stream_via_reader {
+            let AnyArm::Ring(ring) = rb else {
+                panic!("a reader-owned run needs a ring");
+            };
+            let (out, seen) = reader_run(s, ring, prompt, opts, resume)?;
+            assert_eq!(seen, out.ids, "the reader's stream is the run's ids");
+            return Ok(out.ids);
+        }
+        Ok(s.decode(
+            &mut IdentityProposer,
+            rb,
+            &mut greedy(),
+            prompt,
+            &opts,
+            &mut sink,
+        )?
+        .ids)
+    }
+    let mut s = Session::new(model, cache);
+    let turn1 = turn(&mut s, rb, prompt, opts(64), false)?;
+    let full = [prompt, &turn1[..], &[eos][..], user2].concat();
+    let prepared = s.prepare(&full)?;
+    let turn2 = turn(&mut s, rb, &prepared.suffix, opts(12), true)?;
+    Ok(Conversation {
+        turn1,
+        action: prepared.action,
+        turn2,
+    })
+}
+
+/// The flow and the fixed cadence on the real decode kernels (§11.5z-xv): a
+/// two-layer LFM2 on the crown's cache — in-place KV, `Shuffle` conv state
+/// with the fused step, rewind horizon 0 — and a two-turn conversation
+/// through `Session::prepare`. Every arm's turns are the blocking arm's, so
+/// the gated kernel variants, the fused publish and the cadence change no
+/// token. What differs is how turn two reuses the cache, and that is pinned
+/// too: the arms that leave nothing written past the EOS — the blocking arm,
+/// `ring-la0`, the gated flow — extend it; `ring-fixed` and the ungated flow
+/// leave a written overrun this cache cannot rewind, and re-prefill the
+/// conversation (`dispatch.md` §11.5z-xiv's finding, on the toy).
+#[cfg(feature = "metal")]
+#[test]
+fn the_flow_and_the_fixed_cadence_agree_on_the_real_decode_kernels_across_turns() -> Result<()> {
+    use lloom::models::lfm2::{Cache, ConvState};
+    use lloom::nn::ReuseAction;
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    let dev = Device::new_metal(0).expect("metal");
+    let cfg = tiny_lfm2::config(ConvState::Shuffle, true);
+    let model = tiny_lfm2::build(&cfg, &dev)?;
+    let fresh = || Cache::new(true, DType::F16, &cfg, &dev);
+    let prompt = [1u32, 2, 3, 4, 5];
+
+    // The EOS is the stream's first token not seen earlier, at least four in,
+    // so turn one stops on it and every arm has an overrun to handle.
+    let stream = Session::new(&model, fresh()?)
+        .decode(
+            &mut IdentityProposer,
+            &mut Blocking::new(&[u32::MAX], &dev)?,
+            &mut greedy(),
+            &prompt,
+            &DecodeOptions::new(32),
+            &mut sink,
+        )?
+        .ids;
+    let k = (4..stream.len())
+        .find(|&k| !stream[..k].contains(&stream[k]))
+        .unwrap_or_else(|| panic!("no fresh token in the stream to stop on: {stream:?}"));
+    let eos = stream[k];
+
+    // The second message is the first candidate whose blocking turn two runs
+    // at least four tokens before the EOS or the cap, so turn two is decode
+    // steps reading the continued cache, not one prediction.
+    let user2 = [[9u32, 3], [7, 11], [13, 6], [21, 2], [30, 17], [44, 5]]
+        .into_iter()
+        .map(|u| -> Result<(Vec<u32>, [u32; 2])> {
+            let mut rb = AnyArm::Blocking(Blocking::new(&[eos], &dev)?);
+            let c = converse(
+                &model,
+                fresh()?,
+                &mut rb,
+                &DecodeOptions::new,
+                &prompt,
+                eos,
+                &u,
+            )?;
+            Ok((c.turn2, u))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .find(|(t, _)| t.len() >= 4)
+        .map(|(_, u)| u)
+        .expect("no candidate second message runs four tokens on this fixture");
+
+    let slots = lloom::generation::readback::RING_HISTORY_SLOTS;
+    let ring = |read: EosRead| -> Result<AnyArm> {
+        Ok(AnyArm::Ring(Ring::new(&[eos], &dev, slots, read)?))
+    };
+    let poll = || EosRead::Poll(PollMechanism::default());
+    type Opts = Box<dyn Fn(usize) -> DecodeOptions>;
+    let arms: Vec<(&str, AnyArm, Opts, ReuseAction)> = vec![
+        (
+            "blocking",
+            AnyArm::Blocking(Blocking::new(&[eos], &dev)?),
+            Box::new(DecodeOptions::new),
+            ReuseAction::Extend,
+        ),
+        (
+            "ring-la0",
+            ring(poll())?,
+            Box::new(|n| fixed_cadence(n, 0)),
+            ReuseAction::Extend,
+        ),
+        (
+            "ring-fixed",
+            ring(poll())?,
+            Box::new(|n| fixed_cadence(n, 1)),
+            ReuseAction::Fresh,
+        ),
+        (
+            "ring-hostdrain, fixed",
+            ring(EosRead::HostOnDrain)?,
+            Box::new(|n| fixed_cadence(n, 1)),
+            ReuseAction::Fresh,
+        ),
+        (
+            "the flow",
+            ring(poll())?,
+            Box::new(|n| adaptive_opts(n, 8, true)),
+            ReuseAction::Extend,
+        ),
+        (
+            "the flow, --eos-gate=false",
+            ring(poll())?,
+            Box::new(|n| adaptive_opts(n, 8, false)),
+            ReuseAction::Fresh,
+        ),
+    ];
+
+    // The blocking arm runs first; its turn two is every other arm's reference.
+    let mut reference: Option<Vec<u32>> = None;
+    for (name, mut rb, opts, action) in arms {
+        let c = converse(&model, fresh()?, &mut rb, &*opts, &prompt, eos, &user2)?;
+        eprintln!(
+            "{name}: turn 1 {:?}, turn 2 {:?} after {:?}",
+            c.turn1, c.turn2, c.action
+        );
+        assert_eq!(c.turn1, stream[..k], "{name}: turn one ends at the EOS");
+        assert_eq!(c.action, action, "{name}: how turn two reuses the cache");
+        let r = reference.get_or_insert_with(|| c.turn2.clone());
+        assert_eq!(&c.turn2, r, "{name}: turn two against the blocking arm's");
+    }
+    assert!(
+        !reference.expect("the blocking arm ran").is_empty(),
+        "turn two produced nothing"
+    );
     Ok(())
 }
 

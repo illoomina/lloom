@@ -8522,6 +8522,32 @@ fn quant_attention_reference(
     scale: f32,
     bits: KvQuantBits,
 ) -> Vec<f32> {
+    let cells: Vec<usize> = (0..kv_len).collect();
+    quant_attention_reference_cells(
+        q, k_codes, k_scales, k_biases, v_codes, v_scales, v_biases, n_q_heads, n_kv_heads,
+        head_dim, &cells, capacity, scale, bits,
+    )
+}
+
+/// [`quant_attention_reference`] over the keys at `cells`, in that order —
+/// the selected read's reference.
+#[allow(clippy::too_many_arguments)]
+fn quant_attention_reference_cells(
+    q: &[f32],
+    k_codes: &[u8],
+    k_scales: &[f32],
+    k_biases: &[f32],
+    v_codes: &[u8],
+    v_scales: &[f32],
+    v_biases: &[f32],
+    n_q_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    cells: &[usize],
+    capacity: usize,
+    scale: f32,
+    bits: KvQuantBits,
+) -> Vec<f32> {
     let gqa = n_q_heads / n_kv_heads;
     let code_at = |plane: &[u8], head: usize, tok: usize, j: usize| -> f32 {
         let idx = tok * head_dim + j;
@@ -8544,7 +8570,7 @@ fn quant_attention_reference(
         let mut max_score = f32::NEG_INFINITY;
         let mut sum_exp = 0f32;
 
-        for t in 0..kv_len {
+        for &t in cells {
             let ks = k_scales[kv_h * capacity + t];
             let kb = k_biases[kv_h * capacity + t];
             let mut score = 0f32;
@@ -9177,6 +9203,363 @@ fn the_two_widths_differ_and_int8_is_closer_to_f16() {
         rms[1],
         rms[1] / rms[0]
     );
+}
+
+/// `run_quantize_kv` at f32: the planes Qwen4-exp's attention writes (f32
+/// activations, so f32 scale and bias planes).
+#[allow(clippy::too_many_arguments)]
+fn run_quantize_kv_f32(
+    device: &Device,
+    kernels: &Kernels,
+    src: &[f32],
+    n_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    capacity: usize,
+    dst_offset: usize,
+    bits: KvQuantBits,
+) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    let code_bytes = bits.code_bytes(n_heads * capacity * head_dim);
+    let scale_els = n_heads * capacity;
+    let commands = commands(device);
+    let encoder = commands.command_encoder().unwrap();
+    let src_buf = new_buffer(device, src);
+    let codes = new_buffer(device, &vec![0u8; code_bytes]);
+    let scales = new_buffer(device, &vec![0f32; scale_els]);
+    let biases = new_buffer(device, &vec![0f32; scale_els]);
+    let p =
+        SdpaQuantWriteParams::for_append(seq_len * head_dim, capacity, head_dim, dst_offset, bits);
+    let params = new_buffer(device, &[p]);
+    call_quantize_kv(
+        device,
+        &encoder,
+        kernels,
+        0,
+        &src_buf,
+        &codes,
+        &scales,
+        &biases,
+        &params,
+        n_heads,
+        seq_len,
+        head_dim,
+        bits,
+        SdpaDType::F32,
+    )
+    .unwrap();
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    (
+        read_to_vec::<u8>(&codes, code_bytes),
+        read_to_vec::<f32>(&scales, scale_els),
+        read_to_vec::<f32>(&biases, scale_els),
+    )
+}
+
+/// The code of element `j` of token `t` of `head` in a packed plane.
+fn plane_code(
+    plane: &[u8],
+    bits: KvQuantBits,
+    head: usize,
+    t: usize,
+    j: usize,
+    capacity: usize,
+    head_dim: usize,
+) -> u8 {
+    let idx = t * head_dim + j;
+    let base = bits.code_bytes(head * capacity * head_dim);
+    match bits {
+        KvQuantBits::Eight => plane[base + idx],
+        KvQuantBits::Four => {
+            let byte = plane[base + (idx >> 1)];
+            if idx & 1 == 1 {
+                byte >> 4
+            } else {
+                byte & 0x0F
+            }
+        }
+    }
+}
+
+/// Qwen4-exp's K / V fixture: per-token offset and range (the bias term is
+/// observable only when the groups differ — mutant 2 of #218's harness), at
+/// f32, `n_heads × len × head_dim`.
+fn qwen_kv_fixture(n_heads: usize, len: usize, head_dim: usize, salt: usize) -> Vec<f32> {
+    (0..n_heads * len * head_dim)
+        .map(|i| {
+            let tok = (i / head_dim) % len;
+            let offset = (tok as f32) * 0.07 - 2.0 + salt as f32 * 0.3;
+            let amp = 1.0 + ((tok + salt) % 7) as f32 * 0.4;
+            offset + amp * (((i * (53 + salt)) % 97) as f32 - 48.0) / 96.0
+        })
+        .collect()
+}
+
+/// The quantizer at `head_dim` 256, f32 — Qwen4-exp's instantiation —
+/// agrees with the scalar reference. The bias (the group's min) is exact; the
+/// scale `range / levels` is within one f32 ulp of the IEEE quotient (the
+/// library compiles with fast-math, `CONTRIBUTING.md` §1.4, and at f16 the
+/// storage rounding hid it); and every code is a NEAREST code of the value
+/// under the STORED pair — within half a step of `(x − bias) / scale`, exact
+/// in f64 — the contract the kernel states (the encode and the decode read
+/// one stored (scale, bias)). A value within 1e-3 of a half step may take
+/// either neighbour (the fast reciprocal); those ties are counted, and an
+/// off-by-one code is still a failure.
+#[test]
+fn quantize_kv_at_head_dim_256_f32_matches_the_scalar_reference() {
+    let device = device();
+    let kernels = Kernels::new();
+    let (n_heads, head_dim, seq_len, capacity, dst_offset) =
+        (2usize, 256usize, 5usize, 12usize, 4usize);
+    let src = qwen_kv_fixture(n_heads, seq_len, head_dim, 0);
+    for bits in KvQuantBits::ALL {
+        let (codes, scales, biases) = run_quantize_kv_f32(
+            &device, &kernels, &src, n_heads, seq_len, head_dim, capacity, dst_offset, bits,
+        );
+        let (mut checked, mut ties) = (0usize, 0usize);
+        for h in 0..n_heads {
+            for t in 0..seq_len {
+                let group = &src[(h * seq_len + t) * head_dim..(h * seq_len + t + 1) * head_dim];
+                let (_, want_scale, want_bias) = quantize_group_reference(group, bits, |x| x);
+                let dst = dst_offset + t;
+                let (got_scale, got_bias) =
+                    (scales[h * capacity + dst], biases[h * capacity + dst]);
+                let ulp = f32::from_bits(want_scale.to_bits() + 1) - want_scale;
+                assert!(
+                    (got_scale - want_scale).abs() <= ulp,
+                    "scale h{h} t{dst} int{}: {got_scale} vs {want_scale} (> 1 ulp)",
+                    bits.bits()
+                );
+                assert_eq!(got_bias, want_bias, "bias h{h} t{dst} int{}", bits.bits());
+                for (j, &x) in group.iter().enumerate() {
+                    let exact = ((x as f64 - got_bias as f64) / got_scale as f64)
+                        .clamp(0.0, bits.levels() as f64);
+                    let code = plane_code(&codes, bits, h, dst, j, capacity, head_dim) as f64;
+                    assert!(
+                        (code - exact).abs() <= 0.5 + 1e-3,
+                        "code h{h} t{dst} j{j} int{}: {code} is not a nearest code of {exact}",
+                        bits.bits()
+                    );
+                    if (code - exact.round()).abs() > 0.0 {
+                        ties += 1;
+                    }
+                    checked += 1;
+                }
+            }
+            // Outside the append nothing was written.
+            for t in (0..capacity).filter(|t| !(dst_offset..dst_offset + seq_len).contains(t)) {
+                assert_eq!(
+                    scales[h * capacity + t],
+                    0.0,
+                    "h{h} t{t} outside the append"
+                );
+            }
+        }
+        assert_eq!(checked, n_heads * seq_len * head_dim);
+        eprintln!(
+            "int{} quantize_kv hd256 f32: {checked} codes, {ties} at a half-step tie",
+            bits.bits()
+        );
+        assert!(
+            ties * 100 < checked,
+            "{ties} of {checked} codes off the rounded value: not ties"
+        );
+        let distinct = codes.iter().collect::<std::collections::HashSet<_>>().len();
+        assert!(
+            distinct >= 8,
+            "only {distinct} distinct code bytes at int{}",
+            bits.bits()
+        );
+    }
+}
+
+/// Qwen4-exp's attention over a quantized cache: 24 query heads over 2 KV
+/// heads (`gqa_factor` 12), `head_dim` 256, f32 — against the scalar
+/// reference over the planes the GPU wrote. `kv_len` 70 crosses the BN = 32
+/// key-loop wrap twice; `capacity` 96 puts the head stride off `kv_len`.
+///
+/// Returns the planes and the dense output for the selection arm.
+fn qwen_quant_attention_case(
+    device: &Device,
+    kernels: &Kernels,
+    bits: KvQuantBits,
+    sel: Option<&[u32]>,
+) -> (Vec<f32>, Vec<f32>) {
+    let (n_q, n_kv, hd, kv_len, capacity) = (24usize, 2usize, 256usize, 70usize, 96usize);
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let q: Vec<f32> = (0..n_q * hd)
+        .map(|i| ((i * 37 % 71) as f32 - 35.0) / 64.0)
+        .collect();
+    let (kc, ks, kb) = run_quantize_kv_f32(
+        device,
+        kernels,
+        &qwen_kv_fixture(n_kv, kv_len, hd, 0),
+        n_kv,
+        kv_len,
+        hd,
+        capacity,
+        0,
+        bits,
+    );
+    let (vc, vs, vbi) = run_quantize_kv_f32(
+        device,
+        kernels,
+        &qwen_kv_fixture(n_kv, kv_len, hd, 3),
+        n_kv,
+        kv_len,
+        hd,
+        capacity,
+        0,
+        bits,
+    );
+    let n = sel.map(|s| s.len()).unwrap_or(kv_len);
+    let commands = commands(device);
+    let encoder = commands.command_encoder().unwrap();
+    let out_el = n_q * hd;
+    let output = device.new_buffer(out_el * 4, RESOURCE_OPTIONS).unwrap();
+    let p = SdpaQuantParams::for_step(n_q / n_kv, n, capacity, hd, scale, 1.0, bits);
+    let params = new_buffer(device, &[p]);
+    let (qb, kcb, ksb, kbb, vcb, vsb, vbb) = (
+        new_buffer(device, &q),
+        new_buffer(device, &kc),
+        new_buffer(device, &ks),
+        new_buffer(device, &kb),
+        new_buffer(device, &vc),
+        new_buffer(device, &vs),
+        new_buffer(device, &vbi),
+    );
+    match sel {
+        None => call_sdpa_vector_quant(
+            device,
+            &encoder,
+            kernels,
+            0,
+            &[1, n_q, 1, hd],
+            &qb,
+            &kcb,
+            &ksb,
+            &kbb,
+            &vcb,
+            &vsb,
+            &vbb,
+            &output,
+            &params,
+            bits,
+            SdpaDType::F32,
+        )
+        .unwrap(),
+        Some(cells) => {
+            // A leading pad word, so the binding's byte offset is exercised.
+            let mut padded = vec![u32::MAX];
+            padded.extend_from_slice(cells);
+            let sb = new_buffer(device, &padded);
+            call_sdpa_vector_quant_sel(
+                device,
+                &encoder,
+                kernels,
+                0,
+                &[1, n_q, 1, hd],
+                &qb,
+                &kcb,
+                &ksb,
+                &kbb,
+                &vcb,
+                &vsb,
+                &vbb,
+                &output,
+                &params,
+                (&sb, 4),
+                bits,
+                SdpaDType::F32,
+            )
+            .unwrap()
+        }
+    }
+    drop(encoder);
+    commands.wait_until_completed().unwrap();
+    let got = read_to_vec::<f32>(&output, out_el);
+    let cells: Vec<usize> = match sel {
+        Some(c) => c.iter().map(|&c| c as usize).collect(),
+        None => (0..kv_len).collect(),
+    };
+    let want = quant_attention_reference_cells(
+        &q, &kc, &ks, &kb, &vc, &vs, &vbi, n_q, n_kv, hd, &cells, capacity, scale, bits,
+    );
+    (got, want)
+}
+
+fn assert_close(got: &[f32], want: &[f32], tol: f32, what: &str) -> f32 {
+    let distinct = got
+        .iter()
+        .map(|x| x.to_bits())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert!(
+        distinct >= 16,
+        "{what}: {distinct} distinct outputs — vacuous"
+    );
+    let mut worst = 0f32;
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        let d = (g - w).abs();
+        worst = worst.max(d);
+        assert!(
+            d < tol,
+            "{what}: disagrees at {i}: got {g} want {w} (delta {d})"
+        );
+    }
+    worst
+}
+
+#[test]
+fn sdpa_vector_quant_at_head_dim_256_f32_matches_the_scalar_reference() {
+    let device = device();
+    let kernels = Kernels::new();
+    for bits in KvQuantBits::ALL {
+        let (got, want) = qwen_quant_attention_case(&device, &kernels, bits, None);
+        let worst = assert_close(&got, &want, 1e-4, &format!("int{} hd256 f32", bits.bits()));
+        eprintln!(
+            "int{} sdpa_vector_quant hd256 f32 vs scalar reference: worst |delta| = {worst:.3e}",
+            bits.bits()
+        );
+    }
+}
+
+/// The selected read (QSA's cells) against the reference over the same
+/// cells, in the selection's order: scattered complete blocks of 4, a block
+/// out of order, and the incomplete tail — 37 cells, crossing the BN wrap.
+/// And the identity selection `[0, kv_len)` is the dense kernel **bit for
+/// bit**: the selection changes where key `i` is read, never the arithmetic.
+#[test]
+fn sdpa_vector_quant_sel_reads_the_selected_cells() {
+    let device = device();
+    let kernels = Kernels::new();
+    let mut cells: Vec<u32> = Vec::new();
+    for b in [2u32, 9, 5, 12, 0, 15, 7, 11] {
+        cells.extend(b * 4..b * 4 + 4);
+    }
+    cells.extend(68..70); // the tail
+    cells.extend([40, 41, 42]);
+    for bits in KvQuantBits::ALL {
+        let (got, want) = qwen_quant_attention_case(&device, &kernels, bits, Some(&cells));
+        let worst = assert_close(&got, &want, 1e-4, &format!("int{} sel", bits.bits()));
+        eprintln!("int{} sdpa_vector_quant_sel vs scalar reference over {} cells: worst |delta| = {worst:.3e}", bits.bits(), cells.len());
+        // The selection is not the dense answer (it must not read [0, n)).
+        let (dense_n, _) = qwen_quant_attention_case(&device, &kernels, bits, None);
+        assert_ne!(
+            got,
+            dense_n,
+            "int{}: the selected read equals the dense one",
+            bits.bits()
+        );
+        let identity: Vec<u32> = (0..70).collect();
+        let (id_out, _) = qwen_quant_attention_case(&device, &kernels, bits, Some(&identity));
+        assert_eq!(
+            id_out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            dense_n.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "int{}: the identity selection is not the dense kernel bit for bit",
+            bits.bits()
+        );
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////

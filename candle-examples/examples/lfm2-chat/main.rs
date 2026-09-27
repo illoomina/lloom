@@ -2179,6 +2179,13 @@ fn main() -> Result<()> {
         Device::Metal(m) => Some(churn_snapshot(m)),
         _ => None,
     };
+    // The submission locks' waits over the run (`DESIGN.md` §6.4d): whether
+    // the encoding thread and the completion thread ever block each other.
+    #[cfg(feature = "metal")]
+    let contention_before = match &device {
+        Device::Metal(m) => Some(m.commands().submission_contention()),
+        _ => None,
+    };
     let mem_sampler = args
         .mem_sample
         .then(|| MemSampler::start(&device))
@@ -2667,6 +2674,17 @@ fn main() -> Result<()> {
             } else {
                 ""
             },
+        );
+    }
+    #[cfg(feature = "metal")]
+    if let (Device::Metal(m), Some(before)) = (&device, contention_before.as_ref()) {
+        let d = m.commands().submission_contention().since(before);
+        diag!(
+            "[lock contention over the run: waits={} host_blocked={:.1} us over {} steps | {}]",
+            d.total_waits(),
+            d.host_blocked_ns() as f64 / 1e3,
+            st.steps,
+            d.render(),
         );
     }
     // The per-step split is a debug/profile detail — `step_ns` is empty in a plain

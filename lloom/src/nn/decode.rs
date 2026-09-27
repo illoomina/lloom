@@ -7,12 +7,40 @@
 //! [`ReadbackStrategy`] for how a step feeds the next forward and learns EOS.
 //! The harness selects both and never writes the body.
 //!
+//! # Two cadences, both kept
+//!
+//! The ring arms run one of two cadences, chosen by
+//! [`DecodeOptions::adaptive_commit`]. Neither replaces the other: the flow is
+//! the default where the engine argues it, and the fixed cadence is the arm
+//! for a backend, a model or a consumer the flow does not serve. Both are
+//! pinned to one token stream (`decode_driver_tests`, `docs/dispatch.md`
+//! §11.5z-xv).
+//!
+//! - **The flow** (`adaptive_commit`): the host encodes step after step and
+//!   closes its command buffer only when the GPU has started every buffer
+//!   before it, or at the `run_ahead` bound; nothing on this thread waits on a
+//!   token. A `RingReader` thread is the drain and the stream, per token, and
+//!   raises [`DecodeOptions::stop`] on EOS; the EOS gate makes the forwards
+//!   queued past it write nothing. Needs a CPU-mapped ring (Metal),
+//!   `lookahead = 1` and an EOS read other than the flag.
+//! - **The fixed cadence** (`adaptive_commit` off — `lloom --readback ring-fixed`
+//!   and `ring-la0`, the drain and batched-EOS reads without the adaptive
+//!   commit, and every ring off Metal, where there is no reader): each forward
+//!   is committed at its end, and the pacer waits on the marker
+//!   [`DecodeOptions::pacer_depth`] forwards back; EOS is learned on this
+//!   thread, per step (`eos_of_last`) or from the drained ids on the deferred
+//!   reads; and the loop drains the ring into `on_tokens` at each commit —
+//!   every step for the first budget period (the TTFT ramp, so the first
+//!   token is not held for a drain), then once a period. Its two lookaheads
+//!   are below.
+//!
 //! # The invariant, and what it costs to hold
 //!
 //! The design's hot path *does not commit, does not block, does not read
 //! back*: sample on the device, feed the ring, enqueue the forward, bump
 //! counters. The one thing the loop must eventually learn per token is whether
-//! it was EOS, and where that wait sits decides everything:
+//! it was EOS, and where that wait sits decides everything on the fixed
+//! cadence:
 //!
 //! - **`lookahead = 0`** waits for step `s`'s publish *before* encoding forward
 //!   `s`. The cache never advances past an EOS, so the arm is safe for a
@@ -190,14 +218,18 @@ pub struct DecodeOptions {
     /// per token already) or on [`Self::decode_until`]'s stop return (a caller
     /// that needs stop-strings under a reader thread signals the loop itself).
     pub stream_via_reader: bool,
-    /// The adaptive commit (lloom #735): the loop closes its command buffer
-    /// only when the GPU has started every buffer committed before it, on no
-    /// cadence of its own — a buffer holds whatever the host encoded while the
-    /// GPU ran the previous one. Requires `stream_via_reader` (the drain is the
-    /// reader's, per token, off this thread), a ring arm whose EOS read never
-    /// waits per step (`drain` / `gpubatch*` — a `poll` would wait on a stamp
-    /// inside an uncommitted buffer), and `lookahead == 1`. The cut period is
-    /// held at `usize::MAX` for the run, so the only cuts are the loop's.
+    /// The flow's adaptive commit; off is the fixed cadence (module docs, "Two
+    /// cadences, both kept"). The loop closes its command buffer only when the
+    /// GPU has started every buffer committed before it, on no cadence of its
+    /// own — a buffer holds whatever the host encoded while the GPU ran the
+    /// previous one. Requires `stream_via_reader` (the drain is the reader's,
+    /// per token, off this thread), `lookahead == 1`, and a ring whose EOS
+    /// read is not the flag: `poll`, `drain` or `gpubatch*`. The loop does not
+    /// call `eos_of_last` on this cadence — a `poll` would wait on a stamp
+    /// inside an uncommitted buffer — and learns EOS from the reader's
+    /// [`Self::stop`] flag, or from the drained ids when the run ends first.
+    /// The cut period is held at `usize::MAX` for the run, so the only cuts
+    /// are the loop's.
     pub adaptive_commit: bool,
     /// Under `adaptive_commit`: the most steps the host may encode into one
     /// buffer before closing it regardless (0 = 8). Not a cadence — a buffer
@@ -1110,6 +1142,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
     /// unchanged either way. Streaming appears in commit-sized chunks, which is
     /// the price of not blocking: a token cannot be shown before the GPU makes
     /// it, and the batch is what keeps that observation off the per-token path.
+    /// That is the fixed cadence; on a reader-owned run (the flow, or
+    /// `stream_via_reader`) the reader is the stream and `on_tokens` is not
+    /// called.
     pub fn decode<S, R>(
         &mut self,
         spec: &mut S,

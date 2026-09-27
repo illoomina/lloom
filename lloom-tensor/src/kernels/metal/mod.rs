@@ -36,6 +36,14 @@ pub mod completion;
 /// needs no GPU.
 #[cfg(test)]
 mod completion_gpu_tests;
+/// Contended acquisitions of the submission locks, counted per lock (§6.4d).
+///
+/// Not in the glob re-export: `Side` and `Access` are general names.
+pub mod contention;
+/// The census on the production locks: each site counts a wait it was made
+/// to take, and only that (§6.4d).
+#[cfg(test)]
+mod contention_gpu_tests;
 /// Component digests: one fingerprint per mechanism per variant (#105).
 #[cfg(test)]
 mod component_digest_tests;

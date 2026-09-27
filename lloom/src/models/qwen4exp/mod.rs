@@ -21,7 +21,7 @@ pub mod ple;
 pub mod qsa;
 pub mod testing;
 
-pub use config::{Config, LayerKind};
+pub use config::{Config, ConfigArgs, LayerKind};
 pub use deltanet::{decode_step, DeltaNetDims};
 pub use deltanet_block::GatedDeltaNet;
 pub use hc::HyperConnection;

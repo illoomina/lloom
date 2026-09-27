@@ -159,13 +159,29 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
 }
 
 /// Load the engine `args` names for `shape`. Returns it with the path it
-/// was loaded from. An adaptive commit the readback arm cannot carry is
-/// named here with its reason, beside the arm the loaded line renders.
-pub fn load_engine(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+/// was loaded from. An adaptive commit the readback arm cannot carry, and
+/// an EOS gate the executor arms cannot run, are named here with their
+/// reasons, beside the arm the loaded line renders.
+pub fn load_engine(model: &ModelArgs, mut shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
     if let Some(note) = shape.decode.readback.adaptive_clamp() {
         eprintln!("[readback: {note}]");
     }
+    if let Some(note) = clamp_eos_gate(&mut shape) {
+        eprintln!("[readback: {note}]");
+    }
     family::load(model, shape)
+}
+
+/// Turn the EOS gate off where the executor arms refuse it
+/// (`ExecutorConfig::refuses_eos_gate`), and say why. The gate defaults on,
+/// so a refusal here would meet every `--replay` run that did not ask for it.
+fn clamp_eos_gate(shape: &mut Shape) -> Option<String> {
+    if !shape.decode.readback.eos_gate {
+        return None;
+    }
+    let why = shape.executor.refuses_eos_gate()?;
+    shape.decode.readback.eos_gate = false;
+    Some(format!("eos_gate is off: {why}"))
 }
 
 /// The option layers every subcommand takes (`lloom_engine::options`):
@@ -520,19 +536,34 @@ mod option_layer_tests {
         // The blocking arm ignores the cadence knobs rather than refusing them.
         let o = resolve_options_uninstalled(&common(&["--readback", "blocking", "--adaptive-commit"])).unwrap();
         assert_eq!(o.decode.readback.arm(), crate::ReadbackArm::Blocking);
-        let err = resolve_options_uninstalled(&common(&["--eos-gate", "--adaptive-commit=false"]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("eos_gate needs adaptive_commit"), "{err}");
+        // The EOS gate defaults on and rides the adaptive commit: every
+        // fixed-cadence route serves without it rather than being refused.
+        for argv in [
+            &["--adaptive-commit=false"][..],
+            &["--eos-gate", "--adaptive-commit=false"],
+            &["--readback", "ring-la0"],
+            &["--readback", "ring-fixed"],
+            &["--lookahead", "0"],
+        ] {
+            let o = resolve_options_uninstalled(&common(argv)).unwrap();
+            assert!(o.decode.readback.eos_gate, "{argv:?}");
+            assert!(!o.decode.readback.ring_arm().adaptive, "{argv:?}");
+        }
         // `ring` (the flag EOS read) resolves to the fixed cadence, and the
-        // EOS gate it cannot carry is refused here, not by a request.
-        let o = resolve_options_uninstalled(&common(&["--readback", "ring"])).unwrap();
-        assert!(o.decode.readback.adaptive_clamp().is_some());
-        assert!(matches!(o.decode.readback.arm(), crate::ReadbackArm::Ring(r) if !r.adaptive));
-        let err = resolve_options_uninstalled(&common(&["--readback", "ring", "--eos-gate"]))
+        // clamp note names the EOS gate that goes off with the commit.
+        for argv in [&["--readback", "ring"][..], &["--readback", "ring", "--eos-gate"]] {
+            let o = resolve_options_uninstalled(&common(argv)).unwrap();
+            assert!(
+                o.decode.readback.adaptive_clamp().is_some_and(|n| n.contains("EOS gate")),
+                "{argv:?}"
+            );
+            assert!(matches!(o.decode.readback.arm(), crate::ReadbackArm::Ring(r) if !r.adaptive));
+        }
+        // A knob that defaults off is still refused where no request could use it.
+        let err = resolve_options_uninstalled(&common(&["--readback", "ring", "--stream-reader"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("eos_gate") && err.contains("flag"), "{err}");
+        assert!(err.contains("stream_reader") && err.contains("flag"), "{err}");
         let err = resolve_options_uninstalled(&common(&["--set", "decode.nope=1"]))
             .unwrap_err()
             .to_string();
@@ -541,6 +572,45 @@ mod option_layer_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected key=value"), "{err}");
+    }
+
+    /// The replay executor refuses the gate (`Device::eos_gate_begin`), so
+    /// load turns it off and says why. No other executor arm does, and a
+    /// run already ungated prints nothing.
+    #[test]
+    fn the_replay_executor_takes_the_eos_gate_off_at_load() {
+        let shape = |argv: &[&str]| {
+            let o = resolve_options_uninstalled(&common(argv)).unwrap();
+            Shape {
+                decode: o.decode,
+                model: o.model,
+                speculative: o.speculative,
+                executor: o.executor,
+                memory: o.memory,
+                reuse_prefix: false,
+                seed_text: String::new(),
+                batch: 1,
+                mem_sample: false,
+                rows: "auto".into(),
+                share_prefix: false,
+            }
+        };
+        let mut s = shape(&["--replay"]);
+        let note = clamp_eos_gate(&mut s).expect("the clamp is named");
+        assert!(note.contains("eos_gate is off") && note.contains("replay"), "{note}");
+        assert!(!s.decode.readback.eos_gate);
+        for argv in [
+            &[][..],
+            &["--arena"],
+            &["--packed"],
+            &["--pass-plans"],
+            &["--replay", "--eos-gate=false"],
+        ] {
+            let mut s = shape(argv);
+            let before = s.decode.readback.eos_gate;
+            assert_eq!(clamp_eos_gate(&mut s), None, "{argv:?}");
+            assert_eq!(s.decode.readback.eos_gate, before, "{argv:?}");
+        }
     }
 
     #[test]

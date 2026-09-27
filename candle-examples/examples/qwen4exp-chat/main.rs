@@ -887,6 +887,10 @@ fn rows_gate<R: ExpertResidency + HasStreamStats>(
         // stream must be its greedy row's; the rate beside the greedy one.
         if let Some(head) = model.mtp_head() {
             use lloom::models::qwen4exp::MtpDrafter;
+            // The greedy rows' caches and pools go first: both sets at once
+            // would be two sessions' state the budget did not plan for.
+            drop(sessions);
+            drop(pools);
             let pools = model.spec_pools(args.rows, args.mtp_k, device);
             let mut sessions: Vec<Session<'_, Qwen4Exp<R>>> = (0..args.rows)
                 .map(|_| {

@@ -157,3 +157,28 @@ fn sample_gumbel() -> Result<()> {
     }
     Ok(())
 }
+
+/// The host draw of the gumbel arm (`sample`, the blocking readback's) is
+/// seeded by the processor's seed, as the device draw is: seed 7 twice draws
+/// one sequence, seed 8 another. Without processors, so the property is the
+/// sampler's own.
+#[test]
+fn a_seeded_gumbel_host_draw_reproduces() -> Result<()> {
+    let logits = Tensor::new(
+        &[
+            0.1f32, 0.9, -0.3, 0.4, 0.0, 0.7, -1.0, 0.2, 0.5, 0.3, -0.2, 0.8, 0.6, -0.5, 0.05, 0.35,
+        ],
+        &Device::Cpu,
+    )?;
+    let draw = |seed: u64| -> Result<Vec<u32>> {
+        let mut p = LogitsProcessor::from_sampling(
+            seed,
+            lloom::generation::Sampling::GumbelSoftmax { temperature: 1.0 },
+        );
+        (0..64).map(|_| p.sample(&logits)).collect()
+    };
+    let (a, b, c) = (draw(7)?, draw(7)?, draw(8)?);
+    assert_eq!(a, b, "seed 7 drew two different sequences");
+    assert_ne!(a, c, "seeds 7 and 8 drew the same 64 tokens");
+    Ok(())
+}

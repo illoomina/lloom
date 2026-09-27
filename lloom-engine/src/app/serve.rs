@@ -166,6 +166,9 @@ pub fn run(args: ServeArgs) -> Result<()> {
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
     sampling.apply_checkpoint(engine.generation_config().as_ref());
+    sampling
+        .check()
+        .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     eprintln!(
         "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} reuse_prefix={} {}]",
         model_name,
@@ -642,6 +645,24 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
             .collect(),
         Some(_) => return Err(bad("field 'stop' must be a string or an array of strings")),
     };
+    // vLLM's other draw-changing fields: refused by name, never ignored.
+    for key in [
+        "min_tokens",
+        "stop_token_ids",
+        "bad_words",
+        "allowed_token_ids",
+    ] {
+        let neutral = match v.get(key) {
+            None | Some(Value::Null) => true,
+            Some(Value::Number(n)) => n.as_f64() == Some(0.0),
+            Some(Value::Array(a)) => a.is_empty(),
+            Some(_) => false,
+        };
+        if !neutral {
+            return Err(bad(format!("field '{key}' is not supported")));
+        }
+    }
+    let processors = request_processors(&shared.sampling, v)?;
     let (eos_ids, readback) = {
         let engine = shared.engine.as_ref();
         let eos = if ignore_eos {
@@ -657,12 +678,65 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         top_p,
         top_k,
         gumbel,
+        processors,
         max_tokens,
         eos_ids,
         stop_strings,
         readback,
         prefill_tile: shared.engine.prefill_tile(),
     })
+}
+
+/// The request's logits processors (vLLM's `repetition_penalty` and `min_p`,
+/// OpenAI's `presence_penalty`, `frequency_penalty` and `logit_bias`) over the
+/// process's defaults, each refused by name when malformed or out of range.
+fn request_processors(
+    defaults: &crate::SamplingConfig,
+    v: &Value,
+) -> Handled<lloom::generation::Processors> {
+    let mut cfg = defaults.clone();
+    for (key, slot) in [
+        ("repetition_penalty", &mut cfg.repetition_penalty),
+        ("presence_penalty", &mut cfg.presence_penalty),
+        ("frequency_penalty", &mut cfg.frequency_penalty),
+        ("min_p", &mut cfg.min_p),
+    ] {
+        match v.get(key) {
+            None | Some(Value::Null) => {}
+            Some(x) => {
+                *slot = Some(
+                    x.as_f64()
+                        .ok_or_else(|| bad(format!("field '{key}' must be a number")))?,
+                )
+            }
+        }
+    }
+    match v.get("logit_bias") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => {
+            let mut bias = std::collections::BTreeMap::new();
+            for (id, b) in map {
+                let id: u32 = id.trim().parse().map_err(|_| {
+                    bad(format!("field 'logit_bias': key `{id}` is not a token id"))
+                })?;
+                let b = b.as_f64().ok_or_else(|| {
+                    bad(format!(
+                        "field 'logit_bias': the bias for token {id} must be a number"
+                    ))
+                })?;
+                bias.insert(id, b);
+            }
+            cfg.logit_bias = bias;
+        }
+        Some(_) => {
+            return Err(bad(
+                "field 'logit_bias' must be an object mapping token ids to biases",
+            ))
+        }
+    }
+    let processors = cfg.processors();
+    processors.validate().map_err(bad)?;
+    Ok(processors)
 }
 
 // ---- streaming (SSE) ---------------------------------------------------------
@@ -1118,6 +1192,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             top_p: None,
                             top_k: None,
                             gumbel: false,
+                            processors: Default::default(),
                             max_tokens,
                             eos_ids: engine.eos_ids().to_vec(),
                             stop_strings: Vec::new(),
@@ -1614,6 +1689,9 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     let model_name = engine.model_name().to_string();
     let mut sampling = options.sampling.clone();
     sampling.apply_checkpoint(engine.generation_config().as_ref());
+    sampling
+        .check()
+        .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     eprintln!(
         "[loaded {} from {} in {:.2}s on {:?}; kv_capacity={} readback={} {}]",
         model_name,
@@ -1717,5 +1795,60 @@ mod bench_cells_tests {
         assert!(Cell::parse("decode:512").is_err(), "a decode cell needs D");
         assert!(Cell::parse("ttft:8").is_err());
         assert!(Cell::parse("prefill:many").is_err());
+    }
+}
+
+#[cfg(test)]
+mod request_processors_tests {
+    use super::{request_processors, Failure};
+    use serde_json::json;
+
+    fn refusal(v: serde_json::Value) -> String {
+        match request_processors(&crate::SamplingConfig::default(), &v) {
+            Err(Failure::BadRequest(m)) => m,
+            Err(_) => panic!("{v}: not a 400"),
+            Ok(p) => panic!("{v}: accepted as {p:?}"),
+        }
+    }
+
+    /// The OpenAI / vLLM fields land on the processors; an absent or null
+    /// field keeps the process's default, which is neutral unless set.
+    #[test]
+    fn the_request_fields_reach_the_processors() {
+        let v = json!({
+            "repetition_penalty": 1.1, "presence_penalty": 0.5, "frequency_penalty": -0.25,
+            "min_p": 0.05, "logit_bias": {"42": -100, "7": 2.5},
+        });
+        let p = request_processors(&crate::SamplingConfig::default(), &v)
+            .ok()
+            .unwrap();
+        assert_eq!(p.repetition_penalty, 1.1);
+        assert_eq!(p.presence_penalty, 0.5);
+        assert_eq!(p.frequency_penalty, -0.25);
+        assert_eq!(p.min_p, 0.05);
+        assert_eq!(p.logit_bias, vec![(7, 2.5), (42, -100.0)]);
+        let none = request_processors(&crate::SamplingConfig::default(), &json!({"min_p": null}))
+            .ok()
+            .unwrap();
+        assert!(!none.is_active());
+        let defaults = crate::SamplingConfig {
+            repetition_penalty: Some(1.2),
+            ..Default::default()
+        };
+        let kept = request_processors(&defaults, &json!({})).ok().unwrap();
+        assert_eq!(kept.repetition_penalty, 1.2, "the process's default stands");
+    }
+
+    #[test]
+    fn a_malformed_or_out_of_range_field_is_refused_by_name() {
+        assert!(refusal(json!({"presence_penalty": 3}))
+            .starts_with("presence_penalty must be in [-2, 2]"));
+        assert!(refusal(json!({"frequency_penalty": "x"}))
+            .contains("'frequency_penalty' must be a number"));
+        assert!(refusal(json!({"repetition_penalty": 0})).starts_with("repetition_penalty must be"));
+        assert!(refusal(json!({"min_p": 1.5})).starts_with("min_p must be in [0, 1]"));
+        assert!(refusal(json!({"logit_bias": {"x": 1}})).contains("key `x` is not a token id"));
+        assert!(refusal(json!({"logit_bias": {"3": 500}})).starts_with("logit_bias for token 3"));
+        assert!(refusal(json!({"logit_bias": [1, 2]})).contains("must be an object"));
     }
 }

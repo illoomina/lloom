@@ -2102,7 +2102,10 @@ impl Ring {
     /// run certifies the history's first `g − stamps_ahead` tokens.
     fn stamps_ahead(&self) -> usize {
         let issued = self.generation as usize;
-        debug_assert!(issued >= self.history.fed, "a history token without a stamp");
+        debug_assert!(
+            issued >= self.history.fed,
+            "a history token without a stamp"
+        );
         issued.saturating_sub(self.history.fed)
     }
 

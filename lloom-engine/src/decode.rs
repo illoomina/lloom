@@ -1030,8 +1030,17 @@ mod tests {
             fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
                 Ok(tokens.clone())
             }
-            fn forward_embeds(&self, embeds: &Tensor, pos: usize, cache: &mut Pos) -> Result<Tensor> {
-                assert_eq!(cache.0, pos, "forward at {pos} against a cache of {}", cache.0);
+            fn forward_embeds(
+                &self,
+                embeds: &Tensor,
+                pos: usize,
+                cache: &mut Pos,
+            ) -> Result<Tensor> {
+                assert_eq!(
+                    cache.0, pos,
+                    "forward at {pos} against a cache of {}",
+                    cache.0
+                );
                 let (_b, seq) = embeds.dims2()?;
                 cache.0 += seq;
                 let last = embeds.narrow(1, seq - 1, 1)?.flatten_all()?;
@@ -1046,7 +1055,9 @@ mod tests {
         fn devices() -> Vec<Device> {
             let mut v = vec![Device::Cpu];
             #[cfg(feature = "metal")]
-            v.push(Device::new_metal(0).expect("the `metal` feature is on and no Metal device opened"));
+            v.push(
+                Device::new_metal(0).expect("the `metal` feature is on and no Metal device opened"),
+            );
             v
         }
 
@@ -1128,7 +1139,11 @@ mod tests {
                         held = Some(parts);
                         let at = format!("{device:?} {arm} request {i} ({})", got.readback.name());
                         assert_eq!(fresh.tokens, want, "{at}: the fresh session's ids");
-                        assert_eq!(fresh_streamed, text_of(&want), "{at}: the fresh session's text");
+                        assert_eq!(
+                            fresh_streamed,
+                            text_of(&want),
+                            "{at}: the fresh session's text"
+                        );
                         assert_eq!(got.tokens, want, "{at}: the ids");
                         assert_eq!(streamed, text_of(&want), "{at}: the streamed text");
                         assert_eq!(got.text, streamed, "{at}: the reply's text");

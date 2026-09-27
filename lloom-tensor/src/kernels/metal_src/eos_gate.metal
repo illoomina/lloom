@@ -140,12 +140,13 @@ kernel void ring_stamp(
     }
 }
 
-// The speculative round's readback as a publish (lloom #148): the verify's
+// The speculative round's readback as a publish: the verify's
 // `[argmax, proposed]` words copied into a CPU-mapped buffer the host keeps,
-// a device-scope barrier, then the generation stamp by thread 0 — the same
-// data-then-stamp order as `argmax_publish_body`, so a host that polls the
-// stamp reads the words behind it without waiting on the command buffer's
-// completion handler.
+// a device-scope barrier, then the generation stamp by thread 0. As in
+// `argmax_publish_body`, the barrier orders the stamp after the words for the
+// GPU's threads and NOT for a host reading the mapped words, so a caller whose
+// stamp a host polls passes `generation` 0, which writes no stamp, and stamps
+// with `ring_stamp` bound to `out` (`Device::words_publish` does).
 kernel void words_publish(
     device const uint *src        [[buffer(0)]],
     constant uint     &n          [[buffer(1)]],
@@ -159,7 +160,7 @@ kernel void words_publish(
         out[i] = src[i];
     }
     threadgroup_barrier(mem_flags::mem_device);
-    if (tid == 0) {
+    if (tid == 0 && generation != 0) {
         step[0] = generation;
     }
 }

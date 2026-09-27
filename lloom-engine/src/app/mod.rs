@@ -559,11 +559,9 @@ mod option_layer_tests {
             );
             assert!(matches!(o.decode.readback.arm(), crate::ReadbackArm::Ring(r) if !r.adaptive));
         }
-        // A knob that defaults off is still refused where no request could use it.
-        let err = resolve_options_uninstalled(&common(&["--readback", "ring", "--stream-reader"]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("stream_reader") && err.contains("flag"), "{err}");
+        // The stream reader streams every ring arm, the flag read included.
+        let o = resolve_options_uninstalled(&common(&["--readback", "ring", "--stream-reader"])).unwrap();
+        assert!(o.decode.readback.stream_reader);
         let err = resolve_options_uninstalled(&common(&["--set", "decode.nope=1"]))
             .unwrap_err()
             .to_string();

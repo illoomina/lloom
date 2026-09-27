@@ -266,7 +266,7 @@ impl ReadbackConfig {
     /// on the fixed cadence where the arm cannot carry the adaptive commit
     /// ([`RingArm::resolved`], [`Self::adaptive_clamp`]).
     pub fn ring_arm(&self) -> RingArm {
-        self.requested_ring_arm().resolved(self.fused_publish)
+        self.requested_ring_arm().resolved()
     }
 
     /// Why the adaptive commit this group asks for does not run, or `None`
@@ -279,10 +279,10 @@ impl ReadbackConfig {
             return None;
         }
         let ring = self.requested_ring_arm();
-        ring.why_not_adaptive(self.fused_publish).map(|why| {
+        ring.why_not_adaptive().map(|why| {
             format!(
                 "adaptive_commit is off on {}: {why}; the ring runs on the fixed cadence{}",
-                ring.resolved(self.fused_publish).name(),
+                ring.resolved().name(),
                 if self.eos_gate {
                     ", without the EOS gate that rides it"
                 } else {
@@ -327,22 +327,11 @@ impl ReadbackConfig {
 
     /// The refusals `lfm2-chat` makes before a run, made here once so every
     /// binary refuses the same combinations with the same reasons. Only a
-    /// knob that defaults off is refused: one that defaults on (the adaptive
+    /// value no arm can run is refused: a knob that defaults on (the adaptive
     /// commit, the EOS gate that rides it) is clamped where the arm cannot
-    /// carry it ([`Self::adaptive_clamp`]), or every fixed-cadence arm would
-    /// be refused over a default nobody set.
+    /// carry it ([`Self::adaptive_clamp`]), and the stream reader streams
+    /// every ring arm (`docs/dispatch.md` §11.5z-xvi).
     pub fn check(&self) -> Result<(), String> {
-        if self.stream_reader && self.kind != ReadbackKind::Blocking {
-            let ring = self.ring_arm();
-            if let Some(why) = ring.why_not_stream_reader(self.fused_publish) {
-                return Err(format!(
-                    "stream_reader cannot stream {}: {why} (`--stream-reader` streams the poll \
-                     read, `ring-nonblocking`, or another read under the adaptive commit's fused \
-                     publish)",
-                    ring.name()
-                ));
-            }
-        }
         if self.lookahead > 1 {
             return Err(format!("lookahead {} is not 0 or 1", self.lookahead));
         }
@@ -1265,13 +1254,14 @@ mod tests {
         la0.adaptive_commit = false;
         assert_eq!(la0.adaptive_clamp(), None);
 
-        // A deferred read stamps per token only through the fused publish.
+        // A deferred read carries the adaptive commit with or without the
+        // fused publish: the loop stamps each token after an unfused step.
         let mut drain = ReadbackConfig::default();
         ReadbackConfig::apply_spelling(&mut drain, "ring-hostdrain").unwrap();
         assert!(drain.ring_arm().adaptive);
         drain.fused_publish = false;
-        assert!(!drain.ring_arm().adaptive);
-        assert!(drain.adaptive_clamp().unwrap().contains("deferred"));
+        assert!(drain.ring_arm().adaptive);
+        assert_eq!(drain.adaptive_clamp(), None);
 
         assert_eq!(ReadbackConfig::default().adaptive_clamp(), None);
         assert_eq!(ReadbackConfig::default().ring_arm(), RingArm::CROWN);
@@ -1285,36 +1275,26 @@ mod tests {
             "the blocking arm ignores the cadence knobs"
         );
 
-        // The stream reader is refused where the ring stamps no token for it.
-        let mut reader = ReadbackConfig {
-            stream_reader: true,
-            ..ReadbackConfig::default()
-        };
-        ReadbackConfig::apply_spelling(&mut reader, "ring").unwrap();
-        let err = reader.check().unwrap_err();
-        assert!(
-            err.contains("stream_reader") && err.contains("flag"),
-            "{err}"
-        );
-        ReadbackConfig::apply_spelling(&mut reader, "ring-hostdrain").unwrap();
-        assert!(
-            reader.check().is_ok(),
-            "the adaptive commit's fused publish stamps per token"
-        );
-        reader.fused_publish = false;
-        let err = reader.check().unwrap_err();
-        assert!(
-            err.contains("stream_reader") && err.contains("deferred"),
-            "{err}"
-        );
-        reader.fused_publish = true;
-        reader.adaptive_commit = false;
-        let err = reader.check().unwrap_err();
-        assert!(
-            err.contains("stream_reader") && err.contains("deferred"),
-            "{err}"
-        );
-        ReadbackConfig::apply_spelling(&mut reader, "ring-fixed").unwrap();
-        assert!(reader.check().is_ok(), "the poll read stamps per token");
+        // The stream reader is taken on every spelling, cadence and publish:
+        // every EOS read stamps on a grain its reader streams.
+        for spelling in ReadbackConfig::SPELLINGS {
+            for adaptive_commit in [true, false] {
+                for fused_publish in [true, false] {
+                    let mut reader = ReadbackConfig {
+                        stream_reader: true,
+                        adaptive_commit,
+                        fused_publish,
+                        ..ReadbackConfig::default()
+                    };
+                    ReadbackConfig::apply_spelling(&mut reader, spelling).unwrap();
+                    assert_eq!(
+                        reader.check(),
+                        Ok(()),
+                        "--readback {spelling} --stream-reader adaptive={adaptive_commit} \
+                         fused={fused_publish}"
+                    );
+                }
+            }
+        }
     }
 }

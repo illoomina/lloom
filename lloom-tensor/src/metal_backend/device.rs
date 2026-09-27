@@ -1050,11 +1050,15 @@ impl MetalDevice {
     }
 
     /// See `Device::eos_gate_end`.
-    /// The speculative round's readback as a publish (`words_publish`): `n`
-    /// u32 words of `src` copied into the caller's CPU-mapped `out`, then
-    /// `generation` stamped into `step` behind a device barrier. The host
-    /// polls the stamp and reads the words in place — no completion-handler
-    /// wait, no `to_cpu` (#148).
+    /// The speculative round's readback as a publish: `n` u32 words of `src`
+    /// copied into the caller's CPU-mapped `out` (`words_publish`), then
+    /// `generation` stamped into `step` by a `ring_stamp` dispatch bound to
+    /// `out`. The host polls the stamp and reads the words in place — no
+    /// completion-handler wait, no `to_cpu`. The stamp is a dispatch of its
+    /// own because the command stream's ordering of a dispatch after the
+    /// last writer of what it binds is what a host observes; the kernel's
+    /// in-dispatch barrier orders its stores for the GPU only
+    /// (`docs/dispatch.md` §11.5z-xvi).
     pub fn words_publish(
         &self,
         src: (&crate::MetalStorage, usize),
@@ -1069,19 +1073,21 @@ impl MetalDevice {
                 offset_in_bytes: off,
             }
         }
-        let encoder = self.command_encoder()?;
-        crate::kernels::call_words_publish(
-            &self.device,
-            &encoder,
-            &self.kernels,
-            bo(src.0, src.1),
-            n,
-            bo(out.0, out.1),
-            bo(step.0, step.1),
-            generation,
-        )
-        .map_err(MetalError::from)?;
-        Ok(())
+        {
+            let encoder = self.command_encoder()?;
+            crate::kernels::call_words_publish(
+                &self.device,
+                &encoder,
+                &self.kernels,
+                bo(src.0, src.1),
+                n,
+                bo(out.0, out.1),
+                bo(step.0, step.1),
+                0,
+            )
+            .map_err(MetalError::from)?;
+        }
+        self.ring_stamp(step, generation, [out, out])
     }
 
     /// See `Device::ring_stamp`. Storages with byte offsets.

@@ -221,3 +221,61 @@ fn the_fused_publish_is_stamped_by_a_dispatch_that_binds_its_slot() -> Result<()
     device.synchronize()?;
     Ok(())
 }
+
+/// The speculative verify's publish (`Device::words_publish`, read by `lfm2`'s
+/// `VerifyWords`) has the fused publish's shape: a kernel writes the words the
+/// host reads in place, and the host polls a stamp to know they are there. So
+/// its stamp is a `ring_stamp` of its own, dispatched after the copy and
+/// binding `out`, whose only output is `step`; the copy's in-dispatch barrier
+/// orders its stores for the GPU and not for the host (§11.5z-xvii).
+#[test]
+fn the_verify_words_are_stamped_by_a_dispatch_that_binds_them() -> Result<()> {
+    install_knobs();
+    let Ok(device) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let words: Vec<u32> = (1..=17).collect();
+    let src = Tensor::from_vec(words.clone(), 17, &device)?;
+    let out = Tensor::from_vec(vec![0u32; 64], 64, &device)?;
+    let step = Tensor::from_vec(vec![0u32], 1, &device)?;
+    let ds = traced(|| device.words_publish(&src, 17, &out, &step, 9))?;
+    let (out_a, step_a) = (addr(&out), addr(&step));
+    let at = |name: &str| -> Vec<usize> {
+        ds.iter()
+            .enumerate()
+            .filter(|(_, d)| d.pipeline == name)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let copy = at("words_publish");
+    assert_eq!(copy.len(), 1, "one words_publish per publish, got {copy:?}");
+    assert!(
+        bound(&ds[copy[0]], true).contains(&out_a),
+        "the copy does not write `out`"
+    );
+    let st = at("ring_stamp");
+    assert_eq!(
+        st.len(),
+        1,
+        "verify words: one ring_stamp per publish, got {st:?}"
+    );
+    assert!(
+        st[0] > copy[0],
+        "verify words: the stamp is dispatched before the copy"
+    );
+    let inputs = bound(&ds[st[0]], false);
+    eprintln!("verify words: stamp inputs {inputs:x?}, out {out_a:x}");
+    assert!(
+        inputs.contains(&out_a),
+        "verify words: the stamp does not bind the words it certifies"
+    );
+    assert_eq!(
+        bound(&ds[st[0]], true),
+        vec![step_a],
+        "verify words: the stamp writes step and nothing else"
+    );
+    device.synchronize()?;
+    assert_eq!(step.to_vec1::<u32>()?, vec![9], "the stamp's value");
+    assert_eq!(&out.to_vec1::<u32>()?[..17], words.as_slice(), "the words");
+    Ok(())
+}

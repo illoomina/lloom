@@ -494,3 +494,69 @@ fn the_ring_stamp_writes_the_generation_and_nothing_else() {
         );
     }
 }
+
+/// `call_words_publish` copies exactly `n` words at `out`'s offset and writes
+/// the stamp only for a non-zero generation: a caller whose stamp a host
+/// polls passes 0 and stamps with `ring_stamp` (`Device::words_publish`).
+/// `n = 300` runs past the threadgroup's 256 threads, so each thread copies
+/// more than one word.
+#[test]
+fn the_words_publish_copies_n_words_and_stamps_only_off_generation_0() {
+    use crate::kernels::call_words_publish;
+    let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue().unwrap();
+    let residency_set = Arc::new(ResidencySet::new(&device));
+    let cmds =
+        Commands::new_with_completion_wait(queue, residency_set, CompletionWait::Synchronize)
+            .unwrap();
+    let kernels = Kernels::new();
+    const POISON: u32 = 0xdead_beef;
+    const UNTOUCHED: u32 = 55;
+    for n in [19usize, 300] {
+        let words: Vec<u32> = (0..n as u32).map(|i| 7 * i + 3).collect();
+        let src = device
+            .new_buffer_with_data(words.as_ptr() as *const std::ffi::c_void, n * 4, SHARED)
+            .unwrap();
+        for generation in [77u32, 0] {
+            // `out` at word 2 of a poisoned buffer, the stamp at word 3 of another.
+            let out = device.new_buffer((n + 4) * 4, SHARED).unwrap();
+            write_u32(&out, &vec![POISON; n + 4]);
+            let step = device.new_buffer(32, SHARED).unwrap();
+            write_u32(&step, &[UNTOUCHED; 8]);
+            {
+                let enc = cmds.command_encoder().unwrap();
+                call_words_publish(
+                    &device,
+                    &enc,
+                    &kernels,
+                    BufferOffset::zero_offset(&src),
+                    n,
+                    BufferOffset {
+                        buffer: &out,
+                        offset_in_bytes: 8,
+                    },
+                    BufferOffset {
+                        buffer: &step,
+                        offset_in_bytes: 12,
+                    },
+                    generation,
+                )
+                .unwrap();
+            }
+            cmds.flush_and_wait_current().unwrap();
+            let got = unsafe { std::slice::from_raw_parts(out.contents() as *const u32, n + 4) };
+            assert_eq!(&got[2..n + 2], words.as_slice(), "n={n}: the words");
+            assert_eq!(
+                [got[0], got[1], got[n + 2], got[n + 3]],
+                [POISON; 4],
+                "n={n}: the words around them untouched"
+            );
+            let st = unsafe { std::slice::from_raw_parts(step.contents() as *const u32, 8) };
+            let mut want = [UNTOUCHED; 8];
+            if generation != 0 {
+                want[3] = generation;
+            }
+            assert_eq!(st, want, "n={n} generation {generation}: the stamp");
+        }
+    }
+}

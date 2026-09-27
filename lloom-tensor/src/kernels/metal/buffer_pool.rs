@@ -4104,6 +4104,56 @@ mod contention_tests {
         assert_eq!((occ.free_buffers, occ.pending_buffers), (1, 1), "{occ:?}");
     }
 
+    /// The price of draining one buffer into the free list, the work a
+    /// completion used to do on Metal's thread and `acquire`/`release` now do
+    /// on the host (`DESIGN.md` §6.4e) -- the number a per-token drain count
+    /// multiplies into a per-token cost. A timing, so ignored and asserted on
+    /// nothing but the count: run alone, in release, under `lloom-arb
+    /// measure`: `cargo test --release -p lloom-tensor --features metal --lib
+    /// price_of_a_drained_buffer -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn price_of_a_drained_buffer() {
+        let dev = Device::system_default().expect("no Metal device");
+        let (pool, clock) = pool_with_clock();
+        pool.set_free_budget(usize::MAX);
+        // Decode-shaped: a working set of a few hundred buffers over a few
+        // dozen sizes, every one released and re-acquired per round.
+        const SIZES: usize = 48;
+        const PER_SIZE: usize = 32;
+        const ROUNDS: usize = 200;
+        let sizes: Vec<usize> = (0..SIZES).map(|i| 4096 + 256 * i).collect();
+        let mut held: Vec<_> = sizes
+            .iter()
+            .flat_map(|&s| (0..PER_SIZE).map(move |_| s))
+            .map(|s| alloc(&pool, &dev, s))
+            .collect();
+        let n = held.len();
+        let mut samples = Vec::new();
+        for _ in 0..ROUNDS {
+            drop(std::mem::take(&mut held));
+            let e = clock.commit_epoch();
+            clock.mark_completed(e);
+            let t = Instant::now();
+            pool.drain_completed();
+            samples.push(t.elapsed().as_nanos() as f64 / n as f64);
+            held = sizes
+                .iter()
+                .flat_map(|&s| (0..PER_SIZE).map(move |_| s))
+                .map(|s| pool.acquire(s).expect("drained, so a hit"))
+                .collect();
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "DRAINPRICE buffers_per_round={n} rounds={ROUNDS} ns_per_buffer min {:.1} median {:.1} p90 {:.1} max {:.1}",
+            samples[0],
+            samples[ROUNDS / 2],
+            samples[ROUNDS * 9 / 10],
+            samples[ROUNDS - 1]
+        );
+        assert_eq!(pool.counters().drained, (n * ROUNDS) as u64);
+    }
+
     #[derive(Default)]
     struct Told {
         calls: parking_lot::Mutex<Vec<(std::thread::ThreadId, usize)>>,

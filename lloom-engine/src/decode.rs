@@ -645,10 +645,15 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 // and lookahead 1 (`Session::decode`'s own check); without a
                 // reader it is the fixed cadence, reported as such. The
                 // reader alone (`--stream-reader`) streams per token on the
-                // fixed cadence.
+                // fixed cadence. The pool's ring served earlier runs and its
+                // stamp runs across them, so the reader starts at this run's
+                // first token.
                 let adaptive = adaptive && lookahead == 1;
                 let reader = if adaptive || self.config.readback.stream_reader {
-                    readback.reader()
+                    readback.reader().map(|mut r| {
+                        r.resume_at_published();
+                        r
+                    })
                 } else {
                     None
                 };
@@ -940,5 +945,217 @@ mod tests {
         assert_ne!(Stop::StopString, Stop::Length);
         assert_ne!(Stop::Eos, Stop::StopString);
         assert_ne!(Stop::Cancelled, Stop::StopString);
+    }
+
+    /// Requests in a row through one sequence and one ring pool, as `lloom
+    /// serve` carries them (`from_parts` / `into_parts`, `app::lfm2`).
+    mod served {
+        use super::*;
+        use crate::options::{DecodeConfig, ReadbackConfig};
+        use lloom::nn::{Model, VarBuilder};
+        use lloom_tensor::{DType, Tensor};
+
+        const VOCAB: usize = 64;
+        const EOS: u32 = 42;
+
+        fn next_of(tok: u32) -> u32 {
+            (tok * 7 + 3) % VOCAB as u32
+        }
+
+        /// The ids a request from `start` returns, and whether it ends on EOS.
+        fn chain(start: u32, max: usize) -> (Vec<u32>, bool) {
+            let mut ids = Vec::new();
+            let mut tok = start;
+            while ids.len() < max {
+                tok = next_of(tok);
+                if tok == EOS {
+                    return (ids, true);
+                }
+                ids.push(tok);
+            }
+            (ids, false)
+        }
+
+        fn text_of(ids: &[u32]) -> String {
+            ids.iter().map(|t| format!("{t} ")).collect()
+        }
+
+        /// A position counter as the cache.
+        struct Pos(usize);
+
+        impl CacheReset for Pos {
+            fn reset(&mut self) {
+                self.0 = 0;
+            }
+        }
+
+        impl CacheRewind for Pos {
+            fn rewind_horizon(&self) -> usize {
+                self.0
+            }
+            fn rewind(&mut self, n: usize) -> Result<()> {
+                self.0 -= n;
+                Ok(())
+            }
+        }
+
+        /// A decoder whose logits peak at `next_of(last token)`, device-side.
+        struct Chain {
+            table: Tensor,
+            eye: Tensor,
+        }
+
+        impl Chain {
+            fn new(device: &Device) -> Result<Self> {
+                let table: Vec<f32> = (0..VOCAB as u32).map(|t| next_of(t) as f32).collect();
+                Ok(Self {
+                    table: Tensor::from_vec(table, VOCAB, device)?,
+                    eye: Tensor::eye(VOCAB, DType::F32, device)?,
+                })
+            }
+        }
+
+        impl Model for Chain {
+            type Config = ();
+            fn from_weights(_vb: VarBuilder, _cfg: &()) -> Result<Self> {
+                lloom_tensor::bail!("Chain has no weights")
+            }
+        }
+
+        impl CausalLM for Chain {
+            type Cache = Pos;
+            fn new_cache(&self, _cfg: &(), _dev: &Device) -> Result<Pos> {
+                Ok(Pos(0))
+            }
+            fn embed(&self, tokens: &Tensor) -> Result<Tensor> {
+                Ok(tokens.clone())
+            }
+            fn forward_embeds(
+                &self,
+                embeds: &Tensor,
+                pos: usize,
+                cache: &mut Pos,
+            ) -> Result<Tensor> {
+                assert_eq!(
+                    cache.0, pos,
+                    "forward at {pos} against a cache of {}",
+                    cache.0
+                );
+                let (_b, seq) = embeds.dims2()?;
+                cache.0 += seq;
+                let last = embeds.narrow(1, seq - 1, 1)?.flatten_all()?;
+                let next = self.table.index_select(&last, 0)?.to_dtype(DType::U32)?;
+                self.eye.index_select(&next, 0)
+            }
+            fn vocab_size(&self) -> usize {
+                VOCAB
+            }
+        }
+
+        fn devices() -> Vec<Device> {
+            let mut v = vec![Device::Cpu];
+            #[cfg(feature = "metal")]
+            v.push(
+                Device::new_metal(0).expect("the `metal` feature is on and no Metal device opened"),
+            );
+            v
+        }
+
+        /// One request: on the sequence and pool `held` carries over from the
+        /// previous request, or on a fresh session. Returns the reply, the
+        /// text its fragments streamed, and the parts for the next request.
+        fn request(
+            model: &Chain,
+            device: &Device,
+            config: &DecodeConfig,
+            held: Option<(Sequence<Pos>, RingPool)>,
+            prompt: &[u32],
+            max_tokens: usize,
+        ) -> Result<(Decoded, String, (Sequence<Pos>, RingPool))> {
+            let session = match held {
+                Some((seq, rings)) => DecodeSession::from_parts(model, seq, device.clone(), rings),
+                None => DecodeSession::new(model, Pos(0), device.clone(), 0),
+            };
+            let mut session = session.with_config(config.clone());
+            let params = DecodeParams {
+                max_tokens,
+                eos_ids: vec![EOS],
+                readback: config.readback.arm(),
+                ..DecodeParams::default()
+            };
+            let mut streamed = String::new();
+            let reply = session.decode(
+                prompt,
+                |ids: &[u32]| Ok(text_of(ids)),
+                &params,
+                |frag: &str| streamed.push_str(frag),
+            )?;
+            Ok((reply, streamed, session.into_parts()))
+        }
+
+        /// Each request on a pooled ring streams its own run, and nothing of
+        /// the earlier requests': the text its fragments carried equals the
+        /// text of its ids, which equal the chain from its prompt — what the
+        /// same request reads on a fresh session. On `lloom serve`'s default
+        /// arm (the adaptive commit, whose reader streams), on the
+        /// reader-owned fixed-cadence arms (whose loop retracts every EOS),
+        /// and on the blocking arm, after requests that ended on EOS and
+        /// requests that did not. The reader is Metal's; on the CPU the ring
+        /// arms drain on the loop's cadence and the test holds them to the
+        /// same references.
+        #[test]
+        fn each_request_on_a_pooled_ring_streams_only_its_own_run() -> Result<()> {
+            let arms: [(&str, Option<&str>, bool); 4] = [
+                ("default", None, false),
+                ("ring-la0 --stream-reader", Some("ring-la0"), true),
+                ("ring-fixed --stream-reader", Some("ring-fixed"), true),
+                ("blocking", Some("blocking"), false),
+            ];
+            // (prompt, max_tokens): ends on EOS, on length, EOS twice in a
+            // row, then length after an EOS.
+            let requests: [(&[u32], usize); 5] = [
+                (&[5, 1], 64),
+                (&[5, 0], 24),
+                (&[9, 1], 64),
+                (&[1], 64),
+                (&[0], 24),
+            ];
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                for (arm, spelling, reader) in arms {
+                    let mut config = DecodeConfig::default();
+                    if let Some(s) = spelling {
+                        ReadbackConfig::apply_spelling(&mut config.readback, s)
+                            .map_err(lloom_tensor::Error::msg)?;
+                    }
+                    config.readback.stream_reader = reader;
+                    let mut held = None;
+                    for (i, (prompt, max)) in requests.into_iter().enumerate() {
+                        let (want, hit) = chain(*prompt.last().expect("a prompt"), max);
+                        let (fresh, fresh_streamed, _) =
+                            request(&model, &device, &config, None, prompt, max)?;
+                        let (got, streamed, parts) =
+                            request(&model, &device, &config, held.take(), prompt, max)?;
+                        held = Some(parts);
+                        let at = format!("{device:?} {arm} request {i} ({})", got.readback.name());
+                        assert_eq!(fresh.tokens, want, "{at}: the fresh session's ids");
+                        assert_eq!(
+                            fresh_streamed,
+                            text_of(&want),
+                            "{at}: the fresh session's text"
+                        );
+                        assert_eq!(got.tokens, want, "{at}: the ids");
+                        assert_eq!(streamed, text_of(&want), "{at}: the streamed text");
+                        assert_eq!(got.text, streamed, "{at}: the reply's text");
+                        assert_eq!(
+                            got.stop,
+                            if hit { Stop::Eos } else { Stop::Length },
+                            "{at}: why it stopped"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }

@@ -1167,6 +1167,13 @@ impl Engine {
         let encoder = v.encoder(&device)?;
 
         let mut single = lock(&self.single);
+        // The previous run's overrun (the flow's forwards past its EOS) is
+        // discarded first, as `Session::prepare` does, so the check below
+        // compares the cache's own position with the token log.
+        single.with_session(&self.core, |s, _| {
+            s.reconcile();
+            Ok(())
+        })?;
         let start = {
             let seq = single
                 .seq

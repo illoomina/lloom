@@ -508,9 +508,22 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         self.session.cache_mut()
     }
 
-    /// Positions currently in the cache.
+    /// Positions currently in the cache, a previous run's overrun included.
     pub fn pos(&self) -> usize {
         self.session.pos()
+    }
+
+    /// Discard a previous run's overrun so the cache ends at the token log's
+    /// last id, or reset the sequence where the cache cannot take it back —
+    /// what [`Session::prepare`] does first. For a caller that reads the
+    /// position or prefills before [`Self::decode_until`] prepares the run.
+    pub fn reconcile(&mut self)
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+        if self.session.overrun() > 0 && self.session.reconcile().is_err() {
+            self.session.reset();
+        }
     }
 
     /// Return the sequence to empty: cache reset, token log cleared. A serving
@@ -1222,6 +1235,43 @@ mod tests {
                         );
                     }
                 }
+            }
+            Ok(())
+        }
+
+        /// `DecodeSession::reconcile` takes a run's overrun back before the
+        /// next request reads the position — the image path's reuse check
+        /// (`app::lfm2::Engine::complete_images_until`) compares it with the
+        /// token log. After a request that ended on EOS with forwards queued
+        /// past it (the gated flow's up to two windows on Metal, the
+        /// lookahead's one on the CPU), the position equals the token log,
+        /// the cache kept: the next request extends it.
+        #[test]
+        fn reconcile_brings_the_position_back_to_the_token_log() -> Result<()> {
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                let config = DecodeConfig::default();
+                let (reply, _, (seq, rings)) =
+                    request(&model, &device, &config, None, &[5, 1], 64)?;
+                assert_eq!(reply.stop, Stop::Eos, "{device:?}");
+                let mut s = DecodeSession::from_parts(&model, seq, device.clone(), rings)
+                    .with_config(config.clone());
+                let (pos, kept) = (s.pos(), s.tokens().len());
+                assert!(
+                    pos > kept,
+                    "{device:?}: no overrun to reconcile ({pos} vs {kept})"
+                );
+                s.reconcile();
+                assert_eq!((s.pos(), s.tokens().len()), (kept, kept), "{device:?}");
+                s.reconcile();
+                assert_eq!(s.pos(), kept, "{device:?}: a second call moved it");
+                let mut prompt = vec![5, 1];
+                prompt.extend_from_slice(&reply.tokens);
+                prompt.push(2);
+                let (next, _, _) =
+                    request(&model, &device, &config, Some(s.into_parts()), &prompt, 8)?;
+                assert_eq!(next.reuse, ReuseAction::Extend, "{device:?}");
+                assert_eq!(next.reused, kept, "{device:?}");
             }
             Ok(())
         }

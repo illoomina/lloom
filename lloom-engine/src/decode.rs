@@ -508,9 +508,22 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         self.session.cache_mut()
     }
 
-    /// Positions currently in the cache.
+    /// Positions currently in the cache, a previous run's overrun included.
     pub fn pos(&self) -> usize {
         self.session.pos()
+    }
+
+    /// Discard a previous run's overrun so the cache ends at the token log's
+    /// last id, or reset the sequence where the cache cannot take it back —
+    /// what [`Session::prepare`] does first. For a caller that reads the
+    /// position or prefills before [`Self::decode_until`] prepares the run.
+    pub fn reconcile(&mut self)
+    where
+        M::Cache: CacheRewind + CacheReset,
+    {
+        if self.session.overrun() > 0 && self.session.reconcile().is_err() {
+            self.session.reset();
+        }
     }
 
     /// Return the sequence to empty: cache reset, token log cleared. A serving
@@ -1161,20 +1174,22 @@ mod tests {
         /// the earlier requests': the text its fragments carried equals the
         /// text of its ids, which equal the chain from its prompt — what the
         /// same request reads on a fresh session. On `lloom serve`'s default
-        /// arm (the adaptive commit, whose reader streams), on the
-        /// reader-owned fixed-cadence arms (whose loop retracts every EOS),
-        /// and on the blocking arm, after requests that ended on EOS and
-        /// requests that did not. The reader is Metal's; on the CPU the ring
-        /// arms drain on the loop's cadence and the test holds them to the
-        /// same references.
+        /// arm (the adaptive commit, whose reader streams, and the EOS gate)
+        /// and the same arm ungated, on the reader-owned fixed-cadence arms
+        /// (whose loop retracts every EOS), and on the blocking arm, after
+        /// requests that ended on EOS and requests that did not. The reader
+        /// is Metal's; on the CPU the ring arms drain on the loop's cadence
+        /// and the test holds them to the same references.
         #[test]
         fn each_request_on_a_pooled_ring_streams_only_its_own_run() -> Result<()> {
-            let arms: [(&str, Option<&str>, bool); 5] = [
-                ("default", None, false),
-                ("ring-la0 --stream-reader", Some("ring-la0"), true),
-                ("ring-fixed --stream-reader", Some("ring-fixed"), true),
-                ("ring", Some("ring"), false),
-                ("blocking", Some("blocking"), false),
+            // (name, spelling, stream reader, EOS gate)
+            let arms: [(&str, Option<&str>, bool, bool); 6] = [
+                ("default", None, false, true),
+                ("default --eos-gate=false", None, false, false),
+                ("ring-la0 --stream-reader", Some("ring-la0"), true, true),
+                ("ring-fixed --stream-reader", Some("ring-fixed"), true, true),
+                ("ring", Some("ring"), false, true),
+                ("blocking", Some("blocking"), false, true),
             ];
             // (prompt, max_tokens): ends on EOS, on length, EOS twice in a
             // row, then length after an EOS.
@@ -1187,13 +1202,14 @@ mod tests {
             ];
             for device in devices() {
                 let model = Chain::new(&device)?;
-                for (arm, spelling, reader) in arms {
+                for (arm, spelling, reader, gate) in arms {
                     let mut config = DecodeConfig::default();
                     if let Some(s) = spelling {
                         ReadbackConfig::apply_spelling(&mut config.readback, s)
                             .map_err(lloom_tensor::Error::msg)?;
                     }
                     config.readback.stream_reader = reader;
+                    config.readback.eos_gate = gate;
                     let mut held = None;
                     for (i, (prompt, max)) in requests.into_iter().enumerate() {
                         let (want, hit) = chain(*prompt.last().expect("a prompt"), max);
@@ -1219,6 +1235,43 @@ mod tests {
                         );
                     }
                 }
+            }
+            Ok(())
+        }
+
+        /// `DecodeSession::reconcile` takes a run's overrun back before the
+        /// next request reads the position — the image path's reuse check
+        /// (`app::lfm2::Engine::complete_images_until`) compares it with the
+        /// token log. After a request that ended on EOS with forwards queued
+        /// past it (the gated flow's up to two windows on Metal, the
+        /// lookahead's one on the CPU), the position equals the token log,
+        /// the cache kept: the next request extends it.
+        #[test]
+        fn reconcile_brings_the_position_back_to_the_token_log() -> Result<()> {
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                let config = DecodeConfig::default();
+                let (reply, _, (seq, rings)) =
+                    request(&model, &device, &config, None, &[5, 1], 64)?;
+                assert_eq!(reply.stop, Stop::Eos, "{device:?}");
+                let mut s = DecodeSession::from_parts(&model, seq, device.clone(), rings)
+                    .with_config(config.clone());
+                let (pos, kept) = (s.pos(), s.tokens().len());
+                assert!(
+                    pos > kept,
+                    "{device:?}: no overrun to reconcile ({pos} vs {kept})"
+                );
+                s.reconcile();
+                assert_eq!((s.pos(), s.tokens().len()), (kept, kept), "{device:?}");
+                s.reconcile();
+                assert_eq!(s.pos(), kept, "{device:?}: a second call moved it");
+                let mut prompt = vec![5, 1];
+                prompt.extend_from_slice(&reply.tokens);
+                prompt.push(2);
+                let (next, _, _) =
+                    request(&model, &device, &config, Some(s.into_parts()), &prompt, 8)?;
+                assert_eq!(next.reuse, ReuseAction::Extend, "{device:?}");
+                assert_eq!(next.reused, kept, "{device:?}");
             }
             Ok(())
         }
@@ -1255,19 +1308,21 @@ mod tests {
 
         /// Every `--readback` spelling (and none) × the adaptive commit (unset,
         /// on, off) × the lookahead (unset, 0, 1) × the commit budget (unset,
-        /// per-token) × the EOS gate × the stream reader × the fused publish
-        /// (on, off), resolved through `lloom serve`'s option path and served
-        /// the way it serves them: the options are refused at startup naming
-        /// the knob the arm cannot carry
-        /// (the EOS gate, the stream reader), or every request is answered and
-        /// streams what it returns. A request is never where a combination is
-        /// refused.
+        /// per-token) × the EOS gate (unset, on, off) × the stream reader ×
+        /// the fused publish (on, off), resolved through `lloom serve`'s
+        /// option path and served the way it serves them: the options are
+        /// refused at startup naming the stream reader where no request could
+        /// stream, or every request is answered and streams what it returns.
+        /// A request is never where a combination is refused, and a knob that
+        /// defaults on (the adaptive commit, the EOS gate) is never refused.
         ///
         /// Each reply reports the arm that ran: it names the adaptive commit
         /// iff the loop closed a buffer adaptively (the length request runs
-        /// past `run_ahead`, so an adaptive run closes at least one). Where the
-        /// device carries a reader, that is also the arm the options resolve
-        /// to, which is what the load line renders.
+        /// past `run_ahead`, so an adaptive run closes at least one), and the
+        /// EOS gate armed iff the run was adaptive and the gate is on, fired
+        /// iff the run ended on EOS. Where the device carries a reader, that
+        /// is also the arm the options resolve to, which is what the load
+        /// line renders.
         #[cfg(feature = "serve")]
         #[test]
         fn every_readback_spelling_and_commit_arm_serves_or_is_refused_at_startup() -> Result<()> {
@@ -1283,7 +1338,7 @@ mod tests {
                 for adaptive in [None, Some("true"), Some("false")] {
                     for lookahead in [None, Some("0"), Some("1")] {
                         for commit in [None, Some("per-token")] {
-                            for gate in [false, true] {
+                            for gate in [None, Some("true"), Some("false")] {
                                 for reader in [false, true] {
                                     let mut a: Vec<String> = Vec::new();
                                     if let Some(s) = spelling {
@@ -1298,8 +1353,8 @@ mod tests {
                                     if let Some(v) = commit {
                                         a.extend(["--commit-budget".into(), v.to_string()]);
                                     }
-                                    if gate {
-                                        a.push("--eos-gate".into());
+                                    if let Some(v) = gate {
+                                        a.push(format!("--eos-gate={v}"));
                                     }
                                     if reader {
                                         a.push("--stream-reader".into());
@@ -1313,35 +1368,35 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(combos.len(), 10 * 3 * 3 * 2 * 2 * 2 * 2);
+            assert_eq!(combos.len(), 10 * 3 * 3 * 2 * 3 * 2 * 2);
             let mut failures: Vec<String> = Vec::new();
             let mut vacuous: Vec<String> = Vec::new();
             let mut refusals = std::collections::BTreeMap::new();
             for device in devices() {
                 let model = Chain::new(&device)?;
                 // (refused at startup, served, replies that ran adaptive,
-                // served combinations whose flags asked for it and did not)
+                // served combinations whose flags asked for it and did not,
+                // greedy replies the EOS gate armed / fired on)
                 let (mut refused, mut served, mut adaptive_ran, mut clamped) = (0, 0, 0, 0);
+                let (mut gated, mut gate_fired) = (0, 0);
                 let failed_before = failures.len();
                 for argv in &combos {
                     let label = format!("{device:?} [{}]", argv.join(" "));
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                        || -> Result<std::result::Result<(bool, bool), String>> {
+                        || -> Result<std::result::Result<(bool, bool, usize, usize), String>> {
                             let cli = Cli::parse_from(
                                 std::iter::once("t".to_string()).chain(argv.iter().cloned()),
                             );
                             let config = match crate::app::resolve_options_uninstalled(&cli.common)
                             {
                                 Err(e) => {
-                                    // Only an explicit knob the arm cannot carry is
-                                    // refused, and the refusal names it.
+                                    // Only an explicit knob that defaults off and the
+                                    // arm cannot carry is refused, and the refusal
+                                    // names it.
                                     let e = e.to_string();
-                                    let names = |flag: &str, key: &str| {
-                                        argv.iter().any(|a| a == flag) && e.contains(key)
-                                    };
                                     assert!(
-                                        names("--eos-gate", "eos_gate")
-                                            || names("--stream-reader", "stream_reader"),
+                                        argv.iter().any(|a| a == "--stream-reader")
+                                            && e.contains("stream_reader"),
                                         "{label}: refused without naming a knob it set: {e}"
                                     );
                                     return Ok(Err(e));
@@ -1349,6 +1404,7 @@ mod tests {
                                 Ok(o) => o.decode,
                             };
                             let (mut ran_adaptive, mut was_clamped) = (false, false);
+                            let (mut armed, mut fired) = (0usize, 0usize);
                             let mut held = None;
                             for (prompt, max) in [(&[5u32, 1][..], 64), (&[0u32][..], 24)] {
                                 let (want, hit) = chain(*prompt.last().expect("a prompt"), max);
@@ -1374,6 +1430,23 @@ mod tests {
                                     !ran || says,
                                     "{at}: ran the adaptive commit and does not say so"
                                 );
+                                let gate_on = says && config.readback.eos_gate;
+                                assert_eq!(
+                                    got.stats.eos_gate.is_some(),
+                                    gate_on,
+                                    "{at}: the EOS gate armed={}, adaptive={says} eos_gate={}",
+                                    got.stats.eos_gate.is_some(),
+                                    config.readback.eos_gate
+                                );
+                                if let Some(report) = got.stats.eos_gate {
+                                    assert_eq!(
+                                        report.fired, hit,
+                                        "{at}: the gate fired={}",
+                                        report.fired
+                                    );
+                                    armed += 1;
+                                    fired += report.fired as usize;
+                                }
                                 if !hit {
                                     assert_eq!(says, ran, "{at}: the name says adaptive={says}, the loop ran adaptive={ran}");
                                     ran_adaptive = ran;
@@ -1416,7 +1489,7 @@ mod tests {
                                 );
                                 assert_eq!(got.text, streamed, "{at}: the reply's text");
                             }
-                            Ok(Ok((ran_adaptive, was_clamped)))
+                            Ok(Ok((ran_adaptive, was_clamped, armed, fired)))
                         },
                     ));
                     match outcome {
@@ -1424,10 +1497,12 @@ mod tests {
                             refused += 1;
                             *refusals.entry(e).or_insert(0usize) += 1;
                         }
-                        Ok(Ok(Ok((r, c)))) => {
+                        Ok(Ok(Ok((r, c, g, f)))) => {
                             served += 1;
                             adaptive_ran += r as usize;
                             clamped += c as usize;
+                            gated += g;
+                            gate_fired += f;
                         }
                         Ok(Err(e)) => failures.push(format!("{label}: {e}")),
                         Err(p) => failures.push(
@@ -1438,7 +1513,7 @@ mod tests {
                         ),
                     }
                 }
-                eprintln!("{device:?}: {served} served, {refused} refused at startup, {adaptive_ran} ran adaptive, {clamped} asked for it and ran the fixed cadence");
+                eprintln!("{device:?}: {served} served, {refused} refused at startup, {adaptive_ran} ran adaptive, {clamped} asked for it and ran the fixed cadence, {gated} greedy replies gated, {gate_fired} fired");
                 let failed = failures.len() - failed_before;
                 eprintln!("{device:?}: {failed} failed");
                 for f in &failures[failed_before..] {
@@ -1451,6 +1526,11 @@ mod tests {
                 if device.is_metal() && (adaptive_ran == 0 || clamped == 0) {
                     vacuous.push(format!(
                         "{device:?}: the attribution check saw one arm only"
+                    ));
+                }
+                if device.is_metal() && (gated == 0 || gate_fired == 0 || gated == gate_fired) {
+                    vacuous.push(format!(
+                        "{device:?}: the gate check saw {gated} gated replies, {gate_fired} fired"
                     ));
                 }
             }

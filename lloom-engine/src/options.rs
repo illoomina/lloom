@@ -161,7 +161,7 @@ pub struct ReadbackConfig {
     /// Under the adaptive commit: the most steps one buffer holds before it closes regardless (0 = 8).
     #[opt]
     pub run_ahead: usize,
-    /// Under the adaptive commit: the EOS gate — the kernels past an EOS return at once (lloom #735 step 4).
+    /// The EOS gate: the kernels queued past an EOS return at once, so the cache ends at the EOS. Rides the adaptive commit; off where the adaptive commit does not run, or under the ICB replay executor.
     #[opt(bool)]
     pub eos_gate: bool,
     /// Under the adaptive commit: publish with the fused argmax·eos·stamp kernel (off = the six-launch chain, the A/B arm).
@@ -176,9 +176,9 @@ pub struct ReadbackConfig {
 }
 
 impl Default for ReadbackConfig {
-    /// The crown: the ring polled, one forward of lookahead, a commit every
-    /// eight steps, the adaptive commit — `ReadbackArm::CROWN`, what `lloom
-    /// serve` has run since #702.
+    /// The flow: the ring polled, one forward of lookahead, the adaptive
+    /// commit with its reader, and the EOS gate — `ReadbackArm::CROWN` plus
+    /// the gate (`docs/dispatch.md` §11.5z-xiv).
     fn default() -> Self {
         ReadbackConfig {
             kind: ReadbackKind::Auto,
@@ -188,7 +188,7 @@ impl Default for ReadbackConfig {
             commit_budget: CommitBudget::steps(8).expect("8 > 0"),
             adaptive_commit: true,
             run_ahead: 0,
-            eos_gate: false,
+            eos_gate: true,
             fused_publish: true,
             stream_reader: false,
             wake_cadence: WAKE_LIVE_EVERY_DEFAULT,
@@ -271,7 +271,9 @@ impl ReadbackConfig {
 
     /// Why the adaptive commit this group asks for does not run, or `None`
     /// when it runs or is not asked for (or the kind is `blocking`, whose
-    /// arm has no cadence). Printed at load beside the arm that runs.
+    /// arm has no cadence). The EOS gate rides the adaptive commit, so the
+    /// note names it too when it is on. Printed at load beside the arm that
+    /// runs.
     pub fn adaptive_clamp(&self) -> Option<String> {
         if !self.adaptive_commit || self.kind == ReadbackKind::Blocking {
             return None;
@@ -279,8 +281,13 @@ impl ReadbackConfig {
         let ring = self.requested_ring_arm();
         ring.why_not_adaptive(self.fused_publish).map(|why| {
             format!(
-                "adaptive_commit is off on {}: {why}; the ring runs on the fixed cadence",
-                ring.resolved(self.fused_publish).name()
+                "adaptive_commit is off on {}: {why}; the ring runs on the fixed cadence{}",
+                ring.resolved(self.fused_publish).name(),
+                if self.eos_gate {
+                    ", without the EOS gate that rides it"
+                } else {
+                    ""
+                }
             )
         })
     }
@@ -319,22 +326,12 @@ impl ReadbackConfig {
     }
 
     /// The refusals `lfm2-chat` makes before a run, made here once so every
-    /// binary refuses the same combinations with the same reasons.
+    /// binary refuses the same combinations with the same reasons. Only a
+    /// knob that defaults off is refused: one that defaults on (the adaptive
+    /// commit, the EOS gate that rides it) is clamped where the arm cannot
+    /// carry it ([`Self::adaptive_clamp`]), or every fixed-cadence arm would
+    /// be refused over a default nobody set.
     pub fn check(&self) -> Result<(), String> {
-        if self.eos_gate && !self.adaptive_commit {
-            return Err("eos_gate needs adaptive_commit (`--eos-gate` needs `--adaptive-commit`)".into());
-        }
-        if self.eos_gate && self.kind != ReadbackKind::Blocking {
-            if let Some(why) = self
-                .requested_ring_arm()
-                .why_not_adaptive(self.fused_publish)
-            {
-                return Err(format!(
-                    "eos_gate needs the adaptive commit, and {} cannot run it: {why}",
-                    self.ring_arm().name()
-                ));
-            }
-        }
         if self.stream_reader && self.kind != ReadbackKind::Blocking {
             let ring = self.ring_arm();
             if let Some(why) = ring.why_not_stream_reader(self.fused_publish) {
@@ -349,10 +346,6 @@ impl ReadbackConfig {
         if self.lookahead > 1 {
             return Err(format!("lookahead {} is not 0 or 1", self.lookahead));
         }
-        // `adaptive_commit` and `eos_gate` on the blocking arm are not an
-        // error: the arm reads every token back and the cadence knobs do not
-        // apply to it (the report line renders `blocking`, never a cadence,
-        // §7.1a-i).
         Ok(())
     }
 }
@@ -989,6 +982,16 @@ pub struct ExecutorConfig {
 }
 
 impl ExecutorConfig {
+    /// Why the EOS gate cannot run under these arms, or `None`. The replay
+    /// executor encodes recorded dispatches, which the gate's binding does
+    /// not reach, and `Device::eos_gate_begin` refuses an installed executor.
+    pub fn refuses_eos_gate(&self) -> Option<&'static str> {
+        self.replay.then_some(
+            "the ICB replay executor is installed, and the gate reaches directly encoded \
+             dispatches only",
+        )
+    }
+
     /// The arms for a report line, from the group that was installed.
     pub fn line(&self) -> String {
         format!(
@@ -1124,11 +1127,16 @@ mod tests {
         assert!(ReadbackConfig::apply_spelling(&mut cfg, "ring-x").is_err());
     }
 
+    /// The default is the flow: the crown's ring with the adaptive commit
+    /// and the EOS gate, and the arm it resolves to names no clamp.
     #[test]
     fn the_default_is_the_crown() {
         let cfg = DecodeConfig::default();
         assert_eq!(cfg.readback.arm(), ReadbackArm::Auto);
         assert_eq!(cfg.readback.ring_arm(), RingArm::CROWN);
+        assert!(cfg.readback.eos_gate, "the EOS gate is on by default");
+        assert_eq!(cfg.readback.adaptive_clamp(), None);
+        assert!(cfg.check().is_ok());
         let opts = cfg.options(7, ReadbackArm::Ring(cfg.readback.ring_arm()), 0);
         assert_eq!(opts.lookahead, 1);
         assert_eq!(opts.budget.period(), 8);
@@ -1163,7 +1171,12 @@ mod tests {
         assert!(cfg.check().is_ok(), "the cadence knobs are ignored on the blocking arm, not refused");
         cfg.set("readback.eos_gate", "true").unwrap();
         cfg.set("readback.adaptive_commit", "false").unwrap();
-        assert!(cfg.check().is_err(), "the EOS gate needs the adaptive commit");
+        assert!(
+            cfg.check().is_ok(),
+            "the EOS gate rides the adaptive commit, not refused without it"
+        );
+        cfg.set("readback.eos_gate", "false").unwrap();
+        assert!(!cfg.readback.eos_gate, "the ungated arm stays selectable");
     }
 
     #[test]
@@ -1205,8 +1218,9 @@ mod tests {
     }
 
     /// A ring arm that cannot carry the adaptive commit — the flag EOS read,
-    /// or no lookahead — runs the fixed cadence, says why at load, and
-    /// refuses the EOS gate by name. The crown and an explicit off say nothing.
+    /// or no lookahead — runs the fixed cadence and says why at load, naming
+    /// the EOS gate that rides it; neither default-on knob is refused. The
+    /// crown and an explicit off say nothing.
     #[test]
     fn an_arm_that_cannot_carry_the_adaptive_commit_runs_the_fixed_cadence() {
         let mut ring = ReadbackConfig::default();
@@ -1223,13 +1237,18 @@ mod tests {
         assert_eq!(ring.arm(), ReadbackArm::Ring(flag_fixed));
         let note = ring.adaptive_clamp().expect("the clamp is named");
         assert!(
-            note.contains("ring lookahead=1 commit_steps=8") && note.contains("flag"),
+            note.contains("ring lookahead=1 commit_steps=8")
+                && note.contains("flag")
+                && note.contains("without the EOS gate"),
             "{note}"
         );
-        assert!(ring.check().is_ok());
-        ring.eos_gate = true;
-        let err = ring.check().unwrap_err();
-        assert!(err.contains("eos_gate") && err.contains("flag"), "{err}");
+        assert!(
+            ring.eos_gate && ring.check().is_ok(),
+            "the default gate is clamped, not refused"
+        );
+        ring.eos_gate = false;
+        let note = ring.adaptive_clamp().expect("the clamp is named");
+        assert!(!note.contains("EOS gate"), "{note}");
 
         let mut la0 = ReadbackConfig {
             lookahead: 0,

@@ -1065,6 +1065,32 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// See `Device::ring_stamp`. Storages with byte offsets.
+    pub fn ring_stamp(
+        &self,
+        step: (&crate::MetalStorage, usize),
+        generation: u32,
+        certified: [(&crate::MetalStorage, usize); 2],
+    ) -> Result<()> {
+        fn bo(s: &crate::MetalStorage, off: usize) -> crate::kernels::BufferOffset<'_> {
+            crate::kernels::BufferOffset {
+                buffer: s.buffer(),
+                offset_in_bytes: off,
+            }
+        }
+        let encoder = self.command_encoder()?;
+        crate::kernels::call_ring_stamp(
+            &self.device,
+            &encoder,
+            &self.kernels,
+            bo(step.0, step.1),
+            generation,
+            certified.map(|(s, off)| bo(s, off)),
+        )
+        .map_err(MetalError::from)?;
+        Ok(())
+    }
+
     pub fn eos_gate_end(&self) -> crate::EosGateReport {
         self.kernels.set_eos_gated(false);
         self.commands.eos_gate().end()

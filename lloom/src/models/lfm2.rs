@@ -276,9 +276,11 @@ impl Lfm2Config {
 /// no resident bytes beyond `slack`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConvState {
-    /// `narrow` + `Tensor::cat` — reallocates and copies the whole state every
-    /// token (`DESIGN.md` §6.1). The correctness bar the rings are compared
-    /// against, and the arm every recorded digest belongs to.
+    /// An `l_cache`-wide window shifted one column per token, in place in the
+    /// storage the cache owns: the tail gathered to a scratch and written
+    /// back, the new column appended — three copies per layer per token
+    /// (`DESIGN.md` §6.1, §11.5z-x). The correctness bar the rings are
+    /// compared against, and the arm every recorded digest belongs to.
     #[default]
     Shuffle,
     /// A sliding write index into an `l_cache + k + slack`-wide buffer
@@ -303,7 +305,7 @@ pub enum ConvState {
 /// Slack slots when `--conv-state ring` is given without one.
 ///
 /// 16 puts the amortised wrap cost at one extra copy per 17 tokens — 0.06
-/// dispatches per conv layer per token against the 2 the shuffle pays — while
+/// dispatches per conv layer per token against the 3 the shuffle pays — while
 /// costing 16 × 2048 × 2 B × 22 = 1.375 MiB of resident state. Past ~64 the
 /// curve is flat and the memory is not.
 const DEFAULT_RING_SLACK: usize = 16;
@@ -4567,7 +4569,9 @@ impl Cache {
     /// Per arm: the KV slabs and the paged pool decrement their lengths (the
     /// rows past the new end were never written; the next append overwrites
     /// them). `Shuffle` keeps no per-step conv counter — its phase never moves
-    /// on a single-token pass — so nothing to undo. `RotatingRing` advanced
+    /// on a single-token pass — so nothing to undo, provided a gated step left
+    /// the state as it was: the fused step carries it through, the unfused
+    /// step writes it in place with gated copies (§11.5z-x). `RotatingRing` advanced
     /// `conv_phase`/`conv_history` per step on the host and is stepped back
     /// the same way. Refused: `KvAppend::Cat` (its length is the tensor's; a
     /// gated `cat` still grew it with unwritten rows — narrowing it is a copy
@@ -7115,23 +7119,29 @@ impl ShortConv {
                     self.conv_fold(&window, &conv_weight)?
                 }
                 ConvState::Shuffle => {
-                    // Token-by-token generation: use cached state
-                    let mut state = match &cache.conv_states[block_idx] {
-                        Some(s) => s.clone(),
-                        None => Tensor::zeros(
-                            (b_sz, self.hidden_size, self.l_cache),
-                            bx.dtype(),
-                            bx.device(),
-                        )?,
+                    // The shift is written INTO the storage the cache owns, as
+                    // the prefill writes it, never into a fresh tensor swapped
+                    // in: a step gated past an EOS must leave the state as it
+                    // was, and it skips writes, not swaps. At `l_cache > 1`
+                    // both writes are strided (a window narrower than the
+                    // state), so they are the gated `copy2d`, never a blit.
+                    // (`docs/dispatch.md` §11.5z-x)
+                    let state = match &cache.conv_states[block_idx] {
+                        Some(s) => s.contiguous()?,
+                        None => {
+                            let _declared = lloom_tensor::EscapeGuard::new();
+                            Tensor::zeros(
+                                (b_sz, self.hidden_size, self.l_cache),
+                                bx.dtype(),
+                                bx.device(),
+                            )?
+                        }
                     };
-
-                    // Shift cache and add new token
                     if self.l_cache > 1 {
-                        let tail = state.narrow(2, 1, self.l_cache - 1)?;
-                        state = Tensor::cat(&[tail, bx.clone()], 2)?;
-                    } else {
-                        state = bx.clone();
+                        let tail = self.window_tail(&state, cache.conv_phase)?;
+                        state.slice_set(&tail, 2, 0)?;
                     }
+                    state.slice_set(&bx, 2, self.l_cache - 1)?;
 
                     if cache.use_kv_cache {
                         cache.set_conv_state(block_idx, state.clone())?;

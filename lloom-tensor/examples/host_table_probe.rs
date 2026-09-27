@@ -34,9 +34,9 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLAllocation, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
-    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
-    MTLDevice, MTLEvent, MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor,
-    MTLResourceOptions, MTLSharedEvent, MTLSize,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLLibrary, MTLResidencySet,
+    MTLResidencySetDescriptor, MTLResourceOptions, MTLSharedEvent, MTLSize,
 };
 use std::ffi::c_void;
 use std::os::fd::AsRawFd;
@@ -347,7 +347,9 @@ impl Mapping {
 
     fn resident_fraction(&self) -> f64 {
         let r = self.residency();
-        r.iter().filter(|&&b| b as i32 & libc::MINCORE_INCORE != 0).count() as f64
+        r.iter()
+            .filter(|&&b| b as i32 & libc::MINCORE_INCORE != 0)
+            .count() as f64
             / r.len().max(1) as f64
     }
 
@@ -711,7 +713,8 @@ fn nocopy(
         // submission of the buffer.
         let chk = pick_rows(&map, rows, row_bytes, i as u64 + 1);
         dog.reset_peak();
-        let (wall_ms, gpu_ms, err) = gather_once(&gpu, &table, &chk, &offs_buf, &out, rows, row_bytes)?;
+        let (wall_ms, gpu_ms, err) =
+            gather_once(&gpu, &table, &chk, &offs_buf, &out, rows, row_bytes)?;
         let resident_after = chk
             .offs
             .iter()
@@ -758,11 +761,15 @@ fn nocopy(
         worst = worst.max(stage(
             "invalidated",
             w0,
-            &format!("msync_rc={inval} resident_frac={frac_inval:.4} {}", task_line()),
+            &format!(
+                "msync_rc={inval} resident_frac={frac_inval:.4} {}",
+                task_line()
+            ),
         ));
         let chk_b = pick_rows(&map, rows, row_bytes, 0xB0B + i as u64);
         dog.reset_peak();
-        let (wall_ms, gpu_ms, err) = gather_once(&gpu, &table, &chk_b, &offs_buf, &out, rows, row_bytes)?;
+        let (wall_ms, gpu_ms, err) =
+            gather_once(&gpu, &table, &chk_b, &offs_buf, &out, rows, row_bytes)?;
         let frac_b = map.resident_fraction();
         let bad = verify_rows(&file, region_off, &chk_b, &out, row_bytes)?;
         worst = worst.max(stage(
@@ -782,11 +789,7 @@ fn nocopy(
         let chk2 = pick_rows(&map, rows, row_bytes, 0x5151 + i as u64);
         // SAFETY: offs_buf holds `rows` u64s; the previous buffer completed.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                chk2.offs.as_ptr(),
-                contents(&offs_buf) as *mut u64,
-                rows,
-            )
+            std::ptr::copy_nonoverlapping(chk2.offs.as_ptr(), contents(&offs_buf) as *mut u64, rows)
         };
         ev_value += 1;
         dog.reset_peak();
@@ -1120,8 +1123,14 @@ fn event(trials: usize, floats: usize, long_park_ms: u64) -> Result<()> {
             rig.ev.setSignaledValue(ev_v);
         }
     }
-    summary("presignalled_publish_to_consume_seen (wait already satisfied)", &mut pre);
-    summary("presignalled_control_publish_to_consume_seen (no wait)", &mut pre_ctl);
+    summary(
+        "presignalled_publish_to_consume_seen (wait already satisfied)",
+        &mut pre,
+    );
+    summary(
+        "presignalled_control_publish_to_consume_seen (no wait)",
+        &mut pre_ctl,
+    );
     summary("commit_to_publish_seen", &mut pub_after_commit);
     summary("control_publish_to_consume_seen (no wait)", &mut ctl);
     summary("signal_to_consume_seen (wait mid-buffer)", &mut resume);

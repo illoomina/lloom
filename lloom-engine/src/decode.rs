@@ -1578,6 +1578,9 @@ mod tests {
                 }
             }
             assert_eq!(combos.len(), 10 * 3 * 3 * 2 * 3 * 2 * 2);
+            // What one served combination saw: ran adaptive, was clamped, greedy
+            // replies gated, of those fired, replies streamed by a reader, by the loop.
+            type Seen = (bool, bool, usize, usize, usize, usize);
             let mut failures: Vec<String> = Vec::new();
             let mut vacuous: Vec<String> = Vec::new();
             let mut refusals = std::collections::BTreeMap::new();
@@ -1594,7 +1597,7 @@ mod tests {
                 for argv in &combos {
                     let label = format!("{device:?} [{}]", argv.join(" "));
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                        || -> Result<std::result::Result<(bool, bool, usize, usize, usize, usize), String>> {
+                        || -> Result<std::result::Result<Seen, String>> {
                             let cli = Cli::parse_from(
                                 std::iter::once("t".to_string()).chain(argv.iter().cloned()),
                             );

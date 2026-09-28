@@ -413,6 +413,11 @@ fn hc_mix_on() -> bool {
 /// prefill's take the composed chain.
 pub(crate) const HC_MIX_MAX_ROWS: usize = 1;
 
+/// The most streams the fused HC prologue takes: `hc_mix_a` holds one scale
+/// per stream in a threadgroup array of `HC_MAX_N` (`qwen4exp.metal`), and a
+/// carry of more streams writes past it. The checkpoint has four.
+pub(crate) const HC_MIX_MAX_N: usize = 8;
+
 /// The HC prologue as two launches (`HcMixA`, `HcMixB`) when the bracket's
 /// weights are f16 on Metal and the carry is a decode's rows: `(mixed
 /// [b, seq, d], inject [b, seq, n])`. `None` elsewhere (the composed chain).
@@ -466,7 +471,11 @@ pub(crate) fn hc_mix_pair(
     };
     let (b, seq, nd) = h.dims3().ok()?;
     let rows = b * seq;
-    if nd != n * d || rows == 0 || !shape_req!(hc_mix_fused, rows <= HC_MIX_MAX_ROWS; rows) {
+    if nd != n * d
+        || rows == 0
+        || !shape_req!(hc_mix_fused, rows <= HC_MIX_MAX_ROWS; rows)
+        || !shape_req!(hc_mix_fused, n <= HC_MIX_MAX_N; n)
+    {
         return None;
     }
     let lr = w_down.dim(0).ok()?;

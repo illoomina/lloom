@@ -198,6 +198,9 @@ struct Gguf<'a, R: Read + Seek> {
     shards: Vec<Shard<'a, R>>,
     index: HashMap<String, usize>,
     device: Device,
+    /// Keep float matrices f32 (`QMatMul::Tensor`) rather than f16 stems:
+    /// the CPU reference's precision ([`Qwen4Exp::from_gguf_reference`]).
+    dense_f32: bool,
     /// Every tensor read, for the schema's debug check (`build`).
     #[cfg(debug_assertions)]
     read: std::cell::RefCell<std::collections::BTreeSet<String>>,
@@ -217,6 +220,7 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
             shards,
             index,
             device: device.clone(),
+            dense_f32: false,
             #[cfg(debug_assertions)]
             read: Default::default(),
         })
@@ -274,6 +278,9 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     fn qmat(&mut self, name: &str) -> Result<QMatMul> {
         let qt = self.qtensor(name)?;
         match qt.dtype() {
+            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 if self.dense_f32 => {
+                Ok(QMatMul::Tensor(qt.dequantize(&self.device)?))
+            }
             GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => {
                 Ok(QMatMul::TensorF16(qt.dequantize_f16(&self.device)?))
             }
@@ -792,6 +799,36 @@ impl Qwen4Exp<Resident> {
         )?;
         admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
         build(&mut gg, device, opts, |gg, l| {
+            let p = format!("blk.{l}");
+            Ok(Resident::new(
+                gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,
+                gg.packed(&format!("{p}.ffn_up_exps.weight"))?,
+                gg.packed(&format!("{p}.ffn_down_exps.weight"))?,
+            ))
+        })
+    }
+
+    /// Load from an open GGUF shard with every float matrix kept f32
+    /// (`QMatMul::Tensor`) instead of an f16 stem: f32 activations over the
+    /// file's values, the precision a CPU reference runs at. Not a serving
+    /// arm — the stems' f16 GEMV and its fused stacks are not taken.
+    pub fn from_gguf_reference<R: Read + Seek>(
+        content: Content,
+        reader: &mut R,
+        device: &Device,
+    ) -> Result<Self> {
+        let mut gg = Gguf::new(
+            vec![Shard {
+                content,
+                reader,
+                path: None,
+            }],
+            device,
+        )?;
+        gg.dense_f32 = true;
+        let opts = LoadOptions::default();
+        admit_load(&plan_load(&gg, device, opts.fraction(), None))?;
+        build(&mut gg, device, &opts, |gg, l| {
             let p = format!("blk.{l}");
             Ok(Resident::new(
                 gg.packed(&format!("{p}.ffn_gate_exps.weight"))?,

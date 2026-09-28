@@ -96,7 +96,8 @@ pub fn call_hc_norm(
 /// carries, into one flat buffer `[rows·n·d] xn | [rows·lr] lo | [rows·n]
 /// inject`. `n_inj` is `n` with an inject weight and 0 without (the inject
 /// block is then zeros; `w_inject` is unread). Threadgroups `(⌈(lr+n)/8⌉, rows)`
-/// of 256 threads, a simdgroup per output row.
+/// of 256 threads, a simdgroup per output row. `n` ≤ 8 (the threadgroup
+/// stream scales).
 #[allow(clippy::too_many_arguments)]
 pub fn call_hc_mix_a(
     device: &Device,
@@ -115,6 +116,11 @@ pub fn call_hc_mix_a(
     w_inject: BufferOffset,
     out: &Buffer,
 ) -> Result<(), MetalKernelError> {
+    if n > HC_MIX_MAX_N {
+        return Err(MetalKernelError::LoadLibraryError(format!(
+            "hc_mix_a: {n} streams above the threadgroup scales of {HC_MIX_MAX_N}"
+        )));
+    }
     let pipeline = kernels.load_pipeline(device, Source::Qwen4Exp, "hc_mix_a_f32")?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
@@ -194,6 +200,9 @@ const HC_MIX_SG: usize = 8;
 const HC_MIX_OUT: usize = 1;
 /// The most `lr` `hc_mix_b` stages in threadgroup memory (`HC_MIX_MAX_LR`).
 const HC_MIX_MAX_LR: usize = 1024;
+/// The most streams `hc_mix_a` holds a scale for in threadgroup memory
+/// (`HC_MAX_N`).
+const HC_MIX_MAX_N: usize = 8;
 
 /// `hc_collapse_f32`: `out [rows, d] = mean_s(xn · gate)` over the `n` streams.
 #[allow(clippy::too_many_arguments)]

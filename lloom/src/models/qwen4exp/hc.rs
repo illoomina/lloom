@@ -417,6 +417,115 @@ mod tests {
         }
     }
 
+    /// Past eight streams the fused prologue must decline: `hc_mix_a` keeps
+    /// one scale per stream in a threadgroup array of eight, and a carry of
+    /// more streams wrote past it and returned the wrong mix (the shape
+    /// campaign found it at `hc_count` 10–48, rel 0.1–0.6 against the CPU).
+    /// At 8 the pair runs; above, `mix`'s composed chain does — each against
+    /// the CPU's composed chain over the same f16-rounded weights.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fused_prologue_declines_past_its_stream_scales() {
+        let cpu = Device::Cpu;
+        let gpu = Device::new_metal(0).unwrap();
+        let (d, lr) = (256usize, 64usize);
+        let mut bad = Vec::new();
+        for n in [8usize, 9, 10, 16] {
+            let f16_rounded = |out: usize, inp: usize, seed: f32| -> Tensor {
+                Tensor::from_vec(
+                    (0..out * inp)
+                        .map(|i| ((i as f32 * 0.0117 + seed).sin()) * 0.03)
+                        .collect::<Vec<_>>(),
+                    (out, inp),
+                    &cpu,
+                )
+                .unwrap()
+                .to_dtype(DType::F16)
+                .unwrap()
+            };
+            let gamma = Tensor::from_vec(
+                (0..n * d)
+                    .map(|i| 1.0 + 0.1 * ((i as f32) * 0.3).sin())
+                    .collect::<Vec<f32>>(),
+                n * d,
+                &cpu,
+            )
+            .unwrap();
+            let (wd, wu, wi) = (
+                f16_rounded(lr, n * d, 1.0),
+                f16_rounded(n * d, lr, 2.0),
+                f16_rounded(n, n * d, 3.0),
+            );
+            let hc_cpu = HyperConnection::new(
+                gamma.clone(),
+                QMatMul::Tensor(wd.to_dtype(DType::F32).unwrap()),
+                QMatMul::Tensor(wu.to_dtype(DType::F32).unwrap()),
+                Some(QMatMul::Tensor(wi.to_dtype(DType::F32).unwrap())),
+                n,
+                d,
+                1e-6,
+            )
+            .unwrap();
+            let hc_gpu = HyperConnection::new(
+                gamma.to_device(&gpu).unwrap(),
+                QMatMul::TensorF16(wd.to_device(&gpu).unwrap()),
+                QMatMul::TensorF16(wu.to_device(&gpu).unwrap()),
+                Some(QMatMul::TensorF16(wi.to_device(&gpu).unwrap())),
+                n,
+                d,
+                1e-6,
+            )
+            .unwrap();
+            let h = Tensor::from_vec(
+                (0..n * d)
+                    .map(|i| ((i as f32 * 0.021).cos()) * 0.8)
+                    .collect::<Vec<f32>>(),
+                (1, 1, n * d),
+                &cpu,
+            )
+            .unwrap();
+            let (m_cpu, _) = hc_cpu.mix(&h).unwrap();
+            let h_gpu = h.to_device(&gpu).unwrap();
+            let fused = super::super::kernels::hc_mix_pair(
+                &h_gpu,
+                &hc_gpu.norm_w,
+                &hc_gpu.down,
+                &hc_gpu.up,
+                hc_gpu.inject.as_ref(),
+                n,
+                d,
+                1e-6,
+            );
+            let took = fused.is_some();
+            let (m_gpu, _) = match fused {
+                Some(r) => r.unwrap(),
+                None => hc_gpu.mix(&h_gpu).unwrap(),
+            };
+            let x: Vec<f32> = m_cpu.flatten_all().unwrap().to_vec1().unwrap();
+            let y: Vec<f32> = m_gpu
+                .to_device(&cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let scale = x.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+            let diff = x
+                .iter()
+                .zip(&y)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0f32, f32::max);
+            eprintln!("n {n}: fused pair taken {took}, |gpu - cpu| {diff:e} at scale {scale:e}");
+            if diff > 3e-5 * scale {
+                bad.push(format!("n {n} (pair taken: {took}): {diff:e} at scale {scale:e}"));
+            }
+            if took != (n <= super::super::kernels::HC_MIX_MAX_N) {
+                bad.push(format!("n {n}: pair taken {took}; it takes up to HC_MIX_MAX_N streams"));
+            }
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+
     /// `cargo test -p lloom --release --features metal --lib hc::tests::prologue_bench -- --ignored --nocapture`
     /// (under `lloom-arb measure`): µs per call of the composed Metal
     /// prologue (norm, down·SiLU, up·sigmoid, collapse, inject — five

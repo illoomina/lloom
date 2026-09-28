@@ -1,9 +1,15 @@
-//! The shape campaign over the tiny Qwen4-exp model (`lloom_fuzz::geometry`,
+//! The shape campaign over a family's tiny models (`lloom_fuzz::geometry`,
 //! `docs/porting-models.md` §21.8): geometries searched by the shape probes
 //! and the dispatch census, judged by CPU-vs-Metal parity.
+//!
+//! `--family qwen4exp | lfm2` picks the family; `--manifest` turns a corpus
+//! into the family's manifest (the smallest geometry reaching each point).
 
 use clap::Parser;
-use lloom_fuzz::geometry::{self, Geometry, Outcome, Workload};
+use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
+use lloom::testing::tiny::{Geometry, TinyFamily, ValueLaw, Weights, Workload, MAX_PROMPT};
+use lloom_fuzz::geometry::{self, Outcome};
 use lloom_tensor::Device;
 use std::path::PathBuf;
 
@@ -11,18 +17,31 @@ use std::path::PathBuf;
 struct Args {
     #[command(flatten)]
     cli: lloom_fuzz::campaign::Cli,
+    /// `qwen4exp` or `lfm2`.
+    #[arg(long, default_value = "qwen4exp")]
+    family: String,
+    /// The value law of the weights (`hash[:gain]`, `uniform[:half]`,
+    /// `ramp-sin`, `ramp-mod17`).
+    #[arg(long, default_value = "hash:1")]
+    law: String,
+    /// The weights' seed.
+    #[arg(long, default_value_t = Weights::default().seed)]
+    weight_seed: u64,
     /// The largest CPU-vs-Metal logit difference accepted, relative to the
-    /// CPU logits' largest magnitude.
-    #[arg(long, default_value_t = 2e-2)]
+    /// CPU logits' largest magnitude. The reference computes at f32; the
+    /// Metal arms that cast activations to f16 (the f16-weight GEMM's
+    /// classical route) sit up to a few percent from it at hidden 512, so
+    /// the bound is 5e-2 rather than the spike's 2e-2 — a gross class (a
+    /// non-finite logit, a wrong route) is far outside either.
+    #[arg(long, default_value_t = 5e-2)]
     tol: f32,
     /// Take the fused HC prologue (`QWEN4EXP_HC_MIX`), off by default in the
     /// engine; the campaign reaches its shape checks only with it on.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     hc_mix: bool,
-    /// The seed's dense stems as `TensorF16` (the real checkpoint's kind);
-    /// the tiny fixtures default to f32.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    seed_f16_stems: bool,
+    /// The seed's dense kind, an index into the family's kinds.
+    #[arg(long, default_value_t = 0)]
+    seed_dense: usize,
     /// The seed's prompt length.
     #[arg(long, default_value_t = 1)]
     seed_prompt: usize,
@@ -35,6 +54,13 @@ struct Args {
     /// geometry that reached it, the census labels, the outcome classes.
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Run every input in this directory and write the family's manifest
+    /// (JSON) to `--manifest-out`: the smallest agreeing geometry for each
+    /// probe outcome and census label the corpus reached.
+    #[arg(long)]
+    manifest: Option<PathBuf>,
+    #[arg(long, default_value = "manifest.json")]
+    manifest_out: PathBuf,
     /// Append one line per execution to this file, tab-separated: the
     /// outcome, the largest relative logit difference, the CPU logits'
     /// scale, the geometry, the message, the Unix time in ms, the input hex.
@@ -45,49 +71,81 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     // The census and the tuning are read once, on first use.
     std::env::set_var("CANDLE_METAL_PROFILE", "1");
-    let mut args = Args::parse();
+    let args = Args::parse();
     let mut t = lloom::tuning::Tuning::default();
     t.from_env().map_err(anyhow::Error::msg)?;
     t.qwen4exp.hc_mix = args.hc_mix;
     if lloom::tuning::install(t).is_err() {
         anyhow::bail!("the tuning was read before it was installed");
     }
+    match args.family.as_str() {
+        "qwen4exp" => run::<Qwen4ExpTiny>(args),
+        "lfm2" => run::<Lfm2Tiny>(args),
+        other => anyhow::bail!("--family {other}: qwen4exp | lfm2"),
+    }
+}
 
+fn inputs(dir: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && !p
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        })
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+fn run<F: TinyFamily + 'static>(mut args: Args) -> anyhow::Result<()> {
+    let weights = Weights {
+        law: ValueLaw::parse(&args.law).map_err(anyhow::Error::msg)?,
+        seed: args.weight_seed,
+        ..Weights::default()
+    };
     if args.cli.seeds.is_none() {
-        let dir = args.cli.corpus.with_file_name("geometry-seeds");
+        let dir = args
+            .cli
+            .corpus
+            .with_file_name(format!("geometry-seeds-{}", F::NAME));
         std::fs::create_dir_all(&dir)?;
-        let seed = Geometry::template(Workload {
-            prompt: args.seed_prompt.clamp(1, geometry::MAX_PROMPT),
+        let mut seed = Geometry::template::<F>(Workload {
+            prompt: args.seed_prompt.clamp(1, MAX_PROMPT),
             decode: 1,
-            f16_stems: args.seed_f16_stems,
         });
+        seed.dense = args.seed_dense % F::DENSE_KINDS.len();
         std::fs::write(dir.join("template"), seed.encode())?;
         args.cli.seeds = Some(dir);
     }
 
     let tol = args.tol;
     let devs: std::cell::OnceCell<(Device, Device)> = std::cell::OnceCell::new();
-    let run = move |bytes: &[u8]| -> (Geometry, Outcome) {
+    let exec = move |bytes: &[u8]| -> (Geometry, Outcome) {
         let (cpu, gpu) =
             devs.get_or_init(|| (Device::Cpu, Device::new_metal(0).expect("a Metal device")));
-        let g = Geometry::decode(bytes);
-        let o = geometry::execute(&g, cpu, gpu, tol);
+        let g = Geometry::decode::<F>(bytes);
+        let o = geometry::execute::<F>(&g, weights, cpu, gpu, tol);
         (g, o)
     };
 
     if let Some(path) = &args.show {
-        let mut files = vec![path.clone()];
-        if path.is_dir() {
-            files = std::fs::read_dir(path)?
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.is_file())
-                .collect();
-            files.sort();
-        }
+        let files = if path.is_dir() {
+            inputs(path)?
+        } else {
+            vec![path.clone()]
+        };
         for f in files {
-            let (g, o) = run(&std::fs::read(&f)?);
+            let (g, o) = exec(&std::fs::read(&f)?);
             println!("== {}", f.display());
-            println!("geometry: {}", g.describe());
+            println!(
+                "family: {} law: {} weight_seed: {}",
+                F::NAME,
+                args.law,
+                args.weight_seed
+            );
+            println!("geometry: {}", g.describe::<F>());
             println!("outcome: {o:?}");
             for (i, st) in geometry::last_steps().iter().enumerate() {
                 println!(
@@ -110,11 +168,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     if let Some(dir) = &args.report {
-        let mut run = run;
-        return report(dir, &mut run);
+        let mut exec = exec;
+        return report::<F>(dir, weights, &mut exec);
     }
 
-    lloom_fuzz::campaign::set_structured_mutator(geometry::mutate);
+    if let Some(dir) = &args.manifest {
+        let mut exec = exec;
+        return manifest::<F>(dir, &args, weights, &mut exec);
+    }
+
+    lloom_fuzz::campaign::set_structured_mutator(geometry::mutate::<F>);
     // The model's kernels are compiled at first use, in the process that
     // executes; `--single` keeps that process a re-executed one rather than
     // a forked child (`campaign::Cli::single`). `LLOOM_FUZZ_GEOMETRY_LAUNCHER=1`
@@ -129,8 +192,9 @@ fn main() -> anyhow::Result<()> {
         ),
         None => None,
     };
-    lloom_fuzz::campaign::run(&args.cli, "geometry", move |bytes| {
-        let (g, o) = run(bytes);
+    let name = format!("geometry-{}", F::NAME);
+    lloom_fuzz::campaign::run(&args.cli, &name, move |bytes| {
+        let (g, o) = exec(bytes);
         if let Some(f) = log.as_mut() {
             use std::io::Write;
             let (d, s) = match &o {
@@ -151,52 +215,53 @@ fn main() -> anyhow::Result<()> {
                 f,
                 "{}\t{d:e}\t{s:e}\t{}\t{what}\t{ms}\t{hex}",
                 o.class(),
-                g.describe()
+                g.describe::<F>()
             );
         }
         match o {
-            Outcome::Defect(m) => Err(format!("{m}\ngeometry: {}", g.describe())),
+            Outcome::Defect(m) => Err(format!("{m}\ngeometry: {}", g.describe::<F>())),
             _ => Ok(()),
         }
     })
 }
 
+/// A geometry's size, for "smallest": its weight elements, then its tokens.
+fn size<F: TinyFamily>(g: &Geometry, weights: Weights) -> usize {
+    g.checkpoint::<F>(weights)
+        .and_then(|c| c.schema().ok())
+        .map_or(usize::MAX, |s| s.elements())
+        .saturating_add(g.work.prompt + g.work.decode)
+}
+
 /// The corpus report (`--report`).
-fn report(
+fn report<F: TinyFamily>(
     dir: &std::path::Path,
-    run: &mut impl FnMut(&[u8]) -> (Geometry, Outcome),
+    weights: Weights,
+    exec: &mut impl FnMut(&[u8]) -> (Geometry, Outcome),
 ) -> anyhow::Result<()> {
     use std::collections::BTreeMap;
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.is_file()
-                && !p
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-        })
-        .collect();
-    files.sort();
+    let files = inputs(dir)?;
     let mut probes: BTreeMap<(String, String, bool), (usize, usize, String)> = BTreeMap::new();
     let mut labels: BTreeMap<String, usize> = BTreeMap::new();
     let mut classes: BTreeMap<&'static str, usize> = BTreeMap::new();
     for f in &files {
-        let (g, o) = run(&std::fs::read(f)?);
+        let (g, o) = exec(&std::fs::read(f)?);
         *classes.entry(o.class()).or_default() += 1;
-        let size: usize = g.axes.iter().sum::<usize>() + g.work.prompt + g.work.decode;
+        let size = size::<F>(&g, weights);
         let (ps, ls) = geometry::last_reach();
         for p in ps {
             let e = probes.entry(p).or_insert((0, usize::MAX, String::new()));
             e.0 += 1;
             if size < e.1 {
                 e.1 = size;
-                e.2 = g.describe();
+                e.2 = g.describe::<F>();
             }
         }
         for l in ls {
             *labels.entry(l).or_default() += 1;
         }
     }
+    println!("family: {}", F::NAME);
     println!("inputs: {}", files.len());
     println!("outcomes: {classes:?}");
     println!("probes reached ({}):", probes.len());
@@ -207,5 +272,88 @@ fn report(
     for (l, n) in &labels {
         println!("  {l} {n}");
     }
+    Ok(())
+}
+
+/// The manifest (`--manifest`): every probe outcome and census label the
+/// corpus reached on an AGREEING execution, each assigned the smallest
+/// geometry that reached it; one entry per distinct geometry, with the
+/// points it carries. Points reached only by a refusal or a defect are
+/// listed apart — a drift test cannot replay them as passing.
+fn manifest<F: TinyFamily>(
+    dir: &std::path::Path,
+    args: &Args,
+    weights: Weights,
+    exec: &mut impl FnMut(&[u8]) -> (Geometry, Outcome),
+) -> anyhow::Result<()> {
+    use std::collections::BTreeMap;
+    let files = inputs(dir)?;
+    // point -> (size, geometry bytes)
+    let mut best: BTreeMap<String, (usize, Vec<u8>)> = BTreeMap::new();
+    let mut elsewhere: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut runs: BTreeMap<Vec<u8>, (String, Vec<String>)> = BTreeMap::new();
+    for f in &files {
+        let (g, o) = exec(&std::fs::read(f)?);
+        let (ps, ls) = geometry::last_reach();
+        let points: Vec<String> = ps
+            .iter()
+            .map(|(s, c, ok)| format!("probe|{s}|{c}|{ok}"))
+            .chain(ls.iter().map(|l| format!("census|{l}")))
+            .collect();
+        if !matches!(o, Outcome::Agree { .. }) {
+            for p in points {
+                elsewhere.entry(p).or_insert(o.class());
+            }
+            continue;
+        }
+        let bytes = g.encode();
+        let sz = size::<F>(&g, weights);
+        for p in &points {
+            let e = best.entry(p.clone()).or_insert((usize::MAX, Vec::new()));
+            if sz < e.0 || (sz == e.0 && bytes < e.1) {
+                *e = (sz, bytes.clone());
+            }
+        }
+        runs.insert(bytes, (g.describe::<F>(), points));
+    }
+    let mut entries: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
+    for (p, (_, g)) in &best {
+        entries.entry(g.clone()).or_default().push(p.clone());
+    }
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let json = serde_json::json!({
+        "family": F::NAME,
+        "commit": commit,
+        "law": args.law,
+        "weight_seed": args.weight_seed,
+        "tol": args.tol,
+        "hc_mix": args.hc_mix,
+        "corpus_inputs": files.len(),
+        "entries": entries.iter().map(|(g, pts)| {
+            let (describe, reached) = &runs[g];
+            serde_json::json!({
+                "geometry": g.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "describe": describe,
+                "smallest_for": pts,
+                "reaches": reached,
+            })
+        }).collect::<Vec<_>>(),
+        "reached_only_by_non_agreeing": elsewhere.iter().map(|(p, c)| format!("{p} ({c})")).collect::<Vec<_>>(),
+    });
+    std::fs::write(&args.manifest_out, serde_json::to_string_pretty(&json)?)?;
+    println!(
+        "{}: {} inputs, {} points on agreeing runs, {} entries, {} points only on refusals/defects -> {}",
+        F::NAME,
+        files.len(),
+        best.len(),
+        entries.len(),
+        elsewhere.len(),
+        args.manifest_out.display()
+    );
     Ok(())
 }

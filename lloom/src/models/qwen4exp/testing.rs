@@ -332,6 +332,16 @@ impl TinyFamily for Qwen4ExpTiny {
             &super::loader::LoadOptions::default(),
         )
     }
+
+    /// The loader's f32 arm over the dequantized checkpoint: f32
+    /// activations over the stems' stored values, where the served load's
+    /// `TensorF16` stems would cast the activations to f16 on the CPU.
+    fn reference(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Qwen4Exp<Resident>> {
+        let bytes = gguf_bytes(&ckpt.dequantized(), None)?;
+        let mut r = std::io::Cursor::new(bytes);
+        let content = lloom_tensor::quantized::gguf_file::Content::read(&mut r)?;
+        Qwen4Exp::from_gguf_reference(content, &mut r, dev)
+    }
 }
 
 /// The `qwen4exp.*` header keys for `cfg`, as `Config::from_gguf_metadata`

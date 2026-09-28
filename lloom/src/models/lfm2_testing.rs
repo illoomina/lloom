@@ -6,7 +6,7 @@
 //! `tokenizer.json`, `chat_template.jinja`.
 #![doc(hidden)]
 
-use super::lfm2::{Config, LayerType, Lfm2Config, Model};
+use super::lfm2::{AttnImpl, Config, LayerType, Lfm2Config, Model};
 use crate::nn::var_builder::RecordingBackend;
 use crate::nn::VarBuilder;
 use crate::testing::tiny::backend::TinyBackend;
@@ -151,6 +151,36 @@ impl TinyFamily for Lfm2Tiny {
     fn load(path: &Path, dev: &Device) -> Result<Model> {
         let (model, _) = load_recorded(path, dev, None)?;
         Ok(model)
+    }
+
+    /// f32 on the CPU over the values the in-memory model holds: its dense
+    /// matrices rounded through the dtype it computes in (f16 on Metal by
+    /// the engine's rule), so the reference differs from it by the
+    /// activations' precision alone.
+    fn reference(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Model> {
+        let run = ckpt.dtype.unwrap_or(DType::F16);
+        let mut r = ckpt.dequantized().with_dtype(DType::F32);
+        if r.weights.dense == GgmlDType::F32 {
+            r.weights.dense = match run {
+                DType::F16 => GgmlDType::F16,
+                DType::BF16 => GgmlDType::BF16,
+                _ => GgmlDType::F32,
+            };
+        }
+        Self::build(&r, dev)
+    }
+
+    /// The attention arms: the generic path, `sdpa_vector` /
+    /// `steel_attention`, FlashDecoding. Each falls back to the generic path
+    /// where it does not apply (the CPU, an off-set head dim).
+    const ARMS: &'static [&'static str] = &["generic", "sdpa", "flash"];
+
+    fn set_arm(cfg: &mut Config, arm: usize) {
+        cfg.attn_impl = match arm {
+            1 => AttnImpl::Sdpa,
+            2 => AttnImpl::FlashDecoding,
+            _ => AttnImpl::Generic,
+        };
     }
 }
 

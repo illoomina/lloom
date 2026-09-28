@@ -5,12 +5,23 @@
 //! replaced -- the norm + rope pair fused on `Fused`, the transposed copies
 //! gone on `Strided` and `Fused`.
 //!
-//! Same tiny-model fixture as `lfm2_gemv_epilogue_census.rs`: a fixed ramp
-//! for every weight, so a difference between two arms is the arms'.
+//! The weights are the tiny LFM2's (`lloom::testing::tiny`, keyed by
+//! seed, name and index), so a difference between two arms is the arms'. The
+//! arms agreeing is a shape; the absolute references beside it are the CPU
+//! logits' pinned fingerprint and, on Metal, the CPU backend within a
+//! tolerance (CONTRIBUTING §3.1b) — a defect every arm shares moves both.
 
 use lloom::models::lfm2::{AttnImpl, Cache, Config, KvAppend, LayerType, Model, QkvLayout};
-use lloom::nn::VarBuilder;
+use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::testing::tiny::init::splitmix64;
+use lloom::testing::tiny::{TinyCheckpoint, Weights};
+use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{DType, Device, Result, Tensor};
+
+/// The dispatch recorder is process-global, so no test here runs while a
+/// census test holds its window: another test's dispatches (a construction
+/// dispatches too) would land in it. Held for the whole of each test.
+static RECORDER: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 fn tiny_config(qkv_layout: QkvLayout, attn_impl: AttnImpl) -> Config {
     Config {
@@ -51,59 +62,61 @@ fn tiny_config(qkv_layout: QkvLayout, attn_impl: AttnImpl) -> Config {
     }
 }
 
+/// The tiny LFM2 at `cfg`'s geometry and arms, computing in `dtype`.
 fn build(cfg: &Config, dev: &Device, dtype: DType) -> Result<Model> {
-    let mut tensors = std::collections::HashMap::new();
-    let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
-        let n: usize = shape.iter().product();
-        let v: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect();
-        tensors.insert(name.to_string(), Tensor::from_vec(v, shape, dev)?);
-        Ok(())
-    };
-    let h = cfg.hidden_size;
-    let i = cfg.intermediate_size;
-    fill("model.embed_tokens.weight", vec![cfg.vocab_size, h])?;
-    fill("model.embedding_norm.weight", vec![h])?;
-    for l in 0..cfg.num_hidden_layers {
-        let p = format!("model.layers.{l}");
-        fill(&format!("{p}.operator_norm.weight"), vec![h])?;
-        fill(&format!("{p}.ffn_norm.weight"), vec![h])?;
-        fill(&format!("{p}.feed_forward.w1.weight"), vec![i, h])?;
-        fill(&format!("{p}.feed_forward.w3.weight"), vec![i, h])?;
-        fill(&format!("{p}.feed_forward.w2.weight"), vec![h, i])?;
-        match cfg.layer_types[l] {
-            LayerType::Conv => {
-                fill(&format!("{p}.conv.in_proj.weight"), vec![3 * h, h])?;
-                fill(
-                    &format!("{p}.conv.conv.weight"),
-                    vec![h, 1, cfg.conv_l_cache],
-                )?;
-                fill(&format!("{p}.conv.out_proj.weight"), vec![h, h])?;
-            }
-            LayerType::FullAttention => {
-                let kv = cfg.num_key_value_heads * cfg.head_dim();
-                fill(&format!("{p}.self_attn.q_proj.weight"), vec![h, h])?;
-                fill(&format!("{p}.self_attn.k_proj.weight"), vec![kv, h])?;
-                fill(&format!("{p}.self_attn.v_proj.weight"), vec![kv, h])?;
-                fill(&format!("{p}.self_attn.out_proj.weight"), vec![h, h])?;
-                fill(
-                    &format!("{p}.self_attn.q_layernorm.weight"),
-                    vec![cfg.head_dim()],
-                )?;
-                fill(
-                    &format!("{p}.self_attn.k_layernorm.weight"),
-                    vec![cfg.head_dim()],
-                )?;
-            }
-        }
-    }
-    let vb = VarBuilder::from_tensors(tensors, dtype, dev);
-    Model::new(cfg, vb)
+    TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
+        .with_dtype(dtype)
+        .model(dev)
 }
+
+/// The CPU backend's logits for `cfg` at f32, over the weights a `dtype`
+/// model holds (rounded through `dtype`): the reference an arm is held to.
+fn cpu_reference(cfg: &Config, dtype: DType) -> Result<Vec<Vec<f32>>> {
+    let dense = if dtype == DType::F16 {
+        GgmlDType::F16
+    } else {
+        GgmlDType::F32
+    };
+    let mut cpu = cfg.clone();
+    cpu.attn_impl = AttnImpl::Generic;
+    let model = TinyCheckpoint::<Lfm2Tiny>::new(
+        cpu.clone(),
+        Weights {
+            dense,
+            ..Weights::default()
+        },
+    )
+    .with_dtype(DType::F32)
+    .model(&Device::Cpu)?;
+    Ok(steps(&model, &cpu, &Device::Cpu, DType::F32)?
+        .into_iter()
+        .map(|s| s.into_iter().map(f32::from_bits).collect())
+        .collect())
+}
+
+/// Every logit bit of every step, folded: a pinned value is an absolute
+/// reference that moves when any bit does.
+fn fingerprint(steps: &[Vec<u32>]) -> u64 {
+    steps
+        .iter()
+        .flatten()
+        .fold(0x761, |h, b| splitmix64(h ^ *b as u64))
+}
+
+/// The CPU `Contiguous` arm's fingerprint at f32 under the default law and
+/// seed. It moves with the weights' law, the tiny template's geometry and
+/// the CPU backend's arithmetic — each a reason to re-pin, named in the
+/// commit that does.
+const CPU_FINGERPRINT: u64 = 0x3723_fa1a_3016_59de;
 
 /// A 5-token prefill (strided views, real copies on `Contiguous`), then two
 /// decode steps (contiguous views); the logits of every step as f32 bits.
 fn run(cfg: &Config, dev: &Device, dtype: DType) -> Result<Vec<Vec<u32>>> {
     let model = build(cfg, dev, dtype)?;
+    steps(&model, cfg, dev, dtype)
+}
+
+fn steps(model: &Model, cfg: &Config, dev: &Device, dtype: DType) -> Result<Vec<Vec<u32>>> {
     let mut cache = Cache::new(true, dtype, cfg, dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let mut out = Vec::new();
@@ -135,6 +148,24 @@ fn arms_agree_on(dev: &Device, attn_impl: AttnImpl, dtype: DType) -> Result<()> 
         reference[1], reference[2],
         "two decode steps must not agree"
     );
+    // The absolute reference: the CPU backend within the dtype's
+    // tolerance, over the same (rounded) weights.
+    let want = cpu_reference(&tiny_config(QkvLayout::Contiguous, attn_impl), dtype)?;
+    let tol = if dtype == DType::F16 { 4e-3 } else { 1e-4 };
+    for (step, (g, r)) in reference.iter().zip(&want).enumerate() {
+        let scale = r.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let d = g
+            .iter()
+            .zip(r)
+            .map(|(a, b)| (f32::from_bits(*a) - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!("{dev:?} {attn_impl:?} {dtype:?} step {step}: |Contiguous - CPU| {d:e} at scale {scale:e}");
+        assert!(
+            d <= tol * scale,
+            "Contiguous on {dev:?} {attn_impl:?} {dtype:?}: step {step} is {d:e} from the CPU backend \
+             at scale {scale:e} (tolerance {tol} x scale)"
+        );
+    }
     for arm in [QkvLayout::Strided, QkvLayout::Fused] {
         let got = run(&tiny_config(arm, attn_impl), dev, dtype)?;
         for (step, (g, r)) in got.iter().zip(&reference).enumerate() {
@@ -156,7 +187,19 @@ fn arms_agree_on(dev: &Device, attn_impl: AttnImpl, dtype: DType) -> Result<()> 
 /// the strided and fused kernels run), on both attention arms at f16.
 #[test]
 fn every_arm_computes_the_same_logits() -> Result<()> {
+    let _serial = RECORDER.lock();
     arms_agree_on(&Device::Cpu, AttnImpl::Generic, DType::F32)?;
+    let cpu = run(
+        &tiny_config(QkvLayout::Contiguous, AttnImpl::Generic),
+        &Device::Cpu,
+        DType::F32,
+    )?;
+    assert_eq!(
+        fingerprint(&cpu),
+        CPU_FINGERPRINT,
+        "the CPU logits moved: {:#x}",
+        fingerprint(&cpu)
+    );
     #[cfg(feature = "metal")]
     {
         let dev = Device::new_metal(0)?;
@@ -172,6 +215,7 @@ fn every_arm_computes_the_same_logits() -> Result<()> {
 #[cfg(feature = "metal")]
 #[test]
 fn the_rows_path_agrees_with_the_single_path_on_every_arm() -> Result<()> {
+    let _serial = RECORDER.lock();
     use lloom::nn::model::Row;
     let dev = Device::new_metal(0)?;
     for arm in [QkvLayout::Contiguous, QkvLayout::Strided, QkvLayout::Fused] {
@@ -202,12 +246,6 @@ fn the_rows_path_agrees_with_the_single_path_on_every_arm() -> Result<()> {
 #[cfg(feature = "metal")]
 mod census {
     use super::*;
-    use std::sync::Mutex;
-
-    /// The dispatch recorder is process-global, so the two census tests
-    /// must not run concurrently: one's dispatches would land in the
-    /// other's window. Held for the whole of each test.
-    static RECORDER: Mutex<()> = Mutex::new(());
 
     /// The per-label dispatch census of one forward pass of `width` tokens
     /// at `pos`, after a 5-token prefill has been taken and the counters
@@ -264,7 +302,7 @@ mod census {
             eprintln!("SKIPPED: needs CANDLE_METAL_PROFILE=1 (the census is off otherwise)");
             return Ok(());
         }
-        let _serial = RECORDER.lock().unwrap();
+        let _serial = RECORDER.lock();
         let dev = Device::new_metal(0)?;
         let l = 2u64;
         let contiguous = census_of(&tiny_config(QkvLayout::Contiguous, AttnImpl::Sdpa), &dev, 1)?;
@@ -313,7 +351,7 @@ mod census {
             eprintln!("SKIPPED: needs CANDLE_METAL_PROFILE=1 (the census is off otherwise)");
             return Ok(());
         }
-        let _serial = RECORDER.lock().unwrap();
+        let _serial = RECORDER.lock();
         let dev = Device::new_metal(0)?;
         let l = 2u64;
         let contiguous = census_of(&tiny_config(QkvLayout::Contiguous, AttnImpl::Sdpa), &dev, 4)?;

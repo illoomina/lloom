@@ -29,9 +29,11 @@
 
 #![cfg(feature = "metal")]
 
-use lloom_tensor::{DType, Device, Result, Tensor};
-use lloom::nn::VarBuilder;
 use lloom::models::lfm2::{Cache, Config, KvAppend, LayerType, Model};
+use lloom::models::lfm2_testing::Lfm2Tiny;
+use lloom::testing::tiny::{TinyCheckpoint, Weights};
+use lloom_tensor::quantized::GgmlDType;
+use lloom_tensor::{DType, Device, Result, Tensor};
 
 /// A two-layer LFM2 — one conv layer, one attention layer — so **all three**
 /// residual producers are exercised: `conv.out_proj`, `self_attn.out_proj` and
@@ -78,56 +80,62 @@ fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
     }
 }
 
-/// Deterministic weights: a fixed ramp, so two runs agree and any difference
-/// between two *arms* is attributable to the arms. Same shape as
-/// `lfm2_spec_conv_rollback.rs`'s builder.
+/// The tiny LFM2 at `cfg`'s geometry and arms (`lloom::testing::tiny`,
+/// keyed weights), at f16 — so two runs agree and any difference between
+/// two *arms* is attributable to the arms.
 fn build(cfg: &Config, dev: &Device) -> Result<Model> {
-    let mut tensors = std::collections::HashMap::new();
-    let mut fill = |name: &str, shape: Vec<usize>| -> Result<()> {
-        let n: usize = shape.iter().product();
-        let v: Vec<f32> = (0..n).map(|i| ((i % 17) as f32 - 8.0) / 32.0).collect();
-        tensors.insert(name.to_string(), Tensor::from_vec(v, shape, dev)?);
-        Ok(())
-    };
-    let h = cfg.hidden_size;
-    let i = cfg.intermediate_size;
-    fill("model.embed_tokens.weight", vec![cfg.vocab_size, h])?;
-    fill("model.embedding_norm.weight", vec![h])?;
-    for l in 0..cfg.num_hidden_layers {
-        let p = format!("model.layers.{l}");
-        fill(&format!("{p}.operator_norm.weight"), vec![h])?;
-        fill(&format!("{p}.ffn_norm.weight"), vec![h])?;
-        fill(&format!("{p}.feed_forward.w1.weight"), vec![i, h])?;
-        fill(&format!("{p}.feed_forward.w3.weight"), vec![i, h])?;
-        fill(&format!("{p}.feed_forward.w2.weight"), vec![h, i])?;
-        match cfg.layer_types[l] {
-            LayerType::Conv => {
-                fill(&format!("{p}.conv.in_proj.weight"), vec![3 * h, h])?;
-                fill(
-                    &format!("{p}.conv.conv.weight"),
-                    vec![h, 1, cfg.conv_l_cache],
-                )?;
-                fill(&format!("{p}.conv.out_proj.weight"), vec![h, h])?;
-            }
-            LayerType::FullAttention => {
-                let kv = cfg.num_key_value_heads * cfg.head_dim();
-                fill(&format!("{p}.self_attn.q_proj.weight"), vec![h, h])?;
-                fill(&format!("{p}.self_attn.k_proj.weight"), vec![kv, h])?;
-                fill(&format!("{p}.self_attn.v_proj.weight"), vec![kv, h])?;
-                fill(&format!("{p}.self_attn.out_proj.weight"), vec![h, h])?;
-                fill(
-                    &format!("{p}.self_attn.q_layernorm.weight"),
-                    vec![cfg.head_dim()],
-                )?;
-                fill(
-                    &format!("{p}.self_attn.k_layernorm.weight"),
-                    vec![cfg.head_dim()],
-                )?;
-            }
-        }
-    }
-    let vb = VarBuilder::from_tensors(tensors, DType::F16, dev);
-    Model::new(cfg, vb)
+    TinyCheckpoint::<Lfm2Tiny>::new(cfg.clone(), Weights::default())
+        .with_dtype(DType::F16)
+        .model(dev)
+}
+
+/// The same decode step on the CPU backend at f32, over the weights the f16
+/// model holds (rounded through f16), fusions off (they are Metal
+/// epilogues): the absolute reference every arm is held to (CONTRIBUTING
+/// §3.1b). A defect in a fused arm that moves the logits by less than the
+/// relative bound below still moves them away from this.
+fn cpu_decode_logits(cfg: &Config) -> Result<Vec<f32>> {
+    let mut cpu = cfg.clone();
+    cpu.gemv_silu = false;
+    cpu.gemv_residual = false;
+    let dev = Device::Cpu;
+    let model = TinyCheckpoint::<Lfm2Tiny>::new(
+        cpu.clone(),
+        Weights {
+            dense: GgmlDType::F16,
+            ..Weights::default()
+        },
+    )
+    .with_dtype(DType::F32)
+    .model(&dev)?;
+    decode_with(&model, &cpu, &dev, DType::F32)
+}
+
+/// Every logit bit, folded: a pinned value is an absolute reference that
+/// moves when any bit does — the one here that a defect in code the CPU and
+/// Metal arms share (an op both devices dispatch) cannot move alike.
+fn fingerprint(v: &[f32]) -> u64 {
+    v.iter().fold(0x761, |h, x| {
+        lloom::testing::tiny::init::splitmix64(h ^ x.to_bits() as u64)
+    })
+}
+
+/// The CPU reference's fingerprint under the default law and seed. It moves
+/// with the law, the fixture's geometry and the CPU backend's arithmetic —
+/// each a reason to re-pin, named in the commit that does.
+const CPU_FINGERPRINT: u64 = 0xe41c_e0b0_36c4_0328;
+
+/// `|arm - CPU|` must stay inside the f16 activations' own error, measured
+/// on the unfused arm (`the_unfused_arm_is_within_the_cpu_reference`).
+const CPU_TOL: f32 = 4e-3;
+
+fn assert_near_cpu(tag: &str, arm: &[f32], cpu: &[f32]) {
+    let (d, m) = max_abs_delta(arm, cpu);
+    eprintln!("{tag}: |arm - CPU f32| = {d:e} at scale {m:e}");
+    assert!(
+        d <= CPU_TOL * m,
+        "{tag}: {d:e} from the CPU backend at scale {m:e} (tolerance {CPU_TOL} x scale)"
+    );
 }
 
 /// Prefill a prompt, then take one **decode** step, and return that step's
@@ -135,7 +143,11 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
 /// is a GEMM and takes the eager path by construction.
 fn decode_logits(cfg: &Config, dev: &Device) -> Result<Vec<f32>> {
     let model = build(cfg, dev)?;
-    let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
+    decode_with(&model, cfg, dev, DType::F16)
+}
+
+fn decode_with(model: &Model, cfg: &Config, dev: &Device, dtype: DType) -> Result<Vec<f32>> {
+    let mut cache = Cache::new(true, dtype, cfg, dev)?;
     let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
     let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut cache)?;
@@ -204,6 +216,11 @@ fn gemv_silu_is_reached_from_the_decode_path() -> Result<()> {
     };
     let base = decode_logits(&tiny_config(false, false), &dev)?;
     let fused = decode_logits(&tiny_config(true, false), &dev)?;
+    assert_near_cpu(
+        "gemv_silu",
+        &fused,
+        &cpu_decode_logits(&tiny_config(true, false))?,
+    );
 
     let (delta, mag) = max_abs_delta(&base, &fused);
     eprintln!("gemv_silu: max|delta| = {delta:e}, max|logit| = {mag:e}");
@@ -240,6 +257,11 @@ fn gemv_residual_is_reached_from_the_decode_path() -> Result<()> {
     };
     let base = decode_logits(&tiny_config(false, false), &dev)?;
     let fused = decode_logits(&tiny_config(false, true), &dev)?;
+    assert_near_cpu(
+        "gemv_residual",
+        &fused,
+        &cpu_decode_logits(&tiny_config(false, true))?,
+    );
 
     let (delta, mag) = max_abs_delta(&base, &fused);
     eprintln!("gemv_residual: max|delta| = {delta:e}, max|logit| = {mag:e}");
@@ -306,5 +328,27 @@ fn prefill_is_bit_identical_with_the_flags_on() -> Result<()> {
             return Err(e);
         }
     }
+    Ok(())
+}
+
+/// **The unfused arm is the CPU backend's answer at f16's precision**: the
+/// level [`CPU_TOL`] is set from, and the absolute reference the shape
+/// checks above (flag off agrees with itself; a fused arm is near the
+/// unfused one) cannot see — a defect that moves every arm alike.
+#[test]
+fn the_unfused_arm_is_within_the_cpu_reference() -> Result<()> {
+    let Ok(dev) = Device::new_metal(0) else {
+        eprintln!("no Metal device; skipping");
+        return Ok(());
+    };
+    let cfg = tiny_config(false, false);
+    let cpu = cpu_decode_logits(&cfg)?;
+    assert_eq!(
+        fingerprint(&cpu),
+        CPU_FINGERPRINT,
+        "the CPU reference moved: {:#x}",
+        fingerprint(&cpu)
+    );
+    assert_near_cpu("unfused", &decode_logits(&cfg, &dev)?, &cpu);
     Ok(())
 }

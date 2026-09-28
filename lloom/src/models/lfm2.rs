@@ -5195,6 +5195,9 @@ impl Attention {
     ///   (`seq_len <= kv_len`, the shape `Sdpa::metal_fwd` admits).
     /// * **dtype** f16/bf16/f32 and **`head_dim`** in the instantiated set;
     ///   f32 has no `head_dim == 512` instantiation.
+    ///
+    /// The two head-dim checks are shape probes (`docs/porting-models.md`
+    /// §21.8): the check is the annotation.
     fn sdpa_full_applies(&self, q: &Tensor, seq_len: usize, kv_len: usize) -> bool {
         const HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
         self.attn_impl != AttnImpl::Generic
@@ -5202,8 +5205,17 @@ impl Attention {
             && seq_len > 1
             && seq_len <= kv_len
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
-            && HEAD_DIMS.contains(&self.head_dim)
-            && !(self.head_dim == 512 && q.dtype() == DType::F32)
+            && lloom_tensor::shape_req!(
+                sdpa_head_dim,
+                HEAD_DIMS.contains(&self.head_dim);
+                head_dim = self.head_dim
+            )
+            && lloom_tensor::shape_req!(
+                sdpa_head_dim,
+                !(self.head_dim == 512 && q.dtype() == DType::F32);
+                head_dim = self.head_dim,
+                is_f32 = q.dtype() == DType::F32
+            )
     }
 
     /// Whether this call can take the FlashDecoding kernels (issue #116).

@@ -214,6 +214,18 @@ pub trait TinyFamily: Sized {
     /// A written checkpoint, through the family's real loader.
     fn load(path: &Path, dev: &Device) -> Result<Self::Model>;
 
+    /// The CPU oracle for `ckpt`: the same values, every packed tensor
+    /// dequantized, computed at f32.
+    fn reference(ckpt: &TinyCheckpoint<Self>, dev: &Device) -> Result<Self::Model> {
+        Self::build(&ckpt.dequantized().with_dtype(DType::F32), dev)
+    }
+
+    /// Runtime arms a campaign varies beside the geometry (an attention
+    /// kernel, a KV layout), by name; the first is the family's default.
+    const ARMS: &'static [&'static str] = &["default"];
+    /// Select arm `arm` (an index into [`TinyFamily::ARMS`]) on `cfg`.
+    fn set_arm(_cfg: &mut Self::Config, _arm: usize) {}
+
     /// `template()` with `axes` (in [`TinyConfig::axes`] order) applied and
     /// the derived fields recomputed; `None` if it drops a layer kind.
     fn apply(axes: &[usize]) -> Option<Self::Config> {
@@ -363,4 +375,144 @@ pub fn run<M: crate::nn::model::CausalLM>(
         pos += 1;
     }
     Ok(out)
+}
+
+/// One candidate of a shape search, in a family's terms: the axes (in
+/// [`TinyConfig::axes`] order), a workload, the stored kinds and the
+/// runtime arm. The byte form is positional and total — a missing field keeps
+/// the template's value, every value is clamped into range — so any byte
+/// string is a geometry and a campaign's input, a manifest entry and a
+/// drift test's case are the same bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Geometry {
+    pub axes: Vec<usize>,
+    pub work: Workload,
+    /// An index into [`TinyFamily::DENSE_KINDS`].
+    pub dense: usize,
+    /// An index into [`TinyFamily::EXPERT_KINDS`] (0 without experts).
+    pub experts: usize,
+    /// An index into [`TinyFamily::ARMS`].
+    pub arm: usize,
+}
+
+/// The longest prompt and the most decode steps a geometry's workload runs.
+pub const MAX_PROMPT: usize = 64;
+pub const MAX_DECODE: usize = 4;
+/// The largest value an axis without its own `max` may take.
+pub const AXIS_CAP: usize = 512;
+
+impl Geometry {
+    /// The family's template with `work`, the default kinds and arm.
+    pub fn template<F: TinyFamily>(work: Workload) -> Self {
+        let t = F::template();
+        Self {
+            axes: F::Config::axes(AXIS_CAP)
+                .iter()
+                .map(|(n, _)| t.axis(n).expect("an axis"))
+                .collect(),
+            work,
+            dense: 0,
+            experts: 0,
+            arm: 0,
+        }
+    }
+
+    /// Little-endian `u16` per axis, then the prompt, the decode steps, the
+    /// dense kind, the expert kind and the arm, a byte each.
+    pub fn decode<F: TinyFamily>(bytes: &[u8]) -> Self {
+        let mut g = Self::template::<F>(Workload {
+            prompt: 7,
+            decode: 1,
+        });
+        let mut at = 0usize;
+        let mut next = |n: usize| -> Option<&[u8]> {
+            let s = bytes.get(at..at + n)?;
+            at += n;
+            Some(s)
+        };
+        for (v, (_, max)) in g.axes.iter_mut().zip(F::Config::axes(AXIS_CAP)) {
+            if let Some(b) = next(2) {
+                *v = (u16::from_le_bytes([b[0], b[1]]) as usize).clamp(1, max);
+            }
+        }
+        let modulo = |b: u8, n: usize| (b as usize) % n.max(1);
+        if let Some(b) = next(1) {
+            g.work.prompt = (b[0] as usize).clamp(1, MAX_PROMPT);
+        }
+        if let Some(b) = next(1) {
+            g.work.decode = (b[0] as usize).min(MAX_DECODE);
+        }
+        if let Some(b) = next(1) {
+            g.dense = modulo(b[0], F::DENSE_KINDS.len());
+        }
+        if let Some(b) = next(1) {
+            g.experts = modulo(b[0], F::EXPERT_KINDS.len());
+        }
+        if let Some(b) = next(1) {
+            g.arm = modulo(b[0], F::ARMS.len());
+        }
+        g
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.axes.len() * 2 + 5);
+        for v in &self.axes {
+            out.extend_from_slice(&(*v as u16).to_le_bytes());
+        }
+        out.extend_from_slice(&[
+            self.work.prompt as u8,
+            self.work.decode as u8,
+            self.dense as u8,
+            self.experts as u8,
+            self.arm as u8,
+        ]);
+        out
+    }
+
+    /// The checkpoint this geometry names under `weights`' law and seed, or
+    /// `None` if it drops a layer kind the template has.
+    pub fn checkpoint<F: TinyFamily>(&self, weights: Weights) -> Option<TinyCheckpoint<F>> {
+        let mut cfg = F::apply(&self.axes)?;
+        F::set_arm(&mut cfg, self.arm);
+        let kind = |kinds: &[GgmlDType], i: usize| kinds.get(i).copied().unwrap_or(GgmlDType::F32);
+        Some(TinyCheckpoint::new(
+            cfg,
+            Weights {
+                dense: kind(F::DENSE_KINDS, self.dense),
+                experts: kind(F::EXPERT_KINDS, self.experts),
+                ..weights
+            },
+        ))
+    }
+
+    /// `name=value` for every axis, then the workload, the kinds, the arm.
+    pub fn describe<F: TinyFamily>(&self) -> String {
+        let mut s: Vec<String> = F::Config::axes(AXIS_CAP)
+            .iter()
+            .zip(&self.axes)
+            .map(|((n, _), v)| format!("{n}={v}"))
+            .collect();
+        s.push(format!(
+            "prompt={} decode={}",
+            self.work.prompt, self.work.decode
+        ));
+        s.push(format!(
+            "dense={:?}",
+            F::DENSE_KINDS
+                .get(self.dense)
+                .copied()
+                .unwrap_or(GgmlDType::F32)
+        ));
+        if !F::EXPERT_KINDS.is_empty() {
+            s.push(format!(
+                "experts={:?}",
+                F::EXPERT_KINDS[self.experts.min(F::EXPERT_KINDS.len() - 1)]
+            ));
+        }
+        s.push(format!(
+            "arm={}",
+            F::ARMS.get(self.arm).copied().unwrap_or("?")
+        ));
+        s.join(" ")
+    }
 }

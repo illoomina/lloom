@@ -1901,9 +1901,11 @@ impl DSparkAttention {
     /// drafter, which is in it. Kept as a named predicate so the Metal arm's
     /// guard reads as one condition and a checkpoint with an un-instantiated
     /// head dim falls to the eager arm rather than bailing in the kernel.
+    /// A shape probe (`docs/porting-models.md` §21.8): the check is the
+    /// annotation.
     fn head_dim_instantiated(head_dim: usize) -> bool {
         const HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
-        HEAD_DIMS.contains(&head_dim)
+        lloom_tensor::shape_req!(sdpa_head_dim, HEAD_DIMS.contains(&head_dim); head_dim)
     }
 
     /// Project `H_ctx` into this layer's context K/V and append to `cache`.

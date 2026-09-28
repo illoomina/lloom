@@ -345,6 +345,7 @@ impl Family for Lfm2Family {
             dspark_k: spec.k,
             executor: shape.executor.clone(),
             memory: shape.memory.clone(),
+            flash_k: model.flash_k,
         })?;
         Ok(Box::new(engine))
     }
@@ -395,6 +396,9 @@ impl Family for Qwen4ExpFamily {
                     s.batch
                 );
             }
+        }
+        if req.model.flash_k.is_some() {
+            anyhow::bail!("--flash-k sizes LFM2's FlashDecoding chunk; qwen4exp has no such arm");
         }
         match req.model.experts.as_str() {
             "stream" | "resident" => {}
@@ -734,6 +738,27 @@ mod tests {
         let mut s = with("ring-nonblocking");
         assert_eq!(clamp_ungated_eos_gate(&LFM2_CAPABILITIES, &mut s), None);
         assert!(s.decode.readback.eos_gate, "LFM2 keeps its gate");
+    }
+
+    /// `--flash-k` is LFM2's FlashDecoding chunk: Qwen4-exp refuses it by
+    /// name, LFM2 resolves it (the load refuses it off `--attn flash`).
+    #[test]
+    fn flash_k_is_lfm2s() {
+        let m = model_args(&["--flash-k", "2"]);
+        let err = Qwen4ExpFamily
+            .resolve(&Requested {
+                model: &m,
+                shape: shape(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--flash-k"), "{err}");
+        Lfm2Family
+            .resolve(&Requested {
+                model: &m,
+                shape: shape(),
+            })
+            .unwrap();
     }
 
     #[test]

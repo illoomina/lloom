@@ -1565,8 +1565,13 @@ fn models_body(model_name: &str) -> Value {
 /// (`/prefill_throughput`, `/decode_throughput`, `/end_to_end_latency`,
 /// `/max_memory_usage`), run in-process on the same engine and the same
 /// option groups — one `BENCH` line per cell per run, the resolved arms last.
+/// `--mode reuse | concurrent` runs a multi-sequence measurement mode instead
+/// (`modes.rs`, LFM2): its per-sequence lines and one `RESULT` line.
 #[derive(Parser)]
-#[command(name = "lloom bench", about = "Run the benchmark cells in-process")]
+#[command(
+    name = "lloom bench",
+    about = "Run the benchmark cells, or a multi-sequence mode, in-process"
+)]
 pub struct BenchArgs {
     #[command(flatten)]
     pub model: super::ModelArgs,
@@ -1606,6 +1611,62 @@ pub struct BenchArgs {
     /// A file whose text is tiled into the cells' prompts.
     #[arg(long)]
     pub prompt_seed_file: Option<PathBuf>,
+
+    /// `cells` (the cells above), or a multi-sequence mode on LFM2: `reuse` (a
+    /// two-turn conversation through prefix reuse against a fresh prefill;
+    /// are the turn-2 streams identical, and turn 2's TTFT on each) or
+    /// `concurrent` (`--sequences` conversations on one model — the
+    /// time-sliced interleave, `--batched`, or the pipelined speculative
+    /// driver under `--dspark` — each stream checked against its solo run).
+    #[arg(long, default_value = "cells", value_name = "cells|reuse|concurrent")]
+    pub mode: String,
+
+    /// `--mode concurrent`: how many sequences. The prompts are a varied set
+    /// of eight from the workloads corpus, cycled past eight.
+    #[arg(long, default_value_t = 2)]
+    pub sequences: usize,
+
+    /// `--mode concurrent`: drive the sequences through the batched-forward
+    /// driver — one `m = B` forward per step for every live sequence —
+    /// against each prompt run solo on the selected readback arm.
+    #[arg(long)]
+    pub batched: bool,
+
+    /// `--mode concurrent --batched`: skip the neighbour-independence arm
+    /// (the rows re-run as two separately batched halves).
+    #[arg(long)]
+    pub no_independence_check: bool,
+
+    /// `--mode concurrent --batched`: skip the solo arm; the identity
+    /// columns then read `false`.
+    #[arg(long)]
+    pub skip_solo: bool,
+
+    /// `--mode concurrent`: tokens per visit on the time-sliced interleave.
+    #[arg(long, default_value_t = 16)]
+    pub chunk: usize,
+
+    /// `--mode concurrent`: sequence `i` arrives at round (interleave) or
+    /// step (`--batched`) `i × N`; 0 admits every sequence at once.
+    #[arg(long, default_value_t = 0)]
+    pub stagger: usize,
+
+    /// `--mode concurrent`: give the last sequence a synthetic prompt of
+    /// exactly this many body tokens, so a long prompt arrives beside the
+    /// short ones; 0 keeps the corpus prompt.
+    #[arg(long, default_value_t = 0)]
+    pub long_prompt_tokens: usize,
+
+    /// `--mode concurrent`: which arm runs first — `solo`, or `pipelined`
+    /// (`--dspark`) / `batched` (`--batched`) — so a rotation can alternate
+    /// the order.
+    #[arg(long, default_value = "solo")]
+    pub first: String,
+
+    /// `--mode concurrent --dspark`: write every round of both arms as CSV
+    /// (`arm,seq,round,start_ms,draft_ms,enqueue_ms,wait_ms,observe_ms,accepted`).
+    #[arg(long, value_name = "PATH")]
+    pub timeline: Option<PathBuf>,
 }
 
 /// One cell of `--cells`.
@@ -1655,11 +1716,21 @@ impl Cell {
 }
 
 pub fn bench(args: BenchArgs) -> Result<()> {
+    let mode = match args.mode.as_str() {
+        "cells" => None,
+        "reuse" => Some(super::modes::Mode::Reuse),
+        "concurrent" => Some(super::modes::Mode::Concurrent),
+        other => anyhow::bail!("--mode {other}: cells | reuse | concurrent"),
+    };
+    if let Some(mode) = mode {
+        return bench_mode(args, mode);
+    }
     let cells = Cell::parse_list(&args.cells)?;
     if cells.is_empty() {
         anyhow::bail!("--cells names no cell");
     }
     let mut options = super::resolve_options(&args.common)?;
+    super::report::arm_trace();
     let seed_text = match &args.prompt_seed_file {
         Some(p) => std::fs::read_to_string(p)
             .with_context(|| format!("reading the prompt seed {}", p.display()))?,
@@ -1776,6 +1847,293 @@ pub fn bench(args: BenchArgs) -> Result<()> {
     );
     shared.engine.shutdown();
     Ok(())
+}
+
+/// `lloom bench --mode reuse | concurrent`: resolve the mode's knobs, load
+/// the engine at `--batch 1` on the arms the mode needs, and run it.
+fn bench_mode(args: BenchArgs, mode: super::modes::Mode) -> Result<()> {
+    let mut options = super::resolve_options(&args.common)?;
+    super::report::arm_trace();
+    let spec = resolve_mode(&args, mode, &mut options)?;
+    let load_start = Instant::now();
+    let (engine, model_path) = super::load_engine(
+        &args.model,
+        super::Shape {
+            decode: options.decode.clone(),
+            model: options.model.clone(),
+            speculative: options.speculative.clone(),
+            executor: options.executor.clone(),
+            memory: options.memory.clone(),
+            reuse_prefix: false,
+            seed_text: DEFAULT_SEED_TEXT.to_string(),
+            batch: 1,
+            mem_sample: false,
+            rows: "auto".into(),
+            share_prefix: false,
+        },
+    )?;
+    eprintln!(
+        "[loaded {} from {} in {:.2}s on {:?}; {}]",
+        engine.model_name(),
+        model_path.display(),
+        load_start.elapsed().as_secs_f64(),
+        engine.device(),
+        engine.describe(),
+    );
+    let gauge = super::common::MemGauge::start(engine.device(), args.mem_sample);
+    let out = engine.run_mode(&spec);
+    let mem = gauge.finish(engine.device());
+    if args.mem_sample {
+        super::report::print_mempeak(&mem);
+    }
+    #[cfg(feature = "metal")]
+    if let (Some(i), lloom_tensor::Device::Metal(dev)) = (engine.installed(), engine.device()) {
+        if i.pass_plans {
+            super::report::print_pass_plans(dev, i.pass_widths);
+        }
+    }
+    engine.shutdown();
+    out
+}
+
+/// A mode's knobs from the option groups and `lloom bench`'s own flags, with
+/// the refusals made before anything loads: a flag the mode does not read is
+/// refused rather than worn by a run that ignored it (§7.1a-i). Under `--rows
+/// pool*` the model group's preset becomes the pool's (every sequence is a
+/// slot of one paged pool, which the `auto` rule does not pick at `--batch
+/// 1`).
+fn resolve_mode(
+    args: &BenchArgs,
+    mode: super::modes::Mode,
+    options: &mut crate::EngineOptions,
+) -> Result<super::modes::ModeSpec> {
+    let dspark = options.speculative.method == "dspark";
+    let decode = &options.decode;
+    if args.batch > 1 {
+        anyhow::bail!(
+            "--mode {} drives its own sequences (`--sequences`); --batch starts the serving \
+             scheduler, which is `lloom serve --batch N` / the cells",
+            mode.name()
+        );
+    }
+    if decode.prefill.spark.is_some() {
+        anyhow::bail!(
+            "--spark is not read by --mode {} (its drivers prefill per sequence); it is honoured \
+             by `lloom chat` and the cells. Use --prefill-ubatch for the modes",
+            mode.name()
+        );
+    }
+    if args.batched && dspark {
+        anyhow::bail!(
+            "--batched drives the K=1 batched-forward body; a batched verify is not built \
+             (speculative-pipeline-scheduler-design.md §4b). Pick one of --batched / --dspark"
+        );
+    }
+    if options.executor.replay || options.executor.arena {
+        anyhow::bail!(
+            "--replay/--arena record one sequence's step; they do not compose with --mode {} \
+             (the modes drive many)",
+            mode.name()
+        );
+    }
+    if dspark && decode.prefill.chunk > 0 {
+        anyhow::bail!(
+            "--prefill-chunk is not read by --dspark (its seed is `Session::prefill_streamed`, the \
+             spark-then-remainder ramp); run it on the K=1 interleave or --batched"
+        );
+    }
+    let rows = super::lfm2::RowsArm::parse(
+        if args.rows == "auto" {
+            "private"
+        } else {
+            &args.rows
+        },
+        true,
+    )?;
+    if rows.pooled() {
+        let want = if dspark { "pool-spec" } else { "pool" };
+        match options.model.cache.as_str() {
+            "auto" => options.model.cache = want.into(),
+            c if c == want => {}
+            other => anyhow::bail!(
+                "--rows {} makes every sequence a slot of one paged pool; --cache {other} is not \
+                 its preset ({want})",
+                rows.name()
+            ),
+        }
+    }
+    let decode = &options.decode;
+    let readback = match decode.readback.spelling() {
+        "auto" => {
+            eprintln!(
+                "[mode: --readback auto resolves per request; the modes take one arm per \
+                 sequence: ring-nonblocking]"
+            );
+            "ring-nonblocking".to_string()
+        }
+        s => s.to_string(),
+    };
+    Ok(super::modes::ModeSpec {
+        mode,
+        max_tokens: options.sampling.max_tokens,
+        readback,
+        lookahead: decode.readback.lookahead,
+        commit_budget: decode.readback.commit_budget,
+        sequences: args.sequences,
+        chunk: args.chunk,
+        prefill_ubatch: decode.prefill.ubatch,
+        // The speculative drivers' seed does not read the tile.
+        prefill_tile: if dspark { 0 } else { decode.prefill.tile },
+        prefill_chunk: decode.prefill.chunk,
+        pass_widths: decode.prefill.pass_widths,
+        stagger: args.stagger,
+        long_prompt_tokens: args.long_prompt_tokens,
+        dspark,
+        batched: args.batched,
+        rows,
+        check_independence: !args.no_independence_check,
+        skip_solo: args.skip_solo,
+        first: args.first.clone(),
+        timeline: args.timeline.clone(),
+    })
+}
+
+#[cfg(test)]
+mod bench_mode_tests {
+    use super::{resolve_mode, BenchArgs};
+    use crate::app::modes::Mode;
+    use clap::Parser;
+
+    fn resolve(
+        argv: &[&str],
+    ) -> anyhow::Result<(super::super::modes::ModeSpec, crate::EngineOptions)> {
+        let mut full = vec!["lloom bench"];
+        full.extend_from_slice(argv);
+        let args = BenchArgs::try_parse_from(full)?;
+        let mut o = super::super::resolve_options_uninstalled(&args.common)?;
+        let mode = match args.mode.as_str() {
+            "reuse" => Mode::Reuse,
+            _ => Mode::Concurrent,
+        };
+        let spec = resolve_mode(&args, mode, &mut o)?;
+        Ok((spec, o))
+    }
+
+    fn refusal(argv: &[&str]) -> String {
+        match resolve(argv) {
+            Ok(_) => panic!("{argv:?}: accepted"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The knobs reach the mode from the groups and the mode's own flags.
+    #[test]
+    fn the_knobs_reach_the_mode() {
+        let (s, _) = resolve(&[
+            "--mode",
+            "concurrent",
+            "--batched",
+            "--sequences",
+            "4",
+            "--stagger",
+            "8",
+            "--long-prompt-tokens",
+            "300",
+            "--prefill-chunk",
+            "64",
+            "--prefill-tile",
+            "0",
+            "--readback",
+            "ring-hostdrain",
+            "--lookahead",
+            "0",
+            "--commit-budget",
+            "steps:4",
+            "-n",
+            "48",
+            "--first",
+            "batched",
+            "--skip-solo",
+            "--no-independence-check",
+            "--pass-widths",
+            "ladder",
+        ])
+        .unwrap();
+        assert_eq!(s.mode, Mode::Concurrent);
+        assert!(s.batched && s.skip_solo && !s.check_independence);
+        assert_eq!((s.sequences, s.stagger, s.long_prompt_tokens), (4, 8, 300));
+        assert_eq!((s.prefill_chunk, s.prefill_tile, s.max_tokens), (64, 0, 48));
+        assert_eq!((s.readback.as_str(), s.lookahead), ("ring-hostdrain", 0));
+        assert_eq!(s.commit_budget.period(), 4);
+        assert_eq!(s.first, "batched");
+        assert_eq!(s.pass_widths, lloom::nn::PassWidths::Ladder);
+        assert_eq!(
+            s.rows,
+            crate::app::lfm2::RowsArm::Private,
+            "auto is a cache each"
+        );
+    }
+
+    /// `auto` is resolved per request; a mode takes one arm per sequence.
+    #[test]
+    fn auto_readback_is_the_nonblocking_ring() {
+        let (s, _) = resolve(&["--mode", "concurrent"]).unwrap();
+        assert_eq!(s.readback, "ring-nonblocking");
+        let (s, _) = resolve(&["--mode", "reuse", "--readback", "blocking"]).unwrap();
+        assert_eq!(s.readback, "blocking");
+    }
+
+    /// Every sequence a slot of one pool needs the pool's preset: `auto`
+    /// takes it (the speculative one under `--dspark`), a named other preset
+    /// is refused by name.
+    #[test]
+    fn the_pool_rows_take_the_pool_preset() {
+        let (s, o) = resolve(&["--mode", "concurrent", "--batched", "--rows", "pool"]).unwrap();
+        assert_eq!(s.rows, crate::app::lfm2::RowsArm::Pool);
+        assert_eq!(o.model.cache, "pool");
+        let (_, o) =
+            resolve(&["--mode", "concurrent", "--dspark", "--rows", "pool-per-row"]).unwrap();
+        assert_eq!(o.model.cache, "pool-spec");
+        let e = refusal(&["--mode", "concurrent", "--rows", "pool", "--cache", "crown"]);
+        assert!(e.contains("--cache crown is not its preset (pool)"), "{e}");
+    }
+
+    /// What a mode does not read is refused, not worn.
+    #[test]
+    fn the_unread_knobs_are_refused() {
+        for (argv, want) in [
+            (
+                &["--mode", "concurrent", "--batch", "2"][..],
+                "--batch starts the serving scheduler",
+            ),
+            (
+                &["--mode", "concurrent", "--spark", "16"],
+                "--spark is not read",
+            ),
+            (
+                &["--mode", "concurrent", "--batched", "--dspark"],
+                "a batched verify is not built",
+            ),
+            (
+                &["--mode", "reuse", "--replay"],
+                "do not compose with --mode reuse",
+            ),
+            (
+                &["--mode", "concurrent", "--arena"],
+                "do not compose with --mode concurrent",
+            ),
+            (
+                &["--mode", "concurrent", "--dspark", "--prefill-chunk", "64"],
+                "--prefill-chunk is not read by --dspark",
+            ),
+        ] {
+            let e = refusal(argv);
+            assert!(e.contains(want), "{argv:?}: {e}");
+        }
+        let (s, _) =
+            resolve(&["--mode", "concurrent", "--dspark", "--prefill-tile", "256"]).unwrap();
+        assert_eq!(s.prefill_tile, 0, "the speculative seed reads no tile");
+    }
 }
 
 #[cfg(test)]

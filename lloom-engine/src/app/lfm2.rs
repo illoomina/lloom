@@ -240,6 +240,17 @@ pub struct Engine {
     pub vision: Option<Vision>,
     /// What the last request loaded and encoded (`Served::vision_report`).
     last_vision: Mutex<Value>,
+    /// The resolved model config: what the bench modes build their own
+    /// caches and pools from.
+    pub config: Config,
+    pub dtype: DType,
+    /// The drafter's directory and config under `--dspark`.
+    pub dspark_setup: Option<(PathBuf, DSparkConfig)>,
+    /// The executor arms armed at load, for their engagement reports.
+    pub installed: super::report::Installed,
+    /// What warmup measured: the in-flight depth and the `(host_ns, gpu_ns)`
+    /// balance it implies (the pacer takes `decode.in_flight`, not this).
+    pub warm_in_flight: Option<(usize, (u64, u64))>,
     single: Mutex<Single>,
     sched: Option<BatchHandle<Model, Extra>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -284,6 +295,9 @@ pub struct LoadOptions {
     pub executor: crate::ExecutorConfig,
     /// The memory budgets (the KV bucket and grow fraction, the free-list budget).
     pub memory: crate::MemoryConfig,
+    /// `--flash-k`: pages per FlashDecoding chunk (the model's
+    /// `flash_pages_per_chunk`), under `--attn flash` only.
+    pub flash_k: Option<usize>,
 }
 
 /// How the rows of `--batch N` hold their KV and conv state, and how a step
@@ -404,7 +418,7 @@ impl Engine {
             Some(p) => Some(p.clone()),
         };
         // The speculative arm's pool budget: 1024 MiB, sized from measurement
-        // (#148, the B=1 defaults pass; `lfm2-chat` applies the same default):
+        // (#148, the B=1 defaults pass):
         // a round is two models' activations plus the verify's logits,
         // released a few rounds later under the nonblocking readback, and at
         // the 256 MiB ceiling that working set is evicted as it frees — ~10
@@ -415,7 +429,12 @@ impl Engine {
                 m.set_free_budget(mb * 1024 * 1024);
             }
         }
-        super::common::install_executor(&device, &opts.executor, dspark_dir.is_some())?;
+        let mut installed =
+            super::common::install_executor(&device, &opts.executor, dspark_dir.is_some())?;
+        installed.pass_widths = match opts.decode.prefill.pass_widths {
+            lloom::nn::PassWidths::Lru => "lru",
+            lloom::nn::PassWidths::Ladder => "ladder",
+        };
         // Measured on natural text (#148, record §8.3): the speculative loop
         // on the pool is +14 % at B=4 and a LOSS at B ≥ 8 (−7 % / −40 % at
         // 8 / 16, 2.1–2.4 accepted of 9 per round against a B × 10-position
@@ -450,38 +469,74 @@ impl Engine {
         if opts.share_prefix && !pooled {
             anyhow::bail!("--share-prefix needs `--batch N --rows pool` (the rows share one pool)");
         }
-        // The preset: `auto` is the rule below; a named one is `lfm2-chat
-        // --cache`'s, refused where it needs the drafter's config it has not
-        // got. Then the per-axis overrides (`--attn`, `--kv-append`, … or
-        // `--set model.<axis>=<arm>`), applied over it in key order.
+        // The preset: `auto` is the rule below; a named one is refused where
+        // it needs the drafter's config it has not got. Then the per-axis
+        // overrides (`--attn`, `--kv-append`, … or `--set
+        // model.<axis>=<arm>`), applied over it in key order.
         match opts.model.cache.as_str() {
             "auto" => match &dcfg {
                 Some(dcfg) if pooled => pool_spec_config(&mut config, dcfg),
-                Some(dcfg) => rewindable_config(&mut config, dcfg),
+                Some(dcfg) => rewindable_config(&mut config, dcfg.max_draft(), dcfg.tap_layers()),
                 None if pooled => pool_config(&mut config),
                 None => crown_config(&mut config),
             },
             "crown" => crown_config(&mut config),
             "pool" => pool_config(&mut config),
+            // Without a drafter the speculative body's cache runs K = 1, so
+            // the cost of leaving the crown separates from the verify loop's;
+            // its taps are the 2.6B drafter's (the same per-token capture), or
+            // none on `rewindable-notap`, which separates the taps' cost from
+            // the ring's. The ring is sized for a `--dspark-k` window (the
+            // drafter's block, 9, by default).
             "rewindable" => match &dcfg {
-                Some(dcfg) => rewindable_config(&mut config, dcfg),
-                None => anyhow::bail!("--cache rewindable needs --dspark (the ring is sized from the drafter's block)"),
+                Some(dcfg) => rewindable_config(&mut config, dcfg.max_draft(), dcfg.tap_layers()),
+                None => {
+                    let two_six = DSparkConfig::lfm2_2_6b();
+                    let k = opts.dspark_k.unwrap_or(two_six.max_draft());
+                    rewindable_config(&mut config, k, two_six.tap_layers())
+                }
+            },
+            "rewindable-notap" => match &dcfg {
+                Some(_) => anyhow::bail!(
+                    "--cache rewindable-notap drops the taps the drafter's projection reads; \
+                     under --dspark the preset is `rewindable`"
+                ),
+                None => {
+                    let k = opts
+                        .dspark_k
+                        .unwrap_or(DSparkConfig::lfm2_2_6b().max_draft());
+                    rewindable_config(&mut config, k, Vec::new())
+                }
             },
             "pool-spec" => match &dcfg {
                 Some(dcfg) => pool_spec_config(&mut config, dcfg),
                 None => anyhow::bail!("--cache pool-spec needs --dspark"),
             },
-            other => anyhow::bail!("--cache {other}: auto | crown | rewindable | pool | pool-spec"),
+            other => anyhow::bail!(
+                "--cache {other}: auto | crown | rewindable | rewindable-notap | pool | pool-spec"
+            ),
         }
         opts.model
             .apply_axes(&mut config)
             .map_err(|e| anyhow::anyhow!("model axes: {e}"))?;
         refuse_kv_quant_shape(&config, &device, opts.batch)?;
-        // A prefill fed in more than one forward — a tile, a chunk — needs
-        // the conv's left-context carry, or the conv zero-pads each piece's
-        // left edge and computes something one pass does not (§13.2f
-        // defect 1). One forward is identical either way.
-        config.conv_prefill_ctx = opts.prefill_tile > 0 || opts.prefill_chunk > 0;
+        if let Some(k) = opts.flash_k {
+            if config.attn_impl != AttnImpl::FlashDecoding {
+                anyhow::bail!(
+                    "--flash-k sizes FlashDecoding's chunk; this shape's attention is {:?} \
+                     (select it with --attn flash)",
+                    config.attn_impl
+                );
+            }
+            config.flash_pages_per_chunk = k.max(1);
+        }
+        config.conv_prefill_ctx = config.conv_prefill_ctx
+            || conv_carry_needed(
+                opts.prefill_tile,
+                opts.prefill_chunk,
+                &opts.decode,
+                opts.reuse_prefix,
+            );
         let axes_line = config.axes_line();
         // Admission (§9.5d): predict the peak at the configured ceiling and
         // refuse at load rather than find the limit by dying. The activation
@@ -562,7 +617,7 @@ impl Engine {
         let cache = make_cache(&device)?;
 
         // Stop on the checkpoint's declared EOS plus `<|im_end|>` (the chat
-        // turn end), as `lfm2-chat` does.
+        // turn end).
         let mut eos_ids: Vec<u32> = config.eos_token_id.into_iter().collect();
         if let Some(id) = tokenizer.token_to_id("<|im_end|>") {
             if !eos_ids.contains(&id) {
@@ -638,6 +693,11 @@ impl Engine {
             lm_record,
             vision,
             last_vision: Mutex::new(Value::Null),
+            config: config.clone(),
+            dtype,
+            dspark_setup: dspark_dir.clone().zip(dcfg.clone()),
+            installed,
+            warm_in_flight: None,
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -650,7 +710,9 @@ impl Engine {
         };
 
         if opts.warmup {
-            let (libs, pipes) = engine.with_single(|s, _| Ok(s.warmup()?))?;
+            let ((libs, pipes), measured) =
+                engine.with_single(|s, _| Ok((s.warmup()?, s.measured_in_flight())))?;
+            engine.warm_in_flight = Some(measured);
             eprintln!("[warmup: {libs} libraries, {pipes} pipelines compiled]");
         }
         // The two rings every request will want, built here rather than inside
@@ -679,7 +741,7 @@ impl Engine {
                 anyhow::bail!("{} does not exist", draft_file.display());
             }
             // The largest absolute position a draft attends: the KV ceiling
-            // plus the block and slack (`lfm2-chat`'s sizing).
+            // plus the block and slack.
             let max_pos = opts.kv_capacity + dcfg.block_size + 64;
             let dvb = unsafe {
                 VarBuilder::from_mmaped_safetensors(&[draft_file], DType::F16, &core.device)?
@@ -692,15 +754,16 @@ impl Engine {
             // per-sequence pool or the contiguous arm attends per row. The
             // static pipelined driver (private) keeps the contiguous default
             // (§10.2z: a shared pool costs THAT driver its overlap). An
-            // explicit `LLOOM_DSPARK_CTX_KV` wins on every arm.
-            let ctx_kv = match std::env::var("LLOOM_DSPARK_CTX_KV") {
-                Ok(v) => CtxKv::parse(&v)?,
-                Err(_) if pooled && n_seq > 1 => CtxKv::Paged {
-                    page_size: CtxKv::DEFAULT_PAGE_SIZE,
-                    shared: true,
-                },
-                Err(_) => CtxKv::Contiguous,
-            };
+            // explicit `tuning.dspark.ctx_kv` (`--dspark-ctx`, the
+            // `LLOOM_DSPARK_CTX_KV` alias) wins on every arm; its default
+            // spelling is the contiguous arm, so only a value that names
+            // another arm reads as a choice.
+            let ctx_kv = drafter_ctx_kv(
+                CtxKv::from_env()?,
+                std::env::var_os("LLOOM_DSPARK_CTX_KV").is_some(),
+                pooled,
+                n_seq,
+            );
             let mut spec = DSparkSpeculator::new_with_ctx(
                 drafter,
                 core.model.draft_embedding().clone(),
@@ -746,8 +809,15 @@ impl Engine {
             if opts.warmup {
                 // The batched draft's pipelines too (`m = n_seq·γ`, the
                 // ragged paged attention, the batched Markov chain).
+                let before = pipeline_cache_sizes(&core.device);
                 spec.warmup_rows(n_seq, &core.device)
                     .context("warming DSpark drafter pipelines")?;
+                let after = pipeline_cache_sizes(&core.device);
+                eprintln!(
+                    "[dspark: drafter warmup +{} libs +{} pipelines]",
+                    after.0.saturating_sub(before.0),
+                    after.1.saturating_sub(before.1),
+                );
             }
             Ok(spec)
         };
@@ -1863,6 +1933,111 @@ impl Engine {
         Ok((argmax, top))
     }
 
+    /// The verbose report's family lines: the pacer's depth against what
+    /// warmup measured, and the held sequence's KV slab with the process's
+    /// device allocation — the memory a run held at the length it reached,
+    /// not the ceiling it could have (§9.5's admission is a prediction; this
+    /// is the reading).
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let single = lock(&self.single);
+        let flag = single.decode.in_flight;
+        if let Some((measured, (host_ns, gpu_ns))) = self.warm_in_flight {
+            out.push(format!(
+                "[in-flight: depth {} (warmup measured {:.2} ms host encode / {:.2} ms gpu step -> \
+                 {measured}){}]",
+                if flag > 0 { flag } else { lloom::nn::decode::IN_FLIGHT_FLOOR },
+                host_ns as f64 / 1e6,
+                gpu_ns as f64 / 1e6,
+                if flag > 0 {
+                    ", overridden"
+                } else {
+                    "; the pacer takes decode.in_flight, whose 0 is the floor, not the measured depth"
+                },
+            ));
+        }
+        if let Some(seq) = single.seq.as_ref() {
+            let kv = seq.cache().kv_report();
+            let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
+            #[cfg(feature = "metal")]
+            let device_line = match &self.core.device {
+                Device::Metal(m) => format!(
+                    " device_allocated={:.2} GB working_set={:.2} GB",
+                    m.device().current_allocated_size() as f64 / 1e9,
+                    m.device().recommended_max_working_set_size() as f64 / 1e9
+                ),
+                _ => String::new(),
+            };
+            #[cfg(not(feature = "metal"))]
+            let device_line = String::new();
+            out.push(format!(
+                "[kv: len={} slab={} ceiling={} bucket={} grows={} kv_bytes={:.1} MiB{device_line}]",
+                kv.kv_len,
+                kv.slab,
+                kv.capacity,
+                kv.bucket,
+                kv.grows,
+                mib(kv.bytes)
+            ));
+        }
+        out
+    }
+
+    /// `lloom bench --mode reuse | concurrent` on this engine's model: the
+    /// modes build their own sessions, caches and — under `--rows pool*` —
+    /// the rows' pool, so the engine's own sequence is untouched.
+    pub fn run_mode(&self, spec: &super::modes::ModeSpec) -> Result<()> {
+        if self.sched.is_some() {
+            anyhow::bail!(
+                "`lloom bench --mode {}` drives its own sequences; load it at --batch 1 (the \
+                 scheduler would hold the pool the mode builds)",
+                spec.mode.name()
+            );
+        }
+        let pooled = spec.rows.pooled();
+        if pooled && self.config.kv_append != KvAppend::Paged {
+            anyhow::bail!(
+                "--rows {} makes every sequence a slot of one paged pool; the model loaded on \
+                 {:?} (load it on --cache pool, pool-spec under --dspark)",
+                spec.rows.name(),
+                self.config.kv_append
+            );
+        }
+        let pool = if pooled {
+            let p = BatchPool::new(
+                &self.config,
+                &self.core.device,
+                spec.sequences.max(1) + 3,
+                self.kv_capacity,
+            )
+            .context("allocating the rows' shared pool")?;
+            p.set_batched_arms(spec.rows == RowsArm::Pool);
+            Some(p)
+        } else {
+            None
+        };
+        let encode = |text: &str| -> Result<Vec<u32>> {
+            Ok(self
+                .text
+                .tokenizer
+                .encode(text, false)
+                .map_err(|e| anyhow::anyhow!("tokenizing: {e}"))?
+                .get_ids()
+                .to_vec())
+        };
+        super::modes::run(super::modes::Ctx {
+            model: &self.core.model,
+            config: &self.config,
+            device: &self.core.device,
+            dtype: self.dtype,
+            eos_ids: &self.text.eos_ids,
+            spec,
+            pool: pool.as_ref(),
+            dspark_setup: self.dspark_setup.clone(),
+            encode: &encode,
+        })
+    }
+
     fn check_fits(&self, prompt: usize, gen: usize) -> Result<()> {
         let need = prompt + gen;
         if need > self.kv_capacity {
@@ -2045,7 +2220,7 @@ fn static_dspark_body<'a, 'm>(
     Ok(outs)
 }
 
-/// The crown decode configuration `lfm2-chat --cache crown` bakes in: the
+/// The crown decode configuration `--cache crown` bakes in: the
 /// `Sdpa × InPlace × Shuffle` arms and the GEMV/conv fusions, every one
 /// token-identical to the generic path (§13.5, §12.2d, §12.2h). The library's
 /// `Config` ships the conservative arms (§7.1a); a serving binary turns the
@@ -2132,13 +2307,12 @@ fn crown_config(config: &mut Config) {
     config.conv_fused = true;
 }
 
-/// The REWINDABLE configuration the speculative body needs (`lfm2-chat
-/// --cache rewindable`): `Cache::advance` rewinds only under a rotating ring
-/// wide enough for the verify window (the shuffle is destructive) and
-/// `Cache::resolve` only under `InPlace` (the `Cat` arm has no length to
-/// rewind); the taps feed the drafter's projection at F32 (§10.2m).
-fn rewindable_config(config: &mut Config, dcfg: &DSparkConfig) {
-    let k = dcfg.max_draft();
+/// The REWINDABLE configuration the speculative body needs: `Cache::advance`
+/// rewinds only under a rotating ring wide enough for a `k`-token verify
+/// window (the shuffle is destructive) and `Cache::resolve` only under
+/// `InPlace` (the `Cat` arm has no length to rewind); `taps` feed the
+/// drafter's projection at F32 (§10.2m).
+fn rewindable_config(config: &mut Config, k: usize, taps: Vec<usize>) {
     config.qkv_layout = QkvLayout::Fused;
     config.attn_impl = AttnImpl::Sdpa;
     config.kv_append = KvAppend::InPlace;
@@ -2147,7 +2321,55 @@ fn rewindable_config(config: &mut Config, dcfg: &DSparkConfig) {
     config.gemv_residual = true;
     config.conv_fused = true;
     config.tap_dtype = DType::F32;
-    config.tap_layers = dcfg.tap_layers();
+    config.tap_layers = taps;
+}
+
+/// Whether the conv's left-context carry must be on: a prefill fed in more
+/// than one forward — a tile, a chunk, the spark's ramp — or onto a cache a
+/// held sequence extends zero-pads each piece's left edge without it, and
+/// computes something one pass does not (§13.2f defect 1). One forward onto
+/// a cold cache is identical either way.
+fn conv_carry_needed(
+    prefill_tile: usize,
+    prefill_chunk: usize,
+    decode: &crate::DecodeConfig,
+    reuse_prefix: bool,
+) -> bool {
+    prefill_tile > 0
+        || prefill_chunk > 0
+        || decode.prefill.ubatch > 0
+        || decode.prefill.spark.is_some()
+        || reuse_prefix
+}
+
+/// The drafter's context KV: the arm `tuning.dspark.ctx_kv` names when it
+/// was chosen — the env alias set, or a value other than its default — else
+/// one paged pool shared by every sequence on the pool arms at `N > 1` (the
+/// shape the batched draft reads in one dispatch, §12.9), else the
+/// contiguous arm (the static pipelined driver's; a shared pool costs it its
+/// overlap, §10.2z).
+fn drafter_ctx_kv(tuned: CtxKv, env_set: bool, pooled: bool, n_seq: usize) -> CtxKv {
+    if env_set || tuned != CtxKv::Contiguous {
+        tuned
+    } else if pooled && n_seq > 1 {
+        CtxKv::Paged {
+            page_size: CtxKv::DEFAULT_PAGE_SIZE,
+            shared: true,
+        }
+    } else {
+        CtxKv::Contiguous
+    }
+}
+
+/// The Metal kernel cache's `(libraries, pipelines)` sizes, `(0, 0)` off
+/// Metal: what a warmup compiled, by difference.
+fn pipeline_cache_sizes(device: &Device) -> (usize, usize) {
+    #[cfg(feature = "metal")]
+    if let Device::Metal(m) = device {
+        return m.kernels().cache_sizes();
+    }
+    let _ = device;
+    (0, 0)
 }
 
 /// The safetensors shards for a checkpoint: the sharded index if present,
@@ -2310,12 +2532,82 @@ impl super::served::Served for Engine {
     fn shutdown(&self) {
         Engine::shutdown(self)
     }
+    fn installed(&self) -> Option<&super::report::Installed> {
+        Some(&self.installed)
+    }
+    fn diagnostics(&self) -> Vec<String> {
+        Engine::diagnostics(self)
+    }
+    fn run_mode(&self, spec: &super::modes::ModeSpec) -> Result<()> {
+        Engine::run_mode(self, spec)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use lloom::nn::ops::KvQuant;
+
+    /// `--dspark-ctx` (the tuning knob) reaches the drafter on every arm;
+    /// only when nothing chose one does the pool arms' shared default apply.
+    #[test]
+    fn the_drafter_context_kv_follows_the_knob() {
+        let paged = CtxKv::Paged {
+            page_size: 256,
+            shared: false,
+        };
+        assert_eq!(
+            drafter_ctx_kv(paged, false, false, 1),
+            paged,
+            "the flag alone, --batch 1"
+        );
+        assert_eq!(
+            drafter_ctx_kv(paged, false, true, 4),
+            paged,
+            "the flag beats the pool default"
+        );
+        assert_eq!(
+            drafter_ctx_kv(CtxKv::Contiguous, true, true, 4),
+            CtxKv::Contiguous,
+            "the env alias naming the contiguous arm is a choice"
+        );
+        assert_eq!(
+            drafter_ctx_kv(CtxKv::Contiguous, false, true, 4),
+            CtxKv::Paged {
+                page_size: CtxKv::DEFAULT_PAGE_SIZE,
+                shared: true
+            }
+        );
+        assert_eq!(
+            drafter_ctx_kv(CtxKv::Contiguous, false, true, 1),
+            CtxKv::Contiguous
+        );
+        assert_eq!(
+            drafter_ctx_kv(CtxKv::Contiguous, false, false, 4),
+            CtxKv::Contiguous
+        );
+    }
+
+    /// The rewindable preset's ring holds the verify window, and its taps are
+    /// whatever the caller names (none on `rewindable-notap`).
+    #[test]
+    fn the_rewindable_preset_sizes_the_ring_for_k() {
+        let mut c = Config::default();
+        rewindable_config(&mut c, 9, vec![3, 10]);
+        assert_eq!(c.conv_state, ConvState::RotatingRing { k: 10 });
+        assert_eq!(
+            (c.attn_impl, c.kv_append),
+            (AttnImpl::Sdpa, KvAppend::InPlace)
+        );
+        assert_eq!(
+            (c.tap_dtype, c.tap_layers.clone()),
+            (DType::F32, vec![3, 10])
+        );
+        let mut c = Config::default();
+        rewindable_config(&mut c, 3, Vec::new());
+        assert_eq!(c.conv_state, ConvState::RotatingRing { k: 4 });
+        assert!(c.tap_layers.is_empty());
+    }
 
     fn config(quant: KvQuant, append: KvAppend) -> Config {
         let mut c = Config::default();

@@ -111,6 +111,31 @@ pub trait Served: Send + Sync {
         )
     }
 
+    /// The executor arms armed at load, for their engagement reports
+    /// (`report::print_executor`); `None` where nothing was armed.
+    fn installed(&self) -> Option<&super::report::Installed> {
+        None
+    }
+
+    /// The family's lines for a verbose run report: the state a turn left
+    /// behind that only the family can read (the held sequence's KV, the
+    /// pacer's depth against what warmup measured).
+    fn diagnostics(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The multi-sequence measurement modes (`lloom bench --mode reuse |
+    /// concurrent`): built where the family can drive several sequences of
+    /// one model directly; refused by name elsewhere.
+    fn run_mode(&self, spec: &super::modes::ModeSpec) -> Result<()> {
+        anyhow::bail!(
+            "{} has no `lloom bench --mode {}`: the reuse and concurrent modes drive LFM2's \
+             sessions, caches and pools directly (its `Served` is the only one that builds them)",
+            self.capabilities().family,
+            spec.mode.name()
+        )
+    }
+
     fn prefill_throughput(&self, n: usize, batch: usize) -> Result<PrefillTiming>;
     fn decode_throughput(
         &self,

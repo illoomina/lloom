@@ -546,6 +546,17 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         self.session.warmup(&self.device)
     }
 
+    /// What warmup measured: the in-flight depth its host/GPU balance
+    /// implies, and the `(host_ns, gpu_ns)` balance itself; zeros before it
+    /// runs. The session's pacer takes `decode.in_flight` (0 = the floor),
+    /// not this; a report names both.
+    pub fn measured_in_flight(&self) -> (usize, (u64, u64)) {
+        (
+            self.session.measured_in_flight_depth(),
+            self.session.measured_balance_ns(),
+        )
+    }
+
     /// The device this session decodes on.
     pub fn device(&self) -> &Device {
         &self.device
@@ -921,9 +932,17 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             Ok(())
         };
         let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+        // The session's own options, as the K=1 arms take them: the phase
+        // drain (`decode.phase_sync`) and the spark the drafter is seeded
+        // unit by unit from are this body's knobs; the cadence ones are
+        // read by nothing here.
         let opts = DecodeOptions {
             stop: Some(stop.clone()),
-            ..DecodeOptions::new(params.max_tokens)
+            ..self.config.options(
+                params.max_tokens,
+                ReadbackArm::Blocking,
+                params.prefill_tile,
+            )
         };
         let k = spec.max_draft();
         let out = self.session.decode_speculative(

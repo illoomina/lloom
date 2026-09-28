@@ -1,17 +1,22 @@
-//! The multi-sequence modes of `lfm2-chat` (absorbed from the former
-//! `lfm2-sequence`, issue #677 + #685 + #148):
+//! `lloom bench --mode reuse | concurrent`: the multi-sequence measurement
+//! modes, on LFM2 (`Served::run_mode`):
 //!
 //! * `--mode reuse` — a two-turn conversation decoded two ways (prefix reuse
 //!   through `Session::prepare` vs a fresh prefill), reporting whether the
 //!   streams agree and turn 2's TTFT on each. `DESIGN.md` §13.2f.
 //! * `--mode concurrent` — `--sequences` independent conversations interleaved
 //!   on one model in `--chunk`-token visits (non-speculative, time-sliced), or
-//!   — with `--dspark` — all of them through `Session::decode_speculative_pipelined`
-//!   (#685), which overlaps one sequence's draft/observe with the others'
-//!   verifies, or — with `--batched` — all of them through
-//!   `Session::decode_batched` (#694), one `m = B` forward per step for every
-//!   live sequence. Reports per-sequence identity against the solo stream and
-//!   the aggregate token rate.
+//!   — with `--dspark` — all of them through
+//!   `Session::decode_speculative_pipelined`, which overlaps one sequence's
+//!   draft/observe with the others' verifies, or — with `--batched` — all of
+//!   them through `Session::decode_batched_admitted`, one `m = B` forward per
+//!   step for every live sequence. Reports per-sequence identity against the
+//!   solo stream and the aggregate token rate.
+//!
+//! These are A/B instruments over the library's drivers, not serving shapes:
+//! each carries its own solo reference arm and identity check, which a server
+//! has no use for. The serving shape of the batched driver is `lloom serve
+//! --batch N` (the scheduler, `batch.rs`).
 //!
 //! The concurrent modes print **no token text** (they are a throughput/identity
 //! surface, not a chat) and instead repaint a **live raw-stats block** on stderr
@@ -23,7 +28,6 @@
 //! prefill work the harness exists to exercise.
 
 use anyhow::{Context, Result};
-use candle::{DType, Device};
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
@@ -31,15 +35,85 @@ use lloom::generation::{
 use lloom::models::lfm2::{BatchPool, Cache, Config, Model};
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, PrefillOut, ReuseAction, Session};
+use lloom_tensor::{DType, Device};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::time::Instant;
 
-/// `design/workloads/prompts/`, the #549 corpus: a multi-turn pair and four
-/// single prompts of DIFFERENT shapes — varied so the concurrent run exercises
-/// prefill rather than sharing one prefix.
+/// Which mode `lloom bench --mode` runs besides the cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Reuse,
+    Concurrent,
+}
+
+impl Mode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Reuse => "reuse",
+            Mode::Concurrent => "concurrent",
+        }
+    }
+}
+
+/// A mode's knobs, resolved from the option groups and `lloom bench`'s own
+/// flags before the engine loads.
+#[derive(Debug, Clone)]
+pub struct ModeSpec {
+    pub mode: Mode,
+    pub max_tokens: usize,
+    /// The readback arm every sequence takes, by its `--readback` spelling.
+    pub readback: String,
+    pub lookahead: usize,
+    pub commit_budget: CommitBudget,
+    pub sequences: usize,
+    /// Tokens per visit on the time-sliced interleave.
+    pub chunk: usize,
+    /// The prefill's spark under `--dspark` (both its arms seed the drafter
+    /// unit by unit, `Session::prefill_streamed`); the K=1 interleave and the
+    /// batched arm prefill one-shot and do not read it.
+    pub prefill_ubatch: usize,
+    /// The most prompt tokens one prefill forward takes, on the K=1
+    /// interleave and the batched arm.
+    pub prefill_tile: usize,
+    /// The most prompt tokens fed of one sequence per visit (interleave) or
+    /// per step (batched), between the others' decode; `0` prefills a prompt
+    /// whole at its arrival.
+    pub prefill_chunk: usize,
+    /// How a prompt piece's width is chosen (`lru` | `ladder`), on the batched
+    /// arm's pieces and the interleave's visits.
+    pub pass_widths: lloom::nn::PassWidths,
+    /// Sequence `i` arrives at round/step `i × stagger`.
+    pub stagger: usize,
+    /// The last sequence's synthetic prompt length in body tokens; `0` keeps
+    /// the corpus prompt.
+    pub long_prompt_tokens: usize,
+    /// Drive the sequences through the pipelined speculative driver instead
+    /// of the time-sliced interleave.
+    pub dspark: bool,
+    /// Drive the sequences through the batched-forward driver.
+    pub batched: bool,
+    /// How the sequences hold their state: `private` (a cache each), or a slot
+    /// of one pool (`pool`, `pool-per-row`).
+    pub rows: super::lfm2::RowsArm,
+    /// Under `batched`: re-run the rows as two separately batched halves and
+    /// assert each row's stream equals its full-batch stream — the
+    /// neighbour-independence check no digest sees.
+    pub check_independence: bool,
+    /// Under `batched`: skip the solo arm (a tile A/B at a large `B` wants
+    /// only the batched arm's step; the identity columns then read `false`).
+    pub skip_solo: bool,
+    /// Which arm runs first (`solo`, or `pipelined` / `batched`), so a
+    /// rotation can alternate the order.
+    pub first: String,
+    /// Under `dspark`: every round of both arms as CSV.
+    pub timeline: Option<PathBuf>,
+}
+
+/// `design/workloads/prompts/`, the workloads corpus: a multi-turn pair and
+/// four single prompts of DIFFERENT shapes — varied so the concurrent run
+/// exercises prefill rather than sharing one prefix.
 const TURN_1: &str = "I am designing a cache for a single-threaded interpreter. Entries are immutable once written and the working set is about eight times the cache. What eviction policy should I start with, and why not LRU?";
 const TURN_2: &str = "Suppose I measure and find the hit rate is 40% lower than you predicted. What are the two most likely causes, and which measurement separates them?";
 const PROMPTS: [&str; 8] = [
@@ -47,12 +121,10 @@ const PROMPTS: [&str; 8] = [
     "Count from one to forty, writing each number as a word on its own line, with no other text.",
     "Here is a Rust function that is missing its body:\n\nfn merge_sorted(a: &[i32], b: &[i32]) -> Vec<i32> {\n    // Merge two already-sorted slices into one sorted Vec.\n    // Do not allocate more than once.\n}\n\nWrite the body. Explain your choice of capacity for the allocation, and say what happens when one slice is empty.",
     "Extract every date, monetary amount, and party name from the paragraph below and return them as a JSON object with the keys \"dates\", \"amounts\", and \"parties\". Return only the JSON.\n\nOn 14 March 2019, Halloran Freight Ltd. agreed to pay Baswick Terminals the sum of 48,250 GBP in settlement of demurrage accrued between 2 January 2019 and 27 February 2019. A further 6,900 GBP was withheld pending inspection, to be released on or before 30 April 2019 unless Baswick Terminals lodged an objection.",
-    // The `design/workloads/prompts/` corpus (#549), embedded so a batched run
-    // at `--sequences` above four still has distinct prompts of distinct
-    // shapes. The four above ARE the corpus's `short-factual`,
-    // `low-entropy-list`, `code-completion` and `structured-extract`, so the
-    // four added here are the corpus members the built-ins do not already
-    // carry. Beyond eight the set cycles.
+    // The corpus's other four, embedded so a batched run at `--sequences`
+    // above four still has distinct prompts of distinct shapes (the four
+    // above ARE its `short-factual`, `low-entropy-list`, `code-completion`
+    // and `structured-extract`). Beyond eight the set cycles.
     include_str!("../../../../design/workloads/prompts/long-summarize.txt"),
     include_str!("../../../../design/workloads/prompts/multiturn-t1.txt"),
     include_str!("../../../../design/workloads/prompts/multiturn-t2.txt"),
@@ -61,12 +133,10 @@ const PROMPTS: [&str; 8] = [
 
 /// Render a knob's value only when the run read it. `--dspark` drives the
 /// speculative body over a fixed `Blocking` handle whose commit, lookahead and
-/// pacer paths it never enters (`Session::decode_speculative` commits only
-/// under a ring-owning strategy and holds no pipelined period), so
-/// `--readback`, `--lookahead`, `--commit-budget` and `--wake-cadence` are
-/// parsed there and unread. A value printed beside a run that did not read it
-/// compares equal to every run that did — §7.1a-i's wrong-arm shape — so it
-/// renders as unread instead.
+/// pacer paths it never enters, so `--readback`, `--lookahead` and
+/// `--commit-budget` are parsed there and unread. A value printed beside a run
+/// that did not read it compares equal to every run that did — §7.1a-i's
+/// wrong-arm shape — so it renders as unread instead.
 pub fn read_or_na(read: bool, value: impl std::fmt::Display) -> String {
     if read {
         value.to_string()
@@ -84,63 +154,22 @@ fn prompt_set(n: usize) -> Vec<&'static str> {
         .collect()
 }
 
-/// What `run` needs from `main` after it has built the model, config and eos set.
+/// What `run` needs from the engine: the model it loaded, the config it was
+/// built from, the EOS set, the knobs, and — under `--rows pool*` — the pool
+/// every sequence's cache is a slot of.
 pub struct Ctx<'a> {
     pub model: &'a Model,
     pub config: &'a Config,
     pub device: &'a Device,
     pub dtype: DType,
     pub eos_ids: &'a [u32],
-    /// `mode` ("reuse" | "concurrent"), and the knobs the modes read.
-    pub mode: &'a str,
-    pub max_tokens: usize,
-    pub readback: &'a str,
-    pub lookahead: usize,
-    pub commit_budget: &'a str,
-    pub sequences: usize,
-    pub chunk: usize,
-    /// `--prefill-ubatch`: the prefill's spark under `--dspark` (both its
-    /// arms seed the drafter unit by unit, `Session::prefill_streamed`). The
-    /// K=1 interleave and the batched arm prefill one-shot and do not read it.
-    pub prefill_ubatch: usize,
-    /// `--prefill-tile`: the most prompt tokens one prefill forward takes, on
-    /// the K=1 interleave and the batched arm (#728).
-    pub prefill_tile: usize,
-    /// `--prefill-chunk`: the most prompt tokens fed of one sequence per
-    /// visit (interleave) or per step (batched), between the others' decode.
-    /// `0` prefills a prompt whole at its arrival.
-    pub prefill_chunk: usize,
-    /// `--pass-widths`: how a prompt piece's width is chosen (`lru` |
-    /// `ladder`), on the batched arm's pieces and this driver's visits.
-    pub pass_widths: lloom::nn::PassWidths,
-    /// `--stagger`: sequence `i` arrives at round/step `i × stagger`.
-    pub stagger: usize,
-    /// `--long-prompt-tokens`: the last sequence's synthetic prompt length in
-    /// body tokens; `0` keeps the corpus prompt.
-    pub long_prompt_tokens: usize,
-    /// `--dspark` — drive the concurrent sequences through the pipelined
-    /// speculative driver instead of the time-sliced non-spec interleave.
-    pub dspark: bool,
-    /// `--batched` — drive the concurrent sequences through the batched-forward
-    /// driver (`Session::decode_batched`, #694): one `m = B` forward per step.
-    pub batched: bool,
-    /// Under `--rows pool|pool-per-row`: the pool every sequence's cache is
-    /// a slot of (`batched-decode-design.md` §12.2).
+    pub spec: &'a ModeSpec,
     pub pool: Option<&'a BatchPool>,
-    /// Under `--batched`: also run the rows in two separately batched halves
-    /// and assert each row's stream equals its full-batch stream — the
-    /// neighbour-independence check no digest sees.
-    pub check_independence: bool,
-    /// Under `--batched`: skip the solo arm (a tile A/B at a large `B` wants
-    /// only the batched arm's step; the identity columns then read `false`).
-    pub skip_solo: bool,
-    /// The drafter dir + config, resolved by `main` when `--dspark` is set.
+    /// The drafter dir + config, under `--dspark`.
     pub dspark_setup: Option<(PathBuf, DSparkConfig)>,
-    pub first: &'a str,
-    pub timeline: Option<PathBuf>,
-    /// Raw tokenizer encode (NO chat wrapping), passed as a closure so `main`
-    /// owns the tokenizer. The modes wrap with `user_turn_text` themselves, and
-    /// the reuse mode also encodes pre-wrapped text raw.
+    /// Raw tokenizer encode (no chat wrapping): the modes wrap with
+    /// `user_turn_text` themselves, and the reuse mode also encodes
+    /// pre-wrapped text raw.
     pub encode: &'a dyn Fn(&str) -> Result<Vec<u32>>,
 }
 
@@ -158,7 +187,9 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-/// One readback strategy per sequence, chosen by name.
+/// One readback strategy per sequence, chosen by name. One per sequence,
+/// held for the run: the ring's size is not worth a box.
+#[allow(clippy::large_enum_variant)]
 enum Arm {
     Blocking(Blocking),
     Ring(Ring),
@@ -247,8 +278,8 @@ fn prompt_ids(ctx: &Ctx<'_>, n: usize) -> Result<Vec<Vec<u32>>> {
         .iter()
         .map(|p| (ctx.encode)(&user_turn_text(p)))
         .collect::<Result<_>>()?;
-    if ctx.long_prompt_tokens > 0 {
-        let target = ctx.long_prompt_tokens;
+    if ctx.spec.long_prompt_tokens > 0 {
+        let target = ctx.spec.long_prompt_tokens;
         let body_text = PROMPTS[4].trim_end();
         let mut body: Vec<u32> = Vec::new();
         while body.len() < target {
@@ -381,7 +412,6 @@ impl LiveStats {
     }
 }
 
-/// Entry point from `main` once `mode != "single"`.
 /// A sequence's cache: a slot of the pool under `--rows pool*`, else its own.
 fn new_cache(
     pool: Option<&BatchPool>,
@@ -396,14 +426,14 @@ fn new_cache(
 }
 
 pub fn run(ctx: Ctx<'_>) -> Result<()> {
-    let budget = CommitBudget::from_str(ctx.commit_budget).map_err(anyhow::Error::msg)?;
-    let lookahead = if ctx.readback == "blocking" {
+    let budget = ctx.spec.commit_budget;
+    let lookahead = if ctx.spec.readback == "blocking" {
         0
     } else {
-        ctx.lookahead
+        ctx.spec.lookahead
     };
     let opts = DecodeOptions {
-        max_tokens: ctx.max_tokens,
+        max_tokens: ctx.spec.max_tokens,
         budget,
         lookahead,
         sample_split: false,
@@ -426,7 +456,7 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         eos_gate: false,
         fused_publish: true,
         // The tile bounds every prefill forward, a visit's chunk included.
-        prefill_tile: ctx.prefill_tile,
+        prefill_tile: ctx.spec.prefill_tile,
         // The time-sliced interleave chunks at the visit level (`run_concurrent`)
         // and the batched driver reads its own copy (`run_batched_concurrent`).
         prefill_chunk: 0,
@@ -434,26 +464,31 @@ pub fn run(ctx: Ctx<'_>) -> Result<()> {
         // the visit's width itself (`run_concurrent`).
         pass_widths: lloom::nn::PassWidths::Lru,
     };
-    let capacity = 8 * ctx.max_tokens + 8 * (budget.period() + 2);
+    let capacity = 8 * ctx.spec.max_tokens + 8 * (budget.period() + 2);
 
     // Under `--dspark` the speculative drivers read none of the readback knobs
     // (`read_or_na`); the line names the arm that ran and marks the rest unread.
     let common = format!(
         "readback={} lookahead={} commit_budget={} in_flight_steps={} max_tokens={} dtype={:?}",
-        if ctx.dspark { "dspark" } else { ctx.readback },
-        read_or_na(!ctx.dspark, lookahead),
-        read_or_na(!ctx.dspark, budget.arm()),
-        read_or_na(!ctx.dspark, lloom::nn::decode::IN_FLIGHT_STEPS),
-        ctx.max_tokens,
+        if ctx.spec.dspark {
+            "dspark"
+        } else {
+            ctx.spec.readback.as_str()
+        },
+        read_or_na(!ctx.spec.dspark, lookahead),
+        read_or_na(!ctx.spec.dspark, budget.arm()),
+        read_or_na(!ctx.spec.dspark, lloom::nn::decode::IN_FLIGHT_STEPS),
+        ctx.spec.max_tokens,
         ctx.dtype
     );
 
-    match ctx.mode {
-        "reuse" => run_reuse(&ctx, &opts, capacity, &common),
-        "concurrent" if ctx.dspark => run_dspark_concurrent(&ctx, &common),
-        "concurrent" if ctx.batched => run_batched_concurrent(&ctx, &opts, capacity, &common),
-        "concurrent" => run_concurrent(&ctx, &opts, capacity, &common),
-        other => anyhow::bail!("--mode must be `single`, `reuse` or `concurrent`, got `{other}`"),
+    match ctx.spec.mode {
+        Mode::Reuse => run_reuse(&ctx, &opts, capacity, &common),
+        Mode::Concurrent if ctx.spec.dspark => run_dspark_concurrent(&ctx, &common),
+        Mode::Concurrent if ctx.spec.batched => {
+            run_batched_concurrent(&ctx, &opts, capacity, &common)
+        }
+        Mode::Concurrent => run_concurrent(&ctx, &opts, capacity, &common),
     }
 }
 
@@ -463,7 +498,7 @@ fn run_reuse(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: &str)
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
     let turn1 = (ctx.encode)(&user_turn_text(TURN_1))?;
     let mut session = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
-    let mut arm = Arm::new(ctx.readback, ctx.eos_ids, device, capacity)?;
+    let mut arm = Arm::new(&ctx.spec.readback, ctx.eos_ids, device, capacity)?;
     let t1 = decode(&mut session, &mut arm, &turn1, opts)?;
     let reply1 = t1.out.ids.clone();
     eprintln!(
@@ -490,7 +525,7 @@ fn run_reuse(ctx: &Ctx<'_>, opts: &DecodeOptions, capacity: usize, common: &str)
     let reply2_reuse = t2.out.ids.clone();
 
     let mut fresh = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
-    let mut arm_f = Arm::new(ctx.readback, ctx.eos_ids, device, capacity)?;
+    let mut arm_f = Arm::new(&ctx.spec.readback, ctx.eos_ids, device, capacity)?;
     let tf = decode(&mut fresh, &mut arm_f, &full2, opts)?;
     let reply2_fresh = tf.out.ids.clone();
 
@@ -554,7 +589,7 @@ fn run_concurrent(
     common: &str,
 ) -> Result<()> {
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
-    let n = ctx.sequences.max(1);
+    let n = ctx.spec.sequences.max(1);
     let prompts = prompt_ids(ctx, n)?;
     let prompt_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
 
@@ -564,7 +599,7 @@ fn run_concurrent(
     let mut solo_rates = Vec::with_capacity(n);
     for p in &prompts {
         let mut s = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
-        let mut arm = Arm::new(ctx.readback, ctx.eos_ids, device, capacity)?;
+        let mut arm = Arm::new(&ctx.spec.readback, ctx.eos_ids, device, capacity)?;
         let t = decode(&mut s, &mut arm, p, opts)?;
         solo_wall += t.wall.as_secs_f64();
         solo_rates.push(t.out.ids.len() as f64 / t.wall.as_secs_f64());
@@ -588,11 +623,11 @@ fn run_concurrent(
         })
         .collect::<Result<_>>()?;
     let mut arms: Vec<Arm> = (0..n)
-        .map(|_| Arm::new(ctx.readback, ctx.eos_ids, device, capacity))
+        .map(|_| Arm::new(&ctx.spec.readback, ctx.eos_ids, device, capacity))
         .collect::<Result<_>>()?;
     let mut streams: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut done = vec![false; n];
-    let arrivals: Vec<usize> = (0..n).map(|i| i * ctx.stagger).collect();
+    let arrivals: Vec<usize> = (0..n).map(|i| i * ctx.spec.stagger).collect();
     let mut prefilled = vec![0usize; n];
     let mut arrival_at: Vec<Option<f64>> = vec![None; n];
     let mut first_token_at: Vec<Option<f64>> = vec![None; n];
@@ -602,7 +637,7 @@ fn run_concurrent(
     let mut visits = 0usize;
     let mut resumes = 0usize;
     let mut round = 0usize;
-    let mut live = LiveStats::new("concurrent", vec![ctx.max_tokens; n], false);
+    let mut live = LiveStats::new("concurrent", vec![ctx.spec.max_tokens; n], false);
     live.paint();
     let t = Instant::now();
     while done.iter().any(|d| !d) {
@@ -615,19 +650,19 @@ fn run_concurrent(
             }
             if prefilled[i] < prompts[i].len() {
                 let remaining = prompts[i].len() - prefilled[i];
-                let take = if ctx.prefill_chunk == 0 {
+                let take = if ctx.spec.prefill_chunk == 0 {
                     remaining
-                } else if ctx.pass_widths == lloom::nn::PassWidths::Ladder {
+                } else if ctx.spec.pass_widths == lloom::nn::PassWidths::Ladder {
                     // The visit's width from the ladder's rungs (§9.2aa I4):
                     // the tile bounded by the chunk is the top rung.
-                    let top = if ctx.prefill_tile > 0 {
-                        ctx.prefill_tile.min(ctx.prefill_chunk)
+                    let top = if ctx.spec.prefill_tile > 0 {
+                        ctx.spec.prefill_tile.min(ctx.spec.prefill_chunk)
                     } else {
-                        ctx.prefill_chunk
+                        ctx.spec.prefill_chunk
                     };
-                    lloom::nn::ladder_width(remaining.min(ctx.prefill_chunk), top)
+                    lloom::nn::ladder_width(remaining.min(ctx.spec.prefill_chunk), top)
                 } else {
-                    remaining.min(ctx.prefill_chunk)
+                    remaining.min(ctx.spec.prefill_chunk)
                 };
                 let prepared = sessions[i].prepare(&prompts[i][..prefilled[i] + take])?;
                 if prepared.suffix.len() != take {
@@ -650,7 +685,7 @@ fn run_concurrent(
             if prepared.action == ReuseAction::Resume {
                 resumes += 1;
             }
-            let want = ctx.chunk.min(ctx.max_tokens - streams[i].len());
+            let want = ctx.spec.chunk.min(ctx.spec.max_tokens - streams[i].len());
             let visit_opts = DecodeOptions {
                 max_tokens: want,
                 ..opts.clone()
@@ -671,7 +706,7 @@ fn run_concurrent(
             }
             streams[i].extend_from_slice(&out.ids);
             visits += 1;
-            if out.eos || streams[i].len() >= ctx.max_tokens {
+            if out.eos || streams[i].len() >= ctx.spec.max_tokens {
                 done[i] = true;
             }
             live.set(i, streams[i].len(), 0, done[i]);
@@ -716,10 +751,10 @@ fn run_concurrent(
     eprintln!(
         "[{n} sequences interleaved in {}-token visits (prefill chunk {}, tile {}, stagger {}): \
          {total} tokens in {wall:.3} s = {:.1} tok/s aggregate; solo {:.1} tok/s mean]",
-        ctx.chunk,
-        ctx.prefill_chunk,
-        ctx.prefill_tile,
-        ctx.stagger,
+        ctx.spec.chunk,
+        ctx.spec.prefill_chunk,
+        ctx.spec.prefill_tile,
+        ctx.spec.stagger,
         total as f64 / wall,
         solo_rates.iter().sum::<f64>() / n as f64,
     );
@@ -731,10 +766,10 @@ fn run_concurrent(
          per_seq_identical={:?} per_seq_tokens={:?} per_seq_ttft_ms={:?} \
          per_seq_gap_p50_ms={:?} per_seq_gap_max_ms={:?}",
         arms[0].eos_read(),
-        ctx.chunk,
-        ctx.prefill_chunk,
-        ctx.prefill_tile,
-        ctx.stagger,
+        ctx.spec.chunk,
+        ctx.spec.prefill_chunk,
+        ctx.spec.prefill_tile,
+        ctx.spec.stagger,
         prompt_lens,
         visits,
         prefill_visits,
@@ -788,15 +823,15 @@ impl SpecArm {
 }
 
 /// `--mode concurrent --dspark`: every prompt solo through the serial
-/// speculative loop, and all through the pipelined driver (#685), with the live
-/// stats repainting on the pipelined arm's per-sequence callback.
+/// speculative loop, and all through the pipelined driver, with the live stats
+/// repainting on the pipelined arm's per-sequence callback.
 fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
     let (draft_dir, dcfg) = ctx
         .dspark_setup
         .as_ref()
         .context("--dspark set but no drafter resolved")?;
-    let n = ctx.sequences.max(1);
+    let n = ctx.spec.sequences.max(1);
     let prompts: Vec<Vec<u32>> = prompt_set(n)
         .iter()
         .map(|p| (ctx.encode)(&user_turn_text(p)))
@@ -808,7 +843,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         anyhow::bail!("{} does not exist", draft_file.display());
     }
     let longest = prompts.iter().map(|p| p.len()).max().unwrap_or(0);
-    let max_pos = longest + ctx.max_tokens + dcfg.block_size + 64;
+    let max_pos = longest + ctx.spec.max_tokens + dcfg.block_size + 64;
     let dvb = unsafe {
         lloom::nn::VarBuilder::from_mmaped_safetensors(&[draft_file], DType::F16, device)?
     };
@@ -829,9 +864,9 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         spec.ctx_kv().name()
     );
     let opts = DecodeOptions {
-        max_tokens: ctx.max_tokens,
-        prefill_ubatch: ctx.prefill_ubatch,
-        ..DecodeOptions::new(ctx.max_tokens)
+        max_tokens: ctx.spec.max_tokens,
+        prefill_ubatch: ctx.spec.prefill_ubatch,
+        ..DecodeOptions::new(ctx.spec.max_tokens)
     };
     let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
 
@@ -855,7 +890,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
     let run_solo = |spec: &mut DSparkSpeculator| -> Result<SpecArm> {
         let t = Instant::now();
         let mut outs = Vec::with_capacity(n);
-        let mut live = LiveStats::new("solo", vec![ctx.max_tokens; n], true);
+        let mut live = LiveStats::new("solo", vec![ctx.spec.max_tokens; n], true);
         live.paint();
         for (i, p) in prompts.iter().enumerate() {
             let mut s = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
@@ -895,7 +930,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
             .collect::<Result<_>>()?;
         let prompt_refs: Vec<&[u32]> = prompts.iter().map(|p| p.as_slice()).collect();
         let mut streams: Vec<Vec<u32>> = vec![Vec::new(); n];
-        let mut live = LiveStats::new("pipelined", vec![ctx.max_tokens; n], true);
+        let mut live = LiveStats::new("pipelined", vec![ctx.spec.max_tokens; n], true);
         live.paint();
         let t = Instant::now();
         let outs = Session::decode_speculative_pipelined(
@@ -930,7 +965,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
         })
     };
 
-    let (solo, pipe) = match ctx.first {
+    let (solo, pipe) = match ctx.spec.first.as_str() {
         "solo" => {
             let s = run_solo(&mut spec)?;
             let p = run_pipelined(&mut spec)?;
@@ -950,14 +985,14 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
     }
 
     let identical: Vec<bool> = (0..n).map(|i| pipe.streams[i] == solo.streams[i]).collect();
-    for i in 0..n {
+    for (i, same) in identical.iter().enumerate() {
         eprintln!(
             "[seq {i}: solo {} tokens in {} rounds; pipelined {} tokens in {} rounds; {}]",
             solo.streams[i].len(),
             solo.outs[i].stats.rounds.len(),
             pipe.streams[i].len(),
             pipe.outs[i].stats.rounds.len(),
-            if identical[i] { "IDENTICAL" } else { "DIFFERS" }
+            if *same { "IDENTICAL" } else { "DIFFERS" }
         );
     }
     for arm in [&solo, &pipe] {
@@ -975,7 +1010,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
             arm.per_round_ms(|r| r.timing.wall_ns()),
         );
     }
-    if let Some(path) = &ctx.timeline {
+    if let Some(path) = &ctx.spec.timeline {
         let mut w = String::from(
             "arm,seq,round,start_ms,draft_ms,enqueue_ms,wait_ms,observe_ms,accepted\n",
         );
@@ -1004,8 +1039,8 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
          solo_tokens={} solo_rounds={} solo_wall_s={:.4} solo_aggregate_tok_s={:.4} \
          pipelined_tokens={} pipelined_rounds={} pipelined_wall_s={:.4} pipelined_aggregate_tok_s={:.4} \
          speedup={:.4} identical={} per_seq_identical={:?} per_seq_tokens={:?}",
-        ctx.first,
-        ctx.prefill_ubatch,
+        ctx.spec.first,
+        ctx.spec.prefill_ubatch,
         solo.outs.iter().map(|o| o.stats.prefill_units).collect::<Vec<_>>(),
         pipe.outs.iter().map(|o| o.stats.prefill_units).collect::<Vec<_>>(),
         solo.tokens(),
@@ -1030,7 +1065,7 @@ fn run_dspark_concurrent(ctx: &Ctx<'_>, common: &str) -> Result<()> {
 fn profile_take() -> (f64, u64, u64) {
     #[cfg(feature = "metal")]
     {
-        use candle::kernels::metal::profile;
+        use lloom_tensor::kernels::metal::profile;
         if profile::enabled() {
             let s = profile::snapshot();
             profile::reset();
@@ -1046,7 +1081,7 @@ fn profile_take() -> (f64, u64, u64) {
 fn profile_census() -> HashMap<String, u64> {
     #[cfg(feature = "metal")]
     {
-        use candle::kernels::metal::profile;
+        use lloom_tensor::kernels::metal::profile;
         if profile::enabled() {
             return profile::snapshot().by_label.into_iter().collect();
         }
@@ -1094,22 +1129,22 @@ fn run_batched_concurrent(
     common: &str,
 ) -> Result<()> {
     let (model, config, device, dtype) = (ctx.model, ctx.config, ctx.device, ctx.dtype);
-    let n = ctx.sequences.max(1);
+    let n = ctx.spec.sequences.max(1);
     let prompts = prompt_ids(ctx, n)?;
     let prompt_lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
     // The batched driver's own options: the lookahead is the arm's, the commit
     // budget and sample split have no meaning under it; the tile bounds each
-    // prefill forward and the chunk is the per-step prompt budget (#728).
+    // prefill forward and the chunk is the per-step prompt budget.
     let batched_opts = DecodeOptions {
-        max_tokens: ctx.max_tokens,
-        lookahead: ctx.lookahead.min(1),
-        prefill_tile: ctx.prefill_tile,
-        prefill_chunk: ctx.prefill_chunk,
-        pass_widths: ctx.pass_widths,
-        ..DecodeOptions::new(ctx.max_tokens)
+        max_tokens: ctx.spec.max_tokens,
+        lookahead: ctx.spec.lookahead.min(1),
+        prefill_tile: ctx.spec.prefill_tile,
+        prefill_chunk: ctx.spec.prefill_chunk,
+        pass_widths: ctx.spec.pass_widths,
+        ..DecodeOptions::new(ctx.spec.max_tokens)
     };
     // Row `i` arrives at step `i × stagger`.
-    let arrivals: Vec<u64> = (0..n).map(|i| (i * ctx.stagger) as u64).collect();
+    let arrivals: Vec<u64> = (0..n).map(|i| (i * ctx.spec.stagger) as u64).collect();
 
     // Warm the batched GEMM pipelines at this `B` off the clock: the row-tile
     // pipelines `Session::warmup` compiled are the prefill's; a batched step at
@@ -1143,13 +1178,13 @@ fn run_batched_concurrent(
     }
 
     let run_solo = || -> Result<BatchArm> {
-        let mut live = LiveStats::new("solo", vec![ctx.max_tokens; n], false);
+        let mut live = LiveStats::new("solo", vec![ctx.spec.max_tokens; n], false);
         live.paint();
         let t = Instant::now();
         let mut outs = Vec::with_capacity(n);
         for (i, p) in prompts.iter().enumerate() {
             let mut s = Session::new(model, new_cache(ctx.pool, dtype, config, device)?);
-            let mut arm = Arm::new(ctx.readback, ctx.eos_ids, device, capacity)?;
+            let mut arm = Arm::new(&ctx.spec.readback, ctx.eos_ids, device, capacity)?;
             let out = decode(&mut s, &mut arm, p, opts)?.out;
             live.set(i, out.ids.len(), 0, true);
             live.paint();
@@ -1187,7 +1222,7 @@ fn run_batched_concurrent(
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
         let mut streams: Vec<Vec<u32>> = vec![Vec::new(); rows.len()];
         let mut stamps: Vec<Vec<f64>> = vec![Vec::new(); rows.len()];
-        let mut live = LiveStats::new(label, vec![ctx.max_tokens; rows.len()], false);
+        let mut live = LiveStats::new(label, vec![ctx.spec.max_tokens; rows.len()], false);
         live.paint();
         let t = Instant::now();
         let outs = Session::decode_batched_admitted(
@@ -1244,7 +1279,7 @@ fn run_batched_concurrent(
         census: HashMap::new(),
         stamps: vec![Vec::new(); n],
     };
-    let (solo, batched) = match (ctx.first, ctx.skip_solo) {
+    let (solo, batched) = match (ctx.spec.first.as_str(), ctx.spec.skip_solo) {
         (_, true) => (empty_solo(), run_batched("batched", &all)?),
         ("solo", _) => {
             let s = run_solo()?;
@@ -1298,7 +1333,7 @@ fn run_batched_concurrent(
     // Neighbour independence: the same rows batched in two halves must give
     // each row the full batch's stream — both arms take the `m > 1` GEMM,
     // so this is exact where the solo comparison is tier 2.
-    let independent = if ctx.check_independence && n >= 2 {
+    let independent = if ctx.spec.check_independence && n >= 2 {
         let half = n / 2;
         let lo: Vec<usize> = (0..half).collect();
         let hi: Vec<usize> = (half..n).collect();
@@ -1407,11 +1442,11 @@ fn run_batched_concurrent(
          batched_gemm={} batched_gemv={} batched_step_ms_median={:.4} \
          speedup={:.4} identical={} per_seq_identical={:?} common_prefix={:?} independent={:?} \
          per_seq_tokens={:?} per_seq_overrun={:?}",
-        ctx.first,
+        ctx.spec.first,
         batched_opts.lookahead,
-        ctx.prefill_chunk,
-        ctx.prefill_tile,
-        ctx.stagger,
+        ctx.spec.prefill_chunk,
+        ctx.spec.prefill_tile,
+        ctx.spec.stagger,
         arrivals,
         batched.outs.iter().map(|o| o.stats.prefill_units).collect::<Vec<_>>(),
         batched
@@ -1451,7 +1486,7 @@ fn run_batched_concurrent(
     Ok(())
 }
 
-/// The ChatML user-turn wrapping, matching `lfm2-chat`'s single path.
+/// The ChatML user-turn wrapping.
 fn user_turn_text(p: &str) -> String {
     format!("<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n")
 }

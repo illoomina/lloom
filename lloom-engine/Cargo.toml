@@ -43,6 +43,8 @@ sha2 = { version = "0.10", optional = true }
 # composes image rows and names no codec.
 image = { workspace = true, optional = true }
 base64 = { version = "0.22", optional = true }
+# `lloom chat --verbose`'s page-fault count over a turn (`getrusage`).
+libc = { workspace = true, optional = true }
 # The sampling group draws a fresh seed when none is given (the library too).
 rand = { workspace = true }
 
@@ -90,4 +92,5 @@ serve = [
     "dep:sha2",
     "dep:image",
     "dep:base64",
+    "dep:libc",
 ]

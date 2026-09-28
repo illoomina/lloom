@@ -436,9 +436,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         }
         if opts.warmup {
             let t = Instant::now();
-            // This model brackets the passes the warmup runs itself, after its
-            // embedding; a driver's pass of the same key opens before it. The
-            // warmup's passes must leave no plan behind (`DESIGN.md` §9.2aa).
+            // The warmup's passes belong to no sequence and must leave no plan
+            // behind (`DESIGN.md` §9.2aa).
             #[cfg(feature = "metal")]
             let _paused = match &engine.device {
                 Device::Metal(m) => Some(m.pause_pass_plans()?),
@@ -1094,6 +1093,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
         let logits = self.with_single(|s| {
             s.reset();
             let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
+            // No driver bracket: the model opens its own passes, keyed apart
+            // from a driver's pass of the same shape (§9.2aa).
             let logits = s.model().forward(&input, 0, s.cache_mut())?;
             s.reset();
             Ok(logits.squeeze(0)?.to_dtype(DType::F32)?)

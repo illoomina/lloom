@@ -208,6 +208,15 @@ pub fn eos_gate_name(report: Option<lloom_tensor::EosGateReport>) -> &'static st
     }
 }
 
+/// A run's host fill for a report line: `fills/forwards`, or `off` when the
+/// run took none (`DecodeStats::host_feed`).
+pub fn host_fill_name(report: Option<&lloom::nn::HostFeedReport>) -> String {
+    match report {
+        Some(f) => format!("{}/{}", f.fills, f.forwards),
+        None => "off".to_string(),
+    }
+}
+
 pub fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }

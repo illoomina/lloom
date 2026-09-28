@@ -10,7 +10,7 @@
 //! says what the process holds — the model's tensors, whether the tower is
 //! loaded — and, under `CANDLE_METAL_PROFILE=1`, the image's dispatch census.
 
-use super::common::{eos_gate_name, ms, NEVER_EOS};
+use super::common::{eos_gate_name, host_fill_name, ms, NEVER_EOS};
 use super::vision::{expand_image_tokens, DecodedImage};
 use super::{load_engine, ModelArgs, Shape};
 use anyhow::{Context, Result};
@@ -33,8 +33,11 @@ pub struct ChatArgs {
     /// `--readback auto` is `lloom serve`'s on both families: the flow on
     /// LFM2 (the adaptive commit, the reader, the EOS gate — the forwards
     /// past a turn's EOS write nothing, so the next turn extends the cache)
-    /// and the blocking arm on Qwen4-exp. `--readback ring-la0` is the ring
-    /// without the lookahead, whose cache also ends at the EOS.
+    /// and the blocking arm on Qwen4-exp, where `--readback ring-fixed`
+    /// feeds the PLE from the host instead (faster while the streamed expert
+    /// pool holds the working set, slower while it misses).
+    /// `--readback ring-la0` is the ring without the lookahead, whose cache
+    /// also ends at the EOS.
     #[command(flatten)]
     pub common: super::CommonArgs,
 
@@ -238,7 +241,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(started.elapsed());
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -254,6 +257,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
             tokens_sha256(&decoded.tokens),
             tokens_sha256(&ids),
             eos_gate_name(st.eos_gate),
+            host_fill_name(st.host_feed.as_ref()),
         );
         let report = engine.vision_report();
         if !report.is_null() {

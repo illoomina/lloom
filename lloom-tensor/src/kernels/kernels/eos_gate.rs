@@ -47,8 +47,10 @@ pub fn call_eos_gate(
     Ok(())
 }
 /// `words_publish`: `n` u32 words from `src` into the mapped `out`, then the
-/// `generation` stamp into `step` (data first, a device barrier, then the
-/// stamp — the fused publish's order). One threadgroup.
+/// `generation` stamp into `step` behind a device barrier, unless
+/// `generation` is 0. The barrier orders the two for the GPU, not for a host
+/// polling the stamp: such a caller passes 0 and stamps with
+/// [`call_ring_stamp`] certifying `out`. One threadgroup.
 #[allow(clippy::too_many_arguments)]
 pub fn call_words_publish(
     device: &Device,

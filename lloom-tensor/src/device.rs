@@ -613,10 +613,10 @@ impl Device {
     }
 
     /// `words_publish` (Metal): `n` U32 words of `src` copied into the
-    /// CPU-mapped `out`, then `generation` stamped into `step` behind a
-    /// device barrier — the fused publish's data-then-stamp order, for a
-    /// host that polls `step` and reads `out` in place (lloom #148, the
-    /// speculative verify's readback).
+    /// CPU-mapped `out`, then `generation` stamped into `step` by a dispatch
+    /// ordered after the copy (a `ring_stamp` bound to `out`), for a host
+    /// that polls `step` and reads `out` in place — the speculative verify's
+    /// readback. A host that sees the stamp reads this publish's words.
     pub fn words_publish(
         &self,
         src: &crate::Tensor,

@@ -2988,9 +2988,10 @@ impl std::fmt::Debug for VerifyWordsSlot {
 }
 
 /// The verify's `[argmax, proposed]` words as a PUBLISH rather than a
-/// readback (#148): a CPU-mapped U32 buffer the `words_publish` kernel copies
-/// the round's words into behind a device barrier, then stamps `step` with
-/// the round's generation. The host polls the stamp (`PollMechanism`, the
+/// readback: a CPU-mapped U32 buffer `Device::words_publish` copies the
+/// round's words into, then a stamp of the round's generation into `step`,
+/// dispatched after the copy and bound to it, so a host that sees the stamp
+/// reads the words behind it. The host polls the stamp (`PollMechanism`, the
 /// ring's own wait) and reads the words in place into `host` — no wait on
 /// the command buffer's completion handler, no `to_cpu`, no `Vec` per round.
 /// A poll that outlives `POLL_BUDGET` falls back to `Device::synchronize`
@@ -3124,7 +3125,8 @@ impl VerifyWords {
         }
         self.host.clear();
         for i in 0..p.n {
-            // SAFETY: the stamp is behind a device barrier over the words.
+            // SAFETY: `out_ptr` maps `cap >= n` words of `out`, which this
+            // struct holds; the stamp is ordered after the words' copy.
             self.host
                 .push(unsafe { std::ptr::read_volatile((p.out_ptr as *const u32).add(i)) });
         }

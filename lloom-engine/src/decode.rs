@@ -54,8 +54,8 @@ pub struct RingArm {
     /// a buffer is closed when the GPU starts the previous one rather than
     /// every `commit_steps`, and the token drain is a reader thread's, off
     /// the loop's path. Measured +0.5 tok/s on the B=1 crown (#148, record
-    /// §8.1). Needs a CPU-mapped ring, lookahead 1, an EOS read other than
-    /// the flag and a per-token stamp; the fixed cadence where it has not
+    /// §8.1). Needs a CPU-mapped ring, lookahead 1 and an EOS read other
+    /// than the flag; the fixed cadence where it has not
     /// ([`RingArm::resolved`]).
     pub adaptive: bool,
     /// How the ring learns EOS (`ring` = a blocking flag read, `ring-nonblocking`
@@ -84,47 +84,27 @@ impl RingArm {
     };
 
     /// Why this arm cannot run the adaptive commit, or `None` if it can. The
-    /// commit encodes the next forward before anything is read back and its
-    /// reader streams the ring's per-token stamp, so it needs one forward of
-    /// lookahead, an EOS read that does not read each token back (every ring
-    /// read but the flag, `Session::decode`'s refusals), and a stamp per
-    /// token: the poll read's, or the fused argmax·eos·stamp publish, which
-    /// runs for the argmax sampler with `fused_publish` on (`fused`).
-    pub fn why_not_adaptive(&self, fused: bool) -> Option<&'static str> {
+    /// commit encodes the next forward before anything is read back, so it
+    /// needs one forward of lookahead and an EOS read that does not read each
+    /// token back: every ring read but the flag (`Session::decode`'s
+    /// refusals). Every read stamps each token under the commit, for any
+    /// sampler, so its reader streams whatever the run returns
+    /// (`docs/dispatch.md` §11.5z-xvi).
+    pub fn why_not_adaptive(&self) -> Option<&'static str> {
         if self.lookahead != 1 {
             Some("the adaptive commit needs lookahead 1")
         } else if matches!(self.eos, EosRead::Blocking) {
             Some("the `ring` EOS read (the flag) reads each token back per step")
         } else {
-            self.why_not_stream_reader(fused)
-        }
-    }
-
-    /// Why a ring reader cannot stream this arm, or `None` if it can: the
-    /// reader streams what a per-token stamp certifies. The poll read stamps
-    /// every token on any cadence; the other reads do only through the
-    /// adaptive commit's fused publish (see [`Self::why_not_adaptive`]) —
-    /// otherwise the flag read stamps nothing and the deferred reads stamp
-    /// once per commit window.
-    pub fn why_not_stream_reader(&self, fused: bool) -> Option<&'static str> {
-        match self.eos {
-            EosRead::Poll(_) => None,
-            _ if self.adaptive && fused => None,
-            EosRead::Blocking => {
-                Some("the `ring` EOS read (the flag) stamps no token for a reader")
-            }
-            _ => Some(
-                "a deferred EOS read stamps once per commit window, not per token, outside the \
-                 fused publish (the argmax sampler, `fused_publish` on)",
-            ),
+            None
         }
     }
 
     /// The arm that runs: this one, on the fixed cadence where it cannot
     /// carry the adaptive commit.
-    pub fn resolved(self, fused: bool) -> RingArm {
+    pub fn resolved(self) -> RingArm {
         RingArm {
-            adaptive: self.adaptive && self.why_not_adaptive(fused).is_none(),
+            adaptive: self.adaptive && self.why_not_adaptive().is_none(),
             ..self
         }
     }
@@ -711,13 +691,13 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 (out, ReadbackArm::Blocking)
             }
             ReadbackArm::Ring(ring) => {
-                // The fused publish, which lets a non-poll read stamp per
-                // token, runs for the argmax sampler only, and never under
-                // processors: its kernel draws the argmax itself, past them.
+                // The fused publish runs for the argmax sampler only, and
+                // never under processors: its kernel draws the argmax itself,
+                // past them.
                 let fused = self.config.readback.fused_publish
                     && matches!(sampler.sampling(), Sampling::ArgMax)
                     && sampler.processors().is_none();
-                let ring = ring.resolved(fused);
+                let ring = ring.resolved();
                 let RingArm {
                     adaptive,
                     eos,
@@ -731,16 +711,13 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 readback.set_wake_cadence(wake);
                 // The adaptive arm needs the ring's reader (a CPU-mapped ring);
                 // without one it is the fixed cadence, reported as such. The
-                // reader alone (`--stream-reader`) streams per token on the
-                // fixed cadence where the ring stamps per token, and a request
-                // whose sampler rules out the fused publish takes no reader
-                // (`RingArm::why_not_stream_reader`; the options refuse at
-                // startup what no request could stream). The pool's ring
-                // served earlier runs and its stamp runs across them, so the
-                // reader starts at this run's first token.
-                let reader = if (adaptive || self.config.readback.stream_reader)
-                    && ring.why_not_stream_reader(fused).is_none()
-                {
+                // reader alone (`--stream-reader`) streams what the arm stamps:
+                // per token on the poll and flag reads, per commit window on
+                // the deferred reads' fixed cadence (`docs/dispatch.md`
+                // §11.5z-xvi). The pool's ring served earlier runs and its
+                // stamp runs across them, so the reader starts at this run's
+                // first token.
+                let reader = if adaptive || self.config.readback.stream_reader {
                     readback.reader().map(|mut r| {
                         r.resume_at_published();
                         r
@@ -1176,6 +1153,51 @@ mod tests {
             prompt: &[u32],
             max_tokens: usize,
         ) -> Result<(Decoded, String, (Sequence<Pos>, RingPool))> {
+            let (reply, streamed, _, parts) =
+                request_streamed(model, device, config, held, prompt, max_tokens)?;
+            Ok((reply, streamed, parts))
+        }
+
+        /// Who streamed a reply: a ring reader calls the fragment hook from
+        /// its own thread and nothing else calls it, the loop's drain from
+        /// the caller's thread. So the thread the fragments arrived on is
+        /// which of the two streamed, and `None` is a reply that streamed
+        /// nothing.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum StreamedBy {
+            Reader,
+            Loop,
+        }
+
+        fn streamed_by(
+            caller: std::thread::ThreadId,
+            seen: &mut Option<StreamedBy>,
+            mixed: &mut bool,
+        ) {
+            let now = if std::thread::current().id() == caller {
+                StreamedBy::Loop
+            } else {
+                StreamedBy::Reader
+            };
+            *mixed |= seen.is_some_and(|s| s != now);
+            *seen = Some(now);
+        }
+
+        /// [`request`], and who streamed it.
+        #[allow(clippy::type_complexity)]
+        fn request_streamed(
+            model: &Chain,
+            device: &Device,
+            config: &DecodeConfig,
+            held: Option<(Sequence<Pos>, RingPool)>,
+            prompt: &[u32],
+            max_tokens: usize,
+        ) -> Result<(
+            Decoded,
+            String,
+            Option<StreamedBy>,
+            (Sequence<Pos>, RingPool),
+        )> {
             let session = match held {
                 Some((seq, rings)) => DecodeSession::from_parts(model, seq, device.clone(), rings),
                 None => DecodeSession::new(model, Pos(0), device.clone(), 0),
@@ -1188,13 +1210,21 @@ mod tests {
                 ..DecodeParams::default()
             };
             let mut streamed = String::new();
+            let caller = std::thread::current().id();
+            let (mut by, mut mixed) = (None, false);
             let reply = session.decode(
                 prompt,
                 |ids: &[u32]| Ok(text_of(ids)),
                 &params,
-                |frag: &str| streamed.push_str(frag),
+                |frag: &str| {
+                    streamed_by(caller, &mut by, &mut mixed);
+                    streamed.push_str(frag)
+                },
             )?;
-            Ok((reply, streamed, session.into_parts()))
+            if mixed {
+                lloom_tensor::bail!("the reader and the loop both streamed one reply");
+            }
+            Ok((reply, streamed, by, session.into_parts()))
         }
 
         /// Each request on a pooled ring streams its own run, and nothing of
@@ -1456,7 +1486,7 @@ mod tests {
             config: &DecodeConfig,
             temperature: f64,
             top_p: Option<f64>,
-        ) -> Result<(Decoded, String)> {
+        ) -> Result<(Decoded, String, Option<StreamedBy>)> {
             let mut session =
                 DecodeSession::new(model, Pos(0), device.clone(), 0).with_config(config.clone());
             let params = DecodeParams {
@@ -1468,24 +1498,32 @@ mod tests {
                 ..DecodeParams::default()
             };
             let mut streamed = String::new();
+            let caller = std::thread::current().id();
+            let (mut by, mut mixed) = (None, false);
             let reply = session.decode(
                 &[3],
                 |ids: &[u32]| Ok(text_of(ids)),
                 &params,
-                |frag: &str| streamed.push_str(frag),
+                |frag: &str| {
+                    streamed_by(caller, &mut by, &mut mixed);
+                    streamed.push_str(frag)
+                },
             )?;
-            Ok((reply, streamed))
+            if mixed {
+                lloom_tensor::bail!("the reader and the loop both streamed one reply");
+            }
+            Ok((reply, streamed, by))
         }
 
         /// Every `--readback` spelling (and none) × the adaptive commit (unset,
         /// on, off) × the lookahead (unset, 0, 1) × the commit budget (unset,
         /// per-token) × the EOS gate (unset, on, off) × the stream reader ×
         /// the fused publish (on, off), resolved through `lloom serve`'s
-        /// option path and served the way it serves them: the options are
-        /// refused at startup naming the stream reader where no request could
-        /// stream, or every request is answered and streams what it returns.
-        /// A request is never where a combination is refused, and a knob that
-        /// defaults on (the adaptive commit, the EOS gate) is never refused.
+        /// option path and served the way it serves them: every combination
+        /// starts, and every request is answered and streams what it returns.
+        /// Every EOS read stamps on a grain its reader can stream
+        /// (`docs/dispatch.md` §11.5z-xvi), so nothing here is refused, at
+        /// startup or per request.
         ///
         /// Each reply reports the arm that ran: it names the adaptive commit
         /// iff the loop closed a buffer adaptively (the length request runs
@@ -1496,7 +1534,7 @@ mod tests {
         /// line renders.
         #[cfg(feature = "serve")]
         #[test]
-        fn every_readback_spelling_and_commit_arm_serves_or_is_refused_at_startup() -> Result<()> {
+        fn every_readback_spelling_and_commit_arm_serves() -> Result<()> {
             use clap::Parser;
             #[derive(Parser)]
             struct Cli {
@@ -1540,6 +1578,9 @@ mod tests {
                 }
             }
             assert_eq!(combos.len(), 10 * 3 * 3 * 2 * 3 * 2 * 2);
+            // What one served combination saw: ran adaptive, was clamped, greedy
+            // replies gated, of those fired, replies streamed by a reader, by the loop.
+            type Seen = (bool, bool, usize, usize, usize, usize);
             let mut failures: Vec<String> = Vec::new();
             let mut vacuous: Vec<String> = Vec::new();
             let mut refusals = std::collections::BTreeMap::new();
@@ -1550,44 +1591,64 @@ mod tests {
                 // greedy replies the EOS gate armed / fired on)
                 let (mut refused, mut served, mut adaptive_ran, mut clamped) = (0, 0, 0, 0);
                 let (mut gated, mut gate_fired) = (0, 0);
+                // replies streamed by a ring reader, by the loop's drain
+                let (mut by_reader, mut by_loop) = (0, 0);
                 let failed_before = failures.len();
                 for argv in &combos {
                     let label = format!("{device:?} [{}]", argv.join(" "));
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                        || -> Result<std::result::Result<(bool, bool, usize, usize), String>> {
+                        || -> Result<std::result::Result<Seen, String>> {
                             let cli = Cli::parse_from(
                                 std::iter::once("t".to_string()).chain(argv.iter().cloned()),
                             );
                             let config = match crate::app::resolve_options_uninstalled(&cli.common)
                             {
-                                Err(e) => {
-                                    // Only an explicit knob that defaults off and the
-                                    // arm cannot carry is refused, and the refusal
-                                    // names it.
-                                    let e = e.to_string();
-                                    assert!(
-                                        argv.iter().any(|a| a == "--stream-reader")
-                                            && e.contains("stream_reader"),
-                                        "{label}: refused without naming a knob it set: {e}"
-                                    );
-                                    return Ok(Err(e));
-                                }
+                                Err(e) => return Ok(Err(e.to_string())),
                                 Ok(o) => o.decode,
                             };
                             let (mut ran_adaptive, mut was_clamped) = (false, false);
                             let (mut armed, mut fired) = (0usize, 0usize);
+                            let (mut readers, mut loops) = (0usize, 0usize);
+                            // Where the device maps its ring, a reader streams
+                            // every ring arm that runs the adaptive commit or
+                            // asks for one; nothing refuses or withholds it.
+                            let mut check_streamer =
+                                |at: &str, arm: ReadbackArm, by: Option<StreamedBy>| {
+                                    let want = if device.is_metal()
+                                        && matches!(arm, ReadbackArm::Ring(r)
+                                            if r.adaptive || config.readback.stream_reader)
+                                    {
+                                        StreamedBy::Reader
+                                    } else {
+                                        StreamedBy::Loop
+                                    };
+                                    assert_eq!(by, Some(want), "{at}: who streamed the reply");
+                                    match want {
+                                        StreamedBy::Reader => readers += 1,
+                                        StreamedBy::Loop => loops += 1,
+                                    }
+                                };
                             let mut held = None;
                             for (prompt, max) in [(&[5u32, 1][..], 64), (&[0u32][..], 24)] {
                                 let (want, hit) = chain(*prompt.last().expect("a prompt"), max);
-                                let (got, streamed, parts) =
-                                    request(&model, &device, &config, held.take(), prompt, max)
-                                        .unwrap_or_else(|e| {
-                                            panic!("{label}: a greedy request was refused: {e}")
-                                        });
+                                let (got, streamed, by, parts) = request_streamed(
+                                    &model,
+                                    &device,
+                                    &config,
+                                    held.take(),
+                                    prompt,
+                                    max,
+                                )
+                                .unwrap_or_else(|e| {
+                                    panic!("{label}: a greedy request was refused: {e}")
+                                });
                                 held = Some(parts);
                                 let at = format!("{label} ({}) max {max}", got.readback.name());
                                 assert_eq!(got.tokens, want, "{at}: the ids");
                                 assert_eq!(streamed, text_of(&want), "{at}: the streamed text");
+                                if !streamed.is_empty() {
+                                    check_streamer(&at, got.readback, by);
+                                }
                                 assert_eq!(
                                     got.stop,
                                     if hit { Stop::Eos } else { Stop::Length },
@@ -1640,7 +1701,7 @@ mod tests {
                                 if p.is_some() && !host_sampler {
                                     continue;
                                 }
-                                let (got, streamed) = sampled(&model, &device, &config, t, p)
+                                let (got, streamed, by) = sampled(&model, &device, &config, t, p)
                                     .unwrap_or_else(|e| {
                                         panic!("{label}: a request at temperature {t} top_p {p:?} was refused: {e}")
                                     });
@@ -1648,6 +1709,16 @@ mod tests {
                                     "{label} ({}) temperature {t} top_p {p:?}",
                                     got.readback.name()
                                 );
+                                if device.is_metal() {
+                                    let resolved = config.readback.arm().resolve(
+                                        &DecodeParams::sampling_of(Some(t), p, None, false),
+                                        config.readback.ring_arm(),
+                                    );
+                                    assert_eq!(got.readback, resolved, "{at}: the reply reports another arm than the options resolve to");
+                                }
+                                if !streamed.is_empty() {
+                                    check_streamer(&at, got.readback, by);
+                                }
                                 assert!(
                                     got.tokens.len() <= 24,
                                     "{at}: {} tokens past max_tokens 24",
@@ -1660,7 +1731,7 @@ mod tests {
                                 );
                                 assert_eq!(got.text, streamed, "{at}: the reply's text");
                             }
-                            Ok(Ok((ran_adaptive, was_clamped, armed, fired)))
+                            Ok(Ok((ran_adaptive, was_clamped, armed, fired, readers, loops)))
                         },
                     ));
                     match outcome {
@@ -1668,12 +1739,14 @@ mod tests {
                             refused += 1;
                             *refusals.entry(e).or_insert(0usize) += 1;
                         }
-                        Ok(Ok(Ok((r, c, g, f)))) => {
+                        Ok(Ok(Ok((r, c, g, f, rd, lp)))) => {
                             served += 1;
                             adaptive_ran += r as usize;
                             clamped += c as usize;
                             gated += g;
                             gate_fired += f;
+                            by_reader += rd;
+                            by_loop += lp;
                         }
                         Ok(Err(e)) => failures.push(format!("{label}: {e}")),
                         Err(p) => failures.push(
@@ -1684,19 +1757,27 @@ mod tests {
                         ),
                     }
                 }
-                eprintln!("{device:?}: {served} served, {refused} refused at startup, {adaptive_ran} ran adaptive, {clamped} asked for it and ran the fixed cadence, {gated} greedy replies gated, {gate_fired} fired");
+                eprintln!("{device:?}: {served} served, {refused} refused at startup, {adaptive_ran} ran adaptive, {clamped} asked for it and ran the fixed cadence, {gated} greedy replies gated, {gate_fired} fired, {by_reader} replies streamed by a reader, {by_loop} by the loop");
                 let failed = failures.len() - failed_before;
                 eprintln!("{device:?}: {failed} failed");
                 for f in &failures[failed_before..] {
                     eprintln!("FAIL {f}");
                 }
                 assert_eq!(served + refused + failed, combos.len());
-                if served == 0 || refused == 0 {
-                    vacuous.push(format!("{device:?}: one side of the matrix is empty"));
+                for (e, n) in std::mem::take(&mut refusals) {
+                    eprintln!("REFUSED x{n}: {e}");
+                    failures.push(format!(
+                        "{device:?}: {n} combinations refused at startup: {e}"
+                    ));
                 }
                 if device.is_metal() && (adaptive_ran == 0 || clamped == 0) {
                     vacuous.push(format!(
                         "{device:?}: the attribution check saw one arm only"
+                    ));
+                }
+                if device.is_metal() && (by_reader == 0 || by_loop == 0) {
+                    vacuous.push(format!(
+                        "{device:?}: the streamer check saw {by_reader} reader replies, {by_loop} loop replies"
                     ));
                 }
                 if device.is_metal() && (gated == 0 || gate_fired == 0 || gated == gate_fired) {
@@ -1704,9 +1785,6 @@ mod tests {
                         "{device:?}: the gate check saw {gated} gated replies, {gate_fired} fired"
                     ));
                 }
-            }
-            for (e, n) in &refusals {
-                eprintln!("REFUSED x{n}: {e}");
             }
             assert!(
                 failures.is_empty(),

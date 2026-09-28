@@ -41,18 +41,43 @@ impl CommandBuffer {
         prev_ce_outputs: &PrevCeOutputs,
         executor: &Arc<ExecutorSlot>,
     ) -> ComputeCommandEncoder {
-        self.as_ref()
-            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-            .map(|raw| {
-                ComputeCommandEncoder::with_executor(
-                    raw,
-                    self.raw.clone(),
-                    Arc::clone(fence),
-                    Arc::clone(prev_ce_outputs),
-                    Arc::clone(executor),
-                )
-            })
-            .unwrap()
+        let raw = match crate::kernels::metal::profile::sample_encoder(&self.raw) {
+            Some((samples, index)) => self.sampled_encoder(&samples, index),
+            None => self
+                .as_ref()
+                .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent),
+        };
+        raw.map(|raw| {
+            ComputeCommandEncoder::with_executor(
+                raw,
+                self.raw.clone(),
+                Arc::clone(fence),
+                Arc::clone(prev_ce_outputs),
+                Arc::clone(executor),
+            )
+        })
+        .unwrap()
+    }
+
+    /// A concurrent compute encoder whose stage start and end write timestamps
+    /// into `samples` at `index` and `index + 1` (the profiler's counter arm,
+    /// `profile::sample_encoder`).
+    fn sampled_encoder(
+        &self,
+        samples: &ProtocolObject<dyn objc2_metal::MTLCounterSampleBuffer>,
+        index: usize,
+    ) -> Option<Retained<ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>>> {
+        let d = objc2_metal::MTLComputePassDescriptor::computePassDescriptor();
+        d.setDispatchType(MTLDispatchType::Concurrent);
+        // SAFETY: attachment 0 always exists (the array is preallocated), and
+        // `sample_encoder` keeps `index + 1` below the buffer's sample count.
+        unsafe {
+            let a = d.sampleBufferAttachments().objectAtIndexedSubscript(0);
+            a.setSampleBuffer(Some(samples));
+            a.setStartOfEncoderSampleIndex(index);
+            a.setEndOfEncoderSampleIndex(index + 1);
+        }
+        self.as_ref().computeCommandEncoderWithDescriptor(&d)
     }
 
     /// Create a compute command encoder with freshly allocated fence and a standalone output map.
@@ -60,19 +85,23 @@ impl CommandBuffer {
     pub fn compute_command_encoder_no_fence(&self) -> ComputeCommandEncoder {
         let device = Device::new(self.raw.device());
         let fence = Arc::new(Fence::new(&device));
-        self.as_ref()
-            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-            .map(|raw| {
-                ComputeCommandEncoder::new(
-                    raw,
-                    self.raw.clone(),
-                    fence,
-                    Arc::new(crate::kernels::metal::contention::Censused::new(
-                        parking_lot::RwLock::new(std::collections::HashMap::new()),
-                    )),
-                )
-            })
-            .unwrap()
+        let raw = match crate::kernels::metal::profile::sample_encoder(&self.raw) {
+            Some((samples, index)) => self.sampled_encoder(&samples, index),
+            None => self
+                .as_ref()
+                .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent),
+        };
+        raw.map(|raw| {
+            ComputeCommandEncoder::new(
+                raw,
+                self.raw.clone(),
+                fence,
+                Arc::new(crate::kernels::metal::contention::Censused::new(
+                    parking_lot::RwLock::new(std::collections::HashMap::new()),
+                )),
+            )
+        })
+        .unwrap()
     }
 
     pub fn blit_command_encoder(
@@ -180,8 +209,11 @@ impl CommandBuffer {
             // completion handler, so the pointer is valid and non-null for the
             // duration of the call. Only the two timing properties are read,
             // and both are plain scalars valid in the completed state.
+            let key = cb.as_ptr() as *const () as usize;
             let cb = unsafe { cb.as_ref() };
-            profile::record_command_buffer(cb.GPUStartTime(), cb.GPUEndTime(), committed, step);
+            let (start, end) = (cb.GPUStartTime(), cb.GPUEndTime());
+            profile::record_command_buffer(start, end, committed, step);
+            profile::resolve_encoder_samples(key, start, end);
         });
         unsafe { self.raw.addCompletedHandler(RcBlock::as_ptr(&block)) };
     }

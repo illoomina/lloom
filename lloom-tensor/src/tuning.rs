@@ -469,6 +469,12 @@ pub struct InstrumentTuning {
     /// The GPU profiler: per-command-buffer GPU intervals and per-label census (`PROFILE` lines).
     #[opt(flag = "profile", env = "CANDLE_METAL_PROFILE", bool)]
     pub profile: bool,
+    /// Under `profile`: time every compute encoder with stage-boundary counter samples.
+    #[opt(flag = "profile-counters", env = "CANDLE_METAL_PROFILE_COUNTERS", bool)]
+    pub profile_counters: bool,
+    /// Under `profile`: end the compute encoder after every dispatch, so each counter-sampled encoder is one kernel (an arm: a seam per dispatch).
+    #[opt(flag = "profile-encoder-per-dispatch", env = "CANDLE_METAL_PROFILE_ENCODER_PER_DISPATCH", bool)]
+    pub profile_encoder_per_dispatch: bool,
     /// The dispatch trace recorder (kernel, grid, threadgroup, barrier, encoder per dispatch).
     #[opt(flag = "trace", env = "CANDLE_METAL_TRACE", bool)]
     pub trace: bool,

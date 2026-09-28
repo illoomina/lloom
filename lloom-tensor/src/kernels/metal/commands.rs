@@ -933,6 +933,14 @@ impl Commands {
             self.commit_swap_locked(&mut state_guard, 1)?;
         }
 
+        // The per-kernel timing arm: a counter-sampled encoder per dispatch,
+        // so each encoder's interval is one kernel's (`profile::encoder_per_dispatch`).
+        if crate::kernels::metal::profile::encoder_per_dispatch() {
+            if let Some(enc) = state_guard.current_encoder.take() {
+                self.end_encoding(enc);
+            }
+        }
+
         if state_guard.current_encoder.is_none() {
             let fence = Arc::new(Fence::new(&self.device));
             // No blanket wait here. HazardTrackingModeUntracked means Metal does

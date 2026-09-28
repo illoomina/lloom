@@ -112,3 +112,13 @@ harness = false
 
 [[example]]
 name = "cpu_benchmarks"
+
+# macOS-only: `mincore`/`MINCORE_INCORE` and the page-cache arms are Darwin
+# semantics, so the probe is gated with the Metal build (never on the CPU CI).
+[[example]]
+name = "ple_fill_probe"
+required-features = ["metal"]
+
+[[example]]
+name = "ple_window_probe"
+required-features = ["metal"]

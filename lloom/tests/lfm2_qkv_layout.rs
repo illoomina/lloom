@@ -18,11 +18,6 @@ use lloom::testing::tiny::{TinyCheckpoint, Weights};
 use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
-/// The dispatch recorder is process-global, so no test here runs while a
-/// census test holds its window: another test's dispatches (a construction
-/// dispatches too) would land in it. Held for the whole of each test.
-static RECORDER: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
 fn tiny_config(qkv_layout: QkvLayout, attn_impl: AttnImpl) -> Config {
     Config {
         vocab_size: 64,
@@ -187,7 +182,6 @@ fn arms_agree_on(dev: &Device, attn_impl: AttnImpl, dtype: DType) -> Result<()> 
 /// the strided and fused kernels run), on both attention arms at f16.
 #[test]
 fn every_arm_computes_the_same_logits() -> Result<()> {
-    let _serial = RECORDER.lock();
     arms_agree_on(&Device::Cpu, AttnImpl::Generic, DType::F32)?;
     let cpu = run(
         &tiny_config(QkvLayout::Contiguous, AttnImpl::Generic),
@@ -215,7 +209,6 @@ fn every_arm_computes_the_same_logits() -> Result<()> {
 #[cfg(feature = "metal")]
 #[test]
 fn the_rows_path_agrees_with_the_single_path_on_every_arm() -> Result<()> {
-    let _serial = RECORDER.lock();
     use lloom::nn::model::Row;
     let dev = Device::new_metal(0)?;
     for arm in [QkvLayout::Contiguous, QkvLayout::Strided, QkvLayout::Fused] {
@@ -248,17 +241,33 @@ mod census {
     use super::*;
 
     /// The per-label dispatch census of one forward pass of `width` tokens
-    /// at `pos`, after a 5-token prefill has been taken and the counters
-    /// reset (a decode step at `width == 1`, a second multi-token pass at
-    /// `width > 1`). Labels are the `[[host_name]]`s the census records.
-    fn census_of(cfg: &Config, dev: &Device, width: usize) -> Result<Vec<(String, u64)>> {
+    /// at `pos`, after a 5-token prefill (a decode step at `width == 1`, a
+    /// second multi-token pass at `width > 1`), from `dev`'s own census, so a
+    /// test running beside it on another device lands nothing in it. Labels
+    /// are the `[[host_name]]`s the census records. `both`, when given, is
+    /// met with the window open, before and after the pass, and kept on
+    /// failure too (`Rendezvous`), so a peer thread is never left waiting.
+    fn census_of(
+        cfg: &Config,
+        dev: &Device,
+        width: usize,
+        both: Option<&std::sync::Barrier>,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut meet = both.map(|b| lloom_tensor::test_utils::Rendezvous::new(b, 2));
         let model = build(cfg, dev, DType::F16)?;
         let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
         let prompt: Vec<u32> = vec![1, 2, 3, 4, 5];
         let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
         model.forward(&inp, 0, &mut cache)?;
         dev.synchronize()?;
-        lloom_tensor::metal_backend::profile::reset();
+        let window = dev
+            .as_metal_device()?
+            .dispatch_census()
+            .open()
+            .expect("one census window on a fresh device");
+        if let Some(m) = meet.as_mut() {
+            m.meet();
+        }
         let toks: Vec<u32> = (0..width as u32).map(|i| 7 + i).collect();
         let step = Tensor::new(toks.as_slice(), dev)?.reshape((1, width))?;
         let logits = model.forward(&step, prompt.len(), &mut cache)?;
@@ -267,7 +276,10 @@ mod census {
             .to_dtype(DType::F32)?
             .to_vec1::<f32>()?;
         dev.synchronize()?;
-        let mut by_label = lloom_tensor::metal_backend::profile::snapshot().by_label;
+        if let Some(m) = meet.as_mut() {
+            m.meet();
+        }
+        let mut by_label = window.close();
         by_label.sort();
         Ok(by_label)
     }
@@ -302,12 +314,26 @@ mod census {
             eprintln!("SKIPPED: needs CANDLE_METAL_PROFILE=1 (the census is off otherwise)");
             return Ok(());
         }
-        let _serial = RECORDER.lock();
         let dev = Device::new_metal(0)?;
         let l = 2u64;
-        let contiguous = census_of(&tiny_config(QkvLayout::Contiguous, AttnImpl::Sdpa), &dev, 1)?;
-        let strided = census_of(&tiny_config(QkvLayout::Strided, AttnImpl::Sdpa), &dev, 1)?;
-        let fused = census_of(&tiny_config(QkvLayout::Fused, AttnImpl::Sdpa), &dev, 1)?;
+        let contiguous = census_of(
+            &tiny_config(QkvLayout::Contiguous, AttnImpl::Sdpa),
+            &dev,
+            1,
+            None,
+        )?;
+        let strided = census_of(
+            &tiny_config(QkvLayout::Strided, AttnImpl::Sdpa),
+            &dev,
+            1,
+            None,
+        )?;
+        let fused = census_of(
+            &tiny_config(QkvLayout::Fused, AttnImpl::Sdpa),
+            &dev,
+            1,
+            None,
+        )?;
         dump("Contiguous decode", &contiguous);
         dump("Fused decode", &fused);
         assert!(total(&contiguous) > 0, "blind census");
@@ -341,6 +367,53 @@ mod census {
         Ok(())
     }
 
+    /// Two decode censuses taken AT ONCE, on two devices from two threads,
+    /// both windows open across both passes: each reads exactly what it reads
+    /// alone, so a census test here holds for any test beside it. The
+    /// absolute references are the rope counts `Fused` moves (2 per attention
+    /// layer, and none); the process-wide census over the same span is the
+    /// control that saw both passes.
+    #[test]
+    fn two_censuses_taken_at_once_on_two_devices_see_only_their_own() -> Result<()> {
+        use lloom_tensor::metal_backend::profile;
+        if !profile::enabled() {
+            eprintln!("SKIPPED: needs CANDLE_METAL_PROFILE=1 (the census is off otherwise)");
+            return Ok(());
+        }
+        let l = 2u64;
+        let (c_cfg, f_cfg) = (
+            tiny_config(QkvLayout::Contiguous, AttnImpl::Sdpa),
+            tiny_config(QkvLayout::Fused, AttnImpl::Sdpa),
+        );
+        let alone_c = census_of(&c_cfg, &Device::new_metal(0)?, 1, None)?;
+        let alone_f = census_of(&f_cfg, &Device::new_metal(0)?, 1, None)?;
+        let rope_before = count(&profile::snapshot().by_label, "rmsnorm_rope_f16");
+        let both = std::sync::Barrier::new(2);
+        let (c, f) = std::thread::scope(|s| {
+            let c = s.spawn(|| census_of(&c_cfg, &Device::new_metal(0)?, 1, Some(&both)));
+            let f = s.spawn(|| census_of(&f_cfg, &Device::new_metal(0)?, 1, Some(&both)));
+            (c.join().unwrap(), f.join().unwrap())
+        });
+        let (c, f) = (c?, f?);
+        let rope_after = count(&profile::snapshot().by_label, "rmsnorm_rope_f16");
+        assert!(
+            rope_after - rope_before >= 2 * l,
+            "control: the process-wide census saw the Fused pass ({} fused norms)",
+            rope_after - rope_before
+        );
+        assert_eq!(count(&c, "rope_f16"), 2 * l, "Contiguous, beside Fused");
+        assert_eq!(count(&c, "rmsnorm_rope_f16"), 0, "Contiguous, beside Fused");
+        assert_eq!(count(&f, "rope_f16"), 0, "Fused, beside Contiguous");
+        assert_eq!(
+            count(&f, "rmsnorm_rope_f16"),
+            2 * l,
+            "Fused, beside Contiguous"
+        );
+        assert_eq!(c, alone_c, "Contiguous: at once vs alone");
+        assert_eq!(f, alone_f, "Fused: at once vs alone");
+        Ok(())
+    }
+
     /// A multi-token pass: `Contiguous` copies the three transposed views
     /// per attention layer (`copy_f16_strided`) and `slice_set` writes `V`
     /// with a `copy2d_f16`; `Strided` norms the views where they lie
@@ -351,12 +424,26 @@ mod census {
             eprintln!("SKIPPED: needs CANDLE_METAL_PROFILE=1 (the census is off otherwise)");
             return Ok(());
         }
-        let _serial = RECORDER.lock();
         let dev = Device::new_metal(0)?;
         let l = 2u64;
-        let contiguous = census_of(&tiny_config(QkvLayout::Contiguous, AttnImpl::Sdpa), &dev, 4)?;
-        let strided = census_of(&tiny_config(QkvLayout::Strided, AttnImpl::Sdpa), &dev, 4)?;
-        let fused = census_of(&tiny_config(QkvLayout::Fused, AttnImpl::Sdpa), &dev, 4)?;
+        let contiguous = census_of(
+            &tiny_config(QkvLayout::Contiguous, AttnImpl::Sdpa),
+            &dev,
+            4,
+            None,
+        )?;
+        let strided = census_of(
+            &tiny_config(QkvLayout::Strided, AttnImpl::Sdpa),
+            &dev,
+            4,
+            None,
+        )?;
+        let fused = census_of(
+            &tiny_config(QkvLayout::Fused, AttnImpl::Sdpa),
+            &dev,
+            4,
+            None,
+        )?;
         dump("Contiguous seq 4", &contiguous);
         dump("Strided seq 4", &strided);
         dump("Fused seq 4", &fused);

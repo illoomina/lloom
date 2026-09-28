@@ -426,6 +426,9 @@ pub struct Commands {
     /// Shared with the buffer pools, which use it to decide when a released
     /// buffer is safe to hand out again. This is the only place it advances.
     clock: Arc<GpuClock>,
+    /// This queue's own dispatch census (`profile::DeviceCensus`), handed to
+    /// every compute encoder this creates while profiling is on.
+    census: Arc<crate::kernels::metal::profile::DeviceCensus>,
     /// Run after each command buffer completes, once per command buffer.
     ///
     /// The buffer pools subscribe here to sweep in what that command buffer was
@@ -673,6 +676,7 @@ impl Commands {
             live_fences: Censused::new(parking_lot::Mutex::new(FenceBook::default())),
             residency_set,
             clock: Arc::new(GpuClock::new()),
+            census: Arc::default(),
             on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
             executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
             completion_wait,
@@ -816,6 +820,12 @@ impl Commands {
         Arc::clone(&self.clock)
     }
 
+    /// The dispatch census of this queue alone, for a window that must not
+    /// count another device's work (`profile::DeviceCensus`).
+    pub fn dispatch_census(&self) -> &Arc<crate::kernels::metal::profile::DeviceCensus> {
+        &self.census
+    }
+
     /// Registers `f` to run after every command buffer completes.
     ///
     /// Must be called during device setup, before any work is encoded:
@@ -946,7 +956,7 @@ impl Commands {
             // so it waits per buffer in set_input_buffer / set_output_buffer
             // instead. Waiting on every live fence would order this encoder
             // after work it never touches.
-            let enc = state_guard
+            let mut enc = state_guard
                 .current
                 .compute_command_encoder_with_executor(
                     &fence,
@@ -954,6 +964,9 @@ impl Commands {
                     &self.executor(),
                 )
                 .with_clock(Arc::clone(&self.clock));
+            if crate::kernels::metal::profile::enabled() {
+                enc = enc.with_census(Arc::clone(&self.census));
+            }
             if let Some(flag) = self.eos_gate.armed_flag() {
                 // The EOS gate (lloom #735 step 4): the gated kernel variants
                 // read the flag at this index; bound once per encoder.

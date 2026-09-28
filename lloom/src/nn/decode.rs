@@ -566,6 +566,22 @@ pub struct DecodeStats {
     /// step this sequence took part in — one entry per `step_ns` entry. Empty
     /// on the single-sequence bodies.
     pub batch_rows: Vec<usize>,
+    /// The model's host fill (`CausalLM::host_feed`), when the run took it:
+    /// its engagement counters.
+    pub host_feed: Option<HostFeedReport>,
+}
+
+/// What a run's host fill did (`CausalLM::host_feed`).
+#[derive(Debug, Clone, Default)]
+pub struct HostFeedReport {
+    /// Slots the producer filled and signalled: one per token the loop fed.
+    pub fills: u64,
+    /// The decode forwards that waited for a filled slot.
+    pub forwards: u64,
+    /// Host time from seeing a token's stamp to signalling its slot, per
+    /// fill, in a debug or `profile` build (empty in release, where the
+    /// producer reads no clock).
+    pub fill_ns: Vec<u64>,
 }
 
 /// The per-kernel dispatch counts so far, under `CANDLE_METAL_PROFILE=1`.
@@ -1069,6 +1085,120 @@ type PacerMarker = lloom_tensor::metal_backend::CommandMarker;
 #[cfg(not(feature = "metal"))]
 type PacerMarker = ();
 
+/// The host fill's producer (`CausalLM::host_feed`, `expert-streaming.md`
+/// §20.13): a thread that reads every token the ring stamps, in order, and
+/// fills the slot of the forward that consumes it. It stops once the loop's
+/// GPU work is complete and every value a forward waited for is filled.
+/// Dropped before [`Self::finish`] — an error or a panic on the loop — it
+/// releases every wait the run encoded, so no command buffer stays parked.
+struct FeedThread {
+    link: std::sync::Arc<crate::nn::ngram_memory::FeedLink>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Result<Produced>>>,
+}
+
+/// What the producer hands back: its fill (the tokens it filled) and each
+/// fill's host time.
+type Produced = (crate::nn::ngram_memory::NgramFill, Vec<u64>);
+
+impl FeedThread {
+    fn start(
+        feed: crate::nn::ngram_memory::HostFeed,
+        mut reader: crate::generation::RingReader,
+    ) -> Result<Self> {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let (link, mut fill) = feed.into_parts();
+        let done = Arc::new(AtomicBool::new(false));
+        reader.resume_at_published();
+        let (link_t, done_t) = (Arc::clone(&link), Arc::clone(&done));
+        let handle = std::thread::Builder::new()
+            .name("host-feed".into())
+            .spawn(
+                move || match produce(&mut fill, &mut reader, &link_t, &done_t) {
+                    Ok(fill_ns) => Ok((fill, fill_ns)),
+                    Err(e) => {
+                        link_t.fail(&e);
+                        Err(e)
+                    }
+                },
+            )
+            .map_err(|e| lloom_tensor::Error::Msg(format!("host feed: spawn: {e}")))?;
+        Ok(Self {
+            link,
+            done,
+            handle: Some(handle),
+        })
+    }
+
+    fn link(&self) -> &crate::nn::ngram_memory::FeedLink {
+        &self.link
+    }
+
+    /// The loop's GPU work is complete (its final drain returned): let the
+    /// producer fill what is left and stop. The tokens it filled, in order,
+    /// and its counters.
+    fn finish(mut self) -> Result<(Vec<u32>, HostFeedReport)> {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+        let handle = self.handle.take().expect("finished once");
+        let (fill, fill_ns) = handle
+            .join()
+            .map_err(|_| lloom_tensor::Error::Msg("host feed: the producer panicked".into()))??;
+        let report = HostFeedReport {
+            fills: fill.filled(),
+            forwards: self.link.demanded(),
+            fill_ns,
+        };
+        Ok((fill.into_consumed(), report))
+    }
+}
+
+impl Drop for FeedThread {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.link.release();
+            self.done.store(true, std::sync::atomic::Ordering::Release);
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The producer's loop: fill every token the ring stamps until `done` and
+/// every demanded value is filled (or the run released its waits). Each
+/// fill's host time in a debug or `profile` build.
+fn produce(
+    fill: &mut crate::nn::ngram_memory::NgramFill,
+    reader: &mut crate::generation::RingReader,
+    link: &crate::nn::ngram_memory::FeedLink,
+    done: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<u64>> {
+    let mechanism = crate::generation::poll::PollMechanism::DEFAULT;
+    let mut tokens: Vec<u32> = Vec::with_capacity(64);
+    let mut fill_ns: Vec<u64> = Vec::new();
+    loop {
+        tokens.clear();
+        reader
+            .read_all_new(&mut tokens)
+            .map_err(|lap| lloom_tensor::Error::Msg(format!("host feed: {lap}")))?;
+        if tokens.is_empty() {
+            if done.load(std::sync::atomic::Ordering::Acquire)
+                && (fill.filled() >= link.demanded() || link.released())
+            {
+                return Ok(fill_ns);
+            }
+            reader.wait_for_publish(mechanism);
+            continue;
+        }
+        for &t in &tokens {
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            let t0 = std::time::Instant::now();
+            fill.fill(t)?;
+            #[cfg(any(debug_assertions, feature = "profile"))]
+            fill_ns.push(t0.elapsed().as_nanos() as u64);
+        }
+    }
+}
+
 /// Disarms the EOS gate when dropped (`Device::eos_gate_end`), so no exit
 /// path of `decode_until` leaves it armed; `finish` takes the report.
 struct EosGateGuard<'a>(&'a Device);
@@ -1342,6 +1472,31 @@ impl<'m, M: CausalLM> Session<'m, M> {
             pacer.set_depth(opts.pacer_depth());
         }
 
+        // The model's host fill (`CausalLM::host_feed`): on an arm whose
+        // reader sees every token as it is stamped, a producer thread fills
+        // each decode forward's host-side input from the token before it and
+        // the GPU waits for it, so no forward reads its input back. Armed
+        // after the prefill, whose ids are the host's already.
+        let mut host_feed = None;
+        if readback.stamps_each_token(opts.adaptive_commit) {
+            if let Some(f) = self.model.host_feed(&mut self.seq.cache)? {
+                let link = std::sync::Arc::clone(f.link());
+                let started = match readback.reader() {
+                    Some(reader) => FeedThread::start(f, reader).map(Some),
+                    None => Ok(None),
+                };
+                match started {
+                    Ok(Some(t)) => host_feed = Some(t),
+                    Ok(None) => self.model.host_feed_end(&mut self.seq.cache, &[])?,
+                    Err(e) => {
+                        link.release();
+                        self.model.host_feed_end(&mut self.seq.cache, &[])?;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         let mut produced = 0usize;
         let mut since_commit = 0usize;
         let mut eos = false;
@@ -1437,6 +1592,9 @@ impl<'m, M: CausalLM> Session<'m, M> {
             let sample_start = (timed || opts.sample_split).then(std::time::Instant::now);
 
             let feed = readback.sample_and_feed(sampler, &logits)?;
+            if let Some(f) = &host_feed {
+                f.link().note_fed();
+            }
             // An arm that holds the fed id host-side hands it to the model
             // (`CausalLM::note_input_ids`): a no-op for every model whose
             // forward reads nothing back, the readback it would otherwise
@@ -1817,6 +1975,17 @@ impl<'m, M: CausalLM> Session<'m, M> {
                     all_ids.extend_from_slice(&tail);
                 }
             }
+        }
+        // Every wait a forward encoded is satisfiable once what the loop
+        // encoded is committed (the final drain synchronised it unless there
+        // was nothing left to drain); the producer fills what is left of them
+        // and stops. The model then brings the host-side state the fed
+        // forwards skipped up to date.
+        if let Some(f) = host_feed.take() {
+            flush_and_prune(&device)?;
+            let (published, report) = f.finish()?;
+            self.model.host_feed_end(&mut self.seq.cache, &published)?;
+            stats.host_feed = Some(report);
         }
         if all_ids.len() != produced {
             lloom_tensor::bail!(

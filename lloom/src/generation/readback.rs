@@ -273,6 +273,18 @@ pub trait ReadbackStrategy {
         None
     }
 
+    /// Whether every token is stamped as it is published, so a
+    /// [`RingReader`] sees token `k` before the command stream runs anything
+    /// encoded after it — what a GPU wait on a host-filled slot needs
+    /// (`CausalLM::host_feed`). A deferred read on the fixed cadence stamps
+    /// once per window, after the window's forwards (§11.5z-xvi), and a
+    /// forward waiting on one of its tokens would never run. `false` (the
+    /// default) on a strategy with no reader.
+    fn stamps_each_token(&self, adaptive_commit: bool) -> bool {
+        let _ = adaptive_commit;
+        false
+    }
+
     /// Under the adaptive commit: publish each step with the fused
     /// argmax·eos·stamp kernel (`Device::argmax_publish`) where the strategy
     /// can — the ring with an argmax sampler on Metal. After a step for which
@@ -634,6 +646,36 @@ impl RingReader {
     /// how many were appended, or [`RingLap`] if the writer overtook the
     /// cursor. Never waits: an unmapped word or segment reads as nothing new.
     pub fn read_new(&mut self, out: &mut Vec<u32>) -> std::result::Result<usize, RingLap> {
+        self.read_published(out, true)
+    }
+
+    /// [`Self::read_new`] that does not stop at a stop id: every token the
+    /// ring stamped, the EOS and the forwards queued past it included — what
+    /// a consumer that must answer every forward the loop encoded reads
+    /// (the host fill's producer, `CausalLM::host_feed`).
+    pub fn read_all_new(&mut self, out: &mut Vec<u32>) -> std::result::Result<usize, RingLap> {
+        self.read_published(out, false)
+    }
+
+    /// Wait, by `mechanism`, until the ring may have stamped past this
+    /// reader's cursor — a bounded wait (`PollMechanism::wait_on`), so the
+    /// caller re-reads and re-tests after it returns.
+    pub fn wait_for_publish(&self, mechanism: PollMechanism) {
+        // SAFETY: a mapped, aligned pointer into the step word `_step` keeps
+        // alive for this reader's life.
+        #[cfg(feature = "metal")]
+        unsafe {
+            mechanism.wait_on(self.step_ptr, self.cursor as u32);
+        }
+        #[cfg(not(feature = "metal"))]
+        mechanism.wait();
+    }
+
+    fn read_published(
+        &mut self,
+        out: &mut Vec<u32>,
+        stop_at_eos: bool,
+    ) -> std::result::Result<usize, RingLap> {
         if self.ended {
             return Ok(0);
         }
@@ -653,7 +695,7 @@ impl RingReader {
         }
         #[cfg(not(feature = "metal"))]
         {
-            let _ = published;
+            let _ = (published, stop_at_eos, out);
             return Ok(0);
         }
         #[cfg(feature = "metal")]
@@ -668,7 +710,7 @@ impl RingReader {
                 // that made `published` cover it.
                 let id = unsafe { self.seg_bases[seg].add(off).read_volatile() };
                 self.cursor += 1;
-                if self.eos_ids.contains(&id) {
+                if stop_at_eos && self.eos_ids.contains(&id) {
                     self.ended = true;
                     break;
                 }
@@ -1655,7 +1697,13 @@ impl Ring {
                 .iter()
                 .map(|s| unsafe { s.peek_scalar_ptr::<u32>(0) })
                 .collect::<Option<Vec<_>>>()?;
-            let eos_ids = self.ring.eos_ids().ok()?;
+            // The host copy where the arm keeps one: a read of the device's
+            // would wait on the queue's tail, a prefill the loop just encoded.
+            let eos_ids = if self.eos_ids_host.is_empty() {
+                self.ring.eos_ids().ok()?
+            } else {
+                self.eos_ids_host.clone()
+            };
             let total_tiles = self.history.ring.total_tiles;
             // At quantum 1 the next publish stamps `generation + 1` and
             // writes slot `fed`.
@@ -2111,6 +2159,15 @@ impl ReadbackStrategy for Ring {
 
     fn reader(&self) -> Option<RingReader> {
         Ring::reader(self)
+    }
+
+    fn stamps_each_token(&self, adaptive_commit: bool) -> bool {
+        match self.eos {
+            EosRead::Blocking | EosRead::Poll(_) => true,
+            EosRead::HostOnDrain | EosRead::GpuBatched | EosRead::GpuBatchedNonblocking => {
+                adaptive_commit
+            }
+        }
     }
 
     fn set_fused_publish(&mut self, on: bool) {

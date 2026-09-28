@@ -24,6 +24,8 @@ use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
 pub use device::{wire_weights_on, DeviceId, MetalDevice, PassPlansPaused};
+mod host_fed;
+pub use host_fed::HostFedRing;
 use device::{
     ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
 };

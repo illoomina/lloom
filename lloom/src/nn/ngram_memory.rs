@@ -1,9 +1,10 @@
 //! An n-gram memory's table: hashed n-gram embedding rows, read a handful per
 //! token from a table far too large to be resident — Qwen4-exp's N-gram PLE
 //! (320 M rows, 28.8 GB) and the Engram shape DeepSeek-V4.1 shares with it
-//! (`design/docs/expert-streaming.md` §20.1a, §20.13). The family owns its
-//! hash and the block that consumes the rows; this is the storage: where the
-//! rows live and how one token's rows are read.
+//! (`design/docs/expert-streaming.md` §20.1a, §20.13). The family owns the
+//! hash's constants and the block that consumes the rows; this is the hash
+//! ([`NgramHash`] over an [`NgramWindow`]), the storage — where the rows live
+//! and how one token's rows are read — and the host fill ([`HostFeed`]).
 //!
 //! Storage arms ([`RowTable`]): a memory map of the checkpoint's table
 //! ([`MmapRows`]), an LRU of packed rows in front of it ([`CachedRows`]), and a
@@ -15,12 +16,30 @@
 //! one after another cost ~1.6-2.2 ms on the host. [`ReadPolicy::Adaptive`]
 //! reads the rows the page cache holds through the map and the others
 //! concurrently: ~0.35 ms for sixteen cold rows (§20.13).
+//!
+//! # The host fill (§20.13, option A)
+//!
+//! A decode step whose rows depend on the token the step before it sampled
+//! cannot be encoded ahead by a host that must know the token first. The host
+//! fill moves the wait onto the GPU: the forward encodes a wait on a shared
+//! event just before its first reader of the rows and reads a staging slot
+//! ([`FeedLink::encode_read`]); a producer thread learns each published token,
+//! hashes its window, gathers the rows into the slot and signals
+//! ([`NgramFill::fill`]). The rows are the ones the host path reads, through
+//! the same math, so the arms are byte-identical by construction.
+//!
+//! Every wait is satisfiable when it is encoded: the forward that reads value
+//! `k` consumes the `k`-th token the loop fed, and a forward is refused unless
+//! that token is already in the command stream ahead of it. A producer that
+//! fails, or a run that ends early, releases every wait it left
+//! ([`FeedLink::release`]) rather than leaving the queue parked.
 
 use lloom_tensor::quantized::gguf_file::Content;
 use lloom_tensor::quantized::{GgmlDType, GgmlType};
 use lloom_tensor::{Device, Result, Tensor};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering, Ordering::Relaxed};
+use std::sync::Arc;
 
 /// The per-layer token embedding table's GGUF name (Qwen4-exp's N-gram PLE).
 pub const PER_LAYER_TOKEN_EMBD: &str = "per_layer_token_embd.weight";
@@ -654,6 +673,533 @@ unsafe fn mincore(addr: *const u8, len: usize, vec: *mut u8) -> bool {
 #[cfg(not(unix))]
 unsafe fn mincore(_addr: *const u8, _len: usize, _vec: *mut u8) -> bool {
     false
+}
+
+/// The per-layer hash constants, as the checkpoint records them
+/// (`qwen4exp.ple.{layer_multipliers, head_offsets, head_vocab_sizes, eos_token_id}`).
+#[derive(Debug, Clone)]
+pub struct NgramHash {
+    /// `layer_multipliers[i]` multiplies the token `i` positions back.
+    pub(crate) multipliers: Vec<i64>,
+    /// Per-head prime table sizes, `n_heads` of them.
+    pub(crate) sizes: Vec<i64>,
+    /// Per-head row offsets into the flat table.
+    pub(crate) offsets: Vec<i64>,
+    pub(crate) heads_per_ngram: usize,
+    pub(crate) ngram_size: usize,
+    pub(crate) eos: i64,
+}
+
+impl NgramHash {
+    pub fn new(
+        multipliers: Vec<i64>,
+        sizes: Vec<i64>,
+        offsets: Vec<i64>,
+        heads_per_ngram: usize,
+        eos: u32,
+    ) -> Result<Self> {
+        let ngram_size = multipliers.len();
+        let n_heads = (ngram_size.saturating_sub(1)) * heads_per_ngram;
+        if ngram_size < 2 || heads_per_ngram == 0 {
+            lloom_tensor::bail!(
+                "ple hash: ngram_size {ngram_size} / heads_per_ngram {heads_per_ngram}"
+            )
+        }
+        if sizes.len() < n_heads || offsets.len() < n_heads {
+            lloom_tensor::bail!(
+                "ple hash: {n_heads} heads but {} sizes / {} offsets",
+                sizes.len(),
+                offsets.len()
+            )
+        }
+        if sizes.iter().take(n_heads).any(|&s| s <= 0) {
+            lloom_tensor::bail!("ple hash: a head vocab size is not positive")
+        }
+        Ok(Self {
+            multipliers,
+            sizes,
+            offsets,
+            heads_per_ngram,
+            ngram_size,
+            eos: eos as i64,
+        })
+    }
+
+    /// Heads (rows gathered per token): `(ngram_size − 1) · heads_per_ngram`.
+    pub fn n_heads(&self) -> usize {
+        (self.ngram_size - 1) * self.heads_per_ngram
+    }
+
+    /// Predecessors the window needs: `ngram_size − 1`.
+    pub fn context_len(&self) -> usize {
+        self.ngram_size - 1
+    }
+
+    /// One row of the table, past the last real row (the padded tail).
+    pub fn total_rows(&self) -> i64 {
+        let n = self.n_heads();
+        (0..n)
+            .map(|h| self.offsets[h] + self.sizes[h])
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Row ids for one token. `window[0]` is the token itself, `window[s]` the
+    /// token `s` positions back (`None` before the sequence start). `out` is
+    /// `n_heads` long, head-major.
+    pub fn row_ids(&self, window: &[Option<u32>], out: &mut [i64]) {
+        debug_assert_eq!(window.len(), self.ngram_size);
+        debug_assert_eq!(out.len(), self.n_heads());
+        let cur = window[0].map(|t| t as i64).unwrap_or(self.eos);
+        // mixed[n-2] accumulates the n-gram's XOR as the window walks outward.
+        let mut mixed = cur.wrapping_mul(self.multipliers[0]);
+        let mut crossed = false;
+        for (shift, older) in window.iter().enumerate().skip(1) {
+            let mut candidate = older.map(|t| t as i64).unwrap_or(self.eos);
+            if crossed {
+                candidate = self.eos;
+            }
+            crossed |= candidate == self.eos;
+            mixed ^= candidate.wrapping_mul(self.multipliers[shift]);
+            // Every head of order n > shift includes this term; the order
+            // `shift + 1` heads are complete now.
+            let order = shift + 1;
+            let base = (order - 2) * self.heads_per_ngram;
+            for g in 0..self.heads_per_ngram {
+                let h = base + g;
+                let size = self.sizes[h];
+                let mut rem = mixed.wrapping_rem(size);
+                if rem < 0 {
+                    rem += size;
+                }
+                out[h] = rem + self.offsets[h];
+            }
+        }
+    }
+
+    /// The reference derivation of the constants (vLLM
+    /// `Qwen4ExpNGramEmbedding::_make_layer_multipliers` /
+    /// `_make_vocab_layout`), so the checkpoint's recorded values can be
+    /// cross-checked rather than trusted.
+    pub fn derive(
+        seed: u64,
+        unigram_vocab_size: u64,
+        ngram_size: usize,
+        heads_per_ngram: usize,
+        ngram_vocab_size_base: u64,
+        ple_dense_layer_id: u64,
+        eos: u32,
+    ) -> Result<Self> {
+        const GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+        const PRIME: u64 = 10007;
+        let max_multiplier = ((1u64 << 63) - 1) / unigram_vocab_size;
+        let half_bound = (max_multiplier / 2).max(1);
+        let base_seed = seed.wrapping_add(PRIME.wrapping_mul(ple_dense_layer_id));
+        let multipliers: Vec<i64> = (0..ngram_size)
+            .map(|i| {
+                let v = base_seed.wrapping_add(GAMMA.wrapping_mul(i as u64 + 1));
+                (2 * (splitmix64(v) % half_bound) + 1) as i64
+            })
+            .collect();
+        let n_heads = (ngram_size - 1) * heads_per_ngram;
+        let mut sizes = Vec::with_capacity(n_heads);
+        let mut offsets = Vec::with_capacity(n_heads);
+        let mut offset = 0i64;
+        for local in 0..n_heads as u64 {
+            let global = ple_dense_layer_id * n_heads as u64 + local;
+            let size = nth_prime_after(ngram_vocab_size_base - 1, global + 1) as i64;
+            sizes.push(size);
+            offsets.push(offset);
+            offset += size;
+        }
+        Self::new(multipliers, sizes, offsets, heads_per_ngram, eos)
+    }
+}
+
+fn splitmix64(mut v: u64) -> u64 {
+    v = v.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    v = (v ^ (v >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    v = (v ^ (v >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    v ^ (v >> 31)
+}
+
+fn is_prime_64(n: u64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    for p in [2u64, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37] {
+        if n.is_multiple_of(p) {
+            return n == p;
+        }
+    }
+    let mut d = n - 1;
+    let mut s = 0;
+    while d.is_multiple_of(2) {
+        d /= 2;
+        s += 1;
+    }
+    'witness: for a in [2u64, 325, 9375, 28178, 450775, 9780504, 1795265022] {
+        if a % n == 0 {
+            continue;
+        }
+        let mut x = mod_pow(a, d, n);
+        if x == 1 || x == n - 1 {
+            continue;
+        }
+        for _ in 0..s - 1 {
+            x = mod_mul(x, x, n);
+            if x == n - 1 {
+                continue 'witness;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+fn mod_mul(a: u64, b: u64, m: u64) -> u64 {
+    ((a as u128 * b as u128) % m as u128) as u64
+}
+
+fn mod_pow(mut base: u64, mut exp: u64, m: u64) -> u64 {
+    let mut acc = 1u64;
+    base %= m;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc = mod_mul(acc, base, m);
+        }
+        base = mod_mul(base, base, m);
+        exp >>= 1;
+    }
+    acc
+}
+
+/// The `count`-th prime strictly greater than `start`.
+fn nth_prime_after(start: u64, count: u64) -> u64 {
+    let mut prime = start;
+    for _ in 0..count {
+        let mut c = prime + 1;
+        if c <= 2 {
+            prime = 2;
+            continue;
+        }
+        if c.is_multiple_of(2) {
+            c += 1;
+        }
+        while !is_prime_64(c) {
+            c += 2;
+        }
+        prime = c;
+    }
+    prime
+}
+
+/// The per-sequence token window the hash reads: the last `context_len`
+/// tokens, newest last, `None` before the sequence start.
+#[derive(Debug, Clone)]
+pub struct NgramWindow {
+    prev: Vec<Option<u32>>,
+}
+
+impl NgramWindow {
+    pub fn new(context_len: usize) -> Self {
+        Self {
+            prev: vec![None; context_len],
+        }
+    }
+
+    pub fn reset(&mut self) {
+        for p in &mut self.prev {
+            *p = None;
+        }
+    }
+
+    /// The hash window for `token` at the current position: `[token, prev1,
+    /// prev2, …]` (newest first).
+    pub fn window(&self, token: Option<u32>) -> Vec<Option<u32>> {
+        let mut w = Vec::with_capacity(self.prev.len() + 1);
+        w.push(token);
+        w.extend(self.prev.iter().rev().copied());
+        w
+    }
+
+    /// [`Self::window`] into `out`, which keeps its capacity.
+    pub fn window_into(&self, token: Option<u32>, out: &mut Vec<Option<u32>>) {
+        out.clear();
+        out.push(token);
+        out.extend(self.prev.iter().rev().copied());
+    }
+
+    /// Advance past `token`.
+    pub fn push(&mut self, token: Option<u32>) {
+        if self.prev.is_empty() {
+            return;
+        }
+        self.prev.rotate_left(1);
+        let last = self.prev.len() - 1;
+        self.prev[last] = token;
+    }
+}
+
+/// Staging slots a run's producer fills: two, so the slot a producer writes
+/// is never the one the forward before it reads (the staging ring's
+/// depth + 1).
+pub const HOST_FILL_SLOTS: usize = 2;
+
+/// What one run's three parties share: the forward encodes its waits through
+/// it, the decode loop counts the tokens it fed, the producer signals.
+///
+/// Values are `base + k` for the `k`-th decode forward of the run (1-based),
+/// which consumes the `k`-th token the loop fed: position `pos0 + k - 1`. A
+/// forward replayed at the same position (a device-plan miss) waits for the
+/// same value and reads the same slot.
+#[derive(Debug)]
+pub struct FeedLink {
+    #[cfg(feature = "metal")]
+    ring: Arc<lloom_tensor::metal_backend::HostFedRing>,
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    base: u64,
+    pos0: usize,
+    fed: AtomicU64,
+    signalled: AtomicU64,
+    demanded: AtomicU64,
+    released: AtomicBool,
+    /// Why the producer stopped, if it failed.
+    failure: parking_lot::Mutex<Option<String>>,
+}
+
+impl FeedLink {
+    /// A run whose first decode forward is at `pos0`, over `ring`, whose
+    /// event holds the previous run's last value.
+    #[cfg(feature = "metal")]
+    pub fn new(ring: Arc<lloom_tensor::metal_backend::HostFedRing>, pos0: usize) -> Self {
+        let base = ring.base();
+        Self {
+            ring,
+            base,
+            pos0,
+            fed: AtomicU64::new(0),
+            signalled: AtomicU64::new(0),
+            demanded: AtomicU64::new(0),
+            released: AtomicBool::new(false),
+            failure: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// The position of the run's first decode forward.
+    pub fn pos0(&self) -> usize {
+        self.pos0
+    }
+
+    /// The loop fed one more token into the command stream (published it
+    /// ahead of every forward it encodes after this call).
+    pub fn note_fed(&self) {
+        self.fed.fetch_add(1, Ordering::Release);
+    }
+
+    /// Tokens the loop has fed this run.
+    pub fn fed(&self) -> u64 {
+        self.fed.load(Ordering::Acquire)
+    }
+
+    /// Values the producer has signalled this run.
+    pub fn signalled(&self) -> u64 {
+        self.signalled.load(Ordering::Acquire)
+    }
+
+    /// The highest value a forward of this run waits for.
+    pub fn demanded(&self) -> u64 {
+        self.demanded.load(Ordering::Acquire)
+    }
+
+    /// Whether [`Self::release`] ran: every wait of the run was let through,
+    /// whatever its slot held.
+    pub fn released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
+    }
+
+    /// The run-relative value (1-based) the forward at `pos` consumes.
+    fn index_at(&self, pos: usize) -> Result<u64> {
+        if pos < self.pos0 {
+            lloom_tensor::bail!(
+                "host feed: a forward at position {pos}, before the run's first decode step {}",
+                self.pos0
+            )
+        }
+        Ok((pos - self.pos0) as u64 + 1)
+    }
+
+    /// The rows the forward at `pos` reads: a wait for its value, encoded
+    /// here, and the `[len]` f32 slot the producer fills. Refused when the
+    /// loop has not yet fed the token that value is filled from — a wait
+    /// nothing would ever signal.
+    pub fn encode_read(&self, pos: usize) -> Result<Tensor> {
+        if self.released() {
+            lloom_tensor::bail!(
+                "host feed: the fill of a run that ended early (its waits were released{}); \
+                 the sequence's state past position {} is not the model's",
+                match &*self.failure.lock() {
+                    Some(why) => format!(": {why}"),
+                    None => String::new(),
+                },
+                self.pos0
+            )
+        }
+        let k = self.index_at(pos)?;
+        let fed = self.fed();
+        if k > fed {
+            lloom_tensor::bail!(
+                "host feed: the forward at position {pos} reads token {k} of the run, and the \
+                 loop has fed {fed}: its wait would never be signalled"
+            )
+        }
+        self.demanded.fetch_max(k, Ordering::AcqRel);
+        #[cfg(feature = "metal")]
+        {
+            let v = self.base + k;
+            self.ring.encode_wait(v)?;
+            Ok(self.ring.tensor(v).clone())
+        }
+        #[cfg(not(feature = "metal"))]
+        lloom_tensor::bail!("host feed: no host-fed ring off Metal")
+    }
+
+    /// Let every wait of the run through: the event jumps past any value the
+    /// run could have encoded. For a run that fails, or ends, with waits its
+    /// producer will not fill; the slots those forwards read are stale.
+    pub fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        #[cfg(feature = "metal")]
+        self.ring.release(self.base);
+    }
+
+    /// The producer failed with `why`: record it and release every wait.
+    pub fn fail(&self, why: &dyn std::fmt::Display) {
+        *self.failure.lock() = Some(why.to_string());
+        self.release();
+    }
+
+    /// The producer filled run value `k`'s slot: signal it.
+    fn signal(&self, k: u64) {
+        if self.released() {
+            return;
+        }
+        #[cfg(feature = "metal")]
+        self.ring.signal(self.base + k);
+        self.signalled.store(k, Ordering::Release);
+    }
+
+    /// The slot run value `k` fills, for the producer.
+    ///
+    /// # Safety
+    /// As [`lloom_tensor::metal_backend::HostFedRing::slot_mut`]: value `k`'s
+    /// token is published, so the forward that read the slot's previous value
+    /// (`k - HOST_FILL_SLOTS`) has run; only the producer writes slots.
+    #[cfg(feature = "metal")]
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn slot_mut(&self, k: u64) -> &mut [f32] {
+        // SAFETY: the caller's contract, forwarded.
+        unsafe { self.ring.slot_mut(self.base + k) }
+    }
+}
+
+/// One run's host fill, as a model hands it to the decode loop
+/// (`CausalLM::host_feed`): the shared [`FeedLink`] and the producer's half.
+#[derive(Debug)]
+pub struct HostFeed {
+    link: Arc<FeedLink>,
+    fill: NgramFill,
+}
+
+impl HostFeed {
+    /// The fill of `rows` hashed by `hash`, starting from `window` (the
+    /// sequence's window at the run's first decode step), over `link`.
+    pub fn new(
+        link: Arc<FeedLink>,
+        rows: Arc<RowTable>,
+        hash: NgramHash,
+        window: NgramWindow,
+    ) -> Self {
+        let n = hash.n_heads();
+        Self {
+            fill: NgramFill {
+                link: Arc::clone(&link),
+                rows,
+                hash,
+                window,
+                filled: 0,
+                ids: vec![0; n],
+                scratch: Vec::with_capacity(n + 1),
+                consumed: Vec::new(),
+            },
+            link,
+        }
+    }
+
+    pub fn link(&self) -> &Arc<FeedLink> {
+        &self.link
+    }
+
+    pub fn into_parts(self) -> (Arc<FeedLink>, NgramFill) {
+        (self.link, self.fill)
+    }
+}
+
+/// The producer's half of a [`HostFeed`]: fills one slot per token the loop
+/// published, in order.
+#[derive(Debug)]
+pub struct NgramFill {
+    link: Arc<FeedLink>,
+    #[cfg_attr(not(feature = "metal"), allow(dead_code))]
+    rows: Arc<RowTable>,
+    hash: NgramHash,
+    window: NgramWindow,
+    filled: u64,
+    ids: Vec<i64>,
+    scratch: Vec<Option<u32>>,
+    consumed: Vec<u32>,
+}
+
+impl NgramFill {
+    /// The next published token of the run: hash its window, gather its rows
+    /// into the next value's slot, advance the window, signal. A run's tokens
+    /// must arrive in the order they were published.
+    pub fn fill(&mut self, token: u32) -> Result<()> {
+        let k = self.filled + 1;
+        self.window.window_into(Some(token), &mut self.scratch);
+        self.hash.row_ids(&self.scratch, &mut self.ids);
+        self.gather_into_slot(k)?;
+        self.window.push(Some(token));
+        self.consumed.push(token);
+        self.filled = k;
+        self.link.signal(k);
+        Ok(())
+    }
+
+    #[cfg(feature = "metal")]
+    fn gather_into_slot(&self, k: u64) -> Result<()> {
+        // SAFETY: token `k` is published (the caller read it off the ring's
+        // stamp), so the forward that read value `k - 2`'s slot — two tokens
+        // back — has run; this thread is the only writer.
+        let slot = unsafe { self.link.slot_mut(k) };
+        self.rows.gather_into(&self.ids, slot)
+    }
+
+    #[cfg(not(feature = "metal"))]
+    fn gather_into_slot(&self, _k: u64) -> Result<()> {
+        lloom_tensor::bail!("host feed: no host-fed ring off Metal")
+    }
+
+    /// Slots filled so far this run.
+    pub fn filled(&self) -> u64 {
+        self.filled
+    }
+
+    /// The tokens filled, in order: what the run's decode forwards consumed,
+    /// and possibly the tokens past its last forward.
+    pub fn into_consumed(self) -> Vec<u32> {
+        self.consumed
+    }
 }
 
 #[cfg(test)]

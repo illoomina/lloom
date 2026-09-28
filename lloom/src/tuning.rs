@@ -154,6 +154,9 @@ pub struct StreamTuning {
     /// Reader threads of the expert prefetcher (≥ 1; the SSD's rate flattens past eight).
     #[opt(flag = "prefetch-threads", env = "LLOOM_PREFETCH_THREADS", parser = "parse_at_least_one")]
     pub prefetch_threads: usize,
+    /// Pieces per plane a reader request covers (0 = an expert is one request, its planes read one after another).
+    #[opt(flag = "prefetch-split", env = "LLOOM_PREFETCH_SPLIT")]
+    pub prefetch_split: usize,
     /// Layers of lead the prefill's prefetcher runs ahead of the layer being computed (≥ 1).
     #[opt(flag = "prefetch-lead", env = "QWEN4EXP_PREFETCH_LEAD", parser = "parse_at_least_one")]
     pub prefetch_lead: usize,
@@ -166,6 +169,9 @@ pub struct StreamTuning {
     /// Score the residual-speculation hint against the real routing — an instrument (extra router runs and readbacks).
     #[opt(flag = "hint-recall", env = "QWEN4EXP_HINT_RECALL", bool)]
     pub hint_recall: bool,
+    /// A token's settle submits every layer's loads before waiting for any (off = one layer after another, the A/B arm).
+    #[opt(flag = "settle-batch", env = "QWEN4EXP_SETTLE_BATCH", bool)]
+    pub settle_batch: bool,
     /// Print every settle's ids, flags and misses — an instrument.
     #[opt(flag = "trace-settle", env = "QWEN4EXP_TRACE_SETTLE", bool)]
     pub trace_settle: bool,
@@ -177,10 +183,12 @@ impl Default for StreamTuning {
             pread_direct: false,
             // `nn::expert_prefetch::DEFAULT_THREADS` (metal-only module): 8.
             prefetch_threads: 8,
+            prefetch_split: 1,
             prefetch_lead: 2,
             plan: "device".into(),
             decode_hint: false,
             hint_recall: false,
+            settle_batch: true,
             trace_settle: false,
         }
     }

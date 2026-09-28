@@ -28,6 +28,16 @@
 //! cap is reached and resumes as the tiers take or release what was staged,
 //! so a prefetch burst never turns the ring's one-shots into growth.
 //!
+//! # Pieces
+//!
+//! One `pread` of a plane is latency-bound (the SSD reads 2.2 GB/s at one
+//! in flight, 6.6 at four, 8.6 at eight), so a request is a piece of a plane
+//! rather than an expert (`LLOOM_PREFETCH_SPLIT` = pieces per plane; 0 is the
+//! expert as one request, its planes read one after another): a single miss
+//! is read by several threads at once. An expert's pieces land in ring
+//! entries acquired when its first piece is taken, and it is staged once the
+//! last one has landed.
+//!
 //! Metal only: the ring and the copy are the Metal path's; the CPU tier
 //! keeps its synchronous loads.
 
@@ -50,8 +60,13 @@ pub struct PlaneSource {
 
 impl PlaneSource {
     fn read(&self, expert: u32, dst: &mut [u8]) -> std::io::Result<()> {
+        self.read_at(expert, 0, dst)
+    }
+
+    /// `dst.len()` bytes of `expert`'s plane from byte `at` of it.
+    fn read_at(&self, expert: u32, at: usize, dst: &mut [u8]) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
-        let off = self.data_start + expert as u64 * self.plane_bytes as u64;
+        let off = self.data_start + expert as u64 * self.plane_bytes as u64 + at as u64;
         self.file.read_exact_at(dst, off)
     }
 }
@@ -70,11 +85,27 @@ impl Staged {
     }
 }
 
+/// What one request reads: the expert's three planes one after another, or
+/// bytes `lo..hi` of one plane — a piece of assembly `asm`, which has
+/// `pieces` in all.
+#[derive(Clone, Copy, Debug)]
+enum Part {
+    Whole,
+    Piece {
+        asm: u64,
+        plane: u8,
+        lo: usize,
+        hi: usize,
+        pieces: usize,
+    },
+}
+
 struct Req {
     key: usize,
     generation: u64,
     expert: u32,
     planes: [PlaneSource; 3],
+    part: Part,
     /// A direct read: into these slots, once `epoch` is complete; the
     /// batch it belongs to (`direct_pending`) is told when it lands.
     direct: Option<(u64, [DirectDst; 3], u64)>,
@@ -116,6 +147,10 @@ pub struct PrefetchCounters {
     pub parked: AtomicU64,
     /// Experts a layer read through the threads at the layer (`load_now`).
     pub now: AtomicU64,
+    /// `submit_now` tickets not yet waited for, and the most there were at
+    /// once: above one, several layers' reads were in flight together.
+    pub now_outstanding: AtomicU64,
+    pub now_peak: AtomicU64,
 }
 
 /// A snapshot of [`PrefetchCounters`].
@@ -133,12 +168,34 @@ pub struct PrefetchStats {
     pub stage_read_bytes: u64,
     pub direct_read_ns: u64,
     pub direct_read_bytes: u64,
+    pub now_peak: u64,
+}
+
+/// An expert read in pieces, into the ring entries its first piece
+/// acquired; staged when `left` — its pieces not yet landed — reaches zero.
+struct Assembly {
+    key: usize,
+    generation: u64,
+    expert: u32,
+    bufs: [(Option<usize>, Arc<PooledBuffer>); 3],
+    left: usize,
+    /// A piece failed to read, or was cancelled before it ran.
+    failed: bool,
+}
+
+impl Assembly {
+    fn bytes(&self) -> usize {
+        self.bufs.iter().map(|(_, b)| b.size()).sum()
+    }
 }
 
 struct State {
-    /// Direct-read batches issued, and the jobs still to land per batch.
+    /// Direct-read batches issued, and the requests still to land per batch.
     direct_batches: u64,
     direct_pending: HashMap<u64, usize>,
+    /// Experts being read in pieces, by assembly id, and the next id.
+    assembling: HashMap<u64, Assembly>,
+    next_asm: u64,
     reqs: VecDeque<Req>,
     done: HashMap<usize, Vec<Staged>>,
     generation: HashMap<usize, u64>,
@@ -164,6 +221,8 @@ struct Shared {
     /// The GPU clock a direct read gates on: the slot's last reader's epoch
     /// must be complete before the bytes land in place.
     clock: Arc<lloom_tensor::kernels::metal::GpuClock>,
+    /// Pieces per plane (0: an expert is one request).
+    split: usize,
 }
 
 /// A slot's bytes, for a direct read: a raw pointer into a Shared slot
@@ -183,6 +242,20 @@ pub struct DirectJob {
     pub planes: [PlaneSource; 3],
     pub dsts: [DirectDst; 3],
     pub epoch: u64,
+}
+
+/// A [`Prefetcher::submit_now`] in flight: what was already staged, and
+/// what the threads are reading.
+pub struct NowTicket {
+    key: usize,
+    generation: u64,
+    missing: Vec<u32>,
+    have: Vec<Staged>,
+}
+
+/// A [`Prefetcher::submit_direct`] in flight (`None`: nothing submitted).
+pub struct DirectTicket {
+    batch: Option<u64>,
 }
 
 /// Bytes the prefetcher keeps staged at most: ~2 layers of a cold pool's
@@ -209,6 +282,27 @@ fn threads() -> usize {
     *N.get_or_init(|| crate::tuning::tuning().stream.prefetch_threads.max(1))
 }
 
+/// Pieces per plane by default (`LLOOM_PREFETCH_SPLIT`, read once).
+pub fn default_split() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| crate::tuning::tuning().stream.prefetch_split)
+}
+
+/// A piece's bytes are a multiple of this (the last piece of a plane takes
+/// the remainder).
+const PIECE_ALIGN: usize = 16 << 10;
+
+/// `plane_bytes` cut into at most `split` pieces, `(lo, hi)` each.
+fn cut(plane_bytes: usize, split: usize) -> impl Iterator<Item = (usize, usize)> {
+    let step = plane_bytes
+        .div_ceil(split.max(1))
+        .next_multiple_of(PIECE_ALIGN)
+        .max(PIECE_ALIGN);
+    (0..plane_bytes)
+        .step_by(step)
+        .map(move |lo| (lo, (lo + step).min(plane_bytes)))
+}
+
 impl std::fmt::Debug for Prefetcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Prefetcher {{ {:?} }}", self.stats())
@@ -225,10 +319,23 @@ impl Prefetcher {
         ring: SharedStagingRing,
         max_staged_bytes: usize,
     ) -> Self {
+        Self::with_split(device, ring, max_staged_bytes, default_split())
+    }
+
+    /// [`Self::with_cap`] cutting each plane into `split` pieces (0: an
+    /// expert is one request).
+    pub fn with_split(
+        device: &MetalDevice,
+        ring: SharedStagingRing,
+        max_staged_bytes: usize,
+        split: usize,
+    ) -> Self {
         let shared = Arc::new(Shared {
             state: parking_lot::Mutex::new(State {
                 direct_batches: 0,
                 direct_pending: HashMap::new(),
+                assembling: HashMap::new(),
+                next_asm: 0,
                 reqs: VecDeque::new(),
                 done: HashMap::new(),
                 generation: HashMap::new(),
@@ -243,6 +350,7 @@ impl Prefetcher {
             max_staged_bytes,
             stop: AtomicBool::new(false),
             clock: device.gpu_clock(),
+            split,
         });
         let workers = (0..threads())
             .map(|i| {
@@ -259,75 +367,138 @@ impl Prefetcher {
         }
     }
 
+    /// The requests reading `expert` of tier `key` — one, or three planes
+    /// × the split's pieces sharing an assembly id — appended to `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn reqs_for(
+        &self,
+        g: &mut State,
+        key: usize,
+        generation: u64,
+        expert: u32,
+        planes: &[PlaneSource; 3],
+        now: bool,
+        direct: Option<(u64, [DirectDst; 3], u64)>,
+        out: &mut Vec<Req>,
+    ) {
+        let split = self.shared.split;
+        if split == 0 {
+            out.push(Req {
+                key,
+                generation,
+                expert,
+                planes: planes.clone(),
+                part: Part::Whole,
+                direct,
+                now,
+            });
+            return;
+        }
+        let asm = g.next_asm;
+        g.next_asm += 1;
+        let pieces: usize = planes
+            .iter()
+            .map(|p| cut(p.plane_bytes, split).count())
+            .sum();
+        for (i, src) in planes.iter().enumerate() {
+            for (lo, hi) in cut(src.plane_bytes, split) {
+                out.push(Req {
+                    key,
+                    generation,
+                    expert,
+                    planes: planes.clone(),
+                    part: Part::Piece {
+                        asm,
+                        plane: i as u8,
+                        lo,
+                        hi,
+                        pieces,
+                    },
+                    direct,
+                    now,
+                });
+            }
+        }
+    }
+
+    /// Put `reqs` behind the requests a layer is already waiting for and
+    /// ahead of every hint, in order.
+    fn push_now(g: &mut State, reqs: Vec<Req>) {
+        let at = g.reqs.iter().take_while(|r| r.now).count();
+        for (i, r) in reqs.into_iter().enumerate() {
+            g.reqs.insert(at + i, r);
+        }
+    }
+
     /// Ask for `experts` of tier `key`, in order, from `planes` (gate, up,
     /// down). Supersedes the tier's pending requests and hands back what it
     /// had staged and not taken (a hint is per pass: what the last pass left
     /// is stale).
     pub fn request(&self, key: usize, experts: &[u32], planes: &[PlaneSource; 3]) {
-        let leftovers = {
+        let (leftovers, finished) = {
             let mut g = self.shared.state.lock();
             let gen = g.generation.entry(key).or_insert(0);
             *gen += 1;
             let gen = *gen;
-            g.reqs.retain(|r| r.key != key);
+            let (_, finished) = cancel_key(&mut g, key);
             let left = g.done.remove(&key).unwrap_or_default();
             for s in &left {
                 g.staged_bytes = g.staged_bytes.saturating_sub(s.bytes());
             }
+            let mut reqs = Vec::with_capacity(experts.len());
             for &e in experts {
-                g.reqs.push_back(Req {
-                    key,
-                    generation: gen,
-                    expert: e,
-                    planes: planes.clone(),
-                    direct: None,
-                    now: false,
-                });
+                self.reqs_for(&mut g, key, gen, e, planes, false, None, &mut reqs);
             }
-            left
+            g.reqs.extend(reqs);
+            (left, finished)
         };
         self.shared
             .counters
             .issued
             .fetch_add(experts.len() as u64, Ordering::Relaxed);
         self.give_back(leftovers);
+        release_assemblies(&self.shared, finished);
         self.shared.cv.notify_all();
     }
 
-    /// The staged experts of tier `key` that `needed` names, out of the
-    /// prefetcher's books; the caller lands each one. What was staged and
-    /// not needed by THIS group stays staged for the pass's next group of
-    /// the same layer (a pass whose expert union exceeds the pool resolves
-    /// in several groups) and is released by the tier's next hint if no
-    /// group took it. The pass has reached the tier, so its requests still
-    /// pending are cancelled (`stale`): the threads move on to the next
-    /// layer's.
     /// Read `jobs` straight into their slots through the reader threads —
     /// each once its slot's last reader's epoch is complete — and wait for
     /// all of them. The point-of-use read of the `pread` arm without the
     /// ring and the landing copy (`DESIGN.md` §20.4a, #749 P27). Returns
     /// the time waited for the epochs, summed over the jobs.
     pub fn read_direct(&self, key: usize, jobs: Vec<DirectJob>) -> std::time::Duration {
+        let t = self.submit_direct(key, jobs);
+        self.wait_direct(t)
+    }
+
+    /// [`Self::read_direct`]'s submission: the reads are queued ahead of
+    /// every hint and run while the caller does other work; the ticket is
+    /// waited for with [`Self::wait_direct`].
+    pub fn submit_direct(&self, key: usize, jobs: Vec<DirectJob>) -> DirectTicket {
         if jobs.is_empty() {
-            return std::time::Duration::ZERO;
+            return DirectTicket { batch: None };
         }
         let n = jobs.len();
         let batch = {
             let mut g = self.shared.state.lock();
             g.direct_batches += 1;
             let batch = g.direct_batches;
-            g.direct_pending.insert(batch, n);
             let gen = *g.generation.entry(key).or_insert(0);
-            for j in jobs.into_iter().rev() {
-                g.reqs.push_front(Req {
+            let mut reqs = Vec::with_capacity(n);
+            for j in jobs {
+                self.reqs_for(
+                    &mut g,
                     key,
-                    generation: gen,
-                    expert: j.expert,
-                    planes: j.planes,
-                    direct: Some((batch, j.dsts, j.epoch)),
-                    now: true,
-                });
+                    gen,
+                    j.expert,
+                    &j.planes,
+                    true,
+                    Some((batch, j.dsts, j.epoch)),
+                    &mut reqs,
+                );
             }
+            g.direct_pending.insert(batch, reqs.len());
+            Self::push_now(&mut g, reqs);
             batch
         };
         self.shared
@@ -335,6 +506,15 @@ impl Prefetcher {
             .direct
             .fetch_add(n as u64, Ordering::Relaxed);
         self.shared.cv.notify_all();
+        DirectTicket { batch: Some(batch) }
+    }
+
+    /// Wait for a [`Self::submit_direct`]'s reads to land; the time the
+    /// threads waited for epochs since the last such wait.
+    pub fn wait_direct(&self, t: DirectTicket) -> std::time::Duration {
+        let Some(batch) = t.batch else {
+            return std::time::Duration::ZERO;
+        };
         let mut g = self.shared.state.lock();
         while g.direct_pending.get(&batch).is_some_and(|&left| left > 0) {
             self.shared.cv.wait(&mut g);
@@ -348,6 +528,14 @@ impl Prefetcher {
         )
     }
 
+    /// The staged experts of tier `key` that `needed` names, out of the
+    /// prefetcher's books; the caller lands each one. What was staged and
+    /// not needed by THIS group stays staged for the pass's next group of
+    /// the same layer (a pass whose expert union exceeds the pool resolves
+    /// in several groups) and is released by the tier's next hint if no
+    /// group took it. The pass has reached the tier, so its requests still
+    /// pending are cancelled (`stale`): the threads move on to the next
+    /// layer's.
     pub fn take_needed(&self, key: usize, needed: &[u32]) -> Vec<Staged> {
         self.take_needed_with(key, needed, true)
     }
@@ -360,28 +548,38 @@ impl Prefetcher {
     /// An expert whose read failed (reported by the thread) is left out and
     /// the caller reads it itself.
     pub fn load_now(&self, key: usize, experts: &[u32], planes: &[PlaneSource; 3]) -> Vec<Staged> {
-        let mut have = self.take_needed_with(key, experts, false);
+        let t = self.submit_now(key, experts, planes);
+        self.wait_now(t)
+    }
+
+    /// [`Self::load_now`]'s submission: what is staged is taken, the rest
+    /// queued behind the reads already waited for and ahead of every hint.
+    /// Several layers' submissions then read concurrently
+    /// (`Streamed::settle_batch`); each ticket is waited for with
+    /// [`Self::wait_now`].
+    pub fn submit_now(&self, key: usize, experts: &[u32], planes: &[PlaneSource; 3]) -> NowTicket {
+        let have = self.take_needed_with(key, experts, false);
         let missing: Vec<u32> = experts
             .iter()
             .copied()
             .filter(|e| !have.iter().any(|s| s.expert == *e))
             .collect();
         if missing.is_empty() {
-            return have;
+            return NowTicket {
+                key,
+                generation: 0,
+                missing,
+                have,
+            };
         }
-        let gen = {
+        let generation = {
             let mut g = self.shared.state.lock();
             let gen = *g.generation.entry(key).or_insert(0);
-            for &e in missing.iter().rev() {
-                g.reqs.push_front(Req {
-                    key,
-                    generation: gen,
-                    expert: e,
-                    planes: planes.clone(),
-                    direct: None,
-                    now: true,
-                });
+            let mut reqs = Vec::with_capacity(missing.len());
+            for &e in &missing {
+                self.reqs_for(&mut g, key, gen, e, planes, true, None, &mut reqs);
             }
+            Self::push_now(&mut g, reqs);
             gen
         };
         self.shared
@@ -392,7 +590,34 @@ impl Prefetcher {
             .counters
             .now
             .fetch_add(missing.len() as u64, Ordering::Relaxed);
+        let c = &self.shared.counters;
+        let open = c.now_outstanding.fetch_add(1, Ordering::Relaxed) + 1;
+        c.now_peak.fetch_max(open, Ordering::Relaxed);
         self.shared.cv.notify_all();
+        NowTicket {
+            key,
+            generation,
+            missing,
+            have,
+        }
+    }
+
+    /// Wait for a [`Self::submit_now`]'s experts: every one staged, or its
+    /// read reported failed (the caller reads what is missing itself).
+    pub fn wait_now(&self, t: NowTicket) -> Vec<Staged> {
+        let NowTicket {
+            key,
+            generation: gen,
+            missing,
+            mut have,
+        } = t;
+        if missing.is_empty() {
+            return have;
+        }
+        self.shared
+            .counters
+            .now_outstanding
+            .fetch_sub(1, Ordering::Relaxed);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             have.extend(self.take_needed_with(key, &missing, false));
@@ -403,7 +628,10 @@ impl Prefetcher {
             let pending = g
                 .reqs
                 .iter()
-                .any(|r| r.key == key && r.generation == gen && missing.contains(&r.expert));
+                .any(|r| r.key == key && r.generation == gen && missing.contains(&r.expert))
+                || g.assembling
+                    .values()
+                    .any(|a| a.key == key && a.generation == gen && missing.contains(&a.expert));
             let in_flight = g.staged_bytes > 0;
             let staged_here = g.done.get(&key).is_some_and(|v| !v.is_empty());
             if (!pending && !in_flight && !staged_here) || std::time::Instant::now() > deadline {
@@ -416,12 +644,12 @@ impl Prefetcher {
     }
 
     fn take_needed_with(&self, key: usize, needed: &[u32], cancel: bool) -> Vec<Staged> {
-        let (out, expired) = {
+        let (out, expired, finished) = {
             let mut g = self.shared.state.lock();
+            let mut finished = Vec::new();
             if cancel {
-                let before = g.reqs.len();
-                g.reqs.retain(|r| r.key != key);
-                let dropped = (before - g.reqs.len()) as u64;
+                let (dropped, fin) = cancel_key(&mut g, key);
+                finished = fin;
                 if dropped > 0 {
                     self.shared
                         .counters
@@ -469,9 +697,10 @@ impl Prefetcher {
             for s in &out {
                 g.staged_bytes = g.staged_bytes.saturating_sub(s.bytes());
             }
-            (out, expired)
+            (out, expired, finished)
         };
         self.give_back(expired);
+        release_assemblies(&self.shared, finished);
         self.shared.cv.notify_all();
         out
     }
@@ -529,6 +758,7 @@ impl Prefetcher {
             stage_read_bytes: c.stage_read_bytes.load(Ordering::Relaxed),
             direct_read_ns: c.direct_read_ns.load(Ordering::Relaxed),
             direct_read_bytes: c.direct_read_bytes.load(Ordering::Relaxed),
+            now_peak: c.now_peak.load(Ordering::Relaxed),
         }
     }
 
@@ -551,11 +781,16 @@ impl Drop for Prefetcher {
         for h in self.workers.lock().drain(..) {
             let _ = h.join();
         }
-        // Whatever was staged and never taken goes back to the ring.
-        let left: Vec<Staged> = {
+        // Whatever was staged and never taken goes back to the ring, and
+        // so does every assembly whose pieces never all ran.
+        let (left, partial): (Vec<Staged>, Vec<Assembly>) = {
             let mut g = self.shared.state.lock();
             g.staged_bytes = 0;
-            g.done.drain().flat_map(|(_, v)| v).collect()
+            g.reqs.clear();
+            (
+                g.done.drain().flat_map(|(_, v)| v).collect(),
+                g.assembling.drain().map(|(_, a)| a).collect(),
+            )
         };
         let mut ring = self.shared.ring.lock();
         for s in left {
@@ -563,12 +798,113 @@ impl Drop for Prefetcher {
                 ring.release(*entry, buf);
             }
         }
+        for a in partial {
+            for (entry, buf) in &a.bufs {
+                ring.release(*entry, buf);
+            }
+        }
     }
+}
+
+/// Remove tier `key`'s pending requests. An expert with pieces already
+/// taken is marked failed (its bytes will never be whole) and handed back
+/// once the pieces in flight land; one whose last pieces were all pending
+/// is returned here for the caller to release. Returns the experts dropped
+/// before any of their reads ran, and the assemblies finished.
+fn cancel_key(g: &mut State, key: usize) -> (u64, Vec<Assembly>) {
+    let mut whole = 0u64;
+    let mut pieces: HashMap<u64, usize> = HashMap::new();
+    g.reqs.retain(|r| {
+        if r.key != key {
+            return true;
+        }
+        match r.part {
+            Part::Whole => whole += 1,
+            Part::Piece { asm, .. } => *pieces.entry(asm).or_default() += 1,
+        }
+        false
+    });
+    let mut dropped = whole;
+    let mut finished = Vec::new();
+    for (asm, n) in pieces {
+        match g.assembling.get_mut(&asm) {
+            Some(a) => {
+                a.failed = true;
+                a.left -= n;
+                if a.left == 0 {
+                    let a = g.assembling.remove(&asm).expect("present");
+                    g.staged_bytes = g.staged_bytes.saturating_sub(a.bytes());
+                    finished.push(a);
+                }
+            }
+            None => dropped += 1,
+        }
+    }
+    (dropped, finished)
+}
+
+/// Hand finished-but-unusable assemblies' entries back to the ring.
+fn release_assemblies(w: &Shared, finished: Vec<Assembly>) {
+    if finished.is_empty() {
+        return;
+    }
+    let mut ring = w.ring.lock();
+    for a in finished {
+        for (entry, buf) in &a.bufs {
+            ring.release(*entry, buf);
+        }
+    }
+}
+
+/// The ring entries for one expert's three planes, or none (every entry
+/// taken is handed back on failure).
+fn acquire_three(
+    w: &Shared,
+    planes: &[PlaneSource; 3],
+) -> Result<[(Option<usize>, Arc<PooledBuffer>); 3]> {
+    let mut ring = w.ring.lock();
+    let mut got: Vec<(Option<usize>, Arc<PooledBuffer>)> = Vec::with_capacity(3);
+    for src in planes {
+        match ring.acquire(&w.device, src.plane_bytes) {
+            Ok((entry, buf)) if !buf.contents().is_null() => got.push((entry, buf)),
+            other => {
+                if let Ok((entry, buf)) = &other {
+                    ring.release(*entry, buf);
+                }
+                for (e, b) in &got {
+                    ring.release(*e, b);
+                }
+                return match other {
+                    Err(e) => Err(e),
+                    Ok(_) => lloom_tensor::bail!(
+                        "the staging buffer has no CPU mapping ({} bytes)",
+                        src.plane_bytes
+                    ),
+                };
+            }
+        }
+    }
+    let mut it = got.into_iter();
+    Ok([
+        it.next().expect("three"),
+        it.next().expect("three"),
+        it.next().expect("three"),
+    ])
+}
+
+/// What a popped request reads into.
+enum Target {
+    /// Straight into a slot (`read_direct`).
+    Direct(u64, [DirectDst; 3], u64),
+    /// Into ring entries of its own (`Part::Whole`, `stage`).
+    Stage,
+    /// A piece of an assembly, into this plane's ring entry.
+    Piece(u64, Arc<PooledBuffer>),
 }
 
 fn worker(w: Arc<Shared>) {
     loop {
-        let req = {
+        let (req, target) = {
             let mut g = w.state.lock();
             loop {
                 if w.stop.load(Ordering::Acquire) {
@@ -576,7 +912,9 @@ fn worker(w: Arc<Shared>) {
                 }
                 if let Some(front) = g.reqs.front() {
                     let need: usize = front.planes.iter().map(|p| p.plane_bytes).sum();
+                    let started = matches!(front.part, Part::Piece { asm, .. } if g.assembling.contains_key(&asm));
                     if front.now
+                        || started
                         || g.staged_bytes + need <= w.max_staged_bytes
                         || g.staged_bytes == 0
                     {
@@ -589,91 +927,216 @@ fn worker(w: Arc<Shared>) {
             let req = g.reqs.pop_front().expect("front checked");
             // A direct read is never stale (a take's cancel is for the
             // hints) and takes no ring: it lands where it is told.
-            if req.direct.is_none() {
-                if g.generation.get(&req.key).copied().unwrap_or(0) != req.generation {
-                    w.counters.stale.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-                // Reserve the bytes now so a burst of requests cannot all pass
-                // the cap check before any of them lands.
-                g.staged_bytes += req.planes.iter().map(|p| p.plane_bytes).sum::<usize>();
-            }
-            req
-        };
-        if let Some((batch, dsts, epoch)) = req.direct {
-            // The slot's last reader must have run: the pool's clock says
-            // when its command buffer completed.
-            let t0 = std::time::Instant::now();
-            while !w.clock.is_complete(epoch) {
-                std::thread::sleep(std::time::Duration::from_micros(50));
-            }
-            w.counters
-                .direct_wait_ns
-                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            let mut bytes = 0u64;
-            let t_read = std::time::Instant::now();
-            for (src, dst) in req.planes.iter().zip(dsts.iter()) {
-                // SAFETY: `dst` addresses `plane_bytes` of a Shared slot the
-                // tier keeps alive, given to this job alone.
-                let slice = unsafe { std::slice::from_raw_parts_mut(dst.0, src.plane_bytes) };
-                if let Err(e) = src.read(req.expert, slice) {
-                    eprintln!(
-                        "expert-prefetch: direct read of expert {} of tier {}: {e}",
-                        req.expert, req.key
-                    );
-                }
-                bytes += src.plane_bytes as u64;
-            }
-            w.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
-            w.counters
-                .direct_read_ns
-                .fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            w.counters
-                .direct_read_bytes
-                .fetch_add(bytes, Ordering::Relaxed);
-            let mut g = w.state.lock();
-            if let Some(left) = g.direct_pending.get_mut(&batch) {
-                *left = left.saturating_sub(1);
-            }
-            drop(g);
-            w.cv.notify_all();
-            continue;
-        }
-        match stage(&w, &req) {
-            Ok(staged) => {
-                let bytes = staged.bytes() as u64;
-                let mut g = w.state.lock();
-                if g.generation.get(&req.key).copied().unwrap_or(0) == req.generation {
-                    g.done.entry(req.key).or_default().push(staged);
-                    drop(g);
-                    w.counters.staged.fetch_add(1, Ordering::Relaxed);
-                    w.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
-                    w.cv.notify_all();
-                } else {
-                    // Superseded while reading: back to the ring, unbooked.
-                    g.staged_bytes = g.staged_bytes.saturating_sub(staged.bytes());
-                    drop(g);
-                    let mut ring = w.ring.lock();
-                    for (entry, buf) in &staged.planes {
-                        ring.release(*entry, buf);
+            let target = match (req.direct, req.part) {
+                (Some((batch, dsts, epoch)), _) => Target::Direct(batch, dsts, epoch),
+                (None, Part::Whole) => {
+                    if g.generation.get(&req.key).copied().unwrap_or(0) != req.generation {
+                        w.counters.stale.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
-                    w.counters.stale.fetch_add(1, Ordering::Relaxed);
+                    // Reserve the bytes now so a burst of requests cannot all
+                    // pass the cap check before any of them lands.
+                    g.staged_bytes += req.planes.iter().map(|p| p.plane_bytes).sum::<usize>();
+                    Target::Stage
                 }
-            }
-            Err(e) => {
-                // A read that failed is a miss the layer will take
-                // synchronously (and report, if it fails there too).
-                eprintln!(
-                    "expert-prefetch: expert {} of tier {}: {e}",
-                    req.expert, req.key
-                );
+                (
+                    None,
+                    Part::Piece {
+                        asm, plane, pieces, ..
+                    },
+                ) => {
+                    if !g.assembling.contains_key(&asm) {
+                        // The expert's first piece: stale now means every
+                        // piece of it is.
+                        if g.generation.get(&req.key).copied().unwrap_or(0) != req.generation {
+                            g.reqs.retain(
+                                |r| !matches!(r.part, Part::Piece { asm: a, .. } if a == asm),
+                            );
+                            w.counters.stale.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        match acquire_three(&w, &req.planes) {
+                            Ok(bufs) => {
+                                let a = Assembly {
+                                    key: req.key,
+                                    generation: req.generation,
+                                    expert: req.expert,
+                                    bufs,
+                                    left: pieces,
+                                    failed: false,
+                                };
+                                g.staged_bytes += a.bytes();
+                                g.assembling.insert(asm, a);
+                            }
+                            Err(e) => {
+                                // A miss the layer will take synchronously.
+                                eprintln!(
+                                    "expert-prefetch: expert {} of tier {}: {e}",
+                                    req.expert, req.key
+                                );
+                                g.reqs.retain(
+                                    |r| !matches!(r.part, Part::Piece { asm: a, .. } if a == asm),
+                                );
+                                drop(g);
+                                w.cv.notify_all();
+                                continue;
+                            }
+                        }
+                    }
+                    let buf = Arc::clone(&g.assembling[&asm].bufs[plane as usize].1);
+                    Target::Piece(asm, buf)
+                }
+            };
+            (req, target)
+        };
+        match target {
+            Target::Direct(batch, dsts, epoch) => {
+                // The slot's last reader must have run: the pool's clock says
+                // when its command buffer completed.
+                let t0 = std::time::Instant::now();
+                while !w.clock.is_complete(epoch) {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+                w.counters
+                    .direct_wait_ns
+                    .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let mut bytes = 0u64;
+                let t_read = std::time::Instant::now();
+                let spans: Vec<(usize, usize, usize)> = match req.part {
+                    Part::Whole => (0..3).map(|i| (i, 0, req.planes[i].plane_bytes)).collect(),
+                    Part::Piece { plane, lo, hi, .. } => vec![(plane as usize, lo, hi)],
+                };
+                for (i, lo, hi) in spans {
+                    // SAFETY: `dsts[i]` addresses `plane_bytes` of a Shared
+                    // slot the tier keeps alive, given to this job alone;
+                    // `lo..hi` lies inside it and no other piece writes it.
+                    let slice =
+                        unsafe { std::slice::from_raw_parts_mut(dsts[i].0.add(lo), hi - lo) };
+                    if let Err(e) = req.planes[i].read_at(req.expert, lo, slice) {
+                        eprintln!(
+                            "expert-prefetch: direct read of expert {} of tier {}: {e}",
+                            req.expert, req.key
+                        );
+                    }
+                    bytes += (hi - lo) as u64;
+                }
+                w.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
+                w.counters
+                    .direct_read_ns
+                    .fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                w.counters
+                    .direct_read_bytes
+                    .fetch_add(bytes, Ordering::Relaxed);
                 let mut g = w.state.lock();
-                g.staged_bytes = g
-                    .staged_bytes
-                    .saturating_sub(req.planes.iter().map(|p| p.plane_bytes).sum::<usize>());
+                if let Some(left) = g.direct_pending.get_mut(&batch) {
+                    *left = left.saturating_sub(1);
+                }
                 drop(g);
                 w.cv.notify_all();
             }
+            Target::Stage => stage_whole(&w, &req),
+            Target::Piece(asm, buf) => {
+                let Part::Piece { plane, lo, hi, .. } = req.part else {
+                    unreachable!("a piece target is a piece")
+                };
+                let t_read = std::time::Instant::now();
+                // SAFETY: a Shared ring entry of at least the plane's bytes,
+                // acquired for this assembly alone; `lo..hi` lies inside the
+                // plane and no other piece writes it.
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut(buf.contents().add(lo), hi - lo) };
+                let r = req.planes[plane as usize].read_at(req.expert, lo, dst);
+                w.counters
+                    .stage_read_ns
+                    .fetch_add(t_read.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                w.counters
+                    .stage_read_bytes
+                    .fetch_add((hi - lo) as u64, Ordering::Relaxed);
+                if let Err(e) = &r {
+                    eprintln!(
+                        "expert-prefetch: expert {} of tier {}: {e}",
+                        req.expert, req.key
+                    );
+                }
+                piece_landed(&w, asm, r.is_err());
+            }
+        }
+    }
+}
+
+/// One piece of assembly `asm` has landed (or failed): the expert is staged
+/// once its last piece is in — or handed back, if a piece failed or the
+/// tier's generation moved on while it was read.
+fn piece_landed(w: &Shared, asm: u64, failed: bool) {
+    let mut g = w.state.lock();
+    let Some(a) = g.assembling.get_mut(&asm) else {
+        return;
+    };
+    a.failed |= failed;
+    a.left -= 1;
+    if a.left > 0 {
+        return;
+    }
+    let a = g.assembling.remove(&asm).expect("present");
+    let current = g.generation.get(&a.key).copied().unwrap_or(0) == a.generation;
+    if !a.failed && current {
+        let bytes = a.bytes() as u64;
+        g.done.entry(a.key).or_default().push(Staged {
+            expert: a.expert,
+            planes: a.bufs,
+        });
+        drop(g);
+        w.counters.staged.fetch_add(1, Ordering::Relaxed);
+        w.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
+        w.cv.notify_all();
+        return;
+    }
+    g.staged_bytes = g.staged_bytes.saturating_sub(a.bytes());
+    drop(g);
+    if !a.failed {
+        w.counters.stale.fetch_add(1, Ordering::Relaxed);
+    }
+    release_assemblies(w, vec![a]);
+    w.cv.notify_all();
+}
+
+/// A whole-expert request: its three planes read one after another into
+/// ring entries, then staged (or handed back if superseded meanwhile).
+fn stage_whole(w: &Shared, req: &Req) {
+    match stage(w, req) {
+        Ok(staged) => {
+            let bytes = staged.bytes() as u64;
+            let mut g = w.state.lock();
+            if g.generation.get(&req.key).copied().unwrap_or(0) == req.generation {
+                g.done.entry(req.key).or_default().push(staged);
+                drop(g);
+                w.counters.staged.fetch_add(1, Ordering::Relaxed);
+                w.counters.bytes.fetch_add(bytes, Ordering::Relaxed);
+                w.cv.notify_all();
+            } else {
+                // Superseded while reading: back to the ring, unbooked.
+                g.staged_bytes = g.staged_bytes.saturating_sub(staged.bytes());
+                drop(g);
+                let mut ring = w.ring.lock();
+                for (entry, buf) in &staged.planes {
+                    ring.release(*entry, buf);
+                }
+                w.counters.stale.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Err(e) => {
+            // A read that failed is a miss the layer will take
+            // synchronously (and report, if it fails there too).
+            eprintln!(
+                "expert-prefetch: expert {} of tier {}: {e}",
+                req.expert, req.key
+            );
+            let mut g = w.state.lock();
+            g.staged_bytes = g
+                .staged_bytes
+                .saturating_sub(req.planes.iter().map(|p| p.plane_bytes).sum::<usize>());
+            drop(g);
+            w.cv.notify_all();
         }
     }
 }

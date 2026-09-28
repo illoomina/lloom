@@ -124,6 +124,28 @@ pub trait ExpertResidency {
         Ok(false)
     }
 
+    /// [`Self::settle_host`] over several layers' records at once, in layer
+    /// order: each part's experts loaded, the count per part (0: the part's
+    /// pass found everything resident). A strategy may begin every part's
+    /// loads before finishing any, so a token's misses read together
+    /// (`Streamed`); the default settles one part after another.
+    fn settle_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<u64>>
+    where
+        Self: Sized,
+    {
+        parts
+            .iter()
+            .map(|(r, v)| {
+                let before = r.misses_so_far();
+                Ok(if r.settle_host(v)? {
+                    r.misses_so_far() - before
+                } else {
+                    0
+                })
+            })
+            .collect()
+    }
+
     /// A hint that a multi-token pass is about to run this layer: stage the
     /// experts it will most likely miss, off the encoding thread
     /// (`nn::expert_prefetch`, §20.3 P1). Never changes what the layer
@@ -403,7 +425,12 @@ pub struct ResidencyMap {
     /// Per slot, the GPU epoch (the pool clock's) of the last command
     /// buffer that read or wrote it: a direct read into the slot waits for
     /// it to complete before the bytes land (`Prefetcher::read_direct`).
+    /// Read through [`Self::reader_epoch`].
     last_epoch: Vec<u64>,
+    /// The epoch of the last device plan: that pass may read ANY slot, so
+    /// every slot's last reader is at least this recent. One store per plan
+    /// instead of a stamp per slot.
+    plan_epoch: u64,
     tick: u64,
 }
 
@@ -419,6 +446,7 @@ impl ResidencyMap {
             pinned: vec![false; n_slots],
             inflight: vec![0; n_slots],
             last_epoch: vec![0; n_slots],
+            plan_epoch: 0,
             tick: 0,
         }
     }
@@ -485,7 +513,7 @@ impl ResidencyMap {
             if self.pinned[s]
                 || self.last_use[s] == tick
                 || (skip_inflight && self.inflight[s] != 0)
-                || self.last_epoch[s] >= settled_before
+                || self.reader_epoch(s) >= settled_before
             {
                 continue;
             }
@@ -499,6 +527,16 @@ impl ResidencyMap {
             }
         }
         best.map(|(s, _)| (s, true))
+    }
+
+    /// The epoch of slot `s`'s last GPU reader or writer.
+    fn reader_epoch(&self, s: usize) -> u64 {
+        self.last_epoch[s].max(self.plan_epoch)
+    }
+
+    /// A device plan in epoch `epoch` may read every slot.
+    fn plan_read_all(&mut self, epoch: u64) {
+        self.plan_epoch = self.plan_epoch.max(epoch);
     }
 
     fn install(&mut self, slot: usize, e: usize) {
@@ -582,6 +620,13 @@ pub struct StreamCounters {
     /// reader threads' time waiting for the slots' last readers' epochs.
     pub direct_loads: AtomicU64,
     pub direct_wait_ns: AtomicU64,
+    /// Misses a settle loaded, and the host time it spent loading them
+    /// (the device plan's per-miss cost before any replay).
+    pub settle_loads: AtomicU64,
+    pub settle_ns: AtomicU64,
+    /// Settles that loaded while the pool clock still showed a committed
+    /// command buffer incomplete (its completion handler not yet run).
+    pub settle_clock_lag: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -620,6 +665,9 @@ pub struct StreamStats {
     pub io_inflight_landed: u64,
     pub direct_loads: u64,
     pub direct_wait_ns: u64,
+    pub settle_loads: u64,
+    pub settle_ns: u64,
+    pub settle_clock_lag: u64,
 }
 
 impl StreamCounters {
@@ -644,6 +692,9 @@ impl StreamCounters {
             io_inflight_landed: self.io_inflight_landed.load(Ordering::Relaxed),
             direct_loads: self.direct_loads.load(Ordering::Relaxed),
             direct_wait_ns: self.direct_wait_ns.load(Ordering::Relaxed),
+            settle_loads: self.settle_loads.load(Ordering::Relaxed),
+            settle_ns: self.settle_ns.load(Ordering::Relaxed),
+            settle_clock_lag: self.settle_clock_lag.load(Ordering::Relaxed),
         }
     }
 }
@@ -663,6 +714,9 @@ impl std::ops::AddAssign for StreamStats {
         self.io_inflight_landed += o.io_inflight_landed;
         self.direct_loads += o.direct_loads;
         self.direct_wait_ns += o.direct_wait_ns;
+        self.settle_loads += o.settle_loads;
+        self.settle_ns += o.settle_ns;
+        self.settle_clock_lag += o.settle_clock_lag;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -772,6 +826,37 @@ struct Inner {
     /// The slot pools are Shared and a miss is read straight into its slot
     /// (`pread_direct_on`, the `pread` arm on Metal).
     direct: bool,
+    /// A settle's distinct ids and misses, kept between calls so a settle
+    /// allocates nothing once they have grown.
+    scratch_ids: Vec<u32>,
+    scratch_missing: Vec<u32>,
+}
+
+/// A resolve between its halves (`Streamed::resolve_begin` →
+/// `resolve_finish`): each expert's slot, and the misses' reads in flight.
+struct Pending {
+    slots: Vec<usize>,
+    /// Misses read synchronously at the finish.
+    misses: Vec<(usize, usize)>,
+    #[cfg(feature = "metal")]
+    landed: Vec<(usize, usize, crate::nn::expert_prefetch::Staged)>,
+    #[cfg(feature = "metal")]
+    wait_value: u64,
+    /// The direct reads submitted: the ticket, the experts, the submit time.
+    #[cfg(feature = "metal")]
+    direct: Option<(
+        crate::nn::expert_prefetch::DirectTicket,
+        u64,
+        std::time::Duration,
+    )>,
+    /// The ring reads submitted: the ticket, the `(expert, slot)`s asked
+    /// for, the submit time.
+    #[cfg(feature = "metal")]
+    now: Option<(
+        crate::nn::expert_prefetch::NowTicket,
+        Vec<(usize, usize)>,
+        std::time::Duration,
+    )>,
 }
 
 /// The routed experts streamed from the checkpoint into a slot pool (§20.6).
@@ -904,6 +989,8 @@ impl Streamed {
                 #[cfg(feature = "metal")]
                 clock,
                 direct,
+                scratch_ids: Vec::new(),
+                scratch_missing: Vec::new(),
             }),
             counters: StreamCounters::default(),
             n_experts,
@@ -1092,6 +1179,17 @@ impl Streamed {
     /// Make every expert of `experts` resident within epoch `tick`, loading
     /// the misses; returns each one's slot.
     fn resolve(&self, inner: &mut Inner, experts: &[u32], tick: u64) -> Result<Vec<usize>> {
+        let pending = self.resolve_begin(inner, experts, tick)?;
+        self.resolve_finish(inner, pending)
+    }
+
+    /// [`Self::resolve`]'s first half: every expert given its slot and the
+    /// map updated, the staged ones taken, and the misses' reads SUBMITTED
+    /// to the reader threads — not waited for. [`Self::resolve_finish`]
+    /// waits for them and lands them; between the two another layer's
+    /// reads can be submitted, so a token's misses read together
+    /// (`settle_batch`).
+    fn resolve_begin(&self, inner: &mut Inner, experts: &[u32], tick: u64) -> Result<Pending> {
         let mut slots = Vec::with_capacity(experts.len());
         let mut misses: Vec<(usize, usize)> = Vec::new();
         // What the prefetcher staged for this layer: a miss with a staged
@@ -1188,6 +1286,20 @@ impl Streamed {
             slots.push(slot);
         }
         #[cfg(feature = "metal")]
+        let mut pending = Pending {
+            slots,
+            misses: Vec::new(),
+            landed,
+            wait_value,
+            direct: None,
+            now: None,
+        };
+        #[cfg(not(feature = "metal"))]
+        let pending = Pending {
+            slots,
+            misses: Vec::new(),
+        };
+        #[cfg(feature = "metal")]
         {
             if !staged.is_empty() {
                 if let Some(p) = &self.prefetch {
@@ -1209,7 +1321,7 @@ impl Streamed {
                     let (now, later): (Vec<(usize, usize)>, Vec<(usize, usize)>) = misses
                         .iter()
                         .copied()
-                        .partition(|&(_, s)| inner.map.last_epoch[s] < settled);
+                        .partition(|&(_, s)| inner.map.reader_epoch(s) < settled);
                     misses = later;
                     let mut jobs = Vec::with_capacity(now.len());
                     let mut bytes = 0u64;
@@ -1235,26 +1347,18 @@ impl Streamed {
                                 inner.sources[2].plane_source(),
                             ],
                             dsts,
-                            epoch: inner.map.last_epoch[s],
+                            epoch: inner.map.reader_epoch(s),
                         });
                     }
                     let n_direct = jobs.len();
-                    let waited = p.read_direct(self.key, jobs);
-                    self.counters
-                        .direct_loads
-                        .fetch_add(n_direct as u64, Ordering::Relaxed);
-                    self.counters
-                        .direct_wait_ns
-                        .fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
-                    self.counters
-                        .load_now_ns
-                        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let ticket = p.submit_direct(self.key, jobs);
                     self.counters
                         .bytes_loaded
                         .fetch_add(bytes, Ordering::Relaxed);
                     if n_direct > 0 {
                         inner.table_stale = true;
                     }
+                    pending.direct = Some((ticket, n_direct as u64, t0.elapsed()));
                 }
             }
             // The misses nothing staged: read now, through the reader
@@ -1269,29 +1373,68 @@ impl Streamed {
                         inner.sources[2].plane_source(),
                     ];
                     let t0 = std::time::Instant::now();
-                    let mut got: std::collections::HashMap<
-                        u32,
-                        crate::nn::expert_prefetch::Staged,
-                    > = p
-                        .load_now(self.key, &want, &planes)
-                        .into_iter()
-                        .map(|s| (s.expert, s))
-                        .collect();
-                    self.counters
-                        .load_now_ns
-                        .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    let mut rest = Vec::new();
-                    for &(e, s) in &misses {
-                        match got.remove(&(e as u32)) {
-                            Some(st) => landed.push((e, s, st)),
-                            None => rest.push((e, s)),
-                        }
-                    }
-                    self.counters
-                        .prefetch_now
-                        .fetch_add((misses.len() - rest.len()) as u64, Ordering::Relaxed);
-                    misses = rest;
+                    let ticket = p.submit_now(self.key, &want, &planes);
+                    pending.now = Some((ticket, std::mem::take(&mut misses), t0.elapsed()));
                 }
+            }
+        }
+        #[cfg_attr(not(feature = "metal"), allow(unused_mut))]
+        let mut pending = pending;
+        pending.misses = misses;
+        Ok(pending)
+    }
+
+    /// [`Self::resolve`]'s second half: wait for what `resolve_begin`
+    /// submitted, land it, read synchronously whatever the threads did not;
+    /// returns each expert's slot.
+    fn resolve_finish(&self, inner: &mut Inner, pending: Pending) -> Result<Vec<usize>> {
+        #[cfg(feature = "metal")]
+        let Pending {
+            slots,
+            mut misses,
+            mut landed,
+            wait_value,
+            direct,
+            now,
+        } = pending;
+        #[cfg(not(feature = "metal"))]
+        let Pending { slots, misses } = pending;
+        #[cfg(feature = "metal")]
+        {
+            if let (Some(p), Some((ticket, n_direct, submit))) = (&self.prefetch, direct) {
+                let t0 = std::time::Instant::now();
+                let waited = p.wait_direct(ticket);
+                self.counters
+                    .direct_loads
+                    .fetch_add(n_direct, Ordering::Relaxed);
+                self.counters
+                    .direct_wait_ns
+                    .fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+                self.counters
+                    .load_now_ns
+                    .fetch_add((submit + t0.elapsed()).as_nanos() as u64, Ordering::Relaxed);
+            }
+            if let (Some(p), Some((ticket, asked, submit))) = (&self.prefetch, now) {
+                let t0 = std::time::Instant::now();
+                let mut got: std::collections::HashMap<u32, crate::nn::expert_prefetch::Staged> = p
+                    .wait_now(ticket)
+                    .into_iter()
+                    .map(|s| (s.expert, s))
+                    .collect();
+                self.counters
+                    .load_now_ns
+                    .fetch_add((submit + t0.elapsed()).as_nanos() as u64, Ordering::Relaxed);
+                let mut rest = Vec::new();
+                for &(e, s) in &asked {
+                    match got.remove(&(e as u32)) {
+                        Some(st) => landed.push((e, s, st)),
+                        None => rest.push((e, s)),
+                    }
+                }
+                self.counters
+                    .prefetch_now
+                    .fetch_add((asked.len() - rest.len()) as u64, Ordering::Relaxed);
+                misses.extend(rest);
             }
             if !landed.is_empty() {
                 let t0 = std::time::Instant::now();
@@ -1711,6 +1854,13 @@ fn plan_rows_pinned(
     groups
 }
 
+/// A token's settle begins every layer's loads before finishing any
+/// (`QWEN4EXP_SETTLE_BATCH`, read once; off = one layer after another).
+fn settle_batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().stream.settle_batch)
+}
+
 /// `QWEN4EXP_TRACE_SETTLE=1` (read once): print every settle's ids, flags
 /// and misses — a debugging instrument, never the shipping path.
 fn trace_settle() -> bool {
@@ -1814,7 +1964,99 @@ impl lloom_tensor::CustomOp1 for SlotMap {
     }
 }
 
+/// A settle between its halves: the resolve in flight, and what it loads.
+struct SettlePending {
+    pending: Pending,
+    loads: u64,
+    t0: std::time::Instant,
+}
+
 impl Streamed {
+    /// A settle's first half: what the pass used touched, its misses given
+    /// slots and their reads submitted; `None` when the pass found every
+    /// expert resident (nothing to finish, no replay).
+    fn settle_begin(&self, v: &[u32]) -> Result<Option<SettlePending>> {
+        if !v.len().is_multiple_of(3) {
+            lloom_tensor::bail!("settle: a plan record is [3·n], got {}", v.len())
+        }
+        let n = v.len() / 3;
+        let ids = &v[n..2 * n];
+        let flags = &v[2 * n..];
+        let mut inner = self.inner.lock();
+        let mut distinct = std::mem::take(&mut inner.scratch_ids);
+        let mut missing = std::mem::take(&mut inner.scratch_missing);
+        distinct.clear();
+        missing.clear();
+        distinct.extend_from_slice(ids);
+        distinct.sort_unstable();
+        distinct.dedup();
+        let tick = inner.map.begin();
+        // What the pass used and found: touched first, so a load below never
+        // evicts an expert this pass needs.
+        for &e in &distinct {
+            match inner.map.slot_of(e as usize) {
+                Some(s) => {
+                    inner.map.touch(s, tick);
+                    inner.map.usage[e as usize] = inner.map.usage[e as usize].saturating_add(1);
+                    self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                }
+                // Counted by `resolve` below.
+                None => missing.push(e),
+            }
+        }
+        inner.scratch_ids = distinct;
+        let flagged = flags.iter().any(|&f| f != 0);
+        if trace_settle() {
+            let stale: Vec<u32> = ids
+                .iter()
+                .zip(flags)
+                .filter(|(&e, &f)| f != 0 && inner.map.slot_of(e as usize).is_some())
+                .map(|(&e, _)| e)
+                .collect();
+            eprintln!(
+                "SETTLE tick={tick} ids={ids:?} flags={flags:?} missing={missing:?} flagged_but_resident={stale:?} resident={}",
+                inner.map.resident().len()
+            );
+        }
+        if missing.is_empty() {
+            inner.scratch_missing = missing;
+            if flagged {
+                lloom_tensor::bail!(
+                    "settle: the device plan flagged a miss the residency map does not show"
+                )
+            }
+            return Ok(None);
+        }
+        if inner.completed_epochs() < inner.current_epoch() {
+            self.counters
+                .settle_clock_lag
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let t0 = std::time::Instant::now();
+        let pending = self.resolve_begin(&mut inner, &missing, tick);
+        let loads = missing.len() as u64;
+        inner.scratch_missing = missing;
+        Ok(Some(SettlePending {
+            pending: pending?,
+            loads,
+            t0,
+        }))
+    }
+
+    /// A settle's second half: its reads waited for and landed.
+    fn settle_finish(&self, p: SettlePending) -> Result<()> {
+        let mut inner = self.inner.lock();
+        self.resolve_finish(&mut inner, p.pending)?;
+        self.counters
+            .settle_ns
+            .fetch_add(p.t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.counters
+            .settle_loads
+            .fetch_add(p.loads, Ordering::Relaxed);
+        self.counters.settled_misses.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// The residency table on the device, rebuilt when a settle changed it.
     fn device_table(&self, inner: &mut Inner) -> Result<Tensor> {
         if inner.table_stale || inner.table.is_none() {
@@ -1960,12 +2202,10 @@ impl ExpertResidency for Streamed {
         let ids = ids.flatten_all()?.contiguous()?;
         let table = {
             let mut inner = self.inner.lock();
-            // The pass may read any resident slot: stamp them all with this
-            // epoch (a direct read into one waits for it).
+            // The pass may read any resident slot (a direct read into one
+            // waits for it).
             let epoch = inner.current_epoch();
-            for e in inner.map.last_epoch.iter_mut() {
-                *e = epoch;
-            }
+            inner.map.plan_read_all(epoch);
             self.device_table(&mut inner)?
         };
         self.counters.device_plans.fetch_add(1, Ordering::Relaxed);
@@ -1985,55 +2225,47 @@ impl ExpertResidency for Streamed {
 
     fn settle_host(&self, v: &[u32]) -> Result<bool> {
         let _escape = escape_guard();
-        if !v.len().is_multiple_of(3) {
-            lloom_tensor::bail!("settle: a plan record is [3·n], got {}", v.len())
+        Ok(match self.settle_begin(v)? {
+            Some(p) => {
+                self.settle_finish(p)?;
+                true
+            }
+            None => false,
+        })
+    }
+
+    fn settle_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<u64>> {
+        let _escape = escape_guard();
+        if !settle_batch_on() {
+            let mut out = Vec::with_capacity(parts.len());
+            for (r, v) in parts {
+                out.push(match r.settle_begin(v)? {
+                    Some(p) => {
+                        let n = p.loads;
+                        r.settle_finish(p)?;
+                        n
+                    }
+                    None => 0,
+                });
+            }
+            return Ok(out);
         }
-        let n = v.len() / 3;
-        let ids = &v[n..2 * n];
-        let flags = &v[2 * n..];
-        let mut distinct: Vec<u32> = ids.to_vec();
-        distinct.sort_unstable();
-        distinct.dedup();
-        let mut inner = self.inner.lock();
-        let tick = inner.map.begin();
-        // What the pass used and found: touched first, so a load below never
-        // evicts an expert this pass needs.
-        let mut missing: Vec<u32> = Vec::new();
-        for &e in &distinct {
-            match inner.map.slot_of(e as usize) {
-                Some(s) => {
-                    inner.map.touch(s, tick);
-                    inner.map.usage[e as usize] = inner.map.usage[e as usize].saturating_add(1);
-                    self.counters.hits.fetch_add(1, Ordering::Relaxed);
+        let mut begun = Vec::with_capacity(parts.len());
+        for (r, v) in parts {
+            begun.push(r.settle_begin(v)?);
+        }
+        let mut out = Vec::with_capacity(parts.len());
+        for ((r, _), p) in parts.iter().zip(begun) {
+            out.push(match p {
+                Some(p) => {
+                    let n = p.loads;
+                    r.settle_finish(p)?;
+                    n
                 }
-                // Counted by `resolve` below.
-                None => missing.push(e),
-            }
+                None => 0,
+            });
         }
-        let flagged = flags.iter().any(|&f| f != 0);
-        if trace_settle() {
-            let stale: Vec<u32> = ids
-                .iter()
-                .zip(flags)
-                .filter(|(&e, &f)| f != 0 && inner.map.slot_of(e as usize).is_some())
-                .map(|(&e, _)| e)
-                .collect();
-            eprintln!(
-                "SETTLE tick={tick} ids={ids:?} flags={flags:?} missing={missing:?} flagged_but_resident={stale:?} resident={}",
-                inner.map.resident().len()
-            );
-        }
-        if missing.is_empty() {
-            if flagged {
-                lloom_tensor::bail!(
-                    "settle: the device plan flagged a miss the residency map does not show"
-                )
-            }
-            return Ok(false);
-        }
-        self.resolve(&mut inner, &missing, tick)?;
-        self.counters.settled_misses.fetch_add(1, Ordering::Relaxed);
-        Ok(true)
+        Ok(out)
     }
 
     fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>> {
@@ -2533,5 +2765,225 @@ mod tests {
         assert_eq!(pf2.issued - pf.issued, (e as u64 - resident).min(n));
         assert_eq!((pf2.used - pf2.now) + pf2.wasted, n, "{pf2:?}");
         std::fs::remove_file(path).ok();
+    }
+
+    /// Metal: a miss read in pieces — each plane cut into `split` requests
+    /// read by the pool at once, the last piece shorter — lands the same
+    /// bytes as the expert read whole on the encoding thread: the routed
+    /// output over decode rows and an evicting chunk equals the synchronous
+    /// tier's bit for bit at every split, and every miss came through the
+    /// threads. Planes of 128 KiB, so a split of 3 is three uneven pieces
+    /// (48 + 48 + 32 KiB).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_miss_read_in_pieces_lands_the_same_bytes() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (10usize, 128usize, 256usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let plain = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            4,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        let x_decode: Vec<Tensor> = (0..6)
+            .map(|t| x(1, d, t as f32).to_device(&dev).unwrap())
+            .collect();
+        let id_decode: Vec<Tensor> = (0..6)
+            .map(|t| ids(1, topk, e, t).to_device(&dev).unwrap())
+            .collect();
+        let x_chunk = x(7, d, 0.5).to_device(&dev).unwrap();
+        let id_chunk = ids(7, topk, e, 3).to_device(&dev).unwrap();
+        let mut want = Vec::new();
+        for (xs, id) in x_decode.iter().zip(&id_decode) {
+            want.push(run(&plain, xs, id));
+        }
+        want.push(run(&plain, &x_chunk, &id_chunk));
+        assert!(plain.stats().evictions > 0, "the reference never evicted");
+        for split in [0usize, 1, 3] {
+            let ring = StagingRing::shared(&m);
+            let mut tier = Streamed::with_staging(
+                open(&path, "gate"),
+                open(&path, "up"),
+                open(&path, "down"),
+                4,
+                LoaderArm::Pread,
+                &dev,
+                Some(Arc::clone(&ring)),
+            )
+            .unwrap();
+            tier.set_prefetcher(Arc::new(Prefetcher::with_split(
+                &m,
+                Arc::clone(&ring),
+                crate::nn::expert_prefetch::DEFAULT_MAX_STAGED_BYTES,
+                split,
+            )));
+            let mut got = Vec::new();
+            for (xs, id) in x_decode.iter().zip(&id_decode) {
+                got.push(run(&tier, xs, id));
+            }
+            got.push(run(&tier, &x_chunk, &id_chunk));
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g, w,
+                    "split {split}: pass {i} differs from the synchronous tier"
+                );
+            }
+            let s = tier.stats();
+            let pf = tier.prefetch_stats();
+            assert!(s.misses > 0 && s.evictions > 0, "split {split}: {s:?}");
+            assert_eq!(
+                s.prefetch_now, s.misses,
+                "split {split}: a miss was not read by the threads: {s:?} {pf:?}"
+            );
+            assert_eq!(pf.staged, s.misses, "split {split}: {pf:?}");
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal: a batched settle (`settle_batch`) over two layers sharing one
+    /// prefetcher submits the second layer's reads before it waits for the
+    /// first's (the prefetcher saw two tickets open at once), and settles to
+    /// exactly what one settle after another does: the same experts in the
+    /// same slots and the routed outputs on them bit for bit (the sequential
+    /// settle against `Resident` is `device_plan_settles_to_the_host_plan`).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_batched_settle_reads_every_layers_misses_before_waiting() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (12usize, 32usize, 64usize, 3usize);
+        let weights: Vec<[QTensor; 3]> = (0..2usize)
+            .map(|l| {
+                let o = l as f32 * 10.0;
+                [
+                    stacked(e, ff, d, 1.0 + o, dtype),
+                    stacked(e, ff, d, 2.0 + o, dtype),
+                    stacked(e, d, ff, 3.0 + o, dtype),
+                ]
+            })
+            .collect();
+        let paths: Vec<PathBuf> = weights
+            .iter()
+            .map(|w| write_gguf(&[("gate", &w[0]), ("up", &w[1]), ("down", &w[2])]))
+            .collect();
+        // Two layers over one ring and one prefetcher, as the loader builds a tier.
+        let pair = || -> Vec<Streamed> {
+            let ring = StagingRing::shared(&m);
+            let pf = Arc::new(Prefetcher::new(&m, Arc::clone(&ring)));
+            paths
+                .iter()
+                .map(|p| {
+                    let mut t = Streamed::with_staging(
+                        open(p, "gate"),
+                        open(p, "up"),
+                        open(p, "down"),
+                        5,
+                        LoaderArm::Pread,
+                        &dev,
+                        Some(Arc::clone(&ring)),
+                    )
+                    .unwrap();
+                    t.set_prefetcher(Arc::clone(&pf));
+                    t
+                })
+                .collect()
+        };
+        let batched = pair();
+        let sequential = pair();
+        let mut batched_misses = 0;
+        for t in 0..6 {
+            let id: Vec<Tensor> = (0..2)
+                .map(|l| ids(1, topk, e, t * 2 + l).to_device(&dev).unwrap())
+                .collect();
+            let records = |tiers: &[Streamed]| -> Vec<Vec<u32>> {
+                tiers
+                    .iter()
+                    .zip(&id)
+                    .map(|(tier, id)| {
+                        let (_, rec) = tier.plan_device(id).unwrap().unwrap();
+                        rec.to_vec1().unwrap()
+                    })
+                    .collect()
+            };
+            let rb = records(&batched);
+            let rs = records(&sequential);
+            assert_eq!(rb, rs, "token {t}: the two pairs planned differently");
+            let parts: Vec<(&Streamed, &[u32])> =
+                batched.iter().zip(&rb).map(|(t, r)| (t, &r[..])).collect();
+            let loads = Streamed::settle_batch(&parts).unwrap();
+            let one_by_one: Vec<bool> = sequential
+                .iter()
+                .zip(&rs)
+                .map(|(tier, r)| tier.settle_host(r).unwrap())
+                .collect();
+            assert_eq!(
+                loads.iter().map(|&n| n > 0).collect::<Vec<_>>(),
+                one_by_one,
+                "token {t}: which layers missed"
+            );
+            if loads.iter().all(|&n| n > 0) {
+                batched_misses += 1;
+            }
+            for (l, (b, q)) in batched.iter().zip(&sequential).enumerate() {
+                assert_eq!(b.resident(), q.resident(), "token {t} layer {l}: the slots");
+                let xs = x(1, d, (t * 2 + l) as f32).to_device(&dev).unwrap();
+                // The same ops on both twins, so their LRU clocks stay equal.
+                let out = |tier: &Streamed| -> Vec<f32> {
+                    let (slots, rec) = tier.plan_device(&id[l]).unwrap().unwrap();
+                    assert!(
+                        !tier.settle(&rec).unwrap(),
+                        "token {t} layer {l}: still missing"
+                    );
+                    let (g, u) = tier.gate_up(&xs, &slots).unwrap();
+                    let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+                    tier.down(&hh, &slots)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
+                };
+                assert_eq!(out(b), out(q), "token {t} layer {l}: routed output");
+            }
+        }
+        assert!(
+            batched_misses > 0,
+            "no token missed in both layers: the batch was never exercised"
+        );
+        let peak = batched[0].prefetch_stats().now_peak;
+        if settle_batch_on() {
+            assert!(
+                peak >= 2,
+                "the batched settle waited for a layer before submitting the next (peak {peak})"
+            );
+        }
+        let seq_peak = sequential[0].prefetch_stats().now_peak;
+        assert_eq!(
+            seq_peak, 1,
+            "one settle after another overlapped (peak {seq_peak})"
+        );
+        for p in paths {
+            std::fs::remove_file(p).ok();
+        }
     }
 }

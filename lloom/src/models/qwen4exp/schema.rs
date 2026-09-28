@@ -48,7 +48,7 @@ struct Builder<'a> {
 /// kind rather than refuse), so a tiny geometry may mix kinds as a real
 /// checkpoint does.
 fn fit(kind: GgmlDType, row: usize) -> GgmlDType {
-    if row % kind.block_size() == 0 {
+    if row.is_multiple_of(kind.block_size()) {
         kind
     } else {
         GgmlDType::F16

@@ -551,7 +551,7 @@ fn write_tiny<F: lloom::testing::tiny::TinyFamily>(
     weights: lloom::testing::tiny::Weights,
     geometry: Option<&str>,
 ) -> anyhow::Result<std::path::PathBuf> {
-    use lloom::testing::tiny::{Geometry, TinyCheckpoint, TinyConfig, TinyFamily};
+    use lloom::testing::tiny::{Geometry, TinyCheckpoint, TinyConfig};
     let mut ckpt = match geometry {
         Some(hex) => {
             let bytes = (0..hex.len())

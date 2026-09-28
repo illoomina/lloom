@@ -70,8 +70,7 @@ fn greedy(model: &lloom::models::lfm2::Model, c: &Config, dev: &Device) -> Resul
     let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), dev)?;
     let mut logits = model.forward(&input, 0, &mut cache)?;
     let mut out = Vec::with_capacity(GREEDY);
-    let mut pos = prompt.len();
-    for _ in 0..GREEDY {
+    for pos in (prompt.len()..).take(GREEDY) {
         let v = logits
             .flatten_all()?
             .to_dtype(DType::F32)?
@@ -80,7 +79,6 @@ fn greedy(model: &lloom::models::lfm2::Model, c: &Config, dev: &Device) -> Resul
         out.push(t);
         let input = Tensor::from_vec(vec![t], (1, 1), dev)?;
         logits = model.forward(&input, pos, &mut cache)?;
-        pos += 1;
     }
     Ok(out)
 }

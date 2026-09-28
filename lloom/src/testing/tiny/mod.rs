@@ -368,11 +368,9 @@ pub fn run<M: crate::nn::model::CausalLM>(
         |t: Tensor| -> Result<Vec<f32>> { t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>() };
     let input = Tensor::from_vec(prompt.clone(), (1, prompt.len()), dev)?;
     out.push(flat(model.forward(&input, 0, &mut cache)?)?);
-    let mut pos = prompt.len();
-    for t in decode {
+    for (pos, t) in (prompt.len()..).zip(decode) {
         let input = Tensor::from_vec(vec![t], (1, 1), dev)?;
         out.push(flat(model.forward(&input, pos, &mut cache)?)?);
-        pos += 1;
     }
     Ok(out)
 }

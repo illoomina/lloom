@@ -109,7 +109,7 @@ fn the_real_headers_match_the_declared_schema() {
             .unwrap_or_default()
             .join(".cache/lloom/qwen4exp-mtp-q8.gguf");
         if sidecar.is_file() {
-            let mtp = read_headers(&[sidecar.clone()]);
+            let mtp = read_headers(std::slice::from_ref(&sidecar));
             let mtp_table: Vec<(String, Vec<usize>)> = mtp[0]
                 .tensor_infos
                 .iter()

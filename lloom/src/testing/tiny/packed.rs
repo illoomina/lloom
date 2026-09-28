@@ -115,7 +115,7 @@ pub fn synthesize_bytes(
     }
     let n = shape.elem_count();
     let bs = dtype.block_size();
-    if n % bs != 0 || shape.dims().last().is_none_or(|d| d % bs != 0) {
+    if !n.is_multiple_of(bs) || shape.dims().last().is_none_or(|d| !d.is_multiple_of(bs)) {
         bail!("{dtype:?}: shape {shape:?} is not a whole number of {bs}-element blocks per row")
     }
     let ts = dtype.type_size();

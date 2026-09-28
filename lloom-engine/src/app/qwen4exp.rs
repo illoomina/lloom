@@ -92,6 +92,9 @@ pub struct LoadOptions {
     pub executor: crate::ExecutorConfig,
     /// The memory budgets.
     pub memory: crate::MemoryConfig,
+    /// The full-attention KV store (`model.axes.kv-quant`, resolved by the
+    /// family); `None` is the checkpoint's f32.
+    pub kv_precision: Option<lloom::nn::ops::KvPrecision>,
 }
 
 /// The model, shared with the batch thread.
@@ -191,6 +194,7 @@ impl Engine<Resident> {
             ple_cache_rows: (opts.ple_cache_rows > 0).then_some(opts.ple_cache_rows),
             mtp: opts.mtp.is_some(),
             memory_fraction: Some(opts.memory_fraction),
+            kv_precision: opts.kv_precision,
         };
         let prefill_mode = match opts.prefill_mode.as_str() {
             "chunk" => PrefillMode::Chunk,
@@ -359,6 +363,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         tier["ple"] = json!(opts.ple);
         tier["ple_cache_rows"] = json!(opts.ple_cache_rows);
         tier["moe_act"] = json!(opts.moe_act);
+        tier["config"] = json!(model.config().axes_line());
         tier["first_shard"] = json!(opts.first_shard.display().to_string());
         let mut engine = Engine {
             core: Arc::new(QwenCore { model }),
@@ -805,7 +810,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
     }
     fn describe(&self) -> String {
         format!(
-            "family=qwen4exp batch={} experts={} slots={} loader={} mtp={} ple={} ple_cache_rows={} moe_act={} prefill_tile={} mem_sample={} {}",
+            "family=qwen4exp batch={} experts={} slots={} loader={} mtp={} ple={} ple_cache_rows={} moe_act={} config=[{}] prefill_tile={} mem_sample={} {}",
             self.batch,
             self.tier["experts"].as_str().unwrap_or("?"),
             self.tier["slots_per_layer"].as_u64().unwrap_or(0),
@@ -814,6 +819,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
             self.tier["ple"].as_bool().unwrap_or(true),
             self.tier["ple_cache_rows"].as_u64().unwrap_or(0),
             self.tier["moe_act"].as_str().unwrap_or("f32"),
+            self.core.model.config().axes_line(),
             self.prefill_tile,
             self.mem_sample,
             self.executor.line(),

@@ -604,6 +604,10 @@ pub struct LoadOptions {
     /// on the device but Metal reads a working set; elsewhere the check is
     /// inert. Read at load only, never per token.
     pub memory_fraction: Option<f64>,
+    /// The full-attention KV store (`Config::kv_precision`, `DESIGN.md`
+    /// §10.7); `None` is the checkpoint's f32. Set at load, so the slot plan
+    /// reserves for the store the caches will hold.
+    pub kv_precision: Option<crate::nn::ops::KvPrecision>,
 }
 
 impl LoadOptions {
@@ -831,7 +835,10 @@ impl Qwen4Exp<Streamed> {
             })
             .collect();
         let mut gg = Gguf::new(shards, device)?;
-        let cfg0 = Config::from_gguf_metadata(gg.metadata())?;
+        let mut cfg0 = Config::from_gguf_metadata(gg.metadata())?;
+        if let Some(p) = opts.kv_precision {
+            cfg0.kv_precision = p;
+        }
         let slots = match stream.slots {
             SlotBudget::Fixed(n) => n,
             SlotBudget::Auto {
@@ -984,6 +991,9 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
     }
 
     let mut model = Qwen4Exp::new(embed_tokens, layers, hc_head, lm_head, cfg.clone());
+    if let Some(p) = opts.kv_precision {
+        model.set_kv_precision(p)?;
+    }
     if let Some(dt) = opts.moe_act {
         model.set_routed_act(dt);
     }

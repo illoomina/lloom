@@ -1512,7 +1512,7 @@ impl crate::Module for QMatMul {
                     // block read past the row — garbage that varied run to
                     // run at the tiny test geometry (#749 P30 (1)). Such a
                     // K takes the classical route below.
-                    && w.dims()[1] % 32 == 0
+                    && crate::shape_req!(f16_weight_gemm, w.dims()[1] % 32 == 0; k = w.dims()[1])
                     && metal::f16_weight_mm_route()
                 {
                     // A prefill's rows: the quantized GEMM's f16 arm reads

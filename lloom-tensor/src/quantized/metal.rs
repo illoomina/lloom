@@ -746,9 +746,15 @@ impl QMetalStorage {
         // The rows-grouped-by-expert GEMM for a tile (lloom #749 P22): from
         // `moe_mm_from()` rows, f32 activations, every weight kind with a
         // `kernel_mul_mm_id_mapped` arm. The matmul-vec keeps the decode
-        // rows byte-identical.
+        // rows byte-identical. The GEMM reads K in 32-wide blocks, as the
+        // f16-weight GEMM does (#749 P30 (1)): a K off the block reads past
+        // the row, so such a weight keeps the matmul-vec at every row count.
         let from = moe_mm_from();
-        if from > 0 && batch >= from && triple == GemvTriple::F32F32F32 && mm_id_has_arm(ggml_dtype)
+        if from > 0
+            && batch >= from
+            && triple == GemvTriple::F32F32F32
+            && mm_id_has_arm(ggml_dtype)
+            && crate::shape_req!(moe_mm_id, k % 32 == 0; k)
         {
             let bn = moe_mm_bn(batch * topk, n_experts);
             let bound = crate::kernels::mm_id_block_bound(batch, topk, n_experts, bn);
@@ -845,13 +851,19 @@ impl QMetalStorage {
         if !input_l.is_contiguous() || !ids_l.is_contiguous() {
             crate::bail!("indexed_moe_forward_pair needs contiguous input and ids")
         }
-        if other.dtype != self.dtype || other.buffer.length() != self.buffer.length() {
+        // Both weights hold `self_shape` of one kind. A pooled buffer may be
+        // longer than the tensor in it, so each length is checked against
+        // what the shape needs, never against the other's.
+        let need = self_shape.elem_count() * self.dtype.type_size() / self.dtype.block_size();
+        if other.dtype != self.dtype || other.buffer.length() < need || self.buffer.length() < need
+        {
             crate::bail!(
-                "indexed_moe_forward_pair: the two weights differ ({:?}/{} vs {:?}/{})",
+                "indexed_moe_forward_pair: the two weights differ ({:?}/{} vs {:?}/{}, {} needed)",
                 self.dtype,
                 self.buffer.length(),
                 other.dtype,
-                other.buffer.length()
+                other.buffer.length(),
+                need
             )
         }
         if input.dtype() != DType::F32 {
@@ -1155,10 +1167,10 @@ impl From<GgmlDType> for crate::kernels::GgmlDType {
 
 /// Rows from which `QMetalStorage::indexed_moe_forward` takes the GEMM with
 /// the rows grouped by expert (`kernel_mul_mm_id_mapped`) instead of the
-/// matmul-vec: `LLOOM_MOE_MM_FROM` (0 = never), read once; default 16 — a
-/// decode step (1 row, a batch of up to 8, an MTP verify of K+1) keeps the
-/// byte-identical matmul-vec, a prefill tile takes the GEMM. Settable for
-/// the tests and an A/B (`set_moe_mm_from`).
+/// matmul-vec: `LLOOM_MOE_MM_FROM` (0 = never), read once; default 64
+/// ([`DEFAULT_MOE_MM_FROM`]) — a decode step (1 row, a batch of up to 8, an
+/// MTP verify of K+1) keeps the byte-identical matmul-vec, a prefill tile
+/// takes the GEMM. Settable for the tests and an A/B (`set_moe_mm_from`).
 pub fn moe_mm_from() -> usize {
     let v = MOE_MM_FROM.load(std::sync::atomic::Ordering::Relaxed);
     if v != usize::MAX {
@@ -1237,11 +1249,10 @@ pub fn matmul_f16_weight_f32(xs: &crate::Tensor, w: &crate::Tensor) -> Result<cr
             xs.dtype()
         )
     }
-    if k % 32 != 0 {
-        // The GEMM's f16 arm reads K in 32-wide blocks; a K off the block
-        // reads past the row (#749 P30 (1)).
-        crate::bail!("matmul_f16_weight_f32: K {k} is not a multiple of the 32-wide block")
-    }
+    // The GEMM's f16 arm reads K in 32-wide blocks; a K off the block
+    // reads past the row (#749 P30 (1)).
+    crate::shape_ensure!(f16_weight_gemm, k % 32 == 0; k =>
+        "matmul_f16_weight_f32: K {k} is not a multiple of the 32-wide block");
     let xs = xs.contiguous()?;
     let w = w.contiguous()?;
     let (ws, wl) = w.storage_and_layout();

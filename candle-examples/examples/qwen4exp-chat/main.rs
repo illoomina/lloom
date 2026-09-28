@@ -724,6 +724,13 @@ fn main() -> Result<()> {
         ple_cache_rows: (args.ple_cache_rows > 0).then_some(args.ple_cache_rows),
         mtp: args.mtp.is_some(),
         memory_fraction: Some(args.memory_fraction),
+        kv_precision: args
+            .axes
+            .kv_precision
+            .as_deref()
+            .map(lloom::models::qwen4exp::config::parse_kv_precision)
+            .transpose()
+            .map_err(anyhow::Error::msg)?,
     };
     let mem_check = mem_check_arm(&args)?;
     let prefill_mode = match args.prefill.as_str() {

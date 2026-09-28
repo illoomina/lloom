@@ -873,6 +873,9 @@ fn print_profile(stats: &DecodeStats, wall: std::time::Duration, call: std::time
         s.gpu_busy_sum_s,
         call.as_secs_f64(),
     );
+    if lloom_tensor::kernels::metal::profile::counters_enabled() {
+        print_encoder_counters(&s);
+    }
     eprintln!(
         "[profile: cb lifecycle on the hot thread: {:.1} commits/step at {:.1} µs each = \
          {:.3} ms/step (of which commandBuffer() {:.3} ms/step); {:.2} prunes/step at \
@@ -886,6 +889,167 @@ fn print_profile(stats: &DecodeStats, wall: std::time::Duration, call: std::time
         s.prune_ns as f64 / 1e6 / steps,
     );
     print_idle_gaps(&s, stats, wall);
+}
+
+/// Per-kernel GPU time from the counter-sampled encoders
+/// (`CANDLE_METAL_PROFILE_COUNTERS=1`), decode steps only.
+///
+/// Printed with the checks that make it readable: how many encoders were
+/// sampled, dropped (with any sample buffer the device refused), resolved to
+/// the error marker, empty, or never resolved; how many fall outside their
+/// command buffer (the clock and unit check — zero is the only readable
+/// answer); and what the encoders cover against the command buffers' union. A
+/// kernel's row is exact only when its encoders hold one dispatch each
+/// (`CANDLE_METAL_PROFILE_ENCODER_PER_DISPATCH=1`); otherwise the time sits in
+/// the `<encoders of several dispatches>` row.
+///
+/// A GEMV's row carries its weight MB and GB/s — the largest input it bound
+/// over its time; no other kernel's largest input is its traffic, so none
+/// prints one.
+///
+/// `CANDLE_METAL_PROFILE_DUMP=<path>` adds `<path>.encoders.csv`, one row per
+/// encoder.
+#[cfg(feature = "metal")]
+fn print_encoder_counters(s: &lloom_tensor::kernels::metal::profile::Snapshot) {
+    use lloom_tensor::kernels::metal::profile as p;
+    if let Some(why) = &s.counters_unavailable {
+        eprintln!("[profile: encoder counters OFF: {why}]");
+        return;
+    }
+    let decode: Vec<p::EncoderRecord> = s
+        .encoder_records
+        .iter()
+        .filter(|r| r.step >= 1)
+        .cloned()
+        .collect();
+    let steps = {
+        let mut v: Vec<u64> = decode.iter().map(|r| r.step).collect();
+        v.sort_unstable();
+        v.dedup();
+        v.len().max(1) as f64
+    };
+    // The command buffers committed in the same decode steps: the
+    // denominator the encoders are reconciled against.
+    let cb_union_decode = {
+        let mut iv: Vec<(f64, f64)> = s
+            .command_buffer_records
+            .iter()
+            .filter(|r| r.step >= 1)
+            .map(|r| (r.interval.start, r.interval.end))
+            .collect();
+        iv.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let (mut u, mut cur) = (0.0, None::<(f64, f64)>);
+        for (a, b) in iv {
+            cur = match cur {
+                Some((x, y)) if a <= y => Some((x, y.max(b))),
+                Some((x, y)) => {
+                    u += y - x;
+                    Some((a, b))
+                }
+                None => Some((a, b)),
+            };
+        }
+        u + cur.map_or(0.0, |(x, y)| y - x)
+    };
+    let enc_sum: f64 = decode.iter().map(|r| r.end - r.start).sum();
+    let enc_union = p::encoder_union_s(&decode);
+    let outside = p::encoder_containment(&s.encoder_records, 1e-6);
+    let single = decode.iter().filter(|r| r.dispatches == 1).count();
+    let refused = match &s.counter_refusal {
+        Some(why) => format!(
+            " ({} sample buffers refused, last with {why})",
+            s.counter_buffers_refused
+        ),
+        None => String::new(),
+    };
+    eprintln!(
+        "[profile: encoder counters: {} sampled ({} in decode steps, {} holding one dispatch), \
+         dropped {}{refused}, error-marker {}, empty {}, unresolved buffers {}, sample unit {}, \
+         OUTSIDE their command buffer {}; sample buffers {} (peak {} command buffers in flight, \
+         slowest allocation {:.1} µs); decode: encoders sum {:.3} ms/step, union {:.3} ms/step, \
+         against the command buffers' union {:.3} ms/step ({:.2} %), {:.0} steps]",
+        s.encoder_records.len(),
+        decode.len(),
+        single,
+        s.encoder_samples_dropped,
+        s.encoder_samples_bad,
+        s.encoder_samples_empty,
+        s.encoder_buffers_unresolved,
+        match s.counter_unit_s {
+            Some(u) if (u - 1e-9).abs() < 1e-15 => "1 ns".to_string(),
+            Some(u) => format!("{:.3} ns", u * 1e9),
+            None => "unresolved".to_string(),
+        },
+        outside,
+        s.counter_buffers_live,
+        s.encoder_buffers_in_flight_peak,
+        1e6 * s.counter_alloc_max_s,
+        1e3 * enc_sum / steps,
+        1e3 * enc_union / steps,
+        1e3 * cb_union_decode / steps,
+        100.0 * enc_union / cb_union_decode.max(1e-12),
+        steps,
+    );
+    eprintln!(
+        "[profile: gpu time by kernel from encoder counters (decode steps; share of the \
+         encoders' sum; weight MB and GB/s for a GEMV only, from the largest input it bound):"
+    );
+    for k in p::encoder_time_by_label(&decode) {
+        let weights = if k.label.starts_with("gemv") {
+            format!(
+                "{:>9.3} MB/step {:>7.1} GB/s",
+                k.input_bytes as f64 / 1e6 / steps,
+                k.input_bytes as f64 / k.total_s.max(1e-12) / 1e9
+            )
+        } else {
+            format!("{:>9} MB/step {:>7} GB/s", "-", "-")
+        };
+        eprintln!(
+            "    {:>8.3} ms/step {:>6.1} %  {:>6.1} enc/step  p50 {:>8.2} / p90 {:>8.2} / max {:>9.2} µs  \
+             {weights}  {}",
+            1e3 * k.total_s / steps,
+            100.0 * k.total_s / enc_sum.max(1e-12),
+            k.encoders as f64 / steps,
+            1e6 * k.p50_s,
+            1e6 * k.p90_s,
+            1e6 * k.max_s,
+            k.label,
+        );
+    }
+    eprintln!("]");
+    if let Ok(path) = std::env::var("CANDLE_METAL_PROFILE_DUMP") {
+        use std::io::Write;
+        let path = format!("{path}.encoders.csv");
+        let write = || -> std::io::Result<()> {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&path)?);
+            writeln!(
+                f,
+                "step,start_s,end_s,label,dispatches,input_bytes,cb_start_s,cb_end_s"
+            )?;
+            for r in &s.encoder_records {
+                writeln!(
+                    f,
+                    "{},{:.9},{:.9},{},{},{},{:.9},{:.9}",
+                    r.step,
+                    r.start,
+                    r.end,
+                    r.label.as_deref().unwrap_or(""),
+                    r.dispatches,
+                    r.input_bytes,
+                    r.cb_start,
+                    r.cb_end
+                )?;
+            }
+            Ok(())
+        };
+        match write() {
+            Ok(()) => eprintln!(
+                "[profile: dumped {} encoders to {path}]",
+                s.encoder_records.len()
+            ),
+            Err(e) => eprintln!("[profile: encoder dump to {path} failed: {e}]"),
+        }
+    }
 }
 
 /// The GPU's idle between consecutive command buffers, as a distribution and
@@ -1068,9 +1232,50 @@ pub fn print_trace_census(steps: u64) {
         return;
     }
     let mut census: std::collections::BTreeMap<(String, bool), u64> = Default::default();
+    // Which GEMVs are ORDERED after their predecessor — a barrier before
+    // them, or the first dispatch of an encoder session — and so pay a drain
+    // and a fill, against those free to overlap it; keyed by weight bytes
+    // (the largest input bound). Observed from the trace, not modelled.
+    let mut ordering: std::collections::BTreeMap<usize, (u64, u64)> = Default::default();
+    let (mut prev_encoder, mut ordered_all, mut n_all) = (u64::MAX, 0u64, 0u64);
     for d in trace::take_dispatches() {
+        let ordered = d.barrier || d.encoder != prev_encoder;
+        prev_encoder = d.encoder;
+        n_all += 1;
+        ordered_all += u64::from(ordered);
+        if d.pipeline.starts_with("gemv") {
+            let w = d
+                .bindings
+                .iter()
+                .filter(|b| !b.is_output)
+                .map(|b| b.len)
+                .max()
+                .unwrap_or(0);
+            let e = ordering.entry(w).or_default();
+            if ordered {
+                e.0 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
         *census.entry((d.pipeline, d.by_threadgroups)).or_default() += 1;
     }
+    let per = steps.max(1) as f64;
+    eprintln!(
+        "[trace ordering: {:.1} of {:.1} dispatches/step ordered after their predecessor (a \
+         barrier or a new encoder); GEMVs by weight bytes, ordered / free to overlap, per step:",
+        ordered_all as f64 / per,
+        n_all as f64 / per
+    );
+    for (w, (o, f)) in &ordering {
+        eprintln!(
+            "  {:>10.3} MB: {:>6.1} ordered {:>6.1} free",
+            *w as f64 / 1e6,
+            *o as f64 / per,
+            *f as f64 / per
+        );
+    }
+    eprintln!("]");
     let total: u64 = census.values().sum();
     let threads: u64 = census
         .iter()

@@ -49,6 +49,7 @@
 
 #[cfg(feature = "accelerate")]
 mod accelerate;
+pub mod arms;
 pub mod autorelease;
 pub mod backend;
 pub mod backprop;
@@ -109,6 +110,7 @@ pub mod quantized;
 pub mod safetensors;
 pub mod scalar;
 pub mod shape;
+pub mod shape_probe;
 mod sort;
 mod storage;
 pub mod streaming;

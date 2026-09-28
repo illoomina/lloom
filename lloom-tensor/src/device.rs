@@ -613,10 +613,10 @@ impl Device {
     }
 
     /// `words_publish` (Metal): `n` U32 words of `src` copied into the
-    /// CPU-mapped `out`, then `generation` stamped into `step` behind a
-    /// device barrier — the fused publish's data-then-stamp order, for a
-    /// host that polls `step` and reads `out` in place (lloom #148, the
-    /// speculative verify's readback).
+    /// CPU-mapped `out`, then `generation` stamped into `step` by a dispatch
+    /// ordered after the copy (a `ring_stamp` bound to `out`), for a host
+    /// that polls `step` and reads `out` in place — the speculative verify's
+    /// readback. A host that sees the stamp reads this publish's words.
     pub fn words_publish(
         &self,
         src: &crate::Tensor,
@@ -720,8 +720,11 @@ impl Device {
     /// `token_slot` and `history_slot` (U32 views of one element), raises the
     /// EOS gate's flag if the token is in `eos_ids` (U32; only while the gate
     /// is armed), fences, and stamps `generation` into `step` (U32, one
-    /// element) — the chain of `cast`, `argmax`, three blits and the gate
-    /// kernel as one launch. The argmax follows `reduce.metal`'s rule (the
+    /// element) unless `generation` is 0 — the chain of `cast`, `argmax`, three
+    /// blits and the gate kernel as one launch. The fence orders the stamp
+    /// after the slots for the GPU, not for a host reading mapped memory; a
+    /// stamp a host polls is `ring_stamp`'s, bound to the slots' buffer.
+    /// The argmax follows `reduce.metal`'s rule (the
     /// greatest value, the lowest index on ties). Metal only.
     pub fn argmax_publish(
         &self,

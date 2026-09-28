@@ -20,6 +20,12 @@
 //! so a type-introspecting macro would have to special-case each shape. An
 //! explicit attribute is the shape `.bench/configurations.md` §1 already uses
 //! (name, variants, default as prose) and keeps the macro one code path.
+//!
+//! A struct whose fields carry `#[tiny(...)]` also gets the tiny-model
+//! surface (`docs/porting-models.md` §21.8): the `TINY` field table, the axis
+//! accessors a shape search mutates through, and `tiny_derive`, which
+//! recomputes the derived fields from the axes. Emitted only when some field
+//! is tagged, so a config without `#[tiny]` expands exactly as before.
 
 mod options;
 
@@ -123,12 +129,170 @@ impl Parse for AxisAttr {
     }
 }
 
+/// The parsed `#[tiny(...)]` attribute on one field.
+#[derive(Default)]
+struct TinyAttr {
+    /// A searched dimension (`usize`).
+    axis: bool,
+    /// Kept at the template's value.
+    fixed: bool,
+    /// Every layer kind the template has must survive a mutation.
+    cover: bool,
+    /// Recomputed from the other fields by this expression over their names.
+    derived: Option<syn::Expr>,
+    /// The largest value a search may set.
+    max: Option<usize>,
+}
+
+impl Parse for TinyAttr {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut t = TinyAttr::default();
+        while !input.is_empty() {
+            let key: syn::Ident = input.parse()?;
+            match key.to_string().as_str() {
+                "axis" => t.axis = true,
+                "fixed" => t.fixed = true,
+                "cover" => t.cover = true,
+                "derived" => {
+                    input.parse::<Token![=]>()?;
+                    let s = input.parse::<LitStr>()?;
+                    t.derived = Some(s.parse::<syn::Expr>()?);
+                }
+                "max" => {
+                    input.parse::<Token![=]>()?;
+                    t.max = Some(input.parse::<syn::LitInt>()?.base10_parse()?);
+                }
+                other => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        format!("unknown #[tiny] key `{other}` (axis, fixed, cover, derived, max)"),
+                    ));
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        let roles = [t.axis, t.fixed, t.derived.is_some()]
+            .iter()
+            .filter(|b| **b)
+            .count();
+        if roles != 1 {
+            return Err(
+                input.error("#[tiny] takes exactly one of `axis`, `fixed`, `derived = \"...\"`")
+            );
+        }
+        if t.max.is_some() && !t.axis {
+            return Err(input.error("#[tiny] `max` applies to an `axis` only"));
+        }
+        Ok(t)
+    }
+}
+
+/// The tiny-model surface for the `#[tiny]`-tagged fields; empty when none is.
+fn tiny_surface(
+    struct_ident: &syn::Ident,
+    fields: &syn::punctuated::Punctuated<syn::Field, Token![,]>,
+) -> syn::Result<proc_macro2::TokenStream> {
+    let mut tagged: Vec<(syn::Ident, Type, TinyAttr)> = Vec::new();
+    for field in fields {
+        let Some(ident) = field.ident.clone() else {
+            continue;
+        };
+        for attr in &field.attrs {
+            if attr.path().is_ident("tiny") {
+                tagged.push((ident.clone(), field.ty.clone(), attr.parse_args()?));
+            }
+        }
+    }
+    if tagged.is_empty() {
+        return Ok(quote! {});
+    }
+    for (ident, ty, t) in &tagged {
+        if t.axis && quote!(#ty).to_string() != "usize" {
+            return Err(syn::Error::new_spanned(
+                ty,
+                format!("#[tiny(axis)] `{ident}` must be `usize`"),
+            ));
+        }
+    }
+    let rows = tagged.iter().map(|(ident, _, t)| {
+        let name = ident.to_string();
+        let role = if t.axis {
+            quote!(crate::testing::tiny::TinyRole::Axis)
+        } else if t.fixed {
+            quote!(crate::testing::tiny::TinyRole::Fixed)
+        } else {
+            let e = t.derived.as_ref().expect("one role");
+            let text = quote!(#e).to_string();
+            quote!(crate::testing::tiny::TinyRole::Derived(#text))
+        };
+        let cover = t.cover;
+        let max = match t.max {
+            Some(m) => quote!(::std::option::Option::Some(#m)),
+            None => quote!(::std::option::Option::None),
+        };
+        quote! {
+            crate::testing::tiny::TinyField { name: #name, role: #role, cover: #cover, max: #max }
+        }
+    });
+    let axes: Vec<&syn::Ident> = tagged
+        .iter()
+        .filter(|(_, _, t)| t.axis)
+        .map(|(i, _, _)| i)
+        .collect();
+    let axis_names: Vec<String> = axes.iter().map(|i| i.to_string()).collect();
+    // Every field bound by name, so a derived expression reads its inputs as
+    // plain identifiers; each derived field is rebound after it is computed.
+    let all: Vec<&syn::Ident> = fields.iter().filter_map(|f| f.ident.as_ref()).collect();
+    let derived = tagged
+        .iter()
+        .filter_map(|(i, _, t)| t.derived.as_ref().map(|e| (i, e)));
+    let derive_stmts = derived.map(|(i, e)| {
+        quote! {
+            self.#i = #e;
+            let #i = ::std::clone::Clone::clone(&self.#i);
+        }
+    });
+    Ok(quote! {
+        impl #struct_ident {
+            /// The `#[tiny]` annotations, in field order (`docs/porting-models.md` §21.8).
+            pub const TINY: &'static [crate::testing::tiny::TinyField] = &[#(#rows),*];
+
+            /// The value of the `#[tiny(axis)]` field `name`.
+            pub fn tiny_axis(&self, name: &str) -> ::std::option::Option<usize> {
+                match name {
+                    #(#axis_names => ::std::option::Option::Some(self.#axes),)*
+                    _ => ::std::option::Option::None,
+                }
+            }
+
+            /// Set the `#[tiny(axis)]` field `name`; `false` if there is none.
+            /// The derived fields are stale until [`Self::tiny_derive`].
+            pub fn set_tiny_axis(&mut self, name: &str, value: usize) -> bool {
+                match name {
+                    #(#axis_names => { self.#axes = value; true })*
+                    _ => false,
+                }
+            }
+
+            /// Recompute every `#[tiny(derived = "...")]` field, in field order.
+            #[allow(unused_variables, clippy::redundant_clone)]
+            pub fn tiny_derive(&mut self) {
+                #(let #all = ::std::clone::Clone::clone(&self.#all);)*
+                #(#derive_stmts)*
+            }
+        }
+    })
+}
+
 /// `#[derive(Config)]`.
 ///
 /// The struct must have named fields. Fields tagged `#[axis(...)]` are the
 /// engine's configuration axes: each one contributes to the `AXES` slice and
-/// becomes a `clap` flag.
-#[proc_macro_derive(Config, attributes(axis))]
+/// becomes a `clap` flag. Fields tagged `#[tiny(...)]` describe the family's
+/// tiny-model geometry (see the crate docs).
+#[proc_macro_derive(Config, attributes(axis, tiny))]
 pub fn derive_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let struct_ident = &input.ident;
@@ -326,8 +490,14 @@ pub fn derive_config(input: TokenStream) -> TokenStream {
          fields (`hidden_size`, `layer_types`, …) come from the checkpoint. The companion \
          struct carries only the axes, which is what a run actually selects."
     );
+    let tiny = match tiny_surface(struct_ident, fields) {
+        Ok(t) => t,
+        Err(e) => return e.to_compile_error().into(),
+    };
     let expanded = quote! {
         #(#axes_statics)*
+
+        #tiny
 
         #[doc = #args_doc]
         #[derive(::clap::Args, Debug, Clone, Default)]

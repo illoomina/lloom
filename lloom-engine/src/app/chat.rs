@@ -120,6 +120,9 @@ pub fn run(args: ChatArgs) -> Result<()> {
     );
     eprintln!("[capabilities: {}]", engine.capabilities().line());
     sampling.apply_checkpoint(engine.generation_config().as_ref());
+    sampling
+        .check()
+        .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
     let kwargs = json!({ "enable_thinking": args.think });
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = &args.system {

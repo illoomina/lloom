@@ -25,6 +25,17 @@
 //! (`MAX_EDGES_FOUND`) against the map size; a binary with zero guards is
 //! refused, because a campaign over an uninstrumented binary is #504's
 //! `evicted = 0` with a fuzzer around it.
+//!
+//! # Coverage a harness reports itself
+//!
+//! Beside the edges, every campaign carries a second map, the shape map: a
+//! harness marks points in it with [`shape_hit`] — the shape probes it
+//! reached, the kernels the census saw (`fuzz_geometry`, §21.8). GPU code is
+//! not compiled by rustc, so no edge ever sees which Metal kernel ran; this
+//! map is how that becomes coverage. A harness that never marks it leaves it
+//! zero, and a zero map is never interesting. Likewise a harness may register
+//! a structured mutator ([`set_structured_mutator`]) that runs as one more
+//! mutational stage; without one the stage skips.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -60,6 +71,80 @@ use libafl_bolts::{
 use libafl_targets::{std_edges_map_observer, EDGES_MAP_DEFAULT_SIZE, MAX_EDGES_FOUND};
 
 use crate::record::{replay, Record};
+
+/// Points in the shape map. Sized for the probes' `(site, condition,
+/// outcome)` triples and the census labels with room to spare; a
+/// collision merges two points, it loses none of the edges.
+pub const SHAPE_MAP_SIZE: usize = 1 << 14;
+
+static mut SHAPE_MAP: [u8; SHAPE_MAP_SIZE] = [0; SHAPE_MAP_SIZE];
+
+/// Mark the point `key` in the shape map for the running execution.
+pub fn shape_hit(key: &str) {
+    // FNV-1a: stable across builds, so a corpus keeps its meaning.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    let i = (h % SHAPE_MAP_SIZE as u64) as usize;
+    // SAFETY: one client is one thread; the map is written here and read by
+    // the observer between executions, on that same thread.
+    unsafe {
+        let m = &raw mut SHAPE_MAP;
+        (*m)[i] = (*m)[i].saturating_add(1);
+    }
+}
+
+/// A structured mutation: rewrite the input in place from a random seed;
+/// `false` if it did not change.
+pub type StructuredMutate = fn(&mut Vec<u8>, u64) -> bool;
+
+static STRUCTURED: std::sync::OnceLock<StructuredMutate> = std::sync::OnceLock::new();
+
+/// Register this binary's structured mutator (once, before [`run`]).
+pub fn set_structured_mutator(f: StructuredMutate) {
+    let _ = STRUCTURED.set(f);
+}
+
+/// The stage [`set_structured_mutator`] feeds.
+struct Structured;
+
+impl libafl_bolts::Named for Structured {
+    fn name(&self) -> &std::borrow::Cow<'static, str> {
+        static NAME: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed("Structured");
+        &NAME
+    }
+}
+
+impl<S: libafl::state::HasRand> libafl::mutators::Mutator<BytesInput, S> for Structured {
+    fn mutate(
+        &mut self,
+        state: &mut S,
+        input: &mut BytesInput,
+    ) -> Result<libafl::mutators::MutationResult, Error> {
+        use libafl::inputs::{HasMutatorBytes, ResizableMutator};
+        use libafl_bolts::rands::Rand;
+        let Some(f) = STRUCTURED.get() else {
+            return Ok(libafl::mutators::MutationResult::Skipped);
+        };
+        let mut bytes = input.mutator_bytes().to_vec();
+        if !f(&mut bytes, state.rand_mut().next()) {
+            return Ok(libafl::mutators::MutationResult::Skipped);
+        }
+        input.resize(bytes.len(), 0);
+        input.mutator_bytes_mut().copy_from_slice(&bytes);
+        Ok(libafl::mutators::MutationResult::Mutated)
+    }
+
+    fn post_exec(
+        &mut self,
+        _state: &mut S,
+        _new_corpus_id: Option<libafl::corpus::CorpusId>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
 
 /// The command line every harness binary takes.
 #[derive(Parser, Debug, Clone)]
@@ -109,6 +194,11 @@ pub struct Cli {
     /// Do not refuse an uninstrumented binary (for the positive control).
     #[arg(long)]
     pub allow_uninstrumented: bool,
+    /// One client, no broker, restarted by re-executing the binary instead
+    /// of forking it (`--cores`, `--port`, `--broker` are ignored). For a
+    /// harness that compiles Metal kernels at run time.
+    #[arg(long)]
+    pub single: bool,
     /// Redirect the clients' stdout and stderr to this file (the launcher
     /// silences them otherwise); the in-process crash report lands here.
     #[arg(long)]
@@ -222,15 +312,33 @@ where
     let config_name = format!("{name}-{}", arm());
     let record = Record;
 
-    let mut run_client =
-        |state: Option<_>, mut mgr, _client: ClientDescription| -> Result<(), Error> {
+    // One client's fuzzer, over whichever event manager runs it: the
+    // launcher's LLMP clients, or `--single`'s restarting manager.
+    macro_rules! client {
+        ($state:expr, $mgr:expr) => {{
+            let state = $state;
+            let mut mgr = $mgr;
             let edges_observer =
                 HitcountsMapObserver::new(unsafe { std_edges_map_observer("edges") })
                     .track_indices();
             let time_observer = TimeObserver::new("time");
+            // SAFETY: the map is a static of `SHAPE_MAP_SIZE` bytes, written
+            // only by `shape_hit` on this client's one thread.
+            let shape_observer = unsafe {
+                libafl::observers::StdMapObserver::from_mut_ptr(
+                    "shape",
+                    (&raw mut SHAPE_MAP).cast::<u8>(),
+                    SHAPE_MAP_SIZE,
+                )
+            };
             let map_feedback = MaxMapFeedback::new(&edges_observer);
+            let shape_feedback = MaxMapFeedback::new(&shape_observer);
             let calibration = CalibrationStage::new(&map_feedback);
-            let mut feedback = feedback_or!(map_feedback, TimeFeedback::new(&time_observer));
+            let mut feedback = feedback_or!(
+                map_feedback,
+                shape_feedback,
+                TimeFeedback::new(&time_observer)
+            );
             let mut objective = feedback_or_fast!(CrashFeedback::new(), TimeoutFeedback::new());
 
             let mut state = match state {
@@ -266,7 +374,7 @@ where
             #[allow(deprecated)]
             let mut executor = InProcessExecutor::with_timeout(
                 &mut exec_harness,
-                tuple_list!(edges_observer, time_observer),
+                tuple_list!(edges_observer, shape_observer, time_observer),
                 &mut fuzzer,
                 &mut state,
                 &mut mgr,
@@ -303,6 +411,7 @@ where
             }
 
             let mutational = StdMutationalStage::new(HavocScheduledMutator::new(havoc_mutations()));
+            let structured = StdMutationalStage::new(Structured);
 
             #[cfg(feature = "cmplog")]
             {
@@ -332,16 +441,46 @@ where
                 let i2s = StdMutationalStage::new(HavocScheduledMutator::new(tuple_list!(
                     I2SRandReplace::new()
                 )));
-                let mut stages = tuple_list!(calibration, tracing, i2s, mutational);
+                let mut stages = tuple_list!(calibration, tracing, i2s, structured, mutational);
                 fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
             }
             #[cfg(not(feature = "cmplog"))]
             {
-                let mut stages = tuple_list!(calibration, mutational);
+                let mut stages = tuple_list!(calibration, structured, mutational);
                 fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)?;
             }
             Ok(())
+        }};
+    }
+
+    if cli.single {
+        // One client, restarted by re-executing this binary rather than by
+        // forking it: LibAFL's LLMP clients always fork their fuzzer child
+        // (`fork(true)` in `setup_restarting_mgr_llmp`), and in such a child
+        // a Metal library load has failed with MTLCompilerService
+        // unreachable (`measurements/issue-761-shape-probe-spike.md` §4).
+        remove_stale_shmem_server_socket();
+        let monitor = MultiMonitor::new(|s| println!("{s}"));
+        let mut shmem_provider = StdShMemProvider::new().map_err(|e| anyhow!("shmem: {e}"))?;
+        let (state, mgr) = match libafl::events::SimpleRestartingEventManager::launch(
+            monitor,
+            &mut shmem_provider,
+            false,
+        ) {
+            Ok(r) => r,
+            Err(Error::ShuttingDown) => return Ok(()),
+            Err(e) => return Err(anyhow!("restarting manager: {e}")),
         };
+        let run = || -> Result<(), Error> { client!(state, mgr) };
+        return match run() {
+            Ok(()) | Err(Error::ShuttingDown) => Ok(()),
+            Err(e) => Err(anyhow!("client: {e}")),
+        };
+    }
+
+    let mut run_client = |state: Option<_>, mgr, _client: ClientDescription| -> Result<(), Error> {
+        client!(state, mgr)
+    };
 
     let cores = Cores::from_cmdline(&cli.cores).map_err(|e| anyhow!("--cores: {e}"))?;
     if cli.broker {
@@ -362,7 +501,11 @@ where
         // child inherits the parent's Metal device and command queue, and
         // every execution then dies in the driver (measured: 2 252 of 2 252
         // executions were "objectives" on the first cb_liveness campaign).
-        // Re-executed clients create their own device in their own `main`.
+        // Each client still forks its fuzzer child (LibAFL's LLMP restarting
+        // manager always does), before any device is open: the harnesses
+        // open theirs lazily, in the child. A harness that compiles Metal
+        // kernels there has seen the compiler service unreachable; `--single`
+        // re-executes instead.
         .fork(false)
         .stdout_file(client_log.as_deref())
         .stderr_file(client_log.as_deref())

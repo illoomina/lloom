@@ -92,6 +92,9 @@ pub struct LoadOptions {
     pub executor: crate::ExecutorConfig,
     /// The memory budgets.
     pub memory: crate::MemoryConfig,
+    /// The full-attention KV store (`model.axes.kv-quant`, resolved by the
+    /// family); `None` is the checkpoint's f32.
+    pub kv_precision: Option<lloom::nn::ops::KvPrecision>,
 }
 
 /// The model, shared with the batch thread.
@@ -191,6 +194,7 @@ impl Engine<Resident> {
             ple_cache_rows: (opts.ple_cache_rows > 0).then_some(opts.ple_cache_rows),
             mtp: opts.mtp.is_some(),
             memory_fraction: Some(opts.memory_fraction),
+            kv_precision: opts.kv_precision,
         };
         let prefill_mode = match opts.prefill_mode.as_str() {
             "chunk" => PrefillMode::Chunk,
@@ -359,6 +363,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         tier["ple"] = json!(opts.ple);
         tier["ple_cache_rows"] = json!(opts.ple_cache_rows);
         tier["moe_act"] = json!(opts.moe_act);
+        tier["config"] = json!(model.config().axes_line());
         tier["first_shard"] = json!(opts.first_shard.display().to_string());
         let mut engine = Engine {
             core: Arc::new(QwenCore { model }),
@@ -429,21 +434,16 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
                 opts.batch
             );
         }
-        // Under the pass-plan cache the warmup pass corrupts the first real
-        // decode on this family (issue-329 step 5: `--pass-plans` with the
-        // warmup answered "The capital1 isTheThe…", without it "Paris"; the
-        // harness, which never warms up, is right under `--pass-plans`) —
-        // the plan a warmup-shaped pass records is served to a differently
-        // shaped one. The warmup is skipped under the cache, said once, until
-        // the plan/warmup interaction is bisected (owed).
-        if opts.warmup && opts.executor.pass_plans {
-            eprintln!(
-                "[warmup: skipped under executor.pass_plans on Qwen4-exp — the warmup pass's plan \
-                 corrupts the first decode (issue-329 step 5, owed); the first prompt compiles the \
-                 pipelines inside its own TTFT]"
-            );
-        } else if opts.warmup {
+        if opts.warmup {
             let t = Instant::now();
+            // This model brackets the passes the warmup runs itself, after its
+            // embedding; a driver's pass of the same key opens before it. The
+            // warmup's passes must leave no plan behind (`DESIGN.md` §9.2aa).
+            #[cfg(feature = "metal")]
+            let _paused = match &engine.device {
+                Device::Metal(m) => Some(m.pause_pass_plans()?),
+                _ => None,
+            };
             let (libs, pipes) = engine.with_single(|s| Ok(s.warmup()?))?;
             eprintln!(
                 "[warmup: {libs} libraries, {pipes} pipelines compiled in {:.1} ms]",
@@ -810,7 +810,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
     }
     fn describe(&self) -> String {
         format!(
-            "family=qwen4exp batch={} experts={} slots={} loader={} mtp={} ple={} ple_cache_rows={} moe_act={} prefill_tile={} mem_sample={} {}",
+            "family=qwen4exp batch={} experts={} slots={} loader={} mtp={} ple={} ple_cache_rows={} moe_act={} config=[{}] prefill_tile={} mem_sample={} {}",
             self.batch,
             self.tier["experts"].as_str().unwrap_or("?"),
             self.tier["slots_per_layer"].as_u64().unwrap_or(0),
@@ -819,6 +819,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
             self.tier["ple"].as_bool().unwrap_or(true),
             self.tier["ple_cache_rows"].as_u64().unwrap_or(0),
             self.tier["moe_act"].as_str().unwrap_or("f32"),
+            self.core.model.config().axes_line(),
             self.prefill_tile,
             self.mem_sample,
             self.executor.line(),

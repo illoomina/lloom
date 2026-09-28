@@ -226,7 +226,9 @@ fn the_gated_variant_is_a_separate_pipeline_and_the_plain_one_is_untouched() {
 /// The fused publish (`call_argmax_publish`, lloom #735 step 5) against the
 /// host: the greatest value, the lowest index on ties — `reduce.metal`'s
 /// `indexed<T>` rule, which `fast_argmax` implements — into both slots, the
-/// flag iff the token is a stop token, the stamp last.
+/// flag iff the token is a stop token, the stamp last; and with generation 0
+/// no stamp at all (the ring stamps with `ring_stamp` instead, whose order a
+/// host reading mapped memory can rely on), the stamp word left as it was.
 #[test]
 fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
     use crate::kernels::call_argmax_publish;
@@ -283,9 +285,12 @@ fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
                 ("argmax_publish_f16", &logits16),
                 ("argmax_publish_f32", &logits32),
             ] {
-                for eos_is_the_token in [false, true] {
+                for (eos_is_the_token, generation) in [(false, 77u32), (true, 77), (false, 0)] {
                     let slots = device.new_buffer(64, SHARED).unwrap();
                     zero(&slots, 64);
+                    const UNTOUCHED: u32 = 55;
+                    // SAFETY: a fresh Shared buffer of 64 bytes, nothing in flight.
+                    unsafe { (slots.contents() as *mut u32).add(5).write(UNTOUCHED) };
                     let eos = device.new_buffer(8, SHARED).unwrap();
                     write_u32(
                         &eos,
@@ -317,7 +322,7 @@ fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
                                 buffer: &slots,
                                 offset_in_bytes: 20,
                             },
-                            77,
+                            generation,
                         )
                         .unwrap();
                     }
@@ -326,7 +331,15 @@ fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
                         unsafe { std::slice::from_raw_parts(slots.contents() as *const u32, 8) };
                     assert_eq!(out[1], host, "{kernel} n={n}: the token slot");
                     assert_eq!(out[3], host, "{kernel} n={n}: the history slot");
-                    assert_eq!(out[5], 77, "{kernel} n={n}: the stamp");
+                    assert_eq!(
+                        out[5],
+                        if generation == 0 {
+                            UNTOUCHED
+                        } else {
+                            generation
+                        },
+                        "{kernel} n={n} generation {generation}: the stamp"
+                    );
                     assert_eq!(
                         [out[0], out[2], out[4], out[6]],
                         [0; 4],
@@ -479,5 +492,71 @@ fn the_ring_stamp_writes_the_generation_and_nothing_else() {
             certified.as_slice(),
             "the certified buffer is not written"
         );
+    }
+}
+
+/// `call_words_publish` copies exactly `n` words at `out`'s offset and writes
+/// the stamp only for a non-zero generation: a caller whose stamp a host
+/// polls passes 0 and stamps with `ring_stamp` (`Device::words_publish`).
+/// `n = 300` runs past the threadgroup's 256 threads, so each thread copies
+/// more than one word.
+#[test]
+fn the_words_publish_copies_n_words_and_stamps_only_off_generation_0() {
+    use crate::kernels::call_words_publish;
+    let device = Device::system_default().expect("no Metal device");
+    let queue = device.new_command_queue().unwrap();
+    let residency_set = Arc::new(ResidencySet::new(&device));
+    let cmds =
+        Commands::new_with_completion_wait(queue, residency_set, CompletionWait::Synchronize)
+            .unwrap();
+    let kernels = Kernels::new();
+    const POISON: u32 = 0xdead_beef;
+    const UNTOUCHED: u32 = 55;
+    for n in [19usize, 300] {
+        let words: Vec<u32> = (0..n as u32).map(|i| 7 * i + 3).collect();
+        let src = device
+            .new_buffer_with_data(words.as_ptr() as *const std::ffi::c_void, n * 4, SHARED)
+            .unwrap();
+        for generation in [77u32, 0] {
+            // `out` at word 2 of a poisoned buffer, the stamp at word 3 of another.
+            let out = device.new_buffer((n + 4) * 4, SHARED).unwrap();
+            write_u32(&out, &vec![POISON; n + 4]);
+            let step = device.new_buffer(32, SHARED).unwrap();
+            write_u32(&step, &[UNTOUCHED; 8]);
+            {
+                let enc = cmds.command_encoder().unwrap();
+                call_words_publish(
+                    &device,
+                    &enc,
+                    &kernels,
+                    BufferOffset::zero_offset(&src),
+                    n,
+                    BufferOffset {
+                        buffer: &out,
+                        offset_in_bytes: 8,
+                    },
+                    BufferOffset {
+                        buffer: &step,
+                        offset_in_bytes: 12,
+                    },
+                    generation,
+                )
+                .unwrap();
+            }
+            cmds.flush_and_wait_current().unwrap();
+            let got = unsafe { std::slice::from_raw_parts(out.contents() as *const u32, n + 4) };
+            assert_eq!(&got[2..n + 2], words.as_slice(), "n={n}: the words");
+            assert_eq!(
+                [got[0], got[1], got[n + 2], got[n + 3]],
+                [POISON; 4],
+                "n={n}: the words around them untouched"
+            );
+            let st = unsafe { std::slice::from_raw_parts(step.contents() as *const u32, 8) };
+            let mut want = [UNTOUCHED; 8];
+            if generation != 0 {
+                want[3] = generation;
+            }
+            assert_eq!(st, want, "n={n} generation {generation}: the stamp");
+        }
     }
 }

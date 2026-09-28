@@ -1,10 +1,10 @@
 //! Native CPU arms: the ISA features this CPU executes, read at run time.
 //!
-//! An arm exists where the hardware executes its types, and nowhere else. A
-//! kernel that needs a feature asks [`native`] and takes its native arm only
+//! A kernel that needs a feature asks [`native`] and takes its native arm only
 //! when the answer is yes; an arm a caller *selects* on a CPU that lacks its
 //! feature is refused by [`require`], with an error naming the feature.
-//! Neither path emulates a missing instruction in software. (§15.2a)
+//! Neither path emulates a missing instruction in software. The set type and
+//! the refusal are the backend-generic ones in [`crate::arms`]. (§15.2a)
 //!
 //! The set is detected once per process. `LLOOM_CPU_DISABLE` (a comma list of
 //! [`Feature::name`]s) removes features from it, so an arm's absent path can be
@@ -15,7 +15,8 @@
 //! SME/SME2 and AMX are not listed: the standard library has no stable detector
 //! for them, and a feature that cannot be detected cannot be registered.
 
-use crate::{Error, Result};
+use crate::arms::{Capability, Set};
+use crate::Result;
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -80,10 +81,6 @@ impl Feature {
         Feature::ALL.into_iter().find(|f| f.name() == name)
     }
 
-    const fn bit(self) -> u32 {
-        1 << self as u32
-    }
-
     /// Whether the build enables the feature for every function. Such a
     /// feature needs no run-time check, and cannot be withdrawn by one.
     pub const fn compiled_in(self) -> bool {
@@ -137,27 +134,26 @@ impl fmt::Display for Feature {
     }
 }
 
+impl Capability for Feature {
+    const ALL: &'static [Self] = &Feature::ALL;
+    const BACKEND: &'static str = "CPU";
+    const EXECUTOR: &'static str = "CPU";
+    const NOUN: (&'static str, &'static str) = ("feature", "features");
+
+    fn name(self) -> &'static str {
+        Feature::name(self)
+    }
+
+    #[inline(always)]
+    fn index(self) -> u32 {
+        self as u32
+    }
+}
+
 /// A set of [`Feature`]s.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct Features(u32);
+pub type Features = Set<Feature>;
 
-impl Features {
-    pub const fn empty() -> Self {
-        Features(0)
-    }
-
-    pub const fn with(self, feature: Feature) -> Self {
-        Features(self.0 | feature.bit())
-    }
-
-    pub const fn without(self, feature: Feature) -> Self {
-        Features(self.0 & !feature.bit())
-    }
-
-    pub const fn has(self, feature: Feature) -> bool {
-        self.0 & feature.bit() != 0
-    }
-
+impl Set<Feature> {
     /// Every feature the operating system reports for this CPU. Asks the OS
     /// per feature; a repeated caller wants [`host`].
     pub fn detect() -> Self {
@@ -165,65 +161,6 @@ impl Features {
             .into_iter()
             .filter(|f| f.detect())
             .fold(Features::empty(), Features::with)
-    }
-
-    /// The set `LLOOM_CPU_DISABLE` names: a comma list of feature names,
-    /// whitespace ignored. An unknown name is an error, so a typo cannot pass
-    /// for a disabled feature.
-    pub fn parse_list(list: &str) -> Result<Self> {
-        let mut set = Features::empty();
-        for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            match Feature::from_name(name) {
-                Some(feature) => set = set.with(feature),
-                None => {
-                    return Err(Error::Msg(format!(
-                        "unknown CPU feature `{name}` (known: {})",
-                        Features(u32::MAX)
-                    )))
-                }
-            }
-        }
-        Ok(set)
-    }
-
-    pub fn iter(self) -> impl Iterator<Item = Feature> {
-        Feature::ALL.into_iter().filter(move |f| self.has(*f))
-    }
-
-    /// `Ok` when the set holds `feature`; otherwise the refusal of `arm`,
-    /// naming the missing feature.
-    pub fn require(self, feature: Feature, arm: &str) -> Result<()> {
-        if self.has(feature) {
-            Ok(())
-        } else {
-            Err(Error::Msg(format!(
-                "CPU arm `{arm}` refused: this CPU does not execute `{feature}`, \
-                 and the arm is not emulated in software (CPU features: {self})"
-            )))
-        }
-    }
-}
-
-impl fmt::Display for Features {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut first = true;
-        for feature in self.iter() {
-            if !first {
-                f.write_str(" ")?;
-            }
-            first = false;
-            f.write_str(feature.name())?;
-        }
-        if first {
-            f.write_str("none")?;
-        }
-        Ok(())
-    }
-}
-
-impl fmt::Debug for Features {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Features({self})")
     }
 }
 
@@ -238,13 +175,7 @@ impl fmt::Debug for Features {
 pub fn host() -> Features {
     static HOST: OnceLock<Features> = OnceLock::new();
     *HOST.get_or_init(|| {
-        let disabled = match std::env::var("LLOOM_CPU_DISABLE") {
-            Ok(list) => {
-                Features::parse_list(&list).unwrap_or_else(|e| panic!("LLOOM_CPU_DISABLE: {e}"))
-            }
-            Err(_) => Features::empty(),
-        };
-        let detected = Features(Features::detect().0 & !disabled.0);
+        let detected = Features::detect().minus(Features::from_env("LLOOM_CPU_DISABLE"));
         Feature::ALL
             .into_iter()
             .filter(|f| f.compiled_in())

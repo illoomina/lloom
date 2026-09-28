@@ -23,10 +23,10 @@ use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
+pub use device::{wire_weights_on, DeviceId, MetalDevice, PassPlansPaused};
 use device::{
     ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
 };
-pub use device::{wire_weights_on, DeviceId, MetalDevice};
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
 ///

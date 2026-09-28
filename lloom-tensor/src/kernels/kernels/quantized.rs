@@ -1,3 +1,4 @@
+use crate::kernels::metal::arms::{self, Feature, Features};
 use crate::kernels::utils::EncoderProvider;
 use crate::kernels::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, ConstantValues, Device, Kernels,
@@ -119,6 +120,39 @@ impl GemvTriple {
     /// refused rather than resolve a kernel that does not exist.
     pub fn is_implemented(self) -> bool {
         !matches!(self, GemvTriple::I8I32I8)
+    }
+
+    /// What the GPU must execute natively for this arm to be dispatched
+    /// (§15.2a): the float legs' types, or the int8 matrix unit.
+    pub fn requires(self) -> Features {
+        match self {
+            GemvTriple::F32F32F32 => Features::empty().with(Feature::F32),
+            GemvTriple::F16F32F16 => Features::empty().with(Feature::F16).with(Feature::F32),
+            GemvTriple::I8I32I8 => Features::empty().with(Feature::Int8Mma),
+        }
+    }
+
+    /// The triple as a refusal names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            GemvTriple::F32F32F32 => "(f32, f32, f32)",
+            GemvTriple::F16F32F16 => "(f16, f32, f16)",
+            GemvTriple::I8I32I8 => "(i8, i32, i8)",
+        }
+    }
+
+    /// Refuse this arm on a `device` that does not execute its legs, then
+    /// refuse a declared triple whose kernel body is not built. `op` names the
+    /// dispatch in the refusal.
+    fn check(self, device: &Device, op: &'static str) -> Result<(), MetalKernelError> {
+        arms::require_all(device, self.requires(), || format!("{op} {}", self.label()))?;
+        if !self.is_implemented() {
+            return Err(MetalKernelError::UnsupportedDTypeForOp(
+                "declared-unimplemented GemvTriple (M5 native-int)",
+                op,
+            ));
+        }
+        Ok(())
     }
 
     /// The activation (`src1`) dtype leg, for the two float arms. The native-int
@@ -403,15 +437,7 @@ pub fn call_quantized_matmul_mv_t(
         height: nth1,
         depth: 1,
     };
-    // The M5 native-int arm is declared-unimplemented (issue #750): its kernel
-    // body is not built, so refuse the dispatch rather than resolve a name that
-    // does not exist in the metallib.
-    if !triple.is_implemented() {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "declared-unimplemented GemvTriple (M5 native-int)",
-            "quantized matmul-vec",
-        ));
-    }
+    triple.check(device, "quantized matmul-vec")?;
 
     // The weight-dtype stem, e.g. `kernel_mul_mv_q4_0`. The `(activation, store)`
     // triple suffix is appended below. The dense-weight rows (F16/BF16/F32/Q8K)
@@ -601,12 +627,7 @@ pub fn call_quantized_matmul_mv_id_t(
     ids_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
-    if !triple.is_implemented() {
-        return Err(MetalKernelError::UnsupportedDTypeForOp(
-            "declared-unimplemented GemvTriple (M5 native-int)",
-            "routed quantized matmul-vec",
-        ));
-    }
+    triple.check(device, "routed quantized matmul-vec")?;
     if triple != GemvTriple::F32F32F32 && !dtype.has_gemv_triple() {
         return Err(MetalKernelError::UnsupportedDTypeForOp(
             "non-f32 GemvTriple",
@@ -1345,4 +1366,104 @@ pub fn call_quantized_matmul_mv_id2_t(
 
     encoder.dispatch_thread_groups(thread_groups_count, threads_per_threadgroup);
     Ok(())
+}
+
+#[cfg(test)]
+mod arm_tests {
+    use super::*;
+    use crate::kernels::metal::{Commands, ResidencySet};
+    use crate::kernels::RESOURCE_OPTIONS;
+    use std::sync::Arc;
+
+    fn setup() -> (Device, Kernels, Commands, Buffer) {
+        let device = Device::system_default().expect("a Metal device");
+        let queue = device.new_command_queue().unwrap();
+        let commands = Commands::new(queue, Arc::new(ResidencySet::new(&device))).unwrap();
+        let buffer = device.new_buffer(4096, RESOURCE_OPTIONS).unwrap();
+        (device, Kernels::new(), commands, buffer)
+    }
+
+    fn dispatch_plain(triple: GemvTriple) -> Result<(), MetalKernelError> {
+        let (device, kernels, commands, buf) = setup();
+        let encoder = commands.command_encoder().unwrap();
+        call_quantized_matmul_mv_t(
+            &device,
+            &encoder,
+            &kernels,
+            GgmlDType::Q4K,
+            triple,
+            (1, 1, 32, 256),
+            &buf,
+            0,
+            &buf,
+            0,
+            &buf,
+        )
+    }
+
+    fn dispatch_routed(triple: GemvTriple) -> Result<(), MetalKernelError> {
+        let (device, kernels, commands, buf) = setup();
+        let encoder = commands.command_encoder().unwrap();
+        call_quantized_matmul_mv_id_t(
+            &device,
+            &encoder,
+            &kernels,
+            GgmlDType::Q4K,
+            triple,
+            (2, 32, 256),
+            (1, 1, 1),
+            &buf,
+            &buf,
+            0,
+            &buf,
+            0,
+            &buf,
+        )
+    }
+
+    /// The int8 arm needs a feature no family registers, so both dispatches
+    /// refuse it by that feature's name before any kernel is resolved — not by
+    /// the kernel body being unbuilt, which is the second check.
+    #[test]
+    fn the_int8_arm_is_refused_by_the_feature_it_lacks() {
+        for (err, op) in [
+            (dispatch_plain(GemvTriple::I8I32I8), "quantized matmul-vec"),
+            (
+                dispatch_routed(GemvTriple::I8I32I8),
+                "routed quantized matmul-vec",
+            ),
+        ] {
+            let err = err.unwrap_err();
+            assert!(matches!(err, MetalKernelError::ArmRefused(_)), "{err}");
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with(&format!(
+                    "Metal arm `{op} (i8, i32, i8)` refused: this GPU does not execute `int8-mma`"
+                )),
+                "{msg}"
+            );
+        }
+    }
+
+    /// The float arms pass the device check here, which registers `f16` on
+    /// every Apple family; `LLOOM_METAL_DISABLE=f16` makes the same dispatch
+    /// refuse, naming `f16`.
+    #[test]
+    fn the_f16_arm_follows_the_device_set() {
+        let (device, ..) = setup();
+        assert!(GemvTriple::F32F32F32.check(&device, "op").is_ok());
+        let f16 = GemvTriple::F16F32F16.check(&device, "op");
+        if arms::for_device(&device).has(Feature::F16) {
+            assert!(f16.is_ok(), "{f16:?}");
+        } else {
+            let msg = f16.unwrap_err().to_string();
+            assert!(msg.contains("`op (f16, f32, f16)` refused"), "{msg}");
+            assert!(msg.contains("does not execute `f16`"), "{msg}");
+            let routed = dispatch_routed(GemvTriple::F16F32F16)
+                .unwrap_err()
+                .to_string();
+            assert!(routed.contains("does not execute `f16`"), "{routed}");
+            eprintln!("f16 withdrawn: {msg}");
+        }
+    }
 }

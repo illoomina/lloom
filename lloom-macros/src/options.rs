@@ -320,7 +320,7 @@ pub(crate) fn derive(input: DeriveInput) -> TokenStream {
             let value_name = type_name(f.inner.as_ref().unwrap_or(&f.ty)).to_uppercase();
             quote! {
                 #[doc = #doc]
-                #[arg(id = #id, long = #flag, #short #alias value_name = #value_name)]
+                #[arg(id = #id, long = #flag, #short #alias value_name = #value_name, allow_negative_numbers = true)]
                 pub #ident: Option<String>,
             }
         }

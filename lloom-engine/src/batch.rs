@@ -258,7 +258,7 @@ pub enum BatchMode<M: BatchedCausalLM, E> {
 }
 
 enum Job<M: BatchedCausalLM, E> {
-    Request(BatchRequest, Sender<BatchEvent>),
+    Request(Box<BatchRequest>, Sender<BatchEvent>),
     Closed(ClosedJob<M, E>),
     Shutdown,
 }
@@ -280,7 +280,7 @@ impl<M: BatchedCausalLM, E> BatchHandle<M, E> {
     /// Queue a row; its events arrive on the returned receiver.
     pub fn submit(&self, req: BatchRequest) -> Receiver<BatchEvent> {
         let (tx, rx) = mpsc::channel();
-        if self.tx.send(Job::Request(req, tx.clone())).is_err() {
+        if self.tx.send(Job::Request(Box::new(req), tx.clone())).is_err() {
             let _ = tx.send(BatchEvent::Error(
                 "the batch scheduler has stopped".to_string(),
             ));
@@ -493,7 +493,7 @@ where
 
     fn enqueue(&mut self, job: Job<M, E>) -> bool {
         match job {
-            Job::Request(req, tx) => self.waiting.push_back((req, tx)),
+            Job::Request(req, tx) => self.waiting.push_back((*req, tx)),
             Job::Closed(job) => self.closed.push_back(job),
             Job::Shutdown => return false,
         }
@@ -512,6 +512,11 @@ where
         if req.prompt_ids.is_empty() {
             lloom_tensor::bail!("batch scheduler: empty prompt");
         }
+        req.params.refuse_processors(
+            "the batch scheduler",
+            "its rows draw through the batched driver's per-row sampler or one device argmax \
+             over the batch (serve them at --batch 1)",
+        )?;
         let (routed, seq) = self
             .pool
             .acquire(&req.prompt_ids)
@@ -1226,6 +1231,37 @@ mod tests {
                 .map(|(_, d)| d.joined_beside)
                 .collect::<Vec<_>>()
         );
+        handle.shutdown();
+        thread.join().unwrap();
+    }
+
+    /// A row draws through the batched driver, never through the request's
+    /// sampler, so a request carrying logits processors is refused by name
+    /// rather than served without them; the next plain request still runs.
+    #[test]
+    fn a_request_with_processors_is_refused_by_name() {
+        let (handle, thread) = start(2, 0, BatchMode::Continuous);
+        let mut with = params(12);
+        with.processors.presence_penalty = 1.0;
+        let rx = handle.submit(BatchRequest {
+            prompt_ids: vec![3, 1],
+            params: with,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        match rx.recv_timeout(Duration::from_secs(30)).expect("an event") {
+            BatchEvent::Error(e) => assert!(
+                e.contains("the batch scheduler does not run logits processors"),
+                "{e}"
+            ),
+            BatchEvent::Tokens(_) | BatchEvent::Done(_) => panic!("served with processors"),
+        }
+        let rx = handle.submit(BatchRequest {
+            prompt_ids: vec![3, 1],
+            params: params(12),
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        let (_, done) = collect(&rx);
+        assert_eq!(done.tokens, chain(1, 12).0);
         handle.shutdown();
         thread.join().unwrap();
     }

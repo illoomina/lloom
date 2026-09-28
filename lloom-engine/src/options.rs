@@ -266,7 +266,7 @@ impl ReadbackConfig {
     /// on the fixed cadence where the arm cannot carry the adaptive commit
     /// ([`RingArm::resolved`], [`Self::adaptive_clamp`]).
     pub fn ring_arm(&self) -> RingArm {
-        self.requested_ring_arm().resolved(self.fused_publish)
+        self.requested_ring_arm().resolved()
     }
 
     /// Why the adaptive commit this group asks for does not run, or `None`
@@ -279,10 +279,10 @@ impl ReadbackConfig {
             return None;
         }
         let ring = self.requested_ring_arm();
-        ring.why_not_adaptive(self.fused_publish).map(|why| {
+        ring.why_not_adaptive().map(|why| {
             format!(
                 "adaptive_commit is off on {}: {why}; the ring runs on the fixed cadence{}",
-                ring.resolved(self.fused_publish).name(),
+                ring.resolved().name(),
                 if self.eos_gate {
                     ", without the EOS gate that rides it"
                 } else {
@@ -327,22 +327,11 @@ impl ReadbackConfig {
 
     /// The refusals `lfm2-chat` makes before a run, made here once so every
     /// binary refuses the same combinations with the same reasons. Only a
-    /// knob that defaults off is refused: one that defaults on (the adaptive
+    /// value no arm can run is refused: a knob that defaults on (the adaptive
     /// commit, the EOS gate that rides it) is clamped where the arm cannot
-    /// carry it ([`Self::adaptive_clamp`]), or every fixed-cadence arm would
-    /// be refused over a default nobody set.
+    /// carry it ([`Self::adaptive_clamp`]), and the stream reader streams
+    /// every ring arm (`docs/dispatch.md` §11.5z-xvi).
     pub fn check(&self) -> Result<(), String> {
-        if self.stream_reader && self.kind != ReadbackKind::Blocking {
-            let ring = self.ring_arm();
-            if let Some(why) = ring.why_not_stream_reader(self.fused_publish) {
-                return Err(format!(
-                    "stream_reader cannot stream {}: {why} (`--stream-reader` streams the poll \
-                     read, `ring-nonblocking`, or another read under the adaptive commit's fused \
-                     publish)",
-                    ring.name()
-                ));
-            }
-        }
         if self.lookahead > 1 {
             return Err(format!("lookahead {} is not 0 or 1", self.lookahead));
         }
@@ -775,6 +764,25 @@ impl ModelConfigArgs {
 fn parse_stop(v: &str) -> Result<Vec<String>, String> {
     Ok(v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
 }
+/// `id:bias[,id:bias…]` — OpenAI's `logit_bias` map as a flag.
+fn parse_logit_bias(v: &str) -> Result<std::collections::BTreeMap<u32, f64>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for pair in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (id, bias) = pair
+            .split_once(':')
+            .ok_or_else(|| format!("`{pair}` is not `token_id:bias`"))?;
+        let id: u32 = id
+            .trim()
+            .parse()
+            .map_err(|_| format!("`{id}` in `{pair}` is not a token id"))?;
+        let bias: f64 = bias
+            .trim()
+            .parse()
+            .map_err(|_| format!("`{bias}` in `{pair}` is not a number"))?;
+        out.insert(id, bias);
+    }
+    Ok(out)
+}
 fn parse_defaults(v: &str) -> Result<String, String> {
     match v.trim() {
         "greedy" => Ok("greedy".into()),
@@ -820,6 +828,21 @@ pub struct SamplingConfig {
     /// Stop strings, comma-separated (a request's own `stop` overrides).
     #[opt(flag = "stop", parser = "parse_stop")]
     pub stop: Vec<String>,
+    /// Repetition penalty over prompt and output tokens (> 0; 1 is off): a positive logit divided by it, a negative one multiplied.
+    #[opt(flag = "repetition-penalty")]
+    pub repetition_penalty: Option<f64>,
+    /// Presence penalty (OpenAI, [-2, 2]; 0 is off): subtracted once from every token the output holds.
+    #[opt(flag = "presence-penalty")]
+    pub presence_penalty: Option<f64>,
+    /// Frequency penalty (OpenAI, [-2, 2]; 0 is off): subtracted per occurrence in the output.
+    #[opt(flag = "frequency-penalty")]
+    pub frequency_penalty: Option<f64>,
+    /// Min-p ([0, 1]; 0 is off): drops tokens below min_p times the top token's probability; sampled arms only.
+    #[opt(flag = "min-p")]
+    pub min_p: Option<f64>,
+    /// Logit bias, `token_id:bias,…` (each bias in [-100, 100]), added before the penalties.
+    #[opt(flag = "logit-bias", parser = "parse_logit_bias")]
+    pub logit_bias: std::collections::BTreeMap<u32, f64>,
 }
 
 impl Default for SamplingConfig {
@@ -834,6 +857,11 @@ impl Default for SamplingConfig {
             max_tokens: 512,
             ignore_eos: false,
             stop: Vec::new(),
+            repetition_penalty: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            min_p: None,
+            logit_bias: Default::default(),
         }
     }
 }
@@ -855,6 +883,39 @@ impl SamplingConfig {
         if self.top_k.is_none() {
             self.top_k = gc.top_k;
         }
+        if self.repetition_penalty.is_none() {
+            self.repetition_penalty = gc.repetition_penalty;
+        }
+        if self.min_p.is_none() {
+            self.min_p = gc.min_p;
+        }
+    }
+
+    /// The logits processors these fields name; an unset field is neutral.
+    pub fn processors(&self) -> lloom::generation::Processors {
+        let neutral = lloom::generation::Processors::default();
+        lloom::generation::Processors {
+            repetition_penalty: self
+                .repetition_penalty
+                .unwrap_or(neutral.repetition_penalty),
+            presence_penalty: self.presence_penalty.unwrap_or(neutral.presence_penalty),
+            frequency_penalty: self.frequency_penalty.unwrap_or(neutral.frequency_penalty),
+            min_p: self.min_p.unwrap_or(neutral.min_p),
+            logit_bias: self
+                .logit_bias
+                .iter()
+                .map(|(&id, &b)| (id, b as f32))
+                .collect(),
+        }
+    }
+
+    /// Refuse an out-of-range processor value, by its field's name. Every
+    /// layer — flags, `--set`, `--generation-config`, the env — lands here,
+    /// since the JSON layer deserializes without the flag parsers.
+    pub fn check(&self) -> Result<(), String> {
+        self.processors()
+            .validate()
+            .map_err(|e| format!("sampling: {e}"))
     }
 
     /// The seed for one run.
@@ -875,6 +936,7 @@ impl SamplingConfig {
             top_p: self.top_p,
             top_k: self.top_k,
             gumbel: self.gumbel,
+            processors: self.processors(),
             max_tokens: self.max_tokens,
             eos_ids: if self.ignore_eos { vec![u32::MAX] } else { eos_ids.to_vec() },
             stop_strings: self.stop.clone(),
@@ -1101,7 +1163,8 @@ pub struct EngineOptions {
 impl EngineOptions {
     /// The refusals of every group, once.
     pub fn check(&self) -> Result<(), String> {
-        self.decode.check()
+        self.decode.check()?;
+        self.sampling.check()
     }
 }
 
@@ -1265,13 +1328,14 @@ mod tests {
         la0.adaptive_commit = false;
         assert_eq!(la0.adaptive_clamp(), None);
 
-        // A deferred read stamps per token only through the fused publish.
+        // A deferred read carries the adaptive commit with or without the
+        // fused publish: the loop stamps each token after an unfused step.
         let mut drain = ReadbackConfig::default();
         ReadbackConfig::apply_spelling(&mut drain, "ring-hostdrain").unwrap();
         assert!(drain.ring_arm().adaptive);
         drain.fused_publish = false;
-        assert!(!drain.ring_arm().adaptive);
-        assert!(drain.adaptive_clamp().unwrap().contains("deferred"));
+        assert!(drain.ring_arm().adaptive);
+        assert_eq!(drain.adaptive_clamp(), None);
 
         assert_eq!(ReadbackConfig::default().adaptive_clamp(), None);
         assert_eq!(ReadbackConfig::default().ring_arm(), RingArm::CROWN);
@@ -1285,36 +1349,26 @@ mod tests {
             "the blocking arm ignores the cadence knobs"
         );
 
-        // The stream reader is refused where the ring stamps no token for it.
-        let mut reader = ReadbackConfig {
-            stream_reader: true,
-            ..ReadbackConfig::default()
-        };
-        ReadbackConfig::apply_spelling(&mut reader, "ring").unwrap();
-        let err = reader.check().unwrap_err();
-        assert!(
-            err.contains("stream_reader") && err.contains("flag"),
-            "{err}"
-        );
-        ReadbackConfig::apply_spelling(&mut reader, "ring-hostdrain").unwrap();
-        assert!(
-            reader.check().is_ok(),
-            "the adaptive commit's fused publish stamps per token"
-        );
-        reader.fused_publish = false;
-        let err = reader.check().unwrap_err();
-        assert!(
-            err.contains("stream_reader") && err.contains("deferred"),
-            "{err}"
-        );
-        reader.fused_publish = true;
-        reader.adaptive_commit = false;
-        let err = reader.check().unwrap_err();
-        assert!(
-            err.contains("stream_reader") && err.contains("deferred"),
-            "{err}"
-        );
-        ReadbackConfig::apply_spelling(&mut reader, "ring-fixed").unwrap();
-        assert!(reader.check().is_ok(), "the poll read stamps per token");
+        // The stream reader is taken on every spelling, cadence and publish:
+        // every EOS read stamps on a grain its reader streams.
+        for spelling in ReadbackConfig::SPELLINGS {
+            for adaptive_commit in [true, false] {
+                for fused_publish in [true, false] {
+                    let mut reader = ReadbackConfig {
+                        stream_reader: true,
+                        adaptive_commit,
+                        fused_publish,
+                        ..ReadbackConfig::default()
+                    };
+                    ReadbackConfig::apply_spelling(&mut reader, spelling).unwrap();
+                    assert_eq!(
+                        reader.check(),
+                        Ok(()),
+                        "--readback {spelling} --stream-reader adaptive={adaptive_commit} \
+                         fused={fused_publish}"
+                    );
+                }
+            }
+        }
     }
 }

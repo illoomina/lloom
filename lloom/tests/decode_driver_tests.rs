@@ -1266,8 +1266,20 @@ fn reader_run<M: CausalLM>(
     session: &mut Session<'_, M>,
     rb: &mut Ring,
     prompt: &[u32],
+    opts: DecodeOptions,
+    resume: bool,
+) -> Result<(lloom::nn::DecodeOut, Vec<u32>)> {
+    reader_run_sampled(session, rb, prompt, opts, resume, &mut greedy())
+}
+
+/// [`reader_run`] with the caller's sampler.
+fn reader_run_sampled<M: CausalLM>(
+    session: &mut Session<'_, M>,
+    rb: &mut Ring,
+    prompt: &[u32],
     mut opts: DecodeOptions,
     resume: bool,
+    sampler: &mut LogitsProcessor,
 ) -> Result<(lloom::nn::DecodeOut, Vec<u32>)> {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1304,8 +1316,7 @@ fn reader_run<M: CausalLM>(
         })
     };
     let mut spec = IdentityProposer;
-    let mut sampler = greedy();
-    let out = session.decode(&mut spec, rb, &mut sampler, prompt, &opts, &mut sink)?;
+    let out = session.decode(&mut spec, rb, sampler, prompt, &opts, &mut sink)?;
     done.store(true, Ordering::Release);
     let seen = watcher.join().expect("watcher");
     Ok((out, seen))
@@ -2481,5 +2492,362 @@ fn the_flow_and_the_fixed_cadence_agree_on_the_real_decode_kernels_across_turns(
         !reference.expect("the blocking arm ran").is_empty(),
         "turn two produced nothing"
     );
+    Ok(())
+}
+
+/// A [`RingReader`] streams exactly the ids its run returns on every EOS read,
+/// every cadence that can host one and every device-resident sampler, request
+/// after request on one pooled ring (`Ring::new` at `RING_HISTORY_SLOTS`, as
+/// `RingPool` builds it; each reader resumed at its run's first token).
+///
+/// What each arm stamps is what the reader can stream: the per-step reads
+/// (flag, poll) stamp every token; the deferred reads stamp a window per
+/// commit on the fixed cadence and the last window at the final drain, and
+/// every token under the adaptive commit — through the fused kernel for the
+/// argmax sampler, through the loop's `publish_marker` for any other. The
+/// sampled arm (seeded gumbel-max) is the one every greedy gate is blind to:
+/// the fused kernel serves argmax only. Because the final drain stamps what
+/// is left, a stream that was never per-token still ends equal to the ids;
+/// so under the adaptive commit an early EOS must also have stopped the run
+/// through the reader's flag, which only a per-token stamp raises in time.
+/// Where the adaptive commit carries the EOS gate, the gate must fire on the
+/// EOS whichever path published it.
+#[test]
+fn a_ring_reader_streams_what_every_arm_returns() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        if matches!(device, Device::Cpu) {
+            continue; // the reader is Metal
+        }
+        let reads = [
+            ("flag", EosRead::Blocking),
+            ("poll", EosRead::Poll(PollMechanism::default())),
+            ("drain", EosRead::HostOnDrain),
+            ("gpubatch", EosRead::GpuBatched),
+            ("gpubatch-nonblocking", EosRead::GpuBatchedNonblocking),
+        ];
+        let fixed = |lookahead: usize, budget: CommitBudget, n: usize| DecodeOptions {
+            lookahead,
+            budget,
+            stream_via_reader: true,
+            ..DecodeOptions::new(n)
+        };
+        let adaptive = |fused: bool, gate: bool, n: usize| DecodeOptions {
+            fused_publish: fused,
+            ..adaptive_opts(n, 8, gate)
+        };
+        type Cadence = (&'static str, bool, Box<dyn Fn(usize) -> DecodeOptions>);
+        let cadences: Vec<Cadence> = vec![
+            (
+                "la0 steps:8",
+                false,
+                Box::new(move |n| fixed(0, CommitBudget::steps(8).expect("8"), n)),
+            ),
+            (
+                "la1 steps:8",
+                false,
+                Box::new(move |n| fixed(1, CommitBudget::steps(8).expect("8"), n)),
+            ),
+            (
+                "la1 per-token",
+                false,
+                Box::new(move |n| fixed(1, CommitBudget::per_token(), n)),
+            ),
+            (
+                "adaptive",
+                true,
+                Box::new(move |n| adaptive(true, false, n)),
+            ),
+            (
+                "adaptive unfused",
+                true,
+                Box::new(move |n| adaptive(false, false, n)),
+            ),
+            (
+                "adaptive gated",
+                true,
+                Box::new(move |n| adaptive(true, true, n)),
+            ),
+        ];
+        // Gumbel-max at t = 0.1 is a sampler the fused kernel does not serve
+        // whose draws, against the fixture's one-hot logits, still follow the
+        // chain to its early EOS: the sampled arm the per-token check reads.
+        // At t = 0.6 the draws are near uniform and an EOS is rare and late.
+        let samplers = [
+            ("argmax", Sampling::ArgMax),
+            ("t=0.1", Sampling::All { temperature: 0.1 }),
+            ("t=0.6", Sampling::All { temperature: 0.6 }),
+        ];
+        // (start, max): ends on EOS, on length, EOS again, then length.
+        let runs: [(u32, usize); 4] = [(1, 64), (0, 24), (1, 64), (0, 24)];
+        let model = Chain::new(&device)?;
+        let mut failures: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        let mut sampled_early_eos = 0usize;
+        for (read, eos) in reads {
+            for (cadence, is_adaptive, opts_for) in &cadences {
+                if *is_adaptive && matches!(eos, EosRead::Blocking) {
+                    continue; // the flag reads every token back: refused
+                }
+                for (sname, sampling) in &samplers {
+                    let mut rb = Ring::new(
+                        &[EOS],
+                        &device,
+                        lloom::generation::readback::RING_HISTORY_SLOTS,
+                        eos,
+                    )?;
+                    let mut sampler = LogitsProcessor::from_sampling(805, sampling.clone());
+                    for (i, (start, max)) in runs.into_iter().enumerate() {
+                        let at = format!("{read} {cadence} {sname} run {i}");
+                        let opts = opts_for(max);
+                        let gated = opts.eos_gate;
+                        let mut session = Session::new(&model, 0usize);
+                        let (out, seen) = match reader_run_sampled(
+                            &mut session,
+                            &mut rb,
+                            &[start],
+                            opts,
+                            true,
+                            &mut sampler,
+                        ) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                failures.push(format!("{at}: refused: {e}"));
+                                break;
+                            }
+                        };
+                        checked += 1;
+                        if matches!(sampling, Sampling::ArgMax) {
+                            let (want, hit) = chain(start, max);
+                            if out.ids != want || out.eos != hit {
+                                failures.push(format!(
+                                    "{at}: the loop's ids {:?} (eos {}) against the chain {want:?} (eos {hit})",
+                                    out.ids, out.eos
+                                ));
+                            }
+                        }
+                        if seen != out.ids {
+                            failures.push(format!(
+                                "{at}: the reader streamed {seen:?}, the run returned {:?}",
+                                out.ids
+                            ));
+                        }
+                        // Per token, not only by the end: under the adaptive
+                        // commit the reader's flag is the loop's EOS, and it
+                        // is raised in time only off a per-token stamp. The
+                        // loop runs at most two run-ahead windows (16 steps)
+                        // past an EOS the reader has seen, so an EOS 32 short
+                        // of the cap is margin; a run that reached the cap
+                        // instead streamed its tokens from the final drain.
+                        let early_eos = *is_adaptive && out.eos && out.ids.len() + 32 <= max;
+                        if early_eos && !matches!(sampling, Sampling::ArgMax) {
+                            sampled_early_eos += 1;
+                        }
+                        if early_eos && !out.stats.stopped_by_flag {
+                            failures.push(format!(
+                                "{at}: the EOS at {} did not stop the run through the reader \
+                                 (it ran {} steps of {max})",
+                                out.ids.len(),
+                                out.stats.steps
+                            ));
+                        }
+                        if gated {
+                            let gate = out.stats.eos_gate.expect("the gate ran");
+                            if out.eos && !gate.fired {
+                                failures.push(format!("{at}: an EOS the gate did not see"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{device:?}: {checked} runs checked ({sampled_early_eos} sampled, adaptive, early EOS), \
+             {} failed",
+            failures.len()
+        );
+        for f in &failures {
+            eprintln!("FAIL {f}");
+        }
+        assert!(checked >= 150, "{device:?}: only {checked} runs ran");
+        assert!(
+            sampled_early_eos > 0,
+            "{device:?}: no sampled run ended on an early EOS under the adaptive commit, so the \
+             per-token check never read the unfused publish"
+        );
+        assert!(
+            failures.is_empty(),
+            "{} runs failed (listed above)",
+            failures.len()
+        );
+    }
+    Ok(())
+}
+
+/// A rate, not a gate: a reader that saw a stamp and read the slot behind it
+/// before the slot's write was visible — the previous content (the zero fill
+/// on a slot never written, #735's shape; a stale token on a reused one).
+/// Pairs of an EOS request then a length request on one pooled ring, as
+/// `lloom serve` runs them. `LLOOM_READER_STRESS=<pairs>` per arm (default
+/// 200); `LLOOM_READER_STRESS_ARMS` filters arms by substring. Prints, per
+/// arm, the runs whose stream was not the ids and how: `stale` (one slot
+/// differs), `past-eos` (the EOS slot read stale, the stream ran on), other.
+/// Asserts nothing: a count of a race is machine state (§3.2c).
+#[test]
+#[ignore = "a stress rate; run with --ignored"]
+fn reader_stale_slot_rate_after_an_eos_on_a_pooled_ring() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    let pairs: usize = std::env::var("LLOOM_READER_STRESS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+    let filter = std::env::var("LLOOM_READER_STRESS_ARMS").unwrap_or_default();
+    for device in devices() {
+        if matches!(device, Device::Cpu) {
+            continue;
+        }
+        let model = Chain::new(&device)?;
+        type Opts = Box<dyn Fn(usize) -> DecodeOptions>;
+        let cadences: Vec<(&str, Opts)> = vec![
+            ("adaptive fused", Box::new(|n| adaptive_opts(n, 8, false))),
+            (
+                "adaptive fused ra1",
+                Box::new(|n| adaptive_opts(n, 1, false)),
+            ),
+            (
+                "adaptive unfused",
+                Box::new(|n| DecodeOptions {
+                    fused_publish: false,
+                    ..adaptive_opts(n, 8, false)
+                }),
+            ),
+            (
+                "fixed la1 steps:8",
+                Box::new(|n| DecodeOptions {
+                    lookahead: 1,
+                    budget: CommitBudget::steps(8).expect("8"),
+                    stream_via_reader: true,
+                    ..DecodeOptions::new(n)
+                }),
+            ),
+        ];
+        for (read, eos) in [
+            ("poll", EosRead::Poll(PollMechanism::default())),
+            ("drain", EosRead::HostOnDrain),
+            ("gpubatch-nonblocking", EosRead::GpuBatchedNonblocking),
+        ] {
+            for (cadence, opts_for) in &cadences {
+                let arm = format!("{read} {cadence}");
+                if !filter.is_empty() && !arm.contains(&filter) {
+                    continue;
+                }
+                let mut rb = Ring::new(
+                    &[EOS],
+                    &device,
+                    lloom::generation::readback::RING_HISTORY_SLOTS,
+                    eos,
+                )?;
+                let (mut runs, mut tokens, mut stale, mut past, mut other) = (0, 0, 0, 0, 0);
+                let mut first: Option<String> = None;
+                for _ in 0..pairs {
+                    for (start, max) in [(1u32, 64usize), (0, 24)] {
+                        let mut session = Session::new(&model, 0usize);
+                        let (out, seen) =
+                            reader_run(&mut session, &mut rb, &[start], opts_for(max), true)?;
+                        runs += 1;
+                        tokens += out.ids.len();
+                        if seen == out.ids {
+                            continue;
+                        }
+                        let diffs: Vec<usize> = (0..seen.len().min(out.ids.len()))
+                            .filter(|&i| seen[i] != out.ids[i])
+                            .collect();
+                        if seen.len() == out.ids.len() && diffs.len() == 1 {
+                            stale += 1;
+                        } else if seen.len() > out.ids.len() && diffs.is_empty() {
+                            past += 1;
+                        } else {
+                            other += 1;
+                        }
+                        first.get_or_insert_with(|| {
+                            format!("start {start}: streamed {seen:?}, ids {:?}", out.ids)
+                        });
+                    }
+                }
+                eprintln!(
+                    "STRESS {arm}: {} wrong of {runs} runs ({tokens} tokens): {stale} stale, \
+                     {past} past-eos, {other} other{}",
+                    stale + past + other,
+                    first.map(|f| format!("; first: {f}")).unwrap_or_default()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The stamp after the fused publish never runs ahead of the slot it
+/// certifies, as seen by a host reader: under the adaptive commit at a
+/// one-step run-ahead — where the kernel's own in-dispatch stamp let a reader
+/// read the slot's previous content in about 0.8 % of runs (§11.5z-xvi) — a
+/// resumed reader streams exactly the ids, and the ids are the chain, for
+/// every run of 1 000 EOS-then-length pairs on each deferred and per-step
+/// read. A race, so a red here is a defect and a green is a bound.
+#[test]
+fn the_fused_publishs_stamp_never_runs_ahead_of_its_slot() -> Result<()> {
+    let _quiet = GPU_QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    for device in devices() {
+        if matches!(device, Device::Cpu) {
+            continue; // the fused publish and the reader are Metal
+        }
+        let model = Chain::new(&device)?;
+        let mut failures: Vec<String> = Vec::new();
+        let mut runs = 0usize;
+        for (read, eos) in [
+            ("poll", EosRead::Poll(PollMechanism::default())),
+            ("drain", EosRead::HostOnDrain),
+            ("gpubatch-nonblocking", EosRead::GpuBatchedNonblocking),
+        ] {
+            let mut rb = Ring::new(
+                &[EOS],
+                &device,
+                lloom::generation::readback::RING_HISTORY_SLOTS,
+                eos,
+            )?;
+            for pair in 0..1000 {
+                for (start, max) in [(1u32, 64usize), (0, 24)] {
+                    let (want, _) = chain(start, max);
+                    let mut session = Session::new(&model, 0usize);
+                    let (out, seen) = reader_run(
+                        &mut session,
+                        &mut rb,
+                        &[start],
+                        adaptive_opts(max, 1, false),
+                        true,
+                    )?;
+                    runs += 1;
+                    assert!(
+                        out.stats.readback.fused_publishes > 0,
+                        "{read}: the fused publish did not run"
+                    );
+                    if out.ids != want || seen != want {
+                        failures.push(format!(
+                            "{read} pair {pair} from {start}: ids {:?}, streamed {seen:?}, chain {want:?}",
+                            out.ids
+                        ));
+                    }
+                }
+            }
+        }
+        eprintln!("{device:?}: {runs} runs, {} wrong", failures.len());
+        for f in failures.iter().take(8) {
+            eprintln!("FAIL {f}");
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {runs} runs wrong",
+            failures.len()
+        );
+    }
     Ok(())
 }

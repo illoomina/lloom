@@ -257,6 +257,7 @@ fn main() -> Result<()> {
         ple_cache_rows: None,
         mtp: false,
         memory_fraction: Some(args.memory_fraction),
+        kv_precision: None,
     };
     let slots = match args.slots.as_str() {
         "auto" => SlotBudget::Auto {

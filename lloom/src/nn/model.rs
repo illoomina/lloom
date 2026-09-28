@@ -93,6 +93,30 @@ pub trait CausalLM: Model {
         Ok(())
     }
 
+    /// Arm a host fill for the decode steps that follow on `cache`, for a
+    /// loop whose tokens stay on the device: each single-position forward
+    /// then waits on the GPU for rows a producer thread fills from the token
+    /// before it, instead of reading its input id back
+    /// (`nn::ngram_memory::HostFeed`, `expert-streaming.md` §20.13). The
+    /// loop feeds the producer every token it publishes, in order, and calls
+    /// [`Self::host_feed_end`] once the run's GPU work is complete. `None`
+    /// (the default) for a model whose forward needs nothing from the host.
+    fn host_feed(
+        &self,
+        _cache: &mut Self::Cache,
+    ) -> Result<Option<crate::nn::ngram_memory::HostFeed>> {
+        Ok(None)
+    }
+
+    /// The run [`Self::host_feed`] armed has ended: `published` are the
+    /// tokens its producer filled, in order — every token a decode forward
+    /// consumed, and possibly one fed past the last forward. The model
+    /// brings the host-side state those forwards did not update up to date
+    /// and disarms. The default is a no-op.
+    fn host_feed_end(&self, _cache: &mut Self::Cache, _published: &[u32]) -> Result<()> {
+        Ok(())
+    }
+
     fn vocab_size(&self) -> usize;
 }
 

@@ -257,6 +257,8 @@ pub struct Cache {
     /// for the NEXT forward, which consumes the note instead of reading its
     /// input ids back from the device. Cleared by that forward.
     pub pending_noted: bool,
+    /// The PLE's host fill (`CausalLM::host_feed`).
+    host: HostFill,
     /// Decode position (number of tokens seen).
     pub pos: usize,
     /// Retain every forward's pre-final-mixer carry `[1, seq, n·d]` (the
@@ -290,6 +292,25 @@ pub struct Cache {
     /// same pass prepared twice (driver, then `forward`'s chunk loop) reads
     /// the device once.
     prepared: Option<(usize, usize)>,
+}
+
+/// A sequence's PLE host fill: the run in progress, if a decode loop armed
+/// one — a single-position forward with no noted id then waits on the GPU for
+/// rows a producer fills, and `Cache::ngram` stays at the run's first decode
+/// step until `host_feed_end` catches it up — and the staging slots and event
+/// it runs over, kept across runs. A clone of the cache shares neither: two
+/// sequences filling one ring would overwrite each other's rows.
+#[derive(Debug, Default)]
+struct HostFill {
+    run: Option<std::sync::Arc<crate::nn::ngram_memory::FeedLink>>,
+    #[cfg(feature = "metal")]
+    ring: Option<std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>>,
+}
+
+impl Clone for HostFill {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 /// What a speculative window must put back besides the recurrent channels'
@@ -407,6 +428,7 @@ impl Cache {
             ngram: NgramWindow::new(cfg.ple_ngram_size.saturating_sub(1)),
             pending_tokens: std::collections::VecDeque::new(),
             pending_noted: false,
+            host: HostFill::default(),
             pos: 0,
             want_nextn: false,
             nextn: Vec::new(),
@@ -431,6 +453,7 @@ impl Cache {
         self.ngram.reset();
         self.pending_tokens.clear();
         self.pending_noted = false;
+        self.host.run = None;
         self.pos = 0;
         self.nextn.clear();
         self.window = None;
@@ -739,7 +762,8 @@ struct PleWindowMarks {
 pub struct Ple {
     pub layer: usize,
     pub hash: NgramHash,
-    pub table: PleTable,
+    /// Shared with a run's host-fill producer (`CausalLM::host_feed`).
+    pub table: std::sync::Arc<PleTable>,
     pub block: PleLayer,
 }
 
@@ -759,6 +783,9 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     ple: Option<Ple>,
     /// The PLE-window instrument, when armed (`arm_ple_window`).
     ple_window: Option<parking_lot::Mutex<PleWindowMarks>>,
+    /// Whether [`CausalLM::host_feed`] offers the PLE's host fill to a loop
+    /// whose tokens stay on the device (`set_host_fill`).
+    host_fill: bool,
     /// The MTP head, when loaded (`LoadOptions::mtp`); an `MtpDrafter`
     /// borrows it beside `embed_tokens` and `lm_head`.
     mtp: Option<super::mtp::MtpHead<R>>,
@@ -878,6 +905,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             lm_head,
             ple: None,
             ple_window: None,
+            host_fill: true,
             mtp: None,
             prefill_mode: PrefillMode::default(),
             device_plan,
@@ -1203,10 +1231,21 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         self.ple = Some(Ple {
             layer,
             hash,
-            table,
+            table: std::sync::Arc::new(table),
             block,
         });
         Ok(())
+    }
+
+    /// Offer the PLE's host fill to a decode loop whose tokens stay on the
+    /// device (`CausalLM::host_feed`, on by default). Off, such a loop's
+    /// forwards read their input ids back instead: the A/B arm.
+    pub fn set_host_fill(&mut self, on: bool) {
+        self.host_fill = on;
+    }
+
+    pub fn host_fill(&self) -> bool {
+        self.host_fill
     }
 
     /// Arm the PLE-window instrument (`design/docs/expert-streaming.md`
@@ -1256,7 +1295,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 
     /// The N-gram PLE's table, if attached (its read policy and counters).
     pub fn ple_table(&self) -> Option<&PleTable> {
-        self.ple.as_ref().map(|p| &p.table)
+        self.ple.as_ref().map(|p| &*p.table)
     }
 
     /// The N-gram PLE's hash, if attached.
@@ -1272,7 +1311,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// The PLE hot-row cache's `(hits, misses)`, if a cached table is attached.
     pub fn ple_cache_stats(&self) -> Option<(u64, u64)> {
         match &self.ple {
-            Some(p) => match &p.table {
+            Some(p) => match &*p.table {
                 PleTable::Cached(_) => Some(p.table.cache_stats()),
                 _ => None,
             },
@@ -1400,6 +1439,17 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     fn ple_delta(&self, ple: &Ple, res_hc: &Tensor, cache: &mut Cache) -> Result<Tensor> {
         self.ple_window_cut(res_hc)?;
         let seq = res_hc.dim(1)?;
+        if seq == 1 && cache.pending_tokens.is_empty() {
+            if let Some(link) = &cache.host.run {
+                // The host fill: wait on the GPU for the rows a producer
+                // fills from this position's token (`nn::ngram_memory`).
+                let emb = link.encode_read(cache.pos)?;
+                let emb = emb.reshape((1, emb.elem_count()))?;
+                return ple
+                    .block
+                    .forward(res_hc, &emb, &mut cache.ple_conv, ple.layer);
+            }
+        }
         let n_heads = ple.hash.n_heads();
         let mut ids = vec![0i64; seq * n_heads];
         for t in 0..seq {
@@ -2075,6 +2125,9 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
         self.ple_window_entry(seq);
         if cache.pending_noted && cache.pending_tokens.len() == seq {
             cache.pending_noted = false;
+        } else if seq == 1 && cache.host.run.is_some() {
+            // The host fill supplies this position's rows (`host_feed`).
+            cache.set_pending_tokens(&[]);
         } else {
             let ids: Vec<u32> = tokens.flatten_all()?.to_vec1::<u32>()?;
             cache.set_pending_tokens(&ids);
@@ -2086,6 +2139,83 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
     fn note_input_ids(&self, cache: &mut Self::Cache, ids: &[u32]) -> Result<()> {
         cache.set_pending_tokens(ids);
         cache.pending_noted = true;
+        Ok(())
+    }
+
+    /// The PLE's host fill (`expert-streaming.md` §20.13): the rows of each
+    /// decode position are filled by the loop's producer from the token
+    /// before it and waited for on the GPU at the PLE layer. Metal only, and
+    /// only with the PLE attached and `set_host_fill` on.
+    fn host_feed(
+        &self,
+        cache: &mut Self::Cache,
+    ) -> Result<Option<crate::nn::ngram_memory::HostFeed>> {
+        #[cfg(feature = "metal")]
+        {
+            use crate::nn::ngram_memory::{FeedLink, HostFeed, HOST_FILL_SLOTS};
+            use lloom_tensor::metal_backend::HostFedRing;
+            use std::sync::Arc;
+            let Some(ple) = self.ple.as_ref().filter(|_| self.host_fill) else {
+                return Ok(None);
+            };
+            let lloom_tensor::Device::Metal(m) = ple.block.device() else {
+                return Ok(None);
+            };
+            let len = ple.hash.n_heads() * ple.table.head_dim()?;
+            let ring = match &cache.host.ring {
+                Some(r) if r.len() == len => Arc::clone(r),
+                _ => {
+                    let r = Arc::new(HostFedRing::new(m, HOST_FILL_SLOTS, len)?);
+                    cache.host.ring = Some(Arc::clone(&r));
+                    r
+                }
+            };
+            let link = Arc::new(FeedLink::new(ring, cache.pos));
+            cache.host.run = Some(Arc::clone(&link));
+            Ok(Some(HostFeed::new(
+                link,
+                Arc::clone(&ple.table),
+                ple.hash.clone(),
+                cache.ngram.clone(),
+            )))
+        }
+        #[cfg(not(feature = "metal"))]
+        {
+            let _ = cache;
+            Ok(None)
+        }
+    }
+
+    /// Disarm the host fill and catch the n-gram window up: every fed
+    /// forward consumed its token without pushing it, so the window (and a
+    /// standing window's snapshot of it) still reads the run's first decode
+    /// step.
+    fn host_feed_end(&self, cache: &mut Self::Cache, published: &[u32]) -> Result<()> {
+        let Some(link) = cache.host.run.take() else {
+            return Ok(());
+        };
+        let fed = cache.pos.saturating_sub(link.pos0());
+        if published.len() < fed && !link.released() {
+            lloom_tensor::bail!(
+                "qwen4exp host feed: {} tokens filled for {fed} fed forwards",
+                published.len()
+            )
+        }
+        let consumed = &published[..fed.min(published.len())];
+        let start = cache.ngram.clone();
+        let after = |n: usize| {
+            let mut w = start.clone();
+            for &t in &consumed[..n.min(consumed.len())] {
+                w.push(Some(t));
+            }
+            w
+        };
+        // A window a fed forward opened snapshots the window it started from;
+        // one opened before the run already holds the right one.
+        if let Some(w) = cache.window.as_mut().filter(|w| w.pos >= link.pos0()) {
+            w.ngram = after(w.pos - link.pos0());
+        }
+        cache.ngram = after(fed);
         Ok(())
     }
 

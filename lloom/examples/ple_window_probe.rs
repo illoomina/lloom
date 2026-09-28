@@ -18,7 +18,8 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use lloom::generation::{Blocking, LogitsProcessor, Sampling};
+use lloom::generation::poll::PollMechanism;
+use lloom::generation::{Blocking, CommitBudget, EosRead, LogitsProcessor, Ring, Sampling};
 use lloom::models::qwen4exp::loader::{LoadOptions, SlotBudget, StreamLoader, StreamOptions};
 use lloom::models::qwen4exp::NgramWindow;
 use lloom::models::qwen4exp::{prefill_chunk, prefill_pair_on, prefill_tiles, Qwen4Exp, Streamed};
@@ -80,6 +81,15 @@ struct Args {
     /// Print one `STEP` line per decode step.
     #[arg(long)]
     per_step: bool,
+    /// The driver's readback arm: `blocking` (the id read back per step),
+    /// `ring-fixed` (the device-resident token polled, lookahead 1, a commit
+    /// every 8 steps) or `ring` (the same under the adaptive commit).
+    #[arg(long, default_value = "blocking")]
+    readback: String,
+    /// The PLE's host fill on a ring arm (§20.13 option A): `false` reads
+    /// each decode step's input id back instead.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    host_fill: bool,
 }
 
 fn hf_snapshot(repo_dir: &str) -> Option<PathBuf> {
@@ -266,6 +276,13 @@ fn main() -> Result<()> {
     let mut model: Qwen4Exp<Streamed> =
         Qwen4Exp::from_gguf_streamed(&shards(&gguf), &device, &opts, &stream)?;
     model.set_memory_fraction(args.memory_fraction);
+    model.set_host_fill(args.host_fill);
+    let (lookahead, adaptive) = match args.readback.as_str() {
+        "blocking" => (0, false),
+        "ring-fixed" => (1, false),
+        "ring" => (1, true),
+        other => anyhow::bail!("--readback {other}: blocking | ring-fixed | ring"),
+    };
     if !args.unarmed {
         model.arm_ple_window();
     }
@@ -287,12 +304,14 @@ fn main() -> Result<()> {
         None
     };
     println!(
-        "LOADED slots={} ple={} armed={} prompt_tokens={} ple_read={policy:?} evict_ple={}",
+        "LOADED slots={} ple={} armed={} prompt_tokens={} ple_read={policy:?} evict_ple={} readback={} host_fill={}",
         model.slots_per_layer(),
         model.has_ple(),
         !args.unarmed,
         prompt_ids.len(),
-        args.evict_ple
+        args.evict_ple,
+        args.readback,
+        lookahead > 0 && args.host_fill
     );
 
     // The harness's tile rule (`qwen4exp-chat` `driver_gate`).
@@ -312,22 +331,45 @@ fn main() -> Result<()> {
         let cache = model.new_cache(&cfg, &device)?;
         let mut session = Session::new(&model, cache);
         let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
-        let mut rb = Blocking::new(&eos_ids, &device)?;
         let mut spec = IdentityProposer;
-        let dopts = DecodeOptions {
+        let mut dopts = DecodeOptions {
             prefill_tile: tile,
             ..DecodeOptions::new(args.max_tokens)
         };
+        if lookahead > 0 {
+            dopts.lookahead = lookahead;
+            dopts.budget = CommitBudget::steps(8)?;
+            dopts.adaptive_commit = adaptive;
+            dopts.stream_via_reader = adaptive;
+        }
         profile::reset();
         let t = std::time::Instant::now();
-        let out = session.decode(
-            &mut spec,
-            &mut rb,
-            &mut sampler,
-            &prompt_ids,
-            &dopts,
-            &mut |_| Ok(()),
-        )?;
+        let out = if lookahead == 0 {
+            let mut rb = Blocking::new(&eos_ids, &device)?;
+            session.decode(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                &prompt_ids,
+                &dopts,
+                &mut |_| Ok(()),
+            )?
+        } else {
+            let mut rb = Ring::new(
+                &eos_ids,
+                &device,
+                0,
+                EosRead::Poll(PollMechanism::default()),
+            )?;
+            session.decode(
+                &mut spec,
+                &mut rb,
+                &mut sampler,
+                &prompt_ids,
+                &dopts,
+                &mut |_| Ok(()),
+            )?
+        };
         let wall_ms = t.elapsed().as_secs_f64() * 1e3;
         let prefill_ms = out.stats.prefill_ns as f64 / 1e6;
         let mut h = sha256::Sha256::new();
@@ -346,13 +388,23 @@ fn main() -> Result<()> {
         let decode_ms = (wall_ms - prefill_ms).max(0.0);
         let (mapped1, pooled1) = table.read_counters();
         println!(
-            "RESULT run={run} tokens_sha256={digest} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} ms_per_token={:.3} ple_rows_mapped={} ple_rows_pooled={}",
+            "RESULT run={run} tokens_sha256={digest} generated={} hit_eos={} prefill_ms={prefill_ms:.0} decode_ms={decode_ms:.0} ms_per_token={:.3} ple_rows_mapped={} ple_rows_pooled={} readback={} host_fill_forwards={} host_fill_fills={} overrun={}",
             out.ids.len(),
             out.eos,
             decode_ms / out.ids.len().max(1) as f64,
             mapped1 - mapped0,
             pooled1 - pooled0,
+            args.readback,
+            out.stats.host_feed.as_ref().map_or(0, |f| f.forwards),
+            out.stats.host_feed.as_ref().map_or(0, |f| f.fills),
+            out.stats.overrun,
         );
+        if let Some(f) = &out.stats.host_feed {
+            if !f.fill_ns.is_empty() {
+                let mut v: Vec<f64> = f.fill_ns.iter().map(|&n| n as f64 / 1e6).collect();
+                println!("HOSTFILL run={run} {}", dist(&mut v));
+            }
+        }
         last_stream = prompt_ids.iter().chain(&out.ids).copied().collect();
         if args.unarmed {
             continue;

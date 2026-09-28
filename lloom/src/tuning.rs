@@ -169,6 +169,9 @@ pub struct StreamTuning {
     /// Score the residual-speculation hint against the real routing — an instrument (extra router runs and readbacks).
     #[opt(flag = "hint-recall", env = "QWEN4EXP_HINT_RECALL", bool)]
     pub hint_recall: bool,
+    /// Slots each streamed layer keeps free: a miss lands in one, an eviction is quarantined until its readers complete (0 = land in the victim's slot in place, the A/B arm).
+    #[opt(flag = "spare-slots", env = "QWEN4EXP_SPARE_SLOTS")]
+    pub spare_slots: usize,
     /// A token's settle submits every layer's loads before waiting for any (off = one layer after another, the A/B arm).
     #[opt(flag = "settle-batch", env = "QWEN4EXP_SETTLE_BATCH", bool)]
     pub settle_batch: bool,
@@ -188,6 +191,7 @@ impl Default for StreamTuning {
             plan: "device".into(),
             decode_hint: false,
             hint_recall: false,
+            spare_slots: 2,
             settle_batch: true,
             trace_settle: false,
         }

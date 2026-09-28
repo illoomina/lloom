@@ -1964,11 +1964,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             parts.push((self.layers[*l].moe().experts(), slice));
             at += n;
         }
-        let loads = R::settle_batch(&parts)?;
+        let settled = R::settle_batch(&parts)?;
         let mut redo = false;
         let mut after_first = 0u64;
-        for n in loads {
-            if n > 0 {
+        for (missed, n) in settled {
+            if missed {
                 if redo {
                     after_first += n;
                 }

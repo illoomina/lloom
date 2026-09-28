@@ -1088,7 +1088,7 @@ fn stream_line<R: ExpertResidency + HasStreamStats>(
 ) {
     let s = model.stream_stats();
     println!(
-        "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0} settle_loads={} settle_ms={:.0} settle_clock_lag={} settle_after_first={} replay_ms={:.0} host_pass_ms={:.0}",
+        "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0} settle_loads={} settle_ms={:.0} settle_clock_lag={} settle_after_first={} replay_ms={:.0} host_pass_ms={:.0} free_takes={} inplace_takes={} quarantined={} recycled={}",
         args.loader,
         model.slots_per_layer(),
         s.plans,
@@ -1119,6 +1119,10 @@ fn stream_line<R: ExpertResidency + HasStreamStats>(
         cache.settle_after_first,
         cache.replay_ns as f64 / 1e6,
         cache.host_pass_ns as f64 / 1e6,
+        s.free_takes,
+        s.inplace_takes,
+        s.quarantined,
+        s.recycled,
     );
 }
 
@@ -1192,8 +1196,14 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         let trace_on = trace_requested();
         let mut produced = 0usize;
         let mut traced: Vec<(usize, TraceStep)> = Vec::new();
+        // The tier's counters when the first token is out: what the prompt's
+        // prefill loaded, so the decode's share is the difference.
+        let mut pre: Option<lloom::nn::expert_stream::StreamStats> = None;
         let t1 = std::time::Instant::now();
         let mut on_tokens = |toks: &[u32]| -> candle::Result<()> {
+            if pre.is_none() {
+                pre = Some(model.stream_stats());
+            }
             if trace_on {
                 let before = produced;
                 produced += toks.len();
@@ -1285,6 +1295,20 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         let s = model.stream_stats();
         if s.plans + s.device_plans > 0 {
             prefetch_line(run, model, args);
+            if let Some(p) = pre {
+                println!(
+                    "STREAMPRE run={run} misses={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} settle_loads={} settle_ms={:.0} direct_loads={} direct_wait_ms={:.0}",
+                    p.misses,
+                    p.readback_ns as f64 / 1e6,
+                    p.load_now_ns as f64 / 1e6,
+                    p.land_ns as f64 / 1e6,
+                    p.sync_load_ns as f64 / 1e6,
+                    p.settle_loads,
+                    p.settle_ns as f64 / 1e6,
+                    p.direct_loads,
+                    p.direct_wait_ns as f64 / 1e6,
+                );
+            }
             stream_line(run, model, args, session.sequence().cache());
         }
         greedy_digest = Some(digest);

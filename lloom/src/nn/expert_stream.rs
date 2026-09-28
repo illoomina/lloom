@@ -125,11 +125,11 @@ pub trait ExpertResidency {
     }
 
     /// [`Self::settle_host`] over several layers' records at once, in layer
-    /// order: each part's experts loaded, the count per part (0: the part's
-    /// pass found everything resident). A strategy may begin every part's
-    /// loads before finishing any, so a token's misses read together
+    /// order: per part, whether its pass computed on a missing expert (a
+    /// replay) and how many experts were loaded. A strategy may begin every
+    /// part's loads before finishing any, so a token's misses read together
     /// (`Streamed`); the default settles one part after another.
-    fn settle_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<u64>>
+    fn settle_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<(bool, u64)>>
     where
         Self: Sized,
     {
@@ -137,11 +137,8 @@ pub trait ExpertResidency {
             .iter()
             .map(|(r, v)| {
                 let before = r.misses_so_far();
-                Ok(if r.settle_host(v)? {
-                    r.misses_so_far() - before
-                } else {
-                    0
-                })
+                let redo = r.settle_host(v)?;
+                Ok((redo, r.misses_so_far() - before))
             })
             .collect()
     }
@@ -407,6 +404,16 @@ impl LoaderArm {
 /// Expert id → slot, slot → expert, an LRU tick per slot and pin flags. The
 /// query is one indexed load; the victim search is over the (small) slot
 /// count and runs only on a miss.
+///
+/// Two arms for where a miss lands. **In place** (`spare == 0`): the LRU
+/// victim's slot, written by a copy the encoder orders after the slot's
+/// earlier readers. **Quarantined** (`spare > 0`): a FREE slot — one whose
+/// last reader has completed — while `spare` slots are kept free by evicting
+/// the LRU expert into an epoch quarantine (`kv_pages::EpochQuarantine`,
+/// the KV pool's liveness rule), recycled once the pool clock shows its
+/// epoch complete. A slot is then never written while anything may read
+/// it, whatever the landing path, which is what a load that runs beside the
+/// pass needs (§20.4a).
 #[derive(Debug, Clone)]
 pub struct ResidencyMap {
     slot_of: Vec<u32>,
@@ -432,6 +439,18 @@ pub struct ResidencyMap {
     /// instead of a stamp per slot.
     plan_epoch: u64,
     tick: u64,
+    /// Slots the quarantined arm keeps free (0: the in-place arm).
+    spare: usize,
+    /// Slots holding nothing whose last reader has completed.
+    free: Vec<u32>,
+    /// Slots evicted and not yet safe to write, with the epoch they outlive.
+    quarantine: lloom_tensor::kv_pages::EpochQuarantine<u32>,
+    /// Slots evicted while a device plan was open: that plan's readers are
+    /// not all encoded yet, so the epoch they must outlive is known only
+    /// once it settles (`release_deferred`).
+    deferred: Vec<u32>,
+    /// Scratch for a recycle.
+    recycled: Vec<u32>,
 }
 
 const NONE: u32 = u32::MAX;
@@ -448,7 +467,112 @@ impl ResidencyMap {
             last_epoch: vec![0; n_slots],
             plan_epoch: 0,
             tick: 0,
+            spare: 0,
+            free: Vec::new(),
+            quarantine: lloom_tensor::kv_pages::EpochQuarantine::new(),
+            deferred: Vec::new(),
+            recycled: Vec::new(),
         }
+    }
+
+    /// Select the arm: `spare` slots kept free (0: in place). Only on an
+    /// empty map (a pool that has loaded nothing).
+    pub fn set_spare(&mut self, spare: usize) {
+        assert!(
+            self.expert_in.iter().all(|&e| e == NONE),
+            "set_spare on a map that already holds experts"
+        );
+        self.spare = spare.min(self.n_slots().saturating_sub(1));
+        self.free.clear();
+        if self.spare > 0 {
+            // Descending, so the pops fill slot 0, 1, 2, … — the order the
+            // in-place arm fills an empty pool in.
+            self.free.extend((0..self.n_slots() as u32).rev());
+        }
+    }
+
+    /// Whether misses land in free slots (the quarantined arm).
+    pub fn quarantined(&self) -> bool {
+        self.spare > 0
+    }
+
+    /// Slots the quarantined arm keeps free (0: the in-place arm).
+    pub fn spare(&self) -> usize {
+        self.spare
+    }
+
+    /// Slots evicted and not yet reusable (quarantined or deferred).
+    pub fn held(&self) -> usize {
+        self.quarantine.held() + self.deferred.len()
+    }
+
+    /// Move every quarantined slot whose epoch has completed to the free
+    /// list; how many.
+    fn recycle(&mut self, completed: u64) -> usize {
+        self.quarantine
+            .drain_completed_into(completed, &mut self.recycled);
+        let n = self.recycled.len();
+        self.free.extend(self.recycled.drain(..));
+        n
+    }
+
+    /// A free slot, if any.
+    fn take_free(&mut self) -> Option<usize> {
+        self.free.pop().map(|s| s as usize)
+    }
+
+    /// The least-recently-used RESIDENT unpinned slot not used in `tick` and
+    /// not in flight.
+    fn lru_resident(&self, tick: u64) -> Option<usize> {
+        let mut best: Option<(usize, u64)> = None;
+        for s in 0..self.expert_in.len() {
+            if self.expert_in[s] == NONE
+                || self.pinned[s]
+                || self.last_use[s] == tick
+                || self.inflight[s] != 0
+            {
+                continue;
+            }
+            match best {
+                Some((_, t)) if t <= self.last_use[s] => {}
+                _ => best = Some((s, self.last_use[s])),
+            }
+        }
+        best.map(|(s, _)| s)
+    }
+
+    /// Evict the LRU expert (not used in `tick`) out of the map. Its slot
+    /// is quarantined at `epoch` — every reader encoded so far is in an
+    /// epoch at most `epoch` — or deferred while a device plan is open.
+    /// Returns the expert evicted.
+    fn evict_lru(&mut self, tick: u64, epoch: u64, plan_open: bool) -> Option<u32> {
+        let s = self.lru_resident(tick)?;
+        let e = self.uninstall(s);
+        if plan_open {
+            self.deferred.push(s as u32);
+        } else {
+            self.quarantine.quarantine_one(epoch, s as u32);
+        }
+        Some(e)
+    }
+
+    /// The device plans are settled: every reader of a slot evicted while
+    /// one was open is encoded now, in an epoch at most `epoch`.
+    fn release_deferred(&mut self, epoch: u64) {
+        for s in self.deferred.drain(..) {
+            self.quarantine.quarantine_one(epoch, s);
+        }
+    }
+
+    /// Empty slot `slot`, returning the expert it held.
+    fn uninstall(&mut self, slot: usize) -> u32 {
+        let old = self.expert_in[slot];
+        if old != NONE {
+            self.slot_of[old as usize] = NONE;
+        }
+        self.expert_in[slot] = NONE;
+        self.inflight[slot] = 0;
+        old
     }
 
     pub fn n_slots(&self) -> usize {
@@ -576,8 +700,13 @@ impl ResidencyMap {
         self.pinned.iter().filter(|&&p| p).count()
     }
 
-    /// Slots holding no expert.
+    /// Slots a load can take without evicting: holding no expert (the
+    /// in-place arm), or free with its last reader complete (the
+    /// quarantined arm — an evicted slot still quarantined is not).
     pub fn free_slots(&self) -> usize {
+        if self.quarantined() {
+            return self.free.len();
+        }
         self.expert_in.iter().filter(|&&e| e == NONE).count()
     }
 }
@@ -627,6 +756,13 @@ pub struct StreamCounters {
     /// Settles that loaded while the pool clock still showed a committed
     /// command buffer incomplete (its completion handler not yet run).
     pub settle_clock_lag: AtomicU64,
+    /// The quarantined arm: misses landed in a free slot, and in a
+    /// victim's slot in place because none was free; evictions quarantined,
+    /// and slots recycled from the quarantine.
+    pub free_takes: AtomicU64,
+    pub inplace_takes: AtomicU64,
+    pub quarantined: AtomicU64,
+    pub recycled: AtomicU64,
 }
 
 /// A staging ring's counters (the `pread` arm on Metal; zeros elsewhere).
@@ -668,6 +804,10 @@ pub struct StreamStats {
     pub settle_loads: u64,
     pub settle_ns: u64,
     pub settle_clock_lag: u64,
+    pub free_takes: u64,
+    pub inplace_takes: u64,
+    pub quarantined: u64,
+    pub recycled: u64,
 }
 
 impl StreamCounters {
@@ -695,6 +835,10 @@ impl StreamCounters {
             settle_loads: self.settle_loads.load(Ordering::Relaxed),
             settle_ns: self.settle_ns.load(Ordering::Relaxed),
             settle_clock_lag: self.settle_clock_lag.load(Ordering::Relaxed),
+            free_takes: self.free_takes.load(Ordering::Relaxed),
+            inplace_takes: self.inplace_takes.load(Ordering::Relaxed),
+            quarantined: self.quarantined.load(Ordering::Relaxed),
+            recycled: self.recycled.load(Ordering::Relaxed),
         }
     }
 }
@@ -717,6 +861,10 @@ impl std::ops::AddAssign for StreamStats {
         self.settle_loads += o.settle_loads;
         self.settle_ns += o.settle_ns;
         self.settle_clock_lag += o.settle_clock_lag;
+        self.free_takes += o.free_takes;
+        self.inplace_takes += o.inplace_takes;
+        self.quarantined += o.quarantined;
+        self.recycled += o.recycled;
         self.plans += o.plans;
         self.groups += o.groups;
         self.hits += o.hits;
@@ -830,6 +978,92 @@ struct Inner {
     /// allocates nothing once they have grown.
     scratch_ids: Vec<u32>,
     scratch_missing: Vec<u32>,
+    /// Device plans encoded and not yet settled. While one is open its pass
+    /// may still map any resident slot, so no resident slot may be written
+    /// and an eviction's quarantine waits for the settle.
+    plans_open: u32,
+    /// The residency table the device plan reads, in place (Metal, the
+    /// quarantined arm on `pread`): an entry is written when its expert's
+    /// bytes are ordered before every reader that can see it. `None`: the
+    /// table is rebuilt from the map after a change (`table`).
+    live: Option<LiveTable>,
+    /// Entries whose bytes land by a copy encoded while a device plan was
+    /// open: stored once the copy's epoch is complete.
+    landing: lloom_tensor::kv_pages::EpochQuarantine<(u32, u32)>,
+    landed_scratch: Vec<(u32, u32)>,
+}
+
+/// The residency table in a persistent Shared buffer, written by the host
+/// in place (`expert → slot`, `NONE` = absent).
+struct LiveTable {
+    tensor: Tensor,
+    #[cfg(feature = "metal")]
+    buf: Arc<lloom_tensor::kernels::metal::PooledBuffer>,
+    n: usize,
+}
+
+impl LiveTable {
+    #[cfg(feature = "metal")]
+    fn new(device: &lloom_tensor::MetalDevice, n: usize) -> Result<Self> {
+        let buf = device.new_persistent_shared(n * std::mem::size_of::<u32>())?;
+        if buf.contents().is_null() {
+            lloom_tensor::bail!("the live residency table has no CPU mapping")
+        }
+        let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
+            Arc::clone(&buf),
+            device.clone(),
+            n,
+            lloom_tensor::DType::U32,
+        ));
+        let tensor = Tensor::from_storage(storage, n, lloom_tensor::op::BackpropOp::none(), false);
+        let t = Self { tensor, buf, n };
+        for e in 0..n {
+            t.store(e, NONE);
+        }
+        Ok(t)
+    }
+
+    /// `table[e] = v`.
+    #[cfg(feature = "metal")]
+    fn store(&self, e: usize, v: u32) {
+        assert!(e < self.n, "live table: expert {e} out of {}", self.n);
+        // SAFETY: a CPU-mapped Shared buffer of `n` u32 (checked at `new`),
+        // `e < n`. Nothing on the device writes it; a kernel reading the word
+        // sees the old value or the new one (an aligned u32 store).
+        unsafe { (self.buf.contents() as *mut u32).add(e).write_volatile(v) }
+    }
+
+    #[cfg(not(feature = "metal"))]
+    fn store(&self, _e: usize, _v: u32) {}
+}
+
+impl Inner {
+    /// Store the landed entries whose copies' epochs have completed (and
+    /// whose expert is still in that slot).
+    fn store_landed(&mut self) {
+        if self.landing.is_empty() {
+            return;
+        }
+        let done = self.completed_epochs();
+        let mut ready = std::mem::take(&mut self.landed_scratch);
+        self.landing.drain_completed_into(done, &mut ready);
+        for &(e, slot) in &ready {
+            if self.map.slot_of(e as usize) == Some(slot as usize) {
+                self.table_set(e, slot);
+            }
+        }
+        ready.clear();
+        self.landed_scratch = ready;
+    }
+
+    /// Record `e → slot` in the device's table: in place when a table is
+    /// live, else by marking it for a rebuild.
+    fn table_set(&mut self, e: u32, slot: u32) {
+        match &self.live {
+            Some(t) => t.store(e as usize, slot),
+            None => self.table_stale = true,
+        }
+    }
 }
 
 /// A resolve between its halves (`Streamed::resolve_begin` →
@@ -838,6 +1072,11 @@ struct Pending {
     slots: Vec<usize>,
     /// Misses read synchronously at the finish.
     misses: Vec<(usize, usize)>,
+    /// Every `(expert, slot)` installed, and the experts whose bytes the
+    /// reader threads write straight into their slots: the device table
+    /// learns each once its bytes are ordered before any reader of it.
+    installed: Vec<(u32, u32)>,
+    direct_landed: Vec<u32>,
     #[cfg(feature = "metal")]
     landed: Vec<(usize, usize, crate::nn::expert_prefetch::Staged)>,
     #[cfg(feature = "metal")]
@@ -930,8 +1169,32 @@ impl Streamed {
         >,
         #[cfg(not(feature = "metal"))] staging: Option<()>,
     ) -> Result<Self> {
+        #[cfg(feature = "metal")]
+        let direct = pread_direct_on();
         #[cfg(not(feature = "metal"))]
-        let _ = staging;
+        let direct = false;
+        Self::with_staging_direct(gate, up, down, n_slots, loader, device, staging, direct)
+    }
+
+    /// [`Self::with_staging`] with the direct read chosen here rather than
+    /// by `LLOOM_PREAD_DIRECT` (Shared slot pools a miss is read straight
+    /// into, on Metal's `pread` arm).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_staging_direct(
+        gate: ExpertSource,
+        up: ExpertSource,
+        down: ExpertSource,
+        n_slots: usize,
+        loader: LoaderArm,
+        device: &Device,
+        #[cfg(feature = "metal")] staging: Option<
+            lloom_tensor::kernels::metal::staging::SharedStagingRing,
+        >,
+        #[cfg(not(feature = "metal"))] staging: Option<()>,
+        direct: bool,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "metal"))]
+        let _ = (staging, direct);
         let n_experts = gate.n_experts();
         if up.n_experts() != n_experts || down.n_experts() != n_experts {
             lloom_tensor::bail!(
@@ -955,9 +1218,8 @@ impl Streamed {
         // Persistent storage of known geometry: never a pool bucket. Shared
         // under the direct read (the CPU writes a miss into its slot).
         #[cfg(feature = "metal")]
-        let direct = matches!(loader, LoaderArm::Pread)
-            && matches!(device, Device::Metal(_))
-            && pread_direct_on();
+        let direct =
+            direct && matches!(loader, LoaderArm::Pread) && matches!(device, Device::Metal(_));
         #[cfg(not(feature = "metal"))]
         let direct = false;
         let pool = |s: &ExpertSource| -> Result<SlotPool> {
@@ -973,11 +1235,18 @@ impl Streamed {
             Device::Metal(d) => Some(d.gpu_clock()),
             _ => None,
         };
+        // Every slot was last written by the pools' zeroing, encoded just
+        // now: a direct read (the CPU writing a slot outside the command
+        // stream) must wait for it like for any other writer, or the blit
+        // still pending would zero what the read landed.
+        let mut map = ResidencyMap::new(n_experts, n_slots);
+        #[cfg(feature = "metal")]
+        map.plan_read_all(clock.as_ref().map_or(0, |c| c.current_epoch()));
         Ok(Self {
             inner: parking_lot::Mutex::new(Inner {
                 pools,
                 sources,
-                map: ResidencyMap::new(n_experts, n_slots),
+                map,
                 loader,
                 device: device.clone(),
                 #[cfg(feature = "metal")]
@@ -991,6 +1260,10 @@ impl Streamed {
                 direct,
                 scratch_ids: Vec::new(),
                 scratch_missing: Vec::new(),
+                plans_open: 0,
+                live: None,
+                landing: lloom_tensor::kv_pages::EpochQuarantine::new(),
+                landed_scratch: Vec::new(),
             }),
             counters: StreamCounters::default(),
             n_experts,
@@ -1001,6 +1274,47 @@ impl Streamed {
             io_hints: false,
             key: NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
+        .and_then(|mut t| {
+            t.set_spare_slots(default_spare_slots())?;
+            Ok(t)
+        })
+    }
+
+    /// Keep `k` slots free (the quarantined arm: a miss lands in a free
+    /// slot, an eviction is quarantined until its readers complete); 0 is
+    /// the in-place arm. A live device table comes with the quarantined arm
+    /// on Metal's `pread` loader. Only on a pool that has loaded nothing.
+    pub fn set_spare_slots(&mut self, k: usize) -> Result<()> {
+        let inner = self.inner.get_mut();
+        if inner.map.expert_in.iter().any(|&e| e != NONE) {
+            lloom_tensor::bail!("set_spare_slots on a pool that already holds experts")
+        }
+        inner.map.set_spare(k);
+        inner.live = None;
+        #[cfg(feature = "metal")]
+        if inner.map.quarantined() && matches!(inner.loader, LoaderArm::Pread) {
+            if let Device::Metal(d) = &inner.device {
+                inner.live = Some(LiveTable::new(d, self.n_experts)?);
+            }
+        }
+        inner.table = None;
+        inner.table_stale = true;
+        Ok(())
+    }
+
+    /// Slots kept free (0: the in-place arm).
+    pub fn spare_slots(&self) -> usize {
+        self.inner.lock().map.spare()
+    }
+
+    /// Slots evicted and not yet reusable.
+    pub fn held_slots(&self) -> usize {
+        self.inner.lock().map.held()
+    }
+
+    /// Whether the device plan reads a table written in place.
+    pub fn live_table(&self) -> bool {
+        self.inner.lock().live.is_some()
     }
 
     /// Attach the tier's prefetcher (the `pread` arm on Metal; a loader
@@ -1139,7 +1453,8 @@ impl Streamed {
         let tick = inner.map.begin();
         // Loaded as one group (one staging pass); a warm is not a use.
         let before: Vec<u32> = inner.map.usage.clone();
-        self.resolve(&mut inner, &take, tick)?;
+        let pending = self.resolve_begin(&mut inner, &take, tick, false)?;
+        self.resolve_finish(&mut inner, pending)?;
         inner.map.usage = before;
         // The `io` arm: no more than two layers' warms pending on the queue
         // (their bytes are held on the device while they wait).
@@ -1179,7 +1494,7 @@ impl Streamed {
     /// Make every expert of `experts` resident within epoch `tick`, loading
     /// the misses; returns each one's slot.
     fn resolve(&self, inner: &mut Inner, experts: &[u32], tick: u64) -> Result<Vec<usize>> {
-        let pending = self.resolve_begin(inner, experts, tick)?;
+        let pending = self.resolve_begin(inner, experts, tick, true)?;
         self.resolve_finish(inner, pending)
     }
 
@@ -1189,7 +1504,16 @@ impl Streamed {
     /// waits for them and lands them; between the two another layer's
     /// reads can be submitted, so a token's misses read together
     /// (`settle_batch`).
-    fn resolve_begin(&self, inner: &mut Inner, experts: &[u32], tick: u64) -> Result<Pending> {
+    /// On the quarantined arm a miss takes a free slot, and `replenish`
+    /// then evicts LRU experts into the quarantine until `spare` slots are
+    /// free or held again (a warm, which evicts nothing, does not).
+    fn resolve_begin(
+        &self,
+        inner: &mut Inner,
+        experts: &[u32],
+        tick: u64,
+        replenish: bool,
+    ) -> Result<Pending> {
         let mut slots = Vec::with_capacity(experts.len());
         let mut misses: Vec<(usize, usize)> = Vec::new();
         // What the prefetcher staged for this layer: a miss with a staged
@@ -1222,6 +1546,15 @@ impl Streamed {
         // Under the direct read, a victim whose last reader has completed
         // costs the reader thread no wait: prefer those.
         let settled_before = inner.completed_epochs();
+        if inner.map.quarantined() {
+            let n = inner.map.recycle(settled_before);
+            self.counters
+                .recycled
+                .fetch_add(n as u64, Ordering::Relaxed);
+        }
+        // Every expert installed here, for the table once its bytes are
+        // ordered before its readers.
+        let mut installed: Vec<(u32, u32)> = Vec::new();
         #[cfg(feature = "metal")]
         if inner.map.inflight_count() > 0 {
             if let LoaderArm::Io(q) = &inner.loader {
@@ -1252,15 +1585,57 @@ impl Streamed {
                     s
                 }
                 None => {
-                    let (s, evicted) = match inner.map.victim_settled(tick, settled_before) {
-                        Some(v) => v,
-                        None => lloom_tensor::bail!(
-                            "the slot pool ({} slots, {} pinned) cannot hold this group's {} experts",
-                            self.n_slots,
-                            inner.map.pinned_count(),
-                            experts.len()
-                        ),
+                    let free = if inner.map.quarantined() {
+                        inner.map.take_free()
+                    } else {
+                        None
                     };
+                    let (s, evicted) = match free {
+                        Some(s) => {
+                            self.counters.free_takes.fetch_add(1, Ordering::Relaxed);
+                            (s, false)
+                        }
+                        // A resident slot is written only while no device
+                        // plan is open: an open plan's pass may map any.
+                        None if inner.map.quarantined() && inner.plans_open > 0 => {
+                            lloom_tensor::bail!(
+                                "no free slot of {} ({} held) for a load while a device plan is open",
+                                self.n_slots,
+                                inner.map.held()
+                            )
+                        }
+                        // No free slot, no plan open: a RESIDENT victim in
+                        // place (an empty slot here is quarantined — its
+                        // readers may not have run).
+                        None if inner.map.quarantined() => match inner.map.lru_resident(tick) {
+                            Some(s) => {
+                                self.counters.inplace_takes.fetch_add(1, Ordering::Relaxed);
+                                (s, true)
+                            }
+                            None => lloom_tensor::bail!(
+                                "the slot pool ({} slots, {} pinned, {} held) cannot hold this group's {} experts",
+                                self.n_slots,
+                                inner.map.pinned_count(),
+                                inner.map.held(),
+                                experts.len()
+                            ),
+                        },
+                        None => match inner.map.victim_settled(tick, settled_before) {
+                            Some(v) => v,
+                            None => lloom_tensor::bail!(
+                                "the slot pool ({} slots, {} pinned) cannot hold this group's {} experts",
+                                self.n_slots,
+                                inner.map.pinned_count(),
+                                experts.len()
+                            ),
+                        },
+                    };
+                    if evicted {
+                        // The victim's entry goes before its slot is written.
+                        let old = inner.map.expert_in[s];
+                        inner.table_set(old, NONE);
+                    }
+                    installed.push((e as u32, s as u32));
                     if inner.map.inflight[s] != 0 {
                         self.counters
                             .io_inflight_wasted
@@ -1285,10 +1660,24 @@ impl Streamed {
             inner.map.touch(slot, tick);
             slots.push(slot);
         }
+        if replenish && inner.map.quarantined() && !installed.is_empty() {
+            let epoch = inner.current_epoch();
+            let open = inner.plans_open > 0;
+            while inner.map.free.len() + inner.map.held() < inner.map.spare() {
+                let Some(old) = inner.map.evict_lru(tick, epoch, open) else {
+                    break;
+                };
+                inner.table_set(old, NONE);
+                self.counters.evictions.fetch_add(1, Ordering::Relaxed);
+                self.counters.quarantined.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         #[cfg(feature = "metal")]
         let mut pending = Pending {
             slots,
             misses: Vec::new(),
+            installed,
+            direct_landed: Vec::new(),
             landed,
             wait_value,
             direct: None,
@@ -1298,6 +1687,8 @@ impl Streamed {
         let pending = Pending {
             slots,
             misses: Vec::new(),
+            installed,
+            direct_landed: Vec::new(),
         };
         #[cfg(feature = "metal")]
         {
@@ -1351,6 +1742,9 @@ impl Streamed {
                         });
                     }
                     let n_direct = jobs.len();
+                    pending
+                        .direct_landed
+                        .extend(now.iter().map(|&(e, _)| e as u32));
                     let ticket = p.submit_direct(self.key, jobs);
                     self.counters
                         .bytes_loaded
@@ -1392,13 +1786,20 @@ impl Streamed {
         let Pending {
             slots,
             mut misses,
+            installed,
+            direct_landed,
             mut landed,
             wait_value,
             direct,
             now,
         } = pending;
         #[cfg(not(feature = "metal"))]
-        let Pending { slots, misses } = pending;
+        let Pending {
+            slots,
+            misses,
+            installed,
+            direct_landed,
+        } = pending;
         #[cfg(feature = "metal")]
         {
             if let (Some(p), Some((ticket, n_direct, submit))) = (&self.prefetch, direct) {
@@ -1458,7 +1859,29 @@ impl Streamed {
             // path installed: a host plan, a settle, a pin).
             inner.table_stale = true;
         }
+        self.publish(inner, &installed, &direct_landed);
         Ok(slots)
+    }
+
+    /// Tell the device table about experts just installed. A table rebuilt
+    /// from the map is marked stale by the landing itself. A live one is
+    /// written now when no device plan is open (every later plan is encoded
+    /// after the landing, so its readers are ordered after the bytes) or
+    /// when the host wrote the bytes itself; an entry landed by a copy
+    /// while a plan is open waits until the copy's epoch completes (a pass
+    /// already encoded could otherwise map the slot before the copy runs).
+    fn publish(&self, inner: &mut Inner, installed: &[(u32, u32)], direct_landed: &[u32]) {
+        if inner.live.is_none() {
+            return;
+        }
+        let epoch = inner.current_epoch();
+        for &(e, slot) in installed {
+            if inner.plans_open == 0 || direct_landed.contains(&e) {
+                inner.table_set(e, slot);
+            } else {
+                inner.landing.quarantine_one(epoch, (e, slot));
+            }
+        }
     }
 
     /// Make the compute stream wait for the `io` arm's loads up to `value`
@@ -1525,8 +1948,16 @@ impl Streamed {
             // over a hotlist-warmed pool, `p26-io2-*.txt`). The `pread`
             // arm's ring is the room its hints read into; the `io` arm's
             // room is its empty slots.
-            let Some((s, false)) = inner.map.victim_in(protect, true, u64::MAX) else {
-                break;
+            let s = if inner.map.quarantined() {
+                match inner.map.take_free() {
+                    Some(s) => s,
+                    None => break,
+                }
+            } else {
+                let Some((s, false)) = inner.map.victim_in(protect, true, u64::MAX) else {
+                    break;
+                };
+                s
             };
             inner.map.install(s, e);
             // In flight from here (the value below once issued), so the
@@ -1729,13 +2160,18 @@ impl Streamed {
     fn plan_rows_host(&self, host: &[u32], rows: usize, topk: usize) -> Vec<RoutedGroup> {
         self.counters.plans.fetch_add(1, Ordering::Relaxed);
         // The pinned experts are resident whatever the group: a row's
-        // pinned experts do not count against the unpinned capacity.
+        // pinned experts do not count against the unpinned capacity; nor do
+        // the spare slots, which may be held for readers not yet run.
         let (capacity, pinned) = {
             let inner = self.inner.lock();
             let pinned: Vec<bool> = (0..self.n_experts)
                 .map(|e| inner.map.slot_of(e).is_some_and(|s| inner.map.pinned[s]))
                 .collect();
-            (self.n_slots - inner.map.pinned_count(), pinned)
+            let capacity = self
+                .n_slots
+                .saturating_sub(inner.map.pinned_count() + inner.map.spare())
+                .max(1);
+            (capacity, pinned)
         };
         let groups = plan_rows_pinned(host, rows, topk, capacity, &pinned);
         self.counters
@@ -1852,6 +2288,13 @@ fn plan_rows_pinned(
     }
     groups.push(start..rows);
     groups
+}
+
+/// Slots each streamed layer keeps free by default (`QWEN4EXP_SPARE_SLOTS`,
+/// read once; 0 = the in-place arm).
+fn default_spare_slots() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| crate::tuning::tuning().stream.spare_slots)
 }
 
 /// A token's settle begins every layer's loads before finishing any
@@ -1983,6 +2426,13 @@ impl Streamed {
         let ids = &v[n..2 * n];
         let flags = &v[2 * n..];
         let mut inner = self.inner.lock();
+        // The plan this record came from is closed: its pass is encoded,
+        // so a slot evicted while it was open outlives the current epoch.
+        inner.plans_open = inner.plans_open.saturating_sub(1);
+        if inner.plans_open == 0 {
+            let epoch = inner.current_epoch();
+            inner.map.release_deferred(epoch);
+        }
         let mut distinct = std::mem::take(&mut inner.scratch_ids);
         let mut missing = std::mem::take(&mut inner.scratch_missing);
         distinct.clear();
@@ -2018,14 +2468,33 @@ impl Streamed {
                 inner.map.resident().len()
             );
         }
+        // In place, nothing is evicted while a plan is open, so a missing
+        // expert is exactly a flagged one. Quarantined, an expert the pass
+        // mapped can be evicted after its map ran (the eviction waits in
+        // `deferred`, its bytes intact): the pass was right iff nothing was
+        // flagged, and an expert missing now is loaded when next needed.
+        if inner.map.quarantined() && !flagged {
+            inner.scratch_missing = missing;
+            return Ok(None);
+        }
         if missing.is_empty() {
             inner.scratch_missing = missing;
-            if flagged {
+            if flagged && !inner.map.quarantined() {
                 lloom_tensor::bail!(
                     "settle: the device plan flagged a miss the residency map does not show"
                 )
             }
-            return Ok(None);
+            if !flagged {
+                return Ok(None);
+            }
+            // Quarantined: flagged, and loaded since the map ran — the
+            // pass computed on a missing expert; replay, nothing to load.
+            let pending = self.resolve_begin(&mut inner, &[], tick, true)?;
+            return Ok(Some(SettlePending {
+                pending,
+                loads: 0,
+                t0: std::time::Instant::now(),
+            }));
         }
         if inner.completed_epochs() < inner.current_epoch() {
             self.counters
@@ -2033,7 +2502,7 @@ impl Streamed {
                 .fetch_add(1, Ordering::Relaxed);
         }
         let t0 = std::time::Instant::now();
-        let pending = self.resolve_begin(&mut inner, &missing, tick);
+        let pending = self.resolve_begin(&mut inner, &missing, tick, true);
         let loads = missing.len() as u64;
         inner.scratch_missing = missing;
         Ok(Some(SettlePending {
@@ -2059,6 +2528,9 @@ impl Streamed {
 
     /// The residency table on the device, rebuilt when a settle changed it.
     fn device_table(&self, inner: &mut Inner) -> Result<Tensor> {
+        if let Some(t) = &inner.live {
+            return Ok(t.tensor.clone());
+        }
         if inner.table_stale || inner.table.is_none() {
             let t = Tensor::from_vec(inner.map.slot_of.clone(), self.n_experts, &inner.device)?;
             inner.table = Some(t);
@@ -2206,6 +2678,8 @@ impl ExpertResidency for Streamed {
             // waits for it).
             let epoch = inner.current_epoch();
             inner.map.plan_read_all(epoch);
+            inner.store_landed();
+            inner.plans_open += 1;
             self.device_table(&mut inner)?
         };
         self.counters.device_plans.fetch_add(1, Ordering::Relaxed);
@@ -2234,7 +2708,7 @@ impl ExpertResidency for Streamed {
         })
     }
 
-    fn settle_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<u64>> {
+    fn settle_batch(parts: &[(&Self, &[u32])]) -> Result<Vec<(bool, u64)>> {
         let _escape = escape_guard();
         if !settle_batch_on() {
             let mut out = Vec::with_capacity(parts.len());
@@ -2243,9 +2717,9 @@ impl ExpertResidency for Streamed {
                     Some(p) => {
                         let n = p.loads;
                         r.settle_finish(p)?;
-                        n
+                        (true, n)
                     }
-                    None => 0,
+                    None => (false, 0),
                 });
             }
             return Ok(out);
@@ -2260,9 +2734,9 @@ impl ExpertResidency for Streamed {
                 Some(p) => {
                     let n = p.loads;
                     r.settle_finish(p)?;
-                    n
+                    (true, n)
                 }
-                None => 0,
+                None => (false, 0),
             });
         }
         Ok(out)
@@ -2937,11 +3411,11 @@ mod tests {
                 .map(|(tier, r)| tier.settle_host(r).unwrap())
                 .collect();
             assert_eq!(
-                loads.iter().map(|&n| n > 0).collect::<Vec<_>>(),
+                loads.iter().map(|&(redo, _)| redo).collect::<Vec<_>>(),
                 one_by_one,
                 "token {t}: which layers missed"
             );
-            if loads.iter().all(|&n| n > 0) {
+            if loads.iter().all(|&(redo, _)| redo) {
                 batched_misses += 1;
             }
             for (l, (b, q)) in batched.iter().zip(&sequential).enumerate() {
@@ -2985,5 +3459,251 @@ mod tests {
         for p in paths {
             std::fs::remove_file(p).ok();
         }
+    }
+
+    /// The quarantined arm at the map: a miss takes a FREE slot; an evicted
+    /// slot is quarantined at the current epoch and reused only once the
+    /// clock's completed count is past it; a slot evicted while a device
+    /// plan is open is not even quarantined until the plan settles
+    /// (`release_deferred`), whatever the clock says.
+    #[test]
+    fn the_quarantined_arm_recycles_a_slot_only_after_its_readers() {
+        let mut m = ResidencyMap::new(8, 4);
+        m.set_spare(1);
+        assert!(m.quarantined());
+        assert_eq!(m.free_slots(), 4);
+        for e in [5, 6, 7] {
+            let t = m.begin();
+            let s = m.take_free().unwrap();
+            m.install(s, e);
+            m.touch(s, t);
+        }
+        assert_eq!(
+            (m.slot_of(5), m.slot_of(6), m.slot_of(7)),
+            (Some(0), Some(1), Some(2))
+        );
+        let t = m.begin();
+        assert_eq!(m.take_free(), Some(3), "the miss lands in the free slot");
+        m.install(3, 1);
+        m.touch(3, t);
+        // Refill the spare: the LRU expert out, its slot held at epoch 10.
+        assert_eq!(m.evict_lru(t, 10, false), Some(5));
+        assert_eq!(m.slot_of(5), None);
+        assert_eq!((m.held(), m.free_slots()), (1, 0));
+        assert_eq!(
+            m.recycle(10),
+            0,
+            "epoch 10 is not finished at a count of 10"
+        );
+        assert_eq!(m.take_free(), None);
+        assert_eq!(m.recycle(11), 1);
+        assert_eq!(m.take_free(), Some(0), "the recycled slot");
+        // A plan open: the eviction is deferred, not quarantined.
+        let t = m.begin();
+        m.install(0, 2);
+        m.touch(0, t);
+        assert_eq!(m.evict_lru(t, 12, true), Some(6));
+        assert_eq!(m.held(), 1);
+        assert_eq!(
+            m.recycle(u64::MAX),
+            0,
+            "a slot evicted under an open plan was recycled before the plan settled"
+        );
+        m.release_deferred(20);
+        assert_eq!(m.recycle(20), 0);
+        assert_eq!(m.recycle(21), 1);
+        assert_eq!(m.take_free(), Some(1));
+    }
+
+    /// Metal, the direct read (Shared slots): a write-after-read planted
+    /// between a device plan's slot map and its routed dispatch. The pass P
+    /// maps experts a and b and its map has run; the host then loads c and
+    /// d before P's experts are encoded. On the in-place arm the second load
+    /// writes d into a slot P maps — P computes on d's bytes and its record
+    /// shows no miss: the corruption is silent (the arm this plants against,
+    /// and the test's non-vacuity). On the quarantined arm c takes the free
+    /// slot, the eviction that refills the spare waits for P's settle, and
+    /// d — with no free slot left and a plan open — is refused: P's output
+    /// is the clean pass's bit for bit.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_load_never_writes_a_slot_an_open_device_plan_maps() {
+        use crate::nn::expert_prefetch::Prefetcher;
+        use lloom_tensor::kernels::metal::staging::StagingRing;
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let m = dev.as_metal_device().unwrap().clone();
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (6usize, 32usize, 64usize, 2usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let (a, b, c, dd, x_exp) = (0u32, 1u32, 2u32, 3u32, 4u32);
+        let xs = x(1, d, 0.25).to_device(&dev).unwrap();
+        let ids_ab = Tensor::from_vec(vec![a, b], (1, topk), &Device::Cpu)
+            .unwrap()
+            .to_device(&dev)
+            .unwrap();
+        let one = |id: u32| {
+            Tensor::from_vec(vec![id], (1, 1), &Device::Cpu)
+                .unwrap()
+                .to_device(&dev)
+                .unwrap()
+        };
+        let tier = |spare: usize| -> Streamed {
+            let ring = StagingRing::shared(&m);
+            let mut t = Streamed::with_staging_direct(
+                open(&path, "gate"),
+                open(&path, "up"),
+                open(&path, "down"),
+                3,
+                LoaderArm::Pread,
+                &dev,
+                Some(Arc::clone(&ring)),
+                true,
+            )
+            .unwrap();
+            t.set_spare_slots(spare).unwrap();
+            t.set_prefetcher(Arc::new(Prefetcher::new(&m, Arc::clone(&ring))));
+            t
+        };
+        let routed = |t: &Streamed, slots: &Tensor| -> Vec<f32> {
+            let (g, u) = t.gate_up(&xs, slots).unwrap();
+            let hh = (crate::nn::ops::silu(&g).unwrap() * u).unwrap();
+            t.down(&hh, slots)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        let clock = m.gpu_clock();
+        let drain = || {
+            // Commit and wait what is open, then let the pool clock catch up
+            // (its completion handler runs on another thread).
+            Tensor::zeros(1, lloom_tensor::DType::F32, &dev)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            while clock.completed_count() < clock.current_epoch() {
+                std::thread::yield_now();
+            }
+        };
+        // The clean pass: P alone.
+        let want = {
+            let t = tier(0);
+            t.warm(&[a, b]).unwrap();
+            let (slots, rec) = t.plan_device(&ids_ab).unwrap().unwrap();
+            let out = routed(&t, &slots);
+            assert!(!t.settle(&rec).unwrap());
+            out
+        };
+        for spare in [0usize, 1] {
+            let t = tier(spare);
+            // In place the pool is full; quarantined it keeps its spare free.
+            let warm: &[u32] = if spare == 0 { &[a, b, x_exp] } else { &[a, b] };
+            assert_eq!(t.warm(warm).unwrap(), warm.len());
+            let (slots, rec) = t.plan_device(&ids_ab).unwrap().unwrap();
+            // P's slot map has run; its experts are not encoded yet.
+            let mapped: Vec<u32> = slots.flatten_all().unwrap().to_vec1().unwrap();
+            drain();
+            let g = t.plan(&one(c)).unwrap();
+            t.ensure(&g[0]).unwrap();
+            drain();
+            let g = t.plan(&one(dd)).unwrap();
+            let d_load = t.ensure(&g[0]);
+            let got = routed(&t, &slots);
+            let flagged = rec.to_vec1::<u32>().unwrap()[2 * topk..]
+                .iter()
+                .any(|&f| f != 0);
+            assert!(!flagged, "spare {spare}: P's map ran before any eviction");
+            if spare == 0 {
+                assert!(d_load.is_ok(), "the in-place arm loads d");
+                let s_d = t.inner.lock().map.slot_of(dd as usize).unwrap() as u32;
+                assert!(
+                    mapped.contains(&s_d),
+                    "the plant missed: d landed in slot {s_d}, P maps {mapped:?}"
+                );
+                assert_ne!(
+                    got, want,
+                    "d was written into a slot P maps and P computed the clean result: the plant is not a WAR"
+                );
+            } else {
+                assert!(
+                    d_load.is_err(),
+                    "a load with no free slot under an open plan was not refused"
+                );
+                assert_eq!(got, want, "a load wrote a slot the open plan P maps");
+                assert!(!t.settle(&rec).unwrap());
+                // The warm's a and b, and c: every landing took a free slot.
+                let st = t.stats();
+                assert_eq!((st.free_takes, st.inplace_takes), (3, 0), "{st:?}");
+            }
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    /// Metal: the quarantined arm's device table is written in place — the
+    /// tensor a device plan reads is the same buffer before and after a
+    /// settle loads — and a plan after the settle maps the loaded experts
+    /// (no flag) onto the slots the host map holds them in.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_live_table_is_written_in_place() {
+        let dev = match Device::new_metal(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let dtype = GgmlDType::F32;
+        let (e, ff, d, topk) = (8usize, 32usize, 64usize, 3usize);
+        let gate = stacked(e, ff, d, 1.0, dtype);
+        let up = stacked(e, ff, d, 2.0, dtype);
+        let down = stacked(e, d, ff, 3.0, dtype);
+        let path = write_gguf(&[("gate", &gate), ("up", &up), ("down", &down)]);
+        let mut t = Streamed::new(
+            open(&path, "gate"),
+            open(&path, "up"),
+            open(&path, "down"),
+            5,
+            LoaderArm::Pread,
+            &dev,
+        )
+        .unwrap();
+        t.set_spare_slots(1).unwrap();
+        assert!(t.live_table());
+        let id = ids(1, topk, e, 2).to_device(&dev).unwrap();
+        let table_ptr = |t: &Streamed| {
+            let inner = t.inner.lock();
+            let tt = &inner.live.as_ref().unwrap().tensor;
+            let (st, _) = tt.storage_and_layout();
+            match &*st {
+                lloom_tensor::Storage::Metal(m) => m.buffer().contents() as usize,
+                _ => unreachable!(),
+            }
+        };
+        let before = table_ptr(&t);
+        let (_, rec) = t.plan_device(&id).unwrap().unwrap();
+        assert!(t.settle(&rec).unwrap(), "a cold pool missed nothing");
+        let (slots, rec) = t.plan_device(&id).unwrap().unwrap();
+        assert!(
+            !t.settle(&rec).unwrap(),
+            "the loaded experts are still flagged"
+        );
+        assert_eq!(table_ptr(&t), before, "the table was re-uploaded");
+        let want: Vec<u32> = {
+            let inner = t.inner.lock();
+            id.flatten_all()
+                .unwrap()
+                .to_vec1::<u32>()
+                .unwrap()
+                .iter()
+                .map(|&x| inner.map.slot_of(x as usize).unwrap() as u32)
+                .collect()
+        };
+        assert_eq!(slots.flatten_all().unwrap().to_vec1::<u32>().unwrap(), want);
+        std::fs::remove_file(path).ok();
     }
 }

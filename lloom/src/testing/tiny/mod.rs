@@ -11,8 +11,8 @@
 //!   schema of a family that loads through a `VarBuilder`.
 //! - [`tokenizer`]: 256 bytes, the family's added tokens and chat template.
 //! - [`TinyFamily`] / [`TinyCheckpoint`]: one source, three outputs — a
-//!   model in memory, files the real loader reads, and (with #620) a
-//!   trainable map.
+//!   model in memory and files the real loader reads (a trainable map is
+//!   the third, not built).
 
 pub mod backend;
 pub mod init;

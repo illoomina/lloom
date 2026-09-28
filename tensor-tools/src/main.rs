@@ -160,6 +160,43 @@ enum Command {
         #[arg(long)]
         out_file: std::path::PathBuf,
     },
+
+    /// Write a tiny checkpoint of a served family (`docs/porting-models.md`
+    /// §21.8): the family's files at the template geometry, or at a manifest
+    /// entry's, with keyed weights and a byte-level tokenizer. Prints the
+    /// path `lloom --model` takes.
+    Tiny {
+        /// `lfm2` or `qwen4exp`.
+        #[arg(long)]
+        family: String,
+
+        /// The directory the files are written to.
+        #[arg(long)]
+        out: std::path::PathBuf,
+
+        /// The weights' value law (`hash[:gain]`, `uniform[:half]`,
+        /// `ramp-sin`, `ramp-mod17`).
+        #[arg(long, default_value = "hash:1")]
+        law: String,
+
+        /// The weights' seed.
+        #[arg(long)]
+        seed: Option<u64>,
+
+        /// What the dense matrices are stored as (`F32`, `F16`, `BF16`, a
+        /// GGUF kind on Qwen4-exp).
+        #[arg(long, default_value = "F32")]
+        dense: String,
+
+        /// What the routed expert stacks are stored as (Qwen4-exp).
+        #[arg(long, default_value = "F32")]
+        experts: String,
+
+        /// A geometry in `fuzz_geometry`'s byte form (a manifest entry's
+        /// hex); the template otherwise.
+        #[arg(long)]
+        geometry: Option<String>,
+    },
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -506,6 +543,39 @@ fn run_quantize(
     Ok(())
 }
 
+/// One family's tiny checkpoint in `out`: the geometry's (or the
+/// template's) config, the vocabulary widened to the tokenizer the files
+/// carry.
+fn write_tiny<F: lloom::testing::tiny::TinyFamily>(
+    out: &std::path::Path,
+    weights: lloom::testing::tiny::Weights,
+    geometry: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
+    use lloom::testing::tiny::{Geometry, TinyCheckpoint, TinyConfig, TinyFamily};
+    let mut ckpt = match geometry {
+        Some(hex) => {
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                .collect::<std::result::Result<Vec<u8>, _>>()?;
+            let g = Geometry::decode::<F>(&bytes);
+            let kinds = (weights.dense, weights.experts);
+            let mut c = g
+                .checkpoint::<F>(weights)
+                .ok_or_else(|| anyhow::anyhow!("the geometry drops a layer kind"))?;
+            (c.weights.dense, c.weights.experts) = kinds;
+            c
+        }
+        None => TinyCheckpoint::<F>::new(F::template(), weights),
+    };
+    let vocab = F::tokenizer().vocab_size();
+    if ckpt.cfg.axis("vocab_size").unwrap_or(0) < vocab {
+        ckpt.cfg.set_axis("vocab_size", vocab);
+        ckpt.cfg.derive();
+    }
+    Ok(ckpt.write(out)?)
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let device = Device::Cpu;
@@ -537,6 +607,39 @@ fn main() -> anyhow::Result<()> {
             mode,
         } => run_quantize(&in_file, out_file, quantization, mode, &device)?,
         Command::Dequantize { in_file, out_file } => run_dequantize(in_file, out_file, &device)?,
+        Command::Tiny {
+            family,
+            out,
+            law,
+            seed,
+            dense,
+            experts,
+            geometry,
+        } => {
+            use lloom::models::lfm2_testing::Lfm2Tiny;
+            use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
+            let kind = |s: &str| -> anyhow::Result<GgmlDType> {
+                lloom::testing::tiny::packed::ALL_KINDS
+                    .into_iter()
+                    .find(|k| format!("{k:?}").eq_ignore_ascii_case(s))
+                    .ok_or_else(|| anyhow::anyhow!("{s}: not a GGUF kind"))
+            };
+            let mut weights = lloom::testing::tiny::Weights {
+                law: lloom::testing::tiny::ValueLaw::parse(&law).map_err(anyhow::Error::msg)?,
+                dense: kind(&dense)?,
+                experts: kind(&experts)?,
+                ..Default::default()
+            };
+            if let Some(s) = seed {
+                weights.seed = s;
+            }
+            let path = match family.as_str() {
+                "lfm2" => write_tiny::<Lfm2Tiny>(&out, weights, geometry.as_deref())?,
+                "qwen4exp" => write_tiny::<Qwen4ExpTiny>(&out, weights, geometry.as_deref())?,
+                other => anyhow::bail!("--family {other}: lfm2 | qwen4exp"),
+            };
+            println!("{}", path.display());
+        }
     }
     Ok(())
 }

@@ -1,4 +1,4 @@
-//! Spikes P-a and P-b of #761 (`docs/porting-models.md` §21.8, INV-3b):
+//! Spikes P-a and P-b (`docs/porting-models.md` §21.8, INV-3b):
 //! which value law the tiny models' weights follow.
 //!
 //! One line per case — law × seed × geometry — on stdout, tab-separated:

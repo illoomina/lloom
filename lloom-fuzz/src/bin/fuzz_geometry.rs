@@ -45,6 +45,11 @@ struct Args {
     /// The seed's prompt length.
     #[arg(long, default_value_t = 1)]
     seed_prompt: usize,
+    /// Build the Metal side as the family's CPU reference is built (f32
+    /// stems): a discriminator — a deviation that goes away was the served
+    /// arm's precision, one that stays is not.
+    #[arg(long)]
+    metal_reference: bool,
     /// Run one input (or every file in a directory), print the geometry, the
     /// outcome, the per-step comparison, the probes and the census; exit.
     #[arg(long)]
@@ -105,22 +110,8 @@ fn run<F: TinyFamily + 'static>(mut args: Args) -> anyhow::Result<()> {
         seed: args.weight_seed,
         ..Weights::default()
     };
-    if args.cli.seeds.is_none() {
-        let dir = args
-            .cli
-            .corpus
-            .with_file_name(format!("geometry-seeds-{}", F::NAME));
-        std::fs::create_dir_all(&dir)?;
-        let mut seed = Geometry::template::<F>(Workload {
-            prompt: args.seed_prompt.clamp(1, MAX_PROMPT),
-            decode: 1,
-        });
-        seed.dense = args.seed_dense % F::DENSE_KINDS.len();
-        std::fs::write(dir.join("template"), seed.encode())?;
-        args.cli.seeds = Some(dir);
-    }
-
     let tol = args.tol;
+    geometry::METAL_REFERENCE.store(args.metal_reference, std::sync::atomic::Ordering::Relaxed);
     let devs: std::cell::OnceCell<(Device, Device)> = std::cell::OnceCell::new();
     let exec = move |bytes: &[u8]| -> (Geometry, Outcome) {
         let (cpu, gpu) =
@@ -175,6 +166,21 @@ fn run<F: TinyFamily + 'static>(mut args: Args) -> anyhow::Result<()> {
     if let Some(dir) = &args.manifest {
         let mut exec = exec;
         return manifest::<F>(dir, &args, weights, &mut exec);
+    }
+
+    if args.cli.seeds.is_none() {
+        let dir = args
+            .cli
+            .corpus
+            .with_file_name(format!("geometry-seeds-{}", F::NAME));
+        std::fs::create_dir_all(&dir)?;
+        let mut seed = Geometry::template::<F>(Workload {
+            prompt: args.seed_prompt.clamp(1, MAX_PROMPT),
+            decode: 1,
+        });
+        seed.dense = args.seed_dense % F::DENSE_KINDS.len();
+        std::fs::write(dir.join("template"), seed.encode())?;
+        args.cli.seeds = Some(dir);
     }
 
     lloom_fuzz::campaign::set_structured_mutator(geometry::mutate::<F>);
@@ -316,6 +322,8 @@ fn manifest<F: TinyFamily>(
         }
         runs.insert(bytes, (g.describe::<F>(), points));
     }
+    // The gap list: points no agreeing execution reached.
+    elsewhere.retain(|p, _| !best.contains_key(p));
     let mut entries: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
     for (p, (_, g)) in &best {
         entries.entry(g.clone()).or_default().push(p.clone());

@@ -222,13 +222,22 @@ impl TinyTokenizer {
 mod tests {
     use super::*;
 
-    /// The map is a bijection onto 256 distinct characters, the printable
-    /// ASCII range maps to itself, and space is `Ġ` (U+0120), as in every
-    /// byte-level BPE vocabulary.
+    /// The map is a bijection onto exactly the characters `tokenizers`'
+    /// byte-level pre-tokenizer produces (its own alphabet, the external
+    /// reference), the printable ASCII range maps to itself, and space is
+    /// `Ġ` (U+0120), as in every byte-level BPE vocabulary.
     #[test]
     fn the_byte_map_is_gpt2s() {
         let chars: std::collections::BTreeSet<char> = (0..=255u8).map(byte_char).collect();
         assert_eq!(chars.len(), 256);
+        let reference: std::collections::BTreeSet<char> =
+            tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
+                .into_iter()
+                .collect();
+        assert_eq!(chars, reference);
+        for b in b'!'..=b'~' {
+            assert_eq!(byte_char(b), b as char);
+        }
         assert_eq!(byte_char(b'A'), 'A');
         assert_eq!(byte_char(b' '), '\u{120}');
         assert_eq!(byte_char(b'\n'), '\u{10A}');
@@ -242,7 +251,9 @@ mod tests {
         for tt in [TinyTokenizer::qwen4exp(), TinyTokenizer::lfm2()] {
             let tk = tokenizers::Tokenizer::from_bytes(tokenizer_json(&tt.added)).unwrap();
             assert_eq!(tk.get_vocab_size(true), tt.vocab_size());
-            let text = "The capital of France is Paris. ¿Qué? 東京\n";
+            let ascii: String = (b' '..=b'~').map(char::from).collect();
+            let text = format!("The capital of France is Paris. ¿Qué? 東京\n{ascii}\t");
+            let text = text.as_str();
             let enc = tk.encode(text, false).unwrap();
             assert_eq!(enc.get_ids().len(), text.len(), "one id per byte");
             assert_eq!(

@@ -1,5 +1,5 @@
 //! The shape campaign over a family's tiny models (`docs/porting-models.md`
-//! §21.8, lloom #761): an input is a geometry
+//! §21.8): an input is a geometry
 //! ([`lloom::testing::tiny::Geometry`] — the family's `#[tiny(axis)]` fields,
 //! a workload, the stored kinds and a runtime arm) and an execution builds
 //! the checkpoint it names, runs it on Metal and against the family's CPU
@@ -39,6 +39,12 @@ use lloom_tensor::shape_probe::{self, Event};
 use lloom_tensor::Device;
 
 use crate::campaign::shape_hit;
+
+/// Build the Metal side as the family's reference construction too (f32
+/// stems where the served load has f16 ones): a discriminator for a
+/// deviation — if it goes, the deviation was the served arm's precision.
+pub static METAL_REFERENCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The largest model (weight elements) an execution builds; above it the
 /// geometry is skipped, not run, so one execution stays well under a second.
@@ -195,7 +201,22 @@ fn judge<F: TinyFamily>(
         };
     let armed = shape_probe::arm();
     profile::reset();
-    let metal = quietly(|| run_model::<F>(|d| ckpt.model(d), &ckpt.cfg, vocab, gpu, &w));
+    let as_reference = METAL_REFERENCE.load(std::sync::atomic::Ordering::Relaxed);
+    let metal = quietly(|| {
+        run_model::<F>(
+            |d| {
+                if as_reference {
+                    F::reference(&ckpt, d)
+                } else {
+                    ckpt.model(d)
+                }
+            },
+            &ckpt.cfg,
+            vocab,
+            gpu,
+            &w,
+        )
+    });
     let _ = gpu.synchronize();
     let events = armed.take();
     drop(armed);

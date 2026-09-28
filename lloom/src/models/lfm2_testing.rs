@@ -56,7 +56,8 @@ impl TinyFamily for Lfm2Tiny {
     const EXPERT_KINDS: &'static [GgmlDType] = &[];
 
     /// Three layers (conv, conv, attention), head_dim 64 — inside the SDPA
-    /// head-dim set, so the fused attention arms are reachable on Metal.
+    /// head-dim set, so the fused attention arms are reachable on Metal —
+    /// and RoPE tables long enough for the engine's default KV capacity.
     fn template() -> Config {
         let num_hidden_layers = 3;
         Config {
@@ -68,7 +69,7 @@ impl TinyFamily for Lfm2Tiny {
             num_key_value_heads: 1,
             norm_eps: 1e-5,
             rope_theta: 1_000_000.0,
-            max_position_embeddings: 4096,
+            max_position_embeddings: 32768,
             conv_l_cache: 3,
             conv_bias: false,
             layer_types: Config::tiny_layer_types(num_hidden_layers),

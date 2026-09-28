@@ -119,7 +119,7 @@ harness = false
 [[example]]
 name = "cpu_benchmarks"
 
-# #761's value-law spikes (P-a, P-b): the tiny LFM2 under each law, on the
+# The value-law spikes (P-a, P-b, §21.8): the tiny LFM2 under each law, on the
 # CPU and (with `--device metal`) on Metal.
 [[example]]
 name = "tiny_value_law"

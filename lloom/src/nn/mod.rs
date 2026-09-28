@@ -30,6 +30,7 @@ pub mod expert_prefetch;
 pub mod expert_stream;
 pub mod func;
 pub mod fusion;
+pub mod gdn;
 pub mod group_norm;
 pub mod init;
 pub mod kv_cache;
@@ -49,6 +50,7 @@ pub mod rnn;
 pub mod rotary_emb;
 pub mod sampling;
 pub mod sequential;
+pub mod short_conv;
 pub mod speculator;
 pub mod var_builder;
 pub mod var_map;
@@ -91,7 +93,7 @@ pub use observer::{
 };
 pub use ops::Dropout;
 pub use optim::{AdamW, Optimizer, ParamsAdamW, SGD};
-pub use recurrent::{RecurrentState, StatePool};
+pub use recurrent::{PoolLayer, RecurrentState, StatePool};
 pub use rnn::{gru, lstm, GRUConfig, LSTMConfig, GRU, LSTM, RNN};
 pub use sequential::{seq, Sequential};
 pub use speculator::{

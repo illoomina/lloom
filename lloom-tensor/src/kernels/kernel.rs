@@ -1,5 +1,5 @@
 use crate::kernels::source::{
-    AFFINE, ARENA_ALLOC, BINARY, CAST, CONV, EOS_GATE, EOS_INDEX, FILL, FLASH_DECODING, GEMV,
+    AFFINE, ARENA_ALLOC, BINARY, CAST, CONV, EOS_GATE, EOS_INDEX, FILL, FLASH_DECODING, GDN, GEMV,
     INDEXING, MERGED_MEMBERS, MERGED_NON_MLX, MLX_GEMM, MLX_SORT, QUANTIZED, QWEN4EXP, RANDOM,
     REDUCE, ROPE, SCRATCH, SDPA, SORT, TERNARY, UNARY,
 };
@@ -183,6 +183,7 @@ impl Kernels {
             Source::FlashDecoding => FLASH_DECODING,
             Source::Gemm => MLX_GEMM,
             Source::Gemv => GEMV,
+            Source::Gdn => GDN,
             Source::Indexing => INDEXING,
             Source::MlxSort => MLX_SORT,
             Source::Quantized => QUANTIZED,
@@ -655,6 +656,7 @@ mod tests {
                 | Source::Fill
                 | Source::FlashDecoding
                 | Source::Gemv
+                | Source::Gdn
                 | Source::Indexing
                 | Source::Quantized
                 | Source::Qwen4Exp
@@ -694,6 +696,7 @@ mod tests {
             Source::FlashDecoding,
             Source::Gemm,
             Source::Gemv,
+            Source::Gdn,
             Source::Indexing,
             Source::MlxSort,
             Source::Quantized,
@@ -719,11 +722,11 @@ mod tests {
         // bad edit fails here rather than passing over an empty iteration.
         assert_eq!(
             MERGED_MEMBERS.len(),
-            20,
-            "20 non-MLX sources (#466 §4, +rope #659, +eos_index #702's tree, +eos_gate #735, \
-             +qwen4exp)"
+            21,
+            "21 non-MLX sources (#466 §4, +rope #659, +eos_index #702's tree, +eos_gate #735, \
+             +qwen4exp, +gdn)"
         );
-        assert_eq!(all.len(), 23, "23 Source variants");
+        assert_eq!(all.len(), 24, "24 Source variants");
     }
 
     /// Issue #477. The merged text **compiles**, and it contains kernels from
@@ -805,6 +808,7 @@ mod tests {
             Source::FlashDecoding,
             Source::Gemm,
             Source::Gemv,
+            Source::Gdn,
             Source::Indexing,
             Source::MlxSort,
             Source::Quantized,
@@ -866,12 +870,12 @@ mod tests {
             }
             merged_keys.insert(key);
         }
-        assert_eq!(n_merged, 20, "20 sources must route to the merged library");
-        // 1 merged key + 3 MLX keys. A count of 21 would mean nothing merged.
+        assert_eq!(n_merged, 21, "21 sources must route to the merged library");
+        // 1 merged key + 3 MLX keys. A count of 24 would mean nothing merged.
         assert_eq!(
             merged_keys.len(),
             4,
-            "the merged arm must collapse 21 libraries to 4, or it is not \
+            "the merged arm must collapse 24 libraries to 4, or it is not \
              merging anything"
         );
 
@@ -909,8 +913,9 @@ mod tests {
         }
         assert_eq!(
             default_keys.len(),
-            23,
-            "the default arm must be 23 distinct libraries, unchanged (+eos_gate #735, +qwen4exp)"
+            24,
+            "the default arm must be 24 distinct libraries, unchanged (+eos_gate #735, +qwen4exp, \
+             +gdn)"
         );
     }
 }

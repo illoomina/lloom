@@ -55,7 +55,28 @@ pub const CAST: &str = with_utils!(
     "#include <metal_stdlib>\nusing namespace metal;",
     include_str!("metal_src/cast.metal")
 );
-pub const CONV: &str = include_str!("metal_src/conv.metal");
+/// The short causal convolution block (`metal_src/conv/short_conv.metal`): the
+/// window mechanics and folds LFM2's conv kernels and the Gated DeltaNet
+/// prologue compose. A fragment with no `#include`, spliced after a consumer's
+/// header by `with_short_conv!` — once per translation unit, so the merged
+/// unit below carries it once ahead of both consumers.
+macro_rules! with_short_conv {
+    ($body:expr) => {
+        concat!(
+            "#include <metal_stdlib>\nusing namespace metal;\n",
+            include_str!("metal_src/conv/short_conv.metal"),
+            "\n",
+            $body
+        )
+    };
+}
+
+pub const CONV: &str = with_short_conv!(include_str!("metal_src/conv.metal"));
+/// The Gated DeltaNet block (`metal_src/gdn/`): the decode prologue on the
+/// short-conv block, the recurrence step, the gated norm, the rows and
+/// multi-position forms, the chunked prefill. Split out of `qwen4exp.metal`
+/// so a second GDN model composes it (§7.3).
+pub const GDN: &str = with_short_conv!(include_str!("metal_src/gdn/gdn.metal"));
 /// The batched EOS-index reduction (the `GpuBatched` EOS arm): one dispatch per
 /// commit window returns the first stop-token index or `n`. Self-contained (its
 /// own `#include`, an inlined threadgroup min-reduction), so NOT a `with_utils!`
@@ -66,8 +87,10 @@ pub const EOS_INDEX: &str = include_str!("metal_src/eos_index.metal");
 /// token (or the sticky flag is already up). Self-contained like `EOS_INDEX`.
 pub const EOS_GATE: &str = include_str!("metal_src/eos_gate.metal");
 pub const FILL: &str = include_str!("metal_src/fill.metal");
-/// The Qwen4-exp block kernels (`lloom::models::qwen4exp`): the decode and
-/// prefill pieces written as one launch each. Self-contained like `EOS_INDEX`.
+/// The Qwen4-exp model's own kernels (`lloom::models::qwen4exp`): the
+/// HyperConnection brackets, the MoE routing, the QSA preparation — each one
+/// launch. Self-contained like `EOS_INDEX`. The Gated DeltaNet kernels are
+/// [`GDN`]'s.
 pub const QWEN4EXP: &str = include_str!("metal_src/qwen4exp.metal");
 pub const FLASH_DECODING: &str = include_str!("metal_src/attention/flash_decoding.metal");
 pub const INDEXING: &str = with_utils!(
@@ -199,6 +222,8 @@ pub const MERGED_NON_MLX: &str = concat!(
     "\n",
     include_str!("metal_src/cast.metal"),
     "\n",
+    include_str!("metal_src/conv/short_conv.metal"),
+    "\n",
     include_str!("metal_src/conv.metal"),
     "\n",
     include_str!("metal_src/eos_gate.metal"),
@@ -210,6 +235,8 @@ pub const MERGED_NON_MLX: &str = concat!(
     include_str!("metal_src/attention/flash_decoding.metal"),
     "\n",
     include_str!("metal_src/gemm/gemv.metal"),
+    "\n",
+    include_str!("metal_src/gdn/gdn.metal"),
     "\n",
     include_str!("metal_src/indexing.metal"),
     "\n",
@@ -252,6 +279,7 @@ pub const MERGED_MEMBERS: &[Source] = &[
     Source::Fill,
     Source::FlashDecoding,
     Source::Gemv,
+    Source::Gdn,
     Source::Indexing,
     Source::Quantized,
     Source::Qwen4Exp,
@@ -286,6 +314,9 @@ pub enum Source {
     FlashDecoding,
     Gemm,
     Gemv,
+    /// The Gated DeltaNet block (`metal_src/gdn/`), composed with the short
+    /// conv block. Its own translation unit.
+    Gdn,
     Indexing,
     MlxSort,
     Quantized,

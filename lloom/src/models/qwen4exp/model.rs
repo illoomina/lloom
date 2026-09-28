@@ -98,7 +98,20 @@ impl<R: ExpertResidency> Layer<R> {
         cache: &mut Cache,
         device_plan: bool,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
-        self.decode_parts_rows(res_hc, l, &mut [cache], device_plan)
+        self.decode_parts_rows_with(res_hc, l, &mut [cache], device_plan, &mut ())
+    }
+
+    /// [`Self::decode_parts_planned`] with `hook` at the MoE's join points
+    /// (`moe::PlanHook`) when the routed experts are planned on the device.
+    pub fn decode_parts_planned_with<H: super::moe::PlanHook>(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        cache: &mut Cache,
+        device_plan: bool,
+        hook: &mut H,
+    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+        self.decode_parts_rows_with(res_hc, l, &mut [cache], device_plan, hook)
     }
 
     /// [`Self::decode_parts_planned`] over `B` rows: `res_hc [B, 1, n·d]`,
@@ -111,6 +124,17 @@ impl<R: ExpertResidency> Layer<R> {
         l: usize,
         caches: &mut [&mut Cache],
         device_plan: bool,
+    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+        self.decode_parts_rows_with(res_hc, l, caches, device_plan, &mut ())
+    }
+
+    fn decode_parts_rows_with<H: super::moe::PlanHook>(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        caches: &mut [&mut Cache],
+        device_plan: bool,
+        hook: &mut H,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
         // HC prologue (attn bracket): collapse streams → mixer input.
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // cur [B,1,d]
@@ -138,7 +162,7 @@ impl<R: ExpertResidency> Layer<R> {
         let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
         trace("ffn.mix", l, &cur);
         let (moe_out, record) = if device_plan {
-            self.moe.decode_planned(&cur)?
+            self.moe.decode_planned_with(&cur, hook)?
         } else {
             (self.moe.decode(&cur)?, None)
         };
@@ -822,6 +846,9 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// the layer itself measured worse than no hint: the reads were
     /// cancelled by the take, P20). `QWEN4EXP_SPEC_AHEAD` by default.
     spec_ahead: usize,
+    /// Spike 0's event (`JoinHook::Wait`), made at first use.
+    #[cfg(feature = "metal")]
+    spike0: std::sync::OnceLock<Option<std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>>>,
     cfg: Config,
 }
 
@@ -926,6 +953,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
             mem_check: MemCheck::from_env(),
             spec_ahead: spec_ahead_from_env(),
+            #[cfg(feature = "metal")]
+            spike0: std::sync::OnceLock::new(),
             cfg,
         }
     }
@@ -2016,6 +2045,28 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
     }
 
+    /// The hook a device-planned decode pass runs at each layer's join
+    /// points: nothing, or spike 0's wait (`QWEN4EXP_SPIKE0=wait`).
+    fn join_hook(&self) -> Result<JoinHook> {
+        #[cfg(feature = "metal")]
+        if spike0_wait() {
+            if let Ok(m) = self.device().as_metal_device() {
+                let ring = self
+                    .spike0
+                    .get_or_init(|| {
+                        lloom_tensor::metal_backend::HostFedRing::new(m, 1, 1)
+                            .map(std::sync::Arc::new)
+                            .ok()
+                    })
+                    .clone()
+                    .ok_or_else(|| lloom_tensor::Error::Msg("spike 0: no event".into()))?;
+                let next = ring.base();
+                return Ok(JoinHook::Wait { ring, next });
+            }
+        }
+        Ok(JoinHook::Off)
+    }
+
     fn decode_embed_pass<O: ForwardObserver>(
         &self,
         h: &Tensor,
@@ -2049,6 +2100,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                                                                      // and handed to layer l+2's prefetcher: its misses read during
                                                                      // layers l+1 and l+2's mixer, landed at l+2's resolve.
         let hint = decode_hint_on() && !device_plan;
+        let mut join = self.join_hook()?;
         for (l, layer) in self.layers.iter().enumerate() {
             if probe {
                 for k in 0..4 {
@@ -2091,7 +2143,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
 
             let (next, mixed, moe_out, record) =
-                layer.decode_parts_planned(&res_hc, l, cache, device_plan)?;
+                layer.decode_parts_planned_with(&res_hc, l, cache, device_plan, &mut join)?;
             if let Some(r) = record {
                 records.push((l, r));
             }
@@ -2741,6 +2793,42 @@ impl crate::nn::model::CacheShare for Cache {
     fn share_granularity(&self) -> usize {
         0
     }
+}
+
+/// Spike 0 of fetch-and-wait (`expert-streaming.md` §20.14): at every
+/// device-planned layer's join point — after the routed and the shared
+/// experts, before the combine, where the pass would wait for its misses —
+/// a GPU wait on an event the host has already raised. What the hit path
+/// pays for the wait alone, before any host round trip. An instrument
+/// (`QWEN4EXP_SPIKE0=wait`); `Off` compiles to nothing.
+enum JoinHook {
+    Off,
+    #[cfg(feature = "metal")]
+    Wait {
+        ring: std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>,
+        next: u64,
+    },
+}
+
+impl super::moe::PlanHook for JoinHook {
+    fn at_join(&mut self) -> Result<()> {
+        match self {
+            JoinHook::Off => Ok(()),
+            #[cfg(feature = "metal")]
+            JoinHook::Wait { ring, next } => {
+                *next += 1;
+                ring.signal(*next);
+                ring.encode_wait(*next)
+            }
+        }
+    }
+}
+
+/// `QWEN4EXP_SPIKE0=wait` (read once): spike 0's arm.
+#[cfg(feature = "metal")]
+fn spike0_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().stream.spike0 == "wait")
 }
 
 /// Whether the streamed tier's routed experts are planned on the device

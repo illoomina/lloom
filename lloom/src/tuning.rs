@@ -76,6 +76,9 @@ fn parse_ctx_kv(v: &str) -> Result<String, String> {
 fn parse_hot_thread(v: &str) -> Result<String, String> {
     one_of(v, "hot thread", &["interactive", "default", "demote", "off", "0", "none"])
 }
+fn parse_spike0(v: &str) -> Result<String, String> {
+    one_of(v, "spike 0", &["off", "wait"])
+}
 fn parse_mem_check(v: &str) -> Result<String, String> {
     one_of(v, "mem check", &["off", "report", "refuse"])
 }
@@ -175,6 +178,9 @@ pub struct StreamTuning {
     /// A token's settle submits every layer's loads before waiting for any (off = one layer after another, the A/B arm).
     #[opt(flag = "settle-batch", env = "QWEN4EXP_SETTLE_BATCH", bool)]
     pub settle_batch: bool,
+    /// Spike 0 of fetch-and-wait: `wait` = a GPU wait on an already-raised event at every device-planned layer's join point (an instrument; off = none).
+    #[opt(flag = "spike0", env = "QWEN4EXP_SPIKE0", parser = "parse_spike0", variants = ["off", "wait"])]
+    pub spike0: String,
     /// Print every settle's ids, flags and misses — an instrument.
     #[opt(flag = "trace-settle", env = "QWEN4EXP_TRACE_SETTLE", bool)]
     pub trace_settle: bool,
@@ -193,6 +199,7 @@ impl Default for StreamTuning {
             hint_recall: false,
             spare_slots: 2,
             settle_batch: true,
+            spike0: "off".into(),
             trace_settle: false,
         }
     }

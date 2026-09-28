@@ -20,6 +20,8 @@ use crate::nn::model::{CacheReset, CausalLM, Model as ModelTrait};
 use crate::nn::observer::{ForwardObserver, HcStatePoint, LayerOutputPoint};
 use crate::nn::var_builder::VarBuilder;
 use crate::nn::RecurrentState;
+#[cfg(feature = "metal")]
+use lloom_tensor::metal_backend::{PassKey, PassKind, PassOpener};
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{Module, Result, Tensor, D};
 
@@ -917,18 +919,42 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// Open a planned pass for `shape` (`DESIGN.md` §9.2aa: the pass's
     /// activations served by ordinal from one base, no allocation on a
     /// cached key) — when the device has pass plans enabled and no driver
-    /// holds a pass already. Returns whether this call opened it.
+    /// holds a pass already. Returns whether this call opened it. The pass
+    /// is keyed as the model's own: it opens after the embedding a driver's
+    /// pass of the same shape holds, so the two are different sequences.
     fn open_pass(&self, shape: crate::nn::decode::PassShape) -> Result<bool> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
             if !m.pass_plans_enabled() || m.pass_open() {
                 return Ok(false);
             }
-            crate::nn::decode::begin_pass(&self.device(), shape)?;
+            let Some(key) = Self::pass_key(shape, PassOpener::Model) else {
+                return Ok(false);
+            };
+            m.begin_pass(key)?;
             return Ok(true);
         }
         let _ = shape;
         Ok(false)
+    }
+
+    /// The plan-cache key of a pass shape this model prepares or opens — a
+    /// decode step or a prefill chunk — bracketed by `opener`. `None` for
+    /// the shapes only a driver opens.
+    #[cfg(feature = "metal")]
+    fn pass_key(shape: crate::nn::decode::PassShape, opener: PassOpener) -> Option<PassKey> {
+        use crate::nn::decode::PassShape;
+        let kind = match shape {
+            PassShape::Decode { b } => PassKind::Decode {
+                b: b.min(u16::MAX as usize) as u16,
+            },
+            PassShape::Prefill { w, fresh } => PassKind::Prefill {
+                w: w.min(u32::MAX as usize) as u32,
+                fresh,
+            },
+            PassShape::Verify { .. } | PassShape::Ragged { .. } => return None,
+        };
+        Some(PassKey::new(kind).opened_by(opener))
     }
 
     fn close_pass(&self, opened: bool) -> Result<()> {
@@ -1036,6 +1062,13 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// Idempotent per `(pos, seq)`: a driver prepares, then `forward`'s own
     /// chunk loop prepares the same pass and finds it done.
     pub fn prepare_pass_inner(&self, cache: &mut Cache, seq: usize) -> Result<()> {
+        self.prepare_pass_as(cache, seq, false)
+    }
+
+    /// [`Self::prepare_pass_inner`] for the pass about to run: a driver's,
+    /// or with `own` the one this model opens itself when no driver holds a
+    /// pass — whose plan, if any, is a different key.
+    fn prepare_pass_as(&self, cache: &mut Cache, seq: usize, own: bool) -> Result<()> {
         if seq == 0 || cache.prepared == Some((cache.pos, seq)) {
             return Ok(());
         }
@@ -1047,18 +1080,23 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if seq > 1 {
             if let Ok(m) = self.device().as_metal_device() {
                 if m.pass_plans_enabled() {
-                    let key = lloom_tensor::metal_backend::PassKey::new(
-                        lloom_tensor::metal_backend::PassKind::Prefill {
-                            w: seq.min(u32::MAX as usize) as u32,
-                            fresh: cache.pos == 0,
-                        },
-                    );
-                    if m.pass_plan_cached(&key) {
+                    let opener = if own && !m.pass_open() {
+                        PassOpener::Model
+                    } else {
+                        PassOpener::Driver
+                    };
+                    let shape = crate::nn::decode::PassShape::Prefill {
+                        w: seq,
+                        fresh: cache.pos == 0,
+                    };
+                    if Self::pass_key(shape, opener).is_some_and(|k| m.pass_plan_cached(&k)) {
                         plan.transient = 0;
                     }
                 }
             }
         }
+        #[cfg(not(feature = "metal"))]
+        let _ = own;
         if plan.bytes() == 0 || self.mem_check == MemCheck::Off || self.memory_fraction <= 0.0 {
             return Ok(());
         }
@@ -1503,7 +1541,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                             at += l;
                         }
                         let total: usize = lens.iter().sum();
-                        self.prepare_pass_inner(cache, total)?;
+                        self.prepare_pass_as(cache, total, true)?;
                         let bracket = self.open_pass(crate::nn::decode::PassShape::Prefill {
                             w: total,
                             fresh: cache.pos == 0,
@@ -1516,7 +1554,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     let h = embeds.narrow(1, start, len)?;
                     // Each chunk is a pass of its own: admitted here when the
                     // driver handed the whole prompt over untiled.
-                    self.prepare_pass_inner(cache, len)?;
+                    self.prepare_pass_as(cache, len, true)?;
                     logits = Some(if len == 1 {
                         self.decode_embed(&h, cache, obs)?
                     } else {

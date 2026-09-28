@@ -478,14 +478,19 @@ fn report_pass_plans(device: &Device) {
             let keys: Vec<String> = keys
                 .iter()
                 .map(|(k, covered, total, escapes)| {
+                    // A pass the model bracketed itself is its own key (§9.2aa).
+                    let own = match k.opener {
+                        candle::metal_backend::PassOpener::Model => "/model",
+                        candle::metal_backend::PassOpener::Driver => "",
+                    };
                     if *escapes > 0 {
                         format!(
-                            "{:?}={covered}/{total}(+{escapes} escaped {:?})",
+                            "{:?}{own}={covered}/{total}(+{escapes} escaped {:?})",
                             k.kind,
                             dev.pass_plan_escapes(k)
                         )
                     } else {
-                        format!("{:?}={covered}/{total}", k.kind)
+                        format!("{:?}{own}={covered}/{total}", k.kind)
                     }
                 })
                 .collect();

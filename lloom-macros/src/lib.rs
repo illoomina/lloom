@@ -23,9 +23,11 @@
 //!
 //! A struct whose fields carry `#[tiny(...)]` also gets the tiny-model
 //! surface (`docs/porting-models.md` §21.8): the `TINY` field table, the axis
-//! accessors a shape search mutates through, and `tiny_derive`, which
-//! recomputes the derived fields from the axes. Emitted only when some field
-//! is tagged, so a config without `#[tiny]` expands exactly as before.
+//! accessors a shape search mutates through, `tiny_derive`, which
+//! recomputes the derived fields from the axes, and the same four as
+//! `lloom::testing::tiny::TinyConfig`, which a campaign is generic over.
+//! Emitted only when some field is tagged, so a config without `#[tiny]`
+//! expands exactly as before.
 
 mod options;
 
@@ -242,9 +244,11 @@ fn tiny_surface(
         .map(|(i, _, _)| i)
         .collect();
     let axis_names: Vec<String> = axes.iter().map(|i| i.to_string()).collect();
-    // Every field bound by name, so a derived expression reads its inputs as
-    // plain identifiers; each derived field is rebound after it is computed.
-    let all: Vec<&syn::Ident> = fields.iter().filter_map(|f| f.ident.as_ref()).collect();
+    // Every `#[tiny]` field bound by name, so a derived expression reads its
+    // inputs as plain identifiers; each derived field is rebound after it is
+    // computed. Untagged fields are not bound: a derived dimension depends on
+    // the geometry only, and an untagged field may be `#[cfg]`-gated.
+    let all: Vec<&syn::Ident> = tagged.iter().map(|(i, _, _)| i).collect();
     let derived = tagged
         .iter()
         .filter_map(|(i, _, t)| t.derived.as_ref().map(|e| (i, e)));
@@ -281,6 +285,21 @@ fn tiny_surface(
             pub fn tiny_derive(&mut self) {
                 #(let #all = ::std::clone::Clone::clone(&self.#all);)*
                 #(#derive_stmts)*
+            }
+        }
+
+        impl crate::testing::tiny::TinyConfig for #struct_ident {
+            fn fields() -> &'static [crate::testing::tiny::TinyField] {
+                Self::TINY
+            }
+            fn axis(&self, name: &str) -> ::std::option::Option<usize> {
+                self.tiny_axis(name)
+            }
+            fn set_axis(&mut self, name: &str, value: usize) -> bool {
+                self.set_tiny_axis(name, value)
+            }
+            fn derive(&mut self) {
+                self.tiny_derive()
             }
         }
     })

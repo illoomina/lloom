@@ -944,22 +944,40 @@ impl std::fmt::Display for FusionReport {
 /// configuration axes (RESTRUCTURING §1.6): each contributes to `lloom::axes::AXES`
 /// at link time and becomes a `ConfigArgs` clap flag. The shape fields
 /// (`hidden_size`, `layer_types`, …) come from the checkpoint and are not axes.
+///
+/// `#[tiny]` marks what the shape campaign may search from the tiny
+/// template (`models::lfm2_testing`, `docs/porting-models.md` §21.8).
 #[derive(Debug, Clone, ConfigDerive)]
 pub struct Config {
+    #[tiny(axis)]
     pub vocab_size: usize,
+    #[tiny(axis)]
     pub hidden_size: usize,
+    #[tiny(axis)]
     pub intermediate_size: usize,
+    #[tiny(axis, max = 8)]
     pub num_hidden_layers: usize,
+    #[tiny(axis)]
     pub num_attention_heads: usize,
+    #[tiny(axis)]
     pub num_key_value_heads: usize,
+    #[tiny(fixed)]
     pub norm_eps: f64,
+    #[tiny(fixed)]
     pub rope_theta: f32,
+    #[tiny(fixed)]
     pub max_position_embeddings: usize,
+    #[tiny(axis, max = 8)]
     pub conv_l_cache: usize,
+    #[tiny(fixed)]
     pub conv_bias: bool,
+    #[tiny(derived = "Self::tiny_layer_types(num_hidden_layers)", cover)]
     pub layer_types: Vec<LayerType>,
+    #[tiny(fixed)]
     pub tie_embedding: bool,
+    #[tiny(fixed)]
     pub bos_token_id: Option<u32>,
+    #[tiny(fixed)]
     pub eos_token_id: Option<u32>,
     pub use_flash_attn: bool,
     /// Defaults to `Generic`, so `into_config` and every existing caller keep
@@ -1254,6 +1272,20 @@ pub fn parse_silu_impl(s: &str) -> std::result::Result<SiluImpl, String> {
 impl Config {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
+    }
+
+    /// The tiny models' layer pattern: attention at every third layer, the
+    /// rest conv — both kinds from three layers up.
+    pub fn tiny_layer_types(n_layers: usize) -> Vec<LayerType> {
+        (0..n_layers)
+            .map(|l| {
+                if l % 3 == 2 {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::Conv
+                }
+            })
+            .collect()
     }
 }
 

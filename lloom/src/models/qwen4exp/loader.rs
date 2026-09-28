@@ -198,6 +198,9 @@ struct Gguf<'a, R: Read + Seek> {
     shards: Vec<Shard<'a, R>>,
     index: HashMap<String, usize>,
     device: Device,
+    /// Every tensor read, for the schema's debug check (`build`).
+    #[cfg(debug_assertions)]
+    read: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl<'a, R: Read + Seek> Gguf<'a, R> {
@@ -214,6 +217,8 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
             shards,
             index,
             device: device.clone(),
+            #[cfg(debug_assertions)]
+            read: Default::default(),
         })
     }
     fn metadata(&self) -> &HashMap<String, Value> {
@@ -227,9 +232,20 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     }
     fn qtensor(&mut self, name: &str) -> Result<QTensor> {
         let i = self.shard_of(name)?;
+        #[cfg(debug_assertions)]
+        self.read.borrow_mut().insert(name.to_string());
         let device = self.device.clone();
         let s = &mut self.shards[i];
         s.content.tensor(s.reader, name, &device)
+    }
+    /// Every tensor of every shard, `(name, shape)`.
+    fn table(&self) -> impl Iterator<Item = (&str, &[usize])> {
+        self.shards.iter().flat_map(|s| {
+            s.content
+                .tensor_infos
+                .iter()
+                .map(|(n, ti)| (n.as_str(), ti.shape.dims()))
+        })
     }
     fn shape(&self, name: &str) -> Result<Vec<usize>> {
         let i = self.shard_of(name)?;
@@ -242,6 +258,8 @@ impl<'a, R: Read + Seek> Gguf<'a, R> {
     /// cannot be streamed from.
     fn locate(&self, name: &str) -> Result<(&Content, &Path)> {
         let i = self.shard_of(name)?;
+        #[cfg(debug_assertions)]
+        self.read.borrow_mut().insert(name.to_string());
         let s = &self.shards[i];
         match &s.path {
             Some(p) => Ok((&s.content, p)),
@@ -972,6 +990,15 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
         )
     }
     cfg.vocab_size = embed_shape[0];
+    let schema = super::schema::tensor_schema(
+        &cfg,
+        &super::schema::SchemaOptions {
+            mtp: opts.mtp,
+            ple: ple_hash.is_some(),
+        },
+        &Default::default(),
+    );
+    schema.validate(gg.table())?;
 
     let d = cfg.hidden_size;
     let n = cfg.hc_count;
@@ -1049,6 +1076,14 @@ fn build<R: ExpertResidency, Rd: Read + Seek>(
             None => PleTable::Mmap(table),
         };
         model.set_ple(l, hash, table, block)?;
+    }
+    #[cfg(debug_assertions)]
+    for t in &schema.tensors {
+        debug_assert!(
+            gg.read.borrow().contains(&t.name),
+            "the tensor schema lists `{}`, which the loader never read",
+            t.name
+        );
     }
     Ok(model)
 }

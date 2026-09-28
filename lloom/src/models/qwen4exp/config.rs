@@ -55,7 +55,7 @@ pub struct Config {
     #[tiny(axis)]
     pub hc_count: usize,
     /// `qwen4exp` HC low-rank = 320.
-    #[tiny(axis)]
+    #[tiny(axis, max = 2048)]
     pub hc_lowrank: usize,
 
     // ---- attention (QSA / full) ----

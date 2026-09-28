@@ -1891,6 +1891,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // per-layer readback loads each layer's true experts as it reaches
         // them: one replay per missed token, and the experts it loaded are
         // resident for the tokens after it.
+        let h = &Self::replay_input(h)?;
         cache.open_window()?;
         let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
         let redo = self.settle_records(&records)?;
@@ -1899,6 +1900,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             cache.keep_standing();
             return Ok(logits);
         }
+        self.note_replay();
         cache.rewind_window()?;
         cache.redos += 1;
         cache.device_plan_armed = false;
@@ -1953,6 +1955,35 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             .iter()
             .map(|l| l.moe().experts().misses_so_far())
             .sum()
+    }
+
+    /// `h` as the device-planned pass and its replay read it. A miss
+    /// rewinds the window and replays the pass from `h` after the planned
+    /// pass has run, inside the pass a driver holds; a pass plan recorded
+    /// from a pass that did not replay ends `h`'s interval at its first
+    /// reader and serves its slot to the next value, so the replay would
+    /// read that value. While the device may reuse activations, `h` is
+    /// copied into memory no plan serves (`DESIGN.md` §9.2aa, escapes are
+    /// declared); `h` itself otherwise.
+    fn replay_input(h: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = h.device().as_metal_device() {
+            if m.activations_may_be_reused() {
+                let _declared = lloom_tensor::EscapeGuard::new();
+                return crate::nn::recurrent::own_copy(h);
+            }
+        }
+        Ok(h.clone())
+    }
+
+    /// The pass in progress replays: its recording holds the replay, which
+    /// a pass that settles clean never runs, so it must not become its key's
+    /// plan (`MetalDevice::pass_diverged`).
+    fn note_replay(&self) {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = self.device().as_metal_device() {
+            m.pass_diverged();
+        }
     }
 
     fn decode_embed_pass<O: ForwardObserver>(
@@ -2333,6 +2364,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
             return Ok(logits);
         }
+        let h = Self::replay_input(&h)?;
         for c in caches.iter_mut() {
             c.open_window()?;
         }
@@ -2344,6 +2376,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
             return Ok(logits);
         }
+        self.note_replay();
         for c in caches.iter_mut() {
             c.rewind_window()?;
             c.redos += 1;
@@ -2531,6 +2564,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let input = Tensor::from_vec(tokens.to_vec(), (t, 1), &dev)?;
         let h = self.embed(&input)?; // [T, 1, hidden]
         let planned = self.device_plan && plan_on_device() && cache.device_plan_armed;
+        let h = if planned { Self::replay_input(&h)? } else { h };
         // The cold phase, as `decode_embed`'s: a host-planned window that
         // completed with every expert resident arms the device plan for the
         // rounds after it. Without this the speculative body — a prefill,
@@ -2548,6 +2582,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         if planned {
             let redo = self.settle_records(&records)?;
             if redo {
+                self.note_replay();
                 // The host plan over the same window from the base.
                 let tokens_v = cache
                     .window

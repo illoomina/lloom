@@ -23,7 +23,7 @@ let out = session.decode(&prompt_ids, detokenize, &params, |fragment| print!("{f
 
 - `DecodeParams::readback` selects the readback arm (`design/docs/decode-driver-design.md`,
   seam A). `Auto` takes the device-resident token ring with one forward of
-  lookahead — the arm `lfm2-chat` calls the crown — when the sampler is argmax
+  lookahead — the crown — when the sampler is argmax
   or plain temperature, and the blocking host-readback arm for top-p. `Blocking`
   and `Ring { lookahead, commit_steps }` select explicitly.
 - `decode_until` is `decode` whose fragment hook can end the run (`false` →
@@ -76,11 +76,31 @@ chat`'s default before), `--readback ring-fixed` and `--eos-gate=false` stay
 selectable; the gate is off, named at load, wherever the adaptive commit does
 not run and under `--replay`.
 
+### The run reports, and `lloom bench --mode`
+
+`lloom` is also the measurement harness the retired `lfm2-chat` example was
+(`src/app/report.rs`, `src/app/modes.rs`; the flag-for-flag map is
+`design/docs/decode-driver-design.md` Stage 7):
+
+```sh
+lloom chat --raw -p "$PROMPT" -v                     # the turn's diagnostics: first token, cadence, churn, KV, …
+lloom chat --raw -p "$PROMPT" --replay               # + what the ICB executor replayed (arena, packed, pass plans alike)
+lloom chat --raw -p "$PROMPT" --dspark --phase-sync  # + the round breakdown and its DSPARK_ROUNDS line
+CANDLE_METAL_PROFILE=1 lloom chat --raw -p "$PROMPT" # + GPU time by kernel, busy/wall, the idle between buffers
+lloom bench --mode concurrent --batched --sequences 4 --stagger 8   # solo vs the batched driver, each stream checked
+lloom bench --mode concurrent --dspark --sequences 2 --timeline r.csv  # solo vs the pipelined speculative driver
+lloom bench --mode reuse                             # turn 2 through prefix reuse vs a fresh prefill
+```
+
+The modes are LFM2's (`Served::run_mode`; Qwen4-exp refuses by name): each
+drives several sequences of one model directly, carries its solo reference
+arm and prints one `RESULT` line on stdout.
+
 Loads the LFM2.5-2.6B snapshot from the HF cache when no `--model` is given
 (`LFM2_MODEL_DIR` to point elsewhere), warms the Metal pipelines, and serves one
 request at a time on the crown decode configuration (`Sdpa × InPlace ×
-Shuffle`, the GEMV epilogue and conv fusions — `lfm2-chat --cache crown`'s
-arms, every one token-identical to the generic path).
+Shuffle`, the GEMV epilogue and conv fusions — `--cache crown`'s arms, every
+one token-identical to the generic path).
 
 Two contracts on the one port:
 

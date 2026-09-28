@@ -93,7 +93,7 @@ fn state_write_by_copy() -> bool {
 /// `MetalStorage::try_clone` hands back the same buffer — so a snapshot taken
 /// with it aliases what it snapshots; the CPU backend copies. This allocates
 /// and copies on every backend.
-fn own_copy(t: &Tensor) -> Result<Tensor> {
+pub(crate) fn own_copy(t: &Tensor) -> Result<Tensor> {
     let out = Tensor::zeros(t.shape(), t.dtype(), t.device())?;
     out.slice_set(&t.contiguous()?, 0, 0)?;
     Ok(out)

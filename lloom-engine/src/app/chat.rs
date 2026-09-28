@@ -9,8 +9,15 @@
 //! expands to the image's tiles (`vision.rs`). A `[vision: …]` line per turn
 //! says what the process holds — the model's tensors, whether the tower is
 //! loaded — and, under `CANDLE_METAL_PROFILE=1`, the image's dispatch census.
+//!
+//! After each turn the run reports (`report.rs`): what the executor arms
+//! engaged, the speculative rounds, the profile and trace a variable asked
+//! for, the memory peaks under `--mem-sample`, and under `--verbose` the
+//! once-per-run diagnostics (the first token's split, the visible cadence,
+//! the hot thread, the churn, the lock contention, the KV slab).
 
-use super::common::{eos_gate_name, host_fill_name, ms, NEVER_EOS};
+use super::common::{eos_gate_name, host_fill_name, ms, MemSnapshot, NEVER_EOS};
+use super::report;
 use super::vision::{expand_image_tokens, DecodedImage};
 use super::{load_engine, ModelArgs, Shape};
 use anyhow::{Context, Result};
@@ -60,8 +67,8 @@ pub struct ChatArgs {
     pub prompt: Option<String>,
 
     /// The prompt is already rendered: no chat template, the text encoded as
-    /// given with the checkpoint's BOS — what `lfm2-chat` and a benchmark
-    /// runner feed, so a reply can be compared token for token.
+    /// given with the checkpoint's BOS — what a benchmark runner feeds, so a
+    /// reply can be compared token for token.
     #[arg(long)]
     pub raw: bool,
 
@@ -70,6 +77,23 @@ pub struct ChatArgs {
     /// checkpoint without a vision tower refuses it by name.
     #[arg(long, value_name = "PATH")]
     pub image: Vec<std::path::PathBuf>,
+
+    /// Encode the prompt without the checkpoint's BOS (the template-off A/B:
+    /// LFM2's `generation_config.json` starts a sequence with it).
+    #[arg(long)]
+    pub no_bos: bool,
+
+    /// Sample the memory gauges every 10 ms over each turn and print their
+    /// peaks (`MEMPEAK`): the device allocation, the pool's live / free /
+    /// pending bytes, the footprint. Off the hot thread.
+    #[arg(long)]
+    pub mem_sample: bool,
+
+    /// Print each turn's diagnostics: the first token's split, the visible
+    /// cadence, the hot thread and page faults, the churn, the lock
+    /// contention, the pacer's depth, the KV slab, the speculative rounds.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
 }
 
 /// The reply's token digest in `lfm2-determinism`'s definition: SHA-256 over
@@ -86,6 +110,9 @@ fn tokens_sha256(ids: &[u32]) -> String {
 
 pub fn run(args: ChatArgs) -> Result<()> {
     let options = super::resolve_options(&args.common)?;
+    // After the tuning install: the trace switch is a tuning knob, and a knob
+    // read before the install cannot be installed.
+    report::arm_trace();
     // The chat's own default is a long turn; the group's 512 is the server's.
     let mut sampling = options.sampling.clone();
     if args.common.options.sampling.max_tokens.is_none()
@@ -217,16 +244,27 @@ pub fn run(args: ChatArgs) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             expand_image_tokens(&rendered, &expansions)?
         };
-        let ids = engine.encode(&rendered, true)?;
+        let ids = engine.encode(&rendered, !args.no_bos)?;
         let params = sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
+        let probe = report::RunProbe::start(engine.device(), args.mem_sample);
         let started = Instant::now();
         let mut first_at: Option<f64> = None;
+        let mut first_device_allocated: Option<u64> = None;
+        let mut stamps: Vec<f64> = Vec::new();
+        let verbose = args.verbose;
+        let device = engine.device().clone();
         let mut on_fragment = |frag: &str| {
             if first_at.is_none() {
                 first_at = Some(ms(started.elapsed()));
+                if verbose {
+                    first_device_allocated = Some(MemSnapshot::read(&device).device_allocated);
+                }
             }
             print!("{frag}");
             let _ = std::io::stdout().flush();
+            if verbose {
+                stamps.push(ms(started.elapsed()));
+            }
             true
         };
         let decoded = if images.is_empty() {
@@ -235,13 +273,14 @@ pub fn run(args: ChatArgs) -> Result<()> {
             engine.complete_images_until(&ids, &images, &params, &mut on_fragment)
         }
         .context("decoding the turn")?;
+        let elapsed = started.elapsed();
         println!();
         messages.push(json!({ "role": "assistant", "content": decoded.text }));
         let st = &decoded.stats;
-        let wall = ms(started.elapsed());
+        let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} eos_index={}/{} prefill_units={} param-style={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -258,6 +297,88 @@ pub fn run(args: ChatArgs) -> Result<()> {
             tokens_sha256(&ids),
             eos_gate_name(st.eos_gate),
             host_fill_name(st.host_feed.as_ref()),
+            st.max_in_flight,
+            st.step_markers,
+            st.step_waits,
+            report::cut_policy_arm(engine.device()),
+            report::pipelined_cut_arm(engine.device()),
+            st.readback.ring_publishes,
+            st.readback.poll_fallbacks,
+            st.readback.eos_index_hits,
+            st.readback.eos_index_late,
+            st.prefill_units,
+            report::param_style_arm(),
+        );
+        if st.readback.poll_fallbacks > 0 {
+            eprintln!(
+                "[{}: the ring's words were not CPU-mapped; the EOS read took the blocking \
+                 fallback ({} of {} steps)]",
+                decoded.readback.name(),
+                st.readback.poll_fallbacks,
+                st.steps
+            );
+        }
+        if let Some((ramp, bulk)) = options.decode.prefill.schedule() {
+            let tags: Vec<String> = ramp
+                .iter()
+                .map(|&m| format!("{m}:{}", report::tile_tag(m)))
+                .collect();
+            let bulk = if bulk > 0 {
+                format!("{bulk}:{}", report::tile_tag(bulk))
+            } else {
+                "seq_len=1".to_string()
+            };
+            eprintln!(
+                "[spark: ramp=[{}] bulk={bulk} (remainder), then <bulk seq_len=1 tail; \
+                 prefill_units={}{}]",
+                tags.join(", "),
+                st.prefill_units,
+                if options.decode.prefill.in_flight > 0 {
+                    format!("; prefill_in_flight={}", options.decode.prefill.in_flight)
+                } else {
+                    String::new()
+                },
+            );
+        }
+        if args.verbose {
+            eprintln!(
+                "[first-token: submit {:.2} ms (host encode, no GPU wait) | first fragment {} ms \
+                 (received and detokenized, to stdout); tail after the loop {:.2} ms]",
+                st.ttft_compute_ns as f64 / 1e6,
+                first_at
+                    .map(|t| format!("{t:.2}"))
+                    .unwrap_or_else(|| "n/a".into()),
+                st.tail_ns as f64 / 1e6,
+            );
+            report::print_visible_cadence(&stamps, decoded.tokens.len());
+            if let Some(bytes) = first_device_allocated {
+                eprintln!(
+                    "[prefill: device_allocated {:.3} GB at the first token (after the prefill and the first step)]",
+                    bytes as f64 / 1e9
+                );
+            }
+            for line in engine.diagnostics() {
+                eprintln!("{line}");
+            }
+        }
+        probe.finish(
+            engine.device(),
+            st,
+            report::RunFacts {
+                tokens: decoded.tokens.len(),
+                prompt_tokens: ids.len(),
+                wall: elapsed,
+                k: match decoded.readback {
+                    crate::ReadbackArm::Speculative { k } => Some(k),
+                    _ => None,
+                },
+            },
+            engine.installed(),
+            report::Wanted {
+                verbose: args.verbose,
+                phase_sync: options.decode.phase_sync,
+                run_ahead: options.decode.readback.run_ahead,
+            },
         );
         let report = engine.vision_report();
         if !report.is_null() {

@@ -529,6 +529,10 @@ pub struct EncoderState {
     /// is on -- Metal has no way to read the bound pipeline back, and doing so
     /// per dispatch on the classical path would be cost for nobody.
     pub current_pipeline: Option<Arc<str>>,
+    /// The largest input buffer bound since the last dispatch, in bytes. For a
+    /// GEMV that is its weight matrix, which is how the counter profile prices a
+    /// kernel in GB/s. Only maintained under `profile::counters_enabled()`.
+    pub dispatch_input_max: usize,
 }
 
 impl Default for EncoderState {
@@ -558,6 +562,7 @@ impl EncoderState {
             fence_hits: 0,
             fence_waits: 0,
             current_pipeline: None,
+            dispatch_input_max: 0,
         }
     }
 }
@@ -919,12 +924,15 @@ impl ComputeCommandEncoder {
         if !profiling && !cfg!(feature = "hazard-audit") {
             return;
         }
-        let name = {
-            let s = self.state.lock();
-            s.current_pipeline.clone()
+        let (name, input_bytes) = {
+            let mut s = self.state.lock();
+            (
+                s.current_pipeline.clone(),
+                std::mem::take(&mut s.dispatch_input_max),
+            )
         };
         if profiling {
-            crate::kernels::metal::profile::record_dispatch(name.as_ref());
+            crate::kernels::metal::profile::record_dispatch(name.as_ref(), input_bytes);
         }
         crate::kernels::metal::hazard_audit::record_dispatch(
             name.as_deref().unwrap_or("<unnamed>"),
@@ -1061,6 +1069,9 @@ impl ComputeCommandEncoder {
             let range = Self::bound_range(buf, offset);
             let mut s = self.state.lock();
             late_bind::on_bind(ptr, false, s.current_pipeline.as_deref().unwrap_or("?"));
+            if crate::kernels::metal::profile::counters_enabled() {
+                s.dispatch_input_max = s.dispatch_input_max.max(buf.length());
+            }
             // Read-after-write against an earlier encoder: order against that
             // buffer's last writer only, under the lock this bind holds anyway.
             self.wait_for_buffer(&mut s, ptr);

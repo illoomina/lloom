@@ -184,6 +184,14 @@ name = "gemv_epilogue_ab"
 required-features = ["metal"]
 
 [[example]]
+name = "gemv_ceiling"
+required-features = ["metal"]
+
+[[example]]
+name = "counter_sample_limit"
+required-features = ["metal"]
+
+[[example]]
 name = "gemv_residual_ab"
 required-features = ["metal"]
 

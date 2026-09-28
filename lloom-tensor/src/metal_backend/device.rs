@@ -410,6 +410,9 @@ pub struct PassPlans {
     pending: Option<PassKey>,
     /// What the pass in progress is doing.
     current: Option<PassState>,
+    /// The pass in progress took a data-dependent branch its key does not
+    /// name (`MetalDevice::pass_diverged`).
+    diverged: bool,
     counters: PassPlanCounters,
     /// Per key: ordinals of its first sight the next pass read undeclared,
     /// as `(ordinal, bytes, allocated at dispatch, first read at dispatch of
@@ -477,6 +480,7 @@ impl PassPlans {
             arena_generation: HashMap::new(),
             pending: None,
             current: None,
+            diverged: false,
             counters: PassPlanCounters::default(),
             escapes: HashMap::new(),
             ragged_order: std::collections::VecDeque::new(),
@@ -1832,6 +1836,24 @@ impl MetalDevice {
         Some((keys, p.base.as_ref().map_or(0, |b| b.length())))
     }
 
+    /// The pass in progress took a data-dependent branch its key does not
+    /// name: a model that settles a step and, on a miss, replays it inside
+    /// the same pass. Its recording holds the branch, which a pass of the
+    /// same key that does not take it never runs, so the values the branch
+    /// supersedes (the first computation's logits) would be planned as dead
+    /// and served to a pass whose outputs they are. Such a pass still closes
+    /// the key it observes, and is never itself a plan; its key records
+    /// again on its next sight (`DESIGN.md` §9.2aa). A no-op when no pass is
+    /// open or the cache is off.
+    pub fn pass_diverged(&self) {
+        if let Some(pp) = self.pass_plans.lock().as_mut() {
+            if pp.current.is_some() && !pp.diverged {
+                pp.diverged = true;
+                pp.counters.diverged += 1;
+            }
+        }
+    }
+
     /// Open a forward pass of shape `key`. Under a cached plan the pass is
     /// served from the base; on a key's first sight, and on the pass after
     /// it, the pass runs on the pool under the recorder. Falls back to
@@ -1861,6 +1883,7 @@ impl MetalDevice {
         }
         self.pass_state
             .fetch_or(0b10, std::sync::atomic::Ordering::Relaxed);
+        pp.diverged = false;
         // Whatever this pass does, the arena the last pass installed must not
         // serve it: a pass is served only under its own key's plan.
         self.clear_arena_keep_base();
@@ -1953,9 +1976,10 @@ impl MetalDevice {
                     Self::close_pending(self, pp, closes)?;
                     closed_a_plan = true;
                 }
-                if pp.plans.contains_key(&key) {
+                if pp.plans.contains_key(&key) || pp.diverged {
                     // The key it closed was its own (two sightings back to
-                    // back): planned now, nothing left to observe.
+                    // back): planned now, nothing left to observe. Or this
+                    // pass diverged, and its recording is no key's plan.
                     pp.pending = None;
                     self.finish_arena_recording(pp.layout);
                 } else {

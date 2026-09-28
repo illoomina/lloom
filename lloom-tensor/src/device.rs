@@ -720,8 +720,11 @@ impl Device {
     /// `token_slot` and `history_slot` (U32 views of one element), raises the
     /// EOS gate's flag if the token is in `eos_ids` (U32; only while the gate
     /// is armed), fences, and stamps `generation` into `step` (U32, one
-    /// element) — the chain of `cast`, `argmax`, three blits and the gate
-    /// kernel as one launch. The argmax follows `reduce.metal`'s rule (the
+    /// element) unless `generation` is 0 — the chain of `cast`, `argmax`, three
+    /// blits and the gate kernel as one launch. The fence orders the stamp
+    /// after the slots for the GPU, not for a host reading mapped memory; a
+    /// stamp a host polls is `ring_stamp`'s, bound to the slots' buffer.
+    /// The argmax follows `reduce.metal`'s rule (the
     /// greatest value, the lowest index on ties). Metal only.
     pub fn argmax_publish(
         &self,

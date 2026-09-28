@@ -172,6 +172,10 @@ name = "serial_boundary_cost"
 required-features = ["metal"]
 
 [[example]]
+name = "host_table_probe"
+required-features = ["metal"]
+
+[[example]]
 name = "gdn_step_bench"
 required-features = ["metal"]
 

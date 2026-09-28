@@ -226,7 +226,9 @@ fn the_gated_variant_is_a_separate_pipeline_and_the_plain_one_is_untouched() {
 /// The fused publish (`call_argmax_publish`, lloom #735 step 5) against the
 /// host: the greatest value, the lowest index on ties — `reduce.metal`'s
 /// `indexed<T>` rule, which `fast_argmax` implements — into both slots, the
-/// flag iff the token is a stop token, the stamp last.
+/// flag iff the token is a stop token, the stamp last; and with generation 0
+/// no stamp at all (the ring stamps with `ring_stamp` instead, whose order a
+/// host reading mapped memory can rely on), the stamp word left as it was.
 #[test]
 fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
     use crate::kernels::call_argmax_publish;
@@ -283,9 +285,12 @@ fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
                 ("argmax_publish_f16", &logits16),
                 ("argmax_publish_f32", &logits32),
             ] {
-                for eos_is_the_token in [false, true] {
+                for (eos_is_the_token, generation) in [(false, 77u32), (true, 77), (false, 0)] {
                     let slots = device.new_buffer(64, SHARED).unwrap();
                     zero(&slots, 64);
+                    const UNTOUCHED: u32 = 55;
+                    // SAFETY: a fresh Shared buffer of 64 bytes, nothing in flight.
+                    unsafe { (slots.contents() as *mut u32).add(5).write(UNTOUCHED) };
                     let eos = device.new_buffer(8, SHARED).unwrap();
                     write_u32(
                         &eos,
@@ -317,7 +322,7 @@ fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
                                 buffer: &slots,
                                 offset_in_bytes: 20,
                             },
-                            77,
+                            generation,
                         )
                         .unwrap();
                     }
@@ -326,7 +331,15 @@ fn the_fused_publish_matches_the_host_argmax_and_stamps_after_the_slots() {
                         unsafe { std::slice::from_raw_parts(slots.contents() as *const u32, 8) };
                     assert_eq!(out[1], host, "{kernel} n={n}: the token slot");
                     assert_eq!(out[3], host, "{kernel} n={n}: the history slot");
-                    assert_eq!(out[5], 77, "{kernel} n={n}: the stamp");
+                    assert_eq!(
+                        out[5],
+                        if generation == 0 {
+                            UNTOUCHED
+                        } else {
+                            generation
+                        },
+                        "{kernel} n={n} generation {generation}: the stamp"
+                    );
                     assert_eq!(
                         [out[0], out[2], out[4], out[6]],
                         [0; 4],

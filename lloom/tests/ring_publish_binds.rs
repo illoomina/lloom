@@ -153,3 +153,71 @@ fn every_stamp_binds_the_slots_and_the_flag_it_certifies() -> Result<()> {
     device.synchronize()?;
     Ok(())
 }
+
+/// The fused publish's stamp is a `ring_stamp` of its own, dispatched after
+/// the kernel and binding the history segment the kernel wrote. The kernel's
+/// in-dispatch fence orders its slot and its stamp for the GPU and not for a
+/// host reading the mapped words; a stamp in a later dispatch that binds the
+/// segment is ordered after the slot by the command stream (§11.5z-xvi). A
+/// race test sees the other shape only at a rate; this reads the shape.
+#[test]
+fn the_fused_publish_is_stamped_by_a_dispatch_that_binds_its_slot() -> Result<()> {
+    install_knobs();
+    let Ok(device) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let mut row = vec![0f32; 64];
+    row[5] = 1.0;
+    let logits = Tensor::from_vec(row, 64, &device)?;
+    let mut sampler = LogitsProcessor::from_sampling(0, Sampling::ArgMax);
+    let mut ring = Ring::new(&[EOS], &device, 8, EosRead::Poll(Default::default()))?;
+    ring.set_fused_publish(true);
+    let ds = traced(|| ring.sample_and_feed(&mut sampler, &logits).map(|_| ()))?;
+    assert!(
+        ring.publishes_fused(),
+        "the step did not take the fused publish"
+    );
+    let step = addr(ring.token_ring().step_counter());
+    let input = addr(ring.token_ring().input_device());
+    let fused: Vec<usize> = ds
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.pipeline.starts_with("argmax_publish"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(fused.len(), 1, "one fused dispatch per publish");
+    let mut history: Vec<usize> = bound(&ds[fused[0]], true)
+        .into_iter()
+        .filter(|a| *a != step && *a != input)
+        .collect();
+    history.dedup();
+    assert_eq!(
+        history.len(),
+        1,
+        "the fused kernel writes one history segment: {history:x?}"
+    );
+    let st: Vec<usize> = ds
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.pipeline == "ring_stamp")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(st.len(), 1, "fused: one ring_stamp per publish, got {st:?}");
+    assert!(
+        st[0] > fused[0],
+        "fused: the stamp is dispatched before the kernel"
+    );
+    let inputs = bound(&ds[st[0]], false);
+    eprintln!("fused: stamp inputs {inputs:x?}, history {:x}", history[0]);
+    assert!(
+        inputs.contains(&history[0]),
+        "fused: the stamp does not bind the history segment the kernel wrote"
+    );
+    assert_eq!(
+        bound(&ds[st[0]], true),
+        vec![step],
+        "fused: the stamp writes step and nothing else"
+    );
+    device.synchronize()?;
+    Ok(())
+}

@@ -324,6 +324,10 @@ pub struct PassPlanCounters {
     /// `MetalDevice::set_pass_plan_ragged_cap` of them (the `lru` arm's
     /// bound); a dropped layout is recorded again on its next sight.
     pub capped: u64,
+    /// Passes that took a data-dependent branch their key does not name
+    /// (`MetalDevice::pass_diverged`, a model's replay). None of them was
+    /// made a plan.
+    pub diverged: u64,
 }
 
 /// Alignment of every slot, in bytes.

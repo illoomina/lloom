@@ -1,22 +1,20 @@
 //! The Qwen4-exp engine: one sequence over the resident or the streamed
 //! expert tier (`lloom::models::qwen4exp`, `expert-streaming.md` §20),
-//! driven by the same `DecodeSession` the LFM2 engine drives — the blocking
-//! readback arm by default, because the model's `forward` hashes its input
-//! ids on the host for the N-gram PLE (`CausalLM::note_input_ids` hands them
-//! over; a ring arm's device-resident token would be read back per step,
-//! correct and slower, and is served only when asked for by name). `--mtp`
-//! puts the MTP head on the speculative body (`decode_speculative_until`):
-//! one drafted token per round, verified by the target, byte-identical to
-//! greedy (issue #749).
+//! driven by the same `DecodeSession` the LFM2 engine drives. The N-gram PLE
+//! hashes each input id into a host-mapped table, so a decode forward needs
+//! its id on the host: the blocking arm hands it over
+//! (`CausalLM::note_input_ids`), and a ring arm that stamps each token feeds
+//! it through the driver's host fill, the GPU waiting for the rows
+//! (`CausalLM::host_feed`). `auto` is the blocking arm: the fill is faster
+//! while the streamed expert pool holds the working set and slower while it
+//! misses (`resolve_readback`, `design/docs/expert-streaming.md` §20.13c).
+//! `--mtp` puts the MTP head on the speculative body
+//! (`decode_speculative_until`): one drafted token per round, verified by the
+//! target, byte-identical to greedy (issue #749).
 //!
-//! Not built for this family yet: `--dspark` (LFM2's drafter), the
-//! rewindable cache (a ring arm's lookahead overrun resets the sequence
-//! rather than rewinding it). `--batch N` runs the rows through the
-//! scheduler (the weights once over the rows, the state per row). A ring
-//! arm's lookahead has nothing to gain here by construction: the PLE
-//! hashes the token id into a host-mapped table before layer 1, so the
-//! host must know token `t` before it encodes forward `t+1`
-//! (`design/docs/decode-driver-design.md` Stage 6).
+//! Not built for this family yet: `--dspark` (LFM2's drafter). `--batch N`
+//! runs the rows through the scheduler (the weights once over the rows, the
+//! state per row).
 
 use super::common::{
     lock, model_name_from_dir, ms, newest_snapshot, open_device, DecodeTiming, MemGauge, MemReport,
@@ -119,7 +117,7 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     text: Text,
     model_name: String,
     kv_capacity: usize,
-    /// The arm requests take, resolved at load: `Auto` → the blocking arm.
+    /// The arm requests take, resolved at load (`resolve_readback`).
     readback: ReadbackArm,
     /// The executor arms installed at load.
     executor: crate::ExecutorConfig,
@@ -138,6 +136,71 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     /// `--batch N`: the scheduler and its thread.
     sched: Option<BatchHandle<Qwen4Exp<R>, ()>>,
     sched_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// Why a ring arm on this engine cannot take the PLE's host fill
+/// (`CausalLM::host_feed`), or `None` when it can. Without the fill a ring
+/// arm's forward reads its fed id back.
+fn host_fill_absent<R: ExpertResidency>(
+    model: &Qwen4Exp<R>,
+    device: &Device,
+) -> Option<&'static str> {
+    if !device.is_metal() {
+        Some("the host fill needs Metal (a shared event the GPU waits on)")
+    } else if !model.has_ple() {
+        Some("no PLE is attached")
+    } else if !model.host_fill() {
+        Some("the host fill is off")
+    } else {
+        None
+    }
+}
+
+/// The arm requests take, and the load's note on it.
+///
+/// `auto` is the blocking arm on Qwen4-exp. A ring arm that stamps each
+/// token feeds the PLE through the driver's host fill instead, which is
+/// faster than blocking while the streamed expert pool holds the working set
+/// and slower while it misses (`expert-streaming.md` §20.13c); on any other
+/// ring arm, or where the fill cannot run, the forward reads its fed id back.
+/// An explicit arm is served as asked, and the note says which of the two it
+/// is.
+fn resolve_readback(
+    asked: ReadbackArm,
+    no_fill: Option<&'static str>,
+) -> (ReadbackArm, Option<String>) {
+    match asked {
+        ReadbackArm::Auto => (
+            ReadbackArm::Blocking,
+            Some(
+                "auto: blocking on Qwen4-exp. --readback ring-fixed feeds the PLE from the host \
+                 instead: faster while the streamed expert pool holds the working set, slower \
+                 while it misses (expert-streaming.md §20.13c)"
+                    .to_string(),
+            ),
+        ),
+        ReadbackArm::Ring(ring) => {
+            let why = no_fill.or((!crate::options::stamps_each_token(ring)).then_some(
+                "a deferred EOS read on the fixed cadence stamps once per window, and the fill \
+                 waits on each token's stamp",
+            ));
+            let note = match why {
+                Some(why) => format!(
+                    "{}: each decode forward reads its fed id back ({why}) — correct, and slower \
+                     than blocking where measured (expert-streaming.md §20.13b)",
+                    asked.name()
+                ),
+                None => format!(
+                    "{}: the PLE fed by the driver's host fill — faster than blocking while the \
+                     streamed expert pool holds the working set, slower while it misses \
+                     (expert-streaming.md §20.13c)",
+                    asked.name()
+                ),
+            };
+            (asked, Some(note))
+        }
+        other => (other, None),
+    }
 }
 
 /// `first` plus its `-0000k-of-0000N` siblings, in shard order.
@@ -331,22 +394,10 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         let model_name = opts
             .model_name
             .unwrap_or_else(|| model_name_from_dir(&tokenizer_dir));
-        // The blocking arm is this family's `auto`: the forward needs its
-        // input ids on the host (the PLE hash), which the blocking arm holds
-        // and hands over; a ring arm is honoured by name and reads them back.
-        let readback = match opts.readback {
-            ReadbackArm::Auto => ReadbackArm::Blocking,
-            other => {
-                if !matches!(other, ReadbackArm::Blocking) {
-                    eprintln!(
-                        "[readback {}: a ring arm on Qwen4-exp reads the fed id back per step \
-                         (the PLE hashes it on the host) — correct, and no faster than blocking]",
-                        other.name()
-                    );
-                }
-                other
-            }
-        };
+        let (readback, note) = resolve_readback(opts.readback, host_fill_absent(&model, &device));
+        if let Some(note) = note {
+            eprintln!("[readback {note}]");
+        }
         let mtp = opts.mtp.is_some();
         if mtp && model.mtp_head().is_none() {
             anyhow::bail!("--mtp was given but the loader found no MTP head in the shards");
@@ -436,9 +487,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         }
         if opts.warmup {
             let t = Instant::now();
-            // This model brackets the passes the warmup runs itself, after its
-            // embedding; a driver's pass of the same key opens before it. The
-            // warmup's passes must leave no plan behind (`DESIGN.md` §9.2aa).
+            // The warmup's passes belong to no sequence and must leave no plan
+            // behind (`DESIGN.md` §9.2aa).
             #[cfg(feature = "metal")]
             let _paused = match &engine.device {
                 Device::Metal(m) => Some(m.pause_pass_plans()?),
@@ -1094,6 +1144,8 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
         let logits = self.with_single(|s| {
             s.reset();
             let input = Tensor::new(ids.as_slice(), &device)?.unsqueeze(0)?;
+            // No driver bracket: the model opens its own passes, keyed apart
+            // from a driver's pass of the same shape (§9.2aa).
             let logits = s.model().forward(&input, 0, s.cache_mut())?;
             s.reset();
             Ok(logits.squeeze(0)?.to_dtype(DType::F32)?)
@@ -1148,5 +1200,61 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
                 eprintln!("hotlist {}: not written ({e})", path.display());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_readback;
+    use crate::{ReadbackArm, RingArm};
+    use lloom::generation::EosRead;
+
+    /// `auto` is the blocking arm, fill or no fill, and the note names the
+    /// ring arm that feeds the PLE from the host instead.
+    #[test]
+    fn auto_is_blocking_and_names_the_filled_ring() {
+        for no_fill in [None, Some("no PLE is attached")] {
+            let (arm, note) = resolve_readback(ReadbackArm::Auto, no_fill);
+            assert_eq!(arm, ReadbackArm::Blocking);
+            let note = note.expect("the load says what auto is");
+            assert!(
+                note.contains("blocking")
+                    && note.contains("ring-fixed")
+                    && note.contains("§20.13c"),
+                "{note}"
+            );
+        }
+    }
+
+    /// An explicit arm is served as asked; a ring arm's note says whether the
+    /// host fill feeds it or its forward reads the id back, and why.
+    #[test]
+    fn an_explicit_ring_arm_says_whether_the_fill_feeds_it() {
+        for ring in [ReadbackArm::CROWN, ReadbackArm::RING_FIXED] {
+            let (arm, note) = resolve_readback(ring, None);
+            assert_eq!(arm, ring);
+            let note = note.unwrap();
+            assert!(note.contains("host fill") && note.contains("misses"), "{note}");
+        }
+        let drain = ReadbackArm::Ring(RingArm {
+            eos: EosRead::HostOnDrain,
+            ..RingArm::FIXED
+        });
+        let note = resolve_readback(drain, None).1.unwrap();
+        assert!(
+            note.contains("reads its fed id back") && note.contains("deferred"),
+            "{note}"
+        );
+        let note = resolve_readback(ReadbackArm::RING_FIXED, Some("no PLE is attached"))
+            .1
+            .unwrap();
+        assert!(
+            note.contains("reads its fed id back") && note.contains("no PLE is attached"),
+            "{note}"
+        );
+        assert_eq!(
+            resolve_readback(ReadbackArm::Blocking, None),
+            (ReadbackArm::Blocking, None)
+        );
     }
 }

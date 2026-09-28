@@ -258,18 +258,43 @@ pub enum PassKind {
     Ragged { live: u16, pieces: u16, layout: u64 },
 }
 
+/// Who opened a pass. A driver opens its pass before calling the model, so
+/// the pass holds everything `forward` allocates; a model that brackets a
+/// pass no driver holds opens it inside `forward`, after its embedding. One
+/// shape therefore names two allocation sequences, and a shift of whole
+/// allocate-and-dispatch operations moves an ordinal and its position
+/// together, which the drift guard cannot see. Keying on the opener keeps
+/// each plan to the sequence it was recorded from (`DESIGN.md` §9.2aa).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PassOpener {
+    #[default]
+    Driver,
+    Model,
+}
+
 /// A pass kind under the axes that change its dispatch sequence. `arms` is
 /// the caller's hash of those axes; the harnesses run one configuration per
-/// process and pass 0.
+/// process and pass 0. `opener` is who bracketed the pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PassKey {
     pub kind: PassKind,
     pub arms: u64,
+    pub opener: PassOpener,
 }
 
 impl PassKey {
+    /// A driver's pass of `kind`.
     pub fn new(kind: PassKind) -> Self {
-        Self { kind, arms: 0 }
+        Self {
+            kind,
+            arms: 0,
+            opener: PassOpener::Driver,
+        }
+    }
+
+    /// This key, for a pass `opener` bracketed.
+    pub fn opened_by(self, opener: PassOpener) -> Self {
+        Self { opener, ..self }
     }
 }
 

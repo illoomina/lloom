@@ -1723,13 +1723,11 @@ impl MetalDevice {
     /// pool, record nothing and are served nothing, and the cache comes back
     /// exactly as it was.
     ///
-    /// A plan is valid only for the allocation sequence its key was recorded
-    /// under, and such passes need not share it: a model that brackets its
-    /// own passes opens them after its embedding, a driver before, so one key
-    /// names two sequences one allocation apart — which size and position
-    /// coincide across (§9.2aa). A key left pending would have the paused
-    /// passes recorded into it; its recording is dropped and it records
-    /// again on its next sight. Refused while a pass is open.
+    /// Unpaused, such passes would leave plans behind, recorded at positions
+    /// no real prompt takes, which no `reset` undoes. A key left pending
+    /// would have the paused passes recorded into it; its recording is
+    /// dropped and it records again on its next sight. Refused while a pass
+    /// is open.
     pub fn pause_pass_plans(&self) -> Result<PassPlansPaused<'_>> {
         let mut g = self.pass_plans.lock();
         if g.as_ref().is_some_and(|pp| pp.current.is_some()) {

@@ -339,6 +339,16 @@ impl ReadbackConfig {
     }
 }
 
+/// Whether a ring arm, as it runs ([`RingArm::resolved`]), stamps each token
+/// as it publishes it: the poll and flag reads always, the deferred reads
+/// only under the adaptive commit. A model's host fill needs that stamp
+/// (`CausalLM::host_feed`); on any other arm its forward reads the fed id
+/// back. Restates `ReadbackStrategy::stamps_each_token` for `Ring`, and a
+/// test holds the two equal on every read and cadence.
+pub fn stamps_each_token(ring: RingArm) -> bool {
+    matches!(ring.eos, EosRead::Blocking | EosRead::Poll(_)) || ring.adaptive
+}
+
 // ---- the prefill ----------------------------------------------------------------
 
 /// The aligned GEMM buckets `--spark` schedules through (`lfm2-chat`: `1` is
@@ -1278,6 +1288,43 @@ mod tests {
         assert_eq!(cfg.in_flight, 2);
         assert_eq!(cfg.prefill.tile, 2048);
         assert_eq!(cfg.prefill.schedule(), Some((vec![16], 0)));
+    }
+
+    /// `stamps_each_token` answers what the ring itself answers, on every
+    /// EOS read at both cadences (the CPU ring: the rule is the strategy's,
+    /// not the device's).
+    #[test]
+    fn stamps_each_token_is_the_rings_own_answer() {
+        use lloom::generation::{ReadbackStrategy, Ring};
+        let reads = [
+            EosRead::Blocking,
+            EosRead::Poll(PollMechanism::default()),
+            EosRead::HostOnDrain,
+            EosRead::GpuBatched,
+            EosRead::GpuBatchedNonblocking,
+        ];
+        let mut per_token = 0;
+        for eos in reads {
+            let ring = Ring::new(&[2], &lloom_tensor::Device::Cpu, 64, eos).unwrap();
+            for adaptive in [false, true] {
+                let arm = RingArm {
+                    adaptive,
+                    eos,
+                    ..RingArm::CROWN
+                };
+                assert_eq!(
+                    stamps_each_token(arm),
+                    ring.stamps_each_token(adaptive),
+                    "{}",
+                    arm.name()
+                );
+                per_token += stamps_each_token(arm) as usize;
+            }
+        }
+        assert_eq!(
+            per_token, 7,
+            "poll and flag twice, the three deferred reads once"
+        );
     }
 
     /// A ring arm that cannot carry the adaptive commit — the flag EOS read,

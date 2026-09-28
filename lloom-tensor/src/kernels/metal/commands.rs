@@ -500,8 +500,10 @@ pub struct Commands {
 ///
 /// A command buffer's completion handler only marks the fences of the sessions
 /// it carried completed ([`Fence::mark_completed`]); the host removes their map
-/// entries at its next encoder close ([`FenceBook::reap`]), under the locks that
-/// close takes anyway. So no Metal completion thread ever takes the map's lock
+/// entries at its next encoder close or queue-wide wait ([`FenceBook::reap`]),
+/// under the locks those take anyway. Nothing removes an entry whose session
+/// may still be running: with several threads on one queue, a wait covers only
+/// what was committed when it began. So no Metal completion thread ever takes the map's lock
 /// or this one, and an encoding thread can never wait on a completion thread
 /// descheduled while holding them (`DESIGN.md` §6.4d). Until the close, a bind
 /// that finds a completed fence treats it as absent, as it was once the
@@ -537,11 +539,6 @@ impl FenceBook {
                 }
             }
         }
-    }
-
-    fn clear(&mut self) {
-        self.live.clear();
-        self.retiring.clear();
     }
 }
 
@@ -1086,8 +1083,14 @@ impl Commands {
             }
         }
 
-        self.prev_ce_outputs.write(Side::Host).clear();
-        self.live_fences.lock(Side::Host).clear();
+        // Drop only what has completed. The state lock was released before the
+        // wait, so another thread sharing this queue may have ended sessions
+        // since, and those may still be running: their entries are the only
+        // thing ordering a later encoder's reads of what they wrote (§6.4f).
+        {
+            let mut prev_ce_outputs = self.prev_ce_outputs.write(Side::Host);
+            self.live_fences.lock(Side::Host).reap(&mut prev_ce_outputs);
+        }
 
         Ok(())
     }

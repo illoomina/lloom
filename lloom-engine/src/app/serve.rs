@@ -1519,6 +1519,7 @@ fn timings(prompt: usize, d: &Decoded, elapsed: std::time::Duration) -> Value {
         "poll_fallbacks": st.readback.poll_fallbacks,
         "overrun": st.overrun,
         "eos_gate": super::common::eos_gate_name(st.eos_gate),
+        "host_fill": super::common::host_fill_name(st.host_feed.as_ref()),
         // The generated ids, so a gate can compare a run against a recorded
         // token digest without a second path to the model.
         "tokens": d.tokens,
@@ -1537,7 +1538,7 @@ fn report(endpoint: &str, prompt: usize, d: &Decoded, total_ms: f64) {
     eprintln!(
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
          {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
-         commits={} poll_fallbacks={} overrun={} eos_gate={}]",
+         commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -1547,6 +1548,7 @@ fn report(endpoint: &str, prompt: usize, d: &Decoded, total_ms: f64) {
         st.readback.poll_fallbacks,
         st.overrun,
         super::common::eos_gate_name(st.eos_gate),
+        super::common::host_fill_name(st.host_feed.as_ref()),
     );
 }
 

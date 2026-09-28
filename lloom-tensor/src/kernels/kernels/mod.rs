@@ -9,6 +9,7 @@ pub mod eos_gate;
 pub mod eos_index;
 pub mod fill;
 pub mod flash_decoding;
+pub mod gdn;
 pub mod indexing;
 pub mod indexing_names;
 mod macros;
@@ -44,6 +45,12 @@ pub use fill::*;
 pub use flash_decoding::{
     call_flash_decoding, flash_chunk_count, ChunkTable, FlashDType, FlashKernel, FLASH_HEAD_DIMS,
 };
+pub use gdn::{
+    call_gdn_chunk_decay, call_gdn_chunk_epilogue, call_gdn_chunk_scale, call_gdn_chunk_scan_at,
+    call_gdn_conv_window, call_gdn_gate, call_gdn_gated_norm, call_gdn_gated_norm_rows,
+    call_gdn_prefill_prologue, call_gdn_prologue, call_gdn_prologue_rows, call_gdn_prologue_seq,
+    call_gdn_step, call_gdn_step_rows, call_gdn_step_seq, call_unit_lower_inverse,
+};
 pub use indexing::*;
 pub use indexing_names::IndexingKernel;
 pub use mlx_gemm::{
@@ -52,13 +59,9 @@ pub use mlx_gemm::{
     SKINNY_TILE_MAX_M,
 };
 pub use qwen4exp::{
-    call_gdn_chunk_decay, call_gdn_chunk_epilogue, call_gdn_chunk_scale, call_gdn_chunk_scan_at,
-    call_gdn_conv_window, call_gdn_gate, call_gdn_gated_norm, call_gdn_gated_norm_rows,
-    call_gdn_prefill_prologue, call_gdn_prologue, call_gdn_prologue_rows, call_gdn_prologue_seq,
-    call_gdn_step, call_gdn_step_rows, call_gdn_step_seq, call_gdn_step_with, call_hc_collapse, call_hc_combine, call_hc_mix_a, call_hc_mix_b,
-    call_hc_norm, call_moe_combine, call_moe_slot_map, call_moe_topk, call_qsa_prep,
-    call_qsa_prep_batch, call_qsa_prep_rows, call_sigmoid_mul, call_silu_mul,
-    call_unit_lower_inverse,
+    call_hc_collapse, call_hc_combine, call_hc_mix_a, call_hc_mix_b, call_hc_norm,
+    call_moe_combine, call_moe_slot_map, call_moe_topk, call_qsa_prep, call_qsa_prep_batch,
+    call_qsa_prep_rows, call_sigmoid_mul, call_silu_mul,
 };
 pub use scratch::{
     call_scratch_combine, call_scratch_partials, call_scratch_report, ScratchKernel, ScratchParams,

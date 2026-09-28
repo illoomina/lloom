@@ -944,22 +944,40 @@ impl std::fmt::Display for FusionReport {
 /// configuration axes (RESTRUCTURING §1.6): each contributes to `lloom::axes::AXES`
 /// at link time and becomes a `ConfigArgs` clap flag. The shape fields
 /// (`hidden_size`, `layer_types`, …) come from the checkpoint and are not axes.
+///
+/// `#[tiny]` marks what the shape campaign may search from the tiny
+/// template (`models::lfm2_testing`, `docs/porting-models.md` §21.8).
 #[derive(Debug, Clone, ConfigDerive)]
 pub struct Config {
+    #[tiny(axis)]
     pub vocab_size: usize,
+    #[tiny(axis)]
     pub hidden_size: usize,
+    #[tiny(axis)]
     pub intermediate_size: usize,
+    #[tiny(axis, max = 8)]
     pub num_hidden_layers: usize,
+    #[tiny(axis)]
     pub num_attention_heads: usize,
+    #[tiny(axis)]
     pub num_key_value_heads: usize,
+    #[tiny(fixed)]
     pub norm_eps: f64,
+    #[tiny(fixed)]
     pub rope_theta: f32,
+    #[tiny(fixed)]
     pub max_position_embeddings: usize,
+    #[tiny(axis, max = 8)]
     pub conv_l_cache: usize,
+    #[tiny(fixed)]
     pub conv_bias: bool,
+    #[tiny(derived = "Self::tiny_layer_types(num_hidden_layers)", cover)]
     pub layer_types: Vec<LayerType>,
+    #[tiny(fixed)]
     pub tie_embedding: bool,
+    #[tiny(fixed)]
     pub bos_token_id: Option<u32>,
+    #[tiny(fixed)]
     pub eos_token_id: Option<u32>,
     pub use_flash_attn: bool,
     /// Defaults to `Generic`, so `into_config` and every existing caller keep
@@ -1254,6 +1272,20 @@ pub fn parse_silu_impl(s: &str) -> std::result::Result<SiluImpl, String> {
 impl Config {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
+    }
+
+    /// The tiny models' layer pattern: attention at every third layer, the
+    /// rest conv — both kinds from three layers up.
+    pub fn tiny_layer_types(n_layers: usize) -> Vec<LayerType> {
+        (0..n_layers)
+            .map(|l| {
+                if l % 3 == 2 {
+                    LayerType::FullAttention
+                } else {
+                    LayerType::Conv
+                }
+            })
+            .collect()
     }
 }
 
@@ -5163,6 +5195,9 @@ impl Attention {
     ///   (`seq_len <= kv_len`, the shape `Sdpa::metal_fwd` admits).
     /// * **dtype** f16/bf16/f32 and **`head_dim`** in the instantiated set;
     ///   f32 has no `head_dim == 512` instantiation.
+    ///
+    /// The two head-dim checks are shape probes (`docs/porting-models.md`
+    /// §21.8): the check is the annotation.
     fn sdpa_full_applies(&self, q: &Tensor, seq_len: usize, kv_len: usize) -> bool {
         const HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
         self.attn_impl != AttnImpl::Generic
@@ -5170,8 +5205,17 @@ impl Attention {
             && seq_len > 1
             && seq_len <= kv_len
             && matches!(q.dtype(), DType::F16 | DType::BF16 | DType::F32)
-            && HEAD_DIMS.contains(&self.head_dim)
-            && !(self.head_dim == 512 && q.dtype() == DType::F32)
+            && lloom_tensor::shape_req!(
+                sdpa_head_dim,
+                HEAD_DIMS.contains(&self.head_dim);
+                head_dim = self.head_dim
+            )
+            && lloom_tensor::shape_req!(
+                sdpa_head_dim,
+                !(self.head_dim == 512 && q.dtype() == DType::F32);
+                head_dim = self.head_dim,
+                is_f32 = q.dtype() == DType::F32
+            )
     }
 
     /// Whether this call can take the FlashDecoding kernels (issue #116).
@@ -6228,12 +6272,12 @@ struct ShortConv {
     conv_weight: Tensor,
     l_cache: usize,
     hidden_size: usize,
-    /// One weight permutation per rotation phase, built at load time for
-    /// `ConvState::RotatingRing` and `None` otherwise. See `ShortConv::new`.
-    rotating_weights: Option<Vec<Tensor>>,
-    /// The same permutations stacked `[width, hidden, width]`, the operand the
-    /// fused ring kernel indexes by phase (`shortconv_ring_fused`).
-    rotating_table: Option<Tensor>,
+    /// The engine's short-conv block over the `[hidden, l_cache]` taps, in the
+    /// shift layout (`Shuffle`'s fused step).
+    shift: crate::nn::short_conv::ShortConv<crate::nn::short_conv::Shift>,
+    /// The same taps in the ring layout, for `ConvState::RotatingRing` (one
+    /// permutation per phase, built at load time); `None` otherwise.
+    ring: Option<crate::nn::short_conv::ShortConv<crate::nn::short_conv::Ring>>,
     conv_state: ConvState,
     /// Fuse the post-conv residual add onto `out_proj`'s GEMV store (§12.2h).
     /// 22 of the 60 `badd_f16` dispatches per token — the largest of the three.
@@ -6276,81 +6320,28 @@ impl ShortConv {
         // Conv weight shape: (hidden_size, 1, l_cache) or (hidden_size, l_cache)
         let conv_weight = vb.get((hidden_size, 1, l_cache), "conv.weight")?;
 
-        // The rotating arm's per-phase weights, precomputed at load time.
-        //
-        // **This is what makes the rotating form compute the right convolution
-        // rather than a different one.** A rotating buffer's slot `s` holds the
-        // token of age `(s + width - phase - 1) mod width`, so multiplying slot
-        // `s` by weight `s` -- which is what a naive rotation does -- pairs each
-        // tap with the wrong weight. Measured, that is an **O(1)** error (~1e7
-        // ulp), not a rounding: it is a different operator, and it agrees with
-        // the shuffle only on the one phase in `width` where the rotation is the
-        // identity.
-        //
-        // Permuting the weights by phase restores the pairing exactly, and the
-        // residual against the shuffle is then bounded by **1 ulp** and flat in
-        // run length -- a reduction-order difference and nothing more
-        // (`DESIGN.md` §10.2g). The weight is a `[hidden, l_cache]` constant, so
-        // all `width` permutations are built once here and cost nothing per
-        // token; §10.2a lists this as its third fallback.
-        let rotating_weights = match cfg.conv_state {
-            ConvState::RotatingRing { .. } => {
-                let width = cfg.conv_state.width(l_cache);
-                let w = conv_weight.squeeze(1)?;
-                let mut per_phase = Vec::with_capacity(width);
-                for phase in 0..width {
-                    // **The newest token is AT `phase`, and the live window is
-                    // the `l_cache` slots ending there.** Counting `d` slots
-                    // back from `phase` gives the token `d` steps older, which
-                    // the shuffle would have held at column `l_cache - 1 - d`.
-                    // Every other slot is history and gets a zero column, so a
-                    // stale value cannot contribute however many are held.
-                    //
-                    // **This is the arithmetic #141 got wrong for `K > 0`**, and
-                    // the error was invisible on the arm it shipped. Its formula
-                    // — `age = (s + width - phase - 1) % width`, live iff
-                    // `age < l_cache` — is *equivalent* to this one at
-                    // `width == l_cache`, which is `K = 0`, the default and the
-                    // only arm its digest gate ran against. At `K > 0` it selects
-                    // the `l_cache` slots **following** `phase` rather than the
-                    // ones ending at it, so the live window is read from slots
-                    // that hold history and the newest token is weighted zero.
-                    //
-                    // Measured on the CPU backend at f32 — §2.3.5a's load-bearing
-                    // discriminator — `shuffle` and `rotating:0` give an
-                    // identical token stream and `rotating:2` gives a different
-                    // one. That is a computational bug and not a reduction order,
-                    // so §16 6b's *"K is measurably inert"* held only because
-                    // nothing read the history slots yet.
-                    let mut cols = Vec::with_capacity(width);
-                    for s in 0..width {
-                        // How many slots back from the newest, or `None` if this
-                        // slot is outside the live window.
-                        let back = (phase + width - s) % width;
-                        let col = if back < l_cache {
-                            w.narrow(1, l_cache - 1 - back, 1)?
-                        } else {
-                            Tensor::zeros((hidden_size, 1), w.dtype(), w.device())?
-                        };
-                        cols.push(col);
-                    }
-                    per_phase.push(Tensor::cat(&cols, 1)?.contiguous()?);
-                }
-                Some(per_phase)
-            }
+        // The rotating arm's per-phase weights, precomputed at load time: a
+        // rotating buffer's slot holds a different token's input each phase,
+        // so the taps are permuted to match or the fold is a different
+        // operator (`DESIGN.md` §10.2g). All `width` permutations cost nothing
+        // per token.
+        use crate::nn::short_conv::{Ring, Shift, ShortConv};
+        let taps = conv_weight.squeeze(1)?;
+        let ring = match cfg.conv_state {
+            ConvState::RotatingRing { .. } => Some(ShortConv::<Ring>::new(
+                taps.clone(),
+                cfg.conv_state.width(l_cache),
+            )?),
             _ => None,
         };
-        let rotating_table = match &rotating_weights {
-            Some(per_phase) => Some(Tensor::stack(per_phase, 0)?.contiguous()?),
-            None => None,
-        };
+        let shift = ShortConv::<Shift>::new(taps, l_cache);
 
         Ok(Self {
             in_proj,
             out_proj,
             conv_weight,
-            rotating_weights,
-            rotating_table,
+            shift,
+            ring,
             l_cache,
             hidden_size,
             conv_state: cfg.conv_state,
@@ -6491,7 +6482,6 @@ impl ShortConv {
         x: &Tensor,
         c: &Tensor,
         state: &Tensor,
-        weight: &Tensor,
     ) -> Result<Option<(Tensor, Tensor)>> {
         if !self.conv_fused || conv_c_fusion_disabled() {
             return Ok(None);
@@ -6500,7 +6490,7 @@ impl ShortConv {
         // does not compile off Metal. Fall back to the unfused Shuffle arm.
         #[cfg(not(feature = "metal"))]
         {
-            let _ = (b, x, c, state, weight);
+            let _ = (b, x, c, state);
             return Ok(None);
         }
         #[cfg(feature = "metal")]
@@ -6509,7 +6499,9 @@ impl ShortConv {
                 return Ok(None);
             }
             let k = state.dims3()?.2;
-            if lloom_tensor::kernels::ConvKernel::shortconv_step_k(k).is_none() {
+            if k != self.shift.k()
+                || lloom_tensor::kernels::ConvKernel::shortconv_step_k(k).is_none()
+            {
                 return Ok(None);
             }
             // The kernel reads `state` as dense `[b, hidden, k]` and writes a dense
@@ -6524,8 +6516,7 @@ impl ShortConv {
             if b.stride() != x.stride() || b.stride() != c.stride() {
                 return Ok(None);
             }
-            let (out, new_state) = crate::nn::ops::shortconv_step(b, x, c, state, weight, k)?;
-            Ok(Some((out, new_state)))
+            Ok(Some(self.shift.gated_step(b, x, c, state)?))
         }
     }
 
@@ -6558,7 +6549,7 @@ impl ShortConv {
         }
         #[cfg(feature = "metal")]
         {
-            let Some(table) = &self.rotating_table else {
+            let Some(ring) = &self.ring else {
                 return Ok(None);
             };
             if !state.device().is_metal() || !state.is_contiguous() {
@@ -6569,8 +6560,7 @@ impl ShortConv {
             }
             // `state` is written in place, so the caller's tensor is the
             // updated ring and only the output comes back.
-            let out = crate::nn::ops::shortconv_ring(b, x, c, state, table, phase_last)?;
-            Ok(Some(out))
+            Ok(Some(ring.gated_pass(b, x, c, state, phase_last)?))
         }
     }
 
@@ -6706,7 +6696,7 @@ impl ShortConv {
         if !matches!(self.conv_state, ConvState::RotatingRing { .. })
             || !self.conv_fused
             || conv_c_fusion_disabled()
-            || self.rotating_table.is_none()
+            || self.ring.is_none()
         {
             return false;
         }
@@ -6777,8 +6767,8 @@ impl ShortConv {
         let b = bcx.narrow(1, 0, self.hidden_size)?;
         let c = bcx.narrow(1, self.hidden_size, self.hidden_size)?;
         let x = bcx.narrow(1, 2 * self.hidden_size, self.hidden_size)?;
-        let table = self.rotating_table.as_ref().expect("checked");
-        crate::nn::ops::shortconv_ring_rows(&b, &x, &c, &pool_t, table, &slots_t, &phases_t)
+        let ring = self.ring.as_ref().expect("checked");
+        ring.gated_rows(&b, &x, &c, &pool_t, &slots_t, &phases_t)
     }
 
     /// `convolve_rows` in one dispatch (§12.2). `bcx` is `[B, 3·hidden, 1]`.
@@ -6892,9 +6882,7 @@ impl ShortConv {
                     c.device(),
                 )?,
             };
-            if let Some((conv_out, new_state)) =
-                self.shortconv_fused(&b, &x_proj, &c, &state, &conv_weight)?
-            {
+            if let Some((conv_out, new_state)) = self.shortconv_fused(&b, &x_proj, &c, &state)? {
                 if cache.use_kv_cache {
                     cache.set_conv_state(block_idx, new_state)?;
                 }
@@ -7001,11 +6989,10 @@ impl ShortConv {
                 // is what keeps this a per-position index rather than a
                 // per-position permutation (§15.2 #10).
                 let w = self
-                    .rotating_weights
+                    .ring
                     .as_ref()
-                    .expect("rotating weights exist whenever the arm is RotatingRing")
-                    .get(phase)
-                    .expect("phase is taken modulo width, so it indexes the table");
+                    .expect("the ring's weights exist whenever the arm is RotatingRing")
+                    .phase_weight(phase);
                 // The same fold as the decode arm, per position: `conv_fold`
                 // honours `--conv-fused` here too, so a speculative verify runs
                 // the same conv kernel a decode of that token would.
@@ -7055,11 +7042,10 @@ impl ShortConv {
                     // is an index rather than a permutation (§15.2 #10: the
                     // answer is computed when the plan is built, not per token).
                     let w = self
-                        .rotating_weights
+                        .ring
                         .as_ref()
-                        .expect("rotating weights are built whenever the arm is RotatingRing")
-                        .get(phase)
-                        .expect("phase is taken modulo width, so it indexes the table");
+                        .expect("the ring's weights are built whenever the arm is RotatingRing")
+                        .phase_weight(phase);
                     // The rotating arm folds the WHOLE `width`-wide buffer against
                     // a phase-permuted weight (not an `l_cache` window), so
                     // `conv_fold`'s depthwise kernel runs at `k_size = width`. The

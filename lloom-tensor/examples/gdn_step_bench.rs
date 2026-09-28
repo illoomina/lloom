@@ -20,7 +20,7 @@
 use anyhow::Result;
 use clap::Parser;
 use lloom_tensor::kernels::metal::{Buffer, CommandBuffer, Device};
-use lloom_tensor::kernels::{call_gdn_step_with, BufferOffset, Kernels, RESOURCE_OPTIONS};
+use lloom_tensor::kernels::{call_gdn_step, BufferOffset, Kernels, RESOURCE_OPTIONS};
 use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
 
 #[derive(Parser, Debug)]
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
             } else {
                 (&s0, &outs[k], &os[k])
             };
-            call_gdn_step_with(
+            call_gdn_step(
                 &dev,
                 &enc,
                 &kernels,
@@ -124,7 +124,7 @@ fn main() -> Result<()> {
     let one = |reg: bool, out: &Buffer, o: &Buffer| -> Result<(Vec<u8>, Vec<u8>)> {
         let cb = CommandBuffer::new(queue.commandBuffer().unwrap());
         let enc = cb.compute_command_encoder_no_fence();
-        call_gdn_step_with(
+        call_gdn_step(
             &dev,
             &enc,
             &kernels,

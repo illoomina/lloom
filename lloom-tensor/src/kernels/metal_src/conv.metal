@@ -1344,25 +1344,13 @@ METAL_FUNC void shortconv_step_body(
   const size_t proj = b_idx * p.proj_stride_b + c_idx * p.proj_stride_c;
   const A bx_new = static_cast<A>(b_in[proj]) * static_cast<A>(x_in[proj]);
 
-  // State is contiguous [b, hidden, K]; the row for this channel.
+  // State is contiguous [b, hidden, K]; the row for this channel. The block's
+  // shift window: `cat(state[1..], bx)` folded in that order, so the sum is
+  // `conv_fold`'s, and written back as the next state.
   const size_t st_base = (b_idx * hidden + c_idx) * K_SIZE;
-  const size_t w_base = c_idx * K_SIZE;
-
-  // The shifted window: slots 1..K-1 of the old state, then the new bx at the
-  // end -- exactly `cat(state[1..], bx)`. Fold in that order so the sum matches
-  // `conv_fold` to the ulp, and write the window back as the next state.
-  A acc = static_cast<A>(0);
-#pragma clang loop unroll(full)
-  for (ushort j = 0; j < K_SIZE; ++j) {
-    T win_j;
-    if (j + 1 < K_SIZE) {
-      win_j = state_in[st_base + j + 1];
-    } else {
-      win_j = static_cast<T>(bx_new);
-    }
-    state_out[st_base + j] = win_j;
-    acc += static_cast<A>(win_j) * static_cast<A>(weight[w_base + j]);
-  }
+  const short_conv_shift_taps<T> taps { state_in + st_base, static_cast<T>(bx_new) };
+  const A acc = short_conv_fold_into<A>(
+      taps, weight + c_idx * K_SIZE, state_out + st_base, K_SIZE);
 
   // The `* C` gate, fused single-round: `T(acc * c)`. This keeps `acc` in f32
   // through the multiply and rounds ONCE, where the two-kernel path rounds the
@@ -1473,22 +1461,12 @@ METAL_FUNC void shortconv_ring_body(
   for (size_t i = 0; i < seq_len; ++i) {
     const size_t phase = (phase_last + width - (seq_len - 1 - i)) % width;
     const size_t pi = proj + i * p.proj_stride_l;
-    // `b * x` in T, as the elementwise kernel computes it.
+    // `b * x` in T, as the elementwise kernel computes it, into the block's
+    // ring, folded over the whole row against this phase's permuted weight:
+    // the depthwise fold's arithmetic exactly.
     const T bx = b_in[pi] * x_in[pi];
-    state[st + phase] = bx;
-
-    // The whole row against this slot's permuted weight, slot order, wide
-    // accumulator, rounded once -- the depthwise fold's arithmetic exactly.
-    // The pragma pins the reduction to that serial order: under fast math the
-    // compiler may otherwise split a branch-free loop into interleaved partial
-    // sums, which the depthwise kernel's branchy loop never gets, and the two
-    // then disagree by an ulp.
-    device const T *w = weights + (phase * hidden + c_idx) * width;
-    A acc = static_cast<A>(0);
-#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
-    for (size_t s = 0; s < width; ++s) {
-      acc += static_cast<A>(state[st + s]) * static_cast<A>(w[s]);
-    }
+    const A acc = short_conv_ring_fold<A>(
+        state + st, weights + (phase * hidden + c_idx) * width, width, phase, bx);
     // Rounded to T, then gated in T -- the depthwise store followed by the
     // elementwise `* C`, in that order and at that width. The store to a
     // volatile is the rounding: under fast math the compiler otherwise feeds

@@ -550,10 +550,10 @@ fn every_flash_pipeline_admits_its_dispatch_width() {
 }
 
 /// **Parity at every instantiated head dim and dtype, both partial widths,
-/// one chunk and several**, with a guard band past the output: a head dim
-/// that is not a multiple of 32 (72, 80) masks each lane's tail, and a tail
-/// element read, accumulated or written shows as a wrong answer or a moved
-/// guard. The reference is the f64 softmax over the values as stored; f16
+/// one chunk and several**, with NaN in the reserved capacity past the live
+/// keys and a guard band past the output: a head dim that is not a multiple
+/// of 32 (72, 80) masks each lane's tail, and a tail element read or written
+/// shows as a NaN, a wrong answer or a moved guard. The reference is the f64 softmax over the values as stored; f16
 /// output rounding is below 1e-3 at these magnitudes, f32 is held at 2e-5.
 #[test]
 fn flash_matches_the_reference_at_every_head_dim() {
@@ -570,6 +570,19 @@ fn flash_matches_the_reference_at_every_head_dim() {
             let keys = stored(&fill(n_kv_heads * capacity * hd, 22), dtype);
             let values = stored(&fill(n_kv_heads * capacity * hd, 23), dtype);
             for &n_keys in &[1usize, 200, 300, 1037] {
+                // The reserved capacity past the live keys holds NaN, as an
+                // unwritten cache may: a lane that reads past its head
+                // vector reads the next token, and at the last live token
+                // that is a NaN no zero weight cancels.
+                let poison = |v: &[f32]| -> Vec<f32> {
+                    let mut v = v.to_vec();
+                    for h in 0..n_kv_heads {
+                        let live = (h * capacity + n_keys) * hd;
+                        v[live..(h + 1) * capacity * hd].fill(f32::NAN);
+                    }
+                    v
+                };
+                let (keys, values) = (poison(&keys), poison(&values));
                 let want = reference_attention(
                     &queries, &keys, &values, n_q_heads, n_kv_heads, hd, capacity, n_keys, scale,
                 );

@@ -940,6 +940,12 @@ impl MetalDevice {
         self.commands.dispatch_census()
     }
 
+    /// This device's own dispatch trace: a window on it records the
+    /// dispatches encoded here and no other device's (`trace::DeviceTrace`).
+    pub fn dispatch_trace(&self) -> &Arc<crate::kernels::metal::trace::DeviceTrace> {
+        self.commands.dispatch_trace()
+    }
+
     pub fn wait_until_completed(&self) -> Result<()> {
         self.commands
             .wait_until_completed()

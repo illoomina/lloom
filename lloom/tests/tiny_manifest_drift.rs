@@ -8,7 +8,9 @@
 //!
 //! The manifests are `tests/tiny_manifests/<family>.json`, written by
 //! `lloom-fuzz`'s `fuzz_geometry --manifest <corpus>`; the law, the weight
-//! seed, the tolerance and the tuning they were made under travel with them.
+//! seed, the tolerance and the tuning they were made under travel with them
+//! (`hc_mix`, and the Gated DeltaNet step's form, `gdn_step_reg` — absent in
+//! a manifest made before the field, whose campaign ran the loop form).
 #![cfg(feature = "metal")]
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
@@ -125,6 +127,18 @@ fn every_manifest_entry_still_reaches_its_points() {
     // reaches `hc_mix_fused`'s checks.
     t.qwen4exp.hc_mix = true;
     let _ = lloom::tuning::install(t);
+    // And with the step form its manifest records: the census names the
+    // step's kernel, so the replay runs the form the campaign ran.
+    let qwen =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tiny_manifests/qwen4exp.json");
+    let m: serde_json::Value = serde_json::from_slice(&std::fs::read(qwen).unwrap()).unwrap();
+    let mut tt = lloom_tensor::tuning::Tuning::default();
+    tt.from_env().unwrap();
+    tt.gdn.step_reg = m["gdn_step_reg"].as_bool().unwrap_or(false);
+    assert!(
+        lloom_tensor::tuning::install(tt).is_ok(),
+        "the kernels' tuning was read before the manifest's was installed"
+    );
     let Ok(gpu) = Device::new_metal(0) else {
         eprintln!("no Metal device; skipping");
         return;

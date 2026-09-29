@@ -12,7 +12,7 @@ use super::deltanet::{
     chunk_forward, conv_decode_step, conv_prefill, decode_step, gate_and_beta, gqa_expand,
     gqa_expand_seq, l2_norm_last, q_scale, DeltaNetDims, CHUNK_SIZE,
 };
-use crate::nn::gdn::GdnStepArm;
+use crate::nn::gdn::{GdnStepArm, GdnStepForm};
 use crate::nn::short_conv::{Shift, ShortConv};
 use crate::nn::{ops, RecurrentState};
 use lloom_tensor::quantized::QMatMul;
@@ -95,6 +95,20 @@ impl GatedDeltaNet {
             key_dim: cfg.ssm_state_size * cfg.ssm_n_group,
             norm_eps: cfg.norm_eps,
         }
+    }
+
+    /// This layer with its recurrence step in `form`, where the construction
+    /// tier's choice ([`GdnStepArm::configured`]) is not the one wanted: an
+    /// A/B arm, or a fixture pinned to one form.
+    pub fn with_step_form(mut self, form: GdnStepForm) -> Self {
+        let (d, h_v) = (self.dims.d_k, self.dims.h_v);
+        self.step = GdnStepArm::new(form, d, h_v, &self.ssm_dt, &self.ssm_a);
+        self
+    }
+
+    /// The form of this layer's recurrence step.
+    pub fn step_form(&self) -> GdnStepForm {
+        self.step.form()
     }
 
     /// One decode step: `x [1, 1, hidden]` in, `[1, 1, hidden]` out, threading

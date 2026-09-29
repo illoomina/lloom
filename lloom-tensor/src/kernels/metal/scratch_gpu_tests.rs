@@ -578,8 +578,6 @@ fn stub_value(head: u32, chunk: u32, lane: u32, seed: u32) -> f32 {
 /// assertion catches it.
 #[test]
 fn the_kv_append_is_fenced_before_the_partials_read() {
-    use crate::kernels::metal::trace;
-
     if !barrier_instrument_live() {
         return;
     }
@@ -614,9 +612,12 @@ fn the_kv_append_is_fenced_before_the_partials_read() {
             },
         );
 
-        trace::set_recording(true);
-        trace::set_region(Some("fence".to_string()));
-        let _ = trace::take_dispatches();
+        // This queue's own trace window: the process-wide trace would also
+        // hold whatever the lib's other tests encode meanwhile (§15.1n).
+        let window = cmds
+            .dispatch_trace()
+            .open()
+            .expect("a trace window on a fresh queue");
         {
             let guard = cmds.command_encoder().unwrap();
 
@@ -687,10 +688,7 @@ fn the_kv_append_is_fenced_before_the_partials_read() {
             }
         }
         cmds.wait_until_completed().unwrap();
-        let dispatches = trace::take_dispatches();
-        trace::set_region(None);
-        trace::set_recording(false);
-        dispatches.iter().filter(|d| d.barrier).count()
+        window.close().iter().filter(|d| d.barrier).count()
     };
 
     let fenced = run(true);
@@ -722,8 +720,6 @@ fn the_kv_append_is_fenced_before_the_partials_read() {
 /// This measures the second of the two. The first is the test above.
 #[test]
 fn the_partials_need_one_barrier_before_the_combine_and_none_between() {
-    use crate::kernels::metal::trace;
-
     if !barrier_instrument_live() {
         return;
     }
@@ -758,9 +754,10 @@ fn the_partials_need_one_barrier_before_the_combine_and_none_between() {
         },
     );
 
-    trace::set_recording(true);
-    trace::set_region(Some("combine-fence".to_string()));
-    let _ = trace::take_dispatches();
+    let window = cmds
+        .dispatch_trace()
+        .open()
+        .expect("a trace window on a fresh queue");
     {
         let guard = cmds.command_encoder().unwrap();
         call_scratch_partials(
@@ -788,9 +785,7 @@ fn the_partials_need_one_barrier_before_the_combine_and_none_between() {
         .unwrap();
     }
     cmds.wait_until_completed().unwrap();
-    let dispatches = trace::take_dispatches();
-    trace::set_region(None);
-    trace::set_recording(false);
+    let dispatches = window.close();
 
     assert_eq!(dispatches.len(), 2, "expected two dispatches");
     assert!(

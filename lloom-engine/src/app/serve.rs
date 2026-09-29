@@ -30,7 +30,11 @@
 use super::budgets::{self, Dropped, PromptMode};
 use super::common::{ms, MemSnapshot, NEVER_EOS};
 use super::served::Served;
-use super::template::{request_kwargs, Ignored, Rejected, ENGINE_KWARGS, REASONING_EFFORT};
+use super::template::{
+    request_kwargs, Rejected, Unrenderable, ENABLE_THINKING, ENGINE_KWARGS, NOT_READ,
+    REASONING_EFFORT, REQUEST_FIELDS,
+};
+use super::thinking::{self, Thinking};
 use super::vision::{expand_image_tokens, split_image_parts, DecodedImage};
 use crate::{DecodeParams, Decoded, Stop};
 use anyhow::{Context, Result};
@@ -510,7 +514,9 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     let wanted = request_budgets(shared, v, params.max_tokens)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let want_logprobs = v.get("logprobs").and_then(Value::as_bool).unwrap_or(false);
-    let kwargs = request_kwargs(v, &[REASONING_EFFORT]).map_err(bad)?;
+    let mut kwargs = request_kwargs(v, &REQUEST_FIELDS).map_err(bad)?;
+    let want = kwargs.get(ENABLE_THINKING).and_then(Value::as_bool);
+    thinking::set_kwarg(shared.engine.as_ref(), want, &mut kwargs);
 
     // OpenAI `image_url` parts become the template's `{"type": "image"}`;
     // string content passes through untouched.
@@ -535,6 +541,8 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                 eprintln!("[chat: the rendered template carries BOS twice; check bos_token]");
             }
         }
+        let tags = engine.think_tags();
+        facts.thinking = Some(apply_thinking(engine, want, tags.as_ref(), &mut ids)?);
         // The prompt budget, before the engine sees the prompt: the oldest
         // turns go whole, so what runs is the template's own rendering.
         let mut dropped = Dropped::default();
@@ -554,9 +562,11 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             }
             let arr = messages.as_array().cloned().unwrap_or_default();
             let fitted = budgets::fit_messages(&arr, k, ids.len(), |ms| {
-                engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, true)
+                let mut ids = engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, true)?;
+                let _ = thinking::apply(want, tags.as_ref(), &mut ids);
+                Ok(ids)
             })
-            .map_err(Failure::Internal)?;
+            .map_err(template_failure)?;
             let Some(fitted) = fitted else {
                 return Err(bad(budgets::over_budget(
                     ids.len(),
@@ -1314,11 +1324,21 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
         )?;
         return Ok(());
     }
-    let enable_thinking = v.get("enable_thinking").cloned().unwrap_or(Value::Null);
+    let want = match v.get(ENABLE_THINKING) {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(*b),
+        Some(_) => {
+            respond_error(
+                request,
+                400,
+                "field 'enable_thinking' must be true or false",
+            )?;
+            return Ok(());
+        }
+    };
     let mut kwargs = Map::new();
-    if !enable_thinking.is_null() {
-        kwargs.insert("enable_thinking".into(), enable_thinking);
-    }
+    thinking::set_kwarg(shared.engine.as_ref(), want, &mut kwargs);
+    let tags = shared.engine.think_tags();
 
     let sw = StreamWriter::start(ChunkedWriter::start(request, "application/x-ndjson")?);
     let engine = shared.engine.as_ref();
@@ -1328,7 +1348,8 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
     let run = std::thread::scope(|scope| -> Result<()> {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
-                let (sw, samples, done, kwargs, next) = (&sw, &samples, &done, &kwargs, &next);
+                let (sw, samples, done, kwargs, next, tags) =
+                    (&sw, &samples, &done, &kwargs, &next, &tags);
                 scope.spawn(move || -> Result<()> {
                     loop {
                         let i = next.fetch_add(1, Ordering::AcqRel);
@@ -1351,8 +1372,18 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                         let messages = sample
                             .get("messages")
                             .context("eval sample missing messages")?;
-                        let prompt = engine.render_chat(messages, kwargs)?;
-                        let ids = engine.encode(&prompt, true)?;
+                        let mut prompt = engine.render_chat(messages, kwargs)?;
+                        let mut ids = engine.encode(&prompt, true)?;
+                        let think =
+                            thinking::apply(want, tags.as_ref(), &mut ids).map_err(|why| {
+                                anyhow::anyhow!(
+                                    "enable_thinking=true: {}: {why}",
+                                    engine.capabilities().family
+                                )
+                            })?;
+                        if think.by == thinking::By::Engine {
+                            prompt.push_str(&engine.token_str(ids[ids.len() - 1]));
+                        }
                         sw.event_line(&json!({
                             "kind": "eval_sample_start", "sample_id": sample_id, "prompt": prompt,
                         }));
@@ -1675,11 +1706,6 @@ fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::
         st.step_ns.iter().sum::<u64>() as f64 / 1e6
     };
     let n = d.tokens.len();
-    let ignored: Vec<Value> = facts
-        .ignored
-        .iter()
-        .map(|i| json!({ "name": i.name, "value": i.value, "reason": i.reason }))
-        .collect();
     json!({
         "prompt_n": prompt,
         "prompt_submit_ms": st.prefill_ns as f64 / 1e6,
@@ -1701,10 +1727,13 @@ fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::
         "tokens": d.tokens,
         "prompt_ids_sha256": facts.ids_sha256,
         // The template's variable as the prompt reflects it; null for its
-        // default, or when the template did not act on the request's value
-        // (listed in `template_kwargs_ignored`).
+        // default (a value the template would not act on is a 400).
         "reasoning_effort": facts.reasoning_effort,
-        "template_kwargs_ignored": ignored,
+        // Whether the prompt leaves a thinking block open, and who decided:
+        // the template (its switch or its own behaviour) or the engine,
+        // which closed the block the template opened.
+        "thinking": facts.thinking.map(Thinking::name),
+        "thinking_by": facts.thinking.map(|t| t.by.name()),
         // The token budgets: what was asked, whether the thinking one ran
         // (`thinking_budget_ignored` says why not) and what it did, and what
         // the prompt one dropped before the prefill.
@@ -1731,8 +1760,8 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
          {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
-         reasoning_effort={} thinking_budget={} thought={} budget_fired={} prompt_budget={} \
-         prompt_dropped={}]",
+         reasoning_effort={} think={} think_by={} thinking_budget={} thought={} budget_fired={} \
+         prompt_budget={} prompt_dropped={}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -1745,6 +1774,8 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
         super::common::host_fill_name(st.host_feed.as_ref()),
         facts.ids_sha256,
         facts.reasoning_effort.as_str().unwrap_or("default"),
+        facts.thinking.map_or("none", Thinking::name),
+        facts.thinking.map_or("none", |t| t.by.name()),
         facts
             .thinking_budget
             .map_or_else(|| "none".into(), |n| n.to_string()),
@@ -1766,7 +1797,8 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
 struct PromptFacts {
     ids_sha256: String,
     reasoning_effort: Value,
-    ignored: Vec<Ignored>,
+    /// The prompt's thinking as it runs; `None` where no template rendered it.
+    thinking: Option<Thinking>,
     /// The thinking budget the request asked for, and why it was ignored
     /// (a template or a prompt with no open block) when it was.
     thinking_budget: Option<usize>,
@@ -1825,9 +1857,10 @@ impl PromptFacts {
 }
 
 /// A chat request's prompt through the checkpoint's template. A value the
-/// template rejects is the client's 400. A variable it does not act on is
-/// a warning, not a refusal, because clients send `reasoning_effort` whatever
-/// the model; the prompt is the one the template renders without it.
+/// template rejects, data it fails on, and a `reasoning_effort` it would not
+/// act on (not read, or no effect under the other variables) are the
+/// client's 400: an effort that is not available is refused, whichever
+/// spelling carried it.
 fn render_request(
     engine: &dyn Served,
     endpoint: &str,
@@ -1836,28 +1869,57 @@ fn render_request(
 ) -> Handled<(String, PromptFacts)> {
     let rendered = engine
         .render_checked(messages, kwargs, &[REASONING_EFFORT])
-        .map_err(|e| match e.downcast_ref::<Rejected>() {
-            Some(r) => bad(r.to_string()),
-            None => Failure::Internal(e),
-        })?;
+        .map_err(template_failure)?;
     let family = engine.capabilities().family;
-    for i in &rendered.ignored {
-        eprintln!("[{endpoint}: {family}: {i}; ignored]");
+    if let Some(i) = rendered.ignored.first() {
+        let why = if i.reason == NOT_READ {
+            format!("{family}'s chat template does not read {REASONING_EFFORT}")
+        } else {
+            format!(
+                "{family}'s chat template renders the same prompt for any {REASONING_EFFORT} with \
+                 {ENABLE_THINKING}={}",
+                kwargs.get(ENABLE_THINKING).unwrap_or(&Value::Null)
+            )
+        };
+        eprintln!(
+            "[{endpoint}: {REASONING_EFFORT}={} refused: {why}]",
+            i.value
+        );
+        return Err(bad(format!("{REASONING_EFFORT}={}: {why}", i.value)));
     }
-    let applied = |name: &str| {
-        let ignored = rendered.ignored.iter().any(|i| i.name == name);
-        match kwargs.get(name) {
-            Some(v) if !ignored => v.clone(),
-            _ => Value::Null,
-        }
-    };
     let facts = PromptFacts {
-        ids_sha256: String::new(),
-        reasoning_effort: applied(REASONING_EFFORT),
-        ignored: rendered.ignored.clone(),
+        reasoning_effort: kwargs.get(REASONING_EFFORT).cloned().unwrap_or(Value::Null),
         ..PromptFacts::default()
     };
     Ok((rendered.text, facts))
+}
+
+/// A render failure: the client's 400 when the template refused or failed
+/// on the request's own data, the engine's 500 otherwise.
+fn template_failure(e: anyhow::Error) -> Failure {
+    if let Some(r) = e.downcast_ref::<Rejected>() {
+        bad(r.to_string())
+    } else if let Some(r) = e.downcast_ref::<Unrenderable>() {
+        bad(r.to_string())
+    } else {
+        Failure::Internal(e)
+    }
+}
+
+/// A request's `enable_thinking` on its encoded prompt (`thinking::apply`);
+/// thinking on where the prompt cannot think is the client's 400.
+fn apply_thinking(
+    engine: &dyn Served,
+    want: Option<bool>,
+    tags: Option<&super::template::ThinkTags>,
+    ids: &mut Vec<u32>,
+) -> Handled<Thinking> {
+    thinking::apply(want, tags, ids).map_err(|why| {
+        bad(format!(
+            "{ENABLE_THINKING}=true: {}: {why}",
+            engine.capabilities().family
+        ))
+    })
 }
 
 fn models_body(model_name: &str) -> Value {

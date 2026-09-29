@@ -50,6 +50,8 @@ fn matmul(device: &Device) -> Result<()> {
 }
 
 fn matmul_bf16(device: &Device) -> Result<()> {
+    // The bf16 arm on purpose, where the GPU only emulates it (§15.2a).
+    lloom_tensor::test_utils::allow_emulated(device, DType::BF16);
     if !device.supports_bf16() {
         return Ok(());
     }

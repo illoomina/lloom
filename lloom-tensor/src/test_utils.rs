@@ -24,6 +24,21 @@ macro_rules! test_device {
     };
 }
 
+/// Opt `device` in to computing at `dtype` where its GPU only emulates that
+/// type, for a test that runs the emulated arm on purpose (§15.2a). Scoped to
+/// this device; a no-op off Metal and for a dtype the GPU executes.
+pub fn allow_emulated(device: &crate::Device, dtype: crate::DType) {
+    #[cfg(feature = "metal")]
+    if let crate::Device::Metal(m) = device {
+        use crate::kernels::metal::arms::{Feature, Features};
+        if let Some(f) = Feature::emulable_dtype(dtype) {
+            m.allow_emulated(Features::empty().with(f));
+        }
+    }
+    #[cfg(not(feature = "metal"))]
+    let _ = (device, dtype);
+}
+
 pub fn assert_tensor_eq(t1: &Tensor, t2: &Tensor) -> Result<()> {
     assert_eq!(t1.shape(), t2.shape());
     // Default U8 may not be large enough to hold the sum (`t.sum_all` defaults to the dtype of `t`)

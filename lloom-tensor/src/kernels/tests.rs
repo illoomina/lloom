@@ -6415,9 +6415,10 @@ fn sdpa_packed_names_resolve() {
 /// **Why `sdpa_vector` computes nothing at f32 x head_dim 512**: its pipeline
 /// admits fewer threads per threadgroup than the 1024 `call_sdpa_vector`
 /// dispatches, so the dispatch writes no output (the "returns ~0" of
-/// `docs/porting-models.md` §21.8). The f16 and bf16 pipelines at 512, and
-/// f32 at 256, admit 1024: the control. Asserting the current state, so a
-/// toolchain that fits it turns this red and the refusal can be revisited.
+/// `docs/porting-models.md` §21.8). bf16 x 512 does the same on a GPU that
+/// emulates bf16 (Apple7). f16 at 512 and f32 at 256 admit 1024: the
+/// control. Asserting the current state, so a toolchain that fits it turns
+/// this red and the refusal can be revisited.
 #[test]
 fn sdpa_vector_f32_512_admits_fewer_threads_than_it_is_dispatched_at() {
     let device = device();
@@ -6443,11 +6444,12 @@ fn sdpa_vector_f32_512_admits_fewer_threads_than_it_is_dispatched_at() {
         println!("{name}: maxTotalThreadsPerThreadgroup {}", max(name));
     }
     assert!(max("sdpa_vector_float_512") < 1024);
-    for control in [
-        "sdpa_vector_float16_t_512",
-        "sdpa_vector_bfloat16_t_512",
-        "sdpa_vector_float_256",
-    ] {
+    let bf16_native = crate::kernels::metal::arms::for_device(&device)
+        .has(crate::kernels::metal::arms::Feature::Bf16);
+    if !bf16_native {
+        assert!(max("sdpa_vector_bfloat16_t_512") < 1024);
+    }
+    for control in ["sdpa_vector_float16_t_512", "sdpa_vector_float_256"] {
         assert_eq!(max(control), 1024, "{control}");
     }
 }

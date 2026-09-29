@@ -15,9 +15,12 @@
 #![cfg(feature = "serve")]
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
+#[cfg(feature = "metal")]
 use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
 use lloom::testing::tiny::{TinyCheckpoint, TinyConfig, TinyFamily, Weights};
-use serde_json::{json, Value};
+#[cfg(feature = "metal")]
+use serde_json::json;
+use serde_json::Value;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

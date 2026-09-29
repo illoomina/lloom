@@ -21,12 +21,12 @@ use super::common::{
     PrefillTiming, Text, NEVER_EOS,
 };
 use super::served::Served;
+use super::template::{Rendered, Template};
 use crate::{
     spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRequest, DecodeParams,
     DecodeSession, Decoded, Idle, ReadbackArm, RingPool, SlotPool, Stop, TextStream,
 };
 use anyhow::{Context, Result};
-use hf_chat_template::ChatTemplate;
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::qwen4exp::loader::{
     LoadOptions as ModelLoad, SlotBudget, StreamLoader, StreamOptions,
@@ -38,7 +38,7 @@ use lloom::nn::model::CausalLM;
 use lloom::nn::Sequence;
 use lloom::nn::{DecodeOptions, Session};
 use lloom_tensor::{DType, Device, Tensor, D};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -377,10 +377,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             anyhow::bail!("the tokenizer has neither <|im_end|> nor <|endoftext|>");
         }
         let template = match std::fs::read_to_string(tokenizer_dir.join("chat_template.jinja")) {
-            Ok(src) => Some(
-                ChatTemplate::from_str(&src)
-                    .map_err(|e| anyhow::anyhow!("compiling chat_template.jinja: {e}"))?,
-            ),
+            Ok(src) => Some(Template::compile(&src)?),
             Err(_) => None,
         };
         let seed_tokens = tokenizer
@@ -894,23 +891,20 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
             .decode(&[id], false)
             .unwrap_or_else(|_| format!("<{id}>"))
     }
-    fn render_chat(&self, messages: &Value, kwargs: Option<&Value>) -> Result<String> {
-        let template = self.text.template.as_ref().context(
-            "no chat_template.jinja beside the tokenizer; /v1/chat/completions needs one",
-        )?;
-        let mut ctx = json!({
-            "messages": messages,
-            "bos_token": "",
-            "add_generation_prompt": true,
-        });
-        if let Some(Value::Object(extra)) = kwargs {
-            for (k, v) in extra {
-                ctx[k] = v.clone();
-            }
-        }
-        template
-            .render_context(&ctx)
-            .map_err(|e| anyhow::anyhow!("rendering the chat template: {e}"))
+    fn render_checked(
+        &self,
+        messages: &Value,
+        kwargs: &Map<String, Value>,
+        checked: &[&str],
+    ) -> Result<Rendered> {
+        self.text
+            .template
+            .as_ref()
+            .context("no chat_template.jinja beside the tokenizer; /v1/chat/completions needs one")?
+            .render_checked(messages, "", kwargs, checked)
+    }
+    fn template_reads(&self, name: &str) -> Option<bool> {
+        self.text.template.as_ref()?.reads(name)
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         let seed = &self.text.seed_tokens;

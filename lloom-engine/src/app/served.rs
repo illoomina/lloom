@@ -10,11 +10,12 @@
 //! shape refuses it with the reason (`check_batch`), never serves it wrong.
 
 use super::common::{DecodeTiming, PrefillTiming};
+use super::template::Rendered;
 use super::vision::DecodedImage;
 use crate::{DecodeParams, Decoded, ReadbackArm};
 use anyhow::Result;
 use lloom_tensor::Device;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub trait Served: Send + Sync {
     /// The device the model decodes on.
@@ -49,7 +50,23 @@ pub trait Served: Send + Sync {
 
     fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>>;
     fn token_str(&self, id: u32) -> String;
-    fn render_chat(&self, messages: &Value, kwargs: Option<&Value>) -> Result<String>;
+    /// Render `messages` through the checkpoint's own chat template with the
+    /// generation prompt appended, `kwargs` laid over its variables and each
+    /// of `checked` tested against it (`template::Template::render_checked`).
+    /// A value the template rejects is a `template::Rejected`.
+    fn render_checked(
+        &self,
+        messages: &Value,
+        kwargs: &Map<String, Value>,
+        checked: &[&str],
+    ) -> Result<Rendered>;
+    /// [`Self::render_checked`] with nothing checked.
+    fn render_chat(&self, messages: &Value, kwargs: &Map<String, Value>) -> Result<String> {
+        Ok(self.render_checked(messages, kwargs, &[])?.text)
+    }
+    /// Whether the chat template reads `name`; `None` without a template, or
+    /// when its source could not be analysed.
+    fn template_reads(&self, name: &str) -> Option<bool>;
     /// The benchmark seed tiled to `n` ids, `row` seed tokens in.
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32>;
 
@@ -199,8 +216,16 @@ mod tests {
         fn token_str(&self, _: u32) -> String {
             unreachable!()
         }
-        fn render_chat(&self, _: &Value, _: Option<&Value>) -> Result<String> {
+        fn render_checked(
+            &self,
+            _: &Value,
+            _: &Map<String, Value>,
+            _: &[&str],
+        ) -> Result<Rendered> {
             unreachable!()
+        }
+        fn template_reads(&self, _: &str) -> Option<bool> {
+            None
         }
         fn seed_prompt_row(&self, _: usize, _: usize) -> Vec<u32> {
             unreachable!()

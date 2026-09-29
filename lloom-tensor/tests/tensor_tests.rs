@@ -10,6 +10,8 @@ fn zeros(device: &Device) -> Result<()> {
 }
 
 fn ones(device: &Device) -> Result<()> {
+    // Every dtype, bf16 included, which the GPU may only emulate (§15.2a).
+    lloom_tensor::test_utils::allow_emulated(device, DType::BF16);
     assert_eq!(
         Tensor::ones((2, 3), DType::U8, device)?.to_vec2::<u8>()?,
         [[1, 1, 1], [1, 1, 1]],

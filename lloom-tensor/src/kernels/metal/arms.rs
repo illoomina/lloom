@@ -14,10 +14,19 @@
 //!
 //! `LLOOM_METAL_DISABLE` (a comma list of [`Feature::name`]s) withdraws
 //! features, so a refusal can be exercised on a device that has the feature.
+//!
+//! One type is the exception the language makes: `bfloat` arithmetic is
+//! defined on every family, and a family whose ALUs lack it runs it through
+//! the compiler's software emulation. Such an arm is not refused outright,
+//! because it computes the right numbers; it is refused **unless the operator
+//! opts in** ([`EmulatedArms`]), and an admitted one warns once. Whether a
+//! type is emulated on a device is the registry's answer: it is emulable and
+//! [`NATIVE`] does not register it for the device's families.
 
 use crate::arms::{Capability, Set};
 use crate::kernels::{Device, MetalKernelError};
 use objc2_metal::{MTLDevice, MTLGPUFamily};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 /// A capability a Metal arm can depend on: a GPU family the device reports,
@@ -194,6 +203,165 @@ pub fn require_all(
     }
 }
 
+/// The opt-in to an emulated arm, as each surface spells it: the flag on
+/// `lloom chat|serve`, the dotted tuning key, the env alias. Each takes a
+/// comma list of emulable [`Feature::name`]s.
+pub const ALLOW_EMULATED_FLAG: &str = "--allow-emulated";
+pub const ALLOW_EMULATED_KEY: &str = "tuning.metal.allow_emulated";
+pub const ALLOW_EMULATED_ENV: &str = "LLOOM_METAL_ALLOW_EMULATED";
+
+impl Feature {
+    /// Whether the Metal language defines arithmetic on this type for every
+    /// family, so that a family whose ALUs lack it still runs it, emulated in
+    /// software. `bfloat` is such a type. `float` and `half` are native on
+    /// every Apple family, and an int8 matrix unit has no software fallback.
+    pub const fn emulable(self) -> bool {
+        matches!(self, Feature::Bf16)
+    }
+
+    /// The emulable type a tensor of `dtype` computes at, if any: the one
+    /// dtype whose arithmetic a device may only emulate.
+    #[inline(always)]
+    pub const fn emulable_dtype(dtype: crate::DType) -> Option<Feature> {
+        match dtype {
+            crate::DType::BF16 => Some(Feature::Bf16),
+            _ => None,
+        }
+    }
+
+    /// What the emulation costs, as the refusal and the warning state it.
+    const fn emulation_cost(self) -> &'static str {
+        match self {
+            Feature::Bf16 => "about 2.6x the `float` time, measured on Apple7",
+            _ => "unmeasured",
+        }
+    }
+}
+
+/// Parse an opt-in list: [`Feature::name`]s, each of them emulable.
+pub fn parse_allow_emulated(list: &str) -> Result<Features, String> {
+    let set = Features::parse_list(list).map_err(|e| e.to_string())?;
+    match set.iter().find(|f| !f.emulable()) {
+        Some(f) => Err(format!(
+            "`{f}` is not an emulated Metal type; only {} can be allowed",
+            Feature::ALL
+                .iter()
+                .filter(|f| f.emulable())
+                .map(|f| format!("`{f}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        None => Ok(set),
+    }
+}
+
+/// The emulated arms one device admits.
+///
+/// An emulable type the device's families do not register as native is
+/// refused, naming the reason and the opt-in, unless the operator allowed it
+/// ([`ALLOW_EMULATED_KEY`]). An allowed one runs as before, and the first
+/// admission of each type on the device prints one warning. A type the
+/// device executes natively, and a type that is not emulable, pass without
+/// being looked at: the second is [`require_all`]'s to refuse. (§15.2a)
+#[derive(Debug)]
+pub struct EmulatedArms {
+    native: Features,
+    allowed: AtomicU32,
+    warned: AtomicU32,
+    warnings: AtomicUsize,
+}
+
+impl EmulatedArms {
+    pub fn new(native: Features, allowed: Features) -> Self {
+        EmulatedArms {
+            native,
+            allowed: AtomicU32::new(allowed.bits()),
+            warned: AtomicU32::new(0),
+            warnings: AtomicUsize::new(0),
+        }
+    }
+
+    /// The gate for `device`: its features ([`for_device`]) and the opt-in
+    /// the tuning group carries.
+    pub fn for_device(device: &Device) -> Result<Self, MetalKernelError> {
+        let allowed = match crate::tuning::tuning().metal.allow_emulated.as_deref() {
+            None => Features::empty(),
+            Some(list) => parse_allow_emulated(list).map_err(|e| {
+                MetalKernelError::EmulatedRefused(format!("{ALLOW_EMULATED_KEY}: {e}"))
+            })?,
+        };
+        Ok(Self::new(for_device(device), allowed))
+    }
+
+    /// Allow the emulable members of `features` as well.
+    pub fn allow(&self, features: Features) {
+        self.allowed.fetch_or(features.bits(), Ordering::Relaxed);
+    }
+
+    /// The device's native set the gate decides against ([`for_device`]).
+    pub fn native(&self) -> Features {
+        self.native
+    }
+
+    pub fn allowed(&self) -> Features {
+        Features::from_bits(self.allowed.load(Ordering::Relaxed))
+    }
+
+    /// Warnings this gate has printed: one per emulated type admitted.
+    pub fn warnings(&self) -> usize {
+        self.warnings.load(Ordering::Relaxed)
+    }
+
+    /// Whether [`admit`](Self::admit) would admit `feature`, asked without
+    /// admitting it.
+    pub fn admits(&self, feature: Feature) -> bool {
+        self.native.has(feature)
+            || !feature.emulable()
+            || self.allowed.load(Ordering::Relaxed) & Features::empty().with(feature).bits() != 0
+    }
+
+    /// Admit computing at `feature` for the use `what()` names.
+    #[inline]
+    pub fn admit(
+        &self,
+        feature: Feature,
+        what: impl FnOnce() -> String,
+    ) -> Result<(), MetalKernelError> {
+        if self.native.has(feature) || !feature.emulable() {
+            return Ok(());
+        }
+        self.admit_emulated(feature, what)
+    }
+
+    fn admit_emulated(
+        &self,
+        feature: Feature,
+        what: impl FnOnce() -> String,
+    ) -> Result<(), MetalKernelError> {
+        let bit = Features::empty().with(feature).bits();
+        if self.allowed.load(Ordering::Relaxed) & bit == 0 {
+            return Err(MetalKernelError::EmulatedRefused(format!(
+                "Metal arm `{what}` refused: this GPU does not execute `{feature}` natively, \
+                 so it would run emulated in software ({cost}; Metal features: {native}). \
+                 To run it anyway, opt in: `{ALLOW_EMULATED_FLAG} {feature}` on `lloom chat|serve`, \
+                 `{ALLOW_EMULATED_KEY}={feature}`, or `{ALLOW_EMULATED_ENV}={feature}` (§15.2a)",
+                what = what(),
+                cost = feature.emulation_cost(),
+                native = self.native,
+            )));
+        }
+        if self.warned.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            self.warnings.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "warning: Metal `{feature}` runs emulated in software on this GPU ({cost}); \
+                 enabled by `{ALLOW_EMULATED_FLAG} {feature}` (§15.2a)",
+                cost = feature.emulation_cost(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +418,90 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("`int8-mma`"), "{err}");
+    }
+
+    fn apple7() -> Features {
+        Features::empty()
+            .with(Feature::Apple7)
+            .with(Feature::F32)
+            .with(Feature::F16)
+    }
+
+    /// Without the opt-in, an emulated type is refused, and the refusal names
+    /// the reason and every spelling of the opt-in.
+    #[test]
+    fn an_emulated_type_is_refused_without_the_opt_in() {
+        let gate = EmulatedArms::new(apple7(), Features::empty());
+        let err = gate
+            .admit(Feature::Bf16, || "matmul".into())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "Metal arm `matmul` refused: this GPU does not execute `bf16` natively, so it \
+             would run emulated in software (about 2.6x the `float` time, measured on Apple7; \
+             Metal features: apple7 f32 f16). To run it anyway, opt in: `--allow-emulated bf16` \
+             on `lloom chat|serve`, `tuning.metal.allow_emulated=bf16`, or \
+             `LLOOM_METAL_ALLOW_EMULATED=bf16` (§15.2a)"
+        );
+        assert_eq!(gate.warnings(), 0);
+    }
+
+    /// With the opt-in it is admitted, and warns once however often it is
+    /// admitted.
+    #[test]
+    fn an_allowed_emulated_type_runs_and_warns_once() {
+        let gate = EmulatedArms::new(apple7(), Features::empty().with(Feature::Bf16));
+        for _ in 0..3 {
+            gate.admit(Feature::Bf16, || "matmul".into()).unwrap();
+        }
+        assert_eq!(gate.warnings(), 1);
+
+        let late = EmulatedArms::new(apple7(), Features::empty());
+        assert!(late.admit(Feature::Bf16, String::new).is_err());
+        late.allow(Features::empty().with(Feature::Bf16));
+        late.admit(Feature::Bf16, String::new).unwrap();
+        late.admit(Feature::Bf16, String::new).unwrap();
+        assert_eq!(late.warnings(), 1);
+    }
+
+    /// A family that registers `bf16` as native passes it untouched, with or
+    /// without the opt-in, and warns nothing; a type that is native, or not
+    /// emulable, is never this gate's to refuse.
+    #[test]
+    fn a_native_type_is_admitted_without_a_warning() {
+        let apple_n = apple7().with(Feature::Bf16);
+        for allowed in [Features::empty(), Features::empty().with(Feature::Bf16)] {
+            let gate = EmulatedArms::new(apple_n, allowed);
+            gate.admit(Feature::Bf16, String::new).unwrap();
+            gate.admit(Feature::F16, String::new).unwrap();
+            gate.admit(Feature::Int8Mma, String::new).unwrap();
+            assert_eq!(gate.warnings(), 0);
+        }
+        assert_eq!(
+            Feature::emulable_dtype(crate::DType::BF16),
+            Some(Feature::Bf16)
+        );
+        assert_eq!(Feature::emulable_dtype(crate::DType::F16), None);
+        assert_eq!(Feature::emulable_dtype(crate::DType::F32), None);
+    }
+
+    /// The opt-in names only emulable types, so a typo or a native type is an
+    /// error rather than an opt-in that does nothing.
+    #[test]
+    fn the_opt_in_list_names_only_emulable_types() {
+        assert_eq!(
+            parse_allow_emulated(" bf16 ").unwrap(),
+            Features::empty().with(Feature::Bf16)
+        );
+        assert_eq!(parse_allow_emulated("").unwrap(), Features::empty());
+        assert!(parse_allow_emulated("bf61")
+            .unwrap_err()
+            .contains("unknown Metal feature"));
+        assert_eq!(
+            parse_allow_emulated("f16").unwrap_err(),
+            "`f16` is not an emulated Metal type; only `bf16` can be allowed"
+        );
     }
 
     /// The price of the check on an arm that needs more than `f32`, per call:

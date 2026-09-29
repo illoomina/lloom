@@ -940,6 +940,8 @@ mod metal_sdpa_tests {
     fn sdpa_paged_matches_contiguous_bit_for_bit_f16_bf16() -> Result<()> {
         let scale: f64 = f64::from(LFM2_HEAD_DIM as u32).sqrt().recip();
         let metal = Device::new_metal(0)?;
+        // The bf16 arm on purpose, where the GPU only emulates it (§15.2a).
+        lloom_tensor::test_utils::allow_emulated(&metal, DType::BF16);
         let cpu = Device::Cpu;
         for &(q_len, kv_len, page_size) in &PAGED_SHAPES {
             for (dtype, causal) in [

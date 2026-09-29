@@ -67,6 +67,17 @@ pub trait Served: Send + Sync {
     /// Whether the chat template reads `name`; `None` without a template, or
     /// when its source could not be analysed.
     fn template_reads(&self, name: &str) -> Option<bool>;
+    /// The chat template's reasoning tags (`template::ThinkTags`); `None`
+    /// when it writes no thinking block.
+    fn think_tags(&self) -> Option<super::template::ThinkTags> {
+        None
+    }
+    /// Why this process's decode path cannot feed a thinking budget's
+    /// forced tokens (`budgets::BATCHED`, `budgets::SPECULATIVE`); `None`
+    /// on the K=1 body, which carries it on every readback arm.
+    fn thinking_budget_refused(&self) -> Option<&'static str> {
+        None
+    }
     /// The benchmark seed tiled to `n` ids, `row` seed tokens in.
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32>;
 

@@ -16,6 +16,7 @@
 //! once-per-run diagnostics (the first token's split, the visible cadence,
 //! the hot thread, the churn, the lock contention, the KV slab).
 
+use super::budgets::{self, PromptMode};
 use super::common::{eos_gate_name, host_fill_name, ms, MemSnapshot, NEVER_EOS};
 use super::report;
 use super::served::Served;
@@ -107,6 +108,11 @@ pub struct ChatArgs {
     pub verbose: bool,
 }
 
+/// A turn-line value, `none` when unset.
+fn opt(v: Option<impl std::fmt::Display>) -> String {
+    v.map_or_else(|| "none".to_string(), |v| v.to_string())
+}
+
 /// The reply's token digest in `lfm2-determinism`'s definition: SHA-256 over
 /// the generated ids as little-endian `u32`, EOS excluded — so a turn is
 /// comparable to the harness's `tokens_sha256` on the same prompt and arm.
@@ -158,6 +164,43 @@ fn check_kwargs(
                 ""
             },
         );
+    }
+    Ok(())
+}
+
+/// Refuses `--thinking-budget` before the first turn where it cannot apply:
+/// a template that writes no thinking block, or a generation prompt that
+/// leaves none open (Qwen4-exp without `--think`), on a one-message probe
+/// conversation. A `--raw` prompt is checked at its turn instead.
+fn check_thinking_budget(
+    engine: &dyn Served,
+    system: Option<&str>,
+    kwargs: &Map<String, Value>,
+    budget: usize,
+) -> Result<()> {
+    let mut probe = Vec::new();
+    if let Some(s) = system {
+        probe.push(json!({ "role": "system", "content": s }));
+    }
+    probe.push(json!({ "role": "user", "content": "." }));
+    let ids = engine.encode(&engine.render_chat(&json!(probe), kwargs)?, true)?;
+    if let Err(why) = budgets::thinking(
+        engine.thinking_budget_refused(),
+        engine.think_tags().as_ref(),
+        &ids,
+        budget,
+        &[],
+    )? {
+        let family = engine.capabilities().family;
+        let hint = if why == budgets::NOT_THINKING
+            && kwargs.get(ENABLE_THINKING) == Some(&json!(false))
+            && engine.template_reads(ENABLE_THINKING) == Some(true)
+        {
+            " (add --think)"
+        } else {
+            ""
+        };
+        anyhow::bail!("--thinking-budget {budget}: {family}: {why}{hint}");
     }
     Ok(())
 }
@@ -218,6 +261,14 @@ pub fn run(args: ChatArgs) -> Result<()> {
         kwargs.insert(REASONING_EFFORT.into(), json!(effort));
     }
     check_kwargs(engine.as_ref(), args.system.as_deref(), &kwargs)?;
+    if let (Some(n), false) = (sampling.thinking_budget, args.raw) {
+        check_thinking_budget(engine.as_ref(), args.system.as_deref(), &kwargs, n)?;
+    }
+    let budget_message = match &sampling.thinking_budget_message {
+        Some(m) => engine.encode(m, false)?,
+        None => Vec::new(),
+    };
+    let prompt_mode = PromptMode::parse(&sampling.prompt_budget_mode);
     let effort = args.reasoning_effort.as_deref().unwrap_or("default");
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = &args.system {
@@ -309,8 +360,52 @@ pub fn run(args: ChatArgs) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
             expand_image_tokens(&rendered, &expansions)?
         };
-        let ids = engine.encode(&rendered, !args.no_bos)?;
-        let params = sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
+        let mut ids = engine.encode(&rendered, !args.no_bos)?;
+        // The prompt budget, before the prompt reaches the engine: truncated,
+        // the conversation itself loses its oldest turns, so the next turn
+        // extends the cache this one leaves.
+        let mut dropped = budgets::Dropped::default();
+        if let Some(k) = sampling.prompt_budget.filter(|&k| ids.len() > k) {
+            if prompt_mode == PromptMode::Refuse {
+                anyhow::bail!(budgets::over_budget(
+                    ids.len(),
+                    k,
+                    "--prompt-budget-mode truncate drops the oldest turns instead"
+                ));
+            }
+            if args.raw {
+                (ids, dropped) = budgets::truncate_raw(&ids, k, engine.bos_id());
+            } else {
+                if !images.is_empty() {
+                    anyhow::bail!(
+                        "--prompt-budget {k}: the conversation holds an image, and truncating it \
+                         would drop turns without their images"
+                    );
+                }
+                let fitted = budgets::fit_messages(&messages, k, ids.len(), |ms| {
+                    engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, !args.no_bos)
+                })?;
+                let Some(fitted) = fitted else {
+                    anyhow::bail!(budgets::over_budget(
+                        ids.len(),
+                        k,
+                        "the last turn alone does not fit"
+                    ));
+                };
+                (messages, ids, dropped) = (fitted.messages, fitted.ids, fitted.dropped);
+            }
+        }
+        let mut params =
+            sampling.params(engine.eos_ids(), engine.readback(), engine.prefill_tile());
+        if let Some(n) = sampling.thinking_budget {
+            let refused = engine.thinking_budget_refused();
+            let tags = engine.think_tags();
+            params.thinking =
+                match budgets::thinking(refused, tags.as_ref(), &ids, n, &budget_message)? {
+                    Ok(b) => Some(b),
+                    Err(why) => anyhow::bail!("--thinking-budget {n}: {why}"),
+                };
+        }
         let probe = report::RunProbe::start(engine.device(), args.mem_sample);
         let started = Instant::now();
         let mut first_at: Option<f64> = None;
@@ -345,7 +440,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort} thinking_budget={} thought={} budget_fired={} prompt_budget={} prompt_dropped={}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,
@@ -373,6 +468,11 @@ pub fn run(args: ChatArgs) -> Result<()> {
             st.readback.eos_index_late,
             st.prefill_units,
             report::param_style_arm(),
+            opt(sampling.thinking_budget),
+            opt(decoded.thinking.map(|t| t.thought)),
+            opt(decoded.thinking.map(|t| t.fired)),
+            opt(sampling.prompt_budget),
+            dropped.tokens,
         );
         if st.readback.poll_fallbacks > 0 {
             eprintln!(

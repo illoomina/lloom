@@ -159,6 +159,96 @@ impl Template {
     }
 }
 
+/// The thinking block's markers as a checkpoint's template writes them, and
+/// the id that starts a tool call: the family's reasoning tags, read by
+/// rendering the template ([`Template::think_tags`]), never listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkTags {
+    pub start: u32,
+    pub end: u32,
+    /// A tool call ends the block too; `None` when the template writes tool
+    /// calls without a marker token of their own.
+    pub tool_call: Option<u32>,
+}
+
+impl ThinkTags {
+    /// The ids that close the block.
+    pub fn close_ids(&self) -> Vec<u32> {
+        let mut v = vec![self.end];
+        v.extend(self.tool_call);
+        v
+    }
+
+    /// Whether `ids` end inside a thinking block — a start with no end or
+    /// tool call after it — and if so how many tokens of the block they hold
+    /// after the start marker (what vLLM counts against a budget).
+    pub fn open_at_end(&self, ids: &[u32]) -> Option<usize> {
+        let start = ids.iter().rposition(|&id| id == self.start)?;
+        let after = &ids[start + 1..];
+        let close = self.close_ids();
+        (!after.iter().any(|id| close.contains(id))).then_some(after.len())
+    }
+}
+
+/// Reasoning text no template writes on its own, for the probe renders.
+const PROBE_REASONING: &str = "lloom-probe-reasoning";
+
+impl Template {
+    /// The reasoning tags this template writes, found by rendering: an
+    /// assistant turn carrying [`PROBE_REASONING`] (under each field name
+    /// the families read) puts the start marker before it and the end marker
+    /// after it; the same turn with a tool call and without one first differ
+    /// at the tool-call marker. A marker must be one token `is_marker`
+    /// accepts (the tokenizer's added tokens), so plain text around the
+    /// reasoning is never taken for one. `None` when the template writes no
+    /// such block.
+    pub fn think_tags(
+        &self,
+        bos_token: &str,
+        encode: impl Fn(&str) -> Result<Vec<u32>>,
+        is_marker: impl Fn(u32) -> bool,
+    ) -> Option<ThinkTags> {
+        let user = json!({ "role": "user", "content": "lloom-probe-user" });
+        let reasoned = json!([user, {
+            "role": "assistant",
+            "content": "lloom-probe-answer",
+            "reasoning_content": PROBE_REASONING,
+            "thinking": PROBE_REASONING,
+            "reasoning": PROBE_REASONING,
+        }]);
+        let text = self.render(&reasoned, bos_token, &Map::new()).ok()?;
+        let at = text.find(PROBE_REASONING)?;
+        let start = *encode(text[..at].trim_end()).ok()?.last()?;
+        let end = *encode(text[at + PROBE_REASONING.len()..].trim_start())
+            .ok()?
+            .first()?;
+        if start == end || !is_marker(start) || !is_marker(end) {
+            return None;
+        }
+        let bare = json!([user, { "role": "assistant", "content": "" }]);
+        let called = json!([user, {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": { "name": "lloom_probe_tool", "arguments": { "lloom_probe_arg": "v" } },
+            }],
+        }]);
+        let tool_call = (|| {
+            let bare = encode(&self.render(&bare, bos_token, &Map::new()).ok()?).ok()?;
+            let called = encode(&self.render(&called, bos_token, &Map::new()).ok()?).ok()?;
+            let at = bare.iter().zip(&called).take_while(|(a, b)| a == b).count();
+            let id = *called.get(at)?;
+            (is_marker(id) && id != start && id != end).then_some(id)
+        })();
+        Some(ThinkTags {
+            start,
+            end,
+            tool_call,
+        })
+    }
+}
+
 /// The top-level variables `source` looks up, from minijinja's static
 /// analysis of its AST (control flow is not considered: a variable read on
 /// any branch counts).
@@ -404,6 +494,68 @@ mod tests {
             r.text,
             l.render(&user(), "<|startoftext|>", &Map::new()).unwrap()
         );
+    }
+
+    /// `tok`'s tokenizer, and the reasoning tags `template` yields through it.
+    fn tags_of(tok: &TinyTokenizer, bos: &str) -> Option<ThinkTags> {
+        let json = lloom::testing::tiny::tokenizer::tokenizer_json(&tok.added);
+        let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes()).unwrap();
+        let added = tokenizer.get_added_tokens_decoder();
+        Template::compile(tok.chat_template).unwrap().think_tags(
+            bos,
+            |s| Ok(tokenizer.encode(s, false).unwrap().get_ids().to_vec()),
+            |id| added.contains_key(&id),
+        )
+    }
+
+    /// Each family's tags, read from its template by rendering: Qwen4-exp's
+    /// `<think>` / `</think>` and `<tool_call>`, LFM2's `<think>` / `</think>`
+    /// and `<|tool_call_start|>` — the ids the fixture's token table gives
+    /// them. A template that writes no block has no tags.
+    #[test]
+    fn the_reasoning_tags_come_from_the_template() {
+        let q = TinyTokenizer::qwen4exp();
+        assert_eq!(
+            tags_of(&q, ""),
+            Some(ThinkTags {
+                start: q.id("<think>").unwrap(),
+                end: q.id("</think>").unwrap(),
+                tool_call: q.id("<tool_call>"),
+            })
+        );
+        let l = TinyTokenizer::lfm2();
+        assert_eq!(
+            tags_of(&l, "<|startoftext|>"),
+            Some(ThinkTags {
+                start: l.id("<think>").unwrap(),
+                end: l.id("</think>").unwrap(),
+                tool_call: l.id("<|tool_call_start|>"),
+            })
+        );
+        let plain = TinyTokenizer {
+            added: q.added.clone(),
+            chat_template: "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{%- endfor -%}",
+        };
+        assert_eq!(tags_of(&plain, ""), None);
+    }
+
+    /// The block's state at the end of a prompt: open after a start (with the
+    /// block's tokens counted after it), closed after an end or a tool call,
+    /// closed with no start at all.
+    #[test]
+    fn a_prompt_ends_inside_the_block_only_after_an_unclosed_start() {
+        let t = ThinkTags {
+            start: 1,
+            end: 2,
+            tool_call: Some(3),
+        };
+        assert_eq!(t.open_at_end(&[9, 1]), Some(0));
+        assert_eq!(t.open_at_end(&[1, 9, 9]), Some(2));
+        assert_eq!(t.open_at_end(&[1, 9, 2, 9]), None);
+        assert_eq!(t.open_at_end(&[1, 9, 3]), None);
+        assert_eq!(t.open_at_end(&[9, 9]), None);
+        assert_eq!(t.open_at_end(&[1, 2, 1, 9]), Some(1));
+        assert_eq!(t.close_ids(), vec![2, 3]);
     }
 
     /// The request's two spellings fold into one variable, agree or are

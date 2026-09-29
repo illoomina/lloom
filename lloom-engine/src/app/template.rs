@@ -8,21 +8,31 @@
 //! names but renders identically for any value (Qwen4-exp's
 //! `reasoning_effort` with thinking off) is treated the same way. A value the
 //! template itself rejects (`raise_exception`) is a [`Rejected`] error, which
-//! `serve` answers with a 400.
+//! `serve` answers with a 400; so is a render the template fails on the
+//! request's own data ([`Unrenderable`]).
 
 use anyhow::Result;
 use hf_chat_template::ChatTemplate;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
 
-/// Thinking on or off (`lloom chat --think`, `/eval`'s `enable_thinking`).
+/// Thinking on or off (`lloom chat --think` / `--no-think`, a request's
+/// `enable_thinking`): the template's own switch where it reads it
+/// (`thinking.rs` applies it where it does not).
 pub const ENABLE_THINKING: &str = "enable_thinking";
 /// How long the model thinks (`lloom chat --reasoning-effort`, OpenAI's
 /// `reasoning_effort` request field). The values are the template's.
 pub const REASONING_EFFORT: &str = "reasoning_effort";
 
+/// The tool list (OpenAI's `tools` request field).
+pub const TOOLS: &str = "tools";
+
 /// The variables the engine sets from its own flags and request fields.
 pub const ENGINE_KWARGS: [&str; 2] = [ENABLE_THINKING, REASONING_EFFORT];
+
+/// The top-level request fields a chat request folds into the template's
+/// variables, beside its `chat_template_kwargs`.
+pub const REQUEST_FIELDS: [&str; 3] = [REASONING_EFFORT, ENABLE_THINKING, TOOLS];
 
 /// A value no template recognises: rendering with it in place of a
 /// variable's value shows whether the template's output depends on that
@@ -41,6 +51,20 @@ impl std::fmt::Display for Rejected {
 }
 
 impl std::error::Error for Rejected {}
+
+/// The template failed on the request's data outside `raise_exception` (a
+/// type it does not handle, an attribute the data lacks): the same template
+/// renders the engine's own one-message conversation.
+#[derive(Debug)]
+pub struct Unrenderable(pub String);
+
+impl std::fmt::Display for Unrenderable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the chat template cannot render the request: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unrenderable {}
 
 /// A variable a request set that the rendered prompt does not reflect.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,27 +123,41 @@ impl Template {
     }
 
     /// Render `messages` with the generation prompt appended; `kwargs` are
-    /// extra template variables, laid over the defaults.
+    /// extra template variables, laid over the defaults. A failure is the
+    /// request's ([`Rejected`], [`Unrenderable`]) when the template renders a
+    /// one-message conversation with no variables of the caller's, and the
+    /// engine's otherwise.
     pub fn render(
         &self,
         messages: &Value,
         bos_token: &str,
         kwargs: &Map<String, Value>,
     ) -> Result<String> {
-        let mut ctx = json!({
-            "messages": messages,
-            "bos_token": bos_token,
-            "add_generation_prompt": true,
-        });
-        for (k, v) in kwargs {
-            ctx[k] = v.clone();
-        }
-        self.compiled.render_context(&ctx).map_err(|e| match e {
-            hf_chat_template::Error::TemplateRaised { message } => {
-                anyhow::Error::new(Rejected(message))
+        let ctx = |messages: &Value, kwargs: &Map<String, Value>| {
+            let mut ctx = json!({
+                "messages": messages,
+                "bos_token": bos_token,
+                "add_generation_prompt": true,
+            });
+            for (k, v) in kwargs {
+                ctx[k] = v.clone();
             }
-            e => anyhow::anyhow!("rendering the chat template: {e}"),
-        })
+            ctx
+        };
+        self.compiled
+            .render_context(&ctx(messages, kwargs))
+            .map_err(|e| match e {
+                hf_chat_template::Error::TemplateRaised { message } => {
+                    anyhow::Error::new(Rejected(message))
+                }
+                e => {
+                    let own = json!([{ "role": "user", "content": PROBE_USER }]);
+                    match self.compiled.render_context(&ctx(&own, &Map::new())) {
+                        Ok(_) => anyhow::Error::new(Unrenderable(e.to_string())),
+                        Err(_) => anyhow::anyhow!("rendering the chat template: {e}"),
+                    }
+                }
+            })
     }
 
     /// [`Self::render`], with each of `checked` that `kwargs` sets tested
@@ -162,6 +200,99 @@ impl Template {
             }
         }
         Ok(Rendered { text, ignored })
+    }
+}
+
+/// The thinking block's markers as a checkpoint's template writes them, and
+/// the id that starts a tool call: the family's reasoning tags, read by
+/// rendering the template ([`Template::think_tags`]), never listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkTags {
+    pub start: u32,
+    pub end: u32,
+    /// A tool call ends the block too; `None` when the template writes tool
+    /// calls without a marker token of their own.
+    pub tool_call: Option<u32>,
+}
+
+impl ThinkTags {
+    /// The ids that close the block.
+    pub fn close_ids(&self) -> Vec<u32> {
+        let mut v = vec![self.end];
+        v.extend(self.tool_call);
+        v
+    }
+
+    /// Whether `ids` end inside a thinking block — a start with no end or
+    /// tool call after it — and if so how many tokens of the block they hold
+    /// after the start marker (what vLLM counts against a budget).
+    pub fn open_at_end(&self, ids: &[u32]) -> Option<usize> {
+        let start = ids.iter().rposition(|&id| id == self.start)?;
+        let after = &ids[start + 1..];
+        let close = self.close_ids();
+        (!after.iter().any(|id| close.contains(id))).then_some(after.len())
+    }
+}
+
+/// A user message no template writes on its own, for the probe renders.
+const PROBE_USER: &str = "lloom-probe-user";
+
+/// Reasoning text no template writes on its own, for the probe renders.
+const PROBE_REASONING: &str = "lloom-probe-reasoning";
+
+impl Template {
+    /// The reasoning tags this template writes, found by rendering: an
+    /// assistant turn carrying [`PROBE_REASONING`] (under each field name
+    /// the families read) puts the start marker before it and the end marker
+    /// after it; the same turn with a tool call and without one first differ
+    /// at the tool-call marker. A marker must be one token `is_marker`
+    /// accepts (the tokenizer's added tokens), so plain text around the
+    /// reasoning is never taken for one. `None` when the template writes no
+    /// such block.
+    pub fn think_tags(
+        &self,
+        bos_token: &str,
+        encode: impl Fn(&str) -> Result<Vec<u32>>,
+        is_marker: impl Fn(u32) -> bool,
+    ) -> Option<ThinkTags> {
+        let user = json!({ "role": "user", "content": PROBE_USER });
+        let reasoned = json!([user, {
+            "role": "assistant",
+            "content": "lloom-probe-answer",
+            "reasoning_content": PROBE_REASONING,
+            "thinking": PROBE_REASONING,
+            "reasoning": PROBE_REASONING,
+        }]);
+        let text = self.render(&reasoned, bos_token, &Map::new()).ok()?;
+        let at = text.find(PROBE_REASONING)?;
+        let start = *encode(text[..at].trim_end()).ok()?.last()?;
+        let end = *encode(text[at + PROBE_REASONING.len()..].trim_start())
+            .ok()?
+            .first()?;
+        if start == end || !is_marker(start) || !is_marker(end) {
+            return None;
+        }
+        let bare = json!([user, { "role": "assistant", "content": "" }]);
+        let called = json!([user, {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": { "name": "lloom_probe_tool", "arguments": { "lloom_probe_arg": "v" } },
+            }],
+        }]);
+        let tool_call = (|| {
+            let bare = encode(&self.render(&bare, bos_token, &Map::new()).ok()?).ok()?;
+            let called = encode(&self.render(&called, bos_token, &Map::new()).ok()?).ok()?;
+            let at = bare.iter().zip(&called).take_while(|(a, b)| a == b).count();
+            let id = *called.get(at)?;
+            (is_marker(id) && id != start && id != end).then_some(id)
+        })();
+        Some(ThinkTags {
+            start,
+            end,
+            tool_call,
+        })
     }
 }
 
@@ -292,7 +423,7 @@ fn without_generation_blocks(source: &str) -> String {
 
 /// The template variables a request sets: its `chat_template_kwargs`, with
 /// each of the top-level `fields` folded in under the same name. A field set
-/// both ways must agree.
+/// both ways must agree; one set to `null` either way is unset.
 pub fn request_kwargs(
     v: &Value,
     fields: &[&str],
@@ -303,6 +434,9 @@ pub fn request_kwargs(
         Some(_) => return Err("field 'chat_template_kwargs' must be an object".to_string()),
     };
     for &field in fields {
+        if kwargs.get(field) == Some(&Value::Null) {
+            kwargs.remove(field);
+        }
         let top = match v.get(field) {
             None | Some(Value::Null) => continue,
             Some(t) => t,
@@ -321,6 +455,13 @@ pub fn request_kwargs(
     if let Some(e) = kwargs.get(REASONING_EFFORT) {
         if !e.is_string() && !e.is_null() {
             return Err(format!("'{REASONING_EFFORT}' must be a string, not {e}"));
+        }
+    }
+    if let Some(e) = kwargs.get(ENABLE_THINKING) {
+        if !e.is_boolean() && !e.is_null() {
+            return Err(format!(
+                "'{ENABLE_THINKING}' must be true or false, not {e}"
+            ));
         }
     }
     Ok(kwargs)
@@ -533,6 +674,118 @@ mod tests {
         );
     }
 
+    /// `tok`'s tokenizer, and the reasoning tags `template` yields through it.
+    fn tags_of(tok: &TinyTokenizer, bos: &str) -> Option<ThinkTags> {
+        let json = lloom::testing::tiny::tokenizer::tokenizer_json(&tok.added);
+        let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes()).unwrap();
+        let added = tokenizer.get_added_tokens_decoder();
+        Template::compile(tok.chat_template).unwrap().think_tags(
+            bos,
+            |s| Ok(tokenizer.encode(s, false).unwrap().get_ids().to_vec()),
+            |id| added.contains_key(&id),
+        )
+    }
+
+    /// Each family's tags, read from its template by rendering: Qwen4-exp's
+    /// `<think>` / `</think>` and `<tool_call>`, LFM2's `<think>` / `</think>`
+    /// and `<|tool_call_start|>` — the ids the fixture's token table gives
+    /// them. A template that writes no block has no tags.
+    #[test]
+    fn the_reasoning_tags_come_from_the_template() {
+        let q = TinyTokenizer::qwen4exp();
+        assert_eq!(
+            tags_of(&q, ""),
+            Some(ThinkTags {
+                start: q.id("<think>").unwrap(),
+                end: q.id("</think>").unwrap(),
+                tool_call: q.id("<tool_call>"),
+            })
+        );
+        let l = TinyTokenizer::lfm2();
+        assert_eq!(
+            tags_of(&l, "<|startoftext|>"),
+            Some(ThinkTags {
+                start: l.id("<think>").unwrap(),
+                end: l.id("</think>").unwrap(),
+                tool_call: l.id("<|tool_call_start|>"),
+            })
+        );
+        let plain = TinyTokenizer {
+            added: q.added.clone(),
+            chat_template: "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{%- endfor -%}",
+        };
+        assert_eq!(tags_of(&plain, ""), None);
+    }
+
+    /// The block's state at the end of a prompt: open after a start (with the
+    /// block's tokens counted after it), closed after an end or a tool call,
+    /// closed with no start at all.
+    #[test]
+    fn a_prompt_ends_inside_the_block_only_after_an_unclosed_start() {
+        let t = ThinkTags {
+            start: 1,
+            end: 2,
+            tool_call: Some(3),
+        };
+        assert_eq!(t.open_at_end(&[9, 1]), Some(0));
+        assert_eq!(t.open_at_end(&[1, 9, 9]), Some(2));
+        assert_eq!(t.open_at_end(&[1, 9, 2, 9]), None);
+        assert_eq!(t.open_at_end(&[1, 9, 3]), None);
+        assert_eq!(t.open_at_end(&[9, 9]), None);
+        assert_eq!(t.open_at_end(&[1, 2, 1, 9]), Some(1));
+        assert_eq!(t.close_ids(), vec![2, 3]);
+    }
+
+    /// A render that fails outside `raise_exception` is the request's
+    /// ([`Unrenderable`]) when the template renders the engine's own
+    /// one-message conversation, and the engine's otherwise: a content the
+    /// tiny templates cannot iterate; a template that fails on everything.
+    /// And the checkpoint's Qwen template on OpenAI's string tool-call
+    /// arguments, when it is in the Hugging Face cache.
+    #[test]
+    fn a_failure_on_the_requests_data_is_the_requests() {
+        let number = json!([{ "role": "user", "content": 5 }]);
+        for (t, bos) in [(lfm2(), "<|startoftext|>"), (qwen(), "")] {
+            let err = t.render(&number, bos, &Map::new()).unwrap_err();
+            assert!(err.downcast_ref::<Unrenderable>().is_some(), "{err:#}");
+            assert!(err.downcast_ref::<Rejected>().is_none(), "{err:#}");
+            assert!(t.render(&user(), bos, &Map::new()).is_ok());
+        }
+        let broken = Template::compile("{{ messages[0].content }}{{ 1 + 'a' }}").unwrap();
+        let err = broken.render(&user(), "", &Map::new()).unwrap_err();
+        assert!(err.downcast_ref::<Unrenderable>().is_none(), "{err:#}");
+        assert!(err.downcast_ref::<Rejected>().is_none(), "{err:#}");
+
+        let hub = std::env::var("HF_HUB_CACHE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                    .join(".cache/huggingface/hub")
+            });
+        let snapshots = hub.join("models--Qwen--Qwen3.8-Flash-Next/snapshots");
+        let sources: Vec<String> = std::fs::read_dir(&snapshots)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path().join("chat_template.jinja")).ok())
+            .collect();
+        if sources.is_empty() {
+            eprintln!("skipped: no Qwen3.8-Flash-Next chat template under {snapshots:?}");
+        }
+        let called = json!([
+            { "role": "user", "content": "Weather?" },
+            { "role": "assistant", "content": "", "tool_calls": [{ "type": "function",
+              "function": { "name": "get_weather", "arguments": "{\"city\": \"Paris\"}" } }] },
+        ]);
+        for src in sources {
+            let err = Template::compile(&src)
+                .unwrap()
+                .render(&called, "", &Map::new())
+                .unwrap_err();
+            assert!(err.downcast_ref::<Unrenderable>().is_some(), "{err:#}");
+        }
+    }
+
     /// The request's two spellings fold into one variable, agree or are
     /// refused, and a malformed one is refused by name.
     #[test]
@@ -562,5 +815,23 @@ mod tests {
         assert!(e.contains("must be a string"), "{e}");
         let e = get(json!({"chat_template_kwargs": "enable_thinking=true"})).unwrap_err();
         assert!(e.contains("must be an object"), "{e}");
+
+        let get = |v: Value| request_kwargs(&v, &REQUEST_FIELDS);
+        let tools = json!([{ "type": "function", "function": { "name": "f" } }]);
+        assert_eq!(
+            get(json!({"tools": tools, "enable_thinking": false})).unwrap(),
+            kw(&[(TOOLS, tools.clone()), (ENABLE_THINKING, json!(false))])
+        );
+        assert_eq!(
+            get(
+                json!({"chat_template_kwargs": {"enable_thinking": null, "reasoning_effort": null}})
+            )
+            .unwrap(),
+            Map::new()
+        );
+        let e = get(json!({"tools": tools, "chat_template_kwargs": {"tools": []}})).unwrap_err();
+        assert!(e.contains("disagree"), "{e}");
+        let e = get(json!({"enable_thinking": "yes"})).unwrap_err();
+        assert_eq!(e, "'enable_thinking' must be true or false, not \"yes\"");
     }
 }

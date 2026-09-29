@@ -221,6 +221,7 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
 
     /// Retrieve the tensor associated with the given name & dtype at the current path.
     pub fn get_unchecked_dtype(&self, name: &str, dtype: DType) -> Result<Tensor> {
+        self.data.device.admit_compute_dtype(dtype)?;
         let name = self.path(name);
         self.data
             .backend
@@ -235,6 +236,9 @@ impl<B: Backend> VarBuilderArgs<'_, B> {
         hints: B::Hints,
         dtype: DType,
     ) -> Result<Tensor> {
+        // A model loads at the dtype it computes in, so a type the device only
+        // emulates is refused here, before the first weight (§15.2a).
+        self.data.device.admit_compute_dtype(dtype)?;
         let path = self.path(name);
         self.data
             .backend

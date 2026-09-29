@@ -13,9 +13,13 @@
 //!
 //! And the thinking effort (`--reasoning-effort`, the `reasoning_effort`
 //! request field), through the template: on Qwen4-exp each value's prompt is
-//! the ids of the rendering written out here, and no value is `xhigh`'s; on
-//! LFM2, whose template does not read it, `chat` refuses the flag and
-//! `serve` renders without it and says so.
+//! the ids of the rendering written out here, and no value is `xhigh`'s; an
+//! effort the template would not act on (LFM2's reads none; Qwen4-exp's with
+//! thinking off has no effect) is refused by `chat` and a 400 on `serve`.
+//! The thinking switch (`--think` / `--no-think`, `enable_thinking`): Qwen4-exp
+//! through its template's switch, LFM2 by the engine closing the block its
+//! template opens. And `serve`'s request surface: top-level `tools`, and a
+//! template that fails on the request's data is a 400.
 #![cfg(feature = "serve")]
 
 use lloom::models::lfm2_testing::Lfm2Tiny;
@@ -398,7 +402,8 @@ fn qwen4exp_serve_takes_the_reasoning_effort_request_field() {
         low["timings"]["prompt_ids_sha256"],
         sha(&encode(&tok, &qwen_thinking(Some(LOW))))
     );
-    assert_eq!(low["timings"]["template_kwargs_ignored"], json!([]));
+    assert_eq!(low["timings"]["thinking"], "on");
+    assert_eq!(low["timings"]["thinking_by"], "template");
 
     let (status, xhigh) = server.chat(json!({
         "chat_template_kwargs": { "enable_thinking": true, "reasoning_effort": "xhigh" },
@@ -435,29 +440,25 @@ fn qwen4exp_serve_takes_the_reasoning_effort_request_field() {
         "{err}"
     );
 
-    let (status, off) = server.chat(json!({
-        "reasoning_effort": "low", "chat_template_kwargs": { "enable_thinking": false },
-    }));
+    let (status, off) =
+        server.chat(json!({ "chat_template_kwargs": { "enable_thinking": false } }));
     assert_eq!(status, 200, "{off}");
-    assert_eq!(off["timings"]["reasoning_effort"], Value::Null);
-    assert_eq!(
-        off["timings"]["template_kwargs_ignored"][0]["name"],
-        "reasoning_effort"
-    );
-    assert_eq!(off["timings"]["template_kwargs_ignored"][0]["value"], "low");
     assert_eq!(
         off["timings"]["prompt_ids_sha256"],
         sha(&encode(&tok, &qwen_not_thinking()))
     );
+    assert_eq!(off["timings"]["thinking"], "off");
+    assert_eq!(off["timings"]["thinking_by"], "template");
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// `lloom serve` on the tiny LFM2: clients send `reasoning_effort` blindly,
-/// so it is served — rendered without it, byte-identical to a request with
-/// none, and listed as unread.
+/// An effort the template would not act on is a 400 on `serve`, by either
+/// spelling, naming the family and why: LFM2's template does not read it;
+/// Qwen4-exp's renders the same prompt for any effort with thinking off. The
+/// same requests without the effort are served.
 #[test]
-fn lfm2_serve_ignores_the_reasoning_effort_it_cannot_read() {
+fn serve_refuses_an_effort_the_template_does_not_act_on() {
     let dir = scratch("effort-serve-lfm2");
     let model = write::<Lfm2Tiny>(&dir);
     let server = Server::start(&model, &["--cpu"]);
@@ -466,20 +467,926 @@ fn lfm2_serve_ignores_the_reasoning_effort_it_cannot_read() {
         health["chat_template_reads"],
         json!({"enable_thinking": false, "reasoning_effort": false})
     );
-    let (status, with) = server.chat(json!({ "reasoning_effort": "low" }));
-    assert_eq!(status, 200, "{with}");
-    let (status, without) = server.chat(json!({}));
+    let not_read = "reasoning_effort=\"low\": lfm2's chat template does not read reasoning_effort";
+    for req in [
+        json!({ "reasoning_effort": "low" }),
+        json!({ "chat_template_kwargs": { "reasoning_effort": "low" } }),
+    ] {
+        let (status, err) = server.chat(req.clone());
+        assert_eq!(status, 400, "{req}: {err}");
+        assert_eq!(err["error"]["message"], not_read, "{req}");
+    }
+    let (status, without) = server.chat(json!({ "reasoning_effort": null }));
     assert_eq!(status, 200, "{without}");
+    assert_eq!(without["timings"]["reasoning_effort"], Value::Null);
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let (dir, model, base) = qwen_tiny("effort-serve-off");
+    let args: Vec<&str> = base.iter().map(String::as_str).collect();
+    let server = Server::start(&model, &args);
+    let no_effect = "reasoning_effort=\"low\": qwen4exp's chat template renders the same prompt \
+                     for any reasoning_effort with enable_thinking=false";
+    for req in [
+        json!({ "reasoning_effort": "low", "enable_thinking": false }),
+        json!({ "chat_template_kwargs": { "reasoning_effort": "low", "enable_thinking": false } }),
+    ] {
+        let (status, err) = server.chat(req.clone());
+        assert_eq!(status, 400, "{req}: {err}");
+        assert_eq!(err["error"]["message"], no_effect, "{req}");
+    }
+    let (status, ok) = server.chat(json!({ "enable_thinking": false }));
+    assert_eq!(status, 200, "{ok}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The ids a tiny family gives an added token.
+fn added_id(tok: &TinyTokenizer, content: &str) -> u32 {
+    tok.id(content)
+        .unwrap_or_else(|| panic!("{content} is not an added token"))
+}
+
+/// A `lloom serve` chat request's generated ids and `timings`.
+fn served_ids(server: &Server, fields: Value) -> (Vec<u32>, Value) {
+    let (status, body) = server.chat(fields);
+    assert_eq!(status, 200, "{body}");
+    let ids = body["timings"]["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    (ids, body["timings"].clone())
+}
+
+/// The thinking budget through `lloom serve` on both tiny families, on the
+/// CPU and on Metal, on each family's default readback arm and a ring arm
+/// beside it. Each prompt leaves a block open (Qwen4-exp with thinking on;
+/// LFM2's template always opens one). The model is kept from closing the
+/// block itself (a bias of -100 on the end marker and the tool-call start),
+/// so at the budget of 3 — counted, as vLLM counts it, from the start marker,
+/// the prompt's own tokens after it included — the forced tail (the message's
+/// bytes, then the end marker) is fed, and the ids before it are the
+/// unbudgeted run's. A budget
+/// past `max_tokens` changes nothing. With the tool-call start biased up
+/// instead, the model calls a tool at once, which closes the block, and
+/// nothing is forced: every id is the unbudgeted run's. A budget of 0 (no
+/// bias, so the default arm's fused publish runs after the tail) ends the
+/// block at the first token.
+#[test]
+fn thinking_budget_forces_the_end_marker_through_serve() {
+    struct Family {
+        name: &'static str,
+        tok: TinyTokenizer,
+        model: PathBuf,
+        args: Vec<String>,
+        kwargs: Value,
+        tool: &'static str,
+        /// Tokens of the block the prompt holds after `<think>`, which the
+        /// budget counts: Qwen4-exp's prompt ends `<think>\n`, LFM2's `<think>`.
+        prior: usize,
+    }
+    let q_dir = scratch("budget-qwen");
+    let l_dir = scratch("budget-lfm2");
+    let q_model = write::<Qwen4ExpTiny>(&q_dir);
+    let families = [
+        Family {
+            name: "qwen4exp",
+            tok: Qwen4ExpTiny::tokenizer(),
+            args: vec![
+                "--tokenizer".into(),
+                q_dir.join("tokenizer.json").to_str().unwrap().into(),
+                "--experts".into(),
+                "resident".into(),
+            ],
+            model: q_model,
+            kwargs: json!({ "enable_thinking": true }),
+            tool: "<tool_call>",
+            prior: 1,
+        },
+        Family {
+            name: "lfm2",
+            tok: Lfm2Tiny::tokenizer(),
+            model: write::<Lfm2Tiny>(&l_dir),
+            args: vec![],
+            kwargs: json!({}),
+            tool: "<|tool_call_start|>",
+            prior: 0,
+        },
+    ];
+    let mut devices = vec![true];
+    if cfg!(feature = "metal") {
+        devices.push(false);
+    }
+    let message = "Enough.";
+    for f in &families {
+        let end = added_id(&f.tok, "</think>");
+        let tool = added_id(&f.tok, f.tool);
+        let mut tail = bytes(message);
+        tail.push(end);
+        for &cpu in &devices {
+            for arm in [None, Some("ring-la0")] {
+                let mut args: Vec<&str> = f.args.iter().map(String::as_str).collect();
+                if cpu {
+                    args.push("--cpu");
+                }
+                if let Some(a) = arm {
+                    args.extend(["--readback", a]);
+                }
+                let at = format!("{} cpu={cpu} {arm:?}", f.name);
+                let server = Server::start(&f.model, &args);
+                let (_, health) = server.call("GET", "/health", &json!({}));
+                assert_eq!(
+                    health["reasoning_tags"],
+                    json!({ "start": "<think>", "end": "</think>", "tool_call": f.tool }),
+                    "{at}"
+                );
+                let req = |bias: Value, extra: Value| {
+                    let mut r = json!({
+                        "max_tokens": 16,
+                        "ignore_eos": true,
+                        "chat_template_kwargs": f.kwargs,
+                        "logit_bias": bias,
+                    });
+                    for (k, v) in extra.as_object().unwrap() {
+                        r[k] = v.clone();
+                    }
+                    r
+                };
+                let closed = json!({ end.to_string(): -100, tool.to_string(): -100 });
+                let (plain, t) = served_ids(&server, req(closed.clone(), json!({})));
+                assert_eq!(t["thinking_budget"], Value::Null, "{at}");
+                assert_eq!(plain.len(), 16, "{at}: {plain:?}");
+
+                let (got, t) = served_ids(
+                    &server,
+                    req(
+                        closed.clone(),
+                        json!({ "thinking_token_budget": 3, "thinking_budget_message": message }),
+                    ),
+                );
+                let cut = 3 - f.prior;
+                assert_eq!(got[..cut], plain[..cut], "{at}: before the budget");
+                assert_eq!(
+                    got[cut..cut + tail.len()],
+                    tail[..],
+                    "{at}: the forced tail"
+                );
+                assert_eq!(t["thinking_budget"], 3, "{at}");
+                assert_eq!(t["thinking_budget_fired"], true, "{at}");
+                assert_eq!(t["thinking_tokens"], 3 + bytes(message).len(), "{at}");
+                assert_eq!(t["thinking_budget_ignored"], Value::Null, "{at}");
+
+                let (got, t) = served_ids(
+                    &server,
+                    req(closed.clone(), json!({ "thinking_token_budget": 100 })),
+                );
+                assert_eq!(got, plain, "{at}: a budget past max_tokens");
+                assert_eq!(t["thinking_budget_fired"], false, "{at}");
+                assert_eq!(t["thinking_tokens"], 16 + f.prior, "{at}");
+
+                let calls = json!({ end.to_string(): -100, tool.to_string(): 100 });
+                let (plain_call, _) = served_ids(&server, req(calls.clone(), json!({})));
+                assert_eq!(plain_call[0], tool, "{at}: the bias did not call a tool");
+                let (got, t) =
+                    served_ids(&server, req(calls, json!({ "thinking_token_budget": 3 })));
+                assert_eq!(got, plain_call, "{at}: a tool call ends the block");
+                assert_eq!(t["thinking_budget_fired"], false, "{at}");
+                assert_eq!(t["thinking_tokens"], f.prior, "{at}");
+
+                let (got, t) = served_ids(
+                    &server,
+                    json!({
+                        "max_tokens": 6,
+                        "ignore_eos": true,
+                        "chat_template_kwargs": f.kwargs,
+                        "thinking_token_budget": 0,
+                    }),
+                );
+                assert_eq!(got[0], end, "{at}: a budget of 0");
+                assert_eq!(t["thinking_budget_fired"], true, "{at}");
+                assert_eq!(t["thinking_tokens"], f.prior, "{at}");
+                drop(server);
+            }
+        }
+    }
+    std::fs::remove_dir_all(&q_dir).ok();
+    std::fs::remove_dir_all(&l_dir).ok();
+}
+
+/// Where the thinking budget cannot apply: `lloom serve` serves the request
+/// without it and says why (Qwen4-exp with thinking off, whose prompt closes
+/// its block), and `lloom chat` refuses the flag by name before the first
+/// turn — with the hint on Qwen4-exp, and on a template that writes no
+/// thinking block at all (the tiny Qwen4-exp checkpoint with a plain
+/// template beside it). With `--think` the chat runs it and says so.
+#[test]
+fn thinking_budget_is_ignored_or_refused_where_no_block_is_open() {
+    let (dir, model, base) = qwen_tiny("budget-refuse");
+    let args: Vec<&str> = base.iter().map(String::as_str).collect();
+    let server = Server::start(&model, &args);
+    let off = json!({ "enable_thinking": false });
+    let (status, plain) = server.chat(json!({ "chat_template_kwargs": off }));
+    assert_eq!(status, 200, "{plain}");
+    let (status, with) =
+        server.chat(json!({ "chat_template_kwargs": off, "thinking_token_budget": 2 }));
+    assert_eq!(status, 200, "{with}");
+    assert_eq!(with["timings"]["tokens"], plain["timings"]["tokens"]);
+    assert_eq!(with["timings"]["thinking_budget"], 2);
     assert_eq!(
-        with["timings"]["prompt_ids_sha256"],
-        without["timings"]["prompt_ids_sha256"]
+        with["timings"]["thinking_budget_ignored"],
+        "the prompt leaves no thinking block open"
     );
-    assert_eq!(with["timings"]["reasoning_effort"], Value::Null);
+    assert_eq!(with["timings"]["thinking_budget_fired"], Value::Null);
+    let (status, err) = server.chat(json!({ "thinking_token_budget": -2 }));
+    assert_eq!(status, 400, "{err}");
+    drop(server);
+
+    // A server whose requests run the batch scheduler serves the budget
+    // ignored, by that reason, rather than failing the request.
+    let mut batched: Vec<&str> = base.iter().map(String::as_str).collect();
+    batched.extend(["--batch", "2"]);
+    let server = Server::start(&model, &batched);
+    let on = json!({ "enable_thinking": true });
+    let (status, plain) = server.chat(json!({ "chat_template_kwargs": on }));
+    assert_eq!(status, 200, "{plain}");
+    let (status, with) =
+        server.chat(json!({ "chat_template_kwargs": on, "thinking_token_budget": 0 }));
+    assert_eq!(status, 200, "{with}");
+    assert_eq!(with["timings"]["tokens"], plain["timings"]["tokens"]);
+    assert!(
+        with["timings"]["thinking_budget_ignored"]
+            .as_str()
+            .unwrap()
+            .contains("the batch scheduler (--batch N)"),
+        "{with}"
+    );
+    drop(server);
+
+    let with_args = |extra: &[&str]| {
+        let mut a: Vec<&str> = base.iter().map(String::as_str).collect();
+        a.extend(extra);
+        chat_templated(&model, &a)
+    };
+    let (ok, stderr, f) = with_args(&["--thinking-budget", "4"]);
+    assert!(!ok && f.is_empty(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "--thinking-budget 4: qwen4exp: the prompt leaves no thinking block open (add --think)"
+        ),
+        "{stderr}"
+    );
+    let (ok, stderr, f) = with_args(&["--think", "--thinking-budget", "4"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(f["thinking_budget"], "4");
+    assert_ne!(f["budget_fired"], "none", "{stderr}");
+    std::fs::write(
+        dir.join("chat_template.jinja"),
+        "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{%- endfor -%}<|im_start|>assistant\n",
+    )
+    .unwrap();
+    let (ok, stderr, f) = with_args(&["--thinking-budget", "4"]);
+    assert!(!ok && f.is_empty(), "{stderr}");
+    assert!(
+        stderr
+            .contains("--thinking-budget 4: qwen4exp: the chat template writes no thinking block"),
+        "{stderr}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The prompt budget on a raw prompt (`lloom chat --raw`): over it the turn
+/// is refused by default, with the prompt's length and the budget; under
+/// `--prompt-budget-mode truncate` the prompt is its last tokens, BOS kept
+/// on LFM2, and the prefill in tiles of 4 over the 8 kept tokens (the cut on
+/// a tile boundary) decodes exactly what the kept text given as the prompt
+/// decodes.
+#[test]
+fn prompt_budget_refuses_or_keeps_the_last_tokens() {
+    let l_dir = scratch("prompt-budget-lfm2");
+    let l_model = write::<Lfm2Tiny>(&l_dir);
+    let (q_dir, q_model, q_base) = qwen_tiny("prompt-budget-qwen");
+    let bos = Lfm2Tiny::tokenizer().id("<|startoftext|>").unwrap();
+    let cases: [(&Path, Vec<&str>, Option<u32>); 2] = [
+        (&l_model, vec!["--cpu"], Some(bos)),
+        (&q_model, q_base.iter().map(String::as_str).collect(), None),
+    ];
+    for (model, base, bos) in cases {
+        let run = |prompt: &str, extra: &[&str]| {
+            let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+                .args(["chat", "--model"])
+                .arg(model)
+                .args([
+                    "--raw",
+                    "-p",
+                    prompt,
+                    "-n",
+                    MAX_TOKENS,
+                    "--prefill-tile",
+                    "4",
+                ])
+                .args(&base)
+                .args(extra)
+                .output()
+                .expect("lloom runs");
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let fields: std::collections::BTreeMap<String, String> = stderr
+                .lines()
+                .find(|l| l.starts_with("[turn 1:"))
+                .map(|line| {
+                    line.trim_start_matches("[turn 1:")
+                        .trim_end_matches(']')
+                        .split_whitespace()
+                        .filter_map(|kv| kv.split_once('='))
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (out.status.success(), stderr, fields)
+        };
+        let full = bos.into_iter().chain(bytes(PROMPT)).collect::<Vec<u32>>();
+        let (ok, stderr, _) = run(PROMPT, &["--prompt-budget", "8"]);
+        assert!(!ok, "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "the prompt is {} tokens, over the prompt budget of 8",
+                full.len()
+            )),
+            "{stderr}"
+        );
+        let (ok, stderr, cut) = run(
+            PROMPT,
+            &["--prompt-budget", "8", "--prompt-budget-mode", "truncate"],
+        );
+        assert!(ok, "{stderr}");
+        let kept_bytes = 8 - usize::from(bos.is_some());
+        let tail = &PROMPT[PROMPT.len() - kept_bytes..];
+        let want: Vec<u32> = bos.into_iter().chain(bytes(tail)).collect();
+        assert_eq!(cut["prompt_tokens"], "8");
+        assert_eq!(cut["prompt_ids_sha256"], sha(&want), "{model:?}");
+        assert_eq!(cut["prompt_dropped"], (full.len() - 8).to_string());
+        assert_eq!(cut["prompt_budget"], "8");
+        let (ok, stderr, direct) = run(tail, &[]);
+        assert!(ok, "{stderr}");
+        assert_eq!(direct["prompt_ids_sha256"], cut["prompt_ids_sha256"]);
+        assert_eq!(
+            direct["tokens_sha256"], cut["tokens_sha256"],
+            "{model:?}: the truncated prompt decodes other than the same ids given whole"
+        );
+        assert_eq!(direct["prompt_dropped"], "0");
+    }
+    std::fs::remove_dir_all(&l_dir).ok();
+    std::fs::remove_dir_all(&q_dir).ok();
+}
+
+/// The prompt budget on a conversation, and what it does to the cache.
+///
+/// `lloom chat` (three turns on stdin, a budget the second turn's
+/// conversation exceeds): the truncated turn drops the oldest turns whole,
+/// is reported, and does not reuse the cache (its prompt no longer starts
+/// with what the cache holds); the conversation itself was shortened, so the
+/// turn after it fits without dropping anything again.
+///
+/// `lloom serve`: a request over `truncate_prompt_tokens` renders the kept
+/// turns only — its prompt is exactly the rendering of the conversation
+/// without them, which a second server answers identically — and says what
+/// it dropped.
+#[test]
+fn prompt_budget_drops_whole_turns_and_the_cache_follows() {
+    let dir = scratch("prompt-budget-conv");
+    let model = write::<Lfm2Tiny>(&dir);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .args(["--cpu", "-n", "4", "--prompt-budget", "88"])
+        .args(["--prompt-budget-mode", "truncate"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lloom runs");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for line in [
+            "a first question here",
+            "a second one, longer still",
+            "third",
+        ] {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let turns: Vec<std::collections::BTreeMap<String, String>> = stderr
+        .lines()
+        .filter(|l| l.starts_with("[turn "))
+        .map(|l| {
+            l.split_whitespace()
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.trim_end_matches(']').to_string()))
+                .collect()
+        })
+        .collect();
+    assert_eq!(turns.len(), 3, "{stderr}");
+    let dropped: Vec<usize> = turns
+        .iter()
+        .map(|t| t["prompt_dropped"].parse().unwrap())
+        .collect();
+    let first_cut = dropped
+        .iter()
+        .position(|&d| d > 0)
+        .unwrap_or_else(|| panic!("no turn was truncated at a budget of 88:\n{stderr}"));
+    assert_eq!(first_cut, 1, "turn 1 fits and turn 2 does not:\n{stderr}");
+    assert!(
+        !["Extend", "Resume"].contains(&turns[1]["reuse"].as_str()),
+        "the truncated turn reused a cache its prompt no longer starts with:\n{stderr}"
+    );
+    for t in &turns {
+        assert!(
+            t["prompt_tokens"].parse::<usize>().unwrap() <= 88,
+            "{stderr}"
+        );
+    }
+    assert_eq!(dropped[2], 0, "the third turn dropped again:\n{stderr}");
+
+    let tok = Lfm2Tiny::tokenizer();
+    let conv = json!([
+        { "role": "user", "content": "a first question here" },
+        { "role": "assistant", "content": "an answer" },
+        { "role": "user", "content": PROMPT },
+    ]);
+    let kept = json!([{ "role": "user", "content": PROMPT }]);
+    let a = Server::start(&model, &["--cpu"]);
+    let (status, full) = a.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": conv, "max_tokens": 4 }),
+    );
+    assert_eq!(status, 200, "{full}");
+    let (status, cut) = a.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": conv, "max_tokens": 4, "truncate_prompt_tokens": 60 }),
+    );
+    assert_eq!(status, 200, "{cut}");
+    let bos = tok.id("<|startoftext|>").unwrap();
+    let mut want = vec![bos];
+    want.extend(encode(
+        &tok,
+        &format!("<|im_start|>user\n{PROMPT}<|im_end|>\n<|im_start|>assistant\n<think>"),
+    ));
+    assert!(
+        want.len() <= 60,
+        "the fixture's kept turn is over the budget"
+    );
+    assert_eq!(cut["timings"]["prompt_ids_sha256"], sha(&want));
+    assert_eq!(cut["usage"]["prompt_tokens"], want.len());
+    assert_eq!(cut["timings"]["prompt_messages_dropped"], 2);
     assert_eq!(
-        with["timings"]["template_kwargs_ignored"],
-        json!([{ "name": "reasoning_effort", "value": "low", "reason": "is not read by the chat template" }])
+        cut["timings"]["prompt_tokens_dropped"],
+        full["usage"]["prompt_tokens"].as_u64().unwrap() - want.len() as u64
     );
-    assert_eq!(without["timings"]["template_kwargs_ignored"], json!([]));
+    assert_eq!(cut["timings"]["prompt_budget"], 60);
+    let (status, err) = a.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": conv, "max_tokens": 4, "truncate_prompt_tokens": 5 }),
+    );
+    assert_eq!(status, 400, "{err}");
+    drop(a);
+    let b = Server::start(&model, &["--cpu"]);
+    let (status, alone) = b.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": kept, "max_tokens": 4 }),
+    );
+    assert_eq!(status, 200, "{alone}");
+    assert_eq!(alone["timings"]["prompt_ids_sha256"], sha(&want));
+    assert_eq!(alone["timings"]["tokens"], cut["timings"]["tokens"]);
+    drop(b);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The tiny LFM2's rendering of one user message: its template opens the
+/// thinking block on every turn.
+fn lfm2_rendered() -> String {
+    format!("<|startoftext|><|im_start|>user\n{PROMPT}<|im_end|>\n<|im_start|>assistant\n<think>")
+}
+
+/// A template that writes a thinking block for a past turn's reasoning (so
+/// the family has reasoning tags) but opens none in its generation prompt,
+/// and reads no `enable_thinking`: as LFM2.5-VL-3B's does.
+const NO_OPEN_BLOCK: &str = "{{- bos_token -}}{%- for m in messages -%}\
+    <|im_start|>{{ m.role ~ '\\n' }}\
+    {% if m.reasoning_content %}<think>{{ m.reasoning_content }}</think>{% endif %}\
+    {{ m.content }}<|im_end|>{{ '\\n' }}{%- endfor -%}<|im_start|>assistant{{ '\\n' }}";
+
+/// The directory a written tiny checkpoint reads its chat template from.
+fn template_dir<'a>(model: &'a Path, dir: &'a Path) -> &'a Path {
+    if model.is_dir() {
+        model
+    } else {
+        dir
+    }
+}
+
+/// `lloom chat --think` / `--no-think`.
+///
+/// LFM2: its template opens the block on every turn, so no flag and `--think`
+/// both run its rendering, thinking; `--no-think` runs that rendering and the
+/// end marker, closed by the engine, and decodes exactly what that prompt
+/// given raw decodes. Qwen4-exp: its template's switch, `--no-think` being
+/// the chat's default. A template that opens no block and has no switch
+/// refuses `--think` and runs `--no-think` as rendered. `--raw` refuses both,
+/// and a thinking budget under `--no-think` is refused with the hint.
+#[test]
+fn chat_switches_thinking_by_the_template_or_by_closing_the_block() {
+    let dir = scratch("think-chat-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let tok = Lfm2Tiny::tokenizer();
+    let on = encode(&tok, &lfm2_rendered());
+    let mut off = on.clone();
+    off.push(added_id(&tok, "</think>"));
+    let run = |extra: &[&str]| {
+        let mut a = vec!["--cpu"];
+        a.extend(extra);
+        chat_templated(&model, &a)
+    };
+    let mut no_think = None;
+    for (flags, want, think, by) in [
+        (&[][..], &on, "on", "template"),
+        (&["--think"][..], &on, "on", "template"),
+        (&["--no-think"][..], &off, "off", "engine"),
+    ] {
+        let (ok, stderr, f) = run(flags);
+        assert!(ok, "{flags:?}:\n{stderr}");
+        assert_eq!(f["prompt_ids_sha256"], sha(want), "{flags:?}: the prompt");
+        assert_eq!(f["prompt_tokens"], want.len().to_string(), "{flags:?}");
+        assert_eq!((f["think"].as_str(), f["think_by"].as_str()), (think, by));
+        assert!(f["completion_tokens"].parse::<usize>().unwrap() > 0);
+        if flags == ["--no-think"] {
+            no_think = Some(f);
+        }
+    }
+    let no_think = no_think.unwrap();
+    let raw_text = format!(
+        "{}</think>",
+        lfm2_rendered().trim_start_matches("<|startoftext|>")
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .args(["--cpu", "--raw", "-n", "4", "-p", &raw_text])
+        .output()
+        .expect("lloom runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let line = stderr.lines().find(|l| l.starts_with("[turn 1:")).unwrap();
+    assert!(
+        line.contains(&format!("prompt_ids_sha256={}", sha(&off))),
+        "the raw prompt is not --no-think's: {line}"
+    );
+    assert!(
+        line.contains(&format!("tokens_sha256={} ", no_think["tokens_sha256"])),
+        "--no-think decoded other than its prompt given raw: {line}"
+    );
+
+    let (ok, stderr, _) = chat_templated(&model, &["--cpu", "--raw", "--no-think"]);
+    assert!(!ok, "{stderr}");
+    assert!(stderr.contains("--raw renders no template"), "{stderr}");
+    let (ok, stderr, _) = run(&["--no-think", "--thinking-budget", "4"]);
+    assert!(!ok, "{stderr}");
+    assert!(
+        stderr.contains(
+            "--thinking-budget 4: lfm2: the prompt leaves no thinking block open (drop --no-think)"
+        ),
+        "{stderr}"
+    );
+
+    std::fs::write(
+        template_dir(&model, &dir).join("chat_template.jinja"),
+        NO_OPEN_BLOCK,
+    )
+    .unwrap();
+    let plain = encode(
+        &tok,
+        &format!("<|startoftext|><|im_start|>user\n{PROMPT}<|im_end|>\n<|im_start|>assistant\n"),
+    );
+    let (ok, stderr, f) = run(&["--think"]);
+    assert!(!ok && f.is_empty(), "{stderr}");
+    assert!(
+        stderr.contains("--think: lfm2: the chat template leaves no thinking block open"),
+        "{stderr}"
+    );
+    let (ok, stderr, f) = run(&["--no-think"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(f["prompt_ids_sha256"], sha(&plain));
+    assert_eq!(
+        (f["think"].as_str(), f["think_by"].as_str()),
+        ("off", "template")
+    );
+    std::fs::remove_dir_all(&dir).ok();
+
+    let (dir, model, base) = qwen_tiny("think-chat-qwen");
+    let tok = Qwen4ExpTiny::tokenizer();
+    for (flags, text, think) in [
+        (&[][..], qwen_not_thinking(), "off"),
+        (&["--no-think"][..], qwen_not_thinking(), "off"),
+        (&["--think"][..], qwen_thinking(Some(XHIGH)), "on"),
+    ] {
+        let mut a: Vec<&str> = base.iter().map(String::as_str).collect();
+        a.extend(flags);
+        let (ok, stderr, f) = chat_templated(&model, &a);
+        assert!(ok, "{flags:?}:\n{stderr}");
+        assert_eq!(
+            f["prompt_ids_sha256"],
+            sha(&encode(&tok, &text)),
+            "{flags:?}"
+        );
+        assert_eq!(
+            (f["think"].as_str(), f["think_by"].as_str()),
+            (think, "template")
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `serve`'s `enable_thinking`, top-level or in `chat_template_kwargs`.
+/// LFM2: off is the rendering and the end marker, closed by the engine, and
+/// `timings` says so; on and no field are the rendering; the two spellings
+/// must agree and must be booleans. A thinking budget on an off prompt is
+/// served without it. The same off prompt under the batch scheduler, where
+/// no forced token can be fed. Qwen4-exp: the top-level field reaches its
+/// template's switch. A template that opens no block: on is a 400.
+#[test]
+fn serve_switches_thinking_by_the_template_or_by_closing_the_block() {
+    let dir = scratch("think-serve-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let tok = Lfm2Tiny::tokenizer();
+    let on = encode(&tok, &lfm2_rendered());
+    let mut off = on.clone();
+    off.push(added_id(&tok, "</think>"));
+    let server = Server::start(&model, &["--cpu"]);
+    for (req, want, think, by) in [
+        (json!({}), &on, "on", "template"),
+        (json!({ "enable_thinking": true }), &on, "on", "template"),
+        (json!({ "enable_thinking": false }), &off, "off", "engine"),
+        (
+            json!({ "chat_template_kwargs": { "enable_thinking": false } }),
+            &off,
+            "off",
+            "engine",
+        ),
+        (
+            json!({ "enable_thinking": false, "chat_template_kwargs": { "enable_thinking": false } }),
+            &off,
+            "off",
+            "engine",
+        ),
+    ] {
+        let (status, body) = server.chat(req.clone());
+        assert_eq!(status, 200, "{req}: {body}");
+        let t = &body["timings"];
+        assert_eq!(t["prompt_ids_sha256"], sha(want), "{req}: the prompt");
+        assert_eq!(body["usage"]["prompt_tokens"], want.len(), "{req}");
+        assert_eq!(
+            (t["thinking"].as_str(), t["thinking_by"].as_str()),
+            (Some(think), Some(by))
+        );
+    }
+    let (status, err) = server.chat(json!({
+        "enable_thinking": true, "chat_template_kwargs": { "enable_thinking": false },
+    }));
+    assert_eq!(status, 400, "{err}");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("disagree"),
+        "{err}"
+    );
+    let (status, err) = server.chat(json!({ "enable_thinking": "no" }));
+    assert_eq!(status, 400, "{err}");
+    assert_eq!(
+        err["error"]["message"],
+        "'enable_thinking' must be true or false, not \"no\""
+    );
+    let (status, body) =
+        server.chat(json!({ "enable_thinking": false, "thinking_token_budget": 2 }));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["timings"]["thinking_budget_ignored"],
+        "the prompt leaves no thinking block open"
+    );
+    assert_eq!(body["timings"]["prompt_ids_sha256"], sha(&off));
+    drop(server);
+
+    // LFM2's shared pool is Metal-only; the private rows run on the CPU.
+    let mut batched = vec![vec!["--cpu", "--batch", "2", "--rows", "private"]];
+    if cfg!(feature = "metal") {
+        batched.push(vec!["--batch", "2"]);
+    }
+    for args in batched {
+        let server = Server::start(&model, &args);
+        let (status, body) = server.chat(json!({ "enable_thinking": false }));
+        assert_eq!(status, 200, "{args:?}: {body}");
+        assert_eq!(body["timings"]["prompt_ids_sha256"], sha(&off), "{args:?}");
+        assert_eq!(body["timings"]["thinking_by"], "engine", "{args:?}");
+        drop(server);
+    }
+
+    std::fs::write(
+        template_dir(&model, &dir).join("chat_template.jinja"),
+        NO_OPEN_BLOCK,
+    )
+    .unwrap();
+    let server = Server::start(&model, &["--cpu"]);
+    let (status, err) = server.chat(json!({ "enable_thinking": true }));
+    assert_eq!(status, 400, "{err}");
+    assert_eq!(
+        err["error"]["message"],
+        "enable_thinking=true: lfm2: the chat template leaves no thinking block open for this \
+         prompt and has no enable_thinking switch that opens one"
+    );
+    let (status, body) = server.chat(json!({ "enable_thinking": false }));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["timings"]["thinking"], "off");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let (dir, model, base) = qwen_tiny("think-serve-qwen");
+    let args: Vec<&str> = base.iter().map(String::as_str).collect();
+    let server = Server::start(&model, &args);
+    let qtok = Qwen4ExpTiny::tokenizer();
+    let (status, body) = server.chat(json!({ "enable_thinking": false }));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["timings"]["prompt_ids_sha256"],
+        sha(&encode(&qtok, &qwen_not_thinking())),
+        "the top-level field reaches the template's switch"
+    );
+    assert_eq!(body["timings"]["thinking_by"], "template");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A `/eval` stream's events (`application/x-ndjson`, chunked).
+fn eval_events(server: &Server, body: &Value) -> Vec<Value> {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let body = body.to_string();
+    write!(
+        s,
+        "POST /eval HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = Vec::new();
+    s.read_to_end(&mut response).unwrap();
+    let response = String::from_utf8(response).unwrap();
+    let (head, mut rest) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}\n{rest}");
+    let mut text = String::new();
+    while let Some((size, after)) = rest.split_once("\r\n") {
+        let n = usize::from_str_radix(size.trim(), 16).unwrap();
+        if n == 0 {
+            break;
+        }
+        text.push_str(&after[..n]);
+        rest = &after[n + 2..];
+    }
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+/// `/eval`'s `enable_thinking` on LFM2: `false` runs the rendering closed by
+/// the end marker, the prompt it reports says so, and a sample decodes; a
+/// value that is not a boolean is a 400.
+#[test]
+fn eval_switches_thinking_off_on_lfm2() {
+    let dir = scratch("think-eval-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let server = Server::start(&model, &["--cpu"]);
+    let sample = json!([{ "id": "a", "messages": [{ "role": "user", "content": PROMPT }] }]);
+    for (want, ends) in [(Some(false), "<think></think>"), (None, "<think>")] {
+        let mut req = json!({ "samples": sample, "max_tokens": 4 });
+        if let Some(w) = want {
+            req["enable_thinking"] = json!(w);
+        }
+        let events = eval_events(&server, &req);
+        let start = events
+            .iter()
+            .find(|e| e["kind"] == "eval_sample_start")
+            .unwrap();
+        let prompt = start["prompt"].as_str().unwrap();
+        assert!(
+            prompt.ends_with(&format!("<|im_start|>assistant\n{ends}")),
+            "{want:?}: {prompt:?}"
+        );
+        let done = events
+            .iter()
+            .find(|e| e["kind"] == "eval_sample_done")
+            .unwrap();
+        assert!(
+            done["completion_tokens"].as_u64().unwrap() > 0,
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e["kind"] == "eval_done"),
+            "{events:?}"
+        );
+    }
+    let (status, err) = server.call(
+        "POST",
+        "/eval",
+        &json!({ "samples": sample, "max_tokens": 4, "enable_thinking": 1 }),
+    );
+    assert_eq!(status, 400, "{err}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `serve` folds OpenAI's top-level `tools` into the template's `tools`: the
+/// prompt is the template's rendering with the list (computed here through
+/// the same template), whichever spelling carries it, and differs from the
+/// prompt without it; the two spellings must agree.
+#[test]
+fn serve_folds_the_top_level_tools_field() {
+    let dir = scratch("tools-serve-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let tok = Lfm2Tiny::tokenizer();
+    let tools = json!([{ "type": "function", "function": {
+        "name": "get_weather", "description": "The weather in a city.",
+        "parameters": { "type": "object", "properties": { "city": { "type": "string" } } },
+    } }]);
+    let messages = json!([{ "role": "user", "content": PROMPT }]);
+    let mut kw = serde_json::Map::new();
+    kw.insert("tools".into(), tools.clone());
+    let text = lloom_engine::app::template::Template::compile(tok.chat_template)
+        .unwrap()
+        .render(&messages, "<|startoftext|>", &kw)
+        .unwrap();
+    assert!(text.contains("get_weather"), "{text}");
+    let want = sha(&encode(&tok, &text));
+    let server = Server::start(&model, &["--cpu"]);
+    let (_, plain) = server.chat(json!({}));
+    for req in [
+        json!({ "tools": tools }),
+        json!({ "chat_template_kwargs": { "tools": tools } }),
+        json!({ "tools": tools, "chat_template_kwargs": { "tools": tools } }),
+    ] {
+        let (status, body) = server.chat(req.clone());
+        assert_eq!(status, 200, "{req}: {body}");
+        assert_eq!(body["timings"]["prompt_ids_sha256"], want, "{req}");
+        assert_ne!(
+            body["timings"]["prompt_ids_sha256"],
+            plain["timings"]["prompt_ids_sha256"]
+        );
+    }
+    let (status, err) =
+        server.chat(json!({ "tools": tools, "chat_template_kwargs": { "tools": [] } }));
+    assert_eq!(status, 400, "{err}");
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("disagree"),
+        "{err}"
+    );
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A template failing on the request's data outside `raise_exception` is the
+/// client's 400, with the template's error: a message content the tiny
+/// templates cannot iterate (a number), on both families.
+#[test]
+fn serve_answers_a_template_failure_on_client_data_with_a_400() {
+    let dir = scratch("render-400-lfm2");
+    let model = write::<Lfm2Tiny>(&dir);
+    let bad = json!({ "messages": [{ "role": "user", "content": 5 }], "max_tokens": 2 });
+    let server = Server::start(&model, &["--cpu"]);
+    let (status, err) = server.call("POST", "/v1/chat/completions", &bad);
+    assert_eq!(status, 400, "{err}");
+    let m = err["error"]["message"].as_str().unwrap();
+    assert!(
+        m.starts_with("the chat template cannot render the request: "),
+        "{m}"
+    );
+    let (status, ok) = server.chat(json!({}));
+    assert_eq!(status, 200, "the server serves after it: {ok}");
+    drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+
+    let (dir, model, base) = qwen_tiny("render-400-qwen");
+    let args: Vec<&str> = base.iter().map(String::as_str).collect();
+    let server = Server::start(&model, &args);
+    let (status, err) = server.call("POST", "/v1/chat/completions", &bad);
+    assert_eq!(status, 400, "{err}");
     drop(server);
     std::fs::remove_dir_all(&dir).ok();
 }

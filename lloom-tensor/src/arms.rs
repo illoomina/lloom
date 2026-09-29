@@ -66,11 +66,17 @@ impl<C> Default for Set<C> {
 }
 
 impl<C> Set<C> {
-    const fn from_bits(bits: u32) -> Self {
+    /// The set a [`bits`](Self::bits) word holds, for a backend that keeps a
+    /// set in an atomic.
+    pub(crate) const fn from_bits(bits: u32) -> Self {
         Set {
             bits,
             _c: PhantomData,
         }
+    }
+
+    pub(crate) const fn bits(self) -> u32 {
+        self.bits
     }
 
     pub const fn empty() -> Self {

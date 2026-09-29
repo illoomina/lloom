@@ -800,6 +800,13 @@ fn parse_logit_bias(v: &str) -> Result<std::collections::BTreeMap<u32, f64>, Str
     }
     Ok(out)
 }
+fn parse_prompt_budget_mode(v: &str) -> Result<String, String> {
+    match v.trim() {
+        "refuse" => Ok("refuse".into()),
+        "truncate" => Ok("truncate".into()),
+        other => Err(format!("`{other}` is not `refuse` or `truncate`")),
+    }
+}
 fn parse_defaults(v: &str) -> Result<String, String> {
     match v.trim() {
         "greedy" => Ok("greedy".into()),
@@ -860,6 +867,18 @@ pub struct SamplingConfig {
     /// Logit bias, `token_id:bias,…` (each bias in [-100, 100]), added before the penalties.
     #[opt(flag = "logit-bias", parser = "parse_logit_bias")]
     pub logit_bias: std::collections::BTreeMap<u32, f64>,
+    /// Tokens the model may generate inside the thinking block its prompt opens (vLLM's `thinking_token_budget`); then the template's end marker is fed and the answer follows. Refused where the template writes no block.
+    #[opt(flag = "thinking-budget")]
+    pub thinking_budget: Option<usize>,
+    /// Text fed before the end marker when the thinking budget is spent, so the cut reads naturally (default: the marker alone).
+    #[opt(flag = "thinking-budget-message")]
+    pub thinking_budget_message: Option<String>,
+    /// The most tokens a prompt may take (vLLM's `truncate_prompt_tokens`); a longer one is refused or truncated per `prompt_budget_mode`.
+    #[opt(flag = "prompt-budget")]
+    pub prompt_budget: Option<usize>,
+    /// Over the prompt budget: `refuse` (the default: a clean error, the prompt is never silently shortened) or `truncate` (drop the oldest whole messages, the system message kept; a raw prompt keeps BOS and its last tokens).
+    #[opt(flag = "prompt-budget-mode", parser = "parse_prompt_budget_mode", variants = ["refuse", "truncate"])]
+    pub prompt_budget_mode: String,
 }
 
 impl Default for SamplingConfig {
@@ -879,6 +898,10 @@ impl Default for SamplingConfig {
             frequency_penalty: None,
             min_p: None,
             logit_bias: Default::default(),
+            thinking_budget: None,
+            thinking_budget_message: None,
+            prompt_budget: None,
+            prompt_budget_mode: "refuse".into(),
         }
     }
 }
@@ -932,7 +955,13 @@ impl SamplingConfig {
     pub fn check(&self) -> Result<(), String> {
         self.processors()
             .validate()
-            .map_err(|e| format!("sampling: {e}"))
+            .map_err(|e| format!("sampling: {e}"))?;
+        if self.prompt_budget == Some(0) {
+            return Err("sampling: prompt_budget must be at least 1".into());
+        }
+        parse_prompt_budget_mode(&self.prompt_budget_mode)
+            .map(|_| ())
+            .map_err(|e| format!("sampling: prompt_budget_mode: {e}"))
     }
 
     /// The seed for one run.
@@ -959,6 +988,7 @@ impl SamplingConfig {
             stop_strings: self.stop.clone(),
             readback,
             prefill_tile,
+            thinking: None,
         }
     }
 }

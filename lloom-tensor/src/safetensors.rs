@@ -495,21 +495,23 @@ impl MmapAdvice {
     /// Collapsing the two would make the default unreachable-by-omission the
     /// moment it changed.
     pub fn from_env() -> Result<Self> {
-        // `tuning.cpu.mmap_advice` (`CANDLE_MMAP_ADVICE`): the parser refuses an
-        // unknown arm; `none` (and the empty string, what a shell supplies for
-        // `CANDLE_MMAP_ADVICE=`) is the explicit request to disable.
-        Ok(match crate::tuning::tuning().cpu.mmap_advice.as_deref() {
-            Some("willneed") | Some("will_need") => Self::WillNeed,
-            Some("sequential") | Some("seq") => Self::Sequential,
-            Some(_) => Self::None,
-            None => {
-                if std::env::var_os("CANDLE_MMAP_ADVICE").is_some() {
-                    Self::None
-                } else {
-                    Self::default()
-                }
-            }
-        })
+        Self::from_knob(crate::tuning::tuning().cpu.mmap_advice.as_deref())
+    }
+
+    /// The arm a `tuning.cpu.mmap_advice` value selects: unset is the default,
+    /// `none` disables. Every front end but a JSON group reaches the field
+    /// through the parser, which already refused an unknown arm; a JSON group
+    /// is deserialized straight into it, so the refusal is repeated here.
+    pub fn from_knob(knob: Option<&str>) -> Result<Self> {
+        match knob.map(str::to_ascii_lowercase).as_deref() {
+            None => Ok(Self::default()),
+            Some("" | "none") => Ok(Self::None),
+            Some("willneed" | "will_need") => Ok(Self::WillNeed),
+            Some("sequential" | "seq") => Ok(Self::Sequential),
+            Some(other) => crate::bail!(
+                "unknown CANDLE_MMAP_ADVICE {other:?}, expected one of: none, willneed, sequential"
+            ),
+        }
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -551,19 +553,24 @@ pub static MMAP_ADVICE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// Number of mappings the advice was applied to.
 pub static MMAP_ADVICE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn advise_map(map: &memmap2::Mmap, advice: MmapAdvice) -> Result<()> {
+/// Applies `advice` to `map`, and returns whether an `madvise` call was made.
+fn advise_map(map: &memmap2::Mmap, advice: MmapAdvice) -> Result<bool> {
     let took = advice.apply(map)?;
-    if advice != MmapAdvice::None {
-        use std::sync::atomic::Ordering;
-        MMAP_ADVICE_NANOS.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
-        MMAP_ADVICE_CALLS.fetch_add(1, Ordering::Relaxed);
+    if advice == MmapAdvice::None {
+        return Ok(false);
     }
-    Ok(())
+    use std::sync::atomic::Ordering;
+    MMAP_ADVICE_NANOS.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    MMAP_ADVICE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
 }
 
 pub struct MmapedSafetensors {
     safetensors: Vec<yoke::Yoke<SafeTensors_<'static>, memmap2::Mmap>>,
     routing: Option<HashMap<String, usize>>,
+    /// Mappings of this instance that were advised: the process-wide
+    /// counters, attributed to one instance.
+    advised: usize,
 }
 
 impl MmapedSafetensors {
@@ -573,12 +580,22 @@ impl MmapedSafetensors {
     ///
     /// The unsafe is inherited from [`memmap2::MmapOptions`].
     pub unsafe fn new<P: AsRef<Path>>(p: P) -> Result<Self> {
+        Self::with_advice(p, MmapAdvice::from_env()?)
+    }
+
+    /// As [`Self::new`], with the page-in advice given rather than read from
+    /// the process's tuning.
+    ///
+    /// # Safety
+    ///
+    /// The unsafe is inherited from [`memmap2::MmapOptions`].
+    pub unsafe fn with_advice<P: AsRef<Path>>(p: P, advice: MmapAdvice) -> Result<Self> {
         let p = p.as_ref();
         let file = std::fs::File::open(p).map_err(|e| Error::from(e).with_path(p))?;
         let file = memmap2::MmapOptions::new()
             .map(&file)
             .map_err(|e| Error::from(e).with_path(p))?;
-        advise_map(&file, MmapAdvice::from_env()?)?;
+        let advised = advise_map(&file, advice)? as usize;
         let safetensors = yoke::Yoke::<SafeTensors_<'static>, memmap2::Mmap>::try_attach_to_cart(
             file,
             |data: &[u8]| {
@@ -590,6 +607,7 @@ impl MmapedSafetensors {
         Ok(Self {
             safetensors: vec![safetensors],
             routing: None,
+            advised,
         })
     }
 
@@ -604,13 +622,14 @@ impl MmapedSafetensors {
         let mut routing = HashMap::new();
         let mut safetensors = vec![];
         let advice = MmapAdvice::from_env()?;
+        let mut advised = 0;
         for (index, p) in paths.iter().enumerate() {
             let p = p.as_ref();
             let file = std::fs::File::open(p).map_err(|e| Error::from(e).with_path(p))?;
             let file = memmap2::MmapOptions::new()
                 .map(&file)
                 .map_err(|e| Error::from(e).with_path(p))?;
-            advise_map(&file, advice)?;
+            advised += advise_map(&file, advice)? as usize;
             let data = yoke::Yoke::<SafeTensors_<'static>, memmap2::Mmap>::try_attach_to_cart(
                 file,
                 |data: &[u8]| {
@@ -627,7 +646,13 @@ impl MmapedSafetensors {
         Ok(Self {
             safetensors,
             routing: Some(routing),
+            advised,
         })
+    }
+
+    /// How many of this instance's mappings were given page-in advice.
+    pub fn advised_mappings(&self) -> usize {
+        self.advised
     }
 
     pub fn load(&self, name: &str, dev: &Device) -> Result<Tensor> {
@@ -787,37 +812,46 @@ mod tests {
         std::fs::remove_file("test_u8.safetensors").unwrap();
     }
 
-    /// `CANDLE_MMAP_ADVICE` is process-global, so these arms cannot run
-    /// concurrently with each other and are one test rather than several.
+    /// The arm each spelling selects, through the parser every front end uses
+    /// (env alias, flag, `--set`) and then the resolver.
+    ///
+    /// Read from a fresh `CpuTuning`, never from the process's: that group is
+    /// fixed at its first read, so setting `CANDLE_MMAP_ADVICE` in a test
+    /// reaches nothing, and a misspelled value set there would panic whichever
+    /// sibling test read the tuning first (`DESIGN.md` §15.1n).
+    fn resolve(spelling: Option<&str>) -> Result<MmapAdvice> {
+        let mut t = crate::tuning::CpuTuning::default();
+        if let Some(v) = spelling {
+            t.set("mmap_advice", v).map_err(Error::msg)?;
+        }
+        MmapAdvice::from_knob(t.mmap_advice.as_deref())
+    }
+
     #[test]
     fn mmap_advice_parses_every_arm_and_rejects_the_rest() {
-        // The default is `WillNeed`, and an unset variable takes it. Pinned
-        // here because the default is the whole subject of the decision that
-        // set it: a silent revert to `None` would restore a 7.40 s cold TTFT
+        // The default is `WillNeed`, and an unset knob takes it. Pinned here
+        // because the default is the whole subject of the decision that set
+        // it: a silent revert to `None` would restore a 7.40 s cold TTFT
         // against this arm's 3.43 s, and no other test would notice.
-        std::env::remove_var("CANDLE_MMAP_ADVICE");
         assert_eq!(MmapAdvice::default(), MmapAdvice::WillNeed);
-        assert_eq!(MmapAdvice::from_env().unwrap(), MmapAdvice::WillNeed);
+        assert_eq!(resolve(None).unwrap(), MmapAdvice::WillNeed);
 
-        // Unset and empty must NOT agree, which is the asymmetry `from_env`
-        // documents: unset is "no opinion" and follows the default, while
-        // `CANDLE_MMAP_ADVICE=` is an explicit request to disable. If these
-        // ever collapse, opting out via the empty string silently stops
-        // working -- and so does reaching the default by omission.
-        std::env::set_var("CANDLE_MMAP_ADVICE", "");
-        assert_eq!(MmapAdvice::from_env().unwrap(), MmapAdvice::None);
-        std::env::remove_var("CANDLE_MMAP_ADVICE");
+        // Unset and `none` must NOT agree: unset follows the default, `none`
+        // (and the empty string a shell passes for `CANDLE_MMAP_ADVICE=`) is
+        // an explicit request to disable. A parser that clears `none` to
+        // "unset" makes `--mmap-advice none` run the advised default.
         assert_ne!(
-            MmapAdvice::from_env().unwrap(),
+            resolve(None).unwrap(),
             MmapAdvice::None,
-            "unset must follow the default, not alias the empty string"
+            "unset must follow the default, not alias `none`"
         );
 
-        // Every arm the axis declares must be reachable from the environment,
-        // or an arm exists that no measurement can select.
+        // Every arm the axis declares must be reachable, or an arm exists that
+        // no measurement can select.
         for (value, want) in [
             ("none", MmapAdvice::None),
             ("", MmapAdvice::None),
+            ("NONE", MmapAdvice::None),
             ("willneed", MmapAdvice::WillNeed),
             ("will_need", MmapAdvice::WillNeed),
             ("WillNeed", MmapAdvice::WillNeed),
@@ -825,82 +859,76 @@ mod tests {
             ("seq", MmapAdvice::Sequential),
             ("SEQUENTIAL", MmapAdvice::Sequential),
         ] {
-            std::env::set_var("CANDLE_MMAP_ADVICE", value);
-            assert_eq!(
-                MmapAdvice::from_env().unwrap(),
-                want,
-                "CANDLE_MMAP_ADVICE={value:?} did not select {want:?}"
-            );
+            let got = resolve(Some(value)).unwrap();
+            assert_eq!(got, want, "mmap advice {value:?} did not select {want:?}");
             // The arm has to render back, so a RESULT line cannot report an
             // arm the run was not in.
-            assert_eq!(MmapAdvice::from_env().unwrap().as_str(), want.as_str());
+            assert_eq!(got.as_str(), want.as_str());
         }
 
         // The load-bearing half: a value nobody recognises must FAIL rather
         // than fall back to the default. A silent fallback runs the baseline
         // under the changed arm's name and reports a null for a path that was
-        // never exercised.
-        std::env::set_var("CANDLE_MMAP_ADVICE", "wilneed");
+        // never exercised. Refused by the parser, and by the resolver for a
+        // JSON group, which is deserialized into the field without the parser.
         assert!(
-            MmapAdvice::from_env().is_err(),
+            resolve(Some("wilneed")).is_err(),
             "a misspelled arm fell back to the default instead of failing"
         );
-        std::env::remove_var("CANDLE_MMAP_ADVICE");
+        assert!(
+            MmapAdvice::from_knob(Some("wilneed")).is_err(),
+            "a misspelled arm from a JSON group fell back instead of failing"
+        );
     }
 
     /// The counters are the engagement proof, so they owe a demonstration that
-    /// they move for the advised arms and stay at zero for the default.
+    /// they move for the advised arms and stay at zero for `none`. Each arm is
+    /// read from its own mapping, since the process-wide totals also count
+    /// every other mapping this process makes.
     #[test]
     fn mmap_advice_counters_separate_the_default_from_the_advised_arms() {
         use std::sync::atomic::Ordering;
 
         let bytes = b"8\0\0\0\0\0\0\0{\"x\":{\"dtype\":\"U8\",\"shape\":[2],\"data_offsets\":[0,2]}}   \x01\x03";
-        let path = "test_advice.safetensors";
-        std::fs::write(path, bytes).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("test_advice_{}.safetensors", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
 
-        // `None`: no call is made, so the call counter must not move. This is
-        // the arm that proves the counter is not simply always incrementing,
-        // which is the property this test exists for.
-        //
-        // It is selected EXPLICITLY rather than by unsetting the variable.
-        // Since the default became `WillNeed`, an unset variable takes the
-        // advised arm -- so unsetting here would test that `WillNeed` makes no
-        // call, which is false, and the no-call arm would be left with no
-        // coverage at all.
-        std::env::set_var("CANDLE_MMAP_ADVICE", "none");
-        let before = MMAP_ADVICE_CALLS.load(Ordering::Relaxed);
-        let _ = unsafe { MmapedSafetensors::new(path) }.unwrap();
+        // `None`: no call is made. This is the arm that proves the counter is
+        // not simply always incrementing, which is the property this test
+        // exists for.
+        let m = unsafe { MmapedSafetensors::with_advice(&path, MmapAdvice::None) }.unwrap();
         assert_eq!(
-            MMAP_ADVICE_CALLS.load(Ordering::Relaxed),
-            before,
+            m.advised_mappings(),
+            0,
             "the `none` arm made an madvise call"
         );
 
-        // And the DEFAULT arm -- unset -- does make one, which is the flip
-        // this test would otherwise be silent about.
-        std::env::remove_var("CANDLE_MMAP_ADVICE");
-        let before = MMAP_ADVICE_CALLS.load(Ordering::Relaxed);
-        let _ = unsafe { MmapedSafetensors::new(path) }.unwrap();
-        assert_eq!(
-            MMAP_ADVICE_CALLS.load(Ordering::Relaxed),
-            before + 1,
-            "the default arm did not make an madvise call"
-        );
+        // The default arm does make one, which is the flip this test would
+        // otherwise be silent about; and so does each advised arm, once per
+        // mapping. The process-wide counter moves by at least as much, since
+        // it is what a harness reads.
+        for advice in [
+            MmapAdvice::default(),
+            MmapAdvice::WillNeed,
+            MmapAdvice::Sequential,
+        ] {
+            let before = MMAP_ADVICE_CALLS.load(Ordering::Relaxed);
+            let m = unsafe { MmapedSafetensors::with_advice(&path, advice) }.unwrap();
+            assert_eq!(
+                m.advised_mappings(),
+                1,
+                "the {advice:?} arm did not record an madvise call"
+            );
+            assert!(
+                MMAP_ADVICE_CALLS.load(Ordering::Relaxed) > before,
+                "the {advice:?} arm's call is missing from the process-wide counter"
+            );
+            // And the mapping still reads correctly through the advice.
+            let t = m.load("x", &Device::Cpu).unwrap();
+            assert_eq!(t.to_vec1::<u8>().unwrap(), vec![1, 3]);
+        }
 
-        // Advised: the call counter moves, once per mapping.
-        std::env::set_var("CANDLE_MMAP_ADVICE", "willneed");
-        let before = MMAP_ADVICE_CALLS.load(Ordering::Relaxed);
-        let m = unsafe { MmapedSafetensors::new(path) }.unwrap();
-        assert_eq!(
-            MMAP_ADVICE_CALLS.load(Ordering::Relaxed),
-            before + 1,
-            "the advised arm did not record an madvise call"
-        );
-        // And the mapping still reads correctly through the advice.
-        let t = m.load("x", &Device::Cpu).unwrap();
-        assert_eq!(t.to_vec1::<u8>().unwrap(), vec![1, 3]);
-
-        std::env::remove_var("CANDLE_MMAP_ADVICE");
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 }

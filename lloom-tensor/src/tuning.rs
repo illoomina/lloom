@@ -132,14 +132,28 @@ fn parse_completion_wait(v: &str) -> Result<String, String> {
     crate::kernels::metal::completion::CompletionWait::from_str_arm(v.trim())?;
     Ok(v.trim().to_string())
 }
+fn parse_allow_emulated(v: &str) -> Result<Option<String>, String> {
+    optional(v, |s| {
+        #[cfg(feature = "metal")]
+        crate::kernels::metal::arms::parse_allow_emulated(s)?;
+        Ok(s.trim().to_string())
+    })
+}
 fn parse_eviction(v: &str) -> Result<String, String> {
     one_of(v, "eviction order", &["age", "oldest", "off", "size", "largest"])
 }
 fn parse_hazard_key(v: &str) -> Result<Option<String>, String> {
     optional(v, |s| one_of(s, "hazard key", &["range", "pointer", "ptr"]))
 }
+/// `none` (and the empty string a shell passes for `CANDLE_MMAP_ADVICE=`) is
+/// kept as `"none"`, not cleared: unset takes the default, which is an advised
+/// arm, so clearing would turn a request to disable into the default.
 fn parse_mmap_advice(v: &str) -> Result<Option<String>, String> {
-    optional(v, |s| one_of(s, "mmap advice", &["willneed", "will_need", "sequential", "seq"]))
+    let v = v.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return Ok(Some("none".to_string()));
+    }
+    one_of(v, "mmap advice", &["willneed", "will_need", "sequential", "seq"]).map(Some)
 }
 fn parse_dequant_gemm(v: &str) -> Result<String, String> {
     one_of(v, "dequant gemm", &["qmm", "steel"])
@@ -389,6 +403,9 @@ pub struct MetalTuning {
     /// The ICB run's residency declaration: `per-run` (the buffers a run binds) or `plan-wide` (every buffer the plan binds, at every run).
     #[opt(flag = "icb-residency", env = "LLOOM_688_RESIDENCY", parser = "parse_icb_residency", variants = ["per-run", "plan-wide"])]
     pub icb_residency: String,
+    /// Run these types although this GPU only emulates them (a comma list; `bf16` on Apple7, ~2.6x the f32 time); none = refuse them (§15.2a).
+    #[opt(flag = "allow-emulated", env = "LLOOM_METAL_ALLOW_EMULATED", parser = "parse_allow_emulated", variants = ["none", "bf16"])]
+    pub allow_emulated: Option<String>,
 }
 
 impl Default for MetalTuning {
@@ -411,6 +428,7 @@ impl Default for MetalTuning {
             merged_unit: false,
             icb_quarantine_off: false,
             icb_residency: "per-run".into(),
+            allow_emulated: None,
         }
     }
 }
@@ -579,6 +597,8 @@ mod tests {
         assert!(t.set("metal.completion_wait", "spin").is_err());
         assert!(t.set("pool.buffer_alignment", "100").is_err());
         assert!(t.set("metal.cflags", "").is_err());
+        #[cfg(feature = "metal")]
+        assert!(t.set("metal.allow_emulated", "f16").is_err());
         t.set("gemm.tile", "64x64").unwrap();
         t.set("metal.cut_policy", "nodes:15").unwrap();
         t.set("metal.completion_wait", "shared-event-wait:5").unwrap();
@@ -586,6 +606,30 @@ mod tests {
         t.set("pool.reuse_oversize_bound", "off").unwrap();
         assert_eq!(t.pool.reuse_oversize_bound, None);
         assert_eq!(t.gemm.tile.as_deref(), Some("64x64"));
+        t.set("metal.allow_emulated", "bf16").unwrap();
+        assert_eq!(t.metal.allow_emulated.as_deref(), Some("bf16"));
+        t.set("metal.allow_emulated", "none").unwrap();
+        assert_eq!(t.metal.allow_emulated, None);
+    }
+
+    /// The refusal names the opt-in by these spellings; they are the knob's.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_refusal_names_the_knob_by_its_own_spellings() {
+        use crate::kernels::metal::arms::{
+            ALLOW_EMULATED_ENV, ALLOW_EMULATED_FLAG, ALLOW_EMULATED_KEY,
+        };
+        let rows = crate::options::rows(
+            "tuning",
+            Tuning::META,
+            &serde_json::to_value(Tuning::default()).unwrap(),
+        );
+        let row = rows
+            .iter()
+            .find(|r| r.key == ALLOW_EMULATED_KEY)
+            .unwrap_or_else(|| panic!("no knob keyed {ALLOW_EMULATED_KEY}"));
+        assert_eq!(row.flag, ALLOW_EMULATED_FLAG);
+        assert_eq!(row.env, Some(ALLOW_EMULATED_ENV));
     }
 
     #[test]

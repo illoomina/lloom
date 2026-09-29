@@ -227,6 +227,22 @@ pub trait BackendDevice: Sized + std::fmt::Debug + Clone {
     fn finish_pass(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Admit computing at `dtype` on this device: `Ok` for a dtype it
+    /// executes natively, and for one it emulates in software once the
+    /// operator has opted in (one warning, at the first admission); otherwise
+    /// the refusal, naming the reason and the opt-in (`DESIGN.md` §15.2a).
+    /// A model load asks before its first weight. CPU and CUDA run every
+    /// dtype they accept natively, so they admit all.
+    fn admit_compute_dtype(&self, _dtype: DType) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether [`Self::admit_compute_dtype`] would admit `dtype`, asked
+    /// without admitting it (no warning is printed).
+    fn admits_compute_dtype(&self, _dtype: DType) -> bool {
+        true
+    }
 }
 
 /// The shape of a forward pass, backend-neutrally: what a plan is keyed by

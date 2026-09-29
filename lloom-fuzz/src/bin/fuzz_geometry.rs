@@ -341,6 +341,7 @@ fn manifest<F: TinyFamily>(
         "weight_seed": args.weight_seed,
         "tol": args.tol,
         "hc_mix": args.hc_mix,
+        "gdn_step_reg": lloom_tensor::tuning::tuning().gdn.step_reg,
         "corpus_inputs": files.len(),
         "entries": entries.iter().map(|(g, pts)| {
             let (describe, reached) = &runs[g];

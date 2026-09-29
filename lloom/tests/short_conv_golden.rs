@@ -486,6 +486,8 @@ const GOLDEN: &[(&str, &str)] = &[
 #[test]
 fn the_blocks_compute_what_the_kernels_they_replaced_did() -> Result<()> {
     let dev = Device::new_metal(0)?;
+    // The fixtures run bf16 too, which the GPU may only emulate (§15.2a).
+    lloom_tensor::test_utils::allow_emulated(&dev, DType::BF16);
     let mut got = Vec::new();
     lfm2_fixtures(&dev, &mut got)?;
     for (name, cfg) in gdn_configs() {
@@ -525,6 +527,8 @@ fn the_blocks_compute_what_the_kernels_they_replaced_did() -> Result<()> {
 #[test]
 fn the_fixtures_are_deterministic() -> Result<()> {
     let dev = Device::new_metal(0)?;
+    // The fixtures run bf16 too, which the GPU may only emulate (§15.2a).
+    lloom_tensor::test_utils::allow_emulated(&dev, DType::BF16);
     let run = || -> Result<Vec<(String, String)>> {
         let mut v = Vec::new();
         lfm2_fixtures(&dev, &mut v)?;

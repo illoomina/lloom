@@ -137,6 +137,8 @@ fn the_seeds_low_32_bits_are_what_reach_the_kernel() -> Result<()> {
 #[test]
 fn f16_and_bf16_take_the_same_seed_path() -> Result<()> {
     let device = Device::new_metal(0)?;
+    // The bf16 arm on purpose, where the GPU only emulates it (§15.2a).
+    lloom_tensor::test_utils::allow_emulated(&device, DType::BF16);
 
     // `rand_uniform` instantiates per dtype (`rand_uniform_f32`, `_f16`,
     // `_bf16`) over one templated body, so the seeding is shared — but it is

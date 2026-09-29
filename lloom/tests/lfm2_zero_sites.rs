@@ -37,9 +37,6 @@ enum Verdict {
 struct Arm {
     name: &'static str,
     set: fn(&mut Config),
-    /// The sliding ring cannot open a sequence with a decode step: its first
-    /// window starts before slot 0 (`ShortConv::convolve_bcx`'s `narrow`).
-    one_token_prompt: bool,
 }
 
 fn arms() -> Vec<Arm> {
@@ -51,12 +48,10 @@ fn arms() -> Vec<Arm> {
                 c.kv_append = KvAppend::Cat;
                 c.conv_state = ConvState::Shuffle;
             },
-            one_token_prompt: true,
         },
         Arm {
             name: "crown",
             set: lloom::models::lfm2_presets::crown,
-            one_token_prompt: true,
         },
         Arm {
             name: "crown+int8",
@@ -64,7 +59,6 @@ fn arms() -> Vec<Arm> {
                 lloom::models::lfm2_presets::crown(c);
                 c.kv_quant = KvQuant::Int8;
             },
-            one_token_prompt: true,
         },
         Arm {
             name: "crown+int4",
@@ -72,7 +66,6 @@ fn arms() -> Vec<Arm> {
                 lloom::models::lfm2_presets::crown(c);
                 c.kv_quant = KvQuant::Int4;
             },
-            one_token_prompt: true,
         },
         Arm {
             name: "flash/in-place",
@@ -80,12 +73,10 @@ fn arms() -> Vec<Arm> {
                 lloom::models::lfm2_presets::crown(c);
                 c.attn_impl = AttnImpl::FlashDecoding;
             },
-            one_token_prompt: true,
         },
         Arm {
             name: "pool",
             set: lloom::models::lfm2_presets::pool,
-            one_token_prompt: true,
         },
         Arm {
             name: "sliding:0:2",
@@ -94,7 +85,6 @@ fn arms() -> Vec<Arm> {
                 c.conv_state = ConvState::SlidingRing { k: 0, slack: 2 };
                 c.conv_fused = false;
             },
-            one_token_prompt: false,
         },
         Arm {
             name: "rotating:4 unfused",
@@ -103,7 +93,6 @@ fn arms() -> Vec<Arm> {
                 c.conv_state = ConvState::RotatingRing { k: 4 };
                 c.conv_fused = false;
             },
-            one_token_prompt: true,
         },
         Arm {
             name: "rotating:4 fused",
@@ -111,7 +100,6 @@ fn arms() -> Vec<Arm> {
                 lloom::models::lfm2_presets::crown(c);
                 c.conv_state = ConvState::RotatingRing { k: 4 };
             },
-            one_token_prompt: true,
         },
     ]
 }
@@ -145,13 +133,10 @@ fn model(cfg: &Config, dev: &Device) -> Result<Model> {
 }
 
 /// Every logit of every workload, as bits.
-fn run(model: &Model, cfg: &Config, dev: &Device, one_token_prompt: bool) -> Result<Vec<u32>> {
+fn run(model: &Model, cfg: &Config, dev: &Device) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     let mut id = 1u32;
     for w in WORKLOADS {
-        if !one_token_prompt && w.turns[0].0 == [1] {
-            continue;
-        }
         let mut cache = Cache::new(true, DType::F16, cfg, dev)?.with_kv_bucket(8)?;
         let mut pos = 0usize;
         for &(tiles, decode) in w.turns {
@@ -193,15 +178,14 @@ fn poisoned(
     reference: &[u32],
     site: &str,
     value: &str,
-    one: bool,
 ) -> Result<(bool, u64)> {
     zeros::set_poison(site, value)?;
     let before = zeros::poisoned();
-    let got = run(model, cfg, dev, one);
+    let got = run(model, cfg, dev);
     let fills = zeros::poisoned() - before;
     zeros::set_poison("", "nan")?;
     let got = got?;
-    let again = run(model, cfg, dev, one)?;
+    let again = run(model, cfg, dev)?;
     assert!(
         again == reference,
         "the unpoisoned run moved after poisoning {site} with {value}: a site that skips \
@@ -217,11 +201,10 @@ fn classify(arm: &Arm, dev: &Device) -> Result<Vec<(&'static str, Verdict)>> {
     cfg.conv_prefill_ctx = true;
     let model = model(&cfg, dev)?;
     zeros::set_poison("", "nan")?;
-    let one = arm.one_token_prompt;
-    let reference = run(&model, &cfg, dev, one)?;
+    let reference = run(&model, &cfg, dev)?;
     assert_eq!(
         reference,
-        run(&model, &cfg, dev, one)?,
+        run(&model, &cfg, dev)?,
         "{}: the reference is not stable",
         arm.name
     );
@@ -232,8 +215,8 @@ fn classify(arm: &Arm, dev: &Device) -> Result<Vec<(&'static str, Verdict)>> {
     );
     let mut table = Vec::new();
     for &site in zeros::SITES {
-        let (nan_moved, nan_fills) = poisoned(&model, &cfg, dev, &reference, site, "nan", one)?;
-        let (fin_moved, fin_fills) = poisoned(&model, &cfg, dev, &reference, site, "finite", one)?;
+        let (nan_moved, nan_fills) = poisoned(&model, &cfg, dev, &reference, site, "nan")?;
+        let (fin_moved, fin_fills) = poisoned(&model, &cfg, dev, &reference, site, "finite")?;
         assert_eq!(
             nan_fills, fin_fills,
             "{} {site}: the two sentinels filled differently",
@@ -270,7 +253,7 @@ fn every_zero_site_reads_its_zeros_as_the_table_says() -> Result<()> {
         ("crown+int4", [Unreached, Unreached, Unread, Unread, Unreached, Read, Unreached, Unread, Unreached]),
         ("flash/in-place", [Unreached, Unreached, Unread, Unread, Unreached, Read, Unread, Unreached, Unreached]),
         ("pool", [Unreached, Unread, ReadTimesZero, Unread, Unreached, Read, Unreached, Unreached, Unread]),
-        ("sliding:0:2", [Unread, Unreached, Unread, Unread, Unread, Unreached, Unread, Unreached, Unreached]),
+        ("sliding:0:2", [Unread, Unreached, Unread, Unread, Unread, Read, Unread, Unreached, Unreached]),
         ("rotating:4 unfused", [Unreached, ReadTimesZero, ReadTimesZero, Unread, Unreached, Read, Unread, Unreached, Unreached]),
         ("rotating:4 fused", [Unreached, ReadTimesZero, ReadTimesZero, Unread, Unreached, Read, Unread, Unreached, Unreached]),
     ];

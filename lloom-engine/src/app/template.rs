@@ -92,6 +92,12 @@ impl Template {
         self.reads.as_ref().map(|r| r.contains(name))
     }
 
+    /// Every top-level name the template's source reads (the functions it
+    /// calls included); `None` when it could not be analysed.
+    pub fn variables(&self) -> Option<&BTreeSet<String>> {
+        self.reads.as_ref()
+    }
+
     /// Render `messages` with the generation prompt appended; `kwargs` are
     /// extra template variables, laid over the defaults.
     pub fn render(
@@ -159,15 +165,193 @@ impl Template {
     }
 }
 
+/// The thinking block's markers as a checkpoint's template writes them, and
+/// the id that starts a tool call: the family's reasoning tags, read by
+/// rendering the template ([`Template::think_tags`]), never listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinkTags {
+    pub start: u32,
+    pub end: u32,
+    /// A tool call ends the block too; `None` when the template writes tool
+    /// calls without a marker token of their own.
+    pub tool_call: Option<u32>,
+}
+
+impl ThinkTags {
+    /// The ids that close the block.
+    pub fn close_ids(&self) -> Vec<u32> {
+        let mut v = vec![self.end];
+        v.extend(self.tool_call);
+        v
+    }
+
+    /// Whether `ids` end inside a thinking block — a start with no end or
+    /// tool call after it — and if so how many tokens of the block they hold
+    /// after the start marker (what vLLM counts against a budget).
+    pub fn open_at_end(&self, ids: &[u32]) -> Option<usize> {
+        let start = ids.iter().rposition(|&id| id == self.start)?;
+        let after = &ids[start + 1..];
+        let close = self.close_ids();
+        (!after.iter().any(|id| close.contains(id))).then_some(after.len())
+    }
+}
+
+/// Reasoning text no template writes on its own, for the probe renders.
+const PROBE_REASONING: &str = "lloom-probe-reasoning";
+
+impl Template {
+    /// The reasoning tags this template writes, found by rendering: an
+    /// assistant turn carrying [`PROBE_REASONING`] (under each field name
+    /// the families read) puts the start marker before it and the end marker
+    /// after it; the same turn with a tool call and without one first differ
+    /// at the tool-call marker. A marker must be one token `is_marker`
+    /// accepts (the tokenizer's added tokens), so plain text around the
+    /// reasoning is never taken for one. `None` when the template writes no
+    /// such block.
+    pub fn think_tags(
+        &self,
+        bos_token: &str,
+        encode: impl Fn(&str) -> Result<Vec<u32>>,
+        is_marker: impl Fn(u32) -> bool,
+    ) -> Option<ThinkTags> {
+        let user = json!({ "role": "user", "content": "lloom-probe-user" });
+        let reasoned = json!([user, {
+            "role": "assistant",
+            "content": "lloom-probe-answer",
+            "reasoning_content": PROBE_REASONING,
+            "thinking": PROBE_REASONING,
+            "reasoning": PROBE_REASONING,
+        }]);
+        let text = self.render(&reasoned, bos_token, &Map::new()).ok()?;
+        let at = text.find(PROBE_REASONING)?;
+        let start = *encode(text[..at].trim_end()).ok()?.last()?;
+        let end = *encode(text[at + PROBE_REASONING.len()..].trim_start())
+            .ok()?
+            .first()?;
+        if start == end || !is_marker(start) || !is_marker(end) {
+            return None;
+        }
+        let bare = json!([user, { "role": "assistant", "content": "" }]);
+        let called = json!([user, {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": { "name": "lloom_probe_tool", "arguments": { "lloom_probe_arg": "v" } },
+            }],
+        }]);
+        let tool_call = (|| {
+            let bare = encode(&self.render(&bare, bos_token, &Map::new()).ok()?).ok()?;
+            let called = encode(&self.render(&called, bos_token, &Map::new()).ok()?).ok()?;
+            let at = bare.iter().zip(&called).take_while(|(a, b)| a == b).count();
+            let id = *called.get(at)?;
+            (is_marker(id) && id != start && id != end).then_some(id)
+        })();
+        Some(ThinkTags {
+            start,
+            end,
+            tool_call,
+        })
+    }
+}
+
 /// The top-level variables `source` looks up, from minijinja's static
 /// analysis of its AST (control flow is not considered: a variable read on
 /// any branch counts).
 fn undeclared_variables(source: &str) -> Option<BTreeSet<String>> {
-    let source = without_generation_blocks(source);
+    let source = with_self_assignments_renamed(&without_generation_blocks(source));
     let mut env = minijinja::Environment::new();
     env.add_template("chat", &source).ok()?;
     let names = env.get_template("chat").ok()?.undeclared_variables(false);
     Some(names.into_iter().collect())
+}
+
+/// `source` with the target of each `{% set name = … name … %}` renamed, so
+/// the analysis sees the read on the right-hand side. That is how a template
+/// defaults a caller's variable (`set x = x | default(…)`, the LFM2
+/// checkpoints' `preserve_thinking`), and minijinja's analysis assigns the
+/// target before it visits the value, so it reports none of them. A name
+/// the template declared before (a loop variable, a macro argument, an
+/// earlier `set`) is still declared at the read and still not reported.
+fn with_self_assignments_renamed(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find("{%") {
+        let Some(len) = rest[open + 2..].find("%}") else {
+            break;
+        };
+        let tag = &rest[open..open + 2 + len + 2];
+        out.push_str(&rest[..open]);
+        out.push_str(&self_assignment_renamed(tag).unwrap_or_else(|| tag.to_string()));
+        rest = &rest[open + 2 + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A `{% set name = … %}` tag whose value reads `name`, with the target
+/// renamed; `None` for any other tag.
+fn self_assignment_renamed(tag: &str) -> Option<String> {
+    let body = &tag[2..tag.len() - 2];
+    let lead = body.len() - body.trim_start_matches(['-', '+']).trim_start().len();
+    let after_set = body[lead..].strip_prefix("set")?;
+    let gap = after_set.len() - after_set.trim_start().len();
+    if gap == 0 {
+        return None;
+    }
+    let (target, value) = after_set.split_once('=')?;
+    let target = target.trim();
+    if value.starts_with('=') || !is_identifier(target) {
+        return None;
+    }
+    if !read_names(value).iter().any(|n| n == target) {
+        return None;
+    }
+    let at = 2 + lead + "set".len() + gap;
+    Some(format!(
+        "{}lloom_self_{}{}",
+        &tag[..at],
+        target,
+        &tag[at + target.len()..]
+    ))
+}
+
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// The bare names an expression looks up: string literals, attributes
+/// (`.name`) and keyword-argument names (`name=`) excluded.
+fn read_names(expr: &str) -> Vec<String> {
+    let b = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' || c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != c {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+        } else if c == b'_' || c.is_ascii_alphabetic() {
+            let start = i;
+            while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            let attribute = expr[..start].trim_end().ends_with('.');
+            let after = expr[i..].trim_start();
+            let keyword = after.starts_with('=') && !after.starts_with("==");
+            if !attribute && !keyword {
+                out.push(expr[start..i].to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// `source` with transformers' `{% generation %}` / `{% endgeneration %}`
@@ -237,8 +421,8 @@ mod tests {
     use super::*;
     use lloom::testing::tiny::TinyTokenizer;
 
-    const LOW: &str = "Reasoning effort is set to low.";
-    const XHIGH: &str = "Reasoning effort is set to xhigh.";
+    const LOW: &str = "Thinking effort: low.";
+    const XHIGH: &str = "Thinking effort: xhigh.";
 
     fn qwen() -> Template {
         Template::compile(TinyTokenizer::qwen4exp().chat_template).unwrap()
@@ -281,6 +465,39 @@ mod tests {
         assert_eq!(q.reads("thinking_budget"), Some(false));
     }
 
+    /// A variable a template defaults onto itself (`set x = x |
+    /// default(…)`) is read, though minijinja's own analysis does not report
+    /// it; a name declared before its self-assignment (an earlier `set`, a
+    /// loop variable), a local set from something else, an attribute and a
+    /// keyword argument's name are not reads.
+    #[test]
+    fn a_variable_the_template_defaults_onto_itself_is_read() {
+        let src = "{%- set preserve_thinking = preserve_thinking | default(false) -%}\
+                   {% set local = 'local' %}{% set local = local ~ '!' %}\
+                   {% for m in messages %}{% set m = m | trim %}{{ m }}{% endfor %}\
+                   {% set attr = ns.attr %}{% set kw = f(kw=1) %}\
+                   {{ preserve_thinking }}{{ local }}{{ attr }}{{ kw }}";
+        let mut env = minijinja::Environment::new();
+        env.add_template("x", src).unwrap();
+        let theirs = env.get_template("x").unwrap().undeclared_variables(false);
+        assert!(
+            !theirs.contains("preserve_thinking"),
+            "minijinja now reports it: {theirs:?}"
+        );
+        let t = Template::compile(src).unwrap();
+        assert_eq!(t.reads("preserve_thinking"), Some(true));
+        for name in ["local", "m", "attr", "kw"] {
+            assert_eq!(t.reads(name), Some(false), "{name}");
+        }
+        for name in ["messages", "ns", "f"] {
+            assert_eq!(t.reads(name), Some(true), "{name}");
+        }
+        assert_eq!(
+            with_self_assignments_renamed("{%- set x = x | default(1) -%}{% set y = 2 %}"),
+            "{%- set lloom_self_x = x | default(1) -%}{% set y = 2 %}"
+        );
+    }
+
     /// The analysis reads through a `{% generation %}` block (LFM2's
     /// template has one) and misses nothing inside it.
     #[test]
@@ -320,7 +537,7 @@ mod tests {
             xhigh.starts_with(&format!("<|im_start|>system\n{XHIGH}")),
             "{xhigh}"
         );
-        assert!(!medium.contains("Reasoning effort"), "{medium}");
+        assert!(!medium.contains("Thinking effort"), "{medium}");
         assert!(medium.starts_with("<|im_start|>user\n"), "{medium}");
         assert_ne!(low, xhigh);
         assert_eq!(default, xhigh);
@@ -341,7 +558,7 @@ mod tests {
             .expect("a Rejected, not a render failure");
         assert_eq!(
             rejected.0,
-            "Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low."
+            "tiny qwen4exp template: reasoning_effort high is not one of low, medium, xhigh"
         );
     }
 
@@ -404,6 +621,68 @@ mod tests {
             r.text,
             l.render(&user(), "<|startoftext|>", &Map::new()).unwrap()
         );
+    }
+
+    /// `tok`'s tokenizer, and the reasoning tags `template` yields through it.
+    fn tags_of(tok: &TinyTokenizer, bos: &str) -> Option<ThinkTags> {
+        let json = lloom::testing::tiny::tokenizer::tokenizer_json(&tok.added);
+        let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes()).unwrap();
+        let added = tokenizer.get_added_tokens_decoder();
+        Template::compile(tok.chat_template).unwrap().think_tags(
+            bos,
+            |s| Ok(tokenizer.encode(s, false).unwrap().get_ids().to_vec()),
+            |id| added.contains_key(&id),
+        )
+    }
+
+    /// Each family's tags, read from its template by rendering: Qwen4-exp's
+    /// `<think>` / `</think>` and `<tool_call>`, LFM2's `<think>` / `</think>`
+    /// and `<|tool_call_start|>` — the ids the fixture's token table gives
+    /// them. A template that writes no block has no tags.
+    #[test]
+    fn the_reasoning_tags_come_from_the_template() {
+        let q = TinyTokenizer::qwen4exp();
+        assert_eq!(
+            tags_of(&q, ""),
+            Some(ThinkTags {
+                start: q.id("<think>").unwrap(),
+                end: q.id("</think>").unwrap(),
+                tool_call: q.id("<tool_call>"),
+            })
+        );
+        let l = TinyTokenizer::lfm2();
+        assert_eq!(
+            tags_of(&l, "<|startoftext|>"),
+            Some(ThinkTags {
+                start: l.id("<think>").unwrap(),
+                end: l.id("</think>").unwrap(),
+                tool_call: l.id("<|tool_call_start|>"),
+            })
+        );
+        let plain = TinyTokenizer {
+            added: q.added.clone(),
+            chat_template: "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{%- endfor -%}",
+        };
+        assert_eq!(tags_of(&plain, ""), None);
+    }
+
+    /// The block's state at the end of a prompt: open after a start (with the
+    /// block's tokens counted after it), closed after an end or a tool call,
+    /// closed with no start at all.
+    #[test]
+    fn a_prompt_ends_inside_the_block_only_after_an_unclosed_start() {
+        let t = ThinkTags {
+            start: 1,
+            end: 2,
+            tool_call: Some(3),
+        };
+        assert_eq!(t.open_at_end(&[9, 1]), Some(0));
+        assert_eq!(t.open_at_end(&[1, 9, 9]), Some(2));
+        assert_eq!(t.open_at_end(&[1, 9, 2, 9]), None);
+        assert_eq!(t.open_at_end(&[1, 9, 3]), None);
+        assert_eq!(t.open_at_end(&[9, 9]), None);
+        assert_eq!(t.open_at_end(&[1, 2, 1, 9]), Some(1));
+        assert_eq!(t.close_ids(), vec![2, 3]);
     }
 
     /// The request's two spellings fold into one variable, agree or are

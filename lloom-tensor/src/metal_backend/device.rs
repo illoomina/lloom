@@ -347,6 +347,9 @@ pub struct MetalDevice {
     /// prepares (`set_next_pass_variant`), folded into that pass's key by
     /// `begin_pass` and cleared there and at `finish_pass`.
     pub(crate) next_pass_variant: Arc<std::sync::atomic::AtomicU32>,
+    /// The emulated arms this device admits: a type its GPU only emulates is
+    /// refused unless the operator opted in (`DESIGN.md` §15.2a).
+    pub(crate) emulated: Arc<crate::kernels::metal::arms::EmulatedArms>,
 }
 
 /// One forward pass's plan, cached by its [`PassKey`]. Every plan is served
@@ -917,6 +920,29 @@ impl MetalDevice {
     /// an absent one could not.
     pub fn cut_policy(&self) -> crate::kernels::metal::CutPolicy {
         self.commands.cut_policy()
+    }
+
+    /// Admit computing at `dtype` for the use `what` names: a type this GPU
+    /// only emulates is refused unless allowed (§15.2a).
+    pub fn admit_dtype(&self, dtype: DType, what: &str) -> Result<()> {
+        match crate::kernels::metal::arms::Feature::emulable_dtype(dtype) {
+            None => Ok(()),
+            Some(feature) => Ok(self
+                .emulated
+                .admit(feature, || format!("{what} `{feature}`"))
+                .map_err(MetalError::from)?),
+        }
+    }
+
+    /// Allow these emulated types on this device as well as the ones the
+    /// tuning group allows — a test's opt-in, scoped to its own device.
+    pub fn allow_emulated(&self, features: crate::kernels::metal::arms::Features) {
+        self.emulated.allow(features)
+    }
+
+    /// The device's emulated-arm gate: what it allows, the warnings printed.
+    pub fn emulated_arms(&self) -> &crate::kernels::metal::arms::EmulatedArms {
+        &self.emulated
     }
 
     /// The dispatch period the counter cut uses (`DESIGN.md` §13.5m).
@@ -2388,6 +2414,13 @@ impl MetalDevice {
         dtype: DType,
         _name: &str,
     ) -> Result<BufferHandle> {
+        // An op's result buffer: writing it at a type this GPU only emulates
+        // is that type's arithmetic, admitted only by the opt-in (§15.2a).
+        if let Some(feature) = crate::kernels::metal::arms::Feature::emulable_dtype(dtype) {
+            self.emulated
+                .admit(feature, || format!("a `{feature}` op"))
+                .map_err(MetalError::from)?;
+        }
         let size = element_count * dtype.size_in_bytes();
         // Layer 3 (`DESIGN.md` §9.2a). The arena is offered the allocation
         // first; it serves it only inside a decode step, only while the plan
@@ -2660,6 +2693,12 @@ impl MetalDevice {
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<BufferHandle> {
         let unpooled_uploads = Self::unpooled;
         let size = core::mem::size_of_val(data);
+        // Metal refuses a zero-length `newBufferWithBytes`, and an empty tensor
+        // is legal: it gets the pool's minimum allocation, as `allocate_buffer`
+        // gives any empty request (`buf_size`), with nothing to copy.
+        if size == 0 {
+            return self.allocate_buffer(0);
+        }
         // A small upload is served from the buffer pool and filled on the host:
         // an acquired buffer has no GPU reader (reuse waits for completion,
         // §6.3b), so a host write into it is what `newBufferWithBytes` did
@@ -2871,7 +2910,10 @@ const MIN_BUFFER_ALIGNMENT: usize = 16;
 fn buffer_alignment() -> usize {
     // A power of two >= `MIN_BUFFER_ALIGNMENT`, refused otherwise by the
     // parser (`tuning.rs`); `BUFFER_ALIGNMENT` (128) is the default.
-    crate::tuning::tuning().pool.buffer_alignment.max(MIN_BUFFER_ALIGNMENT)
+    crate::tuning::tuning()
+        .pool
+        .buffer_alignment
+        .max(MIN_BUFFER_ALIGNMENT)
 }
 
 /// Size to allocate for a request of `size` bytes.

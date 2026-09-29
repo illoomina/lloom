@@ -62,7 +62,8 @@ pub struct LoopForm;
 /// Holds each thread's slice of `S` in registers between the read-out and the
 /// update, so a row's slab is read once. Not the loop form bit for bit: its
 /// rounding is the compiler's for its shape (`docs/architecture.md` §2.3.5a).
-/// Single rows only; the rows and multi-position kernels have the loop form.
+/// One row, the rows and the positions of a window run one column, so a
+/// sequence computes the same bits alone, batched or verified.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RegisterForm;
 
@@ -149,6 +150,7 @@ impl<F: StepForm> GdnStep<F> {
             alpha,
             beta,
             &StepRowsOp {
+                form: F::FORM,
                 rows: slots.elem_count(),
                 d: self.d,
                 h_v: self.h_v,
@@ -179,6 +181,7 @@ impl<F: StepForm> GdnStep<F> {
             alpha,
             beta,
             &StepSeqOp {
+                form: F::FORM,
                 steps: alpha.dim(0)?,
                 d: self.d,
                 h_v: self.h_v,
@@ -409,8 +412,9 @@ impl lloom_tensor::CustomOp3 for StepOp {
     }
 }
 
-/// The rows' step (`gdn_step_rows_f32`).
+/// The rows' step (`gdn_step_rows_f32` or its register form).
 struct StepRowsOp {
+    form: GdnStepForm,
     rows: usize,
     d: usize,
     h_v: usize,
@@ -503,6 +507,7 @@ impl lloom_tensor::CustomOp3 for StepRowsOp {
             bo(&ss, &sl),
             bo(&hs, &hl),
             &output,
+            self.form == GdnStepForm::Register,
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((
@@ -512,8 +517,9 @@ impl lloom_tensor::CustomOp3 for StepRowsOp {
     }
 }
 
-/// The multi-position step (`gdn_step_seq_f32`).
+/// The multi-position step (`gdn_step_seq_f32` or its register form).
 struct StepSeqOp {
+    form: GdnStepForm,
     steps: usize,
     d: usize,
     h_v: usize,
@@ -606,6 +612,7 @@ impl lloom_tensor::CustomOp3 for StepSeqOp {
             bo(&as_, &al),
             bo(&ps, &pl),
             &output,
+            self.form == GdnStepForm::Register,
         )
         .map_err(lloom_tensor::Error::wrap)?;
         Ok((

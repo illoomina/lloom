@@ -6,6 +6,7 @@
 //! had), a GGUF is Qwen4-exp (`qwen4exp.rs`). `lloom-serve` stays as a
 //! binary name for the pipette runner and is `lloom serve` verbatim.
 
+pub mod budgets;
 pub mod chat;
 pub mod common;
 pub mod family;

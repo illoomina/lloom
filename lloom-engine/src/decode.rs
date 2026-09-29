@@ -18,7 +18,10 @@
 
 use lloom::generation::poll::PollMechanism;
 use lloom::generation::readback::RING_HISTORY_SLOTS;
-use lloom::generation::{Blocking, EosRead, LogitsProcessor, Processors, Ring, Sampling};
+use lloom::generation::{
+    Blocking, EosRead, LogitsProcessor, Processors, ReadbackStrategy, Ring, Sampling,
+    ThinkingBudget, ThinkingReport,
+};
 use lloom::nn::{
     CacheReset, CacheRewind, CausalLM, DecodeOptions, DecodeOut, DecodeStats, IdentityProposer,
     ReuseAction, Sequence, Session,
@@ -243,6 +246,11 @@ pub struct DecodeParams {
     /// tile's worth whatever the prompt. The model's `conv_prefill_ctx` must
     /// be on for a tiled prefill to compute what one pass does.
     pub prefill_tile: usize,
+    /// The thinking budget, resolved against the family's markers for a
+    /// prompt that leaves a thinking block open (`generation::budget`). The
+    /// K=1 body carries it on every readback arm; the speculative body and
+    /// the batch scheduler refuse it.
+    pub thinking: Option<ThinkingBudget>,
 }
 
 impl DecodeParams {
@@ -293,6 +301,18 @@ impl DecodeParams {
         }
         Ok(())
     }
+
+    /// Refuse the thinking budget on a path that cannot feed its forced
+    /// tokens — `path` names it and `why` says what it feeds instead.
+    pub fn refuse_thinking_budget(&self, path: &str, why: &str) -> Result<()> {
+        if let Some(b) = &self.thinking {
+            lloom_tensor::bail!(
+                "{path} does not carry a thinking budget ({} tokens): {why}",
+                b.budget()
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for DecodeParams {
@@ -309,6 +329,7 @@ impl Default for DecodeParams {
             stop_strings: Vec::new(),
             readback: ReadbackArm::Auto,
             prefill_tile: 0,
+            thinking: None,
         }
     }
 }
@@ -334,6 +355,8 @@ pub struct Decoded {
     /// commits, ring engagement — so a consumer that reports throughput reads
     /// the loop's clock rather than bracketing the call.
     pub stats: DecodeStats,
+    /// What the run did inside the thinking block, when a budget was armed.
+    pub thinking: Option<ThinkingReport>,
 }
 
 /// A decode session: a borrowed target and the sequence it drives — the cache,
@@ -688,6 +711,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         let (out, ran): (DecodeOut, ReadbackArm) = match arm {
             ReadbackArm::Blocking => {
                 let mut readback = Blocking::new(&params.eos_ids, &self.device)?;
+                readback.set_thinking_budget(params.thinking.as_ref())?;
                 let opts = self
                     .config
                     .options(params.max_tokens, ReadbackArm::Blocking, params.prefill_tile);
@@ -720,6 +744,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                 // every run.
                 let readback = self.rings.ring(&params.eos_ids, &self.device, eos)?;
                 readback.set_wake_cadence(wake);
+                // Armed for this run whatever it holds (`None` disarms), so a
+                // pooled ring never carries a budget into another run.
+                readback.set_thinking_budget(params.thinking.as_ref())?;
                 // The adaptive arm needs the ring's reader (a CPU-mapped ring);
                 // without one it is the fixed cadence, reported as such. The
                 // reader alone (`--stream-reader`) streams what the arm stamps:
@@ -826,6 +853,9 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
                         out?
                     }
                 };
+                self.rings
+                    .ring(&params.eos_ids, &self.device, eos)?
+                    .set_thinking_budget(None)?;
                 (out, ran)
             }
             ReadbackArm::Auto => unreachable!("resolved above"),
@@ -848,6 +878,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         };
 
         let (text, _) = stream.finish(&params.stop_strings);
+        let thinking = params.thinking.as_ref().map(|b| b.report(&out.ids));
 
         Ok(Decoded {
             text,
@@ -858,6 +889,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             prefilled: prepared.suffix.len(),
             readback: ran,
             stats: out.stats,
+            thinking,
         })
     }
 }
@@ -892,6 +924,11 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
         params.refuse_processors(
             "DecodeSession::decode_speculative",
             "the verify accepts the target's raw argmax",
+        )?;
+        params.refuse_thinking_budget(
+            "the speculative body (--dspark, --mtp)",
+            "its verify accepts the target's argmax over a drafted block, so a forced token \
+             cannot be fed in place of a draw",
         )?;
         let mut sampler = params.sampler();
         if sampler.sampling() != &Sampling::ArgMax {
@@ -973,6 +1010,7 @@ impl<'m, M: CausalLM> DecodeSession<'m, M> {
             prefilled: prepared.suffix.len(),
             readback: ReadbackArm::Speculative { k },
             stats: out.stats,
+            thinking: None,
         })
     }
 }
@@ -1468,6 +1506,149 @@ mod tests {
                             matches!(got.readback, ReadbackArm::Ring(_)),
                             "{at}: processors took the request off the ring"
                         );
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// A thinking budget on every readback arm, the default flow with and
+        /// without the fused publish among them. From prompt `[5, 1]` the
+        /// chain is `10 9 2 17 58 25 50 33`, then EOS.
+        ///
+        /// - fires: the block (closed by 20 or 30) is open at the budget of
+        ///   2, so steps 2 and 3 feed the tail `5 20` in place of the draws
+        ///   `2 38`, and the chain continues from 20;
+        /// - a tool call first: 58 closes the block at step 4, before the
+        ///   budget of 6, so nothing is forced and the chain is untouched;
+        /// - never reached: a budget of 100;
+        /// - cut short: a budget of 6 on a run of 3 tokens, which ends with
+        ///   the rule still live — the case a budget left armed on a pooled
+        ///   ring would force into the next request (its third token).
+        ///
+        /// The streamed text is the fed ids' (the reader streams the forced
+        /// tokens too), the report reads the ids back, and a request without
+        /// a budget on the same pooled ring right after is the plain chain.
+        #[test]
+        fn a_thinking_budget_feeds_its_tail_on_every_readback_arm() -> Result<()> {
+            use lloom::generation::{ThinkingBudget, ThinkingReport};
+            const MAX: usize = 12;
+            let fires = ThinkingBudget::new(2, vec![20, 30], vec![5, 20])?;
+            let mut fired_want = vec![10, 9, 5, 20];
+            let (rest, rest_eos) = chain(20, MAX - 4);
+            fired_want.extend(rest);
+            assert_eq!(chain(1, 3).0, vec![10, 9, 2], "the fixture's chain moved");
+            let tool = ThinkingBudget::new(6, vec![20, 58], vec![5, 20])?;
+            let never = ThinkingBudget::new(100, vec![20, 30], vec![5, 20])?;
+            let short = ThinkingBudget::new(6, vec![20, 30], vec![5, 20])?;
+            let (plain, plain_eos) = chain(1, MAX);
+            assert_eq!(plain, vec![10, 9, 2, 17, 58, 25, 50, 33]);
+            let cases = [
+                (
+                    "fires",
+                    MAX,
+                    &fires,
+                    fired_want.clone(),
+                    rest_eos,
+                    ThinkingReport {
+                        thought: 3,
+                        fired: true,
+                        closed_by: Some(20),
+                    },
+                ),
+                (
+                    "a tool call first",
+                    MAX,
+                    &tool,
+                    plain.clone(),
+                    plain_eos,
+                    ThinkingReport {
+                        thought: 4,
+                        fired: false,
+                        closed_by: Some(58),
+                    },
+                ),
+                (
+                    "never reached",
+                    MAX,
+                    &never,
+                    plain.clone(),
+                    plain_eos,
+                    ThinkingReport {
+                        thought: plain.len(),
+                        fired: false,
+                        closed_by: None,
+                    },
+                ),
+                (
+                    "cut short",
+                    3,
+                    &short,
+                    plain[..3].to_vec(),
+                    false,
+                    ThinkingReport {
+                        thought: 3,
+                        fired: false,
+                        closed_by: None,
+                    },
+                ),
+            ];
+            let mut arms: Vec<(String, DecodeConfig)> =
+                vec![("default".into(), DecodeConfig::default())];
+            let mut unfused = DecodeConfig::default();
+            unfused.readback.fused_publish = false;
+            arms.push(("default --fused-publish=false".into(), unfused));
+            for s in ReadbackConfig::SPELLINGS {
+                let mut c = DecodeConfig::default();
+                ReadbackConfig::apply_spelling(&mut c.readback, s)
+                    .map_err(lloom_tensor::Error::msg)?;
+                arms.push((s.to_string(), c));
+            }
+            for device in devices() {
+                let model = Chain::new(&device)?;
+                for (arm, config) in &arms {
+                    let mut held: Option<(Sequence<Pos>, RingPool)> = None;
+                    for (name, max, budget, want, hit, report) in &cases {
+                        let session = match held.take() {
+                            Some((seq, rings)) => {
+                                DecodeSession::from_parts(&model, seq, device.clone(), rings)
+                            }
+                            None => DecodeSession::new(&model, Pos(0), device.clone(), 0),
+                        };
+                        let mut session = session.with_config(config.clone());
+                        session.reset();
+                        let params = DecodeParams {
+                            max_tokens: *max,
+                            eos_ids: vec![EOS],
+                            readback: config.readback.arm(),
+                            thinking: Some((*budget).clone()),
+                            ..DecodeParams::default()
+                        };
+                        let mut streamed = String::new();
+                        let got = session.decode(
+                            &[5, 1],
+                            |ids: &[u32]| Ok(text_of(ids)),
+                            &params,
+                            |frag: &str| streamed.push_str(frag),
+                        )?;
+                        let at = format!("{device:?} {arm} {name} ({})", got.readback.name());
+                        assert_eq!(&got.tokens, want, "{at}: the ids");
+                        assert_eq!(streamed, text_of(want), "{at}: the streamed text");
+                        assert_eq!(
+                            got.stop,
+                            if *hit { Stop::Eos } else { Stop::Length },
+                            "{at}"
+                        );
+                        assert_eq!(got.thinking, Some(*report), "{at}: the report");
+                        let parts = session.into_parts();
+                        let (plain_got, _, parts) =
+                            request(&model, &device, config, Some(parts), &[5, 1], MAX)?;
+                        assert_eq!(
+                            plain_got.tokens, plain,
+                            "{at}: a request without a budget after it"
+                        );
+                        assert_eq!(plain_got.thinking, None, "{at}");
+                        held = Some(parts);
                     }
                 }
             }

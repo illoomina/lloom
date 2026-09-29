@@ -1,9 +1,9 @@
 //! `lloom chat --model <tiny>` end to end on both families
 //! (`docs/porting-models.md` §21.8, #761): each family's tiny checkpoint is
 //! written to real files — safetensors + `config.json` for LFM2, one GGUF
-//! for Qwen4-exp, each with the byte-level tokenizer and the family's own
-//! chat template — and the shipped binary loads it through family
-//! detection, renders the template, prefills and decodes.
+//! for Qwen4-exp, each with the byte-level tokenizer and the family's tiny
+//! chat template (`tiny_templates.rs`) — and the shipped binary loads it
+//! through family detection, renders the template, prefills and decodes.
 //!
 //! What is asserted, per family and device:
 //! - the process exits 0 and reports its turn;
@@ -162,8 +162,10 @@ fn encode(tok: &TinyTokenizer, s: &str) -> Vec<u32> {
     ids
 }
 
-const LOW: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
-const XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+const LOW: &str = "Thinking effort: low. Think briefly.";
+const XHIGH: &str = "Thinking effort: xhigh. Think the problem through.";
+const REJECTED: &str =
+    "tiny qwen4exp template: reasoning_effort high is not one of low, medium, xhigh";
 
 /// Qwen4-exp's rendering of one user message with thinking on: the effort's
 /// instruction as the system turn (`medium` has none), then the open think
@@ -274,10 +276,12 @@ fn chat_refuses_an_effort_the_template_rejects_or_does_not_act_on() {
     };
     let (ok, stderr, f) = with(&["--think", "--reasoning-effort", "high"]);
     assert!(!ok && f.is_empty(), "{stderr}");
-    assert!(stderr.contains(
-        "--reasoning-effort high: the chat template rejected the request: Unexpected reasoning effort high. \
-         Supported types are xhigh (default), medium, and low."
-    ), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "--reasoning-effort high: the chat template rejected the request: {REJECTED}"
+        )),
+        "{stderr}"
+    );
     let (ok, stderr, f) = with(&["--reasoning-effort", "low"]);
     assert!(!ok && f.is_empty(), "{stderr}");
     assert!(stderr.contains(
@@ -416,8 +420,7 @@ fn qwen4exp_serve_takes_the_reasoning_effort_request_field() {
     assert_eq!(status, 400, "{err}");
     assert_eq!(
         err["error"]["message"],
-        "the chat template rejected the request: Unexpected reasoning effort high. \
-         Supported types are xhigh (default), medium, and low."
+        format!("the chat template rejected the request: {REJECTED}")
     );
     let (status, err) = server.chat(json!({
         "reasoning_effort": "low",
@@ -478,5 +481,473 @@ fn lfm2_serve_ignores_the_reasoning_effort_it_cannot_read() {
     );
     assert_eq!(without["timings"]["template_kwargs_ignored"], json!([]));
     drop(server);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The ids a tiny family gives an added token.
+fn added_id(tok: &TinyTokenizer, content: &str) -> u32 {
+    tok.id(content)
+        .unwrap_or_else(|| panic!("{content} is not an added token"))
+}
+
+/// A `lloom serve` chat request's generated ids and `timings`.
+fn served_ids(server: &Server, fields: Value) -> (Vec<u32>, Value) {
+    let (status, body) = server.chat(fields);
+    assert_eq!(status, 200, "{body}");
+    let ids = body["timings"]["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_u64().unwrap() as u32)
+        .collect();
+    (ids, body["timings"].clone())
+}
+
+/// The thinking budget through `lloom serve` on both tiny families, on the
+/// CPU and on Metal, on each family's default readback arm and a ring arm
+/// beside it. Each prompt leaves a block open (Qwen4-exp with thinking on;
+/// LFM2's template always opens one). The model is kept from closing the
+/// block itself (a bias of -100 on the end marker and the tool-call start),
+/// so at the budget of 3 — counted, as vLLM counts it, from the start marker,
+/// the prompt's own tokens after it included — the forced tail (the message's
+/// bytes, then the end marker) is fed, and the ids before it are the
+/// unbudgeted run's. A budget
+/// past `max_tokens` changes nothing. With the tool-call start biased up
+/// instead, the model calls a tool at once, which closes the block, and
+/// nothing is forced: every id is the unbudgeted run's. A budget of 0 (no
+/// bias, so the default arm's fused publish runs after the tail) ends the
+/// block at the first token.
+#[test]
+fn thinking_budget_forces_the_end_marker_through_serve() {
+    struct Family {
+        name: &'static str,
+        tok: TinyTokenizer,
+        model: PathBuf,
+        args: Vec<String>,
+        kwargs: Value,
+        tool: &'static str,
+        /// Tokens of the block the prompt holds after `<think>`, which the
+        /// budget counts: Qwen4-exp's prompt ends `<think>\n`, LFM2's `<think>`.
+        prior: usize,
+    }
+    let q_dir = scratch("budget-qwen");
+    let l_dir = scratch("budget-lfm2");
+    let q_model = write::<Qwen4ExpTiny>(&q_dir);
+    let families = [
+        Family {
+            name: "qwen4exp",
+            tok: Qwen4ExpTiny::tokenizer(),
+            args: vec![
+                "--tokenizer".into(),
+                q_dir.join("tokenizer.json").to_str().unwrap().into(),
+                "--experts".into(),
+                "resident".into(),
+            ],
+            model: q_model,
+            kwargs: json!({ "enable_thinking": true }),
+            tool: "<tool_call>",
+            prior: 1,
+        },
+        Family {
+            name: "lfm2",
+            tok: Lfm2Tiny::tokenizer(),
+            model: write::<Lfm2Tiny>(&l_dir),
+            args: vec![],
+            kwargs: json!({}),
+            tool: "<|tool_call_start|>",
+            prior: 0,
+        },
+    ];
+    let mut devices = vec![true];
+    if cfg!(feature = "metal") {
+        devices.push(false);
+    }
+    let message = "Enough.";
+    for f in &families {
+        let end = added_id(&f.tok, "</think>");
+        let tool = added_id(&f.tok, f.tool);
+        let mut tail = bytes(message);
+        tail.push(end);
+        for &cpu in &devices {
+            for arm in [None, Some("ring-la0")] {
+                let mut args: Vec<&str> = f.args.iter().map(String::as_str).collect();
+                if cpu {
+                    args.push("--cpu");
+                }
+                if let Some(a) = arm {
+                    args.extend(["--readback", a]);
+                }
+                let at = format!("{} cpu={cpu} {arm:?}", f.name);
+                let server = Server::start(&f.model, &args);
+                let (_, health) = server.call("GET", "/health", &json!({}));
+                assert_eq!(
+                    health["reasoning_tags"],
+                    json!({ "start": "<think>", "end": "</think>", "tool_call": f.tool }),
+                    "{at}"
+                );
+                let req = |bias: Value, extra: Value| {
+                    let mut r = json!({
+                        "max_tokens": 16,
+                        "ignore_eos": true,
+                        "chat_template_kwargs": f.kwargs,
+                        "logit_bias": bias,
+                    });
+                    for (k, v) in extra.as_object().unwrap() {
+                        r[k] = v.clone();
+                    }
+                    r
+                };
+                let closed = json!({ end.to_string(): -100, tool.to_string(): -100 });
+                let (plain, t) = served_ids(&server, req(closed.clone(), json!({})));
+                assert_eq!(t["thinking_budget"], Value::Null, "{at}");
+                assert_eq!(plain.len(), 16, "{at}: {plain:?}");
+
+                let (got, t) = served_ids(
+                    &server,
+                    req(
+                        closed.clone(),
+                        json!({ "thinking_token_budget": 3, "thinking_budget_message": message }),
+                    ),
+                );
+                let cut = 3 - f.prior;
+                assert_eq!(got[..cut], plain[..cut], "{at}: before the budget");
+                assert_eq!(
+                    got[cut..cut + tail.len()],
+                    tail[..],
+                    "{at}: the forced tail"
+                );
+                assert_eq!(t["thinking_budget"], 3, "{at}");
+                assert_eq!(t["thinking_budget_fired"], true, "{at}");
+                assert_eq!(t["thinking_tokens"], 3 + bytes(message).len(), "{at}");
+                assert_eq!(t["thinking_budget_ignored"], Value::Null, "{at}");
+
+                let (got, t) = served_ids(
+                    &server,
+                    req(closed.clone(), json!({ "thinking_token_budget": 100 })),
+                );
+                assert_eq!(got, plain, "{at}: a budget past max_tokens");
+                assert_eq!(t["thinking_budget_fired"], false, "{at}");
+                assert_eq!(t["thinking_tokens"], 16 + f.prior, "{at}");
+
+                let calls = json!({ end.to_string(): -100, tool.to_string(): 100 });
+                let (plain_call, _) = served_ids(&server, req(calls.clone(), json!({})));
+                assert_eq!(plain_call[0], tool, "{at}: the bias did not call a tool");
+                let (got, t) =
+                    served_ids(&server, req(calls, json!({ "thinking_token_budget": 3 })));
+                assert_eq!(got, plain_call, "{at}: a tool call ends the block");
+                assert_eq!(t["thinking_budget_fired"], false, "{at}");
+                assert_eq!(t["thinking_tokens"], f.prior, "{at}");
+
+                let (got, t) = served_ids(
+                    &server,
+                    json!({
+                        "max_tokens": 6,
+                        "ignore_eos": true,
+                        "chat_template_kwargs": f.kwargs,
+                        "thinking_token_budget": 0,
+                    }),
+                );
+                assert_eq!(got[0], end, "{at}: a budget of 0");
+                assert_eq!(t["thinking_budget_fired"], true, "{at}");
+                assert_eq!(t["thinking_tokens"], f.prior, "{at}");
+                drop(server);
+            }
+        }
+    }
+    std::fs::remove_dir_all(&q_dir).ok();
+    std::fs::remove_dir_all(&l_dir).ok();
+}
+
+/// Where the thinking budget cannot apply: `lloom serve` serves the request
+/// without it and says why (Qwen4-exp with thinking off, whose prompt closes
+/// its block), and `lloom chat` refuses the flag by name before the first
+/// turn — with the hint on Qwen4-exp, and on a template that writes no
+/// thinking block at all (the tiny Qwen4-exp checkpoint with a plain
+/// template beside it). With `--think` the chat runs it and says so.
+#[test]
+fn thinking_budget_is_ignored_or_refused_where_no_block_is_open() {
+    let (dir, model, base) = qwen_tiny("budget-refuse");
+    let args: Vec<&str> = base.iter().map(String::as_str).collect();
+    let server = Server::start(&model, &args);
+    let off = json!({ "enable_thinking": false });
+    let (status, plain) = server.chat(json!({ "chat_template_kwargs": off }));
+    assert_eq!(status, 200, "{plain}");
+    let (status, with) =
+        server.chat(json!({ "chat_template_kwargs": off, "thinking_token_budget": 2 }));
+    assert_eq!(status, 200, "{with}");
+    assert_eq!(with["timings"]["tokens"], plain["timings"]["tokens"]);
+    assert_eq!(with["timings"]["thinking_budget"], 2);
+    assert_eq!(
+        with["timings"]["thinking_budget_ignored"],
+        "the prompt leaves no thinking block open"
+    );
+    assert_eq!(with["timings"]["thinking_budget_fired"], Value::Null);
+    let (status, err) = server.chat(json!({ "thinking_token_budget": -2 }));
+    assert_eq!(status, 400, "{err}");
+    drop(server);
+
+    // A server whose requests run the batch scheduler serves the budget
+    // ignored, by that reason, rather than failing the request.
+    let mut batched: Vec<&str> = base.iter().map(String::as_str).collect();
+    batched.extend(["--batch", "2"]);
+    let server = Server::start(&model, &batched);
+    let on = json!({ "enable_thinking": true });
+    let (status, plain) = server.chat(json!({ "chat_template_kwargs": on }));
+    assert_eq!(status, 200, "{plain}");
+    let (status, with) =
+        server.chat(json!({ "chat_template_kwargs": on, "thinking_token_budget": 0 }));
+    assert_eq!(status, 200, "{with}");
+    assert_eq!(with["timings"]["tokens"], plain["timings"]["tokens"]);
+    assert!(
+        with["timings"]["thinking_budget_ignored"]
+            .as_str()
+            .unwrap()
+            .contains("the batch scheduler (--batch N)"),
+        "{with}"
+    );
+    drop(server);
+
+    let with_args = |extra: &[&str]| {
+        let mut a: Vec<&str> = base.iter().map(String::as_str).collect();
+        a.extend(extra);
+        chat_templated(&model, &a)
+    };
+    let (ok, stderr, f) = with_args(&["--thinking-budget", "4"]);
+    assert!(!ok && f.is_empty(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "--thinking-budget 4: qwen4exp: the prompt leaves no thinking block open (add --think)"
+        ),
+        "{stderr}"
+    );
+    let (ok, stderr, f) = with_args(&["--think", "--thinking-budget", "4"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(f["thinking_budget"], "4");
+    assert_ne!(f["budget_fired"], "none", "{stderr}");
+    std::fs::write(
+        dir.join("chat_template.jinja"),
+        "{%- for m in messages -%}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{%- endfor -%}<|im_start|>assistant\n",
+    )
+    .unwrap();
+    let (ok, stderr, f) = with_args(&["--thinking-budget", "4"]);
+    assert!(!ok && f.is_empty(), "{stderr}");
+    assert!(
+        stderr
+            .contains("--thinking-budget 4: qwen4exp: the chat template writes no thinking block"),
+        "{stderr}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The prompt budget on a raw prompt (`lloom chat --raw`): over it the turn
+/// is refused by default, with the prompt's length and the budget; under
+/// `--prompt-budget-mode truncate` the prompt is its last tokens, BOS kept
+/// on LFM2, and the prefill in tiles of 4 over the 8 kept tokens (the cut on
+/// a tile boundary) decodes exactly what the kept text given as the prompt
+/// decodes.
+#[test]
+fn prompt_budget_refuses_or_keeps_the_last_tokens() {
+    let l_dir = scratch("prompt-budget-lfm2");
+    let l_model = write::<Lfm2Tiny>(&l_dir);
+    let (q_dir, q_model, q_base) = qwen_tiny("prompt-budget-qwen");
+    let bos = Lfm2Tiny::tokenizer().id("<|startoftext|>").unwrap();
+    let cases: [(&Path, Vec<&str>, Option<u32>); 2] = [
+        (&l_model, vec!["--cpu"], Some(bos)),
+        (&q_model, q_base.iter().map(String::as_str).collect(), None),
+    ];
+    for (model, base, bos) in cases {
+        let run = |prompt: &str, extra: &[&str]| {
+            let out = Command::new(env!("CARGO_BIN_EXE_lloom"))
+                .args(["chat", "--model"])
+                .arg(model)
+                .args([
+                    "--raw",
+                    "-p",
+                    prompt,
+                    "-n",
+                    MAX_TOKENS,
+                    "--prefill-tile",
+                    "4",
+                ])
+                .args(&base)
+                .args(extra)
+                .output()
+                .expect("lloom runs");
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let fields: std::collections::BTreeMap<String, String> = stderr
+                .lines()
+                .find(|l| l.starts_with("[turn 1:"))
+                .map(|line| {
+                    line.trim_start_matches("[turn 1:")
+                        .trim_end_matches(']')
+                        .split_whitespace()
+                        .filter_map(|kv| kv.split_once('='))
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (out.status.success(), stderr, fields)
+        };
+        let full = bos.into_iter().chain(bytes(PROMPT)).collect::<Vec<u32>>();
+        let (ok, stderr, _) = run(PROMPT, &["--prompt-budget", "8"]);
+        assert!(!ok, "{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "the prompt is {} tokens, over the prompt budget of 8",
+                full.len()
+            )),
+            "{stderr}"
+        );
+        let (ok, stderr, cut) = run(
+            PROMPT,
+            &["--prompt-budget", "8", "--prompt-budget-mode", "truncate"],
+        );
+        assert!(ok, "{stderr}");
+        let kept_bytes = 8 - usize::from(bos.is_some());
+        let tail = &PROMPT[PROMPT.len() - kept_bytes..];
+        let want: Vec<u32> = bos.into_iter().chain(bytes(tail)).collect();
+        assert_eq!(cut["prompt_tokens"], "8");
+        assert_eq!(cut["prompt_ids_sha256"], sha(&want), "{model:?}");
+        assert_eq!(cut["prompt_dropped"], (full.len() - 8).to_string());
+        assert_eq!(cut["prompt_budget"], "8");
+        let (ok, stderr, direct) = run(tail, &[]);
+        assert!(ok, "{stderr}");
+        assert_eq!(direct["prompt_ids_sha256"], cut["prompt_ids_sha256"]);
+        assert_eq!(
+            direct["tokens_sha256"], cut["tokens_sha256"],
+            "{model:?}: the truncated prompt decodes other than the same ids given whole"
+        );
+        assert_eq!(direct["prompt_dropped"], "0");
+    }
+    std::fs::remove_dir_all(&l_dir).ok();
+    std::fs::remove_dir_all(&q_dir).ok();
+}
+
+/// The prompt budget on a conversation, and what it does to the cache.
+///
+/// `lloom chat` (three turns on stdin, a budget the second turn's
+/// conversation exceeds): the truncated turn drops the oldest turns whole,
+/// is reported, and does not reuse the cache (its prompt no longer starts
+/// with what the cache holds); the conversation itself was shortened, so the
+/// turn after it fits without dropping anything again.
+///
+/// `lloom serve`: a request over `truncate_prompt_tokens` renders the kept
+/// turns only — its prompt is exactly the rendering of the conversation
+/// without them, which a second server answers identically — and says what
+/// it dropped.
+#[test]
+fn prompt_budget_drops_whole_turns_and_the_cache_follows() {
+    let dir = scratch("prompt-budget-conv");
+    let model = write::<Lfm2Tiny>(&dir);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lloom"))
+        .args(["chat", "--model"])
+        .arg(&model)
+        .args(["--cpu", "-n", "4", "--prompt-budget", "88"])
+        .args(["--prompt-budget-mode", "truncate"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lloom runs");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        for line in [
+            "a first question here",
+            "a second one, longer still",
+            "third",
+        ] {
+            writeln!(stdin, "{line}").unwrap();
+        }
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    let turns: Vec<std::collections::BTreeMap<String, String>> = stderr
+        .lines()
+        .filter(|l| l.starts_with("[turn "))
+        .map(|l| {
+            l.split_whitespace()
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.trim_end_matches(']').to_string()))
+                .collect()
+        })
+        .collect();
+    assert_eq!(turns.len(), 3, "{stderr}");
+    let dropped: Vec<usize> = turns
+        .iter()
+        .map(|t| t["prompt_dropped"].parse().unwrap())
+        .collect();
+    let first_cut = dropped
+        .iter()
+        .position(|&d| d > 0)
+        .unwrap_or_else(|| panic!("no turn was truncated at a budget of 88:\n{stderr}"));
+    assert_eq!(first_cut, 1, "turn 1 fits and turn 2 does not:\n{stderr}");
+    assert!(
+        !["Extend", "Resume"].contains(&turns[1]["reuse"].as_str()),
+        "the truncated turn reused a cache its prompt no longer starts with:\n{stderr}"
+    );
+    for t in &turns {
+        assert!(
+            t["prompt_tokens"].parse::<usize>().unwrap() <= 88,
+            "{stderr}"
+        );
+    }
+    assert_eq!(dropped[2], 0, "the third turn dropped again:\n{stderr}");
+
+    let tok = Lfm2Tiny::tokenizer();
+    let conv = json!([
+        { "role": "user", "content": "a first question here" },
+        { "role": "assistant", "content": "an answer" },
+        { "role": "user", "content": PROMPT },
+    ]);
+    let kept = json!([{ "role": "user", "content": PROMPT }]);
+    let a = Server::start(&model, &["--cpu"]);
+    let (status, full) = a.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": conv, "max_tokens": 4 }),
+    );
+    assert_eq!(status, 200, "{full}");
+    let (status, cut) = a.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": conv, "max_tokens": 4, "truncate_prompt_tokens": 60 }),
+    );
+    assert_eq!(status, 200, "{cut}");
+    let bos = tok.id("<|startoftext|>").unwrap();
+    let mut want = vec![bos];
+    want.extend(encode(
+        &tok,
+        &format!("<|im_start|>user\n{PROMPT}<|im_end|>\n<|im_start|>assistant\n<think>"),
+    ));
+    assert!(
+        want.len() <= 60,
+        "the fixture's kept turn is over the budget"
+    );
+    assert_eq!(cut["timings"]["prompt_ids_sha256"], sha(&want));
+    assert_eq!(cut["usage"]["prompt_tokens"], want.len());
+    assert_eq!(cut["timings"]["prompt_messages_dropped"], 2);
+    assert_eq!(
+        cut["timings"]["prompt_tokens_dropped"],
+        full["usage"]["prompt_tokens"].as_u64().unwrap() - want.len() as u64
+    );
+    assert_eq!(cut["timings"]["prompt_budget"], 60);
+    let (status, err) = a.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": conv, "max_tokens": 4, "truncate_prompt_tokens": 5 }),
+    );
+    assert_eq!(status, 400, "{err}");
+    drop(a);
+    let b = Server::start(&model, &["--cpu"]);
+    let (status, alone) = b.call(
+        "POST",
+        "/v1/chat/completions",
+        &json!({ "messages": kept, "max_tokens": 4 }),
+    );
+    assert_eq!(status, 200, "{alone}");
+    assert_eq!(alone["timings"]["prompt_ids_sha256"], sha(&want));
+    assert_eq!(alone["timings"]["tokens"], cut["timings"]["tokens"]);
+    drop(b);
     std::fs::remove_dir_all(&dir).ok();
 }

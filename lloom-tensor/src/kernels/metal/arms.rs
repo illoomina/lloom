@@ -312,6 +312,12 @@ impl EmulatedArms {
         self.warnings.load(Ordering::Relaxed)
     }
 
+    /// The emulated types this gate has admitted, each warned once
+    /// ([`emulated_warning`] is the line it printed).
+    pub fn admitted(&self) -> Features {
+        Features::from_bits(self.warned.load(Ordering::Relaxed))
+    }
+
     /// Whether [`admit`](Self::admit) would admit `feature`, asked without
     /// admitting it.
     pub fn admits(&self, feature: Feature) -> bool {
@@ -352,14 +358,20 @@ impl EmulatedArms {
         }
         if self.warned.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
             self.warnings.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "warning: Metal `{feature}` runs emulated in software on this GPU ({cost}); \
-                 enabled by `{ALLOW_EMULATED_FLAG} {feature}` (§15.2a)",
-                cost = feature.emulation_cost(),
-            );
+            eprintln!("warning: {}", emulated_warning(feature));
         }
         Ok(())
     }
+}
+
+/// What an admitted emulated type costs, as the gate warns it: the stderr
+/// line and a load-warning channel's message are this text.
+pub fn emulated_warning(feature: Feature) -> String {
+    format!(
+        "Metal `{feature}` runs emulated in software on this GPU ({cost}); enabled by \
+         `{ALLOW_EMULATED_FLAG} {feature}` (§15.2a)",
+        cost = feature.emulation_cost(),
+    )
 }
 
 #[cfg(test)]

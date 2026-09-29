@@ -486,14 +486,26 @@ pub fn load(model: &ModelArgs, shape: Shape) -> Result<(Box<dyn Served>, PathBuf
     };
     let (family, checkpoint) = detect(&path)?;
     let mut shape = shape;
-    if let Some(note) = clamp_ungated_eos_gate(&family.capabilities(), &mut shape) {
+    let clamp = clamp_ungated_eos_gate(&family.capabilities(), &mut shape);
+    if let Some(note) = &clamp {
         eprintln!("[readback: {note}]");
     }
     let req = Requested { model, shape };
     family
         .resolve(&req)
         .map_err(|e| anyhow::anyhow!("{} cannot serve this shape: {e}", family.name()))?;
-    let engine = family.load(checkpoint.clone(), req)?;
+    let mut engine = family.load(checkpoint.clone(), req)?;
+    engine.note_load_warnings(
+        clamp
+            .into_iter()
+            .map(|n| {
+                lloom::load_warning::LoadWarning::new(
+                    lloom::load_warning::LoadWarningKind::Readback,
+                    n,
+                )
+            })
+            .collect(),
+    );
     Ok((engine, checkpoint))
 }
 

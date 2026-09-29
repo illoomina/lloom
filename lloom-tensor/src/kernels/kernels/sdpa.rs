@@ -36,6 +36,51 @@ pub const SDPA_FULL_HEAD_DIMS: [usize; 8] = [32, 64, 72, 80, 96, 128, 256, 512];
 /// (`sdpa_vector_declares_variants_the_name_table_cannot_reach`).
 pub const SDPA_VECTOR_HEAD_DIMS: [usize; 6] = [32, 64, 96, 128, 256, 512];
 
+/// Whether every `sdpa_vector` pipeline at `(head_dim, itype)` admits the
+/// threadgroup width it is dispatched at: the one-pass kernel and the two-pass
+/// kernels' second pass at 1024 threads, the first pass at 256. A pipeline
+/// admitting fewer cannot run its dispatch, and the output is left unwritten.
+/// Register demand grows with the head dim, so this is a property of the
+/// device and toolchain, read from the compiled pipelines; a load-time check,
+/// never a per-dispatch one.
+pub fn sdpa_vector_admits_its_widths(
+    device: &Device,
+    kernels: &Kernels,
+    head_dim: usize,
+    itype: SdpaDType,
+) -> Result<bool, MetalKernelError> {
+    if !SDPA_VECTOR_HEAD_DIMS.contains(&head_dim) {
+        return Ok(false);
+    }
+    let t = match itype {
+        SdpaDType::F16 => "float16_t",
+        SdpaDType::BF16 => "bfloat16_t",
+        SdpaDType::F32 => "float",
+    };
+    let constants = || {
+        Some(ConstantValues::new(vec![(
+            20,
+            Value::Bool(/* sdpa_vector_has_mask */ false),
+        )]))
+    };
+    let cells = [
+        (format!("sdpa_vector_{t}_{head_dim}"), true, 1024),
+        (format!("sdpa_vector_2pass_1_{t}_{head_dim}"), true, 8 * 32),
+        (format!("sdpa_vector_2pass_2_{t}_{head_dim}"), false, 1024),
+    ];
+    for (name, specialized, width) in cells {
+        let pipeline = if specialized {
+            kernels.load_pipeline_with_constants(device, Source::Sdpa, name, constants())?
+        } else {
+            kernels.load_pipeline(device, Source::Sdpa, name)?
+        };
+        if pipeline.max_total_threads_per_threadgroup() < width {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// The tile `steel_attention` runs `head_dim` at: `(BQ, BK, WM, WN)`.
 ///
 /// `Err` for a head dim the kernel does not instantiate, and for f32 at 512

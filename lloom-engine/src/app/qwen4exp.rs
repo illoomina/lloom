@@ -28,6 +28,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use lloom::generation::{LogitsProcessor, Sampling};
+use lloom::load_warning::{LoadWarning, LoadWarningKind};
 use lloom::models::qwen4exp::loader::{
     LoadOptions as ModelLoad, SlotBudget, StreamLoader, StreamOptions,
 };
@@ -132,6 +133,8 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     hotlist: Option<PathBuf>,
     /// The tier's load-time description (`[loaded …]`, `/health`).
     tier: Value,
+    /// The load's degradations (`Served::load_warnings`).
+    load_warnings: Vec<LoadWarning>,
     single: Mutex<Single>,
     /// `--batch N`: the scheduler and its thread.
     sched: Option<BatchHandle<Qwen4Exp<R>, ()>>,
@@ -180,11 +183,7 @@ fn resolve_readback(
             ),
         ),
         ReadbackArm::Ring(ring) => {
-            let why = no_fill.or((!crate::options::stamps_each_token(ring)).then_some(
-                "a deferred EOS read on the fixed cadence stamps once per window, and the fill \
-                 waits on each token's stamp",
-            ));
-            let note = match why {
+            let note = match reads_fed_id_back(ring, no_fill) {
                 Some(why) => format!(
                     "{}: each decode forward reads its fed id back ({why}) — correct, and slower \
                      than blocking where measured (expert-streaming.md §20.13b)",
@@ -201,6 +200,18 @@ fn resolve_readback(
         }
         other => (other, None),
     }
+}
+
+/// Why a ring arm's decode forwards read their fed id back rather than
+/// taking the PLE from the driver's host fill; `None` when the fill runs.
+fn reads_fed_id_back(
+    ring: crate::decode::RingArm,
+    no_fill: Option<&'static str>,
+) -> Option<&'static str> {
+    no_fill.or((!crate::options::stamps_each_token(ring)).then_some(
+        "a deferred EOS read on the fixed cadence stamps once per window, and the fill waits on \
+         each token's stamp",
+    ))
 }
 
 /// `first` plus its `-0000k-of-0000N` siblings, in shard order.
@@ -391,9 +402,18 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         let model_name = opts
             .model_name
             .unwrap_or_else(|| model_name_from_dir(&tokenizer_dir));
-        let (readback, note) = resolve_readback(opts.readback, host_fill_absent(&model, &device));
+        let no_fill = host_fill_absent(&model, &device);
+        let (readback, note) = resolve_readback(opts.readback, no_fill);
+        let mut load_warnings = Vec::new();
         if let Some(note) = note {
             eprintln!("[readback {note}]");
+            // Only the arm that reads its fed id back is slower than asked;
+            // `auto`'s resolution and the host fill are the arm as asked.
+            if let ReadbackArm::Ring(ring) = readback {
+                if reads_fed_id_back(ring, no_fill).is_some() {
+                    load_warnings.push(LoadWarning::new(LoadWarningKind::Readback, note));
+                }
+            }
         }
         let mtp = opts.mtp.is_some();
         if mtp && model.mtp_head().is_none() {
@@ -435,6 +455,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
             mtp_k: opts.mtp_k.max(1),
             hotlist: opts.hotlist.clone(),
             tier,
+            load_warnings,
             single: Mutex::new(Single {
                 seq: Some(Sequence::new(cache)),
                 rings: Some(RingPool::new()),
@@ -874,6 +895,14 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
     }
     fn capabilities(&self) -> super::family::Capabilities {
         super::family::QWEN4EXP_CAPABILITIES
+    }
+    fn load_warnings(&self) -> Vec<LoadWarning> {
+        let mut w = self.load_warnings.clone();
+        w.extend(lloom::load_warning::emulated(&self.device));
+        w
+    }
+    fn note_load_warnings(&mut self, warnings: Vec<LoadWarning>) {
+        self.load_warnings.splice(0..0, warnings);
     }
     fn encode(&self, text: &str, _add_special: bool) -> Result<Vec<u32>> {
         // No BOS on this checkpoint: the template starts with the turn tag.

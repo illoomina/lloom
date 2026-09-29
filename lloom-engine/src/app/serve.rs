@@ -222,6 +222,7 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 let mut body = shared.engine.health();
                 body["mem"] = MemSnapshot::read(shared.engine.device()).json();
                 body["capabilities"] = shared.engine.capabilities().json();
+                body["load_warnings"] = load_warnings_json(shared.engine.as_ref());
                 body["chat_template_reads"] = ENGINE_KWARGS
                     .iter()
                     .map(|&k| (k.to_string(), json!(shared.engine.template_reads(k))))
@@ -230,7 +231,11 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 let _ = respond_json(request, 200, &body);
             }
             (Method::Get, "/v1/models") => {
-                let _ = respond_json(request, 200, &models_body(&shared.model_name));
+                let _ = respond_json(
+                    request,
+                    200,
+                    &models_body(&shared.model_name, shared.engine.as_ref()),
+                );
             }
             (Method::Post, "/eval/abort") => {
                 let _ = handle_abort(&shared, request);
@@ -1652,11 +1657,26 @@ fn render_request(
     Ok((rendered.text, facts))
 }
 
-fn models_body(model_name: &str) -> Value {
+fn models_body(model_name: &str, engine: &dyn Served) -> Value {
     json!({
         "object": "list",
-        "data": [{ "id": model_name, "object": "model", "created": now(), "owned_by": "lloom" }],
+        "data": [{
+            "id": model_name,
+            "object": "model",
+            "created": now(),
+            "owned_by": "lloom",
+            "load_warnings": load_warnings_json(engine),
+        }],
     })
+}
+
+/// The load's degradations as `[{kind, message}]` (`Served::load_warnings`).
+fn load_warnings_json(engine: &dyn Served) -> Value {
+    engine
+        .load_warnings()
+        .iter()
+        .map(|w| json!({ "kind": w.kind.name(), "message": w.message }))
+        .collect()
 }
 
 // ---- `lloom bench` ---------------------------------------------------------------

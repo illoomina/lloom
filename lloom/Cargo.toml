@@ -130,6 +130,12 @@ name = "tiny_value_law"
 name = "ple_fill_probe"
 required-features = ["metal"]
 
+# The widened FlashDecoding head dims against the kernel a route takes
+# without them (`docs/porting-models.md` §21.8).
+[[example]]
+name = "attn_decode_ab"
+required-features = ["metal"]
+
 [[example]]
 name = "ple_window_probe"
 required-features = ["metal"]

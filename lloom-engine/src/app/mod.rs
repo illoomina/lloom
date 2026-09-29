@@ -172,13 +172,19 @@ pub fn detect_family(model: Option<&Path>) -> Result<Family> {
 /// an EOS gate the executor arms cannot run, are named here with their
 /// reasons, beside the arm the loaded line renders.
 pub fn load_engine(model: &ModelArgs, mut shape: Shape) -> Result<(Box<dyn Served>, PathBuf)> {
+    use lloom::load_warning::{LoadWarning, LoadWarningKind};
+    let mut notes = Vec::new();
     if let Some(note) = shape.decode.readback.adaptive_clamp() {
         eprintln!("[readback: {note}]");
+        notes.push(LoadWarning::new(LoadWarningKind::Readback, note));
     }
     if let Some(note) = clamp_eos_gate(&mut shape) {
         eprintln!("[readback: {note}]");
+        notes.push(LoadWarning::new(LoadWarningKind::Readback, note));
     }
-    family::load(model, shape)
+    let (mut engine, path) = family::load(model, shape)?;
+    engine.note_load_warnings(notes);
+    Ok((engine, path))
 }
 
 /// Turn the EOS gate off where the executor arms refuse it

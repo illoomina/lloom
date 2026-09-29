@@ -33,10 +33,10 @@ use anyhow::{Context, Result};
 use hf_chat_template::ChatTemplate;
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::lfm2::{
-    AttnImpl, BatchPool, Cache, Config, ConvState, KvAppend, Lfm2Config, MemoryBudget, Model,
-    QkvLayout,
+    AttnImpl, BatchPool, Cache, Config, KvAppend, Lfm2Config, MemoryBudget, Model,
 };
 use lloom::models::lfm2_dspark::{CtxKv, DSparkConfig, DSparkDrafter, DSparkSpeculator};
+use lloom::models::lfm2_presets as presets;
 use lloom::models::lfm2_vl::{ImageProcessor, Lfm2VlConfig, VisionEncoder};
 use lloom::nn::var_builder::{LoadRecord, RecordingBackend};
 use lloom::nn::{DecodeOptions, DecodeOut, ReuseAction, Sequence, Session, VarBuilder};
@@ -475,13 +475,13 @@ impl Engine {
         // model.<axis>=<arm>`), applied over it in key order.
         match opts.model.cache.as_str() {
             "auto" => match &dcfg {
-                Some(dcfg) if pooled => pool_spec_config(&mut config, dcfg),
-                Some(dcfg) => rewindable_config(&mut config, dcfg.max_draft(), dcfg.tap_layers()),
-                None if pooled => pool_config(&mut config),
-                None => crown_config(&mut config),
+                Some(dcfg) if pooled => presets::pool_spec(&mut config, dcfg),
+                Some(dcfg) => presets::rewindable(&mut config, dcfg.max_draft(), dcfg.tap_layers()),
+                None if pooled => presets::pool(&mut config),
+                None => presets::crown(&mut config),
             },
-            "crown" => crown_config(&mut config),
-            "pool" => pool_config(&mut config),
+            "crown" => presets::crown(&mut config),
+            "pool" => presets::pool(&mut config),
             // Without a drafter the speculative body's cache runs K = 1, so
             // the cost of leaving the crown separates from the verify loop's;
             // its taps are the 2.6B drafter's (the same per-token capture), or
@@ -489,11 +489,11 @@ impl Engine {
             // the ring's. The ring is sized for a `--dspark-k` window (the
             // drafter's block, 9, by default).
             "rewindable" => match &dcfg {
-                Some(dcfg) => rewindable_config(&mut config, dcfg.max_draft(), dcfg.tap_layers()),
+                Some(dcfg) => presets::rewindable(&mut config, dcfg.max_draft(), dcfg.tap_layers()),
                 None => {
                     let two_six = DSparkConfig::lfm2_2_6b();
                     let k = opts.dspark_k.unwrap_or(two_six.max_draft());
-                    rewindable_config(&mut config, k, two_six.tap_layers())
+                    presets::rewindable(&mut config, k, two_six.tap_layers())
                 }
             },
             "rewindable-notap" => match &dcfg {
@@ -505,11 +505,11 @@ impl Engine {
                     let k = opts
                         .dspark_k
                         .unwrap_or(DSparkConfig::lfm2_2_6b().max_draft());
-                    rewindable_config(&mut config, k, Vec::new())
+                    presets::rewindable(&mut config, k, Vec::new())
                 }
             },
             "pool-spec" => match &dcfg {
-                Some(dcfg) => pool_spec_config(&mut config, dcfg),
+                Some(dcfg) => presets::pool_spec(&mut config, dcfg),
                 None => anyhow::bail!("--cache pool-spec needs --dspark"),
             },
             other => anyhow::bail!(
@@ -2220,46 +2220,6 @@ fn static_dspark_body<'a, 'm>(
     Ok(outs)
 }
 
-/// The crown decode configuration `--cache crown` bakes in: the
-/// `Sdpa × InPlace × Shuffle` arms and the GEMV/conv fusions, every one
-/// token-identical to the generic path (§13.5, §12.2d, §12.2h). The library's
-/// `Config` ships the conservative arms (§7.1a); a serving binary turns the
-/// measured ones on.
-/// The rows' shared-pool configuration (`--rows pool`, `batched-decode-design.md`
-/// §12.2): the paged pool the slot-indexed kernels read, the in-place ring
-/// they write, the crown's fused epilogues.
-fn pool_config(config: &mut Config) {
-    // The fused q/k/v layout (`lfm2-chat --qkv-layout=fused`): no `.contiguous()`
-    // copies of the three views at decode — the norms read the transposed view
-    // strided and V lands in the slab directly; bit for bit the contiguous path.
-    // Measured on the serving line (#148, the B=1 defaults pass, record §8):
-    // lfm2-chat 64.0 / 63.7 vs 63.6 / 63.5, the server's B=1 cell 63.1 / 63.1 /
-    // 63.2 vs 62.8 / 63.0 / 63.0 (six alternations) — +0.2–0.3 tok/s, every
-    // pair the same way; a wash at B=8 (235.3 / 232.2 vs 235.6 / 234.6).
-    config.qkv_layout = QkvLayout::Fused;
-    config.attn_impl = AttnImpl::FlashDecoding;
-    config.kv_append = KvAppend::Paged;
-    config.conv_state = ConvState::RotatingRing { k: 1 };
-    config.gemv_silu = true;
-    config.gemv_residual = true;
-    config.conv_fused = true;
-}
-
-/// The pool arms under `--dspark` (§12.4): the paged pool and the flash
-/// read, a ring wide enough for the verify window, the drafter's taps.
-fn pool_spec_config(config: &mut Config, dcfg: &DSparkConfig) {
-    let k = dcfg.max_draft();
-    config.qkv_layout = QkvLayout::Fused;
-    config.attn_impl = AttnImpl::FlashDecoding;
-    config.kv_append = KvAppend::Paged;
-    config.conv_state = ConvState::RotatingRing { k: k + 1 };
-    config.gemv_silu = true;
-    config.gemv_residual = true;
-    config.conv_fused = true;
-    config.tap_dtype = DType::F32;
-    config.tap_layers = dcfg.tap_layers();
-}
-
 /// The shapes the quantized KV arms have no path on, refused by the flags that
 /// select them, from the config the preset and the overrides resolved to: the
 /// paged pool (the model's `Cache` has no quantized arm for it) and a device
@@ -2288,40 +2248,6 @@ fn refuse_kv_quant_shape(config: &Config, device: &Device, batch: usize) -> Resu
         );
     }
     Ok(())
-}
-
-fn crown_config(config: &mut Config) {
-    // The fused q/k/v layout (`lfm2-chat --qkv-layout=fused`): no `.contiguous()`
-    // copies of the three views at decode — the norms read the transposed view
-    // strided and V lands in the slab directly; bit for bit the contiguous path.
-    // Measured on the serving line (#148, the B=1 defaults pass, record §8):
-    // lfm2-chat 64.0 / 63.7 vs 63.6 / 63.5, the server's B=1 cell 63.1 / 63.1 /
-    // 63.2 vs 62.8 / 63.0 / 63.0 (six alternations) — +0.2–0.3 tok/s, every
-    // pair the same way; a wash at B=8 (235.3 / 232.2 vs 235.6 / 234.6).
-    config.qkv_layout = QkvLayout::Fused;
-    config.attn_impl = AttnImpl::Sdpa;
-    config.kv_append = KvAppend::InPlace;
-    config.conv_state = ConvState::Shuffle;
-    config.gemv_silu = true;
-    config.gemv_residual = true;
-    config.conv_fused = true;
-}
-
-/// The REWINDABLE configuration the speculative body needs: `Cache::advance`
-/// rewinds only under a rotating ring wide enough for a `k`-token verify
-/// window (the shuffle is destructive) and `Cache::resolve` only under
-/// `InPlace` (the `Cat` arm has no length to rewind); `taps` feed the
-/// drafter's projection at F32 (§10.2m).
-fn rewindable_config(config: &mut Config, k: usize, taps: Vec<usize>) {
-    config.qkv_layout = QkvLayout::Fused;
-    config.attn_impl = AttnImpl::Sdpa;
-    config.kv_append = KvAppend::InPlace;
-    config.conv_state = ConvState::RotatingRing { k: k + 1 };
-    config.gemv_silu = true;
-    config.gemv_residual = true;
-    config.conv_fused = true;
-    config.tap_dtype = DType::F32;
-    config.tap_layers = taps;
 }
 
 /// Whether the conv's left-context carry must be on: a prefill fed in more
@@ -2586,27 +2512,6 @@ mod tests {
             drafter_ctx_kv(CtxKv::Contiguous, false, false, 4),
             CtxKv::Contiguous
         );
-    }
-
-    /// The rewindable preset's ring holds the verify window, and its taps are
-    /// whatever the caller names (none on `rewindable-notap`).
-    #[test]
-    fn the_rewindable_preset_sizes_the_ring_for_k() {
-        let mut c = Config::default();
-        rewindable_config(&mut c, 9, vec![3, 10]);
-        assert_eq!(c.conv_state, ConvState::RotatingRing { k: 10 });
-        assert_eq!(
-            (c.attn_impl, c.kv_append),
-            (AttnImpl::Sdpa, KvAppend::InPlace)
-        );
-        assert_eq!(
-            (c.tap_dtype, c.tap_layers.clone()),
-            (DType::F32, vec![3, 10])
-        );
-        let mut c = Config::default();
-        rewindable_config(&mut c, 3, Vec::new());
-        assert_eq!(c.conv_state, ConvState::RotatingRing { k: 4 });
-        assert!(c.tap_layers.is_empty());
     }
 
     fn config(quant: KvQuant, append: KvAppend) -> Config {

@@ -59,7 +59,8 @@ use anyhow::{Context, Result};
 use candle::metal_backend::ArenaLayout;
 use candle::{DType, Device, IndexOp, Tensor};
 use candle_examples::lfm2_setup::{default_model_dir, parse_config, tensor_names, weight_files};
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::lfm2::{AttnImpl, Cache, ConvState, KvAppend, Model};
 use lloom::nn::ops::KvQuant;
@@ -284,6 +285,22 @@ struct Args {
     /// `Sdpa × arena`, which is why #105's C6 reports counts rather than digests.
     #[arg(long, default_value = "generic")]
     attn: String,
+
+    /// The configuration preset the axis flags apply over: `none` (this
+    /// harness's defaults, the canonical §2.3.8c pairs), `crown` (what `lloom
+    /// chat` decodes at one sequence, whose conv runs the fused step
+    /// `shortconv_step`) or `pool` (the rows' preset, the fused ring step
+    /// `shortconv_ring`).
+    ///
+    /// **The presets are the engine's own functions**
+    /// (`lloom::models::lfm2_presets`), so a gate run on one follows the preset
+    /// as it changes instead of a flag list kept beside it. Under a preset only
+    /// the axis flags given on the command line override it, and the conv
+    /// carry across a turn-boundary prefill is on, as the engine's default
+    /// prefill tile resolves it. The resolved axes are printed on the `axes:`
+    /// line, in the form `lloom chat` prints them.
+    #[arg(long, default_value = "none")]
+    preset: String,
 
     /// KV tokens per page for `--attn flash` — the **allocation** granularity.
     ///
@@ -530,6 +547,27 @@ struct Args {
     icb_replay_barriers: String,
 }
 
+/// The `Args` fields that set a `Config` field, by clap id: under `--preset`
+/// only these, given on the command line, override the preset. A flag missing
+/// here is refused by the check after resolution rather than silently lost.
+const AXIS_FLAGS: [&str; 15] = [
+    "attn",
+    "flash_page_size",
+    "flash_k",
+    "flash_scratch_sizing",
+    "kv_append",
+    "kv_quant",
+    "conv_state",
+    "silu_impl",
+    "gemv_silu",
+    "gemv_residual",
+    "gemv_gate",
+    "conv_fused",
+    "conv_prefill_ctx",
+    "qkv_layout",
+    "fusion",
+];
+
 /// Follow-up prompts for multi-turn mode, cycled in order.
 ///
 /// Fixed and content-free with respect to the measurement: they exist to keep
@@ -604,7 +642,9 @@ fn parse_forced_tokens(raw: &str) -> Result<Vec<u32>> {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches)?;
+    let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
 
     if args.self_test {
         sha256::self_test().map_err(|e| anyhow::anyhow!("sha256 self-test failed: {e}"))?;
@@ -660,11 +700,23 @@ fn main() -> Result<()> {
         .with_context(|| format!("reading {}", model_dir.join("config.json").display()))?;
     let mut config = parse_config(&config_raw)?;
 
+    // The preset first, then the axis flags over it: every flag when there is
+    // no preset (the canonical pairs, byte for byte what this harness always
+    // resolved), only the flags given on the command line when there is one.
+    let preset = candle_examples::lfm2_setup::preset(&args.preset)?;
+    let mut preset_config = config.clone();
+    if let Some(apply) = preset {
+        apply(&mut preset_config);
+        preset_config.conv_prefill_ctx = true;
+        config = preset_config.clone();
+    }
+    let set = |id: &str| preset.is_none() || given(id);
+
     // Refused rather than defaulted. A silent fallback would report the generic
     // path's digests under the sdpa arm's name, and the whole point of this run
     // is to tell those two apart -- #69's vacuous determinism run is exactly the
     // failure this avoids (§2.4).
-    config.attn_impl = match args.attn.as_str() {
+    let attn = match args.attn.as_str() {
         "generic" => AttnImpl::Generic,
         "sdpa" => AttnImpl::Sdpa,
         // Issue #116. Selectable and never a default: 10.4's argument for it
@@ -673,34 +725,52 @@ fn main() -> Result<()> {
         "flash" => AttnImpl::FlashDecoding,
         other => anyhow::bail!("--attn must be `generic`, `sdpa` or `flash`, got `{other}`"),
     };
-    config.flash_page_size = args.flash_page_size;
-    config.flash_pages_per_chunk = args.flash_k;
+    if set("attn") {
+        config.attn_impl = attn;
+    }
+    if set("flash_page_size") {
+        config.flash_page_size = args.flash_page_size;
+    }
+    if set("flash_k") {
+        config.flash_pages_per_chunk = args.flash_k;
+    }
     // §9.1a's sizing policy (#234). Refused rather than defaulted, for the same
     // reason as `--attn`: a silently-ignored flag makes a gate report on an arm
     // it did not run (§2.4).
-    config.flash_scratch_sizing =
-        lloom::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
-            .map_err(anyhow::Error::msg)?;
+    let sizing = lloom::nn::ops::FlashScratchSizing::parse(&args.flash_scratch_sizing)
+        .map_err(anyhow::Error::msg)?;
+    if set("flash_scratch_sizing") {
+        config.flash_scratch_sizing = sizing;
+    }
     println!("attention implementation: {:?}", config.attn_impl);
     // Refused rather than defaulted, for the same reason as `--attn`: an
     // unrecognized value that silently pinned the default would report the
     // `cat` arm's digest under the `in-place` arm's name, which is #69's
     // vacuous run (§2.4, §9.2f).
-    config.kv_append = match args.kv_append.as_str() {
+    let kv_append = match args.kv_append.as_str() {
         "paged" => lloom::models::lfm2::KvAppend::Paged,
         "cat" => KvAppend::Cat,
         "in-place" => KvAppend::InPlace,
         other => anyhow::bail!("--kv-append must be `cat` or `in-place`, got `{other}`"),
     };
+    if set("kv_append") {
+        config.kv_append = kv_append;
+    }
     println!("kv append: {:?}", config.kv_append);
 
     // Refused rather than defaulted, for `--kv-append`'s reason: an
     // unrecognized value that silently pinned the default would report the f16
     // arm's digest under a quantized arm's name, which is #69's vacuous run.
-    config.kv_quant = KvQuant::parse(&args.kv_quant).map_err(anyhow::Error::msg)?;
+    let kv_quant = KvQuant::parse(&args.kv_quant).map_err(anyhow::Error::msg)?;
+    if set("kv_quant") {
+        config.kv_quant = kv_quant;
+    }
     println!("kv quant: {:?}", config.kv_quant);
 
-    config.conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    let conv_state = ConvState::parse(&args.conv_state).map_err(anyhow::Error::msg)?;
+    if set("conv_state") {
+        config.conv_state = conv_state;
+    }
     println!("conv state: {:?}", config.conv_state);
 
     // #599's SiLU arm. Refused rather than defaulted, for `--conv-state`'s
@@ -720,24 +790,43 @@ fn main() -> Result<()> {
     // so setting it here (rather than calling `set_silu_impl` directly) is what
     // makes the run record it. Setting the atomic directly would be clobbered by
     // `Model::new`'s push of `config.silu_impl`.
-    config.silu_impl = silu;
-    println!("silu impl: {}", silu.name());
+    if set("silu_impl") {
+        config.silu_impl = silu;
+    }
+    println!("silu impl: {}", config.silu_impl.name());
 
     // The two GEMV epilogue fusions (#509's wiring of #484's and #509's
     // kernels). Printed whether or not they are set, because *inert* and
     // *unrecorded* are different facts (#241) and a digest is only
     // interpretable against the arm it was taken in (§2.3.7).
-    config.gemv_silu = args.gemv_silu;
-    config.gemv_residual = args.gemv_residual;
-    config.gemv_gate =
+    let gemv_gate =
         lloom::models::lfm2::GateFusion::parse(&args.gemv_gate).map_err(anyhow::Error::msg)?;
-    config.conv_fused = args.conv_fused;
-    config.conv_prefill_ctx = args.conv_prefill_ctx;
-    config.qkv_layout =
+    let qkv_layout =
         lloom::models::lfm2::QkvLayout::parse(&args.qkv_layout).map_err(anyhow::Error::msg)?;
-    println!("qkv layout: {:?}", config.qkv_layout);
-    config.fusion =
+    let fusion =
         lloom::models::lfm2::FusionPolicy::parse(&args.fusion).map_err(anyhow::Error::msg)?;
+    if set("gemv_silu") {
+        config.gemv_silu = args.gemv_silu;
+    }
+    if set("gemv_residual") {
+        config.gemv_residual = args.gemv_residual;
+    }
+    if set("gemv_gate") {
+        config.gemv_gate = gemv_gate;
+    }
+    if set("conv_fused") {
+        config.conv_fused = args.conv_fused;
+    }
+    if set("conv_prefill_ctx") {
+        config.conv_prefill_ctx = args.conv_prefill_ctx;
+    }
+    if set("qkv_layout") {
+        config.qkv_layout = qkv_layout;
+    }
+    println!("qkv layout: {:?}", config.qkv_layout);
+    if set("fusion") {
+        config.fusion = fusion;
+    }
     println!(
         "gemv epilogue: silu={} residual={} gate={} fusion={}",
         config.gemv_silu,
@@ -745,6 +834,25 @@ fn main() -> Result<()> {
         config.gemv_gate.name(),
         config.fusion.name()
     );
+    // The resolved axes, and under a preset a refusal when one moved with no
+    // flag asking for it: an axis this harness resolved but did not route
+    // through `set` would overwrite the preset with its own default, and the
+    // run would report the preset's name over a configuration it is not.
+    println!("preset: {} conv_fused={}", args.preset, config.conv_fused);
+    println!("axes: {}", config.axes_line());
+    if preset.is_some()
+        && !matches
+            .ids()
+            .any(|id| AXIS_FLAGS.contains(&id.as_str()) && given(id.as_str()))
+    {
+        anyhow::ensure!(
+            config.axes_line() == preset_config.axes_line(),
+            "--preset {} resolved to `{}`, the preset is `{}`",
+            args.preset,
+            config.axes_line(),
+            preset_config.axes_line()
+        );
+    }
 
     // The binding-style axis (issue #115). Set before any dispatch, and read
     // back from the crate rather than echoed from `args`, so the line printed is

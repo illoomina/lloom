@@ -155,6 +155,26 @@ pub fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(names.into_iter().map(|n| dir.join(n)).collect())
 }
 
+/// The preset a harness's `--preset` names: `None` for `none` (the harness's
+/// own axis defaults, which the canonical §2.3.8c pairs are taken under), else
+/// one of `lloom::models::lfm2_presets::NAMED`, the functions `lloom chat|serve`
+/// resolve `--cache` through. A harness applies the preset before its axis
+/// flags and lets only the flags given on the command line override it.
+///
+/// Refused rather than defaulted: an unknown name silently read as `none`
+/// would report the canonical arm's digests under the preset's name (§2.4).
+pub fn preset(name: &str) -> Result<Option<fn(&mut Config)>> {
+    use lloom::models::lfm2_presets::{by_name, NAMED};
+    if name == "none" {
+        return Ok(None);
+    }
+    by_name(name).map(Some).ok_or_else(|| {
+        Error::Msg(format!(
+            "--preset must be `none` or one of {NAMED:?}, got `{name}`"
+        ))
+    })
+}
+
 /// The newest LFM2.5-VL-3B snapshot in the HF cache, if one is there.
 ///
 /// The HF cache stores blobs as **symlinks**, so this tests for `config.json`

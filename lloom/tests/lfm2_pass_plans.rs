@@ -218,19 +218,19 @@ fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Resul
     // the served-pass count must not see them.
     //
     // What a served pass does ask the pool for is exact, and all of it is
-    // `Tensor::zeros`, which the Shared pool serves and no plan does: on the
-    // fresh tile the sequence's session state (each conv layer's carry, each
-    // attention layer's K and V), and on every tile each conv layer's ring
-    // padding (`ShortConv`'s carry). The private pool, which plans serve, is
-    // asked nothing; nor is any pool by a decode step.
+    // `Tensor::zeros`, which the Shared pool serves and no plan does: the
+    // sequence's session state on the fresh tile (each conv layer's carry,
+    // each attention layer's K and V), and nothing on a later tile, since the
+    // carry's padding is set in place in the state (`pass-plan-design.md`
+    // §18). The private pool, which plans serve, is asked nothing; nor is any
+    // pool by a decode step.
     let conv = cfg
         .layer_types
         .iter()
         .filter(|t| matches!(t, LayerType::Conv))
         .count() as u64;
     let attn = cfg.layer_types.len() as u64 - conv;
-    let tiles = 3u64;
-    let per_prompt = (conv + 2 * attn + conv * tiles, 0);
+    let per_prompt = (conv + 2 * attn, 0);
     let served_before = m.pass_plan_counters().unwrap().served;
     let requests_before = m.served_pass_pool_requests();
     m.trim_unused_buffers();
@@ -264,8 +264,7 @@ fn plans_serve_every_pass_shape_after_two_sightings_with_the_same_ids() -> Resul
         requests,
         (2 * per_prompt.0, 2 * per_prompt.1),
         "(shared, private) pool requests made inside the two prompts' served passes: \
-         beyond the session state and the ring padding, a served pass allocates from \
-         its plan alone ({c:?})"
+         beyond the session state, a served pass allocates from its plan alone ({c:?})"
     );
     assert!(
         allocs_after > allocs_before,

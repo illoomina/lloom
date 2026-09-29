@@ -98,7 +98,20 @@ impl<R: ExpertResidency> Layer<R> {
         cache: &mut Cache,
         device_plan: bool,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
-        self.decode_parts_rows(res_hc, l, &mut [cache], device_plan)
+        self.decode_parts_rows_with(res_hc, l, &mut [cache], device_plan, &mut ())
+    }
+
+    /// [`Self::decode_parts_planned`] with `hook` at the MoE's join points
+    /// (`moe::PlanHook`) when the routed experts are planned on the device.
+    pub fn decode_parts_planned_with<H: super::moe::PlanHook>(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        cache: &mut Cache,
+        device_plan: bool,
+        hook: &mut H,
+    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+        self.decode_parts_rows_with(res_hc, l, &mut [cache], device_plan, hook)
     }
 
     /// [`Self::decode_parts_planned`] over `B` rows: `res_hc [B, 1, n·d]`,
@@ -111,6 +124,17 @@ impl<R: ExpertResidency> Layer<R> {
         l: usize,
         caches: &mut [&mut Cache],
         device_plan: bool,
+    ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
+        self.decode_parts_rows_with(res_hc, l, caches, device_plan, &mut ())
+    }
+
+    fn decode_parts_rows_with<H: super::moe::PlanHook>(
+        &self,
+        res_hc: &Tensor,
+        l: usize,
+        caches: &mut [&mut Cache],
+        device_plan: bool,
+        hook: &mut H,
     ) -> Result<(Tensor, Tensor, Tensor, Option<Tensor>)> {
         // HC prologue (attn bracket): collapse streams → mixer input.
         let (cur, inject) = self.hc_attn.mix(res_hc)?; // cur [B,1,d]
@@ -138,7 +162,7 @@ impl<R: ExpertResidency> Layer<R> {
         let (cur, inject) = self.hc_ffn.mix(&res_hc)?;
         trace("ffn.mix", l, &cur);
         let (moe_out, record) = if device_plan {
-            self.moe.decode_planned(&cur)?
+            self.moe.decode_planned_with(&cur, hook)?
         } else {
             (self.moe.decode(&cur)?, None)
         };
@@ -290,6 +314,14 @@ pub struct Cache {
     /// Decode passes that ran the host plan while the device plan was
     /// disarmed (the cold phase's length, in tokens).
     pub host_plan_passes: u64,
+    /// Host nanoseconds in the replays (`redos`) and in the disarmed
+    /// host-plan passes (`host_plan_passes`): the miss regime's two pass
+    /// kinds, timed only when they run.
+    pub replay_ns: u64,
+    pub host_pass_ns: u64,
+    /// Experts a settle loaded for layers past the first layer that missed:
+    /// their ids were routed from a carry already wrong at that layer.
+    pub settle_after_first: u64,
     /// The `(pos, seq)` the last `prepare_pass` sized and admitted, so the
     /// same pass prepared twice (driver, then `forward`'s chunk loop) reads
     /// the device once.
@@ -440,6 +472,9 @@ impl Cache {
             redos: 0,
             device_plan_armed: false,
             host_plan_passes: 0,
+            replay_ns: 0,
+            host_pass_ns: 0,
+            settle_after_first: 0,
             prepared: None,
         }
     }
@@ -811,6 +846,9 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// the layer itself measured worse than no hint: the reads were
     /// cancelled by the take, P20). `QWEN4EXP_SPEC_AHEAD` by default.
     spec_ahead: usize,
+    /// Spike 0's event (`JoinHook::Wait`), made at first use.
+    #[cfg(feature = "metal")]
+    spike0: std::sync::OnceLock<Option<std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>>>,
     cfg: Config,
 }
 
@@ -915,6 +953,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             memory_fraction: super::loader::DEFAULT_MEMORY_FRACTION,
             mem_check: MemCheck::from_env(),
             spec_ahead: spec_ahead_from_env(),
+            #[cfg(feature = "metal")]
+            spike0: std::sync::OnceLock::new(),
             cfg,
         }
     }
@@ -1862,7 +1902,9 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             if own {
                 cache.open_window()?;
             }
-            let logits = self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)?;
+            let logits = self
+                .decode_embed_pass(h, cache, obs, false)
+                .map(|(l, _)| l)?;
             if own {
                 cache.keep_standing();
             }
@@ -1873,12 +1915,14 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // with every expert resident; then the device plan, until it misses.
         if !cache.device_plan_armed {
             let before = self.stream_misses();
+            let t0 = std::time::Instant::now();
             cache.open_window()?;
             let logits = self
                 .decode_embed_pass(h, cache, obs, false)
                 .map(|(l, _)| l)?;
             cache.keep_standing();
             cache.host_plan_passes += 1;
+            cache.host_pass_ns += t0.elapsed().as_nanos() as u64;
             if self.stream_misses() == before {
                 cache.device_plan_armed = true;
             }
@@ -1894,19 +1938,24 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let h = &Self::replay_input(h)?;
         cache.open_window()?;
         let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
-        let redo = self.settle_records(&records)?;
+        let (redo, after_first) = self.settle_records(&records)?;
         if !redo {
             // The step's window stays open as the standing one.
             cache.keep_standing();
             return Ok(logits);
         }
+        cache.settle_after_first += after_first;
+        let t0 = std::time::Instant::now();
         self.note_replay();
         cache.rewind_window()?;
         cache.redos += 1;
         cache.device_plan_armed = false;
         cache.open_window()?;
-        let logits = self.decode_embed_pass(h, cache, obs, false).map(|(l, _)| l)?;
+        let logits = self
+            .decode_embed_pass(h, cache, obs, false)
+            .map(|(l, _)| l)?;
         cache.keep_standing();
+        cache.replay_ns += t0.elapsed().as_nanos() as u64;
         Ok(logits)
     }
 
@@ -1914,10 +1963,11 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// in ONE readback (a `cat` after the pass and one wait on its tail),
     /// then each layer's slice settled in layer order. Reading them one by
     /// one was 48 commits and waits a token on retired work (#749 P29).
-    /// `true` when any layer computed on a missing expert.
-    fn settle_records(&self, records: &[(usize, Tensor)]) -> Result<bool> {
+    /// `true` when any layer computed on a missing expert, and the experts
+    /// loaded for layers past the first one that did.
+    fn settle_records(&self, records: &[(usize, Tensor)]) -> Result<(bool, u64)> {
         if records.is_empty() {
-            return Ok(false);
+            return Ok((false, 0));
         }
         let flat: Vec<Tensor> = records
             .iter()
@@ -1929,7 +1979,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             let refs: Vec<&Tensor> = flat.iter().collect();
             Tensor::cat(&refs, 0)?.to_vec1()?
         };
-        let mut redo = false;
+        let mut parts: Vec<(&R, &[u32])> = Vec::with_capacity(records.len());
         let mut at = 0usize;
         for ((l, _), f) in records.iter().zip(&flat) {
             let n = f.elem_count();
@@ -1940,12 +1990,21 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     at + n
                 ))
             })?;
-            if self.layers[*l].moe().experts().settle_host(slice)? {
-                redo = true;
-            }
+            parts.push((self.layers[*l].moe().experts(), slice));
             at += n;
         }
-        Ok(redo)
+        let settled = R::settle_batch(&parts)?;
+        let mut redo = false;
+        let mut after_first = 0u64;
+        for (missed, n) in settled {
+            if missed {
+                if redo {
+                    after_first += n;
+                }
+                redo = true;
+            }
+        }
+        Ok((redo, after_first))
     }
 
     /// The streamed tier's misses so far, summed over the layers (0 for
@@ -1986,6 +2045,28 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
     }
 
+    /// The hook a device-planned decode pass runs at each layer's join
+    /// points: nothing, or spike 0's wait (`QWEN4EXP_SPIKE0=wait`).
+    fn join_hook(&self) -> Result<JoinHook> {
+        #[cfg(feature = "metal")]
+        if spike0_wait() {
+            if let Ok(m) = self.device().as_metal_device() {
+                let ring = self
+                    .spike0
+                    .get_or_init(|| {
+                        lloom_tensor::metal_backend::HostFedRing::new(m, 1, 1)
+                            .map(std::sync::Arc::new)
+                            .ok()
+                    })
+                    .clone()
+                    .ok_or_else(|| lloom_tensor::Error::Msg("spike 0: no event".into()))?;
+                let next = ring.base();
+                return Ok(JoinHook::Wait { ring, next });
+            }
+        }
+        Ok(JoinHook::Off)
+    }
+
     fn decode_embed_pass<O: ForwardObserver>(
         &self,
         h: &Tensor,
@@ -2019,6 +2100,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                                                                      // and handed to layer l+2's prefetcher: its misses read during
                                                                      // layers l+1 and l+2's mixer, landed at l+2's resolve.
         let hint = decode_hint_on() && !device_plan;
+        let mut join = self.join_hook()?;
         for (l, layer) in self.layers.iter().enumerate() {
             if probe {
                 for k in 0..4 {
@@ -2061,7 +2143,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
 
             let (next, mixed, moe_out, record) =
-                layer.decode_parts_planned(&res_hc, l, cache, device_plan)?;
+                layer.decode_parts_planned_with(&res_hc, l, cache, device_plan, &mut join)?;
             if let Some(r) = record {
                 records.push((l, r));
             }
@@ -2354,10 +2436,14 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             self.device_plan && plan_on_device() && caches.iter().all(|c| c.device_plan_armed);
         if !planned {
             let before = self.stream_misses();
+            // Timed only where a tier streams (the miss regime's pass).
+            let t0 = self.device_plan.then(std::time::Instant::now);
             let logits = self.decode_rows_pass(&h, &mut caches, false)?.0;
             let clean = self.stream_misses() == before;
+            let ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
             for c in caches.iter_mut() {
                 c.host_plan_passes += 1;
+                c.host_pass_ns += ns;
                 if clean {
                     c.device_plan_armed = true;
                 }
@@ -2369,20 +2455,27 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             c.open_window()?;
         }
         let (logits, records) = self.decode_rows_pass(&h, &mut caches, true)?;
-        let redo = self.settle_records(&records)?;
+        let (redo, after_first) = self.settle_records(&records)?;
         if !redo {
             for c in caches.iter_mut() {
                 c.resolve_window()?;
             }
             return Ok(logits);
         }
+        let t0 = std::time::Instant::now();
         self.note_replay();
         for c in caches.iter_mut() {
             c.rewind_window()?;
             c.redos += 1;
             c.device_plan_armed = false;
         }
-        Ok(self.decode_rows_pass(&h, &mut caches, false)?.0)
+        let logits = self.decode_rows_pass(&h, &mut caches, false)?.0;
+        let ns = t0.elapsed().as_nanos() as u64;
+        for c in caches.iter_mut() {
+            c.replay_ns += ns;
+            c.settle_after_first += after_first;
+        }
+        Ok(logits)
     }
 
     /// The layer stack over `B` rows from their embeddings `h [B, 1,
@@ -2570,18 +2663,26 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // rounds after it. Without this the speculative body — a prefill,
         // then verify windows, never a decode step — planned every round on
         // the host (P29 (9): 137 ms a round against the 40 ms step).
-        let misses_before = (!planned).then(|| self.stream_misses());
+        let misses_before = (!planned).then(|| {
+            (
+                self.stream_misses(),
+                self.device_plan.then(std::time::Instant::now),
+            )
+        });
         let (logits, records) = self.verify_pass(&h, cache, planned)?;
         let mut logits = logits;
-        if let Some(before) = misses_before {
+        if let Some((before, t0)) = misses_before {
             cache.host_plan_passes += 1;
+            cache.host_pass_ns += t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
             if self.device_plan && plan_on_device() && self.stream_misses() == before {
                 cache.device_plan_armed = true;
             }
         }
         if planned {
-            let redo = self.settle_records(&records)?;
+            let (redo, after_first) = self.settle_records(&records)?;
             if redo {
+                cache.settle_after_first += after_first;
+                let t0 = std::time::Instant::now();
                 self.note_replay();
                 // The host plan over the same window from the base.
                 let tokens_v = cache
@@ -2598,6 +2699,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                     w.tokens = tokens_v;
                 }
                 logits = self.verify_pass(&h, cache, false)?.0;
+                cache.replay_ns += t0.elapsed().as_nanos() as u64;
             }
         }
         let argmax = logits.argmax(D::Minus1)?.to_vec1::<u32>()?; // [T]
@@ -2691,6 +2793,42 @@ impl crate::nn::model::CacheShare for Cache {
     fn share_granularity(&self) -> usize {
         0
     }
+}
+
+/// Spike 0 of fetch-and-wait (`expert-streaming.md` §20.14): at every
+/// device-planned layer's join point — after the routed and the shared
+/// experts, before the combine, where the pass would wait for its misses —
+/// a GPU wait on an event the host has already raised. What the hit path
+/// pays for the wait alone, before any host round trip. An instrument
+/// (`QWEN4EXP_SPIKE0=wait`); `Off` compiles to nothing.
+enum JoinHook {
+    Off,
+    #[cfg(feature = "metal")]
+    Wait {
+        ring: std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>,
+        next: u64,
+    },
+}
+
+impl super::moe::PlanHook for JoinHook {
+    fn at_join(&mut self) -> Result<()> {
+        match self {
+            JoinHook::Off => Ok(()),
+            #[cfg(feature = "metal")]
+            JoinHook::Wait { ring, next } => {
+                *next += 1;
+                ring.signal(*next);
+                ring.encode_wait(*next)
+            }
+        }
+    }
+}
+
+/// `QWEN4EXP_SPIKE0=wait` (read once): spike 0's arm.
+#[cfg(feature = "metal")]
+fn spike0_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::tuning::tuning().stream.spike0 == "wait")
 }
 
 /// Whether the streamed tier's routed experts are planned on the device

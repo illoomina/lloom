@@ -23,6 +23,22 @@ use lloom_tensor::{DType, Module, Result, Tensor, D};
 
 pub use crate::nn::expert_stream::{ExpertResidency, Resident, RoutedGroup, Streamed};
 
+/// What a device-planned layer does at its two join points: right after
+/// the routed experts are planned (`after_plan`, handed the plan's record)
+/// and after the routed experts and the shared expert are encoded, before
+/// the combine (`at_join`) — where a pass that fetches its misses instead
+/// of replaying would wait for them. `()` does nothing and compiles away.
+pub trait PlanHook {
+    fn after_plan(&mut self, _record: &Tensor) -> Result<()> {
+        Ok(())
+    }
+    fn at_join(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl PlanHook for () {}
+
 /// One layer's MoE, generic over the residency strategy (static dispatch).
 #[derive(Debug, Clone)]
 pub struct MoeLayer<R: ExpertResidency> {
@@ -116,7 +132,27 @@ impl<R: ExpertResidency> MoeLayer<R> {
     /// pass if it computed on a missing expert. `None` record = the host
     /// plan ran (nothing to settle).
     pub fn decode_planned(&self, x: &Tensor) -> Result<(Tensor, Option<Tensor>)> {
-        self.forward_inner(x, true)
+        self.decode_planned_with(x, &mut ())
+    }
+
+    /// [`Self::decode_planned`] with `hook` run at the layer's join points
+    /// (see [`PlanHook`]); a host plan (no record) runs neither.
+    pub fn decode_planned_with<H: PlanHook>(
+        &self,
+        x: &Tensor,
+        hook: &mut H,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let r = self.prefill_route(x)?;
+        let Some((slot_ids, rec)) = self.experts.plan_device(&r.ids)? else {
+            let groups = self.experts.plan(&r.ids)?;
+            let y = self.routed_groups(&r.x3, &groups)?;
+            return Ok((self.finish(&r, &y)?, None));
+        };
+        hook.after_plan(&rec)?;
+        let y = self.routed_one_group(&r.x3, &slot_ids)?;
+        let (shared, sh_logit) = self.shared_expert(&r)?;
+        hook.at_join()?;
+        Ok((self.combine(&r, &y, &shared, &sh_logit)?, Some(rec)))
     }
 
     /// The router alone: the top-k expert ids `[seq, topk]` (u32) of `x
@@ -323,24 +359,42 @@ impl<R: ExpertResidency> MoeLayer<R> {
     /// The shared expert and the combine over the routed output `y [seq,
     /// topk, hidden]` → `[b, seq, hidden]`.
     fn finish(&self, r: &PrefillRouted, y: &Tensor) -> Result<Tensor> {
-        let (x1, w, seq, hidden, topk) = (&r.x1, &r.w, r.seq, r.hidden, r.topk);
         super::trace("moe.y", usize::MAX, y);
+        let (shared, sh_logit) = self.shared_expert(r)?;
+        self.combine(r, y, &shared, &sh_logit)
+    }
 
-        // Shared expert: SwiGLU gated by sigmoid(sh_router·x), always on.
+    /// The shared expert — SwiGLU, gated by `sigmoid(sh_router·x)`, always
+    /// on — and its gate's logit `[seq, 1]`.
+    fn shared_expert(&self, r: &PrefillRouted) -> Result<(Tensor, Tensor)> {
+        let x1 = &r.x1;
         let shared = swiglu(x1, &self.sh_gate, &self.sh_up, &self.sh_down)?;
         let sh_logit = self.sh_router.forward(x1)?.to_dtype(shared.dtype())?; // [seq, 1]
+        Ok((shared, sh_logit))
+    }
+
+    /// The routed combine over `y [seq, topk, hidden]` plus the gated
+    /// shared expert → `[b, seq, hidden]`.
+    fn combine(
+        &self,
+        r: &PrefillRouted,
+        y: &Tensor,
+        shared: &Tensor,
+        sh_logit: &Tensor,
+    ) -> Result<Tensor> {
+        let (x1, w, seq, hidden, topk) = (&r.x1, &r.w, r.seq, r.hidden, r.topk);
 
         // The routed combine over the top-k plus the gated shared expert: one
         // launch on Metal (`kernels::MoeCombine`), the composed five elsewhere.
         let y32 = y.to_dtype(DType::F32)?;
-        let out = match super::kernels::moe_combine(&y32, w, &shared, &sh_logit, topk, hidden) {
+        let out = match super::kernels::moe_combine(&y32, w, shared, sh_logit, topk, hidden) {
             Some(o) => o?.to_dtype(x1.dtype())?,
             None => {
                 let routed = y32
                     .broadcast_mul(&w.reshape((seq, topk, 1))?)?
                     .sum(1)?
                     .to_dtype(x1.dtype())?; // [seq, hidden]
-                let sh_gate_v = ops::sigmoid(&sh_logit)?;
+                let sh_gate_v = ops::sigmoid(sh_logit)?;
                 let shared = shared.broadcast_mul(&sh_gate_v)?;
                 (routed + shared)?
             }

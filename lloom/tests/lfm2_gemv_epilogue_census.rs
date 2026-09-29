@@ -27,14 +27,6 @@ use lloom::models::lfm2::{Cache, Config, GateFusion, KvAppend, LayerType, Model}
 use lloom::nn::VarBuilder;
 use lloom_tensor::{DType, Device, Result, Tensor};
 
-/// The dispatch census is process-wide (`profile::reset` / `snapshot`), and
-/// the test harness runs this file's tests on parallel threads: two decodes
-/// in flight at once read each other's dispatches into one snapshot (seen as
-/// `silu_f16: 2 -> 2` beside `gemv_*_silu: 0 -> 2` the moment a third test
-/// joined the file). Every census-reading test holds this for its whole
-/// off/on pair. `parking_lot`, per `CONTRIBUTING.md` §3.3a — test code too.
-static CENSUS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
 fn tiny_config(gemv_silu: bool, gemv_residual: bool) -> Config {
     tiny_config_with_gate(gemv_silu, gemv_residual, GateFusion::Off)
 }
@@ -127,12 +119,12 @@ fn build(cfg: &Config, dev: &Device) -> Result<Model> {
     Model::new(cfg, vb)
 }
 
-/// The per-label dispatch census **of one decode step**.
+/// The per-label dispatch census **of one decode step**, from `dev`'s own
+/// census: a test decoding beside it on another device lands nothing in it.
 ///
-/// The prompt is prefilled first and the counters reset afterwards, so what is
-/// counted is a decode token and not a prefill — which matters because prefill
-/// is a GEMM and would put `gemv` names in the census that no decode step
-/// dispatched.
+/// The prompt is prefilled before the window opens, so what is counted is a
+/// decode token and not a prefill — which matters because prefill is a GEMM
+/// and would put `gemv` names in the census that no decode step dispatched.
 fn decode_census(cfg: &Config, dev: &Device) -> Result<Vec<(String, u64)>> {
     let model = build(cfg, dev)?;
     let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
@@ -142,10 +134,11 @@ fn decode_census(cfg: &Config, dev: &Device) -> Result<Vec<(String, u64)>> {
     model.forward(&inp, 0, &mut cache)?;
     dev.synchronize()?;
 
-    // Reset AFTER the synchronize, per `profile::reset`'s own doc: an in-flight
-    // command buffer's completion handler fires later and would otherwise land
-    // in this window.
-    lloom_tensor::metal_backend::profile::reset();
+    let window = dev
+        .as_metal_device()?
+        .dispatch_census()
+        .open()
+        .expect("one census window on a fresh device");
 
     let step = Tensor::new(&[7u32], dev)?.reshape((1, 1))?;
     let logits = model.forward(&step, prompt.len(), &mut cache)?;
@@ -156,7 +149,7 @@ fn decode_census(cfg: &Config, dev: &Device) -> Result<Vec<(String, u64)>> {
         .to_vec1::<f32>()?;
     dev.synchronize()?;
 
-    Ok(lloom_tensor::metal_backend::profile::snapshot().by_label)
+    Ok(window.close())
 }
 
 fn count_matching(census: &[(String, u64)], pred: impl Fn(&str) -> bool) -> u64 {
@@ -186,7 +179,6 @@ fn dump(tag: &str, census: &[(String, u64)]) {
 /// and a delta-only test cannot see it.
 #[test]
 fn the_census_shows_gemv_silu_replacing_the_silu_dispatch() -> Result<()> {
-    let _serial = CENSUS.lock();
     if !lloom_tensor::metal_backend::profile::enabled() {
         eprintln!(
             "SKIPPED: this test reads the dispatch census, which is only \
@@ -253,7 +245,6 @@ fn the_census_shows_gemv_silu_replacing_the_silu_dispatch() -> Result<()> {
 /// which is recorded only under `CANDLE_METAL_PROFILE=1`.
 #[test]
 fn the_census_shows_gemv_residual_replacing_the_add_dispatch() -> Result<()> {
-    let _serial = CENSUS.lock();
     if !lloom_tensor::metal_backend::profile::enabled() {
         eprintln!(
             "SKIPPED: this test reads the dispatch census, which is only \
@@ -320,7 +311,6 @@ fn the_census_shows_gemv_residual_replacing_the_add_dispatch() -> Result<()> {
 /// store either way.
 #[test]
 fn the_census_shows_gemv_mul_replacing_the_gate_product_dispatch() -> Result<()> {
-    let _serial = CENSUS.lock();
     if !lloom_tensor::metal_backend::profile::enabled() {
         eprintln!(
             "SKIPPED: this test reads the dispatch census, which is only \
@@ -368,7 +358,6 @@ fn the_census_shows_gemv_mul_replacing_the_gate_product_dispatch() -> Result<()>
 /// `w1` and `w3` for two MLPs). No `gemv_*_silu`, no `gemv_*_mul` beside it.
 #[test]
 fn the_census_shows_gemv_swiglu_replacing_four_dispatches() -> Result<()> {
-    let _serial = CENSUS.lock();
     if !lloom_tensor::metal_backend::profile::enabled() {
         eprintln!(
             "SKIPPED: this test reads the dispatch census, which is only \

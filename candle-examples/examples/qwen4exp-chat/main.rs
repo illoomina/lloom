@@ -1063,6 +1063,69 @@ fn loaded_line<R: ExpertResidency + HasStreamStats>(
     mem_line(0, "loaded", device, None);
 }
 
+/// The prefetcher's counters for the run so far (cumulative over runs).
+fn prefetch_line<R: ExpertResidency + HasStreamStats>(
+    run: usize,
+    model: &Qwen4Exp<R>,
+    args: &Args,
+) {
+    let pf = model.prefetch_stats();
+    println!(
+        "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={} stage_read_gb_s={:.2} direct_read_gb_s={:.2}",
+        args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked,
+        pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
+        pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
+    );
+}
+
+/// The streamed tier's counters (cumulative over the process's runs) and
+/// the cache's (this run's): where a miss's host time went, by path.
+fn stream_line<R: ExpertResidency + HasStreamStats>(
+    run: usize,
+    model: &Qwen4Exp<R>,
+    args: &Args,
+    cache: &Cache,
+) {
+    let s = model.stream_stats();
+    println!(
+        "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0} settle_loads={} settle_ms={:.0} settle_clock_lag={} settle_after_first={} replay_ms={:.0} host_pass_ms={:.0} free_takes={} inplace_takes={} quarantined={} recycled={}",
+        args.loader,
+        model.slots_per_layer(),
+        s.plans,
+        s.groups,
+        s.hits,
+        s.misses,
+        s.evictions,
+        s.bytes_loaded,
+        s.hits as f64 / (s.hits + s.misses).max(1) as f64,
+        s.device_plans,
+        s.settled_misses,
+        s.prefetch_now,
+        cache.redos,
+        cache.host_plan_passes,
+        s.readback_ns as f64 / 1e6,
+        s.load_now_ns as f64 / 1e6,
+        s.land_ns as f64 / 1e6,
+        s.sync_load_ns as f64 / 1e6,
+        s.io_hints,
+        s.io_inflight_hits,
+        s.io_inflight_wasted,
+        s.io_inflight_landed,
+        s.direct_loads,
+        s.direct_wait_ns as f64 / 1e6,
+        s.settle_loads,
+        s.settle_ns as f64 / 1e6,
+        s.settle_clock_lag,
+        cache.settle_after_first,
+        cache.replay_ns as f64 / 1e6,
+        cache.host_pass_ns as f64 / 1e6,
+        s.free_takes,
+        s.inplace_takes,
+        s.quarantined,
+        s.recycled,
+    );
+}
+
 /// `--driver`: the prompt through `Session::decode` on the blocking arm —
 /// the loop `lloom serve` runs (`decode-driver-design.md` Stage 5/6) —
 /// with the same `RESULT` / `PROFILE` / `MEM` / `STREAM` lines as `gate`,
@@ -1133,8 +1196,14 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         let trace_on = trace_requested();
         let mut produced = 0usize;
         let mut traced: Vec<(usize, TraceStep)> = Vec::new();
+        // The tier's counters when the first token is out: what the prompt's
+        // prefill loaded, so the decode's share is the difference.
+        let mut pre: Option<lloom::nn::expert_stream::StreamStats> = None;
         let t1 = std::time::Instant::now();
         let mut on_tokens = |toks: &[u32]| -> candle::Result<()> {
+            if pre.is_none() {
+                pre = Some(model.stream_stats());
+            }
             if trace_on {
                 let before = produced;
                 produced += toks.len();
@@ -1225,18 +1294,22 @@ fn driver_gate<R: ExpertResidency + HasStreamStats>(
         }
         let s = model.stream_stats();
         if s.plans + s.device_plans > 0 {
-            println!(
-                "STREAM run={run} loader={} slots={} plans={} hits={} misses={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={}",
-                args.loader,
-                model.slots_per_layer(),
-                s.plans,
-                s.hits,
-                s.misses,
-                s.bytes_loaded,
-                s.hits as f64 / (s.hits + s.misses).max(1) as f64,
-                s.device_plans,
-                s.settled_misses,
-            );
+            prefetch_line(run, model, args);
+            if let Some(p) = pre {
+                println!(
+                    "STREAMPRE run={run} misses={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} settle_loads={} settle_ms={:.0} direct_loads={} direct_wait_ms={:.0}",
+                    p.misses,
+                    p.readback_ns as f64 / 1e6,
+                    p.load_now_ns as f64 / 1e6,
+                    p.land_ns as f64 / 1e6,
+                    p.sync_load_ns as f64 / 1e6,
+                    p.settle_loads,
+                    p.settle_ns as f64 / 1e6,
+                    p.direct_loads,
+                    p.direct_wait_ns as f64 / 1e6,
+                );
+            }
+            stream_line(run, model, args, session.sequence().cache());
         }
         greedy_digest = Some(digest);
     }
@@ -1540,20 +1613,13 @@ fn gate<R: ExpertResidency + HasStreamStats>(
             args.max_tokens,
             cfg.axes_line()
         );
-        let s = model.stream_stats();
         if args.experts == "stream" {
             let st = model.staging_stats();
             println!(
                 "STAGING run={run} buffers={} bytes={} allocations={} reuses={} overflows={}",
                 st.buffers, st.bytes, st.allocations, st.reuses, st.overflows
             );
-            let pf = model.prefetch_stats();
-            println!(
-                "PREFETCH run={run} on={} spec_ahead={} issued={} staged={} used={} wasted={} stale={} bytes={} parked={} stage_read_gb_s={:.2} direct_read_gb_s={:.2}",
-                args.prefetch, model.spec_ahead(), pf.issued, pf.staged, pf.used, pf.wasted, pf.stale, pf.bytes, pf.parked,
-                pf.stage_read_bytes as f64 / pf.stage_read_ns.max(1) as f64,
-                pf.direct_read_bytes as f64 / pf.direct_read_ns.max(1) as f64
-            );
+            prefetch_line(run, model, args);
             report_pass_plans(device);
             let dh = lloom::models::qwen4exp::Qwen4Exp::<lloom::models::qwen4exp::Streamed>::decode_hints();
             if dh > 0 {
@@ -1571,33 +1637,7 @@ fn gate<R: ExpertResidency + HasStreamStats>(
                     hr[0].1
                 );
             }
-            println!(
-                "STREAM run={run} loader={} slots={} plans={} groups={} hits={} misses={} evictions={} bytes_loaded={} hit_rate={:.4} device_plans={} settled_misses={} prefetch_now={} redos={} host_plan_passes={} readback_ms={:.0} load_now_ms={:.0} land_ms={:.0} sync_load_ms={:.0} io_hints={} io_inflight_hits={} io_inflight_wasted={} io_inflight_landed={} direct_loads={} direct_wait_ms={:.0}",
-                args.loader,
-                model.slots_per_layer(),
-                s.plans,
-                s.groups,
-                s.hits,
-                s.misses,
-                s.evictions,
-                s.bytes_loaded,
-                s.hits as f64 / (s.hits + s.misses).max(1) as f64,
-                s.device_plans,
-                s.settled_misses,
-                s.prefetch_now,
-                cache.redos,
-                cache.host_plan_passes,
-                s.readback_ns as f64 / 1e6,
-                s.load_now_ns as f64 / 1e6,
-                s.land_ns as f64 / 1e6,
-                s.sync_load_ns as f64 / 1e6,
-                s.io_hints,
-                s.io_inflight_hits,
-                s.io_inflight_wasted,
-                s.io_inflight_landed,
-                s.direct_loads,
-                s.direct_wait_ns as f64 / 1e6
-            );
+            stream_line(run, model, args, &cache);
         }
         if let Some((hits, misses)) = model.ple_cache_stats() {
             println!(

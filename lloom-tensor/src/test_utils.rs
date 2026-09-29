@@ -69,3 +69,37 @@ pub fn to_vec3_round(t: &Tensor, digits: i32) -> Result<Vec<Vec<Vec<f32>>>> {
         .collect();
     Ok(t)
 }
+
+/// A fixed number of meetings at a [`std::sync::Barrier`] that a thread keeps
+/// even when it fails: the meetings not yet made are made on drop, during
+/// unwinding too, so a peer that got further is never left waiting on a
+/// thread that returned an error or panicked.
+pub struct Rendezvous<'a> {
+    barrier: &'a std::sync::Barrier,
+    left: usize,
+}
+
+impl<'a> Rendezvous<'a> {
+    pub fn new(barrier: &'a std::sync::Barrier, meetings: usize) -> Self {
+        Self {
+            barrier,
+            left: meetings,
+        }
+    }
+
+    /// Wait at the barrier for the next meeting; nothing once all are made.
+    pub fn meet(&mut self) {
+        if self.left > 0 {
+            self.left -= 1;
+            self.barrier.wait();
+        }
+    }
+}
+
+impl Drop for Rendezvous<'_> {
+    fn drop(&mut self) {
+        while self.left > 0 {
+            self.meet();
+        }
+    }
+}

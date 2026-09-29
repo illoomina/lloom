@@ -76,6 +76,9 @@ fn parse_ctx_kv(v: &str) -> Result<String, String> {
 fn parse_hot_thread(v: &str) -> Result<String, String> {
     one_of(v, "hot thread", &["interactive", "default", "demote", "off", "0", "none"])
 }
+fn parse_spike0(v: &str) -> Result<String, String> {
+    one_of(v, "spike 0", &["off", "wait"])
+}
 fn parse_mem_check(v: &str) -> Result<String, String> {
     one_of(v, "mem check", &["off", "report", "refuse"])
 }
@@ -154,6 +157,9 @@ pub struct StreamTuning {
     /// Reader threads of the expert prefetcher (≥ 1; the SSD's rate flattens past eight).
     #[opt(flag = "prefetch-threads", env = "LLOOM_PREFETCH_THREADS", parser = "parse_at_least_one")]
     pub prefetch_threads: usize,
+    /// Pieces per plane a reader request covers (0 = an expert is one request, its planes read one after another).
+    #[opt(flag = "prefetch-split", env = "LLOOM_PREFETCH_SPLIT")]
+    pub prefetch_split: usize,
     /// Layers of lead the prefill's prefetcher runs ahead of the layer being computed (≥ 1).
     #[opt(flag = "prefetch-lead", env = "QWEN4EXP_PREFETCH_LEAD", parser = "parse_at_least_one")]
     pub prefetch_lead: usize,
@@ -166,6 +172,15 @@ pub struct StreamTuning {
     /// Score the residual-speculation hint against the real routing — an instrument (extra router runs and readbacks).
     #[opt(flag = "hint-recall", env = "QWEN4EXP_HINT_RECALL", bool)]
     pub hint_recall: bool,
+    /// Slots each streamed layer keeps free: a miss lands in one, an eviction is quarantined until its readers complete (0 = land in the victim's slot in place; the protocol a load beside the pass needs, off while none runs: each spare slot is one expert less cached).
+    #[opt(flag = "spare-slots", env = "QWEN4EXP_SPARE_SLOTS")]
+    pub spare_slots: usize,
+    /// A token's settle submits every layer's loads before waiting for any (off = one layer after another, the A/B arm).
+    #[opt(flag = "settle-batch", env = "QWEN4EXP_SETTLE_BATCH", bool)]
+    pub settle_batch: bool,
+    /// Spike 0 of fetch-and-wait: `wait` = a GPU wait on an already-raised event at every device-planned layer's join point (an instrument; off = none).
+    #[opt(flag = "spike0", env = "QWEN4EXP_SPIKE0", parser = "parse_spike0", variants = ["off", "wait"])]
+    pub spike0: String,
     /// Print every settle's ids, flags and misses — an instrument.
     #[opt(flag = "trace-settle", env = "QWEN4EXP_TRACE_SETTLE", bool)]
     pub trace_settle: bool,
@@ -177,10 +192,14 @@ impl Default for StreamTuning {
             pread_direct: false,
             // `nn::expert_prefetch::DEFAULT_THREADS` (metal-only module): 8.
             prefetch_threads: 8,
+            prefetch_split: 1,
             prefetch_lead: 2,
             plan: "device".into(),
             decode_hint: false,
             hint_recall: false,
+            spare_slots: 0,
+            settle_batch: true,
+            spike0: "off".into(),
             trace_settle: false,
         }
     }

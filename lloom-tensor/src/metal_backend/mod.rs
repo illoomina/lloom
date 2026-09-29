@@ -2988,6 +2988,7 @@ impl BackendDevice for MetalDevice {
             pass_plans: Arc::new(parking_lot::Mutex::new(None)),
             base_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pass_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            served_pass_pool_requests: Arc::new(Default::default()),
             emulated,
         })
     }

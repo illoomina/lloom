@@ -512,7 +512,7 @@ impl ResidencyMap {
         self.quarantine
             .drain_completed_into(completed, &mut self.recycled);
         let n = self.recycled.len();
-        self.free.extend(self.recycled.drain(..));
+        self.free.append(&mut self.recycled);
         n
     }
 
@@ -1081,22 +1081,28 @@ struct Pending {
     landed: Vec<(usize, usize, crate::nn::expert_prefetch::Staged)>,
     #[cfg(feature = "metal")]
     wait_value: u64,
-    /// The direct reads submitted: the ticket, the experts, the submit time.
     #[cfg(feature = "metal")]
-    direct: Option<(
-        crate::nn::expert_prefetch::DirectTicket,
-        u64,
-        std::time::Duration,
-    )>,
-    /// The ring reads submitted: the ticket, the `(expert, slot)`s asked
-    /// for, the submit time.
+    direct: Option<DirectInFlight>,
     #[cfg(feature = "metal")]
-    now: Option<(
-        crate::nn::expert_prefetch::NowTicket,
-        Vec<(usize, usize)>,
-        std::time::Duration,
-    )>,
+    now: Option<NowInFlight>,
 }
+
+/// Direct reads submitted: the ticket, the experts, the submit time.
+#[cfg(feature = "metal")]
+type DirectInFlight = (
+    crate::nn::expert_prefetch::DirectTicket,
+    u64,
+    std::time::Duration,
+);
+
+/// Ring reads submitted: the ticket, the `(expert, slot)`s asked for, the
+/// submit time.
+#[cfg(feature = "metal")]
+type NowInFlight = (
+    crate::nn::expert_prefetch::NowTicket,
+    Vec<(usize, usize)>,
+    std::time::Duration,
+);
 
 /// The routed experts streamed from the checkpoint into a slot pool (§20.6).
 pub struct Streamed {
@@ -1709,7 +1715,7 @@ impl Streamed {
                 if let Some(p) = &self.prefetch {
                     let t0 = std::time::Instant::now();
                     let settled = inner.completed_epochs();
-                    let (now, later): (Vec<(usize, usize)>, Vec<(usize, usize)>) = misses
+                    let (now, later): (Vec<_>, Vec<_>) = misses
                         .iter()
                         .copied()
                         .partition(|&(_, s)| inner.map.reader_epoch(s) < settled);

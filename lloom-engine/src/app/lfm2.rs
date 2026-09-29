@@ -23,6 +23,7 @@ use super::common::{
     lock, model_name_from_dir, ms, newest_snapshot, open_device, profile_reset, profile_take,
     DecodeTiming, MemGauge, MemReport, MemSnapshot, PrefillTiming, Text, NEVER_EOS,
 };
+use super::template::{Rendered, Template};
 use super::vision::{take_window, DecodedImage, ImageCensus, ImageRows};
 use crate::{
     ring_eos_read, spawn_batch, BatchConfig, BatchEvent, BatchHandle, BatchMode, BatchRequest,
@@ -30,7 +31,6 @@ use crate::{
     TextStream,
 };
 use anyhow::{Context, Result};
-use hf_chat_template::ChatTemplate;
 use lloom::generation::{LogitsProcessor, Sampling};
 use lloom::models::lfm2::{
     AttnImpl, BatchPool, Cache, Config, KvAppend, Lfm2Config, MemoryBudget, Model,
@@ -41,7 +41,7 @@ use lloom::models::lfm2_vl::{ImageProcessor, Lfm2VlConfig, VisionEncoder};
 use lloom::nn::var_builder::{LoadRecord, RecordingBackend};
 use lloom::nn::{DecodeOptions, DecodeOut, ReuseAction, Sequence, Session, VarBuilder};
 use lloom_tensor::{DType, Device, Tensor, D};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -630,10 +630,7 @@ impl Engine {
             .unwrap_or_default();
 
         let template = match std::fs::read_to_string(model_dir.join("chat_template.jinja")) {
-            Ok(src) => Some(
-                ChatTemplate::from_str(&src)
-                    .map_err(|e| anyhow::anyhow!("compiling chat_template.jinja: {e}"))?,
-            ),
+            Ok(src) => Some(Template::compile(&src)?),
             Err(_) => None,
         };
 
@@ -1052,27 +1049,26 @@ impl Engine {
         (0..n).map(|i| seed[(i + row * 7) % seed.len()]).collect()
     }
 
+    /// The checkpoint's own chat template.
+    pub fn template(&self) -> Result<&Template> {
+        self.text
+            .template
+            .as_ref()
+            .context("the checkpoint has no chat_template.jinja; /v1/chat/completions needs one")
+    }
+
     /// Render `messages` through the checkpoint's own chat template with the
-    /// generation prompt appended. `kwargs` are extra template variables
-    /// (`chat_template_kwargs`, e.g. `enable_thinking`).
-    pub fn render_chat(&self, messages: &Value, kwargs: Option<&Value>) -> Result<String> {
-        let template =
-            self.text.template.as_ref().context(
-                "the checkpoint has no chat_template.jinja; /v1/chat/completions needs one",
-            )?;
-        let mut ctx = json!({
-            "messages": messages,
-            "bos_token": self.text.bos_token,
-            "add_generation_prompt": true,
-        });
-        if let Some(Value::Object(extra)) = kwargs {
-            for (k, v) in extra {
-                ctx[k] = v.clone();
-            }
-        }
-        template
-            .render_context(&ctx)
-            .map_err(|e| anyhow::anyhow!("rendering the chat template: {e}"))
+    /// generation prompt appended, `kwargs` laid over the template's
+    /// variables and each of `checked` tested against it
+    /// (`Template::render_checked`).
+    pub fn render_checked(
+        &self,
+        messages: &Value,
+        kwargs: &Map<String, Value>,
+        checked: &[&str],
+    ) -> Result<Rendered> {
+        self.template()?
+            .render_checked(messages, &self.text.bos_token, kwargs, checked)
     }
 
     fn detok(&self) -> impl FnMut(&[u32]) -> lloom_tensor::Result<String> + '_ {
@@ -2409,8 +2405,16 @@ impl super::served::Served for Engine {
     fn token_str(&self, id: u32) -> String {
         Engine::token_str(self, id)
     }
-    fn render_chat(&self, messages: &Value, kwargs: Option<&Value>) -> Result<String> {
-        Engine::render_chat(self, messages, kwargs)
+    fn render_checked(
+        &self,
+        messages: &Value,
+        kwargs: &Map<String, Value>,
+        checked: &[&str],
+    ) -> Result<Rendered> {
+        Engine::render_checked(self, messages, kwargs, checked)
+    }
+    fn template_reads(&self, name: &str) -> Option<bool> {
+        self.text.template.as_ref()?.reads(name)
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         Engine::seed_prompt_row(self, n, row)

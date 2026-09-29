@@ -32,7 +32,7 @@ use lloom::generation::poll::PollMechanism;
 use lloom::generation::{
     Blocking, CommitBudget, EosRead, LogitsProcessor, ReadbackStrategy, Ring, Sampling,
 };
-use lloom::models::lfm2::{BatchPool, Cache, Config, Model};
+use lloom::models::lfm2::{BatchPool, Cache, Config, GateFusion, Model};
 use lloom::models::lfm2_dspark::{DSparkConfig, DSparkDrafter, DSparkSpeculator};
 use lloom::nn::{DecodeOptions, DecodeOut, IdentityProposer, PrefillOut, ReuseAction, Session};
 use lloom_tensor::{DType, Device};
@@ -1115,13 +1115,529 @@ impl BatchArm {
     }
 }
 
+/// Which kernels the solo arm's `m = 1` matmuls take: the shipping GEMV with
+/// the model's GEMV-only epilogues, or the batch's own GEMM. The batch is held
+/// to the solo stream bit for bit on the second and to tier 2 on the first,
+/// where a near-tie argmax may part across the seam
+/// (`batched-decode-design.md` §10.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoloKernels {
+    Gemv,
+    Gemm,
+}
+
+impl SoloKernels {
+    /// `--force-gemm m` (or `both`) with every GEMV-only epilogue the model
+    /// runs off — the model's, since `Fusion=Derived` decides them rather
+    /// than the config.
+    fn of(model: &Model, config: &Config) -> Self {
+        let forced = matches!(
+            lloom_tensor::tuning::tuning().gemm.force.as_deref(),
+            Some("m" | "both")
+        );
+        let (silu, residual, gate) = match model.fusion_report() {
+            Some(r) => (r.gemv_silu, r.gemv_residual, r.gemv_gate),
+            None => (config.gemv_silu, config.gemv_residual, config.gemv_gate),
+        };
+        if forced && !silu && !residual && gate == GateFusion::Off {
+            SoloKernels::Gemm
+        } else {
+            SoloKernels::Gemv
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SoloKernels::Gemv => "gemv",
+            SoloKernels::Gemm => "gemm",
+        }
+    }
+}
+
+/// The forward that produced one of a row's tokens: `forward` (the solo arm)
+/// or a batched step over `m` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Solo,
+    Rows(usize),
+}
+
+impl Pass {
+    /// The `m = 1` route: the GEMV, unless `--force-gemm m`.
+    fn single(self) -> bool {
+        matches!(self, Pass::Solo | Pass::Rows(1))
+    }
+}
+
+/// The pass behind each of a batched row's tokens `1..tokens` (entry `t - 1`;
+/// token 0 is the prefill's), from the live-row count of every step the row
+/// took part in. Under the lookahead the forward of the step that streams
+/// token `t - 1` produces token `t` over that step's rows; without it the
+/// forward runs after the readback over the rows kept, which are the next
+/// step's when no row joins. `None` when the count is short, or when prompt
+/// pieces ride the steps (`--prefill-chunk`): a ragged pass is not `m` rows.
+fn batched_passes(
+    batch_rows: &[usize],
+    lookahead: usize,
+    tokens: usize,
+    prefill_chunk: usize,
+) -> Option<Vec<Pass>> {
+    if prefill_chunk > 0 {
+        return None;
+    }
+    let shift = if lookahead > 0 { 1 } else { 0 };
+    (1..tokens)
+        .map(|t| batch_rows.get(t - shift).map(|&m| Pass::Rows(m)))
+        .collect()
+}
+
+/// The first token whose forward took the `m = 1` route on one arm and not
+/// on the other: where the two arms' GEMV/GEMM seam is first crossed.
+fn seam_crossed(a: &[Pass], b: &[Pass], through: usize) -> Option<usize> {
+    (1..=through).find(|&t| match (a.get(t - 1), b.get(t - 1)) {
+        (Some(x), Some(y)) => x.single() != y.single(),
+        _ => false,
+    })
+}
+
+/// A row's parting between two arms, re-derived: the prompt and the shared
+/// prefix replayed through each arm's own passes (`forward`, or `forward_rows`
+/// over `m` copies of the row — the batch's `m`, so its pipeline) in lockstep,
+/// both logit vectors read at every token up to the parting.
+#[derive(Debug, Clone, PartialEq)]
+struct Parting {
+    at: usize,
+    a_token: u32,
+    b_token: u32,
+    /// The first token whose argmax left that arm's stream, when the replay
+    /// did not reproduce it through `at`.
+    a_left: Option<usize>,
+    b_left: Option<usize>,
+    /// The copies of a batched row disagreed at some token.
+    copies_differ: bool,
+    /// Each path's logits for `(a_token, b_token)` at `at`.
+    a_logits: (f32, f32),
+    b_logits: (f32, f32),
+    /// How many tokens besides the path's own beat the other arm's token at
+    /// `at` on that path: 0 when it is the runner-up or tied with the leader.
+    a_others_above: usize,
+    b_others_above: usize,
+    /// max |Δlogit| between the paths at `at`, and over every token before it.
+    delta_at: f32,
+    delta_before: f32,
+    /// The widest step's max |Δlogit| through `at`, in ulps of the logits'
+    /// dtype at that step's logit scale (`max |logit|`).
+    ulps: f32,
+    /// The same, token by token `0..=at`: flat is a reordering, growing is
+    /// error accumulating (§2.3.5a).
+    trace: Vec<f32>,
+}
+
+/// The most the GEMV/GEMM seam may move a logit vector, in ulps of the dtype
+/// at the vector's scale: past 4× the widest reordering §2.3.5a measured on
+/// LFM2's logits (3.50 ulp) and two orders of magnitude below its measured
+/// defect (1840 ulp).
+const SEAM_ULPS: f32 = 16.0;
+
+/// The gap above `|x|` at the precision `dtype` carries (§2.3.5a's
+/// `logit_delta.py`, the same definition).
+fn ulp_at(x: f32, dtype: DType) -> f32 {
+    let bits = match dtype {
+        DType::F16 => 10,
+        DType::BF16 => 7,
+        _ => 23,
+    };
+    let x = x.abs();
+    if x == 0.0 {
+        return (2f32).powi(-24 - bits);
+    }
+    (2f32).powi(x.log2().floor() as i32 - bits)
+}
+
+/// max |a - b| in ulps of `dtype` at `a`'s scale.
+fn ulps_apart(a: &[f32], b: &[f32], dtype: DType) -> f32 {
+    let scale = a.iter().fold(0f32, |m, x| m.max(x.abs()));
+    max_abs_diff(a, b) / ulp_at(scale, dtype)
+}
+
+impl Parting {
+    /// A near-tie: both replays reproduce their arm's stream, the paths stay
+    /// within the seam's reach of each other (`SEAM_ULPS`), and at the parting
+    /// nothing but each path's own token stands above the other arm's —
+    /// runner-up, or tied with the leader and losing on the id.
+    fn is_near_tie(&self) -> bool {
+        self.a_left.is_none()
+            && self.b_left.is_none()
+            && !self.copies_differ
+            && self.ulps <= SEAM_ULPS
+            && self.a_others_above == 0
+            && self.b_others_above == 0
+    }
+
+    /// The widest step in the first and in the last `w` tokens of the trace,
+    /// `w` up to 50 (§2.3.5a's growth reading, `logit_delta.py`'s window).
+    fn growth(&self) -> (usize, f32, f32) {
+        let n = self.trace.len();
+        let w = 50.min(n / 2).max(1).min(n);
+        let widest = |s: &[f32]| s.iter().fold(0f32, |m, &x| m.max(x));
+        (w, widest(&self.trace[..w]), widest(&self.trace[n - w..]))
+    }
+
+    /// Each path's logits at the parting, `a`'s path first.
+    fn logits(&self, a: &str, b: &str) -> String {
+        format!(
+            "{a} path {} = {:.4}, {} = {:.4}; {b} path {} = {:.4}, {} = {:.4}",
+            self.a_token,
+            self.a_logits.0,
+            self.b_token,
+            self.a_logits.1,
+            self.a_token,
+            self.b_logits.0,
+            self.b_token,
+            self.b_logits.1
+        )
+    }
+}
+
+/// One row's comparison between two arms.
+#[derive(Debug, Clone, PartialEq)]
+enum RowVerdict {
+    Identical,
+    /// Tier 2: the arms' `m = 1` routes differ from token `seam` on, and the
+    /// row parts at a near-tie.
+    SeamTie {
+        seam: usize,
+        parting: Parting,
+    },
+    /// Not re-derivable from this run (`--prefill-chunk`, or a replay that
+    /// could not run); neither a pass nor a failure.
+    Unverified(String),
+    Differs(String),
+}
+
+impl RowVerdict {
+    fn name(&self) -> &'static str {
+        match self {
+            RowVerdict::Identical => "identical",
+            RowVerdict::SeamTie { .. } => "seam-tie",
+            RowVerdict::Unverified(_) => "unverified",
+            RowVerdict::Differs(_) => "differs",
+        }
+    }
+}
+
+/// What two arms of one row are held to. Bit for bit when the solo arm runs
+/// the batch's GEMM, or when both arms took the `m = 1` route at the same
+/// tokens up to the parting; otherwise tier 2, where the parting must
+/// re-derive as a near-tie (`replay`, called with the parting index).
+fn row_verdict(
+    kernels: SoloKernels,
+    a: &[u32],
+    b: &[u32],
+    passes: Option<(&[Pass], &[Pass])>,
+    replay: impl FnOnce(usize) -> Result<Parting>,
+) -> RowVerdict {
+    if a == b {
+        return RowVerdict::Identical;
+    }
+    let at = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    if at == a.len().min(b.len()) {
+        return RowVerdict::Differs(format!(
+            "one stream ends where the other goes on ({} against {} tokens)",
+            a.len(),
+            b.len()
+        ));
+    }
+    if kernels == SoloKernels::Gemm {
+        return RowVerdict::Differs(
+            "every forward runs the GEMM here, where the row is owed its stream bit for bit".into(),
+        );
+    }
+    let Some((pa, pb)) = passes else {
+        return RowVerdict::Unverified(
+            "the row's step record does not name its forwards (prompt pieces rode the steps, or \
+             the record is short)"
+                .into(),
+        );
+    };
+    let Some(seam) = seam_crossed(pa, pb, at) else {
+        return RowVerdict::Differs(format!(
+            "both arms took the same route at every token through {at}, where the row is owed \
+             its stream bit for bit"
+        ));
+    };
+    match replay(at) {
+        Ok(p) if p.is_near_tie() => RowVerdict::SeamTie { seam, parting: p },
+        Ok(p) => RowVerdict::Differs(format!(
+            "not a near-tie: the replay left the arms at {:?} / {:?}, copies differ {}, {} / {} \
+             other tokens above the other arm's, the paths {:.2} ulp apart (the seam's reach is \
+             {SEAM_ULPS}); {}",
+            p.a_left,
+            p.b_left,
+            p.copies_differ,
+            p.a_others_above,
+            p.b_others_above,
+            p.ulps,
+            p.logits("one arm's", "the other's")
+        )),
+        Err(e) => RowVerdict::Unverified(format!("the replay could not run: {e}")),
+    }
+}
+
+impl RowVerdict {
+    /// The verdict's word on the per-row line.
+    fn label(&self) -> &'static str {
+        match self {
+            RowVerdict::Identical => "IDENTICAL",
+            RowVerdict::SeamTie { .. } => "PARTS (tier 2)",
+            RowVerdict::Unverified(_) => "PARTS (not re-derived)",
+            RowVerdict::Differs(_) => "DIFFERS",
+        }
+    }
+
+    /// The verdict as a line prints it: `a` and `b` name the two arms, whose
+    /// streams run `a_len` and `b_len` tokens.
+    fn describe(&self, (a, a_len): (&str, usize), (b, b_len): (&str, usize), at: usize) -> String {
+        let why = match self {
+            RowVerdict::Identical => return self.label().into(),
+            RowVerdict::SeamTie { seam, parting: p } => format!(
+                "a near-tie across the GEMV/GEMM seam, crossed from token {seam}: {} (margins \
+                 {:.4} / {:.4}); max |Δlogit| between the paths {:.4} there, {:.4} before, at \
+                 most {:.2} ulp at the logit scale ({:.2} / {:.2} over the first / last {} tokens)",
+                p.logits(a, b),
+                p.a_logits.0 - p.a_logits.1,
+                p.b_logits.1 - p.b_logits.0,
+                p.delta_at,
+                p.delta_before,
+                p.ulps,
+                p.growth().1,
+                p.growth().2,
+                p.growth().0
+            ),
+            RowVerdict::Unverified(why) | RowVerdict::Differs(why) => why.clone(),
+        };
+        format!("{} at {at} of {b_len} / {a_len}: {why}", self.label())
+    }
+}
+
+/// `v`'s first maximum.
+fn argmax(v: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, &x) in v.iter().enumerate() {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// How many logits other than `own`'s beat `token`'s.
+fn others_above(v: &[f32], token: u32, own: u32) -> usize {
+    let l = v[token as usize];
+    v.iter()
+        .enumerate()
+        .filter(|&(i, &x)| i != own as usize && x > l)
+        .count()
+}
+
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
+}
+
+/// One arm of a replay: its passes, and as many copies of the row's cache as
+/// its widest step, prefilled as every arm prefills (`forward` per
+/// `prefill_tile` of the prompt).
+struct ReplayArm<'p> {
+    passes: &'p [Pass],
+    caches: Vec<Cache>,
+    /// The copies still in step with the row: a step of `m` rows advances the
+    /// first `m`.
+    live: usize,
+}
+
+impl<'p> ReplayArm<'p> {
+    fn new(
+        ctx: &Ctx<'_>,
+        prompt: &[u32],
+        passes: &'p [Pass],
+        upto: usize,
+    ) -> Result<(Self, Vec<f32>)> {
+        use lloom::nn::CausalLM;
+        let width = passes[..upto]
+            .iter()
+            .map(|p| match p {
+                Pass::Solo => 1,
+                Pass::Rows(m) => *m,
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let tile = match ctx.spec.prefill_tile {
+            0 => prompt.len().max(1),
+            t => t,
+        };
+        let mut caches = Vec::with_capacity(width);
+        let mut first = None;
+        for _ in 0..width {
+            let mut cache = new_cache(ctx.pool, ctx.dtype, ctx.config, ctx.device)?;
+            let (mut pos, mut last) = (0, None);
+            for unit in prompt.chunks(tile) {
+                CausalLM::prepare_pass(ctx.model, &mut cache, unit.len())?;
+                let input = lloom_tensor::Tensor::new(unit, ctx.device)?.unsqueeze(0)?;
+                last = Some(CausalLM::forward(ctx.model, &input, pos, &mut cache)?);
+                pos += unit.len();
+            }
+            let logits = host_logits(ctx, &last.context("an empty prompt")?)?;
+            first.get_or_insert(logits);
+            caches.push(cache);
+        }
+        Ok((
+            ReplayArm {
+                passes,
+                caches,
+                live: width,
+            },
+            first.expect("at least one copy"),
+        ))
+    }
+
+    /// Feed `token` as the row's token `t - 1` at `pos`; the logits for token
+    /// `t` and whether the copies agreed.
+    fn step(
+        &mut self,
+        ctx: &Ctx<'_>,
+        t: usize,
+        token: u32,
+        pos: usize,
+    ) -> Result<(Vec<f32>, bool)> {
+        use lloom::nn::{BatchedCausalLM, CausalLM, Row};
+        use lloom_tensor::Tensor;
+        match self.passes[t - 1] {
+            Pass::Solo => {
+                let cache = &mut self.caches[0];
+                CausalLM::prepare_pass(ctx.model, cache, 1)?;
+                let input = Tensor::new(&[[token]], ctx.device)?;
+                let out = CausalLM::forward(ctx.model, &input, pos, cache)?;
+                self.live = 1;
+                Ok((host_logits(ctx, &out)?, true))
+            }
+            Pass::Rows(m) => {
+                anyhow::ensure!(
+                    m >= 1 && m <= self.live,
+                    "token {t}: a step of {m} rows after one of {} (a row joined mid-run)",
+                    self.live
+                );
+                for cache in &mut self.caches[..m] {
+                    CausalLM::prepare_pass(ctx.model, cache, 1)?;
+                }
+                let input = Tensor::new(vec![token; m].as_slice(), ctx.device)?.reshape((m, 1))?;
+                let mut rows: Vec<Row<'_, Cache>> = self.caches[..m]
+                    .iter_mut()
+                    .map(|cache| Row { pos, cache })
+                    .collect();
+                let out = BatchedCausalLM::forward_rows(ctx.model, &input, &mut rows)?;
+                self.live = m;
+                let first = host_logits(ctx, &out.get(0)?)?;
+                let mut agree = true;
+                for k in 1..m {
+                    agree &= host_logits(ctx, &out.get(k)?)? == first;
+                }
+                Ok((first, agree))
+            }
+        }
+    }
+}
+
+/// The last position's logits, on the host, as f32.
+fn host_logits(ctx: &Ctx<'_>, t: &lloom_tensor::Tensor) -> Result<Vec<f32>> {
+    use lloom::nn::CausalLM;
+    let vocab = CausalLM::vocab_size(ctx.model);
+    let v = t.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+    anyhow::ensure!(
+        v.len() >= vocab,
+        "{} logits for a vocabulary of {vocab}",
+        v.len()
+    );
+    Ok(v[v.len() - vocab..].to_vec())
+}
+
+/// Replay one row through two arms to their parting at token `at` (`Parting`).
+fn replay_parting(
+    ctx: &Ctx<'_>,
+    prompt: &[u32],
+    (a, pa): (&[u32], &[Pass]),
+    (b, pb): (&[u32], &[Pass]),
+    at: usize,
+) -> Result<Parting> {
+    anyhow::ensure!(
+        pa.len() >= at && pb.len() >= at,
+        "passes recorded for {} / {} tokens, the parting is at {at}",
+        pa.len() + 1,
+        pb.len() + 1
+    );
+    let (mut ra, mut la) = ReplayArm::new(ctx, prompt, pa, at)?;
+    let (mut rb, mut lb) = ReplayArm::new(ctx, prompt, pb, at)?;
+    let (mut a_left, mut b_left) = (None, None);
+    let mut copies_differ = false;
+    let mut delta_before = 0f32;
+    let mut trace = Vec::with_capacity(at + 1);
+    for t in 0..at {
+        delta_before = delta_before.max(max_abs_diff(&la, &lb));
+        trace.push(ulps_apart(&la, &lb, ctx.dtype));
+        if a_left.is_none() && argmax(&la) != a[t] {
+            a_left = Some(t);
+        }
+        if b_left.is_none() && argmax(&lb) != b[t] {
+            b_left = Some(t);
+        }
+        let pos = prompt.len() + t;
+        let (next, agree) = ra.step(ctx, t + 1, a[t], pos)?;
+        la = next;
+        copies_differ |= !agree;
+        let (next, agree) = rb.step(ctx, t + 1, b[t], pos)?;
+        lb = next;
+        copies_differ |= !agree;
+    }
+    let (at_a, at_b) = (a[at], b[at]);
+    if a_left.is_none() && argmax(&la) != at_a {
+        a_left = Some(at);
+    }
+    if b_left.is_none() && argmax(&lb) != at_b {
+        b_left = Some(at);
+    }
+    trace.push(ulps_apart(&la, &lb, ctx.dtype));
+    Ok(Parting {
+        at,
+        a_token: at_a,
+        b_token: at_b,
+        a_left,
+        b_left,
+        copies_differ,
+        a_logits: (la[at_a as usize], la[at_b as usize]),
+        b_logits: (lb[at_a as usize], lb[at_b as usize]),
+        a_others_above: others_above(&la, at_b, at_a),
+        b_others_above: others_above(&lb, at_a, at_b),
+        delta_at: max_abs_diff(&la, &lb),
+        delta_before,
+        ulps: trace.iter().fold(0f32, |m, &x| m.max(x)),
+        trace,
+    })
+}
+
 /// `--mode concurrent --batched`: every prompt solo through the selected
 /// readback arm (the crown loop), and all of them through
 /// `Session::decode_batched` — one `m = B` forward per step. Per-sequence
 /// identity against solo, the aggregate rates, GPU busy per arm from the
-/// profiler, and — under `--check-independence` — the rows re-run in two
-/// separately batched halves, each row asserted equal to its full-batch
-/// stream.
+/// profiler, and — unless `--no-independence-check` — the rows re-run in two
+/// separately batched halves, each row held to its full-batch stream.
+///
+/// A row is held to the other arm's stream bit for bit wherever both ran its
+/// forwards on the same route, and to tier 2 where one took the `m = 1` GEMV
+/// and the other the batch's GEMM (`row_verdict`); a parting there must
+/// replay as a near-tie. Anything else fails the run.
 fn run_batched_concurrent(
     ctx: &Ctx<'_>,
     opts: &DecodeOptions,
@@ -1294,10 +1810,52 @@ fn run_batched_concurrent(
         (other, _) => anyhow::bail!("--first must be `solo` or `batched`, got `{other}`"),
     };
 
-    // Identity against solo: tier 2 across the GEMV/GEMM seam (§13.5b), so
-    // the first divergence index is reported beside the verdict.
+    // What the rows are held to (`batched-decode-design.md` §10.4): bit for
+    // bit wherever both arms run a token's forward on the same route, tier 2
+    // where one took the `m = 1` GEMV and the other the batch's GEMM — there a
+    // row may part only at a near-tie, which the replay re-derives.
+    let kernels = SoloKernels::of(model, config);
+    let lookahead = batched_opts.lookahead;
+    let chunk = ctx.spec.prefill_chunk;
+    let passes_of = |arm: &BatchArm, k: usize| {
+        batched_passes(
+            &arm.outs[k].stats.batch_rows,
+            lookahead,
+            arm.streams[k].len(),
+            chunk,
+        )
+    };
+    let judge =
+        |i: usize, (a, pa): (&[u32], Option<Vec<Pass>>), (b, pb): (&[u32], Option<Vec<Pass>>)| {
+            let passes = pa.as_deref().zip(pb.as_deref());
+            row_verdict(kernels, a, b, passes, |at| {
+                let (pa, pb) = passes.expect("a replay is asked for only with both arms' passes");
+                replay_parting(ctx, &prompts[i], (a, pa), (b, pb), at)
+            })
+        };
+    if !ctx.spec.skip_solo {
+        eprintln!(
+            "[identity: the solo arm's m = 1 matmuls take the {} ({}); a batched row is held to \
+             its solo stream bit for bit wherever both run a token's forward on the same route, \
+             and to tier 2 where the routes differ — a parting there must re-derive as a \
+             near-tie{}]",
+            kernels.name(),
+            match kernels {
+                SoloKernels::Gemv => "the shipping decode",
+                SoloKernels::Gemm => "--force-gemm m, the GEMV-only epilogues off",
+            },
+            match kernels {
+                SoloKernels::Gemv => {
+                    "; the arm exact at every token is --force-gemm m --gemv-silu=false \
+                     --gemv-residual=false"
+                }
+                SoloKernels::Gemm => "",
+            }
+        );
+    }
     let mut identical = Vec::with_capacity(n);
     let mut common_prefix = Vec::with_capacity(n);
+    let mut verdicts: Vec<RowVerdict> = Vec::with_capacity(n);
     for (i, &prompt_len) in prompt_lens.iter().enumerate() {
         let same = batched.streams[i] == solo.streams[i];
         let lcp = batched.streams[i]
@@ -1307,10 +1865,22 @@ fn run_batched_concurrent(
             .count();
         identical.push(same);
         common_prefix.push(lcp);
+        let verdict = if ctx.spec.skip_solo {
+            RowVerdict::Unverified("the solo arm was skipped".into())
+        } else {
+            judge(
+                i,
+                (
+                    &solo.streams[i],
+                    Some(vec![Pass::Solo; solo.streams[i].len()]),
+                ),
+                (&batched.streams[i], passes_of(&batched, i)),
+            )
+        };
         let (gap_p50, gap_max) = gap_stats_ms(&batched.stamps[i]);
         eprintln!(
             "[seq {i}: prompt {prompt_len} tok, arrival step {}; batched first token at {:.1} ms \
-             (prefill {} forwards), gap p50 {:.1} max {:.1} ms; solo {} tokens eos={}; batched {} tokens eos={} overrun={}; {}{}]",
+             (prefill {} forwards), gap p50 {:.1} max {:.1} ms; solo {} tokens eos={}; batched {} tokens eos={} overrun={}; {}]",
             arrivals[i],
             batched.stamps[i].first().map(|s| s * 1e3).unwrap_or(f64::NAN),
             batched.outs[i].stats.prefill_units,
@@ -1321,48 +1891,111 @@ fn run_batched_concurrent(
             batched.streams[i].len(),
             batched.outs[i].eos,
             batched.outs[i].stats.overrun,
-            if same { "IDENTICAL" } else { "DIFFERS" },
-            if same {
-                String::new()
-            } else {
-                format!(" at {lcp} of {} / {}", batched.streams[i].len(), solo.streams[i].len())
-            }
+            verdict.describe(
+                ("solo", solo.streams[i].len()),
+                ("batched", batched.streams[i].len()),
+                lcp
+            ),
         );
+        if let RowVerdict::SeamTie { parting, .. } = &verdict {
+            eprintln!(
+                "[seq {i}: the replay's max |Δlogit| per token 0..={}, ulp at the logit scale: {}]",
+                parting.at,
+                parting
+                    .trace
+                    .iter()
+                    .map(|u| format!("{u:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        verdicts.push(verdict);
     }
 
-    // Neighbour independence: the same rows batched in two halves must give
-    // each row the full batch's stream — both arms take the `m > 1` GEMM,
-    // so this is exact where the solo comparison is tier 2.
-    let independent = if ctx.spec.check_independence && n >= 2 {
-        let half = n / 2;
-        let lo: Vec<usize> = (0..half).collect();
-        let hi: Vec<usize> = (half..n).collect();
-        let a = run_batched("batched-lo", &lo)?;
-        let b = run_batched("batched-hi", &hi)?;
-        let mut ok = true;
-        for (k, &i) in lo.iter().enumerate() {
-            if a.streams[k] != batched.streams[i] {
-                ok = false;
-                eprintln!("[independence: row {i} differs between B={n} and B={half}]");
+    // Neighbour independence: the same rows batched in two halves, each row
+    // held to its full-batch stream on the same terms — bit for bit while
+    // both batches run it on the same route; a row left alone in one of them
+    // takes the `m = 1` route there, and from that token on the pair is
+    // tier 2.
+    let independence: Option<Vec<(usize, RowVerdict, String)>> =
+        if ctx.spec.check_independence && n >= 2 {
+            let half = n / 2;
+            let lo: Vec<usize> = (0..half).collect();
+            let hi: Vec<usize> = (half..n).collect();
+            let a = run_batched("batched-lo", &lo)?;
+            let b = run_batched("batched-hi", &hi)?;
+            let mut out = Vec::with_capacity(n);
+            for (arm, rows) in [(&a, &lo), (&b, &hi)] {
+                for (k, &i) in rows.iter().enumerate() {
+                    let (full, part) = (&batched.streams[i], &arm.streams[k]);
+                    let v = judge(i, (full, passes_of(&batched, i)), (part, passes_of(arm, k)));
+                    let at = full.iter().zip(part).take_while(|(x, y)| x == y).count();
+                    let line = v.describe(
+                        (&format!("B={n}"), full.len()),
+                        (&format!("B={}", rows.len()), part.len()),
+                        at,
+                    );
+                    if v != RowVerdict::Identical {
+                        eprintln!("[independence: row {i}: {line}]");
+                    }
+                    out.push((i, v, line));
+                }
             }
-        }
-        for (k, &i) in hi.iter().enumerate() {
-            if b.streams[k] != batched.streams[i] {
-                ok = false;
-                eprintln!(
-                    "[independence: row {i} differs between B={n} and B={}]",
-                    n - half
-                );
-            }
-        }
-        eprintln!(
-            "[independence: rows re-batched as {half} + {}: {}]",
-            n - half,
-            if ok { "IDENTICAL" } else { "DIFFERS" }
-        );
-        Some(ok)
+            let differs = out
+                .iter()
+                .filter(|(_, v, _)| matches!(v, RowVerdict::Differs(_)))
+                .count();
+            eprintln!(
+                "[independence: rows re-batched as {half} + {}: {}]",
+                n - half,
+                if out.iter().all(|(_, v, _)| *v == RowVerdict::Identical) {
+                    "IDENTICAL".to_string()
+                } else if differs == 0 {
+                    "tier 2 only (the partings above re-derive as near-ties)".to_string()
+                } else {
+                    format!("DIFFERS on {differs} row(s)")
+                }
+            );
+            out.sort_by_key(|(i, _, _)| *i);
+            Some(out)
+        } else {
+            None
+        };
+    let independent = independence
+        .as_ref()
+        .map(|v| v.iter().all(|(_, v, _)| *v == RowVerdict::Identical));
+    let failures: Vec<String> = verdicts
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| matches!(v, RowVerdict::Differs(_)))
+        .map(|(i, v)| {
+            format!(
+                "seq {i} against solo: {}",
+                v.describe(
+                    ("solo", solo.streams[i].len()),
+                    ("batched", batched.streams[i].len()),
+                    common_prefix[i]
+                )
+            )
+        })
+        .chain(
+            independence
+                .iter()
+                .flatten()
+                .filter(|(_, v, _)| matches!(v, RowVerdict::Differs(_)))
+                .map(|(i, _, line)| format!("seq {i} across the re-batch: {line}")),
+        )
+        .collect();
+    let gate = if !failures.is_empty() {
+        "fail"
+    } else if verdicts
+        .iter()
+        .chain(independence.iter().flatten().map(|(_, v, _)| v))
+        .any(|v| matches!(v, RowVerdict::Unverified(_)))
+    {
+        "unverified"
     } else {
-        None
+        "pass"
     };
 
     // The batched arm's step shape: median step, mean live rows per step.
@@ -1441,7 +2074,8 @@ fn run_batched_concurrent(
          batched_aggregate_tok_s={:.4} batched_gpu_busy_s={:.4} batched_dispatches={} \
          batched_gemm={} batched_gemv={} batched_step_ms_median={:.4} \
          speedup={:.4} identical={} per_seq_identical={:?} common_prefix={:?} independent={:?} \
-         per_seq_tokens={:?} per_seq_overrun={:?}",
+         per_seq_tokens={:?} per_seq_overrun={:?} solo_kernels={} per_seq_verdict={:?} \
+         independence_verdict={:?} gate={gate}",
         ctx.spec.first,
         batched_opts.lookahead,
         ctx.spec.prefill_chunk,
@@ -1482,7 +2116,19 @@ fn run_batched_concurrent(
         independent,
         batched.streams.iter().map(|s| s.len()).collect::<Vec<_>>(),
         batched.outs.iter().map(|o| o.stats.overrun).collect::<Vec<_>>(),
+        kernels.name(),
+        verdicts.iter().map(RowVerdict::name).collect::<Vec<_>>(),
+        independence
+            .as_ref()
+            .map(|v| v.iter().map(|(_, v, _)| v.name()).collect::<Vec<_>>()),
     );
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "--mode concurrent --batched: {} row(s) broke what they are held to:\n  {}",
+            failures.len(),
+            failures.join("\n  ")
+        );
+    }
     Ok(())
 }
 
@@ -1493,7 +2139,223 @@ fn user_turn_text(p: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::read_or_na;
+    use super::{
+        argmax, batched_passes, others_above, read_or_na, row_verdict, seam_crossed, ulp_at,
+        ulps_apart, Parting, Pass, RowVerdict, SoloKernels,
+    };
+    use anyhow::Result;
+
+    /// A replayed parting at `at` where `above` tokens besides each path's own
+    /// beat the other arm's, both streams reproduced.
+    fn parting(at: usize, above: (usize, usize)) -> Parting {
+        Parting {
+            at,
+            a_token: 7,
+            b_token: 9,
+            a_left: None,
+            b_left: None,
+            copies_differ: false,
+            a_logits: (12.5, 12.4375),
+            b_logits: (12.4375, 12.5),
+            a_others_above: above.0,
+            b_others_above: above.1,
+            delta_at: 0.0625,
+            delta_before: 0.0625,
+            ulps: 4.0,
+            trace: vec![4.0; at + 1],
+        }
+    }
+
+    const SOLO: [u32; 5] = [1, 2, 3, 7, 4];
+    const BATCHED: [u32; 5] = [1, 2, 3, 9, 5];
+
+    fn never(_: usize) -> Result<Parting> {
+        panic!("the replay must not run for this verdict")
+    }
+
+    /// Token `t`'s forward is the step that streamed token `t - 1` under the
+    /// lookahead, and the next step's kept rows without it; a ragged step or
+    /// a short count is not re-derivable.
+    #[test]
+    fn a_batched_rows_passes_are_read_off_its_live_counts() {
+        let rows = [4, 4, 3, 1];
+        assert_eq!(
+            batched_passes(&rows, 1, 4, 0),
+            Some(vec![Pass::Rows(4), Pass::Rows(4), Pass::Rows(3)])
+        );
+        assert_eq!(
+            batched_passes(&rows, 0, 4, 0),
+            Some(vec![Pass::Rows(4), Pass::Rows(3), Pass::Rows(1)])
+        );
+        assert_eq!(batched_passes(&rows, 0, 5, 0), None);
+        assert_eq!(batched_passes(&rows, 1, 4, 64), None);
+    }
+
+    /// The seam is crossed at the first token one arm computed on the `m = 1`
+    /// route and the other did not; `Solo` and a one-row step are one route.
+    #[test]
+    fn the_seam_is_the_first_token_the_routes_differ() {
+        let solo = [Pass::Solo; 4];
+        let alone = [Pass::Rows(2), Pass::Rows(1), Pass::Rows(1), Pass::Rows(1)];
+        assert_eq!(seam_crossed(&solo, &[Pass::Rows(4); 4], 4), Some(1));
+        assert_eq!(seam_crossed(&solo, &alone, 4), Some(1));
+        assert_eq!(seam_crossed(&[Pass::Rows(4); 4], &alone, 4), Some(2));
+        assert_eq!(
+            seam_crossed(&[Pass::Rows(4); 4], &[Pass::Rows(2); 4], 4),
+            None
+        );
+        assert_eq!(seam_crossed(&solo, &[Pass::Rows(1); 4], 4), None);
+    }
+
+    /// Streams that agree are identical and replay nothing.
+    #[test]
+    fn identical_streams_replay_nothing() {
+        let v = row_verdict(SoloKernels::Gemv, &SOLO, &SOLO, None, never);
+        assert_eq!(v, RowVerdict::Identical);
+    }
+
+    /// On the GEMM kernel set every token is owed bit for bit: a parting fails
+    /// without a replay, near-tie or not.
+    #[test]
+    fn on_the_gemm_set_any_parting_fails() {
+        let passes = ([Pass::Solo; 4], [Pass::Rows(4); 4]);
+        let v = row_verdict(
+            SoloKernels::Gemm,
+            &SOLO,
+            &BATCHED,
+            Some((&passes.0, &passes.1)),
+            never,
+        );
+        assert!(matches!(v, RowVerdict::Differs(_)), "{v:?}");
+    }
+
+    /// Two arms that ran every forward before the parting on the same route
+    /// owe each other the stream: a parting there is a failure whatever its
+    /// logits look like — the re-batch whose halves both keep `m > 1`.
+    #[test]
+    fn a_parting_on_one_route_fails_without_a_replay() {
+        let passes = ([Pass::Rows(4); 4], [Pass::Rows(2); 4]);
+        let v = row_verdict(
+            SoloKernels::Gemv,
+            &SOLO,
+            &BATCHED,
+            Some((&passes.0, &passes.1)),
+            never,
+        );
+        match v {
+            RowVerdict::Differs(why) => assert!(why.contains("same route"), "{why}"),
+            v => panic!("{v:?}"),
+        }
+    }
+
+    /// Across the seam a parting passes as tier 2 exactly when it replays as a
+    /// near-tie: the replay is asked at the parting, and on each arm's path
+    /// nothing but its own token may stand above the other arm's.
+    #[test]
+    fn across_the_seam_a_parting_passes_only_as_a_near_tie() {
+        let passes = ([Pass::Solo; 4], [Pass::Rows(4); 4]);
+        let judge = |above: (usize, usize)| {
+            row_verdict(
+                SoloKernels::Gemv,
+                &SOLO,
+                &BATCHED,
+                Some((&passes.0, &passes.1)),
+                |at| {
+                    assert_eq!(at, 3, "the replay is asked for the first differing token");
+                    Ok(parting(at, above))
+                },
+            )
+        };
+        assert_eq!(
+            judge((0, 0)),
+            RowVerdict::SeamTie {
+                seam: 1,
+                parting: parting(3, (0, 0))
+            }
+        );
+        assert!(matches!(judge((1, 0)), RowVerdict::Differs(_)));
+        assert!(matches!(judge((0, 3)), RowVerdict::Differs(_)));
+    }
+
+    /// A replay that did not reproduce an arm's stream, whose copies of a
+    /// batched row disagreed, or whose paths drifted past the seam's reach,
+    /// proves no tie.
+    #[test]
+    fn a_replay_that_left_its_stream_is_not_a_tie() {
+        let passes = ([Pass::Solo; 4], [Pass::Rows(4); 4]);
+        for p in [
+            Parting {
+                a_left: Some(2),
+                ..parting(3, (0, 0))
+            },
+            Parting {
+                b_left: Some(3),
+                ..parting(3, (0, 0))
+            },
+            Parting {
+                copies_differ: true,
+                ..parting(3, (0, 0))
+            },
+            Parting {
+                ulps: 17.0,
+                ..parting(3, (0, 0))
+            },
+        ] {
+            let v = row_verdict(
+                SoloKernels::Gemv,
+                &SOLO,
+                &BATCHED,
+                Some((&passes.0, &passes.1)),
+                |_| Ok(p.clone()),
+            );
+            assert!(matches!(v, RowVerdict::Differs(_)), "{v:?}");
+        }
+    }
+
+    /// What cannot be re-derived is reported as such, never as a pass or a
+    /// failure; a stream that stops where the other goes on is a failure.
+    #[test]
+    fn the_unverifiable_and_the_truncated() {
+        let passes = ([Pass::Solo; 4], [Pass::Rows(4); 4]);
+        let v = row_verdict(SoloKernels::Gemv, &SOLO, &BATCHED, None, never);
+        assert!(matches!(v, RowVerdict::Unverified(_)), "{v:?}");
+        let v = row_verdict(
+            SoloKernels::Gemv,
+            &SOLO,
+            &BATCHED,
+            Some((&passes.0, &passes.1)),
+            |_| anyhow::bail!("no slot"),
+        );
+        assert!(matches!(v, RowVerdict::Unverified(_)), "{v:?}");
+        let v = row_verdict(SoloKernels::Gemv, &SOLO, &SOLO[..3], None, never);
+        assert!(matches!(v, RowVerdict::Differs(_)), "{v:?}");
+    }
+
+    /// The ulp is the dtype's at the vector's scale: one f16 ulp in [16, 32)
+    /// is 1/64, so 22.4531 against 22.4375 is one ulp apart.
+    #[test]
+    fn ulps_are_counted_at_the_logit_scale() {
+        use lloom_tensor::DType;
+        assert_eq!(ulp_at(22.4531, DType::F16), 1.0 / 64.0);
+        assert_eq!(ulp_at(0.75, DType::F16), 1.0 / 2048.0);
+        assert_eq!(ulp_at(3.0, DType::BF16), 1.0 / 64.0);
+        let a = [22.453125, -3.0, 1.0];
+        let b = [22.4375, -3.0, 1.0];
+        assert_eq!(ulps_apart(&a, &b, DType::F16), 1.0);
+    }
+
+    /// The first maximum wins the argmax, so a token tied with the leader
+    /// loses on the id and has nothing but the leader above it — the exact
+    /// tie is a near-tie; a third token above it is not.
+    #[test]
+    fn a_tie_with_the_leader_leaves_nothing_else_above() {
+        let v = [0.5, 2.0, 2.0, -1.0, 1.5];
+        assert_eq!(argmax(&v), 1);
+        assert_eq!(others_above(&v, 2, 1), 0);
+        assert_eq!(others_above(&v, 4, 1), 1);
+        assert_eq!(others_above(&v, 3, 1), 3);
+        assert_eq!(others_above(&v, 1, 2), 0);
+    }
 
     /// A `--dspark` line must not report a readback knob the speculative body
     /// never read; a K=1 line reports it verbatim.

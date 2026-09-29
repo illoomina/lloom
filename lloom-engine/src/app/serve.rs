@@ -29,11 +29,12 @@
 
 use super::common::{ms, MemSnapshot, NEVER_EOS};
 use super::served::Served;
+use super::template::{request_kwargs, Ignored, Rejected, ENGINE_KWARGS, REASONING_EFFORT};
 use super::vision::{expand_image_tokens, split_image_parts, DecodedImage};
 use crate::{DecodeParams, Decoded, Stop};
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::PathBuf;
@@ -221,6 +222,11 @@ pub fn run(args: ServeArgs) -> Result<()> {
                 let mut body = shared.engine.health();
                 body["mem"] = MemSnapshot::read(shared.engine.device()).json();
                 body["capabilities"] = shared.engine.capabilities().json();
+                body["chat_template_reads"] = ENGINE_KWARGS
+                    .iter()
+                    .map(|&k| (k.to_string(), json!(shared.engine.template_reads(k))))
+                    .collect::<Map<String, Value>>()
+                    .into();
                 let _ = respond_json(request, 200, &body);
             }
             (Method::Get, "/v1/models") => {
@@ -310,6 +316,7 @@ enum Reply {
 struct StreamingRun {
     kind: StreamKind,
     prompt_ids: Vec<u32>,
+    facts: PromptFacts,
     /// The chat's images, in the order their `<image>` positions appear.
     images: Vec<DecodedImage>,
     params: DecodeParams,
@@ -412,10 +419,12 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
         return Err(bad("empty prompt"));
     }
     let id = format!("cmpl-{}", short_id());
+    let facts = PromptFacts::of(&prompt_ids);
     if stream {
         return Ok(Reply::Stream(Box::new(StreamingRun {
             kind: StreamKind::Completion,
             prompt_ids,
+            facts,
             images: Vec::new(),
             params,
             id,
@@ -425,7 +434,13 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
     let started = Instant::now();
     let decoded = shared.engine.complete(&prompt_ids, &params, &mut |_| {})?;
     let elapsed = started.elapsed();
-    report("/v1/completions", prompt_ids.len(), &decoded, ms(elapsed));
+    report(
+        "/v1/completions",
+        prompt_ids.len(),
+        &facts,
+        &decoded,
+        ms(elapsed),
+    );
     Ok(Reply::Json(json!({
         "id": id,
         "object": "text_completion",
@@ -438,7 +453,7 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
             "finish_reason": finish_reason(decoded.stop),
         }],
         "usage": usage(prompt_ids.len(), decoded.tokens.len()),
-        "timings": timings(prompt_ids.len(), &decoded, elapsed),
+        "timings": timings(prompt_ids.len(), &facts, &decoded, elapsed),
     })))
 }
 
@@ -461,14 +476,15 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     let params = sampling_params(shared, v)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let want_logprobs = v.get("logprobs").and_then(Value::as_bool).unwrap_or(false);
-    let kwargs = v.get("chat_template_kwargs");
+    let kwargs = request_kwargs(v, &[REASONING_EFFORT]).map_err(bad)?;
 
     // OpenAI `image_url` parts become the template's `{"type": "image"}`;
     // string content passes through untouched.
     let (messages, images) = split_image_parts(messages).map_err(|e| bad(format!("{e:#}")))?;
-    let prompt_ids = {
+    let (prompt_ids, facts) = {
         let engine = shared.engine.as_ref();
-        let rendered = engine.render_chat(&messages, kwargs)?;
+        let (rendered, mut facts) =
+            render_request(engine, "/v1/chat/completions", &messages, &kwargs)?;
         let rendered = if images.is_empty() {
             rendered
         } else {
@@ -485,7 +501,8 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                 eprintln!("[chat: the rendered template carries BOS twice; check bos_token]");
             }
         }
-        ids
+        facts.ids_sha256 = super::chat::tokens_sha256(&ids);
+        (ids, facts)
     };
     let id = format!("chatcmpl-{}", short_id());
 
@@ -547,6 +564,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         return Ok(Reply::Stream(Box::new(StreamingRun {
             kind: StreamKind::Chat,
             prompt_ids,
+            facts,
             images,
             params,
             id,
@@ -565,6 +583,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     report(
         "/v1/chat/completions",
         prompt_ids.len(),
+        &facts,
         &decoded,
         ms(elapsed),
     );
@@ -580,7 +599,7 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
             "finish_reason": finish_reason(decoded.stop),
         }],
         "usage": usage(prompt_ids.len(), decoded.tokens.len()),
-        "timings": timings(prompt_ids.len(), &decoded, elapsed),
+        "timings": timings(prompt_ids.len(), &facts, &decoded, elapsed),
     });
     attach_vision(shared, &mut body);
     Ok(Reply::Json(body))
@@ -795,7 +814,13 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
         anyhow::bail!("client went away mid-stream: {e}");
     }
     let elapsed = started.elapsed();
-    report(endpoint, run.prompt_ids.len(), &decoded, ms(elapsed));
+    report(
+        endpoint,
+        run.prompt_ids.len(),
+        &run.facts,
+        &decoded,
+        ms(elapsed),
+    );
     let usage = usage(run.prompt_ids.len(), decoded.tokens.len());
     let last = match run.kind {
         StreamKind::Completion => json!({
@@ -803,13 +828,13 @@ fn stream_response(shared: &Shared, request: Request, run: StreamingRun) -> Resu
             "choices": [{ "index": 0, "text": "", "logprobs": null,
                           "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(run.prompt_ids.len(), &decoded, elapsed),
+            "timings": timings(run.prompt_ids.len(), &run.facts, &decoded, elapsed),
         }),
         StreamKind::Chat => json!({
             "id": run.id, "object": "chat.completion.chunk", "created": created, "model": run.model,
             "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason(decoded.stop) }],
             "usage": usage,
-            "timings": timings(run.prompt_ids.len(), &decoded, elapsed),
+            "timings": timings(run.prompt_ids.len(), &run.facts, &decoded, elapsed),
         }),
     };
     let mut last = last;
@@ -1037,7 +1062,13 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
     if batch == 1 {
         let decoded = engine.complete(&ids, &params, &mut |_| {})?;
         let total_ms = ms(started.elapsed());
-        report("/end_to_end_latency", ids.len(), &decoded, total_ms);
+        report(
+            "/end_to_end_latency",
+            ids.len(),
+            &PromptFacts::of(&ids),
+            &decoded,
+            total_ms,
+        );
         return Ok(json!({
             "total_ms": total_ms,
             "prompt_tokens": ids.len(),
@@ -1070,10 +1101,12 @@ fn end_to_end_latency(shared: &Shared, v: &Value) -> Handled<Value> {
         Ok::<_, anyhow::Error>((ds, ts))
     })?;
     let total_ms = ms(started.elapsed());
+    let facts = PromptFacts::of(&ids);
     for (i, d) in decoded.iter().enumerate() {
         report(
             &format!("/end_to_end_latency row {i}/{batch}"),
             ids.len(),
+            &facts,
             d,
             per_row_ms[i],
         );
@@ -1144,11 +1177,10 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
         return Ok(());
     }
     let enable_thinking = v.get("enable_thinking").cloned().unwrap_or(Value::Null);
-    let kwargs = if enable_thinking.is_null() {
-        None
-    } else {
-        Some(json!({ "enable_thinking": enable_thinking }))
-    };
+    let mut kwargs = Map::new();
+    if !enable_thinking.is_null() {
+        kwargs.insert("enable_thinking".into(), enable_thinking);
+    }
 
     let sw = StreamWriter::start(ChunkedWriter::start(request, "application/x-ndjson")?);
     let engine = shared.engine.as_ref();
@@ -1181,7 +1213,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                         let messages = sample
                             .get("messages")
                             .context("eval sample missing messages")?;
-                        let prompt = engine.render_chat(messages, kwargs.as_ref())?;
+                        let prompt = engine.render_chat(messages, kwargs)?;
                         let ids = engine.encode(&prompt, true)?;
                         sw.event_line(&json!({
                             "kind": "eval_sample_start", "sample_id": sample_id, "prompt": prompt,
@@ -1493,7 +1525,7 @@ fn usage(prompt: usize, completion: usize) -> Value {
 /// The engine's own brackets beside the request's wall clock: the prompt's
 /// submit time, the per-step host clock and the arm that ran. `predicted_ms`
 /// is the sum of the loop's steps — the decode window, prefill excluded.
-fn timings(prompt: usize, d: &Decoded, elapsed: std::time::Duration) -> Value {
+fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::Duration) -> Value {
     let st = &d.stats;
     // Release builds compile the per-step clock out (`step_ns` is empty, since
     // `6c33cd89`), so the decode's window is the request's wall minus the
@@ -1504,6 +1536,11 @@ fn timings(prompt: usize, d: &Decoded, elapsed: std::time::Duration) -> Value {
         st.step_ns.iter().sum::<u64>() as f64 / 1e6
     };
     let n = d.tokens.len();
+    let ignored: Vec<Value> = facts
+        .ignored
+        .iter()
+        .map(|i| json!({ "name": i.name, "value": i.value, "reason": i.reason }))
+        .collect();
     json!({
         "prompt_n": prompt,
         "prompt_submit_ms": st.prefill_ns as f64 / 1e6,
@@ -1523,10 +1560,16 @@ fn timings(prompt: usize, d: &Decoded, elapsed: std::time::Duration) -> Value {
         // The generated ids, so a gate can compare a run against a recorded
         // token digest without a second path to the model.
         "tokens": d.tokens,
+        "prompt_ids_sha256": facts.ids_sha256,
+        // The template's variable as the prompt reflects it; null for its
+        // default, or when the template did not act on the request's value
+        // (listed in `template_kwargs_ignored`).
+        "reasoning_effort": facts.reasoning_effort,
+        "template_kwargs_ignored": ignored,
     })
 }
 
-fn report(endpoint: &str, prompt: usize, d: &Decoded, total_ms: f64) {
+fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total_ms: f64) {
     let st = &d.stats;
     let mut steps: Vec<u64> = st.step_ns.clone();
     steps.sort_unstable();
@@ -1538,7 +1581,8 @@ fn report(endpoint: &str, prompt: usize, d: &Decoded, total_ms: f64) {
     eprintln!(
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
          {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
-         commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={}]",
+         commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
+         reasoning_effort={}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -1549,7 +1593,63 @@ fn report(endpoint: &str, prompt: usize, d: &Decoded, total_ms: f64) {
         st.overrun,
         super::common::eos_gate_name(st.eos_gate),
         super::common::host_fill_name(st.host_feed.as_ref()),
+        facts.ids_sha256,
+        facts.reasoning_effort.as_str().unwrap_or("default"),
     );
+}
+
+/// What a request's prompt was: the digest of its ids (`lloom chat`'s
+/// `prompt_ids_sha256`) and the engine's template variables as the prompt
+/// reflects them.
+#[derive(Default)]
+struct PromptFacts {
+    ids_sha256: String,
+    reasoning_effort: Value,
+    ignored: Vec<Ignored>,
+}
+
+impl PromptFacts {
+    fn of(ids: &[u32]) -> Self {
+        Self {
+            ids_sha256: super::chat::tokens_sha256(ids),
+            ..Self::default()
+        }
+    }
+}
+
+/// A chat request's prompt through the checkpoint's template. A value the
+/// template rejects is the client's 400. A variable it does not act on is
+/// a warning, not a refusal, because clients send `reasoning_effort` whatever
+/// the model; the prompt is the one the template renders without it.
+fn render_request(
+    engine: &dyn Served,
+    endpoint: &str,
+    messages: &Value,
+    kwargs: &Map<String, Value>,
+) -> Handled<(String, PromptFacts)> {
+    let rendered = engine
+        .render_checked(messages, kwargs, &[REASONING_EFFORT])
+        .map_err(|e| match e.downcast_ref::<Rejected>() {
+            Some(r) => bad(r.to_string()),
+            None => Failure::Internal(e),
+        })?;
+    let family = engine.capabilities().family;
+    for i in &rendered.ignored {
+        eprintln!("[{endpoint}: {family}: {i}; ignored]");
+    }
+    let applied = |name: &str| {
+        let ignored = rendered.ignored.iter().any(|i| i.name == name);
+        match kwargs.get(name) {
+            Some(v) if !ignored => v.clone(),
+            _ => Value::Null,
+        }
+    };
+    let facts = PromptFacts {
+        ids_sha256: String::new(),
+        reasoning_effort: applied(REASONING_EFFORT),
+        ignored: rendered.ignored.clone(),
+    };
+    Ok((rendered.text, facts))
 }
 
 fn models_body(model_name: &str) -> Value {

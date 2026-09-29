@@ -15,6 +15,7 @@ pub mod qwen4exp;
 pub mod report;
 pub mod serve;
 pub mod served;
+pub mod template;
 pub mod vision;
 
 use anyhow::{Context, Result};

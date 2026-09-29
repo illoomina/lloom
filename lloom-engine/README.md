@@ -60,6 +60,19 @@ its hot-row cache), `--mtp <gguf>` for the MTP head on the speculative body
 The tokenizer and the chat template come from the HF cache's
 `Qwen/Qwen3.8-Flash-Next` snapshot (`--tokenizer` to point elsewhere).
 
+**The template's variables** (`src/app/template.rs`). `lloom chat --think`
+sets `enable_thinking`; `--reasoning-effort <EFFORT>` sets `reasoning_effort`
+(Qwen4-exp: `low`, `medium`, `xhigh`; its default, and a run with no flag
+renders byte-identically to `xhigh`). Which family supports a variable is
+read from its template — a static parse of the source plus a render probe —
+not from a list: `chat` refuses, before the first turn, an effort the template
+does not read (LFM2), one it renders the same way for any value (Qwen4-exp
+without `--think`) and a value it rejects (its own `raise_exception`
+message); `serve` answers the last with a 400 and serves the first two
+without the effort, naming it in `timings.template_kwargs_ignored`. The turn
+line and `timings` carry `reasoning_effort` and `prompt_ids_sha256`, so a run
+says which prompt it ran.
+
 The request seam is `app::served::Served`, `dyn` per request (§15.2 #9); the
 per-token loop behind it is `DecodeSession`'s, generic over `CausalLM`. On
 Qwen4-exp `--readback auto` resolves to the **blocking** arm: the model's
@@ -106,11 +119,11 @@ Two contracts on the one port:
 
 | endpoint | shape | for |
 |---|---|---|
-| `GET /health` | `{}` | readiness |
+| `GET /health` | `{}`; `chat_template_reads` says which of the engine's template variables (`enable_thinking`, `reasoning_effort`) the checkpoint's template reads | readiness |
 | `GET /v1/models` | OpenAI | model id |
 | `POST /tokenize` | `{prompt, add_special_tokens?}` → `{tokens, count}` (also `{content, add_special}`) | exact-count prompt construction; counts what `/v1/completions` will report |
 | `POST /v1/completions` | OpenAI + `ignore_eos`; text or token-id prompt; `stream`; `usage`; `timings` | pipette's `end_to_end_latency` / `max_memory_usage` cells, generic clients |
-| `POST /v1/chat/completions` | OpenAI; the checkpoint's own `chat_template.jinja` (with `chat_template_kwargs`); `stream` SSE; `logprobs`/`top_logprobs` at `max_tokens = 1`; `guided_choice` → 400 | pipette's `eval` cells, chat clients |
+| `POST /v1/chat/completions` | OpenAI; the checkpoint's own `chat_template.jinja` (with `chat_template_kwargs`); `reasoning_effort` (OpenAI's field, or `chat_template_kwargs.reasoning_effort`; the values are the template's — Qwen4-exp: `low`, `medium`, `xhigh`); a value the template rejects → 400 with its message; an effort the template does not act on (LFM2, or thinking off) is served without it, with a warning; `timings` carries `reasoning_effort`, `template_kwargs_ignored` and `prompt_ids_sha256`; `stream` SSE; `logprobs`/`top_logprobs` at `max_tokens = 1`; `guided_choice` → 400 | pipette's `eval` cells, chat clients |
 | `POST /prefill_throughput` | `{prompt_tokens}` → `{prompt_tps, prompt_tokens, prefill_ms}` | the MLX-sidecar contract pipette's throughput runner speaks |
 | `POST /decode_throughput` | `{prompt_tokens, decode_tokens}` → `{generation_tps, decode_tokens, decode_ms, context_ms, readback}` | " |
 | `POST /end_to_end_latency` | `{prompt, decode_tokens}` → `{total_ms, prompt_tokens, completion_tokens}` | " |

@@ -219,29 +219,23 @@ kernel void gdn_step_f32(
   }
 }
 
-// `gdn_step_f32` with each thread's values of `S` (at most `R`) held in
+// One recurrence step of column `dv` for head `h` over the `dk` slice
+// `j, j+split, …`, with the slice's values of `S` (at most `R`) held in
 // registers between the read-out and the update, so the slab is read once
 // rather than twice: 6 MB a layer at the real geometry where the loop form
-// moves 9. The loops are the loop form's; the rounding is the compiler's for
-// this shape (fast math), so the result is not the loop form's bit for bit
-// (§2.3.5a). The host dispatches it only when `ceil(d / split) ≤ R`.
+// (`gdn_step_column`) moves 9. Every register-form kernel runs this column,
+// so a row's arithmetic is the same alone, among rows and in a window. The
+// rounding is the compiler's for this shape (fast math), so the result is not
+// the loop form's bit for bit (§2.3.5a). The host dispatches the register
+// form only when `ceil(d / split) ≤ R`.
 template <uint R>
-static inline void gdn_step_reg_body(
-    const device float* heads, const device float* alpha, const device float* beta,
-    const device float* dt_bias, const device float* ssm_a, const device float* s,
-    device float* o, uint d, uint h_v, device float* s_out, uint dv, uint t, uint width,
-    threadgroup float* part) {
-  const uint split = width / h_v;
-  const uint h = t % h_v;
-  const uint j = t / h_v;
-  const bool live = j < split;
-  const device float* q = heads + (size_t)h * d;
-  const device float* k = heads + (size_t)(h_v + h) * d;
-  const device float* v = heads + (size_t)(2 * h_v + h) * d;
-  const float a = alpha[h] + dt_bias[h];
-  const float sp = metal::max(a, 0.0f) + metal::log(1.0f + metal::exp(-metal::fabs(a)));
-  const float eg = metal::exp(ssm_a[h] * sp);
-  const float b = 1.0f / (1.0f + metal::exp(-beta[h]));
+static inline void gdn_step_column_reg(
+    const device float* q, const device float* k, const device float* v,
+    const float eg, const float bt,
+    const device float* s, device float* s_out,
+    const uint d, const uint h_v, const uint dv, const uint h, const uint j,
+    const uint split, const bool live, const uint t,
+    threadgroup float* part, device float* o_out) {
   float sv[R];
   float r = 0.0f;
   if (live) {
@@ -256,7 +250,7 @@ static inline void gdn_step_reg_body(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   r = 0.0f;
   for (uint jj = 0; jj < split; jj++) r += part[jj * h_v + h];
-  const float delta = b * (v[dv] - r);
+  const float delta = bt * (v[dv] - r);
   float acc = 0.0f;
   if (live) {
     uint u = 0;
@@ -272,10 +266,12 @@ static inline void gdn_step_reg_body(
   if (j == 0) {
     float sum = 0.0f;
     for (uint jj = 0; jj < split; jj++) sum += part[jj * h_v + h];
-    o[(size_t)h * d + dv] = sum;
+    o_out[(size_t)h * d + dv] = sum;
   }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
+// `gdn_step_f32` in the register form (`gdn_step_column_reg`).
 #define GDN_STEP_REG(R)                                                                     \
   kernel void gdn_step_r##R##_f32(                                                          \
       const device float* heads [[buffer(0)]], const device float* alpha [[buffer(1)]],     \
@@ -286,8 +282,16 @@ static inline void gdn_step_reg_body(
       uint dv [[threadgroup_position_in_grid]], uint t [[thread_position_in_threadgroup]], \
       uint width [[threads_per_threadgroup]]) {                                             \
     threadgroup float part[1024];                                                           \
-    gdn_step_reg_body<R>(heads, alpha, beta, dt_bias, ssm_a, s, o, d, h_v, s_out, dv, t,    \
-                         width, part);                                                      \
+    const uint split = width / h_v;                                                         \
+    const uint h = t % h_v;                                                                 \
+    const uint j = t / h_v;                                                                 \
+    const float a = alpha[h] + dt_bias[h];                                                  \
+    const float sp = metal::max(a, 0.0f) + metal::log(1.0f + metal::exp(-metal::fabs(a))); \
+    const float eg = metal::exp(ssm_a[h] * sp);                                             \
+    const float b = 1.0f / (1.0f + metal::exp(-beta[h]));                                   \
+    gdn_step_column_reg<R>(heads + (size_t)h * d, heads + (size_t)(h_v + h) * d,           \
+                           heads + (size_t)(2 * h_v + h) * d, eg, b, s, s_out, d, h_v, dv,  \
+                           h, j, split, j < split, t, part, o);                             \
   }
 GDN_STEP_REG(16)
 GDN_STEP_REG(32)
@@ -663,28 +667,40 @@ static inline float gdn_gate_eg(const float alpha, const float dt_bias, const fl
   return metal::exp(ssm_a * sp);
 }
 
+// The column a step kernel runs, by form: `R = 0` the loop form
+// (`gdn_step_column`), else the register form holding up to `R` values.
+template <uint R>
+struct GdnColumn {
+  static inline void run(const device float* q, const device float* k, const device float* v,
+                         const float eg, const float bt, const device float* s,
+                         device float* s_out, const uint d, const uint h_v, const uint dv,
+                         const uint h, const uint j, const uint split, const bool live,
+                         const uint t, threadgroup float* part, device float* o_out) {
+    gdn_step_column_reg<R>(q, k, v, eg, bt, s, s_out, d, h_v, dv, h, j, split, live, t, part,
+                           o_out);
+  }
+};
+template <>
+struct GdnColumn<0> {
+  static inline void run(const device float* q, const device float* k, const device float* v,
+                         const float eg, const float bt, const device float* s,
+                         device float* s_out, const uint d, const uint h_v, const uint dv,
+                         const uint h, const uint j, const uint split, const bool live,
+                         const uint t, threadgroup float* part, device float* o_out) {
+    gdn_step_column(q, k, v, eg, bt, s, s_out, d, h_v, dv, h, j, split, live, t, part, o_out);
+  }
+};
+
 // `gdn_step_f32` over `B` rows: `heads [B, 3, h_v, d]`, `alpha` / `beta`
 // `[B, h_v]`, the `S` pool (row `b` reads `phases[b]` at `slots[b]`, writes
 // the next phase), `o [B, h_v, d]`. Grid: d × B threadgroups of `h_v × split`.
-kernel void gdn_step_rows_f32(
-    const device float* heads [[buffer(0)]],
-    const device float* alpha [[buffer(1)]],
-    const device float* beta [[buffer(2)]],
-    const device float* dt_bias [[buffer(3)]],
-    const device float* ssm_a [[buffer(4)]],
-    const device float* s_pool [[buffer(5)]],
-    const device uint* slots [[buffer(6)]],
-    const device uint* phases [[buffer(7)]],
-    device float* o [[buffer(8)]],
-    constant uint& d [[buffer(9)]],
-    constant uint& h_v [[buffer(10)]],
-    constant uint& n_slots [[buffer(11)]],
-    constant uint& n_phases [[buffer(12)]],
-    device float* s_pool_out [[buffer(13)]],
-    uint2 gid [[threadgroup_position_in_grid]],
-    uint2 tid [[thread_position_in_threadgroup]],
-    uint2 tptg [[threads_per_threadgroup]]) {
-  threadgroup float part[1024];
+template <uint R>
+static inline void gdn_step_rows_body(
+    const device float* heads, const device float* alpha, const device float* beta,
+    const device float* dt_bias, const device float* ssm_a, const device float* s_pool,
+    const device uint* slots, const device uint* phases, device float* o, const uint d,
+    const uint h_v, const uint n_slots, const uint n_phases, device float* s_pool_out,
+    const uint2 gid, const uint2 tid, const uint2 tptg, threadgroup float* part) {
   const uint dv = gid.x;
   const uint b = gid.y;
   const uint t = tid.x;
@@ -701,9 +717,9 @@ kernel void gdn_step_rows_f32(
   const device float* hrow = heads + (size_t)b * 3 * h_v * d;
   const float eg = gdn_gate_eg(alpha[(size_t)b * h_v + h], dt_bias[h], ssm_a[h]);
   const float bt = 1.0f / (1.0f + metal::exp(-beta[(size_t)b * h_v + h]));
-  gdn_step_column(hrow + (size_t)h * d, hrow + (size_t)(h_v + h) * d, hrow + (size_t)(2 * h_v + h) * d,
-                  eg, bt, s, s_out, d, h_v, dv, h, j, split, live, t, part,
-                  o + (size_t)b * h_v * d);
+  GdnColumn<R>::run(hrow + (size_t)h * d, hrow + (size_t)(h_v + h) * d,
+                    hrow + (size_t)(2 * h_v + h) * d, eg, bt, s, s_out, d, h_v, dv, h, j, split,
+                    live, t, part, o + (size_t)b * h_v * d);
 }
 
 // `gdn_step_f32` over `T` POSITIONS of one row, in one launch: position t
@@ -713,27 +729,14 @@ kernel void gdn_step_rows_f32(
 // `[T, h_v]`, `o [T, h_v, d]`. A threadgroup owns column `dv` for every
 // head — the recurrence of a column depends on that column alone — so the
 // positions run in sequence inside the group, each step the arithmetic of
-// `gdn_step_f32`. Grid: d threadgroups of `h_v × split`.
-kernel void gdn_step_seq_f32(
-    const device float* heads [[buffer(0)]],
-    const device float* alpha [[buffer(1)]],
-    const device float* beta [[buffer(2)]],
-    const device float* dt_bias [[buffer(3)]],
-    const device float* ssm_a [[buffer(4)]],
-    const device float* s_pool [[buffer(5)]],
-    device float* o [[buffer(6)]],
-    constant uint& d [[buffer(7)]],
-    constant uint& h_v [[buffer(8)]],
-    constant uint& n_slots [[buffer(9)]],
-    constant uint& n_phases [[buffer(10)]],
-    constant uint& slot [[buffer(11)]],
-    constant uint& phase [[buffer(12)]],
-    constant uint& steps [[buffer(13)]],
-    device float* s_pool_out [[buffer(14)]],
-    uint dv [[threadgroup_position_in_grid]],
-    uint t [[thread_position_in_threadgroup]],
-    uint width [[threads_per_threadgroup]]) {
-  threadgroup float part[1024];
+// the one-row step in the same form. Grid: d threadgroups of `h_v × split`.
+template <uint R>
+static inline void gdn_step_seq_body(
+    const device float* heads, const device float* alpha, const device float* beta,
+    const device float* dt_bias, const device float* ssm_a, const device float* s_pool,
+    device float* o, const uint d, const uint h_v, const uint n_slots, const uint n_phases,
+    const uint slot, const uint phase, const uint steps, device float* s_pool_out,
+    const uint dv, const uint t, const uint width, threadgroup float* part) {
   const uint split = width / h_v;
   const uint h = t % h_v;
   const uint j = t / h_v;
@@ -745,11 +748,46 @@ kernel void gdn_step_seq_f32(
     const device float* hrow = heads + (size_t)p * 3 * h_v * d;
     const float eg = gdn_gate_eg(alpha[(size_t)p * h_v + h], dt_bias[h], ssm_a[h]);
     const float bt = 1.0f / (1.0f + metal::exp(-beta[(size_t)p * h_v + h]));
-    gdn_step_column(hrow + (size_t)h * d, hrow + (size_t)(h_v + h) * d, hrow + (size_t)(2 * h_v + h) * d,
-                    eg, bt, s, s_out, d, h_v, dv, h, j, split, live, t, part,
-                    o + (size_t)p * h_v * d);
+    GdnColumn<R>::run(hrow + (size_t)h * d, hrow + (size_t)(h_v + h) * d,
+                      hrow + (size_t)(2 * h_v + h) * d, eg, bt, s, s_out, d, h_v, dv, h, j,
+                      split, live, t, part, o + (size_t)p * h_v * d);
   }
 }
+
+// The rows and multi-position kernels in form `R` (0 = the loop form, whose
+// names carry no `_r<R>`).
+#define GDN_STEP_ROWS_SEQ(R, SUFFIX)                                                           \
+  kernel void gdn_step_rows##SUFFIX##_f32(                                                     \
+      const device float* heads [[buffer(0)]], const device float* alpha [[buffer(1)]],        \
+      const device float* beta [[buffer(2)]], const device float* dt_bias [[buffer(3)]],       \
+      const device float* ssm_a [[buffer(4)]], const device float* s_pool [[buffer(5)]],       \
+      const device uint* slots [[buffer(6)]], const device uint* phases [[buffer(7)]],         \
+      device float* o [[buffer(8)]], constant uint& d [[buffer(9)]],                           \
+      constant uint& h_v [[buffer(10)]], constant uint& n_slots [[buffer(11)]],                \
+      constant uint& n_phases [[buffer(12)]], device float* s_pool_out [[buffer(13)]],         \
+      uint2 gid [[threadgroup_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]], \
+      uint2 tptg [[threads_per_threadgroup]]) {                                                \
+    threadgroup float part[1024];                                                              \
+    gdn_step_rows_body<R>(heads, alpha, beta, dt_bias, ssm_a, s_pool, slots, phases, o, d, h_v, \
+                          n_slots, n_phases, s_pool_out, gid, tid, tptg, part);                \
+  }                                                                                            \
+  kernel void gdn_step_seq##SUFFIX##_f32(                                                      \
+      const device float* heads [[buffer(0)]], const device float* alpha [[buffer(1)]],        \
+      const device float* beta [[buffer(2)]], const device float* dt_bias [[buffer(3)]],       \
+      const device float* ssm_a [[buffer(4)]], const device float* s_pool [[buffer(5)]],       \
+      device float* o [[buffer(6)]], constant uint& d [[buffer(7)]],                           \
+      constant uint& h_v [[buffer(8)]], constant uint& n_slots [[buffer(9)]],                  \
+      constant uint& n_phases [[buffer(10)]], constant uint& slot [[buffer(11)]],              \
+      constant uint& phase [[buffer(12)]], constant uint& steps [[buffer(13)]],                \
+      device float* s_pool_out [[buffer(14)]], uint dv [[threadgroup_position_in_grid]],       \
+      uint t [[thread_position_in_threadgroup]], uint width [[threads_per_threadgroup]]) {     \
+    threadgroup float part[1024];                                                              \
+    gdn_step_seq_body<R>(heads, alpha, beta, dt_bias, ssm_a, s_pool, o, d, h_v, n_slots,       \
+                         n_phases, slot, phase, steps, s_pool_out, dv, t, width, part);        \
+  }
+GDN_STEP_ROWS_SEQ(0, )
+GDN_STEP_ROWS_SEQ(16, _r16)
+GDN_STEP_ROWS_SEQ(32, _r32)
 
 // `gdn_gated_norm_f32` over `B` rows: `o [B, h_v, d]`, `z [B, h_v·d]` →
 // `[B, h_v·d]`. Grid: h_v × B threadgroups.

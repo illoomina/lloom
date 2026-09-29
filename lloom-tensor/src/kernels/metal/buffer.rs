@@ -40,8 +40,8 @@ pub struct Buffer {
     /// carries its slot size so `length()` cannot report the whole arena.
     length: Option<usize>,
 
-    /// Whether `contents()` addresses CPU-readable memory: false for Private
-    /// storage, decided once at construction (see `new`).
+    /// Whether `contents()` may be trusted at all: false for a Private buffer
+    /// placed in a heap, decided once at construction (see `new`).
     cpu_visible: bool,
 }
 
@@ -50,17 +50,14 @@ unsafe impl Sync for Buffer {}
 
 impl Buffer {
     pub fn new(raw: Retained<ProtocolObject<dyn MTLBuffer>>) -> Buffer {
-        // A Private buffer has no CPU mapping. `contents()` says so with a
-        // null for a buffer of its own — and with a NON-null, invalid pointer
-        // for a buffer sub-allocated from a Private `MTLHeap` (measured: the
-        // readback's `contents().is_null()` fast path took it and faulted,
-        // lloom #749 P26). Decided once here from the storage mode, which is
-        // the property the question is about; `data()` returns null for it
-        // whatever Metal hands back.
-        let cpu_visible = {
-            use objc2_metal::MTLResource as _;
-            raw.storageMode() != objc2_metal::MTLStorageMode::Private
-        };
+        // A Private buffer placed in an `MTLHeap` answers `contents()` with
+        // null plus its heap offset: non-null, not a CPU mapping, and reading
+        // it faults (§6.3k). A Private buffer of its own answers truthfully: a
+        // mapping below 16384 B, null at or above (§15.2 #12a). So heap
+        // placement is what makes the answer untrustworthy, and only it is
+        // overridden.
+        let cpu_visible =
+            raw.storageMode() != objc2_metal::MTLStorageMode::Private || raw.heap().is_none();
         super::arena::note_new_buffer(Retained::as_ptr(&raw) as usize);
         Buffer {
             raw,
@@ -146,7 +143,8 @@ impl Buffer {
     /// CPU mapping -- unchanged by the offset, since `null + n` is still not
     /// readable and callers already assert on it. Below that threshold a
     /// Private allocation *is* mapped, which is `DESIGN.md` §15.2 #12a's
-    /// correction to the older "null for Private" reading.
+    /// correction to the older "null for Private" reading. Null, too, for a
+    /// Private buffer placed in a heap, whatever `contents()` returns (`new`).
     ///
     /// # This function's own null check folded away (#366, repaired #454)
     ///

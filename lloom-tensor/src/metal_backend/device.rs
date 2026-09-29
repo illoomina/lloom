@@ -2572,6 +2572,12 @@ impl MetalDevice {
     pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<PooledBuffer>> {
         let unpooled_uploads = Self::unpooled;
         let size = core::mem::size_of_val(data);
+        // Metal refuses a zero-length `newBufferWithBytes`, and an empty tensor
+        // is legal: it gets the pool's minimum allocation, as `allocate_buffer`
+        // gives any empty request (`buf_size`), with nothing to copy.
+        if size == 0 {
+            return self.allocate_buffer(0);
+        }
         // A small upload is served from the buffer pool and filled on the host:
         // an acquired buffer has no GPU reader (reuse waits for completion,
         // §6.3b), so a host write into it is what `newBufferWithBytes` did

@@ -199,29 +199,15 @@ fn repeated_identical_work_converges_to_bounded_reuse() -> Result<()> {
 /// Deferring release to GPU completion holds more buffers at once than
 /// releasing on CPU drop did, which is the cost of the change. The cost has to
 /// be a constant -- the depth of the in-flight window -- and not something that
-/// grows with how long the process runs, which is the shape issue #21 removed
-/// from the free-list scan and must not be reintroduced in the footprint.
+/// grows with how long the process runs, which is the shape removed from the
+/// free-list scan and must not be reintroduced in the footprint.
 ///
-/// # The horizon matters, and an earlier version of this test got it wrong
-///
-/// It warmed up for 200 iterations and then required the next 1000 to change
-/// the footprint by nothing at all. That failed, and the failure was the test's:
-/// 200 iterations is still on the ramp. Measured on an M1 Max, the footprint
-/// climbs for roughly 4000 iterations and is then flat *to the byte*:
-///
-/// ```text
-///   after  2000 iters: total=  93413760
-///   after  3000 iters: total= 131067648
-///   after  4000 iters: total= 140579456   <- plateau
-///   after  6000 iters: total= 140579456
-///   after  8000 iters: total= 140579456
-///   after 10000 iters: total= 140579456
-/// ```
-///
-/// Thirteen consecutive samples at exactly 140,579,456 bytes. So the property
-/// is real and the assertion was measuring it too early -- convergence takes
-/// longer than one iteration's working set suggests, because the working set
-/// is the in-flight window's, not one iteration's.
+/// The window is only a constant when the host paces the GPU. Run free, the
+/// CPU gets as far ahead as the queue allows, the pool keeps the deepest
+/// window it has ever needed, and a slower GPU later (another process's work)
+/// raises that plateau: a running maximum, bounded by the queue and not flat.
+/// So the work here waits once per iteration, as decode does once per token,
+/// and the footprint must then be flat to the byte (`DESIGN.md` §6.3b).
 #[test]
 fn pool_footprint_converges_and_stays_flat() -> Result<()> {
     let _guard = lock();
@@ -244,11 +230,11 @@ fn pool_footprint_converges_and_stays_flat() -> Result<()> {
         for _ in 0..n {
             let c = ((&a + &b)? * 2.0)?;
             let _ = c.sum_all()?;
+            metal.wait_until_completed()?;
         }
         Ok(())
     };
 
-    // Past the ramp. See the table above for where the plateau actually is.
     work(5000)?;
     let settled = footprint(metal);
 
@@ -443,24 +429,29 @@ fn growing_allocations_do_not_grow_the_pool_without_bound() -> Result<()> {
         s.total_bytes() + p.total_bytes()
     };
 
-    // Ever-larger tensors, as a growing KV cache produces.
+    // Ever-larger tensors, as a growing KV cache produces. Each footprint is
+    // read after a wait: the wait drains every pending buffer to its free list
+    // and evicts past the budget, so the figure is the bound's and not how far
+    // the CPU happened to run ahead of a shared GPU.
     for n in 1..300usize {
         let t = Tensor::zeros((n, 512), DType::F32, &device)?;
         let _ = (&t + 1.0)?;
     }
+    metal.wait_until_completed()?;
     let at_300 = footprint(metal);
 
     for n in 300..600usize {
         let t = Tensor::zeros((n, 512), DType::F32, &device)?;
         let _ = (&t + 1.0)?;
     }
+    metal.wait_until_completed()?;
     let at_600 = footprint(metal);
 
     // Each of the two pools caps its free list at 256 MB, and both are counted
-    // here, so the ceiling this can reach is 512 MB plus whatever is in flight.
-    // What the assertion is really about is that the ceiling exists: without it
-    // the second half adds a second half's worth of stranded buffers and the
-    // total keeps climbing with the loop bound, unbounded.
+    // here; after the wait nothing is pending, so the ceiling is 512 MB plus
+    // what is live. What the assertion is really about is that the ceiling
+    // exists: without it the second half adds a second half's worth of
+    // stranded buffers and the total keeps climbing with the loop bound.
     let ceiling = 2 * 256 * 1024 * 1024 + 64 * 1024 * 1024;
     assert!(
         at_600 <= ceiling,
@@ -469,21 +460,9 @@ fn growing_allocations_do_not_grow_the_pool_without_bound() -> Result<()> {
          is not bounded"
     );
 
-    // **The free lists specifically, which is what the bound is on.**
-    //
-    // The assertion above is on `total_bytes()` -- live + free + pending -- so
-    // its 64 MiB slack term has to cover a whole in-flight window, and that
-    // window is a property of the machine's scheduling rather than of the
-    // bound. Measured, it does not always: this test fails intermittently on
-    // `lloom/integration` at 088d7249, **6 of 30** interleaved against **9 of
-    // 30** on issue #210's branch, always at the same figure -- 622 962 688
-    // bytes, 86.1 MB of live+pending against 67.1 MB of slack. Both arms, one
-    // population, and §1.3 says a difference that size at that sample is not
-    // evidence of anything.
-    //
-    // So the free-list bound gets its own assertion, on the quantity the bound
-    // is actually enforced against. This one cannot be perturbed by how far the
-    // CPU has run ahead of the GPU, which is what makes it the sharper half.
+    // The free lists specifically, which is what the bound is on: the total
+    // above also carries what is live, and this is the quantity the budget is
+    // enforced against (`DESIGN.md` §6.3b).
     let (s, p) = metal.pool_occupancy();
     let cap = 256 * 1024 * 1024;
     assert!(
@@ -836,23 +815,20 @@ fn evicting_a_free_buffer_releases_the_allocation_to_metal() -> Result<()> {
     Ok(())
 }
 
-/// **A residency commit was already on the allocation path**, which is the fact
-/// that makes the eager arm affordable (`DESIGN.md` §6.3e, issue #210).
+/// **A pool miss stages its residency add, and the next command-buffer cut
+/// commits everything staged once** (`DESIGN.md` §6.3b, §6.3i).
 ///
-/// §6.3d attributes eager unregistration's cost to putting a `commit()` on the
-/// per-token path, and §6.3e wonders whether a sweep folded into the existing
-/// completion handler could avoid one because *"the `commit()` may not be
-/// additional"*. Both are reasoning about the same quantity and neither had
-/// counted it. Counted: `ResidencySet::insert` is one buffer and one commit, and
-/// every pool **miss** calls it — so allocation already commits at the
-/// allocation rate, and what eviction adds is one commit per *round*.
+/// The allocation path's residency cost is one `addAllocation` per miss and
+/// one `commit()` per cut that follows a miss, never one per buffer. §6.3f's
+/// cost comparison for eager release was made against the per-miss commit this
+/// replaced, so a return to it would change that comparison as well as the
+/// prefill's cost; this pins the batched form so either change fails here.
 ///
-/// Pinned as a test because it is the load-bearing premise of the choice #210
-/// made, and because a future change routing allocation through `insert_batch`
-/// would improve it — at which point this test says so by failing rather than
-/// leaving the reasoning stale.
+/// A fresh device has empty pools, so the four direct allocations below are
+/// four misses and encode nothing (no cut can fall between them), and the one
+/// dispatch after them is the only work the wait's cut commits.
 #[test]
-fn allocation_already_commits_the_residency_set() -> Result<()> {
+fn a_pool_miss_stages_its_residency_add_and_the_cut_commits_once() -> Result<()> {
     let _guard = lock();
     let Some(device) = metal_device() else {
         return Ok(());
@@ -861,31 +837,45 @@ fn allocation_already_commits_the_residency_set() -> Result<()> {
         return Ok(());
     };
 
-    // Warm the pool so the sizes below are genuine misses rather than hits: a
-    // hit allocates nothing and registers nothing, which is the property
-    // `a_pool_hit_is_not_subject_to_the_cap` pins one layer down.
     let before = metal.residency_counters();
-
-    // Distinct, unusual sizes so each one misses.
     let mut held = Vec::new();
     for i in 0..4 {
-        held.push(Tensor::zeros((37, 1024 + i * 7), DType::F32, &device)?);
+        held.push(metal.allocate_buffer(37 * (1024 + i * 7) * 4)?);
     }
-    let after = metal.residency_counters();
-
-    let added = after.added - before.added;
-    let commits = after.commits - before.commits;
-    assert!(
-        added > 0,
-        "no allocation registered, so this test measured nothing"
+    let staged = metal.residency_counters();
+    assert_eq!(
+        staged.added - before.added,
+        4,
+        "four misses on an empty pool must stage four residency adds"
     );
     assert_eq!(
-        commits, added,
-        "expected one commit per registered allocation, got {commits} for \
-         {added} additions. This is the figure the eviction cost is compared \
-         against (§6.3e): if allocation batched its commits, the eager \
-         eviction arm's relative cost would be larger than #210 measured."
+        staged.commits - before.commits,
+        0,
+        "a pool miss committed the residency set inline: the per-buffer form \
+         §6.3b's batching removed, at ~0.087 ms a commit"
     );
+
+    // One dispatch, then the wait that cuts its command buffer. The input is a
+    // host upload (a pool buffer filled by memcpy, nothing encoded), so the
+    // affine is the only work before the cut.
+    let out = (Tensor::new(&[1f32, 2., 3., 4.], &device)? + 1.0)?;
+    metal.wait_until_completed()?;
+    let cut = metal.residency_counters();
+    assert!(
+        cut.added - staged.added >= 1,
+        "the dispatch's own allocations were not misses; the cut below would \
+         then be committing only the four above"
+    );
+    assert_eq!(
+        cut.commits - staged.commits,
+        1,
+        "one command-buffer cut must commit every staged add once, got {} \
+         commits for {} adds",
+        cut.commits - staged.commits,
+        cut.added - before.added
+    );
+    // Read after the counters: a readback may cut a command buffer of its own.
+    assert_eq!(out.to_vec1::<f32>()?, [2., 3., 4., 5.]);
     drop(held);
     Ok(())
 }

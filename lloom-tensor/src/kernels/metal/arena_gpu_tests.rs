@@ -449,8 +449,12 @@ fn reset_orders_against_the_previous_steps_arena_reads() {
             .unwrap();
         let cursor = ArenaCursor::new(&device, &[128], 4096).unwrap();
 
-        let _ = trace::take_dispatches();
-        trace::set_recording(true);
+        // This queue's own trace window: the process-wide trace would also
+        // hold whatever the lib's other tests encode meanwhile (§15.1n).
+        let window = cmds
+            .dispatch_trace()
+            .open()
+            .expect("a trace window on a fresh queue");
         {
             let guard = cmds.command_encoder().unwrap();
             if read_arena {
@@ -468,11 +472,7 @@ fn reset_orders_against_the_previous_steps_arena_reads() {
             call_arena_reset(&device, &guard, &kernels, cursor.cursor_buffer(), &arena).unwrap();
         }
         cmds.wait_until_completed().unwrap();
-        trace::set_recording(false);
-        trace::take_dispatches()
-            .iter()
-            .filter(|d| d.barrier)
-            .count()
+        window.close().iter().filter(|d| d.barrier).count()
     };
 
     let without_reader = barriers_with(false);

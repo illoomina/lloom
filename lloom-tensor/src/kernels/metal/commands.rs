@@ -429,6 +429,9 @@ pub struct Commands {
     /// This queue's own dispatch census (`profile::DeviceCensus`), handed to
     /// every compute encoder this creates while profiling is on.
     census: Arc<crate::kernels::metal::profile::DeviceCensus>,
+    /// This queue's own dispatch trace (`trace::DeviceTrace`), handed to
+    /// every compute encoder this creates while the trace switch is on.
+    trace: Arc<crate::kernels::metal::trace::DeviceTrace>,
     /// Run after each command buffer completes, once per command buffer.
     ///
     /// The buffer pools subscribe here to sweep in what that command buffer was
@@ -677,6 +680,7 @@ impl Commands {
             residency_set,
             clock: Arc::new(GpuClock::new()),
             census: Arc::default(),
+            trace: Arc::default(),
             on_complete: Arc::new(parking_lot::Mutex::new(Vec::new())),
             executor: parking_lot::Mutex::new(Arc::new(ExecutorSlot::Classical)),
             completion_wait,
@@ -826,6 +830,12 @@ impl Commands {
         &self.census
     }
 
+    /// The dispatch trace of this queue alone, for a window that must not
+    /// record another device's work (`trace::DeviceTrace`).
+    pub fn dispatch_trace(&self) -> &Arc<crate::kernels::metal::trace::DeviceTrace> {
+        &self.trace
+    }
+
     /// Registers `f` to run after every command buffer completes.
     ///
     /// Must be called during device setup, before any work is encoded:
@@ -967,6 +977,9 @@ impl Commands {
             if crate::kernels::metal::profile::enabled() {
                 enc = enc.with_census(Arc::clone(&self.census));
             }
+            if crate::kernels::metal::trace::trace_requested() {
+                enc = enc.with_trace(Arc::clone(&self.trace));
+            }
             if let Some(flag) = self.eos_gate.armed_flag() {
                 // The EOS gate (lloom #735 step 4): the gated kernel variants
                 // read the flag at this index; bound once per encoder.
@@ -978,7 +991,7 @@ impl Commands {
             }
             // Hazard state is per encoder, so a barrier count is only
             // interpretable against the session boundaries (`DESIGN.md` §9.2e).
-            crate::kernels::metal::trace::record_encoder_begin();
+            crate::kernels::metal::trace::record_encoder_begin(enc.trace.as_deref());
             crate::kernels::metal::profile::record_encoder();
             // The audit needs the seam as a first-class ordering primitive, not
             // only as context for a count: a cross-session edge is ordered by

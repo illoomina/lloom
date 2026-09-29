@@ -16,9 +16,17 @@
 //! row, pooled rows, a multi-position window) and its chunked prefill, at
 //! Qwen4-exp's head geometry (k = 4) and at one no model has (k = 3, d = 24,
 //! 2 → 6 heads).
+//!
+//! The GDN fixtures name the step's form rather than take the configured one:
+//! the loop form's are the pre-block kernels' hashes above; the register
+//! form's (`gdn … register …`) were taken on the tree that gave the register
+//! form its rows and window kernels, whose bits
+//! `gdn_step_forms.rs` holds to the one-row step's
+//! (`design/measurements/issue-839-raw/golden.txt`).
 #![cfg(feature = "metal")]
 
 use lloom::models::qwen4exp::{Config, GatedDeltaNet};
+use lloom::nn::gdn::GdnStepForm;
 use lloom::nn::{RecurrentState, StatePool};
 use lloom_tensor::quantized::QMatMul;
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -155,7 +163,7 @@ fn lin(out: usize, inp: usize, seed: usize, dev: &Device) -> Result<QMatMul> {
     )?))
 }
 
-fn gdn_block(cfg: &Config, dev: &Device) -> Result<GatedDeltaNet> {
+fn gdn_block(cfg: &Config, form: GdnStepForm, dev: &Device) -> Result<GatedDeltaNet> {
     let d = cfg.hidden_size;
     let conv_ch = cfg.conv_channels();
     let value_dim = cfg.ssm_state_size * cfg.ssm_dt_rank;
@@ -174,7 +182,8 @@ fn gdn_block(cfg: &Config, dev: &Device) -> Result<GatedDeltaNet> {
         ramp(cfg.ssm_state_size, &|i| 1.0 + 0.01 * (i % 5) as f32)?,
         lin(d, value_dim, 6, dev)?,
         cfg,
-    ))
+    )
+    .with_step_form(form))
 }
 
 fn x_at(d: usize, t: usize, dev: &Device) -> Result<Tensor> {
@@ -184,10 +193,16 @@ fn x_at(d: usize, t: usize, dev: &Device) -> Result<Tensor> {
 fn gdn_fixtures(
     name: &str,
     cfg: &Config,
+    form: GdnStepForm,
     dev: &Device,
     out: &mut Vec<(String, String)>,
 ) -> Result<()> {
-    let blk = gdn_block(cfg, dev)?;
+    let blk = gdn_block(cfg, form, dev)?;
+    assert_eq!(blk.step_form(), form);
+    let name = match form {
+        GdnStepForm::Loop => name.to_string(),
+        GdnStepForm::Register => format!("{name} register"),
+    };
     let d = cfg.hidden_size;
     let dims = cfg.deltanet_dims();
     let (dk, h_v, conv_ch, k) = (dims.d_k, dims.h_v, cfg.conv_channels(), cfg.ssm_conv_kernel);
@@ -287,7 +302,8 @@ fn gdn_configs() -> Vec<(&'static str, Config)> {
     vec![("heads16x48-d128-k4", real), ("heads2x6-d24-k3", odd)]
 }
 
-/// The pre-block tree's hashes (`design/measurements/issue-840-raw/golden-base.txt`).
+/// The pre-block tree's hashes (`design/measurements/issue-840-raw/golden-base.txt`),
+/// then the register form's (`design/measurements/issue-839-raw/golden.txt`).
 const GOLDEN: &[(&str, &str)] = &[
     ("step f16 hidden=37 k=2 b=2 out", "8cdf5b20c0383f3f"),
     ("step f16 hidden=37 k=2 b=2 state", "cf4cc264cab0cfc0"),
@@ -481,6 +497,54 @@ const GOLDEN: &[(&str, &str)] = &[
     ("gdn heads2x6-d24-k3 rows state", "2048d3f4868d6dd0"),
     ("gdn heads2x6-d24-k3 seq", "8e8f82ae7c31a4c4"),
     ("gdn heads2x6-d24-k3 seq pools", "68a5540f0ff196cf"),
+    ("gdn heads16x48-d128-k4 register decode", "0045079f925f38de"),
+    (
+        "gdn heads16x48-d128-k4 register decode state",
+        "43eb30165271b56f",
+    ),
+    (
+        "gdn heads16x48-d128-k4 register prefill",
+        "6b6b6f6c30bccddd",
+    ),
+    (
+        "gdn heads16x48-d128-k4 register prefill state",
+        "566bea49e41be0f2",
+    ),
+    (
+        "gdn heads16x48-d128-k4 register decode after prefill",
+        "4b2d3e9399798ad3",
+    ),
+    ("gdn heads16x48-d128-k4 register rows", "f328eca06a4f53c0"),
+    (
+        "gdn heads16x48-d128-k4 register rows state",
+        "7a0d842ad0fe6066",
+    ),
+    ("gdn heads16x48-d128-k4 register seq", "ecfcacda3a6fa4c2"),
+    (
+        "gdn heads16x48-d128-k4 register seq pools",
+        "a903bfed10e23106",
+    ),
+    ("gdn heads2x6-d24-k3 register decode", "9ac02ea26a7ee376"),
+    (
+        "gdn heads2x6-d24-k3 register decode state",
+        "91c8617d3fc43bfc",
+    ),
+    ("gdn heads2x6-d24-k3 register prefill", "e11009398d1e3b1f"),
+    (
+        "gdn heads2x6-d24-k3 register prefill state",
+        "992e5e06a8963597",
+    ),
+    (
+        "gdn heads2x6-d24-k3 register decode after prefill",
+        "556e6009be1e2a0a",
+    ),
+    ("gdn heads2x6-d24-k3 register rows", "974aca3c8fe03982"),
+    (
+        "gdn heads2x6-d24-k3 register rows state",
+        "47ae84353b3f156c",
+    ),
+    ("gdn heads2x6-d24-k3 register seq", "82c110ce53c6ec0a"),
+    ("gdn heads2x6-d24-k3 register seq pools", "a98d06de3aefbc64"),
 ];
 
 #[test]
@@ -488,8 +552,10 @@ fn the_blocks_compute_what_the_kernels_they_replaced_did() -> Result<()> {
     let dev = Device::new_metal(0)?;
     let mut got = Vec::new();
     lfm2_fixtures(&dev, &mut got)?;
-    for (name, cfg) in gdn_configs() {
-        gdn_fixtures(name, &cfg, &dev, &mut got)?;
+    for form in [GdnStepForm::Loop, GdnStepForm::Register] {
+        for (name, cfg) in gdn_configs() {
+            gdn_fixtures(name, &cfg, form, &dev, &mut got)?;
+        }
     }
     for (name, h) in &got {
         println!("GOLDEN {h} {name}");
@@ -528,8 +594,10 @@ fn the_fixtures_are_deterministic() -> Result<()> {
     let run = || -> Result<Vec<(String, String)>> {
         let mut v = Vec::new();
         lfm2_fixtures(&dev, &mut v)?;
-        for (name, cfg) in gdn_configs() {
-            gdn_fixtures(name, &cfg, &dev, &mut v)?;
+        for form in [GdnStepForm::Loop, GdnStepForm::Register] {
+            for (name, cfg) in gdn_configs() {
+                gdn_fixtures(name, &cfg, form, &dev, &mut v)?;
+            }
         }
         Ok(v)
     };

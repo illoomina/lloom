@@ -113,22 +113,7 @@ pub fn call_gdn_step(
     s_out: BufferOffset,
     register: bool,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Gdn, "gdn_step_f32")?;
-    // `h_v × split` threads: `split` slices of `dk` per head, as many as the
-    // threadgroup takes up to 8 (the reductions close over `split` partials
-    // in threadgroup memory; `h_v × split` ≤ 1024).
-    let split = gdn_split(h_v, &pipeline);
-    let pipeline = match gdn_step_reg_name(d, split).filter(|_| register) {
-        Some(name) => {
-            let reg = kernels.load_pipeline(device, Source::Gdn, name)?;
-            if reg.max_total_threads_per_threadgroup() >= h_v * split {
-                reg
-            } else {
-                pipeline
-            }
-        }
-        None => pipeline,
-    };
+    let (pipeline, split) = gdn_step_pipeline(device, kernels, StepShape::Row, d, h_v, register)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -152,16 +137,59 @@ pub fn call_gdn_step(
     Ok(())
 }
 
-/// The register form of `gdn_step` whose array holds a thread's
-/// `ceil(d / split)` values of `S`, if one is instantiated.
-fn gdn_step_reg_name(d: usize, split: usize) -> Option<&'static str> {
-    if split == 0 {
-        return None;
+/// The step kernels' shapes: one row, the rows of a pool, the positions of
+/// one row.
+#[derive(Debug, Clone, Copy)]
+enum StepShape {
+    Row,
+    Rows,
+    Seq,
+}
+
+/// The pipeline for `shape` and the `split` it runs at. `h_v × split`
+/// threads: `split` slices of `dk` per head, as many as the loop form's
+/// threadgroup takes up to the cap (the reductions close over `split`
+/// partials in threadgroup memory; `h_v × split` ≤ 1024). `register` takes
+/// the register form where an instantiated array bound covers `ceil(d /
+/// split)` and its pipeline takes the same threadgroup; otherwise the loop
+/// form. Both forms run at the loop form's `split`, so each form computes one
+/// arithmetic whatever the shape.
+fn gdn_step_pipeline(
+    device: &Device,
+    kernels: &Kernels,
+    shape: StepShape,
+    d: usize,
+    h_v: usize,
+    register: bool,
+) -> Result<(crate::kernels::ComputePipeline, usize), MetalKernelError> {
+    let (loop_name, reg16, reg32) = match shape {
+        StepShape::Row => ("gdn_step_f32", "gdn_step_r16_f32", "gdn_step_r32_f32"),
+        StepShape::Rows => (
+            "gdn_step_rows_f32",
+            "gdn_step_rows_r16_f32",
+            "gdn_step_rows_r32_f32",
+        ),
+        StepShape::Seq => (
+            "gdn_step_seq_f32",
+            "gdn_step_seq_r16_f32",
+            "gdn_step_seq_r32_f32",
+        ),
+    };
+    let pipeline = kernels.load_pipeline(device, Source::Gdn, loop_name)?;
+    let split = gdn_split(h_v, &pipeline);
+    if !register || split == 0 {
+        return Ok((pipeline, split));
     }
-    match d.div_ceil(split) {
-        0..=16 => Some("gdn_step_r16_f32"),
-        17..=32 => Some("gdn_step_r32_f32"),
-        _ => None,
+    let name = match d.div_ceil(split) {
+        0..=16 => reg16,
+        17..=32 => reg32,
+        _ => return Ok((pipeline, split)),
+    };
+    let reg = kernels.load_pipeline(device, Source::Gdn, name)?;
+    if reg.max_total_threads_per_threadgroup() >= h_v * split {
+        Ok((reg, split))
+    } else {
+        Ok((pipeline, split))
     }
 }
 
@@ -601,7 +629,8 @@ fn gdn_split_cap() -> usize {
     crate::tuning::tuning().gdn.split
 }
 
-/// `gdn_step_rows_f32`: `B` rows of the recurrence over the `S` pool.
+/// `gdn_step_rows_f32`: `B` rows of the recurrence over the `S` pool, in the
+/// form `register` names (as [`call_gdn_step`]).
 #[allow(clippy::too_many_arguments)]
 pub fn call_gdn_step_rows(
     device: &Device,
@@ -621,8 +650,9 @@ pub fn call_gdn_step_rows(
     slots: BufferOffset,
     phases: BufferOffset,
     o: &Buffer,
+    register: bool,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Gdn, "gdn_step_rows_f32")?;
+    let (pipeline, split) = gdn_step_pipeline(device, kernels, StepShape::Rows, d, h_v, register)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -646,13 +676,13 @@ pub fn call_gdn_step_rows(
             Output::from_buffer_offset(&s_pool)
         )
     );
-    let split = gdn_split(h_v, &pipeline);
     dispatch_groups_2d(encoder, d, rows, h_v * split);
     Ok(())
 }
 
 /// `gdn_step_seq_f32`: `T` positions of one row's recurrence in one launch,
-/// every intermediate `S` kept at phases `phase + 1 ..= phase + T`.
+/// every intermediate `S` kept at phases `phase + 1 ..= phase + T`, in the
+/// form `register` names (as [`call_gdn_step`]).
 #[allow(clippy::too_many_arguments)]
 pub fn call_gdn_step_seq(
     device: &Device,
@@ -672,8 +702,9 @@ pub fn call_gdn_step_seq(
     ssm_a: BufferOffset,
     s_pool: BufferOffset,
     o: &Buffer,
+    register: bool,
 ) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Gdn, "gdn_step_seq_f32")?;
+    let (pipeline, split) = gdn_step_pipeline(device, kernels, StepShape::Seq, d, h_v, register)?;
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
     encoder.set_compute_pipeline_state(&pipeline);
@@ -698,7 +729,6 @@ pub fn call_gdn_step_seq(
             Output::from_buffer_offset(&s_pool)
         )
     );
-    let split = gdn_split(h_v, &pipeline);
     dispatch_groups(encoder, d, h_v * split);
     Ok(())
 }

@@ -134,3 +134,65 @@ fn rejects_string_length_above_remaining_file_bytes() {
     pad(&mut buf, 64);
     assert_rejects(buf, "string length");
 }
+
+/// `write` is `write_header` at `packed_offsets` followed by each tensor's
+/// bytes at its offset: the split a sparse writer places the data through
+/// (lloom `testing::scale`) produces the file `write` does, byte for byte,
+/// and the reader finds each tensor where the header says.
+#[test]
+fn write_is_its_header_then_each_tensor_at_its_offset() -> lloom_tensor::Result<()> {
+    use lloom_tensor::quantized::gguf_file::{
+        packed_offsets, write, write_header, HeaderTensor, Value,
+    };
+    use lloom_tensor::quantized::{GgmlDType, QTensor};
+    use lloom_tensor::Tensor;
+    use std::io::{Seek, SeekFrom, Write};
+    let dev = Device::Cpu;
+    let a = QTensor::quantize(
+        &Tensor::arange(0f32, 15.0, &dev)?.reshape((3, 5))?,
+        GgmlDType::F32,
+    )?;
+    let b = QTensor::quantize(
+        &(Tensor::arange(0f32, 128.0, &dev)?.reshape((2, 64))? / 7.0)?,
+        GgmlDType::Q8_0,
+    )?;
+    let md_v = Value::U32(7);
+    let md = [("general.test", &md_v)];
+    let mut whole = Cursor::new(Vec::new());
+    write(&mut whole, &md, &[("a", &a), ("b", &b)])?;
+    let whole = whole.into_inner();
+
+    let offsets = packed_offsets([a.storage_size_in_bytes(), b.storage_size_in_bytes()]);
+    assert_eq!(offsets, vec![0, 64], "15 f32 = 60 B, padded to 64");
+    let entries = [
+        HeaderTensor {
+            name: "a",
+            dims: a.shape().dims(),
+            dtype: GgmlDType::F32,
+            offset: offsets[0],
+        },
+        HeaderTensor {
+            name: "b",
+            dims: b.shape().dims(),
+            dtype: GgmlDType::Q8_0,
+            offset: offsets[1],
+        },
+    ];
+    let mut split = Cursor::new(Vec::new());
+    let start = write_header(&mut split, &md, &entries)?;
+    for (t, off) in [&a, &b].iter().zip(&offsets) {
+        split.seek(SeekFrom::Start(start + off))?;
+        split.write_all(&t.data()?)?;
+    }
+    let len = whole.len();
+    let mut split = split.into_inner();
+    split.resize(len, 0);
+    assert_eq!(split, whole, "header + placed data is `write`'s file");
+
+    let content = Content::read(&mut Cursor::new(&whole))?;
+    assert_eq!(content.tensor_data_offset, start);
+    assert_eq!(content.tensor_infos["b"].offset, 64);
+    let back = content.tensor(&mut Cursor::new(&whole), "b", &dev)?;
+    assert_eq!(back.data()?, b.data()?);
+    Ok(())
+}

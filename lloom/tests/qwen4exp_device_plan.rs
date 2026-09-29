@@ -3,76 +3,46 @@
 //! from the window) decodes the ids and the logits the resident model
 //! decodes — bit for bit — on a pool small enough that tokens miss and are
 //! replayed. CPU and, when present, Metal (the map kernel).
-use lloom::models::qwen4exp::testing;
-use lloom::models::qwen4exp::{Config, Qwen4Exp, Resident};
-use lloom::nn::expert_stream::{ExpertSource, LoaderArm, Streamed};
+//!
+//! The model is the loader's, from a GGUF (`lloom::testing::fixture`). On
+//! it, 3 slots of 8 miss on every pass, so the adaptive switch never arms
+//! the device plan (`expert-streaming.md` §20.14's steady-miss shape); 6
+//! slots over a 24-token decode arm it and replay.
+//!
+//! At scale (`LLOOM_FIXTURE=real|synthetic`, Metal) the resident model is
+//! 47 GB and refused at load (`memory.md` §9.5q), so the reference is the
+//! same tier at twice the pool, and the subject's pool must evict what the
+//! reference's holds: the stream may not depend on what a pool held. Whether
+//! the device plan arms at scale is the workload's routing, not the tier's:
+//! on the real checkpoint no probed prompt armed it within 24 tokens
+//! (`design/measurements/issue-865-real-scale.md`), so at scale its counters
+//! are reported and the eviction is what is asserted.
+use lloom::models::qwen4exp::testing::Qwen4ExpTiny;
+use lloom::models::qwen4exp::{
+    Cache, Config, ExpertResidency, LoadOptions, Qwen4Exp, SlotBudget, StreamLoader, StreamOptions,
+};
 use lloom::nn::model::CausalLM;
-use lloom_tensor::quantized::gguf_file::{self, Content};
-use lloom_tensor::quantized::{GgmlDType, QTensor};
+use lloom::testing::fixture::{Backend, Fixture};
 use lloom_tensor::{Device, Result, Tensor};
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-fn temp_gguf(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "lloom-device-plan-{}-{tag}.gguf",
-        std::process::id()
-    ))
+fn stream(slots: usize) -> StreamOptions {
+    StreamOptions {
+        slots: SlotBudget::Fixed(slots),
+        loader: StreamLoader::Pread,
+        prefetch: false,
+        io_hints: false,
+    }
 }
 
-/// Every layer's expert stacks in one GGUF, named as the loader names them.
-fn write_experts(cfg: &Config, path: &Path) -> Result<Vec<[QTensor; 3]>> {
-    let dev = Device::Cpu;
-    let stacks: Vec<[QTensor; 3]> = (0..cfg.n_layers)
-        .map(|l| testing::expert_stacks(cfg, l, &dev, GgmlDType::F32))
-        .collect();
-    let names: Vec<String> = (0..cfg.n_layers)
-        .flat_map(|l| {
-            [
-                format!("blk.{l}.ffn_gate_exps.weight"),
-                format!("blk.{l}.ffn_up_exps.weight"),
-                format!("blk.{l}.ffn_down_exps.weight"),
-            ]
-        })
-        .collect();
-    let refs: Vec<(&str, &QTensor)> = names
-        .iter()
-        .zip(stacks.iter().flat_map(|s| s.iter()))
-        .map(|(n, t)| (n.as_str(), t))
-        .collect();
-    let mut f = File::create(path)?;
-    gguf_file::write(&mut f, &[], &refs)?;
-    Ok(stacks)
-}
+type Decoded = (Vec<u32>, Vec<Vec<f32>>, Cache);
 
-fn streamed_model(
-    cfg: &Config,
-    dev: &Device,
-    path: &Path,
-    slots: usize,
-) -> Result<Qwen4Exp<Streamed>> {
-    let content = Content::read(&mut File::open(path)?)?;
-    testing::model_with(cfg, dev, |l| {
-        let src = |n: &str| ExpertSource::from_gguf(&content, path, n);
-        Streamed::new(
-            src(&format!("blk.{l}.ffn_gate_exps.weight"))?,
-            src(&format!("blk.{l}.ffn_up_exps.weight"))?,
-            src(&format!("blk.{l}.ffn_down_exps.weight"))?,
-            slots,
-            LoaderArm::Pread,
-            dev,
-        )
-    })
-}
-
-fn decode<R: lloom::nn::expert_stream::ExpertResidency>(
+fn decode<R: ExpertResidency>(
     model: &Qwen4Exp<R>,
     cfg: &Config,
     dev: &Device,
     prompt: &[u32],
     steps: usize,
-) -> Result<(Vec<u32>, Vec<Vec<f32>>, lloom::models::qwen4exp::Cache)> {
+) -> Result<Decoded> {
     let mut cache = model.new_cache(cfg, dev)?;
     let input = Tensor::from_vec(prompt.to_vec(), (1, prompt.len()), dev)?;
     let mut logits = model.forward(&input, 0, &mut cache)?;
@@ -95,50 +65,84 @@ fn decode<R: lloom::nn::expert_stream::ExpertResidency>(
     Ok((ids, rows, cache))
 }
 
-fn check_on(dev: &Device, tag: &str) -> Result<()> {
-    let mut cfg = Config::tiny();
-    cfg.n_experts = 8;
-    cfg.n_experts_per_tok = 2;
-    let path = temp_gguf(tag);
-    let stacks = write_experts(&cfg, &path)?;
-    let resident: Qwen4Exp<Resident> = testing::model_with(&cfg, dev, |l| {
-        let [g, u, d] = testing::expert_stacks(&cfg, l, dev, GgmlDType::F32);
-        Ok(Resident::new(Arc::new(g), Arc::new(u), Arc::new(d)))
-    })?;
-    drop(stacks);
-    // 3 slots for 8 experts at top-2: tokens miss, settles load, passes replay.
-    let streamed = streamed_model(&cfg, dev, &path, 3)?;
-    let prompt: Vec<u32> = vec![3, 5, 2, 8, 8, 1, 9, 3, 5];
-    let steps = 10;
-    let (want_ids, want_rows, _) = decode(&resident, &cfg, dev, &prompt, steps)?;
+fn check_on(fx: &Fixture<Qwen4ExpTiny>, dev: &Device, tag: &str) -> Result<()> {
+    let cfg = fx.config(|_| {});
+    let opts = LoadOptions::default();
+    // At scale a 192-token prompt, in blocks of distinct ids: a prefill that
+    // groups rows to the pool and evicts from it.
+    let base = [3u32, 5, 2, 8, 8, 1, 9, 3, 5];
+    let prompt: Vec<u32> = (0..fx.pick(9u32, 192))
+        .map(|i| base[(i % 9) as usize] + 1000 * (i / 9))
+        .collect();
+    let steps = 24;
+    // The reference: every expert resident, or at scale the tier at twice
+    // the pool. Dropped before the subject loads.
+    let (want_ids, want_rows) = if fx.at_scale() {
+        let wide = fx.streamed(&cfg, dev, &opts, &stream(256))?;
+        let (ids, rows, _) = decode(&wide, &cfg, dev, &prompt, steps)?;
+        (ids, rows)
+    } else {
+        let resident = fx.resident(&cfg, dev, &opts)?;
+        let (ids, rows, _) = decode(&resident, &cfg, dev, &prompt, steps)?;
+        (ids, rows)
+    };
+    // Tiny: 6 slots for 8 experts at top-2. At scale: 128 for 512 at
+    // top-10. Tokens miss, settles load, passes replay.
+    let streamed = fx.streamed(&cfg, dev, &opts, &stream(fx.pick(6, 128)))?;
     let (ids, rows, cache) = decode(&streamed, &cfg, dev, &prompt, steps)?;
     assert_eq!(ids, want_ids, "{tag}: the device-planned ids differ");
     for (t, (a, b)) in rows.iter().zip(&want_rows).enumerate() {
         assert_eq!(a, b, "{tag}: step {t} logits differ");
     }
     let st = streamed.stream_stats();
+    println!(
+        "DEVICEPLAN {tag} backend={} steps={steps} device_plans={} settled_misses={} redos={} hits={} misses={} evictions={}",
+        fx.backend().name(),
+        st.device_plans,
+        st.settled_misses,
+        cache.redos,
+        st.hits,
+        st.misses,
+        st.evictions
+    );
+    if fx.at_scale() {
+        assert!(
+            st.evictions > 0,
+            "{tag}: the pool evicted nothing, so it held what the reference held: {st:?}"
+        );
+        return Ok(());
+    }
     assert!(st.device_plans > 0, "{tag}: no device plan ran: {st:?}");
     assert!(
         cache.redos > 0 && st.settled_misses > 0,
         "{tag}: no token was replayed — the pool never missed: {st:?} redos {}",
         cache.redos
     );
-    println!("DEVICEPLAN {tag} steps={steps} device_plans={} settled_misses={} redos={} hits={} misses={}",
-        st.device_plans, st.settled_misses, cache.redos, st.hits, st.misses);
-    std::fs::remove_file(&path).ok();
     Ok(())
 }
 
+/// The tiny model on the CPU. At scale the Metal test runs the checkpoint.
 #[test]
 fn device_plan_decodes_the_resident_stream_cpu() -> Result<()> {
-    check_on(&Device::Cpu, "cpu")
+    if Backend::current().at_scale() {
+        println!("at scale: device_plan_decodes_the_resident_stream_metal runs the checkpoint");
+        return Ok(());
+    }
+    let Some(fx) = Fixture::<Qwen4ExpTiny>::new("qwen4exp_device_plan_cpu", Config::tiny())? else {
+        return Ok(());
+    };
+    check_on(&fx, &Device::Cpu, "cpu")
 }
 
 #[cfg(feature = "metal")]
 #[test]
 fn device_plan_decodes_the_resident_stream_metal() -> Result<()> {
-    match Device::new_metal(0) {
-        Ok(dev) => check_on(&dev, "metal"),
-        Err(_) => Ok(()),
-    }
+    let Ok(dev) = Device::new_metal(0) else {
+        return Ok(());
+    };
+    let Some(fx) = Fixture::<Qwen4ExpTiny>::new("qwen4exp_device_plan_metal", Config::tiny())?
+    else {
+        return Ok(());
+    };
+    check_on(&fx, &dev, "metal")
 }

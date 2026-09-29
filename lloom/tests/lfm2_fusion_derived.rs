@@ -12,6 +12,10 @@
 //! The default (`Manual`, flags off) is asserted untouched: bit-identical to
 //! itself across the arms, which is the half that proves the shipping path
 //! was not disturbed (§7.1a).
+//!
+//! The `silu_impl=relu` refusal is `lfm2_fusion_derived_refusal.rs`, its own
+//! process: building that model sets the process-wide SiLU steer, which would
+//! move the logits every test here compares.
 
 #![cfg(feature = "metal")]
 
@@ -20,13 +24,9 @@ use lloom::models::lfm2::{
 };
 use lloom::models::lfm2_testing::Lfm2Tiny;
 use lloom::testing::tiny::{TinyCheckpoint, Weights};
+use lloom_tensor::metal_backend::profile::CensusRefused;
 use lloom_tensor::quantized::GgmlDType;
 use lloom_tensor::{DType, Device, Result, Tensor};
-
-/// The dispatch census is process-wide: every test holds this for its whole
-/// body (a construction dispatches too), so no other test's dispatches land
-/// in a census window.
-static CENSUS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// The two-layer fixture `lfm2_gemv_epilogue_wiring.rs` uses: one conv layer,
 /// one attention layer, so every epilogue site kind is exercised, and sizes
@@ -103,7 +103,9 @@ fn cpu_decode(cfg: &Config) -> Result<Vec<f32>> {
 }
 
 /// A prefill and one decode step; the decode step's logits, and the per-label
-/// dispatch census of that step (recorded only under `CANDLE_METAL_PROFILE=1`).
+/// dispatch census of that step from `dev`'s own census (recorded only under
+/// `CANDLE_METAL_PROFILE=1`, empty otherwise), which no test on another
+/// device lands in.
 fn decode(cfg: &Config, dev: &Device) -> Result<(Vec<f32>, Vec<(String, u64)>)> {
     let model = build(cfg, dev)?;
     let mut cache = Cache::new(true, DType::F16, cfg, dev)?;
@@ -111,7 +113,11 @@ fn decode(cfg: &Config, dev: &Device) -> Result<(Vec<f32>, Vec<(String, u64)>)> 
     let inp = Tensor::new(prompt.as_slice(), dev)?.reshape((1, prompt.len()))?;
     model.forward(&inp, 0, &mut cache)?;
     dev.synchronize()?;
-    lloom_tensor::metal_backend::profile::reset();
+    let window = match dev.as_metal_device()?.dispatch_census().open() {
+        Ok(w) => Some(w),
+        Err(CensusRefused::ProfileOff) => None,
+        Err(e) => panic!("the decode step's census window: {e:?}"),
+    };
     let step = Tensor::new(&[7u32], dev)?.reshape((1, 1))?;
     let logits = model.forward(&step, prompt.len(), &mut cache)?;
     let logits = logits
@@ -119,10 +125,7 @@ fn decode(cfg: &Config, dev: &Device) -> Result<(Vec<f32>, Vec<(String, u64)>)> 
         .to_dtype(DType::F32)?
         .to_vec1::<f32>()?;
     dev.synchronize()?;
-    Ok((
-        logits,
-        lloom_tensor::metal_backend::profile::snapshot().by_label,
-    ))
+    Ok((logits, window.map(|w| w.close()).unwrap_or_default()))
 }
 
 /// Every logit bit, folded: a pinned value is an absolute reference that
@@ -162,7 +165,6 @@ fn max_abs_delta(a: &[f32], b: &[f32]) -> f32 {
 /// derivation that silently fell back to `Manual` would read as a defect here.
 #[test]
 fn derived_matches_the_hand_selected_fusions_bit_for_bit() -> Result<()> {
-    let _census = CENSUS.lock();
     let Ok(dev) = Device::new_metal(0) else {
         eprintln!("no Metal device; skipping");
         return Ok(());
@@ -214,7 +216,6 @@ fn derived_matches_the_hand_selected_fusions_bit_for_bit() -> Result<()> {
 /// not add the fused kernel beside the pair it was to replace.
 #[test]
 fn the_census_shows_the_derived_plan_taken() -> Result<()> {
-    let _census = CENSUS.lock();
     if !lloom_tensor::metal_backend::profile::enabled() {
         eprintln!("SKIPPED: the dispatch census is recorded only under CANDLE_METAL_PROFILE=1.");
         return Ok(());
@@ -286,7 +287,6 @@ fn the_census_shows_the_derived_plan_taken() -> Result<()> {
 /// computed, run to run.
 #[test]
 fn manual_off_is_the_shipping_path_and_deterministic() -> Result<()> {
-    let _census = CENSUS.lock();
     let Ok(dev) = Device::new_metal(0) else {
         eprintln!("no Metal device; skipping");
         return Ok(());
@@ -296,37 +296,6 @@ fn manual_off_is_the_shipping_path_and_deterministic() -> Result<()> {
     let (a, _) = decode(&cfg, &dev)?;
     let (b, _) = decode(&cfg, &dev)?;
     assert_eq!(a, b);
-    Ok(())
-}
-
-/// P2: the exclusion set is consulted for the arms the config selects, not
-/// only for the fragments the derivation composes. `silu_impl=relu` is the
-/// transform §12.2l measured degenerate (2307 f16 ulp, `ARAARAARA…`); under
-/// `Derived` a model selecting it is refused at construction, by name and
-/// with its numbers. Under `Manual` nothing changes — the arm stays selectable
-/// for the ladder it exists to measure.
-#[test]
-fn derived_refuses_an_excluded_silu_arm_at_construction() -> Result<()> {
-    let _census = CENSUS.lock();
-    let Ok(dev) = Device::new_metal(0) else {
-        eprintln!("no Metal device; skipping");
-        return Ok(());
-    };
-    let mut cfg = tiny_config(FusionPolicy::Derived, false, false);
-    cfg.silu_impl = lloom_tensor::kernels::SiluImpl::Relu;
-    let err = match build(&cfg, &dev) {
-        Ok(_) => panic!("Fusion=Derived must refuse the excluded `silu_impl=relu` arm"),
-        Err(e) => e.to_string(),
-    };
-    assert!(
-        err.contains("silu_impl=relu") && err.contains("excluded"),
-        "{err}"
-    );
-    eprintln!("{err}");
-    // Manual is untouched: the arm builds.
-    let mut manual = tiny_config(FusionPolicy::Manual, false, false);
-    manual.silu_impl = lloom_tensor::kernels::SiluImpl::Relu;
-    build(&manual, &dev)?;
     Ok(())
 }
 
@@ -340,7 +309,6 @@ fn derived_refuses_an_excluded_silu_arm_at_construction() -> Result<()> {
 /// regions: one conv ring, one KV, no fused site in either.
 #[test]
 fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<()> {
-    let _census = CENSUS.lock();
     let Ok(dev) = Device::new_metal(0) else {
         eprintln!("no Metal device; skipping");
         return Ok(());
@@ -439,7 +407,6 @@ fn the_report_names_the_model_the_regions_and_the_joint_validation() -> Result<(
 /// `taps − 1 = 2`.
 #[test]
 fn the_conv_fold_gain_is_the_weights_norm_and_the_horizon_is_the_window() -> Result<()> {
-    let _census = CENSUS.lock();
     let Ok(dev) = Device::new_metal(0) else {
         eprintln!("no Metal device; skipping");
         return Ok(());

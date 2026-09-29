@@ -900,6 +900,13 @@ impl MetalDevice {
         &self.commands
     }
 
+    /// This device's own dispatch census: a window on it counts the
+    /// dispatches encoded here and no other device's
+    /// (`profile::DeviceCensus`).
+    pub fn dispatch_census(&self) -> &Arc<crate::kernels::metal::profile::DeviceCensus> {
+        self.commands.dispatch_census()
+    }
+
     pub fn wait_until_completed(&self) -> Result<()> {
         self.commands
             .wait_until_completed()

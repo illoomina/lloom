@@ -25,7 +25,7 @@
 //! different dispatch pattern than the one that ships.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Whether profiling was requested, read once from the environment.
@@ -287,6 +287,99 @@ fn bump_label(map: &mut HashMap<Arc<str>, u64>, label: &Arc<str>) {
     } else {
         map.insert(Arc::clone(label), 1);
     }
+}
+
+/// One device's dispatch census: per-label counts of the dispatches encoded
+/// on that device's queue while a [`CensusWindow`] is open.
+///
+/// The process-wide census ([`snapshot`]) counts every device in the
+/// process, so two windows open at once on different devices -- two tests on
+/// parallel threads -- each count the other's dispatches, and a [`reset`] in
+/// one clears the other's. This one is owned by the device's `Commands` and
+/// fed by the encoders it opens, so a window sees its own device and nothing
+/// else, whichever thread encodes. Recorded beside the process-wide census,
+/// never instead of it, and only under [`enabled`]: a closed window costs a
+/// relaxed load per dispatch, and with profiling off the encoder does not
+/// hold one.
+#[derive(Default)]
+pub struct DeviceCensus {
+    open: AtomicBool,
+    dispatches: parking_lot::Mutex<HashMap<Arc<str>, u64>>,
+}
+
+/// Why [`DeviceCensus::open`] refused a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CensusRefused {
+    /// `CANDLE_METAL_PROFILE` is off: nothing is recorded, so a window would
+    /// read empty and look like a census of nothing.
+    ProfileOff,
+    /// A window is already open on this device; a second would clear its
+    /// counts.
+    WindowOpen,
+}
+
+impl DeviceCensus {
+    /// Open a window: from here until [`CensusWindow::close`], every dispatch
+    /// encoded on this device is counted under its pipeline label.
+    pub fn open(self: &Arc<Self>) -> Result<CensusWindow, CensusRefused> {
+        if !enabled() {
+            return Err(CensusRefused::ProfileOff);
+        }
+        let mut map = self.dispatches.lock();
+        if self
+            .open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(CensusRefused::WindowOpen);
+        }
+        map.clear();
+        Ok(CensusWindow {
+            census: Arc::clone(self),
+        })
+    }
+
+    /// Count one dispatch, if a window is open. Called by the encoder,
+    /// already behind [`enabled`].
+    #[inline]
+    pub(crate) fn record(&self, label: Option<&Arc<str>>) {
+        if !self.open.load(Ordering::Relaxed) {
+            return;
+        }
+        bump_label(
+            &mut self.dispatches.lock(),
+            label.unwrap_or_else(|| unnamed()),
+        );
+    }
+}
+
+/// An open [`DeviceCensus`] window. Dropping it without [`Self::close`]
+/// closes it and discards the counts.
+pub struct CensusWindow {
+    census: Arc<DeviceCensus>,
+}
+
+impl CensusWindow {
+    /// Close the window and return its counts by label, in
+    /// [`Snapshot::by_label`]'s order (descending count, then label).
+    pub fn close(self) -> Vec<(String, u64)> {
+        let map = std::mem::take(&mut *self.census.dispatches.lock());
+        drop(self);
+        sorted_by_count(&map)
+    }
+}
+
+impl Drop for CensusWindow {
+    fn drop(&mut self) {
+        self.census.open.store(false, Ordering::Release);
+    }
+}
+
+/// Per-label counts, descending by count, ties by label.
+fn sorted_by_count(map: &HashMap<Arc<str>, u64>) -> Vec<(String, u64)> {
+    let mut by_label: Vec<(String, u64)> = map.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    by_label.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    by_label
 }
 
 /// Add one encoder session's fence-probe counts. Called at encoder close,
@@ -1088,12 +1181,7 @@ pub fn snapshot() -> Snapshot {
     // token boundary under `--per-token`), never per dispatch, so the
     // allocation here is off the hot path by construction and callers that
     // format or serialise the result want an owned `String` anyway.
-    let mut by_label: Vec<(String, u64)> = rec
-        .dispatches
-        .iter()
-        .map(|(k, v)| (k.to_string(), *v))
-        .collect();
-    by_label.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let by_label = sorted_by_count(&rec.dispatches);
     drop(rec);
 
     let c = counters().lock();

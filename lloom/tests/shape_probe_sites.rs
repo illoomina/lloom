@@ -20,12 +20,8 @@ fn site<'a>(events: &'a [Event], site: &str) -> Vec<&'a Event> {
     events.iter().filter(|e| e.site == site).collect()
 }
 
-fn labels() -> Vec<String> {
-    profile::snapshot()
-        .by_label
-        .into_iter()
-        .map(|(l, _)| l)
-        .collect()
+fn labels(census: &[(String, u64)]) -> Vec<String> {
+    census.iter().map(|(l, _)| l.clone()).collect()
 }
 
 /// `QMatMul::TensorF16` at a prefill's rows: K = 64 takes the f16-weight
@@ -43,9 +39,14 @@ fn the_f16_weight_gemm_check_routes_and_refuses_by_k() -> Result<()> {
         let x = Tensor::ones((1, rows, k), DType::F32, &dev)?;
         let mm = QMatMul::TensorF16(w.clone());
         let a = arm();
-        profile::reset();
+        let window = dev
+            .as_metal_device()?
+            .dispatch_census()
+            .open()
+            .expect("one census window on this test's device");
         let y = mm.forward(&x)?;
         dev.synchronize()?;
+        let census = window.close();
         let got = site(&a.take(), "f16_weight_gemm")
             .into_iter()
             .map(|e| (e.cond, e.kind, e.ok, e.operands.clone()))
@@ -62,8 +63,8 @@ fn the_f16_weight_gemm_check_routes_and_refuses_by_k() -> Result<()> {
             want.push(("k % 32 == 0", Kind::Refuse, true, vec![("k", k as i64)]));
         }
         assert_eq!(got, want, "K = {k}");
-        let gemm = labels().iter().any(|l| l.contains("mul_mm_f16_f32"));
-        assert_eq!(gemm, admitted, "K = {k}: census {:?}", labels());
+        let gemm = labels(&census).iter().any(|l| l.contains("mul_mm_f16_f32"));
+        assert_eq!(gemm, admitted, "K = {k}: census {:?}", labels(&census));
         let v: Vec<f32> = y.flatten_all()?.to_vec1()?;
         assert!(
             v.iter().all(|&e| e == k as f32),

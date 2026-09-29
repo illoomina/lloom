@@ -604,6 +604,9 @@ pub struct ComputeCommandEncoder {
     /// (`ConstantsPool`). `None` on encoders built outside `Commands`, which
     /// have no in-flight work to order a CPU write behind.
     pub(crate) clock: Option<Arc<crate::kernels::metal::GpuClock>>,
+    /// The device's own dispatch census, when profiling is on
+    /// (`profile::DeviceCensus`). `None` on encoders built outside `Commands`.
+    pub(crate) census: Option<Arc<crate::kernels::metal::profile::DeviceCensus>>,
 }
 
 /// Scalars accumulated for a packed params block, and the buffer renumbering
@@ -672,12 +675,23 @@ impl ComputeCommandEncoder {
             capturing: Arc::new(AtomicBool::new(false)),
             param_capture: Arc::new(parking_lot::Mutex::new(ParamCapture::default())),
             clock: None,
+            census: None,
         }
     }
 
     /// The GPU clock of the queue this encoder's command buffer is committed on.
     pub fn with_clock(mut self, clock: Arc<crate::kernels::metal::GpuClock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Count this encoder's dispatches into `census` as well as the
+    /// process-wide census.
+    pub fn with_census(
+        mut self,
+        census: Arc<crate::kernels::metal::profile::DeviceCensus>,
+    ) -> Self {
+        self.census = Some(census);
         self
     }
 
@@ -933,6 +947,9 @@ impl ComputeCommandEncoder {
         };
         if profiling {
             crate::kernels::metal::profile::record_dispatch(name.as_ref(), input_bytes);
+            if let Some(census) = &self.census {
+                census.record(name.as_ref());
+            }
         }
         crate::kernels::metal::hazard_audit::record_dispatch(
             name.as_deref().unwrap_or("<unnamed>"),

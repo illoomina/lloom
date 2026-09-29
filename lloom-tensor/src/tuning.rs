@@ -310,7 +310,7 @@ impl Default for MoeTuning {
     }
 }
 
-/// The DeltaNet step kernel (`kernels/qwen4exp.rs`).
+/// The Gated DeltaNet step kernels (`kernels/gdn.rs`).
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[options(krate = "crate")]
 #[serde(default)]
@@ -318,7 +318,7 @@ pub struct GdnTuning {
     /// The most `dk` slices a head's threads take in `gdn_step` (1..32; more slices, longer cross-slice reduction).
     #[opt(flag = "gdn-split", env = "LLOOM_GDN_SPLIT", parser = "parse_gdn_split")]
     pub split: usize,
-    /// `gdn_step` holds each thread's slice of `S` in registers (the slab read once, not twice); off = the loop form.
+    /// The step's register form (the default): each thread's slice of `S` held in registers, the slab read once, not twice; `false` = the loop form, the A/B arm (`docs/models/qwen3.8-flash-next.md`).
     #[opt(flag = "gdn-step-reg", env = "LLOOM_GDN_STEP_REG", bool)]
     pub step_reg: bool,
 }
@@ -327,7 +327,7 @@ impl Default for GdnTuning {
     fn default() -> Self {
         GdnTuning {
             split: 8,
-            step_reg: false,
+            step_reg: true,
         }
     }
 }

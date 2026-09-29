@@ -957,6 +957,12 @@ fn a_ring_conv_arm_has_no_escapes_fused_or_not() -> Result<()> {
 /// The control arm pins the detector itself: a value whose object is still
 /// alive and bound in the next pass IS an escape, so the fixed arm's zero is
 /// not a detector that stopped seeing anything.
+///
+/// Whether a new object lands on a freed address is the allocator's choice:
+/// in a fresh process the first freed object's address rarely comes back,
+/// and once a round of objects has been created and freed it comes back on
+/// the first attempt. So the scenario repeats, each time with a fresh
+/// recorder, until one lands.
 #[test]
 fn a_new_buffer_at_a_destroyed_buffers_address_is_not_the_old_value() -> Result<()> {
     use lloom_tensor::kernels::metal::arena::{set_bind_observer, ArenaRecorder};
@@ -969,55 +975,65 @@ fn a_new_buffer_at_a_destroyed_buffers_address_is_not_the_old_value() -> Result<
         raw.new_buffer(4096, MTLResourceOptions::empty())
             .expect("a 4 KiB buffer")
     };
-    let rec = Arc::new(parking_lot::Mutex::new(ArenaRecorder::new()));
-    set_bind_observer(Some(Arc::clone(&rec)));
+    // `Some((attempt, escaped ordinals))` once a new object took the dead
+    // object's address.
+    let scenario = || -> Option<(usize, Vec<usize>)> {
+        let rec = Arc::new(parking_lot::Mutex::new(ArenaRecorder::new()));
+        set_bind_observer(Some(Arc::clone(&rec)));
 
-    // Pass 1: two values, one whose object then dies and one that lives on.
-    let dying = new_buffer();
-    let living = new_buffer();
-    let dead_addr = dying.raw_addr();
-    {
-        let mut r = rec.lock();
-        r.record_alloc(dead_addr, 4096);
-        r.record_alloc(living.raw_addr(), 4096);
-    }
-    drop(dying);
-    rec.lock().next_step();
-
-    // Pass 2: objects are created, none reported as an allocation, until one
-    // lands on the dead object's address. Each is kept alive so no attempt
-    // can hand back an address an earlier attempt freed.
-    let mut attempts = Vec::new();
-    let reused = loop {
-        let b = new_buffer();
-        let hit = b.raw_addr() == dead_addr;
-        attempts.push(b);
-        if hit || attempts.len() == 4096 {
-            break hit;
+        // Pass 1: two values, one whose object then dies and one that lives on.
+        let dying = new_buffer();
+        let living = new_buffer();
+        let dead_addr = dying.raw_addr();
+        {
+            let mut r = rec.lock();
+            r.record_alloc(dead_addr, 4096);
+            r.record_alloc(living.raw_addr(), 4096);
         }
+        drop(dying);
+        rec.lock().next_step();
+
+        // Pass 2: objects are created, none reported as an allocation, until
+        // one lands on the dead object's address. Each is kept alive so no
+        // attempt can hand back an address an earlier attempt freed.
+        let mut attempts = Vec::new();
+        let reused = loop {
+            let b = new_buffer();
+            let hit = b.raw_addr() == dead_addr;
+            attempts.push(b);
+            if hit || attempts.len() == 16 {
+                break hit;
+            }
+        };
+        if reused {
+            let mut r = rec.lock();
+            r.record_bind(dead_addr);
+            r.record_bind(living.raw_addr());
+        }
+        set_bind_observer(None);
+        let escaped: Vec<usize> = rec
+            .lock()
+            .previous_undeclared_ordinals()
+            .iter()
+            .map(|&(ordinal, ..)| ordinal)
+            .collect();
+        reused.then_some((attempts.len(), escaped))
     };
-    {
-        let mut r = rec.lock();
-        r.record_bind(dead_addr);
-        r.record_bind(living.raw_addr());
-    }
-    set_bind_observer(None);
-    assert!(
-        reused,
-        "no new buffer object took the destroyed one's address in {} attempts: \
-         the fixture cannot exercise the path it exists for",
-        attempts.len()
-    );
+    let mut scenarios = 0;
+    let (attempt, escaped) = loop {
+        scenarios += 1;
+        if let Some(found) = scenario() {
+            break found;
+        }
+        assert!(
+            scenarios < 256,
+            "no new buffer object took a destroyed one's address in {scenarios} scenarios: \
+             the fixture cannot exercise the path it exists for"
+        );
+    };
     eprintln!(
-        "the destroyed object's address came back on attempt {}",
-        attempts.len()
+        "the destroyed object's address came back on attempt {attempt} of scenario {scenarios}"
     );
-    let escaped: Vec<usize> = rec
-        .lock()
-        .previous_undeclared_ordinals()
-        .iter()
-        .map(|&(ordinal, ..)| ordinal)
-        .collect();
     assert_eq!(
         escaped,
         vec![1],

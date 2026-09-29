@@ -331,9 +331,13 @@ impl Device {
         matches!(self, Self::Metal(_))
     }
 
+    /// Whether this device computes at bf16: on Metal, natively or by the
+    /// operator's opt-in to the emulated arm (§15.2a), so a caller choosing
+    /// its dtype here is never handed one the device then refuses.
     pub fn supports_bf16(&self) -> bool {
         match self {
-            Self::Cuda(_) | Self::Metal(_) => true,
+            Self::Cuda(d) => d.admits_compute_dtype(DType::BF16),
+            Self::Metal(d) => d.admits_compute_dtype(DType::BF16),
             Self::Cpu => false,
         }
     }
@@ -548,6 +552,17 @@ impl Device {
             Self::Cpu => Ok(()),
             Self::Cuda(d) => d.finish_pass(),
             Self::Metal(d) => crate::backend::BackendDevice::finish_pass(d),
+        }
+    }
+
+    /// Admit computing at `dtype` here (`BackendDevice::admit_compute_dtype`):
+    /// Metal refuses a type its GPU only emulates unless the operator opted
+    /// in (§15.2a).
+    pub fn admit_compute_dtype(&self, dtype: DType) -> Result<()> {
+        match self {
+            Self::Cpu => Ok(()),
+            Self::Cuda(d) => d.admit_compute_dtype(dtype),
+            Self::Metal(d) => d.admit_compute_dtype(dtype),
         }
     }
 

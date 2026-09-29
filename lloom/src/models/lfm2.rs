@@ -8013,8 +8013,9 @@ impl Model {
         // `Cache` beside the bytes it indexes rather than in a params struct).
         //
         // Prefill writes the state directly rather than through the ring, and
-        // leaves the newest token in the last live slot -- which is slot
-        // `l_cache + K - 1`. Decode advances from there. Advancing *before* the
+        // leaves the newest token at slot `l_cache - 1`, the window at the
+        // front; a decode step that opens a sequence writes that same slot.
+        // Decode advances from there. Advancing *before* the
         // layers run rather than after is what makes the first decode token
         // after a prefill land past the newest token instead of overwriting it.
         //
@@ -8652,7 +8653,12 @@ impl Model {
             let width = self.conv_state.width(self.l_cache);
             let live_w = self.l_cache + self.conv_state.history();
             if seq_len == 1 {
-                let next = cache.conv_phase + 1;
+                // Never below the prefill's seed: a decode step that opens the
+                // sequence writes where a prefill leaves the newest column, so
+                // a full `l_cache` window fits behind it and the fresh state's
+                // zeros stand where the shuffle's zero history does. Every
+                // later phase is already at or past that slot.
+                let next = (cache.conv_phase + 1).max(self.l_cache - 1);
                 cache.conv_compact = next >= width;
                 cache.conv_phase = if cache.conv_compact { live_w } else { next };
             } else {

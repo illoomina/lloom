@@ -13,6 +13,10 @@ pub enum MetalKernelError {
     /// An arm this device does not execute, refused by name (§15.2a).
     #[error("{0}")]
     ArmRefused(String),
+    /// A type this device runs only through software emulation, refused
+    /// until the operator opts in to it (§15.2a).
+    #[error("{0}")]
+    EmulatedRefused(String),
     #[error("Unsupported dtype {0} for operation {1}")]
     UnsupportedDTypeForOp(&'static str, &'static str),
     #[error("Failed to create compute function")]

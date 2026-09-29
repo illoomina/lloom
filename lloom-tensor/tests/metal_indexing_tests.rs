@@ -42,8 +42,11 @@ fn values(n: usize) -> Vec<f32> {
     (0..n).map(|i| ((i * 37 % 101) as f32) - 50.0).collect()
 }
 
+/// Every dtype pair runs, bf16 included, which this GPU may only emulate
+/// (§15.2a): the device is opted in to it.
 fn cpu_and_metal() -> Option<(Device, Device)> {
     let metal = Device::new_metal(0).ok()?;
+    lloom_tensor::test_utils::allow_emulated(&metal, DType::BF16);
     Some((Device::Cpu, metal))
 }
 

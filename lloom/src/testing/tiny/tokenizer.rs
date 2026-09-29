@@ -1,7 +1,8 @@
 //! The tiny models' tokenizer (`docs/porting-models.md` §21.8, INV-6): the
-//! 256 bytes, then the family's added tokens in the family's order, with the
-//! family's real chat template beside it. A byte-level BPE with no merges,
-//! so any text round-trips and no checkpoint's vocabulary is needed.
+//! 256 bytes, then the family's added tokens in the family's order, with a
+//! chat template of lloom's own for the family beside it (`templates/`: the
+//! checkpoints' turn tokens, none of their text). A byte-level BPE with no
+//! merges, so any text round-trips and no checkpoint's vocabulary is needed.
 
 /// One added token, as the family's `tokenizer.json` lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,7 +174,10 @@ pub fn tokenizer_json(added: &[(String, bool)]) -> String {
     serde_json::to_string_pretty(&t).expect("a JSON value serializes")
 }
 
-/// A family's tokenizer: the added tokens and the chat template.
+/// A family's tokenizer: the added tokens and the tiny chat template, which
+/// covers every template path the engine drives on the family
+/// (`lloom-engine/tests/tiny_templates.rs` pins each one, and checks the
+/// checkpoints' own templates against the same paths when they are cached).
 #[derive(Debug, Clone)]
 pub struct TinyTokenizer {
     pub added: Vec<(String, bool)>,

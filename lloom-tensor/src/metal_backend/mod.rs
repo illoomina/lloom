@@ -25,10 +25,10 @@ use std::sync::{Arc, PoisonError, TryLockError};
 mod device;
 pub use device::{wire_weights_on, DeviceId, MetalDevice, PassPlansPaused};
 mod host_fed;
-pub use host_fed::HostFedRing;
 use device::{
     ConstantsByValue, DeviceTeardown, ResidencyEvictionObserver, PRIVATE_RESOURCE_OPTIONS,
 };
+pub use host_fed::HostFedRing;
 
 /// The activation arena's public vocabulary (`DESIGN.md` §9.2).
 ///
@@ -2946,6 +2946,10 @@ impl BackendDevice for MetalDevice {
             private_buffers.set_eviction_observer(observer);
         }
 
+        let emulated = Arc::new(
+            crate::kernels::metal::arms::EmulatedArms::for_device(&device)
+                .map_err(MetalError::from)?,
+        );
         let commands = Arc::new(commands);
         // The guard holds its own `Arc` to the two things it needs, so it fires
         // when the last `MetalDevice` handle drops rather than when any clone
@@ -2985,7 +2989,17 @@ impl BackendDevice for MetalDevice {
             base_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pass_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             served_pass_pool_requests: Arc::new(Default::default()),
+            emulated,
         })
+    }
+
+    fn admit_compute_dtype(&self, dtype: DType) -> Result<()> {
+        self.admit_dtype(dtype, "computing at")
+    }
+
+    fn admits_compute_dtype(&self, dtype: DType) -> bool {
+        crate::kernels::metal::arms::Feature::emulable_dtype(dtype)
+            .is_none_or(|f| self.emulated.admits(f))
     }
 
     fn location(&self) -> crate::DeviceLocation {
@@ -3555,6 +3569,8 @@ mod issue_336_to_cpu {
     #[test]
     fn readback_agrees_with_the_blit_across_dtypes_and_sizes() {
         let Some(dev) = metal() else { return };
+        // The sweep includes bf16, which this GPU may only emulate (§15.2a).
+        crate::test_utils::allow_emulated(&dev, DType::BF16);
         let mut checked = 0usize;
 
         for n in [1usize, 3, 1024, 128000] {

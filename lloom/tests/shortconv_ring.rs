@@ -244,6 +244,8 @@ const CASES: &[Case] = &[
 
 fn parity(dtype: DType) -> Result<()> {
     let device = Device::new_metal(0)?;
+    // A bf16 arm runs on purpose where the GPU only emulates it (§15.2a).
+    lloom_tensor::test_utils::allow_emulated(&device, DType::BF16);
     for (i, case) in CASES.iter().enumerate() {
         let ((out, state), (want_out, want_state)) = run(case, dtype, &device)?;
         // State first: it isolates the `b * x` write from the fold and gate.
@@ -410,6 +412,8 @@ fn f16_multiply_rounding() -> Result<()> {
 #[test]
 fn fold_only_parity() -> Result<()> {
     let device = Device::new_metal(0)?;
+    // A bf16 arm runs on purpose where the GPU only emulates it (§15.2a).
+    lloom_tensor::test_utils::allow_emulated(&device, DType::BF16);
     for dtype in [DType::F16, DType::F32, DType::BF16] {
         for (i, case) in CASES.iter().enumerate() {
             let ((out, state), (want_out, want_state)) = run_with(case, dtype, &device, true)?;

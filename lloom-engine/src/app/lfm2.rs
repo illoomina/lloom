@@ -657,6 +657,7 @@ impl Engine {
                 bos_id,
                 eos_ids,
                 seed_tokens,
+                think: Default::default(),
             },
             model_name,
             kv_capacity: opts.kv_capacity,
@@ -1451,6 +1452,7 @@ impl Engine {
                 },
             },
             stats: done.stats,
+            thinking: None,
         })
     }
 
@@ -2415,6 +2417,18 @@ impl super::served::Served for Engine {
     }
     fn template_reads(&self, name: &str) -> Option<bool> {
         self.text.template.as_ref()?.reads(name)
+    }
+    fn think_tags(&self) -> Option<super::template::ThinkTags> {
+        self.text.think_tags().cloned()
+    }
+    fn thinking_budget_refused(&self) -> Option<&'static str> {
+        if self.sched.is_some() {
+            Some(super::budgets::BATCHED)
+        } else if self.dspark_k.is_some() {
+            Some(super::budgets::SPECULATIVE)
+        } else {
+            None
+        }
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         Engine::seed_prompt_row(self, n, row)

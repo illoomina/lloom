@@ -423,6 +423,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
                 bos_id: None,
                 eos_ids,
                 seed_tokens,
+                think: Default::default(),
             },
             model_name,
             kv_capacity: opts.kv_capacity,
@@ -704,6 +705,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
                 rows: done.joined_beside,
             },
             stats: done.stats,
+            thinking: None,
         })
     }
 
@@ -905,6 +907,18 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Eng
     }
     fn template_reads(&self, name: &str) -> Option<bool> {
         self.text.template.as_ref()?.reads(name)
+    }
+    fn think_tags(&self) -> Option<super::template::ThinkTags> {
+        self.text.think_tags().cloned()
+    }
+    fn thinking_budget_refused(&self) -> Option<&'static str> {
+        if self.sched.is_some() {
+            Some(super::budgets::BATCHED)
+        } else if self.mtp {
+            Some(super::budgets::SPECULATIVE)
+        } else {
+            None
+        }
     }
     fn seed_prompt_row(&self, n: usize, row: usize) -> Vec<u32> {
         let seed = &self.text.seed_tokens;

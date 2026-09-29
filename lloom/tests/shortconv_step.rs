@@ -317,6 +317,8 @@ const CASES: &[Case] = &[
 
 fn parity(dtype: DType) -> Result<()> {
     let device = Device::new_metal(0)?;
+    // A bf16 arm runs on purpose where the GPU only emulates it (§15.2a).
+    lloom_tensor::test_utils::allow_emulated(&device, DType::BF16);
     let mut total_closer = 0usize;
     for (i, case) in CASES.iter().enumerate() {
         // l_cache 1 has no `shortconv_step_k(1)` variant; the fused arm falls
@@ -422,6 +424,8 @@ fn parity_bf16() -> Result<()> {
 #[test]
 fn fold_only_parity() -> Result<()> {
     let device = Device::new_metal(0)?;
+    // A bf16 arm runs on purpose where the GPU only emulates it (§15.2a).
+    lloom_tensor::test_utils::allow_emulated(&device, DType::BF16);
     for dtype in [DType::F16, DType::F32, DType::BF16] {
         for (i, case) in CASES.iter().enumerate() {
             if case.l_cache < 2 {

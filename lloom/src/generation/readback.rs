@@ -37,6 +37,7 @@
 //! encoded before the host knows — and is retracted by [`ReadbackStrategy::eos_of_last`]
 //! rolling the write cursor back one, so the next token overwrites it.
 
+use crate::generation::budget::{DeviceForcing, HostForcing, ThinkingBudget};
 use crate::generation::poll::PollMechanism;
 use crate::generation::token_ring::TokenRing;
 use crate::generation::{LogitsProcessor, Sampling};
@@ -131,6 +132,21 @@ pub trait ReadbackStrategy {
     /// arms leave it on the device and return the ring's own slot.
     fn sample_and_feed(&mut self, sampler: &mut LogitsProcessor, logits: &Tensor)
         -> Result<Tensor>;
+
+    /// Arm a thinking budget from the next [`Self::sample_and_feed`] on: each
+    /// step feeds the budget's token ([`crate::generation::budget`]), which is
+    /// the draw except while its forced tail runs. `None` disarms. A strategy
+    /// arms it for the next run only, so its caller disarms after the run.
+    /// The default refuses a budget rather than feed the draws under it.
+    fn set_thinking_budget(&mut self, budget: Option<&ThinkingBudget>) -> Result<()> {
+        if budget.is_some() {
+            lloom_tensor::bail!(
+                "the `{}` readback strategy cannot feed a thinking budget's forced tokens",
+                self.eos_read_arm()
+            );
+        }
+        Ok(())
+    }
 
     /// Stage a **prompt chunk** as the next forward's input and return the tensor
     /// to feed it — the streamed-prefill counterpart of [`Self::sample_and_feed`],
@@ -312,6 +328,7 @@ pub struct Blocking {
     eos_ids: Vec<u32>,
     ids: Vec<u32>,
     last: Option<u32>,
+    forcing: Option<HostForcing>,
 }
 
 impl Blocking {
@@ -324,6 +341,7 @@ impl Blocking {
             eos_ids: eos_ids.to_vec(),
             ids: Vec::new(),
             last: None,
+            forcing: None,
         })
     }
 }
@@ -358,10 +376,18 @@ impl ReadbackStrategy for Blocking {
         sampler: &mut LogitsProcessor,
         logits: &Tensor,
     ) -> Result<Tensor> {
-        let id = sampler.sample(logits)?;
+        let id = match &mut self.forcing {
+            Some(f) => sampler.sample_fed(logits, |d| f.feed(d))?,
+            None => sampler.sample(logits)?,
+        };
         self.ids.push(id);
         self.last = Some(id);
         Tensor::new(&[id], &self.device)?.unsqueeze(0)
+    }
+
+    fn set_thinking_budget(&mut self, budget: Option<&ThinkingBudget>) -> Result<()> {
+        self.forcing = budget.cloned().map(HostForcing::new);
+        Ok(())
     }
 
     fn fed_host_ids(&self) -> Option<&[u32]> {
@@ -1436,6 +1462,9 @@ pub struct Ring {
     counters: ReadbackCounters,
     /// [`ReadbackStrategy::take_ids_into`]'s window, reused across calls.
     scratch: Vec<u32>,
+    /// The armed thinking budget's device state; while it can still change
+    /// a fed token, steps take the unfused chain with its select.
+    forcing: Option<DeviceForcing>,
 }
 
 /// Iterations before the non-blocking poll takes the blocking read instead.
@@ -1627,6 +1656,7 @@ impl Ring {
             commits_since_live: std::cell::Cell::new(0),
             counters: ReadbackCounters::default(),
             scratch: Vec::new(),
+            forcing: None,
         })
     }
 
@@ -1790,7 +1820,9 @@ impl ReadbackStrategy for Ring {
         sampler: &mut LogitsProcessor,
         logits: &Tensor,
     ) -> Result<Tensor> {
-        if self.fused_publish && matches!(sampler.sampling(), Sampling::ArgMax) {
+        let forcing = self.forcing.as_mut().filter(|f| f.live());
+        if self.fused_publish && forcing.is_none() && matches!(sampler.sampling(), Sampling::ArgMax)
+        {
             // The fused publish (lloom #735 step 5): the argmax, the history
             // slot, the input slot and the EOS test in one dispatch, then the
             // stamp as its own dispatch certifying the history segment. The
@@ -1827,7 +1859,12 @@ impl ReadbackStrategy for Ring {
             return self.ring.input_for(1);
         }
         self.fused_step = false;
-        let sampled = sampler.sample_argmax_on_device(logits)?;
+        // The fed token: the draw, or the budget's select over it — a device
+        // tensor either way, published below exactly as a draw is.
+        let sampled = match forcing {
+            Some(f) => sampler.sample_argmax_on_device_fed(logits, |t| f.feed(&t))?,
+            None => sampler.sample_argmax_on_device(logits)?,
+        };
         self.counters.ring_publishes += 1;
         // Begin this step's tile (one token per step on this arm → quantum=1 →
         // each tile is one slot, so this is a dense write; the tile machinery is
@@ -1886,6 +1923,14 @@ impl ReadbackStrategy for Ring {
         // stale slots past the token. `input_for(1)` is a contiguous prefix view,
         // no copy — the same allocation, just the one live slot.
         self.ring.input_for(1)
+    }
+
+    fn set_thinking_budget(&mut self, budget: Option<&ThinkingBudget>) -> Result<()> {
+        self.forcing = match budget {
+            Some(b) => Some(DeviceForcing::new(b.clone(), self.device())?),
+            None => None,
+        };
+        Ok(())
     }
 
     fn publish_marker(&mut self, force_live: bool) -> Result<()> {

@@ -4,7 +4,7 @@
 //! LFM2 engine (`lfm2.rs`, the former `lloom-serve/engine.rs`) unchanged so a
 //! second family (`qwen4exp.rs`) reuses them rather than restating them.
 
-use super::template::Template;
+use super::template::{Template, ThinkTags};
 use crate::ReadbackArm;
 use anyhow::Result;
 use lloom_tensor::Device;
@@ -29,6 +29,31 @@ pub struct Text {
     /// The benchmark prompt seed, encoded without special tokens and tiled to
     /// the requested prefill length (the MLX sidecar's `make_tokens`).
     pub seed_tokens: Vec<u32>,
+    /// The template's reasoning tags, read on first use ([`Self::think_tags`]).
+    pub think: std::sync::OnceLock<Option<ThinkTags>>,
+}
+
+impl Text {
+    /// The family's reasoning tags ([`Template::think_tags`]): markers are
+    /// the tokenizer's added tokens. `None` without a template, or when it
+    /// writes no thinking block.
+    pub fn think_tags(&self) -> Option<&ThinkTags> {
+        self.think
+            .get_or_init(|| {
+                let added = self.tokenizer.get_added_tokens_decoder();
+                self.template.as_ref()?.think_tags(
+                    &self.bos_token,
+                    |s| {
+                        self.tokenizer
+                            .encode(s, false)
+                            .map(|e| e.get_ids().to_vec())
+                            .map_err(|e| anyhow::anyhow!("encoding a probe render: {e}"))
+                    },
+                    |id| added.contains_key(&id),
+                )
+            })
+            .as_ref()
+    }
 }
 
 /// What one throughput cell measured, in the sidecar's units.

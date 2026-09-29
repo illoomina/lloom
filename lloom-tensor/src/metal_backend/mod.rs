@@ -3685,6 +3685,37 @@ mod issue_336_to_cpu {
             !std::hint::black_box(big_shared.contents()).is_null(),
             "shared must be mapped"
         );
+
+        // A Private buffer placed in a heap is the exception, at any size:
+        // Metal answers its `contents()` with null plus its offset in the
+        // heap, which is non-null for every placement but the first and is not
+        // a mapping (reading it faults, §6.3k), so `Buffer` reports null for
+        // it. The raw answer is pinned too, since it is why the override
+        // exists; the second placement is the one at a nonzero offset.
+        use objc2_metal::{MTLBuffer as _, MTLResource as _};
+        let heaps = crate::kernels::metal::HeapChunks::new(
+            m.device(),
+            m.residency_set_handle(),
+            super::PRIVATE_RESOURCE_OPTIONS,
+            1 << 20,
+        );
+        let first = heaps.alloc(128).unwrap();
+        let placed = heaps.alloc(128).unwrap();
+        let offset = placed.as_ref().heapOffset();
+        let raw_ptr = std::hint::black_box(placed.as_ref().contents().as_ptr());
+        assert!(offset > 0, "the second placement is at offset 0");
+        assert_eq!(
+            raw_ptr as usize, offset,
+            "a Private heap sub-buffer's contents() is no longer null plus its \
+             heap offset; re-measure what the override in `Buffer::new` guards"
+        );
+        assert!(
+            std::hint::black_box(placed.contents()).is_null(),
+            "a 128 B Private heap sub-buffer at offset {offset} was reported \
+             CPU-mapped; its contents() is {raw_ptr:?}, which is not a mapping"
+        );
+        heaps.release(&placed);
+        heaps.release(&first);
     }
 
     /// The env switch resolves, and it defaults to the fast path.

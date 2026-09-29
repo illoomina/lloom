@@ -27,6 +27,7 @@
 //! (`DecodeStats`, or a `synchronize()`-closed window) and says which; the
 //! runner brackets the HTTP request itself for the latency cells.
 
+use super::budgets::{self, Dropped, PromptMode};
 use super::common::{ms, MemSnapshot, NEVER_EOS};
 use super::served::Served;
 use super::template::{request_kwargs, Ignored, Rejected, ENGINE_KWARGS, REASONING_EFFORT};
@@ -228,6 +229,15 @@ pub fn run(args: ServeArgs) -> Result<()> {
                     .map(|&k| (k.to_string(), json!(shared.engine.template_reads(k))))
                     .collect::<Map<String, Value>>()
                     .into();
+                // The thinking budget's markers, as the template writes them.
+                let engine = shared.engine.as_ref();
+                body["reasoning_tags"] = engine.think_tags().map_or(Value::Null, |t| {
+                    json!({
+                        "start": engine.token_str(t.start),
+                        "end": engine.token_str(t.end),
+                        "tool_call": t.tool_call.map(|id| engine.token_str(id)),
+                    })
+                });
                 let _ = respond_json(request, 200, &body);
             }
             (Method::Get, "/v1/models") => {
@@ -423,8 +433,31 @@ fn completions(shared: &Shared, v: &Value, _headers: &[Header]) -> Handled<Reply
     if prompt_ids.is_empty() {
         return Err(bad("empty prompt"));
     }
+    let mut params = params;
+    let wanted = request_budgets(shared, v, params.max_tokens)?;
+    let (prompt_ids, dropped) = match wanted.prompt {
+        Some((k, mode)) if prompt_ids.len() > k => {
+            if mode == PromptMode::Refuse {
+                return Err(bad(budgets::over_budget(
+                    prompt_ids.len(),
+                    k,
+                    "truncate_prompt_tokens keeps the last tokens instead",
+                )));
+            }
+            budgets::truncate_raw(&prompt_ids, k, shared.engine.bos_id())
+        }
+        _ => (prompt_ids, Dropped::default()),
+    };
     let id = format!("cmpl-{}", short_id());
-    let facts = PromptFacts::of(&prompt_ids);
+    let mut facts = PromptFacts::of(&prompt_ids);
+    facts.apply_budgets(
+        shared.engine.as_ref(),
+        "/v1/completions",
+        &wanted,
+        dropped,
+        &prompt_ids,
+        &mut params,
+    )?;
     if stream {
         return Ok(Reply::Stream(Box::new(StreamingRun {
             kind: StreamKind::Completion,
@@ -478,7 +511,8 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
         // fall back to `logprobs` looks for.
         return Err(bad("guided decoding is not supported"));
     }
-    let params = sampling_params(shared, v)?;
+    let mut params = sampling_params(shared, v)?;
+    let wanted = request_budgets(shared, v, params.max_tokens)?;
     let stream = v.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let want_logprobs = v.get("logprobs").and_then(Value::as_bool).unwrap_or(false);
     let kwargs = request_kwargs(v, &[REASONING_EFFORT]).map_err(bad)?;
@@ -500,13 +534,52 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
                 .map_err(|e| bad(format!("{e:#}")))?;
             expand_image_tokens(&rendered, &expansions).map_err(|e| bad(format!("{e:#}")))?
         };
-        let ids = engine.encode(&rendered, true)?;
+        let mut ids = engine.encode(&rendered, true)?;
         if let Some(bos) = engine.bos_id() {
             if ids.iter().filter(|&&t| t == bos).count() > 1 {
                 eprintln!("[chat: the rendered template carries BOS twice; check bos_token]");
             }
         }
+        // The prompt budget, before the engine sees the prompt: the oldest
+        // turns go whole, so what runs is the template's own rendering.
+        let mut dropped = Dropped::default();
+        if let Some((k, mode)) = wanted.prompt.filter(|&(k, _)| ids.len() > k) {
+            if mode == PromptMode::Refuse {
+                return Err(bad(budgets::over_budget(
+                    ids.len(),
+                    k,
+                    "truncate_prompt_tokens drops the oldest turns instead",
+                )));
+            }
+            if !images.is_empty() {
+                return Err(bad(
+                    "truncate_prompt_tokens with an image is not supported: truncating would \
+                     drop turns without their images",
+                ));
+            }
+            let arr = messages.as_array().cloned().unwrap_or_default();
+            let fitted = budgets::fit_messages(&arr, k, ids.len(), |ms| {
+                engine.encode(&engine.render_chat(&json!(ms), &kwargs)?, true)
+            })
+            .map_err(Failure::Internal)?;
+            let Some(fitted) = fitted else {
+                return Err(bad(budgets::over_budget(
+                    ids.len(),
+                    k,
+                    "the last user turn alone does not fit",
+                )));
+            };
+            (ids, dropped) = (fitted.ids, fitted.dropped);
+        }
         facts.ids_sha256 = super::chat::tokens_sha256(&ids);
+        facts.apply_budgets(
+            engine,
+            "/v1/chat/completions",
+            &wanted,
+            dropped,
+            &ids,
+            &mut params,
+        )?;
         (ids, facts)
     };
     let id = format!("chatcmpl-{}", short_id());
@@ -610,6 +683,70 @@ fn chat_completions(shared: &Shared, v: &Value) -> Handled<Reply> {
     Ok(Reply::Json(body))
 }
 
+/// The token budgets a request asks for, over the process's defaults
+/// (`--thinking-budget`, `--prompt-budget`): vLLM's `thinking_token_budget`
+/// (`-1` is none) with `thinking_budget_message`, and its
+/// `truncate_prompt_tokens` (`-1` is the longest prompt the engine takes
+/// beside `max_tokens`), which asks for truncation whatever the process's
+/// mode.
+struct Budgets {
+    thinking: Option<usize>,
+    message: Option<String>,
+    prompt: Option<(usize, PromptMode)>,
+}
+
+fn request_budgets(shared: &Shared, v: &Value, max_tokens: usize) -> Handled<Budgets> {
+    let signed = |key: &str| -> Handled<Option<i64>> {
+        match v.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(n) => n
+                .as_i64()
+                .map(Some)
+                .ok_or_else(|| bad(format!("field '{key}' must be an integer"))),
+        }
+    };
+    let thinking = match signed("thinking_token_budget")? {
+        None => shared.sampling.thinking_budget,
+        Some(-1) => None,
+        Some(n) if n >= 0 => Some(n as usize),
+        Some(n) => {
+            return Err(bad(format!(
+                "field 'thinking_token_budget' must be -1 (none) or at least 0, not {n}"
+            )))
+        }
+    };
+    let message = match v.get("thinking_budget_message") {
+        None | Some(Value::Null) => shared.sampling.thinking_budget_message.clone(),
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(bad("field 'thinking_budget_message' must be a string")),
+    };
+    let prompt = match signed("truncate_prompt_tokens")? {
+        None => shared
+            .sampling
+            .prompt_budget
+            .map(|k| (k, PromptMode::parse(&shared.sampling.prompt_budget_mode))),
+        Some(-1) => Some((
+            shared
+                .engine
+                .kv_capacity()
+                .saturating_sub(max_tokens)
+                .max(1),
+            PromptMode::Truncate,
+        )),
+        Some(k) if k >= 1 => Some((k as usize, PromptMode::Truncate)),
+        Some(k) => {
+            return Err(bad(format!(
+                "field 'truncate_prompt_tokens' must be -1 or at least 1, not {k}"
+            )))
+        }
+    };
+    Ok(Budgets {
+        thinking,
+        message,
+        prompt,
+    })
+}
+
 /// The sampling knobs both OpenAI endpoints share.
 fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
     let max_tokens = v
@@ -708,6 +845,7 @@ fn sampling_params(shared: &Shared, v: &Value) -> Handled<DecodeParams> {
         stop_strings,
         readback,
         prefill_tile: shared.engine.prefill_tile(),
+        thinking: None,
     })
 }
 
@@ -1235,6 +1373,7 @@ fn eval(shared: &Shared, request: Request, v: &Value) -> Result<()> {
                             stop_strings: Vec::new(),
                             readback: engine.readback(),
                             prefill_tile: engine.prefill_tile(),
+                            thinking: None,
                         };
                         let mut pending = String::new();
                         let started = Instant::now();
@@ -1571,6 +1710,16 @@ fn timings(prompt: usize, facts: &PromptFacts, d: &Decoded, elapsed: std::time::
         // (listed in `template_kwargs_ignored`).
         "reasoning_effort": facts.reasoning_effort,
         "template_kwargs_ignored": ignored,
+        // The token budgets: what was asked, whether the thinking one ran
+        // (`thinking_budget_ignored` says why not) and what it did, and what
+        // the prompt one dropped before the prefill.
+        "thinking_budget": facts.thinking_budget,
+        "thinking_budget_ignored": facts.thinking_ignored,
+        "thinking_tokens": d.thinking.map(|t| t.thought),
+        "thinking_budget_fired": d.thinking.map(|t| t.fired),
+        "prompt_budget": facts.prompt_budget,
+        "prompt_tokens_dropped": facts.dropped.tokens,
+        "prompt_messages_dropped": facts.dropped.messages,
     })
 }
 
@@ -1587,7 +1736,8 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
         "[{endpoint}: prompt_tokens={prompt} completion_tokens={} stop={:?} total {total_ms:.1} ms, \
          {steady:.1} tok/s steady (median step), readback={} reuse={:?} prefilled={} \
          commits={} poll_fallbacks={} overrun={} eos_gate={} host_fill={} prompt_ids_sha256={} \
-         reasoning_effort={}]",
+         reasoning_effort={} thinking_budget={} thought={} budget_fired={} prompt_budget={} \
+         prompt_dropped={}]",
         d.tokens.len(),
         d.stop,
         d.readback.name(),
@@ -1600,6 +1750,17 @@ fn report(endpoint: &str, prompt: usize, facts: &PromptFacts, d: &Decoded, total
         super::common::host_fill_name(st.host_feed.as_ref()),
         facts.ids_sha256,
         facts.reasoning_effort.as_str().unwrap_or("default"),
+        facts
+            .thinking_budget
+            .map_or_else(|| "none".into(), |n| n.to_string()),
+        d.thinking
+            .map_or_else(|| "none".into(), |t| t.thought.to_string()),
+        d.thinking
+            .map_or_else(|| "none".into(), |t| t.fired.to_string()),
+        facts
+            .prompt_budget
+            .map_or_else(|| "none".into(), |n| n.to_string()),
+        facts.dropped.tokens,
     );
 }
 
@@ -1611,6 +1772,13 @@ struct PromptFacts {
     ids_sha256: String,
     reasoning_effort: Value,
     ignored: Vec<Ignored>,
+    /// The thinking budget the request asked for, and why it was ignored
+    /// (a template or a prompt with no open block) when it was.
+    thinking_budget: Option<usize>,
+    thinking_ignored: Option<&'static str>,
+    /// The prompt budget, and what it dropped.
+    prompt_budget: Option<usize>,
+    dropped: Dropped,
 }
 
 impl PromptFacts {
@@ -1619,6 +1787,45 @@ impl PromptFacts {
             ids_sha256: super::chat::tokens_sha256(ids),
             ..Self::default()
         }
+    }
+
+    /// Record the request's budgets against the prompt that runs, and arm
+    /// the thinking budget on `params` where the prompt leaves a block open.
+    /// Where it does not, the request is served without it and says so —
+    /// clients send the field whatever the model, as with `reasoning_effort`.
+    fn apply_budgets(
+        &mut self,
+        engine: &dyn Served,
+        endpoint: &str,
+        wanted: &Budgets,
+        dropped: Dropped,
+        ids: &[u32],
+        params: &mut DecodeParams,
+    ) -> Handled<()> {
+        self.prompt_budget = wanted.prompt.map(|(k, _)| k);
+        self.dropped = dropped;
+        let Some(n) = wanted.thinking else {
+            return Ok(());
+        };
+        self.thinking_budget = Some(n);
+        let message = match &wanted.message {
+            Some(m) => engine.encode(m, false)?,
+            None => Vec::new(),
+        };
+        let refused = engine.thinking_budget_refused();
+        match budgets::thinking(refused, engine.think_tags().as_ref(), ids, n, &message)
+            .map_err(|e| bad(format!("{e:#}")))?
+        {
+            Ok(b) => params.thinking = Some(b),
+            Err(why) => {
+                eprintln!(
+                    "[{endpoint}: {}: thinking_token_budget={n} ignored: {why}]",
+                    engine.capabilities().family
+                );
+                self.thinking_ignored = Some(why);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1653,6 +1860,7 @@ fn render_request(
         ids_sha256: String::new(),
         reasoning_effort: applied(REASONING_EFFORT),
         ignored: rendered.ignored.clone(),
+        ..PromptFacts::default()
     };
     Ok((rendered.text, facts))
 }

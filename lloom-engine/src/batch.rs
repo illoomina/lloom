@@ -517,6 +517,11 @@ where
             "its rows draw through the batched driver's per-row sampler or one device argmax \
              over the batch (serve them at --batch 1)",
         )?;
+        req.params.refuse_thinking_budget(
+            "the batch scheduler",
+            "its rows draw through the batched driver, which feeds no forced token (serve it at \
+             --batch 1)",
+        )?;
         let (routed, seq) = self
             .pool
             .acquire(&req.prompt_ids)

@@ -145,8 +145,15 @@ fn parse_eviction(v: &str) -> Result<String, String> {
 fn parse_hazard_key(v: &str) -> Result<Option<String>, String> {
     optional(v, |s| one_of(s, "hazard key", &["range", "pointer", "ptr"]))
 }
+/// `none` (and the empty string a shell passes for `CANDLE_MMAP_ADVICE=`) is
+/// kept as `"none"`, not cleared: unset takes the default, which is an advised
+/// arm, so clearing would turn a request to disable into the default.
 fn parse_mmap_advice(v: &str) -> Result<Option<String>, String> {
-    optional(v, |s| one_of(s, "mmap advice", &["willneed", "will_need", "sequential", "seq"]))
+    let v = v.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("none") {
+        return Ok(Some("none".to_string()));
+    }
+    one_of(v, "mmap advice", &["willneed", "will_need", "sequential", "seq"]).map(Some)
 }
 fn parse_dequant_gemm(v: &str) -> Result<String, String> {
     one_of(v, "dequant gemm", &["qmm", "steel"])

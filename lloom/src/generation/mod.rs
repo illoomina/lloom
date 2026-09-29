@@ -6,6 +6,7 @@
 use lloom_tensor::{DType, Error, Result, Tensor};
 use rand::{distr::Distribution, SeedableRng};
 
+pub mod budget;
 pub mod hot_thread;
 pub mod poll;
 pub mod processors;
@@ -16,6 +17,7 @@ pub mod token_ring;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod token_ring_fuzz;
 
+pub use budget::{ThinkingBudget, ThinkingReport};
 pub use hot_thread::{HotThread, HotThreadArm, HotThreadReport, QosClass};
 pub use processors::Processors;
 pub use readback::{
@@ -140,12 +142,24 @@ impl LogitsProcessor {
     /// Processors, when installed, run first and advance their history from
     /// the drawn tensor.
     pub fn sample_argmax_on_device(&mut self, logits: &Tensor) -> Result<Tensor> {
+        self.sample_argmax_on_device_fed(logits, Ok)
+    }
+
+    /// [`Self::sample_argmax_on_device`], with the step's fed token
+    /// `feed(draw)` in place of the draw: the token the processors' history
+    /// counts is the one the step feeds (a thinking budget's forced tail,
+    /// [`budget`]).
+    pub fn sample_argmax_on_device_fed(
+        &mut self,
+        logits: &Tensor,
+        feed: impl FnOnce(Tensor) -> Result<Tensor>,
+    ) -> Result<Tensor> {
         let temperature = self.temperature();
         let Some(stage) = self.stage.as_mut() else {
-            return self.draw_on_device(logits);
+            return feed(self.draw_on_device(logits)?);
         };
         let processed = stage.apply(logits, temperature)?;
-        let token = self.draw_on_device(&processed)?;
+        let token = feed(self.draw_on_device(&processed)?)?;
         if let Some(stage) = self.stage.as_mut() {
             stage.record(&token)?;
         }
@@ -271,12 +285,27 @@ impl LogitsProcessor {
     }
 
     pub fn sample_f(&mut self, logits: &Tensor, f: impl FnOnce(&mut [f32])) -> Result<u32> {
+        self.sample_f_fed(logits, f, |id| id)
+    }
+
+    /// [`Self::sample`], with the step's fed token `feed(draw)` in place of
+    /// the draw, as [`Self::sample_argmax_on_device_fed`].
+    pub fn sample_fed(&mut self, logits: &Tensor, feed: impl FnOnce(u32) -> u32) -> Result<u32> {
+        self.sample_f_fed(logits, |_| {}, feed)
+    }
+
+    fn sample_f_fed(
+        &mut self,
+        logits: &Tensor,
+        f: impl FnOnce(&mut [f32]),
+        feed: impl FnOnce(u32) -> u32,
+    ) -> Result<u32> {
         let temperature = self.temperature();
         let Some(stage) = self.stage.as_mut() else {
-            return self.draw(logits, f);
+            return Ok(feed(self.draw(logits, f)?));
         };
         let processed = stage.apply(logits, temperature)?;
-        let id = self.draw(&processed, f)?;
+        let id = feed(self.draw(&processed, f)?);
         if let Some(stage) = self.stage.as_mut() {
             stage.record_id(id)?;
         }

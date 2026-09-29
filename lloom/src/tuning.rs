@@ -91,6 +91,9 @@ fn parse_state_write(v: &str) -> Result<String, String> {
 fn parse_rows_arm(v: &str) -> Result<String, String> {
     one_of(v, "rows arm", &["batched", "per-row"])
 }
+fn parse_poison_value(v: &str) -> Result<String, String> {
+    one_of(v, "poison value", &["nan", "finite"])
+}
 
 /// LFM2's runtime toggles (`models/lfm2.rs`, `nn/ops.rs`).
 #[derive(Options, Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -111,6 +114,12 @@ pub struct Lfm2Tuning {
     /// Print every verify poll's spins and fallback — an instrument.
     #[opt(flag = "verify-poll-trace", env = "LLOOM_VERIFY_POLL_TRACE", bool)]
     pub verify_poll_trace: bool,
+    /// Fill these zero sites with a sentinel instead of zeros (`nn/zeros.rs`): `all`, or site names separated by commas — an instrument.
+    #[opt(flag = "poison-zeros", env = "LLOOM_POISON_ZEROS")]
+    pub poison_zeros: String,
+    /// The poison's sentinel: `nan` (any read that reaches arithmetic shows) or `finite` (a read whose value matters shows).
+    #[opt(flag = "poison-value", env = "LLOOM_POISON_VALUE", parser = "parse_poison_value", variants = ["nan", "finite"])]
+    pub poison_value: String,
 }
 
 impl Default for Lfm2Tuning {
@@ -121,6 +130,8 @@ impl Default for Lfm2Tuning {
             flash_partial_bn: 32,
             share_trace: false,
             verify_poll_trace: false,
+            poison_zeros: String::new(),
+            poison_value: "nan".into(),
         }
     }
 }
@@ -355,6 +366,7 @@ mod tests {
         assert!(t.set("lfm2.flash_partial_bn", "16").is_err());
         assert!(t.set("dspark.ctx_kv", "sparse").is_err());
         assert!(t.set("qwen4exp.mem_check", "maybe").is_err());
+        assert!(t.set("lfm2.poison_value", "inf").is_err());
         t.set("dspark.ctx_kv", "paged:256").unwrap();
         t.set("ring.hot_thread", "off").unwrap();
         t.set("stream.plan", "host").unwrap();

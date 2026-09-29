@@ -7,6 +7,7 @@
 
 use crate::models::with_tracing::{linear_no_bias as linear, Embedding, Linear, RmsNorm};
 use crate::nn::ops::{FlashScratchSizing, KvQuant};
+use crate::nn::zeros as zs;
 use crate::nn::{
     BatchedCausalLM, CacheReset, CausalLM, Conv1d, Conv1dConfig, Model as ModelTrait, RaggedRow,
     Row, Speculative, VarBuilder,
@@ -1604,7 +1605,7 @@ impl KvSlot {
         if let Some(old) = self.all_data.as_ref() {
             let mut shape = old.dims().to_vec();
             shape[2] = capacity;
-            let grown = Tensor::zeros(shape, old.dtype(), old.device())?;
+            let grown = zs::zeros(zs::LFM2_KV_SLAB, shape, old.dtype(), old.device())?;
             grown.slice_set(old, 2, 0)?;
             self.all_data = Some(grown);
         }
@@ -1622,7 +1623,12 @@ impl KvSlot {
         if self.all_data.is_none() {
             let mut shape = src.dims().to_vec();
             shape[2] = self.capacity;
-            self.all_data = Some(Tensor::zeros(shape, src.dtype(), src.device())?);
+            self.all_data = Some(zs::zeros(
+                zs::LFM2_KV_SLAB,
+                shape,
+                src.dtype(),
+                src.device(),
+            )?);
         }
         let all_data = self.all_data.as_ref().unwrap();
         if self.len + seq_len > self.capacity {
@@ -1745,13 +1751,19 @@ impl QuantKvSlot {
             };
             let (old_row, new_row) = (row(self.capacity)?, row(capacity)?);
             let old = codes.reshape((rows, old_row))?;
-            let grown = Tensor::zeros((rows, new_row), DType::U8, codes.device())?;
+            let grown = zs::zeros(
+                zs::LFM2_KV_QUANT,
+                (rows, new_row),
+                DType::U8,
+                codes.device(),
+            )?;
             grown.slice_set(&old, 1, 0)?;
             self.codes = Some(grown.reshape(rows * new_row)?);
             for plane in [&mut self.scales, &mut self.biases] {
                 if let Some(p) = plane.as_ref() {
                     let old = p.reshape((rows, self.capacity))?;
-                    let grown = Tensor::zeros((rows, capacity), p.dtype(), p.device())?;
+                    let grown =
+                        zs::zeros(zs::LFM2_KV_QUANT, (rows, capacity), p.dtype(), p.device())?;
                     grown.slice_set(&old, 1, 0)?;
                     *plane = Some(grown.reshape(rows * capacity)?);
                 }
@@ -1802,10 +1814,10 @@ impl QuantKvSlot {
             .ok_or_else(|| lloom_tensor::Error::msg("QuantKvSlot::ensure on the Off arm"))?;
         // A u8 plane rather than a typed one: the packing is the kernel's, and
         // a `Tensor` of the code width does not exist at int4 anyway.
-        self.codes = Some(Tensor::zeros(code_bytes, DType::U8, device)?);
+        self.codes = Some(zs::zeros(zs::LFM2_KV_QUANT, code_bytes, DType::U8, device)?);
         let scale_els = b_sz * n_heads * self.capacity;
-        self.scales = Some(Tensor::zeros(scale_els, DType::F16, device)?);
-        self.biases = Some(Tensor::zeros(scale_els, DType::F16, device)?);
+        self.scales = Some(zs::zeros(zs::LFM2_KV_QUANT, scale_els, DType::F16, device)?);
+        self.biases = Some(zs::zeros(zs::LFM2_KV_QUANT, scale_els, DType::F16, device)?);
         self.b_sz = b_sz;
         self.n_heads = n_heads;
         self.head_dim = head_dim;
@@ -2054,9 +2066,9 @@ impl PagedKv {
             if let Some((pk, pv)) = layer.as_ref() {
                 let mut shape = pk.dims().to_vec();
                 shape[2] = tokens;
-                let nk = Tensor::zeros(shape.clone(), pk.dtype(), pk.device())?;
+                let nk = zs::zeros(zs::LFM2_KV_PAGES, shape.clone(), pk.dtype(), pk.device())?;
                 nk.slice_set(pk, 2, 0)?;
-                let nv = Tensor::zeros(shape, pv.dtype(), pv.device())?;
+                let nv = zs::zeros(zs::LFM2_KV_PAGES, shape, pv.dtype(), pv.device())?;
                 nv.slice_set(pv, 2, 0)?;
                 *layer = Some((nk, nv));
             }
@@ -2213,8 +2225,8 @@ impl PagedKv {
         if self.pools[block_idx].is_none() {
             let shape = (1, n_kv_heads, tokens, head_dim);
             self.pools[block_idx] = Some((
-                Tensor::zeros(shape, k.dtype(), k.device())?,
-                Tensor::zeros(shape, v.dtype(), v.device())?,
+                zs::zeros(zs::LFM2_KV_PAGES, shape, k.dtype(), k.device())?,
+                zs::zeros(zs::LFM2_KV_PAGES, shape, v.dtype(), v.device())?,
             ));
         }
         let slots = self
@@ -2475,8 +2487,8 @@ impl PagedKv {
         if self.pools[block_idx].is_none() {
             let shape = (1, n_kv_heads, tokens, head_dim);
             self.pools[block_idx] = Some((
-                Tensor::zeros(shape, k.dtype(), k.device())?,
-                Tensor::zeros(shape, v.dtype(), v.device())?,
+                zs::zeros(zs::LFM2_KV_PAGES, shape, k.dtype(), k.device())?,
+                zs::zeros(zs::LFM2_KV_PAGES, shape, v.dtype(), v.device())?,
             ));
         }
         let (pk, pv) = self.pools[block_idx].as_ref().expect("allocated above");
@@ -6466,6 +6478,25 @@ impl ShortConv {
         })
     }
 
+    /// The ring columns past the live window a prefill leaves, set for what
+    /// decode reads of them (`pass-plan-design.md` §18). The sliding ring
+    /// reads no slot outside its window before writing it, so its tail is
+    /// left as it is. The rotating ring folds every slot, the history against
+    /// a zero weight, so its tail must be finite, and it is zeroed: that is
+    /// also what keeps a rewind from reaching a slot this prefill did not
+    /// write (`sequence-state.md` §10.2a).
+    fn ring_regions_after_prefill(&self, state: &Tensor) -> Result<()> {
+        let width = self.conv_state.width(self.l_cache);
+        if width == self.l_cache {
+            return Ok(());
+        }
+        let tail = state.narrow(2, self.l_cache, width - self.l_cache)?;
+        match self.conv_state {
+            ConvState::RotatingRing { .. } => zs::zero_region(zs::LFM2_CONV_RING_HISTORY, &tail),
+            _ => zs::poison_region(zs::LFM2_CONV_RING_SLACK, &tail),
+        }
+    }
+
     /// The newest `l_cache - 1` columns of the live window, oldest first — the
     /// left context a multi-token pass owes (`DESIGN.md` §13.2f). `prev_phase`
     /// is the slot the window ended at before this pass advanced it; the
@@ -6990,7 +7021,8 @@ impl ShortConv {
         {
             let state = match &cache.conv_states[block_idx] {
                 Some(s) => s.clone(),
-                None => Tensor::zeros(
+                None => zs::zeros(
+                    zs::LFM2_CONV_FIRST_STATE,
                     (b_sz, self.hidden_size, self.l_cache),
                     c.dtype(),
                     c.device(),
@@ -7016,7 +7048,12 @@ impl ShortConv {
             let width = self.conv_state.width(self.l_cache);
             let state = match &cache.conv_states[block_idx] {
                 Some(s) => s.clone(),
-                None => Tensor::zeros((b_sz, self.hidden_size, width), c.dtype(), c.device())?,
+                None => zs::zeros(
+                    zs::LFM2_CONV_FIRST_STATE,
+                    (b_sz, self.hidden_size, width),
+                    c.dtype(),
+                    c.device(),
+                )?,
             };
             // `Model::forward`/`forward_all` have advanced `conv_phase` to the
             // slot of this pass's LAST position (§10.2e's one owner).
@@ -7078,7 +7115,12 @@ impl ShortConv {
             let width = self.conv_state.width(self.l_cache);
             let state = match &cache.conv_states[block_idx] {
                 Some(s) => s.clone(),
-                None => Tensor::zeros((b_sz, self.hidden_size, width), bx.dtype(), bx.device())?,
+                None => zs::zeros(
+                    zs::LFM2_CONV_FIRST_STATE,
+                    (b_sz, self.hidden_size, width),
+                    bx.dtype(),
+                    bx.device(),
+                )?,
             };
 
             // `Model::forward_all` has already advanced `conv_phase` by
@@ -7138,9 +7180,12 @@ impl ShortConv {
                     let width = self.conv_state.width(self.l_cache);
                     let state = match &cache.conv_states[block_idx] {
                         Some(s) => s.clone(),
-                        None => {
-                            Tensor::zeros((b_sz, self.hidden_size, width), bx.dtype(), bx.device())?
-                        }
+                        None => zs::zeros(
+                            zs::LFM2_CONV_FIRST_STATE,
+                            (b_sz, self.hidden_size, width),
+                            bx.dtype(),
+                            bx.device(),
+                        )?,
                     };
 
                     // Advanced once per token by `Model::forward`, for the same
@@ -7173,9 +7218,12 @@ impl ShortConv {
                     // before the write rather than being produced by it.
                     let mut state = match &cache.conv_states[block_idx] {
                         Some(s) => s.clone(),
-                        None => {
-                            Tensor::zeros((b_sz, self.hidden_size, width), bx.dtype(), bx.device())?
-                        }
+                        None => zs::zeros(
+                            zs::LFM2_CONV_FIRST_STATE,
+                            (b_sz, self.hidden_size, width),
+                            bx.dtype(),
+                            bx.device(),
+                        )?,
                     };
 
                     // `conv_phase` is the write slot, advanced once per token by
@@ -7194,7 +7242,8 @@ impl ShortConv {
                     if cache.conv_compact {
                         let live_w = self.l_cache + self.conv_state.history();
                         let live = state.narrow(2, width - live_w, live_w)?.contiguous()?;
-                        let pad = Tensor::zeros(
+                        let pad = zs::uninit(
+                            zs::LFM2_CONV_COMPACT_PAD,
                             (b_sz, self.hidden_size, width - live_w),
                             bx.dtype(),
                             bx.device(),
@@ -7232,7 +7281,8 @@ impl ShortConv {
                         Some(s) => s.contiguous()?,
                         None => {
                             let _declared = lloom_tensor::EscapeGuard::new();
-                            Tensor::zeros(
+                            zs::zeros(
+                                zs::LFM2_CONV_FIRST_STATE,
                                 (b_sz, self.hidden_size, self.l_cache),
                                 bx.dtype(),
                                 bx.device(),
@@ -7335,61 +7385,43 @@ impl ShortConv {
                 let src_len = conv_in.dim(2)?;
                 let start = src_len.saturating_sub(self.l_cache);
                 let cache_len = src_len - start;
-                let mut cache_src = conv_in.narrow(2, start, cache_len)?;
-                if cache_len < self.l_cache {
-                    let pad = self.l_cache - cache_len;
-                    let zeros = Tensor::zeros(
-                        (b_sz, self.hidden_size, pad),
-                        cache_src.dtype(),
-                        cache_src.device(),
-                    )?;
-                    cache_src = Tensor::cat(&[zeros, cache_src], 2)?;
-                }
-                // Under the ring the buffer is `l_cache + K + slack` wide and
-                // decode writes into it in place -- so prefill must hand over
-                // storage of the *full* width, with the live window at the front
-                // (write slot `live_w - 1`, which is what `Model::forward` seeds)
-                // and everything after it zeroed. Prefill is off the per-token
-                // path, so this `cat` is paid once per prompt, not once per token.
+                let carried = conv_in.narrow(2, start, cache_len)?.contiguous()?;
+                // The state OUTLIVES this pass, so the carry is written INTO
+                // the storage the cache owns (a cache with none yet allocates
+                // it under an `EscapeGuard`, which no plan serves), and the
+                // regions around it are set in place: nothing this tile
+                // allocates escapes it, and nothing is allocated to pad it.
+                // The live window sits at the front, the newest column at
+                // `l_cache - 1` (what `Model::forward` seeds). What each
+                // region must hold is `nn::zeros`'s classification
+                // (`pass-plan-design.md` §18).
                 let width = self.conv_state.width(self.l_cache);
-                if width > self.l_cache {
-                    let zeros = Tensor::zeros(
-                        (b_sz, self.hidden_size, width - self.l_cache),
-                        cache_src.dtype(),
-                        cache_src.device(),
-                    )?;
-                    cache_src = Tensor::cat(&[cache_src, zeros], 2)?;
-                }
-                // The state OUTLIVES this pass: the next pass reads it. Under
-                // a pass plan (`DESIGN.md` §9.2aa) this pass's activations —
-                // `cache_src` among them — live in slots the next pass reuses,
-                // so the carry is written INTO the storage the cache already
-                // owns (one `copy2d`, ordered after this pass's own read of it
-                // by the barrier chain), and a cache with no state yet gets
-                // one allocated under an `EscapeGuard`, which no plan serves.
-                // This is what makes a prefill tile allocate nothing that
-                // escapes it: measured 2 undeclared escapes per tile on the
-                // tiny fixture before, 0 after (`lfm2_pass_plans.rs`).
-                let carried = cache_src.contiguous()?;
+                let pad = self.l_cache - cache_len;
                 let owned = match &cache.conv_states[block_idx] {
                     Some(prev)
-                        if prev.shape() == carried.shape()
+                        if prev.dims() == [b_sz, self.hidden_size, width]
                             && prev.dtype() == carried.dtype()
                             && prev.is_contiguous() =>
                     {
-                        prev.slice_set(&carried, 2, 0)?;
                         prev.clone()
                     }
                     _ => {
                         // Not `Tensor::copy`: on Metal `try_clone` shares
                         // the buffer, and the storage must be this cache's own.
                         let _declared = lloom_tensor::EscapeGuard::new();
-                        let own =
-                            Tensor::zeros(carried.shape(), carried.dtype(), carried.device())?;
-                        own.slice_set(&carried, 2, 0)?;
-                        own
+                        zs::zeros(
+                            zs::LFM2_CONV_STATE,
+                            (b_sz, self.hidden_size, width),
+                            carried.dtype(),
+                            carried.device(),
+                        )?
                     }
                 };
+                owned.slice_set(&carried, 2, pad)?;
+                if pad > 0 {
+                    zs::zero_region(zs::LFM2_CONV_LEFT_PAD, &owned.narrow(2, 0, pad)?)?;
+                }
+                self.ring_regions_after_prefill(&owned)?;
                 cache.set_conv_state(block_idx, owned)?;
             }
 

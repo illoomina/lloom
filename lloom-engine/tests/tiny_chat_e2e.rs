@@ -1,9 +1,9 @@
 //! `lloom chat --model <tiny>` end to end on both families
 //! (`docs/porting-models.md` §21.8, #761): each family's tiny checkpoint is
 //! written to real files — safetensors + `config.json` for LFM2, one GGUF
-//! for Qwen4-exp, each with the byte-level tokenizer and the family's own
-//! chat template — and the shipped binary loads it through family
-//! detection, renders the template, prefills and decodes.
+//! for Qwen4-exp, each with the byte-level tokenizer and the family's tiny
+//! chat template (`tiny_templates.rs`) — and the shipped binary loads it
+//! through family detection, renders the template, prefills and decodes.
 //!
 //! What is asserted, per family and device:
 //! - the process exits 0 and reports its turn;
@@ -162,8 +162,10 @@ fn encode(tok: &TinyTokenizer, s: &str) -> Vec<u32> {
     ids
 }
 
-const LOW: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
-const XHIGH: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+const LOW: &str = "Thinking effort: low. Think briefly.";
+const XHIGH: &str = "Thinking effort: xhigh. Think the problem through.";
+const REJECTED: &str =
+    "tiny qwen4exp template: reasoning_effort high is not one of low, medium, xhigh";
 
 /// Qwen4-exp's rendering of one user message with thinking on: the effort's
 /// instruction as the system turn (`medium` has none), then the open think
@@ -274,10 +276,12 @@ fn chat_refuses_an_effort_the_template_rejects_or_does_not_act_on() {
     };
     let (ok, stderr, f) = with(&["--think", "--reasoning-effort", "high"]);
     assert!(!ok && f.is_empty(), "{stderr}");
-    assert!(stderr.contains(
-        "--reasoning-effort high: the chat template rejected the request: Unexpected reasoning effort high. \
-         Supported types are xhigh (default), medium, and low."
-    ), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "--reasoning-effort high: the chat template rejected the request: {REJECTED}"
+        )),
+        "{stderr}"
+    );
     let (ok, stderr, f) = with(&["--reasoning-effort", "low"]);
     assert!(!ok && f.is_empty(), "{stderr}");
     assert!(stderr.contains(
@@ -416,8 +420,7 @@ fn qwen4exp_serve_takes_the_reasoning_effort_request_field() {
     assert_eq!(status, 400, "{err}");
     assert_eq!(
         err["error"]["message"],
-        "the chat template rejected the request: Unexpected reasoning effort high. \
-         Supported types are xhigh (default), medium, and low."
+        format!("the chat template rejected the request: {REJECTED}")
     );
     let (status, err) = server.chat(json!({
         "reasoning_effort": "low",

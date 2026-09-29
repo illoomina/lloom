@@ -92,6 +92,12 @@ impl Template {
         self.reads.as_ref().map(|r| r.contains(name))
     }
 
+    /// Every top-level name the template's source reads (the functions it
+    /// calls included); `None` when it could not be analysed.
+    pub fn variables(&self) -> Option<&BTreeSet<String>> {
+        self.reads.as_ref()
+    }
+
     /// Render `messages` with the generation prompt appended; `kwargs` are
     /// extra template variables, laid over the defaults.
     pub fn render(
@@ -163,11 +169,99 @@ impl Template {
 /// analysis of its AST (control flow is not considered: a variable read on
 /// any branch counts).
 fn undeclared_variables(source: &str) -> Option<BTreeSet<String>> {
-    let source = without_generation_blocks(source);
+    let source = with_self_assignments_renamed(&without_generation_blocks(source));
     let mut env = minijinja::Environment::new();
     env.add_template("chat", &source).ok()?;
     let names = env.get_template("chat").ok()?.undeclared_variables(false);
     Some(names.into_iter().collect())
+}
+
+/// `source` with the target of each `{% set name = … name … %}` renamed, so
+/// the analysis sees the read on the right-hand side. That is how a template
+/// defaults a caller's variable (`set x = x | default(…)`, the LFM2
+/// checkpoints' `preserve_thinking`), and minijinja's analysis assigns the
+/// target before it visits the value, so it reports none of them. A name
+/// the template declared before (a loop variable, a macro argument, an
+/// earlier `set`) is still declared at the read and still not reported.
+fn with_self_assignments_renamed(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find("{%") {
+        let Some(len) = rest[open + 2..].find("%}") else {
+            break;
+        };
+        let tag = &rest[open..open + 2 + len + 2];
+        out.push_str(&rest[..open]);
+        out.push_str(&self_assignment_renamed(tag).unwrap_or_else(|| tag.to_string()));
+        rest = &rest[open + 2 + len + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A `{% set name = … %}` tag whose value reads `name`, with the target
+/// renamed; `None` for any other tag.
+fn self_assignment_renamed(tag: &str) -> Option<String> {
+    let body = &tag[2..tag.len() - 2];
+    let lead = body.len() - body.trim_start_matches(['-', '+']).trim_start().len();
+    let after_set = body[lead..].strip_prefix("set")?;
+    let gap = after_set.len() - after_set.trim_start().len();
+    if gap == 0 {
+        return None;
+    }
+    let (target, value) = after_set.split_once('=')?;
+    let target = target.trim();
+    if value.starts_with('=') || !is_identifier(target) {
+        return None;
+    }
+    if !read_names(value).iter().any(|n| n == target) {
+        return None;
+    }
+    let at = 2 + lead + "set".len() + gap;
+    Some(format!(
+        "{}lloom_self_{}{}",
+        &tag[..at],
+        target,
+        &tag[at + target.len()..]
+    ))
+}
+
+fn is_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// The bare names an expression looks up: string literals, attributes
+/// (`.name`) and keyword-argument names (`name=`) excluded.
+fn read_names(expr: &str) -> Vec<String> {
+    let b = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' || c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != c {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+        } else if c == b'_' || c.is_ascii_alphabetic() {
+            let start = i;
+            while i < b.len() && (b[i] == b'_' || b[i].is_ascii_alphanumeric()) {
+                i += 1;
+            }
+            let attribute = expr[..start].trim_end().ends_with('.');
+            let after = expr[i..].trim_start();
+            let keyword = after.starts_with('=') && !after.starts_with("==");
+            if !attribute && !keyword {
+                out.push(expr[start..i].to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 /// `source` with transformers' `{% generation %}` / `{% endgeneration %}`
@@ -237,8 +331,8 @@ mod tests {
     use super::*;
     use lloom::testing::tiny::TinyTokenizer;
 
-    const LOW: &str = "Reasoning effort is set to low.";
-    const XHIGH: &str = "Reasoning effort is set to xhigh.";
+    const LOW: &str = "Thinking effort: low.";
+    const XHIGH: &str = "Thinking effort: xhigh.";
 
     fn qwen() -> Template {
         Template::compile(TinyTokenizer::qwen4exp().chat_template).unwrap()
@@ -281,6 +375,39 @@ mod tests {
         assert_eq!(q.reads("thinking_budget"), Some(false));
     }
 
+    /// A variable a template defaults onto itself (`set x = x |
+    /// default(…)`) is read, though minijinja's own analysis does not report
+    /// it; a name declared before its self-assignment (an earlier `set`, a
+    /// loop variable), a local set from something else, an attribute and a
+    /// keyword argument's name are not reads.
+    #[test]
+    fn a_variable_the_template_defaults_onto_itself_is_read() {
+        let src = "{%- set preserve_thinking = preserve_thinking | default(false) -%}\
+                   {% set local = 'local' %}{% set local = local ~ '!' %}\
+                   {% for m in messages %}{% set m = m | trim %}{{ m }}{% endfor %}\
+                   {% set attr = ns.attr %}{% set kw = f(kw=1) %}\
+                   {{ preserve_thinking }}{{ local }}{{ attr }}{{ kw }}";
+        let mut env = minijinja::Environment::new();
+        env.add_template("x", src).unwrap();
+        let theirs = env.get_template("x").unwrap().undeclared_variables(false);
+        assert!(
+            !theirs.contains("preserve_thinking"),
+            "minijinja now reports it: {theirs:?}"
+        );
+        let t = Template::compile(src).unwrap();
+        assert_eq!(t.reads("preserve_thinking"), Some(true));
+        for name in ["local", "m", "attr", "kw"] {
+            assert_eq!(t.reads(name), Some(false), "{name}");
+        }
+        for name in ["messages", "ns", "f"] {
+            assert_eq!(t.reads(name), Some(true), "{name}");
+        }
+        assert_eq!(
+            with_self_assignments_renamed("{%- set x = x | default(1) -%}{% set y = 2 %}"),
+            "{%- set lloom_self_x = x | default(1) -%}{% set y = 2 %}"
+        );
+    }
+
     /// The analysis reads through a `{% generation %}` block (LFM2's
     /// template has one) and misses nothing inside it.
     #[test]
@@ -320,7 +447,7 @@ mod tests {
             xhigh.starts_with(&format!("<|im_start|>system\n{XHIGH}")),
             "{xhigh}"
         );
-        assert!(!medium.contains("Reasoning effort"), "{medium}");
+        assert!(!medium.contains("Thinking effort"), "{medium}");
         assert!(medium.starts_with("<|im_start|>user\n"), "{medium}");
         assert_ne!(low, xhigh);
         assert_eq!(default, xhigh);
@@ -341,7 +468,7 @@ mod tests {
             .expect("a Rejected, not a render failure");
         assert_eq!(
             rejected.0,
-            "Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low."
+            "tiny qwen4exp template: reasoning_effort high is not one of low, medium, xhigh"
         );
     }
 

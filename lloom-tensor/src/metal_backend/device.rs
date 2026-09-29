@@ -375,13 +375,20 @@ pub struct MetalDevice {
     /// for both, set before the first recorded pass.
     pub(crate) base_mode: Arc<std::sync::atomic::AtomicBool>,
     /// Under the pass cache: whether a pass is open (`begin_pass` ..
-    /// `finish_pass`). Bit 0 = the cache is on, bit 1 = a pass is open. The
-    /// recorder takes an allocation only while a pass is open: one made
-    /// BETWEEN passes (a sampler's ids, a staged input) is nobody's ordinal
-    /// — recorded, it would be charged to the pass before it and, read by
-    /// the pass after it, counted as that pass's escape (measured: exactly
-    /// one per batched step, the argmax's ids).
+    /// `finish_pass`). Bit 0 = the cache is on, bit 1 = a pass is open, bit 2
+    /// = the open pass is served from a cached plan. The recorder takes an
+    /// allocation only while a pass is open: one made BETWEEN passes (a
+    /// sampler's ids, a staged input) is nobody's ordinal — recorded, it
+    /// would be charged to the pass before it and, read by the pass after
+    /// it, counted as that pass's escape (measured: exactly one per batched
+    /// step, the argmax's ids).
     pub(crate) pass_state: Arc<std::sync::atomic::AtomicU8>,
+    /// Requests that reached a buffer pool while a served pass was open,
+    /// `[shared, private]` (`DESIGN.md` §9.2aa, invariant I1). Counted per
+    /// request, hit or miss, so the figure is a function of what the pass
+    /// asked for and never of how far the GPU clock has let the free lists
+    /// refill (§6.3b).
+    pub(crate) served_pass_pool_requests: Arc<[std::sync::atomic::AtomicU64; 2]>,
 }
 
 /// One forward pass's plan, cached by its [`PassKey`]. Every plan is served
@@ -1817,6 +1824,33 @@ impl MetalDevice {
         self.pass_plans.lock().as_ref().map(|p| p.counters)
     }
 
+    /// Requests this device's pools received while a served pass was open,
+    /// `(shared, private)`: zero when every served pass allocated from its
+    /// plan alone (`DESIGN.md` §9.2aa, I1).
+    ///
+    /// The pools' own `allocations` cannot say this. They count misses over
+    /// every allocation, and a request made between passes (a staged input)
+    /// misses or hits according to whether the completion handler has
+    /// drained its same-size predecessor yet (§6.3b), which is the GPU's
+    /// timing, not the plan's coverage. Scoped to the device: a request
+    /// counts whichever thread made it.
+    pub fn served_pass_pool_requests(&self) -> (u64, u64) {
+        let [shared, private] = &*self.served_pass_pool_requests;
+        (
+            shared.load(std::sync::atomic::Ordering::Relaxed),
+            private.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Counts a request that reached pool `which` (0 shared, 1 private) if a
+    /// served pass is open. One relaxed load when none is.
+    fn note_pool_request(&self, which: usize) {
+        if self.pass_state.load(std::sync::atomic::Ordering::Relaxed) & 0b100 != 0 {
+            self.served_pass_pool_requests[which]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// The undeclared escapes of `key`'s plan as `(ordinal, bytes, allocated
     /// at dispatch, first read at dispatch of the following pass)` — empty
     /// when it has none or no plan.
@@ -1931,6 +1965,8 @@ impl MetalDevice {
                 }
                 arena.begin_step();
                 pp.counters.served += 1;
+                self.pass_state
+                    .fetch_or(0b100, std::sync::atomic::Ordering::Relaxed);
                 PassState::Served(key)
             }
             (None, false) => {
@@ -1957,7 +1993,7 @@ impl MetalDevice {
             return Err(MetalError::Message("finish_pass: no pass is open".to_string()).into());
         };
         self.pass_state
-            .fetch_and(!0b10, std::sync::atomic::Ordering::Relaxed);
+            .fetch_and(!0b110, std::sync::atomic::Ordering::Relaxed);
         // A plan closed this pass: the recording pass's transients sit in
         // the pool's free list while the base now holds the pass's shape —
         // trimmed after the lock, or a budget that admitted one copy of the
@@ -2298,6 +2334,7 @@ impl MetalDevice {
                 }
             }
         }
+        self.note_pool_request(1);
         let buffer = match self.private_buffers.acquire(size) {
             Some(b) => b,
             None => {
@@ -2615,6 +2652,7 @@ impl MetalDevice {
 
     /// The critical allocator algorithm
     pub fn allocate_buffer(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+        self.note_pool_request(0);
         if let Some(b) = self.buffers.acquire(size) {
             return Ok(b);
         }

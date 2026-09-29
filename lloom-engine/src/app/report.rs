@@ -582,7 +582,10 @@ pub fn print_executor(device: &Device, installed: &Installed, steps: u64) {
 
 /// The pass-plan cache's counters, and each key's coverage — with the
 /// escapes' identities (ordinal, bytes, allocated-at, first-read-at), since a
-/// count says a hole exists and the sizes say what leaked.
+/// count says a hole exists and the sizes say what leaked. Beside them, what
+/// the served passes still asked the pools for: a key's coverage cannot show
+/// that, because the recorder sees only the private pool (`DESIGN.md`
+/// §9.2aa, I1).
 #[cfg(feature = "metal")]
 pub fn print_pass_plans(dev: &lloom_tensor::MetalDevice, widths: &str) {
     let (Some(c), Some((keys, base))) = (dev.pass_plan_counters(), dev.pass_plan_report()) else {
@@ -602,9 +605,11 @@ pub fn print_pass_plans(dev: &lloom_tensor::MetalDevice, widths: &str) {
             }
         })
         .collect();
+    let (shared, private) = dev.served_pass_pool_requests();
     eprintln!(
         "[pass plans: served={} recorded={} observed={} plans={} evicted={} \
-         escapes={} capped={} base_grows={} base={:.1} MiB widths={} keys=[{}]]",
+         escapes={} capped={} base_grows={} served_pass_pool_requests=shared:{shared},private:{private} \
+         base={:.1} MiB widths={} keys=[{}]]",
         c.served,
         c.recorded,
         c.observed,

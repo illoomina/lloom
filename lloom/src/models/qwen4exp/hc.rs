@@ -95,6 +95,19 @@ impl HyperConnection {
     /// `gate = sigmoid(up·lo)`; `mixed = mean_streams(xn · gate)`;
     /// `inject = inject·xn`.
     pub fn mix(&self, h: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (mixed, inject) = self.mix_parts(h, true)?;
+        Ok((mixed, inject.expect("the injection was asked for")))
+    }
+
+    /// The collapsed input alone: [`Self::mix`] for a caller with no
+    /// [`Self::combine`] to feed (the head, a tap), which makes no injection
+    /// (the composed arm's zeros when there is no `inject`, a gemv when there
+    /// is) only to drop it.
+    pub fn collapse(&self, h: &Tensor) -> Result<Tensor> {
+        Ok(self.mix_parts(h, false)?.0)
+    }
+
+    fn mix_parts(&self, h: &Tensor, want_inject: bool) -> Result<(Tensor, Option<Tensor>)> {
         let (b, seq, _) = h.dims3()?;
         // The whole prologue as two launches on Metal at a decode's rows
         // (`kernels::hc_mix_fused`: norm + down·SiLU + inject, then
@@ -110,7 +123,7 @@ impl HyperConnection {
             self.d,
             self.eps,
         ) {
-            return out;
+            return out.map(|(m, i)| (m, Some(i)));
         }
         // The grouped norm as one launch on Metal (`kernels::HcNorm`); the
         // composed pair (`rms_norm` per stream, `broadcast_mul` γ) elsewhere.
@@ -145,11 +158,14 @@ impl HyperConnection {
             }
         };
 
+        if !want_inject {
+            return Ok((mixed, None));
+        }
         let inject = match &self.inject {
             Some(inject) => inject.forward(&xn)?, // [b, seq, n]
             None => Tensor::zeros((b, seq, self.n), xn.dtype(), xn.device())?,
         };
-        Ok((mixed, inject))
+        Ok((mixed, Some(inject)))
     }
 
     /// Epilogue: scatter `block_out [b, seq, d]` back across the `n` streams of

@@ -58,6 +58,10 @@ pub struct PleLayer {
     k: usize,
     dilation: usize,
     eps: f32,
+    /// The gate's scalars `(1e-6, f32::MAX, 0)` on the device at the gate's
+    /// dtype, made on first use: a scalar operand is an upload per call
+    /// (`TensorOrScalar`), and these are the same three every step.
+    gate_scalars: std::sync::OnceLock<(Tensor, Tensor, Tensor)>,
 }
 
 impl PleLayer {
@@ -92,7 +96,33 @@ impl PleLayer {
             k,
             dilation,
             eps,
+            gate_scalars: std::sync::OnceLock::new(),
         })
+    }
+
+    /// See [`Self::gate_scalars`]. Made outside any pass plan: they outlive
+    /// every pass.
+    fn gate_scalars(&self, like: &Tensor) -> Result<&(Tensor, Tensor, Tensor)> {
+        if let Some(t) = self.gate_scalars.get() {
+            if t.0.dtype() == like.dtype() && t.0.device().same_device(like.device()) {
+                return Ok(t);
+            }
+        }
+        #[cfg(feature = "metal")]
+        let _declared = lloom_tensor::EscapeGuard::new();
+        let (dt, dev) = (like.dtype(), like.device());
+        // Converted on the host and moved, as the scalar operand path does.
+        let cpu = lloom_tensor::Device::Cpu;
+        let made = (
+            Tensor::new(1e-6f32, &cpu)?.to_dtype(dt)?.to_device(dev)?,
+            Tensor::new(f32::MAX, &cpu)?.to_dtype(dt)?.to_device(dev)?,
+            Tensor::new(0f32, &cpu)?.to_dtype(dt)?.to_device(dev)?,
+        );
+        let _ = self.gate_scalars.set(made);
+        match self.gate_scalars.get() {
+            Some(t) if t.0.dtype() == dt && t.0.device().same_device(dev) => Ok(t),
+            _ => lloom_tensor::bail!("ple gate scalars: made for another dtype or device"),
+        }
     }
 
     /// The device the block's weights live on.
@@ -134,8 +164,15 @@ impl PleLayer {
         // Per-stream dot, signed square root, sigmoid.
         let prod = (key_n.reshape((1, seq, n, d))? * query_n.reshape((1, seq, n, d))?)?;
         let s = (prod.sum(3)? * (1.0 / (d as f64).sqrt()))?; // [1, seq, n]
-        let mag = s.abs()?.clamp(1e-6f32, f32::MAX)?.sqrt()?;
-        let sgn = (s.gt(0f32)?.to_dtype(dt)? - s.lt(0f32)?.to_dtype(dt)?)?;
+        let (lo, hi, zero) = self.gate_scalars(&s)?;
+        let shape = s.shape();
+        let (lo, hi, zero) = (
+            lo.broadcast_as(shape)?,
+            hi.broadcast_as(shape)?,
+            zero.broadcast_as(shape)?,
+        );
+        let mag = s.abs()?.clamp(&lo, &hi)?.sqrt()?;
+        let sgn = (s.gt(&zero)?.to_dtype(dt)? - s.lt(&zero)?.to_dtype(dt)?)?;
         let gate = ops::sigmoid(&(sgn * mag)?)?; // [1, seq, n]
 
         // value broadcast over the streams, scaled by the gate.

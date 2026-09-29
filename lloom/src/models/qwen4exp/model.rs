@@ -71,7 +71,7 @@ impl<R: ExpertResidency> Layer<R> {
     /// The `[.., d]` collapse of a carry through this layer's ffn bracket —
     /// the per-layer value the observer reports (`LayerOutputPoint`).
     pub fn collapsed(&self, res_hc: &Tensor) -> Result<Tensor> {
-        Ok(self.hc_ffn.mix(res_hc)?.0)
+        self.hc_ffn.collapse(res_hc)
     }
 
     /// One position through the layer: `res_hc [1, 1, n·d]` → the new carry,
@@ -859,6 +859,17 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// the command buffer its last reader was encoded into.
     #[cfg(feature = "metal")]
     replay_h: parking_lot::Mutex<Option<(Tensor, Option<u64>)>>,
+    /// A one-position step's PLE rows, gathered on the host into a Shared
+    /// buffer the model keeps rather than uploaded per step
+    /// (`ple_rows_owned`), and the epoch of its last reader.
+    #[cfg(feature = "metal")]
+    ple_rows: parking_lot::Mutex<
+        Option<(
+            lloom_tensor::kernels::metal::BufferHandle,
+            Tensor,
+            Option<u64>,
+        )>,
+    >,
     cfg: Config,
 }
 
@@ -969,6 +980,8 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             settle_dst: parking_lot::Mutex::new(None),
             #[cfg(feature = "metal")]
             replay_h: parking_lot::Mutex::new(None),
+            #[cfg(feature = "metal")]
+            ple_rows: parking_lot::Mutex::new(None),
             cfg,
         }
     }
@@ -1575,10 +1588,85 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
                 .row_ids(&window, &mut ids[t * n_heads..(t + 1) * n_heads]);
             cache.ngram.push(token);
         }
+        if seq == 1 {
+            if let Some(emb) = self.ple_rows_owned(ple, &ids, res_hc.device())? {
+                let emb = emb.reshape((1, emb.elem_count()))?;
+                let out = ple
+                    .block
+                    .forward(res_hc, &emb, &mut cache.ple_conv, ple.layer);
+                self.ple_rows_read_encoded();
+                return out;
+            }
+        }
         let emb = ple.table.gather(&ids, res_hc.device())?; // [seq·n_heads·head_dim]
         let emb = emb.reshape((seq, emb.elem_count() / seq))?;
         ple.block
             .forward(res_hc, &emb, &mut cache.ple_conv, ple.layer)
+    }
+
+    /// One position's PLE rows gathered on the host straight into the
+    /// model's Shared buffer, once the step that last read it has retired;
+    /// `None` — the caller uploads them, as always — while it may still run,
+    /// off Metal, or for a table that cannot gather into a slice.
+    fn ple_rows_owned(
+        &self,
+        ple: &Ple,
+        ids: &[i64],
+        dev: &lloom_tensor::Device,
+    ) -> Result<Option<Tensor>> {
+        #[cfg(feature = "metal")]
+        if let lloom_tensor::Device::Metal(m) = dev {
+            let Ok(hd) = ple.table.head_dim() else {
+                return Ok(None);
+            };
+            let n = ids.len() * hd;
+            let clock = m.gpu_clock();
+            let mut g = self.ple_rows.lock();
+            let fits = matches!(g.as_ref(), Some((_, t, _)) if t.elem_count() == n);
+            if !fits {
+                // Outlives every pass: no plan serves it.
+                let _declared = lloom_tensor::EscapeGuard::new();
+                let buf = m.new_persistent_shared(n * std::mem::size_of::<f32>())?;
+                if buf.contents().is_null() {
+                    return Ok(None);
+                }
+                let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
+                    buf.clone(),
+                    m.clone(),
+                    n,
+                    lloom_tensor::DType::F32,
+                ));
+                let t =
+                    Tensor::from_storage(storage, n, lloom_tensor::op::BackpropOp::none(), false);
+                *g = Some((buf, t, None));
+            }
+            let (buf, t, read) = g.as_mut().expect("made above");
+            if !read.is_none_or(|e| clock.is_complete(e)) {
+                return Ok(None);
+            }
+            // SAFETY: a CPU-mapped Shared buffer of `n` f32 (checked when
+            // made); the step that last read it has completed (above), and
+            // nothing on the device writes it.
+            let out = unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut f32, n) };
+            if ple.table.gather_into(ids, out).is_err() {
+                return Ok(None);
+            }
+            *read = None;
+            return Ok(Some(t.clone()));
+        }
+        let _ = (ple, ids, dev);
+        Ok(None)
+    }
+
+    /// The PLE block has encoded its reads of the model's rows buffer: stamp
+    /// the epoch they ride (`ple_rows_owned`).
+    fn ple_rows_read_encoded(&self) {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = self.device().as_metal_device() {
+            if let Some((_, _, read)) = self.ple_rows.lock().as_mut() {
+                *read = Some(m.gpu_clock().current_epoch());
+            }
+        }
     }
 
     /// Embed `tokens [b, seq]` → `[b, seq, hidden]` without running a layer.
@@ -1777,7 +1865,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
 
         // Only the last position feeds the head.
         let last = res_hc.narrow(1, seq - 1, 1)?;
-        let (collapsed, _) = self.hc_head.mix(&last)?; // [1, 1, d]
+        let collapsed = self.hc_head.collapse(&last)?; // [1, 1, d]
         cache.pos += seq;
         let logits = self.lm_head.forward(&collapsed)?;
         logits
@@ -1902,7 +1990,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // Only the last position feeds the head.
         let last_seq = seqs[n_tiles - 1];
         let last = res[n_tiles - 1].narrow(1, last_seq - 1, 1)?;
-        let (collapsed, _) = self.hc_head.mix(&last)?; // [1, 1, d]
+        let collapsed = self.hc_head.collapse(&last)?; // [1, 1, d]
         cache.pos += seqs.iter().sum::<usize>();
         let logits = self.lm_head.forward(&collapsed)?;
         logits
@@ -2313,7 +2401,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         }
 
         // Final HC collapse (carries the output norm) → lm_head.
-        let (collapsed, _) = self.hc_head.mix(&res_hc)?; // [1, 1, d]
+        let collapsed = self.hc_head.collapse(&res_hc)?; // [1, 1, d]
         cache.pos += 1;
         let logits = self.lm_head.forward(&collapsed)?; // [1, 1, vocab]
         let logits = logits

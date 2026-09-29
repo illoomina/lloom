@@ -18,11 +18,13 @@
 
 use super::common::{eos_gate_name, host_fill_name, ms, MemSnapshot, NEVER_EOS};
 use super::report;
+use super::served::Served;
+use super::template::{Rejected, ENABLE_THINKING, NOT_READ, REASONING_EFFORT};
 use super::vision::{expand_image_tokens, DecodedImage};
 use super::{load_engine, ModelArgs, Shape};
 use anyhow::{Context, Result};
 use clap::Parser;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::io::{BufRead, Write};
 use std::time::Instant;
 
@@ -56,6 +58,15 @@ pub struct ChatArgs {
     /// default so the reply is the answer.
     #[arg(long)]
     pub think: bool,
+
+    /// How long the model thinks: the chat template's `reasoning_effort`
+    /// (Qwen4-exp's: `low`, `medium`, `xhigh`, its default `xhigh`). The
+    /// values are the template's own, and so is the refusal of one it does
+    /// not accept. Refused, before the first turn, on a template that does
+    /// not read the variable (LFM2) or renders the same prompt for any value
+    /// of it (Qwen4-exp without `--think`).
+    #[arg(long, value_name = "EFFORT")]
+    pub reasoning_effort: Option<String>,
 
     /// Re-prefill the whole conversation every turn instead of extending
     /// the cache (a measurement arm).
@@ -99,7 +110,7 @@ pub struct ChatArgs {
 /// The reply's token digest in `lfm2-determinism`'s definition: SHA-256 over
 /// the generated ids as little-endian `u32`, EOS excluded — so a turn is
 /// comparable to the harness's `tokens_sha256` on the same prompt and arm.
-fn tokens_sha256(ids: &[u32]) -> String {
+pub(super) fn tokens_sha256(ids: &[u32]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for id in ids {
@@ -108,7 +119,55 @@ fn tokens_sha256(ids: &[u32]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Refuses a template variable the flags set that the checkpoint's template
+/// would not act on, and a value it rejects — on a one-message conversation,
+/// before the first turn, so the REPL does not find out at its first line.
+fn check_kwargs(
+    engine: &dyn Served,
+    system: Option<&str>,
+    kwargs: &Map<String, Value>,
+) -> Result<()> {
+    let Some(effort) = kwargs.get(REASONING_EFFORT).and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let mut probe = Vec::new();
+    if let Some(s) = system {
+        probe.push(json!({ "role": "system", "content": s }));
+    }
+    probe.push(json!({ "role": "user", "content": "." }));
+    let rendered = engine
+        .render_checked(&json!(probe), kwargs, &[REASONING_EFFORT])
+        .map_err(|e| match e.downcast_ref::<Rejected>() {
+            Some(r) => anyhow::anyhow!("--reasoning-effort {effort}: {r}"),
+            None => e,
+        })?;
+    if let Some(ignored) = rendered.ignored.first() {
+        let family = engine.capabilities().family;
+        if ignored.reason == NOT_READ {
+            anyhow::bail!(
+                "--reasoning-effort: {family}'s chat template does not read {REASONING_EFFORT}"
+            );
+        }
+        anyhow::bail!(
+            "--reasoning-effort {effort}: {family}'s chat template renders the same prompt for any \
+             {REASONING_EFFORT} with {ENABLE_THINKING}={}{}",
+            kwargs.get(ENABLE_THINKING).unwrap_or(&Value::Null),
+            if kwargs.get(ENABLE_THINKING) == Some(&json!(false)) {
+                " (add --think)"
+            } else {
+                ""
+            },
+        );
+    }
+    Ok(())
+}
+
 pub fn run(args: ChatArgs) -> Result<()> {
+    if args.raw && args.reasoning_effort.is_some() {
+        anyhow::bail!(
+            "--reasoning-effort sets a chat-template variable; --raw renders no template"
+        );
+    }
     let options = super::resolve_options(&args.common)?;
     // After the tuning install: the trace switch is a tuning knob, and a knob
     // read before the install cannot be installed.
@@ -153,7 +212,13 @@ pub fn run(args: ChatArgs) -> Result<()> {
     sampling
         .check()
         .map_err(|e| anyhow::anyhow!("the checkpoint's generation_config.json: {e}"))?;
-    let kwargs = json!({ "enable_thinking": args.think });
+    let mut kwargs = Map::new();
+    kwargs.insert(ENABLE_THINKING.into(), json!(args.think));
+    if let Some(effort) = &args.reasoning_effort {
+        kwargs.insert(REASONING_EFFORT.into(), json!(effort));
+    }
+    check_kwargs(engine.as_ref(), args.system.as_deref(), &kwargs)?;
+    let effort = args.reasoning_effort.as_deref().unwrap_or("default");
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = &args.system {
         messages.push(json!({ "role": "system", "content": sys }));
@@ -233,7 +298,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let rendered = if args.raw {
             user.clone()
         } else {
-            engine.render_chat(&json!(messages), Some(&kwargs))?
+            engine.render_chat(&json!(messages), &kwargs)?
         };
         let rendered = if images.is_empty() {
             rendered
@@ -280,7 +345,7 @@ pub fn run(args: ChatArgs) -> Result<()> {
         let wall = ms(elapsed);
         let decode_ms = (wall - st.prefill_ns as f64 / 1e6).max(1e-9);
         eprintln!(
-            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} eos_index={}/{} prefill_units={} param-style={}]",
+            "[turn {turn}: prompt_tokens={} completion_tokens={} stop={:?} ttft={:.0} ms total={:.0} ms {:.1} tok/s (wall minus submit), readback={} reuse={:?} reused={} prefilled={} commits={} overrun={} tokens_sha256={} prompt_ids_sha256={} eos_gate={} host_fill={} max_in_flight={} step_markers={} step_waits={} cut={} pipelined_cut={} ring_publishes={} poll_fallbacks={} eos_index={}/{} prefill_units={} param-style={} reasoning_effort={effort}]",
             ids.len(),
             decoded.tokens.len(),
             decoded.stop,

@@ -4,9 +4,9 @@
 //! LFM2 engine (`lfm2.rs`, the former `lloom-serve/engine.rs`) unchanged so a
 //! second family (`qwen4exp.rs`) reuses them rather than restating them.
 
+use super::template::Template;
 use crate::ReadbackArm;
 use anyhow::Result;
-use hf_chat_template::ChatTemplate;
 use lloom_tensor::Device;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ pub const NEVER_EOS: [u32; 1] = [u32::MAX];
 /// requests are shaped by.
 pub struct Text {
     pub tokenizer: Tokenizer,
-    pub template: Option<ChatTemplate>,
+    pub template: Option<Template>,
     pub bos_token: String,
     pub bos_id: Option<u32>,
     pub eos_ids: Vec<u32>,

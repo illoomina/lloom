@@ -54,6 +54,7 @@ pub mod short_conv;
 pub mod speculator;
 pub mod var_builder;
 pub mod var_map;
+pub mod zeros;
 /// Re-export of [`attention::varlen`] for backward compatibility.
 pub mod varlen_attention {
     pub use crate::nn::attention::varlen::*;

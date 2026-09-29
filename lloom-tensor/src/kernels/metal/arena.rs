@@ -81,7 +81,7 @@
 // Its slots are unpooled handles over its own base, which is what §9.2a's
 // layer 3 means -- the free list never sees them. The test module below imports
 // one of its own, to assert that installing an arena leaves it untouched.
-use super::{ArenaOffsets, Buffer, PooledBuffer};
+use super::{ArenaOffsets, Buffer, BufferHandle, PooledBuffer};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -274,12 +274,19 @@ pub enum PassOpener {
 
 /// A pass kind under the axes that change its dispatch sequence. `arms` is
 /// the caller's hash of those axes; the harnesses run one configuration per
-/// process and pass 0. `opener` is who bracketed the pass.
+/// process and pass 0. `opener` is who bracketed the pass. `variant` is the
+/// model's name for which of its allocation sequences this pass of `kind`
+/// runs, where the model knows it before the pass and the kind does not say
+/// it (a block of keys completed every few positions, a routing plan resolved
+/// on the device or the host): one sequence per key, so each variant is
+/// served its own plan rather than drifting on the other's (`DESIGN.md`
+/// §9.2aa). 0 for a model with one sequence per kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PassKey {
     pub kind: PassKind,
     pub arms: u64,
     pub opener: PassOpener,
+    pub variant: u32,
 }
 
 impl PassKey {
@@ -289,12 +296,18 @@ impl PassKey {
             kind,
             arms: 0,
             opener: PassOpener::Driver,
+            variant: 0,
         }
     }
 
     /// This key, for a pass `opener` bracketed.
     pub fn opened_by(self, opener: PassOpener) -> Self {
         Self { opener, ..self }
+    }
+
+    /// This key, for the model's allocation sequence `variant`.
+    pub fn with_variant(self, variant: u32) -> Self {
+        Self { variant, ..self }
     }
 }
 
@@ -757,7 +770,7 @@ struct ArenaPlanState {
     /// the plan lives, so the free list never sees them and no lookup ever
     /// considers them -- exactly how resident weights already behave (§6.3a).
     /// Nothing here calls `free`.
-    slot_handles: Vec<Arc<PooledBuffer>>,
+    slot_handles: Vec<BufferHandle>,
 }
 
 /// Why the arena declined an allocation.
@@ -795,7 +808,7 @@ pub enum ArenaDecline {
 #[derive(Clone)]
 pub struct ArenaOffer {
     /// The buffer, when the arena served it.
-    pub served: Option<Arc<PooledBuffer>>,
+    pub served: Option<BufferHandle>,
     /// The allocation ordinal this offer consumed, when a step was open.
     ///
     /// **The key a downstream region must use**, and the reason this struct
@@ -928,7 +941,7 @@ impl Arena {
         }
 
         // One handle per slot, made once, **unpooled**. Every consumer still
-        // takes the same `Arc<PooledBuffer>` it always did; what an unpooled
+        // takes the same `BufferHandle` it always did; what an unpooled
         // handle changes is what happens when the last one drops.
         //
         // # Why not `adopt` (lloom issue #489)
@@ -961,7 +974,7 @@ impl Arena {
         let slot_handles = plan
             .slots()
             .iter()
-            .map(|s| Arc::new(PooledBuffer::unpooled(base.view(s.offset, s.size), s.size)))
+            .map(|s| BufferHandle::new(PooledBuffer::unpooled(base.view(s.offset, s.size), s.size)))
             .collect();
 
         Ok(Self {
@@ -1181,7 +1194,7 @@ impl Arena {
     /// `nothing_downstream_derives_ordering_from_the_ordinal` pins the two
     /// consumers above, so a future reader that *does* need an edge fails a test
     /// rather than inheriting a `Relaxed` that no longer suffices.
-    pub fn acquire(&self, size: usize) -> Option<Arc<PooledBuffer>> {
+    pub fn acquire(&self, size: usize) -> Option<BufferHandle> {
         self.acquire_attributed(size).served
     }
 
@@ -1286,7 +1299,7 @@ impl Arena {
         }
         counters.hits.fetch_add(1, Ordering::Relaxed);
         ArenaOffer {
-            served: Some(Arc::clone(&plan_state.slot_handles[slot])),
+            served: Some(BufferHandle::clone(&plan_state.slot_handles[slot])),
             ordinal: Some(ordinal),
             decline: None,
         }

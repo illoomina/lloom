@@ -294,7 +294,7 @@ pub fn install_executor(
             dev.set_executor(std::sync::Arc::new(ExecutorSlot::Custom(exec.clone())));
             installed.replay = Some(exec);
         }
-        if cfg.pass_plans {
+        if cfg.pass_plans_armed() {
             dev.enable_pass_plans(ArenaLayout::Packed);
             installed.pass_plans = true;
         }

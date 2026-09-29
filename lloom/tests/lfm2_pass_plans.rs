@@ -1117,3 +1117,90 @@ fn a_ramped_prefill_has_no_escapes_under_eviction_on_either_attention_arm() -> R
     );
     Ok(())
 }
+
+/// The crown's conv arm — the SHUFFLED state decoded by the fused step
+/// (`shortconv_step`) — reaches the no-allocation invariant too: the step
+/// writes the next state into the layer's spare and the two swap, so a
+/// served decode step asks the pools for nothing and no ordinal escapes.
+///
+/// The shuffle cannot write in place (it reads column `j + 1` while it writes
+/// `j`), which is why its state was a fresh tensor per step: one escape per
+/// conv layer per step, the 22 a token the real model's `--pass-plans` line
+/// carried (`pass-plan-design.md` §17). The stream is the pool path's, and
+/// the unfused shuffle arm — which still allocates its state per step — is
+/// the control that the zero is the spare's, not a detector gone blind.
+#[test]
+fn the_fused_shuffle_step_writes_its_spare_and_asks_the_pools_for_nothing() -> Result<()> {
+    let _serial = SERIAL.lock();
+    let prompt: Vec<u32> = (1..=10).collect();
+    let steps = 12;
+    let conv_layers = 2u64;
+    // (ids, escapes, served decode passes, served-pass requests (shared, private))
+    let run = |conv_fused: bool, plans: bool| -> Result<(Vec<u32>, u64, u64, (u64, u64))> {
+        let dev = Device::new_metal(0)?;
+        let Device::Metal(m) = &dev else {
+            unreachable!()
+        };
+        let mut cfg = tiny_config(ConvState::Shuffle);
+        cfg.conv_prefill_ctx = true;
+        cfg.conv_fused = conv_fused;
+        let model = build(&cfg, &dev)?;
+        if !plans {
+            return Ok((
+                run_prompt(&model, &cfg, &dev, &prompt, 0, steps)?,
+                0,
+                0,
+                (0, 0),
+            ));
+        }
+        m.enable_pass_plans(ArenaLayout::Packed);
+        // Two prompts see every key twice; the third is the measured one.
+        for _ in 0..2 {
+            run_prompt(&model, &cfg, &dev, &prompt, 0, steps)?;
+        }
+        let c0 = m.pass_plan_counters().unwrap();
+        let r0 = m.served_pass_pool_requests();
+        let ids = run_prompt(&model, &cfg, &dev, &prompt, 0, steps)?;
+        let c1 = m.pass_plan_counters().unwrap();
+        let r1 = m.served_pass_pool_requests();
+        Ok((
+            ids,
+            c1.escapes,
+            c1.served - c0.served,
+            (r1.0 - r0.0, r1.1 - r0.1),
+        ))
+    };
+    let (want, ..) = run(true, false)?;
+    let (ids, escapes, served, requests) = run(true, true)?;
+    eprintln!("[fused shuffle] escapes={escapes} served={served} requests={requests:?}");
+    assert_eq!(ids, want, "a served step moved the stream");
+    assert!(
+        served >= steps as u64 - 1,
+        "the decode was not served: {served}"
+    );
+    assert_eq!(escapes, 0, "the fused shuffle's state escaped its pass");
+    // What the measured sequence's served passes asked for is its session
+    // state, once: the fresh prefill's K and V slab (2) and its two conv
+    // states (2), and each conv layer's spare on the first fused step (2), all
+    // from the Shared pool — none per decode step.
+    assert_eq!(
+        requests,
+        (4 + conv_layers, 0),
+        "served passes asked the pools (shared, private) for more than the sequence's \
+         session state: a per-step state allocation is back"
+    );
+
+    // The control: the unfused shuffle still builds its state per step
+    // (`cat`), one Shared-pool request per conv layer per served step on top
+    // of the same session state, so the counter sees what the spare removed.
+    let (want_u, ..) = run(false, false)?;
+    let (ids_u, escapes_u, served_u, requests_u) = run(false, true)?;
+    eprintln!("[unfused shuffle] escapes={escapes_u} served={served_u} requests={requests_u:?}");
+    assert_eq!(ids_u, want_u);
+    assert_eq!(
+        requests_u,
+        (4 + conv_layers * steps as u64, 0),
+        "the unfused shuffle's per-step state is the request the counter must see"
+    );
+    Ok(())
+}

@@ -611,14 +611,22 @@ pub fn print_pass_plans(dev: &lloom_tensor::MetalDevice, widths: &str) {
     let keys: Vec<String> = keys
         .iter()
         .map(|(k, covered, total, escapes)| {
+            // The kind, then the model's sequence variant and a model-opened
+            // pass's mark when they are not the default (`PassKey`).
+            let mut name = format!("{:?}", k.kind);
+            if k.variant != 0 {
+                name.push_str(&format!("#v{}", k.variant));
+            }
+            if k.opener == lloom_tensor::metal_backend::PassOpener::Model {
+                name.push_str("@model");
+            }
             if *escapes > 0 {
                 format!(
-                    "{:?}={covered}/{total}(+{escapes} escaped {:?})",
-                    k.kind,
+                    "{name}={covered}/{total}(+{escapes} escaped {:?})",
                     dev.pass_plan_escapes(k)
                 )
             } else {
-                format!("{:?}={covered}/{total}", k.kind)
+                format!("{name}={covered}/{total}")
             }
         })
         .collect();
@@ -639,6 +647,13 @@ pub fn print_pass_plans(dev: &lloom_tensor::MetalDevice, widths: &str) {
         widths,
         keys.join(" ")
     );
+    // `LLOOM_SERVED_REQUEST_TRACE`: the served passes' requests by site.
+    for (pool, site, n) in lloom_tensor::metal_backend::served_pass_request_sites() {
+        eprintln!(
+            "[served pass requests: {n} {} {site}]",
+            if pool == 0 { "shared" } else { "private" }
+        );
+    }
 }
 
 /// What the ICB executor did: engagement first, then the residency term
@@ -1260,7 +1275,9 @@ pub fn print_trace_census(steps: u64) {
     // (the largest input bound). Observed from the trace, not modelled.
     let mut ordering: std::collections::BTreeMap<usize, (u64, u64)> = Default::default();
     let (mut prev_encoder, mut ordered_all, mut n_all) = (u64::MAX, 0u64, 0u64);
+    let mut flow = OutputFlow::default();
     for d in trace::take_dispatches() {
+        flow.dispatch(&d);
         let ordered = d.barrier || d.encoder != prev_encoder;
         prev_encoder = d.encoder;
         n_all += 1;
@@ -1311,6 +1328,102 @@ pub fn print_trace_census(steps: u64) {
     );
     for ((name, tg), n) in &census {
         eprintln!("  {n:6} {} {name}", if *tg { "tg " } else { "thr" });
+    }
+    flow.print(steps);
+}
+
+/// The trace's outputs as values (`#814`, `DESIGN.md` §9.2aa): each output
+/// binding at a `(buffer, offset)` is one value, live until the next output
+/// binding there, and its readers are the later dispatches that bind it as
+/// an input. An output read by exactly one dispatch, the one right after its
+/// producer, is the fusion candidate: its only purpose is to hand a result to
+/// the next kernel. Keyed on `(buffer, offset)`, so two bindings of one
+/// region at different offsets are not matched; a binding a kernel both
+/// reads and writes counts as a new value only.
+#[cfg(feature = "metal")]
+#[derive(Default)]
+struct OutputFlow {
+    names: Vec<String>,
+    name_of: std::collections::HashMap<String, u32>,
+    /// Per live value: `(producer dispatch, producer name, readers, first
+    /// reader, last reader)`.
+    live: std::collections::HashMap<(u64, usize), (u64, u32, u32, u64, u64)>,
+    at: u64,
+    outputs: u64,
+    unread: u64,
+    next_only: u64,
+    pairs: std::collections::HashMap<(u32, u32), u64>,
+    /// Kernel of each dispatch, by trace position.
+    kernel_of: Vec<u32>,
+}
+
+#[cfg(feature = "metal")]
+impl OutputFlow {
+    fn dispatch(&mut self, d: &lloom_tensor::kernels::metal::trace::Dispatch) {
+        let i = self.at;
+        self.at += 1;
+        let id = match self.name_of.get(&d.pipeline) {
+            Some(&id) => id,
+            None => {
+                let id = self.names.len() as u32;
+                self.names.push(d.pipeline.clone());
+                self.name_of.insert(d.pipeline.clone(), id);
+                id
+            }
+        };
+        self.kernel_of.push(id);
+        for b in d.bindings.iter().filter(|b| !b.is_output) {
+            if let Some(v) = self.live.get_mut(&(b.buffer_id, b.offset)) {
+                if v.4 != i {
+                    v.2 += 1;
+                    if v.2 == 1 {
+                        v.3 = i;
+                    }
+                    v.4 = i;
+                }
+            }
+        }
+        for b in d.bindings.iter().filter(|b| b.is_output) {
+            let fresh = (i, id, 0u32, u64::MAX, u64::MAX);
+            if let Some(old) = self.live.insert((b.buffer_id, b.offset), fresh) {
+                self.retire(old);
+            }
+        }
+    }
+
+    fn retire(&mut self, (producer, name, readers, first, _): (u64, u32, u32, u64, u64)) {
+        self.outputs += 1;
+        match readers {
+            0 => self.unread += 1,
+            1 if first == producer + 1 => {
+                self.next_only += 1;
+                let consumer = self
+                    .kernel_of
+                    .get(first as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX);
+                *self.pairs.entry((name, consumer)).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn print(mut self, steps: u64) {
+        let live: Vec<_> = self.live.drain().map(|(_, v)| v).collect();
+        for v in live {
+            self.retire(v);
+        }
+        eprintln!(
+            "[trace outputs: {} outputs over {steps} steps (whole run); read only by the next \
+             dispatch: {}; never read on the GPU: {}]",
+            self.outputs, self.next_only, self.unread
+        );
+        let mut pairs: Vec<_> = self.pairs.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        let name = |k: u32| self.names.get(k as usize).map_or("<none>", |s| s.as_str());
+        for ((p, c), n) in pairs {
+            eprintln!("  {n:8} {} -> {}", name(p), name(c));
+        }
     }
 }
 

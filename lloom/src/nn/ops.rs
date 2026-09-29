@@ -639,7 +639,6 @@ pub fn conv1d_depthwise_scaled(
 /// **Metal only.** The unfused Shuffle arm (`cat` + `conv_fold` + `* c`) is the
 /// portable path and the parity oracle; this returns an error off Metal so the
 /// caller falls back to it rather than silently diverging.
-#[allow(unused_variables)]
 pub fn shortconv_step(
     b: &Tensor,
     x: &Tensor,
@@ -647,6 +646,37 @@ pub fn shortconv_step(
     state: &Tensor,
     weight: &Tensor,
     k_size: usize,
+) -> Result<(Tensor, Tensor)> {
+    shortconv_step_impl(b, x, c, state, weight, k_size, None)
+}
+
+/// [`shortconv_step`] writing the next state into `next`, a contiguous
+/// `[b, hidden, k]` tensor of `state`'s dtype that is not `state`'s memory
+/// (the kernel reads `state[j + 1]` while it writes `next[j]`), so a cache
+/// that owns two states per layer alternates them and the step allocates
+/// only its output (`DESIGN.md` §9.2aa). Returns the output; the next state
+/// is `next`.
+pub fn shortconv_step_into(
+    b: &Tensor,
+    x: &Tensor,
+    c: &Tensor,
+    state: &Tensor,
+    weight: &Tensor,
+    k_size: usize,
+    next: &Tensor,
+) -> Result<Tensor> {
+    shortconv_step_impl(b, x, c, state, weight, k_size, Some(next)).map(|(out, _)| out)
+}
+
+#[allow(unused_variables)]
+fn shortconv_step_impl(
+    b: &Tensor,
+    x: &Tensor,
+    c: &Tensor,
+    state: &Tensor,
+    weight: &Tensor,
+    k_size: usize,
+    next: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
     #[cfg(not(feature = "metal"))]
     {
@@ -700,12 +730,46 @@ pub fn shortconv_step(
         let elem_sz = dtype.size_in_bytes();
 
         let device = st_s.device();
-        let state_out = device
-            .new_buffer_builder()
-            .with_size_for(b_sz * hidden * k_size, dtype)
-            .with_label("shortconv_step_state")
-            .build()
-            .map_err(lloom_tensor::Error::wrap)?;
+        let next_storage = next.map(|n| n.storage_and_layout());
+        let fresh = match &next_storage {
+            Some(_) => None,
+            None => Some(
+                device
+                    .new_buffer_builder()
+                    .with_size_for(b_sz * hidden * k_size, dtype)
+                    .with_label("shortconv_step_state")
+                    .build()
+                    .map_err(lloom_tensor::Error::wrap)?,
+            ),
+        };
+        let state_out: &lloom_tensor::kernels::metal::Buffer = match (&next_storage, &fresh) {
+            (Some((n_s, n_l)), _) => {
+                let n = next.expect("next_storage is next's");
+                if n.dims() != [b_sz, hidden, k_size] || n.dtype() != dtype {
+                    lloom_tensor::bail!(
+                        "shortconv_step_into: the next state is {:?} {:?}, the step writes \
+                         [{b_sz}, {hidden}, {k_size}] {dtype:?}",
+                        n.dims(),
+                        n.dtype()
+                    )
+                }
+                let n_s = metal!(*n_s, "next state");
+                if !n_l.is_contiguous() || n_l.start_offset() != 0 {
+                    lloom_tensor::bail!(
+                        "shortconv_step_into: the next state must be a whole contiguous buffer"
+                    )
+                }
+                if n_s.buffer().raw_addr() == st_s.buffer().raw_addr() {
+                    lloom_tensor::bail!(
+                        "shortconv_step_into: the next state is the state's memory; the shift \
+                         reads what it would already have overwritten"
+                    )
+                }
+                n_s.buffer()
+            }
+            (None, Some(f)) => f,
+            (None, None) => unreachable!("a fresh state is built when no next is given"),
+        };
         let dst = device
             .new_buffer_builder()
             .with_size_for(dst_numel, dtype)
@@ -727,7 +791,7 @@ pub fn shortconv_step(
             buffer_o(c_s.buffer(), &c_l, dtype),
             buffer_o(st_s.buffer(), &st_l, dtype),
             buffer_o(w_s.buffer(), &w_l, dtype),
-            &state_out,
+            state_out,
             &dst,
         )
         .map_err(lloom_tensor::Error::wrap)?;
@@ -741,6 +805,10 @@ pub fn shortconv_step(
             BackpropOp::none(),
             false,
         );
+        let Some(state_out) = fresh else {
+            let n = next.expect("no fresh state means next was given");
+            return Ok((out, n.clone()));
+        };
         let state_storage = lloom_tensor::MetalStorage::new(
             state_out,
             device.clone(),

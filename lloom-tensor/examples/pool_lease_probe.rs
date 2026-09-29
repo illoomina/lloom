@@ -22,7 +22,7 @@
 //! units, a fuzzer over it contends for the allocator and nothing else.
 
 use lloom_tensor::kernels::metal::device::Device;
-use lloom_tensor::kernels::metal::{BufferPool, GpuClock, PooledBuffer};
+use lloom_tensor::kernels::metal::{BufferHandle, BufferPool, GpuClock};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -49,7 +49,7 @@ fn main() {
     // Deliberately mixes sizes so both the exact-bucket and the range probe
     // fire, and so eviction engages.
     let t1 = Instant::now();
-    let mut live: Vec<Arc<PooledBuffer>> = Vec::new();
+    let mut live: Vec<BufferHandle> = Vec::new();
     let mut allocations = 0usize;
     for i in 0..ops {
         let size = 1024 + (i % 97) * 128;

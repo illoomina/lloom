@@ -121,6 +121,8 @@ pub struct Engine<R: ExpertResidency + HasStreamStats> {
     readback: ReadbackArm,
     /// The executor arms installed at load.
     executor: crate::ExecutorConfig,
+    /// What they armed, for the engagement reports (`report::print_executor`).
+    installed: super::report::Installed,
     reuse_prefix: bool,
     prefill_tile: usize,
     mem_sample: bool,
@@ -264,7 +266,8 @@ impl Engine<Resident> {
             "replay" => PrefillMode::Replay,
             other => anyhow::bail!("--prefill-mode {other}: chunk | replay"),
         };
-        super::common::install_executor(&device, &opts.executor, opts.mtp.is_some())?;
+        let installed =
+            super::common::install_executor(&device, &opts.executor, opts.mtp.is_some())?;
         #[cfg(feature = "metal")]
         if let Some(mb) = opts.memory.free_budget_mb {
             if let Device::Metal(m) = &device {
@@ -280,7 +283,7 @@ impl Engine<Resident> {
                 model.set_prefill_mode(prefill_mode);
                 model.set_memory_fraction(opts.memory_fraction);
                 let tier = json!({ "experts": "resident", "shards": shards.len(), "load_ms": ms(t.elapsed()), "prefill_mode": opts.prefill_mode });
-                Engine::<Resident>::finish(model, device, opts, tier)
+                Engine::<Resident>::finish(model, device, opts, tier, installed)
             }
             "stream" => {
                 let slots = match opts.slots.as_str() {
@@ -336,12 +339,12 @@ impl Engine<Resident> {
                     "prefetch": opts.prefetch,
                     "io_hints": opts.io_hints,
                     "prefill_mode": opts.prefill_mode,
-                    "pass_plans": opts.executor.pass_plans,
+                    "pass_plans": opts.executor.pass_plans_armed(),
                     "shards": shards.len(),
                     "load_ms": ms(t.elapsed()),
                     "warm": warmed,
                 });
-                Engine::<Streamed>::finish(model, device, opts, tier)
+                Engine::<Streamed>::finish(model, device, opts, tier, installed)
             }
             other => anyhow::bail!("--experts {other}: resident | stream"),
         }
@@ -354,6 +357,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         device: Device,
         opts: LoadOptions,
         mut tier: Value,
+        installed: super::report::Installed,
     ) -> Result<Box<dyn Served>> {
         let tokenizer_path = match &opts.tokenizer {
             Some(p) => p.clone(),
@@ -415,6 +419,7 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
         tier["first_shard"] = json!(opts.first_shard.display().to_string());
         let mut engine = Engine {
             core: Arc::new(QwenCore { model }),
+            installed,
             device,
             text: Text {
                 tokenizer,
@@ -823,6 +828,9 @@ impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Engine<R> {
 impl<R: ExpertResidency + HasStreamStats + Send + Sync + 'static> Served for Engine<R> {
     fn device(&self) -> &Device {
         &self.device
+    }
+    fn installed(&self) -> Option<&super::report::Installed> {
+        Some(&self.installed)
     }
     fn model_name(&self) -> &str {
         &self.model_name

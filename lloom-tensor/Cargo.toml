@@ -231,3 +231,7 @@ required-features = ["metal"]
 name = "variant_selection_cost"
 required-features = ["metal"]
 
+
+[[example]]
+name = "pool_round_trip_price"
+required-features = ["metal"]

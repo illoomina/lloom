@@ -1090,7 +1090,7 @@ impl QTensor {
         &mut self,
         offset: usize,
         len: usize,
-        staging: std::sync::Arc<crate::kernels::metal::PooledBuffer>,
+        staging: crate::kernels::metal::BufferHandle,
         ring: &mut crate::kernels::metal::staging::StagingRing,
         entry: Option<usize>,
     ) -> Result<()> {

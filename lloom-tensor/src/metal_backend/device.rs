@@ -7,9 +7,9 @@ use crate::kernels::{
     metal::{
         session_region::{RegionCounters, RegionPlan},
         transient_heaps_on, Arena, ArenaCounters, ArenaCursor, ArenaDecline, ArenaLayout,
-        ArenaOffsets, ArenaRecorder, BlitCommandsGuard, Buffer, BufferPool, Commands,
+        ArenaOffsets, ArenaRecorder, BlitCommandsGuard, Buffer, BufferHandle, BufferPool, Commands,
         CommandsGuard, Device, FreeSummary, HeapChunks, HeapStats, MTLResourceOptions, PassKey,
-        PassKind, PassPlanCounters, PoolCounters, PoolOccupancySnapshot, PooledBuffer,
+        PassKind, PassOpener, PassPlanCounters, PoolCounters, PoolOccupancySnapshot, PooledBuffer,
         ResidencySet, SessionRegion, StepPlan,
     },
     Kernels,
@@ -329,7 +329,8 @@ pub struct MetalDevice {
     pub(crate) base_mode: Arc<std::sync::atomic::AtomicBool>,
     /// Under the pass cache: whether a pass is open (`begin_pass` ..
     /// `finish_pass`). Bit 0 = the cache is on, bit 1 = a pass is open, bit 2
-    /// = the open pass is served from a cached plan. The recorder takes an
+    /// = the open pass is served from a cached plan, bit 3 = the open pass is
+    /// a model's own (`PassOpener::Model`). The recorder takes an
     /// allocation only while a pass is open: one made BETWEEN passes (a
     /// sampler's ids, a staged input) is nobody's ordinal — recorded, it
     /// would be charged to the pass before it and, read by the pass after
@@ -342,6 +343,10 @@ pub struct MetalDevice {
     /// asked for and never of how far the GPU clock has let the free lists
     /// refill (§6.3b).
     pub(crate) served_pass_pool_requests: Arc<[std::sync::atomic::AtomicU64; 2]>,
+    /// The allocation-sequence variant a model named for the next pass it
+    /// prepares (`set_next_pass_variant`), folded into that pass's key by
+    /// `begin_pass` and cleared there and at `finish_pass`.
+    pub(crate) next_pass_variant: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// One forward pass's plan, cached by its [`PassKey`]. Every plan is served
@@ -408,6 +413,82 @@ impl Drop for PassPlansPaused<'_> {
                 .fetch_or(0b01, std::sync::atomic::Ordering::Relaxed);
         }
     }
+}
+
+/// `LLOOM_SERVED_REQUEST_TRACE` (read once), or [`set_served_request_trace`]:
+/// attribute each pool request a served pass makes to its call site in the
+/// model crate. 0 = not yet read, 1 = off, 2 = on.
+static SERVED_TRACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn served_request_trace_on() -> bool {
+    match SERVED_TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::tuning::tuning().instrument.served_request_trace;
+            set_served_request_trace(on);
+            on
+        }
+    }
+}
+
+/// Turn the served-pass request attribution on or off for the process (a
+/// test's switch; the knob sets it for a run).
+pub fn set_served_request_trace(on: bool) {
+    SERVED_TRACE.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+type SiteCounts = HashMap<(usize, String), u64>;
+
+fn served_request_sites_map() -> &'static Mutex<SiteCounts> {
+    static SITES: std::sync::OnceLock<Mutex<SiteCounts>> = std::sync::OnceLock::new();
+    SITES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The instrument's half of [`MetalDevice::note_pool_request`]: the first two
+/// frames of the `lloom` crate (the model's call site and its caller) of a
+/// backtrace, counted per pool. Process-wide, like the trace recorder.
+fn note_served_request_site(which: usize) {
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    let frames: Vec<&str> = bt
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.split_once(": ").map(|(_, f)| f))
+        .map(|f| match f.rfind("::h") {
+            Some(i) if f.len() - i == 19 => &f[..i],
+            _ => f,
+        })
+        .collect();
+    let model = |f: &str| f.starts_with("lloom::") || f.starts_with("<lloom::");
+    // The tensor-crate entry the model called (the frame just inside the
+    // first model frame), then the model's two innermost frames.
+    let first_model = frames.iter().position(|f| model(f));
+    let api = first_model
+        .and_then(|i| i.checked_sub(1))
+        .map(|i| frames[i])
+        .unwrap_or("?");
+    let mut ours = frames.iter().filter(|f| model(f));
+    let site = match (ours.next(), ours.next()) {
+        (Some(a), Some(b)) => format!("{api} <- {a} <- {b}"),
+        (Some(a), None) => format!("{api} <- {a}"),
+        _ => "(no lloom frame)".to_string(),
+    };
+    *served_request_sites_map()
+        .lock()
+        .entry((which, site))
+        .or_default() += 1;
+}
+
+/// What `LLOOM_SERVED_REQUEST_TRACE` attributed since the last call:
+/// `(pool, site, requests)`, pool 0 shared and 1 private, most requests
+/// first. Taking clears it, so a caller reads one window.
+pub fn served_pass_request_sites() -> Vec<(usize, String, u64)> {
+    let mut v: Vec<(usize, String, u64)> = std::mem::take(&mut *served_request_sites_map().lock())
+        .into_iter()
+        .map(|((w, s), n)| (w, s, n))
+        .collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    v
 }
 
 /// One cached plan as the harness reports it: `(key, ordinals served,
@@ -534,7 +615,7 @@ pub struct ConstantsByValue {
 
 #[derive(Default)]
 struct ConstantsInner {
-    map: HashMap<Vec<u8>, Arc<PooledBuffer>>,
+    map: HashMap<Vec<u8>, BufferHandle>,
     order: std::collections::VecDeque<Vec<u8>>,
     hits: u64,
     misses: u64,
@@ -1820,6 +1901,9 @@ impl MetalDevice {
         if self.pass_state.load(std::sync::atomic::Ordering::Relaxed) & 0b100 != 0 {
             self.served_pass_pool_requests[which]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if served_request_trace_on() {
+                note_served_request_site(which);
+            }
         }
     }
 
@@ -1867,10 +1951,15 @@ impl MetalDevice {
         }
     }
 
-    /// Open a forward pass of shape `key`. Under a cached plan the pass is
-    /// served from the base; on a key's first sight, and on the pass after
-    /// it, the pass runs on the pool under the recorder. Falls back to
-    /// [`Self::begin_decode_step`] when the cache is off.
+    /// Whether the open pass is one a model bracketed itself
+    /// (`PassOpener::Model`): the model reads some of its values after it
+    /// closes the pass (a settle after the pass body), so those must be
+    /// declared escapes; under a driver's pass the same reads are inside it.
+    /// One relaxed load.
+    pub fn model_pass_open(&self) -> bool {
+        self.pass_state.load(std::sync::atomic::Ordering::Relaxed) & 0b1010 == 0b1010
+    }
+
     /// Whether a planned pass is open (`begin_pass` without its
     /// `finish_pass`): a model that brackets its own passes skips the
     /// bracket when a driver already holds one.
@@ -1881,7 +1970,34 @@ impl MetalDevice {
             .is_some_and(|pp| pp.current.is_some())
     }
 
+    /// Name the allocation sequence the next pass runs, for a model whose
+    /// passes of one kind take one of several sequences it can tell apart
+    /// before the pass ([`PassKey::variant`]). Called from the model's
+    /// `prepare_pass`, which a driver calls immediately before `begin_pass`;
+    /// `begin_pass` folds it into the driver's key and clears it, and
+    /// `finish_pass` clears one set inside a pass, so a variant never
+    /// outlives the pass it was named for. A relaxed store; nothing when the
+    /// cache is off.
+    pub fn set_next_pass_variant(&self, variant: u32) {
+        self.next_pass_variant
+            .store(variant, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Open a forward pass of shape `key`. Under a cached plan the pass is
+    /// served from the base; on a key's first sight, and on the pass after
+    /// it, the pass runs on the pool under the recorder. Falls back to
+    /// [`Self::begin_decode_step`] when the cache is off.
     pub fn begin_pass(&self, key: PassKey) -> Result<()> {
+        let variant = self
+            .next_pass_variant
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        // A driver's key names the kind; the variant is the model's, named
+        // in its `prepare_pass`. A model that opens its own pass keys it
+        // itself.
+        let key = match key.opener {
+            PassOpener::Driver => key.with_variant(variant),
+            PassOpener::Model => key,
+        };
         let mut g = self.pass_plans.lock();
         let Some(pp) = g.as_mut() else {
             drop(g);
@@ -1894,8 +2010,12 @@ impl MetalDevice {
             )
             .into());
         }
+        let opener_bit = match key.opener {
+            PassOpener::Model => 0b1000,
+            PassOpener::Driver => 0,
+        };
         self.pass_state
-            .fetch_or(0b10, std::sync::atomic::Ordering::Relaxed);
+            .fetch_or(0b10 | opener_bit, std::sync::atomic::Ordering::Relaxed);
         pp.diverged = false;
         // Whatever this pass does, the arena the last pass installed must not
         // serve it: a pass is served only under its own key's plan.
@@ -1956,6 +2076,8 @@ impl MetalDevice {
     /// key as pending if it was recorded. Falls back to
     /// [`Self::finish_decode_step`] when the cache is off.
     pub fn finish_pass(&self) -> Result<()> {
+        self.next_pass_variant
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let mut g = self.pass_plans.lock();
         let Some(pp) = g.as_mut() else {
             drop(g);
@@ -1965,7 +2087,7 @@ impl MetalDevice {
             return Err(MetalError::Message("finish_pass: no pass is open".to_string()).into());
         };
         self.pass_state
-            .fetch_and(!0b110, std::sync::atomic::Ordering::Relaxed);
+            .fetch_and(!0b1110, std::sync::atomic::Ordering::Relaxed);
         // A plan closed this pass: the recording pass's transients sit in
         // the pool's free list while the base now holds the pass's shape —
         // trimmed after the lock, or a budget that admitted one copy of the
@@ -2265,7 +2387,7 @@ impl MetalDevice {
         element_count: usize,
         dtype: DType,
         _name: &str,
-    ) -> Result<Arc<PooledBuffer>> {
+    ) -> Result<BufferHandle> {
         let size = element_count * dtype.size_in_bytes();
         // Layer 3 (`DESIGN.md` §9.2a). The arena is offered the allocation
         // first; it serves it only inside a decode step, only while the plan
@@ -2369,7 +2491,7 @@ impl MetalDevice {
     /// The interval **ends at the last bind**, not here and not when the handle
     /// drops -- see `ArenaRecorder::record_bind` for why the CPU's clock is the
     /// wrong one.
-    fn note_for_recording(&self, buffer: Arc<PooledBuffer>, size: usize) -> Arc<PooledBuffer> {
+    fn note_for_recording(&self, buffer: BufferHandle, size: usize) -> BufferHandle {
         // **One relaxed load on the allocation path when nothing records**,
         // which is every run that did not ask for an arena or a plan cache.
         // `observing_binds` is set exactly while a recorder is installed
@@ -2407,7 +2529,7 @@ impl MetalDevice {
         element_count: usize,
         dtype: DType,
         _name: &str,
-    ) -> Result<Arc<PooledBuffer>> {
+    ) -> Result<BufferHandle> {
         let size = element_count * dtype.size_in_bytes();
         let buffer = self
             .device
@@ -2417,7 +2539,7 @@ impl MetalDevice {
         // Deliberately not pooled: this exists for persistent buffers, so it
         // returns a handle with no pool behind it. Dropping it frees the buffer
         // outright rather than offering it for reuse.
-        Ok(Arc::new(PooledBuffer::unpooled(buffer, size)))
+        Ok(BufferHandle::new(PooledBuffer::unpooled(buffer, size)))
     }
 
     /// Creates a new buffer from data.
@@ -2429,14 +2551,14 @@ impl MetalDevice {
     /// kernel's argument block, chunk table or live count: a repeated value
     /// costs a hash and a lock, a new one a pooled upload. Larger than
     /// `CONSTANT_MAX_BYTES` falls back to an upload.
-    pub fn constant_buffer(&self, bytes: &[u8]) -> Result<Arc<PooledBuffer>> {
+    pub fn constant_buffer(&self, bytes: &[u8]) -> Result<BufferHandle> {
         if bytes.len() > CONSTANT_MAX_BYTES {
             return self.new_buffer_with_data(bytes);
         }
         {
             let mut g = self.constants.inner.lock();
             if let Some(b) = g.map.get(bytes) {
-                let b = Arc::clone(b);
+                let b = BufferHandle::clone(b);
                 g.hits += 1;
                 return Ok(b);
             }
@@ -2449,13 +2571,13 @@ impl MetalDevice {
                 g.map.remove(&old);
             }
         }
-        g.map.insert(bytes.to_vec(), Arc::clone(&buf));
+        g.map.insert(bytes.to_vec(), BufferHandle::clone(&buf));
         g.order.push_back(bytes.to_vec());
         Ok(buf)
     }
 
     /// [`Self::constant_buffer`] for one plain-data value (a params block).
-    pub fn constant_of<T: Copy>(&self, v: &T) -> Result<Arc<PooledBuffer>> {
+    pub fn constant_of<T: Copy>(&self, v: &T) -> Result<BufferHandle> {
         self.constant_buffer(pod_bytes(v))
     }
 
@@ -2475,13 +2597,13 @@ impl MetalDevice {
     /// the one tenant class whose reuse gate is known to leak at long context
     /// (lloom #748 / PR #754, which records it as `docs/invariants.md` §15.1m) — a recycled Shared buffer
     /// written by the host while a still-running command buffer reads it.
-    pub fn new_unpooled_shared(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+    pub fn new_unpooled_shared(&self, size: usize) -> Result<BufferHandle> {
         let buffer = self
             .device
             .new_buffer(size.max(1), RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         self.residency_set.insert(&buffer);
-        Ok(Arc::new(PooledBuffer::unpooled_resident(
+        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
             buffer,
             size,
             Arc::clone(&self.residency_set),
@@ -2495,7 +2617,7 @@ impl MetalDevice {
     /// As [`Self::new_persistent_private`], Shared: a persistent buffer the
     /// CPU writes into place (the streamed tier's slot pools under the
     /// direct read, `DESIGN.md` §20.4a).
-    pub fn new_persistent_shared(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+    pub fn new_persistent_shared(&self, size: usize) -> Result<BufferHandle> {
         let buffer = self
             .device
             .new_buffer(size.max(1), RESOURCE_OPTIONS)
@@ -2507,20 +2629,20 @@ impl MetalDevice {
         // of them compressed mid-prefill, #749 P27); a Private buffer's are
         // not. Pin them.
         wire_pages(buffer.contents(), size);
-        Ok(Arc::new(PooledBuffer::unpooled_resident(
+        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
             buffer,
             size,
             Arc::clone(&self.residency_set),
         )))
     }
 
-    pub fn new_persistent_private(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+    pub fn new_persistent_private(&self, size: usize) -> Result<BufferHandle> {
         let buffer = self
             .device
             .new_buffer(size.max(1), PRIVATE_RESOURCE_OPTIONS)
             .map_err(MetalError::from)?;
         self.residency_set.insert(&buffer);
-        Ok(Arc::new(PooledBuffer::unpooled_resident(
+        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
             buffer,
             size,
             Arc::clone(&self.residency_set),
@@ -2535,7 +2657,7 @@ impl MetalDevice {
         wire_pages(buffer.contents(), buffer.size());
     }
 
-    pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<Arc<PooledBuffer>> {
+    pub fn new_buffer_with_data<T>(&self, data: &[T]) -> Result<BufferHandle> {
         let unpooled_uploads = Self::unpooled;
         let size = core::mem::size_of_val(data);
         // A small upload is served from the buffer pool and filled on the host:
@@ -2590,14 +2712,14 @@ impl MetalDevice {
         // And it leaves the residency set on drop: the set retains what it
         // holds, so an unpooled upload that stayed in it was never freed at
         // all — neither these staging buffers nor a per-round `Tensor::new`.
-        Ok(Arc::new(PooledBuffer::unpooled_resident(
+        Ok(BufferHandle::new(PooledBuffer::unpooled_resident(
             new_buffer,
             size,
             Arc::clone(&self.residency_set),
         )))
     }
 
-    pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<PooledBuffer>> {
+    pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<BufferHandle> {
         let buffer = self.allocate_buffer(size_in_bytes)?;
         if self.base_mode() {
             // A compute fill, inside the barrier chain (see `base_mode`).
@@ -2623,7 +2745,7 @@ impl MetalDevice {
     }
 
     /// The critical allocator algorithm
-    pub fn allocate_buffer(&self, size: usize) -> Result<Arc<PooledBuffer>> {
+    pub fn allocate_buffer(&self, size: usize) -> Result<BufferHandle> {
         self.note_pool_request(0);
         if let Some(b) = self.buffers.acquire(size) {
             return Ok(b);
@@ -2780,7 +2902,7 @@ fn buffer_label(buffer: &Buffer, label: Option<&str>) {
 #[inline]
 fn buffer_label(_buffer: &Buffer, _label: Option<&str>) {}
 
-type DataUpload<'a> = Box<dyn FnOnce(&MetalDevice) -> Result<Arc<PooledBuffer>> + 'a>;
+type DataUpload<'a> = Box<dyn FnOnce(&MetalDevice) -> Result<BufferHandle> + 'a>;
 
 enum BufferInit<'a> {
     Typed { elem_count: usize, dtype: DType },
@@ -2855,7 +2977,7 @@ impl<'a> ReadyBufferBuilder<'a> {
         self
     }
 
-    pub fn build(self) -> Result<Arc<PooledBuffer>> {
+    pub fn build(self) -> Result<BufferHandle> {
         let buffer = match self.init {
             BufferInit::Typed { elem_count, dtype } => {
                 self.device.new_buffer(elem_count, dtype, "")?

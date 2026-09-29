@@ -934,7 +934,10 @@ mod executor_and_memory_tests {
         .unwrap();
         assert!(o.executor.replay && o.executor.pass_plans && !o.executor.arena);
         assert_eq!(o.executor.arena_layout, "non-aliasing");
-        assert_eq!(o.executor.line(), "arena=non-aliasing packed=true replay=always/run-start pass_plans=true");
+        // The replay's arena is the single-key one; the plan cache would
+        // bypass its recording, so the replay supersedes it.
+        assert!(!o.executor.pass_plans_armed());
+        assert_eq!(o.executor.line(), "arena=non-aliasing packed=true replay=always/run-start pass_plans=false");
         assert_eq!(o.memory.memory_fraction, 0.7);
         assert_eq!(o.memory.kv_capacity, 4096);
         assert_eq!(o.memory.kv_bucket, 2048);
@@ -947,7 +950,11 @@ mod executor_and_memory_tests {
             .to_string();
         assert!(err.contains("not an arena layout"), "{err}");
         let o = resolve_options_uninstalled(&common(&[])).unwrap();
+        assert_eq!(o.executor.line(), "arena=off packed=false replay=off pass_plans=true");
+        let o = resolve_options_uninstalled(&common(&["--pass-plans", "false"])).unwrap();
         assert_eq!(o.executor.line(), "arena=off packed=false replay=off pass_plans=false");
+        let o = resolve_options_uninstalled(&common(&["--arena"])).unwrap();
+        assert_eq!(o.executor.line(), "arena=packed packed=false replay=off pass_plans=false");
         assert_eq!(o.memory.kv_capacity, 8704, "the serving default");
     }
 }

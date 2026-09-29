@@ -924,6 +924,12 @@ impl Indexer {
         self.budget + self.ratio - 1
     }
 
+    /// Tokens per compressed block: a pass whose last token completes one
+    /// runs the block's pooling, norm, rope and append.
+    pub fn ratio(&self) -> usize {
+        self.ratio
+    }
+
     /// Blocks selected per query.
     fn block_topk(&self) -> usize {
         self.budget / self.ratio
@@ -964,7 +970,10 @@ impl Indexer {
         let pooled = (members.sum(1)? * (1.0 / self.ratio as f64))?; // [n_new, head_dim]
         let normed = self.k_norm.forward(&pooled.contiguous()?)?;
         let positions: Vec<usize> = (0..n_new).map(|b| (have + b) * self.ratio).collect();
-        let (cos, sin) = rope_cs_at(self.n_rot, self.rope_theta, &positions, k_raw.device())?;
+        let (cos, sin) = match positions[..] {
+            [pos] => rope_cs_one(self.n_rot, self.rope_theta, pos, k_raw.device())?,
+            _ => rope_cs_at(self.n_rot, self.rope_theta, &positions, k_raw.device())?,
+        };
         let half = self.n_rot / 2;
         let roped = partial_rope_seq(
             &normed.reshape((n_new, 1, self.head_dim))?,
@@ -1004,7 +1013,7 @@ impl Indexer {
             .forward(x1)?
             .reshape((self.n_heads, self.head_dim))?;
         let q = self.q_norm.forward(&q)?;
-        let (cos, sin) = rope_cs_at(self.n_rot, self.rope_theta, &[pos], dev)?;
+        let (cos, sin) = rope_cs_one(self.n_rot, self.rope_theta, pos, dev)?;
         let half = self.n_rot / 2;
         let q = partial_rope_seq(
             &q.reshape((1, self.n_heads, self.head_dim))?,
@@ -1146,7 +1155,7 @@ impl QsaAttention {
     /// Text-only decode: mRoPE reduces to standard RoPE (all sections share the
     /// text position), so partial RoPE over the first `n_rot` dims is correct.
     fn rope_cs(&self, pos: usize, dev: &lloom_tensor::Device) -> Result<(Tensor, Tensor)> {
-        let (c, s) = rope_cs_at(self.n_rot, self.rope_theta, &[pos], dev)?;
+        let (c, s) = rope_cs_one(self.n_rot, self.rope_theta, pos, dev)?;
         let half = self.n_rot / 2;
         Ok((c.reshape(half)?, s.reshape(half)?))
     }
@@ -1953,9 +1962,24 @@ fn rope_cs_at(
     dev: &lloom_tensor::Device,
 ) -> Result<(Tensor, Tensor)> {
     let half = n_rot / 2;
+    let (cos, sin) = rope_cs_host(n_rot, theta, positions.iter().copied());
+    Ok((
+        Tensor::from_vec(cos, (positions.len(), half), dev)?,
+        Tensor::from_vec(sin, (positions.len(), half), dev)?,
+    ))
+}
+
+/// The partial rope's `(cos, sin)` at each of `positions`, `n_rot / 2` each,
+/// in the host's f32 arithmetic (which the device's is not, bit for bit).
+fn rope_cs_host(
+    n_rot: usize,
+    theta: f64,
+    positions: impl ExactSizeIterator<Item = usize>,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = n_rot / 2;
     let mut cos = Vec::with_capacity(positions.len() * half);
     let mut sin = Vec::with_capacity(positions.len() * half);
-    for &pos in positions {
+    for pos in positions {
         for i in 0..half {
             let inv = 1f32 / (theta as f32).powf(2.0 * i as f32 / n_rot as f32);
             let f = inv * pos as f32;
@@ -1963,10 +1987,48 @@ fn rope_cs_at(
             sin.push(f.sin());
         }
     }
-    Ok((
-        Tensor::from_vec(cos, (positions.len(), half), dev)?,
-        Tensor::from_vec(sin, (positions.len(), half), dev)?,
-    ))
+    (cos, sin)
+}
+
+/// [`rope_cs_at`] at one position, `[1, n_rot / 2]` each: on Metal a view
+/// of a table of every position up to a power of two, computed on the host
+/// by the same arithmetic and uploaded once per growth, so a decode step's
+/// rope asks no pool for an upload (`DESIGN.md` §9.2aa). One table per
+/// device and `(n_rot, theta)`, kept for the process.
+fn rope_cs_one(
+    n_rot: usize,
+    theta: f64,
+    pos: usize,
+    dev: &lloom_tensor::Device,
+) -> Result<(Tensor, Tensor)> {
+    #[cfg(feature = "metal")]
+    if let lloom_tensor::Device::Metal(m) = dev {
+        type Tables = std::collections::HashMap<
+            (lloom_tensor::metal_backend::DeviceId, usize, u64),
+            (Tensor, Tensor, usize),
+        >;
+        static TABLES: std::sync::OnceLock<parking_lot::Mutex<Tables>> = std::sync::OnceLock::new();
+        let half = n_rot / 2;
+        let mut g = TABLES
+            .get_or_init(|| parking_lot::Mutex::new(Tables::new()))
+            .lock();
+        let key = (m.id(), n_rot, theta.to_bits());
+        if g.get(&key).is_none_or(|t| t.2 <= pos) {
+            let rows = (pos + 1).next_power_of_two().max(4096);
+            let (cos, sin) = rope_cs_host(n_rot, theta, 0..rows);
+            // The table outlives every pass: no plan serves it.
+            let _declared = lloom_tensor::EscapeGuard::new();
+            let table = (
+                Tensor::from_vec(cos, (rows, half), dev)?,
+                Tensor::from_vec(sin, (rows, half), dev)?,
+                rows,
+            );
+            g.insert(key, table);
+        }
+        let (cos, sin, _) = g.get(&key).expect("made above");
+        return Ok((cos.narrow(0, pos, 1)?, sin.narrow(0, pos, 1)?));
+    }
+    rope_cs_at(n_rot, theta, &[pos], dev)
 }
 
 /// Partial RoPE on `x [seq, h, head_dim]` with `cos`/`sin` `[seq, 1, n_rot/2]`:
@@ -2575,6 +2637,32 @@ mod tests {
             assert!((v - 1.0).abs() < 1e-5, "tail dim rotated: {yv:?}");
         }
     }
+    /// A single position's rope from the device table is the host's upload
+    /// for that position, bit for bit, on either side of the table's first
+    /// growth: the table is the same arithmetic, stored once.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn the_rope_table_is_the_hosts_rope_at_every_position() {
+        let dev = Device::new_metal(0).unwrap();
+        let (n_rot, theta) = (64usize, 1e7f64);
+        let bits = |t: &Tensor| -> Vec<u32> {
+            t.flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+                .into_iter()
+                .map(f32::to_bits)
+                .collect()
+        };
+        for pos in [0usize, 1, 4, 5, 2051, 4095, 4096, 4100, 9000] {
+            let (c1, s1) = rope_cs_one(n_rot, theta, pos, &dev).unwrap();
+            let (c0, s0) = rope_cs_at(n_rot, theta, &[pos], &dev).unwrap();
+            assert_eq!(c1.dims(), c0.dims(), "pos {pos}");
+            assert_eq!(bits(&c1), bits(&c0), "cos at pos {pos}");
+            assert_eq!(bits(&s1), bits(&s0), "sin at pos {pos}");
+        }
+    }
+
     /// The rope pairs dim `i` with dim `i + n_rot/2` (NEOX), at the pair's own
     /// frequency, and leaves the tail alone — pinned against a hand
     /// computation so an adjacent-pair rotation (same shapes, same short-text

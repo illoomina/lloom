@@ -92,7 +92,7 @@
 //! `two_tenants_never_receive_overlapping_spans` pins the first against a
 //! mutation.
 
-use super::{Buffer, PooledBuffer};
+use super::{Buffer, BufferHandle, PooledBuffer};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -293,7 +293,7 @@ struct RegionInner {
     /// served a view of its prefix. Holding the full-span handle rather than
     /// making one per request is what keeps the per-token path free of any
     /// allocation at all.
-    handles: Mutex<HashMap<TenantId, Arc<PooledBuffer>>>,
+    handles: Mutex<HashMap<TenantId, BufferHandle>>,
     counters: LiveCounters,
 }
 
@@ -351,7 +351,7 @@ impl SessionRegion {
     /// counted so a run can say which happened rather than reporting one number
     /// that could mean either (§3.1c: a zero is not evidence unless something
     /// nonzero came from the same command).
-    pub fn acquire(&self, tenant: TenantId, size: usize) -> Option<Arc<PooledBuffer>> {
+    pub fn acquire(&self, tenant: TenantId, size: usize) -> Option<BufferHandle> {
         let c = &self.inner.counters;
         c.offers.fetch_add(1, Ordering::Relaxed);
 
@@ -370,7 +370,7 @@ impl SessionRegion {
         // `parking_lot` never poisons, so there is no lock error to decline on.
         let mut handles = self.inner.handles.lock();
         let full = handles.entry(tenant).or_insert_with(|| {
-            Arc::new(PooledBuffer::unpooled(
+            BufferHandle::new(PooledBuffer::unpooled(
                 self.inner.base.view(span.offset, span.reserved),
                 span.reserved,
             ))
@@ -378,7 +378,7 @@ impl SessionRegion {
         // The view is of the tenant's own span, so two tenants can never be
         // handed overlapping bytes as long as the plan is disjoint — which
         // `RegionPlan::check_disjoint` established at construction.
-        let handle = Arc::new(PooledBuffer::unpooled(full.view(0, size), size));
+        let handle = BufferHandle::new(PooledBuffer::unpooled(full.view(0, size), size));
         c.hits.fetch_add(1, Ordering::Relaxed);
         Some(handle)
     }

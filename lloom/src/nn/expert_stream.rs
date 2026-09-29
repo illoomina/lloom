@@ -991,6 +991,95 @@ struct Inner {
     /// open: stored once the copy's epoch is complete.
     landing: lloom_tensor::kv_pages::EpochQuarantine<(u32, u32)>,
     landed_scratch: Vec<(u32, u32)>,
+    /// A one-row host plan's buffers (Metal), kept for the tier's life so a
+    /// decode step asks no pool for them (`DESIGN.md` §9.2aa): the routing
+    /// ids' readback destination, and the slot ids the routed kernels read.
+    #[cfg(feature = "metal")]
+    decode_io: DecodeIo,
+}
+
+/// See [`Inner::decode_io`].
+#[cfg(feature = "metal")]
+#[derive(Default)]
+struct DecodeIo {
+    ids_dst: Option<lloom_tensor::kernels::metal::BufferHandle>,
+    slots: Option<(lloom_tensor::kernels::metal::BufferHandle, Tensor)>,
+    /// The epoch of the command buffer the slot ids' last readers were
+    /// encoded into (`down` stamps it), or `BUSY` from the write until then.
+    slots_read_at: Option<u64>,
+}
+
+/// [`DecodeIo::slots_read_at`] between a write and its group's `down`.
+#[cfg(feature = "metal")]
+const BUSY: u64 = u64::MAX;
+
+#[cfg(feature = "metal")]
+impl Inner {
+    /// The destination a one-row plan's routing ids are read back into:
+    /// the tier's own Shared buffer of at least `bytes`, so the readback asks
+    /// no pool for one per step.
+    fn decode_ids_dst(
+        &mut self,
+        bytes: usize,
+    ) -> Result<Option<lloom_tensor::kernels::metal::BufferHandle>> {
+        let Ok(m) = self.device.as_metal_device() else {
+            return Ok(None);
+        };
+        Ok(Some(match &self.decode_io.ids_dst {
+            Some(b) if b.length() >= bytes => b.clone(),
+            _ => {
+                let _escape = escape_guard();
+                let b = m.new_persistent_shared(bytes)?;
+                self.decode_io.ids_dst = Some(b.clone());
+                b
+            }
+        }))
+    }
+
+    /// A one-row group's slot ids written into the tier's own Shared buffer,
+    /// once the command buffer holding the last ids' readers has completed
+    /// (`slots_read_at`, stamped by `down` after a group's last dispatch).
+    /// `None` — the caller uploads through the pool, as always — while a
+    /// reader may still run: another group of the same call, whose
+    /// dispatches sit in the open command buffer, or any reader not yet
+    /// retired.
+    fn write_decode_slots(&mut self, slot_ids: &[u32]) -> Result<Option<Tensor>> {
+        let (Some(clock), Ok(m)) = (&self.clock, self.device.as_metal_device()) else {
+            return Ok(None);
+        };
+        if let Some(e) = self.decode_io.slots_read_at {
+            if e == BUSY || !clock.is_complete(e) {
+                return Ok(None);
+            }
+        }
+        let n = slot_ids.len();
+        let fits = matches!(&self.decode_io.slots, Some((_, t)) if t.dims() == [1, n]);
+        if !fits {
+            let _escape = escape_guard();
+            let buf = m.new_persistent_shared(n * std::mem::size_of::<u32>())?;
+            if buf.contents().is_null() {
+                return Ok(None);
+            }
+            let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
+                buf.clone(),
+                m.clone(),
+                n,
+                lloom_tensor::DType::U32,
+            ));
+            let t =
+                Tensor::from_storage(storage, (1, n), lloom_tensor::op::BackpropOp::none(), false);
+            self.decode_io.slots = Some((buf, t));
+        }
+        let (buf, t) = self.decode_io.slots.as_ref().expect("made above");
+        // SAFETY: a CPU-mapped Shared buffer of `n` u32 (checked when made);
+        // the command buffer holding its last readers has completed (above),
+        // and nothing on the device writes it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(slot_ids.as_ptr(), buf.contents() as *mut u32, n);
+        }
+        self.decode_io.slots_read_at = Some(BUSY);
+        Ok(Some(t.clone()))
+    }
 }
 
 /// The residency table in a persistent Shared buffer, written by the host
@@ -998,7 +1087,7 @@ struct Inner {
 struct LiveTable {
     tensor: Tensor,
     #[cfg(feature = "metal")]
-    buf: Arc<lloom_tensor::kernels::metal::PooledBuffer>,
+    buf: lloom_tensor::kernels::metal::BufferHandle,
     n: usize,
 }
 
@@ -1010,7 +1099,7 @@ impl LiveTable {
             lloom_tensor::bail!("the live residency table has no CPU mapping")
         }
         let storage = lloom_tensor::Storage::Metal(lloom_tensor::MetalStorage::new(
-            Arc::clone(&buf),
+            buf.clone(),
             device.clone(),
             n,
             lloom_tensor::DType::U32,
@@ -1270,6 +1359,8 @@ impl Streamed {
                 live: None,
                 landing: lloom_tensor::kv_pages::EpochQuarantine::new(),
                 landed_scratch: Vec::new(),
+                #[cfg(feature = "metal")]
+                decode_io: DecodeIo::default(),
             }),
             counters: StreamCounters::default(),
             n_experts,
@@ -2065,7 +2156,7 @@ impl Streamed {
                 let plane = pool.plane_bytes;
                 let (entry, buf) = &st.planes[i];
                 pool.qt
-                    .write_staged(s * plane, plane, Arc::clone(buf), &mut ring, *entry)?;
+                    .write_staged(s * plane, plane, buf.clone(), &mut ring, *entry)?;
                 bytes += plane as u64;
             }
             // The copy writes the slot in this command buffer.
@@ -2212,6 +2303,18 @@ impl Streamed {
 pub fn pread_direct_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::tuning::tuning().stream.pread_direct)
+}
+
+/// Whether a value allocated now is read after the open pass closes: the
+/// open pass is a model's own (`MetalDevice::model_pass_open`), whose settle
+/// runs after it. False with no pass open, off Metal, or under a driver's.
+fn record_outlives_pass(t: &Tensor) -> bool {
+    #[cfg(feature = "metal")]
+    if let Ok(m) = t.device().as_metal_device() {
+        return m.model_pass_open();
+    }
+    let _ = t;
+    false
 }
 
 /// An escape guard while the streamed tier allocates (Metal): the pool
@@ -2674,11 +2777,20 @@ impl ExpertResidency for Streamed {
     }
 
     fn plan_device(&self, ids: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
-        let _escape = escape_guard();
         let (rows, topk) = ids.dims2()?;
         let n = rows * topk;
         let ids = ids.flatten_all()?.contiguous()?;
+        // The record is read by the settle after the pass body: inside a
+        // driver's pass, where a plan serves it, and after a model's own
+        // pass has closed, where it must be declared (`DESIGN.md` §9.2aa).
+        let _escape = if record_outlives_pass(&ids) {
+            escape_guard()
+        } else {
+            None
+        };
         let table = {
+            // The table outlives the pass: the tier's, rebuilt when stale.
+            let _escape = escape_guard();
             let mut inner = self.inner.lock();
             // The pass may read any resident slot (a direct read into one
             // waits for it).
@@ -2751,7 +2863,29 @@ impl ExpertResidency for Streamed {
     fn plan(&self, ids: &Tensor) -> Result<Vec<RoutedGroup>> {
         let (rows, topk) = ids.dims2()?;
         let t0 = std::time::Instant::now();
-        let host: Vec<u32> = ids.flatten_all()?.to_vec1::<u32>()?;
+        // One row: read through the tier's own destination (the lock only
+        // to fetch it; the wait runs without it). The same bytes `to_vec1`
+        // reads.
+        #[cfg(feature = "metal")]
+        let decode = if rows == 1 {
+            let flat = ids.flatten_all()?.contiguous()?;
+            let bytes = flat.elem_count() * std::mem::size_of::<u32>();
+            let dst = self.inner.lock().decode_ids_dst(bytes)?;
+            match dst {
+                Some(dst) => {
+                    Some(lloom_tensor::metal_backend::stage_readback_into(&flat, &dst)?.finish()?)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "metal"))]
+        let decode: Option<Vec<u32>> = None;
+        let host: Vec<u32> = match decode {
+            Some(v) => v,
+            None => ids.flatten_all()?.to_vec1::<u32>()?,
+        };
         self.counters
             .readback_ns
             .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -2788,6 +2922,12 @@ impl ExpertResidency for Streamed {
                 slots[i] as u32
             })
             .collect();
+        #[cfg(feature = "metal")]
+        if group.rows.len() == 1 {
+            if let Some(t) = inner.write_decode_slots(&slot_ids)? {
+                return Ok(t);
+            }
+        }
         Tensor::from_vec(slot_ids, (group.rows.len(), topk), &inner.device)
     }
 
@@ -2809,6 +2949,12 @@ impl ExpertResidency for Streamed {
         let slots = std::mem::take(&mut inner.open_slots);
         for s in slots {
             inner.map.last_epoch[s] = epoch;
+        }
+        // The group's slot ids, if they were the tier's own buffer: its last
+        // reader is encoded into this epoch's command buffer.
+        #[cfg(feature = "metal")]
+        if inner.decode_io.slots_read_at == Some(BUSY) {
+            inner.decode_io.slots_read_at = Some(epoch);
         }
         Ok(y)
     }

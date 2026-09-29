@@ -849,6 +849,16 @@ pub struct Qwen4Exp<R: ExpertResidency> {
     /// Spike 0's event (`JoinHook::Wait`), made at first use.
     #[cfg(feature = "metal")]
     spike0: std::sync::OnceLock<Option<std::sync::Arc<lloom_tensor::metal_backend::HostFedRing>>>,
+    /// The device plan's settle reads every layer's record back into this
+    /// Shared buffer rather than a pool buffer per step (`DESIGN.md` §9.2aa):
+    /// grown to the largest record set, kept for the model's life.
+    #[cfg(feature = "metal")]
+    settle_dst: parking_lot::Mutex<Option<lloom_tensor::kernels::metal::BufferHandle>>,
+    /// A one-row decode step's replay input, in memory the model owns rather
+    /// than a pool buffer per step (`replay_input_owned`), and the epoch of
+    /// the command buffer its last reader was encoded into.
+    #[cfg(feature = "metal")]
+    replay_h: parking_lot::Mutex<Option<(Tensor, Option<u64>)>>,
     cfg: Config,
 }
 
@@ -955,6 +965,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             spec_ahead: spec_ahead_from_env(),
             #[cfg(feature = "metal")]
             spike0: std::sync::OnceLock::new(),
+            #[cfg(feature = "metal")]
+            settle_dst: parking_lot::Mutex::new(None),
+            #[cfg(feature = "metal")]
+            replay_h: parking_lot::Mutex::new(None),
             cfg,
         }
     }
@@ -991,6 +1005,12 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
     /// is keyed as the model's own: it opens after the embedding a driver's
     /// pass of the same shape holds, so the two are different sequences.
     fn open_pass(&self, shape: crate::nn::decode::PassShape) -> Result<bool> {
+        self.open_pass_variant(shape, 0)
+    }
+
+    /// [`Self::open_pass`] for the allocation sequence `variant` of `shape`
+    /// ([`Self::decode_variant`]).
+    fn open_pass_variant(&self, shape: crate::nn::decode::PassShape, variant: u32) -> Result<bool> {
         #[cfg(feature = "metal")]
         if let Ok(m) = self.device().as_metal_device() {
             if !m.pass_plans_enabled() || m.pass_open() {
@@ -999,11 +1019,28 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             let Some(key) = Self::pass_key(shape, PassOpener::Model) else {
                 return Ok(false);
             };
-            m.begin_pass(key)?;
+            m.begin_pass(key.with_variant(variant))?;
             return Ok(true);
         }
-        let _ = shape;
+        let _ = (shape, variant);
         Ok(false)
+    }
+
+    /// Which of this model's decode sequences a step at `pos` runs, as its
+    /// pass key's variant (`PassKey::variant`, `DESIGN.md` §9.2aa): bit 0,
+    /// the step completes an indexer block (`(pos + 1) % ratio == 0`), which
+    /// adds the block's pooling, norm, rope and append; bit 1, the routing
+    /// is resolved on the device (the device plan and its settle) rather
+    /// than read back per layer. Two steps of one variant allocate the same
+    /// ordinals, so each is served its own plan instead of the one recorded
+    /// at the other phase drifting on it.
+    fn decode_variant(&self, pos: usize, device_plan: bool) -> u32 {
+        let ratio = self.layers.iter().find_map(|l| match &l.mixer {
+            Mixer::Full(a) => a.indexer().map(|i| i.ratio()),
+            Mixer::Linear(_) => None,
+        });
+        let block = ratio.is_some_and(|r| r > 0 && (pos + 1) % r == 0);
+        block as u32 | (device_plan as u32) << 1
     }
 
     /// The plan-cache key of a pass shape this model prepares or opens — a
@@ -1935,9 +1972,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         // per-layer readback loads each layer's true experts as it reaches
         // them: one replay per missed token, and the experts it loaded are
         // resident for the tokens after it.
-        let h = &Self::replay_input(h)?;
+        let h = &self.replay_input_owned(h)?;
         cache.open_window()?;
         let (logits, records) = self.decode_embed_pass(h, cache, obs, true)?;
+        self.replay_read_encoded(h);
         let (redo, after_first) = self.settle_records(&records)?;
         if !redo {
             // The step's window stays open as the standing one.
@@ -1954,6 +1992,7 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let logits = self
             .decode_embed_pass(h, cache, obs, false)
             .map(|(l, _)| l)?;
+        self.replay_read_encoded(h);
         cache.keep_standing();
         cache.replay_ns += t0.elapsed().as_nanos() as u64;
         Ok(logits)
@@ -1974,10 +2013,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             .map(|(_, r)| r.flatten_all())
             .collect::<Result<_>>()?;
         let all: Vec<u32> = if flat.len() == 1 {
-            flat[0].to_vec1()?
+            self.read_records(&flat[0])?
         } else {
             let refs: Vec<&Tensor> = flat.iter().collect();
-            Tensor::cat(&refs, 0)?.to_vec1()?
+            self.read_records(&Tensor::cat(&refs, 0)?)?
         };
         let mut parts: Vec<(&R, &[u32])> = Vec::with_capacity(records.len());
         let mut at = 0usize;
@@ -2007,6 +2046,31 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         Ok((redo, after_first))
     }
 
+    /// The settle's one readback of the records `t` (u32), through the
+    /// model's own Shared destination on Metal so a step asks no pool for
+    /// it; `to_vec1` elsewhere. The same bytes either way.
+    fn read_records(&self, t: &Tensor) -> Result<Vec<u32>> {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = t.device().as_metal_device() {
+            let t = t.contiguous()?;
+            let bytes = t.elem_count() * std::mem::size_of::<u32>();
+            let dst = {
+                let mut g = self.settle_dst.lock();
+                match g.as_ref() {
+                    Some(b) if b.length() >= bytes => b.clone(),
+                    _ => {
+                        let _declared = lloom_tensor::EscapeGuard::new();
+                        let b = m.new_persistent_shared(bytes)?;
+                        *g = Some(b.clone());
+                        b
+                    }
+                }
+            };
+            return lloom_tensor::metal_backend::stage_readback_into(&t, &dst)?.finish();
+        }
+        t.to_vec1()
+    }
+
     /// The streamed tier's misses so far, summed over the layers (0 for
     /// `Resident`): the cold-phase probe.
     fn stream_misses(&self) -> u64 {
@@ -2033,6 +2097,54 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
             }
         }
         Ok(h.clone())
+    }
+
+    /// [`Self::replay_input`] for a one-row decode step, into a buffer the
+    /// model keeps: the copy asks no pool for its destination. The previous
+    /// step's replay (if it ran) must have retired first, since it read the
+    /// same buffer; otherwise, and for a shape the buffer is not, the copy
+    /// goes to the pool as `replay_input` makes it.
+    fn replay_input_owned(&self, h: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = h.device().as_metal_device() {
+            if m.activations_may_be_reused() {
+                let clock = m.gpu_clock();
+                let mut g = self.replay_h.lock();
+                let fits = matches!(g.as_ref(), Some((t, _)) if t.dims() == h.dims() && t.dtype() == h.dtype());
+                if !fits {
+                    // Outlives every pass: no plan serves it.
+                    let _declared = lloom_tensor::EscapeGuard::new();
+                    *g = Some((Tensor::zeros(h.dims(), h.dtype(), h.device())?, None));
+                }
+                let (t, read) = g.as_mut().expect("made above");
+                if read.is_none_or(|e| clock.is_complete(e)) {
+                    // The copy as `replay_input` makes it, minus the fill.
+                    let _declared = lloom_tensor::EscapeGuard::new();
+                    t.slice_set(&h.contiguous()?, 0, 0)?;
+                    *read = None;
+                    return Ok(t.clone());
+                }
+            }
+        }
+        Self::replay_input(h)
+    }
+
+    /// A pass has encoded its reads of `h` (the planned computation, or the
+    /// replay): when `h` is the model's own replay input, stamp the epoch
+    /// they ride, so the next step's copy waits for them to retire
+    /// (`replay_input_owned`).
+    fn replay_read_encoded(&self, h: &Tensor) {
+        #[cfg(feature = "metal")]
+        if let Ok(m) = h.device().as_metal_device() {
+            let mut g = self.replay_h.lock();
+            if let Some((t, read)) = g.as_mut() {
+                if t.id() == h.id() {
+                    *read = Some(m.gpu_clock().current_epoch());
+                }
+            }
+        }
+        #[cfg(not(feature = "metal"))]
+        let _ = h;
     }
 
     /// The pass in progress replays: its recording holds the replay, which
@@ -2077,7 +2189,10 @@ impl<R: ExpertResidency> Qwen4Exp<R> {
         let n = self.cfg.hc_count;
         let d = self.cfg.hidden_size;
         let mut records: Vec<(usize, Tensor)> = Vec::new();
-        let bracket = self.open_pass(crate::nn::decode::PassShape::Decode { b: 1 })?;
+        let bracket = self.open_pass_variant(
+            crate::nn::decode::PassShape::Decode { b: 1 },
+            self.decode_variant(cache.pos, device_plan),
+        )?;
 
         // broadcast the embedding into the n-stream HC carry `res_hc [1, 1, n*d]`.
         // The reference inits the streams from the embed broadcast across n.
@@ -2246,6 +2361,18 @@ impl<R: ExpertResidency> CausalLM for Qwen4Exp<R> {
     }
 
     fn prepare_pass(&self, cache: &mut Self::Cache, seq_len: usize) -> Result<()> {
+        #[cfg(feature = "metal")]
+        if seq_len == 1 {
+            if let Ok(m) = self.device().as_metal_device() {
+                if m.pass_plans_enabled() {
+                    let device_plan = self.device_plan
+                        && plan_on_device()
+                        && !cache.window_open()
+                        && cache.device_plan_armed;
+                    m.set_next_pass_variant(self.decode_variant(cache.pos, device_plan));
+                }
+            }
+        }
         self.prepare_pass_inner(cache, seq_len)
     }
 

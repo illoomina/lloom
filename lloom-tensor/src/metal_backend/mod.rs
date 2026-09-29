@@ -9,7 +9,7 @@ use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
 // `use crate::kernels::unary::contiguous` instead. RESTRUCTURING §7.1.)
 use crate::kernels::{
     metal::{
-        heap_chunk_bytes, Buffer, BufferPool, Commands, Device, HeapChunks, PooledBuffer,
+        heap_chunk_bytes, Buffer, BufferHandle, BufferPool, Commands, Device, HeapChunks,
         ResidencySet,
     },
     BufferOffset, CallConvTranspose2dCfg, ConvKernel, IndexingKernel, Kernels, RESOURCE_OPTIONS,
@@ -23,7 +23,10 @@ use std::ffi::c_void;
 use std::sync::{Arc, PoisonError, TryLockError};
 
 mod device;
-pub use device::{wire_weights_on, DeviceId, MetalDevice, PassPlansPaused};
+pub use device::{
+    served_pass_request_sites, set_served_request_trace, wire_weights_on, DeviceId, MetalDevice,
+    PassPlansPaused,
+};
 mod host_fed;
 pub use host_fed::HostFedRing;
 use device::{
@@ -133,7 +136,7 @@ pub fn to_cpu_staged_count() -> u64 {
 /// silently become the tail wait it was meant to avoid.
 #[derive(Debug)]
 pub struct StagedMetalRead {
-    staging: Arc<PooledBuffer>,
+    staging: BufferHandle,
     count: usize,
     dtype: DType,
     marker: CommandMarker,
@@ -172,7 +175,7 @@ impl StagedMetalRead {
 /// first. The plain `to_cpu` waits for the queue's tail, so a readback
 /// issued after the other tile's work would wait for that work too.
 pub struct StagedReadback {
-    buffer: Arc<PooledBuffer>,
+    buffer: BufferHandle,
     /// `None` for a deferred stage (`stage_readback_deferred`): the blit is
     /// encoded and NOT committed; `finish` reads with no wait, on the
     /// caller's word that a drain (`flush_and_wait_current`, a plain
@@ -198,15 +201,29 @@ impl StagedReadback {
 /// stage costs no command-buffer cut. The caller's obligation: that drain
 /// runs before `finish`.
 pub fn stage_readback_deferred(t: &crate::Tensor) -> Result<StagedReadback> {
-    stage_readback_with(t, false)
+    stage_readback_with(t, false, None)
 }
 
 /// Stage the readback of a contiguous Metal tensor (`StagedReadback`).
 pub fn stage_readback(t: &crate::Tensor) -> Result<StagedReadback> {
-    stage_readback_with(t, true)
+    stage_readback_with(t, true, None)
 }
 
-fn stage_readback_with(t: &crate::Tensor, commit: bool) -> Result<StagedReadback> {
+/// [`stage_readback`] into `dst`, a Shared buffer the caller keeps across
+/// readbacks (`MetalDevice::new_persistent_shared`) of at least the tensor's
+/// bytes, so a per-step readback asks no pool for its destination. The
+/// buffer's only GPU access is this copy's write and the host reads it after
+/// [`StagedReadback::finish`] has waited, so the next stage into it is
+/// ordered after that read by program order.
+pub fn stage_readback_into(t: &crate::Tensor, dst: &BufferHandle) -> Result<StagedReadback> {
+    stage_readback_with(t, true, Some(dst))
+}
+
+fn stage_readback_with(
+    t: &crate::Tensor,
+    commit: bool,
+    dst: Option<&BufferHandle>,
+) -> Result<StagedReadback> {
     let (storage, layout) = t.storage_and_layout();
     let m = match &*storage {
         crate::Storage::Metal(m) => m,
@@ -220,13 +237,24 @@ fn stage_readback_with(t: &crate::Tensor, commit: bool) -> Result<StagedReadback
     let size = count * elem;
     // The copy's destination is read by the host, never by a later
     // dispatch: outside any pass plan (§9.2aa).
-    let buffer = {
-        let _escape = EscapeGuard::new();
-        m.device
-            .new_buffer_builder()
-            .with_size(size.max(1))
-            .with_label("staged_readback_dst")
-            .build()?
+    let buffer = match dst {
+        Some(d) => {
+            if d.length() < size || d.contents().is_null() {
+                crate::bail!(
+                    "stage_readback_into: a {}-byte destination for {size} bytes, or not host-visible",
+                    d.length()
+                )
+            }
+            d.clone()
+        }
+        None => {
+            let _escape = EscapeGuard::new();
+            m.device
+                .new_buffer_builder()
+                .with_size(size.max(1))
+                .with_label("staged_readback_dst")
+                .build()?
+        }
     };
     if m.device.base_mode() {
         // Under a pass plan a blit is outside the compute barrier chain
@@ -423,7 +451,7 @@ impl From<String> for MetalError {
 #[derive(Debug, Clone)]
 pub struct MetalStorage {
     /// The actual buffer containing the data.
-    buffer: Arc<PooledBuffer>,
+    buffer: BufferHandle,
     /// a reference to the device owning this buffer
     device: MetalDevice,
     /// The count of allocated elements in the buffer
@@ -2330,7 +2358,7 @@ impl BackendStorage for MetalStorage {
 }
 
 impl MetalStorage {
-    pub fn new(buffer: Arc<PooledBuffer>, device: MetalDevice, count: usize, dtype: DType) -> Self {
+    pub fn new(buffer: BufferHandle, device: MetalDevice, count: usize, dtype: DType) -> Self {
         Self {
             buffer,
             device,
@@ -2981,6 +3009,7 @@ impl BackendDevice for MetalDevice {
             base_mode: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pass_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             served_pass_pool_requests: Arc::new(Default::default()),
+            next_pass_variant: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         })
     }
 

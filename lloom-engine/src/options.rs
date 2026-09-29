@@ -1055,7 +1055,7 @@ pub struct ExecutorConfig {
     /// Under `replay`: how far back an ICB command's barrier scan looks — `run-start` or `since-barrier`.
     #[opt(flag = "replay-barrier-scope", parser = "parse_barrier_scope", variants = ["run-start", "since-barrier"])]
     pub replay_barrier_scope: String,
-    /// The pass-keyed plan cache (§9.2aa): every forward pass served from one arena base by a plan cached per pass shape.
+    /// The pass-keyed plan cache (§9.2aa): every forward pass served from one arena base by a plan cached per pass shape. On by default; `--pass-plans false` runs every pass on the buffer pool. `arena` or `replay` select the single-key arena instead.
     #[opt(flag = "pass-plans", bool)]
     pub pass_plans: bool,
 }
@@ -1071,6 +1071,15 @@ impl ExecutorConfig {
         )
     }
 
+    /// Whether the pass-plan cache is installed: asked for, and not
+    /// superseded by the single-key arena `arena`/`replay` record from the
+    /// decode loop's legacy step bracket, which the cache's pass brackets
+    /// replace (`MetalDevice::begin_pass` runs that bracket only with the
+    /// cache off).
+    pub fn pass_plans_armed(&self) -> bool {
+        self.pass_plans && !self.arena && !self.replay
+    }
+
     /// The arms for a report line, from the group that was installed.
     pub fn line(&self) -> String {
         format!(
@@ -1082,7 +1091,7 @@ impl ExecutorConfig {
             } else {
                 "off".to_string()
             },
-            self.pass_plans
+            self.pass_plans_armed()
         )
     }
 }
@@ -1096,7 +1105,7 @@ impl Default for ExecutorConfig {
             replay: false,
             replay_barriers: "skip-replayed".into(),
             replay_barrier_scope: "run-start".into(),
-            pass_plans: false,
+            pass_plans: true,
         }
     }
 }

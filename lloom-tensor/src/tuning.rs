@@ -481,6 +481,9 @@ pub struct InstrumentTuning {
     /// Trace every buffer-pool allocation (who missed, at what size).
     #[opt(flag = "pool-trace", env = "LLOOM_POOL_TRACE", bool)]
     pub pool_trace: bool,
+    /// Attribute every pool request a served pass makes to the model call site that made it (a backtrace per request; the residue of `served_pass_pool_requests`, §9.2aa).
+    #[opt(flag = "served-request-trace", env = "LLOOM_SERVED_REQUEST_TRACE", bool)]
+    pub served_request_trace: bool,
     /// Shadow every host upload and check it back (the #748 corruption instrument).
     #[opt(flag = "upload-shadow", env = "LLOOM_UPLOAD_SHADOW", bool)]
     pub upload_shadow: bool,

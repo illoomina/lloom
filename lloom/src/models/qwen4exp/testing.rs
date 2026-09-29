@@ -9,7 +9,7 @@ use super::hc::HyperConnection;
 use super::model::{Layer, Mixer, Qwen4Exp};
 use super::moe::{ExpertResidency, MoeLayer, Resident};
 use super::mtp::MtpHead;
-use super::qsa::QsaAttention;
+use super::qsa::{Indexer, QsaAttention};
 use crate::nn::RmsNorm;
 use lloom_tensor::quantized::{GgmlDType, QMatMul, QTensor};
 use lloom_tensor::{DType, Device, Result, Tensor};
@@ -172,12 +172,46 @@ pub fn moe(cfg: &Config, dev: &Device) -> MoeLayer<Resident> {
 pub fn model_with<R: ExpertResidency>(
     cfg: &Config,
     dev: &Device,
+    experts: impl FnMut(usize) -> Result<R>,
+) -> Result<Qwen4Exp<R>> {
+    build(cfg, dev, experts, false)
+}
+
+/// [`model_with`] with every full-attention layer carrying the QSA indexer
+/// (`cfg.indexer_*`), as the checkpoint's do: a decode step that completes a
+/// block of `indexer_compress_ratio` keys runs the block's compression.
+pub fn model_with_indexer<R: ExpertResidency>(
+    cfg: &Config,
+    dev: &Device,
+    experts: impl FnMut(usize) -> Result<R>,
+) -> Result<Qwen4Exp<R>> {
+    build(cfg, dev, experts, true)
+}
+
+fn indexer(cfg: &Config, dev: &Device) -> Result<Indexer> {
+    let (h, ih, id) = (cfg.hidden_size, cfg.indexer_n_heads, cfg.indexer_head_dim);
+    Indexer::new(
+        lin(ih * id, h, 5.0, dev),
+        lin(id, h, 6.0, dev),
+        RmsNorm::new(ones(id, dev), cfg.norm_eps),
+        RmsNorm::new(ones(id, dev), cfg.norm_eps),
+        cfg,
+    )
+}
+
+fn build<R: ExpertResidency>(
+    cfg: &Config,
+    dev: &Device,
     mut experts: impl FnMut(usize) -> Result<R>,
+    indexed: bool,
 ) -> Result<Qwen4Exp<R>> {
     let mut layers = Vec::with_capacity(cfg.n_layers);
     for l in 0..cfg.n_layers {
         let mixer = match cfg.layer_types[l] {
             LayerKind::Linear => Mixer::Linear(deltanet(cfg, dev)),
+            LayerKind::Full if indexed => {
+                Mixer::Full(qsa(cfg, dev).with_indexer(indexer(cfg, dev)?))
+            }
             LayerKind::Full => Mixer::Full(qsa(cfg, dev)),
         };
         layers.push(Layer::new(

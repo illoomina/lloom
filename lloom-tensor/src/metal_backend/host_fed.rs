@@ -15,12 +15,11 @@
 //! a pending command still reads it (`docs/invariants.md` §15.1m).
 
 use super::MetalDevice;
-use crate::kernels::metal::PooledBuffer;
+use crate::kernels::metal::BufferHandle;
 use crate::{DType, Result, Tensor};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLSharedEvent};
-use std::sync::Arc;
 
 /// A value no wait of a live run reaches: signalled to release every wait a
 /// failed run left encoded (`HostFedRing::release`).
@@ -29,7 +28,7 @@ const RELEASE_SPAN: u64 = 1 << 40;
 pub struct HostFedRing {
     device: MetalDevice,
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
-    buffers: Vec<Arc<PooledBuffer>>,
+    buffers: Vec<BufferHandle>,
     tensors: Vec<Tensor>,
     len: usize,
 }
@@ -59,7 +58,7 @@ impl HostFedRing {
                 crate::bail!("HostFedRing: a Shared buffer with no CPU mapping")
             }
             let storage = crate::Storage::Metal(super::MetalStorage::new(
-                Arc::clone(&buf),
+                BufferHandle::clone(&buf),
                 device.clone(),
                 len,
                 DType::F32,

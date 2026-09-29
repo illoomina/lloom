@@ -29,10 +29,14 @@
 //! # Structure
 //!
 //! ```text
-//!   free:    BTreeMap<usize, Vec<Buffer>>  size -> buffers ready to hand out
-//!   pending: VecDeque<PendingBuffer>       released, waiting on the GPU
-//!   live_buffers / live_bytes: usize       what callers currently hold
+//!   free:    BTreeMap<usize, Bucket>     size -> buffers ready to hand out
+//!   pending: VecDeque<PendingBuffer>     released, waiting on the GPU
+//!   live_buffers / live_bytes: usize     what callers currently hold
 //! ```
+//!
+//! A buffer travels with its handle's allocation ([`BufferHandle`]): the last
+//! handle's drop parks the node itself, and `acquire` hands the same node out
+//! again, so a hit allocates nothing on the host.
 //!
 //! `BTreeMap` rather than `HashMap` because lookup wants the *smallest bucket
 //! at least as large as the request*, which is `range(size..).next()`: one
@@ -65,7 +69,9 @@ use super::cache_pad::CachePadded;
 use super::contention::{Access, Censused, Contention, Side};
 use super::Buffer;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::mem::ManuallyDrop;
+use std::ptr::NonNull;
+use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
 /// Tracks how far the GPU has got through the command buffers submitted to it.
@@ -234,8 +240,8 @@ impl GpuClock {
 /// A buffer that returns itself to its pool when the last handle drops.
 ///
 /// Derefs to `Buffer`, so it substitutes for the `Arc<Buffer>` this replaces
-/// everywhere the buffer is read. Cloning the `Arc<PooledBuffer>` shares the
-/// handle; the return happens when the final clone drops.
+/// everywhere the buffer is read. It is shared through a [`BufferHandle`];
+/// the return happens when the final clone drops.
 pub struct PooledBuffer {
     /// `Option` only so `drop` can take ownership and hand the buffer back
     /// rather than destroying it. Always `Some` for a live handle.
@@ -324,7 +330,8 @@ impl std::fmt::Debug for PooledBuffer {
 impl Drop for PooledBuffer {
     /// The event the old design lacked.
     ///
-    /// This runs when the last `Arc<PooledBuffer>` goes away, which is the
+    /// This runs when the last handle goes away and its node cannot go back
+    /// with the buffer (`BufferHandle`), which is the
     /// same instant `Arc::strong_count == 1` used to become true of the pooled
     /// `Arc<Buffer>` -- except that now it is a notification rather than a
     /// state to be discovered later by a scan.
@@ -338,7 +345,7 @@ impl Drop for PooledBuffer {
         // Pool gone: the buffer drops here and Metal frees it. Correct, and the
         // reason the back-reference is `Weak`.
         if let Some(pool) = self.pool.upgrade() {
-            pool.release(buffer, self.size);
+            pool.release(buffer, self.size, self.pool.clone());
         } else {
             // Destroyed rather than returned, so any mark must come off before
             // the allocation does (#475).
@@ -362,6 +369,286 @@ impl Drop for PooledBuffer {
                 set.remove_deferred(&buffer);
             }
             unsafe { super::poison::unpoison_buffer(&buffer) };
+        }
+    }
+}
+
+/// The shared handle to a [`PooledBuffer`], counted as `Arc` counts: clones
+/// share it, [`Self::downgrade`] makes a weak one, and the buffer goes back
+/// when the last strong handle drops.
+///
+/// Unlike `Arc`, a pooled buffer goes back WITH the handle's allocation: the
+/// pool parks the node the handles pointed at and hands the same node out on
+/// its next hit, so an acquire and a release allocate nothing on the host
+/// (CONTRIBUTING §3.3a). A node goes back only while no weak handle to it
+/// exists, since a weak handle to a node handed to another tenant would
+/// upgrade to that tenant's buffer; otherwise the buffer alone goes back and
+/// the node lives until its last weak handle drops.
+pub struct BufferHandle {
+    node: NonNull<HandleNode>,
+}
+
+struct HandleNode {
+    strong: AtomicUsize,
+    /// Weak handles, plus one the strong handles hold between them.
+    weak: AtomicUsize,
+    /// Dropped by hand: a node that goes back to its pool keeps its value.
+    value: ManuallyDrop<PooledBuffer>,
+}
+
+/// A weak [`BufferHandle`]: it keeps nothing alive, and upgrades while a
+/// strong handle exists.
+pub struct WeakBufferHandle {
+    node: NonNull<HandleNode>,
+}
+
+// SAFETY: a handle shares a `PooledBuffer` across threads exactly as
+// `BufferHandle` did, and its counts are atomics; `PooledBuffer` is
+// `Send + Sync` (asserted below), so the bounds are `Arc`'s.
+unsafe impl Send for BufferHandle {}
+unsafe impl Sync for BufferHandle {}
+// SAFETY: as above; a weak handle only touches the counts until it upgrades.
+unsafe impl Send for WeakBufferHandle {}
+unsafe impl Sync for WeakBufferHandle {}
+
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<PooledBuffer>();
+};
+
+impl BufferHandle {
+    /// One strong handle to `value`, in a fresh node.
+    pub fn new(value: PooledBuffer) -> Self {
+        let node = Box::new(HandleNode {
+            strong: AtomicUsize::new(1),
+            weak: AtomicUsize::new(1),
+            value: ManuallyDrop::new(value),
+        });
+        Self {
+            node: NonNull::from(Box::leak(node)),
+        }
+    }
+
+    fn inner(&self) -> &HandleNode {
+        // SAFETY: a strong handle keeps its node and value alive.
+        unsafe { self.node.as_ref() }
+    }
+
+    /// Whether `a` and `b` are handles to one buffer.
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.node == b.node
+    }
+
+    /// The shared value's address, stable for as long as a handle exists.
+    pub fn as_ptr(this: &Self) -> *const PooledBuffer {
+        &*this.inner().value as *const PooledBuffer
+    }
+
+    pub fn strong_count(this: &Self) -> usize {
+        this.inner().strong.load(Ordering::Relaxed)
+    }
+
+    pub fn downgrade(this: &Self) -> WeakBufferHandle {
+        this.inner().weak.fetch_add(1, Ordering::Relaxed);
+        WeakBufferHandle { node: this.node }
+    }
+}
+
+impl Clone for BufferHandle {
+    fn clone(&self) -> Self {
+        let old = self.inner().strong.fetch_add(1, Ordering::Relaxed);
+        if old > isize::MAX as usize {
+            std::process::abort();
+        }
+        Self { node: self.node }
+    }
+}
+
+impl std::ops::Deref for BufferHandle {
+    type Target = PooledBuffer;
+
+    fn deref(&self) -> &PooledBuffer {
+        &self.inner().value
+    }
+}
+
+impl AsRef<Buffer> for BufferHandle {
+    fn as_ref(&self) -> &Buffer {
+        self.inner().value.buffer()
+    }
+}
+
+impl std::fmt::Debug for BufferHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.inner().value, f)
+    }
+}
+
+impl Drop for BufferHandle {
+    fn drop(&mut self) {
+        if self.inner().strong.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        // Every other strong handle's use of the value happens before this.
+        fence(Ordering::Acquire);
+        // SAFETY: that was the last strong handle, so the value is ours.
+        unsafe { HandleNode::last_strong_dropped(self.node) }
+    }
+}
+
+impl WeakBufferHandle {
+    /// A strong handle, if one still exists.
+    pub fn upgrade(&self) -> Option<BufferHandle> {
+        // SAFETY: a weak handle keeps its node allocated.
+        let strong = unsafe { &self.node.as_ref().strong };
+        let mut n = strong.load(Ordering::Relaxed);
+        loop {
+            if n == 0 {
+                return None;
+            }
+            match strong.compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return Some(BufferHandle { node: self.node }),
+                Err(seen) => n = seen,
+            }
+        }
+    }
+}
+
+impl Clone for WeakBufferHandle {
+    fn clone(&self) -> Self {
+        // SAFETY: a weak handle keeps its node allocated.
+        unsafe { self.node.as_ref() }
+            .weak
+            .fetch_add(1, Ordering::Relaxed);
+        Self { node: self.node }
+    }
+}
+
+impl Drop for WeakBufferHandle {
+    fn drop(&mut self) {
+        // SAFETY: this weak handle's share of the count is what it gives up.
+        unsafe { HandleNode::drop_weak(self.node) }
+    }
+}
+
+impl HandleNode {
+    /// The last strong handle to `node` dropped.
+    ///
+    /// # Safety
+    ///
+    /// No strong handle to `node` exists, and the caller has synchronised
+    /// with every earlier one's release.
+    unsafe fn last_strong_dropped(node: NonNull<HandleNode>) {
+        // A weak count of one is the strong handles' own: no weak handle
+        // exists, and none can be made without a strong one. So the node can
+        // go back with its buffer and nobody can reach it from outside.
+        let pool = {
+            let inner: &HandleNode = node.as_ref();
+            match inner.value.buffer.as_ref() {
+                Some(buffer) if inner.weak.load(Ordering::Acquire) == 1 => {
+                    inner.value.pool.upgrade().inspect(|_| {
+                        // `LLOOM_UPLOAD_SHADOW` (#748), as `PooledBuffer::drop`.
+                        super::upload_shadow::check_at_release(buffer);
+                    })
+                }
+                _ => None,
+            }
+        };
+        if let Some(pool) = pool {
+            pool.release_node(FreeNode(node));
+            return;
+        }
+        let n = node.as_ptr();
+        ManuallyDrop::drop(&mut (*n).value);
+        Self::drop_weak(node);
+    }
+
+    /// Give up one share of the weak count; the last frees the node.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns one share of `node`'s weak count.
+    unsafe fn drop_weak(node: NonNull<HandleNode>) {
+        if node.as_ref().weak.fetch_sub(1, Ordering::Release) == 1 {
+            fence(Ordering::Acquire);
+            drop(Box::from_raw(node.as_ptr()));
+        }
+    }
+}
+
+/// A node the pool holds between tenants: no strong handle, no weak one but
+/// the strong handles' share, and its buffer inside. Dropped, it destroys the
+/// buffer and frees the node.
+struct FreeNode(NonNull<HandleNode>);
+
+// SAFETY: a free node is owned by exactly one holder (the pool's state, under
+// its lock), and nothing else can reach it: no handle to it exists.
+unsafe impl Send for FreeNode {}
+
+impl FreeNode {
+    /// A free node for `buffer`, for a release whose handle could not go back
+    /// with it.
+    fn new(buffer: Buffer, size: usize, pool: Weak<PoolInner>) -> Self {
+        let handle = BufferHandle::new(PooledBuffer {
+            buffer: Some(buffer),
+            size,
+            residency: None,
+            pool,
+        });
+        let node = handle.node;
+        std::mem::forget(handle);
+        // SAFETY: the node was just made with one strong handle, now given up
+        // without running its drop.
+        unsafe { node.as_ref() }.strong.store(0, Ordering::Relaxed);
+        FreeNode(node)
+    }
+
+    fn value(&self) -> &PooledBuffer {
+        // SAFETY: a free node is exclusively this holder's.
+        unsafe { &self.0.as_ref().value }
+    }
+
+    fn buffer(&self) -> &Buffer {
+        self.value().buffer()
+    }
+
+    /// The bucket it returns to.
+    fn size(&self) -> usize {
+        self.value().size
+    }
+
+    /// Hand the node out as one strong handle.
+    fn into_handle(self) -> BufferHandle {
+        let node = self.0;
+        std::mem::forget(self);
+        // SAFETY: exclusively ours until returned; the handle is published to
+        // other threads only through a synchronising transfer.
+        unsafe { node.as_ref() }.strong.store(1, Ordering::Relaxed);
+        BufferHandle { node }
+    }
+
+    /// Free the node, keeping its buffer (for a caller that destroys it).
+    fn into_buffer(self) -> Buffer {
+        let node = self.0;
+        std::mem::forget(self);
+        // SAFETY: exclusively ours, and no handle can reach it.
+        unsafe {
+            let mut b = Box::from_raw(node.as_ptr());
+            let buffer = b.value.buffer.take().expect("a free node holds its buffer");
+            ManuallyDrop::drop(&mut b.value);
+            buffer
+        }
+    }
+}
+
+impl Drop for FreeNode {
+    fn drop(&mut self) {
+        // SAFETY: exclusively ours, and no handle can reach it. Taking the
+        // buffer first keeps `PooledBuffer::drop` from handing it back.
+        unsafe {
+            let mut b = Box::from_raw(self.0.as_ptr());
+            drop(b.value.buffer.take());
+            ManuallyDrop::drop(&mut b.value);
         }
     }
 }
@@ -794,8 +1081,16 @@ struct PoolState {
     /// Ordered so lookup can ask for "smallest size >= n" directly. A bucket
     /// is removed from the map when it empties, so the map's length is the
     /// number of sizes that actually have something free -- never a graveyard
-    /// of emptied keys.
-    free: BTreeMap<usize, Vec<Buffer>>,
+    /// of emptied keys. The emptied bucket's storage goes to `spare_buckets`
+    /// and the next bucket created takes it, so a size that empties and
+    /// refills every step allocates nothing.
+    free: BTreeMap<usize, Bucket>,
+
+    /// Emptied buckets, kept for their storage.
+    spare_buckets: Vec<Bucket>,
+
+    /// Buffers in `free`, so `free_order` can be bounded without a walk.
+    free_buffers: usize,
 
     /// Buffers currently held by a caller, and their total allocated bytes.
     ///
@@ -825,7 +1120,11 @@ struct PoolState {
     /// Sizes in the order they entered `free`, so eviction can take the oldest
     /// without sorting or scanning. An entry whose buffer has since been handed
     /// out is stale and simply skipped; that is cheaper than removing it
-    /// eagerly, and it keeps `acquire` off this structure entirely.
+    /// eagerly, and it keeps `acquire` off this structure entirely. Stale
+    /// entries are dropped in place once they outnumber the free buffers
+    /// (`compact_free_order`): a pool whose releases are all reused never
+    /// evicts, and without that the queue would grow by one entry per
+    /// release for the life of the process.
     free_order: std::collections::VecDeque<usize>,
 
     /// Cap on `free_bytes`. See `evict_over_budget` for why there has to be one.
@@ -956,13 +1255,20 @@ impl std::fmt::Display for ResidualExceeded {
 
 impl std::error::Error for ResidualExceeded {}
 
-/// A buffer waiting for the GPU to finish with it.
+/// A buffer waiting for the GPU to finish with it, in the node its handles
+/// shared (the node's `size` is the bucket it returns to).
 struct PendingBuffer {
-    buffer: Buffer,
-    /// Bucket to return to -- the allocated size, as for a live handle.
-    size: usize,
+    node: FreeNode,
     /// The epoch this must outlive before it can be handed out again.
     epoch: u64,
+}
+
+/// The free buffers of one size, newest last.
+#[derive(Default)]
+struct Bucket {
+    nodes: Vec<FreeNode>,
+    /// `compact_free_order`'s count of this size's queue entries.
+    queued: usize,
 }
 
 /// Told when the pool destroys a free buffer, so a holder of a second reference
@@ -1042,6 +1348,8 @@ impl PoolInner {
         Self {
             state: Censused::new(parking_lot::Mutex::new(PoolState {
                 free: BTreeMap::new(),
+                spare_buckets: Vec::new(),
+                free_buffers: 0,
                 live_buffers: 0,
                 live_bytes: 0,
                 pending: std::collections::VecDeque::new(),
@@ -1082,8 +1390,17 @@ impl PoolInner {
     ///
     /// Lookup is untouched. This is a change to *when* a buffer is offered, not
     /// to how one is found.
-    fn release(&self, buffer: Buffer, size: usize) {
+    fn release(&self, buffer: Buffer, size: usize, pool: Weak<PoolInner>) {
+        self.release_node(FreeNode::new(buffer, size, pool));
+    }
+
+    /// Hands a buffer back in the node its handles shared, so the next
+    /// `acquire` of its size hands the same node out and neither side
+    /// allocates. Called from the last strong handle's drop, and from
+    /// [`Self::release`].
+    fn release_node(&self, node: FreeNode) {
         let epoch = self.clock.current_epoch();
+        let size = node.size();
 
         let mut state = self.state.lock(Side::Host);
         state.counters.releases += 1;
@@ -1098,12 +1415,8 @@ impl PoolInner {
         // `VecDeque` push here against a `BTreeMap` entry push there, so the
         // branch would not have bought anything measurable either.
         state.counters.deferred += 1;
-        super::late_bind::on_release(&buffer, epoch);
-        state.pending.push_back(PendingBuffer {
-            buffer,
-            size,
-            epoch,
-        });
+        super::late_bind::on_release(node.buffer(), epoch);
+        state.pending.push_back(PendingBuffer { node, epoch });
         // No gauge to update: how many buffers are parked is `state.pending`
         // itself, which `occupancy()` reports (issue #507). Mirroring it into
         // `PoolCounters` is what let `reset_counters` zero it.
@@ -1155,7 +1468,7 @@ impl PoolInner {
             // claim -- the last handle dropped (`PooledBuffer::drop` is what
             // put it in `pending`) AND `is_complete` just said the GPU is done
             // with it. Inert without the `asan-poison` feature.
-            unsafe { super::poison::poison_buffer(&entry.buffer) };
+            unsafe { super::poison::poison_buffer(entry.node.buffer()) };
             // The device-visible half of the same claim (#706): overwrite the
             // memory itself, so a command buffer that is STILL reading it --
             // which `is_complete` has just said cannot exist -- reads the
@@ -1164,29 +1477,29 @@ impl PoolInner {
             #[cfg(feature = "fuzzing")]
             {
                 let poison = self.free_poison.load(std::sync::atomic::Ordering::Relaxed);
-                if poison & 0x100 != 0 && !entry.buffer.is_view() {
+                let buffer = entry.node.buffer();
+                if poison & 0x100 != 0 && !buffer.is_view() {
                     // SAFETY: no handle exists (the last drop parked it) and
                     // the GPU epoch it was released in is complete; the write
                     // covers exactly the allocation.
                     unsafe {
-                        std::ptr::write_bytes(
-                            entry.buffer.contents(),
-                            poison as u8,
-                            entry.buffer.length(),
-                        );
+                        std::ptr::write_bytes(buffer.contents(), poison as u8, buffer.length());
                     }
                 }
             }
-            state.free_bytes += entry.size;
-            state.free_order.push_back(entry.size);
-            state.free.entry(entry.size).or_default().push(entry.buffer);
+            let size = entry.node.size();
+            state.free_bytes += size;
+            state.free_order.push_back(size);
+            state.put_free(size, entry.node);
             drained += 1;
         }
         if drained == 0 {
             return Vec::new();
         }
         state.counters.drained += drained;
-        state.evict_over_budget()
+        let evicted = state.evict_over_budget();
+        state.compact_free_order();
+        evicted
     }
 
     /// [`Self::drain_locked`] under its own acquisition of the lock.
@@ -1249,25 +1562,87 @@ impl Drop for PoolInner {
         }
         let state = self.state.lock(Side::Host);
         for bucket in state.free.values() {
-            for buffer in bucket {
+            for node in &bucket.nodes {
                 // SAFETY: the pool is being destroyed, so nothing can acquire
                 // these; they are freed as `state` drops.
-                unsafe { super::poison::unpoison_buffer(buffer) };
+                unsafe { super::poison::unpoison_buffer(node.buffer()) };
             }
         }
         for entry in &state.pending {
             // Pending buffers are not poisoned today (they are marked only on
             // entering the free list), but clearing is idempotent and this is
             // the site that must not be re-derived if that changes.
-            unsafe { super::poison::unpoison_buffer(&entry.buffer) };
+            unsafe { super::poison::unpoison_buffer(entry.node.buffer()) };
         }
     }
 }
 
 impl PoolState {
+    /// Put a drained node into its size's bucket, making the bucket from a
+    /// spare's storage if the size has none.
+    fn put_free(&mut self, size: usize, node: FreeNode) {
+        let spare = &mut self.spare_buckets;
+        self.free
+            .entry(size)
+            .or_insert_with(|| spare.pop().unwrap_or_default())
+            .nodes
+            .push(node);
+        self.free_buffers += 1;
+    }
+
+    /// Take the newest node of `size`'s bucket, and retire the bucket to the
+    /// spares if that emptied it.
+    fn pop_free(&mut self, size: usize) -> Option<FreeNode> {
+        let bucket = self.free.get_mut(&size)?;
+        let node = bucket.nodes.pop();
+        if bucket.nodes.is_empty() {
+            if let Some(mut empty) = self.free.remove(&size) {
+                empty.queued = 0;
+                self.spare_buckets.push(empty);
+            }
+        }
+        if node.is_some() {
+            self.free_buffers -= 1;
+        }
+        node
+    }
+
+    /// Drop `free_order`'s stale entries once they outnumber the free
+    /// buffers, keeping for each size its newest `bucket.nodes.len()` entries
+    /// in their order: the queue then says what it said before, minus the
+    /// entries eviction would have skipped. Amortized O(1) per release (it
+    /// runs when the queue has doubled past what it keeps), in place.
+    fn compact_free_order(&mut self) {
+        if self.free_order.len() <= 2 * self.free_buffers + 64 {
+            return;
+        }
+        for b in self.free.values_mut() {
+            b.queued = 0;
+        }
+        for size in &self.free_order {
+            if let Some(b) = self.free.get_mut(size) {
+                b.queued += 1;
+            }
+        }
+        // Now `queued` counts entries to skip from the front: all but the
+        // newest `nodes.len()`.
+        for b in self.free.values_mut() {
+            b.queued = b.queued.saturating_sub(b.nodes.len());
+        }
+        let free = &mut self.free;
+        self.free_order.retain(|size| match free.get_mut(size) {
+            Some(b) if b.queued > 0 => {
+                b.queued -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        });
+    }
+
     /// The lookup half of [`BufferPool::acquire`]: a buffer of at least
     /// `size` bytes out of the free list, with the counters for it, or `None`.
-    fn take(&mut self, size: usize) -> Option<(Buffer, usize)> {
+    fn take(&mut self, size: usize) -> Option<(FreeNode, usize)> {
         self.counters.lookups += 1;
 
         // Exact hit. Checked separately from the range query below because it
@@ -1275,11 +1650,7 @@ impl PoolState {
         // -- and because an exact match is optimal, so there is nothing to gain
         // by looking further.
         self.counters.buckets_probed += 1;
-        let found = if let Some(bucket) = self.free.get_mut(&size) {
-            bucket.pop().map(|b| (b, size))
-        } else {
-            None
-        };
+        let found = self.pop_free(size).map(|n| (n, size));
 
         // Otherwise the smallest bucket that can satisfy the request. One
         // ordered probe: `range` starts at the first key > size and stops.
@@ -1300,12 +1671,13 @@ impl PoolState {
                 // policy into a retention policy. `evict_over_budget` remains
                 // the only thing that removes a free buffer.
                 let bound = self.oversize_bound;
-                let next = self
+                let candidate = self
                     .free
-                    .range_mut((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
+                    .range((std::ops::Bound::Excluded(size), std::ops::Bound::Unbounded))
                     .next()
-                    .filter(|(k, _)| bucket_admissible(size, **k, bound))
-                    .and_then(|(k, v)| v.pop().map(|b| (b, *k)));
+                    .map(|(k, _)| *k)
+                    .filter(|k| bucket_admissible(size, *k, bound));
+                let next = candidate.and_then(|k| self.pop_free(k).map(|n| (n, k)));
                 if next.is_none() && bound.is_some() {
                     // Only when a candidate existed and the bound is what
                     // rejected it. An empty range yields `None` too, and
@@ -1324,24 +1696,17 @@ impl PoolState {
             }
         };
 
-        let (buffer, bucket_size) = found?;
+        let (node, bucket_size) = found?;
 
         // The buffer has left the free list. Its `free_order` entry is left
         // behind and skipped when eviction reaches it -- removing it here would
         // mean a linear search, which is exactly what must not be on this path.
+        // Its key went with the bucket if that emptied it (`pop_free`): the
+        // old pool's `retain` cleared a bucket's Vec but left the key, so
+        // emptied keys accumulated at ~3.2 per decode token and were walked
+        // forever.
         self.free_bytes = self.free_bytes.saturating_sub(bucket_size);
-
-        // Drop the key when its bucket empties. This is what stops the map
-        // from becoming a graveyard: the old pool's `retain` cleared a bucket's
-        // Vec but left the key, so emptied keys accumulated at ~3.2 per decode
-        // token and were walked forever.
-        if self
-            .free
-            .get(&bucket_size)
-            .is_some_and(|bucket| bucket.is_empty())
-        {
-            self.free.remove(&bucket_size);
-        }
+        let buffer = node.buffer();
 
         // Handed to a caller, so it is theirs to touch again. This must happen
         // before the handle can be observed, or the caller's first legitimate
@@ -1349,8 +1714,8 @@ impl PoolState {
         //
         // SAFETY: the buffer has just left the free list under the pool lock,
         // so no other handle to it exists. Inert without `asan-poison`.
-        unsafe { super::poison::unpoison_buffer(&buffer) };
-        super::late_bind::on_leave(&buffer);
+        unsafe { super::poison::unpoison_buffer(buffer) };
+        super::late_bind::on_leave(buffer);
 
         self.counters.hits += 1;
         // The overhang's HIT source (§9.2). `bucket_size` is what the range
@@ -1368,7 +1733,7 @@ impl PoolState {
         self.counters.record_band(size, bucket_size);
         self.live_buffers += 1;
         self.live_bytes += bucket_size;
-        Some((buffer, bucket_size))
+        Some((node, bucket_size))
     }
 
     /// Bytes this pool holds that no planner owns (`DESIGN.md` §9.5k).
@@ -1395,7 +1760,7 @@ impl PoolState {
             + self
                 .pending
                 .iter()
-                .map(|p| p.buffer.length())
+                .map(|p| p.node.buffer().length())
                 .sum::<usize>();
         held.saturating_sub(cap.planned)
     }
@@ -1443,9 +1808,10 @@ impl PoolState {
     fn evict_over_budget(&mut self) -> Vec<Buffer> {
         let mut evicted = Vec::new();
         while self.free_bytes > self.free_budget {
-            let Some((size, buffer)) = self.take_eviction_victim() else {
+            let Some((size, node)) = self.take_eviction_victim() else {
                 break;
             };
+            let buffer = node.into_buffer();
             self.free_bytes = self.free_bytes.saturating_sub(size);
             self.counters.evicted += 1;
             // Leaving the free list to be DESTROYED rather than reused, so the
@@ -1479,24 +1845,17 @@ impl PoolState {
     /// bucket is `O(log n)` and there is no walk. Both stay off §3.3's
     /// no-O(N)-on-the-per-token-path list; this runs at the host's drain,
     /// inside `acquire`, on either arm (§6.4e).
-    fn take_eviction_victim(&mut self) -> Option<(usize, Buffer)> {
+    fn take_eviction_victim(&mut self) -> Option<(usize, FreeNode)> {
         match self.eviction_order {
             EvictionOrder::Age => loop {
                 let size = self.free_order.pop_front()?;
-                let bucket = match self.free.get_mut(&size) {
-                    Some(b) => b,
-                    // The key is gone: its bucket emptied and was removed.
-                    None => continue,
-                };
-                // Stale entry: a lookup already took this buffer, so there is
+                // The key is gone (its bucket emptied and was retired), or
+                // the entry is stale (a lookup already took this buffer):
                 // nothing here to evict and the queue entry is just noise.
-                let Some(buffer) = bucket.pop() else {
+                let Some(node) = self.pop_free(size) else {
                     continue;
                 };
-                if bucket.is_empty() {
-                    self.free.remove(&size);
-                }
-                return Some((size, buffer));
+                return Some((size, node));
             },
             EvictionOrder::Size => {
                 // `last_key_value` is the largest bucket. A bucket present in
@@ -1506,16 +1865,12 @@ impl PoolState {
                 // case to skip because this arm reads the map rather than the
                 // queue.
                 let size = *self.free.last_key_value()?.0;
-                let bucket = self.free.get_mut(&size)?;
-                let buffer = bucket.pop()?;
-                if bucket.is_empty() {
-                    self.free.remove(&size);
-                }
+                let node = self.pop_free(size)?;
                 // `free_order`'s entry for this buffer is left behind and
                 // skipped if the arm ever changes -- the same treatment
                 // `acquire` already gives an entry whose buffer it took, and
                 // the reason removing it would be a linear search.
-                Some((size, buffer))
+                Some((size, node))
             }
         }
     }
@@ -1707,7 +2062,7 @@ impl BufferPool {
     ///
     /// `None` means the caller should allocate; it does **not** mean the pool
     /// holds nothing of that size, only that nothing of that size is free.
-    pub fn acquire(&self, size: usize) -> Option<Arc<PooledBuffer>> {
+    pub fn acquire(&self, size: usize) -> Option<BufferHandle> {
         let (found, evicted) = {
             let mut state = self.inner.state.lock(Side::Host);
             // A completion handler only advances the clock; what it made
@@ -1727,13 +2082,9 @@ impl BufferPool {
         };
         // Outside the lock, before `evicted` drops (`DESIGN.md` §6.3c).
         self.inner.notify_evicted(&evicted);
-        let (buffer, bucket_size) = found?;
-        Some(Arc::new(PooledBuffer {
-            buffer: Some(buffer),
-            size: bucket_size,
-            pool: Arc::downgrade(&self.inner),
-            residency: None,
-        }))
+        let (node, _) = found?;
+        // The node its last tenant's handles shared: no allocation.
+        Some(node.into_handle())
     }
 
     /// Whether allocating `size` fresh bytes would take this pool past
@@ -1828,7 +2179,7 @@ impl BufferPool {
     /// backstop rather than the mechanism; and because a violation is a
     /// programming error rather than a resource one, where §9.5e's argument
     /// against panicking deep inside a forward pass applies.
-    pub fn adopt(&self, buffer: Buffer, size: usize) -> Arc<PooledBuffer> {
+    pub fn adopt(&self, buffer: Buffer, size: usize) -> BufferHandle {
         debug_assert!(
             !buffer.is_view(),
             "BufferPool::adopt was given a VIEW ({} bytes at offset {} of a \
@@ -1849,8 +2200,12 @@ impl BufferPool {
             state.live_buffers += 1;
             state.live_bytes += size;
             if trace_on() {
-                let pending_same = state.pending.iter().filter(|p| p.size == size).count();
-                let free_same = state.free.get(&size).map_or(0, |b| b.len());
+                let pending_same = state
+                    .pending
+                    .iter()
+                    .filter(|p| p.node.size() == size)
+                    .count();
+                let free_same = state.free.get(&size).map_or(0, |b| b.nodes.len());
                 let head = state.pending.front().map(|p| p.epoch);
                 Some(format!(
                     "free_same={free_same} pending_same={pending_same} pending={} head_epoch={head:?} \
@@ -1866,7 +2221,7 @@ impl BufferPool {
         if let Some(why) = why {
             trace_allocation(size, &why);
         }
-        Arc::new(PooledBuffer {
+        BufferHandle::new(PooledBuffer {
             buffer: Some(buffer),
             size,
             pool: Arc::downgrade(&self.inner),
@@ -1900,7 +2255,7 @@ impl BufferPool {
         buffer: Buffer,
         requested: usize,
         allocated: usize,
-    ) -> Arc<PooledBuffer> {
+    ) -> BufferHandle {
         debug_assert!(
             allocated >= requested,
             "adopt_requesting({requested} -> {allocated}) shrank the request; \
@@ -1941,7 +2296,7 @@ impl BufferPool {
         let mut freed = Vec::new();
         {
             let mut state = self.inner.state.lock(Side::Host);
-            for (_, mut bucket) in std::mem::take(&mut state.free) {
+            while let Some((_, mut bucket)) = state.free.pop_first() {
                 // Destroyed rather than reused, as in `evict_over_budget`: the
                 // mark comes off before the allocation goes, or it outlives the
                 // buffer and reports a later correct access (#475).
@@ -1949,12 +2304,16 @@ impl BufferPool {
                 // SAFETY: these have just been taken out of the free list under
                 // the pool lock, so nothing holds them. Inert without
                 // `asan-poison`.
-                for buffer in &bucket {
-                    unsafe { super::poison::unpoison_buffer(buffer) };
-                    super::late_bind::on_leave(buffer);
+                for node in bucket.nodes.drain(..) {
+                    let buffer = node.into_buffer();
+                    unsafe { super::poison::unpoison_buffer(&buffer) };
+                    super::late_bind::on_leave(&buffer);
+                    freed.push(buffer);
                 }
-                freed.append(&mut bucket);
+                bucket.queued = 0;
+                state.spare_buckets.push(bucket);
             }
+            state.free_buffers = 0;
             state.free_bytes = 0;
             state.free_order.clear();
             state.counters.trims += 1;
@@ -1978,7 +2337,7 @@ impl BufferPool {
         let mut classes: Vec<(usize, usize)> = state
             .free
             .iter()
-            .map(|(&size, bucket)| (size, bucket.len()))
+            .map(|(&size, bucket)| (size, bucket.nodes.len()))
             .collect();
         classes.sort_by(|a, b| (b.0 * b.1).cmp(&(a.0 * a.1)));
         FreeSummary {
@@ -2011,7 +2370,7 @@ impl BufferPool {
     /// sitting in the free list ready to be handed out.
     pub fn occupancy(&self) -> PoolOccupancySnapshot {
         let state = self.inner.state.lock(Side::Host);
-        let free_buffers = state.free.values().map(|b| b.len()).sum();
+        let free_buffers = state.free.values().map(|b| b.nodes.len()).sum();
         PoolOccupancySnapshot {
             live_buffers: state.live_buffers,
             live_bytes: state.live_bytes,
@@ -2022,7 +2381,7 @@ impl BufferPool {
             free_bytes: state.free_bytes,
             free_buckets: state.free.len(),
             pending_buffers: state.pending.len(),
-            pending_bytes: state.pending.iter().map(|p| p.buffer.length()).sum(),
+            pending_bytes: state.pending.iter().map(|p| p.node.buffer().length()).sum(),
         }
     }
 }
@@ -2084,7 +2443,7 @@ mod tests {
 
     /// Allocates through the pool the way `MetalDevice` does: try to reuse,
     /// otherwise create and adopt.
-    fn alloc(pool: &BufferPool, dev: &Device, size: usize) -> Arc<PooledBuffer> {
+    fn alloc(pool: &BufferPool, dev: &Device, size: usize) -> BufferHandle {
         if let Some(b) = pool.acquire(size) {
             return b;
         }
@@ -2096,7 +2455,7 @@ mod tests {
 
     /// Drops `b` and lets the GPU finish, so it is available for reuse. The
     /// two-step is the point of this change: a drop alone no longer suffices.
-    fn release_and_complete(pool: &BufferPool, clock: &GpuClock, b: Arc<PooledBuffer>) {
+    fn release_and_complete(pool: &BufferPool, clock: &GpuClock, b: BufferHandle) {
         drop(b);
         gpu_completes(pool, clock);
     }
@@ -2111,7 +2470,7 @@ mod tests {
         pool: &BufferPool,
         dev: &Device,
         size: usize,
-    ) -> std::result::Result<Arc<PooledBuffer>, ResidualExceeded> {
+    ) -> std::result::Result<BufferHandle, ResidualExceeded> {
         if let Some(b) = pool.acquire(size) {
             return Ok(b);
         }
@@ -2805,6 +3164,159 @@ mod tests {
         }
     }
 
+    /// A released handle goes back WITH its node, and the next hit of its
+    /// size hands out that node: an acquire allocates no handle
+    /// (`BufferHandle`, §6.4e). The same node is shown by address while the
+    /// first handle's node is provably not free memory (the second arm's weak
+    /// handle below pins that the address test can tell the routes apart).
+    #[test]
+    fn a_released_handle_goes_back_with_its_node() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        let a = alloc(&pool, &dev, 4096);
+        let node = BufferHandle::as_ptr(&a);
+        release_and_complete(&pool, &clock, a);
+        let b = pool.acquire(4096).expect("the release is free again");
+        assert_eq!(
+            BufferHandle::as_ptr(&b),
+            node,
+            "the hit handed out a new node: the handle was allocated per acquire"
+        );
+        assert_eq!(BufferHandle::strong_count(&b), 1);
+        let c = b.clone();
+        assert!(BufferHandle::ptr_eq(&b, &c));
+        assert_eq!(BufferHandle::strong_count(&b), 2);
+    }
+
+    /// While a weak handle exists the node stays out of the pool (a weak
+    /// handle to a node handed to another tenant would upgrade to that
+    /// tenant's buffer): the buffer goes back alone, the weak handle cannot
+    /// upgrade, and the next hit is a different node. The node is still
+    /// allocated (the weak handle holds it), so the address comparison here
+    /// cannot be a coincidence of the allocator's.
+    #[test]
+    fn a_weak_handle_keeps_its_node_out_of_the_pool() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        let a = alloc(&pool, &dev, 4096);
+        let weak = BufferHandle::downgrade(&a);
+        let node = BufferHandle::as_ptr(&a);
+        assert!(weak.upgrade().is_some(), "a live handle upgrades");
+        release_and_complete(&pool, &clock, a);
+        assert!(
+            weak.upgrade().is_none(),
+            "no strong handle is left to upgrade to"
+        );
+        let b = pool.acquire(4096).expect("the buffer went back alone");
+        assert_ne!(
+            BufferHandle::as_ptr(&b),
+            node,
+            "a node a weak handle can still reach was handed to a new tenant"
+        );
+        assert_eq!(pool.counters().allocations, 1, "one buffer, reused");
+    }
+
+    /// An emptied bucket keeps its storage for the next size that needs a
+    /// bucket, and leaves the map (the #21 graveyard stays closed).
+    #[test]
+    fn an_emptied_bucket_keeps_its_storage() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        let held: Vec<_> = (0..4).map(|_| alloc(&pool, &dev, 8192)).collect();
+        drop(held);
+        gpu_completes(&pool, &clock);
+        let again: Vec<_> = (0..4).map(|_| pool.acquire(8192).expect("free")).collect();
+        {
+            let state = pool.inner.state.lock(Side::Host);
+            assert_eq!(state.free.len(), 0, "the emptied bucket's key left the map");
+            assert_eq!(state.spare_buckets.len(), 1, "its storage was kept");
+            assert!(state.spare_buckets[0].nodes.capacity() >= 4);
+        }
+        drop(again);
+        gpu_completes(&pool, &clock);
+        let state = pool.inner.state.lock(Side::Host);
+        assert_eq!(state.spare_buckets.len(), 0, "the refill took the spare");
+        assert_eq!(state.free[&8192].nodes.len(), 4);
+    }
+
+    /// `free_order` is bounded by what is free, not by what was ever
+    /// released: a pool whose every release is reused never evicts, and each
+    /// hit leaves its queue entry stale. Absolute bound, and the level the
+    /// same loop reaches uncompacted is printed beside it.
+    #[test]
+    fn free_order_stays_bounded_when_every_release_is_reused() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        let mut held = Vec::new();
+        let rounds = 5000;
+        for _ in 0..rounds {
+            for s in [4096, 4096, 16384] {
+                held.push(alloc(&pool, &dev, s));
+            }
+            held.clear();
+            gpu_completes(&pool, &clock);
+        }
+        let state = pool.inner.state.lock(Side::Host);
+        let free: usize = state.free.values().map(|b| b.nodes.len()).sum();
+        assert_eq!(
+            state.free_buffers, free,
+            "the maintained count is the free list's"
+        );
+        eprintln!(
+            "free_order {} entries over {} releases, {} free",
+            state.free_order.len(),
+            3 * rounds,
+            free
+        );
+        assert!(
+            state.free_order.len() <= 2 * free + 64,
+            "free_order holds {} entries for {free} free buffers: it grows with every \
+             release that is reused",
+            state.free_order.len()
+        );
+        assert!(
+            state.counters.evicted == 0,
+            "the bound came from compaction, not eviction"
+        );
+    }
+
+    /// Compaction keeps each size's NEWEST entries in order, so the age
+    /// order eviction reads is the one it read before, minus stale entries:
+    /// with the budget forcing one eviction, the oldest free size goes. The
+    /// old size is the SMALLER one, so no hot request can be served it by
+    /// the oversize reuse and refresh its age.
+    #[test]
+    fn compaction_keeps_the_age_order_eviction_reads() {
+        let dev = device();
+        let (pool, clock) = pool_with_clock();
+        // An old size, released once and never asked for again.
+        let old = alloc(&pool, &dev, 4096);
+        release_and_complete(&pool, &clock, old);
+        // A hot size, reused many times: its stale entries force compactions.
+        for _ in 0..500 {
+            let h = alloc(&pool, &dev, 65536);
+            release_and_complete(&pool, &clock, h);
+        }
+        {
+            let state = pool.inner.state.lock(Side::Host);
+            assert_eq!(
+                state.free_order.front(),
+                Some(&4096),
+                "the old size is still first"
+            );
+            assert!(state.free_order.len() <= 2 * state.free_buffers + 64);
+            assert_eq!(state.free_buffers, 2);
+        }
+        // Room for the hot buffer alone: the oldest (the 4 KiB) must go.
+        pool.set_free_budget(65536);
+        let state = pool.inner.state.lock(Side::Host);
+        assert!(state.free.contains_key(&65536), "the newer size stayed");
+        assert!(
+            !state.free.contains_key(&4096),
+            "the oldest size was evicted"
+        );
+    }
+
     /// An empty free list stops the loop rather than spinning (§9.2w).
     ///
     /// Both arms return `None` when there is nothing evictable, which is what
@@ -3134,7 +3646,7 @@ mod tests {
         let (pool, clock) = pool_with_clock();
 
         struct Holder {
-            _buffer: Arc<PooledBuffer>,
+            _buffer: BufferHandle,
         }
 
         let b = alloc(&pool, &dev, 512);
@@ -3334,7 +3846,7 @@ mod tests {
         let raw = dev
             .new_buffer(1024, crate::kernels::RESOURCE_OPTIONS)
             .expect("buffer allocation");
-        let b = Arc::new(PooledBuffer::unpooled(raw, 1024));
+        let b = BufferHandle::new(PooledBuffer::unpooled(raw, 1024));
         drop(b);
 
         assert_eq!(pool.occupancy().free_buffers, 0);
@@ -3421,7 +3933,7 @@ mod tests {
         const DEPTH: usize = 8;
 
         // Steady state: `DEPTH` iterations in flight at any moment.
-        let mut in_flight: std::collections::VecDeque<Arc<PooledBuffer>> =
+        let mut in_flight: std::collections::VecDeque<BufferHandle> =
             std::collections::VecDeque::new();
         for _ in 0..DEPTH {
             in_flight.push_back(alloc(&pool, &dev, 4096));
@@ -3994,7 +4506,7 @@ mod contention_tests {
         (BufferPool::with_clock(Arc::clone(&clock)), clock)
     }
 
-    fn alloc(pool: &BufferPool, dev: &Device, size: usize) -> Arc<PooledBuffer> {
+    fn alloc(pool: &BufferPool, dev: &Device, size: usize) -> BufferHandle {
         pool.acquire(size).unwrap_or_else(|| {
             let raw = dev
                 .new_buffer(size, crate::kernels::RESOURCE_OPTIONS)

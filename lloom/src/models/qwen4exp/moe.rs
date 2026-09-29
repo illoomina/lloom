@@ -309,9 +309,10 @@ impl<R: ExpertResidency> MoeLayer<R> {
         self.finish(r, &y)
     }
 
-    /// The routed experts over one device-resolved group of slot ids.
+    /// The routed experts over one device-resolved group of slot ids. Its
+    /// outputs are shaped by the pass alone (`[rows, topk, ·]`, one group),
+    /// so a pass plan serves them (`DESIGN.md` §9.2aa).
     fn routed_one_group(&self, x3: &Tensor, slot_ids: &Tensor) -> Result<Tensor> {
-        let _escape = escape_guard();
         let (g, u) = self.experts.gate_up(x3, slot_ids)?;
         let h = match super::kernels::silu_mul(&g, &u) {
             Some(h) => h?,
@@ -326,8 +327,11 @@ impl<R: ExpertResidency> MoeLayer<R> {
     fn routed_groups(&self, x3: &Tensor, groups: &[RoutedGroup]) -> Result<Tensor> {
         // The routed GEMMs' outputs are sized by the plan's groups, which
         // the pool's state decides: not a pass-shape allocation, so
-        // declared outside the plan (§9.2aa) and served by the pool.
-        let _escape = escape_guard();
+        // declared outside the plan (§9.2aa) and served by the pool. One
+        // group of one row (a B = 1 decode step) is the pass's shape
+        // whatever the pool holds, and a plan serves it.
+        let one_row = groups.len() == 1 && groups[0].rows.len() == 1;
+        let _escape = if one_row { None } else { escape_guard() };
         let mut ys = Vec::with_capacity(groups.len());
         for (gi, group) in groups.iter().enumerate() {
             let slot_ids = self.experts.ensure(group)?;

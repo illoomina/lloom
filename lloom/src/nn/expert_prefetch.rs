@@ -42,7 +42,7 @@
 //! keeps its synchronous loads.
 
 use lloom_tensor::kernels::metal::staging::SharedStagingRing;
-use lloom_tensor::kernels::metal::PooledBuffer;
+use lloom_tensor::kernels::metal::BufferHandle;
 use lloom_tensor::{MetalDevice, Result};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -76,7 +76,7 @@ impl PlaneSource {
 pub struct Staged {
     pub expert: u32,
     /// Per projection: the ring entry (`None` = a one-shot) and its buffer.
-    pub planes: [(Option<usize>, Arc<PooledBuffer>); 3],
+    pub planes: [(Option<usize>, BufferHandle); 3],
 }
 
 impl Staged {
@@ -177,7 +177,7 @@ struct Assembly {
     key: usize,
     generation: u64,
     expert: u32,
-    bufs: [(Option<usize>, Arc<PooledBuffer>); 3],
+    bufs: [(Option<usize>, BufferHandle); 3],
     left: usize,
     /// A piece failed to read, or was cancelled before it ran.
     failed: bool,
@@ -861,9 +861,9 @@ fn release_assemblies(w: &Shared, finished: Vec<Assembly>) {
 fn acquire_three(
     w: &Shared,
     planes: &[PlaneSource; 3],
-) -> Result<[(Option<usize>, Arc<PooledBuffer>); 3]> {
+) -> Result<[(Option<usize>, BufferHandle); 3]> {
     let mut ring = w.ring.lock();
-    let mut got: Vec<(Option<usize>, Arc<PooledBuffer>)> = Vec::with_capacity(3);
+    let mut got: Vec<(Option<usize>, BufferHandle)> = Vec::with_capacity(3);
     for src in planes {
         match ring.acquire(&w.device, src.plane_bytes) {
             Ok((entry, buf)) if !buf.contents().is_null() => got.push((entry, buf)),
@@ -899,7 +899,7 @@ enum Target {
     /// Into ring entries of its own (`Part::Whole`, `stage`).
     Stage,
     /// A piece of an assembly, into this plane's ring entry.
-    Piece(u64, Arc<PooledBuffer>),
+    Piece(u64, BufferHandle),
 }
 
 fn worker(w: Arc<Shared>) {
@@ -983,7 +983,7 @@ fn worker(w: Arc<Shared>) {
                             }
                         }
                     }
-                    let buf = Arc::clone(&g.assembling[&asm].bufs[plane as usize].1);
+                    let buf = BufferHandle::clone(&g.assembling[&asm].bufs[plane as usize].1);
                     Target::Piece(asm, buf)
                 }
             };
@@ -1143,7 +1143,7 @@ fn stage_whole(w: &Shared, req: &Req) {
 
 /// Read the three planes of `req.expert` into ring buffers.
 fn stage(w: &Shared, req: &Req) -> Result<Staged> {
-    let mut planes: Vec<(Option<usize>, Arc<PooledBuffer>)> = Vec::with_capacity(3);
+    let mut planes: Vec<(Option<usize>, BufferHandle)> = Vec::with_capacity(3);
     for src in &req.planes {
         let (entry, buf) = {
             let mut ring = w.ring.lock();

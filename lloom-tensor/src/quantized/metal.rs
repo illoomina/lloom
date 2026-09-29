@@ -1,13 +1,12 @@
 use super::{GgmlDType, QStorage};
 use crate::backend::BackendStorage;
-use crate::kernels::metal::{Buffer, PooledBuffer};
+use crate::kernels::metal::{Buffer, BufferHandle};
 use crate::{DType, Layout, MetalDevice, MetalStorage, Result, Shape, D};
-use std::sync::Arc;
 
 pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,
-    buffer: Arc<PooledBuffer>,
+    buffer: BufferHandle,
 }
 
 impl QMetalStorage {
@@ -972,7 +971,7 @@ impl QMetalStorage {
         &self,
         offset: usize,
         len: usize,
-        staging: Arc<PooledBuffer>,
+        staging: BufferHandle,
         ring: &mut crate::kernels::metal::staging::StagingRing,
         entry: Option<usize>,
     ) -> Result<()> {
@@ -992,7 +991,7 @@ impl QMetalStorage {
         &self,
         offset: usize,
         len: usize,
-        staging: Arc<PooledBuffer>,
+        staging: BufferHandle,
         fill: &mut dyn FnMut(&mut [u8]) -> Result<()>,
         ring: Option<(
             &mut crate::kernels::metal::staging::StagingRing,
@@ -1390,21 +1389,19 @@ fn dequant_once_kind(dtype: crate::kernels::GgmlDType) -> bool {
 /// One Private scratch a device for the dequantised stems, grown to the
 /// largest asked for (outside the pools: a tenant with a fixed identity,
 /// the hazard chain orders every stem's write after the last stem's read).
-fn dequant_scratch(device: &MetalDevice, bytes: usize) -> Result<Arc<PooledBuffer>> {
+fn dequant_scratch(device: &MetalDevice, bytes: usize) -> Result<BufferHandle> {
     static SCRATCH: std::sync::OnceLock<
-        parking_lot::Mutex<
-            std::collections::HashMap<crate::metal_backend::DeviceId, Arc<PooledBuffer>>,
-        >,
+        parking_lot::Mutex<std::collections::HashMap<crate::metal_backend::DeviceId, BufferHandle>>,
     > = std::sync::OnceLock::new();
     let map = SCRATCH.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
     let key = device.id();
     let mut g = map.lock();
     if let Some(b) = g.get(&key) {
         if b.size() >= bytes {
-            return Ok(Arc::clone(b));
+            return Ok(BufferHandle::clone(b));
         }
     }
     let b = device.new_persistent_private(bytes)?;
-    g.insert(key, Arc::clone(&b));
+    g.insert(key, BufferHandle::clone(&b));
     Ok(b)
 }

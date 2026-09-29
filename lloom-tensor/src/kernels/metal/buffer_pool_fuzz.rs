@@ -40,7 +40,7 @@
 
 #![cfg(any(test, feature = "fuzzing"))]
 
-use super::buffer_pool::{BufferPool, GpuClock, PooledBuffer};
+use super::buffer_pool::{BufferHandle, BufferPool, GpuClock};
 use super::device::Device;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
@@ -48,15 +48,15 @@ use std::sync::Arc;
 /// One symbol of the pool's alphabet.
 ///
 /// This is the public surface #494 names, minus the two operations that are
-/// *destructors* rather than calls: `PooledBuffer::drop` is reached by
-/// [`Op::DropLive`] and `PoolInner::drop` by the end of a run.
+/// *destructors* rather than calls: the last `BufferHandle`'s drop is reached
+/// by [`Op::DropLive`] and `PoolInner::drop` by the end of a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     /// `acquire(size)`, falling back to a fresh allocation + `adopt` on a miss
     /// -- the shape `MetalDevice` uses and the shape the tests' `alloc` uses.
     Alloc { size: usize },
-    /// Drop the live handle at `index % live.len()`, running
-    /// `PooledBuffer::drop`.
+    /// Drop the live handle at `index % live.len()`, running the last
+    /// `BufferHandle`'s drop (the node goes back with its buffer).
     DropLive { index: usize },
     /// `commit_epoch()` -- the host committing a command buffer.
     CommitEpoch,
@@ -251,7 +251,7 @@ pub fn run_sequence(dev: &Device, ops: &[Op]) -> Result<(), String> {
     let clock = Arc::new(GpuClock::new());
     let pool = BufferPool::with_clock(Arc::clone(&clock));
     let mut model = Model::new();
-    let mut live: Vec<Arc<PooledBuffer>> = Vec::new();
+    let mut live: Vec<BufferHandle> = Vec::new();
 
     for (i, op) in ops.iter().enumerate() {
         match op {
@@ -639,7 +639,7 @@ mod proptests {
             // Re-run the sequence against a fresh pool, counting what it reached.
             let clock = Arc::new(GpuClock::new());
             let pool = BufferPool::with_clock(Arc::clone(&clock));
-            let mut live: Vec<Arc<PooledBuffer>> = Vec::new();
+            let mut live: Vec<BufferHandle> = Vec::new();
             let mut submitted = 0u64;
             for op in &ops {
                 match op {

@@ -39,7 +39,7 @@
 //! re-acquiring buffers while copies of them are in flight.
 
 use lloom_tensor::kernels::metal::buffer::Buffer;
-use lloom_tensor::kernels::metal::buffer_pool::{BufferPool, PooledBuffer};
+use lloom_tensor::kernels::metal::buffer_pool::{BufferHandle, BufferPool};
 use lloom_tensor::kernels::metal::commands::{cb_unretained, Commands};
 use lloom_tensor::kernels::metal::device::Device;
 use lloom_tensor::kernels::metal::residency_set::ResidencySet;
@@ -124,7 +124,7 @@ fn run_sequence_inner(dev: &Device, ops: &[Op]) -> Result<Engagement, String> {
     let pool = BufferPool::with_clock(cmds.clock());
     pool.set_free_poison(Some(FREE_POISON));
 
-    let mut live: Vec<(Arc<PooledBuffer>, u8, u64)> = Vec::new();
+    let mut live: Vec<(BufferHandle, u8, u64)> = Vec::new();
     let mut pending: Vec<Pending> = Vec::new();
     let mut eng = Engagement {
         unretained: cb_unretained(),

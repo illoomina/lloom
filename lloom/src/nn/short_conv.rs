@@ -118,6 +118,21 @@ impl ShortConv<Shift> {
     ) -> Result<(Tensor, Tensor)> {
         crate::nn::ops::shortconv_step(b, x, c, state, &self.weight, self.k)
     }
+
+    /// [`Self::gated_step`] writing the next state into `next`, a contiguous
+    /// `[b, channels, k]` buffer that is not `state`'s: a caller that owns two
+    /// states per layer alternates them and the step allocates only its
+    /// output. Returns the output.
+    pub fn gated_step_into(
+        &self,
+        b: &Tensor,
+        x: &Tensor,
+        c: &Tensor,
+        state: &Tensor,
+        next: &Tensor,
+    ) -> Result<Tensor> {
+        crate::nn::ops::shortconv_step_into(b, x, c, state, &self.weight, self.k, next)
+    }
 }
 
 impl ShortConv<Ring> {

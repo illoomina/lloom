@@ -3055,6 +3055,12 @@ pub struct Cache {
     kv_bytes_per_token: usize,
     // Conv state cache for convolution layers
     conv_states: Vec<Option<Tensor>>,
+    /// Per conv layer, the `Shuffle` state the fused decode step writes next:
+    /// the step reads `conv_states[l]` and writes this, and the two swap, so
+    /// a decode step allocates no state (`DESIGN.md` §9.2aa). Scratch, kept
+    /// across `reset`; allocated on a layer's first fused step, outside every
+    /// plan.
+    conv_spare: Vec<Option<Tensor>>,
     /// The ring's rotating write index, in slots.
     ///
     /// **Deliberately here and not in a params struct** (`DESIGN.md` §10.2c,
@@ -3566,6 +3572,7 @@ impl Cache {
             kv_grow_fraction,
             kv_bytes_per_token,
             conv_states: vec![None; num_layers],
+            conv_spare: vec![None; num_layers],
             conv_phase: 0,
             conv_phase_prev: 0,
             conv_history: 0,
@@ -3944,6 +3951,21 @@ impl Cache {
             self.paged_pass_pending = false;
             Ok(shared)
         }
+    }
+
+    /// Layer `layer`'s spare `Shuffle` state, shaped as `state`: the buffer
+    /// the fused step writes the next state into. Allocated on the layer's
+    /// first fused step under an `EscapeGuard` (it outlives every pass, so no
+    /// plan serves it), and again only if the state's shape or dtype moved.
+    fn conv_spare_for(&mut self, layer: usize, state: &Tensor) -> Result<Tensor> {
+        if let Some(s) = self.conv_spare[layer].take() {
+            if s.dims() == state.dims() && s.dtype() == state.dtype() && s.is_contiguous() {
+                return Ok(s);
+            }
+        }
+        #[cfg(feature = "metal")]
+        let _declared = lloom_tensor::EscapeGuard::new();
+        Tensor::zeros(state.dims(), state.dtype(), state.device())
     }
 
     /// Store layer `layer`'s conv state: on the batch arm into the row's
@@ -6627,6 +6649,7 @@ impl ShortConv {
         x: &Tensor,
         c: &Tensor,
         state: &Tensor,
+        next: Option<&Tensor>,
     ) -> Result<Option<(Tensor, Tensor)>> {
         if !self.conv_fused || conv_c_fusion_disabled() {
             return Ok(None);
@@ -6635,7 +6658,7 @@ impl ShortConv {
         // does not compile off Metal. Fall back to the unfused Shuffle arm.
         #[cfg(not(feature = "metal"))]
         {
-            let _ = (b, x, c, state);
+            let _ = (b, x, c, state, next);
             return Ok(None);
         }
         #[cfg(feature = "metal")]
@@ -6661,7 +6684,10 @@ impl ShortConv {
             if b.stride() != x.stride() || b.stride() != c.stride() {
                 return Ok(None);
             }
-            Ok(Some(self.shift.gated_step(b, x, c, state)?))
+            Ok(Some(match next {
+                Some(n) => (self.shift.gated_step_into(b, x, c, state, n)?, n.clone()),
+                None => self.shift.gated_step(b, x, c, state)?,
+            }))
         }
     }
 
@@ -7028,8 +7054,21 @@ impl ShortConv {
                     c.device(),
                 )?,
             };
-            if let Some((conv_out, new_state)) = self.shortconv_fused(&b, &x_proj, &c, &state)? {
+            // A cache that keeps the state writes it into the layer's spare
+            // and swaps the two; the batch arm's state is a pool row, copied
+            // into by `set_conv_state`, so it keeps a fresh one.
+            let next = if cache.use_kv_cache && cache.batch.is_none() {
+                Some(cache.conv_spare_for(block_idx, &state)?)
+            } else {
+                None
+            };
+            if let Some((conv_out, new_state)) =
+                self.shortconv_fused(&b, &x_proj, &c, &state, next.as_ref())?
+            {
                 if cache.use_kv_cache {
+                    if next.is_some() {
+                        cache.conv_spare[block_idx] = Some(state);
+                    }
                     cache.set_conv_state(block_idx, new_state)?;
                 }
                 // `c` is already applied in the kernel store; only the transpose
